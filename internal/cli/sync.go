@@ -16,6 +16,7 @@ var (
 	syncDryRun      bool
 	syncForce       bool
 	syncInteractive bool
+	syncSkip        bool
 )
 
 var syncCmd = &cobra.Command{
@@ -31,6 +32,7 @@ func init() {
 	syncCmd.Flags().BoolVar(&syncDryRun, "dry-run", false, "Show what would be synced")
 	syncCmd.Flags().BoolVar(&syncForce, "force", false, "Overwrite existing files")
 	syncCmd.Flags().BoolVarP(&syncInteractive, "interactive", "i", false, "Prompt for each conflict")
+	syncCmd.Flags().BoolVar(&syncSkip, "skip", false, "Skip conflicts without prompting (non-interactive)")
 }
 
 func runSync(cmd *cobra.Command, args []string) error {
@@ -81,7 +83,14 @@ func runSync(cmd *cobra.Command, args []string) error {
 	resolutions := make(sync.ResolutionMap)
 
 	if len(allConflicts) > 0 && !syncForce {
-		if shouldPrompt() {
+		if syncSkip {
+			// Skip all conflicts silently
+			for _, c := range allConflicts {
+				key := sync.ConflictKey(c.Target, c.Artifact.Name)
+				resolutions[key] = sync.ResolutionSkip
+			}
+			fmt.Printf("Skipping %d conflict(s)\n", len(allConflicts))
+		} else if shouldPrompt() {
 			prompter := NewPrompter()
 			promptResult, err := prompter.ResolveConflicts(allConflicts)
 			if err != nil {
@@ -111,7 +120,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 			}
 		} else {
 			// Non-interactive with conflicts: report and exit
-			fmt.Printf("\n%d conflict(s) detected - use --force to overwrite or -i for interactive:\n", len(allConflicts))
+			fmt.Printf("\n%d conflict(s) detected - use --force to overwrite, --skip to skip, or -i for interactive:\n", len(allConflicts))
 			for _, c := range allConflicts {
 				fmt.Printf("  - %s (%s): %s\n", c.Artifact.Name, c.Target, c.Path)
 			}
