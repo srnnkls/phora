@@ -31,6 +31,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&globalConfigPath, "config", defaultConfig, "Global config file")
 	rootCmd.PersistentFlags().StringVar(&dataDir, "data-dir", defaultData, "Data directory for cloned repos")
 
+	rootCmd.AddCommand(configCmd)
 	rootCmd.AddCommand(initCmd)
 	rootCmd.AddCommand(installCmd)
 	rootCmd.AddCommand(syncCmd)
