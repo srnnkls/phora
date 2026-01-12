@@ -39,10 +39,42 @@ const (
 	ConflictDuplicateSource
 )
 
-func Sync(cfg *config.Config, opts Options) (*Result, error) {
-	result := &Result{}
+// Resolution represents user's choice for a conflict
+type Resolution int
 
-	// Determine targets
+const (
+	ResolutionSkip Resolution = iota
+	ResolutionOverwrite
+)
+
+// ResolutionMap maps conflict keys to resolution choices
+type ResolutionMap map[string]Resolution
+
+// DetectionResult contains pre-sync analysis for a target
+type DetectionResult struct {
+	Target    string
+	Harness   config.Harness
+	Artifacts []*artifact.Artifact
+	Conflicts []Conflict
+	Generated int
+}
+
+// ApplyOptions extends Options with resolution data
+type ApplyOptions struct {
+	Options
+	Resolutions ResolutionMap
+}
+
+// ConflictKey generates a unique key for a conflict
+func ConflictKey(target, artifactName string) string {
+	return target + ":" + artifactName
+}
+
+// Detect analyzes sources and identifies conflicts without writing
+func Detect(cfg *config.Config, opts Options) ([]DetectionResult, error) {
+	var results []DetectionResult
+	var errors []error
+
 	targetNames := opts.Targets
 	if len(targetNames) == 0 {
 		targetNames = cfg.DefaultHarnesses
@@ -54,52 +86,81 @@ func Sync(cfg *config.Config, opts Options) (*Result, error) {
 		src := source.NewLocal(srcPath, cfg.DefaultArtifacts)
 		arts, err := src.Discover()
 		if err != nil {
-			result.Errors = append(result.Errors, err)
+			errors = append(errors, err)
 			continue
 		}
 		allArtifacts = append(allArtifacts, arts...)
 	}
 
-	// Process each target
+	if len(errors) > 0 {
+		return nil, fmt.Errorf("discovery errors: %v", errors)
+	}
+
 	for _, targetName := range targetNames {
 		harness, ok := cfg.Harness[targetName]
 		if !ok {
-			result.Errors = append(result.Errors, fmt.Errorf("unknown harness: %s", targetName))
 			continue
 		}
 
-		// Generate commands from user-invocable skills if configured
-		var generated []*artifact.Artifact
-		if harness.GenerateCommandsFromSkills {
-			generated = generateCommands(allArtifacts)
-			result.Generated += len(generated)
-		}
+		// Filter artifacts based on include/exclude
+		filtered := filterArtifacts(allArtifacts, harness)
 
-		// Combine artifacts
-		artifacts := append(allArtifacts, generated...)
+		// Generate commands from user-invocable skills if configured
+		var generated int
+		if harness.GenerateCommandsFromSkills {
+			genArts := generateCommands(filtered)
+			filtered = append(filtered, genArts...)
+			generated = len(genArts)
+		}
 
 		// Detect conflicts
-		if !opts.Force {
-			conflicts := DetectFileConflicts(artifacts, targetName, harness)
-			if len(conflicts) > 0 && cfg.Conflict.FileExists == "error" {
-				result.Conflicts = append(result.Conflicts, conflicts...)
-				continue
-			}
-		}
+		conflicts := DetectFileConflicts(filtered, targetName, harness)
 
-		// Create target writer
-		tgt := target.NewFromConfig(targetName, harness)
+		results = append(results, DetectionResult{
+			Target:    targetName,
+			Harness:   harness,
+			Artifacts: filtered,
+			Conflicts: conflicts,
+			Generated: generated,
+		})
+	}
 
-		// Create transformer
+	return results, nil
+}
+
+// Apply writes artifacts based on detection results and resolutions
+func Apply(cfg *config.Config, detection []DetectionResult, opts ApplyOptions) (*Result, error) {
+	result := &Result{}
+
+	for _, det := range detection {
+		tgt := target.NewFromConfig(det.Target, det.Harness)
 		tr := &transform.Transformer{
-			Variables: harness.Variables,
-			Mappings:  harness.Mappings,
+			Variables: det.Harness.Variables,
+			Mappings:  det.Harness.Mappings,
 		}
 
-		// Sync each artifact
-		for _, art := range artifacts {
-			// Check if exists and not forcing
-			if !opts.Force {
+		result.Generated += det.Generated
+
+		for _, art := range det.Artifacts {
+			key := ConflictKey(det.Target, art.Name)
+
+			// Check if this artifact has a conflict
+			if hasConflict(det.Conflicts, art) {
+				if opts.Force {
+					// Force mode: always overwrite
+				} else if resolution, hasRes := opts.Resolutions[key]; hasRes {
+					if resolution == ResolutionSkip {
+						result.Skipped++
+						continue
+					}
+					// ResolutionOverwrite falls through to write
+				} else {
+					// No resolution provided for conflict, skip
+					result.Skipped++
+					continue
+				}
+			} else if !opts.Force {
+				// No conflict, but check if file exists (for non-force mode)
 				if exists, _ := tgt.Exists(art); exists {
 					result.Skipped++
 					continue
@@ -125,11 +186,90 @@ func Sync(cfg *config.Config, opts Options) (*Result, error) {
 		}
 	}
 
-	if len(result.Conflicts) > 0 {
-		return result, fmt.Errorf("conflicts detected: %d", len(result.Conflicts))
+	return result, nil
+}
+
+// Sync is the original API, uses Detect + Apply internally (backward compatible)
+func Sync(cfg *config.Config, opts Options) (*Result, error) {
+	detection, err := Detect(cfg, opts)
+	if err != nil {
+		return nil, err
 	}
 
-	return result, nil
+	// Original behavior: if any conflicts and file_exists="error", fail
+	if !opts.Force && cfg.Conflict.FileExists == "error" {
+		var allConflicts []Conflict
+		for _, det := range detection {
+			allConflicts = append(allConflicts, det.Conflicts...)
+		}
+		if len(allConflicts) > 0 {
+			return &Result{Conflicts: allConflicts}, fmt.Errorf("conflicts detected: %d", len(allConflicts))
+		}
+	}
+
+	// For backward compat: if force, overwrite all; otherwise skip conflicts
+	resolutions := make(ResolutionMap)
+	if opts.Force {
+		for _, det := range detection {
+			for _, c := range det.Conflicts {
+				resolutions[ConflictKey(c.Target, c.Artifact.Name)] = ResolutionOverwrite
+			}
+		}
+	}
+
+	return Apply(cfg, detection, ApplyOptions{
+		Options:     opts,
+		Resolutions: resolutions,
+	})
+}
+
+// filterArtifacts applies include/exclude rules from harness config
+func filterArtifacts(arts []*artifact.Artifact, harness config.Harness) []*artifact.Artifact {
+	var filtered []*artifact.Artifact
+
+	for _, art := range arts {
+		if !shouldSync(art.Name, harness) {
+			continue
+		}
+		filtered = append(filtered, art)
+	}
+
+	return filtered
+}
+
+// shouldSync checks if an artifact should be synced based on include/exclude lists
+func shouldSync(name string, harness config.Harness) bool {
+	// If include list is set, artifact must be in it
+	if len(harness.Include) > 0 {
+		found := false
+		for _, inc := range harness.Include {
+			if inc == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+
+	// Check exclude list
+	for _, exc := range harness.Exclude {
+		if exc == name {
+			return false
+		}
+	}
+
+	return true
+}
+
+func hasConflict(conflicts []Conflict, art *artifact.Artifact) bool {
+	for _, c := range conflicts {
+		if c.Artifact.Name == art.Name {
+			return true
+		}
+	}
+	return false
 }
 
 func DetectFileConflicts(arts []*artifact.Artifact, targetName string, harness config.Harness) []Conflict {

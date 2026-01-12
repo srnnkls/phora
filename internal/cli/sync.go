@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 	"github.com/srnnkls/tropos/internal/config"
@@ -10,10 +11,11 @@ import (
 )
 
 var (
-	syncSources []string
-	syncTargets []string
-	syncDryRun  bool
-	syncForce   bool
+	syncSources     []string
+	syncTargets     []string
+	syncDryRun      bool
+	syncForce       bool
+	syncInteractive bool
 )
 
 var syncCmd = &cobra.Command{
@@ -28,28 +30,25 @@ func init() {
 	syncCmd.Flags().StringSliceVar(&syncTargets, "target", nil, "Target harnesses (default: all enabled)")
 	syncCmd.Flags().BoolVar(&syncDryRun, "dry-run", false, "Show what would be synced")
 	syncCmd.Flags().BoolVar(&syncForce, "force", false, "Overwrite existing files")
+	syncCmd.Flags().BoolVarP(&syncInteractive, "interactive", "i", false, "Prompt for each conflict")
 }
 
 func runSync(cmd *cobra.Command, args []string) error {
-	// Determine project directory
 	cwd, err := os.Getwd()
 	if err != nil {
 		return err
 	}
 
-	// Load config
 	cfg, err := config.Load(cwd, globalConfigPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	// Determine sources
 	sources := syncSources
 	if len(sources) == 0 {
 		sources = []string{cwd}
 	}
 
-	// Determine targets
 	targets := syncTargets
 	if len(targets) == 0 {
 		targets = cfg.DefaultHarnesses
@@ -66,7 +65,65 @@ func runSync(cmd *cobra.Command, args []string) error {
 		fmt.Println("Dry run - no files will be written")
 	}
 
-	result, err := sync.Sync(cfg, opts)
+	// Phase 1: Detect
+	detection, err := sync.Detect(cfg, opts)
+	if err != nil {
+		return err
+	}
+
+	// Collect all conflicts
+	var allConflicts []sync.Conflict
+	for _, det := range detection {
+		allConflicts = append(allConflicts, det.Conflicts...)
+	}
+
+	// Phase 2: Resolve conflicts
+	resolutions := make(sync.ResolutionMap)
+
+	if len(allConflicts) > 0 && !syncForce {
+		if shouldPrompt() {
+			prompter := NewPrompter()
+			promptResult, err := prompter.ResolveConflicts(allConflicts)
+			if err != nil {
+				return err
+			}
+			if promptResult.Aborted {
+				fmt.Println("Aborted.")
+				return nil
+			}
+			resolutions = promptResult.Resolutions
+
+			// Save skip choices to config as exclusions
+			configPath := filepath.Join(cwd, "tropos.toml")
+			var savedExclusions int
+			for _, c := range allConflicts {
+				key := sync.ConflictKey(c.Target, c.Artifact.Name)
+				if res, ok := resolutions[key]; ok && res == sync.ResolutionSkip {
+					if err := config.AddExclusion(configPath, c.Target, c.Artifact.Name); err != nil {
+						fmt.Fprintf(os.Stderr, "Warning: could not save exclusion: %v\n", err)
+					} else {
+						savedExclusions++
+					}
+				}
+			}
+			if savedExclusions > 0 {
+				fmt.Printf("Saved %d exclusion(s) to tropos.toml\n", savedExclusions)
+			}
+		} else {
+			// Non-interactive with conflicts: report and exit
+			fmt.Printf("\n%d conflict(s) detected - use --force to overwrite or -i for interactive:\n", len(allConflicts))
+			for _, c := range allConflicts {
+				fmt.Printf("  - %s (%s): %s\n", c.Artifact.Name, c.Target, c.Path)
+			}
+			return fmt.Errorf("conflicts detected")
+		}
+	}
+
+	// Phase 3: Apply
+	result, err := sync.Apply(cfg, detection, sync.ApplyOptions{
+		Options:     opts,
+		Resolutions: resolutions,
+	})
 
 	// Report results
 	if syncDryRun {
@@ -80,14 +137,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 	}
 
 	if result.Skipped > 0 {
-		fmt.Printf("Skipped %d (already exist, use --force to overwrite)\n", result.Skipped)
-	}
-
-	if len(result.Conflicts) > 0 {
-		fmt.Printf("\nConflicts:\n")
-		for _, c := range result.Conflicts {
-			fmt.Printf("  - %s: %s\n", c.Artifact.Name, c.Path)
-		}
+		fmt.Printf("Skipped %d (excluded or already exist)\n", result.Skipped)
 	}
 
 	for _, e := range result.Errors {
@@ -95,4 +145,13 @@ func runSync(cmd *cobra.Command, args []string) error {
 	}
 
 	return err
+}
+
+// shouldPrompt determines if we should enter interactive mode
+func shouldPrompt() bool {
+	if syncInteractive {
+		return true
+	}
+	// Auto-detect TTY: prompt if stdin is terminal
+	return isTerminal()
 }

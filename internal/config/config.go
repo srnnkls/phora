@@ -26,6 +26,8 @@ type Harness struct {
 	GenerateCommandsFromSkills bool              `toml:"generate_commands_from_skills"`
 	Mappings                   map[string]string `toml:"mappings"`
 	Variables                  map[string]string `toml:"variables"`
+	Include                    []string          `toml:"include"`
+	Exclude                    []string          `toml:"exclude"`
 }
 
 type Manifest struct {
@@ -98,6 +100,8 @@ func Merge(global, project *Config) *Config {
 			GenerateCommandsFromSkills: harness.GenerateCommandsFromSkills,
 			Mappings:                   make(map[string]string),
 			Variables:                  make(map[string]string),
+			Include:                    append([]string{}, harness.Include...),
+			Exclude:                    append([]string{}, harness.Exclude...),
 		}
 		for k, v := range harness.Mappings {
 			h.Mappings[k] = v
@@ -151,6 +155,8 @@ func Merge(global, project *Config) *Config {
 		for k, v := range harness.Variables {
 			h.Variables[k] = v
 		}
+		h.Include = appendUnique(h.Include, harness.Include...)
+		h.Exclude = appendUnique(h.Exclude, harness.Exclude...)
 		result.Harness[name] = h
 	}
 
@@ -166,4 +172,18 @@ func ExpandPath(path string) string {
 		return filepath.Join(home, path[2:])
 	}
 	return path
+}
+
+func appendUnique(slice []string, items ...string) []string {
+	seen := make(map[string]bool)
+	for _, s := range slice {
+		seen[s] = true
+	}
+	for _, item := range items {
+		if !seen[item] {
+			slice = append(slice, item)
+			seen[item] = true
+		}
+	}
+	return slice
 }
