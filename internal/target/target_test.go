@@ -9,8 +9,8 @@ import (
 	"github.com/srnnkls/tropos/internal/config"
 )
 
-func TestNestedTargetPath(t *testing.T) {
-	target := NewNested("/home/user/.claude")
+func TestTargetPath(t *testing.T) {
+	target := New("/home/user/.claude")
 
 	tests := []struct {
 		art  *artifact.Artifact
@@ -40,36 +40,9 @@ func TestNestedTargetPath(t *testing.T) {
 	}
 }
 
-func TestFlatTargetPath(t *testing.T) {
-	target := NewFlat("/home/user/.config/opencode")
-
-	tests := []struct {
-		art  *artifact.Artifact
-		want string
-	}{
-		{
-			art:  &artifact.Artifact{Name: "code-test", Type: artifact.TypeSkill},
-			want: "/home/user/.config/opencode/skills/code-test.md",
-		},
-		{
-			art:  &artifact.Artifact{Name: "tester", Type: artifact.TypeAgent},
-			want: "/home/user/.config/opencode/agents/tester.md",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.art.Name, func(t *testing.T) {
-			got := target.TargetPath(tt.art)
-			if got != tt.want {
-				t.Errorf("TargetPath() = %q, want %q", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestNestedWrite(t *testing.T) {
+func TestWrite(t *testing.T) {
 	tmpDir := t.TempDir()
-	target := NewNested(tmpDir)
+	target := New(tmpDir)
 
 	art := &artifact.Artifact{
 		Name: "code-test",
@@ -96,10 +69,9 @@ func TestNestedWrite(t *testing.T) {
 	}
 }
 
-func TestNestedWriteWithResources(t *testing.T) {
+func TestWriteWithResources(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	// Create source with resources
 	srcDir := filepath.Join(tmpDir, "src", "skills", "code-test")
 	os.MkdirAll(filepath.Join(srcDir, "reference"), 0755)
 	os.WriteFile(filepath.Join(srcDir, "SKILL.md"), []byte("# Skill"), 0644)
@@ -107,7 +79,7 @@ func TestNestedWriteWithResources(t *testing.T) {
 	os.WriteFile(filepath.Join(srcDir, "script.sh"), []byte("#!/bin/bash"), 0755)
 
 	targetDir := filepath.Join(tmpDir, "target")
-	target := NewNested(targetDir)
+	target := New(targetDir)
 
 	art := &artifact.Artifact{
 		Name:        "code-test",
@@ -123,7 +95,6 @@ func TestNestedWriteWithResources(t *testing.T) {
 		t.Fatalf("Write() error = %v", err)
 	}
 
-	// Check resources copied
 	refPath := filepath.Join(targetDir, "skills", "code-test", "reference", "guide.md")
 	if _, err := os.Stat(refPath); err != nil {
 		t.Errorf("reference/guide.md not copied: %v", err)
@@ -135,47 +106,9 @@ func TestNestedWriteWithResources(t *testing.T) {
 	}
 }
 
-func TestFlatWriteWithResources(t *testing.T) {
+func TestExists(t *testing.T) {
 	tmpDir := t.TempDir()
-
-	srcDir := filepath.Join(tmpDir, "src", "skills", "code-test")
-	os.MkdirAll(filepath.Join(srcDir, "reference"), 0755)
-	os.WriteFile(filepath.Join(srcDir, "SKILL.md"), []byte("# Skill"), 0644)
-	os.WriteFile(filepath.Join(srcDir, "reference", "guide.md"), []byte("# Guide"), 0644)
-
-	targetDir := filepath.Join(tmpDir, "target")
-	target := NewFlat(targetDir)
-
-	art := &artifact.Artifact{
-		Name:        "code-test",
-		Type:        artifact.TypeSkill,
-		SourcePath:  srcDir,
-		IsDirectory: true,
-		Resources:   []string{"reference"},
-		Frontmatter: map[string]any{"name": "code-test"},
-		Body:        "# Skill\n",
-	}
-
-	if err := target.Write(art); err != nil {
-		t.Fatalf("Write() error = %v", err)
-	}
-
-	// Check main file
-	mainPath := filepath.Join(targetDir, "skills", "code-test.md")
-	if _, err := os.Stat(mainPath); err != nil {
-		t.Errorf("main file not written: %v", err)
-	}
-
-	// Check resources in sibling directory
-	refPath := filepath.Join(targetDir, "skills", "code-test", "reference", "guide.md")
-	if _, err := os.Stat(refPath); err != nil {
-		t.Errorf("reference/guide.md not copied: %v", err)
-	}
-}
-
-func TestTargetExists(t *testing.T) {
-	tmpDir := t.TempDir()
-	target := NewNested(tmpDir)
+	target := New(tmpDir)
 
 	art := &artifact.Artifact{
 		Name: "code-test",
@@ -187,7 +120,6 @@ func TestTargetExists(t *testing.T) {
 		t.Error("Exists() = true before write")
 	}
 
-	// Create the file
 	targetPath := target.TargetPath(art)
 	os.MkdirAll(filepath.Dir(targetPath), 0755)
 	os.WriteFile(targetPath, []byte("content"), 0644)
@@ -203,8 +135,7 @@ func TestTargetExists(t *testing.T) {
 
 func TestNewFromConfig(t *testing.T) {
 	harness := config.Harness{
-		Path:      "/home/user/.claude",
-		Structure: "nested",
+		Path: "/home/user/.claude",
 	}
 
 	target := NewFromConfig("claude", harness)

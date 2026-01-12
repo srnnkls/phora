@@ -24,8 +24,8 @@ func TestIntegrationFullDeploy(t *testing.T) {
 
 	os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(`---
 name: code-test
-description: TDD workflow using {{.model_strong}}
-model: {{.model_strong}}
+description: "TDD workflow using {{.model_strong}}"
+model: "{{.model_strong}}"
 user-invocable: true
 allowed_tools:
   - read
@@ -67,7 +67,7 @@ Just a basic skill without resources.
 	os.MkdirAll(cmdDir, 0755)
 	os.WriteFile(filepath.Join(cmdDir, "COMMAND.md"), []byte(`---
 name: test.run
-description: Run tests with {{.model_weak}}
+description: "Run tests with {{.model_weak}}"
 ---
 
 # Run Tests
@@ -81,7 +81,7 @@ Execute test suite using {{.model_weak}} for speed.
 	os.WriteFile(filepath.Join(agentsDir, "tester.md"), []byte(`---
 name: tester
 description: Test execution agent
-model: {{.model_weak}}
+model: "{{.model_weak}}"
 ---
 
 # Tester Agent
@@ -100,7 +100,7 @@ Runs tests and reports results.
 		Harness: map[string]config.Harness{
 			"claude": {
 				Path:                       claudeTarget,
-				Structure:                  "nested",
+				
 				GenerateCommandsFromSkills: false,
 				Variables: map[string]string{
 					"model_strong": "opus",
@@ -109,7 +109,7 @@ Runs tests and reports results.
 			},
 			"opencode": {
 				Path:                       opencodeTarget,
-				Structure:                  "flat",
+				
 				GenerateCommandsFromSkills: true,
 				Mappings: map[string]string{
 					"allowed_tools": "tools",
@@ -189,10 +189,10 @@ Runs tests and reports results.
 		t.Errorf("Claude agent not written: %v", err)
 	}
 
-	// === Verify OpenCode target (flat structure) ===
+	// === Verify OpenCode target (nested structure, same as Claude) ===
 
 	// Check skill with transformed variables and mappings
-	opencodeSkillPath := filepath.Join(opencodeTarget, "skills", "code-test.md")
+	opencodeSkillPath := filepath.Join(opencodeTarget, "skills", "code-test", "SKILL.md")
 	opencodeSkillContent, err := os.ReadFile(opencodeSkillPath)
 	if err != nil {
 		t.Fatalf("OpenCode skill not written: %v", err)
@@ -213,14 +213,14 @@ Runs tests and reports results.
 		t.Error("OpenCode skill: allowed_tools should be renamed to tools")
 	}
 
-	// Check resources in sibling directory (flat structure)
+	// Check resources copied
 	opencodeRefPath := filepath.Join(opencodeTarget, "skills", "code-test", "reference", "best-practices.md")
 	if _, err := os.Stat(opencodeRefPath); err != nil {
 		t.Errorf("OpenCode skill reference not copied: %v", err)
 	}
 
 	// Check auto-generated command from user-invocable skill
-	opencodeGenCmdPath := filepath.Join(opencodeTarget, "commands", "code-test.md")
+	opencodeGenCmdPath := filepath.Join(opencodeTarget, "commands", "code-test", "COMMAND.md")
 	opencodeGenCmdContent, err := os.ReadFile(opencodeGenCmdPath)
 	if err != nil {
 		t.Fatalf("OpenCode generated command not written: %v", err)
@@ -234,8 +234,8 @@ Runs tests and reports results.
 		t.Error("Generated command missing name")
 	}
 
-	// Check agent (flat)
-	opencodeAgentPath := filepath.Join(opencodeTarget, "agents", "tester.md")
+	// Check agent
+	opencodeAgentPath := filepath.Join(opencodeTarget, "agents", "tester", "AGENT.md")
 	opencodeAgentContent, err := os.ReadFile(opencodeAgentPath)
 	if err != nil {
 		t.Fatalf("OpenCode agent not written: %v", err)
@@ -274,7 +274,7 @@ description: New version
 		Harness: map[string]config.Harness{
 			"test": {
 				Path:      targetDir,
-				Structure: "nested",
+				
 			},
 		},
 	}
@@ -336,7 +336,7 @@ name: test
 		Harness: map[string]config.Harness{
 			"test": {
 				Path:      targetDir,
-				Structure: "nested",
+				
 			},
 		},
 	}

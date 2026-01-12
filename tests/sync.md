@@ -184,7 +184,7 @@ Synced 5 artifact(s)
 Generated 1 command(s) from user-invocable skills
 ```
 
-## List OpenCode Target Structure (Flat)
+## List OpenCode Target Structure (Nested)
 
 ```scrut
 $ ls -R /tmp/tropos-test-opencode
@@ -193,28 +193,40 @@ commands
 skills
 
 /tmp/tropos-test-opencode/agents:
-tester.md
+tester
+
+/tmp/tropos-test-opencode/agents/tester:
+AGENT.md
 
 /tmp/tropos-test-opencode/commands:
-code-test.md
-test.run.md
+code-test
+test.run
+
+/tmp/tropos-test-opencode/commands/code-test:
+COMMAND.md
+
+/tmp/tropos-test-opencode/commands/test.run:
+COMMAND.md
 
 /tmp/tropos-test-opencode/skills:
 code-test
-code-test.md
-simple.md
+simple
 
 /tmp/tropos-test-opencode/skills/code-test:
+SKILL.md
 reference
 
 /tmp/tropos-test-opencode/skills/code-test/reference:
 guide.md
+
+/tmp/tropos-test-opencode/skills/simple:
+SKILL.md
 ```
 
 ## Verify OpenCode Key Mapping
 
 ```scrut
-$ cat /tmp/tropos-test-opencode/skills/code-test.md
+$ cat /tmp/tropos-test-opencode/skills/code-test/SKILL.md
 ---
 description: TDD workflow using anthropic/claude-sonnet-4-5
 model: anthropic/claude-sonnet-4-5
@@ -241,7 +253,7 @@ Use anthropic/claude-haiku-4-5 for simple validations.
 ## Verify Generated Command
 
 ```scrut
-$ cat /tmp/tropos-test-opencode/commands/code-test.md
+$ cat /tmp/tropos-test-opencode/commands/code-test/COMMAND.md
 ---
 description: TDD workflow using anthropic/claude-sonnet-4-5
 name: code-test
@@ -253,7 +265,7 @@ Invoke skill: code-test
 ## Verify OpenCode Agent
 
 ```scrut
-$ cat /tmp/tropos-test-opencode/agents/tester.md
+$ cat /tmp/tropos-test-opencode/agents/tester/AGENT.md
 ---
 description: Test execution agent
 model: anthropic/claude-haiku-4-5
@@ -268,7 +280,7 @@ Runs tests and reports results.
 ## Verify OpenCode Simple Skill
 
 ```scrut
-$ cat /tmp/tropos-test-opencode/skills/simple.md
+$ cat /tmp/tropos-test-opencode/skills/simple/SKILL.md
 ---
 description: A simple skill without resources
 name: simple
@@ -282,7 +294,7 @@ Just a basic skill.
 ## Verify OpenCode Command
 
 ```scrut
-$ cat /tmp/tropos-test-opencode/commands/test.run.md
+$ cat /tmp/tropos-test-opencode/commands/test.run/COMMAND.md
 ---
 description: Run tests with anthropic/claude-haiku-4-5
 name: test.run

@@ -19,7 +19,6 @@ duplicate_artifact = "error"
 
 [harness.claude]
 path = "~/.claude"
-structure = "nested"
 generate_commands_from_skills = false
 
 [harness.claude.mappings]
@@ -29,12 +28,11 @@ model_strong = "opus"
 model_weak = "haiku"
 
 [harness.opencode]
-path = "~/.config/opencode"
-structure = "flat"
+path = "~/.opencode"
 generate_commands_from_skills = true
 
 [harness.opencode.mappings]
-allowed_tools = "tools"
+allowed-tools = "tools"
 
 [harness.opencode.variables]
 model_strong = "anthropic/claude-sonnet-4-5"
@@ -63,9 +61,6 @@ model_weak = "anthropic/claude-haiku-4-5"
 	if !ok {
 		t.Fatal("missing claude harness")
 	}
-	if claude.Structure != "nested" {
-		t.Errorf("claude.Structure = %q, want %q", claude.Structure, "nested")
-	}
 	if claude.Variables["model_strong"] != "opus" {
 		t.Errorf("claude.Variables[model_strong] = %q, want %q", claude.Variables["model_strong"], "opus")
 	}
@@ -77,8 +72,8 @@ model_weak = "anthropic/claude-haiku-4-5"
 	if !opencode.GenerateCommandsFromSkills {
 		t.Error("opencode.GenerateCommandsFromSkills = false, want true")
 	}
-	if opencode.Mappings["allowed_tools"] != "tools" {
-		t.Errorf("opencode.Mappings[allowed_tools] = %q, want %q", opencode.Mappings["allowed_tools"], "tools")
+	if opencode.Mappings["allowed-tools"] != "tools" {
+		t.Errorf("opencode.Mappings[allowed-tools] = %q, want %q", opencode.Mappings["allowed-tools"], "tools")
 	}
 }
 
@@ -92,8 +87,7 @@ func TestMergeConfigs(t *testing.T) {
 		},
 		Harness: map[string]Harness{
 			"claude": {
-				Path:      "~/.claude",
-				Structure: "nested",
+				Path: "~/.claude",
 				Variables: map[string]string{
 					"model_strong": "opus",
 				},
@@ -194,7 +188,6 @@ default_harnesses = ["claude"]
 
 [harness.claude]
 path = "~/.claude"
-structure = "nested"
 
 [harness.claude.variables]
 model_strong = "opus"

@@ -23,7 +23,6 @@ type ConflictConfig struct {
 
 type Harness struct {
 	Path                       string            `toml:"path"`
-	Structure                  string            `toml:"structure"`
 	GenerateCommandsFromSkills bool              `toml:"generate_commands_from_skills"`
 	Mappings                   map[string]string `toml:"mappings"`
 	Variables                  map[string]string `toml:"variables"`
@@ -96,7 +95,6 @@ func Merge(global, project *Config) *Config {
 	for name, harness := range global.Harness {
 		h := Harness{
 			Path:                       harness.Path,
-			Structure:                  harness.Structure,
 			GenerateCommandsFromSkills: harness.GenerateCommandsFromSkills,
 			Mappings:                   make(map[string]string),
 			Variables:                  make(map[string]string),
@@ -143,9 +141,6 @@ func Merge(global, project *Config) *Config {
 		}
 		if harness.Path != "" {
 			h.Path = harness.Path
-		}
-		if harness.Structure != "" {
-			h.Structure = harness.Structure
 		}
 		if harness.GenerateCommandsFromSkills {
 			h.GenerateCommandsFromSkills = true

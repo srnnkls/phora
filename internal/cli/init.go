@@ -93,7 +93,6 @@ func runInit(cmd *cobra.Command, args []string) error {
 		Harness: map[string]config.Harness{
 			"claude": {
 				Path:                       "~/.claude",
-				Structure:                  "nested",
 				GenerateCommandsFromSkills: false,
 				Variables: map[string]string{
 					"model_strong": "opus",
@@ -101,11 +100,10 @@ func runInit(cmd *cobra.Command, args []string) error {
 				},
 			},
 			"opencode": {
-				Path:                       "~/.config/opencode",
-				Structure:                  "flat",
+				Path:                       "~/.opencode",
 				GenerateCommandsFromSkills: true,
 				Mappings: map[string]string{
-					"allowed_tools": "tools",
+					"allowed-tools": "tools",
 				},
 				Variables: map[string]string{
 					"model_strong": "anthropic/claude-sonnet-4-5",

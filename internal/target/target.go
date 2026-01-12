@@ -17,48 +17,36 @@ type Target interface {
 	Write(art *artifact.Artifact) error
 }
 
-type NestedTarget struct {
+type HarnessTarget struct {
 	name     string
 	basePath string
 }
 
-type FlatTarget struct {
-	name     string
-	basePath string
-}
-
-func NewNested(basePath string) *NestedTarget {
-	return &NestedTarget{basePath: basePath}
-}
-
-func NewFlat(basePath string) *FlatTarget {
-	return &FlatTarget{basePath: basePath}
+func New(basePath string) *HarnessTarget {
+	return &HarnessTarget{basePath: basePath}
 }
 
 func NewFromConfig(name string, h config.Harness) Target {
 	path := config.ExpandPath(h.Path)
-	if h.Structure == "flat" {
-		return &FlatTarget{name: name, basePath: path}
-	}
-	return &NestedTarget{name: name, basePath: path}
+	return &HarnessTarget{name: name, basePath: path}
 }
 
-func (t *NestedTarget) Name() string { return t.name }
-func (t *NestedTarget) Path() string { return t.basePath }
+func (t *HarnessTarget) Name() string { return t.name }
+func (t *HarnessTarget) Path() string { return t.basePath }
 
-func (t *NestedTarget) TargetPath(art *artifact.Artifact) string {
+func (t *HarnessTarget) TargetPath(art *artifact.Artifact) string {
 	typeDir := artifact.TypeDirName(art.Type)
 	mainFile := artifact.MainFileName(art.Type)
 	return filepath.Join(t.basePath, typeDir, art.Name, mainFile)
 }
 
-func (t *NestedTarget) Exists(art *artifact.Artifact) (bool, string) {
+func (t *HarnessTarget) Exists(art *artifact.Artifact) (bool, string) {
 	path := t.TargetPath(art)
 	_, err := os.Stat(path)
 	return err == nil, path
 }
 
-func (t *NestedTarget) Write(art *artifact.Artifact) error {
+func (t *HarnessTarget) Write(art *artifact.Artifact) error {
 	targetPath := t.TargetPath(art)
 	targetDir := filepath.Dir(targetPath)
 
@@ -73,43 +61,6 @@ func (t *NestedTarget) Write(art *artifact.Artifact) error {
 
 	if art.IsDirectory && len(art.Resources) > 0 {
 		if err := copyResources(art.SourcePath, targetDir, art.Resources); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (t *FlatTarget) Name() string { return t.name }
-func (t *FlatTarget) Path() string { return t.basePath }
-
-func (t *FlatTarget) TargetPath(art *artifact.Artifact) string {
-	typeDir := artifact.TypeDirName(art.Type)
-	return filepath.Join(t.basePath, typeDir, art.Name+".md")
-}
-
-func (t *FlatTarget) Exists(art *artifact.Artifact) (bool, string) {
-	path := t.TargetPath(art)
-	_, err := os.Stat(path)
-	return err == nil, path
-}
-
-func (t *FlatTarget) Write(art *artifact.Artifact) error {
-	targetPath := t.TargetPath(art)
-	targetDir := filepath.Dir(targetPath)
-
-	if err := os.MkdirAll(targetDir, 0755); err != nil {
-		return err
-	}
-
-	content := art.Render()
-	if err := os.WriteFile(targetPath, []byte(content), 0644); err != nil {
-		return err
-	}
-
-	if art.IsDirectory && len(art.Resources) > 0 {
-		resourceDir := filepath.Join(targetDir, art.Name)
-		if err := copyResources(art.SourcePath, resourceDir, art.Resources); err != nil {
 			return err
 		}
 	}

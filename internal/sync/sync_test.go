@@ -50,7 +50,7 @@ description: Create spec
 		Harness: map[string]config.Harness{
 			"claude": {
 				Path:      targetDir,
-				Structure: "nested",
+				
 				Variables: map[string]string{
 					"model_strong": "opus",
 				},
@@ -194,7 +194,7 @@ description: TDD workflow
 		Harness: map[string]config.Harness{
 			"opencode": {
 				Path:                       targetDir,
-				Structure:                  "flat",
+				
 				GenerateCommandsFromSkills: true,
 			},
 		},
@@ -219,7 +219,7 @@ description: TDD workflow
 	}
 
 	// Check generated command exists
-	cmdPath := filepath.Join(targetDir, "commands", "code-test.md")
+	cmdPath := filepath.Join(targetDir, "commands", "code-test", "COMMAND.md")
 	content, err := os.ReadFile(cmdPath)
 	if err != nil {
 		t.Fatalf("generated command not written: %v", err)
@@ -240,7 +240,7 @@ func TestDetectConflicts(t *testing.T) {
 	os.MkdirAll(skillDir, 0755)
 	os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("existing"), 0644)
 
-	harness := config.Harness{Path: targetDir, Structure: "nested"}
+	harness := config.Harness{Path: targetDir}
 	conflicts := DetectFileConflicts(arts, "claude", harness)
 
 	if len(conflicts) != 1 {
