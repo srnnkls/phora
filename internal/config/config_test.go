@@ -128,34 +128,6 @@ func TestExpandPath(t *testing.T) {
 	}
 }
 
-func TestManifest(t *testing.T) {
-	configContent := `
-[manifest]
-skills = ["code-test", "code-debug"]
-commands = ["spec.create"]
-agents = ["tester"]
-`
-
-	tmpDir := t.TempDir()
-	configPath := filepath.Join(tmpDir, "tropos.toml")
-	os.WriteFile(configPath, []byte(configContent), 0644)
-
-	cfg, err := LoadFile(configPath)
-	if err != nil {
-		t.Fatalf("LoadFile() error = %v", err)
-	}
-
-	if len(cfg.Manifest.Skills) != 2 {
-		t.Errorf("Manifest.Skills = %v, want 2 items", cfg.Manifest.Skills)
-	}
-	if len(cfg.Manifest.Commands) != 1 {
-		t.Errorf("Manifest.Commands = %v, want 1 item", cfg.Manifest.Commands)
-	}
-	if len(cfg.Manifest.Agents) != 1 {
-		t.Errorf("Manifest.Agents = %v, want 1 item", cfg.Manifest.Agents)
-	}
-}
-
 func TestLoadWithDiscovery(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -195,5 +167,83 @@ project_name = "test"
 	}
 	if claude.Variables["project_name"] != "test" {
 		t.Error("project variable not set")
+	}
+}
+
+func TestMergeSources(t *testing.T) {
+	global := &Config{
+		Sources: []Source{
+			{Repo: "global/repo", Path: "skills"},
+		},
+		Harness: map[string]Harness{},
+	}
+
+	project := &Config{
+		Sources: []Source{
+			{Repo: "project/repo"},
+			{Repo: "global/repo", Path: "skills"}, // duplicate
+		},
+		Harness: map[string]Harness{},
+	}
+
+	merged := Merge(global, project)
+
+	if len(merged.Sources) != 2 {
+		t.Errorf("Sources length = %d, want 2 (deduplicated)", len(merged.Sources))
+	}
+
+	foundGlobal := false
+	foundProject := false
+	for _, src := range merged.Sources {
+		if src.Repo == "global/repo" && src.Path == "skills" {
+			foundGlobal = true
+		}
+		if src.Repo == "project/repo" {
+			foundProject = true
+		}
+	}
+	if !foundGlobal {
+		t.Error("global source not found in merged config")
+	}
+	if !foundProject {
+		t.Error("project source not found in merged config")
+	}
+}
+
+func TestLoadSources(t *testing.T) {
+	configContent := `
+[[sources]]
+repo = "owner/repo"
+path = "skills/claude"
+ref = "v1.0"
+
+[[sources]]
+repo = "another/repo"
+`
+
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "tropos.toml")
+	os.WriteFile(configPath, []byte(configContent), 0644)
+
+	cfg, err := LoadFile(configPath)
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+
+	if len(cfg.Sources) != 2 {
+		t.Fatalf("Sources length = %d, want 2", len(cfg.Sources))
+	}
+
+	if cfg.Sources[0].Repo != "owner/repo" {
+		t.Errorf("Sources[0].Repo = %q, want %q", cfg.Sources[0].Repo, "owner/repo")
+	}
+	if cfg.Sources[0].Path != "skills/claude" {
+		t.Errorf("Sources[0].Path = %q, want %q", cfg.Sources[0].Path, "skills/claude")
+	}
+	if cfg.Sources[0].Ref != "v1.0" {
+		t.Errorf("Sources[0].Ref = %q, want %q", cfg.Sources[0].Ref, "v1.0")
+	}
+	if cfg.Sources[1].Repo != "another/repo" {
+		t.Errorf("Sources[1].Repo = %q, want %q", cfg.Sources[1].Repo, "another/repo")
 	}
 }

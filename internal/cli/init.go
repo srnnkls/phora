@@ -7,8 +7,8 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/spf13/cobra"
-	"github.com/srnnkls/tropos/internal/artifact"
 	"github.com/srnnkls/tropos/internal/config"
+	"github.com/srnnkls/tropos/internal/manifest"
 )
 
 var initCmd = &cobra.Command{
@@ -24,67 +24,42 @@ func runInit(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	artifactTypes := []string{"skills", "commands", "agents"}
+
+	// Generate manifest
+	m, err := manifest.Generate(cwd, artifactTypes)
+	if err != nil {
+		return fmt.Errorf("generate manifest: %w", err)
+	}
+
+	manifestDir := filepath.Join(cwd, manifest.Dir)
+	if err := os.MkdirAll(manifestDir, 0755); err != nil {
+		return fmt.Errorf("create manifest dir: %w", err)
+	}
+
+	manifestPath := manifest.FilePath(cwd)
+	if err := m.Write(manifestPath); err != nil {
+		return fmt.Errorf("write manifest: %w", err)
+	}
+
+	fmt.Printf("Created %s/%s\n", manifest.Dir, manifest.FileName)
+	fmt.Printf("  Skills:   %d\n", len(m.Skills))
+	fmt.Printf("  Commands: %d\n", len(m.Commands))
+	fmt.Printf("  Agents:   %d\n", len(m.Agents))
+
+	// Generate config if it doesn't exist
 	configPath := filepath.Join(cwd, "tropos.toml")
 	if _, err := os.Stat(configPath); err == nil {
-		return fmt.Errorf("tropos.toml already exists")
+		return nil
 	}
 
-	// Discover artifacts
-	var skills, commands, agents []string
-
-	for _, typeDir := range []string{"skills", "commands", "agents"} {
-		dir := filepath.Join(cwd, typeDir)
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			continue
-		}
-
-		artType := artifact.TypeFromPath(typeDir + "/x")
-
-		for _, entry := range entries {
-			name := entry.Name()
-
-			if entry.IsDir() {
-				mainFile := artifact.MainFileName(artType)
-				mainPath := filepath.Join(dir, name, mainFile)
-				if _, err := os.Stat(mainPath); err == nil {
-					switch typeDir {
-					case "skills":
-						skills = append(skills, name)
-					case "commands":
-						commands = append(commands, name)
-					case "agents":
-						agents = append(agents, name)
-					}
-				}
-			} else if filepath.Ext(name) == ".md" {
-				baseName := name[:len(name)-3]
-				switch typeDir {
-				case "skills":
-					skills = append(skills, baseName)
-				case "commands":
-					commands = append(commands, baseName)
-				case "agents":
-					agents = append(agents, baseName)
-				}
-			}
-		}
-	}
-
-	// Generate config
 	cfg := struct {
-		Manifest         config.Manifest           `toml:"manifest"`
 		DefaultHarnesses []string                  `toml:"default_harnesses"`
 		DefaultArtifacts []string                  `toml:"default_artifacts"`
 		Harness          map[string]config.Harness `toml:"harness"`
 	}{
-		Manifest: config.Manifest{
-			Skills:   skills,
-			Commands: commands,
-			Agents:   agents,
-		},
 		DefaultHarnesses: []string{"claude"},
-		DefaultArtifacts: []string{"skills", "commands", "agents"},
+		DefaultArtifacts: artifactTypes,
 		Harness: map[string]config.Harness{
 			"claude": {
 				Path: "~/.claude",
@@ -118,10 +93,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	fmt.Printf("Created tropos.toml\n")
-	fmt.Printf("  Skills:   %d\n", len(skills))
-	fmt.Printf("  Commands: %d\n", len(commands))
-	fmt.Printf("  Agents:   %d\n", len(agents))
+	fmt.Println("Created tropos.toml")
 
 	return nil
 }

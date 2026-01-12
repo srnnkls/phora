@@ -14,6 +14,8 @@ import (
 var (
 	installHarnesses []string
 	installRef       string
+	installPath      string
+	installLocal     bool
 )
 
 var installCmd = &cobra.Command{
@@ -27,6 +29,8 @@ var installCmd = &cobra.Command{
 func init() {
 	installCmd.Flags().StringSliceVar(&installHarnesses, "harness", nil, "Target harnesses (default: all enabled)")
 	installCmd.Flags().StringVar(&installRef, "ref", "main", "Branch, tag, or commit")
+	installCmd.Flags().StringVar(&installPath, "path", "", "Subdirectory within repo containing artifacts")
+	installCmd.Flags().BoolVar(&installLocal, "local", false, "Save source to local tropos.toml instead of global config")
 }
 
 func runInstall(cmd *cobra.Command, args []string) error {
@@ -52,22 +56,25 @@ func runInstall(cmd *cobra.Command, args []string) error {
 	}
 
 	// Clone/update repo
-	fmt.Printf("Cloning %s to %s...\n", repoStr, repoSrc.LocalPath())
-
-	// For now, check if already cloned
 	localPath := repoSrc.LocalPath()
 	if _, err := os.Stat(localPath); os.IsNotExist(err) {
-		// Create directory and inform user to clone manually
-		if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
-			return err
-		}
-		fmt.Printf("\nPlease clone manually:\n")
-		fmt.Printf("  git clone https://github.com/%s.git %s\n\n", repoStr, localPath)
-		return fmt.Errorf("repo not cloned yet")
+		fmt.Printf("Cloning %s to %s...\n", repoStr, localPath)
+	} else {
+		fmt.Printf("Updating %s...\n", repoStr)
+	}
+
+	if err := repoSrc.Clone(); err != nil {
+		return fmt.Errorf("clone/update repo: %w", err)
+	}
+
+	// Determine source path (repo root or subdirectory)
+	sourcePath := localPath
+	if installPath != "" {
+		sourcePath = filepath.Join(localPath, installPath)
 	}
 
 	// Load repo config if present
-	repoCfg, err := config.Load(localPath, globalConfigPath)
+	repoCfg, err := config.Load(sourcePath, globalConfigPath)
 	if err != nil {
 		return fmt.Errorf("load repo config: %w", err)
 	}
@@ -80,7 +87,7 @@ func runInstall(cmd *cobra.Command, args []string) error {
 
 	// Sync
 	opts := sync.Options{
-		SourcePaths: []string{localPath},
+		SourcePaths: []string{sourcePath},
 		Targets:     targets,
 	}
 
@@ -97,6 +104,29 @@ func runInstall(cmd *cobra.Command, args []string) error {
 	if result.Skipped > 0 {
 		fmt.Printf("Skipped %d (already exist)\n", result.Skipped)
 	}
+
+	// Save source to config
+	src := config.Source{
+		Repo: repoStr,
+		Path: installPath,
+		Ref:  installRef,
+	}
+
+	var configPath string
+	if installLocal {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return fmt.Errorf("get working directory: %w", err)
+		}
+		configPath = filepath.Join(cwd, "tropos.toml")
+	} else {
+		configPath = globalConfigPath
+	}
+
+	if err := config.AddSource(configPath, src); err != nil {
+		return fmt.Errorf("save source to config: %w", err)
+	}
+	fmt.Printf("Added source to %s\n", configPath)
 
 	return nil
 }

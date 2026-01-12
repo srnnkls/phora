@@ -134,19 +134,21 @@ func TestLocalSourceEmptyDir(t *testing.T) {
 func TestRepoSourceParseRepoString(t *testing.T) {
 	tests := []struct {
 		input     string
+		wantHost  string
 		wantOwner string
 		wantRepo  string
 	}{
-		{"srnnkls/tropos", "srnnkls", "tropos"},
-		{"org/some-repo", "org", "some-repo"},
+		{"srnnkls/tropos", "github.com", "srnnkls", "tropos"},
+		{"github.com/org/repo", "github.com", "org", "repo"},
+		{"gitlab.com/org/repo", "gitlab.com", "org", "repo"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
-			owner, repo := ParseRepoString(tt.input)
-			if owner != tt.wantOwner || repo != tt.wantRepo {
-				t.Errorf("ParseRepoString(%q) = %q, %q; want %q, %q",
-					tt.input, owner, repo, tt.wantOwner, tt.wantRepo)
+			host, owner, repo := ParseRepoString(tt.input)
+			if host != tt.wantHost || owner != tt.wantOwner || repo != tt.wantRepo {
+				t.Errorf("ParseRepoString(%q) = %q, %q, %q; want %q, %q, %q",
+					tt.input, host, owner, repo, tt.wantHost, tt.wantOwner, tt.wantRepo)
 			}
 		})
 	}
@@ -154,12 +156,13 @@ func TestRepoSourceParseRepoString(t *testing.T) {
 
 func TestRepoSourceDataDir(t *testing.T) {
 	src := &RepoSource{
+		Host:    "github.com",
 		Owner:   "srnnkls",
 		Repo:    "tropos",
 		DataDir: "/home/user/.local/share/tropos/repos",
 	}
 
-	expected := "/home/user/.local/share/tropos/repos/srnnkls/tropos"
+	expected := "/home/user/.local/share/tropos/repos/github.com/srnnkls/tropos"
 	if src.LocalPath() != expected {
 		t.Errorf("LocalPath() = %q, want %q", src.LocalPath(), expected)
 	}

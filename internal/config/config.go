@@ -9,25 +9,25 @@ import (
 )
 
 type Config struct {
-	DefaultHarnesses []string           `toml:"default_harnesses"`
-	DefaultArtifacts []string           `toml:"default_artifacts"`
-	Harness          map[string]Harness `toml:"harness"`
-	Manifest         Manifest           `toml:"manifest"`
+	Sources          []Source           `toml:"sources,omitempty"`
+	DefaultHarnesses []string           `toml:"default_harnesses,omitempty"`
+	DefaultArtifacts []string           `toml:"default_artifacts,omitempty"`
+	Harness          map[string]Harness `toml:"harness,omitempty"`
+}
+
+type Source struct {
+	Repo string `toml:"repo"`
+	Path string `toml:"path,omitempty"`
+	Ref  string `toml:"ref,omitempty"`
 }
 
 type Harness struct {
-	Path                       string            `toml:"path"`
-	GenerateCommandsFromSkills bool              `toml:"generate_commands_from_skills"`
-	Mappings                   map[string]string `toml:"mappings"`
-	Variables                  map[string]string `toml:"variables"`
-	Include                    []string          `toml:"include"`
-	Exclude                    []string          `toml:"exclude"`
-}
-
-type Manifest struct {
-	Skills   []string `toml:"skills"`
-	Commands []string `toml:"commands"`
-	Agents   []string `toml:"agents"`
+	Path                       string            `toml:"path,omitempty"`
+	GenerateCommandsFromSkills bool              `toml:"generate_commands_from_skills,omitempty"`
+	Mappings                   map[string]string `toml:"mappings,omitempty"`
+	Variables                  map[string]string `toml:"variables,omitempty"`
+	Include                    []string          `toml:"include,omitempty"`
+	Exclude                    []string          `toml:"exclude,omitempty"`
 }
 
 func LoadFile(path string) (*Config, error) {
@@ -81,10 +81,10 @@ func Load(projectDir, globalConfigPath string) (*Config, error) {
 
 func Merge(global, project *Config) *Config {
 	result := &Config{
+		Sources:          append([]Source{}, global.Sources...),
 		DefaultHarnesses: global.DefaultHarnesses,
 		DefaultArtifacts: global.DefaultArtifacts,
 		Harness:          make(map[string]Harness),
-		Manifest:         global.Manifest,
 	}
 
 	for name, harness := range global.Harness {
@@ -112,14 +112,10 @@ func Merge(global, project *Config) *Config {
 		result.DefaultArtifacts = project.DefaultArtifacts
 	}
 
-	if len(project.Manifest.Skills) > 0 {
-		result.Manifest.Skills = project.Manifest.Skills
-	}
-	if len(project.Manifest.Commands) > 0 {
-		result.Manifest.Commands = project.Manifest.Commands
-	}
-	if len(project.Manifest.Agents) > 0 {
-		result.Manifest.Agents = project.Manifest.Agents
+	for _, src := range project.Sources {
+		if !containsSource(result.Sources, src) {
+			result.Sources = append(result.Sources, src)
+		}
 	}
 
 	for name, harness := range project.Harness {
@@ -173,4 +169,13 @@ func appendUnique(slice []string, items ...string) []string {
 		}
 	}
 	return slice
+}
+
+func containsSource(sources []Source, src Source) bool {
+	for _, s := range sources {
+		if s.Repo == src.Repo && s.Path == src.Path {
+			return true
+		}
+	}
+	return false
 }

@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/srnnkls/tropos/internal/artifact"
 )
 
@@ -22,6 +24,7 @@ type LocalSource struct {
 }
 
 type RepoSource struct {
+	Host          string
 	Owner         string
 	Repo          string
 	Ref           string
@@ -47,16 +50,20 @@ func (s *LocalSource) Discover() ([]*artifact.Artifact, error) {
 	return artifact.Discover(s.path, s.artifactTypes)
 }
 
-func ParseRepoString(repo string) (owner, name string) {
-	parts := strings.SplitN(repo, "/", 2)
-	if len(parts) != 2 {
-		return "", repo
+func ParseRepoString(repo string) (host, owner, name string) {
+	parts := strings.Split(repo, "/")
+	switch len(parts) {
+	case 3:
+		return parts[0], parts[1], parts[2]
+	case 2:
+		return "github.com", parts[0], parts[1]
+	default:
+		return "github.com", "", repo
 	}
-	return parts[0], parts[1]
 }
 
 func NewRepo(repoStr, ref, dataDir string, artifactTypes []string) *RepoSource {
-	owner, repo := ParseRepoString(repoStr)
+	host, owner, repo := ParseRepoString(repoStr)
 	if ref == "" {
 		ref = "main"
 	}
@@ -64,6 +71,7 @@ func NewRepo(repoStr, ref, dataDir string, artifactTypes []string) *RepoSource {
 		artifactTypes = []string{"skills", "commands", "agents"}
 	}
 	return &RepoSource{
+		Host:          host,
 		Owner:         owner,
 		Repo:          repo,
 		Ref:           ref,
@@ -77,12 +85,20 @@ func (s *RepoSource) Name() string {
 }
 
 func (s *RepoSource) LocalPath() string {
-	return filepath.Join(s.DataDir, s.Owner, s.Repo)
+	return filepath.Join(s.DataDir, s.Host, s.Owner, s.Repo)
+}
+
+func (s *RepoSource) RepoURL() string {
+	return fmt.Sprintf("https://%s/%s/%s.git", s.Host, s.Owner, s.Repo)
 }
 
 func (s *RepoSource) ManifestURL() string {
-	return fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/%s/tropos.toml",
-		s.Owner, s.Repo, s.Ref)
+	if s.Host == "github.com" {
+		return fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/%s/.tropos/manifest.yaml",
+			s.Owner, s.Repo, s.Ref)
+	}
+	return fmt.Sprintf("https://%s/%s/%s/-/raw/%s/.tropos/manifest.yaml",
+		s.Host, s.Owner, s.Repo, s.Ref)
 }
 
 func (s *RepoSource) FetchManifest() ([]byte, error) {
@@ -111,22 +127,53 @@ func (s *RepoSource) Clone() error {
 	localPath := s.LocalPath()
 
 	if _, err := os.Stat(localPath); err == nil {
-		return s.Pull()
+		if err := s.Pull(); err != nil {
+			if err := os.RemoveAll(localPath); err != nil {
+				return fmt.Errorf("remove stale clone: %w", err)
+			}
+			return s.clone()
+		}
+		return nil
 	}
+
+	return s.clone()
+}
+
+func (s *RepoSource) clone() error {
+	localPath := s.LocalPath()
 
 	if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
 		return err
 	}
 
-	// Use git sparse-checkout for efficiency
-	// For now, simple clone
-	repoURL := fmt.Sprintf("https://github.com/%s/%s.git", s.Owner, s.Repo)
-
-	// This is a placeholder - actual implementation would use go-git
-	_ = repoURL
-	return fmt.Errorf("clone not implemented - use go-git")
+	_, err := git.PlainClone(localPath, false, &git.CloneOptions{
+		URL:           s.RepoURL(),
+		ReferenceName: plumbing.NewBranchReferenceName(s.Ref),
+		SingleBranch:  true,
+		Depth:         1,
+	})
+	return err
 }
 
 func (s *RepoSource) Pull() error {
-	return fmt.Errorf("pull not implemented - use go-git")
+	localPath := s.LocalPath()
+
+	repo, err := git.PlainOpen(localPath)
+	if err != nil {
+		return err
+	}
+
+	wt, err := repo.Worktree()
+	if err != nil {
+		return err
+	}
+
+	err = wt.Pull(&git.PullOptions{
+		ReferenceName: plumbing.NewBranchReferenceName(s.Ref),
+		SingleBranch:  true,
+	})
+	if err == git.NoErrAlreadyUpToDate {
+		return nil
+	}
+	return err
 }
