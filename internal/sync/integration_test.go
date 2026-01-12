@@ -93,14 +93,9 @@ Runs tests and reports results.
 	cfg := &config.Config{
 		DefaultHarnesses: []string{"claude", "opencode"},
 		DefaultArtifacts: []string{"skills", "commands", "agents"},
-		Conflict: config.ConflictConfig{
-			FileExists:        "error",
-			DuplicateArtifact: "error",
-		},
 		Harness: map[string]config.Harness{
 			"claude": {
 				Path:                       claudeTarget,
-				
 				GenerateCommandsFromSkills: false,
 				Variables: map[string]string{
 					"model_strong": "opus",
@@ -268,29 +263,25 @@ description: New version
 	cfg := &config.Config{
 		DefaultHarnesses: []string{"test"},
 		DefaultArtifacts: []string{"skills"},
-		Conflict: config.ConflictConfig{
-			FileExists: "error",
-		},
 		Harness: map[string]config.Harness{
 			"test": {
-				Path:      targetDir,
-				
+				Path: targetDir,
 			},
 		},
 	}
 
-	// Should fail without force
+	// Without force, conflicts should be skipped
 	opts := sync.Options{
 		SourcePaths: []string{srcDir},
 		Targets:     []string{"test"},
 	}
 
 	result, err := sync.Sync(cfg, opts)
-	if err == nil {
-		t.Error("Sync() should error on conflict")
+	if err != nil {
+		t.Fatalf("Sync() error = %v", err)
 	}
-	if len(result.Conflicts) != 1 {
-		t.Errorf("Conflicts = %d, want 1", len(result.Conflicts))
+	if result.Skipped != 1 {
+		t.Errorf("Skipped = %d, want 1", result.Skipped)
 	}
 
 	// Verify old content unchanged

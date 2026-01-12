@@ -11,15 +11,14 @@ file_exists = "error"
 duplicate_artifact = "error"
 
 [harness.claude]
-path = "/tmp/tropos-test-claude"
-generate_commands_from_skills = false
+path = "tmp/tropos-test-claude"
 
 [harness.claude.variables]
 model_strong = "opus"
 model_weak = "haiku"
 
 [harness.opencode]
-path = "/tmp/tropos-test-opencode"
+path = "tmp/tropos-test-opencode"
 generate_commands_from_skills = true
 
 [harness.opencode.mappings]

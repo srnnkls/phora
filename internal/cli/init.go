@@ -73,11 +73,10 @@ func runInit(cmd *cobra.Command, args []string) error {
 
 	// Generate config
 	cfg := struct {
-		Manifest         config.Manifest            `toml:"manifest"`
-		DefaultHarnesses []string                   `toml:"default_harnesses"`
-		DefaultArtifacts []string                   `toml:"default_artifacts"`
-		Conflict         config.ConflictConfig      `toml:"conflict"`
-		Harness          map[string]config.Harness  `toml:"harness"`
+		Manifest         config.Manifest           `toml:"manifest"`
+		DefaultHarnesses []string                  `toml:"default_harnesses"`
+		DefaultArtifacts []string                  `toml:"default_artifacts"`
+		Harness          map[string]config.Harness `toml:"harness"`
 	}{
 		Manifest: config.Manifest{
 			Skills:   skills,
@@ -86,14 +85,9 @@ func runInit(cmd *cobra.Command, args []string) error {
 		},
 		DefaultHarnesses: []string{"claude"},
 		DefaultArtifacts: []string{"skills", "commands", "agents"},
-		Conflict: config.ConflictConfig{
-			FileExists:        "error",
-			DuplicateArtifact: "error",
-		},
 		Harness: map[string]config.Harness{
 			"claude": {
-				Path:                       "~/.claude",
-				GenerateCommandsFromSkills: false,
+				Path: "~/.claude",
 				Variables: map[string]string{
 					"model_strong": "opus",
 					"model_weak":   "haiku",

@@ -13,15 +13,8 @@ func TestLoadConfig(t *testing.T) {
 default_harnesses = ["claude", "opencode"]
 default_artifacts = ["skills", "commands", "agents"]
 
-[conflict]
-file_exists = "error"
-duplicate_artifact = "error"
-
 [harness.claude]
 path = "~/.claude"
-generate_commands_from_skills = false
-
-[harness.claude.mappings]
 
 [harness.claude.variables]
 model_strong = "opus"
@@ -53,10 +46,6 @@ model_weak = "anthropic/claude-haiku-4-5"
 		t.Errorf("DefaultHarnesses = %v, want 2 items", cfg.DefaultHarnesses)
 	}
 
-	if cfg.Conflict.FileExists != "error" {
-		t.Errorf("Conflict.FileExists = %q, want %q", cfg.Conflict.FileExists, "error")
-	}
-
 	claude, ok := cfg.Harness["claude"]
 	if !ok {
 		t.Fatal("missing claude harness")
@@ -81,10 +70,6 @@ func TestMergeConfigs(t *testing.T) {
 	global := &Config{
 		DefaultHarnesses: []string{"claude"},
 		DefaultArtifacts: []string{"skills"},
-		Conflict: ConflictConfig{
-			FileExists:        "error",
-			DuplicateArtifact: "error",
-		},
 		Harness: map[string]Harness{
 			"claude": {
 				Path: "~/.claude",
@@ -97,9 +82,6 @@ func TestMergeConfigs(t *testing.T) {
 
 	project := &Config{
 		DefaultHarnesses: []string{"claude", "opencode"},
-		Conflict: ConflictConfig{
-			FileExists: "overwrite",
-		},
 		Harness: map[string]Harness{
 			"claude": {
 				Variables: map[string]string{
@@ -113,10 +95,6 @@ func TestMergeConfigs(t *testing.T) {
 
 	if len(merged.DefaultHarnesses) != 2 {
 		t.Errorf("merged.DefaultHarnesses = %v, want 2 items", merged.DefaultHarnesses)
-	}
-
-	if merged.Conflict.FileExists != "overwrite" {
-		t.Errorf("merged.Conflict.FileExists = %q, want %q", merged.Conflict.FileExists, "overwrite")
 	}
 
 	claude := merged.Harness["claude"]

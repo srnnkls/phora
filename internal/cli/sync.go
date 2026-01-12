@@ -14,7 +14,6 @@ var (
 	syncSources     []string
 	syncTargets     []string
 	syncDryRun      bool
-	syncForce       bool
 	syncInteractive bool
 	syncSkip        bool
 )
@@ -30,9 +29,8 @@ func init() {
 	syncCmd.Flags().StringSliceVar(&syncSources, "source", nil, "Source paths (default: current directory)")
 	syncCmd.Flags().StringSliceVar(&syncTargets, "target", nil, "Target harnesses (default: all enabled)")
 	syncCmd.Flags().BoolVar(&syncDryRun, "dry-run", false, "Show what would be synced")
-	syncCmd.Flags().BoolVar(&syncForce, "force", false, "Overwrite existing files")
 	syncCmd.Flags().BoolVarP(&syncInteractive, "interactive", "i", false, "Prompt for each conflict")
-	syncCmd.Flags().BoolVar(&syncSkip, "skip", false, "Skip conflicts without prompting (non-interactive)")
+	syncCmd.Flags().BoolVar(&syncSkip, "skip", false, "Skip existing files instead of updating")
 }
 
 func runSync(cmd *cobra.Command, args []string) error {
@@ -60,7 +58,6 @@ func runSync(cmd *cobra.Command, args []string) error {
 		SourcePaths: sources,
 		Targets:     targets,
 		DryRun:      syncDryRun,
-		Force:       syncForce,
 	}
 
 	if syncDryRun {
@@ -82,15 +79,16 @@ func runSync(cmd *cobra.Command, args []string) error {
 	// Phase 2: Resolve conflicts
 	resolutions := make(sync.ResolutionMap)
 
-	if len(allConflicts) > 0 && !syncForce {
+	if len(allConflicts) > 0 {
 		if syncSkip {
-			// Skip all conflicts silently
+			// Skip all conflicts
 			for _, c := range allConflicts {
 				key := sync.ConflictKey(c.Target, c.Artifact.Name)
 				resolutions[key] = sync.ResolutionSkip
 			}
 			fmt.Printf("Skipping %d conflict(s)\n", len(allConflicts))
-		} else if shouldPrompt() {
+		} else if syncInteractive && shouldPrompt() {
+			// Interactive mode: prompt for each conflict
 			prompter := NewPrompter()
 			promptResult, err := prompter.ResolveConflicts(allConflicts)
 			if err != nil {
@@ -119,12 +117,12 @@ func runSync(cmd *cobra.Command, args []string) error {
 				fmt.Printf("Saved %d exclusion(s) to tropos.toml\n", savedExclusions)
 			}
 		} else {
-			// Non-interactive with conflicts: report and exit
-			fmt.Printf("\n%d conflict(s) detected - use --force to overwrite, --skip to skip, or -i for interactive:\n", len(allConflicts))
+			// Default: overwrite all conflicts (tropos-managed files)
 			for _, c := range allConflicts {
-				fmt.Printf("  - %s (%s): %s\n", c.Artifact.Name, c.Target, c.Path)
+				key := sync.ConflictKey(c.Target, c.Artifact.Name)
+				resolutions[key] = sync.ResolutionOverwrite
 			}
-			return fmt.Errorf("conflicts detected")
+			fmt.Printf("Updating %d existing file(s)\n", len(allConflicts))
 		}
 	}
 

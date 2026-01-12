@@ -11,14 +11,8 @@ import (
 type Config struct {
 	DefaultHarnesses []string           `toml:"default_harnesses"`
 	DefaultArtifacts []string           `toml:"default_artifacts"`
-	Conflict         ConflictConfig     `toml:"conflict"`
 	Harness          map[string]Harness `toml:"harness"`
 	Manifest         Manifest           `toml:"manifest"`
-}
-
-type ConflictConfig struct {
-	FileExists        string `toml:"file_exists"`
-	DuplicateArtifact string `toml:"duplicate_artifact"`
 }
 
 type Harness struct {
@@ -89,7 +83,6 @@ func Merge(global, project *Config) *Config {
 	result := &Config{
 		DefaultHarnesses: global.DefaultHarnesses,
 		DefaultArtifacts: global.DefaultArtifacts,
-		Conflict:         global.Conflict,
 		Harness:          make(map[string]Harness),
 		Manifest:         global.Manifest,
 	}
@@ -117,12 +110,6 @@ func Merge(global, project *Config) *Config {
 	}
 	if len(project.DefaultArtifacts) > 0 {
 		result.DefaultArtifacts = project.DefaultArtifacts
-	}
-	if project.Conflict.FileExists != "" {
-		result.Conflict.FileExists = project.Conflict.FileExists
-	}
-	if project.Conflict.DuplicateArtifact != "" {
-		result.Conflict.DuplicateArtifact = project.Conflict.DuplicateArtifact
 	}
 
 	if len(project.Manifest.Skills) > 0 {

@@ -7,6 +7,7 @@ import (
 
 	"github.com/srnnkls/tropos/internal/artifact"
 	"github.com/srnnkls/tropos/internal/config"
+	"github.com/srnnkls/tropos/internal/lockfile"
 )
 
 func setupSyncTest(t *testing.T) (srcDir, targetDir string, cfg *config.Config) {
@@ -43,14 +44,9 @@ description: Create spec
 	cfg = &config.Config{
 		DefaultHarnesses: []string{"claude"},
 		DefaultArtifacts: []string{"skills", "commands"},
-		Conflict: config.ConflictConfig{
-			FileExists:        "error",
-			DuplicateArtifact: "error",
-		},
 		Harness: map[string]config.Harness{
 			"claude": {
-				Path:      targetDir,
-				
+				Path: targetDir,
 				Variables: map[string]string{
 					"model_strong": "opus",
 				},
@@ -119,10 +115,10 @@ func TestSyncDryRun(t *testing.T) {
 	}
 }
 
-func TestSyncConflictFileExists(t *testing.T) {
+func TestSyncConflictFileExists_Unmanaged(t *testing.T) {
 	srcDir, targetDir, cfg := setupSyncTest(t)
 
-	// Pre-create target file
+	// Pre-create target file (NOT in lock file = user-created = conflict)
 	skillDir := filepath.Join(targetDir, "skills", "code-test")
 	os.MkdirAll(skillDir, 0755)
 	os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("existing"), 0644)
@@ -133,12 +129,57 @@ func TestSyncConflictFileExists(t *testing.T) {
 	}
 
 	result, err := Sync(cfg, opts)
-	if err == nil {
-		t.Fatal("Sync() should error on conflict")
+	if err != nil {
+		t.Fatalf("Sync() error = %v", err)
 	}
 
-	if len(result.Conflicts) == 0 {
-		t.Error("should have conflicts")
+	// New behavior: unmanaged files (not in lock file) are skipped
+	if result.Skipped != 1 {
+		t.Errorf("Skipped = %d, want 1 (unmanaged file)", result.Skipped)
+	}
+
+	// Verify file was NOT overwritten
+	content, _ := os.ReadFile(filepath.Join(skillDir, "SKILL.md"))
+	if string(content) != "existing" {
+		t.Error("unmanaged file should not have been overwritten")
+	}
+}
+
+func TestSyncConflictFileExists_Managed(t *testing.T) {
+	srcDir, targetDir, cfg := setupSyncTest(t)
+
+	// Pre-create target file
+	skillDir := filepath.Join(targetDir, "skills", "code-test")
+	os.MkdirAll(skillDir, 0755)
+	os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("existing"), 0644)
+
+	// Add to lock file (managed by tropos)
+	lf := &lockfile.LockFile{
+		Files: []lockfile.FileEntry{
+			{Path: "skills/code-test/SKILL.md", Artifact: "code-test", Type: "skill"},
+		},
+	}
+	lf.Save(targetDir)
+
+	opts := Options{
+		SourcePaths: []string{srcDir},
+		Targets:     []string{"claude"},
+	}
+
+	result, err := Sync(cfg, opts)
+	if err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+
+	// Managed files are overwritten (no conflict)
+	if result.Synced < 1 {
+		t.Errorf("Synced = %d, want >= 1", result.Synced)
+	}
+
+	// Verify file was overwritten
+	content, _ := os.ReadFile(filepath.Join(skillDir, "SKILL.md"))
+	if string(content) == "existing" {
+		t.Error("managed file should have been overwritten")
 	}
 }
 
@@ -230,6 +271,38 @@ description: TDD workflow
 	}
 }
 
+func TestSyncCreatesLockFile(t *testing.T) {
+	srcDir, targetDir, cfg := setupSyncTest(t)
+
+	opts := Options{
+		SourcePaths: []string{srcDir},
+		Targets:     []string{"claude"},
+	}
+
+	_, err := Sync(cfg, opts)
+	if err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+
+	// Verify lock file was created
+	lf, err := lockfile.Load(targetDir)
+	if err != nil {
+		t.Fatalf("Failed to load lock file: %v", err)
+	}
+
+	if len(lf.Files) != 2 {
+		t.Errorf("Lock file has %d entries, want 2", len(lf.Files))
+	}
+
+	// Verify entries
+	if !lf.IsManaged("skills/code-test/SKILL.md") {
+		t.Error("skills/code-test/SKILL.md should be in lock file")
+	}
+	if !lf.IsManaged("commands/spec.create/COMMAND.md") {
+		t.Error("commands/spec.create/COMMAND.md should be in lock file")
+	}
+}
+
 func TestDetectConflicts(t *testing.T) {
 	arts := []*artifact.Artifact{
 		{Name: "test", Type: artifact.TypeSkill},
@@ -241,10 +314,34 @@ func TestDetectConflicts(t *testing.T) {
 	os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("existing"), 0644)
 
 	harness := config.Harness{Path: targetDir}
-	conflicts := DetectFileConflicts(arts, "claude", harness)
+	lf := &lockfile.LockFile{}
+	conflicts := DetectFileConflicts(arts, "claude", harness, lf)
 
 	if len(conflicts) != 1 {
 		t.Errorf("DetectFileConflicts() = %d conflicts, want 1", len(conflicts))
+	}
+}
+
+func TestDetectConflicts_ManagedFileNoConflict(t *testing.T) {
+	arts := []*artifact.Artifact{
+		{Name: "test", Type: artifact.TypeSkill},
+	}
+
+	targetDir := t.TempDir()
+	skillDir := filepath.Join(targetDir, "skills", "test")
+	os.MkdirAll(skillDir, 0755)
+	os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("existing"), 0644)
+
+	harness := config.Harness{Path: targetDir}
+	lf := &lockfile.LockFile{
+		Files: []lockfile.FileEntry{
+			{Path: "skills/test/SKILL.md", Artifact: "test", Type: "skill"},
+		},
+	}
+	conflicts := DetectFileConflicts(arts, "claude", harness, lf)
+
+	if len(conflicts) != 0 {
+		t.Errorf("DetectFileConflicts() = %d conflicts, want 0 (file is managed)", len(conflicts))
 	}
 }
 
