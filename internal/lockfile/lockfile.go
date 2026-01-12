@@ -58,6 +58,10 @@ func (l *LockFile) IsManaged(relativePath string) bool {
 	return false
 }
 
+func (l *LockFile) IsEmpty() bool {
+	return len(l.Files) == 0
+}
+
 func (l *LockFile) Add(entry FileEntry) {
 	for i, f := range l.Files {
 		if f.Path == entry.Path {

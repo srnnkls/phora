@@ -16,6 +16,7 @@ var (
 	installRef       string
 	installPath      string
 	installLocal     bool
+	installForce     bool
 )
 
 var installCmd = &cobra.Command{
@@ -31,6 +32,7 @@ func init() {
 	installCmd.Flags().StringVar(&installRef, "ref", "main", "Branch, tag, or commit")
 	installCmd.Flags().StringVar(&installPath, "path", "", "Subdirectory within repo containing artifacts")
 	installCmd.Flags().BoolVar(&installLocal, "local", false, "Save source to local tropos.toml instead of global config")
+	installCmd.Flags().BoolVarP(&installForce, "force", "f", false, "Overwrite existing unmanaged files")
 }
 
 func runInstall(cmd *cobra.Command, args []string) error {
@@ -79,10 +81,12 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("load repo config: %w", err)
 	}
 
-	// Determine targets
+	// Determine targets (all defined harnesses by default)
 	targets := installHarnesses
 	if len(targets) == 0 {
-		targets = repoCfg.DefaultHarnesses
+		for name := range repoCfg.Harness {
+			targets = append(targets, name)
+		}
 	}
 
 	// Sync
@@ -92,7 +96,53 @@ func runInstall(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("Syncing to %v...\n", targets)
-	result, err := sync.Sync(repoCfg, opts)
+
+	// Phase 1: Detect conflicts
+	detection, err := sync.Detect(repoCfg, opts)
+	if err != nil {
+		return err
+	}
+
+	// Collect conflicts and check for fresh installs
+	var allConflicts []sync.Conflict
+	var freshTargets []string
+	for _, det := range detection {
+		allConflicts = append(allConflicts, det.Conflicts...)
+		if det.LockFile.IsEmpty() {
+			freshTargets = append(freshTargets, det.Target)
+		}
+	}
+
+	// Warn about fresh installs
+	if len(freshTargets) > 0 {
+		fmt.Printf("First install to: %v (no lockfile found)\n", freshTargets)
+	}
+
+	// Phase 2: Handle conflicts
+	// Skip unmanaged existing files, overwrite if --force
+	resolutions := make(sync.ResolutionMap)
+	if len(allConflicts) > 0 {
+		if installForce {
+			for _, c := range allConflicts {
+				key := sync.ConflictKey(c.Target, c.Artifact.Name)
+				resolutions[key] = sync.ResolutionOverwrite
+			}
+			fmt.Printf("Overwriting %d existing file(s) (--force)\n", len(allConflicts))
+		} else {
+			fmt.Printf("Skipping %d existing file(s) not managed by tropos:\n", len(allConflicts))
+			for _, c := range allConflicts {
+				key := sync.ConflictKey(c.Target, c.Artifact.Name)
+				resolutions[key] = sync.ResolutionSkip
+				fmt.Printf("  %s: %s\n", c.Target, c.Artifact.Name)
+			}
+		}
+	}
+
+	// Phase 3: Apply
+	result, err := sync.Apply(repoCfg, detection, sync.ApplyOptions{
+		Options:     opts,
+		Resolutions: resolutions,
+	})
 	if err != nil {
 		return err
 	}
@@ -102,7 +152,7 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Generated %d command(s)\n", result.Generated)
 	}
 	if result.Skipped > 0 {
-		fmt.Printf("Skipped %d (already exist)\n", result.Skipped)
+		fmt.Printf("Skipped %d (excluded or already exist)\n", result.Skipped)
 	}
 
 	// Save source to config
