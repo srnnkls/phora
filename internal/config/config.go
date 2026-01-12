@@ -86,10 +86,15 @@ func Load(projectDir, globalConfigPath string) (*Config, error) {
 
 func Merge(global, project *Config) *Config {
 	result := &Config{
-		Sources:          append([]Source{}, global.Sources...),
+		Sources:          make(map[string]Source),
 		DefaultHarnesses: global.DefaultHarnesses,
 		DefaultArtifacts: global.DefaultArtifacts,
 		Harness:          make(map[string]Harness),
+	}
+
+	// Copy global sources
+	for name, src := range global.Sources {
+		result.Sources[name] = src
 	}
 
 	for name, harness := range global.Harness {
@@ -118,10 +123,9 @@ func Merge(global, project *Config) *Config {
 		result.DefaultArtifacts = project.DefaultArtifacts
 	}
 
-	for _, src := range project.Sources {
-		if !containsSource(result.Sources, src) {
-			result.Sources = append(result.Sources, src)
-		}
+	// Merge project sources (override global)
+	for name, src := range project.Sources {
+		result.Sources[name] = src
 	}
 
 	for name, harness := range project.Harness {
@@ -180,11 +184,3 @@ func appendUnique(slice []string, items ...string) []string {
 	return slice
 }
 
-func containsSource(sources []Source, src Source) bool {
-	for _, s := range sources {
-		if s.Repo == src.Repo && s.Path == src.Path {
-			return true
-		}
-	}
-	return false
-}

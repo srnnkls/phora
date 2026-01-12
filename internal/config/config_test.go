@@ -172,16 +172,16 @@ project_name = "test"
 
 func TestMergeSources(t *testing.T) {
 	global := &Config{
-		Sources: []Source{
-			{Repo: "global/repo", Path: "skills"},
+		Sources: map[string]Source{
+			"global/repo": {Repo: "https://github.com/global/repo.git", Path: "skills"},
 		},
 		Harness: map[string]Harness{},
 	}
 
 	project := &Config{
-		Sources: []Source{
-			{Repo: "project/repo"},
-			{Repo: "global/repo", Path: "skills"}, // duplicate
+		Sources: map[string]Source{
+			"project/repo": {Repo: "https://github.com/project/repo.git"},
+			"global/repo":  {Repo: "https://github.com/global/repo.git", Path: "updated"}, // override
 		},
 		Harness: map[string]Harness{},
 	}
@@ -189,36 +189,31 @@ func TestMergeSources(t *testing.T) {
 	merged := Merge(global, project)
 
 	if len(merged.Sources) != 2 {
-		t.Errorf("Sources length = %d, want 2 (deduplicated)", len(merged.Sources))
+		t.Errorf("Sources length = %d, want 2", len(merged.Sources))
 	}
 
-	foundGlobal := false
-	foundProject := false
-	for _, src := range merged.Sources {
-		if src.Repo == "global/repo" && src.Path == "skills" {
-			foundGlobal = true
-		}
-		if src.Repo == "project/repo" {
-			foundProject = true
-		}
-	}
-	if !foundGlobal {
+	globalSrc, ok := merged.Sources["global/repo"]
+	if !ok {
 		t.Error("global source not found in merged config")
 	}
-	if !foundProject {
+	if globalSrc.Path != "updated" {
+		t.Errorf("global source not overridden, Path = %q, want %q", globalSrc.Path, "updated")
+	}
+
+	if _, ok := merged.Sources["project/repo"]; !ok {
 		t.Error("project source not found in merged config")
 	}
 }
 
 func TestLoadSources(t *testing.T) {
 	configContent := `
-[[sources]]
-repo = "owner/repo"
+[sources."owner/repo"]
+repo = "https://github.com/owner/repo.git"
 path = "skills/claude"
 ref = "v1.0"
 
-[[sources]]
-repo = "another/repo"
+[sources."another/repo"]
+repo = "https://github.com/another/repo.git"
 `
 
 	tmpDir := t.TempDir()
@@ -234,16 +229,25 @@ repo = "another/repo"
 		t.Fatalf("Sources length = %d, want 2", len(cfg.Sources))
 	}
 
-	if cfg.Sources[0].Repo != "owner/repo" {
-		t.Errorf("Sources[0].Repo = %q, want %q", cfg.Sources[0].Repo, "owner/repo")
+	ownerRepo, ok := cfg.Sources["owner/repo"]
+	if !ok {
+		t.Fatal("owner/repo source not found")
 	}
-	if cfg.Sources[0].Path != "skills/claude" {
-		t.Errorf("Sources[0].Path = %q, want %q", cfg.Sources[0].Path, "skills/claude")
+	if ownerRepo.Repo != "https://github.com/owner/repo.git" {
+		t.Errorf("Sources[owner/repo].Repo = %q, want %q", ownerRepo.Repo, "https://github.com/owner/repo.git")
 	}
-	if cfg.Sources[0].Ref != "v1.0" {
-		t.Errorf("Sources[0].Ref = %q, want %q", cfg.Sources[0].Ref, "v1.0")
+	if ownerRepo.Path != "skills/claude" {
+		t.Errorf("Sources[owner/repo].Path = %q, want %q", ownerRepo.Path, "skills/claude")
 	}
-	if cfg.Sources[1].Repo != "another/repo" {
-		t.Errorf("Sources[1].Repo = %q, want %q", cfg.Sources[1].Repo, "another/repo")
+	if ownerRepo.Ref != "v1.0" {
+		t.Errorf("Sources[owner/repo].Ref = %q, want %q", ownerRepo.Ref, "v1.0")
+	}
+
+	anotherRepo, ok := cfg.Sources["another/repo"]
+	if !ok {
+		t.Fatal("another/repo source not found")
+	}
+	if anotherRepo.Repo != "https://github.com/another/repo.git" {
+		t.Errorf("Sources[another/repo].Repo = %q, want %q", anotherRepo.Repo, "https://github.com/another/repo.git")
 	}
 }

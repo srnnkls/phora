@@ -173,7 +173,7 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		configPath = globalConfigPath
 	}
 
-	if err := config.AddSource(configPath, src); err != nil {
+	if err := config.AddSource(configPath, repoStr, src); err != nil {
 		return fmt.Errorf("save source to config: %w", err)
 	}
 	fmt.Printf("Added source to %s\n", configPath)

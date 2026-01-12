@@ -82,11 +82,12 @@ func RemoveExclusion(path string, harnessName string, artifactName string) error
 }
 
 // AddSource adds a source to the config and saves it
-func AddSource(configPath string, src Source) error {
+func AddSource(configPath string, name string, src Source) error {
 	cfg, err := LoadFile(configPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			cfg = &Config{
+				Sources: make(map[string]Source),
 				Harness: make(map[string]Harness),
 			}
 		} else {
@@ -94,10 +95,10 @@ func AddSource(configPath string, src Source) error {
 		}
 	}
 
-	if containsSource(cfg.Sources, src) {
-		return nil
+	if cfg.Sources == nil {
+		cfg.Sources = make(map[string]Source)
 	}
 
-	cfg.Sources = append(cfg.Sources, src)
+	cfg.Sources[name] = src
 	return WriteFile(configPath, cfg)
 }

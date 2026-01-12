@@ -171,8 +171,8 @@ func TestAddSource(t *testing.T) {
 	}
 	WriteFile(path, cfg)
 
-	src := Source{Repo: "owner/repo", Path: "skills", Ref: "main"}
-	err := AddSource(path, src)
+	src := Source{Repo: "https://github.com/owner/repo.git", Path: "skills", Ref: "main"}
+	err := AddSource(path, "owner/repo", src)
 	if err != nil {
 		t.Fatalf("AddSource() error = %v", err)
 	}
@@ -181,33 +181,39 @@ func TestAddSource(t *testing.T) {
 	if len(loaded.Sources) != 1 {
 		t.Fatalf("Sources length = %d, want 1", len(loaded.Sources))
 	}
-	if loaded.Sources[0].Repo != "owner/repo" {
-		t.Errorf("Source.Repo = %q, want %q", loaded.Sources[0].Repo, "owner/repo")
+	if loaded.Sources["owner/repo"].Repo != "https://github.com/owner/repo.git" {
+		t.Errorf("Source.Repo = %q, want %q", loaded.Sources["owner/repo"].Repo, "https://github.com/owner/repo.git")
 	}
-	if loaded.Sources[0].Path != "skills" {
-		t.Errorf("Source.Path = %q, want %q", loaded.Sources[0].Path, "skills")
+	if loaded.Sources["owner/repo"].Path != "skills" {
+		t.Errorf("Source.Path = %q, want %q", loaded.Sources["owner/repo"].Path, "skills")
 	}
 }
 
-func TestAddSourceDuplicate(t *testing.T) {
+func TestAddSourceOverride(t *testing.T) {
 	tmpDir := t.TempDir()
 	path := filepath.Join(tmpDir, "tropos.toml")
 
 	cfg := &Config{
-		Sources: []Source{{Repo: "owner/repo", Path: "skills"}},
+		Sources: map[string]Source{
+			"owner/repo": {Repo: "https://github.com/owner/repo.git", Path: "skills"},
+		},
 		Harness: map[string]Harness{},
 	}
 	WriteFile(path, cfg)
 
-	src := Source{Repo: "owner/repo", Path: "skills", Ref: "v2"}
-	err := AddSource(path, src)
+	// Adding same name should override
+	src := Source{Repo: "https://github.com/owner/repo.git", Path: "skills", Ref: "v2"}
+	err := AddSource(path, "owner/repo", src)
 	if err != nil {
 		t.Fatalf("AddSource() error = %v", err)
 	}
 
 	loaded, _ := LoadFile(path)
 	if len(loaded.Sources) != 1 {
-		t.Errorf("Duplicate source added, length = %d, want 1", len(loaded.Sources))
+		t.Errorf("Source count = %d, want 1", len(loaded.Sources))
+	}
+	if loaded.Sources["owner/repo"].Ref != "v2" {
+		t.Errorf("Source.Ref = %q, want %q", loaded.Sources["owner/repo"].Ref, "v2")
 	}
 }
 
@@ -215,8 +221,8 @@ func TestAddSourceNewFile(t *testing.T) {
 	tmpDir := t.TempDir()
 	path := filepath.Join(tmpDir, "new-config.toml")
 
-	src := Source{Repo: "owner/repo"}
-	err := AddSource(path, src)
+	src := Source{Repo: "https://github.com/owner/repo.git"}
+	err := AddSource(path, "owner/repo", src)
 	if err != nil {
 		t.Fatalf("AddSource() on new file error = %v", err)
 	}
