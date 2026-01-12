@@ -146,3 +146,78 @@ func TestNewFromConfig(t *testing.T) {
 		t.Errorf("Path() = %q", target.Path())
 	}
 }
+
+func TestFlatTargetPath(t *testing.T) {
+	target := NewFromConfig("opencode", config.Harness{
+		Path:      "/home/user/.opencode",
+		Structure: "flat",
+	})
+
+	tests := []struct {
+		art  *artifact.Artifact
+		want string
+	}{
+		{
+			art:  &artifact.Artifact{Name: "code-test", Type: artifact.TypeSkill},
+			want: "/home/user/.opencode/skills/code-test.md",
+		},
+		{
+			art:  &artifact.Artifact{Name: "spec.create", Type: artifact.TypeCommand},
+			want: "/home/user/.opencode/commands/spec.create.md",
+		},
+		{
+			art:  &artifact.Artifact{Name: "tester", Type: artifact.TypeAgent},
+			want: "/home/user/.opencode/agents/tester.md",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.art.Name, func(t *testing.T) {
+			got := target.TargetPath(tt.art)
+			if got != tt.want {
+				t.Errorf("TargetPath() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFlatWriteWithResources(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	srcDir := filepath.Join(tmpDir, "src", "skills", "code-test")
+	os.MkdirAll(filepath.Join(srcDir, "reference"), 0755)
+	os.WriteFile(filepath.Join(srcDir, "SKILL.md"), []byte("# Skill"), 0644)
+	os.WriteFile(filepath.Join(srcDir, "reference", "guide.md"), []byte("# Guide"), 0644)
+
+	targetDir := filepath.Join(tmpDir, "target")
+	target := NewFromConfig("opencode", config.Harness{
+		Path:      targetDir,
+		Structure: "flat",
+	})
+
+	art := &artifact.Artifact{
+		Name:        "code-test",
+		Type:        artifact.TypeSkill,
+		SourcePath:  srcDir,
+		IsDirectory: true,
+		Resources:   []string{"reference"},
+		Frontmatter: map[string]any{"name": "code-test"},
+		Body:        "# Skill\n",
+	}
+
+	if err := target.Write(art); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+
+	// Main file should be flat
+	mainPath := filepath.Join(targetDir, "skills", "code-test.md")
+	if _, err := os.Stat(mainPath); err != nil {
+		t.Errorf("main file not written at flat path: %v", err)
+	}
+
+	// Resources should be in sibling directory
+	refPath := filepath.Join(targetDir, "skills", "code-test", "reference", "guide.md")
+	if _, err := os.Stat(refPath); err != nil {
+		t.Errorf("reference/guide.md not copied to sibling dir: %v", err)
+	}
+}

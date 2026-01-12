@@ -5,9 +5,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/BurntSushi/toml"
 	"github.com/spf13/cobra"
-	"github.com/srnnkls/tropos/internal/config"
+	"github.com/srnnkls/tropos/internal/defaults"
 	"github.com/srnnkls/tropos/internal/manifest"
 )
 
@@ -53,43 +52,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	cfg := struct {
-		DefaultHarnesses []string                  `toml:"default_harnesses"`
-		DefaultArtifacts []string                  `toml:"default_artifacts"`
-		Harness          map[string]config.Harness `toml:"harness"`
-	}{
-		DefaultHarnesses: []string{"claude"},
-		DefaultArtifacts: artifactTypes,
-		Harness: map[string]config.Harness{
-			"claude": {
-				Path: "~/.claude",
-				Variables: map[string]string{
-					"model_strong": "opus",
-					"model_weak":   "haiku",
-				},
-			},
-			"opencode": {
-				Path:                       "~/.opencode",
-				GenerateCommandsFromSkills: true,
-				Mappings: map[string]string{
-					"allowed-tools": "tools",
-				},
-				Variables: map[string]string{
-					"model_strong": "anthropic/claude-sonnet-4-5",
-					"model_weak":   "anthropic/claude-haiku-4-5",
-				},
-			},
-		},
-	}
-
-	f, err := os.Create(configPath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	enc := toml.NewEncoder(f)
-	if err := enc.Encode(cfg); err != nil {
+	if err := os.WriteFile(configPath, []byte(defaults.ConfigTOML), 0644); err != nil {
 		return err
 	}
 

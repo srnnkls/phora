@@ -9,7 +9,7 @@ import (
 )
 
 type Config struct {
-	Sources          []Source           `toml:"sources,omitempty"`
+	Sources          map[string]Source  `toml:"sources,omitempty"`
 	DefaultHarnesses []string           `toml:"default_harnesses,omitempty"`
 	DefaultArtifacts []string           `toml:"default_artifacts,omitempty"`
 	Harness          map[string]Harness `toml:"harness,omitempty"`
@@ -23,6 +23,7 @@ type Source struct {
 
 type Harness struct {
 	Path                       string            `toml:"path,omitempty"`
+	Structure                  string            `toml:"structure,omitempty"` // "flat" or "nested" (default)
 	GenerateCommandsFromSkills bool              `toml:"generate_commands_from_skills,omitempty"`
 	Mappings                   map[string]string `toml:"mappings,omitempty"`
 	Variables                  map[string]string `toml:"variables,omitempty"`
@@ -34,6 +35,9 @@ func LoadFile(path string) (*Config, error) {
 	var cfg Config
 	if _, err := toml.DecodeFile(path, &cfg); err != nil {
 		return nil, err
+	}
+	if cfg.Sources == nil {
+		cfg.Sources = make(map[string]Source)
 	}
 	if cfg.Harness == nil {
 		cfg.Harness = make(map[string]Harness)
@@ -65,6 +69,7 @@ func Load(projectDir, globalConfigPath string) (*Config, error) {
 
 	if global == nil && project == nil {
 		return &Config{
+			Sources: make(map[string]Source),
 			Harness: make(map[string]Harness),
 		}, nil
 	}
@@ -90,6 +95,7 @@ func Merge(global, project *Config) *Config {
 	for name, harness := range global.Harness {
 		h := Harness{
 			Path:                       harness.Path,
+			Structure:                  harness.Structure,
 			GenerateCommandsFromSkills: harness.GenerateCommandsFromSkills,
 			Mappings:                   make(map[string]string),
 			Variables:                  make(map[string]string),
@@ -128,6 +134,9 @@ func Merge(global, project *Config) *Config {
 		}
 		if harness.Path != "" {
 			h.Path = harness.Path
+		}
+		if harness.Structure != "" {
+			h.Structure = harness.Structure
 		}
 		if harness.GenerateCommandsFromSkills {
 			h.GenerateCommandsFromSkills = true

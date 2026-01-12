@@ -18,8 +18,9 @@ type Target interface {
 }
 
 type HarnessTarget struct {
-	name     string
-	basePath string
+	name      string
+	basePath  string
+	structure string // "flat" or "nested" (default)
 }
 
 func New(basePath string) *HarnessTarget {
@@ -28,7 +29,7 @@ func New(basePath string) *HarnessTarget {
 
 func NewFromConfig(name string, h config.Harness) Target {
 	path := config.ExpandPath(h.Path)
-	return &HarnessTarget{name: name, basePath: path}
+	return &HarnessTarget{name: name, basePath: path, structure: h.Structure}
 }
 
 func (t *HarnessTarget) Name() string { return t.name }
@@ -36,6 +37,9 @@ func (t *HarnessTarget) Path() string { return t.basePath }
 
 func (t *HarnessTarget) TargetPath(art *artifact.Artifact) string {
 	typeDir := artifact.TypeDirName(art.Type)
+	if t.structure == "flat" {
+		return filepath.Join(t.basePath, typeDir, art.Name+".md")
+	}
 	mainFile := artifact.MainFileName(art.Type)
 	return filepath.Join(t.basePath, typeDir, art.Name, mainFile)
 }
@@ -60,7 +64,12 @@ func (t *HarnessTarget) Write(art *artifact.Artifact) error {
 	}
 
 	if art.IsDirectory && len(art.Resources) > 0 {
-		if err := copyResources(art.SourcePath, targetDir, art.Resources); err != nil {
+		resourceDir := targetDir
+		if t.structure == "flat" {
+			// For flat structure, resources go in a sibling directory named after the artifact
+			resourceDir = filepath.Join(targetDir, art.Name)
+		}
+		if err := copyResources(art.SourcePath, resourceDir, art.Resources); err != nil {
 			return err
 		}
 	}

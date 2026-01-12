@@ -1,0 +1,78 @@
+default_harnesses = ["claude"]
+default_artifacts = ["skills", "commands", "agents"]
+
+# Claude Code - Anthropic's CLI
+# Structure: nested (skills/name/SKILL.md)
+# Docs: https://docs.anthropic.com/en/docs/claude-code
+[harness.claude]
+path = "~/.claude"
+structure = "nested"
+
+[harness.claude.variables]
+model_strong = "opus"
+model_normal = "sonnet"
+model_weak = "haiku"
+
+# OpenCode
+# Structure: flat (skills/name.md)
+# Docs: https://opencode.ai/docs/
+[harness.opencode]
+path = "~/.opencode"
+structure = "flat"
+generate_commands_from_skills = true
+
+[harness.opencode.mappings]
+allowed-tools = "tools"
+
+[harness.opencode.variables]
+model_strong = "anthropic/claude-sonnet-4-5"
+model_normal = "anthropic/claude-sonnet-4-5"
+model_weak = "anthropic/claude-haiku-4-5"
+
+# OpenAI Codex CLI
+# Structure: nested (skills/name/SKILL.md)
+# Docs: https://github.com/openai/codex
+[harness.codex]
+path = "~/.codex"
+structure = "nested"
+
+[harness.codex.variables]
+model_strong = "gpt-5.2-codex"
+model_normal = "gpt-5.1-codex"
+model_weak = "gpt-5.1-codex-mini"
+
+# Google Gemini CLI
+# Structure: nested (skills/name/SKILL.md)
+# Docs: https://github.com/google-gemini/gemini-cli
+[harness.gemini]
+path = "~/.gemini"
+structure = "nested"
+
+[harness.gemini.variables]
+model_strong = "gemini-3-pro"
+model_normal = "gemini-3-flash"
+model_weak = "gemini-2.5-flash-lite"
+
+# GitHub Copilot
+# Structure: nested (skills/name/SKILL.md)
+# Docs: https://docs.github.com/en/copilot
+[harness.github]
+path = "~/.config/gh"
+structure = "nested"
+
+[harness.github.variables]
+model_strong = "claude-opus-4-5"
+model_normal = "claude-sonnet-4-5"
+model_weak = "claude-haiku-4-5"
+
+# Cursor IDE
+# Structure: nested (skills/name/SKILL.md)
+# Docs: https://cursor.com/docs/context/skills
+[harness.cursor]
+path = "~/.cursor"
+structure = "nested"
+
+[harness.cursor.variables]
+model_strong = "claude-opus-4-5"
+model_normal = "claude-sonnet-4-5"
+model_weak = "claude-haiku-4-5"
