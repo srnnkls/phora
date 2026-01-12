@@ -1,0 +1,32 @@
+default_harnesses = ["claude"]
+default_artifacts = ["skills", "commands", "agents"]
+
+[manifest]
+skills = ["code-test", "simple"]
+commands = ["test.run"]
+agents = ["tester"]
+
+[conflict]
+file_exists = "error"
+duplicate_artifact = "error"
+
+[harness.claude]
+path = "/tmp/tropos-test-claude"
+structure = "nested"
+generate_commands_from_skills = false
+
+[harness.claude.variables]
+model_strong = "opus"
+model_weak = "haiku"
+
+[harness.opencode]
+path = "/tmp/tropos-test-opencode"
+structure = "flat"
+generate_commands_from_skills = true
+
+[harness.opencode.mappings]
+allowed_tools = "tools"
+
+[harness.opencode.variables]
+model_strong = "anthropic/claude-sonnet-4-5"
+model_weak = "anthropic/claude-haiku-4-5"
