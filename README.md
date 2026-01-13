@@ -141,18 +141,22 @@ Phora transforms artifact references in backticks to match each harness's format
 | Symbol | Type | Source Format | Claude Code | OpenCode |
 |--------|------|---------------|-------------|----------|
 | `$` | Skill | `$skill-name` | `/skill-name` | `@skill-name` |
+| `/` | Command | `/cmd-name` | `/cmd-name` | `/cmd-name` |
 | `@` | Agent | `@agent-name` | `@agent-name` | `@agent-name` |
-| `#` | Command | `#cmd-name` | `#cmd-name` | `#cmd-name` |
 | `!` | Tool | `!tool-name` | `ToolName` | `tool_name` |
 
 Example skill content:
 ```markdown
 Use `$code-review` after writing code.
-Run `!bash` to execute tests.
+Run `/build` to compile the project.
+Ask `@reviewer` for feedback.
+Execute with `!bash` tool.
 ```
 
 Transforms to (Claude Code):
 ```markdown
 Use `/code-review` after writing code.
-Run `Bash` to execute tests.
+Run `/build` to compile the project.
+Ask `@reviewer` for feedback.
+Execute with `Bash` tool.
 ```
