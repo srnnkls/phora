@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/srnnkls/phora/internal/config"
 )
 
 func setupTestSource(t *testing.T) string {
@@ -141,6 +143,11 @@ func TestRepoSourceParseRepoString(t *testing.T) {
 		{"srnnkls/phora", "github.com", "srnnkls", "phora"},
 		{"github.com/org/repo", "github.com", "org", "repo"},
 		{"gitlab.com/org/repo", "gitlab.com", "org", "repo"},
+		{"https://github.com/owner/repo", "github.com", "owner", "repo"},
+		{"https://github.com/owner/repo.git", "github.com", "owner", "repo"},
+		{"https://gitlab.com/owner/repo", "gitlab.com", "owner", "repo"},
+		{"http://custom.git/owner/repo", "custom.git", "owner", "repo"},
+		{"bitbucket.org/team/project", "bitbucket.org", "team", "project"},
 	}
 
 	for _, tt := range tests {
@@ -165,5 +172,128 @@ func TestRepoSourceDataDir(t *testing.T) {
 	expected := "/home/user/.local/share/phora/repos/github.com/srnnkls/phora"
 	if src.LocalPath() != expected {
 		t.Errorf("LocalPath() = %q, want %q", src.LocalPath(), expected)
+	}
+}
+
+func TestExpandTemplate(t *testing.T) {
+	tests := []struct {
+		name     string
+		template string
+		owner    string
+		repo     string
+		ref      string
+		path     string
+		want     string
+	}{
+		{
+			name:     "github git URL",
+			template: "https://github.com/{owner}/{repo}.git",
+			owner:    "srnnkls",
+			repo:     "phora",
+			ref:      "main",
+			path:     "",
+			want:     "https://github.com/srnnkls/phora.git",
+		},
+		{
+			name:     "github raw URL",
+			template: "https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{path}",
+			owner:    "srnnkls",
+			repo:     "phora",
+			ref:      "main",
+			path:     "phora.toml",
+			want:     "https://raw.githubusercontent.com/srnnkls/phora/main/phora.toml",
+		},
+		{
+			name:     "gitlab raw URL",
+			template: "https://gitlab.com/{owner}/{repo}/-/raw/{ref}/{path}",
+			owner:    "myorg",
+			repo:     "myproject",
+			ref:      "develop",
+			path:     "config.toml",
+			want:     "https://gitlab.com/myorg/myproject/-/raw/develop/config.toml",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := expandTemplate(tt.template, tt.owner, tt.repo, tt.ref, tt.path)
+			if got != tt.want {
+				t.Errorf("expandTemplate() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRepoSourceURLsWithHostConfig(t *testing.T) {
+	hostConfig := &config.Host{
+		GitURL: "https://github.com/{owner}/{repo}.git",
+		RawURL: "https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{path}",
+	}
+
+	src := &RepoSource{
+		Host:       "github.com",
+		Owner:      "srnnkls",
+		Repo:       "phora",
+		Ref:        "main",
+		HostConfig: hostConfig,
+	}
+
+	t.Run("RepoURL with config", func(t *testing.T) {
+		got := src.RepoURL()
+		want := "https://github.com/srnnkls/phora.git"
+		if got != want {
+			t.Errorf("RepoURL() = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("ConfigURL with config", func(t *testing.T) {
+		got := src.ConfigURL()
+		want := "https://raw.githubusercontent.com/srnnkls/phora/main/phora.toml"
+		if got != want {
+			t.Errorf("ConfigURL() = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestRepoSourceURLsWithoutHostConfig(t *testing.T) {
+	src := &RepoSource{
+		Host:       "custom-git.company.com",
+		Owner:      "team",
+		Repo:       "project",
+		Ref:        "main",
+		HostConfig: nil,
+	}
+
+	t.Run("RepoURL fallback", func(t *testing.T) {
+		got := src.RepoURL()
+		want := "https://custom-git.company.com/team/project.git"
+		if got != want {
+			t.Errorf("RepoURL() = %q, want %q (fallback)", got, want)
+		}
+	})
+
+	t.Run("ConfigURL no fallback", func(t *testing.T) {
+		got := src.ConfigURL()
+		if got != "" {
+			t.Errorf("ConfigURL() = %q, want empty string (no host config)", got)
+		}
+	})
+}
+
+func TestRepoSourceFetchConfigWithoutHostConfig(t *testing.T) {
+	src := &RepoSource{
+		Host:       "unknown-host.com",
+		Owner:      "owner",
+		Repo:       "repo",
+		Ref:        "main",
+		HostConfig: nil,
+	}
+
+	_, err := src.FetchConfig()
+	if err == nil {
+		t.Error("FetchConfig() should return error when host config is missing")
+	}
+	if err != nil && err.Error() != "no host configuration for unknown-host.com (direct config fetch not supported)" {
+		t.Errorf("FetchConfig() error = %q, want host config error", err.Error())
 	}
 }
