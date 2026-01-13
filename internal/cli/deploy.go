@@ -11,29 +11,31 @@ import (
 )
 
 var (
-	syncSources     []string
-	syncTargets     []string
-	syncDryRun      bool
-	syncInteractive bool
-	syncSkip        bool
+	deploySources     []string
+	deployTargets     []string
+	deployDryRun      bool
+	deployInteractive bool
+	deploySkip        bool
 )
 
-var syncCmd = &cobra.Command{
-	Use:   "sync",
-	Short: "Sync artifacts to harnesses",
-	Long:  "Sync from sources to target harnesses with transformation",
-	RunE:  runSync,
+var deployCmd = &cobra.Command{
+	Use:   "deploy",
+	Short: "Deploy artifacts to harnesses",
+	Long:  "Deploy from sources to target harnesses with transformation",
+	RunE:  runDeploy,
 }
 
 func init() {
-	syncCmd.Flags().StringSliceVar(&syncSources, "source", nil, "Source paths (default: current directory)")
-	syncCmd.Flags().StringSliceVar(&syncTargets, "target", nil, "Target harnesses (default: all enabled)")
-	syncCmd.Flags().BoolVar(&syncDryRun, "dry-run", false, "Show what would be synced")
-	syncCmd.Flags().BoolVarP(&syncInteractive, "interactive", "i", false, "Prompt for each conflict")
-	syncCmd.Flags().BoolVar(&syncSkip, "skip", false, "Skip existing files instead of updating")
+	deployCmd.Flags().StringSliceVar(&deploySources, "source", nil, "Source paths (default: current directory)")
+	deployCmd.Flags().StringSliceVar(&deployTargets, "target", nil, "Target harnesses (default: all enabled)")
+	deployCmd.Flags().BoolVar(&deployDryRun, "dry-run", false, "Show what would be deployed")
+	deployCmd.Flags().BoolVarP(&deployInteractive, "interactive", "i", false, "Prompt for each conflict")
+	deployCmd.Flags().BoolVar(&deploySkip, "skip", false, "Skip existing files instead of updating")
+
+	rootCmd.AddCommand(deployCmd)
 }
 
-func runSync(cmd *cobra.Command, args []string) error {
+func runDeploy(cmd *cobra.Command, args []string) error {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return err
@@ -44,12 +46,12 @@ func runSync(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	sources := syncSources
+	sources := deploySources
 	if len(sources) == 0 {
 		sources = []string{cwd}
 	}
 
-	targets := syncTargets
+	targets := deployTargets
 	if len(targets) == 0 {
 		targets = cfg.DefaultHarnesses
 	}
@@ -57,10 +59,10 @@ func runSync(cmd *cobra.Command, args []string) error {
 	opts := sync.Options{
 		SourcePaths: sources,
 		Targets:     targets,
-		DryRun:      syncDryRun,
+		DryRun:      deployDryRun,
 	}
 
-	if syncDryRun {
+	if deployDryRun {
 		fmt.Println("Dry run - no files will be written")
 	}
 
@@ -80,14 +82,14 @@ func runSync(cmd *cobra.Command, args []string) error {
 	resolutions := make(sync.ResolutionMap)
 
 	if len(allConflicts) > 0 {
-		if syncSkip {
+		if deploySkip {
 			// Skip all conflicts
 			for _, c := range allConflicts {
 				key := sync.ConflictKey(c.Target, c.Artifact.Name)
 				resolutions[key] = sync.ResolutionSkip
 			}
 			fmt.Printf("Skipping %d conflict(s)\n", len(allConflicts))
-		} else if syncInteractive && shouldPrompt() {
+		} else if deployInteractive && shouldPromptDeploy() {
 			// Interactive mode: prompt for each conflict
 			prompter := NewPrompter()
 			promptResult, err := prompter.ResolveConflicts(allConflicts)
@@ -133,10 +135,10 @@ func runSync(cmd *cobra.Command, args []string) error {
 	})
 
 	// Report results
-	if syncDryRun {
-		fmt.Printf("Would sync %d artifact(s)\n", result.Synced)
+	if deployDryRun {
+		fmt.Printf("Would deploy %d artifact(s)\n", result.Synced)
 	} else {
-		fmt.Printf("Synced %d artifact(s)\n", result.Synced)
+		fmt.Printf("Deployed %d artifact(s)\n", result.Synced)
 	}
 
 	if result.Generated > 0 {
@@ -154,9 +156,9 @@ func runSync(cmd *cobra.Command, args []string) error {
 	return err
 }
 
-// shouldPrompt determines if we should enter interactive mode
-func shouldPrompt() bool {
-	if syncInteractive {
+// shouldPromptDeploy determines if we should enter interactive mode
+func shouldPromptDeploy() bool {
+	if deployInteractive {
 		return true
 	}
 	// Auto-detect TTY: prompt if stdin is terminal

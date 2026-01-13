@@ -33,6 +33,4 @@ func init() {
 
 	rootCmd.AddCommand(configCmd)
 	rootCmd.AddCommand(initCmd)
-	rootCmd.AddCommand(installCmd)
-	rootCmd.AddCommand(syncCmd)
 }

@@ -81,7 +81,13 @@ func harnessesEqual(a, b map[string]Harness) bool {
 		if va.Path != vb.Path || va.Structure != vb.Structure || va.GenerateCommandsFromSkills != vb.GenerateCommandsFromSkills {
 			return false
 		}
-		if !mapsEqual(va.Mappings, vb.Mappings) || !mapsEqual(va.Variables, vb.Variables) {
+		if !mapsEqual(va.Keys, vb.Keys) || !mapsEqual(va.Variables, vb.Variables) {
+			return false
+		}
+		if !nestedMapsEqual(va.Values, vb.Values) {
+			return false
+		}
+		if !artifactMappingsEqual(va.ArtifactMappings, vb.ArtifactMappings) {
 			return false
 		}
 		if !slicesEqual(va.Include, vb.Include) || !slicesEqual(va.Exclude, vb.Exclude) {
@@ -97,6 +103,41 @@ func mapsEqual(a, b map[string]string) bool {
 	}
 	for k, v := range a {
 		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+func nestedMapsEqual(a, b map[string]map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, va := range a {
+		vb, ok := b[k]
+		if !ok {
+			return false
+		}
+		if !mapsEqual(va, vb) {
+			return false
+		}
+	}
+	return true
+}
+
+func artifactMappingsEqual(a, b map[string]ArtifactMapping) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, va := range a {
+		vb, ok := b[k]
+		if !ok {
+			return false
+		}
+		if !mapsEqual(va.Keys, vb.Keys) {
+			return false
+		}
+		if !nestedMapsEqual(va.Values, vb.Values) {
 			return false
 		}
 	}
@@ -120,8 +161,10 @@ func AddExclusion(path string, harnessName string, artifactName string) error {
 	harness, exists := cfg.Harness[harnessName]
 	if !exists {
 		harness = Harness{
-			Mappings:  make(map[string]string),
-			Variables: make(map[string]string),
+			Keys:             make(map[string]string),
+			Values:           make(map[string]map[string]string),
+			ArtifactMappings: make(map[string]ArtifactMapping),
+			Variables:        make(map[string]string),
 		}
 	}
 

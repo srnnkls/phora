@@ -11,17 +11,17 @@ file_exists = "error"
 duplicate_artifact = "error"
 
 [harness.claude]
-path = "tmp/phora-test-claude"
+path = "/tmp/phora-test-claude"
 
 [harness.claude.variables]
 model_strong = "opus"
 model_weak = "haiku"
 
 [harness.opencode]
-path = "tmp/phora-test-opencode"
+path = "/tmp/phora-test-opencode"
 generate_commands_from_skills = true
 
-[harness.opencode.mappings]
+[harness.opencode.keys]
 allowed_tools = "tools"
 
 [harness.opencode.variables]

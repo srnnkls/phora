@@ -21,12 +21,20 @@ const (
 
 type Artifact struct {
 	Name        string
+	Namespace   string
 	Type        Type
 	SourcePath  string
 	IsDirectory bool
 	Frontmatter map[string]any
 	Body        string
 	Resources   []string
+}
+
+func (a *Artifact) FullName() string {
+	if a.Namespace == "" {
+		return a.Name
+	}
+	return a.Namespace + "." + a.Name
 }
 
 func Parse(data []byte) (*Artifact, error) {

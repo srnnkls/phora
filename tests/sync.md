@@ -1,4 +1,4 @@
-# Phora Sync Tests
+# Phora Deploy Tests
 
 ## Help
 
@@ -10,11 +10,12 @@ Usage:
   phora [command]
 
 Available Commands:
+  add         Add artifacts from a repository
   completion  Generate the autocompletion script for the specified shell
+  config      Manage phora configuration
+  deploy      Deploy artifacts to harnesses
   help        Help about any command
-  init        Initialize phora configuration
-  install     Install artifacts from a repository
-  sync        Sync artifacts to harnesses
+  init        Initialize phora package manifest
 
 Flags:
       --config string     Global config file (default "*") (glob)
@@ -24,19 +25,20 @@ Flags:
 Use "phora [command] --help" for more information about a command.
 ```
 
-## Sync Help
+## Deploy Help
 
 ```scrut
-$ phora sync --help
-Sync from sources to target harnesses with transformation
+$ phora deploy --help
+Deploy from sources to target harnesses with transformation
 
 Usage:
-  phora sync [flags]
+  phora deploy [flags]
 
 Flags:
-      --dry-run          Show what would be synced
-      --force            Overwrite existing files
-  -h, --help             help for sync
+      --dry-run          Show what would be deployed
+  -h, --help             help for deploy
+  -i, --interactive      Prompt for each conflict
+      --skip             Skip existing files instead of updating
       --source strings   Source paths (default: current directory)
       --target strings   Target harnesses (default: all enabled)
 
@@ -45,19 +47,19 @@ Global Flags:
       --data-dir string   Data directory for cloned repos (default "*") (glob)
 ```
 
-## Sync Dry Run Shows Plan
+## Deploy Dry Run Shows Plan
 
 ```scrut
-$ rm -rf /tmp/phora-test-claude /tmp/phora-test-opencode && cd "$TESTDIR/fixtures" && phora sync --dry-run --target claude 2>&1
+$ rm -rf /tmp/phora-test-claude /tmp/phora-test-opencode && cd "$TESTDIR/fixtures" && phora deploy --dry-run --target claude 2>&1
 Dry run - no files will be written
-Would sync 4 artifact(s)
+Would deploy 4 artifact(s)
 ```
 
-## Sync To Claude Target
+## Deploy To Claude Target
 
 ```scrut
-$ rm -rf /tmp/phora-test-claude && cd "$TESTDIR/fixtures" && phora sync --target claude 2>&1
-Synced 4 artifact(s)
+$ rm -rf /tmp/phora-test-claude && cd "$TESTDIR/fixtures" && phora deploy --target claude 2>&1
+Deployed 4 artifact(s)
 ```
 
 ## List Claude Target Structure
@@ -176,11 +178,11 @@ name: simple
 Just a basic skill.
 ```
 
-## Sync To OpenCode Target
+## Deploy To OpenCode Target
 
 ```scrut
-$ rm -rf /tmp/phora-test-opencode && cd "$TESTDIR/fixtures" && phora sync --target opencode 2>&1
-Synced 5 artifact(s)
+$ rm -rf /tmp/phora-test-opencode && cd "$TESTDIR/fixtures" && phora deploy --target opencode 2>&1
+Deployed 5 artifact(s)
 Generated 1 command(s) from user-invocable skills
 ```
 
@@ -316,18 +318,18 @@ $ cat /tmp/phora-test-opencode/skills/code-test/reference/guide.md
 - Red, green, refactor
 ```
 
-## Force Overwrite
+## Re-deploy (Lock File Tracks Managed Files)
 
 ```scrut
-$ cd "$TESTDIR/fixtures" && phora sync --target claude --force 2>&1
-Synced 4 artifact(s)
+$ cd "$TESTDIR/fixtures" && phora deploy --target claude 2>&1
+Deployed 4 artifact(s)
 ```
 
-## Init Creates Config
+## Init Creates Manifest
 
 ```scrut
 $ TMPINIT=$(mktemp -d) && mkdir -p "$TMPINIT/skills/myskill" && printf '%s\n' '---' 'name: myskill' '---' '# My Skill' > "$TMPINIT/skills/myskill/SKILL.md" && cd "$TMPINIT" && phora init && rm -rf "$TMPINIT"
-Created phora.toml
+Created .phora/manifest.yaml
   Skills:   1
   Commands: 0
   Agents:   0

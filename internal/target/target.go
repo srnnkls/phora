@@ -38,10 +38,10 @@ func (t *HarnessTarget) Path() string { return t.basePath }
 func (t *HarnessTarget) TargetPath(art *artifact.Artifact) string {
 	typeDir := artifact.TypeDirName(art.Type)
 	if t.structure == "flat" {
-		return filepath.Join(t.basePath, typeDir, art.Name+".md")
+		return filepath.Join(t.basePath, typeDir, art.FullName()+".md")
 	}
 	mainFile := artifact.MainFileName(art.Type)
-	return filepath.Join(t.basePath, typeDir, art.Name, mainFile)
+	return filepath.Join(t.basePath, typeDir, art.FullName(), mainFile)
 }
 
 func (t *HarnessTarget) Exists(art *artifact.Artifact) (bool, string) {
@@ -66,8 +66,7 @@ func (t *HarnessTarget) Write(art *artifact.Artifact) error {
 	if art.IsDirectory && len(art.Resources) > 0 {
 		resourceDir := targetDir
 		if t.structure == "flat" {
-			// For flat structure, resources go in a sibling directory named after the artifact
-			resourceDir = filepath.Join(targetDir, art.Name)
+			resourceDir = filepath.Join(targetDir, art.FullName())
 		}
 		if err := copyResources(art.SourcePath, resourceDir, art.Resources); err != nil {
 			return err

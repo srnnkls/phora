@@ -357,3 +357,449 @@ func containsHelper(s, substr string) bool {
 	}
 	return false
 }
+
+func TestDiscoverSetsNamespaceFromNonGlobalSource(t *testing.T) {
+	srcDir := t.TempDir()
+	targetDir := t.TempDir()
+
+	skillDir := filepath.Join(srcDir, "skills", "code-test")
+	os.MkdirAll(skillDir, 0755)
+	os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(`---
+name: code-test
+description: TDD workflow
+---
+
+# Code Test
+`), 0644)
+
+	cfg := &config.Config{
+		DefaultHarnesses: []string{"claude"},
+		DefaultArtifacts: []string{"skills"},
+		Sources: map[string]config.Source{
+			"company": {
+				Type:   "local",
+				Path:   srcDir,
+				Global: false,
+			},
+		},
+		Harness: map[string]config.Harness{
+			"claude": {
+				Path: targetDir,
+			},
+		},
+	}
+
+	opts := Options{
+		SourcePaths: []string{srcDir},
+		Targets:     []string{"claude"},
+	}
+
+	results, err := Detect(cfg, opts)
+	if err != nil {
+		t.Fatalf("Detect() error = %v", err)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 detection result, got %d", len(results))
+	}
+
+	if len(results[0].Artifacts) != 1 {
+		t.Fatalf("expected 1 artifact, got %d", len(results[0].Artifacts))
+	}
+
+	art := results[0].Artifacts[0]
+	if art.Namespace != "company" {
+		t.Errorf("Namespace = %q, want %q", art.Namespace, "company")
+	}
+	if art.FullName() != "company.code-test" {
+		t.Errorf("FullName() = %q, want %q", art.FullName(), "company.code-test")
+	}
+}
+
+func TestDiscoverSetsEmptyNamespaceFromGlobalSource(t *testing.T) {
+	srcDir := t.TempDir()
+	targetDir := t.TempDir()
+
+	skillDir := filepath.Join(srcDir, "skills", "code-test")
+	os.MkdirAll(skillDir, 0755)
+	os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(`---
+name: code-test
+description: TDD workflow
+---
+
+# Code Test
+`), 0644)
+
+	cfg := &config.Config{
+		DefaultHarnesses: []string{"claude"},
+		DefaultArtifacts: []string{"skills"},
+		Sources: map[string]config.Source{
+			"shared": {
+				Type:   "local",
+				Path:   srcDir,
+				Global: true,
+			},
+		},
+		Harness: map[string]config.Harness{
+			"claude": {
+				Path: targetDir,
+			},
+		},
+	}
+
+	opts := Options{
+		SourcePaths: []string{srcDir},
+		Targets:     []string{"claude"},
+	}
+
+	results, err := Detect(cfg, opts)
+	if err != nil {
+		t.Fatalf("Detect() error = %v", err)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 detection result, got %d", len(results))
+	}
+
+	if len(results[0].Artifacts) != 1 {
+		t.Fatalf("expected 1 artifact, got %d", len(results[0].Artifacts))
+	}
+
+	art := results[0].Artifacts[0]
+	if art.Namespace != "" {
+		t.Errorf("Namespace = %q, want empty (global source)", art.Namespace)
+	}
+	if art.FullName() != "code-test" {
+		t.Errorf("FullName() = %q, want %q (bare name for global)", art.FullName(), "code-test")
+	}
+}
+
+func TestDiscoverMultipleSourcesWithMixedGlobal(t *testing.T) {
+	globalSrcDir := t.TempDir()
+	companySrcDir := t.TempDir()
+	targetDir := t.TempDir()
+
+	globalSkillDir := filepath.Join(globalSrcDir, "skills", "shared-skill")
+	os.MkdirAll(globalSkillDir, 0755)
+	os.WriteFile(filepath.Join(globalSkillDir, "SKILL.md"), []byte(`---
+name: shared-skill
+---
+
+# Shared
+`), 0644)
+
+	companySkillDir := filepath.Join(companySrcDir, "skills", "internal-skill")
+	os.MkdirAll(companySkillDir, 0755)
+	os.WriteFile(filepath.Join(companySkillDir, "SKILL.md"), []byte(`---
+name: internal-skill
+---
+
+# Internal
+`), 0644)
+
+	cfg := &config.Config{
+		DefaultHarnesses: []string{"claude"},
+		DefaultArtifacts: []string{"skills"},
+		Sources: map[string]config.Source{
+			"shared": {
+				Type:   "local",
+				Path:   globalSrcDir,
+				Global: true,
+			},
+			"company": {
+				Type:   "local",
+				Path:   companySrcDir,
+				Global: false,
+			},
+		},
+		Harness: map[string]config.Harness{
+			"claude": {
+				Path: targetDir,
+			},
+		},
+	}
+
+	opts := Options{
+		SourcePaths: []string{globalSrcDir, companySrcDir},
+		Targets:     []string{"claude"},
+	}
+
+	results, err := Detect(cfg, opts)
+	if err != nil {
+		t.Fatalf("Detect() error = %v", err)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 detection result, got %d", len(results))
+	}
+
+	if len(results[0].Artifacts) != 2 {
+		t.Fatalf("expected 2 artifacts, got %d", len(results[0].Artifacts))
+	}
+
+	artByName := make(map[string]*artifact.Artifact)
+	for _, art := range results[0].Artifacts {
+		artByName[art.Name] = art
+	}
+
+	sharedArt, ok := artByName["shared-skill"]
+	if !ok {
+		t.Fatal("shared-skill artifact not found")
+	}
+	if sharedArt.Namespace != "" {
+		t.Errorf("shared-skill Namespace = %q, want empty (global source)", sharedArt.Namespace)
+	}
+	if sharedArt.FullName() != "shared-skill" {
+		t.Errorf("shared-skill FullName() = %q, want %q", sharedArt.FullName(), "shared-skill")
+	}
+
+	internalArt, ok := artByName["internal-skill"]
+	if !ok {
+		t.Fatal("internal-skill artifact not found")
+	}
+	if internalArt.Namespace != "company" {
+		t.Errorf("internal-skill Namespace = %q, want %q", internalArt.Namespace, "company")
+	}
+	if internalArt.FullName() != "company.internal-skill" {
+		t.Errorf("internal-skill FullName() = %q, want %q", internalArt.FullName(), "company.internal-skill")
+	}
+}
+
+func TestSyncNamespacedArtifactUsesFullNameForOutputPath(t *testing.T) {
+	srcDir := t.TempDir()
+	targetDir := t.TempDir()
+
+	skillDir := filepath.Join(srcDir, "skills", "code-test")
+	os.MkdirAll(skillDir, 0755)
+	os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(`---
+name: code-test
+description: TDD workflow
+---
+
+# Code Test
+`), 0644)
+
+	cfg := &config.Config{
+		DefaultHarnesses: []string{"claude"},
+		DefaultArtifacts: []string{"skills"},
+		Sources: map[string]config.Source{
+			"company": {
+				Type:   "local",
+				Path:   srcDir,
+				Global: false,
+			},
+		},
+		Harness: map[string]config.Harness{
+			"claude": {
+				Path: targetDir,
+			},
+		},
+	}
+
+	opts := Options{
+		SourcePaths: []string{srcDir},
+		Targets:     []string{"claude"},
+	}
+
+	result, err := Sync(cfg, opts)
+	if err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+
+	if result.Synced != 1 {
+		t.Errorf("Synced = %d, want 1", result.Synced)
+	}
+
+	expectedPath := filepath.Join(targetDir, "skills", "company.code-test", "SKILL.md")
+	if _, err := os.Stat(expectedPath); os.IsNotExist(err) {
+		t.Errorf("expected artifact at %s (using FullName), but file does not exist", expectedPath)
+	}
+
+	wrongPath := filepath.Join(targetDir, "skills", "code-test", "SKILL.md")
+	if _, err := os.Stat(wrongPath); err == nil {
+		t.Errorf("artifact written to %s (using Name), should use FullName (company.code-test)", wrongPath)
+	}
+}
+
+func TestSyncGlobalSourceArtifactUsesBareName(t *testing.T) {
+	srcDir := t.TempDir()
+	targetDir := t.TempDir()
+
+	skillDir := filepath.Join(srcDir, "skills", "code-test")
+	os.MkdirAll(skillDir, 0755)
+	os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(`---
+name: code-test
+description: TDD workflow
+---
+
+# Code Test
+`), 0644)
+
+	cfg := &config.Config{
+		DefaultHarnesses: []string{"claude"},
+		DefaultArtifacts: []string{"skills"},
+		Sources: map[string]config.Source{
+			"shared": {
+				Type:   "local",
+				Path:   srcDir,
+				Global: true,
+			},
+		},
+		Harness: map[string]config.Harness{
+			"claude": {
+				Path: targetDir,
+			},
+		},
+	}
+
+	opts := Options{
+		SourcePaths: []string{srcDir},
+		Targets:     []string{"claude"},
+	}
+
+	result, err := Sync(cfg, opts)
+	if err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+
+	if result.Synced != 1 {
+		t.Errorf("Synced = %d, want 1", result.Synced)
+	}
+
+	expectedPath := filepath.Join(targetDir, "skills", "code-test", "SKILL.md")
+	if _, err := os.Stat(expectedPath); os.IsNotExist(err) {
+		t.Errorf("expected artifact at %s (bare name for global source), but file does not exist", expectedPath)
+	}
+}
+
+func TestSyncMixedGlobalAndNamespacedOutputPaths(t *testing.T) {
+	globalSrcDir := t.TempDir()
+	companySrcDir := t.TempDir()
+	targetDir := t.TempDir()
+
+	globalSkillDir := filepath.Join(globalSrcDir, "skills", "shared-skill")
+	os.MkdirAll(globalSkillDir, 0755)
+	os.WriteFile(filepath.Join(globalSkillDir, "SKILL.md"), []byte(`---
+name: shared-skill
+---
+
+# Shared
+`), 0644)
+
+	companySkillDir := filepath.Join(companySrcDir, "skills", "internal-skill")
+	os.MkdirAll(companySkillDir, 0755)
+	os.WriteFile(filepath.Join(companySkillDir, "SKILL.md"), []byte(`---
+name: internal-skill
+---
+
+# Internal
+`), 0644)
+
+	cfg := &config.Config{
+		DefaultHarnesses: []string{"claude"},
+		DefaultArtifacts: []string{"skills"},
+		Sources: map[string]config.Source{
+			"shared": {
+				Type:   "local",
+				Path:   globalSrcDir,
+				Global: true,
+			},
+			"company": {
+				Type:   "local",
+				Path:   companySrcDir,
+				Global: false,
+			},
+		},
+		Harness: map[string]config.Harness{
+			"claude": {
+				Path: targetDir,
+			},
+		},
+	}
+
+	opts := Options{
+		SourcePaths: []string{globalSrcDir, companySrcDir},
+		Targets:     []string{"claude"},
+	}
+
+	result, err := Sync(cfg, opts)
+	if err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+
+	if result.Synced != 2 {
+		t.Errorf("Synced = %d, want 2", result.Synced)
+	}
+
+	globalPath := filepath.Join(targetDir, "skills", "shared-skill", "SKILL.md")
+	if _, err := os.Stat(globalPath); os.IsNotExist(err) {
+		t.Errorf("global artifact not at expected path %s", globalPath)
+	}
+
+	namespacedPath := filepath.Join(targetDir, "skills", "company.internal-skill", "SKILL.md")
+	if _, err := os.Stat(namespacedPath); os.IsNotExist(err) {
+		t.Errorf("namespaced artifact not at expected path %s (should use FullName)", namespacedPath)
+	}
+
+	wrongNamespacedPath := filepath.Join(targetDir, "skills", "internal-skill", "SKILL.md")
+	if _, err := os.Stat(wrongNamespacedPath); err == nil {
+		t.Errorf("namespaced artifact at wrong path %s (should use FullName: company.internal-skill)", wrongNamespacedPath)
+	}
+}
+
+func TestSyncLockFileUsesFullName(t *testing.T) {
+	srcDir := t.TempDir()
+	targetDir := t.TempDir()
+
+	skillDir := filepath.Join(srcDir, "skills", "code-test")
+	os.MkdirAll(skillDir, 0755)
+	os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(`---
+name: code-test
+description: TDD workflow
+---
+
+# Code Test
+`), 0644)
+
+	cfg := &config.Config{
+		DefaultHarnesses: []string{"claude"},
+		DefaultArtifacts: []string{"skills"},
+		Sources: map[string]config.Source{
+			"company": {
+				Type:   "local",
+				Path:   srcDir,
+				Global: false,
+			},
+		},
+		Harness: map[string]config.Harness{
+			"claude": {
+				Path: targetDir,
+			},
+		},
+	}
+
+	opts := Options{
+		SourcePaths: []string{srcDir},
+		Targets:     []string{"claude"},
+	}
+
+	_, err := Sync(cfg, opts)
+	if err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+
+	lf, err := lockfile.Load(targetDir)
+	if err != nil {
+		t.Fatalf("failed to load lock file: %v", err)
+	}
+
+	expectedLockPath := "skills/company.code-test/SKILL.md"
+	if !lf.IsManaged(expectedLockPath) {
+		t.Errorf("lock file should contain %s (using FullName)", expectedLockPath)
+	}
+
+	wrongLockPath := "skills/code-test/SKILL.md"
+	if lf.IsManaged(wrongLockPath) {
+		t.Errorf("lock file contains %s (bare name) but should use FullName", wrongLockPath)
+	}
+}

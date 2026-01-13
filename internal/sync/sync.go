@@ -93,6 +93,15 @@ func Detect(cfg *config.Config, opts Options) ([]DetectionResult, error) {
 			errors = append(errors, err)
 			continue
 		}
+
+		// Look up source config by path to determine namespace
+		sourceName, isGlobal := findSourceByPath(cfg, srcPath)
+		if sourceName != "" && !isGlobal {
+			for _, art := range arts {
+				art.Namespace = sourceName
+			}
+		}
+
 		allArtifacts = append(allArtifacts, arts...)
 	}
 
@@ -148,8 +157,12 @@ func Apply(cfg *config.Config, detection []DetectionResult, opts ApplyOptions) (
 	for _, det := range detection {
 		tgt := target.NewFromConfig(det.Target, det.Harness)
 		tr := &transform.Transformer{
-			Variables: det.Harness.Variables,
-			Mappings:  det.Harness.Mappings,
+			Variables:  det.Harness.Variables,
+			Mappings:   det.Harness.Keys,
+			Keys:       det.Harness.Keys,
+			Values:     det.Harness.Values,
+			Tools:      det.Harness.Tools,
+			References: convertReferences(det.Harness.References),
 		}
 		basePath := config.ExpandPath(det.Harness.Path)
 		lf := det.LockFile
@@ -230,7 +243,7 @@ func addToLockFile(lf *lockfile.LockFile, tgt target.Target, art *artifact.Artif
 	lf.Add(lockfile.FileEntry{
 		Path:     relativePath,
 		Checksum: checksum,
-		Artifact: art.Name,
+		Artifact: art.FullName(),
 		Type:     string(art.Type),
 		Resource: false,
 	})
@@ -238,7 +251,7 @@ func addToLockFile(lf *lockfile.LockFile, tgt target.Target, art *artifact.Artif
 	// Add resources
 	if art.IsDirectory && len(art.Resources) > 0 {
 		artDir := filepath.Dir(mainPath)
-		addResourcesToLockFile(lf, artDir, art.Resources, art.Name, string(art.Type), basePath)
+		addResourcesToLockFile(lf, artDir, art.Resources, art.FullName(), string(art.Type), basePath)
 	}
 }
 
@@ -387,4 +400,26 @@ func generateCommands(artifacts []*artifact.Artifact) []*artifact.Artifact {
 	}
 
 	return commands
+}
+
+func findSourceByPath(cfg *config.Config, srcPath string) (name string, isGlobal bool) {
+	expandedSrcPath := config.ExpandPath(srcPath)
+	for sourceName, src := range cfg.Sources {
+		expandedCfgPath := config.ExpandPath(src.Path)
+		if expandedCfgPath == expandedSrcPath {
+			return sourceName, src.Global
+		}
+	}
+	return "", false
+}
+
+func convertReferences(refs map[string]config.ReferenceConfig) map[string]transform.ReferenceConfig {
+	if refs == nil {
+		return nil
+	}
+	result := make(map[string]transform.ReferenceConfig)
+	for k, v := range refs {
+		result[k] = transform.ReferenceConfig{Output: v.Output}
+	}
+	return result
 }

@@ -112,8 +112,14 @@ func printConfig(cfg *config.Config) {
 			if len(h.Variables) > 0 {
 				fmt.Printf("    variables: %v\n", h.Variables)
 			}
-			if len(h.Mappings) > 0 {
-				fmt.Printf("    mappings: %v\n", h.Mappings)
+			if len(h.Keys) > 0 {
+				fmt.Printf("    keys: %v\n", h.Keys)
+			}
+			if len(h.Values) > 0 {
+				fmt.Printf("    values: %v\n", h.Values)
+			}
+			if len(h.ArtifactMappings) > 0 {
+				fmt.Printf("    artifact_mappings: %v\n", h.ArtifactMappings)
 			}
 			if len(h.Include) > 0 {
 				fmt.Printf("    include: %v\n", h.Include)

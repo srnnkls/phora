@@ -16,20 +16,34 @@ type Config struct {
 }
 
 type Source struct {
-	Type string `toml:"type,omitempty"`
-	Repo string `toml:"repo,omitempty"`
-	Path string `toml:"path,omitempty"`
-	Ref  string `toml:"ref,omitempty"`
+	Type   string `toml:"type,omitempty"`
+	Repo   string `toml:"repo,omitempty"`
+	Path   string `toml:"path,omitempty"`
+	Ref    string `toml:"ref,omitempty"`
+	Global bool   `toml:"global,omitempty"`
+}
+
+type ArtifactMapping struct {
+	Keys   map[string]string            `toml:"keys,omitempty"`
+	Values map[string]map[string]string `toml:"values,omitempty"`
+}
+
+type ReferenceConfig struct {
+	Output string `toml:"output,omitempty"`
 }
 
 type Harness struct {
-	Path                       string            `toml:"path,omitempty"`
-	Structure                  string            `toml:"structure,omitempty"` // "flat" or "nested" (default)
-	GenerateCommandsFromSkills bool              `toml:"generate_commands_from_skills,omitempty"`
-	Mappings                   map[string]string `toml:"mappings,omitempty"`
-	Variables                  map[string]string `toml:"variables,omitempty"`
-	Include                    []string          `toml:"include,omitempty"`
-	Exclude                    []string          `toml:"exclude,omitempty"`
+	Path                       string                       `toml:"path,omitempty"`
+	Structure                  string                       `toml:"structure,omitempty"` // "flat" or "nested" (default)
+	GenerateCommandsFromSkills bool                         `toml:"generate_commands_from_skills,omitempty"`
+	Keys                       map[string]string            `toml:"keys,omitempty"`
+	Values                     map[string]map[string]string `toml:"values,omitempty"`
+	ArtifactMappings           map[string]ArtifactMapping   `toml:"artifact_mappings,omitempty"`
+	Variables                  map[string]string            `toml:"variables,omitempty"`
+	Tools                      map[string]string            `toml:"tools,omitempty"`
+	References                 map[string]ReferenceConfig   `toml:"references,omitempty"`
+	Include                    []string                     `toml:"include,omitempty"`
+	Exclude                    []string                     `toml:"exclude,omitempty"`
 }
 
 func LoadFile(path string) (*Config, error) {
@@ -107,16 +121,32 @@ func Merge(global, project *Config) *Config {
 			Path:                       harness.Path,
 			Structure:                  harness.Structure,
 			GenerateCommandsFromSkills: harness.GenerateCommandsFromSkills,
-			Mappings:                   make(map[string]string),
+			Keys:                       make(map[string]string),
+			Values:                     make(map[string]map[string]string),
+			ArtifactMappings:           make(map[string]ArtifactMapping),
 			Variables:                  make(map[string]string),
+			Tools:                      make(map[string]string),
+			References:                 make(map[string]ReferenceConfig),
 			Include:                    append([]string{}, harness.Include...),
 			Exclude:                    append([]string{}, harness.Exclude...),
 		}
-		for k, v := range harness.Mappings {
-			h.Mappings[k] = v
+		for k, v := range harness.Keys {
+			h.Keys[k] = v
+		}
+		for k, v := range harness.Values {
+			h.Values[k] = copyStringMap(v)
+		}
+		for k, v := range harness.ArtifactMappings {
+			h.ArtifactMappings[k] = copyArtifactMapping(v)
 		}
 		for k, v := range harness.Variables {
 			h.Variables[k] = v
+		}
+		for k, v := range harness.Tools {
+			h.Tools[k] = v
+		}
+		for k, v := range harness.References {
+			h.References[k] = v
 		}
 		result.Harness[name] = h
 	}
@@ -137,8 +167,12 @@ func Merge(global, project *Config) *Config {
 		h, exists := result.Harness[name]
 		if !exists {
 			h = Harness{
-				Mappings:  make(map[string]string),
-				Variables: make(map[string]string),
+				Keys:             make(map[string]string),
+				Values:           make(map[string]map[string]string),
+				ArtifactMappings: make(map[string]ArtifactMapping),
+				Variables:        make(map[string]string),
+				Tools:            make(map[string]string),
+				References:       make(map[string]ReferenceConfig),
 			}
 		}
 		if harness.Path != "" {
@@ -150,11 +184,34 @@ func Merge(global, project *Config) *Config {
 		if harness.GenerateCommandsFromSkills {
 			h.GenerateCommandsFromSkills = true
 		}
-		for k, v := range harness.Mappings {
-			h.Mappings[k] = v
+		for k, v := range harness.Keys {
+			h.Keys[k] = v
+		}
+		for k, v := range harness.Values {
+			if h.Values[k] == nil {
+				h.Values[k] = make(map[string]string)
+			}
+			for vk, vv := range v {
+				h.Values[k][vk] = vv
+			}
+		}
+		for k, v := range harness.ArtifactMappings {
+			h.ArtifactMappings[k] = mergeArtifactMapping(h.ArtifactMappings[k], v)
 		}
 		for k, v := range harness.Variables {
 			h.Variables[k] = v
+		}
+		if h.Tools == nil {
+			h.Tools = make(map[string]string)
+		}
+		for k, v := range harness.Tools {
+			h.Tools[k] = v
+		}
+		if h.References == nil {
+			h.References = make(map[string]ReferenceConfig)
+		}
+		for k, v := range harness.References {
+			h.References[k] = v
 		}
 		h.Include = appendUnique(h.Include, harness.Include...)
 		h.Exclude = appendUnique(h.Exclude, harness.Exclude...)
@@ -187,5 +244,52 @@ func appendUnique(slice []string, items ...string) []string {
 		}
 	}
 	return slice
+}
+
+func copyStringMap(m map[string]string) map[string]string {
+	result := make(map[string]string)
+	for k, v := range m {
+		result[k] = v
+	}
+	return result
+}
+
+func copyArtifactMapping(am ArtifactMapping) ArtifactMapping {
+	result := ArtifactMapping{
+		Keys:   make(map[string]string),
+		Values: make(map[string]map[string]string),
+	}
+	for k, v := range am.Keys {
+		result.Keys[k] = v
+	}
+	for k, v := range am.Values {
+		result.Values[k] = copyStringMap(v)
+	}
+	return result
+}
+
+func mergeArtifactMapping(base, overlay ArtifactMapping) ArtifactMapping {
+	result := ArtifactMapping{
+		Keys:   make(map[string]string),
+		Values: make(map[string]map[string]string),
+	}
+	for k, v := range base.Keys {
+		result.Keys[k] = v
+	}
+	for k, v := range overlay.Keys {
+		result.Keys[k] = v
+	}
+	for k, v := range base.Values {
+		result.Values[k] = copyStringMap(v)
+	}
+	for k, v := range overlay.Values {
+		if result.Values[k] == nil {
+			result.Values[k] = make(map[string]string)
+		}
+		for vk, vv := range v {
+			result.Values[k][vk] = vv
+		}
+	}
+	return result
 }
 

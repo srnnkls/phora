@@ -12,42 +12,40 @@ import (
 )
 
 var (
-	installHarnesses []string
-	installRef       string
-	installPath      string
-	installLocal     bool
-	installForce     bool
+	addHarnesses []string
+	addRef       string
+	addPath      string
+	addLocal     bool
+	addForce     bool
 )
 
-var installCmd = &cobra.Command{
-	Use:   "install <owner/repo>",
-	Short: "Install artifacts from a repository",
+var addCmd = &cobra.Command{
+	Use:   "add <owner/repo>",
+	Short: "Add artifacts from a repository",
 	Long:  "Clone repo to data directory and sync to harnesses",
 	Args:  cobra.ExactArgs(1),
-	RunE:  runInstall,
+	RunE:  runAdd,
 }
 
 func init() {
-	installCmd.Flags().StringSliceVar(&installHarnesses, "harness", nil, "Target harnesses (default: all enabled)")
-	installCmd.Flags().StringVar(&installRef, "ref", "main", "Branch, tag, or commit")
-	installCmd.Flags().StringVar(&installPath, "path", "", "Subdirectory within repo containing artifacts")
-	installCmd.Flags().BoolVar(&installLocal, "local", false, "Save source to local phora.toml instead of global config")
-	installCmd.Flags().BoolVarP(&installForce, "force", "f", false, "Overwrite existing unmanaged files")
+	addCmd.Flags().StringSliceVar(&addHarnesses, "harness", nil, "Target harnesses (default: all enabled)")
+	addCmd.Flags().StringVar(&addRef, "ref", "main", "Branch, tag, or commit")
+	addCmd.Flags().StringVar(&addPath, "path", "", "Subdirectory within repo containing artifacts")
+	addCmd.Flags().BoolVar(&addLocal, "local", false, "Save source to local phora.toml instead of global config")
+	addCmd.Flags().BoolVarP(&addForce, "force", "f", false, "Overwrite existing unmanaged files")
+	rootCmd.AddCommand(addCmd)
 }
 
-func runInstall(cmd *cobra.Command, args []string) error {
+func runAdd(cmd *cobra.Command, args []string) error {
 	repoStr := args[0]
 
-	// Load global config
 	cfg, err := config.Load("", globalConfigPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	// Create repo source
-	repoSrc := source.NewRepo(repoStr, installRef, dataDir, cfg.DefaultArtifacts)
+	repoSrc := source.NewRepo(repoStr, addRef, dataDir, cfg.DefaultArtifacts)
 
-	// Fetch manifest first
 	fmt.Printf("Fetching manifest from %s...\n", repoSrc.ManifestURL())
 	manifestData, err := repoSrc.FetchManifest()
 	if err != nil {
@@ -57,7 +55,6 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Found manifest (%d bytes)\n", len(manifestData))
 	}
 
-	// Clone/update repo
 	localPath := repoSrc.LocalPath()
 	if _, err := os.Stat(localPath); os.IsNotExist(err) {
 		fmt.Printf("Cloning %s to %s...\n", repoStr, localPath)
@@ -69,27 +66,23 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("clone/update repo: %w", err)
 	}
 
-	// Determine source path (repo root or subdirectory)
 	sourcePath := localPath
-	if installPath != "" {
-		sourcePath = filepath.Join(localPath, installPath)
+	if addPath != "" {
+		sourcePath = filepath.Join(localPath, addPath)
 	}
 
-	// Load repo config if present
 	repoCfg, err := config.Load(sourcePath, globalConfigPath)
 	if err != nil {
 		return fmt.Errorf("load repo config: %w", err)
 	}
 
-	// Determine targets (all defined harnesses by default)
-	targets := installHarnesses
+	targets := addHarnesses
 	if len(targets) == 0 {
 		for name := range repoCfg.Harness {
 			targets = append(targets, name)
 		}
 	}
 
-	// Sync
 	opts := sync.Options{
 		SourcePaths: []string{sourcePath},
 		Targets:     targets,
@@ -97,13 +90,11 @@ func runInstall(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Syncing to %v...\n", targets)
 
-	// Phase 1: Detect conflicts
 	detection, err := sync.Detect(repoCfg, opts)
 	if err != nil {
 		return err
 	}
 
-	// Collect conflicts and check for fresh installs
 	var allConflicts []sync.Conflict
 	var freshTargets []string
 	for _, det := range detection {
@@ -113,16 +104,13 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Warn about fresh installs
 	if len(freshTargets) > 0 {
 		fmt.Printf("First install to: %v (no lockfile found)\n", freshTargets)
 	}
 
-	// Phase 2: Handle conflicts
-	// Skip unmanaged existing files, overwrite if --force
 	resolutions := make(sync.ResolutionMap)
 	if len(allConflicts) > 0 {
-		if installForce {
+		if addForce {
 			for _, c := range allConflicts {
 				key := sync.ConflictKey(c.Target, c.Artifact.Name)
 				resolutions[key] = sync.ResolutionOverwrite
@@ -138,7 +126,6 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Phase 3: Apply
 	result, err := sync.Apply(repoCfg, detection, sync.ApplyOptions{
 		Options:     opts,
 		Resolutions: resolutions,
@@ -155,15 +142,14 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Skipped %d (excluded or already exist)\n", result.Skipped)
 	}
 
-	// Save source to config
 	src := config.Source{
 		Repo: repoStr,
-		Path: installPath,
-		Ref:  installRef,
+		Path: addPath,
+		Ref:  addRef,
 	}
 
 	var configPath string
-	if installLocal {
+	if addLocal {
 		cwd, err := os.Getwd()
 		if err != nil {
 			return fmt.Errorf("get working directory: %w", err)

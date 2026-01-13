@@ -216,3 +216,40 @@ func TestArtifactRenderEmptyFrontmatter(t *testing.T) {
 		t.Errorf("Render() = %q, want %q", got, want)
 	}
 }
+
+func TestArtifactFullName(t *testing.T) {
+	tests := []struct {
+		name      string
+		namespace string
+		artName   string
+		want      string
+	}{
+		{"with namespace", "company", "code-test", "company.code-test"},
+		{"empty namespace", "", "code-test", "code-test"},
+		{"different namespace", "myorg", "deploy", "myorg.deploy"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			art := &Artifact{
+				Name:      tt.artName,
+				Namespace: tt.namespace,
+			}
+			got := art.FullName()
+			if got != tt.want {
+				t.Errorf("FullName() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestArtifactNamespaceField(t *testing.T) {
+	art := &Artifact{
+		Name:      "test-skill",
+		Namespace: "mycompany",
+	}
+
+	if art.Namespace != "mycompany" {
+		t.Errorf("Namespace = %q, want %q", art.Namespace, "mycompany")
+	}
+}

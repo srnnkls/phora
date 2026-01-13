@@ -104,9 +104,8 @@ Runs tests and reports results.
 			},
 			"opencode": {
 				Path:                       opencodeTarget,
-				
 				GenerateCommandsFromSkills: true,
-				Mappings: map[string]string{
+				Keys: map[string]string{
 					"allowed_tools": "tools",
 				},
 				Variables: map[string]string{

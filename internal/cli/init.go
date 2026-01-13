@@ -6,14 +6,13 @@ import (
 	"path/filepath"
 
 	"github.com/spf13/cobra"
-	"github.com/srnnkls/phora/internal/defaults"
 	"github.com/srnnkls/phora/internal/manifest"
 )
 
 var initCmd = &cobra.Command{
 	Use:   "init",
-	Short: "Initialize phora configuration",
-	Long:  "Check repo structure and create phora.toml with default mappings",
+	Short: "Initialize phora package manifest",
+	Long:  "Scan for artifacts and generate .phora/manifest.yaml",
 	RunE:  runInit,
 }
 
@@ -45,18 +44,6 @@ func runInit(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  Skills:   %d\n", len(m.Skills))
 	fmt.Printf("  Commands: %d\n", len(m.Commands))
 	fmt.Printf("  Agents:   %d\n", len(m.Agents))
-
-	// Generate config if it doesn't exist
-	configPath := filepath.Join(cwd, "phora.toml")
-	if _, err := os.Stat(configPath); err == nil {
-		return nil
-	}
-
-	if err := os.WriteFile(configPath, []byte(defaults.ConfigTOML), 0644); err != nil {
-		return err
-	}
-
-	fmt.Println("Created phora.toml")
 
 	return nil
 }
