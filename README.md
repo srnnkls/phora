@@ -24,17 +24,23 @@ go install github.com/srnnkls/phora/cmd/phora@latest
 # Initialize config in current directory
 phora init
 
-# Install artifacts from a repository
-phora install owner/repo
+# Add artifacts from a repository
+phora add owner/repo
 
-# Sync artifacts to configured harnesses
-phora sync
+# Add with options
+phora add owner/repo --ref main --path skills --local
 
-# Sync to specific harness
-phora sync --target claude
+# Deploy artifacts to configured harnesses
+phora deploy
 
-# Dry run
-phora sync --dry-run
+# Deploy to specific harness
+phora deploy --target claude
+
+# Deploy with options
+phora deploy --dry-run           # Preview changes
+phora deploy --interactive       # Prompt for conflicts
+phora deploy --skip              # Skip existing files
+phora deploy --source ./custom   # Deploy from specific path
 ```
 
 ## Configuration
@@ -45,15 +51,44 @@ Phora uses `phora.toml` for configuration:
 default_harnesses = ["claude"]
 default_artifacts = ["skills", "commands", "agents"]
 
+# Optional: Declare available artifacts in this repo
+[manifest]
+skills = ["code-review", "code-test"]
+commands = ["build"]
+agents = ["reviewer"]
+
+# Optional: Configure artifact sources
+[sources.mycompany]
+repo = "mycompany/shared-skills"
+ref = "main"
+path = "artifacts"
+# Artifacts become: mycompany.skill-name
+
+[sources.personal]
+repo = "username/dotfiles"
+global = true  # Use bare names (no namespace prefix)
+
+# Claude Code harness
 [harness.claude]
 path = "~/.claude"
 
+[harness.claude.variables]
+model_strong = "opus"
+model_weak = "haiku"
+
+# OpenCode harness
 [harness.opencode]
-path = "~/.opencode"
+path = "~/.config/opencode"
 generate_commands_from_skills = true
 
-[harness.opencode.mappings]
+# Map YAML keys (rename fields)
+[harness.opencode.keys]
 allowed_tools = "tools"
+
+# Map tool names
+[harness.opencode.tools]
+bash = "Bash"
+read = "Read"
 
 [harness.opencode.variables]
 model_strong = "anthropic/claude-sonnet-4-5"
@@ -71,5 +106,53 @@ Phora supports multiple AI coding assistant configurations:
 Each harness can have:
 - Custom output paths
 - Key mappings (e.g., `allowed_tools` → `tools`)
+- Tool name mappings (e.g., `bash` → `Bash`)
 - Variable substitution (e.g., `{{model_strong}}`)
 - Auto-generation of commands from user-invocable skills
+
+## Namespaces
+
+Phora uses namespaces to prevent conflicts when artifacts come from multiple sources:
+
+- **Global sources** (with `global = true`) use bare artifact names: `skill-name`
+- **Non-global sources** use namespaced names: `source-name.skill-name`
+
+Example:
+```toml
+[sources.personal]
+repo = "user/dotfiles"
+global = true  # Artifacts: code-review, test-runner
+
+[sources.company]
+repo = "company/shared"
+# Artifacts: company.deploy, company.review
+```
+
+When deployed, artifacts are stored with their full names:
+```
+~/.claude/skills/code-review/         # from global source
+~/.claude/skills/company.deploy/      # from company source
+```
+
+## References
+
+Phora transforms artifact references in backticks to match each harness's format:
+
+| Symbol | Type | Source Format | Claude Code | OpenCode |
+|--------|------|---------------|-------------|----------|
+| `$` | Skill | `$skill-name` | `/skill-name` | `@skill-name` |
+| `@` | Agent | `@agent-name` | `@agent-name` | `@agent-name` |
+| `#` | Command | `#cmd-name` | `#cmd-name` | `#cmd-name` |
+| `!` | Tool | `!tool-name` | `ToolName` | `tool_name` |
+
+Example skill content:
+```markdown
+Use `$code-review` after writing code.
+Run `!bash` to execute tests.
+```
+
+Transforms to (Claude Code):
+```markdown
+Use `/code-review` after writing code.
+Run `Bash` to execute tests.
+```
