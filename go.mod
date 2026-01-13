@@ -1,4 +1,4 @@
-module github.com/srnnkls/tropos
+module github.com/srnnkls/phora
 
 go 1.23.0
 
