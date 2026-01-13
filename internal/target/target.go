@@ -5,8 +5,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/srnnkls/tropos/internal/artifact"
-	"github.com/srnnkls/tropos/internal/config"
+	"github.com/srnnkls/phora/internal/artifact"
+	"github.com/srnnkls/phora/internal/config"
 )
 
 type Target interface {

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"text/template"
 
-	"github.com/srnnkls/tropos/internal/artifact"
+	"github.com/srnnkls/phora/internal/artifact"
 )
 
 type Transformer struct {

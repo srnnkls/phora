@@ -5,9 +5,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/srnnkls/tropos/internal/artifact"
-	"github.com/srnnkls/tropos/internal/config"
-	"github.com/srnnkls/tropos/internal/lockfile"
+	"github.com/srnnkls/phora/internal/artifact"
+	"github.com/srnnkls/phora/internal/config"
+	"github.com/srnnkls/phora/internal/lockfile"
 )
 
 func setupSyncTest(t *testing.T) (srcDir, targetDir string, cfg *config.Config) {
@@ -153,7 +153,7 @@ func TestSyncConflictFileExists_Managed(t *testing.T) {
 	os.MkdirAll(skillDir, 0755)
 	os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("existing"), 0644)
 
-	// Add to lock file (managed by tropos)
+	// Add to lock file (managed by phora)
 	lf := &lockfile.LockFile{
 		Files: []lockfile.FileEntry{
 			{Path: "skills/code-test/SKILL.md", Artifact: "code-test", Type: "skill"},

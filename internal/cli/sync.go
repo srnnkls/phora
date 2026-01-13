@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 
 	"github.com/spf13/cobra"
-	"github.com/srnnkls/tropos/internal/config"
-	"github.com/srnnkls/tropos/internal/sync"
+	"github.com/srnnkls/phora/internal/config"
+	"github.com/srnnkls/phora/internal/sync"
 )
 
 var (
@@ -101,7 +101,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 			resolutions = promptResult.Resolutions
 
 			// Save skip choices to config as exclusions
-			configPath := filepath.Join(cwd, "tropos.toml")
+			configPath := filepath.Join(cwd, "phora.toml")
 			var savedExclusions int
 			for _, c := range allConflicts {
 				key := sync.ConflictKey(c.Target, c.Artifact.Name)
@@ -114,10 +114,10 @@ func runSync(cmd *cobra.Command, args []string) error {
 				}
 			}
 			if savedExclusions > 0 {
-				fmt.Printf("Saved %d exclusion(s) to tropos.toml\n", savedExclusions)
+				fmt.Printf("Saved %d exclusion(s) to phora.toml\n", savedExclusions)
 			}
 		} else {
-			// Default: overwrite all conflicts (tropos-managed files)
+			// Default: overwrite all conflicts (phora-managed files)
 			for _, c := range allConflicts {
 				key := sync.ConflictKey(c.Target, c.Artifact.Name)
 				resolutions[key] = sync.ResolutionOverwrite

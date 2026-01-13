@@ -6,9 +6,9 @@ import (
 	"path/filepath"
 
 	"github.com/spf13/cobra"
-	"github.com/srnnkls/tropos/internal/config"
-	"github.com/srnnkls/tropos/internal/source"
-	"github.com/srnnkls/tropos/internal/sync"
+	"github.com/srnnkls/phora/internal/config"
+	"github.com/srnnkls/phora/internal/source"
+	"github.com/srnnkls/phora/internal/sync"
 )
 
 var (
@@ -31,7 +31,7 @@ func init() {
 	installCmd.Flags().StringSliceVar(&installHarnesses, "harness", nil, "Target harnesses (default: all enabled)")
 	installCmd.Flags().StringVar(&installRef, "ref", "main", "Branch, tag, or commit")
 	installCmd.Flags().StringVar(&installPath, "path", "", "Subdirectory within repo containing artifacts")
-	installCmd.Flags().BoolVar(&installLocal, "local", false, "Save source to local tropos.toml instead of global config")
+	installCmd.Flags().BoolVar(&installLocal, "local", false, "Save source to local phora.toml instead of global config")
 	installCmd.Flags().BoolVarP(&installForce, "force", "f", false, "Overwrite existing unmanaged files")
 }
 
@@ -129,7 +129,7 @@ func runInstall(cmd *cobra.Command, args []string) error {
 			}
 			fmt.Printf("Overwriting %d existing file(s) (--force)\n", len(allConflicts))
 		} else {
-			fmt.Printf("Skipping %d existing file(s) not managed by tropos:\n", len(allConflicts))
+			fmt.Printf("Skipping %d existing file(s) not managed by phora:\n", len(allConflicts))
 			for _, c := range allConflicts {
 				key := sync.ConflictKey(c.Target, c.Artifact.Name)
 				resolutions[key] = sync.ResolutionSkip
@@ -168,7 +168,7 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("get working directory: %w", err)
 		}
-		configPath = filepath.Join(cwd, "tropos.toml")
+		configPath = filepath.Join(cwd, "phora.toml")
 	} else {
 		configPath = globalConfigPath
 	}

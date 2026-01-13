@@ -5,12 +5,12 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
-	"github.com/srnnkls/tropos/internal/config"
+	"github.com/srnnkls/phora/internal/config"
 )
 
 var configCmd = &cobra.Command{
 	Use:   "config",
-	Short: "Manage tropos configuration",
+	Short: "Manage phora configuration",
 }
 
 var configListCmd = &cobra.Command{
@@ -42,7 +42,7 @@ func runConfigList(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	projectConfigPath := cwd + "/tropos.toml"
+	projectConfigPath := cwd + "/phora.toml"
 	if _, err := os.Stat(projectConfigPath); err == nil {
 		p, err := config.LoadFile(projectConfigPath)
 		if err != nil {

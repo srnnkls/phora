@@ -4,10 +4,10 @@ import (
 	_ "embed"
 
 	"github.com/pelletier/go-toml/v2"
-	"github.com/srnnkls/tropos/internal/config"
+	"github.com/srnnkls/phora/internal/config"
 )
 
-//go:embed tropos.toml
+//go:embed phora.toml
 var ConfigTOML string
 
 func Config() (*config.Config, error) {

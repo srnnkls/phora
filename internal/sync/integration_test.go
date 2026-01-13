@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/srnnkls/tropos/internal/config"
-	"github.com/srnnkls/tropos/internal/sync"
+	"github.com/srnnkls/phora/internal/config"
+	"github.com/srnnkls/phora/internal/sync"
 )
 
 func TestIntegrationFullDeploy(t *testing.T) {

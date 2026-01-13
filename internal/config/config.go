@@ -63,7 +63,7 @@ func Load(projectDir, globalConfigPath string) (*Config, error) {
 	}
 
 	var project *Config
-	projectConfigPath := filepath.Join(projectDir, "tropos.toml")
+	projectConfigPath := filepath.Join(projectDir, "phora.toml")
 	if _, err := os.Stat(projectConfigPath); err == nil {
 		p, err := LoadFile(projectConfigPath)
 		if err != nil {

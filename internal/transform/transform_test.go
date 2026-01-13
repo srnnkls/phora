@@ -3,7 +3,7 @@ package transform
 import (
 	"testing"
 
-	"github.com/srnnkls/tropos/internal/artifact"
+	"github.com/srnnkls/phora/internal/artifact"
 )
 
 func TestExecuteTemplate(t *testing.T) {

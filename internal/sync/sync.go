@@ -5,12 +5,12 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/srnnkls/tropos/internal/artifact"
-	"github.com/srnnkls/tropos/internal/config"
-	"github.com/srnnkls/tropos/internal/lockfile"
-	"github.com/srnnkls/tropos/internal/source"
-	"github.com/srnnkls/tropos/internal/target"
-	"github.com/srnnkls/tropos/internal/transform"
+	"github.com/srnnkls/phora/internal/artifact"
+	"github.com/srnnkls/phora/internal/config"
+	"github.com/srnnkls/phora/internal/lockfile"
+	"github.com/srnnkls/phora/internal/source"
+	"github.com/srnnkls/phora/internal/target"
+	"github.com/srnnkls/phora/internal/transform"
 )
 
 type Options struct {
@@ -176,7 +176,7 @@ func Apply(cfg *config.Config, detection []DetectionResult, opts ApplyOptions) (
 				}
 			} else if !opts.Force {
 				// No conflict, but check if file exists (for non-force mode)
-				// Skip only if file exists AND is not managed by tropos
+				// Skip only if file exists AND is not managed by phora
 				if exists, path := tgt.Exists(art); exists {
 					relativePath := relativeTo(basePath, path)
 					if !lf.IsManaged(relativePath) {

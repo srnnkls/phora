@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/srnnkls/tropos/internal/artifact"
-	"github.com/srnnkls/tropos/internal/sync"
+	"github.com/srnnkls/phora/internal/artifact"
+	"github.com/srnnkls/phora/internal/sync"
 )
 
 func TestPrompter_ResolveConflicts_Skip(t *testing.T) {

@@ -17,16 +17,16 @@ func Execute() error {
 }
 
 var rootCmd = &cobra.Command{
-	Use:   "tropos",
+	Use:   "phora",
 	Short: "Sync AI assistant artifacts across harnesses",
-	Long:  "Tropos syncs skills, commands, and agents across different AI coding assistant harnesses (Claude, OpenCode, Codex).",
+	Long:  "Phora syncs skills, commands, and agents across different AI coding assistant harnesses (Claude, OpenCode, Codex).",
 }
 
 func init() {
 	home, _ := os.UserHomeDir()
 
-	defaultConfig := filepath.Join(home, ".config", "tropos", "config.toml")
-	defaultData := filepath.Join(home, ".local", "share", "tropos", "repos")
+	defaultConfig := filepath.Join(home, ".config", "phora", "config.toml")
+	defaultData := filepath.Join(home, ".local", "share", "phora", "repos")
 
 	rootCmd.PersistentFlags().StringVar(&globalConfigPath, "config", defaultConfig, "Global config file")
 	rootCmd.PersistentFlags().StringVar(&dataDir, "data-dir", defaultData, "Data directory for cloned repos")

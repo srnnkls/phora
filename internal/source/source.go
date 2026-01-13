@@ -10,7 +10,7 @@ import (
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/srnnkls/tropos/internal/artifact"
+	"github.com/srnnkls/phora/internal/artifact"
 )
 
 type Source interface {
@@ -94,10 +94,10 @@ func (s *RepoSource) RepoURL() string {
 
 func (s *RepoSource) ManifestURL() string {
 	if s.Host == "github.com" {
-		return fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/%s/.tropos/manifest.yaml",
+		return fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/%s/.phora/manifest.yaml",
 			s.Owner, s.Repo, s.Ref)
 	}
-	return fmt.Sprintf("https://%s/%s/%s/-/raw/%s/.tropos/manifest.yaml",
+	return fmt.Sprintf("https://%s/%s/%s/-/raw/%s/.phora/manifest.yaml",
 		s.Host, s.Owner, s.Repo, s.Ref)
 }
 

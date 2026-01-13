@@ -4,12 +4,12 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/srnnkls/tropos/internal/artifact"
+	"github.com/srnnkls/phora/internal/artifact"
 	"gopkg.in/yaml.v3"
 )
 
 const (
-	Dir      = ".tropos"
+	Dir      = ".phora"
 	FileName = "manifest.yaml"
 )
 

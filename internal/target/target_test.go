@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/srnnkls/tropos/internal/artifact"
-	"github.com/srnnkls/tropos/internal/config"
+	"github.com/srnnkls/phora/internal/artifact"
+	"github.com/srnnkls/phora/internal/config"
 )
 
 func TestTargetPath(t *testing.T) {

@@ -6,14 +6,14 @@ import (
 	"path/filepath"
 
 	"github.com/spf13/cobra"
-	"github.com/srnnkls/tropos/internal/defaults"
-	"github.com/srnnkls/tropos/internal/manifest"
+	"github.com/srnnkls/phora/internal/defaults"
+	"github.com/srnnkls/phora/internal/manifest"
 )
 
 var initCmd = &cobra.Command{
 	Use:   "init",
-	Short: "Initialize tropos configuration",
-	Long:  "Check repo structure and create tropos.toml with default mappings",
+	Short: "Initialize phora configuration",
+	Long:  "Check repo structure and create phora.toml with default mappings",
 	RunE:  runInit,
 }
 
@@ -47,7 +47,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  Agents:   %d\n", len(m.Agents))
 
 	// Generate config if it doesn't exist
-	configPath := filepath.Join(cwd, "tropos.toml")
+	configPath := filepath.Join(cwd, "phora.toml")
 	if _, err := os.Stat(configPath); err == nil {
 		return nil
 	}
@@ -56,7 +56,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	fmt.Println("Created tropos.toml")
+	fmt.Println("Created phora.toml")
 
 	return nil
 }

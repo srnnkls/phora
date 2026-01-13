@@ -138,7 +138,7 @@ func TestRepoSourceParseRepoString(t *testing.T) {
 		wantOwner string
 		wantRepo  string
 	}{
-		{"srnnkls/tropos", "github.com", "srnnkls", "tropos"},
+		{"srnnkls/phora", "github.com", "srnnkls", "phora"},
 		{"github.com/org/repo", "github.com", "org", "repo"},
 		{"gitlab.com/org/repo", "gitlab.com", "org", "repo"},
 	}
@@ -158,11 +158,11 @@ func TestRepoSourceDataDir(t *testing.T) {
 	src := &RepoSource{
 		Host:    "github.com",
 		Owner:   "srnnkls",
-		Repo:    "tropos",
-		DataDir: "/home/user/.local/share/tropos/repos",
+		Repo:    "phora",
+		DataDir: "/home/user/.local/share/phora/repos",
 	}
 
-	expected := "/home/user/.local/share/tropos/repos/github.com/srnnkls/tropos"
+	expected := "/home/user/.local/share/phora/repos/github.com/srnnkls/phora"
 	if src.LocalPath() != expected {
 		t.Errorf("LocalPath() = %q, want %q", src.LocalPath(), expected)
 	}

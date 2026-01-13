@@ -18,7 +18,7 @@ func TestLoad_NonExistent(t *testing.T) {
 
 func TestLoad_ExistingFile(t *testing.T) {
 	dir := t.TempDir()
-	lockPath := filepath.Join(dir, ".tropos.lock")
+	lockPath := filepath.Join(dir, ".phora.lock")
 
 	content := `[[files]]
 path = "skills/code-test/SKILL.md"

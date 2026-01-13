@@ -8,7 +8,7 @@ import (
 
 func TestWriteFile(t *testing.T) {
 	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "tropos.toml")
+	path := filepath.Join(tmpDir, "phora.toml")
 
 	cfg := &Config{
 		DefaultHarnesses: []string{"claude"},
@@ -46,7 +46,7 @@ func TestWriteFile(t *testing.T) {
 
 func TestAddExclusion(t *testing.T) {
 	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "tropos.toml")
+	path := filepath.Join(tmpDir, "phora.toml")
 
 	// Create initial config
 	cfg := &Config{
@@ -90,7 +90,7 @@ func TestAddExclusion(t *testing.T) {
 
 func TestAddExclusionNewHarness(t *testing.T) {
 	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "tropos.toml")
+	path := filepath.Join(tmpDir, "phora.toml")
 
 	// Start with empty config
 	cfg := &Config{
@@ -113,7 +113,7 @@ func TestAddExclusionNewHarness(t *testing.T) {
 
 func TestAddExclusionNewFile(t *testing.T) {
 	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "new-tropos.toml")
+	path := filepath.Join(tmpDir, "new-phora.toml")
 
 	// File doesn't exist yet
 	err := AddExclusion(path, "claude", "skill")
@@ -134,7 +134,7 @@ func TestAddExclusionNewFile(t *testing.T) {
 
 func TestRemoveExclusion(t *testing.T) {
 	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "tropos.toml")
+	path := filepath.Join(tmpDir, "phora.toml")
 
 	cfg := &Config{
 		Harness: map[string]Harness{
@@ -164,7 +164,7 @@ func TestRemoveExclusion(t *testing.T) {
 
 func TestAddSource(t *testing.T) {
 	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "tropos.toml")
+	path := filepath.Join(tmpDir, "phora.toml")
 
 	cfg := &Config{
 		Harness: map[string]Harness{},
@@ -191,7 +191,7 @@ func TestAddSource(t *testing.T) {
 
 func TestAddSourceOverride(t *testing.T) {
 	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "tropos.toml")
+	path := filepath.Join(tmpDir, "phora.toml")
 
 	cfg := &Config{
 		Sources: map[string]Source{

@@ -7,7 +7,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/srnnkls/tropos/internal/sync"
+	"github.com/srnnkls/phora/internal/sync"
 )
 
 // Prompter handles interactive conflict resolution

@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	"github.com/srnnkls/tropos/internal/cli"
+	"github.com/srnnkls/phora/internal/cli"
 )
 
 func main() {

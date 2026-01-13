@@ -11,7 +11,7 @@ import (
 	"github.com/pelletier/go-toml/v2"
 )
 
-const FileName = ".tropos.lock"
+const FileName = ".phora.lock"
 
 type LockFile struct {
 	Files []FileEntry `toml:"files"`

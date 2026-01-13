@@ -85,7 +85,7 @@ func TestMergeConfigs(t *testing.T) {
 		Harness: map[string]Harness{
 			"claude": {
 				Variables: map[string]string{
-					"project_name": "tropos",
+					"project_name": "phora",
 				},
 			},
 		},
@@ -101,8 +101,8 @@ func TestMergeConfigs(t *testing.T) {
 	if claude.Variables["model_strong"] != "opus" {
 		t.Errorf("merged claude.Variables[model_strong] = %q, want %q", claude.Variables["model_strong"], "opus")
 	}
-	if claude.Variables["project_name"] != "tropos" {
-		t.Errorf("merged claude.Variables[project_name] = %q, want %q", claude.Variables["project_name"], "tropos")
+	if claude.Variables["project_name"] != "phora" {
+		t.Errorf("merged claude.Variables[project_name] = %q, want %q", claude.Variables["project_name"], "phora")
 	}
 }
 
@@ -131,7 +131,7 @@ func TestExpandPath(t *testing.T) {
 func TestLoadWithDiscovery(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	globalDir := filepath.Join(tmpDir, ".config", "tropos")
+	globalDir := filepath.Join(tmpDir, ".config", "phora")
 	os.MkdirAll(globalDir, 0755)
 	os.WriteFile(filepath.Join(globalDir, "config.toml"), []byte(`
 default_harnesses = ["claude"]
@@ -145,7 +145,7 @@ model_strong = "opus"
 
 	projectDir := filepath.Join(tmpDir, "project")
 	os.MkdirAll(projectDir, 0755)
-	os.WriteFile(filepath.Join(projectDir, "tropos.toml"), []byte(`
+	os.WriteFile(filepath.Join(projectDir, "phora.toml"), []byte(`
 default_harnesses = ["claude", "opencode"]
 
 [harness.claude.variables]
@@ -217,7 +217,7 @@ repo = "https://github.com/another/repo.git"
 `
 
 	tmpDir := t.TempDir()
-	configPath := filepath.Join(tmpDir, "tropos.toml")
+	configPath := filepath.Join(tmpDir, "phora.toml")
 	os.WriteFile(configPath, []byte(configContent), 0644)
 
 	cfg, err := LoadFile(configPath)
