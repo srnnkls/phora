@@ -15,14 +15,14 @@ var (
 	addHarnesses []string
 	addRef       string
 	addPath      string
-	addLocal     bool
+	addGlobal    bool
 	addForce     bool
 )
 
 var addCmd = &cobra.Command{
 	Use:   "add <owner/repo>",
 	Short: "Add artifacts from a repository",
-	Long:  "Clone repo to data directory and sync to harnesses",
+	Long:  "Clone repo to data directory and sync to harnesses (local by default)",
 	Args:  cobra.ExactArgs(1),
 	RunE:  runAdd,
 }
@@ -31,7 +31,7 @@ func init() {
 	addCmd.Flags().StringSliceVar(&addHarnesses, "harness", nil, "Target harnesses (default: all enabled)")
 	addCmd.Flags().StringVar(&addRef, "ref", "main", "Branch, tag, or commit")
 	addCmd.Flags().StringVar(&addPath, "path", "", "Subdirectory within repo containing artifacts")
-	addCmd.Flags().BoolVar(&addLocal, "local", false, "Save source to local phora.toml instead of global config")
+	addCmd.Flags().BoolVarP(&addGlobal, "global", "g", false, "Save source to global config instead of local phora.toml")
 	addCmd.Flags().BoolVarP(&addForce, "force", "f", false, "Overwrite existing unmanaged files")
 	rootCmd.AddCommand(addCmd)
 }
@@ -175,14 +175,14 @@ func runAdd(cmd *cobra.Command, args []string) error {
 	}
 
 	var configPath string
-	if addLocal {
+	if addGlobal {
+		configPath = globalConfigPath
+	} else {
 		cwd, err := os.Getwd()
 		if err != nil {
 			return fmt.Errorf("get working directory: %w", err)
 		}
 		configPath = filepath.Join(cwd, "phora.toml")
-	} else {
-		configPath = globalConfigPath
 	}
 
 	if err := config.AddSource(configPath, repoStr, src); err != nil {

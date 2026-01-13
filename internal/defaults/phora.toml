@@ -15,7 +15,7 @@ raw_url = "https://gitlab.com/{owner}/{repo}/-/raw/{ref}/{path}"
 # Structure: nested (skills/name/SKILL.md)
 # Docs: https://docs.anthropic.com/en/docs/claude-code
 [harness.claude]
-path = "~/.claude"
+path = ".claude"
 structure = "nested"
 
 [harness.claude.variables]
@@ -45,7 +45,7 @@ output = "@{{.Name}}"
 # Structure: flat (skills/name.md)
 # Docs: https://opencode.ai/docs/
 [harness.opencode]
-path = "~/.opencode"
+path = ".opencode"
 structure = "flat"
 generate_commands_from_skills = true
 
@@ -78,7 +78,7 @@ model_weak = "anthropic/claude-haiku-4-5"
 # Structure: nested (skills/name/SKILL.md)
 # Docs: https://github.com/openai/codex
 [harness.codex]
-path = "~/.codex"
+path = ".codex"
 structure = "nested"
 
 [harness.codex.variables]
@@ -107,7 +107,7 @@ output = "@{{.Name}}"
 # Structure: nested (skills/name/SKILL.md)
 # Docs: https://github.com/google-gemini/gemini-cli
 [harness.gemini]
-path = "~/.gemini"
+path = ".gemini"
 structure = "nested"
 
 [harness.gemini.variables]
@@ -136,7 +136,7 @@ output = "@{{.Name}}"
 # Structure: nested (skills/name/SKILL.md)
 # Docs: https://docs.github.com/en/copilot
 [harness.github]
-path = "~/.config/gh"
+path = ".github"
 structure = "nested"
 
 [harness.github.variables]
@@ -165,7 +165,7 @@ output = "@{{.Name}}"
 # Structure: nested (skills/name/SKILL.md)
 # Docs: https://cursor.com/docs/context/skills
 [harness.cursor]
-path = "~/.cursor"
+path = ".cursor"
 structure = "nested"
 
 [harness.cursor.variables]

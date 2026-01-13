@@ -1,3 +1,8 @@
+# Example phora.toml configuration
+# This can be used as either:
+# - Project config: ./phora.toml (uses relative paths by default)
+# - Global config: ~/.config/phora/phora.toml (override paths to ~/)
+
 default_harnesses = ["claude"]
 default_artifacts = ["skills", "commands", "agents"]
 
@@ -20,8 +25,9 @@ repo = "username/dotfiles"
 global = true  # Use bare names (no namespace prefix)
 
 # Claude Code harness
+# Note: In global config (~/.config/phora/phora.toml), override path to ~/.claude
 [harness.claude]
-path = "~/.claude"
+path = "~/.claude"  # Use .claude for project-local, ~/.claude for global
 
 [harness.claude.variables]
 model_strong = "opus"
