@@ -44,23 +44,39 @@ func runAdd(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	repoSrc := source.NewRepo(repoStr, addRef, dataDir, cfg.DefaultArtifacts)
+	// Parse repo string to get structured data
+	host, owner, repo := source.ParseRepoString(repoStr)
 
-	fmt.Printf("Fetching config from %s...\n", repoSrc.ConfigURL())
-	configData, err := repoSrc.FetchConfig()
-	if err != nil {
-		fmt.Printf("Warning: %v\n", err)
-		fmt.Println("Proceeding without remote config...")
-	} else {
-		remoteConfig, err := config.ParseTOML(configData)
-		if err != nil {
-			fmt.Printf("Warning: failed to parse remote config: %v\n", err)
-		} else if remoteConfig.Manifest != nil {
-			fmt.Printf("Found manifest with %d skill(s), %d command(s), %d agent(s)\n",
-				len(remoteConfig.Manifest.Skills),
-				len(remoteConfig.Manifest.Commands),
-				len(remoteConfig.Manifest.Agents))
+	// Look up host config (may be nil for unknown hosts)
+	var hostConfig *config.Host
+	if cfg.Hosts != nil {
+		if hc, ok := cfg.Hosts[host]; ok {
+			hostConfig = &hc
 		}
+	}
+
+	repoSrc := source.NewRepo(repoStr, addRef, dataDir, hostConfig, cfg.DefaultArtifacts)
+
+	configURL := repoSrc.ConfigURL()
+	if configURL != "" {
+		fmt.Printf("Fetching config from %s...\n", configURL)
+		configData, err := repoSrc.FetchConfig()
+		if err != nil {
+			fmt.Printf("Warning: %v\n", err)
+			fmt.Println("Proceeding without remote config...")
+		} else {
+			remoteConfig, err := config.ParseTOML(configData)
+			if err != nil {
+				fmt.Printf("Warning: failed to parse remote config: %v\n", err)
+			} else if remoteConfig.Manifest != nil {
+				fmt.Printf("Found manifest with %d skill(s), %d command(s), %d agent(s)\n",
+					len(remoteConfig.Manifest.Skills),
+					len(remoteConfig.Manifest.Commands),
+					len(remoteConfig.Manifest.Agents))
+			}
+		}
+	} else {
+		fmt.Println("No host configuration for direct config fetch - will clone and discover locally")
 	}
 
 	localPath := repoSrc.LocalPath()
@@ -151,9 +167,11 @@ func runAdd(cmd *cobra.Command, args []string) error {
 	}
 
 	src := config.Source{
-		Repo: repoStr,
-		Path: addPath,
-		Ref:  addRef,
+		Host:  host,
+		Owner: owner,
+		Repo:  repo,
+		Path:  addPath,
+		Ref:   addRef,
 	}
 
 	var configPath string

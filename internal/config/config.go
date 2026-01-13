@@ -11,9 +11,15 @@ import (
 type Config struct {
 	DefaultHarnesses []string           `toml:"default_harnesses,omitempty"`
 	DefaultArtifacts []string           `toml:"default_artifacts,omitempty"`
+	Hosts            map[string]Host    `toml:"hosts,omitempty"`
 	Manifest         *Manifest          `toml:"manifest,omitempty"`
 	Sources          map[string]Source  `toml:"sources,omitempty"`
 	Harness          map[string]Harness `toml:"harness,omitempty"`
+}
+
+type Host struct {
+	GitURL string `toml:"git_url,omitempty"`
+	RawURL string `toml:"raw_url,omitempty"`
 }
 
 type Manifest struct {
@@ -25,6 +31,8 @@ type Manifest struct {
 
 type Source struct {
 	Type   string `toml:"type,omitempty"`
+	Host   string `toml:"host,omitempty"`
+	Owner  string `toml:"owner,omitempty"`
 	Repo   string `toml:"repo,omitempty"`
 	Path   string `toml:"path,omitempty"`
 	Ref    string `toml:"ref,omitempty"`
@@ -58,6 +66,9 @@ func ParseTOML(data []byte) (*Config, error) {
 	var cfg Config
 	if err := toml.Unmarshal(data, &cfg); err != nil {
 		return nil, err
+	}
+	if cfg.Hosts == nil {
+		cfg.Hosts = make(map[string]Host)
 	}
 	if cfg.Sources == nil {
 		cfg.Sources = make(map[string]Source)

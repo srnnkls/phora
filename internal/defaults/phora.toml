@@ -1,6 +1,16 @@
 default_harnesses = ["claude"]
 default_artifacts = ["skills", "commands", "agents"]
 
+# Host configurations for direct config/manifest fetching
+# If host is not defined, falls back to git clone only
+[hosts.github]
+git_url = "https://github.com/{owner}/{repo}.git"
+raw_url = "https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{path}"
+
+[hosts.gitlab]
+git_url = "https://gitlab.com/{owner}/{repo}.git"
+raw_url = "https://gitlab.com/{owner}/{repo}/-/raw/{ref}/{path}"
+
 # Claude Code - Anthropic's CLI
 # Structure: nested (skills/name/SKILL.md)
 # Docs: https://docs.anthropic.com/en/docs/claude-code
