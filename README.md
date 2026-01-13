@@ -8,7 +8,9 @@
 
 ## About
 
-Phora syncs skills, commands, and agents across different AI coding assistant harnesses (Claude Code, OpenCode, Codex).
+A package manager and multiplexer for agent artifacts—skills, commands, and agents that work across AI coding assistants (Claude Code, OpenCode, Codex).
+
+Phora carries your artifacts across harnesses. Install once, sync everywhere.
 
 ## Installation
 
