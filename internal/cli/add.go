@@ -55,7 +55,12 @@ func runAdd(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	repoSrc := source.NewRepo(repoStr, addRef, dataDir, hostConfig, cfg.DefaultArtifacts)
+	// Use global artifacts config or default
+	artifactTypes := cfg.Artifacts
+	if len(artifactTypes) == 0 {
+		artifactTypes = []string{"skills", "commands", "agents"}
+	}
+	repoSrc := source.NewRepo(repoStr, addRef, dataDir, hostConfig, artifactTypes)
 
 	configURL := repoSrc.ConfigURL()
 	if configURL != "" {

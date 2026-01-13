@@ -53,7 +53,10 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 
 	targets := deployTargets
 	if len(targets) == 0 {
-		targets = cfg.DefaultHarnesses
+		// Use all configured harnesses as default targets
+		for name := range cfg.Harness {
+			targets = append(targets, name)
+		}
 	}
 
 	opts := sync.Options{

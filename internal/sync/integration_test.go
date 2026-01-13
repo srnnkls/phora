@@ -91,8 +91,7 @@ Runs tests and reports results.
 
 	// Create config
 	cfg := &config.Config{
-		DefaultHarnesses: []string{"claude", "opencode"},
-		DefaultArtifacts: []string{"skills", "commands", "agents"},
+		Artifacts: []string{"skills", "commands", "agents"},
 		Harness: map[string]config.Harness{
 			"claude": {
 				Path:                       claudeTarget,
@@ -260,8 +259,7 @@ description: New version
 	os.WriteFile(filepath.Join(targetSkillDir, "SKILL.md"), []byte("Old content"), 0644)
 
 	cfg := &config.Config{
-		DefaultHarnesses: []string{"test"},
-		DefaultArtifacts: []string{"skills"},
+		Artifacts: []string{"skills"},
 		Harness: map[string]config.Harness{
 			"test": {
 				Path: targetDir,
@@ -321,8 +319,7 @@ name: test
 `), 0644)
 
 	cfg := &config.Config{
-		DefaultHarnesses: []string{"test"},
-		DefaultArtifacts: []string{"skills"},
+		Artifacts: []string{"skills"},
 		Harness: map[string]config.Harness{
 			"test": {
 				Path:      targetDir,

@@ -10,8 +10,7 @@ func TestLoadConfig(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	configContent := `
-default_harnesses = ["claude", "opencode"]
-default_artifacts = ["skills", "commands", "agents"]
+artifacts = ["skills", "commands", "agents"]
 
 [harness.claude]
 path = "~/.claude"
@@ -42,8 +41,12 @@ model_weak = "anthropic/claude-haiku-4-5"
 		t.Fatalf("LoadFile() error = %v", err)
 	}
 
-	if len(cfg.DefaultHarnesses) != 2 {
-		t.Errorf("DefaultHarnesses = %v, want 2 items", cfg.DefaultHarnesses)
+	if len(cfg.Artifacts) != 3 {
+		t.Errorf("Artifacts = %v, want 3 items", cfg.Artifacts)
+	}
+
+	if len(cfg.Harness) != 2 {
+		t.Errorf("Harness = %d harnesses, want 2", len(cfg.Harness))
 	}
 
 	claude, ok := cfg.Harness["claude"]
@@ -68,8 +71,7 @@ model_weak = "anthropic/claude-haiku-4-5"
 
 func TestMergeConfigs(t *testing.T) {
 	global := &Config{
-		DefaultHarnesses: []string{"claude"},
-		DefaultArtifacts: []string{"skills"},
+		Artifacts: []string{"skills"},
 		Harness: map[string]Harness{
 			"claude": {
 				Path: "~/.claude",
@@ -81,20 +83,27 @@ func TestMergeConfigs(t *testing.T) {
 	}
 
 	project := &Config{
-		DefaultHarnesses: []string{"claude", "opencode"},
+		Artifacts: []string{"skills", "commands"},
 		Harness: map[string]Harness{
 			"claude": {
 				Variables: map[string]string{
 					"project_name": "phora",
 				},
 			},
+			"opencode": {
+				Path: "~/.opencode",
+			},
 		},
 	}
 
 	merged := Merge(global, project)
 
-	if len(merged.DefaultHarnesses) != 2 {
-		t.Errorf("merged.DefaultHarnesses = %v, want 2 items", merged.DefaultHarnesses)
+	if len(merged.Artifacts) != 2 {
+		t.Errorf("merged.Artifacts = %v, want 2 items (skills, commands)", merged.Artifacts)
+	}
+
+	if len(merged.Harness) != 2 {
+		t.Errorf("merged.Harness = %d harnesses, want 2 (claude, opencode)", len(merged.Harness))
 	}
 
 	claude := merged.Harness["claude"]
@@ -146,10 +155,14 @@ model_strong = "opus"
 	projectDir := filepath.Join(tmpDir, "project")
 	os.MkdirAll(projectDir, 0755)
 	os.WriteFile(filepath.Join(projectDir, "phora.toml"), []byte(`
-default_harnesses = ["claude", "opencode"]
+[harness.claude]
+path = ".claude"
 
 [harness.claude.variables]
 project_name = "test"
+
+[harness.opencode]
+path = ".opencode"
 `), 0644)
 
 	cfg, err := Load(projectDir, filepath.Join(globalDir, "config.toml"))
@@ -157,8 +170,8 @@ project_name = "test"
 		t.Fatalf("Load() error = %v", err)
 	}
 
-	if len(cfg.DefaultHarnesses) != 2 {
-		t.Errorf("DefaultHarnesses = %v, want 2", cfg.DefaultHarnesses)
+	if len(cfg.Harness) != 2 {
+		t.Errorf("Harness = %d, want 2 (claude, opencode)", len(cfg.Harness))
 	}
 
 	claude := cfg.Harness["claude"]

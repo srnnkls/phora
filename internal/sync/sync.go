@@ -81,13 +81,21 @@ func Detect(cfg *config.Config, opts Options) ([]DetectionResult, error) {
 
 	targetNames := opts.Targets
 	if len(targetNames) == 0 {
-		targetNames = cfg.DefaultHarnesses
+		// Use all configured harnesses as default targets
+		for name := range cfg.Harness {
+			targetNames = append(targetNames, name)
+		}
 	}
 
 	// Collect all artifacts from sources
 	var allArtifacts []*artifact.Artifact
 	for _, srcPath := range opts.SourcePaths {
-		src := source.NewLocal(srcPath, cfg.DefaultArtifacts)
+		// Use global artifacts for discovery (will filter per-harness later)
+		artifactTypes := cfg.Artifacts
+		if len(artifactTypes) == 0 {
+			artifactTypes = []string{"skills", "commands", "agents"}
+		}
+		src := source.NewLocal(srcPath, artifactTypes)
 		arts, err := src.Discover()
 		if err != nil {
 			errors = append(errors, err)
@@ -123,8 +131,8 @@ func Detect(cfg *config.Config, opts Options) ([]DetectionResult, error) {
 			continue
 		}
 
-		// Filter artifacts based on include/exclude
-		filtered := filterArtifacts(allArtifacts, harness)
+		// Filter artifacts based on type and include/exclude
+		filtered := filterArtifacts(allArtifacts, harness, cfg.Artifacts)
 
 		// Generate commands from user-invocable skills if configured
 		var generated int
@@ -292,10 +300,34 @@ func Sync(cfg *config.Config, opts Options) (*Result, error) {
 }
 
 // filterArtifacts applies include/exclude rules from harness config
-func filterArtifacts(arts []*artifact.Artifact, harness config.Harness) []*artifact.Artifact {
+func filterArtifacts(arts []*artifact.Artifact, harness config.Harness, globalArtifacts []string) []*artifact.Artifact {
 	var filtered []*artifact.Artifact
 
+	// Determine which artifact types this harness wants
+	allowedTypes := harness.Artifacts
+	if len(allowedTypes) == 0 {
+		allowedTypes = globalArtifacts
+	}
+	if len(allowedTypes) == 0 {
+		allowedTypes = []string{"skills", "commands", "agents"}
+	}
+
+	// Create a set for quick lookup (normalize to singular)
+	typeSet := make(map[string]bool)
+	for _, t := range allowedTypes {
+		// Normalize plural to singular (skills -> skill, etc.)
+		normalized := t
+		if strings.HasSuffix(t, "s") {
+			normalized = strings.TrimSuffix(t, "s")
+		}
+		typeSet[normalized] = true
+	}
+
 	for _, art := range arts {
+		// Filter by artifact type (already singular)
+		if !typeSet[string(art.Type)] {
+			continue
+		}
 		if !shouldSync(art.Name, harness) {
 			continue
 		}

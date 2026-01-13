@@ -36,10 +36,9 @@ func runInit(cmd *cobra.Command, args []string) error {
 		fmt.Println("Updating existing phora.toml...")
 	} else {
 		cfg = &config.Config{
-			DefaultHarnesses: []string{"claude"},
-			DefaultArtifacts: artifactTypes,
-			Sources:          make(map[string]config.Source),
-			Harness:          make(map[string]config.Harness),
+			Artifacts: artifactTypes,
+			Sources:   make(map[string]config.Source),
+			Harness:   make(map[string]config.Harness),
 		}
 		fmt.Println("Creating new phora.toml...")
 	}

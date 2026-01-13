@@ -9,12 +9,11 @@ import (
 )
 
 type Config struct {
-	DefaultHarnesses []string           `toml:"default_harnesses,omitempty"`
-	DefaultArtifacts []string           `toml:"default_artifacts,omitempty"`
-	Hosts            map[string]Host    `toml:"hosts,omitempty"`
-	Manifest         *Manifest          `toml:"manifest,omitempty"`
-	Sources          map[string]Source  `toml:"sources,omitempty"`
-	Harness          map[string]Harness `toml:"harness,omitempty"`
+	Artifacts []string           `toml:"artifacts,omitempty"`
+	Hosts     map[string]Host    `toml:"hosts,omitempty"`
+	Manifest  *Manifest          `toml:"manifest,omitempty"`
+	Sources   map[string]Source  `toml:"sources,omitempty"`
+	Harness   map[string]Harness `toml:"harness,omitempty"`
 }
 
 type Host struct {
@@ -52,6 +51,7 @@ type Harness struct {
 	Path                       string                       `toml:"path,omitempty"`
 	Structure                  string                       `toml:"structure,omitempty"` // "flat" or "nested" (default)
 	GenerateCommandsFromSkills bool                         `toml:"generate_commands_from_skills,omitempty"`
+	Artifacts                  []string                     `toml:"artifacts,omitempty"`
 	Keys                       map[string]string            `toml:"keys,omitempty"`
 	Values                     map[string]map[string]string `toml:"values,omitempty"`
 	ArtifactMappings           map[string]ArtifactMapping   `toml:"artifact_mappings,omitempty"`
@@ -128,10 +128,9 @@ func Load(projectDir, globalConfigPath string) (*Config, error) {
 
 func Merge(global, project *Config) *Config {
 	result := &Config{
-		Sources:          make(map[string]Source),
-		DefaultHarnesses: global.DefaultHarnesses,
-		DefaultArtifacts: global.DefaultArtifacts,
-		Harness:          make(map[string]Harness),
+		Sources:   make(map[string]Source),
+		Artifacts: global.Artifacts,
+		Harness:   make(map[string]Harness),
 	}
 
 	// Copy global sources
@@ -144,6 +143,7 @@ func Merge(global, project *Config) *Config {
 			Path:                       harness.Path,
 			Structure:                  harness.Structure,
 			GenerateCommandsFromSkills: harness.GenerateCommandsFromSkills,
+			Artifacts:                  append([]string{}, harness.Artifacts...),
 			Keys:                       make(map[string]string),
 			Values:                     make(map[string]map[string]string),
 			ArtifactMappings:           make(map[string]ArtifactMapping),
@@ -174,11 +174,8 @@ func Merge(global, project *Config) *Config {
 		result.Harness[name] = h
 	}
 
-	if len(project.DefaultHarnesses) > 0 {
-		result.DefaultHarnesses = project.DefaultHarnesses
-	}
-	if len(project.DefaultArtifacts) > 0 {
-		result.DefaultArtifacts = project.DefaultArtifacts
+	if len(project.Artifacts) > 0 {
+		result.Artifacts = project.Artifacts
 	}
 
 	// Merge project sources (override global)
@@ -206,6 +203,9 @@ func Merge(global, project *Config) *Config {
 		}
 		if harness.GenerateCommandsFromSkills {
 			h.GenerateCommandsFromSkills = true
+		}
+		if len(harness.Artifacts) > 0 {
+			h.Artifacts = harness.Artifacts
 		}
 		for k, v := range harness.Keys {
 			h.Keys[k] = v

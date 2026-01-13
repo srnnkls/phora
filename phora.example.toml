@@ -3,8 +3,8 @@
 # - Project config: ./phora.toml (uses relative paths by default)
 # - Global config: ~/.config/phora/phora.toml (override paths to ~/)
 
-default_harnesses = ["claude"]
-default_artifacts = ["skills", "commands", "agents"]
+# Global default artifact types to discover and sync
+artifacts = ["skills", "commands", "agents"]
 
 # Package manifest (declares this repo as a phora package)
 [manifest]
@@ -44,6 +44,7 @@ output = "/{{.Name}}"
 [harness.opencode]
 path = "~/.config/opencode"
 generate_commands_from_skills = true
+artifacts = ["skills"]  # Override: only sync skills to opencode
 
 [harness.opencode.keys]
 allowed_tools = "tools"

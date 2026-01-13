@@ -1,5 +1,4 @@
-default_harnesses = ["claude"]
-default_artifacts = ["skills", "commands", "agents"]
+artifacts = ["skills", "commands", "agents"]
 
 # Host configurations for direct config/manifest fetching
 # If host is not defined, falls back to git clone only

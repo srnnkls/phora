@@ -91,12 +91,8 @@ func printConfig(cfg *config.Config) {
 		}
 	}
 
-	if len(cfg.DefaultHarnesses) > 0 {
-		fmt.Printf("Default harnesses: %v\n", cfg.DefaultHarnesses)
-	}
-
-	if len(cfg.DefaultArtifacts) > 0 {
-		fmt.Printf("Default artifacts: %v\n", cfg.DefaultArtifacts)
+	if len(cfg.Artifacts) > 0 {
+		fmt.Printf("Artifacts: %v\n", cfg.Artifacts)
 	}
 
 	if len(cfg.Harness) > 0 {

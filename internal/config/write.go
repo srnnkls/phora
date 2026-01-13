@@ -29,10 +29,7 @@ func WriteFile(path string, cfg *Config) error {
 
 // Equal returns true if two configs are semantically equal
 func Equal(a, b *Config) bool {
-	if !slicesEqual(a.DefaultHarnesses, b.DefaultHarnesses) {
-		return false
-	}
-	if !slicesEqual(a.DefaultArtifacts, b.DefaultArtifacts) {
+	if !slicesEqual(a.Artifacts, b.Artifacts) {
 		return false
 	}
 	if !manifestsEqual(a.Manifest, b.Manifest) {
@@ -97,6 +94,9 @@ func harnessesEqual(a, b map[string]Harness) bool {
 			return false
 		}
 		if va.Path != vb.Path || va.Structure != vb.Structure || va.GenerateCommandsFromSkills != vb.GenerateCommandsFromSkills {
+			return false
+		}
+		if !slicesEqual(va.Artifacts, vb.Artifacts) {
 			return false
 		}
 		if !mapsEqual(va.Keys, vb.Keys) || !mapsEqual(va.Variables, vb.Variables) {

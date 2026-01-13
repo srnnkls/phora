@@ -11,7 +11,7 @@ func TestWriteFile(t *testing.T) {
 	path := filepath.Join(tmpDir, "phora.toml")
 
 	cfg := &Config{
-		DefaultHarnesses: []string{"claude"},
+		Artifacts: []string{"skills"},
 		Harness: map[string]Harness{
 			"claude": {
 				Path:    "~/.claude",
@@ -31,8 +31,8 @@ func TestWriteFile(t *testing.T) {
 		t.Fatalf("LoadFile() error = %v", err)
 	}
 
-	if len(loaded.DefaultHarnesses) != 1 || loaded.DefaultHarnesses[0] != "claude" {
-		t.Errorf("DefaultHarnesses not preserved")
+	if len(loaded.Artifacts) != 1 || loaded.Artifacts[0] != "skills" {
+		t.Errorf("Artifacts not preserved")
 	}
 
 	harness := loaded.Harness["claude"]

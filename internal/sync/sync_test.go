@@ -42,8 +42,7 @@ description: Create spec
 `), 0644)
 
 	cfg = &config.Config{
-		DefaultHarnesses: []string{"claude"},
-		DefaultArtifacts: []string{"skills", "commands"},
+		Artifacts: []string{"skills", "commands"},
 		Harness: map[string]config.Harness{
 			"claude": {
 				Path: targetDir,
@@ -230,8 +229,7 @@ description: TDD workflow
 `), 0644)
 
 	cfg := &config.Config{
-		DefaultHarnesses: []string{"opencode"},
-		DefaultArtifacts: []string{"skills"},
+		Artifacts: []string{"skills"},
 		Harness: map[string]config.Harness{
 			"opencode": {
 				Path:                       targetDir,
@@ -373,8 +371,7 @@ description: TDD workflow
 `), 0644)
 
 	cfg := &config.Config{
-		DefaultHarnesses: []string{"claude"},
-		DefaultArtifacts: []string{"skills"},
+		Artifacts: []string{"skills"},
 		Sources: map[string]config.Source{
 			"company": {
 				Type:   "local",
@@ -431,8 +428,7 @@ description: TDD workflow
 `), 0644)
 
 	cfg := &config.Config{
-		DefaultHarnesses: []string{"claude"},
-		DefaultArtifacts: []string{"skills"},
+		Artifacts: []string{"skills"},
 		Sources: map[string]config.Source{
 			"shared": {
 				Type:   "local",
@@ -498,8 +494,7 @@ name: internal-skill
 `), 0644)
 
 	cfg := &config.Config{
-		DefaultHarnesses: []string{"claude"},
-		DefaultArtifacts: []string{"skills"},
+		Artifacts: []string{"skills"},
 		Sources: map[string]config.Source{
 			"shared": {
 				Type:   "local",
@@ -580,8 +575,7 @@ description: TDD workflow
 `), 0644)
 
 	cfg := &config.Config{
-		DefaultHarnesses: []string{"claude"},
-		DefaultArtifacts: []string{"skills"},
+		Artifacts: []string{"skills"},
 		Sources: map[string]config.Source{
 			"company": {
 				Type:   "local",
@@ -636,8 +630,7 @@ description: TDD workflow
 `), 0644)
 
 	cfg := &config.Config{
-		DefaultHarnesses: []string{"claude"},
-		DefaultArtifacts: []string{"skills"},
+		Artifacts: []string{"skills"},
 		Sources: map[string]config.Source{
 			"shared": {
 				Type:   "local",
@@ -696,8 +689,7 @@ name: internal-skill
 `), 0644)
 
 	cfg := &config.Config{
-		DefaultHarnesses: []string{"claude"},
-		DefaultArtifacts: []string{"skills"},
+		Artifacts: []string{"skills"},
 		Sources: map[string]config.Source{
 			"shared": {
 				Type:   "local",
@@ -762,8 +754,7 @@ description: TDD workflow
 `), 0644)
 
 	cfg := &config.Config{
-		DefaultHarnesses: []string{"claude"},
-		DefaultArtifacts: []string{"skills"},
+		Artifacts: []string{"skills"},
 		Sources: map[string]config.Source{
 			"company": {
 				Type:   "local",
