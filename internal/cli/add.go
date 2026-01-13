@@ -46,13 +46,21 @@ func runAdd(cmd *cobra.Command, args []string) error {
 
 	repoSrc := source.NewRepo(repoStr, addRef, dataDir, cfg.DefaultArtifacts)
 
-	fmt.Printf("Fetching manifest from %s...\n", repoSrc.ManifestURL())
-	manifestData, err := repoSrc.FetchManifest()
+	fmt.Printf("Fetching config from %s...\n", repoSrc.ConfigURL())
+	configData, err := repoSrc.FetchConfig()
 	if err != nil {
 		fmt.Printf("Warning: %v\n", err)
-		fmt.Println("Proceeding without manifest...")
+		fmt.Println("Proceeding without remote config...")
 	} else {
-		fmt.Printf("Found manifest (%d bytes)\n", len(manifestData))
+		remoteConfig, err := config.ParseTOML(configData)
+		if err != nil {
+			fmt.Printf("Warning: failed to parse remote config: %v\n", err)
+		} else if remoteConfig.Manifest != nil {
+			fmt.Printf("Found manifest with %d skill(s), %d command(s), %d agent(s)\n",
+				len(remoteConfig.Manifest.Skills),
+				len(remoteConfig.Manifest.Commands),
+				len(remoteConfig.Manifest.Agents))
+		}
 	}
 
 	localPath := repoSrc.LocalPath()

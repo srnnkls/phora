@@ -92,24 +92,24 @@ func (s *RepoSource) RepoURL() string {
 	return fmt.Sprintf("https://%s/%s/%s.git", s.Host, s.Owner, s.Repo)
 }
 
-func (s *RepoSource) ManifestURL() string {
+func (s *RepoSource) ConfigURL() string {
 	if s.Host == "github.com" {
-		return fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/%s/.phora/manifest.yaml",
+		return fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/%s/phora.toml",
 			s.Owner, s.Repo, s.Ref)
 	}
-	return fmt.Sprintf("https://%s/%s/%s/-/raw/%s/.phora/manifest.yaml",
+	return fmt.Sprintf("https://%s/%s/%s/-/raw/%s/phora.toml",
 		s.Host, s.Owner, s.Repo, s.Ref)
 }
 
-func (s *RepoSource) FetchManifest() ([]byte, error) {
-	resp, err := http.Get(s.ManifestURL())
+func (s *RepoSource) FetchConfig() ([]byte, error) {
+	resp, err := http.Get(s.ConfigURL())
 	if err != nil {
-		return nil, fmt.Errorf("fetch manifest: %w", err)
+		return nil, fmt.Errorf("fetch config: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("manifest not found: %s", resp.Status)
+		return nil, fmt.Errorf("phora.toml not found: %s", resp.Status)
 	}
 
 	return io.ReadAll(resp.Body)

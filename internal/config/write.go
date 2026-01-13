@@ -35,6 +35,9 @@ func Equal(a, b *Config) bool {
 	if !slicesEqual(a.DefaultArtifacts, b.DefaultArtifacts) {
 		return false
 	}
+	if !manifestsEqual(a.Manifest, b.Manifest) {
+		return false
+	}
 	if !sourcesEqual(a.Sources, b.Sources) {
 		return false
 	}
@@ -42,6 +45,21 @@ func Equal(a, b *Config) bool {
 		return false
 	}
 	return true
+}
+
+func manifestsEqual(a, b *Manifest) bool {
+	if (a == nil) != (b == nil) {
+		return false
+	}
+	if a == nil {
+		return true
+	}
+	if a.Version != b.Version {
+		return false
+	}
+	return slicesEqual(a.Skills, b.Skills) &&
+		slicesEqual(a.Commands, b.Commands) &&
+		slicesEqual(a.Agents, b.Agents)
 }
 
 func slicesEqual(a, b []string) bool {

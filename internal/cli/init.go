@@ -6,13 +6,14 @@ import (
 	"path/filepath"
 
 	"github.com/spf13/cobra"
+	"github.com/srnnkls/phora/internal/config"
 	"github.com/srnnkls/phora/internal/manifest"
 )
 
 var initCmd = &cobra.Command{
 	Use:   "init",
-	Short: "Initialize phora package manifest",
-	Long:  "Scan for artifacts and generate .phora/manifest.yaml",
+	Short: "Initialize phora config with manifest",
+	Long:  "Scan for artifacts and add [manifest] section to phora.toml",
 	RunE:  runInit,
 }
 
@@ -22,25 +23,47 @@ func runInit(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	configPath := filepath.Join(cwd, "phora.toml")
 	artifactTypes := []string{"skills", "commands", "agents"}
 
-	// Generate manifest
+	// Load existing config or create new one
+	var cfg *config.Config
+	if _, err := os.Stat(configPath); err == nil {
+		cfg, err = config.LoadFile(configPath)
+		if err != nil {
+			return fmt.Errorf("load existing config: %w", err)
+		}
+		fmt.Println("Updating existing phora.toml...")
+	} else {
+		cfg = &config.Config{
+			DefaultHarnesses: []string{"claude"},
+			DefaultArtifacts: artifactTypes,
+			Sources:          make(map[string]config.Source),
+			Harness:          make(map[string]config.Harness),
+		}
+		fmt.Println("Creating new phora.toml...")
+	}
+
+	// Generate manifest from discovered artifacts
 	m, err := manifest.Generate(cwd, artifactTypes)
 	if err != nil {
 		return fmt.Errorf("generate manifest: %w", err)
 	}
 
-	manifestDir := filepath.Join(cwd, manifest.Dir)
-	if err := os.MkdirAll(manifestDir, 0755); err != nil {
-		return fmt.Errorf("create manifest dir: %w", err)
+	// Update config with manifest
+	cfg.Manifest = &config.Manifest{
+		Skills:   m.Skills,
+		Commands: m.Commands,
+		Agents:   m.Agents,
 	}
 
-	manifestPath := manifest.FilePath(cwd)
-	if err := m.Write(manifestPath); err != nil {
-		return fmt.Errorf("write manifest: %w", err)
+	// Write updated config
+	if err := config.WriteFile(configPath, cfg); err != nil {
+		return fmt.Errorf("write config: %w", err)
 	}
 
-	fmt.Printf("Created %s/%s\n", manifest.Dir, manifest.FileName)
+	fmt.Printf("Updated phora.toml\n")
+	fmt.Printf("  [manifest]\n")
 	fmt.Printf("  Skills:   %d\n", len(m.Skills))
 	fmt.Printf("  Commands: %d\n", len(m.Commands))
 	fmt.Printf("  Agents:   %d\n", len(m.Agents))

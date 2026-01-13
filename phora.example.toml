@@ -1,17 +1,54 @@
 default_harnesses = ["claude"]
 default_artifacts = ["skills", "commands", "agents"]
 
+# Package manifest (declares this repo as a phora package)
+[manifest]
+skills = ["code-review", "debug-helper"]
+commands = ["deploy", "test"]
+agents = ["reviewer"]
+version = "1.0.0"
+
+# Sources (packages you depend on)
+[sources.company]
+repo = "company/shared-skills"
+ref = "main"
+path = "artifacts"
+# Artifacts become: company.skill-name
+
+[sources.personal]
+repo = "username/dotfiles"
+global = true  # Use bare names (no namespace prefix)
+
+# Claude Code harness
 [harness.claude]
 path = "~/.claude"
+
 [harness.claude.variables]
 model_strong = "opus"
 model_weak = "haiku"
 
+[harness.claude.tools]
+bash = "Bash"
+read = "Read"
+
+[harness.claude.references.skill]
+output = "/{{.Name}}"
+
+# OpenCode harness
 [harness.opencode]
 path = "~/.config/opencode"
 generate_commands_from_skills = true
-[harness.opencode.mappings]
+
+[harness.opencode.keys]
 allowed_tools = "tools"
+
+[harness.opencode.tools]
+bash = "bash"
+read = "read"
+
+[harness.opencode.references.skill]
+output = "@{{.Name}}"
+
 [harness.opencode.variables]
 model_strong = "anthropic/claude-sonnet-4-5"
 model_weak = "anthropic/claude-haiku-4-5"

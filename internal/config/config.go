@@ -11,8 +11,16 @@ import (
 type Config struct {
 	DefaultHarnesses []string           `toml:"default_harnesses,omitempty"`
 	DefaultArtifacts []string           `toml:"default_artifacts,omitempty"`
+	Manifest         *Manifest          `toml:"manifest,omitempty"`
 	Sources          map[string]Source  `toml:"sources,omitempty"`
 	Harness          map[string]Harness `toml:"harness,omitempty"`
+}
+
+type Manifest struct {
+	Skills   []string `toml:"skills,omitempty"`
+	Commands []string `toml:"commands,omitempty"`
+	Agents   []string `toml:"agents,omitempty"`
+	Version  string   `toml:"version,omitempty"`
 }
 
 type Source struct {
@@ -46,11 +54,7 @@ type Harness struct {
 	Exclude                    []string                     `toml:"exclude,omitempty"`
 }
 
-func LoadFile(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
+func ParseTOML(data []byte) (*Config, error) {
 	var cfg Config
 	if err := toml.Unmarshal(data, &cfg); err != nil {
 		return nil, err
@@ -62,6 +66,14 @@ func LoadFile(path string) (*Config, error) {
 		cfg.Harness = make(map[string]Harness)
 	}
 	return &cfg, nil
+}
+
+func LoadFile(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return ParseTOML(data)
 }
 
 func Load(projectDir, globalConfigPath string) (*Config, error) {
