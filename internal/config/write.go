@@ -1,24 +1,106 @@
 package config
 
 import (
-	"bytes"
 	"os"
 	"path/filepath"
 
-	"github.com/BurntSushi/toml"
+	"github.com/pelletier/go-toml/v2"
 )
 
-// WriteFile writes the config to a TOML file
+// WriteFile writes the config to a TOML file, only if parsed content differs
 func WriteFile(path string, cfg *Config) error {
+	// Check if existing file parses to the same config
+	if existing, err := LoadFile(path); err == nil {
+		if Equal(existing, cfg) {
+			return nil
+		}
+	}
+
+	newContent, err := toml.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
-	var buf bytes.Buffer
-	enc := toml.NewEncoder(&buf)
-	if err := enc.Encode(cfg); err != nil {
-		return err
+	return os.WriteFile(path, newContent, 0644)
+}
+
+// Equal returns true if two configs are semantically equal
+func Equal(a, b *Config) bool {
+	if !slicesEqual(a.DefaultHarnesses, b.DefaultHarnesses) {
+		return false
 	}
-	return os.WriteFile(path, buf.Bytes(), 0644)
+	if !slicesEqual(a.DefaultArtifacts, b.DefaultArtifacts) {
+		return false
+	}
+	if !sourcesEqual(a.Sources, b.Sources) {
+		return false
+	}
+	if !harnessesEqual(a.Harness, b.Harness) {
+		return false
+	}
+	return true
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func sourcesEqual(a, b map[string]Source) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, va := range a {
+		vb, ok := b[k]
+		if !ok || va != vb {
+			return false
+		}
+	}
+	return true
+}
+
+func harnessesEqual(a, b map[string]Harness) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, va := range a {
+		vb, ok := b[k]
+		if !ok {
+			return false
+		}
+		if va.Path != vb.Path || va.Structure != vb.Structure || va.GenerateCommandsFromSkills != vb.GenerateCommandsFromSkills {
+			return false
+		}
+		if !mapsEqual(va.Mappings, vb.Mappings) || !mapsEqual(va.Variables, vb.Variables) {
+			return false
+		}
+		if !slicesEqual(va.Include, vb.Include) || !slicesEqual(va.Exclude, vb.Exclude) {
+			return false
+		}
+	}
+	return true
+}
+
+func mapsEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 // AddExclusion adds an artifact to a harness's exclude list and saves the config

@@ -1,14 +1,14 @@
 package lockfile
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 
-	"github.com/BurntSushi/toml"
+	"github.com/pelletier/go-toml/v2"
 )
 
 const FileName = ".tropos.lock"
@@ -27,12 +27,16 @@ type FileEntry struct {
 
 func Load(targetPath string) (*LockFile, error) {
 	lockPath := filepath.Join(targetPath, FileName)
-	if _, err := os.Stat(lockPath); os.IsNotExist(err) {
+	data, err := os.ReadFile(lockPath)
+	if os.IsNotExist(err) {
 		return &LockFile{}, nil
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	var lf LockFile
-	if _, err := toml.DecodeFile(lockPath, &lf); err != nil {
+	if err := toml.Unmarshal(data, &lf); err != nil {
 		return nil, err
 	}
 	return &lf, nil
@@ -41,12 +45,25 @@ func Load(targetPath string) (*LockFile, error) {
 func (l *LockFile) Save(targetPath string) error {
 	lockPath := filepath.Join(targetPath, FileName)
 
-	var buf bytes.Buffer
-	enc := toml.NewEncoder(&buf)
-	if err := enc.Encode(l); err != nil {
+	// Only write if parsed content differs
+	if existing, err := Load(targetPath); err == nil {
+		if l.Equal(existing) {
+			return nil
+		}
+	}
+
+	data, err := toml.Marshal(l)
+	if err != nil {
 		return err
 	}
-	return os.WriteFile(lockPath, buf.Bytes(), 0644)
+
+	return os.WriteFile(lockPath, data, 0644)
+}
+
+func (l *LockFile) Equal(other *LockFile) bool {
+	return slices.EqualFunc(l.Files, other.Files, func(a, b FileEntry) bool {
+		return a == b
+	})
 }
 
 func (l *LockFile) IsManaged(relativePath string) bool {

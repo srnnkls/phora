@@ -5,18 +5,19 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/BurntSushi/toml"
+	"github.com/pelletier/go-toml/v2"
 )
 
 type Config struct {
-	Sources          map[string]Source  `toml:"sources,omitempty"`
 	DefaultHarnesses []string           `toml:"default_harnesses,omitempty"`
 	DefaultArtifacts []string           `toml:"default_artifacts,omitempty"`
+	Sources          map[string]Source  `toml:"sources,omitempty"`
 	Harness          map[string]Harness `toml:"harness,omitempty"`
 }
 
 type Source struct {
-	Repo string `toml:"repo"`
+	Type string `toml:"type,omitempty"`
+	Repo string `toml:"repo,omitempty"`
 	Path string `toml:"path,omitempty"`
 	Ref  string `toml:"ref,omitempty"`
 }
@@ -32,8 +33,12 @@ type Harness struct {
 }
 
 func LoadFile(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
 	var cfg Config
-	if _, err := toml.DecodeFile(path, &cfg); err != nil {
+	if err := toml.Unmarshal(data, &cfg); err != nil {
 		return nil, err
 	}
 	if cfg.Sources == nil {
