@@ -1,0 +1,27 @@
+spec: phora-v2-phase2
+tasks:
+  PH2-001:
+    depends_on: []
+    blocks: [PH2-002, PH2-003, PH2-005, PH2-007]
+  PH2-002:
+    depends_on: [PH2-001]
+    blocks: [PH2-004]
+  PH2-003:
+    depends_on: [PH2-001]
+    blocks: [PH2-004]
+  PH2-004:
+    depends_on: [PH2-002, PH2-003]
+    blocks: [PH2-005]
+  PH2-005:
+    depends_on: [PH2-001, PH2-004]
+    blocks: [PH2-006]
+  PH2-006:
+    depends_on: [PH2-005]
+    blocks: []
+  PH2-007:
+    depends_on: [PH2-001]
+    blocks: []
+
+parallel_groups:
+  - [PH2-002, PH2-003]
+  - [PH2-006, PH2-007]

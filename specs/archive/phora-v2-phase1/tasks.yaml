@@ -1,0 +1,101 @@
+spec: phora-v2-phase1
+code: PH1
+next_id: 12
+tasks:
+  - id: PH1-001
+    content: Rename install.go to add.go and update command
+    status: completed
+    active_form: Renaming install command to add
+
+  - id: PH1-002
+    content: Rename sync.go to deploy.go and update command
+    status: completed
+    active_form: Renaming sync command to deploy
+
+  - id: PH1-003
+    content: Update root.go command registration
+    status: completed
+    active_form: Updating command registration
+
+  - id: PH1-004
+    content: Add Global bool to Source struct
+    status: completed
+    active_form: Adding Global field to Source
+
+  - id: PH1-005
+    content: Add Namespace field and FullName() to Artifact
+    status: completed
+    active_form: Adding namespace support to Artifact
+
+  - id: PH1-006
+    content: Apply namespace during source discovery
+    status: completed
+    active_form: Applying namespace in source discovery
+
+  - id: PH1-007
+    content: Create internal/reference package with Parse()
+    status: completed
+    active_form: Creating reference parsing package
+
+  - id: PH1-008
+    content: Add Tools and References to config structs
+    status: completed
+    active_form: Adding tools and references to config
+
+  - id: PH1-009
+    content: Add Keys, Values, ArtifactMappings to Harness
+    status: completed
+    active_form: Adding new mappings structure
+
+  - id: PH1-010
+    content: Update transform.go for reference and value mappings
+    status: completed
+    active_form: Updating transform for new mappings
+
+  - id: PH1-011
+    content: Update sync.go to use FullName() throughout
+    status: completed
+    active_form: Updating sync for namespaced names
+
+meta:
+  created: 2026-01-13
+  last_updated: 2026-01-13
+  completed: 2026-01-13
+  progress: 11/11
+
+phases:
+  - name: "Phase A: Command Renames"
+    task_ids: [PH1-001, PH1-002, PH1-003]
+    checkpoint:
+      description: Commands renamed, CLI functional
+      criteria:
+        - phora add --help works
+        - phora deploy --help works
+      verified: true
+
+  - name: "Phase B: Namespace Support"
+    task_ids: [PH1-004, PH1-005, PH1-006]
+    checkpoint:
+      description: Namespacing functional
+      criteria:
+        - Artifacts get namespace prefix
+        - global=true skips prefix
+      verified: true
+
+  - name: "Phase C: Reference System"
+    task_ids: [PH1-007, PH1-008]
+    checkpoint:
+      description: Reference parsing works
+      criteria:
+        - Sigils parsed correctly
+        - Templates applied per harness
+      verified: true
+
+  - name: "Phase D: Mappings Refactor"
+    task_ids: [PH1-009, PH1-010, PH1-011]
+    checkpoint:
+      description: New mappings structure complete
+      criteria:
+        - Keys/values work
+        - Per-artifact-type overrides work
+      verified: true

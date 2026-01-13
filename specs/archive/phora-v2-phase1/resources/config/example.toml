@@ -1,0 +1,87 @@
+# Phora v2 Configuration Example
+
+# Global tools (available in all harnesses, lowercase canonical names)
+tools = ["bash", "read", "write", "edit", "glob", "grep"]
+
+# Optional tool metadata
+[tools.bash]
+description = "Execute shell commands"
+
+# Global reference defaults (sigils are fixed, outputs are defaults)
+[references.skill]
+sigil = "$"
+output = "`/{{name}}`"
+
+[references.command]
+sigil = "/"
+output = "`/{{name}}`"
+
+[references.agent]
+sigil = "@"
+output = "`@{{name}}`"
+
+[references.file]
+sigil = "#"
+output = "`@{{name}}`"
+
+[references.tool]
+sigil = "!"
+output = "`{{name}}`"
+
+# Sources
+[sources.srnnkls]
+repo = "srnnkls/dotfiles"
+global = true  # artifacts use bare names
+
+[sources.company]
+repo = "company/shared-skills"
+# default: artifacts become company.skill-name
+
+# Claude harness
+[harness.claude]
+path = "~/.claude"
+structure = "nested"
+
+[harness.claude.tools]
+bash = "Bash"
+read = "Read"
+write = "Write"
+edit = "Edit"
+glob = "Glob"
+grep = "Grep"
+task = "Task"
+
+[harness.claude.references.skill]
+output = "`/{{name}}`"
+
+[harness.claude.references.tool]
+output = "`{{name}}`"
+
+[harness.claude.keys]
+allowed-tools = "tools"
+
+[harness.claude.values.tools]
+bash = "Bash"
+read = "Read"
+
+# Per-artifact-type overrides
+[harness.claude.skills.keys]
+# Skill-specific key mappings (extends harness.claude.keys)
+
+[harness.claude.skills.values.tools]
+# Skill-specific value mappings
+
+# OpenCode harness
+[harness.opencode]
+path = "~/.opencode"
+structure = "flat"
+generate_commands_from_skills = true
+
+[harness.opencode.tools]
+agent = "agent"
+
+[harness.opencode.references.skill]
+output = "`{{name}}`"
+
+[harness.opencode.references.file]
+output = "`#{{name}}`"

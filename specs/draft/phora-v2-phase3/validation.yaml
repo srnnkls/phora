@@ -1,0 +1,54 @@
+spec: phora-v2-phase3
+created: 2026-01-13
+issue_type: Feature
+
+clarification_log:
+  - question: Issue type
+    answer: Feature
+    taxonomy: Scope
+  - question: Which features to include
+    answer: All four (manage, templating, linting, dependencies)
+    taxonomy: Scope
+  - question: What should phora manage do
+    answer: Init on target, copy artifacts, deploy - start managing existing artifacts
+    taxonomy: Behavior
+  - question: Linting scope
+    answer: Full (schema + references + custom rules)
+    taxonomy: Behavior
+  - question: Env var templating syntax
+    answer: Go template (existing pattern)
+    taxonomy: Behavior
+  - question: Dependency tracking scope
+    answer: Both artifact and source level
+    taxonomy: Data Model
+  - question: Migration of existing artifacts
+    answer: Yes, detect and migrate
+    taxonomy: Behavior
+
+taxonomy_coverage:
+  Scope: covered
+  Behavior: covered
+  Data Model: covered
+  Constraints: not_covered
+  Edge Cases: not_covered
+  Integration: not_covered
+  Terminology: not_covered
+
+markers:
+  TBD: []
+  QUESTION: []
+  ASSUMPTION:
+    - "Undefined env vars resolve to empty string"
+    - "phora manage is idempotent"
+
+gates:
+  lint_check:
+    status: pending
+    errors: []
+  test_coverage:
+    status: pending
+    minimum: 80
+    current: null
+  review:
+    status: pending
+    reviewers: []

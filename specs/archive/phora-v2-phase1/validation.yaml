@@ -1,0 +1,128 @@
+spec: phora-v2-phase1
+issue_type: feature
+created: 2026-01-13
+
+# Validation from spec-validate
+validation:
+  questions_used: 4
+  questions_limit: 5
+
+  ambiguity_scan:
+    scope:
+      status: clear
+    behavior:
+      status: clear
+    data_model:
+      status: clear
+    constraints:
+      status: clear
+      note: "Breaking change - no backwards compat for old mappings"
+    edge_cases:
+      status: clear
+      note: "Malformed refs: configurable handling, default warn"
+    integration:
+      status: clear
+    terminology:
+      status: clear
+
+  taxonomy_coverage:
+    scope: covered
+    behavior: covered
+    data_model: covered
+    constraints: covered
+    edge_cases: covered
+    integration: covered
+    terminology: covered
+
+  clarification_log:
+    - question: "How should we handle existing phora.toml configs that use the old mappings field?"
+      answer: "Breaking change, no migration support"
+      integration: "config.go - remove Mappings field entirely"
+
+    - question: "How should malformed canonical references be handled?"
+      answer: "Configurable behavior, default to warn"
+      integration: "reference.go - add OnMalformed config option"
+
+    - question: "Which detailed sections do you want in the spec?"
+      answer: "Tech Decisions, Data Model"
+      integration: "context.md includes both sections"
+
+    - question: "Confirm implementation approach from planning?"
+      answer: "Phase 1 only"
+      integration: "Spec scoped to Phase 1 features"
+
+  approach_selected: "Phase 1 only - scoped implementation"
+
+  sdd_optins:
+    - tech_decisions
+    - data_model
+
+# Source context
+native_plan:
+  path: .claude/plans/buzzing-cuddling-backus.md
+  coverage: Phase 1 of 3
+
+# Markers (resolved)
+markers:
+  - id: M2
+    area: edge_cases
+    description: "Edge case parsing rules for $, $$, mid-word $var"
+    status: resolved
+    resolution: "Sigils only parsed inside backticks - avoids all edge cases"
+
+# Review session
+clarification_sessions:
+  - id: S001
+    timestamp: 2026-01-13
+    source: spec-review
+    reviewers: [claude-opus]
+    questions:
+      - id: Q001
+        question: "How should namespaced artifacts be referenced?"
+        answer: "Within same source: bare names. Across sources: if globalized implicit OK, otherwise full qualification needed"
+        area: behavior
+        doc_updates:
+          - file: spec.md
+            section: Namespace Reference Resolution
+            action: modified
+      - id: Q002
+        question: "Explicit namespace in global source?"
+        answer: "Warn - conventional misnomer, not a conflict"
+        area: edge_cases
+        doc_updates:
+          - file: spec.md
+            section: Namespace Reference Resolution
+            action: modified
+  - id: S002
+    timestamp: 2026-01-13
+    source: spec-clarify
+    questions:
+      - id: Q003
+        question: "How should edge case reference patterns be handled?"
+        answer: "Sigils only parsed inside backticks - avoids $100, foo$bar, etc."
+        area: edge_cases
+        doc_updates:
+          - file: spec.md
+            section: Reference Parsing
+            action: modified
+          - file: context.md
+            section: Gotchas
+            action: modified
+
+# Gate checks (n/a for features)
+gates: n/a
+
+# Review result
+review:
+  date: 2026-01-13
+  recommendation: APPROVE_WITH_CHANGES
+  gates:
+    completeness: pass_with_issues
+    consistency: pass
+    feasibility: pass
+    clarity: pass_with_issues
+  changes_required:
+    - "Consider splitting PH1-010 into subtasks"
+  resolved:
+    - "Namespace reference resolution rules added to spec.md"
+    - "Edge case parsing resolved: sigils only in backticks"

@@ -1,0 +1,40 @@
+spec: phora-v2-phase2
+issue_type: Feature
+
+taxonomy_coverage:
+  scope: covered
+  behavior: covered
+  data_model: covered
+  constraints: covered
+  edge_cases: partial
+  integration: covered
+  terminology: covered
+
+clarifications: []
+
+markers:
+  - location: spec.md
+    type: assumption
+    content: Glob patterns use filepath.Match syntax
+    resolved: false
+
+  - location: context.md
+    type: decision
+    content: Harness include/exclude deprecated but still functional
+    resolved: true
+
+gates:
+  tests_pass:
+    required: true
+    verified: false
+    evidence: null
+
+  no_regressions:
+    required: true
+    verified: false
+    evidence: null
+
+  acceptance_criteria_met:
+    required: true
+    verified: false
+    evidence: null

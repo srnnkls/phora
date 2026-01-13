@@ -1,0 +1,33 @@
+spec: phora-v2-phase1
+
+# Task dependency graph for parallel dispatch
+# Tasks with no dependencies can run in parallel
+
+graph:
+  # Phase A: Command Renames (independent, can run in parallel)
+  PH1-001: []  # Rename install → add
+  PH1-002: []  # Rename sync → deploy
+  PH1-003: [PH1-001, PH1-002]  # Update root.go (depends on both renames)
+
+  # Phase B: Namespace Support
+  PH1-004: []  # Add Global to Source (independent)
+  PH1-005: []  # Add Namespace to Artifact (independent)
+  PH1-006: [PH1-004, PH1-005]  # Apply namespace in discovery (needs both)
+
+  # Phase C: Reference System
+  PH1-007: []  # Create reference package (independent)
+  PH1-008: [PH1-007]  # Add to config (needs reference types)
+
+  # Phase D: Mappings Refactor
+  PH1-009: []  # Add Keys/Values to Harness (independent)
+  PH1-010: [PH1-007, PH1-008, PH1-009]  # Update transform (needs all new types)
+  PH1-011: [PH1-005, PH1-006]  # Update sync for FullName (needs namespace)
+
+# Parallel execution groups (tasks that can run together)
+parallel_groups:
+  - [PH1-001, PH1-002, PH1-004, PH1-005, PH1-007, PH1-009]  # All independent
+  - [PH1-003, PH1-006, PH1-008]  # First wave of dependents
+  - [PH1-010, PH1-011]  # Final integration
+
+# Critical path (longest dependency chain)
+critical_path: [PH1-007, PH1-008, PH1-010]

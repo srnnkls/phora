@@ -1,0 +1,56 @@
+spec: phora-v2-phase3
+
+nodes:
+  PH3-001:
+    name: Create template.go
+    deps: []
+  PH3-002:
+    name: Integrate templating
+    deps: [PH3-001]
+  PH3-003:
+    name: Artifact DependsOn
+    deps: []
+  PH3-004:
+    name: Source DependsOn
+    deps: []
+  PH3-005:
+    name: Deps graph package
+    deps: []
+  PH3-006:
+    name: Topological sort
+    deps: [PH3-005]
+  PH3-007:
+    name: Circular detection
+    deps: [PH3-005]
+  PH3-008:
+    name: Integrate into sync
+    deps: [PH3-003, PH3-006, PH3-007]
+  PH3-009:
+    name: Lint engine
+    deps: []
+  PH3-010:
+    name: Schema validation
+    deps: [PH3-009]
+  PH3-011:
+    name: Reference validation
+    deps: [PH3-009]
+  PH3-012:
+    name: Lint config
+    deps: []
+  PH3-013:
+    name: Lint command
+    deps: [PH3-009, PH3-010, PH3-011, PH3-012]
+  PH3-014:
+    name: Manage command
+    deps: []
+  PH3-015:
+    name: Artifact migration
+    deps: [PH3-014]
+
+parallel_groups:
+  - name: Foundation
+    tasks: [PH3-001, PH3-003, PH3-004, PH3-005, PH3-009, PH3-012, PH3-014]
+  - name: Core Implementation
+    tasks: [PH3-002, PH3-006, PH3-007, PH3-010, PH3-011, PH3-015]
+  - name: Integration
+    tasks: [PH3-008, PH3-013]

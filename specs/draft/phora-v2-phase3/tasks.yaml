@@ -1,0 +1,120 @@
+spec: phora-v2-phase3
+code: PH3
+next_id: 16
+tasks:
+  - id: PH3-001
+    content: Create internal/config/template.go with env var expansion
+    status: pending
+    active_form: Creating config template expansion
+
+  - id: PH3-002
+    content: Integrate template expansion into config.Load()
+    status: pending
+    active_form: Integrating template expansion into config loading
+
+  - id: PH3-003
+    content: Add DependsOn field to Artifact struct
+    status: pending
+    active_form: Adding DependsOn to Artifact
+
+  - id: PH3-004
+    content: Add DependsOn field to Source struct
+    status: pending
+    active_form: Adding DependsOn to Source
+
+  - id: PH3-005
+    content: Create internal/deps/deps.go with Graph type
+    status: pending
+    active_form: Creating dependency graph package
+
+  - id: PH3-006
+    content: Implement topological sort for deploy ordering
+    status: pending
+    active_form: Implementing topological sort
+
+  - id: PH3-007
+    content: Add circular dependency detection
+    status: pending
+    active_form: Adding circular dependency detection
+
+  - id: PH3-008
+    content: Integrate dependency resolution into sync.Apply()
+    status: pending
+    active_form: Integrating dependencies into sync
+
+  - id: PH3-009
+    content: Create internal/lint/lint.go with Linter type
+    status: pending
+    active_form: Creating lint engine
+
+  - id: PH3-010
+    content: Implement schema validation rule
+    status: pending
+    active_form: Implementing schema validation
+
+  - id: PH3-011
+    content: Implement reference validation rule
+    status: pending
+    active_form: Implementing reference validation
+
+  - id: PH3-012
+    content: Add LintConfig to Harness struct
+    status: pending
+    active_form: Adding lint config to harness
+
+  - id: PH3-013
+    content: Create internal/cli/lint.go command
+    status: pending
+    active_form: Creating lint command
+
+  - id: PH3-014
+    content: Create internal/cli/manage.go command
+    status: pending
+    active_form: Creating manage command
+
+  - id: PH3-015
+    content: Implement artifact import/migration in manage
+    status: pending
+    active_form: Implementing artifact migration
+
+meta:
+  created: 2026-01-13
+  last_updated: 2026-01-13
+  progress: 0/15
+
+phases:
+  - name: "Phase A: Config Templating"
+    task_ids: [PH3-001, PH3-002]
+    checkpoint:
+      description: Env var templating works in config
+      criteria:
+        - "{{.Env.HOME}} expands correctly"
+        - Template errors reported clearly
+      verified: false
+
+  - name: "Phase B: Dependency Tracking"
+    task_ids: [PH3-003, PH3-004, PH3-005, PH3-006, PH3-007, PH3-008]
+    checkpoint:
+      description: Dependencies resolve and order deploys
+      criteria:
+        - Artifacts deploy in dependency order
+        - Circular deps detected
+      verified: false
+
+  - name: "Phase C: Linting System"
+    task_ids: [PH3-009, PH3-010, PH3-011, PH3-012, PH3-013]
+    checkpoint:
+      description: phora lint works with configurable rules
+      criteria:
+        - Schema validation catches missing keys
+        - Reference validation finds unresolved refs
+      verified: false
+
+  - name: "Phase D: Manage Command"
+    task_ids: [PH3-014, PH3-015]
+    checkpoint:
+      description: phora manage imports existing artifacts
+      criteria:
+        - Creates phora.toml in target
+        - Imports existing skills/commands/agents
+      verified: false
