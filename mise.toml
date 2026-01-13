@@ -1,0 +1,20 @@
+[tools]
+"github:facebookincubator/scrut" = "0.4.2"
+go = "1.25.5"
+
+[tasks.build]
+description = "Build tropos binary"
+run = "go build -o tropos ./cmd/tropos"
+
+[tasks.test]
+description = "Run all tests"
+depends = ["test:unit", "test:integration"]
+
+[tasks."test:unit"]
+description = "Run Go unit tests"
+run = "go test ./..."
+
+[tasks."test:integration"]
+description = "Run scrut integration tests"
+depends = ["build"]
+run = "PATH=$PWD:$PATH scrut test tests/"
