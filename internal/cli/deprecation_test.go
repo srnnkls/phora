@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"os"
 	"strings"
 	"testing"
 )
@@ -10,8 +11,9 @@ func TestDeployCommand_PrintsDeprecationWarning(t *testing.T) {
 	var stderr bytes.Buffer
 	rootCmd.SetErr(&stderr)
 	rootCmd.SetOut(&bytes.Buffer{})
-	rootCmd.SetArgs([]string{"deploy", "--help"})
+	rootCmd.SetArgs([]string{"deploy", "--dry-run"})
 
+	// Command will fail (no config), but PreRunE should still print warning
 	_ = rootCmd.Execute()
 
 	got := stderr.String()
@@ -22,10 +24,16 @@ func TestDeployCommand_PrintsDeprecationWarning(t *testing.T) {
 }
 
 func TestInitCommand_PrintsDeprecationWarning(t *testing.T) {
+	// Change to temp directory to avoid modifying actual files
+	tmpDir := t.TempDir()
+	originalDir, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(originalDir)
+
 	var stderr bytes.Buffer
 	rootCmd.SetErr(&stderr)
 	rootCmd.SetOut(&bytes.Buffer{})
-	rootCmd.SetArgs([]string{"init", "--help"})
+	rootCmd.SetArgs([]string{"init"})
 
 	_ = rootCmd.Execute()
 
