@@ -1,0 +1,104 @@
+spec: phora-henia-split
+created: 2026-01-14
+updated: 2026-01-14
+
+taxonomy_coverage:
+  Scope:
+    covered: true
+    notes: Split into phora (fetcher) and henia (workflow manager) clearly defined
+  Behavior:
+    covered: true
+    notes: CLI commands and library API specified with schemas
+  Data Model:
+    covered: true
+    notes: Config types for both packages defined with example schemas
+  Constraints:
+    covered: true
+    notes: Go module compatibility, existing test preservation
+  Edge Cases:
+    covered: true
+    notes: Manifest optional with --ignore-manifest, path rewrite precedence defined
+  Integration:
+    covered: true
+    notes: henia imports phora as library, pass-through sources config
+  Terminology:
+    covered: true
+    notes: phora = fetcher, henia = workflow manager
+
+clarification_log:
+  - question: Should phora be a library or CLI subprocess?
+    answer: Go library (henia imports phora)
+    timestamp: 2026-01-14
+    impact: Architecture decision AD-2
+
+  - question: What should phora know about artifacts?
+    answer: Nothing - raw file fetcher only, henia handles artifact semantics
+    timestamp: 2026-01-14
+    impact: Clean separation of concerns, new FetchResult interface (AD-4)
+
+  - question: Where should lockfiles live?
+    answer: Both levels - phora.lock in data_dir (global), henia.lock per harness
+    timestamp: 2026-01-14
+    impact: Two lockfile formats, AD-6
+
+  - question: Should manifest be required?
+    answer: Optional, with --ignore-manifest flag on phora add
+    timestamp: 2026-01-14
+    impact: ignore_manifest field in Source config struct
+
+  - question: Should henia.toml sources be pass-through or extended?
+    answer: Pass-through to phora unchanged
+    timestamp: 2026-01-14
+    impact: AD-5, henia parses sources section, passes to phora.Client as-is
+
+  - question: Where does phora.lock live when henia is consumer?
+    answer: Global in {data_dir}/phora.lock
+    timestamp: 2026-01-14
+    impact: AD-6, single global lock managed by phora.Client
+
+  - question: Where should henia be created initially?
+    answer: ./henia/ directory (temporary, will be moved later)
+    timestamp: 2026-01-14
+    impact: AD-1 updated, development starts in ./henia/
+
+markers:
+  TBD: []
+  PLACEHOLDER: []
+  NEEDS_DISCUSSION: []
+  ASSUMPTION: []
+
+review_log:
+  - reviewer: opus
+    timestamp: 2026-01-14
+    status: changes_requested
+    critical_issues:
+      - Source interface returns artifact.Artifact - needs redesign
+      - Path rewrite system is new functionality, not extraction
+      - Open questions unresolved
+    resolution: Added SPLIT-001 for interface design, resolved open questions (AD-5, AD-6)
+
+  - reviewer: opencode/gpt-5.2-codex
+    timestamp: 2026-01-14
+    status: changes_requested
+    critical_issues:
+      - SPLIT-014 vs SPLIT-017 overlap
+      - No henia add task
+      - Tests deferred to end
+    resolution: Restructured tasks, added per-phase tests, clarified task purposes
+
+gates:
+  spec_complete:
+    status: passed
+    evidence: All sections filled, acceptance criteria defined, schemas documented
+
+  dependencies_resolved:
+    status: passed
+    evidence: No external blockers identified
+
+  risks_documented:
+    status: passed
+    evidence: Migration path, backward compatibility, interface redesign addressed
+
+  review_complete:
+    status: passed
+    evidence: Dual review (Opus + OpenCode), all critical issues addressed

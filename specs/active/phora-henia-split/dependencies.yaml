@@ -1,0 +1,114 @@
+spec: phora-henia-split
+
+nodes:
+  # Phase 1: phora library
+  SPLIT-001:
+    name: Design FetchResult interface
+    phase: 1
+  SPLIT-002:
+    name: Create phora config types
+    phase: 1
+    depends_on: [SPLIT-001]
+  SPLIT-003:
+    name: Create phora repo.go
+    phase: 1
+    depends_on: [SPLIT-002]
+  SPLIT-004:
+    name: Create phora pathmap.go
+    phase: 1
+    depends_on: [SPLIT-002]
+  SPLIT-005:
+    name: Create phora lockfile.go
+    phase: 1
+  SPLIT-006:
+    name: Create phora client.go
+    phase: 1
+    depends_on: [SPLIT-003, SPLIT-004, SPLIT-005]
+  SPLIT-007:
+    name: Create phora CLI
+    phase: 1
+    depends_on: [SPLIT-006]
+  SPLIT-008:
+    name: Write phora tests
+    phase: 1
+    depends_on: [SPLIT-007]
+
+  # Phase 2: henia module
+  SPLIT-009:
+    name: Create henia go.mod
+    phase: 2
+    depends_on: [SPLIT-006]
+  SPLIT-010:
+    name: Move artifact package
+    phase: 2
+    depends_on: [SPLIT-009]
+  SPLIT-011:
+    name: Move transform package
+    phase: 2
+    depends_on: [SPLIT-009]
+  SPLIT-012:
+    name: Move target package
+    phase: 2
+    depends_on: [SPLIT-009]
+  SPLIT-013:
+    name: Move reference package
+    phase: 2
+    depends_on: [SPLIT-009]
+  SPLIT-014:
+    name: Move defaults package
+    phase: 2
+    depends_on: [SPLIT-009]
+  SPLIT-015:
+    name: Create henia config types
+    phase: 2
+    depends_on: [SPLIT-009]
+  SPLIT-016:
+    name: Create henia lockfile
+    phase: 2
+    depends_on: [SPLIT-009]
+  SPLIT-017:
+    name: Verify henia compiles
+    phase: 2
+    depends_on: [SPLIT-010, SPLIT-011, SPLIT-012, SPLIT-013, SPLIT-014, SPLIT-015, SPLIT-016]
+  SPLIT-018:
+    name: Refactor sync for phora.Client
+    phase: 2
+    depends_on: [SPLIT-017]
+  SPLIT-019:
+    name: Create henia CLI
+    phase: 2
+    depends_on: [SPLIT-018]
+  SPLIT-020:
+    name: Write henia tests
+    phase: 2
+    depends_on: [SPLIT-019]
+
+  # Phase 3: Integration
+  SPLIT-021:
+    name: End-to-end test
+    phase: 3
+    depends_on: [SPLIT-020]
+  SPLIT-022:
+    name: Add deprecation warnings
+    phase: 3
+    depends_on: [SPLIT-021]
+
+# Parallelizable groups
+parallel_groups:
+  phase1_start: [SPLIT-001, SPLIT-005]
+  phase1_mid: [SPLIT-003, SPLIT-004]
+  phase2_moves: [SPLIT-010, SPLIT-011, SPLIT-012, SPLIT-013, SPLIT-014, SPLIT-015, SPLIT-016]
+
+# Critical path
+critical_path:
+  - SPLIT-001
+  - SPLIT-002
+  - SPLIT-003
+  - SPLIT-006
+  - SPLIT-009
+  - SPLIT-017
+  - SPLIT-018
+  - SPLIT-019
+  - SPLIT-020
+  - SPLIT-021
+  - SPLIT-022
