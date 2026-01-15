@@ -22,7 +22,11 @@ var deployCmd = &cobra.Command{
 	Use:   "deploy",
 	Short: "Deploy artifacts to harnesses",
 	Long:  "Deploy from sources to target harnesses with transformation",
-	RunE:  runDeploy,
+	PreRunE: func(cmd *cobra.Command, args []string) error {
+		fmt.Fprintln(cmd.ErrOrStderr(), "Warning: 'phora deploy' is deprecated. Use 'henia deploy' instead.")
+		return nil
+	},
+	RunE: runDeploy,
 }
 
 func init() {

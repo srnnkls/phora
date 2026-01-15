@@ -14,7 +14,11 @@ var initCmd = &cobra.Command{
 	Use:   "init",
 	Short: "Initialize phora config with manifest",
 	Long:  "Scan for artifacts and add [manifest] section to phora.toml",
-	RunE:  runInit,
+	PreRunE: func(cmd *cobra.Command, args []string) error {
+		fmt.Fprintln(cmd.ErrOrStderr(), "Warning: 'phora init' is deprecated. Use 'henia init' instead.")
+		return nil
+	},
+	RunE: runInit,
 }
 
 func runInit(cmd *cobra.Command, args []string) error {
