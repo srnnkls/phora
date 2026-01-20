@@ -6,22 +6,64 @@ taxonomy_coverage:
   behavior: covered
   data_model: covered
   constraints: covered
-  edge_cases: partial
+  edge_cases: covered
   integration: covered
   terminology: covered
 
-clarifications: []
+clarification_sessions:
+  - id: S001
+    timestamp: 2026-01-13T00:00:00Z
+    source: spec-review
+    reviewers: [claude-opus]
+    questions:
+      - id: Q001
+        question: "Should glob patterns match against artifact.Name or artifact.FullName()?"
+        answer: "Name only - simpler, namespace-agnostic"
+        area: Behavior
+        doc_updates:
+          - file: spec.md
+            section: Glob Pattern Edge Cases
+            action: added
+          - file: context.md
+            section: Filter Application Order
+            action: added
+      - id: Q002
+        question: "When deploy runs without --source flag, should it auto-discover sources from config.Sources?"
+        answer: "Yes, deploy all config sources"
+        area: Integration
+        doc_updates:
+          - file: spec.md
+            section: Deploy from Config Sources
+            action: added
+          - file: tasks.yaml
+            section: tasks
+            action: added PH2-006, PH2-007
+      - id: Q003
+        question: "How should invalid local source paths be handled?"
+        answer: "Fail fast - error and abort if path doesn't exist"
+        area: Edge Cases
+        doc_updates:
+          - file: spec.md
+            section: Deploy from Config Sources
+            action: added
 
 markers:
   - location: spec.md
     type: assumption
     content: Glob patterns use filepath.Match syntax
-    resolved: false
+    status: resolved
+    resolution: Confirmed - standard library approach
 
   - location: context.md
     type: decision
     content: Harness include/exclude deprecated but still functional
-    resolved: true
+    status: resolved
+
+  - location: context.md
+    type: decision
+    content: Constructor injection for filters (no interface change)
+    status: resolved
+    resolution: Avoids breaking Source interface
 
 gates:
   tests_pass:
@@ -38,3 +80,14 @@ gates:
     required: true
     verified: false
     evidence: null
+
+review_summary:
+  reviewer: claude-opus
+  gates_passed: [clarity]
+  gates_failed: [completeness, consistency, feasibility]
+  issues_addressed:
+    - "Added missing tasks PH2-005 through PH2-010"
+    - "Replaced SetFilter interface with constructor injection"
+    - "Added edge case acceptance criteria"
+    - "Documented filter application order"
+  outcome: All critical/high issues resolved via spec updates

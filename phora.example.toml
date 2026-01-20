@@ -1,61 +1,48 @@
-# Example phora.toml configuration
-# This can be used as either:
-# - Project config: ./phora.toml (uses relative paths by default)
-# - Global config: ~/.config/phora/phora.toml (override paths to ~/)
+# I think this is not needed anymore, we just want to manage artifacts
+# as packages
+# artifacts = ["skills", "commands", "agents"]
 
-# Global default artifact types to discover and sync
-artifacts = ["skills", "commands", "agents"]
+# Is this the right shape? The mapping should
+# declare the source and the default target,
+# I will state a revised version below
+# [manifest]
+# skills = ["code-review", "debug-helper"]
+# commands = ["deploy", "test"]
+# agents = ["reviewer"]
+# version = "1.0.0"
 
-# Package manifest (declares this repo as a phora package)
 [manifest]
-skills = ["code-review", "debug-helper"]
-commands = ["deploy", "test"]
-agents = ["reviewer"]
 version = "1.0.0"
+[manifest.artifacts]
+skills = { path = ".claude/skills", target_path = "skills" }
+commands = { path = ".claude/plugins/commander/comandas", target_path = "commands" }
+resources = "resources" # string -> string is a convencience alias for: resources = { path = "resources", target_path = "resources" }
 
 # Sources (packages you depend on)
-[sources.company]
-repo = "company/shared-skills"
-ref = "main"
-path = "artifacts"
-# Artifacts become: company.skill-name
+# `phora add https://github.com/company/shared-agents/skills` becomes`
+[sources.shared_agents]
+host = "github.com"
+repo = "company/shared-agents"
+ref = "dev"
+# should also be possible like cargo (valdidated b/c mutuallualy exclusive)
+# branch = ...
+# tag = ...
+path = "skills"
+target_path = ".claude/skills"
 
-[sources.personal]
-repo = "username/dotfiles"
-global = true  # Use bare names (no namespace prefix)
+# `phora add username/dotfiles` defaults to github backend
+[sources.dotfiles]
+host = "github.com"
+repo = "username/dotfiles/"
+# all of the following are defaults
+# ref = "main"
+# path = "" # fetches whatever manifest defines => default: full repo
+# tag = ""
+# branch = ""
+# target_path = "" # puts wherever manifest defines => default: cwd
 
-# Claude Code harness
-# Note: In global config (~/.config/phora/phora.toml), override path to ~/.claude
-[harness.claude]
-path = "~/.claude"  # Use .claude for project-local, ~/.claude for global
-
-[harness.claude.variables]
-model_strong = "opus"
-model_weak = "haiku"
-
-[harness.claude.tools]
-bash = "Bash"
-read = "Read"
-
-[harness.claude.references.skill]
-output = "/{{.Name}}"
-
-# OpenCode harness
-[harness.opencode]
-path = "~/.config/opencode"
-generate_commands_from_skills = true
-artifacts = ["skills"]  # Override: only sync skills to opencode
-
-[harness.opencode.keys]
-allowed_tools = "tools"
-
-[harness.opencode.tools]
-bash = "bash"
-read = "read"
-
-[harness.opencode.references.skill]
-output = "@{{.Name}}"
-
-[harness.opencode.variables]
-model_strong = "anthropic/claude-sonnet-4-5"
-model_weak = "anthropic/claude-haiku-4-5"
+# not needed (henia's responsibility)
+# # Claude Code harness
+# # Note: In global config (~/.config/phora/phora.toml), override path to ~/.claude
+# [harness.claude]
+# path = "~/.claude"  # Use .claude for project-local, ~/.claude for global

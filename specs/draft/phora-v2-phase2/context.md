@@ -68,28 +68,41 @@ type Harness struct {
 }
 ```
 
-### Source Interface Changes
+### Source Struct Changes
+
+Filter fields injected via constructor (no interface change needed):
 
 ```go
+// Source interface unchanged
 type Source interface {
     Name() string
     Discover() ([]*artifact.Artifact, error)
-    SetFilter(include, exclude []string)  // NEW
 }
 
 type LocalSource struct {
     path          string
     artifactTypes []string
-    include       []string  // NEW
-    exclude       []string  // NEW
+    include       []string  // NEW: injected via constructor
+    exclude       []string  // NEW: injected via constructor
 }
 
 type RepoSource struct {
     // ... existing fields
-    include []string  // NEW
-    exclude []string  // NEW
+    include []string  // NEW: injected via constructor
+    exclude []string  // NEW: injected via constructor
 }
+
+// Updated constructors
+func NewLocal(path string, artifactTypes, include, exclude []string) *LocalSource
+func NewRepo(repoStr, ref, dataDir string, artifactTypes, include, exclude []string) *RepoSource
 ```
+
+### Filter Application Order
+
+1. If `include` is set and non-empty, artifact.Name must match at least one pattern
+2. If artifact.Name matches any `exclude` pattern, artifact is excluded
+3. Exclude wins when artifact matches both include and exclude patterns
+4. Patterns match against `artifact.Name` only (not `FullName` with namespace)
 
 ## Config Hierarchy
 

@@ -10,19 +10,19 @@ tasks:
 
   - id: SPLIT-002
     content: Create phora config.go with minimal Source, Host types
-    status: in_progress
+    status: completed
     active_form: Creating phora config.go with minimal types
     depends_on: [SPLIT-001]
 
   - id: SPLIT-003
     content: Create phora repo.go extracting git operations from internal/source
-    status: pending
+    status: completed
     active_form: Creating phora repo.go with git operations
     depends_on: [SPLIT-002]
 
   - id: SPLIT-004
     content: Create phora pathmap.go for manifest + call-side path rewrites
-    status: pending
+    status: completed
     active_form: Creating phora pathmap.go for path rewrites
     depends_on: [SPLIT-002]
 
@@ -33,112 +33,112 @@ tasks:
 
   - id: SPLIT-006
     content: Create phora client.go with high-level Client API
-    status: pending
+    status: completed
     active_form: Creating phora client.go with Client API
     depends_on: [SPLIT-003, SPLIT-004, SPLIT-005]
 
   - id: SPLIT-007
     content: Create cmd/phora/main.go standalone CLI (add, sync, update, list)
-    status: pending
+    status: completed
     active_form: Creating phora standalone CLI
     depends_on: [SPLIT-006]
 
   - id: SPLIT-008
     content: Write tests for phora library
-    status: pending
+    status: completed
     active_form: Writing tests for phora library
     depends_on: [SPLIT-007]
 
   # Phase 2: Create henia module
   - id: SPLIT-009
     content: Create ./henia/go.mod with phora dependency and replace directive
-    status: pending
+    status: completed
     active_form: Creating henia go.mod in ./henia/
     depends_on: [SPLIT-006]
 
   - id: SPLIT-010
     content: Move artifact package to henia/internal/artifact, update imports
-    status: pending
+    status: completed
     active_form: Moving artifact package to henia
     depends_on: [SPLIT-009]
 
   - id: SPLIT-011
     content: Move transform package to henia/internal/transform, update imports
-    status: pending
+    status: completed
     active_form: Moving transform package to henia
     depends_on: [SPLIT-009]
 
   - id: SPLIT-012
     content: Move target package to henia/internal/target, update imports
-    status: pending
+    status: completed
     active_form: Moving target package to henia
     depends_on: [SPLIT-009]
 
   - id: SPLIT-013
     content: Move reference package to henia/internal/reference, update imports
-    status: pending
+    status: completed
     active_form: Moving reference package to henia
     depends_on: [SPLIT-009]
 
   - id: SPLIT-014
     content: Move defaults package to henia/internal/defaults, update imports
-    status: pending
+    status: completed
     active_form: Moving defaults package to henia
     depends_on: [SPLIT-009]
 
   - id: SPLIT-015
     content: Create henia/config.go with full harness config types
-    status: pending
+    status: completed
     active_form: Creating henia config.go with harness types
     depends_on: [SPLIT-009]
 
   - id: SPLIT-016
     content: Create henia/internal/lockfile with henia.lock format
-    status: pending
+    status: completed
     active_form: Creating henia lockfile package
     depends_on: [SPLIT-009]
 
   - id: SPLIT-017
     content: Verify henia module compiles after package moves
-    status: pending
+    status: completed
     active_form: Verifying henia module compiles
     depends_on: [SPLIT-010, SPLIT-011, SPLIT-012, SPLIT-013, SPLIT-014, SPLIT-015, SPLIT-016]
 
   - id: SPLIT-018
     content: Refactor henia/internal/sync to use phora.Client for fetching
-    status: pending
+    status: completed
     active_form: Refactoring sync to use phora.Client
     depends_on: [SPLIT-017]
 
   - id: SPLIT-019
     content: Create henia CLI commands (sync, deploy, update, add)
-    status: pending
+    status: completed
     active_form: Creating henia CLI commands
     depends_on: [SPLIT-018]
 
   - id: SPLIT-020
     content: Write tests for henia module
-    status: pending
+    status: completed
     active_form: Writing tests for henia module
     depends_on: [SPLIT-019]
 
   # Phase 3: Integration and cleanup
   - id: SPLIT-021
     content: End-to-end test henia sync -> phora fetch -> henia deploy
-    status: pending
+    status: completed
     active_form: Testing end-to-end workflow
     depends_on: [SPLIT-020]
 
   - id: SPLIT-022
     content: Add deprecation warnings to old phora CLI commands
-    status: pending
+    status: completed
     active_form: Adding deprecation warnings
     depends_on: [SPLIT-021]
 
 meta:
   created: 2026-01-14
   last_updated: 2026-01-15
-  progress: 2/22
+  progress: 22/22
 
 phases:
   - name: "Phase 1: Extract phora Library"
@@ -150,7 +150,7 @@ phases:
         - phora.Client API is usable
         - phora.lock tracks fetched commits
         - Tests pass
-      verified: false
+      verified: true
 
   - name: "Phase 2: Create henia Module"
     task_ids: [SPLIT-009, SPLIT-010, SPLIT-011, SPLIT-012, SPLIT-013, SPLIT-014, SPLIT-015, SPLIT-016, SPLIT-017, SPLIT-018, SPLIT-019, SPLIT-020]
@@ -161,7 +161,7 @@ phases:
         - All packages moved and compile
         - henia sync/deploy/update/add commands work
         - Tests pass
-      verified: false
+      verified: true
 
   - name: "Phase 3: Integration"
     task_ids: [SPLIT-021, SPLIT-022]
@@ -171,4 +171,4 @@ phases:
         - henia sync calls phora successfully
         - henia deploy writes to harnesses
         - Old phora commands show deprecation warnings
-      verified: false
+      verified: true

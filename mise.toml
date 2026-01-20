@@ -1,6 +1,8 @@
 [tools]
 "github:facebookincubator/scrut" = "0.4.2"
+"github:mufeedvh/code2prompt" = "latest"
 go = "1.25.5"
+"ubi:mufeedvh/code2prompt" = "latest"
 
 [tasks.build]
 description = "Build tropos binary"

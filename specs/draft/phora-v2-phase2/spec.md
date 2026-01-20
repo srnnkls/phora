@@ -73,6 +73,30 @@ Move include/exclude filtering from harness to source level and add explicit loc
 - **When** artifacts are discovered
 - **Then** artifacts use bare names
 
+### Deploy from Config Sources
+
+- **Given** `phora deploy` runs without `--source` flag
+- **When** config has `[sources.*]` entries
+- **Then** all config sources are instantiated and deployed
+
+- **Given** local source path doesn't exist
+- **When** source is instantiated
+- **Then** error is returned and deploy aborts (fail fast)
+
+### Glob Pattern Edge Cases
+
+- **Given** source config with empty `include = []`
+- **When** artifacts are discovered
+- **Then** all artifacts pass (no filtering)
+
+- **Given** glob pattern with invalid syntax
+- **When** pattern is matched
+- **Then** pattern returns no match (treated as literal)
+
+- **Given** artifact in namespaced source (e.g., `company.code-test`)
+- **When** include pattern `code-*` is evaluated
+- **Then** pattern matches against `Name` only (`code-test`), not `FullName`
+
 ## Non-Functional Requirements
 
 - Backward compatible: existing harness-level include/exclude works but logs deprecation warning

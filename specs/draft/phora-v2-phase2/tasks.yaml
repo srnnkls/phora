@@ -1,46 +1,61 @@
 spec: phora-v2-phase2
 code: PH2
-next_id: 8
+next_id: 11
 tasks:
   - id: PH2-001
-    content: Add Include/Exclude fields to Source struct
+    content: Add Include/Exclude fields to Source struct in config
     status: pending
     active_form: Adding Include/Exclude to Source struct
 
   - id: PH2-002
-    content: Add filter fields and SetFilter method to LocalSource
+    content: Update LocalSource constructor to accept include/exclude params
     status: pending
-    active_form: Adding filter support to LocalSource
+    active_form: Updating LocalSource constructor
 
   - id: PH2-003
-    content: Add filter fields and SetFilter method to RepoSource
+    content: Update RepoSource constructor to accept include/exclude params
     status: pending
-    active_form: Adding filter support to RepoSource
+    active_form: Updating RepoSource constructor
 
   - id: PH2-004
-    content: Implement glob pattern matching in source filtering
+    content: Implement glob pattern matching filter in source Discover()
     status: pending
     active_form: Implementing glob pattern matching
 
   - id: PH2-005
-    content: Refactor sync.go to remove harness-level filtering
+    content: Refactor sync.Detect() to accept []source.Source instead of []string paths
     status: pending
-    active_form: Refactoring sync to use source-level filtering
+    active_form: Refactoring sync.Detect() signature
 
   - id: PH2-006
-    content: Add deprecation warning for harness include/exclude
+    content: Implement source instantiation from config.Sources map
+    status: pending
+    active_form: Implementing config-based source instantiation
+
+  - id: PH2-007
+    content: Update deploy command to auto-deploy config sources when no --source flag
+    status: pending
+    active_form: Updating deploy for config sources
+
+  - id: PH2-008
+    content: Remove harness-level filtering from sync.go
+    status: pending
+    active_form: Removing harness-level filtering
+
+  - id: PH2-009
+    content: Add deprecation warning for harness include/exclude usage
     status: pending
     active_form: Adding deprecation warning
 
-  - id: PH2-007
-    content: Update deploy command to instantiate sources from config
+  - id: PH2-010
+    content: Update findSourceByPath() to return full config.Source
     status: pending
-    active_form: Updating deploy for config-based sources
+    active_form: Updating findSourceByPath return type
 
 meta:
   created: 2026-01-13
   last_updated: 2026-01-13
-  progress: 0/7
+  progress: 0/10
 
 phases:
   - name: "Phase A: Config Changes"
@@ -57,25 +72,27 @@ phases:
     checkpoint:
       description: Source-level filtering works
       criteria:
-        - LocalSource filters artifacts
-        - RepoSource filters artifacts
-        - Glob patterns supported
+        - LocalSource filters artifacts via constructor params
+        - RepoSource filters artifacts via constructor params
+        - Glob patterns matched against artifact.Name
       verified: false
 
   - name: "Phase C: Sync Refactor"
-    task_ids: [PH2-005, PH2-006]
+    task_ids: [PH2-005, PH2-006, PH2-008, PH2-009, PH2-010]
     checkpoint:
-      description: Filtering moved to source
+      description: Filtering moved to source, sync uses Source interface
       criteria:
-        - sync.go uses source filtering
-        - Deprecation warning logged
+        - sync.Detect() accepts []source.Source
+        - Sources instantiated from config.Sources
+        - Harness filtering removed with deprecation warning
+        - findSourceByPath returns config.Source
       verified: false
 
   - name: "Phase D: Deploy Integration"
     task_ids: [PH2-007]
     checkpoint:
-      description: Local sources work via config
+      description: Deploy auto-discovers config sources
       criteria:
-        - Local sources load from config
-        - phora deploy works with local sources
+        - phora deploy without --source uses config.Sources
+        - Invalid local paths fail fast with error
       verified: false
