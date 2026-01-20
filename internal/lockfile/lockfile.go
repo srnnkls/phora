@@ -1,3 +1,7 @@
+// Package lockfile provides lockfile types for phora.
+//
+// Deprecated: Use the root phora package types (phora.Lock, phora.SourceLock) instead.
+// This package will be removed in a future version.
 package lockfile
 
 import (

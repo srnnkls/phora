@@ -9,21 +9,32 @@ import (
 	"github.com/srnnkls/phora"
 )
 
+var (
+	syncForce bool
+)
+
 var syncCmd = &cobra.Command{
 	Use:   "sync",
-	Short: "Fetch all configured sources",
-	Long:  "Fetch all sources defined in phora.toml",
-	RunE:  runSync,
+	Short: "Sync configured sources to local targets",
+	Long: `Sync all sources defined in phora.toml to their local targets.
+
+Detects drift (local modifications) and errors unless --force is used.
+Uses locked SHA for fetching (run 'phora update' to re-resolve refs).`,
+	RunE: runSync,
 }
 
 var updateCmd = &cobra.Command{
-	Use:   "update",
-	Short: "Fetch all configured sources (alias for sync)",
-	Long:  "Fetch all sources defined in phora.toml",
-	RunE:  runSync,
+	Use:   "update [source]",
+	Short: "Re-resolve refs and update lock file",
+	Long: `Re-resolve branch/tag refs to latest commit SHA and update lock file.
+
+If a source name is provided, only that source is updated.
+Otherwise, all sources are updated.`,
+	RunE: runUpdate,
 }
 
 func init() {
+	syncCmd.Flags().BoolVarP(&syncForce, "force", "f", false, "Overwrite drifted files without prompting")
 	rootCmd.AddCommand(syncCmd)
 	rootCmd.AddCommand(updateCmd)
 }
@@ -39,6 +50,47 @@ func runSync(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("get working directory: %w", err)
+	}
+
+	lock, err := phora.LoadLock(cwd)
+	if err != nil {
+		lock = &phora.Lock{}
+	}
+
+	var driftedFiles []phora.DriftResult
+	for name, source := range cfg.Sources {
+		targetDir := source.Target
+		if targetDir == "" {
+			targetDir = name
+		}
+		targetPath := filepath.Join(cwd, targetDir)
+
+		drift, err := phora.DetectDrift(lock, name, targetPath)
+		if err != nil {
+			return fmt.Errorf("detect drift for %s: %w", name, err)
+		}
+		driftedFiles = append(driftedFiles, drift...)
+	}
+
+	if len(driftedFiles) > 0 && !syncForce {
+		fmt.Printf("Drift detected in %d file(s):\n", len(driftedFiles))
+		for _, d := range driftedFiles {
+			status := "modified"
+			if d.Status == phora.DriftMissing {
+				status = "missing"
+			}
+			fmt.Printf("  %s (%s)\n", d.Path, status)
+		}
+		return fmt.Errorf("drift detected; use --force to overwrite")
+	}
+
+	if len(driftedFiles) > 0 {
+		fmt.Printf("Overwriting %d drifted file(s) (--force)\n", len(driftedFiles))
+	}
+
 	client := phora.NewClient(cfg, phora.WithDataDir(dataDir))
 
 	results, err := client.FetchAll()
@@ -47,10 +99,57 @@ func runSync(cmd *cobra.Command, args []string) error {
 	}
 
 	for _, result := range results {
-		fmt.Printf("Fetched %s (%s)\n", result.Name, result.Commit[:8])
+		fmt.Printf("Synced %s (%s)\n", result.Name, result.Commit[:8])
 	}
 
 	fmt.Printf("Synced %d source(s)\n", len(results))
+	return nil
+}
+
+func runUpdate(cmd *cobra.Command, args []string) error {
+	cfg, err := loadPhoraConfig()
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+
+	if len(cfg.Sources) == 0 {
+		fmt.Println("No sources configured")
+		return nil
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("get working directory: %w", err)
+	}
+
+	if len(args) > 0 {
+		sourceName := args[0]
+		result, err := updateSource(cfg, sourceName, cwd)
+		if err != nil {
+			return fmt.Errorf("update source: %w", err)
+		}
+		if result.OldSHA != "" && result.OldSHA != result.NewSHA {
+			fmt.Printf("Updated %s: %s -> %s\n", result.SourceName, result.OldSHA[:8], result.NewSHA[:8])
+		} else {
+			fmt.Printf("Updated %s: %s\n", result.SourceName, result.NewSHA[:8])
+		}
+		return nil
+	}
+
+	results, err := updateAllSources(cfg, cwd)
+	if err != nil {
+		return fmt.Errorf("update sources: %w", err)
+	}
+
+	for _, result := range results {
+		if result.OldSHA != "" && result.OldSHA != result.NewSHA {
+			fmt.Printf("Updated %s: %s -> %s\n", result.SourceName, result.OldSHA[:8], result.NewSHA[:8])
+		} else {
+			fmt.Printf("Updated %s: %s\n", result.SourceName, result.NewSHA[:8])
+		}
+	}
+
+	fmt.Printf("Updated %d source(s)\n", len(results))
 	return nil
 }
 

@@ -47,7 +47,7 @@ tasks:
     active_form: Implementing URL parser
   - id: CFG-011
     content: Integrate parser into phora add command with collision validation
-    status: pending
+    status: completed
     active_form: Integrating parser
   - id: CFG-018
     content: Implement include/exclude glob filtering for source paths
@@ -57,11 +57,11 @@ tasks:
   # Phase 5: Consolidation
   - id: CFG-012
     content: Consolidate config types (root + internal/config)
-    status: pending
+    status: completed
     active_form: Consolidating config types
   - id: CFG-013
     content: Consolidate lockfile types (root + internal/lockfile)
-    status: pending
+    status: completed
     active_form: Consolidating lockfile types
   - id: CFG-014
     content: Update imports and deprecate old packages
@@ -85,7 +85,7 @@ tasks:
 meta:
   created: 2026-01-18
   last_updated: 2026-01-20
-  progress: 10/17
+  progress: 13/17
 
 phases:
   - name: "Phase 1: Config Format"
