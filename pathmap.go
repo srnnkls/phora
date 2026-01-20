@@ -51,21 +51,21 @@ func (p *PathMap) Resolve(path string) string {
 	return resolved
 }
 
-// Manifest represents the manifest from a phora.toml file.
-type Manifest struct {
+// RepoManifest represents the manifest from a phora.toml file in a source repo.
+type RepoManifest struct {
 	Name    string            `toml:"name"`
 	Exports map[string]string `toml:"exports"`
 }
 
-// LoadManifest loads a manifest from phora.toml in the given repository path.
-func LoadManifest(repoPath string) (*Manifest, error) {
+// LoadRepoManifest loads a manifest from phora.toml in the given repository path.
+func LoadRepoManifest(repoPath string) (*RepoManifest, error) {
 	configPath := filepath.Join(repoPath, "phora.toml")
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return nil, err
 	}
 
-	var m Manifest
+	var m RepoManifest
 	if err := toml.Unmarshal(data, &m); err != nil {
 		return nil, err
 	}

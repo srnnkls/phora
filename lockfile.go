@@ -103,6 +103,35 @@ func (l *Lock) IsEmpty() bool {
 	return len(l.Repos) == 0
 }
 
+func (l *Lock) FindSourceByName(name string) (SourceLock, bool) {
+	for _, s := range l.Sources {
+		if s.Name == name {
+			return s, true
+		}
+	}
+	return SourceLock{}, false
+}
+
+func (l *Lock) AddSource(source SourceLock) {
+	for i, s := range l.Sources {
+		if s.Name == source.Name {
+			l.Sources[i] = source
+			return
+		}
+	}
+	l.Sources = append(l.Sources, source)
+}
+
+func (l *Lock) RemoveSource(name string) {
+	var filtered []SourceLock
+	for _, s := range l.Sources {
+		if s.Name != name {
+			filtered = append(filtered, s)
+		}
+	}
+	l.Sources = filtered
+}
+
 func ComputeFileHash(path string) (string, int64, error) {
 	info, err := os.Stat(path)
 	if err != nil {

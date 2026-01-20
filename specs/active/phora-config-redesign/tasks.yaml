@@ -9,11 +9,11 @@ tasks:
     active_form: Defining new Source struct
   - id: CFG-002
     content: Add mutual exclusivity validation for branch/tag/rev
-    status: pending
+    status: completed
     active_form: Adding ref validation
   - id: CFG-004
     content: Update config parsing tests
-    status: pending
+    status: completed
     active_form: Updating config tests
 
   # Phase 2: Manifest
@@ -23,21 +23,21 @@ tasks:
     active_form: Simplifying Manifest struct
   - id: CFG-006
     content: Add manifest filtering tests
-    status: pending
+    status: completed
     active_form: Adding manifest tests
 
   # Phase 3: Lock File
   - id: CFG-007
     content: Add digest generation and comparison
-    status: pending
+    status: completed
     active_form: Adding config digest
   - id: CFG-008
     content: Add per-file SHA256 hashes to lock
-    status: pending
+    status: completed
     active_form: Adding file hashes
   - id: CFG-009
     content: Implement lazy sync based on digest
-    status: pending
+    status: completed
     active_form: Implementing lazy sync
 
   # Phase 4: URL Parser
@@ -51,7 +51,7 @@ tasks:
     active_form: Integrating parser
   - id: CFG-018
     content: Implement include/exclude glob filtering for source paths
-    status: pending
+    status: completed
     active_form: Implementing glob filtering
 
   # Phase 5: Consolidation
@@ -85,7 +85,7 @@ tasks:
 meta:
   created: 2026-01-18
   last_updated: 2026-01-20
-  progress: 3/17
+  progress: 10/17
 
 phases:
   - name: "Phase 1: Config Format"

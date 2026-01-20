@@ -154,8 +154,8 @@ func TestPathMap_Resolve_ChainedMapping(t *testing.T) {
 	}
 }
 
-func TestManifest_Fields(t *testing.T) {
-	m := Manifest{
+func TestRepoManifest_Fields(t *testing.T) {
+	m := RepoManifest{
 		Name: "my-source",
 		Exports: map[string]string{
 			"skills/internal/my-skill": "my-skill",
@@ -173,8 +173,8 @@ func TestManifest_Fields(t *testing.T) {
 	}
 }
 
-func TestManifest_ZeroValue(t *testing.T) {
-	var m Manifest
+func TestRepoManifest_ZeroValue(t *testing.T) {
+	var m RepoManifest
 
 	if m.Name != "" {
 		t.Error("zero value Name should be empty")
@@ -184,7 +184,7 @@ func TestManifest_ZeroValue(t *testing.T) {
 	}
 }
 
-func TestLoadManifest_FromPhoraTOML(t *testing.T) {
+func TestLoadRepoManifest_FromPhoraTOML(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "phora.toml")
 
@@ -198,13 +198,13 @@ func TestLoadManifest_FromPhoraTOML(t *testing.T) {
 		t.Fatalf("failed to write test phora.toml: %v", err)
 	}
 
-	m, err := LoadManifest(dir)
+	m, err := LoadRepoManifest(dir)
 	if err != nil {
-		t.Fatalf("LoadManifest() error: %v", err)
+		t.Fatalf("LoadRepoManifest() error: %v", err)
 	}
 
 	if m == nil {
-		t.Fatal("LoadManifest() returned nil")
+		t.Fatal("LoadRepoManifest() returned nil")
 	}
 	if m.Name != "my-source" {
 		t.Errorf("Name = %q, want %q", m.Name, "my-source")
@@ -220,16 +220,16 @@ func TestLoadManifest_FromPhoraTOML(t *testing.T) {
 	}
 }
 
-func TestLoadManifest_FileNotFound(t *testing.T) {
+func TestLoadRepoManifest_FileNotFound(t *testing.T) {
 	dir := t.TempDir()
 
-	_, err := LoadManifest(dir)
+	_, err := LoadRepoManifest(dir)
 	if err == nil {
-		t.Error("LoadManifest() should return error when phora.toml not found")
+		t.Error("LoadRepoManifest() should return error when phora.toml not found")
 	}
 }
 
-func TestLoadManifest_MalformedTOML(t *testing.T) {
+func TestLoadRepoManifest_MalformedTOML(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "phora.toml")
 
@@ -239,13 +239,13 @@ invalid toml syntax`
 		t.Fatalf("failed to write test file: %v", err)
 	}
 
-	_, err := LoadManifest(dir)
+	_, err := LoadRepoManifest(dir)
 	if err == nil {
-		t.Error("LoadManifest() should return error for malformed TOML")
+		t.Error("LoadRepoManifest() should return error for malformed TOML")
 	}
 }
 
-func TestLoadManifest_EmptyExports(t *testing.T) {
+func TestLoadRepoManifest_EmptyExports(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "phora.toml")
 
@@ -255,9 +255,9 @@ func TestLoadManifest_EmptyExports(t *testing.T) {
 		t.Fatalf("failed to write test file: %v", err)
 	}
 
-	m, err := LoadManifest(dir)
+	m, err := LoadRepoManifest(dir)
 	if err != nil {
-		t.Fatalf("LoadManifest() error: %v", err)
+		t.Fatalf("LoadRepoManifest() error: %v", err)
 	}
 
 	if m.Name != "empty-source" {

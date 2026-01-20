@@ -2,10 +2,13 @@ package cli
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/srnnkls/phora"
 	"github.com/srnnkls/phora/internal/config"
 	"github.com/srnnkls/phora/internal/source"
 	"github.com/srnnkls/phora/internal/sync"
@@ -15,22 +18,55 @@ var (
 	addHarnesses []string
 	addRef       string
 	addPath      string
+	addTarget    string
+	addName      string
 	addGlobal    bool
 	addForce     bool
 )
 
 var addCmd = &cobra.Command{
-	Use:   "add <owner/repo>",
+	Use:   "add <url> [flags]",
 	Short: "Add artifacts from a repository",
-	Long:  "Clone repo to data directory and sync to harnesses (local by default)",
-	Args:  cobra.ExactArgs(1),
-	RunE:  runAdd,
+	Long: `Add artifacts from a repository to your project.
+
+Supported URL formats:
+  - owner/repo              GitHub shorthand
+  - owner/repo/path         GitHub shorthand with subdirectory
+  - https://github.com/owner/repo/tree/ref/path
+  - gitlab.com/owner/repo/path
+
+The command parses the URL, clones the repository, and syncs artifacts
+to the configured harnesses. The source is saved to phora.toml.
+
+Flags:
+  --ref      Branch, tag, or commit (required for refs containing "/")
+  --path     Subdirectory within repo containing artifacts
+  --target   Override target directory (default: source key name)
+  --name     Override source key name (default: derived from repo name)
+  --harness  Target harnesses (default: all enabled)
+  --global   Save source to global config instead of local phora.toml
+  --force    Overwrite existing unmanaged files`,
+	Example: `  # Add from GitHub shorthand
+  phora add srnnkls/dotfiles/.claude/skills
+
+  # Add with explicit ref (required for feature/xyz branches)
+  phora add srnnkls/dotfiles --ref feature/new-skills --path .claude/skills
+
+  # Add from full GitHub URL
+  phora add https://github.com/company/shared/tree/v1.0/artifacts/skills
+
+  # Save to global config
+  phora add company/shared --global`,
+	Args: cobra.ExactArgs(1),
+	RunE: runAdd,
 }
 
 func init() {
 	addCmd.Flags().StringSliceVar(&addHarnesses, "harness", nil, "Target harnesses (default: all enabled)")
 	addCmd.Flags().StringVar(&addRef, "ref", "main", "Branch, tag, or commit")
 	addCmd.Flags().StringVar(&addPath, "path", "", "Subdirectory within repo containing artifacts")
+	addCmd.Flags().StringVar(&addTarget, "target", "", "Override target directory (default: source key name)")
+	addCmd.Flags().StringVar(&addName, "name", "", "Override source key name (default: derived from repo name)")
 	addCmd.Flags().BoolVarP(&addGlobal, "global", "g", false, "Save source to global config instead of local phora.toml")
 	addCmd.Flags().BoolVarP(&addForce, "force", "f", false, "Overwrite existing unmanaged files")
 	rootCmd.AddCommand(addCmd)
@@ -39,13 +75,37 @@ func init() {
 func runAdd(cmd *cobra.Command, args []string) error {
 	repoStr := args[0]
 
+	parsed, err := phora.ParseURL(repoStr)
+	if err != nil {
+		return fmt.Errorf("parse URL: %w", err)
+	}
+
+	host, owner, repo := extractHostOwnerRepo(parsed.Git)
+
+	sourceName := addName
+	if sourceName == "" {
+		sourceName = repo
+	}
+
+	var configPath string
+	if addGlobal {
+		configPath = globalConfigPath
+	} else {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return fmt.Errorf("get working directory: %w", err)
+		}
+		configPath = filepath.Join(cwd, "phora.toml")
+	}
+
+	if err := checkSourceNameCollision(configPath, sourceName); err != nil {
+		return err
+	}
+
 	cfg, err := config.Load("", globalConfigPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-
-	// Parse repo string to get structured data
-	host, owner, repo := source.ParseRepoString(repoStr)
 
 	// Look up host config (may be nil for unknown hosts)
 	var hostConfig *config.Host
@@ -169,29 +229,66 @@ func runAdd(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Skipped %d (excluded or already exist)\n", result.Skipped)
 	}
 
+	configSourcePath := addPath
+	if configSourcePath == "" {
+		configSourcePath = parsed.Path
+	}
+
+	targetDir := addTarget
+	if targetDir == "" {
+		targetDir = sourceName
+	}
+
+	ref := addRef
+	if ref == "main" && parsed.Branch != "" {
+		ref = parsed.Branch
+	}
+
 	src := config.Source{
 		Host:  host,
 		Owner: owner,
 		Repo:  repo,
-		Path:  addPath,
-		Ref:   addRef,
+		Path:  configSourcePath,
+		Ref:   ref,
 	}
 
-	var configPath string
-	if addGlobal {
-		configPath = globalConfigPath
-	} else {
-		cwd, err := os.Getwd()
-		if err != nil {
-			return fmt.Errorf("get working directory: %w", err)
-		}
-		configPath = filepath.Join(cwd, "phora.toml")
-	}
-
-	if err := config.AddSource(configPath, repoStr, src); err != nil {
+	if err := config.AddSource(configPath, sourceName, src); err != nil {
 		return fmt.Errorf("save source to config: %w", err)
 	}
-	fmt.Printf("Added source to %s\n", configPath)
+	fmt.Printf("Added source '%s' to %s (target: %s)\n", sourceName, configPath, targetDir)
 
 	return nil
+}
+
+func checkSourceNameCollision(configPath, sourceName string) error {
+	cfg, err := config.LoadFile(configPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return nil
+	}
+
+	if _, exists := cfg.Sources[sourceName]; exists {
+		return fmt.Errorf("source '%s' already exists", sourceName)
+	}
+	return nil
+}
+
+func extractHostOwnerRepo(gitURL string) (host, owner, repo string) {
+	u, err := url.Parse(gitURL)
+	if err != nil {
+		return "", "", ""
+	}
+
+	host = u.Host
+	path := strings.TrimPrefix(u.Path, "/")
+	path = strings.TrimSuffix(path, ".git")
+
+	parts := strings.Split(path, "/")
+	if len(parts) >= 2 {
+		owner = parts[0]
+		repo = parts[1]
+	}
+	return host, owner, repo
 }

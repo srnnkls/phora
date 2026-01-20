@@ -293,3 +293,171 @@ func TestLockV2_WriteTOML(t *testing.T) {
 		t.Errorf("Files[0].Size after roundtrip = %d, want 2048", file.Size)
 	}
 }
+
+func TestLock_FindSourceByName(t *testing.T) {
+	now := time.Now()
+	lock := Lock{
+		Version: 1,
+		Sources: []SourceLock{
+			{Name: "alpha", Repo: "org/alpha", FetchedAt: now},
+			{Name: "beta", Repo: "org/beta", FetchedAt: now},
+			{Name: "gamma", Repo: "org/gamma", FetchedAt: now},
+		},
+	}
+
+	tests := []struct {
+		name     string
+		wantRepo string
+		exists   bool
+	}{
+		{"alpha", "org/alpha", true},
+		{"beta", "org/beta", true},
+		{"gamma", "org/gamma", true},
+		{"delta", "", false},
+		{"", "", false},
+	}
+
+	for _, tc := range tests {
+		source, ok := lock.FindSourceByName(tc.name)
+		if ok != tc.exists {
+			t.Errorf("FindSourceByName(%q) exists = %v, want %v", tc.name, ok, tc.exists)
+			continue
+		}
+		if ok && source.Repo != tc.wantRepo {
+			t.Errorf("FindSourceByName(%q) Repo = %q, want %q", tc.name, source.Repo, tc.wantRepo)
+		}
+	}
+}
+
+func TestLock_AddSource_New(t *testing.T) {
+	var lock Lock
+	lock.Version = 1
+
+	now := time.Now()
+	lock.AddSource(SourceLock{
+		Name:      "new-source",
+		Repo:      "org/new-repo",
+		Ref:       "main",
+		SHA:       "abc123",
+		FetchedAt: now,
+	})
+
+	if len(lock.Sources) != 1 {
+		t.Fatalf("expected 1 source after add, got %d", len(lock.Sources))
+	}
+	if lock.Sources[0].Name != "new-source" {
+		t.Errorf("Name = %q, want %q", lock.Sources[0].Name, "new-source")
+	}
+	if lock.Sources[0].Repo != "org/new-repo" {
+		t.Errorf("Repo = %q, want %q", lock.Sources[0].Repo, "org/new-repo")
+	}
+}
+
+func TestLock_AddSource_UpdateExisting(t *testing.T) {
+	now := time.Now()
+	lock := Lock{
+		Version: 1,
+		Sources: []SourceLock{
+			{
+				Name:      "existing",
+				Repo:      "org/repo",
+				Ref:       "main",
+				SHA:       "old-sha",
+				FetchedAt: now.Add(-1 * time.Hour),
+			},
+		},
+	}
+
+	lock.AddSource(SourceLock{
+		Name:      "existing",
+		Repo:      "org/repo",
+		Ref:       "main",
+		SHA:       "new-sha",
+		FetchedAt: now,
+	})
+
+	if len(lock.Sources) != 1 {
+		t.Fatalf("expected 1 source after update, got %d", len(lock.Sources))
+	}
+	if lock.Sources[0].SHA != "new-sha" {
+		t.Errorf("SHA = %q, want %q", lock.Sources[0].SHA, "new-sha")
+	}
+}
+
+func TestLock_RemoveSource(t *testing.T) {
+	now := time.Now()
+	lock := Lock{
+		Version: 1,
+		Sources: []SourceLock{
+			{Name: "keep-a", Repo: "org/a", FetchedAt: now},
+			{Name: "remove-me", Repo: "org/remove", FetchedAt: now},
+			{Name: "keep-b", Repo: "org/b", FetchedAt: now},
+		},
+	}
+
+	lock.RemoveSource("remove-me")
+
+	if len(lock.Sources) != 2 {
+		t.Fatalf("expected 2 sources after remove, got %d", len(lock.Sources))
+	}
+	if _, found := lock.FindSourceByName("remove-me"); found {
+		t.Error("removed source should not be found")
+	}
+	if _, found := lock.FindSourceByName("keep-a"); !found {
+		t.Error("keep-a should still exist")
+	}
+	if _, found := lock.FindSourceByName("keep-b"); !found {
+		t.Error("keep-b should still exist")
+	}
+}
+
+func TestLock_RemoveSource_NotFound(t *testing.T) {
+	now := time.Now()
+	lock := Lock{
+		Version: 1,
+		Sources: []SourceLock{
+			{Name: "existing", Repo: "org/existing", FetchedAt: now},
+		},
+	}
+
+	lock.RemoveSource("nonexistent")
+
+	if len(lock.Sources) != 1 {
+		t.Errorf("expected 1 source unchanged, got %d", len(lock.Sources))
+	}
+}
+
+func TestLock_TrackFiles(t *testing.T) {
+	now := time.Now()
+	lock := Lock{
+		Version: 1,
+		Sources: []SourceLock{
+			{
+				Name:      "shared",
+				Repo:      "company/shared",
+				Ref:       "v1.0",
+				SHA:       "abc123",
+				FetchedAt: now,
+				Files: []FileLock{
+					{Path: "skills/review.md", SHA256: "hash1", Size: 1024},
+					{Path: "skills/debug.md", SHA256: "hash2", Size: 2048},
+				},
+			},
+		},
+	}
+
+	source, ok := lock.FindSourceByName("shared")
+	if !ok {
+		t.Fatal("source not found")
+	}
+
+	if len(source.Files) != 2 {
+		t.Fatalf("expected 2 files, got %d", len(source.Files))
+	}
+	if source.Files[0].Path != "skills/review.md" {
+		t.Errorf("Files[0].Path = %q, want %q", source.Files[0].Path, "skills/review.md")
+	}
+	if source.Files[1].SHA256 != "hash2" {
+		t.Errorf("Files[1].SHA256 = %q, want %q", source.Files[1].SHA256, "hash2")
+	}
+}
