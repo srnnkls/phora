@@ -1,6 +1,10 @@
 package phora
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -11,7 +15,25 @@ import (
 const LockFileName = "phora.lock"
 
 type Lock struct {
-	Repos []RepoEntry `toml:"repos"`
+	Version int          `toml:"version,omitempty"`
+	Sources []SourceLock `toml:"sources,omitempty"`
+	Repos   []RepoEntry  `toml:"repos,omitempty"`
+}
+
+type SourceLock struct {
+	Name      string     `toml:"name"`
+	Repo      string     `toml:"repo"`
+	Ref       string     `toml:"ref"`
+	SHA       string     `toml:"sha"`
+	Digest    string     `toml:"digest"`
+	FetchedAt time.Time  `toml:"fetched_at"`
+	Files     []FileLock `toml:"files"`
+}
+
+type FileLock struct {
+	Path   string `toml:"path"`
+	SHA256 string `toml:"sha256"`
+	Size   int64  `toml:"size"`
 }
 
 type RepoEntry struct {
@@ -79,4 +101,28 @@ func (l *Lock) RemoveByName(name string) {
 
 func (l *Lock) IsEmpty() bool {
 	return len(l.Repos) == 0
+}
+
+func ComputeFileHash(path string) (string, int64, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", 0, err
+	}
+	if info.IsDir() {
+		return "", 0, fmt.Errorf("cannot hash directory: %s", path)
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return "", 0, err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	size, err := io.Copy(h, f)
+	if err != nil {
+		return "", 0, err
+	}
+
+	return hex.EncodeToString(h.Sum(nil)), size, nil
 }
