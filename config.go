@@ -155,7 +155,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	for name, source := range cfg.Sources {
-		if source.Ref == "" {
+		// Only default Ref for legacy Repo field when no new-style refs specified
+		if source.Repo != "" && source.Ref == "" &&
+			source.Branch == "" && source.Tag == "" && source.Rev == "" {
 			source.Ref = "main"
 		}
 		if source.Target == "" {
@@ -170,9 +172,22 @@ func LoadConfig(path string) (*Config, error) {
 // Validate validates the configuration.
 func (c *Config) Validate() error {
 	for name, source := range c.Sources {
-		_, _, err := source.ParseRepo()
-		if err != nil {
-			return fmt.Errorf("source %q: %w", name, err)
+		// Git and Repo are mutually exclusive
+		if source.Git != "" && source.Repo != "" {
+			return fmt.Errorf("source %q: git and repo are mutually exclusive", name)
+		}
+
+		// Must have either Git or Repo
+		if source.Git == "" && source.Repo == "" {
+			return fmt.Errorf("source %q: must specify either git or repo", name)
+		}
+
+		// Validate Repo format if using legacy field
+		if source.Repo != "" {
+			_, _, err := source.ParseRepo()
+			if err != nil {
+				return fmt.Errorf("source %q: %w", name, err)
+			}
 		}
 
 		if source.Host != "" {

@@ -726,6 +726,94 @@ func TestConfig_ValidateRefMutualExclusivity_None(t *testing.T) {
 	}
 }
 
+func TestConfig_ValidateGitRepoMutualExclusivity(t *testing.T) {
+	cfg := &Config{
+		Sources: map[string]Source{
+			"test": {
+				Git:    "https://github.com/owner/repo.git",
+				Repo:   "owner/repo",
+				Branch: "main",
+			},
+		},
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Error("Validate() should return error when both git and repo are specified")
+	}
+}
+
+func TestConfig_ValidateRequireGitOrRepo(t *testing.T) {
+	cfg := &Config{
+		Sources: map[string]Source{
+			"test": {
+				Branch: "main",
+			},
+		},
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Error("Validate() should return error when neither git nor repo is specified")
+	}
+}
+
+func TestConfig_ValidateGitWithBranch(t *testing.T) {
+	cfg := &Config{
+		Sources: map[string]Source{
+			"test": {
+				Git:    "https://github.com/owner/repo.git",
+				Branch: "main",
+			},
+		},
+	}
+	err := cfg.Validate()
+	if err != nil {
+		t.Errorf("Validate() should not return error for git with branch: %v", err)
+	}
+}
+
+func TestConfig_ValidateGitWithTag(t *testing.T) {
+	cfg := &Config{
+		Sources: map[string]Source{
+			"test": {
+				Git: "https://github.com/owner/repo.git",
+				Tag: "v1.0.0",
+			},
+		},
+	}
+	err := cfg.Validate()
+	if err != nil {
+		t.Errorf("Validate() should not return error for git with tag: %v", err)
+	}
+}
+
+func TestSource_RefNotDefaultedWhenTagSpecified(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "phora.toml")
+
+	content := `version = 1
+
+[sources.test]
+repo = "owner/repo"
+tag = "v1.0"
+`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write test config: %v", err)
+	}
+
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig() error: %v", err)
+	}
+
+	source := cfg.Sources["test"]
+	if source.Ref != "" {
+		t.Errorf("Ref should be empty when tag is specified, got %q", source.Ref)
+	}
+	if source.Tag != "v1.0" {
+		t.Errorf("Tag = %q, want %q", source.Tag, "v1.0")
+	}
+}
+
 func TestConfig_HasManifestField(t *testing.T) {
 	cfg := Config{
 		Manifest: &Manifest{

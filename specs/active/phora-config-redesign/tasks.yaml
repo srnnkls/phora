@@ -5,7 +5,7 @@ tasks:
   # Phase 1: Config Format
   - id: CFG-001
     content: Define new Source struct with Cargo-style fields
-    status: pending
+    status: completed
     active_form: Defining new Source struct
   - id: CFG-002
     content: Add mutual exclusivity validation for branch/tag/rev
@@ -19,7 +19,7 @@ tasks:
   # Phase 2: Manifest
   - id: CFG-005
     content: Simplify Manifest struct to filter-only
-    status: pending
+    status: completed
     active_form: Simplifying Manifest struct
   - id: CFG-006
     content: Add manifest filtering tests
@@ -43,7 +43,7 @@ tasks:
   # Phase 4: URL Parser
   - id: CFG-010
     content: Implement GitHub URL parser
-    status: pending
+    status: completed
     active_form: Implementing URL parser
   - id: CFG-011
     content: Integrate parser into phora add command with collision validation
@@ -85,7 +85,7 @@ tasks:
 meta:
   created: 2026-01-18
   last_updated: 2026-01-20
-  progress: 0/17
+  progress: 3/17
 
 phases:
   - name: "Phase 1: Config Format"
