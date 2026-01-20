@@ -74,10 +74,8 @@ func runAdd(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				fmt.Printf("Warning: failed to parse remote config: %v\n", err)
 			} else if remoteConfig.Manifest != nil {
-				fmt.Printf("Found manifest with %d skill(s), %d command(s), %d agent(s)\n",
-					len(remoteConfig.Manifest.Skills),
-					len(remoteConfig.Manifest.Commands),
-					len(remoteConfig.Manifest.Agents))
+				fmt.Printf("Found manifest with %d artifact(s)\n",
+					len(remoteConfig.Manifest.Artifacts))
 			}
 		}
 	} else {

@@ -53,11 +53,13 @@ func runInit(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("generate manifest: %w", err)
 	}
 
-	// Update config with manifest
+	// Update config with manifest - combine all artifact names
+	var allArtifacts []string
+	allArtifacts = append(allArtifacts, m.Skills...)
+	allArtifacts = append(allArtifacts, m.Commands...)
+	allArtifacts = append(allArtifacts, m.Agents...)
 	cfg.Manifest = &config.Manifest{
-		Skills:   m.Skills,
-		Commands: m.Commands,
-		Agents:   m.Agents,
+		Artifacts: allArtifacts,
 	}
 
 	// Write updated config
@@ -67,9 +69,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Updated phora.toml\n")
 	fmt.Printf("  [manifest]\n")
-	fmt.Printf("  Skills:   %d\n", len(m.Skills))
-	fmt.Printf("  Commands: %d\n", len(m.Commands))
-	fmt.Printf("  Agents:   %d\n", len(m.Agents))
+	fmt.Printf("  Artifacts: %d\n", len(allArtifacts))
 
 	return nil
 }

@@ -51,12 +51,7 @@ func manifestsEqual(a, b *Manifest) bool {
 	if a == nil {
 		return true
 	}
-	if a.Version != b.Version {
-		return false
-	}
-	return slicesEqual(a.Skills, b.Skills) &&
-		slicesEqual(a.Commands, b.Commands) &&
-		slicesEqual(a.Agents, b.Agents)
+	return slicesEqual(a.Artifacts, b.Artifacts)
 }
 
 func slicesEqual(a, b []string) bool {

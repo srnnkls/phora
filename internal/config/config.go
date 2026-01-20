@@ -1,6 +1,11 @@
+// Package config provides configuration types for phora.
+//
+// Deprecated: Use the root phora package types (phora.Config, phora.Source) instead.
+// This package will be removed in a future version.
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,10 +27,54 @@ type Host struct {
 }
 
 type Manifest struct {
-	Skills   []string `toml:"skills,omitempty"`
-	Commands []string `toml:"commands,omitempty"`
-	Agents   []string `toml:"agents,omitempty"`
-	Version  string   `toml:"version,omitempty"`
+	Artifacts []string `toml:"artifacts,omitempty"`
+}
+
+func (m *Manifest) ContainsArtifact(name string) bool {
+	if len(m.Artifacts) == 0 {
+		return false
+	}
+	for _, a := range m.Artifacts {
+		if a == name {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manifest) ValidatePath(path string) error {
+	if len(m.Artifacts) == 0 {
+		return fmt.Errorf("path '%s' not in source artifacts (manifest is empty)", path)
+	}
+
+	cleaned := filepath.Clean(path)
+	if cleaned != path || strings.HasPrefix(cleaned, "..") {
+		return fmt.Errorf("path '%s' contains invalid traversal", path)
+	}
+
+	for _, a := range m.Artifacts {
+		if a == cleaned || strings.HasPrefix(cleaned, a+"/") {
+			return nil
+		}
+	}
+	return fmt.Errorf("path '%s' not in source artifacts", path)
+}
+
+func (m *Manifest) FilterDirectories(dirs []string) []string {
+	if len(m.Artifacts) == 0 {
+		return []string{}
+	}
+	artifactSet := make(map[string]bool)
+	for _, a := range m.Artifacts {
+		artifactSet[a] = true
+	}
+	var result []string
+	for _, dir := range dirs {
+		if artifactSet[dir] {
+			result = append(result, dir)
+		}
+	}
+	return result
 }
 
 type Source struct {

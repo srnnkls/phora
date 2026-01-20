@@ -1,8 +1,9 @@
 ---
 issue_type: Feature
 created: 2026-01-18
-status: Draft
-stage: draft
+status: Active
+stage: active
+promoted: 2026-01-20
 claude_plan: .claude/plans/silly-baking-rossum.md
 ---
 
