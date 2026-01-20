@@ -1,0 +1,522 @@
+spec: phora-config-redesign
+version: 1
+
+review_config:
+  reviewers:
+    - type: claude
+      model: opus
+    - type: opencode
+      model: openai/gpt-5.2-pro
+    - type: opencode
+      model: google/gemini-3-pro-preview
+
+coverage:
+  scope: complete
+  behavior: complete
+  data_model: complete
+  constraints: complete
+  edge_cases: complete
+  integration: complete
+  terminology: complete
+
+markers:
+  - id: M001
+    area: Data Model
+    status: resolved
+    description: "Manifest section inconsistent: spec says filter list but example shows nested structure"
+    severity: critical
+    found_by: [claude-opus]
+    resolution: "Simple filter list - artifacts = [\"skills\", \"commands\"] as export list"
+  - id: M002
+    area: Behavior
+    status: resolved
+    description: "Lazy sync conflicts with branch-based sources (digest match skips fetch for moving refs)"
+    severity: critical
+    found_by: [openai-gpt5.2-pro]
+    resolution: "Lock SHA authoritative + phora update command (Cargo/Poetry pattern)"
+  - id: M003
+    area: Data Model
+    status: resolved
+    description: "phora.toml full schema not specified (section headers, source location)"
+    severity: critical
+    found_by: [openai-gpt5.2-pro, gemini-3-pro]
+    resolution: "[sources] + [manifest] sections with version at root"
+  - id: M004
+    area: Integration
+    status: resolved
+    description: "Two conflicting lock file implementations need unification"
+    severity: critical
+    found_by: [claude-opus]
+    resolution: "Single unified phora.lock at project root (answered in S002/Q010)"
+  - id: M005
+    area: Edge Cases
+    status: resolved
+    description: "URL parser doesn't handle refs with slashes (feature/my-branch)"
+    severity: high
+    found_by: [claude-opus, openai-gpt5.2-pro]
+    resolution: "Require --ref flag for slash-containing refs"
+  - id: M006
+    area: Terminology
+    status: resolved
+    description: "artifacts semantics ambiguous (filter list vs packaging vs view)"
+    severity: high
+    found_by: [openai-gpt5.2-pro, gemini-3-pro]
+    resolution: "Export list - what downstream consumers can import (organized by directory)"
+  - id: M007
+    area: Behavior
+    status: resolved
+    description: "Filter semantics mislabeled as gitignore-style but differ in precedence"
+    severity: high
+    found_by: [openai-gpt5.2-pro]
+    resolution: "Include-then-exclude algorithm (simpler, no negation support)"
+  - id: M008
+    area: Behavior
+    status: resolved
+    description: "Lockfile integrity verification behavior not specified"
+    severity: high
+    found_by: [openai-gpt5.2-pro]
+    resolution: "Error on sync if drift detected, require --force to overwrite"
+  - id: M009
+    area: Data Model
+    status: resolved
+    description: "Digest canonicalization method not specified"
+    severity: high
+    found_by: [gemini-3-pro]
+    resolution: "JSON with sorted keys (standard Go pattern)"
+
+clarification_log:
+  - date: 2026-01-18
+    topic: Config format
+    resolution: Use Cargo/Poetry inline table syntax
+  - date: 2026-01-18
+    topic: Manifest purpose
+    resolution: Filter only, no path rewriting (avoids action at distance)
+  - date: 2026-01-18
+    topic: Target default
+    resolution: Defaults to source key name
+  - date: 2026-01-18
+    topic: Lock file features
+    resolution: digest for lazy sync, per-file SHA256 for auditing
+  - date: 2026-01-18
+    topic: URL parsing
+    resolution: Support GitHub tree/ref/path URLs, minimal custom parser
+
+clarification_sessions:
+  - id: S001
+    timestamp: 2026-01-18T17:08:00Z
+    source: spec-review
+    reviewers: [claude-opus]
+    questions:
+      - id: Q001
+        question: Should redesign target root phora package or consolidate?
+        answer: Consolidate into single implementation
+        area: Data Model
+        doc_updates:
+          - file: spec.md
+            section: Scope
+            action: modified
+          - file: context.md
+            section: Decisions
+            action: modified
+      - id: Q002
+        question: How should URL parser handle ambiguous inputs?
+        answer: GitHub default - assume owner/repo/path unless host detected
+        area: Edge Cases
+        doc_updates:
+          - file: spec.md
+            section: URL Parser
+            action: modified
+          - file: resources/parser-logic.md
+            section: Parsing Algorithm
+            action: modified
+      - id: Q003
+        question: How should we handle migration from old config format?
+        answer: Breaking change - old format is parse error, no migration
+        area: Behavior
+        doc_updates:
+          - file: spec.md
+            section: Non-Functional Requirements
+            action: modified
+      - id: Q004
+        question: What glob syntax for include/exclude filters?
+        answer: gitignore-style patterns
+        area: Behavior
+        doc_updates:
+          - file: spec.md
+            section: Filter Semantics
+            action: added
+      - id: Q005
+        question: What does sha in lock file refer to?
+        answer: Git commit SHA that ref resolved to at fetch time
+        area: Data Model
+        doc_updates:
+          - file: spec.md
+            section: Lock File Schema
+            action: added
+      - id: Q006
+        question: What is digest algorithm?
+        answer: SHA256 of source TOML config (canonical form, sorted keys)
+        area: Data Model
+        doc_updates:
+          - file: spec.md
+            section: Lock File Schema
+            action: added
+      - id: Q007
+        question: What does target control and collision handling?
+        answer: Local destination directory, error if exists with different source
+        area: Behavior
+        doc_updates:
+          - file: spec.md
+            section: Path/Target Semantics
+            action: added
+  - id: S002
+    timestamp: 2026-01-20T14:00:00Z
+    source: spec-review
+    reviewers: [claude-opus, openai-gpt5.2-pro, gemini-3-pro]
+    gates:
+      completeness: fail
+      consistency: fail
+      feasibility: fail
+      clarity: fail
+    questions:
+      - id: Q008
+        question: Should Source struct support both shorthand and explicit fields?
+        answer: Single canonical format - git = "path/to/repo.git"
+        area: Data Model
+      - id: Q009
+        question: Which package should be canonical after consolidation?
+        answer: Root package (phora.Config, phora.Lock)
+        area: Scope
+      - id: Q010
+        question: Should there be a single phora.lock replacing both lock files?
+        answer: Single unified lock at project root
+        area: Integration
+      - id: Q011
+        question: Should per-file hash detect drift from user edits?
+        answer: Detect drift via per-file hash comparison
+        area: Behavior
+  - id: S003
+    timestamp: 2026-01-20T14:15:00Z
+    source: spec-clarify
+    questions:
+      - id: Q012
+        question: "Manifest artifacts format?"
+        answer: "Simple filter list - export list of what downstream consumers can import"
+        area: Data Model
+        doc_updates:
+          - file: spec.md
+            section: Scope
+            action: modified
+      - id: Q013
+        question: "Branch update behavior?"
+        answer: "Lock SHA authoritative + phora update command (Cargo/Poetry pattern)"
+        area: Behavior
+        doc_updates:
+          - file: spec.md
+            section: Acceptance Criteria
+            action: modified
+          - file: context.md
+            section: Decisions
+            action: modified
+      - id: Q014
+        question: "phora.toml schema sections?"
+        answer: "[sources] + [manifest] sections"
+        area: Data Model
+        doc_updates:
+          - file: spec.md
+            section: Config Schema
+            action: added
+      - id: Q015
+        question: "Slash refs in URLs?"
+        answer: "Require --ref flag"
+        area: Edge Cases
+        doc_updates:
+          - file: spec.md
+            section: Scope
+            action: modified
+      - id: Q016
+        question: "Artifacts terminology?"
+        answer: "Export list - what downstream consumers can import (organized by directory)"
+        area: Terminology
+        doc_updates:
+          - file: spec.md
+            section: Scope
+            action: modified
+      - id: Q017
+        question: "Filter algorithm?"
+        answer: "Include-then-exclude (no negation, simpler than gitignore)"
+        area: Behavior
+        doc_updates:
+          - file: spec.md
+            section: Filter Semantics
+            action: modified
+      - id: Q018
+        question: "Integrity verification behavior?"
+        answer: "Error on sync if drift, require --force to overwrite"
+        area: Behavior
+        doc_updates:
+          - file: spec.md
+            section: Drift Detection
+            action: modified
+      - id: Q019
+        question: "Digest canonicalization?"
+        answer: "JSON with sorted keys (standard Go pattern)"
+        area: Data Model
+        doc_updates:
+          - file: spec.md
+            section: Lock File Schema
+            action: modified
+          - file: context.md
+            section: Decisions
+            action: modified
+  - id: S004
+    timestamp: 2026-01-20T16:30:00Z
+    source: spec-review
+    reviewers: [claude-opus, openai-gpt5.2-pro, gemini-3-pro]
+    gates:
+      completeness: fail
+      consistency: fail
+      feasibility: pass
+      clarity: fail
+    questions:
+      - id: Q020
+        question: "Should CFG-003 be removed since spec decided against github/gitlab shorthand?"
+        answer: "Remove CFG-003 - URL parser is for phora add input only, config uses full git URLs"
+        area: Scope
+        doc_updates:
+          - file: tasks.yaml
+            section: Phase 1
+            action: modified
+      - id: Q021
+        question: "Should phora sync always check local file integrity even when skipping remote fetch?"
+        answer: "Always check - verify local files match lock hashes on every sync"
+        area: Behavior
+        doc_updates:
+          - file: spec.md
+            section: Drift Detection
+            action: modified
+      - id: Q022
+        question: "Which fields included in config digest calculation?"
+        answer: "Resolution fields only (git, ref, path, include, exclude). Target change triggers local move, not re-fetch."
+        area: Data Model
+        doc_updates:
+          - file: spec.md
+            section: Lock File Schema
+            action: modified
+  - id: S005
+    timestamp: 2026-01-20T17:00:00Z
+    source: spec-clarify
+    questions:
+      - id: Q023
+        question: "How should symlinks be handled during sync and file hashing?"
+        answer: "Follow symlinks - hash and sync target file content, not the link itself"
+        area: Edge Cases
+        doc_updates:
+          - file: spec.md
+            section: Lock File Schema
+            action: modified
+      - id: Q024
+        question: "How should deleted/extra local files be handled during drift detection?"
+        answer: "Missing local file = drift, extra local files ignored"
+        area: Behavior
+        doc_updates:
+          - file: spec.md
+            section: Drift Detection
+            action: modified
+      - id: Q025
+        question: "What flags should phora add support?"
+        answer: "--ref, --target, --path, --name"
+        area: Integration
+        doc_updates:
+          - file: spec.md
+            section: phora add CLI
+            action: added
+
+new_markers:
+  - id: M010
+    area: Scope
+    status: resolved
+    description: "CFG-003 contradicts spec decision on shorthand"
+    severity: critical
+    found_by: [claude-opus, openai-gpt5.2-pro, gemini-3-pro]
+    resolution: "Remove CFG-003 - URL parser for phora add only"
+  - id: M011
+    area: Consistency
+    status: resolved
+    description: "URL parser output format inconsistent with config schema"
+    severity: critical
+    found_by: [claude-opus, openai-gpt5.2-pro]
+    resolution: "Parser outputs components assembled into full git URL"
+  - id: M012
+    area: Data Model
+    status: resolved
+    description: "Digest says JSON but lock schema comment says TOML"
+    severity: high
+    found_by: [openai-gpt5.2-pro]
+    resolution: "JSON with sorted keys (context.md decision table is authoritative)"
+  - id: M013
+    area: Completeness
+    status: resolved
+    description: "Missing task for phora update command"
+    severity: high
+    found_by: [claude-opus]
+    resolution: "Added CFG-015 in Phase 6"
+  - id: M014
+    area: Completeness
+    status: resolved
+    description: "Missing task for drift detection with --force flag"
+    severity: high
+    found_by: [claude-opus]
+    resolution: "Added CFG-016 in Phase 6"
+  - id: M015
+    area: Edge Cases
+    status: resolved
+    description: "Per-file hashing semantics incomplete (symlinks, deleted files)"
+    severity: high
+    found_by: [openai-gpt5.2-pro]
+    resolution: "Follow symlinks, hash target content. Missing file = drift, extra files ignored."
+  - id: M016
+    area: Integration
+    status: resolved
+    description: "phora add CLI behavior underspecified"
+    severity: high
+    found_by: [openai-gpt5.2-pro]
+    resolution: "Added CLI section with flags: --ref, --target, --path, --name"
+  - id: M017
+    area: Edge Cases
+    status: resolved
+    description: "No acceptance criteria for rev ref specifier"
+    severity: medium
+    found_by: [claude-opus]
+    resolution: "Added acceptance criteria for rev in Config Parsing section"
+  - id: M018
+    area: Behavior
+    status: resolved
+    description: "Filter glob matching depth unclear"
+    severity: medium
+    found_by: [claude-opus]
+    resolution: "Added matching depth examples (*.md vs **/*.md)"
+  - id: M019
+    area: Constraints
+    status: resolved
+    description: "Config version validation missing acceptance criteria"
+    severity: medium
+    found_by: [claude-opus]
+    resolution: "Added acceptance criteria for missing/invalid version"
+  - id: M020
+    area: Consistency
+    status: resolved
+    description: "dependencies.yaml references CFG-003 but task was removed from tasks.yaml"
+    severity: critical
+    found_by: [claude-opus]
+    resolution: "Removed CFG-003 from dependencies.yaml"
+  - id: M021
+    area: Completeness
+    status: resolved
+    description: "No task implements include/exclude glob filter logic"
+    severity: high
+    found_by: [claude-opus]
+    resolution: "Added CFG-018 in Phase 4"
+  - id: M022
+    area: Completeness
+    status: resolved
+    description: "Source name collision validation missing from tasks (phora add)"
+    severity: high
+    found_by: [claude-opus]
+    resolution: "Updated CFG-011 to include collision validation"
+  - id: M023
+    area: Consistency
+    status: resolved
+    description: "Lock file schema unification strategy unclear (two existing lock structures)"
+    severity: high
+    found_by: [claude-opus]
+    resolution: "Complete replacement - new schema replaces both, old lock files ignored"
+  - id: M024
+    area: Behavior
+    status: resolved
+    description: "Drift handling policy matrix incomplete (partial drift vs full resync, --force semantics)"
+    severity: high
+    found_by: [openai-gpt5.2-pro]
+    resolution: "--force overwrites only drifted files, clean files untouched"
+  - id: M025
+    area: Data Model
+    status: resolved
+    description: "Lock file field types and required/optional status not specified"
+    severity: high
+    found_by: [openai-gpt5.2-pro]
+    resolution: "Added strict schema with field table (all required, typed)"
+  - id: M026
+    area: Integration
+    status: resolved
+    description: "Manifest artifacts + consumer include/exclude interaction undefined"
+    severity: medium
+    found_by: [gemini-3-pro]
+    resolution: "Error if consumer requests path outside producer's artifacts"
+
+clarification_sessions_s006:
+  - id: S006
+    timestamp: 2026-01-20T19:00:00Z
+    source: spec-review
+    reviewers: [claude-opus]
+    gates:
+      completeness: fail
+      consistency: fail
+      feasibility: pass
+      clarity: pass
+    note: "OpenCode reviewers (gpt-5.2-pro, gemini-3-pro) timed out"
+    questions:
+      - id: Q026
+        question: "When source has both path and include patterns, are include patterns relative to path?"
+        answer: "Confirm - include patterns are relative to source path"
+        area: Behavior
+      - id: Q027
+        question: "For phora sync on fresh project with no lock file, what should happen?"
+        answer: "Create lock file with all sources synced"
+        area: Behavior
+      - id: Q028
+        question: "What should happen to old .phora.lock files after migration?"
+        answer: "Leave them - don't touch, they're ignored"
+        area: Integration
+  - id: S007
+    timestamp: 2026-01-20T19:30:00Z
+    source: spec-clarify
+    questions:
+      - id: Q029
+        question: "How should new lock schema handle existing two lock structures?"
+        answer: "Complete replacement - new schema replaces both, old lock files ignored"
+        area: Consistency
+        doc_updates:
+          - file: spec.md
+            section: Lock File Schema
+            action: modified
+          - file: context.md
+            section: Decisions
+            action: modified
+  - id: S008
+    timestamp: 2026-01-20T20:00:00Z
+    source: spec-clarify
+    questions:
+      - id: Q030
+        question: "How should --force behave during drift detection?"
+        answer: "Overwrite only drifted files, leave clean files untouched"
+        area: Behavior
+        doc_updates:
+          - file: spec.md
+            section: Drift Detection
+            action: modified
+      - id: Q031
+        question: "Should lock file fields be strictly typed?"
+        answer: "Yes - add explicit required/optional markers and type constraints"
+        area: Data Model
+        doc_updates:
+          - file: spec.md
+            section: Lock File Schema
+            action: modified
+      - id: Q032
+        question: "What happens if consumer requests path outside producer's manifest artifacts?"
+        answer: "Error - consumer gets clear error that path is not in source artifacts"
+        area: Integration
+        doc_updates:
+          - file: spec.md
+            section: Manifest
+            action: modified

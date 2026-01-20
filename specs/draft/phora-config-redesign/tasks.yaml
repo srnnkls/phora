@@ -1,0 +1,151 @@
+spec: phora-config-redesign
+code: CFG
+next_id: 18
+tasks:
+  # Phase 1: Config Format
+  - id: CFG-001
+    content: Define new Source struct with Cargo-style fields
+    status: pending
+    active_form: Defining new Source struct
+  - id: CFG-002
+    content: Add mutual exclusivity validation for branch/tag/rev
+    status: pending
+    active_form: Adding ref validation
+  - id: CFG-004
+    content: Update config parsing tests
+    status: pending
+    active_form: Updating config tests
+
+  # Phase 2: Manifest
+  - id: CFG-005
+    content: Simplify Manifest struct to filter-only
+    status: pending
+    active_form: Simplifying Manifest struct
+  - id: CFG-006
+    content: Add manifest filtering tests
+    status: pending
+    active_form: Adding manifest tests
+
+  # Phase 3: Lock File
+  - id: CFG-007
+    content: Add digest generation and comparison
+    status: pending
+    active_form: Adding config digest
+  - id: CFG-008
+    content: Add per-file SHA256 hashes to lock
+    status: pending
+    active_form: Adding file hashes
+  - id: CFG-009
+    content: Implement lazy sync based on digest
+    status: pending
+    active_form: Implementing lazy sync
+
+  # Phase 4: URL Parser
+  - id: CFG-010
+    content: Implement GitHub URL parser
+    status: pending
+    active_form: Implementing URL parser
+  - id: CFG-011
+    content: Integrate parser into phora add command with collision validation
+    status: pending
+    active_form: Integrating parser
+  - id: CFG-018
+    content: Implement include/exclude glob filtering for source paths
+    status: pending
+    active_form: Implementing glob filtering
+
+  # Phase 5: Consolidation
+  - id: CFG-012
+    content: Consolidate config types (root + internal/config)
+    status: pending
+    active_form: Consolidating config types
+  - id: CFG-013
+    content: Consolidate lockfile types (root + internal/lockfile)
+    status: pending
+    active_form: Consolidating lockfile types
+  - id: CFG-014
+    content: Update imports and deprecate old packages
+    status: pending
+    active_form: Updating imports and deprecations
+
+  # Phase 6: Commands
+  - id: CFG-015
+    content: Implement phora update command to re-resolve refs
+    status: pending
+    active_form: Implementing phora update command
+  - id: CFG-016
+    content: Implement drift detection with --force override
+    status: pending
+    active_form: Implementing drift detection
+  - id: CFG-017
+    content: Document phora add CLI contract (flags, output)
+    status: pending
+    active_form: Documenting phora add CLI
+
+meta:
+  created: 2026-01-18
+  last_updated: 2026-01-20
+  progress: 0/17
+
+phases:
+  - name: "Phase 1: Config Format"
+    task_ids: [CFG-001, CFG-002, CFG-004]
+    checkpoint:
+      description: New config format parses correctly
+      criteria:
+        - Source struct has git field with full URL
+        - branch/tag/rev are mutually exclusive
+        - Tests pass
+      verified: false
+
+  - name: "Phase 2: Manifest"
+    task_ids: [CFG-005, CFG-006]
+    checkpoint:
+      description: Manifest filters exports correctly
+      criteria:
+        - artifacts field filters directories
+        - No path rewriting
+      verified: false
+
+  - name: "Phase 3: Lock File"
+    task_ids: [CFG-007, CFG-008, CFG-009]
+    checkpoint:
+      description: Lock file supports lazy sync
+      criteria:
+        - digest computed and stored
+        - Per-file hashes recorded
+        - Unchanged config skips fetch
+      verified: false
+
+  - name: "Phase 4: URL Parser"
+    task_ids: [CFG-010, CFG-011, CFG-018]
+    checkpoint:
+      description: phora add parses GitHub URLs and filters work
+      criteria:
+        - Shorthand owner/repo/path works
+        - Full tree/ref/path URLs work
+        - GitLab URLs work
+        - Source name collision detected
+        - Include/exclude glob filtering works
+      verified: false
+
+  - name: "Phase 5: Consolidation"
+    task_ids: [CFG-012, CFG-013, CFG-014]
+    checkpoint:
+      description: Single unified implementation
+      criteria:
+        - Config types consolidated
+        - Lockfile types consolidated
+        - Old internal packages deprecated
+        - All tests pass
+      verified: false
+
+  - name: "Phase 6: Commands"
+    task_ids: [CFG-015, CFG-016, CFG-017]
+    checkpoint:
+      description: CLI commands complete
+      criteria:
+        - phora update re-resolves refs and updates lock
+        - phora sync detects drift and errors without --force
+        - phora add CLI contract documented
+      verified: false

@@ -1,0 +1,46 @@
+# phora.toml - Consumer Configuration
+
+[sources]
+# Shorthand (GitHub default)
+dotfiles = { github = "srnnkls/dotfiles" }
+
+# With ref specifiers (mutually exclusive)
+skills = { github = "company/shared", branch = "main" }
+tools = { github = "company/tools", tag = "v1.0" }
+pinned = { github = "company/utils", rev = "a1b2c3d" }
+
+# With path and target
+my-skills = { github = "company/shared", tag = "v1.0", path = "skills", target = ".claude/skills" }
+
+# With filtering
+filtered = { github = "company/repo", tag = "v2.0", include = ["**/*.md"], exclude = ["**/test/**"] }
+
+# Full git URL
+external = { git = "https://gitlab.com/org/repo.git", branch = "main" }
+
+# ---
+
+# phora.toml - Source Manifest (in source repo)
+
+[manifest]
+version = "1.0.0"
+artifacts = ["skills", "commands"]  # Filter only, no path rewriting
+
+# ---
+
+# phora.lock - Lock File Format
+
+# version = 1
+#
+# [[sources]]
+# name = "shared"
+# repo = "company/shared"
+# ref = "v1.0"
+# sha = "a1b2c3d4e5f6..."
+# digest = "8f3a2b..."
+# fetched_at = 2026-01-18T10:00:00Z
+#
+# [[sources.files]]
+# path = "skills/code-review.md"
+# sha256 = "9e8d7c6b..."
+# size = 2048

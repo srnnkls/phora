@@ -1,0 +1,32 @@
+spec: phora-config-redesign
+version: 1
+
+# Phase 1: Config Format (can run in parallel)
+CFG-001: []                    # Source struct - no deps
+CFG-002: [CFG-001]             # Validation needs struct
+CFG-004: [CFG-001, CFG-002]    # Tests need struct + validation
+
+# Phase 2: Manifest (parallel with Phase 1)
+CFG-005: []                    # Manifest struct - no deps
+CFG-006: [CFG-005]             # Tests need struct
+
+# Phase 3: Lock File (depends on Phase 1)
+CFG-007: [CFG-001]             # Digest needs Source struct
+CFG-008: [CFG-007]             # File hashes extend lock
+CFG-009: [CFG-007]             # Lazy sync needs digest
+
+# Phase 4: URL Parser + Filtering (parallel with above)
+CFG-010: []                    # Parser is standalone
+CFG-011: [CFG-001, CFG-010]    # Integration needs both
+CFG-018: [CFG-001]             # Filter needs Source struct
+
+# Phase 5: Consolidation (depends on all prior phases)
+CFG-012: [CFG-001, CFG-004]    # Config consolidation needs new struct + tests
+CFG-013: [CFG-007, CFG-008]    # Lockfile consolidation needs new lock features
+CFG-014: [CFG-012, CFG-013]    # Import updates need both consolidations
+
+# Parallelization opportunities:
+# - CFG-001, CFG-005, CFG-010 can start together
+# - CFG-002, CFG-003 can run in parallel after CFG-001
+# - CFG-008, CFG-009 can run in parallel after CFG-007
+# - CFG-012, CFG-013 can run in parallel after their deps
