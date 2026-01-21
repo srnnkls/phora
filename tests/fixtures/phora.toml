@@ -1,29 +1,4 @@
-default_harnesses = ["claude"]
-default_artifacts = ["skills", "commands", "agents"]
+version = 1
 
 [manifest]
-skills = ["code-test", "simple"]
-commands = ["test.run"]
-agents = ["tester"]
-
-[conflict]
-file_exists = "error"
-duplicate_artifact = "error"
-
-[harness.claude]
-path = "/tmp/phora-test-claude"
-
-[harness.claude.variables]
-model_strong = "opus"
-model_weak = "haiku"
-
-[harness.opencode]
-path = "/tmp/phora-test-opencode"
-generate_commands_from_skills = true
-
-[harness.opencode.keys]
-allowed_tools = "tools"
-
-[harness.opencode.variables]
-model_strong = "anthropic/claude-sonnet-4-5"
-model_weak = "anthropic/claude-haiku-4-5"
+artifacts = ["skills", "commands", "agents"]

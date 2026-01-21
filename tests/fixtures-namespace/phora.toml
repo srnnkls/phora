@@ -1,22 +1,4 @@
-default_harnesses = ["claude"]
-default_artifacts = ["skills"]
+version = 1
 
-[sources.company]
-type = "local"
-path = "."
-global = false
-
-[sources.shared]
-type = "local"
-path = "."
-global = true
-
-[harness.claude]
-path = "/tmp/phora-test-namespace"
-
-[harness.claude.tools]
-bash = "Bash"
-read = "Read"
-
-[harness.claude.references.skill]
-output = "/{{.Name}}"
+[manifest]
+artifacts = ["skills"]
