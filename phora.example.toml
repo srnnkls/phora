@@ -1,48 +1,18 @@
-# I think this is not needed anymore, we just want to manage artifacts
-# as packages
-# artifacts = ["skills", "commands", "agents"]
+version = 1
 
-# Is this the right shape? The mapping should
-# declare the source and the default target,
-# I will state a revised version below
-# [manifest]
-# skills = ["code-review", "debug-helper"]
-# commands = ["deploy", "test"]
-# agents = ["reviewer"]
-# version = "1.0.0"
+# Source definitions (Cargo-style inline tables)
+[sources]
+skills = { git = "https://github.com/company/shared.git", tag = "v1.0", path = "skills", target = ".claude/skills" }
+prompts = { git = "https://github.com/company/prompts.git", branch = "main" }
 
+# Ref types (mutually exclusive):
+#   branch = "main"      - tracks a branch (use `phora update` to get latest)
+#   tag = "v1.0"         - pinned to tag
+#   rev = "abc123"       - pinned to specific commit
+
+# Optional filtering
+# filtered = { git = "...", branch = "main", include = ["**/*.md"], exclude = ["drafts/*"] }
+
+# Export configuration (for this repo as a source)
 [manifest]
-version = "1.0.0"
-[manifest.artifacts]
-skills = { path = ".claude/skills", target_path = "skills" }
-commands = { path = ".claude/plugins/commander/comandas", target_path = "commands" }
-resources = "resources" # string -> string is a convencience alias for: resources = { path = "resources", target_path = "resources" }
-
-# Sources (packages you depend on)
-# `phora add https://github.com/company/shared-agents/skills` becomes`
-[sources.shared_agents]
-host = "github.com"
-repo = "company/shared-agents"
-ref = "dev"
-# should also be possible like cargo (valdidated b/c mutuallualy exclusive)
-# branch = ...
-# tag = ...
-path = "skills"
-target_path = ".claude/skills"
-
-# `phora add username/dotfiles` defaults to github backend
-[sources.dotfiles]
-host = "github.com"
-repo = "username/dotfiles/"
-# all of the following are defaults
-# ref = "main"
-# path = "" # fetches whatever manifest defines => default: full repo
-# tag = ""
-# branch = ""
-# target_path = "" # puts wherever manifest defines => default: cwd
-
-# not needed (henia's responsibility)
-# # Claude Code harness
-# # Note: In global config (~/.config/phora/phora.toml), override path to ~/.claude
-# [harness.claude]
-# path = "~/.claude"  # Use .claude for project-local, ~/.claude for global
+artifacts = ["skills", "commands", "agents"]
