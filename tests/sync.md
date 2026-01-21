@@ -142,3 +142,24 @@ Global Flags:
       --config string     Global config file (default "*") (glob)
       --data-dir string   Data directory for cloned repos (default "*") (glob)
 ```
+
+## Sync Without Sources Shows Message
+
+```scrut
+$ TMPDIR=$(mktemp -d) && printf 'version = 1\n' > "$TMPDIR/phora.toml" && cd "$TMPDIR" && phora sync 2>&1; rm -rf "$TMPDIR"
+No sources configured
+```
+
+## Sync With Invalid Sources Shows Error
+
+```scrut
+$ TMPDIR=$(mktemp -d) && printf 'version = 1\n\n[sources]\ntest = { git = "https://github.com/nonexistent/repo.git", branch = "main" }\n' > "$TMPDIR/phora.toml" && cd "$TMPDIR" && phora sync 2>&1 | head -1; rm -rf "$TMPDIR"
+Error: fetch sources: repo is empty
+```
+
+## Config Validates Sources Have Git
+
+```scrut
+$ TMPDIR=$(mktemp -d) && printf 'version = 1\n\n[sources]\ntest = { branch = "main" }\n' > "$TMPDIR/phora.toml" && cd "$TMPDIR" && phora sync 2>&1 | head -1; rm -rf "$TMPDIR"
+Error: fetch sources: repo is empty
+```
