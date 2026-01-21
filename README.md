@@ -21,26 +21,24 @@ go install github.com/srnnkls/phora/cmd/phora@latest
 ## Usage
 
 ```bash
-# Initialize config in current directory
-phora init
-
 # Add artifacts from a repository
 phora add owner/repo
 
 # Add with options
-phora add owner/repo --ref main --path skills --local
+phora add owner/repo --ref v1.0 --path skills --name my-skills --target .claude/skills
 
-# Deploy artifacts to configured harnesses
-phora deploy
+# Add from full URL
+phora add https://github.com/company/shared/tree/main/artifacts
 
-# Deploy to specific harness
-phora deploy --target claude
+# Sync sources (uses locked SHA, detects drift)
+phora sync
 
-# Deploy with options
-phora deploy --dry-run           # Preview changes
-phora deploy --interactive       # Prompt for conflicts
-phora deploy --skip              # Skip existing files
-phora deploy --source ./custom   # Deploy from specific path
+# Force sync (overwrite drifted files)
+phora sync --force
+
+# Update refs to latest (re-resolve branch/tag to SHA)
+phora update
+phora update my-source  # Update specific source
 ```
 
 ## Configuration
@@ -48,51 +46,24 @@ phora deploy --source ./custom   # Deploy from specific path
 Phora uses `phora.toml` for configuration:
 
 ```toml
-default_harnesses = ["claude"]
-default_artifacts = ["skills", "commands", "agents"]
+version = 1
 
-# Optional: Declare available artifacts in this repo
+# Source definitions (Cargo-style inline tables)
+[sources]
+skills = { git = "https://github.com/company/shared.git", tag = "v1.0", path = "skills", target = ".claude/skills" }
+prompts = { git = "https://github.com/company/prompts.git", branch = "main" }
+
+# Ref types (mutually exclusive):
+#   branch = "main"      - tracks a branch (use `phora update` to get latest)
+#   tag = "v1.0"         - pinned to tag
+#   rev = "abc123"       - pinned to specific commit
+
+# Optional filtering
+# filtered = { git = "...", branch = "main", include = ["**/*.md"], exclude = ["drafts/*"] }
+
+# Export configuration (for this repo as a source)
 [manifest]
-skills = ["code-review", "code-test"]
-commands = ["build"]
-agents = ["reviewer"]
-
-# Optional: Configure artifact sources
-[sources.mycompany]
-repo = "mycompany/shared-skills"
-ref = "main"
-path = "artifacts"
-# Artifacts become: mycompany.skill-name
-
-[sources.personal]
-repo = "username/dotfiles"
-global = true  # Use bare names (no namespace prefix)
-
-# Claude Code harness
-[harness.claude]
-path = "~/.claude"
-
-[harness.claude.variables]
-model_strong = "opus"
-model_weak = "haiku"
-
-# OpenCode harness
-[harness.opencode]
-path = "~/.config/opencode"
-generate_commands_from_skills = true
-
-# Map YAML keys (rename fields)
-[harness.opencode.keys]
-allowed_tools = "tools"
-
-# Map tool names
-[harness.opencode.tools]
-bash = "Bash"
-read = "Read"
-
-[harness.opencode.variables]
-model_strong = "anthropic/claude-sonnet-4-5"
-model_weak = "anthropic/claude-haiku-4-5"
+artifacts = ["skills", "commands", "agents"]
 ```
 
 ## Harnesses
@@ -110,29 +81,29 @@ Each harness can have:
 - Variable substitution (e.g., `{{model_strong}}`)
 - Auto-generation of commands from user-invocable skills
 
-## Namespaces
+## Lock File
 
-Phora uses namespaces to prevent conflicts when artifacts come from multiple sources:
+Phora maintains a `phora.lock` file tracking synced sources:
 
-- **Global sources** (with `global = true`) use bare artifact names: `skill-name`
-- **Non-global sources** use namespaced names: `source-name.skill-name`
-
-Example:
 ```toml
-[sources.personal]
-repo = "user/dotfiles"
-global = true  # Artifacts: code-review, test-runner
+version = 1
 
-[sources.company]
+[[sources]]
+name = "skills"
 repo = "company/shared"
-# Artifacts: company.deploy, company.review
+ref = "v1.0"
+sha = "a1b2c3d4..."        # Resolved commit SHA
+digest = "8f3a2b..."       # Config hash for lazy sync
+fetched_at = 2026-01-18T10:00:00Z
+
+[[sources.files]]          # Per-file integrity
+path = "skills/code-review.md"
+sha256 = "9e8d7c..."
 ```
 
-When deployed, artifacts are stored with their full names:
-```
-~/.claude/skills/code-review/         # from global source
-~/.claude/skills/company.deploy/      # from company source
-```
+- `phora sync` uses locked SHA (no network check if digest matches)
+- `phora update` re-resolves refs and updates lock
+- Drift detection compares local files against locked hashes
 
 ## References
 
