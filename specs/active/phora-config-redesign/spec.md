@@ -95,6 +95,14 @@ Replace current config format with Cargo/Poetry-style inline table syntax for so
 - **When** consumer syncs source
 - **Then** error is returned: "path 'commands' not in source artifacts"
 
+- **Given** manifest section exists with empty `artifacts = []`
+- **When** ValidatePath or FilterDirectories is called
+- **Then** no paths are allowed, no directories are exposed (strict deny-by-default)
+
+- **Given** path input contains traversal sequence `skills/../commands`
+- **When** ValidatePath is called
+- **Then** path is cleaned via filepath.Clean() before validation; cleaned path must match artifact prefix
+
 ### Lock File
 
 - **Given** source synced successfully
@@ -165,11 +173,11 @@ Replace current config format with Cargo/Poetry-style inline table syntax for so
 
 **Usage:** `phora add <url> [flags]`
 
-**Flags:**
+**Flags (all optional with sensible defaults):**
 - `--ref <ref>`: Specify branch, tag, or rev (required for refs containing `/`)
 - `--target <dir>`: Override target directory (default: source key name)
 - `--path <subdir>`: Specify source subdirectory to sync
-- `--name <key>`: Override source key name (default: repo name)
+- `--name <key>`: Override source key name (default: derived from repo name)
 
 **Examples:**
 ```bash

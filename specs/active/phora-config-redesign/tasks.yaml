@@ -65,27 +65,27 @@ tasks:
     active_form: Consolidating lockfile types
   - id: CFG-014
     content: Update imports and deprecate old packages
-    status: pending
+    status: completed
     active_form: Updating imports and deprecations
 
   # Phase 6: Commands
   - id: CFG-015
     content: Implement phora update command to re-resolve refs
-    status: pending
+    status: completed
     active_form: Implementing phora update command
   - id: CFG-016
     content: Implement drift detection with --force override
-    status: pending
+    status: completed
     active_form: Implementing drift detection
   - id: CFG-017
     content: Document phora add CLI contract (flags, output)
-    status: pending
+    status: completed
     active_form: Documenting phora add CLI
 
 meta:
   created: 2026-01-18
   last_updated: 2026-01-20
-  progress: 13/17
+  progress: 17/17
 
 phases:
   - name: "Phase 1: Config Format"

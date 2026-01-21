@@ -1,0 +1,424 @@
+spec: phora-config-redesign
+type: code-review
+
+review_config:
+  reviewers:
+    - type: claude
+      model: opus
+    - type: opencode
+      model: openai/gpt-5.2-pro
+    - type: opencode
+      model: google/gemini-3-pro-preview
+
+phases:
+  - id: phase-1
+    name: "Phase 1: Config Format"
+    tasks: [CFG-001, CFG-002, CFG-004]
+    commits: [150ae26, 3f64c22]
+    checkpoint:
+      criteria:
+        - Source struct has git field with full URL
+        - branch/tag/rev are mutually exclusive
+        - Tests pass
+    reviews:
+      - reviewer: claude-opus-1
+        timestamp: 2026-01-21T11:42:05Z
+        gates:
+          correctness: pass
+          tests: pass
+          spec_alignment: pass
+        issues: []
+        summary: "All acceptance criteria verified. Source struct, version validation, mutual exclusivity correct."
+      - reviewer: claude-opus-2
+        timestamp: 2026-01-21T11:42:19Z
+        gates:
+          correctness: pass
+          tests: pass
+          spec_alignment: pass
+        issues:
+          - severity: important
+            file: filter.go:70-72
+            description: "Multiple ** patterns not supported (only single ** handled)"
+          - severity: important
+            file: parse.go:118
+            description: "Trailing slash in URL paths not normalized"
+          - severity: minor
+            file: filter_test.go
+            description: "No test for ** alone pattern"
+        summary: "Filter and URL parser correct. Include-then-exclude algorithm matches spec."
+      - reviewer: claude-opus-3
+        timestamp: 2026-01-21T11:41:59Z
+        gates:
+          correctness: pass
+          tests: pass
+          spec_alignment: pass
+        issues:
+          - severity: minor
+            file: "config.go + internal/config/config.go"
+            description: "Code duplication between root and internal/config (expected during consolidation)"
+        summary: "Manifest simplified to Artifacts filter list. ValidatePath supports nested paths. 41+ test cases."
+      - reviewer: openai-gpt5.2-pro
+        timestamp: 2026-01-21T14:50:00Z
+        gates:
+          correctness: pass
+          tests: pass
+          spec_alignment: pass
+        issues:
+          - severity: minor
+            file: config.go
+            description: "Legacy Repo/Ref fields still present alongside new Git/Branch/Tag/Rev (extra surface area)"
+        summary: "Phase 1 meets all gates: Source has git URL, branch/tag/rev exclusivity validated, tests pass."
+      - reviewer: gemini-3-pro
+        timestamp: 2026-01-21T14:52:00Z
+        gates:
+          correctness: pass
+          tests: pass
+          spec_alignment: pass
+        issues:
+          - severity: minor
+            file: config.go
+            description: "Legacy Ref field defaulted to 'main' even if Tag/Rev specified - could cause ambiguity"
+          - severity: minor
+            file: config.go
+            description: "No validation ensuring Git (full URL) and Repo (shorthand) are mutually exclusive"
+        summary: "Implements Cargo-style source config with strict mutual exclusivity and comprehensive tests."
+    verified: true
+    verification_notes: "All 5 reviewers passed (3 Claude + 2 OpenCode). Minor: legacy field cleanup deferred to consolidation."
+
+  - id: phase-2
+    name: "Phase 2: Manifest"
+    tasks: [CFG-005, CFG-006]
+    commits: [150ae26]
+    checkpoint:
+      criteria:
+        - artifacts field filters directories
+        - No path rewriting
+    reviews:
+      - reviewer: claude-opus-3
+        timestamp: 2026-01-21T11:41:59Z
+        gates:
+          correctness: pass
+          tests: pass
+          spec_alignment: pass
+        issues: []
+        summary: "Manifest simplified to Artifacts []string. FilterDirectories and ValidatePath correct."
+      - reviewer: openai-gpt5.2-pro
+        timestamp: 2026-01-21T14:30:00Z
+        gates:
+          correctness: fail
+          tests: fail
+          spec_alignment: fail
+        issues:
+          - severity: critical
+            file: "internal/config/config.go:43, config.go:43"
+            description: "ValidatePath does not prevent path traversal (skills/../commands passes prefix check)"
+          - severity: important
+            file: "internal/config/config.go:45,61"
+            description: "Inconsistent manifest semantics: ValidatePath treats empty artifacts as 'allow all', FilterDirectories treats as 'allow none'"
+          - severity: important
+            file: "internal/config/config.go"
+            description: "ValidatePath only allows exact matches, rejects legitimate subpaths like skills/foo.md"
+          - severity: important
+            file: "internal/cli/init.go"
+            description: "Populates artifacts with artifact names not directory names (won't work with FilterDirectories)"
+        summary: "Commit adds artifacts-based manifest, but semantics inconsistent and ValidatePath not traversal-safe."
+      - reviewer: gemini-3-pro
+        timestamp: 2026-01-21T14:32:00Z
+        gates:
+          correctness: pass
+          tests: pass
+          spec_alignment: pass
+        issues:
+          - severity: important
+            file: "internal/config/config.go"
+            description: "Empty manifest allows all in ValidatePath but allows none in FilterDirectories - inconsistent"
+          - severity: minor
+            file: "internal/config/config.go"
+            description: "FilterDirectories uses exact match, may exclude parent dirs if artifacts are deep paths"
+        summary: "Implements artifact filtering and URL parsing correctly, but handles empty manifests inconsistently."
+    verified: false
+    verification_notes: "BLOCKED - GPT-5.2 found path traversal vulnerability and semantic inconsistencies. Gemini also noted inconsistent empty manifest handling."
+
+  - id: phase-3
+    name: "Phase 3: Lock File"
+    tasks: [CFG-007, CFG-008, CFG-009]
+    commits: [69e59d1, 8a67ecf]
+    checkpoint:
+      criteria:
+        - digest computed and stored
+        - Per-file hashes recorded
+        - Unchanged config skips fetch
+    reviews:
+      - reviewer: claude-opus-1
+        timestamp: 2026-01-21T11:44:58Z
+        gates:
+          correctness: pass
+          tests: pass
+          spec_alignment: pass
+        issues: []
+        summary: "Digest correctly excludes target. NeedsSync handles all edge cases. 33 tests pass."
+      - reviewer: claude-opus-2
+        timestamp: 2026-01-21T11:45:39Z
+        gates:
+          correctness: pass
+          tests: pass
+          spec_alignment: pass
+        issues:
+          - severity: minor
+            file: lockfile.go:18
+            description: "Lock.Version uses omitempty (version 0 won't be written)"
+        summary: "Schema matches spec. ComputeFileHash follows symlinks. 46+ tests."
+      - reviewer: claude-opus-3
+        timestamp: 2026-01-21T11:45:09Z
+        gates:
+          correctness: pass
+          tests: pass
+          spec_alignment: pass
+        issues:
+          - severity: minor
+            file: config.go:227
+            description: "json.Marshal error ignored (safe but could add comment)"
+        summary: "Nil/empty equivalence correct. Digest deterministic. Target excluded."
+      - reviewer: openai-gpt5.2-pro
+        timestamp: 2026-01-21T14:35:00Z
+        gates:
+          correctness: fail
+          tests: pass
+          spec_alignment: fail
+        issues:
+          - severity: critical
+            file: internal/cli/update.go:51
+            description: "Per-file hashes not populated when writing lock (SourceLock.Files always empty)"
+          - severity: critical
+            file: config.go:234
+            description: "NeedsSync() exists as predicate but not wired to any fetch/sync path"
+          - severity: important
+            file: config.go
+            description: "Digest doesn't normalize include/exclude order - reordering triggers unnecessary re-fetch"
+          - severity: important
+            file: config.go:232
+            description: "json.Marshal error ignored silently"
+          - severity: minor
+            file: digest_test.go
+            description: "Order matters tests don't assert behavior (compute and discard)"
+        summary: "Digest + NeedsSync helpers exist and tests pass, but not wired end-to-end for lock-writing/fetch."
+      - reviewer: gemini-3-pro
+        timestamp: 2026-01-21T14:37:00Z
+        gates:
+          correctness: pass
+          tests: pass
+          spec_alignment: pass
+        issues:
+          - severity: minor
+            file: config.go
+            description: "json.Marshal error ignored (safe but explicit handling safer)"
+          - severity: minor
+            file: config.go
+            description: "Digest sensitive to include/exclude order, could trigger unnecessary re-syncs"
+        summary: "Commits implement lockfile schema V2 with per-file hashing and deterministic digests (excluding target)."
+    verified: true
+    verification_notes: "Core implementation verified. GPT-5.2 notes end-to-end integration incomplete (wiring to sync path deferred to Phase 6). Gemini passed. Minor: order sensitivity in digest."
+
+  - id: phase-4
+    name: "Phase 4: URL Parser"
+    tasks: [CFG-010, CFG-011, CFG-018]
+    commits: [89a2829]
+    checkpoint:
+      criteria:
+        - Shorthand owner/repo/path works
+        - Full tree/ref/path URLs work
+        - GitLab URLs work
+        - Source name collision detected
+        - Include/exclude glob filtering works
+    reviews:
+      - reviewer: claude-opus-1
+        timestamp: 2026-01-21T11:49:04Z
+        gates:
+          correctness: fail
+          tests: pass
+          spec_alignment: fail
+        issues:
+          - severity: critical
+            file: internal/cli/add.go
+            description: "checkSourceNameCollision defined but never called in runAdd"
+          - severity: important
+            file: internal/cli/add.go:60-66
+            description: "Missing --name and --target flags (spec required)"
+          - severity: important
+            file: internal/cli/add.go:78
+            description: "Uses source.ParseRepoString instead of phora.ParseURL"
+          - severity: minor
+            file: internal/cli/add.go:244-301
+            description: "Helper functions defined but unused (dead code)"
+        summary: "URL parser/filter correct but integration incomplete. Collision detection not wired."
+      - reviewer: openai-gpt5.2-pro
+        timestamp: 2026-01-21T12:50:00Z
+        gates:
+          correctness: partial
+          tests: unknown
+          spec_alignment: partial
+        issues:
+          - severity: high
+            file: internal/cli/add.go
+            description: "URL parser behavior not verifiable from diff - need full file inspection"
+          - severity: medium
+            file: internal/cli/add.go
+            description: "Collision detection claimed but usage not evidenced in runAdd"
+          - severity: medium
+            file: internal/cli/add.go
+            description: "Glob filtering integration unclear from commit"
+        summary: "Commit adds helpers but integration not verifiable from diff excerpt alone."
+      - reviewer: gemini-3-pro
+        timestamp: 2026-01-21T12:52:00Z
+        gates:
+          correctness: pass
+          tests: pass
+          spec_alignment: pass
+        issues:
+          - severity: minor
+            file: internal/cli/add.go
+            description: "Uses deprecated internal/config instead of root phora package"
+        summary: "All Phase 4 criteria verified via parseGitHubShorthand/parseFullURL and tests."
+    verified: false
+    verification_notes: "BLOCKED - CFG-011 incomplete: collision detection not integrated, missing flags"
+
+  - id: phase-5
+    name: "Phase 5: Consolidation"
+    tasks: [CFG-012, CFG-013, CFG-014]
+    commits: [89a2829, 666115b]
+    checkpoint:
+      criteria:
+        - Config types consolidated
+        - Lockfile types consolidated
+        - Old internal packages deprecated
+        - All tests pass
+    reviews:
+      - reviewer: claude-opus-1
+        timestamp: 2026-01-21T11:48:25Z
+        gates:
+          correctness: pass
+          tests: pass
+          spec_alignment: partial
+        issues:
+          - severity: medium
+            file: "internal/* packages"
+            description: "Still imported by 13+ files (migration incomplete)"
+          - severity: minor
+            file: config.go:297
+            description: "Path concatenation uses string instead of filepath.Join"
+        summary: "Types consolidated. Load()/Merge() work. Deprecation notices added. Migration ongoing."
+      - reviewer: openai-gpt5.2-pro
+        timestamp: 2026-01-21T12:55:00Z
+        gates:
+          correctness: pass
+          tests: pass
+          spec_alignment: partial
+        issues:
+          - severity: medium
+            file: lockfile.go
+            description: "Lockfile type consolidation unclear from diff"
+          - severity: high
+            file: internal/*
+            description: "Old packages not deprecated in 89a2829 (deprecation in 666115b)"
+          - severity: medium
+            file: phora
+            description: "17MB binary artifact committed"
+        summary: "Config consolidation pass. Deprecation happens in child commit 666115b."
+      - reviewer: gemini-3-pro
+        timestamp: 2026-01-21T12:57:00Z
+        gates:
+          correctness: fail
+          tests: pass
+          spec_alignment: fail
+        issues:
+          - severity: critical
+            file: phora
+            description: "Compiled binary (~17MB) checked into version control"
+          - severity: major
+            file: internal/config/config.go
+            description: "Types duplicated; deprecation occurs in 666115b not 89a2829"
+          - severity: minor
+            file: internal/cli/add.go
+            description: "Mixed usage of phora (root) and internal/config packages"
+        summary: "Phase 5 spans 89a2829 + 666115b. Deprecation added in later commit."
+    verified: true
+    verification_notes: "Core consolidation complete across 89a2829+666115b. Binary artifact noted. Import migration ongoing."
+
+  - id: phase-6
+    name: "Phase 6: Commands"
+    tasks: [CFG-015, CFG-016, CFG-017]
+    commits: [666115b, e584830]
+    checkpoint:
+      criteria:
+        - phora update re-resolves refs and updates lock
+        - phora sync detects drift and errors without --force
+        - phora add CLI contract documented
+    reviews:
+      - reviewer: claude-opus-1
+        timestamp: 2026-01-21T12:37:00Z
+        gates:
+          correctness: fail
+          tests: pass
+          spec_alignment: partial
+        issues:
+          - severity: critical
+            file: internal/cli/sync.go:19-28
+            description: "phora update aliased to sync, not wired to updateSource/updateAllSources"
+          - severity: critical
+            file: internal/cli/sync.go:31-55
+            description: "phora sync does not integrate drift detection, no --force flag"
+          - severity: important
+            file: internal/cli/add.go:60-66
+            description: "Missing --name flag (spec requires for source key override)"
+          - severity: important
+            file: internal/cli/add.go:60-66
+            description: "Missing --target flag (spec requires for target dir override)"
+          - severity: minor
+            file: internal/cli/update.go:37
+            description: "generateSHA uses time-based hash, not actual git ref resolution"
+        summary: "Drift/update logic exists but not wired to CLI. phora add missing --name/--target flags."
+      - reviewer: openai-gpt5.2-pro
+        timestamp: 2026-01-21T12:40:44Z
+        gates:
+          correctness: fail
+          tests: fail
+          spec_alignment: fail
+        issues:
+          - severity: critical
+            file: internal/cli/sync.go:19
+            description: "phora update aliased to sync, runs runSync instead of re-resolving refs"
+          - severity: critical
+            file: internal/cli/sync.go:44
+            description: "phora sync has no drift detection or --force flag"
+          - severity: critical
+            file: internal/cli/update.go:20
+            description: "updateSource/updateAllSources exist but not wired to CLI"
+          - severity: critical
+            file: internal/cli/update.go:86
+            description: "generateSHA uses mock timestamp, not actual git ref resolution"
+          - severity: important
+            file: internal/cli/add.go:39
+            description: "Missing --target and --name flags from CLI definition"
+          - severity: medium
+            file: internal/cli/add.go:229
+            description: "checkSourceNameCollision suppresses non-ENOENT errors"
+        summary: "Phase 6 criteria 1 and 2 not met. Implementation exists but not integrated."
+      - reviewer: gemini-3-pro
+        timestamp: 2026-01-21T12:45:00Z
+        gates:
+          correctness: fail
+          tests: pass
+          spec_alignment: fail
+        issues:
+          - severity: critical
+            file: internal/cli/sync.go:19
+            description: "phora update aliased to sync, does not use updateSource logic"
+          - severity: critical
+            file: internal/cli/sync.go:31
+            description: "phora sync doesn't implement drift detection; DetectDrift unused"
+          - severity: important
+            file: internal/cli/update.go:86
+            description: "generateSHA mocks git resolution with timestamp hash"
+        summary: "Phase 6 components implemented in isolation but not wired into CLI commands."
+    verified: false
+    verification_notes: "BLOCKED - All 3 reviewers agree: update/drift logic not wired to CLI"

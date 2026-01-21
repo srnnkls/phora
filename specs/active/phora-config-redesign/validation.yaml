@@ -452,6 +452,30 @@ new_markers:
     severity: medium
     found_by: [gemini-3-pro]
     resolution: "Error if consumer requests path outside producer's artifacts"
+  - id: M027
+    area: Behavior
+    status: resolved
+    description: "Empty manifest semantics inconsistent between ValidatePath and FilterDirectories"
+    severity: critical
+    found_by: [openai-gpt5.2-pro, gemini-3-pro]
+    source: code-review/phase-2
+    resolution: "Allow none (strict) - empty artifacts = no paths allowed, consistent deny-by-default"
+  - id: M028
+    area: Edge Cases
+    status: resolved
+    description: "ValidatePath vulnerable to path traversal (skills/../commands)"
+    severity: critical
+    found_by: [openai-gpt5.2-pro]
+    source: code-review/phase-2
+    resolution: "Clean then validate - use filepath.Clean() before prefix check"
+  - id: M029
+    area: Integration
+    status: resolved
+    description: "phora add --name and --target flags optional vs required unclear"
+    severity: important
+    found_by: [claude-opus, openai-gpt5.2-pro]
+    source: code-review/phase-4,phase-6
+    resolution: "Both optional with defaults - --name from repo name, --target from source key"
 
 clarification_sessions_s006:
   - id: S006
@@ -519,4 +543,33 @@ clarification_sessions_s006:
         doc_updates:
           - file: spec.md
             section: Manifest
+            action: modified
+  - id: S009
+    timestamp: 2026-01-21T15:00:00Z
+    source: spec-clarify
+    note: "Resolving blocking issues from code review"
+    questions:
+      - id: Q033
+        question: "Empty manifest should mean what for ValidatePath and FilterDirectories?"
+        answer: "Allow none (strict) - empty artifacts = no paths allowed, consistent deny-by-default"
+        area: Behavior
+        doc_updates:
+          - file: spec.md
+            section: Manifest
+            action: modified
+      - id: Q034
+        question: "How should ValidatePath handle path traversal attempts like 'skills/../commands'?"
+        answer: "Clean then validate - use filepath.Clean() before prefix check"
+        area: Edge Cases
+        doc_updates:
+          - file: spec.md
+            section: Manifest
+            action: modified
+      - id: Q035
+        question: "Should phora add flags --name and --target be required or optional?"
+        answer: "Both optional with defaults - --name defaults to repo name, --target defaults to source key"
+        area: Integration
+        doc_updates:
+          - file: spec.md
+            section: phora add CLI
             action: modified
