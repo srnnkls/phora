@@ -15,15 +15,14 @@ import (
 const LockFileName = "phora.lock"
 
 type Lock struct {
-	Version int          `toml:"version,omitempty"`
+	Version int          `toml:"version"`
 	Sources []SourceLock `toml:"sources,omitempty"`
-	Repos   []RepoEntry  `toml:"repos,omitempty"`
 }
 
 type SourceLock struct {
 	Name      string     `toml:"name"`
 	Repo      string     `toml:"repo"`
-	Ref       string     `toml:"ref"`
+	Rev       string     `toml:"rev"`
 	SHA       string     `toml:"sha"`
 	Digest    string     `toml:"digest"`
 	FetchedAt time.Time  `toml:"fetched_at"`
@@ -34,14 +33,6 @@ type FileLock struct {
 	Path   string `toml:"path"`
 	SHA256 string `toml:"sha256"`
 	Size   int64  `toml:"size"`
-}
-
-type RepoEntry struct {
-	Name      string    `toml:"name"`
-	Repo      string    `toml:"repo"`
-	Ref       string    `toml:"ref"`
-	Commit    string    `toml:"commit"`
-	FetchedAt time.Time `toml:"fetched_at"`
 }
 
 func LoadLock(dir string) (*Lock, error) {
@@ -58,10 +49,66 @@ func LoadLock(dir string) (*Lock, error) {
 	if err := toml.Unmarshal(data, &lock); err != nil {
 		return nil, err
 	}
+	if err := lock.Validate(); err != nil {
+		return nil, err
+	}
 	return &lock, nil
 }
 
+func (l *Lock) Validate() error {
+	if l.Version != 1 {
+		return fmt.Errorf("unsupported lock file version: %d (expected 1)", l.Version)
+	}
+	for _, src := range l.Sources {
+		if err := src.Validate(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *SourceLock) Validate() error {
+	if s.Name == "" {
+		return fmt.Errorf("source lock missing required field: name")
+	}
+	if s.Repo == "" {
+		return fmt.Errorf("source lock %q missing required field: repo", s.Name)
+	}
+	if !isValidSHA(s.SHA) {
+		return fmt.Errorf("source lock %q has invalid SHA: must be 40-char hex string", s.Name)
+	}
+	if !isValidDigest(s.Digest) {
+		return fmt.Errorf("source lock %q has invalid digest: must be 64-char hex string", s.Name)
+	}
+	return nil
+}
+
+func isValidSHA(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+func isValidDigest(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
 func (l *Lock) Save(dir string) error {
+	l.Version = 1
 	lockPath := filepath.Join(dir, LockFileName)
 	data, err := toml.Marshal(l)
 	if err != nil {
@@ -70,37 +117,8 @@ func (l *Lock) Save(dir string) error {
 	return os.WriteFile(lockPath, data, 0644)
 }
 
-func (l *Lock) AddRepo(entry RepoEntry) {
-	for i, r := range l.Repos {
-		if r.Name == entry.Name {
-			l.Repos[i] = entry
-			return
-		}
-	}
-	l.Repos = append(l.Repos, entry)
-}
-
-func (l *Lock) FindByName(name string) (RepoEntry, bool) {
-	for _, r := range l.Repos {
-		if r.Name == name {
-			return r, true
-		}
-	}
-	return RepoEntry{}, false
-}
-
-func (l *Lock) RemoveByName(name string) {
-	var filtered []RepoEntry
-	for _, r := range l.Repos {
-		if r.Name != name {
-			filtered = append(filtered, r)
-		}
-	}
-	l.Repos = filtered
-}
-
 func (l *Lock) IsEmpty() bool {
-	return len(l.Repos) == 0
+	return len(l.Sources) == 0
 }
 
 func (l *Lock) FindSourceByName(name string) (SourceLock, bool) {

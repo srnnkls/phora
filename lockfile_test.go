@@ -9,18 +9,19 @@ import (
 
 func TestLock_Empty(t *testing.T) {
 	var lock Lock
-	if len(lock.Repos) != 0 {
-		t.Errorf("expected empty Lock to have 0 repos, got %d", len(lock.Repos))
+	if len(lock.Sources) != 0 {
+		t.Errorf("expected empty Lock to have 0 sources, got %d", len(lock.Sources))
 	}
 }
 
-func TestRepoEntry_Fields(t *testing.T) {
+func TestSourceLock_Fields(t *testing.T) {
 	now := time.Now()
-	entry := RepoEntry{
+	entry := SourceLock{
 		Name:      "company",
 		Repo:      "company/shared-skills",
-		Ref:       "main",
-		Commit:    "abc123def456",
+		Rev:       "main",
+		SHA:       "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+		Digest:    "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
 		FetchedAt: now,
 	}
 
@@ -30,11 +31,11 @@ func TestRepoEntry_Fields(t *testing.T) {
 	if entry.Repo != "company/shared-skills" {
 		t.Errorf("Repo = %q, want %q", entry.Repo, "company/shared-skills")
 	}
-	if entry.Ref != "main" {
-		t.Errorf("Ref = %q, want %q", entry.Ref, "main")
+	if entry.Rev != "main" {
+		t.Errorf("Rev = %q, want %q", entry.Rev, "main")
 	}
-	if entry.Commit != "abc123def456" {
-		t.Errorf("Commit = %q, want %q", entry.Commit, "abc123def456")
+	if entry.SHA != "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2" {
+		t.Errorf("SHA = %q, want %q", entry.SHA, "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2")
 	}
 	if !entry.FetchedAt.Equal(now) {
 		t.Errorf("FetchedAt = %v, want %v", entry.FetchedAt, now)
@@ -47,8 +48,8 @@ func TestLoadLock_NonExistent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadLock should not error for nonexistent lockfile: %v", err)
 	}
-	if len(lock.Repos) != 0 {
-		t.Errorf("expected empty Lock, got %d repos", len(lock.Repos))
+	if len(lock.Sources) != 0 {
+		t.Errorf("expected empty Lock, got %d sources", len(lock.Sources))
 	}
 }
 
@@ -56,11 +57,14 @@ func TestLoadLock_ExistingFile(t *testing.T) {
 	dir := t.TempDir()
 	lockPath := filepath.Join(dir, "phora.lock")
 
-	content := `[[repos]]
+	content := `version = 1
+
+[[sources]]
 name = "company"
 repo = "company/shared-skills"
-ref = "main"
-commit = "abc123def456"
+rev = "main"
+sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+digest = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
 fetched_at = 2026-01-14T10:00:00Z
 `
 	if err := os.WriteFile(lockPath, []byte(content), 0644); err != nil {
@@ -71,27 +75,27 @@ fetched_at = 2026-01-14T10:00:00Z
 	if err != nil {
 		t.Fatalf("LoadLock failed: %v", err)
 	}
-	if len(lock.Repos) != 1 {
-		t.Fatalf("expected 1 repo, got %d", len(lock.Repos))
+	if len(lock.Sources) != 1 {
+		t.Fatalf("expected 1 source, got %d", len(lock.Sources))
 	}
 
-	r := lock.Repos[0]
-	if r.Name != "company" {
-		t.Errorf("Name = %q, want %q", r.Name, "company")
+	s := lock.Sources[0]
+	if s.Name != "company" {
+		t.Errorf("Name = %q, want %q", s.Name, "company")
 	}
-	if r.Repo != "company/shared-skills" {
-		t.Errorf("Repo = %q, want %q", r.Repo, "company/shared-skills")
+	if s.Repo != "company/shared-skills" {
+		t.Errorf("Repo = %q, want %q", s.Repo, "company/shared-skills")
 	}
-	if r.Ref != "main" {
-		t.Errorf("Ref = %q, want %q", r.Ref, "main")
+	if s.Rev != "main" {
+		t.Errorf("Rev = %q, want %q", s.Rev, "main")
 	}
-	if r.Commit != "abc123def456" {
-		t.Errorf("Commit = %q, want %q", r.Commit, "abc123def456")
+	if s.SHA != "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2" {
+		t.Errorf("SHA = %q, want %q", s.SHA, "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2")
 	}
 
 	expected := time.Date(2026, 1, 14, 10, 0, 0, 0, time.UTC)
-	if !r.FetchedAt.Equal(expected) {
-		t.Errorf("FetchedAt = %v, want %v", r.FetchedAt, expected)
+	if !s.FetchedAt.Equal(expected) {
+		t.Errorf("FetchedAt = %v, want %v", s.FetchedAt, expected)
 	}
 }
 
@@ -100,12 +104,13 @@ func TestSaveLock(t *testing.T) {
 
 	now := time.Date(2026, 1, 14, 12, 30, 0, 0, time.UTC)
 	lock := &Lock{
-		Repos: []RepoEntry{
+		Sources: []SourceLock{
 			{
 				Name:      "personal",
 				Repo:      "user/dotfiles",
-				Ref:       "main",
-				Commit:    "deadbeef",
+				Rev:       "main",
+				SHA:       "deadbeef1234567890abcdef1234567890abcdef",
+				Digest:    "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
 				FetchedAt: now,
 			},
 		},
@@ -124,73 +129,73 @@ func TestSaveLock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadLock after save failed: %v", err)
 	}
-	if len(loaded.Repos) != 1 {
-		t.Fatalf("expected 1 repo after roundtrip, got %d", len(loaded.Repos))
+	if len(loaded.Sources) != 1 {
+		t.Fatalf("expected 1 source after roundtrip, got %d", len(loaded.Sources))
 	}
-	if loaded.Repos[0].Name != "personal" {
-		t.Errorf("Name after roundtrip = %q, want %q", loaded.Repos[0].Name, "personal")
+	if loaded.Sources[0].Name != "personal" {
+		t.Errorf("Name after roundtrip = %q, want %q", loaded.Sources[0].Name, "personal")
 	}
-	if loaded.Repos[0].Commit != "deadbeef" {
-		t.Errorf("Commit after roundtrip = %q, want %q", loaded.Repos[0].Commit, "deadbeef")
+	if loaded.Sources[0].SHA != "deadbeef1234567890abcdef1234567890abcdef" {
+		t.Errorf("SHA after roundtrip = %q, want %q", loaded.Sources[0].SHA, "deadbeef1234567890abcdef1234567890abcdef")
 	}
 }
 
-func TestLock_AddRepo_New(t *testing.T) {
+func TestLock_AddSource_New(t *testing.T) {
 	var lock Lock
 
 	now := time.Now()
-	lock.AddRepo(RepoEntry{
+	lock.AddSource(SourceLock{
 		Name:      "new-source",
 		Repo:      "org/new-repo",
-		Ref:       "main",
-		Commit:    "abc123",
+		Rev:       "main",
+		SHA:       "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
 		FetchedAt: now,
 	})
 
-	if len(lock.Repos) != 1 {
-		t.Fatalf("expected 1 repo after add, got %d", len(lock.Repos))
+	if len(lock.Sources) != 1 {
+		t.Fatalf("expected 1 source after add, got %d", len(lock.Sources))
 	}
-	if lock.Repos[0].Name != "new-source" {
-		t.Errorf("Name = %q, want %q", lock.Repos[0].Name, "new-source")
+	if lock.Sources[0].Name != "new-source" {
+		t.Errorf("Name = %q, want %q", lock.Sources[0].Name, "new-source")
 	}
 }
 
-func TestLock_AddRepo_UpdateExisting(t *testing.T) {
+func TestLock_AddSource_UpdateExisting(t *testing.T) {
 	now := time.Now()
 	lock := Lock{
-		Repos: []RepoEntry{
+		Sources: []SourceLock{
 			{
 				Name:      "existing",
 				Repo:      "org/repo",
-				Ref:       "main",
-				Commit:    "old-commit",
+				Rev:       "main",
+				SHA:       "1111111111111111111111111111111111111111",
 				FetchedAt: now.Add(-1 * time.Hour),
 			},
 		},
 	}
 
-	lock.AddRepo(RepoEntry{
+	lock.AddSource(SourceLock{
 		Name:      "existing",
 		Repo:      "org/repo",
-		Ref:       "main",
-		Commit:    "new-commit",
+		Rev:       "main",
+		SHA:       "2222222222222222222222222222222222222222",
 		FetchedAt: now,
 	})
 
-	if len(lock.Repos) != 1 {
-		t.Fatalf("expected 1 repo after update, got %d", len(lock.Repos))
+	if len(lock.Sources) != 1 {
+		t.Fatalf("expected 1 source after update, got %d", len(lock.Sources))
 	}
-	if lock.Repos[0].Commit != "new-commit" {
-		t.Errorf("Commit = %q, want %q", lock.Repos[0].Commit, "new-commit")
+	if lock.Sources[0].SHA != "2222222222222222222222222222222222222222" {
+		t.Errorf("SHA = %q, want %q", lock.Sources[0].SHA, "2222222222222222222222222222222222222222")
 	}
 }
 
-func TestLock_FindByName(t *testing.T) {
+func TestLock_FindSourceByName(t *testing.T) {
 	lock := Lock{
-		Repos: []RepoEntry{
-			{Name: "alpha", Commit: "aaa"},
-			{Name: "beta", Commit: "bbb"},
-			{Name: "gamma", Commit: "ccc"},
+		Sources: []SourceLock{
+			{Name: "alpha", SHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+			{Name: "beta", SHA: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+			{Name: "gamma", SHA: "cccccccccccccccccccccccccccccccccccccccc"},
 		},
 	}
 
@@ -199,61 +204,61 @@ func TestLock_FindByName(t *testing.T) {
 		want   string
 		exists bool
 	}{
-		{"alpha", "aaa", true},
-		{"beta", "bbb", true},
-		{"gamma", "ccc", true},
+		{"alpha", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", true},
+		{"beta", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", true},
+		{"gamma", "cccccccccccccccccccccccccccccccccccccccc", true},
 		{"delta", "", false},
 		{"", "", false},
 	}
 
 	for _, tc := range tests {
-		entry, ok := lock.FindByName(tc.name)
+		entry, ok := lock.FindSourceByName(tc.name)
 		if ok != tc.exists {
-			t.Errorf("FindByName(%q) exists = %v, want %v", tc.name, ok, tc.exists)
+			t.Errorf("FindSourceByName(%q) exists = %v, want %v", tc.name, ok, tc.exists)
 			continue
 		}
-		if ok && entry.Commit != tc.want {
-			t.Errorf("FindByName(%q) Commit = %q, want %q", tc.name, entry.Commit, tc.want)
+		if ok && entry.SHA != tc.want {
+			t.Errorf("FindSourceByName(%q) SHA = %q, want %q", tc.name, entry.SHA, tc.want)
 		}
 	}
 }
 
-func TestLock_RemoveByName(t *testing.T) {
+func TestLock_RemoveSource(t *testing.T) {
 	lock := Lock{
-		Repos: []RepoEntry{
+		Sources: []SourceLock{
 			{Name: "keep-a"},
 			{Name: "remove-me"},
 			{Name: "keep-b"},
 		},
 	}
 
-	lock.RemoveByName("remove-me")
+	lock.RemoveSource("remove-me")
 
-	if len(lock.Repos) != 2 {
-		t.Fatalf("expected 2 repos after remove, got %d", len(lock.Repos))
+	if len(lock.Sources) != 2 {
+		t.Fatalf("expected 2 sources after remove, got %d", len(lock.Sources))
 	}
-	if _, found := lock.FindByName("remove-me"); found {
-		t.Error("removed repo should not be found")
+	if _, found := lock.FindSourceByName("remove-me"); found {
+		t.Error("removed source should not be found")
 	}
-	if _, found := lock.FindByName("keep-a"); !found {
+	if _, found := lock.FindSourceByName("keep-a"); !found {
 		t.Error("keep-a should still exist")
 	}
-	if _, found := lock.FindByName("keep-b"); !found {
+	if _, found := lock.FindSourceByName("keep-b"); !found {
 		t.Error("keep-b should still exist")
 	}
 }
 
-func TestLock_RemoveByName_NotFound(t *testing.T) {
+func TestLock_RemoveSource_NotFound(t *testing.T) {
 	lock := Lock{
-		Repos: []RepoEntry{
+		Sources: []SourceLock{
 			{Name: "existing"},
 		},
 	}
 
-	lock.RemoveByName("nonexistent")
+	lock.RemoveSource("nonexistent")
 
-	if len(lock.Repos) != 1 {
-		t.Errorf("expected 1 repo unchanged, got %d", len(lock.Repos))
+	if len(lock.Sources) != 1 {
+		t.Errorf("expected 1 source unchanged, got %d", len(lock.Sources))
 	}
 }
 
@@ -278,7 +283,7 @@ func TestLock_IsEmpty(t *testing.T) {
 	}
 
 	nonEmpty := Lock{
-		Repos: []RepoEntry{{Name: "test"}},
+		Sources: []SourceLock{{Name: "test"}},
 	}
 	if nonEmpty.IsEmpty() {
 		t.Error("non-empty Lock should report IsEmpty() = false")
