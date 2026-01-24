@@ -171,7 +171,7 @@ func TestAddSource(t *testing.T) {
 	}
 	WriteFile(path, cfg)
 
-	src := Source{Repo: "https://github.com/owner/repo.git", Path: "skills", Ref: "main"}
+	src := Source{Git: "https://github.com/owner/repo.git", Path: "skills", Branch: "main"}
 	err := AddSource(path, "owner/repo", src)
 	if err != nil {
 		t.Fatalf("AddSource() error = %v", err)
@@ -181,8 +181,8 @@ func TestAddSource(t *testing.T) {
 	if len(loaded.Sources) != 1 {
 		t.Fatalf("Sources length = %d, want 1", len(loaded.Sources))
 	}
-	if loaded.Sources["owner/repo"].Repo != "https://github.com/owner/repo.git" {
-		t.Errorf("Source.Repo = %q, want %q", loaded.Sources["owner/repo"].Repo, "https://github.com/owner/repo.git")
+	if loaded.Sources["owner/repo"].Git != "https://github.com/owner/repo.git" {
+		t.Errorf("Source.Git = %q, want %q", loaded.Sources["owner/repo"].Git, "https://github.com/owner/repo.git")
 	}
 	if loaded.Sources["owner/repo"].Path != "skills" {
 		t.Errorf("Source.Path = %q, want %q", loaded.Sources["owner/repo"].Path, "skills")
@@ -195,14 +195,14 @@ func TestAddSourceOverride(t *testing.T) {
 
 	cfg := &Config{
 		Sources: map[string]Source{
-			"owner/repo": {Repo: "https://github.com/owner/repo.git", Path: "skills"},
+			"owner/repo": {Git: "https://github.com/owner/repo.git", Path: "skills"},
 		},
 		Harness: map[string]Harness{},
 	}
 	WriteFile(path, cfg)
 
 	// Adding same name should override
-	src := Source{Repo: "https://github.com/owner/repo.git", Path: "skills", Ref: "v2"}
+	src := Source{Git: "https://github.com/owner/repo.git", Path: "skills", Branch: "v2"}
 	err := AddSource(path, "owner/repo", src)
 	if err != nil {
 		t.Fatalf("AddSource() error = %v", err)
@@ -212,8 +212,8 @@ func TestAddSourceOverride(t *testing.T) {
 	if len(loaded.Sources) != 1 {
 		t.Errorf("Source count = %d, want 1", len(loaded.Sources))
 	}
-	if loaded.Sources["owner/repo"].Ref != "v2" {
-		t.Errorf("Source.Ref = %q, want %q", loaded.Sources["owner/repo"].Ref, "v2")
+	if loaded.Sources["owner/repo"].Branch != "v2" {
+		t.Errorf("Source.Branch = %q, want %q", loaded.Sources["owner/repo"].Branch, "v2")
 	}
 }
 
@@ -221,7 +221,7 @@ func TestAddSourceNewFile(t *testing.T) {
 	tmpDir := t.TempDir()
 	path := filepath.Join(tmpDir, "new-config.toml")
 
-	src := Source{Repo: "https://github.com/owner/repo.git"}
+	src := Source{Git: "https://github.com/owner/repo.git"}
 	err := AddSource(path, "owner/repo", src)
 	if err != nil {
 		t.Fatalf("AddSource() on new file error = %v", err)
@@ -234,5 +234,95 @@ func TestAddSourceNewFile(t *testing.T) {
 	loaded, _ := LoadFile(path)
 	if len(loaded.Sources) != 1 {
 		t.Error("Source not saved to new file")
+	}
+}
+
+func TestAddSource_RejectsEmptyGit(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "phora.toml")
+
+	cfg := &Config{
+		Version: 1,
+		Harness: map[string]Harness{},
+	}
+	WriteFile(path, cfg)
+
+	src := Source{Path: "skills", Branch: "main"}
+	err := AddSource(path, "test-source", src)
+	if err == nil {
+		t.Fatal("AddSource() should return error when Git field is empty")
+	}
+
+	if _, err := LoadFile(path); err == nil {
+		loaded, _ := LoadFile(path)
+		if _, exists := loaded.Sources["test-source"]; exists {
+			t.Error("Source with empty Git field should not be saved")
+		}
+	}
+}
+
+func TestAddSource_RejectsLegacyFormat(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "phora.toml")
+
+	cfg := &Config{
+		Version: 1,
+		Harness: map[string]Harness{},
+	}
+	WriteFile(path, cfg)
+
+	src := Source{
+		Host:   "github.com",
+		Owner:  "owner",
+		Repo:   "repo",
+		Branch: "main",
+	}
+	err := AddSource(path, "legacy-source", src)
+	if err == nil {
+		t.Fatal("AddSource() should return error for legacy format (Host/Owner/Repo without Git)")
+	}
+
+	loaded, loadErr := LoadFile(path)
+	if loadErr == nil {
+		if _, exists := loaded.Sources["legacy-source"]; exists {
+			t.Error("Source with legacy format should not be saved")
+		}
+	}
+}
+
+func TestAddSource_AcceptsValidGit(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "phora.toml")
+
+	cfg := &Config{
+		Version: 1,
+		Harness: map[string]Harness{},
+	}
+	WriteFile(path, cfg)
+
+	src := Source{
+		Git:    "https://github.com/owner/repo.git",
+		Branch: "main",
+		Path:   "skills",
+	}
+	err := AddSource(path, "valid-source", src)
+	if err != nil {
+		t.Fatalf("AddSource() with valid Git field should succeed, got error: %v", err)
+	}
+
+	loaded, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+
+	savedSrc, exists := loaded.Sources["valid-source"]
+	if !exists {
+		t.Fatal("Source with valid Git field should be saved")
+	}
+	if savedSrc.Git != "https://github.com/owner/repo.git" {
+		t.Errorf("Source.Git = %q, want %q", savedSrc.Git, "https://github.com/owner/repo.git")
+	}
+	if savedSrc.Branch != "main" {
+		t.Errorf("Source.Branch = %q, want %q", savedSrc.Branch, "main")
 	}
 }

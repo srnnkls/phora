@@ -80,11 +80,9 @@ func runAdd(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("parse URL: %w", err)
 	}
 
-	host, owner, repo := extractHostOwnerRepo(parsed.Git)
-
 	sourceName := addName
 	if sourceName == "" {
-		sourceName = repo
+		sourceName = repoNameFromGitURL(parsed.Git)
 	}
 
 	var configPath string
@@ -110,6 +108,7 @@ func runAdd(cmd *cobra.Command, args []string) error {
 	// Look up host config (may be nil for unknown hosts)
 	var hostConfig *config.Host
 	if cfg.Hosts != nil {
+		host := hostFromGitURL(parsed.Git)
 		if hc, ok := cfg.Hosts[host]; ok {
 			hostConfig = &hc
 		}
@@ -244,13 +243,7 @@ func runAdd(cmd *cobra.Command, args []string) error {
 		ref = parsed.Branch
 	}
 
-	src := config.Source{
-		Host:  host,
-		Owner: owner,
-		Repo:  repo,
-		Path:  configSourcePath,
-		Ref:   ref,
-	}
+	src := buildSourceFromParsedURL(parsed, ref, configSourcePath)
 
 	if err := config.AddSource(configPath, sourceName, src); err != nil {
 		return fmt.Errorf("save source to config: %w", err)
@@ -275,20 +268,32 @@ func checkSourceNameCollision(configPath, sourceName string) error {
 	return nil
 }
 
-func extractHostOwnerRepo(gitURL string) (host, owner, repo string) {
+func buildSourceFromParsedURL(parsed *phora.ParsedURL, ref, path string) config.Source {
+	return config.Source{
+		Git:    parsed.Git,
+		Path:   path,
+		Branch: ref,
+	}
+}
+
+func repoNameFromGitURL(gitURL string) string {
 	u, err := url.Parse(gitURL)
 	if err != nil {
-		return "", "", ""
+		return ""
 	}
-
-	host = u.Host
 	path := strings.TrimPrefix(u.Path, "/")
 	path = strings.TrimSuffix(path, ".git")
-
 	parts := strings.Split(path, "/")
 	if len(parts) >= 2 {
-		owner = parts[0]
-		repo = parts[1]
+		return parts[1]
 	}
-	return host, owner, repo
+	return ""
+}
+
+func hostFromGitURL(gitURL string) string {
+	u, err := url.Parse(gitURL)
+	if err != nil {
+		return ""
+	}
+	return u.Host
 }

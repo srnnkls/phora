@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -219,12 +220,18 @@ func RemoveExclusion(path string, harnessName string, artifactName string) error
 	return WriteFile(path, cfg)
 }
 
-// AddSource adds a source to the config and saves it
+// AddSource adds a source to the config and saves it.
+// Requires v1 format with Git field populated.
 func AddSource(configPath string, name string, src Source) error {
+	if src.Git == "" {
+		return fmt.Errorf("source requires git field")
+	}
+
 	cfg, err := LoadFile(configPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			cfg = &Config{
+				Version: 1,
 				Sources: make(map[string]Source),
 				Harness: make(map[string]Harness),
 			}
@@ -236,6 +243,8 @@ func AddSource(configPath string, name string, src Source) error {
 	if cfg.Sources == nil {
 		cfg.Sources = make(map[string]Source)
 	}
+
+	cfg.Version = 1
 
 	cfg.Sources[name] = src
 	return WriteFile(configPath, cfg)

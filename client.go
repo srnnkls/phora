@@ -8,6 +8,31 @@ import (
 	"time"
 )
 
+// extractRepoFromGit extracts "owner/repo" from a git URL.
+// Handles both https:// and git@ formats.
+func extractRepoFromGit(gitURL string) string {
+	if gitURL == "" {
+		return ""
+	}
+	url := gitURL
+	url = strings.TrimSuffix(url, ".git")
+
+	// Handle git@host:owner/repo format (SSH URLs)
+	if strings.HasPrefix(url, "git@") {
+		if idx := strings.Index(url, ":"); idx >= 0 {
+			return url[idx+1:]
+		}
+	}
+
+	// Handle https://host/owner/repo format
+	// Find the last two path segments
+	parts := strings.Split(url, "/")
+	if len(parts) >= 2 {
+		return parts[len(parts)-2] + "/" + parts[len(parts)-1]
+	}
+	return url
+}
+
 type Client struct {
 	Config  *Config
 	DataDir string
@@ -47,33 +72,6 @@ func WithLockDir(dir string) ClientOption {
 	}
 }
 
-const defaultGitURLTemplate = "https://github.com/{owner}/{repo}.git"
-
-func (c *Client) ResolveGitURL(source Source) (string, error) {
-	owner, repo, err := source.ParseRepo()
-	if err != nil {
-		return "", err
-	}
-
-	template := defaultGitURLTemplate
-
-	if source.Host != "" {
-		if c.Config.Hosts == nil {
-			return "", fmt.Errorf("unknown host %q", source.Host)
-		}
-		host, ok := c.Config.Hosts[source.Host]
-		if !ok {
-			return "", fmt.Errorf("unknown host %q", source.Host)
-		}
-		template = host.GitURL
-	}
-
-	url := strings.ReplaceAll(template, "{owner}", owner)
-	url = strings.ReplaceAll(url, "{repo}", repo)
-
-	return url, nil
-}
-
 func (c *Client) Fetch(sourceName string) (*FetchResult, error) {
 	if c.Config.Sources == nil {
 		return nil, fmt.Errorf("unknown source %q", sourceName)
@@ -83,22 +81,27 @@ func (c *Client) Fetch(sourceName string) (*FetchResult, error) {
 		return nil, fmt.Errorf("unknown source %q", sourceName)
 	}
 
-	url, err := c.ResolveGitURL(source)
-	if err != nil {
-		return nil, err
-	}
-
 	localPath := filepath.Join(c.DataDir, sourceName)
 
 	repo := Repo{
 		Name:      sourceName,
-		URL:       url,
+		URL:       source.Git,
 		LocalPath: localPath,
-		Ref:       source.Ref,
+		Ref:       source.ResolveRev(),
 	}
 
 	if err := CloneOrPull(repo); err != nil {
 		return nil, err
+	}
+
+	// Validate path against producer's manifest
+	if source.Path != "" && !source.IgnoreManifest {
+		producerCfg, err := LoadConfig(filepath.Join(localPath, "phora.toml"))
+		if err == nil && producerCfg.Manifest != nil {
+			if err := producerCfg.Manifest.ValidatePath(source.Path); err != nil {
+				return nil, fmt.Errorf("path validation: %w", err)
+			}
+		}
 	}
 
 	commit, err := repo.CurrentCommit()
@@ -124,12 +127,28 @@ func (c *Client) Fetch(sourceName string) (*FetchResult, error) {
 			return nil, err
 		}
 
-		lock.AddRepo(RepoEntry{
+		var fileLocks []FileLock
+		for _, path := range files {
+			fullPath := filepath.Join(localPath, path)
+			hash, size, err := ComputeFileHash(fullPath)
+			if err != nil {
+				return nil, fmt.Errorf("computing hash for %s: %w", path, err)
+			}
+			fileLocks = append(fileLocks, FileLock{
+				Path:   path,
+				SHA256: hash,
+				Size:   size,
+			})
+		}
+
+		lock.AddSource(SourceLock{
 			Name:      sourceName,
-			Repo:      source.Repo,
-			Ref:       source.Ref,
-			Commit:    commit,
+			Repo:      extractRepoFromGit(source.Git),
+			Rev:       source.ResolveRev(),
+			SHA:       commit,
+			Digest:    source.Digest(),
 			FetchedAt: time.Now(),
+			Files:     fileLocks,
 		})
 
 		if err := lock.Save(c.LockDir); err != nil {
