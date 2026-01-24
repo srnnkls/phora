@@ -15,12 +15,11 @@ func TestAddCommand_SourceNameCollision(t *testing.T) {
 	configPath := filepath.Join(tmpDir, "phora.toml")
 
 	existingConfig := &config.Config{
+		Version: 1,
 		Sources: map[string]config.Source{
 			"dotfiles": {
-				Host:  "github.com",
-				Owner: "srnnkls",
-				Repo:  "dotfiles",
-				Branch:   "main",
+				Git:    "https://github.com/srnnkls/dotfiles.git",
+				Branch: "main",
 			},
 		},
 	}
@@ -44,12 +43,11 @@ func TestAddCommand_NoCollisionForNewSource(t *testing.T) {
 	configPath := filepath.Join(tmpDir, "phora.toml")
 
 	existingConfig := &config.Config{
+		Version: 1,
 		Sources: map[string]config.Source{
 			"existing-source": {
-				Host:  "github.com",
-				Owner: "owner",
-				Repo:  "existing-source",
-				Branch:   "main",
+				Git:    "https://github.com/owner/existing-source.git",
+				Branch: "main",
 			},
 		},
 	}
@@ -254,16 +252,6 @@ func TestBuildSourceFromParsedURL_UsesGitDirectly(t *testing.T) {
 	if src.Git != parsed.Git {
 		t.Errorf("Source.Git = %q, want %q (from ParsedURL.Git)", src.Git, parsed.Git)
 	}
-
-	if src.Host != "" {
-		t.Errorf("Source.Host = %q, want empty (legacy field should not be set)", src.Host)
-	}
-	if src.Owner != "" {
-		t.Errorf("Source.Owner = %q, want empty (legacy field should not be set)", src.Owner)
-	}
-	if src.Repo != "" {
-		t.Errorf("Source.Repo = %q, want empty (legacy field should not be set)", src.Repo)
-	}
 }
 
 func TestBuildSourceFromParsedURL_IncludesPathAndBranch(t *testing.T) {
@@ -285,7 +273,7 @@ func TestBuildSourceFromParsedURL_IncludesPathAndBranch(t *testing.T) {
 	}
 }
 
-func TestBuildSourceFromParsedURL_NoLegacyFieldsForGitLab(t *testing.T) {
+func TestBuildSourceFromParsedURL_GitLabURL(t *testing.T) {
 	parsed, err := phora.ParseURL("gitlab.com/company/configs")
 	if err != nil {
 		t.Fatalf("ParseURL failed: %v", err)
@@ -295,15 +283,5 @@ func TestBuildSourceFromParsedURL_NoLegacyFieldsForGitLab(t *testing.T) {
 
 	if src.Git != "https://gitlab.com/company/configs.git" {
 		t.Errorf("Source.Git = %q, want %q", src.Git, "https://gitlab.com/company/configs.git")
-	}
-
-	if src.Host != "" {
-		t.Errorf("Source.Host = %q, want empty (legacy field should not be set)", src.Host)
-	}
-	if src.Owner != "" {
-		t.Errorf("Source.Owner = %q, want empty (legacy field should not be set)", src.Owner)
-	}
-	if src.Repo != "" {
-		t.Errorf("Source.Repo = %q, want empty (legacy field should not be set)", src.Repo)
 	}
 }

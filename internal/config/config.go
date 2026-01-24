@@ -14,6 +14,7 @@ import (
 )
 
 type Config struct {
+	Version   int                `toml:"version"`
 	Artifacts []string           `toml:"artifacts,omitempty"`
 	Hosts     map[string]Host    `toml:"hosts,omitempty"`
 	Manifest  *Manifest          `toml:"manifest,omitempty"`
@@ -78,13 +79,22 @@ func (m *Manifest) FilterDirectories(dirs []string) []string {
 }
 
 type Source struct {
-	Type   string `toml:"type,omitempty"`
-	Host   string `toml:"host,omitempty"`
-	Owner  string `toml:"owner,omitempty"`
-	Repo   string `toml:"repo,omitempty"`
+	Git    string `toml:"git,omitempty"`
+	Branch string `toml:"branch,omitempty"`
+	Tag    string `toml:"tag,omitempty"`
+	Rev    string `toml:"rev,omitempty"`
 	Path   string `toml:"path,omitempty"`
-	Ref    string `toml:"ref,omitempty"`
-	Global bool   `toml:"global,omitempty"`
+	Target string `toml:"target,omitempty"`
+}
+
+func (s *Source) ResolveRev() string {
+	if s.Branch != "" {
+		return s.Branch
+	}
+	if s.Tag != "" {
+		return s.Tag
+	}
+	return s.Rev
 }
 
 type ArtifactMapping struct {
@@ -133,7 +143,14 @@ func LoadFile(path string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	return ParseTOML(data)
+	cfg, err := ParseTOML(data)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Version != 1 {
+		return nil, fmt.Errorf("unsupported config version: %d (expected 1)", cfg.Version)
+	}
+	return cfg, nil
 }
 
 func Load(projectDir, globalConfigPath string) (*Config, error) {

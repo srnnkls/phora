@@ -103,8 +103,9 @@ func Detect(cfg *config.Config, opts Options) ([]DetectionResult, error) {
 		}
 
 		// Look up source config by path to determine namespace
-		sourceName, isGlobal := findSourceByPath(cfg, srcPath)
-		if sourceName != "" && !isGlobal {
+		// v1: all sources are namespaced (no global concept)
+		sourceName := findSourceByPath(cfg, srcPath)
+		if sourceName != "" {
 			for _, art := range arts {
 				art.Namespace = sourceName
 			}
@@ -434,15 +435,15 @@ func generateCommands(artifacts []*artifact.Artifact) []*artifact.Artifact {
 	return commands
 }
 
-func findSourceByPath(cfg *config.Config, srcPath string) (name string, isGlobal bool) {
+func findSourceByPath(cfg *config.Config, srcPath string) string {
 	expandedSrcPath := config.ExpandPath(srcPath)
 	for sourceName, src := range cfg.Sources {
 		expandedCfgPath := config.ExpandPath(src.Path)
 		if expandedCfgPath == expandedSrcPath {
-			return sourceName, src.Global
+			return sourceName
 		}
 	}
-	return "", false
+	return ""
 }
 
 func convertReferences(refs map[string]config.ReferenceConfig) map[string]transform.ReferenceConfig {

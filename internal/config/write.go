@@ -165,6 +165,7 @@ func AddExclusion(path string, harnessName string, artifactName string) error {
 		// If file doesn't exist, create new config
 		if os.IsNotExist(err) {
 			cfg = &Config{
+				Version: 1,
 				Harness: make(map[string]Harness),
 			}
 		} else {

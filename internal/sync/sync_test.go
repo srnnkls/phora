@@ -374,9 +374,7 @@ description: TDD workflow
 		Artifacts: []string{"skills"},
 		Sources: map[string]config.Source{
 			"company": {
-				Type:   "local",
-				Path:   srcDir,
-				Global: false,
+				Path: srcDir,
 			},
 		},
 		Harness: map[string]config.Harness{
@@ -413,7 +411,10 @@ description: TDD workflow
 	}
 }
 
-func TestDiscoverSetsEmptyNamespaceFromGlobalSource(t *testing.T) {
+// TestDiscoverSetsNamespaceFromV1Source verifies that ALL sources in v1 are namespaced.
+// (This test was previously TestDiscoverSetsEmptyNamespaceFromGlobalSource for v0,
+// but v1 removes the Global field - all sources are namespaced by their key.)
+func TestDiscoverSetsNamespaceFromV1Source(t *testing.T) {
 	srcDir := t.TempDir()
 	targetDir := t.TempDir()
 
@@ -431,9 +432,7 @@ description: TDD workflow
 		Artifacts: []string{"skills"},
 		Sources: map[string]config.Source{
 			"shared": {
-				Type:   "local",
-				Path:   srcDir,
-				Global: true,
+				Path: srcDir,
 			},
 		},
 		Harness: map[string]config.Harness{
@@ -462,22 +461,26 @@ description: TDD workflow
 	}
 
 	art := results[0].Artifacts[0]
-	if art.Namespace != "" {
-		t.Errorf("Namespace = %q, want empty (global source)", art.Namespace)
+	// v1: ALL sources are namespaced by their key
+	if art.Namespace != "shared" {
+		t.Errorf("Namespace = %q, want %q (v1: all sources namespaced)", art.Namespace, "shared")
 	}
-	if art.FullName() != "code-test" {
-		t.Errorf("FullName() = %q, want %q (bare name for global)", art.FullName(), "code-test")
+	if art.FullName() != "shared.code-test" {
+		t.Errorf("FullName() = %q, want %q", art.FullName(), "shared.code-test")
 	}
 }
 
-func TestDiscoverMultipleSourcesWithMixedGlobal(t *testing.T) {
-	globalSrcDir := t.TempDir()
+// TestDiscoverMultipleSources verifies that multiple sources are all namespaced in v1.
+// (This test was previously TestDiscoverMultipleSourcesWithMixedGlobal for v0,
+// but v1 removes the Global field - all sources are namespaced by their key.)
+func TestDiscoverMultipleSources(t *testing.T) {
+	sharedSrcDir := t.TempDir()
 	companySrcDir := t.TempDir()
 	targetDir := t.TempDir()
 
-	globalSkillDir := filepath.Join(globalSrcDir, "skills", "shared-skill")
-	os.MkdirAll(globalSkillDir, 0755)
-	os.WriteFile(filepath.Join(globalSkillDir, "SKILL.md"), []byte(`---
+	sharedSkillDir := filepath.Join(sharedSrcDir, "skills", "shared-skill")
+	os.MkdirAll(sharedSkillDir, 0755)
+	os.WriteFile(filepath.Join(sharedSkillDir, "SKILL.md"), []byte(`---
 name: shared-skill
 ---
 
@@ -497,14 +500,10 @@ name: internal-skill
 		Artifacts: []string{"skills"},
 		Sources: map[string]config.Source{
 			"shared": {
-				Type:   "local",
-				Path:   globalSrcDir,
-				Global: true,
+				Path: sharedSrcDir,
 			},
 			"company": {
-				Type:   "local",
-				Path:   companySrcDir,
-				Global: false,
+				Path: companySrcDir,
 			},
 		},
 		Harness: map[string]config.Harness{
@@ -515,7 +514,7 @@ name: internal-skill
 	}
 
 	opts := Options{
-		SourcePaths: []string{globalSrcDir, companySrcDir},
+		SourcePaths: []string{sharedSrcDir, companySrcDir},
 		Targets:     []string{"claude"},
 	}
 
@@ -541,11 +540,12 @@ name: internal-skill
 	if !ok {
 		t.Fatal("shared-skill artifact not found")
 	}
-	if sharedArt.Namespace != "" {
-		t.Errorf("shared-skill Namespace = %q, want empty (global source)", sharedArt.Namespace)
+	// v1: ALL sources are namespaced
+	if sharedArt.Namespace != "shared" {
+		t.Errorf("shared-skill Namespace = %q, want %q", sharedArt.Namespace, "shared")
 	}
-	if sharedArt.FullName() != "shared-skill" {
-		t.Errorf("shared-skill FullName() = %q, want %q", sharedArt.FullName(), "shared-skill")
+	if sharedArt.FullName() != "shared.shared-skill" {
+		t.Errorf("shared-skill FullName() = %q, want %q", sharedArt.FullName(), "shared.shared-skill")
 	}
 
 	internalArt, ok := artByName["internal-skill"]
@@ -578,9 +578,7 @@ description: TDD workflow
 		Artifacts: []string{"skills"},
 		Sources: map[string]config.Source{
 			"company": {
-				Type:   "local",
-				Path:   srcDir,
-				Global: false,
+				Path: srcDir,
 			},
 		},
 		Harness: map[string]config.Harness{
@@ -615,7 +613,10 @@ description: TDD workflow
 	}
 }
 
-func TestSyncGlobalSourceArtifactUsesBareName(t *testing.T) {
+// TestSyncSourceArtifactUsesFullName verifies that ALL sources in v1 use namespaced paths.
+// (This test was previously TestSyncGlobalSourceArtifactUsesBareName for v0,
+// but v1 removes the Global field - all sources are namespaced.)
+func TestSyncSourceArtifactUsesFullName(t *testing.T) {
 	srcDir := t.TempDir()
 	targetDir := t.TempDir()
 
@@ -633,9 +634,7 @@ description: TDD workflow
 		Artifacts: []string{"skills"},
 		Sources: map[string]config.Source{
 			"shared": {
-				Type:   "local",
-				Path:   srcDir,
-				Global: true,
+				Path: srcDir,
 			},
 		},
 		Harness: map[string]config.Harness{
@@ -659,20 +658,24 @@ description: TDD workflow
 		t.Errorf("Synced = %d, want 1", result.Synced)
 	}
 
-	expectedPath := filepath.Join(targetDir, "skills", "code-test", "SKILL.md")
+	// v1: ALL sources are namespaced, so path uses FullName
+	expectedPath := filepath.Join(targetDir, "skills", "shared.code-test", "SKILL.md")
 	if _, err := os.Stat(expectedPath); os.IsNotExist(err) {
-		t.Errorf("expected artifact at %s (bare name for global source), but file does not exist", expectedPath)
+		t.Errorf("expected artifact at %s (using FullName for namespaced source), but file does not exist", expectedPath)
 	}
 }
 
-func TestSyncMixedGlobalAndNamespacedOutputPaths(t *testing.T) {
-	globalSrcDir := t.TempDir()
+// TestSyncMultipleSourcesNamespacedOutputPaths verifies that ALL sources in v1 use namespaced paths.
+// (This test was previously TestSyncMixedGlobalAndNamespacedOutputPaths for v0,
+// but v1 removes the Global field - all sources are namespaced.)
+func TestSyncMultipleSourcesNamespacedOutputPaths(t *testing.T) {
+	sharedSrcDir := t.TempDir()
 	companySrcDir := t.TempDir()
 	targetDir := t.TempDir()
 
-	globalSkillDir := filepath.Join(globalSrcDir, "skills", "shared-skill")
-	os.MkdirAll(globalSkillDir, 0755)
-	os.WriteFile(filepath.Join(globalSkillDir, "SKILL.md"), []byte(`---
+	sharedSkillDir := filepath.Join(sharedSrcDir, "skills", "shared-skill")
+	os.MkdirAll(sharedSkillDir, 0755)
+	os.WriteFile(filepath.Join(sharedSkillDir, "SKILL.md"), []byte(`---
 name: shared-skill
 ---
 
@@ -692,14 +695,10 @@ name: internal-skill
 		Artifacts: []string{"skills"},
 		Sources: map[string]config.Source{
 			"shared": {
-				Type:   "local",
-				Path:   globalSrcDir,
-				Global: true,
+				Path: sharedSrcDir,
 			},
 			"company": {
-				Type:   "local",
-				Path:   companySrcDir,
-				Global: false,
+				Path: companySrcDir,
 			},
 		},
 		Harness: map[string]config.Harness{
@@ -710,7 +709,7 @@ name: internal-skill
 	}
 
 	opts := Options{
-		SourcePaths: []string{globalSrcDir, companySrcDir},
+		SourcePaths: []string{sharedSrcDir, companySrcDir},
 		Targets:     []string{"claude"},
 	}
 
@@ -723,19 +722,15 @@ name: internal-skill
 		t.Errorf("Synced = %d, want 2", result.Synced)
 	}
 
-	globalPath := filepath.Join(targetDir, "skills", "shared-skill", "SKILL.md")
-	if _, err := os.Stat(globalPath); os.IsNotExist(err) {
-		t.Errorf("global artifact not at expected path %s", globalPath)
+	// v1: ALL sources are namespaced
+	sharedPath := filepath.Join(targetDir, "skills", "shared.shared-skill", "SKILL.md")
+	if _, err := os.Stat(sharedPath); os.IsNotExist(err) {
+		t.Errorf("shared artifact not at expected path %s (should use FullName)", sharedPath)
 	}
 
-	namespacedPath := filepath.Join(targetDir, "skills", "company.internal-skill", "SKILL.md")
-	if _, err := os.Stat(namespacedPath); os.IsNotExist(err) {
-		t.Errorf("namespaced artifact not at expected path %s (should use FullName)", namespacedPath)
-	}
-
-	wrongNamespacedPath := filepath.Join(targetDir, "skills", "internal-skill", "SKILL.md")
-	if _, err := os.Stat(wrongNamespacedPath); err == nil {
-		t.Errorf("namespaced artifact at wrong path %s (should use FullName: company.internal-skill)", wrongNamespacedPath)
+	companyPath := filepath.Join(targetDir, "skills", "company.internal-skill", "SKILL.md")
+	if _, err := os.Stat(companyPath); os.IsNotExist(err) {
+		t.Errorf("company artifact not at expected path %s (should use FullName)", companyPath)
 	}
 }
 
@@ -757,9 +752,7 @@ description: TDD workflow
 		Artifacts: []string{"skills"},
 		Sources: map[string]config.Source{
 			"company": {
-				Type:   "local",
-				Path:   srcDir,
-				Global: false,
+				Path: srcDir,
 			},
 		},
 		Harness: map[string]config.Harness{

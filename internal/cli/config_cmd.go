@@ -83,10 +83,14 @@ func printConfig(cfg *config.Config) {
 	if len(cfg.Sources) > 0 {
 		fmt.Println("Sources:")
 		for _, src := range cfg.Sources {
+			rev := src.ResolveRev()
+			if rev == "" {
+				rev = "main"
+			}
 			if src.Path != "" {
-				fmt.Printf("  - %s (path: %s, ref: %s)\n", src.Repo, src.Path, src.Ref)
+				fmt.Printf("  - %s (path: %s, rev: %s)\n", src.Git, src.Path, rev)
 			} else {
-				fmt.Printf("  - %s (ref: %s)\n", src.Repo, src.Ref)
+				fmt.Printf("  - %s (rev: %s)\n", src.Git, rev)
 			}
 		}
 	}

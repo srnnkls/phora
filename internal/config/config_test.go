@@ -1,8 +1,10 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -10,6 +12,7 @@ func TestLoadConfig(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	configContent := `
+version = 1
 artifacts = ["skills", "commands", "agents"]
 
 [harness.claude]
@@ -143,6 +146,7 @@ func TestLoadWithDiscovery(t *testing.T) {
 	globalDir := filepath.Join(tmpDir, ".config", "phora")
 	os.MkdirAll(globalDir, 0755)
 	os.WriteFile(filepath.Join(globalDir, "config.toml"), []byte(`
+version = 1
 default_harnesses = ["claude"]
 
 [harness.claude]
@@ -155,6 +159,8 @@ model_strong = "opus"
 	projectDir := filepath.Join(tmpDir, "project")
 	os.MkdirAll(projectDir, 0755)
 	os.WriteFile(filepath.Join(projectDir, "phora.toml"), []byte(`
+version = 1
+
 [harness.claude]
 path = ".claude"
 
@@ -186,15 +192,15 @@ path = ".opencode"
 func TestMergeSources(t *testing.T) {
 	global := &Config{
 		Sources: map[string]Source{
-			"global/repo": {Repo: "https://github.com/global/repo.git", Path: "skills"},
+			"global/repo": {Git: "https://github.com/global/repo.git", Path: "skills"},
 		},
 		Harness: map[string]Harness{},
 	}
 
 	project := &Config{
 		Sources: map[string]Source{
-			"project/repo": {Repo: "https://github.com/project/repo.git"},
-			"global/repo":  {Repo: "https://github.com/global/repo.git", Path: "updated"}, // override
+			"project/repo": {Git: "https://github.com/project/repo.git"},
+			"global/repo":  {Git: "https://github.com/global/repo.git", Path: "updated"}, // override
 		},
 		Harness: map[string]Harness{},
 	}
@@ -220,13 +226,15 @@ func TestMergeSources(t *testing.T) {
 
 func TestLoadSources(t *testing.T) {
 	configContent := `
+version = 1
+
 [sources."owner/repo"]
-repo = "https://github.com/owner/repo.git"
+git = "https://github.com/owner/repo.git"
 path = "skills/claude"
-ref = "v1.0"
+branch = "v1.0"
 
 [sources."another/repo"]
-repo = "https://github.com/another/repo.git"
+git = "https://github.com/another/repo.git"
 `
 
 	tmpDir := t.TempDir()
@@ -246,97 +254,30 @@ repo = "https://github.com/another/repo.git"
 	if !ok {
 		t.Fatal("owner/repo source not found")
 	}
-	if ownerRepo.Repo != "https://github.com/owner/repo.git" {
-		t.Errorf("Sources[owner/repo].Repo = %q, want %q", ownerRepo.Repo, "https://github.com/owner/repo.git")
+	if ownerRepo.Git != "https://github.com/owner/repo.git" {
+		t.Errorf("Sources[owner/repo].Git = %q, want %q", ownerRepo.Git, "https://github.com/owner/repo.git")
 	}
 	if ownerRepo.Path != "skills/claude" {
 		t.Errorf("Sources[owner/repo].Path = %q, want %q", ownerRepo.Path, "skills/claude")
 	}
-	if ownerRepo.Ref != "v1.0" {
-		t.Errorf("Sources[owner/repo].Ref = %q, want %q", ownerRepo.Ref, "v1.0")
+	if ownerRepo.Branch != "v1.0" {
+		t.Errorf("Sources[owner/repo].Ref = %q, want %q", ownerRepo.Branch, "v1.0")
 	}
 
 	anotherRepo, ok := cfg.Sources["another/repo"]
 	if !ok {
 		t.Fatal("another/repo source not found")
 	}
-	if anotherRepo.Repo != "https://github.com/another/repo.git" {
-		t.Errorf("Sources[another/repo].Repo = %q, want %q", anotherRepo.Repo, "https://github.com/another/repo.git")
+	if anotherRepo.Git != "https://github.com/another/repo.git" {
+		t.Errorf("Sources[another/repo].Git = %q, want %q", anotherRepo.Git, "https://github.com/another/repo.git")
 	}
 }
 
-func TestLoadSourceWithGlobal(t *testing.T) {
-	configContent := `
-[sources."global-source"]
-repo = "https://github.com/owner/global-repo.git"
-global = true
-
-[sources."namespaced-source"]
-repo = "https://github.com/owner/namespaced-repo.git"
-`
-
-	tmpDir := t.TempDir()
-	configPath := filepath.Join(tmpDir, "phora.toml")
-	os.WriteFile(configPath, []byte(configContent), 0644)
-
-	cfg, err := LoadFile(configPath)
-	if err != nil {
-		t.Fatalf("LoadFile() error = %v", err)
-	}
-
-	globalSrc, ok := cfg.Sources["global-source"]
-	if !ok {
-		t.Fatal("global-source not found")
-	}
-	if !globalSrc.Global {
-		t.Error("Sources[global-source].Global = false, want true")
-	}
-
-	namespacedSrc, ok := cfg.Sources["namespaced-source"]
-	if !ok {
-		t.Fatal("namespaced-source not found")
-	}
-	if namespacedSrc.Global {
-		t.Error("Sources[namespaced-source].Global = true, want false (default)")
-	}
-}
-
-func TestMergeSourcesPreservesGlobal(t *testing.T) {
-	global := &Config{
-		Sources: map[string]Source{
-			"global/repo": {Repo: "https://github.com/global/repo.git", Global: true},
-		},
-		Harness: map[string]Harness{},
-	}
-
-	project := &Config{
-		Sources: map[string]Source{
-			"project/repo": {Repo: "https://github.com/project/repo.git", Global: false},
-		},
-		Harness: map[string]Harness{},
-	}
-
-	merged := Merge(global, project)
-
-	globalSrc, ok := merged.Sources["global/repo"]
-	if !ok {
-		t.Fatal("global/repo source not found in merged config")
-	}
-	if !globalSrc.Global {
-		t.Error("merged Sources[global/repo].Global = false, want true (should preserve global source's Global flag)")
-	}
-
-	projectSrc, ok := merged.Sources["project/repo"]
-	if !ok {
-		t.Fatal("project/repo source not found in merged config")
-	}
-	if projectSrc.Global {
-		t.Error("merged Sources[project/repo].Global = true, want false")
-	}
-}
 
 func TestLoadHarnessWithNewMappingStructure(t *testing.T) {
 	configContent := `
+version = 1
+
 [harness.claude]
 path = "~/.claude"
 
@@ -405,6 +346,8 @@ opus = "opus-for-skills"
 
 func TestOldMappingsFieldRemoved(t *testing.T) {
 	configContent := `
+version = 1
+
 [harness.test]
 path = "~/.test"
 
@@ -430,6 +373,8 @@ old-key = "old-value"
 
 func TestLoadHarnessWithToolsAndReferences(t *testing.T) {
 	configContent := `
+version = 1
+
 [harness.claude]
 path = "~/.claude/skills"
 
@@ -552,5 +497,90 @@ func TestMergeHarnessToolsAndReferences(t *testing.T) {
 	}
 	if tool.Output != "{{mapped}}" {
 		t.Errorf("merged References[tool].Output = %q, want %q", tool.Output, "{{mapped}}")
+	}
+}
+
+func TestSourceStructHasNoLegacyFields(t *testing.T) {
+	// This test verifies that the Source struct does NOT have legacy fields.
+	// If any of these fields exist, this test should fail.
+	legacyFields := []string{"Type", "Host", "Owner", "Repo", "Global"}
+
+	sourceType := reflect.TypeOf(Source{})
+	for _, fieldName := range legacyFields {
+		if _, found := sourceType.FieldByName(fieldName); found {
+			t.Errorf("Source struct still has legacy field %q - this field should be removed", fieldName)
+		}
+	}
+}
+
+func TestLoadFileRejectsConfigWithoutVersion(t *testing.T) {
+	configContent := `
+[sources."test/repo"]
+git = "https://github.com/test/repo.git"
+`
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "phora.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := LoadFile(configPath)
+	if err == nil {
+		t.Error("LoadFile() should return error for config without version field")
+	}
+}
+
+func TestLoadFileRejectsConfigWithInvalidVersion(t *testing.T) {
+	tests := []struct {
+		name    string
+		version int
+	}{
+		{"version 0", 0},
+		{"version 2", 2},
+		{"version 99", 99},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configContent := fmt.Sprintf(`
+version = %d
+
+[sources."test/repo"]
+git = "https://github.com/test/repo.git"
+`, tt.version)
+
+			tmpDir := t.TempDir()
+			configPath := filepath.Join(tmpDir, "phora.toml")
+			if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			_, err := LoadFile(configPath)
+			if err == nil {
+				t.Errorf("LoadFile() should return error for config with version = %d", tt.version)
+			}
+		})
+	}
+}
+
+func TestLoadFileAcceptsVersion1(t *testing.T) {
+	configContent := `
+version = 1
+
+[sources."test/repo"]
+git = "https://github.com/test/repo.git"
+`
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "phora.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadFile(configPath)
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v, want nil for version = 1", err)
+	}
+	if cfg.Version != 1 {
+		t.Errorf("cfg.Version = %d, want 1", cfg.Version)
 	}
 }

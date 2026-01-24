@@ -11,6 +11,7 @@ func TestWriteFile(t *testing.T) {
 	path := filepath.Join(tmpDir, "phora.toml")
 
 	cfg := &Config{
+		Version:   1,
 		Artifacts: []string{"skills"},
 		Harness: map[string]Harness{
 			"claude": {
@@ -50,6 +51,7 @@ func TestAddExclusion(t *testing.T) {
 
 	// Create initial config
 	cfg := &Config{
+		Version: 1,
 		Harness: map[string]Harness{
 			"claude": {
 				Path: "~/.claude",
@@ -94,6 +96,7 @@ func TestAddExclusionNewHarness(t *testing.T) {
 
 	// Start with empty config
 	cfg := &Config{
+		Version: 1,
 		Harness: map[string]Harness{},
 	}
 	WriteFile(path, cfg)
@@ -137,6 +140,7 @@ func TestRemoveExclusion(t *testing.T) {
 	path := filepath.Join(tmpDir, "phora.toml")
 
 	cfg := &Config{
+		Version: 1,
 		Harness: map[string]Harness{
 			"claude": {
 				Exclude: []string{"a", "b", "c"},
@@ -167,6 +171,7 @@ func TestAddSource(t *testing.T) {
 	path := filepath.Join(tmpDir, "phora.toml")
 
 	cfg := &Config{
+		Version: 1,
 		Harness: map[string]Harness{},
 	}
 	WriteFile(path, cfg)
@@ -194,6 +199,7 @@ func TestAddSourceOverride(t *testing.T) {
 	path := filepath.Join(tmpDir, "phora.toml")
 
 	cfg := &Config{
+		Version: 1,
 		Sources: map[string]Source{
 			"owner/repo": {Git: "https://github.com/owner/repo.git", Path: "skills"},
 		},
@@ -257,35 +263,6 @@ func TestAddSource_RejectsEmptyGit(t *testing.T) {
 		loaded, _ := LoadFile(path)
 		if _, exists := loaded.Sources["test-source"]; exists {
 			t.Error("Source with empty Git field should not be saved")
-		}
-	}
-}
-
-func TestAddSource_RejectsLegacyFormat(t *testing.T) {
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "phora.toml")
-
-	cfg := &Config{
-		Version: 1,
-		Harness: map[string]Harness{},
-	}
-	WriteFile(path, cfg)
-
-	src := Source{
-		Host:   "github.com",
-		Owner:  "owner",
-		Repo:   "repo",
-		Branch: "main",
-	}
-	err := AddSource(path, "legacy-source", src)
-	if err == nil {
-		t.Fatal("AddSource() should return error for legacy format (Host/Owner/Repo without Git)")
-	}
-
-	loaded, loadErr := LoadFile(path)
-	if loadErr == nil {
-		if _, exists := loaded.Sources["legacy-source"]; exists {
-			t.Error("Source with legacy format should not be saved")
 		}
 	}
 }
