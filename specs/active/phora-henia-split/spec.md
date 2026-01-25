@@ -1,10 +1,14 @@
 ---
 issue_type: Feature
 created: 2026-01-14
-status: Active
+status: Incomplete
 stage: active
 promoted: 2026-01-15
 claude_plan: .claude/plans/federated-imagining-moon.md
+incomplete_reason: |
+  Phase 2 (henia module) was created then deleted. Phase 4 (phora cleanup)
+  never executed. Phora still contains harness/artifact/transform/target/
+  reference/defaults packages (296 harness references across 19 Go files).
 ---
 
 # Phora/Henia Split

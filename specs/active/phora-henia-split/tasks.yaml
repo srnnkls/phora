@@ -135,10 +135,75 @@ tasks:
     active_form: Adding deprecation warnings
     depends_on: [SPLIT-021]
 
+  # Phase 4: Phora cleanup (NOT STARTED - henia was deleted before this phase)
+  - id: SPLIT-023
+    content: Remove internal/artifact package from phora (henia-only)
+    status: pending
+    active_form: Removing artifact package from phora
+    depends_on: [SPLIT-021]
+
+  - id: SPLIT-024
+    content: Remove internal/transform package from phora (henia-only)
+    status: pending
+    active_form: Removing transform package from phora
+    depends_on: [SPLIT-021]
+
+  - id: SPLIT-025
+    content: Remove internal/target package from phora (henia-only)
+    status: pending
+    active_form: Removing target package from phora
+    depends_on: [SPLIT-021]
+
+  - id: SPLIT-026
+    content: Remove internal/reference package from phora (henia-only)
+    status: pending
+    active_form: Removing reference package from phora
+    depends_on: [SPLIT-021]
+
+  - id: SPLIT-027
+    content: Remove internal/defaults package from phora (henia-only)
+    status: pending
+    active_form: Removing defaults package from phora
+    depends_on: [SPLIT-021]
+
+  - id: SPLIT-028
+    content: Remove Harness type and harness config from phora config
+    status: pending
+    active_form: Removing Harness from phora config
+    depends_on: [SPLIT-023, SPLIT-024, SPLIT-025, SPLIT-026, SPLIT-027]
+
+  - id: SPLIT-029
+    content: Remove internal/sync harness-specific logic (keep only git fetch)
+    status: pending
+    active_form: Cleaning up internal/sync
+    depends_on: [SPLIT-028]
+
+  - id: SPLIT-030
+    content: Remove phora deploy command (henia-only)
+    status: pending
+    active_form: Removing deploy command from phora CLI
+    depends_on: [SPLIT-028]
+
+  - id: SPLIT-031
+    content: Update phora CLI to be pure fetcher (add, sync, update, list only)
+    status: pending
+    active_form: Updating phora CLI commands
+    depends_on: [SPLIT-029, SPLIT-030]
+
+  - id: SPLIT-032
+    content: Verify phora is a pure git artifact fetcher with no harness references
+    status: pending
+    active_form: Verifying phora cleanup complete
+    depends_on: [SPLIT-031]
+
 meta:
   created: 2026-01-14
-  last_updated: 2026-01-15
-  progress: 22/22
+  last_updated: 2026-01-25
+  progress: 22/32
+  note: |
+    Phase 2 henia module was created then deleted (commit 931714c).
+    Phase 4 cleanup tasks were never executed - phora still contains
+    harness code that should have been removed.
 
 phases:
   - name: "Phase 1: Extract phora Library"
@@ -162,6 +227,10 @@ phases:
         - henia sync/deploy/update/add commands work
         - Tests pass
       verified: true
+      note: |
+        REVERTED - henia module was deleted in commit 931714c.
+        Packages were copied to henia (not moved), then henia deleted,
+        leaving phora unchanged as a monolith.
 
   - name: "Phase 3: Integration"
     task_ids: [SPLIT-021, SPLIT-022]
@@ -172,3 +241,16 @@ phases:
         - henia deploy writes to harnesses
         - Old phora commands show deprecation warnings
       verified: true
+      note: henia module was subsequently deleted
+
+  - name: "Phase 4: Phora Cleanup"
+    task_ids: [SPLIT-023, SPLIT-024, SPLIT-025, SPLIT-026, SPLIT-027, SPLIT-028, SPLIT-029, SPLIT-030, SPLIT-031, SPLIT-032]
+    checkpoint:
+      description: phora is a pure git artifact fetcher with no harness code
+      criteria:
+        - No Harness type in phora config
+        - No artifact/transform/target/reference/defaults packages
+        - No deploy command
+        - Zero harness references in codebase
+      verified: false
+      note: NOT STARTED - henia was deleted before cleanup began
