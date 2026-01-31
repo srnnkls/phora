@@ -45,6 +45,7 @@ A package manager for fetching, caching, and projecting artifacts from git sourc
 ```
 project/
 ├── phora.toml          # what you want
+├── phora.local.toml    # local overrides (NOT committed; optional)
 └── phora.lock          # what you got (generated)
 ~/.phora/
 ├── git/                # bare mirrors (invisible)
@@ -66,6 +67,34 @@ project/
 │       └── state.lock
 └── meta.json           # strategy cache, filesystem info
 ```
+
+### phora.local.toml (local overrides)
+
+`phora.local.toml` allows machine/user-specific overrides without modifying the shared project config.
+It is intended for:
+  * Local filesystem paths (e.g., local git checkouts)
+  * Local auth selection (e.g., tokens, ssh key locations)
+  * Local target paths (different OS/usernames)
+  * Development-mode deployment choices (e.g., link-mode for local sources)
+
+Hard rules:
+  * `phora.local.toml` MUST NOT be required for the project to function.
+  * `phora.local.toml` SHOULD be ignored by VCS (add to `.gitignore`).
+  * If present, `phora.local.toml` MUST be loaded after `phora.toml` and merged as an overlay.
+
+Config loading order (effective config):
+  1. Read `phora.toml`
+  2. If present, read `phora.local.toml`
+  3. Compute EffectiveConfig = merge(base, local_overlay)
+
+Merge semantics:
+  * Objects/tables merge recursively by key.
+  * Scalars in local overlay replace base values.
+  * Arrays in local overlay replace base arrays (no concatenation) unless explicitly documented otherwise.
+
+Operational note:
+  * `phora.lock` is generated from the EffectiveConfig.
+  * For debuggability, `phora status` SHOULD indicate when `phora.local.toml` was applied (e.g., "(local overrides active)").
 
 ## Architecture
 
@@ -139,6 +168,48 @@ path = "~/.cupcake/policies/claude"
 sources = ["loqui"]
 layout = { type = "prefixed", separator = "/" }
 ```
+
+### phora.local.toml (examples)
+
+Use cases:
+
+**1) Override a source to use a local checkout and live-link it (development workflow):**
+
+```toml
+# phora.local.toml (NOT committed)
+version = 1
+
+[sources.loqui]
+git = "/home/soeren/dev/loqui"   # local path override
+branch = "main"
+deploy = "link"                  # optional: link-mode for local dev
+```
+
+**2) Override target paths on a different OS/user:**
+
+```toml
+version = 1
+
+[targets.vscode]
+path = "C:/Users/Soeren/AppData/Roaming/Code/User"
+```
+
+**3) Override auth/token source:**
+
+```toml
+version = 1
+
+[hosts.github]
+auth = { type = "token", env = "GITHUB_TOKEN_WORK" }
+```
+
+Compatibility:
+  * Any key valid in `phora.toml` is valid in `phora.local.toml`.
+  * Unknown keys SHOULD error (to avoid silent misconfiguration).
+
+Optional CLI ergonomics (non-normative):
+  * `phora config --effective` prints EffectiveConfig after merges (for debugging).
+  * `phora sync --no-local` ignores `phora.local.toml` (for CI/repro runs).
 
 ### phora.lock
 
