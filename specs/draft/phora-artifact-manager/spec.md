@@ -35,6 +35,7 @@ A package manager for fetching, caching, and projecting artifacts from git sourc
 |`phora update [source]`                                     |Bump lock to latest, then sync                          |
 |`phora status`                                              |Show what's projected where                             |
 |`phora verify`                                              |Verify deployed files by hashing contents (cold path)   |
+|`phora where ...`                                           |Query global registry (where-used / deployments)        |
 |`phora eject <artifact> --source <source> --target <target>`|Stop managing, keep file (vendor)                       |
 |`phora clean`                                               |Garbage-collect unused cached snapshots                 |
 |`phora rebuild-registry`                                    |Rebuild global registry from lock + on-disk targets     |
@@ -1071,6 +1072,31 @@ Targets remain free of `.phora-*` files to avoid "manifest pollution" in tool-sc
 Registry record location (file backend v1):
 `~/.phora/state/targets/<target>/artifacts/<source>/<artifact>.toml`
 
+**Global Awareness (origin linkage)**
+
+Phora's registry is authoritative not only for "what is deployed", but also for "what cache snapshot was used".
+This enables:
+  * reverse lookup ("where is this used?")
+  * safe garbage collection of unused cache snapshots
+  * future content-addressed dedupe (CAS)
+
+Each registry record MUST contain an `[origin]` block that links the deployment to its cache snapshot.
+
+Canonical `cache_key` format (v1):
+```
+cache_key = "<source>/<commit>/<root>"
+```
+
+Where:
+  * `<source>` is the source name from config
+  * `<commit>` is the resolved commit hash from the lock
+  * `<root>` is the configured root path within the repo, normalized as:
+      - empty string if no root is configured
+      - slash-separated relative path with no leading slash otherwise
+
+NOTE (v1): matcher/policy are per-source configuration and are therefore implicit in `<source>`.
+If matcher/policy become deployment-varying in the future, `cache_key` MUST be extended to include them (e.g., config hash).
+
 Purpose:
 
 * Track provenance (source, commit, digest)
@@ -1091,6 +1117,11 @@ strategy = "copy"
 layout = "flat"
 allow_symlinks = false
 preserve_executable = true
+
+[origin]
+cache_key = "company-configs/def456789abc123/configs"
+# Optional redundancy (reserved for future CAS). In v1 this MUST equal record.digest.
+digest = "sha256:d4e5f6..."
 
 [[files]]
 path = "python.json"
@@ -1114,11 +1145,20 @@ pub struct ArtifactKey {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Origin {
+    /// Canonical v1 cache key: "<source>/<commit>/<root>"
+    pub cache_key: String,
+    /// Optional (reserved for CAS); in v1 MUST equal RegistryRecord.digest if present.
+    pub digest: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RegistryRecord {
     pub version: u32,
     pub key: ArtifactKey,
     pub commit: String,
     pub digest: String,
+    pub origin: Origin,
     pub projected_at: String,
     pub strategy: String,
     pub layout: String,
@@ -1142,6 +1182,11 @@ pub trait Registry {
     fn list_all(&self) -> Result<Vec<RegistryRecord>, Error>;
 }
 ```
+
+**Reverse lookup (v1):**
+  * FileRegistry MAY implement reverse lookups by scanning `list_all()` and filtering in-memory.
+  * This is acceptable in v1 because state records are small and count is expected to be manageable.
+  * Future backends (e.g., redb) MAY maintain secondary indexes for faster queries.
 
 ### FileRegistry (v1 default)
 
@@ -1809,13 +1854,23 @@ $ phora eject unknown-thing --source company --target vscode
 
 ## Operational Commands
 
-### phora clean
+### phora clean (smart GC)
 
-Garbage-collect cache snapshots not referenced by the active lockfile.
+Garbage-collect cache snapshots that are not referenced by any active deployment.
 
-* Default policy: remove unreferenced cache entries older than N days (default 30).
-* Supports `--dry-run`.
-* Note: removing cache reduces ability to heal without fetching, but does not break existing projections.
+**Mark:**
+  * Scan all registry records under `~/.phora/state/targets/**/artifacts/**.toml`
+  * Collect every referenced `record.origin.cache_key` into a set
+
+**Sweep:**
+  * Enumerate cache snapshots under `~/.phora/cache/`
+  * Delete snapshots whose corresponding `cache_key` is not in the marked set
+  * Implementations MAY also consider active lockfiles as additional roots (future), but registry is authoritative for deployed state.
+
+**Safety:**
+  * Default SHOULD be conservative (e.g., only remove unreferenced snapshots older than N days, default 30).
+  * Supports `--dry-run`.
+  * Note: removing cache reduces ability to heal without fetching, but does not break existing projections.
 
 ### phora rebuild-registry
 
@@ -1825,6 +1880,28 @@ Rebuild `~/.phora/state/...` from:
 2. Target filesystem scan at expected deployment paths
 
 Any mismatches become "Foreign" or "Modified" in status until next successful deploy.
+
+### phora where
+
+Query the global registry to answer "where is this used?" and related questions.
+
+**Inputs (any combination):**
+  * `phora where --digest <hash>`: find all deployments of this exact exported content digest
+  * `phora where --source <name>`: find all deployments from a source
+  * `phora where --artifact <name>`: find all deployments with this artifact name
+  * `phora where --cache-key <key>`: find all deployments that share the same cache snapshot origin
+
+**Behavior:**
+  * Reads `~/.phora/state/...` (authoritative).
+  * In v1, implementation MAY scan all state records and filter results in-memory.
+  * Output groups by (source, artifact) and lists target paths.
+
+**Example output:**
+```
+Artifact: company-skills/python (commit def456, digest sha256:...)
+  • ~/.config/nvim/lua/skills
+  • ~/work/agent-1/resources/skills
+```
 
 ### phora verify
 
