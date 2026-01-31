@@ -1,0 +1,274 @@
+spec: phora-targets
+code: TGT
+next_id: 30
+tasks:
+  # Phase 1: Config Schema
+  - id: TGT-001
+    content: Rename Source.Path to Source.Root in config.go and internal/config
+    status: pending
+    active_form: Renaming Source.Path to Source.Root
+
+  - id: TGT-002
+    content: Remove Source.Target field from config.go and internal/config
+    status: pending
+    active_form: Removing Source.Target field
+
+  - id: TGT-003
+    content: Add Target struct with Path, Mode, Sources fields
+    status: pending
+    active_form: Adding Target struct
+
+  - id: TGT-004
+    content: Add Config.Targets map[string]Target and validation
+    status: pending
+    active_form: Adding Config.Targets with validation
+    depends_on: [TGT-003]
+
+  # Phase 2: Cache Structure
+  - id: TGT-005
+    content: Change cache dir to ~/.phora/cache/<source>/<commit>/
+    status: pending
+    active_form: Restructuring cache directory
+
+  - id: TGT-006
+    content: Update client.go Fetch to use new cache structure
+    status: pending
+    active_form: Updating Fetch for new cache
+    depends_on: [TGT-005]
+
+  # Phase 3: Symlink/Copy Implementation
+  - id: TGT-007
+    content: Implement per-artifact symlink creation for mode=symlink
+    status: pending
+    active_form: Implementing symlink creation
+    depends_on: [TGT-006]
+
+  - id: TGT-008
+    content: Implement file copy for mode=copy
+    status: pending
+    active_form: Implementing copy mode
+    depends_on: [TGT-006]
+
+  - id: TGT-009
+    content: Add tilde expansion for Target.Path
+    status: pending
+    active_form: Adding tilde expansion
+    depends_on: [TGT-003]
+
+  # Phase 4: Sync Logic
+  - id: TGT-010
+    content: Implement target-driven sync (iterate targets, resolve sources)
+    status: pending
+    active_form: Implementing target-driven sync
+    depends_on: [TGT-004, TGT-007, TGT-008]
+
+  - id: TGT-011
+    content: Implement symlink drift detection
+    status: pending
+    active_form: Implementing symlink drift detection
+    depends_on: [TGT-007]
+
+  - id: TGT-012
+    content: Add TargetDeploy to lock file schema
+    status: pending
+    active_form: Extending lock file schema
+    depends_on: [TGT-010]
+
+  # Phase 5: CLI
+  - id: TGT-013
+    content: Add --target flag to phora sync command
+    status: pending
+    active_form: Adding --target flag
+    depends_on: [TGT-010]
+
+  - id: TGT-014
+    content: Update sync output to show per-target results
+    status: pending
+    active_form: Updating sync output
+    depends_on: [TGT-010]
+
+  # Phase 6: Platform & Edge Cases
+  - id: TGT-015
+    content: Detect symlink failure and warn with copy mode suggestion
+    status: pending
+    active_form: Adding symlink failure detection
+    depends_on: [TGT-007]
+
+  - id: TGT-016
+    content: Add --copy flag to phora sync for one-time copy override
+    status: pending
+    active_form: Adding --copy flag
+    depends_on: [TGT-013]
+
+  - id: TGT-017
+    content: Implement phora status with cache mutation detection
+    status: pending
+    active_form: Implementing phora status
+    depends_on: [TGT-012]
+
+  - id: TGT-018
+    content: Implement phora vendor command (symlink → editable copy)
+    status: pending
+    active_form: Implementing phora vendor
+    depends_on: [TGT-010]
+
+  # Phase 7: Remove Henia Packages
+  - id: TGT-019
+    content: Remove internal/transform package (template variables, key/value mappings, reference rewriting)
+    status: pending
+    active_form: Removing internal/transform
+    depends_on: [TGT-010]
+
+  - id: TGT-020
+    content: Remove internal/reference package (backtick reference parsing, used only by transform)
+    status: pending
+    active_form: Removing internal/reference
+    depends_on: [TGT-019]
+
+  - id: TGT-021
+    content: Remove internal/target package (HarnessTarget, harness directory writing)
+    status: pending
+    active_form: Removing internal/target
+    depends_on: [TGT-019]
+
+  - id: TGT-022
+    content: Remove internal/defaults package (embedded default config, only used by deprecated internal/config)
+    status: pending
+    active_form: Removing internal/defaults
+    depends_on: [TGT-019]
+
+  - id: TGT-023
+    content: Remove internal/manifest package (repo manifest generation)
+    status: pending
+    active_form: Removing internal/manifest
+    depends_on: [TGT-019]
+
+  - id: TGT-024
+    content: Remove internal/config package (deprecated, root phora.Config is canonical)
+    status: pending
+    active_form: Removing internal/config
+    depends_on: [TGT-020, TGT-021, TGT-022, TGT-023]
+
+  - id: TGT-025
+    content: Remove internal/lockfile package (deprecated, root phora.Lock is canonical)
+    status: pending
+    active_form: Removing internal/lockfile
+    depends_on: [TGT-024]
+
+  # Phase 8: Remove Henia CLI and Config Fields
+  - id: TGT-026
+    content: Remove deploy and init commands from internal/cli (henia-only, already deprecated)
+    status: pending
+    active_form: Removing deploy and init commands
+    depends_on: [TGT-024]
+
+  - id: TGT-027
+    content: Remove Harness struct and all harness fields from root config.go (GenerateCommandsFromSkills, ArtifactMappings, Variables, Tools, References, Structure)
+    status: pending
+    active_form: Removing Harness from root config
+    depends_on: [TGT-026]
+
+  - id: TGT-028
+    content: Remove pathmap.go and pathmap_test.go (dead code, rewrites ditched)
+    status: pending
+    active_form: Removing pathmap dead code
+    depends_on: [TGT-027]
+
+  - id: TGT-029
+    content: Verify zero harness/henia/rewrite/deploy/transform references in codebase
+    status: pending
+    active_form: Verifying clean codebase
+    depends_on: [TGT-028]
+
+meta:
+  created: 2026-01-25
+  last_updated: 2026-01-25
+  progress: 0/29
+
+phases:
+  - name: "Phase 1: Config Schema"
+    task_ids: [TGT-001, TGT-002, TGT-003, TGT-004]
+    checkpoint:
+      description: Config parses with new targets schema
+      criteria:
+        - Source.Root replaces Source.Path
+        - Source.Target removed
+        - Target struct with Path, Mode, Sources
+        - Config.Targets map works
+        - Validation catches undefined source references
+      verified: false
+
+  - name: "Phase 2: Cache Structure"
+    task_ids: [TGT-005, TGT-006]
+    checkpoint:
+      description: Cache uses content-addressable structure
+      criteria:
+        - Cache at ~/.phora/cache/<source>/<commit>/
+        - Fetch populates new cache location
+      verified: false
+
+  - name: "Phase 3: Symlink/Copy"
+    task_ids: [TGT-007, TGT-008, TGT-009]
+    checkpoint:
+      description: Both deployment modes work
+      criteria:
+        - Symlink mode creates per-artifact symlinks
+        - Copy mode copies files
+        - Tilde expansion works in Target.Path
+      verified: false
+
+  - name: "Phase 4: Sync Logic"
+    task_ids: [TGT-010, TGT-011, TGT-012]
+    checkpoint:
+      description: Target-driven sync deploys from resolved sources
+      criteria:
+        - Targets resolve their source list
+        - nil sources = all sources
+        - Drift detected for symlinks
+        - Lock file tracks target deployments
+      verified: false
+
+  - name: "Phase 5: CLI"
+    task_ids: [TGT-013, TGT-014]
+    checkpoint:
+      description: CLI supports target filtering
+      criteria:
+        - --target flag filters sync
+        - Output shows per-target results
+      verified: false
+
+  - name: "Phase 6: Platform & Edge Cases"
+    task_ids: [TGT-015, TGT-016, TGT-017, TGT-018]
+    checkpoint:
+      description: Platform edge cases handled
+      criteria:
+        - Symlink failure warns with copy suggestion
+        - --copy flag overrides mode per-invocation
+        - phora status detects cache mutations
+        - phora vendor converts symlink to editable copy
+      verified: false
+
+  - name: "Phase 7: Remove Henia Packages"
+    task_ids: [TGT-019, TGT-020, TGT-021, TGT-022, TGT-023, TGT-024, TGT-025]
+    checkpoint:
+      description: All henia-only internal packages removed
+      criteria:
+        - internal/transform removed
+        - internal/reference removed
+        - internal/target removed
+        - internal/defaults removed
+        - internal/manifest removed
+        - internal/config removed (deprecated)
+        - internal/lockfile removed (deprecated)
+      verified: false
+
+  - name: "Phase 8: Remove Henia CLI and Config Fields"
+    task_ids: [TGT-026, TGT-027, TGT-028, TGT-029]
+    checkpoint:
+      description: Zero henia/harness references in codebase
+      criteria:
+        - deploy and init commands removed
+        - Harness struct and all fields removed from root config
+        - pathmap.go removed
+        - grep -ri 'harness\|henia\|rewrite\|deploy.*henia\|GenerateCommands' returns zero Go hits
+      verified: false

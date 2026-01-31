@@ -1,0 +1,109 @@
+spec: phora-targets
+version: 1
+
+metadata:
+  issue_type: Feature
+  created: 2026-01-25
+  taxonomy_coverage:
+    scope: complete
+    behavior: complete
+    data_model: complete
+    constraints: complete
+    edge_cases: partial
+    integration: complete
+    terminology: complete
+
+review_config:
+  reasoning_effort: medium
+  reviewers:
+    - type: claude
+      model: opus
+    - type: opencode
+      model: openai/gpt-5.2
+    - type: opencode
+      model: google/gemini-3-pro-preview
+
+markers:
+  - id: M001
+    status: open
+    category: Edge Cases
+    question: "What happens if target path is a file (not directory)?"
+    context: "Target.Path expects a directory, but user might specify a file path"
+    options:
+      - "Error: target path must be a directory"
+      - "Auto-create parent directory and treat path as directory"
+    resolution: null
+
+  - id: M002
+    status: open
+    category: Edge Cases
+    question: "How to handle symlink to symlink chains?"
+    context: "If cache location is itself a symlink, should we follow or error?"
+    options:
+      - "Follow symlinks in cache (transparent)"
+      - "Error if cache contains symlinks"
+      - "Create symlink to final target (resolve chain)"
+    resolution: null
+
+  - id: M003
+    status: open
+    category: Constraints
+    question: "Should empty targets array be allowed?"
+    context: "Source with targets = [] would fetch but not deploy anywhere"
+    options:
+      - "Allow (fetch-only mode)"
+      - "Error: at least one target required"
+      - "Warning but continue"
+    resolution: null
+
+acceptance_tests:
+  config_parsing:
+    - name: "Parse targets array"
+      given: 'source with targets = ["a", "b"]'
+      when: "config loaded"
+      then: "Source.Targets contains both"
+      status: pending
+
+    - name: "Default mode is symlink"
+      given: "target without mode"
+      when: "sync runs"
+      then: "mode defaults to symlink"
+      status: pending
+
+    - name: "Undefined target error"
+      given: "source references undefined target"
+      when: "config validated"
+      then: "error returned"
+      status: pending
+
+  sync_behavior:
+    - name: "Symlink mode creates symlinks"
+      given: 'mode = "symlink"'
+      when: "sync completes"
+      then: "target contains symlinks to cache"
+      status: pending
+
+    - name: "Copy mode copies files"
+      given: 'mode = "copy"'
+      when: "sync completes"
+      then: "target contains copied files"
+      status: pending
+
+    - name: "Lazy sync skips unchanged"
+      given: "unchanged source digest"
+      when: "sync runs"
+      then: "source skipped"
+      status: pending
+
+  drift_detection:
+    - name: "Deleted symlink is drift"
+      given: "user deleted symlink"
+      when: "sync runs without --force"
+      then: "error reported"
+      status: pending
+
+    - name: "Symlink updated on new commit"
+      given: "symlink points to old commit"
+      when: "sync runs"
+      then: "symlink updated"
+      status: pending

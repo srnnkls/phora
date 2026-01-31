@@ -1,0 +1,60 @@
+spec: phora-targets
+version: 1
+
+# Phase 1: Config Schema (TGT-001, TGT-002, TGT-003 can start in parallel)
+TGT-001: []                    # Source.Path → Root rename
+TGT-002: []                    # Source.Target removal
+TGT-003: []                    # Target struct
+TGT-004: [TGT-003]            # Config.Targets map + validation
+
+# Phase 2: Cache Structure (can start in parallel with Phase 1)
+TGT-005: []                    # Cache dir change
+TGT-006: [TGT-005]            # Fetch update
+
+# Phase 3: Symlink/Copy (depends on cache)
+TGT-007: [TGT-006]            # Symlink impl
+TGT-008: [TGT-006]            # Copy impl
+TGT-009: [TGT-003]            # Tilde expansion
+
+# Phase 4: Sync Logic (depends on config + symlink/copy)
+TGT-010: [TGT-004, TGT-007, TGT-008]  # Target-driven sync
+TGT-011: [TGT-007]            # Drift detection
+TGT-012: [TGT-010]            # Lock file extension
+
+# Phase 5: CLI (depends on sync)
+TGT-013: [TGT-010]            # --target flag
+TGT-014: [TGT-010]            # Output formatting
+
+# Phase 6: Platform & Edge Cases
+TGT-015: [TGT-007]            # Symlink failure detection
+TGT-016: [TGT-013]            # --copy flag
+TGT-017: [TGT-012]            # phora status
+TGT-018: [TGT-010]            # phora vendor
+
+# Phase 7: Remove Henia Packages (depends on new sync working)
+TGT-019: [TGT-010]            # Remove internal/transform
+TGT-020: [TGT-019]            # Remove internal/reference (depends on transform gone)
+TGT-021: [TGT-019]            # Remove internal/target (depends on transform gone)
+TGT-022: [TGT-019]            # Remove internal/defaults
+TGT-023: [TGT-019]            # Remove internal/manifest
+TGT-024: [TGT-020, TGT-021, TGT-022, TGT-023]  # Remove internal/config (after all dependents gone)
+TGT-025: [TGT-024]            # Remove internal/lockfile
+
+# Phase 8: Remove Henia CLI and Config Fields
+TGT-026: [TGT-024]            # Remove deploy + init commands
+TGT-027: [TGT-026]            # Remove Harness struct from root config
+TGT-028: [TGT-027]            # Remove pathmap.go
+TGT-029: [TGT-028]            # Final verification: zero legacy references
+
+# Parallelization:
+# Batch 1: TGT-001, TGT-002, TGT-003, TGT-005 (all independent)
+# Batch 2: TGT-004, TGT-006, TGT-009
+# Batch 3: TGT-007, TGT-008
+# Batch 4: TGT-010, TGT-011, TGT-015
+# Batch 5: TGT-012, TGT-013, TGT-014, TGT-018, TGT-019
+# Batch 6: TGT-016, TGT-017, TGT-020, TGT-021, TGT-022, TGT-023
+# Batch 7: TGT-024
+# Batch 8: TGT-025, TGT-026
+# Batch 9: TGT-027
+# Batch 10: TGT-028
+# Batch 11: TGT-029
