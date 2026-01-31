@@ -31,9 +31,10 @@ A package manager for fetching, caching, and projecting artifacts from git sourc
 
 |Command                                                     |Purpose                                                 |
 |------------------------------------------------------------|--------------------------------------------------------|
+|`phora add <url>`                                           |Parse URL, add source to config                         |
 |`phora sync`                                                |Fetch sources + project to targets                      |
 |`phora update [source]`                                     |Bump lock to latest, then sync                          |
-|`phora status`                                              |Show what's projected where                             |
+|`phora list`                                                |Show configured sources and deployment state            |
 |`phora verify`                                              |Verify deployed files by hashing contents (cold path)   |
 |`phora where ...`                                           |Query global registry (where-used / deployments)        |
 |`phora eject <artifact> --source <source> --target <target>`|Stop managing, keep file (vendor)                       |
@@ -95,7 +96,7 @@ Merge semantics:
 
 Operational note:
   * `phora.lock` is generated from the EffectiveConfig.
-  * For debuggability, `phora status` SHOULD indicate when `phora.local.toml` was applied (e.g., "(local overrides active)").
+  * For debuggability, `phora list` SHOULD indicate when `phora.local.toml` was applied (e.g., "(local overrides active)").
 
 ## Architecture
 
@@ -286,6 +287,8 @@ pub struct Config {
 
 #[derive(Debug, Deserialize)]
 pub struct Host {
+    /// URL template for git operations. Supports: {owner}, {repo}, {ref}, {path}
+    pub git_url: Option<String>,
     pub auth: Option<AuthConfig>,
 }
 
@@ -1101,7 +1104,7 @@ Purpose:
 
 * Track provenance (source, commit, digest)
 * Enable fast modification detection
-* Support `phora status`, future `phora diff`, and `phora clean` / GC
+* Support `phora list`, future `phora diff`, and `phora clean` / GC
 
 Example record:
 
@@ -1127,6 +1130,7 @@ digest = "sha256:d4e5f6..."
 path = "python.json"
 size = 12345
 mtime = 1738329296
+sha256 = "9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d..."  # for phora verify
 ```
 
 ### Registry Interface (pluggable backend)
@@ -1172,6 +1176,8 @@ pub struct ManifestFile {
     pub path: PathBuf,
     pub size: u64,
     pub mtime: u64,
+    /// Content hash for `phora verify`. Computed at projection time.
+    pub sha256: String,
 }
 
 pub trait Registry {
@@ -1375,11 +1381,11 @@ For `Flat` and `BySource`, the effective separator is an empty string and MUST N
 **Rationale: size/mtime over content hashing (stat-first drift detection)**
 
 Phora prioritizes a "feels instant" UX on the hot path (status checks and sync preflight).
-Many real-world artifacts contain thousands of files; re-hashing all content would make `phora status`
+Many real-world artifacts contain thousands of files; re-hashing all content would make `phora list`
 and routine drift checks noticeably slower as total deployed size grows.
 
 Design:
-  * Hot path (`phora status`, sync drift checks): use `stat` (size + mtime) per file
+  * Hot path (`phora list`, sync drift checks): use `stat` (size + mtime) per file
   * Cold path (`phora verify`): optionally hash file contents for maximum correctness
 
 Why `stat` is preferred on the hot path:
@@ -1503,10 +1509,44 @@ pub fn check_artifact_state(
 }
 ```
 
+### Interactive Conflict Resolution
+
+When `phora sync` encounters Modified or Foreign artifacts in interactive mode (TTY detected), it prompts the user:
+
+```
+⚠ Modified locally: snippets
+    python.json (size changed)
+    new-file.txt (added)
+
+  [s]kip  [o]verwrite  [e]ject  [a]bort?
+```
+
+**Options:**
+  * **Skip (s)**: Leave local files, don't update this artifact (default for Modified)
+  * **Overwrite (o)**: Replace with upstream version (equivalent to `--force` for this artifact)
+  * **Eject (e)**: Mark as ejected, keep local files, stop managing
+  * **Abort (a)**: Stop sync entirely, make no changes
+
+**For Foreign content:**
+```
+⚠ Foreign content at: ~/.config/nvim/snippets
+  Directory exists but is not managed by Phora.
+
+  [s]kip  [o]verwrite  [a]bort?
+```
+
+**Batch mode (`--force` or non-TTY):**
+  * `--force`: Overwrite all conflicts without prompting
+  * Non-interactive (CI, piped): Skip all conflicts, log warnings
+
+**Remembering choices:**
+  * `--skip-all`: Skip all conflicts for this run
+  * Future: persist skip/eject choices to config
+
 ## Sync Flow
 
 ```rust
-pub fn sync(config: &Config, lock: Option<Lock>, force: bool) -> Result<Lock, Error> {
+pub fn sync(config: &Config, lock: Option<Lock>, force: bool, interactive: bool) -> Result<Lock, Error> {
     let git = GitBackend::new(phora_dir().join("git"));
     let cache = Cache::new(phora_dir().join("git"), phora_dir().join("cache"));
     let registry: Box<dyn Registry> = Box::new(FileRegistry::open(phora_dir().join("state"))?);
@@ -1762,10 +1802,10 @@ pub fn eject(
 
 **To restore:** delete the ejected files, run `phora sync`.
 
-## Status Output
+## List Output
 
 ```
-$ phora status
+$ phora list
 
 Sources:
   dotfiles         main (abc123) ✓ cached
@@ -1849,10 +1889,83 @@ $ phora eject unknown-thing --source company --target vscode
   Source: company
   Artifact: unknown-thing
 
-  Run `phora status` to see managed artifacts.
+  Run `phora list` to see managed artifacts.
 ```
 
 ## Operational Commands
+
+### phora add
+
+Add a source to `phora.toml` by parsing a URL or shorthand.
+
+**Usage:**
+```
+phora add <url> [--name <name>] [--branch <branch>] [--tag <tag>] [--root <path>]
+```
+
+**URL Parsing:**
+
+Phora supports multiple URL formats and expands them using host templates:
+
+| Input | Parsed As |
+|-------|-----------|
+| `owner/repo` | GitHub shorthand → `https://github.com/owner/repo.git` |
+| `owner/repo/path/to/dir` | GitHub + root → git + `root = "path/to/dir"` |
+| `github.com/owner/repo` | Full host shorthand |
+| `https://github.com/owner/repo` | Full URL |
+| `https://github.com/owner/repo/tree/main/path` | URL with branch + root extraction |
+| `gitlab.com/owner/repo` | GitLab (uses host template) |
+| `git@github.com:owner/repo.git` | SSH URL |
+
+**Host Templates:**
+
+Hosts can define URL templates for shorthand expansion:
+
+```toml
+[hosts.github]
+git_url = "https://github.com/{owner}/{repo}.git"
+auth = { type = "token", env = "GITHUB_TOKEN" }
+
+[hosts.gitlab]
+git_url = "https://gitlab.com/{owner}/{repo}.git"
+auth = { type = "ssh" }
+
+[hosts.company]
+git_url = "https://git.company.com/{owner}/{repo}.git"
+auth = { type = "token", env = "COMPANY_GIT_TOKEN" }
+```
+
+Template variables: `{owner}`, `{repo}`, `{ref}`, `{path}`
+
+**Default hosts (built-in):**
+  * `github` → `https://github.com/{owner}/{repo}.git`
+  * `gitlab` → `https://gitlab.com/{owner}/{repo}.git`
+
+**Behavior:**
+  1. Parse URL to extract: host, owner, repo, ref (branch/tag), path (root)
+  2. Look up host template (or use default)
+  3. Generate source name (default: `repo` or `owner-repo` if collision)
+  4. Append to `phora.toml`:
+     ```toml
+     [sources.<name>]
+     git = "<expanded-url>"
+     branch = "<ref>"      # if detected
+     root = "<path>"       # if detected
+     ```
+  5. Print added source for confirmation
+
+**Examples:**
+```
+$ phora add srnnkls/loqui
+Added source 'loqui':
+  git = "https://github.com/srnnkls/loqui.git"
+
+$ phora add https://github.com/company/configs/tree/main/editor --name editor-config
+Added source 'editor-config':
+  git = "https://github.com/company/configs.git"
+  branch = "main"
+  root = "editor"
+```
 
 ### phora clean (smart GC)
 
@@ -1909,12 +2022,19 @@ Correctness-first verification of deployed artifacts by hashing file contents.
 
 Properties:
   * Intended as a cold path (audit/CI / "suspect corruption") rather than default interactive status.
-  * Uses registry records to know which (target, source, artifact) are managed and which files are expected.
+  * Uses `sha256` hashes stored in registry records (computed at projection time).
+  * Works independently of cache state — verify succeeds even if cache is GC'd.
   * Reports mismatches as Modified-like output, but backed by content hashes rather than size/mtime heuristics.
+
+Algorithm:
+  1. Load registry record for each managed artifact
+  2. For each file in `record.files`, hash deployed file content
+  3. Compare against stored `sha256`
+  4. Report mismatches
 
 Notes:
   * Hashing reads file contents; runtime scales with deployed size.
-  * `phora verify` is explicitly opt-in so `phora status` remains instant.
+  * `phora verify` is explicitly opt-in so `phora list` remains instant.
 
 ### phora check-match --source <source> <path>
 
@@ -1965,10 +2085,10 @@ fs2 = "0.4"  # file locks for ~/.phora/state/locks/state.lock (or equivalent)
 * When `phora sync --force`
 * Then local changes overwritten
 * Given user added symlink to managed artifact, `allow_symlinks=false`
-* When `phora status`
+* When `phora list`
 * Then shows [modified] with symlink path listed (no crash)
 * Given directory exists at target path with no registry record
-* When `phora status`
+* When `phora list`
 * Then shows [foreign]
 
 ### Update
@@ -2022,7 +2142,7 @@ fs2 = "0.4"  # file locks for ~/.phora/state/locks/state.lock (or equivalent)
 * When `phora verify`
 * Then Phora hashes deployed file contents and reports any mismatches
 * Given a file's content changes without changing size and mtime
-* When `phora status`
+* When `phora list`
 * Then Phora MAY still report Clean (stat-first limitation)
 * And when `phora verify`
 * Then Phora MUST report a mismatch
@@ -2031,11 +2151,11 @@ fs2 = "0.4"  # file locks for ~/.phora/state/locks/state.lock (or equivalent)
 
 * Given managed artifact is deployed
 
-  * When `phora status`
+  * When `phora list`
   * Then state is read from `~/.phora/state/...` and no `.phora-*` files appear in target directories
 * Given user deletes `~/.phora/state` (or migrates machines)
 
-  * When `phora status`
+  * When `phora list`
   * Then artifacts on disk appear as `[foreign/untracked]` (no crash)
 * Given artifact previously ejected and later deleted by user
 
