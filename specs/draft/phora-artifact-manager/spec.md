@@ -34,6 +34,7 @@ A package manager for fetching, caching, and projecting artifacts from git sourc
 |`phora sync`                                                |Fetch sources + project to targets                      |
 |`phora update [source]`                                     |Bump lock to latest, then sync                          |
 |`phora status`                                              |Show what's projected where                             |
+|`phora verify`                                              |Verify deployed files by hashing contents (cold path)   |
 |`phora eject <artifact> --source <source> --target <target>`|Stop managing, keep file (vendor)                       |
 |`phora clean`                                               |Garbage-collect unused cached snapshots                 |
 |`phora rebuild-registry`                                    |Rebuild global registry from lock + on-disk targets     |
@@ -1255,6 +1256,43 @@ For `Flat` and `BySource`, the effective separator is an empty string and MUST N
 * **Write operations** (export/projection): Strict — error on disallowed symlinks
 * **Read operations** (status/sync check): Soft — treat as Modified, don't crash
 
+**Rationale: size/mtime over content hashing (stat-first drift detection)**
+
+Phora prioritizes a "feels instant" UX on the hot path (status checks and sync preflight).
+Many real-world artifacts contain thousands of files; re-hashing all content would make `phora status`
+and routine drift checks noticeably slower as total deployed size grows.
+
+Design:
+  * Hot path (`phora status`, sync drift checks): use `stat` (size + mtime) per file
+  * Cold path (`phora verify`): optionally hash file contents for maximum correctness
+
+Why `stat` is preferred on the hot path:
+  * Speed: `stat` is a metadata read (one syscall per file) and does not read file contents.
+  * Scaling: hashing requires reading every byte; runtime scales with total artifact size.
+  * Predictability: results are stable and fast across reflink/copy strategies.
+
+Failure mode (why this is acceptable by default):
+  * Size/mtime can miss changes when content is modified while preserving both:
+      - identical byte length AND
+      - unchanged mtime (including explicit timestamp restoration), OR
+      - edits within the filesystem's timestamp resolution (some filesystems can be coarse).
+    This is considered an acceptable edge case for a developer tool managing config artifacts.
+
+Why this matches the broader ecosystem:
+  * Git uses the same optimization strategy for `git status`: it checks file stats first and only
+    re-hashes content when something looks "suspicious" (stat mismatch).
+  * Phora applies the same stat-cache validation pattern in its registry-driven design.
+
+Relationship to atomic swaps:
+  * Phora deploys via stage + atomic directory swap. It replaces directories rather than patching
+    files in-place, reducing the risk of partial writes. Drift detection primarily covers user edits
+    between syncs, not incomplete deployments.
+
+`phora verify`:
+  * Provides a correctness-first mode that hashes deployed content and reports any mismatches.
+  * Intended for "I suspect corruption/tampering" workflows, CI checks, or audits—not the default
+    interactive path.
+
 ```rust
 pub enum ArtifactState {
     /// Matches cache exactly
@@ -1717,6 +1755,19 @@ Rebuild `~/.phora/state/...` from:
 
 Any mismatches become "Foreign" or "Modified" in status until next successful deploy.
 
+### phora verify
+
+Correctness-first verification of deployed artifacts by hashing file contents.
+
+Properties:
+  * Intended as a cold path (audit/CI / "suspect corruption") rather than default interactive status.
+  * Uses registry records to know which (target, source, artifact) are managed and which files are expected.
+  * Reports mismatches as Modified-like output, but backed by content hashes rather than size/mtime heuristics.
+
+Notes:
+  * Hashing reads file contents; runtime scales with deployed size.
+  * `phora verify` is explicitly opt-in so `phora status` remains instant.
+
 ### phora check-match --source <source> <path>
 
 Debug include/exclude matching. Prints which patterns match:
@@ -1816,6 +1867,17 @@ fs2 = "0.4"  # file locks for ~/.phora/state/locks/state.lock (or equivalent)
 * Given artifact projected via copy
 * When `phora sync` runs again
 * Then no false "modified" detection (mtime matches)
+
+### Verify (content hashing, cold path)
+
+* Given a managed artifact is deployed and registry indicates Clean
+* When `phora verify`
+* Then Phora hashes deployed file contents and reports any mismatches
+* Given a file's content changes without changing size and mtime
+* When `phora status`
+* Then Phora MAY still report Clean (stat-first limitation)
+* And when `phora verify`
+* Then Phora MUST report a mismatch
 
 ### Registry (global state, no target metadata)
 
