@@ -13,6 +13,13 @@ var (
 	syncForce bool
 )
 
+func shortSHA(sha string) string {
+	if len(sha) > 8 {
+		return sha[:8]
+	}
+	return sha
+}
+
 var syncCmd = &cobra.Command{
 	Use:   "sync",
 	Short: "Sync configured sources to local targets",
@@ -60,6 +67,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 		lock = &phora.Lock{}
 	}
 
+	driftBySource := make(map[string][]phora.DriftResult)
 	var driftedFiles []phora.DriftResult
 	for name, source := range cfg.Sources {
 		targetDir := source.Target
@@ -71,6 +79,9 @@ func runSync(cmd *cobra.Command, args []string) error {
 		drift, err := phora.DetectDrift(lock, name, targetPath)
 		if err != nil {
 			return fmt.Errorf("detect drift for %s: %w", name, err)
+		}
+		if len(drift) > 0 {
+			driftBySource[name] = drift
 		}
 		driftedFiles = append(driftedFiles, drift...)
 	}
@@ -91,18 +102,29 @@ func runSync(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Overwriting %d drifted file(s) (--force)\n", len(driftedFiles))
 	}
 
-	client := phora.NewClient(cfg, phora.WithDataDir(dataDir))
+	client := phora.NewClient(cfg, phora.WithDataDir(dataDir), phora.WithLockDir(cwd))
 
-	results, err := client.FetchAll()
-	if err != nil {
-		return fmt.Errorf("fetch sources: %w", err)
+	var synced int
+	for name, source := range cfg.Sources {
+		sourceDrift := driftBySource[name]
+		hasDrift := len(sourceDrift) > 0
+
+		if !source.NeedsSync(name, lock) && !(syncForce && hasDrift) {
+			fmt.Printf("Skipping %s (config unchanged)\n", name)
+			continue
+		}
+
+		result, err := client.Fetch(name)
+		if err != nil {
+			return fmt.Errorf("fetch sources: %w", err)
+		}
+		fmt.Printf("Synced %s (%s)\n", result.Name, shortSHA(result.Commit))
+		synced++
 	}
 
-	for _, result := range results {
-		fmt.Printf("Synced %s (%s)\n", result.Name, result.Commit[:8])
+	if synced > 0 {
+		fmt.Printf("Synced %d source(s)\n", synced)
 	}
-
-	fmt.Printf("Synced %d source(s)\n", len(results))
 	return nil
 }
 
@@ -129,9 +151,9 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("update source: %w", err)
 		}
 		if result.OldSHA != "" && result.OldSHA != result.NewSHA {
-			fmt.Printf("Updated %s: %s -> %s\n", result.SourceName, result.OldSHA[:8], result.NewSHA[:8])
+			fmt.Printf("Updated %s: %s -> %s\n", result.SourceName, shortSHA(result.OldSHA), shortSHA(result.NewSHA))
 		} else {
-			fmt.Printf("Updated %s: %s\n", result.SourceName, result.NewSHA[:8])
+			fmt.Printf("Updated %s: %s\n", result.SourceName, shortSHA(result.NewSHA))
 		}
 		return nil
 	}
@@ -143,9 +165,9 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 
 	for _, result := range results {
 		if result.OldSHA != "" && result.OldSHA != result.NewSHA {
-			fmt.Printf("Updated %s: %s -> %s\n", result.SourceName, result.OldSHA[:8], result.NewSHA[:8])
+			fmt.Printf("Updated %s: %s -> %s\n", result.SourceName, shortSHA(result.OldSHA), shortSHA(result.NewSHA))
 		} else {
-			fmt.Printf("Updated %s: %s\n", result.SourceName, result.NewSHA[:8])
+			fmt.Printf("Updated %s: %s\n", result.SourceName, shortSHA(result.NewSHA))
 		}
 	}
 

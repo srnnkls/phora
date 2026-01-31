@@ -1,9 +1,9 @@
 package cli
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
+	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/srnnkls/phora"
@@ -34,24 +34,21 @@ func updateSource(cfg *phora.Config, sourceName string, lockDir string) (*Update
 		oldSHA = oldLock.SHA
 	}
 
-	newSHA := generateSHA(sourceName, time.Now())
-	newDigest := source.Digest()
-
-	ref := source.Branch
-	if ref == "" {
-		ref = source.Tag
-	}
-	if ref == "" {
-		ref = source.Rev
-	}
+	ref := source.ResolveRev()
 	if ref == "" {
 		ref = "main"
 	}
 
+	newSHA, err := resolveRefToSHA(source.Git, ref)
+	if err != nil {
+		return nil, fmt.Errorf("resolving ref %q for source %q: %w", ref, sourceName, err)
+	}
+	newDigest := source.Digest()
+
 	newSourceLock := phora.SourceLock{
 		Name:      sourceName,
 		Repo:      extractRepoFromGit(source.Git),
-		Ref:       ref,
+		Rev:       ref,
 		SHA:       newSHA,
 		Digest:    newDigest,
 		FetchedAt: time.Now(),
@@ -83,10 +80,33 @@ func updateAllSources(cfg *phora.Config, lockDir string) ([]UpdateResult, error)
 	return results, nil
 }
 
-func generateSHA(sourceName string, t time.Time) string {
-	data := fmt.Sprintf("%s-%d", sourceName, t.UnixNano())
-	hash := sha256.Sum256([]byte(data))
-	return hex.EncodeToString(hash[:20])
+func resolveRefToSHA(gitURL, ref string) (string, error) {
+	if gitURL == "" {
+		return "", fmt.Errorf("git URL is empty")
+	}
+
+	cmd := exec.Command("git", "ls-remote", gitURL, ref)
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("git ls-remote failed: %w", err)
+	}
+
+	lines := strings.TrimSpace(string(output))
+	if lines == "" {
+		return "", fmt.Errorf("ref %q not found in %s", ref, gitURL)
+	}
+
+	parts := strings.Fields(lines)
+	if len(parts) < 1 {
+		return "", fmt.Errorf("unexpected git ls-remote output: %q", lines)
+	}
+
+	sha := parts[0]
+	if len(sha) != 40 {
+		return "", fmt.Errorf("invalid SHA length %d: %q", len(sha), sha)
+	}
+
+	return sha, nil
 }
 
 func extractRepoFromGit(gitURL string) string {

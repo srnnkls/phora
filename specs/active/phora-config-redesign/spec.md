@@ -207,7 +207,7 @@ version = 1
 [[sources]]
 name = "shared"                      # Source key from config
 repo = "company/shared"              # Resolved repo identifier
-ref = "v1.0"                         # Original ref from config
+rev = "v1.0"                         # Original ref from config
 sha = "a1b2c3d4e5f6..."              # Resolved git commit SHA
 digest = "8f3a2b..."                  # SHA256 of source config (JSON with sorted keys)
 fetched_at = 2026-01-18T10:00:00Z
@@ -225,7 +225,7 @@ size = 2048
 | `version` | integer | yes | Lock format version (currently 1) |
 | `sources[].name` | string | yes | Source key from config |
 | `sources[].repo` | string | yes | Resolved repo identifier |
-| `sources[].ref` | string | yes | Original ref from config (branch/tag/rev value) |
+| `sources[].rev` | string | yes | Original ref from config (branch/tag/rev value) |
 | `sources[].sha` | string | yes | Resolved git commit SHA (40-char hex) |
 | `sources[].digest` | string | yes | SHA256 of source config (64-char hex) |
 | `sources[].fetched_at` | datetime | yes | ISO 8601 timestamp of last fetch |

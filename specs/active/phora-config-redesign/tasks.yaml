@@ -82,10 +82,41 @@ tasks:
     status: completed
     active_form: Documenting phora add CLI
 
+  # Phase 7: CLI Integration Fixes (from spec review)
+  - id: FIX-001
+    content: Update add.go to use phora.Source and write v1 config format
+    status: completed
+    active_form: Updating add.go to use phora.Source
+
+  - id: FIX-002
+    content: Implement real git ref resolution in update.go (replace fake SHA)
+    status: completed
+    active_form: Implementing real git ref resolution
+
+  - id: FIX-003
+    content: Wire up NeedsSync() in sync.go for lazy sync
+    status: completed
+    active_form: Wiring up NeedsSync for lazy sync
+
+  - id: FIX-004
+    content: Make sync --force selective (only overwrite drifted files)
+    status: completed
+    active_form: Making sync --force selective
+
+  - id: FIX-005
+    content: Set Version=1 in lock file Save() and remove legacy Repos field
+    status: completed
+    active_form: Fixing lock file version handling
+
+  - id: FIX-006
+    content: Add ValidatePath call in client.go Fetch method
+    status: completed
+    active_form: Adding ValidatePath to Fetch
+
 meta:
   created: 2026-01-18
-  last_updated: 2026-01-20
-  progress: 17/17
+  last_updated: 2026-01-22
+  progress: 23/23
 
 phases:
   - name: "Phase 1: Config Format"
@@ -148,4 +179,17 @@ phases:
         - phora update re-resolves refs and updates lock
         - phora sync detects drift and errors without --force
         - phora add CLI contract documented
+      verified: false
+
+  - name: "Phase 7: CLI Integration Fixes"
+    task_ids: [FIX-001, FIX-002, FIX-003, FIX-004, FIX-005, FIX-006]
+    checkpoint:
+      description: CLI commands use consolidated types correctly
+      criteria:
+        - phora add writes v1 config with phora.Source
+        - phora update resolves real SHA from git
+        - phora sync uses NeedsSync() for lazy sync
+        - sync --force only overwrites drifted files
+        - Lock file saves with version=1
+        - ValidatePath called during fetch
       verified: false

@@ -13,7 +13,7 @@ func TestConfig_FieldsExist(t *testing.T) {
 			"github": {GitURL: "https://github.com/{owner}/{repo}.git"},
 		},
 		Sources: map[string]Source{
-			"company": {Repo: "company/shared-skills"},
+			"company": {Git: "https://github.com/company/shared-skills.git"},
 		},
 	}
 
@@ -37,97 +37,23 @@ func TestHost_GitURLField(t *testing.T) {
 
 func TestSource_FieldsExist(t *testing.T) {
 	source := Source{
-		Repo:           "owner/repo-name",
-		Ref:            "main",
+		Git:            "https://github.com/owner/repo-name.git",
+		Branch:         "main",
 		Path:           "subdirectory",
 		IgnoreManifest: true,
-		Paths: map[string]string{
-			"my-skill": "custom/location/my-skill",
-		},
 	}
 
-	if source.Repo != "owner/repo-name" {
-		t.Errorf("Repo = %q, want %q", source.Repo, "owner/repo-name")
+	if source.Git != "https://github.com/owner/repo-name.git" {
+		t.Errorf("Git = %q, want %q", source.Git, "https://github.com/owner/repo-name.git")
 	}
-	if source.Ref != "main" {
-		t.Errorf("Ref = %q, want %q", source.Ref, "main")
+	if source.Branch != "main" {
+		t.Errorf("Branch = %q, want %q", source.Branch, "main")
 	}
 	if source.Path != "subdirectory" {
 		t.Errorf("Path = %q, want %q", source.Path, "subdirectory")
 	}
 	if !source.IgnoreManifest {
 		t.Error("IgnoreManifest should be true")
-	}
-	if source.Paths == nil {
-		t.Error("Paths should not be nil")
-	}
-	if source.Paths["my-skill"] != "custom/location/my-skill" {
-		t.Errorf("Paths[my-skill] = %q, want %q", source.Paths["my-skill"], "custom/location/my-skill")
-	}
-}
-
-func TestSource_ParseRepo(t *testing.T) {
-	tests := []struct {
-		name      string
-		repo      string
-		wantOwner string
-		wantRepo  string
-		wantErr   bool
-	}{
-		{
-			name:      "valid owner/repo",
-			repo:      "owner/repo-name",
-			wantOwner: "owner",
-			wantRepo:  "repo-name",
-			wantErr:   false,
-		},
-		{
-			name:      "org with dashes",
-			repo:      "my-company/shared-skills",
-			wantOwner: "my-company",
-			wantRepo:  "shared-skills",
-			wantErr:   false,
-		},
-		{
-			name:    "missing slash",
-			repo:    "invalid-repo",
-			wantErr: true,
-		},
-		{
-			name:    "empty string",
-			repo:    "",
-			wantErr: true,
-		},
-		{
-			name:    "too many slashes",
-			repo:    "owner/repo/extra",
-			wantErr: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			source := Source{Repo: tt.repo}
-			owner, repo, err := source.ParseRepo()
-
-			if tt.wantErr {
-				if err == nil {
-					t.Errorf("ParseRepo() should return error for %q", tt.repo)
-				}
-				return
-			}
-
-			if err != nil {
-				t.Errorf("ParseRepo() unexpected error: %v", err)
-				return
-			}
-			if owner != tt.wantOwner {
-				t.Errorf("owner = %q, want %q", owner, tt.wantOwner)
-			}
-			if repo != tt.wantRepo {
-				t.Errorf("repo = %q, want %q", repo, tt.wantRepo)
-			}
-		})
 	}
 }
 
@@ -141,12 +67,9 @@ func TestLoadConfig_FromTOMLFile(t *testing.T) {
 git_url = "https://github.com/{owner}/{repo}.git"
 
 [sources.company]
-repo = "company/shared-skills"
-ref = "main"
+git = "https://github.com/company/shared-skills.git"
+branch = "main"
 ignore_manifest = false
-
-[sources.company.paths]
-"my-skill" = "custom/location/my-skill"
 `
 	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
 		t.Fatalf("failed to write test config: %v", err)
@@ -172,17 +95,14 @@ ignore_manifest = false
 	if !ok {
 		t.Error("Sources[company] not found")
 	} else {
-		if source.Repo != "company/shared-skills" {
-			t.Errorf("Sources[company].Repo = %q, want %q", source.Repo, "company/shared-skills")
+		if source.Git != "https://github.com/company/shared-skills.git" {
+			t.Errorf("Sources[company].Git = %q, want %q", source.Git, "https://github.com/company/shared-skills.git")
 		}
-		if source.Ref != "main" {
-			t.Errorf("Sources[company].Ref = %q, want %q", source.Ref, "main")
+		if source.Branch != "main" {
+			t.Errorf("Sources[company].Branch = %q, want %q", source.Branch, "main")
 		}
 		if source.IgnoreManifest {
 			t.Error("Sources[company].IgnoreManifest should be false")
-		}
-		if source.Paths["my-skill"] != "custom/location/my-skill" {
-			t.Errorf("Sources[company].Paths[my-skill] = %q, want %q", source.Paths["my-skill"], "custom/location/my-skill")
 		}
 	}
 }
@@ -194,7 +114,7 @@ func TestLoadConfig_FileNotFound(t *testing.T) {
 	}
 }
 
-func TestSource_DefaultRefIsMain(t *testing.T) {
+func TestSource_ResolveRevEmpty(t *testing.T) {
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "phora.toml")
 
@@ -213,61 +133,26 @@ repo = "owner/repo"
 	}
 
 	source := cfg.Sources["minimal"]
-	if source.Ref != "main" {
-		t.Errorf("default Ref = %q, want %q", source.Ref, "main")
+	if source.ResolveRev() != "" {
+		t.Errorf("ResolveRev() = %q, want empty string", source.ResolveRev())
 	}
 }
 
-func TestConfig_ValidateRepoFormat(t *testing.T) {
-	tests := []struct {
-		name    string
-		repo    string
-		wantErr bool
-	}{
-		{"valid", "owner/repo", false},
-		{"valid with dashes", "my-org/my-repo", false},
-		{"missing slash", "invalid", true},
-		{"empty", "", true},
-		{"extra slash", "owner/repo/extra", true},
-		{"leading slash", "/owner/repo", true},
-		{"trailing slash", "owner/repo/", true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := &Config{
-				Sources: map[string]Source{
-					"test": {Repo: tt.repo, Ref: "main"},
-				},
-			}
-			err := cfg.Validate()
-			if tt.wantErr && err == nil {
-				t.Errorf("Validate() should return error for repo %q", tt.repo)
-			}
-			if !tt.wantErr && err != nil {
-				t.Errorf("Validate() unexpected error for repo %q: %v", tt.repo, err)
-			}
-		})
-	}
-}
-
-func TestConfig_ValidateHostExists(t *testing.T) {
+func TestConfig_ValidateGitRequired(t *testing.T) {
 	cfg := &Config{
-		Hosts: map[string]Host{
-			"github": {GitURL: "https://github.com/{owner}/{repo}.git"},
-		},
 		Sources: map[string]Source{
-			"valid": {Repo: "owner/repo", Ref: "main", Host: "github"},
+			"test": {Branch: "main"},
 		},
 	}
 
-	if err := cfg.Validate(); err != nil {
-		t.Errorf("Validate() should pass for valid host reference: %v", err)
+	err := cfg.Validate()
+	if err == nil {
+		t.Error("Validate() should return error when git is missing")
 	}
 
-	cfg.Sources["invalid"] = Source{Repo: "owner/repo", Ref: "main", Host: "nonexistent"}
-	if err := cfg.Validate(); err == nil {
-		t.Error("Validate() should return error for nonexistent host reference")
+	cfg.Sources["test"] = Source{Git: "https://github.com/owner/repo.git", Branch: "main"}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate() should pass when git is set: %v", err)
 	}
 }
 
@@ -285,20 +170,17 @@ func TestConfig_ZeroValue(t *testing.T) {
 func TestSource_ZeroValue(t *testing.T) {
 	var source Source
 
-	if source.Repo != "" {
-		t.Error("zero value Repo should be empty")
+	if source.Git != "" {
+		t.Error("zero value Git should be empty")
 	}
-	if source.Ref != "" {
-		t.Error("zero value Ref should be empty")
+	if source.Branch != "" {
+		t.Error("zero value Branch should be empty")
 	}
 	if source.Path != "" {
 		t.Error("zero value Path should be empty")
 	}
 	if source.IgnoreManifest {
 		t.Error("zero value IgnoreManifest should be false")
-	}
-	if source.Paths != nil {
-		t.Error("zero value Paths should be nil")
 	}
 }
 
@@ -324,17 +206,6 @@ repo = "owner/repo"
 	_, err := LoadConfig(configPath)
 	if err == nil {
 		t.Error("LoadConfig() should return error for malformed TOML")
-	}
-}
-
-func TestSource_HostField(t *testing.T) {
-	source := Source{
-		Repo: "owner/repo",
-		Host: "github",
-	}
-
-	if source.Host != "github" {
-		t.Errorf("Host = %q, want %q", source.Host, "github")
 	}
 }
 
@@ -606,7 +477,7 @@ func TestConfig_ValidateRefMutualExclusivity_BranchAndTag(t *testing.T) {
 	cfg := &Config{
 		Sources: map[string]Source{
 			"test": {
-				Repo:   "company/repo",
+				Git:    "https://github.com/company/repo.git",
 				Branch: "main",
 				Tag:    "v1.0",
 			},
@@ -622,7 +493,7 @@ func TestConfig_ValidateRefMutualExclusivity_BranchAndRev(t *testing.T) {
 	cfg := &Config{
 		Sources: map[string]Source{
 			"test": {
-				Repo:   "company/repo",
+				Git:    "https://github.com/company/repo.git",
 				Branch: "main",
 				Rev:    "abc123",
 			},
@@ -638,7 +509,7 @@ func TestConfig_ValidateRefMutualExclusivity_TagAndRev(t *testing.T) {
 	cfg := &Config{
 		Sources: map[string]Source{
 			"test": {
-				Repo: "company/repo",
+				Git: "https://github.com/company/repo.git",
 				Tag:  "v1.0",
 				Rev:  "abc123",
 			},
@@ -654,7 +525,7 @@ func TestConfig_ValidateRefMutualExclusivity_AllThree(t *testing.T) {
 	cfg := &Config{
 		Sources: map[string]Source{
 			"test": {
-				Repo:   "company/repo",
+				Git:    "https://github.com/company/repo.git",
 				Branch: "main",
 				Tag:    "v1.0",
 				Rev:    "abc123",
@@ -671,7 +542,7 @@ func TestConfig_ValidateRefMutualExclusivity_OnlyBranch(t *testing.T) {
 	cfg := &Config{
 		Sources: map[string]Source{
 			"test": {
-				Repo:   "company/repo",
+				Git:    "https://github.com/company/repo.git",
 				Branch: "main",
 			},
 		},
@@ -686,7 +557,7 @@ func TestConfig_ValidateRefMutualExclusivity_OnlyTag(t *testing.T) {
 	cfg := &Config{
 		Sources: map[string]Source{
 			"test": {
-				Repo: "company/repo",
+				Git: "https://github.com/company/repo.git",
 				Tag:  "v1.0",
 			},
 		},
@@ -701,7 +572,7 @@ func TestConfig_ValidateRefMutualExclusivity_OnlyRev(t *testing.T) {
 	cfg := &Config{
 		Sources: map[string]Source{
 			"test": {
-				Repo: "company/repo",
+				Git: "https://github.com/company/repo.git",
 				Rev:  "abc123",
 			},
 		},
@@ -716,43 +587,13 @@ func TestConfig_ValidateRefMutualExclusivity_None(t *testing.T) {
 	cfg := &Config{
 		Sources: map[string]Source{
 			"test": {
-				Repo: "company/repo",
+				Git: "https://github.com/company/repo.git",
 			},
 		},
 	}
 	err := cfg.Validate()
 	if err != nil {
 		t.Errorf("Validate() should not return error when no ref fields are specified: %v", err)
-	}
-}
-
-func TestConfig_ValidateGitRepoMutualExclusivity(t *testing.T) {
-	cfg := &Config{
-		Sources: map[string]Source{
-			"test": {
-				Git:    "https://github.com/owner/repo.git",
-				Repo:   "owner/repo",
-				Branch: "main",
-			},
-		},
-	}
-	err := cfg.Validate()
-	if err == nil {
-		t.Error("Validate() should return error when both git and repo are specified")
-	}
-}
-
-func TestConfig_ValidateRequireGitOrRepo(t *testing.T) {
-	cfg := &Config{
-		Sources: map[string]Source{
-			"test": {
-				Branch: "main",
-			},
-		},
-	}
-	err := cfg.Validate()
-	if err == nil {
-		t.Error("Validate() should return error when neither git nor repo is specified")
 	}
 }
 
@@ -806,8 +647,8 @@ tag = "v1.0"
 	}
 
 	source := cfg.Sources["test"]
-	if source.Ref != "" {
-		t.Errorf("Ref should be empty when tag is specified, got %q", source.Ref)
+	if source.Branch != "" {
+		t.Errorf("Ref should be empty when tag is specified, got %q", source.Branch)
 	}
 	if source.Tag != "v1.0" {
 		t.Errorf("Tag = %q, want %q", source.Tag, "v1.0")
@@ -1128,7 +969,7 @@ repo = "company/shared-skills"
 func TestMergeConfigs(t *testing.T) {
 	global := &Config{
 		Sources: map[string]Source{
-			"global-src": {Repo: "company/global", Ref: "main"},
+			"global-src": {Git: "https://github.com/company/global.git", Branch: "main"},
 		},
 		Harness: map[string]Harness{
 			"claude": {Path: ".claude", Structure: "flat"},
@@ -1137,7 +978,7 @@ func TestMergeConfigs(t *testing.T) {
 
 	project := &Config{
 		Sources: map[string]Source{
-			"project-src": {Repo: "company/project", Ref: "main"},
+			"project-src": {Git: "https://github.com/company/project.git", Branch: "main"},
 		},
 		Harness: map[string]Harness{
 			"claude": {Structure: "nested"},

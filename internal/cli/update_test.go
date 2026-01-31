@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,12 +13,13 @@ func TestUpdateCommand_ResolvesRefToNewSHA(t *testing.T) {
 	tmpDir := t.TempDir()
 	lockDir := tmpDir
 
+	// Use real public repo for testing
 	cfg := &phora.Config{
 		Version: 1,
 		Sources: map[string]phora.Source{
 			"shared": {
-				Git:    "https://github.com/company/shared.git",
-				Branch: "main",
+				Git:    "https://github.com/go-git/go-billy.git",
+				Branch: "master",
 			},
 		},
 	}
@@ -28,8 +31,8 @@ func TestUpdateCommand_ResolvesRefToNewSHA(t *testing.T) {
 		Sources: []phora.SourceLock{
 			{
 				Name:      "shared",
-				Repo:      "company/shared",
-				Ref:       "main",
+				Repo:      "go-git/go-billy",
+				Rev:       "master",
 				SHA:       oldSHA,
 				Digest:    (&src).Digest(),
 				FetchedAt: time.Now().Add(-24 * time.Hour),
@@ -61,8 +64,8 @@ func TestUpdateCommand_UpdatesLockDigest(t *testing.T) {
 		Version: 1,
 		Sources: map[string]phora.Source{
 			"shared": {
-				Git:    "https://github.com/company/shared.git",
-				Branch: "main",
+				Git:    "https://github.com/go-git/go-billy.git",
+				Branch: "master",
 			},
 		},
 	}
@@ -73,8 +76,8 @@ func TestUpdateCommand_UpdatesLockDigest(t *testing.T) {
 		Sources: []phora.SourceLock{
 			{
 				Name:      "shared",
-				Repo:      "company/shared",
-				Ref:       "main",
+				Repo:      "go-git/go-billy",
+				Rev:       "master",
 				SHA:       "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 				Digest:    oldDigest,
 				FetchedAt: time.Now().Add(-24 * time.Hour),
@@ -115,12 +118,12 @@ func TestUpdateCommand_SpecificSource(t *testing.T) {
 		Version: 1,
 		Sources: map[string]phora.Source{
 			"source-a": {
-				Git:    "https://github.com/org/repo-a.git",
-				Branch: "main",
+				Git:    "https://github.com/go-git/go-billy.git",
+				Branch: "master",
 			},
 			"source-b": {
-				Git:    "https://github.com/org/repo-b.git",
-				Branch: "main",
+				Git:    "https://github.com/go-git/go-git.git",
+				Branch: "master",
 			},
 		},
 	}
@@ -136,16 +139,16 @@ func TestUpdateCommand_SpecificSource(t *testing.T) {
 		Sources: []phora.SourceLock{
 			{
 				Name:      "source-a",
-				Repo:      "org/repo-a",
-				Ref:       "main",
+				Repo:      "go-git/go-billy",
+				Rev:       "master",
 				SHA:       oldSHA_A,
 				Digest:    (&srcA).Digest(),
 				FetchedAt: now,
 			},
 			{
 				Name:      "source-b",
-				Repo:      "org/repo-b",
-				Ref:       "main",
+				Repo:      "go-git/go-git",
+				Rev:       "master",
 				SHA:       oldSHA_B,
 				Digest:    (&srcB).Digest(),
 				FetchedAt: now,
@@ -183,12 +186,12 @@ func TestUpdateCommand_AllSources(t *testing.T) {
 		Version: 1,
 		Sources: map[string]phora.Source{
 			"source-a": {
-				Git:    "https://github.com/org/repo-a.git",
-				Branch: "main",
+				Git:    "https://github.com/go-git/go-billy.git",
+				Branch: "master",
 			},
 			"source-b": {
-				Git:    "https://github.com/org/repo-b.git",
-				Branch: "develop",
+				Git:    "https://github.com/go-git/go-git.git",
+				Branch: "master",
 			},
 		},
 	}
@@ -204,16 +207,16 @@ func TestUpdateCommand_AllSources(t *testing.T) {
 		Sources: []phora.SourceLock{
 			{
 				Name:      "source-a",
-				Repo:      "org/repo-a",
-				Ref:       "main",
+				Repo:      "go-git/go-billy",
+				Rev:       "master",
 				SHA:       oldSHA_A,
 				Digest:    (&srcA).Digest(),
 				FetchedAt: now,
 			},
 			{
 				Name:      "source-b",
-				Repo:      "org/repo-b",
-				Ref:       "develop",
+				Repo:      "go-git/go-git",
+				Rev:       "master",
 				SHA:       oldSHA_B,
 				Digest:    (&srcB).Digest(),
 				FetchedAt: now,
@@ -258,8 +261,8 @@ func TestUpdateCommand_SourceNotFound(t *testing.T) {
 		Version: 1,
 		Sources: map[string]phora.Source{
 			"existing": {
-				Git:    "https://github.com/org/repo.git",
-				Branch: "main",
+				Git:    "https://github.com/go-git/go-billy.git",
+				Branch: "master",
 			},
 		},
 	}
@@ -302,8 +305,8 @@ func TestUpdateCommand_UpdatesLockSHA(t *testing.T) {
 		Version: 1,
 		Sources: map[string]phora.Source{
 			"shared": {
-				Git:    "https://github.com/company/shared.git",
-				Branch: "main",
+				Git:    "https://github.com/go-git/go-billy.git",
+				Branch: "master",
 			},
 		},
 	}
@@ -315,8 +318,8 @@ func TestUpdateCommand_UpdatesLockSHA(t *testing.T) {
 		Sources: []phora.SourceLock{
 			{
 				Name:      "shared",
-				Repo:      "company/shared",
-				Ref:       "main",
+				Repo:      "go-git/go-billy",
+				Rev:       "master",
 				SHA:       oldSHA,
 				Digest:    (&src).Digest(),
 				FetchedAt: time.Now().Add(-24 * time.Hour),
@@ -348,4 +351,149 @@ func TestUpdateCommand_UpdatesLockSHA(t *testing.T) {
 	if sourceLock.SHA == oldSHA {
 		t.Errorf("lock SHA should be updated from old value %q", oldSHA)
 	}
+}
+
+func TestUpdateSource_SHA_IsDeterministic(t *testing.T) {
+	tmpDir := t.TempDir()
+	lockDir := tmpDir
+
+	cfg := &phora.Config{
+		Version: 1,
+		Sources: map[string]phora.Source{
+			"shared": {
+				Git:    "https://github.com/hashicorp/go-getter.git",
+				Branch: "master",
+			},
+		},
+	}
+
+	result1, err := updateSource(cfg, "shared", lockDir)
+	if err != nil {
+		t.Fatalf("first updateSource failed: %v", err)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+
+	result2, err := updateSource(cfg, "shared", lockDir)
+	if err != nil {
+		t.Fatalf("second updateSource failed: %v", err)
+	}
+
+	if result1.SHA != result2.SHA {
+		t.Errorf("SHA is not deterministic: first call returned %q, second call returned %q; "+
+			"expected same SHA for same source+ref (SHA should not depend on timestamp)",
+			result1.SHA, result2.SHA)
+	}
+}
+
+func TestUpdateSource_SHA_IsValid40CharHex(t *testing.T) {
+	tmpDir := t.TempDir()
+	lockDir := tmpDir
+
+	cfg := &phora.Config{
+		Version: 1,
+		Sources: map[string]phora.Source{
+			"shared": {
+				Git:    "https://github.com/hashicorp/go-getter.git",
+				Branch: "master",
+			},
+		},
+	}
+
+	result, err := updateSource(cfg, "shared", lockDir)
+	if err != nil {
+		t.Fatalf("updateSource failed: %v", err)
+	}
+
+	if len(result.SHA) != 40 {
+		t.Errorf("SHA length = %d, want 40 (git commit SHAs are 40 hex characters)", len(result.SHA))
+	}
+
+	for i, c := range result.SHA {
+		isHex := (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+		if !isHex {
+			t.Errorf("SHA contains invalid hex character %q at position %d", c, i)
+		}
+	}
+}
+
+func TestUpdateSource_SHA_MatchesGitLsRemote(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping network-dependent test in short mode")
+	}
+
+	tmpDir := t.TempDir()
+	lockDir := tmpDir
+
+	cfg := &phora.Config{
+		Version: 1,
+		Sources: map[string]phora.Source{
+			"shared": {
+				Git:    "https://github.com/hashicorp/go-getter.git",
+				Branch: "master",
+			},
+		},
+	}
+
+	result, err := updateSource(cfg, "shared", lockDir)
+	if err != nil {
+		t.Fatalf("updateSource failed: %v", err)
+	}
+
+	expectedSHA := gitLsRemote(t, "https://github.com/hashicorp/go-getter.git", "refs/heads/master")
+
+	if result.SHA != expectedSHA {
+		t.Errorf("SHA = %q, want %q (from git ls-remote); "+
+			"updateSource must resolve refs to real git commit SHAs, not generate fake ones",
+			result.SHA, expectedSHA)
+	}
+}
+
+func TestUpdateSource_SHA_ResolvesTagRef(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping network-dependent test in short mode")
+	}
+
+	tmpDir := t.TempDir()
+	lockDir := tmpDir
+
+	cfg := &phora.Config{
+		Version: 1,
+		Sources: map[string]phora.Source{
+			"getter": {
+				Git: "https://github.com/hashicorp/go-getter.git",
+				Tag: "v1.7.0",
+			},
+		},
+	}
+
+	result, err := updateSource(cfg, "getter", lockDir)
+	if err != nil {
+		t.Fatalf("updateSource failed: %v", err)
+	}
+
+	expectedSHA := gitLsRemote(t, "https://github.com/hashicorp/go-getter.git", "refs/tags/v1.7.0")
+
+	if result.SHA != expectedSHA {
+		t.Errorf("SHA = %q, want %q (from git ls-remote for tag v1.7.0); "+
+			"updateSource must resolve tag refs to real git commit SHAs",
+			result.SHA, expectedSHA)
+	}
+}
+
+func gitLsRemote(t *testing.T, repoURL, ref string) string {
+	t.Helper()
+
+	cmd := exec.Command("git", "ls-remote", repoURL, ref)
+	output, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git ls-remote failed: %v", err)
+	}
+
+	parts := strings.Fields(string(output))
+	if len(parts) < 1 {
+		t.Fatalf("git ls-remote returned unexpected output: %q", string(output))
+	}
+
+	return parts[0]
 }

@@ -115,19 +115,15 @@ type Host struct {
 
 // Source represents a source repository configuration.
 type Source struct {
-	Repo           string            `toml:"repo"`
-	Ref            string            `toml:"ref"`
-	Path           string            `toml:"path,omitempty"`
-	IgnoreManifest bool              `toml:"ignore_manifest"`
-	Paths          map[string]string `toml:"paths"`
-	Host           string            `toml:"host"`
-	Git            string            `toml:"git"`
-	Branch         string            `toml:"branch,omitempty"`
-	Tag            string            `toml:"tag,omitempty"`
-	Rev            string            `toml:"rev,omitempty"`
-	Target         string            `toml:"target,omitempty"`
-	Include        []string          `toml:"include,omitempty"`
-	Exclude        []string          `toml:"exclude,omitempty"`
+	Git            string   `toml:"git"`
+	Branch         string   `toml:"branch,omitempty"`
+	Tag            string   `toml:"tag,omitempty"`
+	Rev            string   `toml:"rev,omitempty"`
+	Path           string   `toml:"path,omitempty"`
+	Target         string   `toml:"target,omitempty"`
+	Include        []string `toml:"include,omitempty"`
+	Exclude        []string `toml:"exclude,omitempty"`
+	IgnoreManifest bool     `toml:"ignore_manifest"`
 }
 
 // LoadConfig loads a phora configuration from a TOML file.
@@ -155,11 +151,6 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	for name, source := range cfg.Sources {
-		// Only default Ref for legacy Repo field when no new-style refs specified
-		if source.Repo != "" && source.Ref == "" &&
-			source.Branch == "" && source.Tag == "" && source.Rev == "" {
-			source.Ref = "main"
-		}
 		if source.Target == "" {
 			source.Target = name
 		}
@@ -172,31 +163,8 @@ func LoadConfig(path string) (*Config, error) {
 // Validate validates the configuration.
 func (c *Config) Validate() error {
 	for name, source := range c.Sources {
-		// Git and Repo are mutually exclusive
-		if source.Git != "" && source.Repo != "" {
-			return fmt.Errorf("source %q: git and repo are mutually exclusive", name)
-		}
-
-		// Must have either Git or Repo
-		if source.Git == "" && source.Repo == "" {
-			return fmt.Errorf("source %q: must specify either git or repo", name)
-		}
-
-		// Validate Repo format if using legacy field
-		if source.Repo != "" {
-			_, _, err := source.ParseRepo()
-			if err != nil {
-				return fmt.Errorf("source %q: %w", name, err)
-			}
-		}
-
-		if source.Host != "" {
-			if c.Hosts == nil {
-				return fmt.Errorf("source %q references unknown host %q", name, source.Host)
-			}
-			if _, ok := c.Hosts[source.Host]; !ok {
-				return fmt.Errorf("source %q references unknown host %q", name, source.Host)
-			}
+		if source.Git == "" {
+			return fmt.Errorf("source %q: git is required", name)
 		}
 
 		var refFields []string
@@ -271,26 +239,16 @@ func (s *Source) NeedsSync(name string, lock *Lock) bool {
 	return true
 }
 
-// ParseRepo splits the Repo field into owner and repo parts.
-func (s *Source) ParseRepo() (owner, repo string, err error) {
-	if s.Repo == "" {
-		return "", "", fmt.Errorf("repo is empty")
+// ResolveRev returns the revision to use for this source.
+// Priority: Branch > Tag > Rev.
+func (s *Source) ResolveRev() string {
+	if s.Branch != "" {
+		return s.Branch
 	}
-
-	if strings.HasPrefix(s.Repo, "/") || strings.HasSuffix(s.Repo, "/") {
-		return "", "", fmt.Errorf("repo %q has invalid format", s.Repo)
+	if s.Tag != "" {
+		return s.Tag
 	}
-
-	parts := strings.Split(s.Repo, "/")
-	if len(parts) != 2 {
-		return "", "", fmt.Errorf("repo %q must be in format owner/repo", s.Repo)
-	}
-
-	if parts[0] == "" || parts[1] == "" {
-		return "", "", fmt.Errorf("repo %q has empty owner or repo", s.Repo)
-	}
-
-	return parts[0], parts[1], nil
+	return s.Rev
 }
 
 // loadConfigFile loads a config from file without version validation.

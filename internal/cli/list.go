@@ -30,11 +30,11 @@ func runList(cmd *cobra.Command, args []string) error {
 
 	fmt.Println("Sources:")
 	for name, source := range cfg.Sources {
-		if source.Host != "" {
-			fmt.Printf("  %s: %s (host: %s, ref: %s)\n", name, source.Repo, source.Host, source.Ref)
-		} else {
-			fmt.Printf("  %s: %s (ref: %s)\n", name, source.Repo, source.Ref)
+		rev := source.ResolveRev()
+		if rev == "" {
+			rev = "main"
 		}
+		fmt.Printf("  %s: %s (rev: %s)\n", name, source.Git, rev)
 	}
 
 	return nil

@@ -32,7 +32,7 @@ func TestDetectDrift_NoDrift(t *testing.T) {
 			{
 				Name:      "shared",
 				Repo:      "company/shared",
-				Ref:       "v1.0",
+				Rev:       "v1.0",
 				SHA:       "abc123",
 				FetchedAt: time.Now(),
 				Files: []FileLock{
@@ -73,7 +73,7 @@ func TestDetectDrift_ModifiedFile(t *testing.T) {
 			{
 				Name:      "shared",
 				Repo:      "company/shared",
-				Ref:       "v1.0",
+				Rev:       "v1.0",
 				SHA:       "abc123",
 				FetchedAt: time.Now(),
 				Files: []FileLock{
@@ -122,7 +122,7 @@ func TestDetectDrift_MissingFile(t *testing.T) {
 			{
 				Name:      "shared",
 				Repo:      "company/shared",
-				Ref:       "v1.0",
+				Rev:       "v1.0",
 				SHA:       "abc123",
 				FetchedAt: time.Now(),
 				Files: []FileLock{
@@ -184,7 +184,7 @@ func TestDetectDrift_ExtraFiles(t *testing.T) {
 			{
 				Name:      "shared",
 				Repo:      "company/shared",
-				Ref:       "v1.0",
+				Rev:       "v1.0",
 				SHA:       "abc123",
 				FetchedAt: time.Now(),
 				Files: []FileLock{
@@ -241,7 +241,7 @@ func TestDetectDrift_MultipleFiles(t *testing.T) {
 			{
 				Name:      "shared",
 				Repo:      "company/shared",
-				Ref:       "v1.0",
+				Rev:       "v1.0",
 				SHA:       "abc123",
 				FetchedAt: time.Now(),
 				Files: []FileLock{
@@ -300,7 +300,7 @@ func TestDetectDrift_SourceNotInLock(t *testing.T) {
 			{
 				Name:      "other-source",
 				Repo:      "company/other",
-				Ref:       "v1.0",
+				Rev:       "v1.0",
 				SHA:       "abc123",
 				FetchedAt: time.Now(),
 				Files: []FileLock{
