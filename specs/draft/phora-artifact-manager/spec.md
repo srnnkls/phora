@@ -1067,28 +1067,227 @@ pub enum ProjectionStrategy {
     Copy,
 }
 
-pub fn detect_strategy(cache_dir: &Path, target_dir: &Path) -> ProjectionStrategy {
-    // Ensure target dir exists for probing
-    let _ = std::fs::create_dir_all(target_dir);
+pub fn detect_projector(cache_path: &Path, target_path: &Path) -> Box<dyn Projector> {
+    let _ = std::fs::create_dir_all(target_path);
 
-    let probe_src = cache_dir.join(".phora-probe-src");
-    let probe_dst = target_dir.join(".phora-probe-dst");
+    if probe_reflink(cache_path, target_path) {
+        return Box::new(ReflinkProjector);
+    }
 
-    let _ = std::fs::write(&probe_src, b"probe");
-    let ok = reflink::reflink(&probe_src, &probe_dst).is_ok();
+    Box::new(CopyProjector)
+}
 
+fn probe_reflink(cache_path: &Path, target_path: &Path) -> bool {
+    let probe_src = cache_path.join(".phora-reflink-probe");
+    let probe_dst = target_path.join(".phora-reflink-probe");
+
+    // Create probe file
+    if std::fs::write(&probe_src, b"reflink-probe").is_err() {
+        return false;
+    }
+
+    let result = reflink_copy::reflink(&probe_src, &probe_dst).is_ok();
+
+    // Cleanup
     let _ = std::fs::remove_file(&probe_src);
     let _ = std::fs::remove_file(&probe_dst);
 
-    if ok {
-        ProjectionStrategy::Reflink
-    } else {
-        ProjectionStrategy::Copy
-    }
+    result
 }
 ```
 
+The `reflink-copy` crate handles platform differences:
+
+```toml
+[dependencies]
+reflink-copy = "0.1"  # Wraps clonefile/FICLONE/FSCTL_DUPLICATE_EXTENTS
+```
+
 Results are cached in `~/.phora/meta.json` keyed by device ID or mount point.
+
+### Platform-Specific Projection Strategies
+
+#### Strategy Matrix (v1)
+
+| OS        | Tier 1 (v1)                     | Tier 2 (future)           |
+|-----------|---------------------------------|---------------------------|
+| **macOS** | Reflink (APFS) → Copy           | macFUSE overlay           |
+| **Linux** | Reflink (Btrfs/XFS) → Copy      | FUSE overlay, bind mounts |
+| **Windows** | Reflink (ReFS/Dev Drive) → Copy | ProjFS                    |
+
+#### macOS
+
+| Strategy     | Support             | Notes                                        |
+|--------------|---------------------|----------------------------------------------|
+| **Reflink**  | APFS only           | `clonefile(2)` — native since 10.12          |
+| **Copy**     | Always              | Universal fallback                           |
+| **Hardlink** | HFS+, APFS          | Breaks edit-safety (shared inode)            |
+| **Symlink**  | Always              | Phora avoids (tool confusion, permissions)   |
+| **FUSE**     | Requires macFUSE    | Kernel extension pain on Apple Silicon       |
+
+**APFS reflink behavior:**
+  * Instant, zero-copy clone via copy-on-write
+  * Safe: writes to clone don't affect original
+  * Works cross-volume only within same APFS container
+  * HFS+ volumes → fallback to copy
+
+#### Linux
+
+| Strategy      | Support                     | Notes                                  |
+|---------------|-----------------------------|----------------------------------------|
+| **Reflink**   | Btrfs, XFS, bcachefs, OCFS2 | `FICLONE` ioctl / `copy_file_range`    |
+| **Copy**      | Always                      | Universal fallback                     |
+| **Hardlink**  | Same filesystem             | Same edit-safety problem as macOS      |
+| **Symlink**   | Always                      | Phora avoids                           |
+| **FUSE**      | Native kernel support       | No kext pain, overlayfs also an option |
+| **Bind mount**| Native                      | Requires root or user namespaces       |
+
+**Filesystem prevalence:**
+
+| Filesystem | Reflink             | Common on                   |
+|------------|---------------------|-----------------------------|
+| ext4       | ✗                   | Most servers, older distros |
+| Btrfs      | ✓                   | Fedora, openSUSE, NixOS     |
+| XFS        | ✓ (since 4.16)      | RHEL 8+, enterprise         |
+| ZFS        | ✗ (different model) | Proxmox, TrueNAS            |
+| bcachefs   | ✓                   | Bleeding edge               |
+
+**Linux reflink detection:**
+
+```rust
+fn probe_reflink_linux(src: &Path, dst: &Path) -> bool {
+    use std::os::unix::io::AsRawFd;
+
+    let src_file = match std::fs::File::open(src) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+
+    let dst_file = match std::fs::File::create(dst) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+
+    // FICLONE ioctl - atomic reflink
+    const FICLONE: libc::c_ulong = 0x40049409;
+
+    let result = unsafe {
+        libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd())
+    };
+
+    let _ = std::fs::remove_file(dst);
+    result == 0
+}
+```
+
+**Practical note:** Many Linux users will hit the copy fallback (ext4 is ubiquitous). That's acceptable.
+
+#### Windows
+
+| Strategy     | Support                              | Notes                                      |
+|--------------|--------------------------------------|--------------------------------------------|
+| **Reflink**  | ReFS only, Dev Drive                 | `FSCTL_DUPLICATE_EXTENTS_TO_FILE`          |
+| **Copy**     | Always                               | `CopyFileW`                                |
+| **Hardlink** | NTFS, same volume                    | `CreateHardLinkW` — same edit-safety issue |
+| **Symlink**  | NTFS, requires elevation or dev mode | Phora avoids                               |
+| **ProjFS**   | Native since 1809                    | Windows Projected File System              |
+
+**Reflink on Windows:**
+
+Very limited — only works on ReFS:
+
+```rust
+#[cfg(windows)]
+fn probe_reflink_windows(src: &Path, dst: &Path) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::*;
+    use windows_sys::Win32::System::Ioctl::FSCTL_DUPLICATE_EXTENTS_TO_FILE;
+
+    // Only works on ReFS
+    // NTFS does not support block cloning
+
+    // ... ioctl setup ...
+    // Returns false on NTFS (most users)
+}
+```
+
+**Practical reality:** Almost no one runs ReFS on workstations. NTFS is ubiquitous.
+
+**Dev Drive:** Windows 11 introduced Dev Drive (ReFS-based) specifically for developer workloads. This does support reflink. Worth detecting, but still minority.
+
+**Windows Projected File System (ProjFS) — future:**
+
+```
+┌─────────────────┐
+│   User sees     │  ← Virtual files at target path
+│   plain files   │
+├─────────────────┤
+│     ProjFS      │  ← Windows kernel component
+├─────────────────┤
+│  Phora provider │  ← Serves content from cache on demand
+└─────────────────┘
+```
+
+Pros:
+  * Zero upfront copy
+  * Files appear instantly
+  * Reads pull from cache lazily
+  * Native Windows API (no third-party driver)
+
+Cons:
+  * Provider must stay running (or files disappear/become placeholders)
+  * More complex than copy
+  * v2+ feature
+
+### Symlink Handling During Projection
+
+Separate from strategy, need to handle symlinks within artifacts:
+
+```rust
+impl Projector for ReflinkProjector {
+    fn project_tree(&self, src: &Path, dst: &Path, policy: &ExportPolicy) -> Result<ProjectionResult, Error> {
+        for entry in walkdir::WalkDir::new(src) {
+            let entry = entry?;
+            let rel = entry.path().strip_prefix(src)?;
+            let dst_path = dst.join(rel);
+
+            let ft = entry.file_type();
+
+            if ft.is_symlink() {
+                if !policy.allow_symlinks {
+                    return Err(Error::SymlinkNotAllowed { path: rel.into() });
+                }
+                let target = std::fs::read_link(entry.path())?;
+                symlink(&target, &dst_path)?;
+            } else if ft.is_dir() {
+                std::fs::create_dir_all(&dst_path)?;
+            } else if ft.is_file() {
+                self.project_file(entry.path(), &dst_path)?;
+            }
+        }
+        // ...
+    }
+}
+
+#[cfg(unix)]
+fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    // v1: always file symlink (per spec)
+    std::os::windows::fs::symlink_file(target, link)
+}
+```
+
+### v1 Summary
+
+Keep it boring:
+
+1. **Probe reflink at runtime** — single code path, platform-agnostic
+2. **Works great on:** APFS, Btrfs, XFS, ReFS/Dev Drive
+3. **Falls back to copy on:** ext4, NTFS, network mounts
+4. **Trait-based design** allows ProjFS/FUSE later without changing sync logic
 
 ### Global Registry Record (no target metadata)
 
