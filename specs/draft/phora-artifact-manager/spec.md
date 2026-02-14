@@ -11,11 +11,11 @@ A package manager for fetching, caching, and projecting artifacts from git sourc
 
 ## Philosophy
 
-- **Invisible infrastructure** — Git fetches, caches, versions. User never sees it.
+- **Invisible infrastructure** — Git fetches and versions. User never sees bare repos.
 - **Projection, not reference** — Real files via reflinks, not symlinks.
-- **Edit-safe** — COW semantics mean local edits never corrupt shared cache.
+- **Edit-safe** — COW semantics mean local edits never corrupt the source.
 - **Vendoring built-in** — Eject to take ownership, keep file.
-- **Boring UX** — Four commands. Lock file. Done.
+- **Simple UX** — Lock file. Sync. Done.
 - **No target metadata** — Phora does not persist any `.phora-*` files/directories in targets.
   (Temporary staging directories may be created during sync and removed afterward.)
 
@@ -29,18 +29,17 @@ A package manager for fetching, caching, and projecting artifacts from git sourc
 
 ## Commands
 
-|Command                                                     |Purpose                                                 |
-|------------------------------------------------------------|--------------------------------------------------------|
-|`phora add <url>`                                           |Parse URL, add source to config                         |
-|`phora sync`                                                |Fetch sources + project to targets                      |
-|`phora update [source]`                                     |Bump lock to latest, then sync                          |
-|`phora list [--plan]`                                       |Show sources and deployment state; --plan shows pending |
-|`phora verify`                                              |Verify deployed files by hashing contents (cold path)   |
-|`phora where ...`                                           |Query global registry (where-used / deployments)        |
-|`phora eject <artifact> --source <source> --target <target>`|Stop managing, keep file (vendor)                       |
-|`phora clean`                                               |Garbage-collect unused cached snapshots                 |
-|`phora rebuild-registry`                                    |Rebuild global registry from lock + on-disk targets     |
-|`phora check-match --source <source> <path>`                |Debug include/exclude matching (like `git check-ignore`)|
+| Command                                                      | Purpose                                                  |
+|--------------------------------------------------------------|----------------------------------------------------------|
+| `phora add <url>`                                            | Parse URL, add source to config                          |
+| `phora sync`                                                 | Fetch sources + project to targets                       |
+| `phora update [source]`                                      | Bump lock to latest, then sync                           |
+| `phora list [--plan]`                                        | Show sources and deployment state; --plan shows pending  |
+| `phora verify`                                               | Verify deployed files by hashing contents (cold path)    |
+| `phora where ...`                                            | Query global registry (where-used / deployments)         |
+| `phora eject <artifact> --source <source> --target <target>` | Stop managing, keep file (vendor)                        |
+| `phora rebuild-registry`                                     | Rebuild global registry from lock + on-disk targets      |
+| `phora check-match --source <source> <path>`                 | Debug include/exclude matching (like `git check-ignore`) |
 
 ## Files
 
@@ -51,25 +50,22 @@ project/
 ├── phora.lock          # resolved sources from phora.toml (committed)
 └── phora.local.lock    # resolved sources from phora.local.toml (NOT committed)
 ~/.phora/
-├── git/                # bare mirrors (invisible)
+├── git/                # bare mirrors (SourceBackend-managed)
 │   ├── company.git
 │   └── personal.git
-├── cache/              # exported snapshots (plain files, no .git)
-│   └── <source>/
-│       └── <commit>/
-│           └── <root>/
-│               └── <artifact>/
-├── state/              # deployment registry (authoritative; no writes into targets)
-│   ├── targets/
-│   │   └── <target>/
-│   │       ├── meta.toml
-│   │       └── artifacts/
-│   │           └── <source>/
-│   │               └── <artifact>.toml
-│   └── locks/
-│       └── state.lock
-└── meta.json           # strategy cache, filesystem info
+└── state/              # deployment registry (authoritative; no writes into targets)
+    ├── targets/
+    │   └── <target>/
+    │       ├── meta.toml
+    │       └── artifacts/
+    │           └── <source>/
+    │               └── <artifact>.toml
+    └── locks/
+        └── state.lock
 ```
+
+**No cache layer:** Phora exports directly from bare mirrors into staging during sync.
+Bare repos grow with fetches, but `git gc` handles that internally. No separate GC command needed.
 
 ### phora.local.toml (local overrides)
 
@@ -108,28 +104,28 @@ Operational note:
 │                        phora sync                           │
 └─────────────────────────────────────────────────────────────┘
                             │
-        ┌───────────────────┼───────────────────┐
-        ▼                   ▼                   ▼
-┌───────────────────┐ ┌───────────────┐ ┌───────────────────┐
-│   Git Backend     │ │    Cache      │ │    Projection     │
-│   (gitoxide)      │ │   (export)    │ │  (reflink/copy)   │
-├───────────────────┤ ├───────────────┤ ├───────────────────┤
-│ • bare mirrors    │ │ • tree export │ │ • multi-source    │
-│ • fetch/auth      │ │ • atomic      │ │ • layouts         │
-│ • ref resolution  │ │ • no .git     │ │ • atomic swap     │
-│ • integrity       │ │ • pathspecs   │ │ • eject/restore   │
-└───────────────────┘ └───────────────┘ └───────────────────┘
-        │                   │                   │
-        └─────────┬─────────┘                   │
-                  ▼                             ▼
-          ~/.phora/git/                   target paths
-          ~/.phora/cache/                (plain directories)
-          ~/.phora/state/                (global authoritative state)
+              ┌─────────────┴─────────────┐
+              ▼                           ▼
+┌───────────────────────────┐   ┌───────────────────────────┐
+│      SourceBackend        │   │        Projection         │
+│        (gitoxide)         │   │     (reflink/copy)        │
+├───────────────────────────┤   ├───────────────────────────┤
+│ • bare mirrors            │   │ • multi-source layouts    │
+│ • fetch/auth              │   │ • export to staging       │
+│ • ref resolution          │   │ • atomic swap             │
+│ • tree export (no .git)   │   │ • eject/restore           │
+└───────────────────────────┘   └───────────────────────────┘
+              │                           │
+              ▼                           ▼
+        ~/.phora/git/               target paths
+        ~/.phora/state/            (plain directories)
 ```
 
-**Hard constraints:** No `.git` in cache or targets. No Phora metadata written into targets. Everything deployed is plain directories.
+**Hard constraints:** No `.git` in targets. No Phora metadata written into targets. Everything deployed is plain directories.
 
 **No target metadata:** No persistent `.phora-*` files or directories in targets.
+
+**No cache layer:** Export happens directly from bare mirrors into staging during sync. No intermediate snapshot storage.
 
 -----
 
@@ -781,63 +777,74 @@ pub fn discover_artifacts(
 | Symlink within artifact        | Allowed if `allow_symlinks=true` |
 | Broken symlink within artifact | Error during export/projection   |
 
-## Cache
+## SourceBackend
 
-### Model: Exported Snapshots
+### Model: Direct Export from Bare Mirrors
 
-Phora's cache is pure filesystem state derived from a Git commit tree. It contains no Git metadata and makes no assumptions about being a checkout.
+Phora exports directly from bare Git mirrors into staging during sync. There is no intermediate cache layer.
 
 ```
 ~/.phora/
-├── git/                  # bare mirrors (gitoxide-managed)
+├── git/                  # bare mirrors (SourceBackend-managed)
 │   ├── company.git
 │   └── dotfiles.git
-└── cache/                # exported snapshots (plain files, no .git)
-    └── <source>/
-        └── <commit>/
-            └── <root>/
-                └── <artifact>/
+└── state/                # deployment registry
 ```
 
 ### Properties
 
 * **No shell-out**: All Git operations via gix
-* **No worktrees**: Cache directories are exports, not checkouts
-* **Content-addressable**: Key is `<source>/<commit>`; content is immutable
+* **No worktrees**: Export directly from bare repos to staging
+* **No cache**: Bare repos are the only store; `git gc` handles internal compaction
 * **Deterministic**: Export result defined by (repo, commit, root, include/exclude, policy)
 
-### Export Process
+### Trait Definition
 
-When `~/.phora/cache/<source>/<commit>/...` doesn't exist:
+The `SourceBackend` trait abstracts source operations. Git+bare repo is the v1 implementation.
 
-1. Open mirror repo `~/.phora/git/<source>.git`
-2. Resolve commit (from lock or freshly resolved)
-3. Load commit tree
-4. Select subtree at root (if configured)
-5. Walk entries, apply path-level include/exclude
-6. Materialize files into staging directory
-7. Atomically rename staging → final cache path
+```rust
+use std::path::{Path, PathBuf};
 
-### Atomic Export
+pub trait SourceBackend {
+    /// Fetch latest refs from remote
+    fn fetch(&self, source: &str, url: &str) -> Result<(), Error>;
 
-Export writes to staging first:
+    /// Resolve refspec (branch/tag/rev) to commit hash
+    fn resolve(&self, source: &str, refspec: &Refspec) -> Result<String, Error>;
 
+    /// Export tree directly to staging directory
+    fn export(
+        &self,
+        source: &str,
+        commit: &str,
+        root: Option<&Path>,
+        matcher: &PathMatcher,
+        policy: &ExportPolicy,
+        staging_dir: &Path,
+        commit_time: u64,
+    ) -> Result<ExportResult, Error>;
+
+    /// Compute digest over exported content (for lock file)
+    fn compute_digest(
+        &self,
+        source: &str,
+        commit: &str,
+        root: Option<&Path>,
+        matcher: &PathMatcher,
+    ) -> Result<String, Error>;
+}
+
+#[derive(Debug)]
+pub struct ExportResult {
+    pub files: Vec<ManifestFile>,
+    pub digest: String,
+}
 ```
-~/.phora/cache/<source>/<commit>.staging-<nonce>/
-```
-
-Then renames to final path:
-
-```
-~/.phora/cache/<source>/<commit>/
-```
-
-If export fails, staging is removed; any existing cache remains untouched.
 
 ### Symlink, Executable, and Submodule Policy
 
 | Entry Type          | Default  | Behavior                                                                          |
-| ------------------- | -------- | --------------------------------------------------------------------------------- |
+|---------------------|----------|-----------------------------------------------------------------------------------|
 | Symlink (120000)    | Reject   | Error with clear message; opt-in via `allow_symlinks=true`                        |
 | Submodule (160000)  | Reject   | Error; opt-in via `allow_submodules=true` (v1: still errors, reserved for future) |
 | Executable (100755) | Preserve | Set +x on Unix; recorded in registry on Windows                                   |
@@ -848,70 +855,104 @@ When allowed, symlinks are materialized as symlinks (not dereferenced). Phora ne
 
 ### Digest
 
-Lock file digest is computed from the exported snapshot, not Git objects. This represents exactly what will be deployed.
+Lock file digest is computed from the tree content, not Git object IDs. This represents exactly what will be deployed.
 
-**Definition:** stable hash over (relative_path, mode_class, content_or_target) for all entries, excluding `.phora-*` files.
+**Definition:** SHA-256 hash over (relative_path, mode_class, content_or_target) for all entries in sorted order.
 
-### Implementation
+### Timestamp Determinism
+
+Exported files must have deterministic mtimes for registry-based drift detection to work correctly.
+
+**Rule:** All exported files receive `mtime = commit_time` (the commit's author timestamp, as Unix seconds).
+
+This ensures:
+  * Re-exporting the same commit produces identical mtimes
+  * Registry `ManifestFile.mtime` values are reproducible across machines
+  * Stat-based drift detection works correctly
+
+```rust
+use filetime::{set_file_mtime, FileTime};
+
+fn set_deterministic_mtime(path: &Path, commit_time: u64) -> Result<(), Error> {
+    let ft = FileTime::from_unix_time(commit_time as i64, 0);
+    set_file_mtime(path, ft)?;
+    Ok(())
+}
+```
+
+### GitBackend Implementation (v1)
 
 ```rust
 use gix::ObjectId;
 use std::path::{Path, PathBuf};
 
-pub struct Cache {
-    git_dir: PathBuf,   // ~/.phora/git
-    cache_dir: PathBuf, // ~/.phora/cache
+pub struct GitBackend {
+    git_dir: PathBuf,  // ~/.phora/git
 }
 
-impl Cache {
-    pub fn new(git_dir: PathBuf, cache_dir: PathBuf) -> Self {
-        Self { git_dir, cache_dir }
+impl GitBackend {
+    pub fn new(git_dir: PathBuf) -> Self {
+        Self { git_dir }
     }
 
-    pub fn snapshot_path(&self, source: &str, commit: &str, root: Option<&Path>) -> PathBuf {
-        let mut path = self.cache_dir.join(source).join(commit);
-        if let Some(r) = root {
-            path = path.join(r);
+    fn mirror_path(&self, source: &str) -> PathBuf {
+        self.git_dir.join(format!("{}.git", source))
+    }
+}
+
+impl SourceBackend for GitBackend {
+    fn fetch(&self, source: &str, url: &str) -> Result<(), Error> {
+        let mirror = self.mirror_path(source);
+
+        if !mirror.exists() {
+            // Clone bare
+            gix::prepare_clone_bare(url, &mirror)?
+                .fetch_only(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)?;
+        } else {
+            // Fetch updates
+            let repo = gix::open(&mirror)?;
+            repo.find_remote("origin")?
+                .connect(gix::remote::Direction::Fetch)?
+                .prepare_fetch(gix::progress::Discard, Default::default())?
+                .receive(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)?;
         }
-        path
+
+        Ok(())
     }
 
-    pub fn ensure_snapshot(
+    fn resolve(&self, source: &str, refspec: &Refspec) -> Result<String, Error> {
+        let mirror = self.mirror_path(source);
+        let repo = gix::open(&mirror)?;
+
+        let commit = match refspec {
+            Refspec::Branch(name) => {
+                repo.find_reference(&format!("refs/heads/{}", name))?
+                    .peel_to_commit()?
+            }
+            Refspec::Tag(name) => {
+                repo.find_reference(&format!("refs/tags/{}", name))?
+                    .peel_to_commit()?
+            }
+            Refspec::Rev(rev) => {
+                let oid = ObjectId::from_hex(rev.as_bytes())?;
+                repo.find_commit(oid)?
+            }
+        };
+
+        Ok(commit.id().to_hex().to_string())
+    }
+
+    fn export(
         &self,
         source: &str,
         commit: &str,
         root: Option<&Path>,
         matcher: &PathMatcher,
         policy: &ExportPolicy,
-    ) -> Result<PathBuf, Error> {
-        let final_path = self.cache_dir.join(source).join(commit);
-
-        if final_path.exists() {
-            return Ok(self.snapshot_path(source, commit, root));
-        }
-
-        let stage = final_path.with_extension(format!("staging-{}", nonce()));
-        if stage.exists() {
-            std::fs::remove_dir_all(&stage)?;
-        }
-
-        self.export_snapshot(source, commit, root, matcher, policy, &stage)?;
-
-        std::fs::rename(&stage, &final_path)?;
-
-        Ok(self.snapshot_path(source, commit, root))
-    }
-
-    fn export_snapshot(
-        &self,
-        source: &str,
-        commit: &str,
-        root: Option<&Path>,
-        matcher: &PathMatcher,
-        policy: &ExportPolicy,
-        out_dir: &Path,
-    ) -> Result<(), Error> {
-        let mirror = self.git_dir.join(format!("{}.git", source));
+        staging_dir: &Path,
+        commit_time: u64,
+    ) -> Result<ExportResult, Error> {
+        let mirror = self.mirror_path(source);
         let repo = gix::open(&mirror)?;
 
         let oid = ObjectId::from_hex(commit.as_bytes())?;
@@ -928,13 +969,42 @@ impl Cache {
             None => tree,
         };
 
-        std::fs::create_dir_all(out_dir)?;
+        std::fs::create_dir_all(staging_dir)?;
 
-        self.export_tree_recursive(&repo, &subtree, out_dir, Path::new(""), matcher, policy)?;
+        let mut files = Vec::new();
+        let mut hasher = sha2::Sha256::new();
 
-        Ok(())
+        self.export_tree_recursive(
+            &repo,
+            &subtree,
+            staging_dir,
+            Path::new(""),
+            matcher,
+            policy,
+            commit_time,
+            &mut files,
+            &mut hasher,
+        )?;
+
+        let digest = format!("sha256:{:x}", hasher.finalize());
+
+        Ok(ExportResult { files, digest })
     }
 
+    fn compute_digest(
+        &self,
+        source: &str,
+        commit: &str,
+        root: Option<&Path>,
+        matcher: &PathMatcher,
+    ) -> Result<String, Error> {
+        // Walk tree without writing, just compute hash
+        // Implementation similar to export but without file I/O
+        todo!()
+    }
+}
+
+impl GitBackend {
     fn export_tree_recursive(
         &self,
         repo: &gix::Repository,
@@ -943,7 +1013,12 @@ impl Cache {
         rel_path: &Path,
         matcher: &PathMatcher,
         policy: &ExportPolicy,
+        commit_time: u64,
+        files: &mut Vec<ManifestFile>,
+        hasher: &mut sha2::Sha256,
     ) -> Result<(), Error> {
+        use sha2::Digest;
+
         for entry in tree.iter() {
             let entry = entry?;
             let name = entry.filename();
@@ -962,6 +1037,22 @@ impl Cache {
                         std::fs::create_dir_all(parent)?;
                     }
                     std::fs::write(&out_path, blob.data)?;
+                    set_deterministic_mtime(&out_path, commit_time)?;
+
+                    // Update digest
+                    hasher.update(entry_rel.to_string_lossy().as_bytes());
+                    hasher.update(b"\x00file\x00");
+                    hasher.update(blob.data);
+
+                    // Compute file hash for registry
+                    let file_hash = sha2::Sha256::digest(blob.data);
+
+                    files.push(ManifestFile {
+                        path: entry_rel,
+                        size: blob.data.len() as u64,
+                        mtime: commit_time,
+                        sha256: format!("{:x}", file_hash),
+                    });
                 }
 
                 gix::object::tree::EntryKind::BlobExecutable => {
@@ -970,6 +1061,7 @@ impl Cache {
                         std::fs::create_dir_all(parent)?;
                     }
                     std::fs::write(&out_path, blob.data)?;
+                    set_deterministic_mtime(&out_path, commit_time)?;
 
                     if policy.preserve_executable {
                         #[cfg(unix)]
@@ -980,6 +1072,20 @@ impl Cache {
                             std::fs::set_permissions(&out_path, perms)?;
                         }
                     }
+
+                    // Update digest
+                    hasher.update(entry_rel.to_string_lossy().as_bytes());
+                    hasher.update(b"\x00exec\x00");
+                    hasher.update(blob.data);
+
+                    let file_hash = sha2::Sha256::digest(blob.data);
+
+                    files.push(ManifestFile {
+                        path: entry_rel,
+                        size: blob.data.len() as u64,
+                        mtime: commit_time,
+                        sha256: format!("{:x}", file_hash),
+                    });
                 }
 
                 gix::object::tree::EntryKind::Link => {
@@ -995,12 +1101,20 @@ impl Cache {
                     }
 
                     create_symlink(&out_path, Path::new(target))?;
+
+                    // Update digest
+                    hasher.update(entry_rel.to_string_lossy().as_bytes());
+                    hasher.update(b"\x00link\x00");
+                    hasher.update(blob.data);
                 }
 
                 gix::object::tree::EntryKind::Tree => {
                     std::fs::create_dir_all(&out_path)?;
                     let subtree = repo.find_tree(entry.object_id())?;
-                    self.export_tree_recursive(repo, &subtree, out_base, &entry_rel, matcher, policy)?;
+                    self.export_tree_recursive(
+                        repo, &subtree, out_base, &entry_rel, matcher, policy,
+                        commit_time, files, hasher,
+                    )?;
                 }
 
                 gix::object::tree::EntryKind::Commit => {
@@ -1018,12 +1132,16 @@ impl Cache {
 }
 
 fn nonce() -> String {
+    use std::process;
     use std::time::{SystemTime, UNIX_EPOCH};
-    let n = SystemTime::now()
+
+    let time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    format!("{:x}", n)
+    let pid = process::id();
+
+    format!("{:x}-{}", time, pid)
 }
 
 fn create_symlink(dst: &Path, target: &Path) -> Result<(), Error> {
@@ -1038,7 +1156,7 @@ fn create_symlink(dst: &Path, target: &Path) -> Result<(), Error> {
         // v1 limitation (intentional, predictable):
         // Always create file symlinks on Windows.
         // Reason: the symlink target may be relative and `metadata(target)` is unreliable
-        // from within the cache/projection context. Directory symlinks may be added in v2
+        // from within the staging/projection context. Directory symlinks may be added in v2
         // by resolving target type via Git tree semantics during export.
         std::os::windows::fs::symlink_file(target, dst)?;
         Ok(())
@@ -1050,244 +1168,69 @@ fn create_symlink(dst: &Path, target: &Path) -> Result<(), Error> {
 
 ### Model: Stage + Atomic Directory Swap
 
-Phora deploys artifacts into targets as plain directories, using reflink when possible, with atomic swap so partial installs are never visible.
+Phora deploys artifacts into targets as plain directories, with atomic swap so partial installs are never visible.
 
 **Hard constraint:** Targets have no `.git`. Everything deployed is just files.
 
 **No target metadata:** Phora does not persist manifests inside targets. Deployment state is stored in a global registry.
 
-### Per-target Reflink Detection
+### Simple File Copy with Reflink Opportunism
 
-Reflink support depends on both cache and target filesystems. Detection is performed per (cache_dev, target_dev) pair.
+No complex strategy abstraction. Per-file copy that tries reflink first:
 
 ```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProjectionStrategy {
-    Reflink,
-    Copy,
-}
-
-pub fn detect_projector(cache_path: &Path, target_path: &Path) -> Box<dyn Projector> {
-    let _ = std::fs::create_dir_all(target_path);
-
-    if probe_reflink(cache_path, target_path) {
-        return Box::new(ReflinkProjector);
+/// Copy file from staging to target. Tries reflink, falls back to copy.
+fn copy_file(src: &Path, dst: &Path) -> Result<(), Error> {
+    // Try reflink first (instant, COW)
+    if reflink_copy::reflink(src, dst).is_ok() {
+        return Ok(());
     }
 
-    Box::new(CopyProjector)
+    // Fall back to regular copy
+    std::fs::copy(src, dst)?;
+    Ok(())
 }
 
-fn probe_reflink(cache_path: &Path, target_path: &Path) -> bool {
-    let probe_src = cache_path.join(".phora-reflink-probe");
-    let probe_dst = target_path.join(".phora-reflink-probe");
+/// Copy directory tree from staging to target.
+fn copy_tree(src: &Path, dst: &Path, allow_symlinks: bool) -> Result<(), Error> {
+    for entry in walkdir::WalkDir::new(src).sort_by_file_name() {
+        let entry = entry?;
+        let rel = entry.path().strip_prefix(src)?;
+        let dst_path = dst.join(rel);
 
-    // Create probe file
-    if std::fs::write(&probe_src, b"reflink-probe").is_err() {
-        return false;
-    }
+        let ft = entry.file_type();
 
-    let result = reflink_copy::reflink(&probe_src, &probe_dst).is_ok();
-
-    // Cleanup
-    let _ = std::fs::remove_file(&probe_src);
-    let _ = std::fs::remove_file(&probe_dst);
-
-    result
-}
-```
-
-The `reflink-copy` crate handles platform differences:
-
-```toml
-[dependencies]
-reflink-copy = "0.1"  # Wraps clonefile/FICLONE/FSCTL_DUPLICATE_EXTENTS
-```
-
-Results are cached in `~/.phora/meta.json` keyed by device ID or mount point.
-
-### Platform-Specific Projection Strategies
-
-#### Strategy Matrix (v1)
-
-| OS        | Tier 1 (v1)                     | Tier 2 (future)           |
-|-----------|---------------------------------|---------------------------|
-| **macOS** | Reflink (APFS) → Copy           | macFUSE overlay           |
-| **Linux** | Reflink (Btrfs/XFS) → Copy      | FUSE overlay, bind mounts |
-| **Windows** | Reflink (ReFS/Dev Drive) → Copy | ProjFS                    |
-
-#### macOS
-
-| Strategy     | Support             | Notes                                        |
-|--------------|---------------------|----------------------------------------------|
-| **Reflink**  | APFS only           | `clonefile(2)` — native since 10.12          |
-| **Copy**     | Always              | Universal fallback                           |
-| **Hardlink** | HFS+, APFS          | Breaks edit-safety (shared inode)            |
-| **Symlink**  | Always              | Phora avoids (tool confusion, permissions)   |
-| **FUSE**     | Requires macFUSE    | Kernel extension pain on Apple Silicon       |
-
-**APFS reflink behavior:**
-  * Instant, zero-copy clone via copy-on-write
-  * Safe: writes to clone don't affect original
-  * Works cross-volume only within same APFS container
-  * HFS+ volumes → fallback to copy
-
-#### Linux
-
-| Strategy      | Support                     | Notes                                  |
-|---------------|-----------------------------|----------------------------------------|
-| **Reflink**   | Btrfs, XFS, bcachefs, OCFS2 | `FICLONE` ioctl / `copy_file_range`    |
-| **Copy**      | Always                      | Universal fallback                     |
-| **Hardlink**  | Same filesystem             | Same edit-safety problem as macOS      |
-| **Symlink**   | Always                      | Phora avoids                           |
-| **FUSE**      | Native kernel support       | No kext pain, overlayfs also an option |
-| **Bind mount**| Native                      | Requires root or user namespaces       |
-
-**Filesystem prevalence:**
-
-| Filesystem | Reflink             | Common on                   |
-|------------|---------------------|-----------------------------|
-| ext4       | ✗                   | Most servers, older distros |
-| Btrfs      | ✓                   | Fedora, openSUSE, NixOS     |
-| XFS        | ✓ (since 4.16)      | RHEL 8+, enterprise         |
-| ZFS        | ✗ (different model) | Proxmox, TrueNAS            |
-| bcachefs   | ✓                   | Bleeding edge               |
-
-**Linux reflink detection:**
-
-```rust
-fn probe_reflink_linux(src: &Path, dst: &Path) -> bool {
-    use std::os::unix::io::AsRawFd;
-
-    let src_file = match std::fs::File::open(src) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-
-    let dst_file = match std::fs::File::create(dst) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-
-    // FICLONE ioctl - atomic reflink
-    const FICLONE: libc::c_ulong = 0x40049409;
-
-    let result = unsafe {
-        libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd())
-    };
-
-    let _ = std::fs::remove_file(dst);
-    result == 0
-}
-```
-
-**Practical note:** Many Linux users will hit the copy fallback (ext4 is ubiquitous). That's acceptable.
-
-#### Windows
-
-| Strategy     | Support                              | Notes                                      |
-|--------------|--------------------------------------|--------------------------------------------|
-| **Reflink**  | ReFS only, Dev Drive                 | `FSCTL_DUPLICATE_EXTENTS_TO_FILE`          |
-| **Copy**     | Always                               | `CopyFileW`                                |
-| **Hardlink** | NTFS, same volume                    | `CreateHardLinkW` — same edit-safety issue |
-| **Symlink**  | NTFS, requires elevation or dev mode | Phora avoids                               |
-| **ProjFS**   | Native since 1809                    | Windows Projected File System              |
-
-**Reflink on Windows:**
-
-Very limited — only works on ReFS:
-
-```rust
-#[cfg(windows)]
-fn probe_reflink_windows(src: &Path, dst: &Path) -> bool {
-    use windows_sys::Win32::Storage::FileSystem::*;
-    use windows_sys::Win32::System::Ioctl::FSCTL_DUPLICATE_EXTENTS_TO_FILE;
-
-    // Only works on ReFS
-    // NTFS does not support block cloning
-
-    // ... ioctl setup ...
-    // Returns false on NTFS (most users)
-}
-```
-
-**Practical reality:** Almost no one runs ReFS on workstations. NTFS is ubiquitous.
-
-**Dev Drive:** Windows 11 introduced Dev Drive (ReFS-based) specifically for developer workloads. This does support reflink. Worth detecting, but still minority.
-
-**Windows Projected File System (ProjFS) — future:**
-
-```
-┌─────────────────┐
-│   User sees     │  ← Virtual files at target path
-│   plain files   │
-├─────────────────┤
-│     ProjFS      │  ← Windows kernel component
-├─────────────────┤
-│  Phora provider │  ← Serves content from cache on demand
-└─────────────────┘
-```
-
-Pros:
-  * Zero upfront copy
-  * Files appear instantly
-  * Reads pull from cache lazily
-  * Native Windows API (no third-party driver)
-
-Cons:
-  * Provider must stay running (or files disappear/become placeholders)
-  * More complex than copy
-  * v2+ feature
-
-### Symlink Handling During Projection
-
-Separate from strategy, need to handle symlinks within artifacts:
-
-```rust
-impl Projector for ReflinkProjector {
-    fn project_tree(&self, src: &Path, dst: &Path, policy: &ExportPolicy) -> Result<ProjectionResult, Error> {
-        for entry in walkdir::WalkDir::new(src) {
-            let entry = entry?;
-            let rel = entry.path().strip_prefix(src)?;
-            let dst_path = dst.join(rel);
-
-            let ft = entry.file_type();
-
-            if ft.is_symlink() {
-                if !policy.allow_symlinks {
-                    return Err(Error::SymlinkNotAllowed { path: rel.into() });
-                }
-                let target = std::fs::read_link(entry.path())?;
-                symlink(&target, &dst_path)?;
-            } else if ft.is_dir() {
-                std::fs::create_dir_all(&dst_path)?;
-            } else if ft.is_file() {
-                self.project_file(entry.path(), &dst_path)?;
+        if ft.is_symlink() {
+            if !allow_symlinks {
+                return Err(Error::SymlinkNotAllowed { path: rel.into() });
             }
+            let target = std::fs::read_link(entry.path())?;
+            create_symlink(&dst_path, &target)?;
+        } else if ft.is_dir() {
+            std::fs::create_dir_all(&dst_path)?;
+        } else if ft.is_file() {
+            if let Some(parent) = dst_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            copy_file(entry.path(), &dst_path)?;
         }
-        // ...
     }
-}
-
-#[cfg(unix)]
-fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(target, link)
-}
-
-#[cfg(windows)]
-fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
-    // v1: always file symlink (per spec)
-    std::os::windows::fs::symlink_file(target, link)
+    Ok(())
 }
 ```
 
-### v1 Summary
+**Reflink availability:**
 
-Keep it boring:
+| Filesystem | Reflink | Notes                        |
+|------------|---------|------------------------------|
+| APFS       | ✓       | macOS 10.12+                 |
+| Btrfs      | ✓       | Fedora, openSUSE, NixOS      |
+| XFS        | ✓       | Since kernel 4.16, RHEL 8+   |
+| ext4       | ✗       | Most Linux servers           |
+| NTFS       | ✗       | Most Windows                 |
+| ReFS       | ✓       | Windows Dev Drive            |
 
-1. **Probe reflink at runtime** — single code path, platform-agnostic
-2. **Works great on:** APFS, Btrfs, XFS, ReFS/Dev Drive
-3. **Falls back to copy on:** ext4, NTFS, network mounts
-4. **Trait-based design** allows ProjFS/FUSE later without changing sync logic
+**Practical note:** Many users hit copy fallback (ext4, NTFS). That's fine — copy is correct and fast enough for config artifacts.
 
 ### Global Registry Record (no target metadata)
 
@@ -1297,36 +1240,11 @@ Targets remain free of `.phora-*` files to avoid "manifest pollution" in tool-sc
 Registry record location (file backend v1):
 `~/.phora/state/targets/<target>/artifacts/<source>/<artifact>.toml`
 
-**Global Awareness (origin linkage)**
-
-Phora's registry is authoritative not only for "what is deployed", but also for "what cache snapshot was used".
-This enables:
-  * reverse lookup ("where is this used?")
-  * safe garbage collection of unused cache snapshots
-  * future content-addressed dedupe (CAS)
-
-Each registry record MUST contain an `[origin]` block that links the deployment to its cache snapshot.
-
-Canonical `cache_key` format (v1):
-```
-cache_key = "<source>/<commit>/<root>"
-```
-
-Where:
-  * `<source>` is the source name from config
-  * `<commit>` is the resolved commit hash from the lock
-  * `<root>` is the configured root path within the repo, normalized as:
-      - empty string if no root is configured
-      - slash-separated relative path with no leading slash otherwise
-
-NOTE (v1): matcher/policy are per-source configuration and are therefore implicit in `<source>`.
-If matcher/policy become deployment-varying in the future, `cache_key` MUST be extended to include them (e.g., config hash).
-
 Purpose:
 
 * Track provenance (source, commit, digest)
-* Enable fast modification detection
-* Support `phora list`, future `phora diff`, and `phora clean` / GC
+* Enable fast modification detection via stat (size + mtime)
+* Support `phora list`, `phora verify`, `phora where`
 
 Example record:
 
@@ -1338,21 +1256,15 @@ artifact = "snippets"
 commit = "def456789abc123"
 digest = "sha256:d4e5f6..."
 projected_at = "2026-01-31T12:34:56Z"
-strategy = "copy"
 layout = "flat"
 allow_symlinks = false
 preserve_executable = true
-
-[origin]
-cache_key = "company-configs/def456789abc123/configs"
-# Optional redundancy (reserved for future CAS). In v1 this MUST equal record.digest.
-digest = "sha256:d4e5f6..."
 
 [[files]]
 path = "python.json"
 size = 12345
 mtime = 1738329296
-sha256 = "9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d..."  # for phora verify
+sha256 = "9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d..."
 ```
 
 **Ejected Artifacts (per-target metadata)**
@@ -1390,19 +1302,11 @@ Phora defines a small registry interface so future backends (e.g., redb) can be 
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ArtifactKey {
     pub target: String,
     pub source: String,
     pub artifact: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Origin {
-    /// Canonical v1 cache key: "<source>/<commit>/<root>"
-    pub cache_key: String,
-    /// Optional (reserved for CAS); in v1 MUST equal RegistryRecord.digest if present.
-    pub digest: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1411,9 +1315,7 @@ pub struct RegistryRecord {
     pub key: ArtifactKey,
     pub commit: String,
     pub digest: String,
-    pub origin: Origin,
     pub projected_at: String,
-    pub strategy: String,
     pub layout: String,
     pub allow_symlinks: bool,
     pub preserve_executable: bool,
@@ -1425,7 +1327,7 @@ pub struct ManifestFile {
     pub path: PathBuf,
     pub size: u64,
     pub mtime: u64,
-    /// Content hash for `phora verify`. Computed at projection time.
+    /// Content hash for `phora verify`. Computed at export time.
     pub sha256: String,
 }
 
@@ -1816,8 +1718,7 @@ pub fn sync(
     force: bool,
     interactive: bool,
 ) -> Result<(Lock, Option<Lock>), Error> {
-    let git = GitBackend::new(phora_dir().join("git"));
-    let cache = Cache::new(phora_dir().join("git"), phora_dir().join("cache"));
+    let backend = GitBackend::new(phora_dir().join("git"));
     let registry: Box<dyn Registry> = Box::new(FileRegistry::open(phora_dir().join("state"))?);
 
     // Merge configs: local overlays base
@@ -1834,8 +1735,11 @@ pub fn sync(
     let mut new_base_lock = Lock { version: 1, sources: Vec::new() };
     let mut new_local_lock = Lock { version: 1, sources: Vec::new() };
 
+    // Track resolved sources for Phase 2
+    let mut resolved_sources: BTreeMap<String, ResolvedSource> = BTreeMap::new();
+
     // ─────────────────────────────────────────────────────────
-    // Phase 1: Fetch and cache sources
+    // Phase 1: Fetch and resolve sources
     // ─────────────────────────────────────────────────────────
 
     for (name, source) in &effective_config.sources {
@@ -1846,31 +1750,27 @@ pub fn sync(
                 l.commit.clone()
             }
             _ => {
-                git.fetch(name, &source.git)?;
-                git.resolve_ref(name, &source.refspec())?
+                backend.fetch(name, &source.git)?;
+                backend.resolve(name, &source.refspec())?
             }
         };
 
+        // Compute digest without exporting (walks git tree)
         let matcher = PathMatcher::new(&source.include, &source.exclude)?;
-        let policy = source.export_policy();
-
-        let snapshot_path = cache.ensure_snapshot(
-            name,
-            &commit,
-            source.root.as_deref(),
-            &matcher,
-            &policy,
-        )?;
-
-        let digest = compute_digest(&snapshot_path)?;
+        let digest = backend.compute_digest(name, &commit, source.root.as_deref(), &matcher)?;
 
         let locked_source = LockedSource {
             name: name.clone(),
             git: source.git.clone(),
             resolved: source.refspec().to_string(),
+            commit: commit.clone(),
+            digest: digest.clone(),
+        };
+
+        resolved_sources.insert(name.clone(), ResolvedSource {
             commit,
             digest,
-        };
+        });
 
         // Route to correct lock based on whether source is overridden locally
         if local_config.map(|lc| lc.sources.contains_key(name)).unwrap_or(false) {
@@ -1881,31 +1781,32 @@ pub fn sync(
     }
 
     // ─────────────────────────────────────────────────────────
-    // Phase 2: Project to targets
+    // Phase 2: Export and deploy to targets
     // ─────────────────────────────────────────────────────────
-
-    // Merge new locks for lookup during projection
-    let new_effective_lock = merge_locks(&new_base_lock, Some(&new_local_lock));
 
     for (target_name, target) in &effective_config.targets {
         let target_path = target.expanded_path();
-        let sources = target.resolve_sources(&effective_config.sources);
-
-        let strategy = detect_strategy(&phora_dir().join("cache"), &target_path);
+        let source_names = target.resolve_sources(&effective_config.sources);
 
         // Load ejected from registry (authoritative)
         let mut ejected = registry.load_ejected(target_name)?;
 
         let mut seen: std::collections::BTreeMap<String, &str> = std::collections::BTreeMap::new();
 
-        for source_name in sources {
+        for source_name in source_names {
             let source = &effective_config.sources[source_name];
-            let locked = new_effective_lock.find_source(source_name).unwrap();
+            let resolved = &resolved_sources[source_name];
 
             let matcher = PathMatcher::new(&source.include, &source.exclude)?;
-            let cache_root = cache.snapshot_path(source_name, &locked.commit, source.root.as_deref());
+            let policy = source.export_policy();
 
-            let discovered = discover_artifacts(&cache_root, &matcher)?;
+            // Discover artifacts by walking git tree (no export yet)
+            let discovered = backend.discover_artifacts(
+                source_name,
+                &resolved.commit,
+                source.root.as_deref(),
+                &matcher,
+            )?;
 
             for artifact_name in discovered {
                 // Collision check for flat layout
@@ -1933,8 +1834,8 @@ pub fn sync(
                 let state = check_artifact_state(
                     &artifact_dst,
                     source_name,
-                    &locked.commit,
-                    &locked.digest,
+                    &resolved.commit,
+                    &resolved.digest,
                     &ejected,
                     &artifact_name,
                     registry.as_ref(),
@@ -1968,45 +1869,43 @@ pub fn sync(
                     ArtifactState::Missing
                     | ArtifactState::Modified { .. }
                     | ArtifactState::Foreign => {
-                        let cache_artifact = cache_root.join(&artifact_name);
+                        // Export directly to staging under target filesystem
+                        let staging = target_path.join(format!(
+                            ".phora-stage/{}-{}",
+                            artifact_name, nonce()
+                        ));
 
-                        // Compute cache_key for origin linkage
-                        let root_str = source.root
-                            .as_ref()
-                            .map(|r| r.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        let cache_key = format!("{}/{}/{}", source_name, locked.commit, root_str);
+                        let commit_time = backend.commit_time(source_name, &resolved.commit)?;
+
+                        let export_result = backend.export(
+                            source_name,
+                            &resolved.commit,
+                            source.root.as_deref(),
+                            &matcher,
+                            &policy,
+                            &staging,
+                            commit_time,
+                        )?;
 
                         let record = RegistryRecord {
                             version: 1,
                             key: key.clone(),
-                            commit: locked.commit.clone(),
-                            digest: locked.digest.clone(),
-                            origin: Origin {
-                                cache_key,
-                                digest: Some(locked.digest.clone()),
-                            },
+                            commit: resolved.commit.clone(),
+                            digest: resolved.digest.clone(),
                             projected_at: chrono::Utc::now().to_rfc3339(),
-                            strategy: format!("{:?}", strategy).to_lowercase(),
                             layout: format!("{:?}", target.layout.kind).to_lowercase(),
                             allow_symlinks: source.allow_symlinks,
                             preserve_executable: source.preserve_executable,
-                            files: build_file_list(&cache_artifact, source.allow_symlinks)?,
+                            files: export_result.files,
                         };
 
-                        deploy_artifact(
-                            &cache_artifact,
-                            &target_path,
-                            &artifact_dst,
-                            strategy,
-                            record,
-                            registry.as_ref(),
-                        )?;
+                        // Atomic swap: staging → destination
+                        deploy_artifact(&staging, &artifact_dst, record, registry.as_ref())?;
 
-                        // Clearing ejected on restore:
-                        // If the user previously ejected this artifact and then deleted it,
-                        // a successful projection MUST remove it from the ejected list
-                        // and persist the change to registry.
+                        // Cleanup staging dir
+                        let _ = std::fs::remove_dir_all(staging.parent().unwrap());
+
+                        // Clear ejected on restore
                         if let Some(pos) = ejected.iter().position(|e| e.artifact == artifact_name) {
                             ejected.swap_remove(pos);
                             registry.save_ejected(target_name, &ejected)?;
@@ -2025,6 +1924,60 @@ pub fn sync(
     };
 
     Ok((new_base_lock, local_result))
+}
+
+struct ResolvedSource {
+    commit: String,
+    digest: String,
+}
+
+/// Check if source config matches what's in the lock (for cache validation)
+fn source_matches(source: &Source, locked: &LockedSource) -> bool {
+    // URL must match
+    if source.git != locked.git {
+        return false;
+    }
+
+    // Refspec must match (branch/tag/rev)
+    if source.refspec().to_string() != locked.resolved {
+        return false;
+    }
+
+    true
+}
+
+/// Atomic deployment: rename staging to destination, persist registry
+fn deploy_artifact(
+    staging: &Path,
+    dst: &Path,
+    record: RegistryRecord,
+    registry: &dyn Registry,
+) -> Result<(), Error> {
+    // Backup existing if present
+    let backup = dst.with_extension("phora-backup");
+    if dst.exists() {
+        std::fs::rename(dst, &backup)?;
+    }
+
+    // Ensure parent exists
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Atomic swap
+    std::fs::rename(staging, dst)?;
+
+    // Persist registry record
+    // NOTE: crash between swap and put leaves artifact deployed but untracked.
+    // phora list will show it as [foreign]; next sync will re-register it.
+    registry.put(&record)?;
+
+    // Cleanup backup (best-effort)
+    if backup.exists() {
+        let _ = std::fs::remove_dir_all(&backup);
+    }
+
+    Ok(())
 }
 ```
 
@@ -2277,24 +2230,6 @@ Added source 'editor-config':
   root = "editor"
 ```
 
-### phora clean (smart GC)
-
-Garbage-collect cache snapshots that are not referenced by any active deployment.
-
-**Mark:**
-  * Scan all registry records under `~/.phora/state/targets/**/artifacts/**.toml`
-  * Collect every referenced `record.origin.cache_key` into a set
-
-**Sweep:**
-  * Enumerate cache snapshots under `~/.phora/cache/`
-  * Delete snapshots whose corresponding `cache_key` is not in the marked set
-  * Implementations MAY also consider active lockfiles as additional roots (future), but registry is authoritative for deployed state.
-
-**Safety:**
-  * Default SHOULD be conservative (e.g., only remove unreferenced snapshots older than N days, default 30).
-  * Supports `--dry-run`.
-  * Note: removing cache reduces ability to heal without fetching, but does not break existing projections.
-
 ### phora rebuild-registry
 
 Rebuild `~/.phora/state/...` from:
@@ -2312,7 +2247,7 @@ Query the global registry to answer "where is this used?" and related questions.
   * `phora where --digest <hash>`: find all deployments of this exact exported content digest
   * `phora where --source <name>`: find all deployments from a source
   * `phora where --artifact <name>`: find all deployments with this artifact name
-  * `phora where --cache-key <key>`: find all deployments that share the same cache snapshot origin
+  * `phora where --commit <hash>`: find all deployments from a specific commit
 
 **Behavior:**
   * Reads `~/.phora/state/...` (authoritative).
@@ -2364,18 +2299,19 @@ edition = "2024"
 
 [dependencies]
 gix = { version = "0.68", features = ["blocking-network-client"] }
-reflink = "0.1"
-filetime = "0.2"
+reflink-copy = "0.1"                  # cross-platform reflink (clonefile/FICLONE/FSCTL_DUPLICATE_EXTENTS)
+filetime = "0.2"                      # deterministic mtime setting
 walkdir = "2"
 globset = "0.4"
-blake3 = "1"
+sha2 = "0.10"                         # SHA-256 for digests and file hashes
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "0.8"                          # reading config/lock files
+toml_edit = "0.22"                    # preserving formatting in phora add
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5"
-fs2 = "0.4"  # file locks for ~/.phora/state/locks/state.lock (or equivalent)
+fs2 = "0.4"                           # file locks for state.lock
 ```
 
 ## Acceptance Criteria
