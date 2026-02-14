@@ -226,21 +226,21 @@ name = "dotfiles"
 git = "https://github.com/me/dotfiles.git"
 resolved = "main"
 commit = "abc123def456789"
-digest = "sha256:a1b2c3..."
+digest = "blake3:a1b2c3..."
 
 [[sources]]
 name = "company-configs"
 git = "https://github.com/company/shared-configs.git"
 resolved = "v2.1"
 commit = "def456789abc123"
-digest = "sha256:d4e5f6..."
+digest = "blake3:d4e5f6..."
 
 [[sources]]
 name = "loqui"
 git = "https://github.com/srnnkls/loqui.git"
 resolved = "v1.0"
 commit = "789xyz123456abc"
-digest = "sha256:g7h8i9..."
+digest = "blake3:g7h8i9..."
 ```
 
 ### phora.local.lock
@@ -257,7 +257,7 @@ name = "loqui"                              # overrides base lock entry
 git = "/home/soeren/dev/loqui"              # local checkout
 resolved = "main"
 commit = "local-abc123def456789"
-digest = "sha256:local..."
+digest = "blake3:local..."
 ```
 
 **Write logic during sync:**
@@ -857,7 +857,7 @@ When allowed, symlinks are materialized as symlinks (not dereferenced). Phora ne
 
 Lock file digest is computed from the tree content, not Git object IDs. This represents exactly what will be deployed.
 
-**Definition:** SHA-256 hash over (relative_path, mode_class, content_or_target) for all entries in sorted order.
+**Definition:** BLAKE3 hash over (relative_path, mode_class, content_or_target) for all entries in sorted order.
 
 ### Timestamp Determinism
 
@@ -972,7 +972,7 @@ impl SourceBackend for GitBackend {
         std::fs::create_dir_all(staging_dir)?;
 
         let mut files = Vec::new();
-        let mut hasher = sha2::Sha256::new();
+        let mut hasher = blake3::Hasher::new();
 
         self.export_tree_recursive(
             &repo,
@@ -986,7 +986,7 @@ impl SourceBackend for GitBackend {
             &mut hasher,
         )?;
 
-        let digest = format!("sha256:{:x}", hasher.finalize());
+        let digest = format!("blake3:{}", hasher.finalize().to_hex());
 
         Ok(ExportResult { files, digest })
     }
@@ -1015,9 +1015,9 @@ impl GitBackend {
         policy: &ExportPolicy,
         commit_time: u64,
         files: &mut Vec<ManifestFile>,
-        hasher: &mut sha2::Sha256,
+        hasher: &mut blake3::Hasher,
     ) -> Result<(), Error> {
-        use sha2::Digest;
+        use blake3;
 
         for entry in tree.iter() {
             let entry = entry?;
@@ -1045,13 +1045,13 @@ impl GitBackend {
                     hasher.update(blob.data);
 
                     // Compute file hash for registry
-                    let file_hash = sha2::Sha256::digest(blob.data);
+                    let file_hash = blake3::hash(blob.data);
 
                     files.push(ManifestFile {
                         path: entry_rel,
                         size: blob.data.len() as u64,
                         mtime: commit_time,
-                        sha256: format!("{:x}", file_hash),
+                        blake3: file_hash.to_hex().to_string(),
                     });
                 }
 
@@ -1078,13 +1078,13 @@ impl GitBackend {
                     hasher.update(b"\x00exec\x00");
                     hasher.update(blob.data);
 
-                    let file_hash = sha2::Sha256::digest(blob.data);
+                    let file_hash = blake3::hash(blob.data);
 
                     files.push(ManifestFile {
                         path: entry_rel,
                         size: blob.data.len() as u64,
                         mtime: commit_time,
-                        sha256: format!("{:x}", file_hash),
+                        blake3: file_hash.to_hex().to_string(),
                     });
                 }
 
@@ -1254,7 +1254,7 @@ target = "vscode"
 source = "company-configs"
 artifact = "snippets"
 commit = "def456789abc123"
-digest = "sha256:d4e5f6..."
+digest = "blake3:d4e5f6..."
 projected_at = "2026-01-31T12:34:56Z"
 layout = "flat"
 allow_symlinks = false
@@ -1264,7 +1264,7 @@ preserve_executable = true
 path = "python.json"
 size = 12345
 mtime = 1738329296
-sha256 = "9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d..."
+blake3 = "9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d..."
 ```
 
 **Ejected Artifacts (per-target metadata)**
@@ -1328,7 +1328,7 @@ pub struct ManifestFile {
     pub size: u64,
     pub mtime: u64,
     /// Content hash for `phora verify`. Computed at export time.
-    pub sha256: String,
+    pub blake3: String,
 }
 
 pub trait Registry {
@@ -2256,7 +2256,7 @@ Query the global registry to answer "where is this used?" and related questions.
 
 **Example output:**
 ```
-Artifact: company-skills/python (commit def456, digest sha256:...)
+Artifact: company-skills/python (commit def456, digest blake3:...)
   • ~/.config/nvim/lua/skills
   • ~/work/agent-1/resources/skills
 ```
@@ -2267,14 +2267,14 @@ Correctness-first verification of deployed artifacts by hashing file contents.
 
 Properties:
   * Intended as a cold path (audit/CI / "suspect corruption") rather than default interactive status.
-  * Uses `sha256` hashes stored in registry records (computed at projection time).
+  * Uses `blake3` hashes stored in registry records (computed at projection time).
   * Works independently of cache state — verify succeeds even if cache is GC'd.
   * Reports mismatches as Modified-like output, but backed by content hashes rather than size/mtime heuristics.
 
 Algorithm:
   1. Load registry record for each managed artifact
   2. For each file in `record.files`, hash deployed file content
-  3. Compare against stored `sha256`
+  3. Compare against stored `blake3`
   4. Report mismatches
 
 Notes:
@@ -2303,7 +2303,7 @@ reflink-copy = "0.1"                  # cross-platform reflink (clonefile/FICLON
 filetime = "0.2"                      # deterministic mtime setting
 walkdir = "2"
 globset = "0.4"
-sha2 = "0.10"                         # SHA-256 for digests and file hashes
+blake3 = "1"                          # BLAKE3 for digests and file hashes
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"                          # reading config/lock files
 toml_edit = "0.22"                    # preserving formatting in phora add
