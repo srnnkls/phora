@@ -812,19 +812,32 @@ pub trait SourceBackend {
     /// Resolve refspec (branch/tag/rev) to commit hash
     fn resolve(&self, source: &str, refspec: &Refspec) -> Result<String, Error>;
 
-    /// Export tree directly to staging directory
-    fn export(
+    /// Get commit timestamp (author time, Unix seconds)
+    fn commit_time(&self, source: &str, commit: &str) -> Result<u64, Error>;
+
+    /// Discover artifacts (top-level directories) at root without exporting
+    fn discover_artifacts(
         &self,
         source: &str,
         commit: &str,
         root: Option<&Path>,
+        matcher: &PathMatcher,
+    ) -> Result<Vec<String>, Error>;
+
+    /// Export single artifact to staging directory
+    fn export_artifact(
+        &self,
+        source: &str,
+        commit: &str,
+        root: Option<&Path>,
+        artifact: &str,
         matcher: &PathMatcher,
         policy: &ExportPolicy,
         staging_dir: &Path,
         commit_time: u64,
     ) -> Result<ExportResult, Error>;
 
-    /// Compute digest over exported content (for lock file)
+    /// Compute digest over all artifacts (for lock file)
     fn compute_digest(
         &self,
         source: &str,
@@ -942,16 +955,21 @@ impl SourceBackend for GitBackend {
         Ok(commit.id().to_hex().to_string())
     }
 
-    fn export(
+    fn commit_time(&self, source: &str, commit: &str) -> Result<u64, Error> {
+        let mirror = self.mirror_path(source);
+        let repo = gix::open(&mirror)?;
+        let oid = ObjectId::from_hex(commit.as_bytes())?;
+        let commit_obj = repo.find_commit(oid)?;
+        Ok(commit_obj.author()?.time.seconds as u64)
+    }
+
+    fn discover_artifacts(
         &self,
         source: &str,
         commit: &str,
         root: Option<&Path>,
         matcher: &PathMatcher,
-        policy: &ExportPolicy,
-        staging_dir: &Path,
-        commit_time: u64,
-    ) -> Result<ExportResult, Error> {
+    ) -> Result<Vec<String>, Error> {
         let mirror = self.mirror_path(source);
         let repo = gix::open(&mirror)?;
 
@@ -969,6 +987,55 @@ impl SourceBackend for GitBackend {
             None => tree,
         };
 
+        // Artifacts are top-level directories
+        let mut artifacts = Vec::new();
+        for entry in subtree.iter() {
+            let entry = entry?;
+            if entry.mode().is_tree() {
+                let name = entry.filename().to_string();
+                if !name.starts_with('.') && matcher.allows_artifact(&name) {
+                    artifacts.push(name);
+                }
+            }
+        }
+
+        artifacts.sort();
+        Ok(artifacts)
+    }
+
+    fn export_artifact(
+        &self,
+        source: &str,
+        commit: &str,
+        root: Option<&Path>,
+        artifact: &str,
+        matcher: &PathMatcher,
+        policy: &ExportPolicy,
+        staging_dir: &Path,
+        commit_time: u64,
+    ) -> Result<ExportResult, Error> {
+        let mirror = self.mirror_path(source);
+        let repo = gix::open(&mirror)?;
+
+        let oid = ObjectId::from_hex(commit.as_bytes())?;
+        let commit_obj = repo.find_commit(oid)?;
+        let tree = commit_obj.tree()?;
+
+        // Navigate to root subtree if specified
+        let root_tree = match root {
+            Some(r) => {
+                let entry = tree.lookup_entry_by_path(r)?
+                    .ok_or(Error::RootNotFound { root: r.to_path_buf() })?;
+                repo.find_tree(entry.object_id())?
+            }
+            None => tree,
+        };
+
+        // Navigate to artifact subtree
+        let artifact_entry = root_tree.lookup_entry_by_path(Path::new(artifact))?
+            .ok_or(Error::ArtifactNotFound { artifact: artifact.to_string() })?;
+        let artifact_tree = repo.find_tree(artifact_entry.object_id())?;
+
         std::fs::create_dir_all(staging_dir)?;
 
         let mut files = Vec::new();
@@ -976,7 +1043,7 @@ impl SourceBackend for GitBackend {
 
         self.export_tree_recursive(
             &repo,
-            &subtree,
+            &artifact_tree,
             staging_dir,
             Path::new(""),
             matcher,
@@ -998,9 +1065,26 @@ impl SourceBackend for GitBackend {
         root: Option<&Path>,
         matcher: &PathMatcher,
     ) -> Result<String, Error> {
-        // Walk tree without writing, just compute hash
-        // Implementation similar to export but without file I/O
-        todo!()
+        let mirror = self.mirror_path(source);
+        let repo = gix::open(&mirror)?;
+
+        let oid = ObjectId::from_hex(commit.as_bytes())?;
+        let commit_obj = repo.find_commit(oid)?;
+        let tree = commit_obj.tree()?;
+
+        let subtree = match root {
+            Some(r) => {
+                let entry = tree.lookup_entry_by_path(r)?
+                    .ok_or(Error::RootNotFound { root: r.to_path_buf() })?;
+                repo.find_tree(entry.object_id())?
+            }
+            None => tree,
+        };
+
+        let mut hasher = blake3::Hasher::new();
+        self.hash_tree_recursive(&repo, &subtree, Path::new(""), matcher, &mut hasher)?;
+
+        Ok(format!("blake3:{}", hasher.finalize().to_hex()))
     }
 }
 
@@ -1123,6 +1207,56 @@ impl GitBackend {
                         return Err(Error::SubmoduleNotAllowed { path: entry_rel });
                     }
                     // v1: even if allowed, we don't recursively fetch submodules
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Hash tree without exporting (for compute_digest)
+    fn hash_tree_recursive(
+        &self,
+        repo: &gix::Repository,
+        tree: &gix::Tree,
+        rel_path: &Path,
+        matcher: &PathMatcher,
+        hasher: &mut blake3::Hasher,
+    ) -> Result<(), Error> {
+        for entry in tree.iter() {
+            let entry = entry?;
+            let name = entry.filename();
+            let entry_rel = rel_path.join(name);
+
+            if !matcher.allows_path(&entry_rel) {
+                continue;
+            }
+
+            match entry.mode().kind() {
+                gix::object::tree::EntryKind::Blob => {
+                    let blob = repo.find_blob(entry.object_id())?;
+                    hasher.update(entry_rel.to_string_lossy().as_bytes());
+                    hasher.update(b"\x00file\x00");
+                    hasher.update(blob.data);
+                }
+                gix::object::tree::EntryKind::BlobExecutable => {
+                    let blob = repo.find_blob(entry.object_id())?;
+                    hasher.update(entry_rel.to_string_lossy().as_bytes());
+                    hasher.update(b"\x00exec\x00");
+                    hasher.update(blob.data);
+                }
+                gix::object::tree::EntryKind::Link => {
+                    let blob = repo.find_blob(entry.object_id())?;
+                    hasher.update(entry_rel.to_string_lossy().as_bytes());
+                    hasher.update(b"\x00link\x00");
+                    hasher.update(blob.data);
+                }
+                gix::object::tree::EntryKind::Tree => {
+                    let subtree = repo.find_tree(entry.object_id())?;
+                    self.hash_tree_recursive(repo, &subtree, &entry_rel, matcher, hasher)?;
+                }
+                gix::object::tree::EntryKind::Commit => {
+                    // Submodule - skip in digest (matches export behavior)
                 }
             }
         }
@@ -1322,6 +1456,7 @@ pub struct RegistryRecord {
     pub files: Vec<ManifestFile>,
 }
 
+/// Registry record file entry (with hash for verify)
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ManifestFile {
     pub path: PathBuf,
@@ -1329,6 +1464,14 @@ pub struct ManifestFile {
     pub mtime: u64,
     /// Content hash for `phora verify`. Computed at export time.
     pub blake3: String,
+}
+
+/// Scanned file entry (no hash — from filesystem metadata only)
+#[derive(Debug, Clone)]
+pub struct ScannedFile {
+    pub path: PathBuf,
+    pub size: u64,
+    pub mtime: u64,
 }
 
 pub trait Registry {
@@ -1373,7 +1516,7 @@ Phora still needs directory scanning to detect drift. Scanning is used in two mo
 ```rust
 #[derive(Debug)]
 pub struct ScanResult {
-    pub files: Vec<ManifestFile>,
+    pub files: Vec<ScannedFile>,
     /// Relative paths of symlinks encountered (excluded from files list).
     /// NOTE: Soft scans never error; they only report symlinks for "treat as Modified".
     pub symlinks: Vec<PathBuf>,
@@ -1383,11 +1526,6 @@ pub struct ScanResult {
 enum ScanMode {
     Strict,
     Soft,
-}
-
-pub fn build_file_list(dir: &Path, allow_symlinks: bool) -> Result<Vec<ManifestFile>, Error> {
-    let res = scan_dir(dir, allow_symlinks, ScanMode::Strict)?;
-    Ok(res.files)
 }
 
 pub fn scan_dir_soft(dir: &Path) -> Result<ScanResult, Error> {
@@ -1429,7 +1567,7 @@ fn scan_dir(dir: &Path, allow_symlinks: bool, mode: ScanMode) -> Result<ScanResu
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
 
-        files.push(ManifestFile {
+        files.push(ScannedFile {
             path: rel.to_path_buf(),
             size: meta.len(),
             mtime,
@@ -1442,73 +1580,23 @@ fn scan_dir(dir: &Path, allow_symlinks: bool, mode: ScanMode) -> Result<ScanResu
 
 ### Atomic Artifact Swap
 
-Projection never writes directly to destination.
+Deployment never writes directly to destination.
 Stage and backup are ephemeral and MUST live on the same filesystem as the destination to preserve atomic renames.
 Phora MAY create temporary directories under the target base during sync, but MUST remove them afterward.
 
 **Paths:**
 
 * stage root = `<target_base>/.phora-stage/`
-* backup root = `<target_base>/.phora-backup/`
 
 **Flow:**
 
-1. Build stage by reflink/copy from cache
-2. If destination exists, rename dst → backup
+1. Export artifact from git to staging (via `backend.export_artifact()`)
+2. If destination exists, rename dst → backup (in staging area)
 3. Rename stage → dst
 4. Persist registry record (authoritative) only after successful swap
-5. Delete stage/backup (best-effort)
+5. Delete staging area (best-effort)
 
-```rust
-pub fn deploy_artifact(
-    cache_artifact: &Path,
-    target_base: &Path,
-    dst: &Path,
-    strategy: ProjectionStrategy,
-    record: RegistryRecord,
-    registry: &dyn Registry,
-) -> Result<(), Error> {
-    let stage_root = target_base.join(".phora-stage");
-    let backup_root = target_base.join(".phora-backup");
-
-    let nonce = nonce();
-    let stage = stage_root.join(format!("{}-{}", record.key.artifact, nonce));
-    let backup = backup_root.join(format!("{}-{}", record.key.artifact, nonce));
-
-    // Clean any leftover stage
-    if stage.exists() {
-        std::fs::remove_dir_all(&stage)?;
-    }
-    std::fs::create_dir_all(&stage)?;
-    std::fs::create_dir_all(&backup_root)?;
-
-    // 1. Populate stage (enforces symlink policy)
-    project_tree(cache_artifact, &stage, strategy, record.allow_symlinks)?;
-
-    // 2. Atomic swap
-    if dst.exists() {
-        std::fs::rename(dst, &backup)?;
-    }
-
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    std::fs::rename(&stage, dst)?;
-
-    // 3. Cleanup (best-effort)
-    if backup.exists() {
-        let _ = std::fs::remove_dir_all(&backup);
-    }
-    let _ = std::fs::remove_dir(&stage_root);
-    let _ = std::fs::remove_dir(&backup_root);
-
-    // 4. Persist registry record only after successful swap
-    registry.put(&record)?;
-
-    Ok(())
-}
-```
+**Failure mode:** If crash occurs between step 3 (swap) and step 4 (registry put), the artifact is deployed but untracked. `phora list` will show it as `[foreign]`; next sync will re-register it. This is acceptable — the target has correct content.
 
 ### Layouts
 
@@ -1869,18 +1957,19 @@ pub fn sync(
                     ArtifactState::Missing
                     | ArtifactState::Modified { .. }
                     | ArtifactState::Foreign => {
-                        // Export directly to staging under target filesystem
-                        let staging = target_path.join(format!(
-                            ".phora-stage/{}-{}",
-                            artifact_name, nonce()
-                        ));
+                        // Staging area under target filesystem (same mount for atomic rename)
+                        let staging_base = target_path.join(".phora-stage");
+                        std::fs::create_dir_all(&staging_base)?;
+
+                        let staging = staging_base.join(format!("{}-{}", artifact_name, nonce()));
 
                         let commit_time = backend.commit_time(source_name, &resolved.commit)?;
 
-                        let export_result = backend.export(
+                        let export_result = backend.export_artifact(
                             source_name,
                             &resolved.commit,
                             source.root.as_deref(),
+                            &artifact_name,
                             &matcher,
                             &policy,
                             &staging,
@@ -1891,7 +1980,7 @@ pub fn sync(
                             version: 1,
                             key: key.clone(),
                             commit: resolved.commit.clone(),
-                            digest: resolved.digest.clone(),
+                            digest: export_result.digest.clone(),
                             projected_at: chrono::Utc::now().to_rfc3339(),
                             layout: format!("{:?}", target.layout.kind).to_lowercase(),
                             allow_symlinks: source.allow_symlinks,
@@ -1900,10 +1989,10 @@ pub fn sync(
                         };
 
                         // Atomic swap: staging → destination
-                        deploy_artifact(&staging, &artifact_dst, record, registry.as_ref())?;
+                        deploy_artifact(&staging_base, &staging, &artifact_dst, record, registry.as_ref())?;
 
-                        // Cleanup staging dir
-                        let _ = std::fs::remove_dir_all(staging.parent().unwrap());
+                        // Cleanup staging area (best-effort, after all artifacts done)
+                        let _ = std::fs::remove_dir_all(&staging_base);
 
                         // Clear ejected on restore
                         if let Some(pos) = ejected.iter().position(|e| e.artifact == artifact_name) {
@@ -1931,7 +2020,7 @@ struct ResolvedSource {
     digest: String,
 }
 
-/// Check if source config matches what's in the lock (for cache validation)
+/// Check if source config matches what's in the lock (for reusing locked commit)
 fn source_matches(source: &Source, locked: &LockedSource) -> bool {
     // URL must match
     if source.git != locked.git {
@@ -1943,18 +2032,26 @@ fn source_matches(source: &Source, locked: &LockedSource) -> bool {
         return false;
     }
 
+    // All export-affecting fields must match:
+    // If any of these changed, the digest would be different even for the same commit.
+    // Note: We compare against a hash of these fields stored in the lock (future),
+    // or we accept that changing these fields requires `phora update` to recompute.
+    // For v1: config changes that affect export output require explicit update.
+
     true
 }
 
 /// Atomic deployment: rename staging to destination, persist registry
 fn deploy_artifact(
+    staging_base: &Path,
     staging: &Path,
     dst: &Path,
     record: RegistryRecord,
     registry: &dyn Registry,
 ) -> Result<(), Error> {
-    // Backup existing if present
-    let backup = dst.with_extension("phora-backup");
+    // Backup existing to staging area (NOT target dir — no .phora-* in targets)
+    let backup = staging_base.join(format!("backup-{}", nonce()));
+
     if dst.exists() {
         std::fs::rename(dst, &backup)?;
     }
@@ -2049,24 +2146,24 @@ pub fn eject(
 $ phora list
 
 Sources:
-  dotfiles         main (abc123) ✓ cached
-  company-configs  v2.1 (def456) ✓ cached
-  loqui            v1.0 (789xyz) ✓ cached
+  dotfiles         main (abc123) ✓ locked
+  company-configs  v2.1 (def456) ✓ locked
+  loqui            v1.0 (789xyz) ✓ locked
 
 Targets:
-  neovim (~/.config/nvim) [strategy: reflink]:
-    nvim/              dotfiles@main
+  neovim (~/.config/nvim):
+    nvim/              dotfiles@main ✓
 
-  vscode (~/.config/Code/User) [strategy: copy]:
-    settings/          dotfiles@main
-    keybindings/       dotfiles@main
+  vscode (~/.config/Code/User):
+    settings/          dotfiles@main ✓
+    keybindings/       dotfiles@main ✓
     snippets/          company-configs@v2.1 [modified]
       python.json (size changed)
       unexpected.lnk [symlink]
 
-  cupcake-policies (~/.cupcake/policies/claude) [strategy: reflink]:
-    loqui/python/      loqui@v1.0
-    loqui/go/          loqui@v1.0
+  cupcake-policies (~/.cupcake/policies/claude):
+    loqui/python/      loqui@v1.0 ✓
+    loqui/go/          loqui@v1.0 ✓
     old-policy/        [ejected]
     unknown-dir/       [foreign]
 ```
