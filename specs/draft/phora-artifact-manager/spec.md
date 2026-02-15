@@ -32,7 +32,7 @@ A package manager for fetching, caching, and projecting artifacts from git sourc
 | Command                                                      | Purpose                                                  |
 |--------------------------------------------------------------|----------------------------------------------------------|
 | `phora add <url>`                                            | Parse URL, add source to config                          |
-| `phora sync`                                                 | Fetch sources + project to targets                       |
+| `phora sync [--prune]`                                       | Fetch sources + project to targets; --prune removes orphans |
 | `phora update [source]`                                      | Bump lock to latest, then sync                           |
 | `phora list [--plan]`                                        | Show sources and deployment state; --plan shows pending  |
 | `phora verify`                                               | Verify deployed files by hashing contents (cold path)    |
@@ -50,19 +50,70 @@ project/
 ├── phora.lock          # resolved sources from phora.toml (committed)
 └── phora.local.lock    # resolved sources from phora.local.toml (NOT committed)
 ~/.phora/
-├── git/                # bare mirrors (SourceBackend-managed)
-│   ├── company.git
-│   └── personal.git
+├── git/                # bare mirrors keyed by URL hash (shared across projects)
+│   ├── <hash(url1)>.git
+│   └── <hash(url2)>.git
 └── state/              # deployment registry (authoritative; no writes into targets)
-    ├── targets/
-    │   └── <target>/
-    │       ├── meta.toml
-    │       └── artifacts/
-    │           └── <source>/
-    │               └── <artifact>.toml
-    └── locks/
-        └── state.lock
+    └── projects/
+        └── <project_id>/   # blake3 hash of canonical project root path
+            ├── meta.toml   # project metadata (path, created_at)
+            ├── targets/
+            │   └── <target>/
+            │       ├── meta.toml
+            │       └── artifacts/
+            │           └── <source>/
+            │               └── <artifact>.toml
+            └── locks/
+                └── state.lock
 ```
+
+### Project Namespacing
+
+Each project gets a unique `project_id` derived from its canonical root path:
+
+```rust
+fn project_id(project_root: &Path) -> String {
+    let canonical = project_root.canonicalize().expect("project root must exist");
+    let hash = blake3::hash(canonical.to_string_lossy().as_bytes());
+    hash.to_hex()[..16].to_string()  // 16 hex chars = 64 bits, sufficient for uniqueness
+}
+```
+
+This prevents collisions when:
+- Two projects both use a target named `vscode`
+- Two projects both have a source named `dotfiles` (pointing to different URLs)
+
+The `meta.toml` in each project directory stores the human-readable path for debugging:
+
+```toml
+# ~/.phora/state/projects/<project_id>/meta.toml
+version = 1
+path = "/home/user/my-project"
+created_at = "2026-01-31T12:00:00Z"
+```
+
+### Mirror Keying by URL
+
+Bare mirrors are keyed by URL hash, not source name:
+
+```rust
+fn mirror_key(url: &str) -> String {
+    let normalized = normalize_git_url(url);
+    let hash = blake3::hash(normalized.as_bytes());
+    hash.to_hex()[..16].to_string()
+}
+
+fn normalize_git_url(url: &str) -> String {
+    // Strip trailing .git, normalize ssh vs https, lowercase host
+    // Example: "git@github.com:user/repo.git" → "github.com/user/repo"
+    todo!()
+}
+```
+
+This allows:
+- Multiple projects to share the same mirror for the same repo
+- Different source names in different projects to point to the same mirror
+- Source name changes without re-fetching
 
 **No cache layer:** Phora exports directly from bare mirrors into staging during sync.
 Bare repos grow with fetches, but `git gc` handles that internally. No separate GC command needed.
@@ -632,9 +683,16 @@ impl PathMatcher {
         Ok((artifact, path))
     }
 
-    /// Path-level if starts with `/`, contains `/`, or contains `**`
+    /// Path-level if starts with `/`, contains `/`, contains `**`, or is a wildcard pattern (e.g., `*.bak`)
+    /// Wildcard patterns without path separators are treated as path-level because users expect
+    /// `*.bak` to mean "any .bak file anywhere" (i.e., `**/*.bak`).
     fn is_path_level(pattern: &str) -> bool {
-        pattern.starts_with('/') || pattern.contains('/') || pattern.contains("**")
+        pattern.starts_with('/')
+            || pattern.contains('/')
+            || pattern.contains("**")
+            || pattern.contains('*')  // *.bak → **/*.bak
+            || pattern.contains('?')  // ?.txt → **/?.txt
+            || pattern.contains('[')  // [abc].txt → **/[abc].txt
     }
 
     /// Normalize: strip leading `/` for anchored; prepend `**/` for unanchored path patterns
@@ -677,16 +735,39 @@ impl PathMatcher {
         !self.artifact_exclude.is_match(name)
     }
 
-    /// Check if relative path passes path-level filters
-    pub fn allows_path(&self, path: &Path) -> bool {
-        let path_str = path.to_string_lossy();
+    /// Normalize path to use `/` separator for cross-platform glob matching.
+    /// On Windows, `path.join()` uses `\`, but globs expect `/`.
+    fn normalize_path(path: &Path) -> String {
+        let s = path.to_string_lossy();
+        #[cfg(windows)]
+        {
+            s.replace('\\', "/")
+        }
+        #[cfg(not(windows))]
+        {
+            s.into_owned()
+        }
+    }
 
+    /// Check if relative path passes path-level filters.
+    /// For files: must match include (if any) and not match exclude.
+    /// For directories: always traverse (never prune on include), but skip if excluded.
+    pub fn allows_path(&self, path: &Path, is_dir: bool) -> bool {
+        let path_str = Self::normalize_path(path);
+
+        // Directories: never prune based on include patterns, only on exclude
+        // This ensures we traverse into dirs to find files that might match includes
+        if is_dir {
+            return !self.path_exclude.is_match(&path_str);
+        }
+
+        // Files: must match include (if any) and not match exclude
         if let Some(inc) = &self.path_include {
-            if !inc.is_match(&*path_str) {
+            if !inc.is_match(&path_str) {
                 return false;
             }
         }
-        !self.path_exclude.is_match(&*path_str)
+        !self.path_exclude.is_match(&path_str)
     }
 }
 ```
@@ -1109,8 +1190,10 @@ impl GitBackend {
             let entry_rel = rel_path.join(name);
             let out_path = out_base.join(&entry_rel);
 
-            // Apply path-level filtering
-            if !matcher.allows_path(&entry_rel) {
+            let is_dir = matches!(entry.mode().kind(), gix::object::tree::EntryKind::Tree);
+
+            // Apply path-level filtering (directories only skip on exclude, files also check include)
+            if !matcher.allows_path(&entry_rel, is_dir) {
                 continue;
             }
 
@@ -1228,7 +1311,10 @@ impl GitBackend {
             let name = entry.filename();
             let entry_rel = rel_path.join(name);
 
-            if !matcher.allows_path(&entry_rel) {
+            let is_dir = matches!(entry.mode().kind(), gix::object::tree::EntryKind::Tree);
+
+            // Apply path-level filtering (directories only skip on exclude, files also check include)
+            if !matcher.allows_path(&entry_rel, is_dir) {
                 continue;
             }
 
@@ -1314,14 +1400,27 @@ No complex strategy abstraction. Per-file copy that tries reflink first:
 
 ```rust
 /// Copy file from staging to target. Tries reflink, falls back to copy.
+/// Preserves mtime for timestamp determinism.
 fn copy_file(src: &Path, dst: &Path) -> Result<(), Error> {
     // Try reflink first (instant, COW)
     if reflink_copy::reflink(src, dst).is_ok() {
+        // Reflink doesn't copy mtime - preserve it for determinism
+        copy_mtime(src, dst)?;
         return Ok(());
     }
 
     // Fall back to regular copy
     std::fs::copy(src, dst)?;
+    // std::fs::copy doesn't preserve mtime either - set it explicitly
+    copy_mtime(src, dst)?;
+    Ok(())
+}
+
+/// Copy mtime from src to dst for timestamp determinism.
+fn copy_mtime(src: &Path, dst: &Path) -> Result<(), Error> {
+    let meta = std::fs::metadata(src)?;
+    let mtime = filetime::FileTime::from_last_modification_time(&meta);
+    filetime::set_file_mtime(dst, mtime)?;
     Ok(())
 }
 
@@ -1689,14 +1788,15 @@ pub fn check_artifact_state(
     registry: &dyn Registry,
     key: &ArtifactKey,
 ) -> Result<ArtifactState, Error> {
+    // Missing beats ejected — allows restoration by deleting files and re-syncing
+    if !target_path.exists() {
+        return Ok(ArtifactState::Missing);
+    }
+
     // Check if artifact is ejected (match both source and artifact name)
     let is_ejected = ejected.iter().any(|e| e.artifact == artifact_name && e.source == expected_source);
     if is_ejected {
         return Ok(ArtifactState::Ejected);
-    }
-
-    if !target_path.exists() {
-        return Ok(ArtifactState::Missing);
     }
 
     let record = match registry.get(key)? {
@@ -1805,6 +1905,7 @@ pub fn sync(
     local_lock: Option<Lock>,
     force: bool,
     interactive: bool,
+    prune: bool,  // Remove artifacts no longer in config
 ) -> Result<(Lock, Option<Lock>), Error> {
     let backend = GitBackend::new(phora_dir().join("git"));
     let registry: Box<dyn Registry> = Box::new(FileRegistry::open(phora_dir().join("state"))?);
@@ -2001,6 +2102,58 @@ pub fn sync(
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Phase 3: Prune orphaned artifacts (if --prune)
+    // ─────────────────────────────────────────────────────────
+
+    if prune {
+        // Collect all expected artifacts from current config
+        let mut expected: std::collections::HashSet<ArtifactKey> = std::collections::HashSet::new();
+
+        for (target_name, target) in &effective_config.targets {
+            let source_names = target.resolve_sources(&effective_config.sources);
+            for source_name in source_names {
+                let source = &effective_config.sources[source_name];
+                let resolved = &resolved_sources[source_name];
+                let matcher = PathMatcher::new(&source.include, &source.exclude)?;
+
+                let discovered = backend.discover_artifacts(
+                    source_name,
+                    &resolved.commit,
+                    source.root.as_deref(),
+                    &matcher,
+                )?;
+
+                for artifact_name in discovered {
+                    expected.insert(ArtifactKey {
+                        target: target_name.clone(),
+                        source: source_name.to_string(),
+                        artifact: artifact_name,
+                    });
+                }
+            }
+        }
+
+        // Find and remove orphaned artifacts
+        let all_records = registry.list_all()?;
+        for record in all_records {
+            if !expected.contains(&record.key) {
+                // Orphaned: remove from disk and registry
+                let target = &effective_config.targets.get(&record.key.target);
+                if let Some(target) = target {
+                    let artifact_path = target.expanded_path().join(
+                        target.layout.artifact_path(&record.key.source, &record.key.artifact)
+                    );
+                    if artifact_path.exists() {
+                        eprintln!("🗑 Pruning orphaned artifact: {}:{}", record.key.source, record.key.artifact);
+                        std::fs::remove_dir_all(&artifact_path)?;
+                    }
+                }
+                registry.remove(&record.key)?;
             }
         }
     }
@@ -2451,6 +2604,15 @@ fs2 = "0.4"                           # file locks for state.lock
 * Given non-existent artifact
 * When `phora eject ...`
 * Then error: artifact not managed
+
+### Prune
+
+* Given source removed from `phora.toml`, artifacts still deployed
+* When `phora sync` (without --prune)
+* Then artifacts remain on disk, registry entries remain (orphaned)
+* Given source removed from `phora.toml`, artifacts still deployed
+* When `phora sync --prune`
+* Then orphaned artifacts removed from disk and registry with message
 
 ### Layout
 
