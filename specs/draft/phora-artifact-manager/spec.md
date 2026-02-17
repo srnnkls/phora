@@ -37,7 +37,8 @@ A package manager for fetching, caching, and projecting artifacts from git sourc
 | `phora list [--plan]`                                        | Show sources and deployment state; --plan shows pending  |
 | `phora verify`                                               | Verify deployed files by hashing contents (cold path)    |
 | `phora where ...`                                            | Query global registry (where-used / deployments)         |
-| `phora eject <artifact> --source <source> --target <target>` | Stop managing, keep file (vendor)                        |
+| `phora eject <artifact> --source <source> --target <target>` | Permanently stop managing, keep file (vendor)            |
+| `phora uneject <artifact> --source <source> --target <target>` | Resume managing an ejected artifact                    |
 | `phora rebuild-registry`                                     | Rebuild global registry from lock + on-disk targets      |
 | `phora check-match --source <source> <path>`                 | Debug include/exclude matching (like `git check-ignore`) |
 
@@ -164,7 +165,7 @@ Operational note:
 │ • bare mirrors            │   │ • multi-source layouts    │
 │ • fetch/auth              │   │ • export to staging       │
 │ • ref resolution          │   │ • atomic swap             │
-│ • tree export (no .git)   │   │ • eject/restore           │
+│ • tree export (no .git)   │   │ • eject/uneject           │
 └───────────────────────────┘   └───────────────────────────┘
               │                           │
               ▼                           ▼
@@ -1524,8 +1525,9 @@ When an artifact is ejected:
   * Entry added to target's `meta.toml` ejected list
   * Files remain on disk untouched
 
-When an ejected artifact's files are deleted and `phora sync` runs:
-  * Artifact is re-projected (ejected entry removed)
+**Eject semantics (v1):** Once ejected, the (target, source, artifact) tuple is permanently unmanaged.
+`phora sync` MUST NOT re-project it, even if the files are deleted.
+To resume management, use `phora uneject` explicitly.
 
 ### Registry Interface (pluggable backend)
 
@@ -2094,12 +2096,6 @@ pub fn sync(
 
                         // Cleanup staging area (best-effort, after all artifacts done)
                         let _ = std::fs::remove_dir_all(&staging_base);
-
-                        // Clear ejected on restore
-                        if let Some(pos) = ejected.iter().position(|e| e.artifact == artifact_name) {
-                            ejected.swap_remove(pos);
-                            registry.save_ejected(target_name, &ejected)?;
-                        }
                     }
                 }
             }
@@ -2291,7 +2287,39 @@ pub fn eject(
 }
 ```
 
-**To restore:** delete the ejected files, run `phora sync`.
+**To restore:** run `phora uneject <artifact> --source <source> --target <target>`, then `phora sync`.
+
+### phora uneject
+
+Resume managing a previously ejected artifact. Removes the ejected entry; next `phora sync` will deploy it.
+
+```rust
+pub fn uneject(
+    config: &Config,
+    registry: &dyn Registry,
+    artifact: &str,
+    source: &str,
+    target: &str,
+) -> Result<(), Error> {
+    config.targets.get(target).ok_or(Error::TargetNotFound {
+        target: target.to_string(),
+    })?;
+
+    let mut ejected = registry.load_ejected(target)?;
+    let pos = ejected.iter().position(|e| e.artifact == artifact && e.source == source)
+        .ok_or(Error::ArtifactNotEjected {
+            target: target.to_string(),
+            source: source.to_string(),
+            artifact: artifact.to_string(),
+        })?;
+
+    ejected.swap_remove(pos);
+    registry.save_ejected(target, &ejected)?;
+
+    eprintln!("Unejected: {} (will be deployed on next sync)", artifact);
+    Ok(())
+}
+```
 
 ## List Output
 
@@ -2318,12 +2346,13 @@ Targets:
     loqui/python/      loqui@v1.0 ✓
     loqui/go/          loqui@v1.0 ✓
     old-policy/        [ejected]
+    deleted-policy/    [ejected, missing]
     unknown-dir/       [foreign]
 ```
 
 ### phora list --plan
 
-Shows what `phora sync` would do without making changes. Computes artifacts from effective config + locks, diffs against registry.
+Shows what `phora sync` would do without making changes. Computes artifacts from effective config + locks, diffs against registry. Ejected artifacts are excluded from pending changes.
 
 ```
 $ phora list --plan
@@ -2336,6 +2365,7 @@ Pending changes:
   vscode (~/.config/Code/User):
     ~ snippets/          company-configs@v2.1 → v2.2 (update)
     - old-keybindings/   (removed from source)
+    ⊘ old-policy/        [ejected — skipped]
 
   cupcake-policies:
     (no changes)
@@ -2598,12 +2628,18 @@ fs2 = "0.4"                           # file locks for state.lock
 * Given managed artifact
 * When `phora eject <artifact> --source <source> --target <target>`
 * Then artifact marked ejected in registry, registry record deleted, files untouched
-* Given ejected artifact deleted by user
+* Given ejected artifact (files present or deleted)
 * When `phora sync`
-* Then artifact re-projected (ejected list cleared for that artifact)
+* Then artifact is NOT re-projected; ejected entry remains
+* Given ejected artifact
+* When `phora uneject <artifact> --source <source> --target <target>` then `phora sync`
+* Then ejected entry removed, artifact re-projected
 * Given non-existent artifact
 * When `phora eject ...`
 * Then error: artifact not managed
+* Given artifact that is not ejected
+* When `phora uneject ...`
+* Then error: artifact not ejected
 
 ### Prune
 
@@ -2664,8 +2700,9 @@ fs2 = "0.4"                           # file locks for state.lock
   * Then artifacts on disk appear as `[foreign/untracked]` (no crash)
 * Given artifact previously ejected and later deleted by user
 
-  * When `phora sync` successfully re-projects it
-  * Then it is removed from the registry ejected list (clearing ejected on restore)
+  * When `phora sync`
+  * Then artifact remains ejected (not re-projected)
+  * And `phora list` shows `[ejected, missing]`
 
 ### No Target Metadata
 
