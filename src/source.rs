@@ -198,14 +198,118 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalizes_ssh_and_https_to_same_form() {
+    fn scp_style_ssh_drops_userinfo_and_strips_git_suffix() {
         assert_eq!(
             NormalizedUrl::parse("git@github.com:user/repo.git").as_str(),
             "github.com/user/repo"
         );
+    }
+
+    #[test]
+    fn https_strips_scheme_and_git_suffix() {
         assert_eq!(
-            NormalizedUrl::parse("https://GitHub.com/user/repo.git").as_str(),
+            NormalizedUrl::parse("https://github.com/user/repo.git").as_str(),
             "github.com/user/repo"
+        );
+    }
+
+    #[test]
+    fn host_is_lowercased_but_path_case_is_preserved() {
+        assert_eq!(
+            NormalizedUrl::parse("https://GitHub.com/User/Repo").as_str(),
+            "github.com/User/Repo"
+        );
+    }
+
+    #[test]
+    fn ssh_scheme_drops_scheme_and_userinfo() {
+        assert_eq!(
+            NormalizedUrl::parse("ssh://git@github.com/user/repo.git").as_str(),
+            "github.com/user/repo"
+        );
+    }
+
+    #[test]
+    fn trailing_slash_is_trimmed() {
+        assert_eq!(
+            NormalizedUrl::parse("https://github.com/user/repo/").as_str(),
+            "github.com/user/repo"
+        );
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_trimmed() {
+        assert_eq!(
+            NormalizedUrl::parse("  https://github.com/user/repo.git  ").as_str(),
+            "github.com/user/repo"
+        );
+    }
+
+    #[test]
+    fn local_path_normalizes_deterministically() {
+        let first = NormalizedUrl::parse("/home/x/dev/loqui");
+        let second = NormalizedUrl::parse("/home/x/dev/loqui");
+        assert_eq!(first, second);
+        assert_eq!(first.as_str(), "/home/x/dev/loqui");
+    }
+
+    #[test]
+    fn equivalent_ssh_and_https_forms_share_one_mirror_key() {
+        let ssh = MirrorKey::from_url(&NormalizedUrl::parse("git@github.com:user/repo.git"));
+        let https = MirrorKey::from_url(&NormalizedUrl::parse("https://github.com/user/repo.git"));
+        let ssh_scheme =
+            MirrorKey::from_url(&NormalizedUrl::parse("ssh://git@github.com/user/repo"));
+        assert_eq!(ssh, https);
+        assert_eq!(https, ssh_scheme);
+    }
+
+    #[test]
+    fn mirror_key_is_sixteen_hex_chars() {
+        let key = MirrorKey::from_url(&NormalizedUrl::parse("https://github.com/user/repo.git"));
+        assert_eq!(key.as_str().len(), 16);
+        assert!(key.as_str().chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn mirror_key_is_deterministic_for_same_input() {
+        let first = MirrorKey::from_url(&NormalizedUrl::parse("https://github.com/user/repo"));
+        let second = MirrorKey::from_url(&NormalizedUrl::parse("https://github.com/user/repo"));
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn different_repos_produce_different_keys() {
+        let one = MirrorKey::from_url(&NormalizedUrl::parse("https://github.com/user/repo-a"));
+        let two = MirrorKey::from_url(&NormalizedUrl::parse("https://github.com/user/repo-b"));
+        assert_ne!(one, two);
+    }
+
+    #[test]
+    fn mirror_key_matches_blake3_of_normalized_url_truncated_to_sixteen() {
+        let url = "git@github.com:user/repo.git";
+        let normalized = NormalizedUrl::parse(url);
+        let expected = blake3::hash(b"github.com/user/repo").to_hex()[..16].to_string();
+        assert_eq!(MirrorKey::from_url(&normalized).as_str(), expected);
+    }
+
+    #[test]
+    fn mirror_path_is_git_dir_joined_with_key_dot_git() {
+        let git_dir = PathBuf::from("/var/phora/git");
+        let backend = GitBackend::new(git_dir.clone());
+        let url = "git@github.com:user/repo.git";
+        let key = MirrorKey::from_url(&NormalizedUrl::parse(url));
+        assert_eq!(
+            backend.mirror_path(url),
+            git_dir.join(format!("{}.git", key.as_str()))
+        );
+    }
+
+    #[test]
+    fn mirror_path_unifies_equivalent_urls_to_one_directory() {
+        let backend = GitBackend::new(PathBuf::from("/var/phora/git"));
+        assert_eq!(
+            backend.mirror_path("git@github.com:user/repo.git"),
+            backend.mirror_path("https://github.com/user/repo")
         );
     }
 }
