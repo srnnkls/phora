@@ -1249,6 +1249,9 @@ mod tests {
         fn save_ejected(&self, target: &str, ejected: &[EjectedEntry]) -> Result<()> {
             self.inner.save_ejected(target, ejected)
         }
+        fn locks_dir(&self) -> PathBuf {
+            self.inner.locks_dir()
+        }
     }
 
     #[test]
@@ -1312,6 +1315,9 @@ mod tests {
         }
         fn save_ejected(&self, target: &str, ejected: &[EjectedEntry]) -> Result<()> {
             self.inner.save_ejected(target, ejected)
+        }
+        fn locks_dir(&self) -> PathBuf {
+            self.inner.locks_dir()
         }
     }
 
