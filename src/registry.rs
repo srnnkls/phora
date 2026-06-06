@@ -78,6 +78,9 @@ pub trait Registry {
 
     fn load_ejected(&self, target: &str) -> Result<Vec<EjectedEntry>>;
     fn save_ejected(&self, target: &str, ejected: &[EjectedEntry]) -> Result<()>;
+
+    /// Directory holding the deploy journal and `state.lock`.
+    fn locks_dir(&self) -> PathBuf;
 }
 
 pub struct FileRegistry {
@@ -311,6 +314,10 @@ impl Registry for FileRegistry {
         let serialized =
             toml::to_string(&meta).map_err(|e| Error::Registry(format!("serialize meta: {e}")))?;
         atomic_write(&self.meta_path(target), &serialized)
+    }
+
+    fn locks_dir(&self) -> PathBuf {
+        self.state_root.join("locks")
     }
 }
 
