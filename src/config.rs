@@ -8,7 +8,7 @@ use serde::Deserialize;
 use crate::error::{Error, Result};
 use crate::source::ExportPolicy;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub version: u32,

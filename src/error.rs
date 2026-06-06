@@ -43,6 +43,13 @@ pub enum Error {
     #[error("sync error: {0}")]
     Sync(String),
 
+    #[error("artifact `{artifact}` collides in target `{target}` from sources: {sources:?}")]
+    Collision {
+        artifact: String,
+        sources: Vec<String>,
+        target: String,
+    },
+
     #[error("not implemented: {0}")]
     NotImplemented(&'static str),
 }
