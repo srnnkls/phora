@@ -48,7 +48,10 @@ pub trait SourceBackend {
         matcher: &PathMatcher,
     ) -> Result<Vec<String>>;
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "collapses into an ExportRequest struct when GitBackend::export_artifact is implemented (PAM-016)"
+    )]
     fn export_artifact(
         &self,
         source: &str,
