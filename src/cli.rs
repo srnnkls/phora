@@ -5,7 +5,7 @@ use std::path::Path;
 
 use clap::{Parser, Subcommand};
 
-use crate::config::{Config, Source};
+use crate::config::{Config, Host, Source};
 use crate::error::{Error, Result};
 use crate::matcher::PathMatcher;
 use crate::paths::{ProjectId, phora_dir};
@@ -91,7 +91,13 @@ pub enum Command {
 )]
 pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Add { .. } => Err(Error::NotImplemented("add")),
+        Command::Add {
+            url,
+            name,
+            branch,
+            tag,
+            root,
+        } => run_add(&url, name, branch, tag, root),
         Command::Sync { .. } => Err(Error::NotImplemented("sync")),
         Command::Update { .. } => Err(Error::NotImplemented("update")),
         Command::List { .. } => Err(Error::NotImplemented("list")),
@@ -162,6 +168,76 @@ pub fn run(cli: Cli) -> Result<()> {
             print_check_match(&source, &path, &report);
             Ok(())
         }
+    }
+}
+
+fn run_add(
+    url: &str,
+    name: Option<String>,
+    branch: Option<String>,
+    tag: Option<String>,
+    root: Option<String>,
+) -> Result<()> {
+    let hosts = load_config().map(|c| c.hosts).unwrap_or_default();
+    let parsed = parse_add_url(url, &hosts)?;
+
+    let name = name.unwrap_or(parsed.name);
+    let branch = branch.or(parsed.branch);
+    let root = root.or(parsed.root);
+
+    let doc_text =
+        std::fs::read_to_string("phora.toml").unwrap_or_else(|_| "version = 1\n".to_owned());
+    let updated = insert_source_with_ref(
+        &doc_text,
+        &name,
+        &parsed.git,
+        branch.as_deref(),
+        tag.as_deref(),
+        root.as_deref(),
+    )?;
+    std::fs::write("phora.toml", &updated)?;
+
+    let refspec = tag
+        .or(branch)
+        .map_or_else(String::new, |r| format!(" ({r})"));
+    println!("Added source '{name}': {}{refspec}", parsed.git);
+    Ok(())
+}
+
+fn insert_source_with_ref(
+    doc_text: &str,
+    name: &str,
+    git: &str,
+    branch: Option<&str>,
+    tag: Option<&str>,
+    root: Option<&str>,
+) -> Result<String> {
+    let mut doc = doc_text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| Error::Config(format!("parse phora.toml: {e}")))?;
+
+    let mut table = toml_edit::Table::new();
+    table["git"] = toml_edit::value(git);
+    if let Some(branch) = branch {
+        table["branch"] = toml_edit::value(branch);
+    }
+    if let Some(tag) = tag {
+        table["tag"] = toml_edit::value(tag);
+    }
+    if let Some(root) = root {
+        table["root"] = toml_edit::value(root);
+    }
+
+    ensure_sources_table(&mut doc);
+    doc["sources"][name] = toml_edit::Item::Table(table);
+    Ok(doc.to_string())
+}
+
+fn ensure_sources_table(doc: &mut toml_edit::DocumentMut) {
+    if doc.get("sources").is_none() {
+        let mut sources = toml_edit::Table::new();
+        sources.set_implicit(true);
+        doc["sources"] = toml_edit::Item::Table(sources);
     }
 }
 
@@ -320,6 +396,217 @@ pub fn check_match_cmd(source: &Source, path: &str) -> CheckMatchReport {
         artifact_allowed: matcher.allows_artifact(artifact),
         path_allowed: matcher.allows_path(Path::new(path), false),
     }
+}
+
+/// A source derived from an `add` URL/shorthand, before name overrides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedSource {
+    pub name: String,
+    pub git: String,
+    pub branch: Option<String>,
+    pub root: Option<String>,
+}
+
+/// Expands an `add` URL/shorthand into a [`ParsedSource`] using built-in
+/// `github`/`gitlab` host templates plus any host in `hosts`.
+///
+/// # Errors
+///
+/// Returns [`Error::Config`] if the input cannot be parsed into owner/repo.
+pub fn parse_add_url(input: &str, hosts: &BTreeMap<String, Host>) -> Result<ParsedSource> {
+    let templates = host_templates(hosts);
+
+    if is_scp_ssh(input) {
+        return Ok(parse_scp_ssh(input));
+    }
+    if let Some((scheme, rest)) = split_scheme(input) {
+        return parse_full_url(input, scheme, rest);
+    }
+    parse_shorthand(input, &templates)
+}
+
+/// `(domain, git_url template)` pairs from built-in defaults overlaid by `hosts`.
+fn host_templates(hosts: &BTreeMap<String, Host>) -> Vec<(String, String)> {
+    let mut templates: BTreeMap<String, String> = BTreeMap::new();
+    templates.insert(
+        "github".to_owned(),
+        "https://github.com/{owner}/{repo}.git".to_owned(),
+    );
+    templates.insert(
+        "gitlab".to_owned(),
+        "https://gitlab.com/{owner}/{repo}.git".to_owned(),
+    );
+    for (name, host) in hosts {
+        if let Some(url) = &host.git_url {
+            templates.insert(name.clone(), url.clone());
+        }
+    }
+    templates
+        .into_values()
+        .filter_map(|url| {
+            let domain = template_domain(&url)?.to_owned();
+            Some((domain, url))
+        })
+        .collect()
+}
+
+/// The host domain embedded in a `git_url` template (between scheme/user and the
+/// next `/` or `:` port). `ssh://git@git.company.com:2222/...` yields `git.company.com`.
+fn template_domain(url: &str) -> Option<&str> {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let after_user = after_scheme
+        .split_once('@')
+        .map_or(after_scheme, |(_, rest)| rest);
+    let end = after_user.find(['/', ':']).unwrap_or(after_user.len());
+    let domain = &after_user[..end];
+    (!domain.is_empty()).then_some(domain)
+}
+
+fn is_scp_ssh(input: &str) -> bool {
+    if input.contains("://") {
+        return false;
+    }
+    match (input.find('@'), input.find(':')) {
+        (Some(at), Some(colon)) => at < colon,
+        _ => false,
+    }
+}
+
+fn parse_scp_ssh(input: &str) -> ParsedSource {
+    ParsedSource {
+        name: repo_name(input),
+        git: input.to_owned(),
+        branch: None,
+        root: None,
+    }
+}
+
+fn split_scheme(input: &str) -> Option<(&str, &str)> {
+    let (scheme, rest) = input.split_once("://")?;
+    matches!(scheme, "https" | "http" | "ssh").then_some((scheme, rest))
+}
+
+fn parse_full_url(input: &str, scheme: &str, rest: &str) -> Result<ParsedSource> {
+    let (host, path) = rest
+        .split_once('/')
+        .ok_or_else(|| Error::Config(format!("cannot parse owner/repo from `{input}`")))?;
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let [owner, repo, tail @ ..] = segments.as_slice() else {
+        return Err(Error::Config(format!(
+            "expected <owner>/<repo> in `{input}`"
+        )));
+    };
+    let name = strip_git(repo).to_owned();
+
+    if let ["tree", git_ref, root_segments @ ..] = tail {
+        return Ok(ParsedSource {
+            name,
+            git: with_git_suffix(&format!("{scheme}://{host}/{owner}/{repo}")),
+            branch: Some((*git_ref).to_owned()),
+            root: join_root(root_segments),
+        });
+    }
+
+    Ok(ParsedSource {
+        name,
+        git: with_git_suffix(input),
+        branch: None,
+        root: None,
+    })
+}
+
+fn parse_shorthand(input: &str, templates: &[(String, String)]) -> Result<ParsedSource> {
+    let segments: Vec<&str> = input.split('/').filter(|s| !s.is_empty()).collect();
+    let first = segments
+        .first()
+        .ok_or_else(|| Error::Config(format!("empty add target `{input}`")))?;
+
+    if let Some((_, template)) = templates.iter().find(|(domain, _)| domain == first) {
+        let [_, owner, repo, root_segments @ ..] = segments.as_slice() else {
+            return Err(Error::Config(format!(
+                "expected <host>/<owner>/<repo> in `{input}`"
+            )));
+        };
+        return Ok(ParsedSource {
+            name: (*repo).to_owned(),
+            git: expand_template(template, owner, repo),
+            branch: None,
+            root: join_root(root_segments),
+        });
+    }
+
+    let [owner, repo, root_segments @ ..] = segments.as_slice() else {
+        return Err(Error::Config(format!(
+            "expected <owner>/<repo> shorthand in `{input}`"
+        )));
+    };
+    let template = "https://github.com/{owner}/{repo}.git";
+    Ok(ParsedSource {
+        name: (*repo).to_owned(),
+        git: expand_template(template, owner, repo),
+        branch: None,
+        root: join_root(root_segments),
+    })
+}
+
+fn join_root(segments: &[&str]) -> Option<String> {
+    (!segments.is_empty()).then(|| segments.join("/"))
+}
+
+fn expand_template(template: &str, owner: &str, repo: &str) -> String {
+    template.replace("{owner}", owner).replace("{repo}", repo)
+}
+
+fn repo_name(input: &str) -> String {
+    let last = input.rsplit('/').next().unwrap_or(input);
+    strip_git(last).to_owned()
+}
+
+fn strip_git(segment: &str) -> &str {
+    segment.strip_suffix(".git").unwrap_or(segment)
+}
+
+#[expect(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "git remote URLs are case-sensitive strings, not filesystem paths"
+)]
+fn with_git_suffix(url: &str) -> String {
+    if url.ends_with(".git") {
+        url.to_owned()
+    } else {
+        format!("{url}.git")
+    }
+}
+
+/// Inserts a `[sources.<name>]` table into existing `phora.toml` text,
+/// preserving surrounding content and formatting, and returns the new text.
+///
+/// # Errors
+///
+/// Returns [`Error::Config`] if `doc_text` is not valid TOML.
+pub fn insert_source(
+    doc_text: &str,
+    name: &str,
+    git: &str,
+    branch: Option<&str>,
+    root: Option<&str>,
+) -> Result<String> {
+    let mut doc = doc_text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| Error::Config(format!("parse phora.toml: {e}")))?;
+
+    let mut table = toml_edit::Table::new();
+    table["git"] = toml_edit::value(git);
+    if let Some(branch) = branch {
+        table["branch"] = toml_edit::value(branch);
+    }
+    if let Some(root) = root {
+        table["root"] = toml_edit::value(root);
+    }
+
+    ensure_sources_table(&mut doc);
+    doc["sources"][name] = toml_edit::Item::Table(table);
+    Ok(doc.to_string())
 }
 
 #[cfg(test)]
@@ -657,6 +944,361 @@ mod tests {
         assert_ne!(
             mixed.artifact_allowed, mixed.path_allowed,
             "artifact-level and path-level outcomes must differ for editor/notes.bak"
+        );
+    }
+
+    // parse_add_url
+
+    fn no_hosts() -> BTreeMap<String, Host> {
+        BTreeMap::new()
+    }
+
+    fn parse(input: &str) -> ParsedSource {
+        parse_add_url(input, &no_hosts()).unwrap_or_else(|e| panic!("parse `{input}`: {e}"))
+    }
+
+    #[test]
+    fn github_shorthand_expands_to_https_git_url() {
+        let parsed = parse("srnnkls/loqui");
+        assert_eq!(
+            parsed.git, "https://github.com/srnnkls/loqui.git",
+            "owner/repo shorthand must expand via the default github template"
+        );
+        assert_eq!(
+            parsed.name, "loqui",
+            "default name is the repo segment, not the owner"
+        );
+        assert!(
+            parsed.branch.is_none(),
+            "a bare shorthand carries no branch"
+        );
+        assert!(parsed.root.is_none(), "a bare shorthand carries no root");
+    }
+
+    #[test]
+    fn github_shorthand_with_extra_path_becomes_root() {
+        let parsed = parse("owner/repo/path/to/dir");
+        assert_eq!(
+            parsed.git, "https://github.com/owner/repo.git",
+            "only owner/repo form the git URL; the rest is the root"
+        );
+        assert_eq!(
+            parsed.root.as_deref(),
+            Some("path/to/dir"),
+            "trailing path segments become the source root"
+        );
+        assert_eq!(
+            parsed.name, "repo",
+            "default name is still the repo segment"
+        );
+        assert!(
+            parsed.branch.is_none(),
+            "a shorthand+path carries no branch"
+        );
+    }
+
+    #[test]
+    fn host_prefixed_shorthand_expands_to_https() {
+        let parsed = parse("github.com/owner/repo");
+        assert_eq!(
+            parsed.git, "https://github.com/owner/repo.git",
+            "a github.com/owner/repo shorthand must expand to the full https git URL"
+        );
+        assert_eq!(parsed.name, "repo");
+        assert!(
+            parsed.branch.is_none(),
+            "a host-prefixed shorthand carries no branch"
+        );
+        assert!(
+            parsed.root.is_none(),
+            "a host-prefixed shorthand carries no root"
+        );
+    }
+
+    #[test]
+    fn full_https_url_gets_git_suffix_appended() {
+        let parsed = parse("https://github.com/owner/repo");
+        assert_eq!(
+            parsed.git, "https://github.com/owner/repo.git",
+            "a full https URL without .git must have .git appended"
+        );
+        assert_eq!(parsed.name, "repo");
+        assert!(parsed.branch.is_none());
+        assert!(parsed.root.is_none());
+    }
+
+    #[test]
+    fn tree_url_extracts_branch_and_root() {
+        let parsed = parse("https://github.com/company/configs/tree/main/editor");
+        assert_eq!(
+            parsed.git, "https://github.com/company/configs.git",
+            "the /tree/<ref>/<path> tail must be stripped from the git URL"
+        );
+        assert_eq!(
+            parsed.branch.as_deref(),
+            Some("main"),
+            "the segment after /tree/ is the branch"
+        );
+        assert_eq!(
+            parsed.root.as_deref(),
+            Some("editor"),
+            "the segments after /tree/<ref>/ are the root"
+        );
+        assert_eq!(
+            parsed.name, "configs",
+            "name is the repo, not the path tail"
+        );
+    }
+
+    #[test]
+    fn gitlab_shorthand_uses_gitlab_default_template() {
+        let parsed = parse("gitlab.com/owner/repo");
+        assert_eq!(
+            parsed.git, "https://gitlab.com/owner/repo.git",
+            "gitlab.com host must resolve via the built-in gitlab template, not github"
+        );
+        assert_eq!(parsed.name, "repo");
+        assert!(
+            parsed.branch.is_none(),
+            "a gitlab shorthand carries no branch"
+        );
+        assert!(parsed.root.is_none(), "a gitlab shorthand carries no root");
+    }
+
+    #[test]
+    fn ssh_url_is_kept_as_a_git_remote() {
+        let parsed = parse("git@github.com:owner/repo.git");
+        assert_eq!(
+            parsed.git, "git@github.com:owner/repo.git",
+            "an ssh scp-style URL is a valid git remote and must be preserved verbatim"
+        );
+        assert_eq!(
+            parsed.name, "repo",
+            "the repo segment of an ssh URL (minus .git) is the default name"
+        );
+        assert!(parsed.branch.is_none(), "an ssh URL carries no branch");
+        assert!(parsed.root.is_none(), "an ssh URL carries no root");
+    }
+
+    #[test]
+    fn custom_host_template_expands_host_prefixed_shorthand() {
+        let mut hosts = BTreeMap::new();
+        hosts.insert(
+            "company".to_owned(),
+            Config::parse(
+                "version = 1\n\n[hosts.company]\ngit_url = \"ssh://git@git.company.com:2222/scm/{owner}/{repo}.git\"\n",
+            )
+            .expect("host toml parses")
+            .hosts
+            .remove("company")
+            .expect("company host present"),
+        );
+
+        let parsed = parse_add_url("git.company.com/owner/repo", &hosts)
+            .expect("custom host shorthand resolves");
+
+        assert_eq!(
+            parsed.git, "ssh://git@git.company.com:2222/scm/owner/repo.git",
+            "the host template (ssh scheme, :2222 port, /scm/ prefix) must be applied verbatim; \
+             a generic default expansion could never produce this URL"
+        );
+        assert_eq!(parsed.name, "repo");
+        assert!(
+            parsed.branch.is_none(),
+            "a custom-host shorthand carries no branch"
+        );
+        assert!(
+            parsed.root.is_none(),
+            "a custom-host shorthand carries no root"
+        );
+    }
+
+    // insert_source
+
+    const ADD_BASE: &str = "version = 1\n\n[sources.foo]\ngit = \"https://github.com/me/foo.git\"\nbranch = \"main\"\n";
+
+    #[test]
+    fn insert_source_preserves_existing_source_and_adds_new() {
+        let out = insert_source(
+            ADD_BASE,
+            "loqui",
+            "https://github.com/srnnkls/loqui.git",
+            None,
+            None,
+        )
+        .expect("insert into base toml");
+
+        let cfg = Config::parse(&out).expect("inserted text is valid phora.toml");
+
+        let foo = cfg
+            .sources
+            .get("foo")
+            .expect("existing foo source survives");
+        assert_eq!(
+            foo.git, "https://github.com/me/foo.git",
+            "the pre-existing source must be untouched"
+        );
+        assert_eq!(
+            foo.branch.as_deref(),
+            Some("main"),
+            "the pre-existing source's branch must be preserved"
+        );
+
+        let loqui = cfg.sources.get("loqui").expect("new loqui source added");
+        assert_eq!(loqui.git, "https://github.com/srnnkls/loqui.git");
+        assert!(
+            loqui.branch.is_none(),
+            "no branch was passed, so no branch key must be emitted"
+        );
+        assert!(
+            loqui.root.is_none(),
+            "no root was passed, so no root key must be emitted"
+        );
+    }
+
+    #[test]
+    fn insert_source_emits_branch_and_root_when_some() {
+        let out = insert_source(
+            ADD_BASE,
+            "editor-config",
+            "https://github.com/company/configs.git",
+            Some("main"),
+            Some("editor"),
+        )
+        .expect("insert with branch and root");
+
+        let cfg = Config::parse(&out).expect("inserted text is valid phora.toml");
+
+        let foo = cfg
+            .sources
+            .get("foo")
+            .expect("pre-existing foo source survives the branch/root insert");
+        assert_eq!(
+            foo.git, "https://github.com/me/foo.git",
+            "the pre-existing source's git must be untouched when inserting a source with branch+root"
+        );
+        assert_eq!(
+            foo.branch.as_deref(),
+            Some("main"),
+            "the pre-existing source's branch must be preserved"
+        );
+
+        let added = cfg
+            .sources
+            .get("editor-config")
+            .expect("new editor-config source added");
+
+        assert_eq!(added.git, "https://github.com/company/configs.git");
+        assert_eq!(
+            added.branch.as_deref(),
+            Some("main"),
+            "a Some(branch) must be written as a branch key"
+        );
+        assert_eq!(
+            added.root.as_deref(),
+            Some(Path::new("editor")),
+            "a Some(root) must be written as a root key"
+        );
+    }
+
+    #[test]
+    fn insert_source_preserves_surrounding_text_verbatim() {
+        let seeded =
+            "# my comment\nversion = 1\n\n[sources.foo]\ngit = \"https://github.com/me/foo.git\"\n";
+
+        let out = insert_source(
+            seeded,
+            "loqui",
+            "https://github.com/srnnkls/loqui.git",
+            None,
+            None,
+        )
+        .expect("insert into seeded toml");
+
+        assert!(
+            out.contains("# my comment\nversion = 1"),
+            "the leading comment and version line must survive byte-for-byte (no reformatting), got:\n{out}"
+        );
+        assert!(
+            out.contains("[sources.foo]\ngit = \"https://github.com/me/foo.git\""),
+            "the existing [sources.foo] block must be present unchanged, not relocated or rewritten, got:\n{out}"
+        );
+        assert!(
+            out.contains("[sources.loqui]"),
+            "the new table must be inserted as [sources.loqui]"
+        );
+
+        let cfg = Config::parse(&out).expect("inserted text is valid phora.toml");
+        let foo = cfg
+            .sources
+            .get("foo")
+            .expect("existing foo source survives");
+        assert_eq!(
+            foo.git, "https://github.com/me/foo.git",
+            "re-parsing the output must yield the original foo git value"
+        );
+    }
+
+    #[test]
+    fn insert_source_uses_standard_table_blocks_not_inline() {
+        let first = insert_source(
+            "version = 1\n",
+            "loqui",
+            "https://github.com/srnnkls/loqui.git",
+            None,
+            None,
+        )
+        .expect("insert first source into a doc with no sources table");
+
+        assert!(
+            first.contains("[sources.loqui]"),
+            "the new source must be a standard table header [sources.loqui], not an inline table, got:\n{first}"
+        );
+        assert!(
+            first.contains("git = \"https://github.com/srnnkls/loqui.git\""),
+            "the git key must be written on its own line under [sources.loqui], got:\n{first}"
+        );
+        assert!(
+            !first.contains("sources = {"),
+            "the sources table must not be rendered as an inline `sources = {{ ... }}` table, got:\n{first}"
+        );
+
+        let second = insert_source(
+            &first,
+            "editor",
+            "https://github.com/company/editor.git",
+            None,
+            None,
+        )
+        .expect("insert second source after the first");
+
+        assert!(
+            second.contains("[sources.loqui]"),
+            "the first source must remain a standard [sources.loqui] block after a second insert, got:\n{second}"
+        );
+        assert!(
+            second.contains("[sources.editor]"),
+            "the second source must be its own standard [sources.editor] block, got:\n{second}"
+        );
+        assert!(
+            !second.contains("sources = {"),
+            "repeated inserts must stay as separate table blocks, never collapse into an inline table, got:\n{second}"
+        );
+
+        let cfg = Config::parse(&second).expect("block-form output is valid phora.toml");
+        assert_eq!(
+            cfg.sources
+                .get("loqui")
+                .expect("loqui source parses from block form")
+                .git,
+            "https://github.com/srnnkls/loqui.git"
+        );
+        assert_eq!(
+            cfg.sources
+                .get("editor")
+                .expect("editor source parses from block form")
+                .git,
+            "https://github.com/company/editor.git"
         );
     }
 }
