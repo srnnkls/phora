@@ -121,22 +121,207 @@ impl PathMatcher {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::path::Path;
+
+    use super::PathMatcher;
+
+    fn matcher(include: &[&str], exclude: &[&str]) -> PathMatcher {
+        let inc: Vec<String> = include.iter().map(|s| (*s).to_string()).collect();
+        let exc: Vec<String> = exclude.iter().map(|s| (*s).to_string()).collect();
+        PathMatcher::new(&inc, &exc).expect("patterns build into a matcher")
+    }
+
+    fn file(matcher: &PathMatcher, rel: &str) -> bool {
+        matcher.allows_path(Path::new(rel), false)
+    }
+
+    fn dir(matcher: &PathMatcher, rel: &str) -> bool {
+        matcher.allows_path(Path::new(rel), true)
+    }
+
+    // ---- PAM-006: classification (is_path_level) ----
+    // Per spec table: artifact-level = no `/`, no `**`, no leading `/` (matches NAME).
+    // Path-level = contains `/` or `**` or leading `/` (matches full relative path).
 
     #[test]
-    fn bare_name_glob_is_artifact_level() {
-        assert!(!PathMatcher::is_path_level("code-*"));
+    fn classifies_bare_name_as_artifact_level() {
         assert!(!PathMatcher::is_path_level("editor"));
-        assert!(PathMatcher::is_path_level("**/test/**"));
-        assert!(PathMatcher::is_path_level("/editor"));
-        assert!(PathMatcher::is_path_level("editor/x.json"));
     }
 
     #[test]
-    fn unanchored_pattern_emits_bare_and_prefixed() {
+    fn classifies_bare_name_glob_as_artifact_level() {
+        // marker M020: `code-*` (no `/`, no `**`) targets artifact NAMES.
+        assert!(!PathMatcher::is_path_level("code-*"));
+    }
+
+    #[test]
+    fn classifies_extension_glob_as_artifact_level() {
+        // `*.bak` has no `/` and no `**`, so per spec it is an artifact-NAME glob,
+        // NOT a file-extension matcher. (Use `**/*.bak` for files.)
+        assert!(!PathMatcher::is_path_level("*.bak"));
+    }
+
+    #[test]
+    fn classifies_double_star_pattern_as_path_level() {
+        assert!(PathMatcher::is_path_level("**/test/**"));
+    }
+
+    #[test]
+    fn classifies_leading_slash_as_path_level() {
+        assert!(PathMatcher::is_path_level("/editor"));
+    }
+
+    #[test]
+    fn classifies_slash_pattern_as_path_level() {
+        assert!(PathMatcher::is_path_level("editor/*.json"));
+    }
+
+    // ---- PAM-007: normalization + anchoring ----
+
+    #[test]
+    fn unanchored_path_pattern_emits_bare_and_double_star_variant() {
         assert_eq!(
-            PathMatcher::normalize_path_pattern("x/y"),
-            vec!["x/y".to_string(), "**/x/y".to_string()]
+            PathMatcher::normalize_path_pattern("editor/x.json"),
+            vec!["editor/x.json".to_string(), "**/editor/x.json".to_string()],
         );
+    }
+
+    #[test]
+    fn anchored_path_pattern_strips_leading_slash_only() {
+        assert_eq!(
+            PathMatcher::normalize_path_pattern("/editor"),
+            vec!["editor".to_string()],
+        );
+    }
+
+    #[test]
+    fn already_double_star_prefixed_pattern_is_left_alone() {
+        assert_eq!(
+            PathMatcher::normalize_path_pattern("**/*.bak"),
+            vec!["**/*.bak".to_string()],
+        );
+    }
+
+    // ---- PAM-008 / PAM-006: allows_artifact ----
+
+    #[test]
+    fn empty_include_allows_all_artifacts() {
+        let m = matcher(&[], &[]);
+        assert!(m.allows_artifact("editor"));
+        assert!(m.allows_artifact("anything-at-all"));
+    }
+
+    #[test]
+    fn artifact_level_exclude_filters_by_name() {
+        let m = matcher(&[], &["code-*"]);
+        assert!(!m.allows_artifact("code-review"));
+        assert!(m.allows_artifact("editor"));
+    }
+
+    #[test]
+    fn artifact_include_admits_only_listed_names() {
+        let m = matcher(&["editor", "lint"], &[]);
+        assert!(m.allows_artifact("editor"));
+        assert!(m.allows_artifact("lint"));
+        assert!(!m.allows_artifact("vim"));
+    }
+
+    #[test]
+    fn artifact_exclude_overrides_include() {
+        let m = matcher(&["editor", "code-review"], &["code-*"]);
+        assert!(m.allows_artifact("editor"));
+        assert!(!m.allows_artifact("code-review"));
+    }
+
+    // ---- PAM-008: allows_path — M011 root-file matching ----
+
+    #[test]
+    fn double_star_bak_exclude_matches_root_level_file() {
+        // CRITICAL (M011): `**/*.bak` must reject a file at the artifact ROOT,
+        // not only nested ones. globset's `**/` alone would miss the root file.
+        let m = matcher(&[], &["**/*.bak"]);
+        assert!(!file(&m, "foo.bak"), "root-level foo.bak must be excluded");
+    }
+
+    #[test]
+    fn double_star_bak_exclude_matches_nested_file() {
+        let m = matcher(&[], &["**/*.bak"]);
+        assert!(!file(&m, "sub/foo.bak"), "nested sub/foo.bak must be excluded");
+    }
+
+    #[test]
+    fn double_star_bak_exclude_allows_non_bak_files() {
+        let m = matcher(&[], &["**/*.bak"]);
+        assert!(file(&m, "foo.json"));
+        assert!(file(&m, "sub/foo.json"));
+    }
+
+    #[test]
+    fn unanchored_path_exclude_matches_at_root_and_any_depth() {
+        // M011: unanchored `editor/x.json` matches at the artifact root AND nested.
+        let m = matcher(&[], &["editor/x.json"]);
+        assert!(!file(&m, "editor/x.json"), "root-level editor/x.json excluded");
+        assert!(
+            !file(&m, "nested/editor/x.json"),
+            "nested editor/x.json excluded via `**/` variant"
+        );
+        assert!(file(&m, "editor/y.json"), "non-matching file allowed");
+    }
+
+    // ---- PAM-008: allows_path — anchoring ----
+
+    #[test]
+    fn anchored_exclude_matches_root_only() {
+        let m = matcher(&[], &["/secret.txt"]);
+        assert!(!file(&m, "secret.txt"), "root secret.txt excluded");
+        assert!(
+            file(&m, "sub/secret.txt"),
+            "anchored pattern must NOT reach nested secret.txt"
+        );
+    }
+
+    // ---- PAM-008: allows_path — include semantics + precedence ----
+
+    #[test]
+    fn path_include_admits_only_matching_files() {
+        let m = matcher(&["**/*.json"], &[]);
+        assert!(file(&m, "config.json"), "root json passes include");
+        assert!(file(&m, "sub/config.json"), "nested json passes include");
+        assert!(!file(&m, "config.yaml"), "non-json rejected by include");
+    }
+
+    #[test]
+    fn path_include_never_prunes_directories() {
+        // Directories must not be pruned by include so traversal can reach nested
+        // matches; only exclude prunes a directory.
+        let m = matcher(&["**/*.json"], &[]);
+        assert!(dir(&m, "sub"), "include must not prune directories");
+    }
+
+    #[test]
+    fn directory_matching_anchored_exclude_is_pruned() {
+        // Anchored path-level exclude `/build` prunes the root dir but not nested ones.
+        let m = matcher(&[], &["/build"]);
+        assert!(!dir(&m, "build"), "anchored exclude prunes root build dir");
+        assert!(dir(&m, "src"), "unmatched directory is traversable");
+        assert!(dir(&m, "sub/build"), "anchored exclude does not reach nested build");
+    }
+
+    #[test]
+    fn directory_matching_unanchored_path_exclude_is_pruned_at_root() {
+        // M011 on the directory side: unanchored `cache/tmp` must prune the dir at
+        // the artifact root, not only when nested.
+        let m = matcher(&[], &["cache/tmp"]);
+        assert!(!dir(&m, "cache/tmp"), "root-level cache/tmp dir is pruned");
+        assert!(!dir(&m, "nested/cache/tmp"), "nested cache/tmp dir is pruned");
+    }
+
+    #[test]
+    fn path_exclude_overrides_path_include() {
+        // A file matching BOTH include and exclude is rejected (exclude precedence).
+        let m = matcher(&["**/*.json"], &["**/secret.json"]);
+        assert!(file(&m, "ok.json"));
+        assert!(!file(&m, "secret.json"), "exclude wins over include at root");
+        assert!(!file(&m, "sub/secret.json"), "exclude wins over include nested");
     }
 }
