@@ -1,15 +1,17 @@
 //! Top-level orchestration: sync, eject, uneject.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::{Config, LayoutKind, Source, Target, merge_configs};
 use crate::error::{Error, Result};
 use crate::lock::{Lock, LockedSource, merge_locks, source_matches, split_locks};
 use crate::matcher::PathMatcher;
-use crate::projection::{ArtifactState, Journal, check_artifact_state, deploy_artifact};
-use crate::registry::{ArtifactKey, Registry, RegistryRecord};
+use crate::projection::{
+    ArtifactState, Journal, check_artifact_state, deploy_artifact, recovery_sweep,
+};
+use crate::registry::{ArtifactKey, EjectedEntry, Registry, RegistryRecord};
 use crate::source::{ExportRequest, SourceBackend};
 
 /// Borrowed inputs to [`sync`]: the configs and locks plus run flags. Bundled so
@@ -22,6 +24,37 @@ pub struct SyncInput<'a> {
     pub force: bool,
     pub interactive: bool,
     pub prune: bool,
+    pub resolver: Option<&'a dyn ConflictResolver>,
+}
+
+/// How the user wants a single Modified/Foreign conflict handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resolution {
+    Skip,
+    Overwrite,
+    Eject,
+    Abort,
+}
+
+/// What kind of conflict surfaced at an artifact destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConflictKind {
+    Modified { changed: Vec<std::path::PathBuf> },
+    Foreign,
+}
+
+/// A single conflict presented to a [`ConflictResolver`] during interactive sync.
+#[derive(Debug, Clone)]
+pub struct Conflict {
+    pub target: String,
+    pub source: String,
+    pub artifact: String,
+    pub kind: ConflictKind,
+}
+
+/// Decides how to resolve each Modified/Foreign conflict in interactive sync.
+pub trait ConflictResolver {
+    fn resolve(&self, conflict: &Conflict) -> Resolution;
 }
 
 /// Result of a sync run: the recomputed base and local locks, plus whether any
@@ -30,6 +63,15 @@ pub struct SyncOutput {
     pub base_lock: Lock,
     pub local_lock: Option<Lock>,
     pub had_failures: bool,
+}
+
+/// A relative target path yields an empty (`""`) or absent parent; both normalize
+/// to `.` so `recovery_sweep` scans exactly the dir deploy stages into.
+fn target_parent(path: &Path) -> PathBuf {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
 }
 
 /// Distinct suffix per call so sibling staging dirs in a shared base never collide.
@@ -56,6 +98,16 @@ pub fn sync(
         .map(|lc| lc.sources.keys().cloned().collect())
         .unwrap_or_default();
 
+    let journal = Journal::open(&registry.locks_dir())?;
+
+    let mut swept_parents: BTreeSet<PathBuf> = BTreeSet::new();
+    for target in effective_config.targets.values() {
+        let parent = target_parent(&target.expanded_path());
+        if swept_parents.insert(parent.clone()) {
+            recovery_sweep(&parent, &journal, registry)?;
+        }
+    }
+
     let (routed, resolved_commits) = resolve_sources(
         &effective_config,
         effective_lock.as_ref(),
@@ -64,7 +116,6 @@ pub fn sync(
     )?;
     let (base_lock, local_lock) = split_locks(routed, &local_names);
 
-    let journal = Journal::open(&registry.locks_dir())?;
     let mut had_failures = false;
 
     for (target_name, target) in &effective_config.targets {
@@ -75,6 +126,8 @@ pub fn sync(
                 target,
                 commits: &resolved_commits,
                 force: input.force,
+                interactive: input.interactive,
+                resolver: input.resolver,
             },
             backend,
             registry,
@@ -117,6 +170,8 @@ struct TargetRun<'a> {
     target: &'a Target,
     commits: &'a BTreeMap<String, String>,
     force: bool,
+    interactive: bool,
+    resolver: Option<&'a dyn ConflictResolver>,
 }
 
 fn deploy_target(
@@ -157,67 +212,151 @@ fn deploy_target(
                 seen.insert(artifact_name.clone(), source_name.to_owned());
             }
 
-            let artifact_dst = target_path.join(layout.artifact_path(source_name, &artifact_name));
-            let key = ArtifactKey {
-                target: run.target_name.to_owned(),
-                source: source_name.to_owned(),
-                artifact: artifact_name.clone(),
-            };
-
-            let state = check_artifact_state(
-                &artifact_dst,
+            let entry = ArtifactEntry {
+                source,
                 source_name,
                 commit,
-                &ejected,
-                &artifact_name,
-                registry,
-                &key,
-            )?;
-
-            match state {
-                ArtifactState::Ejected | ArtifactState::Clean => {}
-                ArtifactState::Modified { changed } if !run.force => {
-                    eprintln!("phora: skipping locally modified {source_name}:{artifact_name}");
-                    for path in &changed {
-                        eprintln!("    {}", path.display());
-                    }
-                    eprintln!("  use --force to overwrite");
-                }
-                ArtifactState::Foreign if !run.force => {
-                    eprintln!(
-                        "phora: skipping foreign content at {}; use --force to overwrite",
-                        artifact_dst.display()
-                    );
-                }
-                ArtifactState::Missing
-                | ArtifactState::Modified { .. }
-                | ArtifactState::Foreign => {
-                    let deploy = deploy_one(
-                        backend,
-                        registry,
-                        journal,
-                        DeployContext {
-                            target_path: &target_path,
-                            layout_kind: layout.kind,
-                            source,
-                            source_name,
-                            commit,
-                            matcher: &matcher,
-                            artifact_name: &artifact_name,
-                            artifact_dst: &artifact_dst,
-                            key,
-                        },
-                    );
-                    if let Err(e) = deploy {
-                        eprintln!("phora: failed to deploy {source_name}:{artifact_name}: {e}");
-                        had_failures = true;
-                    }
-                }
-            }
+                matcher: &matcher,
+                artifact_name: &artifact_name,
+                target_path: &target_path,
+                layout_kind: layout.kind,
+                ejected: &ejected,
+            };
+            had_failures |= deploy_artifact_entry(run, &entry, backend, registry, journal)?;
         }
     }
 
     Ok(had_failures)
+}
+
+struct ArtifactEntry<'a> {
+    source: &'a Source,
+    source_name: &'a str,
+    commit: &'a str,
+    matcher: &'a PathMatcher,
+    artifact_name: &'a str,
+    target_path: &'a Path,
+    layout_kind: LayoutKind,
+    ejected: &'a [EjectedEntry],
+}
+
+fn deploy_artifact_entry(
+    run: TargetRun<'_>,
+    entry: &ArtifactEntry<'_>,
+    backend: &dyn SourceBackend,
+    registry: &dyn Registry,
+    journal: &Journal,
+) -> Result<bool> {
+    let artifact_dst = entry.target_path.join(
+        run.target
+            .layout()
+            .artifact_path(entry.source_name, entry.artifact_name),
+    );
+    let key = ArtifactKey {
+        target: run.target_name.to_owned(),
+        source: entry.source_name.to_owned(),
+        artifact: entry.artifact_name.to_owned(),
+    };
+
+    let state = check_artifact_state(
+        &artifact_dst,
+        entry.source_name,
+        entry.commit,
+        entry.ejected,
+        entry.artifact_name,
+        registry,
+        &key,
+    )?;
+
+    let conflict_kind = match &state {
+        ArtifactState::Modified { changed } if !run.force => Some(ConflictKind::Modified {
+            changed: changed.clone(),
+        }),
+        ArtifactState::Foreign if !run.force => Some(ConflictKind::Foreign),
+        _ => None,
+    };
+
+    let deploy = |key: ArtifactKey| {
+        deploy_one(
+            backend,
+            registry,
+            journal,
+            DeployContext {
+                target_path: entry.target_path,
+                layout_kind: entry.layout_kind,
+                source: entry.source,
+                source_name: entry.source_name,
+                commit: entry.commit,
+                matcher: entry.matcher,
+                artifact_name: entry.artifact_name,
+                artifact_dst: &artifact_dst,
+                key,
+            },
+        )
+    };
+
+    let resolution = match conflict_kind {
+        None if matches!(state, ArtifactState::Ejected | ArtifactState::Clean) => {
+            return Ok(false);
+        }
+        None => Resolution::Overwrite,
+        Some(kind) => match run.resolver {
+            Some(resolver) if run.interactive => resolver.resolve(&Conflict {
+                target: run.target_name.to_owned(),
+                source: entry.source_name.to_owned(),
+                artifact: entry.artifact_name.to_owned(),
+                kind,
+            }),
+            _ => {
+                warn_skip(entry.source_name, entry.artifact_name, &kind, &artifact_dst);
+                Resolution::Skip
+            }
+        },
+    };
+
+    match resolution {
+        Resolution::Skip => Ok(false),
+        Resolution::Overwrite => match deploy(key) {
+            Ok(()) => Ok(false),
+            Err(e) => {
+                eprintln!(
+                    "phora: failed to deploy {}:{}: {e}",
+                    entry.source_name, entry.artifact_name
+                );
+                Ok(true)
+            }
+        },
+        Resolution::Eject => {
+            let mut ejected = registry.load_ejected(run.target_name)?;
+            ejected.push(EjectedEntry {
+                source: entry.source_name.to_owned(),
+                artifact: entry.artifact_name.to_owned(),
+                ejected_at: chrono::Utc::now().to_rfc3339(),
+            });
+            registry.save_ejected(run.target_name, &ejected)?;
+            registry.remove(&key)?;
+            Ok(false)
+        }
+        Resolution::Abort => Err(Error::Aborted),
+    }
+}
+
+fn warn_skip(source: &str, artifact: &str, kind: &ConflictKind, dst: &Path) {
+    match kind {
+        ConflictKind::Modified { changed } => {
+            eprintln!("phora: skipping locally modified {source}:{artifact}");
+            for path in changed {
+                eprintln!("    {}", path.display());
+            }
+            eprintln!("  use --force to overwrite");
+        }
+        ConflictKind::Foreign => {
+            eprintln!(
+                "phora: skipping foreign content at {}; use --force to overwrite",
+                dst.display()
+            );
+        }
+    }
 }
 
 type RoutedSources = (Vec<(String, LockedSource)>, BTreeMap<String, String>);
@@ -280,11 +419,7 @@ fn deploy_one(
     journal: &Journal,
     ctx: DeployContext<'_>,
 ) -> Result<()> {
-    let staging_base = ctx
-        .target_path
-        .parent()
-        .unwrap_or(ctx.target_path)
-        .join(".phora-stage");
+    let staging_base = target_parent(ctx.target_path).join(".phora-stage");
     let staging = staging_base.join(format!("{}-{}", ctx.artifact_name, nonce()));
     let mut staging_guard = StagingGuard::new(&staging_base, &staging);
 
@@ -682,6 +817,7 @@ mod tests {
             force,
             interactive: false,
             prune: false,
+            resolver: None,
         }
     }
 
@@ -990,6 +1126,8 @@ mod tests {
     // ── Phase 2/3 (7b): export/deploy, collision, skip, warn, prune ─
 
     use std::path::PathBuf;
+
+    use crate::projection::JournalEntry;
 
     use crate::projection::ArtifactState;
     use crate::registry::{ArtifactKey, ManifestFile, RegistryRecord};
@@ -1671,6 +1809,7 @@ mod tests {
             force: false,
             interactive: false,
             prune: true,
+            resolver: None,
         };
 
         let out = sync(&in_, &fx.backend, &fx.registry).expect("prune sync runs");
@@ -1739,6 +1878,7 @@ mod tests {
             force: false,
             interactive: false,
             prune: true,
+            resolver: None,
         };
 
         let out = sync(&in_, &backend, &registry).expect("sync runs despite the export failure");
@@ -1884,5 +2024,580 @@ mod tests {
         );
 
         drop(src);
+    }
+
+    // ── interactive conflict resolution (resolver-driven) ──────────
+
+    /// A resolver returning a single preset [`Resolution`] for every conflict,
+    /// counting how many conflicts it was consulted on.
+    struct ScriptedResolver {
+        verdict: Resolution,
+        consulted: Cell<usize>,
+        seen: std::cell::RefCell<Vec<Conflict>>,
+    }
+
+    impl ScriptedResolver {
+        fn new(verdict: Resolution) -> Self {
+            Self {
+                verdict,
+                consulted: Cell::new(0),
+                seen: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        fn consulted(&self) -> usize {
+            self.consulted.get()
+        }
+
+        /// The most recent `Conflict` the resolver was consulted on, cloned out.
+        fn last_conflict(&self) -> Conflict {
+            self.seen
+                .borrow()
+                .last()
+                .cloned()
+                .expect("resolver was consulted on at least one conflict")
+        }
+    }
+
+    impl ConflictResolver for ScriptedResolver {
+        fn resolve(&self, conflict: &Conflict) -> Resolution {
+            self.consulted.set(self.consulted.get() + 1);
+            self.seen.borrow_mut().push(conflict.clone());
+            self.verdict
+        }
+    }
+
+    fn interactive_input<'a>(
+        cfg: &'a Config,
+        base_lock: Option<Lock>,
+        resolver: &'a dyn ConflictResolver,
+    ) -> SyncInput<'a> {
+        SyncInput {
+            base_config: cfg,
+            local_config: None,
+            base_lock,
+            local_lock: None,
+            force: false,
+            interactive: true,
+            prune: false,
+            resolver: Some(resolver),
+        }
+    }
+
+    /// Deploy once, then edit a recorded file so the artifact reads Modified on the next run.
+    /// Returns the base lock from the first sync (so Phase 1 reuses the same commit).
+    fn deploy_then_modify(fx: &SyncFixture, td: &TargetDir, cfg: &Config) -> Lock {
+        let first = sync(
+            &input(cfg, None, None, None, false),
+            &fx.backend,
+            &fx.registry,
+        )
+        .expect("first sync deploys and records the artifact");
+        assert!(!first.had_failures, "premise: first deploy must succeed");
+        let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+        std::fs::write(dst.join("init.lua"), b"-- locally edited\n").expect("edit deployed file");
+        let st = check_state_at(
+            &dst,
+            &fx.registry,
+            "dest",
+            "editor-src",
+            "editor",
+            &first_commit(&first),
+        );
+        assert!(
+            matches!(st, ArtifactState::Modified { .. }),
+            "premise: edited managed artifact must read Modified, got {st:?}"
+        );
+        first.base_lock
+    }
+
+    #[test]
+    fn interactive_overwrite_redeploys_modified_with_upstream() {
+        let fx = build_sync_fixture();
+        let td = TargetDir::new();
+        let cfg =
+            config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+        let base_lock = deploy_then_modify(&fx, &td, &cfg);
+        let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+
+        let resolver = ScriptedResolver::new(Resolution::Overwrite);
+        let out = sync(
+            &interactive_input(&cfg, Some(base_lock), &resolver),
+            &fx.backend,
+            &fx.registry,
+        )
+        .expect("interactive overwrite must not error");
+
+        assert!(!out.had_failures, "an overwrite resolution must succeed");
+        assert_eq!(
+            std::fs::read(dst.join("init.lua")).expect("read redeployed init.lua"),
+            b"-- init\n",
+            "Overwrite must replace the local edit with the upstream artifact content"
+        );
+        assert!(
+            fx.registry
+                .get(&artifact_key("dest", "editor-src", "editor"))
+                .expect("registry get must not error")
+                .is_some(),
+            "Overwrite must leave the registry record in place for the redeployed artifact"
+        );
+    }
+
+    #[test]
+    fn interactive_skip_preserves_local_content() {
+        let fx = build_sync_fixture();
+        let td = TargetDir::new();
+        let cfg =
+            config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+        let base_lock = deploy_then_modify(&fx, &td, &cfg);
+        let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+
+        let resolver = ScriptedResolver::new(Resolution::Skip);
+        let out = sync(
+            &interactive_input(&cfg, Some(base_lock), &resolver),
+            &fx.backend,
+            &fx.registry,
+        )
+        .expect("interactive skip must not error");
+
+        assert!(!out.had_failures, "a skip resolution must not fail the run");
+        assert_eq!(
+            resolver.consulted(),
+            1,
+            "interactive sync must CONSULT the resolver for the Modified artifact (it did not)"
+        );
+
+        let conflict = resolver.last_conflict();
+        assert_eq!(
+            (
+                conflict.target.as_str(),
+                conflict.source.as_str(),
+                conflict.artifact.as_str()
+            ),
+            ("dest", "editor-src", "editor"),
+            "the Conflict handed to the resolver must identify (target, source, artifact), got {conflict:?}"
+        );
+        let ConflictKind::Modified { changed } = &conflict.kind else {
+            panic!(
+                "an edited managed artifact must surface as ConflictKind::Modified, got {:?}",
+                conflict.kind
+            );
+        };
+        assert_eq!(
+            changed.as_slice(),
+            [PathBuf::from("init.lua")],
+            "the Modified conflict must name the changed path (the edited init.lua), got {changed:?}"
+        );
+
+        assert_eq!(
+            std::fs::read(dst.join("init.lua")).expect("read preserved init.lua"),
+            b"-- locally edited\n",
+            "Skip must preserve the local edit, leaving the artifact untouched"
+        );
+    }
+
+    /// A repo whose `editor` artifact holds a top-level file AND a nested file, so an eject
+    /// can prove it preserves the WHOLE on-disk tree, not just the top-level entry.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "fixture setup fails loudly; git CLI is assumed present"
+    )]
+    fn build_nested_artifact_repo() -> (TempDir, String) {
+        let src = TempDir::new().unwrap();
+        let p = src.path();
+        run_git(p, &["init", "-b", "main", "."]);
+        run_git(p, &["config", "user.email", "test@example.com"]);
+        run_git(p, &["config", "user.name", "Test"]);
+        std::fs::create_dir_all(p.join("editor").join("lua")).unwrap();
+        std::fs::write(p.join("editor/init.lua"), b"-- init\n").unwrap();
+        std::fs::write(p.join("editor/lua/keymaps.lua"), b"-- keymaps\n").unwrap();
+        run_git(p, &["add", "-A"]);
+        run_git(p, &["commit", "-m", "init"]);
+        let url = p.to_string_lossy().into_owned();
+        (src, url)
+    }
+
+    #[test]
+    fn interactive_eject_persists_entry_removes_record_keeps_files() {
+        let (src, url) = build_nested_artifact_repo();
+        let git_dir = TempDir::new().expect("git dir");
+        let state_dir = TempDir::new().expect("state dir");
+        let backend = GitBackend::new(git_dir.path().to_path_buf());
+        let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+        let td = TargetDir::new();
+        let cfg =
+            config_one_source_one_target("editor-src", &url, "dest", &td.target_path(), "flat");
+
+        let first = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+            .expect("first sync deploys the nested artifact");
+        assert!(!first.had_failures, "premise: first deploy must succeed");
+        let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+        assert!(
+            dst.join("lua").join("keymaps.lua").exists(),
+            "premise: the nested file must deploy so the eject keep-files check is meaningful"
+        );
+        let edited = b"-- locally edited\n";
+        std::fs::write(dst.join("init.lua"), edited).expect("edit deployed file");
+
+        let resolver = ScriptedResolver::new(Resolution::Eject);
+        let out = sync(
+            &interactive_input(&cfg, Some(first.base_lock.clone()), &resolver),
+            &backend,
+            &registry,
+        )
+        .expect("interactive eject must not error");
+
+        assert!(
+            !out.had_failures,
+            "an eject resolution must not fail the run"
+        );
+        let ejected = registry.load_ejected("dest").expect("load ejected");
+        assert!(
+            ejected
+                .iter()
+                .any(|e| e.source == "editor-src" && e.artifact == "editor"),
+            "Eject must persist an EjectedEntry for (editor-src, editor), got {ejected:?}"
+        );
+        assert!(
+            registry
+                .get(&artifact_key("dest", "editor-src", "editor"))
+                .expect("registry get must not error")
+                .is_none(),
+            "Eject must remove the artifact's registry record (stop managing it)"
+        );
+        assert_eq!(
+            std::fs::read(dst.join("init.lua")).expect("read kept init.lua"),
+            b"-- locally edited\n",
+            "Eject must leave the edited top-level file untouched (keep local content)"
+        );
+        assert_eq!(
+            std::fs::read(dst.join("lua").join("keymaps.lua")).expect("read kept nested file"),
+            b"-- keymaps\n",
+            "Eject must keep EVERY on-disk file, including the nested lua/keymaps.lua, not just the top-level one"
+        );
+
+        drop(src);
+    }
+
+    /// A source exposing TWO artifact dirs (`editor`, `widget`) under `by-source` layout,
+    /// each pre-placed with Foreign content so both would surface a conflict.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "fixture setup fails loudly; git CLI is assumed present"
+    )]
+    fn build_two_artifact_repo() -> (TempDir, String) {
+        let src = TempDir::new().unwrap();
+        let p = src.path();
+        run_git(p, &["init", "-b", "main", "."]);
+        run_git(p, &["config", "user.email", "test@example.com"]);
+        run_git(p, &["config", "user.name", "Test"]);
+        std::fs::create_dir_all(p.join("editor")).unwrap();
+        std::fs::write(p.join("editor/init.lua"), b"-- init\n").unwrap();
+        std::fs::create_dir_all(p.join("widget")).unwrap();
+        std::fs::write(p.join("widget/conf.toml"), b"[w]\n").unwrap();
+        run_git(p, &["add", "-A"]);
+        run_git(p, &["commit", "-m", "init"]);
+        let url = p.to_string_lossy().into_owned();
+        (src, url)
+    }
+
+    #[test]
+    fn interactive_abort_stops_sync_without_processing_remaining() {
+        let (src, url) = build_two_artifact_repo();
+        let git_dir = TempDir::new().expect("git dir");
+        let state_dir = TempDir::new().expect("state dir");
+        let backend = GitBackend::new(git_dir.path().to_path_buf());
+        let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+        let td = TargetDir::new();
+        let cfg =
+            config_one_source_one_target("multi", &url, "dest", &td.target_path(), "by-source");
+
+        // Pre-place Foreign content at BOTH artifact dsts so each would surface a conflict.
+        let editor_dst = td.target_path().join("multi").join("editor");
+        let widget_dst = td.target_path().join("multi").join("widget");
+        preplace_foreign(&editor_dst, b"hand-written editor\n");
+        preplace_foreign(&widget_dst, b"hand-written widget\n");
+
+        let resolver = ScriptedResolver::new(Resolution::Abort);
+        let result = sync(
+            &interactive_input(&cfg, None, &resolver),
+            &backend,
+            &registry,
+        );
+
+        let Err(err) = result else {
+            panic!("an Abort resolution must stop the sync and return Err, got Ok");
+        };
+        assert!(
+            matches!(err, Error::Aborted),
+            "Abort must surface as Error::Aborted, got {err:?}"
+        );
+        assert_eq!(
+            resolver.consulted(),
+            1,
+            "Abort must stop after the FIRST conflict: the resolver must be consulted exactly once, \
+             not once per remaining artifact (got {})",
+            resolver.consulted()
+        );
+        assert!(
+            !editor_dst.join("init.lua").exists() && !widget_dst.join("conf.toml").exists(),
+            "Abort must make NO changes: neither artifact may be deployed over the Foreign content"
+        );
+        assert_eq!(
+            std::fs::read(editor_dst.join("local-only.txt"))
+                .expect("preexisting editor Foreign file still present after abort"),
+            b"hand-written editor\n",
+            "Abort must not touch the preexisting Foreign content it stopped at"
+        );
+        assert_eq!(
+            std::fs::read(widget_dst.join("local-only.txt"))
+                .expect("preexisting widget Foreign file still present after abort"),
+            b"hand-written widget\n",
+            "Abort must not delete the not-yet-processed artifact's preexisting content either"
+        );
+
+        drop(src);
+    }
+
+    #[test]
+    fn non_interactive_still_warns_and_skips_modified_without_resolver() {
+        let fx = build_sync_fixture();
+        let td = TargetDir::new();
+        let cfg =
+            config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+        let base_lock = deploy_then_modify(&fx, &td, &cfg);
+        let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+
+        // interactive=false (and no resolver) must keep the existing warn-and-skip behavior.
+        let out = sync(
+            &input(&cfg, None, Some(base_lock), None, false),
+            &fx.backend,
+            &fx.registry,
+        )
+        .expect("non-interactive sync must not error on a Modified artifact");
+
+        assert!(
+            !out.had_failures,
+            "non-interactive skip of a Modified artifact is not a failure"
+        );
+        assert_eq!(
+            std::fs::read(dst.join("init.lua")).expect("read preserved init.lua"),
+            b"-- locally edited\n",
+            "without interactive mode a Modified artifact must still be skipped, preserving the edit"
+        );
+    }
+
+    // ── recovery sweep wired at sync start ─────────────────────────
+
+    #[test]
+    fn sync_runs_recovery_sweep_finishing_a_swapped_but_unrecorded_artifact() {
+        let fx = build_sync_fixture();
+        let td = TargetDir::new();
+        let cfg =
+            config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+
+        // Simulate a crash between swap and registry put: the artifact's files are on disk at
+        // its dst, the journal carries a swap_completed=true intent, but no record was persisted.
+        let crashed_dst = td.target_path().join("orphan-artifact");
+        std::fs::create_dir_all(&crashed_dst).expect("mkdir crashed dst");
+        std::fs::write(crashed_dst.join("recovered.txt"), b"recovered\n").expect("write dst file");
+
+        let crashed_key = artifact_key("dest", "editor-src", "orphan-artifact");
+        let record = RegistryRecord {
+            version: 1,
+            key: crashed_key.clone(),
+            commit: fx.head_sha.clone(),
+            digest: "blake3:recovered".to_owned(),
+            projected_at: "2026-01-01T00:00:00Z".to_owned(),
+            layout: "flat".to_owned(),
+            allow_symlinks: false,
+            preserve_executable: true,
+            files: vec![ManifestFile {
+                path: PathBuf::from("recovered.txt"),
+                size: 10,
+                mtime: 1_700_000_000,
+                blake3: "blake3:recovered".to_owned(),
+            }],
+        };
+
+        let staging_base = td.parent_path.join(".phora-stage");
+        let staging = staging_base.join("orphan-artifact-deadbeef");
+        let journal = Journal::open(&fx.registry.locks_dir()).expect("open journal");
+        journal
+            .append(&JournalEntry {
+                staging_base,
+                staging,
+                dst: crashed_dst,
+                record,
+                swap_completed: true,
+            })
+            .expect("seed swap-completed crash intent");
+
+        assert!(
+            fx.registry
+                .get(&crashed_key)
+                .expect("pre-sync get")
+                .is_none(),
+            "premise: the crashed artifact has no registry record yet"
+        );
+        assert_eq!(
+            journal.entries().expect("read seeded journal").len(),
+            1,
+            "premise: the crash intent is the sole pending journal entry before sync"
+        );
+
+        sync(
+            &input(&cfg, None, None, None, false),
+            &fx.backend,
+            &fx.registry,
+        )
+        .expect("sync runs (and must sweep recovery first)");
+
+        assert!(
+            fx.registry
+                .get(&crashed_key)
+                .expect("post-sync get")
+                .is_some(),
+            "`orphan-artifact` is not a name Phase 2 discovers (the fixture exposes `editor`), so \
+             its record can only exist if the start-of-sync recovery_sweep finished the crashed swap"
+        );
+        assert!(
+            fx.registry
+                .get(&artifact_key("dest", "editor-src", "editor"))
+                .expect("post-sync get for editor")
+                .is_some(),
+            "premise: Phase 2 deploys the discovered `editor` artifact (distinct from the swept one), \
+             proving the swept record was not a Phase 2 side effect"
+        );
+        assert!(
+            journal
+                .entries()
+                .expect("read journal after sync")
+                .is_empty(),
+            "the recovery sweep must CLEAR the journal once it finishes the crashed swap"
+        );
+    }
+
+    /// Wraps a real `GitBackend` but returns `Err` from `resolve`, forcing Phase 1
+    /// (`resolve_sources`) to fail. The recovery sweep touches only journal + registry +
+    /// filesystem, so it can still complete despite the backend error.
+    struct FailingResolveBackend<'a> {
+        inner: &'a GitBackend,
+    }
+
+    impl SourceBackend for FailingResolveBackend<'_> {
+        fn fetch(&self, source: &str, url: &str) -> Result<()> {
+            self.inner.fetch(source, url)
+        }
+        fn resolve(&self, _source: &str, _url: &str, _refspec: &Refspec) -> Result<String> {
+            Err(Error::Source("injected resolve failure".to_owned()))
+        }
+        fn commit_time(&self, source: &str, url: &str, commit: &str) -> Result<u64> {
+            self.inner.commit_time(source, url, commit)
+        }
+        fn discover_artifacts(
+            &self,
+            source: &str,
+            url: &str,
+            commit: &str,
+            root: Option<&Path>,
+            matcher: &crate::matcher::PathMatcher,
+        ) -> Result<Vec<String>> {
+            self.inner
+                .discover_artifacts(source, url, commit, root, matcher)
+        }
+        fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult> {
+            self.inner.export_artifact(req)
+        }
+        fn compute_digest(
+            &self,
+            source: &str,
+            url: &str,
+            commit: &str,
+            root: Option<&Path>,
+            matcher: &crate::matcher::PathMatcher,
+        ) -> Result<String> {
+            self.inner
+                .compute_digest(source, url, commit, root, matcher)
+        }
+    }
+
+    #[test]
+    fn sync_runs_recovery_before_phase1_even_when_resolve_fails() {
+        let fx = build_sync_fixture();
+        let td = TargetDir::new();
+        let cfg =
+            config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+
+        let crashed_dst = td.target_path().join("orphan-artifact");
+        std::fs::create_dir_all(&crashed_dst).expect("mkdir crashed dst");
+        std::fs::write(crashed_dst.join("recovered.txt"), b"recovered\n").expect("write dst file");
+
+        let crashed_key = artifact_key("dest", "editor-src", "orphan-artifact");
+        let record = RegistryRecord {
+            version: 1,
+            key: crashed_key.clone(),
+            commit: fx.head_sha.clone(),
+            digest: "blake3:recovered".to_owned(),
+            projected_at: "2026-01-01T00:00:00Z".to_owned(),
+            layout: "flat".to_owned(),
+            allow_symlinks: false,
+            preserve_executable: true,
+            files: vec![ManifestFile {
+                path: PathBuf::from("recovered.txt"),
+                size: 10,
+                mtime: 1_700_000_000,
+                blake3: "blake3:recovered".to_owned(),
+            }],
+        };
+
+        let staging_base = td.parent_path.join(".phora-stage");
+        let staging = staging_base.join("orphan-artifact-deadbeef");
+        let journal = Journal::open(&fx.registry.locks_dir()).expect("open journal");
+        journal
+            .append(&JournalEntry {
+                staging_base,
+                staging,
+                dst: crashed_dst,
+                record,
+                swap_completed: true,
+            })
+            .expect("seed swap-completed crash intent");
+
+        assert!(
+            fx.registry
+                .get(&crashed_key)
+                .expect("pre-sync get")
+                .is_none(),
+            "premise: the crashed artifact has no registry record yet"
+        );
+
+        let backend = FailingResolveBackend { inner: &fx.backend };
+        let result = sync(
+            &input(&cfg, None, None, None, false),
+            &backend,
+            &fx.registry,
+        );
+
+        assert!(
+            result.is_err(),
+            "premise: Phase 1 (resolve_sources) must fail when the backend's resolve errors"
+        );
+
+        assert!(
+            fx.registry
+                .get(&crashed_key)
+                .expect("post-sync get")
+                .is_some(),
+            "recovery must run at the TRUE START (before Phase 1): the crashed record exists only \
+             if recovery_sweep finished the swap before resolve_sources returned its error"
+        );
+        assert!(
+            journal
+                .entries()
+                .expect("read journal after sync")
+                .is_empty(),
+            "recovery running before Phase 1 must have CLEARED the journal despite the Phase 1 error"
+        );
     }
 }
