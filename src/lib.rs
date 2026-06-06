@@ -11,9 +11,10 @@
 //! [`source::NormalizedUrl`], [`source::MirrorKey`], [`registry::Digest`]) so that
 //! illegal states are unrepresentable downstream — parse, don't validate.
 
-// Stub signatures return `NotImplemented`; per-function `# Errors` docs land with
-// the real bodies.
-#![allow(clippy::missing_errors_doc)]
+#![expect(
+    clippy::missing_errors_doc,
+    reason = "stub signatures return NotImplemented; per-fn `# Errors` docs land with the real bodies"
+)]
 
 pub mod cli;
 pub mod config;
