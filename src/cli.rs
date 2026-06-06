@@ -95,7 +95,16 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Sync { .. } => Err(Error::NotImplemented("sync")),
         Command::Update { .. } => Err(Error::NotImplemented("update")),
         Command::List { .. } => Err(Error::NotImplemented("list")),
-        Command::Verify => Err(Error::NotImplemented("verify")),
+        Command::Verify => {
+            let config = load_config()?;
+            let mismatches = crate::sync::verify(&config, &open_project_registry()?)?;
+            print_verify(&mismatches);
+            if mismatches.is_empty() {
+                Ok(())
+            } else {
+                std::process::exit(1);
+            }
+        }
         Command::Where {
             digest,
             source,
@@ -114,8 +123,38 @@ pub fn run(cli: Cli) -> Result<()> {
             print_where_matches(&matches);
             Ok(())
         }
-        Command::Eject { .. } => Err(Error::NotImplemented("eject")),
-        Command::Uneject { .. } => Err(Error::NotImplemented("uneject")),
+        Command::Eject {
+            artifact,
+            source,
+            target,
+        } => {
+            let config = load_config()?;
+            crate::sync::eject(
+                &config,
+                &open_project_registry()?,
+                &artifact,
+                &source,
+                &target,
+            )?;
+            println!("ejected {source}/{artifact} from {target} (files kept)");
+            Ok(())
+        }
+        Command::Uneject {
+            artifact,
+            source,
+            target,
+        } => {
+            let config = load_config()?;
+            crate::sync::uneject(
+                &config,
+                &open_project_registry()?,
+                &artifact,
+                &source,
+                &target,
+            )?;
+            println!("unejected {source}/{artifact} in {target}");
+            Ok(())
+        }
         Command::RebuildRegistry => Err(Error::NotImplemented("rebuild-registry")),
         Command::CheckMatch { source, path } => {
             let source = load_source(&source)?;
@@ -135,14 +174,37 @@ fn open_project_registry() -> Result<FileRegistry> {
     FileRegistry::open(state_root)
 }
 
-fn load_source(name: &str) -> Result<Source> {
+fn load_config() -> Result<Config> {
     let text = std::fs::read_to_string("phora.toml")
         .map_err(|e| Error::Config(format!("read phora.toml: {e}")))?;
-    let mut config = Config::parse(&text)?;
-    config
+    Config::parse(&text)
+}
+
+fn load_source(name: &str) -> Result<Source> {
+    load_config()?
         .sources
         .remove(name)
         .ok_or_else(|| Error::Config(format!("source `{name}` not found in phora.toml")))
+}
+
+fn print_verify(mismatches: &[crate::sync::VerifyMismatch]) {
+    use crate::sync::VerifyReason;
+    if mismatches.is_empty() {
+        println!("all verified");
+        return;
+    }
+    for m in mismatches {
+        let reason = match &m.reason {
+            VerifyReason::Missing => "missing".to_owned(),
+            VerifyReason::ContentMismatch { .. } => "content mismatch".to_owned(),
+        };
+        println!(
+            "{}/{}: {} ({reason})",
+            m.key.source,
+            m.key.artifact,
+            m.path.display()
+        );
+    }
 }
 
 fn print_where_matches(matches: &[WhereMatch]) {
