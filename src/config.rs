@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::error::{Error, Result};
 use crate::source::ExportPolicy;
@@ -375,44 +375,6 @@ impl LayoutKind {
             other => Err(format!("unknown layout type `{other}`")),
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Lock {
-    pub version: u32,
-    pub sources: Vec<LockedSource>,
-}
-
-impl Lock {
-    #[must_use]
-    pub fn find_source(&self, name: &str) -> Option<&LockedSource> {
-        self.sources.iter().find(|s| s.name == name)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LockedSource {
-    pub name: String,
-    pub git: String,
-    pub resolved: String,
-    pub commit: String,
-    pub digest: String,
-    /// Hash of export-affecting config; lets sync detect config changes that alter
-    /// export output without a commit change.
-    pub config_digest: String,
-}
-
-/// Effective lock merges base and local locks; local entries override base by name.
-#[must_use]
-pub fn merge_locks(base: &Lock, local: Option<&Lock>) -> Lock {
-    let mut merged = base.clone();
-    if let Some(local) = local {
-        for local_source in &local.sources {
-            merged.sources.retain(|s| s.name != local_source.name);
-            merged.sources.push(local_source.clone());
-        }
-    }
-    merged
 }
 
 #[cfg(test)]

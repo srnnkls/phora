@@ -246,7 +246,10 @@ mod tests {
     #[test]
     fn double_star_bak_exclude_matches_nested_file() {
         let m = matcher(&[], &["**/*.bak"]);
-        assert!(!file(&m, "sub/foo.bak"), "nested sub/foo.bak must be excluded");
+        assert!(
+            !file(&m, "sub/foo.bak"),
+            "nested sub/foo.bak must be excluded"
+        );
     }
 
     #[test]
@@ -260,7 +263,10 @@ mod tests {
     fn unanchored_path_exclude_matches_at_root_and_any_depth() {
         // M011: unanchored `editor/x.json` matches at the artifact root AND nested.
         let m = matcher(&[], &["editor/x.json"]);
-        assert!(!file(&m, "editor/x.json"), "root-level editor/x.json excluded");
+        assert!(
+            !file(&m, "editor/x.json"),
+            "root-level editor/x.json excluded"
+        );
         assert!(
             !file(&m, "nested/editor/x.json"),
             "nested editor/x.json excluded via `**/` variant"
@@ -304,7 +310,10 @@ mod tests {
         let m = matcher(&[], &["/build"]);
         assert!(!dir(&m, "build"), "anchored exclude prunes root build dir");
         assert!(dir(&m, "src"), "unmatched directory is traversable");
-        assert!(dir(&m, "sub/build"), "anchored exclude does not reach nested build");
+        assert!(
+            dir(&m, "sub/build"),
+            "anchored exclude does not reach nested build"
+        );
     }
 
     #[test]
@@ -313,7 +322,10 @@ mod tests {
         // the artifact root, not only when nested.
         let m = matcher(&[], &["cache/tmp"]);
         assert!(!dir(&m, "cache/tmp"), "root-level cache/tmp dir is pruned");
-        assert!(!dir(&m, "nested/cache/tmp"), "nested cache/tmp dir is pruned");
+        assert!(
+            !dir(&m, "nested/cache/tmp"),
+            "nested cache/tmp dir is pruned"
+        );
     }
 
     #[test]
@@ -321,7 +333,13 @@ mod tests {
         // A file matching BOTH include and exclude is rejected (exclude precedence).
         let m = matcher(&["**/*.json"], &["**/secret.json"]);
         assert!(file(&m, "ok.json"));
-        assert!(!file(&m, "secret.json"), "exclude wins over include at root");
-        assert!(!file(&m, "sub/secret.json"), "exclude wins over include nested");
+        assert!(
+            !file(&m, "secret.json"),
+            "exclude wins over include at root"
+        );
+        assert!(
+            !file(&m, "sub/secret.json"),
+            "exclude wins over include nested"
+        );
     }
 }

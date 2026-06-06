@@ -1,7 +1,8 @@
 //! Top-level orchestration: sync, eject, uneject.
 
-use crate::config::{Config, Lock};
+use crate::config::Config;
 use crate::error::{Error, Result};
+use crate::lock::Lock;
 use crate::registry::Registry;
 
 pub fn sync(
