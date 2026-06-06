@@ -1,20 +1,18 @@
 [tools]
-"github:facebookincubator/scrut" = "0.4.2"
-go = "1.25.5"
+rust = "latest"
 
 [tasks.build]
-description = "Build tropos binary"
-run = "go build -o tropos ./cmd/tropos"
+run = "cargo build"
 
 [tasks.test]
-description = "Run all tests"
-depends = ["test:unit", "test:integration"]
+run = "cargo test"
 
-[tasks."test:unit"]
-description = "Run Go unit tests"
-run = "go test ./..."
+[tasks.lint]
+description = "clippy (pedantic, warnings as errors) + rustfmt check"
+run = ["cargo clippy --all-targets -- -D warnings", "cargo fmt --check"]
 
-[tasks."test:integration"]
-description = "Run scrut integration tests"
-depends = ["build"]
-run = "PATH=$PWD:$PATH scrut test tests/"
+[tasks.fmt]
+run = "cargo fmt"
+
+[tasks.check]
+depends = ["lint", "test"]
