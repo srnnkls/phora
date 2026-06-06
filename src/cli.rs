@@ -1,15 +1,20 @@
 //! Command-line surface.
 
 use std::collections::BTreeMap;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 
 use clap::{Parser, Subcommand};
 
 use crate::config::{Config, Host, Source};
 use crate::error::{Error, Result};
+use crate::lock::Lock;
 use crate::matcher::PathMatcher;
 use crate::paths::{ProjectId, phora_dir};
+use crate::projection::{ArtifactState, check_artifact_state};
 use crate::registry::{FileRegistry, Registry};
+use crate::source::GitBackend;
+use crate::sync::{Conflict, ConflictResolver, Resolution, SyncInput, SyncOutput, sync};
 
 #[derive(Parser, Debug)]
 #[command(name = "phora", version, about = "Git-based artifact package manager")]
@@ -98,9 +103,9 @@ pub fn run(cli: Cli) -> Result<()> {
             tag,
             root,
         } => run_add(&url, name, branch, tag, root),
-        Command::Sync { .. } => Err(Error::NotImplemented("sync")),
-        Command::Update { .. } => Err(Error::NotImplemented("update")),
-        Command::List { .. } => Err(Error::NotImplemented("list")),
+        Command::Sync { prune, force } => run_sync(prune, force, None),
+        Command::Update { source } => run_update(source.as_deref()),
+        Command::List { plan } => run_list(plan),
         Command::Verify => {
             let config = load_config()?;
             let mismatches = crate::sync::verify(&config, &open_project_registry()?)?;
@@ -238,6 +243,126 @@ fn ensure_sources_table(doc: &mut toml_edit::DocumentMut) {
         let mut sources = toml_edit::Table::new();
         sources.set_implicit(true);
         doc["sources"] = toml_edit::Item::Table(sources);
+    }
+}
+
+fn run_list(plan: bool) -> Result<()> {
+    let config = load_config()?;
+    let registry = open_project_registry()?;
+    if plan {
+        println!("plan: run `phora sync` to apply pending changes");
+        return Ok(());
+    }
+    let listings = list_statuses(&config, &registry)?;
+    print_listings(&listings);
+    Ok(())
+}
+
+fn print_listings(listings: &[TargetListing]) {
+    for listing in listings {
+        println!("{}:", listing.target);
+        for artifact in &listing.artifacts {
+            println!(
+                "  {}/{}  {}",
+                artifact.source, artifact.artifact, artifact.state
+            );
+        }
+    }
+}
+
+fn run_sync(prune: bool, force: bool, drop: Option<DropSources>) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let base = load_config()?;
+    let local = load_local_config(&cwd)?;
+    let (mut base_lock, mut local_lock) = load_locks(&cwd)?;
+
+    if let Some(drop) = drop {
+        drop_sources(base_lock.as_mut(), &drop);
+        drop_sources(local_lock.as_mut(), &drop);
+    }
+
+    let backend = GitBackend::new(phora_dir()?.join("git"));
+    let registry = open_project_registry()?;
+    let interactive = std::io::stdin().is_terminal();
+    let resolver = TtyResolver;
+
+    let out = sync(
+        &SyncInput {
+            base_config: &base,
+            local_config: local.as_ref(),
+            base_lock,
+            local_lock,
+            force,
+            interactive,
+            prune,
+            resolver: interactive.then_some(&resolver as &dyn ConflictResolver),
+        },
+        &backend,
+        &registry,
+    )?;
+
+    finish_sync(&cwd, &out)
+}
+
+fn finish_sync(cwd: &Path, out: &SyncOutput) -> Result<()> {
+    write_locks(cwd, &out.base_lock, out.local_lock.as_ref())?;
+    if out.had_failures {
+        eprintln!("phora: some artifacts failed to deploy");
+        std::process::exit(1);
+    }
+    println!("sync complete");
+    Ok(())
+}
+
+fn run_update(source: Option<&str>) -> Result<()> {
+    let drop = source.map_or(DropSources::All, |s| DropSources::One(s.to_owned()));
+    run_sync(false, false, Some(drop))
+}
+
+/// Which locked source entries to drop before a sync so they get re-resolved.
+enum DropSources {
+    All,
+    One(String),
+}
+
+fn drop_sources(lock: Option<&mut Lock>, drop: &DropSources) {
+    let Some(lock) = lock else { return };
+    match drop {
+        DropSources::All => lock.sources.clear(),
+        DropSources::One(name) => lock.sources.retain(|s| &s.name != name),
+    }
+}
+
+fn load_local_config(cwd: &Path) -> Result<Option<Config>> {
+    let path = cwd.join("phora.local.toml");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Config::parse(&text).map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error::Config(format!("read {}: {e}", path.display()))),
+    }
+}
+
+/// Prompts on stderr and reads a resolution character from stdin for each conflict.
+struct TtyResolver;
+
+impl ConflictResolver for TtyResolver {
+    fn resolve(&self, conflict: &Conflict) -> Resolution {
+        loop {
+            eprint!(
+                "phora: conflict at {}/{} in {} — [s]kip/[o]verwrite/[e]ject/[a]bort? ",
+                conflict.source, conflict.artifact, conflict.target
+            );
+            let _ = std::io::stderr().flush();
+            let mut line = String::new();
+            match std::io::stdin().read_line(&mut line) {
+                Ok(0) | Err(_) => return Resolution::Skip,
+                Ok(_) => {
+                    if let Some(resolution) = line.chars().next().and_then(resolution_from_char) {
+                        return resolution;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -607,6 +732,144 @@ pub fn insert_source(
     ensure_sources_table(&mut doc);
     doc["sources"][name] = toml_edit::Item::Table(table);
     Ok(doc.to_string())
+}
+
+/// A `phora list` row for one managed artifact under a target: its source, the
+/// artifact name, and a human-readable state label (`✓`, `[modified]`, etc.).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactStatus {
+    pub source: String,
+    pub artifact: String,
+    pub state: String,
+}
+
+/// `phora list` grouped by target: every managed artifact's status under one target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetListing {
+    pub target: String,
+    pub artifacts: Vec<ArtifactStatus>,
+}
+
+/// Writes the base lock to `<dir>/phora.lock` and, when `local` is `Some`, the
+/// local lock to `<dir>/phora.local.lock`; when `local` is `None`, removes any
+/// stale `<dir>/phora.local.lock`.
+///
+/// # Errors
+///
+/// Returns an error if serialization or filesystem I/O fails.
+pub fn write_locks(dir: &Path, base: &Lock, local: Option<&Lock>) -> Result<()> {
+    let base_path = dir.join("phora.lock");
+    let base_text =
+        toml::to_string(base).map_err(|e| Error::Lock(format!("serialize phora.lock: {e}")))?;
+    std::fs::write(&base_path, base_text)
+        .map_err(|e| Error::Lock(format!("write {}: {e}", base_path.display())))?;
+
+    let local_path = dir.join("phora.local.lock");
+    match local {
+        Some(local) => {
+            let local_text = toml::to_string(local)
+                .map_err(|e| Error::Lock(format!("serialize phora.local.lock: {e}")))?;
+            std::fs::write(&local_path, local_text)
+                .map_err(|e| Error::Lock(format!("write {}: {e}", local_path.display())))?;
+        }
+        None => match std::fs::remove_file(&local_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(Error::Lock(format!(
+                    "remove stale {}: {e}",
+                    local_path.display()
+                )));
+            }
+        },
+    }
+    Ok(())
+}
+
+/// Reads `<dir>/phora.lock` and `<dir>/phora.local.lock`, returning `None` for
+/// either file that is absent.
+///
+/// # Errors
+///
+/// Returns an error if a present lock file cannot be read or parsed.
+pub fn load_locks(dir: &Path) -> Result<(Option<Lock>, Option<Lock>)> {
+    Ok((
+        read_lock(&dir.join("phora.lock"))?,
+        read_lock(&dir.join("phora.local.lock"))?,
+    ))
+}
+
+fn read_lock(path: &Path) -> Result<Option<Lock>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => toml::from_str(&text)
+            .map(Some)
+            .map_err(|e| Error::Lock(format!("parse {}: {e}", path.display()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error::Lock(format!("read {}: {e}", path.display()))),
+    }
+}
+
+/// Registry-driven `phora list`: per target, the status of every managed artifact,
+/// computed via [`check_artifact_state`](crate::projection::check_artifact_state).
+///
+/// # Errors
+///
+/// Returns an error if the registry or on-disk targets cannot be read.
+pub fn list_statuses(config: &Config, registry: &dyn Registry) -> Result<Vec<TargetListing>> {
+    let mut listings = Vec::new();
+    for (target_name, target) in &config.targets {
+        let ejected = registry.load_ejected(target_name)?;
+        let mut artifacts = Vec::new();
+        for rec in registry.list_target(target_name)? {
+            let artifact_dst = target.expanded_path().join(
+                target
+                    .layout()
+                    .artifact_path(&rec.key.source, &rec.key.artifact),
+            );
+            let state = check_artifact_state(
+                &artifact_dst,
+                &rec.key.source,
+                &rec.commit,
+                &ejected,
+                &rec.key.artifact,
+                registry,
+                &rec.key,
+            )?;
+            artifacts.push(ArtifactStatus {
+                source: rec.key.source,
+                artifact: rec.key.artifact,
+                state: state_label(&state).to_owned(),
+            });
+        }
+        listings.push(TargetListing {
+            target: target_name.clone(),
+            artifacts,
+        });
+    }
+    Ok(listings)
+}
+
+fn state_label(state: &ArtifactState) -> &'static str {
+    match state {
+        ArtifactState::Clean => "✓ clean",
+        ArtifactState::Modified { .. } => "modified",
+        ArtifactState::Foreign => "foreign",
+        ArtifactState::Missing => "missing",
+        ArtifactState::Ejected => "ejected",
+    }
+}
+
+/// Maps an interactive prompt character to a [`Resolution`]: `s`→Skip, `o`→Overwrite,
+/// `e`→Eject, `a`→Abort; any other character yields `None`.
+#[must_use]
+pub fn resolution_from_char(c: char) -> Option<Resolution> {
+    match c {
+        's' => Some(Resolution::Skip),
+        'o' => Some(Resolution::Overwrite),
+        'e' => Some(Resolution::Eject),
+        'a' => Some(Resolution::Abort),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1299,6 +1562,473 @@ mod tests {
                 .expect("editor source parses from block form")
                 .git,
             "https://github.com/company/editor.git"
+        );
+    }
+
+    // ── write_locks / load_locks ───────────────────────────────────
+
+    use crate::lock::{Lock, LockedSource};
+    use crate::sync::Resolution;
+
+    fn lock_with(name: &str, git: &str, resolved: &str) -> Lock {
+        Lock {
+            version: 1,
+            sources: vec![LockedSource {
+                name: name.to_owned(),
+                git: git.to_owned(),
+                resolved: resolved.to_owned(),
+                commit: "c0ffeec0ffee".to_owned(),
+                digest: "blake3:artifact".to_owned(),
+                config_digest: "blake3:cfg".to_owned(),
+            }],
+        }
+    }
+
+    #[test]
+    fn write_locks_base_only_writes_phora_lock_and_no_local_file() {
+        let dir = TempDir::new().expect("locks dir");
+        let base = lock_with("dotfiles", "https://github.com/me/dotfiles.git", "main");
+
+        write_locks(dir.path(), &base, None).expect("write base-only locks");
+
+        assert!(
+            dir.path().join("phora.lock").is_file(),
+            "base-only write must create phora.lock"
+        );
+        assert!(
+            !dir.path().join("phora.local.lock").exists(),
+            "a base-only write (local=None) must NOT create phora.local.lock"
+        );
+    }
+
+    #[test]
+    fn load_locks_round_trips_base_only_write() {
+        let dir = TempDir::new().expect("locks dir");
+        let base = lock_with("dotfiles", "https://github.com/me/dotfiles.git", "main");
+
+        write_locks(dir.path(), &base, None).expect("write base-only locks");
+        let (loaded_base, loaded_local) = load_locks(dir.path()).expect("load locks");
+
+        let loaded_base = loaded_base.expect("phora.lock present after a base write");
+        assert!(
+            loaded_local.is_none(),
+            "no phora.local.lock on disk must load as None"
+        );
+        let src = loaded_base
+            .find_source("dotfiles")
+            .expect("the base source survives the round-trip");
+        assert_eq!(
+            src.git, "https://github.com/me/dotfiles.git",
+            "round-tripped base lock must echo the source git URL"
+        );
+        assert_eq!(
+            src.resolved, "main",
+            "round-tripped base lock must echo the resolved refspec"
+        );
+        assert_eq!(
+            loaded_base.sources.len(),
+            1,
+            "exactly the one written source must come back"
+        );
+    }
+
+    #[test]
+    fn write_then_load_locks_round_trips_base_and_local() {
+        let dir = TempDir::new().expect("locks dir");
+        let base = lock_with("dotfiles", "https://github.com/me/dotfiles.git", "main");
+        let local = lock_with("loqui", "/home/soeren/dev/loqui", "dev");
+
+        write_locks(dir.path(), &base, Some(&local)).expect("write base+local locks");
+
+        assert!(
+            dir.path().join("phora.lock").is_file(),
+            "phora.lock must exist"
+        );
+        assert!(
+            dir.path().join("phora.local.lock").is_file(),
+            "a Some(local) write must create phora.local.lock"
+        );
+
+        let (loaded_base, loaded_local) = load_locks(dir.path()).expect("load both locks");
+        assert!(
+            loaded_base
+                .expect("base present")
+                .find_source("dotfiles")
+                .is_some(),
+            "base lock must round-trip its source"
+        );
+        let local = loaded_local.expect("local lock present when phora.local.lock exists");
+        let loqui = local
+            .find_source("loqui")
+            .expect("local lock must round-trip its overridden source");
+        assert_eq!(
+            loqui.git, "/home/soeren/dev/loqui",
+            "round-tripped local lock must echo the local checkout path"
+        );
+    }
+
+    #[test]
+    fn write_locks_removes_stale_local_lock_when_local_is_none() {
+        let dir = TempDir::new().expect("locks dir");
+        let base = lock_with("dotfiles", "https://github.com/me/dotfiles.git", "main");
+        let local = lock_with("loqui", "/home/soeren/dev/loqui", "dev");
+
+        write_locks(dir.path(), &base, Some(&local)).expect("seed both locks");
+        assert!(
+            dir.path().join("phora.local.lock").is_file(),
+            "premise: phora.local.lock must exist before the base-only rewrite"
+        );
+
+        write_locks(dir.path(), &base, None).expect("rewrite base-only");
+
+        assert!(
+            !dir.path().join("phora.local.lock").exists(),
+            "a base-only rewrite (local=None) must DELETE the stale phora.local.lock"
+        );
+        let (_, loaded_local) = load_locks(dir.path()).expect("reload after stale removal");
+        assert!(
+            loaded_local.is_none(),
+            "after the stale local lock is removed, load_locks must report no local lock"
+        );
+    }
+
+    // ── list_statuses ──────────────────────────────────────────────
+
+    /// Writes `file` with `content` under `<target_dir>/<artifact>/` and returns a
+    /// [`ManifestFile`] whose size+mtime match what landed on disk, so a record built
+    /// from it reads Clean through `check_artifact_state`.
+    fn deploy_matching_file(
+        target_dir: &Path,
+        artifact: &str,
+        file: &str,
+        content: &[u8],
+    ) -> ManifestFile {
+        let artifact_dir = target_dir.join(artifact);
+        std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
+        let path = artifact_dir.join(file);
+        std::fs::write(&path, content).expect("write deployed file");
+        let meta = std::fs::metadata(&path).expect("stat deployed file");
+        let mtime = meta
+            .modified()
+            .expect("mtime")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after epoch")
+            .as_secs();
+        ManifestFile {
+            path: PathBuf::from(file),
+            size: meta.len(),
+            mtime,
+            blake3: blake3::hash(content).to_hex().to_string(),
+        }
+    }
+
+    fn record_for(
+        target: &str,
+        source: &str,
+        artifact: &str,
+        commit: &str,
+        files: Vec<ManifestFile>,
+    ) -> RegistryRecord {
+        RegistryRecord {
+            version: 1,
+            key: ArtifactKey {
+                target: target.to_owned(),
+                source: source.to_owned(),
+                artifact: artifact.to_owned(),
+            },
+            commit: commit.to_owned(),
+            digest: "blake3:rec".to_owned(),
+            projected_at: "2026-01-31T12:34:56Z".to_owned(),
+            layout: "flat".to_owned(),
+            allow_symlinks: false,
+            preserve_executable: true,
+            files,
+        }
+    }
+
+    fn config_one_flat_target(target: &str, source: &str, target_path: &Path) -> Config {
+        let toml = format!(
+            "version = 1\n\n\
+             [sources.{source}]\ngit = \"https://example.com/x.git\"\nbranch = \"main\"\n\n\
+             [targets.{target}]\npath = \"{}\"\nsources = [\"{source}\"]\nlayout = \"flat\"\n",
+            target_path.display(),
+        );
+        Config::parse(&toml).expect("one-target flat config parses")
+    }
+
+    fn config_two_flat_targets(
+        target_a: &str,
+        source_a: &str,
+        path_a: &Path,
+        target_b: &str,
+        source_b: &str,
+        path_b: &Path,
+    ) -> Config {
+        let toml = format!(
+            "version = 1\n\n\
+             [sources.{source_a}]\ngit = \"https://example.com/a.git\"\nbranch = \"main\"\n\n\
+             [sources.{source_b}]\ngit = \"https://example.com/b.git\"\nbranch = \"main\"\n\n\
+             [targets.{target_a}]\npath = \"{}\"\nsources = [\"{source_a}\"]\nlayout = \"flat\"\n\n\
+             [targets.{target_b}]\npath = \"{}\"\nsources = [\"{source_b}\"]\nlayout = \"flat\"\n",
+            path_a.display(),
+            path_b.display(),
+        );
+        Config::parse(&toml).expect("two-target flat config parses")
+    }
+
+    fn status_for<'a>(
+        listings: &'a [TargetListing],
+        target: &str,
+        artifact: &str,
+    ) -> Option<&'a ArtifactStatus> {
+        listings
+            .iter()
+            .find(|l| l.target == target)
+            .and_then(|l| l.artifacts.iter().find(|a| a.artifact == artifact))
+    }
+
+    #[test]
+    fn list_statuses_reports_clean_for_matching_deployment() {
+        let state_dir = TempDir::new().expect("state root");
+        let reg = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+        let target_root = TempDir::new().expect("target root");
+        let cfg = config_one_flat_target("dest", "editor-src", target_root.path());
+
+        let mf = deploy_matching_file(target_root.path(), "editor", "init.lua", b"-- init\n");
+        reg.put(&record_for(
+            "dest",
+            "editor-src",
+            "editor",
+            "aaa111",
+            vec![mf],
+        ))
+        .expect("seed registry record");
+
+        let listings = list_statuses(&cfg, &reg).expect("list statuses");
+
+        let st = status_for(&listings, "dest", "editor")
+            .expect("the editor artifact must appear under target dest");
+        assert_eq!(
+            st.source, "editor-src",
+            "the status row must carry the artifact's source"
+        );
+        assert!(
+            st.state.contains('✓') || st.state.to_lowercase().contains("clean"),
+            "a deployment whose files match its record must read Clean (✓), got state {:?}",
+            st.state
+        );
+        assert!(
+            !st.state.to_lowercase().contains("modified"),
+            "a matching deployment must NOT be labelled modified, got {:?}",
+            st.state
+        );
+    }
+
+    #[test]
+    fn list_statuses_reports_modified_for_edited_deployment() {
+        let state_dir = TempDir::new().expect("state root");
+        let reg = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+        let target_root = TempDir::new().expect("target root");
+        let cfg = config_one_flat_target("dest", "editor-src", target_root.path());
+
+        let mf = deploy_matching_file(target_root.path(), "editor", "init.lua", b"-- init\n");
+        reg.put(&record_for(
+            "dest",
+            "editor-src",
+            "editor",
+            "aaa111",
+            vec![mf],
+        ))
+        .expect("seed an accurate (would-be-Clean) registry record");
+
+        // Record stays accurate; the deployed file drifts on disk (real user edit).
+        std::fs::write(
+            target_root.path().join("editor").join("init.lua"),
+            b"-- init\nvim.opt.number = true\n",
+        )
+        .expect("edit deployed file on disk");
+
+        let listings = list_statuses(&cfg, &reg).expect("list statuses");
+
+        let st = status_for(&listings, "dest", "editor")
+            .expect("the editor artifact must appear even when modified");
+        assert!(
+            st.state.to_lowercase().contains("modified"),
+            "a deployment whose on-disk file differs from its record must read Modified, got {:?}",
+            st.state
+        );
+        assert!(
+            !st.state.contains('✓'),
+            "a Modified artifact must NOT be shown as clean (✓), got {:?}",
+            st.state
+        );
+    }
+
+    #[test]
+    fn list_statuses_reports_ejected_for_ejected_artifact() {
+        let state_dir = TempDir::new().expect("state root");
+        let reg = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+        let target_root = TempDir::new().expect("target root");
+        let cfg = config_one_flat_target("dest", "editor-src", target_root.path());
+
+        let mf = deploy_matching_file(target_root.path(), "editor", "init.lua", b"-- init\n");
+        reg.put(&record_for(
+            "dest",
+            "editor-src",
+            "editor",
+            "aaa111",
+            vec![mf],
+        ))
+        .expect("seed registry record");
+        reg.save_ejected(
+            "dest",
+            &[crate::registry::EjectedEntry {
+                source: "editor-src".to_owned(),
+                artifact: "editor".to_owned(),
+                ejected_at: "2026-01-31T14:00:00Z".to_owned(),
+            }],
+        )
+        .expect("mark editor ejected");
+
+        let listings = list_statuses(&cfg, &reg).expect("list statuses");
+
+        let st = status_for(&listings, "dest", "editor")
+            .expect("an ejected artifact must still be listed");
+        assert!(
+            st.state.to_lowercase().contains("ejected"),
+            "an artifact in the target's ejected list must read Ejected, got {:?}",
+            st.state
+        );
+    }
+
+    #[test]
+    fn list_statuses_groups_by_target_and_names_source_and_artifact() {
+        let state_dir = TempDir::new().expect("state root");
+        let reg = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+        let root_a = TempDir::new().expect("target a root");
+        let root_b = TempDir::new().expect("target b root");
+        let cfg = config_two_flat_targets(
+            "home",
+            "editor-src",
+            root_a.path(),
+            "xdg",
+            "snippets-src",
+            root_b.path(),
+        );
+
+        let lua = deploy_matching_file(root_a.path(), "editor", "init.lua", b"-- init\n");
+        reg.put(&record_for(
+            "home",
+            "editor-src",
+            "editor",
+            "aaa111",
+            vec![lua],
+        ))
+        .expect("seed editor record under home");
+        let json = deploy_matching_file(root_b.path(), "snippets", "py.json", b"{}\n");
+        reg.put(&record_for(
+            "xdg",
+            "snippets-src",
+            "snippets",
+            "bbb222",
+            vec![json],
+        ))
+        .expect("seed snippets record under xdg");
+
+        let listings = list_statuses(&cfg, &reg).expect("list statuses");
+
+        assert_eq!(
+            listings.len(),
+            2,
+            "each configured target must get its own listing entry, got {listings:?}"
+        );
+
+        let home = listings
+            .iter()
+            .find(|l| l.target == "home")
+            .expect("the home target must be present as its own grouping");
+        let home_names: Vec<&str> = home.artifacts.iter().map(|a| a.artifact.as_str()).collect();
+        assert_eq!(
+            home_names,
+            vec!["editor"],
+            "the home group must carry only its own editor artifact, got {home_names:?}"
+        );
+        assert!(
+            home.artifacts.iter().all(|a| a.source == "editor-src"),
+            "every row in the home group must name the home source, got {:?}",
+            home.artifacts
+        );
+
+        let xdg = listings
+            .iter()
+            .find(|l| l.target == "xdg")
+            .expect("the xdg target must be present as its own grouping");
+        let xdg_names: Vec<&str> = xdg.artifacts.iter().map(|a| a.artifact.as_str()).collect();
+        assert_eq!(
+            xdg_names,
+            vec!["snippets"],
+            "the xdg group must carry only its own snippets artifact, got {xdg_names:?}"
+        );
+        assert!(
+            xdg.artifacts.iter().all(|a| a.source == "snippets-src"),
+            "every row in the xdg group must name the xdg source, got {:?}",
+            xdg.artifacts
+        );
+
+        assert!(
+            !xdg_names.contains(&"editor"),
+            "an artifact deployed under home must NOT leak into the xdg group, got {xdg_names:?}"
+        );
+        assert!(
+            !home_names.contains(&"snippets"),
+            "an artifact deployed under xdg must NOT leak into the home group, got {home_names:?}"
+        );
+    }
+
+    // ── resolution_from_char ───────────────────────────────────────
+
+    #[test]
+    fn resolution_from_char_maps_skip() {
+        assert_eq!(
+            resolution_from_char('s'),
+            Some(Resolution::Skip),
+            "`s` must map to Skip"
+        );
+    }
+
+    #[test]
+    fn resolution_from_char_maps_overwrite() {
+        assert_eq!(
+            resolution_from_char('o'),
+            Some(Resolution::Overwrite),
+            "`o` must map to Overwrite"
+        );
+    }
+
+    #[test]
+    fn resolution_from_char_maps_eject() {
+        assert_eq!(
+            resolution_from_char('e'),
+            Some(Resolution::Eject),
+            "`e` must map to Eject"
+        );
+    }
+
+    #[test]
+    fn resolution_from_char_maps_abort() {
+        assert_eq!(
+            resolution_from_char('a'),
+            Some(Resolution::Abort),
+            "`a` must map to Abort"
+        );
+    }
+
+    #[test]
+    fn resolution_from_char_rejects_unknown() {
+        assert_eq!(
+            resolution_from_char('x'),
+            None,
+            "an unrecognized prompt character must map to None, not a default Resolution"
         );
     }
 }
