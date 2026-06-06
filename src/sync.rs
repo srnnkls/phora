@@ -563,23 +563,114 @@ fn prune_orphans(
 }
 
 pub fn eject(
-    _config: &Config,
-    _registry: &dyn Registry,
-    _artifact: &str,
-    _source: &str,
-    _target: &str,
+    config: &Config,
+    registry: &dyn Registry,
+    artifact: &str,
+    source: &str,
+    target: &str,
 ) -> Result<()> {
-    Err(Error::NotImplemented("eject"))
+    if !config.targets.contains_key(target) {
+        return Err(Error::Config(format!("unknown target: {target}")));
+    }
+    let key = ArtifactKey {
+        target: target.to_owned(),
+        source: source.to_owned(),
+        artifact: artifact.to_owned(),
+    };
+    if registry.get(&key)?.is_none() {
+        return Err(Error::Registry(format!(
+            "{source}/{artifact} is not managed in target {target}"
+        )));
+    }
+
+    let mut ejected = registry.load_ejected(target)?;
+    let already = ejected
+        .iter()
+        .any(|e| e.source == source && e.artifact == artifact);
+    if !already {
+        ejected.push(EjectedEntry {
+            source: source.to_owned(),
+            artifact: artifact.to_owned(),
+            ejected_at: chrono::Utc::now().to_rfc3339(),
+        });
+        registry.save_ejected(target, &ejected)?;
+    }
+    registry.remove(&key)
 }
 
 pub fn uneject(
-    _config: &Config,
-    _registry: &dyn Registry,
-    _artifact: &str,
-    _source: &str,
-    _target: &str,
+    config: &Config,
+    registry: &dyn Registry,
+    artifact: &str,
+    source: &str,
+    target: &str,
 ) -> Result<()> {
-    Err(Error::NotImplemented("uneject"))
+    if !config.targets.contains_key(target) {
+        return Err(Error::Config(format!("unknown target: {target}")));
+    }
+    let mut ejected = registry.load_ejected(target)?;
+    ejected.retain(|e| !(e.source == source && e.artifact == artifact));
+    registry.save_ejected(target, &ejected)
+}
+
+/// Why a deployed file failed verification against its registry record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifyReason {
+    /// The deployed file's content hash differs from the recorded `blake3`.
+    ContentMismatch { expected: String, actual: String },
+    /// The recorded file is absent on disk at the deployed location.
+    Missing,
+}
+
+/// A single deployed file that does not match its registry record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyMismatch {
+    pub key: ArtifactKey,
+    pub path: std::path::PathBuf,
+    pub reason: VerifyReason,
+}
+
+pub fn verify(config: &Config, registry: &dyn Registry) -> Result<Vec<VerifyMismatch>> {
+    let mut mismatches = Vec::new();
+    for record in registry.list_all()? {
+        let Some(target) = config.targets.get(&record.key.target) else {
+            continue;
+        };
+        let artifact_dir = target.expanded_path().join(
+            target
+                .layout()
+                .artifact_path(&record.key.source, &record.key.artifact),
+        );
+        for file in &record.files {
+            let dst = artifact_dir.join(&file.path);
+            match std::fs::read(&dst) {
+                Ok(content) => {
+                    let actual = blake3::hash(&content).to_hex().to_string();
+                    if actual != file.blake3 {
+                        mismatches.push(VerifyMismatch {
+                            key: record.key.clone(),
+                            path: file.path.clone(),
+                            reason: VerifyReason::ContentMismatch {
+                                expected: file.blake3.clone(),
+                                actual,
+                            },
+                        });
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    mismatches.push(VerifyMismatch {
+                        key: record.key.clone(),
+                        path: file.path.clone(),
+                        reason: VerifyReason::Missing,
+                    });
+                }
+                Err(e) => {
+                    return Err(Error::Sync(format!("verify read {}: {e}", dst.display())));
+                }
+            }
+        }
+    }
+    Ok(mismatches)
 }
 
 #[cfg(test)]
@@ -2598,6 +2689,319 @@ mod tests {
                 .expect("read journal after sync")
                 .is_empty(),
             "recovery running before Phase 1 must have CLEARED the journal despite the Phase 1 error"
+        );
+    }
+
+    // ── eject / uneject (programmatic, not interactive) ────────────
+
+    /// Seed a managed artifact: a registry record for `(dest, source, artifact)` plus its
+    /// deployed files on disk at the flat-layout dst. Returns the deployed artifact dir.
+    fn seed_managed_artifact(
+        td: &TargetDir,
+        reg: &FileRegistry,
+        source: &str,
+        artifact: &str,
+        file: &str,
+        content: &[u8],
+    ) -> PathBuf {
+        let dst = td.artifact_dst(&flat_layout(), source, artifact);
+        std::fs::create_dir_all(&dst).expect("mkdir managed dst");
+        std::fs::write(dst.join(file), content).expect("write managed file");
+        let record = RegistryRecord {
+            version: 1,
+            key: artifact_key("dest", source, artifact),
+            commit: "feedfacefeedfacefeedfacefeedfacefeedface".to_owned(),
+            digest: "blake3:seed".to_owned(),
+            projected_at: "2026-01-01T00:00:00Z".to_owned(),
+            layout: "flat".to_owned(),
+            allow_symlinks: false,
+            preserve_executable: true,
+            files: vec![ManifestFile {
+                path: PathBuf::from(file),
+                size: content.len() as u64,
+                mtime: 1_700_000_000,
+                blake3: blake3::hash(content).to_hex().to_string(),
+            }],
+        };
+        reg.put(&record).expect("seed managed record");
+        dst
+    }
+
+    fn eject_target_config(td: &TargetDir, fx: &SyncFixture) -> Config {
+        config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat")
+    }
+
+    #[test]
+    fn eject_adds_ejected_entry_removes_record_and_keeps_files() {
+        let fx = build_sync_fixture();
+        let td = TargetDir::new();
+        let cfg = eject_target_config(&td, &fx);
+        let dst = seed_managed_artifact(
+            &td,
+            &fx.registry,
+            "editor-src",
+            "editor",
+            "init.lua",
+            b"-- init\n",
+        );
+        assert!(
+            fx.registry
+                .get(&artifact_key("dest", "editor-src", "editor"))
+                .expect("registry get must not error")
+                .is_some(),
+            "premise: the artifact must be MANAGED (record present) before eject"
+        );
+
+        eject(&cfg, &fx.registry, "editor", "editor-src", "dest")
+            .expect("eject a managed artifact must succeed");
+
+        let ejected = fx.registry.load_ejected("dest").expect("load ejected");
+        assert!(
+            ejected
+                .iter()
+                .any(|e| e.source == "editor-src" && e.artifact == "editor"),
+            "eject must add an EjectedEntry for (editor-src, editor), got {ejected:?}"
+        );
+        assert!(
+            fx.registry
+                .get(&artifact_key("dest", "editor-src", "editor"))
+                .expect("registry get must not error")
+                .is_none(),
+            "eject must REMOVE the registry record so the artifact is no longer managed"
+        );
+        assert_eq!(
+            std::fs::read(dst.join("init.lua")).expect("deployed file still present"),
+            b"-- init\n",
+            "eject must LEAVE the on-disk files untouched"
+        );
+    }
+
+    #[test]
+    fn eject_persists_entry_across_a_reopened_registry() {
+        let state_dir = TempDir::new().expect("state dir");
+        let fx = build_sync_fixture();
+        let td = TargetDir::new();
+        let cfg = eject_target_config(&td, &fx);
+        let reg = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+        seed_managed_artifact(&td, &reg, "editor-src", "editor", "init.lua", b"-- init\n");
+
+        eject(&cfg, &reg, "editor", "editor-src", "dest").expect("eject must succeed");
+
+        let reopened = FileRegistry::open(state_dir.path().to_path_buf()).expect("reopen registry");
+        let ejected = reopened
+            .load_ejected("dest")
+            .expect("load ejected reopened");
+        assert!(
+            ejected
+                .iter()
+                .any(|e| e.source == "editor-src" && e.artifact == "editor"),
+            "eject must PERSIST the ejected entry to disk so a fresh registry sees it, got {ejected:?}"
+        );
+    }
+
+    #[test]
+    fn uneject_removes_matching_entry_and_leaves_others() {
+        let fx = build_sync_fixture();
+        let td = TargetDir::new();
+        let cfg = eject_target_config(&td, &fx);
+
+        let seeded = vec![
+            EjectedEntry {
+                source: "editor-src".to_owned(),
+                artifact: "editor".to_owned(),
+                ejected_at: "2026-01-31T14:00:00Z".to_owned(),
+            },
+            EjectedEntry {
+                source: "other-src".to_owned(),
+                artifact: "widget".to_owned(),
+                ejected_at: "2026-01-30T10:00:00Z".to_owned(),
+            },
+        ];
+        fx.registry
+            .save_ejected("dest", &seeded)
+            .expect("seed ejected entries");
+
+        uneject(&cfg, &fx.registry, "editor", "editor-src", "dest")
+            .expect("uneject an ejected artifact must succeed");
+
+        let ejected = fx.registry.load_ejected("dest").expect("load ejected");
+        assert!(
+            !ejected
+                .iter()
+                .any(|e| e.source == "editor-src" && e.artifact == "editor"),
+            "uneject must REMOVE the matching (editor-src, editor) entry, got {ejected:?}"
+        );
+        assert!(
+            ejected
+                .iter()
+                .any(|e| e.source == "other-src" && e.artifact == "widget"),
+            "uneject must LEAVE unrelated ejected entries intact, got {ejected:?}"
+        );
+    }
+
+    // ── verify (content-hash audit) ────────────────────────────────
+
+    /// Seed a managed artifact whose `ManifestFile.blake3` is the REAL blake3 of the
+    /// content written to disk, so a verify match case is genuine, not tautological.
+    /// `files`: (relative path, content) pairs; all live under the flat-layout dst.
+    fn seed_verifiable_artifact(
+        td: &TargetDir,
+        reg: &FileRegistry,
+        source: &str,
+        artifact: &str,
+        files: &[(&str, &[u8])],
+    ) -> PathBuf {
+        let dst = td.artifact_dst(&flat_layout(), source, artifact);
+        let manifest = files
+            .iter()
+            .map(|(rel, content)| {
+                let path = dst.join(rel);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).expect("mkdir verify file parent");
+                }
+                std::fs::write(&path, content).expect("write verify file");
+                ManifestFile {
+                    path: PathBuf::from(rel),
+                    size: content.len() as u64,
+                    mtime: 1_700_000_000,
+                    blake3: blake3::hash(content).to_hex().to_string(),
+                }
+            })
+            .collect();
+        let record = RegistryRecord {
+            version: 1,
+            key: artifact_key("dest", source, artifact),
+            commit: "feedfacefeedfacefeedfacefeedfacefeedface".to_owned(),
+            digest: "blake3:seed".to_owned(),
+            projected_at: "2026-01-01T00:00:00Z".to_owned(),
+            layout: "flat".to_owned(),
+            allow_symlinks: false,
+            preserve_executable: true,
+            files: manifest,
+        };
+        reg.put(&record).expect("seed verifiable record");
+        dst
+    }
+
+    fn verify_config(td: &TargetDir, fx: &SyncFixture) -> Config {
+        config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat")
+    }
+
+    #[test]
+    fn verify_reports_no_mismatch_when_content_matches_recorded_hash() {
+        let fx = build_sync_fixture();
+        let td = TargetDir::new();
+        let cfg = verify_config(&td, &fx);
+        seed_verifiable_artifact(
+            &td,
+            &fx.registry,
+            "editor-src",
+            "editor",
+            &[
+                ("init.lua", b"-- init\n"),
+                ("lua/keymaps.lua", b"-- keymaps\n"),
+            ],
+        );
+
+        let mismatches = verify(&cfg, &fx.registry).expect("verify must not error");
+
+        assert!(
+            !mismatches
+                .iter()
+                .any(|m| m.key == artifact_key("dest", "editor-src", "editor")),
+            "an artifact whose deployed file contents hash to the recorded blake3 must produce \
+             NO mismatch, got {mismatches:?}"
+        );
+    }
+
+    #[test]
+    fn verify_reports_mismatch_for_edited_deployed_file() {
+        let fx = build_sync_fixture();
+        let td = TargetDir::new();
+        let cfg = verify_config(&td, &fx);
+
+        let original: &[u8] = b"hello world!";
+        let edited: &[u8] = b"hello-world!";
+        // Equal length defeats a size-only shortcut: only a content hash sees the diff.
+        assert_eq!(original.len(), edited.len());
+
+        let dst = seed_verifiable_artifact(
+            &td,
+            &fx.registry,
+            "editor-src",
+            "editor",
+            &[("init.lua", original), ("notes.txt", b"keep me\n")],
+        );
+        let recorded_hash = blake3::hash(original).to_hex().to_string();
+
+        std::fs::write(dst.join("init.lua"), edited).expect("edit deployed file");
+        let edited_hash = blake3::hash(edited).to_hex().to_string();
+        assert_ne!(recorded_hash, edited_hash);
+
+        let mismatches = verify(&cfg, &fx.registry).expect("verify must not error");
+
+        let hit = mismatches
+            .iter()
+            .find(|m| {
+                m.key == artifact_key("dest", "editor-src", "editor")
+                    && m.path == *Path::new("init.lua")
+            })
+            .unwrap_or_else(|| {
+                panic!("verify must report the edited init.lua as a mismatch, got {mismatches:?}")
+            });
+        let VerifyReason::ContentMismatch { expected, actual } = &hit.reason else {
+            panic!(
+                "an edited file must be reported as a content mismatch, got {:?}",
+                hit.reason
+            )
+        };
+        assert_eq!(
+            *expected, recorded_hash,
+            "ContentMismatch.expected must be the recorded blake3 of the original content"
+        );
+        assert_eq!(
+            *actual, edited_hash,
+            "ContentMismatch.actual must be the real blake3 of the edited deployed content, \
+             proving verify hashes the actual bytes on disk (not size, not a stale/garbage hash)"
+        );
+        assert!(
+            !mismatches.iter().any(|m| m.path == *Path::new("notes.txt")),
+            "the untouched notes.txt must NOT be reported as a mismatch, got {mismatches:?}"
+        );
+    }
+
+    #[test]
+    fn verify_reports_missing_recorded_file() {
+        let fx = build_sync_fixture();
+        let td = TargetDir::new();
+        let cfg = verify_config(&td, &fx);
+        let dst = seed_verifiable_artifact(
+            &td,
+            &fx.registry,
+            "editor-src",
+            "editor",
+            &[("init.lua", b"-- init\n"), ("gone.lua", b"-- gone\n")],
+        );
+
+        // Delete a recorded file: it is in the record but absent on disk.
+        std::fs::remove_file(dst.join("gone.lua")).expect("remove recorded file");
+
+        let mismatches = verify(&cfg, &fx.registry).expect("verify must not error");
+
+        let hit = mismatches
+            .iter()
+            .find(|m| {
+                m.key == artifact_key("dest", "editor-src", "editor")
+                    && m.path == *Path::new("gone.lua")
+            })
+            .unwrap_or_else(|| {
+                panic!("verify must report the missing gone.lua as a mismatch, got {mismatches:?}")
+            });
+        assert_eq!(
+            hit.reason,
+            VerifyReason::Missing,
+            "a recorded file absent from disk must be reported as Missing, got {:?}",
+            hit.reason
         );
     }
 }
