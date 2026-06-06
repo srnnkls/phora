@@ -19,6 +19,7 @@
 pub mod cli;
 pub mod config;
 pub mod error;
+pub mod lock;
 pub mod matcher;
 pub mod paths;
 pub mod projection;
