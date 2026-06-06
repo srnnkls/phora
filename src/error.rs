@@ -52,6 +52,9 @@ pub enum Error {
 
     #[error("not implemented: {0}")]
     NotImplemented(&'static str),
+
+    #[error("aborted by user")]
+    Aborted,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
