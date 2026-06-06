@@ -22,6 +22,18 @@ pub enum Error {
     #[error("source error: {0}")]
     Source(String),
 
+    #[error("root path not found in tree: {root}")]
+    RootNotFound { root: std::path::PathBuf },
+
+    #[error("artifact not found in tree: {artifact}")]
+    ArtifactNotFound { artifact: String },
+
+    #[error("symlink not allowed: {path} (set allow_symlinks=true to permit)")]
+    SymlinkNotAllowed { path: std::path::PathBuf },
+
+    #[error("submodule not allowed: {path} (set allow_submodules=true to permit)")]
+    SubmoduleNotAllowed { path: std::path::PathBuf },
+
     #[error("registry error: {0}")]
     Registry(String),
 
