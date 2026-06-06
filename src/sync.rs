@@ -4,7 +4,6 @@ use crate::config::{Config, Lock};
 use crate::error::{Error, Result};
 use crate::registry::Registry;
 
-#[allow(clippy::too_many_arguments)]
 pub fn sync(
     _base_config: &Config,
     _local_config: Option<&Config>,

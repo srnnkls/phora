@@ -20,7 +20,6 @@ pub struct ScanResult {
     pub symlinks: Vec<PathBuf>,
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn check_artifact_state(
     _target_path: &Path,
     _expected_source: &str,
