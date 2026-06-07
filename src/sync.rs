@@ -11,7 +11,7 @@ use crate::matcher::PathMatcher;
 use crate::projection::{
     ArtifactState, Journal, check_artifact_state, deploy_artifact, recovery_sweep,
 };
-use crate::registry::{ArtifactKey, EjectedEntry, Registry, RegistryRecord};
+use crate::registry::{ArtifactKey, EjectedEntry, ManifestFile, Registry, RegistryRecord};
 use crate::source::{ExportRequest, SourceBackend};
 
 /// Borrowed inputs to [`sync`]: the configs and locks plus run flags. Bundled so
@@ -671,6 +671,285 @@ pub fn verify(config: &Config, registry: &dyn Registry) -> Result<Vec<VerifyMism
         }
     }
     Ok(mismatches)
+}
+
+/// Summary of a [`rebuild_registry`] run: which artifacts were reconstructed and
+/// which on-disk content failed to match the recomputed hash or lacked any config
+/// match.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RebuildReport {
+    /// Managed artifacts whose registry record was reconstructed from mirror + disk.
+    pub reconstructed: Vec<ArtifactKey>,
+    /// Managed artifacts whose on-disk content fails the recomputed per-file hash.
+    pub modified: Vec<ArtifactKey>,
+    /// On-disk artifact dirs under a target with no matching config/lock source.
+    pub foreign: Vec<std::path::PathBuf>,
+}
+
+pub fn rebuild_registry(
+    config: &Config,
+    lock: &Lock,
+    backend: &dyn SourceBackend,
+    registry: &dyn Registry,
+) -> Result<RebuildReport> {
+    let mut report = RebuildReport::default();
+
+    for (target_name, target) in &config.targets {
+        let mut managed: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+
+        for source_name in target.resolve_sources(&config.sources) {
+            let source = config.sources.get(source_name).ok_or_else(|| {
+                Error::Config(format!("target references undefined source: {source_name}"))
+            })?;
+            let locked = lock.find_source(source_name).ok_or_else(|| {
+                Error::Sync(format!(
+                    "no locked commit for source {source_name}; run sync first"
+                ))
+            })?;
+            let commit = &locked.commit;
+            let matcher = PathMatcher::new(source.includes(), source.excludes())?;
+            let policy = source.export_policy();
+            let discovered = backend.discover_artifacts(
+                source_name,
+                &source.git,
+                commit,
+                source.root.as_deref(),
+                &matcher,
+            )?;
+
+            for artifact in discovered {
+                let key = ArtifactKey {
+                    target: target_name.clone(),
+                    source: source_name.to_owned(),
+                    artifact: artifact.clone(),
+                };
+                let artifact_dst = target
+                    .expanded_path()
+                    .join(target.layout().artifact_path(source_name, &artifact));
+
+                rebuild_one(RebuildOne {
+                    backend,
+                    registry,
+                    source,
+                    source_name,
+                    commit,
+                    matcher: &matcher,
+                    policy: &policy,
+                    artifact: &artifact,
+                    artifact_dst: &artifact_dst,
+                    layout_kind: target.layout().kind,
+                    key,
+                    report: &mut report,
+                })?;
+
+                managed
+                    .entry(source_name.to_owned())
+                    .or_default()
+                    .insert(artifact);
+            }
+        }
+
+        report.foreign.extend(scan_foreign(target, &managed)?);
+    }
+
+    Ok(report)
+}
+
+struct RebuildOne<'a> {
+    backend: &'a dyn SourceBackend,
+    registry: &'a dyn Registry,
+    source: &'a Source,
+    source_name: &'a str,
+    commit: &'a str,
+    matcher: &'a PathMatcher,
+    policy: &'a crate::source::ExportPolicy,
+    artifact: &'a str,
+    artifact_dst: &'a Path,
+    layout_kind: LayoutKind,
+    key: ArtifactKey,
+    report: &'a mut RebuildReport,
+}
+
+fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
+    let RebuildOne {
+        backend,
+        registry,
+        source,
+        source_name,
+        commit,
+        matcher,
+        policy,
+        artifact,
+        artifact_dst,
+        layout_kind,
+        key,
+        report,
+    } = args;
+
+    let staging_base = std::env::temp_dir().join("phora-rebuild");
+    let staging = staging_base.join(format!("{artifact}-{}-{}", std::process::id(), nonce()));
+    let _guard = StagingGuard::new(&staging_base, &staging);
+
+    let commit_time = backend.commit_time(source_name, &source.git, commit)?;
+    let export = backend.export_artifact(&ExportRequest {
+        source: source_name,
+        url: &source.git,
+        commit,
+        root: source.root.as_deref(),
+        artifact,
+        matcher,
+        policy,
+        staging_dir: &staging,
+        commit_time,
+    })?;
+
+    let mut modified = false;
+    let mut files = Vec::with_capacity(export.files.len());
+    for mf in export.files {
+        let on_disk = artifact_dst.join(&mf.path);
+        let (size, mtime) = if let Some(actual) = disk_hash(&on_disk)? {
+            if actual.hash != mf.blake3 {
+                modified = true;
+            }
+            (actual.size, actual.mtime)
+        } else {
+            modified = true;
+            (mf.size, mf.mtime)
+        };
+        files.push(ManifestFile {
+            path: mf.path,
+            size,
+            mtime,
+            blake3: mf.blake3,
+        });
+    }
+
+    let record = RegistryRecord {
+        version: 1,
+        key: key.clone(),
+        commit: commit.to_owned(),
+        digest: export.digest,
+        projected_at: chrono::Utc::now().to_rfc3339(),
+        layout: format!("{layout_kind:?}").to_lowercase(),
+        allow_symlinks: policy.allow_symlinks,
+        preserve_executable: policy.preserve_executable,
+        files,
+    };
+    registry.put(&record)?;
+    report.reconstructed.push(key.clone());
+    if modified {
+        report.modified.push(key);
+    }
+    Ok(())
+}
+
+struct DiskHash {
+    hash: String,
+    size: u64,
+    mtime: u64,
+}
+
+/// `Ok(None)` when the file is absent on disk.
+fn disk_hash(path: &Path) -> Result<Option<DiskHash>> {
+    let content = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Error::Sync(format!("read {}: {e}", path.display()))),
+    };
+    let meta = std::fs::metadata(path)
+        .map_err(|e| Error::Sync(format!("stat {}: {e}", path.display())))?;
+    let mtime = filetime::FileTime::from_last_modification_time(&meta).unix_seconds();
+    Ok(Some(DiskHash {
+        hash: blake3::hash(&content).to_hex().to_string(),
+        size: meta.len(),
+        mtime: u64::try_from(mtime).unwrap_or(0),
+    }))
+}
+
+/// On-disk artifact dirs under `target` that no managed `(source, artifact)` maps to.
+fn scan_foreign(
+    target: &Target,
+    managed: &BTreeMap<String, BTreeSet<String>>,
+) -> Result<Vec<PathBuf>> {
+    let target_path = target.expanded_path();
+    let layout = target.layout();
+    let mut foreign = Vec::new();
+
+    let entries = match std::fs::read_dir(&target_path) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(foreign),
+        Err(e) => {
+            return Err(Error::Sync(format!(
+                "read target dir {}: {e}",
+                target_path.display()
+            )));
+        }
+    };
+
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| Error::Sync(format!("read {}: {e}", target_path.display())))?;
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        foreign.extend(foreign_under(&entry.path(), &name, layout.kind, managed));
+    }
+
+    Ok(foreign)
+}
+
+fn foreign_under(
+    dir: &Path,
+    name: &str,
+    layout_kind: LayoutKind,
+    managed: &BTreeMap<String, BTreeSet<String>>,
+) -> Vec<PathBuf> {
+    let is_managed_artifact = managed.values().any(|arts| arts.contains(name));
+    let is_managed_source = managed.contains_key(name);
+
+    match layout_kind {
+        LayoutKind::Flat | LayoutKind::Prefixed => {
+            if is_managed_artifact || is_managed_prefixed(name, managed) {
+                Vec::new()
+            } else {
+                unmanaged_subdirs(dir, &BTreeSet::new())
+            }
+        }
+        LayoutKind::BySource => {
+            if is_managed_source {
+                unmanaged_subdirs(dir, &managed[name])
+            } else {
+                unmanaged_subdirs(dir, &BTreeSet::new())
+            }
+        }
+    }
+}
+
+fn is_managed_prefixed(name: &str, managed: &BTreeMap<String, BTreeSet<String>>) -> bool {
+    managed.iter().any(|(source, arts)| {
+        arts.iter().any(|art| {
+            name.starts_with(source.as_str()) && name.ends_with(art.as_str()) && name != art
+        })
+    })
+}
+
+fn unmanaged_subdirs(dir: &Path, managed_artifacts: &BTreeSet<String>) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(std::result::Result::ok)
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            !n.starts_with('.') && !managed_artifacts.contains(&n)
+        })
+        .map(|e| e.path())
+        .collect()
 }
 
 #[cfg(test)]
@@ -3002,6 +3281,192 @@ mod tests {
             VerifyReason::Missing,
             "a recorded file absent from disk must be reported as Missing, got {:?}",
             hit.reason
+        );
+    }
+
+    // ── rebuild-registry (reconstruct from config+lock + mirror + disk) ─
+
+    /// Deploy `editor-src` into a fresh target via a real sync, returning the
+    /// fixture, target dir, config, and the resulting base lock. The mirror is
+    /// fetched and the registry populated as a side effect.
+    fn rebuild_setup() -> (SyncFixture, TargetDir, Config, Lock) {
+        let fx = build_sync_fixture();
+        let td = TargetDir::new();
+        let cfg =
+            config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+        let out = sync(
+            &input(&cfg, None, None, None, false),
+            &fx.backend,
+            &fx.registry,
+        )
+        .expect("first sync deploys and records the artifact");
+        assert!(!out.had_failures, "premise: the seeding sync must succeed");
+        (fx, td, cfg, out.base_lock)
+    }
+
+    #[test]
+    fn rebuild_reconstructs_lost_record_with_same_commit_digest_and_files() {
+        let (fx, td, cfg, lock) = rebuild_setup();
+        let key = artifact_key("dest", "editor-src", "editor");
+
+        let original = fx
+            .registry
+            .get(&key)
+            .expect("registry get must not error")
+            .expect("premise: sync must have recorded the artifact");
+        let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+        assert!(
+            dst.join("init.lua").exists(),
+            "premise: the deployed files must remain on disk after the record is dropped"
+        );
+
+        // Lose the registry state but keep files + mirror + config + lock.
+        fx.registry.remove(&key).expect("drop the registry record");
+        assert!(
+            fx.registry.get(&key).expect("get after remove").is_none(),
+            "premise: the record must be gone before rebuild"
+        );
+
+        let report = rebuild_registry(&cfg, &lock, &fx.backend, &fx.registry)
+            .expect("rebuild reconstructs from mirror + disk");
+
+        let rebuilt = fx
+            .registry
+            .get(&key)
+            .expect("registry get must not error")
+            .expect("rebuild must reconstruct the dropped record");
+
+        assert_eq!(
+            rebuilt.commit, original.commit,
+            "reconstructed record must carry the same locked commit"
+        );
+        assert_eq!(
+            rebuilt.digest, original.digest,
+            "reconstructed export digest must equal the originally-synced digest \
+             (recomputed by re-walking the mirror at the locked commit)"
+        );
+
+        let file_hashes = |rec: &RegistryRecord| -> BTreeSet<(PathBuf, String)> {
+            rec.files
+                .iter()
+                .map(|f| (f.path.clone(), f.blake3.clone()))
+                .collect()
+        };
+        assert_eq!(
+            file_hashes(&rebuilt),
+            file_hashes(&original),
+            "reconstructed files must match the original path+blake3 set \
+             (content hashes recomputed from the mirror)"
+        );
+
+        assert!(
+            report.reconstructed.contains(&key),
+            "the report must list the reconstructed artifact, got {:?}",
+            report.reconstructed
+        );
+        assert!(
+            report.modified.is_empty(),
+            "an unmodified deploy must not be reported [modified], got {:?}",
+            report.modified
+        );
+    }
+
+    #[test]
+    fn rebuild_preserves_ejected_entries() {
+        let (fx, _td, cfg, lock) = rebuild_setup();
+        let key = artifact_key("dest", "editor-src", "editor");
+        fx.registry.remove(&key).expect("drop the registry record");
+
+        let ejected = EjectedEntry {
+            source: "editor-src".to_owned(),
+            artifact: "other".to_owned(),
+            ejected_at: "2026-01-01T00:00:00Z".to_owned(),
+        };
+        fx.registry
+            .save_ejected("dest", std::slice::from_ref(&ejected))
+            .expect("seed an ejected entry before rebuild");
+
+        rebuild_registry(&cfg, &lock, &fx.backend, &fx.registry)
+            .expect("rebuild succeeds with an ejected entry present");
+
+        let after = fx
+            .registry
+            .load_ejected("dest")
+            .expect("load ejected after rebuild");
+        assert!(
+            after.contains(&ejected),
+            "rebuild must preserve the pre-existing ejected entry, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn rebuild_reports_modified_when_disk_content_fails_recomputed_hash() {
+        let (fx, td, cfg, lock) = rebuild_setup();
+        let key = artifact_key("dest", "editor-src", "editor");
+        fx.registry.remove(&key).expect("drop the registry record");
+
+        let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+        let file = dst.join("init.lua");
+        let original = std::fs::read(&file).expect("deployed init.lua present before tamper");
+        let tampered: Vec<u8> = original
+            .iter()
+            .map(|b| if *b == b'i' { b'I' } else { *b })
+            .collect();
+        assert_ne!(
+            tampered, original,
+            "premise: the tamper must actually change the bytes"
+        );
+        assert_eq!(
+            tampered.len(),
+            original.len(),
+            "premise: the tamper must preserve byte length so size alone won't reveal it"
+        );
+        std::fs::write(&file, &tampered).expect(
+            "overwrite with same-length, different content so disk fails the recomputed hash",
+        );
+
+        let report = rebuild_registry(&cfg, &lock, &fx.backend, &fx.registry)
+            .expect("rebuild must not error on a content mismatch");
+
+        assert!(
+            report.modified.contains(&key),
+            "a managed artifact whose disk content fails the recomputed hash must be \
+             reported [modified], got {:?}",
+            report.modified
+        );
+    }
+
+    #[test]
+    fn rebuild_reports_foreign_artifact_dir_with_no_config_match() {
+        let (fx, td, cfg, lock) = rebuild_setup();
+
+        // An on-disk artifact dir under the target that no source/lock entry maps to.
+        let foreign_dir = td.target_path().join("hand-made").join("scratch");
+        std::fs::create_dir_all(&foreign_dir).expect("mkdir foreign artifact dir");
+        std::fs::write(foreign_dir.join("notes.txt"), b"hand-written\n")
+            .expect("write foreign file");
+
+        let report = rebuild_registry(&cfg, &lock, &fx.backend, &fx.registry)
+            .expect("rebuild must not error in the presence of a foreign dir");
+
+        assert!(
+            report.foreign.iter().any(|p| p.ends_with("scratch")
+                || p.ends_with(std::path::Path::new("hand-made/scratch"))),
+            "an on-disk artifact dir with no config/lock match must be reported [foreign], \
+             got {:?}",
+            report.foreign
+        );
+
+        let managed = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+        assert!(
+            !report
+                .foreign
+                .iter()
+                .any(|p| { p == &managed || p.ends_with("editor") || p.starts_with(&managed) }),
+            "the legit managed artifact ({}) must NOT be reported [foreign]; \
+             only unmanaged on-disk dirs may appear, got {:?}",
+            managed.display(),
+            report.foreign
         );
     }
 }
