@@ -1,27 +1,47 @@
 version = 1
 
-# Hosts (optional): a git URL template + auth, referenced by sources.
+# Host templates expand `add` shorthands (`owner/repo`) and supply auth.
+# `github` and `gitlab` are built in; add others here.
 [hosts.github]
 git_url = "https://github.com/{owner}/{repo}.git"
 auth = { type = "token", env = "GITHUB_TOKEN" }
 
-# Sources: git repositories to mirror, and which artifacts to export.
+[hosts.company]
+git_url = "ssh://git@git.company.com/{owner}/{repo}.git"
+auth = { type = "ssh", key = "~/.ssh/id_ed25519" }
+
+# A source is a git repo. Top-level directories under `root` are its artifacts.
+# Pin with exactly one of branch / tag / rev (defaults to branch `main`).
 [sources.dotfiles]
 git = "https://github.com/me/dotfiles.git"
 branch = "main"
-include = ["nvim", "tmux", "git"]
+root = "modules"
 
-[sources.skills]
-git = "https://github.com/me/claude-skills.git"
-root = "skills"
+[sources.company-configs]
+git = "https://github.com/company/shared-configs.git"
+tag = "v2.1"
+root = "configs"
+include = ["editor", "lint"]
+exclude = ["**/test/**", "**/*.bak"]
 
-# Targets: where exported artifacts are deployed.
-[targets.home]
-path = "~/.config"
+[sources.loqui]
+git = "https://github.com/srnnkls/loqui.git"
+rev = "9f1c2ab"
+root = "languages"
+allow_symlinks = false
+preserve_executable = true
+
+# A target is a directory artifacts are projected into. Omit `sources` to take all.
+[targets.neovim]
+path = "~/.config/nvim"
 sources = ["dotfiles"]
+
+[targets.vscode]
+path = "~/.config/Code/User"
+sources = ["dotfiles", "company-configs"]
 layout = "flat"
 
-[targets.claude]
-path = "~/.claude/skills"
-sources = ["skills"]
-layout = "by-source"
+[targets.policies]
+path = "~/.cupcake/policies/claude"
+sources = ["loqui"]
+layout = { type = "prefixed", separator = "/" }
