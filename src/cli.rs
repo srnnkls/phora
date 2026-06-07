@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 
 use crate::config::{Config, Host, Source};
 use crate::error::{Error, Result};
-use crate::lock::Lock;
+use crate::lock::{Lock, merge_locks};
 use crate::matcher::PathMatcher;
 use crate::paths::{ProjectId, phora_dir};
 use crate::projection::{ArtifactState, check_artifact_state};
@@ -166,7 +166,7 @@ pub fn run(cli: Cli) -> Result<()> {
             println!("unejected {source}/{artifact} in {target}");
             Ok(())
         }
-        Command::RebuildRegistry => Err(Error::NotImplemented("rebuild-registry")),
+        Command::RebuildRegistry => run_rebuild_registry(),
         Command::CheckMatch { source, path } => {
             let source = load_source(&source)?;
             let report = check_match_cmd(&source, &path);
@@ -311,6 +311,40 @@ fn finish_sync(cwd: &Path, out: &SyncOutput) -> Result<()> {
         std::process::exit(1);
     }
     println!("sync complete");
+    Ok(())
+}
+
+fn run_rebuild_registry() -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let config = load_config()?;
+    let (base_lock, local_lock) = load_locks(&cwd)?;
+    let lock = match base_lock {
+        Some(base) => merge_locks(&base, local_lock.as_ref()),
+        None => local_lock
+            .ok_or_else(|| Error::Lock("no lock file found; run sync first".to_owned()))?,
+    };
+
+    let backend = GitBackend::new(phora_dir()?.join("git"));
+    let registry = open_project_registry()?;
+    let report = crate::sync::rebuild_registry(&config, &lock, &backend, &registry)?;
+
+    println!("reconstructed {}", report.reconstructed.len());
+    if !report.modified.is_empty() {
+        let modified: Vec<String> = report
+            .modified
+            .iter()
+            .map(|k| format!("{}/{}", k.source, k.artifact))
+            .collect();
+        println!("modified [{}]", modified.join(", "));
+    }
+    if !report.foreign.is_empty() {
+        let foreign: Vec<String> = report
+            .foreign
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        println!("foreign [{}]", foreign.join(", "));
+    }
     Ok(())
 }
 
