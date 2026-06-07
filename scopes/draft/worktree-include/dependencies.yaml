@@ -1,0 +1,36 @@
+scope: worktree-include
+
+# Decoupled from deploy-link-dev-mode after review (H1): own IncludeMode + own
+# atomic placement helper; only projection::copy_file (already shipped) is reused.
+external_dependencies: []
+
+phases:
+  - id: phase-1-config
+    title: "Config"
+    tasks: [WTI-001]
+
+  - id: phase-2-detect
+    title: "Primary detection + tracked-path plumbing"
+    parallel: true
+    tasks: [WTI-002, WTI-006]
+    depends_on: [WTI-001]
+
+  - id: phase-3-apply
+    title: "Apply engine"
+    tasks: [WTI-003]
+    depends_on: [WTI-001, WTI-002, WTI-006]
+
+  - id: phase-4-guards-docs
+    title: "Guardrails + subcommand/migration/docs"
+    parallel: true
+    tasks: [WTI-004, WTI-005]
+    depends_on: [WTI-003]
+
+edges:
+  WTI-002: [WTI-001]
+  WTI-006: [WTI-002]
+  WTI-003: [WTI-001, WTI-002, WTI-006]
+  WTI-004: [WTI-003]
+  WTI-005: [WTI-003]
+
+critical_path: [WTI-001, WTI-002, WTI-006, WTI-003, WTI-004]

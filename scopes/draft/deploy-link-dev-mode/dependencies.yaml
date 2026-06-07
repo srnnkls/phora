@@ -1,0 +1,43 @@
+scope: deploy-link-dev-mode
+
+# Phase-based DAG. Tasks within a phase are independent and parallel-dispatchable;
+# a phase starts when its dependencies complete.
+
+phases:
+  - id: phase-1-config
+    title: "Config + provenance"
+    tasks: [DLD-001]
+
+  - id: phase-2-edges
+    title: "Discovery, guardrails, registry shape, link-resolution"
+    parallel: true
+    tasks: [DLD-002, DLD-003, DLD-005, DLD-009]
+    depends_on: [DLD-001]
+
+  - id: phase-3-deploy
+    title: "Link deployment"
+    tasks: [DLD-004]
+    depends_on: [DLD-003, DLD-005]
+
+  - id: phase-4-quarantine
+    title: "Verify / rebuild / prune quarantine"
+    tasks: [DLD-006]
+    depends_on: [DLD-004]
+
+  - id: phase-5-transitions-docs
+    title: "Transitions + docs"
+    parallel: true
+    tasks: [DLD-007, DLD-008]
+    depends_on: [DLD-004, DLD-006, DLD-002]
+
+edges:
+  DLD-002: [DLD-001]
+  DLD-003: [DLD-001]
+  DLD-005: [DLD-001]
+  DLD-009: [DLD-001]
+  DLD-004: [DLD-003, DLD-005]
+  DLD-006: [DLD-004]
+  DLD-007: [DLD-004, DLD-006]
+  DLD-008: [DLD-002, DLD-005]
+
+critical_path: [DLD-001, DLD-003, DLD-004, DLD-006, DLD-007]

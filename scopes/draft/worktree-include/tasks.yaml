@@ -1,0 +1,112 @@
+scope: worktree-include
+issue_type: Feature
+created: 2026-06-07
+revised: 2026-06-07   # post multi-agent review (opus+sonnet) — decoupled from deploy-link
+
+# Decoupled: worktree-include defines its own IncludeMode and a ~5-line atomic
+# placement helper. The only pre-existing primitive reused is projection::copy_file
+# (reflink-or-copy, projection.rs:178). No dependency on deploy-link's draft tasks.
+
+tasks:
+  - id: WTI-001
+    content: "Config: [worktree].includes = [{ path, mode }] with own IncludeMode"
+    status: pending
+    activeForm: "Adding [worktree] includes config"
+    review_fixes:
+      - "REVISED (H1/K-001): do NOT reuse deploy-link DeployMode{Copy,Link}; define IncludeMode{Symlink,Copy} (different axis/semantics)"
+      - "REVISED (manifest home = both): support committed phora.toml base + phora.local.toml overlay"
+      - "REVISED (K-003): merge_configs is map-entry level today; extend it to merge config.worktree via WorktreeConfig::merged_with (struct-level array replace)"
+    acceptance:
+      - "Config gains worktree: Option<WorktreeConfig>; [worktree] key parses; absent is fine (empty includes)"
+      - "IncludeMode { Symlink, Copy } from mode = \"symlink\" | \"copy\"; default Symlink"
+      - "merge_configs merges worktree: local [worktree] replaces base entirely (includes is one array)"
+      - "path validated as a safe relative path (no traversal, no absolute); bad mode + unknown [worktree] key rejected (deny_unknown_fields)"
+    tests:
+      - "includes parse with explicit + defaulted mode; [worktree] absent => empty"
+      - "base includes=[{path=a}] + local includes=[{path=b}] => merged has only b"
+      - "absolute/traversal path rejected; unknown mode + unknown key rejected naming the value"
+
+  - id: WTI-002
+    content: "Primary-worktree detection via gix (no git CLI)"
+    status: pending
+    activeForm: "Detecting the primary worktree"
+    depends_on: [WTI-001]
+    review_fixes:
+      - "REVISED (feasibility): codebase is pure-gix (Command::new git only in tests); use gix, not `git worktree list --porcelain`"
+    acceptance:
+      - "gix::discover(cwd) -> Repository; main_repo().work_dir() yields the primary worktree root (absolute, canonical)"
+      - "Used as the symlink/copy source root"
+      - "Bare main repo (work_dir None) => clear error (no primary to back-reference)"
+      - "Not inside a git repo => clear error"
+    tests:
+      - "from a linked worktree, primary resolves to the main checkout"
+      - "from the primary, detection reports primary == cwd (drives the no-op guard)"
+      - "bare main repo => error; outside any repo => error"
+
+  - id: WTI-003
+    content: "phora worktree apply: stateless atomic placement engine"
+    status: pending
+    activeForm: "Implementing worktree apply"
+    depends_on: [WTI-001, WTI-002]
+    review_fixes:
+      - "REVISED (crash-safety): existing journalled swap is registry-coupled; worktree-include is stateless. Use a lean place helper (temp + rename, NO journal — re-apply is self-healing)"
+      - "REVISED (C1/nested): handle a CHILD include path inside a real dir (.cmw.local/config.yaml, .claude/skills/issue) — create parents, never clobber the parent"
+      - "REVISED (statelessness): apply opens NO registry and takes NO state.lock (unlike every other subcommand); reads only phora.toml/.local + git"
+      - "REVISED (C-002): staleness is a readlink comparison; non-symlink at a symlink path is an error/skip"
+      - "REVISED (Windows/dir): symlink_dir vs symlink_file by target type; copy mode uses copy_file (file) / copy_tree (dir)"
+      - "REVISED (C-005): paths resolve from the worktree root (CWD or optional --path), not arbitrary CWD"
+    acceptance:
+      - "phora worktree apply subcommand wired (worktree subcommand group: Apply)"
+      - "For each include: parent create_dir_all; symlink mode => absolute link to <primary>/<path> via temp-symlink + rename; copy mode => copy_file (file) or copy_tree (dir) via temp + rename"
+      - "Idempotent: a symlink entry is correct iff read_link == <primary>/<path>; stale re-pointed; missing created; a real (non-symlink) file/dir at a symlink path is NOT silently replaced"
+      - "Creates nothing under ~/.phora/state; takes no state.lock"
+      - "Paths resolved from worktree root (CWD or --path)"
+    tests:
+      - "symlink entries are absolute links to primary; copy entries independent; second apply no-op"
+      - "nested .cmw.local/config.yaml: parent created/preserved, only leaf linked, siblings intact"
+      - "apply creates nothing under ~/.phora/state"
+      - "stale link re-pointed (readlink oracle); real file at path => warn/skip"
+
+  - id: WTI-004
+    content: "Guardrails: primary no-op, missing-primary skip, warn-and-continue"
+    status: pending
+    activeForm: "Enforcing worktree-apply guardrails"
+    depends_on: [WTI-003]
+    acceptance:
+      - "apply in the primary worktree (primary == cwd) is a no-op with a notice"
+      - "missing primary source path warns and skips (no dangling link)"
+      - "symlink/copy failure warns, skips entry, continues; exit reflects partial failure"
+    tests:
+      - "apply in primary => no symlinks created"
+      - "absent primary path => warn + skip, no dangling link"
+      - "forced symlink failure => warn + continue"
+
+  - id: WTI-005
+    content: "worktree subcommand group, import-legacy, hook + docs"
+    status: pending
+    activeForm: "Wiring subcommand, migration, docs"
+    depends_on: [WTI-003]
+    review_fixes:
+      - "REVISED (L-002): cli.rs has no subcommand nesting today; add a Worktree subcommand enum { Apply, ImportLegacy }"
+    acceptance:
+      - "phora worktree import-legacy <file> converts .worktreeinclude -> [worktree] config (one-shot); symlink entries -> mode=symlink; 'submodule-walk' entries reported as 'declare as a phora source instead', not imported"
+      - "README/example documents [worktree] config (committed base + local overlay), post-checkout wiring (git-worktreeinclude -> phora worktree apply), dropping .worktreeinclude"
+      - "Windows privilege / warn-and-continue noted"
+    tests:
+      - "import-legacy maps symlink entries to mode=symlink; flags submodule-walk entries as out-of-band"
+
+  - id: WTI-006
+    content: "Tracked-path guard via gix index"
+    status: pending
+    activeForm: "Implementing tracked-path refusal"
+    depends_on: [WTI-002]
+    review_fixes:
+      - "REVISED (H3/C-003): phora has NO index/status capability today; this is new gix plumbing. gix default features compile gix-index/gix-status, so it is feasible — give it its own task + spike"
+    acceptance:
+      - "worktree::is_path_tracked(repo, path): open the worktree index via gix and probe the repo-relative path"
+      - "An include path present in the index is refused with a warning (never shadow committed content)"
+      - "Spike-confirmed: an untracked-but-present path (.codex / *.local.toml — the motivating case) reads as ABSENT from the index and is therefore allowed"
+      - "Wired into apply before placement"
+    tests:
+      - "a committed path => refused; an untracked gitignored path => allowed"
+      - "spike: gitignored .codex present on disk reads as absent from index"
