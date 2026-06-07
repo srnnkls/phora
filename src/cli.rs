@@ -90,10 +90,6 @@ pub enum Command {
     },
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "the command implementation will consume the parsed args"
-)]
 pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Add {
