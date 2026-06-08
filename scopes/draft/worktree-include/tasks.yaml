@@ -123,7 +123,7 @@ tasks:
 
   - id: WTI-007
     content: "Submodule support: IncludeMode::SubmoduleWalk + gix submodule detection"
-    status: pending
+    status: done
     activeForm: "Adding submodule include modes + detection"
     depends_on: [WTI-002, WTI-006]
     review_fixes:
