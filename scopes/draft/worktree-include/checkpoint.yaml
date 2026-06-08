@@ -3,17 +3,18 @@ checkpoint:
   scope_path: ./scopes/draft/worktree-include
   branch: feat/worktree-include
   base: feat/deploy-link-dev-mode
-  last_batch: 2
+  last_batch: 3
   tasks:
-    done: [WTI-001, WTI-002]
-    pending: [WTI-006, WTI-007, WTI-003, WTI-004, WTI-005]
+    done: [WTI-001, WTI-002, WTI-006]
+    pending: [WTI-007, WTI-003, WTI-004, WTI-005]
   next_batch:
-    number: 3
-    tasks: [WTI-006]   # tracked-path guard via gix index (gitlinks exempt); then WTI-007, then WTI-003
-  sequence: [WTI-006, WTI-007, WTI-003, "WTI-004 + WTI-005 (parallel)"]
+    number: 4
+    tasks: [WTI-007]   # submodule include modes + gix submodule detection
+  sequence: [WTI-007, WTI-003, "WTI-004 + WTI-005 (parallel)"]
   deferred_issues:
     - "WTI-003: enforce worktree-root containment at apply time (canonicalize + root-prefix); harden Windows-separator/drive/UNC include paths"
     - "WTI-002 (low): canonicalize IO error maps to Error::Worktree not Error::Io (kept for path context)"
+    - "WTI-006 (low): repo.index() errors on unborn-HEAD instead of Absent (unreachable in apply path; safer default)"
   scope_change:
     date: 2026-06-08
     note: "submodule support added (user reversal); WTI-007 new; WTI-003/005/006 amended"
