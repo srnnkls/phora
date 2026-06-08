@@ -30,6 +30,8 @@ pub enum EntryOutcome {
     Placed,
     /// The destination was left as-is for the given reason.
     Skipped(SkipReason),
+    /// Placement of this entry failed; the run continued with the remaining entries.
+    Failed(String),
 }
 
 /// One include's path paired with the decision the engine reached for it.
@@ -43,31 +45,62 @@ pub struct EntryReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyReport {
     pub entries: Vec<EntryReport>,
+    /// `true` when the run was a no-op because it targeted the primary worktree.
+    pub primary_noop: bool,
+}
+
+impl ApplyReport {
+    /// `true` iff any entry was [`EntryOutcome::Failed`].
+    #[must_use]
+    pub fn had_failures(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|e| matches!(e.outcome, EntryOutcome::Failed(_)))
+    }
 }
 
 /// Materializes each configured include at `<worktree_root>/<path>` from
-/// `<primary_root>/<path>`, statelessly and idempotently.
+/// `<primary_root>/<path>`, statelessly and idempotently. In the primary
+/// worktree this is a no-op. A per-include placement failure is recorded as
+/// [`EntryOutcome::Failed`] and the run continues.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Worktree`] when the index cannot be classified, and
-/// [`Error::Projection`] when a filesystem placement (symlink, copy, or
-/// directory creation) fails.
+/// Per-include failures are recorded as [`EntryOutcome::Failed`]; this function
+/// does not currently return an error.
 pub fn apply(
     worktree_root: &Path,
     primary_root: &Path,
     repo: &gix::Repository,
     includes: &[Include],
 ) -> Result<ApplyReport> {
+    if is_primary(worktree_root, primary_root) {
+        return Ok(ApplyReport {
+            entries: Vec::new(),
+            primary_noop: true,
+        });
+    }
+
     let mut entries = Vec::with_capacity(includes.len());
     for include in includes {
-        let outcome = apply_one(worktree_root, primary_root, repo, include)?;
+        let outcome = match apply_one(worktree_root, primary_root, repo, include) {
+            Ok(outcome) => outcome,
+            Err(e) => EntryOutcome::Failed(e.to_string()),
+        };
         entries.push(EntryReport {
             path: include.path.clone(),
             outcome,
         });
     }
-    Ok(ApplyReport { entries })
+    Ok(ApplyReport {
+        entries,
+        primary_noop: false,
+    })
+}
+
+fn is_primary(worktree_root: &Path, primary_root: &Path) -> bool {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(worktree_root) == canon(primary_root)
 }
 
 fn apply_one(
@@ -1100,6 +1133,138 @@ mod tests {
             std::fs::read(dst.join("top.txt")).expect("read copied top file"),
             b"top\n",
             "the copied tree must be INDEPENDENT of the primary: later primary mutation must not change it"
+        );
+    }
+
+    #[test]
+    fn apply_in_primary_worktree_is_noop() {
+        let (primary, _linked_parent, _worktree) = primary_and_linked();
+        let primary_root = canonical(primary.path());
+        std::fs::write(primary_root.join(".envrc"), b"export FOO=bar\n")
+            .expect("create a source that WOULD be placed if apply did not no-op");
+
+        let repo = open(&primary_root);
+        let includes = [include(".envrc", IncludeMode::Symlink)];
+
+        let report = apply(&primary_root, &primary_root, &repo, &includes)
+            .expect("apply in the primary worktree must succeed as a no-op");
+
+        assert!(
+            report.primary_noop,
+            "apply where worktree_root == primary_root must flag the run as a primary no-op"
+        );
+        assert!(
+            report.entries.is_empty(),
+            "a primary no-op must place nothing: entries must be empty, got {:?}",
+            report.entries
+        );
+
+        let meta = std::fs::symlink_metadata(primary_root.join(".envrc"))
+            .expect("the original source file must still exist in the primary");
+        assert!(
+            !meta.file_type().is_symlink(),
+            "apply must NEVER symlink the primary's own include path onto itself"
+        );
+        assert!(!report.had_failures(), "a primary no-op is not a failure");
+    }
+
+    #[test]
+    fn entry_failure_warns_continues_and_flags_partial_failure() {
+        let (primary, _linked_parent, worktree) = primary_and_linked();
+        let primary_root = canonical(primary.path());
+
+        std::fs::create_dir(primary_root.join("blocked"))
+            .expect("create the primary parent for the nested first include");
+        std::fs::write(primary_root.join("blocked").join("leaf"), b"first\n")
+            .expect("create the nested first source");
+        std::fs::write(primary_root.join("second.env"), b"SECOND=ok\n")
+            .expect("create the second source");
+
+        std::fs::write(worktree.join("blocked"), b"i am a regular file\n")
+            .expect("pre-place a REGULAR FILE where the first include's parent dir must be created, so create_dir_all fails deterministically");
+
+        let repo = open(&worktree);
+        let includes = [
+            include("blocked/leaf", IncludeMode::Symlink),
+            include("second.env", IncludeMode::Symlink),
+        ];
+
+        let report = apply(&worktree, &primary_root, &repo, &includes).expect(
+            "a per-entry placement failure must NOT abort apply: the run must still return Ok",
+        );
+
+        assert!(
+            matches!(
+                outcome_for(&report, "blocked/leaf"),
+                EntryOutcome::Failed(_)
+            ),
+            "the first include must be recorded as Failed (its parent dir cannot be created), got {:?}",
+            outcome_for(&report, "blocked/leaf")
+        );
+        assert_eq!(
+            outcome_for(&report, "second.env"),
+            &EntryOutcome::Placed,
+            "the second include must still be Placed, proving apply continued after the first entry failed"
+        );
+        assert!(
+            report.had_failures(),
+            "had_failures() must be true when any entry Failed, so the CLI can exit non-zero"
+        );
+
+        assert_eq!(
+            std::fs::read_link(worktree.join("second.env"))
+                .expect("second include must be a symlink on disk"),
+            primary_root.join("second.env"),
+            "the successful second include's symlink must actually exist on disk after the partial failure"
+        );
+    }
+
+    #[test]
+    fn missing_primary_source_warns_and_skips() {
+        let (primary, _linked_parent, worktree) = primary_and_linked();
+        let primary_root = canonical(primary.path());
+
+        let repo = open(&worktree);
+        let includes = [include("absent-in-primary", IncludeMode::Symlink)];
+
+        let report = apply(&worktree, &primary_root, &repo, &includes)
+            .expect("a missing primary source must be a skip, not an error");
+
+        assert_eq!(
+            outcome_for(&report, "absent-in-primary"),
+            &EntryOutcome::Skipped(SkipReason::MissingSource),
+            "an include whose primary source is absent must be Skipped(MissingSource)"
+        );
+        assert!(
+            std::fs::symlink_metadata(worktree.join("absent-in-primary")).is_err(),
+            "a missing source must leave no dangling link in the worktree"
+        );
+        assert!(
+            !report.had_failures(),
+            "a missing source is a SKIP, not a failure: had_failures() must be false"
+        );
+    }
+
+    #[test]
+    fn report_without_failures_reports_no_partial_failure() {
+        let (primary, _linked_parent, worktree) = primary_and_linked();
+        let primary_root = canonical(primary.path());
+        std::fs::write(primary_root.join(".envrc"), b"export FOO=bar\n").expect("create source");
+
+        let repo = open(&worktree);
+        let includes = [include(".envrc", IncludeMode::Symlink)];
+
+        let report = apply(&worktree, &primary_root, &repo, &includes)
+            .expect("an all-success apply must succeed");
+
+        assert_eq!(outcome_for(&report, ".envrc"), &EntryOutcome::Placed);
+        assert!(
+            !report.primary_noop,
+            "a normal (non-primary) apply must not flag primary_noop"
+        );
+        assert!(
+            !report.had_failures(),
+            "an all-success apply must NOT report a partial failure (guards the exit-code signal against false positives)"
         );
     }
 }

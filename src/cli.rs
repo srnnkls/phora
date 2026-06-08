@@ -201,8 +201,16 @@ fn run_worktree_apply(path: Option<&Path>) -> Result<()> {
     let repo = gix::discover(worktree_root)
         .map_err(|e| Error::Worktree(format!("open repository: {e}")))?;
     let report = crate::worktree_apply::apply(worktree_root, &primary, &repo, includes)?;
+    if report.primary_noop {
+        eprintln!("phora: worktree apply is a no-op in the primary worktree");
+        return Ok(());
+    }
     for entry in &report.entries {
         println!("{}: {:?}", entry.path.display(), entry.outcome);
+    }
+    if report.had_failures() {
+        eprintln!("phora: some includes failed to apply");
+        std::process::exit(1);
     }
     Ok(())
 }

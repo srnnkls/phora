@@ -157,3 +157,26 @@ batch_reviews:
       worktree_apply_tests: "21 passed"
       clippy_all_targets: clean
       fmt: clean
+  - batch: 6
+    tasks: [WTI-004]
+    test_review:
+      reviewers: [test-review-opus, test-review-sonnet]
+      outcome: needs_changes -> clean
+      findings_addressed:
+        - "primary_noop==false on the normal path was never asserted -> added to report_without_failures test"
+    code_review:
+      reviewers: [code-review-opus, code-review-sonnet]
+      gates: { correctness: pass, security: pass, architecture: pass, style: pass }
+      outcome: approved   # both reviewers
+      low_findings_handled:
+        - "apply # Errors doc stale (no ? remains, always Ok) -> corrected to state failures are recorded as EntryOutcome::Failed"
+      deferred_issues:
+        - severity: low
+          detail: "CLI prints EntryOutcome via Debug {:?}; a Display impl would polish output. Informative enough for now."
+        - severity: low
+          detail: "run_worktree_apply uses process::exit(1) on had_failures (bypasses Drop) — matches the existing finish_sync precedent; kept for consistency."
+    verification:
+      lib_tests: "331 passed; 0 failed"
+      worktree_apply_tests: "25 passed"
+      clippy_all_targets: clean
+      fmt: clean
