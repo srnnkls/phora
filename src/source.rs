@@ -549,6 +549,22 @@ pub fn read_local_head(path: &str) -> Result<String> {
     }
 }
 
+/// True when `git` is a local filesystem path (absolute or existing), not a scheme/scp-style URL.
+#[must_use]
+pub fn is_local_path(git: &str) -> bool {
+    if git.contains("://") {
+        return false;
+    }
+    let first_slash = git.find('/');
+    if let Some(colon) = git.find(':')
+        && first_slash.is_none_or(|slash| colon < slash)
+    {
+        return false;
+    }
+    let path = Path::new(git);
+    path.is_absolute() || path.exists()
+}
+
 /// Rejects any git tree filename that is not a single inert path component, so a
 /// malicious tree can never escape the staging dir when joined onto a path.
 fn safe_component(name: &str) -> Result<&str> {
@@ -1129,6 +1145,63 @@ mod tests {
         assert_eq!(
             NormalizedUrl::parse("git@github.com:user/repo.git").as_str(),
             "github.com/user/repo"
+        );
+    }
+
+    #[test]
+    fn is_local_path_rejects_url_and_scp_forms() {
+        for url in [
+            "https://github.com/me/dotfiles.git",
+            "ssh://git@host/x.git",
+            "git@github.com:me/dotfiles.git",
+            "github.com:me/repo",
+        ] {
+            assert!(
+                !is_local_path(url),
+                "url/scp form must not be classified local: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_local_path_accepts_absolute_path() {
+        assert!(
+            is_local_path("/home/soeren/dev/loqui"),
+            "an absolute path is a local path even if it does not exist"
+        );
+    }
+
+    /// Removes its directory on drop, so a panicking assert never leaks it.
+    struct CwdRelDir(PathBuf);
+
+    impl Drop for CwdRelDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[expect(
+        clippy::unwrap_used,
+        reason = "tempdir setup fails loudly in tests"
+    )]
+    #[test]
+    fn is_local_path_accepts_existing_relative_path() {
+        let nonce = format!(
+            "phora-rel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let cwd = std::env::current_dir().unwrap();
+        let abs = cwd.join(&nonce);
+        std::fs::create_dir(&abs).unwrap();
+        let _cleanup = CwdRelDir(abs);
+
+        assert!(
+            is_local_path(&nonce),
+            "a relative name that exists under cwd on disk is a local path"
         );
     }
 

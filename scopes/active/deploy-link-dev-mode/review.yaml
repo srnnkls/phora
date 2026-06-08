@@ -107,6 +107,37 @@ batch_reviews:
       only string-compared (never Digest::parse'd). Pi's "critical" deploy-path finding is DLD-004
       (deploy-closure dispatch), not a DLD-009 defect — see DLD-003-N1.
 
+  - batch: 2d
+    timestamp: 2026-06-08
+    tasks: [DLD-002]
+    phase_a5_test_review:
+      harnesses: [claude-opus (orchestrator inspection), pi]
+      result: clean-after-revision
+      note: >
+        First test pass had 3 flaws (1 high: confounded remote-git test; 1 medium: weak accept oracle;
+        1 medium: cwd-mutation hazard) — re-dispatched tester, all fixed, Pi re-review clean. Tests
+        restructured to target validate_link_mode directly.
+    reviewers:
+      - id: general+arch+style-claude-opus
+        status: success
+        gates: { correctness: pass, architecture: pass, style: pass }
+      - id: general+arch+style-pi
+        status: success
+        gates: { correctness: pass, architecture: pass, style: pass }
+    review_loop:
+      - finding: "Pi (medium): committed base deploy=link escaped rejection when a local overlay downgraded the source to copy (validate_link_mode iterated effective.sources only) — violates 'regardless of local override'."
+        action: "Mini-TDD cycle: added test base_link_rejected_even_when_overlay_downgrades_to_copy (RED), restructured validate_link_mode into independent base-provenance + effective-local-path passes (GREEN). Pi re-confirmed fixed, no over-rejection."
+    synthesized:
+      gates: { correctness: pass, architecture: pass, style: pass }
+      critical_issues: 0
+      high_issues: 0
+      medium_issues: 0
+    outcome: approved
+    notes: >
+      is_local_path predicate (URL/scp rejection then absolute-or-exists) + validate_link_mode
+      (base-provenance pass + effective local-path pass) wired into sync() before resolve_sources.
+      262 lib tests green, clippy clean. One adversarial review-loop fix applied (provenance overlay-bypass).
+
 issues:
   critical: []
   high: []
