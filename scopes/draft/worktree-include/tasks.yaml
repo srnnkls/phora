@@ -76,7 +76,7 @@ tasks:
 
   - id: WTI-004
     content: "Guardrails: primary no-op, missing-primary skip, warn-and-continue"
-    status: pending
+    status: done
     activeForm: "Enforcing worktree-apply guardrails"
     depends_on: [WTI-003]
     acceptance:
