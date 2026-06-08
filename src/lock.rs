@@ -48,7 +48,8 @@ pub fn merge_locks(base: &Lock, local: Option<&Lock>) -> Lock {
 /// refspec, and export-affecting config digest.
 #[must_use]
 pub fn source_matches(source: &Source, locked: &LockedSource) -> bool {
-    source.git == locked.git
+    // HAS-005: compare NormalizedUrl/MirrorKey identity, not raw strings
+    source.git.as_deref().unwrap_or_default() == locked.git
         && source.refspec().to_string() == locked.resolved
         && source.config_digest() == locked.config_digest
 }

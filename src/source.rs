@@ -12,6 +12,13 @@ use crate::registry::ManifestFile;
 /// gix clones origin as refs/remotes/origin/*; a mirror must update refs/heads/* directly.
 const MIRROR_REFSPEC: &str = "+refs/heads/*:refs/heads/*";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    Https,
+    Ssh,
+}
+
 #[derive(Debug, Clone)]
 pub struct ExportPolicy {
     pub allow_symlinks: bool,

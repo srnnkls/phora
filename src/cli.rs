@@ -657,8 +657,10 @@ fn host_templates(hosts: &BTreeMap<String, Host>) -> Vec<(String, String)> {
         "https://gitlab.com/{owner}/{repo}.git".to_owned(),
     );
     for (name, host) in hosts {
-        if let Some(url) = &host.git_url {
-            templates.insert(name.clone(), url.clone());
+        if let Some(remote) = &host.remote
+            && let Some(url) = remote.https_template()
+        {
+            templates.insert(name.clone(), url.to_owned());
         }
     }
     templates
@@ -1508,7 +1510,7 @@ mod tests {
         hosts.insert(
             "company".to_owned(),
             Config::parse(
-                "version = 1\n\n[hosts.company]\ngit_url = \"ssh://git@git.company.com:2222/scm/{owner}/{repo}.git\"\n",
+                "version = 1\n\n[hosts.company]\nremote = \"ssh://git@git.company.com:2222/scm/{owner}/{repo}.git\"\n",
             )
             .expect("host toml parses")
             .hosts
@@ -1557,7 +1559,8 @@ mod tests {
             .get("foo")
             .expect("existing foo source survives");
         assert_eq!(
-            foo.git, "https://github.com/me/foo.git",
+            foo.git.as_deref(),
+            Some("https://github.com/me/foo.git"),
             "the pre-existing source must be untouched"
         );
         assert_eq!(
@@ -1567,7 +1570,10 @@ mod tests {
         );
 
         let loqui = cfg.sources.get("loqui").expect("new loqui source added");
-        assert_eq!(loqui.git, "https://github.com/srnnkls/loqui.git");
+        assert_eq!(
+            loqui.git.as_deref(),
+            Some("https://github.com/srnnkls/loqui.git")
+        );
         assert!(
             loqui.branch.is_none(),
             "no branch was passed, so no branch key must be emitted"
@@ -1596,7 +1602,8 @@ mod tests {
             .get("foo")
             .expect("pre-existing foo source survives the branch/root insert");
         assert_eq!(
-            foo.git, "https://github.com/me/foo.git",
+            foo.git.as_deref(),
+            Some("https://github.com/me/foo.git"),
             "the pre-existing source's git must be untouched when inserting a source with branch+root"
         );
         assert_eq!(
@@ -1610,7 +1617,10 @@ mod tests {
             .get("editor-config")
             .expect("new editor-config source added");
 
-        assert_eq!(added.git, "https://github.com/company/configs.git");
+        assert_eq!(
+            added.git.as_deref(),
+            Some("https://github.com/company/configs.git")
+        );
         assert_eq!(
             added.branch.as_deref(),
             Some("main"),
@@ -1656,7 +1666,8 @@ mod tests {
             .get("foo")
             .expect("existing foo source survives");
         assert_eq!(
-            foo.git, "https://github.com/me/foo.git",
+            foo.git.as_deref(),
+            Some("https://github.com/me/foo.git"),
             "re-parsing the output must yield the original foo git value"
         );
     }
@@ -1712,15 +1723,17 @@ mod tests {
             cfg.sources
                 .get("loqui")
                 .expect("loqui source parses from block form")
-                .git,
-            "https://github.com/srnnkls/loqui.git"
+                .git
+                .as_deref(),
+            Some("https://github.com/srnnkls/loqui.git")
         );
         assert_eq!(
             cfg.sources
                 .get("editor")
                 .expect("editor source parses from block form")
-                .git,
-            "https://github.com/company/editor.git"
+                .git
+                .as_deref(),
+            Some("https://github.com/company/editor.git")
         );
     }
 
