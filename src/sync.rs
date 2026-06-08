@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::config::{Config, LayoutKind, Source, Target, merge_configs};
+use crate::config::{Config, DeployMode, LayoutKind, Source, Target, merge_configs};
 use crate::error::{Error, Result};
 use crate::lock::{Lock, LockedSource, merge_locks, source_matches, split_locks};
 use crate::matcher::PathMatcher;
@@ -192,13 +192,8 @@ fn deploy_target(
         })?;
         let commit = &run.commits[source_name];
         let matcher = PathMatcher::new(source.includes(), source.excludes())?;
-        let discovered = backend.discover_artifacts(
-            source_name,
-            &source.git,
-            commit,
-            source.root.as_deref(),
-            &matcher,
-        )?;
+        let discovered =
+            discover_artifacts_for_source(source, source_name, commit, backend, &matcher)?;
 
         for artifact_name in discovered {
             if layout.kind == LayoutKind::Flat {
@@ -508,6 +503,57 @@ fn remove_orphan_path(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Discover artifact directories by scanning the live working tree at
+/// `<git>/<root>` (Link mode). Mirrors the ODB `discover_artifacts`: only
+/// directory entries become artifacts, dotfiles are skipped, the matcher gates
+/// inclusion, and the result is sorted. A missing path/root is an error.
+fn discover_working_tree(
+    git: &Path,
+    root: Option<&Path>,
+    matcher: &PathMatcher,
+) -> Result<Vec<String>> {
+    let base = root.map_or_else(|| git.to_path_buf(), |r| git.join(r));
+    let entries = std::fs::read_dir(&base)
+        .map_err(|e| Error::Sync(format!("scan working tree {}: {e}", base.display())))?;
+
+    let mut artifacts = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| Error::Sync(format!("read entry in {}: {e}", base.display())))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || !matcher.allows_artifact(&name) {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            artifacts.push(name);
+        }
+    }
+
+    artifacts.sort();
+    Ok(artifacts)
+}
+
+fn discover_artifacts_for_source(
+    source: &Source,
+    source_name: &str,
+    commit: &str,
+    backend: &dyn SourceBackend,
+    matcher: &PathMatcher,
+) -> Result<Vec<String>> {
+    match source.deploy_mode() {
+        DeployMode::Link => {
+            discover_working_tree(Path::new(&source.git), source.root.as_deref(), matcher)
+        }
+        DeployMode::Copy => backend.discover_artifacts(
+            source_name,
+            &source.git,
+            commit,
+            source.root.as_deref(),
+            matcher,
+        ),
+    }
+}
+
 fn prune_orphans(
     config: &Config,
     backend: &dyn SourceBackend,
@@ -522,13 +568,8 @@ fn prune_orphans(
             })?;
             let commit = &resolved_commits[source_name];
             let matcher = PathMatcher::new(source.includes(), source.excludes())?;
-            let discovered = backend.discover_artifacts(
-                source_name,
-                &source.git,
-                commit,
-                source.root.as_deref(),
-                &matcher,
-            )?;
+            let discovered =
+                discover_artifacts_for_source(source, source_name, commit, backend, &matcher)?;
             for artifact in discovered {
                 expected.insert(ArtifactKey {
                     target: target_name.clone(),
@@ -710,13 +751,8 @@ pub fn rebuild_registry(
             let commit = &locked.commit;
             let matcher = PathMatcher::new(source.includes(), source.excludes())?;
             let policy = source.export_policy();
-            let discovered = backend.discover_artifacts(
-                source_name,
-                &source.git,
-                commit,
-                source.root.as_deref(),
-                &matcher,
-            )?;
+            let discovered =
+                discover_artifacts_for_source(source, source_name, commit, backend, &matcher)?;
 
             for artifact in discovered {
                 let key = ArtifactKey {
@@ -728,20 +764,29 @@ pub fn rebuild_registry(
                     .expanded_path()
                     .join(target.layout().artifact_path(source_name, &artifact));
 
-                rebuild_one(RebuildOne {
-                    backend,
-                    registry,
-                    source,
-                    source_name,
-                    commit,
-                    matcher: &matcher,
-                    policy: &policy,
-                    artifact: &artifact,
-                    artifact_dst: &artifact_dst,
-                    layout_kind: target.layout().kind,
-                    key,
-                    report: &mut report,
-                })?;
+                match source.deploy_mode() {
+                    DeployMode::Link => rebuild_linked(
+                        registry,
+                        &policy,
+                        target.layout().kind,
+                        key,
+                        &mut report,
+                    )?,
+                    DeployMode::Copy => rebuild_one(RebuildOne {
+                        backend,
+                        registry,
+                        source,
+                        source_name,
+                        commit,
+                        matcher: &matcher,
+                        policy: &policy,
+                        artifact: &artifact,
+                        artifact_dst: &artifact_dst,
+                        layout_kind: target.layout().kind,
+                        key,
+                        report: &mut report,
+                    })?,
+                }
 
                 managed
                     .entry(source_name.to_owned())
@@ -842,6 +887,32 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
     if modified {
         report.modified.push(key);
     }
+    Ok(())
+}
+
+/// Reconstruct a linked artifact's registry record without hashing or export:
+/// a link source has no mirror, so its marker is synthesized from disk discovery.
+fn rebuild_linked(
+    registry: &dyn Registry,
+    policy: &crate::source::ExportPolicy,
+    layout_kind: LayoutKind,
+    key: ArtifactKey,
+    report: &mut RebuildReport,
+) -> Result<()> {
+    let record = RegistryRecord {
+        version: 1,
+        key: key.clone(),
+        commit: "link".to_owned(),
+        digest: "link:".to_owned(),
+        projected_at: chrono::Utc::now().to_rfc3339(),
+        layout: format!("{layout_kind:?}").to_lowercase(),
+        allow_symlinks: policy.allow_symlinks,
+        preserve_executable: policy.preserve_executable,
+        files: vec![],
+        linked: true,
+    };
+    registry.put(&record)?;
+    report.reconstructed.push(key);
     Ok(())
 }
 
@@ -1081,6 +1152,7 @@ mod tests {
         resolves: Cell<usize>,
         exports: Cell<usize>,
         commit_times: Cell<usize>,
+        discovers: Cell<usize>,
     }
 
     impl<'a> CountingBackend<'a> {
@@ -1091,6 +1163,7 @@ mod tests {
                 resolves: Cell::new(0),
                 exports: Cell::new(0),
                 commit_times: Cell::new(0),
+                discovers: Cell::new(0),
             }
         }
 
@@ -1108,6 +1181,10 @@ mod tests {
 
         fn commit_time_count(&self) -> usize {
             self.commit_times.get()
+        }
+
+        fn discover_count(&self) -> usize {
+            self.discovers.get()
         }
     }
 
@@ -1135,6 +1212,7 @@ mod tests {
             root: Option<&Path>,
             matcher: &crate::matcher::PathMatcher,
         ) -> Result<Vec<String>> {
+            self.discovers.set(self.discovers.get() + 1);
             self.inner
                 .discover_artifacts(source, url, commit, root, matcher)
         }
@@ -3576,5 +3654,200 @@ mod tests {
             managed.display(),
             report.foreign
         );
+    }
+
+    // ── DLD-003: mode-aware working-tree discovery ─────────────────
+
+    /// A plain on-disk working tree (not a git repo) with three real artifact
+    /// dirs, a `.hidden` dotdir, a regular file, and an `uncommitted` dir that
+    /// was never `git add`ed — proving the Link scan reads disk, not the ODB.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "fixture setup fails loudly in tests"
+    )]
+    fn build_worktree(root_sub: Option<&str>) -> TempDir {
+        let td = TempDir::new().unwrap();
+        let base = match root_sub {
+            Some(sub) => td.path().join(sub),
+            None => td.path().to_path_buf(),
+        };
+        std::fs::create_dir_all(&base).unwrap();
+        for art in ["alpha", "zeta", "uncommitted"] {
+            std::fs::create_dir_all(base.join(art)).unwrap();
+            std::fs::write(base.join(art).join("file.txt"), b"x\n").unwrap();
+        }
+        std::fs::create_dir_all(base.join(".hidden")).unwrap();
+        std::fs::write(base.join(".hidden").join("secret"), b"s\n").unwrap();
+        std::fs::write(base.join("loose.txt"), b"loose\n").unwrap();
+        td
+    }
+
+    fn match_all() -> PathMatcher {
+        PathMatcher::new(&[], &[]).expect("empty matcher")
+    }
+
+    #[test]
+    fn worktree_scan_returns_sorted_real_dirs_excluding_dotdirs_and_files() {
+        let wt = build_worktree(None);
+
+        let found = discover_working_tree(wt.path(), None, &match_all())
+            .expect("scanning an existing working tree must succeed");
+
+        assert_eq!(
+            found,
+            vec![
+                "alpha".to_owned(),
+                "uncommitted".to_owned(),
+                "zeta".to_owned()
+            ],
+            "the disk scan must return only real subdirectories, sorted, \
+             excluding the .hidden dotdir and the loose.txt regular file; \
+             the never-added `uncommitted` dir proves this is a disk scan"
+        );
+    }
+
+    #[test]
+    fn worktree_scan_honors_root_subdir() {
+        let wt = build_worktree(Some("languages"));
+
+        let found = discover_working_tree(wt.path(), Some(Path::new("languages")), &match_all())
+            .expect("scanning <git>/<root> must succeed");
+
+        assert_eq!(
+            found,
+            vec![
+                "alpha".to_owned(),
+                "uncommitted".to_owned(),
+                "zeta".to_owned()
+            ],
+            "with root set, artifacts nested under <git>/languages must be discovered"
+        );
+        let direct = discover_working_tree(wt.path(), None, &match_all())
+            .expect("scanning the git root itself must succeed");
+        assert_eq!(
+            direct,
+            vec!["languages".to_owned()],
+            "without root, only the top-level `languages` dir is an artifact"
+        );
+    }
+
+    #[test]
+    fn worktree_scan_honors_matcher_exclude() {
+        let wt = build_worktree(None);
+        let matcher = PathMatcher::new(&[], &["zeta".to_owned()]).expect("exclude matcher");
+
+        let found = discover_working_tree(wt.path(), None, &matcher)
+            .expect("scan with an exclude must succeed");
+
+        assert_eq!(
+            found,
+            vec!["alpha".to_owned(), "uncommitted".to_owned()],
+            "the include/exclude matcher must gate disk artifacts just as it gates ODB ones"
+        );
+    }
+
+    #[test]
+    fn worktree_scan_missing_path_errors() {
+        let missing = std::path::Path::new("/nonexistent/phora/link/source");
+
+        let err = discover_working_tree(missing, None, &match_all())
+            .expect_err("an absent local path must be a clear error, not an empty list");
+
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("nonexistent")
+                || msg.contains("not found")
+                || msg.contains("no such file"),
+            "the error should point at the missing path, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn worktree_scan_missing_root_errors() {
+        let wt = build_worktree(None);
+
+        let err = discover_working_tree(wt.path(), Some(Path::new("absent-root")), &match_all())
+            .expect_err("a missing root subdir must error, not silently yield nothing");
+
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("absent-root")
+                || msg.contains("not found")
+                || msg.contains("no such file")
+                || msg.contains("root"),
+            "the error should name the missing root, got: {msg}"
+        );
+    }
+
+    /// Cross-site invariant (review C2): a Link source must be discovered from
+    /// DISK in `rebuild_registry`, never via `backend.discover_artifacts`.
+    fn config_link_source_one_target(
+        source: &str,
+        link_git: &Path,
+        target_path: &Path,
+    ) -> Config {
+        let toml = format!(
+            "version = 1\n\n\
+             [sources.{source}]\ngit = \"{}\"\nbranch = \"main\"\ndeploy = \"link\"\n\n\
+             [targets.dest]\npath = \"{}\"\nsources = [\"{source}\"]\nlayout = \"by-source\"\n",
+            link_git.display(),
+            target_path.display(),
+        );
+        Config::parse(&toml).expect("link-source config parses")
+    }
+
+    fn link_lock(source: &str, link_git: &Path) -> Lock {
+        Lock {
+            version: 1,
+            sources: vec![LockedSource {
+                name: source.to_owned(),
+                git: link_git.to_string_lossy().into_owned(),
+                resolved: "link".to_owned(),
+                commit: "link".to_owned(),
+                digest: "link:".to_owned(),
+                config_digest: "blake3:link".to_owned(),
+            }],
+        }
+    }
+
+    #[test]
+    fn rebuild_discovers_link_source_from_disk_never_via_odb() {
+        let wt = build_worktree(None);
+        let td = TargetDir::new();
+        let cfg = config_link_source_one_target("linked-src", wt.path(), &td.target_path());
+        let lock = link_lock("linked-src", wt.path());
+
+        let counting = CountingBackend::new({
+            let git_dir = TempDir::new().expect("backend mirror dir");
+            // Leak a backend bound to an empty mirror dir; a link source must
+            // never reach it, so it is never opened.
+            Box::leak(Box::new(GitBackend::new(git_dir.path().to_path_buf())))
+        });
+
+        let report = rebuild_registry(&cfg, &lock, &counting, &fx_registry())
+            .expect("rebuild over a link source must succeed using the disk scan");
+
+        assert_eq!(
+            counting.discover_count(),
+            0,
+            "a Link source must be discovered from disk in rebuild_registry; \
+             the ODB backend.discover_artifacts must NOT be called (review C2)"
+        );
+        let names: BTreeSet<String> = report
+            .reconstructed
+            .iter()
+            .map(|k| k.artifact.clone())
+            .collect();
+        assert!(
+            names.contains("alpha") && names.contains("zeta"),
+            "the link source's working-tree artifacts must be reconstructed, got {names:?}"
+        );
+    }
+
+    fn fx_registry() -> FileRegistry {
+        let state = TempDir::new().expect("registry state dir");
+        let reg = FileRegistry::open(state.path().to_path_buf()).expect("open registry");
+        std::mem::forget(state);
+        reg
     }
 }

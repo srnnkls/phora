@@ -39,7 +39,7 @@ tasks:
 
   - id: DLD-003
     content: "Mode-aware working-tree discovery (deploy + prune + rebuild)"
-    status: pending
+    status: done
     activeForm: "Discovering linked artifacts from the working tree"
     depends_on: [DLD-001]
     review_fixes:
