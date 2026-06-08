@@ -323,3 +323,34 @@ deferred_issues:
     issue: "Link sources still flow through deploy_one (export_artifact/commit_time) on the deploy path; mode dispatch not yet applied at the deploy closure."
     assessment: "NOT a DLD-003 defect — this is DLD-004's acceptance (dispatch on DeployMode at deploy_artifact_entry). DLD-004 depends on DLD-003 precisely for this. Tracked as DLD-004 work."
     defer_to: DLD-004
+
+final_review:
+  status: completed
+  timestamp: 2026-06-08
+  reviewers: [final-claude-opus-independent]
+  note: >
+    Pi harness unavailable for final pass (print-mode emits nothing when auto-backgrounded on large
+    diffs); used a fresh independent Claude reviewer with full scope.md cross-reference.
+  gates: { behavior: pass, guardrails: pass, integrity_quarantine: pass, crash_safety: pass, resolution: pass, style: pass }
+  scope_compliance:
+    all_tasks_complete: true        # DLD-001..009 all done
+    acceptance_criteria_met: true   # all 11 scope requirements evidenced (file:line + tests)
+    edge_cases_handled: true        # dangling link, stale/replaced symlink, transitions, warn-and-continue
+  requirements_verified: 11
+  unmet_requirements: []
+  integration_bugs: []
+  regressions_to_copy_path: []
+  strengths:
+    - "Copy path byte-identical (dispatch at the deploy closure; deploy excluded from config_digest)."
+    - "Adversarial review caught a real crash-reclaim defect (link staging relocated to the swept .phora-stage) and a provenance overlay-bypass (base-config scan) before merge."
+    - "Idempotence + transitions both correct via the matches! guard + mode_transition flag."
+  overall_assessment: "deploy = link implemented end-to-end and verified; 275 tests green, mise run check (clippy pedantic + rustfmt) clean. Ready to merge."
+  recommendation: ready_to_merge
+readiness:
+  all_batches_reviewed: true
+  critical_issues_resolved: true
+  high_issues_resolved: true
+  medium_issues_resolved: true      # DLD-005-M1 fixed in DLD-007; DLD-004-M2 accepted/deferred (atomic-by-construction)
+  final_review_passed: true
+  tests_passing: true
+  ci_check_green: true              # mise run check exit 0
