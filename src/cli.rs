@@ -99,6 +99,8 @@ pub enum Command {
 pub enum WorktreeCommand {
     /// Materialize configured includes in the current linked worktree.
     Apply { path: Option<std::path::PathBuf> },
+    /// Convert a legacy `.worktreeinclude` manifest into `[worktree].includes`.
+    ImportLegacy { file: std::path::PathBuf },
 }
 
 pub fn run(cli: Cli) -> Result<()> {
@@ -182,8 +184,23 @@ pub fn run(cli: Cli) -> Result<()> {
         }
         Command::Worktree { command } => match command {
             WorktreeCommand::Apply { path } => run_worktree_apply(path.as_deref()),
+            WorktreeCommand::ImportLegacy { file } => run_worktree_import_legacy(&file),
         },
     }
+}
+
+fn run_worktree_import_legacy(file: &Path) -> Result<()> {
+    let contents = std::fs::read_to_string(file)
+        .map_err(|e| Error::Config(format!("read {}: {e}", file.display())))?;
+    let import = crate::import_legacy::convert_legacy(&contents);
+    print!(
+        "{}",
+        crate::import_legacy::render_worktree_toml(&import.includes)
+    );
+    for skipped in &import.skipped {
+        eprintln!("phora: skipped {} ({})", skipped.line, skipped.reason);
+    }
+    Ok(())
 }
 
 fn run_worktree_apply(path: Option<&Path>) -> Result<()> {
@@ -991,6 +1008,24 @@ mod tests {
                 "the positional path arg must route into Apply {{ path: Some(..) }}"
             ),
             other => panic!("expected Worktree {{ Apply }}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_worktree_import_legacy() {
+        use clap::Parser as _;
+
+        let cli = Cli::try_parse_from(["phora", "worktree", "import-legacy", ".worktreeinclude"])
+            .expect("`phora worktree import-legacy <file>` must parse as a nested subcommand");
+        match cli.command {
+            Command::Worktree {
+                command: WorktreeCommand::ImportLegacy { file },
+            } => assert_eq!(
+                file,
+                PathBuf::from(".worktreeinclude"),
+                "the positional file arg must route into ImportLegacy {{ file }}"
+            ),
+            other => panic!("expected Worktree {{ ImportLegacy }}, got {other:?}"),
         }
     }
 

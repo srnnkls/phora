@@ -90,7 +90,7 @@ tasks:
 
   - id: WTI-005
     content: "worktree subcommand group, import-legacy, hook + docs"
-    status: pending
+    status: done
     activeForm: "Wiring subcommand, migration, docs"
     depends_on: [WTI-003]
     review_fixes:

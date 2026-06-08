@@ -68,6 +68,10 @@ phora where --source loqui  # reverse-lookup registry (by source/artifact/commit
 phora eject <artifact> --source <source> --target <target>
 phora uneject <artifact> --source <source> --target <target>
 
+# Worktree includes (per-linked-worktree files)
+phora worktree apply                          # materialize includes in the current worktree
+phora worktree import-legacy .worktreeinclude # migrate a git-worktreeinclude manifest
+
 # Maintenance / debugging
 phora rebuild-registry      # reconstruct registry from lock + on-disk targets
 phora check-match --source <source> <path>   # debug include/exclude matching
@@ -161,6 +165,96 @@ skips that artifact, and continues the rest of the sync.
 [sources.loqui]
 git = "/home/me/dev/loqui"   # local path; the live working tree
 deploy = "link"
+```
+
+## Worktree includes
+
+Some files belong in *every* `git worktree` of a repo but aren't committed —
+`.envrc`, local tool config, secret overlays, large vendored submodules. The
+`[worktree]` section lists what each newly checked-out worktree should carry over
+from the primary worktree.
+
+```toml
+version = 1
+
+[[worktree.includes]]
+path = ".envrc"               # mode omitted -> "symlink" (default)
+
+[[worktree.includes]]
+path = "secrets/local.env"
+mode = "copy"                 # an independent copy per worktree
+
+[[worktree.includes]]
+path = "vendor/lib"           # a gitlink (submodule)
+mode = "submodule-walk"
+```
+
+`path` is a worktree-relative path (no absolute, `..`, or `.` components).
+`mode` is one of:
+
+| Mode             | Effect                                                          |
+| ---------------- | -------------------------------------------------------------- |
+| `symlink` (default) | a symlink pointing at the primary worktree's copy           |
+| `copy`           | an independent copy taken from the primary worktree            |
+| `submodule-walk` | per-leaf symlinks into the primary's submodule worktree        |
+
+The manifest lives in the committed `phora.toml`, optionally overlaid by an
+uncommitted `phora.local.toml` (same merge rules as the rest of the config —
+local replaces the base `includes` array wholesale). Both are committed/placed
+alongside the repo, so a freshly checked-out worktree has the manifest available
+at apply time.
+
+**Submodules.** When `path` is a gitlink:
+
+- `symlink` (or the default) places a single directory symlink at the primary
+  worktree's checked-out submodule.
+- `submodule-walk` symlinks each leaf inside the submodule individually,
+  skipping `.git`, which keeps the nested worktree usable in tools that refuse
+  to descend through a symlinked submodule root.
+- `copy` on a gitlink is unsupported and the include is skipped.
+
+### `phora worktree apply`
+
+Run inside a linked worktree, `phora worktree apply` materializes the configured
+includes from the primary worktree. It is meant to run automatically from the
+repo's `post-checkout` hook. If you are migrating from `git-worktreeinclude`,
+swap the hook command and drop the old manifest:
+
+```diff
+ # .git/hooks/post-checkout
+-git-worktreeinclude apply
++phora worktree apply
+```
+
+```bash
+rm .worktreeinclude   # the legacy manifest is replaced by [worktree] in phora.toml
+```
+
+Behavior:
+
+- **Tracked paths are refused** — an include that names a path git already
+  tracks is rejected, so apply never shadows committed content.
+- **Missing primary sources and placement failures warn and continue** — a
+  missing source in the primary, or a placement that fails (e.g. a symlink that
+  cannot be created on Windows without the privilege), is reported and skipped;
+  the remaining includes are still applied.
+- **No-op in the primary** — running apply in the primary worktree does nothing.
+
+### `phora worktree import-legacy`
+
+`phora worktree import-legacy <.worktreeinclude>` is a one-shot migration aid: it
+reads a legacy `git-worktreeinclude` manifest and prints the equivalent
+`[worktree]` config to stdout. Lines that can't map to an explicit literal
+include — globs, negations (`!`), unsafe paths, or a `submodule-walk` without
+`symlink` — are reported on stderr and left out, so the printed config always
+re-parses cleanly.
+
+The output is a standalone `version = 1` + `[worktree]` snippet — review it, then
+merge the `[worktree]` section into your existing `phora.toml` by hand. Do not
+append it blindly, or you will duplicate `version` and other keys.
+
+```bash
+phora worktree import-legacy .worktreeinclude > worktree-includes.toml
 ```
 
 ## Development
