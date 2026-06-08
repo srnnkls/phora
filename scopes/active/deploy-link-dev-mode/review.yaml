@@ -138,6 +138,44 @@ batch_reviews:
       (base-provenance pass + effective local-path pass) wired into sync() before resolve_sources.
       262 lib tests green, clippy clean. One adversarial review-loop fix applied (provenance overlay-bypass).
 
+  - batch: 3
+    timestamp: 2026-06-08
+    tasks: [DLD-004]
+    phase_a5_test_review:
+      harnesses: [claude-opus (orchestrator inspection), pi]
+      result: pass-with-medium-noted
+      note: >
+        Pi flagged the stale-link test asserts final state not atomicity (medium). Accepted: atomicity is
+        guaranteed by construction (temp-symlink + rename) + journal; a deterministic crash-window test is
+        a larger harness, deferred (DLD-004-M2).
+    reviewers:
+      - id: general+arch+style-claude-opus
+        status: success
+        gates: { correctness: pass, architecture: pass, style: pass }
+      - id: general+arch+style-claude-opus-independent
+        status: success
+        gates: { correctness: fail->fixed, architecture: pass, style: pass }
+        note: >
+          Pi print-mode produced no output when auto-backgrounded (large diff) — substituted a fresh
+          independent Claude reviewer subagent as the second harness.
+    review_loop:
+      - finding: "independent reviewer (medium): link_artifact staged .phora-link-<nonce> under dst.parent() with a process-local nonce restarting at 0, but recovery_sweep only reclaims .phora-stage* under target_parent. A crash between symlink-create and journal.append orphans .phora-link-0, and the nonce restart causes EEXIST -> permanently wedges the artifact (copy path is safe via .phora-stage)."
+        action: "Mini-TDD cycle: added regression test orphaned_link_staging_does_not_wedge_next_deploy (plants .phora-link-0..4095 to force collision deterministically; verified RED on a clean build — earlier false-GREEN was a stale cached test binary). Fix: relocated link staging into the reclaimable <target_parent>/.phora-stage base (cleared by recovery_sweep at sync start), passing staging_base into link_artifact. GREEN, 267 tests."
+      - finding: "independent reviewer (low): link_target's canonicalize-failure fallback returned a RELATIVE target, contradicting the absolute-target contract."
+        action: "Hardened the fallback to join cwd (absolute); already-absolute/existing branches unchanged."
+    synthesized:
+      gates: { correctness: pass, architecture: pass, style: pass }
+      critical_issues: 0
+      high_issues: 0
+      medium_issues: 0
+    outcome: approved
+    notes: >
+      link_artifact (own atomic temp-symlink+rename, journalled, NO swap_into/copy_tree) + deploy-closure
+      dispatch on deploy_mode (Copy=deploy_one byte-identical, Link=deploy_link). Closes the recurring
+      DLD-003-N1 (link deploy no longer hits export_artifact/commit_time). Platform symlink helper
+      (unix symlink / windows symlink_dir). Linked record matches rebuild_linked. 267 lib tests green,
+      clippy clean. Two adversarial review-loop fixes applied (crash-reclaim, absolute-target).
+
 issues:
   critical: []
   high: []
@@ -170,6 +208,13 @@ deferred_issues:
     issue: "worktree_scan_missing_path_errors uses a hard-coded /nonexistent path (environment-dependent)."
     assessment: "Low; /nonexistent is reliably absent on dev/CI. Harden to a hermetic TempDir-child-after-removal when next touching this test."
     defer_to: DLD-006
+  - id: DLD-004-M2
+    severity: medium
+    found_by: [pi]
+    area: crash-window-test
+    issue: "No deterministic test proves link deploy ATOMICITY under interruption (stale-link test asserts only final state)."
+    assessment: "Atomicity holds by construction (temp-symlink beside-in-.phora-stage + atomic rename) + the journal/recovery_sweep contract (now shared with the copy path). A true crash-window test needs a process-kill/fault-injection harness — disproportionate for this scope."
+    defer_to: follow-up (scope Verification lists 'atomic symlink + crash window' as a future target)
   - id: DLD-003-N1
     severity: note
     found_by: [pi]

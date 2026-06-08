@@ -3,23 +3,23 @@ checkpoint:
   scope_path: ./scopes/active/deploy-link-dev-mode
   branch: feat/deploy-link-dev-mode
   timestamp: 2026-06-08
-  last_batch: 2d
+  last_batch: 3
   tasks:
-    done: [DLD-001, DLD-005, DLD-003, DLD-009, DLD-002]
-    pending: [DLD-004, DLD-006, DLD-007, DLD-008]
+    done: [DLD-001, DLD-005, DLD-003, DLD-009, DLD-002, DLD-004]
+    pending: [DLD-006, DLD-007, DLD-008]
   next_batch:
-    number: 3
-    title: "DLD-004 link deployment (lean atomic symlink, deploy-closure dispatch)"
-    tasks: [DLD-004]
+    number: 4
+    title: "DLD-006 quarantine verify/prune (rebuild already done in DLD-003)"
+    tasks: [DLD-006]
   note: >
-    Phase 2 complete. Phase 3 = DLD-004 (deploy-closure dispatch on DeployMode; own temp-symlink+rename,
-    NOT swap_into). This closes Pi's recurring DLD-003-N1 (link deploy still hits export_artifact).
-    Helpers: Source::deploy_mode(), read_local_head, discover_working_tree, rebuild_linked,
-    is_local_path, validate_link_mode. Then phase 4 DLD-006 (verify/prune quarantine; rebuild already
-    done), phase 5 DLD-007 (transitions) + DLD-008 (docs).
+    Phases 1-3 complete; link deploy works end-to-end (resolve, discover, guard, deploy as symlink).
+    DLD-006 now only needs verify-skip + prune-symlink-safe + tests (rebuild_linked already landed in
+    DLD-003). Then phase 5: DLD-007 transitions (also fix deferred DLD-005-M1) + DLD-008 docs.
+    Helpers: deploy_mode, read_local_head, discover_working_tree, rebuild_linked, link_artifact,
+    validate_link_mode, is_local_path.
   deferred_issues:
-    - DLD-005-M1 (medium): linked short-circuit doesn't verify dst is a symlink; defer to DLD-007.
+    - DLD-005-M1 (medium): linked short-circuit doesn't verify dst is a symlink; fix in DLD-007.
     - DLD-003-L1 (low): worktree_scan_missing_path_errors uses /nonexistent; harden in DLD-006.
-    - DLD-003-N1 (note): link deploy dispatch is DLD-004 (deploy closure) — addressed next.
+    - DLD-004-M2 (medium): no deterministic atomicity/crash-window test for link deploy; follow-up.
   review_config:
     reviewers: [opus, sonnet]

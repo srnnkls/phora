@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 use crate::lock::{Lock, LockedSource, merge_locks, source_matches, split_locks};
 use crate::matcher::PathMatcher;
 use crate::projection::{
-    ArtifactState, Journal, check_artifact_state, deploy_artifact, recovery_sweep,
+    ArtifactState, Journal, check_artifact_state, deploy_artifact, link_artifact, recovery_sweep,
 };
 use crate::registry::{ArtifactKey, EjectedEntry, ManifestFile, Registry, RegistryRecord};
 use crate::source::{ExportRequest, SourceBackend, is_local_path, read_local_head};
@@ -293,8 +293,9 @@ fn deploy_artifact_entry(
         _ => None,
     };
 
-    let deploy = |key: ArtifactKey| {
-        deploy_one(
+    let deploy = |key: ArtifactKey| match entry.source.deploy_mode() {
+        DeployMode::Link => deploy_link(registry, journal, entry, &artifact_dst, key),
+        DeployMode::Copy => deploy_one(
             backend,
             registry,
             journal,
@@ -309,7 +310,7 @@ fn deploy_artifact_entry(
                 artifact_dst: &artifact_dst,
                 key,
             },
-        )
+        ),
     };
 
     let resolution = match conflict_kind {
@@ -499,6 +500,54 @@ fn deploy_one(
         journal,
         registry,
     )
+}
+
+fn deploy_link(
+    registry: &dyn Registry,
+    journal: &Journal,
+    entry: &ArtifactEntry<'_>,
+    artifact_dst: &Path,
+    key: ArtifactKey,
+) -> Result<()> {
+    let policy = entry.source.export_policy();
+    let record = RegistryRecord {
+        version: 1,
+        key,
+        commit: "link".to_owned(),
+        digest: "link:".to_owned(),
+        projected_at: chrono::Utc::now().to_rfc3339(),
+        layout: format!("{:?}", entry.layout_kind).to_lowercase(),
+        allow_symlinks: policy.allow_symlinks,
+        preserve_executable: policy.preserve_executable,
+        files: vec![],
+        linked: true,
+    };
+    let staging_base = target_parent(entry.target_path).join(".phora-stage");
+    link_artifact(
+        &staging_base,
+        artifact_dst,
+        &link_target(entry),
+        record,
+        journal,
+        registry,
+    )
+}
+
+/// Absolute working-tree path the symlink points at: `<source.git>/<root>/<artifact>`.
+fn link_target(entry: &ArtifactEntry<'_>) -> PathBuf {
+    let base = Path::new(&entry.source.git);
+    let mut target = if base.is_absolute() {
+        base.to_path_buf()
+    } else {
+        base.canonicalize().unwrap_or_else(|_| {
+            std::env::current_dir().map_or_else(|_| base.to_path_buf(), |c| c.join(base))
+        })
+    };
+    if let Some(root) = &entry.source.root {
+        target.push(root);
+    }
+    target.push(entry.artifact_name);
+    target
 }
 
 /// Removes a half-exported `staging` dir on drop unless [`disarm`](StagingGuard::disarm)
@@ -4102,6 +4151,271 @@ mod tests {
         validate_link_mode(&base, &effective).expect(
             "a link confined to phora.local.toml over a local path must pass both the \
              base-overlay and local-path guards",
+        );
+    }
+
+    // ── DLD-004: link deployment (atomic symlink, dispatched at deploy) ─
+
+    /// A base config carrying `source` as a plain copy source (no `deploy`), with
+    /// no target. The link + target live only in the local overlay.
+    fn base_link_overlay_pair(
+        source: &str,
+        git: &Path,
+        target_path: &Path,
+    ) -> (Config, Config) {
+        let base = base_copy_source(source, git);
+        let local = local_link_overlay(source, git, target_path);
+        (base, local)
+    }
+
+    /// Drives a full `sync` of a single local-path link source (confined to the
+    /// overlay) into one `by-source` target. Returns the sync output plus the
+    /// destination dir the artifact should symlink at and the absolute working-tree
+    /// target it should point to.
+    fn link_dst(target_path: &Path, source: &str, artifact: &str) -> PathBuf {
+        let layout = crate::config::LayoutConfig {
+            kind: LayoutKind::BySource,
+            separator: String::new(),
+        };
+        target_path.join(layout.artifact_path(source, artifact))
+    }
+
+    #[test]
+    fn linked_artifact_deploys_as_symlink_to_working_tree() {
+        let fx = build_sync_fixture();
+        let td = TargetDir::new();
+        let (base, local) = base_link_overlay_pair("dev-src", fx.src.path(), &td.target_path());
+        let in_ = input(&base, Some(&local), None, None, false);
+
+        let out = sync(&in_, &fx.backend, &fx.registry).expect("link-source sync runs to deploy");
+        assert!(
+            !out.had_failures,
+            "deploying a link source over a real local working tree must not fail"
+        );
+
+        let dst = link_dst(&td.target_path(), "dev-src", "editor");
+        let meta = std::fs::symlink_metadata(&dst)
+            .expect("the linked artifact must materialize at the destination");
+        assert!(
+            meta.file_type().is_symlink(),
+            "a link-mode artifact must be deployed as a SYMLINK, not a copied directory"
+        );
+
+        let want = fx.src.path().join("editor");
+        let got = std::fs::read_link(&dst).expect("the deployed symlink must be readable");
+        assert_eq!(
+            got, want,
+            "the symlink must point to the ABSOLUTE working-tree path <source>/<artifact>"
+        );
+
+        // Edit-through: a new source-tree file is visible through the symlink with no re-sync.
+        std::fs::write(fx.src.path().join("editor/live.lua"), b"-- live\n")
+            .expect("write a new file into the source working tree");
+        assert_eq!(
+            std::fs::read(dst.join("live.lua")).expect("new file visible through the symlink"),
+            b"-- live\n",
+            "editing the source working tree must be visible through the destination symlink \
+             without re-syncing"
+        );
+
+        let key = artifact_key("dest", "dev-src", "editor");
+        let record = fx
+            .registry
+            .get(&key)
+            .expect("registry read")
+            .expect("a record must be written for the linked artifact");
+        assert!(
+            record.linked,
+            "the deployed registry record for a link artifact must be a LINKED record (linked=true)"
+        );
+    }
+
+    #[test]
+    fn linked_record_is_linked_not_copy() {
+        let fx = build_sync_fixture();
+        let td = TargetDir::new();
+        let (base, local) = base_link_overlay_pair("dev-src", fx.src.path(), &td.target_path());
+        let in_ = input(&base, Some(&local), None, None, false);
+
+        sync(&in_, &fx.backend, &fx.registry).expect("link-source sync runs to deploy");
+
+        let key = artifact_key("dest", "dev-src", "editor");
+        let record = fx
+            .registry
+            .get(&key)
+            .expect("registry read")
+            .expect("a record must be written for the linked artifact");
+        assert!(record.linked, "linked record must carry linked=true");
+        assert!(
+            record.files.is_empty(),
+            "a linked record carries no per-file manifest (it is outside the integrity model)"
+        );
+        assert_eq!(
+            record.commit, "link",
+            "a linked record uses the sentinel commit, not a copied source commit"
+        );
+        assert_eq!(
+            record.digest, "link:",
+            "a linked record uses the sentinel digest, not a copied content digest"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_failure_warns_skips_and_continues() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let td = TargetDir::new();
+        // One artifact dir per repo, so each source maps to its own by-source parent.
+        let (blocked_src, blocked_git) = build_named_artifact_repo("alpha", "a.txt", b"alpha\n");
+        let (ok_src, ok_git) = build_named_artifact_repo("beta", "b.txt", b"beta\n");
+        let (copy_src, copy_git) = build_named_artifact_repo("widget", "w.txt", b"widget\n");
+        let mirror_dir = TempDir::new().expect("backend mirror dir");
+        let backend = GitBackend::new(mirror_dir.path().to_path_buf());
+        let registry = fx_registry();
+
+        let base = {
+            let toml = format!(
+                "version = 1\n\n\
+                 [sources.dev-blocked]\ngit = \"{blocked_git}\"\nbranch = \"main\"\n\n\
+                 [sources.dev-ok]\ngit = \"{ok_git}\"\nbranch = \"main\"\n\n\
+                 [sources.copy-src]\ngit = \"{copy_git}\"\nbranch = \"main\"\n",
+            );
+            Config::parse(&toml).expect("base with link + copy sources parses")
+        };
+        let local = {
+            let toml = format!(
+                "version = 1\n\n\
+                 [sources.dev-blocked]\ngit = \"{blocked_git}\"\nbranch = \"main\"\n\
+                 deploy = \"link\"\n\n\
+                 [sources.dev-ok]\ngit = \"{ok_git}\"\nbranch = \"main\"\ndeploy = \"link\"\n\n\
+                 [targets.dest]\npath = \"{}\"\n\
+                 sources = [\"dev-blocked\", \"dev-ok\", \"copy-src\"]\nlayout = \"by-source\"\n",
+                td.target_path().display(),
+            );
+            Config::parse(&toml).expect("overlay setting links + target parses")
+        };
+
+        // Read-only parent fails the temp-symlink create inside it (EACCES) — landing in
+        // the deploy closure's Err path — while try_exists(dst) still reads clean, so
+        // check_artifact_state does not abort. Siblings keep their own writable parents.
+        let blocked_parent = td.target_path().join("dev-blocked");
+        std::fs::create_dir_all(&blocked_parent).expect("create blocked link parent dir");
+        std::fs::set_permissions(&blocked_parent, std::fs::Permissions::from_mode(0o555))
+            .expect("make the blocked link parent read-only");
+
+        let in_ = input(&base, Some(&local), None, None, false);
+        let out =
+            sync(&in_, &backend, &registry).expect("sync must not abort on a link failure");
+
+        std::fs::set_permissions(&blocked_parent, std::fs::Permissions::from_mode(0o755))
+            .expect("restore perms so the tempdir can be cleaned up");
+
+        assert!(
+            out.had_failures,
+            "a failed link deploy must set had_failures (warn-and-continue, not abort)"
+        );
+
+        let copy_dst = link_dst(&td.target_path(), "copy-src", "widget");
+        assert_eq!(
+            std::fs::read(copy_dst.join("w.txt")).expect("copy artifact deployed"),
+            b"widget\n",
+            "a sibling COPY artifact in the same target must deploy fine despite the link failure"
+        );
+
+        let ok_dst = link_dst(&td.target_path(), "dev-ok", "beta");
+        let ok_meta = std::fs::symlink_metadata(&ok_dst)
+            .expect("the healthy link source must still deploy despite the sibling failure");
+        assert!(
+            ok_meta.file_type().is_symlink(),
+            "a healthy link artifact must deploy as a symlink even when a sibling link fails"
+        );
+        assert_eq!(
+            std::fs::read_link(&ok_dst).expect("healthy symlink readable"),
+            ok_src.path().join("beta"),
+            "the healthy link must point at its absolute working-tree target"
+        );
+        drop((blocked_src, ok_src, copy_src));
+    }
+
+    // Pins the crash-orphan reclaim contract: `.phora-link-*` staging left in the dst
+    // dir by a hard-killed run must not wedge a fresh link deploy. link_nonce is a
+    // process-global counter (shared across tests), so plant a contiguous span to
+    // collide with whatever index this deploy picks; the fix relocates staging under
+    // the recovery_sweep-cleared base, making these orphans irrelevant.
+    #[cfg(unix)]
+    #[test]
+    fn orphaned_link_staging_does_not_wedge_next_deploy() {
+        let fx = build_sync_fixture();
+        let td = TargetDir::new();
+        let (base, local) = base_link_overlay_pair("dev-src", fx.src.path(), &td.target_path());
+
+        let dst = link_dst(&td.target_path(), "dev-src", "editor");
+        let parent = dst.parent().expect("dst has a parent");
+        std::fs::create_dir_all(parent).expect("create dst parent");
+
+        for n in 0..4096 {
+            let orphan = parent.join(format!(".phora-link-{n}"));
+            std::os::unix::fs::symlink(fx.src.path(), &orphan)
+                .expect("plant a crash-orphan staging symlink");
+        }
+
+        let in_ = input(&base, Some(&local), None, None, false);
+        let out = sync(&in_, &fx.backend, &fx.registry).expect("sync runs despite link orphans");
+
+        assert!(
+            !out.had_failures,
+            "a `.phora-link-*` crash orphan must not wedge a fresh link deploy"
+        );
+
+        let meta = std::fs::symlink_metadata(&dst)
+            .expect("the linked artifact must still materialize despite the orphans");
+        assert!(
+            meta.file_type().is_symlink(),
+            "the deploy must produce a SYMLINK, not fail with EEXIST against an orphan"
+        );
+        assert_eq!(
+            std::fs::read_link(&dst).expect("the deployed symlink must be readable"),
+            fx.src.path().join("editor"),
+            "the deploy must point at the correct absolute <source>/<artifact> target"
+        );
+    }
+
+    #[test]
+    fn stale_link_with_wrong_target_is_repointed() {
+        let fx = build_sync_fixture();
+        let td = TargetDir::new();
+        let (base, local) = base_link_overlay_pair("dev-src", fx.src.path(), &td.target_path());
+
+        // A wrong-target symlink with no registry record reads Foreign; force overwrites,
+        // exercising the atomic re-point (a Linked record present would be a no-op per DLD-005).
+        let dst = link_dst(&td.target_path(), "dev-src", "editor");
+        std::fs::create_dir_all(dst.parent().expect("dst has a parent"))
+            .expect("create dst parent");
+        let wrong = fx.src.path().join("docs");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&wrong, &dst).expect("plant a wrong-target symlink");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&wrong, &dst).expect("plant a wrong-target symlink");
+
+        assert_eq!(
+            std::fs::read_link(&dst).expect("stale symlink readable"),
+            wrong,
+            "premise: the destination starts as a symlink to the WRONG target"
+        );
+
+        let in_ = input(&base, Some(&local), None, None, true);
+        sync(&in_, &fx.backend, &fx.registry).expect("forced sync re-points the stale link");
+
+        let meta = std::fs::symlink_metadata(&dst).expect("dst still present after re-point");
+        assert!(
+            meta.file_type().is_symlink(),
+            "after re-point the destination must remain a symlink, never a half state"
+        );
+        assert_eq!(
+            std::fs::read_link(&dst).expect("re-pointed symlink readable"),
+            fx.src.path().join("editor"),
+            "a stale link with the wrong target must be re-pointed to the CORRECT absolute target"
         );
     }
 }
