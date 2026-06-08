@@ -296,7 +296,7 @@ fn deploy_artifact_entry(
     };
 
     let resolution = match conflict_kind {
-        None if matches!(state, ArtifactState::Ejected | ArtifactState::Clean) => {
+        None if matches!(state, ArtifactState::Ejected | ArtifactState::Clean | ArtifactState::Linked) => {
             return Ok(false);
         }
         None => Resolution::Overwrite,
@@ -453,6 +453,7 @@ fn deploy_one(
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
         files: export.files,
+        linked: false,
     };
 
     staging_guard.disarm();
@@ -834,6 +835,7 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
         files,
+        linked: false,
     };
     registry.put(&record)?;
     report.reconstructed.push(key.clone());
@@ -2036,6 +2038,107 @@ mod tests {
         );
     }
 
+    // ── linked artifact idempotence (DLD-005, H1) ──────────────────
+
+    /// H1: without `Linked` in the `matches!` guard at the deploy closure, Linked falls to
+    /// `None => Overwrite` and re-deploys every sync; this pins the no-op.
+    #[test]
+    fn second_deploy_over_correct_link_is_a_noop() {
+        use std::os::unix::fs::symlink;
+
+        let fx = build_sync_fixture();
+        let td = TargetDir::new();
+        let cfg =
+            config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+        let target = cfg.targets.get("dest").expect("dest target present");
+        let source = cfg.sources.get("editor-src").expect("source present");
+
+        let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+        std::fs::create_dir_all(dst.parent().expect("dst parent")).expect("mkdir dst parent");
+        let live = fx.src.path().join("editor");
+        symlink(&live, &dst).expect("deploy artifact as a symlink to the working tree");
+
+        let linked_record = RegistryRecord {
+            version: 1,
+            key: artifact_key("dest", "editor-src", "editor"),
+            commit: "link".to_owned(),
+            digest: "link:".to_owned(),
+            projected_at: "2026-06-08T12:00:00Z".to_owned(),
+            layout: "flat".to_owned(),
+            allow_symlinks: false,
+            preserve_executable: true,
+            files: vec![],
+            linked: true,
+        };
+        fx.registry
+            .put(&linked_record)
+            .expect("seed linked registry record");
+
+        let counting = CountingBackend::new(&fx.backend);
+        let journal = Journal::open(&fx.registry.locks_dir()).expect("open journal");
+        let commits: BTreeMap<String, String> =
+            std::iter::once(("editor-src".to_owned(), fx.head_sha.clone())).collect();
+
+        let run = TargetRun {
+            config: &cfg,
+            target_name: "dest",
+            target,
+            commits: &commits,
+            force: false,
+            interactive: false,
+            resolver: None,
+        };
+        let matcher = PathMatcher::new(source.includes(), source.excludes()).expect("matcher");
+        let entry = ArtifactEntry {
+            source,
+            source_name: "editor-src",
+            commit: &fx.head_sha,
+            matcher: &matcher,
+            artifact_name: "editor",
+            target_path: &target.expanded_path(),
+            layout_kind: LayoutKind::Flat,
+            ejected: &[],
+        };
+
+        let state = check_artifact_state(
+            &dst,
+            "editor-src",
+            &fx.head_sha,
+            &[],
+            "editor",
+            &fx.registry,
+            &artifact_key("dest", "editor-src", "editor"),
+        )
+        .expect("check_artifact_state on the linked dst");
+        assert!(
+            matches!(state, ArtifactState::Linked),
+            "premise: a deployed symlink with a linked record must read Linked, got {state:?}"
+        );
+
+        let had_failures =
+            deploy_artifact_entry(run, &entry, &counting, &fx.registry, &journal)
+                .expect("deploy pass over a linked artifact must not error");
+
+        assert!(!had_failures, "a no-op linked pass is not a failure");
+        assert_eq!(
+            counting.export_count(),
+            0,
+            "a correct linked artifact must NOT be re-exported on a second sync (H1 re-deploy)"
+        );
+        assert_eq!(
+            counting.commit_time_count(),
+            0,
+            "a no-op linked pass must not perform any backend round-trip"
+        );
+        assert!(
+            std::fs::symlink_metadata(&dst)
+                .expect("dst still present")
+                .file_type()
+                .is_symlink(),
+            "the deployed symlink must be left intact — a re-deploy would replace it with a copy"
+        );
+    }
+
     /// The commit the source resolved to during a successful sync, read back from its base lock.
     fn first_commit(out: &SyncOutput) -> String {
         out.base_lock
@@ -2157,6 +2260,7 @@ mod tests {
                 mtime: 1_700_000_000,
                 blake3: "blake3:orphan".to_owned(),
             }],
+            linked: false,
         };
         reg.put(&record).expect("seed orphan record");
         dst
@@ -2788,6 +2892,7 @@ mod tests {
                 mtime: 1_700_000_000,
                 blake3: "blake3:recovered".to_owned(),
             }],
+            linked: false,
         };
 
         let staging_base = td.parent_path.join(".phora-stage");
@@ -2919,6 +3024,7 @@ mod tests {
                 mtime: 1_700_000_000,
                 blake3: "blake3:recovered".to_owned(),
             }],
+            linked: false,
         };
 
         let staging_base = td.parent_path.join(".phora-stage");
@@ -3001,6 +3107,7 @@ mod tests {
                 mtime: 1_700_000_000,
                 blake3: blake3::hash(content).to_hex().to_string(),
             }],
+            linked: false,
         };
         reg.put(&record).expect("seed managed record");
         dst
@@ -3157,6 +3264,7 @@ mod tests {
             allow_symlinks: false,
             preserve_executable: true,
             files: manifest,
+            linked: false,
         };
         reg.put(&record).expect("seed verifiable record");
         dst

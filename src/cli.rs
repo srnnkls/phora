@@ -886,6 +886,7 @@ fn state_label(state: &ArtifactState) -> &'static str {
         ArtifactState::Foreign => "foreign",
         ArtifactState::Missing => "missing",
         ArtifactState::Ejected => "ejected",
+        ArtifactState::Linked => "linked",
     }
 }
 
@@ -915,6 +916,15 @@ mod tests {
         Cli::command().debug_assert();
     }
 
+    #[test]
+    fn state_label_renders_linked_artifact_as_linked() {
+        assert_eq!(
+            state_label(&ArtifactState::Linked),
+            "linked",
+            "`phora list` must label a Linked artifact `linked`"
+        );
+    }
+
     fn record(
         target: &str,
         source: &str,
@@ -941,6 +951,7 @@ mod tests {
                 mtime: 1_738_329_296,
                 blake3: "9e8d7c6b5a4f3e2d".to_owned(),
             }],
+            linked: false,
         }
     }
 
@@ -1773,6 +1784,7 @@ mod tests {
             allow_symlinks: false,
             preserve_executable: true,
             files,
+            linked: false,
         }
     }
 
