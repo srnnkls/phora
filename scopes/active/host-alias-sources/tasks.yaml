@@ -6,7 +6,7 @@ revised: 2026-06-08   # post multi-agent review (opus+sonnet)
 tasks:
   - id: HAS-001
     content: "Config: host/path/protocol + Host.remote (string-or-table) + git_url→remote + git→Option"
-    status: pending
+    status: done
     activeForm: "Adding host/path/protocol + remote config"
     review_fixes:
       - "CRITICAL (Source.git is a required String, consumed at ~8 sites): make `git` Option<String>; merged_with becomes MODE-AWARE — git XOR host+path are atomic groups; setting either in local clears the other (mirror the branch/tag/rev clearing at config.rs:136)"

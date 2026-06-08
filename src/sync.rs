@@ -174,11 +174,11 @@ fn validate_link_mode(base: &Config, effective: &Config) -> Result<()> {
         }
     }
     for (name, source) in &effective.sources {
-        if source.deploy_mode() == DeployMode::Link && !is_local_path(&source.git) {
+        let git = source.git.as_deref().unwrap_or_default(); // HAS-003: host-mode resolves via resolved_remote
+        if source.deploy_mode() == DeployMode::Link && !is_local_path(git) {
             return Err(Error::Config(format!(
                 "source `{name}`: deploy = \"link\" requires a local filesystem path, \
-                 not a remote URL `{git}`",
-                git = source.git
+                 not a remote URL `{git}`"
             )));
         }
     }
@@ -405,13 +405,15 @@ fn resolve_sources(
     let mut resolved_commits = BTreeMap::new();
 
     for (name, source) in &config.sources {
+        // HAS-003: resolve via resolved_remote (host-mode sources)
+        let git = source.git.clone().unwrap_or_default();
         if source.deploy_mode() == DeployMode::Link {
-            let commit = read_local_head(&source.git)?;
+            let commit = read_local_head(&git)?;
             routed.push((
                 name.clone(),
                 LockedSource {
                     name: name.clone(),
-                    git: source.git.clone(),
+                    git: git.clone(),
                     resolved: "link".to_owned(),
                     commit: commit.clone(),
                     digest: "link:".to_owned(),
@@ -426,20 +428,20 @@ fn resolve_sources(
         let commit = match locked {
             Some(l) if source_matches(source, l) && !force => l.commit.clone(),
             _ => {
-                backend.fetch(name, &source.git)?;
-                backend.resolve(name, &source.git, &source.refspec())?
+                backend.fetch(name, &git)?;
+                backend.resolve(name, &git, &source.refspec())?
             }
         };
 
         let matcher = PathMatcher::new(source.includes(), source.excludes())?;
         let digest =
-            backend.compute_digest(name, &source.git, &commit, source.root.as_deref(), &matcher)?;
+            backend.compute_digest(name, &git, &commit, source.root.as_deref(), &matcher)?;
 
         routed.push((
             name.clone(),
             LockedSource {
                 name: name.clone(),
-                git: source.git.clone(),
+                git: git.clone(),
                 resolved: source.refspec().to_string(),
                 commit: commit.clone(),
                 digest,
@@ -474,11 +476,12 @@ fn deploy_one(
     let staging = staging_base.join(format!("{}-{}", ctx.artifact_name, nonce()));
     let mut staging_guard = StagingGuard::new(&staging_base, &staging);
 
-    let commit_time = backend.commit_time(ctx.source_name, &ctx.source.git, ctx.commit)?;
+    let git = ctx.source.git.as_deref().unwrap_or_default(); // HAS-003: host-mode resolves via resolved_remote
+    let commit_time = backend.commit_time(ctx.source_name, git, ctx.commit)?;
     let policy = ctx.source.export_policy();
     let req = ExportRequest {
         source: ctx.source_name,
-        url: &ctx.source.git,
+        url: git,
         commit: ctx.commit,
         root: ctx.source.root.as_deref(),
         artifact: ctx.artifact_name,
@@ -551,7 +554,7 @@ fn deploy_link(
 
 /// Absolute working-tree path the symlink points at: `<source.git>/<root>/<artifact>`.
 fn link_target(entry: &ArtifactEntry<'_>) -> PathBuf {
-    let base = Path::new(&entry.source.git);
+    let base = Path::new(entry.source.git.as_deref().unwrap_or_default()); // HAS-003: host-mode resolves via resolved_remote
     let mut target = if base.is_absolute() {
         base.to_path_buf()
     } else {
@@ -644,13 +647,14 @@ fn discover_artifacts_for_source(
     backend: &dyn SourceBackend,
     matcher: &PathMatcher,
 ) -> Result<Vec<String>> {
+    let git = source.git.as_deref().unwrap_or_default(); // HAS-003: host-mode resolves via resolved_remote
     match source.deploy_mode() {
         DeployMode::Link => {
-            discover_working_tree(Path::new(&source.git), source.root.as_deref(), matcher)
+            discover_working_tree(Path::new(git), source.root.as_deref(), matcher)
         }
         DeployMode::Copy => backend.discover_artifacts(
             source_name,
-            &source.git,
+            git,
             commit,
             source.root.as_deref(),
             matcher,
@@ -939,10 +943,11 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
     let staging = staging_base.join(format!("{artifact}-{}-{}", std::process::id(), nonce()));
     let _guard = StagingGuard::new(&staging_base, &staging);
 
-    let commit_time = backend.commit_time(source_name, &source.git, commit)?;
+    let git = source.git.as_deref().unwrap_or_default(); // HAS-003: host-mode resolves via resolved_remote
+    let commit_time = backend.commit_time(source_name, git, commit)?;
     let export = backend.export_artifact(&ExportRequest {
         source: source_name,
-        url: &source.git,
+        url: git,
         commit,
         root: source.root.as_deref(),
         artifact,
