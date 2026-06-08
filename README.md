@@ -19,8 +19,6 @@ consume them.
 
 ## Installation
 
-Phora is written in Rust (edition 2024). Build from source:
-
 ```bash
 cargo install --path .
 # or, during development:
