@@ -28,7 +28,7 @@ tasks:
 
   - id: WTI-002
     content: "Primary-worktree detection via gix (no git CLI)"
-    status: pending
+    status: done
     activeForm: "Detecting the primary worktree"
     depends_on: [WTI-001]
     review_fixes:
