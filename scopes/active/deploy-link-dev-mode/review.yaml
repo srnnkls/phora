@@ -237,6 +237,33 @@ batch_reviews:
       hoisted to deploy_target (not deploy_artifact_entry) because H1's direct-call scenario makes (mode,dst,state)
       ambiguous there. 275 lib tests green, clippy clean. Closes DLD-005-M1.
 
+  - batch: 5b
+    timestamp: 2026-06-08
+    tasks: [DLD-008]
+    type: docs-only (no TDD tests)
+    reviewers:
+      - id: doc-accuracy-claude-opus
+        status: success
+        gates: { accuracy: pass, style: pass }
+      - id: doc-implementer-self-verification
+        status: success
+        note: "cited exact file:line for every documented behavior against the implementation"
+    synthesized:
+      gates: { accuracy: pass, style: pass }
+      critical_issues: 0
+      high_issues: 0
+      medium_issues: 0
+    outcome: approved
+    notes: >
+      README "Link mode (local development)" subsection + `deploy` added to Source flags + a new
+      phora.local.example.toml overlay + a pointer comment in phora.example.toml. Every claim verified
+      against code (overlay-only/local-path-only config errors, live working-tree symlink, integrity
+      carve-out, list 'linked' label, rebuild-without-hashing, prune symlink-only, dangling->redeploy,
+      link<->copy transition, Windows warn-and-continue). Terse, matches README tone, no focus leakage.
+      275 lib tests green, clippy clean (docs change is non-code). NOTE: Pi reviewer harness unavailable
+      (pi print-mode emits no output when auto-backgrounded); doc accuracy cross-checked by the
+      orchestrator's own diff-vs-code review as the second perspective.
+
 issues:
   critical: []
   high: []
