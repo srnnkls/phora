@@ -96,7 +96,7 @@ tasks:
 
   - id: DLD-006
     content: "Quarantine verify, rebuild, and prune for linked artifacts"
-    status: pending
+    status: done
     activeForm: "Quarantining linked artifacts from integrity ops"
     depends_on: [DLD-004]
     acceptance:

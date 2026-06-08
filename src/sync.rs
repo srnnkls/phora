@@ -763,6 +763,9 @@ pub struct VerifyMismatch {
 pub fn verify(config: &Config, registry: &dyn Registry) -> Result<Vec<VerifyMismatch>> {
     let mut mismatches = Vec::new();
     for record in registry.list_all()? {
+        if record.linked {
+            continue;
+        }
         let Some(target) = config.targets.get(&record.key.target) else {
             continue;
         };
@@ -3913,14 +3916,19 @@ mod tests {
 
     #[test]
     fn worktree_scan_missing_path_errors() {
-        let missing = std::path::Path::new("/nonexistent/phora/link/source");
+        let parent = TempDir::new().expect("hermetic parent for the missing path");
+        let missing = parent.path().join("phora-link-source-absent");
+        assert!(
+            !missing.exists(),
+            "premise: the child path under the tempdir must not exist"
+        );
 
-        let err = discover_working_tree(missing, None, &match_all())
+        let err = discover_working_tree(&missing, None, &match_all())
             .expect_err("an absent local path must be a clear error, not an empty list");
 
         let msg = err.to_string().to_lowercase();
         assert!(
-            msg.contains("nonexistent")
+            msg.contains("phora-link-source-absent")
                 || msg.contains("not found")
                 || msg.contains("no such file"),
             "the error should point at the missing path, got: {msg}"
@@ -4014,6 +4022,218 @@ mod tests {
         let reg = FileRegistry::open(state.path().to_path_buf()).expect("open registry");
         std::mem::forget(state);
         reg
+    }
+
+    // ── DLD-006: integrity quarantine (verify / rebuild / prune) ────
+
+    /// Seed a `linked` registry record carrying a STRAY manifest file that does NOT
+    /// exist on disk. Today `verify` iterates `record.files` and would read the
+    /// absent file, emitting `Missing`; the explicit `if record.linked { continue; }`
+    /// guard must short-circuit BEFORE that read. RED until the guard lands.
+    #[test]
+    fn verify_skips_linked_record_even_with_stray_manifest_file() {
+        let fx = build_sync_fixture();
+        let td = TargetDir::new();
+        let cfg = verify_config(&td, &fx);
+
+        let stray = RegistryRecord {
+            version: 1,
+            key: artifact_key("dest", "editor-src", "editor"),
+            commit: "link".to_owned(),
+            digest: "link:".to_owned(),
+            projected_at: "2026-06-08T12:00:00Z".to_owned(),
+            layout: "flat".to_owned(),
+            allow_symlinks: false,
+            preserve_executable: true,
+            files: vec![ManifestFile {
+                path: PathBuf::from("ghost.lua"),
+                size: 7,
+                mtime: 1_700_000_000,
+                blake3: blake3::hash(b"phantom").to_hex().to_string(),
+            }],
+            linked: true,
+        };
+        fx.registry
+            .put(&stray)
+            .expect("seed a linked record carrying a stray manifest file");
+
+        let mismatches = verify(&cfg, &fx.registry).expect("verify must not error");
+
+        assert!(
+            !mismatches
+                .iter()
+                .any(|m| m.key == artifact_key("dest", "editor-src", "editor")),
+            "verify must SKIP a linked record entirely (record.linked short-circuit), never \
+             reading its files — even a stray manifest entry pointing at an absent path must \
+             produce NO mismatch, got {mismatches:?}"
+        );
+    }
+
+    /// Guard: a normal linked record (empty `files`) over an EDITED symlink target
+    /// yields no mismatch. Pins that linked content is outside verify even as the
+    /// live working tree changes.
+    #[cfg(unix)]
+    #[test]
+    fn verify_skips_linked_record_over_edited_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let fx = build_sync_fixture();
+        let td = TargetDir::new();
+        let cfg = verify_config(&td, &fx);
+
+        let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+        std::fs::create_dir_all(dst.parent().expect("dst parent")).expect("mkdir dst parent");
+        let live = fx.src.path().join("editor");
+        symlink(&live, &dst).expect("deploy the linked artifact as a symlink");
+
+        let linked = RegistryRecord {
+            version: 1,
+            key: artifact_key("dest", "editor-src", "editor"),
+            commit: "link".to_owned(),
+            digest: "link:".to_owned(),
+            projected_at: "2026-06-08T12:00:00Z".to_owned(),
+            layout: "flat".to_owned(),
+            allow_symlinks: false,
+            preserve_executable: true,
+            files: vec![],
+            linked: true,
+        };
+        fx.registry.put(&linked).expect("seed linked record");
+
+        // Edit the live working-tree target through which the symlink resolves.
+        std::fs::write(live.join("init.lua"), b"-- EDITED LIVE\n")
+            .expect("edit the symlink target content");
+
+        let mismatches = verify(&cfg, &fx.registry).expect("verify must not error");
+
+        assert!(
+            !mismatches
+                .iter()
+                .any(|m| m.key == artifact_key("dest", "editor-src", "editor")),
+            "a linked artifact is outside the content-integrity model: editing the live symlink \
+             target must NOT surface as a verify mismatch, got {mismatches:?}"
+        );
+    }
+
+    /// Guard: after `rebuild_registry` over a link source whose artifact is deployed
+    /// as a symlink, the record is `linked` and the deployed symlink is NOT reported
+    /// `foreign`. Pins `scan_foreign`'s no-follow (`file_type().is_dir()`) behavior.
+    #[cfg(unix)]
+    #[test]
+    fn rebuild_keeps_linked_and_excludes_symlink_from_foreign() {
+        use std::os::unix::fs::symlink;
+
+        let wt = build_worktree(None);
+        let td = TargetDir::new();
+        let cfg = config_link_source_one_target("linked-src", wt.path(), &td.target_path());
+        let lock = link_lock("linked-src", wt.path());
+
+        // Deploy `alpha` as a symlink at the by-source destination, as link-mode does.
+        let by_source = crate::config::LayoutConfig {
+            kind: LayoutKind::BySource,
+            separator: String::new(),
+        };
+        let dst = td.artifact_dst(&by_source, "linked-src", "alpha");
+        std::fs::create_dir_all(dst.parent().expect("dst parent")).expect("mkdir dst parent");
+        symlink(wt.path().join("alpha"), &dst).expect("deploy the alpha artifact as a symlink");
+
+        let registry = fx_registry();
+        let report = rebuild_registry(&cfg, &lock, &fx_backend(), &registry)
+            .expect("rebuild over a link source must succeed");
+
+        let record = registry
+            .get(&artifact_key("dest", "linked-src", "alpha"))
+            .expect("registry read")
+            .expect("rebuild must reconstruct the alpha record");
+        assert!(
+            record.linked,
+            "rebuild must reconstruct a Link source's record as linked=true (no hashing), \
+             got linked={}",
+            record.linked
+        );
+
+        assert!(
+            !report.foreign.iter().any(|p| p == &dst || p.ends_with("alpha")),
+            "the deployed linked SYMLINK must NOT be classified foreign — scan_foreign's \
+             no-follow is_dir() skips it; got {:?}",
+            report.foreign
+        );
+    }
+
+    /// Guard: `prune_orphans` removes a stale linked symlink by unlinking the symlink
+    /// ONLY — it must never follow the link to `remove_dir_all` the target. Asserts the
+    /// symlink target (the working-tree dir + a file inside) survives the prune.
+    #[cfg(unix)]
+    #[test]
+    fn prune_removes_stale_linked_symlink_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let wt = build_worktree(None);
+        let td = TargetDir::new();
+        // The config discovers wt's dirs (alpha/zeta/uncommitted); `stale` is NOT among
+        // them, so its registry record is orphaned and must be pruned.
+        let cfg = config_link_source_one_target("linked-src", wt.path(), &td.target_path());
+
+        let target_dir = wt.path().join("alpha");
+        let inside = target_dir.join("file.txt");
+        assert!(inside.exists(), "premise: the symlink target file must exist pre-prune");
+
+        let by_source = crate::config::LayoutConfig {
+            kind: LayoutKind::BySource,
+            separator: String::new(),
+        };
+        let dst = td.artifact_dst(&by_source, "linked-src", "stale");
+        std::fs::create_dir_all(dst.parent().expect("dst parent")).expect("mkdir dst parent");
+        symlink(&target_dir, &dst).expect("plant a stale linked symlink at the destination");
+
+        let registry = fx_registry();
+        registry
+            .put(&RegistryRecord {
+                version: 1,
+                key: artifact_key("dest", "linked-src", "stale"),
+                commit: "link".to_owned(),
+                digest: "link:".to_owned(),
+                projected_at: "2026-06-08T12:00:00Z".to_owned(),
+                layout: "by-source".to_owned(),
+                allow_symlinks: false,
+                preserve_executable: true,
+                files: vec![],
+                linked: true,
+            })
+            .expect("seed the orphaned linked record");
+
+        let commits: BTreeMap<String, String> =
+            std::iter::once(("linked-src".to_owned(), "link".to_owned())).collect();
+
+        prune_orphans(&cfg, &fx_backend(), &registry, &commits)
+            .expect("prune must remove the orphaned linked artifact");
+
+        assert!(
+            std::fs::symlink_metadata(&dst).is_err(),
+            "prune must unlink the stale symlink at {}; it must no longer exist",
+            dst.display()
+        );
+        assert!(
+            target_dir.is_dir() && inside.exists(),
+            "prune must unlink the symlink ONLY (no-follow) — the working-tree target dir and the \
+             file inside it must survive, never removed through the link"
+        );
+        assert!(
+            registry
+                .get(&artifact_key("dest", "linked-src", "stale"))
+                .expect("registry read")
+                .is_none(),
+            "the orphaned linked record must be removed from the registry"
+        );
+    }
+
+    /// A real `GitBackend` over a throwaway mirror dir; link-source rebuild/prune
+    /// never reach it, but the signature requires a backend.
+    fn fx_backend() -> GitBackend {
+        let git_dir = TempDir::new().expect("backend mirror dir");
+        let backend = GitBackend::new(git_dir.path().to_path_buf());
+        std::mem::forget(git_dir);
+        backend
     }
 
     // ── DLD-002: link-mode guardrails (sync-layer enforcement) ─────

@@ -3,23 +3,22 @@ checkpoint:
   scope_path: ./scopes/active/deploy-link-dev-mode
   branch: feat/deploy-link-dev-mode
   timestamp: 2026-06-08
-  last_batch: 3
+  last_batch: 4
   tasks:
-    done: [DLD-001, DLD-005, DLD-003, DLD-009, DLD-002, DLD-004]
-    pending: [DLD-006, DLD-007, DLD-008]
+    done: [DLD-001, DLD-005, DLD-003, DLD-009, DLD-002, DLD-004, DLD-006]
+    pending: [DLD-007, DLD-008]
   next_batch:
-    number: 4
-    title: "DLD-006 quarantine verify/prune (rebuild already done in DLD-003)"
-    tasks: [DLD-006]
+    number: 5
+    title: "DLD-007 transitions (+ fix DLD-005-M1) then DLD-008 docs"
+    tasks: [DLD-007, DLD-008]
   note: >
-    Phases 1-3 complete; link deploy works end-to-end (resolve, discover, guard, deploy as symlink).
-    DLD-006 now only needs verify-skip + prune-symlink-safe + tests (rebuild_linked already landed in
-    DLD-003). Then phase 5: DLD-007 transitions (also fix deferred DLD-005-M1) + DLD-008 docs.
-    Helpers: deploy_mode, read_local_head, discover_working_tree, rebuild_linked, link_artifact,
-    validate_link_mode, is_local_path.
+    Phases 1-4 complete. Phase 5: DLD-007 link<->copy transitions — also a good place to fix deferred
+    DLD-005-M1 (linked short-circuit should return Missing when dst is not a symlink). Then DLD-008 docs.
+    DLD-007 and DLD-008 touch different files (sync/projection vs README/example) so they COULD run in
+    parallel, but DLD-007 is code+tests and DLD-008 is docs — run DLD-007 first, then DLD-008.
   deferred_issues:
     - DLD-005-M1 (medium): linked short-circuit doesn't verify dst is a symlink; fix in DLD-007.
-    - DLD-003-L1 (low): worktree_scan_missing_path_errors uses /nonexistent; harden in DLD-006.
     - DLD-004-M2 (medium): no deterministic atomicity/crash-window test for link deploy; follow-up.
+    - DLD-003-L1 (low): RESOLVED in batch 4.
   review_config:
     reviewers: [opus, sonnet]
