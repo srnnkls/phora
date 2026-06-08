@@ -132,7 +132,7 @@ tasks:
 
   - id: DLD-009
     content: "Link-source resolution: sidestep mirror, synthesize audit lock entry"
-    status: pending
+    status: done
     activeForm: "Resolving link sources without the mirror"
     depends_on: [DLD-001]
     review_fixes:

@@ -12,7 +12,7 @@ use crate::projection::{
     ArtifactState, Journal, check_artifact_state, deploy_artifact, recovery_sweep,
 };
 use crate::registry::{ArtifactKey, EjectedEntry, ManifestFile, Registry, RegistryRecord};
-use crate::source::{ExportRequest, SourceBackend};
+use crate::source::{ExportRequest, SourceBackend, read_local_head};
 
 /// Borrowed inputs to [`sync`]: the configs and locks plus run flags. Bundled so
 /// the orchestration entry point stays stable as later phases add fields.
@@ -366,6 +366,23 @@ fn resolve_sources(
     let mut resolved_commits = BTreeMap::new();
 
     for (name, source) in &config.sources {
+        if source.deploy_mode() == DeployMode::Link {
+            let commit = read_local_head(&source.git)?;
+            routed.push((
+                name.clone(),
+                LockedSource {
+                    name: name.clone(),
+                    git: source.git.clone(),
+                    resolved: "link".to_owned(),
+                    commit: commit.clone(),
+                    digest: "link:".to_owned(),
+                    config_digest: source.config_digest(),
+                },
+            ));
+            resolved_commits.insert(name.clone(), commit);
+            continue;
+        }
+
         let locked = effective_lock.and_then(|l| l.find_source(name));
         let commit = match locked {
             Some(l) if source_matches(source, l) && !force => l.commit.clone(),
@@ -1153,6 +1170,7 @@ mod tests {
         exports: Cell<usize>,
         commit_times: Cell<usize>,
         discovers: Cell<usize>,
+        digests: Cell<usize>,
     }
 
     impl<'a> CountingBackend<'a> {
@@ -1164,6 +1182,7 @@ mod tests {
                 exports: Cell::new(0),
                 commit_times: Cell::new(0),
                 discovers: Cell::new(0),
+                digests: Cell::new(0),
             }
         }
 
@@ -1185,6 +1204,10 @@ mod tests {
 
         fn discover_count(&self) -> usize {
             self.discovers.get()
+        }
+
+        fn digest_count(&self) -> usize {
+            self.digests.get()
         }
     }
 
@@ -1230,6 +1253,7 @@ mod tests {
             root: Option<&Path>,
             matcher: &crate::matcher::PathMatcher,
         ) -> Result<String> {
+            self.digests.set(self.digests.get() + 1);
             self.inner
                 .compute_digest(source, url, commit, root, matcher)
         }
@@ -1354,6 +1378,76 @@ mod tests {
             locked.config_digest,
             config_digest_of(&cfg, "editor-src"),
             "config_digest must equal the source's config digest"
+        );
+    }
+
+    // ── Phase 1: link-source resolution (DLD-009) ──────────────────
+
+    /// A link-mode source whose `git` is the local working-tree path `url`.
+    fn config_with_link_source(name: &str, url: &str) -> Config {
+        let toml = format!(
+            "version = 1\n\n[sources.{name}]\ngit = \"{url}\"\nbranch = \"main\"\ndeploy = \"link\"\n"
+        );
+        Config::parse(&toml).expect("link source config parses")
+    }
+
+    /// A link source whose local path has NO phora mirror must still resolve:
+    /// `resolve_sources` synthesizes an audit lock entry (local path + HEAD read
+    /// directly via `gix`), and must NOT fetch or compute a mirror digest.
+    #[test]
+    fn link_source_resolves_without_mirror_into_audit_lock_entry() {
+        let fx = build_sync_fixture();
+        let cfg = config_with_link_source("dev-src", &fx.url);
+        // No mirror is seeded for fx.url: a fetch/compute_digest would error.
+
+        let counting = CountingBackend::new(&fx.backend);
+        let (routed, _commits) = resolve_sources(&cfg, None, &counting, false)
+            .expect("link source resolves with no reachable mirror");
+
+        let (_name, locked) = routed
+            .iter()
+            .find(|(n, _)| n == "dev-src")
+            .expect("link source routed into a lock entry");
+
+        assert_eq!(
+            locked.resolved, "link",
+            "a link entry is marked with the \"link\" sentinel in `resolved`"
+        );
+        assert_eq!(
+            locked.git, fx.url,
+            "link entry records the local working-tree path as its git source"
+        );
+        assert_eq!(
+            locked.commit, fx.head_sha,
+            "link entry commit is HEAD read directly from the local repo, not a mirror clone"
+        );
+        assert_eq!(
+            locked.config_digest,
+            config_digest_of(&cfg, "dev-src"),
+            "config_digest is recorded as usual"
+        );
+    }
+
+    /// The link carve-out is observable on the backend: zero fetches and zero
+    /// mirror digest computations for the link source.
+    #[test]
+    fn link_source_skips_fetch_and_mirror_digest() {
+        let fx = build_sync_fixture();
+        let cfg = config_with_link_source("dev-src", &fx.url);
+
+        let counting = CountingBackend::new(&fx.backend);
+        let _ = resolve_sources(&cfg, None, &counting, false)
+            .expect("link source resolves without touching the mirror");
+
+        assert_eq!(
+            counting.fetch_count(),
+            0,
+            "a link source must not fetch the git mirror"
+        );
+        assert_eq!(
+            counting.digest_count(),
+            0,
+            "a link source must not compute a mirror digest"
         );
     }
 

@@ -537,6 +537,18 @@ impl ExportWalk<'_> {
     }
 }
 
+/// HEAD of a local working-tree repo; a non-repo or unborn HEAD yields the
+/// `"link"` sentinel, since link mode must tolerate a plain directory.
+pub fn read_local_head(path: &str) -> Result<String> {
+    let Ok(repo) = gix::open(path) else {
+        return Ok("link".to_owned());
+    };
+    match repo.head_id() {
+        Ok(id) => Ok(id.to_hex().to_string()),
+        Err(_) => Ok("link".to_owned()),
+    }
+}
+
 /// Rejects any git tree filename that is not a single inert path component, so a
 /// malicious tree can never escape the staging dir when joined onto a path.
 fn safe_component(name: &str) -> Result<&str> {
