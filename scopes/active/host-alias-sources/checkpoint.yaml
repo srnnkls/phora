@@ -2,16 +2,17 @@ checkpoint:
   scope_name: host-alias-sources
   scope_path: ./scopes/active/host-alias-sources
   branch: feat/host-alias-sources
-  last_batch: 1
+  last_batch: 2
   tasks:
-    done: [HAS-001]
-    pending: [HAS-002, HAS-003, HAS-004, HAS-005, HAS-006]
+    done: [HAS-001, HAS-002]
+    pending: [HAS-003, HAS-004, HAS-005, HAS-006]
   next_batch:
-    number: 2
-    tasks: [HAS-002, HAS-004]   # parallel; both depend on HAS-001
+    number: 3
+    tasks: [HAS-004]   # add-write; then HAS-003 wires sync (HAS-004 + HAS-002 both touch cli.rs, sequenced)
   deferred_issues:
-    - "HAS-002: unify forge registry (is_known_host + cli host_templates), add codeberg/sr.ht/bitbucket"
-    - "HAS-003: replace // HAS-003 \"\" git bridges with resolved_remote; wire Config::validate into load path"
+    - "HAS-003: replace // HAS-003 \"\" git bridges with resolved_remote; wire Config::validate into load path; thread effective_protocol per source"
     - "HAS-005: source_matches NormalizedUrl/MirrorKey identity (// HAS-005 marker at lock.rs)"
+    - "perf(note): builtin_forges() rebuilds a 5-entry map per call; consider LazyLock when HAS-003 calls per-source"
+    - "cosmetic(note): resolved_remote error names source.path not source name"
   review_config:
     reviewers: [opus, sonnet]
