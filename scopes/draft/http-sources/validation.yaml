@@ -1,0 +1,141 @@
+scope: http-sources
+issue_type: Feature
+created: 2026-06-08
+
+ambiguity_scan:
+  scope:        clear     # url source kind, unified via synthetic-commit import
+  behavior:     clear     # download/verify/extract/strip/import; no-op on identical content; update advances
+  data_model:   clear     # Source.url/digest; synthetic content-addressed commit; lock pins it
+  constraints:  clear     # digest verify, traversal guard, three-way mode exclusivity, determinism
+  edge_cases:   partial   # nested archives, symlinks/exec bits inside archives, non-utf8 names, zero-entry archives left to implementation
+  integration:  clear     # SourceBackend port, gix object-write, NormalizedUrl/MirrorKey, projection/verify reuse
+  terminology:  clear     # url source, synthetic commit, auto-strip, digest
+
+decisions:
+  - id: approach
+    question: "Unify into git ODB or separate http cache?"
+    resolution: "Backend A: synthetic content-addressed commit import; reuse the whole projection/verify pipeline"
+    confirmed_by: user
+  - id: field
+    question: "How is an http source declared?"
+    resolution: "url = \"https://…\"; third mode (git XOR host+path XOR url)"
+    confirmed_by: user
+  - id: strip
+    question: "Top-level dir stripping?"
+    resolution: "Auto-strip a single top dir; root selects deeper"
+    confirmed_by: user
+  - id: integrity
+    question: "Download checksum?"
+    resolution: "Optional digest = \"<algo>:<hex>\" (sha256/blake3), verified pre-import"
+    confirmed_by: user
+  - id: determinism
+    question: "How to make the synthetic commit reproducible?"
+    resolution: "Fixed identity + epoch-0 time + constant message => commit id = f(content); commit_time = epoch-0 sentinel"
+    confirmed_by: assistant-default
+  - id: resolve
+    question: "What does resolve return for a static resource?"
+    resolution: "fetch writes the commit + a ref; resolve reads the ref; refspec ignored; branch/tag/rev rejected"
+    confirmed_by: assistant-default
+
+open_risks:
+  - id: gix-object-write
+    description: "Synthetic-commit import via gix write_blob/write_object + commit — API shape unverified"
+    resolution: "Spike HTP-004 first; gix 0.84 exposes write_blob/write_object (confirmed present), commit API to validate"
+  - id: archive-modes-symlinks
+    description: "Archives may carry exec bits, symlinks, non-utf8 names; import must apply the same ExportPolicy semantics as git trees"
+    resolution: "Map archive entry modes to git blob/exec/link; honor allow_symlinks/preserve_executable; pin with tests"
+  - id: new-deps-surface
+    description: "http client + flate2/tar/zip/sha2 enlarge the dependency + supply-chain surface"
+    resolution: "Prefer minimal, rustls-based, well-audited crates (ureq); document the additions; the optional digest mitigates download tampering"
+  - id: dep-on-host-alias-validation
+    description: "Mode-exclusivity edited by both this scope and host-alias-sources"
+    resolution: "Coordinate: one three-way validation fn; sequence or merge"
+
+review_config:
+  reviewers: [opus, sonnet]
+  note: "Highest-value targets: determinism of the synthetic commit (content-only id), archive traversal/mode safety, backend-router dispatch correctness"
+
+verification_gate:
+  - "cargo test green incl. new http-source tests"
+  - "url tarball source resolves/fetches/deploys/verifies like a git source; identical content => no-op; changed => lock advances"
+  - "each format extracts; auto-strip works; traversal rejected; digest mismatch errors pre-import"
+  - "spike: identical bytes => identical synthetic commit id across runs"
+
+review_session:
+  date: 2026-06-08
+  reviewers: [claude-opus, claude-sonnet]
+  gate_summary: { completeness: address, consistency: address, feasibility: fail, clarity: address }
+  recommendation: address_issues
+  keystone: "HTP-004 determinism CONFIRMED feasible against gix-0.84/gix-object (commit_as pins author+committer time via raw SignatureRef.time; write_blob/write_object give content-only ids). Caveat: Tree.entries must be git-sorted before write."
+  findings:
+    - id: C1
+      severity: critical
+      found_by: [claude-opus, claude-sonnet]
+      area: integration
+      issue: "Backend router cannot dispatch on url scheme — a git source legitimately uses https://…​.git"
+      resolution: "HTP-005: RouterBackend dispatches on the source NAME param via a name→mode map; sync(&dyn SourceBackend) unchanged"
+    - id: C2
+      severity: critical
+      found_by: [claude-opus, claude-sonnet]
+      area: behavior
+      issue: "resolve_sources passes source.refspec()=Branch('main'); HttpBackend.resolve would read refs/heads/main not /phora"
+      resolution: "HTP-001/005: Refspec::None for url sources; HttpBackend.resolve ignores refspec, reads refs/heads/phora"
+    - id: C3
+      severity: critical
+      found_by: [claude-opus, claude-sonnet]
+      area: edge_cases
+      issue: "safe_component (source.rs:542) rejects '/'; archive entries are multi-segment → would reject all nested files / miss traversal"
+      resolution: "HTP-003: safe_archive_path splits per segment + rejects absolute/drive/null/backslash"
+    - id: C4
+      severity: critical
+      found_by: [claude-sonnet]
+      area: constraints
+      issue: "mode-exclusivity for url not validated; git+url silently accepted"
+      resolution: "HTP-001: three-way exclusivity in Config::parse; reject branch/tag/rev/root on url"
+    - id: H1
+      severity: high
+      found_by: [claude-opus]
+      area: data_model
+      issue: "Source.git required String threaded as url at 11+ sites; three-way mode forces git→Option"
+      resolution: "HTP-001: Source::source_url() accessor; git→Option; mode-aware merged_with (shared with host-alias)"
+    - id: H2
+      severity: high
+      found_by: [claude-opus, claude-sonnet]
+      area: data_model
+      issue: "LockedSource shape for url sources unspecified (git/resolved/commit)"
+      resolution: "HTP-006: git=url, resolved sentinel 'url', commit=synthetic id; source_matches documented"
+    - id: H3
+      severity: high
+      found_by: [claude-opus]
+      area: integration
+      issue: "Source mode-exclusivity + merged_with shared with host-alias-sources → guaranteed merge conflict"
+      resolution: "Elevated coordination to HARD sequence: land host-alias first; this scope adds the url arm only"
+    - id: M_digest
+      severity: medium
+      found_by: [claude-opus, claude-sonnet]
+      area: integration
+      issue: "registry::Digest is blake3-only and feeds projection verify; widening to sha256 weakens it"
+      resolution: "HTP-001: separate DownloadDigest type"
+    - id: M_mtime
+      severity: medium
+      found_by: [claude-sonnet]
+      area: edge_cases
+      issue: "epoch-0 mtime clamped on some filesystems → perpetual Modified"
+      resolution: "HTP-004: epoch+1 sentinel (or test round-trip)"
+    - id: M_tree_sort
+      severity: medium
+      found_by: [claude-opus]
+      area: constraints
+      issue: "gix Tree.entries must be git-sorted before write (debug_assert) or trees are unstable/malformed"
+      resolution: "HTP-004: sort entries; git fsck the synthetic commit in tests"
+    - id: M_modes
+      severity: medium
+      found_by: [claude-opus]
+      area: edge_cases
+      issue: "archive exec-bit/symlink/non-utf8 handling left to implementation"
+      resolution: "HTP-003: map to EntryKind; reject non-utf8 names in v1"
+  strengths_confirmed:
+    - "Synthetic-commit determinism keystone is sound (gix verified) — the riskiest assumption holds"
+    - "Reusing export/discover/compute_digest once content is a git tree is the right call (EntryKind 1:1 with archive exec/symlink)"
+    - "Pre-import digest verify = stronger supply-chain story than vendir"
+    - "auto-strip → content-only commit id is a good reproducibility property"
