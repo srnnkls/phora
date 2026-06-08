@@ -75,7 +75,7 @@ tasks:
 
   - id: DLD-005
     content: "Registry linked marker + ArtifactState::Linked (+ matches! guard + cli label)"
-    status: pending
+    status: done
     activeForm: "Adding linked marker and Linked state"
     depends_on: [DLD-001]
     review_fixes:

@@ -3,14 +3,18 @@ checkpoint:
   scope_path: ./scopes/active/deploy-link-dev-mode
   branch: feat/deploy-link-dev-mode
   timestamp: 2026-06-08
-  last_batch: 1
+  last_batch: 2a
   tasks:
-    done: [DLD-001]
-    pending: [DLD-002, DLD-003, DLD-005, DLD-009, DLD-004, DLD-006, DLD-007, DLD-008]
+    done: [DLD-001, DLD-005]
+    pending: [DLD-003, DLD-009, DLD-002, DLD-004, DLD-006, DLD-007, DLD-008]
   next_batch:
-    number: 2
-    title: "Discovery, guardrails, registry shape, link-resolution (parallel)"
-    tasks: [DLD-002, DLD-003, DLD-005, DLD-009]
-  deferred_issues: []
+    number: 2b
+    title: "DLD-003 mode-aware working-tree discovery"
+    tasks: [DLD-003]
+  note: >
+    Phase-2 tasks (DLD-002/003/005/009) all edit src/sync.rs; run sequentially despite
+    dependencies.yaml parallel:true. Remaining phase-2 order: DLD-003 -> DLD-009 -> DLD-002.
+  deferred_issues:
+    - DLD-005-M1 (medium): linked short-circuit doesn't verify dst is a symlink; defer to DLD-007.
   review_config:
     reviewers: [opus, sonnet]

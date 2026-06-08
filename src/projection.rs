@@ -16,6 +16,7 @@ pub enum ArtifactState {
     Foreign,
     Missing,
     Ejected,
+    Linked,
 }
 
 #[derive(Debug)]
@@ -55,6 +56,10 @@ pub fn check_artifact_state(
     let Some(record) = registry.get(key)? else {
         return Ok(ArtifactState::Foreign);
     };
+
+    if record.linked {
+        return Ok(ArtifactState::Linked);
+    }
 
     if record.key.source != expected_source || record.commit != expected_commit {
         return Ok(ArtifactState::Foreign);
@@ -712,6 +717,7 @@ mod tests {
             allow_symlinks,
             preserve_executable: true,
             files: manifest,
+            linked: false,
         }
     }
 
@@ -848,6 +854,98 @@ mod tests {
             matches!(st, ArtifactState::Foreign),
             "record is findable under key yet expected_commit is other-commit: \
              record.commit ({COMMIT}) != expected_commit => Foreign, got {st:?}"
+        );
+    }
+
+    // ── linked artifacts (DLD-005) ─────────────────────────────────
+
+    /// A linked record: no manifest files, sentinel commit/digest, `linked = true`.
+    fn linked_record() -> RegistryRecord {
+        RegistryRecord {
+            version: 1,
+            key: key(),
+            commit: "link".to_owned(),
+            digest: "link:".to_owned(),
+            projected_at: "2026-06-08T12:00:00Z".to_owned(),
+            layout: "flat".to_owned(),
+            allow_symlinks: false,
+            preserve_executable: true,
+            files: vec![],
+            linked: true,
+        }
+    }
+
+    /// A symlink deployed at the key, pointing at a live directory, with a linked record
+    /// whose sentinel commit deliberately mismatches `expected_commit`. The linked
+    /// short-circuit must fire BEFORE the commit/source Foreign check, yielding Linked.
+    #[test]
+    fn linked_record_reads_linked_not_foreign_despite_commit_mismatch() {
+        let (_state_dir, reg) = registry();
+        let parent = TempDir::new().expect("target parent");
+        let live = parent.path().join("worktree-artifact");
+        std::fs::create_dir_all(&live).expect("mkdir live target");
+        std::fs::write(live.join("snippets.json"), b"{}").expect("write live file");
+        let dst = parent.path().join("deployed-link");
+        symlink(&live, &dst).expect("deploy symlink");
+
+        reg.put(&linked_record()).expect("put linked record");
+
+        let st = check_artifact_state(&dst, SOURCE, COMMIT, &[], ARTIFACT, &reg, &key())
+            .expect("check_artifact_state on a linked symlink");
+
+        assert!(
+            matches!(st, ArtifactState::Linked),
+            "a linked record must short-circuit to Linked BEFORE the commit-mismatch Foreign \
+             check (sentinel commit `link` != expected {COMMIT}), got {st:?}"
+        );
+    }
+
+    /// Even when the symlink target's content diverges from anything recorded, a linked
+    /// artifact must never be reported Modified — it is quarantined from per-file drift.
+    #[test]
+    fn linked_record_never_reads_modified_when_target_content_differs() {
+        let (_state_dir, reg) = registry();
+        let parent = TempDir::new().expect("target parent");
+        let live = parent.path().join("worktree-artifact");
+        std::fs::create_dir_all(&live).expect("mkdir live target");
+        std::fs::write(live.join("anything.json"), b"locally edited content")
+            .expect("write divergent file");
+        let dst = parent.path().join("deployed-link");
+        symlink(&live, &dst).expect("deploy symlink");
+
+        reg.put(&linked_record()).expect("put linked record");
+
+        let st = state(&dst, &[], &reg);
+
+        assert!(
+            matches!(st, ArtifactState::Linked),
+            "a linked record is quarantined from per-file drift; it must read Linked, never \
+             Modified, even when the live target content changes, got {st:?}"
+        );
+    }
+
+    /// A dangling linked symlink (its target deleted): `try_exists` follows the link and
+    /// returns Ok(false), so the state is Missing — and the call must not crash.
+    #[test]
+    fn dangling_linked_symlink_reads_missing_without_crashing() {
+        let (_state_dir, reg) = registry();
+        let parent = TempDir::new().expect("target parent");
+        let gone = parent.path().join("deleted-worktree-artifact");
+        let dst = parent.path().join("deployed-link");
+        symlink(&gone, &dst).expect("deploy dangling symlink");
+        assert!(
+            !gone.exists(),
+            "premise: the symlink target must be absent so the link dangles"
+        );
+
+        reg.put(&linked_record()).expect("put linked record");
+
+        let st = state(&dst, &[], &reg);
+
+        assert!(
+            matches!(st, ArtifactState::Missing),
+            "a dangling linked symlink follows to a non-existent target => Missing (redeploy), \
+             and must not error, got {st:?}"
         );
     }
 
@@ -1059,6 +1157,7 @@ mod tests {
             allow_symlinks: false,
             preserve_executable: true,
             files: manifest,
+            linked: false,
         }
     }
 
