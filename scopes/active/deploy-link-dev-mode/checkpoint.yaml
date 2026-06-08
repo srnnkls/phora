@@ -3,18 +3,21 @@ checkpoint:
   scope_path: ./scopes/active/deploy-link-dev-mode
   branch: feat/deploy-link-dev-mode
   timestamp: 2026-06-08
-  last_batch: 2a
+  last_batch: 2b
   tasks:
-    done: [DLD-001, DLD-005]
-    pending: [DLD-003, DLD-009, DLD-002, DLD-004, DLD-006, DLD-007, DLD-008]
+    done: [DLD-001, DLD-005, DLD-003]
+    pending: [DLD-009, DLD-002, DLD-004, DLD-006, DLD-007, DLD-008]
   next_batch:
-    number: 2b
-    title: "DLD-003 mode-aware working-tree discovery"
-    tasks: [DLD-003]
+    number: 2c
+    title: "DLD-009 link-source resolution (sidestep mirror)"
+    tasks: [DLD-009]
   note: >
-    Phase-2 tasks (DLD-002/003/005/009) all edit src/sync.rs; run sequentially despite
-    dependencies.yaml parallel:true. Remaining phase-2 order: DLD-003 -> DLD-009 -> DLD-002.
+    Phase-2 tasks all edit src/sync.rs; run sequentially. Remaining phase-2 order: DLD-009 -> DLD-002.
+    DLD-003 pulled DLD-006's rebuild-link-marker forward (rebuild_linked) — DLD-006 now only owns
+    verify-skip + prune-symlink (+ confirm rebuild). Source::deploy_mode() helper now exists.
   deferred_issues:
     - DLD-005-M1 (medium): linked short-circuit doesn't verify dst is a symlink; defer to DLD-007.
+    - DLD-003-L1 (low): worktree_scan_missing_path_errors uses /nonexistent; harden in DLD-006.
+    - DLD-003-N1 (note): link deploy dispatch is DLD-004's job (deploy closure).
   review_config:
     reviewers: [opus, sonnet]
