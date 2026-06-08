@@ -206,7 +206,7 @@ fn run_worktree_import_legacy(file: &Path) -> Result<()> {
 fn run_worktree_apply(path: Option<&Path>) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let worktree_root = path.unwrap_or(&cwd);
-    let base = load_config()?;
+    let base = load_config_from(worktree_root)?;
     let local = load_local_config(worktree_root)?;
     let config = crate::config::merge_configs(base, local);
     let includes = config
@@ -466,8 +466,13 @@ fn open_project_registry() -> Result<FileRegistry> {
 }
 
 fn load_config() -> Result<Config> {
-    let text = std::fs::read_to_string("phora.toml")
-        .map_err(|e| Error::Config(format!("read phora.toml: {e}")))?;
+    load_config_from(Path::new("."))
+}
+
+fn load_config_from(dir: &Path) -> Result<Config> {
+    let path = dir.join("phora.toml");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| Error::Config(format!("read {}: {e}", path.display())))?;
     Config::parse(&text)
 }
 
