@@ -24,6 +24,8 @@ pub struct RegistryRecord {
     pub allow_symlinks: bool,
     pub preserve_executable: bool,
     pub files: Vec<ManifestFile>,
+    #[serde(default)]
+    pub linked: bool,
 }
 
 /// Registry record file entry (carries the content hash used by `phora verify`).
@@ -334,6 +336,74 @@ mod tests {
         assert!(Digest::parse("blake3:").is_err());
     }
 
+    // ── linked marker (DLD-005) ────────────────────────────────────
+
+    /// A linked record carries no files and sentinel commit/digest; it must survive a
+    /// TOML round-trip with `linked = true` intact and the empty `files` preserved.
+    #[test]
+    fn linked_record_round_trips_with_sentinels_and_empty_files() {
+        let rec = RegistryRecord {
+            version: 1,
+            key: ArtifactKey {
+                target: "vscode".to_owned(),
+                source: "local-overlay".to_owned(),
+                artifact: "snippets".to_owned(),
+            },
+            commit: "link".to_owned(),
+            digest: "link:".to_owned(),
+            projected_at: "2026-06-08T12:00:00Z".to_owned(),
+            layout: "flat".to_owned(),
+            allow_symlinks: false,
+            preserve_executable: true,
+            files: vec![],
+            linked: true,
+        };
+
+        let toml = toml::to_string(&rec).expect("serialize linked record");
+        let back: RegistryRecord = toml::from_str(&toml).expect("deserialize linked record");
+
+        assert_eq!(
+            back, rec,
+            "a linked record must round-trip field-for-field through TOML"
+        );
+        assert!(back.linked, "linked flag must survive serde");
+        assert!(
+            back.files.is_empty(),
+            "a linked record carries no manifest files"
+        );
+        assert_eq!(back.commit, "link", "sentinel commit must round-trip");
+        assert_eq!(back.digest, "link:", "sentinel digest must round-trip");
+    }
+
+    /// Records written before the linked marker existed have no `linked` key; serde
+    /// `#[serde(default)]` must deserialize them with `linked = false` (back-compat).
+    #[test]
+    fn record_without_linked_field_deserializes_as_not_linked() {
+        let legacy = r#"
+version = 1
+commit = "def456789abc123"
+digest = "blake3:d4e5f6"
+projected_at = "2026-01-31T12:34:56Z"
+layout = "flat"
+allow_symlinks = false
+preserve_executable = true
+files = []
+
+[key]
+target = "vscode"
+source = "company-configs"
+artifact = "snippets"
+"#;
+
+        let rec: RegistryRecord =
+            toml::from_str(legacy).expect("legacy record without `linked` must still parse");
+
+        assert!(
+            !rec.linked,
+            "a record predating the linked marker must default to linked = false"
+        );
+    }
+
     fn record(target: &str, source: &str, artifact: &str) -> RegistryRecord {
         RegistryRecord {
             version: 1,
@@ -354,6 +424,7 @@ mod tests {
                 mtime: 1_738_329_296,
                 blake3: "9e8d7c6b5a4f3e2d".to_owned(),
             }],
+            linked: false,
         }
     }
 
