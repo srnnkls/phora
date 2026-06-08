@@ -51,6 +51,8 @@ pub enum IncludeMode {
     #[default]
     Symlink,
     Copy,
+    #[serde(rename = "submodule-walk")]
+    SubmoduleWalk,
 }
 
 impl Config {
@@ -1529,6 +1531,94 @@ mode = "hardlink"
             Error::Config(msg) => assert!(
                 msg.contains("hardlink"),
                 "error should name the offending mode value, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    // WTI-007: IncludeMode::SubmoduleWalk
+
+    #[test]
+    fn include_mode_submodule_walk_parses() {
+        let cfg = Config::parse(
+            r#"
+version = 1
+
+[[worktree.includes]]
+path = "vendor/lib"
+mode = "submodule-walk"
+"#,
+        )
+        .expect("a submodule-walk include mode must parse");
+
+        let includes = worktree_includes(&cfg);
+        assert_eq!(includes.len(), 1, "the single include must parse");
+        assert_eq!(includes[0].path, PathBuf::from("vendor/lib"));
+        assert_eq!(
+            includes[0].mode,
+            IncludeMode::SubmoduleWalk,
+            "mode = \"submodule-walk\" must parse to IncludeMode::SubmoduleWalk via an explicit \
+             serde rename (lowercase rename_all would render the variant as `submodulewalk`)"
+        );
+    }
+
+    #[test]
+    fn include_mode_existing_variants_undisturbed_by_submodule_walk() {
+        let cfg = Config::parse(
+            r#"
+version = 1
+
+[[worktree.includes]]
+path = ".envrc"
+
+[[worktree.includes]]
+path = "secrets/local.env"
+mode = "copy"
+
+[[worktree.includes]]
+path = "config/app.toml"
+mode = "symlink"
+"#,
+        )
+        .expect("symlink/copy/default includes must still parse alongside the new variant");
+
+        let includes = worktree_includes(&cfg);
+        assert_eq!(includes.len(), 3);
+        assert_eq!(
+            includes[0].mode,
+            IncludeMode::Symlink,
+            "an omitted mode must still default to Symlink"
+        );
+        assert_eq!(
+            includes[1].mode,
+            IncludeMode::Copy,
+            "mode = \"copy\" must still parse to IncludeMode::Copy"
+        );
+        assert_eq!(
+            includes[2].mode,
+            IncludeMode::Symlink,
+            "mode = \"symlink\" must still parse to IncludeMode::Symlink"
+        );
+    }
+
+    #[test]
+    fn unknown_submodule_walk_lookalike_mode_is_rejected_naming_it() {
+        let toml = r#"
+version = 1
+
+[[worktree.includes]]
+path = "vendor/lib"
+mode = "submodulewalk"
+"#;
+        let err = Config::parse(toml).expect_err(
+            "the bare `submodulewalk` rendering must be rejected: the explicit \
+             #[serde(rename = \"submodule-walk\")] is required, so the lowercase-rename form is invalid",
+        );
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("submodulewalk"),
+                "error should name the offending `submodulewalk` value (not merely list valid variants, \
+                 which would also contain the substring `submodule`), got: {msg}"
             ),
             other => panic!("expected Error::Config, got {other:?}"),
         }

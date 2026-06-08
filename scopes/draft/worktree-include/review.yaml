@@ -89,3 +89,22 @@ batch_reviews:
       clippy_all_targets: clean
       fmt: clean
       gix_api: "repo.index() -> entry_by_path(forward-slash BString) -> Mode::COMMIT?Submodule:Tracked / None?Absent"
+  - batch: 4
+    tasks: [WTI-007]
+    test_review:
+      reviewers: [test-review-opus, test-review-sonnet]
+      outcome: needs_changes -> clean
+      findings_addressed:
+        - "is_submodule_true test lacked the 160000 gitlink fixture self-check -> added (matches index_kind sibling)"
+        - "lookalike 'naming it' not load-bearing (submodule-walk also contains 'submodule') -> switched lookalike to bare 'submodulewalk', pins the explicit serde rename is required"
+    code_review:
+      reviewers: [code-review-opus, code-review-sonnet]
+      gates: { correctness: pass, security: pass, architecture: pass, style: pass }
+      outcome: approved   # both reviewers
+      low_findings_handled:
+        - "is_submodule # Errors doc opened with process narration -> trimmed to the contract sentence"
+      notes: "no production match on IncludeMode yet (only config.rs) -> zero catch-all risk; WTI-003 apply must add a SubmoduleWalk arm. // <task-id>: test-section comments kept to match the file's established PAM-/DLD-/WTI- convention."
+    verification:
+      lib_tests: "306 passed; 0 failed"
+      clippy_all_targets: clean
+      fmt: clean
