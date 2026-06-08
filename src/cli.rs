@@ -88,6 +88,17 @@ pub enum Command {
         source: String,
         path: String,
     },
+    /// Worktree include operations.
+    Worktree {
+        #[command(subcommand)]
+        command: WorktreeCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum WorktreeCommand {
+    /// Materialize configured includes in the current linked worktree.
+    Apply { path: Option<std::path::PathBuf> },
 }
 
 pub fn run(cli: Cli) -> Result<()> {
@@ -169,7 +180,31 @@ pub fn run(cli: Cli) -> Result<()> {
             print_check_match(&source, &path, &report);
             Ok(())
         }
+        Command::Worktree { command } => match command {
+            WorktreeCommand::Apply { path } => run_worktree_apply(path.as_deref()),
+        },
     }
+}
+
+fn run_worktree_apply(path: Option<&Path>) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let worktree_root = path.unwrap_or(&cwd);
+    let base = load_config()?;
+    let local = load_local_config(worktree_root)?;
+    let config = crate::config::merge_configs(base, local);
+    let includes = config
+        .worktree
+        .as_ref()
+        .map_or(&[][..], |w| w.includes.as_slice());
+
+    let primary = crate::worktree::primary_worktree(worktree_root)?;
+    let repo = gix::discover(worktree_root)
+        .map_err(|e| Error::Worktree(format!("open repository: {e}")))?;
+    let report = crate::worktree_apply::apply(worktree_root, &primary, &repo, includes)?;
+    for entry in &report.entries {
+        println!("{}: {:?}", entry.path.display(), entry.outcome);
+    }
+    Ok(())
 }
 
 fn run_add(
@@ -914,6 +949,41 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn cli_parses_worktree_apply() {
+        use clap::Parser as _;
+
+        let cli = Cli::try_parse_from(["phora", "worktree", "apply"])
+            .expect("`phora worktree apply` must parse as a nested subcommand");
+        match cli.command {
+            Command::Worktree {
+                command: WorktreeCommand::Apply { path },
+            } => assert!(
+                path.is_none(),
+                "bare `worktree apply` must leave the optional path unset"
+            ),
+            other => panic!("expected Worktree {{ Apply }}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_worktree_apply_with_path() {
+        use clap::Parser as _;
+
+        let cli = Cli::try_parse_from(["phora", "worktree", "apply", "/tmp/wt"])
+            .expect("`phora worktree apply <path>` must parse the positional path arg");
+        match cli.command {
+            Command::Worktree {
+                command: WorktreeCommand::Apply { path },
+            } => assert_eq!(
+                path,
+                Some(PathBuf::from("/tmp/wt")),
+                "the positional path arg must route into Apply {{ path: Some(..) }}"
+            ),
+            other => panic!("expected Worktree {{ Apply }}, got {other:?}"),
+        }
     }
 
     #[test]
