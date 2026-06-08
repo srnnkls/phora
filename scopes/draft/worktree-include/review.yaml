@@ -62,3 +62,30 @@ batch_reviews:
       clippy_all_targets: clean
       fmt: clean
       gix_api: "gix::discover -> repo.main_repo() -> main.workdir() -> std::fs::canonicalize"
+  - batch: 3
+    tasks: [WTI-006]
+    test_review:
+      reviewers: [test-review-opus, test-review-sonnet]
+      outcome: needs_changes -> clean
+      findings_addressed:
+        - "no nested/subdir path test -> added tracked_nested_path_reads_tracked (pins forward-slash bstr key)"
+        - "redundant assert_ne!(Tracked) after assert_eq!(Submodule) -> removed"
+        - "untracked-present test lacked same-repo Tracked cross-check -> added README.md==Tracked"
+    code_review:
+      reviewers: [code-review-opus, code-review-sonnet]
+      gates: { correctness: pass, security: pass, architecture: pass, style: pass }
+      outcome: changes_requested -> approved
+      issues_resolved:
+        - severity: medium
+          gate: correctness
+          detail: "forward_slash_key used to_string_lossy() -> non-UTF-8 path keys diverge from the git index raw-byte key => false Absent, defeating the guard"
+          fix: "rebuild key from as_os_str().as_encoded_bytes() (byte-level \\ -> /, strip ALL leading ./); added forward_slash_key_normalizes_separators_and_dot_prefix test"
+      deferred_issues:
+        - severity: low
+          gate: architecture
+          detail: "repo.index() errors on unborn-HEAD/no-index instead of IndexKind::Absent. Unreachable in the apply path (a linked worktree always has an index); erroring is the safer default. Kept; documented."
+    verification:
+      lib_tests: "300 passed; 0 failed"
+      clippy_all_targets: clean
+      fmt: clean
+      gix_api: "repo.index() -> entry_by_path(forward-slash BString) -> Mode::COMMIT?Submodule:Tracked / None?Absent"
