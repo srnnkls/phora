@@ -3,28 +3,21 @@ checkpoint:
   scope_path: ./scopes/draft/worktree-include
   branch: feat/worktree-include
   base: feat/deploy-link-dev-mode
-  last_batch: 4
+  last_batch: 5
   tasks:
-    done: [WTI-001, WTI-002, WTI-006, WTI-007]
-    pending: [WTI-003, WTI-004, WTI-005]
+    done: [WTI-001, WTI-002, WTI-006, WTI-007, WTI-003]
+    pending: [WTI-004, WTI-005]
   next_batch:
-    number: 5
-    tasks: [WTI-003]   # stateless atomic placement engine (incl. submodule dir-symlink + submodule-walk)
-  sequence: [WTI-003, "WTI-004 + WTI-005 (parallel)"]
-  apply_design_notes:
-    - "symlink mode: absolute symlink <worktree>/<path> -> <primary>/<path>; temp-symlink + rename"
-    - "copy mode: copy_file (file) / copy_tree (dir) via temp + rename"
-    - "submodule (is_submodule==true): Symlink/default => one dir-symlink to <primary>/<path> (the submodule worktree, checked out there); SubmoduleWalk => per-leaf links inside <worktree>/<path> walking <primary>/<path> sans .git; Copy => warn+skip"
-    - "tracked-path guard: refuse index_kind==Tracked; allow Submodule + Absent (WTI-006)"
-    - "nested leaf: create parents, link only leaf, preserve siblings"
-    - "idempotent: read_link == target => skip; stale => re-point; real non-symlink at symlink path => warn/skip (no clobber)"
-    - "stateless: no registry, no state.lock; paths from worktree root (CWD or --path)"
+    number: 6
+    tasks: [WTI-004, WTI-005]   # parallel-ish; WTI-004 = guardrails (worktree_apply.rs), WTI-005 = cli group + import-legacy + docs
+  apply_engine: "src/worktree_apply.rs::apply (worktree-index classification, submodule dir-symlink/walk/copy-skip, atomic temp+rename, idempotent, no-clobber, stateless)"
   deferred_issues:
-    - "WTI-003: enforce worktree-root containment at apply time (canonicalize + root-prefix); harden Windows-separator/drive/UNC include paths"
-    - "WTI-002 (low): canonicalize IO error maps to Error::Worktree not Error::Io (kept for path context)"
-    - "WTI-006 (low): repo.index() errors on unborn-HEAD instead of Absent (unreachable in apply path)"
+    - "WTI-004: warn-and-continue (collect per-entry errors instead of fail-fast `?`) + partial-failure exit code; human-readable CLI output (replace {:?})"
+    - "WTI-003 deferred: apply-time worktree-root containment canonicalization; Windows-separator/drive include-path hardening"
+    - "WTI-002 (low): canonicalize IO error -> Error::Worktree not Error::Io"
+    - "WTI-006 (low): repo.index() errors on unborn-HEAD (unreachable in apply path)"
   scope_change:
     date: 2026-06-08
-    note: "submodule support added (user reversal); WTI-007 done; WTI-003/005 still must consume submodule modes"
+    note: "submodule support added (user reversal); WTI-007 done; WTI-003 consumes submodule modes"
   review_config:
     reviewers: [opus, sonnet]
