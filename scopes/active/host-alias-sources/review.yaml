@@ -25,6 +25,37 @@ batch_reviews:
       high_issues: 1   # resolved pre-commit
       medium_issues: 4 # deferred to HAS-002/003/005 with markers
     outcome: approved
+  - batch: 2
+    tasks: [HAS-002]
+    reviewers:
+      - id: general-claude-opus
+        status: success
+        gates: { correctness: pass, security: pass, performance: pass }
+        verdict: approved
+      - id: general-claude-sonnet
+        status: success
+        gates: { correctness: fail, security: pass, performance: pass }
+        verdict: changes_requested
+      - id: architecture-claude-sonnet
+        status: success
+        gates: { architecture: pass }
+        verdict: approved
+      - id: compliance-claude-opus
+        status: success
+        gates: { style: pass }
+        verdict: approved
+    synthesized:
+      gates: { correctness: pass, security: pass, performance: pass, architecture: pass, style: pass }
+      critical_issues: 0
+      high_issues: 0
+      medium_issues: 4   # all resolved pre-commit
+    outcome: approved
+    fixes:
+      - "fill_template single-pass substitution (placeholder-injection safe)"
+      - "validate rejects empty/malformed host-mode path (non-empty forge path)"
+      - "removed last hardcoded github literal in cli.rs -> reads builtin_forges() (single source of truth)"
+      - "validate ssh-template guard uses effective_host (builtin+user overlay), factored shared with resolved_remote"
+      - "added sr.ht cli shorthand test"
 issues:
   high:
     - id: HAS-001-H-remote-required

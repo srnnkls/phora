@@ -156,15 +156,24 @@ impl Config {
             let Some(host_name) = &source.host else {
                 continue;
             };
-            if !self.is_known_host(host_name) {
+            let path = source.path.as_deref().unwrap_or_default();
+            if path.trim().is_empty() || path.split('/').any(str::is_empty) {
+                return Err(Error::Config(format!(
+                    "source `{name}`: `path` `{path}` is not a valid forge path \
+                     (no empty, leading, trailing, or doubled `/` segments)"
+                )));
+            }
+            let Some(host) = self.effective_host(host_name) else {
                 return Err(Error::Config(format!(
                     "source `{name}` references unknown host `{host_name}`"
                 )));
-            }
+            };
             if matches!(source.protocol, Some(Protocol::Ssh))
-                && let Some(host) = self.hosts.get(host_name)
-                && let Some(remote) = &host.remote
-                && remote.ssh_template().is_none()
+                && host
+                    .remote
+                    .as_ref()
+                    .and_then(RemoteConfig::ssh_template)
+                    .is_none()
             {
                 return Err(Error::Config(format!(
                     "source `{name}`: protocol `ssh` but host `{host_name}` has no ssh remote template"
@@ -174,9 +183,94 @@ impl Config {
         Ok(())
     }
 
-    fn is_known_host(&self, name: &str) -> bool {
-        self.hosts.contains_key(name) || matches!(name, "github" | "gitlab")
+    fn effective_host(&self, name: &str) -> Option<Host> {
+        effective_host(&self.hosts, name)
     }
+}
+
+/// The effective host for `name`: the built-in forge overlaid by a user
+/// `[hosts]` entry of the same name (user wins), or whichever is defined.
+#[must_use]
+fn effective_host(hosts: &BTreeMap<String, Host>, name: &str) -> Option<Host> {
+    match (builtin_forges().remove(name), hosts.get(name).cloned()) {
+        (Some(b), Some(u)) => Some(b.merged_with(u)),
+        (Some(h), None) | (None, Some(h)) => Some(h),
+        (None, None) => None,
+    }
+}
+
+/// The shipped forge registry: the single source of truth for built-in hosts.
+#[must_use]
+pub fn builtin_forges() -> BTreeMap<String, Host> {
+    fn forge(https: &str, ssh: &str) -> Host {
+        Host {
+            remote: Some(RemoteConfig {
+                https: Some(https.to_owned()),
+                ssh: Some(ssh.to_owned()),
+            }),
+            auth: None,
+        }
+    }
+
+    BTreeMap::from([
+        (
+            "github".to_owned(),
+            forge(
+                "https://github.com/{path}.git",
+                "git@github.com:{path}.git",
+            ),
+        ),
+        (
+            "gitlab".to_owned(),
+            forge(
+                "https://gitlab.com/{path}.git",
+                "git@gitlab.com:{path}.git",
+            ),
+        ),
+        (
+            "codeberg".to_owned(),
+            forge(
+                "https://codeberg.org/{path}.git",
+                "git@codeberg.org:{path}.git",
+            ),
+        ),
+        (
+            "sr.ht".to_owned(),
+            forge("https://git.sr.ht/{path}", "git@git.sr.ht:{path}"),
+        ),
+        (
+            "bitbucket".to_owned(),
+            forge(
+                "https://bitbucket.org/{path}.git",
+                "git@bitbucket.org:{path}.git",
+            ),
+        ),
+    ])
+}
+
+/// Fills a remote template from `path`: `{path}` verbatim, `{owner}` the first
+/// `/`-segment, `{repo}` the remainder (so `{owner}/{repo}` ≡ `{path}` at any depth).
+#[must_use]
+pub fn fill_template(template: &str, path: &str) -> String {
+    let (owner, repo) = path.split_once('/').unwrap_or((path, ""));
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let tail = &rest[open..];
+        if let Some((token, value)) = [("{path}", path), ("{owner}", owner), ("{repo}", repo)]
+            .into_iter()
+            .find(|(token, _)| tail.starts_with(token))
+        {
+            out.push_str(value);
+            rest = &tail[token.len()..];
+        } else {
+            out.push('{');
+            rest = &tail[1..];
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Computes the effective config: `base` overlaid by `local` per spec merge semantics.
@@ -417,6 +511,50 @@ impl Source {
             self.deploy = local.deploy;
         }
         self
+    }
+
+    /// Resolves the concrete git remote for `protocol`. A git-mode source returns
+    /// its literal `git` verbatim; a host-mode source resolves against the built-in
+    /// forge registry overlaid by `hosts` (a user remote wins, else the built-in).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] if the host is in neither `hosts` nor the built-in
+    /// registry, or if the effective host has no template for `protocol`.
+    pub fn resolved_remote(
+        &self,
+        hosts: &BTreeMap<String, Host>,
+        protocol: Protocol,
+    ) -> Result<String> {
+        if let Some(git) = &self.git {
+            return Ok(git.clone());
+        }
+        let host_name = self.host.as_deref().unwrap_or_default();
+        let path = self.path.as_deref().unwrap_or_default();
+
+        let effective = effective_host(hosts, host_name).ok_or_else(|| {
+            Error::Config(format!(
+                "source `{path}` references unknown host `{host_name}`"
+            ))
+        })?;
+
+        let template = effective
+            .remote
+            .as_ref()
+            .and_then(|remote| match protocol {
+                Protocol::Https => remote.https_template(),
+                Protocol::Ssh => remote.ssh_template(),
+            })
+            .ok_or_else(|| {
+                let proto = match protocol {
+                    Protocol::Https => "https",
+                    Protocol::Ssh => "ssh",
+                };
+                Error::Config(format!(
+                    "host `{host_name}` has no {proto} remote template"
+                ))
+            })?;
+        Ok(fill_template(template, path))
     }
 
     #[must_use]
@@ -2302,5 +2440,310 @@ protocol = "ssh"
             "protocol = ssh against a remote table that HAS an ssh key must pass validation \
              (guards against a validate() that always errors)",
         );
+    }
+
+    // HAS-002: resolved_remote + single built-in forge registry
+
+    fn hosts_of(toml: &str) -> BTreeMap<String, Host> {
+        Config::parse(toml).expect("hosts toml parses").hosts
+    }
+
+    fn source_of(toml: &str, name: &str) -> Source {
+        Config::parse(toml)
+            .expect("source toml parses")
+            .sources
+            .remove(name)
+            .expect("named source present")
+    }
+
+    #[test]
+    fn resolved_remote_github_https_and_ssh_for_owner_repo_path() {
+        let host_toml = r#"
+version = 1
+
+[hosts.github]
+remote = { https = "https://github.com/{owner}/{repo}.git", ssh = "git@github.com:{owner}/{repo}.git" }
+"#;
+        let hosts = hosts_of(host_toml);
+        let source = source_of(
+            r#"
+version = 1
+
+[sources.tropos]
+host = "github"
+path = "srnnkls/tropos"
+"#,
+            "tropos",
+        );
+
+        assert_eq!(
+            source
+                .resolved_remote(&hosts, Protocol::Https)
+                .expect("https resolves"),
+            "https://github.com/srnnkls/tropos.git",
+            "https template must fill {{owner}}/{{repo}} from the path"
+        );
+        assert_eq!(
+            source
+                .resolved_remote(&hosts, Protocol::Ssh)
+                .expect("ssh resolves"),
+            "git@github.com:srnnkls/tropos.git",
+            "ssh template must produce the scp-style remote"
+        );
+    }
+
+    #[test]
+    fn resolved_remote_github_uses_builtin_when_no_user_host() {
+        let source = source_of(
+            r#"
+version = 1
+
+[sources.tropos]
+host = "github"
+path = "srnnkls/tropos"
+"#,
+            "tropos",
+        );
+        let no_user_hosts: BTreeMap<String, Host> = BTreeMap::new();
+
+        let https = source
+            .resolved_remote(&no_user_hosts, Protocol::Https)
+            .expect("built-in github https resolves with no user hosts");
+        assert_eq!(
+            https, "https://github.com/srnnkls/tropos.git",
+            "the built-in github forge must resolve EXACTLY without a user [hosts.github] def"
+        );
+
+        let ssh = source
+            .resolved_remote(&no_user_hosts, Protocol::Ssh)
+            .expect("built-in github ssh resolves with no user hosts");
+        assert_eq!(
+            ssh, "git@github.com:srnnkls/tropos.git",
+            "the built-in github forge must ship the EXACT scp-style ssh shape"
+        );
+    }
+
+    #[test]
+    fn resolved_remote_gitlab_subgroup_path_reconstructs_full_path() {
+        let source = source_of(
+            r#"
+version = 1
+
+[sources.internal]
+host = "gitlab"
+path = "group/sub/proj"
+"#,
+            "internal",
+        );
+        let no_user_hosts: BTreeMap<String, Host> = BTreeMap::new();
+
+        let https = source
+            .resolved_remote(&no_user_hosts, Protocol::Https)
+            .expect("gitlab subgroup https resolves");
+        assert!(
+            https.contains("group/sub/proj"),
+            "a gitlab subgroup path must reconstruct fully via {{owner}}/{{repo}} ≡ {{path}}, \
+             not collapse to the first/last segment, got: {https}"
+        );
+
+        let ssh = source
+            .resolved_remote(&no_user_hosts, Protocol::Ssh)
+            .expect("gitlab subgroup ssh resolves");
+        assert!(
+            ssh.contains("group/sub/proj"),
+            "the ssh shape must also carry the full subgroup path, got: {ssh}"
+        );
+    }
+
+    #[test]
+    fn resolved_remote_srht_uses_tilde_path_shape() {
+        let source = source_of(
+            r#"
+version = 1
+
+[sources.aerc]
+host = "sr.ht"
+path = "~rjarry/aerc"
+"#,
+            "aerc",
+        );
+        let no_user_hosts: BTreeMap<String, Host> = BTreeMap::new();
+
+        let https = source
+            .resolved_remote(&no_user_hosts, Protocol::Https)
+            .expect("sr.ht https resolves via the built-in {path} template");
+        assert!(
+            https.contains("~rjarry/aerc"),
+            "the built-in sr.ht template must use {{path}} verbatim so the ~user shape survives, \
+             got: {https}"
+        );
+        assert!(
+            https.contains('~'),
+            "sr.ht resolved remote must retain the leading ~, got: {https}"
+        );
+
+        let ssh = source
+            .resolved_remote(&no_user_hosts, Protocol::Ssh)
+            .expect("sr.ht ssh resolves via the built-in {path} template");
+        assert!(
+            ssh.contains("~rjarry/aerc"),
+            "the built-in sr.ht ssh template must also use {{path}} verbatim so the ~user shape \
+             survives under ssh, got: {ssh}"
+        );
+        assert!(
+            ssh.contains('~'),
+            "sr.ht ssh resolved remote must retain the leading ~, got: {ssh}"
+        );
+    }
+
+    #[test]
+    fn resolved_remote_user_host_overrides_builtin_github() {
+        let host_toml = r#"
+version = 1
+
+[hosts.github]
+remote = { https = "https://ghe.corp.example/{owner}/{repo}.git", ssh = "git@ghe.corp.example:{owner}/{repo}.git" }
+"#;
+        let hosts = hosts_of(host_toml);
+        let source = source_of(
+            r#"
+version = 1
+
+[sources.tropos]
+host = "github"
+path = "srnnkls/tropos"
+"#,
+            "tropos",
+        );
+
+        let https = source
+            .resolved_remote(&hosts, Protocol::Https)
+            .expect("override resolves");
+        assert_eq!(
+            https, "https://ghe.corp.example/srnnkls/tropos.git",
+            "a user [hosts.github] must override the built-in github forge in resolved_remote"
+        );
+
+        let ssh = source
+            .resolved_remote(&hosts, Protocol::Ssh)
+            .expect("override resolves under ssh");
+        assert_eq!(
+            ssh, "git@ghe.corp.example:srnnkls/tropos.git",
+            "the user [hosts.github] ssh template must override the built-in github ssh shape too, \
+             not fall back to git@github.com"
+        );
+    }
+
+    #[test]
+    fn resolved_remote_git_mode_returns_literal_verbatim_ignoring_protocol() {
+        let source = source_of(
+            r#"
+version = 1
+
+[sources.dotfiles]
+git = "https://example.com/me/dotfiles.git"
+"#,
+            "dotfiles",
+        );
+        let no_user_hosts: BTreeMap<String, Host> = BTreeMap::new();
+
+        assert_eq!(
+            source
+                .resolved_remote(&no_user_hosts, Protocol::Https)
+                .expect("git-mode resolves"),
+            "https://example.com/me/dotfiles.git",
+            "a git-mode source returns its literal git verbatim under https"
+        );
+        assert_eq!(
+            source
+                .resolved_remote(&no_user_hosts, Protocol::Ssh)
+                .expect("git-mode resolves under ssh too"),
+            "https://example.com/me/dotfiles.git",
+            "a git-mode source ignores protocol: the literal git is returned verbatim under ssh"
+        );
+    }
+
+    #[test]
+    fn resolved_remote_unknown_host_errors() {
+        let source = source_of(
+            r#"
+version = 1
+
+[sources.tropos]
+host = "ghost"
+path = "srnnkls/tropos"
+"#,
+            "tropos",
+        );
+        let no_user_hosts: BTreeMap<String, Host> = BTreeMap::new();
+
+        let err = source
+            .resolved_remote(&no_user_hosts, Protocol::Https)
+            .expect_err("an unknown host (no built-in, no user def) must error");
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("ghost") && msg.contains("tropos"),
+                "the unknown-host error must name BOTH the offending source and the host, \
+                 consistent with HAS-001's validate() wording \
+                 (`source `tropos` references unknown host `ghost``), got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolved_remote_ssh_without_ssh_template_errors() {
+        let host_toml = r#"
+version = 1
+
+[hosts.github]
+remote = "https://github.com/{owner}/{repo}.git"
+"#;
+        let hosts = hosts_of(host_toml);
+        let source = source_of(
+            r#"
+version = 1
+
+[sources.tropos]
+host = "github"
+path = "srnnkls/tropos"
+"#,
+            "tropos",
+        );
+
+        let err = source
+            .resolved_remote(&hosts, Protocol::Ssh)
+            .expect_err("protocol = ssh against an https-only remote must error");
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("github") && (msg.contains("ssh") || msg.contains("template")),
+                "the missing-template error must NAME the offending host AND indicate the missing \
+                 ssh/template; an error that merely contains \"ssh\" without naming the host \
+                 must fail this test, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builtin_forges_ship_all_five_with_both_shapes() {
+        let forges = builtin_forges();
+        for name in ["github", "gitlab", "codeberg", "sr.ht", "bitbucket"] {
+            let host = forges
+                .get(name)
+                .unwrap_or_else(|| panic!("built-in forge `{name}` must ship"));
+            let remote = host
+                .remote
+                .as_ref()
+                .unwrap_or_else(|| panic!("built-in forge `{name}` must carry a remote"));
+            assert!(
+                remote.https_template().is_some(),
+                "built-in forge `{name}` must ship an https shape"
+            );
+            assert!(
+                remote.ssh_template().is_some(),
+                "built-in forge `{name}` must ship an ssh shape"
+            );
+        }
     }
 }
