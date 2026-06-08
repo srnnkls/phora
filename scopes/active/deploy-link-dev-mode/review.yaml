@@ -79,6 +79,34 @@ batch_reviews:
       (link deploy still flows through deploy_one/export) are DLD-004 scope (deploy-closure dispatch),
       not DLD-003 defects — recorded against DLD-004 below.
 
+  - batch: 2c
+    timestamp: 2026-06-08
+    tasks: [DLD-009]
+    phase_a5_test_review:
+      harnesses: [claude-opus (orchestrator inspection), pi]
+      result: pass
+      note: "fetch_count==0/digest_count==0 confirmed substantive; resolve_count==0 implied (fetch+resolve share the bypassed match arm)."
+    reviewers:
+      - id: general+arch+style-claude-opus
+        status: success
+        gates: { correctness: pass, architecture: pass, style: pass }
+      - id: general+arch+style-pi
+        status: success
+        gates: { correctness: pass (deploy-path finding is DLD-004 scope), architecture: pass, style: pass }
+    synthesized:
+      gates: { correctness: pass, architecture: pass, style: pass }
+      critical_issues: 0
+      high_issues: 0
+      medium_issues: 0
+    outcome: approved
+    notes: >
+      resolve_sources DeployMode::Link carve-out (continue before fetch/resolve/compute_digest) +
+      read_local_head (gix HEAD, 'link' sentinel fallback for non-repo). Synthesized audit LockedSource
+      (resolved='link', git=local path, commit=HEAD, digest='link:' sentinel). 255 lib tests green,
+      clippy clean. Verified: link sources hit the carve-out before source_matches; 'link:' digest is
+      only string-compared (never Digest::parse'd). Pi's "critical" deploy-path finding is DLD-004
+      (deploy-closure dispatch), not a DLD-009 defect — see DLD-003-N1.
+
 issues:
   critical: []
   high: []
