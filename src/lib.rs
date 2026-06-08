@@ -19,6 +19,7 @@
 pub mod cli;
 pub mod config;
 pub mod error;
+pub mod import_legacy;
 pub mod lock;
 pub mod matcher;
 pub mod paths;
