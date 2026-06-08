@@ -61,7 +61,7 @@ tasks:
 
   - id: HAS-004
     content: "add writes symbolic host/path (both writer paths)"
-    status: pending
+    status: done
     activeForm: "Making add persist the alias"
     depends_on: [HAS-001]
     review_fixes:
