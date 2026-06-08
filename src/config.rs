@@ -1,7 +1,7 @@
 //! Config DTOs (`phora.toml`). This module is a boundary, so it carries serde.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 
 use serde::Deserialize;
 
@@ -18,6 +18,39 @@ pub struct Config {
     pub sources: BTreeMap<String, Source>,
     #[serde(default)]
     pub targets: BTreeMap<String, Target>,
+    #[serde(default)]
+    pub worktree: Option<WorktreeConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorktreeConfig {
+    #[serde(default)]
+    pub includes: Vec<Include>,
+}
+
+impl WorktreeConfig {
+    #[must_use]
+    #[allow(clippy::unused_self)] // local wins wholesale; `self` kept to mirror the sibling merged_with API
+    fn merged_with(self, local: WorktreeConfig) -> WorktreeConfig {
+        local
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Include {
+    pub path: PathBuf,
+    #[serde(default)]
+    pub mode: IncludeMode,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IncludeMode {
+    #[default]
+    Symlink,
+    Copy,
 }
 
 impl Config {
@@ -26,7 +59,9 @@ impl Config {
     /// # Errors
     ///
     /// Returns [`Error::Config`] if the document is not valid TOML, contains an
-    /// unknown key, or a source sets more than one of `branch`/`tag`/`rev`.
+    /// unknown key, a source sets more than one of `branch`/`tag`/`rev`, or a
+    /// worktree include path is empty, absolute, or contains a `.` or `..`
+    /// component.
     pub fn parse(s: &str) -> Result<Self> {
         let config: Self = toml::from_str(s).map_err(|e| Error::Config(e.to_string()))?;
         for (name, source) in &config.sources {
@@ -37,6 +72,38 @@ impl Config {
                 return Err(Error::Config(format!(
                     "source `{name}` sets more than one of branch/tag/rev"
                 )));
+            }
+        }
+        if let Some(worktree) = &config.worktree {
+            for include in &worktree.includes {
+                let path = &include.path;
+                if path.as_os_str().is_empty() {
+                    return Err(Error::Config(
+                        "worktree include path must not be empty".to_owned(),
+                    ));
+                }
+                if path.is_absolute() {
+                    return Err(Error::Config(format!(
+                        "worktree include path `{}` must be relative, not absolute",
+                        path.display()
+                    )));
+                }
+                if path.components().any(|c| matches!(c, Component::ParentDir)) {
+                    return Err(Error::Config(format!(
+                        "worktree include path `{}` must not contain a `..` component",
+                        path.display()
+                    )));
+                }
+                if path
+                    .to_string_lossy()
+                    .split(['/', '\\'])
+                    .any(|segment| segment == ".")
+                {
+                    return Err(Error::Config(format!(
+                        "worktree include path `{}` must not contain a `.` component",
+                        path.display()
+                    )));
+                }
             }
         }
         Ok(config)
@@ -78,6 +145,12 @@ pub fn merge_configs(base: Config, local: Option<Config>) -> Config {
                 merged.targets.insert(name, target);
             }
         }
+    }
+    if let Some(local_wt) = local.worktree {
+        merged.worktree = Some(match merged.worktree {
+            Some(base_wt) => base_wt.merged_with(local_wt),
+            None => local_wt,
+        });
     }
     merged
 }
@@ -1173,5 +1246,328 @@ deploy = "wormhole"
             Config::parse(EXAMPLE_TOML).is_ok(),
             "a single-refspec, no-unknown-keys config must parse cleanly"
         );
+    }
+
+    // WTI-001: [worktree].includes config + IncludeMode
+
+    fn worktree_includes(cfg: &Config) -> &[Include] {
+        cfg.worktree
+            .as_ref()
+            .map_or(&[][..], |w| w.includes.as_slice())
+    }
+
+    #[test]
+    fn worktree_include_omitted_mode_defaults_to_symlink() {
+        let cfg = Config::parse(
+            r#"
+version = 1
+
+[[worktree.includes]]
+path = ".envrc"
+
+[[worktree.includes]]
+path = "secrets/local.env"
+mode = "copy"
+"#,
+        )
+        .expect("worktree includes should parse");
+
+        let includes = worktree_includes(&cfg);
+        assert_eq!(includes.len(), 2, "both includes must parse");
+        assert_eq!(includes[0].path, PathBuf::from(".envrc"));
+        assert_eq!(
+            includes[0].mode,
+            IncludeMode::Symlink,
+            "an omitted `mode` must default to Symlink, not Copy"
+        );
+        assert_eq!(includes[1].path, PathBuf::from("secrets/local.env"));
+        assert_eq!(
+            includes[1].mode,
+            IncludeMode::Copy,
+            "mode = \"copy\" must parse to IncludeMode::Copy"
+        );
+    }
+
+    #[test]
+    fn worktree_section_absent_is_none() {
+        let cfg = Config::parse(EXAMPLE_TOML).expect("example without [worktree] still parses");
+        assert!(
+            cfg.worktree.is_none(),
+            "an absent [worktree] section must yield None"
+        );
+        assert!(
+            worktree_includes(&cfg).is_empty(),
+            "no [worktree] means no includes"
+        );
+    }
+
+    #[test]
+    fn merge_local_worktree_replaces_base_includes() {
+        let base = Config::parse(
+            r#"
+version = 1
+
+[[worktree.includes]]
+path = "a"
+"#,
+        )
+        .expect("base parses");
+        let local = Config::parse(
+            r#"
+version = 1
+
+[[worktree.includes]]
+path = "b"
+"#,
+        )
+        .expect("local parses");
+
+        let effective = merge_configs(base, Some(local));
+        let includes = worktree_includes(&effective);
+        assert_eq!(
+            includes.len(),
+            1,
+            "local [worktree] must replace the base array, never concatenate"
+        );
+        assert_eq!(
+            includes[0].path,
+            PathBuf::from("b"),
+            "only the local include `b` must survive the replace"
+        );
+    }
+
+    #[test]
+    fn merge_local_empty_worktree_includes_clears_base() {
+        let base = Config::parse(
+            r#"
+version = 1
+
+[[worktree.includes]]
+path = "a"
+
+[[worktree.includes]]
+path = "b"
+"#,
+        )
+        .expect("base parses");
+        let local = Config::parse(
+            r"
+version = 1
+
+[worktree]
+includes = []
+",
+        )
+        .expect("local parses");
+
+        let effective = merge_configs(base, Some(local));
+        assert!(
+            worktree_includes(&effective).is_empty(),
+            "an explicit empty `includes = []` in local [worktree] must replace (clear) the base \
+             includes, not be ignored as if unset"
+        );
+    }
+
+    #[test]
+    fn merge_without_local_worktree_preserves_base_worktree() {
+        let base = Config::parse(
+            r#"
+version = 1
+
+[[worktree.includes]]
+path = "a"
+"#,
+        )
+        .expect("base parses");
+        let local = Config::parse(
+            r#"
+version = 1
+
+[sources.extra]
+git = "/home/soeren/dev/extra"
+"#,
+        )
+        .expect("local parses");
+
+        let effective = merge_configs(base, Some(local));
+        let includes = worktree_includes(&effective);
+        assert_eq!(
+            includes.len(),
+            1,
+            "a local config without [worktree] must preserve the base [worktree]"
+        );
+        assert_eq!(includes[0].path, PathBuf::from("a"));
+    }
+
+    #[test]
+    fn absolute_include_path_is_rejected() {
+        let toml = r#"
+version = 1
+
+[[worktree.includes]]
+path = "/etc/passwd"
+"#;
+        let err = Config::parse(toml).expect_err("an absolute include path must be rejected");
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("/etc/passwd"),
+                "error should name the offending absolute path, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn traversal_include_path_is_rejected() {
+        let toml = r#"
+version = 1
+
+[[worktree.includes]]
+path = "../outside/secret"
+"#;
+        let err = Config::parse(toml)
+            .expect_err("a leading `..` traversal include path must be rejected");
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("../outside/secret"),
+                "error should name the offending traversal path, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interior_traversal_include_path_is_rejected() {
+        let toml = r#"
+version = 1
+
+[[worktree.includes]]
+path = "sub/../../escape"
+"#;
+        let err = Config::parse(toml)
+            .expect_err("an interior `..` segment must be rejected, not just a leading one");
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("sub/../../escape"),
+                "error should name the offending path; an interior `..` segment must be caught \
+                 by component-wise scanning, not a naive starts_with(\"..\") guard, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_include_path_is_rejected() {
+        let toml = r#"
+version = 1
+
+[[worktree.includes]]
+path = ""
+"#;
+        let err = Config::parse(toml).expect_err("an empty include path must be rejected");
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("empty"),
+                "error should make clear the path is empty, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn current_dir_include_path_is_rejected() {
+        let toml = r#"
+version = 1
+
+[[worktree.includes]]
+path = "."
+"#;
+        let err = Config::parse(toml).expect_err(
+            "a lone `.` include path must be rejected; it would link the worktree root",
+        );
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains('.'),
+                "error should name the offending `.` path, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interior_current_dir_include_path_is_rejected() {
+        let toml = r#"
+version = 1
+
+[[worktree.includes]]
+path = "a/./b"
+"#;
+        let err = Config::parse(toml).expect_err(
+            "an interior `.` segment must be rejected as a non-canonical relative path",
+        );
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("a/./b"),
+                "error should name the offending path; an interior `.` segment must be caught \
+                 by component-wise scanning, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_include_mode_value_is_rejected_naming_it() {
+        let toml = r#"
+version = 1
+
+[[worktree.includes]]
+path = ".envrc"
+mode = "hardlink"
+"#;
+        let err = Config::parse(toml).expect_err("unknown include mode must be rejected");
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("hardlink"),
+                "error should name the offending mode value, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_worktree_key_is_rejected_naming_it() {
+        let toml = r#"
+version = 1
+
+[worktree]
+bogus = "value"
+"#;
+        let err = Config::parse(toml).expect_err("unknown [worktree] key must be rejected");
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("bogus"),
+                "error should name the offending key, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_include_key_is_rejected_naming_it() {
+        let toml = r#"
+version = 1
+
+[[worktree.includes]]
+path = ".envrc"
+destination = "elsewhere"
+"#;
+        let err = Config::parse(toml).expect_err("unknown include key must be rejected");
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("destination"),
+                "error should name the offending key, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
     }
 }
