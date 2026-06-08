@@ -30,6 +30,8 @@ rev = "9f1c2ab"
 root = "languages"
 allow_symlinks = false
 preserve_executable = true
+# For a local dev loop, override this source onto a local checkout and live-link
+# it via `deploy = "link"` — local-overlay-only. See phora.local.example.toml.
 
 # A target is a directory artifacts are projected into. Omit `sources` to take all.
 [targets.neovim]

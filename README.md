@@ -115,7 +115,8 @@ auth. `github` and `gitlab` are built in. Auth is either
 `{ type = "token", env = "VAR" }` or `{ type = "ssh", key = "~/.ssh/key" }`.
 
 **Source flags:** `allow_symlinks`, `allow_submodules` (both default off),
-`preserve_executable` (default on).
+`preserve_executable` (default on), `deploy` (`"copy"` | `"link"`, default
+`"copy"`; `"link"` is local-overlay-only — see [Link mode](#link-mode-local-development)).
 
 **Layouts** decide how an artifact `a` from source `s` is placed in a target:
 
@@ -124,6 +125,43 @@ auth. `github` and `gitlab` are built in. Auth is either
 | `flat` (default)                | `a`         |
 | `by-source`                     | `s/a`       |
 | `{ type = "prefixed", sep="-" }`| `s-a`       |
+
+### Link mode (local development)
+
+By default `deploy = "copy"` materializes a reflink-style copy of each artifact
+from the committed git ODB — point-in-time, content-hashed, verifiable. For a
+tight dev loop, `deploy = "link"` instead **symlinks** the artifact destination
+at the source's live working tree (`<source path>/<root>/<artifact>`, absolute).
+Uncommitted edits in the checkout are visible through the target immediately, with
+no re-sync.
+
+Two guardrails apply:
+
+- **Local overlay only.** `deploy = "link"` is honored only in `phora.local.toml`.
+  Setting it in the committed `phora.toml` is a config error that names the source.
+  Keep it out of shared config.
+- **Local path only.** A link source's `git` must be a local filesystem path
+  (absolute, or an existing relative path). `deploy = "link"` on a remote URL is a
+  config error.
+
+Linked artifacts sit **outside the integrity model**: their registry record carries
+a `linked` marker and no per-file hashes. `phora verify` skips them, drift detection
+never reports them modified or foreign, `phora list` shows them as `linked`, and
+`phora rebuild-registry` reconstructs the marker without hashing. `--prune` removes
+an orphaned linked artifact by deleting the symlink only. If the working-tree target
+is deleted or renamed the link reads as missing and is redeployed on the next sync.
+Switching a source between `link` and `copy` replaces the destination on the next
+sync (symlink ⇄ materialized copy, with full integrity restored on `copy`). If a
+symlink cannot be created (e.g. on Windows without the privilege), phora warns,
+skips that artifact, and continues the rest of the sync.
+
+```toml
+# phora.local.toml — overlays phora.toml, never committed.
+# Override the `loqui` source onto a local checkout and live-link it.
+[sources.loqui]
+git = "/home/me/dev/loqui"   # local path; the live working tree
+deploy = "link"
+```
 
 ## Development
 
