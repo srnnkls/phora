@@ -27,7 +27,7 @@ tasks:
 
   - id: HAS-002
     content: "Resolver: Protocol + resolved_remote + ONE built-in forge registry"
-    status: pending
+    status: done
     activeForm: "Implementing host/protocol remote resolution"
     depends_on: [HAS-001]
     review_fixes:

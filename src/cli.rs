@@ -6,7 +6,7 @@ use std::path::Path;
 
 use clap::{Parser, Subcommand};
 
-use crate::config::{Config, Host, Source};
+use crate::config::{Config, Host, Source, builtin_forges, fill_template};
 use crate::error::{Error, Result};
 use crate::lock::{Lock, merge_locks};
 use crate::matcher::PathMatcher;
@@ -627,8 +627,8 @@ pub struct ParsedSource {
     pub root: Option<String>,
 }
 
-/// Expands an `add` URL/shorthand into a [`ParsedSource`] using built-in
-/// `github`/`gitlab` host templates plus any host in `hosts`.
+/// Expands an `add` URL/shorthand into a [`ParsedSource`] using the built-in
+/// forge registry overlaid by any host in `hosts`.
 ///
 /// # Errors
 ///
@@ -645,18 +645,11 @@ pub fn parse_add_url(input: &str, hosts: &BTreeMap<String, Host>) -> Result<Pars
     parse_shorthand(input, &templates)
 }
 
-/// `(domain, git_url template)` pairs from built-in defaults overlaid by `hosts`.
+/// `(domain, git_url template)` pairs from the built-in forge registry overlaid by `hosts`.
 fn host_templates(hosts: &BTreeMap<String, Host>) -> Vec<(String, String)> {
     let mut templates: BTreeMap<String, String> = BTreeMap::new();
-    templates.insert(
-        "github".to_owned(),
-        "https://github.com/{owner}/{repo}.git".to_owned(),
-    );
-    templates.insert(
-        "gitlab".to_owned(),
-        "https://gitlab.com/{owner}/{repo}.git".to_owned(),
-    );
-    for (name, host) in hosts {
+    let builtins = builtin_forges();
+    for (name, host) in builtins.iter().chain(hosts) {
         if let Some(remote) = &host.remote
             && let Some(url) = remote.https_template()
         {
@@ -751,7 +744,7 @@ fn parse_shorthand(input: &str, templates: &[(String, String)]) -> Result<Parsed
         };
         return Ok(ParsedSource {
             name: (*repo).to_owned(),
-            git: expand_template(template, owner, repo),
+            git: fill_template(template, &format!("{owner}/{repo}")),
             branch: None,
             root: join_root(root_segments),
         });
@@ -762,10 +755,14 @@ fn parse_shorthand(input: &str, templates: &[(String, String)]) -> Result<Parsed
             "expected <owner>/<repo> shorthand in `{input}`"
         )));
     };
-    let template = "https://github.com/{owner}/{repo}.git";
+    let template = builtin_forges()
+        .get("github")
+        .and_then(|h| h.remote.as_ref())
+        .and_then(|r| r.https_template().map(str::to_owned))
+        .ok_or_else(|| Error::Config("built-in github forge has no https template".to_owned()))?;
     Ok(ParsedSource {
         name: (*repo).to_owned(),
-        git: expand_template(template, owner, repo),
+        git: fill_template(&template, &format!("{owner}/{repo}")),
         branch: None,
         root: join_root(root_segments),
     })
@@ -773,10 +770,6 @@ fn parse_shorthand(input: &str, templates: &[(String, String)]) -> Result<Parsed
 
 fn join_root(segments: &[&str]) -> Option<String> {
     (!segments.is_empty()).then(|| segments.join("/"))
-}
-
-fn expand_template(template: &str, owner: &str, repo: &str) -> String {
-    template.replace("{owner}", owner).replace("{repo}", repo)
 }
 
 fn repo_name(input: &str) -> String {
@@ -1487,6 +1480,41 @@ mod tests {
             "a gitlab shorthand carries no branch"
         );
         assert!(parsed.root.is_none(), "a gitlab shorthand carries no root");
+    }
+
+    #[test]
+    fn codeberg_shorthand_resolves_via_unified_builtin_registry() {
+        let parsed = parse("codeberg.org/owner/repo");
+        assert_eq!(
+            parsed.git, "https://codeberg.org/owner/repo.git",
+            "codeberg.org shorthand must resolve via the SINGLE built-in forge registry; \
+             host_templates is no longer a second hardcoded {{github,gitlab}} list"
+        );
+        assert_eq!(parsed.name, "repo");
+    }
+
+    #[test]
+    fn bitbucket_shorthand_resolves_via_unified_builtin_registry() {
+        let parsed = parse("bitbucket.org/owner/repo");
+        assert_eq!(
+            parsed.git, "https://bitbucket.org/owner/repo.git",
+            "bitbucket was NEVER in the old hardcoded {{github,gitlab}} host_templates list; \
+             it can only resolve if host_templates derives from builtin_forges() (the loop), \
+             not from a minimally-extended second list"
+        );
+        assert_eq!(parsed.name, "repo");
+    }
+
+    #[test]
+    fn srht_shorthand_resolves_via_unified_builtin_registry() {
+        let parsed = parse_add_url("git.sr.ht/~rjarry/aerc", &no_hosts())
+            .expect("sr.ht shorthand resolves");
+        assert_eq!(
+            parsed.git, "https://git.sr.ht/~rjarry/aerc",
+            "git.sr.ht shorthand must resolve via the SINGLE built-in forge registry to the \
+             sr.ht `{{path}}` shape: no `.git` suffix and the `~` owner preserved"
+        );
+        assert_eq!(parsed.name, "aerc");
     }
 
     #[test]

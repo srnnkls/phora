@@ -1268,6 +1268,48 @@ mod tests {
     }
 
     #[test]
+    fn symbolic_https_ssh_and_literal_collapse_to_one_mirror_key() {
+        use std::collections::BTreeMap;
+
+        use crate::config::{Config, Host};
+
+        let symbolic = Config::parse(
+            r#"
+version = 1
+
+[sources.tropos]
+host = "github"
+path = "srnnkls/tropos"
+"#,
+        )
+        .expect("symbolic config parses");
+        let source = symbolic.sources.get("tropos").expect("tropos source");
+        let no_user_hosts: BTreeMap<String, Host> = BTreeMap::new();
+
+        let symbolic_https = source
+            .resolved_remote(&no_user_hosts, Protocol::Https)
+            .expect("symbolic github https resolves");
+        let symbolic_ssh = source
+            .resolved_remote(&no_user_hosts, Protocol::Ssh)
+            .expect("symbolic github ssh resolves");
+        let literal_https = "https://github.com/srnnkls/tropos.git";
+
+        let key = |remote: &str| MirrorKey::from_url(&NormalizedUrl::parse(remote));
+
+        assert_eq!(
+            key(&symbolic_https),
+            key(&symbolic_ssh),
+            "flipping protocol must not change the mirror: symbolic https and ssh of one repo \
+             must share a MirrorKey"
+        );
+        assert_eq!(
+            key(&symbolic_https),
+            key(literal_https),
+            "a symbolic host+path source and its literal-URL twin must collapse to one MirrorKey"
+        );
+    }
+
+    #[test]
     fn mirror_key_is_sixteen_hex_chars() {
         let key = MirrorKey::from_url(&NormalizedUrl::parse("https://github.com/user/repo.git"));
         assert_eq!(key.as_str().len(), 16);
