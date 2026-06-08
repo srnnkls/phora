@@ -4,7 +4,7 @@ created: 2026-06-07
 depends_on_scope: deploy-link-dev-mode
 
 ambiguity_scan:
-  scope:        clear     # symlink/copy back-references into primary; submodules explicitly excluded
+  scope:        clear     # symlink/copy back-references into primary; submodules supported (dir-symlink auto-infer + submodule-walk)
   behavior:     clear     # idempotent apply, merge overlay, modes defined
   data_model:   clear     # [worktree].includes = [{ path, mode }]; stateless (no registry)
   constraints:  clear     # primary no-op, tracked-path refusal, absolute symlinks, warn-and-continue
@@ -14,9 +14,10 @@ ambiguity_scan:
 
 decisions:
   - id: submodules
-    question: "How to handle submodule-walk entries?"
-    resolution: "Dropped. phora replaces submodules; declare them as phora sources instead. No submodule mode."
+    question: "How to handle submodule entries?"
+    resolution: "SUPPORTED (reversal, user-confirmed 2026-06-08). Two modes: Symlink/default on a gitlink auto-infers a dir-symlink to the submodule worktree; explicit mode=submodule-walk descends per-leaf; copy on a gitlink warns+skips. Gitlinks are exempt from the tracked-path guard. import-legacy maps the legacy `submodule-walk` attribute to mode=submodule-walk."
     confirmed_by: user
+    superseded: "Earlier 'Dropped — declare submodules as phora sources; no submodule mode' (the source-migration path remains available but is no longer the only option)."
   - id: structure
     question: "Relation to deploy-link-dev-mode?"
     resolution: "DECOUPLED (post-review H1). Own IncludeMode + own ~5-line atomic placement helper; reuse only projection::copy_file. No dependency on deploy-link's draft tasks."
