@@ -56,7 +56,7 @@ tasks:
 
   - id: DLD-004
     content: "Link deployment: own lean atomic symlink, dispatched in orchestration"
-    status: pending
+    status: done
     activeForm: "Implementing atomic symlink deployment"
     depends_on: [DLD-003, DLD-005]
     review_fixes:
