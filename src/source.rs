@@ -1180,10 +1180,7 @@ mod tests {
         }
     }
 
-    #[expect(
-        clippy::unwrap_used,
-        reason = "tempdir setup fails loudly in tests"
-    )]
+    #[expect(clippy::unwrap_used, reason = "tempdir setup fails loudly in tests")]
     #[test]
     fn is_local_path_accepts_existing_relative_path() {
         let nonce = format!(

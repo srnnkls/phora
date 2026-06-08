@@ -1138,7 +1138,8 @@ branch = "main"
     #[test]
     fn config_digest_ignores_deploy_for_lock_stability() {
         let without = parse_source("root = \"languages\"\ninclude = [\"editor\"]\n");
-        let with_link = parse_source("root = \"languages\"\ninclude = [\"editor\"]\ndeploy = \"link\"\n");
+        let with_link =
+            parse_source("root = \"languages\"\ninclude = [\"editor\"]\ndeploy = \"link\"\n");
         assert_eq!(
             with_link.config_digest(),
             without.config_digest(),
