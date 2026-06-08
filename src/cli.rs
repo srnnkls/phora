@@ -6,14 +6,14 @@ use std::path::Path;
 
 use clap::{Parser, Subcommand};
 
-use crate::config::{Config, Host, Source, builtin_forges, fill_template};
+use crate::config::{Config, Host, Source, builtin_forges};
 use crate::error::{Error, Result};
 use crate::lock::{Lock, merge_locks};
 use crate::matcher::PathMatcher;
 use crate::paths::{ProjectId, phora_dir};
 use crate::projection::{ArtifactState, check_artifact_state};
 use crate::registry::{FileRegistry, Registry};
-use crate::source::GitBackend;
+use crate::source::{GitBackend, Protocol};
 use crate::sync::{Conflict, ConflictResolver, Resolution, SyncInput, SyncOutput, sync};
 
 #[derive(Parser, Debug)]
@@ -242,16 +242,16 @@ fn run_add(
     let hosts = load_config().map(|c| c.hosts).unwrap_or_default();
     let parsed = parse_add_url(url, &hosts)?;
 
-    let name = name.unwrap_or(parsed.name);
-    let branch = branch.or(parsed.branch);
-    let root = root.or(parsed.root);
+    let name = name.unwrap_or_else(|| parsed.name.clone());
+    let branch = branch.or_else(|| parsed.branch.clone());
+    let root = root.or_else(|| parsed.root.clone());
 
     let doc_text =
         std::fs::read_to_string("phora.toml").unwrap_or_else(|_| "version = 1\n".to_owned());
     let updated = insert_source_with_ref(
         &doc_text,
         &name,
-        &parsed.git,
+        &parsed,
         branch.as_deref(),
         tag.as_deref(),
         root.as_deref(),
@@ -261,14 +261,22 @@ fn run_add(
     let refspec = tag
         .or(branch)
         .map_or_else(String::new, |r| format!(" ({r})"));
-    println!("Added source '{name}': {}{refspec}", parsed.git);
+    println!("Added source '{name}': {}{refspec}", describe_source(&parsed));
     Ok(())
+}
+
+fn describe_source(source: &ParsedSource) -> String {
+    match (&source.git, &source.host, &source.path) {
+        (Some(git), _, _) => git.clone(),
+        (None, Some(host), Some(path)) => format!("{host}:{path}"),
+        _ => source.name.clone(),
+    }
 }
 
 fn insert_source_with_ref(
     doc_text: &str,
     name: &str,
-    git: &str,
+    source: &ParsedSource,
     branch: Option<&str>,
     tag: Option<&str>,
     root: Option<&str>,
@@ -277,21 +285,38 @@ fn insert_source_with_ref(
         .parse::<toml_edit::DocumentMut>()
         .map_err(|e| Error::Config(format!("parse phora.toml: {e}")))?;
 
-    let mut table = toml_edit::Table::new();
-    table["git"] = toml_edit::value(git);
+    let mut table = source_table(source);
     if let Some(branch) = branch {
         table["branch"] = toml_edit::value(branch);
     }
     if let Some(tag) = tag {
         table["tag"] = toml_edit::value(tag);
     }
-    if let Some(root) = root {
+    if let Some(root) = root.or(source.root.as_deref()) {
         table["root"] = toml_edit::value(root);
     }
 
     ensure_sources_table(&mut doc);
     doc["sources"][name] = toml_edit::Item::Table(table);
     Ok(doc.to_string())
+}
+
+fn source_table(source: &ParsedSource) -> toml_edit::Table {
+    let mut table = toml_edit::Table::new();
+    if let Some(git) = &source.git {
+        table["git"] = toml_edit::value(git.as_str());
+        return table;
+    }
+    if let Some(host) = &source.host {
+        table["host"] = toml_edit::value(host.as_str());
+    }
+    if let Some(path) = &source.path {
+        table["path"] = toml_edit::value(path.as_str());
+    }
+    if let Some(Protocol::Ssh) = source.protocol {
+        table["protocol"] = toml_edit::value("ssh");
+    }
+    table
 }
 
 fn ensure_sources_table(doc: &mut toml_edit::DocumentMut) {
@@ -618,11 +643,15 @@ pub fn check_match_cmd(source: &Source, path: &str) -> CheckMatchReport {
     }
 }
 
-/// A source derived from an `add` URL/shorthand, before name overrides.
+/// A source derived from an `add` URL/shorthand, before name overrides. Either
+/// literal (`git` is `Some`) or symbolic (`host`/`path` are `Some`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedSource {
     pub name: String,
-    pub git: String,
+    pub git: Option<String>,
+    pub host: Option<String>,
+    pub path: Option<String>,
+    pub protocol: Option<Protocol>,
     pub branch: Option<String>,
     pub root: Option<String>,
 }
@@ -634,35 +663,58 @@ pub struct ParsedSource {
 ///
 /// Returns [`Error::Config`] if the input cannot be parsed into owner/repo.
 pub fn parse_add_url(input: &str, hosts: &BTreeMap<String, Host>) -> Result<ParsedSource> {
-    let templates = host_templates(hosts);
-
     if is_scp_ssh(input) {
         return Ok(parse_scp_ssh(input));
     }
     if let Some((scheme, rest)) = split_scheme(input) {
         return parse_full_url(input, scheme, rest);
     }
-    parse_shorthand(input, &templates)
+    if let Some((host, path)) = input.split_once(':') {
+        return parse_colon_alias(input, host, path);
+    }
+    parse_shorthand(input, &domain_to_name(hosts))
 }
 
-/// `(domain, git_url template)` pairs from the built-in forge registry overlaid by `hosts`.
-fn host_templates(hosts: &BTreeMap<String, Host>) -> Vec<(String, String)> {
-    let mut templates: BTreeMap<String, String> = BTreeMap::new();
-    let builtins = builtin_forges();
-    for (name, host) in builtins.iter().chain(hosts) {
-        if let Some(remote) = &host.remote
-            && let Some(url) = remote.https_template()
-        {
-            templates.insert(name.clone(), url.to_owned());
-        }
+fn parse_colon_alias(input: &str, host: &str, path: &str) -> Result<ParsedSource> {
+    if host.is_empty() {
+        return Err(Error::Config(format!("empty host in `{input}`")));
     }
-    templates
-        .into_values()
-        .filter_map(|url| {
-            let domain = template_domain(&url)?.to_owned();
-            Some((domain, url))
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let [owner, repo, root_segments @ ..] = segments.as_slice() else {
+        return Err(Error::Config(format!(
+            "expected <host>:<owner>/<repo> in `{input}`"
+        )));
+    };
+    Ok(symbolic_source(
+        host.to_owned(),
+        &format!("{owner}/{repo}"),
+        join_root(root_segments),
+    ))
+}
+
+/// `domain -> forge name` from the built-in forge registry overlaid by `hosts`.
+fn domain_to_name(hosts: &BTreeMap<String, Host>) -> BTreeMap<String, String> {
+    let builtins = builtin_forges();
+    builtins
+        .iter()
+        .chain(hosts)
+        .filter_map(|(name, host)| {
+            let url = host.remote.as_ref()?.https_template()?;
+            Some((template_domain(url)?.to_owned(), name.clone()))
         })
         .collect()
+}
+
+fn symbolic_source(host: String, path: &str, root: Option<String>) -> ParsedSource {
+    ParsedSource {
+        name: repo_name(path),
+        git: None,
+        host: Some(host),
+        path: Some(path.to_owned()),
+        protocol: None,
+        branch: None,
+        root,
+    }
 }
 
 /// The host domain embedded in a `git_url` template (between scheme/user and the
@@ -688,11 +740,23 @@ fn is_scp_ssh(input: &str) -> bool {
 }
 
 fn parse_scp_ssh(input: &str) -> ParsedSource {
+    literal_source(repo_name(input), input.to_owned(), None, None)
+}
+
+fn literal_source(
+    name: String,
+    git: String,
+    branch: Option<String>,
+    root: Option<String>,
+) -> ParsedSource {
     ParsedSource {
-        name: repo_name(input),
-        git: input.to_owned(),
-        branch: None,
-        root: None,
+        name,
+        git: Some(git),
+        host: None,
+        path: None,
+        protocol: None,
+        branch,
+        root,
     }
 }
 
@@ -714,40 +778,37 @@ fn parse_full_url(input: &str, scheme: &str, rest: &str) -> Result<ParsedSource>
     let name = strip_git(repo).to_owned();
 
     if let ["tree", git_ref, root_segments @ ..] = tail {
-        return Ok(ParsedSource {
+        return Ok(literal_source(
             name,
-            git: with_git_suffix(&format!("{scheme}://{host}/{owner}/{repo}")),
-            branch: Some((*git_ref).to_owned()),
-            root: join_root(root_segments),
-        });
+            with_git_suffix(&format!("{scheme}://{host}/{owner}/{repo}")),
+            Some((*git_ref).to_owned()),
+            join_root(root_segments),
+        ));
     }
 
-    Ok(ParsedSource {
-        name,
-        git: with_git_suffix(input),
-        branch: None,
-        root: None,
-    })
+    Ok(literal_source(name, with_git_suffix(input), None, None))
 }
 
-fn parse_shorthand(input: &str, templates: &[(String, String)]) -> Result<ParsedSource> {
+fn parse_shorthand(
+    input: &str,
+    domains: &BTreeMap<String, String>,
+) -> Result<ParsedSource> {
     let segments: Vec<&str> = input.split('/').filter(|s| !s.is_empty()).collect();
     let first = segments
         .first()
         .ok_or_else(|| Error::Config(format!("empty add target `{input}`")))?;
 
-    if let Some((_, template)) = templates.iter().find(|(domain, _)| domain == first) {
+    if let Some(name) = domains.get(*first) {
         let [_, owner, repo, root_segments @ ..] = segments.as_slice() else {
             return Err(Error::Config(format!(
                 "expected <host>/<owner>/<repo> in `{input}`"
             )));
         };
-        return Ok(ParsedSource {
-            name: (*repo).to_owned(),
-            git: fill_template(template, &format!("{owner}/{repo}")),
-            branch: None,
-            root: join_root(root_segments),
-        });
+        return Ok(symbolic_source(
+            name.clone(),
+            &format!("{owner}/{repo}"),
+            join_root(root_segments),
+        ));
     }
 
     let [owner, repo, root_segments @ ..] = segments.as_slice() else {
@@ -755,17 +816,11 @@ fn parse_shorthand(input: &str, templates: &[(String, String)]) -> Result<Parsed
             "expected <owner>/<repo> shorthand in `{input}`"
         )));
     };
-    let template = builtin_forges()
-        .get("github")
-        .and_then(|h| h.remote.as_ref())
-        .and_then(|r| r.https_template().map(str::to_owned))
-        .ok_or_else(|| Error::Config("built-in github forge has no https template".to_owned()))?;
-    Ok(ParsedSource {
-        name: (*repo).to_owned(),
-        git: fill_template(&template, &format!("{owner}/{repo}")),
-        branch: None,
-        root: join_root(root_segments),
-    })
+    Ok(symbolic_source(
+        "github".to_owned(),
+        &format!("{owner}/{repo}"),
+        join_root(root_segments),
+    ))
 }
 
 fn join_root(segments: &[&str]) -> Option<String> {
@@ -802,20 +857,18 @@ fn with_git_suffix(url: &str) -> String {
 pub fn insert_source(
     doc_text: &str,
     name: &str,
-    git: &str,
-    branch: Option<&str>,
+    source: &ParsedSource,
     root: Option<&str>,
 ) -> Result<String> {
     let mut doc = doc_text
         .parse::<toml_edit::DocumentMut>()
         .map_err(|e| Error::Config(format!("parse phora.toml: {e}")))?;
 
-    let mut table = toml_edit::Table::new();
-    table["git"] = toml_edit::value(git);
-    if let Some(branch) = branch {
-        table["branch"] = toml_edit::value(branch);
+    let mut table = source_table(source);
+    if let Some(branch) = &source.branch {
+        table["branch"] = toml_edit::value(branch.as_str());
     }
-    if let Some(root) = root {
+    if let Some(root) = root.or(source.root.as_deref()) {
         table["root"] = toml_edit::value(root);
     }
 
@@ -1375,11 +1428,23 @@ mod tests {
     }
 
     #[test]
-    fn github_shorthand_expands_to_https_git_url() {
+    fn github_shorthand_yields_symbolic_github_source() {
         let parsed = parse("srnnkls/loqui");
         assert_eq!(
-            parsed.git, "https://github.com/srnnkls/loqui.git",
-            "owner/repo shorthand must expand via the default github template"
+            parsed.host.as_deref(),
+            Some("github"),
+            "a bare owner/repo shorthand must default to the symbolic github host, not an expanded git URL (got git={:?})",
+            parsed.git
+        );
+        assert_eq!(
+            parsed.path.as_deref(),
+            Some("srnnkls/loqui"),
+            "the shorthand must carry path=srnnkls/loqui symbolically"
+        );
+        assert!(
+            parsed.git.is_none(),
+            "owner/repo must stay symbolic, not pre-expand to a github git URL, got {:?}",
+            parsed.git
         );
         assert_eq!(
             parsed.name, "loqui",
@@ -1396,13 +1461,24 @@ mod tests {
     fn github_shorthand_with_extra_path_becomes_root() {
         let parsed = parse("owner/repo/path/to/dir");
         assert_eq!(
-            parsed.git, "https://github.com/owner/repo.git",
-            "only owner/repo form the git URL; the rest is the root"
+            parsed.host.as_deref(),
+            Some("github"),
+            "only owner/repo feed the symbolic host/path; the rest is the root"
+        );
+        assert_eq!(
+            parsed.path.as_deref(),
+            Some("owner/repo"),
+            "the symbolic path is exactly owner/repo, with trailing segments split off as root"
+        );
+        assert!(
+            parsed.git.is_none(),
+            "a shorthand+path stays symbolic, got {:?}",
+            parsed.git
         );
         assert_eq!(
             parsed.root.as_deref(),
             Some("path/to/dir"),
-            "trailing path segments become the source root"
+            "trailing path segments beyond owner/repo become the source root"
         );
         assert_eq!(
             parsed.name, "repo",
@@ -1415,29 +1491,67 @@ mod tests {
     }
 
     #[test]
-    fn host_prefixed_shorthand_expands_to_https() {
+    fn domain_shorthand_yields_symbolic_github_source() {
         let parsed = parse("github.com/owner/repo");
         assert_eq!(
-            parsed.git, "https://github.com/owner/repo.git",
-            "a github.com/owner/repo shorthand must expand to the full https git URL"
+            parsed.host.as_deref(),
+            Some("github"),
+            "a github.com/owner/repo domain shorthand must map to the symbolic host name `github`, not an expanded https URL (got git={:?})",
+            parsed.git
+        );
+        assert_eq!(
+            parsed.path.as_deref(),
+            Some("owner/repo"),
+            "the domain shorthand must carry path=owner/repo symbolically"
+        );
+        assert!(
+            parsed.git.is_none(),
+            "a domain shorthand stays symbolic, got {:?}",
+            parsed.git
         );
         assert_eq!(parsed.name, "repo");
         assert!(
             parsed.branch.is_none(),
-            "a host-prefixed shorthand carries no branch"
+            "a domain shorthand carries no branch"
         );
         assert!(
             parsed.root.is_none(),
-            "a host-prefixed shorthand carries no root"
+            "a domain shorthand carries no root"
         );
     }
 
     #[test]
-    fn full_https_url_gets_git_suffix_appended() {
+    fn srht_domain_shorthand_maps_to_symbolic_srht_host() {
+        let parsed = parse("git.sr.ht/~rjarry/aerc");
+        assert_eq!(
+            parsed.host.as_deref(),
+            Some("sr.ht"),
+            "the git.sr.ht DOMAIN must map to the forge NAME `sr.ht`, not the domain string"
+        );
+        assert_eq!(
+            parsed.path.as_deref(),
+            Some("~rjarry/aerc"),
+            "the `~` owner segment must be preserved verbatim in the symbolic path"
+        );
+        assert!(
+            parsed.git.is_none(),
+            "a non-github domain shorthand stays symbolic, got {:?}",
+            parsed.git
+        );
+        assert_eq!(parsed.name, "aerc");
+    }
+
+    #[test]
+    fn full_https_url_stays_a_literal_git_remote() {
         let parsed = parse("https://github.com/owner/repo");
         assert_eq!(
-            parsed.git, "https://github.com/owner/repo.git",
-            "a full https URL without .git must have .git appended"
+            parsed.git.as_deref(),
+            Some("https://github.com/owner/repo.git"),
+            "a full https URL stays a LITERAL git remote (back-compat) with .git appended"
+        );
+        assert!(
+            parsed.host.is_none() && parsed.path.is_none(),
+            "a literal scheme URL must NOT become a symbolic host/path source"
         );
         assert_eq!(parsed.name, "repo");
         assert!(parsed.branch.is_none());
@@ -1445,11 +1559,16 @@ mod tests {
     }
 
     #[test]
-    fn tree_url_extracts_branch_and_root() {
+    fn tree_url_stays_literal_and_extracts_branch_and_root() {
         let parsed = parse("https://github.com/company/configs/tree/main/editor");
         assert_eq!(
-            parsed.git, "https://github.com/company/configs.git",
-            "the /tree/<ref>/<path> tail must be stripped from the git URL"
+            parsed.git.as_deref(),
+            Some("https://github.com/company/configs.git"),
+            "a scheme URL stays a LITERAL git remote; the /tree/<ref>/<path> tail is stripped from it"
+        );
+        assert!(
+            parsed.host.is_none() && parsed.path.is_none(),
+            "a tree URL is a literal scheme URL, not a symbolic host/path source"
         );
         assert_eq!(
             parsed.branch.as_deref(),
@@ -1468,11 +1587,19 @@ mod tests {
     }
 
     #[test]
-    fn gitlab_shorthand_uses_gitlab_default_template() {
+    fn gitlab_domain_shorthand_maps_to_symbolic_gitlab_host() {
         let parsed = parse("gitlab.com/owner/repo");
         assert_eq!(
-            parsed.git, "https://gitlab.com/owner/repo.git",
-            "gitlab.com host must resolve via the built-in gitlab template, not github"
+            parsed.host.as_deref(),
+            Some("gitlab"),
+            "the gitlab.com DOMAIN must map to the symbolic forge NAME `gitlab`, not github and not an expanded URL (got git={:?})",
+            parsed.git
+        );
+        assert_eq!(parsed.path.as_deref(), Some("owner/repo"));
+        assert!(
+            parsed.git.is_none(),
+            "a gitlab domain shorthand stays symbolic, got {:?}",
+            parsed.git
         );
         assert_eq!(parsed.name, "repo");
         assert!(
@@ -1483,46 +1610,51 @@ mod tests {
     }
 
     #[test]
-    fn codeberg_shorthand_resolves_via_unified_builtin_registry() {
+    fn codeberg_domain_shorthand_maps_to_symbolic_codeberg_host() {
         let parsed = parse("codeberg.org/owner/repo");
         assert_eq!(
-            parsed.git, "https://codeberg.org/owner/repo.git",
-            "codeberg.org shorthand must resolve via the SINGLE built-in forge registry; \
-             host_templates is no longer a second hardcoded {{github,gitlab}} list"
+            parsed.host.as_deref(),
+            Some("codeberg"),
+            "codeberg.org must map to the symbolic forge NAME `codeberg` via the SINGLE built-in forge registry"
+        );
+        assert_eq!(parsed.path.as_deref(), Some("owner/repo"));
+        assert!(
+            parsed.git.is_none(),
+            "a codeberg domain shorthand stays symbolic, got {:?}",
+            parsed.git
         );
         assert_eq!(parsed.name, "repo");
     }
 
     #[test]
-    fn bitbucket_shorthand_resolves_via_unified_builtin_registry() {
+    fn bitbucket_domain_shorthand_maps_to_symbolic_bitbucket_host() {
         let parsed = parse("bitbucket.org/owner/repo");
         assert_eq!(
-            parsed.git, "https://bitbucket.org/owner/repo.git",
-            "bitbucket was NEVER in the old hardcoded {{github,gitlab}} host_templates list; \
-             it can only resolve if host_templates derives from builtin_forges() (the loop), \
-             not from a minimally-extended second list"
+            parsed.host.as_deref(),
+            Some("bitbucket"),
+            "bitbucket.org must map to the symbolic forge NAME `bitbucket`; it can only resolve if \
+             the forge registry derives from builtin_forges()"
+        );
+        assert_eq!(parsed.path.as_deref(), Some("owner/repo"));
+        assert!(
+            parsed.git.is_none(),
+            "a bitbucket domain shorthand stays symbolic, got {:?}",
+            parsed.git
         );
         assert_eq!(parsed.name, "repo");
     }
 
     #[test]
-    fn srht_shorthand_resolves_via_unified_builtin_registry() {
-        let parsed = parse_add_url("git.sr.ht/~rjarry/aerc", &no_hosts())
-            .expect("sr.ht shorthand resolves");
-        assert_eq!(
-            parsed.git, "https://git.sr.ht/~rjarry/aerc",
-            "git.sr.ht shorthand must resolve via the SINGLE built-in forge registry to the \
-             sr.ht `{{path}}` shape: no `.git` suffix and the `~` owner preserved"
-        );
-        assert_eq!(parsed.name, "aerc");
-    }
-
-    #[test]
-    fn ssh_url_is_kept_as_a_git_remote() {
+    fn scp_ssh_url_is_kept_as_a_literal_git_remote() {
         let parsed = parse("git@github.com:owner/repo.git");
         assert_eq!(
-            parsed.git, "git@github.com:owner/repo.git",
-            "an ssh scp-style URL is a valid git remote and must be preserved verbatim"
+            parsed.git.as_deref(),
+            Some("git@github.com:owner/repo.git"),
+            "an ssh scp-style URL is a literal git remote and must be preserved verbatim"
+        );
+        assert!(
+            parsed.host.is_none() && parsed.path.is_none(),
+            "an scp literal must NOT become a symbolic host/path source"
         );
         assert_eq!(
             parsed.name, "repo",
@@ -1533,7 +1665,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_host_template_expands_host_prefixed_shorthand() {
+    fn custom_host_domain_shorthand_maps_to_symbolic_custom_host() {
         let mut hosts = BTreeMap::new();
         hosts.insert(
             "company".to_owned(),
@@ -1550,9 +1682,16 @@ mod tests {
             .expect("custom host shorthand resolves");
 
         assert_eq!(
-            parsed.git, "ssh://git@git.company.com:2222/scm/owner/repo.git",
-            "the host template (ssh scheme, :2222 port, /scm/ prefix) must be applied verbatim; \
-             a generic default expansion could never produce this URL"
+            parsed.host.as_deref(),
+            Some("company"),
+            "the custom host's DOMAIN (git.company.com) must map to its symbolic host NAME `company`, \
+             not be expanded into the template URL"
+        );
+        assert_eq!(parsed.path.as_deref(), Some("owner/repo"));
+        assert!(
+            parsed.git.is_none(),
+            "a custom-host domain shorthand stays symbolic, got {:?}",
+            parsed.git
         );
         assert_eq!(parsed.name, "repo");
         assert!(
@@ -1569,13 +1708,24 @@ mod tests {
 
     const ADD_BASE: &str = "version = 1\n\n[sources.foo]\ngit = \"https://github.com/me/foo.git\"\nbranch = \"main\"\n";
 
+    fn lit(git: &str, branch: Option<&str>) -> ParsedSource {
+        ParsedSource {
+            name: String::new(),
+            git: Some(git.to_owned()),
+            host: None,
+            path: None,
+            protocol: None,
+            branch: branch.map(str::to_owned),
+            root: None,
+        }
+    }
+
     #[test]
     fn insert_source_preserves_existing_source_and_adds_new() {
         let out = insert_source(
             ADD_BASE,
             "loqui",
-            "https://github.com/srnnkls/loqui.git",
-            None,
+            &lit("https://github.com/srnnkls/loqui.git", None),
             None,
         )
         .expect("insert into base toml");
@@ -1617,8 +1767,7 @@ mod tests {
         let out = insert_source(
             ADD_BASE,
             "editor-config",
-            "https://github.com/company/configs.git",
-            Some("main"),
+            &lit("https://github.com/company/configs.git", Some("main")),
             Some("editor"),
         )
         .expect("insert with branch and root");
@@ -1669,8 +1818,7 @@ mod tests {
         let out = insert_source(
             seeded,
             "loqui",
-            "https://github.com/srnnkls/loqui.git",
-            None,
+            &lit("https://github.com/srnnkls/loqui.git", None),
             None,
         )
         .expect("insert into seeded toml");
@@ -1705,8 +1853,7 @@ mod tests {
         let first = insert_source(
             "version = 1\n",
             "loqui",
-            "https://github.com/srnnkls/loqui.git",
-            None,
+            &lit("https://github.com/srnnkls/loqui.git", None),
             None,
         )
         .expect("insert first source into a doc with no sources table");
@@ -1727,8 +1874,7 @@ mod tests {
         let second = insert_source(
             &first,
             "editor",
-            "https://github.com/company/editor.git",
-            None,
+            &lit("https://github.com/company/editor.git", None),
             None,
         )
         .expect("insert second source after the first");
@@ -1762,6 +1908,312 @@ mod tests {
                 .git
                 .as_deref(),
             Some("https://github.com/company/editor.git")
+        );
+    }
+
+    // ── HAS-004: add writes symbolic host/path (both writer paths) ──
+
+    use crate::source::Protocol;
+
+    /// Re-parses inserted text and returns the named source, asserting validity.
+    fn source_from(out: &str, name: &str) -> Source {
+        Config::parse(out)
+            .unwrap_or_else(|e| panic!("inserted text must be valid phora.toml: {e}\n{out}"))
+            .sources
+            .remove(name)
+            .unwrap_or_else(|| panic!("source `{name}` must be present in:\n{out}"))
+    }
+
+    #[test]
+    fn parse_colon_alias_yields_symbolic_github_source() {
+        let parsed = parse("github:srnnkls/tropos");
+        assert_eq!(
+            parsed.host.as_deref(),
+            Some("github"),
+            "`github:srnnkls/tropos` must parse to a symbolic source with host=github, not an expanded git URL (got git={:?})",
+            parsed.git
+        );
+        assert_eq!(
+            parsed.path.as_deref(),
+            Some("srnnkls/tropos"),
+            "the colon alias must carry path=srnnkls/tropos symbolically"
+        );
+        assert_eq!(
+            parsed.name, "tropos",
+            "the default name is the repo segment of the alias"
+        );
+        assert!(
+            parsed.git.is_none(),
+            "a symbolic colon alias must NOT be pre-expanded into a literal git URL, got {:?}",
+            parsed.git
+        );
+    }
+
+    #[test]
+    fn parse_colon_alias_is_not_mistaken_for_scp() {
+        let parsed = parse("github:owner/repo");
+        assert!(
+            parsed.git.is_none(),
+            "`github:owner/repo` has no `@`, so it must NOT be dispatched to the scp-ssh path that keeps the literal string; git must be None, got {:?}",
+            parsed.git
+        );
+        assert_eq!(
+            parsed.host.as_deref(),
+            Some("github"),
+            "the colon alias must resolve symbolically to host=github, not be treated as an scp remote"
+        );
+        assert_eq!(
+            parsed.path.as_deref(),
+            Some("owner/repo"),
+            "the colon alias must carry path=owner/repo, not swallow it into a literal scp string"
+        );
+    }
+
+    #[test]
+    fn parse_gitlab_colon_alias_yields_symbolic_gitlab_source() {
+        let parsed = parse("gitlab:owner/repo");
+        assert_eq!(
+            parsed.host.as_deref(),
+            Some("gitlab"),
+            "`gitlab:owner/repo` must parse to a symbolic source with host=gitlab"
+        );
+        assert_eq!(parsed.path.as_deref(), Some("owner/repo"));
+        assert!(
+            parsed.git.is_none(),
+            "a symbolic gitlab alias must not be pre-expanded"
+        );
+    }
+
+    #[test]
+    fn colon_alias_splits_extra_path_into_root() {
+        let parsed = parse("github:owner/repo/sub/dir");
+        assert_eq!(
+            parsed.host.as_deref(),
+            Some("github"),
+            "only owner/repo feed the symbolic host/path; the rest is the root"
+        );
+        assert_eq!(
+            parsed.path.as_deref(),
+            Some("owner/repo"),
+            "the colon-alias path is exactly owner/repo, with trailing segments split off as root"
+        );
+        assert_eq!(
+            parsed.root.as_deref(),
+            Some("sub/dir"),
+            "segments past owner/repo become the root, mirroring the slash shorthand"
+        );
+        assert!(
+            parsed.git.is_none(),
+            "a colon alias with extra path stays symbolic, got {:?}",
+            parsed.git
+        );
+    }
+
+    #[test]
+    fn colon_alias_empty_host_errors() {
+        let err = parse_add_url(":owner/repo", &no_hosts())
+            .expect_err("`:owner/repo` has an empty host and must be rejected");
+        assert!(
+            err.to_string().contains(":owner/repo"),
+            "the error must name the offending input, got `{err}`"
+        );
+    }
+
+    #[test]
+    fn colon_alias_empty_path_errors() {
+        let err = parse_add_url("github:", &no_hosts())
+            .expect_err("`github:` has an empty path and must be rejected");
+        assert!(
+            err.to_string().contains("github:"),
+            "the error must name the offending input, got `{err}`"
+        );
+    }
+
+    #[test]
+    fn parse_bare_owner_repo_defaults_to_symbolic_github() {
+        let parsed = parse("owner/repo");
+        assert_eq!(
+            parsed.host.as_deref(),
+            Some("github"),
+            "a bare owner/repo shorthand must default to the symbolic github host"
+        );
+        assert_eq!(parsed.path.as_deref(), Some("owner/repo"));
+        assert!(
+            parsed.git.is_none(),
+            "a bare owner/repo must be symbolic, not expanded to a github git URL"
+        );
+    }
+
+    #[test]
+    fn scp_ssh_url_stays_a_literal_git_remote_not_symbolic() {
+        let parsed = parse("git@github.com:owner/repo.git");
+        assert_eq!(
+            parsed.git.as_deref(),
+            Some("git@github.com:owner/repo.git"),
+            "an scp-ssh remote (has `@` before `:`) is a literal git remote, preserved verbatim"
+        );
+        assert!(
+            parsed.host.is_none() && parsed.path.is_none(),
+            "an scp literal must NOT be turned into a symbolic host/path source"
+        );
+    }
+
+    #[test]
+    fn full_https_url_stays_a_literal_git_remote_not_symbolic() {
+        let parsed = parse("https://github.com/owner/repo");
+        assert_eq!(
+            parsed.git.as_deref(),
+            Some("https://github.com/owner/repo.git"),
+            "a full scheme URL stays a literal git remote (back-compat)"
+        );
+        assert!(
+            parsed.host.is_none() && parsed.path.is_none(),
+            "a literal scheme URL must NOT become a symbolic host/path source"
+        );
+    }
+
+    #[test]
+    fn run_add_writer_writes_symbolic_host_path_for_colon_alias() {
+        let parsed = parse("github:srnnkls/tropos");
+        let out = insert_source_with_ref("version = 1\n", &parsed.name, &parsed, None, None, None)
+            .expect("run_add's writer must accept a symbolic ParsedSource");
+
+        assert!(
+            out.contains("[sources.tropos]"),
+            "run_add's writer must emit a [sources.tropos] table, got:\n{out}"
+        );
+        assert!(
+            !out.contains("git ="),
+            "a symbolic add must NOT write an expanded `git =` key (run_add writer), got:\n{out}"
+        );
+
+        let src = source_from(&out, "tropos");
+        assert_eq!(
+            src.host.as_deref(),
+            Some("github"),
+            "run_add's writer must persist host = \"github\""
+        );
+        assert_eq!(
+            src.path.as_deref(),
+            Some("srnnkls/tropos"),
+            "run_add's writer must persist path = \"srnnkls/tropos\""
+        );
+        assert!(
+            src.git.is_none(),
+            "run_add's writer must not persist a literal git for a symbolic add"
+        );
+    }
+
+    /// Serializes cwd-mutating tests: `run_add` reads/writes `phora.toml` in the
+    /// process cwd, so two such tests must not run concurrently.
+    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Runs `body` with the process cwd set to `dir`, restoring it on the way out
+    /// even on panic. Holds [`CWD_LOCK`]; never run alongside other cwd tests.
+    fn with_cwd<T>(dir: &std::path::Path, body: impl FnOnce() -> T) -> T {
+        let _guard = CWD_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = std::env::current_dir().expect("read cwd");
+        std::env::set_current_dir(dir).expect("enter temp cwd");
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+        std::env::set_current_dir(&prev).expect("restore cwd");
+        match out {
+            Ok(value) => value,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    #[test]
+    fn run_add_end_to_end_persists_symbolic_source_to_phora_toml() {
+        let dir = tempfile::TempDir::new().expect("temp project dir");
+        let toml_path = dir.path().join("phora.toml");
+
+        with_cwd(dir.path(), || {
+            run_add("github:srnnkls/tropos", None, None, None, None)
+                .expect("run_add must succeed for a symbolic colon alias");
+        });
+
+        let written = std::fs::read_to_string(&toml_path)
+            .expect("run_add must write phora.toml in the cwd");
+        assert!(
+            !written.contains("git ="),
+            "run_add's parse->writer glue must persist the SYMBOLIC source, never an expanded `git =`, got:\n{written}"
+        );
+
+        let src = source_from(&written, "tropos");
+        assert_eq!(
+            src.host.as_deref(),
+            Some("github"),
+            "run_add end-to-end must persist host = \"github\""
+        );
+        assert_eq!(
+            src.path.as_deref(),
+            Some("srnnkls/tropos"),
+            "run_add end-to-end must persist path = \"srnnkls/tropos\""
+        );
+        assert!(
+            src.git.is_none(),
+            "run_add end-to-end must not persist a literal git for a symbolic add"
+        );
+    }
+
+    #[test]
+    fn insert_source_also_writes_symbolic_host_path_for_colon_alias() {
+        let parsed = parse("gitlab:owner/repo");
+        let out = insert_source("version = 1\n", &parsed.name, &parsed, None)
+            .expect("the second writer must also accept a symbolic ParsedSource");
+
+        assert!(
+            !out.contains("git ="),
+            "both writers must agree: a symbolic add writes no `git =` key, got:\n{out}"
+        );
+        let src = source_from(&out, "repo");
+        assert_eq!(
+            src.host.as_deref(),
+            Some("gitlab"),
+            "insert_source must persist host = \"gitlab\" symbolically"
+        );
+        assert_eq!(src.path.as_deref(), Some("owner/repo"));
+        assert!(
+            src.git.is_none(),
+            "insert_source must not expand a symbolic add into a literal git"
+        );
+    }
+
+    #[test]
+    fn symbolic_add_omits_default_protocol_and_writes_non_default() {
+        let default_src = parse("github:srnnkls/tropos");
+        let default_out =
+            insert_source_with_ref("version = 1\n", &default_src.name, &default_src, None, None, None)
+                .expect("write default-protocol symbolic source");
+        assert!(
+            !default_out.contains("protocol"),
+            "a default (https) protocol must be omitted from the written table, got:\n{default_out}"
+        );
+        assert!(
+            default_out.contains("host = \"github\"") && default_out.contains("path = \"srnnkls/tropos\""),
+            "the default-protocol silence is only meaningful if host+path are still written, got:\n{default_out}"
+        );
+
+        let ssh_src = ParsedSource {
+            protocol: Some(Protocol::Ssh),
+            ..parse("github:srnnkls/tropos")
+        };
+        let ssh_out =
+            insert_source_with_ref("version = 1\n", &ssh_src.name, &ssh_src, None, None, None)
+                .expect("write non-default-protocol symbolic source");
+        assert!(
+            ssh_out.contains("protocol = \"ssh\""),
+            "a non-default protocol must be written literally as `protocol = \"ssh\"`, got:\n{ssh_out}"
+        );
+        assert!(
+            ssh_out.contains("host = \"github\"") && ssh_out.contains("path = \"srnnkls/tropos\""),
+            "a non-default-protocol source must still carry its symbolic host+path, got:\n{ssh_out}"
+        );
+        let src = source_from(&ssh_out, "tropos");
+        assert_eq!(
+            src.protocol,
+            Some(Protocol::Ssh),
+            "a non-default protocol on a symbolic source must round-trip through the parser, got:\n{ssh_out}"
         );
     }
 

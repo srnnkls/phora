@@ -56,6 +56,37 @@ batch_reviews:
       - "removed last hardcoded github literal in cli.rs -> reads builtin_forges() (single source of truth)"
       - "validate ssh-template guard uses effective_host (builtin+user overlay), factored shared with resolved_remote"
       - "added sr.ht cli shorthand test"
+  - batch: 3a
+    tasks: [HAS-004]
+    reviewers:
+      - id: general-claude-opus
+        status: success
+        gates: { correctness: pass, security: pass, performance: pass }
+        verdict: approved
+      - id: general-claude-sonnet
+        status: success
+        gates: { correctness: fail, security: pass, performance: pass }
+        verdict: changes_requested
+      - id: architecture-claude-sonnet
+        status: success
+        gates: { architecture: pass }
+        verdict: approved
+      - id: compliance-claude-opus
+        status: success
+        gates: { style: pass }
+        verdict: approved
+    synthesized:
+      gates: { correctness: pass, security: pass, performance: pass, architecture: pass, style: pass }
+      critical_issues: 0
+      high_issues: 0
+      medium_issues: 2   # resolved pre-commit
+    outcome: approved
+    fixes:
+      - "colon-alias splits extra path into root (consistent with slash shorthand)"
+      - "colon-alias rejects empty host/path (fail at boundary)"
+      - "unified root fallback across both writers"
+    deferred:
+      - "ParsedSource-as-enum to compile-enforce git-XOR-host+path (modeled via helpers + doc)"
 issues:
   high:
     - id: HAS-001-H-remote-required
