@@ -39,3 +39,26 @@ batch_reviews:
       lib_tests: "289 passed; 0 failed"
       clippy_all_targets: clean
       fmt: clean
+  - batch: 2
+    tasks: [WTI-002]
+    test_review:
+      reviewers: [test-review-opus, test-review-sonnet]
+      outcome: needs_changes -> clean
+      findings_addressed:
+        - "error tests asserted Display substrings -> added Error::Worktree(String) variant; assert matches!(Error::Worktree(_)) + disjoint substring to distinguish bare vs not-a-repo"
+        - "nested-subdir fixture used a non-canonical start path -> canonicalize the fixture path (macOS /var vs /private/var)"
+    code_review:
+      reviewers: [code-review-opus, code-review-sonnet]
+      gates: { correctness: pass, security: pass, architecture: pass, style: pass }
+      outcome: approved   # both reviewers
+      low_findings_handled:
+        - "# Errors doc omitted canonicalize-failure path -> doc bullet added (both reviewers)"
+      deferred_issues:
+        - severity: low
+          gate: architecture
+          detail: "canonicalize IO error maps to Error::Worktree (preserves work-dir path context) rather than Error::Io via #[from]. sonnet noted the convention deviation; kept intentionally for context. opus did not flag."
+    verification:
+      lib_tests: "294 passed; 0 failed"
+      clippy_all_targets: clean
+      fmt: clean
+      gix_api: "gix::discover -> repo.main_repo() -> main.workdir() -> std::fs::canonicalize"

@@ -26,3 +26,4 @@ pub mod projection;
 pub mod registry;
 pub mod source;
 pub mod sync;
+pub mod worktree;
