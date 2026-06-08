@@ -2,17 +2,15 @@ checkpoint:
   scope_name: host-alias-sources
   scope_path: ./scopes/active/host-alias-sources
   branch: feat/host-alias-sources
-  last_batch: 2
+  last_batch: 3
   tasks:
-    done: [HAS-001, HAS-002]
-    pending: [HAS-003, HAS-004, HAS-005, HAS-006]
+    done: [HAS-001, HAS-002, HAS-003, HAS-004]
+    pending: [HAS-005, HAS-006]
   next_batch:
-    number: 3
-    tasks: [HAS-004]   # add-write; then HAS-003 wires sync (HAS-004 + HAS-002 both touch cli.rs, sequenced)
+    number: 4
+    tasks: [HAS-005, HAS-006]   # lock (lock.rs) + docs (README/example) — independent files, parallelizable
   deferred_issues:
-    - "HAS-003: replace // HAS-003 \"\" git bridges with resolved_remote; wire Config::validate into load path; thread effective_protocol per source"
-    - "HAS-005: source_matches NormalizedUrl/MirrorKey identity (// HAS-005 marker at lock.rs)"
-    - "perf(note): builtin_forges() rebuilds a 5-entry map per call; consider LazyLock when HAS-003 calls per-source"
-    - "cosmetic(note): resolved_remote error names source.path not source name"
+    - "HAS-005 (CRITICAL, handoff from HAS-003): source_matches must compare NormalizedUrl/MirrorKey identity (hosts, protocol), not raw source.git; today host-mode sources refetch every sync because locked.git=resolved remote vs source.git=None"
+    - "note: effective_protocol lives in sync.rs (cohesion nit); builtin_forges() rebuilt per source (micro-opt); threaded resolved-remote struct fields named `git` (naming nit)"
   review_config:
     reviewers: [opus, sonnet]

@@ -46,7 +46,7 @@ tasks:
 
   - id: HAS-003
     content: "Wire resolution through fetch / sync / discovery (all ~8 sites)"
-    status: pending
+    status: done
     activeForm: "Threading resolved_remote through sync"
     depends_on: [HAS-002]
     review_fixes:
