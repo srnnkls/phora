@@ -180,3 +180,39 @@ batch_reviews:
       worktree_apply_tests: "25 passed"
       clippy_all_targets: clean
       fmt: clean
+  - batch: 7
+    tasks: [WTI-005]
+    test_review:
+      reviewers: [test-review-opus, test-review-sonnet]
+      outcome: needs_changes -> clean
+      findings_addressed:
+        - "symlink-beats-copy precedence untested -> pinned (both orders)"
+        - "glob coverage only `*` -> added `?` and `[`"
+        - "invalid submodule-walk combos (no symlink / copy+walk) -> skip+report pinned"
+        - "negation skip reason unchecked -> asserted"
+        - "unsafe legacy paths (absolute/../.) -> skip+report so output always re-parses"
+        - "unknown trailing attr -> ignored, path still imported (Copy)"
+        - "tab/whitespace separators -> handled"
+    code_review:
+      reviewers: [code-review-opus, code-review-sonnet, code-review-sonnet-recheck]
+      gates: { correctness: pass, security: pass, architecture: pass, style: pass }
+      outcome: changes_requested -> fixes_confirmed
+      tests_intact_after_accidental_restore: true   # implementer dropped+restored the test block; both reviewers verified all 16 intact/unweakened
+      issues_resolved:
+        - severity: critical
+          gate: correctness
+          detail: "is_safe_relative used Path::components() which normalizes interior `.` away, diverging from Config::parse (string-split) -> a/./b, foo/. imported then failed re-parse"
+          fix: "is_safe_relative now string-splits on ['/','\\\\'] rejecting any `.`/`..` segment (+ empty/absolute), mirroring Config::parse; interior_dot_paths_are_skipped pins it"
+        - severity: medium
+          gate: correctness
+          detail: "TOML renderer embedded path via display() unescaped -> a safe path with `\"`/`\\` emitted invalid TOML"
+          fix: "render_worktree_toml escapes via toml_edit::value; centralized as crate::import_legacy::render_worktree_toml (CLI uses it, private cli copy deleted); rendered_toml_escapes_special_chars_and_reparses pins it"
+        - severity: medium
+          gate: docs
+          detail: "README `import-legacy >> phora.toml` would duplicate version/[worktree] keys"
+          fix: "README redirects to a scratch worktree-includes.toml with a merge-by-hand note"
+    verification:
+      lib_tests: "349 passed; 0 failed"
+      import_legacy_tests: "18 passed"
+      clippy_all_targets: clean
+      fmt: clean
