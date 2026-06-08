@@ -398,6 +398,7 @@ fn finish_sync(cwd: &Path, out: &SyncOutput) -> Result<()> {
 fn run_rebuild_registry() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let config = load_config()?;
+    config.validate()?;
     let (base_lock, local_lock) = load_locks(&cwd)?;
     let lock = match base_lock {
         Some(base) => merge_locks(&base, local_lock.as_ref()),
