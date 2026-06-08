@@ -1,6 +1,6 @@
 ---
 created: 2026-06-07
-status: active
+status: done
 issue_type: Feature
 depends_on_scope: deploy-link-dev-mode
 ---
