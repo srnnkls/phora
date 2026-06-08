@@ -52,6 +52,33 @@ batch_reviews:
       247 lib tests green, clippy clean. Two medium concerns deferred (see below) — both reflect the
       intentional tracked-quarantine carve-out, not regressions.
 
+  - batch: 2b
+    timestamp: 2026-06-08
+    tasks: [DLD-003]
+    phase_a5_test_review:
+      harnesses: [claude-opus (orchestrator inspection), pi]
+      result: pass-with-low-nit
+      note: "cross-site invariant test confirmed non-tautological (discover_count==0). One low test-hygiene nit deferred."
+    reviewers:
+      - id: general+arch+style-claude-opus
+        status: success
+        gates: { correctness: pass, architecture: pass, style: pass }
+      - id: general+arch+style-pi
+        status: success
+        gates: { correctness: pass (link-deploy findings are DLD-004 scope), architecture: pass, style: pass }
+    synthesized:
+      gates: { correctness: pass, architecture: pass, style: pass }
+      critical_issues: 0
+      high_issues: 0
+      medium_issues: 0
+    outcome: approved
+    notes: >
+      discover_working_tree (disk scan mirroring ODB discover_artifacts) + discover_artifacts_for_source
+      dispatcher wired into deploy_target/prune_orphans/rebuild_registry + rebuild_linked (DLD-006 rebuild
+      bullet pulled forward). 253 lib tests green, clippy clean (dead_code gone). Pi's two "high" findings
+      (link deploy still flows through deploy_one/export) are DLD-004 scope (deploy-closure dispatch),
+      not DLD-003 defects — recorded against DLD-004 below.
+
 issues:
   critical: []
   high: []
@@ -71,8 +98,23 @@ deferred_issues:
       only ever written by phora's own link-deploy, so divergence requires external mutation. Not a
       regression; medium, non-blocking.
     defer_to: DLD-007
+    candidate_fix_for: DLD-005-M1
     candidate_fix: >
       In the Linked short-circuit, when the dst is present but NOT a symlink, return Missing (redeploy
       the link) instead of Linked — mirrors the dangling-link => Missing => redeploy policy and stays
       within "never Modified/Foreign". Add a test "linked record over a real dir => Missing/redeploy"
       in DLD-007 (transitions) before implementing.
+  - id: DLD-003-L1
+    severity: low
+    found_by: [pi]
+    area: test-hygiene
+    issue: "worktree_scan_missing_path_errors uses a hard-coded /nonexistent path (environment-dependent)."
+    assessment: "Low; /nonexistent is reliably absent on dev/CI. Harden to a hermetic TempDir-child-after-removal when next touching this test."
+    defer_to: DLD-006
+  - id: DLD-003-N1
+    severity: note
+    found_by: [pi]
+    area: deploy-dispatch
+    issue: "Link sources still flow through deploy_one (export_artifact/commit_time) on the deploy path; mode dispatch not yet applied at the deploy closure."
+    assessment: "NOT a DLD-003 defect — this is DLD-004's acceptance (dispatch on DeployMode at deploy_artifact_entry). DLD-004 depends on DLD-003 precisely for this. Tracked as DLD-004 work."
+    defer_to: DLD-004
