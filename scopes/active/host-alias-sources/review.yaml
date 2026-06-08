@@ -87,6 +87,42 @@ batch_reviews:
       - "unified root fallback across both writers"
     deferred:
       - "ParsedSource-as-enum to compile-enforce git-XOR-host+path (modeled via helpers + doc)"
+  - batch: 3b
+    tasks: [HAS-003]
+    reviewers:
+      - id: general-claude-opus
+        status: success
+        gates: { correctness: pass, security: pass, performance: fail }
+        verdict: changes_requested
+      - id: general-claude-sonnet
+        status: success
+        gates: { correctness: fail, security: pass, performance: pass }
+        verdict: changes_requested
+      - id: architecture-claude-sonnet
+        status: success
+        gates: { architecture: pass }
+        verdict: approved
+      - id: compliance-claude-opus
+        status: success
+        gates: { style: pass }
+        verdict: changes_requested
+    synthesized:
+      gates: { correctness: pass, security: pass, performance: pass, architecture: pass, style: pass }
+      critical_issues: 0
+      high_issues: 0   # the host-mode refetch is HAS-005's defined scope, not a HAS-003 defect
+      medium_issues: 3 # resolved pre-commit
+    outcome: approved
+    fixes:
+      - "silent \"\" map-miss -> named error (remote_for helper)"
+      - "validate() wired on rebuild path too (every resolving command validates post-merge)"
+      - "resolution errors already named per source (verified)"
+      - "comment hygiene: moved misplaced test doc; removed HAS-003 process-narration banner"
+    handoff:
+      - id: M-host-mode-refetch
+        found_by: [general-claude-opus, general-claude-sonnet, architecture-claude-sonnet]
+        issue: "LockedSource.git now stores resolved remote, but source_matches still compares raw source.git (None->\"\") => host-mode sources refetch every sync"
+        owner: HAS-005
+        note: "Scope's documented CRITICAL for HAS-005; functional result correct, idempotency restored by next task"
 issues:
   high:
     - id: HAS-001-H-remote-required

@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::config::{Config, DeployMode, LayoutKind, Source, Target, merge_configs};
+use crate::config::{Config, DeployMode, LayoutKind, Protocol, Source, Target, merge_configs};
 use crate::error::{Error, Result};
 use crate::lock::{Lock, LockedSource, merge_locks, source_matches, split_locks};
 use crate::matcher::PathMatcher;
@@ -74,6 +74,35 @@ fn target_parent(path: &Path) -> PathBuf {
     }
 }
 
+/// The protocol a source resolves under: its own, else the global default, else https.
+fn effective_protocol(source: &Source, config: &Config) -> Protocol {
+    source
+        .protocol
+        .or(config.protocol)
+        .unwrap_or(Protocol::Https)
+}
+
+/// Resolves every source's concrete remote once, keyed by source name. A resolution
+/// failure (unknown host, missing protocol template) surfaces named by source.
+fn resolved_remotes(config: &Config) -> Result<BTreeMap<String, String>> {
+    let mut remotes = BTreeMap::new();
+    for (name, source) in &config.sources {
+        let protocol = effective_protocol(source, config);
+        let remote = source
+            .resolved_remote(&config.hosts, protocol)
+            .map_err(|e| Error::Config(format!("source `{name}`: {e}")))?;
+        remotes.insert(name.clone(), remote);
+    }
+    Ok(remotes)
+}
+
+fn remote_for<'a>(remotes: &'a BTreeMap<String, String>, name: &str) -> Result<&'a str> {
+    remotes
+        .get(name)
+        .map(String::as_str)
+        .ok_or_else(|| Error::Config(format!("no resolved remote for source `{name}`")))
+}
+
 /// Distinct suffix per call so sibling staging dirs in a shared base never collide.
 fn nonce() -> u64 {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -86,8 +115,10 @@ pub fn sync(
     registry: &dyn Registry,
 ) -> Result<SyncOutput> {
     let effective_config = merge_configs(input.base_config.clone(), input.local_config.cloned());
+    effective_config.validate()?;
     validate_source_references(&effective_config)?;
-    validate_link_mode(input.base_config, &effective_config)?;
+    let remotes = resolved_remotes(&effective_config)?;
+    validate_link_mode(input.base_config, &effective_config, &remotes)?;
     let effective_lock = match (&input.base_lock, &input.local_lock) {
         (Some(base), local) => Some(merge_locks(base, local.as_ref())),
         (None, Some(local)) => Some(local.clone()),
@@ -111,6 +142,7 @@ pub fn sync(
 
     let (routed, resolved_commits) = resolve_sources(
         &effective_config,
+        &remotes,
         effective_lock.as_ref(),
         backend,
         input.force,
@@ -126,6 +158,7 @@ pub fn sync(
                 target_name,
                 target,
                 commits: &resolved_commits,
+                remotes: &remotes,
                 force: input.force,
                 interactive: input.interactive,
                 resolver: input.resolver,
@@ -140,7 +173,13 @@ pub fn sync(
         if had_failures {
             eprintln!("phora: skipping --prune because some artifacts failed to deploy");
         } else {
-            prune_orphans(&effective_config, backend, registry, &resolved_commits)?;
+            prune_orphans(
+                &effective_config,
+                &remotes,
+                backend,
+                registry,
+                &resolved_commits,
+            )?;
         }
     }
 
@@ -164,7 +203,11 @@ fn validate_source_references(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn validate_link_mode(base: &Config, effective: &Config) -> Result<()> {
+fn validate_link_mode(
+    base: &Config,
+    effective: &Config,
+    remotes: &BTreeMap<String, String>,
+) -> Result<()> {
     for (name, source) in &base.sources {
         if source.deploy_mode() == DeployMode::Link {
             return Err(Error::Config(format!(
@@ -174,7 +217,7 @@ fn validate_link_mode(base: &Config, effective: &Config) -> Result<()> {
         }
     }
     for (name, source) in &effective.sources {
-        let git = source.git.as_deref().unwrap_or_default(); // HAS-003: host-mode resolves via resolved_remote
+        let git = remote_for(remotes, name)?;
         if source.deploy_mode() == DeployMode::Link && !is_local_path(git) {
             return Err(Error::Config(format!(
                 "source `{name}`: deploy = \"link\" requires a local filesystem path, \
@@ -191,6 +234,7 @@ struct TargetRun<'a> {
     target_name: &'a str,
     target: &'a Target,
     commits: &'a BTreeMap<String, String>,
+    remotes: &'a BTreeMap<String, String>,
     force: bool,
     interactive: bool,
     resolver: Option<&'a dyn ConflictResolver>,
@@ -213,9 +257,10 @@ fn deploy_target(
             Error::Config(format!("target references undefined source: {source_name}"))
         })?;
         let commit = &run.commits[source_name];
+        let git = remote_for(run.remotes, source_name)?;
         let matcher = PathMatcher::new(source.includes(), source.excludes())?;
         let discovered =
-            discover_artifacts_for_source(source, source_name, commit, backend, &matcher)?;
+            discover_artifacts_for_source(source, git, source_name, commit, backend, &matcher)?;
 
         for artifact_name in discovered {
             if layout.kind == LayoutKind::Flat {
@@ -239,6 +284,7 @@ fn deploy_target(
 
             let entry = ArtifactEntry {
                 source,
+                git,
                 source_name,
                 commit,
                 matcher: &matcher,
@@ -257,6 +303,7 @@ fn deploy_target(
 
 struct ArtifactEntry<'a> {
     source: &'a Source,
+    git: &'a str,
     source_name: &'a str,
     commit: &'a str,
     matcher: &'a PathMatcher,
@@ -314,6 +361,7 @@ fn deploy_artifact_entry(
                 target_path: entry.target_path,
                 layout_kind: entry.layout_kind,
                 source: entry.source,
+                git: entry.git,
                 source_name: entry.source_name,
                 commit: entry.commit,
                 matcher: entry.matcher,
@@ -397,6 +445,7 @@ type RoutedSources = (Vec<(String, LockedSource)>, BTreeMap<String, String>);
 
 fn resolve_sources(
     config: &Config,
+    remotes: &BTreeMap<String, String>,
     effective_lock: Option<&Lock>,
     backend: &dyn SourceBackend,
     force: bool,
@@ -405,15 +454,14 @@ fn resolve_sources(
     let mut resolved_commits = BTreeMap::new();
 
     for (name, source) in &config.sources {
-        // HAS-003: resolve via resolved_remote (host-mode sources)
-        let git = source.git.clone().unwrap_or_default();
+        let git = remote_for(remotes, name)?;
         if source.deploy_mode() == DeployMode::Link {
-            let commit = read_local_head(&git)?;
+            let commit = read_local_head(git)?;
             routed.push((
                 name.clone(),
                 LockedSource {
                     name: name.clone(),
-                    git: git.clone(),
+                    git: git.to_owned(),
                     resolved: "link".to_owned(),
                     commit: commit.clone(),
                     digest: "link:".to_owned(),
@@ -428,20 +476,20 @@ fn resolve_sources(
         let commit = match locked {
             Some(l) if source_matches(source, l) && !force => l.commit.clone(),
             _ => {
-                backend.fetch(name, &git)?;
-                backend.resolve(name, &git, &source.refspec())?
+                backend.fetch(name, git)?;
+                backend.resolve(name, git, &source.refspec())?
             }
         };
 
         let matcher = PathMatcher::new(source.includes(), source.excludes())?;
         let digest =
-            backend.compute_digest(name, &git, &commit, source.root.as_deref(), &matcher)?;
+            backend.compute_digest(name, git, &commit, source.root.as_deref(), &matcher)?;
 
         routed.push((
             name.clone(),
             LockedSource {
                 name: name.clone(),
-                git: git.clone(),
+                git: git.to_owned(),
                 resolved: source.refspec().to_string(),
                 commit: commit.clone(),
                 digest,
@@ -458,6 +506,7 @@ struct DeployContext<'a> {
     target_path: &'a Path,
     layout_kind: LayoutKind,
     source: &'a Source,
+    git: &'a str,
     source_name: &'a str,
     commit: &'a str,
     matcher: &'a PathMatcher,
@@ -476,7 +525,7 @@ fn deploy_one(
     let staging = staging_base.join(format!("{}-{}", ctx.artifact_name, nonce()));
     let mut staging_guard = StagingGuard::new(&staging_base, &staging);
 
-    let git = ctx.source.git.as_deref().unwrap_or_default(); // HAS-003: host-mode resolves via resolved_remote
+    let git = ctx.git;
     let commit_time = backend.commit_time(ctx.source_name, git, ctx.commit)?;
     let policy = ctx.source.export_policy();
     let req = ExportRequest {
@@ -552,9 +601,9 @@ fn deploy_link(
     )
 }
 
-/// Absolute working-tree path the symlink points at: `<source.git>/<root>/<artifact>`.
+/// Absolute working-tree path the symlink points at: `<remote>/<root>/<artifact>`.
 fn link_target(entry: &ArtifactEntry<'_>) -> PathBuf {
-    let base = Path::new(entry.source.git.as_deref().unwrap_or_default()); // HAS-003: host-mode resolves via resolved_remote
+    let base = Path::new(entry.git);
     let mut target = if base.is_absolute() {
         base.to_path_buf()
     } else {
@@ -642,12 +691,12 @@ fn discover_working_tree(
 
 fn discover_artifacts_for_source(
     source: &Source,
+    git: &str,
     source_name: &str,
     commit: &str,
     backend: &dyn SourceBackend,
     matcher: &PathMatcher,
 ) -> Result<Vec<String>> {
-    let git = source.git.as_deref().unwrap_or_default(); // HAS-003: host-mode resolves via resolved_remote
     match source.deploy_mode() {
         DeployMode::Link => {
             discover_working_tree(Path::new(git), source.root.as_deref(), matcher)
@@ -664,6 +713,7 @@ fn discover_artifacts_for_source(
 
 fn prune_orphans(
     config: &Config,
+    remotes: &BTreeMap<String, String>,
     backend: &dyn SourceBackend,
     registry: &dyn Registry,
     resolved_commits: &BTreeMap<String, String>,
@@ -675,9 +725,10 @@ fn prune_orphans(
                 Error::Config(format!("target references undefined source: {source_name}"))
             })?;
             let commit = &resolved_commits[source_name];
+            let git = remote_for(remotes, source_name)?;
             let matcher = PathMatcher::new(source.includes(), source.excludes())?;
             let discovered =
-                discover_artifacts_for_source(source, source_name, commit, backend, &matcher)?;
+                discover_artifacts_for_source(source, git, source_name, commit, backend, &matcher)?;
             for artifact in discovered {
                 expected.insert(ArtifactKey {
                     target: target_name.clone(),
@@ -846,6 +897,7 @@ pub fn rebuild_registry(
     registry: &dyn Registry,
 ) -> Result<RebuildReport> {
     let mut report = RebuildReport::default();
+    let remotes = resolved_remotes(config)?;
 
     for (target_name, target) in &config.targets {
         let mut managed: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -860,10 +912,11 @@ pub fn rebuild_registry(
                 ))
             })?;
             let commit = &locked.commit;
+            let git = remote_for(&remotes, source_name)?;
             let matcher = PathMatcher::new(source.includes(), source.excludes())?;
             let policy = source.export_policy();
             let discovered =
-                discover_artifacts_for_source(source, source_name, commit, backend, &matcher)?;
+                discover_artifacts_for_source(source, git, source_name, commit, backend, &matcher)?;
 
             for artifact in discovered {
                 let key = ArtifactKey {
@@ -883,6 +936,7 @@ pub fn rebuild_registry(
                         backend,
                         registry,
                         source,
+                        git,
                         source_name,
                         commit,
                         matcher: &matcher,
@@ -912,6 +966,7 @@ struct RebuildOne<'a> {
     backend: &'a dyn SourceBackend,
     registry: &'a dyn Registry,
     source: &'a Source,
+    git: &'a str,
     source_name: &'a str,
     commit: &'a str,
     matcher: &'a PathMatcher,
@@ -928,6 +983,7 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         backend,
         registry,
         source,
+        git,
         source_name,
         commit,
         matcher,
@@ -943,7 +999,6 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
     let staging = staging_base.join(format!("{artifact}-{}-{}", std::process::id(), nonce()));
     let _guard = StagingGuard::new(&staging_base, &staging);
 
-    let git = source.git.as_deref().unwrap_or_default(); // HAS-003: host-mode resolves via resolved_remote
     let commit_time = backend.commit_time(source_name, git, commit)?;
     let export = backend.export_artifact(&ExportRequest {
         source: source_name,
@@ -1492,7 +1547,8 @@ mod tests {
         // No mirror is seeded for fx.url: a fetch/compute_digest would error.
 
         let counting = CountingBackend::new(&fx.backend);
-        let (routed, _commits) = resolve_sources(&cfg, None, &counting, false)
+        let remotes = resolved_remotes(&cfg).expect("remotes resolve");
+        let (routed, _commits) = resolve_sources(&cfg, &remotes, None, &counting, false)
             .expect("link source resolves with no reachable mirror");
 
         let (_name, locked) = routed
@@ -1527,7 +1583,8 @@ mod tests {
         let cfg = config_with_link_source("dev-src", &fx.url);
 
         let counting = CountingBackend::new(&fx.backend);
-        let _ = resolve_sources(&cfg, None, &counting, false)
+        let remotes = resolved_remotes(&cfg).expect("remotes resolve");
+        let _ = resolve_sources(&cfg, &remotes, None, &counting, false)
             .expect("link source resolves without touching the mirror");
 
         assert_eq!(
@@ -2341,12 +2398,14 @@ mod tests {
         let journal = Journal::open(&fx.registry.locks_dir()).expect("open journal");
         let commits: BTreeMap<String, String> =
             std::iter::once(("editor-src".to_owned(), fx.head_sha.clone())).collect();
+        let remotes = resolved_remotes(&cfg).expect("remotes resolve");
 
         let run = TargetRun {
             config: &cfg,
             target_name: "dest",
             target,
             commits: &commits,
+            remotes: &remotes,
             force: false,
             interactive: false,
             resolver: None,
@@ -2354,6 +2413,9 @@ mod tests {
         let matcher = PathMatcher::new(source.includes(), source.excludes()).expect("matcher");
         let entry = ArtifactEntry {
             source,
+            git: remotes
+                .get("editor-src")
+                .expect("resolved_remotes covers every source"),
             source_name: "editor-src",
             commit: &fx.head_sha,
             matcher: &matcher,
@@ -4220,8 +4282,9 @@ mod tests {
 
         let commits: BTreeMap<String, String> =
             std::iter::once(("linked-src".to_owned(), "link".to_owned())).collect();
+        let remotes = resolved_remotes(&cfg).expect("remotes resolve");
 
-        prune_orphans(&cfg, &fx_backend(), &registry, &commits)
+        prune_orphans(&cfg, &remotes, &fx_backend(), &registry, &commits)
             .expect("prune must remove the orphaned linked artifact");
 
         assert!(
@@ -4290,7 +4353,8 @@ mod tests {
         // base-overlay provenance guard can reject it (the path is local).
         let base = config_link_source_one_target("base-linked", wt.path(), &td.target_path());
 
-        let Err(err) = validate_link_mode(&base, &base) else {
+        let remotes = resolved_remotes(&base).expect("remotes resolve");
+        let Err(err) = validate_link_mode(&base, &base, &remotes) else {
             panic!(
                 "deploy = \"link\" set in the committed base config must be rejected as a \
                  non-local-overlay setting, not silently honored"
@@ -4318,7 +4382,8 @@ mod tests {
             "premise: the overlay must make the effective mode Link"
         );
 
-        let Err(err) = validate_link_mode(&base, &effective) else {
+        let remotes = resolved_remotes(&effective).expect("remotes resolve");
+        let Err(err) = validate_link_mode(&base, &effective, &remotes) else {
             panic!(
                 "deploy = \"link\" on a remote-URL git must be rejected (a remote has no \
                  working tree to symlink), even when the link is overlay-only"
@@ -4357,7 +4422,8 @@ mod tests {
             "premise: the overlay must downgrade the effective mode to Copy"
         );
 
-        let Err(err) = validate_link_mode(&base, &effective) else {
+        let remotes = resolved_remotes(&effective).expect("remotes resolve");
+        let Err(err) = validate_link_mode(&base, &effective, &remotes) else {
             panic!(
                 "deploy = \"link\" committed in the base config must be rejected REGARDLESS of a \
                  local overlay downgrading the source to copy"
@@ -4384,7 +4450,8 @@ mod tests {
             "premise: the overlay must make the effective mode Link"
         );
 
-        validate_link_mode(&base, &effective).expect(
+        let remotes = resolved_remotes(&effective).expect("remotes resolve");
+        validate_link_mode(&base, &effective, &remotes).expect(
             "a link confined to phora.local.toml over a local path must pass both the \
              base-overlay and local-path guards",
         );
@@ -4917,5 +4984,349 @@ mod tests {
             fx.src.path().join("editor"),
             "the correct symlink must still point at the same working-tree target"
         );
+    }
+
+    /// Splits a local fixture path into `(parent, basename)` so a host template
+    /// `<parent>/{path}` filled with `basename` reproduces the literal path verbatim.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "fixture paths always have a parent + final component"
+    )]
+    fn split_remote_path(url: &str) -> (String, String) {
+        let p = Path::new(url);
+        let parent = p.parent().unwrap().to_string_lossy().into_owned();
+        let base = p.file_name().unwrap().to_string_lossy().into_owned();
+        (parent, base)
+    }
+
+    /// A single host+path source resolving against `[hosts.fixturehost]` whose
+    /// `remote` template fills to the local fixture repo, plus one flat target.
+    fn config_host_source_one_target(
+        source: &str,
+        url: &str,
+        target: &str,
+        target_path: &Path,
+    ) -> Config {
+        let (parent, base) = split_remote_path(url);
+        let toml = format!(
+            "version = 1\n\n\
+             [hosts.fixturehost]\nremote = \"{parent}/{{path}}\"\n\n\
+             [sources.{source}]\nhost = \"fixturehost\"\npath = \"{base}\"\nbranch = \"main\"\n\n\
+             [targets.{target}]\npath = \"{}\"\nsources = [\"{source}\"]\nlayout = \"flat\"\n",
+            target_path.display(),
+        );
+        Config::parse(&toml).expect("host+path one-target config parses")
+    }
+
+    /// A host+path source must fetch, resolve, and deploy IDENTICALLY to its
+    /// literal-URL twin: same resolved commit and the same deployed artifact bytes.
+    #[test]
+    fn host_path_source_syncs_identically_to_its_literal_twin() {
+        let fx = build_sync_fixture();
+
+        let td_lit = TargetDir::new();
+        let cfg_lit = config_one_source_one_target(
+            "editor-src",
+            &fx.url,
+            "dest",
+            &td_lit.target_path(),
+            "flat",
+        );
+        let in_lit = input(&cfg_lit, None, None, None, false);
+        let git_dir_lit = TempDir::new().expect("literal git dir");
+        let state_dir_lit = TempDir::new().expect("literal state dir");
+        let backend_lit = GitBackend::new(git_dir_lit.path().to_path_buf());
+        let registry_lit =
+            FileRegistry::open(state_dir_lit.path().to_path_buf()).expect("literal registry");
+        let out_lit =
+            sync(&in_lit, &backend_lit, &registry_lit).expect("literal-twin sync deploys");
+
+        let td_host = TargetDir::new();
+        let cfg_host =
+            config_host_source_one_target("editor-src", &fx.url, "dest", &td_host.target_path());
+        let in_host = input(&cfg_host, None, None, None, false);
+        let git_dir_host = TempDir::new().expect("host git dir");
+        let state_dir_host = TempDir::new().expect("host state dir");
+        let backend_host = GitBackend::new(git_dir_host.path().to_path_buf());
+        let registry_host =
+            FileRegistry::open(state_dir_host.path().to_path_buf()).expect("host registry");
+        let out_host =
+            sync(&in_host, &backend_host, &registry_host).expect("host+path sync deploys");
+
+        let commit_lit = out_lit
+            .base_lock
+            .find_source("editor-src")
+            .expect("literal twin locked")
+            .commit
+            .clone();
+        let commit_host = out_host
+            .base_lock
+            .find_source("editor-src")
+            .expect("host+path locked")
+            .commit
+            .clone();
+        assert_eq!(
+            commit_host, commit_lit,
+            "a host+path source must resolve to the SAME commit as its literal twin"
+        );
+        assert_eq!(
+            commit_host, fx.head_sha,
+            "the host+path source must resolve branch main to the fixture HEAD"
+        );
+
+        let dst_lit = td_lit.artifact_dst(&flat_layout(), "editor-src", "editor");
+        let dst_host = td_host.artifact_dst(&flat_layout(), "editor-src", "editor");
+        let bytes_lit =
+            std::fs::read(dst_lit.join("init.lua")).expect("literal twin deployed init.lua");
+        let bytes_host =
+            std::fs::read(dst_host.join("init.lua")).expect("host+path deployed init.lua");
+        assert_eq!(
+            bytes_host, bytes_lit,
+            "a host+path source must deploy the SAME artifact bytes as its literal twin"
+        );
+        assert_eq!(
+            bytes_host, b"-- init\n",
+            "the host+path deploy must materialize the fixture's init.lua content"
+        );
+    }
+
+    /// Regression: a literal-`git` source still syncs and deploys unchanged.
+    #[test]
+    fn literal_git_source_still_syncs_unchanged() {
+        let fx = build_sync_fixture();
+        let td = TargetDir::new();
+        let cfg =
+            config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+        let in_ = input(&cfg, None, None, None, false);
+
+        let out = sync(&in_, &fx.backend, &fx.registry).expect("literal source still syncs");
+
+        assert_eq!(
+            out.base_lock
+                .find_source("editor-src")
+                .expect("literal source locked")
+                .commit,
+            fx.head_sha,
+            "a literal-git source must keep resolving to the fixture HEAD"
+        );
+        let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+        assert_eq!(
+            std::fs::read(dst.join("init.lua")).expect("literal deployed init.lua"),
+            b"-- init\n",
+            "a literal-git source must keep deploying its artifact bytes"
+        );
+    }
+
+    /// Records every URL each backend op is asked about, so a test can prove which
+    /// resolved remote the wiring actually fetched (protocol precedence).
+    struct RecordingBackend<'a> {
+        inner: &'a GitBackend,
+        urls: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl<'a> RecordingBackend<'a> {
+        fn new(inner: &'a GitBackend) -> Self {
+            Self {
+                inner,
+                urls: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        fn fetched_urls(&self) -> Vec<String> {
+            self.urls.borrow().clone()
+        }
+    }
+
+    impl SourceBackend for RecordingBackend<'_> {
+        fn fetch(&self, source: &str, url: &str) -> Result<()> {
+            self.urls.borrow_mut().push(url.to_owned());
+            self.inner.fetch(source, url)
+        }
+        fn resolve(&self, source: &str, url: &str, refspec: &Refspec) -> Result<String> {
+            self.inner.resolve(source, url, refspec)
+        }
+        fn commit_time(&self, source: &str, url: &str, commit: &str) -> Result<u64> {
+            self.inner.commit_time(source, url, commit)
+        }
+        fn discover_artifacts(
+            &self,
+            source: &str,
+            url: &str,
+            commit: &str,
+            root: Option<&Path>,
+            matcher: &crate::matcher::PathMatcher,
+        ) -> Result<Vec<String>> {
+            self.inner
+                .discover_artifacts(source, url, commit, root, matcher)
+        }
+        fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult> {
+            self.inner.export_artifact(req)
+        }
+        fn compute_digest(
+            &self,
+            source: &str,
+            url: &str,
+            commit: &str,
+            root: Option<&Path>,
+            matcher: &crate::matcher::PathMatcher,
+        ) -> Result<String> {
+            self.inner
+                .compute_digest(source, url, commit, root, matcher)
+        }
+    }
+
+    /// A repo at `<parent>/<name>` (name shared across calls) whose `editor/init.lua`
+    /// holds `content`, returning the parent tempdir + the repo URL.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "fixture setup fails loudly; git CLI is assumed present"
+    )]
+    fn build_repo_named(name: &str, content: &[u8]) -> (TempDir, String) {
+        let parent = TempDir::new().unwrap();
+        let repo = parent.path().join(name);
+        std::fs::create_dir_all(repo.join("editor")).unwrap();
+        run_git(&repo, &["init", "-b", "main", "."]);
+        run_git(&repo, &["config", "user.email", "test@example.com"]);
+        run_git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("editor/init.lua"), content).unwrap();
+        run_git(&repo, &["add", "-A"]);
+        run_git(&repo, &["commit", "-m", "init"]);
+        let url = repo.to_string_lossy().into_owned();
+        (parent, url)
+    }
+
+    /// With global=https but source protocol=ssh, the source resolves to the SSH
+    /// repo's HEAD; wrong precedence (global https winning) picks the https HEAD.
+    #[test]
+    fn per_source_protocol_beats_global_default() {
+        let (https_src, https_url) = build_repo_named("repo", b"-- https\n");
+        let (ssh_src, ssh_url) = build_repo_named("repo", b"-- ssh\n");
+        let https_head = rev_parse(Path::new(&https_url), "HEAD");
+        let ssh_head = rev_parse(Path::new(&ssh_url), "HEAD");
+        assert_ne!(
+            https_head, ssh_head,
+            "premise: the two protocol repos must have distinct HEADs"
+        );
+
+        let (https_parent, https_base) = split_remote_path(&https_url);
+        let (ssh_parent, ssh_base) = split_remote_path(&ssh_url);
+        assert_eq!(
+            https_base, ssh_base,
+            "premise: both repos must share a basename so one {{path}} value selects either by protocol"
+        );
+
+        let td = TargetDir::new();
+        let toml = format!(
+            "version = 1\nprotocol = \"https\"\n\n\
+             [hosts.dual]\nremote = {{ https = \"{https_parent}/{{path}}\", ssh = \"{ssh_parent}/{{path}}\" }}\n\n\
+             [sources.editor-src]\nhost = \"dual\"\npath = \"{ssh_base}\"\nprotocol = \"ssh\"\nbranch = \"main\"\n\n\
+             [targets.dest]\npath = \"{}\"\nsources = [\"editor-src\"]\nlayout = \"flat\"\n",
+            td.target_path().display(),
+        );
+        let cfg = Config::parse(&toml).expect("dual-protocol config parses");
+        let in_ = input(&cfg, None, None, None, false);
+
+        let git_dir = TempDir::new().expect("git dir");
+        let state_dir = TempDir::new().expect("state dir");
+        let inner = GitBackend::new(git_dir.path().to_path_buf());
+        let recording = RecordingBackend::new(&inner);
+        let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("registry");
+
+        let out = sync(&in_, &recording, &registry).expect("dual-protocol sync deploys");
+
+        let commit = out
+            .base_lock
+            .find_source("editor-src")
+            .expect("editor-src locked")
+            .commit
+            .clone();
+        assert_eq!(
+            commit, ssh_head,
+            "per-source protocol=ssh must win over global https: resolve via the SSH repo's HEAD"
+        );
+        assert!(
+            recording.fetched_urls().iter().any(|u| u == &ssh_url),
+            "the wiring must fetch the SSH-resolved remote `{ssh_url}`, got {:?}",
+            recording.fetched_urls()
+        );
+
+        let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+        assert_eq!(
+            std::fs::read(dst.join("init.lua")).expect("deployed init.lua"),
+            b"-- ssh\n",
+            "the deployed bytes must come from the SSH repo (per-source protocol wins)"
+        );
+
+        drop(https_src);
+        drop(ssh_src);
+    }
+
+    /// When a source OMITS its own `protocol`, the top-level `Config.protocol`
+    /// must apply (the MIDDLE rung of `protocol ?? config.protocol ?? Https`).
+    /// Global=ssh with a silent source must resolve/fetch/deploy via the SSH
+    /// repo. A wrong impl that ignored config.protocol and used the Https
+    /// default would resolve to the https repo's HEAD and FAIL this test.
+    #[test]
+    fn global_protocol_applies_when_source_omits_protocol() {
+        let (https_src, https_url) = build_repo_named("repo", b"-- https\n");
+        let (ssh_src, ssh_url) = build_repo_named("repo", b"-- ssh\n");
+        let https_head = rev_parse(Path::new(&https_url), "HEAD");
+        let ssh_head = rev_parse(Path::new(&ssh_url), "HEAD");
+        assert_ne!(
+            https_head, ssh_head,
+            "premise: the two protocol repos must have distinct HEADs"
+        );
+
+        let (https_parent, https_base) = split_remote_path(&https_url);
+        let (ssh_parent, ssh_base) = split_remote_path(&ssh_url);
+        assert_eq!(
+            https_base, ssh_base,
+            "premise: both repos must share a basename so one {{path}} value selects either by protocol"
+        );
+
+        let td = TargetDir::new();
+        let toml = format!(
+            "version = 1\nprotocol = \"ssh\"\n\n\
+             [hosts.dual]\nremote = {{ https = \"{https_parent}/{{path}}\", ssh = \"{ssh_parent}/{{path}}\" }}\n\n\
+             [sources.editor-src]\nhost = \"dual\"\npath = \"{ssh_base}\"\nbranch = \"main\"\n\n\
+             [targets.dest]\npath = \"{}\"\nsources = [\"editor-src\"]\nlayout = \"flat\"\n",
+            td.target_path().display(),
+        );
+        let cfg = Config::parse(&toml).expect("config-default-protocol config parses");
+        let in_ = input(&cfg, None, None, None, false);
+
+        let git_dir = TempDir::new().expect("git dir");
+        let state_dir = TempDir::new().expect("state dir");
+        let inner = GitBackend::new(git_dir.path().to_path_buf());
+        let recording = RecordingBackend::new(&inner);
+        let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("registry");
+
+        let out = sync(&in_, &recording, &registry).expect("config-default-protocol sync deploys");
+
+        let commit = out
+            .base_lock
+            .find_source("editor-src")
+            .expect("editor-src locked")
+            .commit
+            .clone();
+        assert_eq!(
+            commit, ssh_head,
+            "a silent source must inherit config.protocol=ssh: resolve via the SSH repo's HEAD, not the Https default"
+        );
+        assert!(
+            recording.fetched_urls().iter().any(|u| u == &ssh_url),
+            "the wiring must fetch the config-resolved SSH remote `{ssh_url}`, got {:?}",
+            recording.fetched_urls()
+        );
+
+        let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+        assert_eq!(
+            std::fs::read(dst.join("init.lua")).expect("deployed init.lua"),
+            b"-- ssh\n",
+            "the deployed bytes must come from the SSH repo (config.protocol applies to a silent source)"
+        );
+
+        drop(https_src);
+        drop(ssh_src);
     }
 }
