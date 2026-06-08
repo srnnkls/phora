@@ -202,6 +202,41 @@ batch_reviews:
       guard tests (the prune test asserts the symlink TARGET survives). Closed deferred DLD-003-L1
       (worktree_scan_missing_path_errors hardened to a hermetic TempDir). 271 lib tests green, clippy clean.
 
+  - batch: 5a
+    timestamp: 2026-06-08
+    tasks: [DLD-007]
+    phase_a5_test_review:
+      harnesses: [claude-opus (orchestrator inspection), pi]
+      result: clean-after-revision
+      note: >
+        Pi flagged the idempotence guard as invalid (HIGH: used a copy config; MEDIUM: export_count==0 can't
+        detect a link re-deploy since deploy_link never exports). Re-dispatched tester: guard rewritten to use
+        deploy=link both legs + symlink-inode-stability detection; verify call fixed to use the effective config.
+        Pi re-review confirmed the guard valid + green.
+    reviewers:
+      - id: general+arch+style-claude-opus
+        status: success
+        gates: { correctness: pass, architecture: pass, style: pass }
+      - id: general+arch+style-claude-opus-independent
+        status: success
+        gates: { correctness: pass, architecture: pass, style: pass }
+        note: >
+          Pi auto-backgrounds on larger diffs and drops output; substituted a fresh independent Claude reviewer.
+          Confirmed mode_transition truth table correct for all 8 cases, no coverage hole, H1 reinterpretation legit.
+    synthesized:
+      gates: { correctness: pass, architecture: pass, style: pass }
+      critical_issues: 0
+      high_issues: 0
+      medium_issues: 0
+    outcome: approved
+    notes: >
+      Effective-mode-aware transition: deploy_target computes mode_transition (Link => dst exists & not symlink;
+      Copy => dst is symlink) threaded via ArtifactEntry; deploy_artifact_entry forces Overwrite on transition,
+      bypassing the Clean/Linked no-op, while preserving idempotence (correct link/copy re-sync stay no-ops).
+      Covers copy->link, link->copy, AND the deferred DLD-005-M1 (linked-record-over-real-dir re-links). Logic
+      hoisted to deploy_target (not deploy_artifact_entry) because H1's direct-call scenario makes (mode,dst,state)
+      ambiguous there. 275 lib tests green, clippy clean. Closes DLD-005-M1.
+
 issues:
   critical: []
   high: []
@@ -221,12 +256,10 @@ deferred_issues:
       only ever written by phora's own link-deploy, so divergence requires external mutation. Not a
       regression; medium, non-blocking.
     defer_to: DLD-007
-    candidate_fix_for: DLD-005-M1
-    candidate_fix: >
-      In the Linked short-circuit, when the dst is present but NOT a symlink, return Missing (redeploy
-      the link) instead of Linked — mirrors the dangling-link => Missing => redeploy policy and stays
-      within "never Modified/Foreign". Add a test "linked record over a real dir => Missing/redeploy"
-      in DLD-007 (transitions) before implementing.
+    status: >
+      RESOLVED in batch 5a (DLD-007). The mode-transition logic in deploy_target redeploys a linked
+      record whose dst is not a symlink (effective Link + dst not symlink => mode_transition => re-link).
+      Pinned by test linked_record_over_real_dir_redeploys_symlink.
   - id: DLD-003-L1
     severity: low
     found_by: [pi]
@@ -242,6 +275,20 @@ deferred_issues:
     issue: "No deterministic test proves link deploy ATOMICITY under interruption (stale-link test asserts only final state)."
     assessment: "Atomicity holds by construction (temp-symlink beside-in-.phora-stage + atomic rename) + the journal/recovery_sweep contract (now shared with the copy path). A true crash-window test needs a process-kill/fault-injection harness — disproportionate for this scope."
     defer_to: follow-up (scope Verification lists 'atomic symlink + crash window' as a future target)
+  - id: DLD-007-L1
+    severity: low
+    found_by: [claude-opus-independent]
+    area: conflict-detection
+    issue: >
+      A foreign hand-placed symlink (no phora record) at a Copy-mode destination is overwritten on sync
+      without a Foreign prompt or --force, because mode_transition uses dst-type as a proxy and cannot
+      distinguish phora's prior link from a user-placed symlink.
+    assessment: >
+      Deliberate design tradeoff inherent to the H1 (mode,dst,state) ambiguity. Real-DIRECTORY foreign
+      content at a copy dst is fully protected (mode_transition=false). Narrow edge case (manually placing
+      a symlink at a copy artifact dst); the intentional-deploy-mode-flip-dominates semantics apply. Low,
+      non-blocking; documented as accepted.
+    defer_to: accepted (no fix)
   - id: DLD-003-N1
     severity: note
     found_by: [pi]

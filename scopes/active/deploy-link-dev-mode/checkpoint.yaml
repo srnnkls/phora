@@ -3,22 +3,22 @@ checkpoint:
   scope_path: ./scopes/active/deploy-link-dev-mode
   branch: feat/deploy-link-dev-mode
   timestamp: 2026-06-08
-  last_batch: 4
+  last_batch: 5a
   tasks:
-    done: [DLD-001, DLD-005, DLD-003, DLD-009, DLD-002, DLD-004, DLD-006]
-    pending: [DLD-007, DLD-008]
+    done: [DLD-001, DLD-005, DLD-003, DLD-009, DLD-002, DLD-004, DLD-006, DLD-007]
+    pending: [DLD-008]
   next_batch:
-    number: 5
-    title: "DLD-007 transitions (+ fix DLD-005-M1) then DLD-008 docs"
-    tasks: [DLD-007, DLD-008]
+    number: 5b
+    title: "DLD-008 docs + phora.local.toml example (final task)"
+    tasks: [DLD-008]
   note: >
-    Phases 1-4 complete. Phase 5: DLD-007 link<->copy transitions — also a good place to fix deferred
-    DLD-005-M1 (linked short-circuit should return Missing when dst is not a symlink). Then DLD-008 docs.
-    DLD-007 and DLD-008 touch different files (sync/projection vs README/example) so they COULD run in
-    parallel, but DLD-007 is code+tests and DLD-008 is docs — run DLD-007 first, then DLD-008.
+    All CODE tasks complete; link mode works end-to-end (config, guardrails, resolve, discover, deploy,
+    quarantine, transitions). DLD-008 is docs-only (README + example): local-only, overlay-only, live-edit,
+    integrity carve-out, dangling-link, Windows warn-and-continue. After DLD-008: final review + /scope done.
   deferred_issues:
-    - DLD-005-M1 (medium): linked short-circuit doesn't verify dst is a symlink; fix in DLD-007.
-    - DLD-004-M2 (medium): no deterministic atomicity/crash-window test for link deploy; follow-up.
-    - DLD-003-L1 (low): RESOLVED in batch 4.
+    - DLD-005-M1 (medium): RESOLVED in DLD-007 (linked-over-real-dir re-links).
+    - DLD-003-L1 (low): RESOLVED in DLD-006.
+    - DLD-004-M2 (medium): no deterministic crash-window atomicity test; follow-up (atomicity by construction).
+    - DLD-007-L1 (low): foreign symlink at copy dst overwritten without prompt; accepted design tradeoff.
   review_config:
     reviewers: [opus, sonnet]
