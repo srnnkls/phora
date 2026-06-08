@@ -12,7 +12,7 @@ use crate::projection::{
     ArtifactState, Journal, check_artifact_state, deploy_artifact, recovery_sweep,
 };
 use crate::registry::{ArtifactKey, EjectedEntry, ManifestFile, Registry, RegistryRecord};
-use crate::source::{ExportRequest, SourceBackend, read_local_head};
+use crate::source::{ExportRequest, SourceBackend, is_local_path, read_local_head};
 
 /// Borrowed inputs to [`sync`]: the configs and locks plus run flags. Bundled so
 /// the orchestration entry point stays stable as later phases add fields.
@@ -87,6 +87,7 @@ pub fn sync(
 ) -> Result<SyncOutput> {
     let effective_config = merge_configs(input.base_config.clone(), input.local_config.cloned());
     validate_source_references(&effective_config)?;
+    validate_link_mode(input.base_config, &effective_config)?;
     let effective_lock = match (&input.base_lock, &input.local_lock) {
         (Some(base), local) => Some(merge_locks(base, local.as_ref())),
         (None, Some(local)) => Some(local.clone()),
@@ -158,6 +159,27 @@ fn validate_source_references(config: &Config) -> Result<()> {
                     "target references undefined source: {source_name}"
                 )));
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_link_mode(base: &Config, effective: &Config) -> Result<()> {
+    for (name, source) in &base.sources {
+        if source.deploy_mode() == DeployMode::Link {
+            return Err(Error::Config(format!(
+                "source `{name}`: deploy = \"link\" is only allowed in phora.local.toml, \
+                 not the committed config"
+            )));
+        }
+    }
+    for (name, source) in &effective.sources {
+        if source.deploy_mode() == DeployMode::Link && !is_local_path(&source.git) {
+            return Err(Error::Config(format!(
+                "source `{name}`: deploy = \"link\" requires a local filesystem path, \
+                 not a remote URL `{git}`",
+                git = source.git
+            )));
         }
     }
     Ok(())
@@ -3943,5 +3965,143 @@ mod tests {
         let reg = FileRegistry::open(state.path().to_path_buf()).expect("open registry");
         std::mem::forget(state);
         reg
+    }
+
+    // ── DLD-002: link-mode guardrails (sync-layer enforcement) ─────
+
+    /// A source with NO `deploy` line and no target, ready to receive a local
+    /// `deploy = "link"` overlay.
+    fn base_copy_source(source: &str, git: &Path) -> Config {
+        let toml = format!(
+            "version = 1\n\n[sources.{source}]\ngit = \"{}\"\nbranch = \"main\"\n",
+            git.display(),
+        );
+        Config::parse(&toml).expect("base source without deploy parses")
+    }
+
+    /// A local overlay setting `deploy = "link"` on `source`, pointing at a target.
+    fn local_link_overlay(source: &str, git: &Path, target_path: &Path) -> Config {
+        let toml = format!(
+            "version = 1\n\n\
+             [sources.{source}]\ngit = \"{}\"\nbranch = \"main\"\ndeploy = \"link\"\n\n\
+             [targets.dest]\npath = \"{}\"\nsources = [\"{source}\"]\nlayout = \"by-source\"\n",
+            git.display(),
+            target_path.display(),
+        );
+        Config::parse(&toml).expect("local link overlay parses")
+    }
+
+    /// Mirrors how `sync` derives the effective config from base + overlay, so a
+    /// guard keyed on provenance (base vs effective) is exercised as in production.
+    fn effective_of(base: &Config, local: &Config) -> Config {
+        merge_configs(base.clone(), Some(local.clone()))
+    }
+
+    #[test]
+    fn link_in_base_config_is_rejected_naming_the_source() {
+        let wt = build_worktree(None);
+        let td = TargetDir::new();
+        // deploy = link committed in the BASE phora.toml over a LOCAL path: only the
+        // base-overlay provenance guard can reject it (the path is local).
+        let base = config_link_source_one_target("base-linked", wt.path(), &td.target_path());
+
+        let Err(err) = validate_link_mode(&base, &base) else {
+            panic!(
+                "deploy = \"link\" set in the committed base config must be rejected as a \
+                 non-local-overlay setting, not silently honored"
+            );
+        };
+        assert!(
+            err.to_string().contains("base-linked"),
+            "the guard error must name the offending source `base-linked`, got: {err}"
+        );
+    }
+
+    #[test]
+    fn remote_git_with_link_is_rejected_naming_the_source() {
+        let td = TargetDir::new();
+        // Link comes ONLY from the overlay (base has no link), but git is a remote
+        // https URL: the base-overlay guard passes, so ONLY the local-path guard
+        // can reject this — isolating it.
+        let remote = std::path::Path::new("https://github.com/me/dotfiles.git");
+        let base = base_copy_source("remote-linked", remote);
+        let local = local_link_overlay("remote-linked", remote, &td.target_path());
+        let effective = effective_of(&base, &local);
+        assert_eq!(
+            effective.sources["remote-linked"].deploy_mode(),
+            DeployMode::Link,
+            "premise: the overlay must make the effective mode Link"
+        );
+
+        let Err(err) = validate_link_mode(&base, &effective) else {
+            panic!(
+                "deploy = \"link\" on a remote-URL git must be rejected (a remote has no \
+                 working tree to symlink), even when the link is overlay-only"
+            );
+        };
+        assert!(
+            err.to_string().contains("remote-linked"),
+            "the local-path guard error must name the offending source `remote-linked`, got: {err}"
+        );
+    }
+
+    /// A local overlay downgrading `source` to `deploy = "copy"`, pointing at a target.
+    fn local_copy_overlay(source: &str, git: &Path, target_path: &Path) -> Config {
+        let toml = format!(
+            "version = 1\n\n\
+             [sources.{source}]\ngit = \"{}\"\nbranch = \"main\"\ndeploy = \"copy\"\n\n\
+             [targets.dest]\npath = \"{}\"\nsources = [\"{source}\"]\nlayout = \"by-source\"\n",
+            git.display(),
+            target_path.display(),
+        );
+        Config::parse(&toml).expect("local copy overlay parses")
+    }
+
+    #[test]
+    fn base_link_rejected_even_when_overlay_downgrades_to_copy() {
+        let wt = build_worktree(None);
+        let td = TargetDir::new();
+        // Base commits deploy = link over a LOCAL path (provenance is the only violation),
+        // then the overlay downgrades the same source to copy.
+        let base = config_link_source_one_target("committed-link", wt.path(), &td.target_path());
+        let local = local_copy_overlay("committed-link", wt.path(), &td.target_path());
+        let effective = effective_of(&base, &local);
+        assert_eq!(
+            effective.sources["committed-link"].deploy_mode(),
+            DeployMode::Copy,
+            "premise: the overlay must downgrade the effective mode to Copy"
+        );
+
+        let Err(err) = validate_link_mode(&base, &effective) else {
+            panic!(
+                "deploy = \"link\" committed in the base config must be rejected REGARDLESS of a \
+                 local overlay downgrading the source to copy"
+            );
+        };
+        assert!(
+            err.to_string().contains("committed-link"),
+            "the base-provenance guard error must name the offending source `committed-link`, \
+             got: {err}"
+        );
+    }
+
+    #[test]
+    fn link_only_in_local_overlay_passes_the_guard() {
+        let wt = build_worktree(None);
+        let td = TargetDir::new();
+        // Link confined to the overlay over a LOCAL path: both guards must pass.
+        let base = base_copy_source("dev-src", wt.path());
+        let local = local_link_overlay("dev-src", wt.path(), &td.target_path());
+        let effective = effective_of(&base, &local);
+        assert_eq!(
+            effective.sources["dev-src"].deploy_mode(),
+            DeployMode::Link,
+            "premise: the overlay must make the effective mode Link"
+        );
+
+        validate_link_mode(&base, &effective).expect(
+            "a link confined to phora.local.toml over a local path must pass both the \
+             base-overlay and local-path guards",
+        );
     }
 }

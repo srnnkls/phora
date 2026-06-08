@@ -3,22 +3,23 @@ checkpoint:
   scope_path: ./scopes/active/deploy-link-dev-mode
   branch: feat/deploy-link-dev-mode
   timestamp: 2026-06-08
-  last_batch: 2c
+  last_batch: 2d
   tasks:
-    done: [DLD-001, DLD-005, DLD-003, DLD-009]
-    pending: [DLD-002, DLD-004, DLD-006, DLD-007, DLD-008]
+    done: [DLD-001, DLD-005, DLD-003, DLD-009, DLD-002]
+    pending: [DLD-004, DLD-006, DLD-007, DLD-008]
   next_batch:
-    number: 2d
-    title: "DLD-002 guardrails (is_local_path + local-overlay-only)"
-    tasks: [DLD-002]
+    number: 3
+    title: "DLD-004 link deployment (lean atomic symlink, deploy-closure dispatch)"
+    tasks: [DLD-004]
   note: >
-    Phase-2 sequential (shared src/sync.rs). Remaining phase-2: DLD-002 (last). Then phase-3 DLD-004
-    (the deploy-closure link dispatch — closes Pi's recurring deploy-path finding DLD-003-N1).
-    Helpers available: Source::deploy_mode(), read_local_head() (source.rs), discover_working_tree,
-    rebuild_linked. DLD-006 rebuild bullet already satisfied by DLD-003.
+    Phase 2 complete. Phase 3 = DLD-004 (deploy-closure dispatch on DeployMode; own temp-symlink+rename,
+    NOT swap_into). This closes Pi's recurring DLD-003-N1 (link deploy still hits export_artifact).
+    Helpers: Source::deploy_mode(), read_local_head, discover_working_tree, rebuild_linked,
+    is_local_path, validate_link_mode. Then phase 4 DLD-006 (verify/prune quarantine; rebuild already
+    done), phase 5 DLD-007 (transitions) + DLD-008 (docs).
   deferred_issues:
     - DLD-005-M1 (medium): linked short-circuit doesn't verify dst is a symlink; defer to DLD-007.
     - DLD-003-L1 (low): worktree_scan_missing_path_errors uses /nonexistent; harden in DLD-006.
-    - DLD-003-N1 (note): link deploy dispatch is DLD-004 (deploy closure) — Pi flags it each batch until DLD-004 lands.
+    - DLD-003-N1 (note): link deploy dispatch is DLD-004 (deploy closure) — addressed next.
   review_config:
     reviewers: [opus, sonnet]

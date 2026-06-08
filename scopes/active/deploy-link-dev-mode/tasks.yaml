@@ -21,7 +21,7 @@ tasks:
 
   - id: DLD-002
     content: "Guardrails: real local-path predicate + local-overlay-only at sync layer"
-    status: pending
+    status: done
     activeForm: "Enforcing link-mode guardrails"
     depends_on: [DLD-001]
     review_fixes:
