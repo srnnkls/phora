@@ -37,6 +37,15 @@ pub fn index_kind(repo: &gix::Repository, rel_path: &Path) -> Result<IndexKind> 
     }
 }
 
+/// Reports whether a repo-relative path is a submodule (gitlink) in the index.
+///
+/// # Errors
+///
+/// Returns [`Error::Worktree`] when the index cannot be opened or read.
+pub fn is_submodule(repo: &gix::Repository, rel_path: &Path) -> Result<bool> {
+    Ok(index_kind(repo, rel_path)? == IndexKind::Submodule)
+}
+
 fn forward_slash_key(rel_path: &Path) -> BString {
     let bytes: Vec<u8> = rel_path
         .as_os_str()
@@ -389,6 +398,71 @@ mod tests {
             tracked_kind,
             IndexKind::Tracked,
             "a genuinely tracked file must still read Tracked here, so an impl that short-circuits on disk presence (Absent for everything) is caught"
+        );
+    }
+
+    // WTI-007: is_submodule predicate
+
+    #[test]
+    fn is_submodule_true_for_gitlink_entry() {
+        let primary = init_primary();
+        let sha = head_sha(primary.path());
+        run_git(
+            primary.path(),
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{sha},sub"),
+            ],
+        );
+
+        let staged = run_git(primary.path(), &["ls-files", "-s", "sub"]);
+        let staged = String::from_utf8_lossy(&staged.stdout);
+        assert!(
+            staged.starts_with("160000 "),
+            "fixture invalid: `sub` must be a commit-mode (160000) gitlink entry, got: {staged}"
+        );
+
+        let repo = open(primary.path());
+        let result =
+            is_submodule(&repo, Path::new("sub")).expect("classifying a gitlink path must succeed");
+
+        assert!(
+            result,
+            "a gitlink (commit-mode 160000) entry must report is_submodule == true"
+        );
+    }
+
+    #[test]
+    fn is_submodule_false_for_committed_regular_file() {
+        let primary = init_primary();
+        let repo = open(primary.path());
+
+        let result = is_submodule(&repo, Path::new("README.md"))
+            .expect("classifying a committed regular file must succeed");
+
+        assert!(
+            !result,
+            "a regular committed file is tracked, not a submodule: is_submodule must be false"
+        );
+    }
+
+    #[test]
+    fn is_submodule_false_for_untracked_gitignored_present_path() {
+        let primary = init_primary();
+        std::fs::write(primary.path().join(".gitignore"), b"mise.local.toml\n")
+            .expect("write .gitignore");
+        std::fs::write(primary.path().join("mise.local.toml"), b"local = true\n")
+            .expect("create untracked local file");
+
+        let repo = open(primary.path());
+        let result = is_submodule(&repo, Path::new("mise.local.toml"))
+            .expect("classifying an untracked-but-present file must succeed");
+
+        assert!(
+            !result,
+            "an untracked gitignored present path is absent from the index, not a submodule: is_submodule must be false"
         );
     }
 
