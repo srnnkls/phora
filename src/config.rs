@@ -172,6 +172,11 @@ impl Source {
     }
 
     #[must_use]
+    pub fn deploy_mode(&self) -> DeployMode {
+        self.deploy.unwrap_or(DeployMode::Copy)
+    }
+
+    #[must_use]
     pub fn includes(&self) -> &[String] {
         self.include.as_deref().unwrap_or(&[])
     }
