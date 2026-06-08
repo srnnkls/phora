@@ -110,7 +110,7 @@ tasks:
 
   - id: DLD-007
     content: "Deploy-mode transitions: link<->copy"
-    status: pending
+    status: done
     activeForm: "Handling link/copy transitions"
     depends_on: [DLD-004, DLD-006]
     acceptance:
