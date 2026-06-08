@@ -1,0 +1,41 @@
+scope: worktree-include
+batch_reviews:
+  - batch: 1
+    tasks: [WTI-001]
+    test_review:
+      reviewers: [test-review-opus, test-review-sonnet]
+      outcome: needs_changes -> clean
+      findings_addressed:
+        - "interior `..` traversal not pinned (leading-only) -> added interior_traversal_include_path_is_rejected"
+        - "loose Err(Error::Config(_)) matching -> tightened to assert msg names offending path"
+        - "empty local includes=[] replace not pinned -> added merge_local_empty_worktree_includes_clears_base"
+    code_review:
+      reviewers: [code-review-opus, code-review-sonnet]
+      gates:
+        correctness: pass   # after fixes
+        security: pass
+        architecture: pass
+        style: pass
+      outcome: changes_requested -> approved
+      issues_resolved:
+        - severity: medium
+          gate: correctness
+          detail: "empty path \"\" and `.`/CurDir include paths were accepted; a lone `.` would symlink the whole worktree root at apply"
+          fix: "reject empty path; reject any `.` segment (raw-segment scan, since Path::components() normalizes interior `.` away); 3 new tests"
+        - severity: low
+          gate: architecture
+          detail: "merge inlined instead of WorktreeConfig::merged_with (scope review_fix K-003 specified the method)"
+          fix: "added WorktreeConfig::merged_with (wholesale replace); merge_configs uses the sibling Some/None match shape"
+    deferred_issues:
+      - severity: medium
+        gate: security
+        detail: "path guard uses std::path semantics; Windows-separator/drive/UNC paths (C:\\, \\\\server, sub\\..\\..) parse as single opaque components on this Unix target and bypass absolute/.. checks. Benign on Unix; real containment is apply-time canonicalization."
+        owner: WTI-003 / WTI-006
+      - severity: low
+        gate: security
+        detail: "parse-time string validation cannot guarantee worktree-root containment against symlink-component escapes; enforce at apply time via canonicalize + root-prefix assertion."
+        owner: WTI-003
+    verification:
+      lib_tests: "289 passed; 0 failed"
+      clippy_all_targets: clean
+      fmt: clean

@@ -10,7 +10,7 @@ revised: 2026-06-07   # post multi-agent review (opus+sonnet) — decoupled from
 tasks:
   - id: WTI-001
     content: "Config: [worktree].includes = [{ path, mode }] with own IncludeMode"
-    status: pending
+    status: done
     activeForm: "Adding [worktree] includes config"
     review_fixes:
       - "REVISED (H1/K-001): do NOT reuse deploy-link DeployMode{Copy,Link}; define IncludeMode{Symlink,Copy} (different axis/semantics)"
