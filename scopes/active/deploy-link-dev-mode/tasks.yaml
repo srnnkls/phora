@@ -123,7 +123,7 @@ tasks:
 
   - id: DLD-008
     content: "Docs + phora.local.toml example for deploy = link"
-    status: pending
+    status: done
     activeForm: "Documenting link-mode"
     depends_on: [DLD-002, DLD-005]
     acceptance:
