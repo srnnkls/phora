@@ -6,7 +6,7 @@ revised: 2026-06-07   # post multi-agent review (opus+sonnet)
 tasks:
   - id: DLD-001
     content: "Config: DeployMode enum + Source.deploy field, merge, digest exclusion"
-    status: pending
+    status: done
     activeForm: "Adding DeployMode field to Source config"
     acceptance:
       - "DeployMode { Copy, Link } deserializes from deploy = \"copy\" | \"link\"; absent => Copy"

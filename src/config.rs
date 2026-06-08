@@ -127,6 +127,15 @@ pub struct Source {
     pub allow_symlinks: Option<bool>,
     pub allow_submodules: Option<bool>,
     pub preserve_executable: Option<bool>,
+    #[serde(default)]
+    pub deploy: Option<DeployMode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeployMode {
+    Copy,
+    Link,
 }
 
 impl Source {
@@ -155,6 +164,9 @@ impl Source {
         }
         if local.preserve_executable.is_some() {
             self.preserve_executable = local.preserve_executable;
+        }
+        if local.deploy.is_some() {
+            self.deploy = local.deploy;
         }
         self
     }
@@ -1022,6 +1034,128 @@ layout = { type = "prefixed", seperator = "/" }
             Error::Config(msg) => assert!(
                 msg.contains("seperator"),
                 "error should name the offending key, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    // DLD-001: deploy mode field, merge, digest exclusion
+
+    fn deploy_of(cfg: &Config, source: &str) -> Option<DeployMode> {
+        cfg.sources.get(source).expect("source present").deploy
+    }
+
+    #[test]
+    fn deploy_absent_is_copy_and_link_parses() {
+        let copy_default = parse_source("");
+        assert_eq!(
+            copy_default.deploy.unwrap_or(DeployMode::Copy),
+            DeployMode::Copy,
+            "an absent `deploy` must resolve to the Copy default"
+        );
+
+        let linked = parse_source("deploy = \"link\"\n");
+        assert_eq!(
+            linked.deploy,
+            Some(DeployMode::Link),
+            "deploy = \"link\" must parse to DeployMode::Link"
+        );
+
+        let explicit_copy = parse_source("deploy = \"copy\"\n");
+        assert_eq!(explicit_copy.deploy, Some(DeployMode::Copy));
+    }
+
+    #[test]
+    fn merge_local_deploy_override_replaces_base() {
+        let base = Config::parse(
+            r#"
+version = 1
+
+[sources.loqui]
+git = "https://github.com/srnnkls/loqui.git"
+tag = "v1.0"
+deploy = "copy"
+"#,
+        )
+        .expect("base parses");
+        let local = Config::parse(
+            r#"
+version = 1
+
+[sources.loqui]
+git = "/home/soeren/dev/loqui"
+branch = "main"
+deploy = "link"
+"#,
+        )
+        .expect("local parses");
+
+        let effective = merge_configs(base, Some(local));
+        assert_eq!(
+            deploy_of(&effective, "loqui"),
+            Some(DeployMode::Link),
+            "a local `deploy = link` must override the base `deploy = copy`"
+        );
+    }
+
+    #[test]
+    fn merge_partial_override_preserves_base_deploy() {
+        let base = Config::parse(
+            r#"
+version = 1
+
+[sources.loqui]
+git = "/home/soeren/dev/loqui"
+tag = "v1.0"
+deploy = "link"
+"#,
+        )
+        .expect("base parses");
+        let local = Config::parse(
+            r#"
+version = 1
+
+[sources.loqui]
+git = "/home/soeren/dev/loqui"
+branch = "main"
+"#,
+        )
+        .expect("local parses");
+
+        let effective = merge_configs(base, Some(local));
+        assert_eq!(
+            deploy_of(&effective, "loqui"),
+            Some(DeployMode::Link),
+            "a git+branch-only override that does not set deploy must keep the base `deploy = link`"
+        );
+    }
+
+    #[test]
+    fn config_digest_ignores_deploy_for_lock_stability() {
+        let without = parse_source("root = \"languages\"\ninclude = [\"editor\"]\n");
+        let with_link = parse_source("root = \"languages\"\ninclude = [\"editor\"]\ndeploy = \"link\"\n");
+        assert_eq!(
+            with_link.config_digest(),
+            without.config_digest(),
+            "deploy mode does not change exported ODB content; it must be excluded from \
+             config_digest or a link flip would invalidate the lock (source_matches, lock.rs:50)"
+        );
+    }
+
+    #[test]
+    fn unknown_deploy_value_is_rejected_naming_it() {
+        let toml = r#"
+version = 1
+
+[sources.dotfiles]
+git = "https://github.com/me/dotfiles.git"
+deploy = "wormhole"
+"#;
+        let err = Config::parse(toml).expect_err("unknown deploy value must be rejected");
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("wormhole"),
+                "error should name the offending deploy value, got: {msg}"
             ),
             other => panic!("expected Error::Config, got {other:?}"),
         }
