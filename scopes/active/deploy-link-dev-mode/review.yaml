@@ -26,8 +26,53 @@ batch_reviews:
       lock stability (pinned by config_digest_ignores_deploy_for_lock_stability). 240 lib tests
       green, clippy clean.
 
+  - batch: 2a
+    timestamp: 2026-06-08
+    tasks: [DLD-005]
+    phase_a5_test_review:
+      harnesses: [claude-opus (orchestrator inspection), pi]
+      result: clean
+      note: "idempotence test (second_deploy_over_correct_link_is_a_noop) confirmed non-tautological by both harnesses"
+    reviewers:
+      - id: general+arch+style-claude-opus
+        status: success
+        gates: { correctness: pass, architecture: pass, style: pass }
+      - id: general+arch+style-pi
+        status: success
+        gates: { correctness: concern(medium), architecture: concern(medium), style: pass }
+    synthesized:
+      gates: { correctness: pass, architecture: pass, style: pass }
+      critical_issues: 0
+      high_issues: 0
+      medium_issues: 2
+    outcome: approved
+    notes: >
+      RegistryRecord.linked + ArtifactState::Linked + check_artifact_state short-circuit (before the
+      Foreign commit-mismatch check) + H1 matches! guard fix (sync.rs:299) + cli state_label arm.
+      247 lib tests green, clippy clean. Two medium concerns deferred (see below) — both reflect the
+      intentional tracked-quarantine carve-out, not regressions.
+
 issues:
   critical: []
   high: []
   medium: []
-deferred_issues: []
+deferred_issues:
+  - id: DLD-005-M1
+    severity: medium
+    found_by: [pi]
+    area: check_artifact_state
+    issue: >
+      Linked is returned from record.linked + target existence alone, without verifying the dst is
+      actually a symlink. A linked record over an externally-replaced regular dir/file (or a symlink
+      with the wrong target) becomes a deploy no-op, quarantining arbitrary content.
+    assessment: >
+      Spec-compliant with DLD-005 acceptance ("never Modified/Foreign for linked keys") and the
+      tracked-quarantine design (linked artifacts sit outside the integrity model). linked=true is
+      only ever written by phora's own link-deploy, so divergence requires external mutation. Not a
+      regression; medium, non-blocking.
+    defer_to: DLD-007
+    candidate_fix: >
+      In the Linked short-circuit, when the dst is present but NOT a symlink, return Missing (redeploy
+      the link) instead of Linked — mirrors the dangling-link => Missing => redeploy policy and stays
+      within "never Modified/Foreign". Add a test "linked record over a real dir => Missing/redeploy"
+      in DLD-007 (transitions) before implementing.
