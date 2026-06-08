@@ -176,6 +176,32 @@ batch_reviews:
       (unix symlink / windows symlink_dir). Linked record matches rebuild_linked. 267 lib tests green,
       clippy clean. Two adversarial review-loop fixes applied (crash-reclaim, absolute-target).
 
+  - batch: 4
+    timestamp: 2026-06-08
+    tasks: [DLD-006]
+    phase_a5_test_review:
+      harnesses: [claude-opus (orchestrator inspection), pi]
+      result: clean
+    reviewers:
+      - id: general+arch+style-claude-opus
+        status: success
+        gates: { correctness: pass, architecture: pass, style: pass }
+      - id: general+arch+style-pi
+        status: success
+        gates: { correctness: pass, architecture: pass, style: pass }
+    synthesized:
+      gates: { correctness: pass, architecture: pass, style: pass }
+      critical_issues: 0
+      high_issues: 0
+      medium_issues: 0
+    outcome: approved
+    notes: >
+      verify() now explicitly quarantines linked records (`if record.linked { continue; }`) — pinned by a
+      stray-manifest RED test proving it short-circuits on the flag, not just empty files. rebuild
+      (rebuild_linked, DLD-003) + prune (remove_orphan_path no-follow) confirmed correct-by-construction via
+      guard tests (the prune test asserts the symlink TARGET survives). Closed deferred DLD-003-L1
+      (worktree_scan_missing_path_errors hardened to a hermetic TempDir). 271 lib tests green, clippy clean.
+
 issues:
   critical: []
   high: []
@@ -208,6 +234,7 @@ deferred_issues:
     issue: "worktree_scan_missing_path_errors uses a hard-coded /nonexistent path (environment-dependent)."
     assessment: "Low; /nonexistent is reliably absent on dev/CI. Harden to a hermetic TempDir-child-after-removal when next touching this test."
     defer_to: DLD-006
+    status: RESOLVED in batch 4 (DLD-006) — worktree_scan_missing_path_errors now uses a hermetic TempDir child.
   - id: DLD-004-M2
     severity: medium
     found_by: [pi]
