@@ -1,0 +1,60 @@
+scope: host-alias-sources
+batch_reviews:
+  - batch: 1
+    tasks: [HAS-001]
+    reviewers:
+      - id: general-claude-opus
+        status: success
+        gates: { correctness: pass, security: pass, performance: pass }
+        verdict: approved
+      - id: general-claude-sonnet
+        status: success
+        gates: { correctness: fail, security: pass, performance: pass }
+        verdict: changes_requested
+      - id: architecture-claude-sonnet
+        status: success
+        gates: { architecture: fail }
+        verdict: changes_requested
+      - id: compliance-claude-opus
+        status: success
+        gates: { style: pass }
+        verdict: approved
+    synthesized:
+      gates: { correctness: pass, security: pass, performance: pass, architecture: pass, style: pass }
+      critical_issues: 0
+      high_issues: 1   # resolved pre-commit
+      medium_issues: 4 # deferred to HAS-002/003/005 with markers
+    outcome: approved
+issues:
+  high:
+    - id: HAS-001-H-remote-required
+      found_by: [general-claude-sonnet]
+      area: correctness
+      file: src/config.rs
+      issue: "Host.remote made a required RemoteConfig; broke auth-only [hosts.X] override (cannot add token to a built-in forge while inheriting its remote)"
+      resolution: "FIXED pre-commit: Host.remote -> Option<RemoteConfig>, merged_with conditional; auth-only-override test restored with local omitting remote"
+      status: resolved
+deferred_issues:
+  - id: M-forge-registry-duplication
+    found_by: [general-claude-opus, architecture-claude-sonnet, compliance-claude-opus]
+    issue: "is_known_host {github,gitlab} duplicates cli.rs host_templates; full forge set (codeberg/sr.ht/bitbucket) absent"
+    owner: HAS-002
+  - id: M-git-bridge-empty-string
+    found_by: [general-claude-sonnet, architecture-claude-sonnet]
+    issue: "source.git Option bridged to \"\" at ~6 sync.rs sites for host-mode sources; literal-git behavior unchanged"
+    owner: HAS-003
+    note: "Marked with // HAS-003 comments"
+  - id: M-source-matches-raw-string
+    found_by: [general-claude-sonnet, architecture-claude-sonnet]
+    issue: "source_matches compares raw git strings; host-mode/protocol-flip will not match"
+    owner: HAS-005
+    note: "Marked with // HAS-005 comment; this is the scope's documented CRITICAL for HAS-005"
+  - id: M-validate-not-wired
+    found_by: [general-claude-opus]
+    issue: "Config::validate not yet invoked on the sync/cli load path"
+    owner: HAS-003
+  - id: M-config-source-mutual-dep
+    found_by: [architecture-claude-sonnet]
+    issue: "config.rs <-> source.rs mutual import (Protocol/Refspec)"
+    note: "Pre-existing (Refspec already crossed); shared-types refactor out of scope"
+    owner: none

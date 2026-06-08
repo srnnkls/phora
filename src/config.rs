@@ -7,11 +7,14 @@ use serde::Deserialize;
 
 use crate::error::{Error, Result};
 use crate::source::ExportPolicy;
+pub use crate::source::Protocol;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub version: u32,
+    #[serde(default)]
+    pub protocol: Option<Protocol>,
     #[serde(default)]
     pub hosts: BTreeMap<String, Host>,
     #[serde(default)]
@@ -66,6 +69,16 @@ impl Config {
     /// component.
     pub fn parse(s: &str) -> Result<Self> {
         let config: Self = toml::from_str(s).map_err(|e| Error::Config(e.to_string()))?;
+        for (name, host) in &config.hosts {
+            if let Some(remote) = &host.remote
+                && remote.https_template().is_none()
+                && remote.ssh_template().is_none()
+            {
+                return Err(Error::Config(format!(
+                    "host `{name}`: `remote` must set at least one protocol template (https or ssh)"
+                )));
+            }
+        }
         for (name, source) in &config.sources {
             let set = u8::from(source.branch.is_some())
                 + u8::from(source.tag.is_some())
@@ -73,6 +86,17 @@ impl Config {
             if set > 1 {
                 return Err(Error::Config(format!(
                     "source `{name}` sets more than one of branch/tag/rev"
+                )));
+            }
+            if source.git.is_some() && (source.host.is_some() || source.path.is_some()) {
+                return Err(Error::Config(format!(
+                    "source `{name}` sets both a literal `git` and a `host`/`path` \
+                     (the git and host modes are mutually exclusive)"
+                )));
+            }
+            if source.host.is_some() != source.path.is_some() {
+                return Err(Error::Config(format!(
+                    "source `{name}`: `host` and `path` must be set together"
                 )));
             }
         }
@@ -110,6 +134,49 @@ impl Config {
         }
         Ok(config)
     }
+
+    /// Post-merge validation: host references resolve, the effective protocol has
+    /// a matching remote template, and every source resolves to exactly one mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] if a source references an unknown host, requests
+    /// a protocol its host's `remote` does not provide, or does not resolve to a
+    /// single complete mode (git, or host+path).
+    pub fn validate(&self) -> Result<()> {
+        for (name, source) in &self.sources {
+            let has_git = source.git.is_some();
+            let has_host = source.host.is_some() && source.path.is_some();
+            if has_git == has_host {
+                return Err(Error::Config(format!(
+                    "source `{name}` must resolve to exactly one of a literal `git` \
+                     or a `host`/`path` pair"
+                )));
+            }
+            let Some(host_name) = &source.host else {
+                continue;
+            };
+            if !self.is_known_host(host_name) {
+                return Err(Error::Config(format!(
+                    "source `{name}` references unknown host `{host_name}`"
+                )));
+            }
+            if matches!(source.protocol, Some(Protocol::Ssh))
+                && let Some(host) = self.hosts.get(host_name)
+                && let Some(remote) = &host.remote
+                && remote.ssh_template().is_none()
+            {
+                return Err(Error::Config(format!(
+                    "source `{name}`: protocol `ssh` but host `{host_name}` has no ssh remote template"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn is_known_host(&self, name: &str) -> bool {
+        self.hosts.contains_key(name) || matches!(name, "github" | "gitlab")
+    }
 }
 
 /// Computes the effective config: `base` overlaid by `local` per spec merge semantics.
@@ -118,6 +185,9 @@ pub fn merge_configs(base: Config, local: Option<Config>) -> Config {
     let Some(local) = local else { return base };
     let mut merged = base;
     merged.version = local.version;
+    if local.protocol.is_some() {
+        merged.protocol = local.protocol;
+    }
     for (name, host) in local.hosts {
         match merged.hosts.remove(&name) {
             Some(base_host) => {
@@ -160,21 +230,104 @@ pub fn merge_configs(base: Config, local: Option<Config>) -> Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Host {
-    /// URL template for git operations. Supports: `{owner}`, `{repo}`, `{ref}`, `{path}`.
-    pub git_url: Option<String>,
+    #[serde(default)]
+    pub remote: Option<RemoteConfig>,
     pub auth: Option<AuthConfig>,
 }
 
 impl Host {
     #[must_use]
     fn merged_with(mut self, local: Host) -> Host {
-        if local.git_url.is_some() {
-            self.git_url = local.git_url;
+        if local.remote.is_some() {
+            self.remote = local.remote;
         }
         if local.auth.is_some() {
             self.auth = local.auth;
         }
         self
+    }
+}
+
+/// A host's remote URL templates. A bare string is the https template; a table
+/// carries explicit `https`/`ssh` keys. Templates support `{owner}`, `{repo}`,
+/// `{ref}`, `{path}`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(from = "RemoteConfigRaw")]
+pub struct RemoteConfig {
+    https: Option<String>,
+    ssh: Option<String>,
+}
+
+impl RemoteConfig {
+    #[must_use]
+    pub fn https_template(&self) -> Option<&str> {
+        self.https.as_deref()
+    }
+
+    #[must_use]
+    pub fn ssh_template(&self) -> Option<&str> {
+        self.ssh.as_deref()
+    }
+}
+
+enum RemoteConfigRaw {
+    Simple(String),
+    Table(RemoteTable),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteTable {
+    https: Option<String>,
+    ssh: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for RemoteConfigRaw {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct RawVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for RawVisitor {
+            type Value = RemoteConfigRaw;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a remote URL string or a { https, ssh } table")
+            }
+
+            fn visit_str<E: serde::de::Error>(
+                self,
+                v: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(RemoteConfigRaw::Simple(v.to_owned()))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                RemoteTable::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(RemoteConfigRaw::Table)
+            }
+        }
+
+        deserializer.deserialize_any(RawVisitor)
+    }
+}
+
+impl From<RemoteConfigRaw> for RemoteConfig {
+    fn from(raw: RemoteConfigRaw) -> Self {
+        match raw {
+            RemoteConfigRaw::Simple(https) => RemoteConfig {
+                https: Some(https),
+                ssh: None,
+            },
+            RemoteConfigRaw::Table(t) => RemoteConfig {
+                https: t.https,
+                ssh: t.ssh,
+            },
+        }
     }
 }
 
@@ -190,7 +343,14 @@ pub enum AuthConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Source {
-    pub git: String,
+    #[serde(default)]
+    pub git: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub protocol: Option<Protocol>,
     pub branch: Option<String>,
     pub tag: Option<String>,
     pub rev: Option<String>,
@@ -216,7 +376,20 @@ pub enum DeployMode {
 impl Source {
     #[must_use]
     fn merged_with(mut self, local: Source) -> Source {
-        self.git = local.git;
+        let local_git_mode = local.git.is_some();
+        let local_host_mode = local.host.is_some() || local.path.is_some();
+        if local_git_mode {
+            self.git = local.git;
+            self.host = None;
+            self.path = None;
+        } else if local_host_mode {
+            self.host = local.host;
+            self.path = local.path;
+            self.git = None;
+        }
+        if local.protocol.is_some() {
+            self.protocol = local.protocol;
+        }
         if local.branch.is_some() || local.tag.is_some() || local.rev.is_some() {
             self.branch = local.branch;
             self.tag = local.tag;
@@ -479,7 +652,7 @@ mod tests {
 version = 1
 
 [hosts.github]
-git_url = "https://github.com/{owner}/{repo}.git"
+remote = "https://github.com/{owner}/{repo}.git"
 auth = { type = "token", env = "GITHUB_TOKEN" }
 
 [sources.dotfiles]
@@ -564,7 +737,10 @@ layout = { type = "prefixed", separator = "/" }
         let cfg = Config::parse(EXAMPLE_TOML).expect("example toml should parse");
 
         let dotfiles = cfg.sources.get("dotfiles").expect("dotfiles source");
-        assert_eq!(dotfiles.git, "https://github.com/me/dotfiles.git");
+        assert_eq!(
+            dotfiles.git.as_deref(),
+            Some("https://github.com/me/dotfiles.git")
+        );
         assert_eq!(dotfiles.branch.as_deref(), Some("main"));
         assert_eq!(dotfiles.root.as_deref(), Some(Path::new("modules")));
 
@@ -609,13 +785,17 @@ layout = { type = "prefixed", separator = "/" }
 version = 1
 
 [hosts.github]
-git_url = "https://github.com/{owner}/{repo}.git"
+remote = "https://github.com/{owner}/{repo}.git"
 auth = { type = "token", env = "GITHUB_TOKEN" }
 "#;
         let cfg = Config::parse(toml).expect("host toml should parse");
         let github = cfg.hosts.get("github").expect("github host");
         assert_eq!(
-            github.git_url.as_deref(),
+            github
+                .remote
+                .as_ref()
+                .expect("remote present")
+                .https_template(),
             Some("https://github.com/{owner}/{repo}.git")
         );
         match github.auth.as_ref().expect("auth config") {
@@ -729,7 +909,7 @@ branch = "main"
 
         let effective = merge_configs(base, Some(local));
         let loqui = effective.sources.get("loqui").expect("loqui source kept");
-        assert_eq!(loqui.git, "/home/soeren/dev/loqui");
+        assert_eq!(loqui.git.as_deref(), Some("/home/soeren/dev/loqui"));
         assert_eq!(loqui.branch.as_deref(), Some("main"));
         assert!(
             loqui.tag.is_none(),
@@ -822,8 +1002,13 @@ branch = "main"
         assert_eq!(effective.hosts.len(), 1);
         assert!(effective.hosts.contains_key("github"), "host survives");
         assert_eq!(
-            effective.sources.get("loqui").expect("loqui kept").git,
-            "https://github.com/srnnkls/loqui.git"
+            effective
+                .sources
+                .get("loqui")
+                .expect("loqui kept")
+                .git
+                .as_deref(),
+            Some("https://github.com/srnnkls/loqui.git")
         );
         assert_eq!(
             effective
@@ -913,13 +1098,13 @@ branch = "main"
     }
 
     #[test]
-    fn merge_host_auth_only_override_preserves_base_git_url() {
+    fn merge_host_auth_only_override_preserves_base_remote() {
         let base = Config::parse(
             r#"
 version = 1
 
 [hosts.github]
-git_url = "https://github.com/{owner}/{repo}.git"
+remote = "https://github.com/{owner}/{repo}.git"
 auth = { type = "token", env = "GITHUB_TOKEN" }
 "#,
         )
@@ -938,9 +1123,13 @@ auth = { type = "token", env = "GITHUB_TOKEN_WORK" }
         let github = effective.hosts.get("github").expect("github host kept");
 
         assert_eq!(
-            github.git_url.as_deref(),
+            github
+                .remote
+                .as_ref()
+                .expect("remote present")
+                .https_template(),
             Some("https://github.com/{owner}/{repo}.git"),
-            "an auth-only local override must NOT clear the base git_url"
+            "an auth-only local override must NOT clear the base remote"
         );
         match github.auth.as_ref().expect("auth config") {
             AuthConfig::Token { env } => assert_eq!(env, "GITHUB_TOKEN_WORK"),
@@ -1025,7 +1214,7 @@ destination = "elsewhere"
 version = 1
 
 [hosts.github]
-git_url = "https://github.com/{owner}/{repo}.git"
+remote = "https://github.com/{owner}/{repo}.git"
 proxy = "http://localhost"
 "#;
         let err = Config::parse(toml).expect_err("unknown host key must be rejected");
@@ -1659,5 +1848,459 @@ destination = "elsewhere"
             ),
             other => panic!("expected Error::Config, got {other:?}"),
         }
+    }
+
+    // HAS-001: host-aliased sources — host/path/protocol + Host.remote string-or-table
+
+    #[test]
+    fn host_remote_parses_as_single_string_template() {
+        let toml = r#"
+version = 1
+
+[hosts.github]
+remote = "https://github.com/{path}.git"
+"#;
+        let cfg = Config::parse(toml).expect("a string `remote` template must parse");
+        let github = cfg.hosts.get("github").expect("github host");
+        let remote = github.remote.as_ref().expect("remote present");
+        assert_eq!(
+            remote.https_template(),
+            Some("https://github.com/{path}.git"),
+            "a bare string `remote` is the https template"
+        );
+        assert_eq!(
+            remote.ssh_template(),
+            None,
+            "a bare string `remote` carries no ssh shape"
+        );
+    }
+
+    #[test]
+    fn host_remote_parses_as_https_ssh_table() {
+        let toml = r#"
+version = 1
+
+[hosts.company]
+remote = { https = "https://git.co/{path}.git", ssh = "git@git.co:{path}.git" }
+"#;
+        let cfg = Config::parse(toml).expect("a `{ https, ssh }` remote table must parse");
+        let company = cfg.hosts.get("company").expect("company host");
+        let remote = company.remote.as_ref().expect("remote present");
+        assert_eq!(
+            remote.https_template(),
+            Some("https://git.co/{path}.git"),
+            "the https key must be exposed"
+        );
+        assert_eq!(
+            remote.ssh_template(),
+            Some("git@git.co:{path}.git"),
+            "the ssh key must be exposed"
+        );
+    }
+
+    #[test]
+    fn host_remote_table_with_unknown_key_is_rejected_naming_it() {
+        let toml = r#"
+version = 1
+
+[hosts.company]
+remote = { https = "https://git.co/{path}.git", gopher = "x" }
+"#;
+        let err =
+            Config::parse(toml).expect_err("an unknown key in the remote table must be rejected");
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("gopher"),
+                "error should name the offending remote-table key, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_remote_empty_table_is_rejected() {
+        let toml = r"
+version = 1
+
+[hosts.company]
+remote = {}
+";
+        let err = Config::parse(toml)
+            .expect_err("an empty `remote = {}` table with no protocol keys must be rejected");
+        match err {
+            Error::Config(msg) => {
+                let m = msg.to_lowercase();
+                assert!(
+                    m.contains("company")
+                        || m.contains("at least one")
+                        || m.contains("protocol")
+                        || m.contains("empty"),
+                    "empty-remote-table rejection must be a domain error explaining the \
+                     missing protocol key (mention the host `company`, or \"at least one\"/\
+                     \"protocol\"/\"empty\"), not a generic serde error, got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_path_source_parses_and_exposes_fields() {
+        let toml = r#"
+version = 1
+
+[hosts.github]
+remote = "https://github.com/{path}.git"
+
+[sources.tropos]
+host = "github"
+path = "srnnkls/tropos"
+branch = "main"
+"#;
+        let cfg = Config::parse(toml).expect("a host+path source must parse");
+        let tropos = cfg.sources.get("tropos").expect("tropos source");
+        assert_eq!(tropos.host.as_deref(), Some("github"));
+        assert_eq!(tropos.path.as_deref(), Some("srnnkls/tropos"));
+        assert_eq!(tropos.branch.as_deref(), Some("main"));
+        assert!(
+            tropos.git.is_none(),
+            "a host+path source must carry no literal git remote"
+        );
+    }
+
+    #[test]
+    fn source_with_both_git_and_host_is_rejected_naming_source() {
+        let toml = r#"
+version = 1
+
+[hosts.github]
+remote = "https://github.com/{path}.git"
+
+[sources.tropos]
+git = "https://github.com/srnnkls/tropos.git"
+host = "github"
+path = "srnnkls/tropos"
+"#;
+        let err = Config::parse(toml)
+            .expect_err("a source that sets both git and host must be rejected (mode exclusivity)");
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("tropos"),
+                "mode-exclusivity error must name the offending source, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_with_host_but_no_path_is_rejected_naming_source() {
+        let toml = r#"
+version = 1
+
+[hosts.github]
+remote = "https://github.com/{path}.git"
+
+[sources.tropos]
+host = "github"
+"#;
+        let err = Config::parse(toml)
+            .expect_err("a host source without a path must be rejected (incomplete mode group)");
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("tropos"),
+                "error must name the offending source, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn top_level_protocol_ssh_parses_and_default_is_https() {
+        let with_ssh = Config::parse(
+            r#"
+version = 1
+protocol = "ssh"
+"#,
+        )
+        .expect("a top-level protocol = \"ssh\" must parse");
+        assert_eq!(
+            with_ssh.protocol,
+            Some(Protocol::Ssh),
+            "top-level `protocol = ssh` must parse to Protocol::Ssh"
+        );
+
+        let with_https = Config::parse(
+            r#"
+version = 1
+protocol = "https"
+"#,
+        )
+        .expect("a top-level protocol = \"https\" must parse");
+        assert_eq!(
+            with_https.protocol,
+            Some(Protocol::Https),
+            "top-level `protocol = https` must parse to Protocol::Https (both enum arms reachable)"
+        );
+
+        let defaulted = Config::parse("version = 1\n").expect("omitting protocol must parse");
+        assert!(
+            defaulted.protocol.is_none(),
+            "an omitted top-level protocol is None (https is the effective default downstream)"
+        );
+    }
+
+    #[test]
+    fn merge_host_path_source_branch_only_override_preserves_mode_and_remote() {
+        let base = Config::parse(
+            r#"
+version = 1
+
+[hosts.github]
+remote = "https://github.com/{path}.git"
+
+[sources.tropos]
+host = "github"
+path = "srnnkls/tropos"
+tag = "v1.0"
+"#,
+        )
+        .expect("base parses");
+        let local = Config::parse(
+            r#"
+version = 1
+
+[sources.tropos]
+branch = "main"
+"#,
+        )
+        .expect("local parses");
+
+        let effective = merge_configs(base, Some(local));
+        let tropos = effective.sources.get("tropos").expect("tropos kept");
+        assert_eq!(
+            tropos.host.as_deref(),
+            Some("github"),
+            "a branch-only local override must NOT clear the base host (mode group is atomic)"
+        );
+        assert_eq!(
+            tropos.path.as_deref(),
+            Some("srnnkls/tropos"),
+            "a branch-only local override must preserve the base path"
+        );
+        assert!(
+            tropos.git.is_none(),
+            "the host+path mode must not flip to literal-git on a partial override"
+        );
+        assert_eq!(
+            tropos.branch.as_deref(),
+            Some("main"),
+            "the local branch override must take effect"
+        );
+        assert!(
+            tropos.tag.is_none(),
+            "the local branch override clears the base refspec group (tag)"
+        );
+    }
+
+    #[test]
+    fn merge_local_source_referencing_base_only_host_validates_after_merge() {
+        let base = Config::parse(
+            r#"
+version = 1
+
+[hosts.company]
+remote = "https://git.co/{path}.git"
+"#,
+        )
+        .expect("base parses");
+        let local = Config::parse(
+            r#"
+version = 1
+
+[sources.internal]
+host = "company"
+path = "team/sub/proj"
+"#,
+        )
+        .expect("local parses");
+
+        let effective = merge_configs(base, Some(local));
+        effective.validate().expect(
+            "a local source referencing a host defined only in the base must pass POST-MERGE \
+             validation (the host is unknown per-file but known after merge)",
+        );
+    }
+
+    #[test]
+    fn protocol_ssh_with_https_only_remote_fails_post_merge_validation() {
+        let cfg = Config::parse(
+            r#"
+version = 1
+
+[hosts.github]
+remote = "https://github.com/{path}.git"
+
+[sources.tropos]
+host = "github"
+path = "srnnkls/tropos"
+protocol = "ssh"
+"#,
+        )
+        .expect("the document parses; the protocol/remote mismatch is a post-merge validation");
+        let err = cfg
+            .validate()
+            .expect_err("protocol = ssh against an https-only remote must fail validation");
+        match err {
+            Error::Config(msg) => {
+                assert!(
+                    msg.contains("tropos"),
+                    "validation error must name the offending source, got: {msg}"
+                );
+                assert!(
+                    msg.contains("github"),
+                    "validation error must name the offending host, got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_host_reference_fails_post_merge_validation_naming_source_and_host() {
+        let cfg = Config::parse(
+            r#"
+version = 1
+
+[sources.tropos]
+host = "ghost"
+path = "srnnkls/tropos"
+"#,
+        )
+        .expect("a single-file source referencing an undefined host parses; validity is post-merge");
+        let err = cfg
+            .validate()
+            .expect_err("a host with no built-in or [hosts] definition must fail validation");
+        match err {
+            Error::Config(msg) => {
+                assert!(
+                    msg.contains("tropos"),
+                    "unknown-host error must name the source, got: {msg}"
+                );
+                assert!(
+                    msg.contains("ghost"),
+                    "unknown-host error must name the host, got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_configs_overlays_top_level_protocol() {
+        let base = Config::parse(
+            r#"
+version = 1
+protocol = "https"
+"#,
+        )
+        .expect("base parses");
+        let local = Config::parse(
+            r#"
+version = 1
+protocol = "ssh"
+"#,
+        )
+        .expect("local parses");
+
+        let effective = merge_configs(base, Some(local));
+        assert_eq!(
+            effective.protocol,
+            Some(Protocol::Ssh),
+            "merge_configs must overlay the top-level protocol (local wins)"
+        );
+    }
+
+    #[test]
+    fn merge_configs_keeps_base_protocol_when_local_omits_it() {
+        let base = Config::parse(
+            r#"
+version = 1
+protocol = "ssh"
+"#,
+        )
+        .expect("base parses");
+        let local = Config::parse("version = 1\n").expect("local parses");
+
+        let effective = merge_configs(base, Some(local));
+        assert_eq!(
+            effective.protocol,
+            Some(Protocol::Ssh),
+            "a local config that omits protocol must preserve the base protocol"
+        );
+    }
+
+    #[test]
+    fn source_with_no_mode_is_allowed_as_partial_overlay() {
+        let toml = r#"
+version = 1
+
+[sources.x]
+branch = "main"
+"#;
+        let cfg = Config::parse(toml).expect(
+            "a mode-less source fragment (no git, no host/path) must parse so a local override \
+             like `[sources.x]\\nbranch = \"main\"` works as a partial overlay",
+        );
+        let x = cfg.sources.get("x").expect("x source");
+        assert!(x.git.is_none(), "no literal git on a mode-less fragment");
+        assert!(x.host.is_none(), "no host on a mode-less fragment");
+        assert!(x.path.is_none(), "no path on a mode-less fragment");
+        assert_eq!(
+            x.branch.as_deref(),
+            Some("main"),
+            "the overlay field must survive parsing"
+        );
+    }
+
+    #[test]
+    fn source_with_path_but_no_host_is_rejected_naming_source() {
+        let toml = r#"
+version = 1
+
+[sources.tropos]
+path = "srnnkls/tropos"
+"#;
+        let err = Config::parse(toml).expect_err(
+            "a source with `path` but no `host` is an incomplete mode group and must be rejected",
+        );
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("tropos"),
+                "error must name the offending source, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_source_with_protocol_matching_remote_passes_validation() {
+        let cfg = Config::parse(
+            r#"
+version = 1
+
+[hosts.company]
+remote = { https = "https://git.co/{path}.git", ssh = "git@git.co:{path}.git" }
+
+[sources.internal]
+host = "company"
+path = "team/sub/proj"
+protocol = "ssh"
+"#,
+        )
+        .expect("a host+path source with a matching protocol must parse");
+        cfg.validate().expect(
+            "protocol = ssh against a remote table that HAS an ssh key must pass validation \
+             (guards against a validate() that always errors)",
+        );
     }
 }
