@@ -108,3 +108,52 @@ batch_reviews:
       lib_tests: "306 passed; 0 failed"
       clippy_all_targets: clean
       fmt: clean
+  - batch: 5
+    tasks: [WTI-003]
+    test_review:
+      reviewers: [test-review-opus, test-review-sonnet]
+      outcome: needs_changes -> clean
+      findings_addressed:
+        - "vacuous stateless test (fake_home never wired) -> snapshot worktree+primary path-sets before/after"
+        - "place_symlink_atomic under-specified -> overwrite-existing-symlink + directory-target cases"
+        - "no directory-source coverage -> symlink-on-dir + copy-tree-on-dir tests"
+        - "copy_mode_on_submodule used exists() (follows links) -> symlink_metadata (catch dangling)"
+        - "submodule-walk never asserted .git exclusion or walk idempotency -> added"
+        - "CLI path arg untested -> added apply <path> => Some(path)"
+    code_review:
+      reviewers: [code-review-opus, code-review-sonnet, code-review-opus-recheck]
+      gates: { correctness: pass, security: pass, architecture: pass, style: pass }
+      outcome: changes_requested -> fixes_confirmed
+      issues_resolved:
+        - severity: critical
+          gate: correctness
+          detail: "tracked guard + submodule detection classified against repo.main_repo() (PRIMARY index) not the linked worktree's own index; on divergent branches could shadow a file tracked IN THE WORKTREE. Both reviewers independently verified against gix source."
+          fix: "classify index_kind/is_submodule against the passed worktree repo; tester re-staged fixtures into the worktree index + added discriminating tracked_only_in_worktree_index_is_refused"
+        - severity: high
+          gate: correctness
+          detail: "missing-source guard bypassed for submodules => dangling link / read_dir error"
+          fix: "apply_submodule returns Skipped(MissingSource) when src absent; test missing_submodule_source_skips_without_dangling_link"
+        - severity: medium
+          gate: correctness
+          detail: "copy_tree(allow_symlinks=false) hard-errors on a primary dir containing symlinks"
+          fix: "copy_tree(...,true); test copy_mode_directory_with_symlink_content_succeeds"
+        - severity: low
+          gate: correctness
+          detail: "copy temp leaked on copy failure"
+          fix: "best-effort temp cleanup on copy error (mirrors place_symlink_atomic)"
+      deferred_issues:
+        - severity: medium
+          detail: "fail-fast: a single entry's error aborts remaining entries; warn-and-continue + exit code is WTI-004"
+          owner: WTI-004
+        - severity: low
+          detail: "CLI prints EntryOutcome via Debug ({:?}); human-readable output formatting"
+          owner: WTI-004
+        - severity: low
+          detail: "no-clobber symlink_metadata-then-act TOCTOU (best-effort, stateless engine)"
+        - severity: low
+          detail: "apply_submodule Copy arm unreachable-by-value (guarded earlier); optional unreachable!() for clarity"
+    verification:
+      lib_tests: "327 passed; 0 failed"
+      worktree_apply_tests: "21 passed"
+      clippy_all_targets: clean
+      fmt: clean

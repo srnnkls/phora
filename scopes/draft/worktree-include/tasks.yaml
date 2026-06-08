@@ -45,7 +45,7 @@ tasks:
 
   - id: WTI-003
     content: "phora worktree apply: stateless atomic placement engine"
-    status: pending
+    status: done
     activeForm: "Implementing worktree apply"
     depends_on: [WTI-001, WTI-002, WTI-006, WTI-007]
     review_fixes:
