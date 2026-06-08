@@ -216,3 +216,33 @@ batch_reviews:
       import_legacy_tests: "18 passed"
       clippy_all_targets: clean
       fmt: clean
+
+final_review:
+  status: completed
+  reviewers: [final-opus, final-sonnet]
+  gates: { config: met, detection: met, apply_engine: met, submodules: met, guardrails: met, import_legacy_and_docs: met, acceptance_oracle: met }
+  initial_outcome: "sonnet ready_to_merge; opus changes_requested (acceptance-oracle gap)"
+  gap_resolved:
+    requirement: "scope Verification (review L-001): an integration test that runs the `phora worktree apply` BINARY end-to-end"
+    action: "added tests/worktree_apply_cli.rs (5 tests via CARGO_BIN_EXE_phora over real primary+linked worktrees): absolute symlink target, idempotent re-apply (exit 0), primary no-op, --path resolution, partial-failure exit 1 with warn-and-continue"
+    bug_found_and_fixed:
+      severity: low-medium
+      detail: "run_worktree_apply loaded base phora.toml from the process CWD, not the resolved worktree_root; --path from another CWD failed to find config"
+      fix: "added load_config_from(dir); run_worktree_apply resolves base+local+primary all relative to worktree_root; other commands unchanged. Pinned by apply_with_path_flag_resolves_target_worktree."
+  scope_compliance:
+    all_tasks_complete: true   # WTI-001..007
+    acceptance_criteria_met: true
+    edge_cases_handled: true
+  deferred_issues:
+    - "apply-time worktree-root containment canonicalization; Windows-separator/drive include-path hardening (config rejects ../absolute/./empty; real containment is a future apply-time canonicalize+prefix)"
+    - "CLI prints EntryOutcome via Debug {:?} (informative; Display polish later)"
+    - "run_worktree_apply uses process::exit(1) on partial failure (matches finish_sync precedent)"
+    - "apply_submodule Copy match arm unreachable-by-value (guarded earlier); optional unreachable!()"
+  overall_assessment: "worktree-include complete: native [worktree] config + gix primary detection + stateless atomic apply engine (symlink/copy/submodule dir-symlink/submodule-walk) + worktree-index tracked guard + guardrails + import-legacy + README. 349 lib + 5 binary integration tests green; clippy --all-targets + fmt clean."
+  recommendation: ready_to_merge
+readiness:
+  all_batches_reviewed: true
+  critical_issues_resolved: true   # batch-5 primary-index classification bug fixed
+  high_issues_resolved: true       # submodule missing-source guard
+  final_review_passed: true
+  tests_passing: true
