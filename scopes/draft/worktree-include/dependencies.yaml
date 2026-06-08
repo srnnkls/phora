@@ -10,15 +10,15 @@ phases:
     tasks: [WTI-001]
 
   - id: phase-2-detect
-    title: "Primary detection + tracked-path plumbing"
-    parallel: true
-    tasks: [WTI-002, WTI-006]
+    title: "Primary detection + index/submodule plumbing"
+    # WTI-002 -> WTI-006 -> WTI-007 share src/worktree.rs index/gix plumbing => sequential
+    tasks: [WTI-002, WTI-006, WTI-007]
     depends_on: [WTI-001]
 
   - id: phase-3-apply
-    title: "Apply engine"
+    title: "Apply engine (incl. submodule placement)"
     tasks: [WTI-003]
-    depends_on: [WTI-001, WTI-002, WTI-006]
+    depends_on: [WTI-001, WTI-002, WTI-006, WTI-007]
 
   - id: phase-4-guards-docs
     title: "Guardrails + subcommand/migration/docs"
@@ -29,8 +29,9 @@ phases:
 edges:
   WTI-002: [WTI-001]
   WTI-006: [WTI-002]
-  WTI-003: [WTI-001, WTI-002, WTI-006]
+  WTI-007: [WTI-002, WTI-006]
+  WTI-003: [WTI-001, WTI-002, WTI-006, WTI-007]
   WTI-004: [WTI-003]
   WTI-005: [WTI-003]
 
-critical_path: [WTI-001, WTI-002, WTI-006, WTI-003, WTI-004]
+critical_path: [WTI-001, WTI-002, WTI-006, WTI-007, WTI-003, WTI-004]

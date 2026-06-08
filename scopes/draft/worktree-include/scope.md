@@ -31,21 +31,33 @@ This reuses the link primitive from the `deploy-link-dev-mode` scope (atomic jou
 warn-and-continue, integrity-quarantine) but adds the primary-worktree source model, the explicit
 manifest, and the worktree trigger.
 
-## Relationship to submodules (explicit non-goal)
+## Submodule support
 
-The arvato manifest also links `resources/effect/*` via `symlink submodule-walk`. Those are git
-submodules, and **phora exists to replace submodules**, so they are *not* modeled here. The intended
-migration is to declare each as an ordinary phora **source** (remote git URL, pinned commit) deployed
-through the normal pipeline — not as a worktree-include entry. No `submodule-walk` mode is added. A
-shared-materialization optimization (deploy a large source once, link it into many worktrees) is noted
-as future work, not part of this scope.
+The arvato manifest also links `resources/effect/*` via `symlink submodule-walk`. These are git
+submodules (gitlink entries in the index), and worktree-include **does** handle them — a submodule's
+working tree is local-checkout state that a fresh worktree needs back-referenced, exactly like a
+gitignored file. Two modes, both supported (review reversal — user-confirmed):
+
+- **Symlink-the-submodule** (default for a gitlink path): one directory-level absolute symlink at
+  `<worktree>/<path>` → the primary's submodule working tree. **Auto-inferred** when an entry's `path`
+  resolves to a submodule and its mode is `Symlink` (or omitted); the gitlink is exempt from the
+  tracked-path guard (a submodule path is in the index but must be allowed).
+- **Submodule-walk** (explicit `mode = "submodule-walk"`): descend the submodule's working tree and
+  place per-leaf links inside the target's existing mountpoint, preserving local-only files beside it.
+  Mirrors `git-worktreeinclude`'s `submodule-walk`.
+- `copy` mode on a submodule path is unsupported: warn and skip (`submodule_copy_unsupported`), matching
+  the reference tool — symlink the submodule instead.
+
+A shared-materialization optimization (deploy a large source once, link it into many worktrees) remains
+future work, not part of this scope.
 
 ## Decisions
 
 | Decision | Choice | Rationale |
 |---|---|---|
 | Config surface | Native `[worktree].includes = [{ path, mode }]`, **committed `phora.toml` base + `phora.local.toml` overlay**; drop `.worktreeinclude` | Include *paths* aren't secret; living in committed config means a **fresh worktree has the manifest at apply time** (a gitignored local file isn't checked out). Local overlay holds machine-specific additions. (review H2) |
-| Modes | Own `IncludeMode { Symlink, Copy }` (default Symlink) | **Decoupled** from deploy-link's `DeployMode{Copy,Link}` — different axis/semantics; submodule-walk dropped. (review H1) |
+| Modes | Own `IncludeMode { Symlink, Copy, SubmoduleWalk }` (default Symlink) | **Decoupled** from deploy-link's `DeployMode{Copy,Link}` — different axis/semantics. (review H1) |
+| Submodules | Supported: `Symlink`/default on a gitlink **auto-infers** a dir-symlink to the submodule worktree; explicit `submodule-walk` descends per-leaf; `copy` on a gitlink warns+skips. Gitlinks are exempt from the tracked-path guard. | A submodule's working tree is local-checkout state a fresh worktree needs, like a gitignored file. Both modes + auto-inference (user-confirmed reversal of the earlier non-goal). |
 | Dependency | **None on deploy-link-dev-mode.** Own ~5-line atomic placement helper; reuse only `projection::copy_file` (reflink) | The two enums differ and the shared primitive is tiny; coupling to a draft scope added risk without payoff. (review H1) |
 | Link source | The repo's **primary (non-linked) worktree**, detected via **gix** (`discover` + `main_repo().work_dir()`), not a `git` shell-out | Codebase is pure-gix. Absolute targets into it (matches current behavior); bare main repo => error. (review feasibility) |
 | Tracked-path guard | Real **gix index** check (own task), refusing include paths present in the worktree index | New but feasible plumbing (gix default features compile `gix-index`); untracked-but-present `.codex`/`*.local.toml` correctly read as absent. (review H3) |
@@ -63,6 +75,10 @@ as future work, not part of this scope.
   worktree) materializes each at `<worktree>/<path>` pointing at / copied from `<primary>/<path>`.
 - `symlink` mode creates an absolute symlink to the primary; `copy` mode reflink-copies (reusing the
   existing reflink-or-copy path).
+- **Submodules:** an entry whose `path` is a submodule (gitlink) with `symlink`/default mode creates a
+  single directory symlink to the primary's submodule working tree; `mode = "submodule-walk"` descends
+  and links per-leaf inside the existing mountpoint; `copy` on a gitlink warns and skips. A submodule
+  gitlink is exempt from the tracked-path refusal.
 - Application is idempotent: an already-correct entry is left untouched; a stale/wrong symlink is
   re-pointed; a missing one is created.
 - Base + local `[worktree]` sections merge via the existing overlay (arrays replace, not concatenate),
@@ -90,15 +106,14 @@ as future work, not part of this scope.
 
 | File | Change |
 |---|---|
-| `src/config.rs` | `WorktreeConfig { includes: Vec<Include> }`, `Include { path, mode: IncludeMode }`, `IncludeMode { Symlink, Copy }`; `Config.worktree`; `WorktreeConfig::merged_with` + extend `merge_configs`; mode/path validation. |
-| `src/worktree.rs` (new) | gix primary-worktree detection (`discover` + `main_repo().work_dir()`); stateless include-application engine (lean temp+rename, no journal/registry); `is_path_tracked` via gix index; primary no-op + missing-primary guards. |
+| `src/config.rs` | `WorktreeConfig { includes: Vec<Include> }`, `Include { path, mode: IncludeMode }`, `IncludeMode { Symlink, Copy, SubmoduleWalk }`; `Config.worktree`; `WorktreeConfig::merged_with` + extend `merge_configs`; mode/path validation. |
+| `src/worktree.rs` (new) | gix primary-worktree detection (`discover` + `main_repo().work_dir()`); stateless include-application engine (lean temp+rename, no journal/registry); `is_path_tracked` via gix index (gitlinks exempt); submodule detection (gix submodules / gitlink) + dir-symlink and submodule-walk placement; primary no-op + missing-primary guards. |
 | `src/projection.rs` | Reuse `copy_file` (reflink); own small symlink helper (file vs dir, Windows `symlink_dir`). |
 | `src/cli.rs` | `Worktree` subcommand enum `{ Apply, ImportLegacy }` (first nested subcommand group). |
 | `hk.pkl` (arvato, downstream) | Swap `git-worktreeinclude apply` → `phora worktree apply` in `post-checkout`. |
 | `README.md` / example | Document `[worktree]` config + hook wiring + migration off `.worktreeinclude`. |
 
 ## Out of Scope
-- `submodule-walk` / any submodule handling — replaced by declaring submodules as phora sources.
 - Relative symlink targets (absolute only in v1).
 - Shared-materialization dedup for large sources across many worktrees (future).
 - Registry tracking / drift-verify of include entries (deliberately stateless).
@@ -108,7 +123,8 @@ as future work, not part of this scope.
 - **Acceptance oracle (CI):** an integration test creates two tempdir "worktrees" (primary + linked),
   writes a `phora.toml` with `[worktree].includes`, runs `phora worktree apply` in the linked dir, and
   asserts the exact symlink targets + idempotent re-apply + a refused tracked path + a warned missing
-  primary path. (review L-001 — replaces the manual arvato check as the gate.)
+  primary path + a submodule path dir-symlinked (auto) and a `submodule-walk` entry placed per-leaf.
+  (review L-001 — replaces the manual arvato check as the gate.)
 - **Smoke (post-merge, not a gate):** in arvato, define `[worktree]` includes, swap the hook to
   `phora worktree apply`, create a fresh worktree, confirm parity with `git-worktreeinclude` output.
 - Migration aid: `phora worktree import-legacy` converts an existing `.worktreeinclude` to `[worktree]`
