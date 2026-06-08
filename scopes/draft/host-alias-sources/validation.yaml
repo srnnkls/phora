@@ -1,0 +1,130 @@
+scope: host-alias-sources
+issue_type: Feature
+created: 2026-06-07
+revised: 2026-06-08
+
+ambiguity_scan:
+  scope:        clear     # symbolic host+path+protocol, additive to literal git
+  behavior:     clear     # resolution, remote string-or-table, protocol toggle, mirror unification, default github/https
+  data_model:   clear     # Source.host/path/protocol; Host.remote string-or-table; top-level protocol default
+  constraints:  clear     # mode exclusivity, unknown-host error, protocol-without-key error, path shape
+  edge_cases:   partial   # forge templates lacking {path}/{owner}/{repo}; a host remote table missing the requested protocol key; scp vs ssh:// normalization parity
+  integration:  clear     # reuses NormalizedUrl/MirrorKey (already unifies ssh/https), resolve_sources, source_matches, LayoutConfigRaw string-or-table precedent
+  terminology:  clear     # host alias, path, protocol, remote, resolved identity
+
+decisions:
+  - id: declaration-form
+    question: "How is a symbolic source expressed?"
+    resolution: "Source-level host + path (+ optional protocol); not a string DSL"
+    confirmed_by: user
+  - id: path-field
+    question: "owner/repo split vs single path?"
+    resolution: "Single forge-agnostic `path`; {path} verbatim, {owner}=first segment, {repo}=remainder so {owner}/{repo} ≡ {path} at any depth"
+    confirmed_by: user
+  - id: remote-field
+    question: "git_url vs url vs remote; how to carry ssh?"
+    resolution: "Rename git_url -> `remote`, string-or-table { https, ssh } (mirrors LayoutConfigRaw). `remote` is honest for scp-style ssh (not a URL)."
+    confirmed_by: user
+  - id: protocol
+    question: "How is ssh selected?"
+    resolution: "protocol = https|ssh, default https, global default + per-source override, selects the remote table key. Free because ssh/https share one MirrorKey."
+    confirmed_by: user
+  - id: built-in-forges
+    question: "Registry of known forges?"
+    resolution: "Ship github/gitlab/codeberg/sr.ht/bitbucket as default remote tables (both protocols), overridable. (straight.el/mise inspiration)"
+    confirmed_by: user
+  - id: default-host
+    question: "Does host default?"
+    resolution: "path set + host omitted => github"
+    confirmed_by: assistant-default
+  - id: lock-form
+    question: "Lock identity across literal/symbolic/protocol?"
+    resolution: "Store resolved remote + symbolic origin; source_matches compares protocol-independent identity (no refetch on literal<->symbolic or https<->ssh)"
+    confirmed_by: assistant-default
+
+open_risks:
+  - id: template-placeholders
+    description: "A custom remote template might omit {path}/{owner}/{repo} or use an unknown placeholder"
+    resolution: "Define the supported placeholder set ({path}, {owner}, {repo}); error on a template that yields no substitution; pin with a test"
+  - id: missing-protocol-key
+    description: "protocol=ssh but the host's remote table has only https (or is a bare string)"
+    resolution: "Config error naming source+host (HAS-001); a bare-string remote ignores protocol"
+  - id: scp-vs-sshurl-parity
+    description: "Built-in ssh shapes use scp-style (git@h:path); must normalize to the same MirrorKey as https/ssh://"
+    resolution: "Already covered by NormalizedUrl (source.rs:1172 equivalent_ssh_and_https_forms_share_one_mirror_key); add a symbolic-source parity test"
+
+review_config:
+  reviewers: [opus, sonnet]
+  note: "Highest-value targets: MirrorKey unification across {literal, symbolic, https, ssh}; protocol-without-remote-key validation; source_matches protocol-independence"
+
+verification_gate:
+  - "cargo test green incl. new host-alias tests"
+  - "host+path source resolves/fetches/deploys identically to its literal twin; https & ssh of one repo share one mirror"
+  - "remote parses as string and { https, ssh }; protocol selects; missing key errors"
+  - "add github:owner/repo persists host/path (toml_edit asserted); unknown-host/dual-mode/bad-path/protocol-without-key error at the boundary"
+
+review_session:
+  date: 2026-06-08
+  reviewers: [claude-opus, claude-sonnet]
+  gate_summary: { completeness: address, consistency: fail, feasibility: fail, clarity: address }
+  recommendation: address_issues
+  findings:
+    - id: C1
+      severity: critical
+      found_by: [claude-opus, claude-sonnet]
+      area: lock
+      issue: "source_matches (lock.rs:50) compares raw strings; storing a resolved-remote string breaks on protocol flip (forces refetch — opposite of intent)"
+      resolution: "HAS-005: compare NormalizedUrl/MirrorKey identity; signature gains (hosts, protocol)"
+    - id: C2
+      severity: critical
+      found_by: [claude-opus]
+      area: data_model
+      issue: "'stores the resolved remote' collides with existing LockedSource.resolved (=refspec)"
+      resolution: "HAS-005: keep resolved=refspec; remote in git/renamed field; symbolic origin serde-default"
+    - id: H1
+      severity: high
+      found_by: [claude-opus, claude-sonnet]
+      area: data_model
+      issue: "Source.git required String + unconditional merged_with breaks three-way mode"
+      resolution: "HAS-001: git→Option; mode-aware (atomic) merged_with"
+    - id: H2
+      severity: high
+      found_by: [claude-opus]
+      area: integration
+      issue: "~8 &source.git sites need resolved_remote+hosts+protocol, not just resolve_sources"
+      resolution: "HAS-003: compute resolved_remote once/source, thread the String"
+    - id: H3
+      severity: high
+      found_by: [claude-opus]
+      area: integration
+      issue: "global protocol default needs merge_configs overlay (only handles version+maps)"
+      resolution: "HAS-001: merge_configs overlays top-level protocol"
+    - id: H4
+      severity: high
+      found_by: [claude-sonnet]
+      area: constraints
+      issue: "unknown-host validation per-file false-positives a local source referencing a base host"
+      resolution: "HAS-001: post-merge validate fn"
+    - id: H5
+      severity: high
+      found_by: [claude-sonnet]
+      area: integration
+      issue: "run_add uses insert_source_with_ref, tests use insert_source — only one updated would ship the old git form"
+      resolution: "HAS-004: update/consolidate both; integration-test via run_add"
+    - id: M_registry
+      severity: medium
+      found_by: [claude-opus, claude-sonnet]
+      area: consistency
+      issue: "cli host_templates ({owner}/{repo} https-only) duplicates the new forge registry ({path}) — drift"
+      resolution: "HAS-002: single forge registry; retire/derive host_templates from it"
+    - id: M_fixtures
+      severity: medium
+      found_by: [claude-opus]
+      area: consistency
+      issue: "git_url fixtures must migrate to remote or deny_unknown_fields rejects"
+      resolution: "HAS-001 acceptance lists fixture sites"
+  strengths_confirmed:
+    - "MirrorKey unification (scp/https/ssh → one key) is real and tested (source.rs:1172)"
+    - "{owner}/{repo} ≡ {path} correct incl. gitlab subgroups"
+    - "RemoteConfig string-or-table has a clean precedent (LayoutConfigRaw)"
+    - "github:owner/repo doesn't collide with scp detection (is_scp_ssh needs '@')"

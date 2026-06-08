@@ -1,0 +1,32 @@
+scope: host-alias-sources
+
+phases:
+  - id: phase-1-config
+    title: "Config model + validation"
+    tasks: [HAS-001]
+
+  - id: phase-2-resolve-add
+    title: "Resolver + add (parallel)"
+    parallel: true
+    tasks: [HAS-002, HAS-004]
+    depends_on: [HAS-001]
+
+  - id: phase-3-wire
+    title: "Wire through sync"
+    tasks: [HAS-003]
+    depends_on: [HAS-002]
+
+  - id: phase-4-lock-docs
+    title: "Lock + docs (parallel)"
+    parallel: true
+    tasks: [HAS-005, HAS-006]
+    depends_on: [HAS-003, HAS-004]
+
+edges:
+  HAS-002: [HAS-001]
+  HAS-004: [HAS-001]
+  HAS-003: [HAS-002]
+  HAS-005: [HAS-003]
+  HAS-006: [HAS-002, HAS-004]
+
+critical_path: [HAS-001, HAS-002, HAS-003, HAS-005]
