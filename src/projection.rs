@@ -421,6 +421,105 @@ pub fn deploy_artifact(
     Ok(())
 }
 
+#[cfg(unix)]
+use std::os::unix::fs::symlink as symlink_dir_impl;
+#[cfg(windows)]
+use std::os::windows::fs::symlink_dir as symlink_dir_impl;
+
+/// Crash-safe symlink deploy: stage a fresh symlink beside `dst`, journal the
+/// intent, then atomically `rename` it over `dst`. No copy/swap is involved —
+/// the link points at the absolute working-tree `target`.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "caller hands off ownership of the record being deployed"
+)]
+pub fn link_artifact(
+    staging_base: &Path,
+    dst: &Path,
+    target: &Path,
+    record: RegistryRecord,
+    journal: &Journal,
+    registry: &dyn Registry,
+) -> Result<()> {
+    let parent = dst
+        .parent()
+        .ok_or_else(|| Error::Projection(format!("link dst {} has no parent", dst.display())))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| Error::Projection(format!("create link dir {}: {e}", parent.display())))?;
+    std::fs::create_dir_all(staging_base).map_err(|e| {
+        Error::Projection(format!(
+            "create staging dir {}: {e}",
+            staging_base.display()
+        ))
+    })?;
+
+    let leaf = dst.file_name().map_or_else(
+        || "artifact".to_owned(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let staging = staging_base.join(format!("link-{leaf}-{}", link_nonce()));
+    let mut cleanup = CleanupGuard::new();
+    cleanup.track(staging.clone());
+    cleanup.track(backup_path(staging_base, dst));
+    cleanup.prune_base_if_empty(staging_base.to_path_buf());
+
+    symlink_dir_impl(target, &staging).map_err(|e| {
+        Error::Projection(format!(
+            "symlink {} -> {}: {e}",
+            staging.display(),
+            target.display()
+        ))
+    })?;
+
+    journal.append(&JournalEntry {
+        staging_base: staging_base.to_path_buf(),
+        staging: staging.clone(),
+        dst: dst.to_path_buf(),
+        record: record.clone(),
+        swap_completed: false,
+    })?;
+
+    let backup = match dst.try_exists() {
+        Ok(true) => {
+            let backup = backup_path(staging_base, dst);
+            std::fs::rename(dst, &backup).map_err(|e| {
+                Error::Projection(format!(
+                    "rename {} -> {}: {e}",
+                    dst.display(),
+                    backup.display()
+                ))
+            })?;
+            Some(backup)
+        }
+        Ok(false) => None,
+        Err(e) => return Err(Error::Projection(format!("stat {}: {e}", dst.display()))),
+    };
+
+    std::fs::rename(&staging, dst).map_err(|e| {
+        Error::Projection(format!(
+            "rename {} -> {}: {e}",
+            staging.display(),
+            dst.display()
+        ))
+    })?;
+    journal.mark_swap_completed(dst)?;
+
+    if let Err(put_err) = registry.put(&record) {
+        rollback_swap(dst, backup.as_deref())?;
+        journal.remove(dst)?;
+        return Err(put_err);
+    }
+
+    journal.remove(dst)?;
+    Ok(())
+}
+
+fn link_nonce() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Same-mount `rename` is atomic; a cross-device error falls back to copy+fsync.
 fn swap_into(staging: &Path, dst: &Path, allow_symlinks: bool) -> Result<()> {
     match std::fs::rename(staging, dst) {
