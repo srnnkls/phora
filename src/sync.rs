@@ -229,6 +229,15 @@ fn deploy_target(
                 seen.insert(artifact_name.clone(), source_name.to_owned());
             }
 
+            let artifact_dst =
+                target_path.join(layout.artifact_path(source_name, &artifact_name));
+            let dst_is_symlink = std::fs::symlink_metadata(&artifact_dst)
+                .is_ok_and(|m| m.file_type().is_symlink());
+            let mode_transition = match source.deploy_mode() {
+                DeployMode::Link => artifact_dst.exists() && !dst_is_symlink,
+                DeployMode::Copy => dst_is_symlink,
+            };
+
             let entry = ArtifactEntry {
                 source,
                 source_name,
@@ -238,6 +247,7 @@ fn deploy_target(
                 target_path: &target_path,
                 layout_kind: layout.kind,
                 ejected: &ejected,
+                mode_transition,
             };
             had_failures |= deploy_artifact_entry(run, &entry, backend, registry, journal)?;
         }
@@ -255,6 +265,7 @@ struct ArtifactEntry<'a> {
     target_path: &'a Path,
     layout_kind: LayoutKind,
     ejected: &'a [EjectedEntry],
+    mode_transition: bool,
 }
 
 fn deploy_artifact_entry(
@@ -286,6 +297,7 @@ fn deploy_artifact_entry(
     )?;
 
     let conflict_kind = match &state {
+        _ if entry.mode_transition => None,
         ArtifactState::Modified { changed } if !run.force => Some(ConflictKind::Modified {
             changed: changed.clone(),
         }),
@@ -314,7 +326,12 @@ fn deploy_artifact_entry(
     };
 
     let resolution = match conflict_kind {
-        None if matches!(state, ArtifactState::Ejected | ArtifactState::Clean | ArtifactState::Linked) => {
+        None if !entry.mode_transition
+            && matches!(
+                state,
+                ArtifactState::Ejected | ArtifactState::Clean | ArtifactState::Linked
+            ) =>
+        {
             return Ok(false);
         }
         None => Resolution::Overwrite,
@@ -2344,6 +2361,7 @@ mod tests {
             target_path: &target.expanded_path(),
             layout_kind: LayoutKind::Flat,
             ejected: &[],
+            mode_transition: false,
         };
 
         let state = check_artifact_state(
@@ -4636,6 +4654,272 @@ mod tests {
             std::fs::read_link(&dst).expect("re-pointed symlink readable"),
             fx.src.path().join("editor"),
             "a stale link with the wrong target must be re-pointed to the CORRECT absolute target"
+        );
+    }
+
+    // ── DLD-007: deploy-mode transitions (link <-> copy) ───────────
+    //
+    // Both legs key the SAME source name (`dev-src`) into the SAME registry and one
+    // by-source target, so the dst path is identical across runs; only the effective
+    // `deploy` flips. The copy leg exports from the ODB via `fx.url`; the link leg
+    // takes the same path as its `git`, symlinking the live working tree. `fx.url`
+    // and `fx.src.path()` are the same path — so the only on-disk difference between
+    // legs is the dst TYPE (real dir vs symlink), which is what these tests assert.
+
+    /// A by-source copy config for `dev-src` sharing the link leg's dst path.
+    fn by_source_copy_config(url: &str, target_path: &Path) -> Config {
+        config_one_source_one_target("dev-src", url, "dest", target_path, "by-source")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transition_copy_to_link_materializes_symlink() {
+        let fx = build_sync_fixture();
+        let td = TargetDir::new();
+        let dst = link_dst(&td.target_path(), "dev-src", "editor");
+
+        // Leg 1: copy. dst becomes a REAL DIR; record linked=false; verify passes.
+        let copy_cfg = by_source_copy_config(&fx.url, &td.target_path());
+        let copy_in = input(&copy_cfg, None, None, None, false);
+        let out = sync(&copy_in, &fx.backend, &fx.registry).expect("copy leg syncs");
+        assert!(!out.had_failures, "the copy leg must deploy cleanly");
+
+        let copy_meta = std::fs::symlink_metadata(&dst).expect("copy dst present");
+        assert!(
+            copy_meta.file_type().is_dir() && !copy_meta.file_type().is_symlink(),
+            "premise: after a copy sync the dst is a REAL directory, not a symlink"
+        );
+        let key = artifact_key("dest", "dev-src", "editor");
+        let copy_rec = fx
+            .registry
+            .get(&key)
+            .expect("registry read")
+            .expect("copy leg writes a record");
+        assert!(!copy_rec.linked, "premise: a copy record is linked=false");
+        let copy_mismatches = verify(&copy_cfg, &fx.registry).expect("verify must not error");
+        assert!(
+            !copy_mismatches.iter().any(|m| m.key == key),
+            "premise: the materialized copy must verify clean, got {copy_mismatches:?}"
+        );
+
+        // Leg 2: link. The SAME source resynced with deploy=link must REDEPLOY the
+        // dst as a symlink to the absolute working tree (transition, not no-op).
+        let (base, local) = base_link_overlay_pair("dev-src", fx.src.path(), &td.target_path());
+        let link_in = input(&base, Some(&local), None, None, false);
+        let out = sync(&link_in, &fx.backend, &fx.registry).expect("link leg syncs");
+        assert!(!out.had_failures, "the link transition must not fail");
+
+        let link_meta = std::fs::symlink_metadata(&dst).expect("link dst present");
+        assert!(
+            link_meta.file_type().is_symlink(),
+            "copy->link transition must REDEPLOY the dst as a SYMLINK, not leave the real copy in \
+             place (an intact copy reads Clean and the no-deploy guard would no-op)"
+        );
+        assert_eq!(
+            std::fs::read_link(&dst).expect("transitioned symlink readable"),
+            fx.src.path().join("editor"),
+            "the materialized symlink must point at the absolute working-tree <source>/<artifact>"
+        );
+
+        let link_rec = fx
+            .registry
+            .get(&key)
+            .expect("registry read")
+            .expect("link leg rewrites the record");
+        assert!(
+            link_rec.linked,
+            "after copy->link the record must flip to a LINKED record (linked=true)"
+        );
+
+        let effective = effective_of(&base, &local);
+        let link_mismatches = verify(&effective, &fx.registry).expect("verify must not error");
+        assert!(
+            !link_mismatches.iter().any(|m| m.key == key),
+            "a linked artifact is quarantined from verify; the transition must surface no \
+             mismatch, got {link_mismatches:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transition_link_to_copy_materializes_real_copy() {
+        let fx = build_sync_fixture();
+        let td = TargetDir::new();
+        let dst = link_dst(&td.target_path(), "dev-src", "editor");
+        let key = artifact_key("dest", "dev-src", "editor");
+
+        // Leg 1: link. dst becomes a SYMLINK; record linked=true.
+        let (base, local) = base_link_overlay_pair("dev-src", fx.src.path(), &td.target_path());
+        let link_in = input(&base, Some(&local), None, None, false);
+        let out = sync(&link_in, &fx.backend, &fx.registry).expect("link leg syncs");
+        assert!(!out.had_failures, "the link leg must deploy cleanly");
+
+        let link_meta = std::fs::symlink_metadata(&dst).expect("link dst present");
+        assert!(
+            link_meta.file_type().is_symlink(),
+            "premise: after a link sync the dst is a symlink"
+        );
+        let link_rec = fx
+            .registry
+            .get(&key)
+            .expect("registry read")
+            .expect("link leg writes a record");
+        assert!(link_rec.linked, "premise: a link record is linked=true");
+
+        // Leg 2: copy. The SAME source resynced with deploy=copy must REDEPLOY the
+        // dst as a real materialized copy (transition, not the symlink no-op a
+        // Linked record short-circuits to).
+        let copy_cfg = by_source_copy_config(&fx.url, &td.target_path());
+        let copy_in = input(&copy_cfg, None, None, None, false);
+        let out = sync(&copy_in, &fx.backend, &fx.registry).expect("copy leg syncs");
+        assert!(!out.had_failures, "the link->copy transition must not fail");
+
+        let copy_meta = std::fs::symlink_metadata(&dst).expect("copy dst present");
+        assert!(
+            copy_meta.file_type().is_dir() && !copy_meta.file_type().is_symlink(),
+            "link->copy transition must REDEPLOY the dst as a REAL directory (NOT a symlink); a \
+             Linked record short-circuits to a no-op without this"
+        );
+        assert_eq!(
+            std::fs::read(dst.join("init.lua")).expect("materialized init.lua present"),
+            b"-- init\n",
+            "the materialized copy must contain the artifact's exported files on disk"
+        );
+
+        let copy_rec = fx
+            .registry
+            .get(&key)
+            .expect("registry read")
+            .expect("copy leg rewrites the record");
+        assert!(
+            !copy_rec.linked,
+            "after link->copy the record must flip to a copy record (linked=false)"
+        );
+        assert!(
+            copy_rec.files.iter().any(|f| f.path == *Path::new("init.lua")),
+            "the materialized copy record must carry a per-file manifest (integrity restored), \
+             got {:?}",
+            copy_rec.files
+        );
+
+        let copy_mismatches = verify(&copy_cfg, &fx.registry).expect("verify must not error");
+        assert!(
+            !copy_mismatches.iter().any(|m| m.key == key),
+            "full per-file integrity must be restored: verify over the materialized copy must \
+             report no mismatch, got {copy_mismatches:?}"
+        );
+    }
+
+    /// DLD-005-M1: a linked record whose dst was externally replaced by a real dir
+    /// must REDEPLOY the symlink, not no-op. `check_artifact_state` returns Linked on
+    /// `record.linked` alone (ignoring dst type), so the orchestration must notice the
+    /// effective-mode/dst-type disagreement and overwrite.
+    #[cfg(unix)]
+    #[test]
+    fn linked_record_over_real_dir_redeploys_symlink() {
+        let fx = build_sync_fixture();
+        let td = TargetDir::new();
+        let dst = link_dst(&td.target_path(), "dev-src", "editor");
+        let key = artifact_key("dest", "dev-src", "editor");
+
+        // Deploy the link once: dst is a symlink, record linked=true.
+        let (base, local) = base_link_overlay_pair("dev-src", fx.src.path(), &td.target_path());
+        let in_ = input(&base, Some(&local), None, None, false);
+        let out = sync(&in_, &fx.backend, &fx.registry).expect("link leg syncs");
+        assert!(!out.had_failures, "the initial link deploy must not fail");
+        assert!(
+            std::fs::symlink_metadata(&dst)
+                .expect("link dst present")
+                .file_type()
+                .is_symlink(),
+            "premise: the artifact is first deployed as a symlink"
+        );
+
+        // Simulate external mutation: replace the symlink with a real directory.
+        std::fs::remove_file(&dst).expect("remove the deployed symlink");
+        std::fs::create_dir_all(&dst).expect("plant a real directory in its place");
+        std::fs::write(dst.join("squatter.txt"), b"external\n").expect("write into the real dir");
+        assert!(
+            std::fs::symlink_metadata(&dst)
+                .expect("replaced dst present")
+                .file_type()
+                .is_dir(),
+            "premise: the dst is now a REAL directory (record still says linked=true)"
+        );
+
+        // Resync (still deploy=link): the linked-record-over-real-dir must re-link.
+        let out = sync(&in_, &fx.backend, &fx.registry).expect("resync runs");
+        assert!(!out.had_failures, "the re-link must not fail");
+
+        let meta = std::fs::symlink_metadata(&dst).expect("dst present after resync");
+        assert!(
+            meta.file_type().is_symlink(),
+            "a linked record whose dst is NOT a symlink must REDEPLOY the symlink, not no-op and \
+             quarantine the externally-planted directory"
+        );
+        assert_eq!(
+            std::fs::read_link(&dst).expect("re-linked symlink readable"),
+            fx.src.path().join("editor"),
+            "the re-linked dst must point at the absolute working-tree target"
+        );
+        let rec = fx
+            .registry
+            .get(&key)
+            .expect("registry read")
+            .expect("record present after re-link");
+        assert!(rec.linked, "the re-linked record must remain linked=true");
+    }
+
+    /// REGRESSION GUARD (must stay green): a correctly-deployed link, resynced with
+    /// deploy=link UNCHANGED, is NOT redeployed. A redeploy recreates the symlink via
+    /// temp-symlink+rename, minting a NEW inode; a true no-op leaves the SAME symlink
+    /// object. Inode stability is the only observable that catches an always-redeploy —
+    /// `deploy_link` never exports, so an export count cannot. Guards that the transition
+    /// fix does not break the linked no-op (H1 idempotence).
+    #[cfg(unix)]
+    #[test]
+    fn correct_link_resync_is_still_a_noop() {
+        use std::os::unix::fs::MetadataExt;
+
+        let fx = build_sync_fixture();
+        let td = TargetDir::new();
+        let dst = link_dst(&td.target_path(), "dev-src", "editor");
+
+        let (base, local) = base_link_overlay_pair("dev-src", fx.src.path(), &td.target_path());
+        let in_ = input(&base, Some(&local), None, None, false);
+        let out = sync(&in_, &fx.backend, &fx.registry).expect("link leg syncs");
+        assert!(!out.had_failures, "the initial link deploy must not fail");
+        assert!(
+            std::fs::symlink_metadata(&dst)
+                .expect("link dst present")
+                .file_type()
+                .is_symlink(),
+            "premise: the artifact is first deployed as a symlink"
+        );
+        let ino_before = std::fs::symlink_metadata(&dst)
+            .expect("link dst present")
+            .ino();
+
+        let out = sync(&in_, &fx.backend, &fx.registry).expect("resync runs");
+        assert!(
+            !out.had_failures,
+            "a correct linked re-sync is not a failure"
+        );
+
+        let meta = std::fs::symlink_metadata(&dst).expect("dst still present after resync");
+        assert!(
+            meta.file_type().is_symlink(),
+            "the correct symlink must be left intact (not replaced by a redeploy)"
+        );
+        assert_eq!(
+            meta.ino(),
+            ino_before,
+            "a correct link re-sync must NOT recreate the symlink (idempotent no-op)"
+        );
+        assert_eq!(
+            std::fs::read_link(&dst).expect("symlink readable"),
+            fx.src.path().join("editor"),
+            "the correct symlink must still point at the same working-tree target"
         );
     }
 }
