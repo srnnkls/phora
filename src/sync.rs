@@ -229,10 +229,9 @@ fn deploy_target(
                 seen.insert(artifact_name.clone(), source_name.to_owned());
             }
 
-            let artifact_dst =
-                target_path.join(layout.artifact_path(source_name, &artifact_name));
-            let dst_is_symlink = std::fs::symlink_metadata(&artifact_dst)
-                .is_ok_and(|m| m.file_type().is_symlink());
+            let artifact_dst = target_path.join(layout.artifact_path(source_name, &artifact_name));
+            let dst_is_symlink =
+                std::fs::symlink_metadata(&artifact_dst).is_ok_and(|m| m.file_type().is_symlink());
             let mode_transition = match source.deploy_mode() {
                 DeployMode::Link => artifact_dst.exists() && !dst_is_symlink,
                 DeployMode::Copy => dst_is_symlink,
@@ -873,13 +872,9 @@ pub fn rebuild_registry(
                     .join(target.layout().artifact_path(source_name, &artifact));
 
                 match source.deploy_mode() {
-                    DeployMode::Link => rebuild_linked(
-                        registry,
-                        &policy,
-                        target.layout().kind,
-                        key,
-                        &mut report,
-                    )?,
+                    DeployMode::Link => {
+                        rebuild_linked(registry, &policy, target.layout().kind, key, &mut report)?;
+                    }
                     DeployMode::Copy => rebuild_one(RebuildOne {
                         backend,
                         registry,
@@ -2379,9 +2374,8 @@ mod tests {
             "premise: a deployed symlink with a linked record must read Linked, got {state:?}"
         );
 
-        let had_failures =
-            deploy_artifact_entry(run, &entry, &counting, &fx.registry, &journal)
-                .expect("deploy pass over a linked artifact must not error");
+        let had_failures = deploy_artifact_entry(run, &entry, &counting, &fx.registry, &journal)
+            .expect("deploy pass over a linked artifact must not error");
 
         assert!(!had_failures, "a no-op linked pass is not a failure");
         assert_eq!(
@@ -3847,10 +3841,7 @@ mod tests {
     /// A plain on-disk working tree (not a git repo) with three real artifact
     /// dirs, a `.hidden` dotdir, a regular file, and an `uncommitted` dir that
     /// was never `git add`ed — proving the Link scan reads disk, not the ODB.
-    #[expect(
-        clippy::unwrap_used,
-        reason = "fixture setup fails loudly in tests"
-    )]
+    #[expect(clippy::unwrap_used, reason = "fixture setup fails loudly in tests")]
     fn build_worktree(root_sub: Option<&str>) -> TempDir {
         let td = TempDir::new().unwrap();
         let base = match root_sub {
@@ -3972,11 +3963,7 @@ mod tests {
 
     /// Cross-site invariant (review C2): a Link source must be discovered from
     /// DISK in `rebuild_registry`, never via `backend.discover_artifacts`.
-    fn config_link_source_one_target(
-        source: &str,
-        link_git: &Path,
-        target_path: &Path,
-    ) -> Config {
+    fn config_link_source_one_target(source: &str, link_git: &Path, target_path: &Path) -> Config {
         let toml = format!(
             "version = 1\n\n\
              [sources.{source}]\ngit = \"{}\"\nbranch = \"main\"\ndeploy = \"link\"\n\n\
@@ -4171,7 +4158,10 @@ mod tests {
         );
 
         assert!(
-            !report.foreign.iter().any(|p| p == &dst || p.ends_with("alpha")),
+            !report
+                .foreign
+                .iter()
+                .any(|p| p == &dst || p.ends_with("alpha")),
             "the deployed linked SYMLINK must NOT be classified foreign — scan_foreign's \
              no-follow is_dir() skips it; got {:?}",
             report.foreign
@@ -4194,7 +4184,10 @@ mod tests {
 
         let target_dir = wt.path().join("alpha");
         let inside = target_dir.join("file.txt");
-        assert!(inside.exists(), "premise: the symlink target file must exist pre-prune");
+        assert!(
+            inside.exists(),
+            "premise: the symlink target file must exist pre-prune"
+        );
 
         let by_source = crate::config::LayoutConfig {
             kind: LayoutKind::BySource,
@@ -4396,11 +4389,7 @@ mod tests {
 
     /// A base config carrying `source` as a plain copy source (no `deploy`), with
     /// no target. The link + target live only in the local overlay.
-    fn base_link_overlay_pair(
-        source: &str,
-        git: &Path,
-        target_path: &Path,
-    ) -> (Config, Config) {
+    fn base_link_overlay_pair(source: &str, git: &Path, target_path: &Path) -> (Config, Config) {
         let base = base_copy_source(source, git);
         let local = local_link_overlay(source, git, target_path);
         (base, local)
@@ -4543,8 +4532,7 @@ mod tests {
             .expect("make the blocked link parent read-only");
 
         let in_ = input(&base, Some(&local), None, None, false);
-        let out =
-            sync(&in_, &backend, &registry).expect("sync must not abort on a link failure");
+        let out = sync(&in_, &backend, &registry).expect("sync must not abort on a link failure");
 
         std::fs::set_permissions(&blocked_parent, std::fs::Permissions::from_mode(0o755))
             .expect("restore perms so the tempdir can be cleaned up");
@@ -4796,7 +4784,10 @@ mod tests {
             "after link->copy the record must flip to a copy record (linked=false)"
         );
         assert!(
-            copy_rec.files.iter().any(|f| f.path == *Path::new("init.lua")),
+            copy_rec
+                .files
+                .iter()
+                .any(|f| f.path == *Path::new("init.lua")),
             "the materialized copy record must carry a per-file manifest (integrity restored), \
              got {:?}",
             copy_rec.files
