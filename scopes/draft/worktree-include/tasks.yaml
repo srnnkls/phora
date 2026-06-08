@@ -105,7 +105,7 @@ tasks:
 
   - id: WTI-006
     content: "Tracked-path guard via gix index"
-    status: pending
+    status: done
     activeForm: "Implementing tracked-path refusal"
     depends_on: [WTI-002]
     review_fixes:
