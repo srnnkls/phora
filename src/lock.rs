@@ -1,10 +1,11 @@
 //! Lock file DTOs (`phora.lock`, `phora.local.lock`) and resolution matching.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::Source;
+use crate::config::{Host, Protocol, Source};
+use crate::source::NormalizedUrl;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Lock {
@@ -44,12 +45,21 @@ pub fn merge_locks(base: &Lock, local: Option<&Lock>) -> Lock {
     merged
 }
 
-/// Whether a locked resolution can be reused for `source`: identical git URL,
-/// refspec, and export-affecting config digest.
+/// Whether a locked resolution can be reused for `source`: same remote identity,
+/// refspec, and export-affecting config digest. A source that fails to resolve
+/// never matches.
 #[must_use]
-pub fn source_matches(source: &Source, locked: &LockedSource) -> bool {
-    // HAS-005: compare NormalizedUrl/MirrorKey identity, not raw strings
-    source.git.as_deref().unwrap_or_default() == locked.git
+pub fn source_matches(
+    source: &Source,
+    locked: &LockedSource,
+    hosts: &BTreeMap<String, Host>,
+    protocol: Protocol,
+) -> bool {
+    let Ok(resolved) = source.resolved_remote(hosts, protocol) else {
+        return false;
+    };
+    // Protocol-independent: https/ssh/literal forms of one repo share an identity.
+    NormalizedUrl::parse(&resolved) == NormalizedUrl::parse(&locked.git)
         && source.refspec().to_string() == locked.resolved
         && source.config_digest() == locked.config_digest
 }
@@ -83,8 +93,19 @@ pub fn split_locks(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, Host, Protocol};
+    use crate::source::NormalizedUrl;
+
+    fn no_hosts() -> BTreeMap<String, Host> {
+        BTreeMap::new()
+    }
+
+    fn hosts_from(toml: &str) -> BTreeMap<String, Host> {
+        Config::parse(toml).expect("hosts toml parses").hosts
+    }
 
     fn locked(name: &str, git: &str, resolved: &str) -> LockedSource {
         LockedSource {
@@ -220,8 +241,6 @@ mod tests {
         assert!(merged.find_source("extra").is_some(), "local-only added");
     }
 
-    // PAM-042: source_matches
-
     #[test]
     fn source_matches_when_git_refspec_and_config_digest_all_agree() {
         let source =
@@ -236,7 +255,7 @@ mod tests {
         };
 
         assert!(
-            source_matches(&source, &locked),
+            source_matches(&source, &locked, &no_hosts(), Protocol::Https),
             "identical git + refspec + config_digest must reuse the lock"
         );
     }
@@ -255,7 +274,7 @@ mod tests {
         };
 
         assert!(
-            !source_matches(&source, &locked),
+            !source_matches(&source, &locked, &no_hosts(), Protocol::Https),
             "different git URL must not match"
         );
     }
@@ -274,7 +293,7 @@ mod tests {
         };
 
         assert!(
-            !source_matches(&source, &locked),
+            !source_matches(&source, &locked, &no_hosts(), Protocol::Https),
             "different resolved refspec must not match"
         );
     }
@@ -302,8 +321,210 @@ mod tests {
             "changing include must change the config digest (guards the test premise)"
         );
         assert!(
-            !source_matches(&source, &locked),
+            !source_matches(&source, &locked, &no_hosts(), Protocol::Https),
             "same git + refspec but changed export config must NOT reuse the locked commit"
+        );
+    }
+
+    #[test]
+    fn literal_git_lock_still_matches_literal_git_source() {
+        let source =
+            source_from("git = \"https://github.com/me/dotfiles.git\"\nbranch = \"main\"\n");
+        let locked = LockedSource {
+            name: "dotfiles".to_owned(),
+            // lock git lacks `.git`: raw-string compare fails, NormalizedUrl matches.
+            git: "https://github.com/me/dotfiles".to_owned(),
+            resolved: source.refspec().to_string(),
+            commit: "abc123".to_owned(),
+            digest: "blake3:artifact".to_owned(),
+            config_digest: source.config_digest(),
+        };
+
+        assert!(
+            source_matches(&source, &locked, &no_hosts(), Protocol::Https),
+            "a literal-git lock must still match its literal-git source under \
+             normalized-identity comparison"
+        );
+    }
+
+    #[test]
+    fn host_path_source_matches_equivalent_literal_github_lock() {
+        let source = source_from("host = \"github\"\npath = \"srnnkls/tropos\"\nbranch = \"main\"\n");
+        let locked = LockedSource {
+            name: "tropos".to_owned(),
+            git: "https://github.com/srnnkls/tropos.git".to_owned(),
+            resolved: source.refspec().to_string(),
+            commit: "abc123".to_owned(),
+            digest: "blake3:artifact".to_owned(),
+            config_digest: source.config_digest(),
+        };
+
+        assert!(
+            source_matches(&source, &locked, &no_hosts(), Protocol::Https),
+            "a host+path source resolving (via built-in github) to the locked literal \
+             github URL must match, so sync suppresses the fetch"
+        );
+    }
+
+    #[test]
+    fn lock_written_https_still_matches_source_resolved_as_ssh() {
+        let source = source_from("host = \"github\"\npath = \"srnnkls/tropos\"\nbranch = \"main\"\n");
+
+        let ssh_remote = source
+            .resolved_remote(&no_hosts(), Protocol::Ssh)
+            .expect("symbolic github ssh resolves");
+        assert!(
+            ssh_remote.starts_with("git@github.com:"),
+            "test premise: the ssh resolution must be the scp-style form, got {ssh_remote}"
+        );
+
+        let locked = LockedSource {
+            name: "tropos".to_owned(),
+            git: "https://github.com/srnnkls/tropos.git".to_owned(),
+            resolved: source.refspec().to_string(),
+            commit: "abc123".to_owned(),
+            digest: "blake3:artifact".to_owned(),
+            config_digest: source.config_digest(),
+        };
+
+        assert_ne!(
+            ssh_remote, locked.git,
+            "premise: the raw ssh and https strings differ — a raw-string compare would reject this"
+        );
+        assert_eq!(
+            NormalizedUrl::parse(&ssh_remote),
+            NormalizedUrl::parse(&locked.git),
+            "premise: both forms normalize to one identity"
+        );
+
+        assert!(
+            source_matches(&source, &locked, &no_hosts(), Protocol::Ssh),
+            "an https-written lock must still match the same repo resolved as ssh: \
+             flipping protocol must not force a refetch"
+        );
+    }
+
+    #[test]
+    fn source_does_not_match_when_remote_identity_differs() {
+        let source = source_from("host = \"github\"\npath = \"srnnkls/tropos\"\nbranch = \"main\"\n");
+        let locked = LockedSource {
+            name: "tropos".to_owned(),
+            git: "https://github.com/srnnkls/OTHER-REPO.git".to_owned(),
+            resolved: source.refspec().to_string(),
+            commit: "abc123".to_owned(),
+            digest: "blake3:artifact".to_owned(),
+            config_digest: source.config_digest(),
+        };
+
+        assert!(
+            !source_matches(&source, &locked, &no_hosts(), Protocol::Https),
+            "a different repo identity must not match, even under normalized comparison"
+        );
+    }
+
+    #[test]
+    fn source_does_not_match_when_remote_cannot_resolve() {
+        let source =
+            source_from("host = \"nonesuch\"\npath = \"srnnkls/tropos\"\nbranch = \"main\"\n");
+        let locked = LockedSource {
+            name: "tropos".to_owned(),
+            git: "https://github.com/srnnkls/tropos.git".to_owned(),
+            resolved: source.refspec().to_string(),
+            commit: "abc123".to_owned(),
+            digest: "blake3:artifact".to_owned(),
+            config_digest: source.config_digest(),
+        };
+
+        assert!(
+            !source_matches(&source, &locked, &no_hosts(), Protocol::Https),
+            "a source whose remote cannot be resolved must not match any lock"
+        );
+    }
+
+    #[test]
+    fn host_override_resolution_flows_into_source_matches() {
+        let hosts = hosts_from(
+            "version = 1\n\n[hosts.github]\nremote = { https = \"https://ghe.corp/{path}.git\", \
+             ssh = \"git@ghe.corp:{path}.git\" }\n",
+        );
+        let source = source_from("host = \"github\"\npath = \"srnnkls/tropos\"\nbranch = \"main\"\n");
+
+        let enterprise_lock = LockedSource {
+            name: "tropos".to_owned(),
+            git: "https://ghe.corp/srnnkls/tropos.git".to_owned(),
+            resolved: source.refspec().to_string(),
+            commit: "abc123".to_owned(),
+            digest: "blake3:artifact".to_owned(),
+            config_digest: source.config_digest(),
+        };
+
+        assert!(
+            source_matches(&source, &enterprise_lock, &hosts, Protocol::Https),
+            "the [hosts.github] override must flow into resolution so the source matches the \
+             ghe.corp lock"
+        );
+
+        let builtin_lock = LockedSource {
+            git: "https://github.com/srnnkls/tropos.git".to_owned(),
+            ..enterprise_lock.clone()
+        };
+        assert!(
+            !source_matches(&source, &builtin_lock, &hosts, Protocol::Https),
+            "with the override active the source resolves to ghe.corp, so a builtin-github lock \
+             must NOT match — proving the hosts arg drove resolution, not the builtin"
+        );
+    }
+
+    #[test]
+    fn existing_literal_git_lock_deserializes_and_matches() {
+        let toml = "\
+name = \"dotfiles\"
+git = \"https://github.com/me/dotfiles.git\"
+resolved = \"main\"
+commit = \"abc123\"
+digest = \"blake3:artifact\"
+config_digest = \"PLACEHOLDER\"
+";
+        let source =
+            source_from("git = \"https://github.com/me/dotfiles.git\"\nbranch = \"main\"\n");
+        let toml = toml.replace("PLACEHOLDER", &source.config_digest());
+
+        let locked: LockedSource =
+            toml::from_str(&toml).expect("an existing literal-git lock must still deserialize");
+
+        assert!(
+            source_matches(&source, &locked, &no_hosts(), Protocol::Https),
+            "an existing lock written with only today's fields must still match its source — \
+             no version bump, no new required field"
+        );
+    }
+
+    #[test]
+    fn host_path_source_does_not_match_when_config_digest_differs() {
+        let source = source_from(
+            "host = \"github\"\npath = \"srnnkls/tropos\"\nbranch = \"main\"\ninclude = [\"editor\"]\n",
+        );
+        let other = source_from(
+            "host = \"github\"\npath = \"srnnkls/tropos\"\nbranch = \"main\"\ninclude = [\"lint\"]\n",
+        );
+        let locked = LockedSource {
+            name: "tropos".to_owned(),
+            git: "https://github.com/srnnkls/tropos.git".to_owned(),
+            resolved: source.refspec().to_string(),
+            commit: "abc123".to_owned(),
+            digest: "blake3:artifact".to_owned(),
+            config_digest: other.config_digest(),
+        };
+
+        assert_ne!(
+            source.config_digest(),
+            other.config_digest(),
+            "changing include must change the config digest (guards the test premise)"
+        );
+        assert!(
+            !source_matches(&source, &locked, &no_hosts(), Protocol::Https),
+            "a symbolic host+path source whose remote + refspec match but whose config_digest \
+             differs must NOT reuse the lock"
         );
     }
 
