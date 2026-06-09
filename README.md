@@ -31,7 +31,8 @@ Requires a Rust toolchain (edition 2024).
 
 - **Source** — a git repository, pinned by `branch`, `tag`, or `rev`. The
   top-level directories under its `root` are its artifacts. Declare its remote
-  literally (`git = "…"`) or symbolically against a host (`host` + `path`).
+  literally (`git = "…"`) or symbolically against a host (`host` + `path`), or
+  point at a downloadable resource (`url = "https://…"`).
 - **Artifact** — one top-level directory in a source (dotfiles are skipped). Glob
   `include`/`exclude` rules select which artifacts and which files within them ship.
 - **Target** — a local directory artifacts are projected into, with a chosen
@@ -189,6 +190,45 @@ level, and is overridable per source. Selecting `ssh` against a host whose
 The symbolic and literal forms of one repo — and its https and ssh remotes —
 share a single `~/.phora/git` mirror, so switching mode or protocol never
 re-clones or refetches.
+
+### Url sources
+
+A `url = "https://…"` source is the third declaration mode (git XOR host+path XOR
+url). It downloads a resource and imports its contents as a source, then
+discovers/exports/deploys exactly like a git source. `branch`, `tag`, `rev`, and
+`root` have no meaning for a static resource and are config errors on a url source;
+`include`/`exclude` still select files.
+
+```toml
+[sources.fzf-bin]
+url = "https://github.com/junegunn/fzf/releases/download/0.55.0/fzf-0.55.0-linux_amd64.tar.gz"
+digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+include = ["fzf"]
+```
+
+**Formats.** tar, tar.gz/tgz, and zip, detected by content (magic bytes); a
+non-archive URL becomes a single file named from the URL basename.
+
+**Auto-strip.** When an archive has exactly one top-level directory it is stripped
+automatically, so version-stamped release tarballs (`fzf-0.55.0/…`) need no
+per-version `root` — and `root` re-selection is unavailable on url sources anyway.
+Only `include`/`exclude` apply; `root`/`branch`/`tag`/`rev` are config errors.
+
+**Integrity.** An optional `digest = "<algo>:<hex>"` (`sha256:` or `blake3:`, 64
+hex chars) is verified **before** extraction; a mismatch errors, naming the source
+with expected vs actual.
+
+**Determinism.** Content is imported as a content-addressed synthetic git commit
+(fixed identity, fixed time, constant message), so identical bytes yield an
+identical commit and no lock churn. The synthetic commit's time is fixed at epoch+1
+(1 second), not epoch 0, since some filesystems (FAT32, HFS+) clamp a 0 mtime — which
+would otherwise make `phora verify` report every url-sourced file as modified. `phora sync` of unchanged content is a no-op;
+`phora update` (or `--force`) re-downloads, and the lock advances only if the
+content changed. `phora verify` re-hashes deployed files with the same guarantees
+as git sources.
+
+**Out of scope (for now).** Auth for private assets and forge release-tag
+resolution (latest tag → asset URL) are future work; v1 targets public URLs.
 
 ### Link mode (local development)
 

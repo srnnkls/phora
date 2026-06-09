@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Host, Protocol, Source};
+use crate::config::{Host, Protocol, Source, SourceMode};
 use crate::source::NormalizedUrl;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +55,12 @@ pub fn source_matches(
     hosts: &BTreeMap<String, Host>,
     protocol: Protocol,
 ) -> bool {
+    if let (SourceMode::Url, Some(url)) = (source.mode(), source.source_url()) {
+        // Url identity = url + config_digest; the synthetic commit is content-addressed, so no refspec/remote comparison.
+        return NormalizedUrl::parse(url) == NormalizedUrl::parse(&locked.git)
+            && source.config_digest() == locked.config_digest;
+    }
+
     let Ok(resolved) = source.resolved_remote(hosts, protocol) else {
         return false;
     };
@@ -525,6 +531,103 @@ config_digest = \"PLACEHOLDER\"
             !source_matches(&source, &locked, &no_hosts(), Protocol::Https),
             "a symbolic host+path source whose remote + refspec match but whose config_digest \
              differs must NOT reuse the lock"
+        );
+    }
+
+    // HTP-006: url-source lock identity (no resolved_remote, no refspec)
+
+    /// A url-mode `Source`: only `url` set, so `mode()` is `SourceMode::Url` and
+    /// `resolved_remote` fabricates a bogus github url that must NOT be consulted.
+    fn url_source(url: &str) -> Source {
+        source_from(&format!("url = \"{url}\"\n"))
+    }
+
+    #[test]
+    fn url_source_matches_lock_with_same_url_and_config_digest() {
+        let source = url_source("https://example.com/p.tar.gz");
+        assert_eq!(
+            source.mode(),
+            crate::config::SourceMode::Url,
+            "premise: the source must classify as a url source"
+        );
+        let locked = LockedSource {
+            name: "s".to_owned(),
+            git: "https://example.com/p.tar.gz".to_owned(),
+            resolved: "url".to_owned(),
+            commit: "abc123".to_owned(),
+            digest: "blake3:artifact".to_owned(),
+            config_digest: source.config_digest(),
+        };
+
+        assert!(
+            source_matches(&source, &locked, &no_hosts(), Protocol::Https),
+            "a url source whose locked git equals its url and whose config_digest agrees must \
+             reuse the lock — comparison must ignore resolved_remote (which fabricates a github \
+             url) and the refspec"
+        );
+    }
+
+    #[test]
+    fn url_source_does_not_match_when_url_differs() {
+        let source = url_source("https://example.com/p.tar.gz");
+        let locked = LockedSource {
+            name: "s".to_owned(),
+            git: "https://example.com/OTHER.tar.gz".to_owned(),
+            resolved: "url".to_owned(),
+            commit: "abc123".to_owned(),
+            digest: "blake3:artifact".to_owned(),
+            config_digest: source.config_digest(),
+        };
+
+        assert!(
+            !source_matches(&source, &locked, &no_hosts(), Protocol::Https),
+            "a different download url must not match, even though both are url sources"
+        );
+    }
+
+    #[test]
+    fn url_source_does_not_match_when_config_digest_differs() {
+        let source = url_source("https://example.com/p.tar.gz");
+        let other = source_from(
+            "url = \"https://example.com/p.tar.gz\"\nallow_symlinks = true\n",
+        );
+        let locked = LockedSource {
+            name: "s".to_owned(),
+            git: "https://example.com/p.tar.gz".to_owned(),
+            resolved: "url".to_owned(),
+            commit: "abc123".to_owned(),
+            digest: "blake3:artifact".to_owned(),
+            config_digest: other.config_digest(),
+        };
+
+        assert_ne!(
+            source.config_digest(),
+            other.config_digest(),
+            "changing allow_symlinks must change the config digest (guards the test premise)"
+        );
+        assert!(
+            !source_matches(&source, &locked, &no_hosts(), Protocol::Https),
+            "same url but a changed export config must NOT reuse the locked url import"
+        );
+    }
+
+    #[test]
+    fn git_source_matching_is_unchanged_by_url_branch() {
+        let source =
+            source_from("git = \"https://github.com/me/dotfiles.git\"\nbranch = \"main\"\n");
+        let locked = LockedSource {
+            name: "dotfiles".to_owned(),
+            git: "https://github.com/me/dotfiles.git".to_owned(),
+            resolved: source.refspec().to_string(),
+            commit: "abc123".to_owned(),
+            digest: "blake3:artifact".to_owned(),
+            config_digest: source.config_digest(),
+        };
+
+        assert!(
+            source_matches(&source, &locked, &no_hosts(), Protocol::Https),
+            "adding a url branch to source_matches must not regress git matching: a git source \
+             with agreeing remote + refspec + config_digest still matches"
         );
     }
 

@@ -2,13 +2,11 @@ checkpoint:
   scope_name: http-sources
   scope_path: ./scopes/draft/http-sources
   branch: feat/http-sources
-  last_batch: 5
+  last_batch: 6
   tasks:
-    done: [HTP-001, HTP-002, HTP-003, HTP-004, HTP-005]
-    pending: [HTP-006, HTP-007]
-  next_batch:
-    number: 6
-    tasks: [HTP-006, HTP-007]
+    done: [HTP-001, HTP-002, HTP-003, HTP-004, HTP-005, HTP-006, HTP-007]
+    pending: []
+  next_batch: null  # all tasks complete; final review next
   carry_forward:
     - "HTP-004: consume src/archive.rs ExtractedEntry { path: PathBuf (relative, validated, top-dir stripped), kind: gix EntryKind (Blob|BlobExecutable|Link only), data: Vec<u8> (file content, or symlink TARGET bytes for Link) }. extract(archive_path,url)->Result<Vec<ExtractedEntry>> done. Empty Vec possible (archive of only dirs). Build gix blobs/trees from these; Tree.entries MUST be git-sorted before write (debug_assert in tree/write.rs); commit_as fixed identity + epoch+1 + constant message + no parents; point refs/heads/phora at commit."
     - "HTP-005: HttpBackend in src/source.rs. fetch = http::download(url,tmp) -> verify (digest) -> archive::extract(tmp,url) -> source::import_tree(git_dir,url,&entries). resolve = read refs/heads/phora (peel_to_commit) ignoring refspec. REUSE the new free fn mirror_path(git_dir,url). REMOVE the #[cfg_attr(not(test),expect(dead_code,...))] on import_tree once wired. RouterBackend (src/backend.rs) dispatches on source NAME via name->mode map; sync(&dyn SourceBackend) unchanged. url sources carry Refspec::None so resolve_sources never passes Branch('main'). Source::mode()->{Git,Host,Url}; resolved_remote must error/branch for url-mode (else url source resolves to https://github.com/.git). discover/export/compute_digest reuse GitBackend's git-tree logic (same store)."

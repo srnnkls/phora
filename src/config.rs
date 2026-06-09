@@ -2671,6 +2671,38 @@ protocol = "ssh"
             .expect("the shipped phora.example.toml must pass post-merge validation");
     }
 
+    // HTP-007: the shipped example must demonstrate a url source with an integrity digest
+
+    #[test]
+    fn shipped_example_toml_includes_a_url_source() {
+        let cfg = Config::parse(include_str!("../phora.example.toml"))
+            .expect("the shipped phora.example.toml must parse");
+        cfg.validate()
+            .expect("the shipped phora.example.toml must pass post-merge validation");
+
+        let url_source = cfg
+            .sources
+            .values()
+            .find(|source| source.mode() == SourceMode::Url)
+            .expect("the shipped phora.example.toml must demonstrate a url source");
+
+        let url = url_source
+            .source_url()
+            .expect("a url source must expose its url via source_url()");
+        assert!(
+            url.starts_with("https://"),
+            "the example url source must use an https url, got `{url}`"
+        );
+
+        let digest = url_source
+            .digest
+            .as_deref()
+            .expect("the example url source must carry an integrity `digest`");
+        DownloadDigest::parse(digest).unwrap_or_else(|err| {
+            panic!("the example url source `digest` must be well-formed: {digest} ({err})")
+        });
+    }
+
     // HAS-002: resolved_remote + single built-in forge registry
 
     fn hosts_of(toml: &str) -> BTreeMap<String, Host> {

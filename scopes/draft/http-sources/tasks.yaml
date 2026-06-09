@@ -90,7 +90,7 @@ tasks:
 
   - id: HTP-006
     content: "Lock + content identity for url sources"
-    status: pending
+    status: done
     activeForm: "Locking url sources by content"
     depends_on: [HTP-005]
     review_fixes:
@@ -104,7 +104,7 @@ tasks:
 
   - id: HTP-007
     content: "Docs + example for url sources"
-    status: pending
+    status: done
     activeForm: "Documenting url sources"
     depends_on: [HTP-005]
     acceptance:

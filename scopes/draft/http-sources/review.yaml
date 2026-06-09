@@ -1,6 +1,52 @@
 scope: http-sources
 
 batch_reviews:
+  - batch: 6
+    tasks: [HTP-006, HTP-007]
+    phase_a5_test_review:
+      reviewers: [opus, sonnet]
+      outcome: changes_requested_then_clean
+      fixed:
+        - "no-op test now asserts written lock resolved=='url' sentinel (ties contract)"
+        - "advance test asserts deployed bytes update (not just commit)"
+        - "clarified CountingRouter counts download (fetch); deploy-side verify runs idempotently"
+    phase_c_code_review:
+      reviewers:
+        - { id: general-opus, verdict: approved, gates: { correctness: pass, security: pass, performance: pass } }
+        - { id: general-sonnet, verdict: changes_requested, gates: { correctness: pass, security: pass, performance: pass, docs: fail } }
+        - { id: arch-compliance-opus, verdict: approved, gates: { architecture: pass, style: pass } }
+      synthesized:
+        gates: { correctness: pass, security: pass, performance: pass, architecture: pass, style: pass, docs: pass }
+        outcome: approved_after_doc_fixes
+      note: "HTP-006 code fix verified correct; arch-opus grepped all resolved_remote callers -> only production caller guarded by mode()!=Url. Deferred batch-5 HIGH fully closed."
+    issues_fixed:
+      docs:
+        - id: B6-readme-root
+          severity: high
+          found_by: [general-sonnet]
+          detail: "README claimed `root` selects deeper on url sources, but root is REJECTED (config.rs). README contradicted implementation."
+          resolution: "README: root/branch/tag/rev are config errors on url; only include/exclude apply"
+        - id: B6-readme-mtime
+          severity: medium
+          found_by: [general-sonnet]
+          detail: "epoch+1 mtime sentinel + rationale undocumented (HTP-007 acceptance requires it)"
+          resolution: "README Determinism paragraph documents epoch+1 (FAT32/HFS+ 0-mtime clamp)"
+        - id: B6-readme-detection
+          severity: low
+          found_by: [general-opus, arch-compliance-opus]
+          detail: "README said 'detected by extension and magic'; detection is magic-only"
+          resolution: "README: detected by content (magic bytes); raw = single file from URL basename"
+    accepted_by_design:
+      - id: B6-test-fmt-drift
+        found_by: [arch-compliance-opus]
+        detail: "new HTP-006 test-code rustfmt drift"
+        resolution: "repo does not gate cargo fmt --check (pre-existing baseline drift); new PRODUCTION code is fmt-clean; test drift consistent with frozen-test style"
+      - id: B6-normalizedurl-dotgit
+        found_by: [arch-compliance-opus]
+        detail: "NormalizedUrl strips trailing .git; exotic collision if a url path ends in .git"
+        resolution: "self-consistent for url-vs-url matching; acceptable v1"
+    scope_inconsistency_noted:
+      - "scope.md Decisions table still says 'root still selects deeper' for url sources, but the review-elevated HTP-001 decision REJECTS root on url (archive is pre-stripped). Implementation + tests + README reflect REJECTION. Scope Decisions table is stale (doc-only)."
   - batch: 5
     tasks: [HTP-005]
     phase_a5_test_review:
