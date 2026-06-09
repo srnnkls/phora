@@ -1,6 +1,6 @@
 ---
 created: 2026-06-08
-status: active
+status: done
 issue_type: Feature
 ---
 

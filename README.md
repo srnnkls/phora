@@ -8,14 +8,14 @@
 
 ## About
 
-Phora is a git-based artifact package manager. It mirrors git repositories, picks
-out the top-level directories you want (**artifacts**), and projects them into
-local **target** directories — pinned to exact commits, verifiable by content hash,
-and recoverable after interruption.
+Phora is a git-based artifact package manager. It mirrors git repositories — or
+imports plain-https resources (tarballs, zips, single files) as content-addressed
+synthetic commits — picks out the top-level directories you want (**artifacts**),
+and projects them into local **target** directories, pinned to exact commits,
+verifiable by content hash, and recoverable after interruption.
 
-Use it to distribute shared config, editor setups, prompt/skill bundles, or any
-directory-shaped payload from one or more repos into the places on disk that
-consume them.
+Use it to distribute shared config, editor setups, prompt/skill bundles, or release
+assets from one or more repos (or URLs) into the places on disk that consume them.
 
 ## Installation
 
@@ -221,11 +221,11 @@ with expected vs actual.
 **Determinism.** Content is imported as a content-addressed synthetic git commit
 (fixed identity, fixed time, constant message), so identical bytes yield an
 identical commit and no lock churn. The synthetic commit's time is fixed at epoch+1
-(1 second), not epoch 0, since some filesystems (FAT32, HFS+) clamp a 0 mtime — which
-would otherwise make `phora verify` report every url-sourced file as modified. `phora sync` of unchanged content is a no-op;
-`phora update` (or `--force`) re-downloads, and the lock advances only if the
-content changed. `phora verify` re-hashes deployed files with the same guarantees
-as git sources.
+(1 second), not epoch 0, since some filesystems (FAT32, HFS+) clamp a 0 mtime —
+which would otherwise make `phora verify` report every url-sourced file as modified.
+`phora sync` of unchanged content is a no-op; `phora update` (or `--force`)
+re-downloads, and the lock advances only if the content changed. `phora verify`
+re-hashes deployed files with the same guarantees as git sources.
 
 **Out of scope (for now).** Auth for private assets and forge release-tag
 resolution (latest tag → asset URL) are future work; v1 targets public URLs.
