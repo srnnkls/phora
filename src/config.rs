@@ -94,9 +94,9 @@ impl Config {
                      (the git and host modes are mutually exclusive)"
                 )));
             }
-            if source.host.is_some() != source.path.is_some() {
+            if source.host.is_some() && source.path.is_none() {
                 return Err(Error::Config(format!(
-                    "source `{name}`: `host` and `path` must be set together"
+                    "source `{name}`: `host` set without a `path`"
                 )));
             }
         }
@@ -146,17 +146,17 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         for (name, source) in &self.sources {
             let has_git = source.git.is_some();
-            let has_host = source.host.is_some() && source.path.is_some();
+            let has_host = source.path.is_some();
             if has_git == has_host {
                 return Err(Error::Config(format!(
                     "source `{name}` must resolve to exactly one of a literal `git` \
                      or a `host`/`path` pair"
                 )));
             }
-            let Some(host_name) = &source.host else {
+            let Some(path) = source.path.as_deref() else {
                 continue;
             };
-            let path = source.path.as_deref().unwrap_or_default();
+            let host_name = source.host.as_deref().unwrap_or("github");
             if path.trim().is_empty() || path.split('/').any(str::is_empty) {
                 return Err(Error::Config(format!(
                     "source `{name}`: `path` `{path}` is not a valid forge path \
@@ -344,7 +344,7 @@ impl Host {
 
 /// A host's remote URL templates. A bare string is the https template; a table
 /// carries explicit `https`/`ssh` keys. Templates support `{owner}`, `{repo}`,
-/// `{ref}`, `{path}`.
+/// `{path}`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(from = "RemoteConfigRaw")]
 pub struct RemoteConfig {
@@ -529,7 +529,7 @@ impl Source {
         if let Some(git) = &self.git {
             return Ok(git.clone());
         }
-        let host_name = self.host.as_deref().unwrap_or_default();
+        let host_name = self.host.as_deref().unwrap_or("github");
         let path = self.path.as_deref().unwrap_or_default();
 
         let effective = effective_host(hosts, host_name).ok_or_else(|| {
@@ -2131,6 +2131,28 @@ path = "srnnkls/tropos"
     }
 
     #[test]
+    fn source_with_git_and_path_is_rejected_naming_source() {
+        let toml = r#"
+version = 1
+
+[sources.tropos]
+git = "https://github.com/srnnkls/tropos.git"
+path = "srnnkls/tropos"
+"#;
+        let err = Config::parse(toml).expect_err(
+            "a source that sets both `git` and `path` is dual-mode (path implies host-mode) \
+             and must be rejected",
+        );
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("tropos"),
+                "mode-exclusivity error must name the offending source, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn source_with_host_but_no_path_is_rejected_naming_source() {
         let toml = r#"
 version = 1
@@ -2401,23 +2423,25 @@ branch = "main"
     }
 
     #[test]
-    fn source_with_path_but_no_host_is_rejected_naming_source() {
+    fn source_with_path_and_no_host_defaults_to_github() {
         let toml = r#"
 version = 1
 
 [sources.tropos]
 path = "srnnkls/tropos"
 "#;
-        let err = Config::parse(toml).expect_err(
-            "a source with `path` but no `host` is an incomplete mode group and must be rejected",
+        let cfg = Config::parse(toml)
+            .expect("a source with `path` but no `host` defaults host to github and parses");
+        cfg.validate()
+            .expect("a path-only source must validate (host defaults to github)");
+        let tropos = cfg.sources.get("tropos").expect("tropos source present");
+        assert_eq!(
+            tropos
+                .resolved_remote(&BTreeMap::new(), Protocol::Https)
+                .expect("path-only source resolves against the built-in github forge"),
+            "https://github.com/srnnkls/tropos.git",
+            "an omitted `host` with `path` set must default to github, not merely parse Ok"
         );
-        match err {
-            Error::Config(msg) => assert!(
-                msg.contains("tropos"),
-                "error must name the offending source, got: {msg}"
-            ),
-            other => panic!("expected Error::Config, got {other:?}"),
-        }
     }
 
     #[test]
