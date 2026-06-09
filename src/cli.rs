@@ -201,7 +201,10 @@ fn run_add(
     let refspec = tag
         .or(branch)
         .map_or_else(String::new, |r| format!(" ({r})"));
-    println!("Added source '{name}': {}{refspec}", describe_source(&parsed));
+    println!(
+        "Added source '{name}': {}{refspec}",
+        describe_source(&parsed)
+    );
     Ok(())
 }
 
@@ -753,10 +756,7 @@ fn parse_full_url(input: &str, scheme: &str, rest: &str) -> Result<ParsedSource>
     Ok(literal_source(name, with_git_suffix(input), None, None))
 }
 
-fn parse_shorthand(
-    input: &str,
-    domains: &BTreeMap<String, String>,
-) -> Result<ParsedSource> {
+fn parse_shorthand(input: &str, domains: &BTreeMap<String, String>) -> Result<ParsedSource> {
     let segments: Vec<&str> = input.split('/').filter(|s| !s.is_empty()).collect();
     let first = segments
         .first()
@@ -1425,10 +1425,7 @@ mod tests {
             parsed.branch.is_none(),
             "a domain shorthand carries no branch"
         );
-        assert!(
-            parsed.root.is_none(),
-            "a domain shorthand carries no root"
-        );
+        assert!(parsed.root.is_none(), "a domain shorthand carries no root");
     }
 
     #[test]
@@ -2022,7 +2019,9 @@ mod tests {
     /// Runs `body` with the process cwd set to `dir`, restoring it on the way out
     /// even on panic. Holds [`CWD_LOCK`]; never run alongside other cwd tests.
     fn with_cwd<T>(dir: &std::path::Path, body: impl FnOnce() -> T) -> T {
-        let _guard = CWD_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = CWD_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prev = std::env::current_dir().expect("read cwd");
         std::env::set_current_dir(dir).expect("enter temp cwd");
         let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
@@ -2043,8 +2042,8 @@ mod tests {
                 .expect("run_add must succeed for a symbolic colon alias");
         });
 
-        let written = std::fs::read_to_string(&toml_path)
-            .expect("run_add must write phora.toml in the cwd");
+        let written =
+            std::fs::read_to_string(&toml_path).expect("run_add must write phora.toml in the cwd");
         assert!(
             !written.contains("git ="),
             "run_add's parse->writer glue must persist the SYMBOLIC source, never an expanded `git =`, got:\n{written}"
@@ -2093,15 +2092,22 @@ mod tests {
     #[test]
     fn symbolic_add_omits_default_protocol_and_writes_non_default() {
         let default_src = parse("github:srnnkls/tropos");
-        let default_out =
-            insert_source_with_ref("version = 1\n", &default_src.name, &default_src, None, None, None)
-                .expect("write default-protocol symbolic source");
+        let default_out = insert_source_with_ref(
+            "version = 1\n",
+            &default_src.name,
+            &default_src,
+            None,
+            None,
+            None,
+        )
+        .expect("write default-protocol symbolic source");
         assert!(
             !default_out.contains("protocol"),
             "a default (https) protocol must be omitted from the written table, got:\n{default_out}"
         );
         assert!(
-            default_out.contains("host = \"github\"") && default_out.contains("path = \"srnnkls/tropos\""),
+            default_out.contains("host = \"github\"")
+                && default_out.contains("path = \"srnnkls/tropos\""),
             "the default-protocol silence is only meaningful if host+path are still written, got:\n{default_out}"
         );
 

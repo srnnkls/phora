@@ -355,7 +355,8 @@ mod tests {
 
     #[test]
     fn host_path_source_matches_equivalent_literal_github_lock() {
-        let source = source_from("host = \"github\"\npath = \"srnnkls/tropos\"\nbranch = \"main\"\n");
+        let source =
+            source_from("host = \"github\"\npath = \"srnnkls/tropos\"\nbranch = \"main\"\n");
         let locked = LockedSource {
             name: "tropos".to_owned(),
             git: "https://github.com/srnnkls/tropos.git".to_owned(),
@@ -374,7 +375,8 @@ mod tests {
 
     #[test]
     fn lock_written_https_still_matches_source_resolved_as_ssh() {
-        let source = source_from("host = \"github\"\npath = \"srnnkls/tropos\"\nbranch = \"main\"\n");
+        let source =
+            source_from("host = \"github\"\npath = \"srnnkls/tropos\"\nbranch = \"main\"\n");
 
         let ssh_remote = source
             .resolved_remote(&no_hosts(), Protocol::Ssh)
@@ -412,7 +414,8 @@ mod tests {
 
     #[test]
     fn source_does_not_match_when_remote_identity_differs() {
-        let source = source_from("host = \"github\"\npath = \"srnnkls/tropos\"\nbranch = \"main\"\n");
+        let source =
+            source_from("host = \"github\"\npath = \"srnnkls/tropos\"\nbranch = \"main\"\n");
         let locked = LockedSource {
             name: "tropos".to_owned(),
             git: "https://github.com/srnnkls/OTHER-REPO.git".to_owned(),
@@ -453,7 +456,8 @@ mod tests {
             "version = 1\n\n[hosts.github]\nremote = { https = \"https://ghe.corp/{path}.git\", \
              ssh = \"git@ghe.corp:{path}.git\" }\n",
         );
-        let source = source_from("host = \"github\"\npath = \"srnnkls/tropos\"\nbranch = \"main\"\n");
+        let source =
+            source_from("host = \"github\"\npath = \"srnnkls/tropos\"\nbranch = \"main\"\n");
 
         let enterprise_lock = LockedSource {
             name: "tropos".to_owned(),
@@ -588,9 +592,7 @@ config_digest = \"PLACEHOLDER\"
     #[test]
     fn url_source_does_not_match_when_config_digest_differs() {
         let source = url_source("https://example.com/p.tar.gz");
-        let other = source_from(
-            "url = \"https://example.com/p.tar.gz\"\nallow_symlinks = true\n",
-        );
+        let other = source_from("url = \"https://example.com/p.tar.gz\"\nallow_symlinks = true\n");
         let locked = LockedSource {
             name: "s".to_owned(),
             git: "https://example.com/p.tar.gz".to_owned(),
