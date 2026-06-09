@@ -301,3 +301,35 @@ deferred_issues:
 style_decisions:
   - "Kept Source::source_url() name (scope-mandated; HTP-005 + frozen tests depend on it) despite compliance suggestion to rename to url()."
   - "Kept DownloadDigest # Errors rustdoc — consistent with existing codebase doc sections."
+
+final_review:
+  status: completed
+  reviewers: [final-claude-opus, final-claude-sonnet]
+  diff_range: 1b36b523..HEAD
+  gates: { correctness: pass, security: pass, architecture: pass, style: pass }
+  scope_compliance:
+    behavior_complete: true
+    given_when_then_covered: true
+    decisions_honored: true
+    verification_gate_met: true
+    out_of_scope_respected: true
+  tests: { lib: 494, integration: 5, status: green, clippy: clean }
+  strengths:
+    - "Unification thesis fully realized: HttpBackend imports a synthetic commit then delegates discover/export/compute_digest/commit_time to an inner GitBackend over the same ODB — one store, one projection/verify path."
+    - "Deferred batch-1/5 HIGH (url leaking into the git remote resolver) fully closed: resolved_remotes + source_matches branch on Source::mode()==Url; RouterBackend dispatches on source name/mode, never url scheme."
+    - "Determinism keystone rigorously tested: content-only commit id (fixed identity+epoch+1+no-parents, git-sorted trees), input-order independence, git fsck --strict, reimport advance/no-churn."
+    - "Security for v1: per-segment traversal guard (tar+zip, mid-path, non-utf8 reject), digest verified before import, 1 GiB decompression-bomb cap on actual bytes, TLS on, redirect auth stripped, partial-dest cleanup."
+  unresolved_issues:
+    - severity: minor
+      detail: "TcpListener-based server tests had one transient failure under heavy parallel load (not reproduced in 7+ runs); timeout-bounded, non-blocking. If it recurs, serialize the url/sync server tests."
+    - severity: minor
+      detail: "G/W/T 'two identical-content different-url sources' covered compositionally (different_repos_produce_different_keys + deterministic_same_entries_same_commit_id), not as one combined test. Test-organization preference, not a defect."
+    - severity: minor
+      detail: "scope.md Decisions 'Strip' row corrected post-review to reflect root-on-url rejection (was stale)."
+  recommendation: ready_to_merge
+readiness:
+  all_batches_reviewed: true
+  critical_issues_resolved: true
+  high_issues_resolved: true
+  final_review_passed: true
+  tests_passing: true
