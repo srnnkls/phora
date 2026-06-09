@@ -718,7 +718,7 @@ fn symbolic_source(host: String, path: &str, root: Option<String>) -> ParsedSour
     }
 }
 
-/// The host domain embedded in a `git_url` template (between scheme/user and the
+/// The host domain embedded in a `remote` template (between scheme/user and the
 /// next `/` or `:` port). `ssh://git@git.company.com:2222/...` yields `git.company.com`.
 fn template_domain(url: &str) -> Option<&str> {
     let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);

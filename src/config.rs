@@ -168,15 +168,18 @@ impl Config {
                     "source `{name}` references unknown host `{host_name}`"
                 )));
             };
-            if matches!(source.protocol, Some(Protocol::Ssh))
-                && host
-                    .remote
-                    .as_ref()
-                    .and_then(RemoteConfig::ssh_template)
-                    .is_none()
-            {
+            let protocol = source.protocol.or(self.protocol).unwrap_or(Protocol::Https);
+            let template = host.remote.as_ref().and_then(|remote| match protocol {
+                Protocol::Https => remote.https_template(),
+                Protocol::Ssh => remote.ssh_template(),
+            });
+            if template.is_none() {
+                let proto = match protocol {
+                    Protocol::Https => "https",
+                    Protocol::Ssh => "ssh",
+                };
                 return Err(Error::Config(format!(
-                    "source `{name}`: protocol `ssh` but host `{host_name}` has no ssh remote template"
+                    "source `{name}`: protocol `{proto}` but host `{host_name}` has no {proto} remote template"
                 )));
             }
         }
@@ -2464,6 +2467,70 @@ protocol = "ssh"
             "protocol = ssh against a remote table that HAS an ssh key must pass validation \
              (guards against a validate() that always errors)",
         );
+    }
+
+    #[test]
+    fn protocol_https_with_ssh_only_remote_fails_validation() {
+        let cfg = Config::parse(
+            r#"
+version = 1
+
+[hosts.sshonly]
+remote = { ssh = "git@h:{path}.git" }
+
+[sources.repo]
+host = "sshonly"
+path = "o/r"
+"#,
+        )
+        .expect("the document parses; the effective-protocol/remote mismatch is post-merge validation");
+        let err = cfg.validate().expect_err(
+            "a source whose effective protocol is the default https against an ssh-only remote \
+             (no https template) must fail validation",
+        );
+        match err {
+            Error::Config(msg) => {
+                assert!(
+                    msg.contains("repo"),
+                    "validation error must name the offending source, got: {msg}"
+                );
+                assert!(
+                    msg.contains("sshonly"),
+                    "validation error must name the offending host, got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn protocol_ssh_with_ssh_only_remote_passes_validation() {
+        let cfg = Config::parse(
+            r#"
+version = 1
+
+[hosts.sshonly]
+remote = { ssh = "git@h:{path}.git" }
+
+[sources.repo]
+host = "sshonly"
+path = "o/r"
+protocol = "ssh"
+"#,
+        )
+        .expect("a source against an ssh-only host with protocol = ssh must parse");
+        cfg.validate().expect(
+            "protocol = ssh against an ssh-only remote that HAS an ssh template must pass \
+             validation (guards against an over-broad missing-template error)",
+        );
+    }
+
+    #[test]
+    fn shipped_example_toml_parses_and_validates() {
+        let cfg = Config::parse(include_str!("../phora.example.toml"))
+            .expect("the shipped phora.example.toml must parse");
+        cfg.validate()
+            .expect("the shipped phora.example.toml must pass post-merge validation");
     }
 
     // HAS-002: resolved_remote + single built-in forge registry
