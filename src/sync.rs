@@ -474,7 +474,12 @@ fn resolve_sources(
 
         let locked = effective_lock.and_then(|l| l.find_source(name));
         let commit = match locked {
-            Some(l) if source_matches(source, l) && !force => l.commit.clone(),
+            Some(l)
+                if source_matches(source, l, &config.hosts, effective_protocol(source, config))
+                    && !force =>
+            {
+                l.commit.clone()
+            }
             _ => {
                 backend.fetch(name, git)?;
                 backend.resolve(name, git, &source.refspec())?
