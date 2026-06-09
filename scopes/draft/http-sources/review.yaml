@@ -1,6 +1,56 @@
 scope: http-sources
 
 batch_reviews:
+  - batch: 3
+    tasks: [HTP-003]
+    phase_a5_test_review:
+      reviewers: [opus, sonnet]
+      outcome: changes_requested_then_clean
+      fixed:
+        - "added zip exec/symlink mapping tests (zip uses external attrs, separate code path)"
+        - "added single-top-level-FILE no-strip test"
+        - "added mid-path + zip traversal rejection tests"
+        - "fixture fix: tar 0.4.46 rejects '..' at write time -> built malicious tar via raw GnuHeader.name bytes"
+    phase_c_code_review:
+      reviewers:
+        - { id: general-opus, verdict: approved, gates: { correctness: pass, security: pass, performance: fail } }
+        - { id: general-sonnet, verdict: approved, gates: { correctness: pass, security: pass, performance: pass } }
+        - { id: architecture-opus, verdict: approved, gates: { architecture: pass } }
+        - { id: compliance-sonnet, verdict: changes_requested, gates: { style: fail } }
+      synthesized:
+        gates: { correctness: pass, security: pass, performance: pass, architecture: pass, style: pass }
+        outcome: approved_after_fixes
+    issues_fixed:
+      high:
+        - id: B3-decompression-bomb
+          found_by: [general-opus, general-sonnet]
+          detail: "no size cap on fs::read + per-entry read_to_end + gzip/zip -> bomb OOM"
+          resolution: "MAX_EXTRACTED_BYTES=1GiB; read_capped tracks actual bytes across tar+zip, errors on exceed. Test extract_rejects_archive_exceeding_size_cap"
+        - id: B3-fmt
+          found_by: [compliance-sonnet]
+          detail: "test module import order + write_tar not rustfmt-canonical (CI fmt --check fails)"
+          resolution: "rustfmt --edition 2024 src/archive.rs (formatting only)"
+      low:
+        - id: B3-raw-basename
+          found_by: [general-sonnet]
+          detail: "raw_entry built path from url basename unvalidated (url .../.. -> traversal)"
+          resolution: "raw_entry fallible, runs basename through safe_archive_path. Test extract_rejects_raw_url_with_unsafe_basename"
+        - id: B3-safe-component-doc
+          found_by: [compliance-sonnet]
+          detail: "safe_component doc said 'git tree filename'; now shared with archives"
+          resolution: "broadened doc to git tree OR archive"
+    deferred_issues:
+      - id: B3-symlink-target-unvalidated
+        severity: low
+        found_by: [general-opus, general-sonnet]
+        detail: "symlink targets stored verbatim as Link data, not validated"
+        resolution: "matches existing GitBackend; materialization gated by ExportPolicy.allow_symlinks (default false). Materialization-layer concern, not archive.rs."
+        carry_to: HTP-005
+      - id: B3-arch-prefs
+        severity: low
+        found_by: [architecture-opus]
+        detail: "extract(url) param used only on raw branch; safe_component could live in paths.rs; whole-archive-in-RAM for huge assets"
+        resolution: "low quality preferences; deferred (v1 scope is config/dotfile + release assets)"
   - batch: 2
     tasks: [HTP-002]
     phase_a5_test_review:

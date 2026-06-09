@@ -37,7 +37,7 @@ tasks:
 
   - id: HTP-003
     content: "Archive extraction + auto-strip + per-segment traversal guard"
-    status: pending
+    status: done
     activeForm: "Extracting archives safely"
     depends_on: [HTP-002]
     review_fixes:

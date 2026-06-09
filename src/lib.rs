@@ -16,6 +16,7 @@
     reason = "stub signatures return NotImplemented; per-fn `# Errors` docs land with the real bodies"
 )]
 
+pub mod archive;
 pub mod cli;
 pub mod config;
 pub mod error;

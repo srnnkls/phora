@@ -572,9 +572,9 @@ pub fn is_local_path(git: &str) -> bool {
     path.is_absolute() || path.exists()
 }
 
-/// Rejects any git tree filename that is not a single inert path component, so a
-/// malicious tree can never escape the staging dir when joined onto a path.
-fn safe_component(name: &str) -> Result<&str> {
+/// Rejects any filename that is not a single inert path component, so a malicious git tree or
+/// archive can never escape the staging dir when joined onto a path.
+pub(crate) fn safe_component(name: &str) -> Result<&str> {
     let unsafe_component =
         name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\');
     if unsafe_component {

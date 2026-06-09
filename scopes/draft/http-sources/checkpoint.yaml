@@ -2,15 +2,15 @@ checkpoint:
   scope_name: http-sources
   scope_path: ./scopes/draft/http-sources
   branch: feat/http-sources
-  last_batch: 2
+  last_batch: 3
   tasks:
-    done: [HTP-001, HTP-002]
-    pending: [HTP-003, HTP-004, HTP-005, HTP-006, HTP-007]
+    done: [HTP-001, HTP-002, HTP-003]
+    pending: [HTP-004, HTP-005, HTP-006, HTP-007]
   next_batch:
-    number: 3
-    tasks: [HTP-003]
+    number: 4
+    tasks: [HTP-004]
   carry_forward:
-    - "HTP-003: extraction lives in src/http.rs (or a sibling); flate2/tar/zip already declared (zip = deflate-only). safe_component (source.rs:577) guards a SINGLE component — add safe_archive_path() splitting on '/' per segment; reject ../, absolute, drive-root, backslash, null, non-utf8. Map tar/zip exec bits + symlinks to gix EntryKind for HTP-004. Auto-strip single top dir. raw file => one-entry tree from URL basename."
+    - "HTP-004: consume src/archive.rs ExtractedEntry { path: PathBuf (relative, validated, top-dir stripped), kind: gix EntryKind (Blob|BlobExecutable|Link only), data: Vec<u8> (file content, or symlink TARGET bytes for Link) }. extract(archive_path,url)->Result<Vec<ExtractedEntry>> done. Empty Vec possible (archive of only dirs). Build gix blobs/trees from these; Tree.entries MUST be git-sorted before write (debug_assert in tree/write.rs); commit_as fixed identity + epoch+1 + constant message + no parents; point refs/heads/phora at commit."
     - "HTP-005: add Source::mode()->{Git,Host,Url}; resolved_remote must error/branch for url (else url source resolves to https://github.com/.git). Refspec::None for url. Add verify_file(path,&DownloadDigest) streaming (avoid re-reading whole archive); verify BEFORE extract. verify_digest msg has no source name (caller prepends)."
     - "HTP-004: gix synthetic-commit import; commit_as fixed identity + epoch+1 + constant message + no parents; Tree.entries MUST be git-sorted before write (debug_assert)."
   http_module:
