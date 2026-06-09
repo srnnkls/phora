@@ -10,8 +10,8 @@
 
 Phora is a git-based artifact package manager. It mirrors git repositories — or
 imports plain-https resources (tarballs, zips, single files) as content-addressed
-synthetic commits — picks out the top-level directories you want (**artifacts**),
-and projects them into local **target** directories, pinned to exact commits,
+synthetic commits — picks out the top-level directories you want (artifacts),
+and projects them into local target directories, pinned to exact commits,
 verifiable by content hash, and recoverable after interruption.
 
 Use it to distribute shared config, editor setups, prompt/skill bundles, or release
@@ -25,7 +25,8 @@ cargo install --path .
 mise run build      # cargo build
 ```
 
-Requires a Rust toolchain (edition 2024).
+Requires a Rust toolchain (edition 2024) and [mise](https://mise.en.dev) for the
+`mise run` tasks.
 
 ## Getting started
 
@@ -49,7 +50,7 @@ phora sync       # fetch, pin to a commit, project artifacts into ~/.config/nvim
 phora verify     # re-hash the deployed files; non-zero exit on any mismatch
 ```
 
-New to phora? The **[guide](GUIDE.md)** walks through a real setup end to end —
+New to phora? The [guide](GUIDE.md) walks through a real setup end to end —
 git and `url` sources, layouts, the local dev loop, and what to do when something
 looks wrong.
 
@@ -382,7 +383,7 @@ per-version `root` — and `root` re-selection is unavailable on url sources any
 Only `include`/`exclude` apply; `root`/`branch`/`tag`/`rev` are config errors.
 
 **Integrity.** An optional `digest = "<algo>:<hex>"` (`sha256:` or `blake3:`, 64
-hex chars) is verified **before** extraction; a mismatch errors, naming the source
+hex chars) is verified before extraction; a mismatch errors, naming the source
 with expected vs actual.
 
 **Determinism.** Content is imported as a content-addressed synthetic git commit
@@ -401,7 +402,7 @@ resolution (latest tag → asset URL) are future work; v1 targets public URLs.
 
 By default `deploy = "copy"` materializes a reflink-style copy of each artifact
 from the committed git ODB — point-in-time, content-hashed, verifiable. For a
-tight dev loop, `deploy = "link"` instead **symlinks** the artifact destination
+tight dev loop, `deploy = "link"` instead symlinks the artifact destination
 at the source's live working tree (`<source path>/<root>/<artifact>`, absolute).
 Uncommitted edits in the checkout are visible through the target immediately, with
 no re-sync.
@@ -415,7 +416,7 @@ Two guardrails apply:
   the `git = "/dir"` alias), a local filesystem path. `deploy = "link"` on a remote
   URL is a config error.
 
-Linked artifacts sit **outside the integrity model**: their registry record carries
+Linked artifacts sit outside the integrity model: their registry record carries
 a `linked` marker and no per-file hashes. `phora verify` skips them, drift detection
 never reports them modified or foreign, `phora list` shows them as `linked`, and
 `phora rebuild-registry` reconstructs the marker without hashing. `--prune` removes
