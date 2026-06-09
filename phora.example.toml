@@ -1,29 +1,40 @@
 version = 1
 
-# Host templates expand `add` shorthands (`owner/repo`) and supply auth.
-# `github` and `gitlab` are built in; add others here.
+# protocol selects https vs ssh for host-aliased sources; default https.
+# Uncomment to flip the global default (still overridable per source):
+# protocol = "ssh"
+
+# github, gitlab, codeberg, sr.ht, bitbucket ship built in (both https + ssh),
+# so a `[hosts]` block is only needed to add a forge or override auth/remote.
 [hosts.github]
-git_url = "https://github.com/{owner}/{repo}.git"
 auth = { type = "token", env = "GITHUB_TOKEN" }
 
+# A custom forge: `remote` is a string (https only) or a { https, ssh } table.
+# Templates fill {path} verbatim; {owner} is the first segment, {repo} the rest.
 [hosts.company]
-git_url = "ssh://git@git.company.com/{owner}/{repo}.git"
+remote = { https = "https://git.company.com/{path}.git", ssh = "git@git.company.com:{path}.git" }
 auth = { type = "ssh", key = "~/.ssh/id_ed25519" }
 
 # A source is a git repo. Top-level directories under `root` are its artifacts.
 # Pin with exactly one of branch / tag / rev (defaults to branch `main`).
+# Declare the remote symbolically (host + path) or literally (git); never both.
+
+# Host-aliased: resolves via the host's `remote` template at sync time.
 [sources.dotfiles]
-git = "https://github.com/me/dotfiles.git"
+host = "github"          # omit to default to github when `path` is set
+path = "me/dotfiles"
 branch = "main"
 root = "modules"
 
-[sources.company-configs]
-git = "https://github.com/company/shared-configs.git"
-tag = "v2.1"
+[sources.internal]
+host = "company"
+path = "team/sub/proj"   # nested paths are fine ({owner}/{repo} ≡ {path})
+protocol = "ssh"         # per-source opt-in to ssh
 root = "configs"
 include = ["editor", "lint"]
 exclude = ["**/test/**", "**/*.bak"]
 
+# Literal remote: any https, ssh://, or scp-style URL, unchanged from before.
 [sources.loqui]
 git = "https://github.com/srnnkls/loqui.git"
 rev = "9f1c2ab"
@@ -40,7 +51,7 @@ sources = ["dotfiles"]
 
 [targets.vscode]
 path = "~/.config/Code/User"
-sources = ["dotfiles", "company-configs"]
+sources = ["dotfiles", "internal"]
 layout = "flat"
 
 [targets.policies]
