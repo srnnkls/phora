@@ -2,17 +2,18 @@ checkpoint:
   scope_name: http-sources
   scope_path: ./scopes/draft/http-sources
   branch: feat/http-sources
-  last_batch: 4
+  last_batch: 5
   tasks:
-    done: [HTP-001, HTP-002, HTP-003, HTP-004]
-    pending: [HTP-005, HTP-006, HTP-007]
+    done: [HTP-001, HTP-002, HTP-003, HTP-004, HTP-005]
+    pending: [HTP-006, HTP-007]
   next_batch:
-    number: 5
-    tasks: [HTP-005]
+    number: 6
+    tasks: [HTP-006, HTP-007]
   carry_forward:
     - "HTP-004: consume src/archive.rs ExtractedEntry { path: PathBuf (relative, validated, top-dir stripped), kind: gix EntryKind (Blob|BlobExecutable|Link only), data: Vec<u8> (file content, or symlink TARGET bytes for Link) }. extract(archive_path,url)->Result<Vec<ExtractedEntry>> done. Empty Vec possible (archive of only dirs). Build gix blobs/trees from these; Tree.entries MUST be git-sorted before write (debug_assert in tree/write.rs); commit_as fixed identity + epoch+1 + constant message + no parents; point refs/heads/phora at commit."
     - "HTP-005: HttpBackend in src/source.rs. fetch = http::download(url,tmp) -> verify (digest) -> archive::extract(tmp,url) -> source::import_tree(git_dir,url,&entries). resolve = read refs/heads/phora (peel_to_commit) ignoring refspec. REUSE the new free fn mirror_path(git_dir,url). REMOVE the #[cfg_attr(not(test),expect(dead_code,...))] on import_tree once wired. RouterBackend (src/backend.rs) dispatches on source NAME via name->mode map; sync(&dyn SourceBackend) unchanged. url sources carry Refspec::None so resolve_sources never passes Branch('main'). Source::mode()->{Git,Host,Url}; resolved_remote must error/branch for url-mode (else url source resolves to https://github.com/.git). discover/export/compute_digest reuse GitBackend's git-tree logic (same store)."
-    - "HTP-006: LockedSource for url: git=url, resolved sentinel 'url', commit=synthetic id; source_matches compares url+synthetic identity. Re-import now force-updates refs/heads/phora (PreviousValue::Any) so changed content advances; identical content idempotent (same id). plain sync no re-download; update re-downloads."
+    - "HTP-006 (MUST FIX the HTP-005-deferred HIGH): src/lock.rs source_matches() currently calls source.resolved_remote() for ALL sources -> a url source fabricates https://github.com/.git -> never matches lock -> EVERY sync re-downloads. Fix: branch on source.mode()==SourceMode::Url -> compare NormalizedUrl::parse(source.source_url()) vs locked.git (skip resolved_remote), keep config_digest compare. LockedSource for url: git=url, resolved sentinel 'url' (currently '' from Refspec::None), commit=synthetic id. Re-import already force-updates refs/heads/phora (changed content advances; identical idempotent). plain sync no re-download once source_matches works; update re-downloads."
+    - "HTP-007: README + phora.example.toml document url sources, DownloadDigest (sha256:/blake3:), formats (tar/tgz/zip/raw), auto-strip single top dir, determinism (content-only commit id), epoch+1 mtime sentinel. Out of scope per scope.md: auth, release resolution, last-modified mtimes, range/incremental."
     - "HTP-004: gix synthetic-commit import; commit_as fixed identity + epoch+1 + constant message + no parents; Tree.entries MUST be git-sorted before write (debug_assert)."
   http_module:
     download: "pub fn download(url:&str, dest:&Path)->Result<()>; ureq 3.x rustls; connect+body timeouts; redirects on; all failures Error::Source; partial dest removed on error"

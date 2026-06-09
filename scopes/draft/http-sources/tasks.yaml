@@ -73,7 +73,7 @@ tasks:
 
   - id: HTP-005
     content: "HttpBackend + mode-aware backend router; url-aware resolve"
-    status: pending
+    status: done
     activeForm: "Implementing HttpBackend and routing"
     depends_on: [HTP-001, HTP-004]
     review_fixes:

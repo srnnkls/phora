@@ -1,6 +1,56 @@
 scope: http-sources
 
 batch_reviews:
+  - batch: 5
+    tasks: [HTP-005]
+    phase_a5_test_review:
+      reviewers: [opus, sonnet]
+      outcome: changes_requested_then_clean
+      fixed:
+        - "discover_and_digest_dispatch_by_mode only proved no-fetch -> Spy now records discover/digest, asserts correct backend per mode"
+        - "router_is_usable_as_dyn asserted nothing -> assert_eq on resolve return"
+        - "mismatched_digest before-import check used loose-ref file path -> git-level find_reference (and a borrow-checker fix to that lookup)"
+        - "discover_and_export now reads stripped root file hello.txt from the tree and asserts content"
+        - "TarServer write timeout added"
+    phase_c_code_review:
+      reviewers:
+        - { id: general-opus, verdict: approved, gates: { correctness: pass, security: pass, performance: pass } }
+        - { id: general-sonnet, verdict: changes_requested, gates: { correctness: fail, security: pass, performance: fail } }
+        - { id: architecture-opus, verdict: approved, gates: { architecture: pass } }
+        - { id: compliance-sonnet, verdict: changes_requested, gates: { style: fail } }
+      synthesized:
+        gates: { correctness: pass, security: pass, performance: pass, architecture: pass, style: pass }
+        outcome: approved_after_minor_fixes_plus_one_deferral
+    issues_fixed:
+      style:
+        - id: B5-backend-fmt
+          found_by: [compliance-sonnet]
+          detail: "new backend.rs rustfmt drift (test-module chains)"
+          resolution: "rustfmt src/backend.rs"
+        - id: B5-reexport-doc
+          found_by: [compliance-sonnet, architecture-opus]
+          detail: "pub use crate::backend::RouterBackend re-export undocumented (dual import path required by frozen tests)"
+          resolution: "one-line doc; re-export kept"
+        - id: B5-btreemap-import
+          found_by: [compliance-sonnet]
+          detail: "HttpBackend used fully-qualified std::collections::BTreeMap"
+          resolution: "use import + short form"
+        - id: B5-mode-doc
+          found_by: [architecture-opus]
+          detail: "Source::mode() relation to validation unclear"
+          resolution: "doc: post-validation classifier; exclusivity enforced by parse/validate"
+    accepted_by_design:
+      - id: B5-generic-router
+        found_by: [architecture-opus]
+        detail: "generic RouterBackend<G,H> + git_backend()/http_backend() accessors leak a test seam into the prod API"
+        resolution: "REQUIRED by the frozen spy tests (RouterBackend<Spy,Spy>); zero-cost, idiomatic. Kept."
+    deferred_issues:
+      - id: B5-source-matches-url
+        severity: high
+        found_by: [general-sonnet, general-opus]
+        detail: "source_matches() calls resolved_remote() for url sources -> fabricates https://github.com/.git -> never matches lock -> every sync re-downloads. Lock resolved field is '' for url."
+        carry_to: HTP-006
+        note: "EXACTLY HTP-006's defined scope (Lock + content identity for url sources; review_fix H2/M_noop). url sources still deploy correctly (idempotent); only the lock-skip optimization is absent. Fix in HTP-006: source_matches branches on Source::mode()==Url -> compare source_url() vs locked.git; lock resolved sentinel 'url'."
   - batch: 4
     tasks: [HTP-004]
     phase_a5_test_review:

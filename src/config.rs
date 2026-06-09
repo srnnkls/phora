@@ -508,6 +508,14 @@ pub enum DeployMode {
     Link,
 }
 
+/// Which backend a source routes to, derived from its declared fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceMode {
+    Git,
+    Host,
+    Url,
+}
+
 /// A download-integrity digest: `<algo>:<64 hex>` where algo is `sha256` or `blake3`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DownloadDigest {
@@ -684,9 +692,23 @@ impl Source {
         self.exclude.as_deref().unwrap_or(&[])
     }
 
+    /// Post-validation classifier assuming exactly one mode is set (url > host > git priority); exclusivity is enforced by `Config::parse`/validate, not here.
+    #[must_use]
+    pub fn mode(&self) -> SourceMode {
+        if self.url.is_some() {
+            SourceMode::Url
+        } else if self.host.is_some() || self.path.is_some() {
+            SourceMode::Host
+        } else {
+            SourceMode::Git
+        }
+    }
+
     #[must_use]
     pub fn refspec(&self) -> Refspec {
-        if let Some(rev) = &self.rev {
+        if matches!(self.mode(), SourceMode::Url) {
+            Refspec::None
+        } else if let Some(rev) = &self.rev {
             Refspec::Rev(rev.clone())
         } else if let Some(tag) = &self.tag {
             Refspec::Tag(tag.clone())
@@ -737,12 +759,15 @@ pub enum Refspec {
     Branch(String),
     Tag(String),
     Rev(String),
+    /// A url source has no git ref; its mirror lives at refs/heads/phora.
+    None,
 }
 
 impl std::fmt::Display for Refspec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Branch(s) | Self::Tag(s) | Self::Rev(s) => write!(f, "{s}"),
+            Self::None => write!(f, ""),
         }
     }
 }
@@ -3306,6 +3331,98 @@ url = ""
             crate::registry::Digest::parse(&format!("blake3:{hex}")).is_ok(),
             "registry::Digest must still accept a blake3 prefix (guards against an over-broad \
              rejection that breaks the existing content digest)"
+        );
+    }
+
+    // HTP-005 A: Source::mode() and Refspec::None
+
+    fn config_source(name: &str, body: &str) -> Source {
+        let toml = format!("version = 1\n\n[sources.{name}]\n{body}");
+        Config::parse(&toml)
+            .expect("source config parses")
+            .sources
+            .remove(name)
+            .expect("named source present")
+    }
+
+    #[test]
+    fn mode_is_url_when_url_set() {
+        let s = config_source("u", "url = \"https://example.com/pkg.tar.gz\"\n");
+        assert_eq!(
+            s.mode(),
+            SourceMode::Url,
+            "a source declaring `url` must classify as SourceMode::Url"
+        );
+    }
+
+    #[test]
+    fn mode_is_git_when_literal_git_set() {
+        let s = config_source("g", "git = \"https://github.com/me/repo.git\"\n");
+        assert_eq!(
+            s.mode(),
+            SourceMode::Git,
+            "a source declaring a literal `git` must classify as SourceMode::Git"
+        );
+    }
+
+    #[test]
+    fn mode_is_host_when_host_path_set() {
+        let s = config_source("h", "host = \"github\"\npath = \"me/repo\"\n");
+        assert_eq!(
+            s.mode(),
+            SourceMode::Host,
+            "a source declaring `host`/`path` must classify as SourceMode::Host"
+        );
+    }
+
+    #[test]
+    fn mode_is_host_when_only_path_set() {
+        let s = config_source("h", "path = \"me/repo\"\n");
+        assert_eq!(
+            s.mode(),
+            SourceMode::Host,
+            "a `path`-only source (host defaults to github) must classify as SourceMode::Host, \
+             not Url and not Git"
+        );
+    }
+
+    #[test]
+    fn refspec_is_none_for_url_source() {
+        let s = config_source("u", "url = \"https://example.com/pkg.tar.gz\"\n");
+        assert!(
+            matches!(s.refspec(), Refspec::None),
+            "a url source has no git ref; refspec() must be Refspec::None, never the \
+             Branch(\"main\") default that would misroute resolve to a git branch"
+        );
+    }
+
+    #[test]
+    fn refspec_none_displays_without_panicking() {
+        let none = Refspec::None;
+        assert_eq!(
+            none.to_string(),
+            "",
+            "Display for Refspec::None must render (empty) without panicking; \
+             resolved_remotes / lock formatting calls Display on it"
+        );
+    }
+
+    #[test]
+    fn refspec_still_branch_tag_rev_for_git_source() {
+        let branch = config_source("g", "git = \"https://x/y.git\"\nbranch = \"dev\"\n");
+        assert!(matches!(branch.refspec(), Refspec::Branch(b) if b == "dev"));
+
+        let tag = config_source("g", "git = \"https://x/y.git\"\ntag = \"v2\"\n");
+        assert!(matches!(tag.refspec(), Refspec::Tag(t) if t == "v2"));
+
+        let rev = config_source("g", "git = \"https://x/y.git\"\nrev = \"abc123\"\n");
+        assert!(matches!(rev.refspec(), Refspec::Rev(r) if r == "abc123"));
+
+        let default = config_source("g", "git = \"https://x/y.git\"\n");
+        assert!(
+            matches!(default.refspec(), Refspec::Branch(b) if b == "main"),
+            "a git source with no explicit ref must still default to Branch(\"main\"); \
+             Refspec::None must not leak into git sources"
         );
     }
 }

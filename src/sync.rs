@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::config::{Config, DeployMode, LayoutKind, Protocol, Source, Target, merge_configs};
+use crate::config::{
+    Config, DeployMode, LayoutKind, Protocol, Source, SourceMode, Target, merge_configs,
+};
 use crate::error::{Error, Result};
 use crate::lock::{Lock, LockedSource, merge_locks, source_matches, split_locks};
 use crate::matcher::PathMatcher;
@@ -87,10 +89,17 @@ fn effective_protocol(source: &Source, config: &Config) -> Protocol {
 fn resolved_remotes(config: &Config) -> Result<BTreeMap<String, String>> {
     let mut remotes = BTreeMap::new();
     for (name, source) in &config.sources {
-        let protocol = effective_protocol(source, config);
-        let remote = source
-            .resolved_remote(&config.hosts, protocol)
-            .map_err(|e| Error::Config(format!("source `{name}`: {e}")))?;
+        let remote = if source.mode() == SourceMode::Url {
+            source
+                .source_url()
+                .ok_or_else(|| Error::Config(format!("source `{name}`: missing url")))?
+                .to_owned()
+        } else {
+            let protocol = effective_protocol(source, config);
+            source
+                .resolved_remote(&config.hosts, protocol)
+                .map_err(|e| Error::Config(format!("source `{name}`: {e}")))?
+        };
         remotes.insert(name.clone(), remote);
     }
     Ok(remotes)

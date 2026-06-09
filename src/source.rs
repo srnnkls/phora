@@ -1,13 +1,17 @@
 //! Source port (`SourceBackend`) and its git adapter (`GitBackend`).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use gix::object::tree::EntryKind;
 
-use crate::config::Refspec;
+use crate::config::{DownloadDigest, Refspec};
 use crate::error::{Error, Result};
 use crate::matcher::PathMatcher;
 use crate::registry::ManifestFile;
+
+/// Re-exported beside the backends it composes; defined in `backend` to keep routing separate.
+pub use crate::backend::RouterBackend;
 
 /// gix clones origin as refs/remotes/origin/*; a mirror must update refs/heads/* directly.
 const MIRROR_REFSPEC: &str = "+refs/heads/*:refs/heads/*";
@@ -214,6 +218,11 @@ impl SourceBackend for GitBackend {
                     .map_err(|e| Error::Source(format!("parse rev {rev} in {source}: {e}")))?;
                 repo.find_commit(oid)
                     .map_err(|e| Error::Source(format!("rev {rev} in {source}: {e}")))?
+            }
+            Refspec::None => {
+                return Err(Error::Source(format!(
+                    "source {source}: git backend cannot resolve a url source's empty refspec"
+                )));
             }
         };
 
@@ -427,6 +436,113 @@ impl GitBackend {
     }
 }
 
+/// A download scratch file under `git_dir`, removed on drop.
+struct TempDownload {
+    path: PathBuf,
+}
+
+impl TempDownload {
+    fn create(git_dir: &Path) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = format!(".phora-download-{}-{nonce}.tmp", std::process::id());
+        Self {
+            path: git_dir.join(name),
+        }
+    }
+}
+
+impl Drop for TempDownload {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Url-source adapter: downloads + extracts + imports a synthetic mirror, then
+/// reads it through an inner [`GitBackend`] over the same `git_dir`.
+pub struct HttpBackend {
+    git_dir: PathBuf,
+    git: GitBackend,
+    digests: BTreeMap<String, DownloadDigest>,
+}
+
+impl HttpBackend {
+    #[must_use]
+    pub fn new(git_dir: PathBuf, digests: BTreeMap<String, DownloadDigest>) -> Self {
+        let git = GitBackend::new(git_dir.clone());
+        Self {
+            git_dir,
+            git,
+            digests,
+        }
+    }
+}
+
+impl SourceBackend for HttpBackend {
+    fn fetch(&self, source: &str, url: &str) -> Result<()> {
+        std::fs::create_dir_all(&self.git_dir)
+            .map_err(|e| Error::Source(format!("source {source}: create git dir: {e}")))?;
+        let temp = TempDownload::create(&self.git_dir);
+
+        crate::http::download(url, &temp.path)?;
+
+        if let Some(expected) = self.digests.get(source) {
+            let bytes = std::fs::read(&temp.path)
+                .map_err(|e| Error::Source(format!("source {source}: read download: {e}")))?;
+            crate::http::verify_digest(&bytes, expected)
+                .map_err(|e| Error::Source(format!("source {source}: {e}")))?;
+        }
+
+        let entries = crate::archive::extract(&temp.path, url)?;
+        import_tree(&self.git_dir, url, &entries)?;
+        Ok(())
+    }
+
+    /// Resolve ignores the refspec: url sources live at refs/heads/phora.
+    fn resolve(&self, source: &str, url: &str, _refspec: &Refspec) -> Result<String> {
+        let mirror = mirror_path(&self.git_dir, url);
+        let repo =
+            gix::open(&mirror).map_err(|e| Error::Source(format!("open mirror {source}: {e}")))?;
+        let commit = repo
+            .find_reference(IMPORT_REF)
+            .map_err(|e| Error::Source(format!("{IMPORT_REF} in {source}: {e}")))?
+            .peel_to_commit()
+            .map_err(|e| Error::Source(format!("peel {IMPORT_REF} in {source}: {e}")))?;
+        Ok(commit.id().to_hex().to_string())
+    }
+
+    fn commit_time(&self, source: &str, url: &str, commit: &str) -> Result<u64> {
+        self.git.commit_time(source, url, commit)
+    }
+
+    fn discover_artifacts(
+        &self,
+        source: &str,
+        url: &str,
+        commit: &str,
+        root: Option<&Path>,
+        matcher: &PathMatcher,
+    ) -> Result<Vec<String>> {
+        self.git
+            .discover_artifacts(source, url, commit, root, matcher)
+    }
+
+    fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult> {
+        self.git.export_artifact(req)
+    }
+
+    fn compute_digest(
+        &self,
+        source: &str,
+        url: &str,
+        commit: &str,
+        root: Option<&Path>,
+        matcher: &PathMatcher,
+    ) -> Result<String> {
+        self.git.compute_digest(source, url, commit, root, matcher)
+    }
+}
+
 struct ExportWalk<'a> {
     repo: &'a gix::Repository,
     source: &'a str,
@@ -562,13 +678,6 @@ const IMPORT_REF: &str = "refs/heads/phora";
 /// Writes `entries` as a synthetic commit on `refs/heads/phora` in the bare mirror for
 /// `url` (created if absent), returning the commit id as hex. The id is content-addressed:
 /// fixed identity/time/message + no parents + git-sorted trees ⇒ identical content, identical id.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into HttpBackend::fetch by HTP-005; expect fires when the caller lands"
-    )
-)]
 pub(crate) fn import_tree(
     git_dir: &Path,
     url: &str,
@@ -2393,5 +2502,341 @@ path = "srnnkls/tropos"
             no_exclude, exclude_lua,
             "excluding entries that exist must change the digest"
         );
+    }
+
+    // ---- HTP-005 B/C: HttpBackend (url source) at the trait level ----
+
+    mod http_backend {
+        use std::collections::BTreeMap;
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::path::Path;
+        use std::time::Duration;
+
+        use gix::object::tree::EntryKind;
+        use tempfile::TempDir;
+
+        use crate::config::{DownloadDigest, Refspec};
+        use crate::error::Error;
+        use crate::matcher::PathMatcher;
+        use crate::source::{ExportPolicy, ExportRequest, HttpBackend, SourceBackend, mirror_path};
+
+        const HELLO_BODY: &[u8] = b"hi";
+        const RUN_BODY: &[u8] = b"#!/bin/sh\n";
+
+        /// One-shot 127.0.0.1 server returning the canned bytes; accept thread is
+        /// detached so a non-connecting fetch never hangs the test on join.
+        struct TarServer {
+            port: u16,
+        }
+
+        impl TarServer {
+            fn spawn(body: Vec<u8>) -> Self {
+                let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+                let port = listener.local_addr().expect("local addr").port();
+                std::thread::spawn(move || {
+                    if let Ok((stream, _)) = listener.accept() {
+                        Self::serve(stream, &body);
+                    }
+                });
+                Self { port }
+            }
+
+            fn serve(mut stream: TcpStream, body: &[u8]) {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+                let _ = stream.flush();
+            }
+
+            fn url(&self) -> String {
+                format!("http://127.0.0.1:{}/pkg-1.0.tar.gz", self.port)
+            }
+        }
+
+        /// A `.tar.gz` of `pkg-1.0/hello.txt`="hi" and `pkg-1.0/bin/run.sh`(0o755)="#!/bin/sh\n".
+        /// After auto-strip the entries are `hello.txt` and `bin/run.sh`.
+        fn build_pkg_tar_gz() -> Vec<u8> {
+            fn append(builder: &mut tar::Builder<Vec<u8>>, path: &str, data: &[u8], mode: u32) {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(mode);
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, path, data)
+                    .expect("append tar entry");
+            }
+
+            let mut builder = tar::Builder::new(Vec::new());
+            append(&mut builder, "pkg-1.0/hello.txt", HELLO_BODY, 0o644);
+            append(&mut builder, "pkg-1.0/bin/run.sh", RUN_BODY, 0o755);
+            let tar_bytes = builder.into_inner().expect("finish tar");
+
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&tar_bytes).expect("gzip tar bytes");
+            encoder.finish().expect("finish gzip")
+        }
+
+        fn empty_matcher() -> PathMatcher {
+            PathMatcher::new(&[], &[]).expect("empty matcher builds")
+        }
+
+        #[test]
+        fn fetch_then_resolve_ignores_refspec_and_reads_phora_head() {
+            let server = TarServer::spawn(build_pkg_tar_gz());
+            let url = server.url();
+            let git_dir = TempDir::new().expect("git_dir tempdir");
+            let backend = HttpBackend::new(git_dir.path().to_path_buf(), BTreeMap::new());
+
+            backend
+                .fetch("pkg", &url)
+                .expect("fetch downloads, extracts, and imports a tree");
+
+            let resolved = backend
+                .resolve("pkg", &url, &Refspec::Branch("main".into()))
+                .expect("resolve must read refs/heads/phora, ignoring the bogus Branch(main)");
+
+            assert_eq!(resolved.len(), 40, "resolve returns a 40-hex commit id");
+            assert!(
+                resolved.chars().all(|c| c.is_ascii_hexdigit()),
+                "resolve returns a hex commit id, got: {resolved}"
+            );
+
+            let none_resolved = backend
+                .resolve("pkg", &url, &Refspec::None)
+                .expect("resolve with Refspec::None must also read the synthetic phora head");
+            assert_eq!(
+                none_resolved, resolved,
+                "resolve must yield the same synthetic commit regardless of the passed refspec, \
+                 proving it ignores the refspec and reads refs/heads/phora"
+            );
+        }
+
+        #[test]
+        fn commit_time_of_synthetic_commit_is_epoch_plus_one() {
+            let server = TarServer::spawn(build_pkg_tar_gz());
+            let url = server.url();
+            let git_dir = TempDir::new().expect("git_dir tempdir");
+            let backend = HttpBackend::new(git_dir.path().to_path_buf(), BTreeMap::new());
+
+            backend.fetch("pkg", &url).expect("fetch");
+            let commit = backend
+                .resolve("pkg", &url, &Refspec::None)
+                .expect("resolve synthetic head");
+
+            let time = backend
+                .commit_time("pkg", &url, &commit)
+                .expect("commit_time of synthetic commit");
+            assert_eq!(
+                time, 1,
+                "the synthetic import commit's author time is epoch+1 (==1)"
+            );
+        }
+
+        #[test]
+        fn discover_and_export_yield_stripped_files_with_exec_bit() {
+            let server = TarServer::spawn(build_pkg_tar_gz());
+            let url = server.url();
+            let git_dir = TempDir::new().expect("git_dir tempdir");
+            let backend = HttpBackend::new(git_dir.path().to_path_buf(), BTreeMap::new());
+
+            backend.fetch("pkg", &url).expect("fetch");
+            let commit = backend
+                .resolve("pkg", &url, &Refspec::None)
+                .expect("resolve synthetic head");
+            let m = empty_matcher();
+
+            let artifacts = backend
+                .discover_artifacts("pkg", &url, &commit, None, &m)
+                .expect("discover artifacts over the synthetic tree");
+            assert_eq!(
+                artifacts,
+                vec!["bin".to_string()],
+                "after pkg-1.0/ strip the only top-level directory artifact is `bin`; \
+                 `hello.txt` is a root file, not an artifact dir"
+            );
+
+            let staging = TempDir::new().expect("staging tempdir");
+            let policy = ExportPolicy {
+                allow_symlinks: false,
+                allow_submodules: false,
+                preserve_executable: true,
+            };
+            let export = backend
+                .export_artifact(&ExportRequest {
+                    source: "pkg",
+                    url: &url,
+                    commit: &commit,
+                    root: None,
+                    artifact: "bin",
+                    matcher: &m,
+                    policy: &policy,
+                    staging_dir: staging.path(),
+                    commit_time: 1,
+                })
+                .expect("export the `bin` artifact");
+
+            let run = export
+                .files
+                .iter()
+                .find(|f| f.path == Path::new("run.sh"))
+                .expect("export must contain run.sh under the bin artifact");
+            let run_on_disk = staging.path().join("run.sh");
+            assert_eq!(
+                std::fs::read(&run_on_disk).expect("read exported run.sh"),
+                RUN_BODY,
+                "exported run.sh content must equal the served file bytes"
+            );
+            assert_eq!(
+                run.size,
+                RUN_BODY.len() as u64,
+                "manifest size must match the run.sh body length"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&run_on_disk)
+                    .expect("stat exported run.sh")
+                    .permissions()
+                    .mode();
+                assert!(
+                    mode & 0o111 != 0,
+                    "the 0o755 archive entry must export with the executable bit set, got mode {mode:o}"
+                );
+            }
+
+            // hello.txt is a root file: discover skips it and export never touches it,
+            // so its import fidelity is only provable straight from the git tree.
+            let mirror = mirror_path(git_dir.path(), &url);
+            let repo = gix::open(&mirror).expect("open synthetic mirror");
+            let oid = gix::ObjectId::from_hex(commit.as_bytes()).expect("commit hex");
+            let hello = repo
+                .find_commit(oid)
+                .expect("find synthetic commit")
+                .tree()
+                .expect("commit tree")
+                .lookup_entry_by_path(Path::new("hello.txt"))
+                .expect("lookup hello.txt")
+                .expect("hello.txt present at the stripped tree root");
+            let blob = repo.find_blob(hello.object_id()).expect("hello.txt blob");
+            assert_eq!(
+                blob.data, HELLO_BODY,
+                "the stripped root file hello.txt must import with its served bytes (`hi`)"
+            );
+        }
+
+        #[test]
+        fn matching_digest_lets_fetch_succeed() {
+            let tar_gz = build_pkg_tar_gz();
+            let server = TarServer::spawn(tar_gz.clone());
+            let url = server.url();
+
+            let mut digests = BTreeMap::new();
+            digests.insert(
+                "pkg".to_string(),
+                DownloadDigest::Sha256(sha256_of(&tar_gz)),
+            );
+
+            let git_dir = TempDir::new().expect("git_dir tempdir");
+            let backend = HttpBackend::new(git_dir.path().to_path_buf(), digests);
+
+            backend
+                .fetch("pkg", &url)
+                .expect("a matching configured digest must let fetch succeed");
+
+            backend
+                .resolve("pkg", &url, &Refspec::None)
+                .expect("a verified fetch must create refs/heads/phora");
+        }
+
+        #[test]
+        fn mismatched_digest_errors_before_import_naming_source() {
+            let tar_gz = build_pkg_tar_gz();
+            let server = TarServer::spawn(tar_gz);
+            let url = server.url();
+
+            let mut digests = BTreeMap::new();
+            digests.insert("pkg".to_string(), DownloadDigest::Sha256([0u8; 32]));
+
+            let git_dir = TempDir::new().expect("git_dir tempdir");
+            let backend = HttpBackend::new(git_dir.path().to_path_buf(), digests);
+
+            let err = backend
+                .fetch("pkg", &url)
+                .expect_err("a non-matching configured digest must fail fetch");
+            match err {
+                Error::Source(msg) => assert!(
+                    msg.contains("pkg"),
+                    "the digest-mismatch error must name the source `pkg`, got: {msg}"
+                ),
+                other => panic!("expected Error::Source on digest mismatch, got: {other:?}"),
+            }
+
+            let mirror = mirror_path(git_dir.path(), &url);
+            let phora_ref_exists = gix::open(&mirror)
+                .ok()
+                .is_some_and(|repo| repo.find_reference("refs/heads/phora").is_ok());
+            assert!(
+                !phora_ref_exists,
+                "a digest mismatch must abort BEFORE import: a git-level lookup of \
+                 refs/heads/phora must find nothing (packed or loose) — or the mirror \
+                 must not even be initialized"
+            );
+            assert!(
+                backend.resolve("pkg", &url, &Refspec::None).is_err(),
+                "with no synthetic head imported, resolve must fail after a rejected fetch"
+            );
+        }
+
+        fn sha256_of(bytes: &[u8]) -> [u8; 32] {
+            use sha2::{Digest, Sha256};
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&Sha256::digest(bytes));
+            out
+        }
+
+        #[test]
+        fn import_round_trip_preserves_hello_blob() {
+            let server = TarServer::spawn(build_pkg_tar_gz());
+            let url = server.url();
+            let git_dir = TempDir::new().expect("git_dir tempdir");
+            let backend = HttpBackend::new(git_dir.path().to_path_buf(), BTreeMap::new());
+
+            backend.fetch("pkg", &url).expect("fetch");
+            let commit = backend
+                .resolve("pkg", &url, &Refspec::None)
+                .expect("resolve synthetic head");
+
+            let mirror = mirror_path(git_dir.path(), &url);
+            let repo = gix::open(&mirror).expect("open synthetic mirror");
+            let oid = gix::ObjectId::from_hex(commit.as_bytes()).expect("commit hex");
+            let tree = repo
+                .find_commit(oid)
+                .expect("find synthetic commit")
+                .tree()
+                .expect("commit tree");
+            let entry = tree
+                .lookup_entry_by_path(Path::new("hello.txt"))
+                .expect("lookup hello.txt")
+                .expect("hello.txt present at the stripped tree root");
+            assert!(
+                matches!(entry.mode().kind(), EntryKind::Blob),
+                "hello.txt must import as a plain blob"
+            );
+            let blob = repo.find_blob(entry.object_id()).expect("hello.txt blob");
+            assert_eq!(
+                blob.data, HELLO_BODY,
+                "the downloaded-extracted-imported hello.txt blob must equal `hi`"
+            );
+        }
     }
 }
