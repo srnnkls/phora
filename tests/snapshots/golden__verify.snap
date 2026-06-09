@@ -1,0 +1,8 @@
+---
+source: tests/golden.rs
+expression: "snapshot(&run(&fixture, &[\"verify\"]))"
+---
+exit: 0
+--- stdout ---
+all verified
+--- stderr ---

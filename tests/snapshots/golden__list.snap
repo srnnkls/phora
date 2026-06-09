@@ -1,0 +1,10 @@
+---
+source: tests/golden.rs
+expression: "snapshot(&run(&fixture, &[\"list\"]))"
+---
+exit: 0
+--- stdout ---
+home:
+  dotfiles/editor  ✓ clean
+  dotfiles/lint  ✓ clean
+--- stderr ---
