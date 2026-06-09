@@ -27,6 +27,32 @@ mise run build      # cargo build
 
 Requires a Rust toolchain (edition 2024).
 
+## Getting started
+
+Describe what you want and where it goes in `phora.toml`:
+
+```toml
+version = 1
+
+[sources.dotfiles]
+host = "github"          # -> https://github.com/me/dotfiles.git
+path = "me/dotfiles"
+branch = "main"
+
+[targets.nvim]
+path = "~/.config/nvim"
+sources = ["dotfiles"]
+```
+
+```bash
+phora sync       # fetch, pin to a commit, project artifacts into ~/.config/nvim
+phora verify     # re-hash the deployed files; non-zero exit on any mismatch
+```
+
+New to phora? The **[guide](GUIDE.md)** walks through a real setup end to end —
+git and `url` sources, layouts, the local dev loop, and what to do when something
+looks wrong.
+
 ## Concepts
 
 - **Source** — provenance: where bytes come from, pinned by `branch`, `tag`, or
@@ -145,6 +171,17 @@ where an artifact wants to land, it prompts (on a TTY):
 ```
 
 Non-interactive runs skip such files unless `--force` is given.
+
+### Troubleshooting
+
+When something looks off, the question you have usually maps to one command:
+
+- **Did `include`/`exclude` match what I expected?** — `phora check-match --source <source> <path>`
+- **Is what's on disk what phora actually deployed?** — `phora verify` (non-zero exit on any mismatch)
+- **Where did a deployed file come from?** — `phora where --source <source>` (by source / artifact / commit / digest)
+- **Registry wrong after hand-editing `~/.phora`?** — `phora rebuild-registry` (rebuilds it from the lock + on-disk targets)
+
+The [guide](GUIDE.md) goes deeper on each.
 
 ## Configuration
 
