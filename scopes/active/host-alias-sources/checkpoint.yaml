@@ -2,15 +2,14 @@ checkpoint:
   scope_name: host-alias-sources
   scope_path: ./scopes/active/host-alias-sources
   branch: feat/host-alias-sources
-  last_batch: 3
+  last_batch: 4
   tasks:
-    done: [HAS-001, HAS-002, HAS-003, HAS-004]
-    pending: [HAS-005, HAS-006]
-  next_batch:
-    number: 4
-    tasks: [HAS-005, HAS-006]   # lock (lock.rs) + docs (README/example) — independent files, parallelizable
+    done: [HAS-001, HAS-002, HAS-003, HAS-004, HAS-005, HAS-006]
+    pending: []
+  all_tasks_complete: true
   deferred_issues:
-    - "HAS-005 (CRITICAL, handoff from HAS-003): source_matches must compare NormalizedUrl/MirrorKey identity (hosts, protocol), not raw source.git; today host-mode sources refetch every sync because locked.git=resolved remote vs source.git=None"
-    - "note: effective_protocol lives in sync.rs (cohesion nit); builtin_forges() rebuilt per source (micro-opt); threaded resolved-remote struct fields named `git` (naming nit)"
+    - "HAS-005 perf: source_matches re-resolves remote (negligible vs git I/O)"
+    - "cosmetic: resolved_remote error labels source by path not name"
+    - "NormalizedUrl split_once('@') edge — unreachable today"
   review_config:
     reviewers: [opus, sonnet]

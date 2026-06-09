@@ -30,7 +30,8 @@ Requires a Rust toolchain (edition 2024).
 ## Concepts
 
 - **Source** — a git repository, pinned by `branch`, `tag`, or `rev`. The
-  top-level directories under its `root` are its artifacts.
+  top-level directories under its `root` are its artifacts. Declare its remote
+  literally (`git = "…"`) or symbolically against a host (`host` + `path`).
 - **Artifact** — one top-level directory in a source (dotfiles are skipped). Glob
   `include`/`exclude` rules select which artifacts and which files within them ship.
 - **Target** — a local directory artifacts are projected into, with a chosen
@@ -45,10 +46,15 @@ Requires a Rust toolchain (edition 2024).
 ## Usage
 
 ```bash
-# Add a source (shorthand expands via host templates)
-phora add owner/repo --name myconfigs --branch main --root configs
-phora add https://github.com/me/dotfiles.git
+# Add a source. Shorthands persist symbolically (host + path), not an expanded URL.
+phora add owner/repo --name myconfigs --branch main --root configs  # -> host = "github"
+phora add github:srnnkls/tropos             # colon alias -> host = "github"
+phora add gitlab:group/repo                 # any built-in forge (alias caps at owner/repo)
+phora add github.com/me/dotfiles            # domain shorthand -> host = "github"
+phora add https://github.com/me/dotfiles.git  # scheme/scp URLs stay literal (git = "…")
 phora add git@github.com:me/dotfiles.git --tag v1.2
+# Deep GitLab subgroups go in the config `path` field (path = "group/sub/proj"),
+# not the colon alias (segments past owner/repo become `root`).
 
 # Fetch sources, resolve commits, project artifacts into targets
 phora sync
@@ -96,13 +102,14 @@ Phora reads `phora.toml` from the working directory, optionally overlaid by
 
 ```toml
 version = 1
+# protocol = "ssh"         # global default for host-aliased sources (default https)
 
 [hosts.github]
-git_url = "https://github.com/{owner}/{repo}.git"
-auth = { type = "token", env = "GITHUB_TOKEN" }
+auth = { type = "token", env = "GITHUB_TOKEN" }   # remote is built in; just add auth
 
 [sources.dotfiles]
-git = "https://github.com/me/dotfiles.git"
+host = "github"          # symbolic remote: host + path (or use git = "…" for a literal URL)
+path = "me/dotfiles"
 branch = "main"          # or tag = "...", or rev = "<sha>" (pick one)
 root = "modules"         # repo subdirectory to treat as the artifact root
 include = ["editor"]     # optional artifact/path globs
@@ -114,8 +121,9 @@ sources = ["dotfiles"]   # omit to draw from every source
 layout = "flat"          # "flat" | "by-source" | { type = "prefixed", separator = "-" }
 ```
 
-**Hosts** provide URL templates (`{owner}`, `{repo}`) for `add` shorthands and
-auth. `github` and `gitlab` are built in. Auth is either
+**Hosts** supply remote templates and auth. `github`, `gitlab`, `codeberg`,
+`sr.ht`, and `bitbucket` ship built in (both https and ssh); a `[hosts.X]` block
+adds a new forge or overrides a built-in's `remote`/`auth`. Auth is either
 `{ type = "token", env = "VAR" }` or `{ type = "ssh", key = "~/.ssh/key" }`.
 
 **Source flags:** `allow_symlinks`, `allow_submodules` (both default off),
@@ -129,6 +137,58 @@ auth. `github` and `gitlab` are built in. Auth is either
 | `flat` (default)                | `a`         |
 | `by-source`                     | `s/a`       |
 | `{ type = "prefixed", sep="-" }`| `s-a`       |
+
+### Host-aliased sources
+
+A source declares its remote in exactly one of two modes — never both:
+
+- **Literal:** `git = "<url>"`, any https, `ssh://`, or scp-style (`git@host:path`)
+  remote. Unchanged; existing configs keep working.
+- **Symbolic:** `host = "<alias>"` + `path = "<owner/repo>"`, resolved at sync time
+  from the host's `remote` template. `host` may be omitted when `path` is set, in
+  which case it defaults to `github`.
+
+```toml
+[sources.tropos]
+host = "github"          # built in; omit to default to github
+path = "srnnkls/tropos"
+branch = "main"
+
+[sources.internal]
+host = "company"         # defined in [hosts.company]
+path = "team/sub/proj"   # nested paths are fine
+protocol = "ssh"         # per-source override (default is https)
+```
+
+A host's `remote` is either a single template string (https) or a
+`{ https = "…", ssh = "…" }` table. Templates fill three placeholders:
+
+| Placeholder | Value                                              |
+| ----------- | -------------------------------------------------- |
+| `{path}`    | the source's `path`, verbatim                      |
+| `{owner}`   | the first `/`-segment of `path`                    |
+| `{repo}`    | the remainder (so `{owner}/{repo}` ≡ `{path}` at any depth — GitLab subgroups) |
+
+```toml
+[hosts.company]
+remote = { https = "https://git.company.com/{path}.git", ssh = "git@git.company.com:{path}.git" }
+```
+
+**Built-in forges.** `github`, `gitlab`, `codeberg`, `sr.ht`, and `bitbucket`
+ship as `remote` tables with both https and ssh shapes, so no template is needed
+for them. A `[hosts.X]` block of the same name overrides the built-in's `remote`
+or adds `auth`; changing a host's `remote` re-points every source on that host
+with no per-source edits.
+
+**Protocol.** `protocol = "https" | "ssh"` selects which template key a symbolic
+source resolves through. It defaults to `https`, can be set globally at the top
+level, and is overridable per source. Selecting `ssh` against a host whose
+`remote` has no `ssh` key is a config error. (`protocol` is ignored for literal
+`git` sources.)
+
+The symbolic and literal forms of one repo — and its https and ssh remotes —
+share a single `~/.phora/git` mirror, so switching mode or protocol never
+re-clones or refetches.
 
 ### Link mode (local development)
 

@@ -77,7 +77,7 @@ tasks:
 
   - id: HAS-005
     content: "Lock shape + protocol-independent source_matches"
-    status: pending
+    status: done
     activeForm: "Stabilizing lock across literal/symbolic/protocol"
     depends_on: [HAS-003]
     review_fixes:
@@ -95,7 +95,7 @@ tasks:
 
   - id: HAS-006
     content: "Docs: host-aliased sources, remote table, protocol, built-in forges"
-    status: pending
+    status: done
     activeForm: "Documenting host-alias sources"
     depends_on: [HAS-002, HAS-004]
     acceptance:
