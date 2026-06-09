@@ -55,7 +55,7 @@ tasks:
 
   - id: HTP-004
     content: "Deterministic synthetic-commit import (gix) — confirmed feasible, mind tree-sort"
-    status: pending
+    status: done
     activeForm: "Importing content as a synthetic commit"
     depends_on: [HTP-003]
     review_fixes:

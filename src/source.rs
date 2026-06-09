@@ -135,6 +135,12 @@ impl MirrorKey {
     }
 }
 
+/// `<MirrorKey>.git` under `git_dir`; the single source of mirror-directory layout.
+pub(crate) fn mirror_path(git_dir: &Path, url: &str) -> PathBuf {
+    let key = MirrorKey::from_url(&NormalizedUrl::parse(url));
+    git_dir.join(format!("{}.git", key.as_str()))
+}
+
 pub struct GitBackend {
     git_dir: PathBuf,
 }
@@ -146,8 +152,7 @@ impl GitBackend {
     }
 
     fn mirror_path(&self, url: &str) -> PathBuf {
-        let key = MirrorKey::from_url(&NormalizedUrl::parse(url));
-        self.git_dir.join(format!("{}.git", key.as_str()))
+        mirror_path(&self.git_dir, url)
     }
 }
 
@@ -542,6 +547,168 @@ impl ExportWalk<'_> {
         );
         Ok(())
     }
+}
+
+// Fixed identity/time/message: with no parents and git-sorted trees the commit id is a
+// function of the imported content only — identical entries yield an identical commit id.
+const IMPORT_NAME: &str = "phora";
+const IMPORT_EMAIL: &str = "phora@localhost";
+const IMPORT_MESSAGE: &str = "phora synthetic import";
+// epoch+1, not epoch 0: HFS+/FAT32 clamp a 0 mtime on EXPORTED files, making clean checks
+// report Modified; the commit id is pure content, so this never affects determinism.
+const IMPORT_TIME_SECONDS: i64 = 1;
+const IMPORT_REF: &str = "refs/heads/phora";
+
+/// Writes `entries` as a synthetic commit on `refs/heads/phora` in the bare mirror for
+/// `url` (created if absent), returning the commit id as hex. The id is content-addressed:
+/// fixed identity/time/message + no parents + git-sorted trees ⇒ identical content, identical id.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "wired into HttpBackend::fetch by HTP-005; expect fires when the caller lands"
+    )
+)]
+pub(crate) fn import_tree(
+    git_dir: &Path,
+    url: &str,
+    entries: &[crate::archive::ExtractedEntry],
+) -> Result<String> {
+    let mirror = mirror_path(git_dir, url);
+
+    let repo = if mirror.exists() {
+        gix::open(&mirror).map_err(|e| Error::Source(format!("open mirror {url}: {e}")))?
+    } else {
+        gix::init_bare(&mirror).map_err(|e| Error::Source(format!("init mirror {url}: {e}")))?
+    };
+
+    let mut root = ImportDir::default();
+    for entry in entries {
+        let oid = repo
+            .write_blob(&entry.data)
+            .map_err(|e| Error::Source(format!("write blob for {url}: {e}")))?
+            .detach();
+        root.insert(&entry.path, entry.kind, oid)?;
+    }
+
+    let root_oid = write_import_tree(&repo, &root, url)?;
+
+    let signature = gix::actor::Signature {
+        name: IMPORT_NAME.into(),
+        email: IMPORT_EMAIL.into(),
+        time: gix::date::Time {
+            seconds: IMPORT_TIME_SECONDS,
+            offset: 0,
+        },
+    };
+    let commit = gix::objs::Commit {
+        tree: root_oid,
+        parents: std::iter::empty::<gix::ObjectId>().collect(),
+        author: signature.clone(),
+        committer: signature,
+        encoding: None,
+        message: IMPORT_MESSAGE.into(),
+        extra_headers: vec![],
+    };
+    let commit_id = repo
+        .write_object(&commit)
+        .map_err(|e| Error::Source(format!("write import commit for {url}: {e}")))?
+        .detach();
+
+    // PreviousValue::Any: create the ref if absent, force-update it on re-import.
+    repo.reference(
+        IMPORT_REF,
+        commit_id,
+        gix::refs::transaction::PreviousValue::Any,
+        IMPORT_MESSAGE,
+    )
+    .map_err(|e| Error::Source(format!("update {IMPORT_REF} for {url}: {e}")))?;
+
+    Ok(commit_id.to_hex().to_string())
+}
+
+/// Mutable in-memory directory while assembling the import; leaves carry a written
+/// blob oid plus the git mode to encode, subdirectories nest further `ImportDir`s.
+#[derive(Default)]
+struct ImportDir {
+    children: std::collections::BTreeMap<String, ImportNode>,
+}
+
+enum ImportNode {
+    Leaf { kind: EntryKind, oid: gix::ObjectId },
+    Dir(ImportDir),
+}
+
+impl ImportDir {
+    fn insert(&mut self, path: &Path, kind: EntryKind, oid: gix::ObjectId) -> Result<()> {
+        let mut components = Vec::new();
+        for component in path.components() {
+            let name = component.as_os_str().to_str().ok_or_else(|| {
+                Error::Source(format!("non-utf8 import path: {}", path.display()))
+            })?;
+            components.push(safe_component(name)?.to_string());
+        }
+        let Some((leaf, dirs)) = components.split_last() else {
+            return Err(Error::Source("empty import path".to_owned()));
+        };
+
+        let mut dir = self;
+        for segment in dirs {
+            let node = dir
+                .children
+                .entry(segment.clone())
+                .or_insert_with(|| ImportNode::Dir(ImportDir::default()));
+            match node {
+                ImportNode::Dir(child) => dir = child,
+                ImportNode::Leaf { .. } => {
+                    return Err(Error::Source(format!(
+                        "import path collides file and directory at {segment:?}"
+                    )));
+                }
+            }
+        }
+        match dir.children.entry(leaf.clone()) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(ImportNode::Leaf { kind, oid });
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(existing) => match existing.get() {
+                ImportNode::Dir(_) => Err(Error::Source(format!(
+                    "import path collides file and directory at {leaf:?}"
+                ))),
+                ImportNode::Leaf { .. } => Err(Error::Source(format!(
+                    "duplicate archive entry path: {leaf:?}"
+                ))),
+            },
+        }
+    }
+}
+
+fn write_import_tree(repo: &gix::Repository, dir: &ImportDir, url: &str) -> Result<gix::ObjectId> {
+    let mut entries = Vec::with_capacity(dir.children.len());
+    for (name, node) in &dir.children {
+        let (mode, oid) = match node {
+            ImportNode::Leaf { kind, oid } => ((*kind).into(), *oid),
+            ImportNode::Dir(child) => {
+                let child_oid = write_import_tree(repo, child, url)?;
+                (EntryKind::Tree.into(), child_oid)
+            }
+        };
+        entries.push(gix::objs::tree::Entry {
+            mode,
+            filename: name.as_str().into(),
+            oid,
+        });
+    }
+    // Git tree order treats directory names as suffixed with '/'; Entry's Ord encodes
+    // exactly that, so sorting here makes the tree id input-order independent.
+    entries.sort();
+
+    let tree = gix::objs::Tree { entries };
+    Ok(repo
+        .write_object(&tree)
+        .map_err(|e| Error::Source(format!("write tree for {url}: {e}")))?
+        .detach())
 }
 
 /// HEAD of a local working-tree repo; a non-repo or unborn HEAD yields the
@@ -1774,6 +1941,430 @@ path = "srnnkls/tropos"
             digest_of_art(&two_files),
             "distinct layouts whose naive path||tag||content streams are byte-identical \
              must hash differently; entries need length framing"
+        );
+    }
+
+    // ---- import_tree (HTP-004): deterministic synthetic-commit import ----
+
+    use crate::archive::ExtractedEntry;
+
+    fn entry(path: &str, kind: EntryKind, data: &[u8]) -> ExtractedEntry {
+        ExtractedEntry {
+            path: PathBuf::from(path),
+            kind,
+            data: data.to_vec(),
+        }
+    }
+
+    /// Opens the bare mirror that `import_tree` wrote for `url` under `git_dir`.
+    fn open_imported_mirror(git_dir: &Path, url: &str) -> gix::Repository {
+        let key = MirrorKey::from_url(&NormalizedUrl::parse(url));
+        let mirror = git_dir.join(format!("{}.git", key.as_str()));
+        gix::open(&mirror).expect("imported mirror opens as a git repo")
+    }
+
+    const IMPORT_URL: &str = "https://example.com/owner/repo";
+
+    #[test]
+    fn deterministic_same_entries_same_commit_id() {
+        let dir_a = TempDir::new().expect("git_dir a");
+        let dir_b = TempDir::new().expect("git_dir b");
+        let entries = || {
+            vec![
+                entry("a.txt", EntryKind::Blob, b"alpha"),
+                entry("dir/b.txt", EntryKind::Blob, b"bravo"),
+            ]
+        };
+
+        let first =
+            import_tree(dir_a.path(), IMPORT_URL, &entries()).expect("import into fresh git_dir a");
+        let second = import_tree(dir_b.path(), IMPORT_URL, &entries())
+            .expect("import the same entries into fresh git_dir b");
+
+        assert_eq!(
+            first, second,
+            "identical entries must produce an identical content-addressed commit id, \
+             independent of which git_dir they land in"
+        );
+    }
+
+    #[test]
+    fn input_order_independent_commit_id() {
+        let dir_a = TempDir::new().expect("git_dir a");
+        let dir_b = TempDir::new().expect("git_dir b");
+
+        let forward = vec![
+            entry("a.txt", EntryKind::Blob, b"alpha"),
+            entry("m.txt", EntryKind::Blob, b"mike"),
+            entry("z.txt", EntryKind::Blob, b"zulu"),
+            entry("dir/b.txt", EntryKind::Blob, b"bravo"),
+        ];
+        let reversed = vec![
+            entry("dir/b.txt", EntryKind::Blob, b"bravo"),
+            entry("z.txt", EntryKind::Blob, b"zulu"),
+            entry("m.txt", EntryKind::Blob, b"mike"),
+            entry("a.txt", EntryKind::Blob, b"alpha"),
+        ];
+
+        let forward_id =
+            import_tree(dir_a.path(), IMPORT_URL, &forward).expect("import forward order");
+        let reversed_id =
+            import_tree(dir_b.path(), IMPORT_URL, &reversed).expect("import reversed order");
+
+        assert_eq!(
+            forward_id, reversed_id,
+            "input order must not affect the commit id: the impl must sort tree entries \
+             into git order before writing"
+        );
+    }
+
+    #[test]
+    fn different_content_different_commit_id() {
+        let dir_a = TempDir::new().expect("git_dir a");
+        let dir_b = TempDir::new().expect("git_dir b");
+
+        let base = import_tree(
+            dir_a.path(),
+            IMPORT_URL,
+            &[entry("a.txt", EntryKind::Blob, b"alpha")],
+        )
+        .expect("import base content");
+        let changed = import_tree(
+            dir_b.path(),
+            IMPORT_URL,
+            &[entry("a.txt", EntryKind::Blob, b"ALPHA")],
+        )
+        .expect("import changed content");
+
+        assert_ne!(
+            base, changed,
+            "changing a file's bytes must change the content-addressed commit id"
+        );
+    }
+
+    #[test]
+    fn commit_has_fixed_identity_time_and_no_parents() {
+        let dir_a = TempDir::new().expect("git_dir a");
+        let dir_b = TempDir::new().expect("git_dir b");
+        let make = || vec![entry("a.txt", EntryKind::Blob, b"alpha")];
+
+        let id_a = import_tree(dir_a.path(), IMPORT_URL, &make()).expect("import a");
+        let id_b = import_tree(dir_b.path(), IMPORT_URL, &make()).expect("import b");
+
+        let repo = open_imported_mirror(dir_a.path(), IMPORT_URL);
+        let oid = gix::ObjectId::from_hex(id_a.as_bytes()).expect("returned hex is a valid oid");
+        let commit = repo
+            .find_commit(oid)
+            .expect("returned commit id exists in the mirror");
+
+        let author = commit.author().expect("commit has an author");
+        let committer = commit.committer().expect("commit has a committer");
+
+        assert_eq!(
+            author.time().expect("author time decodes").seconds,
+            1,
+            "author time must be the fixed epoch+1 second (NOT epoch 0)"
+        );
+        assert_eq!(
+            committer.time().expect("committer time decodes").seconds,
+            1,
+            "committer time must be the fixed epoch+1 second (NOT epoch 0)"
+        );
+
+        assert_eq!(
+            commit.parent_ids().count(),
+            0,
+            "a synthetic import commit must have no parents"
+        );
+
+        let author_a = author.name.to_string();
+        let email_a = author.email.to_string();
+
+        let repo_b = open_imported_mirror(dir_b.path(), IMPORT_URL);
+        let oid_b = gix::ObjectId::from_hex(id_b.as_bytes()).expect("id_b valid oid");
+        let commit_b = repo_b.find_commit(oid_b).expect("commit b exists");
+        let author_b = commit_b.author().expect("author b");
+
+        assert_eq!(
+            author_a,
+            author_b.name.to_string(),
+            "author name must be a fixed constant, stable across imports"
+        );
+        assert_eq!(
+            email_a,
+            author_b.email.to_string(),
+            "author email must be a fixed constant, stable across imports"
+        );
+        assert_eq!(
+            id_a, id_b,
+            "fixed identity+time+message imply identical commit ids for identical trees"
+        );
+    }
+
+    #[test]
+    fn ref_phora_points_at_commit() {
+        let dir = TempDir::new().expect("git_dir");
+        let commit_id = import_tree(
+            dir.path(),
+            IMPORT_URL,
+            &[entry("a.txt", EntryKind::Blob, b"alpha")],
+        )
+        .expect("import");
+
+        let repo = open_imported_mirror(dir.path(), IMPORT_URL);
+        let resolved = repo
+            .find_reference("refs/heads/phora")
+            .expect("refs/heads/phora exists after import")
+            .peel_to_commit()
+            .expect("phora ref peels to a commit")
+            .id()
+            .to_hex()
+            .to_string();
+
+        assert_eq!(
+            resolved, commit_id,
+            "refs/heads/phora must resolve to the returned commit id"
+        );
+    }
+
+    #[test]
+    fn nested_tree_roundtrips_paths_kinds_data() {
+        let dir = TempDir::new().expect("git_dir");
+        let commit_id = import_tree(
+            dir.path(),
+            IMPORT_URL,
+            &[
+                entry("a.txt", EntryKind::Blob, b"A"),
+                entry("dir/b.sh", EntryKind::BlobExecutable, b"B"),
+                entry("dir/link", EntryKind::Link, b"target/x"),
+            ],
+        )
+        .expect("import nested tree");
+
+        let repo = open_imported_mirror(dir.path(), IMPORT_URL);
+        let oid = gix::ObjectId::from_hex(commit_id.as_bytes()).expect("valid oid");
+        let tree = repo
+            .find_commit(oid)
+            .expect("commit exists")
+            .tree()
+            .expect("commit has a tree");
+
+        let lookup = |path: &str| {
+            tree.lookup_entry_by_path(Path::new(path))
+                .expect("lookup does not error")
+                .unwrap_or_else(|| panic!("entry {path} must exist in the imported tree"))
+        };
+
+        let blob_data = |entry: &gix::object::tree::Entry<'_>| {
+            repo.find_blob(entry.object_id())
+                .expect("entry blob exists")
+                .data
+                .clone()
+        };
+
+        let a = lookup("a.txt");
+        assert_eq!(a.mode().kind(), EntryKind::Blob, "a.txt is a plain blob");
+        assert_eq!(blob_data(&a), b"A", "a.txt content roundtrips");
+
+        let b = lookup("dir/b.sh");
+        assert_eq!(
+            b.mode().kind(),
+            EntryKind::BlobExecutable,
+            "dir/b.sh must be an executable blob (mode 100755)"
+        );
+        assert_eq!(blob_data(&b), b"B", "dir/b.sh content roundtrips");
+
+        let link = lookup("dir/link");
+        assert_eq!(
+            link.mode().kind(),
+            EntryKind::Link,
+            "dir/link must be a symlink (mode 120000)"
+        );
+        assert_eq!(
+            blob_data(&link),
+            b"target/x",
+            "symlink blob content must be the target bytes"
+        );
+
+        let dir_entry = lookup("dir");
+        assert_eq!(
+            dir_entry.mode().kind(),
+            EntryKind::Tree,
+            "the nested dir must be a real subtree"
+        );
+    }
+
+    #[test]
+    fn git_fsck_accepts_synthetic_commit() {
+        let dir = TempDir::new().expect("git_dir");
+        import_tree(
+            dir.path(),
+            IMPORT_URL,
+            &[
+                entry("a.txt", EntryKind::Blob, b"A"),
+                entry("dir/b.sh", EntryKind::BlobExecutable, b"B"),
+                entry("dir/link", EntryKind::Link, b"target/x"),
+                entry("z.txt", EntryKind::Blob, b"Z"),
+            ],
+        )
+        .expect("import");
+
+        let key = MirrorKey::from_url(&NormalizedUrl::parse(IMPORT_URL));
+        let mirror = dir.path().join(format!("{}.git", key.as_str()));
+
+        let out = Command::new("git")
+            .args([
+                "--git-dir",
+                mirror.to_str().expect("mirror path is utf8"),
+                "fsck",
+                "--strict",
+            ])
+            .output()
+            .expect("git fsck runs");
+
+        assert!(
+            out.status.success(),
+            "git fsck --strict must accept the synthetic objects; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let reported_problem = stderr.lines().any(|line| {
+            let lower = line.trim().to_lowercase();
+            lower.starts_with("error:") || lower.starts_with("fatal:")
+        });
+        assert!(
+            !reported_problem,
+            "git fsck must emit no error:/fatal: lines (catches unsorted/malformed trees): {stderr}"
+        );
+    }
+
+    #[test]
+    fn empty_entries_produce_stable_empty_tree_commit() {
+        let dir_a = TempDir::new().expect("git_dir a");
+        let dir_b = TempDir::new().expect("git_dir b");
+
+        let first = import_tree(dir_a.path(), IMPORT_URL, &[])
+            .expect("importing zero entries yields a commit over an empty tree");
+        let second =
+            import_tree(dir_b.path(), IMPORT_URL, &[]).expect("re-importing zero entries succeeds");
+
+        assert_eq!(
+            first, second,
+            "an empty entry list must yield a stable empty-tree commit id"
+        );
+    }
+
+    #[test]
+    fn reimport_changed_content_advances_ref() {
+        let dir = TempDir::new().expect("git_dir");
+
+        let first = import_tree(
+            dir.path(),
+            IMPORT_URL,
+            &[entry("a.txt", EntryKind::Blob, b"alpha")],
+        )
+        .expect("first import into a fresh mirror");
+
+        let second = import_tree(
+            dir.path(),
+            IMPORT_URL,
+            &[entry("a.txt", EntryKind::Blob, b"BRAVO")],
+        )
+        .expect("re-import of changed content into the SAME mirror must succeed");
+
+        assert_ne!(
+            first, second,
+            "changed content must yield a different commit id on re-import"
+        );
+
+        let repo = open_imported_mirror(dir.path(), IMPORT_URL);
+        let resolved = repo
+            .find_reference("refs/heads/phora")
+            .expect("phora ref exists after re-import")
+            .peel_to_commit()
+            .expect("phora ref peels to a commit")
+            .id()
+            .to_hex()
+            .to_string();
+
+        assert_eq!(
+            resolved, second,
+            "refs/heads/phora must advance to the second (changed) commit"
+        );
+    }
+
+    #[test]
+    fn reimport_identical_content_is_stable() {
+        let dir = TempDir::new().expect("git_dir");
+        let make = || vec![entry("a.txt", EntryKind::Blob, b"alpha")];
+
+        let first = import_tree(dir.path(), IMPORT_URL, &make()).expect("first import");
+        let second = import_tree(dir.path(), IMPORT_URL, &make())
+            .expect("re-import of identical content into the SAME mirror is idempotent");
+
+        assert_eq!(
+            first, second,
+            "identical content re-imported into the same mirror must be stable"
+        );
+
+        let repo = open_imported_mirror(dir.path(), IMPORT_URL);
+        let resolved = repo
+            .find_reference("refs/heads/phora")
+            .expect("phora ref exists")
+            .peel_to_commit()
+            .expect("phora ref peels to a commit")
+            .id()
+            .to_hex()
+            .to_string();
+
+        assert_eq!(resolved, first, "ref still resolves to the stable commit");
+    }
+
+    #[test]
+    fn import_rejects_duplicate_entry_paths() {
+        let dir = TempDir::new().expect("git_dir");
+
+        let result = import_tree(
+            dir.path(),
+            IMPORT_URL,
+            &[
+                entry("a.txt", EntryKind::Blob, b"first"),
+                entry("a.txt", EntryKind::Blob, b"second"),
+            ],
+        );
+
+        assert!(
+            matches!(result, Err(Error::Source(_))),
+            "two entries with the same path must error, not silently overwrite"
+        );
+    }
+
+    #[test]
+    fn import_rejects_file_dir_collision_either_order() {
+        let dir_after_file = import_tree(
+            TempDir::new().expect("git_dir").path(),
+            IMPORT_URL,
+            &[
+                entry("dir", EntryKind::Blob, b"file"),
+                entry("dir/x", EntryKind::Blob, b"child"),
+            ],
+        );
+        assert!(
+            matches!(dir_after_file, Err(Error::Source(_))),
+            "a file then a directory at the same name must error"
+        );
+
+        let file_after_dir = import_tree(
+            TempDir::new().expect("git_dir").path(),
+            IMPORT_URL,
+            &[
+                entry("dir/x", EntryKind::Blob, b"child"),
+                entry("dir", EntryKind::Blob, b"file"),
+            ],
+        );
+        assert!(
+            matches!(file_after_dir, Err(Error::Source(_))),
+            "a directory then a file at the same name must error"
         );
     }
 

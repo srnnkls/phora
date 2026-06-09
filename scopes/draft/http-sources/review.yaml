@@ -1,6 +1,54 @@
 scope: http-sources
 
 batch_reviews:
+  - batch: 4
+    tasks: [HTP-004]
+    phase_a5_test_review:
+      reviewers: [opus, sonnet]
+      outcome: changes_requested_then_clean
+      fixed:
+        - "CRITICAL: input_order_independent_commit_id neutralized by a double-reverse (reversed.reverse() restored forward order) — the keystone sort oracle tested nothing. Removed the reverse so orders genuinely differ."
+        - "MEDIUM: git_fsck stderr 'error'/'fatal' substring check hardened to line-anchored 'error:'/'fatal:'"
+    phase_c_code_review:
+      reviewers:
+        - { id: general-opus, verdict: changes_requested, gates: { correctness: fail, security: pass, performance: pass } }
+        - { id: general-sonnet, verdict: changes_requested, gates: { correctness: fail, security: pass, performance: pass } }
+        - { id: architecture-opus, verdict: approved, gates: { architecture: pass } }
+        - { id: compliance-sonnet, verdict: approved, gates: { style: pass } }
+      synthesized:
+        gates: { correctness: pass, security: pass, performance: pass, architecture: pass, style: pass }
+        outcome: approved_after_fixes
+      note: "general-opus ran `git checkout src/source.rs` (discarding the uncommitted batch) then reconstructed it by hand; verified faithful (+454, 466 tests pass, clippy+fmt clean) before fixes."
+    issues_fixed:
+      critical:
+        - id: B4-reimport-changed
+          found_by: [general-opus, general-sonnet]
+          detail: "commit_as with empty parents sets refs/heads/phora precondition to MustNotExist; re-importing CHANGED content into an existing mirror errored -> blocked HTP-006 update-advances"
+          resolution: "build Commit object directly + repo.reference(PreviousValue::Any) force-update. Tests reimport_changed_content_advances_ref, reimport_identical_content_is_stable"
+      medium:
+        - id: B4-duplicate-path
+          found_by: [general-sonnet]
+          detail: "duplicate entry paths silently overwrote (BTreeMap::insert)"
+          resolution: "error on duplicate. Test import_rejects_duplicate_entry_paths"
+        - id: B4-file-dir-collision
+          found_by: [general-sonnet]
+          detail: "file/dir collision in reverse order (dir/x then dir) silently clobbered subtree"
+          resolution: "detect both orders via btree Entry match -> error. Test import_rejects_file_dir_collision_either_order"
+        - id: B4-mirror-path-dup
+          found_by: [architecture-opus]
+          detail: "mirror path assembly duplicated across GitBackend::mirror_path + import_tree (+HTP-005)"
+          resolution: "extracted shared free fn mirror_path(git_dir,url); both delegate"
+      low:
+        - id: B4-comment
+          found_by: [general-sonnet, compliance-sonnet]
+          detail: "IMPORT_TIME_SECONDS comment conflated epoch+1 (exported mtime clamp) with commit-id stability; const-group doc mis-attached"
+          resolution: "corrected comment; const-group doc -> // block"
+    deferred_issues:
+      - id: B4-write-import-tree-url-param
+        severity: low
+        found_by: [general-opus, architecture-opus]
+        detail: "write_import_tree threads url only for error messages"
+        resolution: "minor; left as-is (improves error context)"
   - batch: 3
     tasks: [HTP-003]
     phase_a5_test_review:
