@@ -24,7 +24,7 @@ tasks:
 
   - id: HTP-002
     content: "Deps + download + optional digest verification"
-    status: pending
+    status: done
     activeForm: "Implementing download + verify"
     review_fixes:
       - "MEDIUM (TLS dedup): align the http client's TLS with gix's stack — gix uses blocking-network-client; pick ureq/reqwest with rustls features that dedupe (cargo tree -e features | grep tls)"

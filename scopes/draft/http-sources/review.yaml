@@ -1,6 +1,56 @@
 scope: http-sources
 
 batch_reviews:
+  - batch: 2
+    tasks: [HTP-002]
+    phase_a5_test_review:
+      reviewers: [opus, sonnet]
+      outcome: changes_requested_then_clean
+      fixed:
+        - "dead_port() TOCTOU race -> deterministic 127.0.0.1:1 connection-refused"
+        - "blake3 fixture self-check split into its own test (triage clarity)"
+        - "added blake3 mismatch test (opus coverage gap)"
+    phase_c_code_review:
+      reviewers:
+        - { id: general-opus, verdict: approved, gates: { correctness: pass, security: pass, performance: pass } }
+        - { id: general-sonnet, verdict: changes_requested, gates: { correctness: pass, security: pass, performance: fail } }
+        - { id: architecture-opus, verdict: approved, gates: { architecture: pass } }
+        - { id: compliance-sonnet, verdict: approved, gates: { style: pass } }
+      synthesized:
+        gates: { correctness: pass, security: pass, performance: pass, architecture: pass, style: pass }
+        outcome: approved_after_fixes
+    issues_fixed:
+      medium:
+        - id: B2-body-timeout
+          found_by: [general-opus, general-sonnet]
+          detail: "timeout_recv_response covers only headers; streamed body io::copy had no timeout -> stalling server wedges caller"
+          resolution: "added timeout_recv_body (BODY_TIMEOUT); kept connect timeout"
+      low:
+        - id: B2-error-surface
+          found_by: [general-opus, general-sonnet]
+          detail: "File::create / io::copy errors surfaced as Error::Io; partial dest left on error"
+          resolution: "map_err to Error::Source naming url+dest; remove partial dest on error. Regression test download_to_unwritable_dest_errors_as_source"
+        - id: B2-comment-narration
+          found_by: [compliance-sonnet]
+          detail: "3-line CannedServer narration comment"
+          resolution: "collapsed to one line"
+    deferred_issues:
+      - id: HTP-005-verify-streaming
+        severity: medium
+        found_by: [architecture-opus]
+        detail: "verify_digest(&[u8]) vs disk-streamed download -> HTP-005 would re-read whole archive to hash"
+        carry_to: HTP-005
+        recommendation: "add verify_file(path,&DownloadDigest) streaming the file through the hasher, OR hash-while-download; keep verify_digest(&[u8]) for in-memory callers"
+      - id: B2-ssrf-redirect
+        severity: low
+        found_by: [general-opus, architecture-opus]
+        detail: "download follows up to 10 redirects with no host allow/deny -> SSRF if url/redirect points internal"
+        resolution: "accepted v1 trust assumption (operator-controlled public url; auth out of scope). TLS verification confirmed ON; auth headers stripped on redirect (ureq default Never)."
+      - id: B2-deps-unused
+        severity: low
+        found_by: [architecture-opus]
+        detail: "flate2/tar/zip declared but unused until HTP-003"
+        resolution: "task-mandated dep batching in HTP-002; first import in HTP-003 clears it"
   - batch: 1
     tasks: [HTP-001]
     phase_a5_test_review:

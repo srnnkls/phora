@@ -2,16 +2,22 @@ checkpoint:
   scope_name: http-sources
   scope_path: ./scopes/draft/http-sources
   branch: feat/http-sources
-  last_batch: 1
+  last_batch: 2
   tasks:
-    done: [HTP-001]
-    pending: [HTP-002, HTP-003, HTP-004, HTP-005, HTP-006, HTP-007]
+    done: [HTP-001, HTP-002]
+    pending: [HTP-003, HTP-004, HTP-005, HTP-006, HTP-007]
   next_batch:
-    number: 2
-    tasks: [HTP-002]
+    number: 3
+    tasks: [HTP-003]
   carry_forward:
-    - "HTP-005: add Source::mode()->{Git,Host,Url}; resolved_remote must error/branch for url-mode (else url source resolves to https://github.com/.git). Refspec::None for url sources."
-    - "HTP-002: consumes config::DownloadDigest (pub; variants Sha256([u8;32])/Blake3([u8;32]); parse splits first ':'; bytes()->&[u8]). Verify raw download BEFORE extraction. Consider adding DownloadDigest::algo()."
-    - "DownloadDigest derives Debug/Clone/Copy/PartialEq/Eq; registry::Digest stays blake3-only (do not widen)."
+    - "HTP-003: extraction lives in src/http.rs (or a sibling); flate2/tar/zip already declared (zip = deflate-only). safe_component (source.rs:577) guards a SINGLE component — add safe_archive_path() splitting on '/' per segment; reject ../, absolute, drive-root, backslash, null, non-utf8. Map tar/zip exec bits + symlinks to gix EntryKind for HTP-004. Auto-strip single top dir. raw file => one-entry tree from URL basename."
+    - "HTP-005: add Source::mode()->{Git,Host,Url}; resolved_remote must error/branch for url (else url source resolves to https://github.com/.git). Refspec::None for url. Add verify_file(path,&DownloadDigest) streaming (avoid re-reading whole archive); verify BEFORE extract. verify_digest msg has no source name (caller prepends)."
+    - "HTP-004: gix synthetic-commit import; commit_as fixed identity + epoch+1 + constant message + no parents; Tree.entries MUST be git-sorted before write (debug_assert)."
+  http_module:
+    download: "pub fn download(url:&str, dest:&Path)->Result<()>; ureq 3.x rustls; connect+body timeouts; redirects on; all failures Error::Source; partial dest removed on error"
+    verify_digest: "pub fn verify_digest(bytes:&[u8], &DownloadDigest)->Result<()>; sha2/blake3; mismatch Error::Source(expected+actual hex)"
+  deps_added: [ureq=3.3 (rustls), sha2=0.10, flate2=1.1, tar=0.4, "zip=2.4 (deflate-only)"]
   review_config:
     reviewers: [opus, sonnet]
+  notes:
+    - "Repo has PRE-EXISTING rustfmt drift in src/cli.rs, src/lock.rs, src/sync.rs (committed unformatted at baseline). Do NOT let cargo fmt sweep them into feature batches — revert with git checkout. A repo-wide fmt should be a separate commit/scope."
