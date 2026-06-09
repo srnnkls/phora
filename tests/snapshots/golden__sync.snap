@@ -1,0 +1,8 @@
+---
+source: tests/golden.rs
+expression: snapshot(&sync)
+---
+exit: 0
+--- stdout ---
+sync complete
+--- stderr ---

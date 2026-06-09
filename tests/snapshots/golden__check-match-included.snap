@@ -1,0 +1,11 @@
+---
+source: tests/golden.rs
+expression: "snapshot(&run(&fixture,\n&[\"check-match\", \"--source\", \"dotfiles\", \"editor/init.lua\"],))"
+---
+exit: 0
+--- stdout ---
+artifact `editor`: allowed
+path `editor/init.lua`: allowed
+include: ["editor", "lint"]
+exclude: []
+--- stderr ---

@@ -1,0 +1,11 @@
+---
+source: tests/golden.rs
+expression: "snapshot(&run(&fixture, &[\"where\"]))"
+---
+exit: 0
+--- stdout ---
+Artifact: dotfiles/editor (commit <COMMIT8>, digest blake3:2316b2c05d3f72e93270833746381341b70a008daf5af59a2ddb2a8c83206bc0)
+  - home
+Artifact: dotfiles/lint (commit <COMMIT8>, digest blake3:d26cc52a7261d7a76fa1f6dadda5cba932687bd6cf626e7ea746e46dc8937cfb)
+  - home
+--- stderr ---

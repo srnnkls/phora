@@ -1,0 +1,11 @@
+---
+source: tests/golden.rs
+expression: "snapshot(&run(&fixture, &[\"check-match\", \"--source\", \"dotfiles\", \"vim\"],))"
+---
+exit: 0
+--- stdout ---
+artifact `vim`: excluded
+path `vim`: allowed
+include: ["editor", "lint"]
+exclude: []
+--- stderr ---
