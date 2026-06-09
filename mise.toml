@@ -1,0 +1,18 @@
+[tools]
+rust = "latest"
+
+[tasks.build]
+run = "cargo build"
+
+[tasks.test]
+run = "cargo test"
+
+[tasks.lint]
+description = "clippy (pedantic, warnings as errors) + rustfmt check"
+run = ["cargo clippy --all-targets -- -D warnings", "cargo fmt --check"]
+
+[tasks.fmt]
+run = "cargo fmt"
+
+[tasks.check]
+depends = ["lint", "test"]

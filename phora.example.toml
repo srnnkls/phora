@@ -1,0 +1,27 @@
+version = 1
+
+# Hosts (optional): a git URL template + auth, referenced by sources.
+[hosts.github]
+git_url = "https://github.com/{owner}/{repo}.git"
+auth = { type = "token", env = "GITHUB_TOKEN" }
+
+# Sources: git repositories to mirror, and which artifacts to export.
+[sources.dotfiles]
+git = "https://github.com/me/dotfiles.git"
+branch = "main"
+include = ["nvim", "tmux", "git"]
+
+[sources.skills]
+git = "https://github.com/me/claude-skills.git"
+root = "skills"
+
+# Targets: where exported artifacts are deployed.
+[targets.home]
+path = "~/.config"
+sources = ["dotfiles"]
+layout = "flat"
+
+[targets.claude]
+path = "~/.claude/skills"
+sources = ["skills"]
+layout = "by-source"
