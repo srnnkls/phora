@@ -6,7 +6,7 @@ revised: 2026-06-08   # post multi-agent review (opus+sonnet)
 tasks:
   - id: HTP-001
     content: "Config: url + digest fields, three-way mode exclusivity, source-url accessor, refspec/root rejection"
-    status: pending
+    status: done
     activeForm: "Adding url source config"
     review_fixes:
       - "CRITICAL (silent dual-mode): Config::parse must reject >1 of {git, host+path, url}; today only branch/tag/rev>1 is checked (config.rs:33)"

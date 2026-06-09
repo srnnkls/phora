@@ -1,0 +1,17 @@
+checkpoint:
+  scope_name: http-sources
+  scope_path: ./scopes/draft/http-sources
+  branch: feat/http-sources
+  last_batch: 1
+  tasks:
+    done: [HTP-001]
+    pending: [HTP-002, HTP-003, HTP-004, HTP-005, HTP-006, HTP-007]
+  next_batch:
+    number: 2
+    tasks: [HTP-002]
+  carry_forward:
+    - "HTP-005: add Source::mode()->{Git,Host,Url}; resolved_remote must error/branch for url-mode (else url source resolves to https://github.com/.git). Refspec::None for url sources."
+    - "HTP-002: consumes config::DownloadDigest (pub; variants Sha256([u8;32])/Blake3([u8;32]); parse splits first ':'; bytes()->&[u8]). Verify raw download BEFORE extraction. Consider adding DownloadDigest::algo()."
+    - "DownloadDigest derives Debug/Clone/Copy/PartialEq/Eq; registry::Digest stays blake3-only (do not widen)."
+  review_config:
+    reviewers: [opus, sonnet]

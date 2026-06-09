@@ -1,0 +1,59 @@
+scope: http-sources
+
+batch_reviews:
+  - batch: 1
+    tasks: [HTP-001]
+    phase_a5_test_review:
+      reviewers: [opus, sonnet]
+      outcome: changes_requested_then_clean
+      fixed:
+        - "blake3 digest test fixture was 65 chars (odd, undecodable) + mismatched byte array — corrected to deadbeef*8 / matching [u8;32]"
+        - "url+tag / url+rev rejection tests tightened to assert error names the source (consistency with branch/root)"
+    phase_c_code_review:
+      reviewers:
+        - id: general-opus
+          verdict: approved
+          gates: { correctness: pass, security: pass, performance: pass }
+        - id: general-sonnet
+          verdict: changes_requested
+          gates: { correctness: fail, security: pass, performance: pass }
+        - id: architecture-opus
+          verdict: approved
+          gates: { architecture: pass }
+        - id: compliance-sonnet
+          verdict: changes_requested
+          gates: { style: fail }
+      synthesized:
+        gates: { correctness: pass, security: pass, performance: pass, architecture: pass, style: pass }
+        outcome: approved_after_fixes
+issues:
+  high:
+    - id: B1-merge-stale-refspec
+      found_by: [general-sonnet, architecture-opus]
+      detail: "merged_with left stale branch/tag/rev/root (and digest) when a local layer switched a source into url mode; validate() did not re-check url+refspec post-merge"
+      resolution: "url arm of merged_with clears branch/tag/rev/root; git/host arms clear digest; validate() rejects url-mode source carrying branch/tag/rev/root. Regression tests added."
+  medium:
+    - id: B1-empty-url
+      found_by: [general-sonnet]
+      detail: "url = \"\" accepted by parse and validate"
+      resolution: "empty/whitespace url rejected in both parse and validate, naming the source. Test added."
+  low:
+    - id: B1-clippy-format
+      found_by: [compliance-sonnet]
+      detail: "useless format! in download_digest_rejects_unknown_algo_prefix test"
+      resolution: "replaced &format!(\"{hex}\") with hex"
+deferred_issues:
+  - id: HTP-005-resolved-remote-url-arm
+    severity: high-latent
+    found_by: [architecture-opus]
+    detail: "resolved_remote() has no url arm — a config-valid url source would resolve to https://github.com/.git and get git-fetched. No url consumer exists yet (gate passed)."
+    carry_to: HTP-005
+    recommendation: "Introduce Source::mode() -> {Git,Host,Url}; resolved_remote errors (or callers branch) for url-mode; collapses scattered is_some() checks into one exhaustive switch."
+  - id: HTP-002-downloaddigest-algo-accessor
+    severity: low
+    found_by: [architecture-opus]
+    detail: "DownloadDigest::bytes() erases width/algo; consider an algo() accessor so HTP-002 verifier branches on algorithm without matching the enum twice."
+    carry_to: HTP-002
+style_decisions:
+  - "Kept Source::source_url() name (scope-mandated; HTP-005 + frozen tests depend on it) despite compliance suggestion to rename to url()."
+  - "Kept DownloadDigest # Errors rustdoc — consistent with existing codebase doc sections."
