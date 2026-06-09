@@ -717,16 +717,10 @@ fn discover_artifacts_for_source(
     matcher: &PathMatcher,
 ) -> Result<Vec<String>> {
     match source.deploy_mode() {
-        DeployMode::Link => {
-            discover_working_tree(Path::new(git), source.root.as_deref(), matcher)
+        DeployMode::Link => discover_working_tree(Path::new(git), source.root.as_deref(), matcher),
+        DeployMode::Copy => {
+            backend.discover_artifacts(source_name, git, commit, source.root.as_deref(), matcher)
         }
-        DeployMode::Copy => backend.discover_artifacts(
-            source_name,
-            git,
-            commit,
-            source.root.as_deref(),
-            matcher,
-        ),
     }
 }
 
@@ -5413,19 +5407,13 @@ mod tests {
             .expect("append editor/init.lua tar entry");
         let tar_bytes = builder.into_inner().expect("finish tar");
 
-        let mut encoder =
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(&tar_bytes).expect("gzip tar bytes");
         encoder.finish().expect("finish gzip")
     }
 
     /// One-source/one-target config whose single source is a url source.
-    fn url_config_one_target(
-        source: &str,
-        url: &str,
-        target_path: &Path,
-        layout: &str,
-    ) -> Config {
+    fn url_config_one_target(source: &str, url: &str, target_path: &Path, layout: &str) -> Config {
         let toml = format!(
             "version = 1\n\n\
              [sources.{source}]\nurl = \"{url}\"\n\n\
@@ -5506,8 +5494,7 @@ mod tests {
         let server = UrlTarServer::spawn(vec![editor_tar_gz(b"-- v1\n")]);
         let git_dir = TempDir::new().expect("git dir");
         let state_dir = TempDir::new().expect("state dir");
-        let registry =
-            FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+        let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
         let backend = CountingRouter::new(git_dir.path().to_path_buf(), url_modes("pkg"));
         let td = TargetDir::new();
         let cfg = url_config_one_target("pkg", &server.url, &td.target_path(), "flat");
@@ -5563,11 +5550,11 @@ mod tests {
 
     #[test]
     fn update_with_changed_url_content_advances_lock() {
-        let server = UrlTarServer::spawn(vec![editor_tar_gz(b"-- v1\n"), editor_tar_gz(b"-- v2\n")]);
+        let server =
+            UrlTarServer::spawn(vec![editor_tar_gz(b"-- v1\n"), editor_tar_gz(b"-- v2\n")]);
         let git_dir = TempDir::new().expect("git dir");
         let state_dir = TempDir::new().expect("state dir");
-        let registry =
-            FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+        let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
         let backend = CountingRouter::new(git_dir.path().to_path_buf(), url_modes("pkg"));
         let td = TargetDir::new();
         let cfg = url_config_one_target("pkg", &server.url, &td.target_path(), "flat");
@@ -5615,11 +5602,13 @@ mod tests {
 
     #[test]
     fn reimport_identical_bytes_does_not_churn() {
-        let server = UrlTarServer::spawn(vec![editor_tar_gz(b"-- same\n"), editor_tar_gz(b"-- same\n")]);
+        let server = UrlTarServer::spawn(vec![
+            editor_tar_gz(b"-- same\n"),
+            editor_tar_gz(b"-- same\n"),
+        ]);
         let git_dir = TempDir::new().expect("git dir");
         let state_dir = TempDir::new().expect("state dir");
-        let registry =
-            FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+        let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
         let backend = CountingRouter::new(git_dir.path().to_path_buf(), url_modes("pkg"));
         let td = TargetDir::new();
         let cfg = url_config_one_target("pkg", &server.url, &td.target_path(), "flat");
