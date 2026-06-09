@@ -1,0 +1,36 @@
+scope: cli-verbosity
+issue_type: Task
+created: 2026-06-09
+
+# Task scope — minimal validation. The user-facing surface (two flags, level
+# semantics, sink) and mechanism (tracing) were decided up front; see scope.md.
+decisions:
+  - id: mechanism
+    question: "Logging mechanism?"
+    resolution: "tracing + tracing-subscriber (EnvFilter)"
+    confirmed_by: user
+  - id: surfaces
+    question: "What does --debug surface?"
+    resolution: "config resolution, source resolution, projection/deploy, lock/registry"
+    confirmed_by: user
+  - id: size
+    question: "Issue type?"
+    resolution: "Task (lightweight)"
+    confirmed_by: user
+
+open_risks:
+  - id: default-output-parity
+    description: "Adding a subscriber must not change the default (no-flag) stdout/stderr output."
+    resolution: "Init only emits at >=WARN by default; assert a no-flag run produces no tracing output."
+  - id: stdout-purity
+    description: "Logs must go to stderr so stdout stays pipeable."
+    resolution: "tracing-subscriber writer = stderr."
+
+review_config:
+  reviewers: [opus, sonnet]
+  note: "Highest-value targets: default-output parity (no regression), level-mapping correctness, RUST_LOG override precedence."
+
+verification_gate:
+  - "cargo test green; no-flag run emits no tracing output, stdout unchanged"
+  - "--debug surfaces config + source + deploy + lock events; -v shows the info subset; both => DEBUG"
+  - "RUST_LOG overrides the flag-derived filter; clippy clean"

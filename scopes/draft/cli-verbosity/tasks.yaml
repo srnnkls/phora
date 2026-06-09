@@ -1,0 +1,52 @@
+scope: cli-verbosity
+issue_type: Task
+created: 2026-06-09
+
+tasks:
+  - id: CLV-001
+    content: "tracing deps + global --verbose/--debug flags + subscriber init"
+    status: pending
+    activeForm: "Wiring tracing + verbosity flags"
+    acceptance:
+      - "Cargo.toml gains tracing + tracing-subscriber (env-filter)"
+      - "Cli (src/cli.rs:21) gains `#[arg(global=true)] verbose: bool` (short -v) and `debug: bool`"
+      - "subscriber initialized once before dispatch: default WARN, -v => INFO, --debug => DEBUG (debug wins if both); events to stderr; RUST_LOG overrides via EnvFilter"
+      - "no-flag run emits zero tracing output; stdout unchanged"
+    tests:
+      - "level mapping: none=>WARN, -v=>INFO, --debug=>DEBUG, both=>DEBUG (unit on the mapping fn)"
+      - "RUST_LOG override beats the flag-derived filter"
+      - "a no-flag command produces no stderr tracing lines"
+
+  - id: CLV-002
+    content: "Instrument config + source resolution"
+    status: pending
+    activeForm: "Instrumenting config + source resolution"
+    depends_on: [CLV-001]
+    acceptance:
+      - "debug events: which phora.toml/phora.local.toml read + merged result"
+      - "debug events per source: resolved remote/URL, mirror path (MirrorKey), chosen commit"
+      - "info (-v) events: per-source resolved commit summary"
+    tests:
+      - "--debug run over a fixture emits config-merge + per-source resolution events (capture via a test tracing layer)"
+
+  - id: CLV-003
+    content: "Instrument projection/deploy + lock/registry decisions"
+    status: pending
+    activeForm: "Instrumenting deploy + lock/registry"
+    depends_on: [CLV-001]
+    acceptance:
+      - "debug events: per-artifact layout + include/exclude decisions, files written/skipped, conflict outcomes"
+      - "debug events: source_matches outcome (reuse vs refetch + reason), registry record writes, journal/recovery actions"
+      - "info (-v) events: per-artifact deploy summary (counts)"
+    tests:
+      - "--debug run emits a lock reuse-vs-refetch event with the deciding reason"
+      - "--debug run emits projection events for a deployed artifact"
+
+  - id: CLV-004
+    content: "Docs: --verbose/--debug in README + GUIDE"
+    status: pending
+    activeForm: "Documenting the verbosity flags"
+    depends_on: [CLV-001]
+    acceptance:
+      - "README documents -v/--verbose and --debug (level semantics, stderr, RUST_LOG)"
+      - "GUIDE 'When something looks wrong' gains a '--debug: watch a run explain itself' note"
