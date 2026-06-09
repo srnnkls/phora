@@ -189,3 +189,38 @@ deferred_issues:
     issue: "config.rs <-> source.rs mutual import (Protocol/Refspec)"
     note: "Pre-existing (Refspec already crossed); shared-types refactor out of scope"
     owner: none
+
+final_review:
+  status: completed
+  reviewers: [final-scope-correctness-claude-opus, final-scope-correctness-claude-sonnet, final-architecture-claude-sonnet]
+  gates: { correctness: pass, scope: pass, architecture: pass, security: pass, style: pass, docs: pass }
+  scope_compliance:
+    all_tasks_complete: true
+    all_requirements_met: true
+    acceptance_criteria_met: true
+    given_when_then_covered: true
+  strengths:
+    - "builtin_forges() is the single forge registry; cli domain_to_name + config effective_host both derive from it (no duplicate list)"
+    - "source_matches compares NormalizedUrl identity (+refspec +config_digest): literal<->symbolic and https<->ssh do not refetch; existing locks still match (no version bump)"
+    - "resolved_remote computed once per source and threaded; lazy resolution => [hosts.X].remote change applies next sync with no per-source edit"
+    - "mode model (git XOR host+path) coherent across parse/validate/merged_with/ParsedSource; default host=github + default protocol=https honored"
+    - "end-to-end git-fixture tests: host+path twin==literal, per-source protocol > global, global protocol applies to silent source"
+    - "no TODO/FIXME markers remain; deferred items tracked with owners"
+  post_final_fixes:
+    - "generalized validate() to the effective protocol (https-without-template now errors at the boundary, not just ssh)"
+    - "added shipped phora.example.toml parse+validate regression test"
+    - "fixed stale git_url doc reference"
+  deferred_issues:
+    - "LockedSource symbolic-origin fields not persisted (acceptance marked 'optional'; no behavioral impact)"
+    - "source_matches re-resolves remote vs the resolve_sources map (negligible vs git I/O)"
+    - "builtin_forges() rebuilt per call (micro-opt; LazyLock candidate)"
+    - "resolved_remote error labels source by path; sync wraps with the real name"
+    - "ParsedSource runtime git-XOR-host+path invariant (enum candidate)"
+    - "NormalizedUrl split_once('@') edge — unreachable today"
+  recommendation: ready_to_merge
+readiness:
+  all_batches_reviewed: true
+  critical_issues_resolved: true
+  high_issues_resolved: true
+  final_review_passed: true
+  tests_passing: true   # 408 lib + 5 integration, clippy clean
