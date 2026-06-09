@@ -94,6 +94,29 @@ impl Config {
                      (the git and host modes are mutually exclusive)"
                 )));
             }
+            if source.url.is_some()
+                && (source.git.is_some() || source.host.is_some() || source.path.is_some())
+            {
+                return Err(Error::Config(format!(
+                    "source `{name}` sets `url` together with a `git`/`host`/`path` \
+                     (the url, git, and host modes are mutually exclusive)"
+                )));
+            }
+            if source.url.is_some()
+                && (source.branch.is_some()
+                    || source.tag.is_some()
+                    || source.rev.is_some()
+                    || source.root.is_some())
+            {
+                return Err(Error::Config(format!(
+                    "source `{name}`: `branch`/`tag`/`rev`/`root` are meaningless on a `url` source"
+                )));
+            }
+            if source.url.as_deref().is_some_and(|u| u.trim().is_empty()) {
+                return Err(Error::Config(format!(
+                    "source `{name}`: `url` must not be empty"
+                )));
+            }
             if source.host.is_some() && source.path.is_none() {
                 return Err(Error::Config(format!(
                     "source `{name}`: `host` set without a `path`"
@@ -145,13 +168,30 @@ impl Config {
     /// single complete mode (git, or host+path).
     pub fn validate(&self) -> Result<()> {
         for (name, source) in &self.sources {
-            let has_git = source.git.is_some();
-            let has_host = source.path.is_some();
-            if has_git == has_host {
+            let modes = u8::from(source.git.is_some())
+                + u8::from(source.path.is_some())
+                + u8::from(source.url.is_some());
+            if modes != 1 {
                 return Err(Error::Config(format!(
-                    "source `{name}` must resolve to exactly one of a literal `git` \
-                     or a `host`/`path` pair"
+                    "source `{name}` must resolve to exactly one of a literal `git`, \
+                     a `host`/`path` pair, or a `url`"
                 )));
+            }
+            if let Some(url) = source.url.as_deref() {
+                if url.trim().is_empty() {
+                    return Err(Error::Config(format!(
+                        "source `{name}`: `url` must not be empty"
+                    )));
+                }
+                if source.branch.is_some()
+                    || source.tag.is_some()
+                    || source.rev.is_some()
+                    || source.root.is_some()
+                {
+                    return Err(Error::Config(format!(
+                        "source `{name}`: `branch`/`tag`/`rev`/`root` are meaningless on a `url` source"
+                    )));
+                }
             }
             let Some(path) = source.path.as_deref() else {
                 continue;
@@ -218,17 +258,11 @@ pub fn builtin_forges() -> BTreeMap<String, Host> {
     BTreeMap::from([
         (
             "github".to_owned(),
-            forge(
-                "https://github.com/{path}.git",
-                "git@github.com:{path}.git",
-            ),
+            forge("https://github.com/{path}.git", "git@github.com:{path}.git"),
         ),
         (
             "gitlab".to_owned(),
-            forge(
-                "https://gitlab.com/{path}.git",
-                "git@gitlab.com:{path}.git",
-            ),
+            forge("https://gitlab.com/{path}.git", "git@gitlab.com:{path}.git"),
         ),
         (
             "codeberg".to_owned(),
@@ -443,6 +477,10 @@ pub struct Source {
     #[serde(default)]
     pub git: Option<String>,
     #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub digest: Option<String>,
+    #[serde(default)]
     pub host: Option<String>,
     #[serde(default)]
     pub path: Option<String>,
@@ -470,19 +508,95 @@ pub enum DeployMode {
     Link,
 }
 
+/// Which backend a source routes to, derived from its declared fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceMode {
+    Git,
+    Host,
+    Url,
+}
+
+/// A download-integrity digest: `<algo>:<64 hex>` where algo is `sha256` or `blake3`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadDigest {
+    Sha256([u8; 32]),
+    Blake3([u8; 32]),
+}
+
+impl DownloadDigest {
+    /// Parses an `<algo>:<hex>` digest. The body must be exactly 64 hex chars.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] for a missing `<algo>:` prefix, an unknown algo,
+    /// a body that is not exactly 32 bytes of hex, or non-hex characters.
+    pub fn parse(s: &str) -> Result<Self> {
+        let (algo, hex) = s.split_once(':').ok_or_else(|| {
+            Error::Config(format!("invalid digest `{s}`: missing `<algo>:` prefix"))
+        })?;
+        let bytes = decode_hex32(hex).ok_or_else(|| {
+            Error::Config(format!("invalid digest `{s}`: body must be 64 hex chars"))
+        })?;
+        match algo {
+            "sha256" => Ok(Self::Sha256(bytes)),
+            "blake3" => Ok(Self::Blake3(bytes)),
+            other => Err(Error::Config(format!(
+                "invalid digest `{s}`: unknown algorithm `{other}` (expected sha256 or blake3)"
+            ))),
+        }
+    }
+
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Sha256(b) | Self::Blake3(b) => b,
+        }
+    }
+}
+
+fn decode_hex32(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (slot, pair) in out.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        *slot = u8::try_from(hi * 16 + lo).ok()?;
+    }
+    Some(out)
+}
+
 impl Source {
     #[must_use]
     fn merged_with(mut self, local: Source) -> Source {
         let local_git_mode = local.git.is_some();
         let local_host_mode = local.host.is_some() || local.path.is_some();
+        let local_url_mode = local.url.is_some();
         if local_git_mode {
             self.git = local.git;
             self.host = None;
             self.path = None;
+            self.url = None;
+            self.digest = None;
         } else if local_host_mode {
             self.host = local.host;
             self.path = local.path;
             self.git = None;
+            self.url = None;
+            self.digest = None;
+        } else if local_url_mode {
+            self.url = local.url;
+            self.git = None;
+            self.host = None;
+            self.path = None;
+            self.branch = None;
+            self.tag = None;
+            self.rev = None;
+            self.root = None;
+        }
+        if local.digest.is_some() {
+            self.digest = local.digest;
         }
         if local.protocol.is_some() {
             self.protocol = local.protocol;
@@ -553,11 +667,14 @@ impl Source {
                     Protocol::Https => "https",
                     Protocol::Ssh => "ssh",
                 };
-                Error::Config(format!(
-                    "host `{host_name}` has no {proto} remote template"
-                ))
+                Error::Config(format!("host `{host_name}` has no {proto} remote template"))
             })?;
         Ok(fill_template(template, path))
+    }
+
+    #[must_use]
+    pub fn source_url(&self) -> Option<&str> {
+        self.url.as_deref()
     }
 
     #[must_use]
@@ -575,9 +692,23 @@ impl Source {
         self.exclude.as_deref().unwrap_or(&[])
     }
 
+    /// Post-validation classifier assuming exactly one mode is set (url > host > git priority); exclusivity is enforced by `Config::parse`/validate, not here.
+    #[must_use]
+    pub fn mode(&self) -> SourceMode {
+        if self.url.is_some() {
+            SourceMode::Url
+        } else if self.host.is_some() || self.path.is_some() {
+            SourceMode::Host
+        } else {
+            SourceMode::Git
+        }
+    }
+
     #[must_use]
     pub fn refspec(&self) -> Refspec {
-        if let Some(rev) = &self.rev {
+        if matches!(self.mode(), SourceMode::Url) {
+            Refspec::None
+        } else if let Some(rev) = &self.rev {
             Refspec::Rev(rev.clone())
         } else if let Some(tag) = &self.tag {
             Refspec::Tag(tag.clone())
@@ -628,12 +759,15 @@ pub enum Refspec {
     Branch(String),
     Tag(String),
     Rev(String),
+    /// A url source has no git ref; its mirror lives at refs/heads/phora.
+    None,
 }
 
 impl std::fmt::Display for Refspec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Branch(s) | Self::Tag(s) | Self::Rev(s) => write!(f, "{s}"),
+            Self::None => write!(f, ""),
         }
     }
 }
@@ -2339,7 +2473,9 @@ host = "ghost"
 path = "srnnkls/tropos"
 "#,
         )
-        .expect("a single-file source referencing an undefined host parses; validity is post-merge");
+        .expect(
+            "a single-file source referencing an undefined host parses; validity is post-merge",
+        );
         let err = cfg
             .validate()
             .expect_err("a host with no built-in or [hosts] definition must fail validation");
@@ -2483,7 +2619,9 @@ host = "sshonly"
 path = "o/r"
 "#,
         )
-        .expect("the document parses; the effective-protocol/remote mismatch is post-merge validation");
+        .expect(
+            "the document parses; the effective-protocol/remote mismatch is post-merge validation",
+        );
         let err = cfg.validate().expect_err(
             "a source whose effective protocol is the default https against an ssh-only remote \
              (no https template) must fail validation",
@@ -2531,6 +2669,38 @@ protocol = "ssh"
             .expect("the shipped phora.example.toml must parse");
         cfg.validate()
             .expect("the shipped phora.example.toml must pass post-merge validation");
+    }
+
+    // HTP-007: the shipped example must demonstrate a url source with an integrity digest
+
+    #[test]
+    fn shipped_example_toml_includes_a_url_source() {
+        let cfg = Config::parse(include_str!("../phora.example.toml"))
+            .expect("the shipped phora.example.toml must parse");
+        cfg.validate()
+            .expect("the shipped phora.example.toml must pass post-merge validation");
+
+        let url_source = cfg
+            .sources
+            .values()
+            .find(|source| source.mode() == SourceMode::Url)
+            .expect("the shipped phora.example.toml must demonstrate a url source");
+
+        let url = url_source
+            .source_url()
+            .expect("a url source must expose its url via source_url()");
+        assert!(
+            url.starts_with("https://"),
+            "the example url source must use an https url, got `{url}`"
+        );
+
+        let digest = url_source
+            .digest
+            .as_deref()
+            .expect("the example url source must carry an integrity `digest`");
+        DownloadDigest::parse(digest).unwrap_or_else(|err| {
+            panic!("the example url source `digest` must be well-formed: {digest} ({err})")
+        });
     }
 
     // HAS-002: resolved_remote + single built-in forge registry
@@ -2836,5 +3006,455 @@ path = "srnnkls/tropos"
                 "built-in forge `{name}` must ship an ssh shape"
             );
         }
+    }
+
+    // HTP-001: url mode + DownloadDigest
+
+    /// Build a `[sources.s]` document body with no implicit `git` line (unlike the
+    /// `parse_source` helper, which always injects a git remote and would make a
+    /// `url` source dual-mode).
+    fn parse_url_source(body: &str) -> Result<Source> {
+        let toml = format!("version = 1\n\n[sources.s]\n{body}");
+        Config::parse(&toml).map(|mut cfg| {
+            cfg.sources
+                .remove("s")
+                .expect("source `s` present after parse")
+        })
+    }
+
+    #[test]
+    fn url_only_source_parses_and_source_url_returns_it() {
+        let s = parse_url_source("url = \"https://example.com/foo.tar.gz\"\n")
+            .expect("a url-only source must parse");
+        assert_eq!(
+            s.source_url(),
+            Some("https://example.com/foo.tar.gz"),
+            "source_url() must return the configured url for a url-mode source"
+        );
+        assert!(
+            s.git.is_none(),
+            "a url-mode source carries no literal git remote"
+        );
+        assert!(
+            s.host.is_none() && s.path.is_none(),
+            "a url-mode source carries neither host nor path"
+        );
+    }
+
+    #[test]
+    fn non_url_source_has_no_source_url() {
+        let git_mode = parse_source("");
+        assert_eq!(
+            git_mode.source_url(),
+            None,
+            "a git-mode source must not report a source_url()"
+        );
+    }
+
+    #[test]
+    fn url_with_digest_parses_and_exposes_digest_string() {
+        let s = parse_url_source(
+            "url = \"https://example.com/foo.tar.gz\"\n\
+             digest = \"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\n",
+        )
+        .expect("a url source with a digest must parse");
+        assert_eq!(
+            s.digest.as_deref(),
+            Some("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+            "the optional `digest` string must round-trip onto the Source"
+        );
+    }
+
+    #[test]
+    fn source_with_url_and_git_is_rejected_naming_source() {
+        let toml = r#"
+version = 1
+
+[sources.pkg]
+url = "https://example.com/foo.tar.gz"
+git = "https://github.com/me/foo.git"
+"#;
+        let err = Config::parse(toml).expect_err(
+            "a source that sets both `url` and `git` is dual-mode and must be rejected",
+        );
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("pkg"),
+                "three-way mode-exclusivity error must name the offending source, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_with_url_and_host_path_is_rejected_naming_source() {
+        let toml = r#"
+version = 1
+
+[sources.pkg]
+url = "https://example.com/foo.tar.gz"
+host = "github"
+path = "me/foo"
+"#;
+        let err = Config::parse(toml).expect_err(
+            "a source that sets both `url` and host+path is dual-mode and must be rejected",
+        );
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("pkg"),
+                "three-way mode-exclusivity error must name the offending source, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn url_source_with_branch_is_rejected_naming_source() {
+        let toml = r#"
+version = 1
+
+[sources.pkg]
+url = "https://example.com/foo.tar.gz"
+branch = "main"
+"#;
+        let err = Config::parse(toml)
+            .expect_err("`branch` is meaningless on a static url resource and must be rejected");
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("pkg"),
+                "the url-vs-refspec error must name the offending source, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn url_source_with_root_is_rejected_naming_source() {
+        let toml = r#"
+version = 1
+
+[sources.pkg]
+url = "https://example.com/foo.tar.gz"
+root = "subdir"
+"#;
+        let err = Config::parse(toml)
+            .expect_err("`root` is meaningless on a pre-stripped url archive and must be rejected");
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("pkg"),
+                "the url-vs-root error must name the offending source, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn url_source_with_tag_is_rejected() {
+        let toml = r#"
+version = 1
+
+[sources.pkg]
+url = "https://example.com/foo.tar.gz"
+tag = "v1.0"
+"#;
+        let err = Config::parse(toml).expect_err(
+            "`tag` on a url source must be rejected (a static resource has no refspec)",
+        );
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("pkg"),
+                "the url-vs-refspec error must name the offending source, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn url_source_with_rev_is_rejected() {
+        let toml = r#"
+version = 1
+
+[sources.pkg]
+url = "https://example.com/foo.tar.gz"
+rev = "abc123"
+"#;
+        let err = Config::parse(toml).expect_err(
+            "`rev` on a url source must be rejected (a static resource has no refspec)",
+        );
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("pkg"),
+                "the url-vs-refspec error must name the offending source, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_local_url_override_clears_base_git_refspec_and_root() {
+        let base = Config::parse(
+            r#"
+version = 1
+
+[sources.pkg]
+git = "https://github.com/me/pkg.git"
+branch = "main"
+root = "subdir"
+"#,
+        )
+        .expect("base parses");
+        let local = parse_url_source("url = \"https://example.com/foo.tar.gz\"\n")
+            .expect("local url source parses");
+        let merged = base
+            .sources
+            .get("pkg")
+            .expect("pkg present")
+            .clone()
+            .merged_with(local);
+
+        assert_eq!(
+            merged.source_url(),
+            Some("https://example.com/foo.tar.gz"),
+            "a local url override must switch the merged source into url mode"
+        );
+        assert!(merged.git.is_none(), "switching to url mode must clear git");
+        assert!(
+            merged.branch.is_none() && merged.tag.is_none() && merged.rev.is_none(),
+            "switching to url mode must clear the stale base refspec"
+        );
+        assert!(
+            merged.root.is_none(),
+            "switching to url mode must clear the stale base root"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_url_source_with_stale_refspec() {
+        let mut cfg = Config::parse(
+            r#"
+version = 1
+
+[sources.pkg]
+url = "https://example.com/foo.tar.gz"
+"#,
+        )
+        .expect("a url-only source parses; the stale refspec is injected post-parse");
+        let pkg = cfg.sources.get_mut("pkg").expect("pkg present");
+        pkg.branch = Some("main".to_owned());
+        pkg.root = Some(PathBuf::from("subdir"));
+
+        let err = cfg.validate().expect_err(
+            "a url source carrying a stale `branch`/`root` must be rejected by validate()",
+        );
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("pkg"),
+                "validate() url-vs-refspec error must name the source, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_url_is_rejected_naming_source() {
+        let toml = r#"
+version = 1
+
+[sources.pkg]
+url = ""
+"#;
+        let err = Config::parse(toml)
+            .expect_err("an empty `url` is not a usable resource and must be rejected");
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("pkg"),
+                "empty-url error must name the offending source, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn download_digest_parses_sha256_into_sha256_variant_with_bytes() {
+        let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let expected: [u8; 32] = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+            0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67,
+            0x89, 0xab, 0xcd, 0xef,
+        ];
+        let digest =
+            DownloadDigest::parse(&format!("sha256:{hex}")).expect("a sha256 digest must parse");
+        assert!(
+            matches!(digest, DownloadDigest::Sha256(_)),
+            "a `sha256:` prefix must parse into the Sha256 variant, not Blake3"
+        );
+        assert_eq!(
+            digest.bytes(),
+            expected.as_slice(),
+            "the decoded sha256 digest bytes must match the hex, not merely be non-empty"
+        );
+    }
+
+    #[test]
+    fn download_digest_parses_blake3_into_blake3_variant_with_bytes() {
+        let hex = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        let expected: [u8; 32] = [
+            0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef, 0xde, 0xad,
+            0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef,
+            0xde, 0xad, 0xbe, 0xef,
+        ];
+        let digest =
+            DownloadDigest::parse(&format!("blake3:{hex}")).expect("a blake3 digest must parse");
+        assert!(
+            matches!(digest, DownloadDigest::Blake3(_)),
+            "a `blake3:` prefix must parse into the Blake3 variant, not Sha256"
+        );
+        assert_eq!(
+            digest.bytes(),
+            expected.as_slice(),
+            "the decoded blake3 digest bytes must match the hex"
+        );
+    }
+
+    #[test]
+    fn download_digest_rejects_unknown_algo_prefix() {
+        let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert!(
+            DownloadDigest::parse(&format!("md5:{hex}")).is_err(),
+            "an unknown algo prefix (md5) must be rejected, not coerced to a known variant"
+        );
+        assert!(
+            DownloadDigest::parse(hex).is_err(),
+            "a bare hex string with no `<algo>:` prefix must be rejected"
+        );
+    }
+
+    #[test]
+    fn download_digest_rejects_wrong_length_and_non_hex() {
+        assert!(
+            DownloadDigest::parse("sha256:abcd").is_err(),
+            "a too-short hex body must be rejected (digest must be 32 bytes / 64 hex chars)"
+        );
+        assert!(
+            DownloadDigest::parse(
+                "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdefff"
+            )
+            .is_err(),
+            "a too-long hex body must be rejected"
+        );
+        assert!(
+            DownloadDigest::parse(
+                "blake3:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+            )
+            .is_err(),
+            "non-hex characters must be rejected"
+        );
+    }
+
+    #[test]
+    fn registry_digest_still_rejects_sha256_prefix_not_widened() {
+        let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert!(
+            crate::registry::Digest::parse(&format!("sha256:{hex}")).is_err(),
+            "registry::Digest must remain blake3-only; adding DownloadDigest's sha256 support \
+             must NOT widen the registry content digest to accept a `sha256:` prefix"
+        );
+        assert!(
+            crate::registry::Digest::parse(&format!("blake3:{hex}")).is_ok(),
+            "registry::Digest must still accept a blake3 prefix (guards against an over-broad \
+             rejection that breaks the existing content digest)"
+        );
+    }
+
+    // HTP-005 A: Source::mode() and Refspec::None
+
+    fn config_source(name: &str, body: &str) -> Source {
+        let toml = format!("version = 1\n\n[sources.{name}]\n{body}");
+        Config::parse(&toml)
+            .expect("source config parses")
+            .sources
+            .remove(name)
+            .expect("named source present")
+    }
+
+    #[test]
+    fn mode_is_url_when_url_set() {
+        let s = config_source("u", "url = \"https://example.com/pkg.tar.gz\"\n");
+        assert_eq!(
+            s.mode(),
+            SourceMode::Url,
+            "a source declaring `url` must classify as SourceMode::Url"
+        );
+    }
+
+    #[test]
+    fn mode_is_git_when_literal_git_set() {
+        let s = config_source("g", "git = \"https://github.com/me/repo.git\"\n");
+        assert_eq!(
+            s.mode(),
+            SourceMode::Git,
+            "a source declaring a literal `git` must classify as SourceMode::Git"
+        );
+    }
+
+    #[test]
+    fn mode_is_host_when_host_path_set() {
+        let s = config_source("h", "host = \"github\"\npath = \"me/repo\"\n");
+        assert_eq!(
+            s.mode(),
+            SourceMode::Host,
+            "a source declaring `host`/`path` must classify as SourceMode::Host"
+        );
+    }
+
+    #[test]
+    fn mode_is_host_when_only_path_set() {
+        let s = config_source("h", "path = \"me/repo\"\n");
+        assert_eq!(
+            s.mode(),
+            SourceMode::Host,
+            "a `path`-only source (host defaults to github) must classify as SourceMode::Host, \
+             not Url and not Git"
+        );
+    }
+
+    #[test]
+    fn refspec_is_none_for_url_source() {
+        let s = config_source("u", "url = \"https://example.com/pkg.tar.gz\"\n");
+        assert!(
+            matches!(s.refspec(), Refspec::None),
+            "a url source has no git ref; refspec() must be Refspec::None, never the \
+             Branch(\"main\") default that would misroute resolve to a git branch"
+        );
+    }
+
+    #[test]
+    fn refspec_none_displays_without_panicking() {
+        let none = Refspec::None;
+        assert_eq!(
+            none.to_string(),
+            "",
+            "Display for Refspec::None must render (empty) without panicking; \
+             resolved_remotes / lock formatting calls Display on it"
+        );
+    }
+
+    #[test]
+    fn refspec_still_branch_tag_rev_for_git_source() {
+        let branch = config_source("g", "git = \"https://x/y.git\"\nbranch = \"dev\"\n");
+        assert!(matches!(branch.refspec(), Refspec::Branch(b) if b == "dev"));
+
+        let tag = config_source("g", "git = \"https://x/y.git\"\ntag = \"v2\"\n");
+        assert!(matches!(tag.refspec(), Refspec::Tag(t) if t == "v2"));
+
+        let rev = config_source("g", "git = \"https://x/y.git\"\nrev = \"abc123\"\n");
+        assert!(matches!(rev.refspec(), Refspec::Rev(r) if r == "abc123"));
+
+        let default = config_source("g", "git = \"https://x/y.git\"\n");
+        assert!(
+            matches!(default.refspec(), Refspec::Branch(b) if b == "main"),
+            "a git source with no explicit ref must still default to Branch(\"main\"); \
+             Refspec::None must not leak into git sources"
+        );
     }
 }

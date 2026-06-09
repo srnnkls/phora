@@ -6,14 +6,14 @@ use std::path::Path;
 
 use clap::{Parser, Subcommand};
 
-use crate::config::{Config, Host, Source, builtin_forges};
+use crate::config::{Config, DownloadDigest, Host, Source, SourceMode, builtin_forges};
 use crate::error::{Error, Result};
 use crate::lock::{Lock, merge_locks};
 use crate::matcher::PathMatcher;
 use crate::paths::{ProjectId, phora_dir};
 use crate::projection::{ArtifactState, check_artifact_state};
 use crate::registry::{FileRegistry, Registry};
-use crate::source::{GitBackend, Protocol};
+use crate::source::{GitBackend, HttpBackend, Protocol, RouterBackend};
 use crate::sync::{Conflict, ConflictResolver, Resolution, SyncInput, SyncOutput, sync};
 
 #[derive(Parser, Debug)]
@@ -351,6 +351,28 @@ fn print_listings(listings: &[TargetListing]) {
     }
 }
 
+/// Builds the mode-aware router for `config`, parsing each url source's `digest`.
+fn build_router(
+    config: &Config,
+    git_dir: std::path::PathBuf,
+) -> Result<RouterBackend<GitBackend, HttpBackend>> {
+    let mut modes = BTreeMap::new();
+    let mut digests = BTreeMap::new();
+    for (name, source) in &config.sources {
+        modes.insert(name.clone(), source.mode());
+        if source.mode() == SourceMode::Url
+            && let Some(raw) = source.digest.as_deref()
+        {
+            let digest = DownloadDigest::parse(raw)
+                .map_err(|e| Error::Config(format!("source `{name}`: {e}")))?;
+            digests.insert(name.clone(), digest);
+        }
+    }
+    let git = GitBackend::new(git_dir.clone());
+    let http = HttpBackend::new(git_dir, digests);
+    Ok(RouterBackend::new(git, http, modes))
+}
+
 fn run_sync(prune: bool, force: bool, drop: Option<DropSources>) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let base = load_config()?;
@@ -362,7 +384,8 @@ fn run_sync(prune: bool, force: bool, drop: Option<DropSources>) -> Result<()> {
         drop_sources(local_lock.as_mut(), &drop);
     }
 
-    let backend = GitBackend::new(phora_dir()?.join("git"));
+    let effective = crate::config::merge_configs(base.clone(), local.clone());
+    let backend = build_router(&effective, phora_dir()?.join("git"))?;
     let registry = open_project_registry()?;
     let interactive = std::io::stdin().is_terminal();
     let resolver = TtyResolver;
@@ -406,7 +429,7 @@ fn run_rebuild_registry() -> Result<()> {
             .ok_or_else(|| Error::Lock("no lock file found; run sync first".to_owned()))?,
     };
 
-    let backend = GitBackend::new(phora_dir()?.join("git"));
+    let backend = build_router(&config, phora_dir()?.join("git"))?;
     let registry = open_project_registry()?;
     let report = crate::sync::rebuild_registry(&config, &lock, &backend, &registry)?;
 

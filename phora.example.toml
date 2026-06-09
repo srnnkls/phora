@@ -44,6 +44,19 @@ preserve_executable = true
 # For a local dev loop, override this source onto a local checkout and live-link
 # it via `deploy = "link"` — local-overlay-only. See phora.local.example.toml.
 
+# Url source: the third mode (git XOR host+path XOR url). A url downloads and
+# extracts (tar, tar.gz/tgz, zip, or a raw single file named from the URL basename);
+# a single top-level dir is auto-stripped, so version-stamped release tarballs need
+# no per-version `root`. `branch`/`tag`/`rev`/`root` are rejected on a url source.
+[sources.fzf-bin]
+url = "https://github.com/junegunn/fzf/releases/download/0.55.0/fzf-0.55.0-linux_amd64.tar.gz"
+# Optional integrity check, verified before extraction; a mismatch errors.
+digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+# digest = "blake3:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+include = ["fzf"]
+# Content is imported as a deterministic, content-addressed synthetic git commit:
+# identical bytes ⇒ identical commit ⇒ no lock churn.
+
 # A target is a directory artifacts are projected into. Omit `sources` to take all.
 [targets.neovim]
 path = "~/.config/nvim"
@@ -58,3 +71,8 @@ layout = "flat"
 path = "~/.cupcake/policies/claude"
 sources = ["loqui"]
 layout = { type = "prefixed", separator = "/" }
+
+[targets.bin]
+path = "~/.local/bin"
+sources = ["fzf-bin"]
+layout = "flat"

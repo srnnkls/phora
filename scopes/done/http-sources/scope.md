@@ -1,6 +1,6 @@
 ---
 created: 2026-06-08
-status: draft
+status: done
 issue_type: Feature
 ---
 
@@ -41,7 +41,7 @@ vendir's http sources lack).
 | Resolve | `fetch` writes the synthetic commit + `refs/heads/phora`; `resolve` reads that ref and **ignores the refspec**. A url source carries a new `Refspec::None` so `resolve_sources` never passes the default `Branch("main")` | review-CRITICAL: `source.refspec()` defaults to `Branch("main")` (`config.rs:181`); without `None`, `HttpBackend::resolve` would look up `refs/heads/main`. |
 | `commit_time` | Sentinel **epoch+1** ⇒ deterministic exported mtimes | review: epoch 0 is clamped on some filesystems (HFS+/FAT32) → perpetual `Modified`; +1 avoids it. |
 | Formats | `tar`, `tar.gz`/`tgz`, `zip`, and a raw single file (tree with one entry named from the URL basename) | Covers release assets; detected by extension/magic. |
-| Strip | Auto-strip a single top-level dir when the archive has exactly one; `root` still selects deeper | Handles version-stamped GitHub tarballs without a brittle per-version `root`. (user-chosen) |
+| Strip | Auto-strip a single top-level dir when the archive has exactly one; `root` is **rejected** on a url source (archive is pre-stripped — review-elevated, HTP-001) | Handles version-stamped GitHub tarballs without a brittle per-version `root`. (user-chosen; root-on-url rejection added in review) |
 | Integrity | Optional `digest = "<algo>:<hex>"` (`sha256:`/`blake3:`), verified **before** import; mismatch errors | Supply-chain safety. review-MEDIUM: use a **new `DownloadDigest` type**, NOT `registry::Digest` (which is blake3-only and feeds projection verify — must not be widened). (user-chosen) |
 | Dispatch | `RouterBackend` (a `SourceBackend`) holds Git+Http backends + a **source-name → mode** map and dispatches each call on the `source` **name** param — **not** the url scheme | review-CRITICAL: a git source legitimately uses `https://…​.git`, so scheme-based routing mis-routes it. The trait already passes the source name, so `sync(&dyn SourceBackend)` stays unchanged. |
 | Refspec validation | `branch`/`tag`/`rev` on a `url` source ⇒ config error | They have no meaning for a static resource. |

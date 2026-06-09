@@ -1,0 +1,335 @@
+scope: http-sources
+
+batch_reviews:
+  - batch: 6
+    tasks: [HTP-006, HTP-007]
+    phase_a5_test_review:
+      reviewers: [opus, sonnet]
+      outcome: changes_requested_then_clean
+      fixed:
+        - "no-op test now asserts written lock resolved=='url' sentinel (ties contract)"
+        - "advance test asserts deployed bytes update (not just commit)"
+        - "clarified CountingRouter counts download (fetch); deploy-side verify runs idempotently"
+    phase_c_code_review:
+      reviewers:
+        - { id: general-opus, verdict: approved, gates: { correctness: pass, security: pass, performance: pass } }
+        - { id: general-sonnet, verdict: changes_requested, gates: { correctness: pass, security: pass, performance: pass, docs: fail } }
+        - { id: arch-compliance-opus, verdict: approved, gates: { architecture: pass, style: pass } }
+      synthesized:
+        gates: { correctness: pass, security: pass, performance: pass, architecture: pass, style: pass, docs: pass }
+        outcome: approved_after_doc_fixes
+      note: "HTP-006 code fix verified correct; arch-opus grepped all resolved_remote callers -> only production caller guarded by mode()!=Url. Deferred batch-5 HIGH fully closed."
+    issues_fixed:
+      docs:
+        - id: B6-readme-root
+          severity: high
+          found_by: [general-sonnet]
+          detail: "README claimed `root` selects deeper on url sources, but root is REJECTED (config.rs). README contradicted implementation."
+          resolution: "README: root/branch/tag/rev are config errors on url; only include/exclude apply"
+        - id: B6-readme-mtime
+          severity: medium
+          found_by: [general-sonnet]
+          detail: "epoch+1 mtime sentinel + rationale undocumented (HTP-007 acceptance requires it)"
+          resolution: "README Determinism paragraph documents epoch+1 (FAT32/HFS+ 0-mtime clamp)"
+        - id: B6-readme-detection
+          severity: low
+          found_by: [general-opus, arch-compliance-opus]
+          detail: "README said 'detected by extension and magic'; detection is magic-only"
+          resolution: "README: detected by content (magic bytes); raw = single file from URL basename"
+    accepted_by_design:
+      - id: B6-test-fmt-drift
+        found_by: [arch-compliance-opus]
+        detail: "new HTP-006 test-code rustfmt drift"
+        resolution: "repo does not gate cargo fmt --check (pre-existing baseline drift); new PRODUCTION code is fmt-clean; test drift consistent with frozen-test style"
+      - id: B6-normalizedurl-dotgit
+        found_by: [arch-compliance-opus]
+        detail: "NormalizedUrl strips trailing .git; exotic collision if a url path ends in .git"
+        resolution: "self-consistent for url-vs-url matching; acceptable v1"
+    scope_inconsistency_noted:
+      - "scope.md Decisions table still says 'root still selects deeper' for url sources, but the review-elevated HTP-001 decision REJECTS root on url (archive is pre-stripped). Implementation + tests + README reflect REJECTION. Scope Decisions table is stale (doc-only)."
+  - batch: 5
+    tasks: [HTP-005]
+    phase_a5_test_review:
+      reviewers: [opus, sonnet]
+      outcome: changes_requested_then_clean
+      fixed:
+        - "discover_and_digest_dispatch_by_mode only proved no-fetch -> Spy now records discover/digest, asserts correct backend per mode"
+        - "router_is_usable_as_dyn asserted nothing -> assert_eq on resolve return"
+        - "mismatched_digest before-import check used loose-ref file path -> git-level find_reference (and a borrow-checker fix to that lookup)"
+        - "discover_and_export now reads stripped root file hello.txt from the tree and asserts content"
+        - "TarServer write timeout added"
+    phase_c_code_review:
+      reviewers:
+        - { id: general-opus, verdict: approved, gates: { correctness: pass, security: pass, performance: pass } }
+        - { id: general-sonnet, verdict: changes_requested, gates: { correctness: fail, security: pass, performance: fail } }
+        - { id: architecture-opus, verdict: approved, gates: { architecture: pass } }
+        - { id: compliance-sonnet, verdict: changes_requested, gates: { style: fail } }
+      synthesized:
+        gates: { correctness: pass, security: pass, performance: pass, architecture: pass, style: pass }
+        outcome: approved_after_minor_fixes_plus_one_deferral
+    issues_fixed:
+      style:
+        - id: B5-backend-fmt
+          found_by: [compliance-sonnet]
+          detail: "new backend.rs rustfmt drift (test-module chains)"
+          resolution: "rustfmt src/backend.rs"
+        - id: B5-reexport-doc
+          found_by: [compliance-sonnet, architecture-opus]
+          detail: "pub use crate::backend::RouterBackend re-export undocumented (dual import path required by frozen tests)"
+          resolution: "one-line doc; re-export kept"
+        - id: B5-btreemap-import
+          found_by: [compliance-sonnet]
+          detail: "HttpBackend used fully-qualified std::collections::BTreeMap"
+          resolution: "use import + short form"
+        - id: B5-mode-doc
+          found_by: [architecture-opus]
+          detail: "Source::mode() relation to validation unclear"
+          resolution: "doc: post-validation classifier; exclusivity enforced by parse/validate"
+    accepted_by_design:
+      - id: B5-generic-router
+        found_by: [architecture-opus]
+        detail: "generic RouterBackend<G,H> + git_backend()/http_backend() accessors leak a test seam into the prod API"
+        resolution: "REQUIRED by the frozen spy tests (RouterBackend<Spy,Spy>); zero-cost, idiomatic. Kept."
+    deferred_issues:
+      - id: B5-source-matches-url
+        severity: high
+        found_by: [general-sonnet, general-opus]
+        detail: "source_matches() calls resolved_remote() for url sources -> fabricates https://github.com/.git -> never matches lock -> every sync re-downloads. Lock resolved field is '' for url."
+        carry_to: HTP-006
+        note: "EXACTLY HTP-006's defined scope (Lock + content identity for url sources; review_fix H2/M_noop). url sources still deploy correctly (idempotent); only the lock-skip optimization is absent. Fix in HTP-006: source_matches branches on Source::mode()==Url -> compare source_url() vs locked.git; lock resolved sentinel 'url'."
+  - batch: 4
+    tasks: [HTP-004]
+    phase_a5_test_review:
+      reviewers: [opus, sonnet]
+      outcome: changes_requested_then_clean
+      fixed:
+        - "CRITICAL: input_order_independent_commit_id neutralized by a double-reverse (reversed.reverse() restored forward order) — the keystone sort oracle tested nothing. Removed the reverse so orders genuinely differ."
+        - "MEDIUM: git_fsck stderr 'error'/'fatal' substring check hardened to line-anchored 'error:'/'fatal:'"
+    phase_c_code_review:
+      reviewers:
+        - { id: general-opus, verdict: changes_requested, gates: { correctness: fail, security: pass, performance: pass } }
+        - { id: general-sonnet, verdict: changes_requested, gates: { correctness: fail, security: pass, performance: pass } }
+        - { id: architecture-opus, verdict: approved, gates: { architecture: pass } }
+        - { id: compliance-sonnet, verdict: approved, gates: { style: pass } }
+      synthesized:
+        gates: { correctness: pass, security: pass, performance: pass, architecture: pass, style: pass }
+        outcome: approved_after_fixes
+      note: "general-opus ran `git checkout src/source.rs` (discarding the uncommitted batch) then reconstructed it by hand; verified faithful (+454, 466 tests pass, clippy+fmt clean) before fixes."
+    issues_fixed:
+      critical:
+        - id: B4-reimport-changed
+          found_by: [general-opus, general-sonnet]
+          detail: "commit_as with empty parents sets refs/heads/phora precondition to MustNotExist; re-importing CHANGED content into an existing mirror errored -> blocked HTP-006 update-advances"
+          resolution: "build Commit object directly + repo.reference(PreviousValue::Any) force-update. Tests reimport_changed_content_advances_ref, reimport_identical_content_is_stable"
+      medium:
+        - id: B4-duplicate-path
+          found_by: [general-sonnet]
+          detail: "duplicate entry paths silently overwrote (BTreeMap::insert)"
+          resolution: "error on duplicate. Test import_rejects_duplicate_entry_paths"
+        - id: B4-file-dir-collision
+          found_by: [general-sonnet]
+          detail: "file/dir collision in reverse order (dir/x then dir) silently clobbered subtree"
+          resolution: "detect both orders via btree Entry match -> error. Test import_rejects_file_dir_collision_either_order"
+        - id: B4-mirror-path-dup
+          found_by: [architecture-opus]
+          detail: "mirror path assembly duplicated across GitBackend::mirror_path + import_tree (+HTP-005)"
+          resolution: "extracted shared free fn mirror_path(git_dir,url); both delegate"
+      low:
+        - id: B4-comment
+          found_by: [general-sonnet, compliance-sonnet]
+          detail: "IMPORT_TIME_SECONDS comment conflated epoch+1 (exported mtime clamp) with commit-id stability; const-group doc mis-attached"
+          resolution: "corrected comment; const-group doc -> // block"
+    deferred_issues:
+      - id: B4-write-import-tree-url-param
+        severity: low
+        found_by: [general-opus, architecture-opus]
+        detail: "write_import_tree threads url only for error messages"
+        resolution: "minor; left as-is (improves error context)"
+  - batch: 3
+    tasks: [HTP-003]
+    phase_a5_test_review:
+      reviewers: [opus, sonnet]
+      outcome: changes_requested_then_clean
+      fixed:
+        - "added zip exec/symlink mapping tests (zip uses external attrs, separate code path)"
+        - "added single-top-level-FILE no-strip test"
+        - "added mid-path + zip traversal rejection tests"
+        - "fixture fix: tar 0.4.46 rejects '..' at write time -> built malicious tar via raw GnuHeader.name bytes"
+    phase_c_code_review:
+      reviewers:
+        - { id: general-opus, verdict: approved, gates: { correctness: pass, security: pass, performance: fail } }
+        - { id: general-sonnet, verdict: approved, gates: { correctness: pass, security: pass, performance: pass } }
+        - { id: architecture-opus, verdict: approved, gates: { architecture: pass } }
+        - { id: compliance-sonnet, verdict: changes_requested, gates: { style: fail } }
+      synthesized:
+        gates: { correctness: pass, security: pass, performance: pass, architecture: pass, style: pass }
+        outcome: approved_after_fixes
+    issues_fixed:
+      high:
+        - id: B3-decompression-bomb
+          found_by: [general-opus, general-sonnet]
+          detail: "no size cap on fs::read + per-entry read_to_end + gzip/zip -> bomb OOM"
+          resolution: "MAX_EXTRACTED_BYTES=1GiB; read_capped tracks actual bytes across tar+zip, errors on exceed. Test extract_rejects_archive_exceeding_size_cap"
+        - id: B3-fmt
+          found_by: [compliance-sonnet]
+          detail: "test module import order + write_tar not rustfmt-canonical (CI fmt --check fails)"
+          resolution: "rustfmt --edition 2024 src/archive.rs (formatting only)"
+      low:
+        - id: B3-raw-basename
+          found_by: [general-sonnet]
+          detail: "raw_entry built path from url basename unvalidated (url .../.. -> traversal)"
+          resolution: "raw_entry fallible, runs basename through safe_archive_path. Test extract_rejects_raw_url_with_unsafe_basename"
+        - id: B3-safe-component-doc
+          found_by: [compliance-sonnet]
+          detail: "safe_component doc said 'git tree filename'; now shared with archives"
+          resolution: "broadened doc to git tree OR archive"
+    deferred_issues:
+      - id: B3-symlink-target-unvalidated
+        severity: low
+        found_by: [general-opus, general-sonnet]
+        detail: "symlink targets stored verbatim as Link data, not validated"
+        resolution: "matches existing GitBackend; materialization gated by ExportPolicy.allow_symlinks (default false). Materialization-layer concern, not archive.rs."
+        carry_to: HTP-005
+      - id: B3-arch-prefs
+        severity: low
+        found_by: [architecture-opus]
+        detail: "extract(url) param used only on raw branch; safe_component could live in paths.rs; whole-archive-in-RAM for huge assets"
+        resolution: "low quality preferences; deferred (v1 scope is config/dotfile + release assets)"
+  - batch: 2
+    tasks: [HTP-002]
+    phase_a5_test_review:
+      reviewers: [opus, sonnet]
+      outcome: changes_requested_then_clean
+      fixed:
+        - "dead_port() TOCTOU race -> deterministic 127.0.0.1:1 connection-refused"
+        - "blake3 fixture self-check split into its own test (triage clarity)"
+        - "added blake3 mismatch test (opus coverage gap)"
+    phase_c_code_review:
+      reviewers:
+        - { id: general-opus, verdict: approved, gates: { correctness: pass, security: pass, performance: pass } }
+        - { id: general-sonnet, verdict: changes_requested, gates: { correctness: pass, security: pass, performance: fail } }
+        - { id: architecture-opus, verdict: approved, gates: { architecture: pass } }
+        - { id: compliance-sonnet, verdict: approved, gates: { style: pass } }
+      synthesized:
+        gates: { correctness: pass, security: pass, performance: pass, architecture: pass, style: pass }
+        outcome: approved_after_fixes
+    issues_fixed:
+      medium:
+        - id: B2-body-timeout
+          found_by: [general-opus, general-sonnet]
+          detail: "timeout_recv_response covers only headers; streamed body io::copy had no timeout -> stalling server wedges caller"
+          resolution: "added timeout_recv_body (BODY_TIMEOUT); kept connect timeout"
+      low:
+        - id: B2-error-surface
+          found_by: [general-opus, general-sonnet]
+          detail: "File::create / io::copy errors surfaced as Error::Io; partial dest left on error"
+          resolution: "map_err to Error::Source naming url+dest; remove partial dest on error. Regression test download_to_unwritable_dest_errors_as_source"
+        - id: B2-comment-narration
+          found_by: [compliance-sonnet]
+          detail: "3-line CannedServer narration comment"
+          resolution: "collapsed to one line"
+    deferred_issues:
+      - id: HTP-005-verify-streaming
+        severity: medium
+        found_by: [architecture-opus]
+        detail: "verify_digest(&[u8]) vs disk-streamed download -> HTP-005 would re-read whole archive to hash"
+        carry_to: HTP-005
+        recommendation: "add verify_file(path,&DownloadDigest) streaming the file through the hasher, OR hash-while-download; keep verify_digest(&[u8]) for in-memory callers"
+      - id: B2-ssrf-redirect
+        severity: low
+        found_by: [general-opus, architecture-opus]
+        detail: "download follows up to 10 redirects with no host allow/deny -> SSRF if url/redirect points internal"
+        resolution: "accepted v1 trust assumption (operator-controlled public url; auth out of scope). TLS verification confirmed ON; auth headers stripped on redirect (ureq default Never)."
+      - id: B2-deps-unused
+        severity: low
+        found_by: [architecture-opus]
+        detail: "flate2/tar/zip declared but unused until HTP-003"
+        resolution: "task-mandated dep batching in HTP-002; first import in HTP-003 clears it"
+  - batch: 1
+    tasks: [HTP-001]
+    phase_a5_test_review:
+      reviewers: [opus, sonnet]
+      outcome: changes_requested_then_clean
+      fixed:
+        - "blake3 digest test fixture was 65 chars (odd, undecodable) + mismatched byte array — corrected to deadbeef*8 / matching [u8;32]"
+        - "url+tag / url+rev rejection tests tightened to assert error names the source (consistency with branch/root)"
+    phase_c_code_review:
+      reviewers:
+        - id: general-opus
+          verdict: approved
+          gates: { correctness: pass, security: pass, performance: pass }
+        - id: general-sonnet
+          verdict: changes_requested
+          gates: { correctness: fail, security: pass, performance: pass }
+        - id: architecture-opus
+          verdict: approved
+          gates: { architecture: pass }
+        - id: compliance-sonnet
+          verdict: changes_requested
+          gates: { style: fail }
+      synthesized:
+        gates: { correctness: pass, security: pass, performance: pass, architecture: pass, style: pass }
+        outcome: approved_after_fixes
+issues:
+  high:
+    - id: B1-merge-stale-refspec
+      found_by: [general-sonnet, architecture-opus]
+      detail: "merged_with left stale branch/tag/rev/root (and digest) when a local layer switched a source into url mode; validate() did not re-check url+refspec post-merge"
+      resolution: "url arm of merged_with clears branch/tag/rev/root; git/host arms clear digest; validate() rejects url-mode source carrying branch/tag/rev/root. Regression tests added."
+  medium:
+    - id: B1-empty-url
+      found_by: [general-sonnet]
+      detail: "url = \"\" accepted by parse and validate"
+      resolution: "empty/whitespace url rejected in both parse and validate, naming the source. Test added."
+  low:
+    - id: B1-clippy-format
+      found_by: [compliance-sonnet]
+      detail: "useless format! in download_digest_rejects_unknown_algo_prefix test"
+      resolution: "replaced &format!(\"{hex}\") with hex"
+deferred_issues:
+  - id: HTP-005-resolved-remote-url-arm
+    severity: high-latent
+    found_by: [architecture-opus]
+    detail: "resolved_remote() has no url arm — a config-valid url source would resolve to https://github.com/.git and get git-fetched. No url consumer exists yet (gate passed)."
+    carry_to: HTP-005
+    recommendation: "Introduce Source::mode() -> {Git,Host,Url}; resolved_remote errors (or callers branch) for url-mode; collapses scattered is_some() checks into one exhaustive switch."
+  - id: HTP-002-downloaddigest-algo-accessor
+    severity: low
+    found_by: [architecture-opus]
+    detail: "DownloadDigest::bytes() erases width/algo; consider an algo() accessor so HTP-002 verifier branches on algorithm without matching the enum twice."
+    carry_to: HTP-002
+style_decisions:
+  - "Kept Source::source_url() name (scope-mandated; HTP-005 + frozen tests depend on it) despite compliance suggestion to rename to url()."
+  - "Kept DownloadDigest # Errors rustdoc — consistent with existing codebase doc sections."
+
+final_review:
+  status: completed
+  reviewers: [final-claude-opus, final-claude-sonnet]
+  diff_range: 1b36b523..HEAD
+  gates: { correctness: pass, security: pass, architecture: pass, style: pass }
+  scope_compliance:
+    behavior_complete: true
+    given_when_then_covered: true
+    decisions_honored: true
+    verification_gate_met: true
+    out_of_scope_respected: true
+  tests: { lib: 494, integration: 5, status: green, clippy: clean }
+  strengths:
+    - "Unification thesis fully realized: HttpBackend imports a synthetic commit then delegates discover/export/compute_digest/commit_time to an inner GitBackend over the same ODB — one store, one projection/verify path."
+    - "Deferred batch-1/5 HIGH (url leaking into the git remote resolver) fully closed: resolved_remotes + source_matches branch on Source::mode()==Url; RouterBackend dispatches on source name/mode, never url scheme."
+    - "Determinism keystone rigorously tested: content-only commit id (fixed identity+epoch+1+no-parents, git-sorted trees), input-order independence, git fsck --strict, reimport advance/no-churn."
+    - "Security for v1: per-segment traversal guard (tar+zip, mid-path, non-utf8 reject), digest verified before import, 1 GiB decompression-bomb cap on actual bytes, TLS on, redirect auth stripped, partial-dest cleanup."
+  unresolved_issues:
+    - severity: minor
+      detail: "TcpListener-based server tests had one transient failure under heavy parallel load (not reproduced in 7+ runs); timeout-bounded, non-blocking. If it recurs, serialize the url/sync server tests."
+    - severity: minor
+      detail: "G/W/T 'two identical-content different-url sources' covered compositionally (different_repos_produce_different_keys + deterministic_same_entries_same_commit_id), not as one combined test. Test-organization preference, not a defect."
+    - severity: minor
+      detail: "scope.md Decisions 'Strip' row corrected post-review to reflect root-on-url rejection (was stale)."
+  recommendation: ready_to_merge
+readiness:
+  all_batches_reviewed: true
+  critical_issues_resolved: true
+  high_issues_resolved: true
+  final_review_passed: true
+  tests_passing: true

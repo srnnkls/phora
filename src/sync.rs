@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::config::{Config, DeployMode, LayoutKind, Protocol, Source, Target, merge_configs};
+use crate::config::{
+    Config, DeployMode, LayoutKind, Protocol, Source, SourceMode, Target, merge_configs,
+};
 use crate::error::{Error, Result};
 use crate::lock::{Lock, LockedSource, merge_locks, source_matches, split_locks};
 use crate::matcher::PathMatcher;
@@ -87,10 +89,17 @@ fn effective_protocol(source: &Source, config: &Config) -> Protocol {
 fn resolved_remotes(config: &Config) -> Result<BTreeMap<String, String>> {
     let mut remotes = BTreeMap::new();
     for (name, source) in &config.sources {
-        let protocol = effective_protocol(source, config);
-        let remote = source
-            .resolved_remote(&config.hosts, protocol)
-            .map_err(|e| Error::Config(format!("source `{name}`: {e}")))?;
+        let remote = if source.mode() == SourceMode::Url {
+            source
+                .source_url()
+                .ok_or_else(|| Error::Config(format!("source `{name}`: missing url")))?
+                .to_owned()
+        } else {
+            let protocol = effective_protocol(source, config);
+            source
+                .resolved_remote(&config.hosts, protocol)
+                .map_err(|e| Error::Config(format!("source `{name}`: {e}")))?
+        };
         remotes.insert(name.clone(), remote);
     }
     Ok(remotes)
@@ -490,12 +499,17 @@ fn resolve_sources(
         let digest =
             backend.compute_digest(name, git, &commit, source.root.as_deref(), &matcher)?;
 
+        let resolved = if source.mode() == SourceMode::Url {
+            "url".to_owned()
+        } else {
+            source.refspec().to_string()
+        };
         routed.push((
             name.clone(),
             LockedSource {
                 name: name.clone(),
                 git: git.to_owned(),
-                resolved: source.refspec().to_string(),
+                resolved,
                 commit: commit.clone(),
                 digest,
                 config_digest: source.config_digest(),
@@ -1205,7 +1219,9 @@ mod tests {
 
     use crate::config::Refspec;
     use crate::registry::FileRegistry;
-    use crate::source::{ExportRequest, ExportResult, GitBackend, SourceBackend};
+    use crate::source::{
+        ExportRequest, ExportResult, GitBackend, HttpBackend, RouterBackend, SourceBackend,
+    };
 
     // ── git fixture ────────────────────────────────────────────────
 
@@ -5333,5 +5349,307 @@ mod tests {
 
         drop(https_src);
         drop(ssh_src);
+    }
+
+    // ── HTP-006: url-source lock + content identity through full sync ──
+
+    /// Serves a `.tar.gz` over HTTP at a stable url, handing out one queued body per
+    /// connection (last body repeats once the queue drains), so two syncs of the SAME
+    /// url can be fed identical or changed bytes while the url identity is unchanged.
+    struct UrlTarServer {
+        url: String,
+        _handle: std::thread::JoinHandle<()>,
+    }
+
+    impl UrlTarServer {
+        fn spawn(bodies: Vec<Vec<u8>>) -> Self {
+            use std::io::{Read, Write};
+            use std::net::TcpListener;
+            use std::time::Duration;
+
+            let listener =
+                TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port for url server");
+            let port = listener.local_addr().expect("local addr").port();
+            let url = format!("http://127.0.0.1:{port}/pkg-1.0.tar.gz");
+            let handle = std::thread::spawn(move || {
+                let mut idx = 0usize;
+                while let Ok((mut stream, _)) = listener.accept() {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf);
+                    let body = &bodies[idx.min(bodies.len() - 1)];
+                    idx += 1;
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(body);
+                    let _ = stream.flush();
+                }
+            });
+            Self {
+                url,
+                _handle: handle,
+            }
+        }
+    }
+
+    /// A `.tar.gz` holding `editor/init.lua` with the given bytes, so the archive
+    /// deploys the `editor` artifact through `config_one_source_one_target`.
+    fn editor_tar_gz(init_lua: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut header = tar::Header::new_gnu();
+        header.set_size(init_lua.len() as u64);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+
+        let mut builder = tar::Builder::new(Vec::new());
+        builder
+            .append_data(&mut header, "pkg-1.0/editor/init.lua", init_lua)
+            .expect("append editor/init.lua tar entry");
+        let tar_bytes = builder.into_inner().expect("finish tar");
+
+        let mut encoder =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&tar_bytes).expect("gzip tar bytes");
+        encoder.finish().expect("finish gzip")
+    }
+
+    /// One-source/one-target config whose single source is a url source.
+    fn url_config_one_target(
+        source: &str,
+        url: &str,
+        target_path: &Path,
+        layout: &str,
+    ) -> Config {
+        let toml = format!(
+            "version = 1\n\n\
+             [sources.{source}]\nurl = \"{url}\"\n\n\
+             [targets.dest]\npath = \"{}\"\nsources = [\"{source}\"]\nlayout = \"{layout}\"\n",
+            target_path.display(),
+        );
+        Config::parse(&toml).expect("url source + target config parses")
+    }
+
+    /// A fetch-counting `RouterBackend<GitBackend, HttpBackend>`: counts every `fetch`
+    /// so a test can prove the second sync of an unchanged url is a no-op (0 fetches).
+    struct CountingRouter {
+        inner: RouterBackend<GitBackend, HttpBackend>,
+        fetches: Cell<usize>,
+    }
+
+    impl CountingRouter {
+        fn new(git_dir: PathBuf, modes: BTreeMap<String, crate::config::SourceMode>) -> Self {
+            let git = GitBackend::new(git_dir.clone());
+            let http = HttpBackend::new(git_dir, BTreeMap::new());
+            Self {
+                inner: RouterBackend::new(git, http, modes),
+                fetches: Cell::new(0),
+            }
+        }
+
+        fn fetch_count(&self) -> usize {
+            self.fetches.get()
+        }
+    }
+
+    impl SourceBackend for CountingRouter {
+        fn fetch(&self, source: &str, url: &str) -> Result<()> {
+            self.fetches.set(self.fetches.get() + 1);
+            self.inner.fetch(source, url)
+        }
+        fn resolve(&self, source: &str, url: &str, refspec: &Refspec) -> Result<String> {
+            self.inner.resolve(source, url, refspec)
+        }
+        fn commit_time(&self, source: &str, url: &str, commit: &str) -> Result<u64> {
+            self.inner.commit_time(source, url, commit)
+        }
+        fn discover_artifacts(
+            &self,
+            source: &str,
+            url: &str,
+            commit: &str,
+            root: Option<&Path>,
+            matcher: &crate::matcher::PathMatcher,
+        ) -> Result<Vec<String>> {
+            self.inner
+                .discover_artifacts(source, url, commit, root, matcher)
+        }
+        fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult> {
+            self.inner.export_artifact(req)
+        }
+        fn compute_digest(
+            &self,
+            source: &str,
+            url: &str,
+            commit: &str,
+            root: Option<&Path>,
+            matcher: &crate::matcher::PathMatcher,
+        ) -> Result<String> {
+            self.inner
+                .compute_digest(source, url, commit, root, matcher)
+        }
+    }
+
+    fn url_modes(source: &str) -> BTreeMap<String, crate::config::SourceMode> {
+        let mut modes = BTreeMap::new();
+        modes.insert(source.to_owned(), crate::config::SourceMode::Url);
+        modes
+    }
+
+    #[test]
+    fn second_sync_of_unchanged_url_is_a_noop() {
+        let server = UrlTarServer::spawn(vec![editor_tar_gz(b"-- v1\n")]);
+        let git_dir = TempDir::new().expect("git dir");
+        let state_dir = TempDir::new().expect("state dir");
+        let registry =
+            FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+        let backend = CountingRouter::new(git_dir.path().to_path_buf(), url_modes("pkg"));
+        let td = TargetDir::new();
+        let cfg = url_config_one_target("pkg", &server.url, &td.target_path(), "flat");
+
+        let first = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+            .expect("first sync of url source deploys");
+        assert!(!first.had_failures, "first url sync must succeed");
+        assert_eq!(
+            backend.fetch_count(),
+            1,
+            "premise: the first sync of a fresh url source must fetch exactly once"
+        );
+        assert_eq!(
+            first
+                .base_lock
+                .find_source("pkg")
+                .expect("url source in lock")
+                .resolved,
+            "url",
+            "a url source's lock must record the 'url' sentinel in resolved, not the empty Refspec::None string"
+        );
+
+        let dst = td.artifact_dst(&flat_layout(), "pkg", "editor");
+        assert_eq!(
+            std::fs::read(dst.join("init.lua")).expect("deployed init.lua"),
+            b"-- v1\n",
+            "premise: the first sync must deploy the archived editor/init.lua bytes"
+        );
+
+        let fetches_after_first = backend.fetch_count();
+        let second = sync(
+            &input(&cfg, None, Some(first.base_lock.clone()), None, false),
+            &backend,
+            &registry,
+        )
+        .expect("second sync of unchanged url runs cleanly");
+
+        assert!(!second.had_failures, "second clean url sync must not fail");
+        // The load-bearing no-op signal is NO RE-DOWNLOAD: fetch (the network+import step) must not run again. Deploy-side verification (compute_digest/export) may still run idempotently and is not counted here.
+        assert_eq!(
+            backend.fetch_count(),
+            fetches_after_first,
+            "the second sync of an unchanged url MUST be a no-op: the matching lock must \
+             suppress the re-download, so fetch_count must not increase (the bug is that a \
+             url lock never matches and re-fetches every time)"
+        );
+        assert_eq!(
+            std::fs::read(dst.join("init.lua")).expect("init.lua still deployed"),
+            b"-- v1\n",
+            "files must remain correctly deployed after the no-op second sync"
+        );
+    }
+
+    #[test]
+    fn update_with_changed_url_content_advances_lock() {
+        let server = UrlTarServer::spawn(vec![editor_tar_gz(b"-- v1\n"), editor_tar_gz(b"-- v2\n")]);
+        let git_dir = TempDir::new().expect("git dir");
+        let state_dir = TempDir::new().expect("state dir");
+        let registry =
+            FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+        let backend = CountingRouter::new(git_dir.path().to_path_buf(), url_modes("pkg"));
+        let td = TargetDir::new();
+        let cfg = url_config_one_target("pkg", &server.url, &td.target_path(), "flat");
+
+        let first = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+            .expect("first sync deploys v1");
+        let first_commit = first
+            .base_lock
+            .find_source("pkg")
+            .expect("pkg locked after first sync")
+            .commit
+            .clone();
+        let fetches_after_first = backend.fetch_count();
+
+        let second = sync(
+            &input(&cfg, None, Some(first.base_lock.clone()), None, true),
+            &backend,
+            &registry,
+        )
+        .expect("forced second sync re-fetches changed content");
+        assert!(!second.had_failures, "second sync must succeed");
+
+        assert!(
+            backend.fetch_count() > fetches_after_first,
+            "a forced (--force) sync of changed url content MUST re-fetch: fetch_count increases"
+        );
+        let second_commit = second
+            .base_lock
+            .find_source("pkg")
+            .expect("pkg locked after second sync")
+            .commit
+            .clone();
+        assert_ne!(
+            second_commit, first_commit,
+            "changed archive bytes must yield a different synthetic commit id: the lock advances"
+        );
+
+        let dst = td.artifact_dst(&flat_layout(), "pkg", "editor");
+        assert_eq!(
+            std::fs::read(dst.join("init.lua")).expect("deployed init.lua after advance"),
+            b"-- v2\n",
+            "advancing the lock must re-deploy the new archive bytes, not merely bump the commit id"
+        );
+    }
+
+    #[test]
+    fn reimport_identical_bytes_does_not_churn() {
+        let server = UrlTarServer::spawn(vec![editor_tar_gz(b"-- same\n"), editor_tar_gz(b"-- same\n")]);
+        let git_dir = TempDir::new().expect("git dir");
+        let state_dir = TempDir::new().expect("state dir");
+        let registry =
+            FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+        let backend = CountingRouter::new(git_dir.path().to_path_buf(), url_modes("pkg"));
+        let td = TargetDir::new();
+        let cfg = url_config_one_target("pkg", &server.url, &td.target_path(), "flat");
+
+        let first = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+            .expect("first sync imports the archive");
+        let first_commit = first
+            .base_lock
+            .find_source("pkg")
+            .expect("pkg locked after first sync")
+            .commit
+            .clone();
+
+        let second = sync(
+            &input(&cfg, None, Some(first.base_lock.clone()), None, true),
+            &backend,
+            &registry,
+        )
+        .expect("forced re-import of identical bytes");
+        let second_commit = second
+            .base_lock
+            .find_source("pkg")
+            .expect("pkg locked after second sync")
+            .commit
+            .clone();
+
+        assert_eq!(
+            second_commit, first_commit,
+            "re-importing identical archive bytes must yield the SAME content-addressed synthetic \
+             commit id — no lock churn even when forced to re-fetch"
+        );
     }
 }

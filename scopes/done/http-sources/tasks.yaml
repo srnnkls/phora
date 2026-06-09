@@ -6,7 +6,7 @@ revised: 2026-06-08   # post multi-agent review (opus+sonnet)
 tasks:
   - id: HTP-001
     content: "Config: url + digest fields, three-way mode exclusivity, source-url accessor, refspec/root rejection"
-    status: pending
+    status: done
     activeForm: "Adding url source config"
     review_fixes:
       - "CRITICAL (silent dual-mode): Config::parse must reject >1 of {git, host+path, url}; today only branch/tag/rev>1 is checked (config.rs:33)"
@@ -24,7 +24,7 @@ tasks:
 
   - id: HTP-002
     content: "Deps + download + optional digest verification"
-    status: pending
+    status: done
     activeForm: "Implementing download + verify"
     review_fixes:
       - "MEDIUM (TLS dedup): align the http client's TLS with gix's stack — gix uses blocking-network-client; pick ureq/reqwest with rustls features that dedupe (cargo tree -e features | grep tls)"
@@ -37,7 +37,7 @@ tasks:
 
   - id: HTP-003
     content: "Archive extraction + auto-strip + per-segment traversal guard"
-    status: pending
+    status: done
     activeForm: "Extracting archives safely"
     depends_on: [HTP-002]
     review_fixes:
@@ -55,7 +55,7 @@ tasks:
 
   - id: HTP-004
     content: "Deterministic synthetic-commit import (gix) — confirmed feasible, mind tree-sort"
-    status: pending
+    status: done
     activeForm: "Importing content as a synthetic commit"
     depends_on: [HTP-003]
     review_fixes:
@@ -73,7 +73,7 @@ tasks:
 
   - id: HTP-005
     content: "HttpBackend + mode-aware backend router; url-aware resolve"
-    status: pending
+    status: done
     activeForm: "Implementing HttpBackend and routing"
     depends_on: [HTP-001, HTP-004]
     review_fixes:
@@ -90,7 +90,7 @@ tasks:
 
   - id: HTP-006
     content: "Lock + content identity for url sources"
-    status: pending
+    status: done
     activeForm: "Locking url sources by content"
     depends_on: [HTP-005]
     review_fixes:
@@ -104,7 +104,7 @@ tasks:
 
   - id: HTP-007
     content: "Docs + example for url sources"
-    status: pending
+    status: done
     activeForm: "Documenting url sources"
     depends_on: [HTP-005]
     acceptance:
