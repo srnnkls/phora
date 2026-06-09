@@ -43,9 +43,6 @@ pub enum Error {
     #[error("sync error: {0}")]
     Sync(String),
 
-    #[error("worktree error: {0}")]
-    Worktree(String),
-
     #[error("artifact `{artifact}` collides in target `{target}` from sources: {sources:?}")]
     Collision {
         artifact: String,
