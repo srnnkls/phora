@@ -2694,7 +2694,6 @@ fn config_digest_is_unchanged_across_the_path_to_repo_rename() {
 
 // ARCH-015: source-key migration warnings (retrofit of ARCH-005 acceptance).
 mod migration_warnings {
-    use std::path::Path;
 
     use tempfile::TempDir;
 
@@ -2826,8 +2825,8 @@ mod migration_warnings {
             "the meaning-changed hint must be a single line, got: {line:?}"
         );
         assert!(
-            line.contains("repo"),
-            "the hint must name the `repo` key the shorthand moved to, got: {line:?}"
+            line.contains("repo") && line.contains('x'),
+            "the hint must name the offending source and the `repo` key the shorthand moved to, got: {line:?}"
         );
     }
 
@@ -2913,6 +2912,5 @@ mod migration_warnings {
             ws.is_empty(),
             "a config using only canonical keys must produce NO migration warnings, got: {ws:?}"
         );
-        let _ = Path::new("/");
     }
 }
