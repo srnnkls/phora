@@ -43,47 +43,7 @@ impl Config {
             }
         }
         for (name, source) in &config.sources {
-            let set = u8::from(source.branch.is_some())
-                + u8::from(source.tag.is_some())
-                + u8::from(source.rev.is_some());
-            if set > 1 {
-                return Err(Error::Config(format!(
-                    "source `{name}` sets more than one of branch/tag/rev"
-                )));
-            }
-            let forge = source.is_forge();
-            let local = source.local_path().is_some();
-            let kinds = u8::from(source.git.is_some())
-                + u8::from(source.url.is_some())
-                + u8::from(forge)
-                + u8::from(local);
-            if kinds > 1 {
-                return Err(Error::Config(format!(
-                    "source `{name}` sets more than one source kind \
-                     (local `path`, forge `host`/`repo`, literal `git`, and `url` \
-                     are mutually exclusive)"
-                )));
-            }
-            if source.url.is_some()
-                && (source.branch.is_some()
-                    || source.tag.is_some()
-                    || source.rev.is_some()
-                    || source.root.is_some())
-            {
-                return Err(Error::Config(format!(
-                    "source `{name}`: `branch`/`tag`/`rev`/`root` are meaningless on a `url` source"
-                )));
-            }
-            if source.url.as_deref().is_some_and(|u| u.trim().is_empty()) {
-                return Err(Error::Config(format!(
-                    "source `{name}`: `url` must not be empty"
-                )));
-            }
-            if source.host.is_some() && source.forge_path().is_none() {
-                return Err(Error::Config(format!(
-                    "source `{name}`: `host` set without a `repo` (incomplete forge group)"
-                )));
-            }
+            source.classify(name)?;
         }
         Ok(config)
     }
@@ -98,42 +58,18 @@ impl Config {
     /// single complete mode (git, or host+path).
     pub fn validate(&self) -> Result<()> {
         for (name, source) in &self.sources {
-            let forge = source.is_forge();
-            let local = source.local_path().is_some();
-            let kinds = u8::from(source.git.is_some())
-                + u8::from(local)
-                + u8::from(forge)
-                + u8::from(source.url.is_some());
-            if kinds != 1 {
-                return Err(Error::Config(format!(
-                    "source `{name}` must resolve to exactly one of a local `path`, \
-                     a forge `host`/`repo`, a literal `git`, or a `url`"
-                )));
-            }
-            if let Some(url) = source.url.as_deref() {
-                if url.trim().is_empty() {
-                    return Err(Error::Config(format!(
-                        "source `{name}`: `url` must not be empty"
-                    )));
-                }
-                if source.branch.is_some()
-                    || source.tag.is_some()
-                    || source.rev.is_some()
-                    || source.root.is_some()
-                {
-                    return Err(Error::Config(format!(
-                        "source `{name}`: `branch`/`tag`/`rev`/`root` are meaningless on a `url` source"
-                    )));
-                }
-            }
-            if !forge {
+            let parsed = ParsedSource::parse(name, source)?;
+            let Remote::Host {
+                host: host_name,
+                repo,
+                ..
+            } = &parsed.remote
+            else {
                 continue;
-            }
-            let path = source.forge_path().unwrap_or_default();
-            let host_name = source.host.as_deref().unwrap_or("github");
-            if path.trim().is_empty() || path.split('/').any(str::is_empty) {
+            };
+            if repo.trim().is_empty() || repo.split('/').any(str::is_empty) {
                 return Err(Error::Config(format!(
-                    "source `{name}`: `repo` `{path}` is not a valid forge path \
+                    "source `{name}`: `repo` `{repo}` is not a valid forge path \
                      (no empty, leading, trailing, or doubled `/` segments)"
                 )));
             }
@@ -162,6 +98,18 @@ impl Config {
 
     fn effective_host(&self, name: &str) -> Option<Host> {
         effective_host(&self.hosts, name)
+    }
+
+    /// Parses every source into its typed form, keyed by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] if any source fails the typed parse.
+    pub fn parsed_sources(&self) -> Result<BTreeMap<String, ParsedSource>> {
+        self.sources
+            .iter()
+            .map(|(name, source)| Ok((name.clone(), ParsedSource::parse(name, source)?)))
+            .collect()
     }
 }
 
@@ -446,6 +394,228 @@ pub enum SourceMode {
     Url,
 }
 
+/// A source's resolved kind. Exactly one kind per source; illegal combinations
+/// are unrepresentable. Only `Url` carries no refspec/root (rejected at the parse edge).
+#[derive(Debug, Clone)]
+pub enum Remote {
+    /// A literal git remote (`git = <url>`) or the `git = <localpath>` alias.
+    Git(String),
+    /// A local path source (`path = <local>`), resolved verbatim.
+    Path(String),
+    /// A static resource fetched once; no git ref.
+    Url {
+        url: String,
+        digest: Option<crate::kernel::Digest>,
+    },
+    /// A forge source resolved against the host registry.
+    Host {
+        host: String,
+        repo: String,
+        protocol: Option<Protocol>,
+    },
+}
+
+impl Remote {
+    #[must_use]
+    pub fn mode(&self) -> SourceMode {
+        match self {
+            Self::Git(_) | Self::Path(_) => SourceMode::Git,
+            Self::Host { .. } => SourceMode::Host,
+            Self::Url { .. } => SourceMode::Url,
+        }
+    }
+}
+
+/// A `Source` parsed once into a typed, single-kind shape. This is the validated
+/// form the rest of the system reasons about; raw `Source` is the wire DTO only.
+#[derive(Debug, Clone)]
+pub struct ParsedSource {
+    pub remote: Remote,
+    pub branch: Option<String>,
+    pub tag: Option<String>,
+    pub rev: Option<String>,
+    pub root: Option<PathBuf>,
+    include: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
+    allow_symlinks: Option<bool>,
+    allow_submodules: Option<bool>,
+    preserve_executable: Option<bool>,
+    deploy: Option<DeployMode>,
+}
+
+impl ParsedSource {
+    /// Parses a merged raw `Source` into the typed single-kind shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] if the source does not resolve to exactly one
+    /// kind, sets a refspec/root on a `url`, carries an empty `url`/`repo`, or
+    /// carries a malformed `url` digest.
+    pub fn parse(name: &str, source: &Source) -> Result<Self> {
+        let remote = source.classify(name)?.ok_or_else(|| {
+            Error::Config(format!(
+                "source `{name}` must resolve to exactly one of a local `path`, \
+                 a forge `host`/`repo`, a literal `git`, or a `url`"
+            ))
+        })?;
+        Ok(Self {
+            remote,
+            branch: source.branch.clone(),
+            tag: source.tag.clone(),
+            rev: source.rev.clone(),
+            root: source.root.clone(),
+            include: source.include.clone(),
+            exclude: source.exclude.clone(),
+            allow_symlinks: source.allow_symlinks,
+            allow_submodules: source.allow_submodules,
+            preserve_executable: source.preserve_executable,
+            deploy: source.deploy,
+        })
+    }
+
+    #[must_use]
+    pub fn mode(&self) -> SourceMode {
+        self.remote.mode()
+    }
+
+    /// Resolves the concrete git remote for `protocol`. `Git`/`Path` resolve
+    /// verbatim; `Host` resolves against the host registry; `Url` has no remote.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] if a `Host` source's host is unknown or has no
+    /// template for `protocol`.
+    pub fn resolved_remote(
+        &self,
+        hosts: &BTreeMap<String, Host>,
+        protocol: Protocol,
+    ) -> Result<String> {
+        match &self.remote {
+            Remote::Git(remote) => Ok(remote.clone()),
+            Remote::Path(path) => Ok(path.clone()),
+            Remote::Url { .. } => Ok(String::new()),
+            Remote::Host { host, repo, .. } => resolve_forge(hosts, host, repo, protocol),
+        }
+    }
+
+    #[must_use]
+    pub fn source_url(&self) -> Option<&str> {
+        match &self.remote {
+            Remote::Url { url, .. } => Some(url),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn protocol(&self) -> Option<Protocol> {
+        match &self.remote {
+            Remote::Host { protocol, .. } => *protocol,
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn digest(&self) -> Option<crate::kernel::Digest> {
+        match &self.remote {
+            Remote::Url { digest, .. } => *digest,
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn deploy_mode(&self) -> DeployMode {
+        self.deploy.unwrap_or(DeployMode::Copy)
+    }
+
+    #[must_use]
+    pub fn includes(&self) -> &[String] {
+        self.include.as_deref().unwrap_or(&[])
+    }
+
+    #[must_use]
+    pub fn excludes(&self) -> &[String] {
+        self.exclude.as_deref().unwrap_or(&[])
+    }
+
+    #[must_use]
+    pub fn refspec(&self) -> Refspec {
+        if matches!(self.remote, Remote::Url { .. }) {
+            Refspec::None
+        } else if let Some(rev) = &self.rev {
+            Refspec::Rev(rev.clone())
+        } else if let Some(tag) = &self.tag {
+            Refspec::Tag(tag.clone())
+        } else if let Some(branch) = &self.branch {
+            Refspec::Branch(branch.clone())
+        } else {
+            Refspec::Branch("main".into())
+        }
+    }
+
+    #[must_use]
+    pub fn export_policy(&self) -> ExportPolicy {
+        ExportPolicy {
+            allow_symlinks: self.allow_symlinks.unwrap_or(false),
+            allow_submodules: self.allow_submodules.unwrap_or(false),
+            preserve_executable: self.preserve_executable.unwrap_or(true),
+        }
+    }
+
+    /// BLAKE3 over the export-affecting config fields, in a fixed order.
+    #[must_use]
+    pub fn config_digest(&self) -> String {
+        let mut h = blake3::Hasher::new();
+        for p in self.includes() {
+            h.update(b"inc\x00");
+            h.update(p.as_bytes());
+        }
+        for p in self.excludes() {
+            h.update(b"exc\x00");
+            h.update(p.as_bytes());
+        }
+        if let Some(r) = &self.root {
+            h.update(b"root\x00");
+            h.update(r.to_string_lossy().as_bytes());
+        }
+        let policy = self.export_policy();
+        h.update(&[
+            u8::from(policy.allow_symlinks),
+            u8::from(policy.allow_submodules),
+            u8::from(policy.preserve_executable),
+        ]);
+        format!("blake3:{}", h.finalize().to_hex())
+    }
+}
+
+/// Resolves a forge `host`/`repo` against the built-in registry overlaid by `hosts`.
+fn resolve_forge(
+    hosts: &BTreeMap<String, Host>,
+    host_name: &str,
+    repo: &str,
+    protocol: Protocol,
+) -> Result<String> {
+    let effective = effective_host(hosts, host_name).ok_or_else(|| {
+        Error::Config(format!(
+            "source `{repo}` references unknown host `{host_name}`"
+        ))
+    })?;
+    let template = effective
+        .remote
+        .as_ref()
+        .and_then(|remote| match protocol {
+            Protocol::Https => remote.https_template(),
+            Protocol::Ssh => remote.ssh_template(),
+        })
+        .ok_or_else(|| {
+            let proto = match protocol {
+                Protocol::Https => "https",
+                Protocol::Ssh => "ssh",
+            };
+            Error::Config(format!("host `{host_name}` has no {proto} remote template"))
+        })?;
+    Ok(fill_template(template, repo))
+}
+
 impl Source {
     #[must_use]
     fn merged_with(mut self, local: Source) -> Source {
@@ -520,71 +690,6 @@ impl Source {
         self
     }
 
-    /// Resolves the concrete git remote for `protocol`. A git-mode source returns
-    /// its literal `git` verbatim; a host-mode source resolves against the built-in
-    /// forge registry overlaid by `hosts` (a user remote wins, else the built-in).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Config`] if the host is in neither `hosts` nor the built-in
-    /// registry, or if the effective host has no template for `protocol`.
-    pub fn resolved_remote(
-        &self,
-        hosts: &BTreeMap<String, Host>,
-        protocol: Protocol,
-    ) -> Result<String> {
-        if let Some(git) = &self.git {
-            return Ok(git.clone());
-        }
-        if !self.is_forge() {
-            return Ok(self.path.clone().unwrap_or_default());
-        }
-        let host_name = self.host.as_deref().unwrap_or("github");
-        let path = self.forge_path().unwrap_or_default();
-
-        let effective = effective_host(hosts, host_name).ok_or_else(|| {
-            Error::Config(format!(
-                "source `{path}` references unknown host `{host_name}`"
-            ))
-        })?;
-
-        let template = effective
-            .remote
-            .as_ref()
-            .and_then(|remote| match protocol {
-                Protocol::Https => remote.https_template(),
-                Protocol::Ssh => remote.ssh_template(),
-            })
-            .ok_or_else(|| {
-                let proto = match protocol {
-                    Protocol::Https => "https",
-                    Protocol::Ssh => "ssh",
-                };
-                Error::Config(format!("host `{host_name}` has no {proto} remote template"))
-            })?;
-        Ok(fill_template(template, path))
-    }
-
-    #[must_use]
-    pub fn source_url(&self) -> Option<&str> {
-        self.url.as_deref()
-    }
-
-    #[must_use]
-    pub fn deploy_mode(&self) -> DeployMode {
-        self.deploy.unwrap_or(DeployMode::Copy)
-    }
-
-    #[must_use]
-    pub fn includes(&self) -> &[String] {
-        self.include.as_deref().unwrap_or(&[])
-    }
-
-    #[must_use]
-    pub fn excludes(&self) -> &[String] {
-        self.exclude.as_deref().unwrap_or(&[])
-    }
-
     #[must_use]
     fn is_forge(&self) -> bool {
         self.host.is_some() || self.repo.is_some()
@@ -605,65 +710,82 @@ impl Source {
         self.path.as_deref()
     }
 
-    /// Classifier assuming exactly one kind is set (exclusivity enforced by parse/validate). A local `path` source classifies as Git: it resolves verbatim, exactly like `git = <localpath>`.
-    #[must_use]
-    pub fn mode(&self) -> SourceMode {
-        if self.url.is_some() {
-            SourceMode::Url
-        } else if self.is_forge() {
-            SourceMode::Host
-        } else {
-            SourceMode::Git
+    /// The single declared kind, or `None` for a mode-less partial overlay.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] for more than one kind, an incomplete forge
+    /// group, a refspec/root on a `url`, an empty `url`, or a malformed digest.
+    fn classify(&self, name: &str) -> Result<Option<Remote>> {
+        if u8::from(self.branch.is_some())
+            + u8::from(self.tag.is_some())
+            + u8::from(self.rev.is_some())
+            > 1
+        {
+            return Err(Error::Config(format!(
+                "source `{name}` sets more than one of branch/tag/rev"
+            )));
         }
-    }
-
-    #[must_use]
-    pub fn refspec(&self) -> Refspec {
-        if matches!(self.mode(), SourceMode::Url) {
-            Refspec::None
-        } else if let Some(rev) = &self.rev {
-            Refspec::Rev(rev.clone())
-        } else if let Some(tag) = &self.tag {
-            Refspec::Tag(tag.clone())
-        } else if let Some(branch) = &self.branch {
-            Refspec::Branch(branch.clone())
-        } else {
-            Refspec::Branch("main".into())
+        let local = self.local_path();
+        let kinds = u8::from(self.git.is_some())
+            + u8::from(self.url.is_some())
+            + u8::from(self.is_forge())
+            + u8::from(local.is_some());
+        if kinds > 1 {
+            return Err(Error::Config(format!(
+                "source `{name}` sets more than one source kind \
+                 (local `path`, forge `host`/`repo`, literal `git`, and `url` \
+                 are mutually exclusive)"
+            )));
         }
-    }
-
-    #[must_use]
-    pub fn export_policy(&self) -> ExportPolicy {
-        ExportPolicy {
-            allow_symlinks: self.allow_symlinks.unwrap_or(false),
-            allow_submodules: self.allow_submodules.unwrap_or(false),
-            preserve_executable: self.preserve_executable.unwrap_or(true),
+        if let Some(url) = &self.url {
+            if self.branch.is_some()
+                || self.tag.is_some()
+                || self.rev.is_some()
+                || self.root.is_some()
+            {
+                return Err(Error::Config(format!(
+                    "source `{name}`: `branch`/`tag`/`rev`/`root` are meaningless on a `url` source"
+                )));
+            }
+            if url.trim().is_empty() {
+                return Err(Error::Config(format!(
+                    "source `{name}`: `url` must not be empty"
+                )));
+            }
+            let digest = self
+                .digest
+                .as_deref()
+                .map(|raw| {
+                    raw.parse::<crate::kernel::Digest>()
+                        .map_err(|e| Error::Config(format!("source `{name}`: {e}")))
+                })
+                .transpose()?;
+            return Ok(Some(Remote::Url {
+                url: url.clone(),
+                digest,
+            }));
         }
-    }
-
-    /// BLAKE3 over the export-affecting config fields, in a fixed order.
-    #[must_use]
-    pub fn config_digest(&self) -> String {
-        let mut h = blake3::Hasher::new();
-        for p in self.includes() {
-            h.update(b"inc\x00");
-            h.update(p.as_bytes());
+        if let Some(git) = &self.git {
+            return Ok(Some(Remote::Git(git.clone())));
         }
-        for p in self.excludes() {
-            h.update(b"exc\x00");
-            h.update(p.as_bytes());
+        if self.is_forge() {
+            let host = self.host.as_deref().unwrap_or("github");
+            let repo = self.forge_path().ok_or_else(|| {
+                Error::Config(format!(
+                    "source `{name}`: `host` set without a `repo` (incomplete forge group)"
+                ))
+            })?;
+            return Ok(Some(Remote::Host {
+                host: host.to_owned(),
+                repo: repo.to_owned(),
+                protocol: self.protocol,
+            }));
         }
-        if let Some(r) = &self.root {
-            h.update(b"root\x00");
-            h.update(r.to_string_lossy().as_bytes());
+        if let Some(path) = local {
+            return Ok(Some(Remote::Path(path.to_owned())));
         }
-        let policy = self.export_policy();
-        h.update(&[
-            u8::from(policy.allow_symlinks),
-            u8::from(policy.allow_submodules),
-            u8::from(policy.preserve_executable),
-        ]);
-        format!("blake3:{}", h.finalize().to_hex())
+        Ok(None)
     }
 }
 
@@ -712,7 +834,7 @@ impl Target {
     }
 
     #[must_use]
-    pub fn resolve_sources<'a>(&'a self, all: &'a BTreeMap<String, Source>) -> Vec<&'a str> {
+    pub fn resolve_sources<'a, V>(&'a self, all: &'a BTreeMap<String, V>) -> Vec<&'a str> {
         match &self.sources {
             Some(names) => names.iter().map(String::as_str).collect(),
             None => all.keys().map(String::as_str).collect(),
@@ -836,6 +958,200 @@ mod tests {
 
     use super::*;
 
+    fn raw_source(body: &str) -> Source {
+        let toml = format!("version = 1\n\n[sources.s]\n{body}");
+        toml::from_str::<Config>(&toml)
+            .expect("raw source DTO deserializes")
+            .sources
+            .remove("s")
+            .expect("source `s` present")
+    }
+
+    fn parse_remote(name: &str, body: &str) -> Result<ParsedSource> {
+        ParsedSource::parse(name, &raw_source(body))
+    }
+
+    #[test]
+    fn parse_git_url_lands_on_remote_git() {
+        let parsed = parse_remote("g", "git = \"https://github.com/me/x.git\"\n")
+            .expect("a literal git URL parses to a typed source");
+        assert!(
+            matches!(&parsed.remote, Remote::Git(g) if g == "https://github.com/me/x.git"),
+            "a `git = <url>` source must land on Remote::Git carrying the literal remote"
+        );
+        assert_eq!(parsed.mode(), SourceMode::Git);
+    }
+
+    #[test]
+    fn parse_git_localpath_alias_lands_on_local_with_git_mode_and_verbatim_resolution() {
+        let parsed = parse_remote("g", "git = \"/home/me/dev/loqui\"\n")
+            .expect("a `git = <localpath>` alias parses");
+        assert_eq!(
+            parsed.mode(),
+            SourceMode::Git,
+            "the git=<localpath> alias must still classify as SourceMode::Git"
+        );
+        assert_eq!(
+            parsed
+                .resolved_remote(&BTreeMap::new(), Protocol::Https)
+                .expect("local alias resolves verbatim"),
+            "/home/me/dev/loqui",
+            "the git=<localpath> alias resolves the path verbatim"
+        );
+    }
+
+    #[test]
+    fn parse_path_local_lands_on_remote_path() {
+        let parsed = parse_remote("p", "path = \"/home/me/dev/loqui\"\n")
+            .expect("a local `path` parses to a typed source");
+        assert!(
+            matches!(&parsed.remote, Remote::Path(p) if p == "/home/me/dev/loqui"),
+            "a local `path` source must land on Remote::Path"
+        );
+        assert_eq!(
+            parsed.mode(),
+            SourceMode::Git,
+            "Remote::Path classifies as Git"
+        );
+        assert_eq!(
+            parsed
+                .resolved_remote(&BTreeMap::new(), Protocol::Https)
+                .expect("path local resolves verbatim"),
+            "/home/me/dev/loqui"
+        );
+    }
+
+    #[test]
+    fn parse_host_repo_lands_on_remote_host() {
+        let parsed = parse_remote("t", "host = \"github\"\nrepo = \"srnnkls/tropos\"\n")
+            .expect("host + repo parses to a typed forge source");
+        assert!(
+            matches!(&parsed.remote, Remote::Host { host, repo, .. } if host == "github" && repo == "srnnkls/tropos"),
+            "host + repo must land on Remote::Host"
+        );
+        assert_eq!(parsed.mode(), SourceMode::Host);
+    }
+
+    #[test]
+    fn parse_host_path_alias_lands_on_remote_host() {
+        let parsed = parse_remote("t", "host = \"github\"\npath = \"srnnkls/tropos\"\n")
+            .expect("host + path forge alias parses");
+        assert!(
+            matches!(&parsed.remote, Remote::Host { host, repo, .. } if host == "github" && repo == "srnnkls/tropos"),
+            "the host+path alias must land on Remote::Host with repo from the path alias"
+        );
+        assert_eq!(parsed.mode(), SourceMode::Host);
+    }
+
+    #[test]
+    fn parse_bare_repo_lands_on_remote_host_github() {
+        let parsed =
+            parse_remote("t", "repo = \"srnnkls/tropos\"\n").expect("bare repo parses to a forge");
+        assert!(
+            matches!(&parsed.remote, Remote::Host { host, repo, .. } if host == "github" && repo == "srnnkls/tropos"),
+            "a bare `repo` must default the host to github"
+        );
+        assert_eq!(parsed.mode(), SourceMode::Host);
+    }
+
+    #[test]
+    fn parse_url_lands_on_remote_url_with_parsed_digest() {
+        let parsed = parse_remote(
+            "u",
+            "url = \"https://example.com/foo.tar.gz\"\n\
+             digest = \"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\n",
+        )
+        .expect("a url + digest parses to a typed source");
+        match &parsed.remote {
+            Remote::Url { url, digest } => {
+                assert_eq!(url, "https://example.com/foo.tar.gz");
+                assert!(digest.is_some(), "the digest must be parsed at the edge");
+            }
+            other => panic!("expected Remote::Url, got {other:?}"),
+        }
+        assert_eq!(parsed.mode(), SourceMode::Url);
+        assert_eq!(
+            parsed.source_url(),
+            Some("https://example.com/foo.tar.gz"),
+            "source_url must expose the url for a Remote::Url"
+        );
+    }
+
+    #[test]
+    fn parse_zero_kind_is_rejected_with_exactly_one_message() {
+        let err = parse_remote("x", "branch = \"main\"\n")
+            .expect_err("a mode-less source must be rejected by the typed parse");
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains('x') && msg.contains("exactly one"),
+                "zero-kind rejection must name the source and say `exactly one`, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_multiple_kinds_is_rejected() {
+        let err = parse_remote(
+            "x",
+            "git = \"https://github.com/me/x.git\"\nhost = \"github\"\nrepo = \"me/x\"\n",
+        )
+        .expect_err("multiple kinds must be rejected by the typed parse");
+        assert!(matches!(err, Error::Config(_)));
+    }
+
+    #[test]
+    fn parse_url_with_branch_is_rejected_at_the_edge() {
+        let err = parse_remote(
+            "pkg",
+            "url = \"https://example.com/foo.tar.gz\"\nbranch = \"main\"\n",
+        )
+        .expect_err("branch on a url source must be rejected at the typed parse");
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("pkg") && msg.contains("meaningless"),
+                "url+branch rejection must name the source, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_url_with_root_is_rejected_at_the_edge() {
+        let err = parse_remote(
+            "pkg",
+            "url = \"https://example.com/foo.tar.gz\"\nroot = \"sub\"\n",
+        )
+        .expect_err("root on a url source must be rejected at the typed parse");
+        assert!(matches!(err, Error::Config(_)));
+    }
+
+    #[test]
+    fn parse_empty_url_is_rejected_at_the_edge() {
+        let err = parse_remote("pkg", "url = \"\"\n")
+            .expect_err("an empty url must be rejected at the typed parse");
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("pkg") && msg.contains("empty"),
+                "empty-url rejection must name the source, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_host_without_repo_is_rejected_at_the_edge() {
+        let err = parse_remote("t", "host = \"github\"\n")
+            .expect_err("a host without a repo is incomplete and must be rejected");
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains('t') && msg.contains("incomplete"),
+                "incomplete-forge rejection must name the source, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
     const EXAMPLE_TOML: &str = r#"
 version = 1
 
@@ -877,6 +1193,10 @@ sources = ["loqui"]
 layout = { type = "prefixed", separator = "/" }
 "#;
 
+    fn tp(name: &str, source: &Source) -> ParsedSource {
+        ParsedSource::parse(name, source).expect("source parses to typed form")
+    }
+
     fn parse_source(toml_body: &str) -> Source {
         let toml =
             format!("version = 1\n\n[sources.s]\ngit = \"https://example.com/x.git\"\n{toml_body}");
@@ -887,7 +1207,7 @@ layout = { type = "prefixed", separator = "/" }
             .expect("source `s` present")
     }
 
-    fn source(branch: Option<&str>, tag: Option<&str>, rev: Option<&str>) -> Source {
+    fn source(branch: Option<&str>, tag: Option<&str>, rev: Option<&str>) -> ParsedSource {
         use std::fmt::Write as _;
         let mut body = String::new();
         if let Some(b) = branch {
@@ -899,7 +1219,7 @@ layout = { type = "prefixed", separator = "/" }
         if let Some(r) = rev {
             let _ = writeln!(body, "rev = \"{r}\"");
         }
-        parse_source(&body)
+        ParsedSource::parse("s", &parse_source(&body)).expect("source parses to typed form")
     }
 
     fn target_of<'a>(cfg: &'a Config, name: &str) -> &'a Target {
@@ -937,6 +1257,7 @@ layout = { type = "prefixed", separator = "/" }
             .get("company-configs")
             .expect("company-configs source");
         assert_eq!(company.tag.as_deref(), Some("v2.1"));
+        let company = tp("company-configs", company);
         assert_eq!(company.includes(), ["editor", "lint"]);
         assert_eq!(company.excludes(), ["**/test/**", "**/*.bak"]);
     }
@@ -1108,7 +1429,7 @@ branch = "main"
             Some(Path::new("languages")),
             "base-only field must survive when local does not set it"
         );
-        assert!(matches!(loqui.refspec(), Refspec::Branch(b) if b == "main"));
+        assert!(matches!(tp("loqui", loqui).refspec(), Refspec::Branch(b) if b == "main"));
     }
 
     #[test]
@@ -1126,10 +1447,13 @@ include = ["only-this"]
         .expect("local parses");
 
         let effective = merge_configs(base, Some(local));
-        let company = effective
-            .sources
-            .get("company-configs")
-            .expect("company-configs kept");
+        let company = tp(
+            "company-configs",
+            effective
+                .sources
+                .get("company-configs")
+                .expect("company-configs kept"),
+        );
         assert_eq!(company.includes(), ["only-this"]);
     }
 
@@ -1148,10 +1472,13 @@ include = []
         .expect("local parses");
 
         let effective = merge_configs(base, Some(local));
-        let company = effective
-            .sources
-            .get("company-configs")
-            .expect("company-configs kept");
+        let company = tp(
+            "company-configs",
+            effective
+                .sources
+                .get("company-configs")
+                .expect("company-configs kept"),
+        );
         assert!(
             company.includes().is_empty(),
             "an explicit empty `include = []` in local must replace (clear) the base array, \
@@ -1269,11 +1596,8 @@ branch = "main"
         .expect("local parses");
 
         let effective = merge_configs(base, Some(local));
-        let policy = effective
-            .sources
-            .get("loqui")
-            .expect("loqui kept")
-            .export_policy();
+        let policy =
+            tp("loqui", effective.sources.get("loqui").expect("loqui kept")).export_policy();
 
         assert!(
             policy.allow_symlinks,
@@ -1589,9 +1913,14 @@ branch = "main"
 
     #[test]
     fn config_digest_ignores_deploy_for_lock_stability() {
-        let without = parse_source("root = \"languages\"\ninclude = [\"editor\"]\n");
-        let with_link =
-            parse_source("root = \"languages\"\ninclude = [\"editor\"]\ndeploy = \"link\"\n");
+        let without = tp(
+            "s",
+            &parse_source("root = \"languages\"\ninclude = [\"editor\"]\n"),
+        );
+        let with_link = tp(
+            "s",
+            &parse_source("root = \"languages\"\ninclude = [\"editor\"]\ndeploy = \"link\"\n"),
+        );
         assert_eq!(
             with_link.config_digest(),
             without.config_digest(),
@@ -2075,7 +2404,10 @@ repo = "srnnkls/tropos"
             .expect("a source with `repo` but no `host` defaults host to github and parses");
         cfg.validate()
             .expect("a bare-repo source must validate (host defaults to github)");
-        let tropos = cfg.sources.get("tropos").expect("tropos source present");
+        let tropos = tp(
+            "tropos",
+            cfg.sources.get("tropos").expect("tropos source present"),
+        );
         assert_eq!(
             tropos
                 .resolved_remote(&BTreeMap::new(), Protocol::Https)
@@ -2182,8 +2514,10 @@ protocol = "ssh"
         cfg.validate()
             .expect("the shipped phora.example.toml must pass post-merge validation");
 
-        let url_source = cfg
-            .sources
+        let parsed = cfg
+            .parsed_sources()
+            .expect("shipped example parses to typed form");
+        let url_source = parsed
             .values()
             .find(|source| source.mode() == SourceMode::Url)
             .expect("the shipped phora.example.toml must demonstrate a url source");
@@ -2196,15 +2530,10 @@ protocol = "ssh"
             "the example url source must use an https url, got `{url}`"
         );
 
-        let digest = url_source
-            .digest
-            .as_deref()
-            .expect("the example url source must carry an integrity `digest`");
-        digest
-            .parse::<crate::kernel::Digest>()
-            .unwrap_or_else(|err| {
-                panic!("the example url source `digest` must be well-formed: {digest} ({err})")
-            });
+        assert!(
+            url_source.digest().is_some(),
+            "the example url source must carry a well-formed integrity `digest`"
+        );
     }
 
     // HAS-002: resolved_remote + single built-in forge registry
@@ -2213,12 +2542,13 @@ protocol = "ssh"
         Config::parse(toml).expect("hosts toml parses").hosts
     }
 
-    fn source_of(toml: &str, name: &str) -> Source {
-        Config::parse(toml)
+    fn source_of(toml: &str, name: &str) -> ParsedSource {
+        let raw = Config::parse(toml)
             .expect("source toml parses")
             .sources
             .remove(name)
-            .expect("named source present")
+            .expect("named source present");
+        ParsedSource::parse(name, &raw).expect("named source parses to typed form")
     }
 
     #[test]
@@ -2529,7 +2859,7 @@ path = "srnnkls/tropos"
         let s = parse_url_source("url = \"https://example.com/foo.tar.gz\"\n")
             .expect("a url-only source must parse");
         assert_eq!(
-            s.source_url(),
+            tp("s", &s).source_url(),
             Some("https://example.com/foo.tar.gz"),
             "source_url() must return the configured url for a url-mode source"
         );
@@ -2545,7 +2875,7 @@ path = "srnnkls/tropos"
 
     #[test]
     fn non_url_source_has_no_source_url() {
-        let git_mode = parse_source("");
+        let git_mode = tp("s", &parse_source(""));
         assert_eq!(
             git_mode.source_url(),
             None,
@@ -2715,7 +3045,7 @@ root = "subdir"
             .merged_with(local);
 
         assert_eq!(
-            merged.source_url(),
+            tp("pkg", &merged).source_url(),
             Some("https://example.com/foo.tar.gz"),
             "a local url override must switch the merged source into url mode"
         );
@@ -2860,13 +3190,14 @@ url = ""
 
     // HTP-005 A: Source::mode() and Refspec::None
 
-    fn config_source(name: &str, body: &str) -> Source {
+    fn config_source(name: &str, body: &str) -> ParsedSource {
         let toml = format!("version = 1\n\n[sources.{name}]\n{body}");
-        Config::parse(&toml)
+        let raw = Config::parse(&toml)
             .expect("source config parses")
             .sources
             .remove(name)
-            .expect("named source present")
+            .expect("named source present");
+        ParsedSource::parse(name, &raw).expect("named source parses to typed form")
     }
 
     #[test]
@@ -2963,8 +3294,11 @@ url = ""
 
     #[test]
     fn path_key_is_a_local_source_resolving_to_the_local_path_verbatim() {
-        let local = parse_kind_source("loqui", "path = \"/home/me/dev/loqui\"\n")
-            .expect("a `path = \"/abs/local\"` source must parse as a local source");
+        let local = tp(
+            "loqui",
+            &parse_kind_source("loqui", "path = \"/home/me/dev/loqui\"\n")
+                .expect("a `path = \"/abs/local\"` source must parse as a local source"),
+        );
         assert_eq!(
             local
                 .resolved_remote(&BTreeMap::new(), Protocol::Https)
@@ -2977,10 +3311,16 @@ url = ""
 
     #[test]
     fn path_local_source_resolves_identically_to_git_localpath_alias() {
-        let via_path =
-            parse_kind_source("a", "path = \"/home/me/dev/loqui\"\n").expect("local `path` parses");
-        let via_git_alias = parse_kind_source("b", "git = \"/home/me/dev/loqui\"\n")
-            .expect("`git = <localpath>` alias parses");
+        let via_path = tp(
+            "a",
+            &parse_kind_source("a", "path = \"/home/me/dev/loqui\"\n")
+                .expect("local `path` parses"),
+        );
+        let via_git_alias = tp(
+            "b",
+            &parse_kind_source("b", "git = \"/home/me/dev/loqui\"\n")
+                .expect("`git = <localpath>` alias parses"),
+        );
         assert_eq!(
             via_path
                 .resolved_remote(&BTreeMap::new(), Protocol::Https)
@@ -2995,8 +3335,11 @@ url = ""
 
     #[test]
     fn host_plus_repo_is_a_forge_source_resolving_to_the_github_remote() {
-        let forge = parse_kind_source("tropos", "host = \"github\"\nrepo = \"srnnkls/tropos\"\n")
-            .expect("a host + repo forge source must parse");
+        let forge = tp(
+            "tropos",
+            &parse_kind_source("tropos", "host = \"github\"\nrepo = \"srnnkls/tropos\"\n")
+                .expect("a host + repo forge source must parse"),
+        );
         assert_eq!(
             forge
                 .resolved_remote(&BTreeMap::new(), Protocol::Https)
@@ -3020,7 +3363,7 @@ repo = "srnnkls/tropos"
         .expect("a bare `repo` (no host) must parse, defaulting to github");
         cfg.validate()
             .expect("a bare-repo source must validate (host defaults to github)");
-        let forge = cfg.sources.get("tropos").expect("tropos present");
+        let forge = tp("tropos", cfg.sources.get("tropos").expect("tropos present"));
         assert_eq!(
             forge
                 .resolved_remote(&BTreeMap::new(), Protocol::Https)
@@ -3033,8 +3376,11 @@ repo = "srnnkls/tropos"
 
     #[test]
     fn host_plus_path_is_a_deprecated_forge_alias() {
-        let forge = parse_kind_source("tropos", "host = \"github\"\npath = \"srnnkls/tropos\"\n")
-            .expect("host + path (deprecated forge alias) must still parse");
+        let forge = tp(
+            "tropos",
+            &parse_kind_source("tropos", "host = \"github\"\npath = \"srnnkls/tropos\"\n")
+                .expect("host + path (deprecated forge alias) must still parse"),
+        );
         assert_eq!(
             forge
                 .resolved_remote(&BTreeMap::new(), Protocol::Https)
@@ -3047,8 +3393,11 @@ repo = "srnnkls/tropos"
 
     #[test]
     fn host_plus_path_alias_resolves_a_tilde_anchored_forge_owner() {
-        let forge = parse_kind_source("aerc", "host = \"sr.ht\"\npath = \"~rjarry/aerc\"\n")
-            .expect("a host + path alias whose owner starts with ~ must still parse as forge");
+        let forge = tp(
+            "aerc",
+            &parse_kind_source("aerc", "host = \"sr.ht\"\npath = \"~rjarry/aerc\"\n")
+                .expect("a host + path alias whose owner starts with ~ must still parse as forge"),
+        );
         assert_eq!(
             forge
                 .resolved_remote(&BTreeMap::new(), Protocol::Https)
@@ -3061,8 +3410,11 @@ repo = "srnnkls/tropos"
 
     #[test]
     fn bare_path_owner_repo_is_now_a_local_path_not_a_github_remote() {
-        let local = parse_kind_source("x", "path = \"owner/repo\"\n").expect(
-            "the OLD github shorthand `path = \"owner/repo\"` must now parse as a LOCAL source",
+        let local = tp(
+            "x",
+            &parse_kind_source("x", "path = \"owner/repo\"\n").expect(
+                "the OLD github shorthand `path = \"owner/repo\"` must now parse as a LOCAL source",
+            ),
         );
         assert_eq!(
             local
@@ -3083,8 +3435,11 @@ repo = "srnnkls/tropos"
 
     #[test]
     fn git_url_and_url_keys_are_unchanged_for_their_kinds() {
-        let git = parse_kind_source("g", "git = \"https://github.com/me/x.git\"\n")
-            .expect("a real git URL source still parses");
+        let git = tp(
+            "g",
+            &parse_kind_source("g", "git = \"https://github.com/me/x.git\"\n")
+                .expect("a real git URL source still parses"),
+        );
         assert_eq!(
             git.resolved_remote(&BTreeMap::new(), Protocol::Https)
                 .expect("git URL resolves verbatim"),
@@ -3092,8 +3447,11 @@ repo = "srnnkls/tropos"
             "a `git = <url>` remote source is unchanged: it resolves verbatim"
         );
 
-        let url = parse_url_source("url = \"https://example.com/foo.tar.gz\"\n")
-            .expect("a url source still parses");
+        let url = tp(
+            "u",
+            &parse_url_source("url = \"https://example.com/foo.tar.gz\"\n")
+                .expect("a url source still parses"),
+        );
         assert_eq!(
             url.source_url(),
             Some("https://example.com/foo.tar.gz"),
@@ -3124,10 +3482,12 @@ git = "https://github.com/me/x.git"
 
     #[test]
     fn path_under_host_is_the_forge_alias_regardless_of_shape() {
-        let forge = parse_kind_source("dual", "path = \"/home/me/dev/x\"\nhost = \"github\"\n")
-            .expect(
+        let forge = tp(
+            "dual",
+            &parse_kind_source("dual", "path = \"/home/me/dev/x\"\nhost = \"github\"\n").expect(
                 "`host` + a local-looking `path` is the deprecated forge alias, not a conflict",
-            );
+            ),
+        );
         assert_eq!(
             forge.mode(),
             SourceMode::Host,
@@ -3263,7 +3623,7 @@ tag = "v1.0"
             "a local-path override must not leave any other-kind remote set"
         );
         assert_eq!(
-            merged
+            tp("loqui", &merged)
                 .resolved_remote(&BTreeMap::new(), Protocol::Https)
                 .expect("merged local resolves"),
             "/home/me/dev/loqui",
@@ -3274,16 +3634,22 @@ tag = "v1.0"
 
     #[test]
     fn config_digest_is_unchanged_across_the_path_to_repo_rename() {
-        let forge = parse_kind_source(
+        let forge = tp(
             "tropos",
-            "host = \"github\"\nrepo = \"srnnkls/tropos\"\nroot = \"languages\"\ninclude = [\"editor\"]\n",
-        )
-        .expect("repo-key forge source parses");
-        let alias = parse_kind_source(
+            &parse_kind_source(
+                "tropos",
+                "host = \"github\"\nrepo = \"srnnkls/tropos\"\nroot = \"languages\"\ninclude = [\"editor\"]\n",
+            )
+            .expect("repo-key forge source parses"),
+        );
+        let alias = tp(
             "tropos",
-            "host = \"github\"\npath = \"srnnkls/tropos\"\nroot = \"languages\"\ninclude = [\"editor\"]\n",
-        )
-        .expect("path-alias forge source parses");
+            &parse_kind_source(
+                "tropos",
+                "host = \"github\"\npath = \"srnnkls/tropos\"\nroot = \"languages\"\ninclude = [\"editor\"]\n",
+            )
+            .expect("path-alias forge source parses"),
+        );
         assert_eq!(
             forge.config_digest(),
             alias.config_digest(),
