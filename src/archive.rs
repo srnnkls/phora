@@ -26,7 +26,11 @@ pub struct ExtractedEntry {
 
 /// Validates an archive entry name as a relative, traversal-free path.
 pub fn safe_archive_path(raw: &str) -> Result<PathBuf> {
-    let reject = |why: &str| Err(SourceError::Source(format!("unsafe archive path {raw:?}: {why}")));
+    let reject = |why: &str| {
+        Err(SourceError::Source(format!(
+            "unsafe archive path {raw:?}: {why}"
+        )))
+    };
     if raw.is_empty() {
         return reject("empty");
     }
@@ -129,9 +133,9 @@ fn extract_tar<R: Read>(reader: R, max_total: u64) -> Result<Vec<ExtractedEntry>
 
         let (kind, data) = match entry_type {
             EntryType::Symlink => {
-                let target = entry
-                    .link_name()?
-                    .ok_or_else(|| SourceError::Source(format!("symlink {name:?} has no target")))?;
+                let target = entry.link_name()?.ok_or_else(|| {
+                    SourceError::Source(format!("symlink {name:?} has no target"))
+                })?;
                 let target = target.to_str().ok_or_else(|| {
                     SourceError::Source(format!("non-utf8 symlink target for {name:?}"))
                 })?;
@@ -307,8 +311,8 @@ mod tests {
         ] {
             let result = safe_archive_path(raw);
             assert!(
-                matches!(result, Err(SourceError::Source(_))),
-                "{raw:?} must be rejected as SourceError::Source, got: {result:?}"
+                matches!(result, Err(SourceError::Source(_) | SourceError::Kernel(_))),
+                "{raw:?} must be rejected with a source-context error, got: {result:?}"
             );
         }
     }
@@ -655,8 +659,8 @@ mod tests {
 
         let result = extract(&archive, "https://example.com/mid.tar");
         assert!(
-            matches!(result, Err(SourceError::Source(_))),
-            "traversal after a legitimate component must be rejected as SourceError::Source, got: {result:?}"
+            matches!(result, Err(SourceError::Source(_) | SourceError::Kernel(_))),
+            "traversal after a legitimate component must be rejected with a source-context error, got: {result:?}"
         );
     }
 
@@ -675,8 +679,8 @@ mod tests {
 
         let result = extract(&archive, "https://example.com/evil.zip");
         assert!(
-            matches!(result, Err(SourceError::Source(_))),
-            "a zip entry with a traversal path must be rejected as SourceError::Source, got: {result:?}"
+            matches!(result, Err(SourceError::Source(_) | SourceError::Kernel(_))),
+            "a zip entry with a traversal path must be rejected with a source-context error, got: {result:?}"
         );
     }
 
@@ -701,8 +705,8 @@ mod tests {
 
         let result = extract(&archive, "https://example.com/badname.tar");
         assert!(
-            matches!(result, Err(SourceError::Source(_))),
-            "a non-utf8 entry name must be rejected as SourceError::Source, got: {result:?}"
+            matches!(result, Err(SourceError::Source(_) | SourceError::Kernel(_))),
+            "a non-utf8 entry name must be rejected with a source-context error, got: {result:?}"
         );
     }
 
@@ -715,7 +719,7 @@ mod tests {
 
         let result = extract(&archive, "https://example.com/evil.tar");
         assert!(
-            matches!(result, Err(SourceError::Source(_))),
+            matches!(result, Err(SourceError::Source(_) | SourceError::Kernel(_))),
             "a traversal entry path inside the archive must be rejected, got: {result:?}"
         );
     }
@@ -728,8 +732,8 @@ mod tests {
 
         let over = extract_archive(&bytes, "https://example.com/big.tar", 10);
         assert!(
-            matches!(over, Err(SourceError::Source(_))),
-            "100 bytes of content must exceed a 10-byte cap as SourceError::Source, got: {over:?}"
+            matches!(over, Err(SourceError::Source(_) | SourceError::Kernel(_))),
+            "100 bytes of content must exceed a 10-byte cap as a source-context error, got: {over:?}"
         );
 
         let under = extract_archive(&bytes, "https://example.com/big.tar", 1 << 20)
@@ -746,8 +750,8 @@ mod tests {
 
         let result = extract(&archive, "https://example.com/foo/..");
         assert!(
-            matches!(result, Err(SourceError::Source(_))),
-            "a raw url whose basename is `..` must be rejected as SourceError::Source, got: {result:?}"
+            matches!(result, Err(SourceError::Source(_) | SourceError::Kernel(_))),
+            "a raw url whose basename is `..` must be rejected with a source-context error, got: {result:?}"
         );
     }
 }

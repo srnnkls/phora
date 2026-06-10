@@ -3,6 +3,11 @@
 //! Bounded contexts own their own enums ([`crate::source::SourceError`],
 //! [`crate::store::StoreError`]); this type aggregates them via `From` for
 //! propagation and exit-code mapping at the binary boundary.
+//!
+//! Construction rule: port adapters raise their context enum; orchestration
+//! code (`sync`, `deploy`, `cli`) and kernel value objects construct this edge
+//! type directly. The remaining message-bearing variants exist for the latter
+//! — do not add new context-owned failures here.
 
 use thiserror::Error;
 

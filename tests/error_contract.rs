@@ -95,10 +95,11 @@ fn cli_edge_error_converts_from_store_error_preserving_text() {
 fn source_backend_methods_return_source_error() {
     let fixture = GitArtifactFixture::build();
 
-    let typed: Result<u64, SourceError> =
-        fixture
-            .backend
-            .commit_time(&sn("dots"), &fixture.url, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+    let typed: Result<u64, SourceError> = fixture.backend.commit_time(
+        &sn("dots"),
+        &fixture.url,
+        "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    );
 
     assert!(
         typed.is_err(),
@@ -129,7 +130,9 @@ impl GitArtifactFixture {
         let git_dir = TempDir::new().expect("git dir tempdir");
         let backend = GitBackend::new(git_dir.path().to_path_buf());
         let url = root.to_string_lossy().into_owned();
-        backend.fetch(&sn("dots"), &url).expect("fetch builds mirror");
+        backend
+            .fetch(&sn("dots"), &url)
+            .expect("fetch builds mirror");
 
         Self {
             _src: src,

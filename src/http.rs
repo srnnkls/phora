@@ -89,8 +89,8 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use crate::http::{download, verify_digest};
-    use crate::source::SourceError;
     use crate::kernel::Digest;
+    use crate::source::SourceError;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::str::FromStr as _;
