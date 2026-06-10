@@ -3,15 +3,14 @@ checkpoint:
   scope_path: ./scopes/active/architecture-cleanup
   branch: chore/architecture-cleanup
   base: main
-  last_commit: af20620
-  last_batch: 5
+  last_commit: 7e5b234
+  last_batch: 6
   tasks:
-    done: [ARCH-000, ARCH-001, ARCH-002, ARCH-003, ARCH-004, ARCH-005, ARCH-006, ARCH-007, ARCH-008, ARCH-009, ARCH-010]
-    pending: [ARCH-011, ARCH-012, ARCH-013]
-  next_batch:
-    number: 6
-    tasks: [ARCH-011]   # relocate: projection->deploy/, registry->store/, matcher->kernel/selection, config.rs->config/, paths.rs->kernel/path. Depends on ARCH-002 (done). Pure file moves + path fixups; mechanical/zero-churn. NOTE: gix-confinement grep currently reads against flat source.rs — ARCH-011 may move source.rs into source/; update the grep rule accordingly. ARCH-012/013 are optional stretch (per-context errors / crate split) — descope freely.
-  phase: phase-3-internals
+    done: [ARCH-000, ARCH-001, ARCH-002, ARCH-003, ARCH-004, ARCH-005, ARCH-006, ARCH-007, ARCH-008, ARCH-009, ARCH-010, ARCH-011]
+    descoped: [ARCH-012, ARCH-013]
+    pending: []
+  next_batch: null   # SCOPE COMPLETE. All Phase 0-3 tasks done; ARCH-012 (per-context errors) + ARCH-013 (crate split) descoped per user decision. Run /scope done.
+  phase: phase-3-internals-complete
   selection_seam: "src/kernel/selection.rs::Selection — sole artifact-membership + dotfile policy; consumed by source.rs (git discovery), sync/discover.rs (link discovery + foreign scan), cli/query.rs (check-match)"
   layout_note: "sync/ a DIR (mod+resolve+discover+target+prune+verify+rebuild+tests) after ARCH-009. cli/ now a DIR (mod+add+render+query+sync+tests) after ARCH-010: render.rs is the sole struct-driven output producer; build_router (in mod.rs) names concrete GitBackend/HttpBackend. Still flat: src/source.rs, src/archive.rs, src/backend.rs, src/config.rs, src/paths.rs, src/projection.rs, src/registry.rs, src/matcher.rs — these are ARCH-011's relocation targets. gix-confinement grep still reads against flat source.rs."
   invariants:

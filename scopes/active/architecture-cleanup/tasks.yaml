@@ -132,19 +132,19 @@ tasks:
       - "argv parsing separated from business logic; cli/render.rs is the sole string/JSON producer; wire() names concrete adapters"
 
   - id: ARCH-011
-    content: "Relocate projection->deploy/, registry->store/, matcher->kernel/selection, config.rs->config/, paths.rs->kernel/path"
-    status: pending
+    content: "Relocate projection->deploy, registry->store; split config.rs->config/; ProjectId->kernel"
+    status: done   # zero-churn (7e5b234); opus+sonnet confirmed body-identical across all 4 moves. projection->deploy + registry->store module renames (public path phora::deploy/phora::store); config.rs (3660 lines) split into config/{mod,host,source,target,tests} keeping the `config` module name (35 crate::config:: paths preserved via pub use); paths.rs SPLIT per user decision: ProjectId (value newtype) -> kernel/project_id.rs (crate::kernel::ProjectId), phora_dir (home-dir IO) stays src/paths.rs out of the pure kernel. matcher->kernel/selection was already done in ARCH-002. source.rs left flat (gix already confined; no enforced grep test exists). Post-review: tightened 5 config fns pub(crate)->pub(super)/private (sonnet Low).
     activeForm: "Relocating contexts"
     depends_on: [ARCH-002]
 
   - id: ARCH-012
-    content: "(optional, with ARCH-013) per-context error enums"
-    status: pending
+    content: "(descoped) per-context error enums"
+    status: descoped   # user decision 2026-06-10 after consulting /loqui + the ripgrep/BurntSushi error-handling reference: per-context enums are over-engineering for this binary. Empirical basis: EVERY match/matches! on an Error variant is in #[cfg(test)] code (~44 assertions); ZERO production sites match variants (330 construct-and-propagate; main() prints via Display). loqui's caller-intent rule (split by who reads the error, not Cargo target) + both original scope reviewers (OE3) converge: no production caller distinguishes variants, so typed per-context errors add churn (44 test rewrites + wrapper) with no production value. Kept the single crate-wide thiserror Error.
     activeForm: "Splitting the crate-wide error enum"
-    depends_on: [ARCH-009, ARCH-011, ARCH-013]
+    depends_on: [ARCH-009, ARCH-011]
 
   - id: ARCH-013
-    content: "(optional/stretch) phora-core / phora-cli crate split"
-    status: pending
+    content: "(descoped) phora-core / phora-cli crate split"
+    status: descoped   # user decision 2026-06-10: stop after ARCH-012; both reviewers flagged crate split premature (OE3). No external lib consumers.
     activeForm: "Splitting into core + cli crates"
     depends_on: [ARCH-010, ARCH-011]
