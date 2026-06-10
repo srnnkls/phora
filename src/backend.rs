@@ -6,7 +6,7 @@ use std::path::Path;
 
 use crate::config::{Refspec, SourceMode};
 use crate::error::Result;
-use crate::kernel::Selection;
+use crate::kernel::{ArtifactName, Selection, SourceName};
 use crate::source::{ExportRequest, ExportResult, SourceBackend};
 
 /// Routes each `SourceBackend` call to `git` or `http` by the source's declared
@@ -15,21 +15,21 @@ use crate::source::{ExportRequest, ExportResult, SourceBackend};
 pub struct RouterBackend<G, H> {
     git: G,
     http: H,
-    modes: BTreeMap<String, SourceMode>,
+    modes: BTreeMap<SourceName, SourceMode>,
 }
 
 impl<G, H> RouterBackend<G, H> {
-    pub fn new(git: G, http: H, modes: BTreeMap<String, SourceMode>) -> Self {
+    pub fn new(git: G, http: H, modes: BTreeMap<SourceName, SourceMode>) -> Self {
         Self { git, http, modes }
     }
 
-    fn is_url(&self, source: &str) -> bool {
+    fn is_url(&self, source: &SourceName) -> bool {
         matches!(self.modes.get(source), Some(SourceMode::Url))
     }
 }
 
 impl<G: SourceBackend, H: SourceBackend> RouterBackend<G, H> {
-    fn route(&self, source: &str) -> &dyn SourceBackend {
+    fn route(&self, source: &SourceName) -> &dyn SourceBackend {
         if self.is_url(source) {
             &self.http
         } else {
@@ -39,26 +39,26 @@ impl<G: SourceBackend, H: SourceBackend> RouterBackend<G, H> {
 }
 
 impl<G: SourceBackend, H: SourceBackend> SourceBackend for RouterBackend<G, H> {
-    fn fetch(&self, source: &str, url: &str) -> Result<()> {
+    fn fetch(&self, source: &SourceName, url: &str) -> Result<()> {
         self.route(source).fetch(source, url)
     }
 
-    fn resolve(&self, source: &str, url: &str, refspec: &Refspec) -> Result<String> {
+    fn resolve(&self, source: &SourceName, url: &str, refspec: &Refspec) -> Result<String> {
         self.route(source).resolve(source, url, refspec)
     }
 
-    fn commit_time(&self, source: &str, url: &str, commit: &str) -> Result<u64> {
+    fn commit_time(&self, source: &SourceName, url: &str, commit: &str) -> Result<u64> {
         self.route(source).commit_time(source, url, commit)
     }
 
     fn discover_artifacts(
         &self,
-        source: &str,
+        source: &SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
         selection: &Selection,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<ArtifactName>> {
         self.route(source)
             .discover_artifacts(source, url, commit, root, selection)
     }
@@ -69,7 +69,7 @@ impl<G: SourceBackend, H: SourceBackend> SourceBackend for RouterBackend<G, H> {
 
     fn compute_digest(
         &self,
-        source: &str,
+        source: &SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
@@ -95,10 +95,14 @@ mod tests {
 
     use crate::config::{Refspec, SourceMode};
     use crate::error::{Error, Result};
-    use crate::kernel::Selection;
+    use crate::kernel::{ArtifactName, Selection, SourceName};
     use crate::source::{
         ExportRequest, ExportResult, GitBackend, HttpBackend, RouterBackend, SourceBackend,
     };
+
+    fn sn(name: &str) -> SourceName {
+        SourceName::new(name)
+    }
 
     // ── local http server serving a real .tar.gz ───────────────────
 
@@ -220,28 +224,28 @@ mod tests {
         let http = HttpBackend::new(git_dir.path().to_path_buf(), BTreeMap::new());
 
         let mut modes = BTreeMap::new();
-        modes.insert("g".to_string(), SourceMode::Git);
-        modes.insert("u".to_string(), SourceMode::Url);
+        modes.insert(sn("g"), SourceMode::Git);
+        modes.insert(sn("u"), SourceMode::Url);
         let router = RouterBackend::new(git, http, modes);
 
         router
-            .fetch("g", &g_url)
+            .fetch(&sn("g"), &g_url)
             .expect("router fetches git source");
         router
-            .fetch("u", &u_url)
+            .fetch(&sn("u"), &u_url)
             .expect("router fetches url source");
 
         // url source resolved with a bogus git ref: only succeeds if routed to Http
         // (which ignores the refspec and reads refs/heads/phora).
         let u_commit = router
-            .resolve("u", &u_url, &Refspec::Branch("main".into()))
+            .resolve(&sn("u"), &u_url, &Refspec::Branch("main".into()))
             .expect("url source must route to Http and resolve despite a git-style refspec");
         assert_eq!(u_commit.len(), 40, "synthetic phora commit is 40-hex");
 
         // git source resolved with Refspec::None would fail on Http; routing to Git
         // with Branch(main) is what makes it succeed and match the real head.
         let g_commit = router
-            .resolve("g", &g_url, &Refspec::Branch("main".into()))
+            .resolve(&sn("g"), &g_url, &Refspec::Branch("main".into()))
             .expect("git source must route to Git and resolve branch main");
         assert_eq!(
             g_commit, g_head,
@@ -262,11 +266,12 @@ mod tests {
         let git_dir = TempDir::new().expect("git_dir tempdir");
 
         let http = HttpBackend::new(git_dir.path().to_path_buf(), BTreeMap::new());
-        http.fetch("u", &u_url).expect("import synthetic mirror");
+        http.fetch(&sn("u"), &u_url)
+            .expect("import synthetic mirror");
 
         let git = GitBackend::new(git_dir.path().to_path_buf());
         assert!(
-            git.resolve("u", &u_url, &Refspec::Branch("main".into()))
+            git.resolve(&sn("u"), &u_url, &Refspec::Branch("main".into()))
                 .is_err(),
             "a url source mis-sent to Git with Branch(main) must fail: there is no such branch, \
              only refs/heads/phora. This is why dispatch-on-mode (not url-scheme) is load-bearing."
@@ -284,28 +289,28 @@ mod tests {
     }
 
     impl SourceBackend for Spy {
-        fn fetch(&self, source: &str, _url: &str) -> Result<()> {
+        fn fetch(&self, source: &SourceName, _url: &str) -> Result<()> {
             self.fetches.borrow_mut().push(source.to_string());
             Ok(())
         }
 
-        fn resolve(&self, source: &str, _url: &str, _refspec: &Refspec) -> Result<String> {
+        fn resolve(&self, source: &SourceName, _url: &str, _refspec: &Refspec) -> Result<String> {
             self.resolves.borrow_mut().push(source.to_string());
             Ok(format!("resolved-{source}"))
         }
 
-        fn commit_time(&self, _source: &str, _url: &str, _commit: &str) -> Result<u64> {
+        fn commit_time(&self, _source: &SourceName, _url: &str, _commit: &str) -> Result<u64> {
             Ok(0)
         }
 
         fn discover_artifacts(
             &self,
-            source: &str,
+            source: &SourceName,
             _url: &str,
             _commit: &str,
             _root: Option<&Path>,
             _selection: &Selection,
-        ) -> Result<Vec<String>> {
+        ) -> Result<Vec<ArtifactName>> {
             self.discovers.borrow_mut().push(source.to_string());
             Ok(vec![])
         }
@@ -316,7 +321,7 @@ mod tests {
 
         fn compute_digest(
             &self,
-            source: &str,
+            source: &SourceName,
             _url: &str,
             _commit: &str,
             _root: Option<&Path>,
@@ -328,7 +333,7 @@ mod tests {
     }
 
     // git and http share recorded state with their in-router twins via Rc.
-    fn spy_router(modes: BTreeMap<String, SourceMode>) -> (RouterBackend<Spy, Spy>, Spy, Spy) {
+    fn spy_router(modes: BTreeMap<SourceName, SourceMode>) -> (RouterBackend<Spy, Spy>, Spy, Spy) {
         let git = Spy::default();
         let http = Spy::default();
         let router = RouterBackend::new(git.clone(), http.clone(), modes);
@@ -338,22 +343,22 @@ mod tests {
     #[test]
     fn dispatch_sends_url_mode_to_http_and_git_mode_to_git_by_name() {
         let mut modes = BTreeMap::new();
-        modes.insert("g".to_string(), SourceMode::Git);
-        modes.insert("u".to_string(), SourceMode::Url);
+        modes.insert(sn("g"), SourceMode::Git);
+        modes.insert(sn("u"), SourceMode::Url);
         let (router, git, http) = spy_router(modes);
 
         router
-            .fetch("g", "https://example.com/o/r.git")
+            .fetch(&sn("g"), "https://example.com/o/r.git")
             .expect("git fetch");
         router
-            .fetch("u", "https://example.com/pkg.tar.gz")
+            .fetch(&sn("u"), "https://example.com/pkg.tar.gz")
             .expect("url fetch");
         router
-            .resolve("u", "https://example.com/pkg.tar.gz", &Refspec::None)
+            .resolve(&sn("u"), "https://example.com/pkg.tar.gz", &Refspec::None)
             .expect("url resolve");
         router
             .resolve(
-                "g",
+                &sn("g"),
                 "https://example.com/o/r.git",
                 &Refspec::Branch("main".into()),
             )
@@ -386,11 +391,11 @@ mod tests {
         // Routing must be by declared mode, never by url scheme/suffix. A `.git`
         // url under SourceMode::Git must hit the git backend, never http.
         let mut modes = BTreeMap::new();
-        modes.insert("g".to_string(), SourceMode::Git);
+        modes.insert(sn("g"), SourceMode::Git);
         let (router, git, http) = spy_router(modes);
 
         router
-            .fetch("g", "https://example.com/o/r.git")
+            .fetch(&sn("g"), "https://example.com/o/r.git")
             .expect("git fetch");
 
         assert_eq!(
@@ -407,16 +412,16 @@ mod tests {
     #[test]
     fn discover_and_digest_dispatch_by_mode() {
         let mut modes = BTreeMap::new();
-        modes.insert("u".to_string(), SourceMode::Url);
-        modes.insert("g".to_string(), SourceMode::Git);
+        modes.insert(sn("u"), SourceMode::Url);
+        modes.insert(sn("g"), SourceMode::Git);
         let (router, git, http) = spy_router(modes);
         let m = empty_selection();
 
         router
-            .discover_artifacts("u", "http://x/pkg.tgz", "c", None, &m)
+            .discover_artifacts(&sn("u"), "http://x/pkg.tgz", "c", None, &m)
             .expect("url discover");
         router
-            .compute_digest("g", "https://x/y.git", "c", None, &m)
+            .compute_digest(&sn("g"), "https://x/y.git", "c", None, &m)
             .expect("git digest");
 
         assert!(
@@ -450,7 +455,7 @@ mod tests {
         // A name absent from the modes map must resolve to the git backend (the
         // default), never panic and never silently hit http.
         let (router, git, http) = spy_router(BTreeMap::new());
-        let _ = router.fetch("mystery", "https://example.com/o/r.git");
+        let _ = router.fetch(&sn("mystery"), "https://example.com/o/r.git");
         assert_eq!(
             git.fetches.borrow().as_slice(),
             ["mystery"],
@@ -465,11 +470,11 @@ mod tests {
     #[test]
     fn router_is_usable_as_dyn_source_backend() {
         let mut modes = BTreeMap::new();
-        modes.insert("g".to_string(), SourceMode::Git);
+        modes.insert(sn("g"), SourceMode::Git);
         let (router, _git, _http) = spy_router(modes);
         let as_dyn: &dyn SourceBackend = &router;
         let result = as_dyn
-            .resolve("g", "https://x/y.git", &Refspec::Branch("main".into()))
+            .resolve(&sn("g"), "https://x/y.git", &Refspec::Branch("main".into()))
             .expect("router is a SourceBackend so sync(&dyn SourceBackend) keeps working");
         assert_eq!(
             result, "resolved-g",

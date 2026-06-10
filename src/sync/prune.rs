@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use crate::config::{Config, ParsedSource};
 use crate::error::{Error, Result};
-use crate::kernel::Selection;
+use crate::kernel::{Selection, SourceName};
 use crate::source::SourceBackend;
 use crate::store::{ArtifactKey, Registry};
 
@@ -25,11 +25,12 @@ pub(super) fn prune_orphans(
             })?;
             let commit = &resolved_commits[source_name];
             let git = remote_for(remotes, source_name)?;
+            let source_name = SourceName::new(source_name);
             let selection = Selection::new(source.includes(), source.excludes())?;
             let discovered = discover_artifacts_for_source(
                 source,
                 git,
-                source_name,
+                &source_name,
                 commit,
                 backend,
                 &selection,
@@ -37,8 +38,8 @@ pub(super) fn prune_orphans(
             for artifact in discovered {
                 expected.insert(ArtifactKey {
                     target: target_name.clone(),
-                    source: source_name.to_owned(),
-                    artifact,
+                    source: source_name.as_str().to_owned(),
+                    artifact: artifact.as_str().to_owned(),
                 });
             }
         }

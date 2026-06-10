@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{Config, DeployMode, LayoutKind, ParsedSource, Target};
 use crate::error::{Error, Result};
-use crate::kernel::Selection;
+use crate::kernel::{ArtifactName, Selection, SourceName};
 use crate::lock::Lock;
 use crate::source::{ExportRequest, SourceBackend};
 use crate::store::{ArtifactKey, ManifestFile, Registry, RegistryRecord};
@@ -49,13 +49,14 @@ pub fn rebuild_registry(
             })?;
             let commit = &locked.commit;
             let git = remote_for(&remotes, source_name)?;
+            let source_name = SourceName::new(source_name);
             let selection = Selection::new(source.includes(), source.excludes())?;
             selections.push(selection.clone());
             let policy = source.export_policy();
             let discovered = discover_artifacts_for_source(
                 source,
                 git,
-                source_name,
+                &source_name,
                 commit,
                 backend,
                 &selection,
@@ -64,12 +65,14 @@ pub fn rebuild_registry(
             for artifact in discovered {
                 let key = ArtifactKey {
                     target: target_name.clone(),
-                    source: source_name.to_owned(),
-                    artifact: artifact.clone(),
+                    source: source_name.as_str().to_owned(),
+                    artifact: artifact.as_str().to_owned(),
                 };
-                let artifact_dst = target
-                    .expanded_path()
-                    .join(target.layout().artifact_path(source_name, &artifact));
+                let artifact_dst = target.expanded_path().join(
+                    target
+                        .layout()
+                        .artifact_path(source_name.as_str(), artifact.as_str()),
+                );
 
                 match source.deploy_mode() {
                     DeployMode::Link => {
@@ -80,7 +83,7 @@ pub fn rebuild_registry(
                         registry,
                         source,
                         git,
-                        source_name,
+                        source_name: &source_name,
                         commit,
                         selection: &selection,
                         policy: &policy,
@@ -93,9 +96,9 @@ pub fn rebuild_registry(
                 }
 
                 managed
-                    .entry(source_name.to_owned())
+                    .entry(source_name.as_str().to_owned())
                     .or_default()
-                    .insert(artifact);
+                    .insert(artifact.as_str().to_owned());
             }
         }
 
@@ -112,11 +115,11 @@ struct RebuildOne<'a> {
     registry: &'a dyn Registry,
     source: &'a ParsedSource,
     git: &'a str,
-    source_name: &'a str,
+    source_name: &'a SourceName,
     commit: &'a str,
     selection: &'a Selection,
     policy: &'a crate::source::ExportPolicy,
-    artifact: &'a str,
+    artifact: &'a ArtifactName,
     artifact_dst: &'a Path,
     layout_kind: LayoutKind,
     key: ArtifactKey,

@@ -32,7 +32,7 @@ use clap::{Parser, Subcommand};
 
 use crate::config::{Config, ParsedSource};
 use crate::error::{Error, Result};
-use crate::kernel::ProjectId;
+use crate::kernel::{ProjectId, SourceName};
 use crate::paths::phora_dir;
 use crate::source::{GitBackend, HttpBackend, RouterBackend};
 use crate::store::FileRegistry;
@@ -202,7 +202,7 @@ fn build_router(
     let mut modes = BTreeMap::new();
     let mut digests = BTreeMap::new();
     for (name, source) in &config.parsed_sources()? {
-        modes.insert(name.clone(), source.mode());
+        modes.insert(SourceName::new(name.clone()), source.mode());
         if let Some(digest) = source.digest() {
             digests.insert(name.clone(), digest);
         }

@@ -12,6 +12,14 @@ use crate::source::{
 };
 use crate::store::FileRegistry;
 
+fn an(name: &str) -> crate::kernel::ArtifactName {
+    crate::kernel::ArtifactName::new(name)
+}
+
+fn sn(name: &str) -> crate::kernel::SourceName {
+    crate::kernel::SourceName::new(name)
+}
+
 // ── git fixture ────────────────────────────────────────────────
 
 #[expect(
@@ -168,29 +176,39 @@ impl<'a> CountingBackend<'a> {
 }
 
 impl SourceBackend for CountingBackend<'_> {
-    fn fetch(&self, source: &str, url: &str) -> Result<()> {
+    fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> Result<()> {
         self.fetches.set(self.fetches.get() + 1);
         self.inner.fetch(source, url)
     }
 
-    fn resolve(&self, source: &str, url: &str, refspec: &Refspec) -> Result<String> {
+    fn resolve(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        refspec: &Refspec,
+    ) -> Result<String> {
         self.resolves.set(self.resolves.get() + 1);
         self.inner.resolve(source, url, refspec)
     }
 
-    fn commit_time(&self, source: &str, url: &str, commit: &str) -> Result<u64> {
+    fn commit_time(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        commit: &str,
+    ) -> Result<u64> {
         self.commit_times.set(self.commit_times.get() + 1);
         self.inner.commit_time(source, url, commit)
     }
 
     fn discover_artifacts(
         &self,
-        source: &str,
+        source: &crate::kernel::SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
         selection: &crate::kernel::Selection,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<crate::kernel::ArtifactName>> {
         self.discovers.set(self.discovers.get() + 1);
         self.inner
             .discover_artifacts(source, url, commit, root, selection)
@@ -203,7 +221,7 @@ impl SourceBackend for CountingBackend<'_> {
 
     fn compute_digest(
         &self,
-        source: &str,
+        source: &crate::kernel::SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
@@ -254,7 +272,13 @@ fn input<'a>(
 fn expected_digest(fx: &SyncFixture, name: &str, commit: &str) -> String {
     let m = crate::kernel::Selection::new(&[], &[]).expect("empty matcher builds");
     fx.backend
-        .compute_digest(name, &fx.url, commit, None, &m)
+        .compute_digest(
+            &crate::kernel::SourceName::new(name),
+            &fx.url,
+            commit,
+            None,
+            &m,
+        )
         .expect("digest computes over fixture tree")
 }
 
@@ -269,7 +293,7 @@ fn expected_digest_for_source(
     let m = crate::kernel::Selection::new(source.includes(), source.excludes())
         .expect("source matcher builds");
     fx.backend
-        .compute_digest(name, &fx.url, commit, source.root.as_deref(), &m)
+        .compute_digest(&sn(name), &fx.url, commit, source.root.as_deref(), &m)
         .expect("scoped digest computes over fixture tree")
 }
 
@@ -422,7 +446,9 @@ fn matching_lock_reuses_commit_without_refetch() {
     let source = parsed_of(&cfg, "editor-src");
 
     // Pre-seed the mirror so compute_digest can read the tree without sync fetching.
-    fx.backend.fetch("editor-src", &fx.url).expect("seed fetch");
+    fx.backend
+        .fetch(&sn("editor-src"), &fx.url)
+        .expect("seed fetch");
 
     let prior = Lock {
         version: 1,
@@ -512,7 +538,9 @@ fn force_refetches_even_when_lock_matches() {
     let fx = build_sync_fixture();
     let cfg = config_with_source("editor-src", &fx.url);
     let source = parsed_of(&cfg, "editor-src");
-    fx.backend.fetch("editor-src", &fx.url).expect("seed fetch");
+    fx.backend
+        .fetch(&sn("editor-src"), &fx.url)
+        .expect("seed fetch");
 
     let matching = Lock {
         version: 1,
@@ -747,28 +775,38 @@ struct FailingExportBackend<'a> {
 }
 
 impl SourceBackend for FailingExportBackend<'_> {
-    fn fetch(&self, source: &str, url: &str) -> Result<()> {
+    fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> Result<()> {
         self.inner.fetch(source, url)
     }
-    fn resolve(&self, source: &str, url: &str, refspec: &Refspec) -> Result<String> {
+    fn resolve(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        refspec: &Refspec,
+    ) -> Result<String> {
         self.inner.resolve(source, url, refspec)
     }
-    fn commit_time(&self, source: &str, url: &str, commit: &str) -> Result<u64> {
+    fn commit_time(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        commit: &str,
+    ) -> Result<u64> {
         self.inner.commit_time(source, url, commit)
     }
     fn discover_artifacts(
         &self,
-        source: &str,
+        source: &crate::kernel::SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
         selection: &crate::kernel::Selection,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<crate::kernel::ArtifactName>> {
         self.inner
             .discover_artifacts(source, url, commit, root, selection)
     }
     fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult> {
-        if req.artifact == self.fail_artifact {
+        if req.artifact.as_str() == self.fail_artifact {
             return Err(Error::Source(format!(
                 "injected export failure for {}",
                 req.artifact
@@ -778,7 +816,7 @@ impl SourceBackend for FailingExportBackend<'_> {
     }
     fn compute_digest(
         &self,
-        source: &str,
+        source: &crate::kernel::SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
@@ -1225,15 +1263,17 @@ fn second_deploy_over_correct_link_is_a_noop() {
         resolver: None,
     };
     let selection = Selection::new(source.includes(), source.excludes()).expect("selection");
+    let entry_source = sn("editor-src");
+    let entry_artifact = an("editor");
     let entry = ArtifactEntry {
         source: &source,
         git: remotes
             .get("editor-src")
             .expect("resolved_remotes covers every source"),
-        source_name: "editor-src",
+        source_name: &entry_source,
         commit: &fx.head_sha,
         selection: &selection,
-        artifact_name: "editor",
+        artifact_name: &entry_artifact,
         target_path: &target.expanded_path(),
         layout_kind: LayoutKind::Flat,
         ejected: &[],
@@ -1560,28 +1600,38 @@ struct PartialStagingExportBackend<'a> {
 }
 
 impl SourceBackend for PartialStagingExportBackend<'_> {
-    fn fetch(&self, source: &str, url: &str) -> Result<()> {
+    fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> Result<()> {
         self.inner.fetch(source, url)
     }
-    fn resolve(&self, source: &str, url: &str, refspec: &Refspec) -> Result<String> {
+    fn resolve(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        refspec: &Refspec,
+    ) -> Result<String> {
         self.inner.resolve(source, url, refspec)
     }
-    fn commit_time(&self, source: &str, url: &str, commit: &str) -> Result<u64> {
+    fn commit_time(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        commit: &str,
+    ) -> Result<u64> {
         self.inner.commit_time(source, url, commit)
     }
     fn discover_artifacts(
         &self,
-        source: &str,
+        source: &crate::kernel::SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
         selection: &crate::kernel::Selection,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<crate::kernel::ArtifactName>> {
         self.inner
             .discover_artifacts(source, url, commit, root, selection)
     }
     fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult> {
-        if req.artifact == self.fail_artifact {
+        if req.artifact.as_str() == self.fail_artifact {
             std::fs::create_dir_all(req.staging_dir).expect("create partial staging dir");
             std::fs::write(req.staging_dir.join("partial.txt"), b"half-written\n")
                 .expect("write partial staging file");
@@ -1594,7 +1644,7 @@ impl SourceBackend for PartialStagingExportBackend<'_> {
     }
     fn compute_digest(
         &self,
-        source: &str,
+        source: &crate::kernel::SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
@@ -2097,23 +2147,33 @@ struct FailingResolveBackend<'a> {
 }
 
 impl SourceBackend for FailingResolveBackend<'_> {
-    fn fetch(&self, source: &str, url: &str) -> Result<()> {
+    fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> Result<()> {
         self.inner.fetch(source, url)
     }
-    fn resolve(&self, _source: &str, _url: &str, _refspec: &Refspec) -> Result<String> {
+    fn resolve(
+        &self,
+        _source: &crate::kernel::SourceName,
+        _url: &str,
+        _refspec: &Refspec,
+    ) -> Result<String> {
         Err(Error::Source("injected resolve failure".to_owned()))
     }
-    fn commit_time(&self, source: &str, url: &str, commit: &str) -> Result<u64> {
+    fn commit_time(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        commit: &str,
+    ) -> Result<u64> {
         self.inner.commit_time(source, url, commit)
     }
     fn discover_artifacts(
         &self,
-        source: &str,
+        source: &crate::kernel::SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
         selection: &crate::kernel::Selection,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<crate::kernel::ArtifactName>> {
         self.inner
             .discover_artifacts(source, url, commit, root, selection)
     }
@@ -2122,7 +2182,7 @@ impl SourceBackend for FailingResolveBackend<'_> {
     }
     fn compute_digest(
         &self,
-        source: &str,
+        source: &crate::kernel::SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
@@ -2813,11 +2873,7 @@ fn worktree_scan_returns_sorted_real_dirs_excluding_dotdirs_and_files() {
 
     assert_eq!(
         found,
-        vec![
-            "alpha".to_owned(),
-            "uncommitted".to_owned(),
-            "zeta".to_owned()
-        ],
+        vec![an("alpha"), an("uncommitted"), an("zeta")],
         "the disk scan must return only real subdirectories, sorted, \
              excluding the .hidden dotdir and the loose.txt regular file; \
              the never-added `uncommitted` dir proves this is a disk scan"
@@ -2833,18 +2889,14 @@ fn worktree_scan_honors_root_subdir() {
 
     assert_eq!(
         found,
-        vec![
-            "alpha".to_owned(),
-            "uncommitted".to_owned(),
-            "zeta".to_owned()
-        ],
+        vec![an("alpha"), an("uncommitted"), an("zeta")],
         "with root set, artifacts nested under <git>/languages must be discovered"
     );
     let direct = discover_working_tree(wt.path(), None, &match_all())
         .expect("scanning the git root itself must succeed");
     assert_eq!(
         direct,
-        vec!["languages".to_owned()],
+        vec![an("languages")],
         "without root, only the top-level `languages` dir is an artifact"
     );
 }
@@ -2859,7 +2911,7 @@ fn worktree_scan_honors_matcher_exclude() {
 
     assert_eq!(
         found,
-        vec!["alpha".to_owned(), "uncommitted".to_owned()],
+        vec![an("alpha"), an("uncommitted")],
         "the include/exclude matcher must gate disk artifacts just as it gates ODB ones"
     );
 }
@@ -4008,24 +4060,34 @@ impl<'a> RecordingBackend<'a> {
 }
 
 impl SourceBackend for RecordingBackend<'_> {
-    fn fetch(&self, source: &str, url: &str) -> Result<()> {
+    fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> Result<()> {
         self.urls.borrow_mut().push(url.to_owned());
         self.inner.fetch(source, url)
     }
-    fn resolve(&self, source: &str, url: &str, refspec: &Refspec) -> Result<String> {
+    fn resolve(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        refspec: &Refspec,
+    ) -> Result<String> {
         self.inner.resolve(source, url, refspec)
     }
-    fn commit_time(&self, source: &str, url: &str, commit: &str) -> Result<u64> {
+    fn commit_time(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        commit: &str,
+    ) -> Result<u64> {
         self.inner.commit_time(source, url, commit)
     }
     fn discover_artifacts(
         &self,
-        source: &str,
+        source: &crate::kernel::SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
         selection: &crate::kernel::Selection,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<crate::kernel::ArtifactName>> {
         self.inner
             .discover_artifacts(source, url, commit, root, selection)
     }
@@ -4034,7 +4096,7 @@ impl SourceBackend for RecordingBackend<'_> {
     }
     fn compute_digest(
         &self,
-        source: &str,
+        source: &crate::kernel::SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
@@ -4286,7 +4348,10 @@ struct CountingRouter {
 }
 
 impl CountingRouter {
-    fn new(git_dir: PathBuf, modes: BTreeMap<String, crate::config::SourceMode>) -> Self {
+    fn new(
+        git_dir: PathBuf,
+        modes: BTreeMap<crate::kernel::SourceName, crate::config::SourceMode>,
+    ) -> Self {
         let git = GitBackend::new(git_dir.clone());
         let http = HttpBackend::new(git_dir, BTreeMap::new());
         Self {
@@ -4301,24 +4366,34 @@ impl CountingRouter {
 }
 
 impl SourceBackend for CountingRouter {
-    fn fetch(&self, source: &str, url: &str) -> Result<()> {
+    fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> Result<()> {
         self.fetches.set(self.fetches.get() + 1);
         self.inner.fetch(source, url)
     }
-    fn resolve(&self, source: &str, url: &str, refspec: &Refspec) -> Result<String> {
+    fn resolve(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        refspec: &Refspec,
+    ) -> Result<String> {
         self.inner.resolve(source, url, refspec)
     }
-    fn commit_time(&self, source: &str, url: &str, commit: &str) -> Result<u64> {
+    fn commit_time(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        commit: &str,
+    ) -> Result<u64> {
         self.inner.commit_time(source, url, commit)
     }
     fn discover_artifacts(
         &self,
-        source: &str,
+        source: &crate::kernel::SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
         selection: &crate::kernel::Selection,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<crate::kernel::ArtifactName>> {
         self.inner
             .discover_artifacts(source, url, commit, root, selection)
     }
@@ -4327,7 +4402,7 @@ impl SourceBackend for CountingRouter {
     }
     fn compute_digest(
         &self,
-        source: &str,
+        source: &crate::kernel::SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
@@ -4338,9 +4413,9 @@ impl SourceBackend for CountingRouter {
     }
 }
 
-fn url_modes(source: &str) -> BTreeMap<String, crate::config::SourceMode> {
+fn url_modes(source: &str) -> BTreeMap<crate::kernel::SourceName, crate::config::SourceMode> {
     let mut modes = BTreeMap::new();
-    modes.insert(source.to_owned(), crate::config::SourceMode::Url);
+    modes.insert(sn(source), crate::config::SourceMode::Url);
     modes
 }
 
