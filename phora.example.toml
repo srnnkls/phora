@@ -17,22 +17,30 @@ auth = { type = "ssh", key = "~/.ssh/id_ed25519" }
 
 # A source is a git repo. Top-level directories under `root` are its artifacts.
 # Pin with exactly one of branch / tag / rev (defaults to branch `main`).
-# Declare the remote symbolically (host + path) or literally (git); never both.
+# Pick exactly one source kind: forge (host + repo), local (path), literal (git),
+# or url. A bare `repo = "owner/repo"` defaults to github; a bare `path` is LOCAL.
 
-# Host-aliased: resolves via the host's `remote` template at sync time.
+# Forge source: resolves via the host's `remote` template at sync time.
 [sources.dotfiles]
-host = "github"          # omit to default to github when `path` is set
-path = "me/dotfiles"
+host = "github"          # omit to default to github when `repo` is set
+repo = "me/dotfiles"     # deprecated alias: `path` (forge owner/repo) under a host
 branch = "main"
 root = "modules"
 
 [sources.internal]
 host = "company"
-path = "team/sub/proj"   # nested paths are fine ({owner}/{repo} ≡ {path})
+repo = "team/sub/proj"   # nested paths are fine ({owner}/{repo} ≡ {path})
 protocol = "ssh"         # per-source opt-in to ssh
 root = "configs"
 include = ["editor", "lint"]
 exclude = ["**/test/**", "**/*.bak"]
+
+# Local source: `path` is a filesystem path used verbatim as the remote, exactly
+# like a `git = "/abs/local/checkout"` alias.
+[sources.scratch]
+path = "~/dev/scratch-configs"
+branch = "main"
+root = "modules"
 
 # Literal remote: any https, ssh://, or scp-style URL, unchanged from before.
 [sources.loqui]
@@ -44,7 +52,7 @@ preserve_executable = true
 # For a local dev loop, override this source onto a local checkout and live-link
 # it via `deploy = "link"` — local-overlay-only. See phora.local.example.toml.
 
-# Url source: the third mode (git XOR host+path XOR url). A url downloads and
+# Url source: one of the four kinds (forge XOR local XOR git XOR url). A url downloads and
 # extracts (tar, tar.gz/tgz, zip, or a raw single file named from the URL basename);
 # a single top-level dir is auto-stripped, so version-stamped release tarballs need
 # no per-version `root`. `branch`/`tag`/`rev`/`root` are rejected on a url source.
