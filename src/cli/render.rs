@@ -1,7 +1,7 @@
 //! The sole producer of user-facing CLI output (`println!`/`format!`).
 
 use crate::config::ParsedSource;
-use crate::projection::ArtifactState;
+use crate::deploy::ArtifactState;
 
 use super::query::{CheckMatchReport, TargetListing, WhereMatch};
 

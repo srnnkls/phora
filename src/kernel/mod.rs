@@ -3,9 +3,11 @@
 mod commit;
 mod digest;
 mod path;
+mod project_id;
 mod selection;
 
 pub use commit::Commit;
 pub use digest::{Algo, Digest};
 pub use path::RelPath;
+pub use project_id::ProjectId;
 pub use selection::Selection;

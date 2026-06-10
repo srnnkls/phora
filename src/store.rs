@@ -309,7 +309,7 @@ impl Registry for FileRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::paths::ProjectId;
+    use crate::kernel::ProjectId;
     use tempfile::TempDir;
 
     #[test]

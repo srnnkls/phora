@@ -1,5 +1,5 @@
     use super::*;
-    use crate::registry::{ArtifactKey, FileRegistry, ManifestFile, RegistryRecord};
+    use crate::store::{ArtifactKey, FileRegistry, ManifestFile, RegistryRecord};
     use clap::CommandFactory;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -1507,7 +1507,7 @@
         .expect("seed registry record");
         reg.save_ejected(
             "dest",
-            &[crate::registry::EjectedEntry {
+            &[crate::store::EjectedEntry {
                 source: "editor-src".to_owned(),
                 artifact: "editor".to_owned(),
                 ejected_at: "2026-01-31T14:00:00Z".to_owned(),
