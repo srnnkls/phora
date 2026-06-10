@@ -87,7 +87,7 @@ tasks:
 
   - id: ARCH-006
     content: "ParsedSource + Remote ADT (Git | Path | Url | Host); single parse after merge; rename cli.rs::ParsedSource"
-    status: pending
+    status: done
     activeForm: "Parsing Source into a Remote ADT"
     depends_on: [ARCH-001, ARCH-005]
     acceptance:
@@ -100,7 +100,7 @@ tasks:
 
   - id: ARCH-007
     content: "Drop leaky adapter getters; rewrite getter-based dispatch tests; SourceCtx bundle (no sealing)"
-    status: pending
+    status: done   # getters dropped + dispatch tests rewritten; SourceCtx bundle deferred to ARCH-009 (consumer lands there; avoided dead construct-then-destructure)
     activeForm: "Removing adapter getters"
     acceptance:
       - "RouterBackend::git_backend()/http_backend() (backend.rs:25-31) removed"
@@ -109,7 +109,7 @@ tasks:
 
   - id: ARCH-008
     content: "Confine archive.rs's gix use (EntryKind) so `gix only in source/` is grep-clean"
-    status: pending
+    status: done   # phora-owned archive::EntryKind; gix translation confined to source.rs::to_gix_entry_kind. NB flat layout: gix-clean outside source.rs today; the source/ dir lands in ARCH-011
     activeForm: "Confining residual gix"
     acceptance:
       - "gix grep (production): only source/; ureq only source/download.rs; tar/zip/flate2 only source/archive.rs"
