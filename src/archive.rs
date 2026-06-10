@@ -4,10 +4,16 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use flate2::read::GzDecoder;
-use gix::object::tree::EntryKind;
 
 use crate::error::{Error, Result};
 use crate::source::safe_component;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    Blob,
+    BlobExecutable,
+    Link,
+}
 
 #[derive(Debug)]
 pub struct ExtractedEntry {
@@ -223,9 +229,8 @@ fn strip_single_top_level(mut entries: Vec<ExtractedEntry>) -> Vec<ExtractedEntr
 
 #[cfg(test)]
 mod tests {
-    use crate::archive::{ExtractedEntry, extract, extract_archive, safe_archive_path};
+    use crate::archive::{EntryKind, ExtractedEntry, extract, extract_archive, safe_archive_path};
     use crate::error::Error;
-    use gix::object::tree::EntryKind;
     use std::collections::BTreeMap;
     use std::io::Write;
     use std::path::{Path, PathBuf};
