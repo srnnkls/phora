@@ -47,8 +47,12 @@ pub(super) fn discover_artifacts_for_source(
         DeployMode::Link => {
             discover_working_tree(Path::new(git), source.root.as_deref(), selection)
         }
-        DeployMode::Copy => {
-            backend.discover_artifacts(source_name, git, commit, source.root.as_deref(), selection)
-        }
+        DeployMode::Copy => Ok(backend.discover_artifacts(
+            source_name,
+            git,
+            commit,
+            source.root.as_deref(),
+            selection,
+        )?),
     }
 }

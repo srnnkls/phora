@@ -1,12 +1,23 @@
-//! Crate-wide error type.
+//! Crate-wide error aggregate at the CLI edge.
 //!
-//! A single [`Error`] spans every domain for now. Per-module error enums can be
-//! split out later without a mechanical one-enum-per-module rule.
+//! Bounded contexts own their own enums ([`crate::source::SourceError`],
+//! [`crate::store::StoreError`]); this type aggregates them via `From` for
+//! propagation and exit-code mapping at the binary boundary.
 
 use thiserror::Error;
 
+use crate::kernel::KernelError;
+use crate::source::SourceError;
+use crate::store::StoreError;
+
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error(transparent)]
+    SourceCtx(#[from] SourceError),
+
+    #[error(transparent)]
+    StoreCtx(#[from] StoreError),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -55,6 +66,12 @@ pub enum Error {
 
     #[error("aborted by user")]
     Aborted,
+}
+
+impl From<KernelError> for Error {
+    fn from(err: KernelError) -> Self {
+        Self::SourceCtx(SourceError::from(err))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -1,15 +1,24 @@
 use std::fmt;
 use std::str::FromStr;
 
+use thiserror::Error;
+
 use crate::error::{Error, Result};
+
+/// Path-traversal guard failure.
+#[derive(Debug, Error)]
+pub enum KernelError {
+    #[error("unsafe path component: {0:?}")]
+    UnsafeComponent(String),
+}
 
 /// Rejects any string that is not a single inert path component, so a malicious git
 /// tree or archive can never escape the staging dir when joined onto a path.
-pub(crate) fn safe_component(name: &str) -> Result<&str> {
+pub(crate) fn safe_component(name: &str) -> std::result::Result<&str, KernelError> {
     let unsafe_component =
         name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\');
     if unsafe_component {
-        return Err(Error::Source(format!("unsafe path component: {name:?}")));
+        return Err(KernelError::UnsafeComponent(name.to_owned()));
     }
     Ok(name)
 }

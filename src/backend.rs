@@ -5,9 +5,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::config::{Refspec, SourceMode};
-use crate::error::Result;
 use crate::kernel::{ArtifactName, Selection, SourceName};
-use crate::source::{ExportRequest, ExportResult, SourceBackend};
+use crate::source::{ExportRequest, ExportResult, SourceBackend, SourceError};
+
+type Result<T> = std::result::Result<T, SourceError>;
 
 /// Routes each `SourceBackend` call to `git` or `http` by the source's declared
 /// mode, looked up by name. An unmapped name defaults to the git backend.
@@ -94,11 +95,13 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::config::{Refspec, SourceMode};
-    use crate::error::{Error, Result};
     use crate::kernel::{ArtifactName, Selection, SourceName};
     use crate::source::{
         ExportRequest, ExportResult, GitBackend, HttpBackend, RouterBackend, SourceBackend,
+        SourceError,
     };
+
+    type Result<T> = std::result::Result<T, SourceError>;
 
     fn sn(name: &str) -> SourceName {
         SourceName::trusted(name)
@@ -316,7 +319,7 @@ mod tests {
         }
 
         fn export_artifact(&self, _req: &ExportRequest<'_>) -> Result<ExportResult> {
-            Err(Error::Source("spy export".into()))
+            Err(SourceError::Source("spy export".into()))
         }
 
         fn compute_digest(

@@ -339,7 +339,7 @@ pub fn eject(
         });
         registry.save_ejected(target, &ejected)?;
     }
-    registry.remove(&key)
+    Ok(registry.remove(&key)?)
 }
 
 pub fn uneject(
@@ -354,5 +354,5 @@ pub fn uneject(
     }
     let mut ejected = registry.load_ejected(target)?;
     ejected.retain(|e| !(e.source == source && e.artifact == artifact));
-    registry.save_ejected(target, &ejected)
+    Ok(registry.save_ejected(target, &ejected)?)
 }

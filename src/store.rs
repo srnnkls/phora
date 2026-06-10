@@ -3,8 +3,19 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
-use crate::error::{Error, Result};
+/// Errors owned by the store context (`Registry` and its file adapter).
+#[derive(Debug, Error)]
+pub enum StoreError {
+    #[error("registry error: {0}")]
+    Registry(String),
+
+    #[error("lock error: {0}")]
+    Lock(String),
+}
+
+type Result<T> = std::result::Result<T, StoreError>;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ArtifactKey {
@@ -114,7 +125,7 @@ impl FileRegistry {
     pub fn lock_exclusive(&self) -> Result<StateLockGuard> {
         let locks_dir = self.state_root.join("locks");
         std::fs::create_dir_all(&locks_dir).map_err(|e| {
-            Error::Registry(format!("create locks dir {}: {e}", locks_dir.display()))
+            StoreError::Registry(format!("create locks dir {}: {e}", locks_dir.display()))
         })?;
         let lock_path = locks_dir.join("state.lock");
         let file = std::fs::OpenOptions::new()
@@ -123,13 +134,13 @@ impl FileRegistry {
             .write(true)
             .truncate(false)
             .open(&lock_path)
-            .map_err(|e| Error::Registry(format!("open lock file {}: {e}", lock_path.display())))?;
+            .map_err(|e| StoreError::Registry(format!("open lock file {}: {e}", lock_path.display())))?;
         match file.try_lock() {
             Ok(()) => Ok(StateLockGuard { _file: file }),
-            Err(std::fs::TryLockError::WouldBlock) => Err(Error::Lock(
+            Err(std::fs::TryLockError::WouldBlock) => Err(StoreError::Lock(
                 "another phora process is running for this project (state.lock held)".to_owned(),
             )),
-            Err(std::fs::TryLockError::Error(e)) => Err(Error::Registry(format!(
+            Err(std::fs::TryLockError::Error(e)) => Err(StoreError::Registry(format!(
                 "acquire lock on {}: {e}",
                 lock_path.display()
             ))),
@@ -139,36 +150,36 @@ impl FileRegistry {
 
 fn read_record(path: &Path) -> Result<RegistryRecord> {
     let text = std::fs::read_to_string(path)
-        .map_err(|e| Error::Registry(format!("read record {}: {e}", path.display())))?;
+        .map_err(|e| StoreError::Registry(format!("read record {}: {e}", path.display())))?;
     toml::from_str(&text)
-        .map_err(|e| Error::Registry(format!("parse record {}: {e}", path.display())))
+        .map_err(|e| StoreError::Registry(format!("parse record {}: {e}", path.display())))
 }
 
 fn atomic_write(path: &Path, contents: &str) -> Result<()> {
     let parent = path
         .parent()
-        .ok_or_else(|| Error::Registry(format!("path has no parent: {}", path.display())))?;
+        .ok_or_else(|| StoreError::Registry(format!("path has no parent: {}", path.display())))?;
     std::fs::create_dir_all(parent)
-        .map_err(|e| Error::Registry(format!("create dir {}: {e}", parent.display())))?;
+        .map_err(|e| StoreError::Registry(format!("create dir {}: {e}", parent.display())))?;
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
-        .ok_or_else(|| Error::Registry(format!("path has no file name: {}", path.display())))?;
+        .ok_or_else(|| StoreError::Registry(format!("path has no file name: {}", path.display())))?;
     let tmp = parent.join(format!(".{file_name}.tmp"));
     {
         use std::io::Write as _;
         let mut handle = std::fs::File::create(&tmp)
-            .map_err(|e| Error::Registry(format!("create temp {}: {e}", tmp.display())))?;
+            .map_err(|e| StoreError::Registry(format!("create temp {}: {e}", tmp.display())))?;
         handle
             .write_all(contents.as_bytes())
-            .map_err(|e| Error::Registry(format!("write temp {}: {e}", tmp.display())))?;
+            .map_err(|e| StoreError::Registry(format!("write temp {}: {e}", tmp.display())))?;
         handle
             .sync_all()
-            .map_err(|e| Error::Registry(format!("fsync temp {}: {e}", tmp.display())))?;
+            .map_err(|e| StoreError::Registry(format!("fsync temp {}: {e}", tmp.display())))?;
     }
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
-        Error::Registry(format!(
+        StoreError::Registry(format!(
             "rename {} -> {}: {e}",
             tmp.display(),
             path.display()
@@ -181,7 +192,7 @@ fn collect_records(artifacts_dir: &Path, out: &mut Vec<RegistryRecord>) -> Resul
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => {
-            return Err(Error::Registry(format!(
+            return Err(StoreError::Registry(format!(
                 "read dir {}: {e}",
                 artifacts_dir.display()
             )));
@@ -189,17 +200,17 @@ fn collect_records(artifacts_dir: &Path, out: &mut Vec<RegistryRecord>) -> Resul
     };
     for source in source_dirs {
         let source = source.map_err(|e| {
-            Error::Registry(format!("read entry in {}: {e}", artifacts_dir.display()))
+            StoreError::Registry(format!("read entry in {}: {e}", artifacts_dir.display()))
         })?;
         if !source.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
         let source_path = source.path();
         let files = std::fs::read_dir(&source_path)
-            .map_err(|e| Error::Registry(format!("read dir {}: {e}", source_path.display())))?;
+            .map_err(|e| StoreError::Registry(format!("read dir {}: {e}", source_path.display())))?;
         for file in files {
             let file = file.map_err(|e| {
-                Error::Registry(format!("read entry in {}: {e}", source_path.display()))
+                StoreError::Registry(format!("read entry in {}: {e}", source_path.display()))
             })?;
             let path = file.path();
             if path.extension().is_some_and(|ext| ext == "toml") {
@@ -223,7 +234,7 @@ impl Registry for FileRegistry {
     fn put(&self, record: &RegistryRecord) -> Result<()> {
         let path = self.record_path(&record.key);
         let serialized = toml::to_string(record)
-            .map_err(|e| Error::Registry(format!("serialize record: {e}")))?;
+            .map_err(|e| StoreError::Registry(format!("serialize record: {e}")))?;
         atomic_write(&path, &serialized)
     }
 
@@ -232,7 +243,7 @@ impl Registry for FileRegistry {
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(Error::Registry(format!(
+            Err(e) => Err(StoreError::Registry(format!(
                 "remove record {}: {e}",
                 path.display()
             ))),
@@ -256,7 +267,7 @@ impl Registry for FileRegistry {
             Ok(rd) => rd,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => {
-                return Err(Error::Registry(format!(
+                return Err(StoreError::Registry(format!(
                     "read dir {}: {e}",
                     targets_dir.display()
                 )));
@@ -265,7 +276,7 @@ impl Registry for FileRegistry {
         let mut records = Vec::new();
         for target in target_dirs {
             let target = target.map_err(|e| {
-                Error::Registry(format!("read entry in {}: {e}", targets_dir.display()))
+                StoreError::Registry(format!("read entry in {}: {e}", targets_dir.display()))
             })?;
             if !target.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
@@ -280,11 +291,11 @@ impl Registry for FileRegistry {
         match std::fs::read_to_string(&path) {
             Ok(text) => {
                 let meta: EjectedMeta = toml::from_str(&text)
-                    .map_err(|e| Error::Registry(format!("parse meta {}: {e}", path.display())))?;
+                    .map_err(|e| StoreError::Registry(format!("parse meta {}: {e}", path.display())))?;
                 Ok(meta.ejected)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(e) => Err(Error::Registry(format!(
+            Err(e) => Err(StoreError::Registry(format!(
                 "read meta {}: {e}",
                 path.display()
             ))),
@@ -297,7 +308,7 @@ impl Registry for FileRegistry {
             ejected: ejected.to_vec(),
         };
         let serialized =
-            toml::to_string(&meta).map_err(|e| Error::Registry(format!("serialize meta: {e}")))?;
+            toml::to_string(&meta).map_err(|e| StoreError::Registry(format!("serialize meta: {e}")))?;
         atomic_write(&self.meta_path(target), &serialized)
     }
 
