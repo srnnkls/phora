@@ -2,7 +2,8 @@
 created: 2026-06-09
 status: active
 issue_type: Feature
-revised: 2026-06-10   # post opus+sonnet review (review.yaml); ARCH-000..011 landed, ARCH-012/013 deferred to a future session (still in scope)
+target_tree: "origin/main @ 9310c5a (Rust); this branch chore/architecture-cleanup builds on it"
+revised: 2026-06-10   # ARCH-000..011 landed; round 3 (loqui-alignment): ARCH-014 name newtypes added, ARCH-012 mandatory + decoupled from ARCH-013
 ---
 
 # architecture-cleanup
@@ -81,12 +82,13 @@ bar, phased low→high-risk migration.
 | forge key `path`→`repo` | rename host-mode `path`→`repo` (it's `owner/repo`, not a path); bare `repo` keeps the github default; `host`+`path` accepted as a deprecated alias | frees `path` for local; `repo` is the truthful name |
 | local splits off `git` | link-mode/local sources move `git=<path>`→`path=<path>`; `git=<localpath>` kept as back-compat alias | `git` becomes honestly git-only |
 | one intentional break | bare `path = "owner/repo"` (old github shorthand) now means a local path; the shorthand moves to bare `repo` | git sources + `host`+`path` configs unaffected |
+| alias deprecation | alias forms (`git`=<localpath>, `host`+`path`) emit a one-line deprecation warning naming the new key; bare `path` that looks like `owner/repo` and does not exist locally emits a meaning-changed hint | round 2; ARCH-005 shipped WITHOUT them — retrofit is ARCH-015. Horizon: drop decided before next major, not this cycle |
 | Source config | `ParsedSource { remote: Remote = Literal \| Host \| Url, refspec, … }`, parsed once after merge | illegal states unrepresentable; deletes the `is_some()`-counting validators |
 | Ports | drop the leaky adapter getters; rewrite getter-based dispatch tests; **no formal sealing** | single binary, no downstream impls; sealing breaks in-crate test doubles (review B3) |
 | Clock | **not introduced** | 6 `now()` sites are informational timestamps nothing asserts (review OE1) |
-| Newtypes | keep `RelPath`, unified `Digest`, `Commit`; **drop `ArtifactName`/`SourceName`** | names already validated at parse + tree boundary; wrapping churns ~50 sites for 4 re-checks (review OE4) |
+| Newtypes | keep `RelPath`, unified `Digest`, `Commit`; **`ArtifactName`/`SourceName` reinstated** (ARCH-014) | round 3 (loqui-alignment) reverses review OE4: types.md — domain identifiers are newtyped; boundary checks move into constructors |
 | Split | `sync.rs`→`sync/`, `cli.rs`→`cli/`, `projection`→`deploy/`, `registry`→`store/`, `matcher`→`kernel/selection`, `config.rs`→`config/` | feature-organized bounded contexts |
-| Per-context errors / crate split | **deferred together to a future session** (errors earn their keep only once the crate splits); still in scope | review OE3; 2026-06-10: zero production variant consumers; core→cli boundary already clean, grep-pinned (tasks.yaml ARCH-012/013) |
+| Per-context errors / crate split | **decoupled** (round 3, loqui-alignment): ARCH-012 (per-context errors, thiserror, typed errors per port) ships this cycle; ARCH-013 (crate split) stays optional/deferred | traits.md: typed errors per port; the empirical zero-variant-consumer finding stands but the port contract is the value (tasks.yaml ARCH-012) |
 
 ## Requirements
 
@@ -125,6 +127,8 @@ bar, phased low→high-risk migration.
 - [x] A deployed dotfile artifact later removed from config is removed from disk by `--prune`.
 - [x] `path="<local>"` and `host`+`repo` configs work; `git="<localpath>"` and `host`+`path`
       configs still work (aliases); `add` emits the new keys; bare `repo="owner/repo"` resolves to github.
+- [ ] Alias forms warn (deprecation, naming the new key); bare `path` resembling `owner/repo`
+      with no such local path warns about the moved shorthand (ARCH-015).
 - [x] Confinement (grep, production code): `gix` only in `src/source.rs`, `ureq` only in
       `src/http.rs`, archive crates only in `src/archive.rs` (ARCH-011 left `source.rs` flat —
       the planned `source/` dir never materialized; greps re-verified 2026-06-10).
@@ -166,9 +170,10 @@ Phase 3   ARCH-009 split sync/ → ARCH-010 split cli/
 - The typed-keys change keeps back-compat aliases (`git`=<localpath>, `host`+`path`); it does
   **not** drop them this cycle. `git`/`url` for their proper kinds are unchanged.
 - No async; phora stays synchronous.
-- No `Clock` port, no formal trait sealing, no `ArtifactName`/`SourceName` newtypes (see Decisions).
-- Per-context errors and the `phora-core`/`phora-cli` crate split are deferred to a future
-  session (ARCH-012/013: still in scope, not descoped; reopen triggers in tasks.yaml).
+- No `Clock` port, no formal trait sealing (see Decisions). `ArtifactName`/`SourceName`
+  newtypes are IN scope as of round 3 (ARCH-014, loqui-alignment).
+- Per-context errors (ARCH-012) ship this cycle (round 3, decoupled); only the
+  `phora-core`/`phora-cli` crate split (ARCH-013) stays deferred (reopen triggers in tasks.yaml).
 
 ## Verification
 

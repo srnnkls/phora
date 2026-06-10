@@ -35,8 +35,17 @@ decisions:
     confirmed_by: user
   - id: cut-overengineering
     question: "Clock port, sealing, name newtypes, per-context errors?"
-    resolution: "Cut Clock + sealing + ArtifactName/SourceName; defer per-context errors with the crate split"
-    confirmed_by: review        # opus/sonnet OE1-4
+    resolution: "Cut Clock + sealing (OE1/B3); name newtypes + per-context errors initially cut/deferred (OE3/OE4) — overridden by decision loqui-alignment"
+    confirmed_by: review        # opus/sonnet OE1-4; OE3/OE4 later overridden
+  - id: loqui-alignment
+    question: "Keep the OE3/OE4 cuts (no name newtypes; per-context errors deferred) despite loqui types.md/traits.md?"
+    resolution: >
+      No — align with loqui. ArtifactName/SourceName reinstated as kernel newtypes (ARCH-014;
+      types.md: domain identifiers are newtyped; boundary checks move into constructors);
+      per-context errors ship this cycle (ARCH-012 mandatory, decoupled from the crate split;
+      traits.md: typed errors per port — SourceError/StoreError). Clock port and sealing stay cut.
+      ARCH-001 (done) shipped without the name newtypes; ARCH-014 retrofits them.
+    confirmed_by: user          # round 3, 2026-06-10
   - id: golden-prereq
     question: "How is behavior-identical verified?"
     resolution: "ARCH-000 golden/snapshot harness is a hard prerequisite (none exists today)"
@@ -59,6 +68,19 @@ open_risks:
   - "Deprecation horizon for the back-compat aliases (`git`=<localpath>, `host`+`path`) is unset — decide before a future drop."
   - "Bare `path`=<owner/repo> changes meaning (was github forge, now local) — the one intentional break; needs a clear migration note + ideally a detection warning."
   - "sync.rs split (ARCH-009) is the highest-effort/highest-regression task — gate on ARCH-000 golden snapshots."
+
+  - id: alias-deprecation
+    question: "Deprecation horizon + warnings for the alias forms and the bare-path break?"
+    resolution: >
+      Warnings (round 2): alias forms emit a one-line deprecation warning naming the new key;
+      bare path resembling owner/repo with no such local path emits a meaning-changed hint.
+      ARCH-005 shipped without them (the acceptance lived only on the hosting-branch doc copy) —
+      ARCH-015 retrofits. The alias DROP is decided before the next major release, not this cycle.
+    confirmed_by: user          # re-review round 2
+  - id: target-tree
+    question: "Which tree does this scope target?"
+    resolution: "origin/main @ 9310c5a (Rust); implemented on chore/architecture-cleanup (this branch). Hosting-branch doc copy (Go-rewrite branch) is non-canonical."
+    confirmed_by: user          # re-review round 2
 
 review_config:
   reviewers: [opus, sonnet]   # used for the scope review (review.yaml); reuse for implementation phases
