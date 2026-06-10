@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::config::{Config, DeployMode, ParsedSource, SourceMode};
 use crate::error::Result;
-use crate::kernel::Selection;
+use crate::kernel::{Selection, SourceName};
 use crate::lock::{Lock, LockedSource, source_matches};
 use crate::source::{SourceBackend, read_local_head};
 
@@ -23,6 +23,7 @@ pub(super) fn resolve_sources(
 
     for (name, source) in parsed {
         let git = remote_for(remotes, name)?;
+        let source_name = SourceName::new(name.clone());
         if source.deploy_mode() == DeployMode::Link {
             let commit = read_local_head(git)?;
             routed.push((
@@ -49,14 +50,19 @@ pub(super) fn resolve_sources(
                 l.commit.clone()
             }
             _ => {
-                backend.fetch(name, git)?;
-                backend.resolve(name, git, &source.refspec())?
+                backend.fetch(&source_name, git)?;
+                backend.resolve(&source_name, git, &source.refspec())?
             }
         };
 
         let selection = Selection::new(source.includes(), source.excludes())?;
-        let digest =
-            backend.compute_digest(name, git, &commit, source.root.as_deref(), &selection)?;
+        let digest = backend.compute_digest(
+            &source_name,
+            git,
+            &commit,
+            source.root.as_deref(),
+            &selection,
+        )?;
 
         let resolved = if source.mode() == SourceMode::Url {
             "url".to_owned()

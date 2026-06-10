@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use crate::config::{DeployMode, LayoutKind, ParsedSource, Target};
 use crate::deploy::{ArtifactState, Journal, check_artifact_state, deploy_artifact, link_artifact};
 use crate::error::{Error, Result};
-use crate::kernel::Selection;
+use crate::kernel::{ArtifactName, Selection, SourceName};
 use crate::source::{ExportRequest, SourceBackend};
 use crate::store::{ArtifactKey, EjectedEntry, Registry, RegistryRecord};
 
@@ -44,23 +44,28 @@ pub(super) fn deploy_target(
         })?;
         let commit = &run.commits[source_name];
         let git = remote_for(run.remotes, source_name)?;
+        let source_name = SourceName::new(source_name);
         let selection = Selection::new(source.includes(), source.excludes())?;
         let discovered =
-            discover_artifacts_for_source(source, git, source_name, commit, backend, &selection)?;
+            discover_artifacts_for_source(source, git, &source_name, commit, backend, &selection)?;
 
         for artifact_name in discovered {
             if layout.kind == LayoutKind::Flat {
-                if let Some(other) = seen.get(&artifact_name) {
+                if let Some(other) = seen.get(artifact_name.as_str()) {
                     return Err(Error::Collision {
-                        artifact: artifact_name,
-                        sources: vec![other.clone(), source_name.to_owned()],
+                        artifact: artifact_name.as_str().to_owned(),
+                        sources: vec![other.clone(), source_name.as_str().to_owned()],
                         target: run.target_name.to_owned(),
                     });
                 }
-                seen.insert(artifact_name.clone(), source_name.to_owned());
+                seen.insert(
+                    artifact_name.as_str().to_owned(),
+                    source_name.as_str().to_owned(),
+                );
             }
 
-            let artifact_dst = target_path.join(layout.artifact_path(source_name, &artifact_name));
+            let artifact_dst = target_path
+                .join(layout.artifact_path(source_name.as_str(), artifact_name.as_str()));
             let dst_is_symlink =
                 std::fs::symlink_metadata(&artifact_dst).is_ok_and(|m| m.file_type().is_symlink());
             let mode_transition = match source.deploy_mode() {
@@ -71,7 +76,7 @@ pub(super) fn deploy_target(
             let entry = ArtifactEntry {
                 source,
                 git,
-                source_name,
+                source_name: &source_name,
                 commit,
                 selection: &selection,
                 artifact_name: &artifact_name,
@@ -90,10 +95,10 @@ pub(super) fn deploy_target(
 pub(super) struct ArtifactEntry<'a> {
     pub(super) source: &'a ParsedSource,
     pub(super) git: &'a str,
-    pub(super) source_name: &'a str,
+    pub(super) source_name: &'a SourceName,
     pub(super) commit: &'a str,
     pub(super) selection: &'a Selection,
-    pub(super) artifact_name: &'a str,
+    pub(super) artifact_name: &'a ArtifactName,
     pub(super) target_path: &'a Path,
     pub(super) layout_kind: LayoutKind,
     pub(super) ejected: &'a [EjectedEntry],
@@ -110,20 +115,20 @@ pub(super) fn deploy_artifact_entry(
     let artifact_dst = entry.target_path.join(
         run.target
             .layout()
-            .artifact_path(entry.source_name, entry.artifact_name),
+            .artifact_path(entry.source_name.as_str(), entry.artifact_name.as_str()),
     );
     let key = ArtifactKey {
         target: run.target_name.to_owned(),
-        source: entry.source_name.to_owned(),
-        artifact: entry.artifact_name.to_owned(),
+        source: entry.source_name.as_str().to_owned(),
+        artifact: entry.artifact_name.as_str().to_owned(),
     };
 
     let state = check_artifact_state(
         &artifact_dst,
-        entry.source_name,
+        entry.source_name.as_str(),
         entry.commit,
         entry.ejected,
-        entry.artifact_name,
+        entry.artifact_name.as_str(),
         registry,
         &key,
     )?;
@@ -171,12 +176,17 @@ pub(super) fn deploy_artifact_entry(
         Some(kind) => match run.resolver {
             Some(resolver) if run.interactive => resolver.resolve(&Conflict {
                 target: run.target_name.to_owned(),
-                source: entry.source_name.to_owned(),
-                artifact: entry.artifact_name.to_owned(),
+                source: entry.source_name.as_str().to_owned(),
+                artifact: entry.artifact_name.as_str().to_owned(),
                 kind,
             }),
             _ => {
-                warn_skip(entry.source_name, entry.artifact_name, &kind, &artifact_dst);
+                warn_skip(
+                    entry.source_name.as_str(),
+                    entry.artifact_name.as_str(),
+                    &kind,
+                    &artifact_dst,
+                );
                 Resolution::Skip
             }
         },
@@ -197,8 +207,8 @@ pub(super) fn deploy_artifact_entry(
         Resolution::Eject => {
             let mut ejected = registry.load_ejected(run.target_name)?;
             ejected.push(EjectedEntry {
-                source: entry.source_name.to_owned(),
-                artifact: entry.artifact_name.to_owned(),
+                source: entry.source_name.as_str().to_owned(),
+                artifact: entry.artifact_name.as_str().to_owned(),
                 ejected_at: chrono::Utc::now().to_rfc3339(),
             });
             registry.save_ejected(run.target_name, &ejected)?;
@@ -232,10 +242,10 @@ struct DeployContext<'a> {
     layout_kind: LayoutKind,
     source: &'a ParsedSource,
     git: &'a str,
-    source_name: &'a str,
+    source_name: &'a SourceName,
     commit: &'a str,
     selection: &'a Selection,
-    artifact_name: &'a str,
+    artifact_name: &'a ArtifactName,
     artifact_dst: &'a Path,
     key: ArtifactKey,
 }
@@ -339,6 +349,6 @@ fn link_target(entry: &ArtifactEntry<'_>) -> PathBuf {
     if let Some(root) = &entry.source.root {
         target.push(root);
     }
-    target.push(entry.artifact_name);
+    target.push(entry.artifact_name.as_str());
     target
 }

@@ -2,7 +2,7 @@ use std::path::Path;
 
 use crate::config::{DeployMode, ParsedSource};
 use crate::error::{Error, Result};
-use crate::kernel::Selection;
+use crate::kernel::{ArtifactName, Selection, SourceName};
 use crate::source::SourceBackend;
 
 /// Discover artifact directories by scanning the live working tree at
@@ -13,7 +13,7 @@ pub(super) fn discover_working_tree(
     git: &Path,
     root: Option<&Path>,
     selection: &Selection,
-) -> Result<Vec<String>> {
+) -> Result<Vec<ArtifactName>> {
     let base = root.map_or_else(|| git.to_path_buf(), |r| git.join(r));
     let entries = std::fs::read_dir(&base)
         .map_err(|e| Error::Sync(format!("scan working tree {}: {e}", base.display())))?;
@@ -27,7 +27,7 @@ pub(super) fn discover_working_tree(
             continue;
         }
         if entry.file_type()?.is_dir() {
-            artifacts.push(name);
+            artifacts.push(ArtifactName::new(name));
         }
     }
 
@@ -38,11 +38,11 @@ pub(super) fn discover_working_tree(
 pub(super) fn discover_artifacts_for_source(
     source: &ParsedSource,
     git: &str,
-    source_name: &str,
+    source_name: &SourceName,
     commit: &str,
     backend: &dyn SourceBackend,
     selection: &Selection,
-) -> Result<Vec<String>> {
+) -> Result<Vec<ArtifactName>> {
     match source.deploy_mode() {
         DeployMode::Link => {
             discover_working_tree(Path::new(git), source.root.as_deref(), selection)

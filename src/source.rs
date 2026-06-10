@@ -7,7 +7,7 @@ use gix::object::tree::EntryKind;
 
 use crate::config::Refspec;
 use crate::error::{Error, Result};
-use crate::kernel::{Commit, Digest, Selection};
+use crate::kernel::{ArtifactName, Commit, Digest, Selection, SourceName, safe_component};
 use crate::store::ManifestFile;
 
 /// Re-exported beside the backends it composes; defined in `backend` to keep routing separate.
@@ -48,11 +48,11 @@ pub struct ExportResult {
 
 /// Borrowed parameters of [`SourceBackend::export_artifact`].
 pub struct ExportRequest<'a> {
-    pub source: &'a str,
+    pub source: &'a SourceName,
     pub url: &'a str,
     pub commit: &'a str,
     pub root: Option<&'a Path>,
-    pub artifact: &'a str,
+    pub artifact: &'a ArtifactName,
     pub selection: &'a Selection,
     pub policy: &'a ExportPolicy,
     pub staging_dir: &'a Path,
@@ -62,20 +62,20 @@ pub struct ExportRequest<'a> {
 /// `source` is the human name (diagnostics); `url` identifies the bare mirror,
 /// keyed by normalized-URL hash.
 pub trait SourceBackend {
-    fn fetch(&self, source: &str, url: &str) -> Result<()>;
+    fn fetch(&self, source: &SourceName, url: &str) -> Result<()>;
 
-    fn resolve(&self, source: &str, url: &str, refspec: &Refspec) -> Result<String>;
+    fn resolve(&self, source: &SourceName, url: &str, refspec: &Refspec) -> Result<String>;
 
-    fn commit_time(&self, source: &str, url: &str, commit: &str) -> Result<u64>;
+    fn commit_time(&self, source: &SourceName, url: &str, commit: &str) -> Result<u64>;
 
     fn discover_artifacts(
         &self,
-        source: &str,
+        source: &SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
         selection: &Selection,
-    ) -> Result<Vec<String>>;
+    ) -> Result<Vec<ArtifactName>>;
 
     fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult>;
 
@@ -90,7 +90,7 @@ pub trait SourceBackend {
     /// never this digest. Only test assertions read it.
     fn compute_digest(
         &self,
-        source: &str,
+        source: &SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
@@ -170,7 +170,7 @@ impl GitBackend {
 }
 
 impl SourceBackend for GitBackend {
-    fn fetch(&self, source: &str, url: &str) -> Result<()> {
+    fn fetch(&self, source: &SourceName, url: &str) -> Result<()> {
         let mirror = self.mirror_path(url);
 
         if mirror.exists() {
@@ -206,7 +206,7 @@ impl SourceBackend for GitBackend {
         Ok(())
     }
 
-    fn resolve(&self, source: &str, url: &str, refspec: &Refspec) -> Result<String> {
+    fn resolve(&self, source: &SourceName, url: &str, refspec: &Refspec) -> Result<String> {
         let mirror = self.mirror_path(url);
         let repo =
             gix::open(&mirror).map_err(|e| Error::Source(format!("open mirror {source}: {e}")))?;
@@ -241,7 +241,7 @@ impl SourceBackend for GitBackend {
         Ok(commit.id().to_hex().to_string())
     }
 
-    fn commit_time(&self, source: &str, url: &str, commit: &str) -> Result<u64> {
+    fn commit_time(&self, source: &SourceName, url: &str, commit: &str) -> Result<u64> {
         let mirror = self.mirror_path(url);
         let repo =
             gix::open(&mirror).map_err(|e| Error::Source(format!("open mirror {source}: {e}")))?;
@@ -262,14 +262,14 @@ impl SourceBackend for GitBackend {
 
     fn discover_artifacts(
         &self,
-        source: &str,
+        source: &SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
         selection: &Selection,
-    ) -> Result<Vec<String>> {
-        let repo = self.open_mirror(source, url)?;
-        let subtree = Self::subtree_at_root(&repo, source, commit, root)?;
+    ) -> Result<Vec<ArtifactName>> {
+        let repo = self.open_mirror(source.as_str(), url)?;
+        let subtree = Self::subtree_at_root(&repo, source.as_str(), commit, root)?;
 
         let mut artifacts = Vec::new();
         for entry in subtree.iter() {
@@ -288,7 +288,7 @@ impl SourceBackend for GitBackend {
                 continue;
             }
             if matches!(entry.kind(), EntryKind::Tree) {
-                artifacts.push(name);
+                artifacts.push(ArtifactName::new(name));
             }
         }
 
@@ -297,15 +297,20 @@ impl SourceBackend for GitBackend {
     }
 
     fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult> {
-        let repo = self.open_mirror(req.source, req.url)?;
-        let root_tree = Self::subtree_at_root(&repo, req.source, req.commit, req.root)?;
-        let artifact_tree = Self::lookup_subtree(&repo, &root_tree, req.source, req.artifact)?;
+        let repo = self.open_mirror(req.source.as_str(), req.url)?;
+        let root_tree = Self::subtree_at_root(&repo, req.source.as_str(), req.commit, req.root)?;
+        let artifact_tree = Self::lookup_subtree(
+            &repo,
+            &root_tree,
+            req.source.as_str(),
+            req.artifact.as_str(),
+        )?;
 
         std::fs::create_dir_all(req.staging_dir)?;
 
         let mut walk = ExportWalk {
             repo: &repo,
-            source: req.source,
+            source: req.source.as_str(),
             out_base: req.staging_dir,
             selection: req.selection,
             policy: req.policy,
@@ -324,19 +329,19 @@ impl SourceBackend for GitBackend {
 
     fn compute_digest(
         &self,
-        source: &str,
+        source: &SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
         selection: &Selection,
     ) -> Result<String> {
-        let repo = self.open_mirror(source, url)?;
-        let subtree = Self::subtree_at_root(&repo, source, commit, root)?;
+        let repo = self.open_mirror(source.as_str(), url)?;
+        let subtree = Self::subtree_at_root(&repo, source.as_str(), commit, root)?;
 
         let mut hasher = blake3::Hasher::new();
         Self::hash_tree(
             &repo,
-            source,
+            source.as_str(),
             &subtree,
             Path::new(""),
             selection,
@@ -498,14 +503,14 @@ impl HttpBackend {
 }
 
 impl SourceBackend for HttpBackend {
-    fn fetch(&self, source: &str, url: &str) -> Result<()> {
+    fn fetch(&self, source: &SourceName, url: &str) -> Result<()> {
         std::fs::create_dir_all(&self.git_dir)
             .map_err(|e| Error::Source(format!("source {source}: create git dir: {e}")))?;
         let temp = TempDownload::create(&self.git_dir);
 
         crate::http::download(url, &temp.path)?;
 
-        if let Some(expected) = self.digests.get(source) {
+        if let Some(expected) = self.digests.get(source.as_str()) {
             let bytes = std::fs::read(&temp.path)
                 .map_err(|e| Error::Source(format!("source {source}: read download: {e}")))?;
             crate::http::verify_digest(&bytes, expected)
@@ -518,7 +523,7 @@ impl SourceBackend for HttpBackend {
     }
 
     /// Resolve ignores the refspec: url sources live at refs/heads/phora.
-    fn resolve(&self, source: &str, url: &str, _refspec: &Refspec) -> Result<String> {
+    fn resolve(&self, source: &SourceName, url: &str, _refspec: &Refspec) -> Result<String> {
         let mirror = mirror_path(&self.git_dir, url);
         let repo =
             gix::open(&mirror).map_err(|e| Error::Source(format!("open mirror {source}: {e}")))?;
@@ -530,18 +535,18 @@ impl SourceBackend for HttpBackend {
         Ok(commit.id().to_hex().to_string())
     }
 
-    fn commit_time(&self, source: &str, url: &str, commit: &str) -> Result<u64> {
+    fn commit_time(&self, source: &SourceName, url: &str, commit: &str) -> Result<u64> {
         self.git.commit_time(source, url, commit)
     }
 
     fn discover_artifacts(
         &self,
-        source: &str,
+        source: &SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
         selection: &Selection,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<ArtifactName>> {
         self.git
             .discover_artifacts(source, url, commit, root, selection)
     }
@@ -552,7 +557,7 @@ impl SourceBackend for HttpBackend {
 
     fn compute_digest(
         &self,
-        source: &str,
+        source: &SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
@@ -876,17 +881,6 @@ pub fn is_local_path(git: &str) -> bool {
     path.is_absolute() || path.exists()
 }
 
-/// Rejects any filename that is not a single inert path component, so a malicious git tree or
-/// archive can never escape the staging dir when joined onto a path.
-pub(crate) fn safe_component(name: &str) -> Result<&str> {
-    let unsafe_component =
-        name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\');
-    if unsafe_component {
-        return Err(Error::Source(format!("unsafe path component: {name:?}")));
-    }
-    Ok(name)
-}
-
 fn hash_framed_entry(hasher: &mut blake3::Hasher, rel_path: &[u8], tag: &[u8], payload: &[u8]) {
     hasher.update(&(rel_path.len() as u64).to_le_bytes());
     hasher.update(rel_path);
@@ -924,6 +918,14 @@ mod tests {
     use std::process::Command;
 
     use tempfile::TempDir;
+
+    fn sn(name: &str) -> SourceName {
+        SourceName::new(name)
+    }
+
+    fn an(name: &str) -> ArtifactName {
+        ArtifactName::new(name)
+    }
 
     /// Author time on the tagged (first) commit; deliberately != committer time.
     const TAGGED_AUTHOR_TIME: u64 = 1_700_000_000;
@@ -1213,7 +1215,7 @@ mod tests {
         fixture
             .backend
             .compute_digest(
-                "src",
+                &sn("src"),
                 &fixture.url,
                 &fixture.commit,
                 Some(Path::new("art")),
@@ -1284,7 +1286,7 @@ mod tests {
 
         fixture
             .backend
-            .fetch("src", &fixture.url)
+            .fetch(&sn("src"), &fixture.url)
             .expect("fetch clones bare mirror");
 
         assert!(mirror.exists(), "mirror dir should exist after fetch");
@@ -1300,7 +1302,7 @@ mod tests {
 
         fixture
             .backend
-            .fetch("src", &fixture.url)
+            .fetch(&sn("src"), &fixture.url)
             .expect("first fetch clones");
 
         std::fs::write(fixture.src.path().join("THIRD.md"), b"third commit\n")
@@ -1312,12 +1314,12 @@ mod tests {
 
         fixture
             .backend
-            .fetch("src", &fixture.url)
+            .fetch(&sn("src"), &fixture.url)
             .expect("second fetch updates existing mirror");
 
         let resolved = fixture
             .backend
-            .resolve("src", &fixture.url, &Refspec::Branch("main".into()))
+            .resolve(&sn("src"), &fixture.url, &Refspec::Branch("main".into()))
             .expect("branch resolves after update fetch");
 
         assert_eq!(
@@ -1329,11 +1331,14 @@ mod tests {
     #[test]
     fn resolve_branch_main_returns_second_commit_not_tag() {
         let fixture = build_git_fixture();
-        fixture.backend.fetch("src", &fixture.url).expect("fetch");
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
 
         let resolved = fixture
             .backend
-            .resolve("src", &fixture.url, &Refspec::Branch("main".into()))
+            .resolve(&sn("src"), &fixture.url, &Refspec::Branch("main".into()))
             .expect("branch resolves to head commit");
 
         assert_eq!(resolved, fixture.head_sha);
@@ -1349,12 +1354,12 @@ mod tests {
 
         fixture
             .backend
-            .fetch("src", &fixture.url)
+            .fetch(&sn("src"), &fixture.url)
             .expect("first fetch clones bare mirror");
 
         let resolved = fixture
             .backend
-            .resolve("src", &fixture.url, &Refspec::Branch("develop".into()))
+            .resolve(&sn("src"), &fixture.url, &Refspec::Branch("develop".into()))
             .expect("non-default branch resolves after a single first-clone fetch");
 
         assert_eq!(
@@ -1366,11 +1371,14 @@ mod tests {
     #[test]
     fn resolve_tag_returns_tagged_commit_not_head() {
         let fixture = build_git_fixture();
-        fixture.backend.fetch("src", &fixture.url).expect("fetch");
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
 
         let resolved = fixture
             .backend
-            .resolve("src", &fixture.url, &Refspec::Tag("v1.0".into()))
+            .resolve(&sn("src"), &fixture.url, &Refspec::Tag("v1.0".into()))
             .expect("tag resolves to tagged commit");
 
         assert_eq!(resolved, fixture.tag_sha);
@@ -1383,11 +1391,18 @@ mod tests {
     #[test]
     fn resolve_rev_returns_same_sha() {
         let fixture = build_git_fixture();
-        fixture.backend.fetch("src", &fixture.url).expect("fetch");
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
 
         let resolved = fixture
             .backend
-            .resolve("src", &fixture.url, &Refspec::Rev(fixture.head_sha.clone()))
+            .resolve(
+                &sn("src"),
+                &fixture.url,
+                &Refspec::Rev(fixture.head_sha.clone()),
+            )
             .expect("rev resolves to itself");
 
         assert_eq!(resolved, fixture.head_sha);
@@ -1396,11 +1411,15 @@ mod tests {
     #[test]
     fn resolve_rev_for_absent_sha_errors() {
         let fixture = build_git_fixture();
-        fixture.backend.fetch("src", &fixture.url).expect("fetch");
-
-        let result = fixture
+        fixture
             .backend
-            .resolve("src", &fixture.url, &Refspec::Rev(ABSENT_SHA.into()));
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+
+        let result =
+            fixture
+                .backend
+                .resolve(&sn("src"), &fixture.url, &Refspec::Rev(ABSENT_SHA.into()));
 
         assert!(
             result.is_err(),
@@ -1411,11 +1430,15 @@ mod tests {
     #[test]
     fn resolve_nonexistent_branch_errors() {
         let fixture = build_git_fixture();
-        fixture.backend.fetch("src", &fixture.url).expect("fetch");
-
-        let result = fixture
+        fixture
             .backend
-            .resolve("src", &fixture.url, &Refspec::Branch("nope".into()));
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+
+        let result =
+            fixture
+                .backend
+                .resolve(&sn("src"), &fixture.url, &Refspec::Branch("nope".into()));
 
         assert!(result.is_err(), "missing branch must error");
     }
@@ -1424,9 +1447,10 @@ mod tests {
     fn resolve_without_fetch_errors() {
         let fixture = build_git_fixture();
 
-        let result = fixture
-            .backend
-            .resolve("src", &fixture.url, &Refspec::Branch("main".into()));
+        let result =
+            fixture
+                .backend
+                .resolve(&sn("src"), &fixture.url, &Refspec::Branch("main".into()));
 
         assert!(result.is_err(), "resolve without a mirror must error");
     }
@@ -1434,11 +1458,14 @@ mod tests {
     #[test]
     fn commit_time_returns_author_time_not_committer_time() {
         let fixture = build_git_fixture();
-        fixture.backend.fetch("src", &fixture.url).expect("fetch");
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
 
         let time = fixture
             .backend
-            .commit_time("src", &fixture.url, &fixture.tag_sha)
+            .commit_time(&sn("src"), &fixture.url, &fixture.tag_sha)
             .expect("commit time resolves");
 
         assert_eq!(
@@ -1702,21 +1729,20 @@ path = "srnnkls/tropos"
     #[test]
     fn discover_returns_top_level_artifact_dirs_sorted() {
         let fixture = build_export_fixture();
-        fixture.backend.fetch("src", &fixture.url).expect("fetch");
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
 
         let m = matcher(&[], &[]);
         let artifacts = fixture
             .backend
-            .discover_artifacts("src", &fixture.url, &fixture.commit, None, &m)
+            .discover_artifacts(&sn("src"), &fixture.url, &fixture.commit, None, &m)
             .expect("discover walks the git tree");
 
         assert_eq!(
             artifacts,
-            vec![
-                "editor".to_string(),
-                "linky".to_string(),
-                "lint".to_string()
-            ],
+            vec![an("editor"), an("linky"), an("lint")],
             "only top-level trees, sorted; root files and dotdirs excluded"
         );
     }
@@ -1724,16 +1750,19 @@ path = "srnnkls/tropos"
     #[test]
     fn discover_skips_dotdirs() {
         let fixture = build_export_fixture();
-        fixture.backend.fetch("src", &fixture.url).expect("fetch");
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
 
         let m = matcher(&[], &[]);
         let artifacts = fixture
             .backend
-            .discover_artifacts("src", &fixture.url, &fixture.commit, None, &m)
+            .discover_artifacts(&sn("src"), &fixture.url, &fixture.commit, None, &m)
             .expect("discover succeeds");
 
         assert!(
-            !artifacts.iter().any(|a| a == ".hidden"),
+            !artifacts.iter().any(|a| a.as_str() == ".hidden"),
             "names starting with '.' must be skipped"
         );
     }
@@ -1741,17 +1770,20 @@ path = "srnnkls/tropos"
     #[test]
     fn discover_applies_artifact_level_include() {
         let fixture = build_export_fixture();
-        fixture.backend.fetch("src", &fixture.url).expect("fetch");
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
 
         let m = matcher(&["editor"], &[]);
         let artifacts = fixture
             .backend
-            .discover_artifacts("src", &fixture.url, &fixture.commit, None, &m)
+            .discover_artifacts(&sn("src"), &fixture.url, &fixture.commit, None, &m)
             .expect("discover succeeds");
 
         assert_eq!(
             artifacts,
-            vec!["editor".to_string()],
+            vec![an("editor")],
             "artifact-level include must filter discovered names"
         );
     }
@@ -1761,13 +1793,16 @@ path = "srnnkls/tropos"
     #[test]
     fn discover_errors_on_symlink_as_artifact_at_root() {
         let fixture = build_fixture_with_root_symlink();
-        fixture.backend.fetch("src", &fixture.url).expect("fetch");
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
 
         let m = matcher(&[ROOT_SYMLINK_NAME], &[]);
         let result =
             fixture
                 .backend
-                .discover_artifacts("src", &fixture.url, &fixture.commit, None, &m);
+                .discover_artifacts(&sn("src"), &fixture.url, &fixture.commit, None, &m);
 
         let err = result
             .expect_err("v1: a symlink-as-artifact at root must error, not be silently dropped");
@@ -1789,13 +1824,16 @@ path = "srnnkls/tropos"
     #[test]
     fn discover_errors_on_excluded_root_symlink_before_filtering() {
         let fixture = build_fixture_with_root_symlink();
-        fixture.backend.fetch("src", &fixture.url).expect("fetch");
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
 
         let m = matcher(&[], &[ROOT_SYMLINK_NAME]);
         let result =
             fixture
                 .backend
-                .discover_artifacts("src", &fixture.url, &fixture.commit, None, &m);
+                .discover_artifacts(&sn("src"), &fixture.url, &fixture.commit, None, &m);
 
         let err = result.expect_err(
             "v1: a root symlink must error unconditionally, even when the matcher would exclude it",
@@ -1824,12 +1862,14 @@ path = "srnnkls/tropos"
         m: &Selection,
         policy: &ExportPolicy,
     ) -> Result<ExportResult> {
+        let source = sn("src");
+        let artifact = an(artifact);
         let req = ExportRequest {
-            source: "src",
+            source: &source,
             url: &fixture.url,
             commit: &fixture.commit,
             root: None,
-            artifact,
+            artifact: &artifact,
             selection: m,
             policy,
             staging_dir: staging,
@@ -1850,7 +1890,10 @@ path = "srnnkls/tropos"
     #[test]
     fn export_materializes_files_with_exact_content() {
         let fixture = build_export_fixture();
-        fixture.backend.fetch("src", &fixture.url).expect("fetch");
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
         let staging = TempDir::new().expect("staging dir");
 
         let m = matcher(&[], &["**/*.bak"]);
@@ -1870,7 +1913,10 @@ path = "srnnkls/tropos"
     #[test]
     fn export_excludes_bak_files_by_path_matcher() {
         let fixture = build_export_fixture();
-        fixture.backend.fetch("src", &fixture.url).expect("fetch");
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
         let staging = TempDir::new().expect("staging dir");
 
         let m = matcher(&[], &["**/*.bak"]);
@@ -1893,7 +1939,10 @@ path = "srnnkls/tropos"
     #[test]
     fn export_result_lists_exported_files() {
         let fixture = build_export_fixture();
-        fixture.backend.fetch("src", &fixture.url).expect("fetch");
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
         let staging = TempDir::new().expect("staging dir");
 
         let m = matcher(&[], &["**/*.bak"]);
@@ -1924,7 +1973,10 @@ path = "srnnkls/tropos"
     #[test]
     fn export_sets_mtime_to_commit_time() {
         let fixture = build_export_fixture();
-        fixture.backend.fetch("src", &fixture.url).expect("fetch");
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
         let staging = TempDir::new().expect("staging dir");
 
         let m = matcher(&[], &["**/*.bak"]);
@@ -1953,7 +2005,10 @@ path = "srnnkls/tropos"
         use std::os::unix::fs::PermissionsExt;
 
         let fixture = build_export_fixture();
-        fixture.backend.fetch("src", &fixture.url).expect("fetch");
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
         let staging = TempDir::new().expect("staging dir");
 
         let m = matcher(&[], &["**/*.bak"]);
@@ -1975,7 +2030,10 @@ path = "srnnkls/tropos"
     #[test]
     fn export_rejects_symlink_when_policy_disallows() {
         let fixture = build_export_fixture();
-        fixture.backend.fetch("src", &fixture.url).expect("fetch");
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
         let staging = TempDir::new().expect("staging dir");
 
         let m = matcher(&[], &[]);
@@ -2005,7 +2063,10 @@ path = "srnnkls/tropos"
     #[test]
     fn export_materializes_symlink_when_allowed() {
         let fixture = build_export_fixture();
-        fixture.backend.fetch("src", &fixture.url).expect("fetch");
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
         let staging = TempDir::new().expect("staging dir");
 
         let m = matcher(&[], &[]);
@@ -2034,16 +2095,19 @@ path = "srnnkls/tropos"
     #[test]
     fn compute_digest_is_blake3_prefixed_and_stable() {
         let fixture = build_export_fixture();
-        fixture.backend.fetch("src", &fixture.url).expect("fetch");
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
 
         let m = matcher(&[], &[]);
         let first = fixture
             .backend
-            .compute_digest("src", &fixture.url, &fixture.commit, None, &m)
+            .compute_digest(&sn("src"), &fixture.url, &fixture.commit, None, &m)
             .expect("digest computes");
         let second = fixture
             .backend
-            .compute_digest("src", &fixture.url, &fixture.commit, None, &m)
+            .compute_digest(&sn("src"), &fixture.url, &fixture.commit, None, &m)
             .expect("digest computes again");
 
         assert!(
@@ -2067,11 +2131,11 @@ path = "srnnkls/tropos"
         let two_files = build_collision_fixture(&[("a", b"X"), ("b", b"Y")]);
         one_file
             .backend
-            .fetch("src", &one_file.url)
+            .fetch(&sn("src"), &one_file.url)
             .expect("fetch one-file tree");
         two_files
             .backend
-            .fetch("src", &two_files.url)
+            .fetch(&sn("src"), &two_files.url)
             .expect("fetch two-file tree");
 
         assert_ne!(
@@ -2509,12 +2573,15 @@ path = "srnnkls/tropos"
     #[test]
     fn compute_digest_reflects_matched_tree_not_matcher_config() {
         let fixture = build_export_fixture();
-        fixture.backend.fetch("src", &fixture.url).expect("fetch");
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
 
         let digest = |m: &Selection| {
             fixture
                 .backend
-                .compute_digest("src", &fixture.url, &fixture.commit, None, m)
+                .compute_digest(&sn("src"), &fixture.url, &fixture.commit, None, m)
                 .expect("digest computes")
         };
 
@@ -2549,6 +2616,8 @@ path = "srnnkls/tropos"
         use crate::error::Error;
         use crate::kernel::{Digest, Selection};
         use crate::source::{ExportPolicy, ExportRequest, HttpBackend, SourceBackend, mirror_path};
+
+        use super::{an, sn};
 
         const HELLO_BODY: &[u8] = b"hi";
         const RUN_BODY: &[u8] = b"#!/bin/sh\n";
@@ -2627,11 +2696,11 @@ path = "srnnkls/tropos"
             let backend = HttpBackend::new(git_dir.path().to_path_buf(), BTreeMap::new());
 
             backend
-                .fetch("pkg", &url)
+                .fetch(&sn("pkg"), &url)
                 .expect("fetch downloads, extracts, and imports a tree");
 
             let resolved = backend
-                .resolve("pkg", &url, &Refspec::Branch("main".into()))
+                .resolve(&sn("pkg"), &url, &Refspec::Branch("main".into()))
                 .expect("resolve must read refs/heads/phora, ignoring the bogus Branch(main)");
 
             assert_eq!(resolved.len(), 40, "resolve returns a 40-hex commit id");
@@ -2641,7 +2710,7 @@ path = "srnnkls/tropos"
             );
 
             let none_resolved = backend
-                .resolve("pkg", &url, &Refspec::None)
+                .resolve(&sn("pkg"), &url, &Refspec::None)
                 .expect("resolve with Refspec::None must also read the synthetic phora head");
             assert_eq!(
                 none_resolved, resolved,
@@ -2657,13 +2726,13 @@ path = "srnnkls/tropos"
             let git_dir = TempDir::new().expect("git_dir tempdir");
             let backend = HttpBackend::new(git_dir.path().to_path_buf(), BTreeMap::new());
 
-            backend.fetch("pkg", &url).expect("fetch");
+            backend.fetch(&sn("pkg"), &url).expect("fetch");
             let commit = backend
-                .resolve("pkg", &url, &Refspec::None)
+                .resolve(&sn("pkg"), &url, &Refspec::None)
                 .expect("resolve synthetic head");
 
             let time = backend
-                .commit_time("pkg", &url, &commit)
+                .commit_time(&sn("pkg"), &url, &commit)
                 .expect("commit_time of synthetic commit");
             assert_eq!(
                 time, 1,
@@ -2678,18 +2747,18 @@ path = "srnnkls/tropos"
             let git_dir = TempDir::new().expect("git_dir tempdir");
             let backend = HttpBackend::new(git_dir.path().to_path_buf(), BTreeMap::new());
 
-            backend.fetch("pkg", &url).expect("fetch");
+            backend.fetch(&sn("pkg"), &url).expect("fetch");
             let commit = backend
-                .resolve("pkg", &url, &Refspec::None)
+                .resolve(&sn("pkg"), &url, &Refspec::None)
                 .expect("resolve synthetic head");
             let m = empty_matcher();
 
             let artifacts = backend
-                .discover_artifacts("pkg", &url, &commit, None, &m)
+                .discover_artifacts(&sn("pkg"), &url, &commit, None, &m)
                 .expect("discover artifacts over the synthetic tree");
             assert_eq!(
                 artifacts,
-                vec!["bin".to_string()],
+                vec![an("bin")],
                 "after pkg-1.0/ strip the only top-level directory artifact is `bin`; \
                  `hello.txt` is a root file, not an artifact dir"
             );
@@ -2700,13 +2769,15 @@ path = "srnnkls/tropos"
                 allow_submodules: false,
                 preserve_executable: true,
             };
+            let source = sn("pkg");
+            let artifact = an("bin");
             let export = backend
                 .export_artifact(&ExportRequest {
-                    source: "pkg",
+                    source: &source,
                     url: &url,
                     commit: &commit,
                     root: None,
-                    artifact: "bin",
+                    artifact: &artifact,
                     selection: &m,
                     policy: &policy,
                     staging_dir: staging.path(),
@@ -2776,11 +2847,11 @@ path = "srnnkls/tropos"
             let backend = HttpBackend::new(git_dir.path().to_path_buf(), digests);
 
             backend
-                .fetch("pkg", &url)
+                .fetch(&sn("pkg"), &url)
                 .expect("a matching configured digest must let fetch succeed");
 
             backend
-                .resolve("pkg", &url, &Refspec::None)
+                .resolve(&sn("pkg"), &url, &Refspec::None)
                 .expect("a verified fetch must create refs/heads/phora");
         }
 
@@ -2797,7 +2868,7 @@ path = "srnnkls/tropos"
             let backend = HttpBackend::new(git_dir.path().to_path_buf(), digests);
 
             let err = backend
-                .fetch("pkg", &url)
+                .fetch(&sn("pkg"), &url)
                 .expect_err("a non-matching configured digest must fail fetch");
             match err {
                 Error::Source(msg) => assert!(
@@ -2818,7 +2889,7 @@ path = "srnnkls/tropos"
                  must not even be initialized"
             );
             assert!(
-                backend.resolve("pkg", &url, &Refspec::None).is_err(),
+                backend.resolve(&sn("pkg"), &url, &Refspec::None).is_err(),
                 "with no synthetic head imported, resolve must fail after a rejected fetch"
             );
         }
@@ -2837,9 +2908,9 @@ path = "srnnkls/tropos"
             let git_dir = TempDir::new().expect("git_dir tempdir");
             let backend = HttpBackend::new(git_dir.path().to_path_buf(), BTreeMap::new());
 
-            backend.fetch("pkg", &url).expect("fetch");
+            backend.fetch(&sn("pkg"), &url).expect("fetch");
             let commit = backend
-                .resolve("pkg", &url, &Refspec::None)
+                .resolve(&sn("pkg"), &url, &Refspec::None)
                 .expect("resolve synthetic head");
 
             let mirror = mirror_path(git_dir.path(), &url);

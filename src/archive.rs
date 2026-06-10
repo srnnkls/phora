@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use flate2::read::GzDecoder;
 
 use crate::error::{Error, Result};
-use crate::source::safe_component;
+use crate::kernel::safe_component;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {

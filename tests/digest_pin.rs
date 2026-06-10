@@ -2,11 +2,16 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::str::FromStr;
 
 use phora::config::Refspec;
-use phora::kernel::Selection;
+use phora::kernel::{Selection, SourceName};
 use phora::source::{GitBackend, SourceBackend};
 use tempfile::TempDir;
+
+fn sn(name: &str) -> SourceName {
+    SourceName::from_str(name).expect("valid source name")
+}
 
 fn git(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -68,7 +73,9 @@ fn build_fixture() -> DigestFixture {
     let git_dir = TempDir::new().expect("git dir tempdir");
     let backend = GitBackend::new(git_dir.path().to_path_buf());
     let url = root.to_string_lossy().into_owned();
-    backend.fetch("fixture", &url).expect("fetch builds mirror");
+    backend
+        .fetch(&sn("fixture"), &url)
+        .expect("fetch builds mirror");
 
     DigestFixture {
         _src: src,
@@ -93,7 +100,7 @@ fn digest(
     fixture
         .backend
         .compute_digest(
-            "fixture",
+            &sn("fixture"),
             &fixture.url,
             &fixture.commit,
             root.map(Path::new),
@@ -107,7 +114,11 @@ fn resolve_matches_committed_head() {
     let fixture = build_fixture();
     let resolved = fixture
         .backend
-        .resolve("fixture", &fixture.url, &Refspec::Branch("main".to_owned()))
+        .resolve(
+            &sn("fixture"),
+            &fixture.url,
+            &Refspec::Branch("main".to_owned()),
+        )
         .expect("branch resolves");
     assert_eq!(
         resolved, fixture.commit,
