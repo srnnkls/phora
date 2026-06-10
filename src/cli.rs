@@ -6,9 +6,9 @@ use std::path::Path;
 
 use clap::{Parser, Subcommand};
 
-use crate::config::{Config, Host, Source, SourceMode, builtin_forges};
+use crate::config::{Config, Host, ParsedSource, builtin_forges};
 use crate::error::{Error, Result};
-use crate::kernel::{Digest, Selection};
+use crate::kernel::Selection;
 use crate::lock::{Lock, merge_locks};
 use crate::paths::{ProjectId, phora_dir};
 use crate::projection::{ArtifactState, check_artifact_state};
@@ -208,7 +208,7 @@ fn run_add(
     Ok(())
 }
 
-fn describe_source(source: &ParsedSource) -> String {
+fn describe_source(source: &AddTarget) -> String {
     match (&source.git, &source.host, &source.repo) {
         (Some(git), _, _) => git.clone(),
         (None, Some(host), Some(repo)) => format!("{host}:{repo}"),
@@ -219,7 +219,7 @@ fn describe_source(source: &ParsedSource) -> String {
 fn insert_source_with_ref(
     doc_text: &str,
     name: &str,
-    source: &ParsedSource,
+    source: &AddTarget,
     branch: Option<&str>,
     tag: Option<&str>,
     root: Option<&str>,
@@ -244,7 +244,7 @@ fn insert_source_with_ref(
     Ok(doc.to_string())
 }
 
-fn source_table(source: &ParsedSource) -> toml_edit::Table {
+fn source_table(source: &AddTarget) -> toml_edit::Table {
     let mut table = toml_edit::Table::new();
     if let Some(git) = &source.git {
         table["git"] = toml_edit::value(git.as_str());
@@ -301,14 +301,9 @@ fn build_router(
 ) -> Result<RouterBackend<GitBackend, HttpBackend>> {
     let mut modes = BTreeMap::new();
     let mut digests = BTreeMap::new();
-    for (name, source) in &config.sources {
+    for (name, source) in &config.parsed_sources()? {
         modes.insert(name.clone(), source.mode());
-        if source.mode() == SourceMode::Url
-            && let Some(raw) = source.digest.as_deref()
-        {
-            let digest: Digest = raw
-                .parse()
-                .map_err(|e| Error::Config(format!("source `{name}`: {e}")))?;
+        if let Some(digest) = source.digest() {
             digests.insert(name.clone(), digest);
         }
     }
@@ -469,11 +464,12 @@ fn load_config_from(dir: &Path) -> Result<Config> {
     Config::parse(&text)
 }
 
-fn load_source(name: &str) -> Result<Source> {
-    load_config()?
+fn load_source(name: &str) -> Result<ParsedSource> {
+    let source = load_config()?
         .sources
         .remove(name)
-        .ok_or_else(|| Error::Config(format!("source `{name}` not found in phora.toml")))
+        .ok_or_else(|| Error::Config(format!("source `{name}` not found in phora.toml")))?;
+    ParsedSource::parse(name, &source)
 }
 
 fn print_verify(mismatches: &[crate::sync::VerifyMismatch]) {
@@ -509,7 +505,7 @@ fn print_where_matches(matches: &[WhereMatch]) {
     }
 }
 
-fn print_check_match(source: &Source, path: &str, report: &CheckMatchReport) {
+fn print_check_match(source: &ParsedSource, path: &str, report: &CheckMatchReport) {
     let artifact = path.split('/').next().unwrap_or(path);
     println!(
         "artifact `{artifact}`: {}",
@@ -597,7 +593,7 @@ pub fn where_cmd(registry: &dyn Registry, filter: &WhereFilter) -> Result<Vec<Wh
 
 /// Reports artifact-level and path-level allow decisions for `path` under `source`.
 #[must_use]
-pub fn check_match_cmd(source: &Source, path: &str) -> CheckMatchReport {
+pub fn check_match_cmd(source: &ParsedSource, path: &str) -> CheckMatchReport {
     let Ok(selection) = Selection::new(source.includes(), source.excludes()) else {
         return CheckMatchReport {
             artifact_allowed: false,
@@ -614,7 +610,7 @@ pub fn check_match_cmd(source: &Source, path: &str) -> CheckMatchReport {
 /// A source derived from an `add` URL/shorthand, before name overrides. Either
 /// literal (`git` is `Some`) or symbolic forge (`host`/`repo` are `Some`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParsedSource {
+pub struct AddTarget {
     pub name: String,
     pub git: Option<String>,
     pub host: Option<String>,
@@ -624,13 +620,13 @@ pub struct ParsedSource {
     pub root: Option<String>,
 }
 
-/// Expands an `add` URL/shorthand into a [`ParsedSource`] using the built-in
+/// Expands an `add` URL/shorthand into an [`AddTarget`] using the built-in
 /// forge registry overlaid by any host in `hosts`.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Config`] if the input cannot be parsed into owner/repo.
-pub fn parse_add_url(input: &str, hosts: &BTreeMap<String, Host>) -> Result<ParsedSource> {
+pub fn parse_add_url(input: &str, hosts: &BTreeMap<String, Host>) -> Result<AddTarget> {
     if is_scp_ssh(input) {
         return Ok(parse_scp_ssh(input));
     }
@@ -643,7 +639,7 @@ pub fn parse_add_url(input: &str, hosts: &BTreeMap<String, Host>) -> Result<Pars
     parse_shorthand(input, &domain_to_name(hosts))
 }
 
-fn parse_colon_alias(input: &str, host: &str, path: &str) -> Result<ParsedSource> {
+fn parse_colon_alias(input: &str, host: &str, path: &str) -> Result<AddTarget> {
     if host.is_empty() {
         return Err(Error::Config(format!("empty host in `{input}`")));
     }
@@ -673,8 +669,8 @@ fn domain_to_name(hosts: &BTreeMap<String, Host>) -> BTreeMap<String, String> {
         .collect()
 }
 
-fn symbolic_source(host: String, repo: &str, root: Option<String>) -> ParsedSource {
-    ParsedSource {
+fn symbolic_source(host: String, repo: &str, root: Option<String>) -> AddTarget {
+    AddTarget {
         name: repo_name(repo),
         git: None,
         host: Some(host),
@@ -707,7 +703,7 @@ fn is_scp_ssh(input: &str) -> bool {
     }
 }
 
-fn parse_scp_ssh(input: &str) -> ParsedSource {
+fn parse_scp_ssh(input: &str) -> AddTarget {
     literal_source(repo_name(input), input.to_owned(), None, None)
 }
 
@@ -716,8 +712,8 @@ fn literal_source(
     git: String,
     branch: Option<String>,
     root: Option<String>,
-) -> ParsedSource {
-    ParsedSource {
+) -> AddTarget {
+    AddTarget {
         name,
         git: Some(git),
         host: None,
@@ -733,7 +729,7 @@ fn split_scheme(input: &str) -> Option<(&str, &str)> {
     matches!(scheme, "https" | "http" | "ssh").then_some((scheme, rest))
 }
 
-fn parse_full_url(input: &str, scheme: &str, rest: &str) -> Result<ParsedSource> {
+fn parse_full_url(input: &str, scheme: &str, rest: &str) -> Result<AddTarget> {
     let (host, path) = rest
         .split_once('/')
         .ok_or_else(|| Error::Config(format!("cannot parse owner/repo from `{input}`")))?;
@@ -757,7 +753,7 @@ fn parse_full_url(input: &str, scheme: &str, rest: &str) -> Result<ParsedSource>
     Ok(literal_source(name, with_git_suffix(input), None, None))
 }
 
-fn parse_shorthand(input: &str, domains: &BTreeMap<String, String>) -> Result<ParsedSource> {
+fn parse_shorthand(input: &str, domains: &BTreeMap<String, String>) -> Result<AddTarget> {
     let segments: Vec<&str> = input.split('/').filter(|s| !s.is_empty()).collect();
     let first = segments
         .first()
@@ -822,7 +818,7 @@ fn with_git_suffix(url: &str) -> String {
 pub fn insert_source(
     doc_text: &str,
     name: &str,
-    source: &ParsedSource,
+    source: &AddTarget,
     root: Option<&str>,
 ) -> Result<String> {
     let mut doc = doc_text
@@ -1065,7 +1061,7 @@ mod tests {
         (dir, reg)
     }
 
-    fn source_with(include: &[&str], exclude: &[&str]) -> Source {
+    fn source_with(include: &[&str], exclude: &[&str]) -> ParsedSource {
         use std::fmt::Write as _;
         let mut body = String::from("version = 1\n\n[sources.s]\ngit = \"https://x.git\"\n");
         if !include.is_empty() {
@@ -1084,11 +1080,12 @@ mod tests {
                 .join(", ");
             let _ = writeln!(body, "exclude = [{list}]");
         }
-        crate::config::Config::parse(&body)
+        let raw = crate::config::Config::parse(&body)
             .expect("source toml parses")
             .sources
             .remove("s")
-            .expect("source `s` present")
+            .expect("source `s` present");
+        ParsedSource::parse("s", &raw).expect("source parses to typed form")
     }
 
     fn find<'a>(matches: &'a [WhereMatch], source: &str, artifact: &str) -> Option<&'a WhereMatch> {
@@ -1335,7 +1332,7 @@ mod tests {
         BTreeMap::new()
     }
 
-    fn parse(input: &str) -> ParsedSource {
+    fn parse(input: &str) -> AddTarget {
         parse_add_url(input, &no_hosts()).unwrap_or_else(|e| panic!("parse `{input}`: {e}"))
     }
 
@@ -1617,8 +1614,8 @@ mod tests {
 
     const ADD_BASE: &str = "version = 1\n\n[sources.foo]\ngit = \"https://github.com/me/foo.git\"\nbranch = \"main\"\n";
 
-    fn lit(git: &str, branch: Option<&str>) -> ParsedSource {
-        ParsedSource {
+    fn lit(git: &str, branch: Option<&str>) -> AddTarget {
+        AddTarget {
             name: String::new(),
             git: Some(git.to_owned()),
             host: None,
@@ -1825,7 +1822,7 @@ mod tests {
     use crate::source::Protocol;
 
     /// Re-parses inserted text and returns the named source, asserting validity.
-    fn source_from(out: &str, name: &str) -> Source {
+    fn source_from(out: &str, name: &str) -> crate::config::Source {
         Config::parse(out)
             .unwrap_or_else(|e| panic!("inserted text must be valid phora.toml: {e}\n{out}"))
             .sources
@@ -1987,7 +1984,7 @@ mod tests {
     fn run_add_writer_writes_host_and_repo_for_symbolic_forge_add() {
         let parsed = parse("github:srnnkls/tropos");
         let out = insert_source_with_ref("version = 1\n", &parsed.name, &parsed, None, None, None)
-            .expect("run_add's writer must accept a symbolic forge ParsedSource");
+            .expect("run_add's writer must accept a symbolic forge AddTarget");
 
         assert!(
             out.contains("repo = \"srnnkls/tropos\""),
@@ -2023,7 +2020,7 @@ mod tests {
     fn run_add_writer_writes_symbolic_host_path_for_colon_alias() {
         let parsed = parse("github:srnnkls/tropos");
         let out = insert_source_with_ref("version = 1\n", &parsed.name, &parsed, None, None, None)
-            .expect("run_add's writer must accept a symbolic ParsedSource");
+            .expect("run_add's writer must accept a symbolic AddTarget");
 
         assert!(
             out.contains("[sources.tropos]"),
@@ -2109,7 +2106,7 @@ mod tests {
     fn insert_source_also_writes_symbolic_host_path_for_colon_alias() {
         let parsed = parse("gitlab:owner/repo");
         let out = insert_source("version = 1\n", &parsed.name, &parsed, None)
-            .expect("the second writer must also accept a symbolic ParsedSource");
+            .expect("the second writer must also accept a symbolic AddTarget");
 
         assert!(
             !out.contains("git ="),
@@ -2150,7 +2147,7 @@ mod tests {
             "the default-protocol silence is only meaningful if host+repo are still written, got:\n{default_out}"
         );
 
-        let ssh_src = ParsedSource {
+        let ssh_src = AddTarget {
             protocol: Some(Protocol::Ssh),
             ..parse("github:srnnkls/tropos")
         };

@@ -1575,7 +1575,7 @@ mod tests {
     fn symbolic_https_ssh_and_literal_collapse_to_one_mirror_key() {
         use std::collections::BTreeMap;
 
-        use crate::config::{Config, Host};
+        use crate::config::{Config, Host, ParsedSource};
 
         let symbolic = Config::parse(
             r#"
@@ -1587,7 +1587,8 @@ path = "srnnkls/tropos"
 "#,
         )
         .expect("symbolic config parses");
-        let source = symbolic.sources.get("tropos").expect("tropos source");
+        let raw = symbolic.sources.get("tropos").expect("tropos source");
+        let source = ParsedSource::parse("tropos", raw).expect("tropos parses to typed form");
         let no_user_hosts: BTreeMap<String, Host> = BTreeMap::new();
 
         let symbolic_https = source

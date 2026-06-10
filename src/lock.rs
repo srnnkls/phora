@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Host, Protocol, Source, SourceMode};
+use crate::config::{Host, ParsedSource, Protocol, SourceMode};
 use crate::source::NormalizedUrl;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,7 +50,7 @@ pub fn merge_locks(base: &Lock, local: Option<&Lock>) -> Lock {
 /// never matches.
 #[must_use]
 pub fn source_matches(
-    source: &Source,
+    source: &ParsedSource,
     locked: &LockedSource,
     hosts: &BTreeMap<String, Host>,
     protocol: Protocol,
@@ -124,13 +124,14 @@ mod tests {
         }
     }
 
-    fn source_from(toml_body: &str) -> Source {
+    fn source_from(toml_body: &str) -> ParsedSource {
         let toml = format!("version = 1\n\n[sources.s]\n{toml_body}");
-        Config::parse(&toml)
+        let raw = Config::parse(&toml)
             .expect("source toml parses")
             .sources
             .remove("s")
-            .expect("source `s` present")
+            .expect("source `s` present");
+        ParsedSource::parse("s", &raw).expect("source parses to typed form")
     }
 
     // PAM-009: lock TOML round-trip
@@ -542,7 +543,7 @@ config_digest = \"PLACEHOLDER\"
 
     /// A url-mode `Source`: only `url` set, so `mode()` is `SourceMode::Url` and
     /// `resolved_remote` fabricates a bogus github url that must NOT be consulted.
-    fn url_source(url: &str) -> Source {
+    fn url_source(url: &str) -> ParsedSource {
         source_from(&format!("url = \"{url}\"\n"))
     }
 

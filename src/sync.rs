@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::{
-    Config, DeployMode, LayoutKind, Protocol, Source, SourceMode, Target, merge_configs,
+    Config, DeployMode, LayoutKind, ParsedSource, Protocol, SourceMode, Target, merge_configs,
 };
 use crate::error::{Error, Result};
 use crate::kernel::Selection;
@@ -77,18 +77,21 @@ fn target_parent(path: &Path) -> PathBuf {
 }
 
 /// The protocol a source resolves under: its own, else the global default, else https.
-fn effective_protocol(source: &Source, config: &Config) -> Protocol {
+fn effective_protocol(source: &ParsedSource, config: &Config) -> Protocol {
     source
-        .protocol
+        .protocol()
         .or(config.protocol)
         .unwrap_or(Protocol::Https)
 }
 
 /// Resolves every source's concrete remote once, keyed by source name. A resolution
 /// failure (unknown host, missing protocol template) surfaces named by source.
-fn resolved_remotes(config: &Config) -> Result<BTreeMap<String, String>> {
+fn resolved_remotes(
+    config: &Config,
+    parsed: &BTreeMap<String, ParsedSource>,
+) -> Result<BTreeMap<String, String>> {
     let mut remotes = BTreeMap::new();
-    for (name, source) in &config.sources {
+    for (name, source) in parsed {
         let remote = if source.mode() == SourceMode::Url {
             source
                 .source_url()
@@ -126,8 +129,9 @@ pub fn sync(
     let effective_config = merge_configs(input.base_config.clone(), input.local_config.cloned());
     effective_config.validate()?;
     validate_source_references(&effective_config)?;
-    let remotes = resolved_remotes(&effective_config)?;
-    validate_link_mode(input.base_config, &effective_config, &remotes)?;
+    let parsed = effective_config.parsed_sources()?;
+    let remotes = resolved_remotes(&effective_config, &parsed)?;
+    validate_link_mode(input.base_config, &parsed, &remotes)?;
     let effective_lock = match (&input.base_lock, &input.local_lock) {
         (Some(base), local) => Some(merge_locks(base, local.as_ref())),
         (None, Some(local)) => Some(local.clone()),
@@ -151,6 +155,7 @@ pub fn sync(
 
     let (routed, resolved_commits) = resolve_sources(
         &effective_config,
+        &parsed,
         &remotes,
         effective_lock.as_ref(),
         backend,
@@ -163,7 +168,7 @@ pub fn sync(
     for (target_name, target) in &effective_config.targets {
         had_failures |= deploy_target(
             TargetRun {
-                config: &effective_config,
+                parsed: &parsed,
                 target_name,
                 target,
                 commits: &resolved_commits,
@@ -184,6 +189,7 @@ pub fn sync(
         } else {
             prune_orphans(
                 &effective_config,
+                &parsed,
                 &remotes,
                 backend,
                 registry,
@@ -214,18 +220,18 @@ fn validate_source_references(config: &Config) -> Result<()> {
 
 fn validate_link_mode(
     base: &Config,
-    effective: &Config,
+    effective: &BTreeMap<String, ParsedSource>,
     remotes: &BTreeMap<String, String>,
 ) -> Result<()> {
     for (name, source) in &base.sources {
-        if source.deploy_mode() == DeployMode::Link {
+        if source.deploy == Some(DeployMode::Link) {
             return Err(Error::Config(format!(
                 "source `{name}`: deploy = \"link\" is only allowed in phora.local.toml, \
                  not the committed config"
             )));
         }
     }
-    for (name, source) in &effective.sources {
+    for (name, source) in effective {
         let git = remote_for(remotes, name)?;
         if source.deploy_mode() == DeployMode::Link && !is_local_path(git) {
             return Err(Error::Config(format!(
@@ -239,7 +245,7 @@ fn validate_link_mode(
 
 #[derive(Clone, Copy)]
 struct TargetRun<'a> {
-    config: &'a Config,
+    parsed: &'a BTreeMap<String, ParsedSource>,
     target_name: &'a str,
     target: &'a Target,
     commits: &'a BTreeMap<String, String>,
@@ -261,8 +267,8 @@ fn deploy_target(
     let mut seen: BTreeMap<String, String> = BTreeMap::new();
     let mut had_failures = false;
 
-    for source_name in run.target.resolve_sources(&run.config.sources) {
-        let source = run.config.sources.get(source_name).ok_or_else(|| {
+    for source_name in run.target.resolve_sources(run.parsed) {
+        let source = run.parsed.get(source_name).ok_or_else(|| {
             Error::Config(format!("target references undefined source: {source_name}"))
         })?;
         let commit = &run.commits[source_name];
@@ -311,7 +317,7 @@ fn deploy_target(
 }
 
 struct ArtifactEntry<'a> {
-    source: &'a Source,
+    source: &'a ParsedSource,
     git: &'a str,
     source_name: &'a str,
     commit: &'a str,
@@ -454,6 +460,7 @@ type RoutedSources = (Vec<(String, LockedSource)>, BTreeMap<String, String>);
 
 fn resolve_sources(
     config: &Config,
+    parsed: &BTreeMap<String, ParsedSource>,
     remotes: &BTreeMap<String, String>,
     effective_lock: Option<&Lock>,
     backend: &dyn SourceBackend,
@@ -462,7 +469,7 @@ fn resolve_sources(
     let mut routed = Vec::new();
     let mut resolved_commits = BTreeMap::new();
 
-    for (name, source) in &config.sources {
+    for (name, source) in parsed {
         let git = remote_for(remotes, name)?;
         if source.deploy_mode() == DeployMode::Link {
             let commit = read_local_head(git)?;
@@ -524,7 +531,7 @@ fn resolve_sources(
 struct DeployContext<'a> {
     target_path: &'a Path,
     layout_kind: LayoutKind,
-    source: &'a Source,
+    source: &'a ParsedSource,
     git: &'a str,
     source_name: &'a str,
     commit: &'a str,
@@ -709,7 +716,7 @@ fn discover_working_tree(
 }
 
 fn discover_artifacts_for_source(
-    source: &Source,
+    source: &ParsedSource,
     git: &str,
     source_name: &str,
     commit: &str,
@@ -728,6 +735,7 @@ fn discover_artifacts_for_source(
 
 fn prune_orphans(
     config: &Config,
+    parsed: &BTreeMap<String, ParsedSource>,
     remotes: &BTreeMap<String, String>,
     backend: &dyn SourceBackend,
     registry: &dyn Registry,
@@ -735,8 +743,8 @@ fn prune_orphans(
 ) -> Result<()> {
     let mut expected: HashSet<ArtifactKey> = HashSet::new();
     for (target_name, target) in &config.targets {
-        for source_name in target.resolve_sources(&config.sources) {
-            let source = config.sources.get(source_name).ok_or_else(|| {
+        for source_name in target.resolve_sources(parsed) {
+            let source = parsed.get(source_name).ok_or_else(|| {
                 Error::Config(format!("target references undefined source: {source_name}"))
             })?;
             let commit = &resolved_commits[source_name];
@@ -918,14 +926,15 @@ pub fn rebuild_registry(
     registry: &dyn Registry,
 ) -> Result<RebuildReport> {
     let mut report = RebuildReport::default();
-    let remotes = resolved_remotes(config)?;
+    let parsed = config.parsed_sources()?;
+    let remotes = resolved_remotes(config, &parsed)?;
 
     for (target_name, target) in &config.targets {
         let mut managed: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut selections: Vec<Selection> = Vec::new();
 
-        for source_name in target.resolve_sources(&config.sources) {
-            let source = config.sources.get(source_name).ok_or_else(|| {
+        for source_name in target.resolve_sources(&parsed) {
+            let source = parsed.get(source_name).ok_or_else(|| {
                 Error::Config(format!("target references undefined source: {source_name}"))
             })?;
             let locked = lock.find_source(source_name).ok_or_else(|| {
@@ -996,7 +1005,7 @@ pub fn rebuild_registry(
 struct RebuildOne<'a> {
     backend: &'a dyn SourceBackend,
     registry: &'a dyn Registry,
-    source: &'a Source,
+    source: &'a ParsedSource,
     git: &'a str,
     source_name: &'a str,
     commit: &'a str,
@@ -1503,7 +1512,7 @@ mod tests {
     /// Differs from [`expected_digest`] whenever sync ignores include/exclude/root.
     fn expected_digest_for_source(
         fx: &SyncFixture,
-        source: &crate::config::Source,
+        source: &ParsedSource,
         name: &str,
         commit: &str,
     ) -> String {
@@ -1514,11 +1523,13 @@ mod tests {
             .expect("scoped digest computes over fixture tree")
     }
 
+    fn parsed_of(cfg: &Config, name: &str) -> ParsedSource {
+        let raw = cfg.sources.get(name).expect("source present");
+        ParsedSource::parse(name, raw).expect("source parses to typed form")
+    }
+
     fn config_digest_of(cfg: &Config, name: &str) -> String {
-        cfg.sources
-            .get(name)
-            .expect("source present")
-            .config_digest()
+        parsed_of(cfg, name).config_digest()
     }
 
     // ── Phase 1: resolve + lock build ──────────────────────────────
@@ -1527,7 +1538,7 @@ mod tests {
     fn resolves_source_with_no_prior_lock_into_base_lock() {
         let fx = build_sync_fixture();
         let cfg = config_with_scoped_source("editor-src", &fx.url);
-        let source = cfg.sources.get("editor-src").expect("source present");
+        let source = parsed_of(&cfg, "editor-src");
         let in_ = input(&cfg, None, None, None, false);
 
         let out = sync(&in_, &fx.backend, &fx.registry).expect("sync resolves a fresh source");
@@ -1557,7 +1568,7 @@ mod tests {
         assert_eq!(locked.git, fx.url, "locked git url matches the source");
         assert_eq!(
             locked.digest,
-            expected_digest_for_source(&fx, source, "editor-src", &fx.head_sha),
+            expected_digest_for_source(&fx, &source, "editor-src", &fx.head_sha),
             "digest must equal compute_digest with the source's own root + include/exclude"
         );
         assert_ne!(
@@ -1598,8 +1609,9 @@ mod tests {
         // No mirror is seeded for fx.url: a fetch/compute_digest would error.
 
         let counting = CountingBackend::new(&fx.backend);
-        let remotes = resolved_remotes(&cfg).expect("remotes resolve");
-        let (routed, _commits) = resolve_sources(&cfg, &remotes, None, &counting, false)
+        let parsed = cfg.parsed_sources().expect("sources parse");
+        let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+        let (routed, _commits) = resolve_sources(&cfg, &parsed, &remotes, None, &counting, false)
             .expect("link source resolves with no reachable mirror");
 
         let (_name, locked) = routed
@@ -1634,8 +1646,9 @@ mod tests {
         let cfg = config_with_link_source("dev-src", &fx.url);
 
         let counting = CountingBackend::new(&fx.backend);
-        let remotes = resolved_remotes(&cfg).expect("remotes resolve");
-        let _ = resolve_sources(&cfg, &remotes, None, &counting, false)
+        let parsed = cfg.parsed_sources().expect("sources parse");
+        let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+        let _ = resolve_sources(&cfg, &parsed, &remotes, None, &counting, false)
             .expect("link source resolves without touching the mirror");
 
         assert_eq!(
@@ -1656,7 +1669,7 @@ mod tests {
     fn matching_lock_reuses_commit_without_refetch() {
         let fx = build_sync_fixture();
         let cfg = config_with_source("editor-src", &fx.url);
-        let source = cfg.sources.get("editor-src").expect("source present");
+        let source = parsed_of(&cfg, "editor-src");
 
         // Pre-seed the mirror so compute_digest can read the tree without sync fetching.
         fx.backend.fetch("editor-src", &fx.url).expect("seed fetch");
@@ -1748,7 +1761,7 @@ mod tests {
     fn force_refetches_even_when_lock_matches() {
         let fx = build_sync_fixture();
         let cfg = config_with_source("editor-src", &fx.url);
-        let source = cfg.sources.get("editor-src").expect("source present");
+        let source = parsed_of(&cfg, "editor-src");
         fx.backend.fetch("editor-src", &fx.url).expect("seed fetch");
 
         let matching = Lock {
@@ -2422,7 +2435,7 @@ mod tests {
         let cfg =
             config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
         let target = cfg.targets.get("dest").expect("dest target present");
-        let source = cfg.sources.get("editor-src").expect("source present");
+        let source = parsed_of(&cfg, "editor-src");
 
         let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
         std::fs::create_dir_all(dst.parent().expect("dst parent")).expect("mkdir dst parent");
@@ -2449,10 +2462,11 @@ mod tests {
         let journal = Journal::open(&fx.registry.locks_dir()).expect("open journal");
         let commits: BTreeMap<String, String> =
             std::iter::once(("editor-src".to_owned(), fx.head_sha.clone())).collect();
-        let remotes = resolved_remotes(&cfg).expect("remotes resolve");
+        let parsed = cfg.parsed_sources().expect("sources parse");
+        let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
 
         let run = TargetRun {
-            config: &cfg,
+            parsed: &parsed,
             target_name: "dest",
             target,
             commits: &commits,
@@ -2463,7 +2477,7 @@ mod tests {
         };
         let selection = Selection::new(source.includes(), source.excludes()).expect("selection");
         let entry = ArtifactEntry {
-            source,
+            source: &source,
             git: remotes
                 .get("editor-src")
                 .expect("resolved_remotes covers every source"),
@@ -4395,9 +4409,10 @@ mod tests {
 
         let commits: BTreeMap<String, String> =
             std::iter::once(("linked-src".to_owned(), "link".to_owned())).collect();
-        let remotes = resolved_remotes(&cfg).expect("remotes resolve");
+        let parsed = cfg.parsed_sources().expect("sources parse");
+        let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
 
-        prune_orphans(&cfg, &remotes, &fx_backend(), &registry, &commits)
+        prune_orphans(&cfg, &parsed, &remotes, &fx_backend(), &registry, &commits)
             .expect("prune must remove the orphaned linked artifact");
 
         assert!(
@@ -4466,8 +4481,9 @@ mod tests {
         // base-overlay provenance guard can reject it (the path is local).
         let base = config_link_source_one_target("base-linked", wt.path(), &td.target_path());
 
-        let remotes = resolved_remotes(&base).expect("remotes resolve");
-        let Err(err) = validate_link_mode(&base, &base, &remotes) else {
+        let base_parsed = base.parsed_sources().expect("sources parse");
+        let remotes = resolved_remotes(&base, &base_parsed).expect("remotes resolve");
+        let Err(err) = validate_link_mode(&base, &base_parsed, &remotes) else {
             panic!(
                 "deploy = \"link\" set in the committed base config must be rejected as a \
                  non-local-overlay setting, not silently honored"
@@ -4490,13 +4506,14 @@ mod tests {
         let local = local_link_overlay("remote-linked", remote, &td.target_path());
         let effective = effective_of(&base, &local);
         assert_eq!(
-            effective.sources["remote-linked"].deploy_mode(),
+            parsed_of(&effective, "remote-linked").deploy_mode(),
             DeployMode::Link,
             "premise: the overlay must make the effective mode Link"
         );
 
-        let remotes = resolved_remotes(&effective).expect("remotes resolve");
-        let Err(err) = validate_link_mode(&base, &effective, &remotes) else {
+        let parsed = effective.parsed_sources().expect("sources parse");
+        let remotes = resolved_remotes(&effective, &parsed).expect("remotes resolve");
+        let Err(err) = validate_link_mode(&base, &parsed, &remotes) else {
             panic!(
                 "deploy = \"link\" on a remote-URL git must be rejected (a remote has no \
                  working tree to symlink), even when the link is overlay-only"
@@ -4530,13 +4547,14 @@ mod tests {
         let local = local_copy_overlay("committed-link", wt.path(), &td.target_path());
         let effective = effective_of(&base, &local);
         assert_eq!(
-            effective.sources["committed-link"].deploy_mode(),
+            parsed_of(&effective, "committed-link").deploy_mode(),
             DeployMode::Copy,
             "premise: the overlay must downgrade the effective mode to Copy"
         );
 
-        let remotes = resolved_remotes(&effective).expect("remotes resolve");
-        let Err(err) = validate_link_mode(&base, &effective, &remotes) else {
+        let parsed = effective.parsed_sources().expect("sources parse");
+        let remotes = resolved_remotes(&effective, &parsed).expect("remotes resolve");
+        let Err(err) = validate_link_mode(&base, &parsed, &remotes) else {
             panic!(
                 "deploy = \"link\" committed in the base config must be rejected REGARDLESS of a \
                  local overlay downgrading the source to copy"
@@ -4558,13 +4576,14 @@ mod tests {
         let local = local_link_overlay("dev-src", wt.path(), &td.target_path());
         let effective = effective_of(&base, &local);
         assert_eq!(
-            effective.sources["dev-src"].deploy_mode(),
+            parsed_of(&effective, "dev-src").deploy_mode(),
             DeployMode::Link,
             "premise: the overlay must make the effective mode Link"
         );
 
-        let remotes = resolved_remotes(&effective).expect("remotes resolve");
-        validate_link_mode(&base, &effective, &remotes).expect(
+        let parsed = effective.parsed_sources().expect("sources parse");
+        let remotes = resolved_remotes(&effective, &parsed).expect("remotes resolve");
+        validate_link_mode(&base, &parsed, &remotes).expect(
             "a link confined to phora.local.toml over a local path must pass both the \
              base-overlay and local-path guards",
         );
