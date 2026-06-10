@@ -695,6 +695,14 @@ const IMPORT_MESSAGE: &str = "phora synthetic import";
 const IMPORT_TIME_SECONDS: i64 = 1;
 const IMPORT_REF: &str = "refs/heads/phora";
 
+fn to_gix_entry_kind(kind: crate::archive::EntryKind) -> EntryKind {
+    match kind {
+        crate::archive::EntryKind::Blob => EntryKind::Blob,
+        crate::archive::EntryKind::BlobExecutable => EntryKind::BlobExecutable,
+        crate::archive::EntryKind::Link => EntryKind::Link,
+    }
+}
+
 /// Writes `entries` as a synthetic commit on `refs/heads/phora` in the bare mirror for
 /// `url` (created if absent), returning the commit id as hex. The id is content-addressed:
 /// fixed identity/time/message + no parents + git-sorted trees ⇒ identical content, identical id.
@@ -717,7 +725,7 @@ pub(crate) fn import_tree(
             .write_blob(&entry.data)
             .map_err(|e| Error::Source(format!("write blob for {url}: {e}")))?
             .detach();
-        root.insert(&entry.path, entry.kind, oid)?;
+        root.insert(&entry.path, to_gix_entry_kind(entry.kind), oid)?;
     }
 
     let root_oid = write_import_tree(&repo, &root, url)?;
@@ -2075,9 +2083,9 @@ path = "srnnkls/tropos"
 
     // ---- import_tree (HTP-004): deterministic synthetic-commit import ----
 
-    use crate::archive::ExtractedEntry;
+    use crate::archive::{EntryKind as BlobKind, ExtractedEntry};
 
-    fn entry(path: &str, kind: EntryKind, data: &[u8]) -> ExtractedEntry {
+    fn entry(path: &str, kind: BlobKind, data: &[u8]) -> ExtractedEntry {
         ExtractedEntry {
             path: PathBuf::from(path),
             kind,
@@ -2100,8 +2108,8 @@ path = "srnnkls/tropos"
         let dir_b = TempDir::new().expect("git_dir b");
         let entries = || {
             vec![
-                entry("a.txt", EntryKind::Blob, b"alpha"),
-                entry("dir/b.txt", EntryKind::Blob, b"bravo"),
+                entry("a.txt", BlobKind::Blob, b"alpha"),
+                entry("dir/b.txt", BlobKind::Blob, b"bravo"),
             ]
         };
 
@@ -2123,16 +2131,16 @@ path = "srnnkls/tropos"
         let dir_b = TempDir::new().expect("git_dir b");
 
         let forward = vec![
-            entry("a.txt", EntryKind::Blob, b"alpha"),
-            entry("m.txt", EntryKind::Blob, b"mike"),
-            entry("z.txt", EntryKind::Blob, b"zulu"),
-            entry("dir/b.txt", EntryKind::Blob, b"bravo"),
+            entry("a.txt", BlobKind::Blob, b"alpha"),
+            entry("m.txt", BlobKind::Blob, b"mike"),
+            entry("z.txt", BlobKind::Blob, b"zulu"),
+            entry("dir/b.txt", BlobKind::Blob, b"bravo"),
         ];
         let reversed = vec![
-            entry("dir/b.txt", EntryKind::Blob, b"bravo"),
-            entry("z.txt", EntryKind::Blob, b"zulu"),
-            entry("m.txt", EntryKind::Blob, b"mike"),
-            entry("a.txt", EntryKind::Blob, b"alpha"),
+            entry("dir/b.txt", BlobKind::Blob, b"bravo"),
+            entry("z.txt", BlobKind::Blob, b"zulu"),
+            entry("m.txt", BlobKind::Blob, b"mike"),
+            entry("a.txt", BlobKind::Blob, b"alpha"),
         ];
 
         let forward_id =
@@ -2155,13 +2163,13 @@ path = "srnnkls/tropos"
         let base = import_tree(
             dir_a.path(),
             IMPORT_URL,
-            &[entry("a.txt", EntryKind::Blob, b"alpha")],
+            &[entry("a.txt", BlobKind::Blob, b"alpha")],
         )
         .expect("import base content");
         let changed = import_tree(
             dir_b.path(),
             IMPORT_URL,
-            &[entry("a.txt", EntryKind::Blob, b"ALPHA")],
+            &[entry("a.txt", BlobKind::Blob, b"ALPHA")],
         )
         .expect("import changed content");
 
@@ -2175,7 +2183,7 @@ path = "srnnkls/tropos"
     fn commit_has_fixed_identity_time_and_no_parents() {
         let dir_a = TempDir::new().expect("git_dir a");
         let dir_b = TempDir::new().expect("git_dir b");
-        let make = || vec![entry("a.txt", EntryKind::Blob, b"alpha")];
+        let make = || vec![entry("a.txt", BlobKind::Blob, b"alpha")];
 
         let id_a = import_tree(dir_a.path(), IMPORT_URL, &make()).expect("import a");
         let id_b = import_tree(dir_b.path(), IMPORT_URL, &make()).expect("import b");
@@ -2236,7 +2244,7 @@ path = "srnnkls/tropos"
         let commit_id = import_tree(
             dir.path(),
             IMPORT_URL,
-            &[entry("a.txt", EntryKind::Blob, b"alpha")],
+            &[entry("a.txt", BlobKind::Blob, b"alpha")],
         )
         .expect("import");
 
@@ -2263,9 +2271,9 @@ path = "srnnkls/tropos"
             dir.path(),
             IMPORT_URL,
             &[
-                entry("a.txt", EntryKind::Blob, b"A"),
-                entry("dir/b.sh", EntryKind::BlobExecutable, b"B"),
-                entry("dir/link", EntryKind::Link, b"target/x"),
+                entry("a.txt", BlobKind::Blob, b"A"),
+                entry("dir/b.sh", BlobKind::BlobExecutable, b"B"),
+                entry("dir/link", BlobKind::Link, b"target/x"),
             ],
         )
         .expect("import nested tree");
@@ -2330,10 +2338,10 @@ path = "srnnkls/tropos"
             dir.path(),
             IMPORT_URL,
             &[
-                entry("a.txt", EntryKind::Blob, b"A"),
-                entry("dir/b.sh", EntryKind::BlobExecutable, b"B"),
-                entry("dir/link", EntryKind::Link, b"target/x"),
-                entry("z.txt", EntryKind::Blob, b"Z"),
+                entry("a.txt", BlobKind::Blob, b"A"),
+                entry("dir/b.sh", BlobKind::BlobExecutable, b"B"),
+                entry("dir/link", BlobKind::Link, b"target/x"),
+                entry("z.txt", BlobKind::Blob, b"Z"),
             ],
         )
         .expect("import");
@@ -2390,14 +2398,14 @@ path = "srnnkls/tropos"
         let first = import_tree(
             dir.path(),
             IMPORT_URL,
-            &[entry("a.txt", EntryKind::Blob, b"alpha")],
+            &[entry("a.txt", BlobKind::Blob, b"alpha")],
         )
         .expect("first import into a fresh mirror");
 
         let second = import_tree(
             dir.path(),
             IMPORT_URL,
-            &[entry("a.txt", EntryKind::Blob, b"BRAVO")],
+            &[entry("a.txt", BlobKind::Blob, b"BRAVO")],
         )
         .expect("re-import of changed content into the SAME mirror must succeed");
 
@@ -2425,7 +2433,7 @@ path = "srnnkls/tropos"
     #[test]
     fn reimport_identical_content_is_stable() {
         let dir = TempDir::new().expect("git_dir");
-        let make = || vec![entry("a.txt", EntryKind::Blob, b"alpha")];
+        let make = || vec![entry("a.txt", BlobKind::Blob, b"alpha")];
 
         let first = import_tree(dir.path(), IMPORT_URL, &make()).expect("first import");
         let second = import_tree(dir.path(), IMPORT_URL, &make())
@@ -2457,8 +2465,8 @@ path = "srnnkls/tropos"
             dir.path(),
             IMPORT_URL,
             &[
-                entry("a.txt", EntryKind::Blob, b"first"),
-                entry("a.txt", EntryKind::Blob, b"second"),
+                entry("a.txt", BlobKind::Blob, b"first"),
+                entry("a.txt", BlobKind::Blob, b"second"),
             ],
         );
 
@@ -2474,8 +2482,8 @@ path = "srnnkls/tropos"
             TempDir::new().expect("git_dir").path(),
             IMPORT_URL,
             &[
-                entry("dir", EntryKind::Blob, b"file"),
-                entry("dir/x", EntryKind::Blob, b"child"),
+                entry("dir", BlobKind::Blob, b"file"),
+                entry("dir/x", BlobKind::Blob, b"child"),
             ],
         );
         assert!(
@@ -2487,8 +2495,8 @@ path = "srnnkls/tropos"
             TempDir::new().expect("git_dir").path(),
             IMPORT_URL,
             &[
-                entry("dir/x", EntryKind::Blob, b"child"),
-                entry("dir", EntryKind::Blob, b"file"),
+                entry("dir/x", BlobKind::Blob, b"child"),
+                entry("dir", BlobKind::Blob, b"file"),
             ],
         );
         assert!(

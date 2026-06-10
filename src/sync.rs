@@ -1590,7 +1590,7 @@ mod tests {
 
     /// A link source whose local path has NO phora mirror must still resolve:
     /// `resolve_sources` synthesizes an audit lock entry (local path + HEAD read
-    /// directly via `gix`), and must NOT fetch or compute a mirror digest.
+    /// directly via the git object layer), and must NOT fetch or compute a mirror digest.
     #[test]
     fn link_source_resolves_without_mirror_into_audit_lock_entry() {
         let fx = build_sync_fixture();
