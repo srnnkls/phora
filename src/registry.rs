@@ -52,24 +52,7 @@ pub struct EjectedEntry {
     pub ejected_at: String,
 }
 
-/// Content digest with a `blake3:` prefix.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Digest(String);
-
-impl Digest {
-    pub fn parse(s: &str) -> Result<Self> {
-        if s.strip_prefix("blake3:").is_some_and(|hex| !hex.is_empty()) {
-            Ok(Self(s.to_string()))
-        } else {
-            Err(Error::Registry(format!("invalid digest: {s}")))
-        }
-    }
-
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
+pub use crate::kernel::Digest;
 
 pub trait Registry {
     fn get(&self, key: &ArtifactKey) -> Result<Option<RegistryRecord>>;
@@ -330,10 +313,25 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn digest_requires_blake3_prefix() {
-        assert!(Digest::parse("blake3:abc").is_ok());
-        assert!(Digest::parse("sha256:abc").is_err());
-        assert!(Digest::parse("blake3:").is_err());
+    fn digest_requires_strict_sixty_four_hex_body() {
+        use std::str::FromStr as _;
+        let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert!(
+            Digest::from_str(&format!("blake3:{hex}")).is_ok(),
+            "a strict 64-hex blake3 body must parse"
+        );
+        assert!(
+            Digest::from_str(&format!("sha256:{hex}")).is_ok(),
+            "the unified Digest now also accepts sha256"
+        );
+        assert!(
+            Digest::from_str("blake3:abc").is_err(),
+            "a short body must be rejected (the unified Digest is strict)"
+        );
+        assert!(
+            Digest::from_str("blake3:").is_err(),
+            "an empty body must be rejected"
+        );
     }
 
     // ── linked marker (DLD-005) ────────────────────────────────────

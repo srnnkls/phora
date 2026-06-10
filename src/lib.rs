@@ -8,7 +8,7 @@
 //!   their port traits rather than in separate directories.
 //!
 //! Boundary inputs are parsed into validated newtypes ([`paths::ProjectId`],
-//! [`source::NormalizedUrl`], [`source::MirrorKey`], [`registry::Digest`]) so that
+//! [`source::NormalizedUrl`], [`source::MirrorKey`], [`kernel::Digest`]) so that
 //! illegal states are unrepresentable downstream — parse, don't validate.
 
 #![expect(
@@ -22,6 +22,7 @@ pub mod cli;
 pub mod config;
 pub mod error;
 pub mod http;
+pub mod kernel;
 pub mod lock;
 pub mod matcher;
 pub mod paths;

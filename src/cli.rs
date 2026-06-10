@@ -6,8 +6,9 @@ use std::path::Path;
 
 use clap::{Parser, Subcommand};
 
-use crate::config::{Config, DownloadDigest, Host, Source, SourceMode, builtin_forges};
+use crate::config::{Config, Host, Source, SourceMode, builtin_forges};
 use crate::error::{Error, Result};
+use crate::kernel::Digest;
 use crate::lock::{Lock, merge_locks};
 use crate::matcher::PathMatcher;
 use crate::paths::{ProjectId, phora_dir};
@@ -306,7 +307,8 @@ fn build_router(
         if source.mode() == SourceMode::Url
             && let Some(raw) = source.digest.as_deref()
         {
-            let digest = DownloadDigest::parse(raw)
+            let digest: Digest = raw
+                .parse()
                 .map_err(|e| Error::Config(format!("source `{name}`: {e}")))?;
             digests.insert(name.clone(), digest);
         }

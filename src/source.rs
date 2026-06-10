@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 
 use gix::object::tree::EntryKind;
 
-use crate::config::{DownloadDigest, Refspec};
+use crate::config::Refspec;
 use crate::error::{Error, Result};
+use crate::kernel::{Commit, Digest};
 use crate::matcher::PathMatcher;
 use crate::registry::ManifestFile;
 
@@ -214,7 +215,10 @@ impl SourceBackend for GitBackend {
                 .peel_to_commit()
                 .map_err(|e| Error::Source(format!("peel tag {name} in {source}: {e}")))?,
             Refspec::Rev(rev) => {
-                let oid = gix::ObjectId::from_hex(rev.as_bytes())
+                let commit: Commit = rev
+                    .parse()
+                    .map_err(|e| Error::Source(format!("parse rev {rev} in {source}: {e}")))?;
+                let oid = gix::ObjectId::from_hex(commit.as_str().as_bytes())
                     .map_err(|e| Error::Source(format!("parse rev {rev} in {source}: {e}")))?;
                 repo.find_commit(oid)
                     .map_err(|e| Error::Source(format!("rev {rev} in {source}: {e}")))?
@@ -463,12 +467,12 @@ impl Drop for TempDownload {
 pub struct HttpBackend {
     git_dir: PathBuf,
     git: GitBackend,
-    digests: BTreeMap<String, DownloadDigest>,
+    digests: BTreeMap<String, Digest>,
 }
 
 impl HttpBackend {
     #[must_use]
-    pub fn new(git_dir: PathBuf, digests: BTreeMap<String, DownloadDigest>) -> Self {
+    pub fn new(git_dir: PathBuf, digests: BTreeMap<String, Digest>) -> Self {
         let git = GitBackend::new(git_dir.clone());
         Self {
             git_dir,
@@ -2516,8 +2520,9 @@ path = "srnnkls/tropos"
         use gix::object::tree::EntryKind;
         use tempfile::TempDir;
 
-        use crate::config::{DownloadDigest, Refspec};
+        use crate::config::Refspec;
         use crate::error::Error;
+        use crate::kernel::Digest;
         use crate::matcher::PathMatcher;
         use crate::source::{ExportPolicy, ExportRequest, HttpBackend, SourceBackend, mirror_path};
 
@@ -2741,10 +2746,7 @@ path = "srnnkls/tropos"
             let url = server.url();
 
             let mut digests = BTreeMap::new();
-            digests.insert(
-                "pkg".to_string(),
-                DownloadDigest::Sha256(sha256_of(&tar_gz)),
-            );
+            digests.insert("pkg".to_string(), Digest::sha256(sha256_of(&tar_gz)));
 
             let git_dir = TempDir::new().expect("git_dir tempdir");
             let backend = HttpBackend::new(git_dir.path().to_path_buf(), digests);
@@ -2765,7 +2767,7 @@ path = "srnnkls/tropos"
             let url = server.url();
 
             let mut digests = BTreeMap::new();
-            digests.insert("pkg".to_string(), DownloadDigest::Sha256([0u8; 32]));
+            digests.insert("pkg".to_string(), Digest::sha256([0u8; 32]));
 
             let git_dir = TempDir::new().expect("git_dir tempdir");
             let backend = HttpBackend::new(git_dir.path().to_path_buf(), digests);

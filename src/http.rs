@@ -3,10 +3,10 @@
 use std::path::Path;
 use std::time::Duration;
 
-use sha2::{Digest, Sha256};
+use sha2::{Digest as _, Sha256};
 
-use crate::config::DownloadDigest;
 use crate::error::{Error, Result};
+use crate::kernel::{Algo, Digest};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const BODY_TIMEOUT: Duration = Duration::from_mins(5);
@@ -57,10 +57,10 @@ pub fn download(url: &str, dest: &Path) -> Result<()> {
 ///
 /// Returns [`Error::Source`] on mismatch; the message names both the expected
 /// and the actual digest as lowercase 64-char hex.
-pub fn verify_digest(bytes: &[u8], expected: &DownloadDigest) -> Result<()> {
-    let (algo, actual) = match expected {
-        DownloadDigest::Sha256(_) => ("sha256", Sha256::digest(bytes).to_vec()),
-        DownloadDigest::Blake3(_) => ("blake3", blake3::hash(bytes).as_bytes().to_vec()),
+pub fn verify_digest(bytes: &[u8], expected: &Digest) -> Result<()> {
+    let (algo, actual) = match expected.algo() {
+        Algo::Sha256 => ("sha256", Sha256::digest(bytes).to_vec()),
+        Algo::Blake3 => ("blake3", blake3::hash(bytes).as_bytes().to_vec()),
     };
 
     if actual == expected.bytes() {
@@ -86,11 +86,12 @@ fn hex_lower(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::DownloadDigest;
     use crate::error::Error;
     use crate::http::{download, verify_digest};
+    use crate::kernel::Digest;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::str::FromStr as _;
     use std::time::Duration;
 
     const PAYLOAD: &[u8] = b"phora-fixture-payload\n";
@@ -196,8 +197,7 @@ mod tests {
 
     #[test]
     fn verify_digest_accepts_matching_sha256() {
-        let digest =
-            DownloadDigest::parse(&format!("sha256:{PAYLOAD_SHA256}")).expect("valid sha256");
+        let digest = Digest::from_str(&format!("sha256:{PAYLOAD_SHA256}")).expect("valid sha256");
         verify_digest(PAYLOAD, &digest).expect("matching sha256 must verify");
     }
 
@@ -213,16 +213,14 @@ mod tests {
 
     #[test]
     fn verify_digest_accepts_matching_blake3() {
-        let digest =
-            DownloadDigest::parse(&format!("blake3:{PAYLOAD_BLAKE3}")).expect("valid blake3");
+        let digest = Digest::from_str(&format!("blake3:{PAYLOAD_BLAKE3}")).expect("valid blake3");
         verify_digest(PAYLOAD, &digest).expect("matching blake3 must verify");
     }
 
     #[test]
     fn verify_digest_rejects_mismatch_naming_expected_and_actual() {
         let wrong_hex = "0".repeat(64);
-        let digest =
-            DownloadDigest::parse(&format!("sha256:{wrong_hex}")).expect("valid 64-hex sha256");
+        let digest = Digest::from_str(&format!("sha256:{wrong_hex}")).expect("valid 64-hex sha256");
 
         let err = verify_digest(PAYLOAD, &digest).expect_err("wrong sha256 must reject");
 
@@ -244,8 +242,7 @@ mod tests {
     #[test]
     fn verify_digest_rejects_blake3_mismatch_naming_expected_and_actual() {
         let wrong_hex = "0".repeat(64);
-        let digest =
-            DownloadDigest::parse(&format!("blake3:{wrong_hex}")).expect("valid 64-hex blake3");
+        let digest = Digest::from_str(&format!("blake3:{wrong_hex}")).expect("valid 64-hex blake3");
 
         let err = verify_digest(PAYLOAD, &digest).expect_err("wrong blake3 must reject");
 
