@@ -1,8 +1,9 @@
 ---
 created: 2026-06-09
-status: active
+status: done
 issue_type: Feature
 revised: 2026-06-09   # post opus+sonnet review (review.yaml) + git-field-misnomer finding
+completed: 2026-06-10   # ARCH-000..011 landed; ARCH-012 (per-context errors) + ARCH-013 (crate split) descoped
 ---
 
 # architecture-cleanup
