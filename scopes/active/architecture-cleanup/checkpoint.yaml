@@ -3,15 +3,14 @@ checkpoint:
   scope_path: ./scopes/active/architecture-cleanup
   branch: chore/architecture-cleanup
   base: main
-  last_commit: 8631a21
-  last_batch: 1
+  last_commit: 9899411
+  last_batch: 2
   tasks:
-    done: [ARCH-000, ARCH-001, ARCH-002, ARCH-003, ARCH-004]
-    pending: [ARCH-005, ARCH-006, ARCH-007, ARCH-008, ARCH-009, ARCH-010, ARCH-011, ARCH-012, ARCH-013]
+    done: [ARCH-000, ARCH-001, ARCH-002, ARCH-003, ARCH-004, ARCH-005]
+    pending: [ARCH-006, ARCH-007, ARCH-008, ARCH-009, ARCH-010, ARCH-011, ARCH-012, ARCH-013]
   next_batch:
-    number: 2
-    tasks: [ARCH-005]   # LEADING standalone PR: typed source-kind keys (+path, forge path->repo) w/ back-compat aliases; must land before ARCH-006 and add-local-symlink
-    follows: [ARCH-006, ARCH-007, ARCH-008]   # ARCH-006 depends on 005; 007/008 independent, parallelizable after
+    number: 3
+    tasks: [ARCH-006, ARCH-007, ARCH-008]   # ARCH-006 (ParsedSource/Remote ADT) depends on ARCH-001+005; ARCH-007 (drop getters) + ARCH-008 (confine archive gix) independent, parallelizable
   phase: phase-2-parse-rename
   selection_seam: "src/kernel/selection.rs::Selection — sole artifact-membership + dotfile policy; consumed by source.rs (git discovery), sync.rs (link discovery + foreign scan), cli.rs (check-match)"
   invariants:
@@ -19,6 +18,10 @@ checkpoint:
     - "Phase 1 behavior-identical save 3 documented exceptions: dotfile opt-in, orphan-prune fix, check-match dotfile output"
   known_flaky:
     - "registry::tests::lock_is_released_after_guard_dropped — fails under parallel test contention on the OS state.lock; passes in isolation"
+  incidents:
+    - "ARCH-005: a review subagent's `git checkout src/config.rs` wiped the implementer's UNCOMMITTED config.rs work (prod + tests). Recovered by replaying the tester+implementer Edit calls from agent transcript jsonl onto pristine config.rs, then applied the review fix. Lesson: commit each batch before dispatching reviewers; never let a subagent run destructive git on the shared tree."
+  review_findings_resolved:
+    - "ARCH-005 HIGH (both reviewers): `path_looks_local` shape heuristic broke the `host`+`path` forge alias for ~/./ /-anchored owners (sr.ht ~user/repo). Fixed: removed the heuristic; `path` is the forge alias iff `host` set with no `repo` (shape-blind via Source::local_path). Added tilde-alias regression test + repurposed the contradicting conflict test."
   deferred_issues: []
   review_config:
     reviewers: [opus, sonnet]
