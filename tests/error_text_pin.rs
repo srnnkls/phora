@@ -54,7 +54,9 @@ host = \"ghost\"
 repo = \"me/dotfiles\"
 ";
     let config = Config::parse(doc).expect("parses; host check is a validate-time concern");
-    let err = config.validate().expect_err("unknown host must fail validation");
+    let err = config
+        .validate()
+        .expect_err("unknown host must fail validation");
     assert_eq!(
         err.to_string(),
         "config error: source `dotfiles` references unknown host `ghost`",
@@ -165,7 +167,9 @@ fn registry_get_corrupt_record_renders_registry_prefixed_parse_message() {
         .expect("create record dir");
     std::fs::write(&record_path, b"= not valid toml =").expect("write corrupt record");
 
-    let err = reg.get(&key).expect_err("a corrupt record must surface a parse error");
+    let err = reg
+        .get(&key)
+        .expect_err("a corrupt record must surface a parse error");
     let msg = err.to_string();
     assert!(
         msg.starts_with("registry error: parse record "),
@@ -240,7 +244,9 @@ impl GitArtifactFixture {
         let git_dir = TempDir::new().expect("git dir tempdir");
         let backend = GitBackend::new(git_dir.path().to_path_buf());
         let url = root.to_string_lossy().into_owned();
-        backend.fetch(&sn("dots"), &url).expect("fetch builds mirror");
+        backend
+            .fetch(&sn("dots"), &url)
+            .expect("fetch builds mirror");
 
         Self {
             _src: src,
