@@ -4,9 +4,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::config::{Config, ParsedSource};
+use crate::deploy::check_artifact_state;
 use crate::error::Result;
 use crate::kernel::Selection;
-use crate::deploy::check_artifact_state;
 use crate::store::Registry;
 
 use super::render::{print_listings, state_label};
