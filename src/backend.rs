@@ -101,7 +101,7 @@ mod tests {
     };
 
     fn sn(name: &str) -> SourceName {
-        SourceName::new(name)
+        SourceName::trusted(name)
     }
 
     // ── local http server serving a real .tar.gz ───────────────────

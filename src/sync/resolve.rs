@@ -23,7 +23,7 @@ pub(super) fn resolve_sources(
 
     for (name, source) in parsed {
         let git = remote_for(remotes, name)?;
-        let source_name = SourceName::new(name.clone());
+        let source_name = SourceName::trusted(name.clone());
         if source.deploy_mode() == DeployMode::Link {
             let commit = read_local_head(git)?;
             routed.push((

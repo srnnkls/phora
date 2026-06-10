@@ -202,10 +202,11 @@ fn build_router(
     let mut modes = BTreeMap::new();
     let mut digests = BTreeMap::new();
     for (name, source) in &config.parsed_sources()? {
-        modes.insert(SourceName::new(name.clone()), source.mode());
+        let source_name = SourceName::trusted(name.clone());
         if let Some(digest) = source.digest() {
-            digests.insert(name.clone(), digest);
+            digests.insert(source_name.clone(), digest);
         }
+        modes.insert(source_name, source.mode());
     }
     let git = GitBackend::new(git_dir.clone());
     let http = HttpBackend::new(git_dir, digests);

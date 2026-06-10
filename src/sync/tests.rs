@@ -13,11 +13,11 @@ use crate::source::{
 use crate::store::FileRegistry;
 
 fn an(name: &str) -> crate::kernel::ArtifactName {
-    crate::kernel::ArtifactName::new(name)
+    crate::kernel::ArtifactName::trusted(name)
 }
 
 fn sn(name: &str) -> crate::kernel::SourceName {
-    crate::kernel::SourceName::new(name)
+    crate::kernel::SourceName::trusted(name)
 }
 
 // ── git fixture ────────────────────────────────────────────────
@@ -273,7 +273,7 @@ fn expected_digest(fx: &SyncFixture, name: &str, commit: &str) -> String {
     let m = crate::kernel::Selection::new(&[], &[]).expect("empty matcher builds");
     fx.backend
         .compute_digest(
-            &crate::kernel::SourceName::new(name),
+            &crate::kernel::SourceName::trusted(name),
             &fx.url,
             commit,
             None,

@@ -25,7 +25,7 @@ pub(super) fn prune_orphans(
             })?;
             let commit = &resolved_commits[source_name];
             let git = remote_for(remotes, source_name)?;
-            let source_name = SourceName::new(source_name);
+            let source_name = SourceName::trusted(source_name);
             let selection = Selection::new(source.includes(), source.excludes())?;
             let discovered = discover_artifacts_for_source(
                 source,
