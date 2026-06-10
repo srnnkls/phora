@@ -1,7 +1,7 @@
 scope: architecture-cleanup
 issue_type: Feature
 created: 2026-06-09
-revised: 2026-06-09   # post opus+sonnet review + git-field-misnomer finding
+revised: 2026-06-10   # loqui alignment (round 3): ARCH-014 (name newtypes) added; ARCH-012 (per-context errors) mandatory, decoupled from ARCH-013
 
 # Authoritative design: resources/CLEANUP.md
 # Phase 1 fixes the one real defect + lands the dotfile opt-in with ZERO lock churn.
@@ -29,7 +29,7 @@ tasks:
       - "One Digest ADT replaces DownloadDigest (config.rs:446) AND registry Digest (registry.rs:57); FromStr/Display at the edge"
       - "RelPath normalized at construction; absorbs paths.rs + scattered strip_prefix/normalize"
       - "Commit validates hex at the resolve boundary (source.rs:217)"
-      - "NO ArtifactName/SourceName newtypes (review OE4)"
+      - "NO ArtifactName/SourceName newtypes (review OE4; superseded — ARCH-014 reinstates them, loqui alignment)"
     tests:
       - "Digest parses sha256:/blake3: 64-hex; rejects bad algo/length; Display round-trips both old types' inputs"
       - "RelPath normalization parity with current behavior"
@@ -69,6 +69,20 @@ tasks:
       - "Property test asserts content_digest byte-identical before/after the refactor"
     tests:
       - "digest unchanged across kernel/Selection introduction"
+
+  - id: ARCH-014
+    content: "kernel name newtypes: SourceName + ArtifactName, parsed once at the boundary (loqui alignment; reverses review OE4)"
+    status: pending
+    activeForm: "Newtyping source/artifact names"
+    depends_on: [ARCH-001]
+    acceptance:
+      - "SourceName/ArtifactName in kernel/name.rs; existing checks (TOML parse, safe_component in source.rs) move into the constructors"
+      - "Interior APIs + port signatures take the newtypes; raw strings only in serde wire structs and Display edges"
+      - "Retrofits the already-split tree (ARCH-006/009/010 landed first; round-3 ordering note is moot)"
+      - "Zero behavior change: golden snapshots + digest pin byte-identical"
+    tests:
+      - "constructors reject exactly what TOML parse + safe_component reject today (parity)"
+      - "grep: no bare &str/String source/artifact identifier in port signatures"
 
   # ---- Phase 2: parse-don't-validate config + rename + getter removal ----
   - id: ARCH-005
@@ -138,13 +152,30 @@ tasks:
     depends_on: [ARCH-002]
 
   - id: ARCH-012
-    content: "(optional) per-context error enums"
-    status: deferred   # to a future session (still in scope, NOT descoped; user decision 2026-06-10). Before doing it, weigh this session's finding: EVERY match/matches! on an Error variant is in #[cfg(test)] code (~44 assertions); ZERO production sites match variants or discriminate via downcast/.source()/message-matching (330 construct-and-propagate; main() prints via Display; the only production branching is io::ErrorKind on raw io::Error BEFORE conversion). /loqui's caller-intent rule (split by who reads the error, not Cargo target) + both original scope reviewers (OE3) say typed per-context errors add churn (44 test rewrites + wrapper) with little production value while no caller distinguishes variants. Reopen with ARCH-013 (a published phora-core shouldn't expose the CLI-flavored god enum) or when production code must recover from a phora-level (non-io) failure.
+    content: "Per-context error enums (thiserror); ports return typed errors (loqui alignment; decoupled from the crate split)"
+    status: pending   # round 3 (decision loqui-alignment) makes this MANDATORY, overriding the batch-6 deferral. Prior empirical finding kept for the implementer: every match/matches! on an Error variant is in #[cfg(test)] code (~44 assertions); zero production sites discriminate variants (330 construct-and-propagate; main() prints via Display). The value here is the port contract (traits.md: typed errors per port), not production branching — keep the CLI edge as the aggregator.
     activeForm: "Splitting the crate-wide error enum"
-    depends_on: [ARCH-009, ARCH-011]
+    depends_on: [ARCH-009, ARCH-010, ARCH-011]
+    acceptance:
+      - "Each bounded context owns a thiserror enum; SourceBackend returns SourceError, Registry returns StoreError"
+      - "error.rs reduces to the CLI edge (aggregation + exit-code mapping); no context imports another's error type"
+    tests:
+      - "error messages preserved in golden snapshots (lowercase, chained context)"
+
+  - id: ARCH-015
+    content: "ARCH-005 migration warnings (round-2 retrofit): deprecation warning on alias forms; meaning-changed hint on bare path=owner/repo"
+    status: pending
+    activeForm: "Adding source-key migration warnings"
+    depends_on: [ARCH-005, ARCH-006]
+    acceptance:
+      - "git=<localpath> and host+path alias forms emit a one-line deprecation warning naming the new key (path / repo), once per offending source per run, to stderr"
+      - "bare path=<value> resembling owner/repo (exactly one '/', no leading ./ or /, nonexistent locally) warns that the github shorthand moved to bare repo"
+      - "warnings do not alter stdout: golden snapshots unchanged (stderr is not captured) or updated as a documented exception"
+    tests:
+      - "alias forms warn once; new-key forms silent; nonexistent bare path=owner/repo warns; existing local dir named like owner/repo does NOT warn"
 
   - id: ARCH-013
     content: "(optional/stretch) phora-core / phora-cli crate split"
-    status: deferred   # to a future session (still in scope, NOT descoped; user decision 2026-06-10). Both reviewers flagged the crate split premature today (OE3: no external lib consumers). This session verified the boundary the split would enforce already holds: zero core->cli imports; cli/ imports core one-way; main.rs is a 2-line shim over phora::cli — pinned by the crate::cli boundary grep in scope.md Verification, so the split stays mechanical. Reopen triggers: an external lib consumer, a second binary (daemon/GUI/plugin host), or real compile-time pain. Do together with ARCH-012.
+    status: deferred   # still optional (round 3 decoupled ARCH-012 from it). Boundary already holds: zero core->cli imports; main.rs a 2-line shim — pinned by the crate::cli boundary grep, so the split stays mechanical. Reopen triggers: an external lib consumer, a second binary, or real compile-time pain.
     activeForm: "Splitting into core + cli crates"
-    depends_on: [ARCH-010, ARCH-011]
+    depends_on: [ARCH-010, ARCH-011, ARCH-012]
