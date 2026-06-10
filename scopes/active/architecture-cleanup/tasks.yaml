@@ -72,7 +72,14 @@ tasks:
 
   - id: ARCH-014
     content: "kernel name newtypes: SourceName + ArtifactName, parsed once at the boundary (loqui alignment; reverses review OE4)"
-    status: pending
+    status: done
+    # done 2026-06-10 (017dc2a + review fixes): kernel/name.rs SourceName/ArtifactName
+    # (FromStr validates = old safe_component exactly; trusted() bypass for config keys,
+    # which are legitimately unvalidated today). Ports (SourceBackend/RouterBackend/
+    # ExportRequest) + sync pipeline carry the newtypes; wire structs stay String.
+    # Golden + digest pins byte-identical; opus mapped every safe_component site pre->post
+    # (validation preserved). Accepted-low: link-mode working-tree names never validated
+    # (pre-existing asymmetry); eject/uneject &str entry points (wire-adjacent).
     activeForm: "Newtyping source/artifact names"
     depends_on: [ARCH-001]
     acceptance:
