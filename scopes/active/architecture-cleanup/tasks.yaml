@@ -73,7 +73,7 @@ tasks:
   # ---- Phase 2: parse-don't-validate config + rename + getter removal ----
   - id: ARCH-005
     content: "Typed source-kind keys (LEADING standalone PR): add `path` (local), rename forge `path`->`repo`, with back-compat aliases"
-    status: pending
+    status: done
     activeForm: "Introducing typed source-kind keys"
     acceptance:
       - "New keys: `path`=<local dir/file>; `host`+`repo`=<forge>; bare `repo`=<owner/repo> defaults to github; `git`/`url` unchanged"
