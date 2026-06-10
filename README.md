@@ -277,6 +277,10 @@ path = "/home/me/dev/loqui"  # local source; the live working tree
 deploy = "link"
 ```
 
+`phora add --local <path>` writes that overlay for you: it records
+`path = "<abspath>"` for a local source in `phora.local.toml` (never `phora.toml`).
+`phora add --symlink <path>` does the same and adds `deploy = "link"` to live-link it.
+
 ## Worktrees
 
 A worktree is just a directory you run `phora sync` from; sync builds the managed

@@ -14,7 +14,20 @@ pub(super) fn run_add(
     branch: Option<String>,
     tag: Option<String>,
     root: Option<String>,
+    local: bool,
+    symlink: bool,
 ) -> Result<()> {
+    if local || symlink {
+        return add_local(
+            url,
+            name,
+            branch.as_deref(),
+            tag.as_deref(),
+            root.as_deref(),
+            symlink,
+        );
+    }
+
     let hosts = load_config().map(|c| c.hosts).unwrap_or_default();
     let parsed = parse_add_url(url, &hosts)?;
 
@@ -41,6 +54,70 @@ pub(super) fn run_add(
         "Added source '{name}': {}{refspec}",
         describe_source(&parsed)
     );
+    Ok(())
+}
+
+fn add_local(
+    url: &str,
+    name: Option<String>,
+    branch: Option<&str>,
+    tag: Option<&str>,
+    root: Option<&str>,
+    symlink: bool,
+) -> Result<()> {
+    let canonical = std::fs::canonicalize(url).map_err(|e| {
+        Error::Config(format!(
+            "`--local`/`--symlink` require an existing local checkout, but `{url}` is not one: {e}"
+        ))
+    })?;
+    if !canonical.is_dir() {
+        return Err(Error::Config(format!(
+            "`--local`/`--symlink` require a directory, but `{url}` is not one"
+        )));
+    }
+
+    let path = canonical.to_string_lossy().into_owned();
+    let name = name.unwrap_or_else(|| {
+        canonical
+            .file_name()
+            .map_or_else(|| path.clone(), |n| n.to_string_lossy().into_owned())
+    });
+
+    let target = AddTarget {
+        name: name.clone(),
+        git: None,
+        host: None,
+        repo: None,
+        path: Some(path.clone()),
+        protocol: None,
+        branch: None,
+        root: None,
+    };
+
+    let mut table = source_table(&target);
+    if let Some(branch) = branch {
+        table["branch"] = toml_edit::value(branch);
+    }
+    if let Some(tag) = tag {
+        table["tag"] = toml_edit::value(tag);
+    }
+    if let Some(root) = root {
+        table["root"] = toml_edit::value(root);
+    }
+    if symlink {
+        table["deploy"] = toml_edit::value("link");
+    }
+
+    let doc_text =
+        std::fs::read_to_string("phora.local.toml").unwrap_or_else(|_| "version = 1\n".to_owned());
+    let mut doc = doc_text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| Error::Config(format!("parse phora.local.toml: {e}")))?;
+    ensure_sources_table(&mut doc);
+    doc["sources"][&name] = toml_edit::Item::Table(table);
+    std::fs::write("phora.local.toml", doc.to_string())?;
+
+    println!("Added local source '{name}': {path}");
     Ok(())
 }
 
@@ -86,6 +163,10 @@ fn source_table(source: &AddTarget) -> toml_edit::Table {
         table["git"] = toml_edit::value(git.as_str());
         return table;
     }
+    if let Some(path) = &source.path {
+        table["path"] = toml_edit::value(path.as_str());
+        return table;
+    }
     if let Some(host) = &source.host {
         table["host"] = toml_edit::value(host.as_str());
     }
@@ -107,13 +188,15 @@ fn ensure_sources_table(doc: &mut toml_edit::DocumentMut) {
 }
 
 /// A source derived from an `add` URL/shorthand, before name overrides. Either
-/// literal (`git` is `Some`) or symbolic forge (`host`/`repo` are `Some`).
+/// literal (`git` is `Some`), symbolic forge (`host`/`repo` are `Some`), or
+/// local path (`path` is `Some`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddTarget {
     pub name: String,
     pub git: Option<String>,
     pub host: Option<String>,
     pub repo: Option<String>,
+    pub path: Option<String>,
     pub protocol: Option<Protocol>,
     pub branch: Option<String>,
     pub root: Option<String>,
@@ -174,6 +257,7 @@ fn symbolic_source(host: String, repo: &str, root: Option<String>) -> AddTarget 
         git: None,
         host: Some(host),
         repo: Some(repo.to_owned()),
+        path: None,
         protocol: None,
         branch: None,
         root,
@@ -217,6 +301,7 @@ fn literal_source(
         git: Some(git),
         host: None,
         repo: None,
+        path: None,
         protocol: None,
         branch,
         root,

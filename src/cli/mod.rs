@@ -58,6 +58,10 @@ pub enum Command {
         tag: Option<String>,
         #[arg(long)]
         root: Option<String>,
+        #[arg(long)]
+        local: bool,
+        #[arg(long)]
+        symlink: bool,
     },
     /// Fetch sources and project them to targets.
     Sync {
@@ -120,7 +124,9 @@ pub fn run(cli: Cli) -> Result<()> {
             branch,
             tag,
             root,
-        } => add::run_add(&url, name, branch, tag, root),
+            local,
+            symlink,
+        } => add::run_add(&url, name, branch, tag, root, local, symlink),
         Command::Sync { prune, force } => sync::run_sync(prune, force, None),
         Command::Update { source } => sync::run_update(source.as_deref()),
         Command::List { plan } => query::run_list(plan),
