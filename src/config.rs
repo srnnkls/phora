@@ -441,57 +441,6 @@ pub enum SourceMode {
     Url,
 }
 
-/// A download-integrity digest: `<algo>:<64 hex>` where algo is `sha256` or `blake3`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DownloadDigest {
-    Sha256([u8; 32]),
-    Blake3([u8; 32]),
-}
-
-impl DownloadDigest {
-    /// Parses an `<algo>:<hex>` digest. The body must be exactly 64 hex chars.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Config`] for a missing `<algo>:` prefix, an unknown algo,
-    /// a body that is not exactly 32 bytes of hex, or non-hex characters.
-    pub fn parse(s: &str) -> Result<Self> {
-        let (algo, hex) = s.split_once(':').ok_or_else(|| {
-            Error::Config(format!("invalid digest `{s}`: missing `<algo>:` prefix"))
-        })?;
-        let bytes = decode_hex32(hex).ok_or_else(|| {
-            Error::Config(format!("invalid digest `{s}`: body must be 64 hex chars"))
-        })?;
-        match algo {
-            "sha256" => Ok(Self::Sha256(bytes)),
-            "blake3" => Ok(Self::Blake3(bytes)),
-            other => Err(Error::Config(format!(
-                "invalid digest `{s}`: unknown algorithm `{other}` (expected sha256 or blake3)"
-            ))),
-        }
-    }
-
-    #[must_use]
-    pub fn bytes(&self) -> &[u8] {
-        match self {
-            Self::Sha256(b) | Self::Blake3(b) => b,
-        }
-    }
-}
-
-fn decode_hex32(hex: &str) -> Option<[u8; 32]> {
-    if hex.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (slot, pair) in out.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
-        let hi = (pair[0] as char).to_digit(16)?;
-        let lo = (pair[1] as char).to_digit(16)?;
-        *slot = u8::try_from(hi * 16 + lo).ok()?;
-    }
-    Some(out)
-}
-
 impl Source {
     #[must_use]
     fn merged_with(mut self, local: Source) -> Source {
@@ -2212,9 +2161,11 @@ protocol = "ssh"
             .digest
             .as_deref()
             .expect("the example url source must carry an integrity `digest`");
-        DownloadDigest::parse(digest).unwrap_or_else(|err| {
-            panic!("the example url source `digest` must be well-formed: {digest} ({err})")
-        });
+        digest
+            .parse::<crate::kernel::Digest>()
+            .unwrap_or_else(|err| {
+                panic!("the example url source `digest` must be well-formed: {digest} ({err})")
+            });
     }
 
     // HAS-002: resolved_remote + single built-in forge registry
@@ -2522,8 +2473,6 @@ path = "srnnkls/tropos"
         }
     }
 
-    // HTP-001: url mode + DownloadDigest
-
     /// Build a `[sources.s]` document body with no implicit `git` line (unlike the
     /// `parse_source` helper, which always injects a git remote and would make a
     /// `url` source dual-mode).
@@ -2789,19 +2738,16 @@ url = ""
     }
 
     #[test]
-    fn download_digest_parses_sha256_into_sha256_variant_with_bytes() {
+    fn download_digest_parses_sha256_with_bytes() {
+        use std::str::FromStr as _;
         let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let expected: [u8; 32] = [
             0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
             0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67,
             0x89, 0xab, 0xcd, 0xef,
         ];
-        let digest =
-            DownloadDigest::parse(&format!("sha256:{hex}")).expect("a sha256 digest must parse");
-        assert!(
-            matches!(digest, DownloadDigest::Sha256(_)),
-            "a `sha256:` prefix must parse into the Sha256 variant, not Blake3"
-        );
+        let digest = crate::kernel::Digest::from_str(&format!("sha256:{hex}"))
+            .expect("a sha256 digest must parse");
         assert_eq!(
             digest.bytes(),
             expected.as_slice(),
@@ -2810,54 +2756,48 @@ url = ""
     }
 
     #[test]
-    fn download_digest_parses_blake3_into_blake3_variant_with_bytes() {
+    fn download_digest_parses_blake3_with_bytes() {
+        use std::str::FromStr as _;
         let hex = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
-        let expected: [u8; 32] = [
-            0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef, 0xde, 0xad,
-            0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef,
-            0xde, 0xad, 0xbe, 0xef,
-        ];
-        let digest =
-            DownloadDigest::parse(&format!("blake3:{hex}")).expect("a blake3 digest must parse");
-        assert!(
-            matches!(digest, DownloadDigest::Blake3(_)),
-            "a `blake3:` prefix must parse into the Blake3 variant, not Sha256"
-        );
+        let digest = crate::kernel::Digest::from_str(&format!("blake3:{hex}"))
+            .expect("a blake3 digest must parse");
         assert_eq!(
-            digest.bytes(),
-            expected.as_slice(),
-            "the decoded blake3 digest bytes must match the hex"
+            digest.bytes().len(),
+            32,
+            "the decoded blake3 digest must be 32 bytes"
         );
     }
 
     #[test]
     fn download_digest_rejects_unknown_algo_prefix() {
+        use std::str::FromStr as _;
         let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         assert!(
-            DownloadDigest::parse(&format!("md5:{hex}")).is_err(),
+            crate::kernel::Digest::from_str(&format!("md5:{hex}")).is_err(),
             "an unknown algo prefix (md5) must be rejected, not coerced to a known variant"
         );
         assert!(
-            DownloadDigest::parse(hex).is_err(),
+            crate::kernel::Digest::from_str(hex).is_err(),
             "a bare hex string with no `<algo>:` prefix must be rejected"
         );
     }
 
     #[test]
     fn download_digest_rejects_wrong_length_and_non_hex() {
+        use std::str::FromStr as _;
         assert!(
-            DownloadDigest::parse("sha256:abcd").is_err(),
+            crate::kernel::Digest::from_str("sha256:abcd").is_err(),
             "a too-short hex body must be rejected (digest must be 32 bytes / 64 hex chars)"
         );
         assert!(
-            DownloadDigest::parse(
+            crate::kernel::Digest::from_str(
                 "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdefff"
             )
             .is_err(),
             "a too-long hex body must be rejected"
         );
         assert!(
-            DownloadDigest::parse(
+            crate::kernel::Digest::from_str(
                 "blake3:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
             )
             .is_err(),
@@ -2866,17 +2806,16 @@ url = ""
     }
 
     #[test]
-    fn registry_digest_still_rejects_sha256_prefix_not_widened() {
+    fn unified_digest_accepts_both_algos_with_strict_hex() {
+        use std::str::FromStr as _;
         let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         assert!(
-            crate::registry::Digest::parse(&format!("sha256:{hex}")).is_err(),
-            "registry::Digest must remain blake3-only; adding DownloadDigest's sha256 support \
-             must NOT widen the registry content digest to accept a `sha256:` prefix"
+            crate::kernel::Digest::from_str(&format!("sha256:{hex}")).is_ok(),
+            "the unified Digest accepts a strict 64-hex sha256 body"
         );
         assert!(
-            crate::registry::Digest::parse(&format!("blake3:{hex}")).is_ok(),
-            "registry::Digest must still accept a blake3 prefix (guards against an over-broad \
-             rejection that breaks the existing content digest)"
+            crate::kernel::Digest::from_str(&format!("blake3:{hex}")).is_ok(),
+            "the unified Digest accepts a strict 64-hex blake3 body"
         );
     }
 
