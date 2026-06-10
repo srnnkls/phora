@@ -9,6 +9,7 @@ use crate::error::Result;
 /// Decides artifact and path membership from include/exclude patterns. Hidden
 /// artifact names are admitted only by a literal leading-dot include pattern;
 /// this is the one place that rule lives.
+#[derive(Clone)]
 pub struct Selection {
     artifact_include: Option<GlobSet>,
     artifact_exclude: GlobSet,

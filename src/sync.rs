@@ -922,6 +922,7 @@ pub fn rebuild_registry(
 
     for (target_name, target) in &config.targets {
         let mut managed: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut selections: Vec<Selection> = Vec::new();
 
         for source_name in target.resolve_sources(&config.sources) {
             let source = config.sources.get(source_name).ok_or_else(|| {
@@ -935,6 +936,7 @@ pub fn rebuild_registry(
             let commit = &locked.commit;
             let git = remote_for(&remotes, source_name)?;
             let selection = Selection::new(source.includes(), source.excludes())?;
+            selections.push(selection.clone());
             let policy = source.export_policy();
             let discovered = discover_artifacts_for_source(
                 source,
@@ -983,7 +985,9 @@ pub fn rebuild_registry(
             }
         }
 
-        report.foreign.extend(scan_foreign(target, &managed)?);
+        report
+            .foreign
+            .extend(scan_foreign(target, &managed, &selections)?);
     }
 
     Ok(report)
@@ -1129,10 +1133,15 @@ fn disk_hash(path: &Path) -> Result<Option<DiskHash>> {
     }))
 }
 
+fn admits_for_foreign(name: &str, selections: &[Selection]) -> bool {
+    !name.starts_with('.') || selections.iter().any(|s| s.selects_artifact(name))
+}
+
 /// On-disk artifact dirs under `target` that no managed `(source, artifact)` maps to.
 fn scan_foreign(
     target: &Target,
     managed: &BTreeMap<String, BTreeSet<String>>,
+    selections: &[Selection],
 ) -> Result<Vec<PathBuf>> {
     let target_path = target.expanded_path();
     let layout = target.layout();
@@ -1156,10 +1165,16 @@ fn scan_foreign(
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
+        if !admits_for_foreign(&name, selections) {
             continue;
         }
-        foreign.extend(foreign_under(&entry.path(), &name, layout.kind, managed));
+        foreign.extend(foreign_under(
+            &entry.path(),
+            &name,
+            layout.kind,
+            managed,
+            selections,
+        ));
     }
 
     Ok(foreign)
@@ -1170,6 +1185,7 @@ fn foreign_under(
     name: &str,
     layout_kind: LayoutKind,
     managed: &BTreeMap<String, BTreeSet<String>>,
+    selections: &[Selection],
 ) -> Vec<PathBuf> {
     let is_managed_artifact = managed.values().any(|arts| arts.contains(name));
     let is_managed_source = managed.contains_key(name);
@@ -1178,15 +1194,17 @@ fn foreign_under(
         LayoutKind::Flat | LayoutKind::Prefixed => {
             if is_managed_artifact || is_managed_prefixed(name, managed) {
                 Vec::new()
+            } else if name.starts_with('.') {
+                vec![dir.to_path_buf()]
             } else {
-                unmanaged_subdirs(dir, &BTreeSet::new())
+                unmanaged_subdirs(dir, &BTreeSet::new(), selections)
             }
         }
         LayoutKind::BySource => {
             if is_managed_source {
-                unmanaged_subdirs(dir, &managed[name])
+                unmanaged_subdirs(dir, &managed[name], selections)
             } else {
-                unmanaged_subdirs(dir, &BTreeSet::new())
+                unmanaged_subdirs(dir, &BTreeSet::new(), selections)
             }
         }
     }
@@ -1200,7 +1218,11 @@ fn is_managed_prefixed(name: &str, managed: &BTreeMap<String, BTreeSet<String>>)
     })
 }
 
-fn unmanaged_subdirs(dir: &Path, managed_artifacts: &BTreeSet<String>) -> Vec<PathBuf> {
+fn unmanaged_subdirs(
+    dir: &Path,
+    managed_artifacts: &BTreeSet<String>,
+    selections: &[Selection],
+) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -1209,7 +1231,7 @@ fn unmanaged_subdirs(dir: &Path, managed_artifacts: &BTreeSet<String>) -> Vec<Pa
         .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
         .filter(|e| {
             let n = e.file_name().to_string_lossy().into_owned();
-            !n.starts_with('.') && !managed_artifacts.contains(&n)
+            admits_for_foreign(&n, selections) && !managed_artifacts.contains(&n)
         })
         .map(|e| e.path())
         .collect()
@@ -3928,6 +3950,68 @@ mod tests {
             "the legit managed artifact ({}) must NOT be reported [foreign]; \
              only unmanaged on-disk dirs may appear, got {:?}",
             managed.display(),
+            report.foreign
+        );
+    }
+
+    /// ARCH-003 (the stranded-dotfile-orphan fix): the foreign scan must route
+    /// through `Selection`, not a blanket `starts_with('.')`. A hidden on-disk dir
+    /// the source's selection ADMITS (`include = [".config"]`) but that no managed
+    /// artifact maps to is an orphaned phora-shaped artifact and MUST be reported
+    /// foreign. A hidden dir NO selection admits (`.cache`) is the user's own and
+    /// MUST stay out of the foreign set. The current blanket skip drops both.
+    #[test]
+    fn foreign_scan_reports_selection_admitted_dotfile_but_spares_user_dotfile() {
+        let fx = build_sync_fixture();
+        let td = TargetDir::new();
+        let toml = format!(
+            "version = 1\n\n\
+             [sources.editor-src]\ngit = \"{url}\"\nbranch = \"main\"\ninclude = [\".config\"]\n\n\
+             [targets.dest]\npath = \"{target}\"\nsources = [\"editor-src\"]\nlayout = \"flat\"\n",
+            url = fx.url,
+            target = td.target_path().display(),
+        );
+        let cfg = Config::parse(&toml).expect("dotfile-include config parses");
+        let out = sync(
+            &input(&cfg, None, None, None, false),
+            &fx.backend,
+            &fx.registry,
+        )
+        .expect("seeding sync over a dotfile-include source succeeds");
+        assert!(!out.had_failures, "premise: the seeding sync must succeed");
+
+        let admitted =
+            crate::kernel::Selection::new(&[".config".to_owned()], &[]).expect("selection builds");
+        assert!(
+            admitted.selects_artifact(".config"),
+            "premise: include=[.config] must admit the `.config` artifact name"
+        );
+        assert!(
+            !admitted.selects_artifact(".cache"),
+            "premise: include=[.config] must NOT admit an unrelated `.cache` dotfile"
+        );
+
+        let orphan = td.target_path().join(".config");
+        std::fs::create_dir_all(&orphan).expect("plant the orphaned dotfile artifact");
+        std::fs::write(orphan.join("settings.json"), b"{}\n").expect("write orphan file");
+        let user_dir = td.target_path().join(".cache");
+        std::fs::create_dir_all(&user_dir).expect("plant the user's own dotfile dir");
+        std::fs::write(user_dir.join("blob.bin"), b"mine\n").expect("write user file");
+
+        let report = rebuild_registry(&cfg, &out.base_lock, &fx.backend, &fx.registry)
+            .expect("rebuild must not error with hidden dirs present");
+
+        assert!(
+            report.foreign.iter().any(|p| p.ends_with(".config")),
+            "a hidden dir the source's Selection admits but that maps to no managed \
+             artifact MUST be reported [foreign] (the scan must consult Selection, not \
+             blanket-skip dotfiles), got {:?}",
+            report.foreign
+        );
+        assert!(
+            !report.foreign.iter().any(|p| p.ends_with(".cache")),
+            "a hidden dir no source Selection admits is the user's own and MUST NOT be \
+             reported [foreign]; the fix must not over-report, got {:?}",
             report.foreign
         );
     }
