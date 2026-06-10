@@ -1,0 +1,137 @@
+scope: architecture-cleanup
+reviewed: 2026-06-09
+reviewers: [opus, sonnet]
+verdict: revise            # both reviewers independently: revise
+summary: >
+  Core diagnosis is correct and well-evidenced (five-site membership duplication; the two
+  defects are real). But the headline claim — "digest-as-fold is behavior-identical except a
+  dotfile-only lock re-baseline" — has a hole big enough to block: the current whole-tree digest
+  also covers loose root files and artifact-excluded root dirs, so the fold re-baselines locks
+  for a large fraction of real sources, not just dotfile-bearing ones. Plus the scope contains
+  fabricated/stale facts (worktree subsystem was dropped in PR #12 yet the scope re-introduces a
+  worktree/ context and gix-leak premise), an unmet prerequisite (no golden-test infra exists),
+  and several over-engineered tasks (Clock port, sealing, per-context errors, name newtypes).
+
+blocking:
+  - id: B1
+    severity: critical
+    raised_by: [opus, sonnet]
+    title: "digest-as-fold blast radius understated by ~10x"
+    claim: "digest != deploy is framed as dotfile-only; fold re-baselines only dotfile-bearing locks."
+    evidence:
+      - "src/source.rs hash_tree (~397): walks whole root subtree gated only by allows_path"
+      - "src/source.rs discover_artifacts (~251/278): returns ONLY EntryKind::Tree passing allows_artifact"
+      - "src/matcher.rs allows_path (~106): admits root-level loose files; never prunes dirs on include"
+    why: >
+      hash_tree hashes (a) loose FILES at the source root (README/LICENSE/flake.nix), and (b) root
+      subdirs excluded by artifact-level include/exclude — none of which discover/deploy. So the
+      current source content_digest already covers strictly more than the deployable set for the
+      COMMON case. Redefining digest as fold-over-(discover∘export) silently re-baselines the lock
+      digest for nearly every real source, not just dotfile-bearing ones. Existing digest tests
+      can't catch it (fixture has no root loose files).
+    recommendation: >
+      Resolve B2 first (what is the digest FOR). Then either: (1) honestly document the full
+      blast radius + emit a migration notice, or (2) keep content_digest as a whole-(sub)tree
+      fingerprint and fix divergence by making it skip exactly what deploy skips (dotfiles via
+      Selection) WITHOUT collapsing to the artifact set — i.e. align the two predicates rather
+      than redefine the digest's domain. Add a fixture with root loose files + an
+      artifact-excluded root dir BEFORE touching hash_tree.
+
+  - id: B2
+    severity: high
+    raised_by: [opus]
+    title: "content_digest's contract/consumers never established"
+    evidence:
+      - "src/lock.rs source_matches (~51-71): re-resolution keys on commit + config_digest, NOT digest"
+      - "src/sync.rs (~499-500): digest recorded into the lock"
+    why: >
+      The design asserts 'digest should equal the deployable set' without identifying what the
+      digest is for. If re-resolve/lock-reuse never reads it, collapsing it is at best cosmetic
+      (weakening the 'fixes a defect' framing); if it's a tree-identity/drift signal, collapsing
+      it is a semantic regression. Either way the claim is unjustified as written.
+    recommendation: "Enumerate every consumer of LockedSource.digest; state the intended contract; then choose B1 path (1) or (2)."
+
+  - id: B3
+    severity: high
+    raised_by: [opus, sonnet]
+    title: "sealing breaks existing dispatch tests + in-crate test backends"
+    evidence:
+      - "src/backend.rs (~298-348): Spy impls SourceBackend in #[cfg(test)]"
+      - "src/backend.rs (~383-465): dispatch tests assert routing via git_backend()/http_backend() getters"
+      - "src/sync.rs (~1415,1987,2803,3333,5186,5485): ~6 in-crate test backends impl SourceBackend"
+    why: "ARCH-006 deletes the getters the routing assertions depend on, and a strict seal locks out the sync.rs test doubles in a different module."
+    recommendation: "Drop formal sealing (no downstream crate). Keep getter removal but budget rewriting getter-based assertions (shared Rc<Spy> handles). Re-evaluate seal only if phora is ever published as a lib."
+
+  - id: B4
+    severity: high
+    raised_by: [opus, sonnet]
+    title: "fabricated/stale facts: worktree subsystem was DROPPED (PR #12)"
+    evidence:
+      - "git log: 9310c5a feat!: drop the worktree-includes subsystem (#12)"
+      - "src/ has no worktree.rs / worktree_apply.rs; gix is in source.rs (+ archive.rs test EntryKind) only"
+    why: >
+      The scope/CLEANUP cite '7+4 gix refs leaking into worktree*', a worktree/ bounded context,
+      ARCH-008 confinement, and 'worktree apply/import-legacy' as commands to preserve. None exist
+      in this codebase. The entire worktree-confinement premise is fictional; gix is already
+      confined to source.rs in production code, so ARCH-008 is largely a no-op.
+    recommendation: "Delete worktree/ from layout, drop worktree commands from functional reqs, rewrite/remove ARCH-008 (the one real cross-module gix use is archive.rs importing EntryKind)."
+
+  - id: B5
+    severity: high
+    raised_by: [sonnet]
+    title: "golden-test acceptance bar has no infrastructure (hidden prerequisite)"
+    evidence: "no snapshot/golden tests; no insta in Cargo.toml; only tempfile in dev-deps"
+    why: "Behavior-identical acceptance for sync/list/verify/where/check-match is unverifiable without a baseline harness; 'pure refactor' can't be gated."
+    recommendation: "Add ARCH-000 (establish golden/snapshot harness + capture baselines) as a hard prerequisite gating Phase 1. Add a property test pinning current digests for non-dotfile sources before ARCH-003."
+
+  - id: B6
+    severity: medium
+    raised_by: [opus, sonnet]
+    title: "silent lock re-baseline contradicts a stated Non-Goal and risks teams"
+    evidence: "Non-Goals: 'no change to lock format/identity'; ARCH-003 default: silent re-baseline"
+    why: "Lock digests are pinning/identity assertions; silent mutation on next update causes unexplained churn for teammates and breaks external verification. The non-goal and the change contradict."
+    recommendation: "Emit a one-time migration notice (or phora migrate-lock) when an old-format digest is detected; remove the contradictory non-goal."
+
+over_engineering:                # both reviewers converge
+  - id: OE1
+    item: "Clock port (ARCH-007)"
+    consensus: cut-or-demote
+    why: "6 chrono::Utc::now() sites produce informational projected_at/ejected_at strings nothing asserts; threading a 4th dep through the sync pipeline is disproportionate. epoch+1 is a CONSTANT, not a clock consumer (mischaracterized)."
+    recommendation: "Drop, or inject an Option<OffsetDateTime> override at sync() entry if determinism is ever needed."
+  - id: OE2
+    item: "Sealing ports (ARCH-006)"
+    consensus: keep-getter-removal-drop-seal
+    why: "Ceremony for a no-downstream binary; breaks test doubles (B3)."
+  - id: OE3
+    item: "Per-context errors (ARCH-012)"
+    consensus: defer
+    why: "Premature without the crate split; no external lib consumers. Make ARCH-012 depend on ARCH-013."
+  - id: OE4
+    item: "ArtifactName/SourceName newtypes (ARCH-001)"
+    consensus: trim
+    why: "~50-site churn for 4 safe_component re-checks; names already validated at parse/tree boundary. Keep RelPath, Digest (unify), Commit — high value; drop/defer ArtifactName/SourceName."
+
+missing:
+  - "ARCH-000 golden/snapshot harness prerequisite (B5)"
+  - "Link-mode (DeployMode::Link) content_digest path — fold described only in git-ODB terms"
+  - "url-source interaction with digest-as-fold (synthetic commit; flat archives expose loose-root-file case)"
+  - "Docs task: README/GUIDE update for the dotfile opt-in + lock re-baseline (cleanup was triggered BY a docs question)"
+  - "check-match output change when routed through Selection — not listed among documented exceptions"
+  - "Rename existing cli.rs::ParsedSource (~613, URL-parse intermediate) before introducing config::ParsedSource — name collision"
+
+factual_corrections:
+  - "cli.rs check-match: ~596 (not 665, which is unrelated URL helper)"
+  - "config.rs DownloadDigest: ~446 (not 521); source.mode(): ~622 (not 697); validate passes ~46-88 & ~100-157"
+  - "cli.rs ~2598 lines (not 2711); config.rs ~2974 (not 3461); sync.rs 5655 correct"
+  - "tar/flate2 appear in source.rs/backend.rs/sync.rs but only in #[cfg(test)] helpers — confinement rule must say 'production code'"
+  - "globset '*' matches '.config' (no dotglob) — dotfile opt-in is a bespoke separate gate, not a 'one-line policy'"
+  - "ParsedSource: Source carries shared fields (include/exclude/deploy/allow_*) across all modes — only remote+refspec become the sum type; Remote snippet understates the work"
+
+sequencing_fixes:
+  - "ARCH-005 (ParsedSource) depends only on ARCH-001, can run parallel to ARCH-002/003/004 (not gated on all of Phase 1)"
+
+strengths:
+  - "Core diagnosis correct: 5-site membership duplication real; both defects (digest!=deploy, stranded orphans) reproducible from code"
+  - "Selection value object is the right consolidation; Phase 1 is the highest-leverage intervention"
+  - "Remote ADT well-motivated: kills the is_some()-counting validators duplicated across two passes"
+  - "Deferring crate split (ARCH-013) is the right call"
