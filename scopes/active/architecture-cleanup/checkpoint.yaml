@@ -7,11 +7,11 @@ checkpoint:
   last_batch: 6
   tasks:
     done: [ARCH-000, ARCH-001, ARCH-002, ARCH-003, ARCH-004, ARCH-005, ARCH-006, ARCH-007, ARCH-008, ARCH-009, ARCH-010, ARCH-011]
-    pending: [ARCH-012, ARCH-013]   # DEFERRED to a future session (still in scope, NOT descoped)
-  next_batch: null   # No batch THIS session. ARCH-012 (per-context errors) + ARCH-013 (crate split) remain pending — deferred to a future session per user. See tasks.yaml notes (incl. this session's loqui/reviewer finding that 012 has little production value as-is). Scope stays active until they land or are explicitly dropped.
+    deferred: [ARCH-012, ARCH-013]   # to a future session (still in scope, NOT descoped)
+  next_batch: null   # No batch THIS session. ARCH-012 (per-context errors) + ARCH-013 (crate split) deferred to a future session per user — reopen triggers + this session's empirical findings (012: zero production variant consumers; 013: core->cli boundary already clean, pinned by grep) live in tasks.yaml. Scope stays active until they land or are explicitly dropped.
   phase: phase-3-internals
   selection_seam: "src/kernel/selection.rs::Selection — sole artifact-membership + dotfile policy; consumed by source.rs (git discovery), sync/discover.rs (link discovery + foreign scan), cli/query.rs (check-match)"
-  layout_note: "sync/ a DIR (mod+resolve+discover+target+prune+verify+rebuild+tests) after ARCH-009. cli/ now a DIR (mod+add+render+query+sync+tests) after ARCH-010: render.rs is the sole struct-driven output producer; build_router (in mod.rs) names concrete GitBackend/HttpBackend. Still flat: src/source.rs, src/archive.rs, src/backend.rs, src/config.rs, src/paths.rs, src/projection.rs, src/registry.rs, src/matcher.rs — these are ARCH-011's relocation targets. gix-confinement grep still reads against flat source.rs."
+  layout_note: "Post-ARCH-011 tree: dirs cli/ config/ kernel/ sync/; flat src/{archive,backend,deploy,error,http,lock,paths,source,store}.rs. projection->deploy.rs, registry->store.rs, config.rs->config/{mod,host,source,target,tests}, ProjectId->kernel/project_id.rs all landed (7e5b234); matcher->kernel/selection landed in ARCH-002. source.rs deliberately left flat (gix already confined to it). Confinement greps read against flat files: gix->source.rs, ureq->http.rs, tar/zip/flate2->archive.rs (production; test modules in backend.rs/source.rs also use tar/flate2)."
   invariants:
     - "ZERO lock churn: source-level content_digest byte-identical (ARCH-004 property test pins it; do not touch digest domain)"
     - "Phase 1 behavior-identical save 3 documented exceptions: dotfile opt-in, orphan-prune fix, check-match dotfile output"

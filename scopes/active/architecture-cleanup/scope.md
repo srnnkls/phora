@@ -86,7 +86,7 @@ bar, phased low→high-risk migration.
 | Clock | **not introduced** | 6 `now()` sites are informational timestamps nothing asserts (review OE1) |
 | Newtypes | keep `RelPath`, unified `Digest`, `Commit`; **drop `ArtifactName`/`SourceName`** | names already validated at parse + tree boundary; wrapping churns ~50 sites for 4 re-checks (review OE4) |
 | Split | `sync.rs`→`sync/`, `cli.rs`→`cli/`, `projection`→`deploy/`, `registry`→`store/`, `matcher`→`kernel/selection`, `config.rs`→`config/` | feature-organized bounded contexts |
-| Per-context errors / crate split | deferred together (errors earn their keep only once the crate splits); optional | review OE3 |
+| Per-context errors / crate split | **deferred together to a future session** (errors earn their keep only once the crate splits); still in scope | review OE3; 2026-06-10: zero production variant consumers; core→cli boundary already clean, grep-pinned (tasks.yaml ARCH-012/013) |
 
 ## Requirements
 
@@ -113,19 +113,22 @@ bar, phased low→high-risk migration.
 
 ## Acceptance Criteria
 
-- [ ] **Golden harness exists (ARCH-000):** snapshot tests capture `sync`/`list`/`verify`/`where`/
+- [x] **Golden harness exists (ARCH-000):** snapshot tests capture `sync`/`list`/`verify`/`where`/
       `check-match` output before any structural change; refactor diffs are reviewed against them.
-- [ ] Pure refactor: command output identical save the documented exceptions (dotfile opt-in,
+- [x] Pure refactor: command output identical save the documented exceptions (dotfile opt-in,
       orphan-prune, check-match dotfile output).
-- [ ] **Zero lock churn:** a property test asserts `content_digest` is byte-identical pre/post.
-- [ ] Membership `starts_with('.')` for artifacts appears in exactly one place (`kernel/selection.rs`).
-- [ ] `include=[".config"]`/`[".*"]` selects `.config`; `include=["*"]` does not.
-- [ ] A deployed dotfile artifact later removed from config is removed from disk by `--prune`.
-- [ ] `path="<local>"` and `host`+`repo` configs work; `git="<localpath>"` and `host`+`path`
+- [x] **Zero lock churn:** a property test asserts `content_digest` is byte-identical pre/post.
+- [x] Membership `starts_with('.')` for artifacts decided in exactly one place (`kernel/selection.rs`;
+      `sync/rebuild.rs`'s foreign scan open-codes only the non-hidden fast path and delegates the
+      membership decision to `Selection::selects_artifact`).
+- [x] `include=[".config"]`/`[".*"]` selects `.config`; `include=["*"]` does not.
+- [x] A deployed dotfile artifact later removed from config is removed from disk by `--prune`.
+- [x] `path="<local>"` and `host`+`repo` configs work; `git="<localpath>"` and `host`+`path`
       configs still work (aliases); `add` emits the new keys; bare `repo="owner/repo"` resolves to github.
-- [ ] Confinement (grep, production code): `gix` only under `source/`, `ureq` only in
-      `source/download.rs`, archive crates only in `source/archive.rs`.
-- [ ] `cargo clippy --all-targets` warning-free at `pedantic`.
+- [x] Confinement (grep, production code): `gix` only in `src/source.rs`, `ureq` only in
+      `src/http.rs`, archive crates only in `src/archive.rs` (ARCH-011 left `source.rs` flat —
+      the planned `source/` dir never materialized; greps re-verified 2026-06-10).
+- [x] `cargo clippy --all-targets` warning-free at `pedantic`.
 
 ## Implementation Strategy
 
@@ -164,13 +167,15 @@ Phase 3   ARCH-009 split sync/ → ARCH-010 split cli/
   **not** drop them this cycle. `git`/`url` for their proper kinds are unchanged.
 - No async; phora stays synchronous.
 - No `Clock` port, no formal trait sealing, no `ArtifactName`/`SourceName` newtypes (see Decisions).
-- Per-context errors and the `phora-core`/`phora-cli` crate split are deferred (optional stretch).
+- Per-context errors and the `phora-core`/`phora-cli` crate split are deferred to a future
+  session (ARCH-012/013: still in scope, not descoped; reopen triggers in tasks.yaml).
 
 ## Verification
 
 - `mise run check` green (clippy pedantic `-D warnings` + rustfmt + tests).
 - Golden snapshots unchanged across the refactor (save documented exceptions); digest property test green.
-- Boundary greps: membership single-site; `gix`/`ureq`/archive confined (production).
+- Boundary greps: membership single-site; `gix`/`ureq`/archive confined (production);
+  `crate::cli` absent outside `src/cli/` and `src/main.rs` (core never imports the CLI layer).
 
 ## Open Questions
 
@@ -183,4 +188,6 @@ Phase 3   ARCH-009 split sync/ → ARCH-010 split cli/
       stay as back-compat aliases; bare `path="owner/repo"` is the one intentional break. (decided)
 - [ ] Deprecation horizon for the `path`(forge)/`git`(local) aliases — how many releases before drop?
 - [ ] ARCH-004: ever align the digest domain with deploy? (Default: no — no consumer, broad churn.)
-- [ ] ARCH-013: crate split this cycle or defer? (Default: defer.)
+- [x] ARCH-013: crate split this cycle or defer? **Deferred to a future session** (decided
+      2026-06-10) together with ARCH-012 — core→cli boundary already clean and grep-pinned;
+      reopen on an external lib consumer, a second binary, or compile-time pain.
