@@ -1,4 +1,4 @@
-//! Pins `compute_digest` to its current bytes so a later refactor proves it byte-identical.
+//! ARCH-004 zero-churn pin: `compute_digest` must stay byte-identical across the cleanup refactor.
 
 use std::path::Path;
 use std::process::Command;
