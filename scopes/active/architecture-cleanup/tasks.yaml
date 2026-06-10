@@ -1,0 +1,150 @@
+scope: architecture-cleanup
+issue_type: Feature
+created: 2026-06-09
+revised: 2026-06-09   # post opus+sonnet review + git-field-misnomer finding
+
+# Authoritative design: resources/CLEANUP.md
+# Phase 1 fixes the one real defect + lands the dotfile opt-in with ZERO lock churn.
+# Source-level digest is left untouched (no production consumer; review B1/B2).
+
+tasks:
+  # ---- Phase 1: harness + the selection seam (highest leverage) ----
+  - id: ARCH-000
+    content: "Golden/snapshot test harness (prereq) — capture sync/list/verify/where/check-match output + a digest property test baseline"
+    status: done
+    activeForm: "Standing up the golden-test harness"
+    acceptance:
+      - "Snapshot harness (e.g. insta) captures output of sync/list/verify/where/check-match on a fixture repo"
+      - "Property test pins current content_digest values for representative sources (incl. root loose files + a top-level dotfile dir)"
+      - "Gates Phase 1: no structural change merges until baselines are green"
+    tests:
+      - "baseline snapshots committed; digest property test green on unchanged code"
+
+  - id: ARCH-001
+    content: "kernel/ value objects: RelPath (normalized), unified Digest (algo + [u8;32]), Commit"
+    status: done
+    activeForm: "Introducing kernel value objects"
+    depends_on: [ARCH-000]
+    acceptance:
+      - "One Digest ADT replaces DownloadDigest (config.rs:446) AND registry Digest (registry.rs:57); FromStr/Display at the edge"
+      - "RelPath normalized at construction; absorbs paths.rs + scattered strip_prefix/normalize"
+      - "Commit validates hex at the resolve boundary (source.rs:217)"
+      - "NO ArtifactName/SourceName newtypes (review OE4)"
+    tests:
+      - "Digest parses sha256:/blake3: 64-hex; rejects bad algo/length; Display round-trips both old types' inputs"
+      - "RelPath normalization parity with current behavior"
+
+  - id: ARCH-002
+    content: "Selection value object: sole home for artifact membership + dotfile policy; route discovery + check-match"
+    status: done
+    activeForm: "Centralizing membership in Selection"
+    depends_on: [ARCH-001]
+    acceptance:
+      - "Selection absorbs PathMatcher; selects_artifact/selects_path are the only membership API"
+      - "Dotfile gate: hidden top-level dir selected iff matched by an include pattern with a literal leading '.' (.config/.* opt in; * does not) — implemented as its own predicate over the include list"
+      - "Discovery (source.rs:274 git, sync.rs:699 link) + check-match (cli.rs:605) call selects_artifact; no artifact-membership starts_with('.') outside kernel/selection.rs"
+      - "check-match output change for dotfile names is a documented golden exception"
+    tests:
+      - "include=['.config'] selects .config; ['*'] does not; ['.*'] selects all top-level dotdirs"
+      - "non-hidden selection unchanged from PathMatcher (port existing matcher tests)"
+
+  - id: ARCH-003
+    content: "Route prune/orphan + foreign scan through Selection (stranded-dotfile-orphan fix)"
+    status: done
+    activeForm: "Routing prune through Selection"
+    depends_on: [ARCH-002]
+    acceptance:
+      - "Foreign scan (sync.rs:1151,1204) consults Selection instead of bare starts_with('.'); prune stays registry-driven"
+    tests:
+      - "deployed dotfile artifact removed from config => --prune deletes the on-disk dir"
+      - "unmanaged user dotfile dir in target is still left untouched"
+
+  - id: ARCH-004
+    content: "Document content_digest's contract; pin a zero-churn property test (NO digest code change)"
+    status: done
+    activeForm: "Documenting the digest contract"
+    depends_on: [ARCH-000]
+    acceptance:
+      - "content_digest is documented as a resolved-subtree fingerprint with no production consumer (lock.rs:52 uses commit+config_digest)"
+      - "Property test asserts content_digest byte-identical before/after the refactor"
+    tests:
+      - "digest unchanged across kernel/Selection introduction"
+
+  # ---- Phase 2: parse-don't-validate config + rename + getter removal ----
+  - id: ARCH-005
+    content: "Typed source-kind keys (LEADING standalone PR): add `path` (local), rename forge `path`->`repo`, with back-compat aliases"
+    status: pending
+    activeForm: "Introducing typed source-kind keys"
+    acceptance:
+      - "New keys: `path`=<local dir/file>; `host`+`repo`=<forge>; bare `repo`=<owner/repo> defaults to github; `git`/`url` unchanged"
+      - "Back-compat aliases: `git`=<localpath> still works (=> Path); `host`+`path` still works (=> repo)"
+      - "Intentional break: bare `path`=<owner/repo> (old github shorthand) now means a local path; shorthand moved to bare `repo`"
+      - "Touches Source struct, parse/merge, LockedSource fields, tests, README/GUIDE, `add` output"
+      - "Ships FIRST as its own PR, before add-local-symlink and before ARCH-006"
+    tests:
+      - "path=<local> => local; git=<localpath> => local (alias); host+repo => forge; host+path => forge (alias); bare repo => github"
+      - "existing git=<url>/url= configs unchanged"
+
+  - id: ARCH-006
+    content: "ParsedSource + Remote ADT (Git | Path | Url | Host); single parse after merge; rename cli.rs::ParsedSource"
+    status: pending
+    activeForm: "Parsing Source into a Remote ADT"
+    depends_on: [ARCH-001, ARCH-005]
+    acceptance:
+      - "Remote = Git(GitUrl) | Path(LocalPath) | Url{url,digest} | Host{host,repo,protocol}; per-variant payloads; Url/Path have no refspec/root"
+      - "Wire deserialization selects the variant by present key (git/path/url/host+repo)"
+      - "is_some()-counting validators (config.rs:33, :100) deleted; SourceMode no longer runtime-derived (config.rs:622)"
+      - "Existing cli.rs::ParsedSource (cli.rs:613, an add-URL intermediate) renamed (e.g. AddTarget) to avoid collision"
+    tests:
+      - "raw TOML wire schema valid; url+branch/url+root rejected at the TryFrom edge; aliases land on the right variant"
+
+  - id: ARCH-007
+    content: "Drop leaky adapter getters; rewrite getter-based dispatch tests; SourceCtx bundle (no sealing)"
+    status: pending
+    activeForm: "Removing adapter getters"
+    acceptance:
+      - "RouterBackend::git_backend()/http_backend() (backend.rs:25-31) removed"
+      - "Dispatch tests rewritten to capture shared spy handles (backend.rs:298) instead of getters"
+      - "SourceCtx bundles (source, remote, commit, root); ports NOT sealed (doc comment instead)"
+
+  - id: ARCH-008
+    content: "Confine archive.rs's gix use (EntryKind) so `gix only in source/` is grep-clean"
+    status: pending
+    activeForm: "Confining residual gix"
+    acceptance:
+      - "gix grep (production): only source/; ureq only source/download.rs; tar/zip/flate2 only source/archive.rs"
+
+  # ---- Phase 3: context internals ----
+  - id: ARCH-009
+    content: "Split sync.rs (5655 lines) into sync/{resolve,discover,target,prune,verify,rebuild}"
+    status: pending
+    activeForm: "Splitting the sync god-module"
+    depends_on: [ARCH-002, ARCH-003]
+    acceptance:
+      - "discover.rs is the single copy+link discovery path over Selection; sync() is a thin pipeline; no behavior change"
+
+  - id: ARCH-010
+    content: "Split cli.rs (2598 lines) into cli/ per command family; one render path"
+    status: pending
+    activeForm: "Splitting the CLI"
+    depends_on: [ARCH-009]
+    acceptance:
+      - "argv parsing separated from business logic; cli/render.rs is the sole string/JSON producer; wire() names concrete adapters"
+
+  - id: ARCH-011
+    content: "Relocate projection->deploy/, registry->store/, matcher->kernel/selection, config.rs->config/, paths.rs->kernel/path"
+    status: pending
+    activeForm: "Relocating contexts"
+    depends_on: [ARCH-002]
+
+  - id: ARCH-012
+    content: "(optional, with ARCH-013) per-context error enums"
+    status: pending
+    activeForm: "Splitting the crate-wide error enum"
+    depends_on: [ARCH-009, ARCH-011, ARCH-013]
+
+  - id: ARCH-013
+    content: "(optional/stretch) phora-core / phora-cli crate split"
+    status: pending
+    activeForm: "Splitting into core + cli crates"
+    depends_on: [ARCH-010, ARCH-011]

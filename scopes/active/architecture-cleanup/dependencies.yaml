@@ -1,0 +1,50 @@
+scope: architecture-cleanup
+
+# Pure refactor + the dotfile opt-in + one defect fix (stranded orphans) + the git rename.
+# Phase 1 is independently shippable, fixes the defect, and lands the feature with ZERO lock churn.
+
+coordination:
+  - scope: add-local-symlink
+    overlap: "Both touch the source-kind keys (--local/--symlink declare local sources; ARCH-005 adds the `path` key)"
+    decision: "ARCH-005 (typed keys) lands FIRST as its own PR, so --local/--symlink write `path` from day one"
+
+phases:
+  - id: phase-0-harness
+    title: "Golden-test harness (prereq)"
+    tasks: [ARCH-000]
+  - id: phase-1-selection
+    title: "Kernel + selection seam"
+    tasks: [ARCH-001, ARCH-002, ARCH-003, ARCH-004]
+    depends_on: [phase-0-harness]
+  - id: phase-2-parse-rename
+    title: "Parse-don't-validate config + git rename + getter removal"
+    tasks: [ARCH-005, ARCH-006, ARCH-007, ARCH-008]
+    # NOTE: ARCH-005/006 need only ARCH-001 (kernel) — can overlap Phase 1 after ARCH-001.
+  - id: phase-3-internals
+    title: "Context internals"
+    tasks: [ARCH-009, ARCH-010, ARCH-011, ARCH-012, ARCH-013]
+    depends_on: [phase-1-selection, phase-2-parse-rename]
+
+edges:
+  - { from: ARCH-001, to: ARCH-000 }
+  - { from: ARCH-002, to: ARCH-001 }   # Selection over kernel types
+  - { from: ARCH-003, to: ARCH-002 }   # prune consults Selection
+  - { from: ARCH-004, to: ARCH-000 }   # digest pinned against the baseline
+  - { from: ARCH-006, to: ARCH-001 }   # ParsedSource over kernel Digest
+  - { from: ARCH-006, to: ARCH-005 }   # ADT builds on the renamed field
+  - { from: ARCH-009, to: ARCH-002 }
+  - { from: ARCH-009, to: ARCH-003 }
+  - { from: ARCH-010, to: ARCH-009 }
+  - { from: ARCH-011, to: ARCH-002 }
+  - { from: ARCH-012, to: ARCH-013 }   # errors split only with the crate split
+  - { from: ARCH-013, to: ARCH-010 }
+  - { from: ARCH-013, to: ARCH-011 }
+
+parallelizable:
+  - "ARCH-005/006 (config rename + ADT) need only ARCH-001 — run alongside ARCH-002/003/004"
+  - "ARCH-007 and ARCH-008 are independent of each other"
+
+notes:
+  - "ZERO intentional data change: source-level digest untouched (ARCH-004 documents + pins it)."
+  - "ARCH-005 carries the only wire-schema change — a rename WITH a back-compat `git` alias (not a drop)."
+  - "ARCH-012/013 are optional stretch; descope freely without affecting acceptance."
