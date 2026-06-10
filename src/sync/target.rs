@@ -2,13 +2,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::config::{DeployMode, LayoutKind, ParsedSource, Target};
+use crate::deploy::{ArtifactState, Journal, check_artifact_state, deploy_artifact, link_artifact};
 use crate::error::{Error, Result};
 use crate::kernel::Selection;
-use crate::deploy::{
-    ArtifactState, Journal, check_artifact_state, deploy_artifact, link_artifact,
-};
-use crate::store::{ArtifactKey, EjectedEntry, Registry, RegistryRecord};
 use crate::source::{ExportRequest, SourceBackend};
+use crate::store::{ArtifactKey, EjectedEntry, Registry, RegistryRecord};
 
 use super::discover::discover_artifacts_for_source;
 use super::{

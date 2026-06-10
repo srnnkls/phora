@@ -10,10 +10,10 @@ mod tests;
 
 #[cfg(test)]
 use {
-    add::{insert_source_with_ref, run_add},
     crate::config::Host,
     crate::deploy::ArtifactState,
     crate::store::Registry,
+    add::{insert_source_with_ref, run_add},
     render::state_label,
 };
 
@@ -34,8 +34,8 @@ use crate::config::{Config, ParsedSource};
 use crate::error::{Error, Result};
 use crate::kernel::ProjectId;
 use crate::paths::phora_dir;
-use crate::store::FileRegistry;
 use crate::source::{GitBackend, HttpBackend, RouterBackend};
+use crate::store::FileRegistry;
 use crate::sync::{Conflict, ConflictResolver, Resolution};
 
 #[derive(Parser, Debug)]

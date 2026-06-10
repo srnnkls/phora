@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, HashSet};
 use crate::config::{Config, ParsedSource};
 use crate::error::{Error, Result};
 use crate::kernel::Selection;
-use crate::store::{ArtifactKey, Registry};
 use crate::source::SourceBackend;
+use crate::store::{ArtifactKey, Registry};
 
 use super::discover::discover_artifacts_for_source;
 use super::{remote_for, remove_orphan_path};

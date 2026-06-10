@@ -5,8 +5,8 @@ use crate::config::{Config, DeployMode, LayoutKind, ParsedSource, Target};
 use crate::error::{Error, Result};
 use crate::kernel::Selection;
 use crate::lock::Lock;
-use crate::store::{ArtifactKey, ManifestFile, Registry, RegistryRecord};
 use crate::source::{ExportRequest, SourceBackend};
+use crate::store::{ArtifactKey, ManifestFile, Registry, RegistryRecord};
 
 use super::discover::discover_artifacts_for_source;
 use super::{StagingGuard, nonce, remote_for, resolved_remotes};

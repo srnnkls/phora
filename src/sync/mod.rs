@@ -20,9 +20,9 @@ use target::{TargetRun, deploy_target};
 #[cfg(test)]
 use {
     crate::config::LayoutKind,
+    crate::deploy::check_artifact_state,
     crate::kernel::Selection,
     crate::lock::LockedSource,
-    crate::deploy::check_artifact_state,
     discover::discover_working_tree,
     target::{ArtifactEntry, deploy_artifact_entry},
 };
@@ -32,11 +32,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::{Config, DeployMode, ParsedSource, Protocol, SourceMode, merge_configs};
+use crate::deploy::{Journal, recovery_sweep};
 use crate::error::{Error, Result};
 use crate::lock::{Lock, merge_locks, split_locks};
-use crate::deploy::{Journal, recovery_sweep};
-use crate::store::{ArtifactKey, EjectedEntry, Registry};
 use crate::source::{SourceBackend, is_local_path};
+use crate::store::{ArtifactKey, EjectedEntry, Registry};
 
 /// Borrowed inputs to [`sync`]: the configs and locks plus run flags. Bundled so
 /// the orchestration entry point stays stable as later phases add fields.
