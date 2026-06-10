@@ -160,7 +160,16 @@ tasks:
 
   - id: ARCH-012
     content: "Per-context error enums (thiserror); ports return typed errors (loqui alignment; decoupled from the crate split)"
-    status: pending   # round 3 (decision loqui-alignment) makes this MANDATORY, overriding the batch-6 deferral. Prior empirical finding kept for the implementer: every match/matches! on an Error variant is in #[cfg(test)] code (~44 assertions); zero production sites discriminate variants (330 construct-and-propagate; main() prints via Display). The value here is the port contract (traits.md: typed errors per port), not production branching — keep the CLI edge as the aggregator.
+    status: done
+    # done 2026-06-10 (4118780 + review fixes): SourceError (source.rs, incl. Kernel(#[from]
+    # KernelError) with "source error: " prefix — chain preserved, Display byte-identical),
+    # StoreError (store.rs), KernelError (kernel/name.rs). Both ports fully typed; edge Error
+    # wraps via #[error(transparent)] SourceCtx/StoreCtx. 9 byte-exact message pins + 5
+    # contract tests; golden unchanged. ACCEPTED-PARTIAL (opus): "error.rs reduces to the CLI
+    # edge" is incomplete — legacy message variants remain, still constructed by kernel
+    # value-object parses (path/commit.rs), sync (Error::Registry at eject), deploy
+    # (SymlinkNotAllowed strict scan). Construction rule documented in error.rs module doc;
+    # full variant elimination deferred to ARCH-013 (a published phora-core would force it).
     activeForm: "Splitting the crate-wide error enum"
     depends_on: [ARCH-009, ARCH-010, ARCH-011]
     acceptance:

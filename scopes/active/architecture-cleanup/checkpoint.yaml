@@ -3,15 +3,12 @@ checkpoint:
   scope_path: ./scopes/active/architecture-cleanup
   branch: chore/architecture-cleanup
   base: main
-  last_commit: 4b9d820
-  last_batch: 8
+  last_commit: 612f243
+  last_batch: 9
   tasks:
-    done: [ARCH-000, ARCH-001, ARCH-002, ARCH-003, ARCH-004, ARCH-005, ARCH-006, ARCH-007, ARCH-008, ARCH-009, ARCH-010, ARCH-011, ARCH-015, ARCH-014]
-    pending: [ARCH-012]
+    done: [ARCH-000, ARCH-001, ARCH-002, ARCH-003, ARCH-004, ARCH-005, ARCH-006, ARCH-007, ARCH-008, ARCH-009, ARCH-010, ARCH-011, ARCH-015, ARCH-014, ARCH-012]
     deferred: [ARCH-013]   # optional/stretch (round 3 decoupled it from ARCH-012)
-  next_batch:
-    number: 9
-    tasks: [ARCH-012]   # per-context errors (thiserror), typed errors per port
+  next_batch: null   # All mandatory tasks done (ARCH-000..012, 014, 015). Only ARCH-013 (crate split) remains: optional/stretch, deferred — reopen triggers in tasks.yaml. Scope ready for /scope done once ARCH-013 is dropped or lands.
   phase: phase-3-internals
   selection_seam: "src/kernel/selection.rs::Selection — sole artifact-membership + dotfile policy; consumed by source.rs (git discovery), sync/discover.rs (link discovery + foreign scan), cli/query.rs (check-match)"
   layout_note: "Post-ARCH-011 tree: dirs cli/ config/ kernel/ sync/; flat src/{archive,backend,deploy,error,http,lock,paths,source,store}.rs. projection->deploy.rs, registry->store.rs, config.rs->config/{mod,host,source,target,tests}, ProjectId->kernel/project_id.rs all landed (7e5b234); matcher->kernel/selection landed in ARCH-002. source.rs deliberately left flat (gix already confined to it). Confinement greps read against flat files: gix->source.rs, ureq->http.rs, tar/zip/flate2->archive.rs (production; test modules in backend.rs/source.rs also use tar/flate2)."
