@@ -4,11 +4,41 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use gix::object::tree::EntryKind;
+use thiserror::Error;
 
 use crate::config::Refspec;
-use crate::error::{Error, Result};
-use crate::kernel::{ArtifactName, Commit, Digest, Selection, SourceName, safe_component};
+use crate::kernel::{ArtifactName, Commit, Digest, KernelError, Selection, SourceName, safe_component};
 use crate::store::ManifestFile;
+
+/// Errors owned by the source context (`SourceBackend` and its adapters).
+#[derive(Debug, Error)]
+pub enum SourceError {
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("source error: {0}")]
+    Source(String),
+
+    #[error("root path not found in tree: {root}")]
+    RootNotFound { root: std::path::PathBuf },
+
+    #[error("artifact not found in tree: {artifact}")]
+    ArtifactNotFound { artifact: String },
+
+    #[error("symlink not allowed: {path} (set allow_symlinks=true to permit)")]
+    SymlinkNotAllowed { path: std::path::PathBuf },
+
+    #[error("submodule not allowed: {path} (set allow_submodules=true to permit)")]
+    SubmoduleNotAllowed { path: std::path::PathBuf },
+}
+
+impl From<KernelError> for SourceError {
+    fn from(err: KernelError) -> Self {
+        Self::Source(err.to_string())
+    }
+}
+
+type Result<T> = std::result::Result<T, SourceError>;
 
 /// Re-exported beside the backends it composes; defined in `backend` to keep routing separate.
 pub use crate::backend::RouterBackend;
@@ -175,32 +205,32 @@ impl SourceBackend for GitBackend {
 
         if mirror.exists() {
             let repo = gix::open(&mirror)
-                .map_err(|e| Error::Source(format!("open mirror {source}: {e}")))?;
+                .map_err(|e| SourceError::Source(format!("open mirror {source}: {e}")))?;
             let mut remote = repo
                 .find_remote("origin")
-                .map_err(|e| Error::Source(format!("find origin in {source}: {e}")))?;
+                .map_err(|e| SourceError::Source(format!("find origin in {source}: {e}")))?;
             remote
                 .replace_refspecs([MIRROR_REFSPEC], gix::remote::Direction::Fetch)
-                .map_err(|e| Error::Source(format!("set mirror refspec in {source}: {e}")))?;
+                .map_err(|e| SourceError::Source(format!("set mirror refspec in {source}: {e}")))?;
             remote
                 .connect(gix::remote::Direction::Fetch)
-                .map_err(|e| Error::Source(format!("connect origin in {source}: {e}")))?
+                .map_err(|e| SourceError::Source(format!("connect origin in {source}: {e}")))?
                 .prepare_fetch(
                     gix::progress::Discard,
                     gix::remote::ref_map::Options::default(),
                 )
-                .map_err(|e| Error::Source(format!("prepare fetch in {source}: {e}")))?
+                .map_err(|e| SourceError::Source(format!("prepare fetch in {source}: {e}")))?
                 .receive(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
-                .map_err(|e| Error::Source(format!("receive pack in {source}: {e}")))?;
+                .map_err(|e| SourceError::Source(format!("receive pack in {source}: {e}")))?;
         } else {
             gix::prepare_clone_bare(url, &mirror)
-                .map_err(|e| Error::Source(format!("prepare clone {source}: {e}")))?
+                .map_err(|e| SourceError::Source(format!("prepare clone {source}: {e}")))?
                 .configure_remote(|mut remote| {
                     remote.replace_refspecs([MIRROR_REFSPEC], gix::remote::Direction::Fetch)?;
                     Ok(remote)
                 })
                 .fetch_only(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
-                .map_err(|e| Error::Source(format!("clone bare {source}: {e}")))?;
+                .map_err(|e| SourceError::Source(format!("clone bare {source}: {e}")))?;
         }
 
         Ok(())
@@ -209,30 +239,30 @@ impl SourceBackend for GitBackend {
     fn resolve(&self, source: &SourceName, url: &str, refspec: &Refspec) -> Result<String> {
         let mirror = self.mirror_path(url);
         let repo =
-            gix::open(&mirror).map_err(|e| Error::Source(format!("open mirror {source}: {e}")))?;
+            gix::open(&mirror).map_err(|e| SourceError::Source(format!("open mirror {source}: {e}")))?;
 
         let commit = match refspec {
             Refspec::Branch(name) => repo
                 .find_reference(&format!("refs/heads/{name}"))
-                .map_err(|e| Error::Source(format!("branch {name} in {source}: {e}")))?
+                .map_err(|e| SourceError::Source(format!("branch {name} in {source}: {e}")))?
                 .peel_to_commit()
-                .map_err(|e| Error::Source(format!("peel branch {name} in {source}: {e}")))?,
+                .map_err(|e| SourceError::Source(format!("peel branch {name} in {source}: {e}")))?,
             Refspec::Tag(name) => repo
                 .find_reference(&format!("refs/tags/{name}"))
-                .map_err(|e| Error::Source(format!("tag {name} in {source}: {e}")))?
+                .map_err(|e| SourceError::Source(format!("tag {name} in {source}: {e}")))?
                 .peel_to_commit()
-                .map_err(|e| Error::Source(format!("peel tag {name} in {source}: {e}")))?,
+                .map_err(|e| SourceError::Source(format!("peel tag {name} in {source}: {e}")))?,
             Refspec::Rev(rev) => {
                 let commit: Commit = rev
                     .parse()
-                    .map_err(|e| Error::Source(format!("parse rev {rev} in {source}: {e}")))?;
+                    .map_err(|e| SourceError::Source(format!("parse rev {rev} in {source}: {e}")))?;
                 let oid = gix::ObjectId::from_hex(commit.as_str().as_bytes())
-                    .map_err(|e| Error::Source(format!("parse rev {rev} in {source}: {e}")))?;
+                    .map_err(|e| SourceError::Source(format!("parse rev {rev} in {source}: {e}")))?;
                 repo.find_commit(oid)
-                    .map_err(|e| Error::Source(format!("rev {rev} in {source}: {e}")))?
+                    .map_err(|e| SourceError::Source(format!("rev {rev} in {source}: {e}")))?
             }
             Refspec::None => {
-                return Err(Error::Source(format!(
+                return Err(SourceError::Source(format!(
                     "source {source}: git backend cannot resolve a url source's empty refspec"
                 )));
             }
@@ -244,20 +274,20 @@ impl SourceBackend for GitBackend {
     fn commit_time(&self, source: &SourceName, url: &str, commit: &str) -> Result<u64> {
         let mirror = self.mirror_path(url);
         let repo =
-            gix::open(&mirror).map_err(|e| Error::Source(format!("open mirror {source}: {e}")))?;
+            gix::open(&mirror).map_err(|e| SourceError::Source(format!("open mirror {source}: {e}")))?;
         let oid = gix::ObjectId::from_hex(commit.as_bytes())
-            .map_err(|e| Error::Source(format!("parse commit {commit} in {source}: {e}")))?;
+            .map_err(|e| SourceError::Source(format!("parse commit {commit} in {source}: {e}")))?;
         let commit_obj = repo
             .find_commit(oid)
-            .map_err(|e| Error::Source(format!("commit {commit} in {source}: {e}")))?;
+            .map_err(|e| SourceError::Source(format!("commit {commit} in {source}: {e}")))?;
         let seconds = commit_obj
             .author()
-            .map_err(|e| Error::Source(format!("author of {commit} in {source}: {e}")))?
+            .map_err(|e| SourceError::Source(format!("author of {commit} in {source}: {e}")))?
             .time()
-            .map_err(|e| Error::Source(format!("author time of {commit} in {source}: {e}")))?
+            .map_err(|e| SourceError::Source(format!("author time of {commit} in {source}: {e}")))?
             .seconds;
         u64::try_from(seconds)
-            .map_err(|e| Error::Source(format!("author time of {commit} in {source}: {e}")))
+            .map_err(|e| SourceError::Source(format!("author time of {commit} in {source}: {e}")))
     }
 
     fn discover_artifacts(
@@ -274,11 +304,11 @@ impl SourceBackend for GitBackend {
         let mut artifacts = Vec::new();
         for entry in subtree.iter() {
             let entry =
-                entry.map_err(|e| Error::Source(format!("read tree entry in {source}: {e}")))?;
+                entry.map_err(|e| SourceError::Source(format!("read tree entry in {source}: {e}")))?;
             let name = safe_component(&entry.filename().to_string())?.to_string();
 
             if matches!(entry.kind(), EntryKind::Link) {
-                return Err(Error::SymlinkNotAllowed {
+                return Err(SourceError::SymlinkNotAllowed {
                     path: PathBuf::from(name),
                 });
             }
@@ -354,7 +384,7 @@ impl SourceBackend for GitBackend {
 impl GitBackend {
     fn open_mirror(&self, source: &str, url: &str) -> Result<gix::Repository> {
         let mirror = self.mirror_path(url);
-        gix::open(&mirror).map_err(|e| Error::Source(format!("open mirror {source}: {e}")))
+        gix::open(&mirror).map_err(|e| SourceError::Source(format!("open mirror {source}: {e}")))
     }
 
     fn commit_tree<'repo>(
@@ -363,11 +393,11 @@ impl GitBackend {
         commit: &str,
     ) -> Result<gix::Tree<'repo>> {
         let oid = gix::ObjectId::from_hex(commit.as_bytes())
-            .map_err(|e| Error::Source(format!("parse commit {commit} in {source}: {e}")))?;
+            .map_err(|e| SourceError::Source(format!("parse commit {commit} in {source}: {e}")))?;
         repo.find_commit(oid)
-            .map_err(|e| Error::Source(format!("commit {commit} in {source}: {e}")))?
+            .map_err(|e| SourceError::Source(format!("commit {commit} in {source}: {e}")))?
             .tree()
-            .map_err(|e| Error::Source(format!("tree of {commit} in {source}: {e}")))
+            .map_err(|e| SourceError::Source(format!("tree of {commit} in {source}: {e}")))
     }
 
     fn subtree_at_root<'repo>(
@@ -382,13 +412,13 @@ impl GitBackend {
                 let entry = tree
                     .lookup_entry_by_path(r)
                     .map_err(|e| {
-                        Error::Source(format!("lookup root {} in {source}: {e}", r.display()))
+                        SourceError::Source(format!("lookup root {} in {source}: {e}", r.display()))
                     })?
-                    .ok_or_else(|| Error::RootNotFound {
+                    .ok_or_else(|| SourceError::RootNotFound {
                         root: r.to_path_buf(),
                     })?;
                 repo.find_tree(entry.object_id()).map_err(|e| {
-                    Error::Source(format!("root tree {} in {source}: {e}", r.display()))
+                    SourceError::Source(format!("root tree {} in {source}: {e}", r.display()))
                 })
             }
             None => Ok(tree),
@@ -403,18 +433,18 @@ impl GitBackend {
     ) -> Result<gix::Tree<'repo>> {
         let entry = tree
             .lookup_entry_by_path(Path::new(artifact))
-            .map_err(|e| Error::Source(format!("lookup artifact {artifact} in {source}: {e}")))?
-            .ok_or_else(|| Error::ArtifactNotFound {
+            .map_err(|e| SourceError::Source(format!("lookup artifact {artifact} in {source}: {e}")))?
+            .ok_or_else(|| SourceError::ArtifactNotFound {
                 artifact: artifact.to_string(),
             })?;
         repo.find_tree(entry.object_id())
-            .map_err(|e| Error::Source(format!("artifact tree {artifact} in {source}: {e}")))
+            .map_err(|e| SourceError::Source(format!("artifact tree {artifact} in {source}: {e}")))
     }
 
     fn find_blob_data(repo: &gix::Repository, source: &str, oid: gix::ObjectId) -> Result<Vec<u8>> {
         let blob = repo
             .find_blob(oid)
-            .map_err(|e| Error::Source(format!("blob {oid} in {source}: {e}")))?;
+            .map_err(|e| SourceError::Source(format!("blob {oid} in {source}: {e}")))?;
         Ok(blob.data.clone())
     }
 
@@ -428,7 +458,7 @@ impl GitBackend {
     ) -> Result<()> {
         for entry in tree.iter() {
             let entry =
-                entry.map_err(|e| Error::Source(format!("read tree entry in {source}: {e}")))?;
+                entry.map_err(|e| SourceError::Source(format!("read tree entry in {source}: {e}")))?;
             let component = safe_component(&entry.filename().to_string())?.to_string();
             let entry_rel = rel_path.join(component);
             let is_dir = matches!(entry.kind(), EntryKind::Tree);
@@ -450,7 +480,7 @@ impl GitBackend {
                 EntryKind::Tree => {
                     let subtree = repo
                         .find_tree(entry.object_id())
-                        .map_err(|e| Error::Source(format!("subtree in {source}: {e}")))?;
+                        .map_err(|e| SourceError::Source(format!("subtree in {source}: {e}")))?;
                     Self::hash_tree(repo, source, &subtree, &entry_rel, selection, hasher)?;
                 }
                 EntryKind::Commit => {}
@@ -505,16 +535,16 @@ impl HttpBackend {
 impl SourceBackend for HttpBackend {
     fn fetch(&self, source: &SourceName, url: &str) -> Result<()> {
         std::fs::create_dir_all(&self.git_dir)
-            .map_err(|e| Error::Source(format!("source {source}: create git dir: {e}")))?;
+            .map_err(|e| SourceError::Source(format!("source {source}: create git dir: {e}")))?;
         let temp = TempDownload::create(&self.git_dir);
 
         crate::http::download(url, &temp.path)?;
 
         if let Some(expected) = self.digests.get(source) {
             let bytes = std::fs::read(&temp.path)
-                .map_err(|e| Error::Source(format!("source {source}: read download: {e}")))?;
+                .map_err(|e| SourceError::Source(format!("source {source}: read download: {e}")))?;
             crate::http::verify_digest(&bytes, expected)
-                .map_err(|e| Error::Source(format!("source {source}: {e}")))?;
+                .map_err(|e| SourceError::Source(format!("source {source}: {e}")))?;
         }
 
         let entries = crate::archive::extract(&temp.path, url)?;
@@ -526,12 +556,12 @@ impl SourceBackend for HttpBackend {
     fn resolve(&self, source: &SourceName, url: &str, _refspec: &Refspec) -> Result<String> {
         let mirror = mirror_path(&self.git_dir, url);
         let repo =
-            gix::open(&mirror).map_err(|e| Error::Source(format!("open mirror {source}: {e}")))?;
+            gix::open(&mirror).map_err(|e| SourceError::Source(format!("open mirror {source}: {e}")))?;
         let commit = repo
             .find_reference(IMPORT_REF)
-            .map_err(|e| Error::Source(format!("{IMPORT_REF} in {source}: {e}")))?
+            .map_err(|e| SourceError::Source(format!("{IMPORT_REF} in {source}: {e}")))?
             .peel_to_commit()
-            .map_err(|e| Error::Source(format!("peel {IMPORT_REF} in {source}: {e}")))?;
+            .map_err(|e| SourceError::Source(format!("peel {IMPORT_REF} in {source}: {e}")))?;
         Ok(commit.id().to_hex().to_string())
     }
 
@@ -583,7 +613,7 @@ impl ExportWalk<'_> {
     fn run(&mut self, tree: &gix::Tree<'_>, rel_path: &Path) -> Result<()> {
         for entry in tree.iter() {
             let entry = entry
-                .map_err(|e| Error::Source(format!("read tree entry in {}: {e}", self.source)))?;
+                .map_err(|e| SourceError::Source(format!("read tree entry in {}: {e}", self.source)))?;
             let component = safe_component(&entry.filename().to_string())?.to_string();
             let entry_rel = rel_path.join(component);
             let out_path = self.out_base.join(&entry_rel);
@@ -605,12 +635,12 @@ impl ExportWalk<'_> {
                     let subtree = self
                         .repo
                         .find_tree(entry.object_id())
-                        .map_err(|e| Error::Source(format!("subtree in {}: {e}", self.source)))?;
+                        .map_err(|e| SourceError::Source(format!("subtree in {}: {e}", self.source)))?;
                     self.run(&subtree, &entry_rel)?;
                 }
                 EntryKind::Commit => {
                     if !self.policy.allow_submodules {
-                        return Err(Error::SubmoduleNotAllowed { path: entry_rel });
+                        return Err(SourceError::SubmoduleNotAllowed { path: entry_rel });
                     }
                 }
             }
@@ -670,7 +700,7 @@ impl ExportWalk<'_> {
         out_path: &Path,
     ) -> Result<()> {
         if !self.policy.allow_symlinks {
-            return Err(Error::SymlinkNotAllowed {
+            return Err(SourceError::SymlinkNotAllowed {
                 path: entry_rel.to_path_buf(),
             });
         }
@@ -719,16 +749,16 @@ pub(crate) fn import_tree(
     let mirror = mirror_path(git_dir, url);
 
     let repo = if mirror.exists() {
-        gix::open(&mirror).map_err(|e| Error::Source(format!("open mirror {url}: {e}")))?
+        gix::open(&mirror).map_err(|e| SourceError::Source(format!("open mirror {url}: {e}")))?
     } else {
-        gix::init_bare(&mirror).map_err(|e| Error::Source(format!("init mirror {url}: {e}")))?
+        gix::init_bare(&mirror).map_err(|e| SourceError::Source(format!("init mirror {url}: {e}")))?
     };
 
     let mut root = ImportDir::default();
     for entry in entries {
         let oid = repo
             .write_blob(&entry.data)
-            .map_err(|e| Error::Source(format!("write blob for {url}: {e}")))?
+            .map_err(|e| SourceError::Source(format!("write blob for {url}: {e}")))?
             .detach();
         root.insert(&entry.path, to_gix_entry_kind(entry.kind), oid)?;
     }
@@ -754,7 +784,7 @@ pub(crate) fn import_tree(
     };
     let commit_id = repo
         .write_object(&commit)
-        .map_err(|e| Error::Source(format!("write import commit for {url}: {e}")))?
+        .map_err(|e| SourceError::Source(format!("write import commit for {url}: {e}")))?
         .detach();
 
     // PreviousValue::Any: create the ref if absent, force-update it on re-import.
@@ -764,7 +794,7 @@ pub(crate) fn import_tree(
         gix::refs::transaction::PreviousValue::Any,
         IMPORT_MESSAGE,
     )
-    .map_err(|e| Error::Source(format!("update {IMPORT_REF} for {url}: {e}")))?;
+    .map_err(|e| SourceError::Source(format!("update {IMPORT_REF} for {url}: {e}")))?;
 
     Ok(commit_id.to_hex().to_string())
 }
@@ -786,12 +816,12 @@ impl ImportDir {
         let mut components = Vec::new();
         for component in path.components() {
             let name = component.as_os_str().to_str().ok_or_else(|| {
-                Error::Source(format!("non-utf8 import path: {}", path.display()))
+                SourceError::Source(format!("non-utf8 import path: {}", path.display()))
             })?;
             components.push(safe_component(name)?.to_string());
         }
         let Some((leaf, dirs)) = components.split_last() else {
-            return Err(Error::Source("empty import path".to_owned()));
+            return Err(SourceError::Source("empty import path".to_owned()));
         };
 
         let mut dir = self;
@@ -803,7 +833,7 @@ impl ImportDir {
             match node {
                 ImportNode::Dir(child) => dir = child,
                 ImportNode::Leaf { .. } => {
-                    return Err(Error::Source(format!(
+                    return Err(SourceError::Source(format!(
                         "import path collides file and directory at {segment:?}"
                     )));
                 }
@@ -815,10 +845,10 @@ impl ImportDir {
                 Ok(())
             }
             std::collections::btree_map::Entry::Occupied(existing) => match existing.get() {
-                ImportNode::Dir(_) => Err(Error::Source(format!(
+                ImportNode::Dir(_) => Err(SourceError::Source(format!(
                     "import path collides file and directory at {leaf:?}"
                 ))),
-                ImportNode::Leaf { .. } => Err(Error::Source(format!(
+                ImportNode::Leaf { .. } => Err(SourceError::Source(format!(
                     "duplicate archive entry path: {leaf:?}"
                 ))),
             },
@@ -849,13 +879,13 @@ fn write_import_tree(repo: &gix::Repository, dir: &ImportDir, url: &str) -> Resu
     let tree = gix::objs::Tree { entries };
     Ok(repo
         .write_object(&tree)
-        .map_err(|e| Error::Source(format!("write tree for {url}: {e}")))?
+        .map_err(|e| SourceError::Source(format!("write tree for {url}: {e}")))?
         .detach())
 }
 
 /// HEAD of a local working-tree repo; a non-repo or unborn HEAD yields the
 /// `"link"` sentinel, since link mode must tolerate a plain directory.
-pub fn read_local_head(path: &str) -> Result<String> {
+pub fn read_local_head(path: &str) -> crate::error::Result<String> {
     let Ok(repo) = gix::open(path) else {
         return Ok("link".to_owned());
     };
@@ -891,7 +921,7 @@ fn hash_framed_entry(hasher: &mut blake3::Hasher, rel_path: &[u8], tag: &[u8], p
 
 fn set_deterministic_mtime(path: &Path, commit_time: u64) -> Result<()> {
     let seconds = i64::try_from(commit_time)
-        .map_err(|e| Error::Source(format!("commit_time out of range: {e}")))?;
+        .map_err(|e| SourceError::Source(format!("commit_time out of range: {e}")))?;
     filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(seconds, 0))?;
     Ok(())
 }
@@ -1807,7 +1837,7 @@ path = "srnnkls/tropos"
         let err = result
             .expect_err("v1: a symlink-as-artifact at root must error, not be silently dropped");
         assert!(
-            !matches!(err, Error::NotImplemented(_)),
+            matches!(err, SourceError::SymlinkNotAllowed { .. }),
             "must be a real symlink-at-root rejection, not the unimplemented stub: {err}"
         );
         let msg = err.to_string();
@@ -1839,7 +1869,7 @@ path = "srnnkls/tropos"
             "v1: a root symlink must error unconditionally, even when the matcher would exclude it",
         );
         assert!(
-            !matches!(err, Error::NotImplemented(_)),
+            matches!(err, SourceError::SymlinkNotAllowed { .. }),
             "must be a real symlink-at-root rejection, not the unimplemented stub: {err}"
         );
         let msg = err.to_string();
@@ -2045,7 +2075,7 @@ path = "srnnkls/tropos"
             .expect_err("linky/link is a symlink; allow_symlinks=false must error");
 
         assert!(
-            !matches!(err, Error::NotImplemented(_)),
+            matches!(err, SourceError::SymlinkNotAllowed { .. }),
             "must be a real symlink-policy rejection, not the unimplemented stub: {err}"
         );
         let msg = err.to_string();
@@ -2536,7 +2566,7 @@ path = "srnnkls/tropos"
         );
 
         assert!(
-            matches!(result, Err(Error::Source(_))),
+            matches!(result, Err(SourceError::Source(_))),
             "two entries with the same path must error, not silently overwrite"
         );
     }
@@ -2552,7 +2582,7 @@ path = "srnnkls/tropos"
             ],
         );
         assert!(
-            matches!(dir_after_file, Err(Error::Source(_))),
+            matches!(dir_after_file, Err(SourceError::Source(_))),
             "a file then a directory at the same name must error"
         );
 
@@ -2565,7 +2595,7 @@ path = "srnnkls/tropos"
             ],
         );
         assert!(
-            matches!(file_after_dir, Err(Error::Source(_))),
+            matches!(file_after_dir, Err(SourceError::Source(_))),
             "a directory then a file at the same name must error"
         );
     }
@@ -2613,9 +2643,10 @@ path = "srnnkls/tropos"
         use tempfile::TempDir;
 
         use crate::config::Refspec;
-        use crate::error::Error;
         use crate::kernel::{Digest, Selection};
-        use crate::source::{ExportPolicy, ExportRequest, HttpBackend, SourceBackend, mirror_path};
+        use crate::source::{
+            ExportPolicy, ExportRequest, HttpBackend, SourceBackend, SourceError, mirror_path,
+        };
 
         use super::{an, sn};
 
@@ -2871,11 +2902,11 @@ path = "srnnkls/tropos"
                 .fetch(&sn("pkg"), &url)
                 .expect_err("a non-matching configured digest must fail fetch");
             match err {
-                Error::Source(msg) => assert!(
+                SourceError::Source(msg) => assert!(
                     msg.contains("pkg"),
                     "the digest-mismatch error must name the source `pkg`, got: {msg}"
                 ),
-                other => panic!("expected Error::Source on digest mismatch, got: {other:?}"),
+                other => panic!("expected SourceError::Source on digest mismatch, got: {other:?}"),
             }
 
             let mirror = mirror_path(git_dir.path(), &url);

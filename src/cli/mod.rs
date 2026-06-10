@@ -272,7 +272,7 @@ fn open_project_registry() -> Result<FileRegistry> {
         .join("state")
         .join("projects")
         .join(project.as_str());
-    FileRegistry::open(state_root)
+    Ok(FileRegistry::open(state_root)?)
 }
 
 fn load_config() -> Result<Config> {

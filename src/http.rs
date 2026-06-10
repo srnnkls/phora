@@ -5,8 +5,10 @@ use std::time::Duration;
 
 use sha2::{Digest as _, Sha256};
 
-use crate::error::{Error, Result};
 use crate::kernel::{Algo, Digest};
+use crate::source::SourceError;
+
+type Result<T> = std::result::Result<T, SourceError>;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const BODY_TIMEOUT: Duration = Duration::from_mins(5);
@@ -15,7 +17,7 @@ const BODY_TIMEOUT: Duration = Duration::from_mins(5);
 ///
 /// # Errors
 ///
-/// Returns [`Error::Source`] on a non-2xx status (message names the status and
+/// Returns [`SourceError::Source`] on a non-2xx status (message names the status and
 /// url), on transport/connection failure, or on a filesystem error writing `dest`.
 pub fn download(url: &str, dest: &Path) -> Result<()> {
     let agent = ureq::Agent::config_builder()
@@ -27,23 +29,23 @@ pub fn download(url: &str, dest: &Path) -> Result<()> {
     let response = match agent.get(url).call() {
         Ok(response) => response,
         Err(ureq::Error::StatusCode(code)) => {
-            return Err(Error::Source(format!(
+            return Err(SourceError::Source(format!(
                 "GET {url} failed with status {code}"
             )));
         }
-        Err(err) => return Err(Error::Source(format!("GET {url} failed: {err}"))),
+        Err(err) => return Err(SourceError::Source(format!("GET {url} failed: {err}"))),
     };
 
     let mut reader = response.into_body().into_reader();
     let mut file = std::fs::File::create(dest).map_err(|err| {
-        Error::Source(format!(
+        SourceError::Source(format!(
             "creating {} for GET {url} failed: {err}",
             dest.display()
         ))
     })?;
     if let Err(err) = std::io::copy(&mut reader, &mut file) {
         let _ = std::fs::remove_file(dest);
-        return Err(Error::Source(format!(
+        return Err(SourceError::Source(format!(
             "writing GET {url} to {} failed: {err}",
             dest.display()
         )));
@@ -55,7 +57,7 @@ pub fn download(url: &str, dest: &Path) -> Result<()> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Source`] on mismatch; the message names both the expected
+/// Returns [`SourceError::Source`] on mismatch; the message names both the expected
 /// and the actual digest as lowercase 64-char hex.
 pub fn verify_digest(bytes: &[u8], expected: &Digest) -> Result<()> {
     let (algo, actual) = match expected.algo() {
@@ -67,7 +69,7 @@ pub fn verify_digest(bytes: &[u8], expected: &Digest) -> Result<()> {
         return Ok(());
     }
 
-    Err(Error::Source(format!(
+    Err(SourceError::Source(format!(
         "{algo} digest mismatch: expected {}, got {}",
         hex_lower(expected.bytes()),
         hex_lower(&actual),
@@ -86,8 +88,8 @@ fn hex_lower(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::error::Error;
     use crate::http::{download, verify_digest};
+    use crate::source::SourceError;
     use crate::kernel::Digest;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -158,8 +160,8 @@ mod tests {
             .expect_err("creating a file under a missing parent must error");
 
         assert!(
-            matches!(err, Error::Source(_)),
-            "file-creation failure must map to Error::Source, got: {err:?}"
+            matches!(err, SourceError::Source(_)),
+            "file-creation failure must map to SourceError::Source, got: {err:?}"
         );
     }
 
@@ -173,11 +175,11 @@ mod tests {
             download(&server.url("/missing.bin"), &dest).expect_err("404 must be an error, not Ok");
 
         match err {
-            Error::Source(msg) => assert!(
+            SourceError::Source(msg) => assert!(
                 msg.contains("404"),
                 "non-2xx error message must include the status code, got: {msg}"
             ),
-            other => panic!("expected Error::Source for non-2xx, got: {other:?}"),
+            other => panic!("expected SourceError::Source for non-2xx, got: {other:?}"),
         }
     }
 
@@ -190,8 +192,8 @@ mod tests {
             .expect_err("connecting to a refused port must error");
 
         assert!(
-            matches!(err, Error::Source(_)),
-            "connection failure must map to Error::Source, got: {err:?}"
+            matches!(err, SourceError::Source(_)),
+            "connection failure must map to SourceError::Source, got: {err:?}"
         );
     }
 
@@ -225,7 +227,7 @@ mod tests {
         let err = verify_digest(PAYLOAD, &digest).expect_err("wrong sha256 must reject");
 
         match err {
-            Error::Source(msg) => {
+            SourceError::Source(msg) => {
                 assert!(
                     msg.contains(&wrong_hex),
                     "mismatch error must name the expected hex `{wrong_hex}`, got: {msg}"
@@ -235,7 +237,7 @@ mod tests {
                     "mismatch error must name the actual hex `{PAYLOAD_SHA256}`, got: {msg}"
                 );
             }
-            other => panic!("expected Error::Source on mismatch, got: {other:?}"),
+            other => panic!("expected SourceError::Source on mismatch, got: {other:?}"),
         }
     }
 
@@ -247,7 +249,7 @@ mod tests {
         let err = verify_digest(PAYLOAD, &digest).expect_err("wrong blake3 must reject");
 
         match err {
-            Error::Source(msg) => {
+            SourceError::Source(msg) => {
                 assert!(
                     msg.contains(&wrong_hex),
                     "mismatch error must name the expected hex `{wrong_hex}`, got: {msg}"
@@ -257,7 +259,7 @@ mod tests {
                     "mismatch error must name the actual hex `{PAYLOAD_BLAKE3}`, got: {msg}"
                 );
             }
-            other => panic!("expected Error::Source on mismatch, got: {other:?}"),
+            other => panic!("expected SourceError::Source on mismatch, got: {other:?}"),
         }
     }
 }

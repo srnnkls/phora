@@ -414,7 +414,7 @@ pub fn deploy_artifact(
     if let Err(put_err) = registry.put(&record) {
         rollback_swap(dst, backup.as_deref())?;
         journal.remove(dst)?;
-        return Err(put_err);
+        return Err(put_err.into());
     }
 
     journal.remove(dst)?;
@@ -507,7 +507,7 @@ pub fn link_artifact(
     if let Err(put_err) = registry.put(&record) {
         rollback_swap(dst, backup.as_deref())?;
         journal.remove(dst)?;
-        return Err(put_err);
+        return Err(put_err.into());
     }
 
     journal.remove(dst)?;
@@ -630,7 +630,9 @@ fn remove_orphaned_staging(target_parent: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{FileRegistry, ManifestFile};
+    use crate::store::{FileRegistry, ManifestFile, StoreError};
+
+    type StoreResult<T> = std::result::Result<T, StoreError>;
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
 
@@ -1420,10 +1422,10 @@ mod tests {
     }
 
     impl Registry for OrderingProbeRegistry {
-        fn get(&self, key: &ArtifactKey) -> Result<Option<RegistryRecord>> {
+        fn get(&self, key: &ArtifactKey) -> StoreResult<Option<RegistryRecord>> {
             self.inner.get(key)
         }
-        fn put(&self, record: &RegistryRecord) -> Result<()> {
+        fn put(&self, record: &RegistryRecord) -> StoreResult<()> {
             let journal = Journal::open(&self.journal_dir).expect("open journal at put time");
             let entries = journal.entries().expect("read journal at put time");
             self.journal_nonempty_at_put.set(!entries.is_empty());
@@ -1432,19 +1434,19 @@ mod tests {
                 .set(on_disk == self.staged_content);
             self.inner.put(record)
         }
-        fn remove(&self, key: &ArtifactKey) -> Result<()> {
+        fn remove(&self, key: &ArtifactKey) -> StoreResult<()> {
             self.inner.remove(key)
         }
-        fn list_target(&self, target: &str) -> Result<Vec<RegistryRecord>> {
+        fn list_target(&self, target: &str) -> StoreResult<Vec<RegistryRecord>> {
             self.inner.list_target(target)
         }
-        fn list_all(&self) -> Result<Vec<RegistryRecord>> {
+        fn list_all(&self) -> StoreResult<Vec<RegistryRecord>> {
             self.inner.list_all()
         }
-        fn load_ejected(&self, target: &str) -> Result<Vec<EjectedEntry>> {
+        fn load_ejected(&self, target: &str) -> StoreResult<Vec<EjectedEntry>> {
             self.inner.load_ejected(target)
         }
-        fn save_ejected(&self, target: &str, ejected: &[EjectedEntry]) -> Result<()> {
+        fn save_ejected(&self, target: &str, ejected: &[EjectedEntry]) -> StoreResult<()> {
             self.inner.save_ejected(target, ejected)
         }
         fn locks_dir(&self) -> PathBuf {
@@ -1493,25 +1495,25 @@ mod tests {
     }
 
     impl Registry for FailingPutRegistry {
-        fn get(&self, key: &ArtifactKey) -> Result<Option<RegistryRecord>> {
+        fn get(&self, key: &ArtifactKey) -> StoreResult<Option<RegistryRecord>> {
             self.inner.get(key)
         }
-        fn put(&self, _record: &RegistryRecord) -> Result<()> {
-            Err(Error::Registry("injected put failure".to_owned()))
+        fn put(&self, _record: &RegistryRecord) -> StoreResult<()> {
+            Err(StoreError::Registry("injected put failure".to_owned()))
         }
-        fn remove(&self, key: &ArtifactKey) -> Result<()> {
+        fn remove(&self, key: &ArtifactKey) -> StoreResult<()> {
             self.inner.remove(key)
         }
-        fn list_target(&self, target: &str) -> Result<Vec<RegistryRecord>> {
+        fn list_target(&self, target: &str) -> StoreResult<Vec<RegistryRecord>> {
             self.inner.list_target(target)
         }
-        fn list_all(&self) -> Result<Vec<RegistryRecord>> {
+        fn list_all(&self) -> StoreResult<Vec<RegistryRecord>> {
             self.inner.list_all()
         }
-        fn load_ejected(&self, target: &str) -> Result<Vec<EjectedEntry>> {
+        fn load_ejected(&self, target: &str) -> StoreResult<Vec<EjectedEntry>> {
             self.inner.load_ejected(target)
         }
-        fn save_ejected(&self, target: &str, ejected: &[EjectedEntry]) -> Result<()> {
+        fn save_ejected(&self, target: &str, ejected: &[EjectedEntry]) -> StoreResult<()> {
             self.inner.save_ejected(target, ejected)
         }
         fn locks_dir(&self) -> PathBuf {

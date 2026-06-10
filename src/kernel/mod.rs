@@ -9,7 +9,7 @@ mod selection;
 
 pub use commit::Commit;
 pub use digest::{Algo, Digest};
-pub use name::{ArtifactName, SourceName};
+pub use name::{ArtifactName, KernelError, SourceName};
 pub use path::RelPath;
 pub use project_id::ProjectId;
 pub use selection::Selection;

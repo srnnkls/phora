@@ -8,9 +8,11 @@ use tempfile::TempDir;
 
 use crate::config::Refspec;
 use crate::source::{
-    ExportRequest, ExportResult, GitBackend, HttpBackend, RouterBackend, SourceBackend,
+    ExportRequest, ExportResult, GitBackend, HttpBackend, RouterBackend, SourceBackend, SourceError,
 };
 use crate::store::FileRegistry;
+
+type SourceResult<T> = std::result::Result<T, SourceError>;
 
 fn an(name: &str) -> crate::kernel::ArtifactName {
     crate::kernel::ArtifactName::trusted(name)
@@ -176,7 +178,7 @@ impl<'a> CountingBackend<'a> {
 }
 
 impl SourceBackend for CountingBackend<'_> {
-    fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> Result<()> {
+    fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> SourceResult<()> {
         self.fetches.set(self.fetches.get() + 1);
         self.inner.fetch(source, url)
     }
@@ -186,7 +188,7 @@ impl SourceBackend for CountingBackend<'_> {
         source: &crate::kernel::SourceName,
         url: &str,
         refspec: &Refspec,
-    ) -> Result<String> {
+    ) -> SourceResult<String> {
         self.resolves.set(self.resolves.get() + 1);
         self.inner.resolve(source, url, refspec)
     }
@@ -196,7 +198,7 @@ impl SourceBackend for CountingBackend<'_> {
         source: &crate::kernel::SourceName,
         url: &str,
         commit: &str,
-    ) -> Result<u64> {
+    ) -> SourceResult<u64> {
         self.commit_times.set(self.commit_times.get() + 1);
         self.inner.commit_time(source, url, commit)
     }
@@ -208,13 +210,13 @@ impl SourceBackend for CountingBackend<'_> {
         commit: &str,
         root: Option<&Path>,
         selection: &crate::kernel::Selection,
-    ) -> Result<Vec<crate::kernel::ArtifactName>> {
+    ) -> SourceResult<Vec<crate::kernel::ArtifactName>> {
         self.discovers.set(self.discovers.get() + 1);
         self.inner
             .discover_artifacts(source, url, commit, root, selection)
     }
 
-    fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult> {
+    fn export_artifact(&self, req: &ExportRequest<'_>) -> SourceResult<ExportResult> {
         self.exports.set(self.exports.get() + 1);
         self.inner.export_artifact(req)
     }
@@ -226,7 +228,7 @@ impl SourceBackend for CountingBackend<'_> {
         commit: &str,
         root: Option<&Path>,
         selection: &crate::kernel::Selection,
-    ) -> Result<String> {
+    ) -> SourceResult<String> {
         self.digests.set(self.digests.get() + 1);
         self.inner
             .compute_digest(source, url, commit, root, selection)
@@ -775,7 +777,7 @@ struct FailingExportBackend<'a> {
 }
 
 impl SourceBackend for FailingExportBackend<'_> {
-    fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> Result<()> {
+    fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> SourceResult<()> {
         self.inner.fetch(source, url)
     }
     fn resolve(
@@ -783,7 +785,7 @@ impl SourceBackend for FailingExportBackend<'_> {
         source: &crate::kernel::SourceName,
         url: &str,
         refspec: &Refspec,
-    ) -> Result<String> {
+    ) -> SourceResult<String> {
         self.inner.resolve(source, url, refspec)
     }
     fn commit_time(
@@ -791,7 +793,7 @@ impl SourceBackend for FailingExportBackend<'_> {
         source: &crate::kernel::SourceName,
         url: &str,
         commit: &str,
-    ) -> Result<u64> {
+    ) -> SourceResult<u64> {
         self.inner.commit_time(source, url, commit)
     }
     fn discover_artifacts(
@@ -801,13 +803,13 @@ impl SourceBackend for FailingExportBackend<'_> {
         commit: &str,
         root: Option<&Path>,
         selection: &crate::kernel::Selection,
-    ) -> Result<Vec<crate::kernel::ArtifactName>> {
+    ) -> SourceResult<Vec<crate::kernel::ArtifactName>> {
         self.inner
             .discover_artifacts(source, url, commit, root, selection)
     }
-    fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult> {
+    fn export_artifact(&self, req: &ExportRequest<'_>) -> SourceResult<ExportResult> {
         if req.artifact.as_str() == self.fail_artifact {
-            return Err(Error::Source(format!(
+            return Err(SourceError::Source(format!(
                 "injected export failure for {}",
                 req.artifact
             )));
@@ -821,7 +823,7 @@ impl SourceBackend for FailingExportBackend<'_> {
         commit: &str,
         root: Option<&Path>,
         selection: &crate::kernel::Selection,
-    ) -> Result<String> {
+    ) -> SourceResult<String> {
         self.inner
             .compute_digest(source, url, commit, root, selection)
     }
@@ -1600,7 +1602,7 @@ struct PartialStagingExportBackend<'a> {
 }
 
 impl SourceBackend for PartialStagingExportBackend<'_> {
-    fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> Result<()> {
+    fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> SourceResult<()> {
         self.inner.fetch(source, url)
     }
     fn resolve(
@@ -1608,7 +1610,7 @@ impl SourceBackend for PartialStagingExportBackend<'_> {
         source: &crate::kernel::SourceName,
         url: &str,
         refspec: &Refspec,
-    ) -> Result<String> {
+    ) -> SourceResult<String> {
         self.inner.resolve(source, url, refspec)
     }
     fn commit_time(
@@ -1616,7 +1618,7 @@ impl SourceBackend for PartialStagingExportBackend<'_> {
         source: &crate::kernel::SourceName,
         url: &str,
         commit: &str,
-    ) -> Result<u64> {
+    ) -> SourceResult<u64> {
         self.inner.commit_time(source, url, commit)
     }
     fn discover_artifacts(
@@ -1626,16 +1628,16 @@ impl SourceBackend for PartialStagingExportBackend<'_> {
         commit: &str,
         root: Option<&Path>,
         selection: &crate::kernel::Selection,
-    ) -> Result<Vec<crate::kernel::ArtifactName>> {
+    ) -> SourceResult<Vec<crate::kernel::ArtifactName>> {
         self.inner
             .discover_artifacts(source, url, commit, root, selection)
     }
-    fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult> {
+    fn export_artifact(&self, req: &ExportRequest<'_>) -> SourceResult<ExportResult> {
         if req.artifact.as_str() == self.fail_artifact {
             std::fs::create_dir_all(req.staging_dir).expect("create partial staging dir");
             std::fs::write(req.staging_dir.join("partial.txt"), b"half-written\n")
                 .expect("write partial staging file");
-            return Err(Error::Source(format!(
+            return Err(SourceError::Source(format!(
                 "injected export failure after partial staging for {}",
                 req.artifact
             )));
@@ -1649,7 +1651,7 @@ impl SourceBackend for PartialStagingExportBackend<'_> {
         commit: &str,
         root: Option<&Path>,
         selection: &crate::kernel::Selection,
-    ) -> Result<String> {
+    ) -> SourceResult<String> {
         self.inner
             .compute_digest(source, url, commit, root, selection)
     }
@@ -2147,7 +2149,7 @@ struct FailingResolveBackend<'a> {
 }
 
 impl SourceBackend for FailingResolveBackend<'_> {
-    fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> Result<()> {
+    fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> SourceResult<()> {
         self.inner.fetch(source, url)
     }
     fn resolve(
@@ -2155,15 +2157,15 @@ impl SourceBackend for FailingResolveBackend<'_> {
         _source: &crate::kernel::SourceName,
         _url: &str,
         _refspec: &Refspec,
-    ) -> Result<String> {
-        Err(Error::Source("injected resolve failure".to_owned()))
+    ) -> SourceResult<String> {
+        Err(SourceError::Source("injected resolve failure".to_owned()))
     }
     fn commit_time(
         &self,
         source: &crate::kernel::SourceName,
         url: &str,
         commit: &str,
-    ) -> Result<u64> {
+    ) -> SourceResult<u64> {
         self.inner.commit_time(source, url, commit)
     }
     fn discover_artifacts(
@@ -2173,11 +2175,11 @@ impl SourceBackend for FailingResolveBackend<'_> {
         commit: &str,
         root: Option<&Path>,
         selection: &crate::kernel::Selection,
-    ) -> Result<Vec<crate::kernel::ArtifactName>> {
+    ) -> SourceResult<Vec<crate::kernel::ArtifactName>> {
         self.inner
             .discover_artifacts(source, url, commit, root, selection)
     }
-    fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult> {
+    fn export_artifact(&self, req: &ExportRequest<'_>) -> SourceResult<ExportResult> {
         self.inner.export_artifact(req)
     }
     fn compute_digest(
@@ -2187,7 +2189,7 @@ impl SourceBackend for FailingResolveBackend<'_> {
         commit: &str,
         root: Option<&Path>,
         selection: &crate::kernel::Selection,
-    ) -> Result<String> {
+    ) -> SourceResult<String> {
         self.inner
             .compute_digest(source, url, commit, root, selection)
     }
@@ -4060,7 +4062,7 @@ impl<'a> RecordingBackend<'a> {
 }
 
 impl SourceBackend for RecordingBackend<'_> {
-    fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> Result<()> {
+    fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> SourceResult<()> {
         self.urls.borrow_mut().push(url.to_owned());
         self.inner.fetch(source, url)
     }
@@ -4069,7 +4071,7 @@ impl SourceBackend for RecordingBackend<'_> {
         source: &crate::kernel::SourceName,
         url: &str,
         refspec: &Refspec,
-    ) -> Result<String> {
+    ) -> SourceResult<String> {
         self.inner.resolve(source, url, refspec)
     }
     fn commit_time(
@@ -4077,7 +4079,7 @@ impl SourceBackend for RecordingBackend<'_> {
         source: &crate::kernel::SourceName,
         url: &str,
         commit: &str,
-    ) -> Result<u64> {
+    ) -> SourceResult<u64> {
         self.inner.commit_time(source, url, commit)
     }
     fn discover_artifacts(
@@ -4087,11 +4089,11 @@ impl SourceBackend for RecordingBackend<'_> {
         commit: &str,
         root: Option<&Path>,
         selection: &crate::kernel::Selection,
-    ) -> Result<Vec<crate::kernel::ArtifactName>> {
+    ) -> SourceResult<Vec<crate::kernel::ArtifactName>> {
         self.inner
             .discover_artifacts(source, url, commit, root, selection)
     }
-    fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult> {
+    fn export_artifact(&self, req: &ExportRequest<'_>) -> SourceResult<ExportResult> {
         self.inner.export_artifact(req)
     }
     fn compute_digest(
@@ -4101,7 +4103,7 @@ impl SourceBackend for RecordingBackend<'_> {
         commit: &str,
         root: Option<&Path>,
         selection: &crate::kernel::Selection,
-    ) -> Result<String> {
+    ) -> SourceResult<String> {
         self.inner
             .compute_digest(source, url, commit, root, selection)
     }
@@ -4366,7 +4368,7 @@ impl CountingRouter {
 }
 
 impl SourceBackend for CountingRouter {
-    fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> Result<()> {
+    fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> SourceResult<()> {
         self.fetches.set(self.fetches.get() + 1);
         self.inner.fetch(source, url)
     }
@@ -4375,7 +4377,7 @@ impl SourceBackend for CountingRouter {
         source: &crate::kernel::SourceName,
         url: &str,
         refspec: &Refspec,
-    ) -> Result<String> {
+    ) -> SourceResult<String> {
         self.inner.resolve(source, url, refspec)
     }
     fn commit_time(
@@ -4383,7 +4385,7 @@ impl SourceBackend for CountingRouter {
         source: &crate::kernel::SourceName,
         url: &str,
         commit: &str,
-    ) -> Result<u64> {
+    ) -> SourceResult<u64> {
         self.inner.commit_time(source, url, commit)
     }
     fn discover_artifacts(
@@ -4393,11 +4395,11 @@ impl SourceBackend for CountingRouter {
         commit: &str,
         root: Option<&Path>,
         selection: &crate::kernel::Selection,
-    ) -> Result<Vec<crate::kernel::ArtifactName>> {
+    ) -> SourceResult<Vec<crate::kernel::ArtifactName>> {
         self.inner
             .discover_artifacts(source, url, commit, root, selection)
     }
-    fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult> {
+    fn export_artifact(&self, req: &ExportRequest<'_>) -> SourceResult<ExportResult> {
         self.inner.export_artifact(req)
     }
     fn compute_digest(
@@ -4407,7 +4409,7 @@ impl SourceBackend for CountingRouter {
         commit: &str,
         root: Option<&Path>,
         selection: &crate::kernel::Selection,
-    ) -> Result<String> {
+    ) -> SourceResult<String> {
         self.inner
             .compute_digest(source, url, commit, root, selection)
     }

@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 
 use flate2::read::GzDecoder;
 
-use crate::error::{Error, Result};
 use crate::kernel::safe_component;
+use crate::source::SourceError;
+
+type Result<T> = std::result::Result<T, SourceError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
@@ -24,7 +26,7 @@ pub struct ExtractedEntry {
 
 /// Validates an archive entry name as a relative, traversal-free path.
 pub fn safe_archive_path(raw: &str) -> Result<PathBuf> {
-    let reject = |why: &str| Err(Error::Source(format!("unsafe archive path {raw:?}: {why}")));
+    let reject = |why: &str| Err(SourceError::Source(format!("unsafe archive path {raw:?}: {why}")));
     if raw.is_empty() {
         return reject("empty");
     }
@@ -122,16 +124,16 @@ fn extract_tar<R: Read>(reader: R, max_total: u64) -> Result<Vec<ExtractedEntry>
             .path()?
             .to_str()
             .map(str::to_owned)
-            .ok_or_else(|| Error::Source("non-utf8 archive entry name".to_owned()))?;
+            .ok_or_else(|| SourceError::Source("non-utf8 archive entry name".to_owned()))?;
         let path = safe_archive_path(&name)?;
 
         let (kind, data) = match entry_type {
             EntryType::Symlink => {
                 let target = entry
                     .link_name()?
-                    .ok_or_else(|| Error::Source(format!("symlink {name:?} has no target")))?;
+                    .ok_or_else(|| SourceError::Source(format!("symlink {name:?} has no target")))?;
                 let target = target.to_str().ok_or_else(|| {
-                    Error::Source(format!("non-utf8 symlink target for {name:?}"))
+                    SourceError::Source(format!("non-utf8 symlink target for {name:?}"))
                 })?;
                 (EntryKind::Link, target.as_bytes().to_vec())
             }
@@ -140,7 +142,7 @@ fn extract_tar<R: Read>(reader: R, max_total: u64) -> Result<Vec<ExtractedEntry>
                 (mode_to_blob_kind(mode), data)
             }
             other => {
-                return Err(Error::Source(format!(
+                return Err(SourceError::Source(format!(
                     "unsupported archive entry type {other:?} for {name:?}"
                 )));
             }
@@ -152,18 +154,18 @@ fn extract_tar<R: Read>(reader: R, max_total: u64) -> Result<Vec<ExtractedEntry>
 
 fn extract_zip(bytes: &[u8], max_total: u64) -> Result<Vec<ExtractedEntry>> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
-        .map_err(|e| Error::Source(format!("invalid zip archive: {e}")))?;
+        .map_err(|e| SourceError::Source(format!("invalid zip archive: {e}")))?;
     let mut entries = Vec::new();
     let mut total: u64 = 0;
     for index in 0..archive.len() {
         let mut file = archive
             .by_index(index)
-            .map_err(|e| Error::Source(format!("reading zip entry {index}: {e}")))?;
+            .map_err(|e| SourceError::Source(format!("reading zip entry {index}: {e}")))?;
         if file.is_dir() {
             continue;
         }
         let name = std::str::from_utf8(file.name_raw())
-            .map_err(|_| Error::Source(format!("non-utf8 zip entry name at index {index}")))?
+            .map_err(|_| SourceError::Source(format!("non-utf8 zip entry name at index {index}")))?
             .to_owned();
         if name.ends_with('/') {
             continue;
@@ -188,7 +190,7 @@ fn read_capped<R: Read>(reader: &mut R, total: &mut u64, max_total: u64) -> Resu
     reader.take(remaining + 1).read_to_end(&mut data)?;
     *total += data.len() as u64;
     if *total > max_total {
-        return Err(Error::Source(format!(
+        return Err(SourceError::Source(format!(
             "archive exceeds maximum extracted size ({MAX_EXTRACTED_BYTES} bytes)"
         )));
     }
@@ -230,7 +232,7 @@ fn strip_single_top_level(mut entries: Vec<ExtractedEntry>) -> Vec<ExtractedEntr
 #[cfg(test)]
 mod tests {
     use crate::archive::{EntryKind, ExtractedEntry, extract, extract_archive, safe_archive_path};
-    use crate::error::Error;
+    use crate::source::SourceError;
     use std::collections::BTreeMap;
     use std::io::Write;
     use std::path::{Path, PathBuf};
@@ -305,8 +307,8 @@ mod tests {
         ] {
             let result = safe_archive_path(raw);
             assert!(
-                matches!(result, Err(Error::Source(_))),
-                "{raw:?} must be rejected as Error::Source, got: {result:?}"
+                matches!(result, Err(SourceError::Source(_))),
+                "{raw:?} must be rejected as SourceError::Source, got: {result:?}"
             );
         }
     }
@@ -653,8 +655,8 @@ mod tests {
 
         let result = extract(&archive, "https://example.com/mid.tar");
         assert!(
-            matches!(result, Err(Error::Source(_))),
-            "traversal after a legitimate component must be rejected as Error::Source, got: {result:?}"
+            matches!(result, Err(SourceError::Source(_))),
+            "traversal after a legitimate component must be rejected as SourceError::Source, got: {result:?}"
         );
     }
 
@@ -673,8 +675,8 @@ mod tests {
 
         let result = extract(&archive, "https://example.com/evil.zip");
         assert!(
-            matches!(result, Err(Error::Source(_))),
-            "a zip entry with a traversal path must be rejected as Error::Source, got: {result:?}"
+            matches!(result, Err(SourceError::Source(_))),
+            "a zip entry with a traversal path must be rejected as SourceError::Source, got: {result:?}"
         );
     }
 
@@ -699,8 +701,8 @@ mod tests {
 
         let result = extract(&archive, "https://example.com/badname.tar");
         assert!(
-            matches!(result, Err(Error::Source(_))),
-            "a non-utf8 entry name must be rejected as Error::Source, got: {result:?}"
+            matches!(result, Err(SourceError::Source(_))),
+            "a non-utf8 entry name must be rejected as SourceError::Source, got: {result:?}"
         );
     }
 
@@ -713,7 +715,7 @@ mod tests {
 
         let result = extract(&archive, "https://example.com/evil.tar");
         assert!(
-            matches!(result, Err(Error::Source(_))),
+            matches!(result, Err(SourceError::Source(_))),
             "a traversal entry path inside the archive must be rejected, got: {result:?}"
         );
     }
@@ -726,8 +728,8 @@ mod tests {
 
         let over = extract_archive(&bytes, "https://example.com/big.tar", 10);
         assert!(
-            matches!(over, Err(Error::Source(_))),
-            "100 bytes of content must exceed a 10-byte cap as Error::Source, got: {over:?}"
+            matches!(over, Err(SourceError::Source(_))),
+            "100 bytes of content must exceed a 10-byte cap as SourceError::Source, got: {over:?}"
         );
 
         let under = extract_archive(&bytes, "https://example.com/big.tar", 1 << 20)
@@ -744,8 +746,8 @@ mod tests {
 
         let result = extract(&archive, "https://example.com/foo/..");
         assert!(
-            matches!(result, Err(Error::Source(_))),
-            "a raw url whose basename is `..` must be rejected as Error::Source, got: {result:?}"
+            matches!(result, Err(SourceError::Source(_))),
+            "a raw url whose basename is `..` must be rejected as SourceError::Source, got: {result:?}"
         );
     }
 }
