@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashSet};
 use crate::config::{Config, ParsedSource};
 use crate::error::{Error, Result};
 use crate::kernel::Selection;
-use crate::registry::{ArtifactKey, Registry};
+use crate::store::{ArtifactKey, Registry};
 use crate::source::SourceBackend;
 
 use super::discover::discover_artifacts_for_source;

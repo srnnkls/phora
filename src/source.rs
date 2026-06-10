@@ -8,7 +8,7 @@ use gix::object::tree::EntryKind;
 use crate::config::Refspec;
 use crate::error::{Error, Result};
 use crate::kernel::{Commit, Digest, Selection};
-use crate::registry::ManifestFile;
+use crate::store::ManifestFile;
 
 /// Re-exported beside the backends it composes; defined in `backend` to keep routing separate.
 pub use crate::backend::RouterBackend;

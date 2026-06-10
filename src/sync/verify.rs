@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::registry::{ArtifactKey, Registry};
+use crate::store::{ArtifactKey, Registry};
 
 /// Why a deployed file failed verification against its registry record.
 #[derive(Debug, Clone, PartialEq, Eq)]

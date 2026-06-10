@@ -7,7 +7,7 @@
     use tempfile::TempDir;
 
     use crate::config::Refspec;
-    use crate::registry::FileRegistry;
+    use crate::store::FileRegistry;
     use crate::source::{
         ExportRequest, ExportResult, GitBackend, HttpBackend, RouterBackend, SourceBackend,
     };
@@ -633,10 +633,10 @@
 
     use std::path::PathBuf;
 
-    use crate::projection::JournalEntry;
+    use crate::deploy::JournalEntry;
 
-    use crate::projection::ArtifactState;
-    use crate::registry::{ArtifactKey, ManifestFile, RegistryRecord};
+    use crate::deploy::ArtifactState;
+    use crate::store::{ArtifactKey, ManifestFile, RegistryRecord};
 
     /// A target deployed beside this dir: `<root>/target` plus the `.phora-stage`
     /// sibling sync owns. The tempdir is the target's parent so staging has somewhere
@@ -1296,7 +1296,7 @@
         artifact: &str,
         commit: &str,
     ) -> ArtifactState {
-        crate::projection::check_artifact_state(
+        crate::deploy::check_artifact_state(
             dst,
             source,
             commit,

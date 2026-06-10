@@ -2,12 +2,12 @@
 //!
 //! The crate follows a hexagonal layering:
 //! - **domain** — config DTOs ([`config`]), path/identity newtypes ([`paths`]),
-//!   selection ([`kernel::Selection`]), and the orchestration in [`sync`]/[`projection`].
-//! - **ports** — the [`source::SourceBackend`] and [`registry::Registry`] traits.
-//! - **adapters** — [`source::GitBackend`] and [`registry::FileRegistry`], kept beside
+//!   selection ([`kernel::Selection`]), and the orchestration in [`sync`]/[`deploy`].
+//! - **ports** — the [`source::SourceBackend`] and [`store::Registry`] traits.
+//! - **adapters** — [`source::GitBackend`] and [`store::FileRegistry`], kept beside
 //!   their port traits rather than in separate directories.
 //!
-//! Boundary inputs are parsed into validated newtypes ([`paths::ProjectId`],
+//! Boundary inputs are parsed into validated newtypes ([`kernel::ProjectId`],
 //! [`source::NormalizedUrl`], [`source::MirrorKey`], [`kernel::Digest`]) so that
 //! illegal states are unrepresentable downstream — parse, don't validate.
 
@@ -20,12 +20,12 @@ pub mod archive;
 pub mod backend;
 pub mod cli;
 pub mod config;
+pub mod deploy;
 pub mod error;
 pub mod http;
 pub mod kernel;
 pub mod lock;
 pub mod paths;
-pub mod projection;
-pub mod registry;
 pub mod source;
+pub mod store;
 pub mod sync;

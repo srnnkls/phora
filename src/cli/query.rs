@@ -6,8 +6,8 @@ use std::path::Path;
 use crate::config::{Config, ParsedSource};
 use crate::error::Result;
 use crate::kernel::Selection;
-use crate::projection::check_artifact_state;
-use crate::registry::Registry;
+use crate::deploy::check_artifact_state;
+use crate::store::Registry;
 
 use super::render::{print_listings, state_label};
 use super::{load_config, open_project_registry};
@@ -34,7 +34,7 @@ pub struct WhereFilter {
 }
 
 impl WhereFilter {
-    fn matches(&self, record: &crate::registry::RegistryRecord) -> bool {
+    fn matches(&self, record: &crate::store::RegistryRecord) -> bool {
         let eq = |want: &Option<String>, have: &str| want.as_deref().is_none_or(|w| w == have);
         eq(&self.digest, &record.digest)
             && eq(&self.source, &record.key.source)
@@ -128,7 +128,7 @@ pub struct TargetListing {
 }
 
 /// Registry-driven `phora list`: per target, the status of every managed artifact,
-/// computed via [`check_artifact_state`](crate::projection::check_artifact_state).
+/// computed via [`check_artifact_state`](crate::deploy::check_artifact_state).
 ///
 /// # Errors
 ///

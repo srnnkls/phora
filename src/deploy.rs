@@ -7,7 +7,7 @@ use std::time::UNIX_EPOCH;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::registry::{ArtifactKey, EjectedEntry, Registry, RegistryRecord, ScannedFile};
+use crate::store::{ArtifactKey, EjectedEntry, Registry, RegistryRecord, ScannedFile};
 
 #[derive(Debug)]
 pub enum ArtifactState {
@@ -630,7 +630,7 @@ fn remove_orphaned_staging(target_parent: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{FileRegistry, ManifestFile};
+    use crate::store::{FileRegistry, ManifestFile};
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
 
