@@ -67,7 +67,7 @@ fn build_fixture() -> Fixture {
     std::fs::create_dir_all(home_path.join(".phora/git")).expect("seed phora git dir");
 
     let config = format!(
-        "version = 1\n\n[sources.dotfiles]\ngit = \"{src}\"\nbranch = \"main\"\n\
+        "version = 1\n\n[sources.dotfiles]\npath = \"{src}\"\nbranch = \"main\"\n\
          include = [\"editor\", \"lint\"]\n\n[targets.home]\npath = \"{target}\"\n\
          sources = [\"dotfiles\"]\nlayout = \"flat\"\n",
         src = src_path.display(),

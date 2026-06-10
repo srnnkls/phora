@@ -276,7 +276,11 @@ fn load_config_from(dir: &Path) -> Result<Config> {
     let path = dir.join("phora.toml");
     let text = std::fs::read_to_string(&path)
         .map_err(|e| Error::Config(format!("read {}: {e}", path.display())))?;
-    Config::parse(&text)
+    let config = Config::parse(&text)?;
+    for warning in config.migration_warnings(dir) {
+        eprintln!("phora: {warning}");
+    }
+    Ok(config)
 }
 
 fn load_source(name: &str) -> Result<ParsedSource> {
