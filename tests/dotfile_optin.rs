@@ -7,7 +7,7 @@ use tempfile::TempDir;
 
 struct Fixture {
     _home: TempDir,
-    _src: TempDir,
+    src: TempDir,
     cwd: TempDir,
     home_path: PathBuf,
     target_path: PathBuf,
@@ -72,7 +72,7 @@ fn build_fixture(include: &str) -> Fixture {
 
     Fixture {
         _home: home,
-        _src: src,
+        src,
         cwd,
         home_path,
         target_path,
@@ -80,8 +80,12 @@ fn build_fixture(include: &str) -> Fixture {
 }
 
 fn sync(fixture: &Fixture) {
+    run_sync(fixture, &["sync"]);
+}
+
+fn run_sync(fixture: &Fixture, args: &[&str]) {
     let out = Command::new(env!("CARGO_BIN_EXE_phora"))
-        .args(["sync"])
+        .args(args)
         .current_dir(fixture.cwd.path())
         .env("HOME", &fixture.home_path)
         .env_remove("GIT_AUTHOR_DATE")
@@ -90,9 +94,21 @@ fn sync(fixture: &Fixture) {
         .expect("phora binary runs");
     assert!(
         out.status.success(),
-        "sync must succeed: {}",
+        "phora {args:?} must succeed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+fn rewrite_include(fixture: &Fixture, include: &str) {
+    let src_path = fixture.src.path().to_path_buf();
+    let config = format!(
+        "version = 1\n\n[sources.dotfiles]\ngit = \"{src}\"\nbranch = \"main\"\n\
+         include = {include}\n\n[targets.home]\npath = \"{target}\"\n\
+         sources = [\"dotfiles\"]\nlayout = \"flat\"\n",
+        src = src_path.display(),
+        target = fixture.target_path.display(),
+    );
+    write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());
 }
 
 #[test]
@@ -122,5 +138,47 @@ fn non_dotfile_include_does_not_deploy_hidden_dir() {
     assert!(
         !fixture.target_path.join(".config").exists(),
         "without a dotfile opt-in pattern, `.config` must NOT be deployed (gate must not leak)"
+    );
+}
+
+// Green regression guard (passes today: registry-driven prune already deletes a dropped
+// dotfile artifact via its record); locks the acceptance invariant against regressions.
+#[test]
+fn prune_deletes_dotfile_artifact_dropped_from_config() {
+    let fixture = build_fixture("[\".config\"]");
+    sync(&fixture);
+
+    let deployed = fixture.target_path.join(".config");
+    assert!(
+        deployed.join("settings.json").exists(),
+        "premise: `.config` must be deployed before it is dropped from config"
+    );
+
+    rewrite_include(&fixture, "[\"editor\"]");
+    run_sync(&fixture, &["sync", "--prune"]);
+
+    assert!(
+        !deployed.exists(),
+        "after `.config` is removed from the selection, `sync --prune` must delete the \
+         stranded on-disk dotfile artifact at {}",
+        deployed.display()
+    );
+}
+
+#[test]
+fn prune_leaves_unmanaged_user_dotfile_dir_untouched() {
+    let fixture = build_fixture("[\"editor\"]");
+    sync(&fixture);
+
+    let user_dotfile = fixture.target_path.join(".cache");
+    write(&user_dotfile.join("blob.bin"), b"user data\n");
+
+    run_sync(&fixture, &["sync", "--prune"]);
+
+    assert!(
+        user_dotfile.join("blob.bin").exists(),
+        "a hand-placed user dotfile dir that no source selects must survive `sync --prune` \
+         untouched; it was at {}",
+        user_dotfile.display()
     );
 }
