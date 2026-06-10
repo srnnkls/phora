@@ -27,7 +27,7 @@ pub(super) fn discover_working_tree(
             continue;
         }
         if entry.file_type()?.is_dir() {
-            artifacts.push(ArtifactName::new(name));
+            artifacts.push(ArtifactName::trusted(name));
         }
     }
 

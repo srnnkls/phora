@@ -19,7 +19,7 @@ pub(crate) fn safe_component(name: &str) -> Result<&str> {
 pub struct SourceName(String);
 
 impl SourceName {
-    pub(crate) fn new(s: impl Into<String>) -> Self {
+    pub(crate) fn trusted(s: impl Into<String>) -> Self {
         Self(s.into())
     }
 
@@ -49,7 +49,7 @@ impl fmt::Display for SourceName {
 pub struct ArtifactName(String);
 
 impl ArtifactName {
-    pub(crate) fn new(s: impl Into<String>) -> Self {
+    pub(crate) fn trusted(s: impl Into<String>) -> Self {
         Self(s.into())
     }
 

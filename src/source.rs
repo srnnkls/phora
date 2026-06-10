@@ -288,7 +288,7 @@ impl SourceBackend for GitBackend {
                 continue;
             }
             if matches!(entry.kind(), EntryKind::Tree) {
-                artifacts.push(ArtifactName::new(name));
+                artifacts.push(ArtifactName::trusted(name));
             }
         }
 
@@ -487,12 +487,12 @@ impl Drop for TempDownload {
 pub struct HttpBackend {
     git_dir: PathBuf,
     git: GitBackend,
-    digests: BTreeMap<String, Digest>,
+    digests: BTreeMap<SourceName, Digest>,
 }
 
 impl HttpBackend {
     #[must_use]
-    pub fn new(git_dir: PathBuf, digests: BTreeMap<String, Digest>) -> Self {
+    pub fn new(git_dir: PathBuf, digests: BTreeMap<SourceName, Digest>) -> Self {
         let git = GitBackend::new(git_dir.clone());
         Self {
             git_dir,
@@ -510,7 +510,7 @@ impl SourceBackend for HttpBackend {
 
         crate::http::download(url, &temp.path)?;
 
-        if let Some(expected) = self.digests.get(source.as_str()) {
+        if let Some(expected) = self.digests.get(source) {
             let bytes = std::fs::read(&temp.path)
                 .map_err(|e| Error::Source(format!("source {source}: read download: {e}")))?;
             crate::http::verify_digest(&bytes, expected)
@@ -920,11 +920,11 @@ mod tests {
     use tempfile::TempDir;
 
     fn sn(name: &str) -> SourceName {
-        SourceName::new(name)
+        SourceName::trusted(name)
     }
 
     fn an(name: &str) -> ArtifactName {
-        ArtifactName::new(name)
+        ArtifactName::trusted(name)
     }
 
     /// Author time on the tagged (first) commit; deliberately != committer time.
@@ -2841,7 +2841,7 @@ path = "srnnkls/tropos"
             let url = server.url();
 
             let mut digests = BTreeMap::new();
-            digests.insert("pkg".to_string(), Digest::sha256(sha256_of(&tar_gz)));
+            digests.insert(sn("pkg"), Digest::sha256(sha256_of(&tar_gz)));
 
             let git_dir = TempDir::new().expect("git_dir tempdir");
             let backend = HttpBackend::new(git_dir.path().to_path_buf(), digests);
@@ -2862,7 +2862,7 @@ path = "srnnkls/tropos"
             let url = server.url();
 
             let mut digests = BTreeMap::new();
-            digests.insert("pkg".to_string(), Digest::sha256([0u8; 32]));
+            digests.insert(sn("pkg"), Digest::sha256([0u8; 32]));
 
             let git_dir = TempDir::new().expect("git_dir tempdir");
             let backend = HttpBackend::new(git_dir.path().to_path_buf(), digests);

@@ -49,7 +49,7 @@ pub fn rebuild_registry(
             })?;
             let commit = &locked.commit;
             let git = remote_for(&remotes, source_name)?;
-            let source_name = SourceName::new(source_name);
+            let source_name = SourceName::trusted(source_name);
             let selection = Selection::new(source.includes(), source.excludes())?;
             selections.push(selection.clone());
             let policy = source.export_policy();
