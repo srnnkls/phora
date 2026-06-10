@@ -117,7 +117,7 @@ tasks:
   # ---- Phase 3: context internals ----
   - id: ARCH-009
     content: "Split sync.rs (5655 lines) into sync/{resolve,discover,target,prune,verify,rebuild}"
-    status: pending
+    status: done   # zero-churn split; opus+sonnet confirmed line-for-line prod equivalence. SourceCtx bundle + per-module test co-location deferred to follow-ups
     activeForm: "Splitting the sync god-module"
     depends_on: [ARCH-002, ARCH-003]
     acceptance:
