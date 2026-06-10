@@ -47,4 +47,4 @@ parallelizable:
 notes:
   - "ZERO intentional data change: source-level digest untouched (ARCH-004 documents + pins it)."
   - "ARCH-005 carries the only wire-schema change — a rename WITH a back-compat `git` alias (not a drop)."
-  - "ARCH-012/013 are optional stretch; descope freely without affecting acceptance."
+  - "ARCH-012/013 deferred to a future session (user decision 2026-06-10; still in scope, NOT descoped); acceptance does not depend on them. Reopen triggers + empirical findings in tasks.yaml."

@@ -139,12 +139,12 @@ tasks:
 
   - id: ARCH-012
     content: "(optional) per-context error enums"
-    status: pending   # DEFERRED to a future session (NOT this one); still in scope. Before doing it, weigh this session's finding: EVERY match/matches! on an Error variant is in #[cfg(test)] code (~44 assertions); ZERO production sites match variants (330 construct-and-propagate; main() prints via Display). /loqui's caller-intent rule (split by who reads the error, not Cargo target) + both original scope reviewers (OE3) say typed per-context errors add churn (44 test rewrites + wrapper) with little production value while no caller distinguishes variants. Revisit if a crate split (ARCH-013) or external lib consumer appears.
+    status: deferred   # to a future session (still in scope, NOT descoped; user decision 2026-06-10). Before doing it, weigh this session's finding: EVERY match/matches! on an Error variant is in #[cfg(test)] code (~44 assertions); ZERO production sites match variants or discriminate via downcast/.source()/message-matching (330 construct-and-propagate; main() prints via Display; the only production branching is io::ErrorKind on raw io::Error BEFORE conversion). /loqui's caller-intent rule (split by who reads the error, not Cargo target) + both original scope reviewers (OE3) say typed per-context errors add churn (44 test rewrites + wrapper) with little production value while no caller distinguishes variants. Reopen with ARCH-013 (a published phora-core shouldn't expose the CLI-flavored god enum) or when production code must recover from a phora-level (non-io) failure.
     activeForm: "Splitting the crate-wide error enum"
     depends_on: [ARCH-009, ARCH-011]
 
   - id: ARCH-013
     content: "(optional/stretch) phora-core / phora-cli crate split"
-    status: pending   # DEFERRED to a future session (NOT this one); still in scope. Both reviewers flagged the crate split premature today (OE3: no external lib consumers) — best landed when a real second consumer appears.
+    status: deferred   # to a future session (still in scope, NOT descoped; user decision 2026-06-10). Both reviewers flagged the crate split premature today (OE3: no external lib consumers). This session verified the boundary the split would enforce already holds: zero core->cli imports; cli/ imports core one-way; main.rs is a 2-line shim over phora::cli — pinned by the crate::cli boundary grep in scope.md Verification, so the split stays mechanical. Reopen triggers: an external lib consumer, a second binary (daemon/GUI/plugin host), or real compile-time pain. Do together with ARCH-012.
     activeForm: "Splitting into core + cli crates"
     depends_on: [ARCH-010, ARCH-011]
