@@ -209,9 +209,9 @@ fn run_add(
 }
 
 fn describe_source(source: &ParsedSource) -> String {
-    match (&source.git, &source.host, &source.path) {
+    match (&source.git, &source.host, &source.repo) {
         (Some(git), _, _) => git.clone(),
-        (None, Some(host), Some(path)) => format!("{host}:{path}"),
+        (None, Some(host), Some(repo)) => format!("{host}:{repo}"),
         _ => source.name.clone(),
     }
 }
@@ -253,8 +253,8 @@ fn source_table(source: &ParsedSource) -> toml_edit::Table {
     if let Some(host) = &source.host {
         table["host"] = toml_edit::value(host.as_str());
     }
-    if let Some(path) = &source.path {
-        table["path"] = toml_edit::value(path.as_str());
+    if let Some(repo) = &source.repo {
+        table["repo"] = toml_edit::value(repo.as_str());
     }
     if let Some(Protocol::Ssh) = source.protocol {
         table["protocol"] = toml_edit::value("ssh");
@@ -612,13 +612,13 @@ pub fn check_match_cmd(source: &Source, path: &str) -> CheckMatchReport {
 }
 
 /// A source derived from an `add` URL/shorthand, before name overrides. Either
-/// literal (`git` is `Some`) or symbolic (`host`/`path` are `Some`).
+/// literal (`git` is `Some`) or symbolic forge (`host`/`repo` are `Some`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedSource {
     pub name: String,
     pub git: Option<String>,
     pub host: Option<String>,
-    pub path: Option<String>,
+    pub repo: Option<String>,
     pub protocol: Option<Protocol>,
     pub branch: Option<String>,
     pub root: Option<String>,
@@ -673,12 +673,12 @@ fn domain_to_name(hosts: &BTreeMap<String, Host>) -> BTreeMap<String, String> {
         .collect()
 }
 
-fn symbolic_source(host: String, path: &str, root: Option<String>) -> ParsedSource {
+fn symbolic_source(host: String, repo: &str, root: Option<String>) -> ParsedSource {
     ParsedSource {
-        name: repo_name(path),
+        name: repo_name(repo),
         git: None,
         host: Some(host),
-        path: Some(path.to_owned()),
+        repo: Some(repo.to_owned()),
         protocol: None,
         branch: None,
         root,
@@ -721,7 +721,7 @@ fn literal_source(
         name,
         git: Some(git),
         host: None,
-        path: None,
+        repo: None,
         protocol: None,
         branch,
         root,
@@ -1349,9 +1349,9 @@ mod tests {
             parsed.git
         );
         assert_eq!(
-            parsed.path.as_deref(),
+            parsed.repo.as_deref(),
             Some("srnnkls/loqui"),
-            "the shorthand must carry path=srnnkls/loqui symbolically"
+            "the shorthand must carry repo=srnnkls/loqui symbolically"
         );
         assert!(
             parsed.git.is_none(),
@@ -1378,7 +1378,7 @@ mod tests {
             "only owner/repo feed the symbolic host/path; the rest is the root"
         );
         assert_eq!(
-            parsed.path.as_deref(),
+            parsed.repo.as_deref(),
             Some("owner/repo"),
             "the symbolic path is exactly owner/repo, with trailing segments split off as root"
         );
@@ -1412,9 +1412,9 @@ mod tests {
             parsed.git
         );
         assert_eq!(
-            parsed.path.as_deref(),
+            parsed.repo.as_deref(),
             Some("owner/repo"),
-            "the domain shorthand must carry path=owner/repo symbolically"
+            "the domain shorthand must carry repo=owner/repo symbolically"
         );
         assert!(
             parsed.git.is_none(),
@@ -1438,7 +1438,7 @@ mod tests {
             "the git.sr.ht DOMAIN must map to the forge NAME `sr.ht`, not the domain string"
         );
         assert_eq!(
-            parsed.path.as_deref(),
+            parsed.repo.as_deref(),
             Some("~rjarry/aerc"),
             "the `~` owner segment must be preserved verbatim in the symbolic path"
         );
@@ -1459,7 +1459,7 @@ mod tests {
             "a full https URL stays a LITERAL git remote (back-compat) with .git appended"
         );
         assert!(
-            parsed.host.is_none() && parsed.path.is_none(),
+            parsed.host.is_none() && parsed.repo.is_none(),
             "a literal scheme URL must NOT become a symbolic host/path source"
         );
         assert_eq!(parsed.name, "repo");
@@ -1476,7 +1476,7 @@ mod tests {
             "a scheme URL stays a LITERAL git remote; the /tree/<ref>/<path> tail is stripped from it"
         );
         assert!(
-            parsed.host.is_none() && parsed.path.is_none(),
+            parsed.host.is_none() && parsed.repo.is_none(),
             "a tree URL is a literal scheme URL, not a symbolic host/path source"
         );
         assert_eq!(
@@ -1504,7 +1504,7 @@ mod tests {
             "the gitlab.com DOMAIN must map to the symbolic forge NAME `gitlab`, not github and not an expanded URL (got git={:?})",
             parsed.git
         );
-        assert_eq!(parsed.path.as_deref(), Some("owner/repo"));
+        assert_eq!(parsed.repo.as_deref(), Some("owner/repo"));
         assert!(
             parsed.git.is_none(),
             "a gitlab domain shorthand stays symbolic, got {:?}",
@@ -1526,7 +1526,7 @@ mod tests {
             Some("codeberg"),
             "codeberg.org must map to the symbolic forge NAME `codeberg` via the SINGLE built-in forge registry"
         );
-        assert_eq!(parsed.path.as_deref(), Some("owner/repo"));
+        assert_eq!(parsed.repo.as_deref(), Some("owner/repo"));
         assert!(
             parsed.git.is_none(),
             "a codeberg domain shorthand stays symbolic, got {:?}",
@@ -1544,7 +1544,7 @@ mod tests {
             "bitbucket.org must map to the symbolic forge NAME `bitbucket`; it can only resolve if \
              the forge registry derives from builtin_forges()"
         );
-        assert_eq!(parsed.path.as_deref(), Some("owner/repo"));
+        assert_eq!(parsed.repo.as_deref(), Some("owner/repo"));
         assert!(
             parsed.git.is_none(),
             "a bitbucket domain shorthand stays symbolic, got {:?}",
@@ -1562,7 +1562,7 @@ mod tests {
             "an ssh scp-style URL is a literal git remote and must be preserved verbatim"
         );
         assert!(
-            parsed.host.is_none() && parsed.path.is_none(),
+            parsed.host.is_none() && parsed.repo.is_none(),
             "an scp literal must NOT become a symbolic host/path source"
         );
         assert_eq!(
@@ -1596,7 +1596,7 @@ mod tests {
             "the custom host's DOMAIN (git.company.com) must map to its symbolic host NAME `company`, \
              not be expanded into the template URL"
         );
-        assert_eq!(parsed.path.as_deref(), Some("owner/repo"));
+        assert_eq!(parsed.repo.as_deref(), Some("owner/repo"));
         assert!(
             parsed.git.is_none(),
             "a custom-host domain shorthand stays symbolic, got {:?}",
@@ -1622,7 +1622,7 @@ mod tests {
             name: String::new(),
             git: Some(git.to_owned()),
             host: None,
-            path: None,
+            repo: None,
             protocol: None,
             branch: branch.map(str::to_owned),
             root: None,
@@ -1843,9 +1843,9 @@ mod tests {
             parsed.git
         );
         assert_eq!(
-            parsed.path.as_deref(),
+            parsed.repo.as_deref(),
             Some("srnnkls/tropos"),
-            "the colon alias must carry path=srnnkls/tropos symbolically"
+            "the colon alias must carry repo=srnnkls/tropos symbolically"
         );
         assert_eq!(
             parsed.name, "tropos",
@@ -1872,9 +1872,9 @@ mod tests {
             "the colon alias must resolve symbolically to host=github, not be treated as an scp remote"
         );
         assert_eq!(
-            parsed.path.as_deref(),
+            parsed.repo.as_deref(),
             Some("owner/repo"),
-            "the colon alias must carry path=owner/repo, not swallow it into a literal scp string"
+            "the colon alias must carry repo=owner/repo, not swallow it into a literal scp string"
         );
     }
 
@@ -1886,7 +1886,7 @@ mod tests {
             Some("gitlab"),
             "`gitlab:owner/repo` must parse to a symbolic source with host=gitlab"
         );
-        assert_eq!(parsed.path.as_deref(), Some("owner/repo"));
+        assert_eq!(parsed.repo.as_deref(), Some("owner/repo"));
         assert!(
             parsed.git.is_none(),
             "a symbolic gitlab alias must not be pre-expanded"
@@ -1902,7 +1902,7 @@ mod tests {
             "only owner/repo feed the symbolic host/path; the rest is the root"
         );
         assert_eq!(
-            parsed.path.as_deref(),
+            parsed.repo.as_deref(),
             Some("owner/repo"),
             "the colon-alias path is exactly owner/repo, with trailing segments split off as root"
         );
@@ -1946,7 +1946,7 @@ mod tests {
             Some("github"),
             "a bare owner/repo shorthand must default to the symbolic github host"
         );
-        assert_eq!(parsed.path.as_deref(), Some("owner/repo"));
+        assert_eq!(parsed.repo.as_deref(), Some("owner/repo"));
         assert!(
             parsed.git.is_none(),
             "a bare owner/repo must be symbolic, not expanded to a github git URL"
@@ -1962,7 +1962,7 @@ mod tests {
             "an scp-ssh remote (has `@` before `:`) is a literal git remote, preserved verbatim"
         );
         assert!(
-            parsed.host.is_none() && parsed.path.is_none(),
+            parsed.host.is_none() && parsed.repo.is_none(),
             "an scp literal must NOT be turned into a symbolic host/path source"
         );
     }
@@ -1976,8 +1976,46 @@ mod tests {
             "a full scheme URL stays a literal git remote (back-compat)"
         );
         assert!(
-            parsed.host.is_none() && parsed.path.is_none(),
+            parsed.host.is_none() && parsed.repo.is_none(),
             "a literal scheme URL must NOT become a symbolic host/path source"
+        );
+    }
+
+    // ── ARCH-005: symbolic forge add writes `host` + `repo` (not `host` + `path`) ──
+
+    #[test]
+    fn run_add_writer_writes_host_and_repo_for_symbolic_forge_add() {
+        let parsed = parse("github:srnnkls/tropos");
+        let out = insert_source_with_ref("version = 1\n", &parsed.name, &parsed, None, None, None)
+            .expect("run_add's writer must accept a symbolic forge ParsedSource");
+
+        assert!(
+            out.contains("repo = \"srnnkls/tropos\""),
+            "a symbolic forge add must write `repo = \"srnnkls/tropos\"`, got:\n{out}"
+        );
+        assert!(
+            !out.contains("path ="),
+            "ARCH-005: a symbolic forge add must NOT emit a forge `path =` key any more, got:\n{out}"
+        );
+        assert!(
+            !out.contains("git ="),
+            "a symbolic forge add must not write an expanded `git =` key, got:\n{out}"
+        );
+
+        let src = source_from(&out, "tropos");
+        assert_eq!(
+            src.host.as_deref(),
+            Some("github"),
+            "run_add's writer must persist host = \"github\""
+        );
+        assert_eq!(
+            src.repo.as_deref(),
+            Some("srnnkls/tropos"),
+            "run_add's writer must persist the forge key as repo = \"srnnkls/tropos\""
+        );
+        assert!(
+            src.git.is_none(),
+            "run_add's writer must not persist a literal git for a symbolic forge add"
         );
     }
 
@@ -2003,9 +2041,9 @@ mod tests {
             "run_add's writer must persist host = \"github\""
         );
         assert_eq!(
-            src.path.as_deref(),
+            src.repo.as_deref(),
             Some("srnnkls/tropos"),
-            "run_add's writer must persist path = \"srnnkls/tropos\""
+            "run_add's writer must persist repo = \"srnnkls/tropos\""
         );
         assert!(
             src.git.is_none(),
@@ -2057,9 +2095,9 @@ mod tests {
             "run_add end-to-end must persist host = \"github\""
         );
         assert_eq!(
-            src.path.as_deref(),
+            src.repo.as_deref(),
             Some("srnnkls/tropos"),
-            "run_add end-to-end must persist path = \"srnnkls/tropos\""
+            "run_add end-to-end must persist repo = \"srnnkls/tropos\""
         );
         assert!(
             src.git.is_none(),
@@ -2083,7 +2121,7 @@ mod tests {
             Some("gitlab"),
             "insert_source must persist host = \"gitlab\" symbolically"
         );
-        assert_eq!(src.path.as_deref(), Some("owner/repo"));
+        assert_eq!(src.repo.as_deref(), Some("owner/repo"));
         assert!(
             src.git.is_none(),
             "insert_source must not expand a symbolic add into a literal git"
@@ -2108,8 +2146,8 @@ mod tests {
         );
         assert!(
             default_out.contains("host = \"github\"")
-                && default_out.contains("path = \"srnnkls/tropos\""),
-            "the default-protocol silence is only meaningful if host+path are still written, got:\n{default_out}"
+                && default_out.contains("repo = \"srnnkls/tropos\""),
+            "the default-protocol silence is only meaningful if host+repo are still written, got:\n{default_out}"
         );
 
         let ssh_src = ParsedSource {
@@ -2124,8 +2162,8 @@ mod tests {
             "a non-default protocol must be written literally as `protocol = \"ssh\"`, got:\n{ssh_out}"
         );
         assert!(
-            ssh_out.contains("host = \"github\"") && ssh_out.contains("path = \"srnnkls/tropos\""),
-            "a non-default-protocol source must still carry its symbolic host+path, got:\n{ssh_out}"
+            ssh_out.contains("host = \"github\"") && ssh_out.contains("repo = \"srnnkls/tropos\""),
+            "a non-default-protocol source must still carry its symbolic host+repo, got:\n{ssh_out}"
         );
         let src = source_from(&ssh_out, "tropos");
         assert_eq!(

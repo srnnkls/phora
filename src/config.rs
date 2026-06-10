@@ -51,18 +51,17 @@ impl Config {
                     "source `{name}` sets more than one of branch/tag/rev"
                 )));
             }
-            if source.git.is_some() && (source.host.is_some() || source.path.is_some()) {
+            let forge = source.is_forge();
+            let local = source.local_path().is_some();
+            let kinds = u8::from(source.git.is_some())
+                + u8::from(source.url.is_some())
+                + u8::from(forge)
+                + u8::from(local);
+            if kinds > 1 {
                 return Err(Error::Config(format!(
-                    "source `{name}` sets both a literal `git` and a `host`/`path` \
-                     (the git and host modes are mutually exclusive)"
-                )));
-            }
-            if source.url.is_some()
-                && (source.git.is_some() || source.host.is_some() || source.path.is_some())
-            {
-                return Err(Error::Config(format!(
-                    "source `{name}` sets `url` together with a `git`/`host`/`path` \
-                     (the url, git, and host modes are mutually exclusive)"
+                    "source `{name}` sets more than one source kind \
+                     (local `path`, forge `host`/`repo`, literal `git`, and `url` \
+                     are mutually exclusive)"
                 )));
             }
             if source.url.is_some()
@@ -80,9 +79,9 @@ impl Config {
                     "source `{name}`: `url` must not be empty"
                 )));
             }
-            if source.host.is_some() && source.path.is_none() {
+            if source.host.is_some() && source.forge_path().is_none() {
                 return Err(Error::Config(format!(
-                    "source `{name}`: `host` set without a `path`"
+                    "source `{name}`: `host` set without a `repo` (incomplete forge group)"
                 )));
             }
         }
@@ -99,13 +98,16 @@ impl Config {
     /// single complete mode (git, or host+path).
     pub fn validate(&self) -> Result<()> {
         for (name, source) in &self.sources {
-            let modes = u8::from(source.git.is_some())
-                + u8::from(source.path.is_some())
+            let forge = source.is_forge();
+            let local = source.local_path().is_some();
+            let kinds = u8::from(source.git.is_some())
+                + u8::from(local)
+                + u8::from(forge)
                 + u8::from(source.url.is_some());
-            if modes != 1 {
+            if kinds != 1 {
                 return Err(Error::Config(format!(
-                    "source `{name}` must resolve to exactly one of a literal `git`, \
-                     a `host`/`path` pair, or a `url`"
+                    "source `{name}` must resolve to exactly one of a local `path`, \
+                     a forge `host`/`repo`, a literal `git`, or a `url`"
                 )));
             }
             if let Some(url) = source.url.as_deref() {
@@ -124,13 +126,14 @@ impl Config {
                     )));
                 }
             }
-            let Some(path) = source.path.as_deref() else {
+            if !forge {
                 continue;
-            };
+            }
+            let path = source.forge_path().unwrap_or_default();
             let host_name = source.host.as_deref().unwrap_or("github");
             if path.trim().is_empty() || path.split('/').any(str::is_empty) {
                 return Err(Error::Config(format!(
-                    "source `{name}`: `path` `{path}` is not a valid forge path \
+                    "source `{name}`: `repo` `{path}` is not a valid forge path \
                      (no empty, leading, trailing, or doubled `/` segments)"
                 )));
             }
@@ -408,6 +411,8 @@ pub struct Source {
     #[serde(default)]
     pub host: Option<String>,
     #[serde(default)]
+    pub repo: Option<String>,
+    #[serde(default)]
     pub path: Option<String>,
     #[serde(default)]
     pub protocol: Option<Protocol>,
@@ -444,25 +449,36 @@ pub enum SourceMode {
 impl Source {
     #[must_use]
     fn merged_with(mut self, local: Source) -> Source {
-        let local_git_mode = local.git.is_some();
-        let local_host_mode = local.host.is_some() || local.path.is_some();
-        let local_url_mode = local.url.is_some();
-        if local_git_mode {
+        let local_git_kind = local.git.is_some();
+        let local_forge_kind = local.host.is_some() || local.repo.is_some();
+        let local_local_kind = local.path.is_some() && !local_forge_kind;
+        let local_url_kind = local.url.is_some();
+        if local_git_kind {
             self.git = local.git;
             self.host = None;
+            self.repo = None;
             self.path = None;
             self.url = None;
             self.digest = None;
-        } else if local_host_mode {
+        } else if local_forge_kind {
             self.host = local.host;
+            self.repo = local.repo;
             self.path = local.path;
             self.git = None;
             self.url = None;
             self.digest = None;
-        } else if local_url_mode {
+        } else if local_local_kind {
+            self.path = local.path;
+            self.host = None;
+            self.repo = None;
+            self.git = None;
+            self.url = None;
+            self.digest = None;
+        } else if local_url_kind {
             self.url = local.url;
             self.git = None;
             self.host = None;
+            self.repo = None;
             self.path = None;
             self.branch = None;
             self.tag = None;
@@ -520,8 +536,11 @@ impl Source {
         if let Some(git) = &self.git {
             return Ok(git.clone());
         }
+        if !self.is_forge() {
+            return Ok(self.path.clone().unwrap_or_default());
+        }
         let host_name = self.host.as_deref().unwrap_or("github");
-        let path = self.path.as_deref().unwrap_or_default();
+        let path = self.forge_path().unwrap_or_default();
 
         let effective = effective_host(hosts, host_name).ok_or_else(|| {
             Error::Config(format!(
@@ -566,12 +585,32 @@ impl Source {
         self.exclude.as_deref().unwrap_or(&[])
     }
 
-    /// Post-validation classifier assuming exactly one mode is set (url > host > git priority); exclusivity is enforced by `Config::parse`/validate, not here.
+    #[must_use]
+    fn is_forge(&self) -> bool {
+        self.host.is_some() || self.repo.is_some()
+    }
+
+    /// `repo`, falling back to the deprecated `path` alias for the forge owner/repo.
+    #[must_use]
+    fn forge_path(&self) -> Option<&str> {
+        self.repo.as_deref().or(self.path.as_deref())
+    }
+
+    /// `path` as a local-source key — `None` when it is the `host`+`path` forge alias (host set, no `repo`).
+    #[must_use]
+    fn local_path(&self) -> Option<&str> {
+        if self.host.is_some() && self.repo.is_none() {
+            return None;
+        }
+        self.path.as_deref()
+    }
+
+    /// Classifier assuming exactly one kind is set (exclusivity enforced by parse/validate). A local `path` source classifies as Git: it resolves verbatim, exactly like `git = <localpath>`.
     #[must_use]
     pub fn mode(&self) -> SourceMode {
         if self.url.is_some() {
             SourceMode::Url
-        } else if self.host.is_some() || self.path.is_some() {
+        } else if self.is_forge() {
             SourceMode::Host
         } else {
             SourceMode::Git
@@ -2025,24 +2064,24 @@ branch = "main"
     }
 
     #[test]
-    fn source_with_path_and_no_host_defaults_to_github() {
+    fn source_with_repo_and_no_host_defaults_to_github() {
         let toml = r#"
 version = 1
 
 [sources.tropos]
-path = "srnnkls/tropos"
+repo = "srnnkls/tropos"
 "#;
         let cfg = Config::parse(toml)
-            .expect("a source with `path` but no `host` defaults host to github and parses");
+            .expect("a source with `repo` but no `host` defaults host to github and parses");
         cfg.validate()
-            .expect("a path-only source must validate (host defaults to github)");
+            .expect("a bare-repo source must validate (host defaults to github)");
         let tropos = cfg.sources.get("tropos").expect("tropos source present");
         assert_eq!(
             tropos
                 .resolved_remote(&BTreeMap::new(), Protocol::Https)
-                .expect("path-only source resolves against the built-in github forge"),
+                .expect("bare-repo source resolves against the built-in github forge"),
             "https://github.com/srnnkls/tropos.git",
-            "an omitted `host` with `path` set must default to github, not merely parse Ok"
+            "an omitted `host` with `repo` set must default to github, not merely parse Ok"
         );
     }
 
@@ -2289,7 +2328,7 @@ version = 1
 
 [sources.aerc]
 host = "sr.ht"
-path = "~rjarry/aerc"
+repo = "~rjarry/aerc"
 "#,
             "aerc",
         );
@@ -2861,12 +2900,12 @@ url = ""
     }
 
     #[test]
-    fn mode_is_host_when_only_path_set() {
-        let s = config_source("h", "path = \"me/repo\"\n");
+    fn mode_is_host_when_only_repo_set() {
+        let s = config_source("h", "repo = \"me/repo\"\n");
         assert_eq!(
             s.mode(),
             SourceMode::Host,
-            "a `path`-only source (host defaults to github) must classify as SourceMode::Host, \
+            "a bare-`repo` source (host defaults to github) must classify as SourceMode::Host, \
              not Url and not Git"
         );
     }
@@ -2908,6 +2947,348 @@ url = ""
             matches!(default.refspec(), Refspec::Branch(b) if b == "main"),
             "a git source with no explicit ref must still default to Branch(\"main\"); \
              Refspec::None must not leak into git sources"
+        );
+    }
+
+    // ARCH-005: typed source-kind keys — `path` = LOCAL, forge key renamed to `repo`
+
+    fn parse_kind_source(name: &str, body: &str) -> Result<Source> {
+        let toml = format!("version = 1\n\n[sources.{name}]\n{body}");
+        Config::parse(&toml).map(|mut cfg| {
+            cfg.sources
+                .remove(name)
+                .expect("named source present after parse")
+        })
+    }
+
+    #[test]
+    fn path_key_is_a_local_source_resolving_to_the_local_path_verbatim() {
+        let local = parse_kind_source("loqui", "path = \"/home/me/dev/loqui\"\n")
+            .expect("a `path = \"/abs/local\"` source must parse as a local source");
+        assert_eq!(
+            local
+                .resolved_remote(&BTreeMap::new(), Protocol::Https)
+                .expect("a local-path source must resolve"),
+            "/home/me/dev/loqui",
+            "a `path` source uses the local path as the remote verbatim, exactly like a \
+             `git = \"/home/me/dev/loqui\"` source"
+        );
+    }
+
+    #[test]
+    fn path_local_source_resolves_identically_to_git_localpath_alias() {
+        let via_path =
+            parse_kind_source("a", "path = \"/home/me/dev/loqui\"\n").expect("local `path` parses");
+        let via_git_alias = parse_kind_source("b", "git = \"/home/me/dev/loqui\"\n")
+            .expect("`git = <localpath>` alias parses");
+        assert_eq!(
+            via_path
+                .resolved_remote(&BTreeMap::new(), Protocol::Https)
+                .expect("path local resolves"),
+            via_git_alias
+                .resolved_remote(&BTreeMap::new(), Protocol::Https)
+                .expect("git-alias local resolves"),
+            "a local `path` source and its `git = <localpath>` alias must resolve to the same \
+             local remote"
+        );
+    }
+
+    #[test]
+    fn host_plus_repo_is_a_forge_source_resolving_to_the_github_remote() {
+        let forge = parse_kind_source("tropos", "host = \"github\"\nrepo = \"srnnkls/tropos\"\n")
+            .expect("a host + repo forge source must parse");
+        assert_eq!(
+            forge
+                .resolved_remote(&BTreeMap::new(), Protocol::Https)
+                .expect("forge source resolves against the built-in github forge"),
+            "https://github.com/srnnkls/tropos.git",
+            "host = github + repo = srnnkls/tropos must resolve to the github https remote, \
+             exactly as host + path did before the rename"
+        );
+    }
+
+    #[test]
+    fn bare_repo_defaults_to_github_forge() {
+        let cfg = Config::parse(
+            r#"
+version = 1
+
+[sources.tropos]
+repo = "srnnkls/tropos"
+"#,
+        )
+        .expect("a bare `repo` (no host) must parse, defaulting to github");
+        cfg.validate()
+            .expect("a bare-repo source must validate (host defaults to github)");
+        let forge = cfg.sources.get("tropos").expect("tropos present");
+        assert_eq!(
+            forge
+                .resolved_remote(&BTreeMap::new(), Protocol::Https)
+                .expect("bare repo resolves against the built-in github forge"),
+            "https://github.com/srnnkls/tropos.git",
+            "a bare `repo = \"owner/repo\"` with no host must default to the github forge, \
+             exactly as the OLD bare `path = \"owner/repo\"` shorthand did"
+        );
+    }
+
+    #[test]
+    fn host_plus_path_is_a_deprecated_forge_alias() {
+        let forge = parse_kind_source("tropos", "host = \"github\"\npath = \"srnnkls/tropos\"\n")
+            .expect("host + path (deprecated forge alias) must still parse");
+        assert_eq!(
+            forge
+                .resolved_remote(&BTreeMap::new(), Protocol::Https)
+                .expect("the host+path alias still resolves as a forge source"),
+            "https://github.com/srnnkls/tropos.git",
+            "host + path stays a forge alias: it must resolve to the forge remote, NOT be \
+             treated as a local path under a host"
+        );
+    }
+
+    #[test]
+    fn host_plus_path_alias_resolves_a_tilde_anchored_forge_owner() {
+        let forge = parse_kind_source("aerc", "host = \"sr.ht\"\npath = \"~rjarry/aerc\"\n")
+            .expect("a host + path alias whose owner starts with ~ must still parse as forge");
+        assert_eq!(
+            forge
+                .resolved_remote(&BTreeMap::new(), Protocol::Https)
+                .expect("the ~-anchored host+path alias resolves as a forge source"),
+            "https://git.sr.ht/~rjarry/aerc",
+            "a forge `path` under a `host` is owner/repo regardless of shape: a ~user owner \
+             must resolve via the forge template, never be reclassified as a local path"
+        );
+    }
+
+    #[test]
+    fn bare_path_owner_repo_is_now_a_local_path_not_a_github_remote() {
+        let local = parse_kind_source("x", "path = \"owner/repo\"\n").expect(
+            "the OLD github shorthand `path = \"owner/repo\"` must now parse as a LOCAL source",
+        );
+        assert_eq!(
+            local
+                .resolved_remote(&BTreeMap::new(), Protocol::Https)
+                .expect("a bare-path local source resolves to the path verbatim"),
+            "owner/repo",
+            "INTENTIONAL BREAK: bare `path = \"owner/repo\"` is now a LOCAL relative path used \
+             verbatim as the remote, NOT the github forge remote it used to expand to"
+        );
+        assert_ne!(
+            local
+                .resolved_remote(&BTreeMap::new(), Protocol::Https)
+                .expect("resolves"),
+            "https://github.com/owner/repo.git",
+            "bare `path` must NOT resolve to a github remote URL any more"
+        );
+    }
+
+    #[test]
+    fn git_url_and_url_keys_are_unchanged_for_their_kinds() {
+        let git = parse_kind_source("g", "git = \"https://github.com/me/x.git\"\n")
+            .expect("a real git URL source still parses");
+        assert_eq!(
+            git.resolved_remote(&BTreeMap::new(), Protocol::Https)
+                .expect("git URL resolves verbatim"),
+            "https://github.com/me/x.git",
+            "a `git = <url>` remote source is unchanged: it resolves verbatim"
+        );
+
+        let url = parse_url_source("url = \"https://example.com/foo.tar.gz\"\n")
+            .expect("a url source still parses");
+        assert_eq!(
+            url.source_url(),
+            Some("https://example.com/foo.tar.gz"),
+            "a `url` source is unchanged: source_url() returns the configured url"
+        );
+    }
+
+    #[test]
+    fn source_with_path_and_git_url_is_rejected_naming_source() {
+        let toml = r#"
+version = 1
+
+[sources.dual]
+path = "/home/me/dev/x"
+git = "https://github.com/me/x.git"
+"#;
+        let err = Config::parse(toml).expect_err(
+            "a local `path` together with a `git = <url>` remote is dual-kind and must be rejected",
+        );
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("dual"),
+                "the local-vs-git conflict error must name the offending source, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn path_under_host_is_the_forge_alias_regardless_of_shape() {
+        let forge = parse_kind_source("dual", "path = \"/home/me/dev/x\"\nhost = \"github\"\n")
+            .expect(
+                "`host` + a local-looking `path` is the deprecated forge alias, not a conflict",
+            );
+        assert_eq!(
+            forge.mode(),
+            SourceMode::Host,
+            "a `path` under a `host` is always the forge owner/repo alias: its shape is never \
+             inspected, so it must not be reclassified as a local source"
+        );
+    }
+
+    #[test]
+    fn source_with_path_and_repo_is_rejected_naming_source() {
+        let toml = r#"
+version = 1
+
+[sources.dual]
+path = "/home/me/dev/x"
+repo = "owner/repo"
+"#;
+        let err = Config::parse(toml).expect_err(
+            "a local `path` together with a forge `repo` is dual-kind and must be rejected",
+        );
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("dual"),
+                "the local-vs-forge conflict error must name the offending source, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_with_repo_and_git_is_rejected_naming_source() {
+        let toml = r#"
+version = 1
+
+[sources.dual]
+repo = "owner/repo"
+git = "https://github.com/me/x.git"
+"#;
+        let err = Config::parse(toml).expect_err(
+            "a forge `repo` together with a `git` remote is dual-kind and must be rejected",
+        );
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("dual"),
+                "the forge-vs-git conflict error must name the offending source, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_with_url_and_repo_is_rejected_naming_source() {
+        let toml = r#"
+version = 1
+
+[sources.dual]
+url = "https://example.com/foo.tar.gz"
+repo = "owner/repo"
+"#;
+        let err = Config::parse(toml)
+            .expect_err("a `url` together with a forge `repo` is dual-kind and must be rejected");
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("dual"),
+                "the url-vs-forge conflict error must name the offending source, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_without_repo_or_path_is_rejected_naming_source() {
+        let toml = r#"
+version = 1
+
+[sources.incomplete]
+host = "github"
+"#;
+        let err = Config::parse(toml).expect_err(
+            "a forge `host` with neither `repo` nor a `path` alias is an incomplete forge group \
+             and must be rejected",
+        );
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("incomplete"),
+                "the incomplete-forge error must name the offending source, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_local_path_override_clears_stale_base_forge_repo_and_host() {
+        let base = Config::parse(
+            r#"
+version = 1
+
+[sources.loqui]
+host = "github"
+repo = "srnnkls/loqui"
+tag = "v1.0"
+"#,
+        )
+        .expect("base forge source parses");
+        let local = parse_kind_source(
+            "loqui",
+            "path = \"/home/me/dev/loqui\"\nbranch = \"main\"\n",
+        )
+        .expect("local path override parses");
+
+        let merged = base
+            .sources
+            .get("loqui")
+            .expect("loqui present")
+            .clone()
+            .merged_with(local);
+
+        assert_eq!(
+            merged.path.as_deref(),
+            Some("/home/me/dev/loqui"),
+            "the local path override must switch the merged source into local-kind"
+        );
+        assert!(
+            merged.repo.is_none(),
+            "switching to a local `path` must clear the stale base forge `repo`"
+        );
+        assert!(
+            merged.host.is_none(),
+            "switching to a local `path` must clear the stale base forge `host`"
+        );
+        assert!(
+            merged.git.is_none() && merged.url.is_none(),
+            "a local-path override must not leave any other-kind remote set"
+        );
+        assert_eq!(
+            merged
+                .resolved_remote(&BTreeMap::new(), Protocol::Https)
+                .expect("merged local resolves"),
+            "/home/me/dev/loqui",
+            "after the override the merged source resolves to the local path, not a stale \
+             github forge remote"
+        );
+    }
+
+    #[test]
+    fn config_digest_is_unchanged_across_the_path_to_repo_rename() {
+        let forge = parse_kind_source(
+            "tropos",
+            "host = \"github\"\nrepo = \"srnnkls/tropos\"\nroot = \"languages\"\ninclude = [\"editor\"]\n",
+        )
+        .expect("repo-key forge source parses");
+        let alias = parse_kind_source(
+            "tropos",
+            "host = \"github\"\npath = \"srnnkls/tropos\"\nroot = \"languages\"\ninclude = [\"editor\"]\n",
+        )
+        .expect("path-alias forge source parses");
+        assert_eq!(
+            forge.config_digest(),
+            alias.config_digest(),
+            "config_digest hashes only include/exclude/root/policy; the `path` -> `repo` key \
+             rename must NOT alter it, keeping lock identity byte-identical"
         );
     }
 }

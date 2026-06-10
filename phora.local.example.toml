@@ -4,13 +4,14 @@
 # Link mode lives here only. `deploy = "link"` symlinks an artifact destination at
 # the source's live working tree, so uncommitted edits in the checkout are visible
 # through the target with no re-sync. It is honored ONLY in this overlay (setting it
-# in the committed phora.toml is a config error) and ONLY for a local-path `git`
-# (a remote URL is a config error). Linked artifacts sit outside the integrity
+# in the committed phora.toml is a config error) and ONLY for a local source
+# (`path = "/dir"` or the `git = "/dir"` alias; a remote URL is a config error).
+# Linked artifacts sit outside the integrity
 # model: verify, drift, and rebuild skip them; `phora list` shows them as `linked`.
 
 version = 1
 
 # Override an existing source onto a local checkout and live-link it.
 [sources.loqui]
-git = "/home/me/dev/loqui"   # local path: the live working tree
+path = "/home/me/dev/loqui"  # local source: the live working tree
 deploy = "link"

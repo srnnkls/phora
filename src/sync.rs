@@ -5112,7 +5112,7 @@ mod tests {
         (parent, base)
     }
 
-    /// A single host+path source resolving against `[hosts.fixturehost]` whose
+    /// A single host+repo forge source resolving against `[hosts.fixturehost]` whose
     /// `remote` template fills to the local fixture repo, plus one flat target.
     fn config_host_source_one_target(
         source: &str,
@@ -5124,7 +5124,7 @@ mod tests {
         let toml = format!(
             "version = 1\n\n\
              [hosts.fixturehost]\nremote = \"{parent}/{{path}}\"\n\n\
-             [sources.{source}]\nhost = \"fixturehost\"\npath = \"{base}\"\nbranch = \"main\"\n\n\
+             [sources.{source}]\nhost = \"fixturehost\"\nrepo = \"{base}\"\nbranch = \"main\"\n\n\
              [targets.{target}]\npath = \"{}\"\nsources = [\"{source}\"]\nlayout = \"flat\"\n",
             target_path.display(),
         );

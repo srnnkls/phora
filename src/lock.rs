@@ -633,6 +633,43 @@ config_digest = \"PLACEHOLDER\"
         );
     }
 
+    // ARCH-005: local `path` source has the same lock identity as its `git=<localpath>` alias
+
+    #[test]
+    fn local_path_source_matches_lock_keyed_by_the_local_path() {
+        let source = source_from("path = \"/home/me/dev/loqui\"\nbranch = \"main\"\n");
+        let locked = LockedSource {
+            name: "loqui".to_owned(),
+            git: "/home/me/dev/loqui".to_owned(),
+            resolved: source.refspec().to_string(),
+            commit: "abc123".to_owned(),
+            digest: "blake3:artifact".to_owned(),
+            config_digest: source.config_digest(),
+        };
+
+        assert!(
+            source_matches(&source, &locked, &no_hosts(), Protocol::Https),
+            "a local `path` source must reuse a lock whose `git` field is that same local path, \
+             keeping lock identity byte-identical with the `git = <localpath>` alias"
+        );
+    }
+
+    #[test]
+    fn local_path_and_git_localpath_alias_produce_identical_lock_git_field() {
+        let via_path = source_from("path = \"/home/me/dev/loqui\"\nbranch = \"main\"\n");
+        let via_git = source_from("git = \"/home/me/dev/loqui\"\nbranch = \"main\"\n");
+        assert_eq!(
+            via_path
+                .resolved_remote(&no_hosts(), Protocol::Https)
+                .expect("path local resolves"),
+            via_git
+                .resolved_remote(&no_hosts(), Protocol::Https)
+                .expect("git-alias local resolves"),
+            "the resolved remote written into the lock `git` field must be identical whether the \
+             local source is declared via `path` or the `git = <localpath>` alias"
+        );
+    }
+
     // PAM-011: split_locks
 
     #[test]

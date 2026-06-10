@@ -30,9 +30,9 @@ Requires a Rust toolchain (edition 2024).
 ## Concepts
 
 - **Source** — a git repository, pinned by `branch`, `tag`, or `rev`. The
-  top-level directories under its `root` are its artifacts. Declare its remote
-  literally (`git = "…"`) or symbolically against a host (`host` + `path`), or
-  point at a downloadable resource (`url = "https://…"`).
+  top-level directories under its `root` are its artifacts. Declare its remote as
+  a forge (`host` + `repo`), a local path (`path = "/dir"`), a literal git URL
+  (`git = "…"`), or a downloadable resource (`url = "https://…"`).
 - **Artifact** — one top-level directory in a source (dotfiles are skipped). Glob
   `include`/`exclude` rules select which artifacts and which files within them ship.
 - **Target** — a local directory artifacts are projected into, with a chosen
@@ -47,14 +47,14 @@ Requires a Rust toolchain (edition 2024).
 ## Usage
 
 ```bash
-# Add a source. Shorthands persist symbolically (host + path), not an expanded URL.
+# Add a source. Shorthands persist as a forge source (host + repo), not an expanded URL.
 phora add owner/repo --name myconfigs --branch main --root configs  # -> host = "github"
 phora add github:srnnkls/tropos             # colon alias -> host = "github"
 phora add gitlab:group/repo                 # any built-in forge (alias caps at owner/repo)
 phora add github.com/me/dotfiles            # domain shorthand -> host = "github"
 phora add https://github.com/me/dotfiles.git  # scheme/scp URLs stay literal (git = "…")
 phora add git@github.com:me/dotfiles.git --tag v1.2
-# Deep GitLab subgroups go in the config `path` field (path = "group/sub/proj"),
+# Deep GitLab subgroups go in the config `repo` field (repo = "group/sub/proj"),
 # not the colon alias (segments past owner/repo become `root`).
 
 # Fetch sources, resolve commits, project artifacts into targets
@@ -99,14 +99,14 @@ Phora reads `phora.toml` from the working directory, optionally overlaid by
 
 ```toml
 version = 1
-# protocol = "ssh"         # global default for host-aliased sources (default https)
+# protocol = "ssh"         # global default for forge sources (default https)
 
 [hosts.github]
 auth = { type = "token", env = "GITHUB_TOKEN" }   # remote is built in; just add auth
 
 [sources.dotfiles]
-host = "github"          # symbolic remote: host + path (or use git = "…" for a literal URL)
-path = "me/dotfiles"
+host = "github"          # forge remote: host + repo (or use git = "…" for a literal URL)
+repo = "me/dotfiles"
 branch = "main"          # or tag = "...", or rev = "<sha>" (pick one)
 root = "modules"         # repo subdirectory to treat as the artifact root
 include = ["editor"]     # optional artifact/path globs
@@ -135,35 +135,49 @@ adds a new forge or overrides a built-in's `remote`/`auth`. Auth is either
 | `by-source`                     | `s/a`       |
 | `{ type = "prefixed", sep="-" }`| `s-a`       |
 
-### Host-aliased sources
+### Source kinds
 
-A source declares its remote in exactly one of two modes — never both:
+A source declares its remote in exactly one kind — never more than one:
 
+- **Forge:** `host = "<alias>"` + `repo = "<owner/repo>"`, resolved at sync time
+  from the host's `remote` template. `host` may be omitted when `repo` is set, in
+  which case it defaults to `github` (`repo = "owner/repo"` is github shorthand).
+- **Local:** `path = "<dir-or-file>"`, a filesystem path used verbatim as the
+  remote — exactly like a `git = "/abs/local"` URL.
 - **Literal:** `git = "<url>"`, any https, `ssh://`, or scp-style (`git@host:path`)
-  remote. Unchanged; existing configs keep working.
-- **Symbolic:** `host = "<alias>"` + `path = "<owner/repo>"`, resolved at sync time
-  from the host's `remote` template. `host` may be omitted when `path` is set, in
-  which case it defaults to `github`.
+  remote.
+- **Url:** `url = "https://…"`, a downloadable resource (see below).
 
 ```toml
 [sources.tropos]
 host = "github"          # built in; omit to default to github
-path = "srnnkls/tropos"
+repo = "srnnkls/tropos"
 branch = "main"
 
 [sources.internal]
 host = "company"         # defined in [hosts.company]
-path = "team/sub/proj"   # nested paths are fine
+repo = "team/sub/proj"   # nested paths are fine
 protocol = "ssh"         # per-source override (default is https)
+
+[sources.scratch]
+path = "~/dev/scratch"   # local checkout, used verbatim as the remote
+branch = "main"
 ```
+
+**Back-compat aliases.** `git = "/abs/local"` still declares a local source.
+`host` + `path` (forge owner/repo) is a deprecated alias for `host` + `repo`.
+
+> **Breaking change:** a bare `path = "owner/repo"` (no host) now means a LOCAL
+> path, not a github forge source. The github shorthand moved to bare
+> `repo = "owner/repo"`.
 
 A host's `remote` is either a single template string (https) or a
 `{ https = "…", ssh = "…" }` table. Templates fill three placeholders:
 
 | Placeholder | Value                                              |
 | ----------- | -------------------------------------------------- |
-| `{path}`    | the source's `path`, verbatim                      |
-| `{owner}`   | the first `/`-segment of `path`                    |
+| `{path}`    | the source's `repo` (owner/repo), verbatim         |
+| `{owner}`   | the first `/`-segment of `repo`                     |
 | `{repo}`    | the remainder (so `{owner}/{repo}` ≡ `{path}` at any depth — GitLab subgroups) |
 
 ```toml
@@ -177,20 +191,20 @@ for them. A `[hosts.X]` block of the same name overrides the built-in's `remote`
 or adds `auth`; changing a host's `remote` re-points every source on that host
 with no per-source edits.
 
-**Protocol.** `protocol = "https" | "ssh"` selects which template key a symbolic
+**Protocol.** `protocol = "https" | "ssh"` selects which template key a forge
 source resolves through. It defaults to `https`, can be set globally at the top
 level, and is overridable per source. Selecting `ssh` against a host whose
 `remote` has no `ssh` key is a config error. (`protocol` is ignored for literal
-`git` sources.)
+`git` and local `path` sources.)
 
-The symbolic and literal forms of one repo — and its https and ssh remotes —
-share a single `~/.phora/git` mirror, so switching mode or protocol never
+The forge and literal forms of one repo — and its https and ssh remotes —
+share a single `~/.phora/git` mirror, so switching kind or protocol never
 re-clones or refetches.
 
 ### Url sources
 
-A `url = "https://…"` source is the third declaration mode (git XOR host+path XOR
-url). It downloads a resource and imports its contents as a source, then
+A `url = "https://…"` source is one of the four kinds (forge XOR local XOR git
+XOR url). It downloads a resource and imports its contents as a source, then
 discovers/exports/deploys exactly like a git source. `branch`, `tag`, `rev`, and
 `root` have no meaning for a static resource and are config errors on a url source;
 `include`/`exclude` still select files.
@@ -240,9 +254,9 @@ Two guardrails apply:
 - **Local overlay only.** `deploy = "link"` is honored only in `phora.local.toml`.
   Setting it in the committed `phora.toml` is a config error that names the source.
   Keep it out of shared config.
-- **Local path only.** A link source's `git` must be a local filesystem path
-  (absolute, or an existing relative path). `deploy = "link"` on a remote URL is a
-  config error.
+- **Local path only.** A link source must be a local source: `path = "/dir"` (or
+  the `git = "/dir"` alias), a local filesystem path. `deploy = "link"` on a remote
+  URL is a config error.
 
 Linked artifacts sit **outside the integrity model**: their registry record carries
 a `linked` marker and no per-file hashes. `phora verify` skips them, drift detection
@@ -259,7 +273,7 @@ skips that artifact, and continues the rest of the sync.
 # phora.local.toml — overlays phora.toml, never committed.
 # Override the `loqui` source onto a local checkout and live-link it.
 [sources.loqui]
-git = "/home/me/dev/loqui"   # local path; the live working tree
+path = "/home/me/dev/loqui"  # local source; the live working tree
 deploy = "link"
 ```
 
