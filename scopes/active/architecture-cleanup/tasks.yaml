@@ -164,7 +164,13 @@ tasks:
 
   - id: ARCH-015
     content: "ARCH-005 migration warnings (round-2 retrofit): deprecation warning on alias forms; meaning-changed hint on bare path=owner/repo"
-    status: pending
+    status: done
+    # done 2026-06-10 (a89a414 + b3e14e9): config/migrate.rs MigrationWarning (GitLocalpath|
+    # HostPathForge|PathShorthand) + Config::migration_warnings(base_dir); emitted at
+    # load_config_from AND load_local_config (review: overlay was bypassed). Golden fixture
+    # migrated git=->path= (snapshots byte-identical; Remote::Git/Path resolve verbatim,
+    # config_digest excludes the remote string — opus-verified). Review: opus+sonnet approve;
+    # accepted-low: userless scp `host:path` misclassifies as localpath alias (advice-only).
     activeForm: "Adding source-key migration warnings"
     depends_on: [ARCH-005, ARCH-006]
     acceptance:
