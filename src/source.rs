@@ -79,6 +79,15 @@ pub trait SourceBackend {
 
     fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult>;
 
+    /// Blake3 fingerprint of the matched subtree at the resolved commit — the
+    /// selected source bytes, not the deploy/artifact set.
+    ///
+    /// Filters by path-level selection only (`Selection::selects_path`); the
+    /// artifact dotfile opt-in does not apply, so a top-level `.config` is hashed
+    /// under path rules regardless of that gate.
+    ///
+    /// No production consumer: lock reuse is decided by `lock::source_matches`,
+    /// never this digest. Only test assertions read it.
     fn compute_digest(
         &self,
         source: &str,
