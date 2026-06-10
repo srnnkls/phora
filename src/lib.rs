@@ -2,7 +2,7 @@
 //!
 //! The crate follows a hexagonal layering:
 //! - **domain** — config DTOs ([`config`]), path/identity newtypes ([`paths`]),
-//!   pattern matching ([`matcher`]), and the orchestration in [`sync`]/[`projection`].
+//!   selection ([`kernel::Selection`]), and the orchestration in [`sync`]/[`projection`].
 //! - **ports** — the [`source::SourceBackend`] and [`registry::Registry`] traits.
 //! - **adapters** — [`source::GitBackend`] and [`registry::FileRegistry`], kept beside
 //!   their port traits rather than in separate directories.
@@ -24,7 +24,6 @@ pub mod error;
 pub mod http;
 pub mod kernel;
 pub mod lock;
-pub mod matcher;
 pub mod paths;
 pub mod projection;
 pub mod registry;

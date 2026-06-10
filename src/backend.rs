@@ -6,7 +6,7 @@ use std::path::Path;
 
 use crate::config::{Refspec, SourceMode};
 use crate::error::Result;
-use crate::matcher::PathMatcher;
+use crate::kernel::Selection;
 use crate::source::{ExportRequest, ExportResult, SourceBackend};
 
 /// Routes each `SourceBackend` call to `git` or `http` by the source's declared
@@ -66,14 +66,14 @@ impl<G: SourceBackend, H: SourceBackend> SourceBackend for RouterBackend<G, H> {
         url: &str,
         commit: &str,
         root: Option<&Path>,
-        matcher: &PathMatcher,
+        selection: &Selection,
     ) -> Result<Vec<String>> {
         if self.is_url(source) {
             self.http
-                .discover_artifacts(source, url, commit, root, matcher)
+                .discover_artifacts(source, url, commit, root, selection)
         } else {
             self.git
-                .discover_artifacts(source, url, commit, root, matcher)
+                .discover_artifacts(source, url, commit, root, selection)
         }
     }
 
@@ -91,12 +91,14 @@ impl<G: SourceBackend, H: SourceBackend> SourceBackend for RouterBackend<G, H> {
         url: &str,
         commit: &str,
         root: Option<&Path>,
-        matcher: &PathMatcher,
+        selection: &Selection,
     ) -> Result<String> {
         if self.is_url(source) {
-            self.http.compute_digest(source, url, commit, root, matcher)
+            self.http
+                .compute_digest(source, url, commit, root, selection)
         } else {
-            self.git.compute_digest(source, url, commit, root, matcher)
+            self.git
+                .compute_digest(source, url, commit, root, selection)
         }
     }
 }
@@ -115,7 +117,7 @@ mod tests {
 
     use crate::config::{Refspec, SourceMode};
     use crate::error::{Error, Result};
-    use crate::matcher::PathMatcher;
+    use crate::kernel::Selection;
     use crate::source::{
         ExportRequest, ExportResult, GitBackend, HttpBackend, RouterBackend, SourceBackend,
     };
@@ -223,8 +225,8 @@ mod tests {
         (src, url, head)
     }
 
-    fn empty_matcher() -> PathMatcher {
-        PathMatcher::new(&[], &[]).expect("empty matcher builds")
+    fn empty_selection() -> Selection {
+        Selection::new(&[], &[]).expect("empty selection builds")
     }
 
     // ── behavioral dispatch: real git + real http through the router ──
@@ -324,7 +326,7 @@ mod tests {
             _url: &str,
             _commit: &str,
             _root: Option<&Path>,
-            _matcher: &PathMatcher,
+            _selection: &Selection,
         ) -> Result<Vec<String>> {
             self.discovers.borrow_mut().push(source.to_string());
             Ok(vec![])
@@ -340,7 +342,7 @@ mod tests {
             _url: &str,
             _commit: &str,
             _root: Option<&Path>,
-            _matcher: &PathMatcher,
+            _selection: &Selection,
         ) -> Result<String> {
             self.digests.borrow_mut().push(source.to_string());
             Ok("blake3:spy".into())
@@ -430,7 +432,7 @@ mod tests {
         modes.insert("u".to_string(), SourceMode::Url);
         modes.insert("g".to_string(), SourceMode::Git);
         let router = spy_router(modes);
-        let m = empty_matcher();
+        let m = empty_selection();
 
         router
             .discover_artifacts("u", "http://x/pkg.tgz", "c", None, &m)

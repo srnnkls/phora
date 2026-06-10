@@ -7,8 +7,7 @@ use gix::object::tree::EntryKind;
 
 use crate::config::Refspec;
 use crate::error::{Error, Result};
-use crate::kernel::{Commit, Digest};
-use crate::matcher::PathMatcher;
+use crate::kernel::{Commit, Digest, Selection};
 use crate::registry::ManifestFile;
 
 /// Re-exported beside the backends it composes; defined in `backend` to keep routing separate.
@@ -54,7 +53,7 @@ pub struct ExportRequest<'a> {
     pub commit: &'a str,
     pub root: Option<&'a Path>,
     pub artifact: &'a str,
-    pub matcher: &'a PathMatcher,
+    pub selection: &'a Selection,
     pub policy: &'a ExportPolicy,
     pub staging_dir: &'a Path,
     pub commit_time: u64,
@@ -75,7 +74,7 @@ pub trait SourceBackend {
         url: &str,
         commit: &str,
         root: Option<&Path>,
-        matcher: &PathMatcher,
+        selection: &Selection,
     ) -> Result<Vec<String>>;
 
     fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult>;
@@ -86,7 +85,7 @@ pub trait SourceBackend {
         url: &str,
         commit: &str,
         root: Option<&Path>,
-        matcher: &PathMatcher,
+        selection: &Selection,
     ) -> Result<String>;
 }
 
@@ -258,7 +257,7 @@ impl SourceBackend for GitBackend {
         url: &str,
         commit: &str,
         root: Option<&Path>,
-        matcher: &PathMatcher,
+        selection: &Selection,
     ) -> Result<Vec<String>> {
         let repo = self.open_mirror(source, url)?;
         let subtree = Self::subtree_at_root(&repo, source, commit, root)?;
@@ -275,7 +274,7 @@ impl SourceBackend for GitBackend {
                 });
             }
 
-            let is_candidate = !name.starts_with('.') && matcher.allows_artifact(&name);
+            let is_candidate = selection.selects_artifact(&name);
             if !is_candidate {
                 continue;
             }
@@ -299,7 +298,7 @@ impl SourceBackend for GitBackend {
             repo: &repo,
             source: req.source,
             out_base: req.staging_dir,
-            matcher: req.matcher,
+            selection: req.selection,
             policy: req.policy,
             commit_time: req.commit_time,
             files: Vec::new(),
@@ -320,13 +319,20 @@ impl SourceBackend for GitBackend {
         url: &str,
         commit: &str,
         root: Option<&Path>,
-        matcher: &PathMatcher,
+        selection: &Selection,
     ) -> Result<String> {
         let repo = self.open_mirror(source, url)?;
         let subtree = Self::subtree_at_root(&repo, source, commit, root)?;
 
         let mut hasher = blake3::Hasher::new();
-        Self::hash_tree(&repo, source, &subtree, Path::new(""), matcher, &mut hasher)?;
+        Self::hash_tree(
+            &repo,
+            source,
+            &subtree,
+            Path::new(""),
+            selection,
+            &mut hasher,
+        )?;
         Ok(format!("blake3:{}", hasher.finalize().to_hex()))
     }
 }
@@ -403,7 +409,7 @@ impl GitBackend {
         source: &str,
         tree: &gix::Tree<'_>,
         rel_path: &Path,
-        matcher: &PathMatcher,
+        selection: &Selection,
         hasher: &mut blake3::Hasher,
     ) -> Result<()> {
         for entry in tree.iter() {
@@ -413,7 +419,7 @@ impl GitBackend {
             let entry_rel = rel_path.join(component);
             let is_dir = matches!(entry.kind(), EntryKind::Tree);
 
-            if !matcher.allows_path(&entry_rel, is_dir) {
+            if !selection.selects_path(&entry_rel, is_dir) {
                 continue;
             }
 
@@ -431,7 +437,7 @@ impl GitBackend {
                     let subtree = repo
                         .find_tree(entry.object_id())
                         .map_err(|e| Error::Source(format!("subtree in {source}: {e}")))?;
-                    Self::hash_tree(repo, source, &subtree, &entry_rel, matcher, hasher)?;
+                    Self::hash_tree(repo, source, &subtree, &entry_rel, selection, hasher)?;
                 }
                 EntryKind::Commit => {}
             }
@@ -525,10 +531,10 @@ impl SourceBackend for HttpBackend {
         url: &str,
         commit: &str,
         root: Option<&Path>,
-        matcher: &PathMatcher,
+        selection: &Selection,
     ) -> Result<Vec<String>> {
         self.git
-            .discover_artifacts(source, url, commit, root, matcher)
+            .discover_artifacts(source, url, commit, root, selection)
     }
 
     fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult> {
@@ -541,9 +547,10 @@ impl SourceBackend for HttpBackend {
         url: &str,
         commit: &str,
         root: Option<&Path>,
-        matcher: &PathMatcher,
+        selection: &Selection,
     ) -> Result<String> {
-        self.git.compute_digest(source, url, commit, root, matcher)
+        self.git
+            .compute_digest(source, url, commit, root, selection)
     }
 }
 
@@ -551,7 +558,7 @@ struct ExportWalk<'a> {
     repo: &'a gix::Repository,
     source: &'a str,
     out_base: &'a Path,
-    matcher: &'a PathMatcher,
+    selection: &'a Selection,
     policy: &'a ExportPolicy,
     commit_time: u64,
     files: Vec<ManifestFile>,
@@ -568,7 +575,7 @@ impl ExportWalk<'_> {
             let out_path = self.out_base.join(&entry_rel);
             let is_dir = matches!(entry.kind(), EntryKind::Tree);
 
-            if !self.matcher.allows_path(&entry_rel, is_dir) {
+            if !self.selection.selects_path(&entry_rel, is_dir) {
                 continue;
             }
 
@@ -1069,10 +1076,10 @@ mod tests {
         commit: String,
     }
 
-    fn matcher(include: &[&str], exclude: &[&str]) -> PathMatcher {
+    fn matcher(include: &[&str], exclude: &[&str]) -> Selection {
         let inc: Vec<String> = include.iter().map(|s| (*s).to_string()).collect();
         let exc: Vec<String> = exclude.iter().map(|s| (*s).to_string()).collect();
-        PathMatcher::new(&inc, &exc).expect("patterns build into a matcher")
+        Selection::new(&inc, &exc).expect("patterns build into a selection")
     }
 
     /// Clean base with no root-level symlink: `editor/` is symlink-free; the
@@ -1796,7 +1803,7 @@ path = "srnnkls/tropos"
         fixture: &ExportFixture,
         artifact: &str,
         staging: &Path,
-        m: &PathMatcher,
+        m: &Selection,
         policy: &ExportPolicy,
     ) -> Result<ExportResult> {
         let req = ExportRequest {
@@ -1805,7 +1812,7 @@ path = "srnnkls/tropos"
             commit: &fixture.commit,
             root: None,
             artifact,
-            matcher: m,
+            selection: m,
             policy,
             staging_dir: staging,
             commit_time: EXPORT_COMMIT_TIME,
@@ -1816,7 +1823,7 @@ path = "srnnkls/tropos"
     fn export_editor(
         fixture: &ExportFixture,
         staging: &Path,
-        m: &PathMatcher,
+        m: &Selection,
         policy: &ExportPolicy,
     ) -> Result<ExportResult> {
         export_named(fixture, "editor", staging, m, policy)
@@ -2486,7 +2493,7 @@ path = "srnnkls/tropos"
         let fixture = build_export_fixture();
         fixture.backend.fetch("src", &fixture.url).expect("fetch");
 
-        let digest = |m: &PathMatcher| {
+        let digest = |m: &Selection| {
             fixture
                 .backend
                 .compute_digest("src", &fixture.url, &fixture.commit, None, m)
@@ -2522,8 +2529,7 @@ path = "srnnkls/tropos"
 
         use crate::config::Refspec;
         use crate::error::Error;
-        use crate::kernel::Digest;
-        use crate::matcher::PathMatcher;
+        use crate::kernel::{Digest, Selection};
         use crate::source::{ExportPolicy, ExportRequest, HttpBackend, SourceBackend, mirror_path};
 
         const HELLO_BODY: &[u8] = b"hi";
@@ -2591,8 +2597,8 @@ path = "srnnkls/tropos"
             encoder.finish().expect("finish gzip")
         }
 
-        fn empty_matcher() -> PathMatcher {
-            PathMatcher::new(&[], &[]).expect("empty matcher builds")
+        fn empty_matcher() -> Selection {
+            Selection::new(&[], &[]).expect("empty selection builds")
         }
 
         #[test]
@@ -2683,7 +2689,7 @@ path = "srnnkls/tropos"
                     commit: &commit,
                     root: None,
                     artifact: "bin",
-                    matcher: &m,
+                    selection: &m,
                     policy: &policy,
                     staging_dir: staging.path(),
                     commit_time: 1,
