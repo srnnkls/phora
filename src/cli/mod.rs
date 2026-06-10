@@ -229,7 +229,13 @@ fn drop_sources(lock: Option<&mut crate::lock::Lock>, drop: &DropSources) {
 fn load_local_config(cwd: &Path) -> Result<Option<Config>> {
     let path = cwd.join("phora.local.toml");
     match std::fs::read_to_string(&path) {
-        Ok(text) => Config::parse(&text).map(Some),
+        Ok(text) => {
+            let config = Config::parse(&text)?;
+            for warning in config.migration_warnings(cwd) {
+                eprintln!("phora: phora.local.toml: {warning}");
+            }
+            Ok(Some(config))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(Error::Config(format!("read {}: {e}", path.display()))),
     }
