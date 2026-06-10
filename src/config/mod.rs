@@ -1,6 +1,7 @@
 //! Config DTOs (`phora.toml`). This module is a boundary, so it carries serde.
 
 mod host;
+mod migrate;
 mod source;
 mod target;
 
@@ -15,6 +16,7 @@ use crate::error::{Error, Result};
 pub use crate::source::Protocol;
 
 pub use host::{AuthConfig, Host, RemoteConfig, builtin_forges};
+pub use migrate::MigrationWarning;
 pub use source::{DeployMode, ParsedSource, Refspec, Remote, Source, SourceMode};
 pub use target::{LayoutConfig, LayoutKind, Target};
 
@@ -118,6 +120,15 @@ impl Config {
         self.sources
             .iter()
             .map(|(name, source)| Ok((name.clone(), ParsedSource::parse(name, source)?)))
+            .collect()
+    }
+
+    /// `base_dir` resolves relative `path` values for the local-dir check.
+    #[must_use]
+    pub fn migration_warnings(&self, base_dir: &std::path::Path) -> Vec<MigrationWarning> {
+        self.sources
+            .iter()
+            .filter_map(|(name, source)| migrate::warning_for(name, source, base_dir))
             .collect()
     }
 }

@@ -2691,3 +2691,228 @@ fn config_digest_is_unchanged_across_the_path_to_repo_rename() {
              rename must NOT alter it, keeping lock identity byte-identical"
     );
 }
+
+// ARCH-015: source-key migration warnings (retrofit of ARCH-005 acceptance).
+mod migration_warnings {
+    use std::path::Path;
+
+    use tempfile::TempDir;
+
+    use crate::config::{Config, MigrationWarning};
+
+    fn cfg(body: &str) -> Config {
+        Config::parse(&format!("version = 1\n\n{body}")).expect("config parses")
+    }
+
+    /// Warnings for `body` resolved against a directory with NO local paths, so
+    /// any `path = "owner/repo"` cannot exist as a local dir.
+    fn warnings(body: &str) -> Vec<MigrationWarning> {
+        let empty = TempDir::new().expect("empty base dir");
+        cfg(body).migration_warnings(empty.path())
+    }
+
+    fn for_source<'a>(ws: &'a [MigrationWarning], name: &str) -> Vec<&'a MigrationWarning> {
+        ws.iter().filter(|w| w.source() == name).collect()
+    }
+
+    #[test]
+    fn git_localpath_alias_warns_and_suggests_path() {
+        let ws = warnings("[sources.loqui]\ngit = \"/home/me/dev/loqui\"\n");
+        let hit = for_source(&ws, "loqui");
+        assert_eq!(
+            hit.len(),
+            1,
+            "a `git = <localpath>` alias must emit exactly one migration warning, got: {ws:?}"
+        );
+        assert_eq!(
+            hit[0].suggested_key(),
+            "path",
+            "the git=<localpath> alias warning must steer the user to the `path` key"
+        );
+        let line = hit[0].to_string();
+        assert_eq!(
+            line.lines().count(),
+            1,
+            "the deprecation warning must be a single line, got: {line:?}"
+        );
+        assert!(
+            line.contains("loqui") && line.contains("path"),
+            "the warning line must name the source and the new `path` key, got: {line:?}"
+        );
+    }
+
+    #[test]
+    fn git_url_form_is_silent() {
+        let ws = warnings("[sources.x]\ngit = \"https://github.com/me/x.git\"\n");
+        assert!(
+            for_source(&ws, "x").is_empty(),
+            "a real `git = <url>` remote is the canonical form and must NOT warn, got: {ws:?}"
+        );
+    }
+
+    #[test]
+    fn host_path_forge_alias_warns_and_suggests_repo() {
+        let ws = warnings("[sources.tropos]\nhost = \"github\"\npath = \"srnnkls/tropos\"\n");
+        let hit = for_source(&ws, "tropos");
+        assert_eq!(
+            hit.len(),
+            1,
+            "the `host` + `path` forge alias must emit exactly one migration warning, got: {ws:?}"
+        );
+        assert_eq!(
+            hit[0].suggested_key(),
+            "repo",
+            "the host+path forge-alias warning must steer the user to the `repo` key"
+        );
+        let line = hit[0].to_string();
+        assert_eq!(
+            line.lines().count(),
+            1,
+            "the deprecation warning must be a single line, got: {line:?}"
+        );
+        assert!(
+            line.contains("tropos") && line.contains("repo"),
+            "the warning line must name the source and the new `repo` key, got: {line:?}"
+        );
+    }
+
+    #[test]
+    fn host_repo_forge_form_is_silent() {
+        let ws = warnings("[sources.tropos]\nhost = \"github\"\nrepo = \"srnnkls/tropos\"\n");
+        assert!(
+            for_source(&ws, "tropos").is_empty(),
+            "the canonical `host` + `repo` forge form must NOT warn, got: {ws:?}"
+        );
+    }
+
+    #[test]
+    fn bare_repo_form_is_silent() {
+        let ws = warnings("[sources.tropos]\nrepo = \"srnnkls/tropos\"\n");
+        assert!(
+            for_source(&ws, "tropos").is_empty(),
+            "the canonical bare `repo` form must NOT warn, got: {ws:?}"
+        );
+    }
+
+    #[test]
+    fn url_form_is_silent() {
+        let ws = warnings("[sources.pkg]\nurl = \"https://example.com/foo.tar.gz\"\n");
+        assert!(
+            for_source(&ws, "pkg").is_empty(),
+            "a `url` source is canonical and must NOT warn, got: {ws:?}"
+        );
+    }
+
+    #[test]
+    fn bare_path_that_looks_like_github_shorthand_warns_to_use_bare_repo() {
+        // exactly one '/', no leading '/', './' or '~', and the dir does NOT exist locally
+        let ws = warnings("[sources.x]\npath = \"owner/repo\"\n");
+        let hit = for_source(&ws, "x");
+        assert_eq!(
+            hit.len(),
+            1,
+            "a bare `path = \"owner/repo\"` that looks like the old github shorthand and does \
+             not exist locally must emit exactly one meaning-changed hint, got: {ws:?}"
+        );
+        assert_eq!(
+            hit[0].suggested_key(),
+            "repo",
+            "the shorthand-moved hint must steer the user to the bare `repo` key"
+        );
+        let line = hit[0].to_string();
+        assert_eq!(
+            line.lines().count(),
+            1,
+            "the meaning-changed hint must be a single line, got: {line:?}"
+        );
+        assert!(
+            line.contains("repo"),
+            "the hint must name the `repo` key the shorthand moved to, got: {line:?}"
+        );
+    }
+
+    #[test]
+    fn bare_path_to_existing_owner_repo_dir_does_not_warn() {
+        let base = TempDir::new().expect("base dir");
+        std::fs::create_dir_all(base.path().join("owner/repo")).expect("create owner/repo dir");
+        let ws = cfg("[sources.x]\npath = \"owner/repo\"\n").migration_warnings(base.path());
+        assert!(
+            for_source(&ws, "x").is_empty(),
+            "a relative `path = \"owner/repo\"` that DOES exist as a local dir is a real local \
+             source and must NOT trigger the shorthand hint, got: {ws:?}"
+        );
+    }
+
+    #[test]
+    fn bare_path_absolute_local_dir_does_not_warn() {
+        let ws = warnings("[sources.x]\npath = \"/home/me/dev/loqui\"\n");
+        assert!(
+            for_source(&ws, "x").is_empty(),
+            "an absolute local `path` (leading `/`) is unambiguously local and must NOT warn, \
+             got: {ws:?}"
+        );
+    }
+
+    #[test]
+    fn bare_path_dotslash_relative_dir_does_not_warn() {
+        let ws = warnings("[sources.x]\npath = \"./vendor/pkg\"\n");
+        assert!(
+            for_source(&ws, "x").is_empty(),
+            "a `./`-anchored relative path is unambiguously local and must NOT warn, got: {ws:?}"
+        );
+    }
+
+    #[test]
+    fn bare_path_tilde_home_does_not_warn() {
+        let ws = warnings("[sources.x]\npath = \"~/dev/loqui\"\n");
+        assert!(
+            for_source(&ws, "x").is_empty(),
+            "a `~`-anchored home path is unambiguously local and must NOT warn, got: {ws:?}"
+        );
+    }
+
+    #[test]
+    fn bare_path_deep_relative_dir_does_not_warn() {
+        // more than one '/' -> not the single-segment github shorthand shape
+        let ws = warnings("[sources.x]\npath = \"vendor/group/pkg\"\n");
+        assert!(
+            for_source(&ws, "x").is_empty(),
+            "a multi-segment relative `path` is not the old `owner/repo` shorthand and must \
+             NOT trigger the hint, got: {ws:?}"
+        );
+    }
+
+    #[test]
+    fn each_offending_source_warns_exactly_once_per_parse_pass() {
+        let ws = warnings(
+            "[sources.a]\ngit = \"/home/me/dev/a\"\n\n\
+             [sources.b]\nhost = \"github\"\npath = \"owner/b\"\n",
+        );
+        assert_eq!(
+            for_source(&ws, "a").len(),
+            1,
+            "the git=<localpath> alias source `a` must warn exactly once, got: {ws:?}"
+        );
+        assert_eq!(
+            for_source(&ws, "b").len(),
+            1,
+            "the host+path alias source `b` must warn exactly once, got: {ws:?}"
+        );
+    }
+
+    #[test]
+    fn a_fully_canonical_config_produces_no_warnings() {
+        let ws = warnings(
+            "[sources.remote]\ngit = \"https://github.com/me/x.git\"\n\n\
+             [sources.forge]\nhost = \"github\"\nrepo = \"me/forge\"\n\n\
+             [sources.bare]\nrepo = \"me/bare\"\n\n\
+             [sources.pkg]\nurl = \"https://example.com/foo.tar.gz\"\n\n\
+             [sources.local]\npath = \"/abs/local/dir\"\n",
+        );
+        assert!(
+            ws.is_empty(),
+            "a config using only canonical keys must produce NO migration warnings, got: {ws:?}"
+        );
+        let _ = Path::new("/");
+    }
+}
