@@ -640,6 +640,7 @@ fn lit(git: &str, branch: Option<&str>) -> AddTarget {
         git: Some(git.to_owned()),
         host: None,
         repo: None,
+        path: None,
         protocol: None,
         branch: branch.map(str::to_owned),
         root: None,
@@ -1094,8 +1095,16 @@ fn run_add_end_to_end_persists_symbolic_source_to_phora_toml() {
     let toml_path = dir.path().join("phora.toml");
 
     with_cwd(dir.path(), || {
-        run_add("github:srnnkls/tropos", None, None, None, None)
-            .expect("run_add must succeed for a symbolic colon alias");
+        run_add(
+            "github:srnnkls/tropos",
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        )
+        .expect("run_add must succeed for a symbolic colon alias");
     });
 
     let written =
@@ -1655,5 +1664,470 @@ fn resolution_from_char_rejects_unknown() {
         resolution_from_char('x'),
         None,
         "an unrecognized prompt character must map to None, not a default Resolution"
+    );
+}
+
+// `phora add --local` / `--symlink` (ALS-001): local-overlay path sources.
+
+use crate::config::{DeployMode, Remote};
+
+/// Parses the named source out of a written overlay/config into its typed form.
+fn parsed_source_from(text: &str, name: &str) -> ParsedSource {
+    let raw = Config::parse(text)
+        .unwrap_or_else(|e| panic!("written toml must parse: {e}\n{text}"))
+        .sources
+        .remove(name)
+        .unwrap_or_else(|| panic!("source `{name}` must be present in:\n{text}"));
+    ParsedSource::parse(name, &raw)
+        .unwrap_or_else(|e| panic!("source `{name}` must parse to typed form: {e}"))
+}
+
+#[test]
+fn add_local_writes_path_local_path_to_phora_local_toml() {
+    let dir = tempfile::TempDir::new().expect("temp project dir");
+    let src_dir = tempfile::TempDir::new().expect("temp source dir");
+    let abspath = std::fs::canonicalize(src_dir.path()).expect("canonicalize source dir");
+
+    with_cwd(dir.path(), || {
+        run_add(
+            src_dir.path().to_str().expect("utf8 source path"),
+            Some("mysrc".to_owned()),
+            None,
+            None,
+            None,
+            true,
+            false,
+        )
+        .expect("run_add --local must succeed for an existing dir");
+    });
+
+    let overlay = std::fs::read_to_string(dir.path().join("phora.local.toml"))
+        .expect("--local must write phora.local.toml in the cwd");
+    let src = source_from(&overlay, "mysrc");
+    assert_eq!(
+        src.path.as_deref(),
+        Some(abspath.to_string_lossy().as_ref()),
+        "--local must persist path = <canonical abspath>, got:\n{overlay}"
+    );
+    assert!(
+        src.deploy.is_none(),
+        "--local (copy mode) must NOT write a deploy key, got:\n{overlay}"
+    );
+    assert!(
+        !dir.path().join("phora.toml").exists(),
+        "--local must not create or touch phora.toml"
+    );
+}
+
+#[test]
+fn add_symlink_writes_path_and_deploy_link_to_local_toml() {
+    let dir = tempfile::TempDir::new().expect("temp project dir");
+    let src_dir = tempfile::TempDir::new().expect("temp source dir");
+    let abspath = std::fs::canonicalize(src_dir.path()).expect("canonicalize source dir");
+
+    with_cwd(dir.path(), || {
+        run_add(
+            src_dir.path().to_str().expect("utf8 source path"),
+            Some("linked".to_owned()),
+            None,
+            None,
+            None,
+            false,
+            true,
+        )
+        .expect("run_add --symlink must succeed for an existing dir");
+    });
+
+    let overlay = std::fs::read_to_string(dir.path().join("phora.local.toml"))
+        .expect("--symlink must write phora.local.toml in the cwd");
+    let src = source_from(&overlay, "linked");
+    assert_eq!(
+        src.path.as_deref(),
+        Some(abspath.to_string_lossy().as_ref()),
+        "--symlink must persist path = <canonical abspath>, got:\n{overlay}"
+    );
+    assert_eq!(
+        src.deploy,
+        Some(DeployMode::Link),
+        "--symlink must persist deploy = \"link\", got:\n{overlay}"
+    );
+}
+
+#[test]
+fn add_local_infers_name_from_path_basename() {
+    let dir = tempfile::TempDir::new().expect("temp project dir");
+    let parent = tempfile::TempDir::new().expect("temp parent dir");
+    let src_dir = parent.path().join("widgets");
+    std::fs::create_dir(&src_dir).expect("create named source dir");
+    let abspath = std::fs::canonicalize(&src_dir).expect("canonicalize source dir");
+    let basename = abspath
+        .file_name()
+        .expect("canonical path has a basename")
+        .to_string_lossy()
+        .into_owned();
+
+    with_cwd(dir.path(), || {
+        run_add(
+            src_dir.to_str().expect("utf8 source path"),
+            None,
+            None,
+            None,
+            None,
+            true,
+            false,
+        )
+        .expect("run_add --local with no --name must succeed");
+    });
+
+    let overlay = std::fs::read_to_string(dir.path().join("phora.local.toml"))
+        .expect("--local must write phora.local.toml");
+    let config = Config::parse(&overlay).expect("overlay must parse");
+    assert!(
+        config.sources.contains_key(&basename),
+        "omitting --name must key the source by the canonical basename `{basename}`, got keys: {:?}",
+        config.sources.keys().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn add_symlink_implies_local_overlay_and_is_valid() {
+    let dir = tempfile::TempDir::new().expect("temp project dir");
+    let src_dir = tempfile::TempDir::new().expect("temp source dir");
+    let abspath = std::fs::canonicalize(src_dir.path()).expect("canonicalize source dir");
+
+    with_cwd(dir.path(), || {
+        run_add(
+            src_dir.path().to_str().expect("utf8 source path"),
+            Some("app".to_owned()),
+            None,
+            None,
+            None,
+            false,
+            true,
+        )
+        .expect("run_add --symlink must succeed");
+    });
+
+    let overlay = std::fs::read_to_string(dir.path().join("phora.local.toml"))
+        .expect("--symlink alone must write phora.local.toml");
+    let parsed = parsed_source_from(&overlay, "app");
+    assert_eq!(
+        parsed.deploy_mode(),
+        DeployMode::Link,
+        "the typed overlay source must report deploy_mode == Link"
+    );
+    match &parsed.remote {
+        Remote::Path(p) => assert_eq!(
+            p.as_str(),
+            abspath.to_string_lossy().as_ref(),
+            "the typed overlay source must carry Remote::Path(<abspath>)"
+        ),
+        other => panic!("--symlink must produce a Remote::Path, got {other:?}"),
+    }
+}
+
+#[test]
+fn add_local_and_symlink_together_equals_symlink() {
+    let src_dir = tempfile::TempDir::new().expect("temp source dir");
+    let abspath = std::fs::canonicalize(src_dir.path()).expect("canonicalize source dir");
+
+    let overlay_for = |local: bool, symlink: bool| -> String {
+        let dir = tempfile::TempDir::new().expect("temp project dir");
+        with_cwd(dir.path(), || {
+            run_add(
+                src_dir.path().to_str().expect("utf8 source path"),
+                Some("s".to_owned()),
+                None,
+                None,
+                None,
+                local,
+                symlink,
+            )
+            .expect("run_add must not error");
+        });
+        std::fs::read_to_string(dir.path().join("phora.local.toml"))
+            .expect("must write phora.local.toml")
+    };
+
+    let symlink_only = overlay_for(false, true);
+    let both = overlay_for(true, true);
+
+    let symlink_src = source_from(&symlink_only, "s");
+    let both_src = source_from(&both, "s");
+
+    assert_eq!(
+        both_src.path.as_deref(),
+        Some(abspath.to_string_lossy().as_ref()),
+        "both-flags path must equal the canonical abspath, got:\n{both}"
+    );
+    assert_eq!(
+        symlink_src.path.as_deref(),
+        Some(abspath.to_string_lossy().as_ref()),
+        "symlink-only path must equal the canonical abspath, got:\n{symlink_only}"
+    );
+    assert_eq!(
+        both_src.deploy,
+        Some(DeployMode::Link),
+        "both-flags must deploy = \"link\", got:\n{both}"
+    );
+    assert_eq!(
+        symlink_src.deploy,
+        Some(DeployMode::Link),
+        "symlink-only must deploy = \"link\", got:\n{symlink_only}"
+    );
+    assert_eq!(
+        both_src.path, symlink_src.path,
+        "local+symlink together must yield the same path source as --symlink alone"
+    );
+    assert_eq!(
+        both_src.deploy, symlink_src.deploy,
+        "local+symlink together must yield the same deploy as --symlink alone"
+    );
+}
+
+#[test]
+fn add_without_flags_still_writes_phora_toml() {
+    let dir = tempfile::TempDir::new().expect("temp project dir");
+
+    with_cwd(dir.path(), || {
+        run_add(
+            "github:srnnkls/tropos",
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        )
+        .expect("run_add with no overlay flags must keep its remote behavior");
+    });
+
+    let written = std::fs::read_to_string(dir.path().join("phora.toml"))
+        .expect("no-flags add must write phora.toml");
+    let src = source_from(&written, "tropos");
+    assert_eq!(
+        src.host.as_deref(),
+        Some("github"),
+        "no-flags add must persist the remote host, got:\n{written}"
+    );
+    assert!(
+        src.path.is_none(),
+        "no-flags add must not write a path source, got:\n{written}"
+    );
+    assert!(
+        !dir.path().join("phora.local.toml").exists(),
+        "no-flags add must not create phora.local.toml"
+    );
+}
+
+#[test]
+fn add_local_canonicalizes_relative_path_to_absolute() {
+    let dir = tempfile::TempDir::new().expect("temp project dir");
+    std::fs::create_dir(dir.path().join("sub")).expect("create relative subdir");
+    let expected = std::fs::canonicalize(dir.path().join("sub")).expect("canonicalize subdir");
+
+    with_cwd(dir.path(), || {
+        run_add("sub", Some("s".to_owned()), None, None, None, true, false)
+            .expect("run_add --local must accept a relative existing path");
+    });
+
+    let overlay = std::fs::read_to_string(dir.path().join("phora.local.toml"))
+        .expect("--local must write phora.local.toml");
+    let src = source_from(&overlay, "s");
+    let written = src.path.expect("a path source must be written");
+    assert!(
+        std::path::Path::new(&written).is_absolute(),
+        "a relative input must be written as an absolute path, got `{written}`"
+    );
+    assert_eq!(
+        written,
+        expected.to_string_lossy(),
+        "the written path must equal std::fs::canonicalize of the relative input"
+    );
+}
+
+#[test]
+fn add_local_errors_when_path_does_not_exist() {
+    let dir = tempfile::TempDir::new().expect("temp project dir");
+    let missing = "does-not-exist-xyz";
+
+    let err = with_cwd(dir.path(), || {
+        run_add(missing, Some("s".to_owned()), None, None, None, true, false)
+            .expect_err("--local on a nonexistent path must error")
+    });
+
+    assert!(
+        matches!(err, Error::Config(_)),
+        "a missing local path must yield Error::Config, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains(missing),
+        "the error message must name the offending path `{missing}`, got: {err}"
+    );
+    assert!(
+        !dir.path().join("phora.local.toml").exists(),
+        "a failed --local must not create phora.local.toml"
+    );
+    assert!(
+        !dir.path().join("phora.toml").exists(),
+        "a failed --local must not create phora.toml"
+    );
+}
+
+#[test]
+fn add_local_rejects_non_directory_path() {
+    let dir = tempfile::TempDir::new().expect("temp project dir");
+    let file = dir.path().join("a-file");
+    std::fs::write(&file, b"not a dir").expect("create regular file");
+    let file_str = file.to_str().expect("utf8 file path").to_owned();
+
+    let err = with_cwd(dir.path(), || {
+        run_add(
+            &file_str,
+            Some("s".to_owned()),
+            None,
+            None,
+            None,
+            true,
+            false,
+        )
+        .expect_err("--local on a regular file must error")
+    });
+
+    assert!(
+        matches!(err, Error::Config(_)),
+        "a non-directory local path must yield Error::Config, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains(&file_str),
+        "the error message must name the offending file path `{file_str}`, got: {err}"
+    );
+    assert!(
+        !dir.path().join("phora.local.toml").exists(),
+        "a failed --local must not create phora.local.toml"
+    );
+    assert!(
+        !dir.path().join("phora.toml").exists(),
+        "a failed --local must not create phora.toml"
+    );
+}
+
+#[test]
+fn add_local_preserves_siblings_and_replaces_same_name_in_overlay() {
+    let dir = tempfile::TempDir::new().expect("temp project dir");
+    std::fs::write(
+        dir.path().join("phora.local.toml"),
+        "version = 1\n\n[sources.other]\ngit = \"https://example.com/other.git\"\n",
+    )
+    .expect("seed an existing overlay with a sibling source");
+
+    let first = tempfile::TempDir::new().expect("temp first source dir");
+    let second = tempfile::TempDir::new().expect("temp second source dir");
+    let second_abs = std::fs::canonicalize(second.path()).expect("canonicalize second dir");
+
+    with_cwd(dir.path(), || {
+        run_add(
+            first.path().to_str().expect("utf8"),
+            Some("mine".to_owned()),
+            None,
+            None,
+            None,
+            true,
+            false,
+        )
+        .expect("adding a new overlay source must succeed");
+    });
+
+    let after_add = std::fs::read_to_string(dir.path().join("phora.local.toml"))
+        .expect("overlay still present after add");
+    let config = Config::parse(&after_add).expect("overlay parses after add");
+    assert!(
+        config.sources.contains_key("other"),
+        "adding a new overlay source must preserve the sibling `other`, got:\n{after_add}"
+    );
+    assert!(
+        config.sources.contains_key("mine"),
+        "the new source `mine` must be present, got:\n{after_add}"
+    );
+
+    with_cwd(dir.path(), || {
+        run_add(
+            second.path().to_str().expect("utf8"),
+            Some("mine".to_owned()),
+            None,
+            None,
+            None,
+            true,
+            false,
+        )
+        .expect("re-adding the same name must succeed");
+    });
+
+    let after_replace = std::fs::read_to_string(dir.path().join("phora.local.toml"))
+        .expect("overlay present after replace");
+    let replaced = source_from(&after_replace, "mine");
+    assert_eq!(
+        replaced.path.as_deref(),
+        Some(second_abs.to_string_lossy().as_ref()),
+        "re-adding the same name must replace its path with the new dir, got:\n{after_replace}"
+    );
+    assert!(
+        Config::parse(&after_replace)
+            .expect("overlay parses after replace")
+            .sources
+            .contains_key("other"),
+        "replacing one source must leave the sibling `other` intact, got:\n{after_replace}"
+    );
+}
+
+#[test]
+fn add_symlink_overlay_overrides_base_source_after_merge() {
+    let dir = tempfile::TempDir::new().expect("temp project dir");
+    std::fs::write(
+        dir.path().join("phora.toml"),
+        "version = 1\n\n[sources.app]\nhost = \"github\"\nrepo = \"srnnkls/app\"\n",
+    )
+    .expect("seed base phora.toml with a forge source");
+
+    let src_dir = tempfile::TempDir::new().expect("temp source dir");
+    let abspath = std::fs::canonicalize(src_dir.path()).expect("canonicalize source dir");
+
+    with_cwd(dir.path(), || {
+        run_add(
+            src_dir.path().to_str().expect("utf8"),
+            Some("app".to_owned()),
+            None,
+            None,
+            None,
+            false,
+            true,
+        )
+        .expect("--symlink --name app must write the overlay");
+    });
+
+    let base = Config::parse(
+        &std::fs::read_to_string(dir.path().join("phora.toml")).expect("base phora.toml present"),
+    )
+    .expect("base config parses");
+    let overlay = Config::parse(
+        &std::fs::read_to_string(dir.path().join("phora.local.toml"))
+            .expect("overlay phora.local.toml present"),
+    )
+    .expect("overlay config parses");
+
+    let merged = crate::config::merge_configs(base, Some(overlay));
+    let effective = merged
+        .sources
+        .get("app")
+        .expect("merged config must keep source `app`");
+    assert_eq!(
+        effective.path.as_deref(),
+        Some(abspath.to_string_lossy().as_ref()),
+        "the overlay path must win over the base forge source after merge"
+    );
+    assert_eq!(
+        effective.deploy,
+        Some(DeployMode::Link),
+        "the overlay deploy = link must win after merge"
     );
 }
