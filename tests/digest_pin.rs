@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::Command;
 
 use phora::config::Refspec;
-use phora::matcher::PathMatcher;
+use phora::kernel::Selection;
 use phora::source::{GitBackend, SourceBackend};
 use tempfile::TempDir;
 
@@ -79,9 +79,9 @@ fn build_fixture() -> DigestFixture {
     }
 }
 
-fn matcher(include: &[&str], exclude: &[&str]) -> PathMatcher {
+fn selection(include: &[&str], exclude: &[&str]) -> Selection {
     let to_vec = |xs: &[&str]| xs.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
-    PathMatcher::new(&to_vec(include), &to_vec(exclude)).expect("matcher builds")
+    Selection::new(&to_vec(include), &to_vec(exclude)).expect("selection builds")
 }
 
 fn digest(
@@ -97,7 +97,7 @@ fn digest(
             &fixture.url,
             &fixture.commit,
             root.map(Path::new),
-            &matcher(include, exclude),
+            &selection(include, exclude),
         )
         .expect("compute_digest succeeds")
 }

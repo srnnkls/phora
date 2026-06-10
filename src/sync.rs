@@ -8,8 +8,8 @@ use crate::config::{
     Config, DeployMode, LayoutKind, Protocol, Source, SourceMode, Target, merge_configs,
 };
 use crate::error::{Error, Result};
+use crate::kernel::Selection;
 use crate::lock::{Lock, LockedSource, merge_locks, source_matches, split_locks};
-use crate::matcher::PathMatcher;
 use crate::projection::{
     ArtifactState, Journal, check_artifact_state, deploy_artifact, link_artifact, recovery_sweep,
 };
@@ -267,9 +267,9 @@ fn deploy_target(
         })?;
         let commit = &run.commits[source_name];
         let git = remote_for(run.remotes, source_name)?;
-        let matcher = PathMatcher::new(source.includes(), source.excludes())?;
+        let selection = Selection::new(source.includes(), source.excludes())?;
         let discovered =
-            discover_artifacts_for_source(source, git, source_name, commit, backend, &matcher)?;
+            discover_artifacts_for_source(source, git, source_name, commit, backend, &selection)?;
 
         for artifact_name in discovered {
             if layout.kind == LayoutKind::Flat {
@@ -296,7 +296,7 @@ fn deploy_target(
                 git,
                 source_name,
                 commit,
-                matcher: &matcher,
+                selection: &selection,
                 artifact_name: &artifact_name,
                 target_path: &target_path,
                 layout_kind: layout.kind,
@@ -315,7 +315,7 @@ struct ArtifactEntry<'a> {
     git: &'a str,
     source_name: &'a str,
     commit: &'a str,
-    matcher: &'a PathMatcher,
+    selection: &'a Selection,
     artifact_name: &'a str,
     target_path: &'a Path,
     layout_kind: LayoutKind,
@@ -373,7 +373,7 @@ fn deploy_artifact_entry(
                 git: entry.git,
                 source_name: entry.source_name,
                 commit: entry.commit,
-                matcher: entry.matcher,
+                selection: entry.selection,
                 artifact_name: entry.artifact_name,
                 artifact_dst: &artifact_dst,
                 key,
@@ -495,9 +495,9 @@ fn resolve_sources(
             }
         };
 
-        let matcher = PathMatcher::new(source.includes(), source.excludes())?;
+        let selection = Selection::new(source.includes(), source.excludes())?;
         let digest =
-            backend.compute_digest(name, git, &commit, source.root.as_deref(), &matcher)?;
+            backend.compute_digest(name, git, &commit, source.root.as_deref(), &selection)?;
 
         let resolved = if source.mode() == SourceMode::Url {
             "url".to_owned()
@@ -528,7 +528,7 @@ struct DeployContext<'a> {
     git: &'a str,
     source_name: &'a str,
     commit: &'a str,
-    matcher: &'a PathMatcher,
+    selection: &'a Selection,
     artifact_name: &'a str,
     artifact_dst: &'a Path,
     key: ArtifactKey,
@@ -553,7 +553,7 @@ fn deploy_one(
         commit: ctx.commit,
         root: ctx.source.root.as_deref(),
         artifact: ctx.artifact_name,
-        matcher: ctx.matcher,
+        selection: ctx.selection,
         policy: &policy,
         staging_dir: &staging,
         commit_time,
@@ -680,12 +680,12 @@ fn remove_orphan_path(path: &Path) -> std::io::Result<()> {
 
 /// Discover artifact directories by scanning the live working tree at
 /// `<git>/<root>` (Link mode). Mirrors the ODB `discover_artifacts`: only
-/// directory entries become artifacts, dotfiles are skipped, the matcher gates
-/// inclusion, and the result is sorted. A missing path/root is an error.
+/// directory entries become artifacts, `Selection` gates inclusion (the dotfile
+/// opt-in lives there), and the result is sorted. A missing path/root is an error.
 fn discover_working_tree(
     git: &Path,
     root: Option<&Path>,
-    matcher: &PathMatcher,
+    selection: &Selection,
 ) -> Result<Vec<String>> {
     let base = root.map_or_else(|| git.to_path_buf(), |r| git.join(r));
     let entries = std::fs::read_dir(&base)
@@ -696,7 +696,7 @@ fn discover_working_tree(
         let entry =
             entry.map_err(|e| Error::Sync(format!("read entry in {}: {e}", base.display())))?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') || !matcher.allows_artifact(&name) {
+        if !selection.selects_artifact(&name) {
             continue;
         }
         if entry.file_type()?.is_dir() {
@@ -714,12 +714,14 @@ fn discover_artifacts_for_source(
     source_name: &str,
     commit: &str,
     backend: &dyn SourceBackend,
-    matcher: &PathMatcher,
+    selection: &Selection,
 ) -> Result<Vec<String>> {
     match source.deploy_mode() {
-        DeployMode::Link => discover_working_tree(Path::new(git), source.root.as_deref(), matcher),
+        DeployMode::Link => {
+            discover_working_tree(Path::new(git), source.root.as_deref(), selection)
+        }
         DeployMode::Copy => {
-            backend.discover_artifacts(source_name, git, commit, source.root.as_deref(), matcher)
+            backend.discover_artifacts(source_name, git, commit, source.root.as_deref(), selection)
         }
     }
 }
@@ -739,9 +741,15 @@ fn prune_orphans(
             })?;
             let commit = &resolved_commits[source_name];
             let git = remote_for(remotes, source_name)?;
-            let matcher = PathMatcher::new(source.includes(), source.excludes())?;
-            let discovered =
-                discover_artifacts_for_source(source, git, source_name, commit, backend, &matcher)?;
+            let selection = Selection::new(source.includes(), source.excludes())?;
+            let discovered = discover_artifacts_for_source(
+                source,
+                git,
+                source_name,
+                commit,
+                backend,
+                &selection,
+            )?;
             for artifact in discovered {
                 expected.insert(ArtifactKey {
                     target: target_name.clone(),
@@ -926,10 +934,16 @@ pub fn rebuild_registry(
             })?;
             let commit = &locked.commit;
             let git = remote_for(&remotes, source_name)?;
-            let matcher = PathMatcher::new(source.includes(), source.excludes())?;
+            let selection = Selection::new(source.includes(), source.excludes())?;
             let policy = source.export_policy();
-            let discovered =
-                discover_artifacts_for_source(source, git, source_name, commit, backend, &matcher)?;
+            let discovered = discover_artifacts_for_source(
+                source,
+                git,
+                source_name,
+                commit,
+                backend,
+                &selection,
+            )?;
 
             for artifact in discovered {
                 let key = ArtifactKey {
@@ -952,7 +966,7 @@ pub fn rebuild_registry(
                         git,
                         source_name,
                         commit,
-                        matcher: &matcher,
+                        selection: &selection,
                         policy: &policy,
                         artifact: &artifact,
                         artifact_dst: &artifact_dst,
@@ -982,7 +996,7 @@ struct RebuildOne<'a> {
     git: &'a str,
     source_name: &'a str,
     commit: &'a str,
-    matcher: &'a PathMatcher,
+    selection: &'a Selection,
     policy: &'a crate::source::ExportPolicy,
     artifact: &'a str,
     artifact_dst: &'a Path,
@@ -999,7 +1013,7 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         git,
         source_name,
         commit,
-        matcher,
+        selection,
         policy,
         artifact,
         artifact_dst,
@@ -1019,7 +1033,7 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         commit,
         root: source.root.as_deref(),
         artifact,
-        matcher,
+        selection,
         policy,
         staging_dir: &staging,
         commit_time,
@@ -1394,11 +1408,11 @@ mod tests {
             url: &str,
             commit: &str,
             root: Option<&Path>,
-            matcher: &crate::matcher::PathMatcher,
+            selection: &crate::kernel::Selection,
         ) -> Result<Vec<String>> {
             self.discovers.set(self.discovers.get() + 1);
             self.inner
-                .discover_artifacts(source, url, commit, root, matcher)
+                .discover_artifacts(source, url, commit, root, selection)
         }
 
         fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult> {
@@ -1412,11 +1426,11 @@ mod tests {
             url: &str,
             commit: &str,
             root: Option<&Path>,
-            matcher: &crate::matcher::PathMatcher,
+            selection: &crate::kernel::Selection,
         ) -> Result<String> {
             self.digests.set(self.digests.get() + 1);
             self.inner
-                .compute_digest(source, url, commit, root, matcher)
+                .compute_digest(source, url, commit, root, selection)
         }
     }
 
@@ -1457,7 +1471,7 @@ mod tests {
     }
 
     fn expected_digest(fx: &SyncFixture, name: &str, commit: &str) -> String {
-        let m = crate::matcher::PathMatcher::new(&[], &[]).expect("empty matcher builds");
+        let m = crate::kernel::Selection::new(&[], &[]).expect("empty matcher builds");
         fx.backend
             .compute_digest(name, &fx.url, commit, None, &m)
             .expect("digest computes over fixture tree")
@@ -1471,7 +1485,7 @@ mod tests {
         name: &str,
         commit: &str,
     ) -> String {
-        let m = crate::matcher::PathMatcher::new(source.includes(), source.excludes())
+        let m = crate::kernel::Selection::new(source.includes(), source.excludes())
             .expect("source matcher builds");
         fx.backend
             .compute_digest(name, &fx.url, commit, source.root.as_deref(), &m)
@@ -1964,10 +1978,10 @@ mod tests {
             url: &str,
             commit: &str,
             root: Option<&Path>,
-            matcher: &crate::matcher::PathMatcher,
+            selection: &crate::kernel::Selection,
         ) -> Result<Vec<String>> {
             self.inner
-                .discover_artifacts(source, url, commit, root, matcher)
+                .discover_artifacts(source, url, commit, root, selection)
         }
         fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult> {
             if req.artifact == self.fail_artifact {
@@ -1984,10 +1998,10 @@ mod tests {
             url: &str,
             commit: &str,
             root: Option<&Path>,
-            matcher: &crate::matcher::PathMatcher,
+            selection: &crate::kernel::Selection,
         ) -> Result<String> {
             self.inner
-                .compute_digest(source, url, commit, root, matcher)
+                .compute_digest(source, url, commit, root, selection)
         }
     }
 
@@ -2425,7 +2439,7 @@ mod tests {
             interactive: false,
             resolver: None,
         };
-        let matcher = PathMatcher::new(source.includes(), source.excludes()).expect("matcher");
+        let selection = Selection::new(source.includes(), source.excludes()).expect("selection");
         let entry = ArtifactEntry {
             source,
             git: remotes
@@ -2433,7 +2447,7 @@ mod tests {
                 .expect("resolved_remotes covers every source"),
             source_name: "editor-src",
             commit: &fx.head_sha,
-            matcher: &matcher,
+            selection: &selection,
             artifact_name: "editor",
             target_path: &target.expanded_path(),
             layout_kind: LayoutKind::Flat,
@@ -2777,10 +2791,10 @@ mod tests {
             url: &str,
             commit: &str,
             root: Option<&Path>,
-            matcher: &crate::matcher::PathMatcher,
+            selection: &crate::kernel::Selection,
         ) -> Result<Vec<String>> {
             self.inner
-                .discover_artifacts(source, url, commit, root, matcher)
+                .discover_artifacts(source, url, commit, root, selection)
         }
         fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult> {
             if req.artifact == self.fail_artifact {
@@ -2800,10 +2814,10 @@ mod tests {
             url: &str,
             commit: &str,
             root: Option<&Path>,
-            matcher: &crate::matcher::PathMatcher,
+            selection: &crate::kernel::Selection,
         ) -> Result<String> {
             self.inner
-                .compute_digest(source, url, commit, root, matcher)
+                .compute_digest(source, url, commit, root, selection)
         }
     }
 
@@ -3316,10 +3330,10 @@ mod tests {
             url: &str,
             commit: &str,
             root: Option<&Path>,
-            matcher: &crate::matcher::PathMatcher,
+            selection: &crate::kernel::Selection,
         ) -> Result<Vec<String>> {
             self.inner
-                .discover_artifacts(source, url, commit, root, matcher)
+                .discover_artifacts(source, url, commit, root, selection)
         }
         fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult> {
             self.inner.export_artifact(req)
@@ -3330,10 +3344,10 @@ mod tests {
             url: &str,
             commit: &str,
             root: Option<&Path>,
-            matcher: &crate::matcher::PathMatcher,
+            selection: &crate::kernel::Selection,
         ) -> Result<String> {
             self.inner
-                .compute_digest(source, url, commit, root, matcher)
+                .compute_digest(source, url, commit, root, selection)
         }
     }
 
@@ -3941,8 +3955,8 @@ mod tests {
         td
     }
 
-    fn match_all() -> PathMatcher {
-        PathMatcher::new(&[], &[]).expect("empty matcher")
+    fn match_all() -> Selection {
+        Selection::new(&[], &[]).expect("empty matcher")
     }
 
     #[test]
@@ -3993,9 +4007,9 @@ mod tests {
     #[test]
     fn worktree_scan_honors_matcher_exclude() {
         let wt = build_worktree(None);
-        let matcher = PathMatcher::new(&[], &["zeta".to_owned()]).expect("exclude matcher");
+        let selection = Selection::new(&[], &["zeta".to_owned()]).expect("exclude selection");
 
-        let found = discover_working_tree(wt.path(), None, &matcher)
+        let found = discover_working_tree(wt.path(), None, &selection)
             .expect("scan with an exclude must succeed");
 
         assert_eq!(
@@ -5169,10 +5183,10 @@ mod tests {
             url: &str,
             commit: &str,
             root: Option<&Path>,
-            matcher: &crate::matcher::PathMatcher,
+            selection: &crate::kernel::Selection,
         ) -> Result<Vec<String>> {
             self.inner
-                .discover_artifacts(source, url, commit, root, matcher)
+                .discover_artifacts(source, url, commit, root, selection)
         }
         fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult> {
             self.inner.export_artifact(req)
@@ -5183,10 +5197,10 @@ mod tests {
             url: &str,
             commit: &str,
             root: Option<&Path>,
-            matcher: &crate::matcher::PathMatcher,
+            selection: &crate::kernel::Selection,
         ) -> Result<String> {
             self.inner
-                .compute_digest(source, url, commit, root, matcher)
+                .compute_digest(source, url, commit, root, selection)
         }
     }
 
@@ -5462,10 +5476,10 @@ mod tests {
             url: &str,
             commit: &str,
             root: Option<&Path>,
-            matcher: &crate::matcher::PathMatcher,
+            selection: &crate::kernel::Selection,
         ) -> Result<Vec<String>> {
             self.inner
-                .discover_artifacts(source, url, commit, root, matcher)
+                .discover_artifacts(source, url, commit, root, selection)
         }
         fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult> {
             self.inner.export_artifact(req)
@@ -5476,10 +5490,10 @@ mod tests {
             url: &str,
             commit: &str,
             root: Option<&Path>,
-            matcher: &crate::matcher::PathMatcher,
+            selection: &crate::kernel::Selection,
         ) -> Result<String> {
             self.inner
-                .compute_digest(source, url, commit, root, matcher)
+                .compute_digest(source, url, commit, root, selection)
         }
     }
 

@@ -8,9 +8,8 @@ use clap::{Parser, Subcommand};
 
 use crate::config::{Config, Host, Source, SourceMode, builtin_forges};
 use crate::error::{Error, Result};
-use crate::kernel::Digest;
+use crate::kernel::{Digest, Selection};
 use crate::lock::{Lock, merge_locks};
-use crate::matcher::PathMatcher;
 use crate::paths::{ProjectId, phora_dir};
 use crate::projection::{ArtifactState, check_artifact_state};
 use crate::registry::{FileRegistry, Registry};
@@ -599,7 +598,7 @@ pub fn where_cmd(registry: &dyn Registry, filter: &WhereFilter) -> Result<Vec<Wh
 /// Reports artifact-level and path-level allow decisions for `path` under `source`.
 #[must_use]
 pub fn check_match_cmd(source: &Source, path: &str) -> CheckMatchReport {
-    let Ok(matcher) = PathMatcher::new(source.includes(), source.excludes()) else {
+    let Ok(selection) = Selection::new(source.includes(), source.excludes()) else {
         return CheckMatchReport {
             artifact_allowed: false,
             path_allowed: false,
@@ -607,8 +606,8 @@ pub fn check_match_cmd(source: &Source, path: &str) -> CheckMatchReport {
     };
     let artifact = path.split('/').next().unwrap_or(path);
     CheckMatchReport {
-        artifact_allowed: matcher.allows_artifact(artifact),
-        path_allowed: matcher.allows_path(Path::new(path), false),
+        artifact_allowed: selection.selects_artifact(artifact),
+        path_allowed: selection.selects_path(Path::new(path), false),
     }
 }
 
