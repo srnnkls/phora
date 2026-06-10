@@ -3,17 +3,17 @@ checkpoint:
   scope_path: ./scopes/active/architecture-cleanup
   branch: chore/architecture-cleanup
   base: main
-  last_commit: f156079
-  last_batch: 4
+  last_commit: af20620
+  last_batch: 5
   tasks:
-    done: [ARCH-000, ARCH-001, ARCH-002, ARCH-003, ARCH-004, ARCH-005, ARCH-006, ARCH-007, ARCH-008, ARCH-009]
-    pending: [ARCH-010, ARCH-011, ARCH-012, ARCH-013]
+    done: [ARCH-000, ARCH-001, ARCH-002, ARCH-003, ARCH-004, ARCH-005, ARCH-006, ARCH-007, ARCH-008, ARCH-009, ARCH-010]
+    pending: [ARCH-011, ARCH-012, ARCH-013]
   next_batch:
-    number: 5
-    tasks: [ARCH-010]   # split cli.rs (2640 lines) into cli/ per command family + one render path. Depends on ARCH-009 (done). ARCH-011 (relocate) sequences after to avoid churn overlap.
+    number: 6
+    tasks: [ARCH-011]   # relocate: projection->deploy/, registry->store/, matcher->kernel/selection, config.rs->config/, paths.rs->kernel/path. Depends on ARCH-002 (done). Pure file moves + path fixups; mechanical/zero-churn. NOTE: gix-confinement grep currently reads against flat source.rs — ARCH-011 may move source.rs into source/; update the grep rule accordingly. ARCH-012/013 are optional stretch (per-context errors / crate split) — descope freely.
   phase: phase-3-internals
-  selection_seam: "src/kernel/selection.rs::Selection — sole artifact-membership + dotfile policy; consumed by source.rs (git discovery), sync.rs (link discovery + foreign scan), cli.rs (check-match)"
-  layout_note: "sync/ now a DIR (mod+resolve+discover+target+prune+verify+rebuild+tests) after ARCH-009. Still flat: src/source.rs, src/archive.rs, src/backend.rs, src/cli.rs. cli/ split is ARCH-010; source/ etc. relocation is ARCH-011. gix-confinement grep still reads against flat source.rs."
+  selection_seam: "src/kernel/selection.rs::Selection — sole artifact-membership + dotfile policy; consumed by source.rs (git discovery), sync/discover.rs (link discovery + foreign scan), cli/query.rs (check-match)"
+  layout_note: "sync/ a DIR (mod+resolve+discover+target+prune+verify+rebuild+tests) after ARCH-009. cli/ now a DIR (mod+add+render+query+sync+tests) after ARCH-010: render.rs is the sole struct-driven output producer; build_router (in mod.rs) names concrete GitBackend/HttpBackend. Still flat: src/source.rs, src/archive.rs, src/backend.rs, src/config.rs, src/paths.rs, src/projection.rs, src/registry.rs, src/matcher.rs — these are ARCH-011's relocation targets. gix-confinement grep still reads against flat source.rs."
   invariants:
     - "ZERO lock churn: source-level content_digest byte-identical (ARCH-004 property test pins it; do not touch digest domain)"
     - "Phase 1 behavior-identical save 3 documented exceptions: dotfile opt-in, orphan-prune fix, check-match dotfile output"
@@ -23,6 +23,7 @@ checkpoint:
   incidents:
     - "ARCH-005: a review subagent's `git checkout src/config.rs` wiped the implementer's UNCOMMITTED config.rs work. Lesson (followed in batch 3): commit each task/sub-batch before dispatching reviewers; never let a subagent run destructive git on the shared tree (all batch-3 subagents were prohibited from tree-mutating git)."
   review_findings_resolved:
+    - "ARCH-010 (opus+sonnet): gate PASS, approve, no Critical/High/Medium. Both independently reconstructed pre-split cli.rs (HEAD~1) and proved line-for-line prod equivalence across ~50 functions via per-function body diff — only allowed deltas (visibility->pub(super)/pub(crate), redistributed use, module-qualified call/type paths incl. drop_sources' &mut crate::lock::Lock). mod tests block byte-identical in cli/tests.rs. 496 tests, clippy clean, public surface fully re-exported (only external caller main.rs resolves). Only Lows: 10 inline status println! kept outside render.rs (interleaved with control flow, byte-identical to old monolith — out of zero-churn scope, render.rs is the sole STRUCT-DRIVEN producer); declined. No code changes post-review."
     - "ARCH-009 (opus+sonnet): gate PASS, no Critical/High/Medium. Both independently proved production code is line-for-line equivalent (only added pub(super) + redistributed imports) and tests.rs byte-identical to the old mod-body. Only Lows: the two deferrals above + a 'comment explaining TargetRun test-accessibility' suggestion — declined (house style forbids narration comments; no correctness impact). No code changes made post-review."
     - "ARCH-008 HIGH (opus): to_gix_entry_kind helper was inserted between import_tree's rustdoc and its signature, orphaning the doc. Fixed: relocated helper above the doc block; renamed blob_kind_to_gix->to_gix_entry_kind (Link is not a blob)."
     - "ARCH-007 MED (opus+sonnet): SourceCtx was constructed-then-immediately-destructured at 2/5 dispatch sites = dead churn. Resolved: deferred the bundle to ARCH-009 (the unified discovery path is its real consumer); removed the dead struct. Ports note kept (acceptance requires the unsealed doc note)."

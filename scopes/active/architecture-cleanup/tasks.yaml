@@ -124,8 +124,8 @@ tasks:
       - "discover.rs is the single copy+link discovery path over Selection; sync() is a thin pipeline; no behavior change"
 
   - id: ARCH-010
-    content: "Split cli.rs (2598 lines) into cli/ per command family; one render path"
-    status: pending
+    content: "Split cli.rs (2640 lines) into cli/ per command family; one render path"
+    status: done   # zero-churn split (af20620); opus+sonnet confirmed line-for-line prod equivalence + byte-identical tests move. render.rs = sole struct-driven producer (10 inline status lines kept verbatim, interleaved with control flow — out of zero-churn scope). No wire() invented; build_router already names concrete GitBackend/HttpBackend adapters.
     activeForm: "Splitting the CLI"
     depends_on: [ARCH-009]
     acceptance:
