@@ -10,6 +10,70 @@ fn cli_definition_is_valid() {
 }
 
 #[test]
+fn bind_parses_sources_target_and_flags() {
+    use clap::Parser;
+    let cli = Cli::try_parse_from([
+        "phora", "bind", "tools", "prompts", "--to", "claude", "--local",
+    ])
+    .expect("bind with sources, --to, --local must parse");
+    let Command::Bind {
+        sources, to, local, ..
+    } = cli.command
+    else {
+        panic!("expected Command::Bind");
+    };
+    assert_eq!(sources, vec!["tools".to_owned(), "prompts".to_owned()]);
+    assert_eq!(to, "claude");
+    assert!(local, "--local must set local=true");
+}
+
+#[test]
+fn bind_rejects_empty_source_list() {
+    use clap::Parser;
+    Cli::try_parse_from(["phora", "bind", "--to", "claude"])
+        .expect_err("bind with no positional sources must be rejected (required=true)");
+}
+
+#[test]
+fn bind_requires_to() {
+    use clap::Parser;
+    Cli::try_parse_from(["phora", "bind", "tools"])
+        .expect_err("bind without --to must be rejected");
+}
+
+#[test]
+fn unbind_parses_sources_target_and_local() {
+    use clap::Parser;
+    let cli = Cli::try_parse_from(["phora", "unbind", "tools", "--from", "claude", "--local"])
+        .expect("unbind with sources, --from, --local must parse");
+    let Command::Unbind {
+        sources,
+        from,
+        local,
+    } = cli.command
+    else {
+        panic!("expected Command::Unbind");
+    };
+    assert_eq!(sources, vec!["tools".to_owned()]);
+    assert_eq!(from, "claude");
+    assert!(local, "--local must set local=true");
+}
+
+#[test]
+fn unbind_rejects_empty_source_list() {
+    use clap::Parser;
+    Cli::try_parse_from(["phora", "unbind", "--from", "claude"])
+        .expect_err("unbind with no positional sources must be rejected (required=true)");
+}
+
+#[test]
+fn unbind_requires_from() {
+    use clap::Parser;
+    Cli::try_parse_from(["phora", "unbind", "tools"])
+        .expect_err("unbind without --from must be rejected");
+}
+
+#[test]
 fn state_label_renders_linked_artifact_as_linked() {
     assert_eq!(
         state_label(&ArtifactState::Linked),
@@ -1097,6 +1161,7 @@ fn run_add_end_to_end_persists_symbolic_source_to_phora_toml() {
     with_cwd(dir.path(), || {
         run_add(
             "github:srnnkls/tropos",
+            &[],
             None,
             None,
             None,
@@ -1691,6 +1756,7 @@ fn add_local_writes_path_local_path_to_phora_local_toml() {
     with_cwd(dir.path(), || {
         run_add(
             src_dir.path().to_str().expect("utf8 source path"),
+            &[],
             Some("mysrc".to_owned()),
             None,
             None,
@@ -1728,6 +1794,7 @@ fn add_symlink_writes_path_and_deploy_link_to_local_toml() {
     with_cwd(dir.path(), || {
         run_add(
             src_dir.path().to_str().expect("utf8 source path"),
+            &[],
             Some("linked".to_owned()),
             None,
             None,
@@ -1769,6 +1836,7 @@ fn add_local_infers_name_from_path_basename() {
     with_cwd(dir.path(), || {
         run_add(
             src_dir.to_str().expect("utf8 source path"),
+            &[],
             None,
             None,
             None,
@@ -1798,6 +1866,7 @@ fn add_symlink_implies_local_overlay_and_is_valid() {
     with_cwd(dir.path(), || {
         run_add(
             src_dir.path().to_str().expect("utf8 source path"),
+            &[],
             Some("app".to_owned()),
             None,
             None,
@@ -1836,6 +1905,7 @@ fn add_local_and_symlink_together_equals_symlink() {
         with_cwd(dir.path(), || {
             run_add(
                 src_dir.path().to_str().expect("utf8 source path"),
+                &[],
                 Some("s".to_owned()),
                 None,
                 None,
@@ -1892,6 +1962,7 @@ fn add_without_flags_still_writes_phora_toml() {
     with_cwd(dir.path(), || {
         run_add(
             "github:srnnkls/tropos",
+            &[],
             None,
             None,
             None,
@@ -1927,8 +1998,17 @@ fn add_local_canonicalizes_relative_path_to_absolute() {
     let expected = std::fs::canonicalize(dir.path().join("sub")).expect("canonicalize subdir");
 
     with_cwd(dir.path(), || {
-        run_add("sub", Some("s".to_owned()), None, None, None, true, false)
-            .expect("run_add --local must accept a relative existing path");
+        run_add(
+            "sub",
+            &[],
+            Some("s".to_owned()),
+            None,
+            None,
+            None,
+            true,
+            false,
+        )
+        .expect("run_add --local must accept a relative existing path");
     });
 
     let overlay = std::fs::read_to_string(dir.path().join("phora.local.toml"))
@@ -1952,8 +2032,17 @@ fn add_local_errors_when_path_does_not_exist() {
     let missing = "does-not-exist-xyz";
 
     let err = with_cwd(dir.path(), || {
-        run_add(missing, Some("s".to_owned()), None, None, None, true, false)
-            .expect_err("--local on a nonexistent path must error")
+        run_add(
+            missing,
+            &[],
+            Some("s".to_owned()),
+            None,
+            None,
+            None,
+            true,
+            false,
+        )
+        .expect_err("--local on a nonexistent path must error")
     });
 
     assert!(
@@ -1984,6 +2073,7 @@ fn add_local_rejects_non_directory_path() {
     let err = with_cwd(dir.path(), || {
         run_add(
             &file_str,
+            &[],
             Some("s".to_owned()),
             None,
             None,
@@ -2028,6 +2118,7 @@ fn add_local_preserves_siblings_and_replaces_same_name_in_overlay() {
     with_cwd(dir.path(), || {
         run_add(
             first.path().to_str().expect("utf8"),
+            &[],
             Some("mine".to_owned()),
             None,
             None,
@@ -2053,6 +2144,7 @@ fn add_local_preserves_siblings_and_replaces_same_name_in_overlay() {
     with_cwd(dir.path(), || {
         run_add(
             second.path().to_str().expect("utf8"),
+            &[],
             Some("mine".to_owned()),
             None,
             None,
@@ -2095,6 +2187,7 @@ fn add_symlink_overlay_overrides_base_source_after_merge() {
     with_cwd(dir.path(), || {
         run_add(
             src_dir.path().to_str().expect("utf8"),
+            &[],
             Some("app".to_owned()),
             None,
             None,
@@ -2129,5 +2222,901 @@ fn add_symlink_overlay_overrides_base_source_after_merge() {
         effective.deploy,
         Some(DeployMode::Link),
         "the overlay deploy = link must win after merge"
+    );
+}
+
+// ── CLI-002 / CLI-003: source + target namespace parsing ───────────
+
+#[test]
+fn source_add_parses_into_source_namespace() {
+    let cli = Cli::try_parse_from(["phora", "source", "add", "github:me/dots"])
+        .expect("`source add <url>` must parse");
+    let Command::Source {
+        cmd: SourceCmd::Add { url, .. },
+    } = cli.command
+    else {
+        panic!("`source add` must route to Command::Source(SourceCmd::Add)");
+    };
+    assert_eq!(
+        url, "github:me/dots",
+        "the positional url must reach SourceCmd::Add.url"
+    );
+}
+
+#[test]
+fn source_add_carries_same_args_as_top_level_add() {
+    let argv = ["github:me/dots", "--branch", "dev", "--root", "sub"];
+
+    let top = Cli::try_parse_from(["phora", "add"].into_iter().chain(argv))
+        .expect("top-level add parses");
+    let Command::Add {
+        url: top_url,
+        name: top_name,
+        branch: top_branch,
+        tag: top_tag,
+        root: top_root,
+        local: top_local,
+        symlink: top_symlink,
+        ..
+    } = top.command
+    else {
+        panic!("expected Command::Add");
+    };
+
+    let sub = Cli::try_parse_from(["phora", "source", "add"].into_iter().chain(argv))
+        .expect("source add parses");
+    let Command::Source {
+        cmd:
+            SourceCmd::Add {
+                url,
+                name,
+                branch,
+                tag,
+                root,
+                local,
+                symlink,
+            },
+    } = sub.command
+    else {
+        panic!("expected SourceCmd::Add");
+    };
+
+    assert_eq!(url, top_url, "url must match top-level `add`");
+    assert_eq!(name, top_name, "name must match top-level `add`");
+    assert_eq!(branch, top_branch, "branch must match top-level `add`");
+    assert_eq!(tag, top_tag, "tag must match top-level `add`");
+    assert_eq!(root, top_root, "root must match top-level `add`");
+    assert_eq!(local, top_local, "local must match top-level `add`");
+    assert_eq!(symlink, top_symlink, "symlink must match top-level `add`");
+}
+
+#[test]
+fn source_rm_parses_name() {
+    let cli = Cli::try_parse_from(["phora", "source", "rm", "dotfiles"])
+        .expect("`source rm <name>` must parse");
+    let Command::Source {
+        cmd: SourceCmd::Rm { name },
+    } = cli.command
+    else {
+        unreachable!("expected SourceCmd::Rm");
+    };
+    assert_eq!(name, "dotfiles", "the positional name must reach Rm.name");
+    assert!(
+        Cli::try_parse_from(["phora", "source", "rm", "dotfiles", "--local"]).is_err(),
+        "--local must be rejected: `source rm` scrubs both files, so file-addressing is meaningless"
+    );
+}
+
+#[test]
+fn source_list_parses() {
+    let cli = Cli::try_parse_from(["phora", "source", "list"]).expect("`source list` must parse");
+    assert!(
+        matches!(
+            cli.command,
+            Command::Source {
+                cmd: SourceCmd::List
+            }
+        ),
+        "`source list` must route to SourceCmd::List, got {cli:?}"
+    );
+}
+
+#[test]
+fn source_show_requires_a_name() {
+    Cli::try_parse_from(["phora", "source", "show"])
+        .expect_err("`source show` with no name must be a parse error");
+    let cli = Cli::try_parse_from(["phora", "source", "show", "dotfiles"])
+        .expect("`source show <name>` must parse");
+    assert!(
+        matches!(
+            &cli.command,
+            Command::Source {
+                cmd: SourceCmd::Show { name }
+            } if name == "dotfiles"
+        ),
+        "`source show <name>` must carry the required name, got {cli:?}"
+    );
+}
+
+#[test]
+fn target_add_requires_path() {
+    Cli::try_parse_from(["phora", "target", "add", "nvim"])
+        .expect_err("`target add <name>` without --path must be a clap-level error");
+    let cli = Cli::try_parse_from(["phora", "target", "add", "nvim", "--path", "~/.config/nvim"])
+        .expect("`target add <name> --path <p>` must parse");
+    assert!(
+        matches!(
+            &cli.command,
+            Command::Target {
+                cmd: TargetCmd::Add { name, path, layout: None, local: false }
+            } if name == "nvim" && path == "~/.config/nvim"
+        ),
+        "target add must carry name + required path with default layout/local, got {cli:?}"
+    );
+}
+
+#[test]
+fn target_add_accepts_layout_and_local() {
+    let cli = Cli::try_parse_from([
+        "phora",
+        "target",
+        "add",
+        "nvim",
+        "--path",
+        "~/x",
+        "--layout",
+        "by-source",
+        "--local",
+    ])
+    .expect("`target add` with --layout and --local must parse");
+    let Command::Target {
+        cmd: TargetCmd::Add { layout, local, .. },
+    } = cli.command
+    else {
+        panic!("expected TargetCmd::Add");
+    };
+    assert_eq!(
+        layout.as_deref(),
+        Some("by-source"),
+        "--layout must reach Add.layout as a string"
+    );
+    assert!(local, "--local must reach Add.local");
+}
+
+#[test]
+fn target_rm_parses_name_and_local() {
+    let cli = Cli::try_parse_from(["phora", "target", "rm", "nvim", "--local"])
+        .expect("`target rm <name> --local` must parse");
+    assert!(
+        matches!(
+            &cli.command,
+            Command::Target {
+                cmd: TargetCmd::Rm { name, local: true }
+            } if name == "nvim"
+        ),
+        "target rm must carry name + local, got {cli:?}"
+    );
+}
+
+#[test]
+fn target_list_parses() {
+    let cli = Cli::try_parse_from(["phora", "target", "list"]).expect("`target list` must parse");
+    assert!(
+        matches!(
+            cli.command,
+            Command::Target {
+                cmd: TargetCmd::List
+            }
+        ),
+        "`target list` must route to TargetCmd::List, got {cli:?}"
+    );
+}
+
+#[test]
+fn target_show_requires_a_name() {
+    Cli::try_parse_from(["phora", "target", "show"])
+        .expect_err("`target show` with no name must be a parse error");
+    let cli = Cli::try_parse_from(["phora", "target", "show", "nvim"])
+        .expect("`target show <name>` must parse");
+    assert!(
+        matches!(
+            &cli.command,
+            Command::Target {
+                cmd: TargetCmd::Show { name }
+            } if name == "nvim"
+        ),
+        "`target show <name>` must carry the required name, got {cli:?}"
+    );
+}
+
+// ── CLI-002: source rm + source show pure helpers ──────────────────
+
+#[test]
+fn source_rm_helper_scrubs_both_files_and_target_arrays() {
+    let main = "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\n\n\
+         [targets.A]\npath = \"~/a\"\nsources = [\"dotfiles\", \"other\"]\n\n\
+         [sources.other]\ngit = \"h\"\n";
+    let local = "version = 1\n\n[targets.B]\npath = \"~/b\"\nsources = [\"dotfiles\"]\n";
+
+    let result =
+        config_edit::remove_source(main, local, "dotfiles").expect("source rm removes dotfiles");
+
+    let main_cfg = Config::parse(&result.main).expect("scrubbed main parses");
+    assert!(
+        !main_cfg.sources.contains_key("dotfiles"),
+        "`source rm dotfiles` must drop [sources.dotfiles] from phora.toml"
+    );
+    assert_eq!(
+        main_cfg
+            .targets
+            .get("A")
+            .expect("target A survives")
+            .sources
+            .as_deref(),
+        Some(["other".to_owned()].as_slice()),
+        "dotfiles must be scrubbed from [targets.A].sources, leaving only other"
+    );
+    let local_cfg = Config::parse(&result.local).expect("scrubbed local parses");
+    assert_eq!(
+        local_cfg
+            .targets
+            .get("B")
+            .expect("target B survives")
+            .sources
+            .as_deref(),
+        Some([].as_slice()),
+        "dotfiles must be scrubbed from [targets.B].sources in phora.local.toml too"
+    );
+}
+
+#[test]
+fn source_rm_helper_unknown_name_errors() {
+    let err = config_edit::remove_source("version = 1\n", "version = 1\n", "ghost")
+        .expect_err("`source rm ghost` must error when ghost is undefined");
+    assert!(
+        matches!(err, Error::Config(msg) if msg.contains("ghost")),
+        "removing an undefined source must Err naming the source"
+    );
+}
+
+fn config_with_targets(toml: &str) -> Config {
+    Config::parse(toml).expect("config under test parses")
+}
+
+#[test]
+fn source_summary_lists_only_targets_that_bind_it_explicitly() {
+    let cfg = config_with_targets(
+        "version = 1\n\n[sources.a]\ngit = \"g\"\n\n[sources.b]\ngit = \"h\"\n\n\
+         [targets.binds_a]\npath = \"~/x\"\nsources = [\"a\"]\n\n\
+         [targets.binds_b]\npath = \"~/y\"\nsources = [\"b\"]\n",
+    );
+
+    let summary = source_summary(&cfg, "a").expect("source a is defined");
+    assert_eq!(summary.name, "a", "the summary must echo the source name");
+    assert_eq!(
+        summary.targets,
+        vec!["binds_a".to_owned()],
+        "only the target whose explicit sources list contains `a` must be listed"
+    );
+}
+
+#[test]
+fn source_summary_no_key_target_receives_nothing() {
+    let cfg = config_with_targets(
+        "version = 1\n\n[sources.a]\ngit = \"g\"\n\n[sources.b]\ngit = \"h\"\n\n\
+         [targets.everything]\npath = \"~/x\"\n",
+    );
+
+    let summary_a = source_summary(&cfg, "a").expect("source a defined");
+    let summary_b = source_summary(&cfg, "b").expect("source b defined");
+    assert!(
+        !summary_a.targets.contains(&"everything".to_owned()),
+        "a target with no `sources` key must NOT receive source a, got {:?}",
+        summary_a.targets
+    );
+    assert!(
+        !summary_b.targets.contains(&"everything".to_owned()),
+        "the same no-key target must NOT receive source b either, got {:?}",
+        summary_b.targets
+    );
+}
+
+#[test]
+fn source_summary_unknown_name_errors() {
+    let cfg = config_with_targets("version = 1\n\n[sources.a]\ngit = \"g\"\n");
+    let err = source_summary(&cfg, "ghost").expect_err("an undefined source must error");
+    assert!(
+        matches!(err, Error::Config(msg) if msg.contains("ghost")),
+        "source show on an undefined name must Err naming it"
+    );
+}
+
+#[test]
+fn targets_receiving_only_lists_explicit_binders() {
+    let cfg = config_with_targets(
+        "version = 1\n\n[sources.a]\ngit = \"g\"\n\n[sources.b]\ngit = \"h\"\n\n\
+         [targets.no_key]\npath = \"~/x\"\n\n\
+         [targets.explicit_b]\npath = \"~/y\"\nsources = [\"b\"]\n",
+    );
+
+    let receiving_a = targets_receiving(&cfg, "a");
+    assert!(
+        !receiving_a.contains(&"no_key".to_owned()),
+        "a target with no `sources` key must NOT receive a, got {receiving_a:?}"
+    );
+    assert!(
+        !receiving_a.contains(&"explicit_b".to_owned()),
+        "a target that explicitly binds only b must NOT receive a, got {receiving_a:?}"
+    );
+
+    let receiving_b = targets_receiving(&cfg, "b");
+    assert!(
+        receiving_b.contains(&"explicit_b".to_owned()),
+        "the explicit binder of b must receive b, got {receiving_b:?}"
+    );
+    assert!(
+        !receiving_b.contains(&"no_key".to_owned()),
+        "the no-key target must NOT receive b, got {receiving_b:?}"
+    );
+}
+
+#[test]
+fn source_listing_rows_carry_name_remote_and_refspec() {
+    let cfg = config_with_targets(
+        "version = 1\n\n[sources.dots]\ngit = \"https://example.com/d.git\"\nbranch = \"dev\"\n",
+    );
+
+    let rows = source_listing(&cfg).expect("source list over the merged config");
+    let row = rows
+        .iter()
+        .find(|r| r.name == "dots")
+        .expect("the dots source must appear as a row");
+    assert_eq!(
+        row.remote, "https://example.com/d.git",
+        "a literal git source's remote must be the verbatim url"
+    );
+    assert_eq!(
+        row.refspec, "dev",
+        "the row must carry the source's refspec (branch dev)"
+    );
+}
+
+#[test]
+fn source_listing_uses_per_source_protocol_override_under_https_default() {
+    let cfg = config_with_targets(
+        "version = 1\nprotocol = \"https\"\n\n\
+         [sources.dots]\nhost = \"github\"\nrepo = \"o/r\"\nprotocol = \"ssh\"\n",
+    );
+
+    let rows = source_listing(&cfg).expect("source list over the merged config");
+    let row = rows
+        .iter()
+        .find(|r| r.name == "dots")
+        .expect("the dots source must appear as a row");
+    assert_eq!(
+        row.remote, "git@github.com:o/r.git",
+        "a source's own ssh protocol must win over the global https default"
+    );
+}
+
+// ── CLI-003: target list + target show pure helpers ────────────────
+
+#[test]
+fn target_listing_derives_explicit_vs_all_resolution_mode() {
+    let cfg = config_with_targets(
+        "version = 1\n\n[sources.a]\ngit = \"g\"\n\n\
+         [targets.explicit]\npath = \"~/e\"\nsources = [\"a\"]\n\n\
+         [targets.implicit]\npath = \"~/i\"\n",
+    );
+
+    let rows = target_listing(&cfg);
+    let explicit = rows
+        .iter()
+        .find(|r| r.name == "explicit")
+        .expect("explicit target row present");
+    assert_eq!(
+        explicit.resolution,
+        SourceResolution::Explicit(vec!["a".to_owned()]),
+        "a target with a sources key must resolve as Explicit with its listed names"
+    );
+    let implicit = rows
+        .iter()
+        .find(|r| r.name == "implicit")
+        .expect("no-key target row present");
+    assert_eq!(
+        implicit.resolution,
+        SourceResolution::Explicit(vec![]),
+        "a target with no sources key resolves to the empty explicit set (receives nothing)"
+    );
+}
+
+#[test]
+fn target_detail_no_key_target_binds_nothing() {
+    let state_dir = TempDir::new().expect("state root");
+    let reg = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let cfg = config_with_targets(
+        "version = 1\n\n[sources.a]\ngit = \"g\"\n\n[sources.b]\ngit = \"h\"\n\n\
+         [targets.everything]\npath = \"~/x\"\n",
+    );
+
+    let detail = target_detail(&cfg, &reg, "everything").expect("target everything is defined");
+    assert!(
+        detail.bound_sources.is_empty(),
+        "a target with no `sources` key binds NO sources, got {:?}",
+        detail.bound_sources
+    );
+}
+
+#[test]
+fn target_detail_reports_per_artifact_deployment_state() {
+    let state_dir = TempDir::new().expect("state root");
+    let reg = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let target_root = TempDir::new().expect("target root");
+    let cfg = config_one_flat_target("dest", "editor-src", target_root.path());
+
+    let mf = deploy_matching_file(target_root.path(), "editor", "init.lua", b"-- init\n");
+    reg.put(&record_for(
+        "dest",
+        "editor-src",
+        "editor",
+        "aaa111",
+        vec![mf],
+    ))
+    .expect("seed a clean record");
+
+    let detail = target_detail(&cfg, &reg, "dest").expect("target dest is defined");
+    let editor = detail
+        .artifacts
+        .iter()
+        .find(|a| a.artifact == "editor")
+        .expect("the editor artifact must appear in target detail");
+    assert_eq!(
+        editor.source, "editor-src",
+        "the artifact row must name its source"
+    );
+    assert!(
+        editor.state.contains('✓') || editor.state.to_lowercase().contains("clean"),
+        "a matching deployment must read Clean in target show, got {:?}",
+        editor.state
+    );
+}
+
+#[test]
+fn target_detail_unknown_name_errors() {
+    let state_dir = TempDir::new().expect("state root");
+    let reg = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let cfg = config_with_targets("version = 1\n\n[targets.real]\npath = \"~/x\"\n");
+    let err = target_detail(&cfg, &reg, "ghost")
+        .expect_err("target show on an undefined name must error");
+    assert!(
+        matches!(err, Error::Config(msg) if msg.contains("ghost")),
+        "target show on an undefined target must Err naming it"
+    );
+}
+
+#[test]
+fn target_has_deployed_artifacts_is_true_when_records_exist() {
+    let (_dir, reg) = seeded_registry();
+    assert!(
+        target_has_deployed_artifacts(&reg, "nvim").expect("predicate reads the registry"),
+        "a target with registry records must report having deployed artifacts (warning path)"
+    );
+}
+
+#[test]
+fn target_has_deployed_artifacts_is_false_for_clean_target() {
+    let (_dir, reg) = seeded_registry();
+    assert!(
+        !target_has_deployed_artifacts(&reg, "never-deployed").expect("predicate reads registry"),
+        "a target with no registry records must report no deployed artifacts (no warning)"
+    );
+}
+
+// CLI-005: add/rm sugar — clap surface + atomic desugar (pure helper).
+
+#[test]
+fn add_parses_repeatable_to_targets() {
+    use clap::Parser;
+    let cli = Cli::try_parse_from([
+        "phora",
+        "add",
+        "https://github.com/me/dots.git",
+        "--to",
+        "a",
+        "--to",
+        "b",
+    ])
+    .expect("add with repeated --to must parse");
+    let Command::Add { url, to, .. } = cli.command else {
+        panic!("expected Command::Add");
+    };
+    assert_eq!(url, "https://github.com/me/dots.git");
+    assert_eq!(
+        to,
+        vec!["a".to_owned(), "b".to_owned()],
+        "repeated --to must collect into to == [a, b]"
+    );
+}
+
+#[test]
+fn add_without_to_parses_empty_targets() {
+    use clap::Parser;
+    let cli = Cli::try_parse_from(["phora", "add", "https://github.com/me/dots.git"])
+        .expect("add with no --to must parse");
+    let Command::Add { to, .. } = cli.command else {
+        panic!("expected Command::Add");
+    };
+    assert!(to.is_empty(), "no --to must leave targets empty");
+}
+
+#[test]
+fn add_without_url_is_rejected() {
+    use clap::Parser;
+    Cli::try_parse_from(["phora", "add"])
+        .expect_err("bare `add` with no url must be a clap missing-arg error");
+}
+
+#[test]
+fn rm_parses_name() {
+    use clap::Parser;
+    let cli = Cli::try_parse_from(["phora", "rm", "dotfiles"]).expect("rm <name> must parse");
+    let Command::Rm { name } = cli.command else {
+        panic!("expected Command::Rm");
+    };
+    assert_eq!(name, "dotfiles");
+}
+
+#[test]
+fn rm_rejects_local_flag() {
+    use clap::Parser;
+    Cli::try_parse_from(["phora", "rm", "dotfiles", "--local"])
+        .expect_err("the `rm` alias must not accept --local (cross-file scrub is file-unsafe)");
+}
+
+#[test]
+fn rm_routes_to_same_scrub_as_source_rm() {
+    // Routing parity: `Command::Rm` and `source rm` both delegate to
+    // config_edit::remove_source, which scrubs the source from both files.
+    let main = "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\n\n\
+         [targets.A]\npath = \"~/a\"\nsources = [\"dotfiles\"]\n";
+    let local = "version = 1\n\n\
+         [targets.B]\npath = \"~/b\"\nsources = [\"dotfiles\"]\n";
+
+    let result = config_edit::remove_source(main, local, "dotfiles")
+        .expect("remove_source scrubs dotfiles from both files");
+
+    let main_cfg = Config::parse(&result.main).expect("scrubbed main is valid toml");
+    let local_cfg = Config::parse(&result.local).expect("scrubbed local is valid toml");
+    assert!(
+        !main_cfg.sources.contains_key("dotfiles"),
+        "the [sources.dotfiles] table must be gone from main"
+    );
+    assert_eq!(
+        main_cfg.targets["A"].sources,
+        Some(vec![]),
+        "dotfiles must be scrubbed from [targets.A].sources in main"
+    );
+    assert_eq!(
+        local_cfg.targets["B"].sources,
+        Some(vec![]),
+        "dotfiles must be scrubbed from [targets.B].sources in local"
+    );
+}
+
+// Pure desugar helper: a single config-text string in, final text or whole Err out.
+
+struct RejectAll;
+
+impl MissingTargetDecider for RejectAll {
+    fn decide(&self, _name: &str, _default_path: &str) -> MissingTarget {
+        MissingTarget::Reject
+    }
+}
+
+struct CreateAtDefault;
+
+impl MissingTargetDecider for CreateAtDefault {
+    fn decide(&self, _name: &str, default_path: &str) -> MissingTarget {
+        MissingTarget::Create {
+            path: default_path.to_owned(),
+        }
+    }
+}
+
+struct CreateAt(&'static str);
+
+impl MissingTargetDecider for CreateAt {
+    fn decide(&self, _name: &str, _default_path: &str) -> MissingTarget {
+        MissingTarget::Create {
+            path: self.0.to_owned(),
+        }
+    }
+}
+
+const TWO_EXPLICIT_TARGETS: &str = "version = 1\n\n\
+     [targets.A]\npath = \"~/a\"\nsources = [\"existing\"]\n\n\
+     [targets.B]\npath = \"~/b\"\nsources = [\"existing\"]\n\n\
+     [sources.existing]\ngit = \"e\"\n";
+
+const NO_KEY_TARGET: &str = "version = 1\n\n\
+     [targets.A]\npath = \"~/a\"\n\n\
+     [sources.existing]\ngit = \"e\"\n";
+
+#[test]
+fn add_with_binds_appends_to_both_targets_and_inserts_source() {
+    let out = add_with_binds(
+        TWO_EXPLICIT_TARGETS,
+        "dots",
+        &lit("https://github.com/me/dots.git", None),
+        None,
+        None,
+        None,
+        &["A".to_owned(), "B".to_owned()],
+        &RejectAll,
+    )
+    .expect("binding dots to two explicit targets must succeed atomically");
+
+    let cfg = Config::parse(&out).expect("returned text is valid phora.toml");
+    assert!(
+        cfg.sources.contains_key("dots"),
+        "[sources.dots] must be inserted"
+    );
+    assert_eq!(
+        cfg.targets["A"].sources,
+        Some(vec!["existing".to_owned(), "dots".to_owned()]),
+        "dots must be appended to target A's sources"
+    );
+    assert_eq!(
+        cfg.targets["B"].sources,
+        Some(vec!["existing".to_owned(), "dots".to_owned()]),
+        "dots must be appended to target B's sources"
+    );
+}
+
+#[test]
+fn add_with_binds_missing_target_errs_with_no_partial_text() {
+    let result = add_with_binds(
+        TWO_EXPLICIT_TARGETS,
+        "dots",
+        &lit("https://github.com/me/dots.git", None),
+        None,
+        None,
+        None,
+        &["A".to_owned(), "ghost".to_owned()],
+        &RejectAll,
+    );
+    let err = result.expect_err("a nonexistent target must fail the whole command");
+    assert!(
+        matches!(&err, Error::Config(msg) if msg.contains("ghost") && msg.contains("phora target add")),
+        "the error must name the missing target and point at `phora target add`, \
+         and by returning Err the helper produces no partial text"
+    );
+}
+
+#[test]
+fn add_with_binds_no_key_target_creates_list() {
+    let out = add_with_binds(
+        NO_KEY_TARGET,
+        "dots",
+        &lit("https://github.com/me/dots.git", None),
+        None,
+        None,
+        None,
+        &["A".to_owned()],
+        &RejectAll,
+    )
+    .expect("binding to a no-key target must succeed, creating its sources list");
+
+    let cfg = Config::parse(&out).expect("returned text is valid phora.toml");
+    assert_eq!(
+        cfg.targets["A"].sources,
+        Some(vec!["dots".to_owned()]),
+        "binding via add sugar to a no-key target must create sources = [\"dots\"]"
+    );
+}
+
+#[test]
+fn run_target_add_rejects_path_unsafe_name() {
+    let err = run_target_add("a/b", "~/x", None, false)
+        .expect_err("a target name containing `/` must be rejected before any write");
+    assert!(
+        err.to_string().contains("unsafe path component"),
+        "name validation must propagate the kernel path-traversal guard error, got: {err}"
+    );
+}
+
+#[test]
+fn add_with_binds_no_targets_equals_plain_source_insert() {
+    let base = "version = 1\n";
+    let source = lit("https://github.com/me/dots.git", None);
+    let out = add_with_binds(base, "dots", &source, None, None, None, &[], &RejectAll)
+        .expect("zero targets must behave as a plain source upsert");
+
+    let expected = config_edit::upsert_source(base, "dots", &source, None, None, None)
+        .expect("baseline plain source upsert");
+    assert_eq!(
+        out, expected,
+        "adding with zero targets must produce byte-identical text to a plain source insert"
+    );
+}
+
+#[test]
+fn add_to_default_target_creates_flat_default_and_binds() {
+    let out = add_to_default_target(
+        "version = 1\n",
+        "dots",
+        &lit("https://github.com/me/dots.git", None),
+        None,
+        None,
+        None,
+    )
+    .expect("auto-target add must create [targets.default] and bind the source");
+
+    let cfg = Config::parse(&out).expect("returned text is valid phora.toml");
+    assert!(
+        cfg.sources.contains_key("dots"),
+        "[sources.dots] must be inserted"
+    );
+    let default = &cfg.targets["default"];
+    assert_eq!(
+        default.path,
+        PathBuf::from("."),
+        "the auto-created default target must live at the project root"
+    );
+    assert_eq!(
+        default.layout().kind,
+        LayoutKind::Flat,
+        "the auto-created default target must use the flat layout"
+    );
+    assert_eq!(
+        default.sources,
+        Some(vec!["dots".to_owned()]),
+        "the source must be bound into [targets.default].sources"
+    );
+}
+
+#[test]
+fn add_to_default_target_second_call_extends_without_clobbering() {
+    let first = add_to_default_target(
+        "version = 1\n",
+        "dots",
+        &lit("https://github.com/me/dots.git", None),
+        None,
+        None,
+        None,
+    )
+    .expect("first auto-target add");
+    let second = add_to_default_target(
+        &first,
+        "tools",
+        &lit("https://github.com/me/tools.git", None),
+        None,
+        None,
+        None,
+    )
+    .expect("second auto-target add reuses the existing default target");
+
+    let cfg = Config::parse(&second).expect("returned text is valid phora.toml");
+    assert_eq!(
+        cfg.targets["default"].sources,
+        Some(vec!["dots".to_owned(), "tools".to_owned()]),
+        "a second source must be appended, not clobber the existing default binding"
+    );
+    let again = add_to_default_target(
+        &second,
+        "dots",
+        &lit("https://github.com/me/dots.git", None),
+        None,
+        None,
+        None,
+    )
+    .expect("re-adding an existing source");
+    let cfg = Config::parse(&again).expect("valid");
+    assert_eq!(
+        cfg.targets["default"].sources,
+        Some(vec!["dots".to_owned(), "tools".to_owned()]),
+        "re-binding a present source must dedup, not duplicate"
+    );
+}
+
+#[test]
+fn add_with_binds_to_named_target_never_touches_default() {
+    let base = "version = 1\n\n[targets.A]\npath = \"~/a\"\n\n[sources.existing]\ngit = \"e\"\n";
+    let out = add_with_binds(
+        base,
+        "dots",
+        &lit("https://github.com/me/dots.git", None),
+        None,
+        None,
+        None,
+        &["A".to_owned()],
+        &RejectAll,
+    )
+    .expect("--to routing binds only the named target");
+
+    let cfg = Config::parse(&out).expect("valid");
+    assert!(
+        !cfg.targets.contains_key("default"),
+        "routing to a named target must never materialize [targets.default]"
+    );
+    assert_eq!(
+        cfg.targets["A"].sources,
+        Some(vec!["dots".to_owned()]),
+        "the source must be bound to the named target only"
+    );
+}
+
+#[test]
+fn add_with_binds_create_decider_materializes_flat_default_path_target() {
+    let base = "version = 1\n";
+    let out = add_with_binds(
+        base,
+        "dots",
+        &lit("https://github.com/me/dots.git", None),
+        None,
+        None,
+        None,
+        &["staging".to_owned()],
+        &CreateAtDefault,
+    )
+    .expect("a Create decider must create the missing target and bind");
+
+    let cfg = Config::parse(&out).expect("valid");
+    let staging = &cfg.targets["staging"];
+    assert_eq!(
+        staging.path,
+        PathBuf::from("./staging"),
+        "an empty-input Create must use the default ./<name> path"
+    );
+    assert_eq!(
+        staging.layout().kind,
+        LayoutKind::Flat,
+        "an interactively created target must use the flat layout"
+    );
+    assert_eq!(
+        staging.sources,
+        Some(vec!["dots".to_owned()]),
+        "the source must be bound to the freshly created target"
+    );
+}
+
+#[test]
+fn add_with_binds_create_decider_honors_entered_path() {
+    let out = add_with_binds(
+        "version = 1\n",
+        "dots",
+        &lit("https://github.com/me/dots.git", None),
+        None,
+        None,
+        None,
+        &["staging".to_owned()],
+        &CreateAt("~/custom/staging"),
+    )
+    .expect("a Create decider with a typed path must honor it");
+
+    let cfg = Config::parse(&out).expect("valid");
+    assert_eq!(
+        cfg.targets["staging"].path,
+        PathBuf::from("~/custom/staging"),
+        "a typed path must override the default ./<name>"
+    );
+}
+
+#[test]
+fn add_with_binds_reject_decider_errors_with_hint_and_no_partial_text() {
+    let result = add_with_binds(
+        "version = 1\n",
+        "dots",
+        &lit("https://github.com/me/dots.git", None),
+        None,
+        None,
+        None,
+        &["staging".to_owned()],
+        &RejectAll,
+    );
+    let err = result.expect_err("a Reject decider must fail the whole command");
+    assert!(
+        matches!(&err, Error::Config(msg) if msg.contains("staging") && msg.contains("phora target add")),
+        "rejecting a missing target must error naming it with the `phora target add` hint"
     );
 }

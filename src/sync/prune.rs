@@ -19,7 +19,7 @@ pub(super) fn prune_orphans(
 ) -> Result<()> {
     let mut expected: HashSet<ArtifactKey> = HashSet::new();
     for (target_name, target) in &config.targets {
-        for source_name in target.resolve_sources(parsed) {
+        for source_name in target.resolve_sources() {
             let source = parsed.get(source_name).ok_or_else(|| {
                 Error::Config(format!("target references undefined source: {source_name}"))
             })?;

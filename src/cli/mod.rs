@@ -1,6 +1,8 @@
 //! Command-line surface.
 
 mod add;
+mod bind;
+mod config_edit;
 mod query;
 mod render;
 mod sync;
@@ -10,33 +12,39 @@ mod tests;
 
 #[cfg(test)]
 use {
-    crate::config::Host,
+    crate::config::{Host, LayoutKind},
     crate::deploy::ArtifactState,
     crate::store::Registry,
-    add::{insert_source_with_ref, run_add},
+    add::{
+        MissingTarget, MissingTargetDecider, add_to_default_target, add_with_binds,
+        insert_source_with_ref, run_add,
+    },
     render::state_label,
 };
 
 pub use add::{AddTarget, insert_source, parse_add_url};
 pub use query::{
-    ArtifactStatus, CheckMatchReport, TargetListing, WhereFilter, WhereMatch, check_match_cmd,
-    list_statuses, where_cmd,
+    ArtifactStatus, CheckMatchReport, SourceResolution, SourceRow, SourceSummary, TargetDetail,
+    TargetListing, TargetRow, WhereFilter, WhereMatch, check_match_cmd, list_statuses,
+    source_listing, source_summary, target_detail, target_has_deployed_artifacts, target_listing,
+    targets_receiving, where_cmd,
 };
 pub use sync::{load_locks, write_locks};
 
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 
 use clap::{Parser, Subcommand};
 
-use crate::config::{Config, ParsedSource};
+use crate::config::{Config, ParsedSource, merge_configs};
 use crate::error::{Error, Result};
-use crate::kernel::{ProjectId, SourceName};
+use crate::kernel::{ProjectId, SourceName, TargetName};
 use crate::paths::phora_dir;
 use crate::source::{GitBackend, HttpBackend, RouterBackend};
 use crate::store::FileRegistry;
 use crate::sync::{Conflict, ConflictResolver, Resolution};
+use std::str::FromStr;
 
 #[derive(Parser, Debug)]
 #[command(name = "phora", version, about = "Git-based artifact package manager")]
@@ -47,9 +55,11 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Parse a URL and add a source to the config.
+    /// Parse a URL, add a source, and optionally bind it to one or more targets.
     Add {
         url: String,
+        #[arg(long = "to")]
+        to: Vec<String>,
         #[arg(long)]
         name: Option<String>,
         #[arg(long)]
@@ -63,6 +73,8 @@ pub enum Command {
         #[arg(long)]
         symlink: bool,
     },
+    /// Remove a source and scrub it from every target (alias for `source rm`).
+    Rm { name: String },
     /// Fetch sources and project them to targets.
     Sync {
         #[arg(long)]
@@ -114,19 +126,99 @@ pub enum Command {
         source: String,
         path: String,
     },
+    /// Manage sources (`add`, `rm`, `list`, `show`).
+    Source {
+        #[command(subcommand)]
+        cmd: SourceCmd,
+    },
+    /// Manage targets (`add`, `rm`, `list`, `show`).
+    Target {
+        #[command(subcommand)]
+        cmd: TargetCmd,
+    },
+    /// Bind one or more sources to a target's explicit source list.
+    Bind {
+        #[arg(required = true)]
+        sources: Vec<String>,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        local: bool,
+    },
+    /// Remove one or more sources from a target's explicit source list.
+    Unbind {
+        #[arg(required = true)]
+        sources: Vec<String>,
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        local: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SourceCmd {
+    /// Parse a URL and add a source to the config (same as top-level `add`).
+    Add {
+        url: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long)]
+        tag: Option<String>,
+        #[arg(long)]
+        root: Option<String>,
+        #[arg(long)]
+        local: bool,
+        #[arg(long)]
+        symlink: bool,
+    },
+    /// Remove a source and scrub it from every target's source list.
+    Rm { name: String },
+    /// List sources over the merged config.
+    List,
+    /// Show one source's effective config and the targets that deploy it.
+    Show { name: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TargetCmd {
+    /// Add a target with a path and optional layout.
+    Add {
+        name: String,
+        #[arg(long)]
+        path: String,
+        #[arg(long)]
+        layout: Option<String>,
+        #[arg(long)]
+        local: bool,
+    },
+    /// Remove a target.
+    Rm {
+        name: String,
+        #[arg(long)]
+        local: bool,
+    },
+    /// List targets over the merged config.
+    List,
+    /// Show one target's effective config, bound sources, and deployment state.
+    Show { name: String },
 }
 
 pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Add {
             url,
+            to,
             name,
             branch,
             tag,
             root,
             local,
             symlink,
-        } => add::run_add(&url, name, branch, tag, root, local, symlink),
+        } => add::run_add(&url, &to, name, branch, tag, root, local, symlink),
+        Command::Rm { name } => run_source_rm(&name),
         Command::Sync { prune, force } => sync::run_sync(prune, force, None),
         Command::Update { source } => sync::run_update(source.as_deref()),
         Command::List { plan } => query::run_list(plan),
@@ -197,7 +289,114 @@ pub fn run(cli: Cli) -> Result<()> {
             render::print_check_match(&source, &path, &report);
             Ok(())
         }
+        Command::Source { cmd } => run_source(cmd),
+        Command::Target { cmd } => run_target(cmd),
+        Command::Bind { sources, to, local } => bind::run_bind(&sources, &to, local),
+        Command::Unbind {
+            sources,
+            from,
+            local,
+        } => bind::run_unbind(&sources, &from, local),
     }
+}
+
+fn run_source(cmd: SourceCmd) -> Result<()> {
+    match cmd {
+        SourceCmd::Add {
+            url,
+            name,
+            branch,
+            tag,
+            root,
+            local,
+            symlink,
+        } => add::run_add(&url, &[], name, branch, tag, root, local, symlink),
+        SourceCmd::Rm { name } => run_source_rm(&name),
+        SourceCmd::List => {
+            render::print_source_rows(&source_listing(&load_config()?)?);
+            Ok(())
+        }
+        SourceCmd::Show { name } => {
+            render::print_source_summary(&source_summary(&load_config()?, &name)?);
+            Ok(())
+        }
+    }
+}
+
+fn read_config_text(path: &str) -> Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok("version = 1\n".to_owned()),
+        Err(e) => Err(Error::Config(format!("read {path}: {e}"))),
+    }
+}
+
+fn run_source_rm(name: &str) -> Result<()> {
+    let main = read_config_text("phora.toml")?;
+    let local = read_config_text("phora.local.toml")?;
+    let result = config_edit::remove_source(&main, &local, name)?;
+    if result.main != main {
+        std::fs::write("phora.toml", &result.main)?;
+    }
+    if result.local != local {
+        std::fs::write("phora.local.toml", &result.local)?;
+    }
+    render::print_source_removed(name);
+    Ok(())
+}
+
+fn run_target(cmd: TargetCmd) -> Result<()> {
+    match cmd {
+        TargetCmd::Add {
+            name,
+            path,
+            layout,
+            local,
+        } => run_target_add(&name, &path, layout.as_deref(), local),
+        TargetCmd::Rm { name, local } => run_target_rm(&name, local),
+        TargetCmd::List => {
+            render::print_target_rows(&target_listing(&load_config()?));
+            Ok(())
+        }
+        TargetCmd::Show { name } => {
+            render::print_target_detail(&target_detail(
+                &load_config()?,
+                &open_project_registry()?,
+                &name,
+            )?);
+            Ok(())
+        }
+    }
+}
+
+fn target_config_file(local: bool) -> &'static str {
+    if local {
+        "phora.local.toml"
+    } else {
+        "phora.toml"
+    }
+}
+
+fn run_target_add(name: &str, path: &str, layout: Option<&str>, local: bool) -> Result<()> {
+    TargetName::from_str(name)?;
+    let file = target_config_file(local);
+    let text = read_config_text(file)?;
+    let updated = config_edit::upsert_target(&text, name, path, layout)?;
+    std::fs::write(file, &updated)?;
+    render::print_target_added(name, path);
+    Ok(())
+}
+
+fn run_target_rm(name: &str, local: bool) -> Result<()> {
+    if target_has_deployed_artifacts(&open_project_registry()?, name)? {
+        render::warn_target_rm_deployed(name);
+    }
+    let file = target_config_file(local);
+    let text = read_config_text(file)?;
+    let updated = config_edit::remove_target(&text, name)?;
+    std::fs::write(file, &updated)?;
+    render::print_target_removed(name);
+    Ok(())
 }
 
 /// Builds the mode-aware router for `config`, parsing each url source's `digest`.
@@ -245,6 +444,44 @@ fn load_local_config(cwd: &Path) -> Result<Option<Config>> {
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(Error::Config(format!("read {}: {e}", path.display()))),
+    }
+}
+
+/// Effective `[defaults] auto_target` over the merged base+local config, or `true`
+/// when no `phora.toml` exists yet.
+pub(super) fn effective_auto_target() -> bool {
+    let cwd = Path::new(".");
+    let Ok(base) = load_config_from(cwd) else {
+        return true;
+    };
+    let local = load_local_config(cwd).ok().flatten();
+    merge_configs(base, local).defaults.auto_target()
+}
+
+/// On a TTY, prompts on stderr to create a missing `--to` target and reads a path
+/// from stdin (empty line keeps the default); off a TTY, rejects.
+pub(super) struct TtyMissingTarget;
+
+impl add::MissingTargetDecider for TtyMissingTarget {
+    fn decide(&self, name: &str, default_path: &str) -> add::MissingTarget {
+        if !std::io::stdin().is_terminal() {
+            return add::MissingTarget::Reject;
+        }
+        eprint!("phora: target '{name}' does not exist — create it at [{default_path}]? ");
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(0) | Err(_) => add::MissingTarget::Reject,
+            Ok(_) => {
+                let typed = line.trim();
+                let path = if typed.is_empty() {
+                    default_path.to_owned()
+                } else {
+                    typed.to_owned()
+                };
+                add::MissingTarget::Create { path }
+            }
+        }
     }
 }
 

@@ -229,7 +229,7 @@ pub fn sync(
 
 fn validate_source_references(config: &Config) -> Result<()> {
     for target in config.targets.values() {
-        for source_name in target.resolve_sources(&config.sources) {
+        for source_name in target.resolve_sources() {
             if !config.sources.contains_key(source_name) {
                 return Err(Error::Config(format!(
                     "target references undefined source: {source_name}"

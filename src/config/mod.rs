@@ -20,6 +20,20 @@ pub use migrate::MigrationWarning;
 pub use source::{DeployMode, ParsedSource, Refspec, Remote, Source, SourceMode};
 pub use target::{LayoutConfig, LayoutKind, Target};
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Defaults {
+    #[serde(default)]
+    pub auto_target: Option<bool>,
+}
+
+impl Defaults {
+    #[must_use]
+    pub fn auto_target(&self) -> bool {
+        self.auto_target.unwrap_or(true)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -32,6 +46,8 @@ pub struct Config {
     pub sources: BTreeMap<String, Source>,
     #[serde(default)]
     pub targets: BTreeMap<String, Target>,
+    #[serde(default)]
+    pub defaults: Defaults,
 }
 
 impl Config {
@@ -207,6 +223,9 @@ pub fn merge_configs(base: Config, local: Option<Config>) -> Config {
                 merged.targets.insert(name, target);
             }
         }
+    }
+    if local.defaults.auto_target.is_some() {
+        merged.defaults.auto_target = local.defaults.auto_target;
     }
     merged
 }

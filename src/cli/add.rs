@@ -6,10 +6,15 @@ use crate::config::{Host, builtin_forges};
 use crate::error::{Error, Result};
 use crate::source::Protocol;
 
-use super::load_config;
+use super::{config_edit, load_config, read_config_text, render, target_config_file};
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "CLI flag fan-out mirrors the `phora add` argument surface"
+)]
 pub(super) fn run_add(
     url: &str,
+    targets: &[String],
     name: Option<String>,
     branch: Option<String>,
     tag: Option<String>,
@@ -17,6 +22,18 @@ pub(super) fn run_add(
     local: bool,
     symlink: bool,
 ) -> Result<()> {
+    if !targets.is_empty() {
+        return run_add_to_targets(
+            url,
+            targets,
+            name,
+            branch,
+            tag.as_deref(),
+            root,
+            local,
+            symlink,
+        );
+    }
     if local || symlink {
         return add_local(
             url,
@@ -37,34 +54,41 @@ pub(super) fn run_add(
 
     let doc_text =
         std::fs::read_to_string("phora.toml").unwrap_or_else(|_| "version = 1\n".to_owned());
-    let updated = insert_source_with_ref(
-        &doc_text,
-        &name,
-        &parsed,
-        branch.as_deref(),
-        tag.as_deref(),
-        root.as_deref(),
-    )?;
+    let auto_target = super::effective_auto_target();
+    let updated = if auto_target {
+        add_to_default_target(
+            &doc_text,
+            &name,
+            &parsed,
+            branch.as_deref(),
+            tag.as_deref(),
+            root.as_deref(),
+        )?
+    } else {
+        config_edit::upsert_source(
+            &doc_text,
+            &name,
+            &parsed,
+            branch.as_deref(),
+            tag.as_deref(),
+            root.as_deref(),
+        )?
+    };
     std::fs::write("phora.toml", &updated)?;
 
     let refspec = tag
         .or(branch)
         .map_or_else(String::new, |r| format!(" ({r})"));
-    println!(
-        "Added source '{name}': {}{refspec}",
-        describe_source(&parsed)
-    );
+    let description = format!("{}{refspec}", describe_source(&parsed));
+    if auto_target {
+        render::print_added_to_default(&name, &description);
+    } else {
+        render::print_added_declared(&name, &description);
+    }
     Ok(())
 }
 
-fn add_local(
-    url: &str,
-    name: Option<String>,
-    branch: Option<&str>,
-    tag: Option<&str>,
-    root: Option<&str>,
-    symlink: bool,
-) -> Result<()> {
+fn resolve_local_source(url: &str, name: Option<String>) -> Result<(String, AddTarget)> {
     let canonical = std::fs::canonicalize(url).map_err(|e| {
         Error::Config(format!(
             "`--local`/`--symlink` require an existing local checkout, but `{url}` is not one: {e}"
@@ -88,47 +112,96 @@ fn add_local(
         git: None,
         host: None,
         repo: None,
-        path: Some(path.clone()),
+        path: Some(path),
         protocol: None,
         branch: None,
         root: None,
     };
+    Ok((name, target))
+}
 
-    let mut table = source_table(&target);
-    if let Some(branch) = branch {
-        table["branch"] = toml_edit::value(branch);
-    }
-    if let Some(tag) = tag {
-        table["tag"] = toml_edit::value(tag);
-    }
-    if let Some(root) = root {
-        table["root"] = toml_edit::value(root);
-    }
-    if symlink {
-        table["deploy"] = toml_edit::value("link");
-    }
+fn inject_deploy_link(text: &str, name: &str) -> Result<String> {
+    let mut doc = text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| Error::Config(format!("parse phora.local.toml: {e}")))?;
+    doc["sources"][name]["deploy"] = toml_edit::value("link");
+    Ok(doc.to_string())
+}
+
+fn add_local(
+    url: &str,
+    name: Option<String>,
+    branch: Option<&str>,
+    tag: Option<&str>,
+    root: Option<&str>,
+    symlink: bool,
+) -> Result<()> {
+    let (name, target) = resolve_local_source(url, name)?;
+    let path = target.path.clone().unwrap_or_default();
 
     let doc_text =
         std::fs::read_to_string("phora.local.toml").unwrap_or_else(|_| "version = 1\n".to_owned());
-    let mut doc = doc_text
-        .parse::<toml_edit::DocumentMut>()
-        .map_err(|e| Error::Config(format!("parse phora.local.toml: {e}")))?;
-    ensure_sources_table(&mut doc);
-    doc["sources"][&name] = toml_edit::Item::Table(table);
-    std::fs::write("phora.local.toml", doc.to_string())?;
+    let mut updated = config_edit::upsert_source(&doc_text, &name, &target, branch, tag, root)?;
+    if symlink {
+        updated = inject_deploy_link(&updated, &name)?;
+    }
+    std::fs::write("phora.local.toml", &updated)?;
 
     println!("Added local source '{name}': {path}");
     Ok(())
 }
 
-fn describe_source(source: &AddTarget) -> String {
-    match (&source.git, &source.host, &source.repo) {
-        (Some(git), _, _) => git.clone(),
-        (None, Some(host), Some(repo)) => format!("{host}:{repo}"),
-        _ => source.name.clone(),
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the `phora add` argument surface for the bind-on-add sugar"
+)]
+fn run_add_to_targets(
+    url: &str,
+    targets: &[String],
+    name: Option<String>,
+    branch: Option<String>,
+    tag: Option<&str>,
+    root: Option<String>,
+    local: bool,
+    symlink: bool,
+) -> Result<()> {
+    let overlay = local || symlink;
+    let (name, source, branch, root) = if overlay {
+        let (name, source) = resolve_local_source(url, name)?;
+        (name, source, branch, root)
+    } else {
+        let hosts = load_config().map(|c| c.hosts).unwrap_or_default();
+        let parsed = parse_add_url(url, &hosts)?;
+        let name = name.unwrap_or_else(|| parsed.name.clone());
+        let branch = branch.or_else(|| parsed.branch.clone());
+        let root = root.or_else(|| parsed.root.clone());
+        (name, parsed, branch, root)
+    };
+
+    let file = target_config_file(overlay);
+    let text = read_config_text(file)?;
+
+    let mut updated = add_with_binds(
+        &text,
+        &name,
+        &source,
+        branch.as_deref(),
+        tag,
+        root.as_deref(),
+        targets,
+        &super::TtyMissingTarget,
+    )?;
+    if symlink {
+        updated = inject_deploy_link(&updated, &name)?;
     }
+    super::bind::guard_no_dangling_references(&updated, overlay)?;
+    std::fs::write(file, &updated)?;
+
+    render::print_added_and_bound(&name, &describe_source(&source), targets);
+    Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn insert_source_with_ref(
     doc_text: &str,
     name: &str,
@@ -137,53 +210,14 @@ pub(super) fn insert_source_with_ref(
     tag: Option<&str>,
     root: Option<&str>,
 ) -> Result<String> {
-    let mut doc = doc_text
-        .parse::<toml_edit::DocumentMut>()
-        .map_err(|e| Error::Config(format!("parse phora.toml: {e}")))?;
-
-    let mut table = source_table(source);
-    if let Some(branch) = branch {
-        table["branch"] = toml_edit::value(branch);
-    }
-    if let Some(tag) = tag {
-        table["tag"] = toml_edit::value(tag);
-    }
-    if let Some(root) = root.or(source.root.as_deref()) {
-        table["root"] = toml_edit::value(root);
-    }
-
-    ensure_sources_table(&mut doc);
-    doc["sources"][name] = toml_edit::Item::Table(table);
-    Ok(doc.to_string())
+    config_edit::upsert_source(doc_text, name, source, branch, tag, root)
 }
 
-fn source_table(source: &AddTarget) -> toml_edit::Table {
-    let mut table = toml_edit::Table::new();
-    if let Some(git) = &source.git {
-        table["git"] = toml_edit::value(git.as_str());
-        return table;
-    }
-    if let Some(path) = &source.path {
-        table["path"] = toml_edit::value(path.as_str());
-        return table;
-    }
-    if let Some(host) = &source.host {
-        table["host"] = toml_edit::value(host.as_str());
-    }
-    if let Some(repo) = &source.repo {
-        table["repo"] = toml_edit::value(repo.as_str());
-    }
-    if let Some(Protocol::Ssh) = source.protocol {
-        table["protocol"] = toml_edit::value("ssh");
-    }
-    table
-}
-
-fn ensure_sources_table(doc: &mut toml_edit::DocumentMut) {
-    if doc.get("sources").is_none() {
-        let mut sources = toml_edit::Table::new();
-        sources.set_implicit(true);
-        doc["sources"] = toml_edit::Item::Table(sources);
+fn describe_source(source: &AddTarget) -> String {
+    match (&source.git, &source.host, &source.repo) {
+        (Some(git), _, _) => git.clone(),
+        (None, Some(host), Some(repo)) => format!("{host}:{repo}"),
+        _ => source.name.clone(),
     }
 }
 
@@ -405,19 +439,89 @@ pub fn insert_source(
     source: &AddTarget,
     root: Option<&str>,
 ) -> Result<String> {
-    let mut doc = doc_text
+    config_edit::upsert_source(doc_text, name, source, source.branch.as_deref(), None, root)
+}
+
+/// How to handle a `--to` target that does not yet exist: create it at `path`
+/// (flat layout) or reject the whole command.
+pub(super) enum MissingTarget {
+    Create { path: String },
+    Reject,
+}
+
+/// Decides, per missing `--to` target, whether to create it or reject. The real
+/// impl prompts on a TTY; tests substitute a fake.
+pub(super) trait MissingTargetDecider {
+    fn decide(&self, name: &str, default_path: &str) -> MissingTarget;
+}
+
+/// Upsert `[sources.<name>]` and bind it into `[targets.default]`, creating that
+/// target (flat layout, rooted at `.`) only when it does not already exist.
+///
+/// # Errors
+///
+/// Returns [`Error::Config`] if `text` is not valid TOML.
+pub(super) fn add_to_default_target(
+    text: &str,
+    name: &str,
+    source: &AddTarget,
+    branch: Option<&str>,
+    tag: Option<&str>,
+    root: Option<&str>,
+) -> Result<String> {
+    let mut current = config_edit::upsert_source(text, name, source, branch, tag, root)?;
+    if !target_exists(&current, "default")? {
+        current = config_edit::upsert_target(&current, "default", ".", Some("flat"))?;
+    }
+    Ok(config_edit::bind(&current, "default", &[name.to_owned()])?.text)
+}
+
+/// Atomically upsert `[sources.<name>]` and bind it to every target in `targets`
+/// over a single config-text string, returning the final text or erring whole.
+/// A missing target is resolved by `decider`: create it (flat layout) or reject.
+///
+/// # Errors
+///
+/// Returns [`Error::Config`] if a target is missing and the decider rejects it
+/// (resolved before any bind, so a failure yields no partial text).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "single-string desugar carries the source shape plus refspec and bind targets"
+)]
+pub(super) fn add_with_binds(
+    text: &str,
+    name: &str,
+    source: &AddTarget,
+    branch: Option<&str>,
+    tag: Option<&str>,
+    root: Option<&str>,
+    targets: &[String],
+    decider: &dyn MissingTargetDecider,
+) -> Result<String> {
+    let mut current = config_edit::upsert_source(text, name, source, branch, tag, root)?;
+    let bind_names = [name.to_owned()];
+    for target in targets {
+        if !target_exists(&current, target)? {
+            match decider.decide(target, &format!("./{target}")) {
+                MissingTarget::Create { path } => {
+                    current = config_edit::upsert_target(&current, target, &path, Some("flat"))?;
+                }
+                MissingTarget::Reject => {
+                    return Err(Error::Config(super::bind::missing_target_message(target)));
+                }
+            }
+        }
+        current = config_edit::bind(&current, target, &bind_names)?.text;
+    }
+    Ok(current)
+}
+
+fn target_exists(text: &str, target: &str) -> Result<bool> {
+    let doc = text
         .parse::<toml_edit::DocumentMut>()
-        .map_err(|e| Error::Config(format!("parse phora.toml: {e}")))?;
-
-    let mut table = source_table(source);
-    if let Some(branch) = &source.branch {
-        table["branch"] = toml_edit::value(branch.as_str());
-    }
-    if let Some(root) = root.or(source.root.as_deref()) {
-        table["root"] = toml_edit::value(root);
-    }
-
-    ensure_sources_table(&mut doc);
-    doc["sources"][name] = toml_edit::Item::Table(table);
-    Ok(doc.to_string())
+        .map_err(|e| Error::Config(format!("parse toml: {e}")))?;
+    Ok(doc
+        .get("targets")
+        .and_then(toml_edit::Item::as_table_like)
+        .is_some_and(|targets| targets.contains_key(target)))
 }
