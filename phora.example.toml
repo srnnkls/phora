@@ -4,6 +4,12 @@ version = 1
 # Uncomment to flip the global default (still overridable per source):
 # protocol = "ssh"
 
+# A bare `phora add <url>` (no --to) ensures [targets.default] (path ".", flat)
+# and binds the source into it. Set auto_target = false to make bare add
+# declare-only (it then deploys nowhere until bound or routed with --to).
+[defaults]
+auto_target = true
+
 # github, gitlab, codeberg, sr.ht, bitbucket ship built in (both https + ssh),
 # so a `[hosts]` block is only needed to add a forge or override auth/remote.
 [hosts.github]
@@ -65,7 +71,9 @@ include = ["fzf"]
 # Content is imported as a deterministic, content-addressed synthetic git commit:
 # identical bytes ⇒ identical commit ⇒ no lock churn.
 
-# A target is a directory artifacts are projected into. Omit `sources` to take all.
+# A target is a directory artifacts are projected into. `sources` is an explicit
+# allow-list: list names to deploy them, or set `[]` (or omit the key) to deploy
+# nothing. Manage the list with `phora bind`/`phora unbind`.
 [targets.neovim]
 path = "~/.config/nvim"
 sources = ["dotfiles"]

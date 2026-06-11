@@ -36,7 +36,7 @@ Requires a Rust toolchain (edition 2024).
 - **Artifact** — one top-level directory in a source (dotfiles are skipped). Glob
   `include`/`exclude` rules select which artifacts and which files within them ship.
 - **Target** — a local directory artifacts are projected into, with a chosen
-  layout. A target may draw from all sources or a named subset.
+  layout. A target draws from its explicit `sources` allow-list.
 - **Lock** — `phora.lock` pins each source to a resolved commit so syncs are
   reproducible (`phora.local.toml` gets a companion `phora.local.lock`).
   `phora update` bumps it.
@@ -80,6 +80,48 @@ phora rebuild-registry      # reconstruct registry from lock + on-disk targets
 phora check-match --source <source> <path>   # debug include/exclude matching
 ```
 
+### Sources, targets, and bindings
+
+`source` and `target` group the registry commands; `bind`/`unbind` edit which
+sources a target deploys. `add`/`rm` are top-level sugar over the source namespace.
+
+```bash
+# Sources (`add` is identical to `source add`)
+phora source add owner/repo --name myconfigs --branch main
+phora source list                  # name, resolved remote, refspec
+phora source show myconfigs        # effective config + targets that deploy it
+phora source rm myconfigs          # also scrubs it from every target's `sources`
+phora rm myconfigs                 # alias for `source rm`
+
+# Targets (--path required; --layout takes flat | by-source | prefixed)
+phora target add neovim --path ~/.config/nvim --layout by-source
+phora target list                  # name, path, source-resolution mode
+phora target show neovim           # effective config + resolved sources + state
+phora target rm neovim             # warns if the registry still has deployed artifacts
+
+# Bindings — edit a target's `sources` list
+phora bind dotfiles loqui --to neovim     # add sources to neovim's list
+phora unbind loqui --from neovim          # remove; emptying it deploys nothing
+```
+
+`--to`/`--from` name the target an edge attaches to. `phora add <url> --to T1 --to T2`
+adds the source then binds it to each target atomically — the whole desugar is
+applied to one config-text string and written once, so a failure leaves nothing
+behind. A `--to` target that does not exist prompts to create it (flat layout,
+path `./T`) on an interactive terminal, and errors with a `phora target add` hint
+off a TTY. `--local` on a mutating command writes `phora.local.toml` instead of
+`phora.toml`; `source rm`/`rm` take no `--local`, since their scrub spans both
+files.
+
+A bare `phora add <url>` (no `--to`) deploys into the project: it ensures
+`[targets.default]` (path `.`, flat layout) and binds the source into it. Set
+`[defaults] auto_target = false` to opt out — then a bare `add` only declares the
+source, and it deploys nowhere until bound. `--to` always routes to exactly the
+named target(s) and never touches `[targets.default]`.
+
+`bind` onto a target with no `sources` key creates the list with the bound
+source(s); the target deploys exactly its listed sources (nothing until bound).
+
 ### Conflicts
 
 When `sync` finds a target file that was modified outside phora, or a foreign file
@@ -101,6 +143,9 @@ Phora reads `phora.toml` from the working directory, optionally overlaid by
 version = 1
 # protocol = "ssh"         # global default for forge sources (default https)
 
+# [defaults]
+# auto_target = true       # bare `add` populates [targets.default] (default true)
+
 [hosts.github]
 auth = { type = "token", env = "GITHUB_TOKEN" }   # remote is built in; just add auth
 
@@ -114,9 +159,19 @@ exclude = ["**/*.bak"]
 
 [targets.neovim]
 path = "~/.config/nvim"
-sources = ["dotfiles"]   # omit to draw from every source
+sources = ["dotfiles"]   # the allow-list of sources this target deploys
 layout = "flat"          # "flat" | "by-source" | { type = "prefixed", separator = "-" }
 ```
+
+**Target sources** are an explicit allow-list: `["a", "b"]` deploys those two,
+`[]` (or an omitted `sources` key) deploys nothing. Edit the list with `phora
+bind`/`phora unbind` rather than by hand; `bind` onto a target with no `sources`
+key creates it.
+
+**`[defaults] auto_target`** (bool, default `true`) controls bare-`add` DX: when
+on, `phora add <url>` without `--to` ensures `[targets.default]` (path `.`, flat)
+and binds the source into it; set it `false` to make bare `add` declare-only.
+`--to` is unaffected — it always routes to the named target(s).
 
 **Hosts** supply remote templates and auth. `github`, `gitlab`, `codeberg`,
 `sr.ht`, and `bitbucket` ship built in (both https and ssh); a `[hosts.X]` block
