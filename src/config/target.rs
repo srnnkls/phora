@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use super::source::{ParsedSource, Source};
+use super::source::{ParsedSource, Refspec, Source};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -81,6 +81,9 @@ pub struct RefinedBinding {
     pub root: Option<PathBuf>,
     pub include: Option<Vec<String>>,
     pub exclude: Option<Vec<String>>,
+    pub branch: Option<String>,
+    pub tag: Option<String>,
+    pub rev: Option<String>,
 }
 
 #[derive(Debug)]
@@ -90,12 +93,14 @@ pub struct ResolvedBinding<'a> {
     pub root: Option<&'a Path>,
     pub include: &'a [String],
     pub exclude: &'a [String],
+    pub effective_ref: Refspec,
 }
 
 pub trait SourceFields {
     fn intrinsic_root(&self) -> Option<&Path>;
     fn intrinsic_include(&self) -> &[String];
     fn intrinsic_exclude(&self) -> &[String];
+    fn intrinsic_refspec(&self) -> Refspec;
 }
 
 impl SourceFields for Source {
@@ -110,6 +115,18 @@ impl SourceFields for Source {
     fn intrinsic_exclude(&self) -> &[String] {
         self.exclude.as_deref().unwrap_or(&[])
     }
+
+    fn intrinsic_refspec(&self) -> Refspec {
+        if let Some(rev) = &self.rev {
+            Refspec::Rev(rev.clone())
+        } else if let Some(tag) = &self.tag {
+            Refspec::Tag(tag.clone())
+        } else if let Some(branch) = &self.branch {
+            Refspec::Branch(branch.clone())
+        } else {
+            Refspec::Branch("main".into())
+        }
+    }
 }
 
 impl SourceFields for ParsedSource {
@@ -123,6 +140,10 @@ impl SourceFields for ParsedSource {
 
     fn intrinsic_exclude(&self) -> &[String] {
         self.excludes()
+    }
+
+    fn intrinsic_refspec(&self) -> Refspec {
+        self.refspec()
     }
 }
 
@@ -186,6 +207,10 @@ fn resolve_binding<'a, S: SourceFields>(
             refined.exclude.as_deref(),
         ),
     };
+    let binding_ref = match binding {
+        Binding::Source(_) => None,
+        Binding::Refined(refined) => binding_refspec(refined),
+    };
     let source = all.get(source_name)?;
     Some(ResolvedBinding {
         identity,
@@ -193,7 +218,18 @@ fn resolve_binding<'a, S: SourceFields>(
         root: root.or_else(|| source.intrinsic_root()),
         include: include.unwrap_or_else(|| source.intrinsic_include()),
         exclude: exclude.unwrap_or_else(|| source.intrinsic_exclude()),
+        effective_ref: binding_ref.unwrap_or_else(|| source.intrinsic_refspec()),
     })
+}
+
+fn binding_refspec(refined: &RefinedBinding) -> Option<Refspec> {
+    if let Some(rev) = &refined.rev {
+        Some(Refspec::Rev(rev.clone()))
+    } else if let Some(tag) = &refined.tag {
+        Some(Refspec::Tag(tag.clone()))
+    } else {
+        refined.branch.as_ref().map(|b| Refspec::Branch(b.clone()))
+    }
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]

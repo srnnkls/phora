@@ -729,4 +729,39 @@ config_digest = \"PLACEHOLDER\"
             "non-overridden source must NOT appear in the local lock"
         );
     }
+
+    // Guards existing_literal_git_lock_deserializes_and_matches: a future optional lock field (PTV-004) must skip-serialize so bare locks stay byte-identical.
+    #[test]
+    fn bare_locked_source_serializes_only_existing_fields() {
+        let lock = Lock {
+            version: 1,
+            sources: vec![locked(
+                "dotfiles",
+                "https://github.com/me/dotfiles.git",
+                "main",
+            )],
+        };
+
+        let text = toml::to_string(&lock).expect("lock serializes to toml");
+
+        let value: toml::Value = toml::from_str(&text).expect("serialized lock re-parses as toml");
+        let sources = value
+            .get("sources")
+            .and_then(toml::Value::as_array)
+            .expect("serialized lock has a [[sources]] array");
+        assert_eq!(sources.len(), 1, "fixture has exactly one locked source");
+        let source = sources[0]
+            .as_table()
+            .expect("the single [[sources]] entry is a table");
+
+        let mut keys: Vec<&str> = source.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["commit", "config_digest", "digest", "git", "name", "resolved"],
+            "a bare lock (no per-binding ref) must serialize EXACTLY this key set; any extra key \
+             means a new optional lock field was not skip-serialized when absent, so old configs \
+             would not lock byte-identically, got:\n{text}"
+        );
+    }
 }
