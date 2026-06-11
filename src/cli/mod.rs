@@ -22,7 +22,10 @@ use {
     render::state_label,
 };
 
+use config_edit::BindRefinement;
+
 pub use add::{AddTarget, insert_source, parse_add_url};
+pub use config_edit::remove_source;
 pub use query::{
     ArtifactStatus, CheckMatchReport, SourceResolution, SourceRow, SourceSummary, TargetDetail,
     TargetListing, TargetRow, WhereFilter, WhereMatch, check_match_cmd, list_statuses,
@@ -72,6 +75,12 @@ pub enum Command {
         local: bool,
         #[arg(long)]
         symlink: bool,
+        #[arg(long = "as")]
+        r#as: Option<String>,
+        #[arg(long)]
+        include: Vec<String>,
+        #[arg(long)]
+        exclude: Vec<String>,
     },
     /// Remove a source and scrub it from every target (alias for `source rm`).
     Rm { name: String },
@@ -136,7 +145,7 @@ pub enum Command {
         #[command(subcommand)]
         cmd: TargetCmd,
     },
-    /// Bind one or more sources to a target's explicit source list.
+    /// Bind one or more sources to a target, optionally refining each binding.
     Bind {
         #[arg(required = true)]
         sources: Vec<String>,
@@ -144,8 +153,16 @@ pub enum Command {
         to: String,
         #[arg(long)]
         local: bool,
+        #[arg(long = "as")]
+        r#as: Option<String>,
+        #[arg(long)]
+        root: Option<String>,
+        #[arg(long)]
+        include: Vec<String>,
+        #[arg(long)]
+        exclude: Vec<String>,
     },
-    /// Remove one or more sources from a target's explicit source list.
+    /// Remove one or more bindings from a target by their identity.
     Unbind {
         #[arg(required = true)]
         sources: Vec<String>,
@@ -208,16 +225,7 @@ pub enum TargetCmd {
 
 pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Add {
-            url,
-            to,
-            name,
-            branch,
-            tag,
-            root,
-            local,
-            symlink,
-        } => add::run_add(&url, &to, name, branch, tag, root, local, symlink),
+        cmd @ Command::Add { .. } => dispatch_add(cmd),
         Command::Rm { name } => run_source_rm(&name),
         Command::Sync { prune, force } => sync::run_sync(prune, force, None),
         Command::Update { source } => sync::run_update(source.as_deref()),
@@ -291,13 +299,77 @@ pub fn run(cli: Cli) -> Result<()> {
         }
         Command::Source { cmd } => run_source(cmd),
         Command::Target { cmd } => run_target(cmd),
-        Command::Bind { sources, to, local } => bind::run_bind(&sources, &to, local),
+        cmd @ Command::Bind { .. } => dispatch_bind(cmd),
         Command::Unbind {
             sources,
             from,
             local,
         } => bind::run_unbind(&sources, &from, local),
     }
+}
+
+fn dispatch_add(cmd: Command) -> Result<()> {
+    let Command::Add {
+        url,
+        to,
+        name,
+        branch,
+        tag,
+        root,
+        local,
+        symlink,
+        r#as,
+        include,
+        exclude,
+    } = cmd
+    else {
+        unreachable!("dispatch_add only handles Command::Add")
+    };
+    let to_present = !to.is_empty();
+    let source_root = if to_present { None } else { root.clone() };
+    let refinement = BindRefinement {
+        r#as,
+        root: if to_present { root } else { None },
+        include,
+        exclude,
+    };
+    add::run_add(
+        &url,
+        &to,
+        name,
+        branch,
+        tag,
+        source_root,
+        local,
+        symlink,
+        &refinement,
+    )
+}
+
+fn dispatch_bind(cmd: Command) -> Result<()> {
+    let Command::Bind {
+        sources,
+        to,
+        local,
+        r#as,
+        root,
+        include,
+        exclude,
+    } = cmd
+    else {
+        unreachable!("dispatch_bind only handles Command::Bind")
+    };
+    bind::run_bind(
+        &sources,
+        &to,
+        local,
+        &BindRefinement {
+            r#as,
+            root,
+            include,
+            exclude,
+        },
+    )
 }
 
 fn run_source(cmd: SourceCmd) -> Result<()> {
@@ -310,7 +382,17 @@ fn run_source(cmd: SourceCmd) -> Result<()> {
             root,
             local,
             symlink,
-        } => add::run_add(&url, &[], name, branch, tag, root, local, symlink),
+        } => add::run_add(
+            &url,
+            &[],
+            name,
+            branch,
+            tag,
+            root,
+            local,
+            symlink,
+            &BindRefinement::default(),
+        ),
         SourceCmd::Rm { name } => run_source_rm(&name),
         SourceCmd::List => {
             render::print_source_rows(&source_listing(&load_config()?)?);

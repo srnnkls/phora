@@ -6,7 +6,7 @@ use std::str::FromStr;
 
 use toml_edit::DocumentMut;
 
-use super::config_edit;
+use super::config_edit::{self, BindRefinement};
 use super::{load_config_from, load_local_config, read_config_text, render, target_config_file};
 use crate::config::merge_configs;
 use crate::error::{Error, Result};
@@ -74,7 +74,12 @@ fn target_exists(text: &str, target: &str) -> Result<bool> {
         .is_some_and(|targets| targets.contains_key(target)))
 }
 
-pub(super) fn run_bind(sources: &[String], to: &str, local: bool) -> Result<()> {
+pub(super) fn run_bind(
+    sources: &[String],
+    to: &str,
+    local: bool,
+    refinement: &BindRefinement,
+) -> Result<()> {
     for source in sources {
         SourceName::from_str(source)?;
     }
@@ -95,7 +100,11 @@ pub(super) fn run_bind(sources: &[String], to: &str, local: bool) -> Result<()> 
         return Err(Error::Config(missing_target_message(to)));
     }
 
-    let result = config_edit::bind(&text, to, sources)?;
+    let result = config_edit::bind(&text, to, sources, refinement)?;
+    if !result.changed {
+        render::print_bind_unchanged(sources, to);
+        return Ok(());
+    }
     guard_no_dangling_references(&result.text, local)?;
     std::fs::write(file, &result.text)?;
     render::print_bound(sources, to);

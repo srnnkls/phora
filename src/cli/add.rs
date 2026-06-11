@@ -6,6 +6,7 @@ use crate::config::{Host, builtin_forges};
 use crate::error::{Error, Result};
 use crate::source::Protocol;
 
+use super::config_edit::BindRefinement;
 use super::{config_edit, load_config, read_config_text, render, target_config_file};
 
 #[allow(
@@ -21,7 +22,25 @@ pub(super) fn run_add(
     root: Option<String>,
     local: bool,
     symlink: bool,
+    refinement: &BindRefinement,
 ) -> Result<()> {
+    if refinement.r#as.is_some() && targets.len() != 1 {
+        return Err(Error::Config(
+            "`--as` sets a single binding identity and needs exactly one `--to` target".to_owned(),
+        ));
+    }
+    if !refinement.is_bare() && targets.is_empty() {
+        return Err(Error::Config(
+            "refinement flags (`--as`/`--include`/`--exclude`) need at least one `--to` target"
+                .to_owned(),
+        ));
+    }
+    if (local || symlink) && (!targets.is_empty() || !refinement.is_bare()) {
+        return Err(Error::Config(
+            "`--local`/`--symlink` overlays do not support `--to`/refinement flags".to_owned(),
+        ));
+    }
+
     if !targets.is_empty() {
         return run_add_to_targets(
             url,
@@ -29,9 +48,9 @@ pub(super) fn run_add(
             name,
             branch,
             tag.as_deref(),
-            root,
             local,
             symlink,
+            refinement,
         );
     }
     if local || symlink {
@@ -161,34 +180,35 @@ fn run_add_to_targets(
     name: Option<String>,
     branch: Option<String>,
     tag: Option<&str>,
-    root: Option<String>,
     local: bool,
     symlink: bool,
+    refinement: &BindRefinement,
 ) -> Result<()> {
     let overlay = local || symlink;
-    let (name, source, branch, root) = if overlay {
+    let (name, source, branch) = if overlay {
         let (name, source) = resolve_local_source(url, name)?;
-        (name, source, branch, root)
+        (name, source, branch)
     } else {
         let hosts = load_config().map(|c| c.hosts).unwrap_or_default();
         let parsed = parse_add_url(url, &hosts)?;
         let name = name.unwrap_or_else(|| parsed.name.clone());
         let branch = branch.or_else(|| parsed.branch.clone());
-        let root = root.or_else(|| parsed.root.clone());
-        (name, parsed, branch, root)
+        (name, parsed, branch)
     };
 
     let file = target_config_file(overlay);
     let text = read_config_text(file)?;
 
+    let source_root = source.root.clone();
     let mut updated = add_with_binds(
         &text,
         &name,
         &source,
         branch.as_deref(),
         tag,
-        root.as_deref(),
+        source_root.as_deref(),
         targets,
+        refinement,
         &super::TtyMissingTarget,
     )?;
     if symlink {
@@ -473,12 +493,20 @@ pub(super) fn add_to_default_target(
     if !target_exists(&current, "default")? {
         current = config_edit::upsert_target(&current, "default", ".", Some("flat"))?;
     }
-    Ok(config_edit::bind(&current, "default", &[name.to_owned()])?.text)
+    Ok(config_edit::bind(
+        &current,
+        "default",
+        &[name.to_owned()],
+        &BindRefinement::default(),
+    )?
+    .text)
 }
 
 /// Atomically upsert `[sources.<name>]` and bind it to every target in `targets`
 /// over a single config-text string, returning the final text or erring whole.
 /// A missing target is resolved by `decider`: create it (flat layout) or reject.
+/// Each bind carries `refinement` so an aliased/scoped `add --to` writes a table
+/// binding in every target.
 ///
 /// # Errors
 ///
@@ -496,6 +524,7 @@ pub(super) fn add_with_binds(
     tag: Option<&str>,
     root: Option<&str>,
     targets: &[String],
+    refinement: &BindRefinement,
     decider: &dyn MissingTargetDecider,
 ) -> Result<String> {
     let mut current = config_edit::upsert_source(text, name, source, branch, tag, root)?;
@@ -511,7 +540,7 @@ pub(super) fn add_with_binds(
                 }
             }
         }
-        current = config_edit::bind(&current, target, &bind_names)?.text;
+        current = config_edit::bind(&current, target, &bind_names, refinement)?.text;
     }
     Ok(current)
 }
