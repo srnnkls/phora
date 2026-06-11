@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use crate::config::{Config, DeployMode, LayoutKind, ParsedSource, Target};
+use crate::config::{Config, DeployMode, LayoutKind, Target};
 use crate::error::{Error, Result};
 use crate::kernel::{ArtifactName, Selection, SourceName};
 use crate::lock::Lock;
@@ -38,19 +38,23 @@ pub fn rebuild_registry(
         let mut managed: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut selections: Vec<Selection> = Vec::new();
 
-        for source_name in target.resolve_sources() {
-            let source = parsed.get(source_name).ok_or_else(|| {
-                Error::Config(format!("target references undefined source: {source_name}"))
+        for binding in target.resolve_sources(&parsed) {
+            let source = parsed.get(binding.source).ok_or_else(|| {
+                Error::Config(format!(
+                    "target references undefined source: {}",
+                    binding.source
+                ))
             })?;
-            let locked = lock.find_source(source_name).ok_or_else(|| {
+            let locked = lock.find_source(binding.source).ok_or_else(|| {
                 Error::Sync(format!(
-                    "no locked commit for source {source_name}; run sync first"
+                    "no locked commit for source {}; run sync first",
+                    binding.source
                 ))
             })?;
             let commit = &locked.commit;
-            let git = remote_for(&remotes, source_name)?;
-            let source_name = SourceName::trusted(source_name);
-            let selection = Selection::new(source.includes(), source.excludes())?;
+            let git = remote_for(&remotes, binding.source)?;
+            let source_name = SourceName::trusted(binding.source);
+            let selection = Selection::new(binding.include, binding.exclude)?;
             selections.push(selection.clone());
             let policy = source.export_policy();
             let discovered = discover_artifacts_for_source(
@@ -60,30 +64,39 @@ pub fn rebuild_registry(
                 commit,
                 backend,
                 &selection,
+                binding.root,
             )?;
 
             for artifact in discovered {
                 let key = ArtifactKey {
                     target: target_name.clone(),
-                    source: source_name.as_str().to_owned(),
+                    source: binding.identity.to_owned(),
                     artifact: artifact.as_str().to_owned(),
                 };
                 let artifact_dst = target.expanded_path().join(
                     target
                         .layout()
-                        .artifact_path(source_name.as_str(), artifact.as_str()),
+                        .artifact_path(binding.identity, artifact.as_str()),
                 );
 
                 match source.deploy_mode() {
                     DeployMode::Link => {
-                        rebuild_linked(registry, &policy, target.layout().kind, key, &mut report)?;
+                        rebuild_linked(
+                            registry,
+                            binding.source,
+                            &policy,
+                            target.layout().kind,
+                            key,
+                            &mut report,
+                        )?;
                     }
                     DeployMode::Copy => rebuild_one(RebuildOne {
                         backend,
                         registry,
-                        source,
                         git,
                         source_name: &source_name,
+                        underlying_source: binding.source,
+                        root: binding.root,
                         commit,
                         selection: &selection,
                         policy: &policy,
@@ -96,7 +109,7 @@ pub fn rebuild_registry(
                 }
 
                 managed
-                    .entry(source_name.as_str().to_owned())
+                    .entry(binding.identity.to_owned())
                     .or_default()
                     .insert(artifact.as_str().to_owned());
             }
@@ -113,9 +126,10 @@ pub fn rebuild_registry(
 struct RebuildOne<'a> {
     backend: &'a dyn SourceBackend,
     registry: &'a dyn Registry,
-    source: &'a ParsedSource,
     git: &'a str,
     source_name: &'a SourceName,
+    underlying_source: &'a str,
+    root: Option<&'a Path>,
     commit: &'a str,
     selection: &'a Selection,
     policy: &'a crate::source::ExportPolicy,
@@ -130,9 +144,10 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
     let RebuildOne {
         backend,
         registry,
-        source,
         git,
         source_name,
+        underlying_source,
+        root,
         commit,
         selection,
         policy,
@@ -152,7 +167,7 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         source: source_name,
         url: git,
         commit,
-        root: source.root.as_deref(),
+        root,
         artifact,
         selection,
         policy,
@@ -184,6 +199,7 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
     let record = RegistryRecord {
         version: 1,
         key: key.clone(),
+        source: underlying_source.to_owned(),
         commit: commit.to_owned(),
         digest: export.digest,
         projected_at: chrono::Utc::now().to_rfc3339(),
@@ -205,6 +221,7 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
 /// a link source has no mirror, so its marker is synthesized from disk discovery.
 fn rebuild_linked(
     registry: &dyn Registry,
+    underlying_source: &str,
     policy: &crate::source::ExportPolicy,
     layout_kind: LayoutKind,
     key: ArtifactKey,
@@ -213,6 +230,7 @@ fn rebuild_linked(
     let record = RegistryRecord {
         version: 1,
         key: key.clone(),
+        source: underlying_source.to_owned(),
         commit: "link".to_owned(),
         digest: "link:".to_owned(),
         projected_at: chrono::Utc::now().to_rfc3339(),

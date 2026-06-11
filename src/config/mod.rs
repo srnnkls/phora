@@ -8,7 +8,7 @@ mod target;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 
@@ -18,7 +18,9 @@ pub use crate::source::Protocol;
 pub use host::{AuthConfig, Host, RemoteConfig, builtin_forges};
 pub use migrate::MigrationWarning;
 pub use source::{DeployMode, ParsedSource, Refspec, Remote, Source, SourceMode};
-pub use target::{LayoutConfig, LayoutKind, Target};
+pub use target::{
+    Binding, LayoutConfig, LayoutKind, RefinedBinding, ResolvedBinding, SourceFields, Target,
+};
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -120,6 +122,29 @@ impl Config {
                 )));
             }
         }
+        self.validate_bindings()?;
+        Ok(())
+    }
+
+    fn validate_bindings(&self) -> Result<()> {
+        for (target_name, target) in &self.targets {
+            let mut identities = BTreeSet::new();
+            for binding in target.sources.iter().flatten() {
+                let Some(source) = self.sources.get(binding.source()) else {
+                    return Err(Error::Config(format!(
+                        "target `{target_name}` references undefined source `{}`",
+                        binding.source()
+                    )));
+                };
+                if !identities.insert(binding.identity()) {
+                    return Err(Error::Config(format!(
+                        "target `{target_name}` binds the identity `{}` more than once",
+                        binding.identity()
+                    )));
+                }
+                reject_url_slice(binding, source)?;
+            }
+        }
         Ok(())
     }
 
@@ -147,6 +172,28 @@ impl Config {
             .filter_map(|(name, source)| migrate::warning_for(name, source, base_dir))
             .collect()
     }
+}
+
+fn reject_url_slice(binding: &Binding, source: &Source) -> Result<()> {
+    let Binding::Refined(refined) = binding else {
+        return Ok(());
+    };
+    if source.url.is_none() {
+        return Ok(());
+    }
+    let field = if refined.root.is_some() {
+        "root"
+    } else if refined.include.is_some() {
+        "include"
+    } else if refined.exclude.is_some() {
+        "exclude"
+    } else {
+        return Ok(());
+    };
+    Err(Error::Config(format!(
+        "source `{}`: `{field}` is meaningless on a `url` source",
+        refined.source
+    )))
 }
 
 /// The effective host for `name`: the built-in forge overlaid by a user

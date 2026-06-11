@@ -28,6 +28,8 @@ pub struct ArtifactKey {
 pub struct RegistryRecord {
     pub version: u32,
     pub key: ArtifactKey,
+    #[serde(default)]
+    pub source: String,
     pub commit: String,
     pub digest: String,
     pub projected_at: String,
@@ -361,6 +363,7 @@ mod tests {
                 source: "local-overlay".to_owned(),
                 artifact: "snippets".to_owned(),
             },
+            source: "local-overlay".to_owned(),
             commit: "link".to_owned(),
             digest: "link:".to_owned(),
             projected_at: "2026-06-08T12:00:00Z".to_owned(),
@@ -416,6 +419,77 @@ artifact = "snippets"
         );
     }
 
+    // ── underlying source field (PBR-004) ─────────────────────────
+
+    /// An aliased binding keys `key.source` by IDENTITY (the `as`) but must record
+    /// the UNDERLYING source name in the new `source` field. Both must survive a
+    /// TOML round-trip independently so `rebuild-registry` can reconstruct provenance.
+    #[test]
+    fn record_round_trips_underlying_source_distinct_from_identity() {
+        let rec = RegistryRecord {
+            version: 1,
+            key: ArtifactKey {
+                target: "dest".to_owned(),
+                source: "nvim".to_owned(),
+                artifact: "init".to_owned(),
+            },
+            source: "dotfiles".to_owned(),
+            commit: "def456789abc123".to_owned(),
+            digest: "blake3:d4e5f6".to_owned(),
+            projected_at: "2026-01-31T12:34:56Z".to_owned(),
+            layout: "by-source".to_owned(),
+            allow_symlinks: false,
+            preserve_executable: true,
+            files: vec![],
+            linked: false,
+        };
+
+        let toml = toml::to_string(&rec).expect("serialize aliased record");
+        let back: RegistryRecord = toml::from_str(&toml).expect("deserialize aliased record");
+
+        assert_eq!(
+            back, rec,
+            "an aliased record must round-trip field-for-field through TOML"
+        );
+        assert_eq!(
+            back.key.source, "nvim",
+            "key.source carries the binding IDENTITY (the `as`)"
+        );
+        assert_eq!(
+            back.source, "dotfiles",
+            "the new `source` field carries the UNDERLYING source name, distinct from identity"
+        );
+    }
+
+    /// Records written before the `source` field existed have no `source` key; serde
+    /// `#[serde(default)]` must deserialize them with an empty source (back-compat).
+    #[test]
+    fn record_without_source_field_deserializes_with_default_source() {
+        let legacy = r#"
+version = 1
+commit = "def456789abc123"
+digest = "blake3:d4e5f6"
+projected_at = "2026-01-31T12:34:56Z"
+layout = "flat"
+allow_symlinks = false
+preserve_executable = true
+files = []
+
+[key]
+target = "vscode"
+source = "company-configs"
+artifact = "snippets"
+"#;
+
+        let rec: RegistryRecord =
+            toml::from_str(legacy).expect("legacy record without `source` must still parse");
+
+        assert_eq!(
+            rec.source, "",
+            "a record predating the underlying-source field must default to an empty `source`"
+        );
+    }
+
     fn record(target: &str, source: &str, artifact: &str) -> RegistryRecord {
         RegistryRecord {
             version: 1,
@@ -424,6 +498,7 @@ artifact = "snippets"
                 source: source.to_owned(),
                 artifact: artifact.to_owned(),
             },
+            source: source.to_owned(),
             commit: "def456789abc123".to_owned(),
             digest: "blake3:d4e5f6".to_owned(),
             projected_at: "2026-01-31T12:34:56Z".to_owned(),

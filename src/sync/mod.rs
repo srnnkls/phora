@@ -150,7 +150,6 @@ pub fn sync(
 ) -> Result<SyncOutput> {
     let effective_config = merge_configs(input.base_config.clone(), input.local_config.cloned());
     effective_config.validate()?;
-    validate_source_references(&effective_config)?;
     let parsed = effective_config.parsed_sources()?;
     let remotes = resolved_remotes(&effective_config, &parsed)?;
     validate_link_mode(input.base_config, &parsed, &remotes)?;
@@ -225,19 +224,6 @@ pub fn sync(
         local_lock,
         had_failures,
     })
-}
-
-fn validate_source_references(config: &Config) -> Result<()> {
-    for target in config.targets.values() {
-        for source_name in target.resolve_sources() {
-            if !config.sources.contains_key(source_name) {
-                return Err(Error::Config(format!(
-                    "target references undefined source: {source_name}"
-                )));
-            }
-        }
-    }
-    Ok(())
 }
 
 fn validate_link_mode(

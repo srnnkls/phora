@@ -290,7 +290,7 @@ fn resolve_sources_absent_key_receives_nothing() {
          [targets.t]\npath = \"~/x\"\n",
     )
     .expect("config with a no-key target parses");
-    let resolved = target_of(&cfg, "t").resolve_sources();
+    let resolved = target_of(&cfg, "t").resolve_sources(&cfg.sources);
     assert!(
         resolved.is_empty(),
         "a target with no `sources` key must resolve to NO sources, got {resolved:?}"
@@ -304,9 +304,10 @@ fn resolve_sources_explicit_list_is_verbatim() {
          [targets.t]\npath = \"~/x\"\nsources = [\"a\"]\n",
     )
     .expect("config with an explicit-list target parses");
-    let resolved = target_of(&cfg, "t").resolve_sources();
+    let resolved = target_of(&cfg, "t").resolve_sources(&cfg.sources);
+    let names: Vec<&str> = resolved.iter().map(|b| b.source).collect();
     assert_eq!(
-        resolved,
+        names,
         vec!["a"],
         "an explicit `sources` list resolves to exactly its listed names"
     );
@@ -349,10 +350,17 @@ fn parses_target_sources_and_layout_from_example() {
     let cfg = Config::parse(EXAMPLE_TOML).expect("example toml should parse");
 
     let vscode = cfg.targets.get("vscode").expect("vscode target");
-    assert_eq!(
-        vscode.sources.as_deref(),
-        Some(["dotfiles".to_string(), "company-configs".to_string()].as_slice())
-    );
+    let vscode_sources: Vec<&str> = vscode
+        .sources
+        .as_deref()
+        .expect("vscode declares sources")
+        .iter()
+        .map(|b| match b {
+            crate::config::Binding::Source(name) => name.as_str(),
+            crate::config::Binding::Refined(r) => r.source.as_str(),
+        })
+        .collect();
+    assert_eq!(vscode_sources, ["dotfiles", "company-configs"]);
     assert_eq!(
         effective_layout(vscode).artifact_path("loqui", "python"),
         PathBuf::from("python"),
@@ -1612,6 +1620,34 @@ fn shipped_example_toml_includes_a_url_source() {
     );
 }
 
+// PBR-008: the shipped example must teach per-binding refinement (aliasing via `as`)
+
+#[test]
+fn shipped_example_toml_demonstrates_a_refined_binding_alias() {
+    let cfg = Config::parse(include_str!("../../phora.example.toml"))
+        .expect("the shipped phora.example.toml must parse");
+    cfg.validate()
+        .expect("the shipped phora.example.toml must pass post-merge validation");
+
+    let aliasing = cfg
+        .targets
+        .values()
+        .flat_map(|target| target.sources.iter().flatten())
+        .find(|binding| {
+            matches!(binding, Binding::Refined(_)) && binding.identity() != binding.source()
+        })
+        .expect(
+            "the shipped phora.example.toml must demonstrate a refined binding whose `as` \
+             identity differs from its source (e.g. { source = \"dotfiles\", as = \"nvim\" })",
+        );
+
+    assert_ne!(
+        aliasing.identity(),
+        aliasing.source(),
+        "the refined binding must alias the source to a distinct identity to teach the feature"
+    );
+}
+
 // HAS-002: resolved_remote + single built-in forge registry
 
 fn hosts_of(toml: &str) -> BTreeMap<String, Host> {
@@ -2751,8 +2787,8 @@ fn defaults_absent_section_defaults_auto_target_true() {
 
 #[test]
 fn defaults_present_without_key_defaults_auto_target_true() {
-    let cfg = Config::parse("version = 1\n\n[defaults]\n")
-        .expect("an empty [defaults] section parses");
+    let cfg =
+        Config::parse("version = 1\n\n[defaults]\n").expect("an empty [defaults] section parses");
     assert!(
         cfg.defaults.auto_target(),
         "an empty [defaults] section leaves auto_target at its true default"
@@ -2762,8 +2798,8 @@ fn defaults_present_without_key_defaults_auto_target_true() {
 #[test]
 fn merge_local_auto_target_false_overrides_base() {
     let base = Config::parse("version = 1\n").expect("base parses");
-    let local = Config::parse("version = 1\n\n[defaults]\nauto_target = false\n")
-        .expect("local parses");
+    let local =
+        Config::parse("version = 1\n\n[defaults]\nauto_target = false\n").expect("local parses");
 
     let effective = merge_configs(base, Some(local));
     assert!(
@@ -2774,8 +2810,8 @@ fn merge_local_auto_target_false_overrides_base() {
 
 #[test]
 fn merge_local_unset_auto_target_keeps_base() {
-    let base = Config::parse("version = 1\n\n[defaults]\nauto_target = false\n")
-        .expect("base parses");
+    let base =
+        Config::parse("version = 1\n\n[defaults]\nauto_target = false\n").expect("base parses");
     let local = Config::parse("version = 1\n").expect("local parses");
 
     let effective = merge_configs(base, Some(local));
@@ -3005,5 +3041,714 @@ mod migration_warnings {
             ws.is_empty(),
             "a config using only canonical keys must produce NO migration warnings, got: {ws:?}"
         );
+    }
+}
+
+mod per_binding_refinement {
+    use std::path::Path;
+
+    use crate::config::target::{Binding, RefinedBinding, ResolvedBinding};
+    use crate::config::{Config, Source, Target};
+    use crate::error::Error;
+
+    fn target(toml: &str, name: &str) -> Target {
+        Config::parse(toml)
+            .expect("config parses")
+            .targets
+            .remove(name)
+            .expect("named target present")
+    }
+
+    fn sources(toml: &str) -> std::collections::BTreeMap<String, Source> {
+        Config::parse(toml).expect("config parses").sources
+    }
+
+    fn bindings_of(t: &Target) -> &[Binding] {
+        t.sources
+            .as_deref()
+            .expect("target declares an explicit sources list")
+    }
+
+    fn find_resolved<'a>(
+        resolved: &'a [ResolvedBinding<'a>],
+        identity: &str,
+    ) -> &'a ResolvedBinding<'a> {
+        resolved
+            .iter()
+            .find(|b| b.identity == identity)
+            .unwrap_or_else(|| {
+                panic!("a resolved binding with identity `{identity}` must be present")
+            })
+    }
+
+    #[test]
+    fn bare_string_source_parses_to_binding_source() {
+        let t = target(
+            "version = 1\n\n[targets.neovim]\npath = \"~/.config/nvim\"\nsources = [\"dotfiles\"]\n",
+            "neovim",
+        );
+        let bindings = bindings_of(&t);
+        assert_eq!(bindings.len(), 1, "exactly one binding in the list");
+        match &bindings[0] {
+            Binding::Source(name) => assert_eq!(
+                name, "dotfiles",
+                "a bare TOML string must deserialize to Binding::Source carrying the source name"
+            ),
+            other @ Binding::Refined(_) => {
+                panic!("a bare string must be Binding::Source, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn refinement_table_parses_to_binding_refined_with_all_fields() {
+        let t = target(
+            "version = 1\n\n[targets.t]\npath = \"~/x\"\n\
+             sources = [{ source = \"dotfiles\", as = \"nvim\", root = \"nvim\", \
+             include = [\"init.lua\"], exclude = [\"**/*.bak\"] }]\n",
+            "t",
+        );
+        let bindings = bindings_of(&t);
+        assert_eq!(bindings.len(), 1, "exactly one binding in the list");
+        match &bindings[0] {
+            Binding::Refined(RefinedBinding {
+                source,
+                r#as,
+                root,
+                include,
+                exclude,
+            }) => {
+                assert_eq!(
+                    source, "dotfiles",
+                    "the `source` key carries the referenced source name"
+                );
+                assert_eq!(
+                    r#as.as_deref(),
+                    Some("nvim"),
+                    "the `as` key carries the rename"
+                );
+                assert_eq!(
+                    root.as_deref(),
+                    Some(Path::new("nvim")),
+                    "the `root` key is captured as a PathBuf"
+                );
+                assert_eq!(
+                    include.as_deref(),
+                    Some(["init.lua".to_string()].as_slice()),
+                    "the `include` key is captured as a Vec<String>"
+                );
+                assert_eq!(
+                    exclude.as_deref(),
+                    Some(["**/*.bak".to_string()].as_slice()),
+                    "the `exclude` key is captured as a Vec<String>"
+                );
+            }
+            other @ Binding::Source(_) => {
+                panic!("a refinement table must be Binding::Refined, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn refinement_table_with_unknown_key_is_rejected_naming_it() {
+        let toml = "version = 1\n\n[targets.t]\npath = \"~/x\"\n\
+             sources = [{ source = \"dotfiles\", bogus = 1 }]\n";
+        let err = Config::parse(toml).expect_err(
+            "an unknown key in a refinement table must be rejected (deny_unknown_fields)",
+        );
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("bogus"),
+                "the unknown-refinement-key error must name the offending key, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_overrides_root_independently_and_inherits_include_exclude() {
+        let toml = "version = 1\n\n\
+            [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\
+            root = \"base-root\"\ninclude = [\"src-inc\"]\nexclude = [\"src-exc\"]\n\n\
+            [targets.t]\npath = \"~/x\"\n\
+            sources = [{ source = \"dotfiles\", root = \"override-root\" }]\n";
+        let t = target(toml, "t");
+        let all = sources(toml);
+
+        let resolved = t.resolve_sources(&all);
+        let b = find_resolved(&resolved, "dotfiles");
+
+        assert_eq!(b.source, "dotfiles", "the binding still names its source");
+        assert_eq!(
+            b.root,
+            Some(Path::new("override-root")),
+            "a binding that sets `root` must override the source's `root`"
+        );
+        assert_eq!(
+            b.include,
+            ["src-inc"],
+            "an omitted binding `include` must inherit the source's include verbatim"
+        );
+        assert_eq!(
+            b.exclude,
+            ["src-exc"],
+            "an omitted binding `exclude` must inherit the source's exclude verbatim"
+        );
+    }
+
+    #[test]
+    fn resolve_overrides_include_independently_and_inherits_root() {
+        let toml = "version = 1\n\n\
+            [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\
+            root = \"base-root\"\ninclude = [\"src-inc\"]\n\n\
+            [targets.t]\npath = \"~/x\"\n\
+            sources = [{ source = \"dotfiles\", include = [\"only-binding\"] }]\n";
+        let t = target(toml, "t");
+        let all = sources(toml);
+
+        let resolved = t.resolve_sources(&all);
+        let b = find_resolved(&resolved, "dotfiles");
+
+        assert_eq!(
+            b.include,
+            ["only-binding"],
+            "a binding that sets `include` must override the source's include (no concatenation)"
+        );
+        assert_eq!(
+            b.root,
+            Some(Path::new("base-root")),
+            "an omitted binding `root` must inherit the source's root"
+        );
+    }
+
+    #[test]
+    fn identity_defaults_to_source_name_when_as_omitted() {
+        let toml = "version = 1\n\n\
+            [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
+            [targets.t]\npath = \"~/x\"\nsources = [\"dotfiles\"]\n";
+        let t = target(toml, "t");
+        let all = sources(toml);
+
+        let resolved = t.resolve_sources(&all);
+        assert_eq!(
+            resolved.len(),
+            1,
+            "one binding resolves to one ResolvedBinding"
+        );
+        assert_eq!(
+            resolved[0].identity, "dotfiles",
+            "a bare binding's identity must default to the source name when `as` is omitted"
+        );
+        assert_eq!(
+            resolved[0].source, "dotfiles",
+            "identity and source coincide for a bare binding"
+        );
+    }
+
+    #[test]
+    fn identity_uses_as_when_set() {
+        let toml = "version = 1\n\n\
+            [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
+            [targets.t]\npath = \"~/x\"\n\
+            sources = [{ source = \"dotfiles\", as = \"nvim\" }]\n";
+        let t = target(toml, "t");
+        let all = sources(toml);
+
+        let resolved = t.resolve_sources(&all);
+        let b = &resolved[0];
+        assert_eq!(
+            b.identity, "nvim",
+            "a binding with `as = nvim` must take its identity from `as`, not the source name"
+        );
+        assert_eq!(
+            b.source, "dotfiles",
+            "the underlying source name is preserved independently of the identity"
+        );
+    }
+
+    #[test]
+    fn merge_string_only_sources_is_wholesale_replace_no_concatenation() {
+        let base = Config::parse(
+            "version = 1\n\n\
+             [targets.t]\npath = \"~/x\"\nsources = [\"a\", \"b\"]\n",
+        )
+        .expect("base parses");
+        let local = Config::parse(
+            "version = 1\n\n\
+             [targets.t]\npath = \"~/x\"\nsources = [\"c\"]\n",
+        )
+        .expect("local parses");
+
+        let effective = crate::config::merge_configs(base, Some(local));
+        let merged = effective.targets.get("t").expect("target kept");
+        let names: Vec<&str> = bindings_of(merged)
+            .iter()
+            .map(|b| match b {
+                Binding::Source(name) => name.as_str(),
+                Binding::Refined(r) => r.source.as_str(),
+            })
+            .collect();
+        assert_eq!(
+            names,
+            ["c"],
+            "a local `sources` overlay must WHOLESALE-REPLACE the base list (no concatenation, \
+             the base [\"a\", \"b\"] must be gone)"
+        );
+    }
+
+    #[test]
+    fn r9_golden_bare_string_config_resolves_to_source_identity_and_inherited_fields() {
+        use crate::store::Registry as _;
+        let toml = "version = 1\n\n\
+            [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\
+            root = \"modules\"\ninclude = [\"editor\"]\nexclude = [\"**/*.bak\"]\n\n\
+            [sources.loqui]\ngit = \"https://github.com/srnnkls/loqui.git\"\nroot = \"languages\"\n\n\
+            [targets.t]\npath = \"~/x\"\nsources = [\"dotfiles\", \"loqui\"]\n";
+        let t = target(toml, "t");
+        let all = sources(toml);
+
+        let resolved = t.resolve_sources(&all);
+        let identities: Vec<&str> = resolved.iter().map(|b| b.identity).collect();
+        assert_eq!(
+            identities,
+            ["dotfiles", "loqui"],
+            "a bare-string config must resolve identities equal to the source names, in order"
+        );
+
+        let dotfiles = find_resolved(&resolved, "dotfiles");
+        assert_eq!(
+            dotfiles.source, "dotfiles",
+            "a bare binding's source equals its identity"
+        );
+        assert_eq!(
+            dotfiles.root,
+            Some(Path::new("modules")),
+            "with no binding-level refinement, root is inherited verbatim from the source"
+        );
+        assert_eq!(
+            dotfiles.include,
+            ["editor"],
+            "with no binding-level refinement, include is inherited verbatim from the source"
+        );
+        assert_eq!(
+            dotfiles.exclude,
+            ["**/*.bak"],
+            "with no binding-level refinement, exclude is inherited verbatim from the source"
+        );
+
+        let loqui = find_resolved(&resolved, "loqui");
+        assert_eq!(
+            loqui.root,
+            Some(Path::new("languages")),
+            "the second bare binding also inherits its source root verbatim"
+        );
+        assert!(
+            loqui.include.is_empty() && loqui.exclude.is_empty(),
+            "a source with no include/exclude resolves to empty slices for a bare binding"
+        );
+
+        // PBR-004 byte-identity: a bare binding (identity == source) must persist its
+        // record at …/artifacts/<source>/<artifact>.toml with `source` == the source,
+        // unchanged from the pre-PBR layout.
+        let state = tempfile::TempDir::new().expect("state root");
+        let reg = crate::store::FileRegistry::open(state.path().to_path_buf())
+            .expect("open registry over tempdir");
+        let rec = crate::store::RegistryRecord {
+            version: 1,
+            key: crate::store::ArtifactKey {
+                target: "t".to_owned(),
+                source: dotfiles.identity.to_owned(),
+                artifact: "editor".to_owned(),
+            },
+            source: dotfiles.source.to_owned(),
+            commit: "deadbeef".to_owned(),
+            digest: "blake3:00".to_owned(),
+            projected_at: "2026-01-31T12:34:56Z".to_owned(),
+            layout: "flat".to_owned(),
+            allow_symlinks: false,
+            preserve_executable: true,
+            files: vec![],
+            linked: false,
+        };
+        reg.put(&rec).expect("put bare-binding record");
+
+        let expected = state
+            .path()
+            .join("targets")
+            .join("t")
+            .join("artifacts")
+            .join("dotfiles")
+            .join("editor.toml");
+        assert!(
+            expected.is_file(),
+            "a bare binding must persist at …/artifacts/<source>/<artifact>.toml \
+             byte-identical to the pre-PBR layout, expected {}",
+            expected.display()
+        );
+        assert_eq!(
+            reg.get(&rec.key).expect("get").expect("present").source,
+            "dotfiles",
+            "a bare binding's persisted `source` equals its identity"
+        );
+    }
+
+    #[test]
+    fn resolve_overrides_exclude_independently_and_inherits_root_include() {
+        let toml = "version = 1\n\n\
+            [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\
+            root = \"base-root\"\ninclude = [\"src-inc\"]\nexclude = [\"src-exc\"]\n\n\
+            [targets.t]\npath = \"~/x\"\n\
+            sources = [{ source = \"dotfiles\", exclude = [\"binding-exc\"] }]\n";
+        let t = target(toml, "t");
+        let all = sources(toml);
+
+        let resolved = t.resolve_sources(&all);
+        let b = find_resolved(&resolved, "dotfiles");
+
+        assert_eq!(
+            b.exclude,
+            ["binding-exc"],
+            "a binding that sets `exclude` must override the source's exclude (no concatenation)"
+        );
+        assert_eq!(
+            b.root,
+            Some(Path::new("base-root")),
+            "an omitted binding `root` must inherit the source's root verbatim"
+        );
+        assert_eq!(
+            b.include,
+            ["src-inc"],
+            "an omitted binding `include` must inherit the source's include verbatim"
+        );
+    }
+
+    #[test]
+    fn merge_wholesale_replace_holds_when_base_has_refined_binding() {
+        let base = Config::parse(
+            "version = 1\n\n\
+             [targets.t]\npath = \"~/x\"\n\
+             sources = [{ source = \"a\", as = \"x\", root = \"r\" }, \"b\"]\n",
+        )
+        .expect("base parses");
+        let local = Config::parse(
+            "version = 1\n\n\
+             [targets.t]\npath = \"~/x\"\nsources = [\"c\"]\n",
+        )
+        .expect("local parses");
+
+        let effective = crate::config::merge_configs(base, Some(local));
+        let merged = effective.targets.get("t").expect("target kept");
+        let names: Vec<&str> = bindings_of(merged)
+            .iter()
+            .map(|b| match b {
+                Binding::Source(name) => name.as_str(),
+                Binding::Refined(r) => r.source.as_str(),
+            })
+            .collect();
+        assert_eq!(
+            names,
+            ["c"],
+            "a local `sources` overlay must WHOLESALE-REPLACE a base list containing a refined \
+             binding (no concatenation, the base entries must be gone regardless of variant)"
+        );
+    }
+
+    #[test]
+    fn resolve_combines_as_identity_with_field_override() {
+        let toml = "version = 1\n\n\
+            [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\
+            root = \"base-root\"\n\n\
+            [targets.t]\npath = \"~/x\"\n\
+            sources = [{ source = \"dotfiles\", as = \"nvim\", root = \"override-root\" }]\n";
+        let t = target(toml, "t");
+        let all = sources(toml);
+
+        let resolved = t.resolve_sources(&all);
+        let b = find_resolved(&resolved, "nvim");
+
+        assert_eq!(
+            b.identity, "nvim",
+            "the binding's identity must come from `as` even when a field override is present"
+        );
+        assert_eq!(
+            b.source, "dotfiles",
+            "the underlying source name is preserved alongside the `as` rename"
+        );
+        assert_eq!(
+            b.root,
+            Some(Path::new("override-root")),
+            "a binding with `as` set must still apply its own per-field `root` override"
+        );
+    }
+
+    #[test]
+    fn refinement_table_rejects_misplaced_source_level_key() {
+        let toml = "version = 1\n\n[targets.t]\npath = \"~/x\"\n\
+             sources = [{ source = \"dotfiles\", git = \"x\" }]\n";
+        let err = Config::parse(toml).expect_err(
+            "a source-level key (`git`) placed inside a refinement table must be rejected: \
+             binding fields are not source fields",
+        );
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("git"),
+                "the misplaced-source-key error must name the offending key, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    fn config(toml: &str) -> Config {
+        Config::parse(toml).expect("config parses")
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_bare_identity_within_a_target() {
+        let cfg = config(
+            "version = 1\n\n\
+             [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
+             [targets.editor]\npath = \"~/.config\"\nsources = [\"dotfiles\", \"dotfiles\"]\n",
+        );
+        let err = cfg.validate().expect_err(
+            "two bare `dotfiles` bindings collide on identity `dotfiles` within target `editor` \
+             and must be rejected",
+        );
+        match err {
+            Error::Config(msg) => {
+                assert!(
+                    msg.contains("editor"),
+                    "the duplicate-identity error must name the offending target `editor`, got: {msg}"
+                );
+                assert!(
+                    msg.contains("dotfiles"),
+                    "the duplicate-identity error must name the colliding identity `dotfiles`, got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_identity_collision_between_bare_and_table_forms() {
+        let cfg = config(
+            "version = 1\n\n\
+             [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
+             [targets.editor]\npath = \"~/.config\"\n\
+             sources = [\"dotfiles\", { source = \"dotfiles\" }]\n",
+        );
+        let err = cfg.validate().expect_err(
+            "a table binding with no `as` defaults its identity to its source name `dotfiles`, \
+             colliding with the bare `dotfiles` binding; this must be rejected even across forms",
+        );
+        match err {
+            Error::Config(msg) => {
+                assert!(
+                    msg.contains("editor"),
+                    "the collision error must name the target `editor`, got: {msg}"
+                );
+                assert!(
+                    msg.contains("dotfiles"),
+                    "the collision error must name the colliding identity `dotfiles`, got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_allows_same_source_under_two_distinct_as_identities() {
+        let cfg = config(
+            "version = 1\n\n\
+             [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
+             [targets.editor]\npath = \"~/.config\"\n\
+             sources = [\
+                { source = \"dotfiles\", as = \"nvim\" }, \
+                { source = \"dotfiles\", as = \"tmux\" }\
+             ]\n",
+        );
+        cfg.validate().expect(
+            "two bindings of the SAME source carrying DISTINCT `as` identities (`nvim`, `tmux`) \
+             are two slices into one target and must be VALID",
+        );
+    }
+
+    #[test]
+    fn validate_rejects_target_referencing_undefined_source_via_table_binding() {
+        let cfg = config(
+            "version = 1\n\n\
+             [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
+             [targets.editor]\npath = \"~/.config\"\n\
+             sources = [{ source = \"ghost\", as = \"x\" }]\n",
+        );
+        let err = cfg.validate().expect_err(
+            "a binding whose `source` names no `[sources.*]` entry must be rejected by validate()",
+        );
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("ghost"),
+                "the undefined-source error must name the missing source `ghost`, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_target_referencing_undefined_source_via_bare_binding() {
+        let cfg = config(
+            "version = 1\n\n\
+             [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
+             [targets.editor]\npath = \"~/.config\"\nsources = [\"ghost\"]\n",
+        );
+        let err = cfg.validate().expect_err(
+            "a bare binding naming no `[sources.*]` entry must be rejected by validate(), \
+             exactly as the table-form binding is",
+        );
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("ghost"),
+                "the undefined-source error must name the missing source `ghost`, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_distinct_sources_sharing_one_as_identity() {
+        let cfg = config(
+            "version = 1\n\n\
+             [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
+             [sources.loqui]\ngit = \"https://github.com/srnnkls/loqui.git\"\n\n\
+             [targets.editor]\npath = \"~/.config\"\n\
+             sources = [\
+                { source = \"dotfiles\", as = \"x\" }, \
+                { source = \"loqui\", as = \"x\" }\
+             ]\n",
+        );
+        let err = cfg.validate().expect_err(
+            "two DIFFERENT sources both claiming `as = x` in one target collide on identity `x` \
+             and must be rejected",
+        );
+        match err {
+            Error::Config(msg) => {
+                assert!(
+                    msg.contains("editor"),
+                    "the identity-collision error must name the target `editor`, got: {msg}"
+                );
+                assert!(
+                    msg.contains('x'),
+                    "the identity-collision error must name the colliding identity `x`, got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_allows_root_slice_on_git_backed_source() {
+        let cfg = config(
+            "version = 1\n\n\
+             [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\
+             sources = [{ source = \"dotfiles\", root = \"sub\" }]\n",
+        );
+        cfg.validate().expect(
+            "a binding that slices `root` on a GIT-backed source is valid (git sources carry a \
+             tree to slice); the url-slice rejection must be specific to url-backed sources",
+        );
+    }
+
+    #[test]
+    fn validate_allows_plain_binding_to_url_backed_source() {
+        let cfg = config(
+            "version = 1\n\n\
+             [sources.pkg]\nurl = \"https://example.com/foo.tar.gz\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\
+             sources = [{ source = \"pkg\" }]\n",
+        );
+        cfg.validate().expect(
+            "a PLAIN binding to a url-backed source that sets no root/include/exclude must be \
+             VALID; only sliced bindings on url sources are rejected",
+        );
+    }
+
+    #[test]
+    fn validate_rejects_root_slice_on_url_backed_source() {
+        let cfg = config(
+            "version = 1\n\n\
+             [sources.pkg]\nurl = \"https://example.com/foo.tar.gz\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\
+             sources = [{ source = \"pkg\", root = \"sub\" }]\n",
+        );
+        let err = cfg.validate().expect_err(
+            "a binding that sets `root` on a url-backed source must be rejected: url sources \
+             carry no tree to slice",
+        );
+        match err {
+            Error::Config(msg) => {
+                assert!(
+                    msg.contains("pkg"),
+                    "the url-slice error must name the offending source `pkg`, got: {msg}"
+                );
+                assert!(
+                    msg.contains("root"),
+                    "the url-slice error must name the rejected `root` refinement, got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_include_slice_on_url_backed_source() {
+        let cfg = config(
+            "version = 1\n\n\
+             [sources.pkg]\nurl = \"https://example.com/foo.tar.gz\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\
+             sources = [{ source = \"pkg\", include = [\"a\"] }]\n",
+        );
+        let err = cfg.validate().expect_err(
+            "a binding that sets `include` on a url-backed source must be rejected (url sources \
+             reject slicing, mirroring the source-level rule)",
+        );
+        match err {
+            Error::Config(msg) => {
+                assert!(
+                    msg.contains("pkg"),
+                    "the url-slice error must name the offending source `pkg`, got: {msg}"
+                );
+                assert!(
+                    msg.contains("include"),
+                    "the url-slice error must name the rejected `include` refinement, got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_exclude_slice_on_url_backed_source() {
+        let cfg = config(
+            "version = 1\n\n\
+             [sources.pkg]\nurl = \"https://example.com/foo.tar.gz\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\
+             sources = [{ source = \"pkg\", exclude = [\"b\"] }]\n",
+        );
+        let err = cfg.validate().expect_err(
+            "a binding that sets `exclude` on a url-backed source must be rejected (url sources \
+             reject slicing, mirroring the source-level rule)",
+        );
+        match err {
+            Error::Config(msg) => {
+                assert!(
+                    msg.contains("pkg"),
+                    "the url-slice error must name the offending source `pkg`, got: {msg}"
+                );
+                assert!(
+                    msg.contains("exclude"),
+                    "the url-slice error must name the rejected `exclude` refinement, got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
     }
 }
