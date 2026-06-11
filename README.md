@@ -10,8 +10,8 @@
 
 Phora is a git-based artifact package manager. It mirrors git repositories — or
 imports plain-https resources (tarballs, zips, single files) as content-addressed
-synthetic commits — picks out the top-level directories you want (**artifacts**),
-and projects them into local **target** directories, pinned to exact commits,
+synthetic commits — picks out the top-level directories you want (artifacts),
+and projects them into local target directories, pinned to exact commits,
 verifiable by content hash, and recoverable after interruption.
 
 Use it to distribute shared config, editor setups, prompt/skill bundles, or release
@@ -25,27 +25,68 @@ cargo install --path .
 mise run build      # cargo build
 ```
 
-Requires a Rust toolchain (edition 2024).
+Requires a Rust toolchain (edition 2024) and [mise](https://mise.en.dev) for the
+`mise run` tasks.
+
+## Getting started
+
+The quickest start is one command — `phora add` writes the config and deploys
+into the project directory:
+
+```bash
+phora add me/dotfiles    # add the source, bind it into [targets.default] (path ".")
+phora sync               # fetch, pin to a commit, project artifacts
+phora verify             # re-hash the deployed files; non-zero exit on any mismatch
+```
+
+`--to <name>` routes to a named target instead (created on a prompt if it does not
+exist); `[defaults] auto_target = false` opts out, so a bare `add` only declares
+the source.
+
+For control over *where* things land — a target path, a `root` subdirectory, a
+layout — write `phora.toml` yourself:
+
+```toml
+version = 1
+
+[sources.dotfiles]
+host = "github"          # -> https://github.com/me/dotfiles.git
+repo = "me/dotfiles"
+branch = "main"
+
+[targets.nvim]
+path = "~/.config/nvim"
+sources = ["dotfiles"]
+```
+
+```bash
+phora sync       # fetch, pin to a commit, project artifacts into ~/.config/nvim
+phora verify     # re-hash the deployed files; non-zero exit on any mismatch
+```
+
+New to phora? The [guide](GUIDE.md) walks through a real setup end to end —
+git and `url` sources, layouts, the local dev loop, and what to do when something
+looks wrong.
 
 ## Concepts
 
-- **Source** — provenance: where bytes come from, pinned by `branch`, `tag`, or
+- Source — provenance: where bytes come from, pinned by `branch`, `tag`, or
   `rev`. The top-level directories under its `root` are its artifacts. Declare its
   remote as a forge (`host` + `repo`), a local path (`path = "/dir"`), a literal git
   URL (`git = "…"`), or a downloadable resource (`url = "https://…"`). A source may
   also carry intrinsic selection defaults (`root`/`include`/`exclude`).
-- **Artifact** — one top-level directory in a source (dotfiles are skipped). Glob
+- Artifact — one top-level directory in a source (dotfiles are skipped). Glob
   `include`/`exclude` rules select which artifacts and which files within them ship.
-- **Target** — a local directory artifacts are projected into, with a chosen
+- Target — a local directory artifacts are projected into, with a chosen
   layout. A target draws from its explicit `sources` allow-list.
-- **Binding** — a target's link to a source. Selection lives here per consumer: a
+- Binding — a target's link to a source. Selection lives here per consumer: a
   binding is a bare source name (inherit the source's defaults) or a table that
   refines `root`/`include`/`exclude` for that target alone, and names the slice via
   `as`. See [Bindings](#bindings).
-- **Lock** — `phora.lock` pins each source to a resolved commit so syncs are
+- Lock — `phora.lock` pins each source to a resolved commit so syncs are
   reproducible (`phora.local.toml` gets a companion `phora.local.lock`).
   `phora update` bumps it.
-- **Registry** — per-project state under `~/.phora` recording what was deployed
+- Registry — per-project state under `~/.phora` recording what was deployed
   where (commit + content digest), so phora can detect drift, conflicts, and
   orphans. Bare mirrors live under `~/.phora/git`.
 
@@ -146,6 +187,18 @@ where an artifact wants to land, it prompts (on a TTY):
 
 Non-interactive runs skip such files unless `--force` is given.
 
+### Troubleshooting
+
+When something looks off, the question you have usually maps to one command:
+
+- Did `include`/`exclude` match what I expected? — `phora check-match --source <source> <path>`
+- Is what's on disk what phora actually deployed? — `phora verify` (non-zero exit on any mismatch)
+- Where did a deployed file come from? — `phora where --source <source>` (by source / artifact / commit / digest)
+- Registry wrong after hand-editing `~/.phora`? — `phora rebuild-registry` (rebuilds it from the lock + on-disk targets)
+- `sync` rejects a binding? — two bindings sharing an identity in one target, a `root`/`include`/`exclude` on a `url` source, or a binding naming an undefined source are config errors; give each slice a distinct `as` and check the [Bindings](#bindings) rules.
+
+The [guide](GUIDE.md) goes deeper on each.
+
 ## Configuration
 
 Phora reads `phora.toml` from the working directory, optionally overlaid by
@@ -177,26 +230,26 @@ sources = ["dotfiles"]   # the allow-list of sources this target deploys
 layout = "flat"          # "flat" | "by-source" | { type = "prefixed", separator = "-" }
 ```
 
-**Target sources** are an explicit allow-list: `["a", "b"]` deploys those two,
+Target sources are an explicit allow-list: `["a", "b"]` deploys those two,
 `[]` (or an omitted `sources` key) deploys nothing. Edit the list with `phora
 bind`/`phora unbind` rather than by hand; `bind` onto a target with no `sources`
 key creates it.
 
-**`[defaults] auto_target`** (bool, default `true`) controls bare-`add` DX: when
+`[defaults] auto_target` (bool, default `true`) controls bare-`add` DX: when
 on, `phora add <url>` without `--to` ensures `[targets.default]` (path `.`, flat)
 and binds the source into it; set it `false` to make bare `add` declare-only.
 `--to` is unaffected — it always routes to the named target(s).
 
-**Hosts** supply remote templates and auth. `github`, `gitlab`, `codeberg`,
+Hosts supply remote templates and auth. `github`, `gitlab`, `codeberg`,
 `sr.ht`, and `bitbucket` ship built in (both https and ssh); a `[hosts.X]` block
 adds a new forge or overrides a built-in's `remote`/`auth`. Auth is either
 `{ type = "token", env = "VAR" }` or `{ type = "ssh", key = "~/.ssh/key" }`.
 
-**Source flags:** `allow_symlinks`, `allow_submodules` (both default off),
+Source flags: `allow_symlinks`, `allow_submodules` (both default off),
 `preserve_executable` (default on), `deploy` (`"copy"` | `"link"`, default
 `"copy"`; `"link"` is local-overlay-only — see [Link mode](#link-mode-local-development)).
 
-**Layouts** decide how an artifact `a` from a binding `i` (its identity — the `as`
+Layouts decide how an artifact `a` from a binding `i` (its identity — the `as`
 alias, or the source name for a bare binding) is placed in a target:
 
 | Layout                          | Path        |
@@ -208,19 +261,19 @@ alias, or the source name for a bare binding) is placed in a target:
 ### Bindings
 
 A target's `sources` list says which sources it consumes — and, per source, how.
-Each entry is a **binding**: the edge from a target to a source. A source defines
+Each entry is a binding: the edge from a target to a source. A source defines
 provenance plus intrinsic selection defaults; a binding refines that selection for
 one target without touching the source or any other target.
 
 An entry is one of two forms:
 
-- **Bare name** — `"dotfiles"`. The target consumes the source with its intrinsic
+- Bare name — `"dotfiles"`. The target consumes the source with its intrinsic
   `root`/`include`/`exclude` defaults. Fully back-compatible.
-- **Refinement table** — `{ source = "dotfiles", as = "nvim", root = "nvim", include = […], exclude = […] }`.
-  Each of `root`/`include`/`exclude` set on the binding **overrides** the source's
-  same field for this target; any field omitted **inherits** from the source.
+- Refinement table — `{ source = "dotfiles", as = "nvim", root = "nvim", include = […], exclude = […] }`.
+  Each of `root`/`include`/`exclude` set on the binding overrides the source's
+  same field for this target; any field omitted inherits from the source.
 
-**Restriction.** `root`/`include`/`exclude` on a binding backed by a `url` source
+Restriction. `root`/`include`/`exclude` on a binding backed by a `url` source
 are config errors — a url source has no git tree to re-root.
 
 ```toml
@@ -229,7 +282,7 @@ path = "~/.config/nvim"
 sources = [{ source = "dotfiles", as = "nvim", root = "nvim" }]
 ```
 
-**Identity (`as`).** A binding's identity defaults to the source name and can be
+Identity (`as`). A binding's identity defaults to the source name and can be
 overridden with `as`. The identity keys the registry artifact and the `by-source`
 and `prefixed` layout labels, and must be unique within a target. Because identity
 is what's unique — not the source — the **same source can appear more than once in
@@ -245,7 +298,7 @@ sources = [
 layout = "by-source"     # labels each slice by its identity: nvim/… and helix/…
 ```
 
-**CLI.** `phora bind <source>… --to <target>` adds bindings; `--as`, `--root`,
+CLI. `phora bind <source>… --to <target>` adds bindings; `--as`, `--root`,
 `--include <glob>…`, and `--exclude <glob>…` refine them. Any refinement flag writes
 a table binding; with no flags it writes a bare string. Because `--as` sets a single
 binding identity, it cannot apply to multiple sources. `phora unbind <identity>…
@@ -259,14 +312,14 @@ nor refinement flags.
 
 A source declares its remote in exactly one kind — never more than one:
 
-- **Forge:** `host = "<alias>"` + `repo = "<owner/repo>"`, resolved at sync time
+- Forge: `host = "<alias>"` + `repo = "<owner/repo>"`, resolved at sync time
   from the host's `remote` template. `host` may be omitted when `repo` is set, in
   which case it defaults to `github` (`repo = "owner/repo"` is github shorthand).
-- **Local:** `path = "<dir-or-file>"`, a filesystem path used verbatim as the
+- Local: `path = "<dir-or-file>"`, a filesystem path used verbatim as the
   remote — exactly like a `git = "/abs/local"` URL.
-- **Literal:** `git = "<url>"`, any https, `ssh://`, or scp-style (`git@host:path`)
+- Literal: `git = "<url>"`, any https, `ssh://`, or scp-style (`git@host:path`)
   remote.
-- **Url:** `url = "https://…"`, a downloadable resource (see below).
+- Url: `url = "https://…"`, a downloadable resource (see below).
 
 ```toml
 [sources.tropos]
@@ -284,10 +337,10 @@ path = "~/dev/scratch"   # local checkout, used verbatim as the remote
 branch = "main"
 ```
 
-**Back-compat aliases.** `git = "/abs/local"` still declares a local source.
+Back-compat aliases. `git = "/abs/local"` still declares a local source.
 `host` + `path` (forge owner/repo) is a deprecated alias for `host` + `repo`.
 
-> **Breaking change:** a bare `path = "owner/repo"` (no host) now means a LOCAL
+> Breaking change: a bare `path = "owner/repo"` (no host) now means a LOCAL
 > path, not a github forge source. The github shorthand moved to bare
 > `repo = "owner/repo"`.
 
@@ -305,13 +358,13 @@ A host's `remote` is either a single template string (https) or a
 remote = { https = "https://git.company.com/{path}.git", ssh = "git@git.company.com:{path}.git" }
 ```
 
-**Built-in forges.** `github`, `gitlab`, `codeberg`, `sr.ht`, and `bitbucket`
+Built-in forges. `github`, `gitlab`, `codeberg`, `sr.ht`, and `bitbucket`
 ship as `remote` tables with both https and ssh shapes, so no template is needed
 for them. A `[hosts.X]` block of the same name overrides the built-in's `remote`
 or adds `auth`; changing a host's `remote` re-points every source on that host
 with no per-source edits.
 
-**Protocol.** `protocol = "https" | "ssh"` selects which template key a forge
+Protocol. `protocol = "https" | "ssh"` selects which template key a forge
 source resolves through. It defaults to `https`, can be set globally at the top
 level, and is overridable per source. Selecting `ssh` against a host whose
 `remote` has no `ssh` key is a config error. (`protocol` is ignored for literal
@@ -336,19 +389,19 @@ digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde
 include = ["fzf"]
 ```
 
-**Formats.** tar, tar.gz/tgz, and zip, detected by content (magic bytes); a
+Formats. tar, tar.gz/tgz, and zip, detected by content (magic bytes); a
 non-archive URL becomes a single file named from the URL basename.
 
-**Auto-strip.** When an archive has exactly one top-level directory it is stripped
+Auto-strip. When an archive has exactly one top-level directory it is stripped
 automatically, so version-stamped release tarballs (`fzf-0.55.0/…`) need no
 per-version `root` — and `root` re-selection is unavailable on url sources anyway.
 Only `include`/`exclude` apply; `root`/`branch`/`tag`/`rev` are config errors.
 
-**Integrity.** An optional `digest = "<algo>:<hex>"` (`sha256:` or `blake3:`, 64
-hex chars) is verified **before** extraction; a mismatch errors, naming the source
+Integrity. An optional `digest = "<algo>:<hex>"` (`sha256:` or `blake3:`, 64
+hex chars) is verified before extraction; a mismatch errors, naming the source
 with expected vs actual.
 
-**Determinism.** Content is imported as a content-addressed synthetic git commit
+Determinism. Content is imported as a content-addressed synthetic git commit
 (fixed identity, fixed time, constant message), so identical bytes yield an
 identical commit and no lock churn. The synthetic commit's time is fixed at epoch+1
 (1 second), not epoch 0, since some filesystems (FAT32, HFS+) clamp a 0 mtime —
@@ -357,28 +410,25 @@ which would otherwise make `phora verify` report every url-sourced file as modif
 re-downloads, and the lock advances only if the content changed. `phora verify`
 re-hashes deployed files with the same guarantees as git sources.
 
-**Out of scope (for now).** Auth for private assets and forge release-tag
-resolution (latest tag → asset URL) are future work; v1 targets public URLs.
-
 ### Link mode (local development)
 
 By default `deploy = "copy"` materializes a reflink-style copy of each artifact
 from the committed git ODB — point-in-time, content-hashed, verifiable. For a
-tight dev loop, `deploy = "link"` instead **symlinks** the artifact destination
+tight dev loop, `deploy = "link"` instead symlinks the artifact destination
 at the source's live working tree (`<source path>/<root>/<artifact>`, absolute).
 Uncommitted edits in the checkout are visible through the target immediately, with
 no re-sync.
 
 Two guardrails apply:
 
-- **Local overlay only.** `deploy = "link"` is honored only in `phora.local.toml`.
+- Local overlay only. `deploy = "link"` is honored only in `phora.local.toml`.
   Setting it in the committed `phora.toml` is a config error that names the source.
   Keep it out of shared config.
-- **Local path only.** A link source must be a local source: `path = "/dir"` (or
+- Local path only. A link source must be a local source: `path = "/dir"` (or
   the `git = "/dir"` alias), a local filesystem path. `deploy = "link"` on a remote
   URL is a config error.
 
-Linked artifacts sit **outside the integrity model**: their registry record carries
+Linked artifacts sit outside the integrity model: their registry record carries
 a `linked` marker and no per-file hashes. `phora verify` skips them, drift detection
 never reports them modified or foreign, `phora list` shows them as `linked`, and
 `phora rebuild-registry` reconstructs the marker without hashing. `--prune` removes
