@@ -195,6 +195,7 @@ When something looks off, the question you have usually maps to one command:
 - **Is what's on disk what phora actually deployed?** — `phora verify` (non-zero exit on any mismatch)
 - **Where did a deployed file come from?** — `phora where --source <source>` (by source / artifact / commit / digest)
 - **Registry wrong after hand-editing `~/.phora`?** — `phora rebuild-registry` (rebuilds it from the lock + on-disk targets)
+- **`sync` rejects a binding?** — two bindings sharing an identity in one target, a `root`/`include`/`exclude` on a `url` source, or a binding naming an undefined source are config errors; give each slice a distinct `as` and check the [Bindings](#bindings) rules.
 
 The [guide](GUIDE.md) goes deeper on each.
 
