@@ -73,10 +73,22 @@ include = ["fzf"]
 
 # A target is a directory artifacts are projected into. `sources` is an explicit
 # allow-list: list names to deploy them, or set `[]` (or omit the key) to deploy
-# nothing. Manage the list with `phora bind`/`phora unbind`.
+# nothing. Manage the list with `phora bind`/`phora unbind`. A `sources` entry is a
+# bare source name, or a table that refines how THIS target consumes the source:
+# `source` = provenance, the rest is this target's own slice.
 [targets.neovim]
 path = "~/.config/nvim"
-sources = ["dotfiles"]
+sources = [{ source = "dotfiles", as = "nvim", root = "nvim" }]
+
+# One source feeding one target as two independent slices: distinct `as`
+# identities re-root the same source, and `by-source` labels each slice by identity.
+[targets.editors]
+path = "~/.config"
+sources = [
+  { source = "dotfiles", as = "nvim",  root = "nvim" },
+  { source = "dotfiles", as = "helix", root = "helix" },
+]
+layout = "by-source"
 
 [targets.vscode]
 path = "~/.config/Code/User"

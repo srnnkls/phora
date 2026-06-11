@@ -29,14 +29,19 @@ Requires a Rust toolchain (edition 2024).
 
 ## Concepts
 
-- **Source** — a git repository, pinned by `branch`, `tag`, or `rev`. The
-  top-level directories under its `root` are its artifacts. Declare its remote as
-  a forge (`host` + `repo`), a local path (`path = "/dir"`), a literal git URL
-  (`git = "…"`), or a downloadable resource (`url = "https://…"`).
+- **Source** — provenance: where bytes come from, pinned by `branch`, `tag`, or
+  `rev`. The top-level directories under its `root` are its artifacts. Declare its
+  remote as a forge (`host` + `repo`), a local path (`path = "/dir"`), a literal git
+  URL (`git = "…"`), or a downloadable resource (`url = "https://…"`). A source may
+  also carry intrinsic selection defaults (`root`/`include`/`exclude`).
 - **Artifact** — one top-level directory in a source (dotfiles are skipped). Glob
   `include`/`exclude` rules select which artifacts and which files within them ship.
 - **Target** — a local directory artifacts are projected into, with a chosen
   layout. A target draws from its explicit `sources` allow-list.
+- **Binding** — a target's link to a source. Selection lives here per consumer: a
+  binding is a bare source name (inherit the source's defaults) or a table that
+  refines `root`/`include`/`exclude` for that target alone, and names the slice via
+  `as`. See [Bindings](#bindings).
 - **Lock** — `phora.lock` pins each source to a resolved commit so syncs are
   reproducible (`phora.local.toml` gets a companion `phora.local.lock`).
   `phora update` bumps it.
@@ -56,6 +61,14 @@ phora add https://github.com/me/dotfiles.git  # scheme/scp URLs stay literal (gi
 phora add git@github.com:me/dotfiles.git --tag v1.2
 # Deep GitLab subgroups go in the config `repo` field (repo = "group/sub/proj"),
 # not the colon alias (segments past owner/repo become `root`).
+
+# Bind sources to a target; refinement flags scope the binding to that target
+phora bind dotfiles --to neovim                          # bare binding, inherits source
+phora bind dotfiles --to neovim --as nvim --root nvim    # refined slice, named `nvim`
+phora unbind nvim --from neovim                          # remove a binding by identity
+# `phora add <url> --to <target>` takes the same refinement flags; with --to present,
+# --root scopes the binding (a bare add keeps --root on the source).
+phora add me/dotfiles --to neovim --as nvim --root nvim
 
 # Fetch sources, resolve commits, project artifacts into targets
 phora sync
@@ -160,6 +173,7 @@ exclude = ["**/*.bak"]
 [targets.neovim]
 path = "~/.config/nvim"
 sources = ["dotfiles"]   # the allow-list of sources this target deploys
+# or refine per target: sources = [{ source = "dotfiles", as = "nvim", root = "nvim" }]
 layout = "flat"          # "flat" | "by-source" | { type = "prefixed", separator = "-" }
 ```
 
@@ -182,13 +196,64 @@ adds a new forge or overrides a built-in's `remote`/`auth`. Auth is either
 `preserve_executable` (default on), `deploy` (`"copy"` | `"link"`, default
 `"copy"`; `"link"` is local-overlay-only — see [Link mode](#link-mode-local-development)).
 
-**Layouts** decide how an artifact `a` from source `s` is placed in a target:
+**Layouts** decide how an artifact `a` from a binding `i` (its identity — the `as`
+alias, or the source name for a bare binding) is placed in a target:
 
 | Layout                          | Path        |
 | ------------------------------- | ----------- |
 | `flat` (default)                | `a`         |
-| `by-source`                     | `s/a`       |
-| `{ type = "prefixed", sep="-" }`| `s-a`       |
+| `by-source`                     | `i/a`       |
+| `{ type = "prefixed", sep="-" }`| `i-a`       |
+
+### Bindings
+
+A target's `sources` list says which sources it consumes — and, per source, how.
+Each entry is a **binding**: the edge from a target to a source. A source defines
+provenance plus intrinsic selection defaults; a binding refines that selection for
+one target without touching the source or any other target.
+
+An entry is one of two forms:
+
+- **Bare name** — `"dotfiles"`. The target consumes the source with its intrinsic
+  `root`/`include`/`exclude` defaults. Fully back-compatible.
+- **Refinement table** — `{ source = "dotfiles", as = "nvim", root = "nvim", include = […], exclude = […] }`.
+  Each of `root`/`include`/`exclude` set on the binding **overrides** the source's
+  same field for this target; any field omitted **inherits** from the source.
+
+**Restriction.** `root`/`include`/`exclude` on a binding backed by a `url` source
+are config errors — a url source has no git tree to re-root.
+
+```toml
+[targets.neovim]
+path = "~/.config/nvim"
+sources = [{ source = "dotfiles", as = "nvim", root = "nvim" }]
+```
+
+**Identity (`as`).** A binding's identity defaults to the source name and can be
+overridden with `as`. The identity keys the registry artifact and the `by-source`
+and `prefixed` layout labels, and must be unique within a target. Because identity
+is what's unique — not the source — the **same source can appear more than once in
+one target** under distinct `as` values, projecting two independent slices:
+
+```toml
+[targets.editors]
+path = "~/.config"
+sources = [
+  { source = "dotfiles", as = "nvim",   root = "nvim" },
+  { source = "dotfiles", as = "helix",  root = "helix" },
+]
+layout = "by-source"     # labels each slice by its identity: nvim/… and helix/…
+```
+
+**CLI.** `phora bind <source>… --to <target>` adds bindings; `--as`, `--root`,
+`--include <glob>…`, and `--exclude <glob>…` refine them. Any refinement flag writes
+a table binding; with no flags it writes a bare string. Because `--as` sets a single
+binding identity, it cannot apply to multiple sources. `phora unbind <identity>…
+--from <target>` removes bindings by their identity. `phora add <url> --to <target>`
+accepts the same refinement flags, scoping the binding rather than the source; here
+`--as` requires exactly one `--to` target (it errors with multiple `--to`, or with no
+`--to` at all). Local/symlink overlays (`--local`/`--symlink`) accept neither `--to`
+nor refinement flags.
 
 ### Source kinds
 
