@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::config::{Config, ParsedSource, Protocol};
+use crate::config::{Config, ParsedSource, Protocol, Target};
 use crate::deploy::check_artifact_state;
 use crate::error::{Error, Result};
 use crate::kernel::Selection;
@@ -199,18 +199,27 @@ fn resolved_remote(config: &Config, parsed: &ParsedSource) -> Result<String> {
     parsed.resolved_remote(&config.hosts, protocol)
 }
 
-/// Every target whose `sources` list includes `name`.
+/// Every target with a binding whose underlying source is `name`.
 #[must_use]
 pub fn targets_receiving(config: &Config, name: &str) -> Vec<String> {
     let mut receiving: Vec<String> = config
         .targets
         .iter()
-        .filter(|(_, target)| target.resolve_sources().contains(&name))
+        .filter(|(_, target)| target.declared_sources().any(|source| source == name))
         .map(|(target_name, _)| target_name.clone())
         .collect();
     receiving.sort();
     receiving.dedup();
     receiving
+}
+
+fn binding_identities(target: &Target) -> Vec<String> {
+    target
+        .sources
+        .iter()
+        .flatten()
+        .map(|binding| binding.identity().to_owned())
+        .collect()
 }
 
 /// `phora source show`: effective source config + targets that deploy it.
@@ -241,7 +250,7 @@ pub fn target_listing(config: &Config) -> Vec<TargetRow> {
         .map(|(name, target)| TargetRow {
             name: name.clone(),
             path: target.path.to_string_lossy().into_owned(),
-            resolution: SourceResolution::Explicit(target.sources.clone().unwrap_or_default()),
+            resolution: SourceResolution::Explicit(binding_identities(target)),
         })
         .collect()
 }
@@ -257,11 +266,7 @@ pub fn target_detail(config: &Config, registry: &dyn Registry, name: &str) -> Re
         .targets
         .get(name)
         .ok_or_else(|| Error::Config(format!("target `{name}` is not defined")))?;
-    let bound_sources = target
-        .resolve_sources()
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
+    let bound_sources = binding_identities(target);
     Ok(TargetDetail {
         name: name.to_owned(),
         path: target.path.to_string_lossy().into_owned(),

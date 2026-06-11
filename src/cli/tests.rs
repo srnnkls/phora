@@ -96,6 +96,7 @@ fn record(
             source: source.to_owned(),
             artifact: artifact.to_owned(),
         },
+        source: source.to_owned(),
         commit: commit.to_owned(),
         digest: digest.to_owned(),
         projected_at: "2026-01-31T12:34:56Z".to_owned(),
@@ -1168,6 +1169,7 @@ fn run_add_end_to_end_persists_symbolic_source_to_phora_toml() {
             None,
             false,
             false,
+            &config_edit::BindRefinement::default(),
         )
         .expect("run_add must succeed for a symbolic colon alias");
     });
@@ -1193,6 +1195,87 @@ fn run_add_end_to_end_persists_symbolic_source_to_phora_toml() {
     assert!(
         src.git.is_none(),
         "run_add end-to-end must not persist a literal git for a symbolic add"
+    );
+}
+
+#[test]
+fn source_rm_command_scrubs_bindings_and_source_def_from_phora_toml() {
+    let dir = tempfile::TempDir::new().expect("temp project dir");
+    let toml_path = dir.path().join("phora.toml");
+    std::fs::write(
+        &toml_path,
+        "version = 1\n\
+         \n\
+         [sources.dotfiles]\n\
+         git = \"https://github.com/me/dotfiles.git\"\n\
+         \n\
+         [sources.loqui]\n\
+         git = \"https://github.com/me/loqui.git\"\n\
+         \n\
+         [targets.editor]\n\
+         path = \"~/.config/editor\"\n\
+         sources = [\"dotfiles\", { source = \"dotfiles\", as = \"nvim\" }]\n\
+         \n\
+         [targets.shell]\n\
+         path = \"~/.config/shell\"\n\
+         sources = [\"loqui\"]\n",
+    )
+    .expect("seed phora.toml");
+
+    with_cwd(dir.path(), || {
+        run(Cli {
+            command: Command::Source {
+                cmd: SourceCmd::Rm {
+                    name: "dotfiles".to_owned(),
+                },
+            },
+        })
+        .expect("`phora source rm dotfiles` must succeed");
+    });
+
+    let written = std::fs::read_to_string(&toml_path)
+        .expect("the command must leave phora.toml on disk in the cwd");
+    let config = Config::parse(&written)
+        .unwrap_or_else(|e| panic!("scrubbed phora.toml must re-parse: {e}\n{written}"));
+
+    assert!(
+        !config.sources.contains_key("dotfiles"),
+        "`source rm dotfiles` must drop [sources.dotfiles], got:\n{written}"
+    );
+    assert!(
+        config.sources.contains_key("loqui"),
+        "`source rm dotfiles` must NOT touch the unrelated [sources.loqui], got:\n{written}"
+    );
+
+    let editor = config
+        .targets
+        .get("editor")
+        .expect("target `editor` must survive a source rm");
+    let editor_underlying: Vec<&str> = editor
+        .sources
+        .iter()
+        .flatten()
+        .map(crate::config::Binding::source)
+        .collect();
+    assert!(
+        !editor_underlying.contains(&"dotfiles"),
+        "every dotfiles binding (bare AND `as = \"nvim\"`) must be scrubbed from target `editor`, got bindings={editor_underlying:?}\n{written}"
+    );
+
+    let shell = config
+        .targets
+        .get("shell")
+        .expect("target `shell` must be untouched by a source rm");
+    let shell_underlying: Vec<&str> = shell
+        .sources
+        .iter()
+        .flatten()
+        .map(crate::config::Binding::source)
+        .collect();
+    assert_eq!(
+        shell_underlying,
+        vec!["loqui"],
+        "the unrelated target `shell` must still bind exactly `loqui`, got bindings={shell_underlying:?}\n{written}"
     );
 }
 
@@ -1435,6 +1518,7 @@ fn record_for(
             source: source.to_owned(),
             artifact: artifact.to_owned(),
         },
+        source: source.to_owned(),
         commit: commit.to_owned(),
         digest: "blake3:rec".to_owned(),
         projected_at: "2026-01-31T12:34:56Z".to_owned(),
@@ -1763,6 +1847,7 @@ fn add_local_writes_path_local_path_to_phora_local_toml() {
             None,
             true,
             false,
+            &config_edit::BindRefinement::default(),
         )
         .expect("run_add --local must succeed for an existing dir");
     });
@@ -1801,6 +1886,7 @@ fn add_symlink_writes_path_and_deploy_link_to_local_toml() {
             None,
             false,
             true,
+            &config_edit::BindRefinement::default(),
         )
         .expect("run_add --symlink must succeed for an existing dir");
     });
@@ -1843,6 +1929,7 @@ fn add_local_infers_name_from_path_basename() {
             None,
             true,
             false,
+            &config_edit::BindRefinement::default(),
         )
         .expect("run_add --local with no --name must succeed");
     });
@@ -1873,6 +1960,7 @@ fn add_symlink_implies_local_overlay_and_is_valid() {
             None,
             false,
             true,
+            &config_edit::BindRefinement::default(),
         )
         .expect("run_add --symlink must succeed");
     });
@@ -1912,6 +2000,7 @@ fn add_local_and_symlink_together_equals_symlink() {
                 None,
                 local,
                 symlink,
+                &config_edit::BindRefinement::default(),
             )
             .expect("run_add must not error");
         });
@@ -1969,6 +2058,7 @@ fn add_without_flags_still_writes_phora_toml() {
             None,
             false,
             false,
+            &config_edit::BindRefinement::default(),
         )
         .expect("run_add with no overlay flags must keep its remote behavior");
     });
@@ -2007,6 +2097,7 @@ fn add_local_canonicalizes_relative_path_to_absolute() {
             None,
             true,
             false,
+            &config_edit::BindRefinement::default(),
         )
         .expect("run_add --local must accept a relative existing path");
     });
@@ -2041,6 +2132,7 @@ fn add_local_errors_when_path_does_not_exist() {
             None,
             true,
             false,
+            &config_edit::BindRefinement::default(),
         )
         .expect_err("--local on a nonexistent path must error")
     });
@@ -2080,6 +2172,7 @@ fn add_local_rejects_non_directory_path() {
             None,
             true,
             false,
+            &config_edit::BindRefinement::default(),
         )
         .expect_err("--local on a regular file must error")
     });
@@ -2125,6 +2218,7 @@ fn add_local_preserves_siblings_and_replaces_same_name_in_overlay() {
             None,
             true,
             false,
+            &config_edit::BindRefinement::default(),
         )
         .expect("adding a new overlay source must succeed");
     });
@@ -2151,6 +2245,7 @@ fn add_local_preserves_siblings_and_replaces_same_name_in_overlay() {
             None,
             true,
             false,
+            &config_edit::BindRefinement::default(),
         )
         .expect("re-adding the same name must succeed");
     });
@@ -2194,6 +2289,7 @@ fn add_symlink_overlay_overrides_base_source_after_merge() {
             None,
             false,
             true,
+            &config_edit::BindRefinement::default(),
         )
         .expect("--symlink --name app must write the overlay");
     });
@@ -2223,6 +2319,1104 @@ fn add_symlink_overlay_overrides_base_source_after_merge() {
         Some(DeployMode::Link),
         "the overlay deploy = link must win after merge"
     );
+}
+
+// ── remove_source: scrub bindings out of every target ──────────
+
+fn binding_sources(cfg: &Config, target: &str) -> Vec<String> {
+    use crate::config::Binding;
+    cfg.targets
+        .get(target)
+        .and_then(|t| t.sources.as_deref())
+        .unwrap_or(&[])
+        .iter()
+        .map(|b| match b {
+            Binding::Source(name) => name.clone(),
+            Binding::Refined(r) => r.source.clone(),
+        })
+        .collect()
+}
+
+#[test]
+fn remove_source_drops_bare_binding_of_named_source_from_target() {
+    let toml = "version = 1\n\n\
+        [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
+        [sources.loqui]\ngit = \"https://github.com/srnnkls/loqui.git\"\n\n\
+        [targets.editor]\npath = \"~/.config\"\nsources = [\"dotfiles\", \"loqui\"]\n";
+
+    let out = remove_source(toml, "version = 1\n", "dotfiles")
+        .expect("scrub the dotfiles source")
+        .main;
+    let cfg = Config::parse(&out).expect("scrubbed text is valid phora.toml");
+
+    let remaining = binding_sources(&cfg, "editor");
+    assert!(
+        !remaining.iter().any(|s| s == "dotfiles"),
+        "`phora source rm dotfiles` must drop the bare `dotfiles` binding from target `editor`, \
+         got: {remaining:?}"
+    );
+    assert!(
+        remaining.iter().any(|s| s == "loqui"),
+        "a binding of a different source (`loqui`) must be left untouched, got: {remaining:?}"
+    );
+}
+
+#[test]
+fn remove_source_drops_aliased_table_binding_by_underlying_source_field() {
+    let toml = "version = 1\n\n\
+        [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
+        [sources.loqui]\ngit = \"https://github.com/srnnkls/loqui.git\"\n\n\
+        [targets.editor]\npath = \"~/.config\"\n\
+        sources = [{ source = \"dotfiles\", as = \"nvim\" }, \"loqui\"]\n";
+
+    let out = remove_source(toml, "version = 1\n", "dotfiles")
+        .expect("scrub the dotfiles source")
+        .main;
+    let cfg = Config::parse(&out).expect("scrubbed text is valid phora.toml");
+
+    let remaining = binding_sources(&cfg, "editor");
+    assert!(
+        !remaining.iter().any(|s| s == "dotfiles"),
+        "`phora source rm dotfiles` must drop the aliased `{{ source = dotfiles, as = nvim }}` \
+         binding by matching its underlying `source` field, not the `as` string `nvim`, so the \
+         binding is not left orphaned; got: {remaining:?}"
+    );
+    assert!(
+        remaining.iter().any(|s| s == "loqui"),
+        "a binding of a different source (`loqui`) must survive the scrub, got: {remaining:?}"
+    );
+}
+
+#[test]
+fn remove_source_also_removes_the_source_definition() {
+    let toml = "version = 1\n\n\
+        [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
+        [targets.editor]\npath = \"~/.config\"\nsources = [\"dotfiles\"]\n";
+
+    let out = remove_source(toml, "version = 1\n", "dotfiles")
+        .expect("scrub the dotfiles source")
+        .main;
+    let cfg = Config::parse(&out).expect("scrubbed text is valid phora.toml");
+
+    assert!(
+        !cfg.sources.contains_key("dotfiles"),
+        "`phora source rm dotfiles` must remove the `[sources.dotfiles]` definition itself"
+    );
+}
+
+#[test]
+fn remove_source_scrubs_every_target_and_leaves_others_intact() {
+    let untouched_target = "[targets.solo]\npath = \"~/.solo\"\nsources = [\"loqui\"]\n";
+    let toml = format!(
+        "version = 1\n\n\
+        [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
+        [sources.loqui]\ngit = \"https://github.com/srnnkls/loqui.git\"\n\n\
+        [targets.editor]\npath = \"~/.config\"\nsources = [\"dotfiles\", \"loqui\"]\n\n\
+        [targets.shell]\npath = \"~/.shell\"\n\
+        sources = [{{ source = \"dotfiles\", as = \"nvim\" }}, \"loqui\"]\n\n\
+        {untouched_target}"
+    );
+
+    let out = remove_source(&toml, "version = 1\n", "dotfiles")
+        .expect("scrub the dotfiles source")
+        .main;
+    let cfg = Config::parse(&out).expect("scrubbed text is valid phora.toml");
+
+    assert!(
+        !binding_sources(&cfg, "editor")
+            .iter()
+            .any(|s| s == "dotfiles"),
+        "the bare dotfiles binding must be scrubbed from target `editor`"
+    );
+    assert!(
+        !binding_sources(&cfg, "shell")
+            .iter()
+            .any(|s| s == "dotfiles"),
+        "the aliased dotfiles binding must be scrubbed from the SECOND target `shell` too: \
+         the scrub must sweep EVERY target, not just the first"
+    );
+    assert!(
+        binding_sources(&cfg, "editor").iter().any(|s| s == "loqui"),
+        "the loqui binding in `editor` must survive"
+    );
+    assert!(
+        binding_sources(&cfg, "shell").iter().any(|s| s == "loqui"),
+        "the loqui binding in `shell` must survive"
+    );
+
+    assert!(
+        out.contains(untouched_target),
+        "the loqui-only target `solo` binds no removed source and must be left byte-for-byte \
+         unchanged, got:\n{out}"
+    );
+    assert!(
+        !cfg.sources.contains_key("dotfiles"),
+        "the `[sources.dotfiles]` definition itself must be removed"
+    );
+}
+
+#[test]
+fn source_rm_keeps_binding_whose_alias_matches_but_source_differs() {
+    let toml = "version = 1\n\n\
+        [sources.loqui]\ngit = \"https://github.com/srnnkls/loqui.git\"\n\n\
+        [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
+        [targets.editor]\npath = \"~/.config\"\n\
+        sources = [{ source = \"loqui\", as = \"dotfiles\" }, \"dotfiles\"]\n";
+
+    let out = remove_source(toml, "version = 1\n", "dotfiles")
+        .expect("scrub the dotfiles source")
+        .main;
+    let cfg = Config::parse(&out).expect("scrubbed text is valid phora.toml");
+
+    let remaining = binding_sources(&cfg, "editor");
+    assert!(
+        remaining.iter().any(|s| s == "loqui"),
+        "`source rm dotfiles` must KEEP the `{{ source = loqui, as = dotfiles }}` binding: it is \
+         matched by its underlying `source` (loqui), not its alias `dotfiles`, got: {remaining:?}"
+    );
+    assert!(
+        !remaining.iter().any(|s| s == "dotfiles"),
+        "the bare `dotfiles` binding (source = dotfiles) must be removed, got: {remaining:?}"
+    );
+}
+
+// ── bind / unbind: per-binding refinement, mixed-array aware ────
+
+fn binding_identities(cfg: &Config, target: &str) -> Vec<String> {
+    cfg.targets
+        .get(target)
+        .and_then(|t| t.sources.as_deref())
+        .unwrap_or(&[])
+        .iter()
+        .map(|b| b.identity().to_owned())
+        .collect()
+}
+
+fn refined_binding(cfg: &Config, target: &str, identity: &str) -> crate::config::RefinedBinding {
+    cfg.targets
+        .get(target)
+        .and_then(|t| t.sources.as_deref())
+        .unwrap_or(&[])
+        .iter()
+        .find_map(|b| match b {
+            crate::config::Binding::Refined(r) if b.identity() == identity => Some(r.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!("target `{target}` must hold a TABLE binding with identity `{identity}`")
+        })
+}
+
+#[test]
+fn bind_with_refinement_flags_writes_a_table_entry() {
+    let toml = "version = 1\n\n\
+        [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
+        [targets.editor]\npath = \"~/.config\"\nsources = []\n";
+
+    let out = config_edit::bind(
+        toml,
+        "editor",
+        &["dotfiles".to_owned()],
+        &config_edit::BindRefinement {
+            r#as: Some("nvim".to_owned()),
+            root: Some("nvim".to_owned()),
+            include: Vec::new(),
+            exclude: Vec::new(),
+        },
+    )
+    .expect("bind with refinement flags must succeed")
+    .text;
+
+    let cfg = Config::parse(&out)
+        .unwrap_or_else(|e| panic!("bind output must be valid phora.toml: {e}\n{out}"));
+    let refined = refined_binding(&cfg, "editor", "nvim");
+    assert_eq!(
+        refined.source, "dotfiles",
+        "ANY refinement flag must write a TABLE binding carrying `source = \"dotfiles\"`, got:\n{out}"
+    );
+    assert_eq!(
+        refined.r#as.as_deref(),
+        Some("nvim"),
+        "`--as nvim` must land as `as = \"nvim\"` in the table binding, got:\n{out}"
+    );
+    assert_eq!(
+        refined.root.as_deref(),
+        Some(std::path::Path::new("nvim")),
+        "`--root nvim` must land as `root = \"nvim\"` in the table binding, got:\n{out}"
+    );
+}
+
+#[test]
+fn bind_with_no_flags_writes_a_bare_string() {
+    let toml = "version = 1\n\n\
+        [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
+        [targets.editor]\npath = \"~/.config\"\nsources = []\n";
+
+    let out = config_edit::bind(
+        toml,
+        "editor",
+        &["dotfiles".to_owned()],
+        &config_edit::BindRefinement::default(),
+    )
+    .expect("bind with no flags must succeed")
+    .text;
+
+    let cfg = Config::parse(&out)
+        .unwrap_or_else(|e| panic!("bind output must be valid phora.toml: {e}\n{out}"));
+    let editor = cfg
+        .targets
+        .get("editor")
+        .expect("target editor survives bind");
+    let bindings = editor.sources.as_deref().unwrap_or(&[]);
+    assert!(
+        matches!(bindings.first(), Some(crate::config::Binding::Source(s)) if s == "dotfiles"),
+        "bind with NO refinement flags must append a BARE STRING, not a table, got:\n{out}"
+    );
+}
+
+#[test]
+fn bind_appends_into_an_array_that_already_holds_a_table_entry() {
+    let toml = "version = 1\n\n\
+        [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
+        [sources.loqui]\ngit = \"https://github.com/srnnkls/loqui.git\"\n\n\
+        [targets.editor]\npath = \"~/.config\"\n\
+        sources = [{ source = \"dotfiles\", as = \"nvim\" }]\n";
+
+    let out = config_edit::bind(
+        toml,
+        "editor",
+        &["loqui".to_owned()],
+        &config_edit::BindRefinement::default(),
+    )
+    .expect("bind must READ a mixed array holding a table entry WITHOUT erroring")
+    .text;
+
+    let cfg = Config::parse(&out)
+        .unwrap_or_else(|e| panic!("bind output must be valid phora.toml: {e}\n{out}"));
+    let identities = binding_identities(&cfg, "editor");
+    assert!(
+        identities.iter().any(|i| i == "nvim"),
+        "the pre-existing aliased table binding (identity `nvim`) must be preserved, got: {identities:?}\n{out}"
+    );
+    assert!(
+        identities.iter().any(|i| i == "loqui"),
+        "the newly bound bare source `loqui` must be appended, got: {identities:?}\n{out}"
+    );
+}
+
+#[test]
+fn bind_as_with_multiple_sources_errors() {
+    let toml = "version = 1\n\n\
+        [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
+        [sources.loqui]\ngit = \"https://github.com/srnnkls/loqui.git\"\n\n\
+        [targets.editor]\npath = \"~/.config\"\nsources = []\n";
+
+    let result = config_edit::bind(
+        toml,
+        "editor",
+        &["dotfiles".to_owned(), "loqui".to_owned()],
+        &config_edit::BindRefinement {
+            r#as: Some("nvim".to_owned()),
+            ..config_edit::BindRefinement::default()
+        },
+    );
+
+    assert!(
+        result.is_err(),
+        "`--as` is a single identity; binding it across 2 sources is ambiguous and must error"
+    );
+}
+
+#[test]
+fn unbind_removes_the_aliased_entry_by_identity() {
+    let toml = "version = 1\n\n\
+        [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
+        [targets.editor]\npath = \"~/.config\"\n\
+        sources = [\"dotfiles\", { source = \"dotfiles\", as = \"nvim\" }]\n";
+
+    let out = config_edit::unbind(toml, "editor", &["nvim".to_owned()])
+        .expect("unbind by identity must succeed")
+        .text;
+
+    let cfg = Config::parse(&out)
+        .unwrap_or_else(|e| panic!("unbind output must be valid phora.toml: {e}\n{out}"));
+    let identities = binding_identities(&cfg, "editor");
+    assert!(
+        !identities.iter().any(|i| i == "nvim"),
+        "`unbind nvim` must drop the ALIASED `{{ source = dotfiles, as = nvim }}` binding by IDENTITY, got: {identities:?}\n{out}"
+    );
+    assert!(
+        identities.iter().any(|i| i == "dotfiles"),
+        "the bare `dotfiles` binding (identity `dotfiles`) must survive unbinding the alias `nvim`, got: {identities:?}\n{out}"
+    );
+}
+
+#[test]
+fn string_only_bind_then_unbind_is_byte_identical_to_today() {
+    let toml = "version = 1\n\n\
+        [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
+        [targets.editor]\npath = \"~/.config\"\nsources = []\n";
+
+    let bound = config_edit::bind(
+        toml,
+        "editor",
+        &["dotfiles".to_owned()],
+        &config_edit::BindRefinement::default(),
+    )
+    .expect("string-only bind must succeed")
+    .text;
+    assert!(
+        bound.contains("sources = [\"dotfiles\"]"),
+        "a string-only bind must produce the same bare-string array as today, got:\n{bound}"
+    );
+
+    let unbound = config_edit::unbind(&bound, "editor", &["dotfiles".to_owned()])
+        .expect("string-only unbind must succeed")
+        .text;
+    assert_eq!(
+        unbound, toml,
+        "bind then unbind of a single bare string must round-trip BYTE-IDENTICAL to the original config"
+    );
+}
+
+#[test]
+fn bind_reads_mixed_array_and_dedups_by_identity_without_erroring() {
+    let toml = "version = 1\n\n\
+        [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
+        [targets.editor]\npath = \"~/.config\"\n\
+        sources = [\"dotfiles\", { source = \"dotfiles\", as = \"nvim\" }]\n";
+
+    let out = config_edit::bind(
+        toml,
+        "editor",
+        &["dotfiles".to_owned()],
+        &config_edit::BindRefinement::default(),
+    )
+    .expect(
+        "bind must READ a mixed string|table array WITHOUT erroring (table entries are now VALID); \
+         the old `non-string entry errors` behavior is gone",
+    )
+    .text;
+
+    let cfg = Config::parse(&out)
+        .unwrap_or_else(|e| panic!("bind output must be valid phora.toml: {e}\n{out}"));
+    let identities = binding_identities(&cfg, "editor");
+    assert_eq!(
+        identities,
+        vec!["dotfiles".to_owned(), "nvim".to_owned()],
+        "re-binding bare `dotfiles` must dedup by IDENTITY: the existing bare `dotfiles` and aliased \
+         `nvim` (identity) both survive, with no duplicate `dotfiles` appended, got: {identities:?}\n{out}"
+    );
+}
+
+#[test]
+fn bind_with_zero_sources_is_rejected_by_clap() {
+    let result = Cli::command().try_get_matches_from(["phora", "bind", "--to", "editor"]);
+    assert!(
+        result.is_err(),
+        "`phora bind --to T` with no positional sources must be a clap usage error, not a silent no-op write"
+    );
+}
+
+#[test]
+fn unbind_with_zero_identities_is_rejected_by_clap() {
+    let result = Cli::command().try_get_matches_from(["phora", "unbind", "--from", "editor"]);
+    assert!(
+        result.is_err(),
+        "`phora unbind --from T` with no positional identities must be a clap usage error"
+    );
+}
+
+#[test]
+fn bind_root_on_url_source_errors_and_leaves_file_untouched() {
+    let toml = "version = 1\n\n\
+        [sources.fonts]\nurl = \"https://example.com/fonts.tar.gz\"\n\n\
+        [targets.editor]\npath = \"~/.config\"\nsources = []\n";
+
+    let result = config_edit::bind(
+        toml,
+        "editor",
+        &["fonts".to_owned()],
+        &config_edit::BindRefinement {
+            root: Some("sub".to_owned()),
+            ..config_edit::BindRefinement::default()
+        },
+    );
+
+    assert!(
+        result.is_err(),
+        "binding `--root` onto a `url` source writes a config `validate()` rejects; \
+         bind must validate the edited document and refuse, not return a poisoned text"
+    );
+}
+
+#[test]
+fn bind_bare_when_table_entry_exists_preserves_table_and_reports_unchanged() {
+    let toml = "version = 1\n\n\
+        [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
+        [targets.editor]\npath = \"~/.config\"\n\
+        sources = [{ source = \"dotfiles\", root = \"nvim\" }]\n";
+
+    let result = config_edit::bind(
+        toml,
+        "editor",
+        &["dotfiles".to_owned()],
+        &config_edit::BindRefinement::default(),
+    )
+    .expect("a bare re-bind of an existing identity is a valid no-op, not an error");
+
+    assert!(
+        !result.changed,
+        "a bare re-bind that preserves an existing TABLE entry changes nothing and must report `changed = false`"
+    );
+
+    let cfg = Config::parse(&result.text)
+        .unwrap_or_else(|e| panic!("bind output must be valid phora.toml: {e}\n{}", result.text));
+    let refined = refined_binding(&cfg, "editor", "dotfiles");
+    assert_eq!(
+        refined.root.as_deref(),
+        Some(std::path::Path::new("nvim")),
+        "the bare re-bind must PRESERVE the existing table entry's `root`, not downgrade it to a bare string, got:\n{}",
+        result.text
+    );
+}
+
+// ── PBR-007: `add --to T` threads per-binding refinement ────
+
+#[test]
+fn add_to_with_refinement_flags_writes_source_and_table_binding() {
+    let dir = tempfile::TempDir::new().expect("temp project dir");
+    let toml_path = dir.path().join("phora.toml");
+    std::fs::write(
+        &toml_path,
+        "version = 1\n\n\
+         [targets.editor]\npath = \"~/.config/editor\"\nsources = []\n",
+    )
+    .expect("seed phora.toml with an empty target");
+
+    with_cwd(dir.path(), || {
+        run(Cli {
+            command: Command::Add {
+                url: "github:srnnkls/tropos".to_owned(),
+                name: None,
+                branch: None,
+                tag: None,
+                root: Some("nvim".to_owned()),
+                local: false,
+                symlink: false,
+                to: vec!["editor".to_owned()],
+                r#as: Some("nvim".to_owned()),
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+        })
+        .expect("`add --to editor --as nvim --root nvim` must succeed");
+    });
+
+    let written = std::fs::read_to_string(&toml_path).expect("add must leave phora.toml on disk");
+    let cfg = Config::parse(&written)
+        .unwrap_or_else(|e| panic!("add output must be valid phora.toml: {e}\n{written}"));
+
+    let src = source_from(&written, "tropos");
+    assert_eq!(
+        src.host.as_deref(),
+        Some("github"),
+        "`add --to` must still write the source into [sources.*], got:\n{written}"
+    );
+    assert_eq!(
+        src.repo.as_deref(),
+        Some("srnnkls/tropos"),
+        "`add --to` must persist the symbolic repo, got:\n{written}"
+    );
+
+    let refined = refined_binding(&cfg, "editor", "nvim");
+    assert_eq!(
+        refined.source, "tropos",
+        "`add --to editor` with refinement flags must write a TABLE binding carrying \
+         `source = \"tropos\"`, got:\n{written}"
+    );
+    assert_eq!(
+        refined.r#as.as_deref(),
+        Some("nvim"),
+        "`--as nvim` on add must land as `as = \"nvim\"` in the binding, got:\n{written}"
+    );
+    assert_eq!(
+        refined.root.as_deref(),
+        Some(std::path::Path::new("nvim")),
+        "`--root nvim` on `add --to` must land as the BINDING `root = \"nvim\"`, got:\n{written}"
+    );
+}
+
+#[test]
+fn add_to_with_no_refinement_flags_writes_a_bare_string_binding() {
+    let dir = tempfile::TempDir::new().expect("temp project dir");
+    let toml_path = dir.path().join("phora.toml");
+    std::fs::write(
+        &toml_path,
+        "version = 1\n\n\
+         [targets.editor]\npath = \"~/.config/editor\"\nsources = []\n",
+    )
+    .expect("seed phora.toml with an empty target");
+
+    with_cwd(dir.path(), || {
+        run(Cli {
+            command: Command::Add {
+                url: "github:srnnkls/tropos".to_owned(),
+                name: None,
+                branch: None,
+                tag: None,
+                root: None,
+                local: false,
+                symlink: false,
+                to: vec!["editor".to_owned()],
+                r#as: None,
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+        })
+        .expect("`add --to editor` with no refinement flags must succeed");
+    });
+
+    let written = std::fs::read_to_string(&toml_path).expect("add must leave phora.toml on disk");
+    let cfg = Config::parse(&written)
+        .unwrap_or_else(|e| panic!("add output must be valid phora.toml: {e}\n{written}"));
+
+    let editor = cfg
+        .targets
+        .get("editor")
+        .expect("target editor survives add --to");
+    let bindings = editor.sources.as_deref().unwrap_or(&[]);
+    assert!(
+        matches!(bindings.first(), Some(crate::config::Binding::Source(s)) if s == "tropos"),
+        "`add --to editor` with NO refinement flags must append a BARE STRING `\"tropos\"`, \
+         not a table, got:\n{written}"
+    );
+}
+
+#[test]
+fn add_as_with_multiple_targets_errors() {
+    let dir = tempfile::TempDir::new().expect("temp project dir");
+    let toml_path = dir.path().join("phora.toml");
+    std::fs::write(
+        &toml_path,
+        "version = 1\n\n\
+         [targets.editor]\npath = \"~/.config/editor\"\nsources = []\n\n\
+         [targets.shell]\npath = \"~/.config/shell\"\nsources = []\n",
+    )
+    .expect("seed phora.toml with two empty targets");
+
+    let result = with_cwd(dir.path(), || {
+        run(Cli {
+            command: Command::Add {
+                url: "github:srnnkls/tropos".to_owned(),
+                name: None,
+                branch: None,
+                tag: None,
+                root: None,
+                local: false,
+                symlink: false,
+                to: vec!["editor".to_owned(), "shell".to_owned()],
+                r#as: Some("nvim".to_owned()),
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+        })
+    });
+
+    assert!(
+        result.is_err(),
+        "`--as` sets a single binding identity; spreading it across TWO `--to` targets is \
+         ambiguous and must error"
+    );
+}
+
+#[test]
+fn add_to_a_single_target_with_as_is_the_happy_path() {
+    let dir = tempfile::TempDir::new().expect("temp project dir");
+    let toml_path = dir.path().join("phora.toml");
+    std::fs::write(
+        &toml_path,
+        "version = 1\n\n\
+         [targets.editor]\npath = \"~/.config/editor\"\nsources = []\n",
+    )
+    .expect("seed phora.toml with an empty target");
+
+    with_cwd(dir.path(), || {
+        run(Cli {
+            command: Command::Add {
+                url: "github:srnnkls/tropos".to_owned(),
+                name: None,
+                branch: None,
+                tag: None,
+                root: None,
+                local: false,
+                symlink: false,
+                to: vec!["editor".to_owned()],
+                r#as: Some("nvim".to_owned()),
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+        })
+        .expect(
+            "`add` takes ONE url, so a single `--to` + `--as` is the happy path and must succeed",
+        );
+    });
+
+    let written = std::fs::read_to_string(&toml_path).expect("add must leave phora.toml on disk");
+    let cfg = Config::parse(&written)
+        .unwrap_or_else(|e| panic!("add output must be valid phora.toml: {e}\n{written}"));
+    let refined = refined_binding(&cfg, "editor", "nvim");
+    assert_eq!(
+        refined.source, "tropos",
+        "a single-source `add --to editor --as nvim` must bind `source = \"tropos\"` as `nvim`, got:\n{written}"
+    );
+}
+
+#[test]
+fn bare_add_without_to_does_not_touch_targets() {
+    let dir = tempfile::TempDir::new().expect("temp project dir");
+    let toml_path = dir.path().join("phora.toml");
+    std::fs::write(
+        &toml_path,
+        "version = 1\n\n\
+         [targets.editor]\npath = \"~/.config/editor\"\nsources = []\n",
+    )
+    .expect("seed phora.toml with an empty target");
+
+    with_cwd(dir.path(), || {
+        run(Cli {
+            command: Command::Add {
+                url: "github:srnnkls/tropos".to_owned(),
+                name: None,
+                branch: None,
+                tag: None,
+                root: None,
+                local: false,
+                symlink: false,
+                to: Vec::new(),
+                r#as: None,
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+        })
+        .expect("bare `add` with no `--to` must succeed");
+    });
+
+    let written = std::fs::read_to_string(&toml_path).expect("add must leave phora.toml on disk");
+    let cfg = Config::parse(&written)
+        .unwrap_or_else(|e| panic!("add output must be valid phora.toml: {e}\n{written}"));
+
+    let src = source_from(&written, "tropos");
+    assert_eq!(
+        src.host.as_deref(),
+        Some("github"),
+        "bare add must still write the source into [sources.*], got:\n{written}"
+    );
+    let editor = cfg
+        .targets
+        .get("editor")
+        .expect("target editor must survive a bare add");
+    assert!(
+        editor.sources.as_deref().unwrap_or(&[]).is_empty(),
+        "bare `add` (no `--to`) must NOT bind into any target — `editor.sources` must stay empty, got:\n{written}"
+    );
+}
+
+#[test]
+fn add_to_with_root_scopes_the_binding_not_the_source() {
+    let dir = tempfile::TempDir::new().expect("temp project dir");
+    let toml_path = dir.path().join("phora.toml");
+    std::fs::write(
+        &toml_path,
+        "version = 1\n\n\
+         [targets.editor]\npath = \"~/.config/editor\"\nsources = []\n",
+    )
+    .expect("seed phora.toml with an empty target");
+
+    with_cwd(dir.path(), || {
+        run(Cli {
+            command: Command::Add {
+                url: "github:srnnkls/tropos".to_owned(),
+                name: None,
+                branch: None,
+                tag: None,
+                root: Some("nvim".to_owned()),
+                local: false,
+                symlink: false,
+                to: vec!["editor".to_owned()],
+                r#as: Some("nvim".to_owned()),
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+        })
+        .expect("`add --to editor --as nvim --root nvim` must succeed");
+    });
+
+    let written = std::fs::read_to_string(&toml_path).expect("add must leave phora.toml on disk");
+    let cfg = Config::parse(&written)
+        .unwrap_or_else(|e| panic!("add output must be valid phora.toml: {e}\n{written}"));
+
+    let src = source_from(&written, "tropos");
+    assert!(
+        src.root.is_none(),
+        "`--root` with `--to` scopes the BINDING; the SOURCE must stay pure provenance with NO \
+         root, got: {:?}\n{written}",
+        src.root
+    );
+
+    let refined = refined_binding(&cfg, "editor", "nvim");
+    assert_eq!(
+        refined.root.as_deref(),
+        Some(std::path::Path::new("nvim")),
+        "`--root` with `--to` must land on the BINDING `root = \"nvim\"`, got:\n{written}"
+    );
+}
+
+#[test]
+fn add_to_with_url_embedded_root_sets_the_source_root() {
+    let dir = tempfile::TempDir::new().expect("temp project dir");
+    let toml_path = dir.path().join("phora.toml");
+    std::fs::write(
+        &toml_path,
+        "version = 1\n\n\
+         [targets.editor]\npath = \"~/.config/editor\"\nsources = []\n",
+    )
+    .expect("seed phora.toml with an empty target");
+
+    with_cwd(dir.path(), || {
+        run(Cli {
+            command: Command::Add {
+                url: "github:srnnkls/tropos/editor".to_owned(),
+                name: None,
+                branch: None,
+                tag: None,
+                root: None,
+                local: false,
+                symlink: false,
+                to: vec!["editor".to_owned()],
+                r#as: None,
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+        })
+        .expect("`add github:owner/repo/subdir --to editor` must succeed");
+    });
+
+    let written = std::fs::read_to_string(&toml_path).expect("add must leave phora.toml on disk");
+    let cfg = Config::parse(&written)
+        .unwrap_or_else(|e| panic!("add output must be valid phora.toml: {e}\n{written}"));
+
+    let src = source_from(&written, "tropos");
+    assert_eq!(
+        src.root.as_deref(),
+        Some(std::path::Path::new("editor")),
+        "a URL-embedded root is provenance and must root the SOURCE even with `--to`, got: {:?}\n{written}",
+        src.root
+    );
+
+    let editor = cfg
+        .targets
+        .get("editor")
+        .expect("target editor must survive the add");
+    assert!(
+        binding_sources(&cfg, "editor")
+            .iter()
+            .any(|s| s == "tropos"),
+        "`add --to editor` must bind the source into target `editor`, got:\n{written}"
+    );
+    let binding = editor
+        .sources
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .find(|b| b.identity() == "tropos")
+        .expect("target editor must hold a `tropos` binding");
+    assert!(
+        matches!(binding, crate::config::Binding::Source(_)),
+        "with no explicit `--root`, the binding carries no refinement, got:\n{written}"
+    );
+}
+
+#[test]
+fn bare_add_with_root_still_sets_the_source_root() {
+    let dir = tempfile::TempDir::new().expect("temp project dir");
+    let toml_path = dir.path().join("phora.toml");
+    std::fs::write(&toml_path, "version = 1\n").expect("seed phora.toml");
+
+    with_cwd(dir.path(), || {
+        run(Cli {
+            command: Command::Add {
+                url: "github:srnnkls/tropos".to_owned(),
+                name: None,
+                branch: None,
+                tag: None,
+                root: Some("nvim".to_owned()),
+                local: false,
+                symlink: false,
+                to: Vec::new(),
+                r#as: None,
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+        })
+        .expect("bare `add --root` (no `--to`) must succeed");
+    });
+
+    let written = std::fs::read_to_string(&toml_path).expect("add must leave phora.toml on disk");
+    let src = source_from(&written, "tropos");
+    assert_eq!(
+        src.root.as_deref(),
+        Some(std::path::Path::new("nvim")),
+        "a bare `add --root` (no `--to`) must STILL set the SOURCE root, got:\n{written}"
+    );
+}
+
+#[test]
+fn add_as_without_to_errors() {
+    let dir = tempfile::TempDir::new().expect("temp project dir");
+    let toml_path = dir.path().join("phora.toml");
+    std::fs::write(&toml_path, "version = 1\n").expect("seed phora.toml");
+
+    let result = with_cwd(dir.path(), || {
+        run(Cli {
+            command: Command::Add {
+                url: "github:srnnkls/tropos".to_owned(),
+                name: None,
+                branch: None,
+                tag: None,
+                root: None,
+                local: false,
+                symlink: false,
+                to: Vec::new(),
+                r#as: Some("nvim".to_owned()),
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+        })
+    });
+
+    assert!(
+        result.is_err(),
+        "`--as` with no `--to` target binds nothing and silently drops the identity; it must error"
+    );
+}
+
+#[test]
+fn add_local_with_to_errors() {
+    let dir = tempfile::TempDir::new().expect("temp project dir");
+    let src_dir = tempfile::TempDir::new().expect("temp source dir");
+    let toml_path = dir.path().join("phora.toml");
+    std::fs::write(
+        &toml_path,
+        "version = 1\n\n\
+         [targets.editor]\npath = \"~/.config/editor\"\nsources = []\n",
+    )
+    .expect("seed phora.toml with an empty target");
+
+    let src_path = src_dir.path().to_string_lossy().into_owned();
+    let result = with_cwd(dir.path(), || {
+        run(Cli {
+            command: Command::Add {
+                url: src_path,
+                name: None,
+                branch: None,
+                tag: None,
+                root: None,
+                local: true,
+                symlink: false,
+                to: vec!["editor".to_owned()],
+                r#as: None,
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+        })
+    });
+
+    assert!(
+        result.is_err(),
+        "`--local` overlays do not support `--to`/refinement; pairing them must error rather than \
+         silently dropping the binding"
+    );
+}
+
+#[test]
+fn add_to_multiple_targets_writes_a_binding_in_each() {
+    let dir = tempfile::TempDir::new().expect("temp project dir");
+    let toml_path = dir.path().join("phora.toml");
+    std::fs::write(
+        &toml_path,
+        "version = 1\n\n\
+         [targets.editor]\npath = \"~/.config/editor\"\nsources = []\n\n\
+         [targets.shell]\npath = \"~/.config/shell\"\nsources = []\n",
+    )
+    .expect("seed phora.toml with two empty targets");
+
+    with_cwd(dir.path(), || {
+        run(Cli {
+            command: Command::Add {
+                url: "github:srnnkls/tropos".to_owned(),
+                name: None,
+                branch: None,
+                tag: None,
+                root: None,
+                local: false,
+                symlink: false,
+                to: vec!["editor".to_owned(), "shell".to_owned()],
+                r#as: None,
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+        })
+        .expect("`add --to editor --to shell` must succeed");
+    });
+
+    let written = std::fs::read_to_string(&toml_path).expect("add must leave phora.toml on disk");
+    let cfg = Config::parse(&written)
+        .unwrap_or_else(|e| panic!("add output must be valid phora.toml: {e}\n{written}"));
+
+    for target in ["editor", "shell"] {
+        let bindings = cfg
+            .targets
+            .get(target)
+            .and_then(|t| t.sources.as_deref())
+            .unwrap_or(&[]);
+        assert!(
+            matches!(bindings.first(), Some(crate::config::Binding::Source(s)) if s == "tropos"),
+            "`add --to {target}` must append a bare-string `tropos` binding, got:\n{written}"
+        );
+    }
+}
+
+#[test]
+fn add_to_with_include_exclude_writes_arrays_on_the_binding() {
+    let dir = tempfile::TempDir::new().expect("temp project dir");
+    let toml_path = dir.path().join("phora.toml");
+    std::fs::write(
+        &toml_path,
+        "version = 1\n\n\
+         [targets.editor]\npath = \"~/.config/editor\"\nsources = []\n",
+    )
+    .expect("seed phora.toml with an empty target");
+
+    with_cwd(dir.path(), || {
+        run(Cli {
+            command: Command::Add {
+                url: "github:srnnkls/tropos".to_owned(),
+                name: None,
+                branch: None,
+                tag: None,
+                root: None,
+                local: false,
+                symlink: false,
+                to: vec!["editor".to_owned()],
+                r#as: None,
+                include: vec!["*.lua".to_owned()],
+                exclude: vec![".git".to_owned()],
+            },
+        })
+        .expect("`add --to editor --include --exclude` must succeed");
+    });
+
+    let written = std::fs::read_to_string(&toml_path).expect("add must leave phora.toml on disk");
+    let cfg = Config::parse(&written)
+        .unwrap_or_else(|e| panic!("add output must be valid phora.toml: {e}\n{written}"));
+
+    let refined = refined_binding(&cfg, "editor", "tropos");
+    assert_eq!(
+        refined.include.as_deref(),
+        Some(&["*.lua".to_owned()][..]),
+        "`--include \"*.lua\"` must land as the BINDING include array, got:\n{written}"
+    );
+    assert_eq!(
+        refined.exclude.as_deref(),
+        Some(&[".git".to_owned()][..]),
+        "`--exclude \".git\"` must land as the BINDING exclude array, got:\n{written}"
+    );
+}
+
+#[test]
+fn add_to_target_without_sources_array_creates_the_array_and_binds() {
+    let dir = tempfile::TempDir::new().expect("temp project dir");
+    let toml_path = dir.path().join("phora.toml");
+    let seed = "version = 1\n\n\
+         [targets.editor]\npath = \"~/.config/editor\"\n";
+    std::fs::write(&toml_path, seed).expect("seed phora.toml with a target lacking `sources`");
+
+    with_cwd(dir.path(), || {
+        run(Cli {
+            command: Command::Add {
+                url: "github:srnnkls/tropos".to_owned(),
+                name: None,
+                branch: None,
+                tag: None,
+                root: None,
+                local: false,
+                symlink: false,
+                to: vec!["editor".to_owned()],
+                r#as: None,
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+        })
+        .expect("`add --to editor` must materialize a missing `sources` array, not error");
+    });
+
+    let written = std::fs::read_to_string(&toml_path).expect("phora.toml must remain on disk");
+    let cfg = Config::parse(&written)
+        .unwrap_or_else(|e| panic!("add output must be valid phora.toml: {e}\n{written}"));
+    let bindings = cfg
+        .targets
+        .get("editor")
+        .and_then(|t| t.sources.as_deref())
+        .unwrap_or(&[]);
+    assert!(
+        matches!(bindings.first(), Some(crate::config::Binding::Source(s)) if s == "tropos"),
+        "binding into a target with no `sources` key must create the array with `tropos`, got:\n{written}"
+    );
+}
+
+#[test]
+fn add_to_nonexistent_target_errors_and_leaves_file_untouched() {
+    let dir = tempfile::TempDir::new().expect("temp project dir");
+    let toml_path = dir.path().join("phora.toml");
+    let seed = "version = 1\n\n\
+         [targets.editor]\npath = \"~/.config/editor\"\nsources = []\n";
+    std::fs::write(&toml_path, seed).expect("seed phora.toml");
+
+    let result = with_cwd(dir.path(), || {
+        run(Cli {
+            command: Command::Add {
+                url: "github:srnnkls/tropos".to_owned(),
+                name: None,
+                branch: None,
+                tag: None,
+                root: None,
+                local: false,
+                symlink: false,
+                to: vec!["does-not-exist".to_owned()],
+                r#as: None,
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+        })
+    });
+
+    assert!(
+        result.is_err(),
+        "`add --to does-not-exist` must error on a missing target"
+    );
+    let written = std::fs::read_to_string(&toml_path).expect("phora.toml must remain on disk");
+    assert_eq!(
+        written, seed,
+        "a failed `add --to` must leave phora.toml unchanged (no orphan source write)"
+    );
+}
+
+fn source_names_opt(target: &crate::config::Target) -> Option<Vec<String>> {
+    target
+        .sources
+        .as_ref()
+        .map(|bindings| bindings.iter().map(|b| b.source().to_owned()).collect())
 }
 
 // ── CLI-002 / CLI-003: source + target namespace parsing ───────────
@@ -2447,24 +3641,14 @@ fn source_rm_helper_scrubs_both_files_and_target_arrays() {
         "`source rm dotfiles` must drop [sources.dotfiles] from phora.toml"
     );
     assert_eq!(
-        main_cfg
-            .targets
-            .get("A")
-            .expect("target A survives")
-            .sources
-            .as_deref(),
-        Some(["other".to_owned()].as_slice()),
+        source_names_opt(main_cfg.targets.get("A").expect("target A survives")),
+        Some(vec!["other".to_owned()]),
         "dotfiles must be scrubbed from [targets.A].sources, leaving only other"
     );
     let local_cfg = Config::parse(&result.local).expect("scrubbed local parses");
     assert_eq!(
-        local_cfg
-            .targets
-            .get("B")
-            .expect("target B survives")
-            .sources
-            .as_deref(),
-        Some([].as_slice()),
+        source_names_opt(local_cfg.targets.get("B").expect("target B survives")),
+        Some(vec![]),
         "dotfiles must be scrubbed from [targets.B].sources in phora.local.toml too"
     );
 }
@@ -2792,12 +3976,12 @@ fn rm_routes_to_same_scrub_as_source_rm() {
         "the [sources.dotfiles] table must be gone from main"
     );
     assert_eq!(
-        main_cfg.targets["A"].sources,
+        source_names_opt(&main_cfg.targets["A"]),
         Some(vec![]),
         "dotfiles must be scrubbed from [targets.A].sources in main"
     );
     assert_eq!(
-        local_cfg.targets["B"].sources,
+        source_names_opt(&local_cfg.targets["B"]),
         Some(vec![]),
         "dotfiles must be scrubbed from [targets.B].sources in local"
     );
@@ -2852,6 +4036,7 @@ fn add_with_binds_appends_to_both_targets_and_inserts_source() {
         None,
         None,
         &["A".to_owned(), "B".to_owned()],
+        &config_edit::BindRefinement::default(),
         &RejectAll,
     )
     .expect("binding dots to two explicit targets must succeed atomically");
@@ -2862,12 +4047,12 @@ fn add_with_binds_appends_to_both_targets_and_inserts_source() {
         "[sources.dots] must be inserted"
     );
     assert_eq!(
-        cfg.targets["A"].sources,
+        source_names_opt(&cfg.targets["A"]),
         Some(vec!["existing".to_owned(), "dots".to_owned()]),
         "dots must be appended to target A's sources"
     );
     assert_eq!(
-        cfg.targets["B"].sources,
+        source_names_opt(&cfg.targets["B"]),
         Some(vec!["existing".to_owned(), "dots".to_owned()]),
         "dots must be appended to target B's sources"
     );
@@ -2883,6 +4068,7 @@ fn add_with_binds_missing_target_errs_with_no_partial_text() {
         None,
         None,
         &["A".to_owned(), "ghost".to_owned()],
+        &config_edit::BindRefinement::default(),
         &RejectAll,
     );
     let err = result.expect_err("a nonexistent target must fail the whole command");
@@ -2903,13 +4089,14 @@ fn add_with_binds_no_key_target_creates_list() {
         None,
         None,
         &["A".to_owned()],
+        &config_edit::BindRefinement::default(),
         &RejectAll,
     )
     .expect("binding to a no-key target must succeed, creating its sources list");
 
     let cfg = Config::parse(&out).expect("returned text is valid phora.toml");
     assert_eq!(
-        cfg.targets["A"].sources,
+        source_names_opt(&cfg.targets["A"]),
         Some(vec!["dots".to_owned()]),
         "binding via add sugar to a no-key target must create sources = [\"dots\"]"
     );
@@ -2929,8 +4116,18 @@ fn run_target_add_rejects_path_unsafe_name() {
 fn add_with_binds_no_targets_equals_plain_source_insert() {
     let base = "version = 1\n";
     let source = lit("https://github.com/me/dots.git", None);
-    let out = add_with_binds(base, "dots", &source, None, None, None, &[], &RejectAll)
-        .expect("zero targets must behave as a plain source upsert");
+    let out = add_with_binds(
+        base,
+        "dots",
+        &source,
+        None,
+        None,
+        None,
+        &[],
+        &config_edit::BindRefinement::default(),
+        &RejectAll,
+    )
+    .expect("zero targets must behave as a plain source upsert");
 
     let expected = config_edit::upsert_source(base, "dots", &source, None, None, None)
         .expect("baseline plain source upsert");
@@ -2969,7 +4166,7 @@ fn add_to_default_target_creates_flat_default_and_binds() {
         "the auto-created default target must use the flat layout"
     );
     assert_eq!(
-        default.sources,
+        source_names_opt(default),
         Some(vec!["dots".to_owned()]),
         "the source must be bound into [targets.default].sources"
     );
@@ -2998,7 +4195,7 @@ fn add_to_default_target_second_call_extends_without_clobbering() {
 
     let cfg = Config::parse(&second).expect("returned text is valid phora.toml");
     assert_eq!(
-        cfg.targets["default"].sources,
+        source_names_opt(&cfg.targets["default"]),
         Some(vec!["dots".to_owned(), "tools".to_owned()]),
         "a second source must be appended, not clobber the existing default binding"
     );
@@ -3013,7 +4210,7 @@ fn add_to_default_target_second_call_extends_without_clobbering() {
     .expect("re-adding an existing source");
     let cfg = Config::parse(&again).expect("valid");
     assert_eq!(
-        cfg.targets["default"].sources,
+        source_names_opt(&cfg.targets["default"]),
         Some(vec!["dots".to_owned(), "tools".to_owned()]),
         "re-binding a present source must dedup, not duplicate"
     );
@@ -3030,6 +4227,7 @@ fn add_with_binds_to_named_target_never_touches_default() {
         None,
         None,
         &["A".to_owned()],
+        &config_edit::BindRefinement::default(),
         &RejectAll,
     )
     .expect("--to routing binds only the named target");
@@ -3040,7 +4238,7 @@ fn add_with_binds_to_named_target_never_touches_default() {
         "routing to a named target must never materialize [targets.default]"
     );
     assert_eq!(
-        cfg.targets["A"].sources,
+        source_names_opt(&cfg.targets["A"]),
         Some(vec!["dots".to_owned()]),
         "the source must be bound to the named target only"
     );
@@ -3057,6 +4255,7 @@ fn add_with_binds_create_decider_materializes_flat_default_path_target() {
         None,
         None,
         &["staging".to_owned()],
+        &config_edit::BindRefinement::default(),
         &CreateAtDefault,
     )
     .expect("a Create decider must create the missing target and bind");
@@ -3074,7 +4273,7 @@ fn add_with_binds_create_decider_materializes_flat_default_path_target() {
         "an interactively created target must use the flat layout"
     );
     assert_eq!(
-        staging.sources,
+        source_names_opt(staging),
         Some(vec!["dots".to_owned()]),
         "the source must be bound to the freshly created target"
     );
@@ -3090,6 +4289,7 @@ fn add_with_binds_create_decider_honors_entered_path() {
         None,
         None,
         &["staging".to_owned()],
+        &config_edit::BindRefinement::default(),
         &CreateAt("~/custom/staging"),
     )
     .expect("a Create decider with a typed path must honor it");
@@ -3112,6 +4312,7 @@ fn add_with_binds_reject_decider_errors_with_hint_and_no_partial_text() {
         None,
         None,
         &["staging".to_owned()],
+        &config_edit::BindRefinement::default(),
         &RejectAll,
     );
     let err = result.expect_err("a Reject decider must fail the whole command");

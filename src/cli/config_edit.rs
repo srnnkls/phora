@@ -1,9 +1,10 @@
 //! Text-level `toml_edit` mutators over `phora.toml` / `phora.local.toml`.
 //!
 //! These preserve formatting and comments byte-for-byte on untouched regions.
-use toml_edit::{Array, DocumentMut, Item, Table, Value, value};
+use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value, value};
 
 use super::add::AddTarget;
+use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::source::Protocol;
 
@@ -91,6 +92,29 @@ fn normalize_array_decor(array: &mut Array) {
     array.set_trailing_comma(false);
 }
 
+/// The underlying source a binding entry resolves to: a bare string is its own
+/// source; a table entry's `source` field names it.
+fn binding_source(binding: &Value) -> Option<&str> {
+    match binding {
+        Value::String(s) => Some(s.value()),
+        Value::InlineTable(t) => t.get("source").and_then(Value::as_str),
+        _ => None,
+    }
+}
+
+/// A binding's identity: a bare string is its own identity; a table entry's
+/// `as` else `source` field.
+fn binding_identity(binding: &Value) -> Option<&str> {
+    match binding {
+        Value::String(s) => Some(s.value()),
+        Value::InlineTable(t) => t
+            .get("as")
+            .and_then(Value::as_str)
+            .or_else(|| t.get("source").and_then(Value::as_str)),
+        _ => None,
+    }
+}
+
 fn scrub_target_arrays(doc: &mut DocumentMut, name: &str) {
     let Some(targets) = doc.get_mut("targets").and_then(Item::as_table_like_mut) else {
         return;
@@ -104,7 +128,7 @@ fn scrub_target_arrays(doc: &mut DocumentMut, name: &str) {
             continue;
         };
         let before = array.len();
-        array.retain(|v| v.as_str() != Some(name));
+        array.retain(|v| binding_source(v) != Some(name));
         if array.len() != before {
             normalize_array_decor(array);
         }
@@ -118,7 +142,8 @@ fn remove_source_table(doc: &mut DocumentMut, name: &str) -> bool {
 }
 
 /// Remove `[sources.<name>]` from BOTH texts AND scrub `<name>` from every
-/// `[targets.*].sources` array in BOTH.
+/// `[targets.*].sources` array in BOTH. Table-form bindings are matched by their
+/// underlying `source` field, so aliased bindings are scrubbed, not orphaned.
 ///
 /// # Errors
 ///
@@ -188,65 +213,148 @@ pub fn remove_target(doc_text: &str, name: &str) -> Result<String> {
     Ok(doc.to_string())
 }
 
-fn target_table_mut<'a>(doc: &'a mut DocumentMut, target: &str) -> Option<&'a mut Table> {
+fn target_sources_array<'a>(doc: &'a mut DocumentMut, target: &str) -> Option<&'a mut Array> {
     doc.get_mut("targets")?
         .as_table_like_mut()?
         .get_mut(target)?
-        .as_table_mut()
+        .as_table_mut()?
+        .get_mut("sources")?
+        .as_array_mut()
 }
 
-fn names_array(names: &[String]) -> Array {
-    let mut array = Array::new();
-    for n in names {
-        array.push(n.as_str());
+/// Per-binding refinement carried by `bind`/`add --to`: an optional `as`
+/// identity plus optional `root`/`include`/`exclude` overrides. A "bare"
+/// refinement (all unset) writes a plain source-name string.
+#[derive(Debug, Default)]
+pub struct BindRefinement {
+    pub r#as: Option<String>,
+    pub root: Option<String>,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+}
+
+impl BindRefinement {
+    pub(super) fn is_bare(&self) -> bool {
+        self.r#as.is_none()
+            && self.root.is_none()
+            && self.include.is_empty()
+            && self.exclude.is_empty()
     }
-    normalize_array_decor(&mut array);
-    array
 }
 
 #[derive(Debug)]
 pub struct BindResult {
     pub text: String,
+    pub changed: bool,
 }
 
-/// Append `sources` to `[targets.<target>].sources` (dedup, stable order),
-/// creating the list when the target has no `sources` key.
+fn build_binding(source: &str, refinement: &BindRefinement) -> Value {
+    if refinement.is_bare() {
+        return source.into();
+    }
+    let mut table = InlineTable::new();
+    table.insert("source", source.into());
+    if let Some(r#as) = &refinement.r#as {
+        table.insert("as", r#as.as_str().into());
+    }
+    if let Some(root) = &refinement.root {
+        table.insert("root", root.as_str().into());
+    }
+    if !refinement.include.is_empty() {
+        table.insert("include", string_array(&refinement.include));
+    }
+    if !refinement.exclude.is_empty() {
+        table.insert("exclude", string_array(&refinement.exclude));
+    }
+    Value::InlineTable(table)
+}
+
+fn string_array(items: &[String]) -> Value {
+    items.iter().map(String::as_str).collect::<Array>().into()
+}
+
+fn upsert_binding(array: &mut Array, identity: &str, entry: Value, bare: bool) -> bool {
+    let existing = array
+        .iter()
+        .position(|b| binding_identity(b) == Some(identity));
+    match existing {
+        Some(_) if bare => false,
+        Some(i) => {
+            *array.get_mut(i).expect("position is in bounds") = entry;
+            normalize_array_decor(array);
+            true
+        }
+        None => {
+            array.push(entry);
+            normalize_array_decor(array);
+            true
+        }
+    }
+}
+
+/// Undefined-source is tolerated here because the source may live in the sibling
+/// file; the caller's merged-view guard resolves that. Identity-uniqueness and
+/// url-slice rejection still propagate.
+fn validate_edited(text: &str) -> Result<()> {
+    match Config::parse(text)?.validate() {
+        Err(Error::Config(msg)) if msg.contains("undefined source") => Ok(()),
+        other => other,
+    }
+}
+
+/// Bind `sources` into `[targets.<target>].sources`, matching/replacing entries
+/// by binding identity. A bare refinement appends plain source-name strings; any
+/// set refinement field writes a table entry keyed by identity (`as` else
+/// source). Reads mixed string|table arrays and dedups by identity. The target's
+/// `sources` list is created when absent.
 ///
 /// # Errors
 ///
-/// Returns [`crate::error::Error::Config`] if the target table does not exist.
-pub fn bind(doc_text: &str, target: &str, sources: &[String]) -> Result<BindResult> {
-    let mut doc = parse_doc(doc_text)?;
-    let table = target_table_mut(&mut doc, target)
-        .ok_or_else(|| Error::Config(format!("target `{target}` is not defined")))?;
+/// Returns [`crate::error::Error::Config`] if `doc_text` is not valid TOML, the
+/// target table does not exist, `--as` is paired with more than one source
+/// (ambiguous identity), or the edited document would fail [`Config::validate`]
+/// for a reason other than an undefined source (left to the caller's merged
+/// guard).
+pub fn bind(
+    doc_text: &str,
+    target: &str,
+    sources: &[String],
+    refinement: &BindRefinement,
+) -> Result<BindResult> {
+    if refinement.r#as.is_some() && sources.len() > 1 {
+        return Err(Error::Config(
+            "`--as` sets a single binding identity and cannot apply to multiple sources".to_owned(),
+        ));
+    }
 
-    let mut present: Vec<String> = if table.contains_key("sources") {
-        let array = table["sources"]
-            .as_array_mut()
-            .ok_or_else(|| Error::Config(format!("`{target}.sources` is not an array")))?;
-        array
-            .iter()
-            .map(|v| {
-                v.as_str().map(str::to_owned).ok_or_else(|| {
-                    Error::Config(format!(
-                        "`{target}.sources` contains a non-string entry; only plain source names are supported"
-                    ))
-                })
-            })
-            .collect::<Result<_>>()?
-    } else {
-        Vec::new()
-    };
-    for s in sources {
-        if !present.contains(s) {
-            present.push(s.clone());
+    let mut doc = parse_doc(doc_text)?;
+    {
+        let table = doc
+            .get_mut("targets")
+            .and_then(Item::as_table_like_mut)
+            .and_then(|targets| targets.get_mut(target))
+            .and_then(Item::as_table_mut)
+            .ok_or_else(|| Error::Config(format!("target `{target}` is not defined")))?;
+        if !table.contains_key("sources") {
+            table["sources"] = value(Array::new());
         }
     }
-    table["sources"] = value(names_array(&present));
 
-    Ok(BindResult {
-        text: doc.to_string(),
-    })
+    let mut changed = false;
+    {
+        let array = target_sources_array(&mut doc, target)
+            .ok_or_else(|| Error::Config(format!("`{target}.sources` is not an array")))?;
+        for source in sources {
+            let identity = refinement.r#as.as_deref().unwrap_or(source);
+            let entry = build_binding(source, refinement);
+            changed |= upsert_binding(array, identity, entry, refinement.is_bare());
+        }
+    }
+
+    let text = doc.to_string();
+    validate_edited(&text)?;
+
+    Ok(BindResult { text, changed })
 }
 
 #[derive(Debug)]
@@ -255,51 +363,44 @@ pub struct UnbindResult {
     pub tombstoned: bool,
 }
 
-/// Remove `sources` from `[targets.<target>].sources`.
+/// Remove every binding from `[targets.<target>].sources` whose identity is in
+/// `identities` (a bare string matches by source name; a table entry matches by
+/// `as` else `source`).
 ///
 /// # Errors
 ///
 /// Returns [`crate::error::Error::Config`] if the target has no `sources` list.
-pub fn unbind(doc_text: &str, target: &str, sources: &[String]) -> Result<UnbindResult> {
+pub fn unbind(doc_text: &str, target: &str, identities: &[String]) -> Result<UnbindResult> {
     let mut doc = parse_doc(doc_text)?;
-    let table = target_table_mut(&mut doc, target)
-        .ok_or_else(|| Error::Config(format!("target `{target}` is not defined")))?;
-
-    if !table.contains_key("sources") {
-        return Err(Error::Config(format!(
+    let array = target_sources_array(&mut doc, target).ok_or_else(|| {
+        Error::Config(format!(
             "target `{target}` has no `sources` list; nothing to unbind"
-        )));
-    }
-    let array = table["sources"]
-        .as_array_mut()
-        .ok_or_else(|| Error::Config(format!("`{target}.sources` is not an array")))?;
-    array.retain(|v| v.as_str().is_none_or(|s| !sources.contains(&s.to_owned())));
-    let remaining: Vec<String> = array
-        .iter()
-        .filter_map(|v| v.as_str().map(str::to_owned))
-        .collect();
-    table["sources"] = value(names_array(&remaining));
+        ))
+    })?;
+
+    array.retain(|b| binding_identity(b).is_none_or(|id| !identities.iter().any(|i| i == id)));
+    let tombstoned = array.is_empty();
+    normalize_array_decor(array);
 
     Ok(UnbindResult {
         text: doc.to_string(),
-        tombstoned: remaining.is_empty(),
+        tombstoned,
     })
 }
 
-/// Pre-write guard: every `[targets.*].sources` entry resolves to an existing source.
+/// Pre-write guard: every `[targets.*].sources` binding resolves to an existing
+/// source by its underlying source name.
 ///
 /// # Errors
 ///
 /// Returns [`crate::error::Error::Config`] naming the dangling (target, source).
-pub fn validate_source_references(merged: &crate::config::Config) -> Result<()> {
+pub fn validate_source_references(merged: &Config) -> Result<()> {
     for (target_name, target) in &merged.targets {
-        let Some(sources) = &target.sources else {
-            continue;
-        };
-        for source in sources {
-            if !merged.sources.contains_key(source) {
+        for binding in target.sources.iter().flatten() {
+            if !merged.sources.contains_key(binding.source()) {
                 return Err(Error::Config(format!(
-                    "target `{target_name}` references undefined source `{source}`"
+                    "target `{target_name}` references undefined source `{}`",
+                    binding.source()
                 )));
             }
         }
@@ -350,6 +451,10 @@ mod tests {
             branch: None,
             root: None,
         }
+    }
+
+    fn bare() -> BindRefinement {
+        BindRefinement::default()
     }
 
     // 1. Formatting preservation: byte-identical surrounding regions.
@@ -526,6 +631,22 @@ mod tests {
     }
 
     #[test]
+    fn remove_source_scrubs_aliased_table_binding_by_underlying_source() {
+        let main = "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\n\n\
+             [targets.A]\npath = \"~/a\"\nsources = [{ source = \"dotfiles\", as = \"dots\" }]\n";
+        let local = "version = 1\n";
+
+        let result = remove_source(main, local, "dotfiles").expect("remove dotfiles");
+
+        assert!(
+            !result.main.contains("dotfiles"),
+            "an aliased table binding whose `source` is the removed name must be scrubbed, \
+             not orphaned: {}",
+            result.main
+        );
+    }
+
+    #[test]
     fn remove_source_unknown_name_errors() {
         let main = "version = 1\n\n[sources.foo]\ngit = \"g\"\n";
         let local = "version = 1\n";
@@ -547,7 +668,7 @@ mod tests {
 
     #[test]
     fn bind_to_no_key_target_creates_list() {
-        let result = bind(NO_KEY_TARGET, "t", &names(&["a"]))
+        let result = bind(NO_KEY_TARGET, "t", &names(&["a"]), &bare())
             .expect("binding to a no-key target must succeed, creating sources = [\"a\"]");
 
         let expected = "version = 1\n\n[targets.t]\npath = \"~/x\"\nsources = [\"a\"]\n\n\
@@ -563,7 +684,7 @@ mod tests {
     fn bind_to_explicit_target_appends_stable_order() {
         let base = "version = 1\n\n[targets.t]\npath = \"~/x\"\nsources = [\"a\"]\n\n\
              [sources.a]\ngit = \"g\"\n\n[sources.b]\ngit = \"h\"\n";
-        let result = bind(base, "t", &names(&["b"])).expect("bind to explicit target");
+        let result = bind(base, "t", &names(&["b"]), &bare()).expect("bind to explicit target");
 
         let expected = "version = 1\n\n[targets.t]\npath = \"~/x\"\nsources = [\"a\", \"b\"]\n\n\
              [sources.a]\ngit = \"g\"\n\n[sources.b]\ngit = \"h\"\n";
@@ -577,7 +698,7 @@ mod tests {
     fn bind_dedups_without_reordering() {
         let base = "version = 1\n\n[targets.t]\npath = \"~/x\"\nsources = [\"a\", \"b\"]\n\n\
              [sources.a]\ngit = \"g\"\n\n[sources.b]\ngit = \"h\"\n";
-        let result = bind(base, "t", &names(&["a"]))
+        let result = bind(base, "t", &names(&["a"]), &bare())
             .expect("re-binding an existing source is a no-op on the list");
 
         let expected = "version = 1\n\n[targets.t]\npath = \"~/x\"\nsources = [\"a\", \"b\"]\n\n\
@@ -589,21 +710,8 @@ mod tests {
     }
 
     #[test]
-    fn bind_to_target_with_non_string_source_entry_errors() {
-        let base = "version = 1\n\n[targets.t]\npath = \"~/x\"\nsources = [{ name = \"a\" }]\n\n\
-             [sources.a]\ngit = \"g\"\n\n[sources.b]\ngit = \"h\"\n";
-        let err = bind(base, "t", &names(&["b"])).expect_err(
-            "a non-string entry in an existing sources array must error, not be dropped",
-        );
-        assert!(
-            matches!(err, Error::Config(msg) if msg.contains("non-string")),
-            "the error must report the non-string entry rather than silently dropping it"
-        );
-    }
-
-    #[test]
     fn bind_to_missing_target_errors() {
-        let err = bind(NO_KEY_TARGET, "nope", &names(&["a"]))
+        let err = bind(NO_KEY_TARGET, "nope", &names(&["a"]), &bare())
             .expect_err("binding to a non-existent target must error");
         assert!(
             matches!(err, Error::Config(msg) if msg.contains("nope")),
@@ -659,7 +767,79 @@ mod tests {
         );
     }
 
-    // 7. validate_source_references.
+    // 7. Refinement-aware bind/unbind by identity.
+
+    #[test]
+    fn bind_with_refinement_writes_table_keyed_by_identity() {
+        let base = "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/x\"\nsources = []\n";
+        let refinement = BindRefinement {
+            r#as: Some("dots".to_owned()),
+            root: Some("nvim".to_owned()),
+            ..BindRefinement::default()
+        };
+        let result =
+            bind(base, "t", &names(&["dotfiles"]), &refinement).expect("refined bind succeeds");
+        assert!(result.changed, "a fresh refined bind changes the array");
+
+        let cfg = Config::parse(&result.text).expect("bind output parses");
+        let target = &cfg.targets["t"];
+        let binding = target.sources.as_ref().unwrap().first().unwrap();
+        assert_eq!(binding.identity(), "dots");
+        assert_eq!(binding.source(), "dotfiles");
+    }
+
+    #[test]
+    fn bind_as_with_multiple_sources_errors() {
+        let base = "version = 1\n\n[sources.a]\ngit = \"g\"\n\n[sources.b]\ngit = \"h\"\n\n\
+             [targets.t]\npath = \"~/x\"\nsources = []\n";
+        let refinement = BindRefinement {
+            r#as: Some("x".to_owned()),
+            ..BindRefinement::default()
+        };
+        let err = bind(base, "t", &names(&["a", "b"]), &refinement)
+            .expect_err("`--as` with multiple sources is ambiguous");
+        assert!(matches!(err, Error::Config(msg) if msg.contains("--as")));
+    }
+
+    #[test]
+    fn bind_reads_mixed_array_and_dedups_by_identity() {
+        let base = "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\n\n[sources.a]\ngit = \"h\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\
+             sources = [\"a\", { source = \"dotfiles\", as = \"dots\" }]\n";
+        let result = bind(base, "t", &names(&["a"]), &bare())
+            .expect("re-binding a bare source in a mixed array is a no-op");
+        assert!(
+            !result.changed,
+            "binding an already-present identity over a mixed array changes nothing"
+        );
+    }
+
+    #[test]
+    fn unbind_removes_aliased_entry_by_identity() {
+        let base = "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\
+             sources = [{ source = \"dotfiles\", as = \"dots\" }]\n";
+        let result = unbind(base, "t", &names(&["dots"])).expect("unbind by alias identity");
+        assert!(result.tombstoned, "removing the only entry tombstones");
+        let cfg = Config::parse(&result.text).expect("output parses");
+        assert!(cfg.targets["t"].sources.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn bind_root_on_url_source_errors() {
+        let base = "version = 1\n\n[sources.fonts]\nurl = \"https://example.com/f.tar.gz\"\n\n\
+             [targets.t]\npath = \"~/x\"\nsources = []\n";
+        let refinement = BindRefinement {
+            root: Some("sub".to_owned()),
+            ..BindRefinement::default()
+        };
+        let err = bind(base, "t", &names(&["fonts"]), &refinement)
+            .expect_err("refining a url source's root writes a config validate() rejects");
+        assert!(matches!(err, Error::Config(_)));
+    }
+
+    // 8. validate_source_references.
 
     #[test]
     #[allow(

@@ -136,6 +136,13 @@ pub(super) fn print_bound(sources: &[String], target: &str) {
     println!("Bound {} to '{target}'", sources.join(", "));
 }
 
+pub(super) fn print_bind_unchanged(sources: &[String], target: &str) {
+    println!(
+        "Bindings in '{target}' already up to date: {}",
+        sources.join(", ")
+    );
+}
+
 pub(super) fn print_unbound(sources: &[String], target: &str) {
     println!("Unbound {} from '{target}'", sources.join(", "));
 }
