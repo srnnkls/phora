@@ -38,7 +38,7 @@ pub fn rebuild_registry(
         let mut managed: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut selections: Vec<Selection> = Vec::new();
 
-        for source_name in target.resolve_sources(&parsed) {
+        for source_name in target.resolve_sources() {
             let source = parsed.get(source_name).ok_or_else(|| {
                 Error::Config(format!("target references undefined source: {source_name}"))
             })?;

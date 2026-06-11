@@ -53,6 +53,32 @@ impl fmt::Display for SourceName {
     }
 }
 
+/// A configured target identifier: the `[targets.<name>]` table key.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TargetName(String);
+
+impl TargetName {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for TargetName {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        safe_component(s)?;
+        Ok(Self(s.to_owned()))
+    }
+}
+
+impl fmt::Display for TargetName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// A single artifact path component discovered in a source tree.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ArtifactName(String);
@@ -80,5 +106,36 @@ impl FromStr for ArtifactName {
 impl fmt::Display for ArtifactName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_name_parses_safe_component() {
+        let name: SourceName = "dotfiles".parse().expect("a safe component must parse");
+        assert_eq!(name.as_str(), "dotfiles");
+    }
+
+    #[test]
+    fn source_name_rejects_unsafe_component() {
+        "a/b"
+            .parse::<SourceName>()
+            .expect_err("a component containing `/` must be rejected as path-unsafe");
+    }
+
+    #[test]
+    fn target_name_parses_safe_component() {
+        let name: TargetName = "staging".parse().expect("a safe component must parse");
+        assert_eq!(name.as_str(), "staging");
+    }
+
+    #[test]
+    fn target_name_rejects_unsafe_component() {
+        "a/b"
+            .parse::<TargetName>()
+            .expect_err("a target name with `/` must be rejected as path-unsafe");
     }
 }

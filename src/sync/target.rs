@@ -38,7 +38,7 @@ pub(super) fn deploy_target(
     let mut seen: BTreeMap<String, String> = BTreeMap::new();
     let mut had_failures = false;
 
-    for source_name in run.target.resolve_sources(run.parsed) {
+    for source_name in run.target.resolve_sources() {
         let source = run.parsed.get(source_name).ok_or_else(|| {
             Error::Config(format!("target references undefined source: {source_name}"))
         })?;

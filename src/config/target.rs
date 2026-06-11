@@ -1,6 +1,5 @@
 //! Target DTOs and deploy layout resolution.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -32,11 +31,11 @@ impl Target {
     }
 
     #[must_use]
-    pub fn resolve_sources<'a, V>(&'a self, all: &'a BTreeMap<String, V>) -> Vec<&'a str> {
-        match &self.sources {
-            Some(names) => names.iter().map(String::as_str).collect(),
-            None => all.keys().map(String::as_str).collect(),
-        }
+    pub fn resolve_sources(&self) -> Vec<&str> {
+        self.sources
+            .as_deref()
+            .map(|names| names.iter().map(String::as_str).collect())
+            .unwrap_or_default()
     }
 
     #[must_use]

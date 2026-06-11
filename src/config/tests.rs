@@ -16,6 +16,13 @@ fn parse_remote(name: &str, body: &str) -> Result<ParsedSource> {
 }
 
 #[test]
+fn shipped_example_configs_parse() {
+    Config::parse(include_str!("../../phora.example.toml")).expect("phora.example.toml must parse");
+    Config::parse(include_str!("../../phora.local.example.toml"))
+        .expect("phora.local.example.toml must parse");
+}
+
+#[test]
 fn parse_git_url_lands_on_remote_git() {
     let parsed = parse_remote("g", "git = \"https://github.com/me/x.git\"\n")
         .expect("a literal git URL parses to a typed source");
@@ -272,6 +279,37 @@ fn target_of<'a>(cfg: &'a Config, name: &str) -> &'a Target {
 
 fn effective_layout(target: &Target) -> LayoutConfig {
     target.layout()
+}
+
+// ES-001: a target with no `sources` key receives NOTHING (implicit-all removed).
+
+#[test]
+fn resolve_sources_absent_key_receives_nothing() {
+    let cfg = Config::parse(
+        "version = 1\n\n[sources.a]\ngit = \"g\"\n\n[sources.b]\ngit = \"h\"\n\n\
+         [targets.t]\npath = \"~/x\"\n",
+    )
+    .expect("config with a no-key target parses");
+    let resolved = target_of(&cfg, "t").resolve_sources();
+    assert!(
+        resolved.is_empty(),
+        "a target with no `sources` key must resolve to NO sources, got {resolved:?}"
+    );
+}
+
+#[test]
+fn resolve_sources_explicit_list_is_verbatim() {
+    let cfg = Config::parse(
+        "version = 1\n\n[sources.a]\ngit = \"g\"\n\n[sources.b]\ngit = \"h\"\n\n\
+         [targets.t]\npath = \"~/x\"\nsources = [\"a\"]\n",
+    )
+    .expect("config with an explicit-list target parses");
+    let resolved = target_of(&cfg, "t").resolve_sources();
+    assert_eq!(
+        resolved,
+        vec!["a"],
+        "an explicit `sources` list resolves to exactly its listed names"
+    );
 }
 
 // PAM-001: config parses from phora.toml
@@ -2689,6 +2727,61 @@ fn config_digest_is_unchanged_across_the_path_to_repo_rename() {
         alias.config_digest(),
         "config_digest hashes only include/exclude/root/policy; the `path` -> `repo` key \
              rename must NOT alter it, keeping lock identity byte-identical"
+    );
+}
+
+#[test]
+fn defaults_auto_target_parses_false() {
+    let cfg = Config::parse("version = 1\n\n[defaults]\nauto_target = false\n")
+        .expect("explicit auto_target = false parses");
+    assert!(
+        !cfg.defaults.auto_target(),
+        "an explicit `auto_target = false` must read back as false"
+    );
+}
+
+#[test]
+fn defaults_absent_section_defaults_auto_target_true() {
+    let cfg = Config::parse("version = 1\n").expect("config without [defaults] parses");
+    assert!(
+        cfg.defaults.auto_target(),
+        "with no [defaults] section, auto_target must default to true"
+    );
+}
+
+#[test]
+fn defaults_present_without_key_defaults_auto_target_true() {
+    let cfg = Config::parse("version = 1\n\n[defaults]\n")
+        .expect("an empty [defaults] section parses");
+    assert!(
+        cfg.defaults.auto_target(),
+        "an empty [defaults] section leaves auto_target at its true default"
+    );
+}
+
+#[test]
+fn merge_local_auto_target_false_overrides_base() {
+    let base = Config::parse("version = 1\n").expect("base parses");
+    let local = Config::parse("version = 1\n\n[defaults]\nauto_target = false\n")
+        .expect("local parses");
+
+    let effective = merge_configs(base, Some(local));
+    assert!(
+        !effective.defaults.auto_target(),
+        "local `auto_target = false` must override the base default of true"
+    );
+}
+
+#[test]
+fn merge_local_unset_auto_target_keeps_base() {
+    let base = Config::parse("version = 1\n\n[defaults]\nauto_target = false\n")
+        .expect("base parses");
+    let local = Config::parse("version = 1\n").expect("local parses");
+
+    let effective = merge_configs(base, Some(local));
+    assert!(
+        !effective.defaults.auto_target(),
+        "a local config that does not set auto_target must not clobber the base value"
     );
 }
 
