@@ -3117,6 +3117,9 @@ mod per_binding_refinement {
                 root,
                 include,
                 exclude,
+                branch,
+                tag,
+                rev,
             }) => {
                 assert_eq!(
                     source, "dotfiles",
@@ -3142,6 +3145,9 @@ mod per_binding_refinement {
                     Some(["**/*.bak".to_string()].as_slice()),
                     "the `exclude` key is captured as a Vec<String>"
                 );
+                assert_eq!(branch.as_deref(), None, "no `branch` set in this table");
+                assert_eq!(tag.as_deref(), None, "no `tag` set in this table");
+                assert_eq!(rev.as_deref(), None, "no `rev` set in this table");
             }
             other @ Binding::Source(_) => {
                 panic!("a refinement table must be Binding::Refined, got {other:?}")
@@ -3749,6 +3755,173 @@ mod per_binding_refinement {
                 );
             }
             other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    // PTV-001: per-target version — binding ref overrides source ref, bare inherits.
+
+    use crate::config::Refspec;
+
+    #[test]
+    fn resolve_binding_tag_overrides_source_branch_ref() {
+        let toml = "version = 1\n\n\
+            [sources.fzf]\ngit = \"https://github.com/junegunn/fzf.git\"\nbranch = \"main\"\n\n\
+            [targets.t]\npath = \"~/x\"\n\
+            sources = [{ source = \"fzf\", as = \"canary\", tag = \"v0.56.0\" }]\n";
+        let t = target(toml, "t");
+        let all = sources(toml);
+
+        let resolved = t.resolve_sources(&all);
+        let b = find_resolved(&resolved, "canary");
+
+        match &b.effective_ref {
+            Refspec::Tag(tag) => assert_eq!(
+                tag, "v0.56.0",
+                "a binding `tag` must REPLACE the source ref; effective_ref must be the binding's tag"
+            ),
+            other => panic!(
+                "a binding-level `tag` must resolve effective_ref to Refspec::Tag, got {other:?} \
+                 (this fails if the source's branch=main ref leaked through instead)"
+            ),
+        }
+    }
+
+    #[test]
+    fn bare_binding_inherits_source_tag_ref() {
+        let toml = "version = 1\n\n\
+            [sources.fzf]\ngit = \"https://github.com/junegunn/fzf.git\"\ntag = \"v0.55.0\"\n\n\
+            [targets.t]\npath = \"~/x\"\nsources = [\"fzf\"]\n";
+        let t = target(toml, "t");
+        let all = sources(toml);
+
+        let resolved = t.resolve_sources(&all);
+        let b = find_resolved(&resolved, "fzf");
+
+        match &b.effective_ref {
+            Refspec::Tag(tag) => assert_eq!(
+                tag, "v0.55.0",
+                "a bare binding must INHERIT the source ref; effective_ref must be the source's tag"
+            ),
+            other => panic!(
+                "a bare binding must inherit the source's Refspec::Tag(v0.55.0), got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn resolve_binding_ref_precedence_is_rev_over_tag_over_branch() {
+        // Built directly, not via Config::parse: PTV-002 makes >1 binding ref a validation error.
+        let toml = "version = 1\n\n\
+            [sources.fzf]\ngit = \"https://github.com/junegunn/fzf.git\"\nbranch = \"main\"\n";
+        let all = sources(toml);
+
+        let t = Target {
+            path: std::path::PathBuf::from("~/x"),
+            layout: None,
+            sources: Some(vec![Binding::Refined(RefinedBinding {
+                source: "fzf".to_owned(),
+                r#as: Some("pinned".to_owned()),
+                root: None,
+                include: None,
+                exclude: None,
+                branch: Some("develop".to_owned()),
+                tag: Some("v9.9.9".to_owned()),
+                rev: Some("deadbeef".to_owned()),
+            })]),
+        };
+
+        let resolved = t.resolve_sources(&all);
+        let b = find_resolved(&resolved, "pinned");
+
+        match &b.effective_ref {
+            Refspec::Rev(rev) => assert_eq!(
+                rev, "deadbeef",
+                "with `rev`, `tag`, and `branch` all set on the binding, rev must win (rev > tag > branch)"
+            ),
+            other => panic!(
+                "binding ref precedence must pick `rev` over `tag` and `branch`, got {other:?} \
+                 (a Tag(v9.9.9) or Branch(develop) here would mean precedence is reversed)"
+            ),
+        }
+    }
+
+    #[test]
+    fn resolve_binding_ref_precedence_is_tag_over_branch_when_rev_absent() {
+        // Built directly, not via Config::parse: PTV-002 makes >1 binding ref a validation error.
+        let toml = "version = 1\n\n\
+            [sources.fzf]\ngit = \"https://github.com/junegunn/fzf.git\"\nbranch = \"main\"\n";
+        let all = sources(toml);
+
+        let t = Target {
+            path: std::path::PathBuf::from("~/x"),
+            layout: None,
+            sources: Some(vec![Binding::Refined(RefinedBinding {
+                source: "fzf".to_owned(),
+                r#as: Some("pinned".to_owned()),
+                root: None,
+                include: None,
+                exclude: None,
+                branch: Some("develop".to_owned()),
+                tag: Some("v9.9.9".to_owned()),
+                rev: None,
+            })]),
+        };
+
+        let resolved = t.resolve_sources(&all);
+        let b = find_resolved(&resolved, "pinned");
+
+        match &b.effective_ref {
+            Refspec::Tag(tag) => assert_eq!(
+                tag, "v9.9.9",
+                "with `tag` and `branch` set (no rev), tag must win (rev > tag > branch)"
+            ),
+            other => panic!(
+                "binding ref precedence must pick `tag` over `branch` when rev is absent, got {other:?} \
+                 (a Branch(develop) here would mean precedence is reversed)"
+            ),
+        }
+    }
+
+    #[test]
+    fn two_refined_bindings_of_one_source_carry_distinct_effective_refs() {
+        let toml = "version = 1\n\n\
+            [sources.fzf]\ngit = \"https://github.com/junegunn/fzf.git\"\nbranch = \"main\"\n\n\
+            [targets.t]\npath = \"~/x\"\n\
+            sources = [\
+                { source = \"fzf\", as = \"stable\", tag = \"v0.55.0\" }, \
+                { source = \"fzf\", as = \"canary\", tag = \"v0.56.0\" }\
+            ]\n";
+        let t = target(toml, "t");
+        let all = sources(toml);
+
+        let resolved = t.resolve_sources(&all);
+        assert_eq!(
+            resolved.len(),
+            2,
+            "two distinct refined bindings of one source must resolve to two ResolvedBindings"
+        );
+
+        let stable = find_resolved(&resolved, "stable");
+        let canary = find_resolved(&resolved, "canary");
+
+        assert_eq!(
+            stable.source, "fzf",
+            "both resolved bindings name the same underlying source"
+        );
+        assert_eq!(canary.source, "fzf");
+
+        match (&stable.effective_ref, &canary.effective_ref) {
+            (Refspec::Tag(s), Refspec::Tag(c)) => {
+                assert_eq!(s, "v0.55.0", "the `stable` binding pins its own tag");
+                assert_eq!(c, "v0.56.0", "the `canary` binding pins its own tag");
+                assert_ne!(
+                    s, c,
+                    "two bindings of one source must carry DISTINCT effective_refs"
+                );
+            }
+            other => panic!(
+                "both bindings must resolve to their own Refspec::Tag, got {other:?}"
+            ),
         }
     }
 }
