@@ -19,14 +19,17 @@ pub(super) fn prune_orphans(
 ) -> Result<()> {
     let mut expected: HashSet<ArtifactKey> = HashSet::new();
     for (target_name, target) in &config.targets {
-        for source_name in target.resolve_sources() {
-            let source = parsed.get(source_name).ok_or_else(|| {
-                Error::Config(format!("target references undefined source: {source_name}"))
+        for binding in target.resolve_sources(parsed) {
+            let source = parsed.get(binding.source).ok_or_else(|| {
+                Error::Config(format!(
+                    "target references undefined source: {}",
+                    binding.source
+                ))
             })?;
-            let commit = &resolved_commits[source_name];
-            let git = remote_for(remotes, source_name)?;
-            let source_name = SourceName::trusted(source_name);
-            let selection = Selection::new(source.includes(), source.excludes())?;
+            let commit = &resolved_commits[binding.source];
+            let git = remote_for(remotes, binding.source)?;
+            let source_name = SourceName::trusted(binding.source);
+            let selection = Selection::new(binding.include, binding.exclude)?;
             let discovered = discover_artifacts_for_source(
                 source,
                 git,
@@ -34,11 +37,12 @@ pub(super) fn prune_orphans(
                 commit,
                 backend,
                 &selection,
+                binding.root,
             )?;
             for artifact in discovered {
                 expected.insert(ArtifactKey {
                     target: target_name.clone(),
-                    source: source_name.as_str().to_owned(),
+                    source: binding.identity.to_owned(),
                     artifact: artifact.as_str().to_owned(),
                 });
             }

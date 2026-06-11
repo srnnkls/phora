@@ -55,14 +55,19 @@ pub(super) fn resolve_sources(
             }
         };
 
-        let selection = Selection::new(source.includes(), source.excludes())?;
-        let digest = backend.compute_digest(
-            &source_name,
-            git,
-            &commit,
-            source.root.as_deref(),
-            &selection,
-        )?;
+        let digest = if source.mode() == SourceMode::Url {
+            let full = Selection::new(&[], &[])?;
+            backend.compute_digest(&source_name, git, &commit, None, &full)?
+        } else {
+            let selection = Selection::new(source.includes(), source.excludes())?;
+            backend.compute_digest(
+                &source_name,
+                git,
+                &commit,
+                source.root.as_deref(),
+                &selection,
+            )?
+        };
 
         let resolved = if source.mode() == SourceMode::Url {
             "url".to_owned()

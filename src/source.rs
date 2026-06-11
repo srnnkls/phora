@@ -115,8 +115,8 @@ pub trait SourceBackend {
     /// artifact dotfile opt-in does not apply, so a top-level `.config` is hashed
     /// under path rules regardless of that gate.
     ///
-    /// No production consumer: lock reuse is decided by `lock::source_matches`,
-    /// never this digest. Only test assertions read it.
+    /// The value written to `LockedSource::digest`; lock reuse is decided by
+    /// `lock::source_matches`, not by comparing this digest.
     fn compute_digest(
         &self,
         source: &SourceName,

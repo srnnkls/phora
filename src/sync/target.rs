@@ -38,34 +38,44 @@ pub(super) fn deploy_target(
     let mut seen: BTreeMap<String, String> = BTreeMap::new();
     let mut had_failures = false;
 
-    for source_name in run.target.resolve_sources() {
-        let source = run.parsed.get(source_name).ok_or_else(|| {
-            Error::Config(format!("target references undefined source: {source_name}"))
+    for binding in run.target.resolve_sources(run.parsed) {
+        let source = run.parsed.get(binding.source).ok_or_else(|| {
+            Error::Config(format!(
+                "target references undefined source: {}",
+                binding.source
+            ))
         })?;
-        let commit = &run.commits[source_name];
-        let git = remote_for(run.remotes, source_name)?;
-        let source_name = SourceName::trusted(source_name);
-        let selection = Selection::new(source.includes(), source.excludes())?;
-        let discovered =
-            discover_artifacts_for_source(source, git, &source_name, commit, backend, &selection)?;
+        let commit = &run.commits[binding.source];
+        let git = remote_for(run.remotes, binding.source)?;
+        let source_name = SourceName::trusted(binding.source);
+        let selection = Selection::new(binding.include, binding.exclude)?;
+        let discovered = discover_artifacts_for_source(
+            source,
+            git,
+            &source_name,
+            commit,
+            backend,
+            &selection,
+            binding.root,
+        )?;
 
         for artifact_name in discovered {
             if layout.kind == LayoutKind::Flat {
                 if let Some(other) = seen.get(artifact_name.as_str()) {
                     return Err(Error::Collision {
                         artifact: artifact_name.as_str().to_owned(),
-                        sources: vec![other.clone(), source_name.as_str().to_owned()],
+                        sources: vec![other.clone(), binding.identity.to_owned()],
                         target: run.target_name.to_owned(),
                     });
                 }
                 seen.insert(
                     artifact_name.as_str().to_owned(),
-                    source_name.as_str().to_owned(),
+                    binding.identity.to_owned(),
                 );
             }
 
-            let artifact_dst = target_path
-                .join(layout.artifact_path(source_name.as_str(), artifact_name.as_str()));
+            let artifact_dst =
+                target_path.join(layout.artifact_path(binding.identity, artifact_name.as_str()));
             let dst_is_symlink =
                 std::fs::symlink_metadata(&artifact_dst).is_ok_and(|m| m.file_type().is_symlink());
             let mode_transition = match source.deploy_mode() {
@@ -77,6 +87,9 @@ pub(super) fn deploy_target(
                 source,
                 git,
                 source_name: &source_name,
+                identity: binding.identity,
+                underlying_source: binding.source,
+                root: binding.root,
                 commit,
                 selection: &selection,
                 artifact_name: &artifact_name,
@@ -96,6 +109,9 @@ pub(super) struct ArtifactEntry<'a> {
     pub(super) source: &'a ParsedSource,
     pub(super) git: &'a str,
     pub(super) source_name: &'a SourceName,
+    pub(super) identity: &'a str,
+    pub(super) underlying_source: &'a str,
+    pub(super) root: Option<&'a Path>,
     pub(super) commit: &'a str,
     pub(super) selection: &'a Selection,
     pub(super) artifact_name: &'a ArtifactName,
@@ -115,17 +131,17 @@ pub(super) fn deploy_artifact_entry(
     let artifact_dst = entry.target_path.join(
         run.target
             .layout()
-            .artifact_path(entry.source_name.as_str(), entry.artifact_name.as_str()),
+            .artifact_path(entry.identity, entry.artifact_name.as_str()),
     );
     let key = ArtifactKey {
         target: run.target_name.to_owned(),
-        source: entry.source_name.as_str().to_owned(),
+        source: entry.identity.to_owned(),
         artifact: entry.artifact_name.as_str().to_owned(),
     };
 
     let state = check_artifact_state(
         &artifact_dst,
-        entry.source_name.as_str(),
+        entry.identity,
         entry.commit,
         entry.ejected,
         entry.artifact_name.as_str(),
@@ -133,14 +149,7 @@ pub(super) fn deploy_artifact_entry(
         &key,
     )?;
 
-    let conflict_kind = match &state {
-        _ if entry.mode_transition => None,
-        ArtifactState::Modified { changed } if !run.force => Some(ConflictKind::Modified {
-            changed: changed.clone(),
-        }),
-        ArtifactState::Foreign if !run.force => Some(ConflictKind::Foreign),
-        _ => None,
-    };
+    let conflict_kind = conflict_kind_for(&state, entry, run.force);
 
     let deploy = |key: ArtifactKey| match entry.source.deploy_mode() {
         DeployMode::Link => deploy_link(registry, journal, entry, &artifact_dst, key),
@@ -154,6 +163,8 @@ pub(super) fn deploy_artifact_entry(
                 source: entry.source,
                 git: entry.git,
                 source_name: entry.source_name,
+                underlying_source: entry.underlying_source,
+                root: entry.root,
                 commit: entry.commit,
                 selection: entry.selection,
                 artifact_name: entry.artifact_name,
@@ -176,13 +187,13 @@ pub(super) fn deploy_artifact_entry(
         Some(kind) => match run.resolver {
             Some(resolver) if run.interactive => resolver.resolve(&Conflict {
                 target: run.target_name.to_owned(),
-                source: entry.source_name.as_str().to_owned(),
+                source: entry.identity.to_owned(),
                 artifact: entry.artifact_name.as_str().to_owned(),
                 kind,
             }),
             _ => {
                 warn_skip(
-                    entry.source_name.as_str(),
+                    entry.identity,
                     entry.artifact_name.as_str(),
                     &kind,
                     &artifact_dst,
@@ -199,7 +210,7 @@ pub(super) fn deploy_artifact_entry(
             Err(e) => {
                 eprintln!(
                     "phora: failed to deploy {}:{}: {e}",
-                    entry.source_name, entry.artifact_name
+                    entry.identity, entry.artifact_name
                 );
                 Ok(true)
             }
@@ -207,7 +218,7 @@ pub(super) fn deploy_artifact_entry(
         Resolution::Eject => {
             let mut ejected = registry.load_ejected(run.target_name)?;
             ejected.push(EjectedEntry {
-                source: entry.source_name.as_str().to_owned(),
+                source: entry.identity.to_owned(),
                 artifact: entry.artifact_name.as_str().to_owned(),
                 ejected_at: chrono::Utc::now().to_rfc3339(),
             });
@@ -216,6 +227,21 @@ pub(super) fn deploy_artifact_entry(
             Ok(false)
         }
         Resolution::Abort => Err(Error::Aborted),
+    }
+}
+
+fn conflict_kind_for(
+    state: &ArtifactState,
+    entry: &ArtifactEntry<'_>,
+    force: bool,
+) -> Option<ConflictKind> {
+    match state {
+        _ if entry.mode_transition => None,
+        ArtifactState::Modified { changed } if !force => Some(ConflictKind::Modified {
+            changed: changed.clone(),
+        }),
+        ArtifactState::Foreign if !force => Some(ConflictKind::Foreign),
+        _ => None,
     }
 }
 
@@ -243,6 +269,8 @@ struct DeployContext<'a> {
     source: &'a ParsedSource,
     git: &'a str,
     source_name: &'a SourceName,
+    underlying_source: &'a str,
+    root: Option<&'a Path>,
     commit: &'a str,
     selection: &'a Selection,
     artifact_name: &'a ArtifactName,
@@ -267,7 +295,7 @@ fn deploy_one(
         source: ctx.source_name,
         url: git,
         commit: ctx.commit,
-        root: ctx.source.root.as_deref(),
+        root: ctx.root,
         artifact: ctx.artifact_name,
         selection: ctx.selection,
         policy: &policy,
@@ -284,6 +312,7 @@ fn deploy_one(
     let record = RegistryRecord {
         version: 1,
         key: ctx.key,
+        source: ctx.underlying_source.to_owned(),
         commit: ctx.commit.to_owned(),
         digest: export.digest,
         projected_at: chrono::Utc::now().to_rfc3339(),
@@ -316,6 +345,7 @@ fn deploy_link(
     let record = RegistryRecord {
         version: 1,
         key,
+        source: entry.underlying_source.to_owned(),
         commit: "link".to_owned(),
         digest: "link:".to_owned(),
         projected_at: chrono::Utc::now().to_rfc3339(),
@@ -346,7 +376,7 @@ fn link_target(entry: &ArtifactEntry<'_>) -> PathBuf {
             std::env::current_dir().map_or_else(|_| base.to_path_buf(), |c| c.join(base))
         })
     };
-    if let Some(root) = &entry.source.root {
+    if let Some(root) = entry.root {
         target.push(root);
     }
     target.push(entry.artifact_name.as_str());

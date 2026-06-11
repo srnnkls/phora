@@ -1,15 +1,129 @@
 //! Target DTOs and deploy layout resolution.
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+
+use super::source::{ParsedSource, Source};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Target {
     pub path: PathBuf,
-    pub sources: Option<Vec<String>>,
+    pub sources: Option<Vec<Binding>>,
     pub layout: Option<LayoutConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub enum Binding {
+    Source(String),
+    Refined(RefinedBinding),
+}
+
+impl Binding {
+    #[must_use]
+    pub fn source(&self) -> &str {
+        match self {
+            Binding::Source(name) => name,
+            Binding::Refined(refined) => &refined.source,
+        }
+    }
+
+    #[must_use]
+    pub fn identity(&self) -> &str {
+        match self {
+            Binding::Source(name) => name,
+            Binding::Refined(refined) => refined.r#as.as_deref().unwrap_or(&refined.source),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Binding {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct BindingVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for BindingVisitor {
+            type Value = Binding;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a source name string or a refinement table")
+            }
+
+            fn visit_str<E: serde::de::Error>(
+                self,
+                v: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(Binding::Source(v.to_owned()))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                RefinedBinding::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(Binding::Refined)
+            }
+        }
+
+        deserializer.deserialize_any(BindingVisitor)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefinedBinding {
+    pub source: String,
+    pub r#as: Option<String>,
+    pub root: Option<PathBuf>,
+    pub include: Option<Vec<String>>,
+    pub exclude: Option<Vec<String>>,
+}
+
+#[derive(Debug)]
+pub struct ResolvedBinding<'a> {
+    pub identity: &'a str,
+    pub source: &'a str,
+    pub root: Option<&'a Path>,
+    pub include: &'a [String],
+    pub exclude: &'a [String],
+}
+
+pub trait SourceFields {
+    fn intrinsic_root(&self) -> Option<&Path>;
+    fn intrinsic_include(&self) -> &[String];
+    fn intrinsic_exclude(&self) -> &[String];
+}
+
+impl SourceFields for Source {
+    fn intrinsic_root(&self) -> Option<&Path> {
+        self.root.as_deref()
+    }
+
+    fn intrinsic_include(&self) -> &[String] {
+        self.include.as_deref().unwrap_or(&[])
+    }
+
+    fn intrinsic_exclude(&self) -> &[String] {
+        self.exclude.as_deref().unwrap_or(&[])
+    }
+}
+
+impl SourceFields for ParsedSource {
+    fn intrinsic_root(&self) -> Option<&Path> {
+        self.root.as_deref()
+    }
+
+    fn intrinsic_include(&self) -> &[String] {
+        self.includes()
+    }
+
+    fn intrinsic_exclude(&self) -> &[String] {
+        self.excludes()
+    }
 }
 
 impl Target {
@@ -30,12 +144,20 @@ impl Target {
         self.layout.clone().unwrap_or_default()
     }
 
+    pub fn declared_sources(&self) -> impl Iterator<Item = &str> {
+        self.sources.iter().flatten().map(Binding::source)
+    }
+
     #[must_use]
-    pub fn resolve_sources(&self) -> Vec<&str> {
+    pub fn resolve_sources<'a, S: SourceFields>(
+        &'a self,
+        all: &'a BTreeMap<String, S>,
+    ) -> Vec<ResolvedBinding<'a>> {
         self.sources
-            .as_deref()
-            .map(|names| names.iter().map(String::as_str).collect())
-            .unwrap_or_default()
+            .iter()
+            .flatten()
+            .filter_map(|binding| resolve_binding(binding, all))
+            .collect()
     }
 
     #[must_use]
@@ -48,6 +170,30 @@ impl Target {
         }
         self.path.clone()
     }
+}
+
+fn resolve_binding<'a, S: SourceFields>(
+    binding: &'a Binding,
+    all: &'a BTreeMap<String, S>,
+) -> Option<ResolvedBinding<'a>> {
+    let identity = binding.identity();
+    let source_name = binding.source();
+    let (root, include, exclude) = match binding {
+        Binding::Source(_) => (None, None, None),
+        Binding::Refined(refined) => (
+            refined.root.as_deref(),
+            refined.include.as_deref(),
+            refined.exclude.as_deref(),
+        ),
+    };
+    let source = all.get(source_name)?;
+    Some(ResolvedBinding {
+        identity,
+        source: source_name,
+        root: root.or_else(|| source.intrinsic_root()),
+        include: include.unwrap_or_else(|| source.intrinsic_include()),
+        exclude: exclude.unwrap_or_else(|| source.intrinsic_exclude()),
+    })
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]

@@ -1013,6 +1013,357 @@ fn sync_errors_on_flat_layout_collision_naming_artifact_sources_and_target() {
     drop(fx_b);
 }
 
+// ── per-binding refinement: effective selection + identity (PBR-003) ──
+
+/// A git repo with two disjoint slices: `nvim/init/` and `tmux/conf/`. A binding
+/// `root` of `nvim` (resp. `tmux`) scopes discovery to that slice's single artifact
+/// dir (`init`, resp. `conf`), so projection keys on the binding, not the source.
+#[expect(
+    clippy::unwrap_used,
+    reason = "fixture setup fails loudly; git CLI is assumed present"
+)]
+fn build_multi_root_repo() -> (TempDir, String) {
+    let src = TempDir::new().unwrap();
+    let p = src.path();
+    run_git(p, &["init", "-b", "main", "."]);
+    run_git(p, &["config", "user.email", "test@example.com"]);
+    run_git(p, &["config", "user.name", "Test"]);
+    std::fs::create_dir_all(p.join("nvim/init")).unwrap();
+    std::fs::write(p.join("nvim/init/config.lua"), b"-- nvim\n").unwrap();
+    std::fs::create_dir_all(p.join("tmux/conf")).unwrap();
+    std::fs::write(p.join("tmux/conf/tmux.conf"), b"# tmux\n").unwrap();
+    run_git(p, &["add", "-A"]);
+    run_git(p, &["commit", "-m", "init"]);
+    let url = p.to_string_lossy().into_owned();
+    (src, url)
+}
+
+fn fresh_backend_registry() -> (TempDir, TempDir, GitBackend, FileRegistry) {
+    let git_dir = TempDir::new().expect("git dir");
+    let state_dir = TempDir::new().expect("state dir");
+    let backend = GitBackend::new(git_dir.path().to_path_buf());
+    let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    (git_dir, state_dir, backend, registry)
+}
+
+/// A bare source's intrinsic `root` is inherited only when the binding omits it;
+/// a binding's `root` overrides the source default and scopes discovery to that
+/// slice, proving projection uses the binding's *effective* selection.
+#[test]
+fn refined_binding_root_scopes_projection_to_its_slice() {
+    let (src, url) = build_multi_root_repo();
+    let td = TargetDir::new();
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let toml = format!(
+        "version = 1\n\n[sources.dots]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\n\
+         sources = [{{ source = \"dots\", root = \"nvim\" }}]\nlayout = \"by-source\"\n",
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("refined-binding config parses");
+
+    sync(&input(&cfg, None, None, None, false), &backend, &registry)
+        .expect("sync over a refined binding must succeed");
+
+    assert!(
+        registry
+            .get(&artifact_key("dest", "dots", "init"))
+            .expect("registry get")
+            .is_some(),
+        "the binding's `root = nvim` slice must project artifact `init` under identity `dots`"
+    );
+    assert!(
+        registry
+            .get(&artifact_key("dest", "dots", "conf"))
+            .expect("registry get")
+            .is_none(),
+        "the tmux slice is outside the binding root and must NOT be projected"
+    );
+    assert_eq!(
+        std::fs::read(
+            td.target_path()
+                .join("dots")
+                .join("init")
+                .join("config.lua")
+        )
+        .expect("nvim slice file deployed"),
+        b"-- nvim\n",
+        "the binding's effective root must drive which files materialize"
+    );
+    drop(src);
+}
+
+/// Two bindings of one source under distinct `as` identities are two independent
+/// slices into one target: each keys the registry by its identity and projects its
+/// own root. They must coexist without colliding.
+#[test]
+fn two_slices_of_one_source_into_one_target_both_deploy() {
+    let (src, url) = build_multi_root_repo();
+    let td = TargetDir::new();
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let toml = format!(
+        "version = 1\n\n[sources.dots]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\n\
+         {{ source = \"dots\", as = \"nvim\", root = \"nvim\" }},\n\
+         {{ source = \"dots\", as = \"tmux\", root = \"tmux\" }},\n\
+         ]\nlayout = \"by-source\"\n",
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("two-slice config parses");
+
+    sync(&input(&cfg, None, None, None, false), &backend, &registry)
+        .expect("two slices of one source must deploy without collision");
+
+    assert!(
+        registry
+            .get(&artifact_key("dest", "nvim", "init"))
+            .expect("registry get")
+            .is_some(),
+        "the `as = nvim` slice must key its registry record by identity `nvim`"
+    );
+    assert!(
+        registry
+            .get(&artifact_key("dest", "tmux", "conf"))
+            .expect("registry get")
+            .is_some(),
+        "the `as = tmux` slice must key its registry record by identity `tmux`"
+    );
+    assert_eq!(
+        std::fs::read(
+            td.target_path()
+                .join("nvim")
+                .join("init")
+                .join("config.lua")
+        )
+        .expect("nvim slice deployed under its identity"),
+        b"-- nvim\n",
+    );
+    assert_eq!(
+        std::fs::read(td.target_path().join("tmux").join("conf").join("tmux.conf"))
+            .expect("tmux slice deployed under its identity"),
+        b"# tmux\n",
+    );
+    drop(src);
+}
+
+/// PBR-004: an aliased binding keys its record path by IDENTITY (the `as`) yet must
+/// record the UNDERLYING source name in the new `source` field, so provenance survives.
+#[test]
+fn aliased_binding_records_underlying_source_at_identity_path() {
+    let (src, url) = build_multi_root_repo();
+    let td = TargetDir::new();
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let toml = format!(
+        "version = 1\n\n[sources.dotfiles]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\n\
+         sources = [{{ source = \"dotfiles\", as = \"nvim\", root = \"nvim\" }}]\nlayout = \"by-source\"\n",
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("aliased-binding config parses");
+
+    sync(&input(&cfg, None, None, None, false), &backend, &registry)
+        .expect("sync over an aliased binding must succeed");
+
+    let rec = registry
+        .get(&artifact_key("dest", "nvim", "init"))
+        .expect("registry get")
+        .expect("the record must be keyed by identity `nvim` at …/artifacts/nvim/init.toml");
+    assert_eq!(
+        rec.key.source, "nvim",
+        "key.source is the binding IDENTITY (the `as`), which keys the on-disk record path"
+    );
+    assert_eq!(
+        rec.source, "dotfiles",
+        "the new `source` field must carry the UNDERLYING source name `dotfiles`, not the identity"
+    );
+    drop(src);
+}
+
+/// PBR-004: two aliases of ONE source must not collide — distinct record paths keyed
+/// by identity, both carrying the SAME underlying `source`.
+#[test]
+fn two_aliases_of_one_source_each_record_the_shared_underlying_source() {
+    let (src, url) = build_multi_root_repo();
+    let td = TargetDir::new();
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let toml = format!(
+        "version = 1\n\n[sources.dotfiles]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\n\
+         {{ source = \"dotfiles\", as = \"nvim\", root = \"nvim\" }},\n\
+         {{ source = \"dotfiles\", as = \"tmux\", root = \"tmux\" }},\n\
+         ]\nlayout = \"by-source\"\n",
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("two-alias config parses");
+
+    sync(&input(&cfg, None, None, None, false), &backend, &registry)
+        .expect("two aliases of one source must deploy without collision");
+
+    let nvim = registry
+        .get(&artifact_key("dest", "nvim", "init"))
+        .expect("registry get")
+        .expect("the `as = nvim` record must exist at its own identity path");
+    let tmux = registry
+        .get(&artifact_key("dest", "tmux", "conf"))
+        .expect("registry get")
+        .expect("the `as = tmux` record must exist at its own identity path");
+    assert_eq!(
+        nvim.source, "dotfiles",
+        "the nvim alias must record the shared underlying source `dotfiles`"
+    );
+    assert_eq!(
+        tmux.source, "dotfiles",
+        "the tmux alias must record the same underlying source `dotfiles`"
+    );
+    drop(src);
+}
+
+/// PBR-004 back-compat: a BARE binding (identity == source) keys its record path at
+/// …/artifacts/<source>/ AND records `source` == the source name, byte-identical to
+/// the pre-PBR behaviour.
+#[test]
+fn bare_binding_records_source_equal_to_identity() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let cfg =
+        config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+
+    sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("bare-binding sync deploys");
+
+    let rec = fx
+        .registry
+        .get(&artifact_key("dest", "editor-src", "editor"))
+        .expect("registry get")
+        .expect("bare binding must record at …/artifacts/editor-src/editor.toml");
+    assert_eq!(
+        rec.key.source, "editor-src",
+        "a bare binding keys by the source name (identity == source)"
+    );
+    assert_eq!(
+        rec.source, "editor-src",
+        "a bare binding's underlying `source` equals its identity"
+    );
+}
+
+/// PBR-004: `rebuild-registry` must round-trip an alias — after rebuild the record is
+/// keyed by IDENTITY (path == …/artifacts/nvim/) and carries the UNDERLYING `source`.
+#[test]
+fn rebuild_round_trips_aliased_underlying_source() {
+    let (src, url) = build_multi_root_repo();
+    let td = TargetDir::new();
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let toml = format!(
+        "version = 1\n\n[sources.dotfiles]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\n\
+         sources = [{{ source = \"dotfiles\", as = \"nvim\", root = \"nvim\" }}]\nlayout = \"by-source\"\n",
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("aliased-binding config parses");
+
+    let out = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+        .expect("seeding sync over an aliased binding must succeed");
+
+    let key = artifact_key("dest", "nvim", "init");
+    registry.remove(&key).expect("drop the aliased record");
+    assert!(
+        registry.get(&key).expect("get after remove").is_none(),
+        "premise: the record must be gone before rebuild"
+    );
+
+    rebuild_registry(&cfg, &out.base_lock, &backend, &registry)
+        .expect("rebuild reconstructs the aliased record");
+
+    let rebuilt = registry
+        .get(&key)
+        .expect("registry get")
+        .expect("rebuild must reconstruct the record at the IDENTITY path …/artifacts/nvim/");
+    assert_eq!(
+        rebuilt.key.source, "nvim",
+        "rebuild must key by identity `nvim`, preserving the on-disk path"
+    );
+    assert_eq!(
+        rebuilt.source, "dotfiles",
+        "rebuild must reconstruct the UNDERLYING source `dotfiles` in the `source` field"
+    );
+    drop(src);
+}
+
+/// Two aliased slices that resolve to the SAME destination path under a flat layout
+/// are a real conflict — collision detection is about the destination, not the source.
+#[test]
+fn flat_layout_collision_detected_between_two_aliases_sharing_a_destination() {
+    let (src, url) = build_multi_root_repo();
+    let td = TargetDir::new();
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    // Both bindings expose the SAME artifact name (`init`, via root=nvim) but under
+    // different identities; flat layout drops the identity, so both land at `dest/init`.
+    let toml = format!(
+        "version = 1\n\n[sources.dots]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\n\
+         {{ source = \"dots\", as = \"one\", root = \"nvim\" }},\n\
+         {{ source = \"dots\", as = \"two\", root = \"nvim\" }},\n\
+         ]\nlayout = \"flat\"\n",
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("two-alias flat config parses");
+
+    let Err(Error::Collision {
+        artifact, target, ..
+    }) = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+    else {
+        panic!("two aliases projecting `init` into a flat target must collide on the destination");
+    };
+    assert_eq!(
+        artifact, "init",
+        "the collision must name the shared artifact"
+    );
+    assert_eq!(target, "dest", "the collision must name the target");
+    drop(src);
+}
+
+/// A link-mode binding's symlink must point through the binding's effective root:
+/// the source declares none, the binding sets `root = languages`, so the link must
+/// resolve to `<git>/languages/<artifact>`, not the un-rooted `<git>/<artifact>`.
+#[test]
+fn link_binding_symlink_uses_binding_effective_root() {
+    let wt = build_worktree(Some("languages"));
+    let td = TargetDir::new();
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let base = base_copy_source("linked", wt.path());
+    let local = {
+        let toml = format!(
+            "version = 1\n\n\
+             [sources.linked]\ngit = \"{}\"\nbranch = \"main\"\ndeploy = \"link\"\n\n\
+             [targets.dest]\npath = \"{}\"\n\
+             sources = [{{ source = \"linked\", root = \"languages\" }}]\nlayout = \"by-source\"\n",
+            wt.path().display(),
+            td.target_path().display(),
+        );
+        Config::parse(&toml).expect("link refined-binding overlay parses")
+    };
+
+    sync(
+        &input(&base, Some(&local), None, None, false),
+        &backend,
+        &registry,
+    )
+    .expect("link sync with a binding root must succeed");
+
+    let link = td.target_path().join("linked").join("alpha");
+    let resolved = std::fs::read_link(&link).expect("alpha must be deployed as a symlink");
+    assert_eq!(
+        resolved,
+        wt.path().join("languages").join("alpha"),
+        "the symlink must target <git>/languages/alpha — the binding's effective root, \
+         not the source's un-rooted top level"
+    );
+}
+
 // ── Modified / Foreign skip unless --force ─────────────────────
 
 /// Pre-place foreign content (no registry record) at the artifact dst so
@@ -1234,6 +1585,7 @@ fn second_deploy_over_correct_link_is_a_noop() {
     let linked_record = RegistryRecord {
         version: 1,
         key: artifact_key("dest", "editor-src", "editor"),
+        source: "editor-src".to_owned(),
         commit: "link".to_owned(),
         digest: "link:".to_owned(),
         projected_at: "2026-06-08T12:00:00Z".to_owned(),
@@ -1273,6 +1625,9 @@ fn second_deploy_over_correct_link_is_a_noop() {
             .get("editor-src")
             .expect("resolved_remotes covers every source"),
         source_name: &entry_source,
+        identity: "editor-src",
+        underlying_source: "editor-src",
+        root: source.root.as_deref(),
         commit: &fx.head_sha,
         selection: &selection,
         artifact_name: &entry_artifact,
@@ -1428,6 +1783,7 @@ fn seed_orphan(
     let record = RegistryRecord {
         version: 1,
         key: artifact_key("dest", "gone-src", "obsolete"),
+        source: "gone-src".to_owned(),
         commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
         digest: "blake3:orphan".to_owned(),
         projected_at: "2026-01-01T00:00:00Z".to_owned(),
@@ -2068,6 +2424,7 @@ fn sync_runs_recovery_sweep_finishing_a_swapped_but_unrecorded_artifact() {
     let record = RegistryRecord {
         version: 1,
         key: crashed_key.clone(),
+        source: "editor-src".to_owned(),
         commit: fx.head_sha.clone(),
         digest: "blake3:recovered".to_owned(),
         projected_at: "2026-01-01T00:00:00Z".to_owned(),
@@ -2210,6 +2567,7 @@ fn sync_runs_recovery_before_phase1_even_when_resolve_fails() {
     let record = RegistryRecord {
         version: 1,
         key: crashed_key.clone(),
+        source: "editor-src".to_owned(),
         commit: fx.head_sha.clone(),
         digest: "blake3:recovered".to_owned(),
         projected_at: "2026-01-01T00:00:00Z".to_owned(),
@@ -2293,6 +2651,7 @@ fn seed_managed_artifact(
     let record = RegistryRecord {
         version: 1,
         key: artifact_key("dest", source, artifact),
+        source: source.to_owned(),
         commit: "feedfacefeedfacefeedfacefeedfacefeedface".to_owned(),
         digest: "blake3:seed".to_owned(),
         projected_at: "2026-01-01T00:00:00Z".to_owned(),
@@ -2455,6 +2814,7 @@ fn seed_verifiable_artifact(
     let record = RegistryRecord {
         version: 1,
         key: artifact_key("dest", source, artifact),
+        source: source.to_owned(),
         commit: "feedfacefeedfacefeedfacefeedfacefeedface".to_owned(),
         digest: "blake3:seed".to_owned(),
         projected_at: "2026-01-01T00:00:00Z".to_owned(),
@@ -3039,6 +3399,7 @@ fn verify_skips_linked_record_even_with_stray_manifest_file() {
     let stray = RegistryRecord {
         version: 1,
         key: artifact_key("dest", "editor-src", "editor"),
+        source: "editor-src".to_owned(),
         commit: "link".to_owned(),
         digest: "link:".to_owned(),
         projected_at: "2026-06-08T12:00:00Z".to_owned(),
@@ -3089,6 +3450,7 @@ fn verify_skips_linked_record_over_edited_symlink_target() {
     let linked = RegistryRecord {
         version: 1,
         key: artifact_key("dest", "editor-src", "editor"),
+        source: "editor-src".to_owned(),
         commit: "link".to_owned(),
         digest: "link:".to_owned(),
         projected_at: "2026-06-08T12:00:00Z".to_owned(),
@@ -3197,6 +3559,7 @@ fn prune_removes_stale_linked_symlink_without_following_it() {
         .put(&RegistryRecord {
             version: 1,
             key: artifact_key("dest", "linked-src", "stale"),
+            source: "linked-src".to_owned(),
             commit: "link".to_owned(),
             digest: "link:".to_owned(),
             projected_at: "2026-06-08T12:00:00Z".to_owned(),
@@ -4571,4 +4934,309 @@ fn reimport_identical_bytes_does_not_churn() {
         "re-importing identical archive bytes must yield the SAME content-addressed synthetic \
              commit id — no lock churn even when forced to re-fetch"
     );
+}
+
+// ── PBR-005: lock / digest split (selection-neutral lock; per-binding digest) ──
+
+/// Byte-identical serialized form of a lock — the spec's "byte-identical phora.lock"
+/// is observable as identical TOML, since `Lock` is the on-disk artifact.
+fn lock_bytes(lock: &Lock) -> String {
+    toml::to_string(lock).expect("lock serializes to toml")
+}
+
+/// HEADLINE INVARIANT (T1): a binding's selection lives in the target, never the
+/// source. Changing a binding's `root` must leave `phora.lock` byte-identical yet
+/// re-project the artifact (its registry digest changes), because the lock is keyed
+/// per source/commit and selection routes only into projection.
+#[test]
+fn changing_binding_root_keeps_lock_byte_identical_but_reprojects() {
+    let (src, url) = build_multi_root_repo();
+    let (_g1, _s1, backend_a, registry_a) = fresh_backend_registry();
+    let (_g2, _s2, backend_b, registry_b) = fresh_backend_registry();
+    let td_a = TargetDir::new();
+    let td_b = TargetDir::new();
+
+    let cfg_nvim = Config::parse(&format!(
+        "version = 1\n\n[sources.dots]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\n\
+         sources = [{{ source = \"dots\", root = \"nvim\" }}]\nlayout = \"by-source\"\n",
+        td_a.target_path().display(),
+    ))
+    .expect("nvim-binding config parses");
+    let cfg_tmux = Config::parse(&format!(
+        "version = 1\n\n[sources.dots]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\n\
+         sources = [{{ source = \"dots\", root = \"tmux\" }}]\nlayout = \"by-source\"\n",
+        td_b.target_path().display(),
+    ))
+    .expect("tmux-binding config parses");
+
+    let out_nvim = sync(
+        &input(&cfg_nvim, None, None, None, false),
+        &backend_a,
+        &registry_a,
+    )
+    .expect("sync with binding root=nvim");
+    let out_tmux = sync(
+        &input(&cfg_tmux, None, None, None, false),
+        &backend_b,
+        &registry_b,
+    )
+    .expect("sync with binding root=tmux");
+
+    assert_eq!(
+        lock_bytes(&out_nvim.base_lock),
+        lock_bytes(&out_tmux.base_lock),
+        "a binding `root` change must NOT touch phora.lock: the lock is keyed per source/commit \
+         and is selection-neutral, so both configs must produce a byte-identical lock"
+    );
+
+    let nvim_rec = registry_a
+        .get(&artifact_key("dest", "dots", "init"))
+        .expect("registry get")
+        .expect("root=nvim projects the `init` artifact");
+    let tmux_rec = registry_b
+        .get(&artifact_key("dest", "dots", "conf"))
+        .expect("registry get")
+        .expect("root=tmux projects the `conf` artifact");
+    assert_ne!(
+        nvim_rec.digest, tmux_rec.digest,
+        "changing the binding root must re-project: the per-binding registry artifact digest \
+         must differ, since each slice projects a different tree"
+    );
+
+    drop(src);
+}
+
+/// Two bindings of ONE source (distinct roots) must share exactly ONE lock entry:
+/// the lock is per source, selection is per binding.
+#[test]
+fn two_bindings_of_one_source_share_a_single_lock_entry() {
+    let (src, url) = build_multi_root_repo();
+    let td = TargetDir::new();
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let cfg = Config::parse(&format!(
+        "version = 1\n\n[sources.dots]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\n\
+         {{ source = \"dots\", as = \"nvim\", root = \"nvim\" }},\n\
+         {{ source = \"dots\", as = \"tmux\", root = \"tmux\" }},\n\
+         ]\nlayout = \"by-source\"\n",
+        td.target_path().display(),
+    ))
+    .expect("two-binding config parses");
+
+    let out = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+        .expect("two bindings of one source must sync");
+
+    assert_eq!(
+        out.base_lock.sources.len(),
+        1,
+        "two bindings of one source must collapse to exactly ONE lock entry: the lock keys per \
+         source, not per binding"
+    );
+    assert_eq!(
+        out.base_lock
+            .find_source("dots")
+            .expect("the single lock entry is keyed by the source name")
+            .name,
+        "dots",
+        "the shared lock entry is keyed by the underlying source `dots`, never a binding identity"
+    );
+
+    drop(src);
+}
+
+/// A `.tar.gz` with TWO top-level slices (`editor/init.lua`, `shell/profile.sh`)
+/// under a single `pkg-1.0/` prefix that extraction strips, so the extracted tree
+/// is `editor/` + `shell/`. A url source scoped via include/exclude selects only
+/// one slice — exposing whether the lock digest stays full-archive (selection-neutral)
+/// or leaks the selection.
+fn two_slice_tar_gz() -> Vec<u8> {
+    use std::io::Write;
+
+    let mut builder = tar::Builder::new(Vec::new());
+    for (path, body) in [
+        ("pkg-1.0/editor/init.lua", b"-- editor\n".as_slice()),
+        ("pkg-1.0/shell/profile.sh", b"# shell\n".as_slice()),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, path, body)
+            .expect("append tar entry");
+    }
+    let tar_bytes = builder.into_inner().expect("finish tar");
+
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&tar_bytes).expect("gzip tar bytes");
+    encoder.finish().expect("finish gzip")
+}
+
+/// THE SHARP EDGE: a url source's lock `digest` must become SELECTION-NEUTRAL —
+/// the digest of the FULL extracted archive, NOT the include/exclude-filtered subtree.
+/// Two url sources over IDENTICAL bytes but DIFFERENT include scopes must lock the
+/// SAME digest. Today `resolve_sources` feeds the source's include/exclude into
+/// `compute_digest`, so the filtered url digest differs by selection — this is the RED.
+#[test]
+fn url_source_lock_digest_is_full_archive_regardless_of_selection() {
+    let server_a = UrlTarServer::spawn(vec![two_slice_tar_gz()]);
+    let server_b = UrlTarServer::spawn(vec![two_slice_tar_gz()]);
+    let (_g1, _s1, _b1, registry_a) = fresh_backend_registry();
+    let (_g2, _s2, _b2, registry_b) = fresh_backend_registry();
+    let git_a = TempDir::new().expect("git dir a");
+    let git_b = TempDir::new().expect("git dir b");
+    let backend_a = CountingRouter::new(git_a.path().to_path_buf(), url_modes("pkg"));
+    let backend_b = CountingRouter::new(git_b.path().to_path_buf(), url_modes("pkg"));
+    let td_a = TargetDir::new();
+    let td_b = TargetDir::new();
+
+    // Source-level include is the only legal way a url source carries selection today:
+    // binding-level slices on url sources are rejected (reject_url_slice), source-level is not.
+    let cfg_editor = Config::parse(&format!(
+        "version = 1\n\n[sources.pkg]\nurl = \"{}\"\ninclude = [\"editor/**\"]\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\"pkg\"]\nlayout = \"by-source\"\n",
+        server_a.url,
+        td_a.target_path().display(),
+    ))
+    .expect("editor-scoped url config parses");
+    let cfg_shell = Config::parse(&format!(
+        "version = 1\n\n[sources.pkg]\nurl = \"{}\"\ninclude = [\"shell/**\"]\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\"pkg\"]\nlayout = \"by-source\"\n",
+        server_b.url,
+        td_b.target_path().display(),
+    ))
+    .expect("shell-scoped url config parses");
+
+    let out_editor = sync(
+        &input(&cfg_editor, None, None, None, false),
+        &backend_a,
+        &registry_a,
+    )
+    .expect("editor-scoped url sync");
+    let out_shell = sync(
+        &input(&cfg_shell, None, None, None, false),
+        &backend_b,
+        &registry_b,
+    )
+    .expect("shell-scoped url sync");
+
+    let editor_lock = out_editor
+        .base_lock
+        .find_source("pkg")
+        .expect("editor-scoped url locked");
+    let shell_lock = out_shell
+        .base_lock
+        .find_source("pkg")
+        .expect("shell-scoped url locked");
+
+    assert_eq!(
+        editor_lock.commit, shell_lock.commit,
+        "premise: identical archive bytes give the same content-addressed synthetic commit, so \
+         the url commit is already selection-neutral"
+    );
+    assert_eq!(
+        editor_lock.digest, shell_lock.digest,
+        "a url source's lock digest must be the FULL extracted archive (selection-neutral): two \
+         scopes over identical bytes must lock the same digest. The filtered subtree digest leaks \
+         the selection into the lock and must not be used for url sources"
+    );
+}
+
+/// A url source carrying a source-level selection is still ONE source with ONE lock
+/// entry whose digest must be the FULL-archive digest — the selection scopes only what
+/// is projected, never the lock. The oracle is the empty-selection digest over the
+/// synthetic commit; today the lock records the include-filtered digest (the RED).
+#[test]
+fn url_source_lock_digest_equals_full_archive_oracle() {
+    let server = UrlTarServer::spawn(vec![two_slice_tar_gz()]);
+    let git_dir = TempDir::new().expect("git dir");
+    let (_g, _s, _b, registry) = fresh_backend_registry();
+    let backend = CountingRouter::new(git_dir.path().to_path_buf(), url_modes("pkg"));
+    let td = TargetDir::new();
+    let cfg = Config::parse(&format!(
+        "version = 1\n\n[sources.pkg]\nurl = \"{}\"\ninclude = [\"editor/**\"]\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\"pkg\"]\nlayout = \"by-source\"\n",
+        server.url,
+        td.target_path().display(),
+    ))
+    .expect("scoped url config parses");
+
+    let out = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+        .expect("scoped url source must sync");
+
+    assert_eq!(
+        out.base_lock.sources.len(),
+        1,
+        "one url source must produce exactly ONE lock entry"
+    );
+    let pkg = out
+        .base_lock
+        .find_source("pkg")
+        .expect("the single url lock entry is keyed by source `pkg`");
+
+    let full_archive = backend
+        .compute_digest(
+            &sn("pkg"),
+            &server.url,
+            &pkg.commit,
+            None,
+            &crate::kernel::Selection::new(&[], &[]).expect("empty selection builds"),
+        )
+        .expect("full-archive digest computes");
+    assert_eq!(
+        pkg.digest, full_archive,
+        "the url lock digest must be the FULL-archive digest (no root/include/exclude), not the \
+         include-filtered subtree digest: selection scopes projection, never the lock"
+    );
+}
+
+/// A BARE-binding config (no refinement) must produce a lock byte-identical to a
+/// plain source-only config — the per-binding feature must not perturb the lock for
+/// configs that use no refinements.
+#[test]
+fn bare_binding_lock_is_byte_identical_to_source_only_config() {
+    let (src, url) = build_multi_root_repo();
+    let (_g1, _s1, backend_a, registry_a) = fresh_backend_registry();
+    let (_g2, _s2, backend_b, registry_b) = fresh_backend_registry();
+    let td_a = TargetDir::new();
+    let td_b = TargetDir::new();
+
+    // Bare string binding `sources = ["dots"]` vs no target at all: both must lock identically.
+    let cfg_bare = Config::parse(&format!(
+        "version = 1\n\n[sources.dots]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\"dots\"]\nlayout = \"by-source\"\n",
+        td_a.target_path().display(),
+    ))
+    .expect("bare-binding config parses");
+    let cfg_plain = Config::parse(&format!(
+        "version = 1\n\n[sources.dots]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nlayout = \"by-source\"\n",
+        td_b.target_path().display(),
+    ))
+    .expect("source-only (no explicit bindings) config parses");
+
+    let out_bare = sync(
+        &input(&cfg_bare, None, None, None, false),
+        &backend_a,
+        &registry_a,
+    )
+    .expect("bare-binding sync");
+    let out_plain = sync(
+        &input(&cfg_plain, None, None, None, false),
+        &backend_b,
+        &registry_b,
+    )
+    .expect("source-only sync");
+
+    assert_eq!(
+        lock_bytes(&out_bare.base_lock),
+        lock_bytes(&out_plain.base_lock),
+        "a bare binding must lock byte-identically to a source-only config: the per-binding \
+         feature must not perturb the lock when no refinement is present"
+    );
+
+    drop(src);
 }

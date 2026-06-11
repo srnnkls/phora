@@ -811,6 +811,7 @@ mod tests {
         RegistryRecord {
             version: 1,
             key: key(),
+            source: SOURCE.to_owned(),
             commit: COMMIT.to_owned(),
             digest: "blake3:d4e5f6".to_owned(),
             projected_at: "2026-01-31T12:34:56Z".to_owned(),
@@ -965,6 +966,7 @@ mod tests {
         RegistryRecord {
             version: 1,
             key: key(),
+            source: SOURCE.to_owned(),
             commit: "link".to_owned(),
             digest: "link:".to_owned(),
             projected_at: "2026-06-08T12:00:00Z".to_owned(),
@@ -1251,6 +1253,7 @@ mod tests {
         RegistryRecord {
             version: 1,
             key: key(),
+            source: SOURCE.to_owned(),
             commit: COMMIT.to_owned(),
             digest: "blake3:d4e5f6".to_owned(),
             projected_at: "2026-01-31T12:34:56Z".to_owned(),

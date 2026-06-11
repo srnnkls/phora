@@ -42,17 +42,12 @@ pub(super) fn discover_artifacts_for_source(
     commit: &str,
     backend: &dyn SourceBackend,
     selection: &Selection,
+    root: Option<&Path>,
 ) -> Result<Vec<ArtifactName>> {
     match source.deploy_mode() {
-        DeployMode::Link => {
-            discover_working_tree(Path::new(git), source.root.as_deref(), selection)
+        DeployMode::Link => discover_working_tree(Path::new(git), root, selection),
+        DeployMode::Copy => {
+            Ok(backend.discover_artifacts(source_name, git, commit, root, selection)?)
         }
-        DeployMode::Copy => Ok(backend.discover_artifacts(
-            source_name,
-            git,
-            commit,
-            source.root.as_deref(),
-            selection,
-        )?),
     }
 }
