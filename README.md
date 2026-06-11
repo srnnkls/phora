@@ -30,7 +30,21 @@ Requires a Rust toolchain (edition 2024) and [mise](https://mise.en.dev) for the
 
 ## Getting started
 
-Describe what you want and where it goes in `phora.toml`:
+The quickest start is one command — `phora add` writes the config and deploys
+into the project directory:
+
+```bash
+phora add me/dotfiles    # add the source, bind it into [targets.default] (path ".")
+phora sync               # fetch, pin to a commit, project artifacts
+phora verify             # re-hash the deployed files; non-zero exit on any mismatch
+```
+
+`--to <name>` routes to a named target instead (created on a prompt if it does not
+exist); `[defaults] auto_target = false` opts out, so a bare `add` only declares
+the source.
+
+For control over *where* things land — a target path, a `root` subdirectory, a
+layout — write `phora.toml` yourself:
 
 ```toml
 version = 1
