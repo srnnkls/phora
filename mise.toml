@@ -1,5 +1,5 @@
 [tools]
-rust = "1.96.0"   # pinned: floating rustfmt across versions reformats committed code
+rust = { version = "1.96.0", profile = "default" }   # pinned; default profile ships clippy+rustfmt (mise's rustup default is minimal)
 "github:facebookincubator/scrut" = "0.4.3"   # deliberate one-minor bump over fas's 0.4.2
 
 [tasks.build]
