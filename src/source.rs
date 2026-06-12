@@ -42,8 +42,12 @@ type Result<T> = std::result::Result<T, SourceError>;
 /// Re-exported beside the backends it composes; defined in `backend` to keep routing separate.
 pub use crate::backend::RouterBackend;
 
-/// gix clones origin as refs/remotes/origin/*; a mirror must update refs/heads/* directly.
-const MIRROR_REFSPEC: &str = "+refs/heads/*:refs/heads/*";
+/// gix clones origin as refs/remotes/origin/*; a mirror must update refs/heads/* and
+/// refs/tags/* directly so tags (and tag-only-reachable commits) resolve after one fetch.
+const MIRROR_REFSPECS: &[&str] = &[
+    "+refs/heads/*:refs/heads/*",
+    "+refs/tags/*:refs/tags/*",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -209,7 +213,7 @@ impl SourceBackend for GitBackend {
                 .find_remote("origin")
                 .map_err(|e| SourceError::Source(format!("find origin in {source}: {e}")))?;
             remote
-                .replace_refspecs([MIRROR_REFSPEC], gix::remote::Direction::Fetch)
+                .replace_refspecs(MIRROR_REFSPECS.iter().copied(), gix::remote::Direction::Fetch)
                 .map_err(|e| SourceError::Source(format!("set mirror refspec in {source}: {e}")))?;
             remote
                 .connect(gix::remote::Direction::Fetch)
@@ -225,7 +229,10 @@ impl SourceBackend for GitBackend {
             gix::prepare_clone_bare(url, &mirror)
                 .map_err(|e| SourceError::Source(format!("prepare clone {source}: {e}")))?
                 .configure_remote(|mut remote| {
-                    remote.replace_refspecs([MIRROR_REFSPEC], gix::remote::Direction::Fetch)?;
+                    remote.replace_refspecs(
+                        MIRROR_REFSPECS.iter().copied(),
+                        gix::remote::Direction::Fetch,
+                    )?;
                     Ok(remote)
                 })
                 .fetch_only(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
@@ -978,6 +985,8 @@ mod tests {
         head_sha: String,
         /// Tip of the non-default `develop` branch; not pointed at by HEAD/main.
         develop_sha: String,
+        /// Commit reachable ONLY via tag `v-orphan`; no branch head leads to it.
+        orphan_sha: String,
     }
 
     impl GitFixture {
@@ -1022,6 +1031,10 @@ mod tests {
     #[expect(
         clippy::unwrap_used,
         reason = "fixture setup fails loudly; git CLI is assumed present"
+    )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "single linear fixture builder; splitting obscures the seeded git history"
     )]
     fn build_git_fixture() -> GitFixture {
         let src = TempDir::new().unwrap();
@@ -1073,6 +1086,59 @@ mod tests {
             .to_string();
         run_git(src_path, &["checkout", "main"]);
 
+        run_git(src_path, &["checkout", "--orphan", "orphanbranch"]);
+        run_git(src_path, &["rm", "-rf", "--cached", "."]);
+        for entry in std::fs::read_dir(src_path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.file_name().is_some_and(|n| n == ".git") {
+                continue;
+            }
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path).unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+        }
+        std::fs::write(src_path.join("ORPHAN.md"), b"orphan commit\n").unwrap();
+        run_git(src_path, &["add", "ORPHAN.md"]);
+        run_git(src_path, &["commit", "-m", "orphan"]);
+        let orphan_sha = String::from_utf8(run_git(src_path, &["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        run_git(src_path, &["tag", "-a", "v-orphan", "-m", "orphan tag"]);
+        run_git(src_path, &["checkout", "main"]);
+        run_git(src_path, &["branch", "-D", "orphanbranch"]);
+
+        let is_ancestor_of_main = Command::new("git")
+            .args(["merge-base", "--is-ancestor", &orphan_sha, "main"])
+            .current_dir(src_path)
+            .status()
+            .unwrap()
+            .success();
+        assert!(
+            !is_ancestor_of_main,
+            "orphan commit must be unreachable from main, else heads-only fetch could pull it incidentally"
+        );
+
+        let is_ancestor_of_develop = Command::new("git")
+            .args(["merge-base", "--is-ancestor", &orphan_sha, "develop"])
+            .current_dir(src_path)
+            .status()
+            .unwrap()
+            .success();
+        assert!(
+            !is_ancestor_of_develop,
+            "orphan commit must be unreachable from develop, else heads-only fetch could pull it incidentally"
+        );
+
+        for sha in [&tag_sha, &head_sha, &develop_sha] {
+            assert_ne!(
+                &orphan_sha, sha,
+                "orphan commit must be distinct from the reachable commits"
+            );
+        }
+
         let head_after_checkout =
             String::from_utf8(run_git(src_path, &["rev-parse", "HEAD"]).stdout)
                 .unwrap()
@@ -1100,6 +1166,7 @@ mod tests {
             tag_sha,
             head_sha,
             develop_sha,
+            orphan_sha,
         }
     }
 
@@ -1419,6 +1486,99 @@ mod tests {
             resolved, fixture.head_sha,
             "tag must resolve to its commit, not HEAD/main"
         );
+    }
+
+    #[test]
+    fn resolve_tag_unreachable_from_any_head_after_single_fetch() {
+        let fixture = build_git_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+
+        let resolved = fixture
+            .backend
+            .resolve(&sn("src"), &fixture.url, &Refspec::Tag("v-orphan".into()))
+            .expect("a tag unreachable from every branch head resolves after one fetch");
+
+        assert_eq!(
+            resolved, fixture.orphan_sha,
+            "the mirror must fetch tags, not only commits reachable from heads"
+        );
+    }
+
+    #[test]
+    fn resolve_rev_unreachable_from_any_head_after_single_fetch() {
+        let fixture = build_git_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+
+        let resolved = fixture
+            .backend
+            .resolve(
+                &sn("src"),
+                &fixture.url,
+                &Refspec::Rev(fixture.orphan_sha.clone()),
+            )
+            .expect("a bare sha unreachable from every head resolves after one fetch");
+
+        assert_eq!(
+            resolved, fixture.orphan_sha,
+            "fetching tags must bring the tagged object into the mirror, not just the ref"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "removing the source repo fails loudly if the fixture path is gone"
+    )]
+    fn single_fetch_covers_reachable_and_unreachable_tags() {
+        let fixture = build_git_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("single fetch");
+
+        std::fs::remove_dir_all(fixture.src.path()).unwrap();
+        assert!(
+            fixture.backend.fetch(&sn("src"), &fixture.url).is_err(),
+            "guard: after removing the source repo a fresh fetch from url MUST fail; \
+             otherwise this test cannot prove the single fetch was self-contained"
+        );
+
+        let reachable = fixture
+            .backend
+            .resolve(&sn("src"), &fixture.url, &Refspec::Tag("v1.0".into()))
+            .expect(
+                "reachable tag resolves from the mirror after the remote is gone — \
+                 no hidden refetch needed",
+            );
+        let unreachable = fixture
+            .backend
+            .resolve(&sn("src"), &fixture.url, &Refspec::Tag("v-orphan".into()))
+            .expect(
+                "unreachable tag resolves from the mirror after the remote is gone; \
+                 if resolve relied on a fallback fetch-on-miss this would fail, \
+                 proving one fetch per source was NOT achieved",
+            );
+        let orphan_rev = fixture
+            .backend
+            .resolve(
+                &sn("src"),
+                &fixture.url,
+                &Refspec::Rev(fixture.orphan_sha.clone()),
+            )
+            .expect(
+                "the bare orphan sha resolves from the mirror after the remote is gone; \
+                 the single fetch must have brought the tagged object in, not just the ref",
+            );
+
+        assert_eq!(reachable, fixture.tag_sha);
+        assert_eq!(unreachable, fixture.orphan_sha);
+        assert_eq!(orphan_rev, fixture.orphan_sha);
     }
 
     #[test]
