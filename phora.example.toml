@@ -48,6 +48,14 @@ path = "~/dev/scratch-configs"
 branch = "main"
 root = "modules"
 
+# Forge source pinned to a tag: the source default ref is `v0.55.0`. A binding may
+# override the ref per target (see [targets.tools]), so one source can serve several
+# versions at once.
+[sources.fzf]
+repo = "junegunn/fzf"
+tag = "v0.55.0"
+include = ["bin"]
+
 # Literal remote: any https, ssh://, or scp-style URL, unchanged from before.
 [sources.loqui]
 git = "https://github.com/srnnkls/loqui.git"
@@ -104,3 +112,15 @@ layout = { type = "prefixed", separator = "/" }
 path = "~/.local/bin"
 sources = ["fzf-bin"]
 layout = "flat"
+
+# One source pinned to two versions in one project: distinct `as` identities each
+# pin their own ref, so a binding's branch/tag/rev overrides the source default for
+# that target alone. Each distinct ref gets its own lock entry (at its own commit); a
+# bare binding would inherit the source ref and share the source's single entry.
+[targets.tools]
+path = "~/.local/tools"
+sources = [
+  { source = "fzf", as = "stable", tag = "v0.55.0" },
+  { source = "fzf", as = "canary", tag = "v0.56.0" },
+]
+layout = "by-source"
