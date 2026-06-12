@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::error::{Error, Result};
 use crate::lock::{Lock, merge_locks};
-use crate::paths::phora_dir;
+use crate::paths::cache_root;
 use crate::sync::{ConflictResolver, SyncInput, SyncOutput, sync};
 
 use super::{
@@ -25,7 +25,7 @@ pub(super) fn run_sync(prune: bool, force: bool, drop: Option<DropSources>) -> R
     }
 
     let effective = crate::config::merge_configs(base.clone(), local.clone());
-    let backend = build_router(&effective, phora_dir()?.join("git"))?;
+    let backend = build_router(&effective, cache_root()?.join("git"))?;
     let registry = open_project_registry()?;
     let interactive = std::io::stdin().is_terminal();
     let resolver = TtyResolver;
@@ -69,7 +69,7 @@ pub(super) fn run_rebuild_registry() -> Result<()> {
             .ok_or_else(|| Error::Lock("no lock file found; run sync first".to_owned()))?,
     };
 
-    let backend = build_router(&config, phora_dir()?.join("git"))?;
+    let backend = build_router(&config, cache_root()?.join("git"))?;
     let registry = open_project_registry()?;
     let report = crate::sync::rebuild_registry(&config, &lock, &backend, &registry)?;
 

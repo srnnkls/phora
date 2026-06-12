@@ -8,7 +8,7 @@ use crate::deploy::check_artifact_state;
 use crate::error::{Error, Result};
 use crate::kernel::Selection;
 use crate::lock::{Lock, merge_locks};
-use crate::paths::phora_dir;
+use crate::paths::cache_root;
 use crate::source::SourceBackend;
 use crate::store::Registry;
 use crate::sync::{PreviewTargetPlan, preview_targets, resolved_remotes};
@@ -42,7 +42,7 @@ pub(super) fn run_preview(sel: &PreviewSelectors, json: bool) -> Result<()> {
         |base| Some(merge_locks(&base, local_lock.as_ref())),
     );
 
-    let backend = build_router(&config, phora_dir()?.join("git"))?;
+    let backend = build_router(&config, cache_root()?.join("git"))?;
     let plan = preview_plan(&config, &parsed, &remotes, &backend, lock.as_ref(), sel)?;
 
     print!(
