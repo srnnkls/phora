@@ -29,6 +29,12 @@ isolate_state() {
 	mkdir -p "$XDG_CACHE_HOME" "$XDG_STATE_HOME"
 }
 
+# macOS canonicalizes /var -> /private/var, so `phora add` emits the /private
+# form while `target add` echoes the raw $PWD; collapse both to <ROOT>.
+normalize() {
+	sed -e "s#/private${PWD}#<ROOT>#g" -e "s#${PWD}#<ROOT>#g"
+}
+
 make_git_source() {
 	repo="$PWD/src-$1"
 	mkdir -p "$repo"
