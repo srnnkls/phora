@@ -144,6 +144,18 @@ Artifact: src-dotfiles/lint (commit ca94c83b, digest blake3:d26cc52a7261d7a76fa1
   - home
 ```
 
+`phora list` merges the machine-local config too, so the overlay shows under the
+`machine` target with the `linked` state alongside the git artifacts in `home`.
+
+```scrut
+$ phora list 2>&1 | normalize
+home:
+  src-dotfiles/editor  ✓ clean
+  src-dotfiles/lint  ✓ clean
+machine:
+  overlay-machine/config  linked
+```
+
 `phora preview` renders the full projection from the lock, both targets at once —
 the git artifacts copied into `home`, the overlay linked into `machine`.
 
