@@ -17,7 +17,8 @@ use super::render::{print_listings, render_preview_json, render_preview_tree, st
 use super::{build_router, load_config, load_local_config, load_locks, open_project_registry};
 
 pub(super) fn run_list(plan: bool) -> Result<()> {
-    let config = load_config()?;
+    let cwd = std::env::current_dir()?;
+    let config = merge_configs(load_config()?, load_local_config(&cwd)?);
     let registry = open_project_registry()?;
     if plan {
         println!("plan: run `phora sync` to apply pending changes");
