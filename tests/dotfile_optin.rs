@@ -11,6 +11,8 @@ struct Fixture {
     cwd: TempDir,
     home_path: PathBuf,
     target_path: PathBuf,
+    xdg_cache: PathBuf,
+    xdg_state: PathBuf,
 }
 
 fn git(cwd: &Path, args: &[&str]) {
@@ -58,8 +60,8 @@ fn build_fixture(include: &str) -> Fixture {
     let home_path = home.path().to_path_buf();
     let src_path = src.path().to_path_buf();
     let target_path = home_path.join("deploy");
-
-    std::fs::create_dir_all(home_path.join(".phora/git")).expect("seed phora git dir");
+    let xdg_cache = home_path.join("xdg/cache");
+    let xdg_state = home_path.join("xdg/state");
 
     let config = format!(
         "version = 1\n\n[sources.dotfiles]\ngit = \"{src}\"\nbranch = \"main\"\n\
@@ -76,6 +78,8 @@ fn build_fixture(include: &str) -> Fixture {
         cwd,
         home_path,
         target_path,
+        xdg_cache,
+        xdg_state,
     }
 }
 
@@ -88,6 +92,8 @@ fn run_sync(fixture: &Fixture, args: &[&str]) {
         .args(args)
         .current_dir(fixture.cwd.path())
         .env("HOME", &fixture.home_path)
+        .env("XDG_CACHE_HOME", &fixture.xdg_cache)
+        .env("XDG_STATE_HOME", &fixture.xdg_state)
         .env_remove("GIT_AUTHOR_DATE")
         .env_remove("GIT_COMMITTER_DATE")
         .output()

@@ -13,6 +13,8 @@ struct Fixture {
     home_path: std::path::PathBuf,
     src_path: std::path::PathBuf,
     target_path: std::path::PathBuf,
+    xdg_cache: std::path::PathBuf,
+    xdg_state: std::path::PathBuf,
 }
 
 fn git(cwd: &Path, args: &[&str]) {
@@ -63,8 +65,8 @@ fn build_fixture() -> Fixture {
     let home_path = home.path().to_path_buf();
     let src_path = src.path().to_path_buf();
     let target_path = home_path.join("deploy");
-
-    std::fs::create_dir_all(home_path.join(".phora/git")).expect("seed phora git dir");
+    let xdg_cache = home_path.join("xdg/cache");
+    let xdg_state = home_path.join("xdg/state");
 
     let config = format!(
         "version = 1\n\n[sources.dotfiles]\npath = \"{src}\"\nbranch = \"main\"\n\
@@ -82,6 +84,8 @@ fn build_fixture() -> Fixture {
         home_path,
         src_path,
         target_path,
+        xdg_cache,
+        xdg_state,
     }
 }
 
@@ -90,6 +94,8 @@ fn run(fixture: &Fixture, args: &[&str]) -> Output {
         .args(args)
         .current_dir(fixture.cwd.path())
         .env("HOME", &fixture.home_path)
+        .env("XDG_CACHE_HOME", &fixture.xdg_cache)
+        .env("XDG_STATE_HOME", &fixture.xdg_state)
         .env_remove("GIT_AUTHOR_DATE")
         .env_remove("GIT_COMMITTER_DATE")
         .output()
@@ -109,6 +115,14 @@ fn snapshot(out: &Output) -> String {
 
 fn settings(fixture: &Fixture) -> insta::Settings {
     let mut s = insta::Settings::clone_current();
+    s.add_filter(
+        &regex_escape(&fixture.xdg_cache.to_string_lossy()),
+        "<XDG_CACHE>",
+    );
+    s.add_filter(
+        &regex_escape(&fixture.xdg_state.to_string_lossy()),
+        "<XDG_STATE>",
+    );
     s.add_filter(
         &regex_escape(&fixture.home_path.to_string_lossy()),
         "<HOME>",

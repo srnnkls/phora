@@ -51,7 +51,7 @@ use clap::{Parser, Subcommand};
 use crate::config::{Config, ParsedSource, merge_configs};
 use crate::error::{Error, Result};
 use crate::kernel::{ProjectId, SourceName, TargetName};
-use crate::paths::phora_dir;
+use crate::paths::state_root;
 use crate::source::{GitBackend, HttpBackend, RouterBackend};
 use crate::store::FileRegistry;
 use crate::sync::{Conflict, ConflictResolver, Resolution};
@@ -533,6 +533,8 @@ fn build_router(
     config: &Config,
     git_dir: std::path::PathBuf,
 ) -> Result<RouterBackend<GitBackend, HttpBackend>> {
+    std::fs::create_dir_all(&git_dir)
+        .map_err(|e| Error::Config(format!("create mirror dir {}: {e}", git_dir.display())))?;
     let mut modes = BTreeMap::new();
     let mut digests = BTreeMap::new();
     for (name, source) in &config.parsed_sources()? {
@@ -640,11 +642,8 @@ impl ConflictResolver for TtyResolver {
 
 fn open_project_registry() -> Result<FileRegistry> {
     let project = ProjectId::for_path(&std::env::current_dir()?)?;
-    let state_root = phora_dir()?
-        .join("state")
-        .join("projects")
-        .join(project.as_str());
-    Ok(FileRegistry::open(state_root)?)
+    let registry_root = state_root()?.join("projects").join(project.as_str());
+    Ok(FileRegistry::open(registry_root)?)
 }
 
 fn load_config() -> Result<Config> {
