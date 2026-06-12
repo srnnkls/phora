@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Host, ParsedSource, Protocol, SourceMode};
+use crate::config::{Host, ParsedSource, Protocol, Refspec, SourceMode};
 use crate::source::NormalizedUrl;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,6 +18,13 @@ impl Lock {
     pub fn find_source(&self, name: &str) -> Option<&LockedSource> {
         self.sources.iter().find(|s| s.name == name)
     }
+
+    #[must_use]
+    pub fn find_entry(&self, name: &str, r#ref: Option<&str>) -> Option<&LockedSource> {
+        self.sources
+            .iter()
+            .find(|s| s.name == name && s.r#ref.as_deref() == r#ref)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +37,29 @@ pub struct LockedSource {
     /// Hash of export-affecting config; lets sync detect config changes that alter
     /// export output without a commit change.
     pub config_digest: String,
+    /// Kind-tagged effective ref, set only when this entry overrides the source's
+    /// default refspec; `None` for the canonical entry so bare locks stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#ref: Option<String>,
+}
+
+/// Kind-tagged so `Branch("x")` and `Tag("x")` never collide.
+#[must_use]
+pub fn encode_ref(r: &Refspec) -> String {
+    match r {
+        Refspec::Branch(s) => format!("branch:{s}"),
+        Refspec::Tag(s) => format!("tag:{s}"),
+        Refspec::Rev(s) => format!("rev:{s}"),
+        Refspec::None => "url".to_owned(),
+    }
+}
+
+/// The `ref` field value for an entry: `None` when the effective ref equals the
+/// source's default, else the kind-tagged override.
+#[must_use]
+pub fn ref_discriminator(effective_ref: &Refspec, source_default: &Refspec) -> Option<String> {
+    let encoded = encode_ref(effective_ref);
+    (encoded != encode_ref(source_default)).then_some(encoded)
 }
 
 /// Effective lock merges base and local locks; local entries override base by name.
@@ -38,7 +68,9 @@ pub fn merge_locks(base: &Lock, local: Option<&Lock>) -> Lock {
     let mut merged = base.clone();
     if let Some(local) = local {
         for local_source in &local.sources {
-            merged.sources.retain(|s| s.name != local_source.name);
+            merged
+                .sources
+                .retain(|s| !(s.name == local_source.name && s.r#ref == local_source.r#ref));
             merged.sources.push(local_source.clone());
         }
     }
@@ -55,6 +87,19 @@ pub fn source_matches(
     hosts: &BTreeMap<String, Host>,
     protocol: Protocol,
 ) -> bool {
+    entry_matches(source, &source.refspec(), locked, hosts, protocol)
+}
+
+/// Like [`source_matches`] but checks `effective_ref` against the lock's `resolved`,
+/// so a ref-overriding binding reuses only its own (source, ref) entry.
+#[must_use]
+pub fn entry_matches(
+    source: &ParsedSource,
+    effective_ref: &Refspec,
+    locked: &LockedSource,
+    hosts: &BTreeMap<String, Host>,
+    protocol: Protocol,
+) -> bool {
     if let (SourceMode::Url, Some(url)) = (source.mode(), source.source_url()) {
         // Url identity = url + config_digest; the synthetic commit is content-addressed, so no refspec/remote comparison.
         return NormalizedUrl::parse(url) == NormalizedUrl::parse(&locked.git)
@@ -66,7 +111,7 @@ pub fn source_matches(
     };
     // Protocol-independent: https/ssh/literal forms of one repo share an identity.
     NormalizedUrl::parse(&resolved) == NormalizedUrl::parse(&locked.git)
-        && source.refspec().to_string() == locked.resolved
+        && effective_ref.to_string() == locked.resolved
         && source.config_digest() == locked.config_digest
 }
 
@@ -121,6 +166,7 @@ mod tests {
             commit: "c0ffee".to_owned(),
             digest: "blake3:artifact".to_owned(),
             config_digest: "blake3:cfg".to_owned(),
+            r#ref: None,
         }
     }
 
@@ -259,6 +305,7 @@ mod tests {
             commit: "abc123".to_owned(),
             digest: "blake3:artifact".to_owned(),
             config_digest: source.config_digest(),
+            r#ref: None,
         };
 
         assert!(
@@ -278,6 +325,7 @@ mod tests {
             commit: "abc123".to_owned(),
             digest: "blake3:artifact".to_owned(),
             config_digest: source.config_digest(),
+            r#ref: None,
         };
 
         assert!(
@@ -297,6 +345,7 @@ mod tests {
             commit: "abc123".to_owned(),
             digest: "blake3:artifact".to_owned(),
             config_digest: source.config_digest(),
+            r#ref: None,
         };
 
         assert!(
@@ -320,6 +369,7 @@ mod tests {
             commit: "abc123".to_owned(),
             digest: "blake3:artifact".to_owned(),
             config_digest: other.config_digest(),
+            r#ref: None,
         };
 
         assert_ne!(
@@ -345,6 +395,7 @@ mod tests {
             commit: "abc123".to_owned(),
             digest: "blake3:artifact".to_owned(),
             config_digest: source.config_digest(),
+            r#ref: None,
         };
 
         assert!(
@@ -365,6 +416,7 @@ mod tests {
             commit: "abc123".to_owned(),
             digest: "blake3:artifact".to_owned(),
             config_digest: source.config_digest(),
+            r#ref: None,
         };
 
         assert!(
@@ -394,6 +446,7 @@ mod tests {
             commit: "abc123".to_owned(),
             digest: "blake3:artifact".to_owned(),
             config_digest: source.config_digest(),
+            r#ref: None,
         };
 
         assert_ne!(
@@ -424,6 +477,7 @@ mod tests {
             commit: "abc123".to_owned(),
             digest: "blake3:artifact".to_owned(),
             config_digest: source.config_digest(),
+            r#ref: None,
         };
 
         assert!(
@@ -443,6 +497,7 @@ mod tests {
             commit: "abc123".to_owned(),
             digest: "blake3:artifact".to_owned(),
             config_digest: source.config_digest(),
+            r#ref: None,
         };
 
         assert!(
@@ -467,6 +522,7 @@ mod tests {
             commit: "abc123".to_owned(),
             digest: "blake3:artifact".to_owned(),
             config_digest: source.config_digest(),
+            r#ref: None,
         };
 
         assert!(
@@ -525,6 +581,7 @@ config_digest = \"PLACEHOLDER\"
             commit: "abc123".to_owned(),
             digest: "blake3:artifact".to_owned(),
             config_digest: other.config_digest(),
+            r#ref: None,
         };
 
         assert_ne!(
@@ -562,6 +619,7 @@ config_digest = \"PLACEHOLDER\"
             commit: "abc123".to_owned(),
             digest: "blake3:artifact".to_owned(),
             config_digest: source.config_digest(),
+            r#ref: None,
         };
 
         assert!(
@@ -582,6 +640,7 @@ config_digest = \"PLACEHOLDER\"
             commit: "abc123".to_owned(),
             digest: "blake3:artifact".to_owned(),
             config_digest: source.config_digest(),
+            r#ref: None,
         };
 
         assert!(
@@ -601,6 +660,7 @@ config_digest = \"PLACEHOLDER\"
             commit: "abc123".to_owned(),
             digest: "blake3:artifact".to_owned(),
             config_digest: other.config_digest(),
+            r#ref: None,
         };
 
         assert_ne!(
@@ -625,6 +685,7 @@ config_digest = \"PLACEHOLDER\"
             commit: "abc123".to_owned(),
             digest: "blake3:artifact".to_owned(),
             config_digest: source.config_digest(),
+            r#ref: None,
         };
 
         assert!(
@@ -646,6 +707,7 @@ config_digest = \"PLACEHOLDER\"
             commit: "abc123".to_owned(),
             digest: "blake3:artifact".to_owned(),
             config_digest: source.config_digest(),
+            r#ref: None,
         };
 
         assert!(
@@ -668,6 +730,81 @@ config_digest = \"PLACEHOLDER\"
                 .expect("git-alias local resolves"),
             "the resolved remote written into the lock `git` field must be identical whether the \
              local source is declared via `path` or the `git = <localpath>` alias"
+        );
+    }
+
+    // PTV-004: merge dedups by (name, resolved ref), not name alone
+
+    #[test]
+    fn merge_locks_dedups_ref_split_source_by_name_and_ref_not_name_alone() {
+        let git = "https://github.com/junegunn/fzf.git";
+        let base = Lock {
+            version: 1,
+            sources: vec![
+                LockedSource {
+                    name: "fzf".to_owned(),
+                    git: git.to_owned(),
+                    resolved: "v0.55.0".to_owned(),
+                    commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                    digest: "blake3:v55".to_owned(),
+                    config_digest: "blake3:cfg".to_owned(),
+                    r#ref: Some("tag:v0.55.0".to_owned()),
+                },
+                LockedSource {
+                    name: "fzf".to_owned(),
+                    git: git.to_owned(),
+                    resolved: "v0.56.0".to_owned(),
+                    commit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+                    digest: "blake3:v56".to_owned(),
+                    config_digest: "blake3:cfg".to_owned(),
+                    r#ref: Some("tag:v0.56.0".to_owned()),
+                },
+            ],
+        };
+        // Local overrides only the v0.56.0 split (e.g. repointed at a local checkout).
+        let local = Lock {
+            version: 1,
+            sources: vec![LockedSource {
+                name: "fzf".to_owned(),
+                git: "/home/me/dev/fzf".to_owned(),
+                resolved: "v0.56.0".to_owned(),
+                commit: "cccccccccccccccccccccccccccccccccccccccc".to_owned(),
+                digest: "blake3:local56".to_owned(),
+                config_digest: "blake3:cfg".to_owned(),
+                r#ref: Some("tag:v0.56.0".to_owned()),
+            }],
+        };
+
+        let merged = merge_locks(&base, Some(&local));
+
+        let fzf: Vec<&LockedSource> = merged.sources.iter().filter(|s| s.name == "fzf").collect();
+        assert_eq!(
+            fzf.len(),
+            2,
+            "merge must dedup by (name, ref): the v0.55.0 base split survives and only the \
+             v0.56.0 split is replaced — a name-only dedup wrongly collapses to one entry, got {fzf:?}"
+        );
+
+        let v55 = fzf
+            .iter()
+            .find(|s| s.resolved == "v0.55.0")
+            .expect("the un-overridden v0.55.0 base split must survive the merge");
+        assert_eq!(
+            v55.commit, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "the surviving v0.55.0 split must keep its base commit, untouched by the local override"
+        );
+
+        let v56 = fzf
+            .iter()
+            .find(|s| s.resolved == "v0.56.0")
+            .expect("the v0.56.0 split must still be present after override");
+        assert_eq!(
+            v56.git, "/home/me/dev/fzf",
+            "the local override must REPLACE the matching (name, v0.56.0) split"
+        );
+        assert_eq!(
+            v56.commit, "cccccccccccccccccccccccccccccccccccccccc",
+            "the replaced v0.56.0 split must carry the local override's commit"
         );
     }
 
@@ -758,7 +895,14 @@ config_digest = \"PLACEHOLDER\"
         keys.sort_unstable();
         assert_eq!(
             keys,
-            ["commit", "config_digest", "digest", "git", "name", "resolved"],
+            [
+                "commit",
+                "config_digest",
+                "digest",
+                "git",
+                "name",
+                "resolved"
+            ],
             "a bare lock (no per-binding ref) must serialize EXACTLY this key set; any extra key \
              means a new optional lock field was not skip-serialized when absent, so old configs \
              would not lock byte-identically, got:\n{text}"

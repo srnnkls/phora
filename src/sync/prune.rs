@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashSet};
 use crate::config::{Config, ParsedSource};
 use crate::error::{Error, Result};
 use crate::kernel::{Selection, SourceName};
+use crate::lock::encode_ref;
 use crate::source::SourceBackend;
 use crate::store::{ArtifactKey, Registry};
 
@@ -15,7 +16,7 @@ pub(super) fn prune_orphans(
     remotes: &BTreeMap<String, String>,
     backend: &dyn SourceBackend,
     registry: &dyn Registry,
-    resolved_commits: &BTreeMap<String, String>,
+    resolved_commits: &BTreeMap<(String, String), String>,
 ) -> Result<()> {
     let mut expected: HashSet<ArtifactKey> = HashSet::new();
     for (target_name, target) in &config.targets {
@@ -26,7 +27,16 @@ pub(super) fn prune_orphans(
                     binding.source
                 ))
             })?;
-            let commit = &resolved_commits[binding.source];
+            let commit_key = (
+                binding.source.to_owned(),
+                encode_ref(&binding.effective_ref),
+            );
+            let commit = resolved_commits.get(&commit_key).ok_or_else(|| {
+                Error::Sync(format!(
+                    "no resolved commit for {} at {}",
+                    binding.source, binding.effective_ref
+                ))
+            })?;
             let git = remote_for(remotes, binding.source)?;
             let source_name = SourceName::trusted(binding.source);
             let selection = Selection::new(binding.include, binding.exclude)?;

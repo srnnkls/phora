@@ -22,6 +22,19 @@ fn sn(name: &str) -> crate::kernel::SourceName {
     crate::kernel::SourceName::trusted(name)
 }
 
+/// A single-entry resolved-commit map keyed by (source, encoded default ref).
+fn one_commit(
+    parsed: &BTreeMap<String, ParsedSource>,
+    name: &str,
+    commit: &str,
+) -> BTreeMap<(String, String), String> {
+    let key = (
+        name.to_owned(),
+        crate::lock::encode_ref(&parsed[name].refspec()),
+    );
+    std::iter::once((key, commit.to_owned())).collect()
+}
+
 // ── git fixture ────────────────────────────────────────────────
 
 #[expect(
@@ -461,6 +474,7 @@ fn matching_lock_reuses_commit_without_refetch() {
             commit: fx.head_sha.clone(),
             digest: expected_digest(&fx, "editor-src", &fx.head_sha),
             config_digest: source.config_digest(),
+            r#ref: None,
         }],
     };
 
@@ -511,6 +525,7 @@ fn non_matching_lock_triggers_fetch() {
             commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
             digest: "blake3:stale".to_owned(),
             config_digest: "blake3:stale".to_owned(),
+            r#ref: None,
         }],
     };
 
@@ -553,6 +568,7 @@ fn force_refetches_even_when_lock_matches() {
             commit: fx.head_sha.clone(),
             digest: expected_digest(&fx, "editor-src", &fx.head_sha),
             config_digest: source.config_digest(),
+            r#ref: None,
         }],
     };
 
@@ -1601,9 +1617,8 @@ fn second_deploy_over_correct_link_is_a_noop() {
 
     let counting = CountingBackend::new(&fx.backend);
     let journal = Journal::open(&fx.registry.locks_dir()).expect("open journal");
-    let commits: BTreeMap<String, String> =
-        std::iter::once(("editor-src".to_owned(), fx.head_sha.clone())).collect();
     let parsed = cfg.parsed_sources().expect("sources parse");
+    let commits = one_commit(&parsed, "editor-src", &fx.head_sha);
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
 
     let run = TargetRun {
@@ -3339,6 +3354,7 @@ fn link_lock(source: &str, link_git: &Path) -> Lock {
             commit: "link".to_owned(),
             digest: "link:".to_owned(),
             config_digest: "blake3:link".to_owned(),
+            r#ref: None,
         }],
     }
 }
@@ -3571,9 +3587,8 @@ fn prune_removes_stale_linked_symlink_without_following_it() {
         })
         .expect("seed the orphaned linked record");
 
-    let commits: BTreeMap<String, String> =
-        std::iter::once(("linked-src".to_owned(), "link".to_owned())).collect();
     let parsed = cfg.parsed_sources().expect("sources parse");
+    let commits = one_commit(&parsed, "linked-src", "link");
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
 
     prune_orphans(&cfg, &parsed, &remotes, &fx_backend(), &registry, &commits)
@@ -5239,4 +5254,373 @@ fn bare_binding_lock_is_byte_identical_to_source_only_config() {
     );
 
     drop(src);
+}
+
+// ── PTV-004+005: lock keyed by (source, resolved commit); per-binding ref ──
+
+struct VersionedFixture {
+    _src: TempDir,
+    _git_dir: TempDir,
+    _state_dir: TempDir,
+    backend: GitBackend,
+    registry: FileRegistry,
+    url: String,
+    sha_a: String,
+    sha_b: String,
+}
+
+/// A repo with two tags at DISTINCT commits, each carrying an `editor/` artifact:
+/// `v0.55.0` -> editor/init.lua = "v55", `v0.56.0` -> editor/init.lua = "v56".
+/// One source can thus be bound at two versions; the two tags resolve to two SHAs.
+#[expect(
+    clippy::unwrap_used,
+    reason = "fixture setup fails loudly; git CLI is assumed present"
+)]
+fn build_versioned_sync_fixture() -> VersionedFixture {
+    let src = TempDir::new().unwrap();
+    let p = src.path();
+
+    run_git(p, &["init", "-b", "main", "."]);
+    run_git(p, &["config", "user.email", "test@example.com"]);
+    run_git(p, &["config", "user.name", "Test"]);
+
+    std::fs::create_dir_all(p.join("editor")).unwrap();
+    std::fs::write(p.join("editor/init.lua"), b"v55\n").unwrap();
+    run_git(p, &["add", "-A"]);
+    run_git(p, &["commit", "-m", "v55"]);
+    run_git(p, &["tag", "v0.55.0"]);
+    let sha_a = rev_parse(p, "HEAD");
+
+    std::fs::write(p.join("editor/init.lua"), b"v56\n").unwrap();
+    run_git(p, &["add", "-A"]);
+    run_git(p, &["commit", "-m", "v56"]);
+    run_git(p, &["tag", "v0.56.0"]);
+    let sha_b = rev_parse(p, "HEAD");
+
+    assert_ne!(
+        sha_a, sha_b,
+        "fixture premise: the two tags pin distinct commits"
+    );
+
+    let git_dir = TempDir::new().unwrap();
+    let state_dir = TempDir::new().unwrap();
+    let backend = GitBackend::new(git_dir.path().to_path_buf());
+    let registry =
+        FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry over tempdir");
+    let url = p.to_string_lossy().into_owned();
+
+    VersionedFixture {
+        _src: src,
+        _git_dir: git_dir,
+        _state_dir: state_dir,
+        backend,
+        registry,
+        url,
+        sha_a,
+        sha_b,
+    }
+}
+
+/// Two bindings of one source `fzf` at two distinct tags into one target.
+fn config_two_versions(url: &str, target_path: &Path) -> Config {
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.fzf]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\n\
+         {{ source = \"fzf\", as = \"stable\", tag = \"v0.55.0\" }},\n\
+         {{ source = \"fzf\", as = \"canary\", tag = \"v0.56.0\" }},\n\
+         ]\nlayout = \"by-source\"\n",
+        target_path.display(),
+    );
+    Config::parse(&toml).expect("two-version config parses")
+}
+
+fn fzf_entries(lock: &Lock) -> Vec<&crate::lock::LockedSource> {
+    lock.sources.iter().filter(|s| s.name == "fzf").collect()
+}
+
+/// (a) Two distinct (source, commit) lock entries for one twice-bound source.
+#[test]
+fn two_version_bindings_produce_two_lock_entries_with_distinct_commits() {
+    let fx = build_versioned_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_two_versions(&fx.url, &td.target_path());
+
+    let out = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("two-version sync resolves both refs");
+
+    let entries = fzf_entries(&out.base_lock);
+    assert_eq!(
+        entries.len(),
+        2,
+        "one source bound at two distinct refs must produce TWO lock entries \
+         (one per resolved commit), not one collapsed by source name; got {entries:?}"
+    );
+    let commits: std::collections::BTreeSet<&str> =
+        entries.iter().map(|e| e.commit.as_str()).collect();
+    let expected: std::collections::BTreeSet<&str> =
+        [fx.sha_a.as_str(), fx.sha_b.as_str()].into_iter().collect();
+    assert_eq!(
+        commits, expected,
+        "the two `fzf` lock entries must carry the two tag SHAs \
+         (v0.55.0 -> {}, v0.56.0 -> {}), one commit each",
+        fx.sha_a, fx.sha_b
+    );
+    drop(fx);
+}
+
+/// (b) Each identity projects ITS OWN commit's tree: deployed bytes + record.commit differ.
+#[test]
+fn two_version_bindings_project_each_their_own_commit_tree() {
+    let fx = build_versioned_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_two_versions(&fx.url, &td.target_path());
+
+    sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("two-version sync deploys both slices");
+
+    let stable = fx
+        .registry
+        .get(&artifact_key("dest", "stable", "editor"))
+        .expect("registry get")
+        .expect("the `as = stable` slice must record under identity `stable`");
+    let canary = fx
+        .registry
+        .get(&artifact_key("dest", "canary", "editor"))
+        .expect("registry get")
+        .expect("the `as = canary` slice must record under identity `canary`");
+
+    assert_eq!(
+        stable.commit, fx.sha_a,
+        "the stable (tag v0.55.0) record must pin commit A, not the shared/last commit"
+    );
+    assert_eq!(
+        canary.commit, fx.sha_b,
+        "the canary (tag v0.56.0) record must pin commit B, not the shared/last commit"
+    );
+    assert_ne!(
+        stable.commit, canary.commit,
+        "the two identities must record DISTINCT commits; equality means both bindings \
+         read the same (wrong) per-source-name commit"
+    );
+
+    let stable_lua = std::fs::read(
+        td.target_path()
+            .join("stable")
+            .join("editor")
+            .join("init.lua"),
+    )
+    .expect("stable init.lua deployed");
+    let canary_lua = std::fs::read(
+        td.target_path()
+            .join("canary")
+            .join("editor")
+            .join("init.lua"),
+    )
+    .expect("canary init.lua deployed");
+    assert_eq!(
+        stable_lua, b"v55\n",
+        "stable must materialize v0.55.0's tree (init.lua == v55)"
+    );
+    assert_eq!(
+        canary_lua, b"v56\n",
+        "canary must materialize v0.56.0's tree (init.lua == v56)"
+    );
+    drop(fx);
+}
+
+/// (c) One fetch of `fzf` covers both refs, yet the two commits still differ.
+#[test]
+fn two_version_bindings_fetch_source_once_but_resolve_two_commits() {
+    let fx = build_versioned_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_two_versions(&fx.url, &td.target_path());
+
+    let counting = CountingBackend::new(&fx.backend);
+    let out = sync(
+        &input(&cfg, None, None, None, false),
+        &counting,
+        &fx.registry,
+    )
+    .expect("two-version sync over a counting backend");
+
+    assert_eq!(
+        counting.fetch_count(),
+        1,
+        "one source fetched once must cover both refs: fetch_count must be exactly 1, got {}",
+        counting.fetch_count()
+    );
+    let commits: std::collections::BTreeSet<&str> = fzf_entries(&out.base_lock)
+        .iter()
+        .map(|e| e.commit.as_str())
+        .collect();
+    assert_eq!(
+        commits.len(),
+        2,
+        "a single fetch must still yield two DISTINCT resolved commits, one per ref"
+    );
+    drop(fx);
+}
+
+/// (d) Ref splits share `config_digest` (source-derived) but differ in commit and digest.
+#[test]
+fn ref_split_entries_share_config_digest_but_differ_in_commit_and_digest() {
+    let fx = build_versioned_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_two_versions(&fx.url, &td.target_path());
+
+    let out = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("two-version sync resolves both refs");
+
+    let entries = fzf_entries(&out.base_lock);
+    assert_eq!(
+        entries.len(),
+        2,
+        "premise: two ref-split entries must exist"
+    );
+    let (a, b) = (entries[0], entries[1]);
+
+    assert_eq!(
+        a.config_digest, b.config_digest,
+        "config_digest is source-derived and SHARED across ref splits"
+    );
+    assert_ne!(a.commit, b.commit, "ref splits must pin distinct commits");
+    assert_ne!(
+        a.digest, b.digest,
+        "each entry recomputes its export digest at its own commit; v55 and v56 trees \
+         differ, so the export digests must differ"
+    );
+    drop(fx);
+}
+
+/// (e) PBR-005: selection-only override (no ref change) does NOT split the lock.
+#[test]
+fn selection_only_override_keeps_one_lock_entry_but_two_records() {
+    let fx = build_versioned_sync_fixture();
+    let td = TargetDir::new();
+    // Both bindings inherit the source's default ref (branch main). They differ only
+    // in selection (include), so they must share ONE lock entry yet re-project twice.
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.fzf]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\n\
+         {{ source = \"fzf\", as = \"full\" }},\n\
+         {{ source = \"fzf\", as = \"slim\", include = [\"editor\"] }},\n\
+         ]\nlayout = \"by-source\"\n",
+        fx.url,
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("selection-only override config parses");
+
+    let out = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("selection-only sync succeeds");
+
+    assert_eq!(
+        fzf_entries(&out.base_lock).len(),
+        1,
+        "a selection-only difference (no ref change) must NOT split the lock: \
+         both bindings resolve the same (source, commit) and share ONE entry"
+    );
+    assert!(
+        fx.registry
+            .get(&artifact_key("dest", "full", "editor"))
+            .expect("registry get")
+            .is_some(),
+        "the `full` identity must still get its own re-projected record"
+    );
+    assert!(
+        fx.registry
+            .get(&artifact_key("dest", "slim", "editor"))
+            .expect("registry get")
+            .is_some(),
+        "the `slim` identity must still get its own re-projected record"
+    );
+    drop(fx);
+}
+
+/// (f) Back-compat: a bare config still serializes a lock with no ref discriminator.
+#[test]
+fn bare_config_lock_has_no_ref_discriminator_field() {
+    let fx = build_versioned_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_source_one_target("fzf", &fx.url, "dest", &td.target_path(), "flat");
+
+    let out = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("bare-config sync succeeds");
+
+    let text = toml::to_string(&out.base_lock).expect("lock serializes");
+    for forbidden in ["ref =", "tag =", "branch =", "rev ="] {
+        assert!(
+            !text.contains(forbidden),
+            "a bare lock must carry NO per-binding ref discriminator: found `{forbidden}` in:\n{text}"
+        );
+    }
+    drop(fx);
+}
+
+/// (g) PTV-005: rebuild round-trips BOTH ref splits, selecting the locked entry by
+/// the binding's effective ref (not just by source name).
+#[test]
+fn rebuild_round_trips_both_ref_splits_at_their_own_commits() {
+    let fx = build_versioned_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_two_versions(&fx.url, &td.target_path());
+
+    let out = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("seeding two-version sync");
+
+    let stable_key = artifact_key("dest", "stable", "editor");
+    let canary_key = artifact_key("dest", "canary", "editor");
+    fx.registry.remove(&stable_key).expect("drop stable record");
+    fx.registry.remove(&canary_key).expect("drop canary record");
+
+    rebuild_registry(&cfg, &out.base_lock, &fx.backend, &fx.registry)
+        .expect("rebuild reconstructs both ref splits");
+
+    let stable = fx
+        .registry
+        .get(&stable_key)
+        .expect("registry get")
+        .expect("rebuild must reconstruct the stable record");
+    let canary = fx
+        .registry
+        .get(&canary_key)
+        .expect("registry get")
+        .expect("rebuild must reconstruct the canary record");
+
+    assert_eq!(
+        stable.commit, fx.sha_a,
+        "rebuild must select the locked entry by the binding's effective ref: \
+         stable -> tag v0.55.0 -> commit A"
+    );
+    assert_eq!(
+        canary.commit, fx.sha_b,
+        "rebuild must select the locked entry by the binding's effective ref: \
+         canary -> tag v0.56.0 -> commit B"
+    );
+    drop(fx);
 }
