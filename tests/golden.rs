@@ -124,6 +124,7 @@ fn settings(fixture: &Fixture) -> insta::Settings {
     );
     s.add_filter(r"\b[0-9a-f]{40}\b", "<COMMIT>");
     s.add_filter(r"commit [0-9a-f]{8}", "commit <COMMIT8>");
+    s.add_filter(r"@[0-9a-f]{8}", "@<COMMIT8>");
     s.add_filter(r"\b[0-9a-f]{16}\b", "<PROJECT>");
     s.add_filter(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z", "<TIME>");
     s
@@ -169,6 +170,15 @@ fn golden_cli_output() {
                 &fixture,
                 &["check-match", "--source", "dotfiles", "vim"],
             ))
+        );
+        insta::assert_snapshot!("preview", snapshot(&run(&fixture, &["preview"])));
+        insta::assert_snapshot!(
+            "preview-files",
+            snapshot(&run(&fixture, &["preview", "--files"]))
+        );
+        insta::assert_snapshot!(
+            "preview-json",
+            snapshot(&run(&fixture, &["preview", "--json"]))
         );
     });
 }

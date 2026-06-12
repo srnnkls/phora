@@ -3,14 +3,18 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::config::{Config, ParsedSource, Protocol, SourceFields, Target};
+use crate::config::{Config, ParsedSource, Protocol, SourceFields, Target, merge_configs};
 use crate::deploy::check_artifact_state;
 use crate::error::{Error, Result};
 use crate::kernel::Selection;
+use crate::lock::{Lock, merge_locks};
+use crate::paths::phora_dir;
+use crate::source::SourceBackend;
 use crate::store::Registry;
+use crate::sync::{PreviewTargetPlan, preview_targets, resolved_remotes};
 
-use super::render::{print_listings, state_label};
-use super::{load_config, open_project_registry};
+use super::render::{print_listings, render_preview_json, render_preview_tree, state_label};
+use super::{build_router, load_config, load_local_config, load_locks, open_project_registry};
 
 pub(super) fn run_list(plan: bool) -> Result<()> {
     let config = load_config()?;
@@ -22,6 +26,86 @@ pub(super) fn run_list(plan: bool) -> Result<()> {
     let listings = list_statuses(&config, &registry)?;
     print_listings(&listings);
     Ok(())
+}
+
+pub(super) fn run_preview(sel: &PreviewSelectors, json: bool) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let base = load_config()?;
+    let local = load_local_config(&cwd)?;
+    let config = merge_configs(base, local);
+
+    let parsed = config.parsed_sources()?;
+    let remotes = resolved_remotes(&config, &parsed)?;
+    let (base_lock, local_lock) = load_locks(&cwd)?;
+    let lock = base_lock.map_or_else(
+        || local_lock.clone(),
+        |base| Some(merge_locks(&base, local_lock.as_ref())),
+    );
+
+    let backend = build_router(&config, phora_dir()?.join("git"))?;
+    let plan = preview_plan(&config, &parsed, &remotes, &backend, lock.as_ref(), sel)?;
+
+    print!(
+        "{}",
+        if json {
+            render_preview_json(&plan)?
+        } else {
+            render_preview_tree(&plan)
+        }
+    );
+    Ok(())
+}
+
+/// Which slice of the preview to render: optional source/target filters and the
+/// `--files` enrichment toggle.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct PreviewSelectors {
+    pub source: Option<String>,
+    pub target: Option<String>,
+    pub files: bool,
+}
+
+/// A filtered, optionally file-enriched offline preview across targets.
+#[derive(Debug, Clone)]
+pub(crate) struct PreviewPlan {
+    pub targets: Vec<PreviewTargetPlan>,
+}
+
+/// Returns the offline preview filtered by the selectors, with synced entries
+/// optionally enriched with their file lists.
+///
+/// # Errors
+/// Errors if a selector names an unknown source/target or the preview build fails.
+pub(crate) fn preview_plan(
+    config: &Config,
+    parsed: &BTreeMap<String, ParsedSource>,
+    remotes: &BTreeMap<String, String>,
+    backend: &dyn SourceBackend,
+    lock: Option<&Lock>,
+    sel: &PreviewSelectors,
+) -> Result<PreviewPlan> {
+    if let Some(target) = &sel.target
+        && !config.targets.contains_key(target)
+    {
+        return Err(Error::Config(format!("unknown target: {target}")));
+    }
+    if let Some(source) = &sel.source
+        && !config.sources.contains_key(source)
+    {
+        return Err(Error::Config(format!("unknown source: {source}")));
+    }
+
+    let mut targets = preview_targets(config, parsed, remotes, backend, lock, sel.files)?;
+    if let Some(target) = &sel.target {
+        targets.retain(|t| &t.target == target);
+    }
+    if let Some(source) = &sel.source {
+        for tp in &mut targets {
+            tp.entries.retain(|e| &e.source == source);
+        }
+    }
+
+    Ok(PreviewPlan { targets })
 }
 
 /// Reverse-lookup filter over the registry: every `Some` field is an AND constraint.

@@ -1,0 +1,10 @@
+---
+source: tests/golden.rs
+expression: "snapshot(&run(&fixture, &[\"preview\"]))"
+---
+exit: 0
+--- stdout ---
+home
+  dotfiles@<COMMIT8> editor -> <HOME>/deploy/editor
+  dotfiles@<COMMIT8> lint -> <HOME>/deploy/lint
+--- stderr ---

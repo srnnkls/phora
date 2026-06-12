@@ -68,6 +68,19 @@ impl<G: SourceBackend, H: SourceBackend> SourceBackend for RouterBackend<G, H> {
         self.route(req.source).export_artifact(req)
     }
 
+    fn list_artifact_files(
+        &self,
+        source: &SourceName,
+        url: &str,
+        commit: &str,
+        root: Option<&Path>,
+        artifact: &ArtifactName,
+        selection: &Selection,
+    ) -> Result<Vec<std::path::PathBuf>> {
+        self.route(source)
+            .list_artifact_files(source, url, commit, root, artifact, selection)
+    }
+
     fn compute_digest(
         &self,
         source: &SourceName,
@@ -320,6 +333,18 @@ mod tests {
 
         fn export_artifact(&self, _req: &ExportRequest<'_>) -> Result<ExportResult> {
             Err(SourceError::Source("spy export".into()))
+        }
+
+        fn list_artifact_files(
+            &self,
+            _source: &SourceName,
+            _url: &str,
+            _commit: &str,
+            _root: Option<&Path>,
+            _artifact: &ArtifactName,
+            _selection: &Selection,
+        ) -> Result<Vec<std::path::PathBuf>> {
+            Ok(vec![])
         }
 
         fn compute_digest(
