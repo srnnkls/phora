@@ -24,6 +24,14 @@ use {
 
 use config_edit::BindRefinement;
 
+pub(crate) use query::PreviewSelectors;
+
+#[cfg(test)]
+pub(crate) use {
+    query::{PreviewPlan, preview_plan},
+    render::{render_preview_json, render_preview_tree},
+};
+
 pub use add::{AddTarget, insert_source, parse_add_url};
 pub use config_edit::remove_source;
 pub use query::{
@@ -177,6 +185,17 @@ pub enum Command {
         #[arg(long)]
         local: bool,
     },
+    /// Show an offline deployment preview from the lock.
+    Preview {
+        #[arg(long)]
+        source: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        files: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -311,6 +330,19 @@ pub fn run(cli: Cli) -> Result<()> {
             from,
             local,
         } => bind::run_unbind(&sources, &from, local),
+        Command::Preview {
+            source,
+            target,
+            files,
+            json,
+        } => query::run_preview(
+            &PreviewSelectors {
+                source,
+                target,
+                files,
+            },
+            json,
+        ),
     }
 }
 

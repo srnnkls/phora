@@ -109,6 +109,21 @@ pub trait SourceBackend {
 
     fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult>;
 
+    /// Artifact-relative paths selected at `commit`, read from the mirror without
+    /// staging or writing; the offline counterpart of `export_artifact`.
+    ///
+    /// # Errors
+    /// Errors if the mirror, root, or artifact subtree cannot be read.
+    fn list_artifact_files(
+        &self,
+        source: &SourceName,
+        url: &str,
+        commit: &str,
+        root: Option<&Path>,
+        artifact: &ArtifactName,
+        selection: &Selection,
+    ) -> Result<Vec<PathBuf>>;
+
     /// Blake3 fingerprint of the matched subtree at the resolved commit — the
     /// selected source bytes, not the deploy/artifact set.
     ///
@@ -364,6 +379,33 @@ impl SourceBackend for GitBackend {
         })
     }
 
+    fn list_artifact_files(
+        &self,
+        source: &SourceName,
+        url: &str,
+        commit: &str,
+        root: Option<&Path>,
+        artifact: &ArtifactName,
+        selection: &Selection,
+    ) -> Result<Vec<PathBuf>> {
+        let repo = self.open_mirror(source.as_str(), url)?;
+        let root_tree = Self::subtree_at_root(&repo, source.as_str(), commit, root)?;
+        let artifact_tree =
+            Self::lookup_subtree(&repo, &root_tree, source.as_str(), artifact.as_str())?;
+
+        let mut files = Vec::new();
+        Self::collect_files(
+            &repo,
+            source.as_str(),
+            &artifact_tree,
+            Path::new(""),
+            selection,
+            &mut files,
+        )?;
+        files.sort();
+        Ok(files)
+    }
+
     fn compute_digest(
         &self,
         source: &SourceName,
@@ -389,6 +431,41 @@ impl SourceBackend for GitBackend {
 }
 
 impl GitBackend {
+    fn collect_files(
+        repo: &gix::Repository,
+        source: &str,
+        tree: &gix::Tree<'_>,
+        rel_path: &Path,
+        selection: &Selection,
+        files: &mut Vec<PathBuf>,
+    ) -> Result<()> {
+        for entry in tree.iter() {
+            let entry = entry
+                .map_err(|e| SourceError::Source(format!("read tree entry in {source}: {e}")))?;
+            let component = safe_component(&entry.filename().to_string())?.to_string();
+            let entry_rel = rel_path.join(component);
+            let is_dir = matches!(entry.kind(), EntryKind::Tree);
+
+            if !selection.selects_path(&entry_rel, is_dir) {
+                continue;
+            }
+
+            match entry.kind() {
+                EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link => {
+                    files.push(entry_rel);
+                }
+                EntryKind::Tree => {
+                    let subtree = repo
+                        .find_tree(entry.object_id())
+                        .map_err(|e| SourceError::Source(format!("subtree in {source}: {e}")))?;
+                    Self::collect_files(repo, source, &subtree, &entry_rel, selection, files)?;
+                }
+                EntryKind::Commit => {}
+            }
+        }
+        Ok(())
+    }
+
     fn open_mirror(&self, source: &str, url: &str) -> Result<gix::Repository> {
         let mirror = self.mirror_path(url);
         gix::open(&mirror).map_err(|e| SourceError::Source(format!("open mirror {source}: {e}")))
@@ -592,6 +669,19 @@ impl SourceBackend for HttpBackend {
 
     fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult> {
         self.git.export_artifact(req)
+    }
+
+    fn list_artifact_files(
+        &self,
+        source: &SourceName,
+        url: &str,
+        commit: &str,
+        root: Option<&Path>,
+        artifact: &ArtifactName,
+        selection: &Selection,
+    ) -> Result<Vec<PathBuf>> {
+        self.git
+            .list_artifact_files(source, url, commit, root, artifact, selection)
     }
 
     fn compute_digest(

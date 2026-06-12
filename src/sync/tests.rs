@@ -246,6 +246,19 @@ impl SourceBackend for CountingBackend<'_> {
         self.inner
             .compute_digest(source, url, commit, root, selection)
     }
+
+    fn list_artifact_files(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        commit: &str,
+        root: Option<&Path>,
+        artifact: &crate::kernel::ArtifactName,
+        selection: &crate::kernel::Selection,
+    ) -> SourceResult<Vec<std::path::PathBuf>> {
+        self.inner
+            .list_artifact_files(source, url, commit, root, artifact, selection)
+    }
 }
 
 // ── config helpers (target-less so Phase 2/3 are no-ops) ───────
@@ -842,6 +855,18 @@ impl SourceBackend for FailingExportBackend<'_> {
     ) -> SourceResult<String> {
         self.inner
             .compute_digest(source, url, commit, root, selection)
+    }
+    fn list_artifact_files(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        commit: &str,
+        root: Option<&Path>,
+        artifact: &crate::kernel::ArtifactName,
+        selection: &crate::kernel::Selection,
+    ) -> SourceResult<Vec<std::path::PathBuf>> {
+        self.inner
+            .list_artifact_files(source, url, commit, root, artifact, selection)
     }
 }
 
@@ -2026,6 +2051,18 @@ impl SourceBackend for PartialStagingExportBackend<'_> {
         self.inner
             .compute_digest(source, url, commit, root, selection)
     }
+    fn list_artifact_files(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        commit: &str,
+        root: Option<&Path>,
+        artifact: &crate::kernel::ArtifactName,
+        selection: &crate::kernel::Selection,
+    ) -> SourceResult<Vec<std::path::PathBuf>> {
+        self.inner
+            .list_artifact_files(source, url, commit, root, artifact, selection)
+    }
 }
 
 #[test]
@@ -2564,6 +2601,18 @@ impl SourceBackend for FailingResolveBackend<'_> {
     ) -> SourceResult<String> {
         self.inner
             .compute_digest(source, url, commit, root, selection)
+    }
+    fn list_artifact_files(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        commit: &str,
+        root: Option<&Path>,
+        artifact: &crate::kernel::ArtifactName,
+        selection: &crate::kernel::Selection,
+    ) -> SourceResult<Vec<std::path::PathBuf>> {
+        self.inner
+            .list_artifact_files(source, url, commit, root, artifact, selection)
     }
 }
 
@@ -4485,6 +4534,18 @@ impl SourceBackend for RecordingBackend<'_> {
         self.inner
             .compute_digest(source, url, commit, root, selection)
     }
+    fn list_artifact_files(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        commit: &str,
+        root: Option<&Path>,
+        artifact: &crate::kernel::ArtifactName,
+        selection: &crate::kernel::Selection,
+    ) -> SourceResult<Vec<std::path::PathBuf>> {
+        self.inner
+            .list_artifact_files(source, url, commit, root, artifact, selection)
+    }
 }
 
 /// A repo at `<parent>/<name>` (name shared across calls) whose `editor/init.lua`
@@ -4790,6 +4851,19 @@ impl SourceBackend for CountingRouter {
     ) -> SourceResult<String> {
         self.inner
             .compute_digest(source, url, commit, root, selection)
+    }
+
+    fn list_artifact_files(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        commit: &str,
+        root: Option<&Path>,
+        artifact: &crate::kernel::ArtifactName,
+        selection: &crate::kernel::Selection,
+    ) -> SourceResult<Vec<std::path::PathBuf>> {
+        self.inner
+            .list_artifact_files(source, url, commit, root, artifact, selection)
     }
 }
 
@@ -5622,5 +5696,1418 @@ fn rebuild_round_trips_both_ref_splits_at_their_own_commits() {
         "rebuild must select the locked entry by the binding's effective ref: \
          canary -> tag v0.56.0 -> commit B"
     );
+    drop(fx);
+}
+
+// ── preview (offline, lock-driven) ─────────────────────────────
+
+/// A lock holding one source pinned at `commit`, matching `cfg`'s source identity so
+/// preview reuses it via `find_source` without re-resolving.
+fn lock_with(cfg: &Config, name: &str, git: &str, commit: &str) -> Lock {
+    let source = parsed_of(cfg, name);
+    Lock {
+        version: 1,
+        sources: vec![LockedSource {
+            name: name.to_owned(),
+            git: git.to_owned(),
+            resolved: source.refspec().to_string(),
+            commit: commit.to_owned(),
+            digest: "blake3:locked".to_owned(),
+            config_digest: source.config_digest(),
+            r#ref: None,
+        }],
+    }
+}
+
+/// The single entry for `artifact` in a preview plan's entries.
+fn preview_entry<'a>(plan: &'a PreviewTargetPlan, artifact: &str) -> &'a PreviewEntry {
+    plan.entries
+        .iter()
+        .find(|e| e.artifact == artifact)
+        .unwrap_or_else(|| panic!("preview plan must contain an entry for artifact `{artifact}`"))
+}
+
+fn only_plan<'a>(plans: &'a [PreviewTargetPlan], target: &str) -> &'a PreviewTargetPlan {
+    plans
+        .iter()
+        .find(|p| p.target == target)
+        .unwrap_or_else(|| panic!("preview must produce a plan for target `{target}`"))
+}
+
+#[test]
+fn preview_with_empty_mirror_and_no_lock_performs_no_fetch_and_annotates_not_locked() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let cfg =
+        config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+    // No mirror seeded, no lock: a Copy binding with no lock entry must NOT fetch.
+    let counting = CountingBackend::new(&fx.backend);
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+
+    let plans = preview_targets(&cfg, &parsed, &remotes, &counting, None, false)
+        .expect("an empty mirror + absent lock must NOT abort preview");
+
+    assert_eq!(
+        counting.fetch_count(),
+        0,
+        "preview must perform NO fetch: commits come from the lock only"
+    );
+    let plan = only_plan(&plans, "dest");
+    assert_eq!(
+        plan.entries.len(),
+        1,
+        "an un-locked source still produces one per-binding annotation entry, got {:?}",
+        plan.entries
+    );
+    assert_eq!(
+        plan.entries[0].source, "editor-src",
+        "the annotation entry names the un-locked source"
+    );
+    assert_eq!(
+        plan.entries[0].state,
+        SyncState::NotLocked,
+        "a source with no lock entry must be annotated NotLocked, not fetched"
+    );
+}
+
+#[test]
+fn preview_reads_the_commit_from_the_lock_not_a_fresh_resolution() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let cfg =
+        config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+    // Seed the mirror at the real HEAD so discovery succeeds offline.
+    fx.backend
+        .fetch(&sn("editor-src"), &fx.url)
+        .expect("seed fetch");
+
+    let locked_commit = fx.head_sha.clone();
+    let lock = lock_with(&cfg, "editor-src", &fx.url, &locked_commit);
+
+    // Advance HEAD: a fresh resolution would pick up the new commit; preview must not.
+    let new_head = fx.advance_head();
+    assert_ne!(new_head, locked_commit, "fixture HEAD must have moved");
+
+    let counting = CountingBackend::new(&fx.backend);
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+
+    let plans = preview_targets(&cfg, &parsed, &remotes, &counting, Some(&lock), false)
+        .expect("preview reads the locked commit");
+
+    assert_eq!(
+        counting.fetch_count(),
+        0,
+        "preview must not fetch when the commit is in the lock"
+    );
+    assert_eq!(
+        counting.resolve_count(),
+        0,
+        "preview must reuse the locked commit, never re-resolve a refspec"
+    );
+    let entry = preview_entry(only_plan(&plans, "dest"), "editor");
+    assert_eq!(
+        entry.commit, locked_commit,
+        "the entry's commit must equal the LOCKED commit, not the advanced HEAD"
+    );
+    assert_ne!(
+        entry.commit, new_head,
+        "the advanced HEAD must not leak into the preview entry"
+    );
+}
+
+#[test]
+fn preview_annotates_locked_but_unfetched_source_as_needs_sync_without_fetching() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let cfg =
+        config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+    // Lock pins a commit, but the mirror is EMPTY (never fetched): discovery would fail.
+    let lock = lock_with(&cfg, "editor-src", &fx.url, &fx.head_sha);
+
+    let counting = CountingBackend::new(&fx.backend);
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+
+    let plans = preview_targets(&cfg, &parsed, &remotes, &counting, Some(&lock), false)
+        .expect("a locked-but-absent commit must annotate, not abort");
+
+    assert_eq!(
+        counting.fetch_count(),
+        0,
+        "preview must NOT fetch a locked-but-absent commit — it annotates NeedsSync"
+    );
+    let plan = only_plan(&plans, "dest");
+    assert_eq!(
+        plan.entries.len(),
+        1,
+        "a locked-but-unfetched source yields one annotation entry, got {:?}",
+        plan.entries
+    );
+    assert_eq!(
+        plan.entries[0].state,
+        SyncState::NeedsSync,
+        "locked but commit/mirror absent must be NeedsSync, distinct from NotLocked"
+    );
+}
+
+#[test]
+fn preview_still_plans_other_bindings_when_one_source_needs_sync() {
+    let synced = build_named_artifact_repo("alpha", "a.txt", b"from-alpha\n");
+    let unsynced = build_named_artifact_repo("beta", "b.txt", b"from-beta\n");
+
+    let git_dir = TempDir::new().expect("git dir");
+    let backend = GitBackend::new(git_dir.path().to_path_buf());
+    let td = TargetDir::new();
+
+    let toml = format!(
+        "version = 1\n\n\
+             [sources.src-a]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+             [sources.src-b]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+             [targets.dest]\npath = \"{}\"\nsources = [\"src-a\", \"src-b\"]\nlayout = \"by-source\"\n",
+        synced.1,
+        unsynced.1,
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("two-source config parses");
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+
+    // Seed only src-a's mirror; lock both. src-b's commit is absent => NeedsSync.
+    backend.fetch(&sn("src-a"), &synced.1).expect("seed src-a");
+    let a_head = rev_parse(synced.0.path(), "HEAD");
+    let b_head = rev_parse(unsynced.0.path(), "HEAD");
+    let lock = Lock {
+        version: 1,
+        sources: vec![
+            lock_with(&cfg, "src-a", &synced.1, &a_head)
+                .sources
+                .remove(0),
+            lock_with(&cfg, "src-b", &unsynced.1, &b_head)
+                .sources
+                .remove(0),
+        ],
+    };
+
+    let plans = preview_targets(&cfg, &parsed, &remotes, &backend, Some(&lock), false)
+        .expect("one unsynced source must not blank the whole plan");
+
+    let plan = only_plan(&plans, "dest");
+    let alpha = preview_entry(plan, "alpha");
+    assert_eq!(
+        alpha.state,
+        SyncState::Synced,
+        "the synced source's artifact must still be planned (state Synced)"
+    );
+    assert_eq!(alpha.source, "src-a", "the synced entry belongs to src-a");
+    assert!(
+        plan.entries
+            .iter()
+            .any(|e| e.source == "src-b" && e.state == SyncState::NeedsSync),
+        "the unsynced source must still appear, annotated NeedsSync, got {:?}",
+        plan.entries
+    );
+
+    drop(synced);
+    drop(unsynced);
+}
+
+#[test]
+fn preview_link_binding_reads_the_working_tree_ignoring_the_lock() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+             [sources.dev-src]\ngit = \"{}\"\nbranch = \"main\"\ndeploy = \"link\"\n\n\
+             [targets.dest]\npath = \"{}\"\nsources = [\"dev-src\"]\nlayout = \"flat\"\n",
+        fx.url,
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("link-source config parses");
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+    // No mirror, no lock: link must read the live working tree regardless.
+    let plans = preview_targets(&cfg, &parsed, &remotes, &fx.backend, None, false)
+        .expect("a link binding reads the working tree without lock or mirror");
+
+    let entry = preview_entry(only_plan(&plans, "dest"), "editor");
+    assert_eq!(
+        entry.commit, "link",
+        "a link binding has no resolved commit; its entry carries the \"link\" sentinel"
+    );
+    assert_eq!(
+        entry.state,
+        SyncState::Synced,
+        "a link binding with a present working tree is renderable (Synced), not unsynced"
+    );
+}
+
+#[test]
+fn preview_link_binding_with_missing_working_tree_is_annotated() {
+    let missing = TempDir::new().expect("scratch tempdir");
+    let gone_path = missing.path().join("not-there");
+    let gone = gone_path.to_string_lossy().into_owned();
+    drop(missing); // ensure the path does not exist
+
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+             [sources.dev-src]\ngit = \"{gone}\"\nbranch = \"main\"\ndeploy = \"link\"\n\n\
+             [targets.dest]\npath = \"{}\"\nsources = [\"dev-src\"]\nlayout = \"flat\"\n",
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("link-source config parses");
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes: BTreeMap<String, String> =
+        std::iter::once(("dev-src".to_owned(), gone.clone())).collect();
+
+    let git_dir = TempDir::new().expect("git dir");
+    let backend = GitBackend::new(git_dir.path().to_path_buf());
+
+    let plans = preview_targets(&cfg, &parsed, &remotes, &backend, None, false)
+        .expect("a link binding whose working tree is gone must annotate, not abort");
+
+    let plan = only_plan(&plans, "dest");
+    assert_eq!(
+        plan.entries.len(),
+        1,
+        "a gone working tree yields one annotation entry, got {:?}",
+        plan.entries
+    );
+    assert_eq!(
+        plan.entries[0].state,
+        SyncState::LinkWorkingTreeGone,
+        "a link binding whose working tree directory is gone must be LinkWorkingTreeGone"
+    );
+}
+
+#[test]
+fn preview_writes_nothing_to_the_registry_or_the_target() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let cfg =
+        config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+    fx.backend
+        .fetch(&sn("editor-src"), &fx.url)
+        .expect("seed fetch");
+
+    // Seed a registry record and a target file unrelated to the plan.
+    let seeded = RegistryRecord {
+        version: 1,
+        key: artifact_key("dest", "editor-src", "editor"),
+        source: "editor-src".to_owned(),
+        commit: fx.head_sha.clone(),
+        digest: "blake3:seeded".to_owned(),
+        projected_at: "2026-01-01T00:00:00Z".to_owned(),
+        layout: "flat".to_owned(),
+        allow_symlinks: false,
+        preserve_executable: true,
+        files: vec![ManifestFile {
+            path: PathBuf::from("init.lua"),
+            size: 8,
+            mtime: 1_700_000_000,
+            blake3: "blake3:seeded".to_owned(),
+        }],
+        linked: false,
+    };
+    fx.registry.put(&seeded).expect("seed registry record");
+    let before = fx.registry.list_all().expect("snapshot registry");
+
+    std::fs::create_dir_all(td.target_path()).expect("mkdir target");
+    std::fs::write(td.target_path().join("pre-existing.txt"), b"keep\n")
+        .expect("seed a pre-existing target file");
+    let target_before = read_target_dir(&td.target_path());
+
+    let counting = CountingBackend::new(&fx.backend);
+    let lock = lock_with(&cfg, "editor-src", &fx.url, &fx.head_sha);
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+
+    let plans = preview_targets(&cfg, &parsed, &remotes, &counting, Some(&lock), false)
+        .expect("preview builds a plan");
+    assert!(
+        !preview_entry(only_plan(&plans, "dest"), "editor")
+            .destination
+            .as_os_str()
+            .is_empty(),
+        "premise: preview must actually produce the editor entry so the no-write scan is meaningful"
+    );
+
+    assert_eq!(counting.export_count(), 0, "preview must export nothing");
+    let after = fx.registry.list_all().expect("re-read registry");
+    assert_eq!(
+        before.len(),
+        after.len(),
+        "preview must not add or remove registry records"
+    );
+    assert_eq!(
+        before[0].key, after[0].key,
+        "the seeded registry record must be byte-for-byte unchanged after preview"
+    );
+    assert_eq!(
+        before[0].digest, after[0].digest,
+        "preview must not rewrite the seeded record's digest"
+    );
+    assert_eq!(
+        read_target_dir(&td.target_path()),
+        target_before,
+        "preview must not create, remove, or modify any file under the target dir"
+    );
+}
+
+/// Every file path (relative to `dir`) plus its bytes, for a whole-tree no-write diff.
+fn read_target_dir(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    for entry in walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
+        if entry.file_type().is_file() {
+            let rel = entry
+                .path()
+                .strip_prefix(dir)
+                .expect("entry under dir")
+                .to_path_buf();
+            out.insert(rel, std::fs::read(entry.path()).expect("read target file"));
+        }
+    }
+    out
+}
+
+#[test]
+fn preview_annotates_predicted_flat_collision_as_warning_not_error() {
+    let fx_a = build_named_artifact_repo("shared", "a.txt", b"from-a\n");
+    let fx_b = build_named_artifact_repo("shared", "b.txt", b"from-b\n");
+
+    let git_dir = TempDir::new().expect("git dir");
+    let backend = GitBackend::new(git_dir.path().to_path_buf());
+    let td = TargetDir::new();
+
+    let toml = format!(
+        "version = 1\n\n\
+             [sources.src-a]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+             [sources.src-b]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+             [targets.dest]\npath = \"{}\"\nsources = [\"src-a\", \"src-b\"]\nlayout = \"flat\"\n",
+        fx_a.1,
+        fx_b.1,
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("two-source flat config parses");
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+
+    backend.fetch(&sn("src-a"), &fx_a.1).expect("seed src-a");
+    backend.fetch(&sn("src-b"), &fx_b.1).expect("seed src-b");
+    let a_head = rev_parse(fx_a.0.path(), "HEAD");
+    let b_head = rev_parse(fx_b.0.path(), "HEAD");
+    let lock = Lock {
+        version: 1,
+        sources: vec![
+            lock_with(&cfg, "src-a", &fx_a.1, &a_head).sources.remove(0),
+            lock_with(&cfg, "src-b", &fx_b.1, &b_head).sources.remove(0),
+        ],
+    };
+
+    let result = preview_targets(&cfg, &parsed, &remotes, &backend, Some(&lock), false);
+
+    let plans = match result {
+        Ok(plans) => plans,
+        Err(Error::Collision { .. }) => {
+            panic!("a predicted flat collision must be a warning in preview, NOT Error::Collision")
+        }
+        Err(e) => panic!("preview must not error on a predicted collision, got {e:?}"),
+    };
+
+    let plan = only_plan(&plans, "dest");
+    assert_eq!(
+        plan.entries
+            .iter()
+            .filter(|e| e.artifact == "shared")
+            .count(),
+        2,
+        "preview must render BOTH colliding entries, got {:?}",
+        plan.entries
+    );
+    let collision = plan
+        .collisions
+        .iter()
+        .find(|c| c.artifact == "shared")
+        .expect("the flat collision on `shared` must be annotated on the target");
+    assert!(
+        collision.sources.contains(&"src-a".to_owned())
+            && collision.sources.contains(&"src-b".to_owned()),
+        "the collision warning must name BOTH contributing sources, got {:?}",
+        collision.sources
+    );
+
+    drop(fx_a);
+    drop(fx_b);
+}
+
+#[test]
+fn preview_happy_path_renders_synced_artifacts_at_literal_layout_destinations() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_source_one_target(
+        "editor-src",
+        &fx.url,
+        "dest",
+        &td.target_path(),
+        "by-source",
+    );
+    fx.backend
+        .fetch(&sn("editor-src"), &fx.url)
+        .expect("seed fetch");
+    let lock = lock_with(&cfg, "editor-src", &fx.url, &fx.head_sha);
+
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+
+    let plans = preview_targets(&cfg, &parsed, &remotes, &fx.backend, Some(&lock), false)
+        .expect("a synced source previews its artifacts");
+
+    let plan = only_plan(&plans, "dest");
+    let editor = preview_entry(plan, "editor");
+    assert_eq!(
+        editor.state,
+        SyncState::Synced,
+        "a synced source's artifact must be Synced"
+    );
+    assert_eq!(
+        editor.source, "editor-src",
+        "the entry names its source binding"
+    );
+    assert_eq!(
+        editor.commit, fx.head_sha,
+        "the entry carries the locked commit"
+    );
+    assert_eq!(
+        editor.destination,
+        td.target_path().join("editor-src").join("editor"),
+        "by-source layout must place `editor` at <target>/editor-src/editor"
+    );
+}
+
+// ── preview plan builder (selectors + offline + --files) ──
+
+use crate::cli::{
+    PreviewPlan, PreviewSelectors, preview_plan, render_preview_json, render_preview_tree,
+};
+
+/// Two synced sources (`editor-src`→repo A artifact `editor`, `lint-src`→repo B
+/// artifact `lint`) plus an unlocked `ghost-src`, across two by-source targets:
+/// `home` carries all three bindings, `work` carries only `lint-src`. Mirrors for
+/// the synced sources are seeded; a two-entry lock pins them. Returns everything a
+/// preview-plan test needs to call [`preview_plan`] offline.
+struct PreviewFixture {
+    _fx_a: SyncFixture,
+    _fx_b: TempDir,
+    home: TargetDir,
+    work: TargetDir,
+    _git_dir: TempDir,
+    cfg: Config,
+    lock: Lock,
+    counting_inner: GitBackend,
+    head_a: String,
+}
+
+fn build_preview_fixture() -> PreviewFixture {
+    let fx_a = build_sync_fixture();
+    let (fx_b, url_b) = build_named_artifact_repo("lint", "rules.toml", b"[rules]\n");
+
+    let git_dir = TempDir::new().expect("shared git dir");
+    let backend = GitBackend::new(git_dir.path().to_path_buf());
+    backend
+        .fetch(&sn("editor-src"), &fx_a.url)
+        .expect("seed editor-src mirror");
+    backend
+        .fetch(&sn("lint-src"), &url_b)
+        .expect("seed lint-src mirror");
+    let head_a = fx_a.head_sha.clone();
+    let head_b = backend
+        .resolve(&sn("lint-src"), &url_b, &Refspec::Branch("main".into()))
+        .expect("resolve lint-src HEAD from the seeded mirror");
+
+    let home = TargetDir::new();
+    let work = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+             [sources.editor-src]\ngit = \"{url_a}\"\nbranch = \"main\"\n\n\
+             [sources.lint-src]\ngit = \"{url_b}\"\nbranch = \"main\"\n\n\
+             [sources.ghost-src]\ngit = \"{url_a}\"\nbranch = \"main\"\n\n\
+             [targets.home]\npath = \"{home_path}\"\nsources = [\"editor-src\", \"lint-src\", \"ghost-src\"]\nlayout = \"by-source\"\n\n\
+             [targets.work]\npath = \"{work_path}\"\nsources = [\"lint-src\"]\nlayout = \"by-source\"\n",
+        url_a = fx_a.url,
+        url_b = url_b,
+        home_path = home.target_path().display(),
+        work_path = work.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("multi-target multi-source config parses");
+
+    let lock = Lock {
+        version: 1,
+        sources: vec![
+            LockedSource {
+                name: "editor-src".to_owned(),
+                git: fx_a.url.clone(),
+                resolved: "main".to_owned(),
+                commit: head_a.clone(),
+                digest: "blake3:a".to_owned(),
+                config_digest: parsed_of(&cfg, "editor-src").config_digest(),
+                r#ref: None,
+            },
+            LockedSource {
+                name: "lint-src".to_owned(),
+                git: url_b.clone(),
+                resolved: "main".to_owned(),
+                commit: head_b.clone(),
+                digest: "blake3:b".to_owned(),
+                config_digest: parsed_of(&cfg, "lint-src").config_digest(),
+                r#ref: None,
+            },
+        ],
+    };
+
+    PreviewFixture {
+        _fx_a: fx_a,
+        _fx_b: fx_b,
+        home,
+        work,
+        _git_dir: git_dir,
+        cfg,
+        lock,
+        counting_inner: backend,
+        head_a,
+    }
+}
+
+impl PreviewFixture {
+    fn parsed(&self) -> BTreeMap<String, ParsedSource> {
+        self.cfg.parsed_sources().expect("sources parse")
+    }
+
+    fn remotes(&self) -> BTreeMap<String, String> {
+        let parsed = self.parsed();
+        resolved_remotes(&self.cfg, &parsed).expect("remotes resolve")
+    }
+}
+
+/// All entries for `target` across the plan.
+fn plan_target_of<'a>(plan: &'a PreviewPlan, target: &str) -> &'a PreviewTargetPlan {
+    plan.targets
+        .iter()
+        .find(|t| t.target == target)
+        .unwrap_or_else(|| panic!("preview plan must include target `{target}`"))
+}
+
+fn entry_of<'a>(tp: &'a PreviewTargetPlan, source: &str, artifact: &str) -> &'a PreviewEntry {
+    tp.entries
+        .iter()
+        .find(|e| e.source == source && e.artifact == artifact)
+        .unwrap_or_else(|| {
+            panic!(
+                "target `{}` must carry an entry for {source}/{artifact}, got {:?}",
+                tp.target, tp.entries
+            )
+        })
+}
+
+#[test]
+fn preview_plan_includes_all_targets_with_synced_entries_at_literal_destinations() {
+    let pf = build_preview_fixture();
+    let parsed = pf.parsed();
+    let remotes = pf.remotes();
+    let sel = PreviewSelectors {
+        source: None,
+        target: None,
+        files: false,
+    };
+
+    let plan = preview_plan(
+        &pf.cfg,
+        &parsed,
+        &remotes,
+        &pf.counting_inner,
+        Some(&pf.lock),
+        &sel,
+    )
+    .expect("an unfiltered plan builds over the seeded mirrors");
+
+    let mut targets: Vec<&str> = plan.targets.iter().map(|t| t.target.as_str()).collect();
+    targets.sort_unstable();
+    assert_eq!(
+        targets,
+        vec!["home", "work"],
+        "an unfiltered plan must include every configured target, got {targets:?}"
+    );
+
+    let home = plan_target_of(&plan, "home");
+    let editor = entry_of(home, "editor-src", "editor");
+    assert_eq!(
+        editor.state,
+        SyncState::Synced,
+        "editor-src/editor must be Synced"
+    );
+    assert_eq!(
+        editor.commit, pf.head_a,
+        "the synced entry carries the locked commit of editor-src"
+    );
+    assert_eq!(
+        editor.destination,
+        pf.home.target_path().join("editor-src").join("editor"),
+        "by-source layout must place editor at <home>/editor-src/editor (literal path, not via layout helper)"
+    );
+
+    let lint = entry_of(home, "lint-src", "lint");
+    assert_eq!(
+        lint.state,
+        SyncState::Synced,
+        "lint-src/lint must be Synced"
+    );
+    assert_eq!(
+        lint.destination,
+        pf.home.target_path().join("lint-src").join("lint"),
+        "lint must land at <home>/lint-src/lint"
+    );
+
+    let work = plan_target_of(&plan, "work");
+    assert_eq!(
+        entry_of(work, "lint-src", "lint").destination,
+        pf.work.target_path().join("lint-src").join("lint"),
+        "the work target's lint entry must land at <work>/lint-src/lint"
+    );
+}
+
+#[test]
+fn preview_plan_keeps_unsynced_binding_in_the_unfiltered_plan() {
+    let pf = build_preview_fixture();
+    let parsed = pf.parsed();
+    let remotes = pf.remotes();
+    let sel = PreviewSelectors {
+        source: None,
+        target: None,
+        files: false,
+    };
+
+    let plan = preview_plan(
+        &pf.cfg,
+        &parsed,
+        &remotes,
+        &pf.counting_inner,
+        Some(&pf.lock),
+        &sel,
+    )
+    .expect("plan builds");
+
+    let home = plan_target_of(&plan, "home");
+    let ghost = home
+        .entries
+        .iter()
+        .find(|e| e.source == "ghost-src")
+        .expect("an unlocked source must still appear as a per-binding annotation entry");
+    assert_eq!(
+        ghost.state,
+        SyncState::NotLocked,
+        "ghost-src has no lock entry, so it must be annotated NotLocked (not dropped, not fetched)"
+    );
+}
+
+#[test]
+fn preview_plan_target_selector_keeps_only_that_target() {
+    let pf = build_preview_fixture();
+    let parsed = pf.parsed();
+    let remotes = pf.remotes();
+    let sel = PreviewSelectors {
+        source: None,
+        target: Some("work".to_owned()),
+        files: false,
+    };
+
+    let plan = preview_plan(
+        &pf.cfg,
+        &parsed,
+        &remotes,
+        &pf.counting_inner,
+        Some(&pf.lock),
+        &sel,
+    )
+    .expect("plan builds filtered to work");
+
+    let targets: Vec<&str> = plan.targets.iter().map(|t| t.target.as_str()).collect();
+    assert_eq!(
+        targets,
+        vec!["work"],
+        "--target=work must filter the plan to exactly that target, got {targets:?}"
+    );
+    let work = plan_target_of(&plan, "work");
+    assert!(
+        entry_of(work, "lint-src", "lint").state == SyncState::Synced,
+        "the surviving work target must still carry its lint-src/lint entry"
+    );
+}
+
+#[test]
+fn preview_plan_source_selector_keeps_only_that_underlying_source_across_targets() {
+    let pf = build_preview_fixture();
+    let parsed = pf.parsed();
+    let remotes = pf.remotes();
+    let sel = PreviewSelectors {
+        source: Some("lint-src".to_owned()),
+        target: None,
+        files: false,
+    };
+
+    let plan = preview_plan(
+        &pf.cfg,
+        &parsed,
+        &remotes,
+        &pf.counting_inner,
+        Some(&pf.lock),
+        &sel,
+    )
+    .expect("plan builds filtered to lint-src");
+
+    for tp in &plan.targets {
+        assert!(
+            tp.entries.iter().all(|e| e.source == "lint-src"),
+            "--source=lint-src must drop every entry whose underlying source != lint-src, \
+                 target `{}` still has {:?}",
+            tp.target,
+            tp.entries
+        );
+    }
+    let home = plan_target_of(&plan, "home");
+    assert!(
+        entry_of(home, "lint-src", "lint").state == SyncState::Synced,
+        "the lint-src binding under home must survive the source filter"
+    );
+    assert!(
+        home.entries
+            .iter()
+            .all(|e| e.source != "editor-src" && e.source != "ghost-src"),
+        "editor-src and ghost-src entries must be dropped under --source=lint-src, got {:?}",
+        home.entries
+    );
+}
+
+#[test]
+fn preview_plan_unknown_target_selector_errors() {
+    let pf = build_preview_fixture();
+    let parsed = pf.parsed();
+    let remotes = pf.remotes();
+    let sel = PreviewSelectors {
+        source: None,
+        target: Some("nope".to_owned()),
+        files: false,
+    };
+
+    let err = preview_plan(
+        &pf.cfg,
+        &parsed,
+        &remotes,
+        &pf.counting_inner,
+        Some(&pf.lock),
+        &sel,
+    )
+    .expect_err("an unknown --target must be rejected, not silently produce an empty plan");
+    assert!(
+        err.to_string().contains("nope"),
+        "the error must name the offending target `nope`, got `{err}`"
+    );
+}
+
+#[test]
+fn preview_plan_unknown_source_selector_errors() {
+    let pf = build_preview_fixture();
+    let parsed = pf.parsed();
+    let remotes = pf.remotes();
+    let sel = PreviewSelectors {
+        source: Some("nope-src".to_owned()),
+        target: None,
+        files: false,
+    };
+
+    let err = preview_plan(
+        &pf.cfg,
+        &parsed,
+        &remotes,
+        &pf.counting_inner,
+        Some(&pf.lock),
+        &sel,
+    )
+    .expect_err("an unknown --source must be rejected against the merged config");
+    assert!(
+        err.to_string().contains("nope-src"),
+        "the error must name the offending source `nope-src`, got `{err}`"
+    );
+}
+
+#[test]
+fn preview_plan_is_offline_and_writes_nothing() {
+    let pf = build_preview_fixture();
+    let parsed = pf.parsed();
+    let remotes = pf.remotes();
+    let counting = CountingBackend::new(&pf.counting_inner);
+    let sel = PreviewSelectors {
+        source: None,
+        target: None,
+        files: true,
+    };
+
+    let home_before = read_target_dir(&pf.home.target_path());
+    let work_before = read_target_dir(&pf.work.target_path());
+
+    let plan = preview_plan(&pf.cfg, &parsed, &remotes, &counting, Some(&pf.lock), &sel)
+        .expect("plan builds offline");
+    assert!(
+        !plan.targets.is_empty(),
+        "premise: the plan must be non-empty so the offline assertions are meaningful"
+    );
+
+    assert_eq!(
+        counting.fetch_count(),
+        0,
+        "preview_plan must perform NO fetch; commits come from the lock"
+    );
+    assert_eq!(
+        counting.resolve_count(),
+        0,
+        "preview_plan must reuse the locked commit, never re-resolve a refspec"
+    );
+    assert_eq!(
+        counting.export_count(),
+        0,
+        "even with --files, preview_plan must not export/write artifacts"
+    );
+    assert_eq!(
+        read_target_dir(&pf.home.target_path()),
+        home_before,
+        "preview_plan must not create, remove, or modify any file under the home target"
+    );
+    assert_eq!(
+        read_target_dir(&pf.work.target_path()),
+        work_before,
+        "preview_plan must not write under the work target"
+    );
+}
+
+#[test]
+fn preview_plan_with_files_enriches_synced_entries_with_their_file_lists() {
+    let pf = build_preview_fixture();
+    let parsed = pf.parsed();
+    let remotes = pf.remotes();
+    let sel = PreviewSelectors {
+        source: None,
+        target: None,
+        files: true,
+    };
+
+    let plan = preview_plan(
+        &pf.cfg,
+        &parsed,
+        &remotes,
+        &pf.counting_inner,
+        Some(&pf.lock),
+        &sel,
+    )
+    .expect("a --files plan builds");
+
+    let editor = entry_of(plan_target_of(&plan, "home"), "editor-src", "editor");
+    let mut editor_files = editor.files.clone();
+    editor_files.sort();
+    assert_eq!(
+        editor_files,
+        vec![PathBuf::from("init.lua"), PathBuf::from("notes.bak")],
+        "with --files the editor entry must list EXACTLY the seeded editor tree \
+         (init.lua + the sibling notes.bak), with no over-listing or duplication, got {:?}",
+        editor.files
+    );
+
+    let lint = entry_of(plan_target_of(&plan, "home"), "lint-src", "lint");
+    let mut lint_files = lint.files.clone();
+    lint_files.sort();
+    assert_eq!(
+        lint_files,
+        vec![PathBuf::from("rules.toml")],
+        "with --files the lint entry must list EXACTLY rules.toml, got {:?}",
+        lint.files
+    );
+}
+
+#[test]
+fn preview_plan_without_files_leaves_entries_unenriched() {
+    let pf = build_preview_fixture();
+    let parsed = pf.parsed();
+    let remotes = pf.remotes();
+    let sel = PreviewSelectors {
+        source: None,
+        target: None,
+        files: false,
+    };
+
+    let plan = preview_plan(
+        &pf.cfg,
+        &parsed,
+        &remotes,
+        &pf.counting_inner,
+        Some(&pf.lock),
+        &sel,
+    )
+    .expect("a no-files plan builds");
+
+    let editor = entry_of(plan_target_of(&plan, "home"), "editor-src", "editor");
+    assert!(
+        editor.files.is_empty(),
+        "without --files a synced entry must carry no file list, got {:?}",
+        editor.files
+    );
+}
+
+// ── offline file lister (SourceBackend::list_artifact_files) ──
+
+#[test]
+fn list_artifact_files_returns_artifact_files_offline_without_fetching() {
+    let fx = build_sync_fixture();
+    fx.backend
+        .fetch(&sn("editor-src"), &fx.url)
+        .expect("seed mirror so the lister can read the tree without fetching");
+    let counting = CountingBackend::new(&fx.backend);
+    let selection = Selection::new(&[], &[]).expect("empty selection builds");
+
+    let files = counting
+        .list_artifact_files(
+            &sn("editor-src"),
+            &fx.url,
+            &fx.head_sha,
+            None,
+            &an("editor"),
+            &selection,
+        )
+        .expect("listing a synced artifact's files must succeed");
+
+    assert!(
+        files.contains(&PathBuf::from("init.lua")),
+        "the editor artifact's files must include init.lua, got {files:?}"
+    );
+    assert!(
+        files.contains(&PathBuf::from("notes.bak")),
+        "with an empty selection notes.bak is included too, got {files:?}"
+    );
+    assert_eq!(
+        counting.fetch_count(),
+        0,
+        "list_artifact_files must read the seeded mirror, performing NO fetch"
+    );
+    assert_eq!(
+        counting.export_count(),
+        0,
+        "list_artifact_files must not export/write anything"
+    );
+}
+
+#[test]
+fn list_artifact_files_respects_selection_exclude() {
+    let fx = build_sync_fixture();
+    fx.backend
+        .fetch(&sn("editor-src"), &fx.url)
+        .expect("seed mirror");
+    let selection =
+        Selection::new(&[], &["**/*.bak".to_owned()]).expect("exclude selection builds");
+
+    let files = fx
+        .backend
+        .list_artifact_files(
+            &sn("editor-src"),
+            &fx.url,
+            &fx.head_sha,
+            None,
+            &an("editor"),
+            &selection,
+        )
+        .expect("listing with an exclude must succeed");
+
+    assert!(
+        files.contains(&PathBuf::from("init.lua")),
+        "init.lua is not excluded and must be listed, got {files:?}"
+    );
+    assert!(
+        !files.contains(&PathBuf::from("notes.bak")),
+        "a **/*.bak exclude must drop notes.bak from the listing, got {files:?}"
+    );
+}
+
+// ── tree + json rendering ─────────────────────────────
+
+/// Builds the unfiltered, file-enriched plan once for the rendering tests.
+fn rendered_plan(pf: &PreviewFixture) -> PreviewPlan {
+    let parsed = pf.parsed();
+    let remotes = pf.remotes();
+    let sel = PreviewSelectors {
+        source: None,
+        target: None,
+        files: true,
+    };
+    preview_plan(
+        &pf.cfg,
+        &parsed,
+        &remotes,
+        &pf.counting_inner,
+        Some(&pf.lock),
+        &sel,
+    )
+    .expect("the rendering fixture plan builds")
+}
+
+#[test]
+fn render_preview_tree_shows_targets_bindings_destinations_and_files() {
+    let pf = build_preview_fixture();
+    let plan = rendered_plan(&pf);
+
+    let out = render_preview_tree(&plan);
+
+    assert!(
+        out.contains("home"),
+        "the tree must name the home target, got:\n{out}"
+    );
+    assert!(
+        out.contains("work"),
+        "the tree must name the work target, got:\n{out}"
+    );
+    assert!(
+        out.contains("editor-src"),
+        "the tree must name the editor-src binding, got:\n{out}"
+    );
+    assert!(
+        out.contains("editor"),
+        "the tree must name the editor artifact, got:\n{out}"
+    );
+    assert!(
+        out.contains("editor-src/editor")
+            || out.contains(
+                pf.home
+                    .target_path()
+                    .join("editor-src")
+                    .join("editor")
+                    .to_string_lossy()
+                    .as_ref()
+            ),
+        "the tree must show the artifact's destination path, got:\n{out}"
+    );
+    assert!(
+        out.contains("init.lua"),
+        "with files enriched the tree must list init.lua under its artifact, got:\n{out}"
+    );
+    assert!(
+        out.contains("ghost-src"),
+        "the tree must surface the unsynced ghost-src binding, got:\n{out}"
+    );
+    let lower = out.to_lowercase();
+    assert!(
+        lower.contains("not locked") || lower.contains("needs sync") || lower.contains("notlocked"),
+        "an unsynced binding must render a visible annotation, got:\n{out}"
+    );
+}
+
+#[test]
+fn render_preview_tree_warns_about_a_predicted_collision_naming_both_sources() {
+    let fx_a = build_named_artifact_repo("shared", "a.txt", b"from-a\n");
+    let fx_b = build_named_artifact_repo("shared", "b.txt", b"from-b\n");
+
+    let git_dir = TempDir::new().expect("git dir");
+    let backend = GitBackend::new(git_dir.path().to_path_buf());
+    backend.fetch(&sn("src-a"), &fx_a.1).expect("seed src-a");
+    backend.fetch(&sn("src-b"), &fx_b.1).expect("seed src-b");
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+             [sources.src-a]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+             [sources.src-b]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+             [targets.dest]\npath = \"{}\"\nsources = [\"src-a\", \"src-b\"]\nlayout = \"flat\"\n",
+        fx_a.1,
+        fx_b.1,
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("two-source flat config parses");
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+    let commit_a = backend
+        .resolve(&sn("src-a"), &fx_a.1, &Refspec::Branch("main".into()))
+        .expect("resolve src-a");
+    let commit_b = backend
+        .resolve(&sn("src-b"), &fx_b.1, &Refspec::Branch("main".into()))
+        .expect("resolve src-b");
+    let lock = Lock {
+        version: 1,
+        sources: vec![
+            LockedSource {
+                name: "src-a".to_owned(),
+                git: fx_a.1.clone(),
+                resolved: "main".to_owned(),
+                commit: commit_a,
+                digest: "blake3:a".to_owned(),
+                config_digest: parsed_of(&cfg, "src-a").config_digest(),
+                r#ref: None,
+            },
+            LockedSource {
+                name: "src-b".to_owned(),
+                git: fx_b.1.clone(),
+                resolved: "main".to_owned(),
+                commit: commit_b,
+                digest: "blake3:b".to_owned(),
+                config_digest: parsed_of(&cfg, "src-b").config_digest(),
+                r#ref: None,
+            },
+        ],
+    };
+    let sel = PreviewSelectors {
+        source: None,
+        target: None,
+        files: false,
+    };
+
+    let plan = preview_plan(&cfg, &parsed, &remotes, &backend, Some(&lock), &sel)
+        .expect("a colliding plan builds without error");
+    let out = render_preview_tree(&plan);
+
+    let lower = out.to_lowercase();
+    assert!(
+        lower.contains("collision") || lower.contains("warn") || lower.contains("conflict"),
+        "a predicted flat collision must render a visible warning, got:\n{out}"
+    );
+    assert!(
+        out.contains("src-a") && out.contains("src-b"),
+        "the collision warning must name BOTH contributing sources, got:\n{out}"
+    );
+
+    drop(fx_a);
+    drop(fx_b);
+}
+
+#[test]
+fn render_preview_json_is_valid_json_with_targets_entries_and_collisions() {
+    let pf = build_preview_fixture();
+    let plan = rendered_plan(&pf);
+
+    let json = render_preview_json(&plan).expect("preview JSON must serialize");
+    let value: serde_json::Value =
+        serde_json::from_str(&json).expect("preview JSON must parse back into a Value");
+
+    let targets = value
+        .get("targets")
+        .and_then(serde_json::Value::as_array)
+        .expect("JSON must carry a `targets` array");
+    let home = targets
+        .iter()
+        .find(|t| t.get("target").and_then(serde_json::Value::as_str) == Some("home"))
+        .expect("the targets array must include the home target");
+
+    let entries = home
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+        .expect("each target must carry an `entries` array");
+    let editor = entries
+        .iter()
+        .find(|e| {
+            e.get("source").and_then(serde_json::Value::as_str) == Some("editor-src")
+                && e.get("artifact").and_then(serde_json::Value::as_str) == Some("editor")
+        })
+        .expect("home entries must include editor-src/editor");
+    let dest_str = editor
+        .get("destination")
+        .and_then(serde_json::Value::as_str)
+        .expect("each entry must serialize its destination as a string");
+    assert!(
+        Path::new(dest_str).ends_with("editor-src/editor"),
+        "the editor entry's destination must resolve under editor-src/editor, got {dest_str:?}"
+    );
+
+    let state_str = editor
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .expect("each entry must serialize its sync state as a string");
+    assert_eq!(
+        state_str.to_lowercase(),
+        "synced",
+        "the editor entry's state must mean Synced, got {state_str:?}"
+    );
+
+    let collisions = home
+        .get("collisions")
+        .and_then(serde_json::Value::as_array)
+        .expect("each target must serialize collisions as an array");
+    assert!(
+        collisions.is_empty(),
+        "the unfiltered by-source home plan has no flat collision, got {collisions:?}"
+    );
+}
+
+// ── binding-selection parity: plan/preview must discover the binding's effective
+//    include/exclude (matching deploy_target), not the source-level selection ──
+
+/// A target binding that refines `editor-src` with `include = ["editor"]` discovers
+/// EXACTLY the binding-selected `editor` artifact — not the source's intrinsic set
+/// (`docs` + `editor`). Pins the parity bug where `plan_target` re-derived the
+/// selection from the source: this asserts the override narrows the set.
+#[test]
+fn plan_target_discovers_binding_effective_selection_not_source_level() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\n\
+         {{ source = \"editor-src\", as = \"slim\", include = [\"editor\"] }},\n\
+         ]\nlayout = \"by-source\"\n",
+        fx.url,
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("refined-binding config parses");
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+    fx.backend
+        .fetch(&sn("editor-src"), &fx.url)
+        .expect("seed editor-src mirror");
+    let commits = one_commit(&parsed, "editor-src", &fx.head_sha);
+
+    let plans = plan_targets(&cfg, &parsed, &remotes, &fx.backend, &commits)
+        .expect("plan builds over the seeded mirror");
+
+    let dest = plans
+        .iter()
+        .find(|p| p.target == "dest")
+        .expect("plan must include target `dest`");
+
+    let artifacts: Vec<&str> = dest.entries.iter().map(|e| e.artifact.as_str()).collect();
+    assert_eq!(
+        artifacts,
+        vec!["editor"],
+        "the binding's include=[\"editor\"] override must narrow discovery to EXACTLY `editor`; \
+         the source-level set (docs + editor) would be the bug, got {artifacts:?}"
+    );
+    assert!(
+        !artifacts.contains(&"docs"),
+        "the source intrinsically exposes `docs`, but the binding override excludes it: \
+         plan must NOT discover `docs`"
+    );
+
+    let editor = &dest.entries[0];
+    assert_eq!(editor.identity, "slim");
+    assert_eq!(
+        editor.destination,
+        td.target_path().join("slim").join("editor"),
+        "by-source layout must place editor at <dest>/slim/editor"
+    );
+}
+
+/// Premise guard: WITHOUT the override, `editor-src` discovers BOTH `docs` and
+/// `editor` — proving the override above genuinely narrows the set.
+#[test]
+fn plan_target_without_override_discovers_full_source_level_set() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\"editor-src\"]\nlayout = \"by-source\"\n",
+        fx.url,
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("plain-binding config parses");
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+    fx.backend
+        .fetch(&sn("editor-src"), &fx.url)
+        .expect("seed editor-src mirror");
+    let commits = one_commit(&parsed, "editor-src", &fx.head_sha);
+
+    let plans = plan_targets(&cfg, &parsed, &remotes, &fx.backend, &commits)
+        .expect("plan builds over the seeded mirror");
+
+    let dest = plans
+        .iter()
+        .find(|p| p.target == "dest")
+        .expect("plan must include target `dest`");
+    let mut artifacts: Vec<&str> = dest.entries.iter().map(|e| e.artifact.as_str()).collect();
+    artifacts.sort_unstable();
+    assert_eq!(
+        artifacts,
+        vec!["docs", "editor"],
+        "a plain binding (no override) inherits the source's full set, got {artifacts:?}"
+    );
+}
+
+/// `preview_targets` must annotate the binding's effective selection: a refined
+/// binding with `include = ["editor"]` previews ONLY `editor` as Synced, and with
+/// files=true the file list respects the same selection (dropping `notes.bak`).
+#[test]
+fn preview_target_reflects_binding_effective_selection() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+
+    let git_dir = TempDir::new().expect("shared git dir");
+    let backend = GitBackend::new(git_dir.path().to_path_buf());
+    backend
+        .fetch(&sn("editor-src"), &fx.url)
+        .expect("seed editor-src mirror");
+
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\n\
+         {{ source = \"editor-src\", as = \"slim\", include = [\"editor\"], exclude = [\"**/*.bak\"] }},\n\
+         ]\nlayout = \"by-source\"\n",
+        fx.url,
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("refined-binding preview config parses");
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+
+    let lock = Lock {
+        version: 1,
+        sources: vec![LockedSource {
+            name: "editor-src".to_owned(),
+            git: fx.url.clone(),
+            resolved: "main".to_owned(),
+            commit: fx.head_sha.clone(),
+            digest: "blake3:a".to_owned(),
+            config_digest: parsed_of(&cfg, "editor-src").config_digest(),
+            r#ref: None,
+        }],
+    };
+
+    let plans = preview_targets(&cfg, &parsed, &remotes, &backend, Some(&lock), true)
+        .expect("preview builds over the seeded mirror");
+    let dest = only_plan(&plans, "dest");
+
+    let synced: Vec<&str> = dest
+        .entries
+        .iter()
+        .filter(|e| e.state == SyncState::Synced)
+        .map(|e| e.artifact.as_str())
+        .collect();
+    assert_eq!(
+        synced,
+        vec!["editor"],
+        "preview must reflect the binding's include override (only `editor`), not the \
+         source-level set (docs + editor), got {synced:?}"
+    );
+
+    let editor = preview_entry(dest, "editor");
+    assert_eq!(editor.state, SyncState::Synced);
+    assert_eq!(
+        editor.destination,
+        td.target_path().join("slim").join("editor"),
+        "by-source layout must place editor at <dest>/slim/editor"
+    );
+    assert_eq!(
+        editor.files,
+        vec![PathBuf::from("init.lua")],
+        "files=true must honor the binding's exclude=[\"**/*.bak\"]: `notes.bak` is dropped, \
+         got {:?}",
+        editor.files
+    );
+
     drop(fx);
 }

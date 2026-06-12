@@ -1,11 +1,15 @@
 //! The sole producer of user-facing CLI output (`println!`/`format!`).
 
+use std::fmt::Write;
+
 use crate::config::ParsedSource;
 use crate::deploy::ArtifactState;
+use crate::error::{Error, Result};
+use crate::sync::SyncState;
 
 use super::query::{
-    CheckMatchReport, SourceResolution, SourceRow, SourceSummary, TargetDetail, TargetListing,
-    TargetRow, WhereMatch,
+    CheckMatchReport, PreviewPlan, SourceResolution, SourceRow, SourceSummary, TargetDetail,
+    TargetListing, TargetRow, WhereMatch,
 };
 
 pub(super) fn print_listings(listings: &[TargetListing]) {
@@ -156,6 +160,72 @@ pub(super) fn warn_target_rm_deployed(name: &str) {
 
 pub(super) fn warn_unbind_tombstone(target: &str) {
     eprintln!("phora: {}", super::bind::unbind_tombstone_warning(target));
+}
+
+/// Renders the preview plan as an indented per-target tree for terminal output.
+#[must_use]
+pub(crate) fn render_preview_tree(plan: &PreviewPlan) -> String {
+    let mut out = String::new();
+    for tp in &plan.targets {
+        let _ = writeln!(out, "{}", tp.target);
+        for entry in &tp.entries {
+            match entry.state {
+                SyncState::Synced => render_synced_entry(&mut out, entry),
+                SyncState::NotLocked => {
+                    let _ = writeln!(out, "  {} — not locked", entry.identity);
+                }
+                SyncState::NeedsSync => {
+                    let _ = writeln!(out, "  {} — needs sync", entry.identity);
+                }
+                SyncState::LinkWorkingTreeGone => {
+                    let _ = writeln!(out, "  {} — link working tree gone", entry.identity);
+                }
+            }
+        }
+        for collision in &tp.collisions {
+            let _ = writeln!(
+                out,
+                "  collision: {} from {}",
+                collision.artifact,
+                collision.sources.join(", ")
+            );
+        }
+    }
+    out
+}
+
+fn render_synced_entry(out: &mut String, entry: &crate::sync::PreviewEntry) {
+    let line = if entry.commit == "link" {
+        format!("{}@link", entry.identity)
+    } else {
+        let short = entry.commit.get(..8).unwrap_or(&entry.commit);
+        format!("{}@{short}", entry.identity)
+    };
+    let _ = writeln!(
+        out,
+        "  {line} {} -> {}",
+        entry.artifact,
+        entry.destination.display()
+    );
+    for file in &entry.files {
+        let _ = writeln!(out, "    {}", file.display());
+    }
+}
+
+/// Returns the preview plan as pretty-printed JSON.
+///
+/// # Errors
+/// Errors if serialization fails.
+pub(crate) fn render_preview_json(plan: &PreviewPlan) -> Result<String> {
+    serde_json::to_string_pretty(&PreviewPlanJson {
+        targets: &plan.targets,
+    })
+    .map_err(|e| Error::Sync(format!("serialize preview json: {e}")))
+}
+
+#[derive(serde::Serialize)]
+struct PreviewPlanJson<'a> {
+    targets: &'a [crate::sync::PreviewTargetPlan],
 }
 
 pub(super) fn state_label(state: &ArtifactState) -> &'static str {

@@ -1,0 +1,34 @@
+---
+source: tests/golden.rs
+expression: "snapshot(&run(&fixture, &[\"preview\", \"--json\"]))"
+---
+exit: 0
+--- stdout ---
+{
+  "targets": [
+    {
+      "target": "home",
+      "entries": [
+        {
+          "identity": "dotfiles",
+          "source": "dotfiles",
+          "artifact": "editor",
+          "commit": "<COMMIT>",
+          "destination": "<HOME>/deploy/editor",
+          "state": "Synced",
+          "files": []
+        },
+        {
+          "identity": "dotfiles",
+          "source": "dotfiles",
+          "artifact": "lint",
+          "commit": "<COMMIT>",
+          "destination": "<HOME>/deploy/lint",
+          "state": "Synced",
+          "files": []
+        }
+      ],
+      "collisions": []
+    }
+  ]
+}--- stderr ---

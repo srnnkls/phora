@@ -1,6 +1,8 @@
 //! Top-level orchestration: the `sync` pipeline, eject/uneject, and shared helpers.
 
 mod discover;
+mod plan;
+mod preview;
 mod prune;
 mod rebuild;
 mod resolve;
@@ -10,6 +12,8 @@ mod verify;
 #[cfg(test)]
 mod tests;
 
+pub use plan::{PlanEntry, TargetPlan, plan_target, plan_targets};
+pub use preview::{PreviewCollision, PreviewEntry, PreviewTargetPlan, SyncState, preview_targets};
 pub use rebuild::{RebuildReport, rebuild_registry};
 pub use verify::{VerifyMismatch, VerifyReason, verify};
 
@@ -108,7 +112,7 @@ pub(super) fn effective_protocol(source: &ParsedSource, config: &Config) -> Prot
 
 /// Resolves every source's concrete remote once, keyed by source name. A resolution
 /// failure (unknown host, missing protocol template) surfaces named by source.
-pub(super) fn resolved_remotes(
+pub(crate) fn resolved_remotes(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
 ) -> Result<BTreeMap<String, String>> {

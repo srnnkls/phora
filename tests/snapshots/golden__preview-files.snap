@@ -1,0 +1,13 @@
+---
+source: tests/golden.rs
+expression: "snapshot(&run(&fixture, &[\"preview\", \"--files\"]))"
+---
+exit: 0
+--- stdout ---
+home
+  dotfiles@<COMMIT8> editor -> <HOME>/deploy/editor
+    init.lua
+    lua/opts.lua
+  dotfiles@<COMMIT8> lint -> <HOME>/deploy/lint
+    rules.toml
+--- stderr ---

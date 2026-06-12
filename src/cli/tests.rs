@@ -4380,3 +4380,68 @@ fn drop_one_removes_all_ref_splits_of_that_source() {
         "an unrelated source must survive a targeted drop"
     );
 }
+// ── `phora preview` CLI parsing ───────────────────────
+
+use clap::Parser as _;
+
+/// Destructures `cli`'s command into a `Command::Preview`, panicking otherwise.
+fn preview_of(cli: Cli) -> (Option<String>, Option<String>, bool, bool) {
+    match cli.command {
+        Command::Preview {
+            source,
+            target,
+            files,
+            json,
+        } => (source, target, files, json),
+        other => panic!("expected Command::Preview, got {other:?}"),
+    }
+}
+
+#[test]
+fn preview_parses_all_selectors_and_flags() {
+    let cli = Cli::try_parse_from([
+        "phora", "preview", "--source", "s", "--target", "t", "--files", "--json",
+    ])
+    .expect("`phora preview --source s --target t --files --json` must parse");
+
+    let (source, target, files, json) = preview_of(cli);
+    assert_eq!(
+        source.as_deref(),
+        Some("s"),
+        "--source must populate Command::Preview.source"
+    );
+    assert_eq!(
+        target.as_deref(),
+        Some("t"),
+        "--target must populate Command::Preview.target"
+    );
+    assert!(files, "--files must set the files flag");
+    assert!(json, "--json must set the json flag");
+}
+
+#[test]
+fn bare_preview_defaults_selectors_to_none_and_flags_to_false() {
+    let cli = Cli::try_parse_from(["phora", "preview"]).expect("a bare `phora preview` must parse");
+
+    let (source, target, files, json) = preview_of(cli);
+    assert!(
+        source.is_none(),
+        "a bare preview must leave --source unset, got {source:?}"
+    );
+    assert!(
+        target.is_none(),
+        "a bare preview must leave --target unset, got {target:?}"
+    );
+    assert!(!files, "a bare preview must default --files to false");
+    assert!(!json, "a bare preview must default --json to false");
+}
+
+#[test]
+fn preview_selectors_are_long_flags_not_positionals() {
+    let positional = Cli::try_parse_from(["phora", "preview", "some-source"]);
+    assert!(
+        positional.is_err(),
+        "`phora preview <name>` must be rejected: the source selector is the long flag --source, \
+             not a positional argument"
+    );
+}
