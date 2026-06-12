@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ubuntu-latest only. macOS is deferred: xdg-base-dirs adds a macOS-specific
+  # state fallback (~/Library/Application Support) that stays E2E-uncovered
+  # until a macOS runner is added here.
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with:
+          experimental: true
+          install: true
+          cache: true
+      - run: mise run lint
+      - run: mise run test
+      - run: mise run test-integration
