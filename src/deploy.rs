@@ -12,7 +12,11 @@ use crate::store::{ArtifactKey, EjectedEntry, Registry, RegistryRecord, ScannedF
 #[derive(Debug)]
 pub enum ArtifactState {
     Clean,
-    Modified { changed: Vec<PathBuf> },
+    /// Managed artifact whose lock advanced past the deployed commit; redeploys without `--force`.
+    Outdated,
+    Modified {
+        changed: Vec<PathBuf>,
+    },
     Foreign,
     Missing,
     Ejected,
@@ -61,9 +65,10 @@ pub fn check_artifact_state(
         return Ok(ArtifactState::Linked);
     }
 
-    if record.key.source != expected_source || record.commit != expected_commit {
+    if record.key.source != expected_source {
         return Ok(ArtifactState::Foreign);
     }
+    let commit_advanced = record.commit != expected_commit;
 
     let mut changed: BTreeSet<PathBuf> = BTreeSet::new();
 
@@ -103,12 +108,14 @@ pub fn check_artifact_state(
         changed.extend(scan.symlinks);
     }
 
-    if changed.is_empty() {
-        Ok(ArtifactState::Clean)
-    } else {
+    if !changed.is_empty() {
         Ok(ArtifactState::Modified {
             changed: changed.into_iter().collect(),
         })
+    } else if commit_advanced {
+        Ok(ArtifactState::Outdated)
+    } else {
+        Ok(ArtifactState::Clean)
     }
 }
 
@@ -935,7 +942,7 @@ mod tests {
     }
 
     #[test]
-    fn foreign_when_record_commit_differs() {
+    fn outdated_when_commit_advanced_but_files_clean() {
         let (_state_dir, reg) = registry();
         let target = TempDir::new().expect("target dir");
         let record = deploy_and_record(target.path(), &[("a.json", b"{}")], false);
@@ -953,9 +960,35 @@ mod tests {
         .expect("check_artifact_state");
 
         assert!(
-            matches!(st, ArtifactState::Foreign),
-            "record is findable under key yet expected_commit is other-commit: \
-             record.commit ({COMMIT}) != expected_commit => Foreign, got {st:?}"
+            matches!(st, ArtifactState::Outdated),
+            "same source, lock advanced past the deployed commit, on-disk files still match the \
+             record => Outdated (a managed artifact to redeploy), not Foreign, got {st:?}"
+        );
+    }
+
+    #[test]
+    fn modified_when_commit_advanced_and_files_diverge() {
+        let (_state_dir, reg) = registry();
+        let target = TempDir::new().expect("target dir");
+        let record = deploy_and_record(target.path(), &[("a.json", b"{}")], false);
+        reg.put(&record).expect("put record");
+        std::fs::write(target.path().join("a.json"), b"locally edited").expect("tamper file");
+
+        let st = check_artifact_state(
+            target.path(),
+            SOURCE,
+            "other-commit",
+            &[],
+            ARTIFACT,
+            &reg,
+            &record.key,
+        )
+        .expect("check_artifact_state");
+
+        assert!(
+            matches!(st, ArtifactState::Modified { .. }),
+            "a user edit must read as Modified even when the lock also advanced, so the redeploy \
+             warns instead of silently clobbering local changes, got {st:?}"
         );
     }
 
