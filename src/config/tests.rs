@@ -1683,6 +1683,38 @@ fn shipped_example_toml_demonstrates_a_refined_binding_alias() {
     );
 }
 
+// PTV-007: the shipped example must demonstrate per-target versioning
+
+#[test]
+fn example_toml_demonstrates_per_target_versioning() {
+    let cfg = Config::parse(include_str!("../../phora.example.toml"))
+        .expect("the shipped phora.example.toml must parse");
+    cfg.validate()
+        .expect("the shipped phora.example.toml must pass post-merge validation");
+
+    let parsed = cfg
+        .parsed_sources()
+        .expect("shipped example parses to typed form");
+
+    let has_two_version_pair = cfg.targets.values().any(|target| {
+        let resolved = target.resolve_sources(&parsed);
+        resolved.iter().enumerate().any(|(i, a)| {
+            resolved[i + 1..].iter().any(|b| {
+                a.source == b.source
+                    && a.identity != b.identity
+                    && format!("{:?}", a.effective_ref) != format!("{:?}", b.effective_ref)
+            })
+        })
+    });
+
+    assert!(
+        has_two_version_pair,
+        "the shipped phora.example.toml must demonstrate per-target versioning: ONE source \
+         bound into a target TWICE under two DISTINCT `as` identities resolving to DISTINCT \
+         effective refs (e.g. two tags). Without it the README/example claim is untruthful."
+    );
+}
+
 // HAS-002: resolved_remote + single built-in forge registry
 
 fn hosts_of(toml: &str) -> BTreeMap<String, Host> {
