@@ -20,10 +20,7 @@ use std::path::PathBuf;
 
 use crate::error::{Error, Result};
 
-fn xdg_base(
-    var_value: Option<std::ffi::OsString>,
-    fallback: Option<PathBuf>,
-) -> Option<PathBuf> {
+fn xdg_base(var_value: Option<std::ffi::OsString>, fallback: Option<PathBuf>) -> Option<PathBuf> {
     var_value
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
@@ -52,7 +49,10 @@ mod tests {
     #[test]
     fn absolute_override_is_honored() {
         assert_eq!(
-            xdg_base(Some("/abs/override".into()), Some(PathBuf::from("/fallback"))),
+            xdg_base(
+                Some("/abs/override".into()),
+                Some(PathBuf::from("/fallback"))
+            ),
             Some(PathBuf::from("/abs/override")),
         );
     }
@@ -60,7 +60,10 @@ mod tests {
     #[test]
     fn relative_override_falls_through_to_fallback() {
         assert_eq!(
-            xdg_base(Some("relative/path".into()), Some(PathBuf::from("/fallback"))),
+            xdg_base(
+                Some("relative/path".into()),
+                Some(PathBuf::from("/fallback"))
+            ),
             Some(PathBuf::from("/fallback")),
         );
     }
