@@ -45,9 +45,31 @@ Requires a Rust toolchain (edition 2024).
 - **Lock** — `phora.lock` pins each source to a resolved commit so syncs are
   reproducible (`phora.local.toml` gets a companion `phora.local.lock`).
   `phora update` bumps it.
-- **Registry** — per-project state under `~/.phora` recording what was deployed
-  where (commit + content digest), so phora can detect drift, conflicts, and
-  orphans. Bare mirrors live under `~/.phora/git`.
+- **Registry** — per-project state under the state root (`XDG_STATE_HOME` or, by
+  default, `~/.local/state/phora` on Linux and `~/Library/Application Support/phora`
+  on macOS) recording what was deployed where (commit + content digest), so phora can
+  detect drift, conflicts, and orphans. Bare mirrors live under the cache root
+  (`XDG_CACHE_HOME` or, by default, `~/.cache/phora` on Linux and
+  `~/Library/Caches/phora` on macOS), in its `git/` subdirectory. See
+  [State & locations](#state--locations).
+
+### State & locations
+
+Phora keeps its shared state in two XDG-rooted trees:
+
+| Root  | Holds                              | Override         | Linux default          | macOS default                         |
+| ----- | ---------------------------------- | ---------------- | ---------------------- | ------------------------------------- |
+| Cache | git mirrors (regenerable)          | `XDG_CACHE_HOME` | `~/.cache/phora`       | `~/Library/Caches/phora`              |
+| State | registry (deploy journal, locks)   | `XDG_STATE_HOME` | `~/.local/state/phora` | `~/Library/Application Support/phora` |
+
+An `XDG_*` override is honored only when **absolute** (per the XDG spec); a relative
+value is ignored and the platform default applies. macOS has no native state
+directory, so the state root falls back to `~/Library/Application Support`.
+`XDG_DATA_HOME` and `XDG_CONFIG_HOME` are intentionally unused: phora has no portable
+data payload (the registry is machine-local, mirrors are regenerable) and no global
+config root (config is project-local `phora.toml`). Neither tree is migrated — a
+legacy `~/.phora` is abandoned; mirrors re-clone and the registry rebuilds on the
+next sync.
 
 ## Usage
 
@@ -375,7 +397,8 @@ level, and is overridable per source. Selecting `ssh` against a host whose
 `git` and local `path` sources.)
 
 The forge and literal forms of one repo — and its https and ssh remotes —
-share a single `~/.phora/git` mirror, so switching kind or protocol never
+share a single mirror under the cache root's `git/` subdirectory (see
+[State & locations](#state--locations)), so switching kind or protocol never
 re-clones or refetches.
 
 ### Url sources

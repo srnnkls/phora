@@ -1,4 +1,20 @@
-//! Filesystem locations for Phora's shared state.
+//! Filesystem locations for Phora's shared state, rooted via XDG base directories.
+//!
+//! [`cache_root`] holds regenerable git mirrors: `XDG_CACHE_HOME` when set,
+//! else [`dirs::cache_dir`] (macOS `~/Library/Caches`, Linux `~/.cache`), then `/phora`.
+//!
+//! [`state_root`] holds the per-project registry (deploy journal, locks, records):
+//! `XDG_STATE_HOME` when set, else [`dirs::state_dir`] (Linux `~/.local/state`), else
+//! [`dirs::data_dir`] — the macOS fallback, since macOS has no native state dir
+//! (`~/Library/Application Support`) — then `/phora`.
+//!
+//! An `XDG_*` override is honored only when absolute, per the XDG spec; a relative
+//! value is ignored and the platform default is used.
+//!
+//! `XDG_DATA_HOME` and `XDG_CONFIG_HOME` are intentionally unused: phora has no
+//! portable data payload (the registry is machine-local state, mirrors are
+//! regenerable cache) and no global config root (config is project-local
+//! `phora.toml`).
 
 use std::path::PathBuf;
 
