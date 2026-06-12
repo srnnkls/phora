@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use crate::config::{Host, builtin_forges};
 use crate::error::{Error, Result};
-use crate::source::Protocol;
+use crate::source::{Protocol, is_local_path};
 
 use super::config_edit::BindRefinement;
 use super::{config_edit, load_config, read_config_text, render, target_config_file};
@@ -64,8 +64,7 @@ pub(super) fn run_add(
         );
     }
 
-    let hosts = load_config().map(|c| c.hosts).unwrap_or_default();
-    let parsed = parse_add_url(url, &hosts)?;
+    let parsed = resolve_add_source(url)?;
 
     let name = name.unwrap_or_else(|| parsed.name.clone());
     let branch = branch.or_else(|| parsed.branch.clone());
@@ -105,6 +104,35 @@ pub(super) fn run_add(
         render::print_added_declared(&name, &description);
     }
     Ok(())
+}
+
+/// A local path resolves to `path =` (local), not forge shorthand — `add` must agree with the config layer, where bare `path =` already means local.
+fn resolve_add_source(url: &str) -> Result<AddTarget> {
+    if is_local_path(url) {
+        return local_path_source(url);
+    }
+    let hosts = load_config().map(|c| c.hosts).unwrap_or_default();
+    parse_add_url(url, &hosts)
+}
+
+fn local_path_source(url: &str) -> Result<AddTarget> {
+    let canonical = std::fs::canonicalize(url)
+        .map_err(|e| Error::Config(format!("local path source `{url}` does not exist: {e}")))?;
+    let path = canonical.to_string_lossy().into_owned();
+    let name = canonical.file_name().map_or_else(
+        || path.clone(),
+        |segment| segment.to_string_lossy().into_owned(),
+    );
+    Ok(AddTarget {
+        name,
+        git: None,
+        host: None,
+        repo: None,
+        path: Some(path),
+        protocol: None,
+        branch: None,
+        root: None,
+    })
 }
 
 fn resolve_local_source(url: &str, name: Option<String>) -> Result<(String, AddTarget)> {
@@ -189,8 +217,7 @@ fn run_add_to_targets(
         let (name, source) = resolve_local_source(url, name)?;
         (name, source, branch)
     } else {
-        let hosts = load_config().map(|c| c.hosts).unwrap_or_default();
-        let parsed = parse_add_url(url, &hosts)?;
+        let parsed = resolve_add_source(url)?;
         let name = name.unwrap_or_else(|| parsed.name.clone());
         let branch = branch.or_else(|| parsed.branch.clone());
         (name, parsed, branch)
@@ -234,9 +261,10 @@ pub(super) fn insert_source_with_ref(
 }
 
 fn describe_source(source: &AddTarget) -> String {
-    match (&source.git, &source.host, &source.repo) {
-        (Some(git), _, _) => git.clone(),
-        (None, Some(host), Some(repo)) => format!("{host}:{repo}"),
+    match (&source.git, &source.host, &source.repo, &source.path) {
+        (Some(git), ..) => git.clone(),
+        (None, Some(host), Some(repo), _) => format!("{host}:{repo}"),
+        (None, None, None, Some(path)) => path.clone(),
         _ => source.name.clone(),
     }
 }

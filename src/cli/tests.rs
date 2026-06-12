@@ -1199,6 +1199,95 @@ fn run_add_end_to_end_persists_symbolic_source_to_phora_toml() {
 }
 
 #[test]
+fn run_add_persists_local_path_source_for_absolute_dir() {
+    let project = tempfile::TempDir::new().expect("temp project dir");
+    let source_dir = tempfile::TempDir::new().expect("temp source dir");
+    let toml_path = project.path().join("phora.toml");
+    let source_path = source_dir.path().to_path_buf();
+    let source_arg = source_path.to_str().expect("utf-8 source path");
+
+    with_cwd(project.path(), || {
+        run_add(
+            source_arg,
+            &[],
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            &config_edit::BindRefinement::default(),
+        )
+        .expect("run_add must accept an absolute local path source");
+    });
+
+    let written =
+        std::fs::read_to_string(&toml_path).expect("run_add must write phora.toml in the cwd");
+    let canonical = std::fs::canonicalize(&source_path).expect("canonicalize source dir");
+    let name = canonical
+        .file_name()
+        .expect("source dir has a basename")
+        .to_string_lossy()
+        .into_owned();
+    let src = source_from(&written, &name);
+    assert_eq!(
+        src.path.as_deref(),
+        Some(canonical.to_string_lossy().as_ref()),
+        "an absolute local path must persist as a canonical `path =` source, got:\n{written}"
+    );
+    assert!(
+        src.host.is_none() && src.repo.is_none(),
+        "a local path source must not be misparsed as a forge host/repo, got:\n{written}"
+    );
+    assert!(
+        src.git.is_none(),
+        "a local path source uses `path =`, not `git =`, got:\n{written}"
+    );
+}
+
+#[test]
+fn run_add_to_target_persists_local_path_source() {
+    let project = tempfile::TempDir::new().expect("temp project dir");
+    let source_dir = tempfile::TempDir::new().expect("temp source dir");
+    let toml_path = project.path().join("phora.toml");
+    std::fs::write(
+        &toml_path,
+        "version = 1\n\n[targets.home]\npath = \"./out\"\nlayout = \"flat\"\nsources = []\n",
+    )
+    .expect("seed phora.toml with an existing target");
+    let source_path = source_dir.path().to_path_buf();
+    let source_arg = source_path.to_str().expect("utf-8 source path");
+
+    with_cwd(project.path(), || {
+        run_add(
+            source_arg,
+            &["home".to_owned()],
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            &config_edit::BindRefinement::default(),
+        )
+        .expect("run_add --to must accept a local path source");
+    });
+
+    let written = std::fs::read_to_string(&toml_path).expect("run_add must rewrite phora.toml");
+    let canonical = std::fs::canonicalize(&source_path).expect("canonicalize source dir");
+    let name = canonical
+        .file_name()
+        .expect("source dir has a basename")
+        .to_string_lossy()
+        .into_owned();
+    let src = source_from(&written, &name);
+    assert!(
+        src.path.is_some() && src.host.is_none() && src.repo.is_none() && src.git.is_none(),
+        "`add --to <local path>` must persist a `path =` source bound to the target, got:\n{written}"
+    );
+}
+
+#[test]
 fn source_rm_command_scrubs_bindings_and_source_def_from_phora_toml() {
     let dir = tempfile::TempDir::new().expect("temp project dir");
     let toml_path = dir.path().join("phora.toml");
