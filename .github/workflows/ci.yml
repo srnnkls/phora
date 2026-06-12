@@ -26,6 +26,9 @@ jobs:
           experimental: true
           install: true
           cache: true
+      # mise caches the toolchain but not its rustup components; add them every
+      # run so a cache hit can't leave clippy/rustfmt missing (idempotent).
+      - run: mise exec -- rustup component add clippy rustfmt
       - run: mise run lint
       - run: mise run test
       - run: mise run test-integration
