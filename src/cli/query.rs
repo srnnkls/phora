@@ -151,9 +151,11 @@ pub struct CheckMatchReport {
 ///
 /// Returns an error if the registry cannot be read.
 pub fn where_cmd(registry: &dyn Registry, filter: &WhereFilter) -> Result<Vec<WhereMatch>> {
+    let records = registry.list_all()?;
+    let ejected = crate::store::ejected_index(registry, &records)?;
     let mut groups: BTreeMap<(String, String), WhereMatch> = BTreeMap::new();
 
-    for record in registry.list_all()? {
+    for record in records {
         if !filter.matches(&record) {
             continue;
         }
@@ -166,7 +168,14 @@ pub fn where_cmd(registry: &dyn Registry, filter: &WhereFilter) -> Result<Vec<Wh
                 digest: record.digest.clone(),
                 targets: Vec::new(),
             });
-        entry.targets.push(record.key.target.clone());
+        let k = &record.key;
+        let target = if ejected.contains(&(k.target.clone(), k.source.clone(), k.artifact.clone()))
+        {
+            format!("{} (ejected)", k.target)
+        } else {
+            k.target.clone()
+        };
+        entry.targets.push(target);
     }
 
     Ok(groups

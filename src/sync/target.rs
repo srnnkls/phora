@@ -233,7 +233,6 @@ pub(super) fn deploy_artifact_entry(
                 ejected_at: chrono::Utc::now().to_rfc3339(),
             });
             registry.save_ejected(run.target_name, &ejected)?;
-            registry.remove(&key)?;
             Ok(false)
         }
         Resolution::Abort => Err(Error::Aborted),

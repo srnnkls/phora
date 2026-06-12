@@ -23,24 +23,25 @@ sync complete
 
 ## Eject — stop managing an artifact
 
-`phora eject` drops an artifact from the registry while leaving its deployed
-files in place. It is addressed by `--source`, `--target`, and the bare artifact
-name.
+`phora eject` stops managing an artifact while leaving its deployed files in
+place. It is addressed by `--source`, `--target`, and the bare artifact name.
 
 ```scrut
 $ phora eject --source dotfiles --target home editor 2>&1 | normalize
 ejected dotfiles/editor from home (files kept)
 ```
 
-The ejected artifact disappears from `phora list` — only `lint` remains managed.
+The record is kept and marked ejected, so `phora list` still reports the
+artifact — now labelled `ejected` rather than dropped.
 
 ```scrut
 $ phora list 2>&1 | normalize
 home:
+  dotfiles/editor  ejected
   dotfiles/lint  ✓ clean
 ```
 
-Its files, however, survive in the target tree.
+Its files survive untouched in the target tree.
 
 ```scrut
 $ test -f "$PWD/target-home/editor/init.lua" && echo kept
@@ -49,20 +50,12 @@ kept
 
 ## Uneject — resume managing an artifact
 
-`phora uneject` clears the ejected mark for the artifact.
+`phora uneject` clears the ejected mark. Because the record was kept, management
+resumes immediately — no re-sync needed.
 
 ```scrut
 $ phora uneject --source dotfiles --target home editor 2>&1 | normalize
 unejected dotfiles/editor in home
-```
-
-The ejected files now sit on disk untracked by the registry, so the next sync
-treats them as foreign content. A forced sync reclaims them, restoring the
-artifact to the registry.
-
-```scrut
-$ phora sync --force 2>&1 | normalize
-sync complete
 ```
 
 `phora list` shows the artifact managed and clean again.

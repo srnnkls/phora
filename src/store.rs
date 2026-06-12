@@ -81,6 +81,26 @@ pub trait Registry {
     fn locks_dir(&self) -> PathBuf;
 }
 
+/// `(target, source, artifact)` keys ejected across every target `records` span — lets readers tell a kept-but-ejected record from a managed one.
+///
+/// # Errors
+///
+/// Returns an error if the registry cannot be read.
+pub fn ejected_index(
+    registry: &dyn Registry,
+    records: &[RegistryRecord],
+) -> Result<std::collections::HashSet<(String, String, String)>> {
+    let targets: std::collections::BTreeSet<&str> =
+        records.iter().map(|r| r.key.target.as_str()).collect();
+    let mut index = std::collections::HashSet::new();
+    for target in targets {
+        for entry in registry.load_ejected(target)? {
+            index.insert((target.to_owned(), entry.source, entry.artifact));
+        }
+    }
+    Ok(index)
+}
+
 pub struct FileRegistry {
     state_root: PathBuf,
 }
