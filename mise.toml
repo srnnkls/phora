@@ -1,5 +1,6 @@
 [tools]
 rust = "latest"
+"github:facebookincubator/scrut" = "0.4.3"   # deliberate one-minor bump over fas's 0.4.2
 
 [tasks.build]
 run = "cargo build"
@@ -16,3 +17,11 @@ run = "cargo fmt"
 
 [tasks.check]
 depends = ["lint", "test"]
+
+[tasks.test-integration]
+description = "Run scrut end-to-end CLI suites"
+run = [
+  "cargo build --release",
+  "test -x target/release/phora || { echo 'phora release binary missing (custom CARGO_TARGET_DIR?)'; exit 1; }",
+  "PATH=\"$PWD/target/release:$PATH\" scrut test tests/scrut/*.md",
+]
