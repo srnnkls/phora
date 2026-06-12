@@ -138,11 +138,13 @@ impl Config {
                 };
                 if !identities.insert(binding.identity()) {
                     return Err(Error::Config(format!(
-                        "target `{target_name}` binds the identity `{}` more than once",
+                        "target `{target_name}` binds the identity `{}` more than once; \
+                         give each binding a distinct `as` to bind two versions of one source",
                         binding.identity()
                     )));
                 }
                 reject_url_slice(binding, source)?;
+                reject_multi_ref(binding)?;
             }
         }
         Ok(())
@@ -187,6 +189,12 @@ fn reject_url_slice(binding: &Binding, source: &Source) -> Result<()> {
         "include"
     } else if refined.exclude.is_some() {
         "exclude"
+    } else if refined.branch.is_some() {
+        "branch"
+    } else if refined.tag.is_some() {
+        "tag"
+    } else if refined.rev.is_some() {
+        "rev"
     } else {
         return Ok(());
     };
@@ -194,6 +202,32 @@ fn reject_url_slice(binding: &Binding, source: &Source) -> Result<()> {
         "source `{}`: `{field}` is meaningless on a `url` source",
         refined.source
     )))
+}
+
+fn reject_multi_ref(binding: &Binding) -> Result<()> {
+    let Binding::Refined(refined) = binding else {
+        return Ok(());
+    };
+    let set: Vec<&str> = [
+        ("branch", refined.branch.is_some()),
+        ("tag", refined.tag.is_some()),
+        ("rev", refined.rev.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(name, present)| present.then_some(name))
+    .collect();
+    if set.len() > 1 {
+        let fields = set
+            .iter()
+            .map(|f| format!("`{f}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(Error::Config(format!(
+            "source `{}`: sets more than one of branch/tag/rev ({fields})",
+            refined.source
+        )));
+    }
+    Ok(())
 }
 
 /// The effective host for `name`: the built-in forge overlaid by a user
