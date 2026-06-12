@@ -2523,6 +2523,7 @@ fn bind_with_refinement_flags_writes_a_table_entry() {
             root: Some("nvim".to_owned()),
             include: Vec::new(),
             exclude: Vec::new(),
+            ..config_edit::BindRefinement::default()
         },
     )
     .expect("bind with refinement flags must succeed")
@@ -4320,5 +4321,62 @@ fn add_with_binds_reject_decider_errors_with_hint_and_no_partial_text() {
     assert!(
         matches!(&err, Error::Config(msg) if msg.contains("staging") && msg.contains("phora target add")),
         "rejecting a missing target must error naming it with the `phora target add` hint"
+    );
+}
+
+#[test]
+fn add_tag_writes_source_level_ref() {
+    let out = config_edit::upsert_source(
+        "version = 1\n",
+        "fzf",
+        &lit("https://github.com/junegunn/fzf.git", None),
+        None,
+        Some("v1.0"),
+        None,
+    )
+    .expect("upsert a source with a source-level tag");
+
+    let cfg = Config::parse(&out).expect("output parses");
+    let source = &cfg.sources["fzf"];
+    assert_eq!(
+        source.tag.as_deref(),
+        Some("v1.0"),
+        "`add --tag` must keep writing the ref at the SOURCE level under [sources.fzf]"
+    );
+}
+
+fn locked_split(name: &str, r#ref: Option<&str>) -> LockedSource {
+    LockedSource {
+        name: name.to_owned(),
+        git: "https://github.com/junegunn/fzf.git".to_owned(),
+        resolved: "deadbeef".to_owned(),
+        commit: "deadbeefcafe".to_owned(),
+        digest: "blake3:artifact".to_owned(),
+        config_digest: "blake3:cfg".to_owned(),
+        r#ref: r#ref.map(str::to_owned),
+    }
+}
+
+#[test]
+fn drop_one_removes_all_ref_splits_of_that_source() {
+    let mut lock = Lock {
+        version: 1,
+        sources: vec![
+            locked_split("fzf", None),
+            locked_split("fzf", Some("tag:v0.56.0")),
+            locked_split("other", None),
+        ],
+    };
+
+    drop_sources(Some(&mut lock), &DropSources::One("fzf".to_owned()));
+
+    assert!(
+        lock.sources.iter().all(|s| s.name != "fzf"),
+        "dropping `fzf` must remove BOTH its default entry and its tag:v0.56.0 split, got {:?}",
+        lock.sources
+    );
+    assert!(
+        lock.sources.iter().any(|s| s.name == "other"),
+        "an unrelated source must survive a targeted drop"
     );
 }

@@ -161,6 +161,12 @@ pub enum Command {
         include: Vec<String>,
         #[arg(long)]
         exclude: Vec<String>,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long)]
+        tag: Option<String>,
+        #[arg(long)]
+        rev: Option<String>,
     },
     /// Remove one or more bindings from a target by their identity.
     Unbind {
@@ -332,6 +338,9 @@ fn dispatch_add(cmd: Command) -> Result<()> {
         root: if to_present { root } else { None },
         include,
         exclude,
+        branch: None,
+        tag: None,
+        rev: None,
     };
     add::run_add(
         &url,
@@ -355,6 +364,9 @@ fn dispatch_bind(cmd: Command) -> Result<()> {
         root,
         include,
         exclude,
+        branch,
+        tag,
+        rev,
     } = cmd
     else {
         unreachable!("dispatch_bind only handles Command::Bind")
@@ -368,6 +380,9 @@ fn dispatch_bind(cmd: Command) -> Result<()> {
             root,
             include,
             exclude,
+            branch,
+            tag,
+            rev,
         },
     )
 }

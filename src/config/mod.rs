@@ -144,6 +144,7 @@ impl Config {
                     )));
                 }
                 reject_url_slice(binding, source)?;
+                reject_link_ref(binding, source)?;
                 reject_multi_ref(binding)?;
             }
         }
@@ -200,6 +201,28 @@ fn reject_url_slice(binding: &Binding, source: &Source) -> Result<()> {
     };
     Err(Error::Config(format!(
         "source `{}`: `{field}` is meaningless on a `url` source",
+        refined.source
+    )))
+}
+
+fn reject_link_ref(binding: &Binding, source: &Source) -> Result<()> {
+    let Binding::Refined(refined) = binding else {
+        return Ok(());
+    };
+    if source.deploy != Some(DeployMode::Link) {
+        return Ok(());
+    }
+    let field = if refined.branch.is_some() {
+        "branch"
+    } else if refined.tag.is_some() {
+        "tag"
+    } else if refined.rev.is_some() {
+        "rev"
+    } else {
+        return Ok(());
+    };
+    Err(Error::Config(format!(
+        "source `{}`: `{field}` is meaningless on a `link` source",
         refined.source
     )))
 }
