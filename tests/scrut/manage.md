@@ -84,21 +84,13 @@ $ add_commit proj && echo committed
 committed
 ```
 
-`phora update` re-resolves the branch and advances the lock to the new commit.
-Because the previously deployed files still sit on disk, it skips overwriting
-them as foreign content (the lock still advances).
+`phora update` re-resolves the branch, advances the lock to the new commit, and
+redeploys the affected artifacts in one step — the previously deployed files are
+phora's own (clean against the old lock), so they are refreshed, not skipped as
+foreign content.
 
 ```scrut
 $ phora update 2>&1 | normalize
-phora: skipping foreign content at <ROOT>/target-home/editor; use --force to overwrite
-phora: skipping foreign content at <ROOT>/target-home/lint; use --force to overwrite
-sync complete
-```
-
-A forced sync redeploys the new content.
-
-```scrut
-$ phora sync --force 2>&1 | normalize
 sync complete
 ```
 
