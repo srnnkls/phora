@@ -1038,6 +1038,41 @@ deploy = "wormhole"
 }
 
 #[test]
+fn binding_ref_on_link_source_is_rejected() {
+    let cfg = Config::parse(
+        "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\ndeploy = \"link\"\n\n\
+         [targets.t]\npath = \"~/x\"\n\
+         sources = [{ source = \"dotfiles\", tag = \"v1\" }]\n",
+    )
+    .expect("a link source with a tag-pinned binding still parses as a DTO");
+
+    let err = cfg
+        .validate()
+        .expect_err("pinning a ref on a deploy=link source must be a config error");
+    match err {
+        Error::Config(msg) => assert!(
+            msg.contains("dotfiles") && msg.contains("link"),
+            "the error must name the source `dotfiles` and indicate the ref is meaningless on a \
+             link source, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn binding_ref_on_copy_source_validates() {
+    let cfg = Config::parse(
+        "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\n\n\
+         [targets.t]\npath = \"~/x\"\n\
+         sources = [{ source = \"dotfiles\", tag = \"v1\" }]\n",
+    )
+    .expect("a copy source with a tag-pinned binding parses");
+
+    cfg.validate()
+        .expect("a ref pin on a (default copy) source is allowed");
+}
+
+#[test]
 fn valid_config_parses_ok() {
     assert!(
         Config::parse(EXAMPLE_TOML).is_ok(),

@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::config::{Config, ParsedSource, Protocol, Target};
+use crate::config::{Config, ParsedSource, Protocol, SourceFields, Target};
 use crate::deploy::check_artifact_state;
 use crate::error::{Error, Result};
 use crate::kernel::Selection;
@@ -266,7 +266,24 @@ pub fn target_detail(config: &Config, registry: &dyn Registry, name: &str) -> Re
         .targets
         .get(name)
         .ok_or_else(|| Error::Config(format!("target `{name}` is not defined")))?;
-    let bound_sources = binding_identities(target);
+    let parsed = config.parsed_sources()?;
+    let bound_sources = target
+        .resolve_sources(&parsed)
+        .into_iter()
+        .map(|binding| {
+            let default_ref = parsed
+                .get(binding.source)
+                .map(SourceFields::intrinsic_refspec);
+            let differs = default_ref.is_none_or(|d| {
+                crate::lock::encode_ref(&binding.effective_ref) != crate::lock::encode_ref(&d)
+            });
+            if differs {
+                format!("{} @ {}", binding.identity, binding.effective_ref)
+            } else {
+                binding.identity.to_owned()
+            }
+        })
+        .collect();
     Ok(TargetDetail {
         name: name.to_owned(),
         path: target.path.to_string_lossy().into_owned(),
@@ -333,4 +350,66 @@ fn target_artifact_statuses(
         });
     }
     Ok(artifacts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::FileRegistry;
+    use tempfile::TempDir;
+
+    fn empty_registry() -> (TempDir, FileRegistry) {
+        let dir = TempDir::new().expect("temp state root");
+        let reg = FileRegistry::open(dir.path().to_path_buf()).expect("open registry");
+        (dir, reg)
+    }
+
+    fn bound(detail: &TargetDetail) -> &str {
+        detail
+            .bound_sources
+            .first()
+            .expect("one bound source")
+            .as_str()
+    }
+
+    #[test]
+    fn target_show_renders_non_default_effective_ref() {
+        let config = Config::parse(
+            "version = 1\n\n[sources.fzf]\ngit = \"g\"\nbranch = \"main\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\
+             sources = [{ source = \"fzf\", as = \"canary\", tag = \"v0.56.0\" }]\n",
+        )
+        .expect("config with a ref-pinned binding parses");
+        let (_dir, reg) = empty_registry();
+
+        let detail = target_detail(&config, &reg, "t").expect("target detail");
+        let entry = bound(&detail);
+        assert!(
+            entry.contains("canary"),
+            "the bound source must carry its identity `canary`, got {entry:?}"
+        );
+        assert!(
+            entry.contains("v0.56.0"),
+            "a binding whose effective ref differs from the source default must surface that ref \
+             (v0.56.0) in `target show`, got {entry:?}"
+        );
+    }
+
+    #[test]
+    fn target_show_omits_redundant_default_ref() {
+        let config = Config::parse(
+            "version = 1\n\n[sources.fzf]\ngit = \"g\"\nbranch = \"main\"\n\n\
+             [targets.t]\npath = \"~/x\"\nsources = [\"fzf\"]\n",
+        )
+        .expect("config with a bare binding parses");
+        let (_dir, reg) = empty_registry();
+
+        let detail = target_detail(&config, &reg, "t").expect("target detail");
+        let entry = bound(&detail);
+        assert!(
+            !entry.contains("main"),
+            "a bare binding whose effective ref equals the source default must show just the \
+             identity, never appending the redundant default ref, got {entry:?}"
+        );
+    }
 }

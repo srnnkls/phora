@@ -231,6 +231,9 @@ pub struct BindRefinement {
     pub root: Option<String>,
     pub include: Vec<String>,
     pub exclude: Vec<String>,
+    pub branch: Option<String>,
+    pub tag: Option<String>,
+    pub rev: Option<String>,
 }
 
 impl BindRefinement {
@@ -239,6 +242,9 @@ impl BindRefinement {
             && self.root.is_none()
             && self.include.is_empty()
             && self.exclude.is_empty()
+            && self.branch.is_none()
+            && self.tag.is_none()
+            && self.rev.is_none()
     }
 }
 
@@ -256,6 +262,15 @@ fn build_binding(source: &str, refinement: &BindRefinement) -> Value {
     table.insert("source", source.into());
     if let Some(r#as) = &refinement.r#as {
         table.insert("as", r#as.as_str().into());
+    }
+    if let Some(branch) = &refinement.branch {
+        table.insert("branch", branch.as_str().into());
+    }
+    if let Some(tag) = &refinement.tag {
+        table.insert("tag", tag.as_str().into());
+    }
+    if let Some(rev) = &refinement.rev {
+        table.insert("rev", rev.as_str().into());
     }
     if let Some(root) = &refinement.root {
         table.insert("root", root.as_str().into());
@@ -411,7 +426,7 @@ pub fn validate_source_references(merged: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, RefinedBinding};
     use crate::error::Error;
 
     fn lit_source(git: &str) -> AddTarget {
@@ -824,6 +839,105 @@ mod tests {
         assert!(result.tombstoned, "removing the only entry tombstones");
         let cfg = Config::parse(&result.text).expect("output parses");
         assert!(cfg.targets["t"].sources.as_ref().unwrap().is_empty());
+    }
+
+    // PTV-006: binding-level ref flags (--branch/--tag/--rev) write a TABLE entry.
+
+    fn refined_binding<'a>(cfg: &'a Config, target: &str) -> &'a RefinedBinding {
+        match cfg.targets[target]
+            .sources
+            .as_ref()
+            .expect("target has a sources list")
+            .first()
+            .expect("at least one binding")
+        {
+            crate::config::Binding::Refined(refined) => refined,
+            other @ crate::config::Binding::Source(_) => {
+                panic!("expected a Refined (table) binding, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn bind_tag_writes_table_binding_with_tag() {
+        let base = "version = 1\n\n[sources.fzf]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/x\"\nsources = []\n";
+        let refinement = BindRefinement {
+            r#as: Some("canary".to_owned()),
+            tag: Some("v0.56.0".to_owned()),
+            ..BindRefinement::default()
+        };
+        let result =
+            bind(base, "t", &names(&["fzf"]), &refinement).expect("a tag-pinned bind succeeds");
+
+        let cfg = Config::parse(&result.text).expect("bind output parses");
+        let refined = refined_binding(&cfg, "t");
+        assert_eq!(refined.r#as.as_deref(), Some("canary"));
+        assert_eq!(refined.source, "fzf");
+        assert_eq!(
+            refined.tag.as_deref(),
+            Some("v0.56.0"),
+            "a `--tag` pin must be written into the binding table's `tag` field"
+        );
+    }
+
+    #[test]
+    fn bind_rev_writes_table_binding_with_rev() {
+        let base = "version = 1\n\n[sources.fzf]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/x\"\nsources = []\n";
+        let refinement = BindRefinement {
+            rev: Some("deadbeef".to_owned()),
+            ..BindRefinement::default()
+        };
+        let result =
+            bind(base, "t", &names(&["fzf"]), &refinement).expect("a rev-pinned bind succeeds");
+
+        let cfg = Config::parse(&result.text).expect("bind output parses");
+        let refined = refined_binding(&cfg, "t");
+        assert_eq!(refined.source, "fzf");
+        assert_eq!(
+            refined.rev.as_deref(),
+            Some("deadbeef"),
+            "a `--rev` pin must be written into the binding table's `rev` field"
+        );
+    }
+
+    #[test]
+    fn bind_ref_only_refinement_is_not_bare_and_writes_table() {
+        let refinement = BindRefinement {
+            branch: Some("develop".to_owned()),
+            ..BindRefinement::default()
+        };
+        assert!(
+            !refinement.is_bare(),
+            "a refinement that pins only a branch must NOT be bare; a ref forces a table entry"
+        );
+
+        let base = "version = 1\n\n[sources.fzf]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/x\"\nsources = []\n";
+        let result = bind(base, "t", &names(&["fzf"]), &refinement)
+            .expect("a branch-only refined bind succeeds");
+
+        let cfg = Config::parse(&result.text).expect("bind output parses");
+        let refined = refined_binding(&cfg, "t");
+        assert_eq!(
+            refined.branch.as_deref(),
+            Some("develop"),
+            "a branch-only refinement must emit a table entry carrying `branch`, not a bare string"
+        );
+    }
+
+    #[test]
+    fn bind_tag_on_url_source_errors() {
+        let base = "version = 1\n\n[sources.fonts]\nurl = \"https://example.com/f.tar.gz\"\n\n\
+             [targets.t]\npath = \"~/x\"\nsources = []\n";
+        let refinement = BindRefinement {
+            tag: Some("v1".to_owned()),
+            ..BindRefinement::default()
+        };
+        let err = bind(base, "t", &names(&["fonts"]), &refinement)
+            .expect_err("pinning a ref on a url source must be rejected at validate");
+        assert!(matches!(err, Error::Config(_)));
     }
 
     #[test]
