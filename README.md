@@ -545,3 +545,14 @@ mise run check     # clippy (pedantic, -D warnings) + rustfmt --check + tests
 mise run test      # cargo test
 mise run fmt       # cargo fmt
 ```
+
+### Testing
+
+```bash
+mise run test-integration   # scrut suites under tests/scrut/ against a release build
+```
+
+The scrut suites drive the shipped binary end to end and double as runnable usage
+docs. [`tests/scrut/showcase.md`](tests/scrut/showcase.md) is a narrated
+walkthrough — adding a git source, projecting it, then layering a machine-local
+symlink overlay — whose assertions CI keeps honest.
