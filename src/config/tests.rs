@@ -3924,4 +3924,205 @@ mod per_binding_refinement {
             ),
         }
     }
+
+    // PTV-002: binding-level ref validation.
+
+    #[test]
+    fn validate_rejects_binding_tag_on_url_backed_source() {
+        let cfg = config(
+            "version = 1\n\n\
+             [sources.pkg]\nurl = \"https://example.com/foo.tar.gz\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\
+             sources = [{ source = \"pkg\", as = \"x\", tag = \"v1\" }]\n",
+        );
+        let err = cfg.validate().expect_err(
+            "a binding that pins a `tag` on a url-backed source must be rejected: a static \
+             url resource has no refspec to override",
+        );
+        match err {
+            Error::Config(msg) => {
+                assert!(
+                    msg.contains("pkg"),
+                    "the binding-ref-on-url error must name the offending source `pkg`, got: {msg}"
+                );
+                assert!(
+                    msg.contains("`tag`"),
+                    "the binding-ref-on-url error must name the SPECIFIC offending ref field \
+                     `tag` (a disjunctive tag||branch||rev assertion lets a wrong-field-named \
+                     mutation survive; the url-slice message style quotes fields in backticks, \
+                     mod.rs:194), got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_binding_branch_on_url_backed_source() {
+        let cfg = config(
+            "version = 1\n\n\
+             [sources.pkg]\nurl = \"https://example.com/foo.tar.gz\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\
+             sources = [{ source = \"pkg\", as = \"x\", branch = \"main\" }]\n",
+        );
+        let err = cfg.validate().expect_err(
+            "a binding that pins a `branch` on a url-backed source must be rejected, exactly as \
+             a `tag` is: a static url resource has no refspec",
+        );
+        match err {
+            Error::Config(msg) => {
+                assert!(
+                    msg.contains("pkg"),
+                    "the binding-ref-on-url error must name the offending source `pkg`, got: {msg}"
+                );
+                assert!(
+                    msg.contains("`branch`"),
+                    "the binding-ref-on-url error must name the SPECIFIC offending ref field \
+                     `branch` (a disjunctive assertion lets a wrong-field-named mutation survive; \
+                     the url-slice message style quotes fields in backticks, mod.rs:194), \
+                     got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_binding_rev_on_url_backed_source() {
+        let cfg = config(
+            "version = 1\n\n\
+             [sources.pkg]\nurl = \"https://example.com/foo.tar.gz\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\
+             sources = [{ source = \"pkg\", as = \"x\", rev = \"deadbeef\" }]\n",
+        );
+        let err = cfg.validate().expect_err(
+            "a binding that pins a `rev` on a url-backed source must be rejected, exactly as a \
+             `tag` or `branch` is: a static url resource has no refspec",
+        );
+        match err {
+            Error::Config(msg) => {
+                assert!(
+                    msg.contains("pkg"),
+                    "the binding-ref-on-url error must name the offending source `pkg`, got: {msg}"
+                );
+                assert!(
+                    msg.contains("`rev`"),
+                    "the binding-ref-on-url error must name the SPECIFIC offending ref field \
+                     `rev` (the requirement is branch/tag/rev — rev must be covered; the url-slice \
+                     message style quotes fields in backticks, mod.rs:194), got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_more_than_one_ref_on_a_binding() {
+        let cfg = config(
+            "version = 1\n\n\
+             [sources.fzf]\ngit = \"https://github.com/junegunn/fzf.git\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\
+             sources = [{ source = \"fzf\", as = \"x\", tag = \"v1\", branch = \"main\" }]\n",
+        );
+        let err = cfg.validate().expect_err(
+            "a binding that sets both `tag` and `branch` must be rejected: only one of \
+             branch/tag/rev may pin a binding, mirroring the source-level rule in classify()",
+        );
+        match err {
+            Error::Config(msg) => {
+                assert!(
+                    msg.contains("fzf"),
+                    "the multi-ref error must name the offending source `fzf` \
+                     (the prior `|| msg.contains('x')` single-char alternative is too weak — \
+                     a stray 'x' anywhere in the message satisfies it), got: {msg}"
+                );
+                assert!(
+                    msg.contains("branch") && msg.contains("tag"),
+                    "the multi-ref error must name the conflicting ref fields (`branch`, `tag`), \
+                     got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_tag_and_rev_on_a_binding() {
+        let cfg = config(
+            "version = 1\n\n\
+             [sources.fzf]\ngit = \"https://github.com/junegunn/fzf.git\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\
+             sources = [{ source = \"fzf\", as = \"x\", tag = \"v1\", rev = \"deadbeef\" }]\n",
+        );
+        let err = cfg.validate().expect_err(
+            "a binding that sets both `tag` and `rev` must be rejected: only one of \
+             branch/tag/rev may pin a binding, so `rev` must participate in the one-ref-max rule",
+        );
+        match err {
+            Error::Config(msg) => {
+                assert!(
+                    msg.contains("fzf"),
+                    "the multi-ref error must name the offending source `fzf`, got: {msg}"
+                );
+                assert!(
+                    msg.contains("`tag`") && msg.contains("`rev`"),
+                    "the multi-ref error must name BOTH conflicting ref fields, backtick-quoted \
+                     (`tag`, `rev`); a disjunctive or single-field assertion lets a mutation that \
+                     drops `rev` from the rule survive, got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_two_refs_of_one_source_without_distinct_as_naming_the_as_fix() {
+        let cfg = config(
+            "version = 1\n\n\
+             [sources.fzf]\ngit = \"https://github.com/junegunn/fzf.git\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\
+             sources = [\
+                { source = \"fzf\", tag = \"v0.55.0\" }, \
+                { source = \"fzf\", tag = \"v0.56.0\" }\
+             ]\n",
+        );
+        let err = cfg.validate().expect_err(
+            "two bindings of `fzf` at different tags WITHOUT `as` collapse to identity `fzf` \
+             and must be rejected as a collision",
+        );
+        match err {
+            Error::Config(msg) => {
+                assert!(
+                    msg.contains("fzf"),
+                    "the collision error must name the colliding identity `fzf`, got: {msg}"
+                );
+                assert!(
+                    msg.contains("`as`"),
+                    "the collision error must be actionable by naming the backtick-quoted `as` \
+                     fix (substring \"as\" also matches \"has\"/\"please\"; a generic \
+                     `more than once` message without the field-named fix hint is insufficient), \
+                     got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_allows_two_refs_of_one_source_with_distinct_as() {
+        let cfg = config(
+            "version = 1\n\n\
+             [sources.fzf]\ngit = \"https://github.com/junegunn/fzf.git\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\
+             sources = [\
+                { source = \"fzf\", as = \"stable\", tag = \"v0.55.0\" }, \
+                { source = \"fzf\", as = \"canary\", tag = \"v0.56.0\" }\
+             ]\n",
+        );
+        cfg.validate().expect(
+            "two bindings of `fzf` at different tags carrying DISTINCT `as` identities \
+             (`stable`, `canary`) are two valid slices into one target and must not be rejected \
+             by PTV-002's new checks",
+        );
+    }
 }
