@@ -108,9 +108,7 @@ value is ignored and the platform default applies. macOS has no native state
 directory, so the state root falls back to `~/Library/Application Support`.
 `XDG_DATA_HOME` and `XDG_CONFIG_HOME` are intentionally unused: phora has no portable
 data payload (the registry is machine-local, mirrors are regenerable) and no global
-config root (config is project-local `phora.toml`). Neither tree is migrated — a
-legacy `~/.phora` is abandoned; mirrors re-clone and the registry rebuilds on the
-next sync.
+config root (config is project-local `phora.toml`).
 
 ## Usage
 
