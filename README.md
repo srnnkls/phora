@@ -195,7 +195,7 @@ When something looks off, the question you have usually maps to one command:
 - Is what's on disk what phora actually deployed? — `phora verify` (non-zero exit on any mismatch)
 - Where did a deployed file come from? — `phora where --source <source>` (by source / artifact / commit / digest)
 - Registry wrong after hand-editing `~/.phora`? — `phora rebuild-registry` (rebuilds it from the lock + on-disk targets)
-- `sync` rejects a binding? — two bindings sharing an identity in one target, a `root`/`include`/`exclude` on a `url` source, or a binding naming an undefined source are config errors; give each slice a distinct `as` and check the [Bindings](#bindings) rules.
+- `sync` rejects a binding? — two bindings sharing an identity in one target, a `root`/`include`/`exclude` (or a `branch`/`tag`/`rev`) on a `url` source, a `branch`/`tag`/`rev` on a `deploy = "link"` source, more than one ref on a binding, or a binding naming an undefined source are config errors; give each slice a distinct `as` and check the [Bindings](#bindings) rules.
 
 The [guide](GUIDE.md) goes deeper on each.
 
@@ -274,7 +274,10 @@ An entry is one of two forms:
   same field for this target; any field omitted inherits from the source.
 
 Restriction. `root`/`include`/`exclude` on a binding backed by a `url` source
-are config errors — a url source has no git tree to re-root.
+are config errors — a url source has no git tree to re-root. `branch`/`tag`/`rev`
+on a binding backed by a `url` source or a `deploy = "link"` source are config
+errors too — a url has no ref to resolve, and a link source live-links a working
+tree rather than a pinned commit.
 
 ```toml
 [targets.neovim]
@@ -298,15 +301,44 @@ sources = [
 layout = "by-source"     # labels each slice by its identity: nvim/… and helix/…
 ```
 
+Per-target version (`branch`/`tag`/`rev`). A binding may also set its own ref —
+exactly as it overrides `root`/`include`/`exclude`. The source's ref is the default;
+a binding's ref overrides it for that target alone; a bare binding inherits the
+source's ref. As on a source, set at most one ref per binding (precedence within a
+binding is `rev` > `tag` > `branch`).
+
+Each distinct ref gets its own lock entry, at its own resolved commit. Bindings that
+don't override the ref collapse to the source's ref and share one lock entry, so a
+config that names no binding refs locks byte-for-byte as before; a ref-overriding
+binding records its own entry. Resolution still does one fetch per source — that
+single fetch covers every ref the source's bindings name.
+
+To bind one source at two versions, give each binding a distinct `as` — identity must
+be unique within a target, the same rule as two slices:
+
+```toml
+[targets.tools]
+path = "~/.local/tools"
+sources = [
+  { source = "fzf", as = "stable", tag = "v0.55.0" },
+  { source = "fzf", as = "canary", tag = "v0.56.0" },
+]
+layout = "by-source"     # stable/… and canary/… resolve to different commits
+```
+
 CLI. `phora bind <source>… --to <target>` adds bindings; `--as`, `--root`,
-`--include <glob>…`, and `--exclude <glob>…` refine them. Any refinement flag writes
-a table binding; with no flags it writes a bare string. Because `--as` sets a single
-binding identity, it cannot apply to multiple sources. `phora unbind <identity>…
---from <target>` removes bindings by their identity. `phora add <url> --to <target>`
-accepts the same refinement flags, scoping the binding rather than the source; here
-`--as` requires exactly one `--to` target (it errors with multiple `--to`, or with no
-`--to` at all). Local/symlink overlays (`--local`/`--symlink`) accept neither `--to`
-nor refinement flags.
+`--include <glob>…`, `--exclude <glob>…`, and `--branch`/`--tag`/`--rev` refine them.
+Any refinement flag writes a table binding; with no flags it writes a bare string.
+`--branch`/`--tag`/`--rev` write a table binding pinning that ref for the target.
+Because `--as` sets a single binding identity, it cannot apply to multiple sources.
+`phora unbind <identity>… --from <target>` removes bindings by their identity. `phora
+add <url> --to <target>` accepts the same *selection* refinement flags
+(`--as`/`--root`/`--include`/`--exclude`), scoping the binding rather than the source;
+here `--as` requires exactly one `--to` target (it errors with multiple `--to`, or with
+no `--to` at all). The ref flags are not among them: `phora add`'s `--branch`/`--tag`
+stay source-level — a source is added at a version — so per-target ref overrides are a
+`bind` concern only (`bind --branch/--tag/--rev`). Local/symlink overlays
+(`--local`/`--symlink`) accept neither `--to` nor refinement flags.
 
 ### Source kinds
 
