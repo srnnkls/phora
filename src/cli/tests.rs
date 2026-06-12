@@ -1362,6 +1362,7 @@ fn lock_with(name: &str, git: &str, resolved: &str) -> Lock {
             commit: "c0ffeec0ffee".to_owned(),
             digest: "blake3:artifact".to_owned(),
             config_digest: "blake3:cfg".to_owned(),
+            r#ref: None,
         }],
     }
 }

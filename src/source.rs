@@ -44,10 +44,7 @@ pub use crate::backend::RouterBackend;
 
 /// gix clones origin as refs/remotes/origin/*; a mirror must update refs/heads/* and
 /// refs/tags/* directly so tags (and tag-only-reachable commits) resolve after one fetch.
-const MIRROR_REFSPECS: &[&str] = &[
-    "+refs/heads/*:refs/heads/*",
-    "+refs/tags/*:refs/tags/*",
-];
+const MIRROR_REFSPECS: &[&str] = &["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -213,7 +210,10 @@ impl SourceBackend for GitBackend {
                 .find_remote("origin")
                 .map_err(|e| SourceError::Source(format!("find origin in {source}: {e}")))?;
             remote
-                .replace_refspecs(MIRROR_REFSPECS.iter().copied(), gix::remote::Direction::Fetch)
+                .replace_refspecs(
+                    MIRROR_REFSPECS.iter().copied(),
+                    gix::remote::Direction::Fetch,
+                )
                 .map_err(|e| SourceError::Source(format!("set mirror refspec in {source}: {e}")))?;
             remote
                 .connect(gix::remote::Direction::Fetch)

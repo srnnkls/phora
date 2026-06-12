@@ -3919,9 +3919,7 @@ mod per_binding_refinement {
                     "two bindings of one source must carry DISTINCT effective_refs"
                 );
             }
-            other => panic!(
-                "both bindings must resolve to their own Refspec::Tag, got {other:?}"
-            ),
+            other => panic!("both bindings must resolve to their own Refspec::Tag, got {other:?}"),
         }
     }
 

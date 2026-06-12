@@ -5,6 +5,7 @@ use crate::config::{DeployMode, LayoutKind, ParsedSource, Target};
 use crate::deploy::{ArtifactState, Journal, check_artifact_state, deploy_artifact, link_artifact};
 use crate::error::{Error, Result};
 use crate::kernel::{ArtifactName, Selection, SourceName};
+use crate::lock::encode_ref;
 use crate::source::{ExportRequest, SourceBackend};
 use crate::store::{ArtifactKey, EjectedEntry, Registry, RegistryRecord};
 
@@ -19,7 +20,7 @@ pub(super) struct TargetRun<'a> {
     pub(super) parsed: &'a BTreeMap<String, ParsedSource>,
     pub(super) target_name: &'a str,
     pub(super) target: &'a Target,
-    pub(super) commits: &'a BTreeMap<String, String>,
+    pub(super) commits: &'a BTreeMap<(String, String), String>,
     pub(super) remotes: &'a BTreeMap<String, String>,
     pub(super) force: bool,
     pub(super) interactive: bool,
@@ -45,7 +46,16 @@ pub(super) fn deploy_target(
                 binding.source
             ))
         })?;
-        let commit = &run.commits[binding.source];
+        let commit_key = (
+            binding.source.to_owned(),
+            encode_ref(&binding.effective_ref),
+        );
+        let commit = run.commits.get(&commit_key).ok_or_else(|| {
+            Error::Sync(format!(
+                "no resolved commit for {} at {}",
+                binding.source, binding.effective_ref
+            ))
+        })?;
         let git = remote_for(run.remotes, binding.source)?;
         let source_name = SourceName::trusted(binding.source);
         let selection = Selection::new(binding.include, binding.exclude)?;

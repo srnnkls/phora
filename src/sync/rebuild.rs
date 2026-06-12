@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use crate::config::{Config, DeployMode, LayoutKind, Target};
 use crate::error::{Error, Result};
 use crate::kernel::{ArtifactName, Selection, SourceName};
-use crate::lock::Lock;
+use crate::lock::{Lock, ref_discriminator};
 use crate::source::{ExportRequest, SourceBackend};
 use crate::store::{ArtifactKey, ManifestFile, Registry, RegistryRecord};
 
@@ -45,12 +45,15 @@ pub fn rebuild_registry(
                     binding.source
                 ))
             })?;
-            let locked = lock.find_source(binding.source).ok_or_else(|| {
-                Error::Sync(format!(
-                    "no locked commit for source {}; run sync first",
-                    binding.source
-                ))
-            })?;
+            let discriminator = ref_discriminator(&binding.effective_ref, &source.refspec());
+            let locked = lock
+                .find_entry(binding.source, discriminator.as_deref())
+                .ok_or_else(|| {
+                    Error::Sync(format!(
+                        "no locked commit for source {} at its ref; run sync first",
+                        binding.source
+                    ))
+                })?;
             let commit = &locked.commit;
             let git = remote_for(&remotes, binding.source)?;
             let source_name = SourceName::trusted(binding.source);
