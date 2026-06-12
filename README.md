@@ -124,6 +124,10 @@ phora update myconfigs      # one source
 phora list                  # per-target deployment status
 phora verify                # re-hash deployed files, exit non-zero on mismatch
 phora where --source loqui  # reverse-lookup registry (by source/artifact/commit/digest)
+phora preview               # dry-run: the full tree a sync would project (offline, from the lock)
+phora preview --target home # one target;  --source <s> limits to one source
+phora preview --files       # expand each artifact to its files
+phora preview --json        # machine-readable plan
 
 # Stop managing an artifact but keep its files on disk
 phora eject <artifact> --source <source> --target <target>
@@ -175,6 +179,26 @@ named target(s) and never touches `[targets.default]`.
 
 `bind` onto a target with no `sources` key creates the list with the bound
 source(s); the target deploys exactly its listed sources (nothing until bound).
+
+### Preview
+
+`phora preview` is the dry-run projection view: per target, it shows each binding's
+identity (`source`, or `source@as` for a refined binding), the artifacts it selects,
+and the destinations they'd land at under the target's layout — without writing
+anything. Commits come from the lock and the tree from the mirror, with no network.
+An unsynced source is annotated (`not locked`, `needs sync`, or `link working tree
+gone`) rather than fetched, and the command still exits 0. Predicted flat-layout
+collisions render as warnings. Where `check-match` is a single-path probe, preview
+is the whole-tree view.
+
+```
+home
+  dotfiles@a1b2c3d4 editor -> /home/me/deploy/editor
+  dotfiles@a1b2c3d4 lint -> /home/me/deploy/lint
+```
+
+`--files` expands each artifact to the files it would deploy; `--json` emits the
+same plan as a machine-readable document.
 
 ### Conflicts
 
