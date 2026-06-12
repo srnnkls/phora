@@ -115,9 +115,10 @@ home:
 
 ## State label — ejected
 
-`phora eject` permanently stops managing an artifact while keeping its files on
-disk. The deployed files survive, but the artifact is dropped from the registry,
-so it no longer appears in `phora list`.
+`phora eject` stops managing an artifact while keeping its files on disk. The
+record is retained and marked ejected, so `phora list` reports it as `ejected`
+(this overrides the earlier `modified` tamper — an ejected artifact is no longer
+checked against the lock).
 
 ```scrut
 $ phora eject --source dotfiles --target home editor 2>&1 | normalize
@@ -127,7 +128,17 @@ ejected dotfiles/editor from home (files kept)
 ```scrut
 $ phora list 2>&1 | normalize
 home:
+  dotfiles/editor  ejected
   dotfiles/lint  ✓ clean
+```
+
+`phora where` keeps reporting the artifact too, annotating the target it was
+ejected from.
+
+```scrut
+$ phora where --artifact editor 2>&1 | normalize
+Artifact: dotfiles/editor (commit ca94c83b, digest blake3:2316b2c05d3f72e93270833746381341b70a008daf5af59a2ddb2a8c83206bc0)
+  - home (ejected)
 ```
 
 The ejected artifact's files remain in the target tree.

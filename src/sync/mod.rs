@@ -329,7 +329,8 @@ pub fn eject(
         });
         registry.save_ejected(target, &ejected)?;
     }
-    Ok(registry.remove(&key)?)
+    // Record kept (not removed): list/where render `ejected` from it, and uneject restores by clearing the entry alone.
+    Ok(())
 }
 
 pub fn uneject(

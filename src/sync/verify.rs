@@ -21,8 +21,14 @@ pub struct VerifyMismatch {
 
 pub fn verify(config: &Config, registry: &dyn Registry) -> Result<Vec<VerifyMismatch>> {
     let mut mismatches = Vec::new();
-    for record in registry.list_all()? {
+    let records = registry.list_all()?;
+    let ejected = crate::store::ejected_index(registry, &records)?;
+    for record in records {
         if record.linked {
+            continue;
+        }
+        let k = &record.key;
+        if ejected.contains(&(k.target.clone(), k.source.clone(), k.artifact.clone())) {
             continue;
         }
         let Some(target) = config.targets.get(&record.key.target) else {

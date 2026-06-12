@@ -2290,7 +2290,7 @@ fn build_nested_artifact_repo() -> (TempDir, String) {
 }
 
 #[test]
-fn interactive_eject_persists_entry_removes_record_keeps_files() {
+fn interactive_eject_persists_entry_keeps_record_and_files() {
     let (src, url) = build_nested_artifact_repo();
     let git_dir = TempDir::new().expect("git dir");
     let state_dir = TempDir::new().expect("state dir");
@@ -2333,8 +2333,8 @@ fn interactive_eject_persists_entry_removes_record_keeps_files() {
         registry
             .get(&artifact_key("dest", "editor-src", "editor"))
             .expect("registry get must not error")
-            .is_none(),
-        "Eject must remove the artifact's registry record (stop managing it)"
+            .is_some(),
+        "Eject must keep the artifact's registry record so list/where render it as ejected"
     );
     assert_eq!(
         std::fs::read(dst.join("init.lua")).expect("read kept init.lua"),
@@ -2739,7 +2739,7 @@ fn eject_target_config(td: &TargetDir, fx: &SyncFixture) -> Config {
 }
 
 #[test]
-fn eject_adds_ejected_entry_removes_record_and_keeps_files() {
+fn eject_adds_ejected_entry_keeps_record_and_files() {
     let fx = build_sync_fixture();
     let td = TargetDir::new();
     let cfg = eject_target_config(&td, &fx);
@@ -2751,9 +2751,10 @@ fn eject_adds_ejected_entry_removes_record_and_keeps_files() {
         "init.lua",
         b"-- init\n",
     );
+    let key = artifact_key("dest", "editor-src", "editor");
     assert!(
         fx.registry
-            .get(&artifact_key("dest", "editor-src", "editor"))
+            .get(&key)
             .expect("registry get must not error")
             .is_some(),
         "premise: the artifact must be MANAGED (record present) before eject"
@@ -2771,10 +2772,24 @@ fn eject_adds_ejected_entry_removes_record_and_keeps_files() {
     );
     assert!(
         fx.registry
-            .get(&artifact_key("dest", "editor-src", "editor"))
+            .get(&key)
             .expect("registry get must not error")
-            .is_none(),
-        "eject must REMOVE the registry record so the artifact is no longer managed"
+            .is_some(),
+        "eject must KEEP the registry record so list/where can render it as ejected"
+    );
+    let state = crate::deploy::check_artifact_state(
+        &dst,
+        "editor-src",
+        "any-commit",
+        &ejected,
+        "editor",
+        &fx.registry,
+        &key,
+    )
+    .expect("check_artifact_state");
+    assert!(
+        matches!(state, crate::deploy::ArtifactState::Ejected),
+        "a kept record plus its ejected entry must read as Ejected, got {state:?}"
     );
     assert_eq!(
         std::fs::read(dst.join("init.lua")).expect("deployed file still present"),
@@ -2920,6 +2935,39 @@ fn verify_reports_no_mismatch_when_content_matches_recorded_hash() {
             .any(|m| m.key == artifact_key("dest", "editor-src", "editor")),
         "an artifact whose deployed file contents hash to the recorded blake3 must produce \
              NO mismatch, got {mismatches:?}"
+    );
+}
+
+#[test]
+fn verify_skips_ejected_artifacts() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = verify_config(&td, &fx);
+    let dst = seed_verifiable_artifact(
+        &td,
+        &fx.registry,
+        "editor-src",
+        "editor",
+        &[("init.lua", b"-- init\n")],
+    );
+    std::fs::write(dst.join("init.lua"), b"locally edited after eject").expect("tamper file");
+    fx.registry
+        .save_ejected(
+            "dest",
+            &[crate::store::EjectedEntry {
+                source: "editor-src".to_owned(),
+                artifact: "editor".to_owned(),
+                ejected_at: "2026-01-01T00:00:00Z".to_owned(),
+            }],
+        )
+        .expect("mark the artifact ejected");
+
+    let mismatches = verify(&cfg, &fx.registry).expect("verify must not error");
+
+    assert!(
+        mismatches.is_empty(),
+        "verify must SKIP an ejected artifact: its files are the user's now, so a divergence \
+         from the kept record is not a mismatch, got {mismatches:?}"
     );
 }
 

@@ -335,6 +335,35 @@ fn where_with_no_match_is_empty() {
     );
 }
 
+#[test]
+fn where_marks_ejected_targets() {
+    let (_dir, reg) = seeded_registry();
+    reg.save_ejected(
+        "nvim",
+        &[crate::store::EjectedEntry {
+            source: "dotfiles".to_owned(),
+            artifact: "init".to_owned(),
+            ejected_at: "2026-01-01T00:00:00Z".to_owned(),
+        }],
+    )
+    .expect("eject nvim/dotfiles/init");
+
+    let filter = WhereFilter {
+        source: Some("dotfiles".to_owned()),
+        artifact: Some("init".to_owned()),
+        ..WhereFilter::default()
+    };
+    let matches = where_cmd(&reg, &filter).expect("where dotfiles/init");
+
+    assert_eq!(matches.len(), 1, "one (source, artifact) group expected");
+    assert_eq!(
+        matches[0].targets,
+        vec!["nvim (ejected)".to_owned()],
+        "where must annotate the target an artifact was ejected from, got {:?}",
+        matches[0].targets
+    );
+}
+
 // check_match_cmd
 
 #[test]
