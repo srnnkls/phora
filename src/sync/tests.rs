@@ -7390,6 +7390,51 @@ fn on_change_hooks_run_in_declaration_order_and_dedupe() {
     );
 }
 
+/// Two hooks sharing one `run` but differing in `shell` are distinct: both
+/// survive dedup (key is `(run, shell)`) and the hook id embeds the shell, so
+/// each records its own last-success slot instead of colliding (INV-4).
+#[test]
+fn same_run_different_shell_are_distinct_hooks() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let log = td.parent_path.join("hook.log");
+    let run = append_cmd(&log, "fired").replace('"', "\\\"");
+    let on_change = format!(
+        "[{{ run = \"{run}\", shell = \"sh -c\" }}, {{ run = \"{run}\", shell = \"bash -c\" }}]"
+    );
+    let cfg = config_with_target_hooks(&fx.url, &td.target_path(), &on_change);
+
+    sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("sync runs both same-run/different-shell hooks");
+
+    assert_eq!(
+        log_lines(&log).len(),
+        2,
+        "two hooks with the same run but different shell must BOTH run — they are not \
+         duplicates; got {:?}",
+        log_lines(&log)
+    );
+    let mut ids: Vec<String> = fx
+        .registry
+        .load_hook_state("dest")
+        .expect("load hook state")
+        .into_iter()
+        .map(|h| h.hook_id)
+        .collect();
+    ids.sort();
+    assert_eq!(
+        ids.len(),
+        2,
+        "each shell variant records under a DISTINCT hook id (shell is part of the id, \
+         matching the dedup key) — no id collision; got {ids:?}"
+    );
+    assert_ne!(ids[0], ids[1], "the two recorded hook ids must differ");
+}
+
 /// The hook process environment carries `PHORA_TARGET` (the target name),
 /// `PHORA_CHANGED` (the deployed file paths of changed artifacts), and
 /// `PHORA_CHANGED_NAMES` (their registry-key names), so a hook can react.
@@ -7443,7 +7488,7 @@ fn hook_environment_exposes_phora_target_and_changed() {
 
     let names = read(&names_log);
     assert!(
-        names.split(' ').any(|n| n == "editor"),
+        names.lines().any(|n| n == "editor"),
         "PHORA_CHANGED_NAMES must name the changed artifact member(s) — the `editor` \
          artifact whose digest moved must appear, got {names:?}"
     );

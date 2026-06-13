@@ -57,7 +57,11 @@ pub(super) fn dispatch_hooks(config: &Config, registry: &dyn Registry) -> Result
         let target_path = target.expanded_path();
 
         for hook in dedupe(on_change) {
-            let id = format!("{target_name}#{}", hook.run);
+            let id = format!(
+                "{target_name}#{}#{}",
+                hook.run,
+                hook.shell.as_deref().unwrap_or(DEFAULT_SHELL_PREFIX)
+            );
             let recorded = recorded_set(registry, target_name, &id)?;
             let added = added_records(&records, &recorded);
             if added.is_empty() {
@@ -93,7 +97,11 @@ pub(super) fn dispatch_hooks(config: &Config, registry: &dyn Registry) -> Result
         for hook in dedupe(post_sync) {
             let status = run_hook(hook, &[])?;
             outcomes.push(HookOutcome {
-                hook_id: format!("#{}", hook.run),
+                hook_id: format!(
+                    "post_sync#{}#{}",
+                    hook.run,
+                    hook.shell.as_deref().unwrap_or(DEFAULT_SHELL_PREFIX)
+                ),
                 command: hook.run.clone(),
                 scope: HookScope::PostSync,
                 status,
@@ -135,7 +143,7 @@ fn added_records<'a>(
 
 fn changed_names(added: &[&RegistryRecord]) -> String {
     let names: BTreeSet<&str> = added.iter().map(|r| r.key.artifact.as_str()).collect();
-    names.into_iter().collect::<Vec<_>>().join(" ")
+    names.into_iter().collect::<Vec<_>>().join("\n")
 }
 
 fn changed_paths(
