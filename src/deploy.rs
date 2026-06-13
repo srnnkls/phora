@@ -74,8 +74,8 @@ pub fn check_artifact_state(
         return Ok(ArtifactState::Foreign);
     }
     let commit_advanced = record.commit != expected_commit;
-    let vars_changed = record.vars_digest.is_some()
-        && record.vars_digest.as_deref() != expected_vars_digest;
+    let vars_changed =
+        record.vars_digest.is_some() && record.vars_digest.as_deref() != expected_vars_digest;
 
     let mut changed: BTreeSet<PathBuf> = BTreeSet::new();
 

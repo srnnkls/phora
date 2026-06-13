@@ -242,6 +242,58 @@ sync complete
 tree that happens to carry a hook-shaped `phora.toml` is inert content — it is
 never read as config and never executes.
 
+### Templating
+
+Files can be rendered per-machine with [minijinja](https://docs.rs/minijinja)
+before they deploy. A source file named `*.tmpl` is rendered and lands with the
+suffix stripped (`motd.tmpl` → `motd`); every other file copies byte-for-byte.
+Variables come from a flat `[vars]` table:
+
+```toml
+[vars]
+greeting = "hello"
+editor = "nvim"
+```
+
+```jinja
+{# editor/motd.tmpl → deploys as editor/motd #}
+{{ greeting }} from {{ editor }}
+```
+
+The `.tmpl` suffix is the opt-in by default; a refined binding can widen it to
+arbitrary globs or turn it off:
+
+```toml
+# render these paths too, in addition to *.tmpl:
+sources = [{ source = "dotfiles", template = ["*.conf", "config/*"] }]
+# render nothing, even .tmpl files:
+sources = [{ source = "dotfiles", template = false }]
+```
+
+Rendering is strict: referencing an undefined variable aborts that artifact's
+export — its sibling artifacts still deploy. `phora.local.toml` overrides vars
+per key — keys it omits keep their base value — so each machine fills in its own:
+
+```toml
+# phora.local.toml — overlays phora.toml, never committed
+[vars]
+greeting = "hi from this laptop"
+```
+
+**Integrity.** Phora hashes the *rendered* bytes, so `phora verify` checks the
+deployed output, not the template. The lock records *source* bytes only: two
+machines with different vars produce byte-identical locks, keeping the integrity
+check machine-independent. Editing a variable marks the affected artifacts
+outdated, and the next `phora sync` re-renders and redeploys them — no new commit
+needed. `phora preview --files` shows the deployed name and flags what renders:
+
+```
+home
+  dotfiles@a1b2c3d4 editor -> /home/me/.config/editor
+    motd (templated)
+    static.txt
+```
+
 ## Configuration
 
 Phora reads `phora.toml` from the working directory, optionally overlaid by

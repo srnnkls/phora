@@ -6681,7 +6681,7 @@ fn preview_plan_with_files_enriches_synced_entries_with_their_file_lists() {
     .expect("a --files plan builds");
 
     let editor = entry_of(plan_target_of(&plan, "home"), "editor-src", "editor");
-    let mut editor_files = editor.files.clone();
+    let mut editor_files: Vec<PathBuf> = editor.files.iter().map(|f| f.path.clone()).collect();
     editor_files.sort();
     assert_eq!(
         editor_files,
@@ -6692,7 +6692,7 @@ fn preview_plan_with_files_enriches_synced_entries_with_their_file_lists() {
     );
 
     let lint = entry_of(plan_target_of(&plan, "home"), "lint-src", "lint");
-    let mut lint_files = lint.files.clone();
+    let mut lint_files: Vec<PathBuf> = lint.files.iter().map(|f| f.path.clone()).collect();
     lint_files.sort();
     assert_eq!(
         lint_files,
@@ -7009,6 +7009,238 @@ fn render_preview_json_is_valid_json_with_targets_entries_and_collisions() {
     );
 }
 
+// ── preview templating annotation (M004): --files shows deployed name + flag ──
+
+#[expect(
+    clippy::unwrap_used,
+    reason = "fixture setup fails loudly; git CLI is assumed present"
+)]
+fn build_templated_artifact_repo() -> (TempDir, String) {
+    let src = TempDir::new().unwrap();
+    let p = src.path();
+    run_git(p, &["init", "-b", "main", "."]);
+    run_git(p, &["config", "user.email", "test@example.com"]);
+    run_git(p, &["config", "user.name", "Test"]);
+    std::fs::create_dir_all(p.join("editor")).unwrap();
+    std::fs::write(p.join("editor/motd.tmpl"), b"hello {{ greeting }}!\n").unwrap();
+    std::fs::write(p.join("editor/static.txt"), b"plain content\n").unwrap();
+    run_git(p, &["add", "-A"]);
+    run_git(p, &["commit", "-m", "init"]);
+    let url = p.to_string_lossy().into_owned();
+    (src, url)
+}
+
+fn file_named<'a>(entry: &'a PreviewEntry, name: &str) -> &'a crate::sync::PreviewFile {
+    entry
+        .files
+        .iter()
+        .find(|f| f.path == Path::new(name))
+        .unwrap_or_else(|| {
+            panic!(
+                "entry for `{}` must carry a file with deployed path `{name}`, got {:?}",
+                entry.artifact, entry.files
+            )
+        })
+}
+
+#[test]
+fn preview_files_strips_tmpl_suffix_and_marks_templated_in_copy_mode() {
+    let (src, url) = build_templated_artifact_repo();
+    let git_dir = TempDir::new().expect("git dir");
+    let backend = GitBackend::new(git_dir.path().to_path_buf());
+    backend.fetch(&sn("dotfiles"), &url).expect("seed mirror");
+    let commit = backend
+        .resolve(&sn("dotfiles"), &url, &Refspec::Branch("main".into()))
+        .expect("resolve HEAD from the seeded mirror");
+
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+             [sources.dotfiles]\ngit = \"{url}\"\nbranch = \"main\"\ninclude = [\"editor\"]\n\n\
+             [targets.dest]\npath = \"{}\"\nsources = [\"dotfiles\"]\nlayout = \"flat\"\n",
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("templated copy config parses");
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+    let lock = lock_with(&cfg, "dotfiles", &url, &commit);
+
+    let plans = preview_targets(&cfg, &parsed, &remotes, &backend, Some(&lock), true)
+        .expect("a --files preview over a templated source builds");
+    let entry = preview_entry(only_plan(&plans, "dest"), "editor");
+
+    let motd = file_named(entry, "motd");
+    assert!(
+        motd.templated,
+        "a default-opt-in `.tmpl` file must be marked templated=true, got {:?}",
+        entry.files
+    );
+    assert!(
+        !entry.files.iter().any(|f| f.path == Path::new("motd.tmpl")),
+        "preview must show the DEPLOYED name `motd`, never the source `motd.tmpl`, got {:?}",
+        entry.files
+    );
+
+    let static_txt = file_named(entry, "static.txt");
+    assert!(
+        !static_txt.templated,
+        "a plain sibling must be templated=false and keep its name, got {:?}",
+        entry.files
+    );
+
+    drop(src);
+}
+
+#[test]
+fn preview_files_in_link_mode_never_marks_templated() {
+    let (src, url) = build_templated_artifact_repo();
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+             [sources.dotfiles]\ngit = \"{url}\"\nbranch = \"main\"\ndeploy = \"link\"\ninclude = [\"editor\"]\n\n\
+             [targets.dest]\npath = \"{}\"\nsources = [\"dotfiles\"]\nlayout = \"flat\"\n",
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("link-mode templated config parses");
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+
+    let git_dir = TempDir::new().expect("git dir");
+    let backend = GitBackend::new(git_dir.path().to_path_buf());
+    let plans = preview_targets(&cfg, &parsed, &remotes, &backend, None, true)
+        .expect("a link binding reads the working tree without lock or mirror");
+    let entry = preview_entry(only_plan(&plans, "dest"), "editor");
+
+    let motd = file_named(entry, "motd.tmpl");
+    assert!(
+        !motd.templated,
+        "link mode never renders, so a `.tmpl`-named file must stay templated=false, got {:?}",
+        entry.files
+    );
+    assert!(
+        !entry.files.iter().any(|f| f.path == Path::new("motd")),
+        "link mode must NOT strip the `.tmpl` suffix; the source name `motd.tmpl` deploys as-is, got {:?}",
+        entry.files
+    );
+
+    drop(src);
+}
+
+#[test]
+fn render_preview_tree_annotates_templated_files_only() {
+    let (src, url) = build_templated_artifact_repo();
+    let git_dir = TempDir::new().expect("git dir");
+    let backend = GitBackend::new(git_dir.path().to_path_buf());
+    backend.fetch(&sn("dotfiles"), &url).expect("seed mirror");
+    let commit = backend
+        .resolve(&sn("dotfiles"), &url, &Refspec::Branch("main".into()))
+        .expect("resolve HEAD");
+
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+             [sources.dotfiles]\ngit = \"{url}\"\nbranch = \"main\"\ninclude = [\"editor\"]\n\n\
+             [targets.dest]\npath = \"{}\"\nsources = [\"dotfiles\"]\nlayout = \"flat\"\n",
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("templated config parses");
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+    let lock = lock_with(&cfg, "dotfiles", &url, &commit);
+    let sel = PreviewSelectors {
+        source: None,
+        target: None,
+        files: true,
+    };
+    let plan = preview_plan(&cfg, &parsed, &remotes, &backend, Some(&lock), &sel)
+        .expect("a --files plan builds");
+
+    let out = render_preview_tree(&plan);
+
+    assert!(
+        out.contains("motd (templated)"),
+        "the tree must annotate the templated file as `motd (templated)`, got:\n{out}"
+    );
+    assert!(
+        !out.contains("motd.tmpl"),
+        "the tree must not leak the source name `motd.tmpl`, got:\n{out}"
+    );
+    let static_line = out
+        .lines()
+        .find(|l| l.contains("static.txt"))
+        .unwrap_or_else(|| panic!("the tree must list static.txt, got:\n{out}"));
+    assert!(
+        !static_line.contains("(templated)"),
+        "a plain file must render with NO `(templated)` annotation, got line `{static_line}`"
+    );
+
+    drop(src);
+}
+
+#[test]
+fn render_preview_json_carries_deployed_name_and_templated_flag() {
+    let (src, url) = build_templated_artifact_repo();
+    let git_dir = TempDir::new().expect("git dir");
+    let backend = GitBackend::new(git_dir.path().to_path_buf());
+    backend.fetch(&sn("dotfiles"), &url).expect("seed mirror");
+    let commit = backend
+        .resolve(&sn("dotfiles"), &url, &Refspec::Branch("main".into()))
+        .expect("resolve HEAD");
+
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+             [sources.dotfiles]\ngit = \"{url}\"\nbranch = \"main\"\ninclude = [\"editor\"]\n\n\
+             [targets.dest]\npath = \"{}\"\nsources = [\"dotfiles\"]\nlayout = \"flat\"\n",
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("templated config parses");
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+    let lock = lock_with(&cfg, "dotfiles", &url, &commit);
+    let sel = PreviewSelectors {
+        source: None,
+        target: None,
+        files: true,
+    };
+    let plan = preview_plan(&cfg, &parsed, &remotes, &backend, Some(&lock), &sel)
+        .expect("a --files plan builds");
+
+    let json = render_preview_json(&plan).expect("preview JSON must serialize");
+    let value: serde_json::Value =
+        serde_json::from_str(&json).expect("preview JSON must parse back into a Value");
+
+    let files = value
+        .pointer("/targets/0/entries/0/files")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("JSON must carry a per-entry `files` array, got:\n{json}"));
+
+    let find = |name: &str| {
+        files
+            .iter()
+            .find(|f| f.get("path").and_then(serde_json::Value::as_str) == Some(name))
+            .unwrap_or_else(|| panic!("files must include `{name}` by deployed path, got:\n{json}"))
+    };
+
+    let motd = find("motd");
+    assert_eq!(
+        motd.get("templated").and_then(serde_json::Value::as_bool),
+        Some(true),
+        "the templated file must serialize `\"templated\": true`, got {motd:?}"
+    );
+
+    let static_txt = find("static.txt");
+    assert_eq!(
+        static_txt
+            .get("templated")
+            .and_then(serde_json::Value::as_bool),
+        Some(false),
+        "the plain file must serialize `\"templated\": false`, got {static_txt:?}"
+    );
+
+    drop(src);
+}
+
 // ── binding-selection parity: plan/preview must discover the binding's effective
 //    include/exclude (matching deploy_target), not the source-level selection ──
 
@@ -7169,7 +7401,11 @@ fn preview_target_reflects_binding_effective_selection() {
         "by-source layout must place editor at <dest>/slim/editor"
     );
     assert_eq!(
-        editor.files,
+        editor
+            .files
+            .iter()
+            .map(|f| f.path.clone())
+            .collect::<Vec<_>>(),
         vec![PathBuf::from("init.lua")],
         "files=true must honor the binding's exclude=[\"**/*.bak\"]: `notes.bak` is dropped, \
          got {:?}",

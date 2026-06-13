@@ -4668,7 +4668,10 @@ fn preview_selectors_are_long_flags_not_positionals() {
     );
 }
 
-#[expect(clippy::unwrap_used, reason = "fixture git setup fails loudly in tests")]
+#[expect(
+    clippy::unwrap_used,
+    reason = "fixture git setup fails loudly in tests"
+)]
 fn git_init_with_template(dir: &std::path::Path, body: &[u8]) -> String {
     let run = |args: &[&str]| {
         let status = std::process::Command::new("git")

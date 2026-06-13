@@ -22,6 +22,16 @@ pub enum SyncState {
     LinkWorkingTreeGone,
 }
 
+/// One previewed file under an artifact: its deployed name and whether it renders.
+///
+/// `path` is the deployed name (a templated source has its `.tmpl` suffix stripped);
+/// `templated` is true only for copy-mode files that render. Link files never render.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PreviewFile {
+    pub path: PathBuf,
+    pub templated: bool,
+}
+
 /// A previewed artifact or a per-binding annotation; consumers must branch on `state`.
 ///
 /// A `Synced` entry carries a real `artifact` and `destination`; the unsynced states
@@ -35,8 +45,8 @@ pub struct PreviewEntry {
     pub commit: String,
     pub destination: PathBuf,
     pub state: SyncState,
-    /// Artifact-relative file paths (empty until `--files` enrichment).
-    pub files: Vec<PathBuf>,
+    /// Deployed file names (empty until `--files` enrichment).
+    pub files: Vec<PreviewFile>,
 }
 
 /// A predicted flat-layout clash: two or more identities whose artifacts share one name.
@@ -194,20 +204,30 @@ fn preview_copy(
     Ok(())
 }
 
-fn copy_files(ctx: &BindingCtx, artifact: &str, commit: &str) -> Result<Vec<PathBuf>> {
+fn copy_files(ctx: &BindingCtx, artifact: &str, commit: &str) -> Result<Vec<PreviewFile>> {
     let git = remote_for(ctx.remotes, ctx.binding.source)?;
     let selection = Selection::new(ctx.binding.include, ctx.binding.exclude)?;
-    Ok(ctx.backend.list_artifact_files(
+    let rels = ctx.backend.list_artifact_files(
         ctx.name,
         git,
         commit,
         ctx.binding.root,
         &ArtifactName::trusted(artifact),
         &selection,
-    )?)
+    )?;
+    Ok(rels
+        .into_iter()
+        .map(|rel| {
+            let normalized = rel.to_string_lossy().replace('\\', "/");
+            PreviewFile {
+                path: PathBuf::from(ctx.binding.template_opt_in.deployed_name(&normalized)),
+                templated: ctx.binding.template_opt_in.renders(&normalized),
+            }
+        })
+        .collect())
 }
 
-fn link_files(ctx: &BindingCtx, artifact: &str) -> Result<Vec<PathBuf>> {
+fn link_files(ctx: &BindingCtx, artifact: &str) -> Result<Vec<PreviewFile>> {
     let git = remote_for(ctx.remotes, ctx.binding.source)?;
     let selection = Selection::new(ctx.binding.include, ctx.binding.exclude)?;
     let base = ctx
@@ -218,7 +238,13 @@ fn link_files(ctx: &BindingCtx, artifact: &str) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     collect_working_tree_files(&base, Path::new(""), &selection, &mut files)?;
     files.sort();
-    Ok(files)
+    Ok(files
+        .into_iter()
+        .map(|path| PreviewFile {
+            path,
+            templated: false,
+        })
+        .collect())
 }
 
 fn collect_working_tree_files(
