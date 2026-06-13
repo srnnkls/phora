@@ -5,12 +5,32 @@ use std::fmt::Write;
 use crate::config::ParsedSource;
 use crate::deploy::ArtifactState;
 use crate::error::{Error, Result};
-use crate::sync::SyncState;
+use crate::sync::{HookOutcome, HookScope, HookStatus, SyncState};
 
 use super::query::{
     CheckMatchReport, PreviewPlan, SourceResolution, SourceRow, SourceSummary, TargetDetail,
     TargetListing, TargetRow, WhereMatch,
 };
+
+pub(crate) fn render_hook_report(outcomes: &[HookOutcome]) -> String {
+    let mut out = String::new();
+    for outcome in outcomes {
+        let scope = match outcome.scope {
+            HookScope::OnChange => "on_change",
+            HookScope::PostSync => "post_sync",
+        };
+        let status = match outcome.status {
+            HookStatus::Success => "ok",
+            HookStatus::Failure => "FAILED",
+        };
+        let _ = writeln!(
+            out,
+            "hook {} [{scope}] `{}` {status}",
+            outcome.hook_id, outcome.command
+        );
+    }
+    out
+}
 
 pub(super) fn print_listings(listings: &[TargetListing]) {
     for listing in listings {
