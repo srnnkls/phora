@@ -637,7 +637,7 @@ fn remove_orphaned_staging(target_parent: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{FileRegistry, ManifestFile, StoreError};
+    use crate::store::{FileRegistry, HookState, ManifestFile, StoreError};
 
     type StoreResult<T> = std::result::Result<T, StoreError>;
     use std::os::unix::fs::symlink;
@@ -1485,6 +1485,17 @@ mod tests {
         fn save_ejected(&self, target: &str, ejected: &[EjectedEntry]) -> StoreResult<()> {
             self.inner.save_ejected(target, ejected)
         }
+        fn load_hook_state(&self, target: &str) -> StoreResult<Vec<HookState>> {
+            self.inner.load_hook_state(target)
+        }
+        fn record_hook_success(
+            &self,
+            target: &str,
+            hook_id: &str,
+            digest_set: &BTreeSet<String>,
+        ) -> StoreResult<()> {
+            self.inner.record_hook_success(target, hook_id, digest_set)
+        }
         fn locks_dir(&self) -> PathBuf {
             self.inner.locks_dir()
         }
@@ -1551,6 +1562,17 @@ mod tests {
         }
         fn save_ejected(&self, target: &str, ejected: &[EjectedEntry]) -> StoreResult<()> {
             self.inner.save_ejected(target, ejected)
+        }
+        fn load_hook_state(&self, target: &str) -> StoreResult<Vec<HookState>> {
+            self.inner.load_hook_state(target)
+        }
+        fn record_hook_success(
+            &self,
+            target: &str,
+            hook_id: &str,
+            digest_set: &BTreeSet<String>,
+        ) -> StoreResult<()> {
+            self.inner.record_hook_success(target, hook_id, digest_set)
         }
         fn locks_dir(&self) -> PathBuf {
             self.inner.locks_dir()
