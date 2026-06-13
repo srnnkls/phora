@@ -22,6 +22,7 @@ pub use migrate::MigrationWarning;
 pub use source::{DeployMode, ParsedSource, Refspec, Remote, Source, SourceMode};
 pub use target::{
     Binding, LayoutConfig, LayoutKind, RefinedBinding, ResolvedBinding, SourceFields, Target,
+    TemplateOptIn,
 };
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -54,6 +55,8 @@ pub struct Config {
     pub defaults: Defaults,
     #[serde(default)]
     pub hooks: Option<GlobalHooks>,
+    #[serde(default)]
+    pub vars: BTreeMap<String, String>,
 }
 
 impl Config {
@@ -338,5 +341,6 @@ pub fn merge_configs(base: Config, local: Option<Config>) -> Config {
     if local.hooks.is_some() {
         merged.hooks = local.hooks;
     }
+    merged.vars.extend(local.vars);
     merged
 }
