@@ -13,6 +13,7 @@ mod verify;
 #[cfg(test)]
 mod tests;
 
+pub use hooks::{HookOutcome, HookScope, HookStatus};
 pub use plan::{PlanEntry, TargetPlan, plan_target, plan_targets};
 pub use preview::{PreviewCollision, PreviewEntry, PreviewTargetPlan, SyncState, preview_targets};
 pub use rebuild::{RebuildReport, rebuild_registry};
@@ -45,6 +46,10 @@ use crate::store::{ArtifactKey, EjectedEntry, Registry};
 
 /// Borrowed inputs to [`sync`]: the configs and locks plus run flags. Bundled so
 /// the orchestration entry point stays stable as later phases add fields.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent CLI run flags, not a state machine"
+)]
 pub struct SyncInput<'a> {
     pub base_config: &'a Config,
     pub local_config: Option<&'a Config>,
@@ -53,6 +58,7 @@ pub struct SyncInput<'a> {
     pub force: bool,
     pub interactive: bool,
     pub prune: bool,
+    pub no_hooks: bool,
     pub resolver: Option<&'a dyn ConflictResolver>,
 }
 
@@ -92,6 +98,7 @@ pub struct SyncOutput {
     pub base_lock: Lock,
     pub local_lock: Option<Lock>,
     pub had_failures: bool,
+    pub hook_results: Vec<hooks::HookOutcome>,
 }
 
 /// A relative target path yields an empty (`""`) or absent parent; both normalize
@@ -224,12 +231,20 @@ pub fn sync(
         }
     }
 
-    had_failures |= hooks::dispatch_hooks(&effective_config, registry)?;
+    let hook_results = if input.no_hooks {
+        Vec::new()
+    } else {
+        hooks::dispatch_hooks(&effective_config, registry)?
+    };
+    had_failures |= hook_results
+        .iter()
+        .any(|o| o.status == hooks::HookStatus::Failure);
 
     Ok(SyncOutput {
         base_lock,
         local_lock,
         had_failures,
+        hook_results,
     })
 }
 
