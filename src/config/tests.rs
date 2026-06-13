@@ -3178,17 +3178,19 @@ mod per_binding_refinement {
         let bindings = bindings_of(&t);
         assert_eq!(bindings.len(), 1, "exactly one binding in the list");
         match &bindings[0] {
-            Binding::Refined(RefinedBinding {
-                source,
-                r#as,
-                root,
-                include,
-                exclude,
-                branch,
-                tag,
-                rev,
-                template: _,
-            }) => {
+            Binding::Refined(refined) => {
+                let RefinedBinding {
+                    source,
+                    r#as,
+                    root,
+                    include,
+                    exclude,
+                    branch,
+                    tag,
+                    rev,
+                    template: _,
+                    map: _,
+                } = refined.as_ref();
                 assert_eq!(
                     source, "dotfiles",
                     "the `source` key carries the referenced source name"
@@ -3888,7 +3890,7 @@ mod per_binding_refinement {
             path: std::path::PathBuf::from("~/x"),
             layout: None,
             hooks: None,
-            sources: Some(vec![Binding::Refined(RefinedBinding {
+            sources: Some(vec![Binding::Refined(Box::new(RefinedBinding {
                 source: "fzf".to_owned(),
                 r#as: Some("pinned".to_owned()),
                 root: None,
@@ -3898,7 +3900,8 @@ mod per_binding_refinement {
                 tag: Some("v9.9.9".to_owned()),
                 rev: Some("deadbeef".to_owned()),
                 template: None,
-            })]),
+                map: None,
+            }))]),
         };
 
         let resolved = t.resolve_sources(&all);
@@ -3927,7 +3930,7 @@ mod per_binding_refinement {
             path: std::path::PathBuf::from("~/x"),
             layout: None,
             hooks: None,
-            sources: Some(vec![Binding::Refined(RefinedBinding {
+            sources: Some(vec![Binding::Refined(Box::new(RefinedBinding {
                 source: "fzf".to_owned(),
                 r#as: Some("pinned".to_owned()),
                 root: None,
@@ -3937,7 +3940,8 @@ mod per_binding_refinement {
                 tag: Some("v9.9.9".to_owned()),
                 rev: None,
                 template: None,
-            })]),
+                map: None,
+            }))]),
         };
 
         let resolved = t.resolve_sources(&all);
@@ -5558,4 +5562,298 @@ sources = [{ source = "dotfiles", template = ["*.conf"] }]
         globs.renders("a/b.conf"),
         "template globs use the same default separator semantics as include/exclude (`*.conf` spans separators)"
     );
+}
+
+fn map_config_err(map_body: &str) -> Error {
+    let toml = format!(
+        r#"
+version = 1
+
+[sources.dotfiles]
+git = "https://github.com/me/dotfiles.git"
+
+[targets.t]
+path = "~/x"
+sources = [{{ source = "dotfiles", {map_body} }}]
+"#
+    );
+    let cfg = Config::parse(&toml).expect("a structurally valid `map` binding must parse");
+    cfg.validate()
+        .expect_err("a binding with an invalid `map` must be rejected at validation")
+}
+
+#[test]
+fn binding_map_parses_and_is_visible_on_refined_and_resolved() {
+    let cfg = Config::parse(
+        r#"
+version = 1
+
+[sources.dotfiles]
+git = "https://github.com/me/dotfiles.git"
+
+[targets.t]
+path = "~/x"
+sources = [{ source = "dotfiles", map = { "AGENTS.md" = "CLAUDE.md", "nested/AGENTS.md" = "codex.md" } }]
+"#,
+    )
+    .expect("a valid `map` binding must parse and pass load-time validation");
+
+    let map = refined(&cfg, "t")
+        .map
+        .as_ref()
+        .expect("the refined binding carries the `map`");
+    assert_eq!(
+        map.get("AGENTS.md").map(String::as_str),
+        Some("CLAUDE.md"),
+        "the map selector->dest entry must round-trip on RefinedBinding"
+    );
+    assert_eq!(
+        map.get("nested/AGENTS.md").map(String::as_str),
+        Some("codex.md"),
+        "a key containing `/` (a nested source file) is allowed and must round-trip"
+    );
+
+    let resolved = target_of(&cfg, "t").resolve_sources(&cfg.sources);
+    let binding = resolved
+        .iter()
+        .find(|b| b.source == "dotfiles")
+        .expect("the dotfiles binding resolves");
+    let resolved_map = binding
+        .map
+        .as_ref()
+        .expect("the resolved binding carries the `map`");
+    assert_eq!(
+        resolved_map.get("AGENTS.md").map(String::as_str),
+        Some("CLAUDE.md"),
+        "`map` must be threaded onto ResolvedBinding at the resolve_binding site"
+    );
+    assert_eq!(
+        resolved_map.get("nested/AGENTS.md").map(String::as_str),
+        Some("codex.md"),
+        "the resolved map must carry every entry, slashed keys included"
+    );
+}
+
+#[test]
+fn binding_map_with_include_is_rejected() {
+    let err = map_config_err(r#"map = { "AGENTS.md" = "CLAUDE.md" }, include = ["x"]"#);
+    match err {
+        Error::Config(msg) => assert!(
+            msg.contains("dotfiles") && msg.contains("map") && msg.contains("include"),
+            "map+include rejection must name the source and both fields, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn binding_map_with_exclude_is_rejected() {
+    let err = map_config_err(r#"map = { "AGENTS.md" = "CLAUDE.md" }, exclude = ["x"]"#);
+    match err {
+        Error::Config(msg) => assert!(
+            msg.contains("dotfiles") && msg.contains("map") && msg.contains("exclude"),
+            "map+exclude rejection must name the source and both fields, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn binding_map_value_with_slash_is_rejected() {
+    let err = map_config_err(r#"map = { "AGENTS.md" = "sub/CLAUDE.md" }"#);
+    match err {
+        Error::Config(msg) => assert!(
+            msg.contains("dotfiles") && msg.contains("sub/CLAUDE.md"),
+            "a nested map dest must be rejected and the message name the offending value, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn binding_map_value_with_backslash_is_rejected() {
+    let err = map_config_err(r#"map = { "AGENTS.md" = "sub\\CLAUDE.md" }"#);
+    match err {
+        Error::Config(msg) => assert!(
+            msg.contains("dotfiles") && msg.contains(r"sub\CLAUDE.md"),
+            "a map dest with a backslash must be rejected and the message name the offending value, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn binding_map_value_dotdot_is_rejected() {
+    let err = map_config_err(r#"map = { "AGENTS.md" = ".." }"#);
+    match err {
+        Error::Config(msg) => assert!(
+            msg.contains("dotfiles") && msg.contains(".."),
+            "a `..` map dest must be rejected and the message name the offending value, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn binding_map_value_dot_is_rejected() {
+    let err = map_config_err(r#"map = { "AGENTS.md" = "." }"#);
+    match err {
+        Error::Config(msg) => assert!(
+            msg.contains("dotfiles") && (msg.contains("map") || msg.contains("AGENTS.md")),
+            "a `.` map dest must be rejected and the message name the source and the map dest rule, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn binding_map_value_absolute_is_rejected() {
+    let err = map_config_err(r#"map = { "AGENTS.md" = "/etc/passwd" }"#);
+    match err {
+        Error::Config(msg) => assert!(
+            msg.contains("dotfiles") && msg.contains("/etc/passwd"),
+            "an absolute map dest must be rejected and the message name the offending value, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn binding_map_key_absolute_is_rejected() {
+    let err = map_config_err(r#"map = { "/etc/passwd" = "CLAUDE.md" }"#);
+    match err {
+        Error::Config(msg) => assert!(
+            msg.contains("dotfiles") && msg.contains("/etc/passwd"),
+            "an absolute map key must be rejected and named, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn binding_map_key_dotdot_escape_is_rejected() {
+    let err = map_config_err(r#"map = { "../outside.md" = "CLAUDE.md" }"#);
+    match err {
+        Error::Config(msg) => assert!(
+            msg.contains("dotfiles") && msg.contains(".."),
+            "a `..` map key escaping the root must be rejected and named, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn binding_map_key_embedded_dotdot_escape_is_rejected() {
+    let err = map_config_err(r#"map = { "a/../b" = "CLAUDE.md" }"#);
+    match err {
+        Error::Config(msg) => assert!(
+            msg.contains("dotfiles") && msg.contains(".."),
+            "a `..` in any key component (not just leading) escaping the root must be rejected and named, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn binding_map_on_url_source_is_rejected() {
+    let cfg = Config::parse(
+        r#"
+version = 1
+
+[sources.pkg]
+url = "https://example.com/foo.tar.gz"
+
+[targets.t]
+path = "~/x"
+sources = [{ source = "pkg", map = { "AGENTS.md" = "CLAUDE.md" } }]
+"#,
+    )
+    .expect("a structurally valid `map` binding on a url source must parse");
+    let err = cfg.validate().expect_err(
+        "a `map` on a url-backed source must be rejected: url sources carry no tree to alias",
+    );
+    match err {
+        Error::Config(msg) => assert!(
+            msg.contains("pkg") && msg.contains("map"),
+            "the url-slice error must name the source `pkg` and the rejected `map`, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn binding_map_key_with_slash_is_accepted() {
+    let cfg = Config::parse(
+        r#"
+version = 1
+
+[sources.dotfiles]
+git = "https://github.com/me/dotfiles.git"
+
+[targets.t]
+path = "~/x"
+sources = [{ source = "dotfiles", map = { "a/b/AGENTS.md" = "CLAUDE.md" } }]
+"#,
+    )
+    .expect("a map key containing `/` (a nested source file) must be accepted");
+    let map = refined(&cfg, "t")
+        .map
+        .as_ref()
+        .expect("the refined binding carries the `map`");
+    assert_eq!(
+        map.get("a/b/AGENTS.md").map(String::as_str),
+        Some("CLAUDE.md"),
+        "a slashed key naming a nested source file must round-trip"
+    );
+
+    let resolved = target_of(&cfg, "t").resolve_sources(&cfg.sources);
+    let binding = resolved
+        .iter()
+        .find(|b| b.source == "dotfiles")
+        .expect("the dotfiles binding resolves");
+    let resolved_map = binding
+        .map
+        .as_ref()
+        .expect("the resolved binding carries the `map`");
+    assert_eq!(
+        resolved_map.get("a/b/AGENTS.md").map(String::as_str),
+        Some("CLAUDE.md"),
+        "a slashed key must survive onto ResolvedBinding at the resolve_binding site"
+    );
+}
+
+#[test]
+fn binding_empty_map_is_rejected() {
+    let err = map_config_err(r"map = {}");
+    match err {
+        Error::Config(msg) => assert!(
+            msg.contains("dotfiles") && msg.contains("map"),
+            "an empty `map` table is ambiguous and must be rejected, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn binding_map_empty_key_is_rejected() {
+    let err = map_config_err(r#"map = { "" = "CLAUDE.md" }"#);
+    match err {
+        Error::Config(msg) => assert!(
+            msg.contains("dotfiles") && msg.contains("map"),
+            "an empty map key must be rejected and the message name the source and the map rule, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn binding_map_empty_value_is_rejected() {
+    let err = map_config_err(r#"map = { "AGENTS.md" = "" }"#);
+    match err {
+        Error::Config(msg) => assert!(
+            msg.contains("dotfiles") && (msg.contains("AGENTS.md") || msg.contains("map")),
+            "an empty map dest must be rejected and the message name the source and the offending key/rule, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
 }
