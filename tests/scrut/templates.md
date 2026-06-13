@@ -198,3 +198,30 @@ $ phora list 2>&1 | normalize
 home:
   dotfiles/editor  ✓ clean
 ```
+
+## preview --files shows the deployed name and annotates templated files (M004)
+
+`phora preview --files` lists the RENDERED deployed name of a templated file
+(`motd`, suffix stripped) annotated `(templated)`, while a plain sibling keeps its
+name with no annotation. The source name `motd.tmpl` never appears.
+
+```scrut
+$ cd "$ROOT" && mkdir -p s6 && cd s6 && isolate_state && seed_config_with_vars "$(make_templated_source proj)" && phora sync 2>&1 | normalize
+sync complete
+```
+
+```scrut
+$ phora preview --files 2>&1 | normalize | grep -E 'motd|static'
+    motd (templated)
+    static.txt
+```
+
+The `--json` form carries the deployed path and a per-file `templated` flag.
+
+```scrut
+$ phora preview --files --json 2>&1 | grep -E '"path"|"templated"' | sed -e 's/^ *//' | grep -E 'motd|true|false|static'
+"path": "motd",
+"templated": true
+"path": "static.txt",
+"templated": false
+```

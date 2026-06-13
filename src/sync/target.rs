@@ -268,9 +268,11 @@ fn expected_vars_digest(
         entry.artifact_name,
         entry.selection,
     )?;
-    let templated = files
-        .iter()
-        .any(|p| entry.template_opt_in.renders(&p.to_string_lossy().replace('\\', "/")));
+    let templated = files.iter().any(|p| {
+        entry
+            .template_opt_in
+            .renders(&p.to_string_lossy().replace('\\', "/"))
+    });
     Ok(templated.then(|| crate::source::vars_digest(vars)))
 }
 

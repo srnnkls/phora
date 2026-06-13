@@ -781,7 +781,12 @@ impl<'a> Renderer<'a> {
 pub fn vars_digest(vars: &BTreeMap<String, String>) -> String {
     let mut hasher = blake3::Hasher::new();
     for (key, value) in vars {
-        hash_framed_entry(&mut hasher, key.as_bytes(), b"\x00var\x00", value.as_bytes());
+        hash_framed_entry(
+            &mut hasher,
+            key.as_bytes(),
+            b"\x00var\x00",
+            value.as_bytes(),
+        );
     }
     format!("blake3:{}", hasher.finalize().to_hex())
 }

@@ -229,7 +229,8 @@ fn render_synced_entry(out: &mut String, entry: &crate::sync::PreviewEntry) {
         entry.destination.display()
     );
     for file in &entry.files {
-        let _ = writeln!(out, "    {}", file.display());
+        let suffix = if file.templated { " (templated)" } else { "" };
+        let _ = writeln!(out, "    {}{suffix}", file.path.display());
     }
 }
 

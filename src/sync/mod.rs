@@ -15,7 +15,9 @@ mod tests;
 
 pub use hooks::{HookOutcome, HookScope, HookStatus};
 pub use plan::{PlanEntry, TargetPlan, plan_target, plan_targets};
-pub use preview::{PreviewCollision, PreviewEntry, PreviewTargetPlan, SyncState, preview_targets};
+pub use preview::{
+    PreviewCollision, PreviewEntry, PreviewFile, PreviewTargetPlan, SyncState, preview_targets,
+};
 pub use rebuild::{RebuildReport, rebuild_registry};
 pub use verify::{VerifyMismatch, VerifyReason, verify};
 
