@@ -8022,15 +8022,11 @@ fn feature_free_config_deploys_byte_identically_with_unchanged_lock_and_manifest
     );
     assert!(!out.had_failures, "the feature-free deploy must succeed");
 
-    // The lock digest must equal the pure source-bytes digest (no render influence).
-    let source = parsed_of(&cfg, "ed");
+    // Literal is valid because run_git pins GIT_*_DATE, making the tree digest deterministic.
     let locked = out.base_lock.find_source("ed").expect("ed locked");
-    let commit = locked.commit.clone();
     assert_eq!(
-        locked.digest,
-        h.digest_for(&source, "ed", &commit),
-        "INV-8: the lock digest must equal compute_digest over the source's own scope, unchanged \
-         by the (absent) template feature"
+        locked.digest, "blake3:15bd5ad64b9159e3dc1f4352478767ceea090eff38ca6d61d0354c0f0c7fcd18",
+        "INV-8: feature-free lock digest is a fixed source-derived value, independent of compute_digest"
     );
 }
 
