@@ -436,6 +436,7 @@ fn target_artifact_statuses(
             &rec.key.artifact,
             registry,
             &rec.key,
+            rec.vars_digest.as_deref(),
         )?;
         artifacts.push(ArtifactStatus {
             source: rec.key.source,

@@ -30,6 +30,10 @@ pub struct ScanResult {
     pub symlinks: Vec<PathBuf>,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "drift inputs are independent scalars; bundling them into a struct would only relocate the arity"
+)]
 pub fn check_artifact_state(
     target_path: &Path,
     expected_source: &str,
@@ -38,6 +42,7 @@ pub fn check_artifact_state(
     artifact_name: &str,
     registry: &dyn Registry,
     key: &ArtifactKey,
+    expected_vars_digest: Option<&str>,
 ) -> Result<ArtifactState> {
     let is_ejected = ejected
         .iter()
@@ -69,6 +74,8 @@ pub fn check_artifact_state(
         return Ok(ArtifactState::Foreign);
     }
     let commit_advanced = record.commit != expected_commit;
+    let vars_changed = record.vars_digest.is_some()
+        && record.vars_digest.as_deref() != expected_vars_digest;
 
     let mut changed: BTreeSet<PathBuf> = BTreeSet::new();
 
@@ -112,7 +119,7 @@ pub fn check_artifact_state(
         Ok(ArtifactState::Modified {
             changed: changed.into_iter().collect(),
         })
-    } else if commit_advanced {
+    } else if commit_advanced || vars_changed {
         Ok(ArtifactState::Outdated)
     } else {
         Ok(ArtifactState::Clean)
@@ -827,6 +834,7 @@ mod tests {
             preserve_executable: true,
             files: manifest,
             linked: false,
+            vars_digest: None,
         }
     }
 
@@ -839,7 +847,7 @@ mod tests {
     }
 
     fn state(target: &Path, ejected: &[EjectedEntry], reg: &FileRegistry) -> ArtifactState {
-        check_artifact_state(target, SOURCE, COMMIT, ejected, ARTIFACT, reg, &key())
+        check_artifact_state(target, SOURCE, COMMIT, ejected, ARTIFACT, reg, &key(), None)
             .expect("check_artifact_state")
     }
 
@@ -931,6 +939,7 @@ mod tests {
             ARTIFACT,
             &reg,
             &record.key,
+            None,
         )
         .expect("check_artifact_state");
 
@@ -956,6 +965,7 @@ mod tests {
             ARTIFACT,
             &reg,
             &record.key,
+            None,
         )
         .expect("check_artifact_state");
 
@@ -982,6 +992,7 @@ mod tests {
             ARTIFACT,
             &reg,
             &record.key,
+            None,
         )
         .expect("check_artifact_state");
 
@@ -1008,6 +1019,7 @@ mod tests {
             preserve_executable: true,
             files: vec![],
             linked: true,
+            vars_digest: None,
         }
     }
 
@@ -1026,7 +1038,7 @@ mod tests {
 
         reg.put(&linked_record()).expect("put linked record");
 
-        let st = check_artifact_state(&dst, SOURCE, COMMIT, &[], ARTIFACT, &reg, &key())
+        let st = check_artifact_state(&dst, SOURCE, COMMIT, &[], ARTIFACT, &reg, &key(), None)
             .expect("check_artifact_state on a linked symlink");
 
         assert!(
@@ -1295,6 +1307,7 @@ mod tests {
             preserve_executable: true,
             files: manifest,
             linked: false,
+            vars_digest: None,
         }
     }
 
@@ -1869,6 +1882,102 @@ mod tests {
             !has_phora_stage_leftover(parent.path()),
             "the startup recovery sweep must remove orphaned .phora-stage* dirs, found {:?}",
             read_dir_names(parent.path())
+        );
+    }
+
+    // ── per-artifact vars digest (TPH-010) ─────────────────────────
+
+    /// A clean deployment whose record carries `vars_digest`; on-disk files match
+    /// the record so only the vars-digest comparison can move the state.
+    fn deploy_and_record_with_vars(
+        target: &Path,
+        files: &[(&str, &[u8])],
+        vars_digest: Option<&str>,
+    ) -> RegistryRecord {
+        let mut record = deploy_and_record(target, files, false);
+        record.vars_digest = vars_digest.map(str::to_owned);
+        record
+    }
+
+    #[test]
+    fn outdated_when_vars_digest_differs_and_files_clean() {
+        let (_state_dir, reg) = registry();
+        let target = TempDir::new().expect("target dir");
+        let record =
+            deploy_and_record_with_vars(target.path(), &[("a.json", b"{}")], Some("blake3:old"));
+        reg.put(&record).expect("put record");
+
+        let st = check_artifact_state(
+            target.path(),
+            SOURCE,
+            COMMIT,
+            &[],
+            ARTIFACT,
+            &reg,
+            &record.key,
+            Some("blake3:new"),
+        )
+        .expect("check_artifact_state");
+
+        assert!(
+            matches!(st, ArtifactState::Outdated),
+            "same source, same commit, on-disk files clean, but the templating vars changed since \
+             deploy (record vars_digest blake3:old != expected blake3:new) => Outdated so the \
+             artifact re-renders and redeploys without --force, got {st:?}"
+        );
+    }
+
+    #[test]
+    fn clean_when_vars_digest_matches_and_nothing_else_changed() {
+        let (_state_dir, reg) = registry();
+        let target = TempDir::new().expect("target dir");
+        let record =
+            deploy_and_record_with_vars(target.path(), &[("a.json", b"{}")], Some("blake3:same"));
+        reg.put(&record).expect("put record");
+
+        let st = check_artifact_state(
+            target.path(),
+            SOURCE,
+            COMMIT,
+            &[],
+            ARTIFACT,
+            &reg,
+            &record.key,
+            Some("blake3:same"),
+        )
+        .expect("check_artifact_state");
+
+        assert!(
+            matches!(st, ArtifactState::Clean),
+            "record vars_digest equals the expected current vars_digest and nothing else drifted \
+             => Clean, no needless re-render, got {st:?}"
+        );
+    }
+
+    #[test]
+    fn clean_when_feature_free_record_has_no_vars_digest() {
+        let (_state_dir, reg) = registry();
+        let target = TempDir::new().expect("target dir");
+        let record = deploy_and_record_with_vars(target.path(), &[("a.json", b"{}")], None);
+        reg.put(&record).expect("put record");
+
+        let st = check_artifact_state(
+            target.path(),
+            SOURCE,
+            COMMIT,
+            &[],
+            ARTIFACT,
+            &reg,
+            &record.key,
+            Some("blake3:current-vars"),
+        )
+        .expect("check_artifact_state");
+
+        assert!(
+            matches!(st, ArtifactState::Clean),
+            "a feature-free artifact (rendered no template, so vars_digest is None) must be \
+             unaffected by a vars change: it stays Clean even when an expected vars_digest is \
+             supplied (INV-8), got {st:?}"
         );
     }
 }

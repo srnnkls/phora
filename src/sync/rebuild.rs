@@ -6,7 +6,7 @@ use crate::error::{Error, Result};
 use crate::kernel::{ArtifactName, Selection, SourceName};
 use crate::lock::{Lock, ref_discriminator};
 use crate::source::{ExportRequest, SourceBackend};
-use crate::store::{ArtifactKey, ManifestFile, Registry, RegistryRecord};
+use crate::store::{ArtifactKey, ManifestFile, ProjectedRecord, Registry, RegistryRecord};
 
 use super::discover::discover_artifacts_for_source;
 use super::{StagingGuard, nonce, remote_for, resolved_remotes};
@@ -207,19 +207,17 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         });
     }
 
-    let record = RegistryRecord {
-        version: 1,
+    let record = RegistryRecord::projected(ProjectedRecord {
         key: key.clone(),
-        source: underlying_source.to_owned(),
-        commit: commit.to_owned(),
+        underlying_source,
+        commit,
         digest: export.digest,
-        projected_at: chrono::Utc::now().to_rfc3339(),
         layout: format!("{layout_kind:?}").to_lowercase(),
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
         files,
-        linked: false,
-    };
+        vars_digest: export.vars_digest,
+    });
     registry.put(&record)?;
     report.reconstructed.push(key.clone());
     if modified {
@@ -250,6 +248,7 @@ fn rebuild_linked(
         preserve_executable: policy.preserve_executable,
         files: vec![],
         linked: true,
+        vars_digest: None,
     };
     registry.put(&record)?;
     report.reconstructed.push(key);

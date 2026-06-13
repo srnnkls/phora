@@ -1636,6 +1636,7 @@ fn second_deploy_over_correct_link_is_a_noop() {
         preserve_executable: true,
         files: vec![],
         linked: true,
+        vars_digest: None,
     };
     fx.registry
         .put(&linked_record)
@@ -1688,6 +1689,7 @@ fn second_deploy_over_correct_link_is_a_noop() {
         "editor",
         &fx.registry,
         &artifact_key("dest", "editor-src", "editor"),
+        None,
     )
     .expect("check_artifact_state on the linked dst");
     assert!(
@@ -1743,6 +1745,7 @@ fn check_state_at(
         artifact,
         reg,
         &artifact_key(target, source, artifact),
+        None,
     )
     .expect("check_artifact_state")
 }
@@ -1840,6 +1843,7 @@ fn seed_orphan(
             blake3: "blake3:orphan".to_owned(),
         }],
         linked: false,
+        vars_digest: None,
     };
     reg.put(&record).expect("seed orphan record");
     dst
@@ -2496,6 +2500,7 @@ fn sync_runs_recovery_sweep_finishing_a_swapped_but_unrecorded_artifact() {
             blake3: "blake3:recovered".to_owned(),
         }],
         linked: false,
+        vars_digest: None,
     };
 
     let staging_base = td.parent_path.join(".phora-stage");
@@ -2651,6 +2656,7 @@ fn sync_runs_recovery_before_phase1_even_when_resolve_fails() {
             blake3: "blake3:recovered".to_owned(),
         }],
         linked: false,
+        vars_digest: None,
     };
 
     let staging_base = td.parent_path.join(".phora-stage");
@@ -2735,6 +2741,7 @@ fn seed_managed_artifact(
             blake3: blake3::hash(content).to_hex().to_string(),
         }],
         linked: false,
+        vars_digest: None,
     };
     reg.put(&record).expect("seed managed record");
     dst
@@ -2791,6 +2798,7 @@ fn eject_adds_ejected_entry_keeps_record_and_files() {
         "editor",
         &fx.registry,
         &key,
+        None,
     )
     .expect("check_artifact_state");
     assert!(
@@ -2908,6 +2916,7 @@ fn seed_verifiable_artifact(
         preserve_executable: true,
         files: manifest,
         linked: false,
+        vars_digest: None,
     };
     reg.put(&record).expect("seed verifiable record");
     dst
@@ -3532,6 +3541,7 @@ fn verify_skips_linked_record_even_with_stray_manifest_file() {
             blake3: blake3::hash(b"phantom").to_hex().to_string(),
         }],
         linked: true,
+        vars_digest: None,
     };
     fx.registry
         .put(&stray)
@@ -3578,6 +3588,7 @@ fn verify_skips_linked_record_over_edited_symlink_target() {
         preserve_executable: true,
         files: vec![],
         linked: true,
+        vars_digest: None,
     };
     fx.registry.put(&linked).expect("seed linked record");
 
@@ -3687,6 +3698,7 @@ fn prune_removes_stale_linked_symlink_without_following_it() {
             preserve_executable: true,
             files: vec![],
             linked: true,
+            vars_digest: None,
         })
         .expect("seed the orphaned linked record");
 
@@ -6064,6 +6076,7 @@ fn preview_writes_nothing_to_the_registry_or_the_target() {
             blake3: "blake3:seeded".to_owned(),
         }],
         linked: false,
+        vars_digest: None,
     };
     fx.registry.put(&seeded).expect("seed registry record");
     let before = fx.registry.list_all().expect("snapshot registry");
@@ -8112,5 +8125,47 @@ fn deployed_name_collision_within_an_artifact_is_a_clear_failure_not_last_writer
     assert!(
         !dst.join("foo").exists(),
         "no `foo` may land when `foo` and `foo.tmpl` collide on the deployed name"
+    );
+}
+
+#[test]
+fn sync_redeploys_when_vars_change_without_new_commit() {
+    let (src, url, head) = build_template_repo();
+    let h = RenderHarness::over(src, url, head);
+    let td = TargetDir::new();
+    let dst = td.artifact_dst(&flat_layout(), "ed", "editor");
+
+    let cfg_a = config_with_vars("ed", &h.url, &td.target_path(), "greeting = \"world\"\n");
+    let out_a = sync(
+        &input(&cfg_a, None, None, None, false),
+        &h.backend,
+        &h.registry,
+    )
+    .expect("first vars deploy succeeds");
+    assert!(!out_a.had_failures, "premise: the first deploy is clean");
+    assert_eq!(
+        std::fs::read(dst.join("motd")).expect("rendered motd deployed"),
+        b"hello world!\n",
+        "premise: greeting=world renders `hello world!`"
+    );
+
+    let cfg_b = config_with_vars("ed", &h.url, &td.target_path(), "greeting = \"galaxy\"\n");
+    let out_b = sync(
+        &input(&cfg_b, None, Some(out_a.base_lock.clone()), None, false),
+        &h.backend,
+        &h.registry,
+    )
+    .expect("second deploy with changed vars succeeds");
+
+    assert!(
+        !out_b.had_failures,
+        "a vars-only redeploy (no new commit) must succeed"
+    );
+    assert_eq!(
+        std::fs::read(dst.join("motd")).expect("re-rendered motd deployed"),
+        b"hello galaxy!\n",
+        "a [vars] change at the SAME commit must trigger a redeploy: motd must re-render to \
+         `hello galaxy!`, not stay pinned at the prior `hello world!` because the commit/source \
+         digest is unchanged"
     );
 }
