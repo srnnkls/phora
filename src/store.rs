@@ -65,6 +65,12 @@ pub struct EjectedEntry {
     pub ejected_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HookState {
+    pub hook_id: String,
+    pub last_success: std::collections::BTreeSet<String>,
+}
+
 pub use crate::kernel::Digest;
 
 pub trait Registry {
@@ -101,6 +107,14 @@ pub fn ejected_index(
     Ok(index)
 }
 
+#[must_use]
+pub fn digest_set_changed(
+    current: &std::collections::BTreeSet<String>,
+    recorded: &std::collections::BTreeSet<String>,
+) -> bool {
+    current != recorded
+}
+
 pub struct FileRegistry {
     state_root: PathBuf,
 }
@@ -111,11 +125,13 @@ pub struct StateLockGuard {
     _file: std::fs::File,
 }
 
-#[derive(Serialize, Deserialize)]
-struct EjectedMeta {
+#[derive(Serialize, Deserialize, Default)]
+struct TargetMeta {
     version: u32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     ejected: Vec<EjectedEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    hooks: Vec<HookState>,
 }
 
 impl FileRegistry {
@@ -142,6 +158,55 @@ impl FileRegistry {
             .join("targets")
             .join(target)
             .join("meta.toml")
+    }
+
+    fn read_meta(&self, target: &str) -> Result<TargetMeta> {
+        let path = self.meta_path(target);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => toml::from_str(&text)
+                .map_err(|e| StoreError::Registry(format!("parse meta {}: {e}", path.display()))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(TargetMeta {
+                version: 1,
+                ..TargetMeta::default()
+            }),
+            Err(e) => Err(StoreError::Registry(format!(
+                "read meta {}: {e}",
+                path.display()
+            ))),
+        }
+    }
+
+    fn write_meta(&self, target: &str, meta: &TargetMeta) -> Result<()> {
+        let serialized = toml::to_string(meta)
+            .map_err(|e| StoreError::Registry(format!("serialize meta: {e}")))?;
+        atomic_write(&self.meta_path(target), &serialized)
+    }
+
+    pub fn load_hook_state(&self, target: &str) -> Result<Vec<HookState>> {
+        Ok(self.read_meta(target)?.hooks)
+    }
+
+    pub fn save_hook_state(&self, target: &str, hooks: &[HookState]) -> Result<()> {
+        let mut meta = self.read_meta(target)?;
+        meta.hooks = hooks.to_vec();
+        self.write_meta(target, &meta)
+    }
+
+    pub fn record_hook_success(
+        &self,
+        target: &str,
+        hook_id: &str,
+        digest_set: &std::collections::BTreeSet<String>,
+    ) -> Result<()> {
+        let mut meta = self.read_meta(target)?;
+        match meta.hooks.iter_mut().find(|h| h.hook_id == hook_id) {
+            Some(existing) => existing.last_success.clone_from(digest_set),
+            None => meta.hooks.push(HookState {
+                hook_id: hook_id.to_owned(),
+                last_success: digest_set.clone(),
+            }),
+        }
+        self.write_meta(target, &meta)
     }
 
     pub fn lock_exclusive(&self) -> Result<StateLockGuard> {
@@ -311,30 +376,13 @@ impl Registry for FileRegistry {
     }
 
     fn load_ejected(&self, target: &str) -> Result<Vec<EjectedEntry>> {
-        let path = self.meta_path(target);
-        match std::fs::read_to_string(&path) {
-            Ok(text) => {
-                let meta: EjectedMeta = toml::from_str(&text).map_err(|e| {
-                    StoreError::Registry(format!("parse meta {}: {e}", path.display()))
-                })?;
-                Ok(meta.ejected)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(e) => Err(StoreError::Registry(format!(
-                "read meta {}: {e}",
-                path.display()
-            ))),
-        }
+        Ok(self.read_meta(target)?.ejected)
     }
 
     fn save_ejected(&self, target: &str, ejected: &[EjectedEntry]) -> Result<()> {
-        let meta = EjectedMeta {
-            version: 1,
-            ejected: ejected.to_vec(),
-        };
-        let serialized = toml::to_string(&meta)
-            .map_err(|e| StoreError::Registry(format!("serialize meta: {e}")))?;
-        atomic_write(&self.meta_path(target), &serialized)
+        let mut meta = self.read_meta(target)?;
+        meta.ejected = ejected.to_vec();
+        self.write_meta(target, &meta)
     }
 
     fn locks_dir(&self) -> PathBuf {
