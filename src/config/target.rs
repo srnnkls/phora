@@ -3,10 +3,95 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
 
 use super::TargetHooks;
 use super::source::{ParsedSource, Refspec, Source};
+
+const TMPL_SUFFIX: &str = ".tmpl";
+
+/// Per-binding template opt-in (M001). The `.tmpl` suffix convention is on by
+/// default; a glob list opts additional files in; `template = false` disables
+/// everything, including the suffix.
+#[derive(Debug, Clone)]
+pub enum TemplateOptIn {
+    /// No `template` key: only the `.tmpl` suffix convention renders.
+    SuffixOnly,
+    /// A `template` glob list: matching files render, plus any `.tmpl` file.
+    Globs(GlobSet),
+    /// `template = false`: nothing renders, no suffix is stripped.
+    Disabled,
+}
+
+impl TemplateOptIn {
+    /// True when `path` renders: it matches a template glob, or ends in `.tmpl` —
+    /// unless rendering is disabled.
+    #[must_use]
+    pub fn renders(&self, path: &str) -> bool {
+        match self {
+            Self::SuffixOnly => path.ends_with(TMPL_SUFFIX),
+            Self::Globs(set) => set.is_match(path) || path.ends_with(TMPL_SUFFIX),
+            Self::Disabled => false,
+        }
+    }
+
+    /// The deployed name: strips a trailing `.tmpl` only when the file renders;
+    /// otherwise the name is unchanged.
+    #[must_use]
+    pub fn deployed_name(&self, path: &str) -> String {
+        if self.renders(path)
+            && let Some(stripped) = path.strip_suffix(TMPL_SUFFIX)
+        {
+            return stripped.to_owned();
+        }
+        path.to_owned()
+    }
+}
+
+impl<'de> Deserialize<'de> for TemplateOptIn {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct TemplateVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for TemplateVisitor {
+            type Value = TemplateOptIn;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("`false` to disable templating, or a list of glob strings")
+            }
+
+            fn visit_bool<E: serde::de::Error>(
+                self,
+                v: bool,
+            ) -> std::result::Result<Self::Value, E> {
+                if v {
+                    return Err(E::custom(
+                        "`template = true` is not valid; omit the key for the default .tmpl opt-in, or give a glob list",
+                    ));
+                }
+                Ok(TemplateOptIn::Disabled)
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut builder = GlobSetBuilder::new();
+                while let Some(pattern) = seq.next_element::<String>()? {
+                    let glob = Glob::new(&pattern).map_err(serde::de::Error::custom)?;
+                    builder.add(glob);
+                }
+                let set = builder.build().map_err(serde::de::Error::custom)?;
+                Ok(TemplateOptIn::Globs(set))
+            }
+        }
+
+        deserializer.deserialize_any(TemplateVisitor)
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,6 +123,14 @@ impl Binding {
         match self {
             Binding::Source(name) => name,
             Binding::Refined(refined) => refined.r#as.as_deref().unwrap_or(&refined.source),
+        }
+    }
+
+    #[must_use]
+    pub fn template_opt_in(&self) -> TemplateOptIn {
+        match self {
+            Binding::Source(_) => TemplateOptIn::SuffixOnly,
+            Binding::Refined(refined) => refined.template_opt_in(),
         }
     }
 }
@@ -87,6 +180,15 @@ pub struct RefinedBinding {
     pub branch: Option<String>,
     pub tag: Option<String>,
     pub rev: Option<String>,
+    #[serde(default)]
+    pub template: Option<TemplateOptIn>,
+}
+
+impl RefinedBinding {
+    #[must_use]
+    pub fn template_opt_in(&self) -> TemplateOptIn {
+        self.template.clone().unwrap_or(TemplateOptIn::SuffixOnly)
+    }
 }
 
 #[derive(Debug)]

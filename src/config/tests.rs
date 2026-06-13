@@ -3187,6 +3187,7 @@ mod per_binding_refinement {
                 branch,
                 tag,
                 rev,
+                template: _,
             }) => {
                 assert_eq!(
                     source, "dotfiles",
@@ -3895,6 +3896,7 @@ mod per_binding_refinement {
                 branch: Some("develop".to_owned()),
                 tag: Some("v9.9.9".to_owned()),
                 rev: Some("deadbeef".to_owned()),
+                template: None,
             })]),
         };
 
@@ -3933,6 +3935,7 @@ mod per_binding_refinement {
                 branch: Some("develop".to_owned()),
                 tag: Some("v9.9.9".to_owned()),
                 rev: None,
+                template: None,
             })]),
         };
 
@@ -5068,12 +5071,12 @@ fn vars_absent_parses_as_empty_map() {
 
 #[test]
 fn vars_non_string_value_is_rejected() {
-    let toml = r#"
+    let toml = r"
 version = 1
 
 [vars]
 count = 3
-"#;
+";
     assert!(
         matches!(Config::parse(toml), Err(Error::Config(_))),
         "a non-string [vars] value must be rejected: vars are a flat string map"
@@ -5399,7 +5402,8 @@ sources = [{ source = "dotfiles", template = false }]
 #[test]
 fn feature_free_config_has_empty_vars_and_no_template_fields() {
     // M001: the `.tmpl` opt-in is file-level not config-level, so INV-8 here is field-absence, NOT `!renders(".tmpl")`.
-    let cfg = Config::parse(EXAMPLE_TOML).expect("the feature-free example toml must parse unchanged");
+    let cfg =
+        Config::parse(EXAMPLE_TOML).expect("the feature-free example toml must parse unchanged");
     assert!(
         vars_of(&cfg).is_empty(),
         "INV-8: a config with no [vars] table must carry an empty vars map"
