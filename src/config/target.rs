@@ -11,7 +11,7 @@ use super::source::{ParsedSource, Refspec, Source};
 
 const TMPL_SUFFIX: &str = ".tmpl";
 
-/// Per-binding template opt-in (M001). The `.tmpl` suffix convention is on by
+/// Per-binding template opt-in. The `.tmpl` suffix convention is on by
 /// default; a glob list opts additional files in; `template = false` disables
 /// everything, including the suffix.
 #[derive(Debug, Clone)]
@@ -29,9 +29,10 @@ impl TemplateOptIn {
     /// unless rendering is disabled.
     #[must_use]
     pub fn renders(&self, path: &str) -> bool {
+        let suffix_opts_in = path.ends_with(TMPL_SUFFIX) && path != TMPL_SUFFIX;
         match self {
-            Self::SuffixOnly => path.ends_with(TMPL_SUFFIX),
-            Self::Globs(set) => set.is_match(path) || path.ends_with(TMPL_SUFFIX),
+            Self::SuffixOnly => suffix_opts_in,
+            Self::Globs(set) => set.is_match(path) || suffix_opts_in,
             Self::Disabled => false,
         }
     }
@@ -42,6 +43,7 @@ impl TemplateOptIn {
     pub fn deployed_name(&self, path: &str) -> String {
         if self.renders(path)
             && let Some(stripped) = path.strip_suffix(TMPL_SUFFIX)
+            && !stripped.is_empty()
         {
             return stripped.to_owned();
         }
@@ -80,9 +82,16 @@ impl<'de> Deserialize<'de> for TemplateOptIn {
                 mut seq: A,
             ) -> std::result::Result<Self::Value, A::Error> {
                 let mut builder = GlobSetBuilder::new();
+                let mut count = 0usize;
                 while let Some(pattern) = seq.next_element::<String>()? {
                     let glob = Glob::new(&pattern).map_err(serde::de::Error::custom)?;
                     builder.add(glob);
+                    count += 1;
+                }
+                if count == 0 {
+                    return Err(serde::de::Error::custom(
+                        "template glob list must not be empty; omit the key for the default .tmpl opt-in, or use `template = false` to disable",
+                    ));
                 }
                 let set = builder.build().map_err(serde::de::Error::custom)?;
                 Ok(TemplateOptIn::Globs(set))

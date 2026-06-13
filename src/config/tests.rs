@@ -5452,3 +5452,109 @@ sources = ["dotfiles"]
         "with no glob list a bare binding renders only .tmpl files"
     );
 }
+
+#[test]
+fn bare_dot_tmpl_does_not_render_or_strip_to_empty() {
+    let opt_in = TemplateOptIn::SuffixOnly;
+    assert!(
+        !opt_in.renders(".tmpl"),
+        "a file literally named `.tmpl` has no stem, so the suffix convention must NOT opt it in"
+    );
+    assert_eq!(
+        opt_in.deployed_name(".tmpl"),
+        ".tmpl",
+        "stripping the `.tmpl` suffix from `.tmpl` would yield an empty name; the path must be kept verbatim"
+    );
+}
+
+#[test]
+fn empty_template_glob_list_is_rejected() {
+    let toml = r#"
+version = 1
+
+[sources.dotfiles]
+git = "https://github.com/me/dotfiles.git"
+
+[targets.t]
+path = "~/x"
+sources = [{ source = "dotfiles", template = [] }]
+"#;
+    assert!(
+        matches!(Config::parse(toml), Err(Error::Config(_))),
+        "`template = []` is ambiguous with the default opt-in and must be rejected, \
+         not silently behave like SuffixOnly"
+    );
+}
+
+#[test]
+fn template_on_a_url_source_is_rejected() {
+    let toml = r#"
+version = 1
+
+[sources.blob]
+url = "https://example.com/file.tar.gz"
+
+[targets.t]
+path = "~/x"
+sources = [{ source = "blob", template = ["*.conf"] }]
+"#;
+    let cfg =
+        Config::parse(toml).expect("the toml itself parses; url-slice rejection is in validate()");
+    assert!(
+        matches!(cfg.validate(), Err(Error::Config(_))),
+        "a `template` glob on a single-file `url` source is meaningless and must be rejected, \
+         matching how include/exclude/root are rejected on url sources"
+    );
+}
+
+#[test]
+fn classifier_renders_and_deployed_name_table() {
+    let globs = {
+        let cfg = Config::parse(
+            r#"
+version = 1
+
+[sources.dotfiles]
+git = "https://github.com/me/dotfiles.git"
+
+[targets.t]
+path = "~/x"
+sources = [{ source = "dotfiles", template = ["*.conf"] }]
+"#,
+        )
+        .expect("globs binding parses");
+        refined(&cfg, "t").template_opt_in()
+    };
+    let suffix = TemplateOptIn::SuffixOnly;
+    let disabled = TemplateOptIn::Disabled;
+
+    assert!(
+        globs.renders("app.conf.tmpl") && globs.deployed_name("app.conf.tmpl") == "app.conf",
+        "glob AND suffix both match: renders and strips one .tmpl level"
+    );
+    assert!(
+        suffix.renders("app.conf.tmpl") && suffix.deployed_name("app.conf.tmpl") == "app.conf",
+        "SuffixOnly: a .tmpl file renders and strips"
+    );
+    assert!(
+        globs.renders("foo.tmpl.tmpl") && globs.deployed_name("foo.tmpl.tmpl") == "foo.tmpl",
+        "stripping removes exactly one .tmpl level"
+    );
+    assert!(
+        !suffix.renders(".tmpl") && suffix.deployed_name(".tmpl") == ".tmpl",
+        "SuffixOnly: bare .tmpl neither renders nor strips to empty"
+    );
+    assert!(
+        !globs.renders(".tmpl") && globs.deployed_name(".tmpl") == ".tmpl",
+        "Globs: bare .tmpl neither renders nor strips to empty"
+    );
+    assert!(
+        !disabled.renders("app.conf.tmpl")
+            && disabled.deployed_name("app.conf.tmpl") == "app.conf.tmpl",
+        "Disabled never renders nor strips"
+    );
+    assert!(
+        globs.renders("a/b.conf"),
+        "template globs use the same default separator semantics as include/exclude (`*.conf` spans separators)"
+    );
+}
