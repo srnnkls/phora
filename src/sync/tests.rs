@@ -7170,10 +7170,7 @@ fn append_cmd(log: &Path, marker: &str) -> String {
 
 /// A target-hook command that appends a marker then exits non-zero.
 fn append_then_fail_cmd(log: &Path, marker: &str) -> String {
-    format!(
-        "printf '%s\\n' '{marker}' >> '{}'; exit 7",
-        log.display()
-    )
+    format!("printf '%s\\n' '{marker}' >> '{}'; exit 7", log.display())
 }
 
 /// Reads the hook log into trimmed non-empty lines (empty if the log is absent).
@@ -7235,7 +7232,10 @@ fn changing_sync_fires_on_change_hook_once_and_records_success() {
     )
     .expect("first sync deploys and fires the on_change hook");
 
-    assert!(!out.had_failures, "a clean deploy + successful hook is no failure");
+    assert!(
+        !out.had_failures,
+        "a clean deploy + successful hook is no failure"
+    );
     assert_eq!(
         log_lines(&log),
         vec!["fired".to_owned()],
@@ -7298,7 +7298,10 @@ fn failed_hook_fails_sync_keeps_files_and_refires_next_sync() {
     let cfg = config_with_target_hooks(
         &fx.url,
         &td.target_path(),
-        &format!("\"{}\"", append_then_fail_cmd(&log, "fired").replace('"', "\\\"")),
+        &format!(
+            "\"{}\"",
+            append_then_fail_cmd(&log, "fired").replace('"', "\\\"")
+        ),
     );
 
     let first = sync(
@@ -7379,8 +7382,8 @@ fn on_change_hooks_run_in_declaration_order_and_dedupe() {
     );
 }
 
-/// The hook process environment carries PHORA_TARGET (the target name) and
-/// PHORA_CHANGED (the changed artifact members), so a hook can react to what moved.
+/// The hook process environment carries `PHORA_TARGET` (the target name) and
+/// `PHORA_CHANGED` (the changed artifact members), so a hook can react to what moved.
 #[test]
 fn hook_environment_exposes_phora_target_and_changed() {
     let fx = build_sync_fixture();

@@ -1,6 +1,7 @@
 //! Top-level orchestration: the `sync` pipeline, eject/uneject, and shared helpers.
 
 mod discover;
+mod hooks;
 mod plan;
 mod preview;
 mod prune;
@@ -222,6 +223,8 @@ pub fn sync(
             )?;
         }
     }
+
+    had_failures |= hooks::dispatch_hooks(&effective_config, registry)?;
 
     Ok(SyncOutput {
         base_lock,
