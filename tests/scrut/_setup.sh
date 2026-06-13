@@ -97,3 +97,100 @@ sources = ["dotfiles"]
 layout = "flat"
 EOF
 }
+
+# The report prints the hook command's literal `$HOME` text (it is a format string, not a shell), so it stays byte-stable; the path expands only when the hook runs.
+seed_config_with_hooks() {
+	url="$1"
+	if [ -z "$url" ]; then
+		url="$(make_git_source seed)"
+	fi
+	target="$PWD/target-home"
+	mkdir -p "$target"
+	cat >"$PWD/phora.toml" <<'EOF'
+version = 1
+
+[sources.dotfiles]
+path = "__URL__"
+branch = "main"
+include = ["editor", "lint"]
+
+[targets.home]
+path = "__TARGET__"
+sources = ["dotfiles"]
+layout = "flat"
+
+[targets.home.hooks]
+on_change = "cat \"$HOME/target-home/editor/init.lua\" >> \"$HOME/hook.log\""
+EOF
+	sed -i.bak -e "s#__URL__#$url#" -e "s#__TARGET__#$target#" "$PWD/phora.toml"
+	rm -f "$PWD/phora.toml.bak"
+}
+
+# on_change hook that succeeds only once $HOME/allow exists: lets a scenario fail
+# a hook, then fix the cause and prove it re-fires.
+seed_config_failing_hook() {
+	url="$1"
+	target="$PWD/target-home"
+	mkdir -p "$target"
+	cat >"$PWD/phora.toml" <<'EOF'
+version = 1
+
+[sources.dotfiles]
+path = "__URL__"
+branch = "main"
+include = ["editor"]
+
+[targets.home]
+path = "__TARGET__"
+sources = ["dotfiles"]
+layout = "flat"
+
+[targets.home.hooks]
+on_change = "test -f \"$HOME/allow\" && echo ran >> \"$HOME/hook.log\""
+EOF
+	sed -i.bak -e "s#__URL__#$url#" -e "s#__TARGET__#$target#" "$PWD/phora.toml"
+	rm -f "$PWD/phora.toml.bak"
+}
+
+# A source repo whose own tree carries a hook-shaped phora.toml under payload/ —
+# INV-1 fixture: that hook must stay inert when the tree is synced as content.
+make_evil_source() {
+	repo="$PWD/src-evil"
+	mkdir -p "$repo/payload"
+	_phora_git init -q -b main "$repo"
+	_phora_write "$repo/payload/phora.toml" 'version = 1
+[targets.x.hooks]
+on_change = "touch \"$HOME/PWNED\""
+'
+	_phora_write "$repo/payload/data.txt" "hi
+"
+	_phora_git -C "$repo" add -A
+	_phora_commit "$_PHORA_GIT_AUTHOR_DATE" "$_PHORA_GIT_COMMITTER_DATE" "$repo" "fixture"
+	printf '%s\n' "$repo"
+}
+
+# Consumer config that includes the evil source's payload subtree and declares
+# only a global post_sync hook (no target hooks).
+seed_config_post_sync() {
+	url="$1"
+	target="$PWD/target-home"
+	mkdir -p "$target"
+	cat >"$PWD/phora.toml" <<'EOF'
+version = 1
+
+[sources.dotfiles]
+path = "__URL__"
+branch = "main"
+include = ["payload"]
+
+[targets.home]
+path = "__TARGET__"
+sources = ["dotfiles"]
+layout = "flat"
+
+[hooks]
+post_sync = "echo post >> \"$HOME/post.log\""
+EOF
+	sed -i.bak -e "s#__URL__#$url#" -e "s#__TARGET__#$target#" "$PWD/phora.toml"
+	rm -f "$PWD/phora.toml.bak"
+}
