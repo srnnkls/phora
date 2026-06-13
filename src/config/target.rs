@@ -115,7 +115,7 @@ pub struct Target {
 #[derive(Debug, Clone)]
 pub enum Binding {
     Source(String),
-    Refined(RefinedBinding),
+    Refined(Box<RefinedBinding>),
 }
 
 impl Binding {
@@ -170,7 +170,7 @@ impl<'de> Deserialize<'de> for Binding {
                 map: A,
             ) -> std::result::Result<Self::Value, A::Error> {
                 RefinedBinding::deserialize(serde::de::value::MapAccessDeserializer::new(map))
-                    .map(Binding::Refined)
+                    .map(|refined| Binding::Refined(Box::new(refined)))
             }
         }
 
@@ -191,6 +191,8 @@ pub struct RefinedBinding {
     pub rev: Option<String>,
     #[serde(default)]
     pub template: Option<TemplateOptIn>,
+    #[serde(default)]
+    pub map: Option<BTreeMap<String, String>>,
 }
 
 impl RefinedBinding {
@@ -209,6 +211,7 @@ pub struct ResolvedBinding<'a> {
     pub exclude: &'a [String],
     pub effective_ref: Refspec,
     pub template_opt_in: TemplateOptIn,
+    pub map: Option<&'a BTreeMap<String, String>>,
 }
 
 pub trait SourceFields {
@@ -330,6 +333,10 @@ fn resolve_binding<'a, S: SourceFields>(
         Binding::Source(_) => None,
         Binding::Refined(refined) => binding_refspec(refined),
     };
+    let map = match binding {
+        Binding::Refined(refined) => refined.map.as_ref(),
+        Binding::Source(_) => None,
+    };
     let source = all.get(source_name)?;
     Some(ResolvedBinding {
         identity,
@@ -339,6 +346,7 @@ fn resolve_binding<'a, S: SourceFields>(
         exclude: exclude.unwrap_or_else(|| source.intrinsic_exclude()),
         effective_ref: binding_ref.unwrap_or_else(|| source.intrinsic_refspec()),
         template_opt_in: binding.template_opt_in(),
+        map,
     })
 }
 
