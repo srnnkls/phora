@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use crate::config::{Config, DeployMode, LayoutKind, Target};
+use crate::config::{Config, DeployMode, LayoutKind, Target, TemplateOptIn};
 use crate::error::{Error, Result};
 use crate::kernel::{ArtifactName, Selection, SourceName};
 use crate::lock::{Lock, ref_discriminator};
@@ -143,7 +143,7 @@ struct RebuildOne<'a> {
     layout_kind: LayoutKind,
     key: ArtifactKey,
     report: &'a mut RebuildReport,
-    template_opt_in: &'a crate::config::TemplateOptIn,
+    template_opt_in: &'a TemplateOptIn,
     vars: &'a BTreeMap<String, String>,
 }
 
