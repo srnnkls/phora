@@ -98,7 +98,7 @@ pub enum Command {
         prune: bool,
         #[arg(long)]
         force: bool,
-        #[arg(long = "no-hooks")]
+        #[arg(long)]
         no_hooks: bool,
     },
     /// Bump the lock to latest, then sync.

@@ -57,12 +57,24 @@ pub(super) fn run_sync(
 fn finish_sync(cwd: &Path, out: &SyncOutput) -> Result<()> {
     write_locks(cwd, &out.base_lock, out.local_lock.as_ref())?;
     let report = super::render::render_hook_report(&out.hook_results);
-    if !report.trim().is_empty() {
-        print!("{report}");
-    }
     if out.had_failures {
-        eprintln!("phora: some artifacts failed to deploy");
+        if !report.is_empty() {
+            eprint!("{report}");
+        }
+        let hooks_failed = out
+            .hook_results
+            .iter()
+            .any(|o| o.status == crate::sync::HookStatus::Failure);
+        let message = match (out.deploy_failures, hooks_failed) {
+            (true, true) => "phora: some artifacts failed to deploy and one or more hooks failed",
+            (true, false) => "phora: some artifacts failed to deploy",
+            (false, _) => "phora: one or more hooks failed",
+        };
+        eprintln!("{message}");
         std::process::exit(1);
+    }
+    if !report.is_empty() {
+        print!("{report}");
     }
     println!("sync complete");
     Ok(())
