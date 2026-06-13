@@ -98,6 +98,8 @@ pub enum Command {
         prune: bool,
         #[arg(long)]
         force: bool,
+        #[arg(long = "no-hooks")]
+        no_hooks: bool,
     },
     /// Bump the lock to latest, then sync.
     Update { source: Option<String> },
@@ -252,7 +254,11 @@ pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
         cmd @ Command::Add { .. } => dispatch_add(cmd),
         Command::Rm { name } => run_source_rm(&name),
-        Command::Sync { prune, force } => sync::run_sync(prune, force, None),
+        Command::Sync {
+            prune,
+            force,
+            no_hooks,
+        } => sync::run_sync(prune, force, no_hooks, None),
         Command::Update { source } => sync::run_update(source.as_deref()),
         Command::List { plan } => query::run_list(plan),
         Command::Verify => {

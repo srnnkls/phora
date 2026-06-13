@@ -85,8 +85,8 @@ fn state_label_renders_linked_artifact_as_linked() {
 #[test]
 fn sync_no_hooks_flag_parses_to_true() {
     use clap::Parser;
-    let cli = Cli::try_parse_from(["phora", "sync", "--no-hooks"])
-        .expect("sync --no-hooks must parse");
+    let cli =
+        Cli::try_parse_from(["phora", "sync", "--no-hooks"]).expect("sync --no-hooks must parse");
     let Command::Sync { no_hooks, .. } = cli.command else {
         panic!("expected Command::Sync");
     };

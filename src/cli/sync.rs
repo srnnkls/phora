@@ -13,7 +13,12 @@ use super::{
     open_project_registry,
 };
 
-pub(super) fn run_sync(prune: bool, force: bool, drop: Option<DropSources>) -> Result<()> {
+pub(super) fn run_sync(
+    prune: bool,
+    force: bool,
+    no_hooks: bool,
+    drop: Option<DropSources>,
+) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let base = load_config()?;
     let local = load_local_config(&cwd)?;
@@ -39,7 +44,7 @@ pub(super) fn run_sync(prune: bool, force: bool, drop: Option<DropSources>) -> R
             force,
             interactive,
             prune,
-            no_hooks: false,
+            no_hooks,
             resolver: interactive.then_some(&resolver as &dyn ConflictResolver),
         },
         &backend,
@@ -51,6 +56,10 @@ pub(super) fn run_sync(prune: bool, force: bool, drop: Option<DropSources>) -> R
 
 fn finish_sync(cwd: &Path, out: &SyncOutput) -> Result<()> {
     write_locks(cwd, &out.base_lock, out.local_lock.as_ref())?;
+    let report = super::render::render_hook_report(&out.hook_results);
+    if !report.trim().is_empty() {
+        print!("{report}");
+    }
     if out.had_failures {
         eprintln!("phora: some artifacts failed to deploy");
         std::process::exit(1);
@@ -96,7 +105,7 @@ pub(super) fn run_rebuild_registry() -> Result<()> {
 
 pub(super) fn run_update(source: Option<&str>) -> Result<()> {
     let drop = source.map_or(DropSources::All, |s| DropSources::One(s.to_owned()));
-    run_sync(false, false, Some(drop))
+    run_sync(false, false, false, Some(drop))
 }
 
 /// Writes the base lock to `<dir>/phora.lock` and, when `local` is `Some`, the
