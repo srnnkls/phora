@@ -7318,9 +7318,13 @@ fn failed_hook_fails_sync_keeps_files_and_refires_next_sync() {
         b"-- init\n",
         "INV-2: a hook failure NEVER rolls back files — the artifact stays deployed"
     );
-    assert!(
-        recorded_hook(&fx.registry, "dest", &hook_id("dest", 0)).is_none(),
-        "INV-4: a failed hook must NOT record last-success"
+    assert_eq!(
+        fx.registry
+            .load_hook_state("dest")
+            .expect("load hook state"),
+        vec![],
+        "INV-4: a failed hook must NOT record last-success — with this target's single \
+         hook failing, the registry holds NO recorded success under ANY id"
     );
     assert_eq!(
         log_lines(&log).len(),
