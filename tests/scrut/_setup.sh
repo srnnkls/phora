@@ -152,6 +152,58 @@ EOF
 	rm -f "$PWD/phora.toml.bak"
 }
 
+# The plain `static.txt` sibling exists to prove non-`.tmpl` files copy untouched.
+make_templated_source() {
+	repo="$PWD/src-$1"
+	mkdir -p "$repo"
+	_phora_git init -q -b main "$repo"
+
+	_phora_write "$repo/editor/motd.tmpl" "hello {{ greeting }}!
+"
+	_phora_write "$repo/editor/static.txt" "plain content
+"
+
+	_phora_git -C "$repo" add -A
+	_phora_commit "$_PHORA_GIT_AUTHOR_DATE" "$_PHORA_GIT_COMMITTER_DATE" \
+		"$repo" "fixture"
+
+	printf '%s\n' "$repo"
+}
+
+# Quoted heredoc keeps `{{ greeting }}` literal; __URL__/__TARGET__ are sed-filled.
+seed_config_with_vars() {
+	url="$1"
+	target="$PWD/target-home"
+	mkdir -p "$target"
+	cat >"$PWD/phora.toml" <<'EOF'
+version = 1
+
+[vars]
+greeting = "base"
+
+[sources.dotfiles]
+path = "__URL__"
+branch = "main"
+include = ["editor"]
+
+[targets.home]
+path = "__TARGET__"
+sources = ["dotfiles"]
+layout = "flat"
+EOF
+	sed -i.bak -e "s#__URL__#$url#" -e "s#__TARGET__#$target#" "$PWD/phora.toml"
+	rm -f "$PWD/phora.toml.bak"
+}
+
+seed_local_vars() {
+	cat >"$PWD/phora.local.toml" <<EOF
+version = 1
+
+[vars]
+greeting = "$1"
+EOF
+}
+
 # A source repo whose own tree carries a hook-shaped phora.toml under payload/ —
 # INV-1 fixture: that hook must stay inert when the tree is synced as content.
 make_evil_source() {
