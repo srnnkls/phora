@@ -3885,6 +3885,7 @@ mod per_binding_refinement {
         let t = Target {
             path: std::path::PathBuf::from("~/x"),
             layout: None,
+            hooks: None,
             sources: Some(vec![Binding::Refined(RefinedBinding {
                 source: "fzf".to_owned(),
                 r#as: Some("pinned".to_owned()),
@@ -3922,6 +3923,7 @@ mod per_binding_refinement {
         let t = Target {
             path: std::path::PathBuf::from("~/x"),
             layout: None,
+            hooks: None,
             sources: Some(vec![Binding::Refined(RefinedBinding {
                 source: "fzf".to_owned(),
                 r#as: Some("pinned".to_owned()),
@@ -4270,8 +4272,7 @@ on_change = ["first --flag", "second"]
 
 #[test]
 fn hook_free_config_parses_with_no_hooks_anywhere() {
-    let cfg =
-        Config::parse(EXAMPLE_TOML).expect("the hook-free example toml must parse unchanged");
+    let cfg = Config::parse(EXAMPLE_TOML).expect("the hook-free example toml must parse unchanged");
     assert!(
         cfg.hooks.is_none(),
         "an absent global [hooks] table must parse as None (global hook OFF by default)"
@@ -4298,7 +4299,10 @@ when = "always"
     .expect("a global [hooks] table with post_sync and when = \"always\" must parse");
     assert_eq!(runs(post_sync_of(&cfg)), ["reload-everything"]);
     assert_eq!(
-        cfg.hooks.as_ref().expect("global [hooks] table present").when,
+        cfg.hooks
+            .as_ref()
+            .expect("global [hooks] table present")
+            .when,
         HookWhen::Always,
         "an explicit `when = \"always\"` must be stored on the parsed config, not dropped"
     );
@@ -4317,7 +4321,10 @@ post_sync = ["first", "second"]
     .expect("a global [hooks] table with a post_sync list and no `when` key must parse");
     assert_eq!(runs(post_sync_of(&cfg)), ["first", "second"]);
     assert_eq!(
-        cfg.hooks.as_ref().expect("global [hooks] table present").when,
+        cfg.hooks
+            .as_ref()
+            .expect("global [hooks] table present")
+            .when,
         HookWhen::Always,
         "an omitted `when` must default to always, the only valid value in v1"
     );
