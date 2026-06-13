@@ -4297,6 +4297,11 @@ when = "always"
     )
     .expect("a global [hooks] table with post_sync and when = \"always\" must parse");
     assert_eq!(runs(post_sync_of(&cfg)), ["reload-everything"]);
+    assert_eq!(
+        cfg.hooks.as_ref().expect("global [hooks] table present").when,
+        HookWhen::Always,
+        "an explicit `when = \"always\"` must be stored on the parsed config, not dropped"
+    );
 }
 
 #[test]
@@ -4311,6 +4316,11 @@ post_sync = ["first", "second"]
     )
     .expect("a global [hooks] table with a post_sync list and no `when` key must parse");
     assert_eq!(runs(post_sync_of(&cfg)), ["first", "second"]);
+    assert_eq!(
+        cfg.hooks.as_ref().expect("global [hooks] table present").when,
+        HookWhen::Always,
+        "an omitted `when` must default to always, the only valid value in v1"
+    );
 }
 
 #[test]
