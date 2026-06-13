@@ -2722,7 +2722,7 @@ fn refined_binding(cfg: &Config, target: &str, identity: &str) -> crate::config:
         .unwrap_or(&[])
         .iter()
         .find_map(|b| match b {
-            crate::config::Binding::Refined(r) if b.identity() == identity => Some(r.clone()),
+            crate::config::Binding::Refined(r) if b.identity() == identity => Some((**r).clone()),
             _ => None,
         })
         .unwrap_or_else(|| {
