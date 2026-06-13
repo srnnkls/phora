@@ -7159,3 +7159,340 @@ fn preview_target_reflects_binding_effective_selection() {
 
     drop(fx);
 }
+
+// ── hook dispatch (TPH-003): post-commit digest diff + run ─────
+
+/// A target-hook command that appends one marker line to `log` then exits 0.
+/// Shell-quoted so the path may contain tempdir punctuation.
+fn append_cmd(log: &Path, marker: &str) -> String {
+    format!("printf '%s\\n' '{marker}' >> '{}'", log.display())
+}
+
+/// A target-hook command that appends a marker then exits non-zero.
+fn append_then_fail_cmd(log: &Path, marker: &str) -> String {
+    format!(
+        "printf '%s\\n' '{marker}' >> '{}'; exit 7",
+        log.display()
+    )
+}
+
+/// Reads the hook log into trimmed non-empty lines (empty if the log is absent).
+fn log_lines(log: &Path) -> Vec<String> {
+    match std::fs::read_to_string(log) {
+        Ok(text) => text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// One source scoped to `editor`, one target `dest`, plus an inline
+/// `[targets.dest.hooks] on_change = <commands>` table.
+fn config_with_target_hooks(url: &str, target_path: &Path, on_change_toml: &str) -> Config {
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.editor-src]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\"editor-src\"]\nlayout = \"flat\"\n\n\
+         [targets.dest.hooks]\non_change = {on_change_toml}\n",
+        target_path.display(),
+    );
+    Config::parse(&toml).expect("target-hooks config parses")
+}
+
+/// The hook id the registry records for the Nth `on_change` hook of `target`,
+/// mirroring the `<target>#<index>` convention seeded in the store suite.
+fn hook_id(target: &str, index: usize) -> String {
+    format!("{target}#{index}")
+}
+
+fn recorded_hook(reg: &FileRegistry, target: &str, id: &str) -> Option<crate::store::HookState> {
+    reg.load_hook_state(target)
+        .expect("load hook state")
+        .into_iter()
+        .find(|h| h.hook_id == id)
+}
+
+/// A changing sync fires the target's `on_change` hook exactly once and records
+/// its last-success so the next no-op sync stays quiet (INV-3, success path).
+#[test]
+fn changing_sync_fires_on_change_hook_once_and_records_success() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let log = td.parent_path.join("hook.log");
+    let cfg = config_with_target_hooks(
+        &fx.url,
+        &td.target_path(),
+        &format!("\"{}\"", append_cmd(&log, "fired").replace('"', "\\\"")),
+    );
+
+    let out = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("first sync deploys and fires the on_change hook");
+
+    assert!(!out.had_failures, "a clean deploy + successful hook is no failure");
+    assert_eq!(
+        log_lines(&log),
+        vec!["fired".to_owned()],
+        "a sync that changed the target's digest-set must run on_change EXACTLY once"
+    );
+    assert!(
+        recorded_hook(&fx.registry, "dest", &hook_id("dest", 0)).is_some(),
+        "after the hook exits 0 its last-success digest-set must be recorded (INV-4)"
+    );
+}
+
+/// INV-3: a second sync with no digest change runs NO hook and records nothing new.
+#[test]
+fn noop_sync_fires_no_hook() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let log = td.parent_path.join("hook.log");
+    let cfg = config_with_target_hooks(
+        &fx.url,
+        &td.target_path(),
+        &format!("\"{}\"", append_cmd(&log, "fired").replace('"', "\\\"")),
+    );
+
+    let first = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("first sync deploys and fires once");
+    assert_eq!(
+        log_lines(&log).len(),
+        1,
+        "premise: the first changing sync fires the hook once"
+    );
+
+    let second = sync(
+        &input(&cfg, None, Some(first.base_lock.clone()), None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("second sync is a clean no-op");
+
+    assert!(!second.had_failures, "a clean no-op sync must not fail");
+    assert_eq!(
+        log_lines(&log).len(),
+        1,
+        "INV-3: a no-op sync (digest-set unchanged since last hook success) must fire NOTHING — \
+         the log must still hold exactly the one line from the first run"
+    );
+}
+
+/// Failure semantics: a non-zero hook makes the sync report failure, leaves the
+/// deployed files intact (INV-2), does NOT record last-success (INV-4), and so the
+/// hook re-fires on the next sync even though the digest-set did not change again.
+#[test]
+fn failed_hook_fails_sync_keeps_files_and_refires_next_sync() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let log = td.parent_path.join("hook.log");
+    let cfg = config_with_target_hooks(
+        &fx.url,
+        &td.target_path(),
+        &format!("\"{}\"", append_then_fail_cmd(&log, "fired").replace('"', "\\\"")),
+    );
+
+    let first = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("a hook failure surfaces via had_failures, not a hard Err");
+
+    assert!(
+        first.had_failures,
+        "a hook exiting non-zero must make the sync report failure (CLI exit non-zero)"
+    );
+    let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+    assert_eq!(
+        std::fs::read(dst.join("init.lua")).expect("deployed init.lua present"),
+        b"-- init\n",
+        "INV-2: a hook failure NEVER rolls back files — the artifact stays deployed"
+    );
+    assert!(
+        recorded_hook(&fx.registry, "dest", &hook_id("dest", 0)).is_none(),
+        "INV-4: a failed hook must NOT record last-success"
+    );
+    assert_eq!(
+        log_lines(&log).len(),
+        1,
+        "premise: the failing hook ran exactly once on the first sync"
+    );
+
+    let second = sync(
+        &input(&cfg, None, Some(first.base_lock.clone()), None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("second sync re-runs the never-succeeded hook");
+
+    assert!(
+        second.had_failures,
+        "the still-failing hook keeps the sync in a failed state"
+    );
+    assert_eq!(
+        log_lines(&log).len(),
+        2,
+        "INV-4 retry-on-next-sync: a hook with no recorded success must re-fire next sync, \
+         appending a second line"
+    );
+}
+
+/// Collection + dedup + order: a target reachable via the same command twice runs
+/// it ONCE, and distinct commands run in declaration order.
+#[test]
+fn on_change_hooks_run_in_declaration_order_and_dedupe() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let log = td.parent_path.join("hook.log");
+    let dup = append_cmd(&log, "alpha").replace('"', "\\\"");
+    let beta = append_cmd(&log, "beta").replace('"', "\\\"");
+    let on_change = format!("[\"{dup}\", \"{beta}\", \"{dup}\"]");
+    let cfg = config_with_target_hooks(&fx.url, &td.target_path(), &on_change);
+
+    sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("sync runs the deduped, ordered hook list");
+
+    assert_eq!(
+        log_lines(&log),
+        vec!["alpha".to_owned(), "beta".to_owned()],
+        "duplicate commands collapse to one run and survivors keep declaration order: \
+         alpha (once) then beta — got {:?}",
+        log_lines(&log)
+    );
+}
+
+/// The hook process environment carries PHORA_TARGET (the target name) and
+/// PHORA_CHANGED (the changed artifact members), so a hook can react to what moved.
+#[test]
+fn hook_environment_exposes_phora_target_and_changed() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let log = td.parent_path.join("hook.log");
+    let cmd = format!(
+        "printf 'target=%s\\n' \"$PHORA_TARGET\" >> '{0}'; \
+         printf 'changed=%s\\n' \"$PHORA_CHANGED\" >> '{0}'",
+        log.display()
+    );
+    let cfg = config_with_target_hooks(
+        &fx.url,
+        &td.target_path(),
+        &format!("\"{}\"", cmd.replace('"', "\\\"")),
+    );
+
+    sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("sync runs the env-reporting hook");
+
+    let lines = log_lines(&log);
+    assert!(
+        lines.iter().any(|l| l == "target=dest"),
+        "the hook environment must set PHORA_TARGET to the target name `dest`, got {lines:?}"
+    );
+    let changed = lines
+        .iter()
+        .find_map(|l| l.strip_prefix("changed="))
+        .expect("the hook environment must set PHORA_CHANGED");
+    assert!(
+        changed.contains("editor"),
+        "PHORA_CHANGED must name the changed artifact member(s) — the `editor` artifact whose \
+         digest moved must appear, got {changed:?}"
+    );
+}
+
+/// INV-2 ordering: files are durable BEFORE any hook runs. The hook observes the
+/// already-deployed artifact on disk, proving dispatch is strictly post-commit.
+#[test]
+fn hook_runs_strictly_after_files_are_deployed() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let log = td.parent_path.join("hook.log");
+    let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+    let cmd = format!(
+        "if [ -f '{}' ]; then printf 'deployed\\n' >> '{}'; \
+         else printf 'missing\\n' >> '{}'; fi",
+        dst.join("init.lua").display(),
+        log.display(),
+        log.display(),
+    );
+    let cfg = config_with_target_hooks(
+        &fx.url,
+        &td.target_path(),
+        &format!("\"{}\"", cmd.replace('"', "\\\"")),
+    );
+
+    sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("sync deploys then fires the hook");
+
+    assert_eq!(
+        log_lines(&log),
+        vec!["deployed".to_owned()],
+        "INV-2: the hook must see the artifact already on disk — files are durable \
+         BEFORE any hook is dispatched (strictly post-commit)"
+    );
+}
+
+/// The global `[hooks] post_sync` with the default `when = always` runs after a
+/// sync regardless of any digest change (the escape-hatch).
+#[test]
+fn global_post_sync_runs_even_on_noop_sync() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let log = td.parent_path.join("post.log");
+    let post = append_cmd(&log, "post").replace('"', "\\\"");
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\"editor-src\"]\nlayout = \"flat\"\n\n\
+         [hooks]\npost_sync = \"{post}\"\nwhen = \"always\"\n",
+        fx.url,
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("global post_sync config parses");
+
+    let first = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("first sync runs post_sync");
+    assert_eq!(
+        log_lines(&log).len(),
+        1,
+        "post_sync must run after the first sync"
+    );
+
+    sync(
+        &input(&cfg, None, Some(first.base_lock.clone()), None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("second no-op sync still runs post_sync");
+
+    assert_eq!(
+        log_lines(&log).len(),
+        2,
+        "global post_sync with when=always must run after EVERY sync, including a no-op — \
+         the log must hold a second line"
+    );
+}
