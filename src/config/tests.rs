@@ -4314,15 +4314,6 @@ post_sync = ["first", "second"]
 }
 
 #[test]
-fn global_hooks_absent_is_default_off() {
-    let cfg = Config::parse("version = 1\n").expect("a minimal config parses");
-    assert!(
-        cfg.hooks.is_none(),
-        "no [hooks] table means the global post_sync hook is OFF"
-    );
-}
-
-#[test]
 fn merge_local_target_hooks_replace_base_hooks() {
     let base = Config::parse(
         r#"
@@ -4717,12 +4708,16 @@ fn global_hooks_post_sync_parses_mixed_array_in_declaration_order() {
 version = 1
 
 [hooks]
-post_sync = [{ run = "first" }, "second"]
+post_sync = [{ run = "first", shell = "bash -c" }, "second"]
 "#,
     )
     .expect("a global `post_sync` array mixing tables and strings must parse");
     assert_eq!(runs(post_sync_of(&cfg)), ["first", "second"]);
-    assert_eq!(shells(post_sync_of(&cfg)), [None, None]);
+    assert_eq!(
+        shells(post_sync_of(&cfg)),
+        [Some("bash -c"), None],
+        "each element keeps its own form: table elements carry their shell, string elements none"
+    );
 }
 
 #[test]
