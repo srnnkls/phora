@@ -39,6 +39,7 @@ pub(super) fn run_sync(prune: bool, force: bool, drop: Option<DropSources>) -> R
             force,
             interactive,
             prune,
+            no_hooks: false,
             resolver: interactive.then_some(&resolver as &dyn ConflictResolver),
         },
         &backend,

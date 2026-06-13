@@ -5,6 +5,8 @@ use serde::Deserialize;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookCommand {
     pub run: String,
+    /// Defaults to `sh -c`. Split on whitespace at dispatch, so an interpreter
+    /// path containing spaces is unsupported.
     pub shell: Option<String>,
 }
 

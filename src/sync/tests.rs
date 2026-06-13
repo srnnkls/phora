@@ -293,6 +293,7 @@ fn input<'a>(
         force,
         interactive: false,
         prune: false,
+        no_hooks: false,
         resolver: None,
     }
 }
@@ -1859,6 +1860,7 @@ fn sync_with_prune_removes_orphan_files_and_record_but_keeps_current() {
         force: false,
         interactive: false,
         prune: true,
+        no_hooks: false,
         resolver: None,
     };
 
@@ -1928,6 +1930,7 @@ fn sync_skips_prune_when_a_deploy_failed() {
         force: false,
         interactive: false,
         prune: true,
+        no_hooks: false,
         resolver: None,
     };
 
@@ -2152,6 +2155,7 @@ fn interactive_input<'a>(
         force: false,
         interactive: true,
         prune: false,
+        no_hooks: false,
         resolver: Some(resolver),
     }
 }
@@ -7199,10 +7203,12 @@ fn config_with_target_hooks(url: &str, target_path: &Path, on_change_toml: &str)
     Config::parse(&toml).expect("target-hooks config parses")
 }
 
-/// The hook id the registry records for the Nth `on_change` hook of `target`,
-/// mirroring the `<target>#<index>` convention seeded in the store suite.
-fn hook_id(target: &str, index: usize) -> String {
-    format!("{target}#{index}")
+/// The single `on_change` hook id recorded under `target` (panics unless exactly
+/// one exists): lets a test reuse the id without reconstructing TOML escaping.
+fn sole_hook_id(reg: &FileRegistry, target: &str) -> String {
+    let mut states = reg.load_hook_state(target).expect("load hook state");
+    assert_eq!(states.len(), 1, "expected exactly one recorded hook id");
+    states.remove(0).hook_id
 }
 
 fn recorded_hook(reg: &FileRegistry, target: &str, id: &str) -> Option<crate::store::HookState> {
@@ -7241,9 +7247,11 @@ fn changing_sync_fires_on_change_hook_once_and_records_success() {
         vec!["fired".to_owned()],
         "a sync that changed the target's digest-set must run on_change EXACTLY once"
     );
+    let id = sole_hook_id(&fx.registry, "dest");
     assert!(
-        recorded_hook(&fx.registry, "dest", &hook_id("dest", 0)).is_some(),
-        "after the hook exits 0 its last-success digest-set must be recorded (INV-4)"
+        id.starts_with("dest#") && recorded_hook(&fx.registry, "dest", &id).is_some(),
+        "after the hook exits 0 its last-success digest-set must be recorded under a \
+         command-keyed `dest#<run>` id (INV-4); got {id:?}"
     );
 }
 
@@ -7382,17 +7390,25 @@ fn on_change_hooks_run_in_declaration_order_and_dedupe() {
     );
 }
 
-/// The hook process environment carries `PHORA_TARGET` (the target name) and
-/// `PHORA_CHANGED` (the changed artifact members), so a hook can react to what moved.
+/// The hook process environment carries `PHORA_TARGET` (the target name),
+/// `PHORA_CHANGED` (the deployed file paths of changed artifacts), and
+/// `PHORA_CHANGED_NAMES` (their registry-key names), so a hook can react.
 #[test]
 fn hook_environment_exposes_phora_target_and_changed() {
     let fx = build_sync_fixture();
     let td = TargetDir::new();
-    let log = td.parent_path.join("hook.log");
+    let target_log = td.parent_path.join("target.log");
+    let changed_log = td.parent_path.join("changed.log");
+    let names_log = td.parent_path.join("names.log");
+    // Each var goes to its own file: PHORA_CHANGED is newline-separated, so a
+    // shared log would split its paths across unrelated lines.
     let cmd = format!(
-        "printf 'target=%s\\n' \"$PHORA_TARGET\" >> '{0}'; \
-         printf 'changed=%s\\n' \"$PHORA_CHANGED\" >> '{0}'",
-        log.display()
+        "printf '%s' \"$PHORA_TARGET\" > '{}'; \
+         printf '%s' \"$PHORA_CHANGED\" > '{}'; \
+         printf '%s' \"$PHORA_CHANGED_NAMES\" > '{}'",
+        target_log.display(),
+        changed_log.display(),
+        names_log.display(),
     );
     let cfg = config_with_target_hooks(
         &fx.url,
@@ -7407,19 +7423,29 @@ fn hook_environment_exposes_phora_target_and_changed() {
     )
     .expect("sync runs the env-reporting hook");
 
-    let lines = log_lines(&log);
-    assert!(
-        lines.iter().any(|l| l == "target=dest"),
-        "the hook environment must set PHORA_TARGET to the target name `dest`, got {lines:?}"
+    let read = |p: &Path| std::fs::read_to_string(p).expect("hook wrote the env var");
+    assert_eq!(
+        read(&target_log),
+        "dest",
+        "the hook environment must set PHORA_TARGET to the target name `dest`"
     );
-    let changed = lines
-        .iter()
-        .find_map(|l| l.strip_prefix("changed="))
-        .expect("the hook environment must set PHORA_CHANGED");
+
+    let deployed = td
+        .artifact_dst(&flat_layout(), "editor-src", "editor")
+        .to_string_lossy()
+        .into_owned();
+    let changed = read(&changed_log);
     assert!(
-        changed.contains("editor"),
-        "PHORA_CHANGED must name the changed artifact member(s) — the `editor` artifact whose \
-         digest moved must appear, got {changed:?}"
+        changed.contains(&deployed),
+        "PHORA_CHANGED must hold the DEPLOYED PATH of the changed `editor` artifact \
+         ({deployed}), got {changed:?}"
+    );
+
+    let names = read(&names_log);
+    assert!(
+        names.split(' ').any(|n| n == "editor"),
+        "PHORA_CHANGED_NAMES must name the changed artifact member(s) — the `editor` \
+         artifact whose digest moved must appear, got {names:?}"
     );
 }
 
@@ -7501,5 +7527,85 @@ fn global_post_sync_runs_even_on_noop_sync() {
         2,
         "global post_sync with when=always must run after EVERY sync, including a no-op — \
          the log must hold a second line"
+    );
+}
+
+/// D1: a removal-only sync (prune drops an artifact, nothing added) must NOT fire
+/// `on_change` — the directional changed set is empty — while the global
+/// `post_sync` escape hatch still runs, since removal reactions are its job.
+#[test]
+fn prune_only_sync_skips_on_change_but_runs_post_sync() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let on_change_log = td.parent_path.join("on_change.log");
+    let post_log = td.parent_path.join("post.log");
+    let on_change_run = append_cmd(&on_change_log, "changed");
+    let post_run = append_cmd(&post_log, "post");
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\"editor-src\"]\nlayout = \"flat\"\n\n\
+         [targets.dest.hooks]\non_change = \"{}\"\n\n\
+         [hooks]\npost_sync = \"{}\"\nwhen = \"always\"\n",
+        fx.url,
+        td.target_path().display(),
+        on_change_run.replace('"', "\\\""),
+        post_run.replace('"', "\\\""),
+    );
+    let cfg = Config::parse(&toml).expect("removal-scenario config parses");
+
+    let first = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("first sync deploys, fires on_change, runs post_sync");
+    assert_eq!(
+        log_lines(&on_change_log).len(),
+        1,
+        "premise: the first changing sync fires on_change once"
+    );
+    assert_eq!(
+        log_lines(&post_log).len(),
+        1,
+        "premise: post_sync runs after the first sync"
+    );
+
+    // Record an extra (now-removed) digest into last-success so the post-prune
+    // current set is a strict subset of it: a pure removal, no additions.
+    let id = sole_hook_id(&fx.registry, "dest");
+    let mut recorded: std::collections::BTreeSet<String> = recorded_hook(&fx.registry, "dest", &id)
+        .expect("on_change recorded last-success on first sync")
+        .last_success;
+    recorded.insert("blake3:orphan".to_owned());
+    fx.registry
+        .record_hook_success("dest", &id, &recorded)
+        .expect("seed last-success with the soon-to-be-removed digest");
+    let orphan_dst = seed_orphan(&td, &fx.registry, &flat_layout());
+
+    let in_ = SyncInput {
+        base_config: &cfg,
+        local_config: None,
+        base_lock: Some(first.base_lock.clone()),
+        local_lock: None,
+        force: false,
+        interactive: false,
+        prune: true,
+        no_hooks: false,
+        resolver: None,
+    };
+    sync(&in_, &fx.backend, &fx.registry).expect("prune-only sync runs");
+
+    assert!(!orphan_dst.exists(), "premise: --prune removed the orphan");
+    assert_eq!(
+        log_lines(&on_change_log).len(),
+        1,
+        "D1: a removal-only sync must NOT fire on_change — the directional changed \
+         set is empty, so the log keeps exactly the one line from the first run"
+    );
+    assert_eq!(
+        log_lines(&post_log).len(),
+        2,
+        "D1: the global post_sync escape hatch must still run on a removal-only sync"
     );
 }
