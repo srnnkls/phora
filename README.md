@@ -192,6 +192,56 @@ where an artifact wants to land, it prompts (on a TTY):
 
 Non-interactive runs skip such files unless `--force` is given.
 
+### Hooks
+
+Hooks run shell commands after a sync. A target's `on_change` fires once after a
+sync that **added or modified** that target's artifacts (pure removals don't
+trigger it — that's what the global `post_sync` escape hatch is for); the global
+`[hooks] post_sync` runs after **every** sync. Hooks are declared only in
+`phora.toml` / `phora.local.toml`.
+
+```toml
+[targets.neovim.hooks]
+# a bare string runs under `sh -c`
+on_change = "nvim --headless +'Lazy! sync' +qa"
+
+[targets.editors.hooks]
+# a table picks the shell; an array runs several in declared order (deduped)
+on_change = [
+  { run = "stylua .", shell = "bash -c" },
+  "git -C ~/.config add -A",
+]
+
+[hooks]
+post_sync = "notify-send 'phora synced'"   # runs every sync (when = "always")
+```
+
+A hook value is a command string, a `{ run = "...", shell = "..." }` table
+(`shell` optional, default `sh -c`), or an array mixing both. Each hook sees
+phora's full environment plus, for `on_change`:
+
+| Variable              | Value                                             |
+| --------------------- | ------------------------------------------------- |
+| `PHORA_TARGET`        | the target name                                   |
+| `PHORA_CHANGED`       | newline-separated deployed paths of changed artifacts |
+| `PHORA_CHANGED_NAMES` | newline-separated artifact names                  |
+
+Artifacts land on disk **before** the hook runs. Hook success is recorded, so a
+no-op sync runs no `on_change`; a hook that exits non-zero is not recorded, makes
+`phora sync` exit non-zero, leaves the deployed files in place, and re-fires on
+the next sync. `phora sync --no-hooks` deploys without running any hook.
+
+Each hook that ran is reported with its scope and status:
+
+```
+hook neovim#nvim --headless +'Lazy! sync' +qa#sh -c [on_change] `nvim --headless +'Lazy! sync' +qa` ok
+sync complete
+```
+
+**Trust boundary.** Hooks come only from the consumer's config. A synced source
+tree that happens to carry a hook-shaped `phora.toml` is inert content — it is
+never read as config and never executes.
+
 ## Configuration
 
 Phora reads `phora.toml` from the working directory, optionally overlaid by
