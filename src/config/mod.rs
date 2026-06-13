@@ -1,5 +1,6 @@
 //! Config DTOs (`phora.toml`). This module is a boundary, so it carries serde.
 
+mod hooks;
 mod host;
 mod migrate;
 mod source;
@@ -15,6 +16,7 @@ use serde::Deserialize;
 use crate::error::{Error, Result};
 pub use crate::source::Protocol;
 
+pub use hooks::{GlobalHooks, HookCommand, HookWhen, TargetHooks};
 pub use host::{AuthConfig, Host, RemoteConfig, builtin_forges};
 pub use migrate::MigrationWarning;
 pub use source::{DeployMode, ParsedSource, Refspec, Remote, Source, SourceMode};
@@ -50,6 +52,8 @@ pub struct Config {
     pub targets: BTreeMap<String, Target>,
     #[serde(default)]
     pub defaults: Defaults,
+    #[serde(default)]
+    pub hooks: Option<GlobalHooks>,
 }
 
 impl Config {
@@ -330,6 +334,9 @@ pub fn merge_configs(base: Config, local: Option<Config>) -> Config {
     }
     if local.defaults.auto_target.is_some() {
         merged.defaults.auto_target = local.defaults.auto_target;
+    }
+    if local.hooks.is_some() {
+        merged.hooks = local.hooks;
     }
     merged
 }

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use super::hooks::TargetHooks;
 use super::source::{ParsedSource, Refspec, Source};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -13,6 +14,8 @@ pub struct Target {
     pub path: PathBuf,
     pub sources: Option<Vec<Binding>>,
     pub layout: Option<LayoutConfig>,
+    #[serde(default)]
+    pub hooks: Option<TargetHooks>,
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +159,9 @@ impl Target {
         }
         if local.layout.is_some() {
             self.layout = local.layout;
+        }
+        if local.hooks.is_some() {
+            self.hooks = local.hooks;
         }
         self
     }
