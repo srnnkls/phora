@@ -4191,3 +4191,788 @@ mod per_binding_refinement {
         );
     }
 }
+
+// TPH-001: hook config schema — [targets.X.hooks] on_change + global [hooks] post_sync
+
+fn on_change_of<'a>(cfg: &'a Config, target: &str) -> &'a [HookCommand] {
+    target_of(cfg, target)
+        .hooks
+        .as_ref()
+        .expect("target declares hooks")
+        .on_change
+        .as_deref()
+        .expect("hooks declare on_change")
+}
+
+fn post_sync_of(cfg: &Config) -> &[HookCommand] {
+    cfg.hooks
+        .as_ref()
+        .expect("global [hooks] table present")
+        .post_sync
+        .as_deref()
+        .expect("post_sync declared")
+}
+
+fn runs(commands: &[HookCommand]) -> Vec<&str> {
+    commands.iter().map(|c| c.run.as_str()).collect()
+}
+
+fn shells(commands: &[HookCommand]) -> Vec<Option<&str>> {
+    commands.iter().map(|c| c.shell.as_deref()).collect()
+}
+
+#[test]
+fn target_hooks_on_change_parses_single_string_as_one_command() {
+    let cfg = Config::parse(
+        r#"
+version = 1
+
+[targets.t]
+path = "~/x"
+
+[targets.t.hooks]
+on_change = "bat cache --build"
+"#,
+    )
+    .expect("a target with a string `on_change` hook must parse");
+    assert_eq!(
+        runs(on_change_of(&cfg, "t")),
+        ["bat cache --build"],
+        "a single command string must normalize to a one-element command list"
+    );
+    assert_eq!(
+        shells(on_change_of(&cfg, "t")),
+        [None],
+        "the string form is shorthand for `{{ run = ... }}` and carries no shell"
+    );
+}
+
+#[test]
+fn target_hooks_on_change_parses_list_in_declaration_order() {
+    let cfg = Config::parse(
+        r#"
+version = 1
+
+[targets.t]
+path = "~/x"
+
+[targets.t.hooks]
+on_change = ["first --flag", "second"]
+"#,
+    )
+    .expect("a target with a list `on_change` hook must parse");
+    assert_eq!(
+        runs(on_change_of(&cfg, "t")),
+        ["first --flag", "second"],
+        "list commands must keep declaration order"
+    );
+}
+
+#[test]
+fn hook_free_config_parses_with_no_hooks_anywhere() {
+    let cfg =
+        Config::parse(EXAMPLE_TOML).expect("the hook-free example toml must parse unchanged");
+    assert!(
+        cfg.hooks.is_none(),
+        "an absent global [hooks] table must parse as None (global hook OFF by default)"
+    );
+    for (name, target) in &cfg.targets {
+        assert!(
+            target.hooks.is_none(),
+            "target `{name}` declares no hooks and must carry none"
+        );
+    }
+}
+
+#[test]
+fn global_hooks_post_sync_parses_string_with_when_always() {
+    let cfg = Config::parse(
+        r#"
+version = 1
+
+[hooks]
+post_sync = "reload-everything"
+when = "always"
+"#,
+    )
+    .expect("a global [hooks] table with post_sync and when = \"always\" must parse");
+    assert_eq!(runs(post_sync_of(&cfg)), ["reload-everything"]);
+}
+
+#[test]
+fn global_hooks_post_sync_parses_list_in_declaration_order() {
+    let cfg = Config::parse(
+        r#"
+version = 1
+
+[hooks]
+post_sync = ["first", "second"]
+"#,
+    )
+    .expect("a global [hooks] table with a post_sync list and no `when` key must parse");
+    assert_eq!(runs(post_sync_of(&cfg)), ["first", "second"]);
+}
+
+#[test]
+fn global_hooks_absent_is_default_off() {
+    let cfg = Config::parse("version = 1\n").expect("a minimal config parses");
+    assert!(
+        cfg.hooks.is_none(),
+        "no [hooks] table means the global post_sync hook is OFF"
+    );
+}
+
+#[test]
+fn merge_local_target_hooks_replace_base_hooks() {
+    let base = Config::parse(
+        r#"
+version = 1
+
+[targets.t]
+path = "~/x"
+
+[targets.t.hooks]
+on_change = ["base-cmd"]
+"#,
+    )
+    .expect("base parses");
+    let local = Config::parse(
+        r#"
+version = 1
+
+[targets.t]
+path = "~/x"
+
+[targets.t.hooks]
+on_change = "local-cmd"
+"#,
+    )
+    .expect("local parses");
+
+    let effective = merge_configs(base, Some(local));
+    assert_eq!(
+        runs(on_change_of(&effective, "t")),
+        ["local-cmd"],
+        "a local target `hooks` table must replace the base target's hooks wholesale \
+         (per-key target merge, like `layout`)"
+    );
+}
+
+#[test]
+fn merge_path_only_target_override_preserves_base_hooks() {
+    let base = Config::parse(
+        r#"
+version = 1
+
+[targets.t]
+path = "~/x"
+
+[targets.t.hooks]
+on_change = "base-cmd"
+"#,
+    )
+    .expect("base parses");
+    let local = Config::parse(
+        r#"
+version = 1
+
+[targets.t]
+path = "/local/override"
+"#,
+    )
+    .expect("local parses");
+
+    let effective = merge_configs(base, Some(local));
+    assert_eq!(
+        runs(on_change_of(&effective, "t")),
+        ["base-cmd"],
+        "a path-only local override must NOT clear the base target's hooks"
+    );
+}
+
+#[test]
+fn merge_local_empty_on_change_clears_base_hooks() {
+    let base = Config::parse(
+        r#"
+version = 1
+
+[targets.t]
+path = "~/x"
+
+[targets.t.hooks]
+on_change = "base-cmd"
+"#,
+    )
+    .expect("base parses");
+    let local = Config::parse(
+        r#"
+version = 1
+
+[targets.t]
+path = "~/x"
+
+[targets.t.hooks]
+on_change = []
+"#,
+    )
+    .expect("local parses");
+
+    let effective = merge_configs(base, Some(local));
+    assert!(
+        on_change_of(&effective, "t").is_empty(),
+        "an explicit empty `on_change = []` in local must clear the base commands, \
+         not be ignored as if unset (mirrors `include = []` clearing)"
+    );
+}
+
+#[test]
+fn merge_global_hooks_local_wins() {
+    let base = Config::parse(
+        r#"
+version = 1
+
+[hooks]
+post_sync = "base-reload"
+"#,
+    )
+    .expect("base parses");
+    let local = Config::parse(
+        r#"
+version = 1
+
+[hooks]
+post_sync = "local-reload"
+"#,
+    )
+    .expect("local parses");
+
+    let effective = merge_configs(base, Some(local));
+    assert_eq!(
+        runs(post_sync_of(&effective)),
+        ["local-reload"],
+        "a local [hooks] table must override the base global hooks"
+    );
+}
+
+#[test]
+fn merge_keeps_base_global_hooks_when_local_omits_them() {
+    let base = Config::parse(
+        r#"
+version = 1
+
+[hooks]
+post_sync = "base-reload"
+"#,
+    )
+    .expect("base parses");
+    let local = Config::parse("version = 1\n").expect("local parses");
+
+    let effective = merge_configs(base, Some(local));
+    assert_eq!(
+        runs(post_sync_of(&effective)),
+        ["base-reload"],
+        "a local config without a [hooks] table must preserve the base global hooks"
+    );
+}
+
+#[test]
+fn unknown_target_hooks_key_is_rejected_naming_it() {
+    let toml = r#"
+version = 1
+
+[targets.t]
+path = "~/x"
+
+[targets.t.hooks]
+on_chnage = "x"
+"#;
+    let err =
+        Config::parse(toml).expect_err("an unknown key in [targets.X.hooks] must be rejected");
+    match err {
+        Error::Config(msg) => assert!(
+            msg.contains("on_chnage"),
+            "error should name the offending key, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn unknown_global_hooks_key_is_rejected_naming_it() {
+    let toml = r#"
+version = 1
+
+[hooks]
+pre_sync = "x"
+"#;
+    let err = Config::parse(toml).expect_err(
+        "an unknown key in the global [hooks] table must be rejected \
+         (no `pre` hooks in v1)",
+    );
+    match err {
+        Error::Config(msg) => assert!(
+            msg.contains("pre_sync"),
+            "error should name the offending key, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn empty_on_change_command_string_is_rejected() {
+    let toml = r#"
+version = 1
+
+[targets.t]
+path = "~/x"
+
+[targets.t.hooks]
+on_change = ""
+"#;
+    let err = Config::parse(toml).expect_err("an empty `on_change` command must be rejected");
+    match err {
+        Error::Config(msg) => assert!(
+            msg.to_lowercase().contains("empty"),
+            "empty-command rejection must say the command is empty, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn blank_command_in_on_change_list_is_rejected() {
+    let toml = r#"
+version = 1
+
+[targets.t]
+path = "~/x"
+
+[targets.t.hooks]
+on_change = ["ok-cmd", ""]
+"#;
+    let err = Config::parse(toml)
+        .expect_err("a blank command inside an `on_change` list must be rejected");
+    match err {
+        Error::Config(msg) => assert!(
+            msg.to_lowercase().contains("empty"),
+            "blank-command rejection must say the command is empty, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn empty_post_sync_command_is_rejected() {
+    let toml = r#"
+version = 1
+
+[hooks]
+post_sync = ""
+"#;
+    let err = Config::parse(toml).expect_err("an empty `post_sync` command must be rejected");
+    match err {
+        Error::Config(msg) => assert!(
+            msg.to_lowercase().contains("empty"),
+            "empty-command rejection must say the command is empty, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn global_hooks_when_rejects_unknown_value_naming_it() {
+    let toml = r#"
+version = 1
+
+[hooks]
+post_sync = "reload"
+when = "on-change"
+"#;
+    let err = Config::parse(toml)
+        .expect_err("only `when = \"always\"` is valid on the global [hooks] table in v1");
+    match err {
+        Error::Config(msg) => assert!(
+            msg.contains("on-change"),
+            "error should name the offending `when` value, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn source_declaring_hooks_is_rejected_at_schema_level() {
+    let toml = r#"
+version = 1
+
+[sources.s]
+git = "https://example.com/x.git"
+
+[sources.s.hooks]
+on_change = "evil"
+"#;
+    let err = Config::parse(toml).expect_err(
+        "INV-1: hook fields exist only on consumer config types — a `hooks` key on a \
+         source must stay an unknown field",
+    );
+    match err {
+        Error::Config(msg) => assert!(
+            msg.contains("hooks"),
+            "error should name the rejected `hooks` key, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+// TPH-001: full mise hook value grammar — string | { run, shell } table | mixed array
+
+#[test]
+fn target_hooks_on_change_parses_table_with_run_and_shell() {
+    let cfg = Config::parse(
+        r#"
+version = 1
+
+[targets.t]
+path = "~/x"
+
+[targets.t.hooks]
+on_change = { run = "bat cache --build", shell = "bash -c" }
+"#,
+    )
+    .expect("a target with a `{ run, shell }` table `on_change` hook must parse");
+    assert_eq!(runs(on_change_of(&cfg, "t")), ["bat cache --build"]);
+    assert_eq!(
+        shells(on_change_of(&cfg, "t")),
+        [Some("bash -c")],
+        "the optional `shell` key must be parsed and carried on the command"
+    );
+}
+
+#[test]
+fn target_hooks_on_change_table_without_shell_carries_none() {
+    let cfg = Config::parse(
+        r#"
+version = 1
+
+[targets.t]
+path = "~/x"
+
+[targets.t.hooks]
+on_change = { run = "bat cache --build" }
+"#,
+    )
+    .expect("a `{ run }` table without `shell` must parse (shell is optional)");
+    assert_eq!(runs(on_change_of(&cfg, "t")), ["bat cache --build"]);
+    assert_eq!(
+        shells(on_change_of(&cfg, "t")),
+        [None],
+        "an omitted `shell` must parse as None (sh -c semantics are the dispatch default)"
+    );
+}
+
+#[test]
+fn target_hooks_on_change_parses_mixed_array_in_declaration_order() {
+    let cfg = Config::parse(
+        r#"
+version = 1
+
+[targets.t]
+path = "~/x"
+
+[targets.t.hooks]
+on_change = ["first --flag", { run = "second", shell = "zsh -c" }, "third"]
+"#,
+    )
+    .expect("an `on_change` array mixing strings and `{ run, shell }` tables must parse");
+    assert_eq!(
+        runs(on_change_of(&cfg, "t")),
+        ["first --flag", "second", "third"],
+        "mixed-array commands must keep declaration order"
+    );
+    assert_eq!(
+        shells(on_change_of(&cfg, "t")),
+        [None, Some("zsh -c"), None],
+        "each element keeps its own form: string elements carry no shell, table elements do"
+    );
+}
+
+#[test]
+fn global_hooks_post_sync_parses_table_form() {
+    let cfg = Config::parse(
+        r#"
+version = 1
+
+[hooks]
+post_sync = { run = "reload-everything", shell = "fish -c" }
+"#,
+    )
+    .expect("a global `post_sync` in `{ run, shell }` table form must parse");
+    assert_eq!(runs(post_sync_of(&cfg)), ["reload-everything"]);
+    assert_eq!(shells(post_sync_of(&cfg)), [Some("fish -c")]);
+}
+
+#[test]
+fn global_hooks_post_sync_parses_mixed_array_in_declaration_order() {
+    let cfg = Config::parse(
+        r#"
+version = 1
+
+[hooks]
+post_sync = [{ run = "first" }, "second"]
+"#,
+    )
+    .expect("a global `post_sync` array mixing tables and strings must parse");
+    assert_eq!(runs(post_sync_of(&cfg)), ["first", "second"]);
+    assert_eq!(shells(post_sync_of(&cfg)), [None, None]);
+}
+
+#[test]
+fn hook_table_without_run_is_rejected_naming_run() {
+    let toml = r#"
+version = 1
+
+[targets.t]
+path = "~/x"
+
+[targets.t.hooks]
+on_change = { shell = "bash -c" }
+"#;
+    let err =
+        Config::parse(toml).expect_err("a hook table without `run` must be rejected (required)");
+    match err {
+        Error::Config(msg) => assert!(
+            msg.contains("run"),
+            "error should name the missing `run` key, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn hook_table_unknown_key_is_rejected_naming_it() {
+    let toml = r#"
+version = 1
+
+[targets.t]
+path = "~/x"
+
+[targets.t.hooks]
+on_change = { run = "x", cwd = "/tmp" }
+"#;
+    let err = Config::parse(toml).expect_err("an unknown key in a hook table must be rejected");
+    match err {
+        Error::Config(msg) => assert!(
+            msg.contains("cwd"),
+            "error should name the offending hook-table key, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn empty_run_in_hook_table_is_rejected() {
+    let toml = r#"
+version = 1
+
+[targets.t]
+path = "~/x"
+
+[targets.t.hooks]
+on_change = { run = "" }
+"#;
+    let err = Config::parse(toml).expect_err("an empty `run` in a hook table must be rejected");
+    match err {
+        Error::Config(msg) => assert!(
+            msg.to_lowercase().contains("empty"),
+            "empty-run rejection must say the command is empty, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn blank_run_in_hook_table_is_rejected() {
+    let toml = r#"
+version = 1
+
+[targets.t]
+path = "~/x"
+
+[targets.t.hooks]
+on_change = { run = "   " }
+"#;
+    let err =
+        Config::parse(toml).expect_err("a whitespace-only `run` in a hook table must be rejected");
+    match err {
+        Error::Config(msg) => {
+            let m = msg.to_lowercase();
+            assert!(
+                m.contains("empty") || m.contains("blank"),
+                "blank-run rejection must say the command is empty/blank, got: {msg}"
+            );
+        }
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn empty_shell_in_hook_table_is_rejected() {
+    let toml = r#"
+version = 1
+
+[targets.t]
+path = "~/x"
+
+[targets.t.hooks]
+on_change = { run = "x", shell = "" }
+"#;
+    let err = Config::parse(toml).expect_err("an empty `shell` in a hook table must be rejected");
+    match err {
+        Error::Config(msg) => {
+            let m = msg.to_lowercase();
+            assert!(
+                m.contains("shell") && (m.contains("empty") || m.contains("blank")),
+                "empty-shell rejection must name `shell` and say it is empty, got: {msg}"
+            );
+        }
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn blank_shell_in_hook_table_is_rejected() {
+    let toml = r#"
+version = 1
+
+[hooks]
+post_sync = { run = "reload", shell = "  " }
+"#;
+    let err = Config::parse(toml)
+        .expect_err("a whitespace-only `shell` in a hook table must be rejected");
+    match err {
+        Error::Config(msg) => {
+            let m = msg.to_lowercase();
+            assert!(
+                m.contains("shell") && (m.contains("empty") || m.contains("blank")),
+                "blank-shell rejection must name `shell` and say it is empty/blank, got: {msg}"
+            );
+        }
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn mixed_array_table_element_without_run_is_rejected() {
+    let toml = r#"
+version = 1
+
+[targets.t]
+path = "~/x"
+
+[targets.t.hooks]
+on_change = ["ok-cmd", { shell = "bash -c" }]
+"#;
+    let err = Config::parse(toml).expect_err(
+        "a table element without `run` inside a mixed array must be rejected \
+         (each element validated by its own form's rules)",
+    );
+    match err {
+        Error::Config(msg) => assert!(
+            msg.contains("run"),
+            "error should name the missing `run` key, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn mixed_array_table_element_with_empty_run_is_rejected() {
+    let toml = r#"
+version = 1
+
+[hooks]
+post_sync = [{ run = "" }, "ok-cmd"]
+"#;
+    let err = Config::parse(toml)
+        .expect_err("a table element with an empty `run` inside a mixed array must be rejected");
+    match err {
+        Error::Config(msg) => assert!(
+            msg.to_lowercase().contains("empty"),
+            "empty-run rejection must say the command is empty, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn merge_local_table_form_target_hooks_replace_base_hooks() {
+    let base = Config::parse(
+        r#"
+version = 1
+
+[targets.t]
+path = "~/x"
+
+[targets.t.hooks]
+on_change = ["base-cmd"]
+"#,
+    )
+    .expect("base parses");
+    let local = Config::parse(
+        r#"
+version = 1
+
+[targets.t]
+path = "~/x"
+
+[targets.t.hooks]
+on_change = { run = "local-cmd", shell = "bash -c" }
+"#,
+    )
+    .expect("local parses");
+
+    let effective = merge_configs(base, Some(local));
+    assert_eq!(
+        runs(on_change_of(&effective, "t")),
+        ["local-cmd"],
+        "a local table-form hook must replace the base target's hooks wholesale"
+    );
+    assert_eq!(
+        shells(on_change_of(&effective, "t")),
+        [Some("bash -c")],
+        "the local table's `shell` must survive the merge"
+    );
+}
+
+#[test]
+fn merge_local_mixed_array_global_hooks_win() {
+    let base = Config::parse(
+        r#"
+version = 1
+
+[hooks]
+post_sync = { run = "base-reload", shell = "fish -c" }
+"#,
+    )
+    .expect("base parses");
+    let local = Config::parse(
+        r#"
+version = 1
+
+[hooks]
+post_sync = ["local-first", { run = "local-second", shell = "zsh -c" }]
+"#,
+    )
+    .expect("local parses");
+
+    let effective = merge_configs(base, Some(local));
+    assert_eq!(
+        runs(post_sync_of(&effective)),
+        ["local-first", "local-second"],
+        "a local mixed-array [hooks] value must override the base global hooks wholesale"
+    );
+    assert_eq!(
+        shells(post_sync_of(&effective)),
+        [None, Some("zsh -c")],
+        "the local mixed array's per-element shells must survive the merge"
+    );
+}
