@@ -119,6 +119,9 @@ pub trait SourceBackend {
         selection: &Selection,
     ) -> Result<Vec<ArtifactName>>;
 
+    /// # Errors
+    /// - [`SourceError::Render`]: a templated file is invalid or fails to render.
+    /// - [`SourceError::DeployedNameCollision`]: two source paths map to the same deployed name.
     fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult>;
 
     /// Artifact-relative paths selected at `commit`, read from the mirror without
@@ -723,6 +726,8 @@ impl<'a> Renderer<'a> {
         let mut env = minijinja::Environment::new();
         env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
         env.set_keep_trailing_newline(true);
+        // Bounds runaway templates from untrusted sources (e.g. unbounded loops).
+        env.set_fuel(Some(1_000_000));
         Self { opt_in, env, vars }
     }
 
@@ -735,7 +740,6 @@ impl<'a> Renderer<'a> {
         PathBuf::from(self.opt_in.deployed_name(&key))
     }
 
-    /// Rendered bytes for a templated file, or the source bytes verbatim.
     fn render(&self, entry_rel: &Path, source_bytes: &[u8]) -> Result<Vec<u8>> {
         let key = Self::rel_key(entry_rel);
         if !self.opt_in.renders(&key) {
@@ -755,7 +759,7 @@ impl<'a> Renderer<'a> {
     }
 }
 
-struct ExportWalk<'a> {
+struct ExportWalk<'a, 'r> {
     repo: &'a gix::Repository,
     source: &'a str,
     out_base: &'a Path,
@@ -764,11 +768,11 @@ struct ExportWalk<'a> {
     commit_time: u64,
     files: Vec<ManifestFile>,
     hasher: blake3::Hasher,
-    renderer: &'a Renderer<'a>,
+    renderer: &'a Renderer<'r>,
     deployed_names: BTreeMap<PathBuf, PathBuf>,
 }
 
-impl ExportWalk<'_> {
+impl ExportWalk<'_, '_> {
     fn run(&mut self, tree: &gix::Tree<'_>, rel_path: &Path) -> Result<()> {
         for entry in tree.iter() {
             let entry = entry.map_err(|e| {
@@ -787,7 +791,7 @@ impl ExportWalk<'_> {
             match kind {
                 EntryKind::Blob | EntryKind::BlobExecutable => {
                     let executable = kind == EntryKind::BlobExecutable;
-                    self.write_blob(&entry, &entry_rel, &out_path, executable)?;
+                    self.write_blob(&entry, &entry_rel, executable)?;
                 }
                 EntryKind::Link => self.write_link(&entry, &entry_rel, &out_path)?,
                 EntryKind::Tree => {
@@ -811,7 +815,6 @@ impl ExportWalk<'_> {
         &mut self,
         entry: &gix::object::tree::EntryRef<'_, '_>,
         entry_rel: &Path,
-        _out_path: &Path,
         executable: bool,
     ) -> Result<()> {
         let source_bytes = GitBackend::find_blob_data(self.repo, self.source, entry.object_id())?;
@@ -879,6 +882,19 @@ impl ExportWalk<'_> {
             });
         }
         let target = GitBackend::find_blob_data(self.repo, self.source, entry.object_id())?;
+
+        let deployed_rel = entry_rel.to_path_buf();
+        if let Some(prior) = self
+            .deployed_names
+            .insert(deployed_rel.clone(), entry_rel.to_path_buf())
+        {
+            return Err(SourceError::DeployedNameCollision {
+                name: deployed_rel.to_string_lossy().into_owned(),
+                first: prior,
+                second: entry_rel.to_path_buf(),
+            });
+        }
+
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -1469,6 +1485,25 @@ mod tests {
         for (name, content) in files {
             std::fs::write(art.join(name), content).expect("write collision file");
         }
+        run_git(src_path, &["add", "-A"]);
+        let commit = commit_export_repo(src_path);
+
+        export_fixture_from(src, commit)
+    }
+
+    #[expect(
+        clippy::unwrap_used,
+        reason = "fixture setup fails loudly; git CLI is assumed present"
+    )]
+    fn build_symlink_template_collision_fixture() -> ExportFixture {
+        let src = TempDir::new().unwrap();
+        let src_path = src.path();
+        init_export_repo(src_path);
+
+        let art = src_path.join("art");
+        std::fs::create_dir_all(&art).unwrap();
+        std::fs::write(art.join("link.tmpl"), b"rendered\n").unwrap();
+        std::os::unix::fs::symlink(LINK_TARGET, art.join("link")).unwrap();
         run_git(src_path, &["add", "-A"]);
         let commit = commit_export_repo(src_path);
 
@@ -2447,6 +2482,53 @@ path = "srnnkls/tropos"
             std::fs::read_link(&link).expect("readlink"),
             Path::new(LINK_TARGET),
             "symlink target must be preserved verbatim"
+        );
+    }
+
+    #[test]
+    fn export_rejects_symlink_colliding_with_rendered_deployed_name() {
+        let fixture = build_symlink_template_collision_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+        let staging = TempDir::new().expect("staging dir");
+
+        let m = matcher(&[], &[]);
+        let policy = ExportPolicy {
+            allow_symlinks: true,
+            ..ExportPolicy::default()
+        };
+        let err = export_named(&fixture, "art", staging.path(), &m, &policy)
+            .expect_err("symlink `link` and rendered `link.tmpl` both deploy to `link`");
+        assert!(
+            matches!(err, SourceError::DeployedNameCollision { .. }),
+            "a symlink and a blob mapping to the same deployed name must collide, not last-writer-wins, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn export_aborts_a_runaway_template_via_fuel_instead_of_hanging() {
+        let runaway = b"{% for i in range(100000000) %}x{% endfor %}\n";
+        let fixture = build_collision_fixture(&[("loop.txt.tmpl", runaway)]);
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+        let staging = TempDir::new().expect("staging dir");
+
+        let m = matcher(&[], &[]);
+        let err = export_named(
+            &fixture,
+            "art",
+            staging.path(),
+            &m,
+            &ExportPolicy::default(),
+        )
+        .expect_err("a template that exhausts the fuel budget must surface an error");
+        assert!(
+            matches!(err, SourceError::Render { .. }),
+            "exceeding the minijinja fuel cap must abort the artifact as a Render error, not panic or hang, got: {err:?}"
         );
     }
 
