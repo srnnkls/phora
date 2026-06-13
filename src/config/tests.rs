@@ -5027,3 +5027,423 @@ post_sync = ["local-first", { run = "local-second", shell = "zsh -c" }]
         "the local mixed array's per-element shells must survive the merge"
     );
 }
+
+// TPH-008: [vars] table + phora.local.toml per-key overlay (M003)
+
+fn vars_of(cfg: &Config) -> &BTreeMap<String, String> {
+    &cfg.vars
+}
+
+#[test]
+fn vars_table_parses_flat_string_map() {
+    let cfg = Config::parse(
+        r#"
+version = 1
+
+[vars]
+email = "soeren@code17.io"
+editor = "nvim"
+"#,
+    )
+    .expect("a flat [vars] string table must parse");
+    assert_eq!(
+        vars_of(&cfg).get("email").map(String::as_str),
+        Some("soeren@code17.io"),
+        "a [vars] key must parse to its string value"
+    );
+    assert_eq!(
+        vars_of(&cfg).get("editor").map(String::as_str),
+        Some("nvim")
+    );
+}
+
+#[test]
+fn vars_absent_parses_as_empty_map() {
+    let cfg = Config::parse("version = 1\n").expect("a config with no [vars] table must parse");
+    assert!(
+        vars_of(&cfg).is_empty(),
+        "an absent [vars] table must parse as an empty map, never an error"
+    );
+}
+
+#[test]
+fn vars_non_string_value_is_rejected() {
+    let toml = r#"
+version = 1
+
+[vars]
+count = 3
+"#;
+    assert!(
+        matches!(Config::parse(toml), Err(Error::Config(_))),
+        "a non-string [vars] value must be rejected: vars are a flat string map"
+    );
+}
+
+#[test]
+fn merge_local_vars_overlay_is_per_key_local_wins_omitted_preserved() {
+    let base = Config::parse(
+        r#"
+version = 1
+
+[vars]
+email = "work@code17.io"
+editor = "nvim"
+host = "thinkpad"
+"#,
+    )
+    .expect("base parses");
+    let local = Config::parse(
+        r#"
+version = 1
+
+[vars]
+email = "home@code17.io"
+"#,
+    )
+    .expect("local parses");
+
+    let effective = merge_configs(base, Some(local));
+    let vars = vars_of(&effective);
+    assert_eq!(
+        vars.get("email").map(String::as_str),
+        Some("home@code17.io"),
+        "a local [vars] key must override the matching base key (local wins)"
+    );
+    assert_eq!(
+        vars.get("editor").map(String::as_str),
+        Some("nvim"),
+        "a base [vars] key the local omits must be PRESERVED, not blanked \
+         (per-key overlay, not table-level replace — dotter #174)"
+    );
+    assert_eq!(
+        vars.get("host").map(String::as_str),
+        Some("thinkpad"),
+        "every base key the local omits must survive the per-key overlay"
+    );
+}
+
+#[test]
+fn merge_local_only_vars_added_when_base_has_none() {
+    let base = Config::parse("version = 1\n").expect("base parses");
+    let local = Config::parse(
+        r#"
+version = 1
+
+[vars]
+email = "home@code17.io"
+"#,
+    )
+    .expect("local parses");
+
+    let effective = merge_configs(base, Some(local));
+    assert_eq!(
+        vars_of(&effective).get("email").map(String::as_str),
+        Some("home@code17.io"),
+        "a local-only [vars] table must be adopted wholesale when the base has none"
+    );
+}
+
+#[test]
+fn merge_base_vars_kept_when_local_omits_the_table() {
+    let base = Config::parse(
+        r#"
+version = 1
+
+[vars]
+email = "work@code17.io"
+"#,
+    )
+    .expect("base parses");
+    let local = Config::parse("version = 1\n").expect("local parses");
+
+    let effective = merge_configs(base, Some(local));
+    assert_eq!(
+        vars_of(&effective).get("email").map(String::as_str),
+        Some("work@code17.io"),
+        "a local config with no [vars] table must preserve the base vars entirely"
+    );
+}
+
+// TPH-008: template opt-in (M001) — per-binding `template` glob list + `.tmpl` suffix
+
+fn refined<'a>(cfg: &'a Config, target: &str) -> &'a RefinedBinding {
+    target_of(cfg, target)
+        .sources
+        .as_deref()
+        .expect("target declares sources")
+        .iter()
+        .find_map(|b| match b {
+            Binding::Refined(r) => Some(r),
+            Binding::Source(_) => None,
+        })
+        .expect("target declares a refined binding")
+}
+
+#[test]
+fn binding_template_glob_list_parses() {
+    let cfg = Config::parse(
+        r#"
+version = 1
+
+[sources.dotfiles]
+git = "https://github.com/me/dotfiles.git"
+
+[targets.t]
+path = "~/x"
+sources = [{ source = "dotfiles", template = ["*.conf", "**/*.ini"] }]
+"#,
+    )
+    .expect("a per-binding `template` glob list must parse");
+    let opt_in = refined(&cfg, "t")
+        .template
+        .as_ref()
+        .expect("the binding carries a template opt-in");
+    assert!(
+        opt_in.renders("app.conf"),
+        "a file matching a `template` glob must opt into rendering"
+    );
+    assert!(
+        opt_in.renders("nested/dir/settings.ini"),
+        "a `**/*.ini` glob must match a nested path"
+    );
+    assert!(
+        !opt_in.renders("notes.md"),
+        "a file matching no template glob (and no .tmpl suffix) must NOT opt in"
+    );
+}
+
+#[test]
+fn tmpl_suffix_opts_in_by_default_without_a_glob_list() {
+    let cfg = Config::parse(
+        r#"
+version = 1
+
+[sources.dotfiles]
+git = "https://github.com/me/dotfiles.git"
+
+[targets.t]
+path = "~/x"
+sources = [{ source = "dotfiles" }]
+"#,
+    )
+    .expect("a refined binding with no `template` key must parse");
+    let opt_in = refined(&cfg, "t").template_opt_in();
+    assert!(
+        opt_in.renders("foo.conf.tmpl"),
+        "the `.tmpl` suffix convention is ON by default and must opt a file in \
+         even when no `template` glob list is declared"
+    );
+    assert!(
+        !opt_in.renders("foo.conf"),
+        "a plain file with no .tmpl suffix and no glob must not opt in"
+    );
+}
+
+#[test]
+fn glob_or_suffix_either_renders() {
+    let cfg = Config::parse(
+        r#"
+version = 1
+
+[sources.dotfiles]
+git = "https://github.com/me/dotfiles.git"
+
+[targets.t]
+path = "~/x"
+sources = [{ source = "dotfiles", template = ["*.conf"] }]
+"#,
+    )
+    .expect("a binding with a glob list still honours the .tmpl suffix");
+    let opt_in = refined(&cfg, "t")
+        .template
+        .as_ref()
+        .expect("the binding carries a template opt-in");
+    assert!(
+        opt_in.renders("app.conf"),
+        "a file matching the glob renders (glob arm of glob-OR-suffix)"
+    );
+    assert!(
+        opt_in.renders("other.txt.tmpl"),
+        "a .tmpl file renders even when it matches no glob (suffix arm of glob-OR-suffix)"
+    );
+    assert!(
+        !opt_in.renders("plain.txt"),
+        "a file matching neither the glob nor the suffix must not render"
+    );
+}
+
+#[test]
+fn template_false_disables_the_tmpl_suffix_convention() {
+    let cfg = Config::parse(
+        r#"
+version = 1
+
+[sources.vendor]
+git = "https://github.com/vendor/tree.git"
+
+[targets.t]
+path = "~/x"
+sources = [{ source = "vendor", template = false }]
+"#,
+    )
+    .expect("`template = false` on a binding must parse");
+    let opt_in = refined(&cfg, "t").template_opt_in();
+    assert!(
+        !opt_in.renders("literal.conf.tmpl"),
+        "`template = false` is the escape hatch: a literal *.tmpl file in a \
+         third-party tree must NOT be rendered or have its suffix stripped"
+    );
+    assert!(
+        !opt_in.renders("anything.conf"),
+        "`template = false` opts NOTHING into rendering"
+    );
+}
+
+#[test]
+fn deployed_name_strips_tmpl_suffix_only_for_rendered_files() {
+    let cfg = Config::parse(
+        r#"
+version = 1
+
+[sources.dotfiles]
+git = "https://github.com/me/dotfiles.git"
+
+[targets.t]
+path = "~/x"
+sources = [{ source = "dotfiles", template = ["*.conf"] }]
+"#,
+    )
+    .expect("binding parses");
+    let opt_in = refined(&cfg, "t")
+        .template
+        .as_ref()
+        .expect("the binding carries a template opt-in");
+    assert_eq!(
+        opt_in.deployed_name("foo.conf.tmpl"),
+        "foo.conf",
+        "a .tmpl file deploys with the suffix stripped"
+    );
+    assert_eq!(
+        opt_in.deployed_name("app.conf"),
+        "app.conf",
+        "a glob-matched file with no .tmpl suffix keeps its name verbatim"
+    );
+    assert_eq!(
+        opt_in.deployed_name("plain.txt"),
+        "plain.txt",
+        "a non-rendered file keeps its name verbatim"
+    );
+}
+
+#[test]
+fn template_glob_list_with_bad_glob_is_rejected() {
+    let toml = r#"
+version = 1
+
+[sources.dotfiles]
+git = "https://github.com/me/dotfiles.git"
+
+[targets.t]
+path = "~/x"
+sources = [{ source = "dotfiles", template = ["["] }]
+"#;
+    assert!(
+        matches!(Config::parse(toml), Err(Error::Config(_))),
+        "a malformed glob in a `template` list must be rejected at parse, \
+         not surface as a panic at render time"
+    );
+}
+
+#[test]
+fn merge_local_binding_template_replaces_base_via_sources_replace() {
+    let base = Config::parse(
+        r#"
+version = 1
+
+[sources.dotfiles]
+git = "https://github.com/me/dotfiles.git"
+
+[targets.t]
+path = "~/x"
+sources = [{ source = "dotfiles", template = ["*.conf"] }]
+"#,
+    )
+    .expect("base parses");
+    let local = Config::parse(
+        r#"
+version = 1
+
+[sources.dotfiles]
+git = "https://github.com/me/dotfiles.git"
+
+[targets.t]
+path = "~/x"
+sources = [{ source = "dotfiles", template = false }]
+"#,
+    )
+    .expect("local parses");
+
+    let effective = merge_configs(base, Some(local));
+    let opt_in = refined(&effective, "t").template_opt_in();
+    assert!(
+        !opt_in.renders("app.conf.tmpl"),
+        "a local `sources` list replaces the base wholesale, so a local \
+         `template = false` must win over the base glob list"
+    );
+}
+
+// TPH-008 / INV-8: a config using neither [vars] nor any template opt-in is
+// schema-stable — the new fields default to absent/empty and opt nothing in.
+
+#[test]
+fn feature_free_config_has_empty_vars_and_renders_nothing() {
+    let cfg = Config::parse(EXAMPLE_TOML).expect("the feature-free example toml must parse unchanged");
+    assert!(
+        vars_of(&cfg).is_empty(),
+        "INV-8: a config with no [vars] table must carry an empty vars map"
+    );
+    for (name, target) in &cfg.targets {
+        for binding in target.sources.iter().flatten() {
+            if let Binding::Refined(refined) = binding {
+                assert!(
+                    refined.template.is_none(),
+                    "INV-8: target `{name}` declares no `template` and the field must be absent"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn default_opt_in_for_a_bare_source_binding_honours_only_the_suffix() {
+    let cfg = Config::parse(
+        r#"
+version = 1
+
+[sources.dotfiles]
+git = "https://github.com/me/dotfiles.git"
+
+[targets.t]
+path = "~/x"
+sources = ["dotfiles"]
+"#,
+    )
+    .expect("a bare string-form binding parses");
+    let binding = target_of(&cfg, "t")
+        .sources
+        .as_deref()
+        .expect("declares sources")
+        .first()
+        .expect("one binding");
+    let opt_in = binding.template_opt_in();
+    assert!(
+        opt_in.renders("foo.conf.tmpl"),
+        "a bare `\"dotfiles\"` binding has no `template` key, so the default \
+         .tmpl-suffix convention is ON"
+    );
+    assert!(
+        !opt_in.renders("foo.conf"),
+        "with no glob list a bare binding renders only .tmpl files"
+    );
+}
