@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use gix::object::tree::EntryKind;
 use thiserror::Error;
 
-use crate::config::Refspec;
+use crate::config::{Refspec, TemplateOptIn};
 use crate::kernel::{
     ArtifactName, Commit, Digest, KernelError, Selection, SourceName, safe_component,
 };
@@ -32,6 +32,16 @@ pub enum SourceError {
 
     #[error("submodule not allowed: {path} (set allow_submodules=true to permit)")]
     SubmoduleNotAllowed { path: std::path::PathBuf },
+
+    #[error("template render failed for {path}: {message}")]
+    Render { path: PathBuf, message: String },
+
+    #[error("deployed-name collision in artifact: {name} (from {first} and {second})")]
+    DeployedNameCollision {
+        name: String,
+        first: PathBuf,
+        second: PathBuf,
+    },
 
     #[error("source error: {0}")]
     Kernel(#[from] KernelError),
@@ -87,6 +97,8 @@ pub struct ExportRequest<'a> {
     pub policy: &'a ExportPolicy,
     pub staging_dir: &'a Path,
     pub commit_time: u64,
+    pub template_opt_in: &'a TemplateOptIn,
+    pub vars: &'a BTreeMap<String, String>,
 }
 
 /// `source` is the human name (diagnostics); `url` identifies the bare mirror,
@@ -360,6 +372,7 @@ impl SourceBackend for GitBackend {
 
         std::fs::create_dir_all(req.staging_dir)?;
 
+        let renderer = Renderer::new(req.template_opt_in, req.vars);
         let mut walk = ExportWalk {
             repo: &repo,
             source: req.source.as_str(),
@@ -369,6 +382,8 @@ impl SourceBackend for GitBackend {
             commit_time: req.commit_time,
             files: Vec::new(),
             hasher: blake3::Hasher::new(),
+            renderer: &renderer,
+            deployed_names: BTreeMap::new(),
         };
         walk.run(&artifact_tree, Path::new(""))?;
 
@@ -697,6 +712,49 @@ impl SourceBackend for HttpBackend {
     }
 }
 
+struct Renderer<'a> {
+    opt_in: &'a TemplateOptIn,
+    env: minijinja::Environment<'static>,
+    vars: &'a BTreeMap<String, String>,
+}
+
+impl<'a> Renderer<'a> {
+    fn new(opt_in: &'a TemplateOptIn, vars: &'a BTreeMap<String, String>) -> Self {
+        let mut env = minijinja::Environment::new();
+        env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+        env.set_keep_trailing_newline(true);
+        Self { opt_in, env, vars }
+    }
+
+    fn rel_key(entry_rel: &Path) -> String {
+        entry_rel.to_string_lossy().replace('\\', "/")
+    }
+
+    fn deployed_rel(&self, entry_rel: &Path) -> PathBuf {
+        let key = Self::rel_key(entry_rel);
+        PathBuf::from(self.opt_in.deployed_name(&key))
+    }
+
+    /// Rendered bytes for a templated file, or the source bytes verbatim.
+    fn render(&self, entry_rel: &Path, source_bytes: &[u8]) -> Result<Vec<u8>> {
+        let key = Self::rel_key(entry_rel);
+        if !self.opt_in.renders(&key) {
+            return Ok(source_bytes.to_vec());
+        }
+        let template = std::str::from_utf8(source_bytes).map_err(|e| SourceError::Render {
+            path: entry_rel.to_path_buf(),
+            message: format!("template is not valid UTF-8: {e}"),
+        })?;
+        self.env
+            .render_str(template, self.vars)
+            .map(String::into_bytes)
+            .map_err(|e| SourceError::Render {
+                path: entry_rel.to_path_buf(),
+                message: e.to_string(),
+            })
+    }
+}
+
 struct ExportWalk<'a> {
     repo: &'a gix::Repository,
     source: &'a str,
@@ -706,6 +764,8 @@ struct ExportWalk<'a> {
     commit_time: u64,
     files: Vec<ManifestFile>,
     hasher: blake3::Hasher,
+    renderer: &'a Renderer<'a>,
+    deployed_names: BTreeMap<PathBuf, PathBuf>,
 }
 
 impl ExportWalk<'_> {
@@ -751,23 +811,38 @@ impl ExportWalk<'_> {
         &mut self,
         entry: &gix::object::tree::EntryRef<'_, '_>,
         entry_rel: &Path,
-        out_path: &Path,
+        _out_path: &Path,
         executable: bool,
     ) -> Result<()> {
-        let data = GitBackend::find_blob_data(self.repo, self.source, entry.object_id())?;
+        let source_bytes = GitBackend::find_blob_data(self.repo, self.source, entry.object_id())?;
+        let deployed_rel = self.renderer.deployed_rel(entry_rel);
+        let data = self.renderer.render(entry_rel, &source_bytes)?;
+
+        if let Some(prior) = self
+            .deployed_names
+            .insert(deployed_rel.clone(), entry_rel.to_path_buf())
+        {
+            return Err(SourceError::DeployedNameCollision {
+                name: deployed_rel.to_string_lossy().into_owned(),
+                first: prior,
+                second: entry_rel.to_path_buf(),
+            });
+        }
+
+        let out_path = self.out_base.join(&deployed_rel);
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(out_path, &data)?;
-        set_deterministic_mtime(out_path, self.commit_time)?;
+        std::fs::write(&out_path, &data)?;
+        set_deterministic_mtime(&out_path, self.commit_time)?;
 
         if executable && self.policy.preserve_executable {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let mut perms = std::fs::metadata(out_path)?.permissions();
+                let mut perms = std::fs::metadata(&out_path)?.permissions();
                 perms.set_mode(perms.mode() | 0o111);
-                std::fs::set_permissions(out_path, perms)?;
+                std::fs::set_permissions(&out_path, perms)?;
             }
         }
 
@@ -778,13 +853,13 @@ impl ExportWalk<'_> {
         };
         hash_framed_entry(
             &mut self.hasher,
-            entry_rel.to_string_lossy().as_bytes(),
+            deployed_rel.to_string_lossy().as_bytes(),
             tag,
             &data,
         );
 
         self.files.push(ManifestFile {
-            path: entry_rel.to_path_buf(),
+            path: deployed_rel,
             size: data.len() as u64,
             mtime: self.commit_time,
             blake3: blake3::hash(&data).to_hex().to_string(),
@@ -2157,6 +2232,8 @@ path = "srnnkls/tropos"
             policy,
             staging_dir: staging,
             commit_time: EXPORT_COMMIT_TIME,
+            template_opt_in: &TemplateOptIn::SuffixOnly,
+            vars: &BTreeMap::new(),
         };
         fixture.backend.export_artifact(&req)
     }
@@ -3066,6 +3143,8 @@ path = "srnnkls/tropos"
                     policy: &policy,
                     staging_dir: staging.path(),
                     commit_time: 1,
+                    template_opt_in: &crate::config::TemplateOptIn::SuffixOnly,
+                    vars: &BTreeMap::new(),
                 })
                 .expect("export the `bin` artifact");
 

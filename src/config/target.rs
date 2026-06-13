@@ -208,6 +208,7 @@ pub struct ResolvedBinding<'a> {
     pub include: &'a [String],
     pub exclude: &'a [String],
     pub effective_ref: Refspec,
+    pub template_opt_in: TemplateOptIn,
 }
 
 pub trait SourceFields {
@@ -337,6 +338,7 @@ fn resolve_binding<'a, S: SourceFields>(
         include: include.unwrap_or_else(|| source.intrinsic_include()),
         exclude: exclude.unwrap_or_else(|| source.intrinsic_exclude()),
         effective_ref: binding_ref.unwrap_or_else(|| source.intrinsic_refspec()),
+        template_opt_in: binding.template_opt_in(),
     })
 }
 

@@ -210,6 +210,7 @@ pub fn sync(
                 force: input.force,
                 interactive: input.interactive,
                 resolver: input.resolver,
+                vars: &effective_config.vars,
             },
             backend,
             registry,
