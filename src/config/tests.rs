@@ -5397,7 +5397,8 @@ sources = [{ source = "dotfiles", template = false }]
 // schema-stable — the new fields default to absent/empty and opt nothing in.
 
 #[test]
-fn feature_free_config_has_empty_vars_and_renders_nothing() {
+fn feature_free_config_has_empty_vars_and_no_template_fields() {
+    // M001: the `.tmpl` opt-in is file-level not config-level, so INV-8 here is field-absence, NOT `!renders(".tmpl")`.
     let cfg = Config::parse(EXAMPLE_TOML).expect("the feature-free example toml must parse unchanged");
     assert!(
         vars_of(&cfg).is_empty(),
@@ -5408,7 +5409,7 @@ fn feature_free_config_has_empty_vars_and_renders_nothing() {
             if let Binding::Refined(refined) = binding {
                 assert!(
                     refined.template.is_none(),
-                    "INV-8: target `{name}` declares no `template` and the field must be absent"
+                    "INV-8: target `{name}` declares no `template` glob, so the field must be absent"
                 );
             }
         }
