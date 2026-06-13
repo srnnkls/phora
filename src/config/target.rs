@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use super::hooks::TargetHooks;
+use super::TargetHooks;
 use super::source::{ParsedSource, Refspec, Source};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -161,6 +161,7 @@ impl Target {
             self.layout = local.layout;
         }
         if local.hooks.is_some() {
+            // bare [hooks] section replaces base wholesale, matching layout
             self.hooks = local.hooks;
         }
         self

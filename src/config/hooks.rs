@@ -15,14 +15,14 @@ pub enum HookWhen {
     Always,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TargetHooks {
     #[serde(default, deserialize_with = "deserialize_commands")]
     pub on_change: Option<Vec<HookCommand>>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GlobalHooks {
     #[serde(default, deserialize_with = "deserialize_commands")]
@@ -35,7 +35,6 @@ pub struct GlobalHooks {
 #[serde(deny_unknown_fields)]
 struct HookTable {
     run: String,
-    #[serde(default)]
     shell: Option<String>,
 }
 

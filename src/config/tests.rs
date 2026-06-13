@@ -4434,6 +4434,45 @@ on_change = []
 }
 
 #[test]
+fn merge_local_bare_hooks_section_clears_base_hooks() {
+    let base = Config::parse(
+        r#"
+version = 1
+
+[targets.t]
+path = "~/x"
+
+[targets.t.hooks]
+on_change = "base-cmd"
+"#,
+    )
+    .expect("base parses");
+    let local = Config::parse(
+        r#"
+version = 1
+
+[targets.t]
+path = "~/x"
+
+[targets.t.hooks]
+"#,
+    )
+    .expect("local parses");
+
+    let effective = merge_configs(base, Some(local));
+    assert!(
+        target_of(&effective, "t")
+            .hooks
+            .as_ref()
+            .expect("target carries the local hooks table")
+            .on_change
+            .is_none(),
+        "a bare [targets.X.hooks] section (header, no on_change key) replaces the base \
+         hooks wholesale, clearing base commands — matching the layout whole-replace semantic"
+    );
+}
+
+#[test]
 fn merge_global_hooks_local_wins() {
     let base = Config::parse(
         r#"
