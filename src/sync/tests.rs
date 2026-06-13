@@ -1656,6 +1656,7 @@ fn second_deploy_over_correct_link_is_a_noop() {
         force: false,
         interactive: false,
         resolver: None,
+        vars: &BTreeMap::new(),
     };
     let selection = Selection::new(source.includes(), source.excludes()).expect("selection");
     let entry_source = sn("editor-src");
@@ -1676,6 +1677,7 @@ fn second_deploy_over_correct_link_is_a_noop() {
         layout_kind: LayoutKind::Flat,
         ejected: &[],
         mode_transition: false,
+        template_opt_in: &crate::config::TemplateOptIn::SuffixOnly,
     };
 
     let state = check_artifact_state(
@@ -7678,12 +7680,16 @@ fn prune_only_sync_skips_on_change_but_runs_post_sync() {
 /// paired with a source repo. Lets a render test sync end-to-end against real
 /// staging/swap and then read back deployed files, the manifest, and the lock.
 struct RenderHarness {
-    _src: TempDir,
+    src: TempDir,
     _git_dir: TempDir,
     _state_dir: TempDir,
     backend: GitBackend,
     registry: FileRegistry,
     url: String,
+    #[expect(
+        dead_code,
+        reason = "constructor records the resolved head for harness symmetry"
+    )]
     head: String,
 }
 
@@ -7694,7 +7700,7 @@ impl RenderHarness {
         let backend = GitBackend::new(git_dir.path().to_path_buf());
         let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
         Self {
-            _src: src,
+            src,
             _git_dir: git_dir,
             _state_dir: state_dir,
             backend,
@@ -7767,7 +7773,10 @@ fn sync_renders_tmpl_file_with_vars_and_strips_suffix() {
         !dst.join("motd.tmpl").exists(),
         "the .tmpl suffix must be stripped: no `motd.tmpl` may land at the target"
     );
-    assert!(!out.had_failures, "a clean render deploy must report no failures");
+    assert!(
+        !out.had_failures,
+        "a clean render deploy must report no failures"
+    );
 }
 
 #[test]
@@ -7843,8 +7852,12 @@ fn lock_hashes_source_bytes_independent_of_vars() {
     let ha = RenderHarness::over(src_a, url_a, head_a);
     let tda = TargetDir::new();
     let cfg_a = config_with_vars("ed", &ha.url, &tda.target_path(), "greeting = \"world\"\n");
-    let out_a = sync(&input(&cfg_a, None, None, None, false), &ha.backend, &ha.registry)
-        .expect("sync with vars A");
+    let out_a = sync(
+        &input(&cfg_a, None, None, None, false),
+        &ha.backend,
+        &ha.registry,
+    )
+    .expect("sync with vars A");
     let locked_a = out_a
         .base_lock
         .find_source("ed")
@@ -7855,8 +7868,12 @@ fn lock_hashes_source_bytes_independent_of_vars() {
     let hb = RenderHarness::over(src_b, url_b, head_b);
     let tdb = TargetDir::new();
     let cfg_b = config_with_vars("ed", &hb.url, &tdb.target_path(), "greeting = \"galaxy\"\n");
-    let out_b = sync(&input(&cfg_b, None, None, None, false), &hb.backend, &hb.registry)
-        .expect("sync with vars B");
+    let out_b = sync(
+        &input(&cfg_b, None, None, None, false),
+        &hb.backend,
+        &hb.registry,
+    )
+    .expect("sync with vars B");
     let locked_b = out_b
         .base_lock
         .find_source("ed")
@@ -7951,8 +7968,12 @@ fn render_error_preserves_prior_deployed_content_pre_swap() {
     let td = TargetDir::new();
     let cfg = config_with_vars("ed", &h.url, &td.target_path(), "");
 
-    let first = sync(&input(&cfg, None, None, None, true), &h.backend, &h.registry)
-        .expect("first clean deploy");
+    let first = sync(
+        &input(&cfg, None, None, None, true),
+        &h.backend,
+        &h.registry,
+    )
+    .expect("first clean deploy");
     assert!(!first.had_failures, "premise: first deploy is clean");
     let dst = td.artifact_dst(&flat_layout(), "ed", "editor");
     assert_eq!(
@@ -7962,14 +7983,18 @@ fn render_error_preserves_prior_deployed_content_pre_swap() {
     );
 
     // Advance: replace the plain file with a `.tmpl` that references an undefined var.
-    std::fs::remove_file(h._src.path().join("editor/conf.txt")).expect("rm v1");
-    std::fs::write(h._src.path().join("editor/conf.tmpl"), b"x = {{ nope }}\n")
+    std::fs::remove_file(h.src.path().join("editor/conf.txt")).expect("rm v1");
+    std::fs::write(h.src.path().join("editor/conf.tmpl"), b"x = {{ nope }}\n")
         .expect("write bad tmpl");
-    run_git(h._src.path(), &["add", "-A"]);
-    run_git(h._src.path(), &["commit", "-m", "v2-bad-template"]);
+    run_git(h.src.path(), &["add", "-A"]);
+    run_git(h.src.path(), &["commit", "-m", "v2-bad-template"]);
 
-    let out = sync(&input(&cfg, None, None, None, true), &h.backend, &h.registry)
-        .expect("a render failure must not abort the run");
+    let out = sync(
+        &input(&cfg, None, None, None, true),
+        &h.backend,
+        &h.registry,
+    )
+    .expect("a render failure must not abort the run");
 
     assert!(
         out.had_failures,
@@ -8000,7 +8025,8 @@ fn feature_free_config_deploys_byte_identically_with_unchanged_lock_and_manifest
     run_git(p, &["config", "user.name", "Test"]);
     std::fs::create_dir_all(p.join("editor")).expect("mkdir editor");
     // Content that LOOKS like a template but must NOT be rendered (no opt-in).
-    std::fs::write(p.join("editor/raw.conf"), b"literal {{ greeting }} stays\n").expect("write raw");
+    std::fs::write(p.join("editor/raw.conf"), b"literal {{ greeting }} stays\n")
+        .expect("write raw");
     run_git(p, &["add", "-A"]);
     run_git(p, &["commit", "-m", "init"]);
     let head = rev_parse(p, "HEAD");
@@ -8033,6 +8059,10 @@ fn feature_free_config_deploys_byte_identically_with_unchanged_lock_and_manifest
 impl RenderHarness {
     /// Oracle source-bytes digest for INV-8 / INV-6 reuse, mirroring the sync
     /// fixture's `expected_digest_for_source` but over a `RenderHarness` url.
+    #[expect(
+        dead_code,
+        reason = "source-bytes digest oracle kept available for INV-6/INV-8 checks"
+    )]
     fn digest_for(&self, source: &ParsedSource, name: &str, commit: &str) -> String {
         let m = crate::kernel::Selection::new(source.includes(), source.excludes())
             .expect("source matcher builds");

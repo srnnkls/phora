@@ -108,6 +108,8 @@ pub fn rebuild_registry(
                         layout_kind: target.layout().kind,
                         key,
                         report: &mut report,
+                        template_opt_in: &binding.template_opt_in,
+                        vars: &config.vars,
                     })?,
                 }
 
@@ -141,6 +143,8 @@ struct RebuildOne<'a> {
     layout_kind: LayoutKind,
     key: ArtifactKey,
     report: &'a mut RebuildReport,
+    template_opt_in: &'a crate::config::TemplateOptIn,
+    vars: &'a BTreeMap<String, String>,
 }
 
 fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
@@ -159,6 +163,8 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         layout_kind,
         key,
         report,
+        template_opt_in,
+        vars,
     } = args;
 
     let staging_base = std::env::temp_dir().join("phora-rebuild");
@@ -176,6 +182,8 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         policy,
         staging_dir: &staging,
         commit_time,
+        template_opt_in,
+        vars,
     })?;
 
     let mut modified = false;

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::config::{DeployMode, LayoutKind, ParsedSource, Target};
+use crate::config::{DeployMode, LayoutKind, ParsedSource, Target, TemplateOptIn};
 use crate::deploy::{ArtifactState, Journal, check_artifact_state, deploy_artifact, link_artifact};
 use crate::error::{Error, Result};
 use crate::kernel::{ArtifactName, Selection, SourceName};
@@ -25,6 +25,7 @@ pub(super) struct TargetRun<'a> {
     pub(super) force: bool,
     pub(super) interactive: bool,
     pub(super) resolver: Option<&'a dyn ConflictResolver>,
+    pub(super) vars: &'a BTreeMap<String, String>,
 }
 
 pub(super) fn deploy_target(
@@ -107,6 +108,7 @@ pub(super) fn deploy_target(
                 layout_kind: layout.kind,
                 ejected: &ejected,
                 mode_transition,
+                template_opt_in: &binding.template_opt_in,
             };
             had_failures |= deploy_artifact_entry(run, &entry, backend, registry, journal)?;
         }
@@ -129,6 +131,7 @@ pub(super) struct ArtifactEntry<'a> {
     pub(super) layout_kind: LayoutKind,
     pub(super) ejected: &'a [EjectedEntry],
     pub(super) mode_transition: bool,
+    pub(super) template_opt_in: &'a TemplateOptIn,
 }
 
 pub(super) fn deploy_artifact_entry(
@@ -180,6 +183,8 @@ pub(super) fn deploy_artifact_entry(
                 artifact_name: entry.artifact_name,
                 artifact_dst: &artifact_dst,
                 key,
+                template_opt_in: entry.template_opt_in,
+                vars: run.vars,
             },
         ),
     };
@@ -285,6 +290,8 @@ struct DeployContext<'a> {
     artifact_name: &'a ArtifactName,
     artifact_dst: &'a Path,
     key: ArtifactKey,
+    template_opt_in: &'a TemplateOptIn,
+    vars: &'a BTreeMap<String, String>,
 }
 
 fn deploy_one(
@@ -310,6 +317,8 @@ fn deploy_one(
         policy: &policy,
         staging_dir: &staging,
         commit_time,
+        template_opt_in: ctx.template_opt_in,
+        vars: ctx.vars,
     };
     let export = backend.export_artifact(&req)?;
 
