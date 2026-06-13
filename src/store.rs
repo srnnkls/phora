@@ -895,4 +895,199 @@ artifact = "snippets"
             reacquired.err()
         );
     }
+
+    // ── per-hook last-success digest-set (TPH-002) ─────────────────
+
+    fn digest_set(digests: &[&str]) -> std::collections::BTreeSet<String> {
+        digests.iter().map(|d| (*d).to_owned()).collect()
+    }
+
+    /// A hook's last-success record is the set of artifact digests the target
+    /// carried when that hook last exited 0; saving then loading must return it
+    /// field-for-field (INV-4 state shape).
+    #[test]
+    fn save_then_load_hook_state_round_trips() {
+        let (_dir, reg) = registry();
+        let states = vec![HookState {
+            hook_id: "vscode#0".to_owned(),
+            last_success: digest_set(&["blake3:aaa", "blake3:bbb"]),
+        }];
+
+        reg.save_hook_state("vscode", &states)
+            .expect("save hook state");
+        let loaded = reg.load_hook_state("vscode").expect("load hook state");
+
+        assert_eq!(
+            loaded, states,
+            "load_hook_state must return every saved hook record, field-for-field"
+        );
+    }
+
+    /// A target that never ran a hook has no hook state; loading must not error
+    /// and must yield an empty list (INV-8 absence, not a synthesized record).
+    #[test]
+    fn load_hook_state_on_missing_target_is_empty() {
+        let (_dir, reg) = registry();
+
+        let states = reg
+            .load_hook_state("never-synced")
+            .expect("missing hook state must not error");
+
+        assert!(
+            states.is_empty(),
+            "a target with no recorded hook run yields an empty hook-state list"
+        );
+    }
+
+    /// INV-3: the trigger is a digest-set DIFF. A current set identical to the
+    /// recorded last-success set is unchanged (no-op → fires nothing); any
+    /// difference is changed.
+    #[test]
+    fn digest_set_diff_detects_changed_vs_unchanged() {
+        let recorded = digest_set(&["blake3:aaa", "blake3:bbb"]);
+
+        assert!(
+            !digest_set_changed(&recorded, &recorded),
+            "identical digest-set must be unchanged (no-op sync fires nothing, INV-3)"
+        );
+        assert!(
+            digest_set_changed(&digest_set(&["blake3:aaa", "blake3:ccc"]), &recorded),
+            "a differing member must be detected as changed"
+        );
+        assert!(
+            digest_set_changed(&digest_set(&["blake3:aaa"]), &recorded),
+            "a shrunk digest-set must be detected as changed"
+        );
+        assert!(
+            digest_set_changed(
+                &digest_set(&["blake3:aaa", "blake3:bbb", "blake3:ccc"]),
+                &recorded
+            ),
+            "a grown digest-set must be detected as changed"
+        );
+    }
+
+    /// INV-4 success-only: an unrecorded sibling hook keeps its prior set and re-fires.
+    #[test]
+    fn record_hook_success_merges_and_leaves_other_hooks_untouched() {
+        let (_dir, reg) = registry();
+        reg.save_hook_state(
+            "vscode",
+            &[
+                HookState {
+                    hook_id: "vscode#0".to_owned(),
+                    last_success: digest_set(&["blake3:aaa"]),
+                },
+                HookState {
+                    hook_id: "vscode#1".to_owned(),
+                    last_success: digest_set(&["blake3:bbb"]),
+                },
+            ],
+        )
+        .expect("seed two hook records");
+
+        reg.record_hook_success("vscode", "vscode#0", &digest_set(&["blake3:ccc"]))
+            .expect("record success only for the hook that exited 0");
+
+        let loaded = reg.load_hook_state("vscode").expect("load hook state");
+        let succeeded = loaded
+            .iter()
+            .find(|s| s.hook_id == "vscode#0")
+            .expect("succeeded hook present");
+        let untouched = loaded
+            .iter()
+            .find(|s| s.hook_id == "vscode#1")
+            .expect("the hook that never succeeded must still be present");
+
+        assert_eq!(
+            succeeded.last_success,
+            digest_set(&["blake3:ccc"]),
+            "the succeeded hook's last-success set advances to the current digest-set"
+        );
+        assert_eq!(
+            untouched.last_success,
+            digest_set(&["blake3:bbb"]),
+            "a hook not recorded keeps its prior set, so it re-fires next sync (INV-4)"
+        );
+    }
+
+    #[test]
+    fn record_hook_success_creates_record_for_first_success() {
+        let (_dir, reg) = registry();
+
+        reg.record_hook_success("vscode", "vscode#0", &digest_set(&["blake3:aaa"]))
+            .expect("record first-ever success");
+
+        let loaded = reg.load_hook_state("vscode").expect("load hook state");
+        assert_eq!(
+            loaded,
+            vec![HookState {
+                hook_id: "vscode#0".to_owned(),
+                last_success: digest_set(&["blake3:aaa"]),
+            }],
+            "first success for a hook with no prior record creates exactly that record"
+        );
+    }
+
+    /// INV-8: a target that records hook state and ejected entries side by side
+    /// must round-trip both — hook state does not clobber the existing ejected
+    /// meta, and vice versa.
+    #[test]
+    fn hook_state_and_ejected_meta_coexist_for_same_target() {
+        let (_dir, reg) = registry();
+        let ejected = vec![EjectedEntry {
+            source: "company-configs".to_owned(),
+            artifact: "snippets".to_owned(),
+            ejected_at: "2026-06-13T10:00:00Z".to_owned(),
+        }];
+        let hooks = vec![HookState {
+            hook_id: "vscode#0".to_owned(),
+            last_success: digest_set(&["blake3:aaa"]),
+        }];
+
+        reg.save_ejected("vscode", &ejected).expect("save ejected");
+        reg.save_hook_state("vscode", &hooks)
+            .expect("save hook state");
+
+        assert_eq!(
+            reg.load_ejected("vscode").expect("load ejected"),
+            ejected,
+            "saving hook state must not clobber existing ejected entries"
+        );
+        assert_eq!(
+            reg.load_hook_state("vscode").expect("load hook state"),
+            hooks,
+            "hook state must persist alongside ejected entries"
+        );
+    }
+
+    /// INV-8 (byte-stability): a hook-free target writes meta identical to the
+    /// pre-feature format — the new hook-state field is `skip_serializing_if`
+    /// absent, so an ejected-only meta serializes byte-for-byte as today.
+    #[test]
+    fn hook_free_target_meta_serializes_byte_identical_to_pre_feature() {
+        let (dir, reg) = registry();
+        let ejected = vec![EjectedEntry {
+            source: "company-configs".to_owned(),
+            artifact: "snippets".to_owned(),
+            ejected_at: "2026-01-31T14:00:00Z".to_owned(),
+        }];
+
+        reg.save_ejected("vscode", &ejected).expect("save ejected");
+
+        let meta_path = dir.path().join("targets").join("vscode").join("meta.toml");
+        let written = std::fs::read_to_string(&meta_path).expect("read meta.toml");
+        let expected = "\
+version = 1
+
+[[ejected]]
+source = \"company-configs\"
+artifact = \"snippets\"
+ejected_at = \"2026-01-31T14:00:00Z\"
+";
+        assert_eq!(
+            written, expected,
+            "a hook-free target's meta.toml must serialize byte-identically to the pre-feature format (INV-8)"
+        );
+    }
 }
