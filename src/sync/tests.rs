@@ -7654,3 +7654,437 @@ fn prune_only_sync_skips_on_change_but_runs_post_sync() {
         "D1: the global post_sync escape hatch must still run on a removal-only sync"
     );
 }
+
+// ── TPH-009: minijinja render pipeline (Phase 2 core) ──────────
+//
+// Rendering inserts at STAGE time (before per-file hashing + atomic swap):
+//   - a file that `renders()` is fed through minijinja with Config.vars as the
+//     context and deploys under its `.tmpl`-stripped `deployed_name()`;
+//   - the registry manifest hashes the RENDERED bytes (INV-5), so `verify`
+//     re-hashing the deployed file matches;
+//   - phora.lock hashes SOURCE bytes, independent of vars (INV-6): two machines
+//     with different vars produce the same lock entry;
+//   - a render error (undefined var / syntax error) aborts that artifact
+//     PRE-swap: it is not deployed and leaves no record, the run reports
+//     failure, and sibling artifacts still deploy (warn-and-continue model);
+//   - a vars-free, opt-in-free config deploys byte-identically (INV-8);
+//   - two in-artifact files mapping to one deployed name is a clear failure,
+//     never last-writer-wins.
+//
+// Every test drives the observable sync/deploy boundary, robust to how the
+// template_opt_in / vars plumbing lands internally.
+
+/// A live `GitBackend` + `FileRegistry` whose backing tempdirs outlive the run,
+/// paired with a source repo. Lets a render test sync end-to-end against real
+/// staging/swap and then read back deployed files, the manifest, and the lock.
+struct RenderHarness {
+    _src: TempDir,
+    _git_dir: TempDir,
+    _state_dir: TempDir,
+    backend: GitBackend,
+    registry: FileRegistry,
+    url: String,
+    head: String,
+}
+
+impl RenderHarness {
+    fn over(src: TempDir, url: String, head: String) -> Self {
+        let git_dir = TempDir::new().expect("git dir");
+        let state_dir = TempDir::new().expect("state dir");
+        let backend = GitBackend::new(git_dir.path().to_path_buf());
+        let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+        Self {
+            _src: src,
+            _git_dir: git_dir,
+            _state_dir: state_dir,
+            backend,
+            registry,
+            url,
+            head,
+        }
+    }
+}
+
+/// A repo with one `editor/` artifact holding a `.tmpl` file referencing
+/// `{{ greeting }}` plus a plain non-template `keep.txt`. The default `.tmpl`
+/// suffix opt-in renders `motd.tmpl` -> `motd`; `keep.txt` is byte-copied.
+#[expect(
+    clippy::unwrap_used,
+    reason = "fixture setup fails loudly; git CLI is assumed present"
+)]
+fn build_template_repo() -> (TempDir, String, String) {
+    let src = TempDir::new().unwrap();
+    let p = src.path();
+    run_git(p, &["init", "-b", "main", "."]);
+    run_git(p, &["config", "user.email", "test@example.com"]);
+    run_git(p, &["config", "user.name", "Test"]);
+    std::fs::create_dir_all(p.join("editor")).unwrap();
+    std::fs::write(p.join("editor/motd.tmpl"), b"hello {{ greeting }}!\n").unwrap();
+    std::fs::write(p.join("editor/keep.txt"), b"verbatim\n").unwrap();
+    run_git(p, &["add", "-A"]);
+    run_git(p, &["commit", "-m", "init"]);
+    let head = rev_parse(p, "HEAD");
+    let url = p.to_string_lossy().into_owned();
+    (src, url, head)
+}
+
+/// Config: an optional `[vars]` table plus a `dest` target binding `source`
+/// under a flat layout. The bare-string binding uses the default `.tmpl`
+/// suffix opt-in (so `.tmpl` files render and are renamed).
+fn config_with_vars(source: &str, url: &str, target_path: &Path, vars_toml: &str) -> Config {
+    let vars_section = if vars_toml.is_empty() {
+        String::new()
+    } else {
+        format!("[vars]\n{vars_toml}\n")
+    };
+    let toml = format!(
+        "version = 1\n\n{vars_section}\
+         [sources.{source}]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\"{source}\"]\nlayout = \"flat\"\n",
+        target_path.display(),
+    );
+    Config::parse(&toml).expect("vars + target config parses")
+}
+
+#[test]
+fn sync_renders_tmpl_file_with_vars_and_strips_suffix() {
+    let (src, url, head) = build_template_repo();
+    let h = RenderHarness::over(src, url, head);
+    let td = TargetDir::new();
+    let cfg = config_with_vars("ed", &h.url, &td.target_path(), "greeting = \"world\"\n");
+    let in_ = input(&cfg, None, None, None, false);
+
+    let out = sync(&in_, &h.backend, &h.registry).expect("render sync deploys");
+
+    let dst = td.artifact_dst(&flat_layout(), "ed", "editor");
+    assert_eq!(
+        std::fs::read(dst.join("motd")).expect("rendered file deployed under stripped name"),
+        b"hello world!\n",
+        "a .tmpl file must render through minijinja with Config.vars and deploy under its \
+         .tmpl-stripped name (deployed_name), substituting {{{{ greeting }}}} -> world"
+    );
+    assert!(
+        !dst.join("motd.tmpl").exists(),
+        "the .tmpl suffix must be stripped: no `motd.tmpl` may land at the target"
+    );
+    assert!(!out.had_failures, "a clean render deploy must report no failures");
+}
+
+#[test]
+fn sync_byte_copies_non_template_file_alongside_a_rendered_sibling() {
+    let (src, url, head) = build_template_repo();
+    let h = RenderHarness::over(src, url, head);
+    let td = TargetDir::new();
+    let cfg = config_with_vars("ed", &h.url, &td.target_path(), "greeting = \"world\"\n");
+    let in_ = input(&cfg, None, None, None, false);
+
+    sync(&in_, &h.backend, &h.registry).expect("render sync deploys");
+
+    let dst = td.artifact_dst(&flat_layout(), "ed", "editor");
+    assert_eq!(
+        std::fs::read(dst.join("keep.txt")).expect("plain file deployed verbatim"),
+        b"verbatim\n",
+        "a non-templated file must be byte-copied unchanged, with no name rewrite, even when a \
+         templated sibling in the same artifact renders"
+    );
+    assert_eq!(
+        std::fs::read(dst.join("motd")).expect("rendered sibling deployed"),
+        b"hello world!\n",
+        "the templated sibling must render and deploy under its stripped name in the same pass \
+         that byte-copies the plain file"
+    );
+}
+
+#[test]
+fn manifest_hashes_rendered_bytes_so_verify_passes_on_rendered_output() {
+    // INV-5: the registry manifest hashes the RENDERED (deployed) bytes. A `verify`
+    // pass re-hashes the on-disk deployed file and compares to record.blake3, so a
+    // clean verify is the end-to-end proof the manifest hashed rendered bytes.
+    let (src, url, head) = build_template_repo();
+    let h = RenderHarness::over(src, url, head);
+    let td = TargetDir::new();
+    let cfg = config_with_vars("ed", &h.url, &td.target_path(), "greeting = \"world\"\n");
+    let in_ = input(&cfg, None, None, None, false);
+
+    sync(&in_, &h.backend, &h.registry).expect("render sync deploys");
+
+    let rec = h
+        .registry
+        .get(&artifact_key("dest", "ed", "editor"))
+        .expect("registry get")
+        .expect("deployed record present");
+    let motd = rec
+        .files
+        .iter()
+        .find(|f| f.path == *Path::new("motd"))
+        .expect("manifest lists the rendered file under its stripped name `motd`");
+    let rendered_hash = blake3::hash(b"hello world!\n").to_hex().to_string();
+    assert_eq!(
+        motd.blake3, rendered_hash,
+        "INV-5: the manifest blake3 for `motd` must hash the RENDERED bytes (hello world!\\n), \
+         not the source template bytes; got {}",
+        motd.blake3
+    );
+
+    let mismatches = crate::sync::verify(&cfg, &h.registry).expect("verify runs");
+    assert!(
+        mismatches.is_empty(),
+        "INV-5: verify re-hashes the deployed rendered file and must match the manifest; \
+         mismatches: {mismatches:?}"
+    );
+}
+
+#[test]
+fn lock_hashes_source_bytes_independent_of_vars() {
+    // INV-6: phora.lock hashes SOURCE bytes; rendering must not touch it. Two syncs
+    // with DIFFERENT vars over the same source/commit must yield the SAME locked
+    // digest (and same commit) — the lock is vars-independent.
+    let (src_a, url_a, head_a) = build_template_repo();
+    let ha = RenderHarness::over(src_a, url_a, head_a);
+    let tda = TargetDir::new();
+    let cfg_a = config_with_vars("ed", &ha.url, &tda.target_path(), "greeting = \"world\"\n");
+    let out_a = sync(&input(&cfg_a, None, None, None, false), &ha.backend, &ha.registry)
+        .expect("sync with vars A");
+    let locked_a = out_a
+        .base_lock
+        .find_source("ed")
+        .expect("source A locked")
+        .clone();
+
+    let (src_b, url_b, head_b) = build_template_repo();
+    let hb = RenderHarness::over(src_b, url_b, head_b);
+    let tdb = TargetDir::new();
+    let cfg_b = config_with_vars("ed", &hb.url, &tdb.target_path(), "greeting = \"galaxy\"\n");
+    let out_b = sync(&input(&cfg_b, None, None, None, false), &hb.backend, &hb.registry)
+        .expect("sync with vars B");
+    let locked_b = out_b
+        .base_lock
+        .find_source("ed")
+        .expect("source B locked")
+        .clone();
+
+    assert_eq!(
+        locked_a.commit, locked_b.commit,
+        "premise: both syncs are over identical source content at the same commit"
+    );
+    assert_eq!(
+        locked_a.digest, locked_b.digest,
+        "INV-6: the lock digest hashes SOURCE bytes and must be IDENTICAL across two syncs whose \
+         only difference is [vars] (world vs galaxy); rendering must not leak into the lock"
+    );
+}
+
+#[test]
+fn render_error_on_undefined_var_aborts_that_artifact_and_sibling_still_deploys() {
+    // A `.tmpl` referencing an UNDEFINED var must fail to render (strict undefined),
+    // aborting that artifact PRE-swap: it is not deployed and leaves no record. The
+    // sibling plain artifact still deploys; the run reports failure (non-zero).
+    let (src, url, head) = {
+        let src = TempDir::new().expect("src tempdir");
+        let p = src.path();
+        run_git(p, &["init", "-b", "main", "."]);
+        run_git(p, &["config", "user.email", "test@example.com"]);
+        run_git(p, &["config", "user.name", "Test"]);
+        // `bad` artifact: a .tmpl referencing an undefined var -> render must fail.
+        std::fs::create_dir_all(p.join("bad")).expect("mkdir bad");
+        std::fs::write(p.join("bad/conf.tmpl"), b"value = {{ missing }}\n").expect("write tmpl");
+        // `good` artifact: plain file, must still deploy despite the sibling failure.
+        std::fs::create_dir_all(p.join("good")).expect("mkdir good");
+        std::fs::write(p.join("good/plain.txt"), b"ok\n").expect("write plain");
+        run_git(p, &["add", "-A"]);
+        run_git(p, &["commit", "-m", "init"]);
+        let head = rev_parse(p, "HEAD");
+        let url = p.to_string_lossy().into_owned();
+        (src, url, head)
+    };
+    let h = RenderHarness::over(src, url, head);
+    let td = TargetDir::new();
+    // by-source layout keeps each artifact at its own dst so the sibling check is clean.
+    let cfg = config_one_source_one_target("multi", &h.url, "dest", &td.target_path(), "by-source");
+    let in_ = input(&cfg, None, None, None, false);
+
+    let out = sync(&in_, &h.backend, &h.registry)
+        .expect("a render failure must warn-and-continue, not abort the whole run");
+
+    assert!(
+        out.had_failures,
+        "a strict-undefined render error must set had_failures=true (sync exits non-zero)"
+    );
+    let bad_dst = td.target_path().join("multi").join("bad");
+    assert!(
+        !bad_dst.join("conf").exists() && !bad_dst.join("conf.tmpl").exists(),
+        "the failing artifact must NOT be deployed (no partial/garbage file lands pre-swap), \
+         found something at {}",
+        bad_dst.display()
+    );
+    assert!(
+        h.registry
+            .get(&artifact_key("dest", "multi", "bad"))
+            .expect("get bad record")
+            .is_none(),
+        "a render-aborted artifact must leave no registry record"
+    );
+    let good_dst = td.target_path().join("multi").join("good");
+    assert_eq!(
+        std::fs::read(good_dst.join("plain.txt")).expect("good artifact deployed"),
+        b"ok\n",
+        "the sibling artifact must still deploy despite the render failure (warn-and-continue)"
+    );
+}
+
+#[test]
+fn render_error_preserves_prior_deployed_content_pre_swap() {
+    // The artifact was deployed clean once; a later commit turns it into a `.tmpl`
+    // referencing an undefined var. The failed redeploy must abort PRE-swap, leaving
+    // the previously deployed content intact (no clobber with garbage/partial).
+    let src = TempDir::new().expect("src tempdir");
+    let p = src.path();
+    run_git(p, &["init", "-b", "main", "."]);
+    run_git(p, &["config", "user.email", "test@example.com"]);
+    run_git(p, &["config", "user.name", "Test"]);
+    std::fs::create_dir_all(p.join("editor")).expect("mkdir editor");
+    std::fs::write(p.join("editor/conf.txt"), b"first\n").expect("write v1");
+    run_git(p, &["add", "-A"]);
+    run_git(p, &["commit", "-m", "v1"]);
+    let url = p.to_string_lossy().into_owned();
+    let h = RenderHarness::over(src, url, String::new());
+    let td = TargetDir::new();
+    let cfg = config_with_vars("ed", &h.url, &td.target_path(), "");
+
+    let first = sync(&input(&cfg, None, None, None, true), &h.backend, &h.registry)
+        .expect("first clean deploy");
+    assert!(!first.had_failures, "premise: first deploy is clean");
+    let dst = td.artifact_dst(&flat_layout(), "ed", "editor");
+    assert_eq!(
+        std::fs::read(dst.join("conf.txt")).expect("v1 deployed"),
+        b"first\n",
+        "premise: the clean v1 content must be deployed"
+    );
+
+    // Advance: replace the plain file with a `.tmpl` that references an undefined var.
+    std::fs::remove_file(h._src.path().join("editor/conf.txt")).expect("rm v1");
+    std::fs::write(h._src.path().join("editor/conf.tmpl"), b"x = {{ nope }}\n")
+        .expect("write bad tmpl");
+    run_git(h._src.path(), &["add", "-A"]);
+    run_git(h._src.path(), &["commit", "-m", "v2-bad-template"]);
+
+    let out = sync(&input(&cfg, None, None, None, true), &h.backend, &h.registry)
+        .expect("a render failure must not abort the run");
+
+    assert!(
+        out.had_failures,
+        "the undefined-var render must fail the run (had_failures=true)"
+    );
+    assert_eq!(
+        std::fs::read(dst.join("conf.txt")).expect("prior content intact"),
+        b"first\n",
+        "a render error must abort PRE-swap: the previously deployed conf.txt must remain intact, \
+         never clobbered by partial/garbage rendered output"
+    );
+    assert!(
+        !dst.join("conf").exists(),
+        "no partial rendered `conf` file may land when the render fails pre-swap"
+    );
+}
+
+#[test]
+fn feature_free_config_deploys_byte_identically_with_unchanged_lock_and_manifest() {
+    // INV-8: a config using NO vars and NO template opt-in deploys byte-identically
+    // to the non-template path. A source whose file simply ENDS in template syntax
+    // but is NOT opted in (`template = false` disables even the .tmpl suffix) must
+    // be byte-copied verbatim, its name unchanged, and lock/manifest unaffected.
+    let src = TempDir::new().expect("src tempdir");
+    let p = src.path();
+    run_git(p, &["init", "-b", "main", "."]);
+    run_git(p, &["config", "user.email", "test@example.com"]);
+    run_git(p, &["config", "user.name", "Test"]);
+    std::fs::create_dir_all(p.join("editor")).expect("mkdir editor");
+    // Content that LOOKS like a template but must NOT be rendered (no opt-in).
+    std::fs::write(p.join("editor/raw.conf"), b"literal {{ greeting }} stays\n").expect("write raw");
+    run_git(p, &["add", "-A"]);
+    run_git(p, &["commit", "-m", "init"]);
+    let head = rev_parse(p, "HEAD");
+    let url = p.to_string_lossy().into_owned();
+    let h = RenderHarness::over(src, url, head);
+    let td = TargetDir::new();
+    // No [vars], no template opt-in: the feature-free path.
+    let cfg = config_with_vars("ed", &h.url, &td.target_path(), "");
+    let in_ = input(&cfg, None, None, None, false);
+
+    let out = sync(&in_, &h.backend, &h.registry).expect("feature-free sync deploys");
+
+    let dst = td.artifact_dst(&flat_layout(), "ed", "editor");
+    assert_eq!(
+        std::fs::read(dst.join("raw.conf")).expect("raw.conf deployed"),
+        b"literal {{ greeting }} stays\n",
+        "INV-8: with no vars and no template opt-in, a file containing template-looking syntax \
+         must be byte-copied verbatim, NOT rendered"
+    );
+    assert!(!out.had_failures, "the feature-free deploy must succeed");
+
+    // The lock digest must equal the pure source-bytes digest (no render influence).
+    let source = parsed_of(&cfg, "ed");
+    let locked = out.base_lock.find_source("ed").expect("ed locked");
+    let commit = locked.commit.clone();
+    assert_eq!(
+        locked.digest,
+        h.digest_for(&source, "ed", &commit),
+        "INV-8: the lock digest must equal compute_digest over the source's own scope, unchanged \
+         by the (absent) template feature"
+    );
+}
+
+impl RenderHarness {
+    /// Oracle source-bytes digest for INV-8 / INV-6 reuse, mirroring the sync
+    /// fixture's `expected_digest_for_source` but over a `RenderHarness` url.
+    fn digest_for(&self, source: &ParsedSource, name: &str, commit: &str) -> String {
+        let m = crate::kernel::Selection::new(source.includes(), source.excludes())
+            .expect("source matcher builds");
+        self.backend
+            .compute_digest(&sn(name), &self.url, commit, source.root.as_deref(), &m)
+            .expect("source digest computes")
+    }
+}
+
+#[test]
+fn deployed_name_collision_within_an_artifact_is_a_clear_failure_not_last_writer_wins() {
+    // A single artifact tree holding BOTH `foo` and `foo.tmpl` -> both map to the
+    // deployed name `foo`. This must be a clear failure (the artifact is not
+    // deployed, leaves no record, run reports failure), never last-writer-wins.
+    let src = TempDir::new().expect("src tempdir");
+    let p = src.path();
+    run_git(p, &["init", "-b", "main", "."]);
+    run_git(p, &["config", "user.email", "test@example.com"]);
+    run_git(p, &["config", "user.name", "Test"]);
+    std::fs::create_dir_all(p.join("editor")).expect("mkdir editor");
+    std::fs::write(p.join("editor/foo"), b"plain\n").expect("write foo");
+    std::fs::write(p.join("editor/foo.tmpl"), b"templated {{ x }}\n").expect("write foo.tmpl");
+    run_git(p, &["add", "-A"]);
+    run_git(p, &["commit", "-m", "init"]);
+    let head = rev_parse(p, "HEAD");
+    let url = p.to_string_lossy().into_owned();
+    let h = RenderHarness::over(src, url, head);
+    let td = TargetDir::new();
+    let cfg = config_with_vars("ed", &h.url, &td.target_path(), "x = \"v\"\n");
+    let in_ = input(&cfg, None, None, None, false);
+
+    let out = sync(&in_, &h.backend, &h.registry)
+        .expect("a deployed-name collision must be a per-artifact failure, not a whole-run abort");
+
+    assert!(
+        out.had_failures,
+        "a deployed-name collision (foo and foo.tmpl both -> foo) must report failure"
+    );
+    assert!(
+        h.registry
+            .get(&artifact_key("dest", "ed", "editor"))
+            .expect("get record")
+            .is_none(),
+        "a collided artifact must NOT be deployed (no record), never last-writer-wins"
+    );
+    let dst = td.artifact_dst(&flat_layout(), "ed", "editor");
+    assert!(
+        !dst.join("foo").exists(),
+        "no `foo` may land when `foo` and `foo.tmpl` collide on the deployed name"
+    );
+}
