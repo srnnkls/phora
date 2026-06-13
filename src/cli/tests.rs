@@ -82,6 +82,108 @@ fn state_label_renders_linked_artifact_as_linked() {
     );
 }
 
+#[test]
+fn sync_no_hooks_flag_parses_to_true() {
+    use clap::Parser;
+    let cli = Cli::try_parse_from(["phora", "sync", "--no-hooks"])
+        .expect("sync --no-hooks must parse");
+    let Command::Sync { no_hooks, .. } = cli.command else {
+        panic!("expected Command::Sync");
+    };
+    assert!(no_hooks, "--no-hooks must set no_hooks=true");
+}
+
+#[test]
+fn sync_without_no_hooks_flag_defaults_to_false() {
+    use clap::Parser;
+    let cli = Cli::try_parse_from(["phora", "sync"]).expect("bare sync must parse");
+    let Command::Sync { no_hooks, .. } = cli.command else {
+        panic!("expected Command::Sync");
+    };
+    assert!(!no_hooks, "absent --no-hooks must default no_hooks=false");
+}
+
+#[test]
+fn hook_report_lists_each_hook_with_scope_and_status() {
+    use crate::sync::{HookOutcome, HookScope, HookStatus};
+    let outcomes = vec![
+        HookOutcome {
+            hook_id: "fmt".to_owned(),
+            command: "cargo fmt".to_owned(),
+            scope: HookScope::OnChange,
+            status: HookStatus::Success,
+        },
+        HookOutcome {
+            hook_id: "reload".to_owned(),
+            command: "systemctl reload".to_owned(),
+            scope: HookScope::PostSync,
+            status: HookStatus::Success,
+        },
+    ];
+    let report = render::render_hook_report(&outcomes);
+    assert!(
+        report.contains("fmt"),
+        "report must name the on_change hook by id: {report}"
+    );
+    assert!(
+        report.contains("reload"),
+        "report must name the post_sync hook by id: {report}"
+    );
+    assert!(
+        report.contains("on_change"),
+        "report must label the OnChange scope: {report}"
+    );
+    assert!(
+        report.contains("post_sync"),
+        "report must label the PostSync scope: {report}"
+    );
+}
+
+#[test]
+fn hook_report_surfaces_a_failed_hook_distinctly() {
+    use crate::sync::{HookOutcome, HookScope, HookStatus};
+    let outcomes = vec![
+        HookOutcome {
+            hook_id: "ok".to_owned(),
+            command: "true".to_owned(),
+            scope: HookScope::OnChange,
+            status: HookStatus::Success,
+        },
+        HookOutcome {
+            hook_id: "broken".to_owned(),
+            command: "false".to_owned(),
+            scope: HookScope::PostSync,
+            status: HookStatus::Failure,
+        },
+    ];
+    let report = render::render_hook_report(&outcomes);
+    let broken_line = report
+        .lines()
+        .find(|l| l.contains("broken"))
+        .unwrap_or_else(|| panic!("report must mention the failed hook: {report}"));
+    assert!(
+        broken_line.to_lowercase().contains("fail"),
+        "the failed hook's line must be marked as a failure: {broken_line}"
+    );
+    let ok_line = report
+        .lines()
+        .find(|l| l.contains("ok"))
+        .unwrap_or_else(|| panic!("report must mention the successful hook: {report}"));
+    assert!(
+        !ok_line.to_lowercase().contains("fail"),
+        "a successful hook's line must not be marked as a failure: {ok_line}"
+    );
+}
+
+#[test]
+fn hook_report_is_empty_when_no_hooks_ran() {
+    let report = render::render_hook_report(&[]);
+    assert!(
+        report.trim().is_empty(),
+        "an empty hook-result set must produce no hook-related output: {report}"
+    );
+}
+
 fn record(
     target: &str,
     source: &str,
