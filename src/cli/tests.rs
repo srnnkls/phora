@@ -212,6 +212,7 @@ fn record(
             blake3: "9e8d7c6b5a4f3e2d".to_owned(),
         }],
         linked: false,
+        vars_digest: None,
     }
 }
 
@@ -1748,6 +1749,7 @@ fn record_for(
         preserve_executable: true,
         files,
         linked: false,
+        vars_digest: None,
     }
 }
 
@@ -4663,5 +4665,129 @@ fn preview_selectors_are_long_flags_not_positionals() {
         positional.is_err(),
         "`phora preview <name>` must be rejected: the source selector is the long flag --source, \
              not a positional argument"
+    );
+}
+
+#[expect(clippy::unwrap_used, reason = "fixture git setup fails loudly in tests")]
+fn git_init_with_template(dir: &std::path::Path, body: &[u8]) -> String {
+    let run = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .env("GIT_AUTHOR_DATE", "2026-01-01T00:00:00 +0000")
+            .env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00 +0000")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    };
+    run(&["init", "-b", "main", "."]);
+    run(&["config", "user.email", "test@example.com"]);
+    run(&["config", "user.name", "Test"]);
+    std::fs::create_dir_all(dir.join("editor")).unwrap();
+    std::fs::write(dir.join("editor/motd.tmpl"), body).unwrap();
+    run(&["add", "-A"]);
+    run(&["commit", "-m", "init"]);
+    dir.to_string_lossy().into_owned()
+}
+
+struct EnvVarGuard {
+    key: &'static str,
+    prev: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &std::path::Path) -> Self {
+        let prev = std::env::var_os(key);
+        unsafe { std::env::set_var(key, value) };
+        Self { key, prev }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => unsafe { std::env::set_var(self.key, v) },
+            None => unsafe { std::env::remove_var(self.key) },
+        }
+    }
+}
+
+#[test]
+fn rebuild_over_merged_vars_agrees_with_deployed_vars_digest() {
+    let source = TempDir::new().expect("source repo dir");
+    let url = git_init_with_template(source.path(), b"hello {{ greeting }}!\n");
+
+    let project = TempDir::new().expect("project dir");
+    let target = TempDir::new().expect("target parent dir");
+    let target_path = target.path().join("dest");
+    std::fs::write(
+        project.path().join("phora.toml"),
+        format!(
+            "version = 1\n\n[vars]\ngreeting = \"base\"\n\n\
+             [sources.ed]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+             [targets.home]\npath = \"{}\"\nsources = [\"ed\"]\nlayout = \"flat\"\n",
+            target_path.display(),
+        ),
+    )
+    .expect("write phora.toml");
+    std::fs::write(
+        project.path().join("phora.local.toml"),
+        "version = 1\n\n[vars]\ngreeting = \"local\"\n",
+    )
+    .expect("write phora.local.toml");
+
+    let state = TempDir::new().expect("state root");
+    let cache = TempDir::new().expect("cache root");
+    let key = ArtifactKey {
+        target: "home".to_owned(),
+        source: "ed".to_owned(),
+        artifact: "editor".to_owned(),
+    };
+
+    let (deployed_vd, rebuilt_vd) = with_cwd(project.path(), || {
+        let _state = EnvVarGuard::set("XDG_STATE_HOME", state.path());
+        let _cache = EnvVarGuard::set("XDG_CACHE_HOME", cache.path());
+
+        super::sync::run_sync(false, false, false, None).expect("merged-vars deploy succeeds");
+
+        let motd = target_path.join("editor").join("motd");
+        assert_eq!(
+            std::fs::read(&motd).expect("rendered motd deployed"),
+            b"hello local!\n",
+            "premise: the local [vars] overlay (greeting=local) must win over base; the deploy \
+             renders motd with the MERGED greeting"
+        );
+
+        let reg = open_project_registry().expect("open project registry");
+        let deployed_vd = reg
+            .get(&key)
+            .expect("registry get")
+            .expect("deploy recorded the artifact")
+            .vars_digest;
+        assert!(
+            deployed_vd.is_some(),
+            "premise: a templated artifact's deployed record must stamp a vars_digest"
+        );
+
+        reg.remove(&key).expect("drop the record to force rebuild");
+
+        super::sync::run_rebuild_registry().expect("rebuild reconstructs the dropped record");
+
+        let reg = open_project_registry().expect("reopen project registry");
+        let rebuilt_vd = reg
+            .get(&key)
+            .expect("registry get after rebuild")
+            .expect("rebuild reconstructed the record")
+            .vars_digest;
+        (deployed_vd, rebuilt_vd)
+    });
+
+    assert_eq!(
+        rebuilt_vd, deployed_vd,
+        "rebuild-registry must reconcile against the EFFECTIVE merged base+local vars (the same \
+         config the deploy used), so the reconstructed vars_digest equals the deployed one; \
+         reconciling against base-only vars stamps a divergent digest"
     );
 }

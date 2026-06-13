@@ -3443,6 +3443,7 @@ mod per_binding_refinement {
             preserve_executable: true,
             files: vec![],
             linked: false,
+            vars_digest: None,
         };
         reg.put(&rec).expect("put bare-binding record");
 

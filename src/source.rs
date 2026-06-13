@@ -84,6 +84,8 @@ impl Default for ExportPolicy {
 pub struct ExportResult {
     pub files: Vec<ManifestFile>,
     pub digest: String,
+    /// Digest of the full effective vars map; `Some` iff at least one template rendered.
+    pub vars_digest: Option<String>,
 }
 
 /// Borrowed parameters of [`SourceBackend::export_artifact`].
@@ -387,13 +389,16 @@ impl SourceBackend for GitBackend {
             hasher: blake3::Hasher::new(),
             renderer: &renderer,
             deployed_names: BTreeMap::new(),
+            rendered_any: false,
         };
         walk.run(&artifact_tree, Path::new(""))?;
 
         let digest = format!("blake3:{}", walk.hasher.finalize().to_hex());
+        let vars_digest = walk.rendered_any.then(|| renderer.vars_digest());
         Ok(ExportResult {
             files: walk.files,
             digest,
+            vars_digest,
         })
     }
 
@@ -740,10 +745,13 @@ impl<'a> Renderer<'a> {
         PathBuf::from(self.opt_in.deployed_name(&key))
     }
 
-    fn render(&self, entry_rel: &Path, source_bytes: &[u8]) -> Result<Vec<u8>> {
+    fn render(&self, entry_rel: &Path, source_bytes: &[u8]) -> Result<Rendered> {
         let key = Self::rel_key(entry_rel);
         if !self.opt_in.renders(&key) {
-            return Ok(source_bytes.to_vec());
+            return Ok(Rendered {
+                bytes: source_bytes.to_vec(),
+                templated: false,
+            });
         }
         let template = std::str::from_utf8(source_bytes).map_err(|e| SourceError::Render {
             path: entry_rel.to_path_buf(),
@@ -751,12 +759,36 @@ impl<'a> Renderer<'a> {
         })?;
         self.env
             .render_str(template, self.vars)
-            .map(String::into_bytes)
+            .map(|bytes| Rendered {
+                bytes: bytes.into_bytes(),
+                templated: true,
+            })
             .map_err(|e| SourceError::Render {
                 path: entry_rel.to_path_buf(),
                 message: e.to_string(),
             })
     }
+
+    fn vars_digest(&self) -> String {
+        vars_digest(self.vars)
+    }
+}
+
+/// Blake3 digest of the full effective vars map.
+///
+/// Export and `check_artifact_state` MUST agree byte-for-byte; both route through this.
+#[must_use]
+pub fn vars_digest(vars: &BTreeMap<String, String>) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for (key, value) in vars {
+        hash_framed_entry(&mut hasher, key.as_bytes(), b"\x00var\x00", value.as_bytes());
+    }
+    format!("blake3:{}", hasher.finalize().to_hex())
+}
+
+struct Rendered {
+    bytes: Vec<u8>,
+    templated: bool,
 }
 
 struct ExportWalk<'a, 'r> {
@@ -770,6 +802,7 @@ struct ExportWalk<'a, 'r> {
     hasher: blake3::Hasher,
     renderer: &'a Renderer<'r>,
     deployed_names: BTreeMap<PathBuf, PathBuf>,
+    rendered_any: bool,
 }
 
 impl ExportWalk<'_, '_> {
@@ -819,7 +852,9 @@ impl ExportWalk<'_, '_> {
     ) -> Result<()> {
         let source_bytes = GitBackend::find_blob_data(self.repo, self.source, entry.object_id())?;
         let deployed_rel = self.renderer.deployed_rel(entry_rel);
-        let data = self.renderer.render(entry_rel, &source_bytes)?;
+        let rendered = self.renderer.render(entry_rel, &source_bytes)?;
+        self.rendered_any |= rendered.templated;
+        let data = rendered.bytes;
 
         if let Some(prior) = self
             .deployed_names
@@ -2529,6 +2564,131 @@ path = "srnnkls/tropos"
         assert!(
             matches!(err, SourceError::Render { .. }),
             "exceeding the minijinja fuel cap must abort the artifact as a Render error, not panic or hang, got: {err:?}"
+        );
+    }
+
+    // ---- ExportResult.vars_digest (TPH-010) ----
+
+    fn export_art_with_vars(
+        fixture: &ExportFixture,
+        staging: &Path,
+        vars: &BTreeMap<String, String>,
+    ) -> ExportResult {
+        let source = sn("src");
+        let artifact = an("art");
+        let m = matcher(&[], &[]);
+        let req = ExportRequest {
+            source: &source,
+            url: &fixture.url,
+            commit: &fixture.commit,
+            root: None,
+            artifact: &artifact,
+            selection: &m,
+            policy: &ExportPolicy::default(),
+            staging_dir: staging,
+            commit_time: EXPORT_COMMIT_TIME,
+            template_opt_in: &TemplateOptIn::SuffixOnly,
+            vars,
+        };
+        fixture.backend.export_artifact(&req).expect("export art")
+    }
+
+    #[test]
+    fn export_vars_digest_is_none_when_no_template_rendered() {
+        let fixture = build_collision_fixture(&[("plain.txt", b"static body\n")]);
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+        let staging = TempDir::new().expect("staging dir");
+
+        let mut vars = BTreeMap::new();
+        vars.insert("name".to_owned(), "ada".to_owned());
+
+        let result = export_art_with_vars(&fixture, staging.path(), &vars);
+
+        assert_eq!(
+            result.vars_digest, None,
+            "a feature-free artifact (no `.tmpl`, no template rendered) must report vars_digest = \
+             None even when vars are present, so a vars change leaves it untouched (INV-8), got {:?}",
+            result.vars_digest
+        );
+    }
+
+    #[test]
+    fn export_vars_digest_is_some_when_a_template_rendered() {
+        let fixture = build_collision_fixture(&[("greeting.txt.tmpl", b"hello {{ name }}\n")]);
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+        let staging = TempDir::new().expect("staging dir");
+
+        let mut vars = BTreeMap::new();
+        vars.insert("name".to_owned(), "ada".to_owned());
+
+        let result = export_art_with_vars(&fixture, staging.path(), &vars);
+
+        assert!(
+            result.vars_digest.is_some(),
+            "an artifact that rendered at least one template must report vars_digest = Some(..), \
+             got {:?}",
+            result.vars_digest
+        );
+    }
+
+    #[test]
+    fn export_vars_digest_changes_when_a_var_value_changes() {
+        let fixture = build_collision_fixture(&[("greeting.txt.tmpl", b"hello {{ name }}\n")]);
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+
+        let staging_a = TempDir::new().expect("staging a");
+        let mut vars_a = BTreeMap::new();
+        vars_a.insert("name".to_owned(), "ada".to_owned());
+        let digest_a = export_art_with_vars(&fixture, staging_a.path(), &vars_a).vars_digest;
+
+        let staging_b = TempDir::new().expect("staging b");
+        let mut vars_b = BTreeMap::new();
+        vars_b.insert("name".to_owned(), "grace".to_owned());
+        let digest_b = export_art_with_vars(&fixture, staging_b.path(), &vars_b).vars_digest;
+
+        assert!(
+            digest_a.is_some() && digest_b.is_some(),
+            "both renders must produce a vars_digest"
+        );
+        assert_ne!(
+            digest_a, digest_b,
+            "changing a vars value must change the vars_digest so every templated artifact is \
+             marked Outdated and re-renders, got {digest_a:?} vs {digest_b:?}"
+        );
+    }
+
+    #[test]
+    fn export_vars_digest_hashes_full_vars_not_only_consumed_keys() {
+        let fixture = build_collision_fixture(&[("greeting.txt.tmpl", b"hello {{ name }}\n")]);
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+
+        let staging_a = TempDir::new().expect("staging a");
+        let mut vars_a = BTreeMap::new();
+        vars_a.insert("name".to_owned(), "ada".to_owned());
+        let digest_a = export_art_with_vars(&fixture, staging_a.path(), &vars_a).vars_digest;
+
+        let staging_b = TempDir::new().expect("staging b");
+        let mut vars_b = BTreeMap::new();
+        vars_b.insert("name".to_owned(), "ada".to_owned());
+        vars_b.insert("unused".to_owned(), "x".to_owned());
+        let digest_b = export_art_with_vars(&fixture, staging_b.path(), &vars_b).vars_digest;
+
+        assert_ne!(
+            digest_a, digest_b,
+            "the digest scope is the FULL effective vars map, not consumed-keys-only: adding a var \
+             the template never references must still change vars_digest, got {digest_a:?} vs {digest_b:?}"
         );
     }
 

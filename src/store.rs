@@ -39,6 +39,43 @@ pub struct RegistryRecord {
     pub files: Vec<ManifestFile>,
     #[serde(default)]
     pub linked: bool,
+    /// Digest of the full effective vars map at deploy time; `None` for feature-free artifacts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vars_digest: Option<String>,
+}
+
+/// Borrowed inputs shared by every record-construction site (`deploy_one`, `rebuild_one`).
+pub struct ProjectedRecord<'a> {
+    pub key: ArtifactKey,
+    pub underlying_source: &'a str,
+    pub commit: &'a str,
+    pub digest: String,
+    pub layout: String,
+    pub allow_symlinks: bool,
+    pub preserve_executable: bool,
+    pub files: Vec<ManifestFile>,
+    pub vars_digest: Option<String>,
+}
+
+impl RegistryRecord {
+    /// Build a managed (`linked = false`) record, stamping `projected_at` to now.
+    #[must_use]
+    pub fn projected(p: ProjectedRecord<'_>) -> Self {
+        Self {
+            version: 1,
+            key: p.key,
+            source: p.underlying_source.to_owned(),
+            commit: p.commit.to_owned(),
+            digest: p.digest,
+            projected_at: chrono::Utc::now().to_rfc3339(),
+            layout: p.layout,
+            allow_symlinks: p.allow_symlinks,
+            preserve_executable: p.preserve_executable,
+            files: p.files,
+            linked: false,
+            vars_digest: p.vars_digest,
+        }
+    }
 }
 
 /// Registry record file entry (carries the content hash used by `phora verify`).
@@ -475,6 +512,7 @@ mod tests {
             preserve_executable: true,
             files: vec![],
             linked: true,
+            vars_digest: None,
         };
 
         let toml = toml::to_string(&rec).expect("serialize linked record");
@@ -545,6 +583,7 @@ artifact = "snippets"
             preserve_executable: true,
             files: vec![],
             linked: false,
+            vars_digest: None,
         };
 
         let toml = toml::to_string(&rec).expect("serialize aliased record");
@@ -593,6 +632,108 @@ artifact = "snippets"
         );
     }
 
+    // ── per-artifact vars digest (TPH-010) ─────────────────────────
+
+    fn vars_digest_record(vars_digest: Option<&str>) -> RegistryRecord {
+        RegistryRecord {
+            version: 1,
+            key: ArtifactKey {
+                target: "vscode".to_owned(),
+                source: "company-configs".to_owned(),
+                artifact: "snippets".to_owned(),
+            },
+            source: "company-configs".to_owned(),
+            commit: "def456789abc123".to_owned(),
+            digest: "blake3:d4e5f6".to_owned(),
+            projected_at: "2026-01-31T12:34:56Z".to_owned(),
+            layout: "flat".to_owned(),
+            allow_symlinks: false,
+            preserve_executable: true,
+            files: vec![],
+            linked: false,
+            vars_digest: vars_digest.map(str::to_owned),
+        }
+    }
+
+    /// INV-8 (byte-stability): a feature-free record (rendered no template, so
+    /// `vars_digest` is None) must serialize with NO `vars_digest` key, byte-identical
+    /// to the pre-feature format.
+    #[test]
+    fn feature_free_record_serializes_without_vars_digest_key() {
+        let rec = vars_digest_record(None);
+
+        let toml = toml::to_string(&rec).expect("serialize feature-free record");
+
+        assert!(
+            !toml.contains("vars_digest"),
+            "a record whose vars_digest is None must omit the key entirely (skip_serializing_if), \
+             so feature-free records stay byte-identical to the pre-feature format (INV-8), got:\n{toml}"
+        );
+
+        let back: RegistryRecord = toml::from_str(&toml).expect("deserialize feature-free record");
+        assert_eq!(
+            back, rec,
+            "a None vars_digest must round-trip field-for-field through TOML"
+        );
+        assert_eq!(
+            back.vars_digest, None,
+            "a record with no vars_digest key must deserialize back to None"
+        );
+    }
+
+    /// A templated record carries a `vars_digest`; the key must serialize and round-trip.
+    #[test]
+    fn templated_record_round_trips_vars_digest() {
+        let rec = vars_digest_record(Some("blake3:abc123"));
+
+        let toml = toml::to_string(&rec).expect("serialize templated record");
+
+        assert!(
+            toml.contains("vars_digest"),
+            "a record whose vars_digest is Some(..) must serialize the key, got:\n{toml}"
+        );
+
+        let back: RegistryRecord = toml::from_str(&toml).expect("deserialize templated record");
+        assert_eq!(
+            back, rec,
+            "a Some(vars_digest) record must round-trip field-for-field through TOML"
+        );
+        assert_eq!(
+            back.vars_digest.as_deref(),
+            Some("blake3:abc123"),
+            "the vars_digest value must survive serde"
+        );
+    }
+
+    /// Records written before the vars-digest field existed have no `vars_digest` key;
+    /// serde `#[serde(default)]` must deserialize them as None (back-compat).
+    #[test]
+    fn record_without_vars_digest_field_deserializes_as_none() {
+        let legacy = r#"
+version = 1
+commit = "def456789abc123"
+digest = "blake3:d4e5f6"
+projected_at = "2026-01-31T12:34:56Z"
+layout = "flat"
+allow_symlinks = false
+preserve_executable = true
+files = []
+
+[key]
+target = "vscode"
+source = "company-configs"
+artifact = "snippets"
+"#;
+
+        let rec: RegistryRecord =
+            toml::from_str(legacy).expect("legacy record without `vars_digest` must still parse");
+
+        assert_eq!(
+            rec.vars_digest, None,
+            "a record predating the vars-digest field must default to None"
+        );
+    }
+
     fn record(target: &str, source: &str, artifact: &str) -> RegistryRecord {
         RegistryRecord {
             version: 1,
@@ -615,6 +756,7 @@ artifact = "snippets"
                 blake3: "9e8d7c6b5a4f3e2d".to_owned(),
             }],
             linked: false,
+            vars_digest: None,
         }
     }
 

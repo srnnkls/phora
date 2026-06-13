@@ -7,7 +7,7 @@ use crate::error::{Error, Result};
 use crate::kernel::{ArtifactName, Selection, SourceName};
 use crate::lock::encode_ref;
 use crate::source::{ExportRequest, SourceBackend};
-use crate::store::{ArtifactKey, EjectedEntry, Registry, RegistryRecord};
+use crate::store::{ArtifactKey, EjectedEntry, ProjectedRecord, Registry, RegistryRecord};
 
 use super::discover::discover_artifacts_for_source;
 use super::{
@@ -152,6 +152,7 @@ pub(super) fn deploy_artifact_entry(
         artifact: entry.artifact_name.as_str().to_owned(),
     };
 
+    let expected_vars_digest = expected_vars_digest(entry, backend, registry, &key, run.vars)?;
     let state = check_artifact_state(
         &artifact_dst,
         entry.identity,
@@ -160,6 +161,7 @@ pub(super) fn deploy_artifact_entry(
         entry.artifact_name.as_str(),
         registry,
         &key,
+        expected_vars_digest.as_deref(),
     )?;
 
     let conflict_kind = conflict_kind_for(&state, entry, run.force);
@@ -242,6 +244,34 @@ pub(super) fn deploy_artifact_entry(
         }
         Resolution::Abort => Err(Error::Aborted),
     }
+}
+
+/// `None` unless this copy-mode artifact renders at least one file, mirroring export so a
+/// feature-free artifact stays Clean (INV-8).
+fn expected_vars_digest(
+    entry: &ArtifactEntry<'_>,
+    backend: &dyn SourceBackend,
+    registry: &dyn Registry,
+    key: &ArtifactKey,
+    vars: &BTreeMap<String, String>,
+) -> Result<Option<String>> {
+    if !matches!(entry.source.deploy_mode(), DeployMode::Copy)
+        || registry.get(key)?.is_some_and(|r| r.linked)
+    {
+        return Ok(None);
+    }
+    let files = backend.list_artifact_files(
+        entry.source_name,
+        entry.git,
+        entry.commit,
+        entry.root,
+        entry.artifact_name,
+        entry.selection,
+    )?;
+    let templated = files
+        .iter()
+        .any(|p| entry.template_opt_in.renders(&p.to_string_lossy().replace('\\', "/")));
+    Ok(templated.then(|| crate::source::vars_digest(vars)))
 }
 
 fn conflict_kind_for(
@@ -327,19 +357,17 @@ fn deploy_one(
             .map_err(|e| Error::Sync(format!("create target dir {}: {e}", parent.display())))?;
     }
 
-    let record = RegistryRecord {
-        version: 1,
+    let record = RegistryRecord::projected(ProjectedRecord {
         key: ctx.key,
-        source: ctx.underlying_source.to_owned(),
-        commit: ctx.commit.to_owned(),
+        underlying_source: ctx.underlying_source,
+        commit: ctx.commit,
         digest: export.digest,
-        projected_at: chrono::Utc::now().to_rfc3339(),
         layout: format!("{:?}", ctx.layout_kind).to_lowercase(),
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
         files: export.files,
-        linked: false,
-    };
+        vars_digest: export.vars_digest,
+    });
 
     staging_guard.disarm();
     deploy_artifact(
@@ -372,6 +400,7 @@ fn deploy_link(
         preserve_executable: policy.preserve_executable,
         files: vec![],
         linked: true,
+        vars_digest: None,
     };
     let staging_base = target_parent(entry.target_path).join(".phora-stage");
     link_artifact(

@@ -82,7 +82,9 @@ fn finish_sync(cwd: &Path, out: &SyncOutput) -> Result<()> {
 
 pub(super) fn run_rebuild_registry() -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let config = load_config()?;
+    let base = load_config()?;
+    let local = load_local_config(&cwd)?;
+    let config = crate::config::merge_configs(base, local);
     config.validate()?;
     let (base_lock, local_lock) = load_locks(&cwd)?;
     let lock = match base_lock {
