@@ -833,6 +833,7 @@ impl ExportWalk<'_, '_> {
                 }
                 EntryKind::Link => self.write_link(&entry, &entry_rel, &out_path)?,
                 EntryKind::Tree => {
+                    self.register_deployed_name(entry_rel.clone(), &entry_rel)?;
                     std::fs::create_dir_all(&out_path)?;
                     let subtree = self.repo.find_tree(entry.object_id()).map_err(|e| {
                         SourceError::Source(format!("subtree in {}: {e}", self.source))
@@ -849,28 +850,34 @@ impl ExportWalk<'_, '_> {
         Ok(())
     }
 
+    fn register_deployed_name(&mut self, deployed_rel: PathBuf, source_rel: &Path) -> Result<()> {
+        let name = deployed_rel.to_string_lossy().into_owned();
+        if let Some(prior) = self
+            .deployed_names
+            .insert(deployed_rel, source_rel.to_path_buf())
+        {
+            return Err(SourceError::DeployedNameCollision {
+                name,
+                first: prior,
+                second: source_rel.to_path_buf(),
+            });
+        }
+        Ok(())
+    }
+
     fn write_blob(
         &mut self,
         entry: &gix::object::tree::EntryRef<'_, '_>,
         entry_rel: &Path,
         executable: bool,
     ) -> Result<()> {
-        let source_bytes = GitBackend::find_blob_data(self.repo, self.source, entry.object_id())?;
         let deployed_rel = self.renderer.deployed_rel(entry_rel);
+        self.register_deployed_name(deployed_rel.clone(), entry_rel)?;
+
+        let source_bytes = GitBackend::find_blob_data(self.repo, self.source, entry.object_id())?;
         let rendered = self.renderer.render(entry_rel, &source_bytes)?;
         self.rendered_any |= rendered.templated;
         let data = rendered.bytes;
-
-        if let Some(prior) = self
-            .deployed_names
-            .insert(deployed_rel.clone(), entry_rel.to_path_buf())
-        {
-            return Err(SourceError::DeployedNameCollision {
-                name: deployed_rel.to_string_lossy().into_owned(),
-                first: prior,
-                second: entry_rel.to_path_buf(),
-            });
-        }
 
         let out_path = self.out_base.join(&deployed_rel);
         if let Some(parent) = out_path.parent() {
@@ -923,17 +930,7 @@ impl ExportWalk<'_, '_> {
         }
         let target = GitBackend::find_blob_data(self.repo, self.source, entry.object_id())?;
 
-        let deployed_rel = entry_rel.to_path_buf();
-        if let Some(prior) = self
-            .deployed_names
-            .insert(deployed_rel.clone(), entry_rel.to_path_buf())
-        {
-            return Err(SourceError::DeployedNameCollision {
-                name: deployed_rel.to_string_lossy().into_owned(),
-                first: prior,
-                second: entry_rel.to_path_buf(),
-            });
-        }
+        self.register_deployed_name(entry_rel.to_path_buf(), entry_rel)?;
 
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -1544,6 +1541,21 @@ mod tests {
         std::fs::create_dir_all(&art).unwrap();
         std::fs::write(art.join("link.tmpl"), b"rendered\n").unwrap();
         std::os::unix::fs::symlink(LINK_TARGET, art.join("link")).unwrap();
+        run_git(src_path, &["add", "-A"]);
+        let commit = commit_export_repo(src_path);
+
+        export_fixture_from(src, commit)
+    }
+
+    fn build_dir_template_collision_fixture() -> ExportFixture {
+        let src = TempDir::new().expect("collision src tempdir");
+        let src_path = src.path();
+        init_export_repo(src_path);
+
+        let art = src_path.join("art");
+        std::fs::create_dir_all(art.join("config")).expect("create config dir");
+        std::fs::write(art.join("config").join("inner.txt"), b"inner\n").expect("write inner");
+        std::fs::write(art.join("config.tmpl"), b"rendered\n").expect("write config.tmpl");
         run_git(src_path, &["add", "-A"]);
         let commit = commit_export_repo(src_path);
 
@@ -2544,6 +2556,24 @@ path = "srnnkls/tropos"
         assert!(
             matches!(err, SourceError::DeployedNameCollision { .. }),
             "a symlink and a blob mapping to the same deployed name must collide, not last-writer-wins, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn export_rejects_directory_colliding_with_rendered_deployed_name() {
+        let fixture = build_dir_template_collision_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+        let staging = TempDir::new().expect("staging dir");
+
+        let m = matcher(&[], &[]);
+        let err = export_named(&fixture, "art", staging.path(), &m, &ExportPolicy::default())
+            .expect_err("directory `config` and rendered `config.tmpl` both deploy to `config`");
+        assert!(
+            matches!(err, SourceError::DeployedNameCollision { .. }),
+            "a directory and a blob mapping to the same deployed name must collide, not surface a raw fs error, got: {err:?}"
         );
     }
 

@@ -246,8 +246,8 @@ pub(super) fn deploy_artifact_entry(
     }
 }
 
-/// `None` unless this copy-mode artifact renders at least one file, mirroring export so a
-/// feature-free artifact stays Clean (INV-8).
+/// `check_artifact_state` compares this only when `record.vars_digest.is_some()`; that lets a
+/// non-templated record skip the git-tree walk here and still resolve Clean (INV-8).
 fn expected_vars_digest(
     entry: &ArtifactEntry<'_>,
     backend: &dyn SourceBackend,
@@ -255,9 +255,13 @@ fn expected_vars_digest(
     key: &ArtifactKey,
     vars: &BTreeMap<String, String>,
 ) -> Result<Option<String>> {
-    if !matches!(entry.source.deploy_mode(), DeployMode::Copy)
-        || registry.get(key)?.is_some_and(|r| r.linked)
-    {
+    if !matches!(entry.source.deploy_mode(), DeployMode::Copy) {
+        return Ok(None);
+    }
+    let Some(record) = registry.get(key)? else {
+        return Ok(None);
+    };
+    if record.linked || record.vars_digest.is_none() {
         return Ok(None);
     }
     let files = backend.list_artifact_files(
