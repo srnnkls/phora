@@ -83,6 +83,25 @@ pub trait Registry {
     fn load_ejected(&self, target: &str) -> Result<Vec<EjectedEntry>>;
     fn save_ejected(&self, target: &str, ejected: &[EjectedEntry]) -> Result<()>;
 
+    /// Per-hook last-success digest sets recorded for `target`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the target meta file cannot be read or parsed.
+    fn load_hook_state(&self, target: &str) -> Result<Vec<HookState>>;
+
+    /// Advance one hook's last-success set, leaving sibling hooks untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the target meta file cannot be read, parsed, or written.
+    fn record_hook_success(
+        &self,
+        target: &str,
+        hook_id: &str,
+        digest_set: &std::collections::BTreeSet<String>,
+    ) -> Result<()>;
+
     /// Directory holding the deploy journal and `state.lock`.
     fn locks_dir(&self) -> PathBuf;
 }
@@ -125,13 +144,25 @@ pub struct StateLockGuard {
     _file: std::fs::File,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+const META_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
 struct TargetMeta {
     version: u32,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     ejected: Vec<EjectedEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     hooks: Vec<HookState>,
+}
+
+impl Default for TargetMeta {
+    fn default() -> Self {
+        Self {
+            version: META_VERSION,
+            ejected: Vec::new(),
+            hooks: Vec::new(),
+        }
+    }
 }
 
 impl FileRegistry {
@@ -165,10 +196,7 @@ impl FileRegistry {
         match std::fs::read_to_string(&path) {
             Ok(text) => toml::from_str(&text)
                 .map_err(|e| StoreError::Registry(format!("parse meta {}: {e}", path.display()))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(TargetMeta {
-                version: 1,
-                ..TargetMeta::default()
-            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(TargetMeta::default()),
             Err(e) => Err(StoreError::Registry(format!(
                 "read meta {}: {e}",
                 path.display()
@@ -176,37 +204,23 @@ impl FileRegistry {
         }
     }
 
-    fn write_meta(&self, target: &str, meta: &TargetMeta) -> Result<()> {
+    fn write_meta(&self, target: &str, meta: &mut TargetMeta) -> Result<()> {
+        meta.version = META_VERSION;
         let serialized = toml::to_string(meta)
             .map_err(|e| StoreError::Registry(format!("serialize meta: {e}")))?;
         atomic_write(&self.meta_path(target), &serialized)
     }
 
-    pub fn load_hook_state(&self, target: &str) -> Result<Vec<HookState>> {
-        Ok(self.read_meta(target)?.hooks)
-    }
-
-    pub fn save_hook_state(&self, target: &str, hooks: &[HookState]) -> Result<()> {
+    /// Full-replace helper that can clobber sibling hooks; `record_hook_success` is the safe seam.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the target meta file cannot be read, parsed, or written.
+    #[cfg(test)]
+    pub(crate) fn save_hook_state(&self, target: &str, hooks: &[HookState]) -> Result<()> {
         let mut meta = self.read_meta(target)?;
         meta.hooks = hooks.to_vec();
-        self.write_meta(target, &meta)
-    }
-
-    pub fn record_hook_success(
-        &self,
-        target: &str,
-        hook_id: &str,
-        digest_set: &std::collections::BTreeSet<String>,
-    ) -> Result<()> {
-        let mut meta = self.read_meta(target)?;
-        match meta.hooks.iter_mut().find(|h| h.hook_id == hook_id) {
-            Some(existing) => existing.last_success.clone_from(digest_set),
-            None => meta.hooks.push(HookState {
-                hook_id: hook_id.to_owned(),
-                last_success: digest_set.clone(),
-            }),
-        }
-        self.write_meta(target, &meta)
+        self.write_meta(target, &mut meta)
     }
 
     pub fn lock_exclusive(&self) -> Result<StateLockGuard> {
@@ -382,7 +396,28 @@ impl Registry for FileRegistry {
     fn save_ejected(&self, target: &str, ejected: &[EjectedEntry]) -> Result<()> {
         let mut meta = self.read_meta(target)?;
         meta.ejected = ejected.to_vec();
-        self.write_meta(target, &meta)
+        self.write_meta(target, &mut meta)
+    }
+
+    fn load_hook_state(&self, target: &str) -> Result<Vec<HookState>> {
+        Ok(self.read_meta(target)?.hooks)
+    }
+
+    fn record_hook_success(
+        &self,
+        target: &str,
+        hook_id: &str,
+        digest_set: &std::collections::BTreeSet<String>,
+    ) -> Result<()> {
+        let mut meta = self.read_meta(target)?;
+        match meta.hooks.iter_mut().find(|h| h.hook_id == hook_id) {
+            Some(existing) => existing.last_success.clone_from(digest_set),
+            None => meta.hooks.push(HookState {
+                hook_id: hook_id.to_owned(),
+                last_success: digest_set.clone(),
+            }),
+        }
+        self.write_meta(target, &mut meta)
     }
 
     fn locks_dir(&self) -> PathBuf {
