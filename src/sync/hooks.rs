@@ -63,13 +63,13 @@ pub(super) fn dispatch_hooks(config: &Config, registry: &dyn Registry) -> Result
                 hook.shell.as_deref().unwrap_or(DEFAULT_SHELL_PREFIX)
             );
             let recorded = recorded_set(registry, target_name, &id)?;
-            let added = added_records(&records, &recorded);
-            if added.is_empty() {
+            let changed = changed_records(&records, &recorded);
+            if changed.is_empty() {
                 continue;
             }
 
-            let names = changed_names(&added);
-            let paths = changed_paths(&added, &target_path, &layout);
+            let names = changed_names(&changed);
+            let paths = changed_paths(&changed, &target_path, &layout);
             let status = run_hook(
                 hook,
                 &[
@@ -131,7 +131,7 @@ fn recorded_set(registry: &dyn Registry, target: &str, id: &str) -> Result<BTree
 
 /// Records carrying a digest absent from the hook's last-success set: the
 /// directional changed set (additions/modifications). Pure removals yield none.
-fn added_records<'a>(
+fn changed_records<'a>(
     records: &'a [RegistryRecord],
     recorded: &BTreeSet<String>,
 ) -> Vec<&'a RegistryRecord> {
@@ -141,17 +141,17 @@ fn added_records<'a>(
         .collect()
 }
 
-fn changed_names(added: &[&RegistryRecord]) -> String {
-    let names: BTreeSet<&str> = added.iter().map(|r| r.key.artifact.as_str()).collect();
+fn changed_names(changed: &[&RegistryRecord]) -> String {
+    let names: BTreeSet<&str> = changed.iter().map(|r| r.key.artifact.as_str()).collect();
     names.into_iter().collect::<Vec<_>>().join("\n")
 }
 
 fn changed_paths(
-    added: &[&RegistryRecord],
+    changed: &[&RegistryRecord],
     target_path: &std::path::Path,
     layout: &LayoutConfig,
 ) -> String {
-    let paths: BTreeSet<String> = added
+    let paths: BTreeSet<String> = changed
         .iter()
         .map(|r| {
             target_path

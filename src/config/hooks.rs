@@ -58,7 +58,7 @@ impl<'de> Deserialize<'de> for HookCommand {
                 self,
                 v: &str,
             ) -> std::result::Result<Self::Value, E> {
-                command(v.to_owned(), None)
+                validated_command(v.to_owned(), None)
             }
 
             fn visit_map<A: serde::de::MapAccess<'de>>(
@@ -67,7 +67,7 @@ impl<'de> Deserialize<'de> for HookCommand {
             ) -> std::result::Result<Self::Value, A::Error> {
                 let table =
                     HookTable::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
-                command(table.run, table.shell)
+                validated_command(table.run, table.shell)
             }
         }
 
@@ -75,7 +75,7 @@ impl<'de> Deserialize<'de> for HookCommand {
     }
 }
 
-fn command<E: serde::de::Error>(
+fn validated_command<E: serde::de::Error>(
     run: String,
     shell: Option<String>,
 ) -> std::result::Result<HookCommand, E> {
@@ -106,7 +106,7 @@ where
         }
 
         fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
-            Ok(vec![command(v.to_owned(), None)?])
+            Ok(vec![validated_command(v.to_owned(), None)?])
         }
 
         fn visit_map<A: serde::de::MapAccess<'de>>(

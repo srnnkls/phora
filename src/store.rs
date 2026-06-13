@@ -163,14 +163,6 @@ pub fn ejected_index(
     Ok(index)
 }
 
-#[must_use]
-pub fn digest_set_changed(
-    current: &std::collections::BTreeSet<String>,
-    recorded: &std::collections::BTreeSet<String>,
-) -> bool {
-    current != recorded
-}
-
 pub struct FileRegistry {
     state_root: PathBuf,
 }
@@ -241,9 +233,9 @@ impl FileRegistry {
         }
     }
 
-    fn write_meta(&self, target: &str, meta: &mut TargetMeta) -> Result<()> {
+    fn write_meta(&self, target: &str, mut meta: TargetMeta) -> Result<()> {
         meta.version = META_VERSION;
-        let serialized = toml::to_string(meta)
+        let serialized = toml::to_string(&meta)
             .map_err(|e| StoreError::Registry(format!("serialize meta: {e}")))?;
         atomic_write(&self.meta_path(target), &serialized)
     }
@@ -257,7 +249,7 @@ impl FileRegistry {
     pub(crate) fn save_hook_state(&self, target: &str, hooks: &[HookState]) -> Result<()> {
         let mut meta = self.read_meta(target)?;
         meta.hooks = hooks.to_vec();
-        self.write_meta(target, &mut meta)
+        self.write_meta(target, meta)
     }
 
     pub fn lock_exclusive(&self) -> Result<StateLockGuard> {
@@ -433,7 +425,7 @@ impl Registry for FileRegistry {
     fn save_ejected(&self, target: &str, ejected: &[EjectedEntry]) -> Result<()> {
         let mut meta = self.read_meta(target)?;
         meta.ejected = ejected.to_vec();
-        self.write_meta(target, &mut meta)
+        self.write_meta(target, meta)
     }
 
     fn load_hook_state(&self, target: &str) -> Result<Vec<HookState>> {
@@ -454,7 +446,7 @@ impl Registry for FileRegistry {
                 last_success: digest_set.clone(),
             }),
         }
-        self.write_meta(target, &mut meta)
+        self.write_meta(target, meta)
     }
 
     fn locks_dir(&self) -> PathBuf {
@@ -1161,34 +1153,6 @@ artifact = "snippets"
         assert!(
             states.is_empty(),
             "a target with no recorded hook run yields an empty hook-state list"
-        );
-    }
-
-    /// INV-3: the trigger is a digest-set DIFF. A current set identical to the
-    /// recorded last-success set is unchanged (no-op → fires nothing); any
-    /// difference is changed.
-    #[test]
-    fn digest_set_diff_detects_changed_vs_unchanged() {
-        let recorded = digest_set(&["blake3:aaa", "blake3:bbb"]);
-
-        assert!(
-            !digest_set_changed(&recorded, &recorded),
-            "identical digest-set must be unchanged (no-op sync fires nothing, INV-3)"
-        );
-        assert!(
-            digest_set_changed(&digest_set(&["blake3:aaa", "blake3:ccc"]), &recorded),
-            "a differing member must be detected as changed"
-        );
-        assert!(
-            digest_set_changed(&digest_set(&["blake3:aaa"]), &recorded),
-            "a shrunk digest-set must be detected as changed"
-        );
-        assert!(
-            digest_set_changed(
-                &digest_set(&["blake3:aaa", "blake3:bbb", "blake3:ccc"]),
-                &recorded
-            ),
-            "a grown digest-set must be detected as changed"
         );
     }
 
