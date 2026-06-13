@@ -203,6 +203,8 @@ fn reject_url_slice(binding: &Binding, source: &Source) -> Result<()> {
         "tag"
     } else if refined.rev.is_some() {
         "rev"
+    } else if refined.template.is_some() {
+        "template"
     } else {
         return Ok(());
     };
