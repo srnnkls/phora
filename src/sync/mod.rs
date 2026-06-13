@@ -98,6 +98,7 @@ pub struct SyncOutput {
     pub base_lock: Lock,
     pub local_lock: Option<Lock>,
     pub had_failures: bool,
+    pub deploy_failures: bool,
     pub hook_results: Vec<hooks::HookOutcome>,
 }
 
@@ -236,6 +237,7 @@ pub fn sync(
     } else {
         hooks::dispatch_hooks(&effective_config, registry)?
     };
+    let deploy_failures = had_failures;
     had_failures |= hook_results
         .iter()
         .any(|o| o.status == hooks::HookStatus::Failure);
@@ -244,6 +246,7 @@ pub fn sync(
         base_lock,
         local_lock,
         had_failures,
+        deploy_failures,
         hook_results,
     })
 }
