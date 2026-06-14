@@ -155,7 +155,7 @@ pub(super) struct ArtifactEntry<'a> {
 }
 
 /// A `map`-layout dest is a single component at the target root; layout helpers must not be applied.
-pub(super) fn record_artifact_path(target: &Target, record: &RegistryRecord) -> PathBuf {
+pub(crate) fn record_artifact_path(target: &Target, record: &RegistryRecord) -> PathBuf {
     if record.layout == MAP_LAYOUT {
         target.expanded_path().join(&record.key.artifact)
     } else {
