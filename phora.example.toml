@@ -124,3 +124,26 @@ sources = [
   { source = "fzf", as = "canary", tag = "v0.56.0" },
 ]
 layout = "by-source"
+
+# Mapped leaves: a binding's `map = { "<source-leaf>" = "<dest>" }` aliases a single
+# source file to a renamed destination at the target root, bypassing the layout (and
+# any `by-source`/`prefixed` nesting). The canonical use is fanning one shared file
+# out under the names different tools expect — here one `AGENTS.md` lands three times,
+# with no copies in the source tree. Give each binding a distinct `as`: identity must
+# be unique within a target.
+[targets.agents]
+path = "~/myproject"
+sources = [
+  { source = "dotfiles", map = { "AGENTS.md" = "AGENTS.md" } },
+  { source = "dotfiles", as = "claude", map = { "AGENTS.md" = "CLAUDE.md" } },
+  { source = "dotfiles", as = "codex",  map = { "AGENTS.md" = "codex.md" } },
+]
+# A key may sit in a subdirectory of the source root, e.g. "lint/rules.toml" = "rules.toml".
+
+# Rejected at config load — each is a hard error:
+#   { source = "dotfiles", map = { "AGENTS.md" = "CLAUDE.md" }, include = ["editor"] }
+#     `map` cannot be combined with `include` (or `exclude`) on the same binding.
+#   { source = "dotfiles", map = { "AGENTS.md" = "ai/CLAUDE.md" } }
+#     a dest must be ONE safe filename — no `/`, `\`, `.`, or `..` (nested dests are v2).
+#   { source = "dotfiles", map = { "../secrets.md" = "CLAUDE.md" } }
+#     a key may not be absolute or escape the source root via `..`.
