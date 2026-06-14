@@ -423,11 +423,7 @@ fn target_artifact_statuses(
     let ejected = registry.load_ejected(target_name)?;
     let mut artifacts = Vec::new();
     for rec in registry.list_target(target_name)? {
-        let artifact_dst = target.expanded_path().join(
-            target
-                .layout()
-                .artifact_path(&rec.key.source, &rec.key.artifact),
-        );
+        let artifact_dst = crate::sync::record_artifact_path(target, &rec);
         let state = check_artifact_state(
             &artifact_dst,
             &rec.key.source,
