@@ -27,6 +27,12 @@ pub enum SourceError {
     #[error("artifact not found in tree: {artifact}")]
     ArtifactNotFound { artifact: String },
 
+    #[error("mapped key not found in source tree: {key}")]
+    MappedKeyNotFound { key: PathBuf },
+
+    #[error("mapped key does not resolve to a regular file: {key}")]
+    MappedKeyNotALeaf { key: PathBuf },
+
     #[error("symlink not allowed: {path} (set allow_symlinks=true to permit)")]
     SymlinkNotAllowed { path: std::path::PathBuf },
 
@@ -101,6 +107,8 @@ pub struct ExportRequest<'a> {
     pub commit_time: u64,
     pub template_opt_in: &'a TemplateOptIn,
     pub vars: &'a BTreeMap<String, String>,
+    /// When `Some`, export individually-renamed leaves: source-relative key → single-component dest.
+    pub path_map: Option<&'a BTreeMap<PathBuf, PathBuf>>,
 }
 
 /// `source` is the human name (diagnostics); `url` identifies the bare mirror,
@@ -124,6 +132,8 @@ pub trait SourceBackend {
     /// # Errors
     /// - [`SourceError::Render`]: a templated file is invalid or fails to render.
     /// - [`SourceError::DeployedNameCollision`]: two source paths map to the same deployed name.
+    /// - [`SourceError::MappedKeyNotFound`]: a `path_map` key resolves to nothing in the tree.
+    /// - [`SourceError::MappedKeyNotALeaf`]: a `path_map` key resolves to a non-regular-file.
     fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult>;
 
     /// Artifact-relative paths selected at `commit`, read from the mirror without
@@ -368,12 +378,6 @@ impl SourceBackend for GitBackend {
     fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult> {
         let repo = self.open_mirror(req.source.as_str(), req.url)?;
         let root_tree = Self::subtree_at_root(&repo, req.source.as_str(), req.commit, req.root)?;
-        let artifact_tree = Self::lookup_subtree(
-            &repo,
-            &root_tree,
-            req.source.as_str(),
-            req.artifact.as_str(),
-        )?;
 
         std::fs::create_dir_all(req.staging_dir)?;
 
@@ -391,7 +395,17 @@ impl SourceBackend for GitBackend {
             deployed_names: BTreeMap::new(),
             rendered_any: false,
         };
-        walk.run(&artifact_tree, Path::new(""))?;
+        if let Some(map) = req.path_map {
+            walk.run_mapped(&root_tree, map)?;
+        } else {
+            let artifact_tree = Self::lookup_subtree(
+                &repo,
+                &root_tree,
+                req.source.as_str(),
+                req.artifact.as_str(),
+            )?;
+            walk.run(&artifact_tree, Path::new(""))?;
+        }
 
         let digest = format!("blake3:{}", walk.hasher.finalize().to_hex());
         let vars_digest = walk.rendered_any.then(|| renderer.vars_digest());
@@ -872,12 +886,27 @@ impl ExportWalk<'_, '_> {
         executable: bool,
     ) -> Result<()> {
         let deployed_rel = self.renderer.deployed_rel(entry_rel);
-        self.register_deployed_name(deployed_rel.clone(), entry_rel)?;
-
         let source_bytes = GitBackend::find_blob_data(self.repo, self.source, entry.object_id())?;
-        let rendered = self.renderer.render(entry_rel, &source_bytes)?;
-        self.rendered_any |= rendered.templated;
-        let data = rendered.bytes;
+        self.stage_leaf(deployed_rel, entry_rel, &source_bytes, executable, true)
+    }
+
+    fn stage_leaf(
+        &mut self,
+        deployed_rel: PathBuf,
+        source_rel: &Path,
+        source_bytes: &[u8],
+        executable: bool,
+        render: bool,
+    ) -> Result<()> {
+        self.register_deployed_name(deployed_rel.clone(), source_rel)?;
+
+        let data = if render {
+            let rendered = self.renderer.render(source_rel, source_bytes)?;
+            self.rendered_any |= rendered.templated;
+            rendered.bytes
+        } else {
+            source_bytes.to_vec()
+        };
 
         let out_path = self.out_base.join(&deployed_rel);
         if let Some(parent) = out_path.parent() {
@@ -914,6 +943,37 @@ impl ExportWalk<'_, '_> {
             mtime: self.commit_time,
             blake3: blake3::hash(&data).to_hex().to_string(),
         });
+        Ok(())
+    }
+
+    /// v1 scope: mapped leaves are copied verbatim, never templated.
+    fn run_mapped(
+        &mut self,
+        root_tree: &gix::Tree<'_>,
+        path_map: &BTreeMap<PathBuf, PathBuf>,
+    ) -> Result<()> {
+        for (key, dest) in path_map {
+            let entry = root_tree
+                .lookup_entry_by_path(key)
+                .map_err(|e| {
+                    SourceError::Source(format!(
+                        "lookup key {} in {}: {e}",
+                        key.display(),
+                        self.source
+                    ))
+                })?
+                .ok_or_else(|| SourceError::MappedKeyNotFound { key: key.clone() })?;
+            let executable = match entry.mode().kind() {
+                EntryKind::Blob => false,
+                EntryKind::BlobExecutable => true,
+                EntryKind::Link => {
+                    return Err(SourceError::SymlinkNotAllowed { path: key.clone() });
+                }
+                _ => return Err(SourceError::MappedKeyNotALeaf { key: key.clone() }),
+            };
+            let bytes = GitBackend::find_blob_data(self.repo, self.source, entry.object_id())?;
+            self.stage_leaf(dest.clone(), key, &bytes, executable, false)?;
+        }
         Ok(())
     }
 
@@ -2321,6 +2381,7 @@ path = "srnnkls/tropos"
             commit_time: EXPORT_COMMIT_TIME,
             template_opt_in: &TemplateOptIn::SuffixOnly,
             vars: &BTreeMap::new(),
+            path_map: None,
         };
         fixture.backend.export_artifact(&req)
     }
@@ -2630,6 +2691,7 @@ path = "srnnkls/tropos"
             commit_time: EXPORT_COMMIT_TIME,
             template_opt_in: &TemplateOptIn::SuffixOnly,
             vars,
+            path_map: None,
         };
         fixture.backend.export_artifact(&req).expect("export art")
     }
@@ -2730,6 +2792,275 @@ path = "srnnkls/tropos"
             digest_a, digest_b,
             "the digest scope is the FULL effective vars map, not consumed-keys-only: adding a var \
              the template never references must still change vars_digest, got {digest_a:?} vs {digest_b:?}"
+        );
+    }
+
+    // ---- mapped export (leaf aliasing, T2b) ----
+
+    const MAP_TOP_CONTENT: &[u8] = b"# top-level agents\n";
+    const MAP_NESTED_CONTENT: &[u8] = b"# nested agents\n";
+    const MAP_TOOL_CONTENT: &[u8] = b"#!/bin/sh\necho tool\n";
+
+    /// Top-level and nested leaves plus an executable, all committed at root.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "fixture setup fails loudly; git CLI is assumed present"
+    )]
+    fn build_map_fixture() -> ExportFixture {
+        let src = TempDir::new().unwrap();
+        let src_path = src.path();
+
+        init_export_repo(src_path);
+
+        std::fs::write(src_path.join("AGENTS.md"), MAP_TOP_CONTENT).unwrap();
+        std::fs::create_dir_all(src_path.join("nested")).unwrap();
+        std::fs::write(src_path.join("nested/AGENTS.md"), MAP_NESTED_CONTENT).unwrap();
+        std::fs::write(src_path.join("tool.sh"), MAP_TOOL_CONTENT).unwrap();
+
+        run_git(src_path, &["add", "-A"]);
+        run_git(src_path, &["update-index", "--chmod=+x", "tool.sh"]);
+
+        let commit = commit_export_repo(src_path);
+
+        let tool_mode =
+            String::from_utf8(run_git(src_path, &["ls-files", "-s", "tool.sh"]).stdout).unwrap();
+        assert!(
+            tool_mode.starts_with("100755"),
+            "tool.sh must be committed executable (100755), got: {tool_mode}"
+        );
+
+        export_fixture_from(src, commit)
+    }
+
+    fn path_map(entries: &[(&str, &str)]) -> BTreeMap<PathBuf, PathBuf> {
+        entries
+            .iter()
+            .map(|(k, v)| (PathBuf::from(k), PathBuf::from(v)))
+            .collect()
+    }
+
+    fn export_mapped(
+        fixture: &ExportFixture,
+        staging: &Path,
+        map: &BTreeMap<PathBuf, PathBuf>,
+    ) -> Result<ExportResult> {
+        let source = sn("src");
+        let artifact = an("unused-in-mapped-mode");
+        let m = matcher(&[], &[]);
+        let req = ExportRequest {
+            source: &source,
+            url: &fixture.url,
+            commit: &fixture.commit,
+            root: None,
+            artifact: &artifact,
+            selection: &m,
+            policy: &ExportPolicy::default(),
+            staging_dir: staging,
+            commit_time: EXPORT_COMMIT_TIME,
+            template_opt_in: &TemplateOptIn::SuffixOnly,
+            vars: &BTreeMap::new(),
+            path_map: Some(map),
+        };
+        fixture.backend.export_artifact(&req)
+    }
+
+    #[test]
+    fn mapped_export_renames_top_level_blob() {
+        let fixture = build_map_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+        let staging = TempDir::new().expect("staging dir");
+
+        let map = path_map(&[("AGENTS.md", "CLAUDE.md")]);
+        let result = export_mapped(&fixture, staging.path(), &map).expect("mapped export succeeds");
+
+        assert_eq!(
+            std::fs::read(staging.path().join("CLAUDE.md")).expect("CLAUDE.md staged"),
+            MAP_TOP_CONTENT,
+            "the source bytes of AGENTS.md must land at the renamed dest CLAUDE.md"
+        );
+        assert!(
+            !staging.path().join("AGENTS.md").exists(),
+            "the source name must not be staged; only the dest name"
+        );
+        let listed: Vec<String> = result
+            .files
+            .iter()
+            .map(|f| f.path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(
+            listed,
+            vec!["CLAUDE.md".to_string()],
+            "files must contain exactly the dest path, not the source key, got {listed:?}"
+        );
+    }
+
+    #[test]
+    fn mapped_export_flattens_nested_key_to_dest() {
+        let fixture = build_map_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+        let staging = TempDir::new().expect("staging dir");
+
+        let map = path_map(&[("nested/AGENTS.md", "codex.md")]);
+        let result = export_mapped(&fixture, staging.path(), &map).expect("mapped export succeeds");
+
+        assert_eq!(
+            std::fs::read(staging.path().join("codex.md")).expect("codex.md staged"),
+            MAP_NESTED_CONTENT,
+            "a nested source key must stage flat at the single-component dest"
+        );
+        assert!(
+            !staging.path().join("nested").exists(),
+            "the nested source path must not be reproduced under staging"
+        );
+        let listed: Vec<String> = result
+            .files
+            .iter()
+            .map(|f| f.path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(
+            listed,
+            vec!["codex.md".to_string()],
+            "files must list the flat dest, not the nested key, got {listed:?}"
+        );
+    }
+
+    #[test]
+    fn mapped_export_stages_all_entries_of_a_multi_key_map() {
+        let fixture = build_map_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+        let staging = TempDir::new().expect("staging dir");
+
+        let map = path_map(&[("AGENTS.md", "CLAUDE.md"), ("nested/AGENTS.md", "codex.md")]);
+        let result = export_mapped(&fixture, staging.path(), &map).expect("mapped export succeeds");
+
+        assert_eq!(
+            std::fs::read(staging.path().join("CLAUDE.md")).expect("CLAUDE.md staged"),
+            MAP_TOP_CONTENT,
+            "the top-level key's bytes must land at its dest"
+        );
+        assert_eq!(
+            std::fs::read(staging.path().join("codex.md")).expect("codex.md staged"),
+            MAP_NESTED_CONTENT,
+            "the nested key's bytes must land at its dest"
+        );
+
+        let mut listed: Vec<String> = result
+            .files
+            .iter()
+            .map(|f| f.path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        listed.sort();
+        assert_eq!(
+            listed,
+            vec!["CLAUDE.md".to_string(), "codex.md".to_string()],
+            "files must contain exactly both dests, no source keys and no extras, got {listed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mapped_export_preserves_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = build_map_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+        let staging = TempDir::new().expect("staging dir");
+
+        let map = path_map(&[("tool.sh", "run")]);
+        export_mapped(&fixture, staging.path(), &map).expect("mapped export succeeds");
+
+        let mode = std::fs::metadata(staging.path().join("run"))
+            .expect("run staged")
+            .permissions()
+            .mode();
+        assert!(
+            mode & 0o111 != 0,
+            "executable source leaf must keep an exec bit through the rename, mode {mode:o}"
+        );
+    }
+
+    #[test]
+    fn mapped_export_errors_when_key_is_a_directory() {
+        let fixture = build_map_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+        let staging = TempDir::new().expect("staging dir");
+
+        let map = path_map(&[("nested", "x.md")]);
+        let err = export_mapped(&fixture, staging.path(), &map)
+            .expect_err("a key resolving to a directory must error; only regular files map");
+        assert!(
+            !staging.path().join("x.md").exists(),
+            "no dest must be staged when a key resolves to a directory"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("nested"),
+            "the error must name the offending key so an unrelated failure can't pass, got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn mapped_export_errors_when_key_is_missing() {
+        let fixture = build_map_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+        let staging = TempDir::new().expect("staging dir");
+
+        let map = path_map(&[("does/not/exist.md", "x.md")]);
+        let err = export_mapped(&fixture, staging.path(), &map)
+            .expect_err("a key resolving to nothing must error");
+        assert!(
+            !staging.path().join("x.md").exists(),
+            "no dest must be staged when a key resolves to nothing"
+        );
+        assert!(
+            matches!(err, SourceError::MappedKeyNotFound { .. }),
+            "a missing key must be MappedKeyNotFound, not the not-a-leaf variant, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exist.md"),
+            "the error must name the missing key so an unrelated failure can't pass, got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn mapped_export_errors_when_two_keys_share_a_dest() {
+        let fixture = build_map_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+        let staging = TempDir::new().expect("staging dir");
+
+        let map = path_map(&[("AGENTS.md", "x.md"), ("nested/AGENTS.md", "x.md")]);
+        let err = export_mapped(&fixture, staging.path(), &map)
+            .expect_err("two keys mapping to one dest must collide");
+        assert!(
+            matches!(err, SourceError::DeployedNameCollision { .. }),
+            "mapped collisions must route through register_deployed_name, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("x.md"),
+            "the collision must name the shared dest, got {msg:?}"
         );
     }
 
@@ -3428,6 +3759,7 @@ path = "srnnkls/tropos"
                     commit_time: 1,
                     template_opt_in: &crate::config::TemplateOptIn::SuffixOnly,
                     vars: &BTreeMap::new(),
+                    path_map: None,
                 })
                 .expect("export the `bin` artifact");
 
