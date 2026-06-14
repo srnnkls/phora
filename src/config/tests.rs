@@ -5857,3 +5857,15 @@ fn binding_map_empty_value_is_rejected() {
         other => panic!("expected Error::Config, got {other:?}"),
     }
 }
+
+#[test]
+fn binding_map_duplicate_dest_values_are_rejected() {
+    let err = map_config_err(r#"map = { "A.md" = "OUT.md", "B.md" = "OUT.md" }"#);
+    match err {
+        Error::Config(msg) => assert!(
+            msg.contains("dotfiles") && msg.contains("OUT.md"),
+            "two keys mapping to one dest must be rejected, naming the source and the duplicated dest, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}

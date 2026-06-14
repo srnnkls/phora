@@ -1,13 +1,15 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::config::{DeployMode, LayoutKind, ParsedSource, Target, TemplateOptIn};
+use crate::config::{DeployMode, LayoutConfig, LayoutKind, ParsedSource, Target, TemplateOptIn};
 use crate::deploy::{ArtifactState, Journal, check_artifact_state, deploy_artifact, link_artifact};
 use crate::error::{Error, Result};
 use crate::kernel::{ArtifactName, Selection, SourceName};
 use crate::lock::encode_ref;
 use crate::source::{ExportRequest, SourceBackend};
-use crate::store::{ArtifactKey, EjectedEntry, ProjectedRecord, Registry, RegistryRecord};
+use crate::store::{
+    ArtifactKey, EjectedEntry, MAP_LAYOUT, ProjectedRecord, Registry, RegistryRecord,
+};
 
 use super::discover::discover_artifacts_for_source;
 use super::{
@@ -37,7 +39,7 @@ pub(super) fn deploy_target(
     let target_path = run.target.expanded_path();
     let layout = run.target.layout();
     let ejected = registry.load_ejected(run.target_name)?;
-    let mut seen: BTreeMap<String, String> = BTreeMap::new();
+    let mut seen_dest: BTreeMap<PathBuf, String> = BTreeMap::new();
     let mut had_failures = false;
 
     for binding in run.target.resolve_sources(run.parsed) {
@@ -60,6 +62,61 @@ pub(super) fn deploy_target(
         let git = remote_for(run.remotes, binding.source)?;
         let source_name = SourceName::trusted(binding.source);
         let selection = Selection::new(binding.include, binding.exclude)?;
+
+        let mut deploy_one_entry =
+            |artifact_name: &ArtifactName, mapped_source_key: Option<&str>| -> Result<()> {
+                let artifact_dst = artifact_dst_for(
+                    &target_path,
+                    &layout,
+                    binding.identity,
+                    artifact_name,
+                    mapped_source_key,
+                );
+                if let Some(other) = seen_dest.get(&artifact_dst) {
+                    if other != binding.identity {
+                        return Err(Error::Collision {
+                            artifact: artifact_name.as_str().to_owned(),
+                            sources: vec![other.clone(), binding.identity.to_owned()],
+                            target: run.target_name.to_owned(),
+                        });
+                    }
+                } else {
+                    seen_dest.insert(artifact_dst.clone(), binding.identity.to_owned());
+                }
+                let dst_is_symlink = std::fs::symlink_metadata(&artifact_dst)
+                    .is_ok_and(|m| m.file_type().is_symlink());
+                let mode_transition = match source.deploy_mode() {
+                    DeployMode::Link => artifact_dst.exists() && !dst_is_symlink,
+                    DeployMode::Copy => dst_is_symlink,
+                };
+                let entry = ArtifactEntry {
+                    source,
+                    git,
+                    source_name: &source_name,
+                    identity: binding.identity,
+                    underlying_source: binding.source,
+                    root: binding.root,
+                    commit,
+                    selection: &selection,
+                    artifact_name,
+                    target_path: &target_path,
+                    layout_kind: layout.kind,
+                    ejected: &ejected,
+                    mode_transition,
+                    template_opt_in: &binding.template_opt_in,
+                    mapped_source_key,
+                };
+                had_failures |= deploy_artifact_entry(run, &entry, backend, registry, journal)?;
+                Ok(())
+            };
+
+        if let Some(map) = binding.map {
+            for (key, dest) in map {
+                deploy_one_entry(&ArtifactName::trusted(dest.as_str()), Some(key.as_str()))?;
+            }
+            continue;
+        }
+
         let discovered = discover_artifacts_for_source(
             source,
             git,
@@ -71,46 +128,7 @@ pub(super) fn deploy_target(
         )?;
 
         for artifact_name in discovered {
-            if layout.kind == LayoutKind::Flat {
-                if let Some(other) = seen.get(artifact_name.as_str()) {
-                    return Err(Error::Collision {
-                        artifact: artifact_name.as_str().to_owned(),
-                        sources: vec![other.clone(), binding.identity.to_owned()],
-                        target: run.target_name.to_owned(),
-                    });
-                }
-                seen.insert(
-                    artifact_name.as_str().to_owned(),
-                    binding.identity.to_owned(),
-                );
-            }
-
-            let artifact_dst =
-                target_path.join(layout.artifact_path(binding.identity, artifact_name.as_str()));
-            let dst_is_symlink =
-                std::fs::symlink_metadata(&artifact_dst).is_ok_and(|m| m.file_type().is_symlink());
-            let mode_transition = match source.deploy_mode() {
-                DeployMode::Link => artifact_dst.exists() && !dst_is_symlink,
-                DeployMode::Copy => dst_is_symlink,
-            };
-
-            let entry = ArtifactEntry {
-                source,
-                git,
-                source_name: &source_name,
-                identity: binding.identity,
-                underlying_source: binding.source,
-                root: binding.root,
-                commit,
-                selection: &selection,
-                artifact_name: &artifact_name,
-                target_path: &target_path,
-                layout_kind: layout.kind,
-                ejected: &ejected,
-                mode_transition,
-                template_opt_in: &binding.template_opt_in,
-            };
-            had_failures |= deploy_artifact_entry(run, &entry, backend, registry, journal)?;
+            deploy_one_entry(&artifact_name, None)?;
         }
     }
 
@@ -132,6 +150,33 @@ pub(super) struct ArtifactEntry<'a> {
     pub(super) ejected: &'a [EjectedEntry],
     pub(super) mode_transition: bool,
     pub(super) template_opt_in: &'a TemplateOptIn,
+    /// Source-side key for a mapped leaf; `None` for layout-routed artifacts.
+    pub(super) mapped_source_key: Option<&'a str>,
+}
+
+/// Mapped leaves land as a renamed FILE at the target root, ignoring layout.
+fn artifact_dst_for(
+    target_path: &Path,
+    layout: &LayoutConfig,
+    identity: &str,
+    artifact_name: &ArtifactName,
+    mapped_source_key: Option<&str>,
+) -> PathBuf {
+    if mapped_source_key.is_some() {
+        target_path.join(artifact_name.as_str())
+    } else {
+        target_path.join(layout.artifact_path(identity, artifact_name.as_str()))
+    }
+}
+
+fn artifact_dst_for_entry(run: TargetRun<'_>, entry: &ArtifactEntry<'_>) -> PathBuf {
+    artifact_dst_for(
+        entry.target_path,
+        &run.target.layout(),
+        entry.identity,
+        entry.artifact_name,
+        entry.mapped_source_key,
+    )
 }
 
 pub(super) fn deploy_artifact_entry(
@@ -141,11 +186,7 @@ pub(super) fn deploy_artifact_entry(
     registry: &dyn Registry,
     journal: &Journal,
 ) -> Result<bool> {
-    let artifact_dst = entry.target_path.join(
-        run.target
-            .layout()
-            .artifact_path(entry.identity, entry.artifact_name.as_str()),
-    );
+    let artifact_dst = artifact_dst_for_entry(run, entry);
     let key = ArtifactKey {
         target: run.target_name.to_owned(),
         source: entry.identity.to_owned(),
@@ -187,6 +228,7 @@ pub(super) fn deploy_artifact_entry(
                 key,
                 template_opt_in: entry.template_opt_in,
                 vars: run.vars,
+                mapped_source_key: entry.mapped_source_key,
             },
         ),
     };
@@ -328,6 +370,7 @@ struct DeployContext<'a> {
     key: ArtifactKey,
     template_opt_in: &'a TemplateOptIn,
     vars: &'a BTreeMap<String, String>,
+    mapped_source_key: Option<&'a str>,
 }
 
 fn deploy_one(
@@ -343,6 +386,12 @@ fn deploy_one(
     let git = ctx.git;
     let commit_time = backend.commit_time(ctx.source_name, git, ctx.commit)?;
     let policy = ctx.source.export_policy();
+    let path_map = ctx.mapped_source_key.map(|key| {
+        BTreeMap::from([(
+            PathBuf::from(key),
+            PathBuf::from(ctx.artifact_name.as_str()),
+        )])
+    });
     let req = ExportRequest {
         source: ctx.source_name,
         url: git,
@@ -355,7 +404,7 @@ fn deploy_one(
         commit_time,
         template_opt_in: ctx.template_opt_in,
         vars: ctx.vars,
-        path_map: None,
+        path_map: path_map.as_ref(),
     };
     let export = backend.export_artifact(&req)?;
 
@@ -369,12 +418,28 @@ fn deploy_one(
         underlying_source: ctx.underlying_source,
         commit: ctx.commit,
         digest: export.digest,
-        layout: format!("{:?}", ctx.layout_kind).to_lowercase(),
+        layout: if ctx.mapped_source_key.is_some() {
+            MAP_LAYOUT.to_owned()
+        } else {
+            format!("{:?}", ctx.layout_kind).to_lowercase()
+        },
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
         files: export.files,
         vars_digest: export.vars_digest,
     });
+
+    // Guard stays armed: deploy_artifact only moves the file, so the guard reaps the empty staging dir.
+    if ctx.mapped_source_key.is_some() {
+        return deploy_artifact(
+            &staging_base,
+            &staging.join(ctx.artifact_name.as_str()),
+            ctx.artifact_dst,
+            record,
+            journal,
+            registry,
+        );
+    }
 
     staging_guard.disarm();
     deploy_artifact(

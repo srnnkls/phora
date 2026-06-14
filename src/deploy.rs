@@ -62,20 +62,21 @@ pub fn check_artifact_state(
         }
     }
 
-    let Some(record) = registry.get(key)? else {
-        return Ok(ArtifactState::Foreign);
+    if std::fs::symlink_metadata(target_path).is_ok_and(|m| m.is_file()) {
+        return check_file_artifact_state(
+            target_path,
+            expected_source,
+            expected_commit,
+            registry,
+            key,
+            expected_vars_digest,
+        );
+    }
+
+    let record = match artifact_record(registry, key, expected_source)? {
+        Ok(record) => record,
+        Err(state) => return Ok(state),
     };
-
-    if record.linked {
-        return Ok(ArtifactState::Linked);
-    }
-
-    if record.key.source != expected_source {
-        return Ok(ArtifactState::Foreign);
-    }
-    let commit_advanced = record.commit != expected_commit;
-    let vars_changed =
-        record.vars_digest.is_some() && record.vars_digest.as_deref() != expected_vars_digest;
 
     let mut changed: BTreeSet<PathBuf> = BTreeSet::new();
 
@@ -115,14 +116,84 @@ pub fn check_artifact_state(
         changed.extend(scan.symlinks);
     }
 
-    if !changed.is_empty() {
-        Ok(ArtifactState::Modified {
-            changed: changed.into_iter().collect(),
-        })
-    } else if commit_advanced || vars_changed {
-        Ok(ArtifactState::Outdated)
+    Ok(classify_drift(
+        &record,
+        changed.into_iter().collect(),
+        expected_commit,
+        expected_vars_digest,
+    ))
+}
+
+/// Drift check when the target IS a single renamed FILE, not a directory of recorded files.
+fn check_file_artifact_state(
+    file_path: &Path,
+    expected_source: &str,
+    expected_commit: &str,
+    registry: &dyn Registry,
+    key: &ArtifactKey,
+    expected_vars_digest: Option<&str>,
+) -> Result<ArtifactState> {
+    let record = match artifact_record(registry, key, expected_source)? {
+        Ok(record) => record,
+        Err(state) => return Ok(state),
+    };
+
+    let meta = std::fs::symlink_metadata(file_path)
+        .map_err(|e| Error::Projection(format!("stat {}: {e}", file_path.display())))?;
+    let modified = match record.files.first() {
+        Some(mf) => {
+            !meta.is_file() || meta.len() != mf.size || mtime_secs(&meta, file_path)? != mf.mtime
+        }
+        None => true,
+    };
+    let changed = if modified {
+        vec![file_path.to_path_buf()]
     } else {
-        Ok(ArtifactState::Clean)
+        vec![]
+    };
+
+    Ok(classify_drift(
+        &record,
+        changed,
+        expected_commit,
+        expected_vars_digest,
+    ))
+}
+
+/// `Err(state)` is not a failure: it carries the early Linked/Foreign `ArtifactState` to return.
+fn artifact_record(
+    registry: &dyn Registry,
+    key: &ArtifactKey,
+    expected_source: &str,
+) -> Result<std::result::Result<RegistryRecord, ArtifactState>> {
+    let Some(record) = registry.get(key)? else {
+        return Ok(Err(ArtifactState::Foreign));
+    };
+    if record.linked {
+        return Ok(Err(ArtifactState::Linked));
+    }
+    if record.key.source != expected_source {
+        return Ok(Err(ArtifactState::Foreign));
+    }
+    Ok(Ok(record))
+}
+
+fn classify_drift(
+    record: &RegistryRecord,
+    changed: Vec<PathBuf>,
+    expected_commit: &str,
+    expected_vars_digest: Option<&str>,
+) -> ArtifactState {
+    if !changed.is_empty() {
+        return ArtifactState::Modified { changed };
+    }
+    let commit_advanced = record.commit != expected_commit;
+    let vars_changed =
+        record.vars_digest.is_some() && record.vars_digest.as_deref() != expected_vars_digest;
+    if commit_advanced || vars_changed {
+        ArtifactState::Outdated
+    } else {
+        ArtifactState::Clean
     }
 }
 
@@ -543,7 +614,11 @@ fn swap_into(staging: &Path, dst: &Path, allow_symlinks: bool) -> Result<()> {
                 "phora: staging on a different mount than {}; falling back to recursive copy",
                 dst.display()
             );
-            copy_tree(staging, dst, allow_symlinks)
+            if staging.is_file() {
+                copy_file(staging, dst)
+            } else {
+                copy_tree(staging, dst, allow_symlinks)
+            }
         }
         Err(e) => Err(Error::Projection(format!(
             "rename {} -> {}: {e}",

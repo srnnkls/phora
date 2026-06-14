@@ -1660,8 +1660,7 @@ fn second_deploy_over_correct_link_is_a_noop() {
         vars: &BTreeMap::new(),
     };
     let selection = Selection::new(source.includes(), source.excludes()).expect("selection");
-    let entry_source = sn("editor-src");
-    let entry_artifact = an("editor");
+    let (entry_source, entry_artifact) = (sn("editor-src"), an("editor"));
     let entry = ArtifactEntry {
         source: &source,
         git: remotes
@@ -1679,8 +1678,8 @@ fn second_deploy_over_correct_link_is_a_noop() {
         ejected: &[],
         mode_transition: false,
         template_opt_in: &crate::config::TemplateOptIn::SuffixOnly,
+        mapped_source_key: None,
     };
-
     let state = check_artifact_state(
         &dst,
         "editor-src",
@@ -8696,5 +8695,684 @@ fn sync_redeploys_when_vars_change_without_new_commit() {
         "a [vars] change at the SAME commit must trigger a redeploy: motd must re-render to \
          `hello galaxy!`, not stay pinned at the prior `hello world!` because the commit/source \
          digest is unchanged"
+    );
+}
+
+// ── mapped (leaf-aliasing) COPY-deploy: a `map` binding deploys each leaf as an
+//    individually-renamed file at the target ROOT (no layout), one record per dest
+//    keyed by the dest, with the `map` layout sentinel (T5) ──
+
+/// A repo whose source carries top-level leaf files (`AGENTS.md`, `tools/AGENTS.md`),
+/// committed on `main`, so a mapped binding has real bytes to stage and rename.
+#[expect(
+    clippy::unwrap_used,
+    reason = "fixture setup fails loudly; git CLI is assumed present"
+)]
+fn build_map_sync_fixture() -> SyncFixture {
+    let src = TempDir::new().unwrap();
+    let src_path = src.path();
+
+    run_git(src_path, &["init", "-b", "main", "."]);
+    run_git(src_path, &["config", "user.email", "test@example.com"]);
+    run_git(src_path, &["config", "user.name", "Test"]);
+
+    std::fs::write(src_path.join("AGENTS.md"), b"# agents\n").unwrap();
+    std::fs::create_dir_all(src_path.join("tools")).unwrap();
+    std::fs::write(src_path.join("tools/AGENTS.md"), b"# nested agents\n").unwrap();
+    run_git(src_path, &["add", "-A"]);
+    run_git(src_path, &["commit", "-m", "initial"]);
+
+    let head_sha = rev_parse(src_path, "HEAD");
+
+    let git_dir = TempDir::new().unwrap();
+    let state_dir = TempDir::new().unwrap();
+    let backend = GitBackend::new(git_dir.path().to_path_buf());
+    let registry =
+        FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry over tempdir");
+    let url = src_path.to_string_lossy().into_owned();
+
+    SyncFixture {
+        src,
+        _git_dir: git_dir,
+        _state_dir: state_dir,
+        backend,
+        registry,
+        url,
+        head_sha,
+    }
+}
+
+/// One source + one target whose single binding maps `AGENTS.md → CLAUDE.md`.
+/// `layout` lets a test prove the mapped dest ignores it.
+fn config_one_mapped_binding(url: &str, target_path: &Path, layout: &str) -> Config {
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.agents-src]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\n\
+         {{ source = \"agents-src\", map = {{ \"AGENTS.md\" = \"CLAUDE.md\" }} }},\n\
+         ]\nlayout = \"{layout}\"\n",
+        target_path.display(),
+    );
+    Config::parse(&toml).expect("one-mapped-binding config parses")
+}
+
+#[test]
+fn sync_deploys_mapped_leaf_to_renamed_dest() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_mapped_binding(&fx.url, &td.target_path(), "flat");
+    let in_ = input(&cfg, None, None, None, false);
+
+    let out = sync(&in_, &fx.backend, &fx.registry).expect("sync deploys the mapped leaf");
+
+    let dst = td.target_path().join("CLAUDE.md");
+    assert!(
+        dst.is_file(),
+        "a mapped binding must deploy AGENTS.md as the renamed FILE <target>/CLAUDE.md, \
+         missing at {}",
+        dst.display()
+    );
+    assert_eq!(
+        std::fs::read(&dst).expect("deployed CLAUDE.md present"),
+        b"# agents\n",
+        "the mapped dest must carry the source bytes of AGENTS.md"
+    );
+    assert!(
+        !out.had_failures,
+        "a clean single mapped-leaf deploy must report no failures"
+    );
+}
+
+#[test]
+fn sync_records_mapped_leaf_with_map_layout_keyed_by_dest() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_mapped_binding(&fx.url, &td.target_path(), "flat");
+    let in_ = input(&cfg, None, None, None, false);
+
+    sync(&in_, &fx.backend, &fx.registry).expect("sync deploys the mapped leaf");
+
+    let rec = fx
+        .registry
+        .get(&artifact_key("dest", "agents-src", "CLAUDE.md"))
+        .expect("registry get must not error")
+        .expect("deploy must persist a record keyed by the DEST (dest,agents-src,CLAUDE.md)");
+    assert_eq!(
+        rec.key.artifact, "CLAUDE.md",
+        "the record key's artifact must be the DEST, not the source key AGENTS.md"
+    );
+    assert_eq!(
+        rec.layout, "map",
+        "a mapped record must carry the `map` layout sentinel, not a layout kind"
+    );
+    assert_eq!(
+        rec.files.len(),
+        1,
+        "a mapped leaf deploys exactly one file, got {:?}",
+        rec.files
+    );
+    assert_eq!(
+        rec.files[0].path,
+        *Path::new("CLAUDE.md"),
+        "the manifest's single file must be the renamed dest CLAUDE.md, got {:?}",
+        rec.files[0].path
+    );
+}
+
+#[test]
+fn sync_mapped_leaf_ignores_by_source_layout() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_mapped_binding(&fx.url, &td.target_path(), "by-source");
+    let in_ = input(&cfg, None, None, None, false);
+
+    sync(&in_, &fx.backend, &fx.registry).expect("sync deploys the mapped leaf under by-source");
+
+    let dst = td.target_path().join("CLAUDE.md");
+    assert!(
+        dst.is_file(),
+        "a mapped dest must land at <target>/CLAUDE.md even under by-source, missing at {}",
+        dst.display()
+    );
+    let leaked = td.target_path().join("agents-src").join("CLAUDE.md");
+    assert!(
+        !leaked.exists(),
+        "by-source layout must NOT leak onto a mapped dest; \
+         <target>/agents-src/CLAUDE.md is the bug, found at {}",
+        leaked.display()
+    );
+
+    let rec = fx
+        .registry
+        .get(&artifact_key("dest", "agents-src", "CLAUDE.md"))
+        .expect("registry get must not error")
+        .expect("deploy must persist a mapped record under by-source too");
+    assert_eq!(
+        rec.layout, "map",
+        "the record must carry the `map` sentinel under by-source, not `bysource`"
+    );
+}
+
+#[test]
+fn sync_detects_drift_on_mapped_dest() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_mapped_binding(&fx.url, &td.target_path(), "flat");
+
+    let first = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("first sync deploys and records the mapped leaf");
+    assert!(!first.had_failures, "first mapped deploy must succeed");
+
+    let dst = td.target_path().join("CLAUDE.md");
+    assert!(
+        fx.registry
+            .get(&artifact_key("dest", "agents-src", "CLAUDE.md"))
+            .expect("registry get must not error")
+            .is_some(),
+        "premise: the first sync must record the mapped dest so it is MANAGED"
+    );
+
+    let edited = b"# locally edited, do not clobber\n";
+    std::fs::write(&dst, edited).expect("edit deployed mapped dest");
+
+    let out = sync(
+        &input(&cfg, None, Some(first.base_lock.clone()), None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("sync must not error on a Modified mapped dest without --force");
+
+    assert!(
+        !out.had_failures,
+        "skipping a Modified mapped dest is not a failure"
+    );
+    assert_eq!(
+        std::fs::read(&dst).expect("edited mapped dest still present"),
+        edited,
+        "without --force a Modified mapped dest must be skipped, preserving the local edit"
+    );
+
+    let forced = sync(
+        &input(&cfg, None, Some(first.base_lock.clone()), None, true),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("forced sync redeploys over the Modified mapped dest");
+    assert!(!forced.had_failures, "forced mapped redeploy must succeed");
+    assert_eq!(
+        std::fs::read(&dst).expect("forced mapped dest present"),
+        b"# agents\n",
+        "--force must overwrite the Modified mapped dest with AGENTS.md's source bytes"
+    );
+}
+
+#[test]
+fn sync_detects_foreign_file_at_mapped_dest() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_mapped_binding(&fx.url, &td.target_path(), "flat");
+
+    let dst = td.target_path().join("CLAUDE.md");
+    std::fs::create_dir_all(td.target_path()).expect("mkdir target");
+    std::fs::write(&dst, b"hand-written, not phora-managed\n")
+        .expect("preplace foreign mapped dest");
+
+    let out = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("sync must not error on a Foreign mapped dest without --force");
+
+    assert!(
+        !out.had_failures,
+        "skipping a Foreign mapped dest is not a failure"
+    );
+    assert_eq!(
+        std::fs::read(&dst).expect("foreign mapped dest still present"),
+        b"hand-written, not phora-managed\n",
+        "without --force a Foreign file at the mapped dest must be left untouched"
+    );
+
+    let forced = sync(
+        &input(&cfg, None, None, None, true),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("forced sync deploys over the Foreign mapped dest");
+    assert!(!forced.had_failures, "forced mapped deploy must succeed");
+    assert_eq!(
+        std::fs::read(&dst).expect("forced mapped dest present"),
+        b"# agents\n",
+        "--force must overwrite the Foreign mapped dest with AGENTS.md's bytes, proving \
+         Foreign detection runs over the dest path"
+    );
+}
+
+#[test]
+fn sync_fans_out_one_leaf_to_two_mapped_dests() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.agents-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\n\
+         {{ source = \"agents-src\", as = \"claude\", map = {{ \"AGENTS.md\" = \"CLAUDE.md\" }} }},\n\
+         {{ source = \"agents-src\", as = \"codex\", map = {{ \"AGENTS.md\" = \"codex.md\" }} }},\n\
+         ]\n",
+        fx.url,
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("two-binding fan-out config parses");
+    let in_ = input(&cfg, None, None, None, false);
+
+    let out = sync(&in_, &fx.backend, &fx.registry).expect("sync fans the leaf out to two dests");
+    assert!(!out.had_failures, "fan-out deploy must succeed");
+
+    let claude = td.target_path().join("CLAUDE.md");
+    let codex = td.target_path().join("codex.md");
+    assert_eq!(
+        std::fs::read(&claude).expect("CLAUDE.md deployed"),
+        b"# agents\n",
+        "the first binding must deploy AGENTS.md as CLAUDE.md"
+    );
+    assert_eq!(
+        std::fs::read(&codex).expect("codex.md deployed"),
+        b"# agents\n",
+        "the second binding must deploy the SAME AGENTS.md as codex.md"
+    );
+
+    let claude_rec = fx
+        .registry
+        .get(&artifact_key("dest", "claude", "CLAUDE.md"))
+        .expect("registry get must not error")
+        .expect("a record must exist for the claude binding's CLAUDE.md dest");
+    assert_eq!(
+        claude_rec.layout, "map",
+        "the claude binding's record must carry the `map` layout sentinel"
+    );
+    assert_eq!(
+        claude_rec.files[0].path,
+        *Path::new("CLAUDE.md"),
+        "the claude binding's manifest file must be the renamed dest CLAUDE.md, got {:?}",
+        claude_rec.files[0].path
+    );
+
+    let codex_rec = fx
+        .registry
+        .get(&artifact_key("dest", "codex", "codex.md"))
+        .expect("registry get must not error")
+        .expect("a distinct record must exist for the codex binding's codex.md dest");
+    assert_eq!(
+        codex_rec.layout, "map",
+        "the codex binding's record must carry the `map` layout sentinel"
+    );
+    assert_eq!(
+        codex_rec.files[0].path,
+        *Path::new("codex.md"),
+        "the codex binding's manifest file must be the renamed dest codex.md, got {:?}",
+        codex_rec.files[0].path
+    );
+}
+
+#[test]
+fn preview_shows_mapped_leaf_at_explicit_destination() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_mapped_binding(&fx.url, &td.target_path(), "flat");
+    fx.backend
+        .fetch(&sn("agents-src"), &fx.url)
+        .expect("seed agents-src mirror so offline discovery succeeds");
+    let lock = lock_with(&cfg, "agents-src", &fx.url, &fx.head_sha);
+
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+
+    let plans = preview_targets(&cfg, &parsed, &remotes, &fx.backend, Some(&lock), false)
+        .expect("preview builds over the seeded mirror");
+
+    let plan = only_plan(&plans, "dest");
+    let entry = preview_entry(plan, "CLAUDE.md");
+    assert_eq!(
+        entry.state,
+        SyncState::Synced,
+        "a locked, fetched mapped leaf must preview as Synced"
+    );
+    assert_eq!(
+        entry.artifact, "CLAUDE.md",
+        "a mapped entry's artifact must be the DEST, not the source key AGENTS.md"
+    );
+    assert_eq!(
+        entry.destination,
+        td.target_path().join("CLAUDE.md"),
+        "the mapped dest must preview at <target>/CLAUDE.md (path.join(dest), no layout helper)"
+    );
+}
+
+#[test]
+fn preview_marks_locked_but_unfetched_mapped_binding_needs_sync() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_mapped_binding(&fx.url, &td.target_path(), "flat");
+    // Lock pins a commit, but the mirror is EMPTY (never fetched).
+    let lock = lock_with(&cfg, "agents-src", &fx.url, &fx.head_sha);
+
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+
+    let plans = preview_targets(&cfg, &parsed, &remotes, &fx.backend, Some(&lock), false)
+        .expect("a locked-but-unfetched mapped binding must annotate, not abort");
+
+    let plan = only_plan(&plans, "dest");
+    assert_eq!(
+        plan.entries.len(),
+        1,
+        "a locked-but-unfetched mapped binding yields one annotation, not Synced map entries, got {:?}",
+        plan.entries
+    );
+    assert_eq!(
+        plan.entries[0].state,
+        SyncState::NeedsSync,
+        "a mapped binding locked but with an absent mirror must be NeedsSync, not Synced"
+    );
+}
+
+#[test]
+fn preview_mapped_destination_ignores_by_source_layout() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_mapped_binding(&fx.url, &td.target_path(), "by-source");
+    fx.backend
+        .fetch(&sn("agents-src"), &fx.url)
+        .expect("seed agents-src mirror");
+    let lock = lock_with(&cfg, "agents-src", &fx.url, &fx.head_sha);
+
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+
+    let plans = preview_targets(&cfg, &parsed, &remotes, &fx.backend, Some(&lock), false)
+        .expect("preview builds under by-source layout");
+
+    let plan = only_plan(&plans, "dest");
+    let entry = preview_entry(plan, "CLAUDE.md");
+    assert_eq!(
+        entry.destination,
+        td.target_path().join("CLAUDE.md"),
+        "a mapped dest must preview at <target>/CLAUDE.md even under by-source layout"
+    );
+    let leaked = td.target_path().join("agents-src").join("CLAUDE.md");
+    assert_ne!(
+        entry.destination, leaked,
+        "by-source layout must NOT leak onto a mapped dest in preview"
+    );
+}
+
+#[test]
+fn preview_files_lists_mapped_leaf_dest() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_mapped_binding(&fx.url, &td.target_path(), "flat");
+    fx.backend
+        .fetch(&sn("agents-src"), &fx.url)
+        .expect("seed agents-src mirror");
+    let lock = lock_with(&cfg, "agents-src", &fx.url, &fx.head_sha);
+
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+
+    let plans = preview_targets(&cfg, &parsed, &remotes, &fx.backend, Some(&lock), true)
+        .expect("preview with files builds");
+
+    let plan = only_plan(&plans, "dest");
+    let entry = preview_entry(plan, "CLAUDE.md");
+    let names: Vec<_> = entry.files.iter().map(|f| f.path.clone()).collect();
+    assert_eq!(
+        names,
+        vec![PathBuf::from("CLAUDE.md")],
+        "preview --files for a mapped leaf must list the single renamed dest CLAUDE.md, \
+         not a dir walk nor the source name AGENTS.md, got {names:?}"
+    );
+}
+
+#[test]
+fn preview_fans_out_one_leaf_to_two_mapped_dests() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.agents-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\n\
+         {{ source = \"agents-src\", as = \"claude\", map = {{ \"AGENTS.md\" = \"CLAUDE.md\" }} }},\n\
+         {{ source = \"agents-src\", as = \"codex\", map = {{ \"AGENTS.md\" = \"codex.md\" }} }},\n\
+         ]\n",
+        fx.url,
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("two-binding fan-out config parses");
+    fx.backend
+        .fetch(&sn("agents-src"), &fx.url)
+        .expect("seed agents-src mirror");
+    let lock = lock_with(&cfg, "agents-src", &fx.url, &fx.head_sha);
+
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+
+    let plans = preview_targets(&cfg, &parsed, &remotes, &fx.backend, Some(&lock), false)
+        .expect("preview fans the leaf out to two dests");
+
+    let plan = only_plan(&plans, "dest");
+    assert_eq!(
+        plan.entries.len(),
+        2,
+        "one leaf fanned to two mapped dests must yield exactly 2 entries (no drop/dup/spurious), got {:?}",
+        plan.entries
+    );
+    let claude = preview_entry(plan, "CLAUDE.md");
+    assert_eq!(
+        claude.destination,
+        td.target_path().join("CLAUDE.md"),
+        "the claude binding must preview AGENTS.md at <target>/CLAUDE.md"
+    );
+    let codex = preview_entry(plan, "codex.md");
+    assert_eq!(
+        codex.destination,
+        td.target_path().join("codex.md"),
+        "the codex binding must preview the SAME AGENTS.md at <target>/codex.md"
+    );
+    assert_eq!(
+        claude.source, "agents-src",
+        "the claude binding must derive from the underlying source agents-src"
+    );
+    assert_eq!(
+        codex.source, "agents-src",
+        "the codex binding must derive from the SAME underlying source agents-src, proving one-leaf fan-out"
+    );
+    assert_eq!(
+        claude.source, codex.source,
+        "both fanned-out entries must share one underlying source leaf"
+    );
+}
+
+// ── T4: cross-binding / target-level same-DEST collisions (AD-9) ──
+
+/// Two mapped bindings under one source, distinct `as`, both mapping (different keys)
+/// to the SAME dest `SHARED.md`. `layout` lets a test prove layout-independence.
+fn config_two_mapped_bindings_same_dest(url: &str, target_path: &Path, layout: &str) -> Config {
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.agents-src]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\n\
+         {{ source = \"agents-src\", as = \"claude\", map = {{ \"AGENTS.md\" = \"SHARED.md\" }} }},\n\
+         {{ source = \"agents-src\", as = \"claude2\", map = {{ \"tools/AGENTS.md\" = \"SHARED.md\" }} }},\n\
+         ]\nlayout = \"{layout}\"\n",
+        target_path.display(),
+    );
+    Config::parse(&toml).expect("two-mapped-bindings-same-dest config parses")
+}
+
+#[test]
+fn sync_errors_on_cross_binding_mapped_dest_collision() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_two_mapped_bindings_same_dest(&fx.url, &td.target_path(), "flat");
+    let in_ = input(&cfg, None, None, None, false);
+
+    let Err(err) = sync(&in_, &fx.backend, &fx.registry) else {
+        panic!(
+            "two mapped bindings resolving to the SAME dest SHARED.md in one flat target \
+             must collide (return Err), not deploy both / last-wins"
+        );
+    };
+
+    let Error::Collision {
+        artifact,
+        sources,
+        target,
+    } = err
+    else {
+        panic!("a cross-binding mapped-dest clash must be Error::Collision, got {err:?}");
+    };
+    assert_eq!(
+        artifact, "SHARED.md",
+        "the collision must name the shared DEST (SHARED.md), not a source key"
+    );
+    assert_eq!(target, "dest", "the collision must name the target");
+    assert!(
+        sources.contains(&"claude".to_string()) && sources.contains(&"claude2".to_string()),
+        "the collision must name BOTH offending binding identities, got {sources:?}"
+    );
+}
+
+#[test]
+fn sync_errors_on_mapped_dest_collision_under_by_source() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    // by-source layout: mapped dests bypass layout and collide at the target ROOT,
+    // so the check must NOT be Flat-gated.
+    let cfg = config_two_mapped_bindings_same_dest(&fx.url, &td.target_path(), "by-source");
+    let in_ = input(&cfg, None, None, None, false);
+
+    let Err(err) = sync(&in_, &fx.backend, &fx.registry) else {
+        panic!(
+            "two mapped bindings to the SAME dest must STILL collide under by-source \
+             (mapped dests bypass layout, colliding at root); the check is layout-independent"
+        );
+    };
+
+    let Error::Collision {
+        artifact,
+        sources,
+        target,
+    } = err
+    else {
+        panic!("a mapped-dest clash under by-source must be Error::Collision, got {err:?}");
+    };
+    assert_eq!(
+        artifact, "SHARED.md",
+        "the collision must name the shared DEST even under by-source"
+    );
+    assert_eq!(target, "dest", "the collision must name the target");
+    assert!(
+        sources.contains(&"claude".to_string()) && sources.contains(&"claude2".to_string()),
+        "the collision must name BOTH offending binding identities, got {sources:?}"
+    );
+}
+
+#[test]
+fn sync_errors_on_mapped_vs_dir_artifact_collision() {
+    // dir-artifact source exposes `editor` (dir) at the target root under flat.
+    let (dir_src, dir_url) = build_named_artifact_repo("editor", "config.toml", b"[editor]\n");
+    // mapped source maps AGENTS.md → `editor`, same on-disk path target/editor.
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.dir-src]\ngit = \"{dir_url}\"\nbranch = \"main\"\n\n\
+         [sources.agents-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\n\
+         \"dir-src\",\n\
+         {{ source = \"agents-src\", as = \"claude\", map = {{ \"AGENTS.md\" = \"editor\" }} }},\n\
+         ]\nlayout = \"flat\"\n",
+        fx.url,
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("mapped-vs-dir collision config parses");
+    let in_ = input(&cfg, None, None, None, false);
+
+    let Err(err) = sync(&in_, &fx.backend, &fx.registry) else {
+        panic!(
+            "a mapped dest `editor` and a dir-artifact `editor` at the same target/editor \
+             path must collide (return Err)"
+        );
+    };
+
+    let Error::Collision {
+        artifact,
+        sources,
+        target,
+    } = err
+    else {
+        panic!("a mapped-vs-dir clash must be Error::Collision, got {err:?}");
+    };
+    assert_eq!(
+        artifact, "editor",
+        "the collision must name the shared on-disk path `editor`"
+    );
+    assert_eq!(target, "dest", "the collision must name the target");
+    assert!(
+        sources.contains(&"dir-src".to_owned()) && sources.contains(&"claude".to_owned()),
+        "the collision must name BOTH offending binding identities \
+         (the dir-artifact binding `dir-src` and the mapped binding `claude`), got {sources:?}"
+    );
+
+    drop(dir_src);
+}
+
+#[test]
+fn preview_reports_cross_binding_mapped_dest_collision() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    // by-source proves layout-independence: detect_dest_collisions detects across all layouts.
+    let cfg = config_two_mapped_bindings_same_dest(&fx.url, &td.target_path(), "by-source");
+    fx.backend
+        .fetch(&sn("agents-src"), &fx.url)
+        .expect("seed agents-src mirror so offline preview discovers");
+    let lock = lock_with(&cfg, "agents-src", &fx.url, &fx.head_sha);
+
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+
+    let plans = match preview_targets(&cfg, &parsed, &remotes, &fx.backend, Some(&lock), false) {
+        Ok(plans) => plans,
+        Err(Error::Collision { .. }) => {
+            panic!(
+                "a predicted mapped-dest collision must be a preview warning, NOT Error::Collision"
+            )
+        }
+        Err(e) => panic!("preview must not error on a predicted mapped collision, got {e:?}"),
+    };
+
+    let plan = only_plan(&plans, "dest");
+    let collision = plan
+        .collisions
+        .iter()
+        .find(|c| c.artifact == "SHARED.md")
+        .unwrap_or_else(|| {
+            panic!(
+                "preview must annotate the cross-binding collision on the shared dest SHARED.md \
+                 even under by-source, got collisions {:?}",
+                plan.collisions
+            )
+        });
+    assert!(
+        collision.sources.contains(&"claude".to_owned())
+            && collision.sources.contains(&"claude2".to_owned()),
+        "the collision warning must name BOTH offending identities, got {:?}",
+        collision.sources
     );
 }
