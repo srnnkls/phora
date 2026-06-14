@@ -154,6 +154,28 @@ pub(super) struct ArtifactEntry<'a> {
     pub(super) mapped_source_key: Option<&'a str>,
 }
 
+/// A `map`-layout dest is a single component at the target root; layout helpers must not be applied.
+pub(super) fn record_artifact_path(target: &Target, record: &RegistryRecord) -> PathBuf {
+    if record.layout == MAP_LAYOUT {
+        target.expanded_path().join(&record.key.artifact)
+    } else {
+        target.expanded_path().join(
+            target
+                .layout()
+                .artifact_path(&record.key.source, &record.key.artifact),
+        )
+    }
+}
+
+/// A `map` record's single manifest file IS the dest, so its base is the target root.
+pub(super) fn record_manifest_base(target: &Target, record: &RegistryRecord) -> PathBuf {
+    if record.layout == MAP_LAYOUT {
+        target.expanded_path()
+    } else {
+        record_artifact_path(target, record)
+    }
+}
+
 /// Mapped leaves land as a renamed FILE at the target root, ignoring layout.
 fn artifact_dst_for(
     target_path: &Path,
@@ -467,7 +489,11 @@ fn deploy_link(
         commit: "link".to_owned(),
         digest: "link:".to_owned(),
         projected_at: chrono::Utc::now().to_rfc3339(),
-        layout: format!("{:?}", entry.layout_kind).to_lowercase(),
+        layout: if entry.mapped_source_key.is_some() {
+            MAP_LAYOUT.to_owned()
+        } else {
+            format!("{:?}", entry.layout_kind).to_lowercase()
+        },
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
         files: vec![],
@@ -485,7 +511,8 @@ fn deploy_link(
     )
 }
 
-/// Absolute working-tree path the symlink points at: `<remote>/<root>/<artifact>`.
+/// Absolute working-tree path the symlink points at: `<remote>/<root>/<leaf>`, where
+/// `<leaf>` is the mapped source key for a mapped binding, else the artifact name.
 fn link_target(entry: &ArtifactEntry<'_>) -> PathBuf {
     let base = Path::new(entry.git);
     let mut target = if base.is_absolute() {
@@ -498,6 +525,10 @@ fn link_target(entry: &ArtifactEntry<'_>) -> PathBuf {
     if let Some(root) = entry.root {
         target.push(root);
     }
-    target.push(entry.artifact_name.as_str());
+    target.push(
+        entry
+            .mapped_source_key
+            .unwrap_or_else(|| entry.artifact_name.as_str()),
+    );
     target
 }

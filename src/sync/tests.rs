@@ -9019,6 +9019,201 @@ fn sync_fans_out_one_leaf_to_two_mapped_dests() {
     );
 }
 
+/// Deploy a single mapped binding, then return everything a rebuild test needs.
+fn mapped_rebuild_setup(layout: &str) -> (SyncFixture, TargetDir, Config, Lock) {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_mapped_binding(&fx.url, &td.target_path(), layout);
+    let out = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("seeding sync deploys and records the mapped leaf");
+    assert!(
+        !out.had_failures,
+        "premise: the seeding mapped sync must succeed"
+    );
+    (fx, td, cfg, out.base_lock)
+}
+
+#[test]
+fn rebuild_reconstructs_mapped_copy_record() {
+    let (fx, td, cfg, lock) = mapped_rebuild_setup("flat");
+    let key = artifact_key("dest", "agents-src", "CLAUDE.md");
+
+    let original = fx
+        .registry
+        .get(&key)
+        .expect("registry get must not error")
+        .expect("premise: sync must have recorded the mapped dest");
+    let dst = td.target_path().join("CLAUDE.md");
+    assert!(
+        dst.is_file(),
+        "premise: the mapped dest must remain on disk after the record is dropped"
+    );
+
+    fx.registry.remove(&key).expect("drop the mapped record");
+    assert!(
+        fx.registry.get(&key).expect("get after remove").is_none(),
+        "premise: the mapped record must be gone before rebuild"
+    );
+
+    let report = rebuild_registry(&cfg, &lock, &fx.backend, &fx.registry)
+        .expect("rebuild must reconstruct a mapped record without choking on layout==map");
+
+    let rebuilt = fx
+        .registry
+        .get(&key)
+        .expect("registry get must not error")
+        .expect("rebuild must reconstruct the dropped mapped record from binding.map");
+    assert_eq!(
+        rebuilt.layout,
+        crate::store::MAP_LAYOUT,
+        "a reconstructed mapped record must carry the `map` sentinel"
+    );
+    assert_eq!(
+        rebuilt.key.artifact, "CLAUDE.md",
+        "the reconstructed record must be keyed by the DEST"
+    );
+    assert_eq!(
+        rebuilt.files.len(),
+        1,
+        "a mapped leaf manifest holds exactly one file, got {:?}",
+        rebuilt.files
+    );
+    assert_eq!(
+        rebuilt.files[0].path,
+        *Path::new("CLAUDE.md"),
+        "the reconstructed manifest's single file must be the dest CLAUDE.md"
+    );
+    assert_eq!(
+        rebuilt.commit, original.commit,
+        "reconstructed mapped record must carry the same locked commit"
+    );
+    assert_eq!(
+        rebuilt.digest, original.digest,
+        "reconstructed mapped digest must equal the originally-synced digest"
+    );
+    assert_eq!(
+        rebuilt.files[0].blake3, original.files[0].blake3,
+        "reconstructed mapped file hash must match the original"
+    );
+    assert!(
+        report.reconstructed.contains(&key),
+        "the report must list the reconstructed mapped dest, got {:?}",
+        report.reconstructed
+    );
+    assert!(
+        report.modified.is_empty(),
+        "an unmodified mapped deploy must not be reported [modified], got {:?}",
+        report.modified
+    );
+}
+
+#[test]
+fn rebuild_mapped_record_path_ignores_by_source_layout() {
+    let (fx, td, cfg, lock) = mapped_rebuild_setup("by-source");
+    let key = artifact_key("dest", "agents-src", "CLAUDE.md");
+    fx.registry.remove(&key).expect("drop the mapped record");
+
+    rebuild_registry(&cfg, &lock, &fx.backend, &fx.registry)
+        .expect("rebuild reconstructs a mapped record under by-source");
+
+    let rebuilt = fx
+        .registry
+        .get(&key)
+        .expect("registry get must not error")
+        .expect("rebuild must reconstruct the mapped record under by-source");
+
+    let on_disk = super::target::record_artifact_path(&cfg.targets["dest"], &rebuilt);
+    assert_eq!(
+        on_disk,
+        td.target_path().join("CLAUDE.md"),
+        "a reconstructed mapped record's path must be <target>/CLAUDE.md (root base), \
+         not the by-source layout-derived path"
+    );
+    let leaked = td.target_path().join("agents-src").join("CLAUDE.md");
+    assert_ne!(
+        on_disk, leaked,
+        "by-source layout must not be applied to a reconstructed mapped record"
+    );
+}
+
+/// A mapped binding (base) plus a local overlay flipping its source to link mode.
+fn config_one_mapped_link_binding(url: &str, target_path: &Path) -> (Config, Config) {
+    let base = format!(
+        "version = 1\n\n\
+         [sources.agents-src]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\n\
+         {{ source = \"agents-src\", map = {{ \"AGENTS.md\" = \"CLAUDE.md\" }} }},\n\
+         ]\n",
+        target_path.display(),
+    );
+    let local = format!(
+        "version = 1\n\n[sources.agents-src]\ngit = \"{url}\"\nbranch = \"main\"\ndeploy = \"link\"\n"
+    );
+    (
+        Config::parse(&base).expect("mapped-link base parses"),
+        Config::parse(&local).expect("link overlay parses"),
+    )
+}
+
+#[test]
+fn rebuild_reconstructs_mapped_link_record() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let (base, local) = config_one_mapped_link_binding(&fx.url, &td.target_path());
+    let out = sync(
+        &input(&base, Some(&local), None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("seeding sync links the mapped leaf");
+    assert!(
+        !out.had_failures,
+        "premise: the mapped-link seeding sync must succeed"
+    );
+
+    let key = artifact_key("dest", "agents-src", "CLAUDE.md");
+    fx.registry
+        .remove(&key)
+        .expect("drop the mapped-link record");
+
+    let effective = merge_configs(base, Some(local));
+    let lock = link_lock("agents-src", Path::new(&fx.url));
+    rebuild_registry(&effective, &lock, &fx.backend, &fx.registry)
+        .expect("rebuild reconstructs a mapped-link record");
+
+    let rebuilt = fx
+        .registry
+        .get(&key)
+        .expect("registry get must not error")
+        .expect("rebuild must reconstruct the mapped-link record");
+    assert!(
+        rebuilt.linked,
+        "a reconstructed mapped-link record must be linked"
+    );
+    assert_eq!(
+        rebuilt.layout,
+        crate::store::MAP_LAYOUT,
+        "a mapped-link record must still carry the `map` sentinel"
+    );
+    assert_eq!(
+        rebuilt.key.artifact, "CLAUDE.md",
+        "the mapped-link record must be keyed by the DEST"
+    );
+    assert!(
+        rebuilt.files.is_empty(),
+        "a linked record carries no manifest files, got {:?}",
+        rebuilt.files
+    );
+    assert_eq!(
+        rebuilt.commit, "link",
+        "a reconstructed link record uses the link commit sentinel"
+    );
+}
+
 #[test]
 fn preview_shows_mapped_leaf_at_explicit_destination() {
     let fx = build_map_sync_fixture();
@@ -9194,6 +9389,214 @@ fn preview_fans_out_one_leaf_to_two_mapped_dests() {
     assert_eq!(
         claude.source, codex.source,
         "both fanned-out entries must share one underlying source leaf"
+    );
+}
+
+// ── T6: mapped (leaf-aliasing) LINK-deploy: a `map` binding under deploy = "link"
+//    projects each dest as a SYMLINK to the source-leaf working-tree path, recorded
+//    with the `map` sentinel, `linked: true`, empty files (AD-6, DLD-005) ──
+
+/// `deploy = "link"` is only honored from a local overlay, so a mapped-link config
+/// is split: a base source (no deploy) plus a local overlay carrying `deploy = "link"`
+/// and the mapping `AGENTS.md → CLAUDE.md`. The link-mode source proves AD-6 — a mapped
+/// link deploys regardless of the source's symlink export policy.
+fn mapped_link_base_and_overlay(url: &str, target_path: &Path, layout: &str) -> (Config, Config) {
+    let base = Config::parse(&format!(
+        "version = 1\n\n[sources.agents-src]\ngit = \"{url}\"\nbranch = \"main\"\n",
+    ))
+    .expect("mapped-link base parses");
+    let local = Config::parse(&format!(
+        "version = 1\n\n\
+         [sources.agents-src]\ngit = \"{url}\"\nbranch = \"main\"\ndeploy = \"link\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\n\
+         {{ source = \"agents-src\", map = {{ \"AGENTS.md\" = \"CLAUDE.md\" }} }},\n\
+         ]\nlayout = \"{layout}\"\n",
+        target_path.display(),
+    ))
+    .expect("mapped-link overlay parses");
+    (base, local)
+}
+
+#[test]
+fn sync_deploys_mapped_leaf_as_symlink_to_source_working_tree() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let (base, local) = mapped_link_base_and_overlay(&fx.url, &td.target_path(), "flat");
+    let in_ = input(&base, Some(&local), None, None, false);
+
+    let out = sync(&in_, &fx.backend, &fx.registry).expect("sync deploys the mapped link");
+    assert!(
+        !out.had_failures,
+        "a clean mapped-link deploy must report no failures"
+    );
+
+    let dst = td.target_path().join("CLAUDE.md");
+    let resolved =
+        std::fs::read_link(&dst).expect("a mapped link must deploy CLAUDE.md as a symlink");
+    assert_eq!(
+        resolved,
+        Path::new(&fx.url).join("AGENTS.md"),
+        "the mapped link must target the SOURCE-LEAF working-tree path <git>/AGENTS.md, \
+         not the dest name CLAUDE.md (which would dangle)"
+    );
+    assert_eq!(
+        std::fs::read(&dst).expect("the symlink must resolve to the source leaf's bytes"),
+        b"# agents\n",
+        "the symlink must point at AGENTS.md's content"
+    );
+}
+
+#[test]
+fn sync_deploys_mapped_leaf_as_symlink_ignores_by_source_layout() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let (base, local) = mapped_link_base_and_overlay(&fx.url, &td.target_path(), "by-source");
+    let in_ = input(&base, Some(&local), None, None, false);
+
+    let out = sync(&in_, &fx.backend, &fx.registry).expect("sync deploys the mapped link");
+    assert!(
+        !out.had_failures,
+        "a clean mapped-link deploy must report no failures"
+    );
+
+    let dst = td.target_path().join("CLAUDE.md");
+    let resolved = std::fs::read_link(&dst)
+        .expect("a mapped link must deploy CLAUDE.md at the target root under by-source layout");
+    assert_eq!(
+        resolved,
+        Path::new(&fx.url).join("AGENTS.md"),
+        "by-source layout must not leak onto a mapped link: dest stays at the target root \
+         and the symlink targets the source leaf"
+    );
+}
+
+#[test]
+fn sync_records_mapped_link_with_map_layout_linked_and_empty_files() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let (base, local) = mapped_link_base_and_overlay(&fx.url, &td.target_path(), "flat");
+    let in_ = input(&base, Some(&local), None, None, false);
+
+    sync(&in_, &fx.backend, &fx.registry).expect("sync deploys the mapped link");
+
+    let rec = fx
+        .registry
+        .get(&artifact_key("dest", "agents-src", "CLAUDE.md"))
+        .expect("registry get must not error")
+        .expect("deploy must persist a record keyed by the DEST (dest,agents-src,CLAUDE.md)");
+    assert_eq!(
+        rec.key.artifact, "CLAUDE.md",
+        "the record key's artifact must be the DEST, not the source key AGENTS.md"
+    );
+    assert_eq!(
+        rec.layout, "map",
+        "a mapped link record must carry the `map` layout sentinel, not a layout kind"
+    );
+    assert!(
+        rec.linked,
+        "a mapped link record must be marked linked == true"
+    );
+    assert!(
+        rec.files.is_empty(),
+        "a linked record carries no manifest files, got {:?}",
+        rec.files
+    );
+}
+
+#[test]
+fn sync_mapped_link_ignores_allow_symlinks_export_policy() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    // AD-6: a mapped link is a symlink we create, not one exported from source content,
+    // so the source's `allow_symlinks = false` (the default here) must not block it.
+    let (base, local) = mapped_link_base_and_overlay(&fx.url, &td.target_path(), "flat");
+    let effective = effective_of(&base, &local);
+    let parsed = effective.parsed_sources().expect("sources parse");
+    assert!(
+        !parsed
+            .get("agents-src")
+            .expect("source parsed")
+            .export_policy()
+            .allow_symlinks,
+        "premise: the source's export policy must disallow symlinks for this test to bite"
+    );
+
+    let out = sync(
+        &input(&base, Some(&local), None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("a mapped link must deploy despite allow_symlinks = false");
+    assert!(
+        !out.had_failures,
+        "AD-6: a mapped link deploys regardless of the source's symlink export policy"
+    );
+
+    let dst = td.target_path().join("CLAUDE.md");
+    assert!(
+        std::fs::symlink_metadata(&dst)
+            .expect("dst metadata")
+            .file_type()
+            .is_symlink(),
+        "the mapped dest must be a symlink even with allow_symlinks = false"
+    );
+}
+
+#[test]
+fn sync_mapped_link_points_at_a_file_not_a_directory() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let (base, local) = mapped_link_base_and_overlay(&fx.url, &td.target_path(), "flat");
+
+    sync(
+        &input(&base, Some(&local), None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("sync deploys the mapped link");
+
+    let dst = td.target_path().join("CLAUDE.md");
+    let target = std::fs::canonicalize(&dst).expect("the symlink must resolve to a real path");
+    assert!(
+        target.is_file(),
+        "a single mapped leaf links to a FILE (the leaf), not a directory, got {}",
+        target.display()
+    );
+    assert_eq!(
+        Path::new("CLAUDE.md").components().count(),
+        1,
+        "v1 mapped dests are single-component (T1)"
+    );
+}
+
+#[test]
+fn preview_shows_mapped_link_as_synced_without_a_fetched_commit() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let (base, local) = mapped_link_base_and_overlay(&fx.url, &td.target_path(), "flat");
+    let effective = effective_of(&base, &local);
+    let parsed = effective.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&effective, &parsed).expect("remotes resolve");
+
+    // No mirror, no lock: a link binding must read the live working tree regardless.
+    let plans = preview_targets(&effective, &parsed, &remotes, &fx.backend, None, false)
+        .expect("a mapped link binding previews without lock or mirror");
+
+    let plan = only_plan(&plans, "dest");
+    let entry = preview_entry(plan, "CLAUDE.md");
+    assert_eq!(
+        entry.state,
+        SyncState::Synced,
+        "a mapped link with a present working tree previews as Synced, not NeedsSync"
+    );
+    assert_eq!(
+        entry.commit, "link",
+        "a mapped link entry carries the \"link\" sentinel, having no fetched commit"
+    );
+    assert_eq!(
+        entry.destination,
+        td.target_path().join("CLAUDE.md"),
+        "the mapped link must preview at <target>/CLAUDE.md"
     );
 }
 
@@ -9374,5 +9777,221 @@ fn preview_reports_cross_binding_mapped_dest_collision() {
             && collision.sources.contains(&"claude2".to_owned()),
         "the collision warning must name BOTH offending identities, got {:?}",
         collision.sources
+    );
+}
+
+// ── T7: prune + verify honor the `map` layout sentinel. A mapped record's
+//    on-disk path is <target>/<dest> (root base, no layout helper); prune and
+//    verify must re-derive from the RECORD, never the target's current layout ──
+
+/// One source + one target mapping `AGENTS.md → <dest>` under `layout`.
+fn config_mapped_to(url: &str, target_path: &Path, dest: &str, layout: &str) -> Config {
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.agents-src]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\n\
+         {{ source = \"agents-src\", map = {{ \"AGENTS.md\" = \"{dest}\" }} }},\n\
+         ]\nlayout = \"{layout}\"\n",
+        target_path.display(),
+    );
+    Config::parse(&toml).expect("mapped-to config parses")
+}
+
+/// The source alone, with the mapped binding dropped from the target — the prior
+/// dest is now a full orphan (key gone from config).
+fn config_source_no_binding(url: &str, target_path: &Path, layout: &str) -> Config {
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.agents-src]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = []\nlayout = \"{layout}\"\n",
+        target_path.display(),
+    );
+    Config::parse(&toml).expect("source-no-binding config parses")
+}
+
+fn prune_for(fx: &SyncFixture, cfg: &Config) {
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(cfg, &parsed).expect("remotes resolve");
+    let commits = one_commit(&parsed, "agents-src", &fx.head_sha);
+    prune_orphans(cfg, &parsed, &remotes, &fx.backend, &fx.registry, &commits)
+        .expect("prune the orphaned mapped state");
+}
+
+#[test]
+fn prune_removes_stale_mapped_dest_and_file_on_rename() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let old_cfg = config_mapped_to(&fx.url, &td.target_path(), "old", "flat");
+    let in_ = input(&old_cfg, None, None, None, false);
+    sync(&in_, &fx.backend, &fx.registry).expect("deploy the original mapped dest `old`");
+
+    let old_dst = td.target_path().join("old");
+    assert!(
+        old_dst.is_file(),
+        "premise: the original mapped dest must be on disk at {}",
+        old_dst.display()
+    );
+
+    let new_cfg = config_mapped_to(&fx.url, &td.target_path(), "new", "flat");
+    let new_in = input(&new_cfg, None, None, None, false);
+    sync(&new_in, &fx.backend, &fx.registry).expect("redeploy under the renamed dest `new`");
+
+    let new_dst = td.target_path().join("new");
+    assert!(
+        new_dst.is_file(),
+        "the renamed mapped dest must deploy at {}",
+        new_dst.display()
+    );
+
+    prune_for(&fx, &new_cfg);
+
+    assert!(
+        !old_dst.exists(),
+        "renaming a map value must prune the old mapped dest FILE at {} \
+         (path re-derived from the record's `map` layout, not the target's flat layout)",
+        old_dst.display()
+    );
+    assert!(
+        new_dst.is_file(),
+        "the renamed dest must survive prune, still present at {}",
+        new_dst.display()
+    );
+    assert!(
+        fx.registry
+            .get(&artifact_key("dest", "agents-src", "old"))
+            .expect("registry read")
+            .is_none(),
+        "the stale `old` mapped record must be removed from the registry"
+    );
+    assert!(
+        fx.registry
+            .get(&artifact_key("dest", "agents-src", "new"))
+            .expect("registry read")
+            .is_some(),
+        "the renamed `new` mapped record must remain"
+    );
+}
+
+#[test]
+fn prune_removes_orphaned_mapped_dest_on_full_removal() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_mapped_to(&fx.url, &td.target_path(), "CLAUDE.md", "flat");
+    let in_ = input(&cfg, None, None, None, false);
+    sync(&in_, &fx.backend, &fx.registry).expect("deploy the mapped dest");
+
+    let dst = td.target_path().join("CLAUDE.md");
+    assert!(dst.is_file(), "premise: the mapped dest must be on disk");
+
+    let dropped = config_source_no_binding(&fx.url, &td.target_path(), "flat");
+    prune_for(&fx, &dropped);
+
+    assert!(
+        !dst.exists(),
+        "dropping the map binding entirely must prune the orphaned mapped dest FILE at {}",
+        dst.display()
+    );
+    assert!(
+        fx.registry
+            .get(&artifact_key("dest", "agents-src", "CLAUDE.md"))
+            .expect("registry read")
+            .is_none(),
+        "the orphaned mapped record must be removed from the registry"
+    );
+}
+
+#[test]
+fn prune_mapped_dest_ignores_by_source_layout() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_mapped_to(&fx.url, &td.target_path(), "CLAUDE.md", "by-source");
+    let in_ = input(&cfg, None, None, None, false);
+    sync(&in_, &fx.backend, &fx.registry).expect("deploy the mapped dest under by-source");
+
+    let dst = td.target_path().join("CLAUDE.md");
+    assert!(
+        dst.is_file(),
+        "premise: the mapped dest lands at the ROOT even under by-source, at {}",
+        dst.display()
+    );
+
+    let dropped = config_source_no_binding(&fx.url, &td.target_path(), "by-source");
+    prune_for(&fx, &dropped);
+
+    assert!(
+        !dst.exists(),
+        "by-source layout must NOT leak onto a mapped record's prune path; the dest at the \
+         ROOT {} must be pruned, not a by-source-derived path",
+        dst.display()
+    );
+}
+
+#[test]
+fn verify_hashes_mapped_dest_at_target_root() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_mapped_to(&fx.url, &td.target_path(), "CLAUDE.md", "flat");
+    let in_ = input(&cfg, None, None, None, false);
+    sync(&in_, &fx.backend, &fx.registry).expect("deploy the mapped dest");
+
+    let clean = verify(&cfg, &fx.registry).expect("verify must not error");
+    assert!(
+        !clean
+            .iter()
+            .any(|m| m.key == artifact_key("dest", "agents-src", "CLAUDE.md")),
+        "an unmodified mapped dest must hash clean against <target>/CLAUDE.md, got {clean:?}"
+    );
+
+    let dst = td.target_path().join("CLAUDE.md");
+    std::fs::write(&dst, b"locally edited mapped dest\n").expect("mutate the mapped dest");
+
+    let drifted = verify(&cfg, &fx.registry).expect("verify must not error");
+    let hit = drifted
+        .iter()
+        .find(|m| m.key == artifact_key("dest", "agents-src", "CLAUDE.md"))
+        .unwrap_or_else(|| {
+            panic!(
+                "verify must detect drift on the mutated mapped dest at <target>/CLAUDE.md, \
+                 got {drifted:?}"
+            )
+        });
+    assert!(
+        matches!(hit.reason, VerifyReason::ContentMismatch { .. }),
+        "the mutated mapped dest must be a ContentMismatch, got {:?}",
+        hit.reason
+    );
+    assert_eq!(
+        hit.path,
+        *Path::new("CLAUDE.md"),
+        "verify must report the bare dest as the mismatching file, got {:?}",
+        hit.path
+    );
+}
+
+#[test]
+fn verify_mapped_dest_ignores_by_source_layout() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_mapped_to(&fx.url, &td.target_path(), "CLAUDE.md", "by-source");
+    let in_ = input(&cfg, None, None, None, false);
+    sync(&in_, &fx.backend, &fx.registry).expect("deploy the mapped dest under by-source");
+
+    let dst = td.target_path().join("CLAUDE.md");
+    std::fs::write(&dst, b"edited under by-source\n").expect("mutate the mapped dest");
+
+    let drifted = verify(&cfg, &fx.registry).expect("verify must not error");
+    let hit = drifted
+        .iter()
+        .find(|m| m.key == artifact_key("dest", "agents-src", "CLAUDE.md"))
+        .unwrap_or_else(|| {
+            panic!(
+                "by-source layout must NOT leak onto a mapped record's verify path; verify must \
+                 hash <target>/CLAUDE.md at the ROOT and see the drift, got {drifted:?}"
+            )
+        });
+    assert!(
+        matches!(hit.reason, VerifyReason::ContentMismatch { .. }),
+        "the mutated mapped dest under by-source must be a ContentMismatch, got {:?}",
+        hit.reason
     );
 }

@@ -215,6 +215,38 @@ fn preview_mapped(
     entries: &mut Vec<PreviewEntry>,
 ) -> Result<()> {
     let map = ctx.binding.map.expect("binding.map is Some");
+    match ctx.source.deploy_mode() {
+        DeployMode::Link => preview_mapped_link(ctx, map, entries),
+        DeployMode::Copy => preview_mapped_copy(ctx, map, lock, entries),
+    }
+}
+
+fn preview_mapped_link(
+    ctx: &BindingCtx,
+    map: &BTreeMap<String, String>,
+    entries: &mut Vec<PreviewEntry>,
+) -> Result<()> {
+    let git = remote_for(ctx.remotes, ctx.binding.source)?;
+    let base = ctx
+        .binding
+        .root
+        .map_or_else(|| PathBuf::from(git), |r| Path::new(git).join(r));
+    for (key, dest) in map {
+        if base.join(key).is_file() {
+            push_mapped_entry(ctx, dest, "link", entries);
+        } else {
+            entries.push(annotation(ctx, "link", SyncState::LinkWorkingTreeGone));
+        }
+    }
+    Ok(())
+}
+
+fn preview_mapped_copy(
+    ctx: &BindingCtx,
+    map: &BTreeMap<String, String>,
+    lock: Option<&Lock>,
+    entries: &mut Vec<PreviewEntry>,
+) -> Result<()> {
     let disc = ref_discriminator(&ctx.binding.effective_ref, &ctx.source.refspec());
     let Some(locked) = lock.and_then(|l| l.find_entry(ctx.binding.source, disc.as_deref())) else {
         entries.push(annotation(ctx, "", SyncState::NotLocked));
@@ -232,17 +264,21 @@ fn preview_mapped(
     }
 
     for dest in map.values() {
-        let dest_path = PathBuf::from(dest);
-        let mut entry = synced_entry_at(ctx, dest, &locked.commit, ctx.path.join(&dest_path));
-        if ctx.files {
-            entry.files = vec![PreviewFile {
-                path: dest_path,
-                templated: false,
-            }];
-        }
-        entries.push(entry);
+        push_mapped_entry(ctx, dest, &locked.commit, entries);
     }
     Ok(())
+}
+
+fn push_mapped_entry(ctx: &BindingCtx, dest: &str, commit: &str, entries: &mut Vec<PreviewEntry>) {
+    let dest_path = PathBuf::from(dest);
+    let mut entry = synced_entry_at(ctx, dest, commit, ctx.path.join(&dest_path));
+    if ctx.files {
+        entry.files = vec![PreviewFile {
+            path: dest_path,
+            templated: false,
+        }];
+    }
+    entries.push(entry);
 }
 
 fn copy_files(ctx: &BindingCtx, artifact: &str, commit: &str) -> Result<Vec<PreviewFile>> {
