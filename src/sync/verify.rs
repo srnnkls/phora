@@ -34,11 +34,7 @@ pub fn verify(config: &Config, registry: &dyn Registry) -> Result<Vec<VerifyMism
         let Some(target) = config.targets.get(&record.key.target) else {
             continue;
         };
-        let artifact_dir = target.expanded_path().join(
-            target
-                .layout()
-                .artifact_path(&record.key.source, &record.key.artifact),
-        );
+        let artifact_dir = super::target::record_manifest_base(target, &record);
         for file in &record.files {
             let dst = artifact_dir.join(&file.path);
             match std::fs::read(&dst) {
