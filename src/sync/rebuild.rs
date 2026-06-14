@@ -184,6 +184,7 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         commit_time,
         template_opt_in,
         vars,
+        path_map: None,
     })?;
 
     let mut modified = false;
