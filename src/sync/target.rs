@@ -355,6 +355,7 @@ fn deploy_one(
         commit_time,
         template_opt_in: ctx.template_opt_in,
         vars: ctx.vars,
+        path_map: None,
     };
     let export = backend.export_artifact(&req)?;
 

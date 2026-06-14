@@ -7336,6 +7336,299 @@ fn plan_target_without_override_discovers_full_source_level_set() {
     );
 }
 
+// ── mapped (leaf-aliasing) projection: a binding with `map` emits one explicit
+//    entry per (key → dest) WITHOUT discovery and WITHOUT layout ──
+
+/// A mapped binding with two `key → dest` entries projects to EXACTLY two plan
+/// entries — one per key — with `artifact` set to the DEST and `destination`
+/// rooted at `<target>/<dest>` (a single-component join, no `artifact_path`).
+/// The map keys never exist in the seeded mirror, pinning that mapped projection
+/// bypasses discovery entirely.
+#[test]
+fn plan_projects_mapped_binding_one_entry_per_key() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\n\
+         {{ source = \"editor-src\", map = {{ \"AGENTS.md\" = \"CLAUDE.md\", \"tools/AGENTS.md\" = \"codex.md\" }} }},\n\
+         ]\n",
+        fx.url,
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("mapped-binding config parses");
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+    fx.backend
+        .fetch(&sn("editor-src"), &fx.url)
+        .expect("seed editor-src mirror");
+    let commits = one_commit(&parsed, "editor-src", &fx.head_sha);
+
+    let plans = plan_targets(&cfg, &parsed, &remotes, &fx.backend, &commits)
+        .expect("plan builds for a mapped binding without discovery");
+
+    let dest = plans
+        .iter()
+        .find(|p| p.target == "dest")
+        .expect("plan must include target `dest`");
+
+    assert_eq!(
+        dest.entries.len(),
+        2,
+        "a 2-entry map must project EXACTLY 2 plan entries (one per key), got {:?}",
+        dest.entries
+    );
+
+    let mut artifacts: Vec<&str> = dest.entries.iter().map(|e| e.artifact.as_str()).collect();
+    artifacts.sort_unstable();
+    assert_eq!(
+        artifacts,
+        vec!["CLAUDE.md", "codex.md"],
+        "each entry's `artifact` must be the DEST (the map value), not the key, got {artifacts:?}"
+    );
+
+    let claude = dest
+        .entries
+        .iter()
+        .find(|e| e.artifact == "CLAUDE.md")
+        .expect("entry for dest `CLAUDE.md`");
+    assert_eq!(
+        claude.destination,
+        td.target_path().join("CLAUDE.md"),
+        "mapped destination must be <target>/<dest> via a single-component join"
+    );
+
+    let codex = dest
+        .entries
+        .iter()
+        .find(|e| e.artifact == "codex.md")
+        .expect("entry for dest `codex.md`");
+    assert_eq!(
+        codex.destination,
+        td.target_path().join("codex.md"),
+        "mapped destination must be <target>/<dest> via a single-component join"
+    );
+
+    assert_eq!(
+        claude.source, "editor-src",
+        "mapped entry must carry its originating source, got {:?}",
+        claude.source
+    );
+
+    assert_eq!(
+        claude.commit, fx.head_sha,
+        "mapped entry must carry the resolved commit, not a default/empty, got {:?}",
+        claude.commit
+    );
+}
+
+/// A SINGLE target with two sibling bindings — one `map` binding and one plain
+/// dir-artifact binding over the same source — projects BOTH: the mapped entry
+/// AND the discovered dir entries. Pins that the mapped branch's `continue` does
+/// not skip the sibling normal binding.
+#[test]
+fn plan_handles_mixed_mapped_and_normal_bindings_in_one_target() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\n\
+         {{ source = \"editor-src\", as = \"leaves\", map = {{ \"AGENTS.md\" = \"CLAUDE.md\" }} }},\n\
+         {{ source = \"editor-src\", as = \"dirs\" }},\n\
+         ]\n",
+        fx.url,
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("mixed mapped + normal config parses");
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+    fx.backend
+        .fetch(&sn("editor-src"), &fx.url)
+        .expect("seed editor-src mirror");
+    let commits = one_commit(&parsed, "editor-src", &fx.head_sha);
+
+    let plans = plan_targets(&cfg, &parsed, &remotes, &fx.backend, &commits)
+        .expect("plan builds for a target mixing mapped and normal bindings");
+    let dest = plans
+        .iter()
+        .find(|p| p.target == "dest")
+        .expect("plan must include target `dest`");
+
+    let claude = dest
+        .entries
+        .iter()
+        .find(|e| e.artifact == "CLAUDE.md")
+        .expect("mapped entry for dest `CLAUDE.md` must survive the sibling normal binding");
+    assert!(
+        claude.mapped,
+        "the mapped binding's entry must have mapped == true, got {claude:?}"
+    );
+    assert_eq!(
+        claude.destination,
+        td.target_path().join("CLAUDE.md"),
+        "mapped destination must be <target>/<dest>, got {:?}",
+        claude.destination
+    );
+
+    let mut normal_artifacts: Vec<&str> = dest
+        .entries
+        .iter()
+        .filter(|e| !e.mapped)
+        .map(|e| e.artifact.as_str())
+        .collect();
+    normal_artifacts.sort_unstable();
+    assert_eq!(
+        normal_artifacts,
+        vec!["docs", "editor"],
+        "the sibling plain binding must still discover the full source set; \
+         the mapped branch's `continue` must not skip it, got {:?}",
+        dest.entries
+    );
+
+    let editor = dest
+        .entries
+        .iter()
+        .find(|e| e.artifact == "editor" && !e.mapped)
+        .expect("normal dir entry `editor`");
+    assert_eq!(
+        editor.destination,
+        td.target_path()
+            .join(cfg.targets["dest"].layout().artifact_path("dirs", "editor")),
+        "normal dir entry must route through layout, got {:?}",
+        editor.destination
+    );
+}
+
+/// The SAME mapped binding under `layout = "by-source"` STILL lands each dest at
+/// `<target>/<dest>` — NOT `<target>/<identity>/<dest>`. Pins that mapped
+/// projection bypasses layout (the data-loss / no-leak guard).
+#[test]
+fn plan_mapped_destination_ignores_layout() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\n\
+         {{ source = \"editor-src\", as = \"slim\", map = {{ \"AGENTS.md\" = \"CLAUDE.md\", \"tools/AGENTS.md\" = \"codex.md\" }} }},\n\
+         ]\nlayout = \"by-source\"\n",
+        fx.url,
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("mapped-binding by-source config parses");
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+    fx.backend
+        .fetch(&sn("editor-src"), &fx.url)
+        .expect("seed editor-src mirror");
+    let commits = one_commit(&parsed, "editor-src", &fx.head_sha);
+
+    let plans = plan_targets(&cfg, &parsed, &remotes, &fx.backend, &commits)
+        .expect("plan builds for a mapped binding under by-source layout");
+
+    let dest = plans
+        .iter()
+        .find(|p| p.target == "dest")
+        .expect("plan must include target `dest`");
+
+    let claude = dest
+        .entries
+        .iter()
+        .find(|e| e.artifact == "CLAUDE.md")
+        .expect("entry for dest `CLAUDE.md`");
+    assert_eq!(
+        claude.destination,
+        td.target_path().join("CLAUDE.md"),
+        "by-source layout must NOT be applied to a mapped dest; \
+         <target>/slim/CLAUDE.md would be the bug, got {:?}",
+        claude.destination
+    );
+}
+
+/// Mapped entries carry `mapped == true`; a normal dir-artifact binding's entries
+/// carry `mapped == false`. The premise guard proves the flag distinguishes the
+/// two projections rather than defaulting one way.
+#[test]
+fn plan_marks_mapped_entries() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+
+    let mapped_toml = format!(
+        "version = 1\n\n\
+         [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\n\
+         {{ source = \"editor-src\", map = {{ \"AGENTS.md\" = \"CLAUDE.md\" }} }},\n\
+         ]\n",
+        fx.url,
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&mapped_toml).expect("mapped-binding config parses");
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+    fx.backend
+        .fetch(&sn("editor-src"), &fx.url)
+        .expect("seed editor-src mirror");
+    let commits = one_commit(&parsed, "editor-src", &fx.head_sha);
+
+    let plans = plan_targets(&cfg, &parsed, &remotes, &fx.backend, &commits)
+        .expect("plan builds for a mapped binding");
+    let dest = plans
+        .iter()
+        .find(|p| p.target == "dest")
+        .expect("plan must include target `dest`");
+    assert!(
+        dest.entries.iter().all(|e| e.mapped),
+        "every mapped-binding entry must have mapped == true, got {:?}",
+        dest.entries
+    );
+
+    // Premise guard: a normal dir-artifact binding's entries are NOT mapped.
+    let td2 = TargetDir::new();
+    let normal_toml = format!(
+        "version = 1\n\n\
+         [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\"editor-src\"]\nlayout = \"by-source\"\n",
+        fx.url,
+        td2.target_path().display(),
+    );
+    let normal_cfg = Config::parse(&normal_toml).expect("plain-binding config parses");
+    let normal_parsed = normal_cfg.parsed_sources().expect("sources parse");
+    let normal_remotes = resolved_remotes(&normal_cfg, &normal_parsed).expect("remotes resolve");
+    let normal_commits = one_commit(&normal_parsed, "editor-src", &fx.head_sha);
+
+    let normal_plans = plan_targets(
+        &normal_cfg,
+        &normal_parsed,
+        &normal_remotes,
+        &fx.backend,
+        &normal_commits,
+    )
+    .expect("plan builds for a plain dir-artifact binding");
+    let normal_dest = normal_plans
+        .iter()
+        .find(|p| p.target == "dest")
+        .expect("plan must include target `dest`");
+    let mut normal_artifacts: Vec<&str> = normal_dest
+        .entries
+        .iter()
+        .map(|e| e.artifact.as_str())
+        .collect();
+    normal_artifacts.sort_unstable();
+    assert_eq!(
+        normal_artifacts,
+        vec!["docs", "editor"],
+        "premise guard: a plain editor-src binding must discover the full source-level set, got {:?}",
+        normal_dest.entries
+    );
+    assert!(
+        normal_dest.entries.iter().all(|e| !e.mapped),
+        "a plain dir-artifact binding's entries must have mapped == false, got {:?}",
+        normal_dest.entries
+    );
+}
+
 /// `preview_targets` must annotate the binding's effective selection: a refined
 /// binding with `include = ["editor"]` previews ONLY `editor` as Synced, and with
 /// files=true the file list respects the same selection (dropping `notes.bak`).
