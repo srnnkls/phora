@@ -305,6 +305,15 @@ fn reject_map(binding: &Binding) -> Result<()> {
             )));
         }
     }
+    let mut seen_dests = BTreeSet::new();
+    for value in map.values() {
+        if !seen_dests.insert(value) {
+            return Err(Error::Config(format!(
+                "source `{source}`: `map` dest `{value}` is the target of more than one key; \
+                 distinct sources would clobber one dest"
+            )));
+        }
+    }
     Ok(())
 }
 
