@@ -356,6 +356,16 @@ fn collect_records(artifacts_dir: &Path, out: &mut Vec<RegistryRecord>) -> Resul
     Ok(())
 }
 
+fn sort_records(records: &mut [RegistryRecord]) {
+    records.sort_by(|a, b| {
+        (&a.key.target, &a.key.source, &a.key.artifact).cmp(&(
+            &b.key.target,
+            &b.key.source,
+            &b.key.artifact,
+        ))
+    });
+}
+
 impl Registry for FileRegistry {
     fn get(&self, key: &ArtifactKey) -> Result<Option<RegistryRecord>> {
         let path = self.record_path(key);
@@ -393,6 +403,7 @@ impl Registry for FileRegistry {
             .join("artifacts");
         let mut records = Vec::new();
         collect_records(&artifacts_dir, &mut records)?;
+        sort_records(&mut records);
         Ok(records)
     }
 
@@ -418,6 +429,7 @@ impl Registry for FileRegistry {
             }
             collect_records(&target.path().join("artifacts"), &mut records)?;
         }
+        sort_records(&mut records);
         Ok(records)
     }
 
@@ -988,6 +1000,63 @@ artifact = "snippets"
                 && r.key.source == "dotfiles"
                 && r.key.artifact == "init"),
             "nvim dotfiles/init present in list_all"
+        );
+    }
+
+    #[test]
+    fn list_target_orders_records_by_source_then_artifact() {
+        let (_dir, reg) = registry();
+        reg.put(&record("home", "second", "COPY.md"))
+            .expect("put second");
+        reg.put(&record("home", "dotfiles", "READER.md"))
+            .expect("put dotfiles");
+
+        let keys: Vec<(String, String)> = reg
+            .list_target("home")
+            .expect("list home")
+            .into_iter()
+            .map(|r| (r.key.source, r.key.artifact))
+            .collect();
+
+        assert_eq!(
+            keys,
+            vec![
+                ("dotfiles".to_owned(), "READER.md".to_owned()),
+                ("second".to_owned(), "COPY.md".to_owned()),
+            ],
+            "list_target must order by (source, artifact), independent of filesystem read_dir order"
+        );
+    }
+
+    #[test]
+    fn list_all_orders_records_by_target_then_source_then_artifact() {
+        let (_dir, reg) = registry();
+        reg.put(&record("nvim", "dotfiles", "init"))
+            .expect("put nvim");
+        reg.put(&record("home", "second", "COPY.md"))
+            .expect("put home second");
+        reg.put(&record("home", "dotfiles", "READER.md"))
+            .expect("put home dotfiles");
+
+        let keys: Vec<(String, String, String)> = reg
+            .list_all()
+            .expect("list all")
+            .into_iter()
+            .map(|r| (r.key.target, r.key.source, r.key.artifact))
+            .collect();
+
+        assert_eq!(
+            keys,
+            vec![
+                (
+                    "home".to_owned(),
+                    "dotfiles".to_owned(),
+                    "READER.md".to_owned()
+                ),
+                ("home".to_owned(), "second".to_owned(), "COPY.md".to_owned()),
+                ("nvim".to_owned(), "dotfiles".to_owned(), "init".to_owned()),
+            ],
+            "list_all must order by (target, source, artifact), independent of read_dir order"
         );
     }
 
