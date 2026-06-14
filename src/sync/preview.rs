@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::config::{Config, DeployMode, LayoutConfig, LayoutKind, ParsedSource, Target};
+use crate::config::{Config, DeployMode, LayoutConfig, ParsedSource, Target};
 use crate::error::{Error, Result};
 use crate::kernel::{ArtifactName, Selection, SourceName};
 use crate::lock::{Lock, ref_discriminator};
@@ -117,13 +117,18 @@ fn preview_target(
             files,
         };
 
+        if binding.map.is_some() {
+            preview_mapped(&ctx, lock, &mut entries)?;
+            continue;
+        }
+
         match source.deploy_mode() {
             DeployMode::Link => preview_link(&ctx, &mut entries)?,
             DeployMode::Copy => preview_copy(&ctx, lock, &mut entries)?,
         }
     }
 
-    let collisions = detect_flat_collisions(&layout, &entries);
+    let collisions = detect_dest_collisions(&entries);
     Ok(PreviewTargetPlan {
         target: target_name.to_owned(),
         entries,
@@ -200,6 +205,42 @@ fn preview_copy(
         }
         Err(err @ Error::Config(_)) => return Err(err),
         Err(_) => entries.push(annotation(ctx, &locked.commit, SyncState::NeedsSync)),
+    }
+    Ok(())
+}
+
+fn preview_mapped(
+    ctx: &BindingCtx,
+    lock: Option<&Lock>,
+    entries: &mut Vec<PreviewEntry>,
+) -> Result<()> {
+    let map = ctx.binding.map.expect("binding.map is Some");
+    let disc = ref_discriminator(&ctx.binding.effective_ref, &ctx.source.refspec());
+    let Some(locked) = lock.and_then(|l| l.find_entry(ctx.binding.source, disc.as_deref())) else {
+        entries.push(annotation(ctx, "", SyncState::NotLocked));
+        return Ok(());
+    };
+
+    let git = remote_for(ctx.remotes, ctx.binding.source)?;
+    if ctx
+        .backend
+        .commit_time(ctx.name, git, &locked.commit)
+        .is_err()
+    {
+        entries.push(annotation(ctx, &locked.commit, SyncState::NeedsSync));
+        return Ok(());
+    }
+
+    for dest in map.values() {
+        let dest_path = PathBuf::from(dest);
+        let mut entry = synced_entry_at(ctx, dest, &locked.commit, ctx.path.join(&dest_path));
+        if ctx.files {
+            entry.files = vec![PreviewFile {
+                path: dest_path,
+                templated: false,
+            }];
+        }
+        entries.push(entry);
     }
     Ok(())
 }
@@ -281,14 +322,24 @@ fn collect_working_tree_files(
 }
 
 fn synced_entry(ctx: &BindingCtx, artifact: &str, commit: &str) -> PreviewEntry {
+    let destination = ctx
+        .path
+        .join(ctx.layout.artifact_path(ctx.binding.identity, artifact));
+    synced_entry_at(ctx, artifact, commit, destination)
+}
+
+fn synced_entry_at(
+    ctx: &BindingCtx,
+    artifact: &str,
+    commit: &str,
+    destination: PathBuf,
+) -> PreviewEntry {
     PreviewEntry {
         identity: ctx.binding.identity.to_owned(),
         source: ctx.binding.source.to_owned(),
         artifact: artifact.to_owned(),
         commit: commit.to_owned(),
-        destination: ctx
-            .path
-            .join(ctx.layout.artifact_path(ctx.binding.identity, artifact)),
+        destination,
         state: SyncState::Synced,
         files: Vec::new(),
     }
@@ -306,27 +357,24 @@ fn annotation(ctx: &BindingCtx, commit: &str, state: SyncState) -> PreviewEntry 
     }
 }
 
-fn detect_flat_collisions(
-    layout: &LayoutConfig,
-    entries: &[PreviewEntry],
-) -> Vec<PreviewCollision> {
-    if layout.kind != LayoutKind::Flat {
-        return Vec::new();
-    }
-
-    let mut by_artifact: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+fn detect_dest_collisions(entries: &[PreviewEntry]) -> Vec<PreviewCollision> {
+    let mut by_dest: BTreeMap<&Path, Vec<String>> = BTreeMap::new();
     for entry in entries.iter().filter(|e| e.state == SyncState::Synced) {
-        by_artifact
-            .entry(entry.artifact.as_str())
+        by_dest
+            .entry(entry.destination.as_path())
             .or_default()
             .push(entry.identity.clone());
     }
 
-    by_artifact
+    by_dest
         .into_iter()
         .filter(|(_, sources)| sources.len() > 1)
-        .map(|(artifact, sources)| PreviewCollision {
-            artifact: artifact.to_owned(),
+        .map(|(dest, sources)| PreviewCollision {
+            artifact: dest
+                .file_name()
+                .unwrap_or(dest.as_os_str())
+                .to_string_lossy()
+                .into_owned(),
             sources,
         })
         .collect()
