@@ -231,6 +231,108 @@ where an artifact wants to land, it prompts (on a TTY):
 
 Non-interactive runs skip such files unless `--force` is given.
 
+### Hooks
+
+Hooks run shell commands after a sync. A target's `on_change` fires once after a
+sync that **added or modified** that target's artifacts (pure removals don't
+trigger it — that's what the global `post_sync` escape hatch is for); the global
+`[hooks] post_sync` runs after **every** sync. Hooks are declared only in
+`phora.toml` / `phora.local.toml`.
+
+```toml
+[targets.neovim.hooks]
+# a bare string runs under `sh -c`
+on_change = "nvim --headless +'Lazy! sync' +qa"
+
+[targets.editors.hooks]
+# a table picks the shell; an array runs several in declared order (deduped)
+on_change = [
+  { run = "stylua .", shell = "bash -c" },
+  "git -C ~/.config add -A",
+]
+
+[hooks]
+post_sync = "notify-send 'phora synced'"   # runs every sync (when = "always")
+```
+
+A hook value is a command string, a `{ run = "...", shell = "..." }` table
+(`shell` optional, default `sh -c`), or an array mixing both. Each hook sees
+phora's full environment plus, for `on_change`:
+
+| Variable              | Value                                             |
+| --------------------- | ------------------------------------------------- |
+| `PHORA_TARGET`        | the target name                                   |
+| `PHORA_CHANGED`       | newline-separated deployed paths of changed artifacts |
+| `PHORA_CHANGED_NAMES` | newline-separated artifact names                  |
+
+Artifacts land on disk **before** the hook runs. Hook success is recorded, so a
+no-op sync runs no `on_change`; a hook that exits non-zero is not recorded, makes
+`phora sync` exit non-zero, leaves the deployed files in place, and re-fires on
+the next sync. `phora sync --no-hooks` deploys without running any hook.
+
+Each hook that ran is reported with its scope and status:
+
+```
+hook neovim#nvim --headless +'Lazy! sync' +qa#sh -c [on_change] `nvim --headless +'Lazy! sync' +qa` ok
+sync complete
+```
+
+**Trust boundary.** Hooks come only from the consumer's config. A synced source
+tree that happens to carry a hook-shaped `phora.toml` is inert content — it is
+never read as config and never executes.
+
+### Templating
+
+Files can be rendered per-machine with [minijinja](https://docs.rs/minijinja)
+before they deploy. A source file named `*.tmpl` is rendered and lands with the
+suffix stripped (`motd.tmpl` → `motd`); every other file copies byte-for-byte.
+Variables come from a flat `[vars]` table:
+
+```toml
+[vars]
+greeting = "hello"
+editor = "nvim"
+```
+
+```jinja
+{# editor/motd.tmpl → deploys as editor/motd #}
+{{ greeting }} from {{ editor }}
+```
+
+The `.tmpl` suffix is the opt-in by default; a refined binding can widen it to
+arbitrary globs or turn it off:
+
+```toml
+# render these paths too, in addition to *.tmpl:
+sources = [{ source = "dotfiles", template = ["*.conf", "config/*"] }]
+# render nothing, even .tmpl files:
+sources = [{ source = "dotfiles", template = false }]
+```
+
+Rendering is strict: referencing an undefined variable aborts that artifact's
+export — its sibling artifacts still deploy. `phora.local.toml` overrides vars
+per key — keys it omits keep their base value — so each machine fills in its own:
+
+```toml
+# phora.local.toml — overlays phora.toml, never committed
+[vars]
+greeting = "hi from this laptop"
+```
+
+**Integrity.** Phora hashes the *rendered* bytes, so `phora verify` checks the
+deployed output, not the template. The lock records *source* bytes only: two
+machines with different vars produce byte-identical locks, keeping the integrity
+check machine-independent. Editing a variable marks the affected artifacts
+outdated, and the next `phora sync` re-renders and redeploys them — no new commit
+needed. `phora preview --files` shows the deployed name and flags what renders:
+
+```
+home
+  dotfiles@a1b2c3d4 editor -> /home/me/.config/editor
+    motd (templated)
+    static.txt
+```
+
 ### Troubleshooting
 
 When something looks off, the question you have usually maps to one command:
@@ -383,6 +485,58 @@ no `--to` at all). The ref flags are not among them: `phora add`'s `--branch`/`-
 stay source-level — a source is added at a version — so per-target ref overrides are a
 `bind` concern only (`bind --branch/--tag/--rev`). Local/symlink overlays
 (`--local`/`--symlink`) accept neither `--to` nor refinement flags.
+
+### Aliasing leaves (`map`)
+
+A binding's `map` aliases individual **source files** to renamed destinations,
+without duplicating them in the source repo. Where the rest of phora projects
+top-level directories (artifacts), `map` projects one leaf file to a chosen name —
+the canonical case being a single shared file fanned out under the names different
+tools expect:
+
+```toml
+[targets.agents]
+path = "~/myproject"
+sources = [
+  { source = "dotfiles", map = { "AGENTS.md" = "AGENTS.md" } },
+  { source = "dotfiles", as = "claude", map = { "AGENTS.md" = "CLAUDE.md" } },
+  { source = "dotfiles", as = "codex",  map = { "AGENTS.md" = "codex.md" } },
+]
+```
+
+One `AGENTS.md` in the source now lands three times, under three names, with no
+copies in the source tree. Each `map` entry is `"<source-leaf-path>" = "<dest>"`:
+the key is a file path relative to the binding's source root, the value the name it
+deploys as.
+
+- **Lands at the target root, bypassing layout.** A mapped dest is placed directly
+  at `<target>/<dest>` — the dir-artifact layout does not apply, and a `by-source`
+  target does *not* nest the dest under a per-source subdirectory.
+- **Single-component dest (v1).** A dest must be one safe filename: no `/`, `\`,
+  `.`, or `..`. Nested destinations are deferred to v2. A key may sit in a
+  subdirectory (`lint/rules.toml`) but may not be absolute or escape the root via
+  `..`. A key that resolves to nothing, or to a non-regular-file, errors at sync.
+- **Mutually exclusive with `include`/`exclude`.** `map` selects exact leaves, so
+  combining it with glob selection on the same binding is a config error.
+- **Fan-out without duplication.** The same source leaf can map to different dests
+  across bindings and targets (give each binding a distinct `as` — identity must be
+  unique within a target, as for any other slice). The source is fetched once.
+- **Copy and link both work.** Default `deploy = "copy"` materializes the leaf;
+  `deploy = "link"` (local-overlay-only — see [Link mode](#link-mode-local-development))
+  makes the dest a symlink to the source leaf in the working tree. A missing link
+  leaf degrades gracefully: `preview` flags it and `sync` still completes.
+- **Rename leaves an orphan.** Changing a dest value orphans the old file; it
+  survives until a `phora sync --prune` reclaims it.
+- **Collisions are conflicts.** Two bindings whose dests resolve to the same path
+  in one target — two mapped dests, or a mapped dest landing on a dir-artifact of
+  the same name — fail the sync, naming the contested artifact and both identities.
+  (Within a single binding, two keys mapping to one dest is caught earlier, at
+  config load.)
+
+**Overlay.** `map` lives on a binding, and a `phora.local.toml` `sources` list
+*replaces* the base target's list wholesale — it does not merge per binding. A
+local override of a target's `sources` must therefore restate every binding it
+wants, including their maps; base maps it omits are dropped for that target.
 
 ### Source kinds
 
