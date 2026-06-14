@@ -2569,8 +2569,14 @@ path = "srnnkls/tropos"
         let staging = TempDir::new().expect("staging dir");
 
         let m = matcher(&[], &[]);
-        let err = export_named(&fixture, "art", staging.path(), &m, &ExportPolicy::default())
-            .expect_err("directory `config` and rendered `config.tmpl` both deploy to `config`");
+        let err = export_named(
+            &fixture,
+            "art",
+            staging.path(),
+            &m,
+            &ExportPolicy::default(),
+        )
+        .expect_err("directory `config` and rendered `config.tmpl` both deploy to `config`");
         assert!(
             matches!(err, SourceError::DeployedNameCollision { .. }),
             "a directory and a blob mapping to the same deployed name must collide, not surface a raw fs error, got: {err:?}"
