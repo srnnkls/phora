@@ -436,6 +436,58 @@ per-target ref overrides are a `bind` concern only (`bind --branch/--tag/--rev`)
 Local/symlink overlays (`--local`/`--symlink`) accept neither `--to` nor refinement
 flags.
 
+### Aliasing leaves (`map`)
+
+A binding's `map` aliases individual **source files** to renamed destinations,
+without duplicating them in the source repo. Where the rest of phora projects
+top-level directories (artifacts), `map` projects one leaf file to a chosen name —
+the canonical case being a single shared file fanned out under the names different
+tools expect:
+
+```toml
+[targets.agents]
+path = "~/myproject"
+sources = [
+  { source = "dotfiles", map = { "AGENTS.md" = "AGENTS.md" } },
+  { source = "dotfiles", as = "claude", map = { "AGENTS.md" = "CLAUDE.md" } },
+  { source = "dotfiles", as = "codex",  map = { "AGENTS.md" = "codex.md" } },
+]
+```
+
+One `AGENTS.md` in the source now lands three times, under three names, with no
+copies in the source tree. Each `map` entry is `"<source-leaf-path>" = "<dest>"`:
+the key is a file path relative to the binding's source root, the value the name it
+deploys as.
+
+- **Lands at the target root, bypassing layout.** A mapped dest is placed directly
+  at `<target>/<dest>` — the dir-artifact layout does not apply, and a `by-source`
+  target does *not* nest the dest under a per-source subdirectory.
+- **Single-component dest (v1).** A dest must be one safe filename: no `/`, `\`,
+  `.`, or `..`. Nested destinations are deferred to v2. A key may sit in a
+  subdirectory (`lint/rules.toml`) but may not be absolute or escape the root via
+  `..`. A key that resolves to nothing, or to a non-regular-file, errors at sync.
+- **Mutually exclusive with `include`/`exclude`.** `map` selects exact leaves, so
+  combining it with glob selection on the same binding is a config error.
+- **Fan-out without duplication.** The same source leaf can map to different dests
+  across bindings and targets (give each binding a distinct `as` — identity must be
+  unique within a target, as for any other slice). The source is fetched once.
+- **Copy and link both work.** Default `deploy = "copy"` materializes the leaf;
+  `deploy = "link"` (local-overlay-only — see [Link mode](#link-mode-local-development))
+  makes the dest a symlink to the source leaf in the working tree. A missing link
+  leaf degrades gracefully: `preview` flags it and `sync` still completes.
+- **Rename leaves an orphan.** Changing a dest value orphans the old file; it
+  survives until a `phora sync --prune` reclaims it.
+- **Collisions are conflicts.** Two bindings whose dests resolve to the same path
+  in one target — two mapped dests, or a mapped dest landing on a dir-artifact of
+  the same name — fail the sync, naming the contested artifact and both identities.
+  (Within a single binding, two keys mapping to one dest is caught earlier, at
+  config load.)
+
+**Overlay.** `map` lives on a binding, and a `phora.local.toml` `sources` list
+*replaces* the base target's list wholesale — it does not merge per binding. A
+local override of a target's `sources` must therefore restate every binding it
+wants, including their maps; base maps it omits are dropped for that target.
+
 ### Source kinds
 
 A source declares its remote in exactly one kind — never more than one:
