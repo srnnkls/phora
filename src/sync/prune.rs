@@ -33,11 +33,7 @@ pub(super) fn prune_orphans(
             continue;
         }
         if let Some(target) = config.targets.get(&record.key.target) {
-            let dst = target.expanded_path().join(
-                target
-                    .layout()
-                    .artifact_path(&record.key.source, &record.key.artifact),
-            );
+            let dst = super::target::record_artifact_path(target, &record);
             if dst.exists() {
                 eprintln!(
                     "phora: pruning orphaned {}:{}",

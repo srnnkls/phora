@@ -6,7 +6,9 @@ use crate::error::{Error, Result};
 use crate::kernel::{ArtifactName, Selection, SourceName};
 use crate::lock::{Lock, ref_discriminator};
 use crate::source::{ExportRequest, SourceBackend};
-use crate::store::{ArtifactKey, ManifestFile, ProjectedRecord, Registry, RegistryRecord};
+use crate::store::{
+    ArtifactKey, MAP_LAYOUT, ManifestFile, ProjectedRecord, Registry, RegistryRecord,
+};
 
 use super::discover::discover_artifacts_for_source;
 use super::{StagingGuard, nonce, remote_for, resolved_remotes};
@@ -54,70 +56,25 @@ pub fn rebuild_registry(
                         binding.source
                     ))
                 })?;
-            let commit = &locked.commit;
-            let git = remote_for(&remotes, binding.source)?;
-            let source_name = SourceName::trusted(binding.source);
             let selection = Selection::new(binding.include, binding.exclude)?;
             selections.push(selection.clone());
-            let policy = source.export_policy();
-            let discovered = discover_artifacts_for_source(
-                source,
-                git,
-                &source_name,
-                commit,
-                backend,
-                &selection,
-                binding.root,
+
+            rebuild_binding(
+                &BindingRun {
+                    config,
+                    target_name,
+                    target,
+                    backend,
+                    registry,
+                    binding: &binding,
+                    source,
+                    commit: &locked.commit,
+                    git: remote_for(&remotes, binding.source)?,
+                    selection: &selection,
+                },
+                &mut managed,
+                &mut report,
             )?;
-
-            for artifact in discovered {
-                let key = ArtifactKey {
-                    target: target_name.clone(),
-                    source: binding.identity.to_owned(),
-                    artifact: artifact.as_str().to_owned(),
-                };
-                let artifact_dst = target.expanded_path().join(
-                    target
-                        .layout()
-                        .artifact_path(binding.identity, artifact.as_str()),
-                );
-
-                match source.deploy_mode() {
-                    DeployMode::Link => {
-                        rebuild_linked(
-                            registry,
-                            binding.source,
-                            &policy,
-                            target.layout().kind,
-                            key,
-                            &mut report,
-                        )?;
-                    }
-                    DeployMode::Copy => rebuild_one(RebuildOne {
-                        backend,
-                        registry,
-                        git,
-                        source_name: &source_name,
-                        underlying_source: binding.source,
-                        root: binding.root,
-                        commit,
-                        selection: &selection,
-                        policy: &policy,
-                        artifact: &artifact,
-                        artifact_dst: &artifact_dst,
-                        layout_kind: target.layout().kind,
-                        key,
-                        report: &mut report,
-                        template_opt_in: &binding.template_opt_in,
-                        vars: &config.vars,
-                    })?,
-                }
-
-                managed
-                    .entry(binding.identity.to_owned())
-                    .or_default()
-                    .insert(artifact.as_str().to_owned());
-            }
         }
 
         report
@@ -126,6 +83,113 @@ pub fn rebuild_registry(
     }
 
     Ok(report)
+}
+
+struct BindingRun<'a> {
+    config: &'a Config,
+    target_name: &'a str,
+    target: &'a Target,
+    backend: &'a dyn SourceBackend,
+    registry: &'a dyn Registry,
+    binding: &'a crate::config::ResolvedBinding<'a>,
+    source: &'a crate::config::ParsedSource,
+    commit: &'a str,
+    git: &'a str,
+    selection: &'a Selection,
+}
+
+fn rebuild_binding(
+    run: &BindingRun<'_>,
+    managed: &mut BTreeMap<String, BTreeSet<String>>,
+    report: &mut RebuildReport,
+) -> Result<()> {
+    let source_name = SourceName::trusted(run.binding.source);
+    let policy = run.source.export_policy();
+
+    let reconstruct = |artifact: &ArtifactName,
+                       mapped_source_key: Option<&str>,
+                       managed: &mut BTreeMap<String, BTreeSet<String>>,
+                       report: &mut RebuildReport|
+     -> Result<()> {
+        let key = ArtifactKey {
+            target: run.target_name.to_owned(),
+            source: run.binding.identity.to_owned(),
+            artifact: artifact.as_str().to_owned(),
+        };
+        let artifact_dst = if mapped_source_key.is_some() {
+            run.target.expanded_path().join(artifact.as_str())
+        } else {
+            run.target.expanded_path().join(
+                run.target
+                    .layout()
+                    .artifact_path(run.binding.identity, artifact.as_str()),
+            )
+        };
+
+        match run.source.deploy_mode() {
+            DeployMode::Link => rebuild_linked(
+                run.registry,
+                run.binding.source,
+                &policy,
+                run.target.layout().kind,
+                mapped_source_key.is_some(),
+                key,
+                report,
+            )?,
+            DeployMode::Copy => rebuild_one(RebuildOne {
+                backend: run.backend,
+                registry: run.registry,
+                git: run.git,
+                source_name: &source_name,
+                underlying_source: run.binding.source,
+                root: run.binding.root,
+                commit: run.commit,
+                selection: run.selection,
+                policy: &policy,
+                artifact,
+                artifact_dst: &artifact_dst,
+                layout_kind: run.target.layout().kind,
+                mapped_source_key,
+                key,
+                report,
+                template_opt_in: &run.binding.template_opt_in,
+                vars: &run.config.vars,
+            })?,
+        }
+
+        managed
+            .entry(run.binding.identity.to_owned())
+            .or_default()
+            .insert(artifact.as_str().to_owned());
+        Ok(())
+    };
+
+    if let Some(map) = run.binding.map {
+        for (key, dest) in map {
+            reconstruct(
+                &ArtifactName::trusted(dest.as_str()),
+                Some(key.as_str()),
+                managed,
+                report,
+            )?;
+        }
+        return Ok(());
+    }
+
+    let discovered = discover_artifacts_for_source(
+        run.source,
+        run.git,
+        &source_name,
+        run.commit,
+        run.backend,
+        run.selection,
+        run.binding.root,
+    )?;
+
+    for artifact in discovered {
+        reconstruct(&artifact, None, managed, report)?;
+    }
+    Ok(())
 }
 
 struct RebuildOne<'a> {
@@ -141,6 +205,7 @@ struct RebuildOne<'a> {
     artifact: &'a ArtifactName,
     artifact_dst: &'a Path,
     layout_kind: LayoutKind,
+    mapped_source_key: Option<&'a str>,
     key: ArtifactKey,
     report: &'a mut RebuildReport,
     template_opt_in: &'a TemplateOptIn,
@@ -161,6 +226,7 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         artifact,
         artifact_dst,
         layout_kind,
+        mapped_source_key,
         key,
         report,
         template_opt_in,
@@ -170,6 +236,9 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
     let staging_base = std::env::temp_dir().join("phora-rebuild");
     let staging = staging_base.join(format!("{artifact}-{}-{}", std::process::id(), nonce()));
     let _guard = StagingGuard::new(&staging_base, &staging);
+
+    let path_map = mapped_source_key
+        .map(|key| BTreeMap::from([(PathBuf::from(key), PathBuf::from(artifact.as_str()))]));
 
     let commit_time = backend.commit_time(source_name, git, commit)?;
     let export = backend.export_artifact(&ExportRequest {
@@ -184,13 +253,19 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         commit_time,
         template_opt_in,
         vars,
-        path_map: None,
+        path_map: path_map.as_ref(),
     })?;
+
+    let manifest_base = if mapped_source_key.is_some() {
+        artifact_dst.parent().unwrap_or(artifact_dst)
+    } else {
+        artifact_dst
+    };
 
     let mut modified = false;
     let mut files = Vec::with_capacity(export.files.len());
     for mf in export.files {
-        let on_disk = artifact_dst.join(&mf.path);
+        let on_disk = manifest_base.join(&mf.path);
         let (size, mtime) = if let Some(actual) = disk_hash(&on_disk)? {
             if actual.hash != mf.blake3 {
                 modified = true;
@@ -213,7 +288,11 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         underlying_source,
         commit,
         digest: export.digest,
-        layout: format!("{layout_kind:?}").to_lowercase(),
+        layout: if mapped_source_key.is_some() {
+            MAP_LAYOUT.to_owned()
+        } else {
+            format!("{layout_kind:?}").to_lowercase()
+        },
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
         files,
@@ -234,6 +313,7 @@ fn rebuild_linked(
     underlying_source: &str,
     policy: &crate::source::ExportPolicy,
     layout_kind: LayoutKind,
+    is_mapped: bool,
     key: ArtifactKey,
     report: &mut RebuildReport,
 ) -> Result<()> {
@@ -244,7 +324,11 @@ fn rebuild_linked(
         commit: "link".to_owned(),
         digest: "link:".to_owned(),
         projected_at: chrono::Utc::now().to_rfc3339(),
-        layout: format!("{layout_kind:?}").to_lowercase(),
+        layout: if is_mapped {
+            MAP_LAYOUT.to_owned()
+        } else {
+            format!("{layout_kind:?}").to_lowercase()
+        },
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
         files: vec![],
