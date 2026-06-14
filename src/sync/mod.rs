@@ -23,6 +23,7 @@ pub use verify::{VerifyMismatch, VerifyReason, verify};
 
 use prune::prune_orphans;
 use resolve::resolve_sources;
+pub(crate) use target::record_artifact_path;
 use target::{TargetRun, deploy_target};
 
 #[cfg(test)]

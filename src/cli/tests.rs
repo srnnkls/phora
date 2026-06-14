@@ -1992,6 +1992,205 @@ fn list_statuses_groups_by_target_and_names_source_and_artifact() {
     );
 }
 
+// ── mapped-leaf observability (T8) ─────────────────────────────
+
+/// Single file at `<target_dir>/<dest>` (no artifact dir) with size+mtime matched to disk so the mapped record reads Clean.
+fn deploy_mapped_file(target_dir: &Path, dest: &str, content: &[u8]) -> ManifestFile {
+    let path = target_dir.join(dest);
+    std::fs::write(&path, content).expect("write mapped dest file");
+    let meta = std::fs::metadata(&path).expect("stat mapped dest file");
+    let mtime = meta
+        .modified()
+        .expect("mtime")
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after epoch")
+        .as_secs();
+    ManifestFile {
+        path: PathBuf::from(dest),
+        size: meta.len(),
+        mtime,
+        blake3: blake3::hash(content).to_hex().to_string(),
+    }
+}
+
+fn mapped_record(
+    target: &str,
+    source: &str,
+    dest: &str,
+    commit: &str,
+    files: Vec<ManifestFile>,
+) -> RegistryRecord {
+    RegistryRecord {
+        version: 1,
+        key: ArtifactKey {
+            target: target.to_owned(),
+            source: source.to_owned(),
+            artifact: dest.to_owned(),
+        },
+        source: source.to_owned(),
+        commit: commit.to_owned(),
+        digest: "blake3:map".to_owned(),
+        projected_at: "2026-01-31T12:34:56Z".to_owned(),
+        layout: crate::store::MAP_LAYOUT.to_owned(),
+        allow_symlinks: false,
+        preserve_executable: true,
+        files,
+        linked: false,
+        vars_digest: None,
+    }
+}
+
+fn config_one_by_source_target(target: &str, source: &str, target_path: &Path) -> Config {
+    let toml = format!(
+        "version = 1\n\n\
+             [sources.{source}]\ngit = \"https://example.com/x.git\"\nbranch = \"main\"\n\n\
+             [targets.{target}]\npath = \"{}\"\nsources = [\"{source}\"]\nlayout = \"by-source\"\n",
+        target_path.display(),
+    );
+    Config::parse(&toml).expect("one-target by-source config parses")
+}
+
+#[test]
+fn where_resolves_a_mapped_record_under_its_dest_name() {
+    let dir = TempDir::new().expect("state root");
+    let reg = FileRegistry::open(dir.path().to_path_buf()).expect("open registry");
+    reg.put(&mapped_record(
+        "dest",
+        "fzf-src",
+        "fzf.zsh",
+        "aaa111",
+        vec![ManifestFile {
+            path: PathBuf::from("fzf.zsh"),
+            size: 10,
+            mtime: 1,
+            blake3: "x".to_owned(),
+        }],
+    ))
+    .expect("seed mapped record");
+
+    let filter = WhereFilter {
+        artifact: Some("fzf.zsh".to_owned()),
+        ..WhereFilter::default()
+    };
+    let matches = where_cmd(&reg, &filter).expect("where by mapped dest");
+
+    let m = find(&matches, "fzf-src", "fzf.zsh")
+        .expect("a mapped record must resolve under its dest name fzf.zsh");
+    assert_eq!(
+        m.targets,
+        vec!["dest".to_owned()],
+        "the mapped record must report the target it lands in, got {:?}",
+        m.targets
+    );
+}
+
+#[test]
+fn list_statuses_reports_mapped_dest_path_without_layout_leak() {
+    let state_dir = TempDir::new().expect("state root");
+    let reg = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let target_root = TempDir::new().expect("target root");
+    let cfg = config_one_by_source_target("dest", "fzf-src", target_root.path());
+
+    let mf = deploy_mapped_file(target_root.path(), "fzf.zsh", b"# fzf\n");
+    reg.put(&mapped_record(
+        "dest",
+        "fzf-src",
+        "fzf.zsh",
+        "aaa111",
+        vec![mf],
+    ))
+    .expect("seed mapped record");
+
+    let listings = list_statuses(&cfg, &reg).expect("list statuses");
+
+    let st = status_for(&listings, "dest", "fzf.zsh")
+        .expect("the mapped artifact must appear under target dest by its dest name");
+    assert_eq!(
+        st.source, "fzf-src",
+        "the mapped status row must carry its source"
+    );
+    assert!(
+        st.state.contains('✓') || st.state.to_lowercase().contains("clean"),
+        "the mapped dest file at target/<dest> must read Clean (✓) — a layout-derived \
+         path would miss it and read Missing, got {:?}",
+        st.state
+    );
+    assert!(
+        !st.state.to_lowercase().contains("missing"),
+        "a mapped record must NOT be reported Missing — the by-source layout must not \
+         leak onto the dest path, got {:?}",
+        st.state
+    );
+}
+
+#[test]
+fn eject_keeps_mapped_file_and_marks_record_ejected() {
+    let state_dir = TempDir::new().expect("state root");
+    let reg = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let target_root = TempDir::new().expect("target root");
+    let cfg = config_one_by_source_target("dest", "fzf-src", target_root.path());
+
+    let mf = deploy_mapped_file(target_root.path(), "fzf.zsh", b"# fzf\n");
+    reg.put(&mapped_record(
+        "dest",
+        "fzf-src",
+        "fzf.zsh",
+        "aaa111",
+        vec![mf],
+    ))
+    .expect("seed mapped record");
+
+    crate::sync::eject(&cfg, &reg, "fzf.zsh", "fzf-src", "dest").expect("eject mapped leaf");
+
+    assert!(
+        target_root.path().join("fzf.zsh").exists(),
+        "eject must keep the mapped dest file on disk"
+    );
+    let listings = list_statuses(&cfg, &reg).expect("list statuses after eject");
+    let st = status_for(&listings, "dest", "fzf.zsh")
+        .expect("an ejected mapped artifact must still be listed");
+    assert!(
+        st.state.to_lowercase().contains("ejected"),
+        "a mapped artifact in the target's ejected list must read Ejected, got {:?}",
+        st.state
+    );
+}
+
+#[test]
+fn uneject_round_trips_a_mapped_record_back_to_managed() {
+    let state_dir = TempDir::new().expect("state root");
+    let reg = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let target_root = TempDir::new().expect("target root");
+    let cfg = config_one_by_source_target("dest", "fzf-src", target_root.path());
+
+    let mf = deploy_mapped_file(target_root.path(), "fzf.zsh", b"# fzf\n");
+    reg.put(&mapped_record(
+        "dest",
+        "fzf-src",
+        "fzf.zsh",
+        "aaa111",
+        vec![mf],
+    ))
+    .expect("seed mapped record");
+
+    crate::sync::eject(&cfg, &reg, "fzf.zsh", "fzf-src", "dest").expect("eject mapped leaf");
+    crate::sync::uneject(&cfg, &reg, "fzf.zsh", "fzf-src", "dest").expect("uneject mapped leaf");
+
+    let listings = list_statuses(&cfg, &reg).expect("list statuses after uneject");
+    let st = status_for(&listings, "dest", "fzf.zsh")
+        .expect("an unejected mapped artifact must still be listed");
+    assert!(
+        !st.state.to_lowercase().contains("ejected"),
+        "uneject must clear the ejected mark — the mapped record reads as managed again, got {:?}",
+        st.state
+    );
+    assert!(
+        st.state.contains('✓') || st.state.to_lowercase().contains("clean"),
+        "after uneject the matching mapped dest file must read Clean (✓), got {:?}",
+        st.state
+    );
+}
+
 // ── resolution_from_char ───────────────────────────────────────
 
 #[test]
