@@ -3767,24 +3767,23 @@ fn effective_of(base: &Config, local: &Config) -> Config {
 }
 
 #[test]
-fn link_in_base_config_is_rejected_naming_the_source() {
+fn base_link_over_local_path_now_passes_the_guard() {
     let wt = build_worktree(None);
     let td = TargetDir::new();
-    // deploy = link committed in the BASE phora.toml over a LOCAL path: only the
-    // base-overlay provenance guard can reject it (the path is local).
+    // deploy = link committed in the BASE phora.toml over a LOCAL path. The
+    // committed-config rejection has been removed: a base-defined link over a
+    // local filesystem path is now a SUPPORTED configuration and must validate.
     let base = config_link_source_one_target("base-linked", wt.path(), &td.target_path());
 
     let base_parsed = base.parsed_sources().expect("sources parse");
     let remotes = resolved_remotes(&base, &base_parsed).expect("remotes resolve");
-    let Err(err) = validate_link_mode(&base, &base_parsed, &remotes) else {
-        panic!(
-            "deploy = \"link\" set in the committed base config must be rejected as a \
-                 non-local-overlay setting, not silently honored"
-        );
-    };
+    let warnings = validate_link_mode(&base, &base_parsed, &remotes).expect(
+        "deploy = \"link\" committed in the base config over a LOCAL path must now be \
+             accepted, not rejected as a committed-config violation",
+    );
     assert!(
-        err.to_string().contains("base-linked"),
-        "the guard error must name the offending source `base-linked`, got: {err}"
+        warnings.iter().all(|w| w.contains("base-linked")),
+        "any portability warning emitted must name the source `base-linked`, got: {warnings:?}"
     );
 }
 
@@ -3818,6 +3817,27 @@ fn remote_git_with_link_is_rejected_naming_the_source() {
     );
 }
 
+#[test]
+fn remote_link_in_base_config_still_errors_naming_the_source() {
+    let td = TargetDir::new();
+    let remote = std::path::Path::new("https://github.com/me/dotfiles.git");
+    let base = config_link_source_one_target("base-remote-link", remote, &td.target_path());
+
+    let parsed = base.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&base, &parsed).expect("remotes resolve");
+    let Err(err) = validate_link_mode(&base, &parsed, &remotes) else {
+        panic!(
+            "deploy = \"link\" on a remote-URL git must be rejected even when committed in \
+                 the base config; a remote has no working tree to symlink"
+        );
+    };
+    assert!(
+        err.to_string().contains("base-remote-link")
+            && err.to_string().contains("local filesystem path"),
+        "the local-path guard error must name the source and steer to a local path, got: {err}"
+    );
+}
+
 /// A local overlay downgrading `source` to `deploy = "copy"`, pointing at a target.
 fn local_copy_overlay(source: &str, git: &Path, target_path: &Path) -> Config {
     let toml = format!(
@@ -3831,11 +3851,9 @@ fn local_copy_overlay(source: &str, git: &Path, target_path: &Path) -> Config {
 }
 
 #[test]
-fn base_link_rejected_even_when_overlay_downgrades_to_copy() {
+fn base_link_downgraded_to_copy_locally_passes_with_no_warning() {
     let wt = build_worktree(None);
     let td = TargetDir::new();
-    // Base commits deploy = link over a LOCAL path (provenance is the only violation),
-    // then the overlay downgrades the same source to copy.
     let base = config_link_source_one_target("committed-link", wt.path(), &td.target_path());
     let local = local_copy_overlay("committed-link", wt.path(), &td.target_path());
     let effective = effective_of(&base, &local);
@@ -3847,16 +3865,12 @@ fn base_link_rejected_even_when_overlay_downgrades_to_copy() {
 
     let parsed = effective.parsed_sources().expect("sources parse");
     let remotes = resolved_remotes(&effective, &parsed).expect("remotes resolve");
-    let Err(err) = validate_link_mode(&base, &parsed, &remotes) else {
-        panic!(
-            "deploy = \"link\" committed in the base config must be rejected REGARDLESS of a \
-                 local overlay downgrading the source to copy"
-        );
-    };
+    let warnings = validate_link_mode(&base, &parsed, &remotes)
+        .expect("a base link locally downgraded to copy must pass validation, not error");
     assert!(
-        err.to_string().contains("committed-link"),
-        "the base-provenance guard error must name the offending source `committed-link`, \
-             got: {err}"
+        warnings.is_empty(),
+        "no portability warning may fire when the EFFECTIVE mode is Copy, even though \
+             the source is base-defined over an absolute path, got: {warnings:?}"
     );
 }
 
@@ -3876,9 +3890,192 @@ fn link_only_in_local_overlay_passes_the_guard() {
 
     let parsed = effective.parsed_sources().expect("sources parse");
     let remotes = resolved_remotes(&effective, &parsed).expect("remotes resolve");
-    validate_link_mode(&base, &parsed, &remotes).expect(
-        "a link confined to phora.local.toml over a local path must pass both the \
-             base-overlay and local-path guards",
+    let _warnings = validate_link_mode(&base, &parsed, &remotes).expect(
+        "a link confined to phora.local.toml over a local path must pass the local-path guard",
+    );
+}
+
+/// Negative-provenance control: a base with no sources, so a base-defined-source trigger flips off.
+fn empty_base() -> Config {
+    Config::parse("version = 1\n").expect("empty base parses")
+}
+
+#[test]
+fn base_defined_link_over_absolute_path_warns_exactly_once() {
+    let wt = build_worktree(None);
+    let td = TargetDir::new();
+    assert!(
+        wt.path().is_absolute(),
+        "premise: the link source path must be absolute to trigger the portability warning"
+    );
+    let base = config_link_source_one_target("abs-link", wt.path(), &td.target_path());
+
+    let parsed = base.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&base, &parsed).expect("remotes resolve");
+    let warnings = validate_link_mode(&base, &parsed, &remotes)
+        .expect("a base link over an absolute local path is valid (non-fatal warning only)");
+    assert_eq!(
+        warnings.len(),
+        1,
+        "a base-defined link over an absolute path must emit EXACTLY one portability \
+             warning (no double-emit across the two validation passes), got: {warnings:?}"
+    );
+    assert!(
+        warnings[0].contains("abs-link"),
+        "the portability warning must name the source `abs-link`, got: {:?}",
+        warnings[0]
+    );
+
+    let control = validate_link_mode(&empty_base(), &parsed, &remotes)
+        .expect("the same effective link is valid against an empty base too");
+    assert!(
+        control.is_empty(),
+        "distinguishing trace: with the SAME effective link but no base-defined source, \
+             the warning must NOT fire — proving the trigger is base provenance, not incidental \
+             Vec length, got: {control:?}"
+    );
+}
+
+#[test]
+fn local_overlay_adds_link_to_base_source_warns_exactly_once() {
+    let wt = build_worktree(None);
+    let td = TargetDir::new();
+    assert!(
+        wt.path().is_absolute(),
+        "premise: the source path must be absolute to trigger the portability warning"
+    );
+    let base = base_copy_source("overlay-link", wt.path());
+    let local = local_link_overlay("overlay-link", wt.path(), &td.target_path());
+    let effective = effective_of(&base, &local);
+    assert_eq!(
+        parsed_of(&effective, "overlay-link").deploy_mode(),
+        DeployMode::Link,
+        "premise: the overlay must make the effective mode Link"
+    );
+
+    let parsed = effective.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&effective, &parsed).expect("remotes resolve");
+    let warnings = validate_link_mode(&base, &parsed, &remotes)
+        .expect("link added by the overlay onto a base-defined local source is valid");
+    assert_eq!(
+        warnings.len(),
+        1,
+        "a base-DEFINED source (even with deploy == None) whose effective mode is Link \
+             over an absolute path must warn exactly once, got: {warnings:?}"
+    );
+    assert!(
+        warnings[0].contains("overlay-link"),
+        "the portability warning must name the source `overlay-link`, got: {:?}",
+        warnings[0]
+    );
+
+    let control = validate_link_mode(&empty_base(), &parsed, &remotes)
+        .expect("same effective link is valid against an empty base");
+    assert!(
+        control.is_empty(),
+        "distinguishing trace: drop the source from the base and the warning must vanish, \
+             pinning base-defined-source-presence as the trigger, got: {control:?}"
+    );
+}
+
+#[test]
+fn link_source_only_in_local_overlay_does_not_warn() {
+    let wt = build_worktree(None);
+    let td = TargetDir::new();
+    assert!(
+        wt.path().is_absolute(),
+        "premise: an absolute path would warn IF the source were base-defined; it is not"
+    );
+    let base = empty_base();
+    let local = local_link_overlay("local-only-link", wt.path(), &td.target_path());
+    let effective = effective_of(&base, &local);
+    assert_eq!(
+        parsed_of(&effective, "local-only-link").deploy_mode(),
+        DeployMode::Link,
+        "premise: the effective mode is Link over an absolute path"
+    );
+    assert!(
+        !base.sources.contains_key("local-only-link"),
+        "premise: the source must NOT be base-defined"
+    );
+
+    let parsed = effective.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&effective, &parsed).expect("remotes resolve");
+    let warnings = validate_link_mode(&base, &parsed, &remotes)
+        .expect("a link source confined to the overlay over a local path is valid");
+    assert!(
+        warnings.is_empty(),
+        "a source defined ONLY in phora.local.toml is intentional and machine-specific; \
+             it must emit NO portability warning even over an absolute path, got: {warnings:?}"
+    );
+
+    let provenance_flip = validate_link_mode(&local, &parsed, &remotes)
+        .expect("same effective link is valid against a base that DOES define the source");
+    assert_eq!(
+        provenance_flip.len(),
+        1,
+        "distinguishing trace: feed a base that DOES define the source and the warning \
+             appears — confirming the empty-base result is provenance-driven, got: {provenance_flip:?}"
+    );
+}
+
+/// A base config with a `deploy = "link"` source whose `git` is the literal
+/// `"."` — a LOCAL path (`Path::new(".").exists()`) that is NOT absolute. The
+/// target lives in the same config so the effective mode is Link.
+fn config_link_source_dot_git(source: &str, target_path: &Path) -> Config {
+    let toml = format!(
+        "version = 1\n\n\
+             [sources.{source}]\ngit = \".\"\nbranch = \"main\"\ndeploy = \"link\"\n\n\
+             [targets.dest]\npath = \"{}\"\nsources = [\"{source}\"]\nlayout = \"by-source\"\n",
+        target_path.display(),
+    );
+    Config::parse(&toml).expect("dot-git link-source config parses")
+}
+
+#[test]
+fn base_link_over_non_absolute_local_path_emits_no_warning() {
+    let td = TargetDir::new();
+    // `git = "."` resolves to the local-but-non-absolute remote `"."` (passes the
+    // remote-rejection guard, yet is_absolute() is false) — the warning gate under test.
+    let base = config_link_source_dot_git("dot-link", &td.target_path());
+
+    let parsed = base.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&base, &parsed).expect("remotes resolve");
+    assert!(
+        !std::path::Path::new(&remotes["dot-link"]).is_absolute(),
+        "premise: the resolved remote for `git = \".\"` must be NON-absolute so this \
+             test exercises the is_absolute == false branch, got: {:?}",
+        remotes["dot-link"]
+    );
+    assert_eq!(
+        parsed_of(&base, "dot-link").deploy_mode(),
+        DeployMode::Link,
+        "premise: the effective deploy mode must be Link"
+    );
+
+    let warnings = validate_link_mode(&base, &parsed, &remotes)
+        .expect("a base-defined link over a LOCAL non-absolute path is valid and non-fatal");
+    assert!(
+        warnings.is_empty(),
+        "the portability warning is gated on an ABSOLUTE path; a base-defined link over a \
+             NON-absolute local path must emit ZERO warnings, got: {warnings:?}"
+    );
+
+    let wt = build_worktree(None);
+    assert!(
+        wt.path().is_absolute(),
+        "premise: control path must be absolute"
+    );
+    let abs_base = config_link_source_one_target("dot-link", wt.path(), &td.target_path());
+    let abs_parsed = abs_base.parsed_sources().expect("sources parse");
+    let abs_remotes = resolved_remotes(&abs_base, &abs_parsed).expect("remotes resolve");
+    let abs_warnings = validate_link_mode(&abs_base, &abs_parsed, &abs_remotes)
+        .expect("a base link over an absolute local path is valid (warning only)");
+    assert_eq!(
+        abs_warnings.len(),
+        1,
+        "distinguishing trace: flip the SAME base-defined link source to an ABSOLUTE path \
+             and the warning fires exactly once, pinning is_absolute as the gate, got: {abs_warnings:?}"
     );
 }
 

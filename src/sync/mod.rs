@@ -168,7 +168,9 @@ pub fn sync(
     effective_config.validate()?;
     let parsed = effective_config.parsed_sources()?;
     let remotes = resolved_remotes(&effective_config, &parsed)?;
-    validate_link_mode(input.base_config, &parsed, &remotes)?;
+    for warning in validate_link_mode(input.base_config, &parsed, &remotes)? {
+        eprintln!("phora: {warning}");
+    }
     let effective_lock = match (&input.base_lock, &input.local_lock) {
         (Some(base), local) => Some(merge_locks(base, local.as_ref())),
         (None, Some(local)) => Some(local.clone()),
@@ -259,25 +261,27 @@ fn validate_link_mode(
     base: &Config,
     effective: &BTreeMap<String, ParsedSource>,
     remotes: &BTreeMap<String, String>,
-) -> Result<()> {
-    for (name, source) in &base.sources {
-        if source.deploy == Some(DeployMode::Link) {
-            return Err(Error::Config(format!(
-                "source `{name}`: deploy = \"link\" is only allowed in phora.local.toml, \
-                 not the committed config"
-            )));
-        }
-    }
+) -> Result<Vec<String>> {
+    let mut warnings = Vec::new();
     for (name, source) in effective {
+        if source.deploy_mode() != DeployMode::Link {
+            continue;
+        }
         let git = remote_for(remotes, name)?;
-        if source.deploy_mode() == DeployMode::Link && !is_local_path(git) {
+        if !is_local_path(git) {
             return Err(Error::Config(format!(
                 "source `{name}`: deploy = \"link\" requires a local filesystem path, \
                  not a remote URL `{git}`"
             )));
         }
+        if base.sources.contains_key(name) && Path::new(git).is_absolute() {
+            warnings.push(format!(
+                "source `{name}`: deploy = \"link\" uses the absolute path `{git}`, \
+                 which is not portable across machines"
+            ));
+        }
     }
-    Ok(())
+    Ok(warnings)
 }
 
 /// Removes a half-exported `staging` dir on drop unless [`disarm`](StagingGuard::disarm)
