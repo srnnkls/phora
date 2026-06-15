@@ -226,6 +226,31 @@ pub(crate) fn mirror_path(git_dir: &Path, url: &str) -> PathBuf {
     git_dir.join(format!("{}.git", key.as_str()))
 }
 
+pub(crate) fn mirror_lock_path(git_dir: &Path, url: &str) -> PathBuf {
+    let mut s = mirror_path(git_dir, url).into_os_string();
+    s.push(".lock");
+    PathBuf::from(s)
+}
+
+pub(crate) fn lock_mirror(
+    git_dir: &Path,
+    source: &SourceName,
+    url: &str,
+) -> Result<std::fs::File> {
+    std::fs::create_dir_all(git_dir)
+        .map_err(|e| SourceError::Source(format!("create git dir for lock {source}: {e}")))?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(mirror_lock_path(git_dir, url))
+        .map_err(|e| SourceError::Source(format!("open mirror lock {source}: {e}")))?;
+    lock.lock()
+        .map_err(|e| SourceError::Source(format!("lock mirror {source}: {e}")))?;
+    Ok(lock)
+}
+
 pub struct GitBackend {
     git_dir: PathBuf,
 }
@@ -239,33 +264,11 @@ impl GitBackend {
     fn mirror_path(&self, url: &str) -> PathBuf {
         mirror_path(&self.git_dir, url)
     }
-
-    fn mirror_lock_path(&self, url: &str) -> PathBuf {
-        let mut s = self.mirror_path(url).into_os_string();
-        s.push(".lock");
-        PathBuf::from(s)
-    }
-
-    fn lock_mirror(&self, source: &SourceName, url: &str) -> Result<std::fs::File> {
-        std::fs::create_dir_all(&self.git_dir).map_err(|e| {
-            SourceError::Source(format!("create git dir for lock {source}: {e}"))
-        })?;
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(self.mirror_lock_path(url))
-            .map_err(|e| SourceError::Source(format!("open mirror lock {source}: {e}")))?;
-        lock.lock()
-            .map_err(|e| SourceError::Source(format!("lock mirror {source}: {e}")))?;
-        Ok(lock)
-    }
 }
 
 impl SourceBackend for GitBackend {
     fn fetch(&self, source: &SourceName, url: &str) -> Result<()> {
-        let _lock = self.lock_mirror(source, url)?;
+        let _lock = lock_mirror(&self.git_dir, source, url)?;
         let mirror = self.mirror_path(url);
 
         if mirror.exists() {
@@ -694,6 +697,7 @@ impl SourceBackend for HttpBackend {
         }
 
         let entries = crate::archive::extract(&temp.path, url)?;
+        let _lock = lock_mirror(&self.git_dir, source, url)?;
         import_tree(&self.git_dir, url, &entries)?;
         Ok(())
     }
@@ -4093,6 +4097,110 @@ path = "srnnkls/tropos"
                 blob.data, HELLO_BODY,
                 "the downloaded-extracted-imported hello.txt blob must equal `hi`"
             );
+        }
+
+        // ---- MIRROR-LOCK-002: HttpBackend::fetch takes the SAME per-mirror flock ----
+
+        use std::path::PathBuf;
+        use std::sync::mpsc;
+
+        /// Derived independently from `mirror_path` so the test fails if the impl
+        /// picks a different naming; MUST equal `GitBackend`'s per-mirror lock path.
+        fn mirror_lock_path(git_dir: &Path, url: &str) -> PathBuf {
+            let mut s = mirror_path(git_dir, url).into_os_string();
+            s.push(".lock");
+            PathBuf::from(s)
+        }
+
+        fn hold_mirror_lock(path: &Path) -> std::fs::File {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("create git_dir for lock");
+            }
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(path)
+                .expect("open per-mirror lock file");
+            file.try_lock().expect("test acquires the mirror lock first");
+            file
+        }
+
+        #[test]
+        fn http_fetch_blocks_on_held_per_mirror_lock_then_succeeds_when_released() {
+            let server = TarServer::spawn(build_pkg_tar_gz());
+            let url = server.url();
+            let git_dir = TempDir::new().expect("git_dir tempdir");
+            let git_dir_path = git_dir.path().to_path_buf();
+
+            let lock_path = mirror_lock_path(&git_dir_path, &url);
+            let held = hold_mirror_lock(&lock_path);
+
+            let (tx, rx) = mpsc::channel();
+            let backend = HttpBackend::new(git_dir_path.clone(), BTreeMap::new());
+            let url_for_thread = url.clone();
+            let worker = std::thread::spawn(move || {
+                let result = backend.fetch(&sn("pkg"), &url_for_thread);
+                tx.send(result).expect("send fetch result");
+            });
+
+            assert!(
+                rx.recv_timeout(Duration::from_millis(750)).is_err(),
+                "HttpBackend::fetch must BLOCK while the per-mirror lock is held; it \
+                 completed within the window, so it took no blocking lock on {} \
+                 around its shared-mirror import",
+                lock_path.display()
+            );
+
+            drop(held);
+
+            let result = rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("http fetch must complete promptly once the mirror lock is released");
+            worker.join().expect("fetch thread joins");
+            result.expect("http fetch succeeds after waiting for the lock (blocking, not error)");
+
+            let mirror = mirror_path(&git_dir_path, &url);
+            let repo = gix::open(&mirror).expect("the serialized fetch leaves a valid mirror");
+            assert!(
+                repo.find_reference("refs/heads/phora").is_ok(),
+                "the serialized http fetch must populate refs/heads/phora"
+            );
+        }
+
+        #[test]
+        fn http_holding_one_mirror_lock_does_not_block_fetch_of_a_different_mirror() {
+            let server_a = TarServer::spawn(build_pkg_tar_gz());
+            let server_b = TarServer::spawn(build_pkg_tar_gz());
+            let url_a = server_a.url();
+            let url_b = server_b.url();
+            let git_dir = TempDir::new().expect("git_dir tempdir");
+            let git_dir_path = git_dir.path().to_path_buf();
+
+            assert_ne!(
+                mirror_path(&git_dir_path, &url_a),
+                mirror_path(&git_dir_path, &url_b),
+                "the two urls must map to distinct mirrors for this test to mean anything"
+            );
+
+            let held_a = hold_mirror_lock(&mirror_lock_path(&git_dir_path, &url_a));
+
+            let (tx, rx) = mpsc::channel();
+            let backend = HttpBackend::new(git_dir_path.clone(), BTreeMap::new());
+            let worker = std::thread::spawn(move || {
+                let result = backend.fetch(&sn("pkgb"), &url_b);
+                tx.send(result).expect("send fetch-b result");
+            });
+
+            let result = rx.recv_timeout(Duration::from_secs(10)).expect(
+                "fetching a DIFFERENT mirror must not block on mirror A's lock; \
+                 the per-mirror lock must be keyed per MirrorKey",
+            );
+            worker.join().expect("fetch-b thread joins");
+            result.expect("http fetch of mirror B succeeds while A's lock is held");
+
+            drop(held_a);
         }
     }
 }
