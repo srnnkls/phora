@@ -1,0 +1,57 @@
+amends "package://github.com/jdx/hk/releases/download/v1.47.0/hk@1.47.0#/Config.pkl"
+
+local rustGlob = List("src/**/*.rs", "tests/**/*.rs", "build.rs", "Cargo.toml", "Cargo.lock")
+local scrutGlob = List("src/**/*.rs", "tests/scrut/*.md", "tests/scrut/_setup.sh", "Cargo.toml", "Cargo.lock")
+
+// CI job `lint-test` step `mise run lint`: rustfmt check + clippy (warnings as errors).
+local fast = new Mapping<String, Step> {
+  ["fmt"] {
+    glob = rustGlob
+    check = "cargo fmt --check"
+    fix = "cargo fmt"
+  }
+  ["clippy"] {
+    glob = rustGlob
+    check = "cargo clippy --all-targets -- -D warnings"
+  }
+}
+
+// CI job `lint-test` step `mise run test`, plus CI job `integration` (`mise run test-integration`).
+local heavy = new Mapping<String, Step> {
+  ["test"] {
+    glob = rustGlob
+    check = "cargo test"
+  }
+  ["integration"] {
+    glob = scrutGlob
+    check = "mise run test-integration"
+  }
+}
+
+hooks {
+  ["pre-commit"] {
+    fix = true
+    stage = true
+    fail_on_fix = true
+    stash = "git"
+    steps = new { ...fast }
+  }
+  ["pre-push"] {
+    steps = new {
+      ...fast
+      ...heavy
+    }
+  }
+  ["check"] {
+    steps = new {
+      ...fast
+      ...heavy
+    }
+  }
+  ["fix"] {
+    fix = true
+    steps {
+      ["fmt"] = (fast["fmt"]) { check = null }
+    }
+  }
+}
