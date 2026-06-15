@@ -33,10 +33,12 @@ hooks {
     fix = true
     stage = true
     fail_on_fix = true
-    stash = "git"
+    // cargo checks read disk not index; stash's --include-untracked path corrupted the worktree.
+    stash = "none"
     steps = new { ...fast }
   }
   ["pre-push"] {
+    stash = "none"
     steps = new {
       ...fast
       ...heavy
