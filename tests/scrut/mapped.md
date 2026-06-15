@@ -123,9 +123,9 @@ Artifact: dotfiles/NEW.md (commit ca94c83b, digest blake3:dd02771b145c70dd7166e6
 ## Link mode — dest is a symlink to the source leaf
 
 A source flipped to `deploy = "link"` in `phora.local.toml` links its mapped leaf in
-place rather than copying it. The committed config carries the mapped binding (a
-committed config may not carry `deploy = "link"` — phora restricts it to the local
-overlay); the overlay flips the source.
+place rather than copying it. The committed config carries the mapped binding with an
+absolute source path; activating link mode on that committed absolute path emits a
+non-fatal portability warning, then sync proceeds.
 
 ```scrut
 $ cd "$ROOT" && mkdir -p link && cd link && isolate_state && repo="$(make_git_source dotfiles)" && mkdir -p target-home && cat > phora.toml <<EOF && cat > phora.local.toml <<EOF2 && phora sync 2>&1 | normalize
@@ -144,6 +144,7 @@ $ cd "$ROOT" && mkdir -p link && cd link && isolate_state && repo="$(make_git_so
 > branch = "main"
 > deploy = "link"
 > EOF2
+phora: source `dotfiles`: deploy = "link" uses the absolute path `<ROOT>/src-dotfiles`, which is not portable across machines
 sync complete
 ```
 
@@ -300,6 +301,7 @@ home
 
 ```scrut
 $ phora sync 2>&1 | normalize
+phora: source `dotfiles`: deploy = "link" uses the absolute path `<ROOT>/src-dotfiles`, which is not portable across machines
 sync complete
 ```
 
