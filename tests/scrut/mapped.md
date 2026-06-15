@@ -195,7 +195,6 @@ configured
 ```scrut
 $ phora sync 2>&1
 error: artifact `DUP.md` collides in target `home` from sources: ["dotfiles", "two"]
-Error: Collision { artifact: "DUP.md", sources: ["dotfiles", "two"], target: "home" }
 [1]
 ```
 

@@ -232,11 +232,7 @@ pub(crate) fn mirror_lock_path(git_dir: &Path, url: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-pub(crate) fn lock_mirror(
-    git_dir: &Path,
-    source: &SourceName,
-    url: &str,
-) -> Result<std::fs::File> {
+pub(crate) fn lock_mirror(git_dir: &Path, source: &SourceName, url: &str) -> Result<std::fs::File> {
     std::fs::create_dir_all(git_dir)
         .map_err(|e| SourceError::Source(format!("create git dir for lock {source}: {e}")))?;
     let lock = std::fs::OpenOptions::new()
@@ -1099,8 +1095,8 @@ pub(crate) fn import_tree(
     let mirror = mirror_path(git_dir, url);
 
     if mirror.exists() {
-        let repo =
-            gix::open(&mirror).map_err(|e| SourceError::Source(format!("open mirror {url}: {e}")))?;
+        let repo = gix::open(&mirror)
+            .map_err(|e| SourceError::Source(format!("open mirror {url}: {e}")))?;
         return write_import(&repo, url, entries);
     }
 
@@ -2112,7 +2108,8 @@ mod tests {
             .truncate(false)
             .open(path)
             .expect("open per-mirror lock file");
-        file.try_lock().expect("test acquires the mirror lock first");
+        file.try_lock()
+            .expect("test acquires the mirror lock first");
         file
     }
 
@@ -4194,7 +4191,8 @@ path = "srnnkls/tropos"
                 .truncate(false)
                 .open(path)
                 .expect("open per-mirror lock file");
-            file.try_lock().expect("test acquires the mirror lock first");
+            file.try_lock()
+                .expect("test acquires the mirror lock first");
             file
         }
 

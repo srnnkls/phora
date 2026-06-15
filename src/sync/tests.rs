@@ -10551,8 +10551,11 @@ fn serial_and_parallel_runs_produce_identical_lock_and_registry() {
             .map(|r| (r.key, r.commit, r.digest))
             .collect();
         records.sort_by(|a, b| {
-            (&a.0.target, &a.0.source, &a.0.artifact)
-                .cmp(&(&b.0.target, &b.0.source, &b.0.artifact))
+            (&a.0.target, &a.0.source, &a.0.artifact).cmp(&(
+                &b.0.target,
+                &b.0.source,
+                &b.0.artifact,
+            ))
         });
         (lock_toml, records)
     };
