@@ -63,6 +63,9 @@ pub struct SyncInput<'a> {
     pub prune: bool,
     pub no_hooks: bool,
     pub resolver: Option<&'a dyn ConflictResolver>,
+    /// Worker-pool size for parallel fetch/resolve/digest. `None` derives a
+    /// default of `min(resolution_units, 8)`; `Some(n)` pins the pool to `n`.
+    pub jobs: Option<usize>,
 }
 
 /// How the user wants a single Modified/Foreign conflict handled.
@@ -161,7 +164,7 @@ pub(super) fn nonce() -> u64 {
 
 pub fn sync(
     input: &SyncInput<'_>,
-    backend: &dyn SourceBackend,
+    backend: &(dyn SourceBackend + Sync),
     registry: &dyn Registry,
 ) -> Result<SyncOutput> {
     let effective_config = merge_configs(input.base_config.clone(), input.local_config.cloned());
@@ -199,6 +202,7 @@ pub fn sync(
         effective_lock.as_ref(),
         backend,
         input.force,
+        input.jobs,
     )?;
     let (base_lock, local_lock) = split_locks(routed, &local_names);
 

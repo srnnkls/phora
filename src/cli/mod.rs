@@ -100,6 +100,8 @@ pub enum Command {
         force: bool,
         #[arg(long)]
         no_hooks: bool,
+        #[arg(long, short = 'j')]
+        jobs: Option<usize>,
     },
     /// Bump the lock to latest, then sync.
     Update { source: Option<String> },
@@ -267,7 +269,8 @@ pub fn run(cli: Cli) -> Result<()> {
             prune,
             force,
             no_hooks,
-        } => sync::run_sync(prune, force, no_hooks, None),
+            jobs,
+        } => sync::run_sync(prune, force, no_hooks, None, jobs),
         Command::Update { source } => sync::run_update(source.as_deref()),
         Command::List { plan } => query::run_list(plan),
         Command::Verify => {

@@ -18,6 +18,7 @@ pub(super) fn run_sync(
     force: bool,
     no_hooks: bool,
     drop: Option<DropSources>,
+    jobs: Option<usize>,
 ) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let base = load_config()?;
@@ -47,6 +48,7 @@ pub(super) fn run_sync(
             prune,
             no_hooks,
             resolver: interactive.then_some(&resolver as &dyn ConflictResolver),
+            jobs,
         },
         &backend,
         &registry,
@@ -123,7 +125,7 @@ pub(super) fn run_rebuild_registry() -> Result<()> {
 
 pub(super) fn run_update(source: Option<&str>) -> Result<()> {
     let drop = source.map_or(DropSources::All, |s| DropSources::One(s.to_owned()));
-    run_sync(false, false, false, Some(drop))
+    run_sync(false, false, false, Some(drop), None)
 }
 
 /// Writes the base lock to `<dir>/phora.lock` and, when `local` is `Some`, the
