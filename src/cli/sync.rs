@@ -32,6 +32,7 @@ pub(super) fn run_sync(
     let effective = crate::config::merge_configs(base.clone(), local.clone());
     let backend = build_router(&effective, cache_root()?.join("git"))?;
     let registry = open_project_registry()?;
+    let _guard = registry.lock_exclusive()?;
     let interactive = std::io::stdin().is_terminal();
     let resolver = TtyResolver;
 
@@ -86,6 +87,10 @@ pub(super) fn run_rebuild_registry() -> Result<()> {
     let local = load_local_config(&cwd)?;
     let config = crate::config::merge_configs(base, local);
     config.validate()?;
+
+    let registry = open_project_registry()?;
+    let _guard = registry.lock_exclusive()?;
+
     let (base_lock, local_lock) = load_locks(&cwd)?;
     let lock = match base_lock {
         Some(base) => merge_locks(&base, local_lock.as_ref()),
@@ -94,7 +99,6 @@ pub(super) fn run_rebuild_registry() -> Result<()> {
     };
 
     let backend = build_router(&config, cache_root()?.join("git"))?;
-    let registry = open_project_registry()?;
     let report = crate::sync::rebuild_registry(&config, &lock, &backend, &registry)?;
 
     println!("reconstructed {}", report.reconstructed.len());

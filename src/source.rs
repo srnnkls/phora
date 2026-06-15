@@ -1287,6 +1287,7 @@ mod tests {
         author_date: &str,
         committer_date: &str,
     ) -> std::process::Output {
+        let _serial = crate::store::guard_git_fork();
         let out = Command::new("git")
             .args(args)
             .current_dir(cwd)
@@ -1388,23 +1389,29 @@ mod tests {
         run_git(src_path, &["checkout", "main"]);
         run_git(src_path, &["branch", "-D", "orphanbranch"]);
 
-        let is_ancestor_of_main = Command::new("git")
-            .args(["merge-base", "--is-ancestor", &orphan_sha, "main"])
-            .current_dir(src_path)
-            .status()
-            .unwrap()
-            .success();
+        let is_ancestor_of_main = {
+            let _serial = crate::store::guard_git_fork();
+            Command::new("git")
+                .args(["merge-base", "--is-ancestor", &orphan_sha, "main"])
+                .current_dir(src_path)
+                .status()
+                .unwrap()
+                .success()
+        };
         assert!(
             !is_ancestor_of_main,
             "orphan commit must be unreachable from main, else heads-only fetch could pull it incidentally"
         );
 
-        let is_ancestor_of_develop = Command::new("git")
-            .args(["merge-base", "--is-ancestor", &orphan_sha, "develop"])
-            .current_dir(src_path)
-            .status()
-            .unwrap()
-            .success();
+        let is_ancestor_of_develop = {
+            let _serial = crate::store::guard_git_fork();
+            Command::new("git")
+                .args(["merge-base", "--is-ancestor", &orphan_sha, "develop"])
+                .current_dir(src_path)
+                .status()
+                .unwrap()
+                .success()
+        };
         assert!(
             !is_ancestor_of_develop,
             "orphan commit must be unreachable from develop, else heads-only fetch could pull it incidentally"
@@ -3388,15 +3395,18 @@ path = "srnnkls/tropos"
         let key = MirrorKey::from_url(&NormalizedUrl::parse(IMPORT_URL));
         let mirror = dir.path().join(format!("{}.git", key.as_str()));
 
-        let out = Command::new("git")
-            .args([
-                "--git-dir",
-                mirror.to_str().expect("mirror path is utf8"),
-                "fsck",
-                "--strict",
-            ])
-            .output()
-            .expect("git fsck runs");
+        let out = {
+            let _serial = crate::store::guard_git_fork();
+            Command::new("git")
+                .args([
+                    "--git-dir",
+                    mirror.to_str().expect("mirror path is utf8"),
+                    "fsck",
+                    "--strict",
+                ])
+                .output()
+                .expect("git fsck runs")
+        };
 
         assert!(
             out.status.success(),
