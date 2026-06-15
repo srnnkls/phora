@@ -1,8 +1,9 @@
 use super::*;
 
-use std::cell::Cell;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use tempfile::TempDir;
 
@@ -146,55 +147,55 @@ impl SyncFixture {
 /// re-export (exports use deterministic mtimes, so an mtime check alone cannot).
 struct CountingBackend<'a> {
     inner: &'a GitBackend,
-    fetches: Cell<usize>,
-    resolves: Cell<usize>,
-    exports: Cell<usize>,
-    commit_times: Cell<usize>,
-    discovers: Cell<usize>,
-    digests: Cell<usize>,
+    fetches: AtomicUsize,
+    resolves: AtomicUsize,
+    exports: AtomicUsize,
+    commit_times: AtomicUsize,
+    discovers: AtomicUsize,
+    digests: AtomicUsize,
 }
 
 impl<'a> CountingBackend<'a> {
     fn new(inner: &'a GitBackend) -> Self {
         Self {
             inner,
-            fetches: Cell::new(0),
-            resolves: Cell::new(0),
-            exports: Cell::new(0),
-            commit_times: Cell::new(0),
-            discovers: Cell::new(0),
-            digests: Cell::new(0),
+            fetches: AtomicUsize::new(0),
+            resolves: AtomicUsize::new(0),
+            exports: AtomicUsize::new(0),
+            commit_times: AtomicUsize::new(0),
+            discovers: AtomicUsize::new(0),
+            digests: AtomicUsize::new(0),
         }
     }
 
     fn fetch_count(&self) -> usize {
-        self.fetches.get()
+        self.fetches.load(AtomicOrdering::SeqCst)
     }
 
     fn resolve_count(&self) -> usize {
-        self.resolves.get()
+        self.resolves.load(AtomicOrdering::SeqCst)
     }
 
     fn export_count(&self) -> usize {
-        self.exports.get()
+        self.exports.load(AtomicOrdering::SeqCst)
     }
 
     fn commit_time_count(&self) -> usize {
-        self.commit_times.get()
+        self.commit_times.load(AtomicOrdering::SeqCst)
     }
 
     fn discover_count(&self) -> usize {
-        self.discovers.get()
+        self.discovers.load(AtomicOrdering::SeqCst)
     }
 
     fn digest_count(&self) -> usize {
-        self.digests.get()
+        self.digests.load(AtomicOrdering::SeqCst)
     }
 }
 
 impl SourceBackend for CountingBackend<'_> {
     fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> SourceResult<()> {
-        self.fetches.set(self.fetches.get() + 1);
+        self.fetches.fetch_add(1, AtomicOrdering::SeqCst);
         self.inner.fetch(source, url)
     }
 
@@ -204,7 +205,7 @@ impl SourceBackend for CountingBackend<'_> {
         url: &str,
         refspec: &Refspec,
     ) -> SourceResult<String> {
-        self.resolves.set(self.resolves.get() + 1);
+        self.resolves.fetch_add(1, AtomicOrdering::SeqCst);
         self.inner.resolve(source, url, refspec)
     }
 
@@ -214,7 +215,7 @@ impl SourceBackend for CountingBackend<'_> {
         url: &str,
         commit: &str,
     ) -> SourceResult<u64> {
-        self.commit_times.set(self.commit_times.get() + 1);
+        self.commit_times.fetch_add(1, AtomicOrdering::SeqCst);
         self.inner.commit_time(source, url, commit)
     }
 
@@ -226,13 +227,13 @@ impl SourceBackend for CountingBackend<'_> {
         root: Option<&Path>,
         selection: &crate::kernel::Selection,
     ) -> SourceResult<Vec<crate::kernel::ArtifactName>> {
-        self.discovers.set(self.discovers.get() + 1);
+        self.discovers.fetch_add(1, AtomicOrdering::SeqCst);
         self.inner
             .discover_artifacts(source, url, commit, root, selection)
     }
 
     fn export_artifact(&self, req: &ExportRequest<'_>) -> SourceResult<ExportResult> {
-        self.exports.set(self.exports.get() + 1);
+        self.exports.fetch_add(1, AtomicOrdering::SeqCst);
         self.inner.export_artifact(req)
     }
 
@@ -244,7 +245,7 @@ impl SourceBackend for CountingBackend<'_> {
         root: Option<&Path>,
         selection: &crate::kernel::Selection,
     ) -> SourceResult<String> {
-        self.digests.set(self.digests.get() + 1);
+        self.digests.fetch_add(1, AtomicOrdering::SeqCst);
         self.inner
             .compute_digest(source, url, commit, root, selection)
     }
@@ -297,6 +298,7 @@ fn input<'a>(
         prune: false,
         no_hooks: false,
         resolver: None,
+        jobs: None,
     }
 }
 
@@ -416,7 +418,7 @@ fn link_source_resolves_without_mirror_into_audit_lock_entry() {
     let counting = CountingBackend::new(&fx.backend);
     let parsed = cfg.parsed_sources().expect("sources parse");
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
-    let (routed, _commits) = resolve_sources(&cfg, &parsed, &remotes, None, &counting, false)
+    let (routed, _commits) = resolve_sources(&cfg, &parsed, &remotes, None, &counting, false, None)
         .expect("link source resolves with no reachable mirror");
 
     let (_name, locked) = routed
@@ -453,7 +455,7 @@ fn link_source_skips_fetch_and_mirror_digest() {
     let counting = CountingBackend::new(&fx.backend);
     let parsed = cfg.parsed_sources().expect("sources parse");
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
-    let _ = resolve_sources(&cfg, &parsed, &remotes, None, &counting, false)
+    let _ = resolve_sources(&cfg, &parsed, &remotes, None, &counting, false, None)
         .expect("link source resolves without touching the mirror");
 
     assert_eq!(
@@ -1869,6 +1871,7 @@ fn sync_with_prune_removes_orphan_files_and_record_but_keeps_current() {
         prune: true,
         no_hooks: false,
         resolver: None,
+        jobs: None,
     };
 
     let out = sync(&in_, &fx.backend, &fx.registry).expect("prune sync runs");
@@ -1939,6 +1942,7 @@ fn sync_skips_prune_when_a_deploy_failed() {
         prune: true,
         no_hooks: false,
         resolver: None,
+        jobs: None,
     };
 
     let out = sync(&in_, &backend, &registry).expect("sync runs despite the export failure");
@@ -2114,27 +2118,28 @@ fn sync_cleans_staging_when_export_fails() {
 /// counting how many conflicts it was consulted on.
 struct ScriptedResolver {
     verdict: Resolution,
-    consulted: Cell<usize>,
-    seen: std::cell::RefCell<Vec<Conflict>>,
+    consulted: AtomicUsize,
+    seen: Mutex<Vec<Conflict>>,
 }
 
 impl ScriptedResolver {
     fn new(verdict: Resolution) -> Self {
         Self {
             verdict,
-            consulted: Cell::new(0),
-            seen: std::cell::RefCell::new(Vec::new()),
+            consulted: AtomicUsize::new(0),
+            seen: Mutex::new(Vec::new()),
         }
     }
 
     fn consulted(&self) -> usize {
-        self.consulted.get()
+        self.consulted.load(AtomicOrdering::SeqCst)
     }
 
     /// The most recent `Conflict` the resolver was consulted on, cloned out.
     fn last_conflict(&self) -> Conflict {
         self.seen
-            .borrow()
+            .lock()
+            .expect("seen mutex")
             .last()
             .cloned()
             .expect("resolver was consulted on at least one conflict")
@@ -2143,8 +2148,8 @@ impl ScriptedResolver {
 
 impl ConflictResolver for ScriptedResolver {
     fn resolve(&self, conflict: &Conflict) -> Resolution {
-        self.consulted.set(self.consulted.get() + 1);
-        self.seen.borrow_mut().push(conflict.clone());
+        self.consulted.fetch_add(1, AtomicOrdering::SeqCst);
+        self.seen.lock().expect("seen mutex").push(conflict.clone());
         self.verdict
     }
 }
@@ -2164,6 +2169,7 @@ fn interactive_input<'a>(
         prune: false,
         no_hooks: false,
         resolver: Some(resolver),
+        jobs: None,
     }
 }
 
@@ -4736,25 +4742,25 @@ fn literal_git_source_still_syncs_unchanged() {
 /// resolved remote the wiring actually fetched (protocol precedence).
 struct RecordingBackend<'a> {
     inner: &'a GitBackend,
-    urls: std::cell::RefCell<Vec<String>>,
+    urls: Mutex<Vec<String>>,
 }
 
 impl<'a> RecordingBackend<'a> {
     fn new(inner: &'a GitBackend) -> Self {
         Self {
             inner,
-            urls: std::cell::RefCell::new(Vec::new()),
+            urls: Mutex::new(Vec::new()),
         }
     }
 
     fn fetched_urls(&self) -> Vec<String> {
-        self.urls.borrow().clone()
+        self.urls.lock().expect("urls mutex").clone()
     }
 }
 
 impl SourceBackend for RecordingBackend<'_> {
     fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> SourceResult<()> {
-        self.urls.borrow_mut().push(url.to_owned());
+        self.urls.lock().expect("urls mutex").push(url.to_owned());
         self.inner.fetch(source, url)
     }
     fn resolve(
@@ -5049,7 +5055,7 @@ fn url_config_one_target(source: &str, url: &str, target_path: &Path, layout: &s
 /// so a test can prove the second sync of an unchanged url is a no-op (0 fetches).
 struct CountingRouter {
     inner: RouterBackend<GitBackend, HttpBackend>,
-    fetches: Cell<usize>,
+    fetches: AtomicUsize,
 }
 
 impl CountingRouter {
@@ -5061,18 +5067,18 @@ impl CountingRouter {
         let http = HttpBackend::new(git_dir, BTreeMap::new());
         Self {
             inner: RouterBackend::new(git, http, modes),
-            fetches: Cell::new(0),
+            fetches: AtomicUsize::new(0),
         }
     }
 
     fn fetch_count(&self) -> usize {
-        self.fetches.get()
+        self.fetches.load(AtomicOrdering::SeqCst)
     }
 }
 
 impl SourceBackend for CountingRouter {
     fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> SourceResult<()> {
-        self.fetches.set(self.fetches.get() + 1);
+        self.fetches.fetch_add(1, AtomicOrdering::SeqCst);
         self.inner.fetch(source, url)
     }
     fn resolve(
@@ -8380,6 +8386,7 @@ fn prune_only_sync_skips_on_change_but_runs_post_sync() {
         prune: true,
         no_hooks: false,
         resolver: None,
+        jobs: None,
     };
     sync(&in_, &fx.backend, &fx.registry).expect("prune-only sync runs");
 
@@ -10193,4 +10200,376 @@ fn verify_mapped_dest_ignores_by_source_layout() {
         "the mutated mapped dest under by-source must be a ContentMismatch, got {:?}",
         hit.reason
     );
+}
+
+// ── PAR-001: parallel fetch/resolve/digest ─────────────────────
+
+/// `Send + Sync` recording backend for the parallel path: counts fetches per URL
+/// using `Mutex`/`AtomicUsize` (not `Cell`/`RefCell`) so it can be shared across
+/// rayon worker threads. Records the order-insensitive set of fetched URLs.
+struct SyncRecordingBackend<'a> {
+    inner: &'a GitBackend,
+    fetched_urls: Mutex<Vec<String>>,
+    total_fetches: AtomicUsize,
+}
+
+impl<'a> SyncRecordingBackend<'a> {
+    fn new(inner: &'a GitBackend) -> Self {
+        Self {
+            inner,
+            fetched_urls: Mutex::new(Vec::new()),
+            total_fetches: AtomicUsize::new(0),
+        }
+    }
+
+    fn fetch_count_for(&self, url: &str) -> usize {
+        self.fetched_urls
+            .lock()
+            .expect("fetched_urls mutex")
+            .iter()
+            .filter(|u| u.as_str() == url)
+            .count()
+    }
+
+    fn total_fetches(&self) -> usize {
+        self.total_fetches.load(AtomicOrdering::SeqCst)
+    }
+}
+
+impl SourceBackend for SyncRecordingBackend<'_> {
+    fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> SourceResult<()> {
+        self.total_fetches.fetch_add(1, AtomicOrdering::SeqCst);
+        self.fetched_urls
+            .lock()
+            .expect("fetched_urls mutex")
+            .push(url.to_owned());
+        self.inner.fetch(source, url)
+    }
+    fn resolve(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        refspec: &Refspec,
+    ) -> SourceResult<String> {
+        self.inner.resolve(source, url, refspec)
+    }
+    fn commit_time(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        commit: &str,
+    ) -> SourceResult<u64> {
+        self.inner.commit_time(source, url, commit)
+    }
+    fn discover_artifacts(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        commit: &str,
+        root: Option<&Path>,
+        selection: &crate::kernel::Selection,
+    ) -> SourceResult<Vec<crate::kernel::ArtifactName>> {
+        self.inner
+            .discover_artifacts(source, url, commit, root, selection)
+    }
+    fn export_artifact(&self, req: &ExportRequest<'_>) -> SourceResult<ExportResult> {
+        self.inner.export_artifact(req)
+    }
+    fn compute_digest(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        commit: &str,
+        root: Option<&Path>,
+        selection: &crate::kernel::Selection,
+    ) -> SourceResult<String> {
+        self.inner
+            .compute_digest(source, url, commit, root, selection)
+    }
+    fn list_artifact_files(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        commit: &str,
+        root: Option<&Path>,
+        artifact: &crate::kernel::ArtifactName,
+        selection: &crate::kernel::Selection,
+    ) -> SourceResult<Vec<std::path::PathBuf>> {
+        self.inner
+            .list_artifact_files(source, url, commit, root, artifact, selection)
+    }
+}
+
+/// A [`SyncInput`] carrying an explicit `jobs` pool size. Mirrors [`input`] but
+/// sets the PAR-001 `jobs` knob so a test can drive the serial (1) vs parallel (4) paths.
+fn input_with_jobs(base: &Config, jobs: usize) -> SyncInput<'_> {
+    SyncInput {
+        base_config: base,
+        local_config: None,
+        base_lock: None,
+        local_lock: None,
+        force: false,
+        interactive: false,
+        prune: false,
+        no_hooks: false,
+        resolver: None,
+        jobs: Some(jobs),
+    }
+}
+
+/// Two distinct sources at distinct config paths but sharing ONE upstream URL,
+/// each bound into its own flat target, plus the shared fixture repo URL.
+fn config_two_sources_one_url(url: &str, td_a: &Path, td_b: &Path) -> Config {
+    let toml = format!(
+        "version = 1\n\n\
+             [sources.alpha]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+             [sources.beta]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+             [targets.ta]\npath = \"{}\"\nsources = [\"alpha\"]\nlayout = \"flat\"\n\n\
+             [targets.tb]\npath = \"{}\"\nsources = [\"beta\"]\nlayout = \"flat\"\n",
+        td_a.display(),
+        td_b.display(),
+    );
+    Config::parse(&toml).expect("two-source shared-url config parses")
+}
+
+/// PAR-001 dedup-by-URL: two DIFFERENT sources that resolve to the SAME upstream URL
+/// share ONE bare mirror, so the fetch must run AT MOST ONCE for that URL. Today the
+/// dedup is keyed by source name, so this URL is fetched twice (behavioral RED).
+#[test]
+fn two_sources_sharing_one_url_fetch_the_shared_mirror_once() {
+    let fx = build_sync_fixture();
+    let td_a = TargetDir::new();
+    let td_b = TargetDir::new();
+    let cfg = config_two_sources_one_url(&fx.url, &td_a.target_path(), &td_b.target_path());
+
+    let recording = SyncRecordingBackend::new(&fx.backend);
+    let in_ = input_with_jobs(&cfg, 4);
+
+    sync(&in_, &recording, &fx.registry).expect("two sources sharing one url sync");
+
+    assert_eq!(
+        recording.fetch_count_for(&fx.url),
+        1,
+        "two sources resolving to the SAME upstream url must fetch the shared mirror EXACTLY once \
+         (dedup keyed by normalized url, not source name); got {} fetches of {:?}",
+        recording.fetch_count_for(&fx.url),
+        recording.fetched_urls.lock().expect("urls").clone(),
+    );
+    assert_eq!(
+        recording.total_fetches(),
+        1,
+        "the only upstream is shared, so the run must perform exactly one fetch overall"
+    );
+}
+
+/// `Send + Sync` canned backend recording the per-source `SourceName` handed to
+/// `fetch`; the `Mutex` makes it shareable across rayon workers.
+struct UrlFetchRecordingBackend {
+    fetched_sources: Mutex<Vec<String>>,
+}
+
+impl UrlFetchRecordingBackend {
+    fn new() -> Self {
+        Self {
+            fetched_sources: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn fetched_source_names(&self) -> Vec<String> {
+        self.fetched_sources
+            .lock()
+            .expect("fetched_sources mutex")
+            .clone()
+    }
+
+    fn was_fetched(&self, source: &str) -> bool {
+        self.fetched_source_names().iter().any(|s| s == source)
+    }
+}
+
+impl SourceBackend for UrlFetchRecordingBackend {
+    fn fetch(&self, source: &crate::kernel::SourceName, _url: &str) -> SourceResult<()> {
+        self.fetched_sources
+            .lock()
+            .expect("fetched_sources mutex")
+            .push(source.as_str().to_owned());
+        Ok(())
+    }
+    fn resolve(
+        &self,
+        _source: &crate::kernel::SourceName,
+        _url: &str,
+        _refspec: &Refspec,
+    ) -> SourceResult<String> {
+        Ok("0000000000000000000000000000000000000000".to_owned())
+    }
+    fn commit_time(
+        &self,
+        _source: &crate::kernel::SourceName,
+        _url: &str,
+        _commit: &str,
+    ) -> SourceResult<u64> {
+        Ok(1)
+    }
+    fn discover_artifacts(
+        &self,
+        _source: &crate::kernel::SourceName,
+        _url: &str,
+        _commit: &str,
+        _root: Option<&Path>,
+        _selection: &crate::kernel::Selection,
+    ) -> SourceResult<Vec<crate::kernel::ArtifactName>> {
+        Ok(Vec::new())
+    }
+    fn export_artifact(&self, _req: &ExportRequest<'_>) -> SourceResult<ExportResult> {
+        Ok(ExportResult {
+            files: Vec::new(),
+            digest: "canned".to_owned(),
+            vars_digest: None,
+        })
+    }
+    fn compute_digest(
+        &self,
+        _source: &crate::kernel::SourceName,
+        _url: &str,
+        _commit: &str,
+        _root: Option<&Path>,
+        _selection: &crate::kernel::Selection,
+    ) -> SourceResult<String> {
+        Ok("canned-digest".to_owned())
+    }
+    fn list_artifact_files(
+        &self,
+        _source: &crate::kernel::SourceName,
+        _url: &str,
+        _commit: &str,
+        _root: Option<&Path>,
+        _artifact: &crate::kernel::ArtifactName,
+        _selection: &crate::kernel::Selection,
+    ) -> SourceResult<Vec<std::path::PathBuf>> {
+        Ok(Vec::new())
+    }
+}
+
+/// Two URL-mode sources sharing ONE upstream url but with DISTINCT source names,
+/// each bound into its own flat target.
+fn config_two_url_sources_one_url(url: &str, td_a: &Path, td_b: &Path) -> Config {
+    let toml = format!(
+        "version = 1\n\n\
+             [sources.alpha]\nurl = \"{url}\"\n\n\
+             [sources.beta]\nurl = \"{url}\"\n\n\
+             [targets.ta]\npath = \"{}\"\nsources = [\"alpha\"]\nlayout = \"flat\"\n\n\
+             [targets.tb]\npath = \"{}\"\nsources = [\"beta\"]\nlayout = \"flat\"\n",
+        td_a.display(),
+        td_b.display(),
+    );
+    Config::parse(&toml).expect("two url-source shared-url config parses")
+}
+
+/// PAR-001 integrity-pin regression: for URL-mode (HTTP) sources, `fetch` carries a
+/// PER-SOURCE side effect — it validates that source's declared integrity digest
+/// against the downloaded bytes. So unlike idempotent git mirror sync, fetch must
+/// run for EVERY url-source sharing an upstream url; deduping by normalized url
+/// drops the second source's fetch and SILENTLY SKIPS its digest validation
+/// (an integrity-pin bypass). Both `alpha` and `beta` must be fetched.
+#[test]
+fn url_sources_sharing_one_url_each_fetch_so_per_source_digest_is_validated() {
+    let td_a = TargetDir::new();
+    let td_b = TargetDir::new();
+    let url = "https://example.com/pkg.tar.gz";
+    let cfg = config_two_url_sources_one_url(url, &td_a.target_path(), &td_b.target_path());
+
+    let recording = UrlFetchRecordingBackend::new();
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+
+    resolve_sources(&cfg, &parsed, &remotes, None, &recording, false, Some(4))
+        .expect("two url sources sharing one url resolve");
+
+    assert!(
+        recording.was_fetched("alpha"),
+        "url-source `alpha` must be fetched so its per-source digest is validated; \
+         fetched sources were {:?}",
+        recording.fetched_source_names()
+    );
+    assert!(
+        recording.was_fetched("beta"),
+        "url-source `beta` shares the upstream url with `alpha`, but its fetch must NOT be \
+         deduped away: each url-source's fetch validates ITS OWN integrity digest, so dropping \
+         beta's fetch silently skips beta's digest check (integrity-pin bypass); \
+         fetched sources were {:?}",
+        recording.fetched_source_names()
+    );
+}
+
+/// PAR-001 ordering invariant: the SAME multi-source fixture synced effectively
+/// serial (jobs=1) and parallel (jobs=4) must produce a BYTE-IDENTICAL base lock
+/// (serialized TOML) AND an identical registry record set (keys, commits, digests).
+/// Parallel completion order must not leak into recorded state.
+#[test]
+fn serial_and_parallel_runs_produce_identical_lock_and_registry() {
+    let (src_a, url_a) = build_repo_named("alpha-repo", b"-- alpha\n");
+    let (src_b, url_b) = build_repo_named("beta-repo", b"-- beta\n");
+    let (src_c, url_c) = build_repo_named("gamma-repo", b"-- gamma\n");
+
+    let cfg_toml = |ta: &Path, tb: &Path, tc: &Path| {
+        let toml = format!(
+            "version = 1\n\n\
+                 [sources.alpha]\ngit = \"{url_a}\"\nbranch = \"main\"\n\n\
+                 [sources.beta]\ngit = \"{url_b}\"\nbranch = \"main\"\n\n\
+                 [sources.gamma]\ngit = \"{url_c}\"\nbranch = \"main\"\n\n\
+                 [targets.ta]\npath = \"{}\"\nsources = [\"alpha\"]\nlayout = \"flat\"\n\n\
+                 [targets.tb]\npath = \"{}\"\nsources = [\"beta\"]\nlayout = \"flat\"\n\n\
+                 [targets.tc]\npath = \"{}\"\nsources = [\"gamma\"]\nlayout = \"flat\"\n",
+            ta.display(),
+            tb.display(),
+            tc.display(),
+        );
+        Config::parse(&toml).expect("three-source config parses")
+    };
+
+    let run = |jobs: usize| -> (String, Vec<(ArtifactKey, String, String)>) {
+        let ta = TargetDir::new();
+        let tb = TargetDir::new();
+        let tc = TargetDir::new();
+        let cfg = cfg_toml(&ta.target_path(), &tb.target_path(), &tc.target_path());
+
+        let git_dir = TempDir::new().expect("git dir");
+        let state_dir = TempDir::new().expect("state dir");
+        let backend = GitBackend::new(git_dir.path().to_path_buf());
+        let registry =
+            FileRegistry::open(state_dir.path().to_path_buf()).expect("registry over tempdir");
+
+        let in_ = input_with_jobs(&cfg, jobs);
+        let out = sync(&in_, &backend, &registry).expect("multi-source sync");
+
+        let lock_toml = toml::to_string(&out.base_lock).expect("base lock serializes to toml");
+        let mut records: Vec<(ArtifactKey, String, String)> = registry
+            .list_all()
+            .expect("registry records")
+            .into_iter()
+            .map(|r| (r.key, r.commit, r.digest))
+            .collect();
+        records.sort_by(|a, b| {
+            (&a.0.target, &a.0.source, &a.0.artifact)
+                .cmp(&(&b.0.target, &b.0.source, &b.0.artifact))
+        });
+        (lock_toml, records)
+    };
+
+    let (lock_serial, recs_serial) = run(1);
+    let (lock_parallel, recs_parallel) = run(4);
+
+    assert_eq!(
+        lock_serial, lock_parallel,
+        "serial (jobs=1) and parallel (jobs=4) runs must serialize to a byte-identical base lock; \
+         parallel completion order must not reorder locked sources"
+    );
+    assert_eq!(
+        recs_serial, recs_parallel,
+        "serial and parallel runs must record an identical registry record set \
+         (same keys, commits, digests)"
+    );
+
+    drop((src_a, src_b, src_c));
 }

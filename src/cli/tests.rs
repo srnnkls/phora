@@ -4956,7 +4956,8 @@ fn rebuild_over_merged_vars_agrees_with_deployed_vars_digest() {
         let _state = EnvVarGuard::set("XDG_STATE_HOME", state.path());
         let _cache = EnvVarGuard::set("XDG_CACHE_HOME", cache.path());
 
-        super::sync::run_sync(false, false, false, None).expect("merged-vars deploy succeeds");
+        super::sync::run_sync(false, false, false, None, None)
+            .expect("merged-vars deploy succeeds");
 
         let motd = target_path.join("editor").join("motd");
         assert_eq!(
@@ -4995,5 +4996,46 @@ fn rebuild_over_merged_vars_agrees_with_deployed_vars_digest() {
         "rebuild-registry must reconcile against the EFFECTIVE merged base+local vars (the same \
          config the deploy used), so the reconstructed vars_digest equals the deployed one; \
          reconciling against base-only vars stamps a divergent digest"
+    );
+}
+
+// ── PAR-001: --jobs / -j plumbing ──────────────────────────────
+
+#[test]
+fn sync_jobs_long_flag_parses_to_value() {
+    use clap::Parser;
+    let cli =
+        Cli::try_parse_from(["phora", "sync", "--jobs", "4"]).expect("sync --jobs 4 must parse");
+    let Command::Sync { jobs, .. } = cli.command else {
+        panic!("expected Command::Sync");
+    };
+    assert_eq!(
+        jobs,
+        Some(4),
+        "--jobs 4 must parse the pool size into Some(4)"
+    );
+}
+
+#[test]
+fn sync_jobs_short_flag_parses_to_value() {
+    use clap::Parser;
+    let cli = Cli::try_parse_from(["phora", "sync", "-j", "4"]).expect("sync -j 4 must parse");
+    let Command::Sync { jobs, .. } = cli.command else {
+        panic!("expected Command::Sync");
+    };
+    assert_eq!(jobs, Some(4), "-j 4 must parse the pool size into Some(4)");
+}
+
+#[test]
+fn sync_without_jobs_flag_defaults_to_unset() {
+    use clap::Parser;
+    let cli = Cli::try_parse_from(["phora", "sync"]).expect("bare sync must parse");
+    let Command::Sync { jobs, .. } = cli.command else {
+        panic!("expected Command::Sync");
+    };
+    assert_eq!(
+        jobs, None,
+        "absent --jobs must leave the pool size unset (None) so the default \
+         min(units, 8) is chosen downstream"
     );
 }
