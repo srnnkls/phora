@@ -37,13 +37,6 @@ hooks {
     stash = "none"
     steps = new { ...fast }
   }
-  ["pre-push"] {
-    stash = "none"
-    steps = new {
-      ...fast
-      ...heavy
-    }
-  }
   ["check"] {
     steps = new {
       ...fast
