@@ -26,10 +26,20 @@ ureq = "3.3.0"
 walkdir = "2.5.0"
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 
+[features]
+# Re-exports internals (resolve_sources) for benchmarking only; off by default.
+bench = []
+
 [dev-dependencies]
 assert_cmd = "2.0.17"
+criterion = "0.5"
 insta = { version = "1.43.2", features = ["filters"] }
 tempfile = "3.27.0"
+
+[[bench]]
+name = "resolve"
+harness = false
+required-features = ["bench"]
 
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }

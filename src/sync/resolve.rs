@@ -10,7 +10,7 @@ use crate::source::{MirrorKey, NormalizedUrl, SourceBackend, read_local_head};
 
 use super::{effective_protocol, remote_for};
 
-type RoutedSources = (
+pub type RoutedSources = (
     Vec<(String, LockedSource)>,
     BTreeMap<(String, String), String>,
 );
@@ -253,4 +253,25 @@ pub(super) fn resolve_sources(
         }
         Ok((routed, resolved_commits))
     })
+}
+
+#[cfg(feature = "bench")]
+pub fn resolve_sources_for_bench(
+    config: &Config,
+    parsed: &BTreeMap<String, ParsedSource>,
+    remotes: &BTreeMap<String, String>,
+    effective_lock: Option<&Lock>,
+    backend: &(dyn SourceBackend + Sync),
+    force: bool,
+    jobs: Option<usize>,
+) -> Result<RoutedSources> {
+    resolve_sources(
+        config,
+        parsed,
+        remotes,
+        effective_lock,
+        backend,
+        force,
+        jobs,
+    )
 }
