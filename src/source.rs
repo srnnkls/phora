@@ -239,10 +239,33 @@ impl GitBackend {
     fn mirror_path(&self, url: &str) -> PathBuf {
         mirror_path(&self.git_dir, url)
     }
+
+    fn mirror_lock_path(&self, url: &str) -> PathBuf {
+        let mut s = self.mirror_path(url).into_os_string();
+        s.push(".lock");
+        PathBuf::from(s)
+    }
+
+    fn lock_mirror(&self, source: &SourceName, url: &str) -> Result<std::fs::File> {
+        std::fs::create_dir_all(&self.git_dir).map_err(|e| {
+            SourceError::Source(format!("create git dir for lock {source}: {e}"))
+        })?;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(self.mirror_lock_path(url))
+            .map_err(|e| SourceError::Source(format!("open mirror lock {source}: {e}")))?;
+        lock.lock()
+            .map_err(|e| SourceError::Source(format!("lock mirror {source}: {e}")))?;
+        Ok(lock)
+    }
 }
 
 impl SourceBackend for GitBackend {
     fn fetch(&self, source: &SourceName, url: &str) -> Result<()> {
+        let _lock = self.lock_mirror(source, url)?;
         let mirror = self.mirror_path(url);
 
         if mirror.exists() {
@@ -1988,6 +2011,154 @@ mod tests {
             time, TAGGED_COMMITTER_TIME,
             "commit_time must NOT return the committer timestamp"
         );
+    }
+
+    // ---- MIRROR-LOCK-001: per-mirror BLOCKING flock around fetch ----
+
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// The exact per-mirror lock-file path the implementation must use:
+    /// `<git_dir>/<MirrorKey>.git.lock` (the mirror dir path with `.lock`
+    /// appended). Derived independently from `mirror_path` so the test fails if
+    /// the impl picks a different naming.
+    fn mirror_lock_path(git_dir: &Path, url: &str) -> PathBuf {
+        let mut s = mirror_path(git_dir, url).into_os_string();
+        s.push(".lock");
+        PathBuf::from(s)
+    }
+
+    /// Minimal seeded git repo at `path` with a single commit on `main`; used as
+    /// a `url` for a SECOND distinct mirror (different `MirrorKey`).
+    #[expect(
+        clippy::unwrap_used,
+        reason = "fixture setup fails loudly; git CLI is assumed present"
+    )]
+    fn build_minimal_repo(path: &Path) {
+        run_git(path, &["init", "-b", "main", "."]);
+        run_git(path, &["config", "user.email", "test@example.com"]);
+        run_git(path, &["config", "user.name", "Test"]);
+        std::fs::write(path.join("ONLY.md"), b"only commit\n").unwrap();
+        run_git(path, &["add", "ONLY.md"]);
+        run_git(path, &["commit", "-m", "only"]);
+    }
+
+    /// Holds an exclusive advisory lock on `path` (creating it). The test grabs
+    /// the lock the binary's `fetch` will contend for; held until dropped.
+    fn hold_mirror_lock(path: &Path) -> std::fs::File {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create git_dir for lock");
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .expect("open per-mirror lock file");
+        file.try_lock().expect("test acquires the mirror lock first");
+        file
+    }
+
+    #[test]
+    fn fetch_blocks_on_held_per_mirror_lock_then_succeeds_when_released() {
+        let fixture = build_git_fixture();
+        let git_dir = fixture.backend.git_dir.clone();
+        let url = fixture.url.clone();
+
+        let lock_path = mirror_lock_path(&git_dir, &url);
+        let held = hold_mirror_lock(&lock_path);
+
+        let (tx, rx) = mpsc::channel();
+        let backend = GitBackend::new(git_dir.clone());
+        let url_for_thread = url.clone();
+        let worker = std::thread::spawn(move || {
+            let result = backend.fetch(&sn("src"), &url_for_thread);
+            tx.send(result).expect("send fetch result");
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(750)).is_err(),
+            "fetch must BLOCK while the per-mirror lock is held; it completed \
+             within the window, so it took no blocking lock on {}",
+            lock_path.display()
+        );
+
+        drop(held);
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("fetch must complete promptly once the mirror lock is released");
+        worker.join().expect("fetch thread joins");
+        result.expect("fetch succeeds after waiting for the lock (blocking, not error)");
+
+        let mirror = mirror_path(&git_dir, &url);
+        assert!(
+            is_bare_repo(&mirror),
+            "the serialized fetch must leave a valid, non-corrupt bare mirror"
+        );
+        let repo = gix::open(&mirror).expect("mirror opens as a git repo");
+        assert!(
+            repo.find_reference("refs/heads/main").is_ok(),
+            "the serialized fetch must populate refs/heads/main"
+        );
+    }
+
+    #[test]
+    fn fetch_does_not_create_lock_at_mirror_path_without_locking() {
+        let fixture = build_git_fixture();
+        let git_dir = fixture.backend.git_dir.clone();
+        let lock_path = mirror_lock_path(&git_dir, &fixture.url);
+
+        assert!(
+            !lock_path.exists(),
+            "precondition: no lock file before fetch"
+        );
+
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch clones bare mirror");
+
+        assert!(
+            lock_path.exists(),
+            "fetch must create/use the per-mirror lock file at {}",
+            lock_path.display()
+        );
+    }
+
+    #[test]
+    fn holding_one_mirror_lock_does_not_block_fetch_of_a_different_mirror() {
+        let fixture_a = build_git_fixture();
+        let git_dir = fixture_a.backend.git_dir.clone();
+
+        let src_b = TempDir::new().expect("src b tempdir");
+        build_minimal_repo(src_b.path());
+        let url_b = src_b.path().to_string_lossy().into_owned();
+
+        assert_ne!(
+            mirror_path(&git_dir, &fixture_a.url),
+            mirror_path(&git_dir, &url_b),
+            "the two urls must map to distinct mirrors for this test to mean anything"
+        );
+
+        let held_a = hold_mirror_lock(&mirror_lock_path(&git_dir, &fixture_a.url));
+
+        let (tx, rx) = mpsc::channel();
+        let backend = GitBackend::new(git_dir.clone());
+        let worker = std::thread::spawn(move || {
+            let result = backend.fetch(&sn("srcb"), &url_b);
+            tx.send(result).expect("send fetch-b result");
+        });
+
+        let result = rx.recv_timeout(Duration::from_secs(5)).expect(
+            "fetching a DIFFERENT mirror must not block on mirror A's lock; \
+             the per-mirror lock must be keyed per MirrorKey",
+        );
+        worker.join().expect("fetch-b thread joins");
+        result.expect("fetch of mirror B succeeds while A's lock is held");
+
+        drop(held_a);
     }
 
     #[test]

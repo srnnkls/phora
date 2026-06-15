@@ -1177,6 +1177,9 @@ artifact = "snippets"
 
     #[test]
     fn lock_is_released_after_guard_dropped() {
+        let _serial = STATE_LOCK_SERIAL
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = TempDir::new().expect("temp state root");
         let first = FileRegistry::open(dir.path().to_path_buf()).expect("open first registry");
         let second = FileRegistry::open(dir.path().to_path_buf()).expect("open second registry");
