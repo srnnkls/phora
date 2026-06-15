@@ -184,6 +184,7 @@ mod tests {
         reason = "fixture setup fails loudly; git CLI is assumed present"
     )]
     fn run_git(cwd: &Path, args: &[&str]) {
+        let _serial = crate::store::guard_git_fork();
         let out = Command::new("git")
             .args(args)
             .current_dir(cwd)
@@ -212,6 +213,7 @@ mod tests {
         run_git(p, &["add", "-A"]);
         run_git(p, &["commit", "-m", "initial"]);
         let head = {
+            let _serial = crate::store::guard_git_fork();
             let out = Command::new("git")
                 .args(["rev-parse", "HEAD"])
                 .current_dir(p)

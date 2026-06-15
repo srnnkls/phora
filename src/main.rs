@@ -2,10 +2,10 @@ use clap::Parser;
 
 use phora::cli::{self, Cli};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
     let cli = Cli::parse();
-    cli::run(cli).map_err(|e| {
+    if let Err(e) = cli::run(cli) {
         eprintln!("error: {e}");
-        e.into()
-    })
+        std::process::exit(cli::exit_code(&e));
+    }
 }

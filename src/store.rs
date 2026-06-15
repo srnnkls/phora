@@ -176,6 +176,17 @@ pub struct StateLockGuard {
     _file: std::fs::File,
 }
 
+// flock OFD is inherited by a forked `git` until it execs: the flock-holding test takes write, forkers take read.
+#[cfg(test)]
+pub(crate) static STATE_LOCK_SERIAL: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+#[cfg(test)]
+pub(crate) fn guard_git_fork() -> std::sync::RwLockReadGuard<'static, ()> {
+    STATE_LOCK_SERIAL
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 const META_VERSION: u32 = 1;
 
 #[derive(Serialize, Deserialize)]

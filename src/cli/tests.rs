@@ -4873,6 +4873,7 @@ fn preview_selectors_are_long_flags_not_positionals() {
 )]
 fn git_init_with_template(dir: &std::path::Path, body: &[u8]) -> String {
     let run = |args: &[&str]| {
+        let _serial = crate::store::guard_git_fork();
         let status = std::process::Command::new("git")
             .current_dir(dir)
             .args(args)
@@ -4949,6 +4950,9 @@ fn rebuild_over_merged_vars_agrees_with_deployed_vars_digest() {
     };
 
     let (deployed_vd, rebuilt_vd) = with_cwd(project.path(), || {
+        let _serial = crate::store::STATE_LOCK_SERIAL
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _state = EnvVarGuard::set("XDG_STATE_HOME", state.path());
         let _cache = EnvVarGuard::set("XDG_CACHE_HOME", cache.path());
 

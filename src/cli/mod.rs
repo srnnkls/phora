@@ -53,7 +53,7 @@ use crate::error::{Error, Result};
 use crate::kernel::{ProjectId, SourceName, TargetName};
 use crate::paths::state_root;
 use crate::source::{GitBackend, HttpBackend, RouterBackend};
-use crate::store::FileRegistry;
+use crate::store::{FileRegistry, StoreError};
 use crate::sync::{Conflict, ConflictResolver, Resolution};
 use std::str::FromStr;
 
@@ -250,6 +250,15 @@ pub enum TargetCmd {
     Show { name: String },
 }
 
+/// 75 is `EX_TEMPFAIL` (sysexits.h): a contended lock is "busy, retry", not a hard failure.
+#[must_use]
+pub fn exit_code(err: &Error) -> i32 {
+    match err {
+        Error::StoreCtx(StoreError::Lock(_)) => 75,
+        _ => 1,
+    }
+}
+
 pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
         cmd @ Command::Add { .. } => dispatch_add(cmd),
@@ -295,13 +304,9 @@ pub fn run(cli: Cli) -> Result<()> {
             target,
         } => {
             let config = load_config()?;
-            crate::sync::eject(
-                &config,
-                &open_project_registry()?,
-                &artifact,
-                &source,
-                &target,
-            )?;
+            let registry = open_project_registry()?;
+            let _guard = registry.lock_exclusive()?;
+            crate::sync::eject(&config, &registry, &artifact, &source, &target)?;
             println!("ejected {source}/{artifact} from {target} (files kept)");
             Ok(())
         }
@@ -311,13 +316,9 @@ pub fn run(cli: Cli) -> Result<()> {
             target,
         } => {
             let config = load_config()?;
-            crate::sync::uneject(
-                &config,
-                &open_project_registry()?,
-                &artifact,
-                &source,
-                &target,
-            )?;
+            let registry = open_project_registry()?;
+            let _guard = registry.lock_exclusive()?;
+            crate::sync::uneject(&config, &registry, &artifact, &source, &target)?;
             println!("unejected {source}/{artifact} in {target}");
             Ok(())
         }

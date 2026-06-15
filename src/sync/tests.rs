@@ -42,6 +42,7 @@ fn one_commit(
     reason = "fixture setup fails loudly; git CLI is assumed present"
 )]
 fn run_git(cwd: &Path, args: &[&str]) {
+    let _serial = crate::store::guard_git_fork();
     let out = Command::new("git")
         .args(args)
         .current_dir(cwd)
@@ -61,6 +62,7 @@ fn run_git(cwd: &Path, args: &[&str]) {
     reason = "fixture setup fails loudly; git CLI is assumed present"
 )]
 fn rev_parse(cwd: &Path, rev: &str) -> String {
+    let _serial = crate::store::guard_git_fork();
     let out = Command::new("git")
         .args(["rev-parse", rev])
         .current_dir(cwd)
