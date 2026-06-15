@@ -393,7 +393,7 @@ adds a new forge or overrides a built-in's `remote`/`auth`. Auth is either
 
 Source flags: `allow_symlinks`, `allow_submodules` (both default off),
 `preserve_executable` (default on), `deploy` (`"copy"` | `"link"`, default
-`"copy"`; `"link"` is local-overlay-only — see [Link mode](#link-mode-local-development)).
+`"copy"`; `"link"` is local-path only — see [Link mode](#link-mode-local-development)).
 
 Layouts decide how an artifact `a` from a binding `i` (its identity — the `as`
 alias, or the source name for a bare binding) is placed in a target:
@@ -522,7 +522,7 @@ deploys as.
   across bindings and targets (give each binding a distinct `as` — identity must be
   unique within a target, as for any other slice). The source is fetched once.
 - **Copy and link both work.** Default `deploy = "copy"` materializes the leaf;
-  `deploy = "link"` (local-overlay-only — see [Link mode](#link-mode-local-development))
+  `deploy = "link"` (local-path only — see [Link mode](#link-mode-local-development))
   makes the dest a symlink to the source leaf in the working tree. A missing link
   leaf degrades gracefully: `preview` flags it and `sync` still completes.
 - **Rename leaves an orphan.** Changing a dest value orphans the old file; it
@@ -652,12 +652,17 @@ no re-sync.
 
 Two guardrails apply:
 
-- Local overlay only. `deploy = "link"` is honored only in `phora.local.toml`.
-  Setting it in the committed `phora.toml` is a config error that names the source.
-  Keep it out of shared config.
 - Local path only. A link source must be a local source: `path = "/dir"` (or
   the `git = "/dir"` alias), a local filesystem path. `deploy = "link"` on a remote
-  URL is a config error.
+  URL is a config error that names the source. A relative path counts as local only
+  if it exists relative to the working directory; a relative path that does not yet
+  exist is rejected as "not local".
+- Portable paths in shared config. `deploy = "link"` is allowed in either
+  `phora.toml` or `phora.local.toml`. A committed (`phora.toml`) link source over an
+  absolute path syncs but prints a non-fatal stderr warning that names the source:
+  an absolute checkout path is machine-specific and rarely portable across machines.
+  A committed link over a relative (portable) path warns nothing. Machine-specific
+  checkouts still belong in `phora.local.toml`, which never warns.
 
 Linked artifacts sit outside the integrity model: their registry record carries
 a `linked` marker and no per-file hashes. `phora verify` skips them, drift detection
