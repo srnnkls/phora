@@ -251,6 +251,40 @@ pub(crate) fn lock_mirror(
     Ok(lock)
 }
 
+/// A scratch mirror renamed into the canonical path on success, removed on drop otherwise.
+struct MirrorStaging {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl MirrorStaging {
+    fn create(git_dir: &Path, url: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let key = MirrorKey::from_url(&NormalizedUrl::parse(url));
+        let name = format!(".{}.staging-{}-{nonce}", key.as_str(), std::process::id());
+        Self {
+            path: git_dir.join(name),
+            armed: true,
+        }
+    }
+
+    fn commit_to(mut self, mirror: &Path, label: &str) -> Result<()> {
+        std::fs::rename(&self.path, mirror)
+            .map_err(|e| SourceError::Source(format!("publish mirror {label}: {e}")))?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for MirrorStaging {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
 pub struct GitBackend {
     git_dir: PathBuf,
 }
@@ -294,7 +328,8 @@ impl SourceBackend for GitBackend {
                 .receive(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
                 .map_err(|e| SourceError::Source(format!("receive pack in {source}: {e}")))?;
         } else {
-            gix::prepare_clone_bare(url, &mirror)
+            let staging = MirrorStaging::create(&self.git_dir, url);
+            gix::prepare_clone_bare(url, &staging.path)
                 .map_err(|e| SourceError::Source(format!("prepare clone {source}: {e}")))?
                 .configure_remote(|mut remote| {
                     remote.replace_refspecs(
@@ -305,6 +340,7 @@ impl SourceBackend for GitBackend {
                 })
                 .fetch_only(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
                 .map_err(|e| SourceError::Source(format!("clone bare {source}: {e}")))?;
+            staging.commit_to(&mirror, source.as_str())?;
         }
 
         Ok(())
@@ -1062,13 +1098,29 @@ pub(crate) fn import_tree(
 ) -> Result<String> {
     let mirror = mirror_path(git_dir, url);
 
-    let repo = if mirror.exists() {
-        gix::open(&mirror).map_err(|e| SourceError::Source(format!("open mirror {url}: {e}")))?
-    } else {
-        gix::init_bare(&mirror)
-            .map_err(|e| SourceError::Source(format!("init mirror {url}: {e}")))?
-    };
+    if mirror.exists() {
+        let repo =
+            gix::open(&mirror).map_err(|e| SourceError::Source(format!("open mirror {url}: {e}")))?;
+        return write_import(&repo, url, entries);
+    }
 
+    std::fs::create_dir_all(git_dir)
+        .map_err(|e| SourceError::Source(format!("create git dir for {url}: {e}")))?;
+    let staging = MirrorStaging::create(git_dir, url);
+    let commit = {
+        let repo = gix::init_bare(&staging.path)
+            .map_err(|e| SourceError::Source(format!("init mirror {url}: {e}")))?;
+        write_import(&repo, url, entries)?
+    };
+    staging.commit_to(&mirror, url)?;
+    Ok(commit)
+}
+
+fn write_import(
+    repo: &gix::Repository,
+    url: &str,
+    entries: &[crate::archive::ExtractedEntry],
+) -> Result<String> {
     let mut root = ImportDir::default();
     for entry in entries {
         let oid = repo
@@ -1078,7 +1130,7 @@ pub(crate) fn import_tree(
         root.insert(&entry.path, to_gix_entry_kind(entry.kind), oid)?;
     }
 
-    let root_oid = write_import_tree(&repo, &root, url)?;
+    let root_oid = write_import_tree(repo, &root, url)?;
 
     let signature = gix::actor::Signature {
         name: IMPORT_NAME.into(),
@@ -3397,6 +3449,25 @@ path = "srnnkls/tropos"
         assert_ne!(
             base, changed,
             "changing a file's bytes must change the content-addressed commit id"
+        );
+    }
+
+    #[test]
+    fn failed_fresh_import_leaves_no_mirror_at_canonical_path() {
+        let dir = TempDir::new().expect("git_dir");
+        let key = MirrorKey::from_url(&NormalizedUrl::parse(IMPORT_URL));
+        let mirror = dir.path().join(format!("{}.git", key.as_str()));
+        let duplicate = vec![
+            entry("dup.txt", BlobKind::Blob, b"one"),
+            entry("dup.txt", BlobKind::Blob, b"two"),
+        ];
+
+        let result = import_tree(dir.path(), IMPORT_URL, &duplicate);
+
+        assert!(result.is_err(), "a duplicate archive entry path must error");
+        assert!(
+            !mirror.exists(),
+            "a failed fresh import must not leave a partial mirror at the canonical path"
         );
     }
 
