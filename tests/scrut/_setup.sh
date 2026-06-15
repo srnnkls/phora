@@ -25,8 +25,10 @@ isolate_state() {
 	export XDG_CACHE_HOME="$PWD/cache"
 	export XDG_STATE_HOME="$PWD/state"
 	# XDG_DATA_HOME deliberately unset — matches the xdg-base-dirs scope.
+	# TMPDIR per-doc so concurrent suites don't share rebuild staging in the system temp.
+	export TMPDIR="$PWD/tmp"
 	unset GIT_AUTHOR_DATE GIT_COMMITTER_DATE
-	mkdir -p "$XDG_CACHE_HOME" "$XDG_STATE_HOME"
+	mkdir -p "$XDG_CACHE_HOME" "$XDG_STATE_HOME" "$TMPDIR"
 }
 
 # macOS canonicalizes /var -> /private/var, so `phora add` emits the /private
