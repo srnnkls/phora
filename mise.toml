@@ -17,6 +17,10 @@ run = ["cargo clippy --all-targets -- -D warnings", "cargo fmt --check"]
 [tasks.fmt]
 run = "cargo fmt"
 
+[tasks.bench]
+description = "Criterion benchmarks (parallel-resolve speedup)"
+run = "cargo bench --features bench"
+
 [tasks.check]
 depends = ["lint", "test"]
 

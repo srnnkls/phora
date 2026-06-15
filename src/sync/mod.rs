@@ -21,6 +21,9 @@ pub use preview::{
 pub use rebuild::{RebuildReport, rebuild_registry};
 pub use verify::{VerifyMismatch, VerifyReason, verify};
 
+#[cfg(feature = "bench")]
+pub use resolve::resolve_sources_for_bench;
+
 use prune::prune_orphans;
 use resolve::resolve_sources;
 pub(crate) use target::record_artifact_path;
