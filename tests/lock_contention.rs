@@ -122,7 +122,8 @@ fn hold_project_lock(fixture: &Fixture) -> std::fs::File {
         .truncate(false)
         .open(&lock_path)
         .expect("open lock file");
-    file.try_lock().expect("test acquires the project lock first");
+    file.try_lock()
+        .expect("test acquires the project lock first");
     file
 }
 
@@ -160,7 +161,14 @@ fn eject_fails_fast_with_ex_tempfail_when_project_lock_is_held() {
 
     let out = run(
         &fixture,
-        &["eject", "editor/init.lua", "--source", "dotfiles", "--target", "home"],
+        &[
+            "eject",
+            "editor/init.lua",
+            "--source",
+            "dotfiles",
+            "--target",
+            "home",
+        ],
     );
 
     assert_contended(&out, "eject");
@@ -174,7 +182,14 @@ fn uneject_fails_fast_with_ex_tempfail_when_project_lock_is_held() {
 
     let out = run(
         &fixture,
-        &["uneject", "editor/init.lua", "--source", "dotfiles", "--target", "home"],
+        &[
+            "uneject",
+            "editor/init.lua",
+            "--source",
+            "dotfiles",
+            "--target",
+            "home",
+        ],
     );
 
     assert_contended(&out, "uneject");

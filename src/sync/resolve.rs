@@ -89,21 +89,21 @@ fn fetch_distinct_mirrors(
             continue;
         }
         let git = remote_for(remotes, &unit.name)?;
-        let key = MirrorKey::from_url(&NormalizedUrl::parse(git)).as_str().to_owned();
+        let key = MirrorKey::from_url(&NormalizedUrl::parse(git))
+            .as_str()
+            .to_owned();
         let fetches = groups.entry(key).or_default();
         if source.mode() == SourceMode::Url || fetches.is_empty() {
             fetches.push((SourceName::trusted(unit.name.clone()), git.to_owned()));
         }
     }
 
-    groups
-        .into_par_iter()
-        .try_for_each(|(_key, fetches)| {
-            for (name, git) in &fetches {
-                backend.fetch(name, git)?;
-            }
-            Ok(())
-        })
+    groups.into_par_iter().try_for_each(|(_key, fetches)| {
+        for (name, git) in &fetches {
+            backend.fetch(name, git)?;
+        }
+        Ok(())
+    })
 }
 
 /// The lock entry that lets a unit skip fetch+resolve, or `None` when a fetch is
@@ -172,7 +172,13 @@ fn resolve_unit(
         backend.compute_digest(&source_name, git, &commit, None, &full)?
     } else {
         let selection = Selection::new(source.includes(), source.excludes())?;
-        backend.compute_digest(&source_name, git, &commit, source.root.as_deref(), &selection)?
+        backend.compute_digest(
+            &source_name,
+            git,
+            &commit,
+            source.root.as_deref(),
+            &selection,
+        )?
     };
 
     let resolved = if source.mode() == SourceMode::Url {
@@ -227,7 +233,15 @@ pub(super) fn resolve_sources(
         let resolved: Vec<Option<Resolved>> = units
             .par_iter()
             .map(|unit| {
-                resolve_unit(config, parsed, remotes, effective_lock, backend, force, unit)
+                resolve_unit(
+                    config,
+                    parsed,
+                    remotes,
+                    effective_lock,
+                    backend,
+                    force,
+                    unit,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
 
