@@ -2,3 +2,5 @@
 
 # Scope-tracking working notes are local-only, never tracked.
 /scopes/
+
+/resources/

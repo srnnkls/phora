@@ -10,7 +10,10 @@ clap = { version = "4.6.1", features = ["derive"] }
 dirs = "6.0.0"
 filetime = "0.2.29"
 flate2 = "1.1.9"
-gix = { version = "0.84.0", features = ["blocking-network-client"] }
+gix = { version = "0.84.0", features = [
+    "blocking-network-client",
+    "blocking-http-transport-reqwest-rust-tls",
+] }
 globset = "0.4.18"
 minijinja = { version = "2.5.0", features = ["fuel"] }
 rayon = "1.11"
