@@ -5039,3 +5039,107 @@ fn sync_without_jobs_flag_defaults_to_unset() {
          min(units, 8) is chosen downstream"
     );
 }
+
+// ── empty-state rendering: `list` / `where` (no deployed artifacts) ──
+
+#[test]
+fn format_listings_marks_an_empty_target_with_a_sync_hint() {
+    let listings = vec![TargetListing {
+        target: "claude".to_owned(),
+        artifacts: vec![],
+    }];
+    let out = render::format_listings(&listings);
+    assert!(
+        out.contains("claude:"),
+        "the target header must still render for an undeployed target, got: {out}"
+    );
+    assert!(
+        out.contains("nothing deployed") && out.contains("phora sync"),
+        "an empty target must say nothing is deployed and point at `phora sync`, got: {out}"
+    );
+}
+
+#[test]
+fn format_listings_renders_deployed_artifacts_without_the_empty_hint() {
+    let listings = vec![TargetListing {
+        target: "claude".to_owned(),
+        artifacts: vec![query::ArtifactStatus {
+            source: "tropos".to_owned(),
+            artifact: "agents".to_owned(),
+            state: "clean".to_owned(),
+        }],
+    }];
+    let out = render::format_listings(&listings);
+    assert!(
+        out.contains("tropos/agents") && out.contains("clean"),
+        "a populated target must render its artifact rows, got: {out}"
+    );
+    assert!(
+        !out.contains("nothing deployed"),
+        "a populated target must not show the empty hint, got: {out}"
+    );
+}
+
+#[test]
+fn format_where_empty_names_the_source_filter_and_points_at_sync_and_preview() {
+    let filter = WhereFilter {
+        digest: None,
+        source: Some("tropos".to_owned()),
+        artifact: None,
+        commit: None,
+    };
+    let out = render::format_where_matches(&[], &filter);
+    assert!(
+        out.contains("source `tropos`"),
+        "the empty message must name the active source filter, got: {out}"
+    );
+    assert!(
+        out.contains("phora sync") && out.contains("phora preview"),
+        "the empty message must point at sync (deploy) and preview (plan), got: {out}"
+    );
+}
+
+#[test]
+fn format_where_empty_without_a_filter_reports_none_generally() {
+    let filter = WhereFilter {
+        digest: None,
+        source: None,
+        artifact: None,
+        commit: None,
+    };
+    let out = render::format_where_matches(&[], &filter);
+    assert!(
+        out.to_lowercase().contains("no deployed artifacts"),
+        "an unfiltered empty result must report that nothing is deployed, got: {out}"
+    );
+    assert!(
+        !out.contains(" match "),
+        "with no filter the message must not claim a filter match, got: {out}"
+    );
+}
+
+#[test]
+fn format_where_renders_matches() {
+    let m = WhereMatch {
+        source: "tropos".to_owned(),
+        artifact: "agents".to_owned(),
+        commit: "abcdef1234".to_owned(),
+        digest: "blake3:xyz".to_owned(),
+        targets: vec!["claude".to_owned()],
+    };
+    let filter = WhereFilter {
+        digest: None,
+        source: None,
+        artifact: None,
+        commit: None,
+    };
+    let out = render::format_where_matches(std::slice::from_ref(&m), &filter);
+    assert!(
+        out.contains("Artifact: tropos/agents"),
+        "a non-empty result must render the artifact line, got: {out}"
+    );
+    assert!(
+        out.contains("claude"),
+        "a non-empty result must list the deployed-to target, got: {out}"
+    );
+}

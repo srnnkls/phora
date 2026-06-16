@@ -289,16 +289,14 @@ pub fn run(cli: Cli) -> Result<()> {
             artifact,
             commit,
         } => {
-            let matches = where_cmd(
-                &open_project_registry()?,
-                &WhereFilter {
-                    digest,
-                    source,
-                    artifact,
-                    commit,
-                },
-            )?;
-            render::print_where_matches(&matches);
+            let filter = WhereFilter {
+                digest,
+                source,
+                artifact,
+                commit,
+            };
+            let matches = where_cmd(&open_project_registry()?, &filter)?;
+            render::print_where_matches(&matches, &filter);
             Ok(())
         }
         Command::Eject {

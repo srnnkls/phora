@@ -9,7 +9,7 @@ use crate::sync::{HookOutcome, HookScope, HookStatus, SyncState};
 
 use super::query::{
     CheckMatchReport, PreviewPlan, SourceResolution, SourceRow, SourceSummary, TargetDetail,
-    TargetListing, TargetRow, WhereMatch,
+    TargetListing, TargetRow, WhereFilter, WhereMatch,
 };
 
 #[must_use]
@@ -34,15 +34,31 @@ pub(super) fn render_hook_report(outcomes: &[HookOutcome]) -> String {
 }
 
 pub(super) fn print_listings(listings: &[TargetListing]) {
+    print!("{}", format_listings(listings));
+}
+
+#[must_use]
+pub(super) fn format_listings(listings: &[TargetListing]) -> String {
+    let mut out = String::new();
+    if listings.is_empty() {
+        let _ = writeln!(out, "No targets configured.");
+        return out;
+    }
     for listing in listings {
-        println!("{}:", listing.target);
+        let _ = writeln!(out, "{}:", listing.target);
+        if listing.artifacts.is_empty() {
+            let _ = writeln!(out, "  (nothing deployed — run `phora sync`)");
+            continue;
+        }
         for artifact in &listing.artifacts {
-            println!(
+            let _ = writeln!(
+                out,
                 "  {}/{}  {}",
                 artifact.source, artifact.artifact, artifact.state
             );
         }
     }
+    out
 }
 
 pub(super) fn print_verify(mismatches: &[crate::sync::VerifyMismatch]) {
@@ -65,17 +81,54 @@ pub(super) fn print_verify(mismatches: &[crate::sync::VerifyMismatch]) {
     }
 }
 
-pub(super) fn print_where_matches(matches: &[WhereMatch]) {
+pub(super) fn print_where_matches(matches: &[WhereMatch], filter: &WhereFilter) {
+    print!("{}", format_where_matches(matches, filter));
+}
+
+#[must_use]
+pub(super) fn format_where_matches(matches: &[WhereMatch], filter: &WhereFilter) -> String {
+    let mut out = String::new();
+    if matches.is_empty() {
+        match where_filter_description(filter) {
+            Some(desc) => {
+                let _ = writeln!(out, "No deployed artifacts match {desc}.");
+            }
+            None => {
+                let _ = writeln!(out, "No deployed artifacts yet.");
+            }
+        }
+        let _ = writeln!(
+            out,
+            "Run `phora sync` to deploy, or `phora preview` to see the plan."
+        );
+        return out;
+    }
     for m in matches {
         let commit = m.commit.get(..8).unwrap_or(&m.commit);
-        println!(
+        let _ = writeln!(
+            out,
             "Artifact: {}/{} (commit {commit}, digest {})",
             m.source, m.artifact, m.digest
         );
         for target in &m.targets {
-            println!("  - {target}");
+            let _ = writeln!(out, "  - {target}");
         }
     }
+    out
+}
+
+/// A human phrase for the active `where` filter constraints, or `None` when unfiltered.
+fn where_filter_description(filter: &WhereFilter) -> Option<String> {
+    let parts: Vec<String> = [
+        ("source", filter.source.as_deref()),
+        ("artifact", filter.artifact.as_deref()),
+        ("commit", filter.commit.as_deref()),
+        ("digest", filter.digest.as_deref()),
+    ]
+    .into_iter()
+    .filter_map(|(label, value)| value.map(|v| format!("{label} `{v}`")))
+    .collect();
+    (!parts.is_empty()).then(|| parts.join(", "))
 }
 
 pub(super) fn print_check_match(source: &ParsedSource, path: &str, report: &CheckMatchReport) {
