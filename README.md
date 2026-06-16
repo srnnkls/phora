@@ -382,9 +382,15 @@ sources = [{ source = "dotfiles", as = "nvim", root = "nvim" }]
 
 **Identity (`as`).** A binding's identity defaults to the source name and can be
 overridden with `as`. The identity keys the registry artifact and the `by-source`
-and `prefixed` layout labels, and must be unique within a target. Because identity
-is what's unique — not the source — the **same source can appear more than once in
-one target** under distinct `as` values, projecting two independent slices:
+and `prefixed` layout labels. Bindings that share an identity must resolve to the
+**same source at the same ref** — so one source can appear more than once in a
+target under its default identity (two slices via different `root`/`include`/`map`),
+while two *different* sources, or one source at two *different* refs, must each take
+a distinct `as`. A genuine destination clash between bindings is caught at sync as a
+collision, not by the identity rule. The slices below name each `as` explicitly for
+legible `by-source` labels (`nvim/…`, `helix/…`); the `as` is optional here —
+omitting it lets both share the `dotfiles` identity, allowed because they select
+different roots and so never clash on a destination:
 
 ```toml
 [targets.editors]
@@ -408,8 +414,8 @@ a config that names no binding refs locks byte-for-byte as before; a ref-overrid
 binding records its own entry. Resolution still does one fetch per source —
 that single fetch covers every ref the source's bindings name.
 
-To bind one source at two versions, give each binding a distinct `as` — identity must
-be unique within a target, the same rule as two slices:
+To bind one source at two versions, give each binding a distinct `as` — two *refs* of
+one source may not share an identity (unlike same-ref slices, which may):
 
 ```toml
 [targets.tools]
@@ -469,8 +475,9 @@ deploys as.
 - **Mutually exclusive with `include`/`exclude`.** `map` selects exact leaves, so
   combining it with glob selection on the same binding is a config error.
 - **Fan-out without duplication.** The same source leaf can map to different dests
-  across bindings and targets (give each binding a distinct `as` — identity must be
-  unique within a target, as for any other slice). The source is fetched once.
+  across bindings and targets — bindings of one source at one ref may share the
+  default identity (their dests differ, so they never clash) or take distinct `as`
+  values. The source is fetched once.
 - **Copy and link both work.** Default `deploy = "copy"` materializes the leaf;
   `deploy = "link"` (local-path only — see [Link mode](#link-mode-local-development))
   makes the dest a symlink to the source leaf in the working tree. A missing link
