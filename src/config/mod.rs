@@ -135,7 +135,6 @@ impl Config {
 
     fn validate_bindings(&self) -> Result<()> {
         for (target_name, target) in &self.targets {
-            let mut identities = BTreeSet::new();
             for binding in target.sources.iter().flatten() {
                 let Some(source) = self.sources.get(binding.source()) else {
                     return Err(Error::Config(format!(
@@ -143,17 +142,30 @@ impl Config {
                         binding.source()
                     )));
                 };
-                if !identities.insert(binding.identity()) {
-                    return Err(Error::Config(format!(
-                        "target `{target_name}` binds the identity `{}` more than once; \
-                         give each binding a distinct `as` to bind two versions of one source",
-                        binding.identity()
-                    )));
-                }
                 reject_url_slice(binding, source)?;
                 reject_link_ref(binding, source)?;
                 reject_multi_ref(binding)?;
                 reject_map(binding)?;
+            }
+            self.validate_identity_coherence(target_name, target)?;
+        }
+        Ok(())
+    }
+
+    fn validate_identity_coherence(&self, target_name: &str, target: &Target) -> Result<()> {
+        let resolved = target.resolve_sources(&self.sources);
+        let mut owner: BTreeMap<&str, (&str, (u8, &str))> = BTreeMap::new();
+        for binding in &resolved {
+            let upstream = (binding.source, ref_key(&binding.effective_ref));
+            if let Some(prior) = owner.insert(binding.identity, upstream)
+                && prior != upstream
+            {
+                return Err(Error::Config(format!(
+                    "target `{target_name}` binds the identity `{}` to two distinct upstreams; \
+                     bindings sharing an identity must name one source at one ref — \
+                     give one a distinct `as` to bind two versions side by side",
+                    binding.identity
+                )));
             }
         }
         Ok(())
@@ -182,6 +194,15 @@ impl Config {
             .iter()
             .filter_map(|(name, source)| migrate::warning_for(name, source, base_dir))
             .collect()
+    }
+}
+
+fn ref_key(refspec: &Refspec) -> (u8, &str) {
+    match refspec {
+        Refspec::Branch(s) => (0, s),
+        Refspec::Tag(s) => (1, s),
+        Refspec::Rev(s) => (2, s),
+        Refspec::None => (3, ""),
     }
 }
 

@@ -63,52 +63,50 @@ pub(super) fn deploy_target(
         let source_name = SourceName::trusted(binding.source);
         let selection = Selection::new(binding.include, binding.exclude)?;
 
-        let mut deploy_one_entry =
-            |artifact_name: &ArtifactName, mapped_source_key: Option<&str>| -> Result<()> {
-                let artifact_dst = artifact_dst_for(
-                    &target_path,
-                    &layout,
-                    binding.identity,
-                    artifact_name,
-                    mapped_source_key,
-                );
-                if let Some(other) = seen_dest.get(&artifact_dst) {
-                    if other != binding.identity {
-                        return Err(Error::Collision {
-                            artifact: artifact_name.as_str().to_owned(),
-                            sources: vec![other.clone(), binding.identity.to_owned()],
-                            target: run.target_name.to_owned(),
-                        });
-                    }
-                } else {
-                    seen_dest.insert(artifact_dst.clone(), binding.identity.to_owned());
-                }
-                let dst_is_symlink = std::fs::symlink_metadata(&artifact_dst)
-                    .is_ok_and(|m| m.file_type().is_symlink());
-                let mode_transition = match source.deploy_mode() {
-                    DeployMode::Link => artifact_dst.exists() && !dst_is_symlink,
-                    DeployMode::Copy => dst_is_symlink,
-                };
-                let entry = ArtifactEntry {
-                    source,
-                    git,
-                    source_name: &source_name,
-                    identity: binding.identity,
-                    underlying_source: binding.source,
-                    root: binding.root,
-                    commit,
-                    selection: &selection,
-                    artifact_name,
-                    target_path: &target_path,
-                    layout_kind: layout.kind,
-                    ejected: &ejected,
-                    mode_transition,
-                    template_opt_in: &binding.template_opt_in,
-                    mapped_source_key,
-                };
-                had_failures |= deploy_artifact_entry(run, &entry, backend, registry, journal)?;
-                Ok(())
+        let mut deploy_one_entry = |artifact_name: &ArtifactName,
+                                    mapped_source_key: Option<&str>|
+         -> Result<()> {
+            let artifact_dst = artifact_dst_for(
+                &target_path,
+                &layout,
+                binding.identity,
+                artifact_name,
+                mapped_source_key,
+            );
+            if let Some(other) = seen_dest.insert(artifact_dst.clone(), binding.identity.to_owned())
+            {
+                return Err(Error::Collision {
+                    artifact: artifact_name.as_str().to_owned(),
+                    sources: vec![other, binding.identity.to_owned()],
+                    target: run.target_name.to_owned(),
+                });
+            }
+            let dst_is_symlink =
+                std::fs::symlink_metadata(&artifact_dst).is_ok_and(|m| m.file_type().is_symlink());
+            let mode_transition = match source.deploy_mode() {
+                DeployMode::Link => artifact_dst.exists() && !dst_is_symlink,
+                DeployMode::Copy => dst_is_symlink,
             };
+            let entry = ArtifactEntry {
+                source,
+                git,
+                source_name: &source_name,
+                identity: binding.identity,
+                underlying_source: binding.source,
+                root: binding.root,
+                commit,
+                selection: &selection,
+                artifact_name,
+                target_path: &target_path,
+                layout_kind: layout.kind,
+                ejected: &ejected,
+                mode_transition,
+                template_opt_in: &binding.template_opt_in,
+                mapped_source_key,
+            };
+            had_failures |= deploy_artifact_entry(run, &entry, backend, registry, journal)?;
+            Ok(())
+        };
 
         if let Some(map) = binding.map {
             for (key, dest) in map {

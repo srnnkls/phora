@@ -1372,6 +1372,38 @@ fn flat_layout_collision_detected_between_two_aliases_sharing_a_destination() {
     drop(src);
 }
 
+#[test]
+fn same_identity_bindings_sharing_a_destination_still_collide() {
+    let (src, url) = build_multi_root_repo();
+    let td = TargetDir::new();
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let toml = format!(
+        "version = 1\n\n[sources.dots]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\n\
+         {{ source = \"dots\", root = \"nvim\" }},\n\
+         {{ source = \"dots\", root = \"nvim\" }},\n\
+         ]\nlayout = \"flat\"\n",
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("two bare same-source bindings parse");
+
+    let Err(Error::Collision {
+        artifact, target, ..
+    }) = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+    else {
+        panic!(
+            "two bindings of one source sharing a default identity and projecting `init` into a \
+             flat target must collide on the destination, not silently overwrite"
+        );
+    };
+    assert_eq!(
+        artifact, "init",
+        "the collision must name the shared artifact"
+    );
+    assert_eq!(target, "dest", "the collision must name the target");
+    drop(src);
+}
+
 /// A link-mode binding's symlink must point through the binding's effective root:
 /// the source declares none, the binding sets `root = languages`, so the link must
 /// resolve to `<git>/languages/<artifact>`, not the un-rooted `<git>/<artifact>`.

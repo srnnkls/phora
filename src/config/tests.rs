@@ -3580,56 +3580,46 @@ mod per_binding_refinement {
     }
 
     #[test]
-    fn validate_rejects_duplicate_bare_identity_within_a_target() {
+    fn validate_allows_duplicate_bare_identity_from_one_source() {
         let cfg = config(
             "version = 1\n\n\
              [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
              [targets.editor]\npath = \"~/.config\"\nsources = [\"dotfiles\", \"dotfiles\"]\n",
         );
-        let err = cfg.validate().expect_err(
-            "two bare `dotfiles` bindings collide on identity `dotfiles` within target `editor` \
-             and must be rejected",
+        cfg.validate().expect(
+            "two bare bindings of the SAME source share one identity and one provenance, so they \
+             are valid; an actual destination clash is caught at deploy, not by an identity proxy",
         );
-        match err {
-            Error::Config(msg) => {
-                assert!(
-                    msg.contains("editor"),
-                    "the duplicate-identity error must name the offending target `editor`, got: {msg}"
-                );
-                assert!(
-                    msg.contains("dotfiles"),
-                    "the duplicate-identity error must name the colliding identity `dotfiles`, got: {msg}"
-                );
-            }
-            other => panic!("expected Error::Config, got {other:?}"),
-        }
     }
 
     #[test]
-    fn validate_rejects_identity_collision_between_bare_and_table_forms() {
+    fn validate_allows_two_mapped_bindings_of_one_source_without_distinct_as() {
+        let cfg = config(
+            "version = 1\n\n\
+             [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
+             [targets.editor]\npath = \"~/.config\"\nsources = [\n\
+                { source = \"dotfiles\", map = { \"a.toml\" = \"one.toml\" } },\n\
+                { source = \"dotfiles\", map = { \"b.toml\" = \"two.toml\" } },\n\
+             ]\n",
+        );
+        cfg.validate().expect(
+            "two map bindings of one source at one ref project to distinct dests; sharing the \
+             default identity is valid without `as`, and any real dest clash is caught at deploy",
+        );
+    }
+
+    #[test]
+    fn validate_allows_duplicate_identity_across_bare_and_table_forms_of_one_source() {
         let cfg = config(
             "version = 1\n\n\
              [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
              [targets.editor]\npath = \"~/.config\"\n\
              sources = [\"dotfiles\", { source = \"dotfiles\" }]\n",
         );
-        let err = cfg.validate().expect_err(
-            "a table binding with no `as` defaults its identity to its source name `dotfiles`, \
-             colliding with the bare `dotfiles` binding; this must be rejected even across forms",
+        cfg.validate().expect(
+            "a bare binding and a table binding with no `as`, both naming `dotfiles`, share one \
+             identity backed by one source — valid regardless of the form each takes",
         );
-        match err {
-            Error::Config(msg) => {
-                assert!(
-                    msg.contains("editor"),
-                    "the collision error must name the target `editor`, got: {msg}"
-                );
-                assert!(
-                    msg.contains("dotfiles"),
-                    "the collision error must name the colliding identity `dotfiles`, got: {msg}"
-                );
-            }
-            other => panic!("expected Error::Config, got {other:?}"),
-        }
     }
 
     #[test]
