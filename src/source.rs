@@ -1362,10 +1362,14 @@ mod tests {
         author_date: &str,
         committer_date: &str,
     ) -> std::process::Output {
+        crate::store::assert_git_sandboxed(cwd);
         let _serial = crate::store::guard_git_fork();
         let out = Command::new("git")
             .args(args)
             .current_dir(cwd)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_AUTHOR_DATE", author_date)
             .env("GIT_COMMITTER_DATE", committer_date)
             .output()

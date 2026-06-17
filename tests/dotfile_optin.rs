@@ -15,10 +15,16 @@ struct Fixture {
     xdg_state: PathBuf,
 }
 
+mod common;
+
 fn git(cwd: &Path, args: &[&str]) {
+    common::assert_sandboxed(cwd);
     let out = Command::new("git")
         .current_dir(cwd)
         .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_AUTHOR_DATE", "@1700000000 +0000")
         .env("GIT_COMMITTER_DATE", "@1800000000 +0000")
         .output()

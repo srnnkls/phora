@@ -43,10 +43,14 @@ fn one_commit(
     reason = "fixture setup fails loudly; git CLI is assumed present"
 )]
 fn run_git(cwd: &Path, args: &[&str]) {
+    crate::store::assert_git_sandboxed(cwd);
     let _serial = crate::store::guard_git_fork();
     let out = Command::new("git")
         .args(args)
         .current_dir(cwd)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_AUTHOR_DATE", "@1700000000 +0000")
         .env("GIT_COMMITTER_DATE", "@1700000000 +0000")
         .output()

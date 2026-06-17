@@ -187,6 +187,20 @@ pub(crate) fn guard_git_fork() -> std::sync::RwLockReadGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Refuse fixture git outside the temp sandbox, so it can never write a real repo.
+#[cfg(test)]
+pub(crate) fn assert_git_sandboxed(cwd: &std::path::Path) {
+    let sandbox = std::env::temp_dir();
+    let sandbox = sandbox.canonicalize().unwrap_or(sandbox);
+    let target = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    assert!(
+        target.starts_with(&sandbox),
+        "fixture git refused outside temp sandbox: {} not under {}",
+        target.display(),
+        sandbox.display(),
+    );
+}
+
 const META_VERSION: u32 = 1;
 
 #[derive(Serialize, Deserialize)]
