@@ -56,10 +56,12 @@ Artifact: dotfiles/lint (commit ca94c83b, digest blake3:d26cc52a7261d7a76fa1f6da
 
 ## Filter with no match
 
-A filter that matches nothing produces no output.
+A filter that matches nothing explains the empty result instead of rendering blank.
 
 ```scrut
 $ phora where --artifact nonexistent 2>&1 | normalize
+No deployed artifacts match artifact `nonexistent`.
+Run `phora sync` to deploy, or `phora preview` to see the plan.
 ```
 
 ## Include/exclude matching — an included path

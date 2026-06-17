@@ -107,10 +107,12 @@ $ cat "$PWD/target-home/editor/init.lua"
 
 ## Rebuild registry — reconstruct from lock and on-disk targets
 
-Deleting the global registry under `XDG_STATE_HOME` leaves `phora where` empty.
+Deleting the global registry under `XDG_STATE_HOME` leaves `phora where` with nothing to report.
 
 ```scrut
 $ rm -rf "$XDG_STATE_HOME"/phora/projects && phora where 2>&1 | normalize
+No deployed artifacts yet.
+Run `phora sync` to deploy, or `phora preview` to see the plan.
 ```
 
 `phora rebuild-registry` walks the lock and the on-disk targets to reconstruct
