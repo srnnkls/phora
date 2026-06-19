@@ -21,8 +21,7 @@ pub use host::{AuthConfig, Host, RemoteConfig, builtin_forges};
 pub use migrate::MigrationWarning;
 pub use source::{DeployMode, ParsedSource, Refspec, Remote, Source, SourceMode};
 pub use target::{
-    Binding, LayoutConfig, LayoutKind, RefinedBinding, ResolvedBinding, SourceFields, Target,
-    TemplateOptIn,
+    Binding, LayoutConfig, LayoutKind, ResolvedBinding, SourceFields, Target, TemplateOptIn,
 };
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -67,6 +66,7 @@ impl Config {
     /// Returns [`Error::Config`] if the document is not valid TOML, contains an
     /// unknown key, or a source sets more than one of `branch`/`tag`/`rev`.
     pub fn parse(s: &str) -> Result<Self> {
+        reject_legacy_binding_arrays(s)?;
         let config: Self = toml::from_str(s).map_err(|e| Error::Config(e.to_string()))?;
         for (name, host) in &config.hosts {
             if let Some(remote) = &host.remote
@@ -135,37 +135,17 @@ impl Config {
 
     fn validate_bindings(&self) -> Result<()> {
         for (target_name, target) in &self.targets {
-            for binding in target.sources.iter().flatten() {
-                let Some(source) = self.sources.get(binding.source()) else {
+            for (identity, binding) in target.sources.iter().flatten() {
+                let effective = binding.effective_source(identity);
+                let Some(source) = self.sources.get(effective) else {
                     return Err(Error::Config(format!(
-                        "target `{target_name}` references undefined source `{}`",
-                        binding.source()
+                        "target `{target_name}` references undefined source `{effective}`"
                     )));
                 };
-                reject_url_slice(binding, source)?;
-                reject_link_ref(binding, source)?;
-                reject_multi_ref(binding)?;
-                reject_map(binding)?;
-            }
-            self.validate_identity_coherence(target_name, target)?;
-        }
-        Ok(())
-    }
-
-    fn validate_identity_coherence(&self, target_name: &str, target: &Target) -> Result<()> {
-        let resolved = target.resolve_sources(&self.sources);
-        let mut owner: BTreeMap<&str, (&str, (u8, &str))> = BTreeMap::new();
-        for binding in &resolved {
-            let upstream = (binding.source, ref_key(&binding.effective_ref));
-            if let Some(prior) = owner.insert(binding.identity, upstream)
-                && prior != upstream
-            {
-                return Err(Error::Config(format!(
-                    "target `{target_name}` binds the identity `{}` to two distinct upstreams; \
-                     bindings sharing an identity must name one source at one ref — \
-                     give one a distinct `as` to bind two versions side by side",
-                    binding.identity
-                )));
+                reject_url_slice(effective, binding, source)?;
+                reject_link_ref(effective, binding, source)?;
+                reject_multi_ref(effective, binding)?;
+                reject_map(effective, binding)?;
             }
         }
         Ok(())
@@ -197,77 +177,91 @@ impl Config {
     }
 }
 
-fn ref_key(refspec: &Refspec) -> (u8, &str) {
-    match refspec {
-        Refspec::Branch(s) => (0, s),
-        Refspec::Tag(s) => (1, s),
-        Refspec::Rev(s) => (2, s),
-        Refspec::None => (3, ""),
-    }
-}
-
-fn reject_url_slice(binding: &Binding, source: &Source) -> Result<()> {
-    let Binding::Refined(refined) = binding else {
+fn reject_legacy_binding_arrays(s: &str) -> Result<()> {
+    let doc: toml::Value = match toml::from_str(s) {
+        Ok(value) => value,
+        Err(_) => return Ok(()),
+    };
+    let Some(targets) = doc.get("targets").and_then(toml::Value::as_table) else {
         return Ok(());
     };
+    for (target_name, target) in targets {
+        let Some(array) = target.get("sources").and_then(toml::Value::as_array) else {
+            continue;
+        };
+        let mut seen = BTreeSet::new();
+        for element in array {
+            match element {
+                toml::Value::String(name) => {
+                    if !seen.insert(name.as_str()) {
+                        return Err(Error::Config(format!(
+                            "target `{target_name}`: duplicate source `{name}` in the `sources` list"
+                        )));
+                    }
+                }
+                _ => {
+                    return Err(Error::Config(format!(
+                        "target `{target_name}`: table entries in a `sources` list are no longer \
+                         supported; use a keyed `[targets.{target_name}.sources]` table instead"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reject_url_slice(source_name: &str, binding: &Binding, source: &Source) -> Result<()> {
     if source.url.is_none() {
         return Ok(());
     }
-    let field = if refined.root.is_some() {
+    let field = if binding.root.is_some() {
         "root"
-    } else if refined.include.is_some() {
+    } else if binding.include.is_some() {
         "include"
-    } else if refined.exclude.is_some() {
+    } else if binding.exclude.is_some() {
         "exclude"
-    } else if refined.branch.is_some() {
+    } else if binding.branch.is_some() {
         "branch"
-    } else if refined.tag.is_some() {
+    } else if binding.tag.is_some() {
         "tag"
-    } else if refined.rev.is_some() {
+    } else if binding.rev.is_some() {
         "rev"
-    } else if refined.template.is_some() {
+    } else if binding.template.is_some() {
         "template"
-    } else if refined.map.is_some() {
+    } else if binding.map.is_some() {
         "map"
     } else {
         return Ok(());
     };
     Err(Error::Config(format!(
-        "source `{}`: `{field}` is meaningless on a `url` source",
-        refined.source
+        "source `{source_name}`: `{field}` is meaningless on a `url` source"
     )))
 }
 
-fn reject_link_ref(binding: &Binding, source: &Source) -> Result<()> {
-    let Binding::Refined(refined) = binding else {
-        return Ok(());
-    };
+fn reject_link_ref(source_name: &str, binding: &Binding, source: &Source) -> Result<()> {
     if source.deploy != Some(DeployMode::Link) {
         return Ok(());
     }
-    let field = if refined.branch.is_some() {
+    let field = if binding.branch.is_some() {
         "branch"
-    } else if refined.tag.is_some() {
+    } else if binding.tag.is_some() {
         "tag"
-    } else if refined.rev.is_some() {
+    } else if binding.rev.is_some() {
         "rev"
     } else {
         return Ok(());
     };
     Err(Error::Config(format!(
-        "source `{}`: `{field}` is meaningless on a `link` source",
-        refined.source
+        "source `{source_name}`: `{field}` is meaningless on a `link` source"
     )))
 }
 
-fn reject_multi_ref(binding: &Binding) -> Result<()> {
-    let Binding::Refined(refined) = binding else {
-        return Ok(());
-    };
+fn reject_multi_ref(source_name: &str, binding: &Binding) -> Result<()> {
     let set: Vec<&str> = [
-        ("branch", refined.branch.is_some()),
-        ("tag", refined.tag.is_some()),
-        ("rev", refined.rev.is_some()),
+        ("branch", binding.branch.is_some()),
+        ("tag", binding.tag.is_some()),
+        ("rev", binding.rev.is_some()),
     ]
     .into_iter()
     .filter_map(|(name, present)| present.then_some(name))
@@ -279,27 +273,23 @@ fn reject_multi_ref(binding: &Binding) -> Result<()> {
             .collect::<Vec<_>>()
             .join(", ");
         return Err(Error::Config(format!(
-            "source `{}`: sets more than one of branch/tag/rev ({fields})",
-            refined.source
+            "source `{source_name}`: sets more than one of branch/tag/rev ({fields})"
         )));
     }
     Ok(())
 }
 
-fn reject_map(binding: &Binding) -> Result<()> {
-    let Binding::Refined(refined) = binding else {
+fn reject_map(source_name: &str, binding: &Binding) -> Result<()> {
+    let Some(map) = &binding.map else {
         return Ok(());
     };
-    let Some(map) = &refined.map else {
-        return Ok(());
-    };
-    let source = &refined.source;
-    if refined.include.is_some() {
+    let source = source_name;
+    if binding.include.is_some() {
         return Err(Error::Config(format!(
             "source `{source}`: `map` cannot be combined with `include`"
         )));
     }
-    if refined.exclude.is_some() {
+    if binding.exclude.is_some() {
         return Err(Error::Config(format!(
             "source `{source}`: `map` cannot be combined with `exclude`"
         )));

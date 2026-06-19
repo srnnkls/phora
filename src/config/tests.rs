@@ -352,15 +352,12 @@ fn parses_target_sources_and_layout_from_example() {
     let vscode = cfg.targets.get("vscode").expect("vscode target");
     let vscode_sources: Vec<&str> = vscode
         .sources
-        .as_deref()
+        .as_ref()
         .expect("vscode declares sources")
         .iter()
-        .map(|b| match b {
-            crate::config::Binding::Source(name) => name.as_str(),
-            crate::config::Binding::Refined(r) => r.source.as_str(),
-        })
+        .map(|(identity, binding)| binding.effective_source(identity))
         .collect();
-    assert_eq!(vscode_sources, ["dotfiles", "company-configs"]);
+    assert_eq!(vscode_sources, ["company-configs", "dotfiles"]);
     assert_eq!(
         effective_layout(vscode).artifact_path("loqui", "python"),
         PathBuf::from("python"),
@@ -1042,7 +1039,7 @@ fn binding_ref_on_link_source_is_rejected() {
     let cfg = Config::parse(
         "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\ndeploy = \"link\"\n\n\
          [targets.t]\npath = \"~/x\"\n\
-         sources = [{ source = \"dotfiles\", tag = \"v1\" }]\n",
+         [targets.t.sources]\ndotfiles = { tag = \"v1\" }\n",
     )
     .expect("a link source with a tag-pinned binding still parses as a DTO");
 
@@ -1064,7 +1061,7 @@ fn binding_ref_on_copy_source_validates() {
     let cfg = Config::parse(
         "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\n\n\
          [targets.t]\npath = \"~/x\"\n\
-         sources = [{ source = \"dotfiles\", tag = \"v1\" }]\n",
+         [targets.t.sources]\ndotfiles = { tag = \"v1\" }\n",
     )
     .expect("a copy source with a tag-pinned binding parses");
 
@@ -1664,22 +1661,21 @@ fn shipped_example_toml_demonstrates_a_refined_binding_alias() {
     cfg.validate()
         .expect("the shipped phora.example.toml must pass post-merge validation");
 
-    let aliasing = cfg
+    let (identity, binding) = cfg
         .targets
         .values()
         .flat_map(|target| target.sources.iter().flatten())
-        .find(|binding| {
-            matches!(binding, Binding::Refined(_)) && binding.identity() != binding.source()
-        })
+        .find(|(identity, binding)| binding.effective_source(identity) != identity.as_str())
         .expect(
-            "the shipped phora.example.toml must demonstrate a refined binding whose `as` \
-             identity differs from its source (e.g. { source = \"dotfiles\", as = \"nvim\" })",
+            "the shipped phora.example.toml must demonstrate a binding whose keyed identity \
+             differs from its source (e.g. [targets.editors.sources] nvim = { source = \
+             \"dotfiles\", root = \"nvim\" })",
         );
 
     assert_ne!(
-        aliasing.identity(),
-        aliasing.source(),
-        "the refined binding must alias the source to a distinct identity to teach the feature"
+        identity.as_str(),
+        binding.effective_source(identity),
+        "the binding must alias the source to a distinct identity to teach the feature"
     );
 }
 
@@ -3114,7 +3110,9 @@ mod migration_warnings {
 mod per_binding_refinement {
     use std::path::Path;
 
-    use crate::config::target::{Binding, RefinedBinding, ResolvedBinding};
+    use std::collections::BTreeMap;
+
+    use crate::config::target::{Binding, ResolvedBinding};
     use crate::config::{Config, Source, Target};
     use crate::error::Error;
 
@@ -3126,13 +3124,13 @@ mod per_binding_refinement {
             .expect("named target present")
     }
 
-    fn sources(toml: &str) -> std::collections::BTreeMap<String, Source> {
+    fn sources(toml: &str) -> BTreeMap<String, Source> {
         Config::parse(toml).expect("config parses").sources
     }
 
-    fn bindings_of(t: &Target) -> &[Binding] {
+    fn bindings_of(t: &Target) -> &BTreeMap<String, Binding> {
         t.sources
-            .as_deref()
+            .as_ref()
             .expect("target declares an explicit sources list")
     }
 
@@ -3149,86 +3147,85 @@ mod per_binding_refinement {
     }
 
     #[test]
-    fn bare_string_source_parses_to_binding_source() {
+    fn bare_string_source_parses_to_identity_keyed_binding() {
         let t = target(
             "version = 1\n\n[targets.neovim]\npath = \"~/.config/nvim\"\nsources = [\"dotfiles\"]\n",
             "neovim",
         );
         let bindings = bindings_of(&t);
-        assert_eq!(bindings.len(), 1, "exactly one binding in the list");
-        match &bindings[0] {
-            Binding::Source(name) => assert_eq!(
-                name, "dotfiles",
-                "a bare TOML string must deserialize to Binding::Source carrying the source name"
-            ),
-            other @ Binding::Refined(_) => {
-                panic!("a bare string must be Binding::Source, got {other:?}")
-            }
-        }
+        assert_eq!(bindings.len(), 1, "exactly one binding in the map");
+        let (identity, binding) = bindings.iter().next().expect("one keyed binding");
+        assert_eq!(
+            identity, "dotfiles",
+            "a bare TOML string keys the binding under the source name (identity)"
+        );
+        assert_eq!(
+            binding.source, None,
+            "a bare string sets no explicit `source`; provenance defaults to the key"
+        );
+        assert_eq!(
+            binding.effective_source(identity),
+            "dotfiles",
+            "the effective source of a bare string is its identity key"
+        );
     }
 
     #[test]
-    fn refinement_table_parses_to_binding_refined_with_all_fields() {
+    fn refinement_table_parses_to_keyed_binding_with_all_fields() {
         let t = target(
             "version = 1\n\n[targets.t]\npath = \"~/x\"\n\
-             sources = [{ source = \"dotfiles\", as = \"nvim\", root = \"nvim\", \
-             include = [\"init.lua\"], exclude = [\"**/*.bak\"] }]\n",
+             [targets.t.sources]\n\
+             nvim = { source = \"dotfiles\", root = \"nvim\", \
+             include = [\"init.lua\"], exclude = [\"**/*.bak\"] }\n",
             "t",
         );
         let bindings = bindings_of(&t);
-        assert_eq!(bindings.len(), 1, "exactly one binding in the list");
-        match &bindings[0] {
-            Binding::Refined(refined) => {
-                let RefinedBinding {
-                    source,
-                    r#as,
-                    root,
-                    include,
-                    exclude,
-                    branch,
-                    tag,
-                    rev,
-                    template: _,
-                    map: _,
-                } = refined.as_ref();
-                assert_eq!(
-                    source, "dotfiles",
-                    "the `source` key carries the referenced source name"
-                );
-                assert_eq!(
-                    r#as.as_deref(),
-                    Some("nvim"),
-                    "the `as` key carries the rename"
-                );
-                assert_eq!(
-                    root.as_deref(),
-                    Some(Path::new("nvim")),
-                    "the `root` key is captured as a PathBuf"
-                );
-                assert_eq!(
-                    include.as_deref(),
-                    Some(["init.lua".to_string()].as_slice()),
-                    "the `include` key is captured as a Vec<String>"
-                );
-                assert_eq!(
-                    exclude.as_deref(),
-                    Some(["**/*.bak".to_string()].as_slice()),
-                    "the `exclude` key is captured as a Vec<String>"
-                );
-                assert_eq!(branch.as_deref(), None, "no `branch` set in this table");
-                assert_eq!(tag.as_deref(), None, "no `tag` set in this table");
-                assert_eq!(rev.as_deref(), None, "no `rev` set in this table");
-            }
-            other @ Binding::Source(_) => {
-                panic!("a refinement table must be Binding::Refined, got {other:?}")
-            }
-        }
+        assert_eq!(bindings.len(), 1, "exactly one binding in the map");
+        let (identity, binding) = bindings.iter().next().expect("one keyed binding");
+        let Binding {
+            source,
+            root,
+            include,
+            exclude,
+            branch,
+            tag,
+            rev,
+            template: _,
+            map: _,
+        } = binding;
+        assert_eq!(
+            identity, "nvim",
+            "the map key carries the binding identity (the former `as`)"
+        );
+        assert_eq!(
+            source.as_deref(),
+            Some("dotfiles"),
+            "the `source` key carries the referenced source name"
+        );
+        assert_eq!(
+            root.as_deref(),
+            Some(Path::new("nvim")),
+            "the `root` key is captured as a PathBuf"
+        );
+        assert_eq!(
+            include.as_deref(),
+            Some(["init.lua".to_string()].as_slice()),
+            "the `include` key is captured as a Vec<String>"
+        );
+        assert_eq!(
+            exclude.as_deref(),
+            Some(["**/*.bak".to_string()].as_slice()),
+            "the `exclude` key is captured as a Vec<String>"
+        );
+        assert_eq!(branch.as_deref(), None, "no `branch` set in this table");
+        assert_eq!(tag.as_deref(), None, "no `tag` set in this table");
+        assert_eq!(rev.as_deref(), None, "no `rev` set in this table");
     }
 
     #[test]
     fn refinement_table_with_unknown_key_is_rejected_naming_it() {
         let toml = "version = 1\n\n[targets.t]\npath = \"~/x\"\n\
-             sources = [{ source = \"dotfiles\", bogus = 1 }]\n";
+             [targets.t.sources]\nnvim = { source = \"dotfiles\", bogus = 1 }\n";
         let err = Config::parse(toml).expect_err(
             "an unknown key in a refinement table must be rejected (deny_unknown_fields)",
         );
@@ -3247,7 +3244,7 @@ mod per_binding_refinement {
             [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\
             root = \"base-root\"\ninclude = [\"src-inc\"]\nexclude = [\"src-exc\"]\n\n\
             [targets.t]\npath = \"~/x\"\n\
-            sources = [{ source = \"dotfiles\", root = \"override-root\" }]\n";
+            [targets.t.sources]\ndotfiles = { root = \"override-root\" }\n";
         let t = target(toml, "t");
         let all = sources(toml);
 
@@ -3278,7 +3275,7 @@ mod per_binding_refinement {
             [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\
             root = \"base-root\"\ninclude = [\"src-inc\"]\n\n\
             [targets.t]\npath = \"~/x\"\n\
-            sources = [{ source = \"dotfiles\", include = [\"only-binding\"] }]\n";
+            [targets.t.sources]\ndotfiles = { include = [\"only-binding\"] }\n";
         let t = target(toml, "t");
         let all = sources(toml);
 
@@ -3326,7 +3323,7 @@ mod per_binding_refinement {
         let toml = "version = 1\n\n\
             [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
             [targets.t]\npath = \"~/x\"\n\
-            sources = [{ source = \"dotfiles\", as = \"nvim\" }]\n";
+            [targets.t.sources]\nnvim = { source = \"dotfiles\" }\n";
         let t = target(toml, "t");
         let all = sources(toml);
 
@@ -3359,10 +3356,7 @@ mod per_binding_refinement {
         let merged = effective.targets.get("t").expect("target kept");
         let names: Vec<&str> = bindings_of(merged)
             .iter()
-            .map(|b| match b {
-                Binding::Source(name) => name.as_str(),
-                Binding::Refined(r) => r.source.as_str(),
-            })
+            .map(|(identity, binding)| binding.effective_source(identity))
             .collect();
         assert_eq!(
             names,
@@ -3475,7 +3469,7 @@ mod per_binding_refinement {
             [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\
             root = \"base-root\"\ninclude = [\"src-inc\"]\nexclude = [\"src-exc\"]\n\n\
             [targets.t]\npath = \"~/x\"\n\
-            sources = [{ source = \"dotfiles\", exclude = [\"binding-exc\"] }]\n";
+            [targets.t.sources]\ndotfiles = { exclude = [\"binding-exc\"] }\n";
         let t = target(toml, "t");
         let all = sources(toml);
 
@@ -3504,7 +3498,7 @@ mod per_binding_refinement {
         let base = Config::parse(
             "version = 1\n\n\
              [targets.t]\npath = \"~/x\"\n\
-             sources = [{ source = \"a\", as = \"x\", root = \"r\" }, \"b\"]\n",
+             [targets.t.sources]\nx = { source = \"a\", root = \"r\" }\nb = {}\n",
         )
         .expect("base parses");
         let local = Config::parse(
@@ -3517,10 +3511,7 @@ mod per_binding_refinement {
         let merged = effective.targets.get("t").expect("target kept");
         let names: Vec<&str> = bindings_of(merged)
             .iter()
-            .map(|b| match b {
-                Binding::Source(name) => name.as_str(),
-                Binding::Refined(r) => r.source.as_str(),
-            })
+            .map(|(identity, binding)| binding.effective_source(identity))
             .collect();
         assert_eq!(
             names,
@@ -3536,7 +3527,7 @@ mod per_binding_refinement {
             [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\
             root = \"base-root\"\n\n\
             [targets.t]\npath = \"~/x\"\n\
-            sources = [{ source = \"dotfiles\", as = \"nvim\", root = \"override-root\" }]\n";
+            [targets.t.sources]\nnvim = { source = \"dotfiles\", root = \"override-root\" }\n";
         let t = target(toml, "t");
         let all = sources(toml);
 
@@ -3561,7 +3552,7 @@ mod per_binding_refinement {
     #[test]
     fn refinement_table_rejects_misplaced_source_level_key() {
         let toml = "version = 1\n\n[targets.t]\npath = \"~/x\"\n\
-             sources = [{ source = \"dotfiles\", git = \"x\" }]\n";
+             [targets.t.sources]\nnvim = { source = \"dotfiles\", git = \"x\" }\n";
         let err = Config::parse(toml).expect_err(
             "a source-level key (`git`) placed inside a refinement table must be rejected: \
              binding fields are not source fields",
@@ -3580,46 +3571,62 @@ mod per_binding_refinement {
     }
 
     #[test]
-    fn validate_allows_duplicate_bare_identity_from_one_source() {
-        let cfg = config(
-            "version = 1\n\n\
-             [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
-             [targets.editor]\npath = \"~/.config\"\nsources = [\"dotfiles\", \"dotfiles\"]\n",
-        );
-        cfg.validate().expect(
-            "two bare bindings of the SAME source share one identity and one provenance, so they \
-             are valid; an actual destination clash is caught at deploy, not by an identity proxy",
-        );
-    }
-
-    #[test]
-    fn validate_allows_two_mapped_bindings_of_one_source_without_distinct_as() {
-        let cfg = config(
-            "version = 1\n\n\
-             [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
-             [targets.editor]\npath = \"~/.config\"\nsources = [\n\
-                { source = \"dotfiles\", map = { \"a.toml\" = \"one.toml\" } },\n\
-                { source = \"dotfiles\", map = { \"b.toml\" = \"two.toml\" } },\n\
-             ]\n",
-        );
-        cfg.validate().expect(
-            "two map bindings of one source at one ref project to distinct dests; sharing the \
-             default identity is valid without `as`, and any real dest clash is caught at deploy",
-        );
-    }
-
-    #[test]
-    fn validate_allows_duplicate_identity_across_bare_and_table_forms_of_one_source() {
+    fn validate_allows_two_keys_of_one_source() {
         let cfg = config(
             "version = 1\n\n\
              [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
              [targets.editor]\npath = \"~/.config\"\n\
-             sources = [\"dotfiles\", { source = \"dotfiles\" }]\n",
+             [targets.editor.sources]\n\
+             one = { source = \"dotfiles\" }\ntwo = { source = \"dotfiles\" }\n",
         );
         cfg.validate().expect(
-            "a bare binding and a table binding with no `as`, both naming `dotfiles`, share one \
-             identity backed by one source — valid regardless of the form each takes",
+            "two keyed bindings of the SAME source are two slices into one target and are valid; \
+             an actual destination clash is caught at deploy, not by an identity proxy",
         );
+    }
+
+    #[test]
+    fn validate_allows_two_mapped_bindings_of_one_source_under_distinct_keys() {
+        let cfg = config(
+            "version = 1\n\n\
+             [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
+             [targets.editor]\npath = \"~/.config\"\n\
+             [targets.editor.sources]\n\
+             one = { source = \"dotfiles\", map = { \"a.toml\" = \"one.toml\" } }\n\
+             two = { source = \"dotfiles\", map = { \"b.toml\" = \"two.toml\" } }\n",
+        );
+        cfg.validate().expect(
+            "two map bindings of one source at one ref project to distinct dests; under distinct \
+             keys they are valid, and any real dest clash is caught at deploy",
+        );
+    }
+
+    #[test]
+    fn bare_and_table_forms_of_one_source_yield_the_same_identity_and_source() {
+        let bare = config(
+            "version = 1\n\n\
+             [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
+             [targets.editor]\npath = \"~/.config\"\nsources = [\"dotfiles\"]\n",
+        );
+        let keyed = config(
+            "version = 1\n\n\
+             [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
+             [targets.editor]\npath = \"~/.config\"\n\
+             [targets.editor.sources]\ndotfiles = {}\n",
+        );
+        for cfg in [&bare, &keyed] {
+            cfg.validate()
+                .expect("a single dotfiles binding must validate");
+            let editor = cfg.targets.get("editor").expect("editor target present");
+            let resolved = editor.resolve_sources(&cfg.sources);
+            assert_eq!(resolved.len(), 1, "one binding resolves, got {resolved:?}");
+            assert_eq!(
+                (resolved[0].identity, resolved[0].source),
+                ("dotfiles", "dotfiles"),
+                "a bare string and a same-keyed empty table both resolve to identity == source \
+                 == `dotfiles`, independent of the form each takes",
+            );
+        }
     }
 
     #[test]
@@ -3628,13 +3635,11 @@ mod per_binding_refinement {
             "version = 1\n\n\
              [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
              [targets.editor]\npath = \"~/.config\"\n\
-             sources = [\
-                { source = \"dotfiles\", as = \"nvim\" }, \
-                { source = \"dotfiles\", as = \"tmux\" }\
-             ]\n",
+             [targets.editor.sources]\n\
+             nvim = { source = \"dotfiles\" }\ntmux = { source = \"dotfiles\" }\n",
         );
         cfg.validate().expect(
-            "two bindings of the SAME source carrying DISTINCT `as` identities (`nvim`, `tmux`) \
+            "two bindings of the SAME source under DISTINCT keyed identities (`nvim`, `tmux`) \
              are two slices into one target and must be VALID",
         );
     }
@@ -3645,7 +3650,7 @@ mod per_binding_refinement {
             "version = 1\n\n\
              [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
              [targets.editor]\npath = \"~/.config\"\n\
-             sources = [{ source = \"ghost\", as = \"x\" }]\n",
+             [targets.editor.sources]\nx = { source = \"ghost\" }\n",
         );
         let err = cfg.validate().expect_err(
             "a binding whose `source` names no `[sources.*]` entry must be rejected by validate()",
@@ -3680,32 +3685,24 @@ mod per_binding_refinement {
     }
 
     #[test]
-    fn validate_rejects_distinct_sources_sharing_one_as_identity() {
-        let cfg = config(
+    fn keyed_table_structurally_forbids_two_sources_under_one_identity() {
+        let err = Config::parse(
             "version = 1\n\n\
              [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
              [sources.loqui]\ngit = \"https://github.com/srnnkls/loqui.git\"\n\n\
              [targets.editor]\npath = \"~/.config\"\n\
-             sources = [\
-                { source = \"dotfiles\", as = \"x\" }, \
-                { source = \"loqui\", as = \"x\" }\
-             ]\n",
-        );
-        let err = cfg.validate().expect_err(
-            "two DIFFERENT sources both claiming `as = x` in one target collide on identity `x` \
-             and must be rejected",
+             [targets.editor.sources]\n\
+             x = { source = \"dotfiles\" }\nx = { source = \"loqui\" }\n",
+        )
+        .expect_err(
+            "identity is the map key, so two DIFFERENT sources cannot both claim identity `x` in \
+             one target — the duplicate key is rejected at parse",
         );
         match err {
-            Error::Config(msg) => {
-                assert!(
-                    msg.contains("editor"),
-                    "the identity-collision error must name the target `editor`, got: {msg}"
-                );
-                assert!(
-                    msg.contains('x'),
-                    "the identity-collision error must name the colliding identity `x`, got: {msg}"
-                );
-            }
+            Error::Config(msg) => assert!(
+                msg.contains('x'),
+                "the duplicate-identity error must name the colliding key `x`, got: {msg}"
+            ),
             other => panic!("expected Error::Config, got {other:?}"),
         }
     }
@@ -3716,7 +3713,7 @@ mod per_binding_refinement {
             "version = 1\n\n\
              [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
              [targets.t]\npath = \"~/x\"\n\
-             sources = [{ source = \"dotfiles\", root = \"sub\" }]\n",
+             [targets.t.sources]\ndotfiles = { root = \"sub\" }\n",
         );
         cfg.validate().expect(
             "a binding that slices `root` on a GIT-backed source is valid (git sources carry a \
@@ -3730,7 +3727,7 @@ mod per_binding_refinement {
             "version = 1\n\n\
              [sources.pkg]\nurl = \"https://example.com/foo.tar.gz\"\n\n\
              [targets.t]\npath = \"~/x\"\n\
-             sources = [{ source = \"pkg\" }]\n",
+             [targets.t.sources]\npkg = {}\n",
         );
         cfg.validate().expect(
             "a PLAIN binding to a url-backed source that sets no root/include/exclude must be \
@@ -3744,7 +3741,7 @@ mod per_binding_refinement {
             "version = 1\n\n\
              [sources.pkg]\nurl = \"https://example.com/foo.tar.gz\"\n\n\
              [targets.t]\npath = \"~/x\"\n\
-             sources = [{ source = \"pkg\", root = \"sub\" }]\n",
+             [targets.t.sources]\npkg = { root = \"sub\" }\n",
         );
         let err = cfg.validate().expect_err(
             "a binding that sets `root` on a url-backed source must be rejected: url sources \
@@ -3771,7 +3768,7 @@ mod per_binding_refinement {
             "version = 1\n\n\
              [sources.pkg]\nurl = \"https://example.com/foo.tar.gz\"\n\n\
              [targets.t]\npath = \"~/x\"\n\
-             sources = [{ source = \"pkg\", include = [\"a\"] }]\n",
+             [targets.t.sources]\npkg = { include = [\"a\"] }\n",
         );
         let err = cfg.validate().expect_err(
             "a binding that sets `include` on a url-backed source must be rejected (url sources \
@@ -3798,7 +3795,7 @@ mod per_binding_refinement {
             "version = 1\n\n\
              [sources.pkg]\nurl = \"https://example.com/foo.tar.gz\"\n\n\
              [targets.t]\npath = \"~/x\"\n\
-             sources = [{ source = \"pkg\", exclude = [\"b\"] }]\n",
+             [targets.t.sources]\npkg = { exclude = [\"b\"] }\n",
         );
         let err = cfg.validate().expect_err(
             "a binding that sets `exclude` on a url-backed source must be rejected (url sources \
@@ -3828,7 +3825,7 @@ mod per_binding_refinement {
         let toml = "version = 1\n\n\
             [sources.fzf]\ngit = \"https://github.com/junegunn/fzf.git\"\nbranch = \"main\"\n\n\
             [targets.t]\npath = \"~/x\"\n\
-            sources = [{ source = \"fzf\", as = \"canary\", tag = \"v0.56.0\" }]\n";
+            [targets.t.sources]\ncanary = { source = \"fzf\", tag = \"v0.56.0\" }\n";
         let t = target(toml, "t");
         let all = sources(toml);
 
@@ -3880,18 +3877,20 @@ mod per_binding_refinement {
             path: std::path::PathBuf::from("~/x"),
             layout: None,
             hooks: None,
-            sources: Some(vec![Binding::Refined(Box::new(RefinedBinding {
-                source: "fzf".to_owned(),
-                r#as: Some("pinned".to_owned()),
-                root: None,
-                include: None,
-                exclude: None,
-                branch: Some("develop".to_owned()),
-                tag: Some("v9.9.9".to_owned()),
-                rev: Some("deadbeef".to_owned()),
-                template: None,
-                map: None,
-            }))]),
+            sources: Some(BTreeMap::from([(
+                "pinned".to_owned(),
+                Binding {
+                    source: Some("fzf".to_owned()),
+                    root: None,
+                    include: None,
+                    exclude: None,
+                    branch: Some("develop".to_owned()),
+                    tag: Some("v9.9.9".to_owned()),
+                    rev: Some("deadbeef".to_owned()),
+                    template: None,
+                    map: None,
+                },
+            )])),
         };
 
         let resolved = t.resolve_sources(&all);
@@ -3920,18 +3919,20 @@ mod per_binding_refinement {
             path: std::path::PathBuf::from("~/x"),
             layout: None,
             hooks: None,
-            sources: Some(vec![Binding::Refined(Box::new(RefinedBinding {
-                source: "fzf".to_owned(),
-                r#as: Some("pinned".to_owned()),
-                root: None,
-                include: None,
-                exclude: None,
-                branch: Some("develop".to_owned()),
-                tag: Some("v9.9.9".to_owned()),
-                rev: None,
-                template: None,
-                map: None,
-            }))]),
+            sources: Some(BTreeMap::from([(
+                "pinned".to_owned(),
+                Binding {
+                    source: Some("fzf".to_owned()),
+                    root: None,
+                    include: None,
+                    exclude: None,
+                    branch: Some("develop".to_owned()),
+                    tag: Some("v9.9.9".to_owned()),
+                    rev: None,
+                    template: None,
+                    map: None,
+                },
+            )])),
         };
 
         let resolved = t.resolve_sources(&all);
@@ -3954,10 +3955,9 @@ mod per_binding_refinement {
         let toml = "version = 1\n\n\
             [sources.fzf]\ngit = \"https://github.com/junegunn/fzf.git\"\nbranch = \"main\"\n\n\
             [targets.t]\npath = \"~/x\"\n\
-            sources = [\
-                { source = \"fzf\", as = \"stable\", tag = \"v0.55.0\" }, \
-                { source = \"fzf\", as = \"canary\", tag = \"v0.56.0\" }\
-            ]\n";
+            [targets.t.sources]\n\
+            stable = { source = \"fzf\", tag = \"v0.55.0\" }\n\
+            canary = { source = \"fzf\", tag = \"v0.56.0\" }\n";
         let t = target(toml, "t");
         let all = sources(toml);
 
@@ -3998,7 +3998,7 @@ mod per_binding_refinement {
             "version = 1\n\n\
              [sources.pkg]\nurl = \"https://example.com/foo.tar.gz\"\n\n\
              [targets.t]\npath = \"~/x\"\n\
-             sources = [{ source = \"pkg\", as = \"x\", tag = \"v1\" }]\n",
+             [targets.t.sources]\nx = { source = \"pkg\", tag = \"v1\" }\n",
         );
         let err = cfg.validate().expect_err(
             "a binding that pins a `tag` on a url-backed source must be rejected: a static \
@@ -4028,7 +4028,7 @@ mod per_binding_refinement {
             "version = 1\n\n\
              [sources.pkg]\nurl = \"https://example.com/foo.tar.gz\"\n\n\
              [targets.t]\npath = \"~/x\"\n\
-             sources = [{ source = \"pkg\", as = \"x\", branch = \"main\" }]\n",
+             [targets.t.sources]\nx = { source = \"pkg\", branch = \"main\" }\n",
         );
         let err = cfg.validate().expect_err(
             "a binding that pins a `branch` on a url-backed source must be rejected, exactly as \
@@ -4058,7 +4058,7 @@ mod per_binding_refinement {
             "version = 1\n\n\
              [sources.pkg]\nurl = \"https://example.com/foo.tar.gz\"\n\n\
              [targets.t]\npath = \"~/x\"\n\
-             sources = [{ source = \"pkg\", as = \"x\", rev = \"deadbeef\" }]\n",
+             [targets.t.sources]\nx = { source = \"pkg\", rev = \"deadbeef\" }\n",
         );
         let err = cfg.validate().expect_err(
             "a binding that pins a `rev` on a url-backed source must be rejected, exactly as a \
@@ -4087,7 +4087,7 @@ mod per_binding_refinement {
             "version = 1\n\n\
              [sources.fzf]\ngit = \"https://github.com/junegunn/fzf.git\"\n\n\
              [targets.t]\npath = \"~/x\"\n\
-             sources = [{ source = \"fzf\", as = \"x\", tag = \"v1\", branch = \"main\" }]\n",
+             [targets.t.sources]\nx = { source = \"fzf\", tag = \"v1\", branch = \"main\" }\n",
         );
         let err = cfg.validate().expect_err(
             "a binding that sets both `tag` and `branch` must be rejected: only one of \
@@ -4117,7 +4117,7 @@ mod per_binding_refinement {
             "version = 1\n\n\
              [sources.fzf]\ngit = \"https://github.com/junegunn/fzf.git\"\n\n\
              [targets.t]\npath = \"~/x\"\n\
-             sources = [{ source = \"fzf\", as = \"x\", tag = \"v1\", rev = \"deadbeef\" }]\n",
+             [targets.t.sources]\nx = { source = \"fzf\", tag = \"v1\", rev = \"deadbeef\" }\n",
         );
         let err = cfg.validate().expect_err(
             "a binding that sets both `tag` and `rev` must be rejected: only one of \
@@ -4141,53 +4141,41 @@ mod per_binding_refinement {
     }
 
     #[test]
-    fn validate_rejects_two_refs_of_one_source_without_distinct_as_naming_the_as_fix() {
-        let cfg = config(
+    fn validate_rejects_two_refs_of_one_source_under_one_key() {
+        let err = Config::parse(
             "version = 1\n\n\
              [sources.fzf]\ngit = \"https://github.com/junegunn/fzf.git\"\n\n\
              [targets.t]\npath = \"~/x\"\n\
-             sources = [\
-                { source = \"fzf\", tag = \"v0.55.0\" }, \
-                { source = \"fzf\", tag = \"v0.56.0\" }\
-             ]\n",
-        );
-        let err = cfg.validate().expect_err(
-            "two bindings of `fzf` at different tags WITHOUT `as` collapse to identity `fzf` \
-             and must be rejected as a collision",
+             [targets.t.sources]\n\
+             fzf = { tag = \"v0.55.0\" }\nfzf = { tag = \"v0.56.0\" }\n",
+        )
+        .expect_err(
+            "identity is the map key, so two refs of `fzf` cannot share key `fzf` — the \
+             duplicate key collapses the identity and must be rejected at parse",
         );
         match err {
-            Error::Config(msg) => {
-                assert!(
-                    msg.contains("fzf"),
-                    "the collision error must name the colliding identity `fzf`, got: {msg}"
-                );
-                assert!(
-                    msg.contains("`as`"),
-                    "the collision error must be actionable by naming the backtick-quoted `as` \
-                     fix (substring \"as\" also matches \"has\"/\"please\"; a generic \
-                     `more than once` message without the field-named fix hint is insufficient), \
-                     got: {msg}"
-                );
-            }
+            Error::Config(msg) => assert!(
+                msg.contains("fzf"),
+                "the duplicate-identity error must name the colliding key `fzf`, got: {msg}"
+            ),
             other => panic!("expected Error::Config, got {other:?}"),
         }
     }
 
     #[test]
-    fn validate_allows_two_refs_of_one_source_with_distinct_as() {
+    fn validate_allows_two_refs_of_one_source_under_distinct_keys() {
         let cfg = config(
             "version = 1\n\n\
              [sources.fzf]\ngit = \"https://github.com/junegunn/fzf.git\"\n\n\
              [targets.t]\npath = \"~/x\"\n\
-             sources = [\
-                { source = \"fzf\", as = \"stable\", tag = \"v0.55.0\" }, \
-                { source = \"fzf\", as = \"canary\", tag = \"v0.56.0\" }\
-             ]\n",
+             [targets.t.sources]\n\
+             stable = { source = \"fzf\", tag = \"v0.55.0\" }\n\
+             canary = { source = \"fzf\", tag = \"v0.56.0\" }\n",
         );
         cfg.validate().expect(
-            "two bindings of `fzf` at different tags carrying DISTINCT `as` identities \
+            "two bindings of `fzf` at different tags under DISTINCT keyed identities \
              (`stable`, `canary`) are two valid slices into one target and must not be rejected \
-             by PTV-002's new checks",
+             by PTV-002's checks",
         );
     }
 }
@@ -5165,17 +5153,14 @@ email = "work@code17.io"
 
 // TPH-008: template opt-in (M001) — per-binding `template` glob list + `.tmpl` suffix
 
-fn refined<'a>(cfg: &'a Config, target: &str) -> &'a RefinedBinding {
+fn refined<'a>(cfg: &'a Config, target: &str) -> &'a Binding {
     target_of(cfg, target)
         .sources
-        .as_deref()
+        .as_ref()
         .expect("target declares sources")
-        .iter()
-        .find_map(|b| match b {
-            Binding::Refined(r) => Some(r),
-            Binding::Source(_) => None,
-        })
-        .expect("target declares a refined binding")
+        .values()
+        .next()
+        .expect("target declares a binding")
 }
 
 #[test]
@@ -5189,7 +5174,8 @@ git = "https://github.com/me/dotfiles.git"
 
 [targets.t]
 path = "~/x"
-sources = [{ source = "dotfiles", template = ["*.conf", "**/*.ini"] }]
+[targets.t.sources]
+dotfiles = { template = ["*.conf", "**/*.ini"] }
 "#,
     )
     .expect("a per-binding `template` glob list must parse");
@@ -5222,7 +5208,8 @@ git = "https://github.com/me/dotfiles.git"
 
 [targets.t]
 path = "~/x"
-sources = [{ source = "dotfiles" }]
+[targets.t.sources]
+dotfiles = {}
 "#,
     )
     .expect("a refined binding with no `template` key must parse");
@@ -5249,7 +5236,8 @@ git = "https://github.com/me/dotfiles.git"
 
 [targets.t]
 path = "~/x"
-sources = [{ source = "dotfiles", template = ["*.conf"] }]
+[targets.t.sources]
+dotfiles = { template = ["*.conf"] }
 "#,
     )
     .expect("a binding with a glob list still honours the .tmpl suffix");
@@ -5282,7 +5270,8 @@ git = "https://github.com/vendor/tree.git"
 
 [targets.t]
 path = "~/x"
-sources = [{ source = "vendor", template = false }]
+[targets.t.sources]
+vendor = { template = false }
 "#,
     )
     .expect("`template = false` on a binding must parse");
@@ -5309,7 +5298,8 @@ git = "https://github.com/me/dotfiles.git"
 
 [targets.t]
 path = "~/x"
-sources = [{ source = "dotfiles", template = ["*.conf"] }]
+[targets.t.sources]
+dotfiles = { template = ["*.conf"] }
 "#,
     )
     .expect("binding parses");
@@ -5344,7 +5334,8 @@ git = "https://github.com/me/dotfiles.git"
 
 [targets.t]
 path = "~/x"
-sources = [{ source = "dotfiles", template = ["["] }]
+[targets.t.sources]
+dotfiles = { template = ["["] }
 "#;
     assert!(
         matches!(Config::parse(toml), Err(Error::Config(_))),
@@ -5364,7 +5355,8 @@ git = "https://github.com/me/dotfiles.git"
 
 [targets.t]
 path = "~/x"
-sources = [{ source = "dotfiles", template = ["*.conf"] }]
+[targets.t.sources]
+dotfiles = { template = ["*.conf"] }
 "#,
     )
     .expect("base parses");
@@ -5377,7 +5369,8 @@ git = "https://github.com/me/dotfiles.git"
 
 [targets.t]
 path = "~/x"
-sources = [{ source = "dotfiles", template = false }]
+[targets.t.sources]
+dotfiles = { template = false }
 "#,
     )
     .expect("local parses");
@@ -5404,13 +5397,11 @@ fn feature_free_config_has_empty_vars_and_no_template_fields() {
         "INV-8: a config with no [vars] table must carry an empty vars map"
     );
     for (name, target) in &cfg.targets {
-        for binding in target.sources.iter().flatten() {
-            if let Binding::Refined(refined) = binding {
-                assert!(
-                    refined.template.is_none(),
-                    "INV-8: target `{name}` declares no `template` glob, so the field must be absent"
-                );
-            }
+        for (_identity, binding) in target.sources.iter().flatten() {
+            assert!(
+                binding.template.is_none(),
+                "INV-8: target `{name}` declares no `template` glob, so the field must be absent"
+            );
         }
     }
 }
@@ -5432,9 +5423,10 @@ sources = ["dotfiles"]
     .expect("a bare string-form binding parses");
     let binding = target_of(&cfg, "t")
         .sources
-        .as_deref()
+        .as_ref()
         .expect("declares sources")
-        .first()
+        .values()
+        .next()
         .expect("one binding");
     let opt_in = binding.template_opt_in();
     assert!(
@@ -5472,7 +5464,8 @@ git = "https://github.com/me/dotfiles.git"
 
 [targets.t]
 path = "~/x"
-sources = [{ source = "dotfiles", template = [] }]
+[targets.t.sources]
+dotfiles = { template = [] }
 "#;
     assert!(
         matches!(Config::parse(toml), Err(Error::Config(_))),
@@ -5491,7 +5484,8 @@ url = "https://example.com/file.tar.gz"
 
 [targets.t]
 path = "~/x"
-sources = [{ source = "blob", template = ["*.conf"] }]
+[targets.t.sources]
+blob = { template = ["*.conf"] }
 "#;
     let cfg =
         Config::parse(toml).expect("the toml itself parses; url-slice rejection is in validate()");
@@ -5514,7 +5508,8 @@ git = "https://github.com/me/dotfiles.git"
 
 [targets.t]
 path = "~/x"
-sources = [{ source = "dotfiles", template = ["*.conf"] }]
+[targets.t.sources]
+dotfiles = { template = ["*.conf"] }
 "#,
         )
         .expect("globs binding parses");
@@ -5564,7 +5559,8 @@ git = "https://github.com/me/dotfiles.git"
 
 [targets.t]
 path = "~/x"
-sources = [{{ source = "dotfiles", {map_body} }}]
+[targets.t.sources]
+dotfiles = {{ {map_body} }}
 "#
     );
     let cfg = Config::parse(&toml).expect("a structurally valid `map` binding must parse");
@@ -5583,7 +5579,8 @@ git = "https://github.com/me/dotfiles.git"
 
 [targets.t]
 path = "~/x"
-sources = [{ source = "dotfiles", map = { "AGENTS.md" = "CLAUDE.md", "nested/AGENTS.md" = "codex.md" } }]
+[targets.t.sources]
+dotfiles = { map = { "AGENTS.md" = "CLAUDE.md", "nested/AGENTS.md" = "codex.md" } }
 "#,
     )
     .expect("a valid `map` binding must parse and pass load-time validation");
@@ -5591,11 +5588,11 @@ sources = [{ source = "dotfiles", map = { "AGENTS.md" = "CLAUDE.md", "nested/AGE
     let map = refined(&cfg, "t")
         .map
         .as_ref()
-        .expect("the refined binding carries the `map`");
+        .expect("the keyed binding carries the `map`");
     assert_eq!(
         map.get("AGENTS.md").map(String::as_str),
         Some("CLAUDE.md"),
-        "the map selector->dest entry must round-trip on RefinedBinding"
+        "the map selector->dest entry must round-trip on the binding"
     );
     assert_eq!(
         map.get("nested/AGENTS.md").map(String::as_str),
@@ -5755,7 +5752,8 @@ url = "https://example.com/foo.tar.gz"
 
 [targets.t]
 path = "~/x"
-sources = [{ source = "pkg", map = { "AGENTS.md" = "CLAUDE.md" } }]
+[targets.t.sources]
+pkg = { map = { "AGENTS.md" = "CLAUDE.md" } }
 "#,
     )
     .expect("a structurally valid `map` binding on a url source must parse");
@@ -5782,14 +5780,15 @@ git = "https://github.com/me/dotfiles.git"
 
 [targets.t]
 path = "~/x"
-sources = [{ source = "dotfiles", map = { "a/b/AGENTS.md" = "CLAUDE.md" } }]
+[targets.t.sources]
+dotfiles = { map = { "a/b/AGENTS.md" = "CLAUDE.md" } }
 "#,
     )
     .expect("a map key containing `/` (a nested source file) must be accepted");
     let map = refined(&cfg, "t")
         .map
         .as_ref()
-        .expect("the refined binding carries the `map`");
+        .expect("the keyed binding carries the `map`");
     assert_eq!(
         map.get("a/b/AGENTS.md").map(String::as_str),
         Some("CLAUDE.md"),
@@ -5857,5 +5856,289 @@ fn binding_map_duplicate_dest_values_are_rejected() {
             "two keys mapping to one dest must be rejected, naming the source and the duplicated dest, got: {msg}"
         ),
         other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BIND-KEY-001: per-target `sources` becomes a keyed map (`BTreeMap<String, Binding>`).
+// The map KEY is the binding identity; effective source defaults to the key and
+// the `as` field is removed. A flat array of bare source-name strings is still
+// accepted. Array-of-tables and duplicate/table-laden lists are hard errors.
+mod keyed_bindings {
+    use super::*;
+
+    fn find_resolved<'a>(
+        resolved: &'a [ResolvedBinding<'a>],
+        identity: &str,
+    ) -> &'a ResolvedBinding<'a> {
+        resolved
+            .iter()
+            .find(|b| b.identity == identity)
+            .unwrap_or_else(|| {
+                panic!("a resolved binding with identity `{identity}` must be present")
+            })
+    }
+
+    // A keyed table binding resolves with source defaulting to the key.
+    #[test]
+    fn keyed_binding_source_defaults_to_key() {
+        let cfg = Config::parse(
+            "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\n\
+             [targets.t.sources]\ndotfiles = { root = \".config\" }\n",
+        )
+        .expect("a keyed-table binding must parse");
+        let resolved = target_of(&cfg, "t").resolve_sources(&cfg.sources);
+        assert_eq!(
+            resolved.len(),
+            1,
+            "exactly one binding resolves, got {resolved:?}"
+        );
+        let b = &resolved[0];
+        assert_eq!(
+            b.source, "dotfiles",
+            "with no explicit `source`, the effective source defaults to the map key"
+        );
+        assert_eq!(
+            b.identity, "dotfiles",
+            "the binding identity is the map key"
+        );
+    }
+
+    // An explicit `source` on a divergent key keeps the key as identity.
+    #[test]
+    fn explicit_source_diverges_from_key_identity() {
+        let cfg = Config::parse(
+            "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\n\
+             [targets.t.sources]\nsettings = { source = \"dotfiles\" }\n",
+        )
+        .expect("a keyed binding with an explicit `source` must parse");
+        let resolved = target_of(&cfg, "t").resolve_sources(&cfg.sources);
+        assert_eq!(
+            resolved.len(),
+            1,
+            "exactly one binding resolves, got {resolved:?}"
+        );
+        let b = &resolved[0];
+        assert_eq!(
+            b.identity, "settings",
+            "the identity stays the map key even when `source` diverges"
+        );
+        assert_eq!(
+            b.source, "dotfiles",
+            "the effective source comes from the explicit `source` field"
+        );
+    }
+
+    // An empty inline table is a valid binding (source == key).
+    #[test]
+    fn empty_inline_table_binding_is_valid() {
+        let cfg = Config::parse(
+            "version = 1\n\n[sources.agents]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\n\
+             [targets.t.sources]\nagents = {}\n",
+        )
+        .expect("an empty inline-table binding `agents = {}` must parse");
+        let resolved = target_of(&cfg, "t").resolve_sources(&cfg.sources);
+        assert_eq!(
+            resolved.len(),
+            1,
+            "exactly one binding resolves, got {resolved:?}"
+        );
+        let b = &resolved[0];
+        assert_eq!(b.identity, "agents", "identity is the map key");
+        assert_eq!(
+            b.source, "agents",
+            "source defaults to the key for an empty table"
+        );
+    }
+
+    // Identity flows from the key, never from a (now-removed) `as`.
+    #[test]
+    fn identity_flows_from_map_key() {
+        let cfg = Config::parse(
+            "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\n\
+             [targets.t.sources]\nmy-alias = { source = \"dotfiles\", root = \"sub\" }\n",
+        )
+        .expect("a keyed binding must parse");
+        let resolved = target_of(&cfg, "t").resolve_sources(&cfg.sources);
+        let identities: Vec<&str> = resolved.iter().map(|b| b.identity).collect();
+        assert_eq!(
+            identities,
+            vec!["my-alias"],
+            "the resolved identity is precisely the map key, got {identities:?}"
+        );
+    }
+
+    // Two keys sharing one source at distinct refs are allowed; both resolve to
+    // distinct identities.
+    #[test]
+    fn side_by_side_aliases_of_one_source_are_allowed() {
+        let cfg = Config::parse(
+            "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\n\
+             [targets.t.sources]\n\
+             stable = { source = \"dotfiles\", tag = \"v1\" }\n\
+             edge = { source = \"dotfiles\", branch = \"dev\" }\n",
+        )
+        .expect("two keyed aliases of one source must parse");
+        assert!(
+            cfg.validate().is_ok(),
+            "two keys sharing a source at distinct refs must validate Ok (coherence check removed): {:?}",
+            cfg.validate()
+        );
+        let resolved = target_of(&cfg, "t").resolve_sources(&cfg.sources);
+        assert_eq!(
+            resolved.len(),
+            2,
+            "both aliases must resolve, got {resolved:?}"
+        );
+        let stable = find_resolved(&resolved, "stable");
+        let edge = find_resolved(&resolved, "edge");
+        assert!(
+            matches!(&stable.effective_ref, Refspec::Tag(t) if t == "v1"),
+            "the `stable` alias must carry its tag ref, got {:?}",
+            stable.effective_ref
+        );
+        assert!(
+            matches!(&edge.effective_ref, Refspec::Branch(b) if b == "dev"),
+            "the `edge` alias must carry its branch ref, got {:?}",
+            edge.effective_ref
+        );
+        assert_eq!(stable.source, "dotfiles");
+        assert_eq!(edge.source, "dotfiles");
+    }
+
+    // An array-of-tables binding list is a parse error naming the target and
+    // carrying the `[targets.t.sources]` migration hint.
+    #[test]
+    fn array_of_tables_is_a_hard_parse_error() {
+        let err = Config::parse(
+            "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\
+             sources = [{ source = \"dotfiles\", root = \".claude\" }]\n",
+        )
+        .expect_err("an array-of-tables binding list must be rejected");
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("[targets.t.sources]"),
+                "the rejection must name the target and carry the keyed-table migration hint, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    // Duplicate bare-list elements are an error.
+    #[test]
+    fn duplicate_bare_list_elements_are_rejected() {
+        let err = Config::parse(
+            "version = 1\n\n[sources.a]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/x\"\nsources = [\"a\", \"a\"]\n",
+        )
+        .expect_err("a bare list with a duplicate element must be rejected");
+        match err {
+            Error::Config(msg) => {
+                let lower = msg.to_lowercase();
+                assert!(
+                    lower.contains("duplicate") && msg.contains("`a`"),
+                    "the rejection must name the duplicated element `a` as a duplicate, got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    // A table mixed into the bare list is an error with the migration hint.
+    #[test]
+    fn table_inside_bare_list_is_rejected_with_hint() {
+        let err = Config::parse(
+            "version = 1\n\n[sources.a]\ngit = \"g\"\n\n[sources.b]\ngit = \"h\"\n\n\
+             [targets.t]\npath = \"~/x\"\nsources = [\"a\", { source = \"b\" }]\n",
+        )
+        .expect_err("a table mixed into the bare list must be rejected");
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("[targets.t.sources]"),
+                "a mixed table/list must be rejected with the keyed-table migration hint, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    // An empty `[targets.t.sources]` table is Ok and resolves to zero bindings.
+    #[test]
+    fn empty_keyed_table_resolves_to_no_bindings() {
+        let cfg = Config::parse(
+            "version = 1\n\n[sources.a]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\n[targets.t.sources]\n",
+        )
+        .expect("an empty `[targets.t.sources]` table must parse");
+        let resolved = target_of(&cfg, "t").resolve_sources(&cfg.sources);
+        assert!(
+            resolved.is_empty(),
+            "an empty keyed table resolves to zero bindings, got {resolved:?}"
+        );
+    }
+
+    // An empty `[]` bare list parses Ok with no bindings.
+    #[test]
+    fn empty_bare_list_resolves_to_no_bindings() {
+        let cfg = Config::parse(
+            "version = 1\n\n[sources.a]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/x\"\nsources = []\n",
+        )
+        .expect("an empty `[]` bare list must parse");
+        let resolved = target_of(&cfg, "t").resolve_sources(&cfg.sources);
+        assert!(
+            resolved.is_empty(),
+            "an empty `[]` bare list resolves to zero bindings, got {resolved:?}"
+        );
+    }
+
+    // A local keyed-table `sources` replaces the base bindings wholesale.
+    #[test]
+    fn overlay_keyed_table_replaces_base_bindings_wholesale() {
+        let base = Config::parse(
+            "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\n\n[sources.extra]\ngit = \"h\"\n\n\
+             [targets.t]\npath = \"~/x\"\nsources = [\"dotfiles\", \"extra\"]\n",
+        )
+        .expect("base parses");
+        let local = Config::parse(
+            "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\n\n[sources.extra]\ngit = \"h\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\n\
+             [targets.t.sources]\nonly = { source = \"dotfiles\" }\n",
+        )
+        .expect("local parses");
+        let effective = merge_configs(base, Some(local));
+        let resolved = target_of(&effective, "t").resolve_sources(&effective.sources);
+        let identities: Vec<&str> = resolved.iter().map(|b| b.identity).collect();
+        assert_eq!(
+            identities,
+            vec!["only"],
+            "a local keyed `sources` table replaces the base bindings entirely, got {identities:?}"
+        );
+    }
+
+    // A bare-string list still resolves, source == key.
+    #[test]
+    fn bare_string_list_preserved_non_regression() {
+        let cfg = Config::parse(
+            "version = 1\n\n[sources.a]\ngit = \"g\"\n\n[sources.b]\ngit = \"h\"\n\n\
+             [targets.t]\npath = \"~/x\"\nsources = [\"a\", \"b\"]\n",
+        )
+        .expect("a bare-string list must parse");
+        let declared: Vec<&str> = target_of(&cfg, "t").declared_sources().collect();
+        assert_eq!(
+            declared,
+            vec!["a", "b"],
+            "declared_sources must report the bare list verbatim, got {declared:?}"
+        );
+        let resolved = target_of(&cfg, "t").resolve_sources(&cfg.sources);
+        let a = find_resolved(&resolved, "a");
+        let b = find_resolved(&resolved, "b");
+        assert_eq!(a.source, "a", "a bare element's source equals its identity");
+        assert_eq!(b.source, "b", "a bare element's source equals its identity");
     }
 }

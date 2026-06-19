@@ -1435,7 +1435,10 @@ fn source_rm_command_scrubs_bindings_and_source_def_from_phora_toml() {
          \n\
          [targets.editor]\n\
          path = \"~/.config/editor\"\n\
-         sources = [\"dotfiles\", { source = \"dotfiles\", as = \"nvim\" }]\n\
+         \n\
+         [targets.editor.sources]\n\
+         dotfiles = {}\n\
+         nvim = { source = \"dotfiles\" }\n\
          \n\
          [targets.shell]\n\
          path = \"~/.config/shell\"\n\
@@ -1476,7 +1479,7 @@ fn source_rm_command_scrubs_bindings_and_source_def_from_phora_toml() {
         .sources
         .iter()
         .flatten()
-        .map(crate::config::Binding::source)
+        .map(|(identity, binding)| binding.effective_source(identity))
         .collect();
     assert!(
         !editor_underlying.contains(&"dotfiles"),
@@ -1491,7 +1494,7 @@ fn source_rm_command_scrubs_bindings_and_source_def_from_phora_toml() {
         .sources
         .iter()
         .flatten()
-        .map(crate::config::Binding::source)
+        .map(|(identity, binding)| binding.effective_source(identity))
         .collect();
     assert_eq!(
         shell_underlying,
@@ -2746,16 +2749,12 @@ fn add_symlink_overlay_overrides_base_source_after_merge() {
 // ── remove_source: scrub bindings out of every target ──────────
 
 fn binding_sources(cfg: &Config, target: &str) -> Vec<String> {
-    use crate::config::Binding;
     cfg.targets
         .get(target)
-        .and_then(|t| t.sources.as_deref())
-        .unwrap_or(&[])
-        .iter()
-        .map(|b| match b {
-            Binding::Source(name) => name.clone(),
-            Binding::Refined(r) => r.source.clone(),
-        })
+        .and_then(|t| t.sources.as_ref())
+        .into_iter()
+        .flatten()
+        .map(|(identity, binding)| binding.effective_source(identity).to_owned())
         .collect()
 }
 
@@ -2788,8 +2787,10 @@ fn remove_source_drops_aliased_table_binding_by_underlying_source_field() {
     let toml = "version = 1\n\n\
         [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
         [sources.loqui]\ngit = \"https://github.com/srnnkls/loqui.git\"\n\n\
-        [targets.editor]\npath = \"~/.config\"\n\
-        sources = [{ source = \"dotfiles\", as = \"nvim\" }, \"loqui\"]\n";
+        [targets.editor]\npath = \"~/.config\"\n\n\
+        [targets.editor.sources]\n\
+        nvim = { source = \"dotfiles\" }\n\
+        loqui = {}\n";
 
     let out = remove_source(toml, "version = 1\n", "dotfiles")
         .expect("scrub the dotfiles source")
@@ -2834,8 +2835,10 @@ fn remove_source_scrubs_every_target_and_leaves_others_intact() {
         [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
         [sources.loqui]\ngit = \"https://github.com/srnnkls/loqui.git\"\n\n\
         [targets.editor]\npath = \"~/.config\"\nsources = [\"dotfiles\", \"loqui\"]\n\n\
-        [targets.shell]\npath = \"~/.shell\"\n\
-        sources = [{{ source = \"dotfiles\", as = \"nvim\" }}, \"loqui\"]\n\n\
+        [targets.shell]\npath = \"~/.shell\"\n\n\
+        [targets.shell.sources]\n\
+        nvim = {{ source = \"dotfiles\" }}\n\
+        loqui = {{}}\n\n\
         {untouched_target}"
     );
 
@@ -2882,8 +2885,10 @@ fn source_rm_keeps_binding_whose_alias_matches_but_source_differs() {
     let toml = "version = 1\n\n\
         [sources.loqui]\ngit = \"https://github.com/srnnkls/loqui.git\"\n\n\
         [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
-        [targets.editor]\npath = \"~/.config\"\n\
-        sources = [{ source = \"loqui\", as = \"dotfiles\" }, \"dotfiles\"]\n";
+        [targets.editor]\npath = \"~/.config\"\n\n\
+        [targets.editor.sources]\n\
+        dotfiles = { source = \"loqui\" }\n\
+        nvim = { source = \"dotfiles\" }\n";
 
     let out = remove_source(toml, "version = 1\n", "dotfiles")
         .expect("scrub the dotfiles source")
@@ -2893,12 +2898,12 @@ fn source_rm_keeps_binding_whose_alias_matches_but_source_differs() {
     let remaining = binding_sources(&cfg, "editor");
     assert!(
         remaining.iter().any(|s| s == "loqui"),
-        "`source rm dotfiles` must KEEP the `{{ source = loqui, as = dotfiles }}` binding: it is \
-         matched by its underlying `source` (loqui), not its alias `dotfiles`, got: {remaining:?}"
+        "`source rm dotfiles` must KEEP the `dotfiles = {{ source = loqui }}` binding: it is \
+         matched by its effective source (loqui), not its identity key `dotfiles`, got: {remaining:?}"
     );
     assert!(
         !remaining.iter().any(|s| s == "dotfiles"),
-        "the bare `dotfiles` binding (source = dotfiles) must be removed, got: {remaining:?}"
+        "the `nvim = {{ source = dotfiles }}` binding (effective source = dotfiles) must be removed, got: {remaining:?}"
     );
 }
 
@@ -2907,23 +2912,19 @@ fn source_rm_keeps_binding_whose_alias_matches_but_source_differs() {
 fn binding_identities(cfg: &Config, target: &str) -> Vec<String> {
     cfg.targets
         .get(target)
-        .and_then(|t| t.sources.as_deref())
-        .unwrap_or(&[])
-        .iter()
-        .map(|b| b.identity().to_owned())
+        .and_then(|t| t.sources.as_ref())
+        .into_iter()
+        .flatten()
+        .map(|(identity, _)| identity.clone())
         .collect()
 }
 
-fn refined_binding(cfg: &Config, target: &str, identity: &str) -> crate::config::RefinedBinding {
+fn refined_binding(cfg: &Config, target: &str, identity: &str) -> crate::config::Binding {
     cfg.targets
         .get(target)
-        .and_then(|t| t.sources.as_deref())
-        .unwrap_or(&[])
-        .iter()
-        .find_map(|b| match b {
-            crate::config::Binding::Refined(r) if b.identity() == identity => Some((**r).clone()),
-            _ => None,
-        })
+        .and_then(|t| t.sources.as_ref())
+        .and_then(|sources| sources.get(identity))
+        .cloned()
         .unwrap_or_else(|| {
             panic!("target `{target}` must hold a TABLE binding with identity `{identity}`")
         })
@@ -2954,13 +2955,14 @@ fn bind_with_refinement_flags_writes_a_table_entry() {
         .unwrap_or_else(|e| panic!("bind output must be valid phora.toml: {e}\n{out}"));
     let refined = refined_binding(&cfg, "editor", "nvim");
     assert_eq!(
-        refined.source, "dotfiles",
+        refined.effective_source("nvim"),
+        "dotfiles",
         "ANY refinement flag must write a TABLE binding carrying `source = \"dotfiles\"`, got:\n{out}"
     );
     assert_eq!(
-        refined.r#as.as_deref(),
-        Some("nvim"),
-        "`--as nvim` must land as `as = \"nvim\"` in the table binding, got:\n{out}"
+        refined.source.as_deref(),
+        Some("dotfiles"),
+        "`--as nvim` must key the binding under `nvim` with explicit `source = \"dotfiles\"`, got:\n{out}"
     );
     assert_eq!(
         refined.root.as_deref(),
@@ -2990,9 +2992,16 @@ fn bind_with_no_flags_writes_a_bare_string() {
         .targets
         .get("editor")
         .expect("target editor survives bind");
-    let bindings = editor.sources.as_deref().unwrap_or(&[]);
+    let bindings = editor.sources.as_ref().expect("editor has bindings");
+    let dotfiles = bindings
+        .get("dotfiles")
+        .expect("bind must add a binding keyed `dotfiles`");
     assert!(
-        matches!(bindings.first(), Some(crate::config::Binding::Source(s)) if s == "dotfiles"),
+        dotfiles.source.is_none() && dotfiles.effective_source("dotfiles") == "dotfiles",
+        "bind with NO refinement flags must append a BARE STRING, not a table, got:\n{out}"
+    );
+    assert!(
+        out.contains("sources = [\"dotfiles\"]"),
         "bind with NO refinement flags must append a BARE STRING, not a table, got:\n{out}"
     );
 }
@@ -3002,8 +3011,9 @@ fn bind_appends_into_an_array_that_already_holds_a_table_entry() {
     let toml = "version = 1\n\n\
         [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
         [sources.loqui]\ngit = \"https://github.com/srnnkls/loqui.git\"\n\n\
-        [targets.editor]\npath = \"~/.config\"\n\
-        sources = [{ source = \"dotfiles\", as = \"nvim\" }]\n";
+        [targets.editor]\npath = \"~/.config\"\n\n\
+        [targets.editor.sources]\n\
+        nvim = { source = \"dotfiles\" }\n";
 
     let out = config_edit::bind(
         toml,
@@ -3054,8 +3064,10 @@ fn bind_as_with_multiple_sources_errors() {
 fn unbind_removes_the_aliased_entry_by_identity() {
     let toml = "version = 1\n\n\
         [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
-        [targets.editor]\npath = \"~/.config\"\n\
-        sources = [\"dotfiles\", { source = \"dotfiles\", as = \"nvim\" }]\n";
+        [targets.editor]\npath = \"~/.config\"\n\n\
+        [targets.editor.sources]\n\
+        dotfiles = {}\n\
+        nvim = { source = \"dotfiles\" }\n";
 
     let out = config_edit::unbind(toml, "editor", &["nvim".to_owned()])
         .expect("unbind by identity must succeed")
@@ -3106,8 +3118,10 @@ fn string_only_bind_then_unbind_is_byte_identical_to_today() {
 fn bind_reads_mixed_array_and_dedups_by_identity_without_erroring() {
     let toml = "version = 1\n\n\
         [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
-        [targets.editor]\npath = \"~/.config\"\n\
-        sources = [\"dotfiles\", { source = \"dotfiles\", as = \"nvim\" }]\n";
+        [targets.editor]\npath = \"~/.config\"\n\n\
+        [targets.editor.sources]\n\
+        dotfiles = {}\n\
+        nvim = { source = \"dotfiles\" }\n";
 
     let out = config_edit::bind(
         toml,
@@ -3177,8 +3191,9 @@ fn bind_root_on_url_source_errors_and_leaves_file_untouched() {
 fn bind_bare_when_table_entry_exists_preserves_table_and_reports_unchanged() {
     let toml = "version = 1\n\n\
         [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
-        [targets.editor]\npath = \"~/.config\"\n\
-        sources = [{ source = \"dotfiles\", root = \"nvim\" }]\n";
+        [targets.editor]\npath = \"~/.config\"\n\n\
+        [targets.editor.sources]\n\
+        dotfiles = { root = \"nvim\" }\n";
 
     let result = config_edit::bind(
         toml,
@@ -3254,14 +3269,15 @@ fn add_to_with_refinement_flags_writes_source_and_table_binding() {
 
     let refined = refined_binding(&cfg, "editor", "nvim");
     assert_eq!(
-        refined.source, "tropos",
+        refined.effective_source("nvim"),
+        "tropos",
         "`add --to editor` with refinement flags must write a TABLE binding carrying \
          `source = \"tropos\"`, got:\n{written}"
     );
     assert_eq!(
-        refined.r#as.as_deref(),
-        Some("nvim"),
-        "`--as nvim` on add must land as `as = \"nvim\"` in the binding, got:\n{written}"
+        refined.source.as_deref(),
+        Some("tropos"),
+        "`--as nvim` on add must key the binding under `nvim` with explicit `source = \"tropos\"`, got:\n{written}"
     );
     assert_eq!(
         refined.root.as_deref(),
@@ -3308,9 +3324,17 @@ fn add_to_with_no_refinement_flags_writes_a_bare_string_binding() {
         .targets
         .get("editor")
         .expect("target editor survives add --to");
-    let bindings = editor.sources.as_deref().unwrap_or(&[]);
+    let bindings = editor.sources.as_ref().expect("editor has bindings");
+    let tropos = bindings
+        .get("tropos")
+        .expect("add must add a binding keyed `tropos`");
     assert!(
-        matches!(bindings.first(), Some(crate::config::Binding::Source(s)) if s == "tropos"),
+        tropos.source.is_none() && tropos.effective_source("tropos") == "tropos",
+        "`add --to editor` with NO refinement flags must append a BARE STRING `\"tropos\"`, \
+         not a table, got:\n{written}"
+    );
+    assert!(
+        written.contains("sources = [\"tropos\"]"),
         "`add --to editor` with NO refinement flags must append a BARE STRING `\"tropos\"`, \
          not a table, got:\n{written}"
     );
@@ -3390,7 +3414,8 @@ fn add_to_a_single_target_with_as_is_the_happy_path() {
         .unwrap_or_else(|e| panic!("add output must be valid phora.toml: {e}\n{written}"));
     let refined = refined_binding(&cfg, "editor", "nvim");
     assert_eq!(
-        refined.source, "tropos",
+        refined.effective_source("nvim"),
+        "tropos",
         "a single-source `add --to editor --as nvim` must bind `source = \"tropos\"` as `nvim`, got:\n{written}"
     );
 }
@@ -3440,7 +3465,7 @@ fn bare_add_without_to_does_not_touch_targets() {
         .get("editor")
         .expect("target editor must survive a bare add");
     assert!(
-        editor.sources.as_deref().unwrap_or(&[]).is_empty(),
+        editor.sources.as_ref().is_none_or(BTreeMap::is_empty),
         "bare `add` (no `--to`) must NOT bind into any target — `editor.sources` must stay empty, got:\n{written}"
     );
 }
@@ -3549,13 +3574,11 @@ fn add_to_with_url_embedded_root_sets_the_source_root() {
     );
     let binding = editor
         .sources
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .find(|b| b.identity() == "tropos")
+        .as_ref()
+        .and_then(|sources| sources.get("tropos"))
         .expect("target editor must hold a `tropos` binding");
     assert!(
-        matches!(binding, crate::config::Binding::Source(_)),
+        binding.source.is_none() && binding.root.is_none(),
         "with no explicit `--root`, the binding carries no refinement, got:\n{written}"
     );
 }
@@ -3698,13 +3721,14 @@ fn add_to_multiple_targets_writes_a_binding_in_each() {
         .unwrap_or_else(|e| panic!("add output must be valid phora.toml: {e}\n{written}"));
 
     for target in ["editor", "shell"] {
-        let bindings = cfg
+        let binding = cfg
             .targets
             .get(target)
-            .and_then(|t| t.sources.as_deref())
-            .unwrap_or(&[]);
+            .and_then(|t| t.sources.as_ref())
+            .and_then(|sources| sources.get("tropos"))
+            .unwrap_or_else(|| panic!("`add --to {target}` must hold a `tropos` binding"));
         assert!(
-            matches!(bindings.first(), Some(crate::config::Binding::Source(s)) if s == "tropos"),
+            binding.source.is_none() && binding.effective_source("tropos") == "tropos",
             "`add --to {target}` must append a bare-string `tropos` binding, got:\n{written}"
         );
     }
@@ -3787,13 +3811,14 @@ fn add_to_target_without_sources_array_creates_the_array_and_binds() {
     let written = std::fs::read_to_string(&toml_path).expect("phora.toml must remain on disk");
     let cfg = Config::parse(&written)
         .unwrap_or_else(|e| panic!("add output must be valid phora.toml: {e}\n{written}"));
-    let bindings = cfg
+    let binding = cfg
         .targets
         .get("editor")
-        .and_then(|t| t.sources.as_deref())
-        .unwrap_or(&[]);
+        .and_then(|t| t.sources.as_ref())
+        .and_then(|sources| sources.get("tropos"))
+        .expect("target editor must hold a `tropos` binding");
     assert!(
-        matches!(bindings.first(), Some(crate::config::Binding::Source(s)) if s == "tropos"),
+        binding.source.is_none() && binding.effective_source("tropos") == "tropos",
         "binding into a target with no `sources` key must create the array with `tropos`, got:\n{written}"
     );
 }
@@ -3836,10 +3861,12 @@ fn add_to_nonexistent_target_errors_and_leaves_file_untouched() {
 }
 
 fn source_names_opt(target: &crate::config::Target) -> Option<Vec<String>> {
-    target
-        .sources
-        .as_ref()
-        .map(|bindings| bindings.iter().map(|b| b.source().to_owned()).collect())
+    target.sources.as_ref().map(|bindings| {
+        bindings
+            .iter()
+            .map(|(identity, binding)| binding.effective_source(identity).to_owned())
+            .collect()
+    })
 }
 
 // ── CLI-002 / CLI-003: source + target namespace parsing ───────────
@@ -4471,13 +4498,17 @@ fn add_with_binds_appends_to_both_targets_and_inserts_source() {
     );
     assert_eq!(
         source_names_opt(&cfg.targets["A"]),
-        Some(vec!["existing".to_owned(), "dots".to_owned()]),
-        "dots must be appended to target A's sources"
+        Some(vec!["dots".to_owned(), "existing".to_owned()]),
+        "dots must be bound into target A's sources alongside existing"
     );
     assert_eq!(
         source_names_opt(&cfg.targets["B"]),
-        Some(vec!["existing".to_owned(), "dots".to_owned()]),
-        "dots must be appended to target B's sources"
+        Some(vec!["dots".to_owned(), "existing".to_owned()]),
+        "dots must be bound into target B's sources alongside existing"
+    );
+    assert!(
+        out.contains("sources = [\"existing\", \"dots\"]"),
+        "dots must be APPENDED after `existing` in the written list, not prepended, got:\n{out}"
     );
 }
 

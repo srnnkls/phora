@@ -106,83 +106,19 @@ impl<'de> Deserialize<'de> for TemplateOptIn {
 #[serde(deny_unknown_fields)]
 pub struct Target {
     pub path: PathBuf,
-    pub sources: Option<Vec<Binding>>,
+    #[serde(default, deserialize_with = "deserialize_bindings")]
+    pub sources: Option<BTreeMap<String, Binding>>,
     pub layout: Option<LayoutConfig>,
     #[serde(default)]
     pub hooks: Option<TargetHooks>,
 }
 
-#[derive(Debug, Clone)]
-pub enum Binding {
-    Source(String),
-    Refined(Box<RefinedBinding>),
-}
-
-impl Binding {
-    #[must_use]
-    pub fn source(&self) -> &str {
-        match self {
-            Binding::Source(name) => name,
-            Binding::Refined(refined) => &refined.source,
-        }
-    }
-
-    #[must_use]
-    pub fn identity(&self) -> &str {
-        match self {
-            Binding::Source(name) => name,
-            Binding::Refined(refined) => refined.r#as.as_deref().unwrap_or(&refined.source),
-        }
-    }
-
-    #[must_use]
-    pub fn template_opt_in(&self) -> TemplateOptIn {
-        match self {
-            Binding::Source(_) => TemplateOptIn::SuffixOnly,
-            Binding::Refined(refined) => refined.template_opt_in(),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for Binding {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct BindingVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for BindingVisitor {
-            type Value = Binding;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a source name string or a refinement table")
-            }
-
-            fn visit_str<E: serde::de::Error>(
-                self,
-                v: &str,
-            ) -> std::result::Result<Self::Value, E> {
-                Ok(Binding::Source(v.to_owned()))
-            }
-
-            fn visit_map<A: serde::de::MapAccess<'de>>(
-                self,
-                map: A,
-            ) -> std::result::Result<Self::Value, A::Error> {
-                RefinedBinding::deserialize(serde::de::value::MapAccessDeserializer::new(map))
-                    .map(|refined| Binding::Refined(Box::new(refined)))
-            }
-        }
-
-        deserializer.deserialize_any(BindingVisitor)
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
+/// A per-target binding value. The map key is the binding identity; `source`
+/// overrides the effective source only when the alias diverges from the key.
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RefinedBinding {
-    pub source: String,
-    pub r#as: Option<String>,
+pub struct Binding {
+    pub source: Option<String>,
     pub root: Option<PathBuf>,
     pub include: Option<Vec<String>>,
     pub exclude: Option<Vec<String>>,
@@ -195,11 +131,65 @@ pub struct RefinedBinding {
     pub map: Option<BTreeMap<String, String>>,
 }
 
-impl RefinedBinding {
+impl Binding {
+    /// The effective source name: the explicit `source` field, else the
+    /// binding's identity (its map key).
+    #[must_use]
+    pub fn effective_source<'a>(&'a self, identity: &'a str) -> &'a str {
+        self.source.as_deref().unwrap_or(identity)
+    }
+
     #[must_use]
     pub fn template_opt_in(&self) -> TemplateOptIn {
         self.template.clone().unwrap_or(TemplateOptIn::SuffixOnly)
     }
+}
+
+/// Target-named structural rejections (array-of-tables, table-in-list) are
+/// emitted by a second pass in `Config::parse`.
+fn deserialize_bindings<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<BTreeMap<String, Binding>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct BindingsVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for BindingsVisitor {
+        type Value = Option<BTreeMap<String, Binding>>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a keyed binding table or a flat list of source names")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut map = BTreeMap::new();
+            while let Some(name) = seq.next_element::<String>()? {
+                if map.insert(name.clone(), Binding::default()).is_some() {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate source `{name}` in the `sources` list"
+                    )));
+                }
+            }
+            Ok(Some(map))
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut out = BTreeMap::new();
+            while let Some((key, binding)) = map.next_entry::<String, Binding>()? {
+                out.insert(key, binding);
+            }
+            Ok(Some(out))
+        }
+    }
+
+    deserializer.deserialize_any(BindingsVisitor)
 }
 
 #[derive(Debug)]
@@ -288,7 +278,10 @@ impl Target {
     }
 
     pub fn declared_sources(&self) -> impl Iterator<Item = &str> {
-        self.sources.iter().flatten().map(Binding::source)
+        self.sources
+            .iter()
+            .flatten()
+            .map(|(identity, binding)| binding.effective_source(identity))
     }
 
     #[must_use]
@@ -299,7 +292,7 @@ impl Target {
         self.sources
             .iter()
             .flatten()
-            .filter_map(|binding| resolve_binding(binding, all))
+            .filter_map(|(identity, binding)| resolve_binding(identity, binding, all))
             .collect()
     }
 
@@ -316,47 +309,37 @@ impl Target {
 }
 
 fn resolve_binding<'a, S: SourceFields>(
+    identity: &'a str,
     binding: &'a Binding,
     all: &'a BTreeMap<String, S>,
 ) -> Option<ResolvedBinding<'a>> {
-    let identity = binding.identity();
-    let source_name = binding.source();
-    let (root, include, exclude) = match binding {
-        Binding::Source(_) => (None, None, None),
-        Binding::Refined(refined) => (
-            refined.root.as_deref(),
-            refined.include.as_deref(),
-            refined.exclude.as_deref(),
-        ),
-    };
-    let binding_ref = match binding {
-        Binding::Source(_) => None,
-        Binding::Refined(refined) => binding_refspec(refined),
-    };
-    let map = match binding {
-        Binding::Refined(refined) => refined.map.as_ref(),
-        Binding::Source(_) => None,
-    };
+    let source_name = binding.effective_source(identity);
     let source = all.get(source_name)?;
     Some(ResolvedBinding {
         identity,
         source: source_name,
-        root: root.or_else(|| source.intrinsic_root()),
-        include: include.unwrap_or_else(|| source.intrinsic_include()),
-        exclude: exclude.unwrap_or_else(|| source.intrinsic_exclude()),
-        effective_ref: binding_ref.unwrap_or_else(|| source.intrinsic_refspec()),
+        root: binding.root.as_deref().or_else(|| source.intrinsic_root()),
+        include: binding
+            .include
+            .as_deref()
+            .unwrap_or_else(|| source.intrinsic_include()),
+        exclude: binding
+            .exclude
+            .as_deref()
+            .unwrap_or_else(|| source.intrinsic_exclude()),
+        effective_ref: binding_refspec(binding).unwrap_or_else(|| source.intrinsic_refspec()),
         template_opt_in: binding.template_opt_in(),
-        map,
+        map: binding.map.as_ref(),
     })
 }
 
-fn binding_refspec(refined: &RefinedBinding) -> Option<Refspec> {
-    if let Some(rev) = &refined.rev {
+fn binding_refspec(binding: &Binding) -> Option<Refspec> {
+    if let Some(rev) = &binding.rev {
         Some(Refspec::Rev(rev.clone()))
-    } else if let Some(tag) = &refined.tag {
+    } else if let Some(tag) = &binding.tag {
         Some(Refspec::Tag(tag.clone()))
     } else {
-        refined.branch.as_ref().map(|b| Refspec::Branch(b.clone()))
+        binding.branch.as_ref().map(|b| Refspec::Branch(b.clone()))
     }
 }
 
