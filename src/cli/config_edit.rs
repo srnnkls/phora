@@ -96,15 +96,18 @@ fn keyed_effective_source<'a>(key: &'a str, item: &'a Item) -> &'a str {
     item.get("source").and_then(Item::as_str).unwrap_or(key)
 }
 
-fn scrub_target_bindings(doc: &mut DocumentMut, name: &str) {
+fn scrub_target_bindings(doc: &mut DocumentMut, name: &str) -> Result<()> {
     let Some(targets) = doc.get_mut("targets").and_then(Item::as_table_like_mut) else {
-        return;
+        return Ok(());
     };
-    for (_, target) in targets.iter_mut() {
+    for (target_name, target) in targets.iter_mut() {
         let Some(sources) = target.get_mut("sources") else {
             continue;
         };
         if let Some(array) = sources.as_value_mut().and_then(Value::as_array_mut) {
+            if array.iter().any(|v| v.as_str().is_none()) {
+                return Err(legacy_array_error(target_name.get()));
+            }
             let before = array.len();
             array.retain(|v| v.as_str() != Some(name));
             if array.len() != before {
@@ -121,6 +124,7 @@ fn scrub_target_bindings(doc: &mut DocumentMut, name: &str) {
             }
         }
     }
+    Ok(())
 }
 
 fn remove_source_table(doc: &mut DocumentMut, name: &str) -> bool {
@@ -146,8 +150,8 @@ pub fn remove_source(main_text: &str, local_text: &str, name: &str) -> Result<Sc
         )));
     }
 
-    scrub_target_bindings(&mut main, name);
-    scrub_target_bindings(&mut local, name);
+    scrub_target_bindings(&mut main, name)?;
+    scrub_target_bindings(&mut local, name)?;
 
     Ok(ScrubResult {
         main: main.to_string(),
@@ -1320,6 +1324,20 @@ mod tests {
         assert!(
             matches!(err, Error::Config(msg) if msg.contains("[targets.t.sources]")),
             "the rejection must name the keyed-table migration hint, not silently lose the binding"
+        );
+    }
+
+    #[test]
+    fn remove_source_on_legacy_array_of_tables_errors_with_hint() {
+        let main = "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\
+             sources = [{ source = \"dotfiles\" }]\n";
+        let err = remove_source(main, "", "dotfiles").expect_err(
+            "removing a source bound via legacy array-of-tables must error, not dangle",
+        );
+        assert!(
+            matches!(err, Error::Config(msg) if msg.contains("[targets.t.sources]")),
+            "the rejection must name the keyed-table migration hint, not leave a dangling binding"
         );
     }
 
