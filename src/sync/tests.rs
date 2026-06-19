@@ -1107,7 +1107,7 @@ fn refined_binding_root_scopes_projection_to_its_slice() {
     let toml = format!(
         "version = 1\n\n[sources.dots]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
          [targets.dest]\npath = \"{}\"\n\
-         sources = [{{ source = \"dots\", root = \"nvim\" }}]\nlayout = \"by-source\"\n",
+         sources = {{ dots = {{ root = \"nvim\" }} }}\nlayout = \"by-source\"\n",
         td.target_path().display(),
     );
     let cfg = Config::parse(&toml).expect("refined-binding config parses");
@@ -1153,10 +1153,10 @@ fn two_slices_of_one_source_into_one_target_both_deploy() {
     let (_g, _s, backend, registry) = fresh_backend_registry();
     let toml = format!(
         "version = 1\n\n[sources.dots]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
-         [targets.dest]\npath = \"{}\"\nsources = [\n\
-         {{ source = \"dots\", as = \"nvim\", root = \"nvim\" }},\n\
-         {{ source = \"dots\", as = \"tmux\", root = \"tmux\" }},\n\
-         ]\nlayout = \"by-source\"\n",
+         [targets.dest]\npath = \"{}\"\nsources = {{\n\
+         nvim = {{ source = \"dots\", root = \"nvim\" }},\n\
+         tmux = {{ source = \"dots\", root = \"tmux\" }},\n\
+         }}\nlayout = \"by-source\"\n",
         td.target_path().display(),
     );
     let cfg = Config::parse(&toml).expect("two-slice config parses");
@@ -1206,7 +1206,7 @@ fn aliased_binding_records_underlying_source_at_identity_path() {
     let toml = format!(
         "version = 1\n\n[sources.dotfiles]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
          [targets.dest]\npath = \"{}\"\n\
-         sources = [{{ source = \"dotfiles\", as = \"nvim\", root = \"nvim\" }}]\nlayout = \"by-source\"\n",
+         sources = {{ nvim = {{ source = \"dotfiles\", root = \"nvim\" }} }}\nlayout = \"by-source\"\n",
         td.target_path().display(),
     );
     let cfg = Config::parse(&toml).expect("aliased-binding config parses");
@@ -1238,10 +1238,10 @@ fn two_aliases_of_one_source_each_record_the_shared_underlying_source() {
     let (_g, _s, backend, registry) = fresh_backend_registry();
     let toml = format!(
         "version = 1\n\n[sources.dotfiles]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
-         [targets.dest]\npath = \"{}\"\nsources = [\n\
-         {{ source = \"dotfiles\", as = \"nvim\", root = \"nvim\" }},\n\
-         {{ source = \"dotfiles\", as = \"tmux\", root = \"tmux\" }},\n\
-         ]\nlayout = \"by-source\"\n",
+         [targets.dest]\npath = \"{}\"\nsources = {{\n\
+         nvim = {{ source = \"dotfiles\", root = \"nvim\" }},\n\
+         tmux = {{ source = \"dotfiles\", root = \"tmux\" }},\n\
+         }}\nlayout = \"by-source\"\n",
         td.target_path().display(),
     );
     let cfg = Config::parse(&toml).expect("two-alias config parses");
@@ -1310,7 +1310,7 @@ fn rebuild_round_trips_aliased_underlying_source() {
     let toml = format!(
         "version = 1\n\n[sources.dotfiles]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
          [targets.dest]\npath = \"{}\"\n\
-         sources = [{{ source = \"dotfiles\", as = \"nvim\", root = \"nvim\" }}]\nlayout = \"by-source\"\n",
+         sources = {{ nvim = {{ source = \"dotfiles\", root = \"nvim\" }} }}\nlayout = \"by-source\"\n",
         td.target_path().display(),
     );
     let cfg = Config::parse(&toml).expect("aliased-binding config parses");
@@ -1354,10 +1354,10 @@ fn flat_layout_collision_detected_between_two_aliases_sharing_a_destination() {
     // different identities; flat layout drops the identity, so both land at `dest/init`.
     let toml = format!(
         "version = 1\n\n[sources.dots]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
-         [targets.dest]\npath = \"{}\"\nsources = [\n\
-         {{ source = \"dots\", as = \"one\", root = \"nvim\" }},\n\
-         {{ source = \"dots\", as = \"two\", root = \"nvim\" }},\n\
-         ]\nlayout = \"flat\"\n",
+         [targets.dest]\npath = \"{}\"\nsources = {{\n\
+         one = {{ source = \"dots\", root = \"nvim\" }},\n\
+         two = {{ source = \"dots\", root = \"nvim\" }},\n\
+         }}\nlayout = \"flat\"\n",
         td.target_path().display(),
     );
     let cfg = Config::parse(&toml).expect("two-alias flat config parses");
@@ -1383,10 +1383,10 @@ fn same_identity_bindings_sharing_a_destination_still_collide() {
     let (_g, _s, backend, registry) = fresh_backend_registry();
     let toml = format!(
         "version = 1\n\n[sources.dots]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
-         [targets.dest]\npath = \"{}\"\nsources = [\n\
-         {{ source = \"dots\", root = \"nvim\" }},\n\
-         {{ source = \"dots\", root = \"nvim\" }},\n\
-         ]\nlayout = \"flat\"\n",
+         [targets.dest]\npath = \"{}\"\nsources = {{\n\
+         a = {{ source = \"dots\", root = \"nvim\" }},\n\
+         b = {{ source = \"dots\", root = \"nvim\" }},\n\
+         }}\nlayout = \"flat\"\n",
         td.target_path().display(),
     );
     let cfg = Config::parse(&toml).expect("two bare same-source bindings parse");
@@ -1422,7 +1422,7 @@ fn link_binding_symlink_uses_binding_effective_root() {
             "version = 1\n\n\
              [sources.linked]\ngit = \"{}\"\nbranch = \"main\"\ndeploy = \"link\"\n\n\
              [targets.dest]\npath = \"{}\"\n\
-             sources = [{{ source = \"linked\", root = \"languages\" }}]\nlayout = \"by-source\"\n",
+             sources = {{ linked = {{ root = \"languages\" }} }}\nlayout = \"by-source\"\n",
             wt.path().display(),
             td.target_path().display(),
         );
@@ -5354,14 +5354,14 @@ fn changing_binding_root_keeps_lock_byte_identical_but_reprojects() {
     let cfg_nvim = Config::parse(&format!(
         "version = 1\n\n[sources.dots]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
          [targets.dest]\npath = \"{}\"\n\
-         sources = [{{ source = \"dots\", root = \"nvim\" }}]\nlayout = \"by-source\"\n",
+         sources = {{ dots = {{ root = \"nvim\" }} }}\nlayout = \"by-source\"\n",
         td_a.target_path().display(),
     ))
     .expect("nvim-binding config parses");
     let cfg_tmux = Config::parse(&format!(
         "version = 1\n\n[sources.dots]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
          [targets.dest]\npath = \"{}\"\n\
-         sources = [{{ source = \"dots\", root = \"tmux\" }}]\nlayout = \"by-source\"\n",
+         sources = {{ dots = {{ root = \"tmux\" }} }}\nlayout = \"by-source\"\n",
         td_b.target_path().display(),
     ))
     .expect("tmux-binding config parses");
@@ -5412,10 +5412,10 @@ fn two_bindings_of_one_source_share_a_single_lock_entry() {
     let (_g, _s, backend, registry) = fresh_backend_registry();
     let cfg = Config::parse(&format!(
         "version = 1\n\n[sources.dots]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
-         [targets.dest]\npath = \"{}\"\nsources = [\n\
-         {{ source = \"dots\", as = \"nvim\", root = \"nvim\" }},\n\
-         {{ source = \"dots\", as = \"tmux\", root = \"tmux\" }},\n\
-         ]\nlayout = \"by-source\"\n",
+         [targets.dest]\npath = \"{}\"\nsources = {{\n\
+         nvim = {{ source = \"dots\", root = \"nvim\" }},\n\
+         tmux = {{ source = \"dots\", root = \"tmux\" }},\n\
+         }}\nlayout = \"by-source\"\n",
         td.target_path().display(),
     ))
     .expect("two-binding config parses");
@@ -5706,10 +5706,10 @@ fn config_two_versions(url: &str, target_path: &Path) -> Config {
     let toml = format!(
         "version = 1\n\n\
          [sources.fzf]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
-         [targets.dest]\npath = \"{}\"\nsources = [\n\
-         {{ source = \"fzf\", as = \"stable\", tag = \"v0.55.0\" }},\n\
-         {{ source = \"fzf\", as = \"canary\", tag = \"v0.56.0\" }},\n\
-         ]\nlayout = \"by-source\"\n",
+         [targets.dest]\npath = \"{}\"\nsources = {{\n\
+         stable = {{ source = \"fzf\", tag = \"v0.55.0\" }},\n\
+         canary = {{ source = \"fzf\", tag = \"v0.56.0\" }},\n\
+         }}\nlayout = \"by-source\"\n",
         target_path.display(),
     );
     Config::parse(&toml).expect("two-version config parses")
@@ -5895,10 +5895,10 @@ fn selection_only_override_keeps_one_lock_entry_but_two_records() {
     let toml = format!(
         "version = 1\n\n\
          [sources.fzf]\ngit = \"{}\"\nbranch = \"main\"\n\n\
-         [targets.dest]\npath = \"{}\"\nsources = [\n\
-         {{ source = \"fzf\", as = \"full\" }},\n\
-         {{ source = \"fzf\", as = \"slim\", include = [\"editor\"] }},\n\
-         ]\nlayout = \"by-source\"\n",
+         [targets.dest]\npath = \"{}\"\nsources = {{\n\
+         full = {{ source = \"fzf\" }},\n\
+         slim = {{ source = \"fzf\", include = [\"editor\"] }},\n\
+         }}\nlayout = \"by-source\"\n",
         fx.url,
         td.target_path().display(),
     );
@@ -7495,9 +7495,9 @@ fn plan_target_discovers_binding_effective_selection_not_source_level() {
     let toml = format!(
         "version = 1\n\n\
          [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
-         [targets.dest]\npath = \"{}\"\nsources = [\n\
-         {{ source = \"editor-src\", as = \"slim\", include = [\"editor\"] }},\n\
-         ]\nlayout = \"by-source\"\n",
+         [targets.dest]\npath = \"{}\"\nsources = {{\n\
+         slim = {{ source = \"editor-src\", include = [\"editor\"] }},\n\
+         }}\nlayout = \"by-source\"\n",
         fx.url,
         td.target_path().display(),
     );
@@ -7591,9 +7591,9 @@ fn plan_projects_mapped_binding_one_entry_per_key() {
     let toml = format!(
         "version = 1\n\n\
          [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
-         [targets.dest]\npath = \"{}\"\nsources = [\n\
-         {{ source = \"editor-src\", map = {{ \"AGENTS.md\" = \"CLAUDE.md\", \"tools/AGENTS.md\" = \"codex.md\" }} }},\n\
-         ]\n",
+         [targets.dest]\npath = \"{}\"\nsources = {{\n\
+         editor-src = {{ map = {{ \"AGENTS.md\" = \"CLAUDE.md\", \"tools/AGENTS.md\" = \"codex.md\" }} }},\n\
+         }}\n",
         fx.url,
         td.target_path().display(),
     );
@@ -7674,10 +7674,10 @@ fn plan_handles_mixed_mapped_and_normal_bindings_in_one_target() {
     let toml = format!(
         "version = 1\n\n\
          [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
-         [targets.dest]\npath = \"{}\"\nsources = [\n\
-         {{ source = \"editor-src\", as = \"leaves\", map = {{ \"AGENTS.md\" = \"CLAUDE.md\" }} }},\n\
-         {{ source = \"editor-src\", as = \"dirs\" }},\n\
-         ]\n",
+         [targets.dest]\npath = \"{}\"\nsources = {{\n\
+         leaves = {{ source = \"editor-src\", map = {{ \"AGENTS.md\" = \"CLAUDE.md\" }} }},\n\
+         dirs = {{ source = \"editor-src\" }},\n\
+         }}\n",
         fx.url,
         td.target_path().display(),
     );
@@ -7751,9 +7751,9 @@ fn plan_mapped_destination_ignores_layout() {
     let toml = format!(
         "version = 1\n\n\
          [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
-         [targets.dest]\npath = \"{}\"\nsources = [\n\
-         {{ source = \"editor-src\", as = \"slim\", map = {{ \"AGENTS.md\" = \"CLAUDE.md\", \"tools/AGENTS.md\" = \"codex.md\" }} }},\n\
-         ]\nlayout = \"by-source\"\n",
+         [targets.dest]\npath = \"{}\"\nsources = {{\n\
+         slim = {{ source = \"editor-src\", map = {{ \"AGENTS.md\" = \"CLAUDE.md\", \"tools/AGENTS.md\" = \"codex.md\" }} }},\n\
+         }}\nlayout = \"by-source\"\n",
         fx.url,
         td.target_path().display(),
     );
@@ -7798,9 +7798,9 @@ fn plan_marks_mapped_entries() {
     let mapped_toml = format!(
         "version = 1\n\n\
          [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
-         [targets.dest]\npath = \"{}\"\nsources = [\n\
-         {{ source = \"editor-src\", map = {{ \"AGENTS.md\" = \"CLAUDE.md\" }} }},\n\
-         ]\n",
+         [targets.dest]\npath = \"{}\"\nsources = {{\n\
+         editor-src = {{ map = {{ \"AGENTS.md\" = \"CLAUDE.md\" }} }},\n\
+         }}\n",
         fx.url,
         td.target_path().display(),
     );
@@ -7886,9 +7886,9 @@ fn preview_target_reflects_binding_effective_selection() {
     let toml = format!(
         "version = 1\n\n\
          [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
-         [targets.dest]\npath = \"{}\"\nsources = [\n\
-         {{ source = \"editor-src\", as = \"slim\", include = [\"editor\"], exclude = [\"**/*.bak\"] }},\n\
-         ]\nlayout = \"by-source\"\n",
+         [targets.dest]\npath = \"{}\"\nsources = {{\n\
+         slim = {{ source = \"editor-src\", include = [\"editor\"], exclude = [\"**/*.bak\"] }},\n\
+         }}\nlayout = \"by-source\"\n",
         fx.url,
         td.target_path().display(),
     );
@@ -8990,9 +8990,9 @@ fn config_one_mapped_binding(url: &str, target_path: &Path, layout: &str) -> Con
     let toml = format!(
         "version = 1\n\n\
          [sources.agents-src]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
-         [targets.dest]\npath = \"{}\"\nsources = [\n\
-         {{ source = \"agents-src\", map = {{ \"AGENTS.md\" = \"CLAUDE.md\" }} }},\n\
-         ]\nlayout = \"{layout}\"\n",
+         [targets.dest]\npath = \"{}\"\nsources = {{\n\
+         agents-src = {{ map = {{ \"AGENTS.md\" = \"CLAUDE.md\" }} }},\n\
+         }}\nlayout = \"{layout}\"\n",
         target_path.display(),
     );
     Config::parse(&toml).expect("one-mapped-binding config parses")
@@ -9202,10 +9202,10 @@ fn sync_fans_out_one_leaf_to_two_mapped_dests() {
     let toml = format!(
         "version = 1\n\n\
          [sources.agents-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
-         [targets.dest]\npath = \"{}\"\nsources = [\n\
-         {{ source = \"agents-src\", as = \"claude\", map = {{ \"AGENTS.md\" = \"CLAUDE.md\" }} }},\n\
-         {{ source = \"agents-src\", as = \"codex\", map = {{ \"AGENTS.md\" = \"codex.md\" }} }},\n\
-         ]\n",
+         [targets.dest]\npath = \"{}\"\nsources = {{\n\
+         claude = {{ source = \"agents-src\", map = {{ \"AGENTS.md\" = \"CLAUDE.md\" }} }},\n\
+         codex = {{ source = \"agents-src\", map = {{ \"AGENTS.md\" = \"codex.md\" }} }},\n\
+         }}\n",
         fx.url,
         td.target_path().display(),
     );
@@ -9387,9 +9387,9 @@ fn config_one_mapped_link_binding(url: &str, target_path: &Path) -> (Config, Con
     let base = format!(
         "version = 1\n\n\
          [sources.agents-src]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
-         [targets.dest]\npath = \"{}\"\nsources = [\n\
-         {{ source = \"agents-src\", map = {{ \"AGENTS.md\" = \"CLAUDE.md\" }} }},\n\
-         ]\n",
+         [targets.dest]\npath = \"{}\"\nsources = {{\n\
+         agents-src = {{ map = {{ \"AGENTS.md\" = \"CLAUDE.md\" }} }},\n\
+         }}\n",
         target_path.display(),
     );
     let local = format!(
@@ -9582,10 +9582,10 @@ fn preview_fans_out_one_leaf_to_two_mapped_dests() {
     let toml = format!(
         "version = 1\n\n\
          [sources.agents-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
-         [targets.dest]\npath = \"{}\"\nsources = [\n\
-         {{ source = \"agents-src\", as = \"claude\", map = {{ \"AGENTS.md\" = \"CLAUDE.md\" }} }},\n\
-         {{ source = \"agents-src\", as = \"codex\", map = {{ \"AGENTS.md\" = \"codex.md\" }} }},\n\
-         ]\n",
+         [targets.dest]\npath = \"{}\"\nsources = {{\n\
+         claude = {{ source = \"agents-src\", map = {{ \"AGENTS.md\" = \"CLAUDE.md\" }} }},\n\
+         codex = {{ source = \"agents-src\", map = {{ \"AGENTS.md\" = \"codex.md\" }} }},\n\
+         }}\n",
         fx.url,
         td.target_path().display(),
     );
@@ -9650,9 +9650,9 @@ fn mapped_link_base_and_overlay(url: &str, target_path: &Path, layout: &str) -> 
     let local = Config::parse(&format!(
         "version = 1\n\n\
          [sources.agents-src]\ngit = \"{url}\"\nbranch = \"main\"\ndeploy = \"link\"\n\n\
-         [targets.dest]\npath = \"{}\"\nsources = [\n\
-         {{ source = \"agents-src\", map = {{ \"AGENTS.md\" = \"CLAUDE.md\" }} }},\n\
-         ]\nlayout = \"{layout}\"\n",
+         [targets.dest]\npath = \"{}\"\nsources = {{\n\
+         agents-src = {{ map = {{ \"AGENTS.md\" = \"CLAUDE.md\" }} }},\n\
+         }}\nlayout = \"{layout}\"\n",
         target_path.display(),
     ))
     .expect("mapped-link overlay parses");
@@ -9850,10 +9850,10 @@ fn config_two_mapped_bindings_same_dest(url: &str, target_path: &Path, layout: &
     let toml = format!(
         "version = 1\n\n\
          [sources.agents-src]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
-         [targets.dest]\npath = \"{}\"\nsources = [\n\
-         {{ source = \"agents-src\", as = \"claude\", map = {{ \"AGENTS.md\" = \"SHARED.md\" }} }},\n\
-         {{ source = \"agents-src\", as = \"claude2\", map = {{ \"tools/AGENTS.md\" = \"SHARED.md\" }} }},\n\
-         ]\nlayout = \"{layout}\"\n",
+         [targets.dest]\npath = \"{}\"\nsources = {{\n\
+         claude = {{ source = \"agents-src\", map = {{ \"AGENTS.md\" = \"SHARED.md\" }} }},\n\
+         claude2 = {{ source = \"agents-src\", map = {{ \"tools/AGENTS.md\" = \"SHARED.md\" }} }},\n\
+         }}\nlayout = \"{layout}\"\n",
         target_path.display(),
     );
     Config::parse(&toml).expect("two-mapped-bindings-same-dest config parses")
@@ -9939,10 +9939,10 @@ fn sync_errors_on_mapped_vs_dir_artifact_collision() {
         "version = 1\n\n\
          [sources.dir-src]\ngit = \"{dir_url}\"\nbranch = \"main\"\n\n\
          [sources.agents-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
-         [targets.dest]\npath = \"{}\"\nsources = [\n\
-         \"dir-src\",\n\
-         {{ source = \"agents-src\", as = \"claude\", map = {{ \"AGENTS.md\" = \"editor\" }} }},\n\
-         ]\nlayout = \"flat\"\n",
+         [targets.dest]\npath = \"{}\"\nsources = {{\n\
+         dir-src = {{}},\n\
+         claude = {{ source = \"agents-src\", map = {{ \"AGENTS.md\" = \"editor\" }} }},\n\
+         }}\nlayout = \"flat\"\n",
         fx.url,
         td.target_path().display(),
     );
@@ -10031,9 +10031,9 @@ fn config_mapped_to(url: &str, target_path: &Path, dest: &str, layout: &str) -> 
     let toml = format!(
         "version = 1\n\n\
          [sources.agents-src]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
-         [targets.dest]\npath = \"{}\"\nsources = [\n\
-         {{ source = \"agents-src\", map = {{ \"AGENTS.md\" = \"{dest}\" }} }},\n\
-         ]\nlayout = \"{layout}\"\n",
+         [targets.dest]\npath = \"{}\"\nsources = {{\n\
+         agents-src = {{ map = {{ \"AGENTS.md\" = \"{dest}\" }} }},\n\
+         }}\nlayout = \"{layout}\"\n",
         target_path.display(),
     );
     Config::parse(&toml).expect("mapped-to config parses")

@@ -86,17 +86,17 @@ include = ["fzf"]
 # `source` = provenance, the rest is this target's own slice.
 [targets.neovim]
 path = "~/.config/nvim"
-sources = [{ source = "dotfiles", as = "nvim", root = "nvim" }]
+[targets.neovim.sources]
+nvim = { source = "dotfiles", root = "nvim" }
 
-# One source feeding one target as two independent slices: distinct `as`
-# identities re-root the same source, and `by-source` labels each slice by identity.
+# One source feeding one target as two independent slices: distinct identities
+# (the table keys) re-root the same source, and `by-source` labels each slice by identity.
 [targets.editors]
 path = "~/.config"
-sources = [
-  { source = "dotfiles", as = "nvim",  root = "nvim" },
-  { source = "dotfiles", as = "helix", root = "helix" },
-]
 layout = "by-source"
+[targets.editors.sources]
+nvim  = { source = "dotfiles", root = "nvim" }
+helix = { source = "dotfiles", root = "helix" }
 
 [targets.vscode]
 path = "~/.config/Code/User"
@@ -113,31 +113,29 @@ path = "~/.local/bin"
 sources = ["fzf-bin"]
 layout = "flat"
 
-# One source pinned to two versions in one project: distinct `as` identities each
-# pin their own ref, so a binding's branch/tag/rev overrides the source default for
-# that target alone. Each distinct ref gets its own lock entry (at its own commit); a
-# bare binding would inherit the source ref and share the source's single entry.
+# One source pinned to two versions in one project: distinct identities (the table
+# keys) each pin their own ref, so a binding's branch/tag/rev overrides the source
+# default for that target alone. Each distinct ref gets its own lock entry (at its own
+# commit); a bare binding would inherit the source ref and share the source's single entry.
 [targets.tools]
 path = "~/.local/tools"
-sources = [
-  { source = "fzf", as = "stable", tag = "v0.55.0" },
-  { source = "fzf", as = "canary", tag = "v0.56.0" },
-]
 layout = "by-source"
+[targets.tools.sources]
+stable = { source = "fzf", tag = "v0.55.0" }
+canary = { source = "fzf", tag = "v0.56.0" }
 
 # Mapped leaves: a binding's `map = { "<source-leaf>" = "<dest>" }` aliases a single
 # source file to a renamed destination at the target root, bypassing the layout (and
 # any `by-source`/`prefixed` nesting). The canonical use is fanning one shared file
 # out under the names different tools expect — here one `AGENTS.md` lands three times,
-# with no copies in the source tree. Give each binding a distinct `as`: identity must
-# be unique within a target.
+# with no copies in the source tree. Give each binding a distinct identity (the table
+# key): identity must be unique within a target.
 [targets.agents]
 path = "~/myproject"
-sources = [
-  { source = "dotfiles", map = { "AGENTS.md" = "AGENTS.md" } },
-  { source = "dotfiles", as = "claude", map = { "AGENTS.md" = "CLAUDE.md" } },
-  { source = "dotfiles", as = "codex",  map = { "AGENTS.md" = "codex.md" } },
-]
+[targets.agents.sources]
+dotfiles = { map = { "AGENTS.md" = "AGENTS.md" } }
+claude   = { source = "dotfiles", map = { "AGENTS.md" = "CLAUDE.md" } }
+codex    = { source = "dotfiles", map = { "AGENTS.md" = "codex.md" } }
 # A key may sit in a subdirectory of the source root, e.g. "lint/rules.toml" = "rules.toml".
 
 # Rejected at config load — each is a hard error:

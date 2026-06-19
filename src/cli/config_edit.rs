@@ -92,45 +92,33 @@ fn normalize_array_decor(array: &mut Array) {
     array.set_trailing_comma(false);
 }
 
-/// The underlying source a binding entry resolves to: a bare string is its own
-/// source; a table entry's `source` field names it.
-fn binding_source(binding: &Value) -> Option<&str> {
-    match binding {
-        Value::String(s) => Some(s.value()),
-        Value::InlineTable(t) => t.get("source").and_then(Value::as_str),
-        _ => None,
-    }
+fn keyed_effective_source<'a>(key: &'a str, item: &'a Item) -> &'a str {
+    item.get("source").and_then(Item::as_str).unwrap_or(key)
 }
 
-/// A binding's identity: a bare string is its own identity; a table entry's
-/// `as` else `source` field.
-fn binding_identity(binding: &Value) -> Option<&str> {
-    match binding {
-        Value::String(s) => Some(s.value()),
-        Value::InlineTable(t) => t
-            .get("as")
-            .and_then(Value::as_str)
-            .or_else(|| t.get("source").and_then(Value::as_str)),
-        _ => None,
-    }
-}
-
-fn scrub_target_arrays(doc: &mut DocumentMut, name: &str) {
+fn scrub_target_bindings(doc: &mut DocumentMut, name: &str) {
     let Some(targets) = doc.get_mut("targets").and_then(Item::as_table_like_mut) else {
         return;
     };
     for (_, target) in targets.iter_mut() {
-        let Some(array) = target
-            .get_mut("sources")
-            .and_then(Item::as_value_mut)
-            .and_then(Value::as_array_mut)
-        else {
+        let Some(sources) = target.get_mut("sources") else {
             continue;
         };
-        let before = array.len();
-        array.retain(|v| binding_source(v) != Some(name));
-        if array.len() != before {
-            normalize_array_decor(array);
+        if let Some(array) = sources.as_value_mut().and_then(Value::as_array_mut) {
+            let before = array.len();
+            array.retain(|v| v.as_str() != Some(name));
+            if array.len() != before {
+                normalize_array_decor(array);
+            }
+        } else if let Some(table) = sources.as_table_like_mut() {
+            let doomed: Vec<String> = table
+                .iter()
+                .filter(|(key, item)| keyed_effective_source(key, item) == name)
+                .map(|(key, _)| key.to_owned())
+                .collect();
+            for key in doomed {
+                table.remove(&key);
+            }
         }
     }
 }
@@ -141,9 +129,8 @@ fn remove_source_table(doc: &mut DocumentMut, name: &str) -> bool {
         .is_some_and(|sources| sources.remove(name).is_some())
 }
 
-/// Remove `[sources.<name>]` from BOTH texts AND scrub `<name>` from every
-/// `[targets.*].sources` array in BOTH. Table-form bindings are matched by their
-/// underlying `source` field, so aliased bindings are scrubbed, not orphaned.
+/// Remove `[sources.<name>]` from BOTH texts and scrub every `[targets.*].sources`
+/// binding whose effective source is `<name>` (matched by source, not by key).
 ///
 /// # Errors
 ///
@@ -159,8 +146,8 @@ pub fn remove_source(main_text: &str, local_text: &str, name: &str) -> Result<Sc
         )));
     }
 
-    scrub_target_arrays(&mut main, name);
-    scrub_target_arrays(&mut local, name);
+    scrub_target_bindings(&mut main, name);
+    scrub_target_bindings(&mut local, name);
 
     Ok(ScrubResult {
         main: main.to_string(),
@@ -213,18 +200,16 @@ pub fn remove_target(doc_text: &str, name: &str) -> Result<String> {
     Ok(doc.to_string())
 }
 
-fn target_sources_array<'a>(doc: &'a mut DocumentMut, target: &str) -> Option<&'a mut Array> {
+fn target_sources_item<'a>(doc: &'a mut DocumentMut, target: &str) -> Option<&'a mut Item> {
     doc.get_mut("targets")?
         .as_table_like_mut()?
         .get_mut(target)?
         .as_table_mut()?
-        .get_mut("sources")?
-        .as_array_mut()
+        .get_mut("sources")
 }
 
 /// Per-binding refinement carried by `bind`/`add --to`: an optional `as`
-/// identity plus optional `root`/`include`/`exclude` overrides. A "bare"
-/// refinement (all unset) writes a plain source-name string.
+/// identity plus optional `root`/`include`/`exclude` overrides.
 #[derive(Debug, Default)]
 pub struct BindRefinement {
     pub r#as: Option<String>,
@@ -254,14 +239,10 @@ pub struct BindResult {
     pub changed: bool,
 }
 
-fn build_binding(source: &str, refinement: &BindRefinement) -> Value {
-    if refinement.is_bare() {
-        return source.into();
-    }
+fn keyed_binding_value(source: &str, identity: &str, refinement: &BindRefinement) -> Value {
     let mut table = InlineTable::new();
-    table.insert("source", source.into());
-    if let Some(r#as) = &refinement.r#as {
-        table.insert("as", r#as.as_str().into());
+    if source != identity {
+        table.insert("source", source.into());
     }
     if let Some(branch) = &refinement.branch {
         table.insert("branch", branch.as_str().into());
@@ -288,28 +269,50 @@ fn string_array(items: &[String]) -> Value {
     items.iter().map(String::as_str).collect::<Array>().into()
 }
 
-fn upsert_binding(array: &mut Array, identity: &str, entry: Value, bare: bool) -> bool {
-    let existing = array
-        .iter()
-        .position(|b| binding_identity(b) == Some(identity));
-    match existing {
-        Some(_) if bare => false,
-        Some(i) => {
-            *array.get_mut(i).expect("position is in bounds") = entry;
-            normalize_array_decor(array);
-            true
+fn list_to_keyed_table(array: &Array, target: &str) -> Result<Table> {
+    let mut table = Table::new();
+    table.set_implicit(false);
+    for element in array {
+        let name = element.as_str().ok_or_else(|| legacy_array_error(target))?;
+        if table.contains_key(name) {
+            return Err(legacy_array_error(target));
         }
-        None => {
-            array.push(entry);
-            normalize_array_decor(array);
-            true
-        }
+        table.insert(name, Item::Value(Value::InlineTable(InlineTable::new())));
     }
+    Ok(table)
 }
 
-/// Undefined-source is tolerated here because the source may live in the sibling
-/// file; the caller's merged-view guard resolves that. Identity-uniqueness and
-/// url-slice rejection still propagate.
+fn legacy_array_error(target: &str) -> Error {
+    Error::Config(format!(
+        "target `{target}`: table entries in a `sources` list are no longer supported; \
+         use a keyed `[targets.{target}.sources]` table instead"
+    ))
+}
+
+fn append_bare_to_list(array: &mut Array, source: &str) -> bool {
+    if array.iter().any(|b| b.as_str() == Some(source)) {
+        return false;
+    }
+    array.push(source);
+    normalize_array_decor(array);
+    true
+}
+
+fn upsert_keyed_entry_dyn(
+    table: &mut dyn toml_edit::TableLike,
+    identity: &str,
+    value: Value,
+    bare: bool,
+) -> bool {
+    if bare && table.contains_key(identity) {
+        return false;
+    }
+    table.insert(identity, Item::Value(value));
+    true
+}
+
+/// Tolerates an undefined source (it may live in the sibling file; the caller's
+/// merged-view guard catches a truly dangling one); other rejections propagate.
 fn validate_edited(text: &str) -> Result<()> {
     match Config::parse(text)?.validate() {
         Err(Error::Config(msg)) if msg.contains("undefined source") => Ok(()),
@@ -317,11 +320,9 @@ fn validate_edited(text: &str) -> Result<()> {
     }
 }
 
-/// Bind `sources` into `[targets.<target>].sources`, matching/replacing entries
-/// by binding identity. A bare refinement appends plain source-name strings; any
-/// set refinement field writes a table entry keyed by identity (`as` else
-/// source). Reads mixed string|table arrays and dedups by identity. The target's
-/// `sources` list is created when absent.
+/// Bind `sources` into `[targets.<target>].sources`. A bare bind keeps the flat
+/// `sources = [...]` list; the first `--as` alias or refinement promotes it to a
+/// keyed `[targets.<t>.sources]` table, never the reverse.
 ///
 /// # Errors
 ///
@@ -355,14 +356,24 @@ pub fn bind(
         }
     }
 
+    if !refinement.is_bare() {
+        promote_sources_to_table(&mut doc, target)?;
+    }
+
     let mut changed = false;
-    {
-        let array = target_sources_array(&mut doc, target)
-            .ok_or_else(|| Error::Config(format!("`{target}.sources` is not an array")))?;
-        for source in sources {
-            let identity = refinement.r#as.as_deref().unwrap_or(source);
-            let entry = build_binding(source, refinement);
-            changed |= upsert_binding(array, identity, entry, refinement.is_bare());
+    let item = target_sources_item(&mut doc, target)
+        .ok_or_else(|| Error::Config(format!("`{target}.sources` is missing")))?;
+    for source in sources {
+        let identity = refinement.r#as.as_deref().unwrap_or(source);
+        if let Some(array) = item.as_value_mut().and_then(Value::as_array_mut) {
+            changed |= append_bare_to_list(array, source);
+        } else if let Some(table) = item.as_table_like_mut() {
+            let value = keyed_binding_value(source, identity, refinement);
+            changed |= upsert_keyed_entry_dyn(table, identity, value, refinement.is_bare());
+        } else {
+            return Err(Error::Config(format!(
+                "`{target}.sources` is not a list or table"
+            )));
         }
     }
 
@@ -372,6 +383,15 @@ pub fn bind(
     Ok(BindResult { text, changed })
 }
 
+fn promote_sources_to_table(doc: &mut DocumentMut, target: &str) -> Result<()> {
+    let item = target_sources_item(doc, target)
+        .ok_or_else(|| Error::Config(format!("`{target}.sources` is missing")))?;
+    if let Some(array) = item.as_value().and_then(Value::as_array) {
+        *item = Item::Table(list_to_keyed_table(array, target)?);
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct UnbindResult {
     pub text: String,
@@ -379,23 +399,36 @@ pub struct UnbindResult {
 }
 
 /// Remove every binding from `[targets.<target>].sources` whose identity is in
-/// `identities` (a bare string matches by source name; a table entry matches by
-/// `as` else `source`).
+/// `identities`. Never demotes a keyed table back to a list.
 ///
 /// # Errors
 ///
 /// Returns [`crate::error::Error::Config`] if the target has no `sources` list.
 pub fn unbind(doc_text: &str, target: &str, identities: &[String]) -> Result<UnbindResult> {
     let mut doc = parse_doc(doc_text)?;
-    let array = target_sources_array(&mut doc, target).ok_or_else(|| {
+    let item = target_sources_item(&mut doc, target).ok_or_else(|| {
         Error::Config(format!(
             "target `{target}` has no `sources` list; nothing to unbind"
         ))
     })?;
 
-    array.retain(|b| binding_identity(b).is_none_or(|id| !identities.iter().any(|i| i == id)));
-    let tombstoned = array.is_empty();
-    normalize_array_decor(array);
+    let tombstoned = if let Some(array) = item.as_value_mut().and_then(Value::as_array_mut) {
+        array.retain(|b| {
+            b.as_str()
+                .is_none_or(|id| !identities.iter().any(|i| i == id))
+        });
+        normalize_array_decor(array);
+        array.is_empty()
+    } else if let Some(table) = item.as_table_like_mut() {
+        for identity in identities {
+            table.remove(identity);
+        }
+        table.is_empty()
+    } else {
+        return Err(Error::Config(format!(
+            "target `{target}` has no `sources` list; nothing to unbind"
+        )));
+    };
 
     Ok(UnbindResult {
         text: doc.to_string(),
@@ -411,11 +444,11 @@ pub fn unbind(doc_text: &str, target: &str, identities: &[String]) -> Result<Unb
 /// Returns [`crate::error::Error::Config`] naming the dangling (target, source).
 pub fn validate_source_references(merged: &Config) -> Result<()> {
     for (target_name, target) in &merged.targets {
-        for binding in target.sources.iter().flatten() {
-            if !merged.sources.contains_key(binding.source()) {
+        for (identity, binding) in target.sources.iter().flatten() {
+            let effective = binding.effective_source(identity);
+            if !merged.sources.contains_key(effective) {
                 return Err(Error::Config(format!(
-                    "target `{target_name}` references undefined source `{}`",
-                    binding.source()
+                    "target `{target_name}` references undefined source `{effective}`"
                 )));
             }
         }
@@ -426,7 +459,7 @@ pub fn validate_source_references(merged: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, RefinedBinding};
+    use crate::config::Config;
     use crate::error::Error;
 
     fn lit_source(git: &str) -> AddTarget {
@@ -648,7 +681,7 @@ mod tests {
     #[test]
     fn remove_source_scrubs_aliased_table_binding_by_underlying_source() {
         let main = "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\n\n\
-             [targets.A]\npath = \"~/a\"\nsources = [{ source = \"dotfiles\", as = \"dots\" }]\n";
+             [targets.A]\npath = \"~/a\"\n\n[targets.A.sources]\ndots = { source = \"dotfiles\" }\n";
         let local = "version = 1\n";
 
         let result = remove_source(main, local, "dotfiles").expect("remove dotfiles");
@@ -795,13 +828,14 @@ mod tests {
         };
         let result =
             bind(base, "t", &names(&["dotfiles"]), &refinement).expect("refined bind succeeds");
-        assert!(result.changed, "a fresh refined bind changes the array");
+        assert!(result.changed, "a fresh refined bind changes the bindings");
 
         let cfg = Config::parse(&result.text).expect("bind output parses");
         let target = &cfg.targets["t"];
-        let binding = target.sources.as_ref().unwrap().first().unwrap();
-        assert_eq!(binding.identity(), "dots");
-        assert_eq!(binding.source(), "dotfiles");
+        let bindings = target.sources.as_ref().unwrap();
+        let (identity, binding) = bindings.iter().next().unwrap();
+        assert_eq!(identity, "dots");
+        assert_eq!(binding.effective_source(identity), "dotfiles");
     }
 
     #[test]
@@ -818,23 +852,23 @@ mod tests {
     }
 
     #[test]
-    fn bind_reads_mixed_array_and_dedups_by_identity() {
+    fn bind_reads_keyed_table_and_dedups_by_identity() {
         let base = "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\n\n[sources.a]\ngit = \"h\"\n\n\
-             [targets.t]\npath = \"~/x\"\n\
-             sources = [\"a\", { source = \"dotfiles\", as = \"dots\" }]\n";
+             [targets.t]\npath = \"~/x\"\n\n\
+             [targets.t.sources]\na = {}\ndots = { source = \"dotfiles\" }\n";
         let result = bind(base, "t", &names(&["a"]), &bare())
-            .expect("re-binding a bare source in a mixed array is a no-op");
+            .expect("re-binding a bare source in a keyed table is a no-op");
         assert!(
             !result.changed,
-            "binding an already-present identity over a mixed array changes nothing"
+            "binding an already-present identity over a keyed table changes nothing"
         );
     }
 
     #[test]
     fn unbind_removes_aliased_entry_by_identity() {
         let base = "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\n\n\
-             [targets.t]\npath = \"~/x\"\n\
-             sources = [{ source = \"dotfiles\", as = \"dots\" }]\n";
+             [targets.t]\npath = \"~/x\"\n\n\
+             [targets.t.sources]\ndots = { source = \"dotfiles\" }\n";
         let result = unbind(base, "t", &names(&["dots"])).expect("unbind by alias identity");
         assert!(result.tombstoned, "removing the only entry tombstones");
         let cfg = Config::parse(&result.text).expect("output parses");
@@ -843,19 +877,16 @@ mod tests {
 
     // PTV-006: binding-level ref flags (--branch/--tag/--rev) write a TABLE entry.
 
-    fn refined_binding<'a>(cfg: &'a Config, target: &str) -> &'a RefinedBinding {
-        match cfg.targets[target]
+    fn refined_binding<'a>(cfg: &'a Config, target: &str) -> (&'a str, &'a crate::config::Binding) {
+        let bindings = cfg.targets[target]
             .sources
             .as_ref()
-            .expect("target has a sources list")
-            .first()
+            .expect("target has a sources table");
+        bindings
+            .iter()
+            .next()
+            .map(|(identity, binding)| (identity.as_str(), binding))
             .expect("at least one binding")
-        {
-            crate::config::Binding::Refined(refined) => refined,
-            other @ crate::config::Binding::Source(_) => {
-                panic!("expected a Refined (table) binding, got {other:?}")
-            }
-        }
     }
 
     #[test]
@@ -871,9 +902,9 @@ mod tests {
             bind(base, "t", &names(&["fzf"]), &refinement).expect("a tag-pinned bind succeeds");
 
         let cfg = Config::parse(&result.text).expect("bind output parses");
-        let refined = refined_binding(&cfg, "t");
-        assert_eq!(refined.r#as.as_deref(), Some("canary"));
-        assert_eq!(refined.source, "fzf");
+        let (identity, refined) = refined_binding(&cfg, "t");
+        assert_eq!(identity, "canary");
+        assert_eq!(refined.effective_source(identity), "fzf");
         assert_eq!(
             refined.tag.as_deref(),
             Some("v0.56.0"),
@@ -893,8 +924,8 @@ mod tests {
             bind(base, "t", &names(&["fzf"]), &refinement).expect("a rev-pinned bind succeeds");
 
         let cfg = Config::parse(&result.text).expect("bind output parses");
-        let refined = refined_binding(&cfg, "t");
-        assert_eq!(refined.source, "fzf");
+        let (identity, refined) = refined_binding(&cfg, "t");
+        assert_eq!(refined.effective_source(identity), "fzf");
         assert_eq!(
             refined.rev.as_deref(),
             Some("deadbeef"),
@@ -919,7 +950,7 @@ mod tests {
             .expect("a branch-only refined bind succeeds");
 
         let cfg = Config::parse(&result.text).expect("bind output parses");
-        let refined = refined_binding(&cfg, "t");
+        let (_, refined) = refined_binding(&cfg, "t");
         assert_eq!(
             refined.branch.as_deref(),
             Some("develop"),
@@ -972,6 +1003,264 @@ mod tests {
         assert!(
             matches!(err, Error::Config(msg) if msg.contains("T") && msg.contains("ghost")),
             "the error must name both the target T and the dangling source ghost"
+        );
+    }
+
+    fn resolved_pairs(cfg: &Config, target: &str) -> Vec<(String, String)> {
+        let t = &cfg.targets[target];
+        t.resolve_sources(&cfg.sources)
+            .into_iter()
+            .map(|b| (b.identity.to_owned(), b.source.to_owned()))
+            .collect()
+    }
+
+    fn target_sources_item(text: &str, target: &str) -> Item {
+        let doc = text
+            .parse::<DocumentMut>()
+            .expect("emitted config must be syntactically valid toml");
+        doc["targets"][target]["sources"].clone()
+    }
+
+    const TWO_BARE_SOURCES: &str = "version = 1\n\n[sources.a]\ngit = \"g\"\n\n\
+         [sources.b]\ngit = \"h\"\n\n[targets.t]\npath = \"~/x\"\n";
+
+    #[test]
+    fn two_bare_binds_emit_flat_list_not_a_table() {
+        let first = bind(TWO_BARE_SOURCES, "t", &names(&["a"]), &bare())
+            .expect("first bare bind")
+            .text;
+        let result = bind(&first, "t", &names(&["b"]), &bare())
+            .expect("second bare bind appends")
+            .text;
+
+        let sources = target_sources_item(&result, "t");
+        let array = sources
+            .as_array()
+            .unwrap_or_else(|| panic!("two bare binds must stay a flat array, got:\n{result}"));
+        let elems: Vec<&str> = array.iter().filter_map(Value::as_str).collect();
+        assert_eq!(
+            elems,
+            vec!["a", "b"],
+            "two bare binds must produce a flat list of string elements, got:\n{result}"
+        );
+        let cfg = Config::parse(&result).expect("flat-list output parses");
+        assert_eq!(
+            resolved_pairs(&cfg, "t"),
+            vec![
+                ("a".to_owned(), "a".to_owned()),
+                ("b".to_owned(), "b".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn aliased_bind_promotes_flat_list_to_keyed_table() {
+        let flat = bind(TWO_BARE_SOURCES, "t", &names(&["a"]), &bare())
+            .expect("seed a flat list with one bare element")
+            .text;
+        assert!(
+            target_sources_item(&flat, "t").is_array(),
+            "precondition: target holds a flat list, got:\n{flat}"
+        );
+
+        let refinement = BindRefinement {
+            r#as: Some("alias".to_owned()),
+            ..BindRefinement::default()
+        };
+        let result = bind(&flat, "t", &names(&["b"]), &refinement)
+            .expect("an aliased bind over a flat list must succeed")
+            .text;
+
+        let sources = target_sources_item(&result, "t");
+        assert!(
+            sources.is_table_like(),
+            "the first alias must promote the flat list to a keyed table, got:\n{result}"
+        );
+        assert!(
+            !sources.is_array(),
+            "promotion must NOT emit an inline-table array (001 rejects it on parse), got:\n{result}"
+        );
+
+        let cfg = Config::parse(&result)
+            .expect("the promoted keyed table must re-parse as valid phora.toml");
+        let mut pairs = resolved_pairs(&cfg, "t");
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                ("a".to_owned(), "a".to_owned()),
+                ("alias".to_owned(), "b".to_owned()),
+            ],
+            "after promotion `a` stays bound bare and `alias` resolves to source `b`"
+        );
+    }
+
+    #[test]
+    fn samename_refinement_promotes_and_omits_redundant_source_key() {
+        let flat = bind(TWO_BARE_SOURCES, "t", &names(&["a"]), &bare())
+            .expect("seed a flat list")
+            .text;
+        let refinement = BindRefinement {
+            root: Some("sub".to_owned()),
+            ..BindRefinement::default()
+        };
+        let result = bind(&flat, "t", &names(&["b"]), &refinement)
+            .expect("a same-name refinement over a flat list must succeed")
+            .text;
+
+        let sources = target_sources_item(&result, "t");
+        assert!(
+            sources.is_table_like() && !sources.is_array(),
+            "a refinement must promote the flat list to a keyed table, got:\n{result}"
+        );
+        let b_entry = sources
+            .get("b")
+            .unwrap_or_else(|| panic!("refined entry must be keyed under `b`, got:\n{result}"));
+        assert!(
+            b_entry.get("source").is_none(),
+            "a same-name refinement keyed by `b` must omit the redundant `source` field, \
+             got:\n{result}"
+        );
+        assert_eq!(
+            b_entry.get("root").and_then(Item::as_str),
+            Some("sub"),
+            "the refinement's `root = \"sub\"` must survive the promotion, got:\n{result}"
+        );
+
+        let cfg = Config::parse(&result).expect("promoted same-name table re-parses");
+        let mut pairs = resolved_pairs(&cfg, "t");
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                ("a".to_owned(), "a".to_owned()),
+                ("b".to_owned(), "b".to_owned()),
+            ],
+            "the refined `b` entry's effective source is its own key `b`"
+        );
+    }
+
+    #[test]
+    fn keyed_table_never_auto_demotes_to_list_on_unbind() {
+        let flat = bind(TWO_BARE_SOURCES, "t", &names(&["a"]), &bare())
+            .expect("seed flat list")
+            .text;
+        let refinement = BindRefinement {
+            r#as: Some("alias".to_owned()),
+            ..BindRefinement::default()
+        };
+        let keyed = bind(&flat, "t", &names(&["b"]), &refinement)
+            .expect("promote to keyed table")
+            .text;
+        assert!(
+            target_sources_item(&keyed, "t").is_table_like(),
+            "precondition: target is now a keyed table, got:\n{keyed}"
+        );
+
+        let result = unbind(&keyed, "t", &names(&["alias"]))
+            .expect("unbinding the refined entry leaves only a bare-eligible `a`")
+            .text;
+
+        let sources = target_sources_item(&result, "t");
+        assert!(
+            sources.is_table_like() && !sources.is_array(),
+            "removing the refined entry must KEEP the keyed-table form, never demote to a list, \
+             got:\n{result}"
+        );
+        let cfg = Config::parse(&result).expect("post-unbind keyed table re-parses");
+        assert_eq!(
+            resolved_pairs(&cfg, "t"),
+            vec![("a".to_owned(), "a".to_owned())]
+        );
+    }
+
+    #[test]
+    fn remove_source_scrubs_divergent_keyed_entry_by_source_field() {
+        let main = "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\n\n\
+             [sources.other]\ngit = \"h\"\n\n\
+             [targets.A]\npath = \"~/a\"\n\n[targets.A.sources]\n\
+             settings = { source = \"dotfiles\" }\nkeep = { source = \"other\" }\n";
+        let local = "version = 1\n";
+
+        let result = remove_source(main, local, "dotfiles").expect("remove dotfiles");
+
+        let sources = target_sources_item(&result.main, "A");
+        assert!(
+            sources.get("settings").is_none(),
+            "the keyed entry `settings = {{ source = dotfiles }}` must be scrubbed when \
+             `dotfiles` is deleted (matched by effective source, not key), got:\n{}",
+            result.main
+        );
+        assert!(
+            sources.get("keep").is_some(),
+            "the sibling `keep = {{ source = other }}` points at a surviving source and must \
+             NOT be scrubbed, got:\n{}",
+            result.main
+        );
+    }
+
+    #[test]
+    fn remove_source_scrubs_samename_keyed_entry_by_key() {
+        let main = "version = 1\n\n[sources.loqui]\ngit = \"g\"\n\n\
+             [sources.other]\ngit = \"h\"\n\n\
+             [targets.A]\npath = \"~/a\"\n\n[targets.A.sources]\n\
+             loqui = { root = \"x\" }\nkeep = { source = \"other\" }\n";
+        let local = "version = 1\n";
+
+        let result = remove_source(main, local, "loqui").expect("remove loqui");
+
+        let sources = target_sources_item(&result.main, "A");
+        assert!(
+            sources.get("loqui").is_none(),
+            "a same-name keyed entry whose key == the deleted source must be scrubbed, \
+             got:\n{}",
+            result.main
+        );
+        assert!(
+            sources.get("keep").is_some(),
+            "the sibling `keep = {{ source = other }}` must survive the targeted scrub, got:\n{}",
+            result.main
+        );
+    }
+
+    #[test]
+    fn remove_source_scrubs_keyed_entry_in_local_doc() {
+        let main =
+            "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\n\n[sources.other]\ngit = \"h\"\n";
+        let local = "version = 1\n\n[targets.B]\npath = \"~/b\"\n\n\
+             [targets.B.sources]\nsettings = { source = \"dotfiles\" }\n\
+             keep = { source = \"other\" }\n";
+
+        let result = remove_source(main, local, "dotfiles").expect("remove dotfiles");
+
+        let sources = target_sources_item(&result.local, "B");
+        assert!(
+            sources.get("settings").is_none(),
+            "a keyed binding in phora.local.toml must be scrubbed by effective source too, \
+             got:\n{}",
+            result.local
+        );
+        assert!(
+            sources.get("keep").is_some(),
+            "the sibling `keep = {{ source = other }}` in phora.local.toml must survive, got:\n{}",
+            result.local
+        );
+    }
+
+    #[test]
+    fn refined_bind_over_legacy_array_of_tables_errors_not_lossy() {
+        let base = "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\
+             sources = [{ source = \"dotfiles\", root = \".claude\" }]\n";
+        let refinement = BindRefinement {
+            r#as: Some("dots".to_owned()),
+            ..BindRefinement::default()
+        };
+        let err = bind(base, "t", &names(&["dotfiles"]), &refinement)
+            .expect_err("promoting a legacy array-of-tables must error, never drop the entry");
+        assert!(
+            matches!(err, Error::Config(msg) if msg.contains("[targets.t.sources]")),
+            "the rejection must name the keyed-table migration hint, not silently lose the binding"
         );
     }
 

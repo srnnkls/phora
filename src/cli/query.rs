@@ -312,7 +312,7 @@ fn binding_identities(target: &Target) -> Vec<String> {
         .sources
         .iter()
         .flatten()
-        .map(|binding| binding.identity().to_owned())
+        .map(|(identity, _)| identity.clone())
         .collect()
 }
 
@@ -467,8 +467,8 @@ mod tests {
     fn target_show_renders_non_default_effective_ref() {
         let config = Config::parse(
             "version = 1\n\n[sources.fzf]\ngit = \"g\"\nbranch = \"main\"\n\n\
-             [targets.t]\npath = \"~/x\"\n\
-             sources = [{ source = \"fzf\", as = \"canary\", tag = \"v0.56.0\" }]\n",
+             [targets.t]\npath = \"~/x\"\n\n\
+             [targets.t.sources]\ncanary = { source = \"fzf\", tag = \"v0.56.0\" }\n",
         )
         .expect("config with a ref-pinned binding parses");
         let (_dir, reg) = empty_registry();
