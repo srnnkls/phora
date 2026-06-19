@@ -40,6 +40,10 @@ impl<G: SourceBackend, H: SourceBackend> RouterBackend<G, H> {
 }
 
 impl<G: SourceBackend, H: SourceBackend> SourceBackend for RouterBackend<G, H> {
+    fn mirror_root(&self) -> Option<&Path> {
+        self.git.mirror_root()
+    }
+
     fn fetch(&self, source: &SourceName, url: &str) -> Result<()> {
         self.route(source).fetch(source, url)
     }

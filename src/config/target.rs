@@ -111,6 +111,8 @@ pub struct Target {
     pub layout: Option<LayoutConfig>,
     #[serde(default)]
     pub hooks: Option<TargetHooks>,
+    #[serde(default)]
+    pub imports: Option<Vec<String>>,
 }
 
 /// A per-target binding value. The map key is the binding identity; `source`
@@ -266,6 +268,9 @@ impl Target {
         if local.hooks.is_some() {
             // bare [hooks] section replaces base wholesale, matching layout
             self.hooks = local.hooks;
+        }
+        if local.imports.is_some() {
+            self.imports = local.imports;
         }
         self
     }

@@ -116,6 +116,12 @@ pub struct ExportRequest<'a> {
 pub trait SourceBackend {
     fn fetch(&self, source: &SourceName, url: &str) -> Result<()>;
 
+    /// The bare-mirror root, when this backend mirrors into one. Transitive
+    /// resolution reads a fetched dep's `phora.toml` from the mirror it lands in.
+    fn mirror_root(&self) -> Option<&Path> {
+        None
+    }
+
     fn resolve(&self, source: &SourceName, url: &str, refspec: &Refspec) -> Result<String>;
 
     fn commit_time(&self, source: &SourceName, url: &str, commit: &str) -> Result<u64>;
@@ -297,6 +303,10 @@ impl GitBackend {
 }
 
 impl SourceBackend for GitBackend {
+    fn mirror_root(&self) -> Option<&Path> {
+        Some(&self.git_dir)
+    }
+
     fn fetch(&self, source: &SourceName, url: &str) -> Result<()> {
         let _lock = lock_mirror(&self.git_dir, source, url)?;
         let mirror = self.mirror_path(url);
@@ -714,6 +724,10 @@ impl HttpBackend {
 }
 
 impl SourceBackend for HttpBackend {
+    fn mirror_root(&self) -> Option<&Path> {
+        Some(&self.git_dir)
+    }
+
     fn fetch(&self, source: &SourceName, url: &str) -> Result<()> {
         std::fs::create_dir_all(&self.git_dir)
             .map_err(|e| SourceError::Source(format!("source {source}: create git dir: {e}")))?;

@@ -5,9 +5,13 @@ mod host;
 mod migrate;
 mod source;
 mod target;
+pub mod transitive;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod transitive_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 
