@@ -30,8 +30,8 @@ ready
 ## Fan-out — one leaf, two dests
 
 A single source leaf can be mapped to several destinations at once by binding the same
-source twice under distinct aliases. Here `README.md` fans out to `READER.md` (the bare
-source) and `COPY.md` (aliased `second`).
+source under two distinct table keys (identities). Here `README.md` fans out to `READER.md`
+(the default-identity entry `dotfiles`) and `COPY.md` (the divergent identity `second`).
 
 ```scrut
 $ cd "$ROOT" && mkdir -p fanout && cd fanout && isolate_state && repo="$(make_git_source dotfiles)" && mkdir -p target-home && cat > phora.toml <<EOF && phora sync 2>&1 | normalize
@@ -42,10 +42,9 @@ $ cd "$ROOT" && mkdir -p fanout && cd fanout && isolate_state && repo="$(make_gi
 > [targets.home]
 > path = "$PWD/target-home"
 > layout = "flat"
-> sources = [
->   { source = "dotfiles", map = { "README.md" = "READER.md" } },
->   { source = "dotfiles", as = "second", map = { "README.md" = "COPY.md" } },
-> ]
+> [targets.home.sources]
+> dotfiles = { map = { "README.md" = "READER.md" } }
+> second = { source = "dotfiles", map = { "README.md" = "COPY.md" } }
 > EOF
 sync complete
 ```
@@ -90,7 +89,8 @@ $ cd "$ROOT" && mkdir -p rename && cd rename && isolate_state && repo="$(make_gi
 > [targets.home]
 > path = "$PWD/target-home"
 > layout = "flat"
-> sources = [{ source = "dotfiles", map = { "README.md" = "$1" } }]
+> [targets.home.sources]
+> dotfiles = { map = { "README.md" = "$1" } }
 > EOF
 > } && cfg OLD.md && phora sync 2>&1 | normalize
 sync complete
@@ -136,7 +136,8 @@ $ cd "$ROOT" && mkdir -p link && cd link && isolate_state && repo="$(make_git_so
 > [targets.home]
 > path = "$PWD/target-home"
 > layout = "flat"
-> sources = [{ source = "dotfiles", map = { "README.md" = "LINKED.md" } }]
+> [targets.home.sources]
+> dotfiles = { map = { "README.md" = "LINKED.md" } }
 > EOF
 > version = 1
 > [sources.dotfiles]
@@ -173,7 +174,7 @@ home
 ## Collision — two dests, same name
 
 Two bindings mapping to the *same* dest collide. `phora sync` surfaces the conflict and
-fails, naming the contested artifact and both sources.
+fails, naming the contested artifact and both binding identities.
 
 ```scrut
 $ cd "$ROOT" && mkdir -p collision && cd collision && isolate_state && repo="$(make_git_source dotfiles)" && mkdir -p target-home && cat > phora.toml <<EOF && echo configured
@@ -184,10 +185,9 @@ $ cd "$ROOT" && mkdir -p collision && cd collision && isolate_state && repo="$(m
 > [targets.home]
 > path = "$PWD/target-home"
 > layout = "flat"
-> sources = [
->   { source = "dotfiles", map = { "README.md" = "DUP.md" } },
->   { source = "dotfiles", as = "two", map = { "lint/rules.toml" = "DUP.md" } },
-> ]
+> [targets.home.sources]
+> dotfiles = { map = { "README.md" = "DUP.md" } }
+> two = { source = "dotfiles", map = { "lint/rules.toml" = "DUP.md" } }
 > EOF
 configured
 ```
@@ -211,7 +211,8 @@ $ cd "$ROOT" && mkdir -p eject && cd eject && isolate_state && repo="$(make_git_
 > [targets.home]
 > path = "$PWD/target-home"
 > layout = "flat"
-> sources = [{ source = "dotfiles", map = { "README.md" = "KEEP.md" } }]
+> [targets.home.sources]
+> dotfiles = { map = { "README.md" = "KEEP.md" } }
 > EOF
 sync complete
 ```
@@ -254,7 +255,8 @@ $ cd "$ROOT" && mkdir -p bysource && cd bysource && isolate_state && repo="$(mak
 > [targets.home]
 > path = "$PWD/target-home"
 > layout = "by-source"
-> sources = [{ source = "dotfiles", map = { "README.md" = "BYSRC.md" } }]
+> [targets.home.sources]
+> dotfiles = { map = { "README.md" = "BYSRC.md" } }
 > EOF
 sync complete
 ```
@@ -286,7 +288,8 @@ $ cd "$ROOT" && mkdir -p missing && cd missing && isolate_state && repo="$(make_
 > [targets.home]
 > path = "$PWD/target-home"
 > layout = "flat"
-> sources = [{ source = "dotfiles", map = { "ghost.md" = "GHOST.md" } }]
+> [targets.home.sources]
+> dotfiles = { map = { "ghost.md" = "GHOST.md" } }
 > EOF
 > version = 1
 > [sources.dotfiles]
@@ -318,7 +321,8 @@ $ cd "$ROOT" && mkdir -p drift && cd drift && isolate_state && repo="$(make_git_
 > [targets.home]
 > path = "$PWD/target-home"
 > layout = "flat"
-> sources = [{ source = "dotfiles", map = { "README.md" = "DRIFT.md" } }]
+> [targets.home.sources]
+> dotfiles = { map = { "README.md" = "DRIFT.md" } }
 > EOF
 sync complete
 ```

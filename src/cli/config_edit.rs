@@ -1248,6 +1248,65 @@ mod tests {
     }
 
     #[test]
+    fn bind_then_unbind_to_empty_round_trips_through_parse() {
+        let bound = bind(TWO_BARE_SOURCES, "t", &names(&["a"]), &bare())
+            .expect("bind a fresh bare source")
+            .text;
+        let result = unbind(&bound, "t", &names(&["a"])).expect("unbind the only source");
+
+        assert!(
+            result.tombstoned,
+            "unbinding the last source must report a tombstone"
+        );
+        let sources = target_sources_item(&result.text, "t");
+        let array = sources.as_array().unwrap_or_else(|| {
+            panic!(
+                "a bare-list target stays a list at empty, got:\n{}",
+                result.text
+            )
+        });
+        assert!(
+            array.is_empty(),
+            "the tombstone must leave an empty `sources = []`, got:\n{}",
+            result.text
+        );
+        let cfg = Config::parse(&result.text).expect("the tombstone state must re-parse Ok");
+        assert!(
+            cfg.targets["t"].resolve_sources(&cfg.sources).is_empty(),
+            "a re-parsed tombstone resolves to zero bindings, got:\n{}",
+            result.text
+        );
+    }
+
+    #[test]
+    fn remove_source_prefers_source_field_over_colliding_key() {
+        let main = "version = 1\n\n[sources.loqui]\ngit = \"g\"\n\n\
+             [sources.dotfiles]\ngit = \"h\"\n\n\
+             [targets.A]\npath = \"~/a\"\n\n[targets.A.sources]\n\
+             dotfiles = { source = \"loqui\" }\n";
+        let local = "version = 1\n";
+
+        let retained = remove_source(main, local, "dotfiles").expect("remove source dotfiles");
+        let sources = target_sources_item(&retained.main, "A");
+        assert!(
+            sources.get("dotfiles").is_some(),
+            "the entry keyed `dotfiles` has effective source `loqui`; deleting source `dotfiles` \
+             must RETAIN it — the scrub predicate matches by the `source` field, not the key, \
+             got:\n{}",
+            retained.main
+        );
+
+        let scrubbed = remove_source(main, local, "loqui").expect("remove source loqui");
+        let sources = target_sources_item(&scrubbed.main, "A");
+        assert!(
+            sources.get("dotfiles").is_none(),
+            "deleting the entry's effective source `loqui` must SCRUB the `dotfiles`-keyed entry, \
+             got:\n{}",
+            scrubbed.main
+        );
+    }
+
+    #[test]
     fn refined_bind_over_legacy_array_of_tables_errors_not_lossy() {
         let base = "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\n\n\
              [targets.t]\npath = \"~/x\"\n\
