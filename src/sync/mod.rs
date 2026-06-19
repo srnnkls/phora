@@ -8,6 +8,7 @@ mod prune;
 mod rebuild;
 mod resolve;
 mod target;
+mod transitive;
 mod verify;
 
 #[cfg(test)]
@@ -174,6 +175,7 @@ pub fn sync(
     effective_config.validate()?;
     let parsed = effective_config.parsed_sources()?;
     let remotes = resolved_remotes(&effective_config, &parsed)?;
+    transitive::resolve_transitive_graph(&effective_config, &parsed, backend)?;
     for warning in validate_link_mode(input.base_config, &parsed, &remotes)? {
         eprintln!("phora: {warning}");
     }

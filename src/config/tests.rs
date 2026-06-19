@@ -3877,6 +3877,7 @@ mod per_binding_refinement {
             path: std::path::PathBuf::from("~/x"),
             layout: None,
             hooks: None,
+            imports: None,
             sources: Some(BTreeMap::from([(
                 "pinned".to_owned(),
                 Binding {
@@ -3919,6 +3920,7 @@ mod per_binding_refinement {
             path: std::path::PathBuf::from("~/x"),
             layout: None,
             hooks: None,
+            imports: None,
             sources: Some(BTreeMap::from([(
                 "pinned".to_owned(),
                 Binding {

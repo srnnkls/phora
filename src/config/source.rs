@@ -41,6 +41,16 @@ pub struct Source {
     pub preserve_executable: Option<bool>,
     #[serde(default)]
     pub deploy: Option<DeployMode>,
+    #[serde(default)]
+    pub transitive: Option<bool>,
+}
+
+impl Source {
+    /// Whether this source recurses into its own `phora.toml`. Absent ⇒ flat.
+    #[must_use]
+    pub fn is_transitive(&self) -> bool {
+        self.transitive.unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -105,9 +115,16 @@ pub struct ParsedSource {
     allow_submodules: Option<bool>,
     preserve_executable: Option<bool>,
     deploy: Option<DeployMode>,
+    transitive: bool,
 }
 
 impl ParsedSource {
+    /// Whether this source recurses into its own `phora.toml`.
+    #[must_use]
+    pub fn is_transitive(&self) -> bool {
+        self.transitive
+    }
+
     /// Parses a merged raw `Source` into the typed single-kind shape.
     ///
     /// # Errors
@@ -134,6 +151,7 @@ impl ParsedSource {
             allow_submodules: source.allow_submodules,
             preserve_executable: source.preserve_executable,
             deploy: source.deploy,
+            transitive: source.is_transitive(),
         })
     }
 
@@ -350,6 +368,9 @@ impl Source {
         }
         if local.deploy.is_some() {
             self.deploy = local.deploy;
+        }
+        if local.transitive.is_some() {
+            self.transitive = local.transitive;
         }
         self
     }
