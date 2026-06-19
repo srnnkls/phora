@@ -202,6 +202,13 @@ fn resolve_unit(
     }))
 }
 
+/// Default rayon pool size when `--jobs` is unset: one thread per unit, capped at
+/// twice the core count so network-bound fetch overlaps I/O waits without unbounded
+/// oversubscription of the CPU resolve/digest phase.
+fn default_thread_count(units: usize, cores: usize) -> usize {
+    units.min(2 * cores)
+}
+
 pub(super) fn resolve_sources(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
@@ -213,7 +220,10 @@ pub(super) fn resolve_sources(
 ) -> Result<RoutedSources> {
     let units = resolution_units(config, parsed);
 
-    let threads = jobs.unwrap_or_else(|| units.len().min(8)).max(1);
+    let cores = std::thread::available_parallelism().map_or(8, std::num::NonZero::get);
+    let threads = jobs
+        .unwrap_or_else(|| default_thread_count(units.len(), cores))
+        .max(1);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()
@@ -274,4 +284,49 @@ pub fn resolve_sources_for_bench(
         force,
         jobs,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_thread_count;
+
+    #[test]
+    fn default_thread_count_uses_one_thread_per_unit_below_cores() {
+        assert_eq!(default_thread_count(5, 8), 5);
+    }
+
+    #[test]
+    fn default_thread_count_uses_one_thread_per_unit_at_cores() {
+        assert_eq!(default_thread_count(8, 8), 8);
+    }
+
+    #[test]
+    fn default_thread_count_uses_one_thread_per_unit_between_cores_and_cap() {
+        assert_eq!(default_thread_count(12, 8), 12);
+    }
+
+    #[test]
+    fn default_thread_count_uses_one_thread_per_unit_at_twice_cores() {
+        assert_eq!(default_thread_count(16, 8), 16);
+    }
+
+    #[test]
+    fn default_thread_count_caps_at_twice_cores() {
+        assert_eq!(default_thread_count(20, 8), 16);
+    }
+
+    #[test]
+    fn default_thread_count_single_core_single_unit() {
+        assert_eq!(default_thread_count(1, 1), 1);
+    }
+
+    #[test]
+    fn default_thread_count_single_core_caps_at_two() {
+        assert_eq!(default_thread_count(5, 1), 2);
+    }
+
+    #[test]
+    fn default_thread_count_zero_units_returns_zero() {
+        assert_eq!(default_thread_count(0, 8), 0);
+    }
 }
