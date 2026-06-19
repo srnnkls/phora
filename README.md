@@ -39,9 +39,10 @@ Requires a Rust toolchain (edition 2024).
 - **Target** — a local directory artifacts are projected into, with a chosen
   layout. A target draws from its explicit `sources` allow-list.
 - **Binding** — a target's link to a source. Selection lives here per consumer: a
-  binding is a bare source name (inherit the source's defaults) or a table that
-  refines `root`/`include`/`exclude` for that target alone, and names the slice via
-  `as`. See [Bindings](#bindings).
+  target's `sources` is either a flat list of bare source names (inherit the
+  source's defaults) or a keyed `[targets.<t>.sources]` table whose key is the
+  binding identity and whose value refines `root`/`include`/`exclude` for that
+  target alone. See [Bindings](#bindings).
 - **Lock** — `phora.lock` pins each source to a resolved commit so syncs are
   reproducible (`phora.local.toml` gets a companion `phora.local.lock`).
   `phora update` bumps it.
@@ -86,7 +87,7 @@ phora add git@github.com:me/dotfiles.git --tag v1.2
 
 # Bind sources to a target; refinement flags scope the binding to that target
 phora bind dotfiles --to neovim                          # bare binding, inherits source
-phora bind dotfiles --to neovim --as nvim --root nvim    # refined slice, named `nvim`
+phora bind dotfiles --to neovim --as nvim --root nvim    # refined slice, identity `nvim`
 phora unbind nvim --from neovim                          # remove a binding by identity
 # `phora add <url> --to <target>` takes the same refinement flags; with --to present,
 # --root scopes the binding (a bare add keeps --root on the source).
@@ -164,7 +165,7 @@ source(s); the target deploys exactly its listed sources (nothing until bound).
 ### Preview
 
 `phora preview` is the dry-run projection view: per target, it shows each binding's
-identity (`source`, or `source@as` for a refined binding), the artifacts it selects,
+identity (the `[targets.<t>.sources]` table key, defaulting to the source name), the artifacts it selects,
 and the destinations they'd land at under the target's layout — without writing
 anything. Commits come from the lock and the tree from the mirror, with no network.
 An unsynced source is annotated (`not locked`, `needs sync`, or `link working tree
@@ -264,10 +265,11 @@ The `.tmpl` suffix is the opt-in by default; a refined binding can widen it to
 arbitrary globs or turn it off:
 
 ```toml
+[targets.editor.sources]
 # render these paths too, in addition to *.tmpl:
-sources = [{ source = "dotfiles", template = ["*.conf", "config/*"] }]
+wide = { source = "dotfiles", template = ["*.conf", "config/*"] }
 # render nothing, even .tmpl files:
-sources = [{ source = "dotfiles", template = false }]
+plain = { source = "dotfiles", template = false }
 ```
 
 Rendering is strict: referencing an undefined variable aborts that artifact's
@@ -320,9 +322,15 @@ exclude = ["**/*.bak"]
 
 [targets.neovim]
 path = "~/.config/nvim"
-sources = ["dotfiles"]   # the allow-list of sources this target deploys
-# or refine per target: sources = [{ source = "dotfiles", as = "nvim", root = "nvim" }]
+sources = ["dotfiles"]   # all-bare: a flat list of the sources this target deploys
 layout = "flat"          # "flat" | "by-source" | { type = "prefixed", separator = "-" }
+
+# a second target using the keyed-table form (key = identity, defaults to source name):
+[targets.editor]
+path = "~/.config/editor"
+
+[targets.editor.sources]
+nvim = { source = "dotfiles", root = "nvim" }
 ```
 
 **Target sources** are an explicit allow-list: `["a", "b"]` deploys those two,
@@ -344,8 +352,8 @@ adds a new forge or overrides a built-in's `remote`/`auth`. Auth is either
 `preserve_executable` (default on), `deploy` (`"copy"` | `"link"`, default
 `"copy"`; `"link"` is local-overlay-only — see [Link mode](#link-mode-local-development)).
 
-**Layouts** decide how an artifact `a` from a binding `i` (its identity — the `as`
-alias, or the source name for a bare binding) is placed in a target:
+**Layouts** decide how an artifact `a` from a binding `i` (its identity — the
+`[targets.<t>.sources]` table key, defaulting to the source name) is placed in a target:
 
 | Layout                          | Path        |
 | ------------------------------- | ----------- |
@@ -355,18 +363,28 @@ alias, or the source name for a bare binding) is placed in a target:
 
 ### Bindings
 
-A target's `sources` list says which sources it consumes — and, per source, how.
-Each entry is a **binding**: the edge from a target to a source. A source defines
+A target's `sources` says which sources it consumes — and, per source, how. Each
+entry is a **binding**: the edge from a target to a source. A source defines
 provenance plus intrinsic selection defaults; a binding refines that selection for
 one target without touching the source or any other target.
 
-An entry is one of two forms:
+A target's `sources` takes one of two forms — never both at once:
 
-- **Bare name** — `"dotfiles"`. The target consumes the source with its intrinsic
-  `root`/`include`/`exclude` defaults. Fully back-compatible.
-- **Refinement table** — `{ source = "dotfiles", as = "nvim", root = "nvim", include = […], exclude = […] }`.
-  Each of `root`/`include`/`exclude` set on the binding **overrides** the source's
-  same field for this target; any field omitted **inherits** from the source.
+- **Flat list of bare names** — `sources = ["dotfiles", "loqui"]`. Every source is
+  consumed with its intrinsic `root`/`include`/`exclude` defaults. This is the
+  all-bare, zero-settings form (each element is equivalent to `name = {}`).
+- **Keyed table** — `[targets.<t>.sources]`, a map whose **key is the binding
+  identity** and whose value is **always a table** refining that one binding. The
+  key **defaults to the source name**; `source` is written **only on divergence**,
+  when the identity differs from the source name. A bare entry inside a refined
+  (keyed) target is `name = {}`. Each of `root`/`include`/`exclude` set on the
+  binding **overrides** the source's same field for this target; any field omitted
+  **inherits** from the source.
+
+```toml
+[targets.neovim.sources]
+nvim = { source = "dotfiles", root = "nvim" }   # identity `nvim`, diverges from source
+```
 
 **Restriction.** `root`/`include`/`exclude` on a binding backed by a `url` source
 are config errors — a url source has no git tree to re-root. `branch`/`tag`/`rev`
@@ -374,32 +392,22 @@ on a binding backed by a `url` source or a `deploy = "link"` source are config
 errors too — a url has no ref to resolve, and a link source live-links a working
 tree rather than a pinned commit.
 
-```toml
-[targets.neovim]
-path = "~/.config/nvim"
-sources = [{ source = "dotfiles", as = "nvim", root = "nvim" }]
-```
-
-**Identity (`as`).** A binding's identity defaults to the source name and can be
-overridden with `as`. The identity keys the registry artifact and the `by-source`
-and `prefixed` layout labels. Bindings that share an identity must resolve to the
-**same source at the same ref** — so one source can appear more than once in a
-target under its default identity (two slices via different `root`/`include`/`map`),
-while two *different* sources, or one source at two *different* refs, must each take
-a distinct `as`. A genuine destination clash between bindings is caught at sync as a
-collision, not by the identity rule. The slices below name each `as` explicitly for
-legible `by-source` labels (`nvim/…`, `helix/…`); the `as` is optional here —
-omitting it lets both share the `dotfiles` identity, allowed because they select
-different roots and so never clash on a destination:
+**Identity (the table key).** A binding's identity **is** the
+`[targets.<t>.sources]` table key; it **defaults to the source name** and you write
+`source` only when the identity diverges. The identity keys the registry artifact
+and the `by-source` and `prefixed` layout labels, and is structurally unique because
+TOML keys are unique. To feed one source into one target as two slices, give each a
+distinct key, each re-rooting the same `source`. A genuine destination clash between
+bindings is caught at sync as a collision. The slices below take distinct keys for
+legible `by-source` labels (`nvim/…`, `helix/…`):
 
 ```toml
 [targets.editors]
 path = "~/.config"
-sources = [
-  { source = "dotfiles", as = "nvim",   root = "nvim" },
-  { source = "dotfiles", as = "helix",  root = "helix" },
-]
 layout = "by-source"     # labels each slice by its identity: nvim/… and helix/…
+[targets.editors.sources]
+nvim  = { source = "dotfiles", root = "nvim" }
+helix = { source = "dotfiles", root = "helix" }
 ```
 
 **Per-target version (`branch`/`tag`/`rev`).** A binding may also set its own ref —
@@ -414,22 +422,23 @@ a config that names no binding refs locks byte-for-byte as before; a ref-overrid
 binding records its own entry. Resolution still does one fetch per source —
 that single fetch covers every ref the source's bindings name.
 
-To bind one source at two versions, give each binding a distinct `as` — two *refs* of
-one source may not share an identity (unlike same-ref slices, which may):
+To bind one source at two versions, give each binding a distinct key, each naming the
+same `source` and pinning its own ref:
 
 ```toml
 [targets.tools]
 path = "~/.local/tools"
-sources = [
-  { source = "fzf", as = "stable", tag = "v0.55.0" },
-  { source = "fzf", as = "canary", tag = "v0.56.0" },
-]
 layout = "by-source"     # stable/… and canary/… resolve to different commits
+[targets.tools.sources]
+stable = { source = "fzf", tag = "v0.55.0" }
+canary = { source = "fzf", tag = "v0.56.0" }
 ```
 
 **CLI.** `phora bind <source>… --to <target>` adds bindings; `--as`, `--root`,
 `--include <glob>…`, `--exclude <glob>…`, and `--branch`/`--tag`/`--rev` refine them.
-Any refinement flag writes a table binding; with no flags it writes a bare string.
+Any refinement flag writes a keyed table entry; with no flags it appends a bare
+source name to the target's flat list (or, if the target is already a keyed table,
+writes `name = {}`).
 `--branch`/`--tag`/`--rev` write a table binding pinning that ref for the target.
 Because `--as` sets a single binding identity, it cannot apply to multiple sources.
 `phora unbind <identity>… --from <target>` removes bindings by their identity.
@@ -453,11 +462,10 @@ tools expect:
 ```toml
 [targets.agents]
 path = "~/myproject"
-sources = [
-  { source = "dotfiles", map = { "AGENTS.md" = "AGENTS.md" } },
-  { source = "dotfiles", as = "claude", map = { "AGENTS.md" = "CLAUDE.md" } },
-  { source = "dotfiles", as = "codex",  map = { "AGENTS.md" = "codex.md" } },
-]
+[targets.agents.sources]
+dotfiles = { map = { "AGENTS.md" = "AGENTS.md" } }
+claude   = { source = "dotfiles", map = { "AGENTS.md" = "CLAUDE.md" } }
+codex    = { source = "dotfiles", map = { "AGENTS.md" = "codex.md" } }
 ```
 
 One `AGENTS.md` in the source now lands three times, under three names, with no
@@ -475,9 +483,9 @@ deploys as.
 - **Mutually exclusive with `include`/`exclude`.** `map` selects exact leaves, so
   combining it with glob selection on the same binding is a config error.
 - **Fan-out without duplication.** The same source leaf can map to different dests
-  across bindings and targets — bindings of one source at one ref may share the
-  default identity (their dests differ, so they never clash) or take distinct `as`
-  values. The source is fetched once.
+  across bindings and targets — each fan-out is a binding under its own table key,
+  naming the same `source`; their dests differ, so they never clash. The source is
+  fetched once.
 - **Copy and link both work.** Default `deploy = "copy"` materializes the leaf;
   `deploy = "link"` (local-path only — see [Link mode](#link-mode-local-development))
   makes the dest a symlink to the source leaf in the working tree. A missing link

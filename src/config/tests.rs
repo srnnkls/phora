@@ -6121,6 +6121,52 @@ mod keyed_bindings {
         );
     }
 
+    #[test]
+    fn overlay_bare_list_replaces_base_list_wholesale() {
+        let base = Config::parse(
+            "version = 1\n\n[sources.a]\ngit = \"g\"\n\n[sources.b]\ngit = \"h\"\n\n\
+             [sources.c]\ngit = \"i\"\n\n\
+             [targets.t]\npath = \"~/x\"\nsources = [\"a\", \"b\"]\n",
+        )
+        .expect("base parses");
+        let local = Config::parse(
+            "version = 1\n\n[sources.a]\ngit = \"g\"\n\n[sources.b]\ngit = \"h\"\n\n\
+             [sources.c]\ngit = \"i\"\n\n\
+             [targets.t]\npath = \"~/x\"\nsources = [\"c\"]\n",
+        )
+        .expect("local parses");
+        let effective = merge_configs(base, Some(local));
+        let resolved = target_of(&effective, "t").resolve_sources(&effective.sources);
+        let sources: Vec<&str> = resolved.iter().map(|b| b.source).collect();
+        assert_eq!(
+            sources,
+            vec!["c"],
+            "a local bare list `[\"c\"]` must replace the base `[\"a\", \"b\"]` wholesale — \
+             no concatenation, no union with the base, got {sources:?}"
+        );
+    }
+
+    #[test]
+    fn overlay_empty_list_clears_base_bindings_to_nothing() {
+        let base = Config::parse(
+            "version = 1\n\n[sources.a]\ngit = \"g\"\n\n[sources.b]\ngit = \"h\"\n\n\
+             [targets.t]\npath = \"~/x\"\nsources = [\"a\", \"b\"]\n",
+        )
+        .expect("base parses");
+        let local = Config::parse(
+            "version = 1\n\n[sources.a]\ngit = \"g\"\n\n[sources.b]\ngit = \"h\"\n\n\
+             [targets.t]\npath = \"~/x\"\nsources = []\n",
+        )
+        .expect("local parses");
+        let effective = merge_configs(base, Some(local));
+        let resolved = target_of(&effective, "t").resolve_sources(&effective.sources);
+        assert!(
+            resolved.is_empty(),
+            "an explicit `sources = []` in the local overlay must replace the base bindings \
+             with NOTHING (the tombstone deploys nothing), got {resolved:?}"
+        );
+    }
+
     // A bare-string list still resolves, source == key.
     #[test]
     fn bare_string_list_preserved_non_regression() {
