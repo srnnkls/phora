@@ -1169,14 +1169,14 @@ fn two_slices_of_one_source_into_one_target_both_deploy() {
             .get(&artifact_key("dest", "nvim", "init"))
             .expect("registry get")
             .is_some(),
-        "the `as = nvim` slice must key its registry record by identity `nvim`"
+        "the `nvim` slice must key its registry record by identity `nvim`"
     );
     assert!(
         registry
             .get(&artifact_key("dest", "tmux", "conf"))
             .expect("registry get")
             .is_some(),
-        "the `as = tmux` slice must key its registry record by identity `tmux`"
+        "the `tmux` slice must key its registry record by identity `tmux`"
     );
     assert_eq!(
         std::fs::read(
@@ -1252,11 +1252,11 @@ fn two_aliases_of_one_source_each_record_the_shared_underlying_source() {
     let nvim = registry
         .get(&artifact_key("dest", "nvim", "init"))
         .expect("registry get")
-        .expect("the `as = nvim` record must exist at its own identity path");
+        .expect("the record keyed by identity `nvim` must exist at its own identity path");
     let tmux = registry
         .get(&artifact_key("dest", "tmux", "conf"))
         .expect("registry get")
-        .expect("the `as = tmux` record must exist at its own identity path");
+        .expect("the record keyed by identity `tmux` must exist at its own identity path");
     assert_eq!(
         nvim.source, "dotfiles",
         "the nvim alias must record the shared underlying source `dotfiles`"
@@ -5771,12 +5771,12 @@ fn two_version_bindings_project_each_their_own_commit_tree() {
         .registry
         .get(&artifact_key("dest", "stable", "editor"))
         .expect("registry get")
-        .expect("the `as = stable` slice must record under identity `stable`");
+        .expect("the slice keyed by identity `stable` must record under identity `stable`");
     let canary = fx
         .registry
         .get(&artifact_key("dest", "canary", "editor"))
         .expect("registry get")
-        .expect("the `as = canary` slice must record under identity `canary`");
+        .expect("the slice keyed by identity `canary` must record under identity `canary`");
 
     assert_eq!(
         stable.commit, fx.sha_a,
