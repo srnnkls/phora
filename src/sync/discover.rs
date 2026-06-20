@@ -4,6 +4,13 @@ use crate::config::{DeployMode, ParsedSource};
 use crate::error::{Error, Result};
 use crate::kernel::{ArtifactName, Selection, SourceName, locator_basename};
 use crate::source::SourceBackend;
+use crate::store::RecordKind;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct LinkArtifact {
+    pub(super) name: ArtifactName,
+    pub(super) kind: RecordKind,
+}
 
 /// Discover artifacts by scanning the live working tree at `<git>/<root>` (Link
 /// mode). Mirrors the ODB `discover_artifacts`: directories, matched loose files,
@@ -14,7 +21,7 @@ pub(super) fn discover_working_tree(
     git: &Path,
     root: Option<&Path>,
     selection: &Selection,
-) -> Result<Vec<ArtifactName>> {
+) -> Result<Vec<LinkArtifact>> {
     let base = root.map_or_else(|| git.to_path_buf(), |r| git.join(r));
     let entries = std::fs::read_dir(&base)
         .map_err(|e| Error::Sync(format!("scan working tree {}: {e}", base.display())))?;
@@ -33,7 +40,10 @@ pub(super) fn discover_working_tree(
         if file_type.is_symlink() {
             return Err(Error::SymlinkNotAllowed { path: name.into() });
         }
-        artifacts.push(ArtifactName::trusted(name));
+        artifacts.push(LinkArtifact {
+            name: ArtifactName::trusted(name),
+            kind: kind_of(file_type.is_dir()),
+        });
     }
 
     for locator in selection.nested_locators() {
@@ -55,11 +65,22 @@ pub(super) fn discover_working_tree(
                 path: locator.into(),
             });
         }
-        artifacts.push(ArtifactName::trusted(locator_basename(locator)));
+        artifacts.push(LinkArtifact {
+            name: ArtifactName::trusted(locator_basename(locator)),
+            kind: kind_of(meta.is_dir()),
+        });
     }
 
-    artifacts.sort();
+    artifacts.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(artifacts)
+}
+
+fn kind_of(is_dir: bool) -> RecordKind {
+    if is_dir {
+        RecordKind::Dir
+    } else {
+        RecordKind::File
+    }
 }
 
 pub(super) fn discover_artifacts_for_source(
@@ -71,23 +92,60 @@ pub(super) fn discover_artifacts_for_source(
     selection: &Selection,
     root: Option<&Path>,
 ) -> Result<Vec<ArtifactName>> {
+    Ok(
+        discover_link_artifacts(source, git, source_name, commit, backend, selection, root)?
+            .into_iter()
+            .map(|a| a.name)
+            .collect(),
+    )
+}
+
+/// Copy-mode `kind` is a placeholder (`Dir`); the real kind is resolved at export.
+pub(super) fn discover_link_artifacts(
+    source: &ParsedSource,
+    git: &str,
+    source_name: &SourceName,
+    commit: &str,
+    backend: &dyn SourceBackend,
+    selection: &Selection,
+    root: Option<&Path>,
+) -> Result<Vec<LinkArtifact>> {
     match source.deploy_mode() {
         DeployMode::Link => discover_working_tree(Path::new(git), root, selection),
-        DeployMode::Copy => {
-            Ok(backend.discover_artifacts(source_name, git, commit, root, selection)?)
-        }
+        DeployMode::Copy => Ok(backend
+            .discover_artifacts(source_name, git, commit, root, selection)?
+            .into_iter()
+            .map(|name| LinkArtifact {
+                name,
+                kind: RecordKind::Dir,
+            })
+            .collect()),
     }
 }
 
 #[cfg(test)]
 mod fps002_link_discovery {
-    use super::discover_working_tree;
+    use super::{LinkArtifact, discover_working_tree};
     use crate::error::Error;
     use crate::kernel::{ArtifactName, Selection};
+    use crate::store::RecordKind;
+    use std::path::Path;
     use tempfile::TempDir;
 
     fn an(name: &str) -> ArtifactName {
         ArtifactName::trusted(name)
+    }
+
+    fn names(artifacts: &[LinkArtifact]) -> Vec<ArtifactName> {
+        artifacts.iter().map(|a| a.name.clone()).collect()
+    }
+
+    fn discover_names(
+        git: &Path,
+        root: Option<&Path>,
+        sel: &Selection,
+    ) -> Result<Vec<ArtifactName>, Error> {
+        discover_working_tree(git, root, sel).map(|a| names(&a))
     }
 
     fn selection(include: &[&str], exclude: &[&str]) -> Selection {
@@ -115,7 +173,7 @@ mod fps002_link_discovery {
     fn link_discover_yields_loose_file_as_artifact() {
         let tree = tree_with_loose_files();
         let sel = selection(&["init.lua"], &[]);
-        let artifacts = discover_working_tree(tree.path(), None, &sel).expect("discover succeeds");
+        let artifacts = discover_names(tree.path(), None, &sel).expect("discover succeeds");
         assert_eq!(
             artifacts,
             vec![an("init.lua")],
@@ -127,7 +185,7 @@ mod fps002_link_discovery {
     fn link_discover_glob_pulls_loose_root_json_files() {
         let tree = tree_with_loose_files();
         let sel = selection(&["*.json"], &[]);
-        let artifacts = discover_working_tree(tree.path(), None, &sel).expect("discover succeeds");
+        let artifacts = discover_names(tree.path(), None, &sel).expect("discover succeeds");
         assert_eq!(
             artifacts,
             vec![an("settings.json")],
@@ -139,7 +197,7 @@ mod fps002_link_discovery {
     fn link_discover_nested_path_yields_basename_artifact() {
         let tree = tree_with_loose_files();
         let sel = selection(&["a/b/c"], &[]);
-        let artifacts = discover_working_tree(tree.path(), None, &sel).expect("discover succeeds");
+        let artifacts = discover_names(tree.path(), None, &sel).expect("discover succeeds");
         assert_eq!(
             artifacts,
             vec![an("c")],
@@ -151,7 +209,7 @@ mod fps002_link_discovery {
     fn link_discover_surfaces_included_dot_dir() {
         let tree = tree_with_loose_files();
         let sel = selection(&[".zfunc"], &[]);
-        let artifacts = discover_working_tree(tree.path(), None, &sel).expect("discover succeeds");
+        let artifacts = discover_names(tree.path(), None, &sel).expect("discover succeeds");
         assert!(
             artifacts.iter().any(|a| a.as_str() == ".zfunc"),
             "explicitly-included dot-dir must surface, got {artifacts:?}"
@@ -162,7 +220,7 @@ mod fps002_link_discovery {
     fn link_discover_excludes_dot_dir_when_not_included() {
         let tree = tree_with_loose_files();
         let sel = selection(&["init.lua"], &[]);
-        let artifacts = discover_working_tree(tree.path(), None, &sel).expect("discover succeeds");
+        let artifacts = discover_names(tree.path(), None, &sel).expect("discover succeeds");
         assert!(
             !artifacts.iter().any(|a| a.as_str() == ".zfunc"),
             "dot-dir stays excluded unless explicitly included, got {artifacts:?}"
@@ -195,7 +253,7 @@ mod fps002_link_discovery {
     fn link_discover_excludes_nested_locator_by_path() {
         let tree = tree_with_loose_files();
         let sel = selection(&["a/b/c"], &["a/b/c"]);
-        let artifacts = discover_working_tree(tree.path(), None, &sel).expect("discover succeeds");
+        let artifacts = discover_names(tree.path(), None, &sel).expect("discover succeeds");
         assert!(
             !artifacts.iter().any(|a| a.as_str() == "c"),
             "exclude of the nested locator's full path must drop it; exclude wins, got {artifacts:?}"
@@ -206,7 +264,7 @@ mod fps002_link_discovery {
     fn link_discover_excludes_nested_locator_by_basename() {
         let tree = tree_with_loose_files();
         let sel = selection(&["a/b/c"], &["c"]);
-        let artifacts = discover_working_tree(tree.path(), None, &sel).expect("discover succeeds");
+        let artifacts = discover_names(tree.path(), None, &sel).expect("discover succeeds");
         assert!(
             !artifacts.iter().any(|a| a.as_str() == "c"),
             "exclude of the nested locator's basename must drop it; exclude wins, got {artifacts:?}"
@@ -236,11 +294,40 @@ mod fps002_link_discovery {
     fn link_discover_dir_artifacts_unchanged() {
         let tree = tree_with_loose_files();
         let sel = selection(&["editor"], &[]);
-        let artifacts = discover_working_tree(tree.path(), None, &sel).expect("discover succeeds");
+        let artifacts = discover_names(tree.path(), None, &sel).expect("discover succeeds");
         assert_eq!(
             artifacts,
             vec![an("editor")],
             "a plain dir-artifact selector still resolves to the dir"
+        );
+    }
+
+    #[test]
+    fn link_discover_tags_dir_and_file_with_their_node_kind() {
+        let tree = tree_with_loose_files();
+        let sel = selection(&["editor", "init.lua", "a/b/c"], &[]);
+        let found = discover_working_tree(tree.path(), None, &sel).expect("discover succeeds");
+
+        let kind_of = |name: &str| {
+            found
+                .iter()
+                .find(|a| a.name.as_str() == name)
+                .map(|a| a.kind)
+        };
+        assert_eq!(
+            kind_of("editor"),
+            Some(RecordKind::Dir),
+            "a directory artifact must be tagged kind=dir"
+        );
+        assert_eq!(
+            kind_of("init.lua"),
+            Some(RecordKind::File),
+            "a loose-file artifact must be tagged kind=file"
+        );
+        assert_eq!(
+            kind_of("c"),
+            Some(RecordKind::File),
+            "a nested-locator leaf file must be tagged kind=file"
         );
     }
 }

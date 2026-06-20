@@ -17,8 +17,14 @@ pub enum StoreError {
 
 type Result<T> = std::result::Result<T, StoreError>;
 
-/// Layout sentinel for a renamed leaf deployed at the target root, ignoring layout.
-pub const MAP_LAYOUT: &str = "map";
+/// Whether a deployed artifact is a single file or a directory tree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordKind {
+    File,
+    #[default]
+    Dir,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ArtifactKey {
@@ -37,6 +43,8 @@ pub struct RegistryRecord {
     pub digest: String,
     pub projected_at: String,
     pub layout: String,
+    #[serde(default)]
+    pub kind: RecordKind,
     pub allow_symlinks: bool,
     pub preserve_executable: bool,
     pub files: Vec<ManifestFile>,
@@ -54,6 +62,7 @@ pub struct ProjectedRecord<'a> {
     pub commit: &'a str,
     pub digest: String,
     pub layout: String,
+    pub kind: RecordKind,
     pub allow_symlinks: bool,
     pub preserve_executable: bool,
     pub files: Vec<ManifestFile>,
@@ -72,6 +81,7 @@ impl RegistryRecord {
             digest: p.digest,
             projected_at: chrono::Utc::now().to_rfc3339(),
             layout: p.layout,
+            kind: p.kind,
             allow_symlinks: p.allow_symlinks,
             preserve_executable: p.preserve_executable,
             files: p.files,
@@ -540,6 +550,7 @@ mod tests {
             digest: "link:".to_owned(),
             projected_at: "2026-06-08T12:00:00Z".to_owned(),
             layout: "flat".to_owned(),
+            kind: RecordKind::Dir,
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![],
@@ -611,6 +622,7 @@ artifact = "snippets"
             digest: "blake3:d4e5f6".to_owned(),
             projected_at: "2026-01-31T12:34:56Z".to_owned(),
             layout: "by-source".to_owned(),
+            kind: RecordKind::Dir,
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![],
@@ -679,6 +691,7 @@ artifact = "snippets"
             digest: "blake3:d4e5f6".to_owned(),
             projected_at: "2026-01-31T12:34:56Z".to_owned(),
             layout: "flat".to_owned(),
+            kind: RecordKind::Dir,
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![],
@@ -779,6 +792,7 @@ artifact = "snippets"
             digest: "blake3:d4e5f6".to_owned(),
             projected_at: "2026-01-31T12:34:56Z".to_owned(),
             layout: "flat".to_owned(),
+            kind: RecordKind::Dir,
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![ManifestFile {

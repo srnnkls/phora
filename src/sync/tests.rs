@@ -703,7 +703,7 @@ use std::path::PathBuf;
 use crate::deploy::JournalEntry;
 
 use crate::deploy::ArtifactState;
-use crate::store::{ArtifactKey, ManifestFile, RegistryRecord};
+use crate::store::{ArtifactKey, ManifestFile, RecordKind, RegistryRecord};
 
 /// A target deployed beside this dir: `<root>/target` plus the `.phora-stage`
 /// sibling sync owns. The tempdir is the target's parent so staging has somewhere
@@ -877,6 +877,105 @@ impl SourceBackend for FailingExportBackend<'_> {
         self.inner
             .list_artifact_files(source, url, commit, root, artifact, selection)
     }
+}
+
+/// Rewrites every export to `kind=File` with NO staged files, forcing the empty-file
+/// File-branch invariant in `deploy_one`.
+struct EmptyFileExportBackend<'a> {
+    inner: &'a GitBackend,
+}
+
+impl SourceBackend for EmptyFileExportBackend<'_> {
+    fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> SourceResult<()> {
+        self.inner.fetch(source, url)
+    }
+    fn resolve(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        refspec: &Refspec,
+    ) -> SourceResult<String> {
+        self.inner.resolve(source, url, refspec)
+    }
+    fn commit_time(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        commit: &str,
+    ) -> SourceResult<u64> {
+        self.inner.commit_time(source, url, commit)
+    }
+    fn discover_artifacts(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        commit: &str,
+        root: Option<&Path>,
+        selection: &crate::kernel::Selection,
+    ) -> SourceResult<Vec<crate::kernel::ArtifactName>> {
+        self.inner
+            .discover_artifacts(source, url, commit, root, selection)
+    }
+    fn export_artifact(&self, req: &ExportRequest<'_>) -> SourceResult<ExportResult> {
+        let real = self.inner.export_artifact(req)?;
+        Ok(ExportResult {
+            files: vec![],
+            digest: real.digest,
+            vars_digest: real.vars_digest,
+            kind: RecordKind::File,
+        })
+    }
+    fn compute_digest(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        commit: &str,
+        root: Option<&Path>,
+        selection: &crate::kernel::Selection,
+    ) -> SourceResult<String> {
+        self.inner
+            .compute_digest(source, url, commit, root, selection)
+    }
+    fn list_artifact_files(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        commit: &str,
+        root: Option<&Path>,
+        artifact: &crate::kernel::ArtifactName,
+        selection: &crate::kernel::Selection,
+    ) -> SourceResult<Vec<std::path::PathBuf>> {
+        self.inner
+            .list_artifact_files(source, url, commit, root, artifact, selection)
+    }
+}
+
+/// A `kind=file` export with no staged file must error cleanly, never silently fall
+/// through to deploying the staging directory as a directory at the artifact dst.
+#[test]
+fn empty_file_export_errors_instead_of_deploying_a_directory() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let cfg =
+        config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+    let backend = EmptyFileExportBackend { inner: &fx.backend };
+
+    let out = sync(
+        &input(&cfg, None, None, None, false),
+        &backend,
+        &fx.registry,
+    )
+    .expect("the run must complete, surfacing the failure as a flag");
+
+    assert!(
+        out.had_failures,
+        "an empty kind=file export must be reported as a deploy failure, not a success"
+    );
+    let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+    assert!(
+        !dst.is_dir(),
+        "an empty kind=file export must NOT silently deploy the staging directory at the dst"
+    );
 }
 
 // ── deploy a Missing artifact ──────────────────────────────────
@@ -1408,6 +1507,78 @@ fn same_identity_bindings_sharing_a_destination_still_collide() {
     drop(src);
 }
 
+/// Link-mode `RecordKind` must come from the SAME discovery signal the artifact came
+/// from (dir vs file), not a live re-stat — at both seed (deploy) and rebuild time.
+/// A dir artifact records `kind=dir`; a selected loose-file artifact records `kind=file`,
+/// and rebuild reconstructs the identical kinds without re-probing a possibly-divergent path.
+#[test]
+fn link_record_kind_is_discovery_derived_for_dir_and_file() {
+    let wt = build_worktree(None);
+    let td = TargetDir::new();
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let cfg = {
+        let toml = format!(
+            "version = 1\n\n\
+             [sources.linked]\ngit = \"{}\"\nbranch = \"main\"\ndeploy = \"link\"\n\n\
+             [targets.dest]\npath = \"{}\"\n\
+             sources = {{ linked = {{ include = [\"alpha\", \"loose.txt\"] }} }}\nlayout = \"by-source\"\n",
+            wt.path().display(),
+            td.target_path().display(),
+        );
+        Config::parse(&toml).expect("link include config parses")
+    };
+
+    let out = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+        .expect("link sync over a dir and a loose file must succeed");
+
+    let dir_key = artifact_key("dest", "linked", "alpha");
+    let file_key = artifact_key("dest", "linked", "loose.txt");
+
+    let seeded_dir = registry
+        .get(&dir_key)
+        .expect("registry get")
+        .expect("dir artifact must be recorded");
+    let seeded_file = registry
+        .get(&file_key)
+        .expect("registry get")
+        .expect("loose-file artifact must be recorded");
+    assert_eq!(
+        seeded_dir.kind,
+        RecordKind::Dir,
+        "a linked DIRECTORY artifact's seeded record must carry kind=dir"
+    );
+    assert_eq!(
+        seeded_file.kind,
+        RecordKind::File,
+        "a linked loose-FILE artifact's seeded record must carry kind=file"
+    );
+
+    registry.remove(&dir_key).expect("drop dir record");
+    registry.remove(&file_key).expect("drop file record");
+
+    rebuild_registry(&cfg, &out.base_lock, &backend, &registry)
+        .expect("rebuild reconstructs the linked records");
+
+    let rebuilt_dir = registry
+        .get(&dir_key)
+        .expect("registry get")
+        .expect("rebuild must reconstruct the dir record");
+    let rebuilt_file = registry
+        .get(&file_key)
+        .expect("registry get")
+        .expect("rebuild must reconstruct the file record");
+    assert_eq!(
+        rebuilt_dir.kind,
+        RecordKind::Dir,
+        "rebuild must reconstruct the linked DIRECTORY artifact as kind=dir"
+    );
+    assert_eq!(
+        rebuilt_file.kind,
+        RecordKind::File,
+        "rebuild must reconstruct the linked loose-FILE artifact as kind=file"
+    );
+}
+
 /// A link-mode binding's symlink must point through the binding's effective root:
 /// the source declares none, the binding sets `root = languages`, so the link must
 /// resolve to `<git>/languages/<artifact>`, not the un-rooted `<git>/<artifact>`.
@@ -1649,9 +1820,9 @@ fn sync_with_force_overwrites_modified_registry_artifact() {
 /// H1: without `Linked` in the `matches!` guard at the deploy closure, Linked falls to
 /// `None => Overwrite` and re-deploys every sync; this pins the no-op.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn second_deploy_over_correct_link_is_a_noop() {
     use std::os::unix::fs::symlink;
-
     let fx = build_sync_fixture();
     let td = TargetDir::new();
     let cfg =
@@ -1661,9 +1832,7 @@ fn second_deploy_over_correct_link_is_a_noop() {
 
     let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
     std::fs::create_dir_all(dst.parent().expect("dst parent")).expect("mkdir dst parent");
-    let live = fx.src.path().join("editor");
-    symlink(&live, &dst).expect("deploy artifact as a symlink to the working tree");
-
+    symlink(fx.src.path().join("editor"), &dst).expect("deploy artifact as a symlink");
     let linked_record = RegistryRecord {
         version: 1,
         key: artifact_key("dest", "editor-src", "editor"),
@@ -1672,6 +1841,7 @@ fn second_deploy_over_correct_link_is_a_noop() {
         digest: "link:".to_owned(),
         projected_at: "2026-06-08T12:00:00Z".to_owned(),
         layout: "flat".to_owned(),
+        kind: RecordKind::Dir,
         allow_symlinks: false,
         preserve_executable: true,
         files: vec![],
@@ -1719,6 +1889,7 @@ fn second_deploy_over_correct_link_is_a_noop() {
         mode_transition: false,
         template_opt_in: &crate::config::TemplateOptIn::SuffixOnly,
         mapped_source_key: None,
+        link_kind: RecordKind::Dir,
     };
     let state = check_artifact_state(
         &dst,
@@ -1873,6 +2044,7 @@ fn seed_orphan(
         digest: "blake3:orphan".to_owned(),
         projected_at: "2026-01-01T00:00:00Z".to_owned(),
         layout: "flat".to_owned(),
+        kind: RecordKind::Dir,
         allow_symlinks: false,
         preserve_executable: true,
         files: vec![ManifestFile {
@@ -2534,6 +2706,7 @@ fn sync_runs_recovery_sweep_finishing_a_swapped_but_unrecorded_artifact() {
         digest: "blake3:recovered".to_owned(),
         projected_at: "2026-01-01T00:00:00Z".to_owned(),
         layout: "flat".to_owned(),
+        kind: RecordKind::Dir,
         allow_symlinks: false,
         preserve_executable: true,
         files: vec![ManifestFile {
@@ -2690,6 +2863,7 @@ fn sync_runs_recovery_before_phase1_even_when_resolve_fails() {
         digest: "blake3:recovered".to_owned(),
         projected_at: "2026-01-01T00:00:00Z".to_owned(),
         layout: "flat".to_owned(),
+        kind: RecordKind::Dir,
         allow_symlinks: false,
         preserve_executable: true,
         files: vec![ManifestFile {
@@ -2775,6 +2949,7 @@ fn seed_managed_artifact(
         digest: "blake3:seed".to_owned(),
         projected_at: "2026-01-01T00:00:00Z".to_owned(),
         layout: "flat".to_owned(),
+        kind: RecordKind::Dir,
         allow_symlinks: false,
         preserve_executable: true,
         files: vec![ManifestFile {
@@ -2955,6 +3130,7 @@ fn seed_verifiable_artifact(
         digest: "blake3:seed".to_owned(),
         projected_at: "2026-01-01T00:00:00Z".to_owned(),
         layout: "flat".to_owned(),
+        kind: RecordKind::Dir,
         allow_symlinks: false,
         preserve_executable: true,
         files: manifest,
@@ -3396,6 +3572,10 @@ fn match_all() -> Selection {
     Selection::new(&[], &[]).expect("empty matcher")
 }
 
+fn link_names(artifacts: &[super::discover::LinkArtifact]) -> Vec<crate::kernel::ArtifactName> {
+    artifacts.iter().map(|a| a.name.clone()).collect()
+}
+
 #[test]
 fn worktree_scan_returns_sorted_real_dirs_excluding_dotdirs_and_files() {
     let wt = build_worktree(None);
@@ -3404,7 +3584,7 @@ fn worktree_scan_returns_sorted_real_dirs_excluding_dotdirs_and_files() {
         .expect("scanning an existing working tree must succeed");
 
     assert_eq!(
-        found,
+        link_names(&found),
         vec![an("alpha"), an("uncommitted"), an("zeta")],
         "the disk scan must return only real subdirectories, sorted, \
              excluding the .hidden dotdir and the loose.txt regular file; \
@@ -3420,14 +3600,14 @@ fn worktree_scan_honors_root_subdir() {
         .expect("scanning <git>/<root> must succeed");
 
     assert_eq!(
-        found,
+        link_names(&found),
         vec![an("alpha"), an("uncommitted"), an("zeta")],
         "with root set, artifacts nested under <git>/languages must be discovered"
     );
     let direct = discover_working_tree(wt.path(), None, &match_all())
         .expect("scanning the git root itself must succeed");
     assert_eq!(
-        direct,
+        link_names(&direct),
         vec![an("languages")],
         "without root, only the top-level `languages` dir is an artifact"
     );
@@ -3442,7 +3622,7 @@ fn worktree_scan_honors_matcher_exclude() {
         .expect("scan with an exclude must succeed");
 
     assert_eq!(
-        found,
+        link_names(&found),
         vec![an("alpha"), an("uncommitted")],
         "the include/exclude matcher must gate disk artifacts just as it gates ODB ones"
     );
@@ -3575,6 +3755,7 @@ fn verify_skips_linked_record_even_with_stray_manifest_file() {
         digest: "link:".to_owned(),
         projected_at: "2026-06-08T12:00:00Z".to_owned(),
         layout: "flat".to_owned(),
+        kind: RecordKind::Dir,
         allow_symlinks: false,
         preserve_executable: true,
         files: vec![ManifestFile {
@@ -3627,6 +3808,7 @@ fn verify_skips_linked_record_over_edited_symlink_target() {
         digest: "link:".to_owned(),
         projected_at: "2026-06-08T12:00:00Z".to_owned(),
         layout: "flat".to_owned(),
+        kind: RecordKind::Dir,
         allow_symlinks: false,
         preserve_executable: true,
         files: vec![],
@@ -3737,6 +3919,7 @@ fn prune_removes_stale_linked_symlink_without_following_it() {
             digest: "link:".to_owned(),
             projected_at: "2026-06-08T12:00:00Z".to_owned(),
             layout: "by-source".to_owned(),
+            kind: RecordKind::Dir,
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![],
@@ -6307,6 +6490,7 @@ fn preview_writes_nothing_to_the_registry_or_the_target() {
         digest: "blake3:seeded".to_owned(),
         projected_at: "2026-01-01T00:00:00Z".to_owned(),
         layout: "flat".to_owned(),
+        kind: RecordKind::Dir,
         allow_symlinks: false,
         preserve_executable: true,
         files: vec![ManifestFile {
@@ -7745,7 +7929,7 @@ fn plan_handles_mixed_mapped_and_normal_bindings_in_one_target() {
 /// `<target>/<dest>` — NOT `<target>/<identity>/<dest>`. Pins that mapped
 /// projection bypasses layout (the data-loss / no-leak guard).
 #[test]
-fn plan_mapped_destination_ignores_layout() {
+fn plan_mapped_destination_honors_layout() {
     let fx = build_sync_fixture();
     let td = TargetDir::new();
     let toml = format!(
@@ -7780,9 +7964,8 @@ fn plan_mapped_destination_ignores_layout() {
         .expect("entry for dest `CLAUDE.md`");
     assert_eq!(
         claude.destination,
-        td.target_path().join("CLAUDE.md"),
-        "by-source layout must NOT be applied to a mapped dest; \
-         <target>/slim/CLAUDE.md would be the bug, got {:?}",
+        td.target_path().join("slim").join("CLAUDE.md"),
+        "a mapped dest must honor by-source: <target>/slim/CLAUDE.md, got {:?}",
         claude.destination
     );
 }
@@ -9026,7 +9209,7 @@ fn sync_deploys_mapped_leaf_to_renamed_dest() {
 }
 
 #[test]
-fn sync_records_mapped_leaf_with_map_layout_keyed_by_dest() {
+fn sync_records_mapped_leaf_with_layout_kind_keyed_by_dest() {
     let fx = build_map_sync_fixture();
     let td = TargetDir::new();
     let cfg = config_one_mapped_binding(&fx.url, &td.target_path(), "flat");
@@ -9044,8 +9227,13 @@ fn sync_records_mapped_leaf_with_map_layout_keyed_by_dest() {
         "the record key's artifact must be the DEST, not the source key AGENTS.md"
     );
     assert_eq!(
-        rec.layout, "map",
-        "a mapped record must carry the `map` layout sentinel, not a layout kind"
+        rec.layout, "flat",
+        "a mapped record must carry the real layout kind (flat), not the retired `map` sentinel"
+    );
+    assert_eq!(
+        rec.kind,
+        RecordKind::File,
+        "a mapped leaf is a single-file artifact"
     );
     assert_eq!(
         rec.files.len(),
@@ -9062,7 +9250,7 @@ fn sync_records_mapped_leaf_with_map_layout_keyed_by_dest() {
 }
 
 #[test]
-fn sync_mapped_leaf_ignores_by_source_layout() {
+fn sync_mapped_leaf_honors_by_source_layout_placement() {
     let fx = build_map_sync_fixture();
     let td = TargetDir::new();
     let cfg = config_one_mapped_binding(&fx.url, &td.target_path(), "by-source");
@@ -9070,18 +9258,17 @@ fn sync_mapped_leaf_ignores_by_source_layout() {
 
     sync(&in_, &fx.backend, &fx.registry).expect("sync deploys the mapped leaf under by-source");
 
-    let dst = td.target_path().join("CLAUDE.md");
+    let dst = td.target_path().join("agents-src").join("CLAUDE.md");
     assert!(
         dst.is_file(),
-        "a mapped dest must land at <target>/CLAUDE.md even under by-source, missing at {}",
+        "a mapped dest must honor by-source and land at <target>/agents-src/CLAUDE.md, missing at {}",
         dst.display()
     );
-    let leaked = td.target_path().join("agents-src").join("CLAUDE.md");
+    let root = td.target_path().join("CLAUDE.md");
     assert!(
-        !leaked.exists(),
-        "by-source layout must NOT leak onto a mapped dest; \
-         <target>/agents-src/CLAUDE.md is the bug, found at {}",
-        leaked.display()
+        !root.exists(),
+        "the retired root-bypass must NOT land a mapped dest at <target>/CLAUDE.md under by-source, found at {}",
+        root.display()
     );
 
     let rec = fx
@@ -9090,8 +9277,13 @@ fn sync_mapped_leaf_ignores_by_source_layout() {
         .expect("registry get must not error")
         .expect("deploy must persist a mapped record under by-source too");
     assert_eq!(
-        rec.layout, "map",
-        "the record must carry the `map` sentinel under by-source, not `bysource`"
+        rec.layout, "bysource",
+        "the record must carry the real layout kind (bysource), not the retired `map` sentinel"
+    );
+    assert_eq!(
+        rec.kind,
+        RecordKind::File,
+        "a mapped leaf is a single-file artifact"
     );
 }
 
@@ -9234,8 +9426,13 @@ fn sync_fans_out_one_leaf_to_two_mapped_dests() {
         .expect("registry get must not error")
         .expect("a record must exist for the claude binding's CLAUDE.md dest");
     assert_eq!(
-        claude_rec.layout, "map",
-        "the claude binding's record must carry the `map` layout sentinel"
+        claude_rec.layout, "flat",
+        "the claude binding's record must carry the real layout kind (flat)"
+    );
+    assert_eq!(
+        claude_rec.kind,
+        RecordKind::File,
+        "a mapped leaf is a single-file artifact"
     );
     assert_eq!(
         claude_rec.files[0].path,
@@ -9250,8 +9447,8 @@ fn sync_fans_out_one_leaf_to_two_mapped_dests() {
         .expect("registry get must not error")
         .expect("a distinct record must exist for the codex binding's codex.md dest");
     assert_eq!(
-        codex_rec.layout, "map",
-        "the codex binding's record must carry the `map` layout sentinel"
+        codex_rec.layout, "flat",
+        "the codex binding's record must carry the real layout kind (flat)"
     );
     assert_eq!(
         codex_rec.files[0].path,
@@ -9302,7 +9499,7 @@ fn rebuild_reconstructs_mapped_copy_record() {
     );
 
     let report = rebuild_registry(&cfg, &lock, &fx.backend, &fx.registry)
-        .expect("rebuild must reconstruct a mapped record without choking on layout==map");
+        .expect("rebuild must reconstruct a mapped record carrying the real layout kind");
 
     let rebuilt = fx
         .registry
@@ -9310,9 +9507,13 @@ fn rebuild_reconstructs_mapped_copy_record() {
         .expect("registry get must not error")
         .expect("rebuild must reconstruct the dropped mapped record from binding.map");
     assert_eq!(
-        rebuilt.layout,
-        crate::store::MAP_LAYOUT,
-        "a reconstructed mapped record must carry the `map` sentinel"
+        rebuilt.layout, "flat",
+        "a reconstructed mapped record must carry the real layout kind (flat), not the retired `map` sentinel"
+    );
+    assert_eq!(
+        rebuilt.kind,
+        RecordKind::File,
+        "a reconstructed mapped record is a single-file artifact"
     );
     assert_eq!(
         rebuilt.key.artifact, "CLAUDE.md",
@@ -9354,7 +9555,7 @@ fn rebuild_reconstructs_mapped_copy_record() {
 }
 
 #[test]
-fn rebuild_mapped_record_path_ignores_by_source_layout() {
+fn rebuild_mapped_record_path_honors_by_source_layout() {
     let (fx, td, cfg, lock) = mapped_rebuild_setup("by-source");
     let key = artifact_key("dest", "agents-src", "CLAUDE.md");
     fx.registry.remove(&key).expect("drop the mapped record");
@@ -9371,14 +9572,14 @@ fn rebuild_mapped_record_path_ignores_by_source_layout() {
     let on_disk = super::target::record_artifact_path(&cfg.targets["dest"], &rebuilt);
     assert_eq!(
         on_disk,
-        td.target_path().join("CLAUDE.md"),
-        "a reconstructed mapped record's path must be <target>/CLAUDE.md (root base), \
-         not the by-source layout-derived path"
+        td.target_path().join("agents-src").join("CLAUDE.md"),
+        "a reconstructed mapped record's path must honor the by-source layout \
+         (<target>/<identity>/CLAUDE.md), not the retired target-root base"
     );
-    let leaked = td.target_path().join("agents-src").join("CLAUDE.md");
+    let root = td.target_path().join("CLAUDE.md");
     assert_ne!(
-        on_disk, leaked,
-        "by-source layout must not be applied to a reconstructed mapped record"
+        on_disk, root,
+        "the retired root-bypass must not be applied to a reconstructed mapped record"
     );
 }
 
@@ -9437,9 +9638,13 @@ fn rebuild_reconstructs_mapped_link_record() {
         "a reconstructed mapped-link record must be linked"
     );
     assert_eq!(
-        rebuilt.layout,
-        crate::store::MAP_LAYOUT,
-        "a mapped-link record must still carry the `map` sentinel"
+        rebuilt.layout, "flat",
+        "a mapped-link record must carry the real layout kind (flat), not the retired `map` sentinel"
+    );
+    assert_eq!(
+        rebuilt.kind,
+        RecordKind::File,
+        "a mapped-link record is a single-file artifact"
     );
     assert_eq!(
         rebuilt.key.artifact, "CLAUDE.md",
@@ -9486,7 +9691,7 @@ fn preview_shows_mapped_leaf_at_explicit_destination() {
     assert_eq!(
         entry.destination,
         td.target_path().join("CLAUDE.md"),
-        "the mapped dest must preview at <target>/CLAUDE.md (path.join(dest), no layout helper)"
+        "under flat the mapped dest previews at <target>/CLAUDE.md"
     );
 }
 
@@ -9519,7 +9724,7 @@ fn preview_marks_locked_but_unfetched_mapped_binding_needs_sync() {
 }
 
 #[test]
-fn preview_mapped_destination_ignores_by_source_layout() {
+fn preview_mapped_destination_honors_by_source_layout() {
     let fx = build_map_sync_fixture();
     let td = TargetDir::new();
     let cfg = config_one_mapped_binding(&fx.url, &td.target_path(), "by-source");
@@ -9538,13 +9743,13 @@ fn preview_mapped_destination_ignores_by_source_layout() {
     let entry = preview_entry(plan, "CLAUDE.md");
     assert_eq!(
         entry.destination,
-        td.target_path().join("CLAUDE.md"),
-        "a mapped dest must preview at <target>/CLAUDE.md even under by-source layout"
+        td.target_path().join("agents-src").join("CLAUDE.md"),
+        "a mapped dest must preview at its by-source layout path <target>/agents-src/CLAUDE.md"
     );
-    let leaked = td.target_path().join("agents-src").join("CLAUDE.md");
+    let root = td.target_path().join("CLAUDE.md");
     assert_ne!(
-        entry.destination, leaked,
-        "by-source layout must NOT leak onto a mapped dest in preview"
+        entry.destination, root,
+        "the retired root-bypass must not place the mapped dest at the target root in preview"
     );
 }
 
@@ -9689,7 +9894,7 @@ fn sync_deploys_mapped_leaf_as_symlink_to_source_working_tree() {
 }
 
 #[test]
-fn sync_deploys_mapped_leaf_as_symlink_ignores_by_source_layout() {
+fn sync_deploys_mapped_leaf_as_symlink_honors_by_source_layout() {
     let fx = build_map_sync_fixture();
     let td = TargetDir::new();
     let (base, local) = mapped_link_base_and_overlay(&fx.url, &td.target_path(), "by-source");
@@ -9701,19 +9906,23 @@ fn sync_deploys_mapped_leaf_as_symlink_ignores_by_source_layout() {
         "a clean mapped-link deploy must report no failures"
     );
 
-    let dst = td.target_path().join("CLAUDE.md");
+    let dst = td.target_path().join("agents-src").join("CLAUDE.md");
     let resolved = std::fs::read_link(&dst)
-        .expect("a mapped link must deploy CLAUDE.md at the target root under by-source layout");
+        .expect("a mapped link must deploy CLAUDE.md at its by-source layout path");
     assert_eq!(
         resolved,
         Path::new(&fx.url).join("AGENTS.md"),
-        "by-source layout must not leak onto a mapped link: dest stays at the target root \
-         and the symlink targets the source leaf"
+        "the mapped link honors by-source (<target>/agents-src/CLAUDE.md) and the symlink \
+         still targets the source leaf"
+    );
+    assert!(
+        !td.target_path().join("CLAUDE.md").exists(),
+        "the retired root-bypass must not place the mapped link at the target root"
     );
 }
 
 #[test]
-fn sync_records_mapped_link_with_map_layout_linked_and_empty_files() {
+fn sync_records_mapped_link_with_layout_kind_linked_and_empty_files() {
     let fx = build_map_sync_fixture();
     let td = TargetDir::new();
     let (base, local) = mapped_link_base_and_overlay(&fx.url, &td.target_path(), "flat");
@@ -9731,8 +9940,13 @@ fn sync_records_mapped_link_with_map_layout_linked_and_empty_files() {
         "the record key's artifact must be the DEST, not the source key AGENTS.md"
     );
     assert_eq!(
-        rec.layout, "map",
-        "a mapped link record must carry the `map` layout sentinel, not a layout kind"
+        rec.layout, "flat",
+        "a mapped link record must carry the real layout kind (flat), not the retired `map` sentinel"
+    );
+    assert_eq!(
+        rec.kind,
+        RecordKind::File,
+        "a mapped link is a single-file artifact"
     );
     assert!(
         rec.linked,
@@ -9893,37 +10107,25 @@ fn sync_errors_on_cross_binding_mapped_dest_collision() {
 }
 
 #[test]
-fn sync_errors_on_mapped_dest_collision_under_by_source() {
+fn sync_does_not_collide_same_dest_basename_across_distinct_identities_under_by_source() {
     let fx = build_map_sync_fixture();
     let td = TargetDir::new();
-    // by-source layout: mapped dests bypass layout and collide at the target ROOT,
-    // so the check must NOT be Flat-gated.
     let cfg = config_two_mapped_bindings_same_dest(&fx.url, &td.target_path(), "by-source");
     let in_ = input(&cfg, None, None, None, false);
 
-    let Err(err) = sync(&in_, &fx.backend, &fx.registry) else {
-        panic!(
-            "two mapped bindings to the SAME dest must STILL collide under by-source \
-             (mapped dests bypass layout, colliding at root); the check is layout-independent"
-        );
-    };
-
-    let Error::Collision {
-        artifact,
-        sources,
-        target,
-    } = err
-    else {
-        panic!("a mapped-dest clash under by-source must be Error::Collision, got {err:?}");
-    };
-    assert_eq!(
-        artifact, "SHARED.md",
-        "the collision must name the shared DEST even under by-source"
+    let out = sync(&in_, &fx.backend, &fx.registry).expect(
+        "two distinct identities mapping the same dest BASENAME resolve to DISTINCT by-source \
+         layout paths (<target>/claude/SHARED.md vs <target>/claude2/SHARED.md); the collision \
+         guard keys on the FINAL layout path, so this must NOT collide",
     );
-    assert_eq!(target, "dest", "the collision must name the target");
     assert!(
-        sources.contains(&"claude".to_string()) && sources.contains(&"claude2".to_string()),
-        "the collision must name BOTH offending binding identities, got {sources:?}"
+        !out.had_failures,
+        "the non-colliding two-identity by-source deploy must succeed"
+    );
+    assert!(
+        td.target_path().join("claude").join("SHARED.md").is_file()
+            && td.target_path().join("claude2").join("SHARED.md").is_file(),
+        "both identities must deploy at their distinct by-source layout paths"
     );
 }
 
@@ -9979,10 +10181,9 @@ fn sync_errors_on_mapped_vs_dir_artifact_collision() {
 }
 
 #[test]
-fn preview_reports_cross_binding_mapped_dest_collision() {
+fn preview_reports_no_collision_for_distinct_identities_same_dest_under_by_source() {
     let fx = build_map_sync_fixture();
     let td = TargetDir::new();
-    // by-source proves layout-independence: detect_dest_collisions detects across all layouts.
     let cfg = config_two_mapped_bindings_same_dest(&fx.url, &td.target_path(), "by-source");
     fx.backend
         .fetch(&sn("agents-src"), &fx.url)
@@ -9994,31 +10195,28 @@ fn preview_reports_cross_binding_mapped_dest_collision() {
 
     let plans = match preview_targets(&cfg, &parsed, &remotes, &fx.backend, Some(&lock), false) {
         Ok(plans) => plans,
-        Err(Error::Collision { .. }) => {
-            panic!(
-                "a predicted mapped-dest collision must be a preview warning, NOT Error::Collision"
-            )
+        Err(e) => {
+            panic!("preview must not error on non-colliding by-source mapped dests, got {e:?}")
         }
-        Err(e) => panic!("preview must not error on a predicted mapped collision, got {e:?}"),
     };
 
     let plan = only_plan(&plans, "dest");
-    let collision = plan
-        .collisions
-        .iter()
-        .find(|c| c.artifact == "SHARED.md")
-        .unwrap_or_else(|| {
-            panic!(
-                "preview must annotate the cross-binding collision on the shared dest SHARED.md \
-                 even under by-source, got collisions {:?}",
-                plan.collisions
-            )
-        });
     assert!(
-        collision.sources.contains(&"claude".to_owned())
-            && collision.sources.contains(&"claude2".to_owned()),
-        "the collision warning must name BOTH offending identities, got {:?}",
-        collision.sources
+        plan.collisions.is_empty(),
+        "two distinct identities mapping the same dest BASENAME resolve to DISTINCT by-source \
+         layout paths, so preview must report NO collision, got {:?}",
+        plan.collisions
+    );
+    let dests: Vec<&PathBuf> = plan
+        .entries
+        .iter()
+        .filter(|e| e.artifact == "SHARED.md")
+        .map(|e| &e.destination)
+        .collect();
+    assert!(
+        dests.contains(&&td.target_path().join("claude").join("SHARED.md"))
+            && dests.contains(&&td.target_path().join("claude2").join("SHARED.md")),
+        "both identities preview at their distinct by-source layout paths, got {dests:?}"
     );
 }
 
@@ -10143,17 +10341,17 @@ fn prune_removes_orphaned_mapped_dest_on_full_removal() {
 }
 
 #[test]
-fn prune_mapped_dest_ignores_by_source_layout() {
+fn prune_mapped_dest_honors_by_source_layout() {
     let fx = build_map_sync_fixture();
     let td = TargetDir::new();
     let cfg = config_mapped_to(&fx.url, &td.target_path(), "CLAUDE.md", "by-source");
     let in_ = input(&cfg, None, None, None, false);
     sync(&in_, &fx.backend, &fx.registry).expect("deploy the mapped dest under by-source");
 
-    let dst = td.target_path().join("CLAUDE.md");
+    let dst = td.target_path().join("agents-src").join("CLAUDE.md");
     assert!(
         dst.is_file(),
-        "premise: the mapped dest lands at the ROOT even under by-source, at {}",
+        "premise: the mapped dest honors by-source and lands at <target>/agents-src/CLAUDE.md, at {}",
         dst.display()
     );
 
@@ -10162,8 +10360,7 @@ fn prune_mapped_dest_ignores_by_source_layout() {
 
     assert!(
         !dst.exists(),
-        "by-source layout must NOT leak onto a mapped record's prune path; the dest at the \
-         ROOT {} must be pruned, not a by-source-derived path",
+        "prune must re-derive the mapped dest from its by-source layout path and remove {}",
         dst.display()
     );
 }
@@ -10211,14 +10408,14 @@ fn verify_hashes_mapped_dest_at_target_root() {
 }
 
 #[test]
-fn verify_mapped_dest_ignores_by_source_layout() {
+fn verify_mapped_dest_honors_by_source_layout() {
     let fx = build_map_sync_fixture();
     let td = TargetDir::new();
     let cfg = config_mapped_to(&fx.url, &td.target_path(), "CLAUDE.md", "by-source");
     let in_ = input(&cfg, None, None, None, false);
     sync(&in_, &fx.backend, &fx.registry).expect("deploy the mapped dest under by-source");
 
-    let dst = td.target_path().join("CLAUDE.md");
+    let dst = td.target_path().join("agents-src").join("CLAUDE.md");
     std::fs::write(&dst, b"edited under by-source\n").expect("mutate the mapped dest");
 
     let drifted = verify(&cfg, &fx.registry).expect("verify must not error");
@@ -10227,8 +10424,8 @@ fn verify_mapped_dest_ignores_by_source_layout() {
         .find(|m| m.key == artifact_key("dest", "agents-src", "CLAUDE.md"))
         .unwrap_or_else(|| {
             panic!(
-                "by-source layout must NOT leak onto a mapped record's verify path; verify must \
-                 hash <target>/CLAUDE.md at the ROOT and see the drift, got {drifted:?}"
+                "verify must hash the mapped dest at its by-source layout path \
+                 <target>/agents-src/CLAUDE.md and see the drift, got {drifted:?}"
             )
         });
     assert!(
@@ -10462,6 +10659,7 @@ impl SourceBackend for UrlFetchRecordingBackend {
             files: Vec::new(),
             digest: "canned".to_owned(),
             vars_digest: None,
+            kind: crate::store::RecordKind::Dir,
         })
     }
     fn compute_digest(
@@ -10611,4 +10809,620 @@ fn serial_and_parallel_runs_produce_identical_lock_and_registry() {
     );
 
     drop((src_a, src_b, src_c));
+}
+
+fn record_toml_on_disk(fx: &SyncFixture, target: &str, source: &str, artifact: &str) -> String {
+    let path = fx
+        .registry
+        .state_root()
+        .join("targets")
+        .join(target)
+        .join("artifacts")
+        .join(source)
+        .join(format!("{artifact}.toml"));
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read record toml {}: {e}", path.display()))
+}
+
+/// A repo with a loose root file `init.lua`, a dot-dir `.zfunc/`, and a dir `editor/`,
+/// so one fixture can drive the discovered-file, dot-dir, and dir-artifact cases.
+#[expect(
+    clippy::unwrap_used,
+    reason = "fixture setup fails loudly; git CLI is assumed present"
+)]
+fn build_file_artifact_fixture() -> SyncFixture {
+    let src = TempDir::new().unwrap();
+    let src_path = src.path();
+
+    run_git(src_path, &["init", "-b", "main", "."]);
+    run_git(src_path, &["config", "user.email", "test@example.com"]);
+    run_git(src_path, &["config", "user.name", "Test"]);
+
+    std::fs::write(src_path.join("init.lua"), b"-- loose init\n").unwrap();
+    std::fs::create_dir_all(src_path.join(".zfunc")).unwrap();
+    std::fs::write(src_path.join(".zfunc/_widget"), b"compdef _widget\n").unwrap();
+    std::fs::create_dir_all(src_path.join("editor")).unwrap();
+    std::fs::write(src_path.join("editor/conf.lua"), b"-- editor\n").unwrap();
+    run_git(src_path, &["add", "-A"]);
+    run_git(src_path, &["commit", "-m", "initial"]);
+
+    let head_sha = rev_parse(src_path, "HEAD");
+
+    let git_dir = TempDir::new().unwrap();
+    let state_dir = TempDir::new().unwrap();
+    let backend = GitBackend::new(git_dir.path().to_path_buf());
+    let registry =
+        FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry over tempdir");
+    let url = src_path.to_string_lossy().into_owned();
+
+    SyncFixture {
+        src,
+        _git_dir: git_dir,
+        _state_dir: state_dir,
+        backend,
+        registry,
+        url,
+        head_sha,
+    }
+}
+
+fn config_one_source_select(url: &str, target_path: &Path, include: &str, layout: &str) -> Config {
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.src]\ngit = \"{url}\"\nbranch = \"main\"\ninclude = [{include}]\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\"src\"]\nlayout = \"{layout}\"\n",
+        target_path.display(),
+    );
+    Config::parse(&toml).expect("one-source select config parses")
+}
+
+#[test]
+fn sync_mapped_leaf_honors_by_source_layout() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_mapped_binding(&fx.url, &td.target_path(), "by-source");
+
+    let out = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("sync deploys the mapped leaf under by-source");
+    assert!(
+        !out.had_failures,
+        "mapped deploy under by-source must succeed"
+    );
+
+    let layout_dst = td.target_path().join("agents-src").join("CLAUDE.md");
+    assert!(
+        layout_dst.is_file(),
+        "a mapped dest under by-source must deploy at <target>/<identity>/CLAUDE.md \
+         (layout-honoring), missing at {}",
+        layout_dst.display()
+    );
+    let root_dst = td.target_path().join("CLAUDE.md");
+    assert!(
+        !root_dst.exists(),
+        "the mapped dest must NOT land at the target root <target>/CLAUDE.md under by-source; \
+         the root-bypass is retired, found at {}",
+        root_dst.display()
+    );
+}
+
+#[test]
+fn sync_mapped_leaf_honors_prefixed_layout() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_mapped_binding(&fx.url, &td.target_path(), "prefixed");
+
+    let out = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("sync deploys the mapped leaf under prefixed");
+    assert!(
+        !out.had_failures,
+        "mapped deploy under prefixed must succeed"
+    );
+
+    let layout_dst = td.target_path().join("agents-src-CLAUDE.md");
+    assert!(
+        layout_dst.is_file(),
+        "a mapped dest under prefixed must deploy at <target>/<identity>-CLAUDE.md, missing at {}",
+        layout_dst.display()
+    );
+    let root_dst = td.target_path().join("CLAUDE.md");
+    assert!(
+        !root_dst.exists(),
+        "the mapped dest must NOT land at the target root under prefixed, found at {}",
+        root_dst.display()
+    );
+}
+
+#[test]
+fn sync_discovered_loose_file_honors_by_source_layout() {
+    let fx = build_file_artifact_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_source_select(&fx.url, &td.target_path(), "\"init.lua\"", "by-source");
+
+    let out = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("sync deploys the discovered loose file");
+    assert!(!out.had_failures, "loose-file deploy must succeed");
+
+    let layout_dst = td.target_path().join("src").join("init.lua");
+    assert!(
+        layout_dst.is_file(),
+        "a discovered loose file must deploy at <target>/<identity>/init.lua under by-source, \
+         missing at {}",
+        layout_dst.display()
+    );
+    let root_dst = td.target_path().join("init.lua");
+    assert!(
+        !root_dst.exists(),
+        "a discovered loose file must NOT land at the target root, found at {}",
+        root_dst.display()
+    );
+}
+
+#[test]
+fn sync_discovered_loose_file_records_kind_file() {
+    let fx = build_file_artifact_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_source_select(&fx.url, &td.target_path(), "\"init.lua\"", "by-source");
+
+    sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("sync deploys the discovered loose file");
+
+    let rec = fx
+        .registry
+        .get(&artifact_key("dest", "src", "init.lua"))
+        .expect("registry get must not error")
+        .expect("a record must exist for the discovered loose file init.lua");
+    assert_eq!(
+        rec.layout, "bysource",
+        "a file artifact under by-source must record layout=bysource"
+    );
+    assert_eq!(
+        rec.files.len(),
+        1,
+        "a single-file artifact has one manifest entry, got {:?}",
+        rec.files
+    );
+
+    let toml = record_toml_on_disk(&fx, "dest", "src", "init.lua");
+    assert!(
+        toml.contains("kind = \"file\""),
+        "a single-file artifact's record must carry kind = \"file\", got:\n{toml}"
+    );
+}
+
+#[test]
+fn sync_dir_artifact_records_kind_dir_and_honors_layout() {
+    let fx = build_file_artifact_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_source_select(&fx.url, &td.target_path(), "\"editor\"", "by-source");
+
+    let out = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("sync deploys the editor dir artifact");
+    assert!(!out.had_failures, "dir-artifact deploy must succeed");
+
+    let dir_dst = td.target_path().join("src").join("editor").join("conf.lua");
+    assert!(
+        dir_dst.is_file(),
+        "a dir artifact under by-source must deploy at <target>/<identity>/editor/conf.lua, \
+         missing at {}",
+        dir_dst.display()
+    );
+
+    let rec = fx
+        .registry
+        .get(&artifact_key("dest", "src", "editor"))
+        .expect("registry get must not error")
+        .expect("a record must exist for the editor dir artifact");
+    assert_eq!(
+        rec.layout, "bysource",
+        "dir artifact records its layout kind"
+    );
+
+    let toml = record_toml_on_disk(&fx, "dest", "src", "editor");
+    assert!(
+        toml.contains("kind = \"dir\""),
+        "a directory artifact's record must carry kind = \"dir\", got:\n{toml}"
+    );
+}
+
+#[test]
+fn sync_dir_artifact_honors_prefixed_layout() {
+    let fx = build_file_artifact_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_source_select(&fx.url, &td.target_path(), "\"editor\"", "prefixed");
+
+    let out = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("sync deploys the editor dir artifact under prefixed");
+    assert!(
+        !out.had_failures,
+        "dir-artifact prefixed deploy must succeed"
+    );
+
+    let dir_dst = td.target_path().join("src-editor").join("conf.lua");
+    assert!(
+        dir_dst.is_file(),
+        "a dir artifact under prefixed must deploy at <target>/<source>-<artifact>/conf.lua, \
+         missing at {}",
+        dir_dst.display()
+    );
+    let bysource_dst = td.target_path().join("src").join("editor").join("conf.lua");
+    assert!(
+        !bysource_dst.exists(),
+        "a dir artifact under prefixed must NOT land at the by-source path, found at {}",
+        bysource_dst.display()
+    );
+
+    let rec = fx
+        .registry
+        .get(&artifact_key("dest", "src", "editor"))
+        .expect("registry get must not error")
+        .expect("a record must exist for the editor dir artifact under prefixed");
+    assert_eq!(
+        rec.layout, "prefixed",
+        "a dir artifact under prefixed must record layout=prefixed"
+    );
+
+    let toml = record_toml_on_disk(&fx, "dest", "src", "editor");
+    assert!(
+        toml.contains("kind = \"dir\""),
+        "a directory artifact's record under prefixed must carry kind = \"dir\", got:\n{toml}"
+    );
+}
+
+#[test]
+fn sync_mapped_record_layout_is_the_layout_kind_not_map_sentinel() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_mapped_binding(&fx.url, &td.target_path(), "by-source");
+
+    sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("sync deploys the mapped leaf");
+
+    let rec = fx
+        .registry
+        .get(&artifact_key("dest", "agents-src", "CLAUDE.md"))
+        .expect("registry get must not error")
+        .expect("a record must exist for the mapped dest");
+    assert_eq!(
+        rec.layout, "bysource",
+        "a mapped record's layout must be the actual layout kind (bysource), \
+         not the retired `map` sentinel, got {:?}",
+        rec.layout
+    );
+
+    let toml = record_toml_on_disk(&fx, "dest", "agents-src", "CLAUDE.md");
+    assert!(
+        !toml.contains("layout = \"map\""),
+        "no record may carry the retired `map` layout sentinel, got:\n{toml}"
+    );
+    assert!(
+        toml.contains("kind = \"file\""),
+        "a mapped (single-file) record must carry kind = \"file\", got:\n{toml}"
+    );
+}
+
+#[test]
+fn sync_does_not_collide_two_identities_sharing_dest_basename_under_by_source() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.agents-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = {{\n\
+         claude = {{ source = \"agents-src\", map = {{ \"AGENTS.md\" = \"CLAUDE.md\" }} }},\n\
+         codex = {{ source = \"agents-src\", map = {{ \"AGENTS.md\" = \"CLAUDE.md\" }} }},\n\
+         }}\nlayout = \"by-source\"\n",
+        fx.url,
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("two-identity map config parses");
+
+    let result = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    );
+
+    let out = result.expect(
+        "two distinct identities mapping to the same dest BASENAME resolve to DISTINCT final \
+         layout paths under by-source (<target>/claude/CLAUDE.md vs <target>/codex/CLAUDE.md); \
+         the collision guard keys on the FINAL layout path, so this must NOT collide",
+    );
+    assert!(
+        !out.had_failures,
+        "the non-colliding two-identity deploy must succeed"
+    );
+    assert!(
+        td.target_path().join("claude").join("CLAUDE.md").is_file()
+            && td.target_path().join("codex").join("CLAUDE.md").is_file(),
+        "both identities must deploy at their distinct by-source layout paths"
+    );
+}
+
+#[test]
+fn rebuild_reconstructs_file_artifact_under_by_source_without_map_path() {
+    let fx = build_file_artifact_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_source_select(&fx.url, &td.target_path(), "\"init.lua\"", "by-source");
+
+    let out = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("seeding sync deploys the loose file");
+    assert!(!out.had_failures, "premise: seeding sync must succeed");
+
+    let key = artifact_key("dest", "src", "init.lua");
+    let original = fx
+        .registry
+        .get(&key)
+        .expect("registry get must not error")
+        .expect("premise: sync recorded the file artifact");
+    fx.registry.remove(&key).expect("drop the file record");
+
+    rebuild_registry(&cfg, &out.base_lock, &fx.backend, &fx.registry)
+        .expect("rebuild reconstructs a kind=file record");
+
+    let rebuilt = fx
+        .registry
+        .get(&key)
+        .expect("registry get must not error")
+        .expect("rebuild must reconstruct the dropped file record");
+    assert_eq!(
+        rebuilt.layout, "bysource",
+        "a reconstructed file record must carry the layout kind, not the `map` sentinel"
+    );
+    assert_eq!(
+        rebuilt.digest, original.digest,
+        "reconstructed file digest must equal the originally-synced digest"
+    );
+
+    let on_disk = super::target::record_artifact_path(&cfg.targets["dest"], &rebuilt);
+    assert_eq!(
+        on_disk,
+        td.target_path().join("src").join("init.lua"),
+        "a reconstructed file record's path must be the by-source layout path, not the target root"
+    );
+
+    let toml = record_toml_on_disk(&fx, "dest", "src", "init.lua");
+    assert!(
+        toml.contains("kind = \"file\""),
+        "a reconstructed single-file record must carry kind = \"file\", got:\n{toml}"
+    );
+}
+
+#[test]
+fn sync_copy_dot_dir_deploys_as_one_dir_artifact() {
+    let fx = build_file_artifact_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_source_select(&fx.url, &td.target_path(), "\".zfunc\"", "by-source");
+
+    let out = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("sync deploys the .zfunc dot-dir");
+    assert!(!out.had_failures, ".zfunc dot-dir deploy must succeed");
+
+    let dir_member = td.target_path().join("src").join(".zfunc").join("_widget");
+    assert!(
+        dir_member.is_file(),
+        "a copy-mode dot-dir must deploy as one dir artifact at <target>/<identity>/.zfunc/_widget, \
+         missing at {}",
+        dir_member.display()
+    );
+
+    let rec = fx
+        .registry
+        .get(&artifact_key("dest", "src", ".zfunc"))
+        .expect("registry get must not error")
+        .expect("a single dir record must exist for the .zfunc dot-dir artifact");
+    assert_eq!(
+        rec.layout, "bysource",
+        "the dot-dir record records its layout kind"
+    );
+
+    let toml = record_toml_on_disk(&fx, "dest", "src", ".zfunc");
+    assert!(
+        toml.contains("kind = \"dir\""),
+        "a dot-dir deployed via the dir-artifact path must carry kind = \"dir\", got:\n{toml}"
+    );
+}
+
+#[test]
+fn sync_discovered_loose_file_honors_prefixed_layout_with_kind_file() {
+    let fx = build_file_artifact_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_source_select(&fx.url, &td.target_path(), "\"init.lua\"", "prefixed");
+
+    let out = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("sync deploys the discovered loose file under prefixed");
+    assert!(!out.had_failures, "loose-file prefixed deploy must succeed");
+
+    let layout_dst = td.target_path().join("src-init.lua");
+    assert!(
+        layout_dst.is_file(),
+        "a discovered loose file under prefixed must deploy at <target>/<identity>-init.lua, \
+         missing at {}",
+        layout_dst.display()
+    );
+    let root_dst = td.target_path().join("init.lua");
+    assert!(
+        !root_dst.exists(),
+        "a discovered loose file must NOT land at the target root under prefixed, found at {}",
+        root_dst.display()
+    );
+
+    let rec = fx
+        .registry
+        .get(&artifact_key("dest", "src", "init.lua"))
+        .expect("registry get must not error")
+        .expect("a record must exist for the loose file under prefixed");
+    assert_eq!(
+        rec.layout, "prefixed",
+        "a file artifact under prefixed must record layout=prefixed, not the `map` sentinel"
+    );
+
+    let toml = record_toml_on_disk(&fx, "dest", "src", "init.lua");
+    assert!(
+        toml.contains("kind = \"file\""),
+        "a single-file artifact under prefixed must carry kind = \"file\", got:\n{toml}"
+    );
+}
+
+/// A repo with a loose file `AGENTS.md` and a dir artifact `foo/`.
+#[expect(
+    clippy::unwrap_used,
+    reason = "fixture setup fails loudly; git CLI is assumed present"
+)]
+fn build_map_and_dir_collision_fixture() -> SyncFixture {
+    let src = TempDir::new().unwrap();
+    let src_path = src.path();
+    run_git(src_path, &["init", "-b", "main", "."]);
+    run_git(src_path, &["config", "user.email", "test@example.com"]);
+    run_git(src_path, &["config", "user.name", "Test"]);
+    std::fs::write(src_path.join("AGENTS.md"), b"# agents\n").unwrap();
+    std::fs::create_dir_all(src_path.join("foo")).unwrap();
+    std::fs::write(src_path.join("foo/inner.txt"), b"inner\n").unwrap();
+    run_git(src_path, &["add", "-A"]);
+    run_git(src_path, &["commit", "-m", "initial"]);
+    let head_sha = rev_parse(src_path, "HEAD");
+    let git_dir = TempDir::new().unwrap();
+    let state_dir = TempDir::new().unwrap();
+    let backend = GitBackend::new(git_dir.path().to_path_buf());
+    let registry =
+        FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry over tempdir");
+    let url = src_path.to_string_lossy().into_owned();
+    SyncFixture {
+        src,
+        _git_dir: git_dir,
+        _state_dir: state_dir,
+        backend,
+        registry,
+        url,
+        head_sha,
+    }
+}
+
+#[test]
+fn sync_collides_map_dest_and_dir_artifact_resolving_to_same_layout_path() {
+    let fx = build_map_and_dir_collision_fixture();
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = {{\n\
+         agents = {{ source = \"src\", map = {{ \"AGENTS.md\" = \"src-foo\" }} }},\n\
+         agents-src = {{ source = \"src\", include = [\"foo\"] }},\n\
+         }}\nlayout = \"prefixed\"\n",
+        fx.url,
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("map+dir collision config parses");
+
+    let contested = td.target_path().join("agents-src-foo");
+    let result = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    );
+
+    let Err(err) = result else {
+        panic!(
+            "a map dest `src-foo` under identity `agents` and a discovered dir artifact `foo` \
+             under identity `agents-src` both resolve to the SAME final prefixed layout path \
+             <target>/agents-src-foo; once the map dest honors layout the collision guard MUST \
+             fire on that final path (today the map bypasses to <target>/src-foo and does not collide)"
+        );
+    };
+    assert!(
+        matches!(err, Error::Collision { .. }),
+        "the same-final-path conflict must surface as Error::Collision, got {err:?}"
+    );
+    assert!(
+        !contested.exists(),
+        "the collision must abort before any deploy; nothing may land at the contested {}",
+        contested.display()
+    );
+    assert!(
+        fx.registry.list_all().expect("list registry").is_empty(),
+        "a same-final-path collision must persist NO record on either side"
+    );
+}
+
+#[test]
+fn verify_passes_then_flags_content_mismatch_for_kind_file_record() {
+    let fx = build_file_artifact_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_source_select(&fx.url, &td.target_path(), "\"init.lua\"", "by-source");
+
+    let out = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("seeding sync deploys the loose file");
+    assert!(!out.had_failures, "premise: seeding sync must succeed");
+
+    let layout_dst = td.target_path().join("src").join("init.lua");
+    assert!(
+        layout_dst.is_file(),
+        "premise: the kind=file artifact must be deployed at its by-source layout path, \
+         missing at {}",
+        layout_dst.display()
+    );
+
+    let clean = super::verify(&cfg, &fx.registry).expect("verify runs over a kind=file record");
+    assert!(
+        clean.is_empty(),
+        "a freshly-deployed kind=file artifact must verify clean (verify must resolve the \
+         layout location, not the target root), got {clean:?}"
+    );
+
+    std::fs::write(&layout_dst, b"-- tampered\n").expect("tamper the deployed file");
+
+    let dirty =
+        super::verify(&cfg, &fx.registry).expect("verify runs after the deployed file is tampered");
+    assert!(
+        dirty.iter().any(|m| {
+            m.key.artifact == "init.lua"
+                && matches!(m.reason, super::VerifyReason::ContentMismatch { .. })
+        }),
+        "verify must flag a ContentMismatch for the tampered kind=file artifact at its layout \
+         path; if verify reads the wrong base (target root) it would report Missing or nothing, \
+         got {dirty:?}"
+    );
 }

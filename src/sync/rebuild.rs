@@ -7,10 +7,10 @@ use crate::kernel::{ArtifactName, Selection, SourceName};
 use crate::lock::{Lock, ref_discriminator};
 use crate::source::{ExportRequest, SourceBackend};
 use crate::store::{
-    ArtifactKey, MAP_LAYOUT, ManifestFile, ProjectedRecord, Registry, RegistryRecord,
+    ArtifactKey, ManifestFile, ProjectedRecord, RecordKind, Registry, RegistryRecord,
 };
 
-use super::discover::discover_artifacts_for_source;
+use super::discover::discover_link_artifacts;
 use super::{StagingGuard, nonce, remote_for, resolved_remotes};
 
 /// Summary of a [`rebuild_registry`] run: which artifacts were reconstructed and
@@ -108,6 +108,7 @@ fn rebuild_binding(
 
     let reconstruct = |artifact: &ArtifactName,
                        mapped_source_key: Option<&str>,
+                       link_kind: RecordKind,
                        managed: &mut BTreeMap<String, BTreeSet<String>>,
                        report: &mut RebuildReport|
      -> Result<()> {
@@ -116,15 +117,11 @@ fn rebuild_binding(
             source: run.binding.identity.to_owned(),
             artifact: artifact.as_str().to_owned(),
         };
-        let artifact_dst = if mapped_source_key.is_some() {
-            run.target.expanded_path().join(artifact.as_str())
-        } else {
-            run.target.expanded_path().join(
-                run.target
-                    .layout()
-                    .artifact_path(run.binding.identity, artifact.as_str()),
-            )
-        };
+        let artifact_dst = run.target.expanded_path().join(
+            run.target
+                .layout()
+                .artifact_path(run.binding.identity, artifact.as_str()),
+        );
 
         match run.source.deploy_mode() {
             DeployMode::Link => rebuild_linked(
@@ -132,7 +129,7 @@ fn rebuild_binding(
                 run.binding.source,
                 &policy,
                 run.target.layout().kind,
-                mapped_source_key.is_some(),
+                link_kind,
                 key,
                 report,
             )?,
@@ -169,6 +166,7 @@ fn rebuild_binding(
             reconstruct(
                 &ArtifactName::trusted(dest.as_str()),
                 Some(key.as_str()),
+                RecordKind::File,
                 managed,
                 report,
             )?;
@@ -176,7 +174,7 @@ fn rebuild_binding(
         return Ok(());
     }
 
-    let discovered = discover_artifacts_for_source(
+    let discovered = discover_link_artifacts(
         run.source,
         run.git,
         &source_name,
@@ -187,7 +185,7 @@ fn rebuild_binding(
     )?;
 
     for artifact in discovered {
-        reconstruct(&artifact, None, managed, report)?;
+        reconstruct(&artifact.name, None, artifact.kind, managed, report)?;
     }
     Ok(())
 }
@@ -256,10 +254,9 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         path_map: path_map.as_ref(),
     })?;
 
-    let manifest_base = if mapped_source_key.is_some() {
-        artifact_dst.parent().unwrap_or(artifact_dst)
-    } else {
-        artifact_dst
+    let manifest_base = match export.kind {
+        RecordKind::File => artifact_dst.parent().unwrap_or(artifact_dst),
+        RecordKind::Dir => artifact_dst,
     };
 
     let mut modified = false;
@@ -288,11 +285,8 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         underlying_source,
         commit,
         digest: export.digest,
-        layout: if mapped_source_key.is_some() {
-            MAP_LAYOUT.to_owned()
-        } else {
-            format!("{layout_kind:?}").to_lowercase()
-        },
+        layout: format!("{layout_kind:?}").to_lowercase(),
+        kind: export.kind,
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
         files,
@@ -313,7 +307,7 @@ fn rebuild_linked(
     underlying_source: &str,
     policy: &crate::source::ExportPolicy,
     layout_kind: LayoutKind,
-    is_mapped: bool,
+    kind: RecordKind,
     key: ArtifactKey,
     report: &mut RebuildReport,
 ) -> Result<()> {
@@ -324,11 +318,8 @@ fn rebuild_linked(
         commit: "link".to_owned(),
         digest: "link:".to_owned(),
         projected_at: chrono::Utc::now().to_rfc3339(),
-        layout: if is_mapped {
-            MAP_LAYOUT.to_owned()
-        } else {
-            format!("{layout_kind:?}").to_lowercase()
-        },
+        layout: format!("{layout_kind:?}").to_lowercase(),
+        kind,
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
         files: vec![],

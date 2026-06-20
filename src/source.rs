@@ -11,7 +11,7 @@ use crate::kernel::{
     ArtifactName, Commit, Digest, KernelError, Selection, SourceName, locator_basename,
     safe_component,
 };
-use crate::store::ManifestFile;
+use crate::store::{ManifestFile, RecordKind};
 
 /// Errors owned by the source context (`SourceBackend` and its adapters).
 #[derive(Debug, Error)]
@@ -93,6 +93,8 @@ pub struct ExportResult {
     pub digest: String,
     /// Digest of the full effective vars map; `Some` iff at least one template rendered.
     pub vars_digest: Option<String>,
+    /// Whether the exported artifact is a single renamed file (map/blob) or a directory tree.
+    pub kind: RecordKind,
 }
 
 /// Borrowed parameters of [`SourceBackend::export_artifact`].
@@ -470,8 +472,9 @@ impl SourceBackend for GitBackend {
             deployed_names: BTreeMap::new(),
             rendered_any: false,
         };
-        if let Some(map) = req.path_map {
+        let kind = if let Some(map) = req.path_map {
             walk.run_mapped(&root_tree, map)?;
+            RecordKind::File
         } else {
             let locator = Self::artifact_locator(req.selection, req.artifact.as_str());
             let entry = root_tree
@@ -496,6 +499,7 @@ impl SourceBackend for GitBackend {
                         ))
                     })?;
                     walk.run(&artifact_tree, Path::new(""))?;
+                    RecordKind::Dir
                 }
                 EntryKind::Blob | EntryKind::BlobExecutable => {
                     let executable = entry.mode().kind() == EntryKind::BlobExecutable;
@@ -504,6 +508,7 @@ impl SourceBackend for GitBackend {
                     let source_rel = PathBuf::from(req.artifact.as_str());
                     let deployed_rel = walk.renderer.deployed_rel(&source_rel);
                     walk.stage_leaf(deployed_rel, &source_rel, &bytes, executable, true)?;
+                    RecordKind::File
                 }
                 EntryKind::Link => {
                     return Err(SourceError::SymlinkNotAllowed { path: locator });
@@ -514,7 +519,7 @@ impl SourceBackend for GitBackend {
                     });
                 }
             }
-        }
+        };
 
         let digest = format!("blake3:{}", walk.hasher.finalize().to_hex());
         let vars_digest = walk.rendered_any.then(|| renderer.vars_digest());
@@ -522,6 +527,7 @@ impl SourceBackend for GitBackend {
             files: walk.files,
             digest,
             vars_digest,
+            kind,
         })
     }
 

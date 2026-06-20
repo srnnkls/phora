@@ -1,5 +1,5 @@
 use super::*;
-use crate::store::{ArtifactKey, FileRegistry, ManifestFile, RegistryRecord};
+use crate::store::{ArtifactKey, FileRegistry, ManifestFile, RecordKind, RegistryRecord};
 use clap::CommandFactory;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -203,6 +203,7 @@ fn record(
         digest: digest.to_owned(),
         projected_at: "2026-01-31T12:34:56Z".to_owned(),
         layout: "flat".to_owned(),
+        kind: RecordKind::Dir,
         allow_symlinks: false,
         preserve_executable: true,
         files: vec![ManifestFile {
@@ -1748,6 +1749,7 @@ fn record_for(
         digest: "blake3:rec".to_owned(),
         projected_at: "2026-01-31T12:34:56Z".to_owned(),
         layout: "flat".to_owned(),
+        kind: RecordKind::Dir,
         allow_symlinks: false,
         preserve_executable: true,
         files,
@@ -1998,8 +2000,10 @@ fn list_statuses_groups_by_target_and_names_source_and_artifact() {
 // ── mapped-leaf observability (T8) ─────────────────────────────
 
 /// Single file at `<target_dir>/<dest>` (no artifact dir) with size+mtime matched to disk so the mapped record reads Clean.
-fn deploy_mapped_file(target_dir: &Path, dest: &str, content: &[u8]) -> ManifestFile {
-    let path = target_dir.join(dest);
+fn deploy_mapped_file(target_dir: &Path, source: &str, dest: &str, content: &[u8]) -> ManifestFile {
+    let layout_dir = target_dir.join(source);
+    std::fs::create_dir_all(&layout_dir).expect("mkdir by-source layout dir");
+    let path = layout_dir.join(dest);
     std::fs::write(&path, content).expect("write mapped dest file");
     let meta = std::fs::metadata(&path).expect("stat mapped dest file");
     let mtime = meta
@@ -2034,7 +2038,8 @@ fn mapped_record(
         commit: commit.to_owned(),
         digest: "blake3:map".to_owned(),
         projected_at: "2026-01-31T12:34:56Z".to_owned(),
-        layout: crate::store::MAP_LAYOUT.to_owned(),
+        layout: "by-source".to_owned(),
+        kind: RecordKind::File,
         allow_symlinks: false,
         preserve_executable: true,
         files,
@@ -2094,7 +2099,7 @@ fn list_statuses_reports_mapped_dest_path_without_layout_leak() {
     let target_root = TempDir::new().expect("target root");
     let cfg = config_one_by_source_target("dest", "fzf-src", target_root.path());
 
-    let mf = deploy_mapped_file(target_root.path(), "fzf.zsh", b"# fzf\n");
+    let mf = deploy_mapped_file(target_root.path(), "fzf-src", "fzf.zsh", b"# fzf\n");
     reg.put(&mapped_record(
         "dest",
         "fzf-src",
@@ -2133,7 +2138,7 @@ fn eject_keeps_mapped_file_and_marks_record_ejected() {
     let target_root = TempDir::new().expect("target root");
     let cfg = config_one_by_source_target("dest", "fzf-src", target_root.path());
 
-    let mf = deploy_mapped_file(target_root.path(), "fzf.zsh", b"# fzf\n");
+    let mf = deploy_mapped_file(target_root.path(), "fzf-src", "fzf.zsh", b"# fzf\n");
     reg.put(&mapped_record(
         "dest",
         "fzf-src",
@@ -2146,8 +2151,8 @@ fn eject_keeps_mapped_file_and_marks_record_ejected() {
     crate::sync::eject(&cfg, &reg, "fzf.zsh", "fzf-src", "dest").expect("eject mapped leaf");
 
     assert!(
-        target_root.path().join("fzf.zsh").exists(),
-        "eject must keep the mapped dest file on disk"
+        target_root.path().join("fzf-src").join("fzf.zsh").exists(),
+        "eject must keep the mapped dest file on disk at its by-source layout path"
     );
     let listings = list_statuses(&cfg, &reg).expect("list statuses after eject");
     let st = status_for(&listings, "dest", "fzf.zsh")
@@ -2166,7 +2171,7 @@ fn uneject_round_trips_a_mapped_record_back_to_managed() {
     let target_root = TempDir::new().expect("target root");
     let cfg = config_one_by_source_target("dest", "fzf-src", target_root.path());
 
-    let mf = deploy_mapped_file(target_root.path(), "fzf.zsh", b"# fzf\n");
+    let mf = deploy_mapped_file(target_root.path(), "fzf-src", "fzf.zsh", b"# fzf\n");
     reg.put(&mapped_record(
         "dest",
         "fzf-src",

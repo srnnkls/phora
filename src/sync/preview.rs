@@ -271,7 +271,10 @@ fn preview_mapped_copy(
 
 fn push_mapped_entry(ctx: &BindingCtx, dest: &str, commit: &str, entries: &mut Vec<PreviewEntry>) {
     let dest_path = PathBuf::from(dest);
-    let mut entry = synced_entry_at(ctx, dest, commit, ctx.path.join(&dest_path));
+    let destination = ctx
+        .path
+        .join(ctx.layout.artifact_path(ctx.binding.identity, dest));
+    let mut entry = synced_entry_at(ctx, dest, commit, destination);
     if ctx.files {
         entry.files = vec![PreviewFile {
             path: dest_path,

@@ -719,7 +719,7 @@ fn remove_orphaned_staging(target_parent: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{FileRegistry, HookState, ManifestFile, StoreError};
+    use crate::store::{FileRegistry, HookState, ManifestFile, RecordKind, StoreError};
 
     type StoreResult<T> = std::result::Result<T, StoreError>;
     use std::os::unix::fs::symlink;
@@ -905,6 +905,7 @@ mod tests {
             digest: "blake3:d4e5f6".to_owned(),
             projected_at: "2026-01-31T12:34:56Z".to_owned(),
             layout: "flat".to_owned(),
+            kind: RecordKind::Dir,
             allow_symlinks,
             preserve_executable: true,
             files: manifest,
@@ -1090,6 +1091,7 @@ mod tests {
             digest: "link:".to_owned(),
             projected_at: "2026-06-08T12:00:00Z".to_owned(),
             layout: "flat".to_owned(),
+            kind: RecordKind::Dir,
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![],
@@ -1378,6 +1380,7 @@ mod tests {
             digest: "blake3:d4e5f6".to_owned(),
             projected_at: "2026-01-31T12:34:56Z".to_owned(),
             layout: "flat".to_owned(),
+            kind: RecordKind::Dir,
             allow_symlinks: false,
             preserve_executable: true,
             files: manifest,

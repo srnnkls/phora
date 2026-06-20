@@ -101,7 +101,7 @@ pub fn plan_target(
                     source: binding.source.to_owned(),
                     artifact: dest.clone(),
                     commit: commit.clone(),
-                    destination: path.join(dest),
+                    destination: path.join(layout.artifact_path(binding.identity, dest)),
                     mapped: true,
                 });
             }

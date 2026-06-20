@@ -241,10 +241,11 @@ Artifact: dotfiles/KEEP.md (commit ca94c83b, digest blake3:6be6e4f8dce9e6498d7b5
   - home (ejected)
 ```
 
-## By-source — mapped dest lands at the target root
+## By-source — mapped dest honors the layout
 
-A mapped binding under a `layout = "by-source"` target ignores the by-source layout: the
-dest lands directly at the target root, never under a per-source subdirectory.
+A mapped binding under a `layout = "by-source"` target honors the layout: the renamed
+dest lands at the per-identity layout path `target/<identity>/<dest>`, never at the
+target root.
 
 ```scrut
 $ cd "$ROOT" && mkdir -p bysource && cd bysource && isolate_state && repo="$(make_git_source dotfiles)" && mkdir -p target-home && cat > phora.toml <<EOF && phora sync 2>&1 | normalize
@@ -261,17 +262,17 @@ $ cd "$ROOT" && mkdir -p bysource && cd bysource && isolate_state && repo="$(mak
 sync complete
 ```
 
-The dest is at the target root, and no by-source subdirectory was created.
+The dest lands under the per-identity subdirectory, not at the target root.
 
 ```scrut
-$ test -f target-home/BYSRC.md && test ! -d target-home/dotfiles && echo "at root, no leak"
-at root, no leak
+$ test -f target-home/dotfiles/BYSRC.md && test ! -f target-home/BYSRC.md && echo "honors layout"
+honors layout
 ```
 
 ```scrut
 $ phora preview 2>&1 | normalize
 home
-  dotfiles@ca94c83b BYSRC.md -> <ROOT>/target-home/BYSRC.md
+  dotfiles@ca94c83b BYSRC.md -> <ROOT>/target-home/dotfiles/BYSRC.md
 ```
 
 ## Missing link leaf degrades gracefully

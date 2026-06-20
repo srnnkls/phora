@@ -8,10 +8,10 @@ use crate::kernel::{ArtifactName, Selection, SourceName};
 use crate::lock::encode_ref;
 use crate::source::{ExportRequest, SourceBackend};
 use crate::store::{
-    ArtifactKey, EjectedEntry, MAP_LAYOUT, ProjectedRecord, Registry, RegistryRecord,
+    ArtifactKey, EjectedEntry, ProjectedRecord, RecordKind, Registry, RegistryRecord,
 };
 
-use super::discover::discover_artifacts_for_source;
+use super::discover::discover_link_artifacts;
 use super::{
     Conflict, ConflictKind, ConflictResolver, Resolution, StagingGuard, nonce, remote_for,
     target_parent,
@@ -39,9 +39,83 @@ pub(super) fn deploy_target(
     let target_path = run.target.expanded_path();
     let layout = run.target.layout();
     let ejected = registry.load_ejected(run.target_name)?;
-    let mut seen_dest: BTreeMap<PathBuf, String> = BTreeMap::new();
-    let mut had_failures = false;
 
+    let bindings = plan_bindings(&run, backend)?;
+
+    let mut seen_dest: BTreeMap<PathBuf, String> = BTreeMap::new();
+    for binding in &bindings {
+        for artifact in &binding.artifacts {
+            let dst = artifact_dst_for(&target_path, &layout, &binding.identity, &artifact.name);
+            if let Some(other) = seen_dest.insert(dst, binding.identity.clone()) {
+                return Err(Error::Collision {
+                    artifact: artifact.name.as_str().to_owned(),
+                    sources: vec![other, binding.identity.clone()],
+                    target: run.target_name.to_owned(),
+                });
+            }
+        }
+    }
+
+    let mut had_failures = false;
+    for binding in &bindings {
+        let source_name = SourceName::trusted(&binding.underlying_source);
+        for artifact in &binding.artifacts {
+            let artifact_dst =
+                artifact_dst_for(&target_path, &layout, &binding.identity, &artifact.name);
+            let dst_is_symlink =
+                std::fs::symlink_metadata(&artifact_dst).is_ok_and(|m| m.file_type().is_symlink());
+            let mode_transition = match binding.source.deploy_mode() {
+                DeployMode::Link => artifact_dst.exists() && !dst_is_symlink,
+                DeployMode::Copy => dst_is_symlink,
+            };
+            let entry = ArtifactEntry {
+                source: binding.source,
+                git: &binding.git,
+                source_name: &source_name,
+                identity: &binding.identity,
+                underlying_source: &binding.underlying_source,
+                root: binding.root,
+                commit: &binding.commit,
+                selection: &binding.selection,
+                artifact_name: &artifact.name,
+                target_path: &target_path,
+                layout_kind: layout.kind,
+                ejected: &ejected,
+                mode_transition,
+                template_opt_in: &binding.template_opt_in,
+                mapped_source_key: artifact.mapped_source_key.as_deref(),
+                link_kind: artifact.link_kind,
+            };
+            had_failures |= deploy_artifact_entry(run, &entry, backend, registry, journal)?;
+        }
+    }
+
+    Ok(had_failures)
+}
+
+struct PlannedArtifact {
+    name: ArtifactName,
+    mapped_source_key: Option<String>,
+    link_kind: RecordKind,
+}
+
+struct PlannedBinding<'a> {
+    source: &'a ParsedSource,
+    identity: String,
+    underlying_source: String,
+    git: String,
+    commit: String,
+    root: Option<&'a Path>,
+    selection: Selection,
+    template_opt_in: TemplateOptIn,
+    artifacts: Vec<PlannedArtifact>,
+}
+
+fn plan_bindings<'a>(
+    run: &TargetRun<'a>,
+    backend: &dyn SourceBackend,
+) -> Result<Vec<PlannedBinding<'a>>> {
+    let mut planned = Vec::new();
     for binding in run.target.resolve_sources(run.parsed) {
         let source = run.parsed.get(binding.source).ok_or_else(|| {
             Error::Config(format!(
@@ -63,74 +137,46 @@ pub(super) fn deploy_target(
         let source_name = SourceName::trusted(binding.source);
         let selection = Selection::new(binding.include, binding.exclude)?;
 
-        let mut deploy_one_entry = |artifact_name: &ArtifactName,
-                                    mapped_source_key: Option<&str>|
-         -> Result<()> {
-            let artifact_dst = artifact_dst_for(
-                &target_path,
-                &layout,
-                binding.identity,
-                artifact_name,
-                mapped_source_key,
-            );
-            if let Some(other) = seen_dest.insert(artifact_dst.clone(), binding.identity.to_owned())
-            {
-                return Err(Error::Collision {
-                    artifact: artifact_name.as_str().to_owned(),
-                    sources: vec![other, binding.identity.to_owned()],
-                    target: run.target_name.to_owned(),
-                });
-            }
-            let dst_is_symlink =
-                std::fs::symlink_metadata(&artifact_dst).is_ok_and(|m| m.file_type().is_symlink());
-            let mode_transition = match source.deploy_mode() {
-                DeployMode::Link => artifact_dst.exists() && !dst_is_symlink,
-                DeployMode::Copy => dst_is_symlink,
-            };
-            let entry = ArtifactEntry {
+        let artifacts = if let Some(map) = binding.map {
+            map.iter()
+                .map(|(key, dest)| PlannedArtifact {
+                    name: ArtifactName::trusted(dest.as_str()),
+                    mapped_source_key: Some(key.as_str().to_owned()),
+                    link_kind: RecordKind::File,
+                })
+                .collect()
+        } else {
+            discover_link_artifacts(
                 source,
                 git,
-                source_name: &source_name,
-                identity: binding.identity,
-                underlying_source: binding.source,
-                root: binding.root,
+                &source_name,
                 commit,
-                selection: &selection,
-                artifact_name,
-                target_path: &target_path,
-                layout_kind: layout.kind,
-                ejected: &ejected,
-                mode_transition,
-                template_opt_in: &binding.template_opt_in,
-                mapped_source_key,
-            };
-            had_failures |= deploy_artifact_entry(run, &entry, backend, registry, journal)?;
-            Ok(())
+                backend,
+                &selection,
+                binding.root,
+            )?
+            .into_iter()
+            .map(|a| PlannedArtifact {
+                name: a.name,
+                mapped_source_key: None,
+                link_kind: a.kind,
+            })
+            .collect()
         };
 
-        if let Some(map) = binding.map {
-            for (key, dest) in map {
-                deploy_one_entry(&ArtifactName::trusted(dest.as_str()), Some(key.as_str()))?;
-            }
-            continue;
-        }
-
-        let discovered = discover_artifacts_for_source(
+        planned.push(PlannedBinding {
             source,
-            git,
-            &source_name,
-            commit,
-            backend,
-            &selection,
-            binding.root,
-        )?;
-
-        for artifact_name in discovered {
-            deploy_one_entry(&artifact_name, None)?;
-        }
+            identity: binding.identity.to_owned(),
+            underlying_source: binding.source.to_owned(),
+            git: git.to_owned(),
+            commit: commit.clone(),
+            root: binding.root,
+            selection,
+            template_opt_in: binding.template_opt_in,
+            artifacts,
+        });
     }
-
-    Ok(had_failures)
+    Ok(planned)
 }
 
 pub(super) struct ArtifactEntry<'a> {
@@ -150,43 +196,36 @@ pub(super) struct ArtifactEntry<'a> {
     pub(super) template_opt_in: &'a TemplateOptIn,
     /// Source-side key for a mapped leaf; `None` for layout-routed artifacts.
     pub(super) mapped_source_key: Option<&'a str>,
+    /// Link-mode `RecordKind` from discovery's working-tree scan, not a live re-stat.
+    pub(super) link_kind: RecordKind,
 }
 
-/// A `map`-layout dest is a single component at the target root; layout helpers must not be applied.
+/// The artifact's deployed location at its layout path (a file for `kind=file`, a dir for `kind=dir`).
 pub(crate) fn record_artifact_path(target: &Target, record: &RegistryRecord) -> PathBuf {
-    if record.layout == MAP_LAYOUT {
-        target.expanded_path().join(&record.key.artifact)
-    } else {
-        target.expanded_path().join(
-            target
-                .layout()
-                .artifact_path(&record.key.source, &record.key.artifact),
-        )
-    }
+    target.expanded_path().join(
+        target
+            .layout()
+            .artifact_path(&record.key.source, &record.key.artifact),
+    )
 }
 
-/// A `map` record's single manifest file IS the dest, so its base is the target root.
+/// Base to join manifest file paths against: a file record's base is the deployed file's parent; a dir record's is the deployed dir.
 pub(super) fn record_manifest_base(target: &Target, record: &RegistryRecord) -> PathBuf {
-    if record.layout == MAP_LAYOUT {
-        target.expanded_path()
-    } else {
-        record_artifact_path(target, record)
+    let path = record_artifact_path(target, record);
+    match record.kind {
+        RecordKind::File => path.parent().map_or(path.clone(), Path::to_path_buf),
+        RecordKind::Dir => path,
     }
 }
 
-/// Mapped leaves land as a renamed FILE at the target root, ignoring layout.
+/// Every artifact (file/map or dir) deploys at its layout path for `identity`.
 fn artifact_dst_for(
     target_path: &Path,
     layout: &LayoutConfig,
     identity: &str,
     artifact_name: &ArtifactName,
-    mapped_source_key: Option<&str>,
 ) -> PathBuf {
-    if mapped_source_key.is_some() {
-        target_path.join(artifact_name.as_str())
-    } else {
-        target_path.join(layout.artifact_path(identity, artifact_name.as_str()))
-    }
+    target_path.join(layout.artifact_path(identity, artifact_name.as_str()))
 }
 
 fn artifact_dst_for_entry(run: TargetRun<'_>, entry: &ArtifactEntry<'_>) -> PathBuf {
@@ -195,7 +234,6 @@ fn artifact_dst_for_entry(run: TargetRun<'_>, entry: &ArtifactEntry<'_>) -> Path
         &run.target.layout(),
         entry.identity,
         entry.artifact_name,
-        entry.mapped_source_key,
     )
 }
 
@@ -433,27 +471,33 @@ fn deploy_one(
             .map_err(|e| Error::Sync(format!("create target dir {}: {e}", parent.display())))?;
     }
 
+    let staged_file = if export.kind == RecordKind::File {
+        let mf = export.files.first().ok_or_else(|| {
+            Error::Sync("kind=file export must have exactly one staged file".into())
+        })?;
+        Some(staging.join(&mf.path))
+    } else {
+        None
+    };
+
     let record = RegistryRecord::projected(ProjectedRecord {
         key: ctx.key,
         underlying_source: ctx.underlying_source,
         commit: ctx.commit,
         digest: export.digest,
-        layout: if ctx.mapped_source_key.is_some() {
-            MAP_LAYOUT.to_owned()
-        } else {
-            format!("{:?}", ctx.layout_kind).to_lowercase()
-        },
+        layout: format!("{:?}", ctx.layout_kind).to_lowercase(),
+        kind: export.kind,
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
         files: export.files,
         vars_digest: export.vars_digest,
     });
 
-    // Guard stays armed: deploy_artifact only moves the file, so the guard reaps the empty staging dir.
-    if ctx.mapped_source_key.is_some() {
+    // Guard stays armed for a single-file move: deploy_artifact only takes the file, leaving the staging dir for the guard to reap.
+    if let Some(staged_file) = staged_file {
         return deploy_artifact(
             &staging_base,
-            &staging.join(ctx.artifact_name.as_str()),
+            &staged_file,
             ctx.artifact_dst,
             record,
             journal,
@@ -480,6 +524,8 @@ fn deploy_link(
     key: ArtifactKey,
 ) -> Result<()> {
     let policy = entry.source.export_policy();
+    let link_target = link_target(entry);
+    let kind = entry.link_kind;
     let record = RegistryRecord {
         version: 1,
         key,
@@ -487,11 +533,8 @@ fn deploy_link(
         commit: "link".to_owned(),
         digest: "link:".to_owned(),
         projected_at: chrono::Utc::now().to_rfc3339(),
-        layout: if entry.mapped_source_key.is_some() {
-            MAP_LAYOUT.to_owned()
-        } else {
-            format!("{:?}", entry.layout_kind).to_lowercase()
-        },
+        layout: format!("{:?}", entry.layout_kind).to_lowercase(),
+        kind,
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
         files: vec![],
@@ -502,7 +545,7 @@ fn deploy_link(
     link_artifact(
         &staging_base,
         artifact_dst,
-        &link_target(entry),
+        &link_target,
         record,
         journal,
         registry,
