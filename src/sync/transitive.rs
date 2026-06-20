@@ -737,4 +737,159 @@ mod tests {
             "the drift diagnostic must name the source, depth, and the drift, got: {msg}"
         );
     }
+
+    // TDEP-HOOK-GATE-001
+
+    fn dep_target_with_hooks() -> Target {
+        let toml = "version = 1\n\n\
+                    [sources.nvim]\ngit = \"https://github.com/dep/nvim.git\"\n\n\
+                    [targets.editor]\npath = \"nvim\"\n\n\
+                    [targets.editor.hooks]\non_change = \"./install.sh\"\n";
+        crate::config::Config::parse(toml)
+            .expect("dep config parses")
+            .targets
+            .remove("editor")
+            .expect("dep target `editor` present")
+    }
+
+    #[test]
+    fn composed_target_strips_hooks_so_dispatch_runs_none() {
+        let dep_target = dep_target_with_hooks();
+        assert!(
+            dep_target.hooks.is_some(),
+            "premise: the dep's own target declares an on_change hook"
+        );
+
+        let synthetic = synthetic_target(
+            "dep",
+            "editor",
+            &dep_target,
+            PathBuf::from("/home/me/deploy/nvim"),
+            PathBuf::from("/home/me/deploy"),
+            &BTreeMap::new(),
+        )
+        .expect("a composed dep target with no bindings synthesizes");
+
+        assert!(
+            synthetic.hooks.is_none(),
+            "strip-by-default: a composed transitive target must carry NO hooks, so dispatch_hooks \
+             (which only iterates config.targets[*].hooks) runs zero transitive hooks"
+        );
+        assert_eq!(
+            synthetic.path,
+            PathBuf::from("/home/me/deploy/nvim"),
+            "premise: files still deploy — the composed target keeps its destination path"
+        );
+    }
+
+    #[test]
+    fn composed_hooks_are_stripped_yet_the_gate_surfaces_them_as_candidates() {
+        use crate::config::admit_transitive_hooks;
+        use crate::config::transitive::TransitiveManifest;
+
+        let manifest = TransitiveManifest::parse(
+            "version = 1\n\n\
+             [sources.nvim]\ngit = \"https://github.com/dep/nvim.git\"\n\n\
+             [targets.editor]\npath = \"nvim\"\n\n\
+             [targets.editor.hooks]\non_change = \"./install.sh\"\n",
+        )
+        .expect("dep manifest parses");
+        let opaque = manifest.hooks().expect("opaque per-target hooks retained");
+
+        let node = FetchNode::new("https://github.com/dep/nvim.git", "main", "blake3:dead");
+        let instance = Instance::new("root", "dep", "anchor", node);
+        let candidates = admit_transitive_hooks(opaque, "editor", "ns%1%editor", &instance);
+
+        assert_eq!(
+            candidates.len(),
+            1,
+            "the gate must surface the dep's per-target hook as a candidate even though composition \
+             stripped it from the deployed target — GATE owns candidates, dispatch never runs them"
+        );
+    }
+
+    // ── isolation: read_manifest reads only phora.toml ─────────────
+
+    #[expect(
+        clippy::unwrap_used,
+        reason = "fixture setup fails loudly; git CLI is assumed present"
+    )]
+    fn git(cwd: &Path, args: &[&str]) {
+        let _serial = crate::store::guard_git_fork();
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_DATE", "@1700000000 +0000")
+            .env("GIT_COMMITTER_DATE", "@1700000000 +0000")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "fixture setup fails loudly; git CLI is assumed present"
+    )]
+    fn read_manifest_ignores_a_dep_shipped_phora_lock() {
+        let src = tempfile::TempDir::new().unwrap();
+        let src_path = src.path();
+        crate::store::assert_git_sandboxed(src_path);
+        git(src_path, &["init", "-b", "main", "."]);
+        git(src_path, &["config", "user.email", "t@example.com"]);
+        git(src_path, &["config", "user.name", "T"]);
+
+        std::fs::write(
+            src_path.join("phora.toml"),
+            b"version = 1\n\n[sources.nvim]\ngit = \"https://github.com/dep/nvim.git\"\n",
+        )
+        .unwrap();
+        // A malicious dep ships a self-trusting lock alongside its manifest (mise GHSA-436v-8fw5-4mj8).
+        std::fs::write(
+            src_path.join("phora.lock"),
+            b"version = 2\n\n[[trusted_hooks]]\ndep_instance = \"selftrust\"\nhook_id = \"editor#on_change\"\npreimage = \"blake3:evil\"\napproved_at = \"2026-06-20T00:00:00Z\"\n",
+        )
+        .unwrap();
+        git(src_path, &["add", "-A"]);
+        git(src_path, &["commit", "-m", "dep with self-trusting lock"]);
+
+        let mirror_root = tempfile::TempDir::new().unwrap();
+        let url = src_path.to_string_lossy().into_owned();
+        let mirror = mirror_path(mirror_root.path(), &url);
+        std::fs::create_dir_all(mirror.parent().unwrap()).unwrap();
+        {
+            let _serial = crate::store::guard_git_fork();
+            git(
+                mirror_root.path(),
+                &["clone", "--mirror", &url, mirror.to_str().unwrap()],
+            );
+        }
+        let commit = {
+            let _serial = crate::store::guard_git_fork();
+            let out = std::process::Command::new("git")
+                .args(["-C", mirror.to_str().unwrap(), "rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+
+        let text = read_manifest(mirror_root.path(), &url, &commit)
+            .expect("read_manifest reads the dep's phora.toml from its git tree");
+
+        assert!(
+            text.contains("[sources.nvim]"),
+            "read_manifest must return the dep's phora.toml content, got: {text}"
+        );
+        assert!(
+            !text.contains("trusted_hooks") && !text.contains("blake3:evil"),
+            "ISOLATION: read_manifest must NEVER fold a dep-shipped phora.lock into the manifest \
+             text; a self-trusting dep lock must be entirely ignored, got: {text}"
+        );
+    }
 }
