@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use crate::config::transitive::{FetchNode, Instance, TransitiveManifest};
 use crate::config::{
-    Binding, Config, DeployMode, HookCommand, ParsedSource, Refspec, Remote, SourceMode, Target,
-    admit_transitive_hooks_checked, hook_preimage,
+    Binding, Config, DeployMode, HookCommand, Host, ParsedSource, Protocol, Refspec, Remote,
+    SourceMode, Target, admit_transitive_hooks_checked, hook_preimage,
 };
 use crate::error::{Error, Result};
 use crate::kernel::{SourceName, safe_component};
@@ -140,6 +140,8 @@ pub(super) fn resolve_transitive_graph(
                     counter: &mut counter,
                     graph: &mut graph,
                     frozen: &frozen_gate,
+                    consumer_hosts: &config.hosts,
+                    default_protocol: config.protocol,
                 },
                 1,
             )?;
@@ -158,6 +160,8 @@ struct WalkCtx<'a> {
     counter: &'a mut usize,
     graph: &'a mut ResolvedGraph,
     frozen: &'a FrozenGate<'a>,
+    consumer_hosts: &'a BTreeMap<String, Host>,
+    default_protocol: Option<Protocol>,
 }
 
 /// Checked at the top of every `fetch_manifest` so no depth can fetch an unpinned/drifted node under `--frozen`.
@@ -199,9 +203,13 @@ fn compose_dep(
                 "imported `{imported}`: source `{inner_name}`: {TRANSITIVE_LINK_REJECTED}"
             )));
         }
-        let remote = inner_remote(inner_name, &parsed).map_err(|e| {
-            Error::Config(format!("imported `{imported}`: source `{inner_name}`: {e}"))
-        })?;
+        let remote = inner_remote(
+            inner_name,
+            &parsed,
+            ctx.consumer_hosts,
+            ctx.default_protocol,
+        )
+        .map_err(|e| Error::Config(format!("imported `{imported}`: source `{inner_name}`: {e}")))?;
         reject_escaping_remote(inner_name, &parsed, &remote, depth + 1)?;
         let composed_by_nested_import =
             inner.is_transitive() && imported_inner.contains(inner_name.as_str());
@@ -290,8 +298,13 @@ fn compose_nested_imports(
         })?;
         let inner_parsed = ParsedSource::parse(inner_name, inner)
             .map_err(|e| at_depth(inner_name, depth + 1, &e.to_string()))?;
-        let inner_remote = inner_remote(inner_name, &inner_parsed)
-            .map_err(|e| at_depth(inner_name, depth + 1, &e.to_string()))?;
+        let inner_remote = inner_remote(
+            inner_name,
+            &inner_parsed,
+            ctx.consumer_hosts,
+            ctx.default_protocol,
+        )
+        .map_err(|e| at_depth(inner_name, depth + 1, &e.to_string()))?;
         reject_escaping_remote(inner_name, &inner_parsed, &inner_remote, depth + 1)?;
         let (inner_commit, inner_manifest) = fetch_manifest(
             inner_name,
@@ -364,8 +377,13 @@ fn descend_for_validation(
     for (inner_name, inner) in &manifest.sources {
         let inner_parsed = ParsedSource::parse(inner_name, inner)
             .map_err(|e| at_depth(inner_name, depth + 1, &e.to_string()))?;
-        let inner_remote = inner_remote(inner_name, &inner_parsed)
-            .map_err(|e| at_depth(inner_name, depth + 1, &e.to_string()))?;
+        let inner_remote = inner_remote(
+            inner_name,
+            &inner_parsed,
+            ctx.consumer_hosts,
+            ctx.default_protocol,
+        )
+        .map_err(|e| at_depth(inner_name, depth + 1, &e.to_string()))?;
         reject_escaping_remote(inner_name, &inner_parsed, &inner_remote, depth + 1)?;
         if !inner.is_transitive() {
             continue;
@@ -572,14 +590,27 @@ fn fetch_manifest(
     Ok((commit, manifest))
 }
 
-fn inner_remote(name: &str, source: &ParsedSource) -> Result<String> {
+/// Trust surface: a dep's [`Remote::Host`] source resolves against the CONSUMER's host
+/// registry, never the dep's own `[hosts]` — so a dep cannot redirect a clone.
+fn inner_remote(
+    name: &str,
+    source: &ParsedSource,
+    hosts: &BTreeMap<String, Host>,
+    default_protocol: Option<Protocol>,
+) -> Result<String> {
     if source.mode() == SourceMode::Url {
         return source
             .source_url()
             .map(str::to_owned)
             .ok_or_else(|| Error::Config(format!("source `{name}`: missing url")));
     }
-    source.resolved_remote(&BTreeMap::new(), crate::config::Protocol::Https)
+    source.resolved_remote(
+        hosts,
+        source
+            .protocol()
+            .or(default_protocol)
+            .unwrap_or(Protocol::Https),
+    )
 }
 
 /// A transitive source may not reach a local `path` or `file://` remote resolved on
@@ -661,12 +692,119 @@ fn at_depth(name: &str, depth: usize, detail: &str) -> Error {
 mod tests {
     use super::*;
     use crate::config::Source;
+    use crate::config::{Host, Protocol, transitive::TransitiveManifest};
     use crate::lock::LockedSource;
 
     fn git_source(git: &str) -> ParsedSource {
         let raw: Source = toml::from_str(&format!("git = {git:?}\ntransitive = true\n"))
             .expect("git source DTO parses");
         ParsedSource::parse("dep", &raw).expect("git source parses")
+    }
+
+    fn host_source(host: &str, repo: &str, protocol: Option<&str>) -> ParsedSource {
+        let proto_line = protocol
+            .map(|p| format!("protocol = {p:?}\n"))
+            .unwrap_or_default();
+        let raw: Source =
+            toml::from_str(&format!("host = {host:?}\nrepo = {repo:?}\n{proto_line}"))
+                .expect("host source DTO parses");
+        ParsedSource::parse("inner", &raw).expect("host source parses")
+    }
+
+    fn corp_hosts() -> BTreeMap<String, Host> {
+        let host: Host =
+            toml::from_str("remote = { https = \"https://git.corp.example/{path}.git\", ssh = \"git@git.corp.example:{path}.git\" }")
+                .expect("corp host DTO parses");
+        BTreeMap::from([("corp".to_owned(), host)])
+    }
+
+    // Intended signature: inner_remote(name, source, hosts: &BTreeMap<String, Host>, default_protocol: Option<Protocol>).
+    #[test]
+    fn inner_host_source_resolves_against_consumer_custom_host() {
+        let source = host_source("corp", "team/dots", None);
+        let remote = inner_remote("inner", &source, &corp_hosts(), Some(Protocol::Https)).expect(
+            "a dep host source naming a consumer-custom host must resolve via consumer hosts",
+        );
+        assert_eq!(
+            remote, "https://git.corp.example/team/dots.git",
+            "inner_remote must resolve the inner Host source against the CONSUMER's host map, \
+             not an empty map"
+        );
+    }
+
+    #[test]
+    fn inner_host_source_falls_back_to_consumer_default_protocol() {
+        let source = host_source("github", "owner/repo", None);
+        let remote = inner_remote("inner", &source, &BTreeMap::new(), Some(Protocol::Ssh))
+            .expect("an inner host source with no own protocol resolves via the consumer default");
+        assert_eq!(
+            remote, "git@github.com:owner/repo.git",
+            "with consumer default protocol = ssh and no source-level protocol, inner_remote must \
+             pick the host's SSH template, not the hardcoded HTTPS"
+        );
+    }
+
+    #[test]
+    fn transitive_hosts_override_cannot_redirect_a_clone() {
+        let manifest = TransitiveManifest::parse(
+            "version = 1\n\n\
+             [hosts.github]\n\
+             remote = \"https://evil.example/{path}.git\"\n\n\
+             [sources.x]\n\
+             host = \"github\"\n\
+             repo = \"owner/repo\"\n",
+        )
+        .expect("a dep manifest declaring [hosts.github] still parses");
+
+        let inner = ParsedSource::parse(
+            "x",
+            manifest.sources.get("x").expect("dep source `x` present"),
+        )
+        .expect("inner host source parses");
+
+        let remote = inner_remote("x", &inner, &BTreeMap::new(), Some(Protocol::Https))
+            .expect("the inner github source resolves against the consumer/builtin registry");
+
+        assert_eq!(
+            remote, "https://github.com/owner/repo.git",
+            "TRUST SURFACE: a transitive dep's [hosts.github] override must be dropped — the inner \
+             source must resolve to the builtin/consumer github.com, never the dep's redirect"
+        );
+        assert!(
+            !remote.contains("evil.example"),
+            "the resolved remote must not contain the dep-declared attacker host, got: {remote}"
+        );
+    }
+
+    #[test]
+    fn dep_top_level_protocol_does_not_influence_inner_resolution() {
+        let manifest = TransitiveManifest::parse(
+            "version = 1\n\
+             protocol = \"ssh\"\n\n\
+             [vars]\n\
+             editor = \"nvim\"\n\n\
+             [defaults]\n\
+             auto_target = false\n\n\
+             [sources.x]\n\
+             host = \"github\"\n\
+             repo = \"owner/repo\"\n",
+        )
+        .expect("a dep manifest with top-level vars/protocol/defaults is tolerated");
+
+        let inner = ParsedSource::parse(
+            "x",
+            manifest.sources.get("x").expect("dep source `x` present"),
+        )
+        .expect("inner host source parses");
+
+        let remote = inner_remote("x", &inner, &BTreeMap::new(), Some(Protocol::Https))
+            .expect("inner source resolves under the consumer's default protocol");
+
+        assert_eq!(
+            remote, "https://github.com/owner/repo.git",
+            "the dep's top-level protocol = \"ssh\" must be dropped, never merged: inner_remote \
+             must resolve under the CONSUMER default (https), yielding the https template"
+        );
     }
 
     #[test]
