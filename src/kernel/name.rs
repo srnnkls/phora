@@ -39,6 +39,12 @@ pub(crate) fn safe_relpath(path: &str) -> std::result::Result<&str, KernelError>
     Ok(path)
 }
 
+/// Last `/`-separated segment of a tree locator (the artifact name it yields).
+#[must_use]
+pub(crate) fn locator_basename(locator: &str) -> &str {
+    locator.rsplit('/').next().unwrap_or(locator)
+}
+
 /// A configured source identifier: the `[sources.<name>]` table key.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SourceName(String);

@@ -8,7 +8,8 @@ use thiserror::Error;
 
 use crate::config::{Refspec, TemplateOptIn};
 use crate::kernel::{
-    ArtifactName, Commit, Digest, KernelError, Selection, SourceName, safe_component,
+    ArtifactName, Commit, Digest, KernelError, Selection, SourceName, locator_basename,
+    safe_component,
 };
 use crate::store::ManifestFile;
 
@@ -419,14 +420,30 @@ impl SourceBackend for GitBackend {
                     path: PathBuf::from(name),
                 });
             }
-
-            let is_candidate = selection.selects_artifact(&name);
-            if !is_candidate {
+            let is_dir = matches!(entry.kind(), EntryKind::Tree);
+            if !selection.selects_top_level_artifact(&name, is_dir) {
                 continue;
             }
-            if matches!(entry.kind(), EntryKind::Tree) {
-                artifacts.push(ArtifactName::trusted(name));
+            artifacts.push(ArtifactName::trusted(name));
+        }
+
+        for locator in selection.nested_locators() {
+            let entry = subtree
+                .lookup_entry_by_path(Path::new(locator))
+                .map_err(|e| {
+                    SourceError::Source(format!(
+                        "locate nested selector {locator} in {source}: {e}"
+                    ))
+                })?
+                .ok_or_else(|| SourceError::ArtifactNotFound {
+                    artifact: locator.clone(),
+                })?;
+            if matches!(entry.mode().kind(), EntryKind::Link) {
+                return Err(SourceError::SymlinkNotAllowed {
+                    path: PathBuf::from(locator),
+                });
             }
+            artifacts.push(ArtifactName::trusted(locator_basename(locator).to_owned()));
         }
 
         artifacts.sort();
@@ -456,13 +473,47 @@ impl SourceBackend for GitBackend {
         if let Some(map) = req.path_map {
             walk.run_mapped(&root_tree, map)?;
         } else {
-            let artifact_tree = Self::lookup_subtree(
-                &repo,
-                &root_tree,
-                req.source.as_str(),
-                req.artifact.as_str(),
-            )?;
-            walk.run(&artifact_tree, Path::new(""))?;
+            let locator = Self::artifact_locator(req.selection, req.artifact.as_str());
+            let entry = root_tree
+                .lookup_entry_by_path(&locator)
+                .map_err(|e| {
+                    SourceError::Source(format!(
+                        "lookup artifact {} in {}: {e}",
+                        locator.display(),
+                        req.source.as_str()
+                    ))
+                })?
+                .ok_or_else(|| SourceError::ArtifactNotFound {
+                    artifact: req.artifact.as_str().to_owned(),
+                })?;
+            match entry.mode().kind() {
+                EntryKind::Tree => {
+                    let artifact_tree = repo.find_tree(entry.object_id()).map_err(|e| {
+                        SourceError::Source(format!(
+                            "artifact tree {} in {}: {e}",
+                            locator.display(),
+                            req.source.as_str()
+                        ))
+                    })?;
+                    walk.run(&artifact_tree, Path::new(""))?;
+                }
+                EntryKind::Blob | EntryKind::BlobExecutable => {
+                    let executable = entry.mode().kind() == EntryKind::BlobExecutable;
+                    let bytes =
+                        Self::find_blob_data(&repo, req.source.as_str(), entry.object_id())?;
+                    let source_rel = PathBuf::from(req.artifact.as_str());
+                    let deployed_rel = walk.renderer.deployed_rel(&source_rel);
+                    walk.stage_leaf(deployed_rel, &source_rel, &bytes, executable, true)?;
+                }
+                EntryKind::Link => {
+                    return Err(SourceError::SymlinkNotAllowed { path: locator });
+                }
+                EntryKind::Commit => {
+                    return Err(SourceError::ArtifactNotFound {
+                        artifact: req.artifact.as_str().to_owned(),
+                    });
+                }
+            }
         }
 
         let digest = format!("blake3:{}", walk.hasher.finalize().to_hex());
@@ -485,9 +536,31 @@ impl SourceBackend for GitBackend {
     ) -> Result<Vec<PathBuf>> {
         let repo = self.open_mirror(source.as_str(), url)?;
         let root_tree = Self::subtree_at_root(&repo, source.as_str(), commit, root)?;
-        let artifact_tree =
-            Self::lookup_subtree(&repo, &root_tree, source.as_str(), artifact.as_str())?;
+        let locator = Self::artifact_locator(selection, artifact.as_str());
+        let entry = root_tree
+            .lookup_entry_by_path(&locator)
+            .map_err(|e| {
+                SourceError::Source(format!(
+                    "lookup artifact {} in {}: {e}",
+                    locator.display(),
+                    source.as_str()
+                ))
+            })?
+            .ok_or_else(|| SourceError::ArtifactNotFound {
+                artifact: artifact.as_str().to_owned(),
+            })?;
 
+        if !matches!(entry.mode().kind(), EntryKind::Tree) {
+            return Ok(vec![PathBuf::from(artifact.as_str())]);
+        }
+
+        let artifact_tree = repo.find_tree(entry.object_id()).map_err(|e| {
+            SourceError::Source(format!(
+                "artifact tree {} in {}: {e}",
+                locator.display(),
+                source.as_str()
+            ))
+        })?;
         let mut files = Vec::new();
         Self::collect_files(
             &repo,
@@ -604,22 +677,12 @@ impl GitBackend {
         }
     }
 
-    fn lookup_subtree<'repo>(
-        repo: &'repo gix::Repository,
-        tree: &gix::Tree<'repo>,
-        source: &str,
-        artifact: &str,
-    ) -> Result<gix::Tree<'repo>> {
-        let entry = tree
-            .lookup_entry_by_path(Path::new(artifact))
-            .map_err(|e| {
-                SourceError::Source(format!("lookup artifact {artifact} in {source}: {e}"))
-            })?
-            .ok_or_else(|| SourceError::ArtifactNotFound {
-                artifact: artifact.to_string(),
-            })?;
-        repo.find_tree(entry.object_id())
-            .map_err(|e| SourceError::Source(format!("artifact tree {artifact} in {source}: {e}")))
+    fn artifact_locator(selection: &Selection, artifact: &str) -> PathBuf {
+        selection
+            .nested_locators()
+            .iter()
+            .find(|loc| locator_basename(loc) == artifact)
+            .map_or_else(|| PathBuf::from(artifact), PathBuf::from)
     }
 
     fn find_blob_data(repo: &gix::Repository, source: &str, oid: gix::ObjectId) -> Result<Vec<u8>> {
@@ -2593,6 +2656,270 @@ path = "srnnkls/tropos"
         );
     }
 
+    // ---- FPS-002: copy-mode discovery yields file + nested + dot-dir artifacts ----
+
+    const LOOSE_INIT_CONTENT: &[u8] = b"-- loose init\nreturn 1\n";
+    const NESTED_LEAF_CONTENT: &[u8] = b"deep nested leaf\n";
+
+    #[expect(
+        clippy::unwrap_used,
+        reason = "fixture setup fails loudly; git CLI is assumed present"
+    )]
+    fn build_loose_file_fixture() -> ExportFixture {
+        let src = TempDir::new().unwrap();
+        let src_path = src.path();
+        init_export_repo(src_path);
+
+        std::fs::write(src_path.join("init.lua"), LOOSE_INIT_CONTENT).unwrap();
+        std::fs::write(src_path.join("settings.json"), b"{\"a\":1}\n").unwrap();
+        std::fs::write(src_path.join("other.json"), b"{\"b\":2}\n").unwrap();
+        std::fs::write(src_path.join("README.md"), b"# readme\n").unwrap();
+        std::fs::write(src_path.join("run.sh"), b"#!/bin/sh\necho hi\n").unwrap();
+
+        std::fs::create_dir_all(src_path.join("a/b")).unwrap();
+        std::fs::write(src_path.join("a/b/c"), NESTED_LEAF_CONTENT).unwrap();
+
+        let editor = src_path.join("editor");
+        std::fs::create_dir_all(&editor).unwrap();
+        std::fs::write(editor.join("init.lua"), EDITOR_INIT_CONTENT).unwrap();
+
+        let zfunc = src_path.join(".zfunc");
+        std::fs::create_dir_all(&zfunc).unwrap();
+        std::fs::write(zfunc.join("_fn"), b"# zsh fn\n").unwrap();
+
+        run_git(src_path, &["add", "-A"]);
+        run_git(src_path, &["update-index", "--chmod=+x", "run.sh"]);
+
+        let commit = commit_export_repo(src_path);
+        export_fixture_from(src, commit)
+    }
+
+    #[expect(
+        clippy::unwrap_used,
+        reason = "fixture setup fails loudly; git CLI is assumed present"
+    )]
+    fn build_loose_symlink_fixture() -> ExportFixture {
+        let src = TempDir::new().unwrap();
+        let src_path = src.path();
+        init_export_repo(src_path);
+
+        std::fs::write(src_path.join("init.lua"), LOOSE_INIT_CONTENT).unwrap();
+        std::os::unix::fs::symlink("init.lua", src_path.join("dangle")).unwrap();
+        run_git(src_path, &["add", "-A"]);
+        let commit = commit_export_repo(src_path);
+        export_fixture_from(src, commit)
+    }
+
+    fn discover(fixture: &ExportFixture, m: &Selection) -> Result<Vec<ArtifactName>> {
+        fixture
+            .backend
+            .discover_artifacts(&sn("src"), &fixture.url, &fixture.commit, None, m)
+    }
+
+    #[test]
+    fn copy_discover_yields_loose_file_as_artifact() {
+        let fixture = build_loose_file_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+
+        let m = matcher(&["init.lua"], &[]);
+        let artifacts = discover(&fixture, &m).expect("discover succeeds");
+
+        assert_eq!(
+            artifacts,
+            vec![an("init.lua")],
+            "a loose top-level file matched by include must become an artifact, not be dropped"
+        );
+    }
+
+    #[test]
+    fn copy_discover_glob_pulls_loose_root_json_files() {
+        let fixture = build_loose_file_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+
+        let m = matcher(&["*.json"], &[]);
+        let artifacts = discover(&fixture, &m).expect("discover succeeds");
+
+        assert_eq!(
+            artifacts,
+            vec![an("other.json"), an("settings.json")],
+            "include=[\"*.json\"] at the source root must match loose root .json files (sorted)"
+        );
+    }
+
+    #[test]
+    fn copy_discover_nested_path_yields_basename_artifact() {
+        let fixture = build_loose_file_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+
+        let m = matcher(&["a/b/c"], &[]);
+        let artifacts = discover(&fixture, &m).expect("discover succeeds");
+
+        assert_eq!(
+            artifacts,
+            vec![an("c")],
+            "nested include a/b/c yields ONE artifact named by basename `c`, not the top dir `a`"
+        );
+    }
+
+    #[test]
+    fn copy_discover_excludes_nested_locator_by_path() {
+        let fixture = build_loose_file_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+
+        let m = matcher(&["a/b/c"], &["a/b/c"]);
+        let artifacts = discover(&fixture, &m).expect("discover succeeds");
+
+        assert!(
+            !artifacts.iter().any(|a| a.as_str() == "c"),
+            "exclude of the nested locator's full path must drop it; exclude wins, got {artifacts:?}"
+        );
+    }
+
+    #[test]
+    fn copy_discover_excludes_nested_locator_by_basename() {
+        let fixture = build_loose_file_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+
+        let m = matcher(&["a/b/c"], &["c"]);
+        let artifacts = discover(&fixture, &m).expect("discover succeeds");
+
+        assert!(
+            !artifacts.iter().any(|a| a.as_str() == "c"),
+            "exclude of the nested locator's basename must drop it; exclude wins, got {artifacts:?}"
+        );
+    }
+
+    #[test]
+    fn copy_discover_surfaces_included_dot_dir() {
+        let fixture = build_loose_file_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+
+        let m = matcher(&[".zfunc"], &[]);
+        let artifacts = discover(&fixture, &m).expect("discover succeeds");
+
+        assert!(
+            artifacts.iter().any(|a| a.as_str() == ".zfunc"),
+            "an explicitly-included top-level dot-dir must surface as an artifact, got {artifacts:?}"
+        );
+    }
+
+    #[test]
+    fn copy_discover_excludes_dot_dir_when_not_included() {
+        let fixture = build_loose_file_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+
+        let wild = matcher(&["*"], &[]);
+        let under_wildcard = discover(&fixture, &wild).expect("discover succeeds");
+        assert!(
+            !under_wildcard.iter().any(|a| a.as_str() == ".zfunc"),
+            "a wildcard include must NOT pull a dot-dir in; only the dot-opt-in guard keeps it out, got {under_wildcard:?}"
+        );
+
+        let explicit = matcher(&[".zfunc"], &[]);
+        let under_explicit = discover(&fixture, &explicit).expect("discover succeeds");
+        assert!(
+            under_explicit.iter().any(|a| a.as_str() == ".zfunc"),
+            "the same dot-dir MUST surface when explicitly included, proving the guard (not an include-mismatch) gated it, got {under_explicit:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_discover_executable_loose_file_exports_with_exec_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = build_loose_file_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+
+        let m = matcher(&["run.sh"], &[]);
+        let artifacts = discover(&fixture, &m).expect("discover succeeds");
+        assert_eq!(
+            artifacts,
+            vec![an("run.sh")],
+            "an executable loose file must be discovered as a file artifact"
+        );
+
+        let staging = TempDir::new().expect("staging dir");
+        export_named(
+            &fixture,
+            "run.sh",
+            staging.path(),
+            &m,
+            &ExportPolicy::default(),
+        )
+        .expect("export of the executable loose file succeeds");
+        let mode = std::fs::metadata(staging.path().join("run.sh"))
+            .expect("run.sh staged")
+            .permissions()
+            .mode();
+        assert!(
+            mode & 0o111 != 0,
+            "BlobExecutable must preserve the exec bit through file-artifact export, mode {mode:o}"
+        );
+    }
+
+    #[test]
+    fn copy_discover_refuses_included_symlink_blob() {
+        let fixture = build_loose_symlink_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+
+        let m = matcher(&["dangle"], &[]);
+        let err = discover(&fixture, &m)
+            .expect_err("a top-level symlink selected as a file artifact must be refused");
+        assert!(
+            matches!(err, SourceError::SymlinkNotAllowed { .. }),
+            "a symlink blob must be refused, not staged as a file artifact, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("dangle"),
+            "rejection must name the offending symlink `dangle`, got: {err}"
+        );
+    }
+
+    #[test]
+    fn copy_discover_dir_artifacts_unchanged() {
+        let fixture = build_loose_file_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+
+        let m = matcher(&["editor"], &[]);
+        let artifacts = discover(&fixture, &m).expect("discover succeeds");
+        assert_eq!(
+            artifacts,
+            vec![an("editor")],
+            "a plain dir-artifact selector still resolves to exactly the dir, basename name"
+        );
+    }
+
     // ---- export_artifact ----
 
     fn export_named(
@@ -3027,6 +3354,381 @@ path = "srnnkls/tropos"
             digest_a, digest_b,
             "the digest scope is the FULL effective vars map, not consumed-keys-only: adding a var \
              the template never references must still change vars_digest, got {digest_a:?} vs {digest_b:?}"
+        );
+    }
+
+    // ---- FPS-003: blob-aware file-artifact export (single staged file, render=true) ----
+
+    const TEMPLATED_LEAF_BODY: &[u8] = b"hello {{ name }}\n";
+    const TEMPLATED_LEAF_RENDERED: &[u8] = b"hello ada\n";
+
+    #[expect(
+        clippy::unwrap_used,
+        reason = "fixture setup fails loudly; git CLI is assumed present"
+    )]
+    fn build_templated_leaf_fixture() -> ExportFixture {
+        let src = TempDir::new().unwrap();
+        let src_path = src.path();
+        init_export_repo(src_path);
+
+        std::fs::write(src_path.join("agents.md.tmpl"), TEMPLATED_LEAF_BODY).unwrap();
+        run_git(src_path, &["add", "-A"]);
+        let commit = commit_export_repo(src_path);
+        export_fixture_from(src, commit)
+    }
+
+    fn vars_ada() -> BTreeMap<String, String> {
+        let mut vars = BTreeMap::new();
+        vars.insert("name".to_owned(), "ada".to_owned());
+        vars
+    }
+
+    fn export_file_artifact(
+        fixture: &ExportFixture,
+        artifact: &str,
+        staging: &Path,
+        m: &Selection,
+        opt_in: &TemplateOptIn,
+        vars: &BTreeMap<String, String>,
+    ) -> Result<ExportResult> {
+        let source = sn("src");
+        let artifact = an(artifact);
+        let req = ExportRequest {
+            source: &source,
+            url: &fixture.url,
+            commit: &fixture.commit,
+            root: None,
+            artifact: &artifact,
+            selection: m,
+            policy: &ExportPolicy::default(),
+            staging_dir: staging,
+            commit_time: EXPORT_COMMIT_TIME,
+            template_opt_in: opt_in,
+            vars,
+            path_map: None,
+        };
+        fixture.backend.export_artifact(&req)
+    }
+
+    #[test]
+    fn file_artifact_exports_exactly_one_file_with_source_bytes() {
+        let fixture = build_loose_file_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+        let staging = TempDir::new().expect("staging dir");
+
+        let m = matcher(&["init.lua"], &[]);
+        let result = export_file_artifact(
+            &fixture,
+            "init.lua",
+            staging.path(),
+            &m,
+            &TemplateOptIn::SuffixOnly,
+            &BTreeMap::new(),
+        )
+        .expect("a loose-file artifact must export, not error on lookup_subtree");
+
+        assert_eq!(
+            std::fs::read(staging.path().join("init.lua")).expect("init.lua staged"),
+            LOOSE_INIT_CONTENT,
+            "the single staged file must carry the exact source bytes of the loose blob"
+        );
+        let listed: Vec<String> = result
+            .files
+            .iter()
+            .map(|f| f.path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(
+            listed,
+            vec!["init.lua".to_string()],
+            "a file artifact stages exactly one file under its basename, not a tree walk, got {listed:?}"
+        );
+    }
+
+    #[test]
+    fn nested_file_artifact_exports_blob_at_deep_locator_under_basename() {
+        let fixture = build_loose_file_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+        let staging = TempDir::new().expect("staging dir");
+
+        let m = matcher(&["a/b/c"], &[]);
+        let result = export_file_artifact(
+            &fixture,
+            "c",
+            staging.path(),
+            &m,
+            &TemplateOptIn::SuffixOnly,
+            &BTreeMap::new(),
+        )
+        .expect("a nested file artifact must resolve the blob at a/b/c");
+
+        assert_eq!(
+            std::fs::read(staging.path().join("c")).expect("c staged at staging root"),
+            NESTED_LEAF_CONTENT,
+            "include=[\"a/b/c\"] must export the DEEP blob at a/b/c, named by basename `c`"
+        );
+        assert!(
+            !staging.path().join("a").exists(),
+            "the nested source path a/b must not be reproduced under staging"
+        );
+        let listed: Vec<String> = result
+            .files
+            .iter()
+            .map(|f| f.path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(
+            listed,
+            vec!["c".to_string()],
+            "the nested artifact stages exactly the basename `c`, not `a/b/c` and not a top-level `c`, got {listed:?}"
+        );
+    }
+
+    #[test]
+    fn templated_file_artifact_renders_with_render_true() {
+        let fixture = build_templated_leaf_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+        let staging = TempDir::new().expect("staging dir");
+
+        let m = matcher(&["agents.md.tmpl"], &[]);
+        let result = export_file_artifact(
+            &fixture,
+            "agents.md.tmpl",
+            staging.path(),
+            &m,
+            &TemplateOptIn::SuffixOnly,
+            &vars_ada(),
+        )
+        .expect("a templated file artifact must export");
+
+        assert_eq!(
+            std::fs::read(staging.path().join("agents.md")).expect("rendered file staged"),
+            TEMPLATED_LEAF_RENDERED,
+            "a `.tmpl` file artifact must RENDER (render=true, placeholder substituted) like a file \
+             inside a dir artifact, not be staged verbatim via the run_mapped render=false path"
+        );
+        assert!(
+            result.vars_digest.is_some(),
+            "a rendered file artifact must set vars_digest = Some (it consumed vars), got {:?}",
+            result.vars_digest
+        );
+    }
+
+    #[test]
+    fn map_leaf_of_same_templated_blob_stays_verbatim_render_false() {
+        let fixture = build_templated_leaf_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+        let staging = TempDir::new().expect("staging dir");
+
+        let source = sn("src");
+        let artifact = an("agents.md");
+        let m = matcher(&[], &[]);
+        let map = path_map(&[("agents.md.tmpl", "agents.md")]);
+        let req = ExportRequest {
+            source: &source,
+            url: &fixture.url,
+            commit: &fixture.commit,
+            root: None,
+            artifact: &artifact,
+            selection: &m,
+            policy: &ExportPolicy::default(),
+            staging_dir: staging.path(),
+            commit_time: EXPORT_COMMIT_TIME,
+            template_opt_in: &TemplateOptIn::SuffixOnly,
+            vars: &vars_ada(),
+            path_map: Some(&map),
+        };
+        let result = fixture
+            .backend
+            .export_artifact(&req)
+            .expect("mapped export succeeds");
+
+        assert_eq!(
+            std::fs::read(staging.path().join("agents.md")).expect("mapped file staged"),
+            TEMPLATED_LEAF_BODY,
+            "a `map` leaf of the SAME templated blob must stay VERBATIM (render=false): run_mapped \
+             never templates, pinning the file-artifact-vs-map render boundary"
+        );
+        assert_eq!(
+            result.vars_digest, None,
+            "a verbatim map leaf renders nothing, so vars_digest must be None, got {:?}",
+            result.vars_digest
+        );
+    }
+
+    #[test]
+    fn file_artifact_digest_is_blake3_deterministic_and_content_sensitive() {
+        let fixture = build_loose_file_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+
+        let m = matcher(&["init.lua"], &[]);
+        let staging_a = TempDir::new().expect("staging a");
+        let staging_b = TempDir::new().expect("staging b");
+        let digest_a = export_file_artifact(
+            &fixture,
+            "init.lua",
+            staging_a.path(),
+            &m,
+            &TemplateOptIn::SuffixOnly,
+            &BTreeMap::new(),
+        )
+        .expect("export a")
+        .digest;
+        let digest_b = export_file_artifact(
+            &fixture,
+            "init.lua",
+            staging_b.path(),
+            &m,
+            &TemplateOptIn::SuffixOnly,
+            &BTreeMap::new(),
+        )
+        .expect("export b")
+        .digest;
+
+        assert!(
+            digest_a.starts_with("blake3:"),
+            "a file-artifact digest must carry the blake3: prefix, got {digest_a}"
+        );
+        assert_eq!(
+            digest_a, digest_b,
+            "the same single blob must hash identically across exports, got {digest_a} vs {digest_b}"
+        );
+
+        let m_other = matcher(&["settings.json"], &[]);
+        let staging_c = TempDir::new().expect("staging c");
+        let digest_other = export_file_artifact(
+            &fixture,
+            "settings.json",
+            staging_c.path(),
+            &m_other,
+            &TemplateOptIn::SuffixOnly,
+            &BTreeMap::new(),
+        )
+        .expect("export other")
+        .digest;
+        assert_ne!(
+            digest_a, digest_other,
+            "a different blob's content must change the file-artifact digest, got {digest_a} vs {digest_other}"
+        );
+    }
+
+    #[test]
+    fn list_artifact_files_for_file_artifact_returns_only_the_basename() {
+        let fixture = build_loose_file_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+
+        let m = matcher(&["init.lua"], &[]);
+        let files = fixture
+            .backend
+            .list_artifact_files(
+                &sn("src"),
+                &fixture.url,
+                &fixture.commit,
+                None,
+                &an("init.lua"),
+                &m,
+            )
+            .expect("list_artifact_files must succeed for a file artifact, not require a subtree");
+
+        let listed: Vec<String> = files
+            .iter()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(
+            listed,
+            vec!["init.lua".to_string()],
+            "a file artifact lists exactly its single file by basename, no tree walk, got {listed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_artifact_export_preserves_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = build_loose_file_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+        let staging = TempDir::new().expect("staging dir");
+
+        let m = matcher(&["run.sh"], &[]);
+        export_file_artifact(
+            &fixture,
+            "run.sh",
+            staging.path(),
+            &m,
+            &TemplateOptIn::SuffixOnly,
+            &BTreeMap::new(),
+        )
+        .expect("executable file artifact must export");
+
+        let mode = std::fs::metadata(staging.path().join("run.sh"))
+            .expect("run.sh staged")
+            .permissions()
+            .mode();
+        assert!(
+            mode & 0o111 != 0,
+            "BlobExecutable must keep the exec bit through file-artifact export staging, mode {mode:o}"
+        );
+    }
+
+    #[test]
+    fn tree_artifact_export_is_unchanged_regression() {
+        let fixture = build_export_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+        let staging_a = TempDir::new().expect("staging a");
+        let staging_b = TempDir::new().expect("staging b");
+
+        let m = matcher(&[], &["**/*.bak"]);
+        let result_a = export_editor(&fixture, staging_a.path(), &m, &ExportPolicy::default())
+            .expect("dir-artifact export a");
+        let result_b = export_editor(&fixture, staging_b.path(), &m, &ExportPolicy::default())
+            .expect("dir-artifact export b");
+
+        assert_eq!(
+            result_a.digest, result_b.digest,
+            "the dir-artifact walk must remain deterministic and byte-identical after blob branching"
+        );
+        let mut files: Vec<String> = result_a
+            .files
+            .iter()
+            .map(|f| f.path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        files.sort();
+        assert_eq!(
+            files,
+            vec![
+                "bin/run.sh".to_string(),
+                "init.lua".to_string(),
+                "lua/opts.lua".to_string(),
+            ],
+            "a tree artifact still exports its full file set (bak excluded), unchanged, got {files:?}"
+        );
+        assert_eq!(
+            std::fs::read(staging_a.path().join("lua/opts.lua")).expect("nested opts staged"),
+            EDITOR_OPTS_CONTENT,
+            "nested tree contents must still materialize at their tree-relative path"
         );
     }
 

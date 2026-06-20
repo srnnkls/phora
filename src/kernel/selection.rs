@@ -16,6 +16,11 @@ pub struct Selection {
     path_include: Option<GlobSet>,
     path_exclude: GlobSet,
     dotfile_include: Option<GlobSet>,
+    /// Literal (non-glob) path-level includes, e.g. `a/b/c`: tree locators whose
+    /// basename names a file or directory artifact.
+    nested_locators: Vec<String>,
+    has_artifact_include: bool,
+    has_any_include: bool,
 }
 
 impl Selection {
@@ -30,13 +35,24 @@ impl Selection {
             .filter(|p| p.starts_with('.'))
             .cloned()
             .collect();
+        let artifact_exclude = Self::build_globset(&art_exc)?;
+        let path_exclude = Self::build_globset(&path_exc)?;
+        let nested_locators: Vec<String> = include
+            .iter()
+            .filter(|p| p.contains('/') && !Self::is_glob(p))
+            .filter(|p| !Self::locator_excluded(p, &path_exclude, &artifact_exclude))
+            .cloned()
+            .collect();
 
         Ok(Self {
             artifact_include: Self::build_globset_opt(&art_inc)?,
-            artifact_exclude: Self::build_globset(&art_exc)?,
+            artifact_exclude,
             path_include: Self::build_globset_opt(&path_inc)?,
-            path_exclude: Self::build_globset(&path_exc)?,
+            path_exclude,
             dotfile_include: Self::build_globset_opt(&dotfile)?,
+            nested_locators,
+            has_artifact_include: !art_inc.is_empty(),
+            has_any_include: !include.is_empty(),
         })
     }
 
@@ -60,6 +76,37 @@ impl Selection {
     /// separator or `**` is path-level.
     fn is_path_level(pattern: &str) -> bool {
         pattern.starts_with('/') || pattern.contains('/') || pattern.contains("**")
+    }
+
+    fn is_glob(pattern: &str) -> bool {
+        pattern.contains(['*', '?', '[', ']', '{', '}'])
+    }
+
+    fn locator_excluded(locator: &str, path_exclude: &GlobSet, artifact_exclude: &GlobSet) -> bool {
+        path_exclude.is_match(locator)
+            || artifact_exclude.is_match(crate::kernel::locator_basename(locator))
+    }
+
+    /// Literal nested include paths (`a/b/c`): tree locators that yield a
+    /// basename-named artifact.
+    #[must_use]
+    pub fn nested_locators(&self) -> &[String] {
+        &self.nested_locators
+    }
+
+    /// A top-level tree entry surfaces as an artifact under the artifact rules,
+    /// but never when the only includes are nested locators (those select by
+    /// their own paths, not by sweeping every sibling). A loose file surfaces
+    /// only once some include is given; match-all stays directory-only.
+    #[must_use]
+    pub fn selects_top_level_artifact(&self, name: &str, is_dir: bool) -> bool {
+        if !is_dir && !self.has_any_include {
+            return false;
+        }
+        if self.has_any_include && !self.has_artifact_include && !name.starts_with('.') {
+            return false;
+        }
+        self.selects_artifact(name)
     }
 
     /// Anchored (leading `/`): strip the slash, match from the artifact root.
@@ -251,5 +298,37 @@ mod tests {
         let sel = selection(&[], &["**/*.bak"]);
         assert!(file(&sel, "foo.json"));
         assert!(file(&sel, "sub/foo.json"));
+    }
+
+    // ---- exclude gates nested locators ----
+
+    #[test]
+    fn nested_locator_dropped_when_full_path_excluded() {
+        let sel = selection(&["a/b/c"], &["a/b/c"]);
+        assert!(
+            sel.nested_locators().is_empty(),
+            "exclude of the locator's full path must drop it; exclude always wins, got {:?}",
+            sel.nested_locators()
+        );
+    }
+
+    #[test]
+    fn nested_locator_dropped_when_basename_excluded() {
+        let sel = selection(&["a/b/c"], &["c"]);
+        assert!(
+            sel.nested_locators().is_empty(),
+            "exclude of the locator's basename must drop it; exclude always wins, got {:?}",
+            sel.nested_locators()
+        );
+    }
+
+    #[test]
+    fn nested_locator_survives_unrelated_exclude() {
+        let sel = selection(&["a/b/c"], &["d"]);
+        assert_eq!(
+            sel.nested_locators(),
+            &["a/b/c".to_string()],
+            "an unrelated exclude must not drop the locator"
+        );
     }
 }

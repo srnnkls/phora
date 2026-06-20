@@ -2,13 +2,14 @@ use std::path::Path;
 
 use crate::config::{DeployMode, ParsedSource};
 use crate::error::{Error, Result};
-use crate::kernel::{ArtifactName, Selection, SourceName};
+use crate::kernel::{ArtifactName, Selection, SourceName, locator_basename};
 use crate::source::SourceBackend;
 
-/// Discover artifact directories by scanning the live working tree at
-/// `<git>/<root>` (Link mode). Mirrors the ODB `discover_artifacts`: only
-/// directory entries become artifacts, `Selection` gates inclusion (the dotfile
-/// opt-in lives there), and the result is sorted. A missing path/root is an error.
+/// Discover artifacts by scanning the live working tree at `<git>/<root>` (Link
+/// mode). Mirrors the ODB `discover_artifacts`: directories, matched loose files,
+/// and nested locators (named by basename) become artifacts; `Selection` gates
+/// inclusion (the dotfile opt-in lives there); the result is sorted. A selected
+/// symlink is refused. A missing path/root is an error.
 pub(super) fn discover_working_tree(
     git: &Path,
     root: Option<&Path>,
@@ -23,12 +24,38 @@ pub(super) fn discover_working_tree(
         let entry =
             entry.map_err(|e| Error::Sync(format!("read entry in {}: {e}", base.display())))?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !selection.selects_artifact(&name) {
+        let file_type = entry
+            .file_type()
+            .map_err(|e| Error::Sync(format!("file_type for {name} in {}: {e}", base.display())))?;
+        if !selection.selects_top_level_artifact(&name, file_type.is_dir()) {
             continue;
         }
-        if entry.file_type()?.is_dir() {
-            artifacts.push(ArtifactName::trusted(name));
+        if file_type.is_symlink() {
+            return Err(Error::SymlinkNotAllowed { path: name.into() });
         }
+        artifacts.push(ArtifactName::trusted(name));
+    }
+
+    for locator in selection.nested_locators() {
+        let leaf = base.join(locator);
+        let meta = std::fs::symlink_metadata(&leaf).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Error::SourceCtx(crate::source::SourceError::ArtifactNotFound {
+                    artifact: locator.clone(),
+                })
+            } else {
+                Error::Sync(format!(
+                    "locate nested selector {locator} in {}: {e}",
+                    base.display()
+                ))
+            }
+        })?;
+        if meta.file_type().is_symlink() {
+            return Err(Error::SymlinkNotAllowed {
+                path: locator.into(),
+            });
+        }
+        artifacts.push(ArtifactName::trusted(locator_basename(locator)));
     }
 
     artifacts.sort();
@@ -49,5 +76,171 @@ pub(super) fn discover_artifacts_for_source(
         DeployMode::Copy => {
             Ok(backend.discover_artifacts(source_name, git, commit, root, selection)?)
         }
+    }
+}
+
+#[cfg(test)]
+mod fps002_link_discovery {
+    use super::discover_working_tree;
+    use crate::error::Error;
+    use crate::kernel::{ArtifactName, Selection};
+    use tempfile::TempDir;
+
+    fn an(name: &str) -> ArtifactName {
+        ArtifactName::trusted(name)
+    }
+
+    fn selection(include: &[&str], exclude: &[&str]) -> Selection {
+        let inc: Vec<String> = include.iter().map(|s| (*s).to_string()).collect();
+        let exc: Vec<String> = exclude.iter().map(|s| (*s).to_string()).collect();
+        Selection::new(&inc, &exc).expect("patterns build into a selection")
+    }
+
+    fn tree_with_loose_files() -> TempDir {
+        let dir = TempDir::new().expect("working tree tempdir");
+        let p = dir.path();
+        std::fs::write(p.join("init.lua"), b"-- init\n").expect("write init.lua");
+        std::fs::write(p.join("settings.json"), b"{}\n").expect("write settings.json");
+        std::fs::write(p.join("notes.md"), b"# notes\n").expect("write notes.md");
+        std::fs::create_dir_all(p.join("a/b")).expect("create a/b");
+        std::fs::write(p.join("a/b/c"), b"leaf\n").expect("write a/b/c");
+        std::fs::create_dir_all(p.join("editor")).expect("create editor");
+        std::fs::write(p.join("editor/init.lua"), b"-- ed\n").expect("write editor file");
+        std::fs::create_dir_all(p.join(".zfunc")).expect("create .zfunc");
+        std::fs::write(p.join(".zfunc/_fn"), b"# fn\n").expect("write zfunc file");
+        dir
+    }
+
+    #[test]
+    fn link_discover_yields_loose_file_as_artifact() {
+        let tree = tree_with_loose_files();
+        let sel = selection(&["init.lua"], &[]);
+        let artifacts = discover_working_tree(tree.path(), None, &sel).expect("discover succeeds");
+        assert_eq!(
+            artifacts,
+            vec![an("init.lua")],
+            "link-mode discovery must yield a loose file artifact, not drop it"
+        );
+    }
+
+    #[test]
+    fn link_discover_glob_pulls_loose_root_json_files() {
+        let tree = tree_with_loose_files();
+        let sel = selection(&["*.json"], &[]);
+        let artifacts = discover_working_tree(tree.path(), None, &sel).expect("discover succeeds");
+        assert_eq!(
+            artifacts,
+            vec![an("settings.json")],
+            "include=[\"*.json\"] must match the loose root settings.json"
+        );
+    }
+
+    #[test]
+    fn link_discover_nested_path_yields_basename_artifact() {
+        let tree = tree_with_loose_files();
+        let sel = selection(&["a/b/c"], &[]);
+        let artifacts = discover_working_tree(tree.path(), None, &sel).expect("discover succeeds");
+        assert_eq!(
+            artifacts,
+            vec![an("c")],
+            "nested include a/b/c yields ONE artifact named `c` (basename), not `a`"
+        );
+    }
+
+    #[test]
+    fn link_discover_surfaces_included_dot_dir() {
+        let tree = tree_with_loose_files();
+        let sel = selection(&[".zfunc"], &[]);
+        let artifacts = discover_working_tree(tree.path(), None, &sel).expect("discover succeeds");
+        assert!(
+            artifacts.iter().any(|a| a.as_str() == ".zfunc"),
+            "explicitly-included dot-dir must surface, got {artifacts:?}"
+        );
+    }
+
+    #[test]
+    fn link_discover_excludes_dot_dir_when_not_included() {
+        let tree = tree_with_loose_files();
+        let sel = selection(&["init.lua"], &[]);
+        let artifacts = discover_working_tree(tree.path(), None, &sel).expect("discover succeeds");
+        assert!(
+            !artifacts.iter().any(|a| a.as_str() == ".zfunc"),
+            "dot-dir stays excluded unless explicitly included, got {artifacts:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_discover_refuses_included_symlink() {
+        let tree = tree_with_loose_files();
+        std::os::unix::fs::symlink("init.lua", tree.path().join("dangle")).expect("create symlink");
+        let sel = selection(&["dangle"], &[]);
+        let err = discover_working_tree(tree.path(), None, &sel)
+            .expect_err("a symlink selected as a file artifact must be refused");
+        assert!(
+            matches!(
+                err,
+                Error::SymlinkNotAllowed { .. }
+                    | Error::SourceCtx(crate::source::SourceError::SymlinkNotAllowed { .. })
+            ),
+            "refusal must be the symlink variant, not some unrelated error, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("dangle"),
+            "rejection must name the offending symlink `dangle`, got: {err}"
+        );
+    }
+
+    #[test]
+    fn link_discover_excludes_nested_locator_by_path() {
+        let tree = tree_with_loose_files();
+        let sel = selection(&["a/b/c"], &["a/b/c"]);
+        let artifacts = discover_working_tree(tree.path(), None, &sel).expect("discover succeeds");
+        assert!(
+            !artifacts.iter().any(|a| a.as_str() == "c"),
+            "exclude of the nested locator's full path must drop it; exclude wins, got {artifacts:?}"
+        );
+    }
+
+    #[test]
+    fn link_discover_excludes_nested_locator_by_basename() {
+        let tree = tree_with_loose_files();
+        let sel = selection(&["a/b/c"], &["c"]);
+        let artifacts = discover_working_tree(tree.path(), None, &sel).expect("discover succeeds");
+        assert!(
+            !artifacts.iter().any(|a| a.as_str() == "c"),
+            "exclude of the nested locator's basename must drop it; exclude wins, got {artifacts:?}"
+        );
+    }
+
+    #[test]
+    fn link_discover_missing_nested_locator_is_not_found_not_io() {
+        let tree = tree_with_loose_files();
+        let sel = selection(&["a/b/missing"], &[]);
+        let err = discover_working_tree(tree.path(), None, &sel)
+            .expect_err("a nested locator whose path is absent must error");
+        assert!(
+            matches!(
+                err,
+                Error::SourceCtx(crate::source::SourceError::ArtifactNotFound { .. })
+            ),
+            "an absent locator must be a not-found error, not a generic Sync I/O error, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("a/b/missing"),
+            "the not-found error must name the missing locator, got: {err}"
+        );
+    }
+
+    #[test]
+    fn link_discover_dir_artifacts_unchanged() {
+        let tree = tree_with_loose_files();
+        let sel = selection(&["editor"], &[]);
+        let artifacts = discover_working_tree(tree.path(), None, &sel).expect("discover succeeds");
+        assert_eq!(
+            artifacts,
+            vec![an("editor")],
+            "a plain dir-artifact selector still resolves to the dir"
+        );
     }
 }
