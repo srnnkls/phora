@@ -125,9 +125,14 @@ fn lock_hit<'l>(
         .filter(|l| entry_matches(source, &unit.effective_ref, l, &config.hosts, protocol))
 }
 
-fn frozen_miss(name: &str) -> crate::error::Error {
+fn frozen_miss(name: &str, transitive: bool) -> crate::error::Error {
+    let kind = if transitive {
+        "transitive source"
+    } else {
+        "source"
+    };
     crate::error::Error::Lock(format!(
-        "source `{name}` is not pinned in the lock; --frozen refuses to fetch or re-resolve"
+        "{kind} `{name}` is not pinned in the lock; --frozen refuses to fetch or re-resolve"
     ))
 }
 
@@ -177,7 +182,9 @@ fn resolve_unit(
     let discriminator = ref_discriminator(&unit.effective_ref, &source.refspec());
     let commit = match lock_hit(config, source, unit, effective_lock, force) {
         Some(l) => l.commit.clone(),
-        None if frozen => return Err(frozen_miss(&unit.name)),
+        None if frozen => {
+            return Err(frozen_miss(&unit.name, instances.contains_key(&unit.name)));
+        }
         None => backend.resolve(&source_name, git, &unit.effective_ref)?,
     };
 
