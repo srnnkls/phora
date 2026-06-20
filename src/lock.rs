@@ -17,6 +17,10 @@ pub struct Lock {
     /// Skip-serialized when empty so a no-transitive lock stays byte-identical to v1.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trusted_hooks: Vec<TrustedHook>,
+    /// Discovered-but-untrusted transitive hooks, surfaced with their commit-bound preimage so a
+    /// consumer can pin an approval; carries no trust. Skip-serialized when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidate_hooks: Vec<CandidateHookRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +29,14 @@ pub struct TrustedHook {
     pub hook_id: String,
     pub preimage: String,
     pub approved_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CandidateHookRecord {
+    pub dep_instance: String,
+    pub hook_id: String,
+    pub preimage: String,
+    pub command: String,
 }
 
 impl Lock {
@@ -162,11 +174,13 @@ pub fn split_locks(
         version: LOCK_SCHEMA_VERSION,
         sources: base,
         trusted_hooks: Vec::new(),
+        candidate_hooks: Vec::new(),
     };
     let local_lock = (!local.is_empty()).then_some(Lock {
         version: LOCK_SCHEMA_VERSION,
         sources: local,
         trusted_hooks: Vec::new(),
+        candidate_hooks: Vec::new(),
     });
     (base_lock, local_lock)
 }
@@ -232,6 +246,7 @@ mod tests {
                 ),
             ],
             trusted_hooks: Vec::new(),
+            candidate_hooks: Vec::new(),
         };
 
         let text = toml::to_string(&lock).expect("lock serializes to toml");
@@ -259,6 +274,7 @@ mod tests {
                 "main",
             )],
             trusted_hooks: Vec::new(),
+            candidate_hooks: Vec::new(),
         };
 
         let text = toml::to_string(&lock).expect("lock serializes to toml");
@@ -295,11 +311,13 @@ mod tests {
                 "v1.0",
             )],
             trusted_hooks: Vec::new(),
+            candidate_hooks: Vec::new(),
         };
         let local = Lock {
             version: 1,
             sources: vec![locked("loqui", "/home/soeren/dev/loqui", "main")],
             trusted_hooks: Vec::new(),
+            candidate_hooks: Vec::new(),
         };
 
         let merged = merge_locks(&base, Some(&local));
@@ -324,11 +342,13 @@ mod tests {
                 "main",
             )],
             trusted_hooks: Vec::new(),
+            candidate_hooks: Vec::new(),
         };
         let local = Lock {
             version: 1,
             sources: vec![locked("extra", "/home/soeren/dev/extra", "main")],
             trusted_hooks: Vec::new(),
+            candidate_hooks: Vec::new(),
         };
 
         let merged = merge_locks(&base, Some(&local));
@@ -822,6 +842,7 @@ config_digest = \"PLACEHOLDER\"
                 },
             ],
             trusted_hooks: Vec::new(),
+            candidate_hooks: Vec::new(),
         };
         // Local overrides only the v0.56.0 split (e.g. repointed at a local checkout).
         let local = Lock {
@@ -837,6 +858,7 @@ config_digest = \"PLACEHOLDER\"
                 instance: None,
             }],
             trusted_hooks: Vec::new(),
+            candidate_hooks: Vec::new(),
         };
 
         let merged = merge_locks(&base, Some(&local));
@@ -1162,6 +1184,7 @@ config_digest = \"blake3:cfg\"
                 "main",
             )],
             trusted_hooks: Vec::new(),
+            candidate_hooks: Vec::new(),
         };
 
         let text = toml::to_string(&lock).expect("lock serializes to toml");
@@ -1207,6 +1230,7 @@ config_digest = \"blake3:cfg\"
                 "deadbeefcafe0001",
             )],
             trusted_hooks: Vec::new(),
+            candidate_hooks: Vec::new(),
         };
 
         let text = toml::to_string(&lock).expect("a transitive-node lock serializes");
@@ -1228,6 +1252,7 @@ config_digest = \"blake3:cfg\"
                 "main",
             )],
             trusted_hooks: Vec::new(),
+            candidate_hooks: Vec::new(),
         };
 
         let text = toml::to_string(&lock).expect("a consumer-root lock serializes");
@@ -1250,6 +1275,7 @@ config_digest = \"blake3:cfg\"
                 "owninginstance01",
             )],
             trusted_hooks: Vec::new(),
+            candidate_hooks: Vec::new(),
         };
 
         let text = toml::to_string(&lock).expect("transitive lock serializes");
@@ -1273,6 +1299,7 @@ config_digest = \"blake3:cfg\"
                 preimage: "blake3:hookpreimage".to_owned(),
                 approved_at: "2026-06-20T00:00:00Z".to_owned(),
             }],
+            candidate_hooks: Vec::new(),
         };
 
         let text = toml::to_string(&lock).expect("a lock with trusted hooks serializes");
@@ -1299,6 +1326,7 @@ config_digest = \"blake3:cfg\"
                 "main",
             )],
             trusted_hooks: Vec::new(),
+            candidate_hooks: Vec::new(),
         };
 
         let text = toml::to_string(&lock).expect("a lock with no trusted hooks serializes");
@@ -1329,6 +1357,7 @@ config_digest = \"blake3:cfg\"
                 ),
             ],
             trusted_hooks: Vec::new(),
+            candidate_hooks: Vec::new(),
         };
 
         let merged = merge_locks(&base, None);
@@ -1366,6 +1395,7 @@ config_digest = \"blake3:cfg\"
                     approved_at: "2026-01-01T00:00:00Z".to_owned(),
                 },
             ],
+            candidate_hooks: Vec::new(),
         };
         let local = Lock {
             version: LOCK_SCHEMA_VERSION,
@@ -1376,6 +1406,7 @@ config_digest = \"blake3:cfg\"
                 preimage: "blake3:new".to_owned(),
                 approved_at: "2026-06-20T00:00:00Z".to_owned(),
             }],
+            candidate_hooks: Vec::new(),
         };
 
         let merged = merge_locks(&base, Some(&local));

@@ -67,6 +67,8 @@ pub struct SyncInput<'a> {
     pub interactive: bool,
     pub prune: bool,
     pub no_hooks: bool,
+    /// Suppress transitive (composed-dep) hooks only; the consumer's own hooks still run.
+    pub no_transitive_hooks: bool,
     /// Refuse to fetch or re-resolve: a source absent from or drifted in the lock hard-errors.
     pub frozen: bool,
     pub resolver: Option<&'a dyn ConflictResolver>,
@@ -169,6 +171,125 @@ pub(super) fn nonce() -> u64 {
     COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Trust comes ONLY from `trusted_hooks`; a `candidate_hooks` record grants none (anti-TOFU).
+fn trusted_preimages(effective_lock: Option<&Lock>) -> BTreeSet<String> {
+    let Some(lock) = effective_lock else {
+        return BTreeSet::new();
+    };
+    lock.trusted_hooks
+        .iter()
+        .map(|h| h.preimage.clone())
+        .collect()
+}
+
+fn take_hook_candidates(
+    graph: &mut transitive::ResolvedGraph,
+) -> Vec<transitive::TransitiveHookCandidate> {
+    for diagnostic in std::mem::take(&mut graph.hook_diagnostics) {
+        eprintln!("phora: {diagnostic}");
+    }
+    std::mem::take(&mut graph.hook_candidates)
+}
+
+/// Surfaces every interpreted transitive hook in the lock with its commit-bound preimage so a
+/// consumer can pin an approval; recording grants no trust on its own.
+fn record_candidate_hooks(
+    base_lock: &mut Lock,
+    candidates: &[transitive::TransitiveHookCandidate],
+) {
+    base_lock.candidate_hooks = candidates
+        .iter()
+        .map(|c| crate::lock::CandidateHookRecord {
+            dep_instance: c.dep_instance.clone(),
+            hook_id: c.hook_id.clone(),
+            preimage: c.preimage.clone(),
+            command: c.command.run.clone(),
+        })
+        .collect();
+}
+
+/// Runs the trusted transitive hooks and appends any newly-approved (interactive) ones to the
+/// consumer lock's `trusted_hooks`.
+fn decide_transitive_hooks(
+    base_lock: &mut Lock,
+    candidates: &[transitive::TransitiveHookCandidate],
+    effective_lock: Option<&Lock>,
+    interactive: bool,
+) -> Result<Vec<hooks::HookOutcome>> {
+    let trusted = trusted_preimages(effective_lock);
+    let runs: Vec<hooks::TransitiveHookRun<'_>> = candidates
+        .iter()
+        .map(|c| hooks::TransitiveHookRun {
+            dep_instance: &c.dep_instance,
+            hook_id: &c.hook_id,
+            command: &c.command,
+            preimage: &c.preimage,
+            target_path: &c.target_path,
+        })
+        .collect();
+    let (outcomes, approvals) = hooks::dispatch_transitive_hooks(&runs, &trusted, interactive)?;
+    let now = chrono::Utc::now().to_rfc3339();
+    for approval in approvals {
+        base_lock.trusted_hooks.push(crate::lock::TrustedHook {
+            dep_instance: approval.dep_instance,
+            hook_id: approval.hook_id,
+            preimage: approval.preimage,
+            approved_at: now.clone(),
+        });
+    }
+    Ok(outcomes)
+}
+
+struct DeployAll<'a> {
+    config: &'a Config,
+    parsed: &'a BTreeMap<String, ParsedSource>,
+    remotes: &'a BTreeMap<String, String>,
+    resolved_commits: &'a BTreeMap<(String, String), String>,
+    protected: &'a confine::ProtectedPathSet,
+    input: &'a SyncInput<'a>,
+    backend: &'a (dyn SourceBackend + Sync),
+    registry: &'a dyn Registry,
+    journal: &'a Journal,
+}
+
+fn deploy_all_targets(ctx: &DeployAll<'_>) -> Result<bool> {
+    let mut had_failures = false;
+    for (target_name, target) in &ctx.config.targets {
+        had_failures |= deploy_target(
+            TargetRun {
+                parsed: ctx.parsed,
+                target_name,
+                target,
+                commits: ctx.resolved_commits,
+                remotes: ctx.remotes,
+                force: ctx.input.force,
+                interactive: ctx.input.interactive,
+                resolver: ctx.input.resolver,
+                vars: &ctx.config.vars,
+                protected: ctx.protected,
+            },
+            ctx.backend,
+            ctx.registry,
+            ctx.journal,
+        )?;
+    }
+    Ok(had_failures)
+}
+
+fn sweep_target_parents(config: &Config, journal: &Journal, registry: &dyn Registry) -> Result<()> {
+    let mut swept_parents: BTreeSet<PathBuf> = BTreeSet::new();
+    for target in config.targets.values() {
+        let parent = match &target.confine {
+            Some(anchor) => anchor.clone(),
+            None => target_parent(&target.expanded_path()),
+        };
+        if swept_parents.insert(parent.clone()) {
+            recovery_sweep(&parent, journal, registry)?;
+        }
+    }
+    Ok(())
+}
+
 fn effective_lock(input: &SyncInput<'_>) -> Option<Lock> {
     match (&input.base_lock, &input.local_lock) {
         (Some(base), local) => Some(merge_locks(base, local.as_ref())),
@@ -188,13 +309,14 @@ pub fn sync(
     let mut parsed = effective_config.parsed_sources()?;
     let mut remotes = resolved_remotes(&effective_config, &parsed)?;
     let effective_lock = effective_lock(input);
-    let graph = transitive::resolve_transitive_graph(
+    let mut graph = transitive::resolve_transitive_graph(
         &effective_config,
         &parsed,
         backend,
         input.frozen,
         effective_lock.as_ref(),
     )?;
+    let hook_candidates = take_hook_candidates(&mut graph);
     let instances = graph.inject(&mut effective_config, &mut parsed, &mut remotes);
     for warning in validate_link_mode(input.base_config, &parsed, &remotes)? {
         eprintln!("phora: {warning}");
@@ -210,16 +332,7 @@ pub fn sync(
         .map_err(|e| Error::Sync(format!("resolve current dir for confinement: {e}")))?;
     let protected = confine::ProtectedPathSet::resolve(&cwd)?;
 
-    let mut swept_parents: BTreeSet<PathBuf> = BTreeSet::new();
-    for target in effective_config.targets.values() {
-        let parent = match &target.confine {
-            Some(anchor) => anchor.clone(),
-            None => target_parent(&target.expanded_path()),
-        };
-        if swept_parents.insert(parent.clone()) {
-            recovery_sweep(&parent, &journal, registry)?;
-        }
-    }
+    sweep_target_parents(&effective_config, &journal, registry)?;
 
     let (routed, resolved_commits) = resolve_sources(
         &effective_config,
@@ -232,29 +345,23 @@ pub fn sync(
         input.frozen,
         input.jobs,
     )?;
-    let (base_lock, local_lock) = split_locks(routed, &local_names);
+    let (mut base_lock, local_lock) = split_locks(routed, &local_names);
+    base_lock.trusted_hooks = effective_lock
+        .as_ref()
+        .map(|lock| lock.trusted_hooks.clone())
+        .unwrap_or_default();
 
-    let mut had_failures = false;
-
-    for (target_name, target) in &effective_config.targets {
-        had_failures |= deploy_target(
-            TargetRun {
-                parsed: &parsed,
-                target_name,
-                target,
-                commits: &resolved_commits,
-                remotes: &remotes,
-                force: input.force,
-                interactive: input.interactive,
-                resolver: input.resolver,
-                vars: &effective_config.vars,
-                protected: &protected,
-            },
-            backend,
-            registry,
-            &journal,
-        )?;
-    }
+    let mut had_failures = deploy_all_targets(&DeployAll {
+        config: &effective_config,
+        parsed: &parsed,
+        remotes: &remotes,
+        resolved_commits: &resolved_commits,
+        protected: &protected,
+        input,
+        backend,
+        registry,
+        journal: &journal,
+    })?;
 
     if input.prune {
         if had_failures {
@@ -272,11 +379,21 @@ pub fn sync(
         }
     }
 
-    let hook_results = if input.no_hooks {
+    let mut hook_results = if input.no_hooks {
         Vec::new()
     } else {
         hooks::dispatch_hooks(&effective_config, registry)?
     };
+    record_candidate_hooks(&mut base_lock, &hook_candidates);
+    if !input.no_hooks && !input.no_transitive_hooks {
+        let mut outcomes = decide_transitive_hooks(
+            &mut base_lock,
+            &hook_candidates,
+            effective_lock.as_ref(),
+            input.interactive,
+        )?;
+        hook_results.append(&mut outcomes);
+    }
     let deploy_failures = had_failures;
     had_failures |= hook_results
         .iter()

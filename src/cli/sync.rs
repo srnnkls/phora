@@ -21,6 +21,7 @@ pub(super) fn run_sync(
     prune: bool,
     force: bool,
     no_hooks: bool,
+    no_transitive_hooks: bool,
     frozen: bool,
     drop: Option<DropSources>,
     jobs: Option<usize>,
@@ -52,6 +53,7 @@ pub(super) fn run_sync(
             interactive,
             prune,
             no_hooks,
+            no_transitive_hooks,
             frozen,
             resolver: interactive.then_some(&resolver as &dyn ConflictResolver),
             jobs,
@@ -131,7 +133,7 @@ pub(super) fn run_rebuild_registry() -> Result<()> {
 
 pub(super) fn run_update(source: Option<&str>) -> Result<()> {
     let drop = source.map_or(DropSources::All, |s| DropSources::One(s.to_owned()));
-    run_sync(false, false, false, false, Some(drop), None)
+    run_sync(false, false, false, false, false, Some(drop), None)
 }
 
 /// Writes the base lock to `<dir>/phora.lock` and, when `local` is `Some`, the

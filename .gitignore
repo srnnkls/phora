@@ -4,3 +4,7 @@
 /scopes/
 
 /resources/
+
+# phora is the tool itself, not a managed dotfiles dir — a root lock is always spurious
+/phora.lock
+/phora.local.lock

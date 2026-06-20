@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 
 use crate::config::transitive::{FetchNode, Instance, TransitiveManifest};
 use crate::config::{
-    Binding, Config, DeployMode, ParsedSource, Refspec, Remote, SourceMode, Target,
+    Binding, Config, DeployMode, HookCommand, ParsedSource, Refspec, Remote, SourceMode, Target,
+    admit_transitive_hooks_checked, hook_preimage,
 };
 use crate::error::{Error, Result};
 use crate::kernel::{SourceName, safe_component};
@@ -31,6 +32,16 @@ pub(super) struct ComposedTarget {
     pub(super) target: Target,
 }
 
+/// An interpreted transitive `on_change` hook pinned to its dep's resolved commit, awaiting
+/// the consumer trust decision in [`sync`](super::sync). Stripped from the deployed target.
+pub(super) struct TransitiveHookCandidate {
+    pub(super) dep_instance: String,
+    pub(super) hook_id: String,
+    pub(super) command: HookCommand,
+    pub(super) preimage: String,
+    pub(super) target_path: PathBuf,
+}
+
 /// The transitive pre-pass output: composed targets plus the namespaced source
 /// instances (and their resolved remotes) those targets bind.
 #[derive(Default)]
@@ -41,6 +52,8 @@ pub(super) struct ResolvedGraph {
     /// Namespaced source name → owning `Instance.stable_key()`; the lock stamps this so
     /// a transitive node is keyed by its instance, not a bare name that never lines up.
     pub(super) instances: BTreeMap<String, String>,
+    pub(super) hook_candidates: Vec<TransitiveHookCandidate>,
+    pub(super) hook_diagnostics: Vec<String>,
 }
 
 impl ResolvedGraph {
@@ -233,13 +246,22 @@ fn compose_dep(
             imported,
             dep_target_name,
             dep_target,
-            composed_path,
+            composed_path.clone(),
             anchor_path.clone(),
             &source_names,
         )?;
         *ctx.counter += 1;
+        let composed_name = namespaced_key(instance, dep_target_name, *ctx.counter);
+        admit_hook_candidates(
+            instance,
+            manifest,
+            dep_target_name,
+            &composed_name,
+            &composed_path,
+            ctx,
+        );
         ctx.graph.targets.push(ComposedTarget {
-            name: namespaced_key(instance, dep_target_name, *ctx.counter),
+            name: composed_name,
             target: synthetic,
         });
     }
@@ -406,6 +428,34 @@ fn reject_frozen_drift(name: &str, locked: &str, resolved: &str, depth: usize) -
 
 fn namespaced_key(instance: &Instance, name: &str, counter: usize) -> String {
     format!("{}%{counter}%{name}", instance.stable_key())
+}
+
+/// Interprets the dep target's stripped `on_change` hooks into commit-pinned candidates the
+/// trust decision in [`sync`](super::sync) consumes, recording any parse-failure diagnostic.
+fn admit_hook_candidates(
+    instance: &Instance,
+    manifest: &TransitiveManifest,
+    dep_target_name: &str,
+    composed_name: &str,
+    composed_path: &Path,
+    ctx: &mut WalkCtx<'_>,
+) {
+    let Some(opaque) = manifest.hooks() else {
+        return;
+    };
+    let (candidates, diagnostics) =
+        admit_transitive_hooks_checked(opaque, dep_target_name, composed_name, instance);
+    ctx.graph.hook_diagnostics.extend(diagnostics);
+    let commit = instance.fetch_node().commit();
+    for candidate in candidates {
+        ctx.graph.hook_candidates.push(TransitiveHookCandidate {
+            preimage: hook_preimage(&candidate.command, "on_change", commit),
+            dep_instance: candidate.dep_instance,
+            hook_id: candidate.hook_id,
+            command: candidate.command,
+            target_path: composed_path.to_path_buf(),
+        });
+    }
 }
 
 fn synthetic_target(
@@ -676,6 +726,7 @@ mod tests {
             version: crate::lock::LOCK_SCHEMA_VERSION,
             sources,
             trusted_hooks: Vec::new(),
+            candidate_hooks: Vec::new(),
         }
     }
 

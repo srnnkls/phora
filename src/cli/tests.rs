@@ -104,6 +104,41 @@ fn sync_without_no_hooks_flag_defaults_to_false() {
 }
 
 #[test]
+fn sync_no_transitive_hooks_flag_parses_to_true() {
+    use clap::Parser;
+    let cli = Cli::try_parse_from(["phora", "sync", "--no-transitive-hooks"])
+        .expect("sync --no-transitive-hooks must parse");
+    let Command::Sync {
+        no_transitive_hooks,
+        ..
+    } = cli.command
+    else {
+        panic!("expected Command::Sync");
+    };
+    assert!(
+        no_transitive_hooks,
+        "--no-transitive-hooks must set no_transitive_hooks=true"
+    );
+}
+
+#[test]
+fn sync_without_no_transitive_hooks_flag_defaults_to_false() {
+    use clap::Parser;
+    let cli = Cli::try_parse_from(["phora", "sync"]).expect("bare sync must parse");
+    let Command::Sync {
+        no_transitive_hooks,
+        ..
+    } = cli.command
+    else {
+        panic!("expected Command::Sync");
+    };
+    assert!(
+        !no_transitive_hooks,
+        "absent --no-transitive-hooks must default no_transitive_hooks=false"
+    );
+}
+
+#[test]
 fn sync_frozen_flag_parses_to_true() {
     use clap::Parser;
     let cli = Cli::try_parse_from(["phora", "sync", "--frozen"]).expect("sync --frozen must parse");
@@ -133,6 +168,7 @@ fn drop_one_consumer_source_also_clears_transitive_nodes() {
             instance_locked("ns%1%inner", "owninginstance0001"),
         ],
         trusted_hooks: Vec::new(),
+        candidate_hooks: Vec::new(),
     };
 
     drop_sources(Some(&mut lock), &DropSources::One("dotfiles".to_owned()));
@@ -1660,6 +1696,7 @@ fn lock_with(name: &str, git: &str, resolved: &str) -> Lock {
             instance: None,
         }],
         trusted_hooks: Vec::new(),
+        candidate_hooks: Vec::new(),
     }
 }
 
@@ -4892,6 +4929,7 @@ fn drop_one_removes_all_ref_splits_of_that_source() {
             locked_split("other", None),
         ],
         trusted_hooks: Vec::new(),
+        candidate_hooks: Vec::new(),
     };
 
     drop_sources(Some(&mut lock), &DropSources::One("fzf".to_owned()));
@@ -5061,7 +5099,7 @@ fn rebuild_over_merged_vars_agrees_with_deployed_vars_digest() {
         let _state = EnvVarGuard::set("XDG_STATE_HOME", state.path());
         let _cache = EnvVarGuard::set("XDG_CACHE_HOME", cache.path());
 
-        super::sync::run_sync(false, false, false, false, None, None)
+        super::sync::run_sync(false, false, false, false, false, None, None)
             .expect("merged-vars deploy succeeds");
 
         let motd = target_path.join("editor").join("motd");
