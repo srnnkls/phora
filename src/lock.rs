@@ -14,6 +14,17 @@ pub struct Lock {
     pub version: u32,
     #[serde(default)]
     pub sources: Vec<LockedSource>,
+    /// Skip-serialized when empty so a no-transitive lock stays byte-identical to v1.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_hooks: Vec<TrustedHook>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustedHook {
+    pub dep_instance: String,
+    pub hook_id: String,
+    pub preimage: String,
+    pub approved_at: String,
 }
 
 impl Lock {
@@ -44,6 +55,9 @@ pub struct LockedSource {
     /// default refspec; `None` for the canonical entry so bare locks stay byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub r#ref: Option<String>,
+    /// Owning `Instance.stable_key()` for a transitive node; `None` for a consumer root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
 }
 
 /// Kind-tagged so `Branch("x")` and `Tag("x")` never collide.
@@ -71,10 +85,19 @@ pub fn merge_locks(base: &Lock, local: Option<&Lock>) -> Lock {
     let mut merged = base.clone();
     if let Some(local) = local {
         for local_source in &local.sources {
-            merged
-                .sources
-                .retain(|s| !(s.name == local_source.name && s.r#ref == local_source.r#ref));
+            // `instance` in the key keeps a transitive node from collapsing a consumer source.
+            merged.sources.retain(|s| {
+                !(s.name == local_source.name
+                    && s.r#ref == local_source.r#ref
+                    && s.instance == local_source.instance)
+            });
             merged.sources.push(local_source.clone());
+        }
+        for local_hook in &local.trusted_hooks {
+            merged.trusted_hooks.retain(|h| {
+                !(h.dep_instance == local_hook.dep_instance && h.hook_id == local_hook.hook_id)
+            });
+            merged.trusted_hooks.push(local_hook.clone());
         }
     }
     merged
@@ -128,7 +151,8 @@ pub fn split_locks(
     let mut base = Vec::new();
     let mut local = Vec::new();
     for (name, locked) in resolved {
-        if local_override_names.contains(&name) {
+        // A transitive node always lands in the base namespace, ignoring the override set.
+        if locked.instance.is_none() && local_override_names.contains(&name) {
             local.push(locked);
         } else {
             base.push(locked);
@@ -137,10 +161,12 @@ pub fn split_locks(
     let base_lock = Lock {
         version: LOCK_SCHEMA_VERSION,
         sources: base,
+        trusted_hooks: Vec::new(),
     };
     let local_lock = (!local.is_empty()).then_some(Lock {
         version: LOCK_SCHEMA_VERSION,
         sources: local,
+        trusted_hooks: Vec::new(),
     });
     (base_lock, local_lock)
 }
@@ -170,6 +196,14 @@ mod tests {
             digest: "blake3:artifact".to_owned(),
             config_digest: "blake3:cfg".to_owned(),
             r#ref: None,
+            instance: None,
+        }
+    }
+
+    fn transitive(name: &str, git: &str, resolved: &str, instance: &str) -> LockedSource {
+        LockedSource {
+            instance: Some(instance.to_owned()),
+            ..locked(name, git, resolved)
         }
     }
 
@@ -197,6 +231,7 @@ mod tests {
                     "v2.1",
                 ),
             ],
+            trusted_hooks: Vec::new(),
         };
 
         let text = toml::to_string(&lock).expect("lock serializes to toml");
@@ -223,6 +258,7 @@ mod tests {
                 "https://github.com/me/dotfiles.git",
                 "main",
             )],
+            trusted_hooks: Vec::new(),
         };
 
         let text = toml::to_string(&lock).expect("lock serializes to toml");
@@ -258,10 +294,12 @@ mod tests {
                 "https://github.com/srnnkls/loqui.git",
                 "v1.0",
             )],
+            trusted_hooks: Vec::new(),
         };
         let local = Lock {
             version: 1,
             sources: vec![locked("loqui", "/home/soeren/dev/loqui", "main")],
+            trusted_hooks: Vec::new(),
         };
 
         let merged = merge_locks(&base, Some(&local));
@@ -285,10 +323,12 @@ mod tests {
                 "https://github.com/me/dotfiles.git",
                 "main",
             )],
+            trusted_hooks: Vec::new(),
         };
         let local = Lock {
             version: 1,
             sources: vec![locked("extra", "/home/soeren/dev/extra", "main")],
+            trusted_hooks: Vec::new(),
         };
 
         let merged = merge_locks(&base, Some(&local));
@@ -309,6 +349,7 @@ mod tests {
             digest: "blake3:artifact".to_owned(),
             config_digest: source.config_digest(),
             r#ref: None,
+            instance: None,
         };
 
         assert!(
@@ -329,6 +370,7 @@ mod tests {
             digest: "blake3:artifact".to_owned(),
             config_digest: source.config_digest(),
             r#ref: None,
+            instance: None,
         };
 
         assert!(
@@ -349,6 +391,7 @@ mod tests {
             digest: "blake3:artifact".to_owned(),
             config_digest: source.config_digest(),
             r#ref: None,
+            instance: None,
         };
 
         assert!(
@@ -373,6 +416,7 @@ mod tests {
             digest: "blake3:artifact".to_owned(),
             config_digest: other.config_digest(),
             r#ref: None,
+            instance: None,
         };
 
         assert_ne!(
@@ -399,6 +443,7 @@ mod tests {
             digest: "blake3:artifact".to_owned(),
             config_digest: source.config_digest(),
             r#ref: None,
+            instance: None,
         };
 
         assert!(
@@ -420,6 +465,7 @@ mod tests {
             digest: "blake3:artifact".to_owned(),
             config_digest: source.config_digest(),
             r#ref: None,
+            instance: None,
         };
 
         assert!(
@@ -450,6 +496,7 @@ mod tests {
             digest: "blake3:artifact".to_owned(),
             config_digest: source.config_digest(),
             r#ref: None,
+            instance: None,
         };
 
         assert_ne!(
@@ -481,6 +528,7 @@ mod tests {
             digest: "blake3:artifact".to_owned(),
             config_digest: source.config_digest(),
             r#ref: None,
+            instance: None,
         };
 
         assert!(
@@ -501,6 +549,7 @@ mod tests {
             digest: "blake3:artifact".to_owned(),
             config_digest: source.config_digest(),
             r#ref: None,
+            instance: None,
         };
 
         assert!(
@@ -526,6 +575,7 @@ mod tests {
             digest: "blake3:artifact".to_owned(),
             config_digest: source.config_digest(),
             r#ref: None,
+            instance: None,
         };
 
         assert!(
@@ -585,6 +635,7 @@ config_digest = \"PLACEHOLDER\"
             digest: "blake3:artifact".to_owned(),
             config_digest: other.config_digest(),
             r#ref: None,
+            instance: None,
         };
 
         assert_ne!(
@@ -623,6 +674,7 @@ config_digest = \"PLACEHOLDER\"
             digest: "blake3:artifact".to_owned(),
             config_digest: source.config_digest(),
             r#ref: None,
+            instance: None,
         };
 
         assert!(
@@ -644,6 +696,7 @@ config_digest = \"PLACEHOLDER\"
             digest: "blake3:artifact".to_owned(),
             config_digest: source.config_digest(),
             r#ref: None,
+            instance: None,
         };
 
         assert!(
@@ -664,6 +717,7 @@ config_digest = \"PLACEHOLDER\"
             digest: "blake3:artifact".to_owned(),
             config_digest: other.config_digest(),
             r#ref: None,
+            instance: None,
         };
 
         assert_ne!(
@@ -689,6 +743,7 @@ config_digest = \"PLACEHOLDER\"
             digest: "blake3:artifact".to_owned(),
             config_digest: source.config_digest(),
             r#ref: None,
+            instance: None,
         };
 
         assert!(
@@ -711,6 +766,7 @@ config_digest = \"PLACEHOLDER\"
             digest: "blake3:artifact".to_owned(),
             config_digest: source.config_digest(),
             r#ref: None,
+            instance: None,
         };
 
         assert!(
@@ -752,6 +808,7 @@ config_digest = \"PLACEHOLDER\"
                     digest: "blake3:v55".to_owned(),
                     config_digest: "blake3:cfg".to_owned(),
                     r#ref: Some("tag:v0.55.0".to_owned()),
+                    instance: None,
                 },
                 LockedSource {
                     name: "fzf".to_owned(),
@@ -761,8 +818,10 @@ config_digest = \"PLACEHOLDER\"
                     digest: "blake3:v56".to_owned(),
                     config_digest: "blake3:cfg".to_owned(),
                     r#ref: Some("tag:v0.56.0".to_owned()),
+                    instance: None,
                 },
             ],
+            trusted_hooks: Vec::new(),
         };
         // Local overrides only the v0.56.0 split (e.g. repointed at a local checkout).
         let local = Lock {
@@ -775,7 +834,9 @@ config_digest = \"PLACEHOLDER\"
                 digest: "blake3:local56".to_owned(),
                 config_digest: "blake3:cfg".to_owned(),
                 r#ref: Some("tag:v0.56.0".to_owned()),
+                instance: None,
             }],
+            trusted_hooks: Vec::new(),
         };
 
         let merged = merge_locks(&base, Some(&local));
@@ -1100,6 +1161,7 @@ config_digest = \"blake3:cfg\"
                 "https://github.com/me/dotfiles.git",
                 "main",
             )],
+            trusted_hooks: Vec::new(),
         };
 
         let text = toml::to_string(&lock).expect("lock serializes to toml");
@@ -1129,6 +1191,254 @@ config_digest = \"blake3:cfg\"
             "a bare lock (no per-binding ref) must serialize EXACTLY this key set; any extra key \
              means a new optional lock field was not skip-serialized when absent, so old configs \
              would not lock byte-identically, got:\n{text}"
+        );
+    }
+
+    // TDEP-LOCK-001: dependency-instance namespaced graph + consumer-owned trusted hooks
+
+    #[test]
+    fn transitive_locked_source_emits_instance_key() {
+        let lock = Lock {
+            version: LOCK_SCHEMA_VERSION,
+            sources: vec![transitive(
+                "deadbeefcafe0001%1%inner",
+                "https://github.com/dep/inner.git",
+                "main",
+                "deadbeefcafe0001",
+            )],
+            trusted_hooks: Vec::new(),
+        };
+
+        let text = toml::to_string(&lock).expect("a transitive-node lock serializes");
+
+        assert!(
+            text.contains("instance = \"deadbeefcafe0001\""),
+            "a transitive node must serialize its owning Instance.stable_key() under `instance`, \
+             so split/merge can route it to the base namespace, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn consumer_root_lock_skip_serializes_instance() {
+        let lock = Lock {
+            version: LOCK_SCHEMA_VERSION,
+            sources: vec![locked(
+                "dotfiles",
+                "https://github.com/me/dotfiles.git",
+                "main",
+            )],
+            trusted_hooks: Vec::new(),
+        };
+
+        let text = toml::to_string(&lock).expect("a consumer-root lock serializes");
+
+        assert!(
+            !text.contains("instance"),
+            "a consumer-root source (instance = None) must skip-serialize the `instance` key so \
+             bare locks stay byte-identical to v1, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn instance_round_trips_through_toml() {
+        let lock = Lock {
+            version: LOCK_SCHEMA_VERSION,
+            sources: vec![transitive(
+                "ns%1%inner",
+                "https://github.com/dep/inner.git",
+                "main",
+                "owninginstance01",
+            )],
+            trusted_hooks: Vec::new(),
+        };
+
+        let text = toml::to_string(&lock).expect("transitive lock serializes");
+        let parsed: Lock = toml::from_str(&text).expect("transitive lock deserializes");
+
+        assert_eq!(
+            parsed.sources[0].instance.as_deref(),
+            Some("owninginstance01"),
+            "the instance key must survive a toml round-trip so re-reads keep namespace identity"
+        );
+    }
+
+    #[test]
+    fn populated_trusted_hooks_emit_array_of_tables_with_all_four_fields() {
+        let lock = Lock {
+            version: LOCK_SCHEMA_VERSION,
+            sources: Vec::new(),
+            trusted_hooks: vec![TrustedHook {
+                dep_instance: "owninginstance01".to_owned(),
+                hook_id: "post-deploy".to_owned(),
+                preimage: "blake3:hookpreimage".to_owned(),
+                approved_at: "2026-06-20T00:00:00Z".to_owned(),
+            }],
+        };
+
+        let text = toml::to_string(&lock).expect("a lock with trusted hooks serializes");
+
+        assert!(
+            text.contains("[[trusted_hooks]]"),
+            "trusted hooks must serialize as a serde array-of-tables, got:\n{text}"
+        );
+        for field in ["dep_instance", "hook_id", "preimage", "approved_at"] {
+            assert!(
+                text.contains(&format!("{field} =")),
+                "the trusted_hooks table must carry the `{field}` field, got:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_trusted_hooks_skip_serialize() {
+        let lock = Lock {
+            version: LOCK_SCHEMA_VERSION,
+            sources: vec![locked(
+                "dotfiles",
+                "https://github.com/me/dotfiles.git",
+                "main",
+            )],
+            trusted_hooks: Vec::new(),
+        };
+
+        let text = toml::to_string(&lock).expect("a lock with no trusted hooks serializes");
+
+        assert!(
+            !text.contains("trusted_hooks"),
+            "an empty trusted_hooks vec must skip-serialize so a no-hooks lock stays byte-identical \
+             to v1, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn merge_locks_keeps_same_inner_name_under_distinct_instances() {
+        let base = Lock {
+            version: LOCK_SCHEMA_VERSION,
+            sources: vec![
+                transitive(
+                    "a%1%cfg",
+                    "https://github.com/dep-a/cfg.git",
+                    "main",
+                    "instanceaaaa0001",
+                ),
+                transitive(
+                    "b%1%cfg",
+                    "https://github.com/dep-b/cfg.git",
+                    "main",
+                    "instancebbbb0002",
+                ),
+            ],
+            trusted_hooks: Vec::new(),
+        };
+
+        let merged = merge_locks(&base, None);
+
+        let cfgs: Vec<&LockedSource> = merged
+            .sources
+            .iter()
+            .filter(|s| s.instance.is_some())
+            .collect();
+        assert_eq!(
+            cfgs.len(),
+            2,
+            "two transitive deps sharing the inner-source name `cfg` but owned by distinct \
+             instances must remain two entries; a dedup ignoring `instance` wrongly collapses \
+             them, got {cfgs:?}"
+        );
+    }
+
+    #[test]
+    fn merge_locks_merges_trusted_hooks_local_overrides_base_by_dep_instance_and_hook_id() {
+        let base = Lock {
+            version: LOCK_SCHEMA_VERSION,
+            sources: Vec::new(),
+            trusted_hooks: vec![
+                TrustedHook {
+                    dep_instance: "inst0001".to_owned(),
+                    hook_id: "post-deploy".to_owned(),
+                    preimage: "blake3:old".to_owned(),
+                    approved_at: "2026-01-01T00:00:00Z".to_owned(),
+                },
+                TrustedHook {
+                    dep_instance: "inst0002".to_owned(),
+                    hook_id: "pre-build".to_owned(),
+                    preimage: "blake3:keep".to_owned(),
+                    approved_at: "2026-01-01T00:00:00Z".to_owned(),
+                },
+            ],
+        };
+        let local = Lock {
+            version: LOCK_SCHEMA_VERSION,
+            sources: Vec::new(),
+            trusted_hooks: vec![TrustedHook {
+                dep_instance: "inst0001".to_owned(),
+                hook_id: "post-deploy".to_owned(),
+                preimage: "blake3:new".to_owned(),
+                approved_at: "2026-06-20T00:00:00Z".to_owned(),
+            }],
+        };
+
+        let merged = merge_locks(&base, Some(&local));
+
+        let overridden = merged
+            .trusted_hooks
+            .iter()
+            .find(|h| h.dep_instance == "inst0001" && h.hook_id == "post-deploy")
+            .expect("the (inst0001, post-deploy) approval survives the merge");
+        assert_eq!(
+            overridden.preimage, "blake3:new",
+            "local must override the base trusted-hook approval matched by (dep_instance, hook_id)"
+        );
+        assert_eq!(
+            merged
+                .trusted_hooks
+                .iter()
+                .filter(|h| h.dep_instance == "inst0001" && h.hook_id == "post-deploy")
+                .count(),
+            1,
+            "the override must replace, not duplicate, the matching approval"
+        );
+        assert!(
+            merged
+                .trusted_hooks
+                .iter()
+                .any(|h| h.dep_instance == "inst0002" && h.preimage == "blake3:keep"),
+            "a base-only approval not touched by local must survive the merge"
+        );
+    }
+
+    #[test]
+    fn split_locks_routes_transitive_nodes_to_base_even_when_name_matches_local_override() {
+        let resolved = vec![
+            (
+                "ns%1%loqui".to_owned(),
+                transitive(
+                    "ns%1%loqui",
+                    "https://github.com/dep/loqui.git",
+                    "main",
+                    "owninginst000001",
+                ),
+            ),
+            (
+                "loqui".to_owned(),
+                locked("loqui", "/home/me/dev/loqui", "main"),
+            ),
+        ];
+        let overrides: BTreeSet<String> = ["loqui".to_owned(), "ns%1%loqui".to_owned()]
+            .into_iter()
+            .collect();
+
+        let (base, local) = split_locks(resolved, &overrides);
+
+        assert!(
+            base.sources.iter().any(|s| s.instance.is_some()),
+            "a transitive node (instance.is_some()) must always route to the BASE lock, never the \
+             local override lock, regardless of its namespaced name matching an override"
+        );
+        let local = local.expect("the consumer override still yields a local lock");
+        assert!(
+            local.sources.iter().all(|s| s.instance.is_none()),
+            "no instance-tagged transitive node may leak into the local override lock"
         );
     }
 }

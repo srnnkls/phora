@@ -104,6 +104,76 @@ fn sync_without_no_hooks_flag_defaults_to_false() {
 }
 
 #[test]
+fn sync_frozen_flag_parses_to_true() {
+    use clap::Parser;
+    let cli = Cli::try_parse_from(["phora", "sync", "--frozen"]).expect("sync --frozen must parse");
+    let Command::Sync { frozen, .. } = cli.command else {
+        panic!("expected Command::Sync");
+    };
+    assert!(frozen, "--frozen must set frozen=true");
+}
+
+#[test]
+fn sync_without_frozen_flag_defaults_to_false() {
+    use clap::Parser;
+    let cli = Cli::try_parse_from(["phora", "sync"]).expect("bare sync must parse");
+    let Command::Sync { frozen, .. } = cli.command else {
+        panic!("expected Command::Sync");
+    };
+    assert!(!frozen, "absent --frozen must default frozen=false");
+}
+
+#[test]
+fn drop_one_consumer_source_also_clears_transitive_nodes() {
+    let mut lock = crate::lock::Lock {
+        version: crate::lock::LOCK_SCHEMA_VERSION,
+        sources: vec![
+            consumer_locked("dotfiles", "https://github.com/me/dotfiles.git"),
+            consumer_locked("keep-me", "https://github.com/me/keep.git"),
+            instance_locked("ns%1%inner", "owninginstance0001"),
+        ],
+        trusted_hooks: Vec::new(),
+    };
+
+    drop_sources(Some(&mut lock), &DropSources::One("dotfiles".to_owned()));
+
+    assert!(
+        lock.sources.iter().all(|s| s.name != "dotfiles"),
+        "dropping consumer source `dotfiles` must remove its own entry"
+    );
+    assert!(
+        lock.sources.iter().all(|s| s.instance.is_none()),
+        "dropping ONE consumer source must also clear every transitive node so the dependency \
+         subtree re-resolves; an instance-tagged entry survived: {:?}",
+        lock.sources
+    );
+    assert!(
+        lock.sources.iter().any(|s| s.name == "keep-me"),
+        "dropping one consumer source must NOT touch an unrelated consumer source"
+    );
+}
+
+fn consumer_locked(name: &str, git: &str) -> crate::lock::LockedSource {
+    crate::lock::LockedSource {
+        name: name.to_owned(),
+        git: git.to_owned(),
+        resolved: "main".to_owned(),
+        commit: "c0ffee".to_owned(),
+        digest: "blake3:artifact".to_owned(),
+        config_digest: "blake3:cfg".to_owned(),
+        r#ref: None,
+        instance: None,
+    }
+}
+
+fn instance_locked(name: &str, instance: &str) -> crate::lock::LockedSource {
+    crate::lock::LockedSource {
+        instance: Some(instance.to_owned()),
+        ..consumer_locked(name, "https://github.com/dep/inner.git")
+    }
+}
+
+#[test]
 fn hook_report_lists_each_hook_with_scope_and_status() {
     use crate::sync::{HookOutcome, HookScope, HookStatus};
     let outcomes = vec![
@@ -1587,7 +1657,9 @@ fn lock_with(name: &str, git: &str, resolved: &str) -> Lock {
             digest: "blake3:artifact".to_owned(),
             config_digest: "blake3:cfg".to_owned(),
             r#ref: None,
+            instance: None,
         }],
+        trusted_hooks: Vec::new(),
     }
 }
 
@@ -4806,6 +4878,7 @@ fn locked_split(name: &str, r#ref: Option<&str>) -> LockedSource {
         digest: "blake3:artifact".to_owned(),
         config_digest: "blake3:cfg".to_owned(),
         r#ref: r#ref.map(str::to_owned),
+        instance: None,
     }
 }
 
@@ -4818,6 +4891,7 @@ fn drop_one_removes_all_ref_splits_of_that_source() {
             locked_split("fzf", Some("tag:v0.56.0")),
             locked_split("other", None),
         ],
+        trusted_hooks: Vec::new(),
     };
 
     drop_sources(Some(&mut lock), &DropSources::One("fzf".to_owned()));
@@ -4987,7 +5061,7 @@ fn rebuild_over_merged_vars_agrees_with_deployed_vars_digest() {
         let _state = EnvVarGuard::set("XDG_STATE_HOME", state.path());
         let _cache = EnvVarGuard::set("XDG_CACHE_HOME", cache.path());
 
-        super::sync::run_sync(false, false, false, None, None)
+        super::sync::run_sync(false, false, false, false, None, None)
             .expect("merged-vars deploy succeeds");
 
         let motd = target_path.join("editor").join("motd");

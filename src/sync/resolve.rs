@@ -125,13 +125,25 @@ fn lock_hit<'l>(
         .filter(|l| entry_matches(source, &unit.effective_ref, l, &config.hosts, protocol))
 }
 
+fn frozen_miss(name: &str) -> crate::error::Error {
+    crate::error::Error::Lock(format!(
+        "source `{name}` is not pinned in the lock; --frozen refuses to fetch or re-resolve"
+    ))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "resolving one unit threads config/parsed/remotes/lock/backend plus the force and frozen run flags"
+)]
 fn resolve_unit(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
     remotes: &BTreeMap<String, String>,
+    instances: &BTreeMap<String, String>,
     effective_lock: Option<&Lock>,
     backend: &(dyn SourceBackend + Sync),
     force: bool,
+    frozen: bool,
     unit: &Unit,
 ) -> Result<Option<Resolved>> {
     let Some(source) = parsed.get(&unit.name) else {
@@ -157,6 +169,7 @@ fn resolve_unit(
                 digest: "link:".to_owned(),
                 config_digest: source.config_digest(),
                 r#ref: None,
+                instance: instances.get(&unit.name).cloned(),
             },
         }));
     }
@@ -164,6 +177,7 @@ fn resolve_unit(
     let discriminator = ref_discriminator(&unit.effective_ref, &source.refspec());
     let commit = match lock_hit(config, source, unit, effective_lock, force) {
         Some(l) => l.commit.clone(),
+        None if frozen => return Err(frozen_miss(&unit.name)),
         None => backend.resolve(&source_name, git, &unit.effective_ref)?,
     };
 
@@ -198,6 +212,7 @@ fn resolve_unit(
             digest,
             config_digest: source.config_digest(),
             r#ref: discriminator,
+            instance: instances.get(&unit.name).cloned(),
         },
     }))
 }
@@ -209,13 +224,19 @@ fn default_thread_count(units: usize, cores: usize) -> usize {
     units.min(2 * cores)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "resolution threads config/parsed/remotes/lock/backend plus the force, frozen, and jobs run flags"
+)]
 pub(super) fn resolve_sources(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
     remotes: &BTreeMap<String, String>,
+    instances: &BTreeMap<String, String>,
     effective_lock: Option<&Lock>,
     backend: &(dyn SourceBackend + Sync),
     force: bool,
+    frozen: bool,
     jobs: Option<usize>,
 ) -> Result<RoutedSources> {
     let units = resolution_units(config, parsed);
@@ -230,15 +251,17 @@ pub(super) fn resolve_sources(
         .map_err(|e| crate::error::Error::Source(e.to_string()))?;
 
     pool.install(|| -> Result<RoutedSources> {
-        fetch_distinct_mirrors(
-            config,
-            parsed,
-            remotes,
-            effective_lock,
-            backend,
-            force,
-            &units,
-        )?;
+        if !frozen {
+            fetch_distinct_mirrors(
+                config,
+                parsed,
+                remotes,
+                effective_lock,
+                backend,
+                force,
+                &units,
+            )?;
+        }
 
         let resolved: Vec<Option<Resolved>> = units
             .par_iter()
@@ -247,9 +270,11 @@ pub(super) fn resolve_sources(
                     config,
                     parsed,
                     remotes,
+                    instances,
                     effective_lock,
                     backend,
                     force,
+                    frozen,
                     unit,
                 )
             })
@@ -279,9 +304,11 @@ pub fn resolve_sources_for_bench(
         config,
         parsed,
         remotes,
+        &BTreeMap::new(),
         effective_lock,
         backend,
         force,
+        false,
         jobs,
     )
 }

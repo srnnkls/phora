@@ -7,7 +7,9 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::config::transitive::{FetchNode, Instance, TransitiveManifest};
-use crate::config::{Binding, Config, DeployMode, ParsedSource, Remote, SourceMode, Target};
+use crate::config::{
+    Binding, Config, DeployMode, ParsedSource, Refspec, Remote, SourceMode, Target,
+};
 use crate::error::{Error, Result};
 use crate::kernel::{SourceName, safe_component};
 use crate::source::{SourceBackend, is_local_path, mirror_path};
@@ -36,6 +38,9 @@ pub(super) struct ResolvedGraph {
     pub(super) targets: Vec<ComposedTarget>,
     pub(super) sources: BTreeMap<String, ParsedSource>,
     pub(super) remotes: BTreeMap<String, String>,
+    /// Namespaced source name → owning `Instance.stable_key()`; the lock stamps this so
+    /// a transitive node is keyed by its instance, not a bare name that never lines up.
+    pub(super) instances: BTreeMap<String, String>,
 }
 
 impl ResolvedGraph {
@@ -44,13 +49,14 @@ impl ResolvedGraph {
         config: &mut Config,
         parsed: &mut BTreeMap<String, ParsedSource>,
         remotes: &mut BTreeMap<String, String>,
-    ) {
+    ) -> BTreeMap<String, String> {
         parsed.extend(self.sources);
         remotes.extend(self.remotes);
         for composed in self.targets {
             config.targets.insert(composed.name, composed.target);
         }
         strip_absorbed_anchors(config);
+        self.instances
     }
 }
 
@@ -72,11 +78,17 @@ pub(super) fn resolve_transitive_graph(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
     backend: &(dyn SourceBackend + Sync),
+    frozen: bool,
+    effective_lock: Option<&crate::lock::Lock>,
 ) -> Result<ResolvedGraph> {
     let Some(mirror_root) = backend.mirror_root() else {
         return Ok(ResolvedGraph::default());
     };
     let remotes = resolved_remotes(config, parsed)?;
+    let frozen_gate = FrozenGate {
+        frozen,
+        lock: effective_lock,
+    };
     let mut visited: HashSet<FetchNode> = HashSet::new();
     let mut graph = ResolvedGraph::default();
     let mut counter: usize = 0;
@@ -90,8 +102,15 @@ pub(super) fn resolve_transitive_graph(
                 Error::Config(format!("no resolved remote for source `{imported}`"))
             })?;
             reject_escaping_remote(imported, source, remote, 1)?;
-            let (commit, manifest) =
-                fetch_manifest(imported, source, remote, backend, mirror_root, 1)?;
+            let (commit, manifest) = fetch_manifest(
+                imported,
+                source,
+                remote,
+                backend,
+                mirror_root,
+                1,
+                &frozen_gate,
+            )?;
             let node = FetchNode::new(remote, &source.refspec().to_string(), &commit);
             visited.insert(node.clone());
             let instance = Instance::new("root", imported, anchor_name, node);
@@ -107,6 +126,7 @@ pub(super) fn resolve_transitive_graph(
                     ancestors: Vec::new(),
                     counter: &mut counter,
                     graph: &mut graph,
+                    frozen: &frozen_gate,
                 },
                 1,
             )?;
@@ -124,6 +144,13 @@ struct WalkCtx<'a> {
     ancestors: Vec<FetchNode>,
     counter: &'a mut usize,
     graph: &'a mut ResolvedGraph,
+    frozen: &'a FrozenGate<'a>,
+}
+
+/// Checked at the top of every `fetch_manifest` so no depth can fetch an unpinned/drifted node under `--frozen`.
+struct FrozenGate<'a> {
+    frozen: bool,
+    lock: Option<&'a crate::lock::Lock>,
 }
 
 /// Composes a dep's own targets under `anchor`: each becomes a synthetic target at
@@ -163,17 +190,23 @@ fn compose_dep(
             Error::Config(format!("imported `{imported}`: source `{inner_name}`: {e}"))
         })?;
         reject_escaping_remote(inner_name, &parsed, &remote, depth + 1)?;
-        if inner.is_transitive() && imported_inner.contains(inner_name.as_str()) {
-            continue;
-        }
-        if inner.is_transitive() {
+        let composed_by_nested_import =
+            inner.is_transitive() && imported_inner.contains(inner_name.as_str());
+        // Frozen trusts the lock: a never-locked validation-only sub-tree must not be reached out for.
+        if inner.is_transitive() && !composed_by_nested_import && !ctx.frozen.frozen {
             descend_for_validation(inner_name, &parsed, &remote, ctx, depth + 1)?;
         }
         *ctx.counter += 1;
         let namespaced = namespaced_key(instance, inner_name, *ctx.counter);
         ctx.graph.remotes.insert(namespaced.clone(), remote);
         ctx.graph.sources.insert(namespaced.clone(), parsed);
-        source_names.insert(inner_name.clone(), namespaced);
+        ctx.graph
+            .instances
+            .insert(namespaced.clone(), instance.stable_key());
+        // Pinned in the lock for the frozen gate, but bound to no composed target: its children deploy, it only re-exports them.
+        if !composed_by_nested_import {
+            source_names.insert(inner_name.clone(), namespaced);
+        }
     }
 
     for (dep_target_name, dep_target) in &manifest.targets {
@@ -245,6 +278,7 @@ fn compose_nested_imports(
             ctx.backend,
             ctx.mirror_root,
             depth + 1,
+            ctx.frozen,
         )?;
         let inner_node = FetchNode::new(
             &inner_remote,
@@ -292,8 +326,15 @@ fn descend_for_validation(
     depth: usize,
 ) -> Result<()> {
     reject_depth_overflow(name, depth)?;
-    let (commit, manifest) =
-        fetch_manifest(name, parsed, remote, ctx.backend, ctx.mirror_root, depth)?;
+    let (commit, manifest) = fetch_manifest(
+        name,
+        parsed,
+        remote,
+        ctx.backend,
+        ctx.mirror_root,
+        depth,
+        ctx.frozen,
+    )?;
     let node = FetchNode::new(remote, &parsed.refspec().to_string(), &commit);
     if !ctx.visited.insert(node) {
         return Ok(());
@@ -310,6 +351,57 @@ fn descend_for_validation(
         descend_for_validation(inner_name, &inner_parsed, &inner_remote, ctx, depth + 1)?;
     }
     Ok(())
+}
+
+impl FrozenGate<'_> {
+    /// Pre-fetch the commit is unknown, so the match keys on git/ref + scope (nested: any
+    /// instance-keyed entry; depth-1 anchor: the consumer-root entry by name), never commit.
+    fn require_pinned<'l>(
+        &'l self,
+        name: &str,
+        remote: &str,
+        refspec: &Refspec,
+        depth: usize,
+    ) -> Result<Option<&'l str>> {
+        if !self.frozen {
+            return Ok(None);
+        }
+        let remote_id = crate::source::NormalizedUrl::parse(remote);
+        let resolved_ref = refspec.to_string();
+        let entry = self.lock.and_then(|lock| {
+            lock.sources.iter().find(|s| {
+                let identity_ok = crate::source::NormalizedUrl::parse(&s.git) == remote_id
+                    && s.resolved == resolved_ref;
+                let scope_ok = if depth > 1 {
+                    s.instance.is_some()
+                } else {
+                    s.instance.is_none() && s.name == name
+                };
+                identity_ok && scope_ok
+            })
+        });
+        match entry {
+            Some(locked) => Ok(Some(locked.commit.as_str())),
+            None => Err(frozen_transitive_miss(name, depth)),
+        }
+    }
+}
+
+fn frozen_transitive_miss(name: &str, depth: usize) -> Error {
+    Error::Lock(format!(
+        "transitive source `{name}` at depth {depth} is not pinned in the lock; \
+         --frozen refuses to fetch its manifest"
+    ))
+}
+
+fn reject_frozen_drift(name: &str, locked: &str, resolved: &str, depth: usize) -> Result<()> {
+    if locked == resolved {
+        return Ok(());
+    }
+    Err(Error::Lock(format!(
+        "transitive source `{name}` at depth {depth} drifted from the lock \
+         (locked `{locked}`, resolved `{resolved}`); --frozen refuses to re-resolve it"
+    )))
 }
 
 fn namespaced_key(instance: &Instance, name: &str, counter: usize) -> String {
@@ -408,8 +500,11 @@ fn fetch_manifest(
     backend: &(dyn SourceBackend + Sync),
     mirror_root: &Path,
     depth: usize,
+    frozen: &FrozenGate<'_>,
 ) -> Result<(String, TransitiveManifest)> {
     let refspec = source.refspec();
+    // An unpinned node must hard-error BEFORE any fetch touches its remote.
+    let pinned = frozen.require_pinned(name, remote, &refspec, depth)?;
     let source_name = SourceName::trusted(name.to_owned());
     backend
         .fetch(&source_name, remote)
@@ -417,6 +512,9 @@ fn fetch_manifest(
     let commit = backend
         .resolve(&source_name, remote, &refspec)
         .map_err(|e| at_depth(name, depth, &e.to_string()))?;
+    if let Some(locked_commit) = pinned {
+        reject_frozen_drift(name, locked_commit, &commit, depth)?;
+    }
     let manifest_text = read_manifest(mirror_root, remote, &commit)
         .map_err(|e| at_depth(name, depth, &e.to_string()))?;
     let manifest = TransitiveManifest::parse(&manifest_text)
@@ -513,6 +611,7 @@ fn at_depth(name: &str, depth: usize, detail: &str) -> Error {
 mod tests {
     use super::*;
     use crate::config::Source;
+    use crate::lock::LockedSource;
 
     fn git_source(git: &str) -> ParsedSource {
         let raw: Source = toml::from_str(&format!("git = {git:?}\ntransitive = true\n"))
@@ -557,5 +656,85 @@ mod tests {
                 panic!("non-relative git remote `{remote}` must be allowed: {e}")
             });
         }
+    }
+
+    fn locked_node(name: &str, git: &str, commit: &str, instance: Option<&str>) -> LockedSource {
+        LockedSource {
+            name: name.to_owned(),
+            git: git.to_owned(),
+            resolved: "main".to_owned(),
+            commit: commit.to_owned(),
+            digest: "blake3:artifact".to_owned(),
+            config_digest: "blake3:cfg".to_owned(),
+            r#ref: None,
+            instance: instance.map(str::to_owned),
+        }
+    }
+
+    fn lock_of(sources: Vec<LockedSource>) -> crate::lock::Lock {
+        crate::lock::Lock {
+            version: crate::lock::LOCK_SCHEMA_VERSION,
+            sources,
+            trusted_hooks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn require_pinned_is_inactive_without_frozen() {
+        let gate = FrozenGate {
+            frozen: false,
+            lock: None,
+        };
+        let pinned = gate
+            .require_pinned(
+                "dep",
+                "https://x/r.git",
+                &Refspec::Branch("main".to_owned()),
+                1,
+            )
+            .expect("a non-frozen gate never errors");
+        assert!(
+            pinned.is_none(),
+            "without --frozen the gate must be inactive, yielding no drift commit"
+        );
+    }
+
+    #[test]
+    fn require_pinned_errors_naming_unpinned_nested_node_with_depth() {
+        let lock = lock_of(vec![locked_node(
+            "dep",
+            "https://dep/anchor.git",
+            "c0",
+            None,
+        )]);
+        let gate = FrozenGate {
+            frozen: true,
+            lock: Some(&lock),
+        };
+        let err = gate
+            .require_pinned(
+                "inner",
+                "https://dep/inner.git",
+                &Refspec::Branch("main".to_owned()),
+                2,
+            )
+            .expect_err("an unpinned nested node must hard-error under --frozen");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("inner") && msg.contains("depth 2") && msg.contains("--frozen"),
+            "the frozen miss must name the nested source, its depth, and --frozen, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn reject_frozen_drift_rejects_a_drifted_commit_naming_source_and_depth() {
+        reject_frozen_drift("inner", "c0ffee", "c0ffee", 2).expect("matching commits never drift");
+        let err = reject_frozen_drift("inner", "c0ffee", "deadbeef", 2)
+            .expect_err("a resolved commit differing from the lock must be rejected as drift");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("inner") && msg.contains("depth 2") && msg.contains("drifted"),
+            "the drift diagnostic must name the source, depth, and the drift, got: {msg}"
+        );
     }
 }
