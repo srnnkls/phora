@@ -19,6 +19,9 @@ const COMPOSED_DEST_COLLISION: &str = "composed targets resolve to the same dest
 
 const TRANSITIVE_LINK_REJECTED: &str = "transitive source cannot use deploy = \"link\"";
 
+/// Fail-closed bound: an acyclic ever-deeper `transitive = true` import chain would otherwise stack-overflow (`DoS`) on untrusted manifests.
+const MAX_TRANSITIVE_DEPTH: usize = 64;
+
 /// One dep target composed under a consumer anchor: a synthetic absolute-path
 /// target carrying the dep's own layout, bound to namespaced source instances.
 pub(super) struct ComposedTarget {
@@ -90,22 +93,22 @@ pub(super) fn resolve_transitive_graph(
             let (commit, manifest) =
                 fetch_manifest(imported, source, remote, backend, mirror_root, 1)?;
             let node = FetchNode::new(remote, &source.refspec().to_string(), &commit);
-            walk_recurse(
-                node.clone(),
-                &manifest,
-                backend,
-                mirror_root,
-                &mut visited,
-                1,
-            )?;
+            visited.insert(node.clone());
             let instance = Instance::new("root", imported, anchor_name, node);
             compose_dep(
                 &instance,
                 anchor,
                 imported,
                 &manifest,
-                &mut counter,
-                &mut graph,
+                &mut WalkCtx {
+                    backend,
+                    mirror_root,
+                    visited: &mut visited,
+                    ancestors: Vec::new(),
+                    counter: &mut counter,
+                    graph: &mut graph,
+                },
+                1,
             )?;
         }
     }
@@ -113,51 +116,14 @@ pub(super) fn resolve_transitive_graph(
     Ok(graph)
 }
 
-/// Recurses fetch/parse into a dep's own `transitive = true` inner sources, keying
-/// the visited-set on [`FetchNode`] so a diamond collapses to one fetch.
-fn walk_recurse(
-    parent_node: FetchNode,
-    manifest: &TransitiveManifest,
-    backend: &(dyn SourceBackend + Sync),
-    mirror_root: &Path,
-    visited: &mut HashSet<FetchNode>,
-    depth: usize,
-) -> Result<()> {
-    if !visited.insert(parent_node) {
-        return Ok(());
-    }
-    for (inner_name, inner) in &manifest.sources {
-        let inner_parsed = ParsedSource::parse(inner_name, inner)
-            .map_err(|e| at_depth(inner_name, depth + 1, &e.to_string()))?;
-        let inner_remote = inner_remote(inner_name, &inner_parsed)
-            .map_err(|e| at_depth(inner_name, depth + 1, &e.to_string()))?;
-        reject_escaping_remote(inner_name, &inner_parsed, &inner_remote, depth + 1)?;
-        if !inner.is_transitive() {
-            continue;
-        }
-        let (inner_commit, inner_manifest) = fetch_manifest(
-            inner_name,
-            &inner_parsed,
-            &inner_remote,
-            backend,
-            mirror_root,
-            depth + 1,
-        )?;
-        let inner_node = FetchNode::new(
-            &inner_remote,
-            &inner_parsed.refspec().to_string(),
-            &inner_commit,
-        );
-        walk_recurse(
-            inner_node,
-            &inner_manifest,
-            backend,
-            mirror_root,
-            visited,
-            depth + 1,
-        )?;
-    }
-    Ok(())
+struct WalkCtx<'a> {
+    backend: &'a (dyn SourceBackend + Sync),
+    mirror_root: &'a Path,
+    /// `visited`: fetch-closure dedup gating `descend_for_validation` (LOCK-001); per-Instance nested composition intentionally ignores it. `ancestors`: current-path cycle guard.
+    visited: &'a mut HashSet<FetchNode>,
+    ancestors: Vec<FetchNode>,
+    counter: &'a mut usize,
+    graph: &'a mut ResolvedGraph,
 }
 
 /// Composes a dep's own targets under `anchor`: each becomes a synthetic target at
@@ -169,11 +135,19 @@ fn compose_dep(
     anchor: &Target,
     imported: &str,
     manifest: &TransitiveManifest,
-    counter: &mut usize,
-    graph: &mut ResolvedGraph,
+    ctx: &mut WalkCtx<'_>,
+    depth: usize,
 ) -> Result<()> {
+    reject_depth_overflow(imported, depth)?;
     let anchor_path = anchor.expanded_path();
     let mut composed_dests: BTreeMap<PathBuf, String> = BTreeMap::new();
+
+    let imported_inner: HashSet<&str> = manifest
+        .targets
+        .values()
+        .flat_map(|t| t.imports.iter().flatten())
+        .map(String::as_str)
+        .collect();
 
     let mut source_names: BTreeMap<String, String> = BTreeMap::new();
     for (inner_name, inner) in &manifest.sources {
@@ -188,10 +162,17 @@ fn compose_dep(
         let remote = inner_remote(inner_name, &parsed).map_err(|e| {
             Error::Config(format!("imported `{imported}`: source `{inner_name}`: {e}"))
         })?;
-        *counter += 1;
-        let namespaced = namespaced_key(instance, inner_name, *counter);
-        graph.remotes.insert(namespaced.clone(), remote);
-        graph.sources.insert(namespaced.clone(), parsed);
+        reject_escaping_remote(inner_name, &parsed, &remote, depth + 1)?;
+        if inner.is_transitive() && imported_inner.contains(inner_name.as_str()) {
+            continue;
+        }
+        if inner.is_transitive() {
+            descend_for_validation(inner_name, &parsed, &remote, ctx, depth + 1)?;
+        }
+        *ctx.counter += 1;
+        let namespaced = namespaced_key(instance, inner_name, *ctx.counter);
+        ctx.graph.remotes.insert(namespaced.clone(), remote);
+        ctx.graph.sources.insert(namespaced.clone(), parsed);
         source_names.insert(inner_name.clone(), namespaced);
     }
 
@@ -205,6 +186,16 @@ fn compose_dep(
                 composed_path.display()
             )));
         }
+        compose_nested_imports(
+            instance,
+            imported,
+            dep_target_name,
+            dep_target,
+            &composed_path,
+            manifest,
+            ctx,
+            depth,
+        )?;
         let synthetic = synthetic_target(
             imported,
             dep_target_name,
@@ -213,11 +204,110 @@ fn compose_dep(
             anchor_path.clone(),
             &source_names,
         )?;
-        *counter += 1;
-        graph.targets.push(ComposedTarget {
-            name: namespaced_key(instance, dep_target_name, *counter),
+        *ctx.counter += 1;
+        ctx.graph.targets.push(ComposedTarget {
+            name: namespaced_key(instance, dep_target_name, *ctx.counter),
             target: synthetic,
         });
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "nested composition threads parent instance, anchor path, manifest, ctx, and depth together"
+)]
+fn compose_nested_imports(
+    parent_instance: &Instance,
+    imported: &str,
+    dep_target_name: &str,
+    dep_target: &Target,
+    composed_path: &Path,
+    manifest: &TransitiveManifest,
+    ctx: &mut WalkCtx<'_>,
+    depth: usize,
+) -> Result<()> {
+    for inner_name in dep_target.imports.iter().flatten() {
+        let inner = manifest.sources.get(inner_name).ok_or_else(|| {
+            Error::Config(format!(
+                "imported `{imported}`: target `{dep_target_name}` imports undefined source `{inner_name}`"
+            ))
+        })?;
+        let inner_parsed = ParsedSource::parse(inner_name, inner)
+            .map_err(|e| at_depth(inner_name, depth + 1, &e.to_string()))?;
+        let inner_remote = inner_remote(inner_name, &inner_parsed)
+            .map_err(|e| at_depth(inner_name, depth + 1, &e.to_string()))?;
+        reject_escaping_remote(inner_name, &inner_parsed, &inner_remote, depth + 1)?;
+        let (inner_commit, inner_manifest) = fetch_manifest(
+            inner_name,
+            &inner_parsed,
+            &inner_remote,
+            ctx.backend,
+            ctx.mirror_root,
+            depth + 1,
+        )?;
+        let inner_node = FetchNode::new(
+            &inner_remote,
+            &inner_parsed.refspec().to_string(),
+            &inner_commit,
+        );
+        ctx.visited.insert(inner_node.clone());
+        if ctx.ancestors.contains(&inner_node) {
+            continue;
+        }
+        let inner_instance = Instance::new(
+            &parent_instance.stable_key(),
+            inner_name,
+            dep_target_name,
+            inner_node.clone(),
+        );
+        let nested_anchor = Target {
+            path: composed_path.to_path_buf(),
+            sources: None,
+            layout: None,
+            hooks: None,
+            imports: None,
+            confine: None,
+        };
+        ctx.ancestors.push(inner_node);
+        let composed = compose_dep(
+            &inner_instance,
+            &nested_anchor,
+            inner_name,
+            &inner_manifest,
+            ctx,
+            depth + 1,
+        );
+        ctx.ancestors.pop();
+        composed?;
+    }
+    Ok(())
+}
+
+fn descend_for_validation(
+    name: &str,
+    parsed: &ParsedSource,
+    remote: &str,
+    ctx: &mut WalkCtx<'_>,
+    depth: usize,
+) -> Result<()> {
+    reject_depth_overflow(name, depth)?;
+    let (commit, manifest) =
+        fetch_manifest(name, parsed, remote, ctx.backend, ctx.mirror_root, depth)?;
+    let node = FetchNode::new(remote, &parsed.refspec().to_string(), &commit);
+    if !ctx.visited.insert(node) {
+        return Ok(());
+    }
+    for (inner_name, inner) in &manifest.sources {
+        let inner_parsed = ParsedSource::parse(inner_name, inner)
+            .map_err(|e| at_depth(inner_name, depth + 1, &e.to_string()))?;
+        let inner_remote = inner_remote(inner_name, &inner_parsed)
+            .map_err(|e| at_depth(inner_name, depth + 1, &e.to_string()))?;
+        reject_escaping_remote(inner_name, &inner_parsed, &inner_remote, depth + 1)?;
+        if !inner.is_transitive() {
+            continue;
+        }
+        descend_for_validation(inner_name, &inner_parsed, &inner_remote, ctx, depth + 1)?;
     }
     Ok(())
 }
@@ -402,6 +492,17 @@ fn read_manifest(mirror_root: &Path, remote: &str, commit: &str) -> Result<Strin
         .map_err(|e| Error::Config(format!("phora.toml at `{remote}` is not utf-8: {e}")))
 }
 
+fn reject_depth_overflow(name: &str, depth: usize) -> Result<()> {
+    if depth > MAX_TRANSITIVE_DEPTH {
+        return Err(at_depth(
+            name,
+            depth,
+            &format!("transitive import chain exceeds the maximum depth of {MAX_TRANSITIVE_DEPTH}"),
+        ));
+    }
+    Ok(())
+}
+
 fn at_depth(name: &str, depth: usize, detail: &str) -> Error {
     Error::Config(format!(
         "transitive source `{name}` at depth {depth}: {detail}"
@@ -430,6 +531,18 @@ mod tests {
                 "relative git remote `{remote}` must emit the named diagnostic, got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn depth_cap_fails_closed_past_max() {
+        reject_depth_overflow("dep", MAX_TRANSITIVE_DEPTH).expect("at the limit must be allowed");
+        let err = reject_depth_overflow("dep", MAX_TRANSITIVE_DEPTH + 1)
+            .expect_err("past the limit must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&MAX_TRANSITIVE_DEPTH.to_string()) && msg.contains("depth"),
+            "depth-cap diagnostic must name the limit, got: {msg}"
+        );
     }
 
     #[test]
