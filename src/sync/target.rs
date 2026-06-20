@@ -105,6 +105,7 @@ pub(super) fn deploy_target(
                 mapped_source_key: artifact.mapped_source_key.as_deref(),
                 deploy_rel: artifact.deploy_rel.as_deref(),
                 link_kind: artifact.link_kind,
+                source_locator: artifact.source_locator.as_deref(),
             };
             let outcome = deploy_artifact_entry(run, &entry, backend, registry, journal)?;
             had_failures |= outcome.had_failure;
@@ -124,6 +125,8 @@ struct PlannedArtifact {
     /// Nested map dest under the layout dir; the record still keys on `name` (its basename).
     deploy_rel: Option<PathBuf>,
     link_kind: RecordKind,
+    /// Source relpath under the effective root that discovery matched; the link-target leaf.
+    source_locator: Option<String>,
 }
 
 struct PlannedBinding<'a> {
@@ -177,6 +180,7 @@ fn plan_bindings<'a>(
                     mapped_source_key: Some(key.as_str().to_owned()),
                     deploy_rel: Some(PathBuf::from(dest.as_str())),
                     link_kind: RecordKind::File,
+                    source_locator: None,
                 })
                 .collect()
         } else {
@@ -204,6 +208,7 @@ fn plan_bindings<'a>(
                     mapped_source_key: None,
                     deploy_rel: None,
                     link_kind: a.kind,
+                    source_locator: Some(a.locator),
                 })
                 .collect()
         };
@@ -247,6 +252,8 @@ pub(super) struct ArtifactEntry<'a> {
     pub(super) deploy_rel: Option<&'a Path>,
     /// Link-mode `RecordKind` from discovery's working-tree scan, not a live re-stat.
     pub(super) link_kind: RecordKind,
+    /// Source relpath under the effective root that discovery matched; the link-target leaf.
+    pub(super) source_locator: Option<&'a str>,
 }
 
 fn entry_matched_any(entry: &str, discovered: &[LinkArtifact]) -> Result<bool> {
@@ -669,7 +676,7 @@ fn deploy_link(
 }
 
 /// Absolute working-tree path the symlink points at: `<remote>/<root>/<leaf>`, where
-/// `<leaf>` is the mapped source key for a mapped binding, else the artifact name.
+/// `<leaf>` is the mapped source key, else the matched source locator, else the artifact name.
 fn link_target(entry: &ArtifactEntry<'_>) -> PathBuf {
     let base = Path::new(entry.git);
     let mut target = if base.is_absolute() {
@@ -685,6 +692,7 @@ fn link_target(entry: &ArtifactEntry<'_>) -> PathBuf {
     target.push(
         entry
             .mapped_source_key
+            .or(entry.source_locator)
             .unwrap_or_else(|| entry.artifact_name.as_str()),
     );
     target

@@ -1891,6 +1891,7 @@ fn second_deploy_over_correct_link_is_a_noop() {
         mapped_source_key: None,
         deploy_rel: None,
         link_kind: RecordKind::Dir,
+        source_locator: None,
     };
     let state = check_artifact_state(
         &dst,
@@ -11884,5 +11885,251 @@ fn map_nested_dest_deploys_under_layout_with_basename_record_key() {
         rec.kind,
         RecordKind::File,
         "a nested map dest is a single-file artifact"
+    );
+}
+
+// ── FPS-007: link-mode file & dot-dir artifacts ────────────────
+
+fn fps007_link_worktree() -> TempDir {
+    let td = TempDir::new().expect("fps007 link worktree tempdir");
+    let p = td.path();
+    std::fs::write(p.join("init.lua"), b"-- loose init\n").expect("write init.lua");
+
+    std::fs::create_dir_all(p.join("a").join("b")).expect("mkdir a/b");
+    std::fs::write(p.join("a").join("b").join("c"), b"deep-bytes\n").expect("write a/b/c");
+
+    std::fs::create_dir_all(p.join(".zfunc")).expect("mkdir .zfunc");
+    std::fs::write(p.join(".zfunc").join("_fn"), b"zsh func\n").expect("write .zfunc/_fn");
+
+    std::fs::create_dir_all(p.join("editor")).expect("mkdir editor");
+    std::fs::write(p.join("editor").join("init.lua"), b"-- editor\n").expect("write editor/init");
+    std::fs::write(p.join("editor").join("secret"), b"do-not-share\n")
+        .expect("write editor/secret");
+    td
+}
+
+fn fps007_link_config(wt: &Path, target: &Path, include: &[&str], exclude: &[&str]) -> Config {
+    let quote = |xs: &[&str]| {
+        xs.iter()
+            .map(|x| format!("\"{x}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let exclude_kv = if exclude.is_empty() {
+        String::new()
+    } else {
+        format!(", exclude = [{}]", quote(exclude))
+    };
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.linked]\ngit = \"{}\"\nbranch = \"main\"\ndeploy = \"link\"\n\n\
+         [targets.dest]\npath = \"{}\"\n\
+         sources = {{ linked = {{ include = [{}]{} }} }}\nlayout = \"by-source\"\n",
+        wt.display(),
+        target.display(),
+        quote(include),
+        exclude_kv,
+    );
+    Config::parse(&toml).expect("fps007 link config parses")
+}
+
+#[cfg(unix)]
+#[test]
+fn link_loose_file_deploys_as_symlink_to_the_source_file() {
+    let wt = fps007_link_worktree();
+    let td = TargetDir::new();
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let cfg = fps007_link_config(wt.path(), &td.target_path(), &["init.lua"], &[]);
+
+    sync(&input(&cfg, None, None, None, false), &backend, &registry)
+        .expect("link sync over a loose file must succeed");
+
+    let dst = td.target_path().join("linked").join("init.lua");
+    let meta = std::fs::symlink_metadata(&dst)
+        .expect("the loose file must be deployed at its layout path");
+    assert!(
+        meta.file_type().is_symlink(),
+        "a link-mode loose FILE artifact must deploy as a symlink, not a copy, at {}",
+        dst.display()
+    );
+    assert_eq!(
+        std::fs::read_link(&dst).expect("dst is a symlink"),
+        wt.path().join("init.lua"),
+        "the symlink must point at <remote>/init.lua"
+    );
+    assert_eq!(
+        std::fs::read(&dst).expect("read through the symlink"),
+        b"-- loose init\n",
+        "reading through the symlink must yield the source file's bytes"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn link_nested_file_symlink_targets_the_full_locator_path() {
+    let wt = fps007_link_worktree();
+    let td = TargetDir::new();
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let cfg = fps007_link_config(wt.path(), &td.target_path(), &["a/b/c"], &[]);
+
+    sync(&input(&cfg, None, None, None, false), &backend, &registry)
+        .expect("link sync over a nested file must succeed");
+
+    let dst = td.target_path().join("linked").join("c");
+    let meta = std::fs::symlink_metadata(&dst)
+        .expect("the nested file must be deployed at its basename layout path `c`");
+    assert!(
+        meta.file_type().is_symlink(),
+        "a link-mode nested FILE artifact must deploy as a symlink at {}",
+        dst.display()
+    );
+    assert_eq!(
+        std::fs::read_link(&dst).expect("dst is a symlink"),
+        wt.path().join("a").join("b").join("c"),
+        "the symlink must target the FULL locator path <remote>/a/b/c, not the \
+         basename <remote>/c — link_target must use the nested source path"
+    );
+    assert_eq!(
+        std::fs::read(&dst).expect("read through the symlink resolves the deep file"),
+        b"deep-bytes\n",
+        "reading through the symlink must yield the deep file's bytes — proving the \
+         target resolves to <remote>/a/b/c"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn link_dot_dir_deploys_as_one_whole_dir_symlink() {
+    let wt = fps007_link_worktree();
+    let td = TargetDir::new();
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let cfg = fps007_link_config(wt.path(), &td.target_path(), &[".zfunc"], &[]);
+
+    sync(&input(&cfg, None, None, None, false), &backend, &registry)
+        .expect("link sync over a dot-dir must succeed");
+
+    let dst = td.target_path().join("linked").join(".zfunc");
+    let meta = std::fs::symlink_metadata(&dst).expect(".zfunc must be deployed at its layout path");
+    assert!(
+        meta.file_type().is_symlink(),
+        "a link-mode dot-DIR must deploy as a single symlink at {}, not a copied dir",
+        dst.display()
+    );
+    assert_eq!(
+        std::fs::read_link(&dst).expect("dst is a symlink"),
+        wt.path().join(".zfunc"),
+        "the dir-symlink must target <remote>/.zfunc as a whole"
+    );
+    assert!(
+        std::fs::metadata(&dst).expect("symlink resolves").is_dir(),
+        "the symlink must resolve to a directory (a whole-dir link)"
+    );
+    let dir_link = td.target_path().join("linked");
+    let stray_links: Vec<_> = std::fs::read_dir(&dir_link)
+        .expect("read the by-source dir")
+        .filter_map(std::result::Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        stray_links,
+        vec![".zfunc".to_owned()],
+        "a dot-dir must yield exactly ONE link (`.zfunc`), never one-symlink-per-file; \
+         found {stray_links:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_quarantines_linked_file_record_like_a_linked_dir() {
+    let wt = fps007_link_worktree();
+    let td = TargetDir::new();
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let cfg = fps007_link_config(wt.path(), &td.target_path(), &["init.lua"], &[]);
+
+    sync(&input(&cfg, None, None, None, false), &backend, &registry)
+        .expect("link sync over a loose file must succeed");
+
+    let key = artifact_key("dest", "linked", "init.lua");
+    let deployed = registry
+        .get(&key)
+        .expect("registry get")
+        .expect("a linked loose-file artifact must be recorded");
+    assert!(
+        deployed.linked,
+        "premise: a link-mode FILE record must be `linked`"
+    );
+    assert_eq!(
+        deployed.kind,
+        RecordKind::File,
+        "premise: the loose-file artifact records kind=file"
+    );
+
+    let stray = RegistryRecord {
+        version: 1,
+        key: key.clone(),
+        source: "linked".to_owned(),
+        commit: "link".to_owned(),
+        digest: "link:".to_owned(),
+        projected_at: "2026-06-08T12:00:00Z".to_owned(),
+        layout: "by-source".to_owned(),
+        kind: RecordKind::File,
+        allow_symlinks: false,
+        preserve_executable: true,
+        files: vec![ManifestFile {
+            path: PathBuf::from("init.lua"),
+            size: 7,
+            mtime: 1_700_000_000,
+            blake3: blake3::hash(b"phantom").to_hex().to_string(),
+        }],
+        linked: true,
+        vars_digest: None,
+    };
+    registry
+        .put(&stray)
+        .expect("seed a linked FILE record carrying a stray manifest file");
+
+    std::fs::write(wt.path().join("init.lua"), b"-- EDITED LIVE\n")
+        .expect("edit the live symlink target");
+
+    let mismatches = verify(&cfg, &registry).expect("verify must not error");
+    assert!(
+        !mismatches.iter().any(|m| m.key == key),
+        "a linked FILE record must be quarantined from per-file drift exactly like a \
+         linked dir — no mismatch even with a stray manifest entry, got {mismatches:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn link_dir_with_in_dir_exclude_is_still_a_whole_dir_symlink() {
+    let wt = fps007_link_worktree();
+    let td = TargetDir::new();
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let cfg = fps007_link_config(
+        wt.path(),
+        &td.target_path(),
+        &["editor"],
+        &["editor/secret"],
+    );
+
+    sync(&input(&cfg, None, None, None, false), &backend, &registry)
+        .expect("link sync over a dir with an in-dir exclude must succeed");
+
+    let dst = td.target_path().join("linked").join("editor");
+    let meta = std::fs::symlink_metadata(&dst).expect("editor must deploy at its layout path");
+    assert!(
+        meta.file_type().is_symlink(),
+        "a link-mode DIR artifact is a single whole-dir symlink even with an in-dir exclude"
+    );
+    assert_eq!(
+        std::fs::read_link(&dst).expect("dst is a symlink"),
+        wt.path().join("editor"),
+        "the dir-symlink must target the whole <remote>/editor"
+    );
+    assert_eq!(
+        std::fs::read(dst.join("secret")).expect("the excluded file is reachable through the link"),
+        b"do-not-share\n",
+        "EXPECTED limitation: link mode does NOT granularly apply an in-dir exclude — the \
+         excluded `editor/secret` is still reachable THROUGH the whole-dir symlink"
     );
 }

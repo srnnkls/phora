@@ -10,6 +10,8 @@ use crate::store::RecordKind;
 pub(super) struct LinkArtifact {
     pub(super) name: ArtifactName,
     pub(super) kind: RecordKind,
+    /// Source relpath under the effective root that matched; multi-segment for a nested locator.
+    pub(super) locator: String,
 }
 
 /// Discover artifacts by scanning the live working tree at `<git>/<root>` (Link
@@ -41,8 +43,9 @@ pub(super) fn discover_working_tree(
             return Err(Error::SymlinkNotAllowed { path: name.into() });
         }
         artifacts.push(LinkArtifact {
-            name: ArtifactName::trusted(name),
+            name: ArtifactName::trusted(name.clone()),
             kind: kind_of(file_type.is_dir()),
+            locator: name,
         });
     }
 
@@ -68,6 +71,7 @@ pub(super) fn discover_working_tree(
         artifacts.push(LinkArtifact {
             name: ArtifactName::trusted(locator_basename(locator)),
             kind: kind_of(meta.is_dir()),
+            locator: locator.clone(),
         });
     }
 
@@ -116,6 +120,7 @@ pub(super) fn discover_link_artifacts(
             .discover_artifacts(source_name, git, commit, root, selection)?
             .into_iter()
             .map(|name| LinkArtifact {
+                locator: name.as_str().to_owned(),
                 name,
                 kind: RecordKind::Dir,
             })
