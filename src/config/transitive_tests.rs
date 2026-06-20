@@ -1,5 +1,11 @@
 use super::*;
 use crate::config::transitive::{FetchNode, Instance, TransitiveManifest};
+use crate::config::{CandidateHook, admit_transitive_hooks};
+
+fn composed_instance() -> Instance {
+    let fetch = FetchNode::new("https://github.com/dep/x.git", "main", "blake3:dead");
+    Instance::new("root", "dep", "anchor", fetch)
+}
 
 fn raw_source(body: &str) -> Source {
     let toml = format!("version = 1\n\n[sources.s]\n{body}");
@@ -316,5 +322,186 @@ fn imports_reference_to_an_undefined_source_is_rejected() {
     assert!(
         msg.contains("ghost"),
         "the rejection must name the undefined source `ghost`, got: {msg}"
+    );
+}
+
+// TDEP-HOOK-GATE-001
+
+const DEP_MANIFEST_WITH_TRUST_AND_HOOKS: &str = r#"
+version = 1
+trust = "all"
+trusted_hooks = ["editor#./install.sh"]
+allow_hooks = true
+
+[sources.nvim]
+git = "https://github.com/dep/nvim.git"
+
+[targets.editor]
+path = "nvim"
+sources = ["nvim"]
+
+[targets.editor.hooks]
+on_change = "./install.sh"
+"#;
+
+#[test]
+fn manifest_drops_trust_control_yet_retains_per_target_hooks() {
+    let manifest = TransitiveManifest::parse(DEP_MANIFEST_WITH_TRUST_AND_HOOKS).expect(
+        "a manifest carrying BOTH trust-control fields AND a [targets.X.hooks] block must parse — \
+         trust-control tolerated-and-dropped, hooks retained opaque",
+    );
+    let rendered = format!("{manifest:?}");
+    for dropped in ["trust", "trusted_hooks", "allow_hooks", "\"all\""] {
+        assert!(
+            !rendered.contains(dropped),
+            "no API may expose the dropped trust-control field `{dropped}`, got: {rendered}"
+        );
+    }
+    let hooks = manifest
+        .hooks()
+        .expect("the per-target hooks must still be retained as an opaque value");
+    let reserialized = toml::to_string(hooks).expect("opaque payload round-trips to TOML");
+    assert!(
+        reserialized.contains("./install.sh"),
+        "the per-target hook command must survive verbatim in the opaque payload even when the \
+         manifest also carried trust-control, got: {reserialized}"
+    );
+}
+
+#[test]
+fn admission_interprets_opaque_into_structured_candidate_keyed_by_instance() {
+    let manifest = TransitiveManifest::parse(DEP_MANIFEST).expect("dep manifest parses");
+    let opaque = manifest
+        .hooks()
+        .expect("manifest retains opaque per-target hooks");
+    let instance = composed_instance();
+
+    let candidates = admit_transitive_hooks(opaque, "editor", "ns%1%editor", &instance);
+
+    assert_eq!(
+        candidates.len(),
+        1,
+        "the `editor` target's single on_change command must yield exactly one candidate, got: {candidates:?}"
+    );
+    let candidate = &candidates[0];
+    assert_eq!(
+        candidate.dep_instance,
+        instance.stable_key(),
+        "a candidate must own the CONFINED instance's stable_key() as dep_instance, not a bare name"
+    );
+    assert_eq!(
+        candidate.command,
+        crate::config::HookCommand {
+            run: "./install.sh".to_owned(),
+            shell: None,
+        },
+        "the opaque toml::Value must be INTERPRETED into the structured HookCommand DTO (run/shell)"
+    );
+    assert!(
+        candidate.hook_id.starts_with("ns%1%editor#"),
+        "the hook_id must namespace the COMPOSED target name then the scope, got: {}",
+        candidate.hook_id
+    );
+    assert!(
+        candidate.hook_id.contains("on_change") || candidate.hook_id.contains("on-change"),
+        "the hook_id must name the on_change scope, got: {}",
+        candidate.hook_id
+    );
+}
+
+#[test]
+fn admission_yields_no_candidates_for_a_target_with_no_hooks() {
+    let manifest = TransitiveManifest::parse(DEP_MANIFEST).expect("dep manifest parses");
+    let opaque = manifest
+        .hooks()
+        .expect("manifest retains opaque per-target hooks");
+    let instance = composed_instance();
+
+    let candidates = admit_transitive_hooks(opaque, "nonexistent", "ns%1%nonexistent", &instance);
+
+    assert!(
+        candidates.is_empty(),
+        "a composed target the dep declared no hooks for must yield zero candidates, got: {candidates:?}"
+    );
+}
+
+#[test]
+fn admission_produces_candidates_but_never_a_trusted_marker() {
+    let manifest = TransitiveManifest::parse(DEP_MANIFEST_WITH_TRUST_AND_HOOKS)
+        .expect("dep manifest with trust-control + hooks parses");
+    let opaque = manifest
+        .hooks()
+        .expect("manifest retains opaque per-target hooks");
+    let instance = composed_instance();
+
+    let candidates: Vec<CandidateHook> =
+        admit_transitive_hooks(opaque, "editor", "ns%1%editor", &instance);
+
+    assert_eq!(
+        candidates.len(),
+        1,
+        "even a manifest declaring `trust = \"all\"` produces a CANDIDATE, never a pre-approved hook"
+    );
+    let rendered = format!("{:?}", candidates[0]);
+    assert!(
+        !rendered.to_lowercase().contains("trust") && !rendered.to_lowercase().contains("approv"),
+        "a CandidateHook must carry no trust/approval state — GATE strips by default; the \
+         dep's own trust-control can never self-approve, got: {rendered}"
+    );
+}
+
+fn hook_id_for(run: &str, shell: Option<&str>) -> String {
+    let toml = match shell {
+        None => format!(
+            "version = 1\n\n[sources.nvim]\ngit = \"https://github.com/dep/nvim.git\"\n\n\
+             [targets.editor]\npath = \"nvim\"\nsources = [\"nvim\"]\n\n\
+             [targets.editor.hooks]\non_change = {{ run = \"{run}\" }}\n"
+        ),
+        Some(shell) => format!(
+            "version = 1\n\n[sources.nvim]\ngit = \"https://github.com/dep/nvim.git\"\n\n\
+             [targets.editor]\npath = \"nvim\"\nsources = [\"nvim\"]\n\n\
+             [targets.editor.hooks]\non_change = {{ run = \"{run}\", shell = \"{shell}\" }}\n"
+        ),
+    };
+    let manifest = TransitiveManifest::parse(&toml).expect("manifest parses");
+    let opaque = manifest.hooks().expect("manifest retains opaque hooks");
+    let instance = composed_instance();
+    let candidates = admit_transitive_hooks(opaque, "editor", "ns%1%editor", &instance);
+    candidates
+        .into_iter()
+        .next()
+        .expect("one candidate")
+        .hook_id
+}
+
+#[test]
+fn hook_id_resists_hash_delimiter_injection() {
+    let injected = hook_id_for("x", Some("y#z"));
+    let benign = hook_id_for("x#y", Some("z"));
+    assert_ne!(
+        injected, benign,
+        "two DISTINCT (run, shell) commands that collide under unescaped `#` concatenation must \
+         NOT share a hook_id; an injected `#` cannot forge a trust key, \
+         got injected={injected} benign={benign}"
+    );
+}
+
+#[test]
+fn hook_id_canonicalizes_absent_and_explicit_default_shell() {
+    let absent = hook_id_for("./install.sh", None);
+    let explicit = hook_id_for("./install.sh", Some("sh -c"));
+    assert_eq!(
+        absent, explicit,
+        "shell = None and shell = Some(\"sh -c\") are the same effective command and MUST share \
+         one trust key, got absent={absent} explicit={explicit}"
+    );
+}
+
+#[test]
+fn hook_id_preserves_greppable_prefix_and_namespacing() {
+    let id = hook_id_for("./install.sh", None);
+    assert!(
+        id.starts_with("ns%1%editor#on_change#"),
+        "the human-readable `composed_target#on_change#` prefix must survive for auditing, got: {id}"
     );
 }

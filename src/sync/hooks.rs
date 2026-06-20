@@ -3,13 +3,9 @@
 use std::collections::BTreeSet;
 use std::process::Command;
 
-use crate::config::{Config, HookCommand, HookWhen, LayoutConfig};
+use crate::config::{Config, DEFAULT_SHELL_PREFIX, HookCommand, HookWhen, LayoutConfig};
 use crate::error::{Error, Result};
 use crate::store::{Registry, RegistryRecord};
-
-/// `shell` is split on whitespace, so an interpreter path containing spaces is
-/// unsupported; the first token is the program, the rest are leading args.
-const DEFAULT_SHELL_PREFIX: &str = "sh -c";
 
 /// Which hook table a [`HookOutcome`] came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

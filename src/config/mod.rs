@@ -20,7 +20,10 @@ use serde::Deserialize;
 use crate::error::{Error, Result};
 pub use crate::source::Protocol;
 
-pub use hooks::{GlobalHooks, HookCommand, HookWhen, TargetHooks};
+pub(crate) use hooks::DEFAULT_SHELL_PREFIX;
+pub use hooks::{
+    CandidateHook, GlobalHooks, HookCommand, HookWhen, TargetHooks, admit_transitive_hooks,
+};
 pub use host::{AuthConfig, Host, RemoteConfig, builtin_forges};
 pub use migrate::MigrationWarning;
 pub use source::{DeployMode, ParsedSource, Refspec, Remote, Source, SourceMode};
