@@ -136,6 +136,11 @@ impl Config {
     fn validate_bindings(&self) -> Result<()> {
         for (target_name, target) in &self.targets {
             for (identity, binding) in target.sources.iter().flatten() {
+                if crate::kernel::safe_component(identity).is_err() {
+                    return Err(Error::Config(format!(
+                        "target `{target_name}`: binding identity `{identity}` must be a single safe path component"
+                    )));
+                }
                 let effective = binding.effective_source(identity);
                 let Some(source) = self.sources.get(effective) else {
                     return Err(Error::Config(format!(
@@ -283,36 +288,35 @@ fn reject_map(source_name: &str, binding: &Binding) -> Result<()> {
     let Some(map) = &binding.map else {
         return Ok(());
     };
-    let source = source_name;
     if binding.include.is_some() {
         return Err(Error::Config(format!(
-            "source `{source}`: `map` cannot be combined with `include`"
+            "source `{source_name}`: `map` cannot be combined with `include`"
         )));
     }
     if binding.exclude.is_some() {
         return Err(Error::Config(format!(
-            "source `{source}`: `map` cannot be combined with `exclude`"
+            "source `{source_name}`: `map` cannot be combined with `exclude`"
         )));
     }
     if map.is_empty() {
         return Err(Error::Config(format!(
-            "source `{source}`: `map` must not be empty"
+            "source `{source_name}`: `map` must not be empty"
         )));
     }
     for (key, value) in map {
         if key.is_empty() || value.is_empty() {
             return Err(Error::Config(format!(
-                "source `{source}`: `map` entry `{key}` -> `{value}` must have a non-empty key and value"
+                "source `{source_name}`: `map` entry `{key}` -> `{value}` must have a non-empty key and value"
             )));
         }
         if crate::kernel::safe_component(value).is_err() {
             return Err(Error::Config(format!(
-                "source `{source}`: `map` dest `{value}` must be a single safe filename"
+                "source `{source_name}`: `map` dest `{value}` must be a single safe filename"
             )));
         }
         if key.starts_with('/') || key.split('/').any(|c| c == "..") {
             return Err(Error::Config(format!(
-                "source `{source}`: `map` key `{key}` must stay inside the source root"
+                "source `{source_name}`: `map` key `{key}` must stay inside the source root"
             )));
         }
     }
@@ -320,7 +324,7 @@ fn reject_map(source_name: &str, binding: &Binding) -> Result<()> {
     for value in map.values() {
         if !seen_dests.insert(value) {
             return Err(Error::Config(format!(
-                "source `{source}`: `map` dest `{value}` is the target of more than one key; \
+                "source `{source_name}`: `map` dest `{value}` is the target of more than one key; \
                  distinct sources would clobber one dest"
             )));
         }

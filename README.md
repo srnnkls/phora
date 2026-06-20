@@ -398,8 +398,9 @@ tree rather than a pinned commit.
 and the `by-source` and `prefixed` layout labels, and is structurally unique because
 TOML keys are unique. To feed one source into one target as two slices, give each a
 distinct key, each re-rooting the same `source`. A genuine destination clash between
-bindings is caught at sync as a collision. The slices below take distinct keys for
-legible `by-source` labels (`nvim/…`, `helix/…`):
+bindings is caught at sync as a collision. Bindings resolve in identity (key) order,
+sorted alphabetically — independent of how a flat `sources` list is written. The
+slices below take distinct keys for legible `by-source` labels (`nvim/…`, `helix/…`):
 
 ```toml
 [targets.editors]
