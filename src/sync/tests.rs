@@ -322,6 +322,7 @@ fn input<'a>(
         interactive: false,
         prune: false,
         no_hooks: false,
+        frozen: false,
         resolver: None,
         jobs: None,
     }
@@ -443,8 +444,18 @@ fn link_source_resolves_without_mirror_into_audit_lock_entry() {
     let counting = CountingBackend::new(&fx.backend);
     let parsed = cfg.parsed_sources().expect("sources parse");
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
-    let (routed, _commits) = resolve_sources(&cfg, &parsed, &remotes, None, &counting, false, None)
-        .expect("link source resolves with no reachable mirror");
+    let (routed, _commits) = resolve_sources(
+        &cfg,
+        &parsed,
+        &remotes,
+        &BTreeMap::new(),
+        None,
+        &counting,
+        false,
+        false,
+        None,
+    )
+    .expect("link source resolves with no reachable mirror");
 
     let (_name, locked) = routed
         .iter()
@@ -480,8 +491,18 @@ fn link_source_skips_fetch_and_mirror_digest() {
     let counting = CountingBackend::new(&fx.backend);
     let parsed = cfg.parsed_sources().expect("sources parse");
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
-    let _ = resolve_sources(&cfg, &parsed, &remotes, None, &counting, false, None)
-        .expect("link source resolves without touching the mirror");
+    let _ = resolve_sources(
+        &cfg,
+        &parsed,
+        &remotes,
+        &BTreeMap::new(),
+        None,
+        &counting,
+        false,
+        false,
+        None,
+    )
+    .expect("link source resolves without touching the mirror");
 
     assert_eq!(
         counting.fetch_count(),
@@ -518,7 +539,9 @@ fn matching_lock_reuses_commit_without_refetch() {
             digest: expected_digest(&fx, "editor-src", &fx.head_sha),
             config_digest: source.config_digest(),
             r#ref: None,
+            instance: None,
         }],
+        trusted_hooks: Vec::new(),
     };
 
     // Advance HEAD: if sync re-resolved, it would pick up the new commit.
@@ -569,7 +592,9 @@ fn non_matching_lock_triggers_fetch() {
             digest: "blake3:stale".to_owned(),
             config_digest: "blake3:stale".to_owned(),
             r#ref: None,
+            instance: None,
         }],
+        trusted_hooks: Vec::new(),
     };
 
     let counting = CountingBackend::new(&fx.backend);
@@ -588,6 +613,236 @@ fn non_matching_lock_triggers_fetch() {
     assert_eq!(
         locked.commit, fx.head_sha,
         "stale lock must be replaced by the freshly resolved HEAD"
+    );
+}
+
+// ── TDEP-LOCK-001: --frozen refuses to fetch absent/drifted sources ────
+
+struct DenyNetworkBackend<'a> {
+    inner: &'a GitBackend,
+}
+
+impl SourceBackend for DenyNetworkBackend<'_> {
+    fn fetch(&self, _source: &crate::kernel::SourceName, _url: &str) -> SourceResult<()> {
+        Err(SourceError::Source("frozen must not fetch".to_owned()))
+    }
+    fn resolve(
+        &self,
+        _source: &crate::kernel::SourceName,
+        _url: &str,
+        _refspec: &Refspec,
+    ) -> SourceResult<String> {
+        Err(SourceError::Source("frozen must not resolve".to_owned()))
+    }
+    fn commit_time(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        commit: &str,
+    ) -> SourceResult<u64> {
+        self.inner.commit_time(source, url, commit)
+    }
+    fn discover_artifacts(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        commit: &str,
+        root: Option<&Path>,
+        selection: &crate::kernel::Selection,
+    ) -> SourceResult<Vec<crate::kernel::ArtifactName>> {
+        self.inner
+            .discover_artifacts(source, url, commit, root, selection)
+    }
+    fn export_artifact(&self, req: &ExportRequest<'_>) -> SourceResult<ExportResult> {
+        self.inner.export_artifact(req)
+    }
+    fn compute_digest(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        commit: &str,
+        root: Option<&Path>,
+        selection: &crate::kernel::Selection,
+    ) -> SourceResult<String> {
+        self.inner
+            .compute_digest(source, url, commit, root, selection)
+    }
+    fn list_artifact_files(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        commit: &str,
+        root: Option<&Path>,
+        artifact: &crate::kernel::ArtifactName,
+        selection: &crate::kernel::Selection,
+    ) -> SourceResult<Vec<std::path::PathBuf>> {
+        self.inner
+            .list_artifact_files(source, url, commit, root, artifact, selection)
+    }
+}
+
+#[test]
+fn frozen_errors_naming_source_when_no_lock_entry() {
+    let fx = build_sync_fixture();
+    let cfg = config_with_source("editor-src", &fx.url);
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+
+    let backend = DenyNetworkBackend { inner: &fx.backend };
+    let err = resolve_sources(
+        &cfg,
+        &parsed,
+        &remotes,
+        &BTreeMap::new(),
+        None,
+        &backend,
+        false,
+        true,
+        None,
+    )
+    .expect_err("frozen with no lock entry must hard-error instead of fetching");
+
+    assert!(
+        err.to_string().contains("editor-src"),
+        "the frozen diagnostic must name the missing source, got: {err}"
+    );
+}
+
+#[test]
+fn frozen_reuses_matching_lock_without_touching_network() {
+    let fx = build_sync_fixture();
+    let cfg = config_with_source("editor-src", &fx.url);
+    let source = parsed_of(&cfg, "editor-src");
+    fx.backend
+        .fetch(&sn("editor-src"), &fx.url)
+        .expect("seed mirror so compute_digest can read the tree");
+
+    let prior = Lock {
+        version: crate::lock::LOCK_SCHEMA_VERSION,
+        sources: vec![crate::lock::LockedSource {
+            name: "editor-src".to_owned(),
+            git: fx.url.clone(),
+            resolved: source.refspec().to_string(),
+            commit: fx.head_sha.clone(),
+            digest: expected_digest(&fx, "editor-src", &fx.head_sha),
+            config_digest: source.config_digest(),
+            r#ref: None,
+            instance: None,
+        }],
+        trusted_hooks: Vec::new(),
+    };
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+
+    let backend = DenyNetworkBackend { inner: &fx.backend };
+    let (routed, _commits) = resolve_sources(
+        &cfg,
+        &parsed,
+        &remotes,
+        &BTreeMap::new(),
+        Some(&prior),
+        &backend,
+        false,
+        true,
+        None,
+    )
+    .expect("frozen with a matching lock must reuse it without fetch/resolve");
+
+    let (_name, locked) = routed
+        .iter()
+        .find(|(n, _)| n == "editor-src")
+        .expect("the matched source is routed from the lock");
+    assert_eq!(
+        locked.commit, fx.head_sha,
+        "frozen must reuse the locked commit, proving it never resolved the cached mirror"
+    );
+}
+
+#[test]
+fn frozen_errors_on_drifted_lock_entry() {
+    let fx = build_sync_fixture();
+    let cfg = config_with_source("editor-src", &fx.url);
+
+    let drifted = Lock {
+        version: crate::lock::LOCK_SCHEMA_VERSION,
+        sources: vec![crate::lock::LockedSource {
+            name: "editor-src".to_owned(),
+            git: "https://github.com/other/repo.git".to_owned(),
+            resolved: "main".to_owned(),
+            commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
+            digest: "blake3:stale".to_owned(),
+            config_digest: "blake3:stale".to_owned(),
+            r#ref: None,
+            instance: None,
+        }],
+        trusted_hooks: Vec::new(),
+    };
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+
+    let backend = DenyNetworkBackend { inner: &fx.backend };
+    let err = resolve_sources(
+        &cfg,
+        &parsed,
+        &remotes,
+        &BTreeMap::new(),
+        Some(&drifted),
+        &backend,
+        false,
+        true,
+        None,
+    )
+    .expect_err("frozen with a drifted lock entry must hard-error, not re-resolve");
+
+    assert!(
+        err.to_string().contains("editor-src"),
+        "the frozen drift diagnostic must name the drifted source, got: {err}"
+    );
+}
+
+#[test]
+fn non_frozen_reresolves_drifted_lock_entry() {
+    let fx = build_sync_fixture();
+    let cfg = config_with_source("editor-src", &fx.url);
+
+    let drifted = Lock {
+        version: crate::lock::LOCK_SCHEMA_VERSION,
+        sources: vec![crate::lock::LockedSource {
+            name: "editor-src".to_owned(),
+            git: "https://github.com/other/repo.git".to_owned(),
+            resolved: "main".to_owned(),
+            commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
+            digest: "blake3:stale".to_owned(),
+            config_digest: "blake3:stale".to_owned(),
+            r#ref: None,
+            instance: None,
+        }],
+        trusted_hooks: Vec::new(),
+    };
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+
+    let counting = CountingBackend::new(&fx.backend);
+    let (routed, _commits) = resolve_sources(
+        &cfg,
+        &parsed,
+        &remotes,
+        &BTreeMap::new(),
+        Some(&drifted),
+        &counting,
+        false,
+        false,
+        None,
+    )
+    .expect("without --frozen a drifted lock must re-resolve, not error");
+
+    let (_name, locked) = routed
+        .iter()
+        .find(|(n, _)| n == "editor-src")
+        .expect("source re-resolved");
+    assert_eq!(
+        locked.commit, fx.head_sha,
+        "non-frozen drift must re-resolve to the fixture HEAD, replacing the stale lock"
     );
 }
 
@@ -612,7 +867,9 @@ fn force_refetches_even_when_lock_matches() {
             digest: expected_digest(&fx, "editor-src", &fx.head_sha),
             config_digest: source.config_digest(),
             r#ref: None,
+            instance: None,
         }],
+        trusted_hooks: Vec::new(),
     };
 
     // Advance HEAD after seeding the matching lock: force must pick up C2.
@@ -1911,6 +2168,7 @@ fn sync_with_prune_removes_orphan_files_and_record_but_keeps_current() {
         interactive: false,
         prune: true,
         no_hooks: false,
+        frozen: false,
         resolver: None,
         jobs: None,
     };
@@ -1982,6 +2240,7 @@ fn sync_skips_prune_when_a_deploy_failed() {
         interactive: false,
         prune: true,
         no_hooks: false,
+        frozen: false,
         resolver: None,
         jobs: None,
     };
@@ -2209,6 +2468,7 @@ fn interactive_input<'a>(
         interactive: true,
         prune: false,
         no_hooks: false,
+        frozen: false,
         resolver: Some(resolver),
         jobs: None,
     }
@@ -3515,7 +3775,9 @@ fn link_lock(source: &str, link_git: &Path) -> Lock {
             digest: "link:".to_owned(),
             config_digest: "blake3:link".to_owned(),
             r#ref: None,
+            instance: None,
         }],
+        trusted_hooks: Vec::new(),
     }
 }
 
@@ -6035,7 +6297,9 @@ fn lock_with(cfg: &Config, name: &str, git: &str, commit: &str) -> Lock {
             digest: "blake3:locked".to_owned(),
             config_digest: source.config_digest(),
             r#ref: None,
+            instance: None,
         }],
+        trusted_hooks: Vec::new(),
     }
 }
 
@@ -6208,6 +6472,7 @@ fn preview_still_plans_other_bindings_when_one_source_needs_sync() {
                 .sources
                 .remove(0),
         ],
+        trusted_hooks: Vec::new(),
     };
 
     let plans = preview_targets(&cfg, &parsed, &remotes, &backend, Some(&lock), false)
@@ -6428,6 +6693,7 @@ fn preview_annotates_predicted_flat_collision_as_warning_not_error() {
             lock_with(&cfg, "src-a", &fx_a.1, &a_head).sources.remove(0),
             lock_with(&cfg, "src-b", &fx_b.1, &b_head).sources.remove(0),
         ],
+        trusted_hooks: Vec::new(),
     };
 
     let result = preview_targets(&cfg, &parsed, &remotes, &backend, Some(&lock), false);
@@ -6577,6 +6843,7 @@ fn build_preview_fixture() -> PreviewFixture {
                 digest: "blake3:a".to_owned(),
                 config_digest: parsed_of(&cfg, "editor-src").config_digest(),
                 r#ref: None,
+                instance: None,
             },
             LockedSource {
                 name: "lint-src".to_owned(),
@@ -6586,8 +6853,10 @@ fn build_preview_fixture() -> PreviewFixture {
                 digest: "blake3:b".to_owned(),
                 config_digest: parsed_of(&cfg, "lint-src").config_digest(),
                 r#ref: None,
+                instance: None,
             },
         ],
+        trusted_hooks: Vec::new(),
     };
 
     PreviewFixture {
@@ -7169,6 +7438,7 @@ fn render_preview_tree_warns_about_a_predicted_collision_naming_both_sources() {
                 digest: "blake3:a".to_owned(),
                 config_digest: parsed_of(&cfg, "src-a").config_digest(),
                 r#ref: None,
+                instance: None,
             },
             LockedSource {
                 name: "src-b".to_owned(),
@@ -7178,8 +7448,10 @@ fn render_preview_tree_warns_about_a_predicted_collision_naming_both_sources() {
                 digest: "blake3:b".to_owned(),
                 config_digest: parsed_of(&cfg, "src-b").config_digest(),
                 r#ref: None,
+                instance: None,
             },
         ],
+        trusted_hooks: Vec::new(),
     };
     let sel = PreviewSelectors {
         source: None,
@@ -7920,7 +8192,9 @@ fn preview_target_reflects_binding_effective_selection() {
             digest: "blake3:a".to_owned(),
             config_digest: parsed_of(&cfg, "editor-src").config_digest(),
             r#ref: None,
+            instance: None,
         }],
+        trusted_hooks: Vec::new(),
     };
 
     let plans = preview_targets(&cfg, &parsed, &remotes, &backend, Some(&lock), true)
@@ -8435,6 +8709,7 @@ fn prune_only_sync_skips_on_change_but_runs_post_sync() {
         interactive: false,
         prune: true,
         no_hooks: false,
+        frozen: false,
         resolver: None,
         jobs: None,
     };
@@ -10371,6 +10646,7 @@ fn input_with_jobs(base: &Config, jobs: usize) -> SyncInput<'_> {
         interactive: false,
         prune: false,
         no_hooks: false,
+        frozen: false,
         resolver: None,
         jobs: Some(jobs),
     }
@@ -10542,8 +10818,18 @@ fn url_sources_sharing_one_url_each_fetch_so_per_source_digest_is_validated() {
     let parsed = cfg.parsed_sources().expect("sources parse");
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
 
-    resolve_sources(&cfg, &parsed, &remotes, None, &recording, false, Some(4))
-        .expect("two url sources sharing one url resolve");
+    resolve_sources(
+        &cfg,
+        &parsed,
+        &remotes,
+        &BTreeMap::new(),
+        None,
+        &recording,
+        false,
+        false,
+        Some(4),
+    )
+    .expect("two url sources sharing one url resolve");
 
     assert!(
         recording.was_fetched("alpha"),

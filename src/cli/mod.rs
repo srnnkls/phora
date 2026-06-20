@@ -100,6 +100,8 @@ pub enum Command {
         force: bool,
         #[arg(long)]
         no_hooks: bool,
+        #[arg(long)]
+        frozen: bool,
         #[arg(long, short = 'j')]
         jobs: Option<usize>,
     },
@@ -269,8 +271,9 @@ pub fn run(cli: Cli) -> Result<()> {
             prune,
             force,
             no_hooks,
+            frozen,
             jobs,
-        } => sync::run_sync(prune, force, no_hooks, None, jobs),
+        } => sync::run_sync(prune, force, no_hooks, frozen, None, jobs),
         Command::Update { source } => sync::run_update(source.as_deref()),
         Command::List { plan } => query::run_list(plan),
         Command::Verify => {
@@ -567,7 +570,10 @@ fn drop_sources(lock: Option<&mut crate::lock::Lock>, drop: &DropSources) {
     let Some(lock) = lock else { return };
     match drop {
         DropSources::All => lock.sources.clear(),
-        DropSources::One(name) => lock.sources.retain(|s| &s.name != name),
+        // Drop the named consumer source plus every transitive node, forcing the subtree to re-resolve.
+        DropSources::One(name) => lock
+            .sources
+            .retain(|s| &s.name != name && s.instance.is_none()),
     }
 }
 

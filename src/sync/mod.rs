@@ -67,6 +67,8 @@ pub struct SyncInput<'a> {
     pub interactive: bool,
     pub prune: bool,
     pub no_hooks: bool,
+    /// Refuse to fetch or re-resolve: a source absent from or drifted in the lock hard-errors.
+    pub frozen: bool,
     pub resolver: Option<&'a dyn ConflictResolver>,
     /// Worker-pool size for parallel fetch/resolve/digest. `None` derives a
     /// default of `min(resolution_units, 8)`; `Some(n)` pins the pool to `n`.
@@ -167,6 +169,14 @@ pub(super) fn nonce() -> u64 {
     COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+fn effective_lock(input: &SyncInput<'_>) -> Option<Lock> {
+    match (&input.base_lock, &input.local_lock) {
+        (Some(base), local) => Some(merge_locks(base, local.as_ref())),
+        (None, Some(local)) => Some(local.clone()),
+        (None, None) => None,
+    }
+}
+
 pub fn sync(
     input: &SyncInput<'_>,
     backend: &(dyn SourceBackend + Sync),
@@ -177,16 +187,18 @@ pub fn sync(
     effective_config.validate()?;
     let mut parsed = effective_config.parsed_sources()?;
     let mut remotes = resolved_remotes(&effective_config, &parsed)?;
-    let graph = transitive::resolve_transitive_graph(&effective_config, &parsed, backend)?;
-    graph.inject(&mut effective_config, &mut parsed, &mut remotes);
+    let effective_lock = effective_lock(input);
+    let graph = transitive::resolve_transitive_graph(
+        &effective_config,
+        &parsed,
+        backend,
+        input.frozen,
+        effective_lock.as_ref(),
+    )?;
+    let instances = graph.inject(&mut effective_config, &mut parsed, &mut remotes);
     for warning in validate_link_mode(input.base_config, &parsed, &remotes)? {
         eprintln!("phora: {warning}");
     }
-    let effective_lock = match (&input.base_lock, &input.local_lock) {
-        (Some(base), local) => Some(merge_locks(base, local.as_ref())),
-        (None, Some(local)) => Some(local.clone()),
-        (None, None) => None,
-    };
 
     let local_names: BTreeSet<String> = input
         .local_config
@@ -213,9 +225,11 @@ pub fn sync(
         &effective_config,
         &parsed,
         &remotes,
+        &instances,
         effective_lock.as_ref(),
         backend,
         input.force,
+        input.frozen,
         input.jobs,
     )?;
     let (base_lock, local_lock) = split_locks(routed, &local_names);
