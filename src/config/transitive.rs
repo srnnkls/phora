@@ -128,4 +128,22 @@ impl Instance {
     pub fn fetch_node(&self) -> &FetchNode {
         &self.fetch_node
     }
+
+    /// Length-prefixed field hash; stable across field reorders, unlike a `Debug` rendering.
+    #[must_use]
+    pub fn stable_key(&self) -> String {
+        let mut hasher = blake3::Hasher::new();
+        for field in [
+            self.parent.as_str(),
+            self.source_name.as_str(),
+            self.anchor_target.as_str(),
+            self.fetch_node.url.as_str(),
+            self.fetch_node.r#ref.as_str(),
+            self.fetch_node.digest.as_str(),
+        ] {
+            hasher.update(&(field.len() as u64).to_le_bytes());
+            hasher.update(field.as_bytes());
+        }
+        hasher.finalize().to_hex()[..16].to_owned()
+    }
 }

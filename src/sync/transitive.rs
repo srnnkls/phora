@@ -1,92 +1,154 @@
 //! Serial, cycle-guarded transitive pre-pass: before the parallel resolve pool,
-//! walk every `transitive = true` source's own `phora.toml`, fetching and parsing
-//! each dep manifest. A failure at any depth fails the sync fail-fast, before any
-//! lock write. This phase only resolves the graph; admission/composition is later.
+//! walk every imported `transitive = true` source's own `phora.toml`, fetching and
+//! parsing each dep manifest, and produce a namespaced composition graph. A failure
+//! at any depth fails the sync fail-fast, before any lock write.
 
-use std::collections::BTreeSet;
-use std::path::Path;
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
 
-use crate::config::transitive::TransitiveManifest;
-use crate::config::{Config, ParsedSource, Remote, SourceMode};
+use crate::config::transitive::{FetchNode, Instance, TransitiveManifest};
+use crate::config::{Binding, Config, ParsedSource, Remote, SourceMode, Target};
 use crate::error::{Error, Result};
-use crate::kernel::SourceName;
-use crate::source::{NormalizedUrl, SourceBackend, is_local_path, mirror_path};
+use crate::kernel::{SourceName, safe_component};
+use crate::source::{SourceBackend, is_local_path, mirror_path};
 
 use super::resolved_remotes;
 
-/// Walks the transitive graph rooted at `config`'s `transitive = true` sources.
-/// A failure naming a source below the top level carries `at depth N`.
-pub(super) fn resolve_transitive_graph(
-    config: &Config,
-    parsed: &std::collections::BTreeMap<String, ParsedSource>,
-    backend: &(dyn SourceBackend + Sync),
-) -> Result<()> {
-    let Some(mirror_root) = backend.mirror_root() else {
-        return Ok(());
-    };
-    let mut visited: BTreeSet<(String, String)> = BTreeSet::new();
-    let remotes = resolved_remotes(config, parsed)?;
-    for (name, source) in parsed {
-        if !source.is_transitive() {
-            continue;
-        }
-        let remote = remotes
-            .get(name)
-            .map(String::as_str)
-            .ok_or_else(|| Error::Config(format!("no resolved remote for source `{name}`")))?;
-        reject_escaping_remote(name, source, remote, 1)?;
-        walk(name, source, remote, backend, mirror_root, &mut visited, 1)?;
-    }
-    Ok(())
+/// Named-diagnostic phrase emitted when two composed dep targets land on one destination.
+const COMPOSED_DEST_COLLISION: &str = "composed targets resolve to the same destination";
+
+/// One dep target composed under a consumer anchor: a synthetic absolute-path
+/// target carrying the dep's own layout, bound to namespaced source instances.
+pub(super) struct ComposedTarget {
+    pub(super) name: String,
+    pub(super) target: Target,
 }
 
-/// One transitive node: fetch the dep, read its `phora.toml`, recurse into the
-/// dep's own `transitive = true` sources. `(normalized-url, ref)` bounds cycles.
-fn walk(
-    name: &str,
-    source: &ParsedSource,
-    remote: &str,
+/// The transitive pre-pass output: composed targets plus the namespaced source
+/// instances (and their resolved remotes) those targets bind.
+#[derive(Default)]
+pub(super) struct ResolvedGraph {
+    pub(super) targets: Vec<ComposedTarget>,
+    pub(super) sources: BTreeMap<String, ParsedSource>,
+    pub(super) remotes: BTreeMap<String, String>,
+}
+
+impl ResolvedGraph {
+    pub(super) fn inject(
+        self,
+        config: &mut Config,
+        parsed: &mut BTreeMap<String, ParsedSource>,
+        remotes: &mut BTreeMap<String, String>,
+    ) {
+        parsed.extend(self.sources);
+        remotes.extend(self.remotes);
+        for composed in self.targets {
+            config.targets.insert(composed.name, composed.target);
+        }
+        strip_absorbed_anchors(config);
+    }
+}
+
+/// Once composition absorbs its `imports`, a bindingless anchor would deploy as a live empty target.
+fn strip_absorbed_anchors(config: &mut Config) {
+    config.targets.retain(|_, target| {
+        if target.imports.is_none() {
+            return true;
+        }
+        target.imports = None;
+        target.sources.as_ref().is_some_and(|s| !s.is_empty())
+    });
+}
+
+/// Walks the transitive graph rooted at the consumer's imported `transitive = true`
+/// sources, producing the namespaced composition graph. A failure naming a source
+/// below the top level carries `at depth N`.
+pub(super) fn resolve_transitive_graph(
+    config: &Config,
+    parsed: &BTreeMap<String, ParsedSource>,
     backend: &(dyn SourceBackend + Sync),
-    mirror_root: &Path,
-    visited: &mut BTreeSet<(String, String)>,
-    depth: usize,
-) -> Result<()> {
-    let refspec = source.refspec();
-    let key = (
-        NormalizedUrl::parse(remote).as_str().to_owned(),
-        refspec.to_string(),
-    );
-    if !visited.insert(key) {
-        return Ok(());
+) -> Result<ResolvedGraph> {
+    let Some(mirror_root) = backend.mirror_root() else {
+        return Ok(ResolvedGraph::default());
+    };
+    let remotes = resolved_remotes(config, parsed)?;
+    let mut visited: HashSet<FetchNode> = HashSet::new();
+    let mut graph = ResolvedGraph::default();
+    let mut counter: usize = 0;
+
+    for (anchor_name, anchor) in &config.targets {
+        for imported in anchor.imports.iter().flatten() {
+            let source = parsed.get(imported).ok_or_else(|| {
+                Error::Config(format!("no resolved source for imported `{imported}`"))
+            })?;
+            let remote = remotes.get(imported).map(String::as_str).ok_or_else(|| {
+                Error::Config(format!("no resolved remote for source `{imported}`"))
+            })?;
+            reject_escaping_remote(imported, source, remote, 1)?;
+            let (commit, manifest) =
+                fetch_manifest(imported, source, remote, backend, mirror_root, 1)?;
+            let node = FetchNode::new(remote, &source.refspec().to_string(), &commit);
+            walk_recurse(
+                node.clone(),
+                &manifest,
+                backend,
+                mirror_root,
+                &mut visited,
+                1,
+            )?;
+            let instance = Instance::new("root", imported, anchor_name, node);
+            compose_dep(
+                &instance,
+                anchor,
+                imported,
+                &manifest,
+                &mut counter,
+                &mut graph,
+            )?;
+        }
     }
 
-    let source_name = SourceName::trusted(name.to_owned());
-    backend
-        .fetch(&source_name, remote)
-        .map_err(|e| at_depth(name, depth, &e.to_string()))?;
-    let commit = backend
-        .resolve(&source_name, remote, &refspec)
-        .map_err(|e| at_depth(name, depth, &e.to_string()))?;
+    Ok(graph)
+}
 
-    let manifest_text = read_manifest(mirror_root, remote, &commit)
-        .map_err(|e| at_depth(name, depth, &e.to_string()))?;
-    let manifest = TransitiveManifest::parse(&manifest_text)
-        .map_err(|e| at_depth(name, depth, &e.to_string()))?;
-
+/// Recurses fetch/parse into a dep's own `transitive = true` inner sources, keying
+/// the visited-set on [`FetchNode`] so a diamond collapses to one fetch.
+fn walk_recurse(
+    parent_node: FetchNode,
+    manifest: &TransitiveManifest,
+    backend: &(dyn SourceBackend + Sync),
+    mirror_root: &Path,
+    visited: &mut HashSet<FetchNode>,
+    depth: usize,
+) -> Result<()> {
+    if !visited.insert(parent_node) {
+        return Ok(());
+    }
     for (inner_name, inner) in &manifest.sources {
         let inner_parsed = ParsedSource::parse(inner_name, inner)
             .map_err(|e| at_depth(inner_name, depth + 1, &e.to_string()))?;
         let inner_remote = inner_remote(inner_name, &inner_parsed)
             .map_err(|e| at_depth(inner_name, depth + 1, &e.to_string()))?;
-        reject_escaping_remote(inner_name, &inner_parsed, &inner_remote, depth + 1)
-            .map_err(|e| at_depth(inner_name, depth + 1, &e.to_string()))?;
+        reject_escaping_remote(inner_name, &inner_parsed, &inner_remote, depth + 1)?;
         if !inner.is_transitive() {
             continue;
         }
-        walk(
+        let (inner_commit, inner_manifest) = fetch_manifest(
             inner_name,
             &inner_parsed,
             &inner_remote,
+            backend,
+            mirror_root,
+            depth + 1,
+        )?;
+        let inner_node = FetchNode::new(
+            &inner_remote,
+            &inner_parsed.refspec().to_string(),
+            &inner_commit,
+        );
+        walk_recurse(
+            inner_node,
+            &inner_manifest,
             backend,
             mirror_root,
             visited,
@@ -96,6 +158,172 @@ fn walk(
     Ok(())
 }
 
+/// Composes a dep's own targets under `anchor`: each becomes a synthetic target at
+/// `anchor.expanded_path / dep_target.path`, keeping the dep's own per-target layout,
+/// bound to source instances namespaced by the dep [`Instance`]. Two composed targets
+/// sharing a destination is a hard error.
+fn compose_dep(
+    instance: &Instance,
+    anchor: &Target,
+    imported: &str,
+    manifest: &TransitiveManifest,
+    counter: &mut usize,
+    graph: &mut ResolvedGraph,
+) -> Result<()> {
+    let anchor_path = anchor.expanded_path();
+    let mut composed_dests: BTreeMap<PathBuf, String> = BTreeMap::new();
+
+    let mut source_names: BTreeMap<String, String> = BTreeMap::new();
+    for (inner_name, inner) in &manifest.sources {
+        let parsed = ParsedSource::parse(inner_name, inner).map_err(|e| {
+            Error::Config(format!("imported `{imported}`: source `{inner_name}`: {e}"))
+        })?;
+        let remote = inner_remote(inner_name, &parsed).map_err(|e| {
+            Error::Config(format!("imported `{imported}`: source `{inner_name}`: {e}"))
+        })?;
+        *counter += 1;
+        let namespaced = namespaced_key(instance, inner_name, *counter);
+        graph.remotes.insert(namespaced.clone(), remote);
+        graph.sources.insert(namespaced.clone(), parsed);
+        source_names.insert(inner_name.clone(), namespaced);
+    }
+
+    for (dep_target_name, dep_target) in &manifest.targets {
+        reject_dep_target_path(imported, dep_target_name, &dep_target.path)?;
+        let composed_path = anchor_path.join(&dep_target.path);
+        if let Some(other) = composed_dests.insert(composed_path.clone(), dep_target_name.clone()) {
+            return Err(Error::Config(format!(
+                "{COMPOSED_DEST_COLLISION}: dep targets `{other}` and `{dep_target_name}` of \
+                 imported `{imported}` both compose to {}",
+                composed_path.display()
+            )));
+        }
+        let synthetic = synthetic_target(
+            imported,
+            dep_target_name,
+            dep_target,
+            composed_path,
+            &source_names,
+        )?;
+        *counter += 1;
+        graph.targets.push(ComposedTarget {
+            name: namespaced_key(instance, dep_target_name, *counter),
+            target: synthetic,
+        });
+    }
+    Ok(())
+}
+
+fn namespaced_key(instance: &Instance, name: &str, counter: usize) -> String {
+    format!("{}%{counter}%{name}", instance.stable_key())
+}
+
+fn synthetic_target(
+    imported: &str,
+    dep_target_name: &str,
+    dep_target: &Target,
+    composed_path: PathBuf,
+    source_names: &BTreeMap<String, String>,
+) -> Result<Target> {
+    let mut target = dep_target.clone();
+    target.path = composed_path;
+    target.imports = None;
+    target.hooks = None;
+    if let Some(bindings) = target.sources.as_mut() {
+        for (identity, binding) in bindings.iter_mut() {
+            let effective = binding.source.clone().unwrap_or_else(|| identity.clone());
+            reject_dep_binding(imported, dep_target_name, identity, binding)?;
+            let namespaced = source_names.get(&effective).ok_or_else(|| {
+                Error::Config(format!(
+                    "imported `{imported}`: target `{dep_target_name}` binds undefined source `{effective}`"
+                ))
+            })?;
+            binding.source = Some(namespaced.clone());
+        }
+    }
+    Ok(target)
+}
+
+/// Routes a dep-own binding's `map`/`root` through the same path-safety checks
+/// `Config::validate` applies to consumer bindings (the DTO path skips validate, so
+/// an escaping dep `map` value would otherwise bypass `safe_component`).
+fn reject_dep_binding(
+    imported: &str,
+    dep_target_name: &str,
+    identity: &str,
+    binding: &Binding,
+) -> Result<()> {
+    if let Some(root) = &binding.root
+        && (root.starts_with("~")
+            || root.components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::ParentDir | std::path::Component::RootDir
+                )
+            }))
+    {
+        return Err(Error::Config(format!(
+            "imported `{imported}`: target `{dep_target_name}` binding `{identity}`: \
+             `root` must stay inside the source"
+        )));
+    }
+    for (key, value) in binding.map.iter().flatten() {
+        if safe_component(value).is_err() {
+            return Err(Error::Config(format!(
+                "imported `{imported}`: target `{dep_target_name}` binding `{identity}`: \
+                 `map` dest `{value}` must be a single safe filename"
+            )));
+        }
+        if key.starts_with('/') || key.split('/').any(|c| c == "..") {
+            return Err(Error::Config(format!(
+                "imported `{imported}`: target `{dep_target_name}` binding `{identity}`: \
+                 `map` key `{key}` must stay inside the source root"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A dep target path must be a relative subpath: absolute, `~/`, or `..` escapes the anchor.
+fn reject_dep_target_path(imported: &str, dep_target_name: &str, path: &Path) -> Result<()> {
+    let escapes = path.is_absolute()
+        || path.starts_with("~")
+        || path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir));
+    if escapes {
+        return Err(Error::Config(format!(
+            "imported `{imported}`: target `{dep_target_name}` path `{}` must be a relative \
+             subpath of the anchor",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn fetch_manifest(
+    name: &str,
+    source: &ParsedSource,
+    remote: &str,
+    backend: &(dyn SourceBackend + Sync),
+    mirror_root: &Path,
+    depth: usize,
+) -> Result<(String, TransitiveManifest)> {
+    let refspec = source.refspec();
+    let source_name = SourceName::trusted(name.to_owned());
+    backend
+        .fetch(&source_name, remote)
+        .map_err(|e| at_depth(name, depth, &e.to_string()))?;
+    let commit = backend
+        .resolve(&source_name, remote, &refspec)
+        .map_err(|e| at_depth(name, depth, &e.to_string()))?;
+    let manifest_text = read_manifest(mirror_root, remote, &commit)
+        .map_err(|e| at_depth(name, depth, &e.to_string()))?;
+    let manifest = TransitiveManifest::parse(&manifest_text)
+        .map_err(|e| at_depth(name, depth, &e.to_string()))?;
+    Ok((commit, manifest))
+}
+
 fn inner_remote(name: &str, source: &ParsedSource) -> Result<String> {
     if source.mode() == SourceMode::Url {
         return source
@@ -103,10 +331,7 @@ fn inner_remote(name: &str, source: &ParsedSource) -> Result<String> {
             .map(str::to_owned)
             .ok_or_else(|| Error::Config(format!("source `{name}`: missing url")));
     }
-    source.resolved_remote(
-        &std::collections::BTreeMap::new(),
-        crate::config::Protocol::Https,
-    )
+    source.resolved_remote(&BTreeMap::new(), crate::config::Protocol::Https)
 }
 
 /// A transitive source may not reach a local `path` or `file://` remote resolved on
