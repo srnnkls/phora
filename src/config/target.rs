@@ -145,8 +145,6 @@ impl Binding {
     }
 }
 
-/// Target-named structural rejections (array-of-tables, table-in-list) are
-/// emitted by a second pass in `Config::parse`.
 fn deserialize_bindings<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Option<BTreeMap<String, Binding>>, D::Error>

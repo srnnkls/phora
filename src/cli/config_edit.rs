@@ -279,7 +279,7 @@ fn list_to_keyed_table(array: &Array, target: &str) -> Result<Table> {
     for element in array {
         let name = element.as_str().ok_or_else(|| legacy_array_error(target))?;
         if table.contains_key(name) {
-            return Err(legacy_array_error(target));
+            return Err(duplicate_source_error(target, name));
         }
         table.insert(name, Item::Value(Value::InlineTable(InlineTable::new())));
     }
@@ -293,6 +293,12 @@ fn legacy_array_error(target: &str) -> Error {
     ))
 }
 
+fn duplicate_source_error(target: &str, name: &str) -> Error {
+    Error::Config(format!(
+        "target `{target}`: duplicate source `{name}` in the `sources` list"
+    ))
+}
+
 fn append_bare_to_list(array: &mut Array, source: &str) -> bool {
     if array.iter().any(|b| b.as_str() == Some(source)) {
         return false;
@@ -302,14 +308,37 @@ fn append_bare_to_list(array: &mut Array, source: &str) -> bool {
     true
 }
 
-fn upsert_keyed_entry_dyn(
+#[derive(Clone, Copy)]
+enum UpsertMode {
+    SkipIfPresent,
+    Overwrite,
+}
+
+fn keyed_value_eq(a: &Value, b: &Value) -> bool {
+    fn content(v: &Value) -> Option<toml::Value> {
+        format!("x = {v}").parse::<toml::Table>().ok()?.remove("x")
+    }
+    content(a) == content(b)
+}
+
+fn upsert_keyed_entry(
     table: &mut dyn toml_edit::TableLike,
     identity: &str,
     value: Value,
-    bare: bool,
+    mode: UpsertMode,
 ) -> bool {
-    if bare && table.contains_key(identity) {
-        return false;
+    if let Some(existing) = table.get(identity) {
+        match mode {
+            UpsertMode::SkipIfPresent => return false,
+            UpsertMode::Overwrite => {
+                if existing
+                    .as_value()
+                    .is_some_and(|e| keyed_value_eq(e, &value))
+                {
+                    return false;
+                }
+            }
+        }
     }
     table.insert(identity, Item::Value(value));
     true
@@ -373,7 +402,12 @@ pub fn bind(
             changed |= append_bare_to_list(array, source);
         } else if let Some(table) = item.as_table_like_mut() {
             let value = keyed_binding_value(source, identity, refinement);
-            changed |= upsert_keyed_entry_dyn(table, identity, value, refinement.is_bare());
+            let mode = if refinement.is_bare() {
+                UpsertMode::SkipIfPresent
+            } else {
+                UpsertMode::Overwrite
+            };
+            changed |= upsert_keyed_entry(table, identity, value, mode);
         } else {
             return Err(Error::Config(format!(
                 "`{target}.sources` is not a list or table"
@@ -865,6 +899,86 @@ mod tests {
         assert!(
             !result.changed,
             "binding an already-present identity over a keyed table changes nothing"
+        );
+    }
+
+    #[test]
+    fn bind_as_with_unsafe_identity_is_rejected() {
+        let base = "version = 1\n\n[sources.real]\ngit = \"g\"\n\n[targets.t]\npath = \"~/x\"\n";
+        let refinement = BindRefinement {
+            r#as: Some("../evil".to_owned()),
+            ..BindRefinement::default()
+        };
+        let err = bind(base, "t", &names(&["real"]), &refinement)
+            .expect_err("an `--as` identity that escapes the target dir must be rejected");
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("../evil"),
+                "the rejection must name the unsafe identity, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refined_rebind_with_identical_entry_reports_unchanged() {
+        let base = "version = 1\n\n[sources.fzf]\ngit = \"g\"\n\n[targets.t]\npath = \"~/x\"\n";
+        let refinement = BindRefinement {
+            tag: Some("v1".to_owned()),
+            ..BindRefinement::default()
+        };
+        let first = bind(base, "t", &names(&["fzf"]), &refinement).expect("first refined bind");
+        assert!(first.changed, "the first refined bind changes the document");
+        let second =
+            bind(&first.text, "t", &names(&["fzf"]), &refinement).expect("re-bind identical entry");
+        assert!(
+            !second.changed,
+            "re-binding a byte-identical refined entry must report unchanged"
+        );
+        assert_eq!(
+            second.text, first.text,
+            "an unchanged re-bind must not rewrite the document"
+        );
+    }
+
+    #[test]
+    fn promoting_a_duplicate_flat_list_reports_duplicate_not_legacy() {
+        let base = "version = 1\n\n[sources.a]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/x\"\nsources = [\"a\", \"a\"]\n";
+        let refinement = BindRefinement {
+            root: Some("sub".to_owned()),
+            ..BindRefinement::default()
+        };
+        let err = bind(base, "t", &names(&["a"]), &refinement)
+            .expect_err("a duplicate flat list cannot promote to a keyed table");
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("duplicate source") && !msg.contains("no longer supported"),
+                "the error must report the duplicate, not the array-of-tables migration hint, \
+                 got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_and_dto_layers_agree_on_effective_source() {
+        use crate::config::Binding;
+
+        let diverged: DocumentMut = "alias = { source = \"real\" }\n".parse().unwrap();
+        let item = diverged.as_table().get("alias").expect("alias entry");
+        let dto: Binding = toml::from_str("source = \"real\"").expect("divergent binding parses");
+        assert_eq!(
+            keyed_effective_source("alias", item),
+            dto.effective_source("alias")
+        );
+
+        let bare_doc: DocumentMut = "real = {}\n".parse().unwrap();
+        let bare_item = bare_doc.as_table().get("real").expect("bare entry");
+        let bare_dto: Binding = toml::from_str("").expect("bare binding parses");
+        assert_eq!(
+            keyed_effective_source("real", bare_item),
+            bare_dto.effective_source("real")
         );
     }
 

@@ -5859,11 +5859,7 @@ fn binding_map_duplicate_dest_values_are_rejected() {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// BIND-KEY-001: per-target `sources` becomes a keyed map (`BTreeMap<String, Binding>`).
-// The map KEY is the binding identity; effective source defaults to the key and
-// the `as` field is removed. A flat array of bare source-name strings is still
-// accepted. Array-of-tables and duplicate/table-laden lists are hard errors.
+// BIND-KEY-001
 mod keyed_bindings {
     use super::*;
 
@@ -5879,7 +5875,6 @@ mod keyed_bindings {
             })
     }
 
-    // A keyed table binding resolves with source defaulting to the key.
     #[test]
     fn keyed_binding_source_defaults_to_key() {
         let cfg = Config::parse(
@@ -5905,7 +5900,6 @@ mod keyed_bindings {
         );
     }
 
-    // An explicit `source` on a divergent key keeps the key as identity.
     #[test]
     fn explicit_source_diverges_from_key_identity() {
         let cfg = Config::parse(
@@ -5931,7 +5925,6 @@ mod keyed_bindings {
         );
     }
 
-    // An empty inline table is a valid binding (source == key).
     #[test]
     fn empty_inline_table_binding_is_valid() {
         let cfg = Config::parse(
@@ -5954,7 +5947,6 @@ mod keyed_bindings {
         );
     }
 
-    // Identity flows from the key, never from a (now-removed) `as`.
     #[test]
     fn identity_flows_from_map_key() {
         let cfg = Config::parse(
@@ -5972,8 +5964,6 @@ mod keyed_bindings {
         );
     }
 
-    // Two keys sharing one source at distinct refs are allowed; both resolve to
-    // distinct identities.
     #[test]
     fn side_by_side_aliases_of_one_source_are_allowed() {
         let cfg = Config::parse(
@@ -6011,8 +6001,6 @@ mod keyed_bindings {
         assert_eq!(edge.source, "dotfiles");
     }
 
-    // An array-of-tables binding list is a parse error naming the target and
-    // carrying the `[targets.t.sources]` migration hint.
     #[test]
     fn array_of_tables_is_a_hard_parse_error() {
         let err = Config::parse(
@@ -6030,7 +6018,6 @@ mod keyed_bindings {
         }
     }
 
-    // Duplicate bare-list elements are an error.
     #[test]
     fn duplicate_bare_list_elements_are_rejected() {
         let err = Config::parse(
@@ -6050,7 +6037,6 @@ mod keyed_bindings {
         }
     }
 
-    // A table mixed into the bare list is an error with the migration hint.
     #[test]
     fn table_inside_bare_list_is_rejected_with_hint() {
         let err = Config::parse(
@@ -6067,7 +6053,6 @@ mod keyed_bindings {
         }
     }
 
-    // An empty `[targets.t.sources]` table is Ok and resolves to zero bindings.
     #[test]
     fn empty_keyed_table_resolves_to_no_bindings() {
         let cfg = Config::parse(
@@ -6082,7 +6067,6 @@ mod keyed_bindings {
         );
     }
 
-    // An empty `[]` bare list parses Ok with no bindings.
     #[test]
     fn empty_bare_list_resolves_to_no_bindings() {
         let cfg = Config::parse(
@@ -6097,7 +6081,6 @@ mod keyed_bindings {
         );
     }
 
-    // A local keyed-table `sources` replaces the base bindings wholesale.
     #[test]
     fn overlay_keyed_table_replaces_base_bindings_wholesale() {
         let base = Config::parse(
@@ -6167,7 +6150,6 @@ mod keyed_bindings {
         );
     }
 
-    // A bare-string list still resolves, source == key.
     #[test]
     fn bare_string_list_preserved_non_regression() {
         let cfg = Config::parse(
@@ -6186,5 +6168,40 @@ mod keyed_bindings {
         let b = find_resolved(&resolved, "b");
         assert_eq!(a.source, "a", "a bare element's source equals its identity");
         assert_eq!(b.source, "b", "a bare element's source equals its identity");
+    }
+
+    #[test]
+    fn flat_list_resolves_in_alphabetical_identity_order() {
+        let cfg = Config::parse(
+            "version = 1\n\n[sources.a]\ngit = \"g\"\n\n[sources.z]\ngit = \"h\"\n\n\
+             [targets.t]\npath = \"~/x\"\nsources = [\"z\", \"a\"]\n",
+        )
+        .expect("a flat list in non-sorted order must parse");
+        let declared: Vec<&str> = target_of(&cfg, "t").declared_sources().collect();
+        assert_eq!(
+            declared,
+            vec!["a", "z"],
+            "bindings resolve in alphabetical identity order regardless of declaration order, \
+             got {declared:?}"
+        );
+    }
+
+    #[test]
+    fn binding_identity_escaping_target_dir_is_rejected() {
+        let cfg = Config::parse(
+            "version = 1\n\n[sources.real]\ngit = \"g\"\n\n[targets.t]\npath = \"~/x\"\n\n\
+             [targets.t.sources]\n\"../evil\" = { source = \"real\" }\n",
+        )
+        .expect("a divergent binding key parses structurally");
+        let err = cfg
+            .validate()
+            .expect_err("a binding identity that escapes its target dir must be rejected");
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("../evil") && msg.contains("identity"),
+                "the error must name the unsafe identity, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
     }
 }
