@@ -2495,6 +2495,7 @@ dependencies = [
  "thiserror",
  "toml",
  "toml_edit",
+ "unicode-normalization",
  "ureq",
  "walkdir",
  "zip",

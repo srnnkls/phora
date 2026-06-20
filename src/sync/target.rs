@@ -11,6 +11,7 @@ use crate::store::{
     ArtifactKey, EjectedEntry, MAP_LAYOUT, ProjectedRecord, Registry, RegistryRecord,
 };
 
+use super::confine::{ProtectedPathSet, confine_destination};
 use super::discover::discover_artifacts_for_source;
 use super::{
     Conflict, ConflictKind, ConflictResolver, Resolution, StagingGuard, nonce, remote_for,
@@ -28,6 +29,27 @@ pub(super) struct TargetRun<'a> {
     pub(super) interactive: bool,
     pub(super) resolver: Option<&'a dyn ConflictResolver>,
     pub(super) vars: &'a BTreeMap<String, String>,
+    pub(super) protected: &'a ProtectedPathSet,
+}
+
+impl TargetRun<'_> {
+    fn confined(&self, dst: &Path) -> Result<PathBuf> {
+        match &self.target.confine {
+            Some(anchor) => confine_destination(anchor, dst, self.protected),
+            None if is_composed_target(self.target_name) => Err(Error::Config(format!(
+                "confinement: composed target `{}` reached deploy without a confine anchor; \
+                 refusing an unconfined write to {}",
+                self.target_name,
+                dst.display()
+            ))),
+            None => Ok(dst.to_path_buf()),
+        }
+    }
+}
+
+/// `%` marks the namespaced key minted by `transitive::namespaced_key`.
+pub(super) fn is_composed_target(target_name: &str) -> bool {
+    target_name.contains('%')
 }
 
 pub(super) fn deploy_target(
@@ -206,7 +228,7 @@ pub(super) fn deploy_artifact_entry(
     registry: &dyn Registry,
     journal: &Journal,
 ) -> Result<bool> {
-    let artifact_dst = artifact_dst_for_entry(run, entry);
+    let artifact_dst = run.confined(&artifact_dst_for_entry(run, entry))?;
     let key = ArtifactKey {
         target: run.target_name.to_owned(),
         source: entry.identity.to_owned(),
@@ -234,7 +256,6 @@ pub(super) fn deploy_artifact_entry(
             registry,
             journal,
             DeployContext {
-                target_path: entry.target_path,
                 layout_kind: entry.layout_kind,
                 source: entry.source,
                 git: entry.git,
@@ -249,6 +270,7 @@ pub(super) fn deploy_artifact_entry(
                 template_opt_in: entry.template_opt_in,
                 vars: run.vars,
                 mapped_source_key: entry.mapped_source_key,
+                confine_anchor: run.target.confine.as_deref(),
             },
         ),
     };
@@ -376,7 +398,6 @@ fn warn_skip(source: &str, artifact: &str, kind: &ConflictKind, dst: &Path) {
 }
 
 struct DeployContext<'a> {
-    target_path: &'a Path,
     layout_kind: LayoutKind,
     source: &'a ParsedSource,
     git: &'a str,
@@ -391,6 +412,7 @@ struct DeployContext<'a> {
     template_opt_in: &'a TemplateOptIn,
     vars: &'a BTreeMap<String, String>,
     mapped_source_key: Option<&'a str>,
+    confine_anchor: Option<&'a Path>,
 }
 
 fn deploy_one(
@@ -399,7 +421,7 @@ fn deploy_one(
     journal: &Journal,
     ctx: DeployContext<'_>,
 ) -> Result<()> {
-    let staging_base = target_parent(ctx.target_path).join(".phora-stage");
+    let staging_base = target_parent(ctx.artifact_dst).join(".phora-stage");
     let staging = staging_base.join(format!("{}-{}", ctx.artifact_name, nonce()));
     let mut staging_guard = StagingGuard::new(&staging_base, &staging);
 
@@ -427,6 +449,10 @@ fn deploy_one(
         path_map: path_map.as_ref(),
     };
     let export = backend.export_artifact(&req)?;
+
+    if let Some(anchor) = ctx.confine_anchor {
+        super::confine::reject_symlink_ancestor_at_write(anchor, ctx.artifact_dst)?;
+    }
 
     if let Some(parent) = ctx.artifact_dst.parent() {
         std::fs::create_dir_all(parent)
@@ -498,7 +524,7 @@ fn deploy_link(
         linked: true,
         vars_digest: None,
     };
-    let staging_base = target_parent(entry.target_path).join(".phora-stage");
+    let staging_base = target_parent(artifact_dst).join(".phora-stage");
     link_artifact(
         &staging_base,
         artifact_dst,
@@ -529,4 +555,82 @@ fn link_target(entry: &ArtifactEntry<'_>) -> PathBuf {
             .unwrap_or_else(|| entry.artifact_name.as_str()),
     );
     target
+}
+
+#[cfg(test)]
+mod confine_fail_closed_tests {
+    #![allow(clippy::too_many_arguments)]
+    use super::*;
+    use crate::config::Target;
+    use crate::sync::ConflictResolver;
+
+    struct NeverResolve;
+    impl ConflictResolver for NeverResolve {
+        fn resolve(&self, _conflict: &Conflict) -> Resolution {
+            Resolution::Skip
+        }
+    }
+
+    fn composed_target_without_anchor(dst: &Path) -> Target {
+        Target {
+            path: dst.to_path_buf(),
+            sources: None,
+            layout: None,
+            hooks: None,
+            imports: None,
+            confine: None,
+        }
+    }
+
+    fn run_for<'a>(
+        target: &'a Target,
+        target_name: &'a str,
+        protected: &'a ProtectedPathSet,
+        parsed: &'a BTreeMap<String, ParsedSource>,
+        commits: &'a BTreeMap<(String, String), String>,
+        remotes: &'a BTreeMap<String, String>,
+        vars: &'a BTreeMap<String, String>,
+        resolver: &'a dyn ConflictResolver,
+    ) -> TargetRun<'a> {
+        TargetRun {
+            parsed,
+            target_name,
+            target,
+            commits,
+            remotes,
+            force: false,
+            interactive: false,
+            resolver: Some(resolver),
+            vars,
+            protected,
+        }
+    }
+
+    #[test]
+    fn composed_target_missing_its_confine_anchor_fails_closed() {
+        let outside = Path::new("/home/u/.ssh/authorized_keys");
+        let target = composed_target_without_anchor(outside);
+        let protected = ProtectedPathSet::resolve(Path::new("/home/u/proj")).expect("protected");
+        let parsed = BTreeMap::new();
+        let commits = BTreeMap::new();
+        let remotes = BTreeMap::new();
+        let vars = BTreeMap::new();
+        let resolver = NeverResolve;
+        let run = run_for(
+            &target,
+            "root%1%nvim",
+            &protected,
+            &parsed,
+            &commits,
+            &remotes,
+            &vars,
+            &resolver,
+        );
+
+        run.confined(outside).expect_err(
+            "a composed/transitive target (namespaced name carries `%`) reaching deploy with \
+             `confine == None` must fail closed; falling through to an unconfined write lets a dep \
+             escape to any absolute path",
+        );
+    }
 }

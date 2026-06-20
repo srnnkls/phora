@@ -13,14 +13,37 @@ pub enum KernelError {
 }
 
 /// Rejects any string that is not a single inert path component, so a malicious git
-/// tree or archive can never escape the staging dir when joined onto a path.
+/// tree or archive can never escape the staging dir when joined onto a path. Also
+/// rejects cross-platform foot-guns that are inert on Unix but escape on Windows:
+/// an NTFS alternate-data-stream `:` and the reserved DOS device names.
 pub(crate) fn safe_component(name: &str) -> std::result::Result<&str, KernelError> {
-    let unsafe_component =
-        name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\');
+    let unsafe_component = name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains(':')
+        || is_reserved_device_name(name);
     if unsafe_component {
         return Err(KernelError::UnsafeComponent(name.to_owned()));
     }
     Ok(name)
+}
+
+fn is_reserved_device_name(name: &str) -> bool {
+    const RESERVED: [&str; 4] = ["CON", "PRN", "AUX", "NUL"];
+    let stem = name.split('.').next().unwrap_or(name);
+    let upper = stem.to_ascii_uppercase();
+    if RESERVED.contains(&upper.as_str()) {
+        return true;
+    }
+    if let Some(digit) = upper
+        .strip_prefix("COM")
+        .or_else(|| upper.strip_prefix("LPT"))
+    {
+        return matches!(digit, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9");
+    }
+    false
 }
 
 /// A configured source identifier: the `[sources.<name>]` table key.

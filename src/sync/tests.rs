@@ -87,6 +87,27 @@ struct SyncFixture {
     head_sha: String,
 }
 
+fn test_protected(cwd: &Path) -> super::confine::ProtectedPathSet {
+    super::confine::ProtectedPathSet::resolve(cwd).expect("protected set")
+}
+
+fn linked_flat_record(target: &str, source: &str, artifact: &str) -> RegistryRecord {
+    RegistryRecord {
+        version: 1,
+        key: artifact_key(target, source, artifact),
+        source: source.to_owned(),
+        commit: "link".to_owned(),
+        digest: "link:".to_owned(),
+        projected_at: "2026-06-08T12:00:00Z".to_owned(),
+        layout: "flat".to_owned(),
+        allow_symlinks: false,
+        preserve_executable: true,
+        files: vec![],
+        linked: true,
+        vars_digest: None,
+    }
+}
+
 /// A repo with one commit on `main` containing an `editor/` artifact dir.
 #[expect(
     clippy::unwrap_used,
@@ -1651,7 +1672,6 @@ fn sync_with_force_overwrites_modified_registry_artifact() {
 #[test]
 fn second_deploy_over_correct_link_is_a_noop() {
     use std::os::unix::fs::symlink;
-
     let fx = build_sync_fixture();
     let td = TargetDir::new();
     let cfg =
@@ -1661,33 +1681,17 @@ fn second_deploy_over_correct_link_is_a_noop() {
 
     let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
     std::fs::create_dir_all(dst.parent().expect("dst parent")).expect("mkdir dst parent");
-    let live = fx.src.path().join("editor");
-    symlink(&live, &dst).expect("deploy artifact as a symlink to the working tree");
+    symlink(fx.src.path().join("editor"), &dst).expect("deploy artifact as a symlink");
 
-    let linked_record = RegistryRecord {
-        version: 1,
-        key: artifact_key("dest", "editor-src", "editor"),
-        source: "editor-src".to_owned(),
-        commit: "link".to_owned(),
-        digest: "link:".to_owned(),
-        projected_at: "2026-06-08T12:00:00Z".to_owned(),
-        layout: "flat".to_owned(),
-        allow_symlinks: false,
-        preserve_executable: true,
-        files: vec![],
-        linked: true,
-        vars_digest: None,
-    };
     fx.registry
-        .put(&linked_record)
+        .put(&linked_flat_record("dest", "editor-src", "editor"))
         .expect("seed linked registry record");
-
     let counting = CountingBackend::new(&fx.backend);
     let journal = Journal::open(&fx.registry.locks_dir()).expect("open journal");
     let parsed = cfg.parsed_sources().expect("sources parse");
     let commits = one_commit(&parsed, "editor-src", &fx.head_sha);
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
-
+    let protected = test_protected(fx.src.path());
     let run = TargetRun {
         parsed: &parsed,
         target_name: "dest",
@@ -1698,6 +1702,7 @@ fn second_deploy_over_correct_link_is_a_noop() {
         interactive: false,
         resolver: None,
         vars: &BTreeMap::new(),
+        protected: &protected,
     };
     let selection = Selection::new(source.includes(), source.excludes()).expect("selection");
     let (entry_source, entry_artifact) = (sn("editor-src"), an("editor"));
@@ -3749,8 +3754,17 @@ fn prune_removes_stale_linked_symlink_without_following_it() {
     let commits = one_commit(&parsed, "linked-src", "link");
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
 
-    prune_orphans(&cfg, &parsed, &remotes, &fx_backend(), &registry, &commits)
-        .expect("prune must remove the orphaned linked artifact");
+    let protected = test_protected(&std::env::temp_dir());
+    prune_orphans(
+        &cfg,
+        &parsed,
+        &remotes,
+        &fx_backend(),
+        &registry,
+        &commits,
+        &protected,
+    )
+    .expect("prune must remove the orphaned linked artifact");
 
     assert!(
         std::fs::symlink_metadata(&dst).is_err(),
@@ -10055,8 +10069,17 @@ fn prune_for(fx: &SyncFixture, cfg: &Config) {
     let parsed = cfg.parsed_sources().expect("sources parse");
     let remotes = resolved_remotes(cfg, &parsed).expect("remotes resolve");
     let commits = one_commit(&parsed, "agents-src", &fx.head_sha);
-    prune_orphans(cfg, &parsed, &remotes, &fx.backend, &fx.registry, &commits)
-        .expect("prune the orphaned mapped state");
+    let protected = test_protected(fx.src.path());
+    prune_orphans(
+        cfg,
+        &parsed,
+        &remotes,
+        &fx.backend,
+        &fx.registry,
+        &commits,
+        &protected,
+    )
+    .expect("prune the orphaned mapped state");
 }
 
 #[test]
