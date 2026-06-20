@@ -21,7 +21,8 @@ auth = { type = "token", env = "GITHUB_TOKEN" }
 remote = { https = "https://git.company.com/{path}.git", ssh = "git@git.company.com:{path}.git" }
 auth = { type = "ssh", key = "~/.ssh/id_ed25519" }
 
-# A source is a git repo. Top-level directories under `root` are its artifacts.
+# A source is a git repo. Directories, files, and nested paths selected under `root`
+# are its artifacts (a file or nested path deploys as a single-file artifact).
 # Pin with exactly one of branch / tag / rev (defaults to branch `main`).
 # Pick exactly one source kind: forge (host + repo), local (path), literal (git),
 # or url. A bare `repo = "owner/repo"` defaults to github; a bare `path` is LOCAL.
@@ -125,11 +126,12 @@ stable = { source = "fzf", tag = "v0.55.0" }
 canary = { source = "fzf", tag = "v0.56.0" }
 
 # Mapped leaves: a binding's `map = { "<source-leaf>" = "<dest>" }` aliases a single
-# source file to a renamed destination at the target root, bypassing the layout (and
-# any `by-source`/`prefixed` nesting). The canonical use is fanning one shared file
-# out under the names different tools expect — here one `AGENTS.md` lands three times,
-# with no copies in the source tree. Give each binding a distinct identity (the table
-# key): identity must be unique within a target.
+# source file to a renamed destination, deployed as a single-file artifact at its
+# layout location (honors `by-source`/`prefixed` nesting like any artifact). For an
+# unrenamed file, `map = ["x"]` ≡ `map = { "x" = "x" }` ≡ `include = ["x"]`. The
+# canonical use is fanning one shared file out under the names different tools expect —
+# here one `AGENTS.md` lands three times, with no copies in the source tree. Give each
+# binding a distinct identity (the table key): identity must be unique within a target.
 [targets.agents]
 path = "~/myproject"
 [targets.agents.sources]
@@ -137,11 +139,12 @@ dotfiles = { map = { "AGENTS.md" = "AGENTS.md" } }
 claude   = { source = "dotfiles", map = { "AGENTS.md" = "CLAUDE.md" } }
 codex    = { source = "dotfiles", map = { "AGENTS.md" = "codex.md" } }
 # A key may sit in a subdirectory of the source root, e.g. "lint/rules.toml" = "rules.toml".
+# A dest may also nest under the target, e.g. "AGENTS.md" = "ai/CLAUDE.md" is VALID.
 
 # Rejected at config load — each is a hard error:
 #   { source = "dotfiles", map = { "AGENTS.md" = "CLAUDE.md" }, include = ["editor"] }
 #     `map` cannot be combined with `include` (or `exclude`) on the same binding.
-#   { source = "dotfiles", map = { "AGENTS.md" = "ai/CLAUDE.md" } }
-#     a dest must be ONE safe filename — no `/`, `\`, `.`, or `..` (nested dests are v2).
+#   { source = "dotfiles", map = { "AGENTS.md" = "/etc/CLAUDE.md" } }
+#     a dest may not be absolute or escape the target root via `..`.
 #   { source = "dotfiles", map = { "../secrets.md" = "CLAUDE.md" } }
 #     a key may not be absolute or escape the source root via `..`.

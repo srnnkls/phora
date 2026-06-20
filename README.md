@@ -10,8 +10,8 @@
 
 Phora is a git-based artifact package manager. It mirrors git repositories — or
 imports plain-https resources (tarballs, zips, single files) as content-addressed
-synthetic commits — picks out the top-level directories you want (**artifacts**),
-and projects them into local **target** directories, pinned to exact commits,
+synthetic commits — picks out the directories, files, and nested paths you want
+(**artifacts**), and projects them into local **target** directories, pinned to exact commits,
 verifiable by content hash, and recoverable after interruption.
 
 Use it to distribute shared config, editor setups, prompt/skill bundles, or release
@@ -30,12 +30,17 @@ Requires a Rust toolchain (edition 2024).
 ## Concepts
 
 - **Source** — provenance: where bytes come from, pinned by `branch`, `tag`, or
-  `rev`. The top-level directories under its `root` are its artifacts. Declare its
-  remote as a forge (`host` + `repo`), a local path (`path = "/dir"`), a literal git
+  `rev`. The directories and files selected under its `root` are its artifacts. Declare
+  its remote as a forge (`host` + `repo`), a local path (`path = "/dir"`), a literal git
   URL (`git = "…"`), or a downloadable resource (`url = "https://…"`). A source may
   also carry intrinsic selection defaults (`root`/`include`/`exclude`).
-- **Artifact** — one top-level directory in a source (dotfiles are skipped). Glob
-  `include`/`exclude` rules select which artifacts and which files within them ship.
+- **Artifact** — one selected entry in a source: a top-level directory, a loose file,
+  a nested path, or an explicitly-included dot-entry (dotfiles are otherwise skipped).
+  A directory artifact records `kind = "dir"`; a file or nested-path artifact records
+  `kind = "file"` and deploys as a single file. A nested selector's artifact name is
+  its **basename** (`include = ["a/b/c"]` → artifact `c`). Glob `include`/`exclude`
+  rules select which artifacts ship and, for a directory artifact, which files inside
+  it ship.
 - **Target** — a local directory artifacts are projected into, with a chosen
   layout. A target draws from its explicit `sources` allow-list.
 - **Binding** — a target's link to a source. Selection lives here per consumer: a
@@ -317,7 +322,7 @@ host = "github"          # forge remote: host + repo (or use git = "…" for a l
 repo = "me/dotfiles"
 branch = "main"          # or tag = "...", or rev = "<sha>" (pick one)
 root = "modules"         # repo subdirectory to treat as the artifact root
-include = ["editor"]     # optional artifact/path globs
+include = ["editor"]     # dirs, files, nested paths, or globs (e.g. "init.lua", "a/b/c", "*.json")
 exclude = ["**/*.bak"]
 
 [targets.neovim]
@@ -360,6 +365,12 @@ adds a new forge or overrides a built-in's `remote`/`auth`. Auth is either
 | `flat` (default)                | `a`         |
 | `by-source`                     | `i/a`       |
 | `{ type = "prefixed", sep="-" }`| `i-a`       |
+
+A file or nested-path artifact honors layout exactly like a directory artifact: its
+name `a` is the basename, so `include = ["init.lua"]` lands at `init.lua` (flat),
+`i/init.lua` (by-source), or `i-init.lua` (prefixed). `map` honors layout too — see
+[Selecting files and nested paths](#selecting-files-and-nested-paths) and
+[Aliasing leaves (`map`)](#aliasing-leaves-map).
 
 ### Bindings
 
@@ -452,12 +463,63 @@ per-target ref overrides are a `bind` concern only (`bind --branch/--tag/--rev`)
 Local/symlink overlays (`--local`/`--symlink`) accept neither `--to` nor refinement
 flags.
 
+### Selecting files and nested paths
+
+`include`/`exclude`/`root` select **files** and **nested paths**, not only top-level
+directories. A matched loose file becomes a single-file artifact (record `kind =
+"file"`); a nested selector's artifact name is its **basename** (`include = ["a/b/c"]`
+→ artifact `c`, with `a/b` a locator into the source tree, not part of the dest). A
+file or nested artifact deploys at `layout(identity, basename)` — it honors the
+target's layout exactly like a directory artifact.
+
+```toml
+[targets.editor.sources]
+# loose file -> flat: init.lua  | by-source: nvim/init.lua
+nvim = { source = "dotfiles", root = "nvim", include = ["init.lua"] }
+# nested path -> artifact name is the basename `c`
+deep = { source = "dotfiles", include = ["a/b/c"] }
+```
+
+- **Globs honor loose files.** `include = ["*.json"]` at the source root now deploys
+  loose root `.json` files (previously globs ranged over artifact names only and
+  loose files were dropped).
+- **Dot-dirs are selectable as one artifact.** A dot-prefixed top-level dir named in
+  `include` (`.zfunc`, `.config`) deploys as a single directory artifact — one
+  whole-dir symlink in link mode — rather than N per-file maps.
+- **No-match warning vs. hard error.** A *top-level single-segment* `include` entry, or
+  a `map` key, that matches nothing deployable emits a warning and sync completes (no
+  silent drop). A *nested-path* `include` locator that points at nothing
+  (`include = ["lint/missing.toml"]`) is a hard error (`ArtifactNotFound`) in both copy
+  and link mode — a named path that doesn't exist is a mistake, not a soft no-match — and
+  sync aborts.
+
+**Three equivalent forms.** For a single *unrenamed top-level* file, these deploy
+byte-identically — each lands one file `x` at its layout location (the scrut suite pins
+the shared digest for this case; the equivalence is not claimed for
+nested-include-vs-nested-map):
+
+| Form                      | Meaning                                                  |
+| ------------------------- | -------------------------------------------------------- |
+| `include = ["x"]`         | select file `x` as a single-file artifact                |
+| `map = ["x"]`             | list shorthand; desugars to `{ "x" = "x" }`              |
+| `map = { "x" = "x" }`     | explicit table; source leaf `x` → dest `x`               |
+
+`map` is **distinct** only when it **renames** (`map = { "x" = "y" }`) or reaches a
+**nested source key** (`map = { "lint/rules.toml" = "rules.toml" }`). For the plain
+unrenamed case, prefer `include = ["x"]`.
+
+> **Link-mode filtering limitation.** A directory artifact in link mode is **one
+> whole-dir symlink**, so per-file `include`/`exclude` filtering *inside* that dir
+> does **not** granularly apply — the whole tree is linked. Copy mode filters
+> per-file; link mode does not. Per-file selection within a linked dir requires copy
+> mode.
+
 ### Aliasing leaves (`map`)
 
 A binding's `map` aliases individual **source files** to renamed destinations,
-without duplicating them in the source repo. Where the rest of phora projects
-top-level directories (artifacts), `map` projects one leaf file to a chosen name —
-the canonical case being a single shared file fanned out under the names different
+without duplicating them in the source repo. It projects one leaf file to a chosen
+name, deploying it as a single-file artifact (`kind = "file"`) at its layout location
+— the canonical case being a single shared file fanned out under the names different
 tools expect:
 
 ```toml
@@ -474,13 +536,22 @@ copies in the source tree. Each `map` entry is `"<source-leaf-path>" = "<dest>"`
 the key is a file path relative to the binding's source root, the value the name it
 deploys as.
 
-- **Lands at the target root, bypassing layout.** A mapped dest is placed directly
-  at `<target>/<dest>` — the dir-artifact layout does not apply, and a `by-source`
-  target does *not* nest the dest under a per-source subdirectory.
-- **Single-component dest (v1).** A dest must be one safe filename: no `/`, `\`,
-  `.`, or `..`. Nested destinations are deferred to v2. A key may sit in a
-  subdirectory (`lint/rules.toml`) but may not be absolute or escape the root via
-  `..`. A key that resolves to nothing, or to a non-regular-file, errors at sync.
+- **Honors layout.** A mapped dest routes through `layout(identity, dest)` like any
+  artifact: under `flat` it lands at `<target>/<dest>`; under `by-source` it nests at
+  `<target>/<identity>/<dest>`; under `prefixed` it is prefixed. (Earlier versions
+  force-landed every mapped dest at the target root; `map` no longer bypasses layout.
+  There is **no automatic migration** — a prior root-placed map deployment re-syncs
+  into its layout location on the next `sync`.)
+- **Nested dest allowed; name is the dest basename.** A dest may be a nested relpath
+  (`map = { "src" = "sub/dir/file" }`) — the subpath is deploy-location only; the
+  artifact's record name is the dest **basename**. A dest may not be absolute or
+  escape via `..`. A key (source leaf) may sit in a subdirectory (`lint/rules.toml`)
+  under the same constraints. A key that resolves to nothing warns; a non-regular-file
+  errors at sync.
+- **Distinct from `include` only on rename or nested key.** `map = ["x"]` ≡
+  `map = { "x" = "x" }` ≡ `include = ["x"]` deploy byte-identically (see
+  [Selecting files and nested paths](#selecting-files-and-nested-paths)); `map` earns
+  its keep when it renames or reaches a nested source key.
 - **Mutually exclusive with `include`/`exclude`.** `map` selects exact leaves, so
   combining it with glob selection on the same binding is a config error.
 - **Fan-out without duplication.** The same source leaf can map to different dests

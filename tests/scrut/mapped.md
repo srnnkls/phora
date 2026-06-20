@@ -1,14 +1,16 @@
 # Phora Mapped Leaves
 
 End-to-end behaviour of *mapped leaves*: a binding's `map = { "<leaf>" = "<dest>" }`
-aliases a single source file to a renamed destination at `target/<dest>`, bypassing
-the dir-artifact layout entirely. This suite drives the shipped binary to prove the
-on-disk results: one leaf fanned out to two distinct dests, a renamed dest pruned on
-the next `--prune` sync, a link-mode mapped dest landing as a symlink to the source
-working tree, a dest collision surfaced as a conflict, an ejected mapped record that
-keeps its file, a mapped dest under a `by-source` target that still lands at the
-target root (no layout leak), a missing link leaf degrading gracefully, and drift on
-a mapped dest reported by `list`/`verify`.
+aliases a single source file to a renamed destination, deployed as a single-file
+artifact (record `kind = "file"`) at its **layout** location — `layout(identity, dest)`,
+exactly like any artifact. `map` honors the target layout: under `flat` the dest lands
+at `target/<dest>`; under `by-source` it nests at `target/<identity>/<dest>`. This suite
+drives the shipped binary to prove the on-disk results: one leaf fanned out to two
+distinct dests, a renamed dest pruned on the next `--prune` sync, a link-mode mapped
+dest landing as a symlink to the source working tree, a dest collision surfaced as a
+conflict, an ejected mapped record that keeps its file, a mapped dest under a
+`by-source` target nesting at the per-identity layout path, a missing link leaf
+degrading gracefully, and drift on a mapped dest reported by `list`/`verify`.
 
 The suite is hermetic: `isolate_state` redirects `HOME` and the XDG cache/state roots
 into scrut's per-document tempdir. Each scenario `cd`s into its own subdirectory and
@@ -344,4 +346,137 @@ home:
 $ phora verify 2>&1
 dotfiles/DRIFT.md: DRIFT.md (content mismatch)
 [1]
+```
+
+## Three equivalent forms — `include`, `map` list, `map` table
+
+`include = ["x"]`, `map = ["x"]`, and `map = { "x" = "x" }` all deploy one unrenamed
+file `x` as a single-file artifact at its layout location — byte-identically. `map`
+is only *distinct* when it renames (`{ src = dest }`) or reaches a nested source key.
+Three targets bind the same source under the three forms; all three land `README.md`
+at the same digest.
+
+```scrut
+$ cd "$ROOT" && mkdir -p threeforms && cd threeforms && isolate_state && repo="$(make_git_source dotfiles)" && mkdir -p inc lst tbl && cat > phora.toml <<EOF && phora sync 2>&1 | normalize
+> version = 1
+> [sources.dotfiles]
+> path = "$repo"
+> branch = "main"
+> [targets.inc]
+> path = "$PWD/inc"
+> layout = "flat"
+> [targets.lst]
+> path = "$PWD/lst"
+> layout = "flat"
+> [targets.tbl]
+> path = "$PWD/tbl"
+> layout = "flat"
+> [targets.inc.sources]
+> dotfiles = { include = ["README.md"] }
+> [targets.lst.sources]
+> dotfiles = { map = ["README.md"] }
+> [targets.tbl.sources]
+> dotfiles = { map = { "README.md" = "README.md" } }
+> EOF
+sync complete
+```
+
+Each form deploys the file at its flat-layout path, and `where` groups all three
+targets under one artifact at one digest — proof the forms are byte-identical.
+
+```scrut
+$ test -f inc/README.md && test -f lst/README.md && test -f tbl/README.md && echo "all three"
+all three
+```
+
+```scrut
+$ phora where 2>&1 | normalize
+Artifact: dotfiles/README.md (commit ca94c83b, digest blake3:beaa60ab94c55d9cb9bb833664fb7ef453a695b36233995bc930c655592ac89f)
+  - inc
+  - lst
+  - tbl
+```
+
+## Glob and nested include honor loose files
+
+A glob `include = ["*.md"]` at the source root now deploys loose root `.md` files,
+and a nested `include = ["lint/rules.toml"]` deploys that file as a single-file
+artifact whose name is its **basename** (`rules.toml`), honoring the target layout.
+
+```scrut
+$ cd "$ROOT" && mkdir -p loose && cd loose && isolate_state && repo="$(make_git_source dotfiles)" && mkdir -p glob nest && cat > phora.toml <<EOF && phora sync 2>&1 | normalize
+> version = 1
+> [sources.dotfiles]
+> path = "$repo"
+> branch = "main"
+> [targets.glob]
+> path = "$PWD/glob"
+> layout = "flat"
+> [targets.nest]
+> path = "$PWD/nest"
+> layout = "by-source"
+> [targets.glob.sources]
+> dotfiles = { include = ["*.md"] }
+> [targets.nest.sources]
+> dotfiles = { include = ["lint/rules.toml"] }
+> EOF
+sync complete
+```
+
+The glob pulls the loose root `README.md`; the nested selector deploys `rules.toml`
+at the by-source layout path under its identity.
+
+```scrut
+$ test -f glob/README.md && test -f nest/dotfiles/rules.toml && echo "honored"
+honored
+```
+
+```scrut
+$ phora preview 2>&1 | normalize
+glob
+  dotfiles@ca94c83b README.md -> <ROOT>/glob/README.md
+nest
+  dotfiles@ca94c83b rules.toml -> <ROOT>/nest/dotfiles/rules.toml
+```
+
+## No-match warning — an unmatched selector is reported
+
+An `include` entry that matches nothing deployable emits a warning rather than
+silently vanishing; the sync still completes.
+
+```scrut
+$ cd "$ROOT" && mkdir -p nomatch && cd nomatch && isolate_state && repo="$(make_git_source dotfiles)" && mkdir -p target-home && cat > phora.toml <<EOF && phora sync 2>&1 | normalize
+> version = 1
+> [sources.dotfiles]
+> path = "$repo"
+> branch = "main"
+> [targets.home]
+> path = "$PWD/target-home"
+> layout = "flat"
+> [targets.home.sources]
+> dotfiles = { include = ["nonexistent"] }
+> EOF
+phora: target `home` binding `dotfiles`: include `nonexistent` matched nothing in the source tree
+sync complete
+```
+
+## No-match warning — an unmatched `map` key is reported
+
+A `map` key whose source leaf is absent emits a warning naming the key rather than
+failing; the sync still completes.
+
+```scrut
+$ cd "$ROOT" && mkdir -p mapnomatch && cd mapnomatch && isolate_state && repo="$(make_git_source dotfiles)" && mkdir -p target-home && cat > phora.toml <<EOF && phora sync 2>&1 | normalize
+> version = 1
+> [sources.dotfiles]
+> path = "$repo"
+> branch = "main"
+> [targets.home]
+> path = "$PWD/target-home"
+> layout = "flat"
+> [targets.home.sources]
+> dotfiles = { map = { "ghost.md" = "GHOST.md" } }
+> EOF
+phora: target `home` binding `dotfiles`: map key `ghost.md` matched nothing in the source tree
+sync complete
 ```
