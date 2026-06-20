@@ -1,5 +1,6 @@
 //! Top-level orchestration: the `sync` pipeline, eject/uneject, and shared helpers.
 
+mod confine;
 mod discover;
 mod hooks;
 mod plan;
@@ -193,10 +194,16 @@ pub fn sync(
         .unwrap_or_default();
 
     let journal = Journal::open(&registry.locks_dir())?;
+    let cwd = std::env::current_dir()
+        .map_err(|e| Error::Sync(format!("resolve current dir for confinement: {e}")))?;
+    let protected = confine::ProtectedPathSet::resolve(&cwd)?;
 
     let mut swept_parents: BTreeSet<PathBuf> = BTreeSet::new();
     for target in effective_config.targets.values() {
-        let parent = target_parent(&target.expanded_path());
+        let parent = match &target.confine {
+            Some(anchor) => anchor.clone(),
+            None => target_parent(&target.expanded_path()),
+        };
         if swept_parents.insert(parent.clone()) {
             recovery_sweep(&parent, &journal, registry)?;
         }
@@ -227,6 +234,7 @@ pub fn sync(
                 interactive: input.interactive,
                 resolver: input.resolver,
                 vars: &effective_config.vars,
+                protected: &protected,
             },
             backend,
             registry,
@@ -245,6 +253,7 @@ pub fn sync(
                 backend,
                 registry,
                 &resolved_commits,
+                &protected,
             )?;
         }
     }

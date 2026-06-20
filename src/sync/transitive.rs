@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::config::transitive::{FetchNode, Instance, TransitiveManifest};
-use crate::config::{Binding, Config, ParsedSource, Remote, SourceMode, Target};
+use crate::config::{Binding, Config, DeployMode, ParsedSource, Remote, SourceMode, Target};
 use crate::error::{Error, Result};
 use crate::kernel::{SourceName, safe_component};
 use crate::source::{SourceBackend, is_local_path, mirror_path};
@@ -16,6 +16,8 @@ use super::resolved_remotes;
 
 /// Named-diagnostic phrase emitted when two composed dep targets land on one destination.
 const COMPOSED_DEST_COLLISION: &str = "composed targets resolve to the same destination";
+
+const TRANSITIVE_LINK_REJECTED: &str = "transitive source cannot use deploy = \"link\"";
 
 /// One dep target composed under a consumer anchor: a synthetic absolute-path
 /// target carrying the dep's own layout, bound to namespaced source instances.
@@ -178,6 +180,11 @@ fn compose_dep(
         let parsed = ParsedSource::parse(inner_name, inner).map_err(|e| {
             Error::Config(format!("imported `{imported}`: source `{inner_name}`: {e}"))
         })?;
+        if parsed.deploy_mode() == DeployMode::Link {
+            return Err(Error::Config(format!(
+                "imported `{imported}`: source `{inner_name}`: {TRANSITIVE_LINK_REJECTED}"
+            )));
+        }
         let remote = inner_remote(inner_name, &parsed).map_err(|e| {
             Error::Config(format!("imported `{imported}`: source `{inner_name}`: {e}"))
         })?;
@@ -203,6 +210,7 @@ fn compose_dep(
             dep_target_name,
             dep_target,
             composed_path,
+            anchor_path.clone(),
             &source_names,
         )?;
         *counter += 1;
@@ -223,12 +231,14 @@ fn synthetic_target(
     dep_target_name: &str,
     dep_target: &Target,
     composed_path: PathBuf,
+    anchor_path: PathBuf,
     source_names: &BTreeMap<String, String>,
 ) -> Result<Target> {
     let mut target = dep_target.clone();
     target.path = composed_path;
     target.imports = None;
     target.hooks = None;
+    target.confine = Some(anchor_path);
     if let Some(bindings) = target.sources.as_mut() {
         for (identity, binding) in bindings.iter_mut() {
             let effective = binding.source.clone().unwrap_or_else(|| identity.clone());

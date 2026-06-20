@@ -5,6 +5,7 @@ use crate::error::{Error, Result};
 use crate::source::SourceBackend;
 use crate::store::{ArtifactKey, Registry};
 
+use super::confine::{ProtectedPathSet, confine_destination};
 use super::plan::plan_targets;
 use super::remove_orphan_path;
 
@@ -15,6 +16,7 @@ pub(super) fn prune_orphans(
     backend: &dyn SourceBackend,
     registry: &dyn Registry,
     resolved_commits: &BTreeMap<(String, String), String>,
+    protected: &ProtectedPathSet,
 ) -> Result<()> {
     let plans = plan_targets(config, parsed, remotes, backend, resolved_commits)?;
     let mut expected: HashSet<ArtifactKey> = HashSet::new();
@@ -34,13 +36,33 @@ pub(super) fn prune_orphans(
         }
         if let Some(target) = config.targets.get(&record.key.target) {
             let dst = super::target::record_artifact_path(target, &record);
-            if dst.exists() {
-                eprintln!(
-                    "phora: pruning orphaned {}:{}",
-                    record.key.source, record.key.artifact
-                );
-                remove_orphan_path(&dst)
-                    .map_err(|e| Error::Sync(format!("prune {}: {e}", dst.display())))?;
+            let confined = match &target.confine {
+                Some(anchor) => confine_destination(anchor, &dst, protected),
+                None if super::target::is_composed_target(&record.key.target) => {
+                    Err(Error::Config(format!(
+                        "confinement: composed target `{}` reached prune without a confine \
+                         anchor; refusing an unconfined delete",
+                        record.key.target
+                    )))
+                }
+                None => Ok(dst.clone()),
+            };
+            match confined {
+                Ok(path) if path.exists() => {
+                    eprintln!(
+                        "phora: pruning orphaned {}:{}",
+                        record.key.source, record.key.artifact
+                    );
+                    remove_orphan_path(&path)
+                        .map_err(|e| Error::Sync(format!("prune {}: {e}", path.display())))?;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!(
+                        "phora: refusing to prune out-of-anchor {}: {e}",
+                        dst.display()
+                    );
+                }
             }
         }
         registry.remove(&record.key)?;

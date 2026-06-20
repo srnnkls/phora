@@ -3878,6 +3878,7 @@ mod per_binding_refinement {
             layout: None,
             hooks: None,
             imports: None,
+            confine: None,
             sources: Some(BTreeMap::from([(
                 "pinned".to_owned(),
                 Binding {
@@ -3921,6 +3922,7 @@ mod per_binding_refinement {
             layout: None,
             hooks: None,
             imports: None,
+            confine: None,
             sources: Some(BTreeMap::from([(
                 "pinned".to_owned(),
                 Binding {

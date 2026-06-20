@@ -113,6 +113,9 @@ pub struct Target {
     pub hooks: Option<TargetHooks>,
     #[serde(default)]
     pub imports: Option<Vec<String>>,
+    /// Composition-only anchor every destination must stay under; `Some` iff this is a composed dep target.
+    #[serde(skip)]
+    pub confine: Option<PathBuf>,
 }
 
 /// A per-target binding value. The map key is the binding identity; `source`
