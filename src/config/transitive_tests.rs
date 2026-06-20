@@ -204,3 +204,117 @@ fn instance_distinguishes_parent_and_source_name() {
         "Instance = (parent, source_name, anchor_target, fetch_node); a different parent is a different instance"
     );
 }
+
+#[test]
+fn imports_accepts_a_bare_source_name_list() {
+    let toml = "version = 1\n\n[sources.dep]\ngit = \"https://github.com/me/d.git\"\ntransitive = true\n\n\
+                [targets.home]\npath = \"~/deploy\"\nimports = [\"dep\"]\n";
+    let config = Config::parse(toml).expect("a bare-name imports list must parse");
+    let target = config.targets.get("home").expect("target `home` present");
+    assert_eq!(
+        target.imports,
+        Some(vec!["dep".to_string()]),
+        "`imports` must type as a flat Vec<String> and carry the exact bare source names"
+    );
+}
+
+#[test]
+fn imports_rejects_a_refined_table_import() {
+    let toml = "version = 1\n\n[sources.dep]\ngit = \"https://github.com/me/d.git\"\ntransitive = true\n\n\
+                [targets.home]\npath = \"~/deploy\"\nimports = [{ source = \"dep\", root = \"../escape\" }]\n";
+    // Security contract: `Vec<String>` makes escape-capable refinements (root/map/as) unrepresentable.
+    assert!(
+        Config::parse(toml).is_err(),
+        "a refined-table import must NOT parse into the bare-name `Vec<String>` field"
+    );
+}
+
+#[test]
+fn imports_rejects_a_map_form_refinement() {
+    let toml = "version = 1\n\n[sources.dep]\ngit = \"https://github.com/me/d.git\"\ntransitive = true\n\n\
+                [targets.home.imports.dep]\nas = \"renamed\"\n";
+    // Security contract: `Vec<String>` makes per-import keyed-table refinement unrepresentable.
+    assert!(
+        Config::parse(toml).is_err(),
+        "a map-form (keyed-table) imports refinement must NOT parse into `Vec<String>`"
+    );
+}
+
+#[test]
+fn source_in_both_imports_and_sources_is_rejected() {
+    let toml = "version = 1\n\n[sources.dep]\ngit = \"https://github.com/me/d.git\"\ntransitive = true\n\n\
+                [targets.home]\npath = \"~/deploy\"\nimports = [\"dep\"]\nsources = [\"dep\"]\n";
+    let config = Config::parse(toml).expect("the document itself is structurally valid TOML");
+    let err = config
+        .validate()
+        .expect_err("a source referenced by BOTH imports (mount) and sources (flat) is an error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("dep") && (msg.contains("imports") || msg.contains("mount")),
+        "the conflict must name the doubly-referenced source `dep` and the imports/mount conflict, got: {msg}"
+    );
+}
+
+#[test]
+fn imports_reference_to_a_non_transitive_source_is_rejected() {
+    let toml = "version = 1\n\n[sources.flat]\ngit = \"https://github.com/me/d.git\"\n\n\
+                [targets.home]\npath = \"~/deploy\"\nimports = [\"flat\"]\n";
+    let config = Config::parse(toml).expect("structurally valid TOML");
+    let err = config
+        .validate()
+        .expect_err("mounting a NON-transitive source via imports must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("flat") && msg.contains("transitive"),
+        "the rejection must name `flat` and explain a mount requires a transitive source, got: {msg}"
+    );
+}
+
+#[test]
+fn transitive_source_flat_bound_via_sources_is_rejected() {
+    let toml = "version = 1\n\n[sources.dep]\ngit = \"https://github.com/me/d.git\"\ntransitive = true\n\n\
+                [targets.home]\npath = \"~/deploy\"\nsources = [\"dep\"]\n";
+    let config = Config::parse(toml).expect("structurally valid TOML");
+    let err = config.validate().expect_err(
+        "a transitive source flat-bound via `sources` (never imported) must be rejected: \
+                     it would be silently flat-downgraded, bypassing escape-remote rejection",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("dep")
+            && msg.contains("transitive")
+            && (msg.contains("sources") || msg.contains("flat")),
+        "the rejection must name `dep`, mark it transitive, and explain it cannot be flat-bound via `sources`, got: {msg}"
+    );
+}
+
+#[test]
+fn transitive_source_declared_but_never_imported_is_rejected() {
+    let toml = "version = 1\n\n[sources.dep]\ngit = \"https://github.com/me/d.git\"\ntransitive = true\n\n\
+                [targets.home]\npath = \"~/deploy\"\n";
+    let config = Config::parse(toml).expect("structurally valid TOML");
+    let err = config.validate().expect_err(
+        "a transitive source that no target imports must be rejected: it would never \
+                     be mounted and its sub-graph never resolved",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("dep") && msg.contains("transitive") && msg.contains("import"),
+        "the rejection must name `dep`, mark it transitive, and explain no target imports it, got: {msg}"
+    );
+}
+
+#[test]
+fn imports_reference_to_an_undefined_source_is_rejected() {
+    let toml = "version = 1\n\n\
+                [targets.home]\npath = \"~/deploy\"\nimports = [\"ghost\"]\n";
+    let config = Config::parse(toml).expect("structurally valid TOML");
+    let err = config
+        .validate()
+        .expect_err("an imports reference to an undefined source must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("ghost"),
+        "the rejection must name the undefined source `ghost`, got: {msg}"
+    );
+}

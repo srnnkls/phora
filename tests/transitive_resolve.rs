@@ -242,7 +242,7 @@ fn local_overlay_can_flip_a_source_to_transitive() {
     let fixture = build_fixture();
     let base = format!(
         "version = 1\n\n[sources.dep]\ngit = \"{dep}\"\n\n\
-         [targets.home]\npath = \"~/deploy\"\nimports = [\"dep\"]\n",
+         [targets.flatdep]\npath = \"~/deploy\"\nsources = [\"dep\"]\n",
         dep = dep.path().display(),
     );
     write(&fixture.cwd.path().join("phora.toml"), base.as_bytes());
@@ -262,7 +262,8 @@ fn local_overlay_can_flip_a_source_to_transitive() {
          overlay-driven fail-fast must not mutate",
     );
 
-    let overlay = "version = 1\n\n[sources.dep]\ntransitive = true\n";
+    let overlay = "version = 1\n\n[sources.dep]\ntransitive = true\n\n\
+         [targets.home]\npath = \"~/deploy\"\nimports = [\"dep\"]\n";
     write(
         &fixture.cwd.path().join("phora.local.toml"),
         overlay.as_bytes(),

@@ -171,11 +171,13 @@ pub fn sync(
     backend: &(dyn SourceBackend + Sync),
     registry: &dyn Registry,
 ) -> Result<SyncOutput> {
-    let effective_config = merge_configs(input.base_config.clone(), input.local_config.cloned());
+    let mut effective_config =
+        merge_configs(input.base_config.clone(), input.local_config.cloned());
     effective_config.validate()?;
-    let parsed = effective_config.parsed_sources()?;
-    let remotes = resolved_remotes(&effective_config, &parsed)?;
-    transitive::resolve_transitive_graph(&effective_config, &parsed, backend)?;
+    let mut parsed = effective_config.parsed_sources()?;
+    let mut remotes = resolved_remotes(&effective_config, &parsed)?;
+    let graph = transitive::resolve_transitive_graph(&effective_config, &parsed, backend)?;
+    graph.inject(&mut effective_config, &mut parsed, &mut remotes);
     for warning in validate_link_mode(input.base_config, &parsed, &remotes)? {
         eprintln!("phora: {warning}");
     }
