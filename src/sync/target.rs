@@ -4,14 +4,14 @@ use std::path::{Path, PathBuf};
 use crate::config::{DeployMode, LayoutConfig, LayoutKind, ParsedSource, Target, TemplateOptIn};
 use crate::deploy::{ArtifactState, Journal, check_artifact_state, deploy_artifact, link_artifact};
 use crate::error::{Error, Result};
-use crate::kernel::{ArtifactName, Selection, SourceName};
+use crate::kernel::{ArtifactName, Selection, SourceName, locator_basename};
 use crate::lock::encode_ref;
-use crate::source::{ExportRequest, SourceBackend};
+use crate::source::{ExportRequest, SourceBackend, SourceError};
 use crate::store::{
     ArtifactKey, EjectedEntry, ProjectedRecord, RecordKind, Registry, RegistryRecord,
 };
 
-use super::discover::discover_link_artifacts;
+use super::discover::{LinkArtifact, discover_link_artifacts};
 use super::{
     Conflict, ConflictKind, ConflictResolver, Resolution, StagingGuard, nonce, remote_for,
     target_parent,
@@ -30,22 +30,36 @@ pub(super) struct TargetRun<'a> {
     pub(super) vars: &'a BTreeMap<String, String>,
 }
 
+pub(super) struct TargetDeploy {
+    pub(super) had_failures: bool,
+    pub(super) warnings: Vec<String>,
+}
+
 pub(super) fn deploy_target(
     run: TargetRun<'_>,
     backend: &dyn SourceBackend,
     registry: &dyn Registry,
     journal: &Journal,
-) -> Result<bool> {
+) -> Result<TargetDeploy> {
     let target_path = run.target.expanded_path();
     let layout = run.target.layout();
     let ejected = registry.load_ejected(run.target_name)?;
 
-    let bindings = plan_bindings(&run, backend)?;
+    let PlannedBindings {
+        bindings,
+        mut warnings,
+    } = plan_bindings(&run, backend)?;
 
     let mut seen_dest: BTreeMap<PathBuf, String> = BTreeMap::new();
     for binding in &bindings {
         for artifact in &binding.artifacts {
-            let dst = artifact_dst_for(&target_path, &layout, &binding.identity, &artifact.name);
+            let dst = artifact_dst_for(
+                &target_path,
+                &layout,
+                &binding.identity,
+                &artifact.name,
+                artifact.deploy_rel.as_deref(),
+            );
             if let Some(other) = seen_dest.insert(dst, binding.identity.clone()) {
                 return Err(Error::Collision {
                     artifact: artifact.name.as_str().to_owned(),
@@ -60,8 +74,13 @@ pub(super) fn deploy_target(
     for binding in &bindings {
         let source_name = SourceName::trusted(&binding.underlying_source);
         for artifact in &binding.artifacts {
-            let artifact_dst =
-                artifact_dst_for(&target_path, &layout, &binding.identity, &artifact.name);
+            let artifact_dst = artifact_dst_for(
+                &target_path,
+                &layout,
+                &binding.identity,
+                &artifact.name,
+                artifact.deploy_rel.as_deref(),
+            );
             let dst_is_symlink =
                 std::fs::symlink_metadata(&artifact_dst).is_ok_and(|m| m.file_type().is_symlink());
             let mode_transition = match binding.source.deploy_mode() {
@@ -84,18 +103,26 @@ pub(super) fn deploy_target(
                 mode_transition,
                 template_opt_in: &binding.template_opt_in,
                 mapped_source_key: artifact.mapped_source_key.as_deref(),
+                deploy_rel: artifact.deploy_rel.as_deref(),
                 link_kind: artifact.link_kind,
             };
-            had_failures |= deploy_artifact_entry(run, &entry, backend, registry, journal)?;
+            let outcome = deploy_artifact_entry(run, &entry, backend, registry, journal)?;
+            had_failures |= outcome.had_failure;
+            warnings.extend(outcome.warning);
         }
     }
 
-    Ok(had_failures)
+    Ok(TargetDeploy {
+        had_failures,
+        warnings,
+    })
 }
 
 struct PlannedArtifact {
     name: ArtifactName,
     mapped_source_key: Option<String>,
+    /// Nested map dest under the layout dir; the record still keys on `name` (its basename).
+    deploy_rel: Option<PathBuf>,
     link_kind: RecordKind,
 }
 
@@ -111,11 +138,17 @@ struct PlannedBinding<'a> {
     artifacts: Vec<PlannedArtifact>,
 }
 
+struct PlannedBindings<'a> {
+    bindings: Vec<PlannedBinding<'a>>,
+    warnings: Vec<String>,
+}
+
 fn plan_bindings<'a>(
     run: &TargetRun<'a>,
     backend: &dyn SourceBackend,
-) -> Result<Vec<PlannedBinding<'a>>> {
+) -> Result<PlannedBindings<'a>> {
     let mut planned = Vec::new();
+    let mut warnings = Vec::new();
     for binding in run.target.resolve_sources(run.parsed) {
         let source = run.parsed.get(binding.source).ok_or_else(|| {
             Error::Config(format!(
@@ -140,13 +173,14 @@ fn plan_bindings<'a>(
         let artifacts = if let Some(map) = binding.map {
             map.iter()
                 .map(|(key, dest)| PlannedArtifact {
-                    name: ArtifactName::trusted(dest.as_str()),
+                    name: ArtifactName::trusted(locator_basename(dest)),
                     mapped_source_key: Some(key.as_str().to_owned()),
+                    deploy_rel: Some(PathBuf::from(dest.as_str())),
                     link_kind: RecordKind::File,
                 })
                 .collect()
         } else {
-            discover_link_artifacts(
+            let discovered = discover_link_artifacts(
                 source,
                 git,
                 &source_name,
@@ -154,14 +188,24 @@ fn plan_bindings<'a>(
                 backend,
                 &selection,
                 binding.root,
-            )?
-            .into_iter()
-            .map(|a| PlannedArtifact {
-                name: a.name,
-                mapped_source_key: None,
-                link_kind: a.kind,
-            })
-            .collect()
+            )?;
+            for entry in binding.include {
+                if !entry_matched_any(entry, &discovered)? {
+                    warnings.push(format!(
+                        "target `{}` binding `{}`: include `{entry}` matched nothing in the source tree",
+                        run.target_name, binding.identity,
+                    ));
+                }
+            }
+            discovered
+                .into_iter()
+                .map(|a| PlannedArtifact {
+                    name: a.name,
+                    mapped_source_key: None,
+                    deploy_rel: None,
+                    link_kind: a.kind,
+                })
+                .collect()
         };
 
         planned.push(PlannedBinding {
@@ -176,7 +220,10 @@ fn plan_bindings<'a>(
             artifacts,
         });
     }
-    Ok(planned)
+    Ok(PlannedBindings {
+        bindings: planned,
+        warnings,
+    })
 }
 
 pub(super) struct ArtifactEntry<'a> {
@@ -196,8 +243,23 @@ pub(super) struct ArtifactEntry<'a> {
     pub(super) template_opt_in: &'a TemplateOptIn,
     /// Source-side key for a mapped leaf; `None` for layout-routed artifacts.
     pub(super) mapped_source_key: Option<&'a str>,
+    /// Nested map dest under the layout dir; deploy honors it, the record keys on the basename.
+    pub(super) deploy_rel: Option<&'a Path>,
     /// Link-mode `RecordKind` from discovery's working-tree scan, not a live re-stat.
     pub(super) link_kind: RecordKind,
+}
+
+fn entry_matched_any(entry: &str, discovered: &[LinkArtifact]) -> Result<bool> {
+    let probe = Selection::new(std::slice::from_ref(&entry.to_owned()), &[])?;
+    let nested: Vec<&str> = probe
+        .nested_locators()
+        .iter()
+        .map(|l| locator_basename(l))
+        .collect();
+    Ok(discovered.iter().any(|a| {
+        let name = a.name.as_str();
+        probe.selects_artifact(name) || nested.contains(&name)
+    }))
 }
 
 /// The artifact's deployed location at its layout path (a file for `kind=file`, a dir for `kind=dir`).
@@ -224,8 +286,11 @@ fn artifact_dst_for(
     layout: &LayoutConfig,
     identity: &str,
     artifact_name: &ArtifactName,
+    deploy_rel: Option<&Path>,
 ) -> PathBuf {
-    target_path.join(layout.artifact_path(identity, artifact_name.as_str()))
+    let suffix =
+        deploy_rel.map_or_else(|| PathBuf::from(artifact_name.as_str()), Path::to_path_buf);
+    target_path.join(layout.artifact_path(identity, &suffix.to_string_lossy()))
 }
 
 fn artifact_dst_for_entry(run: TargetRun<'_>, entry: &ArtifactEntry<'_>) -> PathBuf {
@@ -234,7 +299,36 @@ fn artifact_dst_for_entry(run: TargetRun<'_>, entry: &ArtifactEntry<'_>) -> Path
         &run.target.layout(),
         entry.identity,
         entry.artifact_name,
+        entry.deploy_rel,
     )
+}
+
+pub(super) struct DeployOutcome {
+    pub(super) had_failure: bool,
+    pub(super) warning: Option<String>,
+}
+
+impl DeployOutcome {
+    fn clean() -> Self {
+        Self {
+            had_failure: false,
+            warning: None,
+        }
+    }
+
+    fn failed() -> Self {
+        Self {
+            had_failure: true,
+            warning: None,
+        }
+    }
+
+    fn warned(message: String) -> Self {
+        Self {
+            had_failure: false,
+            warning: Some(message),
+        }
+    }
 }
 
 pub(super) fn deploy_artifact_entry(
@@ -243,7 +337,7 @@ pub(super) fn deploy_artifact_entry(
     backend: &dyn SourceBackend,
     registry: &dyn Registry,
     journal: &Journal,
-) -> Result<bool> {
+) -> Result<DeployOutcome> {
     let artifact_dst = artifact_dst_for_entry(run, entry);
     let key = ArtifactKey {
         target: run.target_name.to_owned(),
@@ -287,6 +381,7 @@ pub(super) fn deploy_artifact_entry(
                 template_opt_in: entry.template_opt_in,
                 vars: run.vars,
                 mapped_source_key: entry.mapped_source_key,
+                deploy_rel: entry.deploy_rel,
             },
         ),
     };
@@ -298,7 +393,7 @@ pub(super) fn deploy_artifact_entry(
                 ArtifactState::Ejected | ArtifactState::Clean | ArtifactState::Linked
             ) =>
         {
-            return Ok(false);
+            return Ok(DeployOutcome::clean());
         }
         None => Resolution::Overwrite,
         Some(kind) => match run.resolver {
@@ -320,16 +415,35 @@ pub(super) fn deploy_artifact_entry(
         },
     };
 
+    apply_resolution(run, entry, registry, resolution, key, deploy)
+}
+
+fn apply_resolution(
+    run: TargetRun<'_>,
+    entry: &ArtifactEntry<'_>,
+    registry: &dyn Registry,
+    resolution: Resolution,
+    key: ArtifactKey,
+    deploy: impl FnOnce(ArtifactKey) -> Result<()>,
+) -> Result<DeployOutcome> {
     match resolution {
-        Resolution::Skip => Ok(false),
+        Resolution::Skip => Ok(DeployOutcome::clean()),
         Resolution::Overwrite => match deploy(key) {
-            Ok(()) => Ok(false),
+            Ok(()) => Ok(DeployOutcome::clean()),
+            Err(Error::SourceCtx(SourceError::MappedKeyNotFound { key })) => {
+                Ok(DeployOutcome::warned(format!(
+                    "target `{}` binding `{}`: map key `{}` matched nothing in the source tree",
+                    run.target_name,
+                    entry.identity,
+                    key.display(),
+                )))
+            }
             Err(e) => {
                 eprintln!(
                     "phora: failed to deploy {}:{}: {e}",
                     entry.identity, entry.artifact_name
                 );
-                Ok(true)
+                Ok(DeployOutcome::failed())
             }
         },
         Resolution::Eject => {
@@ -340,7 +454,7 @@ pub(super) fn deploy_artifact_entry(
                 ejected_at: chrono::Utc::now().to_rfc3339(),
             });
             registry.save_ejected(run.target_name, &ejected)?;
-            Ok(false)
+            Ok(DeployOutcome::clean())
         }
         Resolution::Abort => Err(Error::Aborted),
     }
@@ -429,6 +543,7 @@ struct DeployContext<'a> {
     template_opt_in: &'a TemplateOptIn,
     vars: &'a BTreeMap<String, String>,
     mapped_source_key: Option<&'a str>,
+    deploy_rel: Option<&'a Path>,
 }
 
 fn deploy_one(
@@ -445,10 +560,11 @@ fn deploy_one(
     let commit_time = backend.commit_time(ctx.source_name, git, ctx.commit)?;
     let policy = ctx.source.export_policy();
     let path_map = ctx.mapped_source_key.map(|key| {
-        BTreeMap::from([(
-            PathBuf::from(key),
-            PathBuf::from(ctx.artifact_name.as_str()),
-        )])
+        let dest = ctx.deploy_rel.map_or_else(
+            || PathBuf::from(ctx.artifact_name.as_str()),
+            Path::to_path_buf,
+        );
+        BTreeMap::from([(PathBuf::from(key), dest)])
     });
     let req = ExportRequest {
         source: ctx.source_name,

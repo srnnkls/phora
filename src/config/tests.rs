@@ -5647,18 +5647,6 @@ fn binding_map_with_exclude_is_rejected() {
 }
 
 #[test]
-fn binding_map_value_with_slash_is_rejected() {
-    let err = map_config_err(r#"map = { "AGENTS.md" = "sub/CLAUDE.md" }"#);
-    match err {
-        Error::Config(msg) => assert!(
-            msg.contains("dotfiles") && msg.contains("sub/CLAUDE.md"),
-            "a nested map dest must be rejected and the message name the offending value, got: {msg}"
-        ),
-        other => panic!("expected Error::Config, got {other:?}"),
-    }
-}
-
-#[test]
 fn binding_map_value_with_backslash_is_rejected() {
     let err = map_config_err(r#"map = { "AGENTS.md" = "sub\\CLAUDE.md" }"#);
     match err {
@@ -5857,6 +5845,123 @@ fn binding_map_duplicate_dest_values_are_rejected() {
             "two keys mapping to one dest must be rejected, naming the source and the duplicated dest, got: {msg}"
         ),
         other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+// ── FPS-005: map list-shorthand (serde enum) + nested dest ──────
+
+/// Parse a config whose single binding carries `map = {map_body}` and return its
+/// REFINED binding's `map` after desugar/validation. Fails loudly if validation rejects.
+fn map_config_ok(map_body: &str) -> BTreeMap<String, String> {
+    let toml = format!(
+        r#"
+version = 1
+
+[sources.dotfiles]
+git = "https://github.com/me/dotfiles.git"
+
+[targets.t]
+path = "~/x"
+[targets.t.sources]
+dotfiles = {{ {map_body} }}
+"#
+    );
+    let cfg = Config::parse(&toml).expect("a structurally valid `map` binding must parse");
+    cfg.validate()
+        .expect("a valid `map` binding must pass validation");
+    refined(&cfg, "t")
+        .map
+        .as_ref()
+        .expect("the keyed binding carries the desugared `map`")
+        .clone()
+}
+
+#[test]
+fn map_list_shorthand_desugars_to_identity_table() {
+    let map = map_config_ok(r#"map = ["AGENTS.md"]"#);
+    assert_eq!(
+        map.get("AGENTS.md").map(String::as_str),
+        Some("AGENTS.md"),
+        "`map = [\"AGENTS.md\"]` must desugar to the identity entry {{ AGENTS.md = AGENTS.md }}"
+    );
+    assert_eq!(
+        map.len(),
+        1,
+        "a single-element list shorthand desugars to exactly one identity entry, got {map:?}"
+    );
+}
+
+#[test]
+fn map_list_shorthand_multiple_entries_each_desugar_to_identity() {
+    let map = map_config_ok(r#"map = ["a.toml", "b.toml"]"#);
+    assert_eq!(
+        map.get("a.toml").map(String::as_str),
+        Some("a.toml"),
+        "each list entry desugars to an identity dest"
+    );
+    assert_eq!(
+        map.get("b.toml").map(String::as_str),
+        Some("b.toml"),
+        "each list entry desugars to an identity dest"
+    );
+}
+
+#[test]
+fn map_empty_list_is_rejected() {
+    let err = map_config_err(r"map = []");
+    match err {
+        Error::Config(msg) => assert!(
+            msg.contains("dotfiles") && msg.contains("map"),
+            "an empty `map = []` list is ambiguous and must be rejected like an empty table, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn map_nested_dest_is_accepted_and_round_trips() {
+    let map = map_config_ok(r#"map = { "src.txt" = "sub/dir/file" }"#);
+    assert_eq!(
+        map.get("src.txt").map(String::as_str),
+        Some("sub/dir/file"),
+        "a nested map dest `sub/dir/file` (interior `/`) must be accepted via safe_relpath and round-trip"
+    );
+}
+
+#[test]
+fn map_dest_with_dotdot_escape_is_rejected() {
+    let err = map_config_err(r#"map = { "src.txt" = "../escape" }"#);
+    match err {
+        Error::Config(msg) => assert!(
+            msg.contains("dotfiles") && msg.contains(".."),
+            "a `..`-escaping nested map dest must be rejected by safe_relpath and named, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn map_dest_with_leading_slash_is_rejected() {
+    let err = map_config_err(r#"map = { "src.txt" = "/abs" }"#);
+    match err {
+        Error::Config(msg) => assert!(
+            msg.contains("dotfiles") && msg.contains("/abs"),
+            "an absolute (leading-slash) map dest must be rejected by safe_relpath and named, got: {msg}"
+        ),
+        other => panic!("expected Error::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn map_config_err_table_body_still_a_config_error() {
+    let err = map_config_err(r#"map = { "AGENTS.md" = "" }"#);
+    match err {
+        Error::Config(msg) => assert!(
+            msg.contains("AGENTS.md") || msg.contains("empty"),
+            "an empty dest must still be a config error that NAMES the offending key `AGENTS.md` \
+             or the empty-dest condition, got: {msg}"
+        ),
+        other => panic!("expected Error::Config for an empty dest, got {other:?}"),
     }
 }
 
@@ -6399,6 +6504,40 @@ mod nested_path_and_file_selection {
         cfg.validate().expect(
             "distinct basenames `x` and `y` do NOT collide — guards against an over-broad \
              collision check that fires on any nested include",
+        );
+    }
+
+    #[test]
+    fn two_nested_map_dests_sharing_a_basename_is_a_hard_error() {
+        let toml = "version = 1\n\n[sources.g]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/dst\"\n\n\
+             [targets.t.sources]\n\
+             g = { source = \"g\", map = { \"a/x\" = \"sub/a/file\", \"b/x\" = \"sub/b/file\" } }\n";
+        let cfg = Config::parse(toml).expect("two nested map dests parse structurally");
+        let err = cfg.validate().expect_err(
+            "two map dests `sub/a/file` and `sub/b/file` share dest basename `file`; both record \
+             on `.../artifacts/<identity>/file.toml`, so the second deploy clobbers the first — \
+             this collision must be a hard config error",
+        );
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("file"),
+                "the collision error must name the colliding basename `file`, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn distinct_map_dest_basenames_under_one_identity_validate() {
+        let toml = "version = 1\n\n[sources.g]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/dst\"\n\n\
+             [targets.t.sources]\n\
+             g = { source = \"g\", map = { \"a/x\" = \"sub/a/one\", \"b/x\" = \"sub/b/two\" } }\n";
+        let cfg = Config::parse(toml).expect("two nested map dests parse structurally");
+        cfg.validate().expect(
+            "distinct dest basenames `one` and `two` do NOT collide — guards against an \
+             over-broad collision check that fires on any nested map dest",
         );
     }
 }

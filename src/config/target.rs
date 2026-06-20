@@ -127,8 +127,34 @@ pub struct Binding {
     pub rev: Option<String>,
     #[serde(default)]
     pub template: Option<TemplateOptIn>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_map")]
     pub map: Option<BTreeMap<String, String>>,
+}
+
+fn deserialize_map<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<BTreeMap<String, String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum MapSpec {
+        List(Vec<String>),
+        Table(BTreeMap<String, String>),
+    }
+
+    let Some(spec) = Option::<MapSpec>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let map = match spec {
+        MapSpec::List(entries) => entries
+            .into_iter()
+            .map(|entry| (entry.clone(), entry))
+            .collect(),
+        MapSpec::Table(table) => table,
+    };
+    Ok(Some(map))
 }
 
 impl Binding {

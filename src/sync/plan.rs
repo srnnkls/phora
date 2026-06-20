@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{Config, ParsedSource, Target};
 use crate::error::{Error, Result};
-use crate::kernel::{ArtifactName, Selection, SourceName};
+use crate::kernel::{ArtifactName, Selection, SourceName, locator_basename};
 use crate::lock::encode_ref;
 use crate::source::SourceBackend;
 
@@ -96,10 +96,11 @@ pub fn plan_target(
         })?;
         if let Some(map) = binding.map {
             for dest in map.values() {
+                let basename = locator_basename(dest);
                 entries.push(PlanEntry {
                     identity: binding.identity.to_owned(),
                     source: binding.source.to_owned(),
-                    artifact: dest.clone(),
+                    artifact: basename.to_owned(),
                     commit: commit.clone(),
                     destination: path.join(layout.artifact_path(binding.identity, dest)),
                     mapped: true,

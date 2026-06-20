@@ -344,8 +344,9 @@ fn reject_unsafe_selectors(target_name: &str, resolved: &ResolvedBinding) -> Res
 fn reject_basename_collision(target_name: &str, resolved: &ResolvedBinding) -> Result<()> {
     let identity = resolved.identity;
     let mut seen = BTreeSet::new();
-    for selector in resolved.include {
-        let base = selector.rsplit('/').next().unwrap_or(selector);
+    let map_dests = resolved.map.into_iter().flat_map(BTreeMap::values);
+    for locator in resolved.include.iter().chain(map_dests) {
+        let base = crate::kernel::locator_basename(locator);
         if !seen.insert(base) {
             return Err(Error::Config(format!(
                 "target `{target_name}` binding `{identity}`: two selectors share basename \
@@ -382,9 +383,10 @@ fn reject_map(source_name: &str, binding: &Binding) -> Result<()> {
                 "source `{source_name}`: `map` entry `{key}` -> `{value}` must have a non-empty key and value"
             )));
         }
-        if crate::kernel::safe_component(value).is_err() {
+        if crate::kernel::safe_relpath(value).is_err() {
             return Err(Error::Config(format!(
-                "source `{source_name}`: `map` dest `{value}` must be a single safe filename"
+                "source `{source_name}`: `map` dest `{value}` must be a relative path inside the \
+                 target (no leading `/`, `..`, or empty components)"
             )));
         }
         if key.starts_with('/') || key.split('/').any(|c| c == "..") {

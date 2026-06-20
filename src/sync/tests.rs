@@ -1889,6 +1889,7 @@ fn second_deploy_over_correct_link_is_a_noop() {
         mode_transition: false,
         template_opt_in: &crate::config::TemplateOptIn::SuffixOnly,
         mapped_source_key: None,
+        deploy_rel: None,
         link_kind: RecordKind::Dir,
     };
     let state = check_artifact_state(
@@ -1907,10 +1908,10 @@ fn second_deploy_over_correct_link_is_a_noop() {
         "premise: a deployed symlink with a linked record must read Linked, got {state:?}"
     );
 
-    let had_failures = deploy_artifact_entry(run, &entry, &counting, &fx.registry, &journal)
+    let outcome = deploy_artifact_entry(run, &entry, &counting, &fx.registry, &journal)
         .expect("deploy pass over a linked artifact must not error");
 
-    assert!(!had_failures, "a no-op linked pass is not a failure");
+    assert!(!outcome.had_failure, "a no-op linked pass is not a failure");
     assert_eq!(
         counting.export_count(),
         0,
@@ -10876,6 +10877,17 @@ fn config_one_source_select(url: &str, target_path: &Path, include: &str, layout
     Config::parse(&toml).expect("one-source select config parses")
 }
 
+fn config_binding_include(url: &str, target_path: &Path, include: &str, layout: &str) -> Config {
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.src]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\n\
+         sources = {{ src = {{ source = \"src\", include = [{include}] }} }}\nlayout = \"{layout}\"\n",
+        target_path.display(),
+    );
+    Config::parse(&toml).expect("binding-level include config parses")
+}
+
 #[test]
 fn sync_mapped_leaf_honors_by_source_layout() {
     let fx = build_map_sync_fixture();
@@ -11424,5 +11436,453 @@ fn verify_passes_then_flags_content_mismatch_for_kind_file_record() {
         "verify must flag a ContentMismatch for the tampered kind=file artifact at its layout \
          path; if verify reads the wrong base (target root) it would report Missing or nothing, \
          got {dirty:?}"
+    );
+}
+
+// ── FPS-006: warn (not error) when a selector matches nothing deployable ───────
+
+fn sync_warnings(out: &SyncOutput) -> &[String] {
+    &out.warnings
+}
+
+/// A repo with one loose `.json` file at the root, so a `*.json` glob include has
+/// a real loose file to match (the glob negative-control for FPS-006).
+#[expect(
+    clippy::unwrap_used,
+    reason = "fixture setup fails loudly; git CLI is assumed present"
+)]
+fn build_loose_json_fixture() -> SyncFixture {
+    let src = TempDir::new().unwrap();
+    let src_path = src.path();
+
+    run_git(src_path, &["init", "-b", "main", "."]);
+    run_git(src_path, &["config", "user.email", "test@example.com"]);
+    run_git(src_path, &["config", "user.name", "Test"]);
+
+    std::fs::write(src_path.join("settings.json"), b"{}\n").unwrap();
+    run_git(src_path, &["add", "-A"]);
+    run_git(src_path, &["commit", "-m", "initial"]);
+
+    let head_sha = rev_parse(src_path, "HEAD");
+
+    let git_dir = TempDir::new().unwrap();
+    let state_dir = TempDir::new().unwrap();
+    let backend = GitBackend::new(git_dir.path().to_path_buf());
+    let registry =
+        FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry over tempdir");
+    let url = src_path.to_string_lossy().into_owned();
+
+    SyncFixture {
+        src,
+        _git_dir: git_dir,
+        _state_dir: state_dir,
+        backend,
+        registry,
+        url,
+        head_sha,
+    }
+}
+
+/// A single source with the given inline `map` table body and one flat target,
+/// so a test can declare an unmatched map key without a bespoke helper.
+fn config_one_source_map(url: &str, target_path: &Path, map_body: &str) -> Config {
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.src]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = {{ src = {{ map = {{ {map_body} }} }} }}\n\
+         layout = \"flat\"\n",
+        target_path.display(),
+    );
+    Config::parse(&toml).expect("one-source map config parses")
+}
+
+/// (1) An `include` literal that matches nothing in the source tree must produce a
+/// WARNING naming the offending entry — not the current silent drop. Sync still
+/// succeeds (the no-match is a typo/not-yet-pushed path, not a hard error).
+#[test]
+fn unmatched_include_warns_and_names_the_entry() {
+    let fx = build_file_artifact_fixture();
+    let td = TargetDir::new();
+    let cfg = config_binding_include(
+        &fx.url,
+        &td.target_path(),
+        "\"does-not-exist\"",
+        "by-source",
+    );
+
+    let out = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("an unmatched include must WARN, not error — sync must still succeed");
+    assert!(
+        !out.had_failures,
+        "an unmatched include is a warning, not a deploy failure: sync must report no failures"
+    );
+
+    assert!(
+        sync_warnings(&out)
+            .iter()
+            .any(|w| w.contains("does-not-exist")),
+        "an `include` entry that resolves to zero deployed artifacts must emit a warning that \
+         NAMES the offending entry `does-not-exist`; today it is silently dropped. warnings: {:?}",
+        sync_warnings(&out),
+    );
+}
+
+/// (2) A `map` key whose source path matches nothing must WARN naming the key.
+/// Uses the post-FPS-005 plain-table dest representation (`{ key = dest }`); does
+/// not depend on the FPS-005 list-shorthand.
+#[test]
+fn unmatched_map_key_warns_and_names_the_key() {
+    let fx = build_file_artifact_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_source_map(&fx.url, &td.target_path(), "\"missing/key\" = \"dest.lua\"");
+
+    let out = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("an unmatched map key must WARN, not error — sync must still succeed");
+    assert!(
+        !out.had_failures,
+        "an unmatched map key is a warning, not a deploy failure: sync must report no failures"
+    );
+
+    assert!(
+        sync_warnings(&out)
+            .iter()
+            .any(|w| w.contains("missing/key")),
+        "a `map` key that resolves to zero deployed artifacts must emit a warning that NAMES the \
+         key `missing/key`; today it is silently dropped. warnings: {:?}",
+        sync_warnings(&out),
+    );
+}
+
+/// (3) NEGATIVE CONTROL — a glob include that matches at least one loose file must
+/// produce NO warning. Guards against an over-broad "always warns".
+#[test]
+fn matched_glob_include_does_not_warn() {
+    let fx = build_loose_json_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_source_select(&fx.url, &td.target_path(), "\"*.json\"", "by-source");
+
+    let out = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("a glob include matching a loose file must deploy and succeed");
+    assert!(
+        !out.had_failures,
+        "premise: the glob-include sync must succeed"
+    );
+
+    let layout_dst = td.target_path().join("src").join("settings.json");
+    assert!(
+        layout_dst.is_file(),
+        "premise: include=[*.json] must deploy the loose settings.json artifact, missing at {}",
+        layout_dst.display(),
+    );
+
+    assert!(
+        sync_warnings(&out).is_empty(),
+        "a glob include that matches at least one loose file must NOT warn — the warning is for \
+         zero-match selectors only. warnings: {:?}",
+        sync_warnings(&out),
+    );
+}
+
+/// (4) NEGATIVE CONTROL — a normal matched dir artifact must produce NO warning.
+#[test]
+fn matched_dir_artifact_does_not_warn() {
+    let fx = build_file_artifact_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_source_select(&fx.url, &td.target_path(), "\"editor\"", "by-source");
+
+    let out = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("a matched dir-artifact sync must succeed");
+    assert!(
+        !out.had_failures,
+        "premise: the dir-artifact sync must succeed"
+    );
+
+    let layout_dst = td.target_path().join("src").join("editor");
+    assert!(
+        layout_dst.is_dir(),
+        "premise: include=[editor] must deploy the editor dir artifact, missing at {}",
+        layout_dst.display(),
+    );
+
+    assert!(
+        sync_warnings(&out).is_empty(),
+        "a matched dir artifact must NOT warn — only zero-match selectors warn. warnings: {:?}",
+        sync_warnings(&out),
+    );
+}
+
+/// (5) Each unmatched include entry must be named in its own warning, so a config
+/// with two typos surfaces both — not a single collapsed message.
+#[test]
+fn each_unmatched_include_is_named() {
+    let fx = build_file_artifact_fixture();
+    let td = TargetDir::new();
+    let cfg = config_binding_include(
+        &fx.url,
+        &td.target_path(),
+        "\"nope-one\", \"nope-two\"",
+        "by-source",
+    );
+
+    let out = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("two unmatched includes must WARN twice, not error");
+    assert!(
+        !out.had_failures,
+        "two unmatched includes must not fail the sync"
+    );
+
+    assert!(
+        sync_warnings(&out).iter().any(|w| w.contains("nope-one")),
+        "the first unmatched include `nope-one` must be named in a warning. warnings: {:?}",
+        sync_warnings(&out),
+    );
+    assert!(
+        sync_warnings(&out).iter().any(|w| w.contains("nope-two")),
+        "the second unmatched include `nope-two` must be named in a warning. warnings: {:?}",
+        sync_warnings(&out),
+    );
+}
+
+// ── FPS-005: three-forms equivalence + map rename/nested dest deploy ──
+
+fn config_one_form(url: &str, target_path: &Path, binding_body: &str) -> Config {
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.src]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = {{ src = {{ {binding_body} }} }}\n\
+         layout = \"by-source\"\n",
+        target_path.display(),
+    );
+    Config::parse(&toml).expect("single-form binding config parses")
+}
+
+struct DeployedFacts {
+    path: PathBuf,
+    digest: String,
+    kind: RecordKind,
+    layout: String,
+    artifact_key: String,
+    files: Vec<PathBuf>,
+}
+
+fn deploy_one_form(binding_body: &str) -> DeployedFacts {
+    let fx = build_file_artifact_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_form(&fx.url, &td.target_path(), binding_body);
+
+    let out = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .unwrap_or_else(|e| panic!("sync for form `{binding_body}` must succeed: {e:?}"));
+    assert!(
+        !out.had_failures,
+        "form `{binding_body}` must deploy without failures"
+    );
+
+    let path = td.target_path().join("src").join("init.lua");
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+        panic!("form `{binding_body}` must deploy a file at <target>/src/init.lua: {e}")
+    });
+    assert_eq!(
+        bytes, b"-- loose init\n",
+        "form `{binding_body}` must deploy the loose file's bytes unrenamed"
+    );
+
+    let rec = fx
+        .registry
+        .get(&artifact_key("dest", "src", "init.lua"))
+        .expect("registry get must not error")
+        .unwrap_or_else(|| panic!("form `{binding_body}` must persist a kind=file record"));
+
+    // Make the deployed path relative to the per-form temp target so distinct
+    // tempdirs do not falsely differ.
+    let rel = path
+        .strip_prefix(td.target_path())
+        .expect("deployed path is under the target")
+        .to_path_buf();
+
+    DeployedFacts {
+        path: rel,
+        digest: rec.digest.clone(),
+        kind: rec.kind,
+        layout: rec.layout.clone(),
+        artifact_key: rec.key.artifact.clone(),
+        files: rec.files.iter().map(|f| f.path.clone()).collect(),
+    }
+}
+
+#[test]
+fn three_single_file_forms_deploy_byte_identically() {
+    let by_include = deploy_one_form(r#"include = ["init.lua"]"#);
+    let by_list = deploy_one_form(r#"map = ["init.lua"]"#);
+    let by_table = deploy_one_form(r#"map = { "init.lua" = "init.lua" }"#);
+
+    assert_eq!(
+        by_include.path, by_list.path,
+        "include and map-list forms must deploy at the SAME layout path"
+    );
+    assert_eq!(
+        by_include.path, by_table.path,
+        "include and map-table forms must deploy at the SAME layout path"
+    );
+
+    assert_eq!(
+        (
+            by_include.kind,
+            by_include.layout.as_str(),
+            by_include.artifact_key.as_str(),
+        ),
+        (
+            by_list.kind,
+            by_list.layout.as_str(),
+            by_list.artifact_key.as_str(),
+        ),
+        "include and map-list forms must record identical kind/layout/key"
+    );
+    assert_eq!(
+        (
+            by_include.kind,
+            by_include.layout.as_str(),
+            by_include.artifact_key.as_str(),
+        ),
+        (
+            by_table.kind,
+            by_table.layout.as_str(),
+            by_table.artifact_key.as_str(),
+        ),
+        "include and map-table forms must record identical kind/layout/key"
+    );
+    assert_eq!(
+        by_include.kind,
+        RecordKind::File,
+        "all three single-file forms must record kind=file"
+    );
+    assert_eq!(
+        by_include.files, by_list.files,
+        "the recorded file list must be identical across include and map-list"
+    );
+    assert_eq!(
+        by_include.files, by_table.files,
+        "the recorded file list must be identical across include and map-table"
+    );
+
+    assert_eq!(
+        by_include.digest, by_list.digest,
+        "include and map-list forms must produce a byte-identical artifact digest"
+    );
+    assert_eq!(
+        by_include.digest, by_table.digest,
+        "include and map-table forms must produce a byte-identical artifact digest"
+    );
+}
+
+#[test]
+fn map_rename_records_dest_basename_as_artifact_key() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = {{ \
+         agents = {{ source = \"src\", map = {{ \"tools/AGENTS.md\" = \"bar\" }} }} }}\n\
+         layout = \"by-source\"\n",
+        fx.url,
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("nested-source rename config parses");
+
+    let out = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("a renamed nested-source map must deploy");
+    assert!(!out.had_failures, "rename deploy must succeed");
+
+    let rec = fx
+        .registry
+        .get(&artifact_key("dest", "agents", "bar"))
+        .expect("registry get must not error")
+        .expect("a map rename must key the record on the DEST basename `bar`");
+    assert_eq!(
+        rec.key.artifact, "bar",
+        "the rename `tools/AGENTS.md -> bar` must record artifact key = dest basename `bar`"
+    );
+
+    let dst = td.target_path().join("agents").join("bar");
+    assert!(
+        dst.is_file(),
+        "the renamed dest must deploy at <target>/<identity>/bar, missing at {}",
+        dst.display()
+    );
+    assert_eq!(
+        std::fs::read(&dst).expect("read renamed dest"),
+        b"# nested agents\n",
+        "the renamed dest must carry the NESTED source file's bytes (tools/AGENTS.md)"
+    );
+}
+
+#[test]
+fn map_nested_dest_deploys_under_layout_with_basename_record_key() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = {{ \
+         agents = {{ source = \"src\", map = {{ \"AGENTS.md\" = \"sub/dir/file\" }} }} }}\n\
+         layout = \"by-source\"\n",
+        fx.url,
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("nested-dest map config parses");
+
+    let out = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("a nested map dest must deploy");
+    assert!(!out.had_failures, "nested-dest deploy must succeed");
+
+    let dst = td.target_path().join("agents").join("sub/dir/file");
+    assert!(
+        dst.is_file(),
+        "a nested map dest `sub/dir/file` must deploy at <target>/<identity>/sub/dir/file, \
+         missing at {}",
+        dst.display()
+    );
+
+    let rec = fx
+        .registry
+        .get(&artifact_key("dest", "agents", "file"))
+        .expect("registry get must not error")
+        .expect("a nested map dest must key the record on the DEST basename `file`");
+    assert_eq!(
+        rec.kind,
+        RecordKind::File,
+        "a nested map dest is a single-file artifact"
     );
 }

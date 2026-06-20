@@ -109,6 +109,7 @@ pub struct SyncOutput {
     pub had_failures: bool,
     pub deploy_failures: bool,
     pub hook_results: Vec<hooks::HookOutcome>,
+    pub warnings: Vec<String>,
 }
 
 /// A relative target path yields an empty (`""`) or absent parent; both normalize
@@ -210,9 +211,10 @@ pub fn sync(
     let (base_lock, local_lock) = split_locks(routed, &local_names);
 
     let mut had_failures = false;
+    let mut warnings = Vec::new();
 
     for (target_name, target) in &effective_config.targets {
-        had_failures |= deploy_target(
+        let deployed = deploy_target(
             TargetRun {
                 parsed: &parsed,
                 target_name,
@@ -228,6 +230,11 @@ pub fn sync(
             registry,
             &journal,
         )?;
+        had_failures |= deployed.had_failures;
+        for warning in deployed.warnings {
+            eprintln!("phora: {warning}");
+            warnings.push(warning);
+        }
     }
 
     if input.prune {
@@ -261,6 +268,7 @@ pub fn sync(
         had_failures,
         deploy_failures,
         hook_results,
+        warnings,
     })
 }
 
