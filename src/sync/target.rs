@@ -271,10 +271,14 @@ fn entry_matched_any(entry: &str, discovered: &[LinkArtifact]) -> Result<bool> {
 
 /// The artifact's deployed location at its layout path (a file for `kind=file`, a dir for `kind=dir`).
 pub(crate) fn record_artifact_path(target: &Target, record: &RegistryRecord) -> PathBuf {
+    let suffix = record
+        .deploy_rel
+        .as_deref()
+        .map_or_else(|| PathBuf::from(&record.key.artifact), Path::to_path_buf);
     target.expanded_path().join(
         target
             .layout()
-            .artifact_path(&record.key.source, &record.key.artifact),
+            .artifact_path(&record.key.source, &suffix.to_string_lossy()),
     )
 }
 
@@ -614,6 +618,7 @@ fn deploy_one(
         preserve_executable: policy.preserve_executable,
         files: export.files,
         vars_digest: export.vars_digest,
+        deploy_rel: ctx.deploy_rel.map(Path::to_path_buf),
     });
 
     // Guard stays armed for a single-file move: deploy_artifact only takes the file, leaving the staging dir for the guard to reap.
@@ -663,6 +668,7 @@ fn deploy_link(
         files: vec![],
         linked: true,
         vars_digest: None,
+        deploy_rel: entry.deploy_rel.map(Path::to_path_buf),
     };
     let staging_base = target_parent(entry.target_path).join(".phora-stage");
     link_artifact(

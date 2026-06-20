@@ -53,6 +53,9 @@ pub struct RegistryRecord {
     /// Digest of the full effective vars map at deploy time; `None` for feature-free artifacts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vars_digest: Option<String>,
+    /// Nested map-dest subpath under the layout dir; `None` when the deploy path is `key.artifact`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy_rel: Option<PathBuf>,
 }
 
 /// Borrowed inputs shared by every record-construction site (`deploy_one`, `rebuild_one`).
@@ -67,6 +70,7 @@ pub struct ProjectedRecord<'a> {
     pub preserve_executable: bool,
     pub files: Vec<ManifestFile>,
     pub vars_digest: Option<String>,
+    pub deploy_rel: Option<PathBuf>,
 }
 
 impl RegistryRecord {
@@ -87,6 +91,7 @@ impl RegistryRecord {
             files: p.files,
             linked: false,
             vars_digest: p.vars_digest,
+            deploy_rel: p.deploy_rel,
         }
     }
 }
@@ -556,6 +561,7 @@ mod tests {
             files: vec![],
             linked: true,
             vars_digest: None,
+            deploy_rel: None,
         };
 
         let toml = toml::to_string(&rec).expect("serialize linked record");
@@ -628,6 +634,7 @@ artifact = "snippets"
             files: vec![],
             linked: false,
             vars_digest: None,
+            deploy_rel: None,
         };
 
         let toml = toml::to_string(&rec).expect("serialize aliased record");
@@ -697,6 +704,7 @@ artifact = "snippets"
             files: vec![],
             linked: false,
             vars_digest: vars_digest.map(str::to_owned),
+            deploy_rel: None,
         }
     }
 
@@ -803,6 +811,7 @@ artifact = "snippets"
             }],
             linked: false,
             vars_digest: None,
+            deploy_rel: None,
         }
     }
 

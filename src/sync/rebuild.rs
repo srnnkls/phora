@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{Config, DeployMode, LayoutKind, Target, TemplateOptIn};
 use crate::error::{Error, Result};
-use crate::kernel::{ArtifactName, Selection, SourceName};
+use crate::kernel::{ArtifactName, Selection, SourceName, locator_basename};
 use crate::lock::{Lock, ref_discriminator};
 use crate::source::{ExportRequest, SourceBackend};
 use crate::store::{
@@ -108,6 +108,7 @@ fn rebuild_binding(
 
     let reconstruct = |artifact: &ArtifactName,
                        mapped_source_key: Option<&str>,
+                       deploy_rel: Option<&Path>,
                        link_kind: RecordKind,
                        managed: &mut BTreeMap<String, BTreeSet<String>>,
                        report: &mut RebuildReport|
@@ -117,22 +118,25 @@ fn rebuild_binding(
             source: run.binding.identity.to_owned(),
             artifact: artifact.as_str().to_owned(),
         };
+        let deploy_suffix =
+            deploy_rel.map_or_else(|| PathBuf::from(artifact.as_str()), Path::to_path_buf);
         let artifact_dst = run.target.expanded_path().join(
             run.target
                 .layout()
-                .artifact_path(run.binding.identity, artifact.as_str()),
+                .artifact_path(run.binding.identity, &deploy_suffix.to_string_lossy()),
         );
 
         match run.source.deploy_mode() {
-            DeployMode::Link => rebuild_linked(
-                run.registry,
-                run.binding.source,
-                &policy,
-                run.target.layout().kind,
-                link_kind,
+            DeployMode::Link => rebuild_linked(RebuildLinked {
+                registry: run.registry,
+                underlying_source: run.binding.source,
+                policy: &policy,
+                layout_kind: run.target.layout().kind,
+                kind: link_kind,
+                deploy_rel,
                 key,
                 report,
-            )?,
+            })?,
             DeployMode::Copy => rebuild_one(RebuildOne {
                 backend: run.backend,
                 registry: run.registry,
@@ -147,6 +151,7 @@ fn rebuild_binding(
                 artifact_dst: &artifact_dst,
                 layout_kind: run.target.layout().kind,
                 mapped_source_key,
+                deploy_rel,
                 key,
                 report,
                 template_opt_in: &run.binding.template_opt_in,
@@ -164,8 +169,9 @@ fn rebuild_binding(
     if let Some(map) = run.binding.map {
         for (key, dest) in map {
             reconstruct(
-                &ArtifactName::trusted(dest.as_str()),
+                &ArtifactName::trusted(locator_basename(dest.as_str())),
                 Some(key.as_str()),
+                Some(Path::new(dest.as_str())),
                 RecordKind::File,
                 managed,
                 report,
@@ -185,7 +191,7 @@ fn rebuild_binding(
     )?;
 
     for artifact in discovered {
-        reconstruct(&artifact.name, None, artifact.kind, managed, report)?;
+        reconstruct(&artifact.name, None, None, artifact.kind, managed, report)?;
     }
     Ok(())
 }
@@ -204,6 +210,7 @@ struct RebuildOne<'a> {
     artifact_dst: &'a Path,
     layout_kind: LayoutKind,
     mapped_source_key: Option<&'a str>,
+    deploy_rel: Option<&'a Path>,
     key: ArtifactKey,
     report: &'a mut RebuildReport,
     template_opt_in: &'a TemplateOptIn,
@@ -225,6 +232,7 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         artifact_dst,
         layout_kind,
         mapped_source_key,
+        deploy_rel,
         key,
         report,
         template_opt_in,
@@ -235,8 +243,10 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
     let staging = staging_base.join(format!("{artifact}-{}-{}", std::process::id(), nonce()));
     let _guard = StagingGuard::new(&staging_base, &staging);
 
-    let path_map = mapped_source_key
-        .map(|key| BTreeMap::from([(PathBuf::from(key), PathBuf::from(artifact.as_str()))]));
+    let path_map = mapped_source_key.map(|key| {
+        let dest = deploy_rel.map_or_else(|| PathBuf::from(artifact.as_str()), Path::to_path_buf);
+        BTreeMap::from([(PathBuf::from(key), dest)])
+    });
 
     let commit_time = backend.commit_time(source_name, git, commit)?;
     let export = backend.export_artifact(&ExportRequest {
@@ -254,15 +264,13 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         path_map: path_map.as_ref(),
     })?;
 
-    let manifest_base = match export.kind {
-        RecordKind::File => artifact_dst.parent().unwrap_or(artifact_dst),
-        RecordKind::Dir => artifact_dst,
-    };
-
     let mut modified = false;
     let mut files = Vec::with_capacity(export.files.len());
     for mf in export.files {
-        let on_disk = manifest_base.join(&mf.path);
+        let on_disk = match export.kind {
+            RecordKind::File => artifact_dst.to_path_buf(),
+            RecordKind::Dir => artifact_dst.join(&mf.path),
+        };
         let (size, mtime) = if let Some(actual) = disk_hash(&on_disk)? {
             if actual.hash != mf.blake3 {
                 modified = true;
@@ -291,6 +299,7 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         preserve_executable: policy.preserve_executable,
         files,
         vars_digest: export.vars_digest,
+        deploy_rel: deploy_rel.map(Path::to_path_buf),
     });
     registry.put(&record)?;
     report.reconstructed.push(key.clone());
@@ -300,17 +309,30 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Reconstruct a linked artifact's registry record without hashing or export:
-/// a link source has no mirror, so its marker is synthesized from disk discovery.
-fn rebuild_linked(
-    registry: &dyn Registry,
-    underlying_source: &str,
-    policy: &crate::source::ExportPolicy,
+struct RebuildLinked<'a> {
+    registry: &'a dyn Registry,
+    underlying_source: &'a str,
+    policy: &'a crate::source::ExportPolicy,
     layout_kind: LayoutKind,
     kind: RecordKind,
+    deploy_rel: Option<&'a Path>,
     key: ArtifactKey,
-    report: &mut RebuildReport,
-) -> Result<()> {
+    report: &'a mut RebuildReport,
+}
+
+/// Reconstruct a linked artifact's registry record without hashing or export:
+/// a link source has no mirror, so its marker is synthesized from disk discovery.
+fn rebuild_linked(args: RebuildLinked<'_>) -> Result<()> {
+    let RebuildLinked {
+        registry,
+        underlying_source,
+        policy,
+        layout_kind,
+        kind,
+        deploy_rel,
+        key,
+        report,
+    } = args;
     let record = RegistryRecord {
         version: 1,
         key: key.clone(),
@@ -325,6 +347,7 @@ fn rebuild_linked(
         files: vec![],
         linked: true,
         vars_digest: None,
+        deploy_rel: deploy_rel.map(Path::to_path_buf),
     };
     registry.put(&record)?;
     report.reconstructed.push(key);

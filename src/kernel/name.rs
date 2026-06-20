@@ -42,7 +42,13 @@ pub(crate) fn safe_relpath(path: &str) -> std::result::Result<&str, KernelError>
 /// Last `/`-separated segment of a tree locator (the artifact name it yields).
 #[must_use]
 pub(crate) fn locator_basename(locator: &str) -> &str {
-    locator.rsplit('/').next().unwrap_or(locator)
+    locator.rsplit_once('/').map_or(locator, |(_, base)| base)
+}
+
+/// Canonical glob predicate; Selection partitioning and collision-skip must share it.
+#[must_use]
+pub(crate) fn is_glob(pattern: &str) -> bool {
+    pattern.contains(['*', '?', '[', ']', '{', '}'])
 }
 
 /// A configured source identifier: the `[sources.<name>]` table key.

@@ -16,8 +16,6 @@ pub struct Selection {
     path_include: Option<GlobSet>,
     path_exclude: GlobSet,
     dotfile_include: Option<GlobSet>,
-    /// Literal (non-glob) path-level includes, e.g. `a/b/c`: tree locators whose
-    /// basename names a file or directory artifact.
     nested_locators: Vec<String>,
     has_artifact_include: bool,
     has_any_include: bool,
@@ -79,7 +77,7 @@ impl Selection {
     }
 
     fn is_glob(pattern: &str) -> bool {
-        pattern.contains(['*', '?', '[', ']', '{', '}'])
+        crate::kernel::is_glob(pattern)
     }
 
     fn locator_excluded(locator: &str, path_exclude: &GlobSet, artifact_exclude: &GlobSet) -> bool {

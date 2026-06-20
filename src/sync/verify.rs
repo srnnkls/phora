@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::store::{ArtifactKey, Registry};
+use crate::store::{ArtifactKey, RecordKind, Registry};
 
 /// Why a deployed file failed verification against its registry record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,8 +35,12 @@ pub fn verify(config: &Config, registry: &dyn Registry) -> Result<Vec<VerifyMism
             continue;
         };
         let artifact_dir = super::target::record_manifest_base(target, &record);
+        let file_dst = super::target::record_artifact_path(target, &record);
         for file in &record.files {
-            let dst = artifact_dir.join(&file.path);
+            let dst = match record.kind {
+                RecordKind::File => file_dst.clone(),
+                RecordKind::Dir => artifact_dir.join(&file.path),
+            };
             match std::fs::read(&dst) {
                 Ok(content) => {
                     let actual = blake3::hash(&content).to_hex().to_string();

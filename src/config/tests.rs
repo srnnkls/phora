@@ -3441,6 +3441,7 @@ mod per_binding_refinement {
             files: vec![],
             linked: false,
             vars_digest: None,
+            deploy_rel: None,
         };
         reg.put(&rec).expect("put bare-binding record");
 
@@ -6508,6 +6509,20 @@ mod nested_path_and_file_selection {
     }
 
     #[test]
+    fn two_path_level_globs_sharing_a_basename_validate() {
+        let toml = "version = 1\n\n[sources.s]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\n\
+             [targets.t.sources]\n\
+             s = { source = \"s\", include = [\"a/*.lua\", \"b/*.lua\"] }\n";
+        let cfg = Config::parse(toml).expect("two path-level globs parse structurally");
+        cfg.validate().expect(
+            "`include = [\"a/*.lua\", \"b/*.lua\"]` are legal path-level globs that cannot be \
+             reduced to a colliding literal basename; the seen_dest deploy guard remains the \
+             backstop, so config validation must NOT reject them",
+        );
+    }
+
+    #[test]
     fn two_nested_map_dests_sharing_a_basename_is_a_hard_error() {
         let toml = "version = 1\n\n[sources.g]\ngit = \"g\"\n\n\
              [targets.t]\npath = \"~/dst\"\n\n\
@@ -6523,6 +6538,27 @@ mod nested_path_and_file_selection {
             Error::Config(msg) => assert!(
                 msg.contains("file"),
                 "the collision error must name the colliding basename `file`, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_dests_with_literal_glob_metachars_still_collision_checked() {
+        let toml = "version = 1\n\n[sources.g]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/dst\"\n\n\
+             [targets.t.sources]\n\
+             g = { source = \"g\", map = { \"a\" = \"sub/a/x[1]\", \"b\" = \"sub/b/x[1]\" } }\n";
+        let cfg = Config::parse(toml).expect("two literal-bracket map dests parse structurally");
+        let err = cfg.validate().expect_err(
+            "map dests are literal paths validated by `safe_relpath`, never globs; a literal \
+             bracket in `x[1]` must NOT bypass the basename-collision check — both dests record \
+             on `.../artifacts/<identity>/x[1].toml` and collide",
+        );
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("x[1]"),
+                "the collision error must name the colliding basename `x[1]`, got: {msg}"
             ),
             other => panic!("expected Error::Config, got {other:?}"),
         }

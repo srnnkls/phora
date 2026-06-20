@@ -911,6 +911,7 @@ mod tests {
             files: manifest,
             linked: false,
             vars_digest: None,
+            deploy_rel: None,
         }
     }
 
@@ -1097,6 +1098,7 @@ mod tests {
             files: vec![],
             linked: true,
             vars_digest: None,
+            deploy_rel: None,
         }
     }
 
@@ -1386,6 +1388,7 @@ mod tests {
             files: manifest,
             linked: false,
             vars_digest: None,
+            deploy_rel: None,
         }
     }
 

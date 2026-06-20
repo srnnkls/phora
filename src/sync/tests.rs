@@ -1847,6 +1847,7 @@ fn second_deploy_over_correct_link_is_a_noop() {
         files: vec![],
         linked: true,
         vars_digest: None,
+        deploy_rel: None,
     };
     fx.registry
         .put(&linked_record)
@@ -2057,6 +2058,7 @@ fn seed_orphan(
         }],
         linked: false,
         vars_digest: None,
+        deploy_rel: None,
     };
     reg.put(&record).expect("seed orphan record");
     dst
@@ -2719,6 +2721,7 @@ fn sync_runs_recovery_sweep_finishing_a_swapped_but_unrecorded_artifact() {
         }],
         linked: false,
         vars_digest: None,
+        deploy_rel: None,
     };
 
     let staging_base = td.parent_path.join(".phora-stage");
@@ -2876,6 +2879,7 @@ fn sync_runs_recovery_before_phase1_even_when_resolve_fails() {
         }],
         linked: false,
         vars_digest: None,
+        deploy_rel: None,
     };
 
     let staging_base = td.parent_path.join(".phora-stage");
@@ -2962,6 +2966,7 @@ fn seed_managed_artifact(
         }],
         linked: false,
         vars_digest: None,
+        deploy_rel: None,
     };
     reg.put(&record).expect("seed managed record");
     dst
@@ -3138,6 +3143,7 @@ fn seed_verifiable_artifact(
         files: manifest,
         linked: false,
         vars_digest: None,
+        deploy_rel: None,
     };
     reg.put(&record).expect("seed verifiable record");
     dst
@@ -3768,6 +3774,7 @@ fn verify_skips_linked_record_even_with_stray_manifest_file() {
         }],
         linked: true,
         vars_digest: None,
+        deploy_rel: None,
     };
     fx.registry
         .put(&stray)
@@ -3816,6 +3823,7 @@ fn verify_skips_linked_record_over_edited_symlink_target() {
         files: vec![],
         linked: true,
         vars_digest: None,
+        deploy_rel: None,
     };
     fx.registry.put(&linked).expect("seed linked record");
 
@@ -3927,6 +3935,7 @@ fn prune_removes_stale_linked_symlink_without_following_it() {
             files: vec![],
             linked: true,
             vars_digest: None,
+            deploy_rel: None,
         })
         .expect("seed the orphaned linked record");
 
@@ -6503,6 +6512,7 @@ fn preview_writes_nothing_to_the_registry_or_the_target() {
         }],
         linked: false,
         vars_digest: None,
+        deploy_rel: None,
     };
     fx.registry.put(&seeded).expect("seed registry record");
     let before = fx.registry.list_all().expect("snapshot registry");
@@ -10368,6 +10378,112 @@ fn prune_mapped_dest_honors_by_source_layout() {
 }
 
 #[test]
+fn nested_map_dest_record_path_equals_deployed_path() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_mapped_to(&fx.url, &td.target_path(), "sub/dir/file", "flat");
+    let in_ = input(&cfg, None, None, None, false);
+    sync(&in_, &fx.backend, &fx.registry).expect("deploy the nested mapped dest");
+
+    let deployed = td.target_path().join("sub").join("dir").join("file");
+    assert!(
+        deployed.is_file(),
+        "premise: a nested map dest must deploy at {}",
+        deployed.display()
+    );
+
+    let record = fx
+        .registry
+        .get(&artifact_key("dest", "agents-src", "file"))
+        .expect("registry read")
+        .expect("the nested mapped record must exist keyed on its basename");
+
+    let reconstructed = super::target::record_artifact_path(&cfg.targets["dest"], &record);
+    assert_eq!(
+        reconstructed, deployed,
+        "record_artifact_path must reconstruct the FULL nested deploy path \
+         (<target>/sub/dir/file), not just the basename",
+    );
+
+    let manifest_base = super::target::record_manifest_base(&cfg.targets["dest"], &record);
+    assert_eq!(
+        manifest_base,
+        deployed.parent().unwrap(),
+        "a kind=file record's manifest base must be the deployed file's parent dir",
+    );
+}
+
+#[test]
+fn nested_map_dest_second_sync_is_idempotent() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_mapped_to(&fx.url, &td.target_path(), "sub/dir/file", "flat");
+
+    let counting = CountingBackend::new(&fx.backend);
+    let first = sync(
+        &input(&cfg, None, None, None, false),
+        &counting,
+        &fx.registry,
+    )
+    .expect("first sync deploys the nested mapped dest");
+    assert!(!first.had_failures, "first deploy must succeed");
+    assert!(
+        td.target_path()
+            .join("sub")
+            .join("dir")
+            .join("file")
+            .is_file(),
+        "premise: the first sync must deploy the nested dest"
+    );
+    let exports_after_first = counting.export_count();
+
+    let second = sync(
+        &input(&cfg, None, Some(first.base_lock.clone()), None, false),
+        &counting,
+        &fx.registry,
+    )
+    .expect("second sync runs cleanly");
+    assert!(!second.had_failures, "second clean sync must not fail");
+    assert_eq!(
+        counting.export_count(),
+        exports_after_first,
+        "a clean nested mapped dest must NOT be re-exported on the second run: \
+         record path must agree with the deployed path so state resolves Clean"
+    );
+}
+
+#[test]
+fn prune_removes_nested_mapped_dest_on_full_removal() {
+    let fx = build_map_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_mapped_to(&fx.url, &td.target_path(), "sub/dir/file", "flat");
+    let in_ = input(&cfg, None, None, None, false);
+    sync(&in_, &fx.backend, &fx.registry).expect("deploy the nested mapped dest");
+
+    let dst = td.target_path().join("sub").join("dir").join("file");
+    assert!(
+        dst.is_file(),
+        "premise: the nested mapped dest must be on disk"
+    );
+
+    let dropped = config_source_no_binding(&fx.url, &td.target_path(), "flat");
+    prune_for(&fx, &dropped);
+
+    assert!(
+        !dst.exists(),
+        "dropping the map binding must prune the ACTUAL deployed nested file at {} (no leak)",
+        dst.display()
+    );
+    assert!(
+        fx.registry
+            .get(&artifact_key("dest", "agents-src", "file"))
+            .expect("registry read")
+            .is_none(),
+        "the orphaned nested mapped record must be removed from the registry"
+    );
+}
+
+#[test]
 fn verify_hashes_mapped_dest_at_target_root() {
     let fx = build_map_sync_fixture();
     let td = TargetDir::new();
@@ -12083,6 +12199,7 @@ fn verify_quarantines_linked_file_record_like_a_linked_dir() {
         }],
         linked: true,
         vars_digest: None,
+        deploy_rel: None,
     };
     registry
         .put(&stray)

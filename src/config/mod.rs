@@ -344,8 +344,12 @@ fn reject_unsafe_selectors(target_name: &str, resolved: &ResolvedBinding) -> Res
 fn reject_basename_collision(target_name: &str, resolved: &ResolvedBinding) -> Result<()> {
     let identity = resolved.identity;
     let mut seen = BTreeSet::new();
+    let includes = resolved
+        .include
+        .iter()
+        .filter(|locator| !crate::kernel::is_glob(locator));
     let map_dests = resolved.map.into_iter().flat_map(BTreeMap::values);
-    for locator in resolved.include.iter().chain(map_dests) {
+    for locator in includes.chain(map_dests) {
         let base = crate::kernel::locator_basename(locator);
         if !seen.insert(base) {
             return Err(Error::Config(format!(

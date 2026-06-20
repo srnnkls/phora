@@ -214,6 +214,7 @@ fn record(
         }],
         linked: false,
         vars_digest: None,
+        deploy_rel: None,
     }
 }
 
@@ -1755,6 +1756,7 @@ fn record_for(
         files,
         linked: false,
         vars_digest: None,
+        deploy_rel: None,
     }
 }
 
@@ -2045,6 +2047,7 @@ fn mapped_record(
         files,
         linked: false,
         vars_digest: None,
+        deploy_rel: None,
     }
 }
 

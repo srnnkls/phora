@@ -104,7 +104,6 @@ pub(super) fn discover_artifacts_for_source(
     )
 }
 
-/// Copy-mode `kind` is a placeholder (`Dir`); the real kind is resolved at export.
 pub(super) fn discover_link_artifacts(
     source: &ParsedSource,
     git: &str,
