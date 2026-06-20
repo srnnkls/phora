@@ -108,6 +108,73 @@ pub(super) fn dispatch_hooks(config: &Config, registry: &dyn Registry) -> Result
     Ok(outcomes)
 }
 
+/// A commit-pinned transitive `on_change` hook candidate plus the trust decision context.
+pub(super) struct TransitiveHookRun<'a> {
+    pub(super) dep_instance: &'a str,
+    pub(super) hook_id: &'a str,
+    pub(super) command: &'a HookCommand,
+    pub(super) preimage: &'a str,
+    pub(super) target_path: &'a std::path::Path,
+}
+
+/// A new trust approval the producer must persist to the consumer lock's `trusted_hooks`.
+pub(super) struct TransitiveApproval {
+    pub(super) dep_instance: String,
+    pub(super) hook_id: String,
+    pub(super) preimage: String,
+}
+
+/// Runs each commit-pinned transitive hook whose preimage a consumer `trusted_hooks` entry
+/// already pins; an unpinned hook prompts under a TTY (approval persists) and is silently
+/// skipped under non-TTY. A dep can never self-approve: trust is keyed on the consumer lock.
+pub(super) fn dispatch_transitive_hooks(
+    candidates: &[TransitiveHookRun<'_>],
+    trusted: &BTreeSet<String>,
+    interactive: bool,
+) -> Result<(Vec<HookOutcome>, Vec<TransitiveApproval>)> {
+    let mut outcomes = Vec::new();
+    let mut approvals = Vec::new();
+    for candidate in candidates {
+        let pinned = trusted.contains(candidate.preimage);
+        if !pinned {
+            if !interactive || !prompt_trust(candidate) {
+                continue;
+            }
+            approvals.push(TransitiveApproval {
+                dep_instance: candidate.dep_instance.to_owned(),
+                hook_id: candidate.hook_id.to_owned(),
+                preimage: candidate.preimage.to_owned(),
+            });
+        }
+        let status = run_hook(
+            candidate.command,
+            &[("PHORA_TARGET", &candidate.target_path.to_string_lossy())],
+        )?;
+        outcomes.push(HookOutcome {
+            hook_id: candidate.hook_id.to_owned(),
+            command: candidate.command.run.clone(),
+            scope: HookScope::OnChange,
+            status,
+        });
+    }
+    Ok((outcomes, approvals))
+}
+
+/// Prompts on stderr for a transitive hook approval; only an explicit `y` trusts it.
+fn prompt_trust(candidate: &TransitiveHookRun<'_>) -> bool {
+    use std::io::Write as _;
+    eprint!(
+        "phora: composed dep `{}` wants to run on_change hook `{}` — trust it? [y/N] ",
+        candidate.dep_instance, candidate.command.run
+    );
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    match std::io::stdin().read_line(&mut line) {
+        Ok(0) | Err(_) => false,
+        Ok(_) => line.trim().eq_ignore_ascii_case("y"),
+    }
+}
+
 fn dedupe(commands: &[HookCommand]) -> Vec<&HookCommand> {
     let mut seen = BTreeSet::new();
     commands

@@ -322,6 +322,7 @@ fn input<'a>(
         interactive: false,
         prune: false,
         no_hooks: false,
+        no_transitive_hooks: false,
         frozen: false,
         resolver: None,
         jobs: None,
@@ -542,6 +543,7 @@ fn matching_lock_reuses_commit_without_refetch() {
             instance: None,
         }],
         trusted_hooks: Vec::new(),
+        candidate_hooks: Vec::new(),
     };
 
     // Advance HEAD: if sync re-resolved, it would pick up the new commit.
@@ -595,6 +597,7 @@ fn non_matching_lock_triggers_fetch() {
             instance: None,
         }],
         trusted_hooks: Vec::new(),
+        candidate_hooks: Vec::new(),
     };
 
     let counting = CountingBackend::new(&fx.backend);
@@ -730,6 +733,7 @@ fn frozen_reuses_matching_lock_without_touching_network() {
             instance: None,
         }],
         trusted_hooks: Vec::new(),
+        candidate_hooks: Vec::new(),
     };
     let parsed = cfg.parsed_sources().expect("sources parse");
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
@@ -776,6 +780,7 @@ fn frozen_errors_on_drifted_lock_entry() {
             instance: None,
         }],
         trusted_hooks: Vec::new(),
+        candidate_hooks: Vec::new(),
     };
     let parsed = cfg.parsed_sources().expect("sources parse");
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
@@ -818,6 +823,7 @@ fn non_frozen_reresolves_drifted_lock_entry() {
             instance: None,
         }],
         trusted_hooks: Vec::new(),
+        candidate_hooks: Vec::new(),
     };
     let parsed = cfg.parsed_sources().expect("sources parse");
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
@@ -870,6 +876,7 @@ fn force_refetches_even_when_lock_matches() {
             instance: None,
         }],
         trusted_hooks: Vec::new(),
+        candidate_hooks: Vec::new(),
     };
 
     // Advance HEAD after seeding the matching lock: force must pick up C2.
@@ -2168,6 +2175,7 @@ fn sync_with_prune_removes_orphan_files_and_record_but_keeps_current() {
         interactive: false,
         prune: true,
         no_hooks: false,
+        no_transitive_hooks: false,
         frozen: false,
         resolver: None,
         jobs: None,
@@ -2240,6 +2248,7 @@ fn sync_skips_prune_when_a_deploy_failed() {
         interactive: false,
         prune: true,
         no_hooks: false,
+        no_transitive_hooks: false,
         frozen: false,
         resolver: None,
         jobs: None,
@@ -2468,6 +2477,7 @@ fn interactive_input<'a>(
         interactive: true,
         prune: false,
         no_hooks: false,
+        no_transitive_hooks: false,
         frozen: false,
         resolver: Some(resolver),
         jobs: None,
@@ -3778,6 +3788,7 @@ fn link_lock(source: &str, link_git: &Path) -> Lock {
             instance: None,
         }],
         trusted_hooks: Vec::new(),
+        candidate_hooks: Vec::new(),
     }
 }
 
@@ -6300,6 +6311,7 @@ fn lock_with(cfg: &Config, name: &str, git: &str, commit: &str) -> Lock {
             instance: None,
         }],
         trusted_hooks: Vec::new(),
+        candidate_hooks: Vec::new(),
     }
 }
 
@@ -6473,6 +6485,7 @@ fn preview_still_plans_other_bindings_when_one_source_needs_sync() {
                 .remove(0),
         ],
         trusted_hooks: Vec::new(),
+        candidate_hooks: Vec::new(),
     };
 
     let plans = preview_targets(&cfg, &parsed, &remotes, &backend, Some(&lock), false)
@@ -6694,6 +6707,7 @@ fn preview_annotates_predicted_flat_collision_as_warning_not_error() {
             lock_with(&cfg, "src-b", &fx_b.1, &b_head).sources.remove(0),
         ],
         trusted_hooks: Vec::new(),
+        candidate_hooks: Vec::new(),
     };
 
     let result = preview_targets(&cfg, &parsed, &remotes, &backend, Some(&lock), false);
@@ -6857,6 +6871,7 @@ fn build_preview_fixture() -> PreviewFixture {
             },
         ],
         trusted_hooks: Vec::new(),
+        candidate_hooks: Vec::new(),
     };
 
     PreviewFixture {
@@ -7452,6 +7467,7 @@ fn render_preview_tree_warns_about_a_predicted_collision_naming_both_sources() {
             },
         ],
         trusted_hooks: Vec::new(),
+        candidate_hooks: Vec::new(),
     };
     let sel = PreviewSelectors {
         source: None,
@@ -8195,6 +8211,7 @@ fn preview_target_reflects_binding_effective_selection() {
             instance: None,
         }],
         trusted_hooks: Vec::new(),
+        candidate_hooks: Vec::new(),
     };
 
     let plans = preview_targets(&cfg, &parsed, &remotes, &backend, Some(&lock), true)
@@ -8709,6 +8726,7 @@ fn prune_only_sync_skips_on_change_but_runs_post_sync() {
         interactive: false,
         prune: true,
         no_hooks: false,
+        no_transitive_hooks: false,
         frozen: false,
         resolver: None,
         jobs: None,
@@ -10646,6 +10664,7 @@ fn input_with_jobs(base: &Config, jobs: usize) -> SyncInput<'_> {
         interactive: false,
         prune: false,
         no_hooks: false,
+        no_transitive_hooks: false,
         frozen: false,
         resolver: None,
         jobs: Some(jobs),

@@ -101,6 +101,8 @@ pub enum Command {
         #[arg(long)]
         no_hooks: bool,
         #[arg(long)]
+        no_transitive_hooks: bool,
+        #[arg(long)]
         frozen: bool,
         #[arg(long, short = 'j')]
         jobs: Option<usize>,
@@ -271,9 +273,18 @@ pub fn run(cli: Cli) -> Result<()> {
             prune,
             force,
             no_hooks,
+            no_transitive_hooks,
             frozen,
             jobs,
-        } => sync::run_sync(prune, force, no_hooks, frozen, None, jobs),
+        } => sync::run_sync(
+            prune,
+            force,
+            no_hooks,
+            no_transitive_hooks,
+            frozen,
+            None,
+            jobs,
+        ),
         Command::Update { source } => sync::run_update(source.as_deref()),
         Command::List { plan } => query::run_list(plan),
         Command::Verify => {

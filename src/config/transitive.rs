@@ -76,24 +76,29 @@ fn collect_opaque_hooks(document: &toml::Value) -> Option<toml::Value> {
     }
 }
 
-/// Graph dedup key: a fetched node is `(normalized-url, ref, digest)`. A diamond
+/// Graph dedup key: a fetched node is `(normalized-url, ref, commit)`. A diamond
 /// reaching the same triple collapses to one fetch; equivalent URL forms normalize
-/// to the same node; a differing digest is a different node.
+/// to the same node; a differing commit is a different node.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FetchNode {
     url: String,
     r#ref: String,
-    digest: String,
+    commit: String,
 }
 
 impl FetchNode {
     #[must_use]
-    pub fn new(url: &str, r#ref: &str, digest: &str) -> Self {
+    pub fn new(url: &str, r#ref: &str, commit: &str) -> Self {
         Self {
             url: NormalizedUrl::parse(url).as_str().to_owned(),
             r#ref: r#ref.to_owned(),
-            digest: digest.to_owned(),
+            commit: commit.to_owned(),
         }
+    }
+
+    #[must_use]
+    pub fn commit(&self) -> &str {
+        &self.commit
     }
 }
 
@@ -139,7 +144,7 @@ impl Instance {
             self.anchor_target.as_str(),
             self.fetch_node.url.as_str(),
             self.fetch_node.r#ref.as_str(),
-            self.fetch_node.digest.as_str(),
+            self.fetch_node.commit.as_str(),
         ] {
             hasher.update(&(field.len() as u64).to_le_bytes());
             hasher.update(field.as_bytes());
