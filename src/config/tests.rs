@@ -6205,3 +6205,199 @@ mod keyed_bindings {
         }
     }
 }
+
+mod nested_path_and_file_selection {
+    use super::*;
+
+    fn cfg_with_source_body(body: &str) -> Result<Config> {
+        let toml = format!(
+            "version = 1\n\n[sources.s]\ngit = \"https://example.com/x.git\"\n{body}\n\n\
+             [targets.t]\npath = \"~/x\"\n\n[targets.t.sources]\ns = {{ source = \"s\" }}\n"
+        );
+        Config::parse(&toml)
+    }
+
+    #[test]
+    fn nested_include_path_parses_and_validates() {
+        let cfg = cfg_with_source_body("include = [\"a/b/c\"]")
+            .expect("a nested `include` path must parse once safe_relpath replaces safe_component");
+        cfg.validate()
+            .expect("a nested `include = [\"a/b/c\"]` must pass validation");
+        let parsed = ParsedSource::parse("s", cfg.sources.get("s").expect("source s"))
+            .expect("source parses to typed form");
+        assert_eq!(
+            parsed.includes(),
+            ["a/b/c"],
+            "the nested include path must survive parsing verbatim"
+        );
+    }
+
+    #[test]
+    fn nested_root_path_parses() {
+        let cfg = cfg_with_source_body("root = \"a/b/c\"")
+            .expect("a nested `root` path must parse under safe_relpath");
+        cfg.validate().expect("a nested `root` must validate");
+        assert_eq!(
+            cfg.sources
+                .get("s")
+                .expect("source s")
+                .root
+                .as_deref()
+                .expect("root present"),
+            Path::new("a/b/c"),
+            "the nested root path must survive parsing verbatim"
+        );
+    }
+
+    #[test]
+    fn include_with_dotdot_component_is_rejected() {
+        let result = cfg_with_source_body("include = [\"a/../b\"]")
+            .and_then(|cfg| cfg.validate().map(|()| cfg));
+        let err = result.expect_err(
+            "an `include` path with a `..` component escapes the root and must be rejected \
+             by safe_relpath, not accepted as today's safe_component never ran on include",
+        );
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("a/../b") || msg.contains(".."),
+                "the rejection must name the offending path or `..`, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn include_with_leading_slash_is_rejected() {
+        let result =
+            cfg_with_source_body("include = [\"/a\"]").and_then(|cfg| cfg.validate().map(|()| cfg));
+        let err = result.expect_err(
+            "an absolute `include = [\"/a\"]` must be rejected — a selector is root-relative",
+        );
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("/a"),
+                "the rejection must name the offending absolute path `/a`, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn root_with_leading_slash_is_rejected() {
+        let result =
+            cfg_with_source_body("root = \"/a\"").and_then(|cfg| cfg.validate().map(|()| cfg));
+        let err = result.expect_err("an absolute `root = \"/a\"` must be rejected");
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("/a"),
+                "the rejection must name the offending absolute root `/a`, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exclude_with_empty_component_is_rejected() {
+        let result = cfg_with_source_body("exclude = [\"a//b\"]")
+            .and_then(|cfg| cfg.validate().map(|()| cfg));
+        let err = result.expect_err(
+            "a doubled `/` in `exclude` yields an empty component and must be rejected",
+        );
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("a//b") || msg.contains("empty"),
+                "the rejection must name the offending `a//b` or the empty component, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn same_basename_file_and_dir_under_one_identity_is_a_hard_error() {
+        let toml = "version = 1\n\n[sources.g]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/dst\"\n\n\
+             [targets.t.sources]\n\
+             g = { source = \"g\", include = [\"collide\", \"a/collide\"] }\n";
+        let cfg = Config::parse(toml).expect("two selectors sharing a basename parse structurally");
+        let err = cfg.validate().expect_err(
+            "two selectors whose basenames both resolve to `collide` under one identity would \
+             share one record path `.../artifacts/<identity>/collide.toml`; this collision must \
+             be a hard config error",
+        );
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("collide"),
+                "the collision error must name the colliding basename `collide`, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn two_nested_includes_sharing_a_basename_is_a_hard_error() {
+        let toml = "version = 1\n\n[sources.g]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/dst\"\n\n\
+             [targets.t.sources]\n\
+             g = { source = \"g\", include = [\"a/collide\", \"b/collide\"] }\n";
+        let cfg = Config::parse(toml).expect("two nested selectors parse structurally");
+        let err = cfg.validate().expect_err(
+            "`include = [\"a/collide\", \"b/collide\"]` — two nested selectors with basename \
+             `collide` collide on one record path and must be a hard config error",
+        );
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("collide"),
+                "the collision error must name the colliding basename `collide`, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unbound_source_with_unsafe_root_is_rejected() {
+        let toml = "version = 1\n\n[sources.s]\ngit = \"g\"\nroot = \"/evil\"\n\n\
+             [targets.t]\npath = \"~/x\"\n";
+        let cfg = Config::parse(toml).expect("a source with an absolute root parses structurally");
+        let err = cfg.validate().expect_err(
+            "an unbound `[sources.s]` with `root = \"/evil\"` is never reached by the \
+             resolved-bindings pass, so source-level selectors must be validated directly",
+        );
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("/evil") || msg.contains("evil"),
+                "the rejection must name the offending root `/evil`, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unbound_source_with_dotdot_include_is_rejected() {
+        let toml = "version = 1\n\n[sources.s]\ngit = \"g\"\ninclude = [\"../x\"]\n\n\
+             [targets.t]\npath = \"~/x\"\n";
+        let cfg = Config::parse(toml).expect("a source with a `..` include parses structurally");
+        let err = cfg.validate().expect_err(
+            "an unbound source whose `include` escapes its root must be rejected directly",
+        );
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("../x") || msg.contains(".."),
+                "the rejection must name the offending include `../x`, got: {msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn distinct_basenames_under_one_identity_validate() {
+        let toml = "version = 1\n\n[sources.s]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\n\
+             [targets.t.sources]\n\
+             s = { source = \"s\", include = [\"a/x\", \"b/y\"] }\n";
+        let cfg = Config::parse(toml).expect("two nested selectors parse structurally");
+        cfg.validate().expect(
+            "distinct basenames `x` and `y` do NOT collide — guards against an over-broad \
+             collision check that fires on any nested include",
+        );
+    }
+}

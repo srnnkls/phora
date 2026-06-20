@@ -129,6 +129,9 @@ impl Config {
                 )));
             }
         }
+        for (name, source) in &self.sources {
+            reject_unsafe_source_selectors(name, source)?;
+        }
         self.validate_bindings()?;
         Ok(())
     }
@@ -151,6 +154,10 @@ impl Config {
                 reject_link_ref(effective, binding, source)?;
                 reject_multi_ref(effective, binding)?;
                 reject_map(effective, binding)?;
+            }
+            for resolved in target.resolve_sources(&self.sources) {
+                reject_unsafe_selectors(target_name, &resolved)?;
+                reject_basename_collision(target_name, &resolved)?;
             }
         }
         Ok(())
@@ -280,6 +287,72 @@ fn reject_multi_ref(source_name: &str, binding: &Binding) -> Result<()> {
         return Err(Error::Config(format!(
             "source `{source_name}`: sets more than one of branch/tag/rev ({fields})"
         )));
+    }
+    Ok(())
+}
+
+fn reject_unsafe_source_selectors(source_name: &str, source: &Source) -> Result<()> {
+    if let Some(root) = &source.root {
+        let root = root.to_string_lossy();
+        if crate::kernel::safe_relpath(&root).is_err() {
+            return Err(Error::Config(format!(
+                "source `{source_name}`: `root` `{root}` must be a relative path inside the \
+                 source (no leading `/`, `..`, or empty components)"
+            )));
+        }
+    }
+    for (field, selectors) in [("include", &source.include), ("exclude", &source.exclude)] {
+        for selector in selectors.iter().flatten() {
+            if crate::kernel::safe_relpath(selector).is_err() {
+                return Err(Error::Config(format!(
+                    "source `{source_name}`: `{field}` path `{selector}` must be a relative path \
+                     inside the source (no leading `/`, `..`, or empty components)"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reject_unsafe_selectors(target_name: &str, resolved: &ResolvedBinding) -> Result<()> {
+    let identity = resolved.identity;
+    if let Some(root) = resolved.root {
+        let root = root.to_string_lossy();
+        if crate::kernel::safe_relpath(&root).is_err() {
+            return Err(Error::Config(format!(
+                "target `{target_name}` binding `{identity}`: `root` `{root}` must be a relative \
+                 path inside the source (no leading `/`, `..`, or empty components)"
+            )));
+        }
+    }
+    for (field, selector) in resolved
+        .include
+        .iter()
+        .map(|s| ("include", s))
+        .chain(resolved.exclude.iter().map(|s| ("exclude", s)))
+    {
+        if crate::kernel::safe_relpath(selector).is_err() {
+            return Err(Error::Config(format!(
+                "target `{target_name}` binding `{identity}`: `{field}` path `{selector}` must be \
+                 a relative path inside the source (no leading `/`, `..`, or empty components)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn reject_basename_collision(target_name: &str, resolved: &ResolvedBinding) -> Result<()> {
+    let identity = resolved.identity;
+    let mut seen = BTreeSet::new();
+    for selector in resolved.include {
+        let base = selector.rsplit('/').next().unwrap_or(selector);
+        if !seen.insert(base) {
+            return Err(Error::Config(format!(
+                "target `{target_name}` binding `{identity}`: two selectors share basename \
+                 `{base}`; they would collide on one record path \
+                 `.../artifacts/{identity}/{base}.toml`"
+            )));
+        }
     }
     Ok(())
 }

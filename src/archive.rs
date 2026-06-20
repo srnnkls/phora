@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use flate2::read::GzDecoder;
 
-use crate::kernel::safe_component;
+use crate::kernel::safe_relpath;
 use crate::source::SourceError;
 
 type Result<T> = std::result::Result<T, SourceError>;
@@ -26,31 +26,13 @@ pub struct ExtractedEntry {
 
 /// Validates an archive entry name as a relative, traversal-free path.
 pub fn safe_archive_path(raw: &str) -> Result<PathBuf> {
-    let reject = |why: &str| {
-        Err(SourceError::Source(format!(
-            "unsafe archive path {raw:?}: {why}"
-        )))
-    };
-    if raw.is_empty() {
-        return reject("empty");
-    }
-    if raw.starts_with('/') {
-        return reject("absolute");
-    }
-    if raw.contains('\\') {
-        return reject("backslash");
-    }
-    if raw.contains('\0') {
-        return reject("nul byte");
-    }
     if looks_like_windows_drive(raw) {
-        return reject("windows drive root");
+        return Err(SourceError::Source(format!(
+            "unsafe archive path {raw:?}: windows drive root"
+        )));
     }
-    let mut path = PathBuf::new();
-    for segment in raw.split('/') {
-        path.push(safe_component(segment)?);
-    }
-    Ok(path)
+    let relpath = safe_relpath(raw)?;
+    Ok(relpath.split('/').collect())
 }
 
 fn looks_like_windows_drive(raw: &str) -> bool {

@@ -14,4 +14,4 @@ pub use path::RelPath;
 pub use project_id::ProjectId;
 pub use selection::Selection;
 
-pub(crate) use name::safe_component;
+pub(crate) use name::{safe_component, safe_relpath};

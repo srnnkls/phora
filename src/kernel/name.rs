@@ -23,6 +23,22 @@ pub(crate) fn safe_component(name: &str) -> std::result::Result<&str, KernelErro
     Ok(name)
 }
 
+/// Like [`safe_component`] but admits interior `/`: a nested path that still
+/// cannot escape its root when joined.
+pub(crate) fn safe_relpath(path: &str) -> std::result::Result<&str, KernelError> {
+    let unsafe_path = path.is_empty()
+        || path.starts_with('/')
+        || path.contains('\0')
+        || path.contains('\\')
+        || path
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..");
+    if unsafe_path {
+        return Err(KernelError::UnsafeComponent(path.to_owned()));
+    }
+    Ok(path)
+}
+
 /// A configured source identifier: the `[sources.<name>]` table key.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SourceName(String);
@@ -137,5 +153,56 @@ mod tests {
         "a/b"
             .parse::<TargetName>()
             .expect_err("a target name with `/` must be rejected as path-unsafe");
+    }
+
+    #[test]
+    fn safe_relpath_accepts_interior_slashes() {
+        assert_eq!(
+            safe_relpath("a/b/c").expect("a nested relative path with interior `/` must be valid"),
+            "a/b/c",
+            "safe_relpath must accept a multi-segment nested path verbatim"
+        );
+    }
+
+    #[test]
+    fn safe_relpath_accepts_single_component() {
+        assert_eq!(
+            safe_relpath("x").expect("a single-component path is still a valid relpath"),
+            "x",
+            "safe_relpath must remain a superset of safe_component"
+        );
+    }
+
+    #[test]
+    fn safe_relpath_rejects_leading_slash() {
+        safe_relpath("/a").expect_err("a leading `/` makes the path absolute and must be rejected");
+    }
+
+    #[test]
+    fn safe_relpath_rejects_dotdot_component() {
+        safe_relpath("..").expect_err("a bare `..` escapes the root and must be rejected");
+    }
+
+    #[test]
+    fn safe_relpath_rejects_interior_dotdot() {
+        safe_relpath("a/../b")
+            .expect_err("an interior `..` component escapes the root and must be rejected");
+    }
+
+    #[test]
+    fn safe_relpath_rejects_empty_interior_component() {
+        safe_relpath("a//b")
+            .expect_err("a doubled `/` yields an empty component and must be rejected");
+    }
+
+    #[test]
+    fn safe_relpath_rejects_trailing_slash() {
+        safe_relpath("a/b/")
+            .expect_err("a trailing `/` yields an empty final component and must be rejected");
+    }
+
+    #[test]
+    fn safe_relpath_rejects_embedded_nul() {
+        safe_relpath("a\0b").expect_err("an embedded NUL byte must be rejected");
     }
 }
