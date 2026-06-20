@@ -684,9 +684,10 @@ fn unfrozen_sync_locks_nested_instance_and_unmodified_frozen_roundtrips() {
          stderr: {drift_stderr}"
     );
     assert!(
-        drift_stderr.contains("depth") && drift_stderr.contains("--frozen"),
-        "the frozen miss for a dropped nested pin must name the depth and attribute to --frozen; \
-         got: {drift_stderr}"
+        drift_stderr.contains("transitive") && drift_stderr.contains("--frozen"),
+        "the frozen miss for a dropped nested pin must attribute to a transitive source and \
+         --frozen — consistently, whether the walk's manifest gate (depth-N pin) or the resolve \
+         gate (composed-leaf pin) catches the drop; got: {drift_stderr}"
     );
     assert_eq!(
         std::fs::read(&lock_path).expect("lock readable after drift run"),
