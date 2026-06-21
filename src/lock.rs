@@ -7,14 +7,14 @@ use serde::{Deserialize, Serialize};
 use crate::config::{Host, ParsedSource, Protocol, Refspec, SourceMode};
 use crate::source::NormalizedUrl;
 
-pub const LOCK_SCHEMA_VERSION: u32 = 2;
+pub const LOCK_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Lock {
     pub version: u32,
     #[serde(default)]
     pub sources: Vec<LockedSource>,
-    /// Skip-serialized when empty so a no-transitive lock stays byte-identical to v1.
+    /// Skip-serialized when empty so a no-transitive lock keeps the bare source-table layout.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trusted_hooks: Vec<TrustedHook>,
     /// Discovered-but-untrusted transitive hooks, surfaced with their commit-bound preimage so a
@@ -248,7 +248,7 @@ mod tests {
     #[test]
     fn lock_round_trips_through_toml() {
         let lock = Lock {
-            version: 1,
+            version: LOCK_SCHEMA_VERSION,
             sources: vec![
                 locked("dotfiles", "https://github.com/me/dotfiles.git", "main"),
                 locked(
@@ -279,7 +279,7 @@ mod tests {
     #[test]
     fn lock_toml_uses_sources_array_of_tables_with_spec_field_names() {
         let lock = Lock {
-            version: 1,
+            version: LOCK_SCHEMA_VERSION,
             sources: vec![locked(
                 "dotfiles",
                 "https://github.com/me/dotfiles.git",
@@ -316,7 +316,7 @@ mod tests {
     #[test]
     fn merge_locks_local_overrides_base_by_name() {
         let base = Lock {
-            version: 1,
+            version: LOCK_SCHEMA_VERSION,
             sources: vec![locked(
                 "loqui",
                 "https://github.com/srnnkls/loqui.git",
@@ -326,7 +326,7 @@ mod tests {
             candidate_hooks: Vec::new(),
         };
         let local = Lock {
-            version: 1,
+            version: LOCK_SCHEMA_VERSION,
             sources: vec![locked("loqui", "/home/soeren/dev/loqui", "main")],
             trusted_hooks: Vec::new(),
             candidate_hooks: Vec::new(),
@@ -347,7 +347,7 @@ mod tests {
     #[test]
     fn merge_locks_keeps_base_only_and_adds_local_only() {
         let base = Lock {
-            version: 1,
+            version: LOCK_SCHEMA_VERSION,
             sources: vec![locked(
                 "dotfiles",
                 "https://github.com/me/dotfiles.git",
@@ -357,7 +357,7 @@ mod tests {
             candidate_hooks: Vec::new(),
         };
         let local = Lock {
-            version: 1,
+            version: LOCK_SCHEMA_VERSION,
             sources: vec![locked("extra", "/home/soeren/dev/extra", "main")],
             trusted_hooks: Vec::new(),
             candidate_hooks: Vec::new(),
@@ -830,7 +830,7 @@ config_digest = \"PLACEHOLDER\"
     fn merge_locks_dedups_ref_split_source_by_name_and_ref_not_name_alone() {
         let git = "https://github.com/junegunn/fzf.git";
         let base = Lock {
-            version: 1,
+            version: LOCK_SCHEMA_VERSION,
             sources: vec![
                 LockedSource {
                     name: "fzf".to_owned(),
@@ -858,7 +858,7 @@ config_digest = \"PLACEHOLDER\"
         };
         // Local overrides only the v0.56.0 split (e.g. repointed at a local checkout).
         let local = Lock {
-            version: 1,
+            version: LOCK_SCHEMA_VERSION,
             sources: vec![LockedSource {
                 name: "fzf".to_owned(),
                 git: "/home/me/dev/fzf".to_owned(),
@@ -923,7 +923,10 @@ config_digest = \"PLACEHOLDER\"
 
         let (base, local) = split_locks(resolved, &BTreeSet::new());
 
-        assert_eq!(base.version, 2, "base lock version is 2");
+        assert_eq!(
+            base.version, LOCK_SCHEMA_VERSION,
+            "base lock declares the schema version"
+        );
         assert_eq!(base.sources.len(), 2, "all sources land in the base lock");
         assert!(local.is_none(), "no overrides => no local lock");
     }
@@ -954,7 +957,10 @@ config_digest = \"PLACEHOLDER\"
         );
 
         let local = local.expect("override present => local lock exists");
-        assert_eq!(local.version, 2, "local lock version is 2");
+        assert_eq!(
+            local.version, LOCK_SCHEMA_VERSION,
+            "local lock declares the schema version"
+        );
         assert!(
             local.find_source("loqui").is_some(),
             "override in local lock"
@@ -966,7 +972,7 @@ config_digest = \"PLACEHOLDER\"
     }
 
     #[test]
-    fn split_locks_writes_version_two() {
+    fn split_locks_stamps_schema_version_and_keeps_source_fields() {
         let resolved = vec![(
             "dotfiles".to_owned(),
             locked("dotfiles", "https://github.com/me/dotfiles.git", "main"),
@@ -975,33 +981,33 @@ config_digest = \"PLACEHOLDER\"
         let (base, _local) = split_locks(resolved, &BTreeSet::new());
 
         assert_eq!(
-            base.version, 2,
-            "a freshly written base lock must declare schema version 2"
+            base.version, LOCK_SCHEMA_VERSION,
+            "a freshly written base lock must declare the schema version"
         );
 
         let dotfiles = base
             .find_source("dotfiles")
-            .expect("the version bump must NOT drop the resolved source entry");
+            .expect("split_locks must NOT drop the resolved source entry");
         assert_eq!(
             dotfiles.git, "https://github.com/me/dotfiles.git",
-            "the migrated source must retain its git url"
+            "the source must retain its git url"
         );
         assert_eq!(
             dotfiles.resolved, "main",
-            "the migrated source must retain its resolved ref"
+            "the source must retain its resolved ref"
         );
         assert_eq!(
             dotfiles.commit, "c0ffee",
-            "the migrated source must retain its pinned commit"
+            "the source must retain its pinned commit"
         );
         assert_eq!(
             dotfiles.digest, "blake3:artifact",
-            "the migrated source must retain its artifact digest"
+            "the source must retain its artifact digest"
         );
     }
 
     #[test]
-    fn split_locks_writes_version_two_into_local_lock_too() {
+    fn split_locks_stamps_schema_version_into_local_lock_too() {
         let resolved = vec![(
             "loqui".to_owned(),
             locked("loqui", "/home/me/dev/loqui", "main"),
@@ -1012,34 +1018,34 @@ config_digest = \"PLACEHOLDER\"
 
         let local = local.expect("override present => local lock exists");
         assert_eq!(
-            local.version, 2,
-            "a freshly written local lock must also declare schema version 2"
+            local.version, LOCK_SCHEMA_VERSION,
+            "a freshly written local lock must also declare the schema version"
         );
 
         let loqui = local
             .find_source("loqui")
-            .expect("the version bump must NOT drop the locally-overridden source entry");
+            .expect("split_locks must NOT drop the locally-overridden source entry");
         assert_eq!(
             loqui.git, "/home/me/dev/loqui",
-            "the migrated local override must retain its overridden path"
+            "the local override must retain its overridden path"
         );
         assert_eq!(
             loqui.resolved, "main",
-            "the migrated local override must retain its resolved ref"
+            "the local override must retain its resolved ref"
         );
         assert_eq!(
             loqui.commit, "c0ffee",
-            "the migrated local override must retain its pinned commit"
+            "the local override must retain its pinned commit"
         );
         assert_eq!(
             loqui.digest, "blake3:artifact",
-            "the migrated local override must retain its artifact digest"
+            "the local override must retain its artifact digest"
         );
     }
 
     #[test]
-    fn v1_flat_lock_parses_under_v2_parser_without_error_or_loss() {
-        let v1_toml = "\
+    fn flat_source_lock_parses_without_error_or_loss() {
+        let flat_toml = "\
 version = 1
 
 [[sources]]
@@ -1059,21 +1065,21 @@ digest = \"blake3:loqui\"
 config_digest = \"blake3:cfg\"
 ";
 
-        let lock: Lock = toml::from_str(v1_toml)
-            .expect("an existing v1 flat lock must parse under the v2 parser — never hard-error");
+        let lock: Lock =
+            toml::from_str(flat_toml).expect("a flat source lock must parse — never hard-error");
 
         assert_eq!(
             lock.sources.len(),
             2,
-            "no entry may be dropped when a v1 lock is read as a consumer-only root namespace, got: {lock:?}"
+            "no entry may be dropped when a flat lock is read as a consumer-only root namespace, got: {lock:?}"
         );
         assert!(
             lock.find_source("dotfiles").is_some(),
-            "the dotfiles entry must survive the v1->v2 read"
+            "the dotfiles entry must survive the read"
         );
         assert!(
             lock.find_source("loqui").is_some(),
-            "the loqui entry must survive the v1->v2 read"
+            "the loqui entry must survive the read"
         );
 
         let resolved: Vec<(String, LockedSource)> = lock
@@ -1083,22 +1089,25 @@ config_digest = \"blake3:cfg\"
             .collect();
         let (rewritten, _local) = split_locks(resolved, &BTreeSet::new());
         assert_eq!(
-            rewritten.version, 2,
-            "after reading a v1 lock the consumer must rewrite it under schema version 2"
+            rewritten.version, LOCK_SCHEMA_VERSION,
+            "a rewritten lock must declare the schema version"
         );
         assert_eq!(
             rewritten.sources.len(),
             2,
-            "the rewrite must preserve every entry of the upgraded v1 lock"
+            "the rewrite must preserve every entry of the flat lock"
         );
     }
 
     #[test]
-    fn v2_lock_with_no_sources_table_parses_as_empty_lock() {
-        let lock: Lock = toml::from_str("version = 2\n")
-            .expect("a v2 lock with no [[sources]] table is a legitimate empty lock");
+    fn lock_with_no_sources_table_parses_as_empty_lock() {
+        let lock: Lock = toml::from_str("version = 1\n")
+            .expect("a lock with no [[sources]] table is a legitimate empty lock");
 
-        assert_eq!(lock.version, 2, "the declared schema version survives");
+        assert_eq!(
+            lock.version, LOCK_SCHEMA_VERSION,
+            "the declared schema version survives"
+        );
         assert!(
             lock.sources.is_empty(),
             "an absent [[sources]] table parses to an empty source list, not a hard error"
@@ -1106,17 +1115,17 @@ config_digest = \"blake3:cfg\"
     }
 
     #[test]
-    fn no_transitive_lock_source_tables_serialize_byte_identical_to_v1() {
+    fn no_transitive_lock_source_tables_serialize_without_extra_keys() {
         let resolved = vec![(
             "dotfiles".to_owned(),
             locked("dotfiles", "https://github.com/me/dotfiles.git", "main"),
         )];
 
         let (base, _local) = split_locks(resolved, &BTreeSet::new());
-        let text = toml::to_string(&base).expect("lock serializes under the v2 writer");
+        let text = toml::to_string(&base).expect("lock serializes");
 
         let expected = "\
-version = 2
+version = 1
 
 [[sources]]
 name = \"dotfiles\"
@@ -1129,9 +1138,9 @@ config_digest = \"blake3:cfg\"
 
         assert_eq!(
             text, expected,
-            "a no-transitive lock must serialize with the v1 source-table layout (only the version \
-             integer bumps); any extra key in the [[sources]] table means a new v2 graph / \
-             trusted_hooks field leaked into the empty-transitive case"
+            "a no-transitive lock must serialize with the bare source-table layout; any extra key \
+             in the [[sources]] table means a transitive graph / trusted_hooks field leaked into \
+             the empty-transitive case"
         );
     }
 
@@ -1143,7 +1152,7 @@ config_digest = \"blake3:cfg\"
         )];
 
         let (base, _local) = split_locks(resolved, &BTreeSet::new());
-        let text = toml::to_string(&base).expect("lock serializes under the v2 writer");
+        let text = toml::to_string(&base).expect("lock serializes");
 
         assert!(
             !text.contains("trusted_hooks"),
@@ -1156,7 +1165,7 @@ config_digest = \"blake3:cfg\"
     }
 
     #[test]
-    fn bare_lock_golden_round_trips_under_v2_parser() {
+    fn bare_lock_golden_round_trips() {
         let resolved = vec![(
             "dotfiles".to_owned(),
             locked("dotfiles", "https://github.com/me/dotfiles.git", "main"),
@@ -1165,23 +1174,22 @@ config_digest = \"blake3:cfg\"
 
         let text = toml::to_string(&lock).expect("bare lock serializes");
         assert!(
-            text.contains("version = 2"),
-            "the freshly written bare-lock golden must carry schema version 2, got:\n{text}"
+            text.contains("version = 1"),
+            "the freshly written bare-lock golden must carry the schema version, got:\n{text}"
         );
 
-        let reparsed: Lock = toml::from_str(&text)
-            .expect("the bare-lock golden must round-trip under the v2 parser");
+        let reparsed: Lock = toml::from_str(&text).expect("the bare-lock golden must round-trip");
 
         assert_eq!(
-            reparsed.version, 2,
-            "the bare lock round-trips at version 2"
+            reparsed.version, LOCK_SCHEMA_VERSION,
+            "the bare lock round-trips at the schema version"
         );
         assert_eq!(reparsed.sources.len(), 1, "the single bare source survives");
         let s = &reparsed.sources[0];
         assert_eq!(s.name, "dotfiles");
         assert!(
             s.r#ref.is_none(),
-            "a bare lock carries no per-binding ref override after the v2 round-trip"
+            "a bare lock carries no per-binding ref override after the round-trip"
         );
     }
 
@@ -1189,7 +1197,7 @@ config_digest = \"blake3:cfg\"
     #[test]
     fn bare_locked_source_serializes_only_existing_fields() {
         let lock = Lock {
-            version: 1,
+            version: LOCK_SCHEMA_VERSION,
             sources: vec![locked(
                 "dotfiles",
                 "https://github.com/me/dotfiles.git",
@@ -1272,7 +1280,7 @@ config_digest = \"blake3:cfg\"
         assert!(
             !text.contains("instance"),
             "a consumer-root source (instance = None) must skip-serialize the `instance` key so \
-             bare locks stay byte-identical to v1, got:\n{text}"
+             bare locks keep the no-transitive layout, got:\n{text}"
         );
     }
 
@@ -1347,8 +1355,8 @@ config_digest = \"blake3:cfg\"
 
         assert!(
             !text.contains("trusted_hooks"),
-            "an empty trusted_hooks vec must skip-serialize so a no-hooks lock stays byte-identical \
-             to v1, got:\n{text}"
+            "an empty trusted_hooks vec must skip-serialize so a no-hooks lock keeps the \
+             no-transitive layout, got:\n{text}"
         );
     }
 
