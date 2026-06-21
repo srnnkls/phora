@@ -40,8 +40,14 @@ impl<G: SourceBackend, H: SourceBackend> RouterBackend<G, H> {
 }
 
 impl<G: SourceBackend, H: SourceBackend> SourceBackend for RouterBackend<G, H> {
-    fn mirror_root(&self) -> Option<&Path> {
-        self.git.mirror_root()
+    fn read_file_at(
+        &self,
+        source: &SourceName,
+        url: &str,
+        commit: &str,
+        path: &Path,
+    ) -> Result<Vec<u8>> {
+        self.git.read_file_at(source, url, commit, path)
     }
 
     fn fetch(&self, source: &SourceName, url: &str) -> Result<()> {

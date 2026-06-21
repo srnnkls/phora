@@ -21,6 +21,13 @@ pub enum SourceError {
     #[error("source error: {0}")]
     Source(String),
 
+    #[error("{path} is absent at {commit} in {source_name}")]
+    FileAbsent {
+        source_name: String,
+        commit: String,
+        path: PathBuf,
+    },
+
     #[error("root path not found in tree: {root}")]
     RootNotFound { root: std::path::PathBuf },
 
@@ -116,10 +123,21 @@ pub struct ExportRequest<'a> {
 pub trait SourceBackend {
     fn fetch(&self, source: &SourceName, url: &str) -> Result<()>;
 
-    /// The bare-mirror root, when this backend mirrors into one. Transitive
-    /// resolution reads a fetched dep's `phora.toml` from the mirror it lands in.
-    fn mirror_root(&self) -> Option<&Path> {
-        None
+    /// Reads `path` from the already-fetched mirror at `commit`, offline. Mirror
+    /// reads are git-only; the default errs unsupported and only `GitBackend` overrides it.
+    ///
+    /// # Errors
+    /// - the mirror was never fetched, `commit` is unknown, or `path` is absent at `commit`.
+    fn read_file_at(
+        &self,
+        _source: &SourceName,
+        _url: &str,
+        _commit: &str,
+        _path: &Path,
+    ) -> Result<Vec<u8>> {
+        Err(SourceError::Source(
+            "read_file_at is unsupported on this backend: mirror reads are git-only".to_owned(),
+        ))
     }
 
     fn resolve(&self, source: &SourceName, url: &str, refspec: &Refspec) -> Result<String>;
@@ -300,11 +318,141 @@ impl GitBackend {
     fn mirror_path(&self, url: &str) -> PathBuf {
         mirror_path(&self.git_dir, url)
     }
+
+    /// Reads a remote's root `phora.toml` at `refspec`, reusing an existing mirror
+    /// when present and otherwise fetching one. Offline if the mirror is cached.
+    ///
+    /// # Errors
+    /// - the remote cannot be fetched, the ref cannot be resolved, or no `phora.toml` exists.
+    pub fn fetch_root_manifest(
+        &self,
+        source: &SourceName,
+        url: &str,
+        refspec: &Refspec,
+    ) -> Result<Vec<u8>> {
+        if self.mirror_path(url).exists() {
+            let commit = self.resolve(source, url, refspec)?;
+            return self.read_file_at(source, url, &commit, Path::new("phora.toml"));
+        }
+        self.shallow_read_root_manifest(source, url, refspec)
+    }
+
+    /// Reads a remote's root `phora.toml` via a `--depth=1` shallow clone into an
+    /// ephemeral staging dir, leaving the persistent mirror cache untouched.
+    ///
+    /// # Errors
+    /// - the shallow clone fails, the ref cannot be resolved, or no `phora.toml` exists.
+    fn shallow_read_root_manifest(
+        &self,
+        source: &SourceName,
+        url: &str,
+        refspec: &Refspec,
+    ) -> Result<Vec<u8>> {
+        let depth = std::num::NonZeroU32::new(1).expect("1 is non-zero");
+        std::fs::create_dir_all(&self.git_dir)
+            .map_err(|e| SourceError::Source(format!("source {source}: create git dir: {e}")))?;
+        let staging = MirrorStaging::create(&self.git_dir, url);
+
+        let mut prepare = gix::prepare_clone_bare(url, &staging.path)
+            .map_err(|e| SourceError::Source(format!("prepare shallow clone {source}: {e}")))?
+            .with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(depth));
+        if let Some(refname) = shallow_ref_name(refspec) {
+            prepare = prepare.with_ref_name(Some(refname.as_str())).map_err(|e| {
+                SourceError::Source(format!("shallow ref {refname} for {source}: {e}"))
+            })?;
+        }
+        let (repo, _) = prepare
+            .fetch_only(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
+            .map_err(|e| SourceError::Source(format!("shallow clone {source}: {e}")))?;
+
+        let commit = resolve_in(&repo, source, refspec)?;
+        read_blob_at(&repo, source, &commit, Path::new("phora.toml"))
+    }
+}
+
+fn shallow_ref_name(refspec: &Refspec) -> Option<String> {
+    match refspec {
+        Refspec::Branch(name) => Some(format!("refs/heads/{name}")),
+        Refspec::Tag(name) => Some(format!("refs/tags/{name}")),
+        Refspec::Rev(_) | Refspec::None => None,
+    }
+}
+
+fn resolve_in(repo: &gix::Repository, source: &SourceName, refspec: &Refspec) -> Result<String> {
+    let commit = match refspec {
+        Refspec::Branch(name) => repo
+            .find_reference(&format!("refs/heads/{name}"))
+            .map_err(|e| SourceError::Source(format!("branch {name} in {source}: {e}")))?
+            .peel_to_commit()
+            .map_err(|e| SourceError::Source(format!("peel branch {name} in {source}: {e}")))?,
+        Refspec::Tag(name) => repo
+            .find_reference(&format!("refs/tags/{name}"))
+            .map_err(|e| SourceError::Source(format!("tag {name} in {source}: {e}")))?
+            .peel_to_commit()
+            .map_err(|e| SourceError::Source(format!("peel tag {name} in {source}: {e}")))?,
+        Refspec::Rev(rev) => {
+            let commit: Commit = rev
+                .parse()
+                .map_err(|e| SourceError::Source(format!("parse rev {rev} in {source}: {e}")))?;
+            let oid = gix::ObjectId::from_hex(commit.as_str().as_bytes())
+                .map_err(|e| SourceError::Source(format!("parse rev {rev} in {source}: {e}")))?;
+            repo.find_commit(oid)
+                .map_err(|e| SourceError::Source(format!("rev {rev} in {source}: {e}")))?
+        }
+        Refspec::None => {
+            return Err(SourceError::Source(format!(
+                "source {source}: git backend cannot resolve a url source's empty refspec"
+            )));
+        }
+    };
+    Ok(commit.id().to_hex().to_string())
+}
+
+fn read_blob_at(
+    repo: &gix::Repository,
+    source: &SourceName,
+    commit: &str,
+    path: &Path,
+) -> Result<Vec<u8>> {
+    let oid = gix::ObjectId::from_hex(commit.as_bytes())
+        .map_err(|e| SourceError::Source(format!("parse commit {commit} in {source}: {e}")))?;
+    let tree = repo
+        .find_commit(oid)
+        .map_err(|e| SourceError::Source(format!("commit {commit} in {source}: {e}")))?
+        .tree()
+        .map_err(|e| SourceError::Source(format!("tree of {commit} in {source}: {e}")))?;
+    let display = path.display();
+    let entry = tree
+        .lookup_entry_by_path(path)
+        .map_err(|e| SourceError::Source(format!("read {display} at {commit}: {e}")))?
+        .ok_or_else(|| SourceError::FileAbsent {
+            source_name: source.to_string(),
+            commit: commit.to_owned(),
+            path: path.to_owned(),
+        })?;
+    if !entry.mode().is_blob() {
+        return Err(SourceError::Source(format!(
+            "{display} at {commit} in {source} is not a regular file"
+        )));
+    }
+    let object = entry
+        .object()
+        .map_err(|e| SourceError::Source(format!("read {display} at {commit}: {e}")))?;
+    Ok(object.data.clone())
 }
 
 impl SourceBackend for GitBackend {
-    fn mirror_root(&self) -> Option<&Path> {
-        Some(&self.git_dir)
+    fn read_file_at(
+        &self,
+        source: &SourceName,
+        url: &str,
+        commit: &str,
+        path: &Path,
+    ) -> Result<Vec<u8>> {
+        let mirror = self.mirror_path(url);
+        let repo = gix::open(&mirror)
+            .map_err(|e| SourceError::Source(format!("open mirror {source}: {e}")))?;
+        read_blob_at(&repo, source, commit, path)
     }
 
     fn fetch(&self, source: &SourceName, url: &str) -> Result<()> {
@@ -356,36 +504,7 @@ impl SourceBackend for GitBackend {
         let mirror = self.mirror_path(url);
         let repo = gix::open(&mirror)
             .map_err(|e| SourceError::Source(format!("open mirror {source}: {e}")))?;
-
-        let commit = match refspec {
-            Refspec::Branch(name) => repo
-                .find_reference(&format!("refs/heads/{name}"))
-                .map_err(|e| SourceError::Source(format!("branch {name} in {source}: {e}")))?
-                .peel_to_commit()
-                .map_err(|e| SourceError::Source(format!("peel branch {name} in {source}: {e}")))?,
-            Refspec::Tag(name) => repo
-                .find_reference(&format!("refs/tags/{name}"))
-                .map_err(|e| SourceError::Source(format!("tag {name} in {source}: {e}")))?
-                .peel_to_commit()
-                .map_err(|e| SourceError::Source(format!("peel tag {name} in {source}: {e}")))?,
-            Refspec::Rev(rev) => {
-                let commit: Commit = rev.parse().map_err(|e| {
-                    SourceError::Source(format!("parse rev {rev} in {source}: {e}"))
-                })?;
-                let oid = gix::ObjectId::from_hex(commit.as_str().as_bytes()).map_err(|e| {
-                    SourceError::Source(format!("parse rev {rev} in {source}: {e}"))
-                })?;
-                repo.find_commit(oid)
-                    .map_err(|e| SourceError::Source(format!("rev {rev} in {source}: {e}")))?
-            }
-            Refspec::None => {
-                return Err(SourceError::Source(format!(
-                    "source {source}: git backend cannot resolve a url source's empty refspec"
-                )));
-            }
-        };
-
-        Ok(commit.id().to_hex().to_string())
+        resolve_in(&repo, source, refspec)
     }
 
     fn commit_time(&self, source: &SourceName, url: &str, commit: &str) -> Result<u64> {
@@ -724,10 +843,6 @@ impl HttpBackend {
 }
 
 impl SourceBackend for HttpBackend {
-    fn mirror_root(&self) -> Option<&Path> {
-        Some(&self.git_dir)
-    }
-
     fn fetch(&self, source: &SourceName, url: &str) -> Result<()> {
         std::fs::create_dir_all(&self.git_dir)
             .map_err(|e| SourceError::Source(format!("source {source}: create git dir: {e}")))?;
@@ -2442,6 +2557,245 @@ path = "srnnkls/tropos"
         assert_eq!(
             backend.mirror_path("git@github.com:user/repo.git"),
             backend.mirror_path("https://github.com/user/repo")
+        );
+    }
+
+    // ---- read_file_at (offline mirror read; the read_manifest seam) ----
+
+    #[test]
+    fn read_file_at_returns_bytes_of_a_file_present_at_the_commit() {
+        let fixture = build_git_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch builds the bare mirror");
+
+        let bytes = fixture
+            .backend
+            .read_file_at(
+                &sn("src"),
+                &fixture.url,
+                &fixture.head_sha,
+                Path::new("README.md"),
+            )
+            .expect("read_file_at reads a tracked file from the fetched mirror at HEAD");
+
+        assert_eq!(
+            bytes, b"hello\n",
+            "read_file_at must return the exact bytes of README.md at the commit, not a digest or path"
+        );
+    }
+
+    #[test]
+    fn read_file_at_errors_when_the_file_is_absent_at_that_commit() {
+        let fixture = build_git_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch builds the bare mirror");
+
+        // SECOND.md was added on the second commit (head_sha); it does NOT exist at tag_sha.
+        let err = fixture
+            .backend
+            .read_file_at(
+                &sn("src"),
+                &fixture.url,
+                &fixture.tag_sha,
+                Path::new("SECOND.md"),
+            )
+            .expect_err("a file absent at the requested commit must be an error, not empty bytes");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SECOND.md"),
+            "the absent-file error must name the path it could not find, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn read_file_at_errors_when_the_mirror_is_missing() {
+        let git_dir = TempDir::new().expect("git_dir tempdir");
+        let backend = GitBackend::new(git_dir.path().to_path_buf());
+
+        let err = backend
+            .read_file_at(
+                &sn("src"),
+                "https://github.com/never/fetched.git",
+                ABSENT_SHA,
+                Path::new("phora.toml"),
+            )
+            .expect_err("reading from a mirror that was never fetched must error, not panic");
+
+        assert!(
+            !err.to_string().is_empty(),
+            "the missing-mirror error must carry a diagnostic message"
+        );
+    }
+
+    #[test]
+    fn read_file_at_default_impl_is_unsupported_on_non_git_backend() {
+        let git_dir = TempDir::new().expect("git_dir tempdir");
+        let http = HttpBackend::new(git_dir.path().to_path_buf(), BTreeMap::new());
+
+        let err = http
+            .read_file_at(
+                &sn("u"),
+                "https://example.com/pkg.tar.gz",
+                ABSENT_SHA,
+                Path::new("phora.toml"),
+            )
+            .expect_err(
+                "the default SourceBackend::read_file_at must error as unsupported; only GitBackend overrides it",
+            );
+
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("unsupported")
+                || msg.contains("not supported")
+                || msg.contains("only git"),
+            "the default read_file_at error must signal that mirror reads are git-only (unsupported), got: {msg}"
+        );
+    }
+
+    #[test]
+    fn read_file_at_signals_absent_distinctly_from_other_failures() {
+        let fixture = build_git_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch builds the bare mirror");
+
+        let absent = fixture
+            .backend
+            .read_file_at(
+                &sn("src"),
+                &fixture.url,
+                &fixture.tag_sha,
+                Path::new("SECOND.md"),
+            )
+            .expect_err("an absent file must error");
+        assert!(
+            matches!(absent, SourceError::FileAbsent { .. }),
+            "an absent entry must surface as FileAbsent so callers can stay silent, got: {absent:?}"
+        );
+
+        let other = fixture
+            .backend
+            .read_file_at(&sn("src"), &fixture.url, ABSENT_SHA, Path::new("README.md"))
+            .expect_err("an unknown commit must error");
+        assert!(
+            !matches!(other, SourceError::FileAbsent { .. }),
+            "a git/commit failure must NOT be mislabelled as an absent file, got: {other:?}"
+        );
+    }
+
+    #[test]
+    fn read_file_at_errors_clearly_when_entry_is_a_tree_not_a_blob() {
+        let src = TempDir::new().expect("src tempdir");
+        let src_path = src.path();
+        run_git(src_path, &["init", "-b", "main", "."]);
+        run_git(src_path, &["config", "user.email", "t@example.com"]);
+        run_git(src_path, &["config", "user.name", "T"]);
+        std::fs::create_dir(src_path.join("nested")).expect("mk dir");
+        std::fs::write(src_path.join("nested").join("leaf"), b"x\n").expect("write leaf");
+        run_git(src_path, &["add", "-A"]);
+        run_git(src_path, &["commit", "-m", "tree"]);
+        let commit = String::from_utf8(run_git(src_path, &["rev-parse", "HEAD"]).stdout)
+            .expect("utf8 sha")
+            .trim()
+            .to_owned();
+
+        let git_dir = TempDir::new().expect("git_dir tempdir");
+        let backend = GitBackend::new(git_dir.path().to_path_buf());
+        let url = src_path.to_string_lossy().into_owned();
+        backend.fetch(&sn("src"), &url).expect("fetch mirror");
+
+        let err = backend
+            .read_file_at(&sn("src"), &url, &commit, Path::new("nested"))
+            .expect_err("a directory entry must not be returned as file bytes");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("nested"),
+            "the non-blob error must name the path, got: {msg}"
+        );
+        assert!(
+            !matches!(err, SourceError::FileAbsent { .. }),
+            "a present-but-non-blob entry is not 'absent'; it must be a distinct failure, got: {err:?}"
+        );
+    }
+
+    // ---- fetch_root_manifest (single-file / shallow; no full mirror) ----
+
+    #[test]
+    fn fetch_root_manifest_uncached_does_not_build_a_full_mirror() {
+        let src = TempDir::new().expect("src tempdir");
+        let src_path = src.path();
+        run_git(src_path, &["init", "-b", "main", "."]);
+        run_git(src_path, &["config", "user.email", "t@example.com"]);
+        run_git(src_path, &["config", "user.name", "T"]);
+        std::fs::write(
+            src_path.join("phora.toml"),
+            b"version = 1\n\n[sources.nvim]\ngit = \"https://github.com/dep/nvim.git\"\n",
+        )
+        .expect("write manifest");
+        run_git(src_path, &["add", "-A"]);
+        run_git(src_path, &["commit", "-m", "root"]);
+
+        let git_dir = TempDir::new().expect("git_dir tempdir");
+        let backend = GitBackend::new(git_dir.path().to_path_buf());
+        let url = src_path.to_string_lossy().into_owned();
+
+        let bytes = backend
+            .fetch_root_manifest(&sn("dep"), &url, &Refspec::Branch("main".to_owned()))
+            .expect("uncached fetch_root_manifest reads the root phora.toml");
+        let text = String::from_utf8(bytes).expect("manifest is utf-8");
+        assert!(
+            text.contains("[sources.nvim]"),
+            "fetch_root_manifest must return the root phora.toml bytes, got: {text}"
+        );
+
+        assert!(
+            !backend.mirror_path(&url).exists(),
+            "the uncached path must NOT create a persistent all-refs mirror — that is the regression \
+             this task prevents; it must fetch shallowly into ephemeral storage"
+        );
+    }
+
+    #[test]
+    fn fetch_root_manifest_reuses_a_cached_mirror_offline() {
+        let fixture = build_git_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("prime the mirror cache");
+        std::fs::write(
+            fixture.src.path().join("phora.toml"),
+            b"version = 1\n\n[sources.x]\ngit = \"https://github.com/dep/x.git\"\n",
+        )
+        .expect("write manifest");
+        run_git(fixture.src.path(), &["add", "-A"]);
+        run_git(fixture.src.path(), &["commit", "-m", "add manifest"]);
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("refresh cached mirror");
+
+        let bytes = fixture
+            .backend
+            .fetch_root_manifest(
+                &sn("src"),
+                &fixture.url,
+                &Refspec::Branch("main".to_owned()),
+            )
+            .expect("cached fetch_root_manifest reads via the mirror");
+        let text = String::from_utf8(bytes).expect("utf8");
+        assert!(
+            text.contains("[sources.x]"),
+            "cached fetch_root_manifest must read from the primed mirror, got: {text}"
+        );
+        assert!(
+            fixture.backend.mirror_path(&fixture.url).exists(),
+            "a primed mirror must be reused, not discarded"
         );
     }
 
