@@ -20,6 +20,14 @@ type Result<T> = std::result::Result<T, StoreError>;
 /// Layout sentinel for a renamed leaf deployed at the target root, ignoring layout.
 pub const MAP_LAYOUT: &str = "map";
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordKind {
+    File,
+    #[default]
+    Dir,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ArtifactKey {
     pub target: String,
@@ -37,6 +45,8 @@ pub struct RegistryRecord {
     pub digest: String,
     pub projected_at: String,
     pub layout: String,
+    #[serde(default)]
+    pub kind: RecordKind,
     pub allow_symlinks: bool,
     pub preserve_executable: bool,
     pub files: Vec<ManifestFile>,
@@ -54,6 +64,7 @@ pub struct ProjectedRecord<'a> {
     pub commit: &'a str,
     pub digest: String,
     pub layout: String,
+    pub kind: RecordKind,
     pub allow_symlinks: bool,
     pub preserve_executable: bool,
     pub files: Vec<ManifestFile>,
@@ -72,6 +83,7 @@ impl RegistryRecord {
             digest: p.digest,
             projected_at: chrono::Utc::now().to_rfc3339(),
             layout: p.layout,
+            kind: p.kind,
             allow_symlinks: p.allow_symlinks,
             preserve_executable: p.preserve_executable,
             files: p.files,
@@ -540,6 +552,7 @@ mod tests {
             digest: "link:".to_owned(),
             projected_at: "2026-06-08T12:00:00Z".to_owned(),
             layout: "flat".to_owned(),
+            kind: RecordKind::Dir,
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![],
@@ -611,6 +624,7 @@ artifact = "snippets"
             digest: "blake3:d4e5f6".to_owned(),
             projected_at: "2026-01-31T12:34:56Z".to_owned(),
             layout: "by-source".to_owned(),
+            kind: RecordKind::Dir,
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![],
@@ -664,6 +678,149 @@ artifact = "snippets"
         );
     }
 
+    // ── record kind: file vs dir (SMR-001) ─────────────────────────
+
+    #[test]
+    fn record_kind_defaults_to_dir() {
+        assert_eq!(
+            RecordKind::default(),
+            RecordKind::Dir,
+            "an unspecified record kind must default to a directory tree (the legacy shape)"
+        );
+    }
+
+    #[test]
+    fn record_without_kind_field_deserializes_as_dir() {
+        let legacy = r#"
+version = 1
+commit = "def456789abc123"
+digest = "blake3:d4e5f6"
+projected_at = "2026-01-31T12:34:56Z"
+layout = "flat"
+allow_symlinks = false
+preserve_executable = true
+files = []
+
+[key]
+target = "vscode"
+source = "company-configs"
+artifact = "snippets"
+"#;
+
+        let rec: RegistryRecord =
+            toml::from_str(legacy).expect("legacy record without `kind` must still parse");
+
+        assert_eq!(
+            rec.kind,
+            RecordKind::Dir,
+            "a record predating the kind field must default to RecordKind::Dir"
+        );
+    }
+
+    #[test]
+    fn file_kind_record_round_trips_as_lowercase_file() {
+        let rec = RegistryRecord {
+            version: 1,
+            key: ArtifactKey {
+                target: "dest".to_owned(),
+                source: "agents-src".to_owned(),
+                artifact: "CLAUDE.md".to_owned(),
+            },
+            source: "agents-src".to_owned(),
+            commit: "def456789abc123".to_owned(),
+            digest: "blake3:d4e5f6".to_owned(),
+            projected_at: "2026-01-31T12:34:56Z".to_owned(),
+            layout: "flat".to_owned(),
+            kind: RecordKind::File,
+            allow_symlinks: false,
+            preserve_executable: true,
+            files: vec![],
+            linked: false,
+            vars_digest: None,
+        };
+
+        let toml = toml::to_string(&rec).expect("serialize file-kind record");
+        assert!(
+            toml.contains("kind = \"file\""),
+            "a file-kind record must serialize the lowercase tag `kind = \"file\"`, got:\n{toml}"
+        );
+
+        let back: RegistryRecord = toml::from_str(&toml).expect("deserialize file-kind record");
+        assert_eq!(
+            back.kind,
+            RecordKind::File,
+            "a file-kind record must round-trip its kind through serde"
+        );
+        assert_eq!(
+            back, rec,
+            "a file-kind record must round-trip field-for-field"
+        );
+    }
+
+    #[test]
+    fn dir_kind_record_serializes_as_lowercase_dir() {
+        let rec = RegistryRecord {
+            version: 1,
+            key: ArtifactKey {
+                target: "dest".to_owned(),
+                source: "dotfiles".to_owned(),
+                artifact: "nvim".to_owned(),
+            },
+            source: "dotfiles".to_owned(),
+            commit: "def456789abc123".to_owned(),
+            digest: "blake3:d4e5f6".to_owned(),
+            projected_at: "2026-01-31T12:34:56Z".to_owned(),
+            layout: "by-source".to_owned(),
+            kind: RecordKind::Dir,
+            allow_symlinks: false,
+            preserve_executable: true,
+            files: vec![],
+            linked: false,
+            vars_digest: None,
+        };
+
+        let toml = toml::to_string(&rec).expect("serialize dir-kind record");
+        assert!(
+            toml.contains("kind = \"dir\""),
+            "a dir-kind record must serialize the lowercase tag `kind = \"dir\"`, got:\n{toml}"
+        );
+
+        let back: RegistryRecord = toml::from_str(&toml).expect("deserialize dir-kind record");
+        assert_eq!(
+            back.kind,
+            RecordKind::Dir,
+            "a dir-kind record must round-trip its kind through serde"
+        );
+    }
+
+    #[test]
+    fn projected_threads_file_kind_from_projected_record() {
+        let projected = ProjectedRecord {
+            key: ArtifactKey {
+                target: "dest".to_owned(),
+                source: "agents-src".to_owned(),
+                artifact: "CLAUDE.md".to_owned(),
+            },
+            underlying_source: "agents-src",
+            commit: "def456789abc123",
+            digest: "blake3:d4e5f6".to_owned(),
+            layout: "flat".to_owned(),
+            kind: RecordKind::File,
+            allow_symlinks: false,
+            preserve_executable: true,
+            files: vec![],
+            vars_digest: None,
+        };
+
+        let rec = RegistryRecord::projected(projected);
+
+        assert_eq!(
+            rec.kind,
+            RecordKind::File,
+            "projected() must carry the kind from the ProjectedRecord verbatim"
+        );
+    }
+
     // ── per-artifact vars digest (TPH-010) ─────────────────────────
 
     fn vars_digest_record(vars_digest: Option<&str>) -> RegistryRecord {
@@ -679,6 +836,7 @@ artifact = "snippets"
             digest: "blake3:d4e5f6".to_owned(),
             projected_at: "2026-01-31T12:34:56Z".to_owned(),
             layout: "flat".to_owned(),
+            kind: RecordKind::Dir,
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![],
@@ -779,6 +937,7 @@ artifact = "snippets"
             digest: "blake3:d4e5f6".to_owned(),
             projected_at: "2026-01-31T12:34:56Z".to_owned(),
             layout: "flat".to_owned(),
+            kind: RecordKind::Dir,
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![ManifestFile {

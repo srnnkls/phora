@@ -1,5 +1,5 @@
 use super::*;
-use crate::store::{ArtifactKey, FileRegistry, ManifestFile, RegistryRecord};
+use crate::store::{ArtifactKey, FileRegistry, ManifestFile, RecordKind, RegistryRecord};
 use clap::CommandFactory;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -360,6 +360,7 @@ fn record(
         digest: digest.to_owned(),
         projected_at: "2026-01-31T12:34:56Z".to_owned(),
         layout: "flat".to_owned(),
+        kind: RecordKind::Dir,
         allow_symlinks: false,
         preserve_executable: true,
         files: vec![ManifestFile {
@@ -1908,6 +1909,7 @@ fn record_for(
         digest: "blake3:rec".to_owned(),
         projected_at: "2026-01-31T12:34:56Z".to_owned(),
         layout: "flat".to_owned(),
+        kind: RecordKind::Dir,
         allow_symlinks: false,
         preserve_executable: true,
         files,
@@ -2195,6 +2197,7 @@ fn mapped_record(
         digest: "blake3:map".to_owned(),
         projected_at: "2026-01-31T12:34:56Z".to_owned(),
         layout: crate::store::MAP_LAYOUT.to_owned(),
+        kind: RecordKind::Dir,
         allow_symlinks: false,
         preserve_executable: true,
         files,

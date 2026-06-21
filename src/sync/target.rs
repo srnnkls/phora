@@ -8,7 +8,7 @@ use crate::kernel::{ArtifactName, Selection, SourceName};
 use crate::lock::encode_ref;
 use crate::source::{ExportRequest, SourceBackend};
 use crate::store::{
-    ArtifactKey, EjectedEntry, MAP_LAYOUT, ProjectedRecord, Registry, RegistryRecord,
+    ArtifactKey, EjectedEntry, MAP_LAYOUT, ProjectedRecord, RecordKind, Registry, RegistryRecord,
 };
 
 use super::confine::{ProtectedPathSet, confine_destination};
@@ -190,9 +190,14 @@ pub(crate) fn record_artifact_path(target: &Target, record: &RegistryRecord) -> 
 /// A `map` record's single manifest file IS the dest, so its base is the target root.
 pub(super) fn record_manifest_base(target: &Target, record: &RegistryRecord) -> PathBuf {
     if record.layout == MAP_LAYOUT {
-        target.expanded_path()
-    } else {
-        record_artifact_path(target, record)
+        return target.expanded_path();
+    }
+    let artifact_path = record_artifact_path(target, record);
+    match record.kind {
+        RecordKind::File => artifact_path
+            .parent()
+            .map_or(artifact_path.clone(), Path::to_path_buf),
+        RecordKind::Dir => artifact_path,
     }
 }
 
@@ -469,6 +474,7 @@ fn deploy_one(
         } else {
             format!("{:?}", ctx.layout_kind).to_lowercase()
         },
+        kind: RecordKind::Dir,
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
         files: export.files,
@@ -518,6 +524,7 @@ fn deploy_link(
         } else {
             format!("{:?}", entry.layout_kind).to_lowercase()
         },
+        kind: RecordKind::Dir,
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
         files: vec![],
@@ -633,6 +640,225 @@ mod confine_fail_closed_tests {
             "a composed/transitive target (namespaced name carries `%`) reaching deploy with \
              `confine == None` must fail closed; falling through to an unconfined write lets a dep \
              escape to any absolute path",
+        );
+    }
+}
+
+#[cfg(test)]
+mod kind_aware_layout_tests {
+    use super::*;
+    use crate::config::{LayoutConfig, LayoutKind, Target};
+    use crate::store::{ArtifactKey, ManifestFile, RecordKind, RegistryRecord};
+
+    fn target_with_layout(root: &Path, kind: LayoutKind) -> Target {
+        Target {
+            path: root.to_path_buf(),
+            sources: None,
+            layout: Some(LayoutConfig {
+                kind,
+                separator: match kind {
+                    LayoutKind::Prefixed => "-".to_owned(),
+                    LayoutKind::Flat | LayoutKind::BySource => String::new(),
+                },
+            }),
+            hooks: None,
+            imports: None,
+            confine: None,
+        }
+    }
+
+    fn record(identity: &str, artifact: &str, layout: &str, kind: RecordKind) -> RegistryRecord {
+        RegistryRecord {
+            version: 1,
+            key: ArtifactKey {
+                target: "dest".to_owned(),
+                source: identity.to_owned(),
+                artifact: artifact.to_owned(),
+            },
+            source: identity.to_owned(),
+            commit: "def456789abc123".to_owned(),
+            digest: "blake3:d4e5f6".to_owned(),
+            projected_at: "2026-01-31T12:34:56Z".to_owned(),
+            layout: layout.to_owned(),
+            kind,
+            allow_symlinks: false,
+            preserve_executable: true,
+            files: vec![ManifestFile {
+                path: PathBuf::from(artifact),
+                size: 4,
+                mtime: 0,
+                blake3: "blake3:d4e5f6".to_owned(),
+            }],
+            linked: false,
+            vars_digest: None,
+        }
+    }
+
+    #[test]
+    fn file_kind_deploys_at_flat_layout_path_not_root() {
+        let root = Path::new("/home/u/dest");
+        let target = target_with_layout(root, LayoutKind::Flat);
+        let rec = record("agents-src", "CLAUDE.md", "flat", RecordKind::File);
+        let dir_twin = record("agents-src", "CLAUDE.md", "flat", RecordKind::Dir);
+
+        let path = record_artifact_path(&target, &rec);
+
+        assert_eq!(
+            path,
+            root.join("CLAUDE.md"),
+            "a flat-layout file artifact deploys at <target>/CLAUDE.md (the layout path)"
+        );
+        assert_eq!(
+            path,
+            record_artifact_path(&target, &dir_twin),
+            "a file artifact's deploy path must track layout EXACTLY as its dir twin does — \
+             the File-vs-Dir divergence lives only in record_manifest_base, never in the deploy path"
+        );
+    }
+
+    #[test]
+    fn file_kind_deploys_at_by_source_layout_path() {
+        let root = Path::new("/home/u/dest");
+        let target = target_with_layout(root, LayoutKind::BySource);
+        let rec = record("agents-src", "CLAUDE.md", "by-source", RecordKind::File);
+        let dir_twin = record("agents-src", "CLAUDE.md", "by-source", RecordKind::Dir);
+
+        let path = record_artifact_path(&target, &rec);
+
+        assert_eq!(
+            path,
+            root.join("agents-src").join("CLAUDE.md"),
+            "a by-source file artifact deploys under its identity dir, honoring layout — \
+             not flattened to the target root"
+        );
+        assert_ne!(
+            path,
+            root.join("CLAUDE.md"),
+            "a kind=file record must NOT collapse to the target root the way MAP_LAYOUT did"
+        );
+        assert_eq!(
+            path,
+            record_artifact_path(&target, &dir_twin),
+            "a file artifact's deploy path must track layout EXACTLY as its dir twin does — \
+             the File-vs-Dir divergence lives only in record_manifest_base, never in the deploy path"
+        );
+    }
+
+    #[test]
+    fn file_kind_deploys_at_prefixed_layout_path() {
+        let root = Path::new("/home/u/dest");
+        let target = target_with_layout(root, LayoutKind::Prefixed);
+        let rec = record("agents-src", "CLAUDE.md", "prefixed", RecordKind::File);
+        let dir_twin = record("agents-src", "CLAUDE.md", "prefixed", RecordKind::Dir);
+
+        let path = record_artifact_path(&target, &rec);
+
+        assert_eq!(
+            path,
+            root.join("agents-src-CLAUDE.md"),
+            "a prefixed file artifact deploys at the separator-joined layout path"
+        );
+        assert_eq!(
+            path,
+            record_artifact_path(&target, &dir_twin),
+            "a file artifact's deploy path must track layout EXACTLY as its dir twin does — \
+             the File-vs-Dir divergence lives only in record_manifest_base, never in the deploy path"
+        );
+    }
+
+    #[test]
+    fn dir_kind_deploys_at_by_source_layout_path_unchanged() {
+        let root = Path::new("/home/u/dest");
+        let target = target_with_layout(root, LayoutKind::BySource);
+        let rec = record("dotfiles", "nvim", "by-source", RecordKind::Dir);
+
+        let path = record_artifact_path(&target, &rec);
+
+        assert_eq!(
+            path,
+            root.join("dotfiles").join("nvim"),
+            "a dir artifact's deploy path is unchanged: the layout path for its identity"
+        );
+    }
+
+    #[test]
+    fn file_kind_manifest_base_is_the_parent_of_the_deployed_file() {
+        let root = Path::new("/home/u/dest");
+        let target = target_with_layout(root, LayoutKind::BySource);
+        let rec = record("agents-src", "CLAUDE.md", "by-source", RecordKind::File);
+
+        let base = record_manifest_base(&target, &rec);
+
+        assert_eq!(
+            base,
+            root.join("agents-src"),
+            "a file record's manifest base is the PARENT of the deployed file, so its single \
+             manifest entry joins to the file itself"
+        );
+        assert_eq!(
+            base.join(&rec.files[0].path),
+            record_artifact_path(&target, &rec),
+            "manifest_base joined with the manifest file path must reconstruct the deployed file"
+        );
+    }
+
+    #[test]
+    fn file_kind_manifest_base_reconstructs_prefixed_path() {
+        let root = Path::new("/home/u/dest");
+        let target = target_with_layout(root, LayoutKind::Prefixed);
+        let rec = RegistryRecord {
+            version: 1,
+            key: ArtifactKey {
+                target: "dest".to_owned(),
+                source: "agents-src".to_owned(),
+                artifact: "CLAUDE.md".to_owned(),
+            },
+            source: "agents-src".to_owned(),
+            commit: "def456789abc123".to_owned(),
+            digest: "blake3:d4e5f6".to_owned(),
+            projected_at: "2026-01-31T12:34:56Z".to_owned(),
+            layout: "prefixed".to_owned(),
+            kind: RecordKind::File,
+            allow_symlinks: false,
+            preserve_executable: true,
+            files: vec![ManifestFile {
+                path: PathBuf::from("agents-src-CLAUDE.md"),
+                size: 4,
+                mtime: 0,
+                blake3: "blake3:d4e5f6".to_owned(),
+            }],
+            linked: false,
+            vars_digest: None,
+        };
+
+        let base = record_manifest_base(&target, &rec);
+
+        assert_eq!(
+            base,
+            root.to_path_buf(),
+            "a prefixed file record's manifest base is the PARENT (the target root), since the \
+             deployed file's basename is the full prefixed name `agents-src-CLAUDE.md`"
+        );
+        assert_eq!(
+            base.join(&rec.files[0].path),
+            record_artifact_path(&target, &rec),
+            "manifest_base joined with the FULL prefixed manifest path must reconstruct the deployed \
+             file — leaving the manifest path as bare `CLAUDE.md` would join to the wrong location"
+        );
+    }
+
+    #[test]
+    fn dir_kind_manifest_base_is_the_deployed_directory() {
+        let root = Path::new("/home/u/dest");
+        let target = target_with_layout(root, LayoutKind::BySource);
+        let rec = record("dotfiles", "nvim", "by-source", RecordKind::Dir);
+
+        let base = record_manifest_base(&target, &rec);
+
+        assert_eq!(
+            base,
+            record_artifact_path(&target, &rec),
+            "a dir record's manifest base IS the deployed directory, so file paths join under it"
         );
     }
 }

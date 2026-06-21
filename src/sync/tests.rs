@@ -101,6 +101,7 @@ fn linked_flat_record(target: &str, source: &str, artifact: &str) -> RegistryRec
         digest: "link:".to_owned(),
         projected_at: "2026-06-08T12:00:00Z".to_owned(),
         layout: "flat".to_owned(),
+        kind: RecordKind::Dir,
         allow_symlinks: false,
         preserve_executable: true,
         files: vec![],
@@ -989,7 +990,7 @@ use std::path::PathBuf;
 use crate::deploy::JournalEntry;
 
 use crate::deploy::ArtifactState;
-use crate::store::{ArtifactKey, ManifestFile, RegistryRecord};
+use crate::store::{ArtifactKey, ManifestFile, RecordKind, RegistryRecord};
 
 /// A target deployed beside this dir: `<root>/target` plus the `.phora-stage`
 /// sibling sync owns. The tempdir is the target's parent so staging has somewhere
@@ -2143,6 +2144,7 @@ fn seed_orphan(
         digest: "blake3:orphan".to_owned(),
         projected_at: "2026-01-01T00:00:00Z".to_owned(),
         layout: "flat".to_owned(),
+        kind: RecordKind::Dir,
         allow_symlinks: false,
         preserve_executable: true,
         files: vec![ManifestFile {
@@ -2810,6 +2812,7 @@ fn sync_runs_recovery_sweep_finishing_a_swapped_but_unrecorded_artifact() {
         digest: "blake3:recovered".to_owned(),
         projected_at: "2026-01-01T00:00:00Z".to_owned(),
         layout: "flat".to_owned(),
+        kind: RecordKind::Dir,
         allow_symlinks: false,
         preserve_executable: true,
         files: vec![ManifestFile {
@@ -2966,6 +2969,7 @@ fn sync_runs_recovery_before_phase1_even_when_resolve_fails() {
         digest: "blake3:recovered".to_owned(),
         projected_at: "2026-01-01T00:00:00Z".to_owned(),
         layout: "flat".to_owned(),
+        kind: RecordKind::Dir,
         allow_symlinks: false,
         preserve_executable: true,
         files: vec![ManifestFile {
@@ -3051,6 +3055,7 @@ fn seed_managed_artifact(
         digest: "blake3:seed".to_owned(),
         projected_at: "2026-01-01T00:00:00Z".to_owned(),
         layout: "flat".to_owned(),
+        kind: RecordKind::Dir,
         allow_symlinks: false,
         preserve_executable: true,
         files: vec![ManifestFile {
@@ -3231,6 +3236,7 @@ fn seed_verifiable_artifact(
         digest: "blake3:seed".to_owned(),
         projected_at: "2026-01-01T00:00:00Z".to_owned(),
         layout: "flat".to_owned(),
+        kind: RecordKind::Dir,
         allow_symlinks: false,
         preserve_executable: true,
         files: manifest,
@@ -3854,6 +3860,7 @@ fn verify_skips_linked_record_even_with_stray_manifest_file() {
         digest: "link:".to_owned(),
         projected_at: "2026-06-08T12:00:00Z".to_owned(),
         layout: "flat".to_owned(),
+        kind: RecordKind::Dir,
         allow_symlinks: false,
         preserve_executable: true,
         files: vec![ManifestFile {
@@ -3906,6 +3913,7 @@ fn verify_skips_linked_record_over_edited_symlink_target() {
         digest: "link:".to_owned(),
         projected_at: "2026-06-08T12:00:00Z".to_owned(),
         layout: "flat".to_owned(),
+        kind: RecordKind::Dir,
         allow_symlinks: false,
         preserve_executable: true,
         files: vec![],
@@ -4016,6 +4024,7 @@ fn prune_removes_stale_linked_symlink_without_following_it() {
             digest: "link:".to_owned(),
             projected_at: "2026-06-08T12:00:00Z".to_owned(),
             layout: "by-source".to_owned(),
+            kind: RecordKind::Dir,
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![],
@@ -6600,6 +6609,7 @@ fn preview_writes_nothing_to_the_registry_or_the_target() {
         digest: "blake3:seeded".to_owned(),
         projected_at: "2026-01-01T00:00:00Z".to_owned(),
         layout: "flat".to_owned(),
+        kind: RecordKind::Dir,
         allow_symlinks: false,
         preserve_executable: true,
         files: vec![ManifestFile {
