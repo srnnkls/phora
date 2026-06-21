@@ -695,3 +695,60 @@ fn unfrozen_sync_locks_nested_instance_and_unmodified_frozen_roundtrips() {
         "the frozen refusal must fail-fast before any lock write"
     );
 }
+
+/// Offline guarantee (TDEP-LOCK-001 fix3): once a lock pins a transitive dep, `--frozen`
+/// reads its manifest from the mirror at the locked commit and never fetches or re-resolves.
+#[test]
+fn frozen_reads_transitive_manifest_offline_without_fetching() {
+    let leaf = TempDir::new().expect("leaf repo");
+    leaf_repo(leaf.path(), "leaf.txt", "payload\n");
+
+    let dep = TempDir::new().expect("dep repo");
+    let dep_manifest = "version = 1\n\n\
+         [sources.editor]\ngit = \"https://github.com/mock/offleaf.git\"\ninclude = [\"pkg\"]\n\n\
+         [targets.enode]\npath = \"e\"\nsources = [\"editor\"]\n";
+    commit_manifest(dep.path(), dep_manifest);
+
+    let fixture = build_fixture();
+    let reachable = format!(
+        "[url \"{leaf}\"]\n\tinsteadOf = https://github.com/mock/offleaf.git\n\
+         [url \"{dep}\"]\n\tinsteadOf = https://github.com/mock/offdep.git\n",
+        leaf = leaf.path().display(),
+        dep = dep.path().display(),
+    );
+    write(&fixture.home_path.join(".gitconfig"), reachable.as_bytes());
+
+    let config = "version = 1\n\n\
+         [sources.mydeps]\ngit = \"https://github.com/mock/offdep.git\"\ntransitive = true\n\n\
+         [targets.dotcfg]\npath = \"~/.config\"\nimports = [\"mydeps\"]\n";
+    write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());
+
+    let seed = run(&fixture, &["sync"]);
+    let seed_stderr = String::from_utf8_lossy(&seed.stderr);
+    reject_unknown_field_stub(&seed_stderr);
+    assert!(
+        seed.status.success(),
+        "the unfrozen seed must populate the mirrors and write a lock; stderr: {seed_stderr}"
+    );
+
+    let unreachable =
+        "[url \"/nonexistent/phora-offline-guard\"]\n\tinsteadOf = https://github.com/mock/\n";
+    write(
+        &fixture.home_path.join(".gitconfig"),
+        unreachable.as_bytes(),
+    );
+
+    let frozen = run(&fixture, &["sync", "--frozen"]);
+    let frozen_stderr = String::from_utf8_lossy(&frozen.stderr);
+    reject_unknown_field_stub(&frozen_stderr);
+    assert!(
+        frozen.status.success(),
+        "--frozen must read the pinned transitive manifest offline from the mirror; with every \
+         remote repointed to a missing path, any fetch would fail, so success proves no fetch; \
+         stderr: {frozen_stderr}"
+    );
+    assert!(
+        !frozen_stderr.contains("refuses to fetch") && !frozen_stderr.contains("not pinned"),
+        "a fully-pinned frozen run must emit no frozen-miss diagnostic; got: {frozen_stderr}"
+    );
+}
