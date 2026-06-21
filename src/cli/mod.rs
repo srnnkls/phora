@@ -6,6 +6,7 @@ mod config_edit;
 mod query;
 mod render;
 mod sync;
+mod trust;
 
 #[cfg(test)]
 mod tests;
@@ -193,6 +194,14 @@ pub enum Command {
         #[arg(long)]
         local: bool,
     },
+    /// Inspect and approve transitive (composed-dep) hooks before they run.
+    Trust {
+        source: Option<String>,
+        #[arg(long)]
+        list: bool,
+        #[arg(long)]
+        revoke: bool,
+    },
     /// Show an offline deployment preview from the lock.
     Preview {
         #[arg(long)]
@@ -287,16 +296,7 @@ pub fn run(cli: Cli) -> Result<()> {
         ),
         Command::Update { source } => sync::run_update(source.as_deref()),
         Command::List { plan } => query::run_list(plan),
-        Command::Verify => {
-            let config = load_config()?;
-            let mismatches = crate::sync::verify(&config, &open_project_registry()?)?;
-            render::print_verify(&mismatches);
-            if mismatches.is_empty() {
-                Ok(())
-            } else {
-                std::process::exit(1);
-            }
-        }
+        Command::Verify => run_verify(),
         Command::Where {
             digest,
             source,
@@ -352,6 +352,7 @@ pub fn run(cli: Cli) -> Result<()> {
             from,
             local,
         } => bind::run_unbind(&sources, &from, local),
+        cmd @ Command::Trust { .. } => dispatch_trust(cmd),
         Command::Preview {
             source,
             target,
@@ -407,6 +408,29 @@ fn dispatch_add(cmd: Command) -> Result<()> {
         symlink,
         &refinement,
     )
+}
+
+fn run_verify() -> Result<()> {
+    let config = load_config()?;
+    let mismatches = crate::sync::verify(&config, &open_project_registry()?)?;
+    render::print_verify(&mismatches);
+    if mismatches.is_empty() {
+        Ok(())
+    } else {
+        std::process::exit(1);
+    }
+}
+
+fn dispatch_trust(cmd: Command) -> Result<()> {
+    let Command::Trust {
+        source,
+        list,
+        revoke,
+    } = cmd
+    else {
+        unreachable!("dispatch_trust only handles Command::Trust")
+    };
+    trust::run_trust(source.as_deref(), list, revoke)
 }
 
 fn dispatch_bind(cmd: Command) -> Result<()> {

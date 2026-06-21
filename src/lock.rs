@@ -29,6 +29,12 @@ pub struct TrustedHook {
     pub hook_id: String,
     pub preimage: String,
     pub approved_at: String,
+    /// Consumer-facing root import name scoping `phora trust <source>`; `default` keeps old locks parseable.
+    #[serde(default)]
+    pub source: String,
+    /// Dep commit this approval trusted; the `from` side of the inspect-before-trust diff.
+    #[serde(default)]
+    pub commit: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +43,12 @@ pub struct CandidateHookRecord {
     pub hook_id: String,
     pub preimage: String,
     pub command: String,
+    /// Consumer-facing root import name scoping `phora trust <source>`; `default` keeps old locks parseable.
+    #[serde(default)]
+    pub source: String,
+    /// Dep commit this candidate resolved to; the `to` side of the inspect-before-trust diff.
+    #[serde(default)]
+    pub commit: String,
 }
 
 impl Lock {
@@ -1298,6 +1310,8 @@ config_digest = \"blake3:cfg\"
                 hook_id: "post-deploy".to_owned(),
                 preimage: "blake3:hookpreimage".to_owned(),
                 approved_at: "2026-06-20T00:00:00Z".to_owned(),
+                source: "mydeps".to_owned(),
+                commit: "c0ffeecommit".to_owned(),
             }],
             candidate_hooks: Vec::new(),
         };
@@ -1387,12 +1401,16 @@ config_digest = \"blake3:cfg\"
                     hook_id: "post-deploy".to_owned(),
                     preimage: "blake3:old".to_owned(),
                     approved_at: "2026-01-01T00:00:00Z".to_owned(),
+                    source: String::new(),
+                    commit: String::new(),
                 },
                 TrustedHook {
                     dep_instance: "inst0002".to_owned(),
                     hook_id: "pre-build".to_owned(),
                     preimage: "blake3:keep".to_owned(),
                     approved_at: "2026-01-01T00:00:00Z".to_owned(),
+                    source: String::new(),
+                    commit: String::new(),
                 },
             ],
             candidate_hooks: Vec::new(),
@@ -1405,6 +1423,8 @@ config_digest = \"blake3:cfg\"
                 hook_id: "post-deploy".to_owned(),
                 preimage: "blake3:new".to_owned(),
                 approved_at: "2026-06-20T00:00:00Z".to_owned(),
+                source: String::new(),
+                commit: String::new(),
             }],
             candidate_hooks: Vec::new(),
         };

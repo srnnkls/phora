@@ -115,6 +115,8 @@ pub struct SyncOutput {
     pub had_failures: bool,
     pub deploy_failures: bool,
     pub hook_results: Vec<hooks::HookOutcome>,
+    /// Transitive hooks discovered but left unrun for lack of trust.
+    pub stripped_transitive_hooks: usize,
 }
 
 /// A relative target path yields an empty (`""`) or absent parent; both normalize
@@ -204,8 +206,15 @@ fn record_candidate_hooks(
             hook_id: c.hook_id.clone(),
             preimage: c.preimage.clone(),
             command: c.command.run.clone(),
+            source: c.source.clone(),
+            commit: c.commit.clone(),
         })
         .collect();
+}
+
+struct TransitiveHookDecision {
+    outcomes: Vec<hooks::HookOutcome>,
+    stripped: usize,
 }
 
 /// Runs the trusted transitive hooks and appends any newly-approved (interactive) ones to the
@@ -215,7 +224,7 @@ fn decide_transitive_hooks(
     candidates: &[transitive::TransitiveHookCandidate],
     effective_lock: Option<&Lock>,
     interactive: bool,
-) -> Result<Vec<hooks::HookOutcome>> {
+) -> Result<TransitiveHookDecision> {
     let trusted = trusted_preimages(effective_lock);
     let runs: Vec<hooks::TransitiveHookRun<'_>> = candidates
         .iter()
@@ -227,17 +236,31 @@ fn decide_transitive_hooks(
             target_path: &c.target_path,
         })
         .collect();
-    let (outcomes, approvals) = hooks::dispatch_transitive_hooks(&runs, &trusted, interactive)?;
+    let prompt: Box<dyn hooks::TrustPrompt> = if interactive {
+        Box::new(hooks::TtyTrustPrompt)
+    } else {
+        Box::new(hooks::DeclineAll)
+    };
+    let (outcomes, approvals) = hooks::dispatch_transitive_hooks(&runs, &trusted, prompt.as_ref())?;
     let now = chrono::Utc::now().to_rfc3339();
-    for approval in approvals {
+    for approval in &approvals {
+        let candidate = candidates
+            .iter()
+            .find(|c| c.dep_instance == approval.dep_instance && c.hook_id == approval.hook_id);
         base_lock.trusted_hooks.push(crate::lock::TrustedHook {
-            dep_instance: approval.dep_instance,
-            hook_id: approval.hook_id,
-            preimage: approval.preimage,
+            dep_instance: approval.dep_instance.clone(),
+            hook_id: approval.hook_id.clone(),
+            preimage: approval.preimage.clone(),
             approved_at: now.clone(),
+            source: candidate.map(|c| c.source.clone()).unwrap_or_default(),
+            commit: candidate.map(|c| c.commit.clone()).unwrap_or_default(),
         });
     }
-    Ok(outcomes)
+    let ran = outcomes.len();
+    Ok(TransitiveHookDecision {
+        outcomes,
+        stripped: candidates.len() - ran,
+    })
 }
 
 struct DeployAll<'a> {
@@ -385,14 +408,16 @@ pub fn sync(
         hooks::dispatch_hooks(&effective_config, registry)?
     };
     record_candidate_hooks(&mut base_lock, &hook_candidates);
+    let mut stripped_transitive_hooks = 0;
     if !input.no_hooks && !input.no_transitive_hooks {
-        let mut outcomes = decide_transitive_hooks(
+        let mut decision = decide_transitive_hooks(
             &mut base_lock,
             &hook_candidates,
             effective_lock.as_ref(),
             input.interactive,
         )?;
-        hook_results.append(&mut outcomes);
+        stripped_transitive_hooks = decision.stripped;
+        hook_results.append(&mut decision.outcomes);
     }
     let deploy_failures = had_failures;
     had_failures |= hook_results
@@ -405,6 +430,7 @@ pub fn sync(
         had_failures,
         deploy_failures,
         hook_results,
+        stripped_transitive_hooks,
     })
 }
 

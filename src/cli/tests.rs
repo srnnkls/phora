@@ -158,6 +158,57 @@ fn sync_without_frozen_flag_defaults_to_false() {
     assert!(!frozen, "absent --frozen must default frozen=false");
 }
 
+// TDEP-TRUST-CLI-001: `phora trust` CLI surface
+
+#[test]
+fn trust_parses_source_positional() {
+    use clap::Parser;
+    let cli = Cli::try_parse_from(["phora", "trust", "mydeps"])
+        .expect("`phora trust <source>` must parse");
+    let Command::Trust { source, .. } = cli.command else {
+        panic!("expected Command::Trust");
+    };
+    assert_eq!(
+        source.as_deref(),
+        Some("mydeps"),
+        "the positional must bind to the source name being inspected"
+    );
+}
+
+#[test]
+fn trust_list_flag_parses_to_true() {
+    use clap::Parser;
+    let cli =
+        Cli::try_parse_from(["phora", "trust", "--list"]).expect("`phora trust --list` must parse");
+    let Command::Trust { list, .. } = cli.command else {
+        panic!("expected Command::Trust");
+    };
+    assert!(list, "--list must set list=true");
+}
+
+#[test]
+fn trust_revoke_flag_parses_to_true() {
+    use clap::Parser;
+    let cli = Cli::try_parse_from(["phora", "trust", "mydeps", "--revoke"])
+        .expect("`phora trust <source> --revoke` must parse");
+    let Command::Trust { revoke, .. } = cli.command else {
+        panic!("expected Command::Trust");
+    };
+    assert!(revoke, "--revoke must set revoke=true");
+}
+
+#[test]
+fn trust_without_flags_defaults_list_and_revoke_false() {
+    use clap::Parser;
+    let cli =
+        Cli::try_parse_from(["phora", "trust", "mydeps"]).expect("bare `phora trust` must parse");
+    let Command::Trust { list, revoke, .. } = cli.command else {
+        panic!("expected Command::Trust");
+    };
+    assert!(!list, "absent --list must default list=false");
+    assert!(!revoke, "absent --revoke must default revoke=false");
+}
+
 #[test]
 fn drop_one_consumer_source_also_clears_transitive_nodes() {
     let mut lock = crate::lock::Lock {
