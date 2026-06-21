@@ -1,6 +1,6 @@
 //! Source port (`SourceBackend`) and its git adapter (`GitBackend`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use gix::object::tree::EntryKind;
@@ -337,6 +337,38 @@ impl GitBackend {
         self.shallow_read_root_manifest(source, url, refspec)
     }
 
+    /// Every path whose blob differs between `from_commit` and `to_commit` (added, removed, or
+    /// modified), read from `url`'s mirror. Backs the `phora trust` inspect-before-trust diff: both
+    /// commits must already be in the mirror (a full `phora sync` clone holds them).
+    ///
+    /// # Errors
+    /// - the mirror is missing, either commit cannot be resolved, or a tree cannot be walked.
+    pub fn file_diff_between(
+        &self,
+        source: &SourceName,
+        url: &str,
+        from_commit: &str,
+        to_commit: &str,
+    ) -> Result<Vec<String>> {
+        let mirror = self.mirror_path(url);
+        let repo = gix::open(&mirror)
+            .map_err(|e| SourceError::Source(format!("open mirror {source}: {e}")))?;
+        let from = tree_blobs(&repo, source, from_commit)?;
+        let to = tree_blobs(&repo, source, to_commit)?;
+        let mut changed: BTreeSet<String> = BTreeSet::new();
+        for (path, id) in &to {
+            if from.get(path) != Some(id) {
+                changed.insert(path.clone());
+            }
+        }
+        for path in from.keys() {
+            if !to.contains_key(path) {
+                changed.insert(path.clone());
+            }
+        }
+        Ok(changed.into_iter().collect())
+    }
+
     /// Reads a remote's root `phora.toml` via a `--depth=1` shallow clone into an
     /// ephemeral staging dir, leaving the persistent mirror cache untouched.
     ///
@@ -406,6 +438,31 @@ fn resolve_in(repo: &gix::Repository, source: &SourceName, refspec: &Refspec) ->
         }
     };
     Ok(commit.id().to_hex().to_string())
+}
+
+fn tree_blobs(
+    repo: &gix::Repository,
+    source: &SourceName,
+    commit: &str,
+) -> Result<BTreeMap<String, gix::ObjectId>> {
+    let oid = gix::ObjectId::from_hex(commit.as_bytes())
+        .map_err(|e| SourceError::Source(format!("parse commit {commit} in {source}: {e}")))?;
+    let tree = repo
+        .find_commit(oid)
+        .map_err(|e| SourceError::Source(format!("commit {commit} in {source}: {e}")))?
+        .tree()
+        .map_err(|e| SourceError::Source(format!("tree of {commit} in {source}: {e}")))?;
+    let mut blobs = BTreeMap::new();
+    let mut recorder = gix::traverse::tree::Recorder::default();
+    tree.traverse()
+        .breadthfirst(&mut recorder)
+        .map_err(|e| SourceError::Source(format!("walk tree of {commit} in {source}: {e}")))?;
+    for entry in recorder.records {
+        if entry.mode.is_blob() {
+            blobs.insert(entry.filepath.to_string(), entry.oid);
+        }
+    }
+    Ok(blobs)
 }
 
 fn read_blob_at(
@@ -1972,6 +2029,36 @@ mod tests {
         assert_ne!(
             resolved, fixture.tag_sha,
             "main points at the second commit, not the tagged first commit"
+        );
+    }
+
+    #[test]
+    fn file_diff_between_reads_both_commits_and_reports_the_changed_path() {
+        let fixture = build_git_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+
+        let changed = fixture
+            .backend
+            .file_diff_between(
+                &sn("src"),
+                &fixture.url,
+                &fixture.tag_sha,
+                &fixture.head_sha,
+            )
+            .expect("diff between two commits resolves both trees");
+
+        assert!(
+            changed.iter().any(|p| p == "SECOND.md"),
+            "the diff must list `SECOND.md`, which exists only in the second commit's tree — \
+             proving file_diff_between read BOTH commits, not just one; got: {changed:?}"
+        );
+        assert!(
+            !changed.iter().any(|p| p == "README.md"),
+            "`README.md` is byte-identical across both commits and must NOT appear in the diff; \
+             got: {changed:?}"
         );
     }
 

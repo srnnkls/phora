@@ -40,6 +40,10 @@ pub(super) struct TransitiveHookCandidate {
     pub(super) command: HookCommand,
     pub(super) preimage: String,
     pub(super) target_path: PathBuf,
+    /// Consumer-facing root import name this subtree was reached through.
+    pub(super) source: String,
+    /// The dep's resolved commit; recorded so `phora trust` can diff it against the last trusted commit.
+    pub(super) commit: String,
 }
 
 /// The transitive pre-pass output: composed targets plus the namespaced source
@@ -138,6 +142,7 @@ pub(super) fn resolve_transitive_graph(
                     frozen: &frozen_gate,
                     consumer_hosts: &config.hosts,
                     default_protocol: config.protocol,
+                    root_source: imported,
                 },
                 1,
             )?;
@@ -157,6 +162,8 @@ struct WalkCtx<'a> {
     frozen: &'a FrozenGate<'a>,
     consumer_hosts: &'a BTreeMap<String, Host>,
     default_protocol: Option<Protocol>,
+    /// Consumer-facing import name rooting this subtree; stamped on every hook candidate it yields.
+    root_source: &'a str,
 }
 
 /// Checked at the top of every `fetch_manifest` so no depth can fetch an unpinned/drifted node under `--frozen`.
@@ -458,6 +465,8 @@ fn admit_hook_candidates(
             hook_id: candidate.hook_id,
             command: candidate.command,
             target_path: composed_path.to_path_buf(),
+            source: ctx.root_source.to_owned(),
+            commit: commit.to_owned(),
         });
     }
 }

@@ -62,12 +62,37 @@ pub(super) fn run_sync(
         &registry,
     )?;
 
-    finish_sync(&cwd, &out)
+    finish_sync(&cwd, &out, interactive)
 }
 
-fn finish_sync(cwd: &Path, out: &SyncOutput) -> Result<()> {
+struct StrippedHookNotice {
+    message: String,
+    fail: bool,
+}
+
+fn stripped_hook_notice(stripped: usize, interactive: bool) -> Option<StrippedHookNotice> {
+    (stripped > 0).then(|| StrippedHookNotice {
+        message: format!(
+            "phora: {stripped} untrusted transitive hook(s) were stripped and not run — affected \
+             artifacts are deployed but NOT post-processed and may be incomplete\n\
+             phora: run `phora trust <name>` to inspect and approve {stripped} hook(s)"
+        ),
+        fail: interactive,
+    })
+}
+
+fn finish_sync(cwd: &Path, out: &SyncOutput, interactive: bool) -> Result<()> {
     write_locks(cwd, &out.base_lock, out.local_lock.as_ref())?;
     let report = super::render::render_hook_report(&out.hook_results);
+    if let Some(notice) = stripped_hook_notice(out.stripped_transitive_hooks, interactive) {
+        if !report.is_empty() {
+            eprint!("{report}");
+        }
+        eprintln!("{}", notice.message);
+        if notice.fail {
+            std::process::exit(1);
+        }
+    }
     if out.had_failures {
         if !report.is_empty() {
             eprint!("{report}");
@@ -192,5 +217,37 @@ fn read_lock(path: &Path) -> Result<Option<Lock>> {
             .map_err(|e| Error::Lock(format!("parse {}: {e}", path.display()))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(Error::Lock(format!("read {}: {e}", path.display()))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stripped_hook_notice;
+
+    #[test]
+    fn no_stripped_hooks_yields_no_notice() {
+        assert!(stripped_hook_notice(0, true).is_none());
+        assert!(stripped_hook_notice(0, false).is_none());
+    }
+
+    #[test]
+    fn stripped_hooks_under_a_tty_fail_the_command() {
+        let notice = stripped_hook_notice(2, true).expect("a notice when hooks are stripped");
+        assert!(
+            notice.fail,
+            "a TTY sync must fail so a human acts on the stripped hooks"
+        );
+        assert!(notice.message.contains("phora trust") && notice.message.contains("approve"));
+        assert!(notice.message.contains("incomplete"));
+    }
+
+    #[test]
+    fn stripped_hooks_under_non_tty_surface_but_do_not_fail() {
+        let notice = stripped_hook_notice(1, false).expect("a notice when hooks are stripped");
+        assert!(
+            !notice.fail,
+            "non-TTY/CI must stay green; the gap is surfaced, not fatal"
+        );
+        assert!(notice.message.contains("phora trust") && notice.message.contains("approve"));
     }
 }

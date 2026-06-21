@@ -124,20 +124,51 @@ pub(super) struct TransitiveApproval {
     pub(super) preimage: String,
 }
 
+pub(super) trait TrustPrompt {
+    fn confirm(&self, candidate: &TransitiveHookRun<'_>) -> bool;
+}
+
+/// Only an explicit `y` trusts; EOF/error declines.
+pub(super) struct TtyTrustPrompt;
+
+impl TrustPrompt for TtyTrustPrompt {
+    fn confirm(&self, candidate: &TransitiveHookRun<'_>) -> bool {
+        use std::io::Write as _;
+        eprint!(
+            "phora: composed dep `{}` wants to run on_change hook `{}` — trust it? [y/N] ",
+            candidate.dep_instance, candidate.command.run
+        );
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(0) | Err(_) => false,
+            Ok(_) => line.trim().eq_ignore_ascii_case("y"),
+        }
+    }
+}
+
+pub(super) struct DeclineAll;
+
+impl TrustPrompt for DeclineAll {
+    fn confirm(&self, _candidate: &TransitiveHookRun<'_>) -> bool {
+        false
+    }
+}
+
 /// Runs each commit-pinned transitive hook whose preimage a consumer `trusted_hooks` entry
-/// already pins; an unpinned hook prompts under a TTY (approval persists) and is silently
-/// skipped under non-TTY. A dep can never self-approve: trust is keyed on the consumer lock.
+/// already pins; an unpinned hook consults `prompt` (approval persists) and is skipped on a
+/// decline. A dep can never self-approve: trust is keyed on the consumer lock.
 pub(super) fn dispatch_transitive_hooks(
     candidates: &[TransitiveHookRun<'_>],
     trusted: &BTreeSet<String>,
-    interactive: bool,
+    prompt: &dyn TrustPrompt,
 ) -> Result<(Vec<HookOutcome>, Vec<TransitiveApproval>)> {
     let mut outcomes = Vec::new();
     let mut approvals = Vec::new();
     for candidate in candidates {
         let pinned = trusted.contains(candidate.preimage);
         if !pinned {
-            if !interactive || !prompt_trust(candidate) {
+            if !prompt.confirm(candidate) {
                 continue;
             }
             approvals.push(TransitiveApproval {
@@ -158,21 +189,6 @@ pub(super) fn dispatch_transitive_hooks(
         });
     }
     Ok((outcomes, approvals))
-}
-
-/// Prompts on stderr for a transitive hook approval; only an explicit `y` trusts it.
-fn prompt_trust(candidate: &TransitiveHookRun<'_>) -> bool {
-    use std::io::Write as _;
-    eprint!(
-        "phora: composed dep `{}` wants to run on_change hook `{}` — trust it? [y/N] ",
-        candidate.dep_instance, candidate.command.run
-    );
-    let _ = std::io::stderr().flush();
-    let mut line = String::new();
-    match std::io::stdin().read_line(&mut line) {
-        Ok(0) | Err(_) => false,
-        Ok(_) => line.trim().eq_ignore_ascii_case("y"),
-    }
 }
 
 fn dedupe(commands: &[HookCommand]) -> Vec<&HookCommand> {
@@ -252,4 +268,118 @@ fn run_hook(hook: &HookCommand, env: &[(&str, &str)]) -> Result<HookStatus> {
     } else {
         HookStatus::Failure
     })
+}
+
+#[cfg(test)]
+mod transitive_trust_tests {
+    use super::*;
+    use crate::config::HookCommand;
+    use std::path::Path;
+
+    struct CannedPrompt(bool);
+
+    impl TrustPrompt for CannedPrompt {
+        fn confirm(&self, _candidate: &TransitiveHookRun<'_>) -> bool {
+            self.0
+        }
+    }
+
+    struct NeverPrompt;
+    impl TrustPrompt for NeverPrompt {
+        fn confirm(&self, _candidate: &TransitiveHookRun<'_>) -> bool {
+            panic!("a hook already pinned in trusted_hooks must run without prompting");
+        }
+    }
+
+    fn noop_hook() -> HookCommand {
+        HookCommand {
+            run: "true".to_owned(),
+            shell: Some("sh -c".to_owned()),
+        }
+    }
+
+    fn run<'a>(command: &'a HookCommand, target: &'a Path) -> TransitiveHookRun<'a> {
+        TransitiveHookRun {
+            dep_instance: "owninginstance01",
+            hook_id: "composed#on_change#deadbeef",
+            command,
+            preimage: "blake3:candidatepreimage",
+            target_path: target,
+        }
+    }
+
+    #[test]
+    fn answering_yes_yields_an_approval_matching_the_candidate_preimage_and_id() {
+        let cmd = noop_hook();
+        let target = Path::new("/tmp/phora-test-target");
+        let candidate = run(&cmd, target);
+        let trusted = BTreeSet::new();
+
+        let (_outcomes, approvals) =
+            dispatch_transitive_hooks(&[candidate], &trusted, &CannedPrompt(true))
+                .expect("dispatch with a yes-answering prompt must succeed");
+
+        assert_eq!(
+            approvals.len(),
+            1,
+            "an untrusted hook approved with `y` must produce exactly one persistable approval"
+        );
+        let approval = &approvals[0];
+        assert_eq!(
+            approval.preimage, "blake3:candidatepreimage",
+            "the persisted approval must carry the candidate's commit-bound preimage verbatim, so \
+             trust is pinned to the resolved commit"
+        );
+        assert_eq!(
+            approval.dep_instance, "owninginstance01",
+            "the approval must address the candidate's owning dep instance"
+        );
+        assert_eq!(
+            approval.hook_id, "composed#on_change#deadbeef",
+            "the approval must address the candidate's hook id"
+        );
+    }
+
+    #[test]
+    fn answering_no_yields_no_approval_and_does_not_run_the_hook() {
+        let cmd = noop_hook();
+        let target = Path::new("/tmp/phora-test-target");
+        let candidate = run(&cmd, target);
+        let trusted = BTreeSet::new();
+
+        let (outcomes, approvals) =
+            dispatch_transitive_hooks(&[candidate], &trusted, &CannedPrompt(false))
+                .expect("dispatch with a no-answering prompt must succeed");
+
+        assert!(
+            approvals.is_empty(),
+            "anti-TOFU: declining the prompt must write NO trusted_hooks approval"
+        );
+        assert!(
+            outcomes.is_empty(),
+            "a declined untrusted hook must NOT run, so it produces no outcome"
+        );
+    }
+
+    #[test]
+    fn an_already_trusted_hook_runs_without_prompting_or_re_approving() {
+        let cmd = noop_hook();
+        let target = Path::new("/tmp/phora-test-target");
+        let candidate = run(&cmd, target);
+        let mut trusted = BTreeSet::new();
+        trusted.insert("blake3:candidatepreimage".to_owned());
+
+        let (outcomes, approvals) = dispatch_transitive_hooks(&[candidate], &trusted, &NeverPrompt)
+            .expect("a pinned hook dispatches without error");
+
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "a preimage-pinned hook must RUN without consulting the prompt"
+        );
+        assert!(
+            approvals.is_empty(),
+            "a hook already trusted needs no fresh approval to persist"
+        );
+    }
 }
