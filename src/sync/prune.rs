@@ -62,6 +62,8 @@ pub(super) fn prune_orphans(
                         "phora: refusing to prune out-of-anchor {}: {e}",
                         dst.display()
                     );
+                    // Keep the record: the file is still on disk, so it must stay tracked.
+                    continue;
                 }
             }
         }

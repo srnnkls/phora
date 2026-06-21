@@ -1,6 +1,6 @@
 //! Post-commit hook dispatch.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 
 use crate::config::{Config, DEFAULT_SHELL_PREFIX, HookCommand, HookWhen, LayoutConfig};
@@ -115,6 +115,8 @@ pub(super) struct TransitiveHookRun<'a> {
     pub(super) command: &'a HookCommand,
     pub(super) preimage: &'a str,
     pub(super) target_path: &'a std::path::Path,
+    pub(super) source: &'a str,
+    pub(super) commit: &'a str,
 }
 
 /// A new trust approval the producer must persist to the consumer lock's `trusted_hooks`.
@@ -122,28 +124,34 @@ pub(super) struct TransitiveApproval {
     pub(super) dep_instance: String,
     pub(super) hook_id: String,
     pub(super) preimage: String,
+    pub(super) source: String,
+    pub(super) commit: String,
 }
 
 pub(super) trait TrustPrompt {
     fn confirm(&self, candidate: &TransitiveHookRun<'_>) -> bool;
 }
 
-/// Only an explicit `y` trusts; EOF/error declines.
+/// Reads a y/N answer from stdin; only an explicit `y` confirms, EOF and errors decline.
+pub(crate) fn prompt_yes_on_stdin(prompt: &str) -> bool {
+    use std::io::Write as _;
+    eprint!("{prompt}");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    match std::io::stdin().read_line(&mut line) {
+        Ok(0) | Err(_) => false,
+        Ok(_) => line.trim().eq_ignore_ascii_case("y"),
+    }
+}
+
 pub(super) struct TtyTrustPrompt;
 
 impl TrustPrompt for TtyTrustPrompt {
     fn confirm(&self, candidate: &TransitiveHookRun<'_>) -> bool {
-        use std::io::Write as _;
-        eprint!(
+        prompt_yes_on_stdin(&format!(
             "phora: composed dep `{}` wants to run on_change hook `{}` — trust it? [y/N] ",
             candidate.dep_instance, candidate.command.run
-        );
-        let _ = std::io::stderr().flush();
-        let mut line = String::new();
-        match std::io::stdin().read_line(&mut line) {
-            Ok(0) | Err(_) => false,
-            Ok(_) => line.trim().eq_ignore_ascii_case("y"),
-        }
+        ))
     }
 }
 
@@ -165,16 +173,29 @@ pub(super) fn dispatch_transitive_hooks(
 ) -> Result<(Vec<HookOutcome>, Vec<TransitiveApproval>)> {
     let mut outcomes = Vec::new();
     let mut approvals = Vec::new();
+    // Identical preimages share one decision per run: prompt once, then reuse the answer so
+    // duplicate hooks neither re-prompt nor re-run a decline.
+    let mut decided: BTreeMap<&str, bool> = BTreeMap::new();
     for candidate in candidates {
-        let pinned = trusted.contains(candidate.preimage);
-        if !pinned {
-            if !prompt.confirm(candidate) {
-                continue;
-            }
+        let approved = if trusted.contains(candidate.preimage) {
+            true
+        } else if let Some(&prior) = decided.get(candidate.preimage) {
+            prior
+        } else {
+            let answer = prompt.confirm(candidate);
+            decided.insert(candidate.preimage, answer);
+            answer
+        };
+        if !approved {
+            continue;
+        }
+        if !trusted.contains(candidate.preimage) {
             approvals.push(TransitiveApproval {
                 dep_instance: candidate.dep_instance.to_owned(),
                 hook_id: candidate.hook_id.to_owned(),
                 preimage: candidate.preimage.to_owned(),
+                source: candidate.source.to_owned(),
+                commit: candidate.commit.to_owned(),
             });
         }
         let status = run_hook(
@@ -291,6 +312,14 @@ mod transitive_trust_tests {
         }
     }
 
+    struct CountingPrompt(std::cell::Cell<usize>, bool);
+    impl TrustPrompt for CountingPrompt {
+        fn confirm(&self, _candidate: &TransitiveHookRun<'_>) -> bool {
+            self.0.set(self.0.get() + 1);
+            self.1
+        }
+    }
+
     fn noop_hook() -> HookCommand {
         HookCommand {
             run: "true".to_owned(),
@@ -305,6 +334,8 @@ mod transitive_trust_tests {
             command,
             preimage: "blake3:candidatepreimage",
             target_path: target,
+            source: "mydeps",
+            commit: "c0ffeecommit",
         }
     }
 
@@ -338,6 +369,12 @@ mod transitive_trust_tests {
             approval.hook_id, "composed#on_change#deadbeef",
             "the approval must address the candidate's hook id"
         );
+        assert_eq!(
+            (approval.source.as_str(), approval.commit.as_str()),
+            ("mydeps", "c0ffeecommit"),
+            "the approval must carry the candidate's source and commit so the persisted \
+             trusted_hooks entry can be diffed by `phora trust`, never silently emptied"
+        );
     }
 
     #[test]
@@ -359,6 +396,101 @@ mod transitive_trust_tests {
             outcomes.is_empty(),
             "a declined untrusted hook must NOT run, so it produces no outcome"
         );
+    }
+
+    fn run_keyed<'a>(
+        command: &'a HookCommand,
+        target: &'a Path,
+        dep_instance: &'a str,
+        hook_id: &'a str,
+        preimage: &'a str,
+    ) -> TransitiveHookRun<'a> {
+        TransitiveHookRun {
+            dep_instance,
+            hook_id,
+            command,
+            preimage,
+            target_path: target,
+            source: "mydeps",
+            commit: "c0ffeecommit",
+        }
+    }
+
+    #[test]
+    fn duplicate_preimages_prompt_once_but_each_records_its_own_approval() {
+        let cmd = noop_hook();
+        let target = Path::new("/tmp/phora-test-target");
+        let a = run_keyed(
+            &cmd,
+            target,
+            "instanceaaaa0001",
+            "a#on_change#dead",
+            "blake3:shared",
+        );
+        let b = run_keyed(
+            &cmd,
+            target,
+            "instancebbbb0002",
+            "b#on_change#dead",
+            "blake3:shared",
+        );
+        let trusted = BTreeSet::new();
+        let prompt = CountingPrompt(std::cell::Cell::new(0), true);
+
+        let (outcomes, approvals) = dispatch_transitive_hooks(&[a, b], &trusted, &prompt)
+            .expect("dispatch with two same-preimage candidates must succeed");
+
+        assert_eq!(
+            prompt.0.get(),
+            1,
+            "two candidates sharing a preimage must prompt exactly once"
+        );
+        assert_eq!(
+            approvals.len(),
+            2,
+            "each distinct (dep_instance, hook_id) must still get its own approval record"
+        );
+        assert_eq!(
+            outcomes.len(),
+            2,
+            "both shared-preimage hooks must run after the single yes"
+        );
+    }
+
+    #[test]
+    fn declining_a_shared_preimage_skips_all_duplicates_without_re_prompting() {
+        let cmd = noop_hook();
+        let target = Path::new("/tmp/phora-test-target");
+        let a = run_keyed(
+            &cmd,
+            target,
+            "instanceaaaa0001",
+            "a#on_change#dead",
+            "blake3:shared",
+        );
+        let b = run_keyed(
+            &cmd,
+            target,
+            "instancebbbb0002",
+            "b#on_change#dead",
+            "blake3:shared",
+        );
+        let trusted = BTreeSet::new();
+        let prompt = CountingPrompt(std::cell::Cell::new(0), false);
+
+        let (outcomes, approvals) = dispatch_transitive_hooks(&[a, b], &trusted, &prompt)
+            .expect("dispatch declining a shared preimage must succeed");
+
+        assert_eq!(
+            prompt.0.get(),
+            1,
+            "a declined preimage must not re-prompt for duplicates"
+        );
+        assert!(
+            approvals.is_empty(),
+            "a declined preimage records no approval"
+        );
+        assert!(outcomes.is_empty(), "a declined preimage runs nothing");
     }
 
     #[test]

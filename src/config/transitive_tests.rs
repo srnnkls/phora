@@ -1,6 +1,6 @@
 use super::*;
+use crate::config::admit_transitive_hooks;
 use crate::config::transitive::{FetchNode, Instance, TransitiveManifest};
-use crate::config::{CandidateHook, admit_transitive_hooks};
 
 fn composed_instance() -> Instance {
     let fetch = FetchNode::new("https://github.com/dep/x.git", "main", "blake3:dead");
@@ -376,7 +376,8 @@ fn admission_interprets_opaque_into_structured_candidate_keyed_by_instance() {
         .expect("manifest retains opaque per-target hooks");
     let instance = composed_instance();
 
-    let candidates = admit_transitive_hooks(opaque, "editor", "ns%1%editor", &instance);
+    let (candidates, _diagnostics) =
+        admit_transitive_hooks(opaque, "editor", "ns%1%editor", &instance);
 
     assert_eq!(
         candidates.len(),
@@ -417,7 +418,8 @@ fn admission_yields_no_candidates_for_a_target_with_no_hooks() {
         .expect("manifest retains opaque per-target hooks");
     let instance = composed_instance();
 
-    let candidates = admit_transitive_hooks(opaque, "nonexistent", "ns%1%nonexistent", &instance);
+    let (candidates, _diagnostics) =
+        admit_transitive_hooks(opaque, "nonexistent", "ns%1%nonexistent", &instance);
 
     assert!(
         candidates.is_empty(),
@@ -434,7 +436,7 @@ fn admission_produces_candidates_but_never_a_trusted_marker() {
         .expect("manifest retains opaque per-target hooks");
     let instance = composed_instance();
 
-    let candidates: Vec<CandidateHook> =
+    let (candidates, _diagnostics) =
         admit_transitive_hooks(opaque, "editor", "ns%1%editor", &instance);
 
     assert_eq!(
@@ -466,7 +468,8 @@ fn hook_id_for(run: &str, shell: Option<&str>) -> String {
     let manifest = TransitiveManifest::parse(&toml).expect("manifest parses");
     let opaque = manifest.hooks().expect("manifest retains opaque hooks");
     let instance = composed_instance();
-    let candidates = admit_transitive_hooks(opaque, "editor", "ns%1%editor", &instance);
+    let (candidates, _diagnostics) =
+        admit_transitive_hooks(opaque, "editor", "ns%1%editor", &instance);
     candidates
         .into_iter()
         .next()

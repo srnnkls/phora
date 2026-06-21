@@ -2,7 +2,7 @@
 
 mod confine;
 mod discover;
-mod hooks;
+pub(crate) mod hooks;
 mod plan;
 mod preview;
 mod prune;
@@ -201,14 +201,7 @@ fn record_candidate_hooks(
 ) {
     base_lock.candidate_hooks = candidates
         .iter()
-        .map(|c| crate::lock::CandidateHookRecord {
-            dep_instance: c.dep_instance.clone(),
-            hook_id: c.hook_id.clone(),
-            preimage: c.preimage.clone(),
-            command: c.command.run.clone(),
-            source: c.source.clone(),
-            commit: c.commit.clone(),
-        })
+        .map(crate::lock::CandidateHookRecord::from)
         .collect();
 }
 
@@ -234,26 +227,24 @@ fn decide_transitive_hooks(
             command: &c.command,
             preimage: &c.preimage,
             target_path: &c.target_path,
+            source: &c.source,
+            commit: &c.commit,
         })
         .collect();
-    let prompt: Box<dyn hooks::TrustPrompt> = if interactive {
-        Box::new(hooks::TtyTrustPrompt)
+    let (outcomes, approvals) = if interactive {
+        hooks::dispatch_transitive_hooks(&runs, &trusted, &hooks::TtyTrustPrompt)?
     } else {
-        Box::new(hooks::DeclineAll)
+        hooks::dispatch_transitive_hooks(&runs, &trusted, &hooks::DeclineAll)?
     };
-    let (outcomes, approvals) = hooks::dispatch_transitive_hooks(&runs, &trusted, prompt.as_ref())?;
     let now = chrono::Utc::now().to_rfc3339();
-    for approval in &approvals {
-        let candidate = candidates
-            .iter()
-            .find(|c| c.dep_instance == approval.dep_instance && c.hook_id == approval.hook_id);
+    for approval in approvals {
         base_lock.trusted_hooks.push(crate::lock::TrustedHook {
-            dep_instance: approval.dep_instance.clone(),
-            hook_id: approval.hook_id.clone(),
-            preimage: approval.preimage.clone(),
+            dep_instance: approval.dep_instance,
+            hook_id: approval.hook_id,
+            preimage: approval.preimage,
             approved_at: now.clone(),
-            source: candidate.map(|c| c.source.clone()).unwrap_or_default(),
-            commit: candidate.map(|c| c.commit.clone()).unwrap_or_default(),
+            source: approval.source,
+            commit: approval.commit,
         });
     }
     let ran = outcomes.len();

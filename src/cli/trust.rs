@@ -329,15 +329,10 @@ struct StdinConfirm;
 
 impl Confirm for StdinConfirm {
     fn confirm(&self, candidate: &CandidateHookRecord) -> bool {
-        use std::io::Write as _;
-        eprint!(
+        crate::sync::hooks::prompt_yes_on_stdin(&format!(
             "phora: trust `{}` (runs `{}`)? [y/N] ",
             candidate.hook_id, candidate.command
-        );
-        let _ = std::io::stderr().flush();
-        let mut line = String::new();
-        matches!(std::io::stdin().read_line(&mut line), Ok(n) if n > 0)
-            && line.trim().eq_ignore_ascii_case("y")
+        ))
     }
 }
 

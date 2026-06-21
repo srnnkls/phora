@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use crate::config::transitive::{FetchNode, Instance, TransitiveManifest};
 use crate::config::{
     Binding, Config, DeployMode, HookCommand, Host, ParsedSource, Protocol, Refspec, Remote,
-    SourceMode, Target, admit_transitive_hooks_checked, hook_preimage,
+    SourceMode, Target, admit_transitive_hooks, hook_preimage,
 };
 use crate::error::{Error, Result};
 use crate::kernel::{SourceName, safe_component};
@@ -44,6 +44,19 @@ pub(super) struct TransitiveHookCandidate {
     pub(super) source: String,
     /// The dep's resolved commit; recorded so `phora trust` can diff it against the last trusted commit.
     pub(super) commit: String,
+}
+
+impl From<&TransitiveHookCandidate> for crate::lock::CandidateHookRecord {
+    fn from(c: &TransitiveHookCandidate) -> Self {
+        Self {
+            dep_instance: c.dep_instance.clone(),
+            hook_id: c.hook_id.clone(),
+            preimage: c.preimage.clone(),
+            command: c.command.run.clone(),
+            source: c.source.clone(),
+            commit: c.commit.clone(),
+        }
+    }
 }
 
 /// The transitive pre-pass output: composed targets plus the namespaced source
@@ -195,42 +208,8 @@ fn compose_dep(
         .map(String::as_str)
         .collect();
 
-    let mut source_names: BTreeMap<String, String> = BTreeMap::new();
-    for (inner_name, inner) in &manifest.sources {
-        let parsed = ParsedSource::parse(inner_name, inner).map_err(|e| {
-            Error::Config(format!("imported `{imported}`: source `{inner_name}`: {e}"))
-        })?;
-        if parsed.deploy_mode() == DeployMode::Link {
-            return Err(Error::Config(format!(
-                "imported `{imported}`: source `{inner_name}`: {TRANSITIVE_LINK_REJECTED}"
-            )));
-        }
-        let remote = inner_remote(
-            inner_name,
-            &parsed,
-            ctx.consumer_hosts,
-            ctx.default_protocol,
-        )
-        .map_err(|e| Error::Config(format!("imported `{imported}`: source `{inner_name}`: {e}")))?;
-        reject_escaping_remote(inner_name, &parsed, &remote, depth + 1)?;
-        let composed_by_nested_import =
-            inner.is_transitive() && imported_inner.contains(inner_name.as_str());
-        // Frozen trusts the lock: a never-locked validation-only sub-tree must not be reached out for.
-        if inner.is_transitive() && !composed_by_nested_import && !ctx.frozen.frozen {
-            descend_for_validation(inner_name, &parsed, &remote, ctx, depth + 1)?;
-        }
-        *ctx.counter += 1;
-        let namespaced = namespaced_key(instance, inner_name, *ctx.counter);
-        ctx.graph.remotes.insert(namespaced.clone(), remote);
-        ctx.graph.sources.insert(namespaced.clone(), parsed);
-        ctx.graph
-            .instances
-            .insert(namespaced.clone(), instance.stable_key());
-        // Pinned in the lock for the frozen gate, but bound to no composed target: its children deploy, it only re-exports them.
-        if !composed_by_nested_import {
-            source_names.insert(inner_name.clone(), namespaced);
-        }
-    }
+    let source_names =
+        namespace_dep_sources(instance, imported, manifest, &imported_inner, ctx, depth)?;
 
     for (dep_target_name, dep_target) in &manifest.targets {
         reject_dep_target_path(imported, dep_target_name, &dep_target.path)?;
@@ -276,6 +255,53 @@ fn compose_dep(
         });
     }
     Ok(())
+}
+
+/// A source already composed by a nested import is graphed (so the frozen gate can pin it) but
+/// omitted from the returned bind map: it only re-exports its children, binding no target itself.
+fn namespace_dep_sources(
+    instance: &Instance,
+    imported: &str,
+    manifest: &TransitiveManifest,
+    imported_inner: &HashSet<&str>,
+    ctx: &mut WalkCtx<'_>,
+    depth: usize,
+) -> Result<BTreeMap<String, String>> {
+    let mut source_names: BTreeMap<String, String> = BTreeMap::new();
+    for (inner_name, inner) in &manifest.sources {
+        let parsed = ParsedSource::parse(inner_name, inner).map_err(|e| {
+            Error::Config(format!("imported `{imported}`: source `{inner_name}`: {e}"))
+        })?;
+        if parsed.deploy_mode() == DeployMode::Link {
+            return Err(Error::Config(format!(
+                "imported `{imported}`: source `{inner_name}`: {TRANSITIVE_LINK_REJECTED}"
+            )));
+        }
+        let remote = inner_remote(
+            inner_name,
+            &parsed,
+            ctx.consumer_hosts,
+            ctx.default_protocol,
+        )
+        .map_err(|e| Error::Config(format!("imported `{imported}`: source `{inner_name}`: {e}")))?;
+        reject_escaping_remote(inner_name, &parsed, &remote, depth + 1)?;
+        let composed_by_nested_import =
+            inner.is_transitive() && imported_inner.contains(inner_name.as_str());
+        if inner.is_transitive() && !composed_by_nested_import && !ctx.frozen.frozen {
+            descend_for_validation(inner_name, &parsed, &remote, ctx, depth + 1)?;
+        }
+        *ctx.counter += 1;
+        let namespaced = namespaced_key(instance, inner_name, *ctx.counter);
+        ctx.graph.remotes.insert(namespaced.clone(), remote);
+        ctx.graph.sources.insert(namespaced.clone(), parsed);
+        ctx.graph
+            .instances
+            .insert(namespaced.clone(), instance.stable_key());
+        if !composed_by_nested_import {
+            source_names.insert(inner_name.clone(), namespaced);
+        }
+    }
+    Ok(source_names)
 }
 
 #[expect(
@@ -387,8 +413,6 @@ fn descend_for_validation(
 }
 
 impl FrozenGate<'_> {
-    /// Pre-fetch the commit is unknown, so the match keys on git/ref + scope (nested: any
-    /// instance-keyed entry; depth-1 anchor: the consumer-root entry by name), never commit.
     fn require_pinned<'l>(
         &'l self,
         name: &str,
@@ -401,12 +425,13 @@ impl FrozenGate<'_> {
         }
         let remote_id = crate::source::NormalizedUrl::parse(remote);
         let resolved_ref = refspec.to_string();
+        let nested_suffix = format!("%{name}");
         let entry = self.lock.and_then(|lock| {
             lock.sources.iter().find(|s| {
                 let identity_ok = crate::source::NormalizedUrl::parse(&s.git) == remote_id
                     && s.resolved == resolved_ref;
                 let scope_ok = if depth > 1 {
-                    s.instance.is_some()
+                    s.instance.is_some() && s.name.ends_with(&nested_suffix)
                 } else {
                     s.instance.is_none() && s.name == name
                 };
@@ -427,16 +452,6 @@ fn frozen_transitive_miss(name: &str, depth: usize) -> Error {
     ))
 }
 
-fn reject_frozen_drift(name: &str, locked: &str, resolved: &str, depth: usize) -> Result<()> {
-    if locked == resolved {
-        return Ok(());
-    }
-    Err(Error::Lock(format!(
-        "transitive source `{name}` at depth {depth} drifted from the lock \
-         (locked `{locked}`, resolved `{resolved}`); --frozen refuses to re-resolve it"
-    )))
-}
-
 fn namespaced_key(instance: &Instance, name: &str, counter: usize) -> String {
     format!("{}%{counter}%{name}", instance.stable_key())
 }
@@ -455,7 +470,7 @@ fn admit_hook_candidates(
         return;
     };
     let (candidates, diagnostics) =
-        admit_transitive_hooks_checked(opaque, dep_target_name, composed_name, instance);
+        admit_transitive_hooks(opaque, dep_target_name, composed_name, instance);
     ctx.graph.hook_diagnostics.extend(diagnostics);
     let commit = instance.fetch_node().commit();
     for candidate in candidates {
@@ -565,18 +580,18 @@ fn fetch_manifest(
     frozen: &FrozenGate<'_>,
 ) -> Result<(String, TransitiveManifest)> {
     let refspec = source.refspec();
-    // An unpinned node must hard-error BEFORE any fetch touches its remote.
     let pinned = frozen.require_pinned(name, remote, &refspec, depth)?;
     let source_name = SourceName::trusted(name.to_owned());
-    backend
-        .fetch(&source_name, remote)
-        .map_err(|e| at_depth(name, depth, &e.to_string()))?;
-    let commit = backend
-        .resolve(&source_name, remote, &refspec)
-        .map_err(|e| at_depth(name, depth, &e.to_string()))?;
-    if let Some(locked_commit) = pinned {
-        reject_frozen_drift(name, locked_commit, &commit, depth)?;
-    }
+    let commit = if let Some(locked_commit) = pinned {
+        locked_commit.to_owned()
+    } else {
+        backend
+            .fetch(&source_name, remote)
+            .map_err(|e| at_depth(name, depth, &e.to_string()))?;
+        backend
+            .resolve(&source_name, remote, &refspec)
+            .map_err(|e| at_depth(name, depth, &e.to_string()))?
+    };
     let manifest_text = read_manifest(backend, &source_name, remote, &commit)
         .map_err(|e| at_depth(name, depth, &e.to_string()))?;
     let manifest = TransitiveManifest::parse(&manifest_text)
@@ -907,18 +922,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reject_frozen_drift_rejects_a_drifted_commit_naming_source_and_depth() {
-        reject_frozen_drift("inner", "c0ffee", "c0ffee", 2).expect("matching commits never drift");
-        let err = reject_frozen_drift("inner", "c0ffee", "deadbeef", 2)
-            .expect_err("a resolved commit differing from the lock must be rejected as drift");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("inner") && msg.contains("depth 2") && msg.contains("drifted"),
-            "the drift diagnostic must name the source, depth, and the drift, got: {msg}"
-        );
-    }
-
     // TDEP-HOOK-GATE-001
 
     fn dep_target_with_hooks() -> Target {
@@ -979,13 +982,18 @@ mod tests {
 
         let node = FetchNode::new("https://github.com/dep/nvim.git", "main", "blake3:dead");
         let instance = Instance::new("root", "dep", "anchor", node);
-        let candidates = admit_transitive_hooks(opaque, "editor", "ns%1%editor", &instance);
+        let (candidates, diagnostics) =
+            admit_transitive_hooks(opaque, "editor", "ns%1%editor", &instance);
 
         assert_eq!(
             candidates.len(),
             1,
             "the gate must surface the dep's per-target hook as a candidate even though composition \
              stripped it from the deployed target — GATE owns candidates, dispatch never runs them"
+        );
+        assert!(
+            diagnostics.is_empty(),
+            "a well-formed dep hook must surface no parse diagnostic, got: {diagnostics:?}"
         );
     }
 

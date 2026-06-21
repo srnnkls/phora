@@ -15,42 +15,12 @@ pub struct CandidateHook {
     pub command: HookCommand,
 }
 
-/// Interprets a dep target's retained opaque `[targets.X.hooks]` into candidate hooks
-/// keyed by the confined [`Instance`]. Strip-by-default holds: this produces candidates
-/// only — it runs nothing, retains nothing, and never marks a hook trusted.
+/// Interprets a dep target's retained opaque `[targets.X.hooks]` into candidate hooks keyed by
+/// the confined [`Instance`], surfacing a diagnostic for each sub-table that fails to deserialize
+/// rather than silently dropping it. Strip-by-default holds: this produces candidates only — it
+/// runs nothing, retains nothing, and never marks a hook trusted.
 #[must_use]
 pub fn admit_transitive_hooks(
-    opaque: &toml::Value,
-    dep_target_name: &str,
-    composed_target_name: &str,
-    instance: &Instance,
-) -> Vec<CandidateHook> {
-    let Some(hooks) = opaque.get(dep_target_name) else {
-        return Vec::new();
-    };
-    let Ok(hooks) = hooks.clone().try_into::<TargetHooks>() else {
-        return Vec::new();
-    };
-    let Some(on_change) = hooks.on_change else {
-        return Vec::new();
-    };
-    on_change
-        .into_iter()
-        .map(|command| CandidateHook {
-            dep_instance: instance.stable_key(),
-            hook_id: format!(
-                "{composed_target_name}#on_change#{}",
-                command_discriminator(&command)
-            ),
-            command,
-        })
-        .collect()
-}
-
-/// Like [`admit_transitive_hooks`] but surfaces a diagnostic for each `[targets.X.hooks]`
-/// sub-table that fails to deserialize, instead of silently dropping it.
-#[must_use]
-pub fn admit_transitive_hooks_checked(
     opaque: &toml::Value,
     dep_target_name: &str,
     composed_target_name: &str,
@@ -343,7 +313,7 @@ mod tests {
         let instance = Instance::new("root", "dep", "anchor", node);
 
         let (candidates, diagnostics) =
-            admit_transitive_hooks_checked(&opaque, "editor", "ns%1%editor", &instance);
+            admit_transitive_hooks(&opaque, "editor", "ns%1%editor", &instance);
 
         assert!(
             candidates.is_empty(),
@@ -368,7 +338,7 @@ mod tests {
         let instance = Instance::new("root", "dep", "anchor", node);
 
         let (candidates, diagnostics) =
-            admit_transitive_hooks_checked(&opaque, "editor", "ns%1%editor", &instance);
+            admit_transitive_hooks(&opaque, "editor", "ns%1%editor", &instance);
 
         assert_eq!(
             candidates.len(),
