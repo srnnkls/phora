@@ -13,7 +13,7 @@ use crate::config::{
 };
 use crate::error::{Error, Result};
 use crate::kernel::{SourceName, safe_component};
-use crate::source::{SourceBackend, is_local_path, mirror_path};
+use crate::source::{SourceBackend, is_local_path};
 
 use super::resolved_remotes;
 
@@ -94,9 +94,13 @@ pub(super) fn resolve_transitive_graph(
     frozen: bool,
     effective_lock: Option<&crate::lock::Lock>,
 ) -> Result<ResolvedGraph> {
-    let Some(mirror_root) = backend.mirror_root() else {
+    let has_imports = config
+        .targets
+        .values()
+        .any(|t| t.imports.iter().flatten().next().is_some());
+    if !has_imports {
         return Ok(ResolvedGraph::default());
-    };
+    }
     let remotes = resolved_remotes(config, parsed)?;
     let frozen_gate = FrozenGate {
         frozen,
@@ -115,15 +119,8 @@ pub(super) fn resolve_transitive_graph(
                 Error::Config(format!("no resolved remote for source `{imported}`"))
             })?;
             reject_escaping_remote(imported, source, remote, 1)?;
-            let (commit, manifest) = fetch_manifest(
-                imported,
-                source,
-                remote,
-                backend,
-                mirror_root,
-                1,
-                &frozen_gate,
-            )?;
+            let (commit, manifest) =
+                fetch_manifest(imported, source, remote, backend, 1, &frozen_gate)?;
             let node = FetchNode::new(remote, &source.refspec().to_string(), &commit);
             visited.insert(node.clone());
             let instance = Instance::new("root", imported, anchor_name, node);
@@ -134,7 +131,6 @@ pub(super) fn resolve_transitive_graph(
                 &manifest,
                 &mut WalkCtx {
                     backend,
-                    mirror_root,
                     visited: &mut visited,
                     ancestors: Vec::new(),
                     counter: &mut counter,
@@ -153,7 +149,6 @@ pub(super) fn resolve_transitive_graph(
 
 struct WalkCtx<'a> {
     backend: &'a (dyn SourceBackend + Sync),
-    mirror_root: &'a Path,
     /// `visited`: fetch-closure dedup gating `descend_for_validation` (LOCK-001); per-Instance nested composition intentionally ignores it. `ancestors`: current-path cycle guard.
     visited: &'a mut HashSet<FetchNode>,
     ancestors: Vec<FetchNode>,
@@ -311,7 +306,6 @@ fn compose_nested_imports(
             &inner_parsed,
             &inner_remote,
             ctx.backend,
-            ctx.mirror_root,
             depth + 1,
             ctx.frozen,
         )?;
@@ -361,15 +355,7 @@ fn descend_for_validation(
     depth: usize,
 ) -> Result<()> {
     reject_depth_overflow(name, depth)?;
-    let (commit, manifest) = fetch_manifest(
-        name,
-        parsed,
-        remote,
-        ctx.backend,
-        ctx.mirror_root,
-        depth,
-        ctx.frozen,
-    )?;
+    let (commit, manifest) = fetch_manifest(name, parsed, remote, ctx.backend, depth, ctx.frozen)?;
     let node = FetchNode::new(remote, &parsed.refspec().to_string(), &commit);
     if !ctx.visited.insert(node) {
         return Ok(());
@@ -566,7 +552,6 @@ fn fetch_manifest(
     source: &ParsedSource,
     remote: &str,
     backend: &(dyn SourceBackend + Sync),
-    mirror_root: &Path,
     depth: usize,
     frozen: &FrozenGate<'_>,
 ) -> Result<(String, TransitiveManifest)> {
@@ -583,7 +568,7 @@ fn fetch_manifest(
     if let Some(locked_commit) = pinned {
         reject_frozen_drift(name, locked_commit, &commit, depth)?;
     }
-    let manifest_text = read_manifest(mirror_root, remote, &commit)
+    let manifest_text = read_manifest(backend, &source_name, remote, &commit)
         .map_err(|e| at_depth(name, depth, &e.to_string()))?;
     let manifest = TransitiveManifest::parse(&manifest_text)
         .map_err(|e| at_depth(name, depth, &e.to_string()))?;
@@ -650,24 +635,21 @@ fn is_relative_fs_remote(remote: &str) -> bool {
     !Path::new(remote).is_absolute()
 }
 
-fn read_manifest(mirror_root: &Path, remote: &str, commit: &str) -> Result<String> {
-    let mirror = mirror_path(mirror_root, remote);
-    let repo = gix::open(&mirror)
-        .map_err(|e| Error::Source(format!("open mirror for `{remote}`: {e}")))?;
-    let oid = gix::ObjectId::from_hex(commit.as_bytes())
-        .map_err(|e| Error::Source(format!("parse commit {commit}: {e}")))?;
-    let tree = repo
-        .find_commit(oid)
-        .map_err(|e| Error::Source(format!("commit {commit}: {e}")))?
-        .tree()
-        .map_err(|e| Error::Source(format!("tree of {commit}: {e}")))?;
-    let entry = tree
-        .find_entry("phora.toml")
-        .ok_or_else(|| Error::Config(format!("dependency at `{remote}` has no phora.toml")))?;
-    let object = entry
-        .object()
-        .map_err(|e| Error::Source(format!("read phora.toml at {commit}: {e}")))?;
-    String::from_utf8(object.data.clone())
+fn read_manifest(
+    backend: &(dyn SourceBackend + Sync),
+    source: &SourceName,
+    remote: &str,
+    commit: &str,
+) -> Result<String> {
+    let bytes = backend
+        .read_file_at(source, remote, commit, Path::new("phora.toml"))
+        .map_err(|e| match e {
+            crate::source::SourceError::FileAbsent { .. } => {
+                Error::Config(format!("dependency at `{remote}` has no phora.toml"))
+            }
+            other => Error::Source(other.to_string()),
+        })?;
+    String::from_utf8(bytes)
         .map_err(|e| Error::Config(format!("phora.toml at `{remote}` is not utf-8: {e}")))
 }
 
@@ -694,6 +676,7 @@ mod tests {
     use crate::config::Source;
     use crate::config::{Host, Protocol, transitive::TransitiveManifest};
     use crate::lock::LockedSource;
+    use crate::source::mirror_path;
 
     fn git_source(git: &str) -> ParsedSource {
         let raw: Source = toml::from_str(&format!("git = {git:?}\ntransitive = true\n"))
@@ -1068,7 +1051,8 @@ mod tests {
             String::from_utf8(out.stdout).unwrap().trim().to_owned()
         };
 
-        let text = read_manifest(mirror_root.path(), &url, &commit)
+        let backend = crate::source::GitBackend::new(mirror_root.path().to_path_buf());
+        let text = read_manifest(&backend, &SourceName::trusted("dep"), &url, &commit)
             .expect("read_manifest reads the dep's phora.toml from its git tree");
 
         assert!(
@@ -1079,6 +1063,135 @@ mod tests {
             !text.contains("trusted_hooks") && !text.contains("blake3:evil"),
             "ISOLATION: read_manifest must NEVER fold a dep-shipped phora.lock into the manifest \
              text; a self-trusting dep lock must be entirely ignored, got: {text}"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "fixture setup fails loudly; git CLI is assumed present"
+    )]
+    fn read_file_at_reads_only_phora_toml_never_a_dep_shipped_lock() {
+        use crate::source::GitBackend;
+
+        let src = tempfile::TempDir::new().unwrap();
+        let src_path = src.path();
+        crate::store::assert_git_sandboxed(src_path);
+        git(src_path, &["init", "-b", "main", "."]);
+        git(src_path, &["config", "user.email", "t@example.com"]);
+        git(src_path, &["config", "user.name", "T"]);
+
+        std::fs::write(
+            src_path.join("phora.toml"),
+            b"version = 1\n\n[sources.nvim]\ngit = \"https://github.com/dep/nvim.git\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src_path.join("phora.lock"),
+            b"version = 2\n\n[[trusted_hooks]]\ndep_instance = \"selftrust\"\nhook_id = \"editor#on_change\"\npreimage = \"blake3:evil\"\napproved_at = \"2026-06-20T00:00:00Z\"\n",
+        )
+        .unwrap();
+        git(src_path, &["add", "-A"]);
+        git(src_path, &["commit", "-m", "dep with self-trusting lock"]);
+
+        let git_dir = tempfile::TempDir::new().unwrap();
+        let url = src_path.to_string_lossy().into_owned();
+        let backend = GitBackend::new(git_dir.path().to_path_buf());
+        backend
+            .fetch(&crate::kernel::SourceName::trusted("dep"), &url)
+            .expect("fetch builds the bare mirror the offline read targets");
+        let commit = backend
+            .resolve(
+                &crate::kernel::SourceName::trusted("dep"),
+                &url,
+                &crate::config::Refspec::Branch("main".to_owned()),
+            )
+            .expect("resolve main to a commit");
+
+        let manifest_bytes = backend
+            .read_file_at(
+                &crate::kernel::SourceName::trusted("dep"),
+                &url,
+                &commit,
+                Path::new("phora.toml"),
+            )
+            .expect("read_file_at returns the dep's phora.toml from the fetched mirror");
+        let text = String::from_utf8(manifest_bytes).expect("phora.toml is utf-8");
+
+        assert!(
+            text.contains("[sources.nvim]"),
+            "read_file_at(phora.toml) must return the dep manifest content, got: {text}"
+        );
+        assert!(
+            !text.contains("trusted_hooks") && !text.contains("blake3:evil"),
+            "ISOLATION: read_manifest refactored onto read_file_at(phora.toml) must NEVER reach a \
+             dep-shipped phora.lock; the self-trusting lock must be unreachable, got: {text}"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "fixture setup fails loudly; git CLI is assumed present"
+    )]
+    fn read_manifest_says_no_phora_toml_only_when_genuinely_absent() {
+        use crate::source::GitBackend;
+
+        let src = tempfile::TempDir::new().unwrap();
+        let src_path = src.path();
+        crate::store::assert_git_sandboxed(src_path);
+        git(src_path, &["init", "-b", "main", "."]);
+        git(src_path, &["config", "user.email", "t@example.com"]);
+        git(src_path, &["config", "user.name", "T"]);
+        std::fs::write(src_path.join("README.md"), b"hi\n").unwrap();
+        git(src_path, &["add", "-A"]);
+        git(src_path, &["commit", "-m", "no manifest"]);
+
+        let git_dir = tempfile::TempDir::new().unwrap();
+        let url = src_path.to_string_lossy().into_owned();
+        let backend = GitBackend::new(git_dir.path().to_path_buf());
+        let name = SourceName::trusted("dep");
+        backend.fetch(&name, &url).unwrap();
+        let commit = backend
+            .resolve(
+                &name,
+                &url,
+                &crate::config::Refspec::Branch("main".to_owned()),
+            )
+            .unwrap();
+
+        let absent = read_manifest(&backend, &name, &url, &commit)
+            .expect_err("a dep without phora.toml must error");
+        assert!(
+            absent.to_string().contains("no phora.toml"),
+            "a genuinely-absent phora.toml must keep the 'no phora.toml' diagnostic, got: {absent}"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "fixture setup fails loudly; git CLI is assumed present"
+    )]
+    fn read_manifest_propagates_underlying_failure_instead_of_no_phora_toml() {
+        use crate::source::GitBackend;
+
+        let git_dir = tempfile::TempDir::new().unwrap();
+        let backend = GitBackend::new(git_dir.path().to_path_buf());
+        let name = SourceName::trusted("dep");
+
+        let err = read_manifest(
+            &backend,
+            &name,
+            "https://github.com/never/fetched.git",
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        )
+        .expect_err("reading from a mirror that was never fetched must error");
+
+        assert!(
+            !err.to_string().contains("no phora.toml"),
+            "a mirror-open/git failure must NOT be masked as 'no phora.toml'; the underlying error \
+             must surface, got: {err}"
         );
     }
 }

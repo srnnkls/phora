@@ -314,3 +314,131 @@ pub(super) fn state_label(state: &ArtifactState) -> &'static str {
         ArtifactState::Linked => "linked",
     }
 }
+
+/// Summarizes what a dep's root `phora.toml` would contribute if imported: its
+/// targets (with relative paths), any stripped/inert hooks, and the `imports` +
+/// `phora trust` opt-in. Empty for a manifest declaring neither targets nor sources.
+#[must_use]
+pub(super) fn render_add_contribution(
+    name: &str,
+    manifest: &crate::config::transitive::TransitiveManifest,
+) -> String {
+    if manifest.targets.is_empty() && manifest.sources.is_empty() {
+        return String::new();
+    }
+
+    let hooked: std::collections::BTreeSet<&str> = manifest
+        .hooks()
+        .and_then(toml::Value::as_table)
+        .map(|t| t.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Source '{name}' ships a phora.toml that would contribute:"
+    );
+    for (target, config) in &manifest.targets {
+        let _ = writeln!(out, "  [targets.{target}] -> {}", config.path.display());
+        if hooked.contains(target.as_str()) {
+            let _ = writeln!(
+                out,
+                "    note: carries a hook, stripped and inert until you `phora trust` it"
+            );
+        }
+    }
+    let _ = writeln!(
+        out,
+        "Opt in with `imports = [\"{name}\"]`, then `phora trust` to admit any hooks."
+    );
+    out
+}
+
+#[cfg(test)]
+mod contribution_tests {
+    use crate::config::transitive::TransitiveManifest;
+
+    fn manifest(text: &str) -> TransitiveManifest {
+        TransitiveManifest::parse(text).expect("dep manifest parses")
+    }
+
+    #[test]
+    fn contribution_summary_lists_targets_with_relative_paths() {
+        let dep = manifest(
+            "version = 1\n\n\
+             [sources.nvim]\ngit = \"https://github.com/dep/nvim.git\"\n\n\
+             [targets.editor]\npath = \"config/nvim\"\n\n\
+             [targets.shell]\npath = \"config/zsh\"\n",
+        );
+
+        let summary = super::render_add_contribution("dots", &dep);
+
+        assert!(
+            summary.contains("editor") && summary.contains("config/nvim"),
+            "the summary must list target `editor` with its relative path `config/nvim`, got:\n{summary}"
+        );
+        assert!(
+            summary.contains("shell") && summary.contains("config/zsh"),
+            "the summary must list target `shell` with its relative path `config/zsh`, got:\n{summary}"
+        );
+    }
+
+    #[test]
+    fn contribution_summary_strips_hooks_and_notes_they_are_inert() {
+        let dep = manifest(
+            "version = 1\n\n\
+             [sources.nvim]\ngit = \"https://github.com/dep/nvim.git\"\n\n\
+             [targets.editor]\npath = \"config/nvim\"\n\n\
+             [targets.editor.hooks]\non_change = \"./install.sh\"\n",
+        );
+
+        let summary = super::render_add_contribution("dots", &dep);
+
+        assert!(
+            summary.to_lowercase().contains("hook"),
+            "a dep declaring a per-target hook must be surfaced as carrying a stripped hook, got:\n{summary}"
+        );
+        assert!(
+            summary.to_lowercase().contains("inert")
+                || summary.to_lowercase().contains("trust")
+                || summary.to_lowercase().contains("stripped"),
+            "the summary must note the hook is stripped/inert until trusted, got:\n{summary}"
+        );
+        assert!(
+            !summary.contains("./install.sh"),
+            "the contribution summary must NOT echo the hook command verbatim (it stays opaque/inert), got:\n{summary}"
+        );
+    }
+
+    #[test]
+    fn contribution_summary_suggests_the_imports_and_trust_opt_in() {
+        let dep = manifest(
+            "version = 1\n\n\
+             [sources.nvim]\ngit = \"https://github.com/dep/nvim.git\"\n\n\
+             [targets.editor]\npath = \"config/nvim\"\n",
+        );
+
+        let summary = super::render_add_contribution("dots", &dep);
+
+        assert!(
+            summary.contains("imports"),
+            "the summary must point at the `imports = [...]` opt-in path, got:\n{summary}"
+        );
+        assert!(
+            summary.contains("trust"),
+            "the summary must point at `phora trust` as the explicit opt-in, got:\n{summary}"
+        );
+    }
+
+    #[test]
+    fn contribution_summary_is_empty_for_a_manifest_with_no_targets_or_sources() {
+        let dep = manifest("version = 1\n");
+
+        let summary = super::render_add_contribution("dots", &dep);
+
+        assert!(
+            !summary.contains("imports") && !summary.to_lowercase().contains("trust"),
+            "a non-transitive dep (no targets/sources) must NOT produce a contribution/opt-in summary, got:\n{summary}"
+        );
+    }
+}

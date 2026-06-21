@@ -103,7 +103,71 @@ pub(super) fn run_add(
     } else {
         render::print_added_declared(&name, &description);
     }
+
+    if parsed.path.is_none() {
+        print_add_contribution(&name);
+    }
     Ok(())
+}
+
+/// Surfaces what an added source's root `phora.toml` would contribute, when one
+/// exists in the cache or can be fetched. A source without a phora.toml stays
+/// silent (it behaves exactly as a plain `add`); a genuine fetch/parse failure
+/// warns to stderr instead of vanishing.
+fn print_add_contribution(name: &str) {
+    use crate::source::SourceError;
+
+    let Some((backend, source_name, remote, refspec)) = add_contribution_target(name) else {
+        return;
+    };
+    match backend.fetch_root_manifest(&source_name, &remote, &refspec) {
+        Ok(bytes) => print_contribution_from_bytes(name, &bytes),
+        Err(SourceError::FileAbsent { .. }) => {}
+        Err(e) => eprintln!("note: could not inspect {name}'s phora.toml: {e}"),
+    }
+}
+
+fn add_contribution_target(
+    name: &str,
+) -> Option<(
+    crate::source::GitBackend,
+    crate::kernel::SourceName,
+    String,
+    crate::config::Refspec,
+)> {
+    use crate::source::{GitBackend, Protocol as SourceProtocol};
+
+    let config = load_config().ok()?;
+    let sources = config.parsed_sources().ok()?;
+    let source = sources.get(name)?;
+    if source.mode() != crate::config::SourceMode::Git {
+        return None;
+    }
+    let protocol = source
+        .protocol()
+        .or(config.protocol)
+        .unwrap_or(SourceProtocol::Https);
+    let remote = source.resolved_remote(&config.hosts, protocol).ok()?;
+    let git_dir = crate::paths::cache_root().map(|c| c.join("git")).ok()?;
+    let backend = GitBackend::new(git_dir);
+    let source_name = crate::kernel::SourceName::trusted(name.to_owned());
+    Some((backend, source_name, remote, source.refspec()))
+}
+
+fn print_contribution_from_bytes(name: &str, bytes: &[u8]) {
+    use crate::config::transitive::TransitiveManifest;
+
+    let text = match std::str::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("note: could not inspect {name}'s phora.toml: {e}");
+            return;
+        }
+    };
+    match TransitiveManifest::parse(text) {
+        Ok(manifest) => print!("{}", render::render_add_contribution(name, &manifest)),
+        Err(e) => eprintln!("note: could not inspect {name}'s phora.toml: {e}"),
+    }
 }
 
 /// A local path resolves to `path =` (local), not forge shorthand — `add` must agree with the config layer, where bare `path =` already means local.
