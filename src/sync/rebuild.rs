@@ -7,7 +7,7 @@ use crate::kernel::{ArtifactName, Selection, SourceName};
 use crate::lock::{Lock, ref_discriminator};
 use crate::source::{ExportRequest, SourceBackend};
 use crate::store::{
-    ArtifactKey, MAP_LAYOUT, ManifestFile, ProjectedRecord, Registry, RegistryRecord,
+    ArtifactKey, MAP_LAYOUT, ManifestFile, ProjectedRecord, RecordKind, Registry, RegistryRecord,
 };
 
 use super::discover::discover_artifacts_for_source;
@@ -293,6 +293,7 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         } else {
             format!("{layout_kind:?}").to_lowercase()
         },
+        kind: RecordKind::Dir,
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
         files,
@@ -329,6 +330,7 @@ fn rebuild_linked(
         } else {
             format!("{layout_kind:?}").to_lowercase()
         },
+        kind: RecordKind::Dir,
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
         files: vec![],

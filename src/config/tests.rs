@@ -3532,6 +3532,7 @@ mod per_binding_refinement {
             digest: "blake3:00".to_owned(),
             projected_at: "2026-01-31T12:34:56Z".to_owned(),
             layout: "flat".to_owned(),
+            kind: crate::store::RecordKind::Dir,
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![],
