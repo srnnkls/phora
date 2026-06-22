@@ -115,6 +115,8 @@ pub struct Target {
     pub imports: Option<Vec<String>>,
     #[serde(default)]
     pub take: BTreeMap<String, Vec<TakeEntry>>,
+    #[serde(default)]
+    pub collapse: BTreeMap<String, bool>,
     /// Composition-only anchor every destination must stay under; `Some` iff this is a composed dep target.
     #[serde(skip)]
     pub confine: Option<PathBuf>,
@@ -183,6 +185,8 @@ pub struct Binding {
     pub template: Option<TemplateOptIn>,
     #[serde(default)]
     pub take: Option<Vec<TakeEntry>>,
+    #[serde(default)]
+    pub collapse: Option<bool>,
 }
 
 impl Binding {
@@ -254,6 +258,7 @@ pub struct ResolvedBinding<'a> {
     pub effective_ref: Refspec,
     pub template_opt_in: TemplateOptIn,
     pub take: Option<&'a [TakeEntry]>,
+    pub collapse: Option<bool>,
 }
 
 impl ResolvedBinding<'_> {
@@ -344,6 +349,9 @@ impl Target {
         if !local.take.is_empty() {
             self.take = local.take;
         }
+        if !local.collapse.is_empty() {
+            self.collapse = local.collapse;
+        }
         self
     }
 
@@ -399,6 +407,7 @@ fn resolve_binding<'a, S: SourceFields>(
         effective_ref: binding_refspec(binding).unwrap_or_else(|| source.intrinsic_refspec()),
         template_opt_in: binding.template_opt_in(),
         take: binding.take.as_deref(),
+        collapse: binding.collapse,
     })
 }
 
@@ -745,6 +754,146 @@ mod tests {
             matches!(&take[1], TakeEntry::Rename { src, dest } if src == "b/X.md" && dest == "b/x.md"),
             "second resolved take entry is a rename-map; got: {:?}",
             take[1]
+        );
+    }
+
+    #[test]
+    fn binding_collapse_true_parses_to_some_true() {
+        let b = binding("source = \"s\"\ncollapse = true\n");
+        assert_eq!(
+            b.collapse,
+            Some(true),
+            "`collapse = true` on a binding parses to Some(true); got: {:?}",
+            b.collapse
+        );
+    }
+
+    #[test]
+    fn binding_collapse_false_parses_to_some_false() {
+        let b = binding("source = \"s\"\ncollapse = false\n");
+        assert_eq!(
+            b.collapse,
+            Some(false),
+            "`collapse = false` on a binding parses to Some(false); got: {:?}",
+            b.collapse
+        );
+    }
+
+    #[test]
+    fn omitted_binding_collapse_is_none() {
+        let b = binding("source = \"s\"\n");
+        assert_eq!(
+            b.collapse, None,
+            "an omitted `collapse` parses to None (algorithmic default); got: {:?}",
+            b.collapse
+        );
+    }
+
+    #[test]
+    fn resolved_binding_surfaces_the_binding_collapse() {
+        let source = source_with(None, &[], &[]);
+        let mut all = BTreeMap::new();
+        all.insert("s".to_string(), source);
+
+        let b = binding("source = \"s\"\ncollapse = false\n");
+        let resolved = resolve_binding("s", &b, &all).expect("binding resolves");
+        assert_eq!(
+            resolved.collapse,
+            Some(false),
+            "ResolvedBinding surfaces the binding `collapse`; got: {:?}",
+            resolved.collapse
+        );
+    }
+
+    #[test]
+    fn resolved_binding_collapse_is_none_when_omitted() {
+        let source = source_with(None, &[], &[]);
+        let mut all = BTreeMap::new();
+        all.insert("s".to_string(), source);
+
+        let b = binding("source = \"s\"\n");
+        let resolved = resolve_binding("s", &b, &all).expect("binding resolves");
+        assert_eq!(
+            resolved.collapse, None,
+            "an omitted `collapse` stays None through resolution; got: {:?}",
+            resolved.collapse
+        );
+    }
+
+    #[test]
+    fn mount_collapse_table_parses_anchor_keyed_while_imports_stays_string_list() {
+        let target: Target = toml::from_str(
+            "path = \"~/dst\"\n\
+             imports = [\"dep-a\", \"dep-b\"]\n\
+             [collapse]\n\
+             \"anchor/one\" = true\n\
+             \"anchor/two\" = false\n",
+        )
+        .expect("a target with a mount collapse table deserializes");
+
+        assert_eq!(
+            target.imports,
+            Some(vec!["dep-a".to_string(), "dep-b".to_string()]),
+            "`imports` stays a refinement-free Vec<String>; got: {:?}",
+            target.imports
+        );
+        assert_eq!(
+            target.collapse.get("anchor/one"),
+            Some(&true),
+            "the mount collapse table is keyed by anchor; got: {:?}",
+            target.collapse
+        );
+        assert_eq!(
+            target.collapse.get("anchor/two"),
+            Some(&false),
+            "anchor/two present in the collapse table; got: {:?}",
+            target.collapse
+        );
+    }
+
+    #[test]
+    fn omitted_mount_collapse_table_is_empty() {
+        let target: Target =
+            toml::from_str("path = \"~/dst\"\n").expect("a bare target deserializes");
+        assert!(
+            target.collapse.is_empty(),
+            "an omitted mount collapse table defaults to empty; got: {:?}",
+            target.collapse
+        );
+    }
+
+    fn target_toml(body: &str) -> Target {
+        toml::from_str::<Target>(body).expect("target DTO deserializes")
+    }
+
+    #[test]
+    fn merge_non_empty_local_collapse_table_replaces_base() {
+        let base = target_toml("path = \"~/dst\"\n[collapse]\n\"anchor/base\" = true\n");
+        let local = target_toml("path = \"~/dst\"\n[collapse]\n\"anchor/local\" = false\n");
+        let merged = base.merged_with(local);
+        assert_eq!(
+            merged.collapse.get("anchor/local"),
+            Some(&false),
+            "a non-empty local collapse table replaces the base wholesale; got: {:?}",
+            merged.collapse
+        );
+        assert!(
+            !merged.collapse.contains_key("anchor/base"),
+            "the base collapse entry must not survive a non-empty local table; got: {:?}",
+            merged.collapse
+        );
+    }
+
+    #[test]
+    fn merge_empty_local_collapse_table_leaves_base_intact() {
+        let base = target_toml("path = \"~/dst\"\n[collapse]\n\"anchor/base\" = true\n");
+        let local = target_toml("path = \"~/dst\"\n");
+        let merged = base.merged_with(local);
+        assert_eq!(
+            merged.collapse.get("anchor/base"),
+            Some(&true),
+            "an empty local collapse table leaves the base collapse table intact; got: {:?}",
+            merged.collapse
         );
     }
 
