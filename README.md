@@ -690,12 +690,12 @@ source that is itself a phora project — it ships its own `phora.toml` with its
 your config, you import it and phora composes its targets straight into your
 workspace.
 
-Take [`srnnkls/tropos`](https://github.com/srnnkls/tropos), a Claude Code
-configuration. It doesn't reinvent language-specific coding guidelines — it leans on
-a separate repo, [`srnnkls/loqui`](https://github.com/srnnkls/loqui), for those, and
-declares loqui as one of its own sources. Mark tropos `transitive = true`, import
-it, and phora follows that edge: you asked for one repo and got its dependency wired
-up for free.
+Take [`srnnkls/tropos`](https://github.com/srnnkls/tropos), a toolkit of
+agent-harness artifacts — skills, commands, agents, workflows. It doesn't reinvent
+language-specific coding guidelines, though; it leans on a separate repo,
+[`srnnkls/loqui`](https://github.com/srnnkls/loqui), for those, and declares loqui as
+one of its own sources. Mark tropos `transitive = true`, import it, and phora follows
+that edge: you asked for one repo and got its dependency wired up for free.
 
 ```toml
 # your phora.toml
