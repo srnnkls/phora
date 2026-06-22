@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::error::{Error, Result};
 use crate::lock::{Lock, merge_locks};
-use crate::paths::cache_root;
+use crate::paths::cache_root_for;
 use crate::sync::{ConflictResolver, SyncInput, SyncOutput, sync};
 
 use super::{
@@ -37,8 +37,9 @@ pub(super) fn run_sync(
     }
 
     let effective = crate::config::merge_configs(base.clone(), local.clone());
-    let backend = build_router(&effective, cache_root()?.join("git"))?;
-    let registry = open_project_registry()?;
+    let cache_git = cache_root_for(effective.paths.cache.as_deref(), &cwd)?.join("git");
+    let backend = build_router(&effective, cache_git)?;
+    let registry = open_project_registry(&effective)?;
     let _guard = registry.lock_exclusive()?;
     let interactive = std::io::stdin().is_terminal();
     let resolver = TtyResolver;
@@ -123,7 +124,7 @@ pub(super) fn run_rebuild_registry() -> Result<()> {
     let config = crate::config::merge_configs(base, local);
     config.validate()?;
 
-    let registry = open_project_registry()?;
+    let registry = open_project_registry(&config)?;
     let _guard = registry.lock_exclusive()?;
 
     let (base_lock, local_lock) = load_locks(&cwd)?;
@@ -133,7 +134,8 @@ pub(super) fn run_rebuild_registry() -> Result<()> {
             .ok_or_else(|| Error::Lock("no lock file found; run sync first".to_owned()))?,
     };
 
-    let backend = build_router(&config, cache_root()?.join("git"))?;
+    let cache_git = cache_root_for(config.paths.cache.as_deref(), &cwd)?.join("git");
+    let backend = build_router(&config, cache_git)?;
     let report = crate::sync::rebuild_registry(&config, &lock, &backend, &registry)?;
 
     println!("reconstructed {}", report.reconstructed.len());

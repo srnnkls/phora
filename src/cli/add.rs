@@ -148,7 +148,10 @@ fn add_contribution_target(
         .or(config.protocol)
         .unwrap_or(SourceProtocol::Https);
     let remote = source.resolved_remote(&config.hosts, protocol).ok()?;
-    let git_dir = crate::paths::cache_root().map(|c| c.join("git")).ok()?;
+    let cwd = std::env::current_dir().ok()?;
+    let git_dir = crate::paths::cache_root_for(config.paths.cache.as_deref(), &cwd)
+        .map(|c| c.join("git"))
+        .ok()?;
     let backend = GitBackend::new(git_dir);
     let source_name = crate::kernel::SourceName::trusted(name.to_owned());
     Some((backend, source_name, remote, source.refspec()))

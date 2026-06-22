@@ -4,9 +4,10 @@ use std::path::{Component, Path, PathBuf};
 
 use unicode_normalization::UnicodeNormalization;
 
+use crate::config::Paths;
 use crate::error::{Error, Result};
 use crate::kernel::safe_component;
-use crate::paths::{cache_root, state_root};
+use crate::paths::{cache_root_for, state_root_for};
 
 /// Named diagnostics owned by confinement; tests assert these exact phrases.
 const ANCHOR_SYMLINK: &str = "anchor ancestor is a symlink";
@@ -19,7 +20,7 @@ pub(super) struct ProtectedPathSet {
 }
 
 impl ProtectedPathSet {
-    pub(super) fn resolve(cwd: &Path) -> Result<Self> {
+    pub(super) fn resolve(paths: &Paths, cwd: &Path) -> Result<Self> {
         let mut members = vec![
             cwd.join("phora.toml"),
             cwd.join("phora.local.toml"),
@@ -27,8 +28,8 @@ impl ProtectedPathSet {
             cwd.join("phora.local.lock"),
             cwd.join(".git"),
         ];
-        members.push(state_root()?.join("projects"));
-        members.push(cache_root()?);
+        members.push(state_root_for(paths.state.as_deref(), cwd)?.join("projects"));
+        members.push(cache_root_for(paths.cache.as_deref(), cwd)?);
         Ok(Self {
             cwd: cwd.to_path_buf(),
             members: members
@@ -201,7 +202,7 @@ mod tests {
     use super::*;
 
     fn protected(cwd: &Path) -> ProtectedPathSet {
-        ProtectedPathSet::resolve(cwd).expect("resolve protected set")
+        ProtectedPathSet::resolve(&Paths::default(), cwd).expect("resolve protected set")
     }
 
     #[test]

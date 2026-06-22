@@ -88,7 +88,8 @@ struct SyncFixture {
 }
 
 fn test_protected(cwd: &Path) -> super::confine::ProtectedPathSet {
-    super::confine::ProtectedPathSet::resolve(cwd).expect("protected set")
+    super::confine::ProtectedPathSet::resolve(&crate::config::Paths::default(), cwd)
+        .expect("protected set")
 }
 
 fn linked_flat_record(target: &str, source: &str, artifact: &str) -> RegistryRecord {

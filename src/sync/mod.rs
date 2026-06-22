@@ -344,7 +344,7 @@ pub fn sync(
     let journal = Journal::open(&registry.locks_dir())?;
     let cwd = std::env::current_dir()
         .map_err(|e| Error::Sync(format!("resolve current dir for confinement: {e}")))?;
-    let protected = confine::ProtectedPathSet::resolve(&cwd)?;
+    let protected = confine::ProtectedPathSet::resolve(&effective_config.paths, &cwd)?;
 
     sweep_target_parents(&effective_config, &journal, registry)?;
 

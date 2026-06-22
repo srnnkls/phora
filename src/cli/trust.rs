@@ -18,10 +18,12 @@ use super::{load_config, open_project_registry};
 const UNRESOLVED_PREIMAGE: &str = "";
 
 pub(super) fn run_trust(source: Option<&str>, list: bool, revoke: bool) -> Result<()> {
-    let registry = open_project_registry()?;
+    let config = load_config()?;
+    let registry = open_project_registry(&config)?;
     let _guard = registry.lock_exclusive()?;
 
     let cwd = std::env::current_dir()?;
+    let cache_git = crate::paths::cache_root_for(config.paths.cache.as_deref(), &cwd)?.join("git");
     let (mut base_lock, local_lock) = super::sync::load_locks(&cwd)?;
 
     if revoke {
@@ -31,8 +33,8 @@ pub(super) fn run_trust(source: Option<&str>, list: bool, revoke: bool) -> Resul
         return revoke_source_hooks(&cwd, base_lock.as_mut(), local_lock.as_ref(), source);
     }
 
-    let candidates = discover_candidates(base_lock.as_ref(), source)?;
-    let differ = TrustDiff::open(base_lock.as_ref());
+    let candidates = discover_candidates(&config, &cwd, base_lock.as_ref(), source)?;
+    let differ = TrustDiff::open(&cache_git, base_lock.as_ref());
     if list || !std::io::stdin().is_terminal() {
         print_candidates(&candidates, &differ);
         return Ok(());
@@ -50,10 +52,8 @@ struct TrustDiff {
 }
 
 impl TrustDiff {
-    fn open(base_lock: Option<&Lock>) -> Self {
-        let backend = crate::paths::cache_root()
-            .ok()
-            .map(|root| GitBackend::new(root.join("git")));
+    fn open(cache_git: &std::path::Path, base_lock: Option<&Lock>) -> Self {
+        let backend = Some(GitBackend::new(cache_git.to_path_buf()));
         let (trusted_hooks, dep_urls) = base_lock.map_or_else(
             || (Vec::new(), Vec::new()),
             |lock| {
@@ -185,6 +185,8 @@ fn revoke_source_hooks(
 }
 
 fn discover_candidates(
+    config: &crate::config::Config,
+    cwd: &std::path::Path,
     base_lock: Option<&Lock>,
     source: Option<&str>,
 ) -> Result<Vec<CandidateHookRecord>> {
@@ -198,15 +200,18 @@ fn discover_candidates(
         }
     }
     match source {
-        Some(name) => discover_via_fetch(name),
+        Some(name) => discover_via_fetch(config, cwd, name),
         None => Ok(Vec::new()),
     }
 }
 
-fn discover_via_fetch(name: &str) -> Result<Vec<CandidateHookRecord>> {
+fn discover_via_fetch(
+    config: &crate::config::Config,
+    cwd: &std::path::Path,
+    name: &str,
+) -> Result<Vec<CandidateHookRecord>> {
     use crate::source::{GitBackend, Protocol as SourceProtocol, SourceError};
 
-    let config = load_config()?;
     let sources = config.parsed_sources()?;
     let Some(source) = sources.get(name) else {
         return Ok(Vec::new());
@@ -221,7 +226,7 @@ fn discover_via_fetch(name: &str) -> Result<Vec<CandidateHookRecord>> {
     let remote = source
         .resolved_remote(&config.hosts, protocol)
         .map_err(|e| Error::Config(format!("source `{name}`: {e}")))?;
-    let git_dir = crate::paths::cache_root()?.join("git");
+    let git_dir = crate::paths::cache_root_for(config.paths.cache.as_deref(), cwd)?.join("git");
     let backend = GitBackend::new(git_dir);
     let source_name = crate::kernel::SourceName::trusted(name.to_owned());
     let bytes = match backend.fetch_root_manifest(&source_name, &remote, &source.refspec()) {
@@ -381,7 +386,7 @@ mod tests {
     }
 
     fn no_diff() -> TrustDiff {
-        TrustDiff::open(None)
+        TrustDiff::open(std::path::Path::new("/nonexistent/git"), None)
     }
 
     struct Canned(bool);
