@@ -5757,3 +5757,267 @@ mod keyed_bindings {
         }
     }
 }
+
+mod parse_time_structural_validation {
+    use crate::config::Config;
+    use crate::diagnostic::{MATCHED_AGAINST, REMEDY, SELECTION};
+    use crate::error::Error;
+
+    fn parse_err(toml: &str) -> String {
+        match Config::parse(toml) {
+            Ok(_) => panic!("Config::parse must reject:\n{toml}"),
+            Err(Error::Config(msg)) => msg,
+            Err(other) => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    fn flat_bind_with(scope_key: &str) -> String {
+        format!(
+            "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\n\
+             [targets.t.sources]\ndotfiles = {{ {scope_key} }}\n"
+        )
+    }
+
+    fn assert_structured_diagnostic(msg: &str) {
+        for phrase in [SELECTION, MATCHED_AGAINST, REMEDY] {
+            assert!(
+                msg.contains(phrase),
+                "binding-scope rejection must render the STRUCTURED SelectionDiagnostic phrase \
+                 `{phrase}` (always-rendered section, not the raw serde `unknown field` message); \
+                 got:\n{msg}"
+            );
+        }
+        assert!(
+            !msg.contains("unknown field"),
+            "the rejection must be the structured diagnostic, NOT the raw serde \
+             `unknown field` error; got:\n{msg}"
+        );
+    }
+
+    fn assert_binding_context(msg: &str) {
+        assert!(
+            msg.contains('t'),
+            "the diagnostic must carry the target name `t` so it is pinned to the right \
+             binding, not a generic string; got:\n{msg}"
+        );
+        assert!(
+            msg.contains("dotfiles"),
+            "the diagnostic must name the binding/source `dotfiles` from the fixture so a \
+             hand-written generic string cannot pass; got:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn binding_include_is_rejected_with_structured_diagnostic_pointing_at_source_offer() {
+        let msg = parse_err(&flat_bind_with("include = [\"editor/**\"]"));
+        assert_structured_diagnostic(&msg);
+        assert_binding_context(&msg);
+        assert!(
+            msg.contains("include"),
+            "the diagnostic must name the offending `include` key; got:\n{msg}"
+        );
+        assert!(
+            msg.contains("source"),
+            "the remedy must redirect the scope key to the SOURCE offer; got:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn binding_exclude_is_rejected_with_structured_diagnostic_pointing_at_source_offer() {
+        let msg = parse_err(&flat_bind_with("exclude = [\"**/*.swp\"]"));
+        assert_structured_diagnostic(&msg);
+        assert_binding_context(&msg);
+        assert!(
+            msg.contains("exclude"),
+            "the diagnostic must name the offending `exclude` key; got:\n{msg}"
+        );
+        assert!(
+            msg.contains("source"),
+            "the remedy must redirect `exclude` to the SOURCE offer; got:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn binding_root_is_rejected_with_structured_diagnostic_pointing_at_source_offer() {
+        let msg = parse_err(&flat_bind_with("root = \"editor\""));
+        assert_structured_diagnostic(&msg);
+        assert_binding_context(&msg);
+        assert!(
+            msg.contains("root"),
+            "the diagnostic must name the offending `root` key; got:\n{msg}"
+        );
+        assert!(
+            msg.contains("source"),
+            "the remedy must redirect `root` to the SOURCE offer; got:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn binding_map_is_rejected_with_structured_diagnostic_pointing_at_take_rename() {
+        let msg = parse_err(&flat_bind_with("map = { \"a/X.md\" = \"a/x.md\" }"));
+        assert_structured_diagnostic(&msg);
+        assert_binding_context(&msg);
+        assert!(
+            msg.contains("map"),
+            "the diagnostic must name the offending `map` key; got:\n{msg}"
+        );
+        assert!(
+            msg.contains("take"),
+            "the remedy for `map` must redirect to the target `take` rename; got:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn flat_bind_take_rename_with_two_pairs_is_rejected() {
+        let msg = parse_err(
+            "version = 1\n\n[sources.s]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\n\
+             [targets.t.sources]\n\
+             s = { take = [{ \"a/X.md\" = \"a/x.md\", \"c/Y.md\" = \"c/y.md\" }] }\n",
+        );
+        assert!(
+            msg.contains("c/Y.md")
+                || msg.to_lowercase().contains("one")
+                || msg.to_lowercase().contains("single")
+                || msg.to_lowercase().contains("pair"),
+            "a multi-pair rename entry must be a hard error that does NOT silently drop the \
+             second pair; the message must signal the arity violation (name the dropped pair, \
+             or say one/single/pair); got:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn flat_bind_take_rename_with_single_pair_parses() {
+        Config::parse(
+            "version = 1\n\n[sources.s]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\n\
+             [targets.t.sources]\ns = { take = [{ \"a/X.md\" = \"a/x.md\" }] }\n",
+        )
+        .expect(
+            "a single-pair rename entry is well-formed and must still parse (no over-rejection)",
+        );
+    }
+
+    #[test]
+    fn mount_take_table_rename_with_two_pairs_is_rejected() {
+        let msg = parse_err(
+            "version = 1\n\n[sources.dep]\ngit = \"g\"\ntransitive = true\n\n\
+             [targets.t]\npath = \"~/x\"\nimports = [\"dep\"]\n\n\
+             [targets.t.take]\n\
+             \"dep\" = [{ \"a/X.md\" = \"a/x.md\", \"c/Y.md\" = \"c/y.md\" }]\n",
+        );
+        assert!(
+            msg.contains("c/Y.md")
+                || msg.to_lowercase().contains("one")
+                || msg.to_lowercase().contains("single")
+                || msg.to_lowercase().contains("pair"),
+            "the arity rule must apply uniformly to the mount take table; a two-pair rename \
+             entry under [targets.t.take] must be rejected; got:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn mount_take_table_rename_with_single_pair_parses() {
+        Config::parse(
+            "version = 1\n\n[sources.dep]\ngit = \"g\"\ntransitive = true\n\n\
+             [targets.t]\npath = \"~/x\"\nimports = [\"dep\"]\n\n\
+             [targets.t.take]\n\"dep\" = [{ \"a/X.md\" = \"a/x.md\" }]\n",
+        )
+        .expect("a single-pair mount rename is well-formed and must still parse");
+    }
+
+    #[test]
+    fn flat_bind_take_with_malformed_glob_is_rejected() {
+        let msg = parse_err(
+            "version = 1\n\n[sources.s]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\n\
+             [targets.t.sources]\ns = { take = [\"[\"] }\n",
+        );
+        assert!(
+            msg.contains("take")
+                && (msg.contains('[')
+                    || msg.to_lowercase().contains("glob")
+                    || msg.to_lowercase().contains("pattern")),
+            "an unterminated character class in a `take` entry must be validated as a glob: the \
+             message must name `take` AND reference the offending `[` or glob/pattern syntax; \
+             got:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn flat_bind_take_with_well_formed_glob_parses() {
+        Config::parse(
+            "version = 1\n\n[sources.s]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\n\
+             [targets.t.sources]\ns = { take = [\"skills/**\"] }\n",
+        )
+        .expect("a well-formed glob `skills/**` must still parse (no over-rejection)");
+    }
+
+    #[test]
+    fn flat_bind_take_with_plain_literal_parses() {
+        Config::parse(
+            "version = 1\n\n[sources.s]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\n\
+             [targets.t.sources]\ns = { take = [\"a/b.md\"] }\n",
+        )
+        .expect("a plain literal take entry `a/b.md` must still parse");
+    }
+
+    #[test]
+    fn source_owned_scope_keys_parse() {
+        Config::parse(
+            "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\n\
+             root = \"editor\"\ninclude = [\"editor/**\"]\nexclude = [\"**/*.swp\"]\n\n\
+             [targets.t]\npath = \"~/x\"\n\n\
+             [targets.t.sources]\ndotfiles = {}\n",
+        )
+        .expect(
+            "scope keys (root/include/exclude) are owned by the SOURCE; the redesign rejects them \
+             only at the BINDING, so source-level scope must still parse",
+        );
+    }
+
+    #[test]
+    fn mount_take_with_malformed_glob_is_rejected() {
+        let msg = parse_err(
+            "version = 1\n\n[sources.dep]\ngit = \"g\"\ntransitive = true\n\n\
+             [targets.t]\npath = \"~/x\"\nimports = [\"dep\"]\n\n\
+             [targets.t.take]\n\"dep\" = [\"[\"]\n",
+        );
+        assert!(
+            msg.contains("take")
+                && (msg.contains('[')
+                    || msg.to_lowercase().contains("glob")
+                    || msg.to_lowercase().contains("pattern")),
+            "glob validation must apply uniformly to the mount take table: an unterminated \
+             character class under [targets.t.take] must name `take` AND reference `[` or \
+             glob/pattern syntax; got:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn mount_take_with_well_formed_glob_parses() {
+        Config::parse(
+            "version = 1\n\n[sources.dep]\ngit = \"g\"\ntransitive = true\n\n\
+             [targets.t]\npath = \"~/x\"\nimports = [\"dep\"]\n\n\
+             [targets.t.take]\n\"dep\" = [\"skills/**\"]\n",
+        )
+        .expect("a well-formed mount take glob `skills/**` must parse (no over-rejection)");
+    }
+
+    #[test]
+    fn flat_bind_take_array_of_multiple_single_pair_renames_parses() {
+        Config::parse(
+            "version = 1\n\n[sources.s]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/x\"\n\n\
+             [targets.t.sources]\n\
+             s = { take = [{ \"a/X.md\" = \"a/x.md\" }, { \"c/Y.md\" = \"c/y.md\" }] }\n",
+        )
+        .expect(
+            "the arity rule is exactly-one-pair-PER-ENTRY, not one-entry-per-array; an array of \
+             two single-pair rename entries must parse",
+        );
+    }
+}
