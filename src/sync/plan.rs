@@ -9,39 +9,14 @@ use crate::config::{
 use crate::diagnostic::SelectionDiagnostic;
 use crate::error::{Error, Result};
 use crate::kernel::{
-    ArtifactName, CollapseChoice, CollapseMode, Materialization, OfferSelection, Selection,
-    SourceName, Take, fold_dest, is_take_glob, plan_collapse, resolve_take,
+    CollapseChoice, CollapseMode, Materialization, OfferSelection, SourceName, Take, fold_dest,
+    is_take_glob, plan_collapse, resolve_take,
 };
 use crate::lock::encode_ref;
 use crate::source::SourceBackend;
 
-use super::discover::{discover_artifacts_for_source, discover_working_tree_leaves};
+use super::discover::discover_working_tree_leaves;
 use super::remote_for;
-
-/// Discover one binding's artifacts at `commit` under `root`, using the binding's
-/// effective `include`/`exclude` so plan/preview/prune discover the same set the
-/// deploy path (`deploy_target`) would deploy.
-///
-/// # Errors
-/// Errors if the source has no resolved remote, the selection is invalid, or discovery fails.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "mirrors the deploy path's discovery inputs (source + binding selection + remote)"
-)]
-pub(super) fn discover_binding(
-    source: &ParsedSource,
-    source_name: &SourceName,
-    commit: &str,
-    include: &[String],
-    exclude: &[String],
-    root: Option<&Path>,
-    remotes: &BTreeMap<String, String>,
-    backend: &dyn SourceBackend,
-) -> Result<Vec<ArtifactName>> {
-    let git = remote_for(remotes, source_name.as_str())?;
-    let selection = Selection::new(include, exclude)?;
-    discover_artifacts_for_source(source, git, source_name, commit, backend, &selection, root)
-}
 
 /// One target's deployment plan: every binding's resolved leaf-granular plan.
 #[derive(Debug, Clone, PartialEq, Eq)]

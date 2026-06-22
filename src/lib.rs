@@ -2,7 +2,7 @@
 //!
 //! The crate follows a hexagonal layering:
 //! - **domain** — config DTOs ([`config`]), path/identity newtypes ([`paths`]),
-//!   selection ([`kernel::Selection`]), and the orchestration in [`sync`]/[`deploy`].
+//!   offer selection ([`kernel::OfferSelection`]), and the orchestration in [`sync`]/[`deploy`].
 //! - **ports** — the [`source::SourceBackend`] and [`store::Registry`] traits.
 //! - **adapters** — [`source::GitBackend`] and [`store::FileRegistry`], kept beside
 //!   their port traits rather than in separate directories.

@@ -169,6 +169,7 @@ home
   src-dotfiles@ca94c83b lint -> <ROOT>/target-home/lint
 machine
   overlay-machine@link config -> <ROOT>/target-machine/config
+  overlay-machine@link notes.txt -> <ROOT>/target-machine/notes.txt
 ```
 
 The deployed overlay entry is a real symlink pointing back at the source

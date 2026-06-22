@@ -119,10 +119,6 @@ impl fmt::Display for TargetName {
 pub struct ArtifactName(String);
 
 impl ArtifactName {
-    pub(crate) fn trusted(s: impl Into<String>) -> Self {
-        Self(s.into())
-    }
-
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0

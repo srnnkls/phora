@@ -17,9 +17,6 @@ pub enum StoreError {
 
 type Result<T> = std::result::Result<T, StoreError>;
 
-/// Layout sentinel for a renamed leaf deployed at the target root, ignoring layout.
-pub const MAP_LAYOUT: &str = "map";
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RecordKind {

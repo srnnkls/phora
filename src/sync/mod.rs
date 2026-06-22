@@ -38,9 +38,7 @@ use target::{TargetRun, deploy_target};
 use {
     crate::config::LayoutKind,
     crate::deploy::check_artifact_state,
-    crate::kernel::Selection,
     crate::lock::LockedSource,
-    discover::discover_working_tree,
     target::{ArtifactEntry, deploy_artifact_entry},
 };
 

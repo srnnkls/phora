@@ -5,7 +5,7 @@ use std::process::Command;
 use std::str::FromStr;
 
 use phora::config::Refspec;
-use phora::kernel::{Selection, SourceName};
+use phora::kernel::SourceName;
 use phora::source::{GitBackend, SourceBackend};
 use tempfile::TempDir;
 
@@ -92,17 +92,13 @@ fn build_fixture() -> DigestFixture {
     }
 }
 
-fn selection(include: &[&str], exclude: &[&str]) -> Selection {
-    let to_vec = |xs: &[&str]| xs.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
-    Selection::new(&to_vec(include), &to_vec(exclude)).expect("selection builds")
-}
-
 fn digest(
     fixture: &DigestFixture,
     root: Option<&str>,
     include: &[&str],
     exclude: &[&str],
 ) -> String {
+    let to_vec = |xs: &[&str]| xs.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
     fixture
         .backend
         .compute_digest(
@@ -110,7 +106,8 @@ fn digest(
             &fixture.url,
             &fixture.commit,
             root.map(Path::new),
-            &selection(include, exclude),
+            &to_vec(include),
+            &to_vec(exclude),
         )
         .expect("compute_digest succeeds")
 }
@@ -155,7 +152,12 @@ fn digest_pins_tree_without_root_loose_file() {
 #[test]
 fn digest_pins_tree_without_top_level_dotfile_dir() {
     let fixture = build_fixture();
-    let value = digest(&fixture, None, &[], &["/.config"]);
+    let full = digest(&fixture, None, &[], &[]);
+    let value = digest(&fixture, None, &[], &[".config/**"]);
+    assert_ne!(
+        value, full,
+        "excluding the .config subtree must drop its leaves, changing the digest"
+    );
     assert_eq!(
         value,
         "blake3:619b3b51342eb66551a9a8b5057d26b5762dadfd3a190ed9cedfb3ac1de03033"

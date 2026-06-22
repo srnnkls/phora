@@ -1,4 +1,5 @@
-//! ARCH-002 documented exception: `check-match`'s artifact-allow output changes for hidden names.
+//! `check-match`'s artifact-allow output under the gitignore-style `OfferSelection` engine:
+//! a `*` include matches hidden names (gitignore has no shell-dotglob exclusion).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -105,13 +106,13 @@ fn check_match_reports_dotfile_allowed_when_opted_in() {
 }
 
 #[test]
-fn check_match_reports_dotfile_excluded_under_star_include() {
+fn check_match_reports_dotfile_allowed_under_star_include() {
     let fixture = build_fixture("[\"*\"]");
 
     let stdout = check_match_stdout(&fixture, ".config/foo");
 
     assert!(
-        stdout.contains("artifact `.config`: excluded"),
-        "include `*` must NOT opt the hidden artifact in (no dotglob); got:\n{stdout}"
+        stdout.contains("artifact `.config`: allowed"),
+        "under gitignore-style selection a `*` include matches hidden names too; got:\n{stdout}"
     );
 }

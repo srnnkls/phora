@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use crate::config::{DeployMode, LayoutKind, ParsedSource, Target, TemplateOptIn};
 use crate::deploy::{ArtifactState, Journal, check_artifact_state, deploy_artifact, link_artifact};
 use crate::error::{Error, Result};
-use crate::kernel::{ArtifactName, Materialization, Selection, SourceName, safe_relpath};
-use crate::source::{ExportRequest, SourceBackend};
+use crate::kernel::{Materialization, SourceName, safe_relpath};
+use crate::source::{ExportLeaf, ExportRequest, SourceBackend};
 use crate::store::{
-    ArtifactKey, EjectedEntry, MAP_LAYOUT, ProjectedRecord, RecordKind, Registry, RegistryRecord,
+    ArtifactKey, EjectedEntry, ProjectedRecord, RecordKind, Registry, RegistryRecord,
 };
 
 use super::confine::{ProtectedPathSet, confine_destination};
@@ -189,24 +189,17 @@ impl ArtifactEntry<'_> {
     }
 }
 
-/// A `map`-layout dest is a single component at the target root; layout helpers must not be applied.
 pub(crate) fn record_artifact_path(target: &Target, record: &RegistryRecord) -> PathBuf {
-    if record.layout == MAP_LAYOUT {
-        target.expanded_path().join(&record.key.artifact)
-    } else {
-        target.expanded_path().join(
-            target
-                .layout()
-                .artifact_path(&record.key.source, &record.key.artifact),
-        )
-    }
+    target.expanded_path().join(
+        target
+            .layout()
+            .artifact_path(&record.key.source, &record.key.artifact),
+    )
 }
 
-/// A `map` record's single manifest file IS the dest, so its base is the target root.
+/// A `File` record's single manifest file IS the dest, so its base is the dest's parent;
+/// a `Dir` record's base is the deployed directory itself.
 pub(super) fn record_manifest_base(target: &Target, record: &RegistryRecord) -> PathBuf {
-    if record.layout == MAP_LAYOUT {
-        return target.expanded_path();
-    }
     let artifact_path = record_artifact_path(target, record);
     match record.kind {
         RecordKind::File => artifact_path
@@ -423,53 +416,36 @@ fn deploy_one(
     let git = ctx.git;
     let commit_time = backend.commit_time(ctx.source_name, git, ctx.commit)?;
     let policy = ctx.source.export_policy();
-    let empty_selection = Selection::new(&[], &[])?;
 
-    let (export, staging_payload, files) = match ctx.materialization {
+    let (leaves, staging_payload) = match ctx.materialization {
         Materialization::CollapsedDir { dir } => {
-            let artifact = ArtifactName::trusted(dir.clone());
-            let kept_selection = collapsed_dir_selection(dir, ctx.kept_leaves)?;
-            let req = ExportRequest {
-                source: ctx.source_name,
-                url: git,
-                commit: ctx.commit,
-                root: ctx.root,
-                artifact: &artifact,
-                selection: &kept_selection,
-                policy: &policy,
-                staging_dir: &staging,
-                commit_time,
-                template_opt_in: ctx.template_opt_in,
-                vars: ctx.vars,
-                path_map: None,
-            };
-            let export = backend.export_artifact(&req)?;
-            let files = export.files.clone();
-            (export, staging.clone(), files)
+            let leaves = collapsed_dir_leaves(dir, ctx.kept_leaves, ctx.template_opt_in);
+            (leaves, staging.clone())
         }
         Materialization::Leaf(take) => {
             let dest_leaf = leaf_basename(&take.dest);
-            let path_map =
-                BTreeMap::from([(PathBuf::from(&take.source), PathBuf::from(&dest_leaf))]);
-            let req = ExportRequest {
-                source: ctx.source_name,
-                url: git,
-                commit: ctx.commit,
-                root: ctx.root,
-                artifact: &ArtifactName::trusted(take.dest.clone()),
-                selection: &empty_selection,
-                policy: &policy,
-                staging_dir: &staging,
-                commit_time,
-                template_opt_in: ctx.template_opt_in,
-                vars: ctx.vars,
-                path_map: Some(&path_map),
-            };
-            let export = backend.export_artifact(&req)?;
-            let files = export.files.clone();
-            (export, staging.join(&dest_leaf), files)
+            let leaves = vec![ExportLeaf {
+                source: PathBuf::from(&take.source),
+                dest: PathBuf::from(&dest_leaf),
+            }];
+            (leaves, staging.join(&dest_leaf))
         }
     };
+
+    let req = ExportRequest {
+        source: ctx.source_name,
+        url: git,
+        commit: ctx.commit,
+        root: ctx.root,
+        policy: &policy,
+        staging_dir: &staging,
+        commit_time,
+        template_opt_in: ctx.template_opt_in,
+        vars: ctx.vars,
+        leaves: &leaves,
+    };
+    let export = backend.export_artifact(&req)?;
+    let files = export.files.clone();
 
     if let Some(anchor) = ctx.confine_anchor {
         super::confine::reject_symlink_ancestor_at_write(anchor, ctx.artifact_dst)?;
@@ -562,24 +538,29 @@ fn leaf_basename(dest: &str) -> String {
     dest.rsplit('/').next().unwrap_or(dest).to_owned()
 }
 
-fn collapsed_dir_selection(
+/// The collapsed dir's leaf plan: every kept child staged at its dir-relative deployed
+/// name (the child path under `dir/`, run through the template opt-in). The source is the
+/// kept leaf's full source path; the dest is dir-relative so staging mirrors the dir.
+fn collapsed_dir_leaves(
     dir: &str,
     kept_leaves: &[crate::kernel::ResolvedTake],
-) -> Result<Selection> {
+    template_opt_in: &TemplateOptIn,
+) -> Vec<ExportLeaf> {
     let prefix = format!("{dir}/");
-    let include: Vec<String> = kept_leaves
+    kept_leaves
         .iter()
-        .filter_map(|kept| kept.source.strip_prefix(&prefix).map(anchor_to_dir_root))
-        .collect();
-    Selection::new(&include, &[])
-}
-
-fn anchor_to_dir_root(under_dir: &str) -> String {
-    format!("/{under_dir}")
+        .filter_map(|kept| {
+            let child = kept.dest.strip_prefix(&prefix)?;
+            Some(ExportLeaf {
+                source: PathBuf::from(&kept.source),
+                dest: PathBuf::from(template_opt_in.deployed_name(child)),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
-mod collapsed_dir_selection_tests {
+mod collapsed_dir_leaves_tests {
     use super::*;
     use crate::kernel::ResolvedTake;
 
@@ -591,23 +572,38 @@ mod collapsed_dir_selection_tests {
     }
 
     #[test]
-    fn kept_leaf_selection_admits_only_the_kept_child_not_a_deeper_namesake() {
-        let kept_leaves = [kept("editor/a.md")];
-        let sel =
-            collapsed_dir_selection("editor", &kept_leaves).expect("kept-leaf selection compiles");
+    fn kept_leaf_maps_each_child_to_its_dir_relative_deployed_dest() {
+        let kept_leaves = [kept("editor/a.md"), kept("editor/lua/opts.lua")];
+        let leaves = collapsed_dir_leaves("editor", &kept_leaves, &TemplateOptIn::SuffixOnly);
 
-        assert!(
-            sel.selects_path(Path::new("a.md"), false),
-            "the kept leaf must be admitted at the dir root"
+        assert_eq!(
+            leaves,
+            vec![
+                ExportLeaf {
+                    source: PathBuf::from("editor/a.md"),
+                    dest: PathBuf::from("a.md"),
+                },
+                ExportLeaf {
+                    source: PathBuf::from("editor/lua/opts.lua"),
+                    dest: PathBuf::from("lua/opts.lua"),
+                },
+            ],
+            "each kept child stages at its dir-relative path; the source keeps its full path"
         );
-        assert!(
-            !sel.selects_path(Path::new("sub/a.md"), false),
-            "a same-named child under a deeper, unkept sibling dir must NOT be re-admitted; the \
-             include is root-anchored, not a `**/` depth match"
-        );
-        assert!(
-            !sel.selects_path(Path::new("secret"), false),
-            "an offer-excluded sibling absent from the kept set must NOT be admitted"
+    }
+
+    #[test]
+    fn kept_template_leaf_strips_the_tmpl_suffix_in_the_dest() {
+        let kept_leaves = [kept("editor/init.lua.tmpl")];
+        let leaves = collapsed_dir_leaves("editor", &kept_leaves, &TemplateOptIn::SuffixOnly);
+
+        assert_eq!(
+            leaves,
+            vec![ExportLeaf {
+                source: PathBuf::from("editor/init.lua.tmpl"),
+                dest: PathBuf::from("init.lua"),
+            }],
+            "a templated child's dest drops the .tmpl suffix via the opt-in"
         );
     }
 }
@@ -786,7 +782,7 @@ mod kind_aware_layout_tests {
         assert_ne!(
             path,
             root.join("CLAUDE.md"),
-            "a kind=file record must NOT collapse to the target root the way MAP_LAYOUT did"
+            "a kind=file record must NOT collapse to the target root; it honors layout"
         );
         assert_eq!(
             path,

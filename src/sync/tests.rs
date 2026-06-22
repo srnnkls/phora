@@ -15,10 +15,6 @@ use crate::store::FileRegistry;
 
 type SourceResult<T> = std::result::Result<T, SourceError>;
 
-fn an(name: &str) -> crate::kernel::ArtifactName {
-    crate::kernel::ArtifactName::trusted(name)
-}
-
 fn sn(name: &str) -> crate::kernel::SourceName {
     crate::kernel::SourceName::trusted(name)
 }
@@ -246,19 +242,6 @@ impl SourceBackend for CountingBackend<'_> {
         self.inner.commit_time(source, url, commit)
     }
 
-    fn discover_artifacts(
-        &self,
-        source: &crate::kernel::SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        selection: &crate::kernel::Selection,
-    ) -> SourceResult<Vec<crate::kernel::ArtifactName>> {
-        self.discovers.fetch_add(1, AtomicOrdering::SeqCst);
-        self.inner
-            .discover_artifacts(source, url, commit, root, selection)
-    }
-
     fn export_artifact(&self, req: &ExportRequest<'_>) -> SourceResult<ExportResult> {
         self.exports.fetch_add(1, AtomicOrdering::SeqCst);
         self.inner.export_artifact(req)
@@ -270,24 +253,12 @@ impl SourceBackend for CountingBackend<'_> {
         url: &str,
         commit: &str,
         root: Option<&Path>,
-        selection: &crate::kernel::Selection,
+        include: &[String],
+        exclude: &[String],
     ) -> SourceResult<String> {
         self.digests.fetch_add(1, AtomicOrdering::SeqCst);
         self.inner
-            .compute_digest(source, url, commit, root, selection)
-    }
-
-    fn list_artifact_files(
-        &self,
-        source: &crate::kernel::SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        artifact: &crate::kernel::ArtifactName,
-        selection: &crate::kernel::Selection,
-    ) -> SourceResult<Vec<std::path::PathBuf>> {
-        self.inner
-            .list_artifact_files(source, url, commit, root, artifact, selection)
+            .compute_digest(source, url, commit, root, include, exclude)
     }
 
     fn list_source_leaves(
@@ -297,6 +268,7 @@ impl SourceBackend for CountingBackend<'_> {
         commit: &str,
         root: Option<&Path>,
     ) -> SourceResult<Vec<String>> {
+        self.discovers.fetch_add(1, AtomicOrdering::SeqCst);
         self.inner.list_source_leaves(source, url, commit, root)
     }
 }
@@ -342,14 +314,14 @@ fn input<'a>(
 }
 
 fn expected_digest(fx: &SyncFixture, name: &str, commit: &str) -> String {
-    let m = crate::kernel::Selection::new(&[], &[]).expect("empty matcher builds");
     fx.backend
         .compute_digest(
             &crate::kernel::SourceName::trusted(name),
             &fx.url,
             commit,
             None,
-            &m,
+            &[],
+            &[],
         )
         .expect("digest computes over fixture tree")
 }
@@ -362,10 +334,15 @@ fn expected_digest_for_source(
     name: &str,
     commit: &str,
 ) -> String {
-    let m = crate::kernel::Selection::new(source.includes(), source.excludes())
-        .expect("source matcher builds");
     fx.backend
-        .compute_digest(&sn(name), &fx.url, commit, source.root.as_deref(), &m)
+        .compute_digest(
+            &sn(name),
+            &fx.url,
+            commit,
+            source.root.as_deref(),
+            source.includes(),
+            source.excludes(),
+        )
         .expect("scoped digest computes over fixture tree")
 }
 
@@ -657,17 +634,6 @@ impl SourceBackend for DenyNetworkBackend<'_> {
     ) -> SourceResult<u64> {
         self.inner.commit_time(source, url, commit)
     }
-    fn discover_artifacts(
-        &self,
-        source: &crate::kernel::SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        selection: &crate::kernel::Selection,
-    ) -> SourceResult<Vec<crate::kernel::ArtifactName>> {
-        self.inner
-            .discover_artifacts(source, url, commit, root, selection)
-    }
     fn export_artifact(&self, req: &ExportRequest<'_>) -> SourceResult<ExportResult> {
         self.inner.export_artifact(req)
     }
@@ -677,22 +643,11 @@ impl SourceBackend for DenyNetworkBackend<'_> {
         url: &str,
         commit: &str,
         root: Option<&Path>,
-        selection: &crate::kernel::Selection,
+        include: &[String],
+        exclude: &[String],
     ) -> SourceResult<String> {
         self.inner
-            .compute_digest(source, url, commit, root, selection)
-    }
-    fn list_artifact_files(
-        &self,
-        source: &crate::kernel::SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        artifact: &crate::kernel::ArtifactName,
-        selection: &crate::kernel::Selection,
-    ) -> SourceResult<Vec<std::path::PathBuf>> {
-        self.inner
-            .list_artifact_files(source, url, commit, root, artifact, selection)
+            .compute_digest(source, url, commit, root, include, exclude)
     }
 }
 
@@ -1131,22 +1086,11 @@ impl SourceBackend for FailingExportBackend<'_> {
     ) -> SourceResult<u64> {
         self.inner.commit_time(source, url, commit)
     }
-    fn discover_artifacts(
-        &self,
-        source: &crate::kernel::SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        selection: &crate::kernel::Selection,
-    ) -> SourceResult<Vec<crate::kernel::ArtifactName>> {
-        self.inner
-            .discover_artifacts(source, url, commit, root, selection)
-    }
     fn export_artifact(&self, req: &ExportRequest<'_>) -> SourceResult<ExportResult> {
-        if req.artifact.as_str() == self.fail_artifact {
+        if leaves_under_artifact(req.leaves, &self.fail_artifact) {
             return Err(SourceError::Source(format!(
                 "injected export failure for {}",
-                req.artifact
+                self.fail_artifact
             )));
         }
         self.inner.export_artifact(req)
@@ -1157,22 +1101,11 @@ impl SourceBackend for FailingExportBackend<'_> {
         url: &str,
         commit: &str,
         root: Option<&Path>,
-        selection: &crate::kernel::Selection,
+        include: &[String],
+        exclude: &[String],
     ) -> SourceResult<String> {
         self.inner
-            .compute_digest(source, url, commit, root, selection)
-    }
-    fn list_artifact_files(
-        &self,
-        source: &crate::kernel::SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        artifact: &crate::kernel::ArtifactName,
-        selection: &crate::kernel::Selection,
-    ) -> SourceResult<Vec<std::path::PathBuf>> {
-        self.inner
-            .list_artifact_files(source, url, commit, root, artifact, selection)
+            .compute_digest(source, url, commit, root, include, exclude)
     }
     fn list_source_leaves(
         &self,
@@ -1183,6 +1116,17 @@ impl SourceBackend for FailingExportBackend<'_> {
     ) -> SourceResult<Vec<String>> {
         self.inner.list_source_leaves(source, url, commit, root)
     }
+}
+
+/// True when any leaf's source path lies under the `artifact` top-level directory —
+/// the leaf-granular stand-in for the old per-artifact export gate.
+fn leaves_under_artifact(leaves: &[crate::source::ExportLeaf], artifact: &str) -> bool {
+    leaves.iter().any(|leaf| {
+        leaf.source
+            .components()
+            .next()
+            .is_some_and(|c| c.as_os_str() == artifact)
+    })
 }
 
 // ── deploy a Missing artifact ──────────────────────────────────
@@ -1527,6 +1471,46 @@ fn rebuild_round_trips_aliased_underlying_source() {
     assert_eq!(
         rebuilt.source, "dotfiles",
         "rebuild must reconstruct the UNDERLYING source `dotfiles` in the `source` field"
+    );
+    drop(src);
+}
+
+#[test]
+fn rebuild_by_source_spares_managed_identity_dir_but_reports_a_stray() {
+    let (src, url) = build_multi_root_repo();
+    let td = TargetDir::new();
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let toml = format!(
+        "version = 1\n\n[sources.dotfiles]\ngit = \"{url}\"\nbranch = \"main\"\nroot = \"nvim\"\n\n\
+         [targets.dest]\npath = \"{}\"\n\
+         sources = {{ nvim = {{ source = \"dotfiles\" }} }}\nlayout = \"by-source\"\n",
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("by-source config parses");
+
+    let out = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+        .expect("seeding sync over a by-source binding must succeed");
+
+    let stray = td.target_path().join("stray");
+    std::fs::create_dir_all(&stray).expect("mkdir stray dir");
+    std::fs::write(stray.join("x.txt"), b"hand-made\n").expect("write stray file");
+
+    let report = rebuild_registry(&cfg, &out.base_lock, &backend, &registry)
+        .expect("rebuild must not error");
+
+    let managed_identity = td.target_path().join("nvim");
+    assert!(
+        !report.foreign.iter().any(|p| p == &managed_identity),
+        "the by-source identity dir `{}` holds only managed children and must NOT be reported \
+         foreign — scan_foreign must compose destinations with the binding identity, not an empty \
+         identity; got {:?}",
+        managed_identity.display(),
+        report.foreign
+    );
+    assert!(
+        report.foreign.iter().any(|p| p.ends_with("stray")),
+        "a genuinely unmanaged top-level dir must still be reported foreign; got {:?}",
+        report.foreign
     );
     drop(src);
 }
@@ -2211,25 +2195,14 @@ impl SourceBackend for PartialStagingExportBackend<'_> {
     ) -> SourceResult<u64> {
         self.inner.commit_time(source, url, commit)
     }
-    fn discover_artifacts(
-        &self,
-        source: &crate::kernel::SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        selection: &crate::kernel::Selection,
-    ) -> SourceResult<Vec<crate::kernel::ArtifactName>> {
-        self.inner
-            .discover_artifacts(source, url, commit, root, selection)
-    }
     fn export_artifact(&self, req: &ExportRequest<'_>) -> SourceResult<ExportResult> {
-        if req.artifact.as_str() == self.fail_artifact {
+        if leaves_under_artifact(req.leaves, &self.fail_artifact) {
             std::fs::create_dir_all(req.staging_dir).expect("create partial staging dir");
             std::fs::write(req.staging_dir.join("partial.txt"), b"half-written\n")
                 .expect("write partial staging file");
             return Err(SourceError::Source(format!(
                 "injected export failure after partial staging for {}",
-                req.artifact
+                self.fail_artifact
             )));
         }
         self.inner.export_artifact(req)
@@ -2240,22 +2213,11 @@ impl SourceBackend for PartialStagingExportBackend<'_> {
         url: &str,
         commit: &str,
         root: Option<&Path>,
-        selection: &crate::kernel::Selection,
+        include: &[String],
+        exclude: &[String],
     ) -> SourceResult<String> {
         self.inner
-            .compute_digest(source, url, commit, root, selection)
-    }
-    fn list_artifact_files(
-        &self,
-        source: &crate::kernel::SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        artifact: &crate::kernel::ArtifactName,
-        selection: &crate::kernel::Selection,
-    ) -> SourceResult<Vec<std::path::PathBuf>> {
-        self.inner
-            .list_artifact_files(source, url, commit, root, artifact, selection)
+            .compute_digest(source, url, commit, root, include, exclude)
     }
     fn list_source_leaves(
         &self,
@@ -2789,17 +2751,6 @@ impl SourceBackend for FailingResolveBackend<'_> {
     ) -> SourceResult<u64> {
         self.inner.commit_time(source, url, commit)
     }
-    fn discover_artifacts(
-        &self,
-        source: &crate::kernel::SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        selection: &crate::kernel::Selection,
-    ) -> SourceResult<Vec<crate::kernel::ArtifactName>> {
-        self.inner
-            .discover_artifacts(source, url, commit, root, selection)
-    }
     fn export_artifact(&self, req: &ExportRequest<'_>) -> SourceResult<ExportResult> {
         self.inner.export_artifact(req)
     }
@@ -2809,22 +2760,11 @@ impl SourceBackend for FailingResolveBackend<'_> {
         url: &str,
         commit: &str,
         root: Option<&Path>,
-        selection: &crate::kernel::Selection,
+        include: &[String],
+        exclude: &[String],
     ) -> SourceResult<String> {
         self.inner
-            .compute_digest(source, url, commit, root, selection)
-    }
-    fn list_artifact_files(
-        &self,
-        source: &crate::kernel::SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        artifact: &crate::kernel::ArtifactName,
-        selection: &crate::kernel::Selection,
-    ) -> SourceResult<Vec<std::path::PathBuf>> {
-        self.inner
-            .list_artifact_files(source, url, commit, root, artifact, selection)
+            .compute_digest(source, url, commit, root, include, exclude)
     }
 }
 
@@ -3445,13 +3385,9 @@ fn rebuild_reports_foreign_artifact_dir_with_no_config_match() {
         .expect("rebuild must not error in the presence of a foreign dir");
 
     assert!(
-        report
-            .foreign
-            .iter()
-            .any(|p| p.ends_with("scratch")
-                || p.ends_with(std::path::Path::new("hand-made/scratch"))),
-        "an on-disk artifact dir with no config/lock match must be reported [foreign], \
-             got {:?}",
+        report.foreign.iter().any(|p| p.ends_with("hand-made")),
+        "an on-disk top-level entry with no published-key match must be reported [foreign] \
+             (the scan compares top-level entries against the published-key set), got {:?}",
         report.foreign
     );
 
@@ -3468,64 +3404,23 @@ fn rebuild_reports_foreign_artifact_dir_with_no_config_match() {
     );
 }
 
-/// ARCH-003 (the stranded-dotfile-orphan fix): the foreign scan must route
-/// through `Selection`, not a blanket `starts_with('.')`. A hidden on-disk dir
-/// the source's selection ADMITS (`include = [".config"]`) but that no managed
-/// artifact maps to is an orphaned phora-shaped artifact and MUST be reported
-/// foreign. A hidden dir NO selection admits (`.cache`) is the user's own and
-/// MUST stay out of the foreign set. The current blanket skip drops both.
 #[test]
-fn foreign_scan_reports_selection_admitted_dotfile_but_spares_user_dotfile() {
-    let fx = build_sync_fixture();
-    let td = TargetDir::new();
-    let toml = format!(
-        "version = 1\n\n\
-             [sources.editor-src]\ngit = \"{url}\"\nbranch = \"main\"\ninclude = [\".config\"]\n\n\
-             [targets.dest]\npath = \"{target}\"\nsources = [\"editor-src\"]\nlayout = \"flat\"\n",
-        url = fx.url,
-        target = td.target_path().display(),
-    );
-    let cfg = Config::parse(&toml).expect("dotfile-include config parses");
-    let out = sync(
-        &input(&cfg, None, None, None, false),
-        &fx.backend,
-        &fx.registry,
-    )
-    .expect("seeding sync over a dotfile-include source succeeds");
-    assert!(!out.had_failures, "premise: the seeding sync must succeed");
+fn rebuild_spares_user_owned_top_level_dotfile_from_foreign() {
+    let (fx, td, cfg, lock) = rebuild_setup();
 
-    let admitted =
-        crate::kernel::Selection::new(&[".config".to_owned()], &[]).expect("selection builds");
-    assert!(
-        admitted.selects_artifact(".config"),
-        "premise: include=[.config] must admit the `.config` artifact name"
-    );
-    assert!(
-        !admitted.selects_artifact(".cache"),
-        "premise: include=[.config] must NOT admit an unrelated `.cache` dotfile"
-    );
+    // A user-owned dotdir under the target, never managed by phora.
+    let user_dot = td.target_path().join(".cache");
+    std::fs::create_dir_all(&user_dot).expect("mkdir user dotdir");
+    std::fs::write(user_dot.join("blob"), b"user-owned\n").expect("write user file");
 
-    let orphan = td.target_path().join(".config");
-    std::fs::create_dir_all(&orphan).expect("plant the orphaned dotfile artifact");
-    std::fs::write(orphan.join("settings.json"), b"{}\n").expect("write orphan file");
-    let user_dir = td.target_path().join(".cache");
-    std::fs::create_dir_all(&user_dir).expect("plant the user's own dotfile dir");
-    std::fs::write(user_dir.join("blob.bin"), b"mine\n").expect("write user file");
+    let report = rebuild_registry(&cfg, &lock, &fx.backend, &fx.registry)
+        .expect("rebuild must not error in the presence of a user dotdir");
 
-    let report = rebuild_registry(&cfg, &out.base_lock, &fx.backend, &fx.registry)
-        .expect("rebuild must not error with hidden dirs present");
-
-    assert!(
-        report.foreign.iter().any(|p| p.ends_with(".config")),
-        "a hidden dir the source's Selection admits but that maps to no managed \
-             artifact MUST be reported [foreign] (the scan must consult Selection, not \
-             blanket-skip dotfiles), got {:?}",
-        report.foreign
-    );
     assert!(
         !report.foreign.iter().any(|p| p.ends_with(".cache")),
-        "a hidden dir no source Selection admits is the user's own and MUST NOT be \
-             reported [foreign]; the fix must not over-report, got {:?}",
+        "a user-owned top-level dotfile must NOT be reported foreign by rebuild-registry; \
+         an orphaned managed dotfile is reclaimed by `sync --prune` (SMR-033), not flagged here; \
+         got {:?}",
         report.foreign
     );
 }
@@ -3553,23 +3448,24 @@ fn build_worktree(root_sub: Option<&str>) -> TempDir {
     td
 }
 
-fn match_all() -> Selection {
-    Selection::new(&[], &[]).expect("empty matcher")
-}
-
 #[test]
-fn worktree_scan_returns_sorted_real_dirs_excluding_dotdirs_and_files() {
+fn worktree_scan_returns_sorted_leaves_including_dotdirs_and_loose_files() {
     let wt = build_worktree(None);
 
-    let found = discover_working_tree(wt.path(), None, &match_all())
+    let found = crate::sync::discover::discover_working_tree_leaves(wt.path(), None)
         .expect("scanning an existing working tree must succeed");
 
     assert_eq!(
         found,
-        vec![an("alpha"), an("uncommitted"), an("zeta")],
-        "the disk scan must return only real subdirectories, sorted, \
-             excluding the .hidden dotdir and the loose.txt regular file; \
-             the never-added `uncommitted` dir proves this is a disk scan"
+        vec![
+            ".hidden/secret".to_string(),
+            "alpha/file.txt".to_string(),
+            "loose.txt".to_string(),
+            "uncommitted/file.txt".to_string(),
+            "zeta/file.txt".to_string(),
+        ],
+        "the disk scan must return every leaf, sorted and root-relative; the never-added \
+             `uncommitted` leaf proves this is a disk scan, not an ODB walk"
     );
 }
 
@@ -3577,35 +3473,35 @@ fn worktree_scan_returns_sorted_real_dirs_excluding_dotdirs_and_files() {
 fn worktree_scan_honors_root_subdir() {
     let wt = build_worktree(Some("languages"));
 
-    let found = discover_working_tree(wt.path(), Some(Path::new("languages")), &match_all())
-        .expect("scanning <git>/<root> must succeed");
+    let found = crate::sync::discover::discover_working_tree_leaves(
+        wt.path(),
+        Some(Path::new("languages")),
+    )
+    .expect("scanning <git>/<root> must succeed");
 
     assert_eq!(
         found,
-        vec![an("alpha"), an("uncommitted"), an("zeta")],
-        "with root set, artifacts nested under <git>/languages must be discovered"
+        vec![
+            ".hidden/secret".to_string(),
+            "alpha/file.txt".to_string(),
+            "loose.txt".to_string(),
+            "uncommitted/file.txt".to_string(),
+            "zeta/file.txt".to_string(),
+        ],
+        "with root set, leaves nested under <git>/languages must be discovered root-relative"
     );
-    let direct = discover_working_tree(wt.path(), None, &match_all())
+    let direct = crate::sync::discover::discover_working_tree_leaves(wt.path(), None)
         .expect("scanning the git root itself must succeed");
     assert_eq!(
         direct,
-        vec![an("languages")],
-        "without root, only the top-level `languages` dir is an artifact"
-    );
-}
-
-#[test]
-fn worktree_scan_honors_matcher_exclude() {
-    let wt = build_worktree(None);
-    let selection = Selection::new(&[], &["zeta".to_owned()]).expect("exclude selection");
-
-    let found = discover_working_tree(wt.path(), None, &selection)
-        .expect("scan with an exclude must succeed");
-
-    assert_eq!(
-        found,
-        vec![an("alpha"), an("uncommitted")],
-        "the include/exclude matcher must gate disk artifacts just as it gates ODB ones"
+        vec![
+            "languages/.hidden/secret".to_string(),
+            "languages/alpha/file.txt".to_string(),
+            "languages/loose.txt".to_string(),
+            "languages/uncommitted/file.txt".to_string(),
+            "languages/zeta/file.txt".to_string(),
+        ],
+        "without root, the top-level `languages` dir is part of every leaf path"
     );
 }
 
@@ -3618,7 +3514,7 @@ fn worktree_scan_missing_path_errors() {
         "premise: the child path under the tempdir must not exist"
     );
 
-    let err = discover_working_tree(&missing, None, &match_all())
+    let err = crate::sync::discover::discover_working_tree_leaves(&missing, None)
         .expect_err("an absent local path must be a clear error, not an empty list");
 
     let msg = err.to_string().to_lowercase();
@@ -3634,8 +3530,11 @@ fn worktree_scan_missing_path_errors() {
 fn worktree_scan_missing_root_errors() {
     let wt = build_worktree(None);
 
-    let err = discover_working_tree(wt.path(), Some(Path::new("absent-root")), &match_all())
-        .expect_err("a missing root subdir must error, not silently yield nothing");
+    let err = crate::sync::discover::discover_working_tree_leaves(
+        wt.path(),
+        Some(Path::new("absent-root")),
+    )
+    .expect_err("a missing root subdir must error, not silently yield nothing");
 
     let msg = err.to_string().to_lowercase();
     assert!(
@@ -3648,7 +3547,7 @@ fn worktree_scan_missing_root_errors() {
 }
 
 /// Cross-site invariant (review C2): a Link source must be discovered from
-/// DISK in `rebuild_registry`, never via `backend.discover_artifacts`.
+/// DISK in `rebuild_registry`, never via the backend's `list_source_leaves` seam.
 fn config_link_source_one_target(source: &str, link_git: &Path, target_path: &Path) -> Config {
     let toml = format!(
         "version = 1\n\n\
@@ -3699,7 +3598,7 @@ fn rebuild_discovers_link_source_from_disk_never_via_odb() {
         counting.discover_count(),
         0,
         "a Link source must be discovered from disk in rebuild_registry; \
-             the ODB backend.discover_artifacts must NOT be called (review C2)"
+             the ODB backend's list_source_leaves must NOT be called (review C2)"
     );
     let names: BTreeSet<String> = report
         .reconstructed
@@ -5078,17 +4977,6 @@ impl SourceBackend for RecordingBackend<'_> {
     ) -> SourceResult<u64> {
         self.inner.commit_time(source, url, commit)
     }
-    fn discover_artifacts(
-        &self,
-        source: &crate::kernel::SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        selection: &crate::kernel::Selection,
-    ) -> SourceResult<Vec<crate::kernel::ArtifactName>> {
-        self.inner
-            .discover_artifacts(source, url, commit, root, selection)
-    }
     fn export_artifact(&self, req: &ExportRequest<'_>) -> SourceResult<ExportResult> {
         self.inner.export_artifact(req)
     }
@@ -5098,22 +4986,11 @@ impl SourceBackend for RecordingBackend<'_> {
         url: &str,
         commit: &str,
         root: Option<&Path>,
-        selection: &crate::kernel::Selection,
+        include: &[String],
+        exclude: &[String],
     ) -> SourceResult<String> {
         self.inner
-            .compute_digest(source, url, commit, root, selection)
-    }
-    fn list_artifact_files(
-        &self,
-        source: &crate::kernel::SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        artifact: &crate::kernel::ArtifactName,
-        selection: &crate::kernel::Selection,
-    ) -> SourceResult<Vec<std::path::PathBuf>> {
-        self.inner
-            .list_artifact_files(source, url, commit, root, artifact, selection)
+            .compute_digest(source, url, commit, root, include, exclude)
     }
     fn list_source_leaves(
         &self,
@@ -5405,17 +5282,6 @@ impl SourceBackend for CountingRouter {
     ) -> SourceResult<u64> {
         self.inner.commit_time(source, url, commit)
     }
-    fn discover_artifacts(
-        &self,
-        source: &crate::kernel::SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        selection: &crate::kernel::Selection,
-    ) -> SourceResult<Vec<crate::kernel::ArtifactName>> {
-        self.inner
-            .discover_artifacts(source, url, commit, root, selection)
-    }
     fn export_artifact(&self, req: &ExportRequest<'_>) -> SourceResult<ExportResult> {
         self.inner.export_artifact(req)
     }
@@ -5425,23 +5291,11 @@ impl SourceBackend for CountingRouter {
         url: &str,
         commit: &str,
         root: Option<&Path>,
-        selection: &crate::kernel::Selection,
+        include: &[String],
+        exclude: &[String],
     ) -> SourceResult<String> {
         self.inner
-            .compute_digest(source, url, commit, root, selection)
-    }
-
-    fn list_artifact_files(
-        &self,
-        source: &crate::kernel::SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        artifact: &crate::kernel::ArtifactName,
-        selection: &crate::kernel::Selection,
-    ) -> SourceResult<Vec<std::path::PathBuf>> {
-        self.inner
-            .list_artifact_files(source, url, commit, root, artifact, selection)
+            .compute_digest(source, url, commit, root, include, exclude)
     }
 
     fn list_source_leaves(
@@ -5791,13 +5645,7 @@ fn url_source_lock_digest_equals_full_archive_oracle() {
         .expect("the single url lock entry is keyed by source `pkg`");
 
     let full_archive = backend
-        .compute_digest(
-            &sn("pkg"),
-            &server.url,
-            &pkg.commit,
-            None,
-            &crate::kernel::Selection::new(&[], &[]).expect("empty selection builds"),
-        )
+        .compute_digest(&sn("pkg"), &server.url, &pkg.commit, None, &[], &[])
         .expect("full-archive digest computes");
     assert_eq!(
         pkg.digest, full_archive,
@@ -6210,6 +6058,117 @@ fn only_plan<'a>(plans: &'a [PreviewTargetPlan], target: &str) -> &'a PreviewTar
         .iter()
         .find(|p| p.target == target)
         .unwrap_or_else(|| panic!("preview must produce a plan for target `{target}`"))
+}
+
+/// A copy-source repo with a top-level loose file beside an artifact dir, so preview
+/// and deploy must agree on the loose file as its own materialization.
+fn build_loose_file_repo() -> (TempDir, String, String) {
+    let src = TempDir::new().expect("temp src repo");
+    let p = src.path();
+    run_git(p, &["init", "-b", "main", "."]);
+    run_git(p, &["config", "user.email", "test@example.com"]);
+    run_git(p, &["config", "user.name", "Test"]);
+    std::fs::create_dir_all(p.join("editor")).expect("mkdir editor");
+    std::fs::write(p.join("editor/init.lua"), b"-- init\n").expect("write init.lua");
+    std::fs::write(p.join("notes.txt"), b"loose top-level note\n").expect("write notes.txt");
+    run_git(p, &["add", "-A"]);
+    run_git(p, &["commit", "-m", "init"]);
+    let head = rev_parse(p, "HEAD");
+    let url = p.to_string_lossy().into_owned();
+    (src, url, head)
+}
+
+/// Preview parity (the leaf-granular divergence fix): a top-level loose file is its own
+/// materialization, so preview must emit a Synced entry for it exactly as deploy/where do.
+/// Under the old dir-granular preview this leaf was under-predicted (absent here yet
+/// present in where/list/deploy); the leaf-granular plan closes that gap.
+#[test]
+fn preview_emits_top_level_loose_file_leaf_matching_deploy() {
+    let (src, url, head) = build_loose_file_repo();
+    let git_dir = TempDir::new().expect("git dir");
+    let backend = GitBackend::new(git_dir.path().to_path_buf());
+    let td = TargetDir::new();
+    let cfg = config_one_source_one_target("loose-src", &url, "dest", &td.target_path(), "flat");
+
+    backend.fetch(&sn("loose-src"), &url).expect("seed fetch");
+    let lock = lock_with(&cfg, "loose-src", &url, &head);
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+
+    let plans = preview_targets(&cfg, &parsed, &remotes, &backend, Some(&lock), false)
+        .expect("preview builds a plan");
+    let plan = only_plan(&plans, "dest");
+
+    let synced: BTreeSet<String> = plan
+        .entries
+        .iter()
+        .filter(|e| e.state == SyncState::Synced)
+        .map(|e| e.artifact.clone())
+        .collect();
+    assert!(
+        synced.contains("notes.txt"),
+        "preview must emit the top-level loose file `notes.txt` as its own materialization \
+         (leaf-granular parity with deploy/where), got {synced:?}"
+    );
+    assert!(
+        synced.contains("editor"),
+        "the sibling artifact dir must still be previewed alongside the loose file, got {synced:?}"
+    );
+    let notes = preview_entry(plan, "notes.txt");
+    assert_eq!(
+        notes.destination,
+        td.target_path().join("notes.txt"),
+        "the loose-file entry's destination must be the flat target join of its published key"
+    );
+
+    drop(src);
+}
+
+/// Preview parity for a ROOTED source: discovery must hand `OfferSelection` unrooted
+/// candidates (root = None) exactly as `plan_target` does, so the offer's own root
+/// re-anchors them. Discovering WITH the root yielded already-root-relative candidates
+/// that the rooted offer then rejected, emptying the preview for every rooted source.
+#[test]
+fn preview_of_a_rooted_source_emits_root_relative_leaves_matching_deploy() {
+    let (src, url, head) = build_loose_file_repo();
+    let git_dir = TempDir::new().expect("git dir");
+    let backend = GitBackend::new(git_dir.path().to_path_buf());
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n[sources.rooted]\ngit = \"{url}\"\nbranch = \"main\"\nroot = \"editor\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\"rooted\"]\nlayout = \"flat\"\n",
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("rooted-source config parses");
+
+    backend.fetch(&sn("rooted"), &url).expect("seed fetch");
+    let lock = lock_with(&cfg, "rooted", &url, &head);
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+
+    let plans = preview_targets(&cfg, &parsed, &remotes, &backend, Some(&lock), false)
+        .expect("preview builds a plan");
+    let plan = only_plan(&plans, "dest");
+
+    let synced: BTreeSet<String> = plan
+        .entries
+        .iter()
+        .filter(|e| e.state == SyncState::Synced)
+        .map(|e| e.artifact.clone())
+        .collect();
+    assert!(
+        synced.contains("init.lua"),
+        "a rooted source's preview must emit its root-relative leaf `init.lua` (the offer root \
+         `editor` re-anchors the unrooted candidates); discovering WITH the root double-applied it \
+         and emptied the preview, got {synced:?}"
+    );
+    assert!(
+        !synced.contains("notes.txt"),
+        "the loose file OUTSIDE the offer root must not appear — the root scopes the offer, \
+         got {synced:?}"
+    );
+
+    drop(src);
 }
 
 #[test]
@@ -7152,76 +7111,74 @@ fn preview_plan_without_files_leaves_entries_unenriched() {
     );
 }
 
-// ── offline file lister (SourceBackend::list_artifact_files) ──
+// ── offline leaf lister (SourceBackend::list_source_leaves) ──
 
 #[test]
-fn list_artifact_files_returns_artifact_files_offline_without_fetching() {
+fn list_source_leaves_under_artifact_root_lists_offline_without_fetching() {
     let fx = build_sync_fixture();
     fx.backend
         .fetch(&sn("editor-src"), &fx.url)
         .expect("seed mirror so the lister can read the tree without fetching");
     let counting = CountingBackend::new(&fx.backend);
-    let selection = Selection::new(&[], &[]).expect("empty selection builds");
 
-    let files = counting
-        .list_artifact_files(
+    let leaves = counting
+        .list_source_leaves(
             &sn("editor-src"),
             &fx.url,
             &fx.head_sha,
-            None,
-            &an("editor"),
-            &selection,
+            Some(Path::new("editor")),
         )
-        .expect("listing a synced artifact's files must succeed");
+        .expect("listing a synced artifact's leaves must succeed");
 
     assert!(
-        files.contains(&PathBuf::from("init.lua")),
-        "the editor artifact's files must include init.lua, got {files:?}"
+        leaves.contains(&"init.lua".to_string()),
+        "the editor artifact's leaves must include init.lua, got {leaves:?}"
     );
     assert!(
-        files.contains(&PathBuf::from("notes.bak")),
-        "with an empty selection notes.bak is included too, got {files:?}"
+        leaves.contains(&"notes.bak".to_string()),
+        "the unfiltered leaf walk lists notes.bak too, got {leaves:?}"
     );
     assert_eq!(
         counting.fetch_count(),
         0,
-        "list_artifact_files must read the seeded mirror, performing NO fetch"
+        "list_source_leaves must read the seeded mirror, performing NO fetch"
     );
     assert_eq!(
         counting.export_count(),
         0,
-        "list_artifact_files must not export/write anything"
+        "list_source_leaves must not export/write anything"
     );
 }
 
 #[test]
-fn list_artifact_files_respects_selection_exclude() {
+fn offer_selection_exclude_drops_the_leaf_it_matches() {
     let fx = build_sync_fixture();
     fx.backend
         .fetch(&sn("editor-src"), &fx.url)
         .expect("seed mirror");
-    let selection =
-        Selection::new(&[], &["**/*.bak".to_owned()]).expect("exclude selection builds");
 
-    let files = fx
+    let leaves = fx
         .backend
-        .list_artifact_files(
+        .list_source_leaves(
             &sn("editor-src"),
             &fx.url,
             &fx.head_sha,
-            None,
-            &an("editor"),
-            &selection,
+            Some(Path::new("editor")),
         )
-        .expect("listing with an exclude must succeed");
+        .expect("leaf walk succeeds");
+    let candidates: Vec<&str> = leaves.iter().map(String::as_str).collect();
+
+    let selection = crate::kernel::OfferSelection::compile(&[], &["**/*.bak".to_owned()], None)
+        .expect("exclude offer compiles");
+    let selected = selection.select(&candidates);
 
     assert!(
-        files.contains(&PathBuf::from("init.lua")),
-        "init.lua is not excluded and must be listed, got {files:?}"
+        selected.contains(&"init.lua".to_string()),
+        "init.lua is not excluded and must be selected, got {selected:?}"
     );
     assert!(
-        !files.contains(&PathBuf::from("notes.bak")),
-        "a **/*.bak exclude must drop notes.bak from the listing, got {files:?}"
+        !selected.contains(&"notes.bak".to_string()),
+        "a **/*.bak exclude must drop notes.bak from the selection, got {selected:?}"
     );
 }
 
@@ -8603,22 +8560,6 @@ fn feature_free_config_deploys_byte_identically_with_unchanged_lock_and_manifest
     );
 }
 
-impl RenderHarness {
-    /// Oracle source-bytes digest for INV-8 / INV-6 reuse, mirroring the sync
-    /// fixture's `expected_digest_for_source` but over a `RenderHarness` url.
-    #[expect(
-        dead_code,
-        reason = "source-bytes digest oracle kept available for INV-6/INV-8 checks"
-    )]
-    fn digest_for(&self, source: &ParsedSource, name: &str, commit: &str) -> String {
-        let m = crate::kernel::Selection::new(source.includes(), source.excludes())
-            .expect("source matcher builds");
-        self.backend
-            .compute_digest(&sn(name), &self.url, commit, source.root.as_deref(), &m)
-            .expect("source digest computes")
-    }
-}
-
 #[test]
 fn deployed_name_collision_within_an_artifact_is_a_clear_failure_not_last_writer_wins() {
     // A single artifact tree holding BOTH `foo` and `foo.tmpl` -> both map to the
@@ -8763,17 +8704,6 @@ impl SourceBackend for SyncRecordingBackend<'_> {
     ) -> SourceResult<u64> {
         self.inner.commit_time(source, url, commit)
     }
-    fn discover_artifacts(
-        &self,
-        source: &crate::kernel::SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        selection: &crate::kernel::Selection,
-    ) -> SourceResult<Vec<crate::kernel::ArtifactName>> {
-        self.inner
-            .discover_artifacts(source, url, commit, root, selection)
-    }
     fn export_artifact(&self, req: &ExportRequest<'_>) -> SourceResult<ExportResult> {
         self.inner.export_artifact(req)
     }
@@ -8783,22 +8713,11 @@ impl SourceBackend for SyncRecordingBackend<'_> {
         url: &str,
         commit: &str,
         root: Option<&Path>,
-        selection: &crate::kernel::Selection,
+        include: &[String],
+        exclude: &[String],
     ) -> SourceResult<String> {
         self.inner
-            .compute_digest(source, url, commit, root, selection)
-    }
-    fn list_artifact_files(
-        &self,
-        source: &crate::kernel::SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        artifact: &crate::kernel::ArtifactName,
-        selection: &crate::kernel::Selection,
-    ) -> SourceResult<Vec<std::path::PathBuf>> {
-        self.inner
-            .list_artifact_files(source, url, commit, root, artifact, selection)
+            .compute_digest(source, url, commit, root, include, exclude)
     }
     fn list_source_leaves(
         &self,
@@ -8924,16 +8843,6 @@ impl SourceBackend for UrlFetchRecordingBackend {
     ) -> SourceResult<u64> {
         Ok(1)
     }
-    fn discover_artifacts(
-        &self,
-        _source: &crate::kernel::SourceName,
-        _url: &str,
-        _commit: &str,
-        _root: Option<&Path>,
-        _selection: &crate::kernel::Selection,
-    ) -> SourceResult<Vec<crate::kernel::ArtifactName>> {
-        Ok(Vec::new())
-    }
     fn export_artifact(&self, _req: &ExportRequest<'_>) -> SourceResult<ExportResult> {
         Ok(ExportResult {
             files: Vec::new(),
@@ -8947,20 +8856,10 @@ impl SourceBackend for UrlFetchRecordingBackend {
         _url: &str,
         _commit: &str,
         _root: Option<&Path>,
-        _selection: &crate::kernel::Selection,
+        _include: &[String],
+        _exclude: &[String],
     ) -> SourceResult<String> {
         Ok("canned-digest".to_owned())
-    }
-    fn list_artifact_files(
-        &self,
-        _source: &crate::kernel::SourceName,
-        _url: &str,
-        _commit: &str,
-        _root: Option<&Path>,
-        _artifact: &crate::kernel::ArtifactName,
-        _selection: &crate::kernel::Selection,
-    ) -> SourceResult<Vec<std::path::PathBuf>> {
-        Ok(Vec::new())
     }
 }
 
@@ -9734,7 +9633,7 @@ mod leaf_granular_deploy_tests {
 
         let recs = records(&registry, "dest");
         assert!(
-            recs.iter().all(|r| r.layout != crate::store::MAP_LAYOUT),
+            recs.iter().all(|r| r.layout != "map"),
             "no deployed record may carry layout == \"map\"; a rename is a normal leaf record \
              under the active layout; got {recs:?}"
         );

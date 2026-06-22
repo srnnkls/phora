@@ -41,9 +41,6 @@ pub enum Error {
     #[error("root path not found in tree: {root}")]
     RootNotFound { root: std::path::PathBuf },
 
-    #[error("artifact not found in tree: {artifact}")]
-    ArtifactNotFound { artifact: String },
-
     #[error("symlink not allowed: {path} (set allow_symlinks=true to permit)")]
     SymlinkNotAllowed { path: std::path::PathBuf },
 
