@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::config::{Config, DeployMode, LayoutConfig, Offer, ParsedSource, TakeEntry, Target};
+use crate::config::{
+    Config, DeployMode, LayoutConfig, Offer, ParsedSource, TakeEntry, Target, TemplateOptIn,
+};
 use crate::diagnostic::SelectionDiagnostic;
 use crate::error::{Error, Result};
 use crate::kernel::{
@@ -64,6 +66,7 @@ pub struct ResolvedBindingPlan {
 pub struct PlannedItem {
     pub materialization: Materialization,
     pub destination: PathBuf,
+    pub kept_leaves: Vec<crate::kernel::ResolvedTake>,
 }
 
 /// A non-fatal take/collapse outcome carried up from the kernel.
@@ -85,6 +88,7 @@ pub struct BindingPlanInput<'a> {
     pub collapse: Option<bool>,
     pub layout: &'a LayoutConfig,
     pub target_path: &'a Path,
+    pub template_opt_in: &'a TemplateOptIn,
 }
 
 /// Resolves one binding: compile the offer, seal `take` over it, fold collapse, then
@@ -116,18 +120,24 @@ pub fn resolve_binding_plan(input: &BindingPlanInput<'_>) -> Result<ResolvedBind
         Some(true) => CollapseChoice::ForceCollapse,
     };
     let plan = plan_collapse(&resolution.kept, &physical_tree, mode, choice)?;
+    let materializations =
+        reject_partial_take_collapse(plan.items, &resolution.kept, &offer, input.collapse)?
+            .into_iter()
+            .map(|m| apply_deployed_name(m, input))
+            .collect::<Vec<_>>();
 
-    let items = plan
-        .items
+    let items = materializations
         .into_iter()
         .map(|materialization| {
             let key = materialization_key(&materialization);
             let destination = input
                 .target_path
                 .join(input.layout.artifact_path(input.identity, key));
+            let kept_leaves = kept_leaves_under(&materialization, &resolution.kept);
             PlannedItem {
                 materialization,
                 destination,
+                kept_leaves,
             }
         })
         .collect();
@@ -155,6 +165,69 @@ pub fn resolve_binding_plan(input: &BindingPlanInput<'_>) -> Result<ResolvedBind
     })
 }
 
+/// A `CollapsedDir` is sound only when every *offered* leaf under it is kept at
+/// identity; a `take` that drops an offered sibling makes the dir partial. The
+/// partial dir is re-collapsed against only its offered-and-kept leaves, so a
+/// wholly-taken sub-dir still collapses while the dropped siblings stay out.
+fn reject_partial_take_collapse(
+    items: Vec<Materialization>,
+    kept: &[crate::kernel::ResolvedTake],
+    offer: &[String],
+    collapse: Option<bool>,
+) -> Result<Vec<Materialization>> {
+    let kept_at_identity: std::collections::BTreeSet<&str> = kept
+        .iter()
+        .filter(|r| r.source == r.dest)
+        .map(|r| r.source.as_str())
+        .collect();
+    let mode = CollapseMode::Link;
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let Materialization::CollapsedDir { dir } = &item else {
+            out.push(item);
+            continue;
+        };
+        let prefix = format!("{dir}/");
+        let offered_orphan = offer
+            .iter()
+            .any(|leaf| leaf.starts_with(&prefix) && !kept_at_identity.contains(leaf.as_str()));
+        if !offered_orphan {
+            out.push(item);
+            continue;
+        }
+        if collapse == Some(true) {
+            return Err(partial_take_collapse_diagnostic(dir));
+        }
+        let kept_under: Vec<crate::kernel::ResolvedTake> = kept
+            .iter()
+            .filter(|r| r.source.starts_with(&prefix))
+            .cloned()
+            .collect();
+        let offered_under: Vec<String> = offer
+            .iter()
+            .filter(|leaf| leaf.starts_with(&prefix))
+            .cloned()
+            .collect();
+        let sub = plan_collapse(&kept_under, &offered_under, mode, CollapseChoice::Default)?;
+        out.extend(sub.items);
+    }
+    out.sort_by(|a, b| materialization_key(a).cmp(materialization_key(b)));
+    Ok(out)
+}
+
+fn partial_take_collapse_diagnostic(dir: &str) -> Error {
+    SelectionDiagnostic {
+        entry: dir.to_owned(),
+        matched_against: "the offered leaves under the collapsed directory".to_owned(),
+        why: "`collapse = true` was demanded but `take` keeps only part of the offered directory"
+            .to_owned(),
+        did_you_mean: None,
+        remedy: "take the whole directory, or omit `collapse`".to_owned(),
+        debug_hint: None,
+    }
+    .sync()
+}
+
 fn map_take_entries(entries: &[TakeEntry]) -> Vec<Take<'_>> {
     entries
         .iter()
@@ -171,6 +244,33 @@ fn materialization_key(materialization: &Materialization) -> &str {
         Materialization::CollapsedDir { dir } => dir,
         Materialization::Leaf(take) => &take.dest,
     }
+}
+
+fn apply_deployed_name(
+    materialization: Materialization,
+    input: &BindingPlanInput<'_>,
+) -> Materialization {
+    let Materialization::Leaf(mut take) = materialization else {
+        return materialization;
+    };
+    if input.mode == DeployMode::Copy && take.source == take.dest {
+        take.dest = input.template_opt_in.deployed_name(&take.source);
+    }
+    Materialization::Leaf(take)
+}
+
+fn kept_leaves_under(
+    materialization: &Materialization,
+    kept: &[crate::kernel::ResolvedTake],
+) -> Vec<crate::kernel::ResolvedTake> {
+    let Materialization::CollapsedDir { dir } = materialization else {
+        return Vec::new();
+    };
+    let prefix = format!("{dir}/");
+    kept.iter()
+        .filter(|r| r.dest.starts_with(&prefix))
+        .cloned()
+        .collect()
 }
 
 /// Resolves every binding of one target, then rejects any destination two bindings
@@ -283,6 +383,7 @@ pub fn plan_target(
             take: binding.take.map(<[TakeEntry]>::to_vec),
             mode: source.deploy_mode(),
             collapse: binding.collapse,
+            template_opt_in: binding.template_opt_in,
         });
     }
 
@@ -299,6 +400,7 @@ pub fn plan_target(
             collapse: d.collapse,
             layout: &layout,
             target_path: &path,
+            template_opt_in: &d.template_opt_in,
         })
         .collect();
 
@@ -314,6 +416,7 @@ struct DiscoveredBinding<'a> {
     take: Option<Vec<TakeEntry>>,
     mode: DeployMode,
     collapse: Option<bool>,
+    template_opt_in: TemplateOptIn,
 }
 
 /// Every candidate leaf one binding offers at `commit`, unfiltered: the offer's
@@ -355,7 +458,7 @@ pub fn plan_targets(
 mod leaf_granular_resolver_tests {
     use std::path::{Path, PathBuf};
 
-    use crate::config::{DeployMode, LayoutConfig, ParsedSource, Source, TakeEntry};
+    use crate::config::{DeployMode, LayoutConfig, ParsedSource, Source, TakeEntry, TemplateOptIn};
     use crate::diagnostic::{MATCHED_AGAINST, REMEDY, SELECTION};
     use crate::kernel::Materialization;
 
@@ -454,6 +557,7 @@ mod leaf_granular_resolver_tests {
                 collapse: None,
                 layout: &self.layout,
                 target_path: &self.target_path,
+                template_opt_in: &TemplateOptIn::SuffixOnly,
             };
             resolve_binding_plan(&input)
         }
@@ -648,6 +752,7 @@ mod leaf_granular_resolver_tests {
             collapse: Some(false),
             layout: &LayoutConfig::default(),
             target_path: Path::new("/dst"),
+            template_opt_in: &TemplateOptIn::SuffixOnly,
         };
         let plan = resolve_binding_plan(&input).expect("plan resolves");
         assert_eq!(
@@ -672,6 +777,7 @@ mod leaf_granular_resolver_tests {
             collapse: Some(true),
             layout: &LayoutConfig::default(),
             target_path: Path::new("/dst"),
+            template_opt_in: &TemplateOptIn::SuffixOnly,
         };
         let rendered = resolve_binding_plan(&input)
             .expect_err(
@@ -768,6 +874,7 @@ mod leaf_granular_resolver_tests {
             collapse: Some(false),
             layout: &LayoutConfig::default(),
             target_path: Path::new("/dst"),
+            template_opt_in: &TemplateOptIn::SuffixOnly,
         };
         let second = BindingPlanInput {
             identity: "two",
@@ -780,6 +887,7 @@ mod leaf_granular_resolver_tests {
             collapse: Some(false),
             layout: &LayoutConfig::default(),
             target_path: Path::new("/dst"),
+            template_opt_in: &TemplateOptIn::SuffixOnly,
         };
         let rendered = super::resolve_target_plan("home", &[first, second])
             .expect_err(
@@ -803,6 +911,7 @@ mod leaf_granular_resolver_tests {
             collapse: Some(false),
             layout: &LayoutConfig::default(),
             target_path: Path::new("/dst"),
+            template_opt_in: &TemplateOptIn::SuffixOnly,
         };
         let lower = BindingPlanInput {
             identity: "two",
@@ -815,6 +924,7 @@ mod leaf_granular_resolver_tests {
             collapse: Some(false),
             layout: &LayoutConfig::default(),
             target_path: Path::new("/dst"),
+            template_opt_in: &TemplateOptIn::SuffixOnly,
         };
         super::resolve_target_plan("home", &[upper, lower]).expect_err(
             "`C` and `c` collide under simple fold and must be rejected across bindings",
@@ -831,6 +941,7 @@ mod leaf_granular_resolver_tests {
             collapse: Some(false),
             layout: &LayoutConfig::default(),
             target_path: Path::new("/dst"),
+            template_opt_in: &TemplateOptIn::SuffixOnly,
         };
         let ss = BindingPlanInput {
             identity: "two",
@@ -843,6 +954,7 @@ mod leaf_granular_resolver_tests {
             collapse: Some(false),
             layout: &LayoutConfig::default(),
             target_path: Path::new("/dst"),
+            template_opt_in: &TemplateOptIn::SuffixOnly,
         };
         super::resolve_target_plan("home", &[sharp_s, ss]).expect(
             "`straße` and `strasse` are distinct under simple fold (not full case-fold) and must \

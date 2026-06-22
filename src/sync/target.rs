@@ -1,18 +1,17 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::config::{DeployMode, LayoutConfig, LayoutKind, ParsedSource, Target, TemplateOptIn};
+use crate::config::{DeployMode, LayoutKind, ParsedSource, Target, TemplateOptIn};
 use crate::deploy::{ArtifactState, Journal, check_artifact_state, deploy_artifact, link_artifact};
 use crate::error::{Error, Result};
-use crate::kernel::{ArtifactName, Selection, SourceName};
-use crate::lock::encode_ref;
+use crate::kernel::{ArtifactName, Materialization, Selection, SourceName, safe_relpath};
 use crate::source::{ExportRequest, SourceBackend};
 use crate::store::{
     ArtifactKey, EjectedEntry, MAP_LAYOUT, ProjectedRecord, RecordKind, Registry, RegistryRecord,
 };
 
 use super::confine::{ProtectedPathSet, confine_destination};
-use super::discover::discover_artifacts_for_source;
+use super::plan::{PlanWarning, PlannedItem, plan_target};
 use super::{
     Conflict, ConflictKind, ConflictResolver, Resolution, StagingGuard, nonce, remote_for,
     target_parent,
@@ -58,51 +57,47 @@ pub(super) fn deploy_target(
     registry: &dyn Registry,
     journal: &Journal,
 ) -> Result<bool> {
-    let target_path = run.target.expanded_path();
-    let layout = run.target.layout();
+    let layout_kind = run.target.layout().kind;
     let ejected = registry.load_ejected(run.target_name)?;
-    let mut seen_dest: BTreeMap<PathBuf, String> = BTreeMap::new();
     let mut had_failures = false;
 
-    for binding in run.target.resolve_sources(run.parsed) {
-        let source = run.parsed.get(binding.source).ok_or_else(|| {
+    let plan = plan_target(
+        run.target_name,
+        run.target,
+        run.parsed,
+        run.remotes,
+        backend,
+        run.commits,
+    )?;
+
+    let template_opt_ins: BTreeMap<String, TemplateOptIn> = run
+        .target
+        .resolve_sources(run.parsed)
+        .into_iter()
+        .map(|b| (b.identity.to_owned(), b.template_opt_in))
+        .collect();
+
+    for binding in &plan.bindings {
+        surface_plan_warnings(&binding.warnings);
+        let template_opt_in = template_opt_ins.get(&binding.identity).ok_or_else(|| {
+            Error::Sync(format!(
+                "binding `{}` planned without a resolved template opt-in",
+                binding.identity
+            ))
+        })?;
+        let source = run.parsed.get(&binding.source).ok_or_else(|| {
             Error::Config(format!(
                 "target references undefined source: {}",
                 binding.source
             ))
         })?;
-        let commit_key = (
-            binding.source.to_owned(),
-            encode_ref(&binding.effective_ref),
-        );
-        let commit = run.commits.get(&commit_key).ok_or_else(|| {
-            Error::Sync(format!(
-                "no resolved commit for {} at {}",
-                binding.source, binding.effective_ref
-            ))
-        })?;
-        let git = remote_for(run.remotes, binding.source)?;
-        let source_name = SourceName::trusted(binding.source);
-        let selection = Selection::new(binding.include, binding.exclude)?;
+        let git = remote_for(run.remotes, &binding.source)?;
+        let source_name = SourceName::trusted(&binding.source);
 
-        let mut deploy_one_entry = |artifact_name: &ArtifactName,
-                                    mapped_source_key: Option<&str>|
-         -> Result<()> {
-            let artifact_dst = artifact_dst_for(
-                &target_path,
-                &layout,
-                binding.identity,
-                artifact_name,
-                mapped_source_key,
-            );
-            if let Some(other) = seen_dest.insert(artifact_dst.clone(), binding.identity.to_owned())
-            {
-                return Err(Error::Collision {
-                    artifact: artifact_name.as_str().to_owned(),
-                    sources: vec![other, binding.identity.to_owned()],
-                    target: run.target_name.to_owned(),
-                });
-            }
+        for item in &binding.items {
+            let key = published_key(&item.materialization);
+            safe_relpath(key).map_err(|_| unsafe_dest_diagnostic(key))?;
+            let artifact_dst = run.confined(&item.destination)?;
             let dst_is_symlink =
                 std::fs::symlink_metadata(&artifact_dst).is_ok_and(|m| m.file_type().is_symlink());
             let mode_transition = match source.deploy_mode() {
@@ -113,39 +108,57 @@ pub(super) fn deploy_target(
                 source,
                 git,
                 source_name: &source_name,
-                identity: binding.identity,
-                underlying_source: binding.source,
-                root: binding.root,
-                commit,
-                selection: &selection,
-                artifact_name,
-                target_path: &target_path,
-                layout_kind: layout.kind,
+                identity: &binding.identity,
+                underlying_source: &binding.source,
+                commit: &binding.commit,
+                item,
+                artifact_dst: &artifact_dst,
+                layout_kind,
                 ejected: &ejected,
                 mode_transition,
-                template_opt_in: &binding.template_opt_in,
-                mapped_source_key,
+                template_opt_in,
             };
             had_failures |= deploy_artifact_entry(run, &entry, backend, registry, journal)?;
-            Ok(())
-        };
-
-        let discovered = discover_artifacts_for_source(
-            source,
-            git,
-            &source_name,
-            commit,
-            backend,
-            &selection,
-            binding.root,
-        )?;
-
-        for artifact_name in discovered {
-            deploy_one_entry(&artifact_name, None)?;
         }
     }
 
     Ok(had_failures)
+}
+
+fn surface_plan_warnings(warnings: &[PlanWarning]) {
+    for warning in warnings {
+        match warning {
+            PlanWarning::TakeNoMatchGlob(pattern) => {
+                eprintln!("phora: take pattern matched no offered leaf: {pattern}");
+            }
+            PlanWarning::LostCollapseToExclude(dir) => {
+                eprintln!(
+                    "phora: dir `{dir}` cannot collapse to one symlink under a within-dir exclude; \
+                     falling back to per-leaf links"
+                );
+            }
+        }
+    }
+}
+
+/// The published artifact key — the collapsed-dir or the renamed/identity leaf dest.
+fn published_key(materialization: &Materialization) -> &str {
+    match materialization {
+        Materialization::CollapsedDir { dir } => dir,
+        Materialization::Leaf(take) => &take.dest,
+    }
+}
+
+fn unsafe_dest_diagnostic(dest: &str) -> Error {
+    crate::diagnostic::SelectionDiagnostic {
+        entry: dest.to_owned(),
+        matched_against: "the deploy root".to_owned(),
+        why: "destination is not a portable relative path".to_owned(),
+        did_you_mean: None,
+        remedy: "use a forward-slashed relative path inside the deploy root".to_owned(),
+        debug_hint: None,
+    }
+    .sync()
 }
 
 pub(super) struct ArtifactEntry<'a> {
@@ -154,17 +167,26 @@ pub(super) struct ArtifactEntry<'a> {
     pub(super) source_name: &'a SourceName,
     pub(super) identity: &'a str,
     pub(super) underlying_source: &'a str,
-    pub(super) root: Option<&'a Path>,
     pub(super) commit: &'a str,
-    pub(super) selection: &'a Selection,
-    pub(super) artifact_name: &'a ArtifactName,
-    pub(super) target_path: &'a Path,
+    pub(super) item: &'a PlannedItem,
+    pub(super) artifact_dst: &'a Path,
     pub(super) layout_kind: LayoutKind,
     pub(super) ejected: &'a [EjectedEntry],
     pub(super) mode_transition: bool,
     pub(super) template_opt_in: &'a TemplateOptIn,
-    /// Source-side key for a mapped leaf; `None` for layout-routed artifacts.
-    pub(super) mapped_source_key: Option<&'a str>,
+}
+
+impl ArtifactEntry<'_> {
+    fn published_key(&self) -> &str {
+        published_key(&self.item.materialization)
+    }
+
+    fn record_kind(&self) -> RecordKind {
+        match &self.item.materialization {
+            Materialization::CollapsedDir { .. } => RecordKind::Dir,
+            Materialization::Leaf(_) => RecordKind::File,
+        }
+    }
 }
 
 /// A `map`-layout dest is a single component at the target root; layout helpers must not be applied.
@@ -194,31 +216,6 @@ pub(super) fn record_manifest_base(target: &Target, record: &RegistryRecord) -> 
     }
 }
 
-/// Mapped leaves land as a renamed FILE at the target root, ignoring layout.
-fn artifact_dst_for(
-    target_path: &Path,
-    layout: &LayoutConfig,
-    identity: &str,
-    artifact_name: &ArtifactName,
-    mapped_source_key: Option<&str>,
-) -> PathBuf {
-    if mapped_source_key.is_some() {
-        target_path.join(artifact_name.as_str())
-    } else {
-        target_path.join(layout.artifact_path(identity, artifact_name.as_str()))
-    }
-}
-
-fn artifact_dst_for_entry(run: TargetRun<'_>, entry: &ArtifactEntry<'_>) -> PathBuf {
-    artifact_dst_for(
-        entry.target_path,
-        &run.target.layout(),
-        entry.identity,
-        entry.artifact_name,
-        entry.mapped_source_key,
-    )
-}
-
 pub(super) fn deploy_artifact_entry(
     run: TargetRun<'_>,
     entry: &ArtifactEntry<'_>,
@@ -226,20 +223,21 @@ pub(super) fn deploy_artifact_entry(
     registry: &dyn Registry,
     journal: &Journal,
 ) -> Result<bool> {
-    let artifact_dst = run.confined(&artifact_dst_for_entry(run, entry))?;
+    let artifact_dst = entry.artifact_dst;
+    let published_key = entry.published_key().to_owned();
     let key = ArtifactKey {
         target: run.target_name.to_owned(),
         source: entry.identity.to_owned(),
-        artifact: entry.artifact_name.as_str().to_owned(),
+        artifact: published_key.clone(),
     };
 
     let expected_vars_digest = expected_vars_digest(entry, backend, registry, &key, run.vars)?;
     let state = check_artifact_state(
-        &artifact_dst,
+        artifact_dst,
         entry.identity,
         entry.commit,
         entry.ejected,
-        entry.artifact_name.as_str(),
+        &published_key,
         registry,
         &key,
         expected_vars_digest.as_deref(),
@@ -248,7 +246,7 @@ pub(super) fn deploy_artifact_entry(
     let conflict_kind = conflict_kind_for(&state, entry, run.force);
 
     let deploy = |key: ArtifactKey| match entry.source.deploy_mode() {
-        DeployMode::Link => deploy_link(registry, journal, entry, &artifact_dst, key),
+        DeployMode::Link => deploy_link(registry, journal, entry, key),
         DeployMode::Copy => deploy_one(
             backend,
             registry,
@@ -259,15 +257,15 @@ pub(super) fn deploy_artifact_entry(
                 git: entry.git,
                 source_name: entry.source_name,
                 underlying_source: entry.underlying_source,
-                root: entry.root,
+                root: entry.source.offer().root(),
                 commit: entry.commit,
-                selection: entry.selection,
-                artifact_name: entry.artifact_name,
-                artifact_dst: &artifact_dst,
+                materialization: &entry.item.materialization,
+                kept_leaves: &entry.item.kept_leaves,
+                kind: entry.record_kind(),
+                artifact_dst,
                 key,
                 template_opt_in: entry.template_opt_in,
                 vars: run.vars,
-                mapped_source_key: entry.mapped_source_key,
                 confine_anchor: run.target.confine.as_deref(),
             },
         ),
@@ -287,16 +285,11 @@ pub(super) fn deploy_artifact_entry(
             Some(resolver) if run.interactive => resolver.resolve(&Conflict {
                 target: run.target_name.to_owned(),
                 source: entry.identity.to_owned(),
-                artifact: entry.artifact_name.as_str().to_owned(),
+                artifact: published_key.clone(),
                 kind,
             }),
             _ => {
-                warn_skip(
-                    entry.identity,
-                    entry.artifact_name.as_str(),
-                    &kind,
-                    &artifact_dst,
-                );
+                warn_skip(entry.identity, &published_key, &kind, artifact_dst);
                 Resolution::Skip
             }
         },
@@ -308,8 +301,8 @@ pub(super) fn deploy_artifact_entry(
             Ok(()) => Ok(false),
             Err(e) => {
                 eprintln!(
-                    "phora: failed to deploy {}:{}: {e}",
-                    entry.identity, entry.artifact_name
+                    "phora: failed to deploy {}:{published_key}: {e}",
+                    entry.identity
                 );
                 Ok(true)
             }
@@ -318,7 +311,7 @@ pub(super) fn deploy_artifact_entry(
             let mut ejected = registry.load_ejected(run.target_name)?;
             ejected.push(EjectedEntry {
                 source: entry.identity.to_owned(),
-                artifact: entry.artifact_name.as_str().to_owned(),
+                artifact: published_key.clone(),
                 ejected_at: chrono::Utc::now().to_rfc3339(),
             });
             registry.save_ejected(run.target_name, &ejected)?;
@@ -346,19 +339,22 @@ fn expected_vars_digest(
     if record.linked || record.vars_digest.is_none() {
         return Ok(None);
     }
-    let files = backend.list_artifact_files(
-        entry.source_name,
-        entry.git,
-        entry.commit,
-        entry.root,
-        entry.artifact_name,
-        entry.selection,
-    )?;
-    let templated = files.iter().any(|p| {
-        entry
-            .template_opt_in
-            .renders(&p.to_string_lossy().replace('\\', "/"))
-    });
+    let offer_root = entry.source.offer().root();
+    let templated = match &entry.item.materialization {
+        Materialization::Leaf(take) => entry.template_opt_in.renders(&take.source),
+        Materialization::CollapsedDir { dir } => {
+            let subtree = offer_root.map_or_else(|| PathBuf::from(dir), |r| r.join(dir));
+            let leaves = backend.list_source_leaves(
+                entry.source_name,
+                entry.git,
+                entry.commit,
+                Some(&subtree),
+            )?;
+            leaves
+                .iter()
+                .any(|leaf| entry.template_opt_in.renders(&format!("{dir}/{leaf}")))
+        }
+    };
     Ok(templated.then(|| crate::source::vars_digest(vars)))
 }
 
@@ -403,13 +399,13 @@ struct DeployContext<'a> {
     underlying_source: &'a str,
     root: Option<&'a Path>,
     commit: &'a str,
-    selection: &'a Selection,
-    artifact_name: &'a ArtifactName,
+    materialization: &'a Materialization,
+    kept_leaves: &'a [crate::kernel::ResolvedTake],
+    kind: RecordKind,
     artifact_dst: &'a Path,
     key: ArtifactKey,
     template_opt_in: &'a TemplateOptIn,
     vars: &'a BTreeMap<String, String>,
-    mapped_source_key: Option<&'a str>,
     confine_anchor: Option<&'a Path>,
 }
 
@@ -420,33 +416,60 @@ fn deploy_one(
     ctx: DeployContext<'_>,
 ) -> Result<()> {
     let staging_base = target_parent(ctx.artifact_dst).join(".phora-stage");
-    let staging = staging_base.join(format!("{}-{}", ctx.artifact_name, nonce()));
+    let key_label = ctx.key.artifact.replace('/', "_");
+    let staging = staging_base.join(format!("{key_label}-{}", nonce()));
     let mut staging_guard = StagingGuard::new(&staging_base, &staging);
 
     let git = ctx.git;
     let commit_time = backend.commit_time(ctx.source_name, git, ctx.commit)?;
     let policy = ctx.source.export_policy();
-    let path_map = ctx.mapped_source_key.map(|key| {
-        BTreeMap::from([(
-            PathBuf::from(key),
-            PathBuf::from(ctx.artifact_name.as_str()),
-        )])
-    });
-    let req = ExportRequest {
-        source: ctx.source_name,
-        url: git,
-        commit: ctx.commit,
-        root: ctx.root,
-        artifact: ctx.artifact_name,
-        selection: ctx.selection,
-        policy: &policy,
-        staging_dir: &staging,
-        commit_time,
-        template_opt_in: ctx.template_opt_in,
-        vars: ctx.vars,
-        path_map: path_map.as_ref(),
+    let empty_selection = Selection::new(&[], &[])?;
+
+    let (export, staging_payload, files) = match ctx.materialization {
+        Materialization::CollapsedDir { dir } => {
+            let artifact = ArtifactName::trusted(dir.clone());
+            let kept_selection = collapsed_dir_selection(dir, ctx.kept_leaves)?;
+            let req = ExportRequest {
+                source: ctx.source_name,
+                url: git,
+                commit: ctx.commit,
+                root: ctx.root,
+                artifact: &artifact,
+                selection: &kept_selection,
+                policy: &policy,
+                staging_dir: &staging,
+                commit_time,
+                template_opt_in: ctx.template_opt_in,
+                vars: ctx.vars,
+                path_map: None,
+            };
+            let export = backend.export_artifact(&req)?;
+            let files = export.files.clone();
+            (export, staging.clone(), files)
+        }
+        Materialization::Leaf(take) => {
+            let dest_leaf = leaf_basename(&take.dest);
+            let path_map =
+                BTreeMap::from([(PathBuf::from(&take.source), PathBuf::from(&dest_leaf))]);
+            let req = ExportRequest {
+                source: ctx.source_name,
+                url: git,
+                commit: ctx.commit,
+                root: ctx.root,
+                artifact: &ArtifactName::trusted(take.dest.clone()),
+                selection: &empty_selection,
+                policy: &policy,
+                staging_dir: &staging,
+                commit_time,
+                template_opt_in: ctx.template_opt_in,
+                vars: ctx.vars,
+                path_map: Some(&path_map),
+            };
+            let export = backend.export_artifact(&req)?;
+            let files = export.files.clone();
+            (export, staging.join(&dest_leaf), files)
+        }
     };
-    let export = backend.export_artifact(&req)?;
 
     if let Some(anchor) = ctx.confine_anchor {
         super::confine::reject_symlink_ancestor_at_write(anchor, ctx.artifact_dst)?;
@@ -462,34 +485,20 @@ fn deploy_one(
         underlying_source: ctx.underlying_source,
         commit: ctx.commit,
         digest: export.digest,
-        layout: if ctx.mapped_source_key.is_some() {
-            MAP_LAYOUT.to_owned()
-        } else {
-            format!("{:?}", ctx.layout_kind).to_lowercase()
-        },
-        kind: RecordKind::Dir,
+        layout: format!("{:?}", ctx.layout_kind).to_lowercase(),
+        kind: ctx.kind,
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
-        files: export.files,
+        files,
         vars_digest: export.vars_digest,
     });
 
-    // Guard stays armed: deploy_artifact only moves the file, so the guard reaps the empty staging dir.
-    if ctx.mapped_source_key.is_some() {
-        return deploy_artifact(
-            &staging_base,
-            &staging.join(ctx.artifact_name.as_str()),
-            ctx.artifact_dst,
-            record,
-            journal,
-            registry,
-        );
+    if matches!(ctx.kind, RecordKind::Dir) {
+        staging_guard.disarm();
     }
-
-    staging_guard.disarm();
     deploy_artifact(
         &staging_base,
-        &staging,
+        &staging_payload,
         ctx.artifact_dst,
         record,
         journal,
@@ -501,7 +510,6 @@ fn deploy_link(
     registry: &dyn Registry,
     journal: &Journal,
     entry: &ArtifactEntry<'_>,
-    artifact_dst: &Path,
     key: ArtifactKey,
 ) -> Result<()> {
     let policy = entry.source.export_policy();
@@ -512,22 +520,18 @@ fn deploy_link(
         commit: "link".to_owned(),
         digest: "link:".to_owned(),
         projected_at: chrono::Utc::now().to_rfc3339(),
-        layout: if entry.mapped_source_key.is_some() {
-            MAP_LAYOUT.to_owned()
-        } else {
-            format!("{:?}", entry.layout_kind).to_lowercase()
-        },
-        kind: RecordKind::Dir,
+        layout: format!("{:?}", entry.layout_kind).to_lowercase(),
+        kind: entry.record_kind(),
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
         files: vec![],
         linked: true,
         vars_digest: None,
     };
-    let staging_base = target_parent(artifact_dst).join(".phora-stage");
+    let staging_base = target_parent(entry.artifact_dst).join(".phora-stage");
     link_artifact(
         &staging_base,
-        artifact_dst,
+        entry.artifact_dst,
         &link_target(entry),
         record,
         journal,
@@ -535,8 +539,6 @@ fn deploy_link(
     )
 }
 
-/// Absolute working-tree path the symlink points at: `<remote>/<root>/<leaf>`, where
-/// `<leaf>` is the mapped source key for a mapped binding, else the artifact name.
 fn link_target(entry: &ArtifactEntry<'_>) -> PathBuf {
     let base = Path::new(entry.git);
     let mut target = if base.is_absolute() {
@@ -546,15 +548,68 @@ fn link_target(entry: &ArtifactEntry<'_>) -> PathBuf {
             std::env::current_dir().map_or_else(|_| base.to_path_buf(), |c| c.join(base))
         })
     };
-    if let Some(root) = entry.root {
+    if let Some(root) = entry.source.offer().root() {
         target.push(root);
     }
-    target.push(
-        entry
-            .mapped_source_key
-            .unwrap_or_else(|| entry.artifact_name.as_str()),
-    );
+    match &entry.item.materialization {
+        Materialization::CollapsedDir { dir } => target.push(dir),
+        Materialization::Leaf(take) => target.push(&take.source),
+    }
     target
+}
+
+fn leaf_basename(dest: &str) -> String {
+    dest.rsplit('/').next().unwrap_or(dest).to_owned()
+}
+
+fn collapsed_dir_selection(
+    dir: &str,
+    kept_leaves: &[crate::kernel::ResolvedTake],
+) -> Result<Selection> {
+    let prefix = format!("{dir}/");
+    let include: Vec<String> = kept_leaves
+        .iter()
+        .filter_map(|kept| kept.source.strip_prefix(&prefix).map(anchor_to_dir_root))
+        .collect();
+    Selection::new(&include, &[])
+}
+
+fn anchor_to_dir_root(under_dir: &str) -> String {
+    format!("/{under_dir}")
+}
+
+#[cfg(test)]
+mod collapsed_dir_selection_tests {
+    use super::*;
+    use crate::kernel::ResolvedTake;
+
+    fn kept(source: &str) -> ResolvedTake {
+        ResolvedTake {
+            source: source.to_owned(),
+            dest: source.to_owned(),
+        }
+    }
+
+    #[test]
+    fn kept_leaf_selection_admits_only_the_kept_child_not_a_deeper_namesake() {
+        let kept_leaves = [kept("editor/a.md")];
+        let sel =
+            collapsed_dir_selection("editor", &kept_leaves).expect("kept-leaf selection compiles");
+
+        assert!(
+            sel.selects_path(Path::new("a.md"), false),
+            "the kept leaf must be admitted at the dir root"
+        );
+        assert!(
+            !sel.selects_path(Path::new("sub/a.md"), false),
+            "a same-named child under a deeper, unkept sibling dir must NOT be re-admitted; the \
+             include is root-anchored, not a `**/` depth match"
+        );
+        assert!(
+            !sel.selects_path(Path::new("secret"), false),
+            "an offer-excluded sibling absent from the kept set must NOT be admitted"
+        );
+    }
 }
 
 #[cfg(test)]

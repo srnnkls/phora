@@ -1244,7 +1244,6 @@ impl ExportWalk<'_, '_> {
         Ok(())
     }
 
-    /// v1 scope: mapped leaves are copied verbatim, never templated.
     fn run_mapped(
         &mut self,
         root_tree: &gix::Tree<'_>,
@@ -1270,7 +1269,7 @@ impl ExportWalk<'_, '_> {
                 _ => return Err(SourceError::MappedKeyNotALeaf { key: key.clone() }),
             };
             let bytes = GitBackend::find_blob_data(self.repo, self.source, entry.object_id())?;
-            self.stage_leaf(dest.clone(), key, &bytes, executable, false)?;
+            self.stage_leaf(dest.clone(), key, &bytes, executable, true)?;
         }
         Ok(())
     }
