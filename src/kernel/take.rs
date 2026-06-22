@@ -197,7 +197,7 @@ fn reject_duplicate_dest(kept: &[ResolvedTake]) -> Result<()> {
 // NFC + simple lowercase, NOT full Unicode case-folding: macOS (APFS) and
 // Windows (NTFS) collide names by simple-fold only, so `straße` and `strasse`
 // remain distinct files there — full folding would over-reject them.
-fn fold_dest(dest: &str) -> String {
+pub(crate) fn fold_dest(dest: &str) -> String {
     dest.nfc().collect::<String>().to_lowercase()
 }
 

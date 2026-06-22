@@ -140,6 +140,25 @@ pub trait SourceBackend {
         ))
     }
 
+    /// Every blob path in the subtree at `root`, forward-slashed, sorted, and
+    /// root-relative, with no selection applied; the default errs unsupported and
+    /// only `GitBackend` overrides it.
+    ///
+    /// # Errors
+    /// - the mirror was never fetched, `commit` is unknown, or `root` is absent at `commit`.
+    fn list_source_leaves(
+        &self,
+        _source: &SourceName,
+        _url: &str,
+        _commit: &str,
+        _root: Option<&Path>,
+    ) -> Result<Vec<String>> {
+        Err(SourceError::Source(
+            "list_source_leaves is unsupported on this backend: mirror reads are git-only"
+                .to_owned(),
+        ))
+    }
+
     fn resolve(&self, source: &SourceName, url: &str, refspec: &Refspec) -> Result<String>;
 
     fn commit_time(&self, source: &SourceName, url: &str, commit: &str) -> Result<u64>;
@@ -510,6 +529,30 @@ impl SourceBackend for GitBackend {
         let repo = gix::open(&mirror)
             .map_err(|e| SourceError::Source(format!("open mirror {source}: {e}")))?;
         read_blob_at(&repo, source, commit, path)
+    }
+
+    fn list_source_leaves(
+        &self,
+        source: &SourceName,
+        url: &str,
+        commit: &str,
+        root: Option<&Path>,
+    ) -> Result<Vec<String>> {
+        let repo = self.open_mirror(source.as_str(), url)?;
+        let subtree = Self::subtree_at_root(&repo, source.as_str(), commit, root)?;
+        let mut recorder = gix::traverse::tree::Recorder::default();
+        subtree
+            .traverse()
+            .breadthfirst(&mut recorder)
+            .map_err(|e| SourceError::Source(format!("walk subtree in {source}: {e}")))?;
+        let mut leaves: Vec<String> = recorder
+            .records
+            .into_iter()
+            .filter(|entry| entry.mode.is_blob())
+            .map(|entry| entry.filepath.to_string())
+            .collect();
+        leaves.sort_unstable();
+        Ok(leaves)
     }
 
     fn fetch(&self, source: &SourceName, url: &str) -> Result<()> {
@@ -935,6 +978,16 @@ impl SourceBackend for HttpBackend {
 
     fn commit_time(&self, source: &SourceName, url: &str, commit: &str) -> Result<u64> {
         self.git.commit_time(source, url, commit)
+    }
+
+    fn list_source_leaves(
+        &self,
+        source: &SourceName,
+        url: &str,
+        commit: &str,
+        root: Option<&Path>,
+    ) -> Result<Vec<String>> {
+        self.git.list_source_leaves(source, url, commit, root)
     }
 
     fn discover_artifacts(
@@ -1913,6 +1966,46 @@ mod tests {
         run_git(src_path, &["config", "user.email", "test@example.com"]);
         run_git(src_path, &["config", "user.name", "Test"]);
         run_git(src_path, &["config", "core.autocrlf", "false"]);
+    }
+
+    #[test]
+    fn list_source_leaves_under_a_root_yields_root_relative_leaves_without_the_root_prefix() {
+        let src = TempDir::new().expect("leaf-root src tempdir");
+        let src_path = src.path();
+        init_export_repo(src_path);
+
+        let art = src_path.join("art");
+        std::fs::create_dir_all(art.join("nested")).expect("create art/nested");
+        std::fs::write(art.join("top.lua"), b"-- top\n").expect("write art/top.lua");
+        std::fs::write(art.join("nested").join("inner.lua"), b"-- inner\n")
+            .expect("write art/nested/inner.lua");
+        std::fs::write(src_path.join("OUTSIDE.md"), b"sibling outside the root\n")
+            .expect("write OUTSIDE.md");
+        run_git(src_path, &["add", "-A"]);
+        let commit = commit_export_repo(src_path);
+
+        let fixture = export_fixture_from(src, commit);
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch builds the mirror the leaf walk reads");
+
+        let leaves = fixture
+            .backend
+            .list_source_leaves(
+                &sn("src"),
+                &fixture.url,
+                &fixture.commit,
+                Some(Path::new("art")),
+            )
+            .expect("leaf walk under root = art succeeds");
+
+        assert_eq!(
+            leaves,
+            vec!["nested/inner.lua".to_string(), "top.lua".to_string()],
+            "leaves under root = `art` must be ROOT-RELATIVE with no `art/` prefix, and must \
+             exclude the sibling `OUTSIDE.md` that lives outside the root; got: {leaves:?}"
+        );
     }
 
     #[expect(

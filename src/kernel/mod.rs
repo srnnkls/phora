@@ -7,7 +7,7 @@ mod name;
 mod path;
 mod project_id;
 mod selection;
-mod take;
+pub(crate) mod take;
 
 pub use collapse::{
     CollapseChoice, CollapseMode, CollapsePlan, CollapseWarning, Materialization, plan_collapse,
@@ -21,3 +21,4 @@ pub use selection::{OfferSelection, Selection, compile_take_glob};
 pub use take::{ResolvedTake, Take, TakeResolution, TakeWarning, is_take_glob, resolve_take};
 
 pub(crate) use name::{safe_component, safe_relpath};
+pub(crate) use take::fold_dest;

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use crate::config::transitive::{FetchNode, Instance, TransitiveManifest};
 use crate::config::{
     Config, DeployMode, HookCommand, Host, ParsedSource, Protocol, Refspec, Remote, SourceMode,
-    Target, admit_transitive_hooks, hook_preimage,
+    TakeEntry, Target, admit_transitive_hooks, hook_preimage,
 };
 use crate::error::{Error, Result};
 use crate::kernel::SourceName;
@@ -211,6 +211,11 @@ fn compose_dep(
     let source_names =
         namespace_dep_sources(instance, imported, manifest, &imported_inner, ctx, depth)?;
 
+    let mount = MountOverride {
+        take: anchor.take.get(imported).map(Vec::as_slice),
+        collapse: anchor.collapse.get(imported).copied(),
+    };
+
     for (dep_target_name, dep_target) in &manifest.targets {
         reject_dep_target_path(imported, dep_target_name, &dep_target.path)?;
         let composed_path = anchor_path.join(&dep_target.path);
@@ -238,6 +243,7 @@ fn compose_dep(
             composed_path.clone(),
             anchor_path.clone(),
             &source_names,
+            &mount,
         )?;
         *ctx.counter += 1;
         let composed_name = namespaced_key(instance, dep_target_name, *ctx.counter);
@@ -488,6 +494,13 @@ fn admit_hook_candidates(
     }
 }
 
+/// Consumer-owned (D13/C3): the importing anchor's mount take/collapse for one imported dep,
+/// looked up by the imported name — never the dep's own `take`/`collapse` tables.
+struct MountOverride<'a> {
+    take: Option<&'a [TakeEntry]>,
+    collapse: Option<bool>,
+}
+
 fn synthetic_target(
     imported: &str,
     dep_target_name: &str,
@@ -495,12 +508,15 @@ fn synthetic_target(
     composed_path: PathBuf,
     anchor_path: PathBuf,
     source_names: &BTreeMap<String, String>,
+    mount: &MountOverride<'_>,
 ) -> Result<Target> {
     let mut target = dep_target.clone();
     target.path = composed_path;
     target.imports = None;
     target.hooks = None;
     target.confine = Some(anchor_path);
+    target.take = BTreeMap::new();
+    target.collapse = BTreeMap::new();
     if let Some(bindings) = target.sources.as_mut() {
         for (identity, binding) in bindings.iter_mut() {
             let effective = binding.source.clone().unwrap_or_else(|| identity.clone());
@@ -510,6 +526,12 @@ fn synthetic_target(
                 ))
             })?;
             binding.source = Some(namespaced.clone());
+            if let Some(take) = mount.take {
+                binding.take = Some(take.to_vec());
+            }
+            if let Some(collapse) = mount.collapse {
+                binding.collapse = Some(collapse);
+            }
         }
     }
     Ok(target)
@@ -912,6 +934,10 @@ mod tests {
             PathBuf::from("/home/me/deploy/nvim"),
             PathBuf::from("/home/me/deploy"),
             &BTreeMap::new(),
+            &MountOverride {
+                take: None,
+                collapse: None,
+            },
         )
         .expect("a composed dep target with no bindings synthesizes");
 
@@ -1170,6 +1196,276 @@ mod tests {
             !err.to_string().contains("no phora.toml"),
             "a mirror-open/git failure must NOT be masked as 'no phora.toml'; the underlying error \
              must surface, got: {err}"
+        );
+    }
+
+    // ── mount take/collapse is CONSUMER-owned, keyed by the imported dep name (SMR-030/D13) ──
+
+    use crate::config::TakeEntry;
+
+    /// A plain dep target — it owns NO mount tables; the consumer keys those.
+    fn dep_target() -> Target {
+        let toml = "version = 1\n\n\
+                    [sources.nvim]\ngit = \"https://github.com/dep/nvim.git\"\n\n\
+                    [targets.editor]\npath = \"nvim\"\nsources = [\"nvim\"]\n";
+        crate::config::Config::parse(toml)
+            .expect("a plain dep config parses")
+            .targets
+            .remove("editor")
+            .expect("dep target `editor` present")
+    }
+
+    /// A dep target whose own binding ALREADY carries a `take` — used to pin that a
+    /// consumer mount override beats the dep's binding-local choice.
+    fn dep_target_with_binding_local_take() -> Target {
+        let toml = "version = 1\n\n\
+                    [sources.nvim]\ngit = \"https://github.com/dep/nvim.git\"\n\n\
+                    [targets.editor]\npath = \"nvim\"\n\n\
+                    [targets.editor.sources]\nnvim = { take = [\"dep-local.lua\"] }\n";
+        crate::config::Config::parse(toml)
+            .expect("a dep config with a binding-local take parses")
+            .targets
+            .remove("editor")
+            .expect("dep target `editor` present")
+    }
+
+    /// The CONSUMER anchor target carrying `imports = ["dep"]` and the mount tables, keyed by the
+    /// imported dep name `dep` (the ground-truth key shape from the config mount-take tests).
+    fn consumer_anchor(mount_body: &str) -> Target {
+        let toml = format!(
+            "version = 1\n\n\
+             [sources.dep]\ngit = \"https://github.com/me/dep.git\"\ntransitive = true\n\n\
+             [targets.claude]\npath = \"~/.claude\"\nimports = [\"dep\"]\n{mount_body}"
+        );
+        crate::config::Config::parse(&toml)
+            .expect("a consumer anchor with mount tables parses")
+            .targets
+            .remove("claude")
+            .expect("consumer target `claude` present")
+    }
+
+    /// The consumer's mount override for imported `dep`, exactly as `compose_dep` builds it.
+    fn mount_for<'a>(anchor: &'a Target, imported: &str) -> MountOverride<'a> {
+        MountOverride {
+            take: anchor.take.get(imported).map(Vec::as_slice),
+            collapse: anchor.collapse.get(imported).copied(),
+        }
+    }
+
+    fn namespaced_for(internal: &str, namespaced: &str) -> BTreeMap<String, String> {
+        BTreeMap::from([(internal.to_owned(), namespaced.to_owned())])
+    }
+
+    fn binding_of<'a>(target: &'a Target, identity: &str) -> &'a crate::config::Binding {
+        target
+            .sources
+            .as_ref()
+            .expect("synthetic target keeps its bindings")
+            .get(identity)
+            .expect("binding present under its identity")
+    }
+
+    #[test]
+    fn mount_take_table_subsets_a_mounted_deps_offer() {
+        let dep = dep_target();
+        let anchor = consumer_anchor("[targets.claude.take]\n\"dep\" = [\"lua/init.lua\"]\n");
+        let synthetic = synthetic_target(
+            "dep",
+            "editor",
+            &dep,
+            PathBuf::from("/home/me/.claude/nvim"),
+            PathBuf::from("/home/me/.claude"),
+            &namespaced_for("nvim", "dep%1%nvim"),
+            &mount_for(&anchor, "dep"),
+        )
+        .expect("a dep mounted under a consumer anchor with a mount take synthesizes");
+
+        let binding = binding_of(&synthetic, "nvim");
+        let take = binding
+            .take
+            .as_deref()
+            .expect("the consumer's mount take for imported `dep` folds into the binding's `take`");
+        assert!(
+            matches!(take, [TakeEntry::Leaf(s)] if s == "lua/init.lua"),
+            "the CONSUMER mount take `[\"lua/init.lua\"]` (keyed by imported `dep`) must fold \
+             verbatim into the namespaced binding so the resolver stays mount-agnostic; got: {take:?}"
+        );
+    }
+
+    #[test]
+    fn mount_take_table_resolves_against_instance_keyed_published_names() {
+        let dep = dep_target();
+        let anchor =
+            consumer_anchor("[targets.claude.take]\n\"dep\" = [{ \"a/X.md\" = \"a/x.md\" }]\n");
+        let synthetic = synthetic_target(
+            "dep",
+            "editor",
+            &dep,
+            PathBuf::from("/home/me/.claude/nvim"),
+            PathBuf::from("/home/me/.claude"),
+            &namespaced_for("nvim", "dep%1%nvim"),
+            &mount_for(&anchor, "dep"),
+        )
+        .expect("a dep with a consumer rename mount take synthesizes");
+
+        let binding = binding_of(&synthetic, "nvim");
+        assert_eq!(
+            binding.source.as_deref(),
+            Some("dep%1%nvim"),
+            "the binding still points at the Instance-keyed published source; got: {:?}",
+            binding.source
+        );
+        let take = binding
+            .take
+            .as_deref()
+            .expect("the consumer mount take folds into the binding");
+        assert!(
+            matches!(take, [TakeEntry::Rename { src, dest }] if src == "a/X.md" && dest == "a/x.md"),
+            "the consumer rename mount entry resolves against the Instance-keyed published name \
+             verbatim; got: {take:?}"
+        );
+    }
+
+    #[test]
+    fn two_anchors_mounting_same_dep_are_independent() {
+        let dep = dep_target();
+        let anchor_a = consumer_anchor("[targets.claude.take]\n\"dep\" = [\"only-a.md\"]\n");
+        let anchor_b = consumer_anchor("[targets.claude.take]\n\"dep\" = [\"only-b.md\"]\n");
+        let first = synthetic_target(
+            "dep",
+            "editor",
+            &dep,
+            PathBuf::from("/home/me/a/nvim"),
+            PathBuf::from("/home/me/a"),
+            &namespaced_for("nvim", "dep%1%nvim"),
+            &mount_for(&anchor_a, "dep"),
+        )
+        .expect("first anchor synthesizes");
+        let second = synthetic_target(
+            "dep",
+            "editor",
+            &dep,
+            PathBuf::from("/home/me/b/nvim"),
+            PathBuf::from("/home/me/b"),
+            &namespaced_for("nvim", "dep%2%nvim"),
+            &mount_for(&anchor_b, "dep"),
+        )
+        .expect("second anchor synthesizes");
+
+        assert_eq!(
+            binding_of(&first, "nvim").source.as_deref(),
+            Some("dep%1%nvim"),
+            "anchor one binds the first Instance-keyed source"
+        );
+        assert_eq!(
+            binding_of(&second, "nvim").source.as_deref(),
+            Some("dep%2%nvim"),
+            "anchor two binds a DISTINCT Instance-keyed source; the same dep mounted twice is \
+             two independent instances"
+        );
+        let take_a = binding_of(&first, "nvim")
+            .take
+            .as_deref()
+            .expect("anchor one take");
+        let take_b = binding_of(&second, "nvim")
+            .take
+            .as_deref()
+            .expect("anchor two take");
+        assert!(
+            matches!(take_a, [TakeEntry::Leaf(s)] if s == "only-a.md"),
+            "anchor one applies its OWN consumer mount take; got: {take_a:?}"
+        );
+        assert!(
+            matches!(take_b, [TakeEntry::Leaf(s)] if s == "only-b.md"),
+            "anchor two applies its OWN consumer mount take, independent of anchor one; got: {take_b:?}"
+        );
+        assert_eq!(
+            first.path,
+            PathBuf::from("/home/me/a/nvim"),
+            "anchor one deploys under its own anchor path"
+        );
+        assert_eq!(
+            second.path,
+            PathBuf::from("/home/me/b/nvim"),
+            "anchor two deploys under its own anchor path, independent of anchor one"
+        );
+    }
+
+    #[test]
+    fn mount_collapse_table_maps_anchor_bool_to_collapse_choice() {
+        let dep = dep_target();
+        let anchor = consumer_anchor("[targets.claude.collapse]\n\"dep\" = false\n");
+        let synthetic = synthetic_target(
+            "dep",
+            "editor",
+            &dep,
+            PathBuf::from("/home/me/.claude/nvim"),
+            PathBuf::from("/home/me/.claude"),
+            &namespaced_for("nvim", "dep%1%nvim"),
+            &mount_for(&anchor, "dep"),
+        )
+        .expect("a dep mounted under a consumer collapse override synthesizes");
+
+        assert_eq!(
+            binding_of(&synthetic, "nvim").collapse,
+            Some(false),
+            "the CONSUMER mount collapse `false` (keyed by imported `dep`) folds into the \
+             binding's `collapse` (Some(false) = ForcePerLeaf); got: {:?}",
+            binding_of(&synthetic, "nvim").collapse
+        );
+    }
+
+    #[test]
+    fn consumer_mount_take_overrides_a_binding_local_take() {
+        let dep = dep_target_with_binding_local_take();
+        let anchor = consumer_anchor("[targets.claude.take]\n\"dep\" = [\"consumer-wins.lua\"]\n");
+        let synthetic = synthetic_target(
+            "dep",
+            "editor",
+            &dep,
+            PathBuf::from("/home/me/.claude/nvim"),
+            PathBuf::from("/home/me/.claude"),
+            &namespaced_for("nvim", "dep%1%nvim"),
+            &mount_for(&anchor, "dep"),
+        )
+        .expect(
+            "a dep whose binding has its own take, mounted under a consumer override, synthesizes",
+        );
+
+        let take = binding_of(&synthetic, "nvim")
+            .take
+            .as_deref()
+            .expect("the binding carries a take");
+        assert!(
+            matches!(take, [TakeEntry::Leaf(s)] if s == "consumer-wins.lua"),
+            "PRECEDENCE: a present consumer mount take must OVERRIDE the dep's binding-local \
+             `take = [\"dep-local.lua\"]`, not be ignored or merged; got: {take:?}"
+        );
+    }
+
+    #[test]
+    fn absent_consumer_mount_take_leaves_a_binding_local_take_intact() {
+        let dep = dep_target_with_binding_local_take();
+        let anchor = consumer_anchor("");
+        let synthetic = synthetic_target(
+            "dep",
+            "editor",
+            &dep,
+            PathBuf::from("/home/me/.claude/nvim"),
+            PathBuf::from("/home/me/.claude"),
+            &namespaced_for("nvim", "dep%1%nvim"),
+            &mount_for(&anchor, "dep"),
+        )
+        .expect("a dep with a binding-local take and no consumer override synthesizes");
+
+        let take = binding_of(&synthetic, "nvim")
+            .take
+            .as_deref()
+            .expect("the dep's binding-local take survives");
+        assert!(
+            matches!(take, [TakeEntry::Leaf(s)] if s == "dep-local.lua"),
+            "with NO consumer mount override, the dep's binding-local `take` must survive \
+             unclobbered; got: {take:?}"
         );
     }
 }

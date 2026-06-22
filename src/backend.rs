@@ -54,6 +54,17 @@ impl<G: SourceBackend, H: SourceBackend> SourceBackend for RouterBackend<G, H> {
         self.route(source).fetch(source, url)
     }
 
+    fn list_source_leaves(
+        &self,
+        source: &SourceName,
+        url: &str,
+        commit: &str,
+        root: Option<&Path>,
+    ) -> Result<Vec<String>> {
+        self.route(source)
+            .list_source_leaves(source, url, commit, root)
+    }
+
     fn resolve(&self, source: &SourceName, url: &str, refspec: &Refspec) -> Result<String> {
         self.route(source).resolve(source, url, refspec)
     }
@@ -318,12 +329,24 @@ mod tests {
         resolves: Rc<RefCell<Vec<String>>>,
         discovers: Rc<RefCell<Vec<String>>>,
         digests: Rc<RefCell<Vec<String>>>,
+        leaf_walks: Rc<RefCell<Vec<String>>>,
     }
 
     impl SourceBackend for Spy {
         fn fetch(&self, source: &SourceName, _url: &str) -> Result<()> {
             self.fetches.borrow_mut().push(source.to_string());
             Ok(())
+        }
+
+        fn list_source_leaves(
+            &self,
+            source: &SourceName,
+            _url: &str,
+            _commit: &str,
+            _root: Option<&Path>,
+        ) -> Result<Vec<String>> {
+            self.leaf_walks.borrow_mut().push(source.to_string());
+            Ok(vec![format!("leaf-{source}")])
         }
 
         fn resolve(&self, source: &SourceName, _url: &str, _refspec: &Refspec) -> Result<String> {
@@ -427,6 +450,32 @@ mod tests {
             http.resolves.borrow().as_slice(),
             ["u"],
             "url-mode resolve routes to http"
+        );
+    }
+
+    #[test]
+    fn list_source_leaves_routes_url_mode_to_http_and_git_mode_to_git() {
+        let mut modes = BTreeMap::new();
+        modes.insert(sn("g"), SourceMode::Git);
+        modes.insert(sn("u"), SourceMode::Url);
+        let (router, git, http) = spy_router(modes);
+
+        router
+            .list_source_leaves(&sn("g"), "https://example.com/o/r.git", "c", None)
+            .expect("git leaf walk");
+        router
+            .list_source_leaves(&sn("u"), "https://example.com/pkg.tar.gz", "c", None)
+            .expect("url leaf walk");
+
+        assert_eq!(
+            git.leaf_walks.borrow().as_slice(),
+            ["g"],
+            "only the git-mode source `g` may reach the git backend's list_source_leaves"
+        );
+        assert_eq!(
+            http.leaf_walks.borrow().as_slice(),
+            ["u"],
+            "a url-mode source must route its leaf walk to the http backend, not be walked as a git tree"
         );
     }
 

@@ -28,9 +28,10 @@ pub use hooks::{
 };
 pub use host::{AuthConfig, Host, RemoteConfig, builtin_forges};
 pub use migrate::MigrationWarning;
-pub use source::{DeployMode, ParsedSource, Refspec, Remote, Source, SourceMode};
+pub use source::{DeployMode, Offer, ParsedSource, Refspec, Remote, Source, SourceMode};
 pub use target::{
-    Binding, LayoutConfig, LayoutKind, ResolvedBinding, SourceFields, Target, TemplateOptIn,
+    Binding, LayoutConfig, LayoutKind, ResolvedBinding, SourceFields, TakeEntry, Target,
+    TemplateOptIn,
 };
 
 #[derive(Debug, Clone, Default, Deserialize)]

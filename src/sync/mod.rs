@@ -16,7 +16,10 @@ mod verify;
 mod tests;
 
 pub use hooks::{HookOutcome, HookScope, HookStatus};
-pub use plan::{PlanEntry, TargetPlan, plan_target, plan_targets};
+pub use plan::{
+    BindingPlanInput, PlanWarning, PlannedItem, ResolvedBindingPlan, TargetPlan,
+    expected_artifact_keys, plan_target, plan_targets, resolve_binding_plan, resolve_target_plan,
+};
 pub use preview::{
     PreviewCollision, PreviewEntry, PreviewFile, PreviewTargetPlan, SyncState, preview_targets,
 };
@@ -348,6 +351,9 @@ pub fn sync(
 
     sweep_target_parents(&effective_config, &journal, registry)?;
 
+    let recorded_after_recovery: Vec<ArtifactKey> =
+        registry.list_all()?.into_iter().map(|r| r.key).collect();
+
     let (routed, resolved_commits) = resolve_sources(
         &effective_config,
         &parsed,
@@ -365,6 +371,15 @@ pub fn sync(
         .map(|lock| lock.trusted_hooks.clone())
         .unwrap_or_default();
 
+    validate_sealed_offer(
+        &effective_config,
+        &parsed,
+        &remotes,
+        backend,
+        &resolved_commits,
+        &recorded_after_recovery,
+    )?;
+
     let mut had_failures = deploy_all_targets(&DeployAll {
         config: &effective_config,
         parsed: &parsed,
@@ -377,39 +392,28 @@ pub fn sync(
         journal: &journal,
     })?;
 
-    if input.prune {
-        if had_failures {
-            eprintln!("phora: skipping --prune because some artifacts failed to deploy");
-        } else {
-            prune_orphans(
-                &effective_config,
-                &parsed,
-                &remotes,
-                backend,
-                registry,
-                &resolved_commits,
-                &protected,
-            )?;
-        }
+    if input.prune && !had_failures {
+        prune_orphans(
+            &effective_config,
+            &parsed,
+            &remotes,
+            backend,
+            registry,
+            &resolved_commits,
+            &protected,
+        )?;
+    } else if input.prune {
+        eprintln!("phora: skipping --prune because some artifacts failed to deploy");
     }
 
-    let mut hook_results = if input.no_hooks {
-        Vec::new()
-    } else {
-        hooks::dispatch_hooks(&effective_config, registry)?
-    };
-    record_candidate_hooks(&mut base_lock, &hook_candidates);
-    let mut stripped_transitive_hooks = 0;
-    if !input.no_hooks && !input.no_transitive_hooks {
-        let mut decision = decide_transitive_hooks(
-            &mut base_lock,
-            &hook_candidates,
-            effective_lock.as_ref(),
-            input.interactive,
-        )?;
-        stripped_transitive_hooks = decision.stripped;
-        hook_results.append(&mut decision.outcomes);
-    }
+    let (hook_results, stripped_transitive_hooks) = run_all_hooks(
+        input,
+        &effective_config,
+        registry,
+        &mut base_lock,
+        &hook_candidates,
+        effective_lock.as_ref(),
+    )?;
     let deploy_failures = had_failures;
     had_failures |= hook_results
         .iter()
@@ -423,6 +427,105 @@ pub fn sync(
         hook_results,
         stripped_transitive_hooks,
     })
+}
+
+fn run_all_hooks(
+    input: &SyncInput<'_>,
+    config: &Config,
+    registry: &dyn Registry,
+    base_lock: &mut Lock,
+    hook_candidates: &[transitive::TransitiveHookCandidate],
+    effective_lock: Option<&Lock>,
+) -> Result<(Vec<hooks::HookOutcome>, usize)> {
+    let mut hook_results = if input.no_hooks {
+        Vec::new()
+    } else {
+        hooks::dispatch_hooks(config, registry)?
+    };
+    record_candidate_hooks(base_lock, hook_candidates);
+    let mut stripped = 0;
+    if !input.no_hooks && !input.no_transitive_hooks {
+        let mut decision = decide_transitive_hooks(
+            base_lock,
+            hook_candidates,
+            effective_lock,
+            input.interactive,
+        )?;
+        stripped = decision.stripped;
+        hook_results.append(&mut decision.outcomes);
+    }
+    Ok((hook_results, stripped))
+}
+
+/// Compares against the resolved OFFER set, not the take/kept set: a leaf dropped by
+/// `take` while still offered stays allowed. Containment-based: a recorded key survives
+/// if any offered leaf equals it or sits under `<key>/`.
+fn validate_sealed_offer(
+    config: &Config,
+    parsed: &BTreeMap<String, ParsedSource>,
+    remotes: &BTreeMap<String, String>,
+    backend: &(dyn SourceBackend + Sync),
+    resolved_commits: &BTreeMap<(String, String), String>,
+    recorded: &[ArtifactKey],
+) -> Result<()> {
+    use crate::kernel::{OfferSelection, SourceName};
+
+    let mut offered: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    for (target_name, target) in &config.targets {
+        for binding in target.resolve_sources(parsed) {
+            let Some(source) = parsed.get(binding.source) else {
+                continue;
+            };
+            let commit_key = (
+                binding.source.to_owned(),
+                crate::lock::encode_ref(&binding.effective_ref),
+            );
+            let Some(commit) = resolved_commits.get(&commit_key) else {
+                continue;
+            };
+            let name = SourceName::trusted(binding.source);
+            let git = remote_for(remotes, name.as_str())?;
+            let candidates = match source.deploy_mode() {
+                DeployMode::Link => discover::discover_working_tree_leaves(Path::new(git), None)?,
+                DeployMode::Copy => backend.list_source_leaves(&name, git, commit, None)?,
+            };
+            let offer = source.offer();
+            let selection =
+                OfferSelection::compile(offer.includes(), offer.excludes(), offer.root())?;
+            let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+            offered.insert(
+                (target_name.clone(), binding.identity.to_owned()),
+                selection.select(&refs),
+            );
+        }
+    }
+
+    for key in recorded {
+        let Some(leaves) = offered.get(&(key.target.clone(), key.source.clone())) else {
+            continue;
+        };
+        let artifact = &key.artifact;
+        let still_offered = leaves
+            .iter()
+            .any(|leaf| leaf == artifact || leaf.starts_with(&format!("{artifact}/")));
+        if !still_offered {
+            return Err(sealed_offer_diagnostic(&key.target, &key.source, artifact));
+        }
+    }
+    Ok(())
+}
+
+fn sealed_offer_diagnostic(target: &str, source: &str, artifact: &str) -> Error {
+    crate::diagnostic::SelectionDiagnostic {
+        entry: format!("{target}:{source}:{artifact}"),
+        matched_against: format!("the current offer of source `{source}` in target `{target}`"),
+        why: "a recorded artifact is no longer in the source's offer".to_string(),
+        did_you_mean: None,
+        remedy: "restore the artifact to the source's offer, or eject it before removing it"
+            .to_string(),
+        debug_hint: None,
+    }
+    .sync()
 }
 
 fn validate_link_mode(
