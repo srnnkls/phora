@@ -579,6 +579,7 @@ mod confine_fail_closed_tests {
             hooks: None,
             imports: None,
             take: BTreeMap::new(),
+            collapse: BTreeMap::new(),
             confine: None,
         }
     }
@@ -658,6 +659,7 @@ mod kind_aware_layout_tests {
             hooks: None,
             imports: None,
             take: BTreeMap::new(),
+            collapse: BTreeMap::new(),
             confine: None,
         }
     }

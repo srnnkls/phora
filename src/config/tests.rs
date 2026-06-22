@@ -3741,6 +3741,7 @@ mod per_binding_refinement {
             hooks: None,
             imports: None,
             take: BTreeMap::new(),
+            collapse: BTreeMap::new(),
             confine: None,
             sources: Some(BTreeMap::from([(
                 "pinned".to_owned(),
@@ -3751,6 +3752,7 @@ mod per_binding_refinement {
                     rev: Some("deadbeef".to_owned()),
                     template: None,
                     take: None,
+                    collapse: None,
                 },
             )])),
         };
@@ -3783,6 +3785,7 @@ mod per_binding_refinement {
             hooks: None,
             imports: None,
             take: BTreeMap::new(),
+            collapse: BTreeMap::new(),
             confine: None,
             sources: Some(BTreeMap::from([(
                 "pinned".to_owned(),
@@ -3793,6 +3796,7 @@ mod per_binding_refinement {
                     rev: None,
                     template: None,
                     take: None,
+                    collapse: None,
                 },
             )])),
         };
@@ -5976,6 +5980,64 @@ mod parse_time_structural_validation {
         .expect(
             "scope keys (root/include/exclude) are owned by the SOURCE; the redesign rejects them \
              only at the BINDING, so source-level scope must still parse",
+        );
+    }
+
+    #[test]
+    fn binding_collapse_is_exempt_from_the_binding_scope_rejection() {
+        Config::parse(&flat_bind_with("collapse = true")).expect(
+            "`collapse` is target-owned HOW-not-WHAT, exempt from the binding-scope rejection \
+                 exactly like `template` and `take`; a binding carrying it must parse",
+        );
+    }
+
+    #[test]
+    fn binding_collapse_false_is_exempt_from_the_binding_scope_rejection() {
+        Config::parse(&flat_bind_with("collapse = false"))
+            .expect("`collapse = false` on a binding must parse (exempt scope-key prescan)");
+    }
+
+    #[test]
+    fn binding_root_is_still_rejected_alongside_collapse() {
+        let msg = parse_err(&flat_bind_with("collapse = true, root = \"editor\""));
+        assert_structured_diagnostic(&msg);
+        assert!(
+            msg.contains("root"),
+            "exempting `collapse` must NOT loosen the seal on `root`; got:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn binding_include_is_still_rejected_alongside_collapse() {
+        let msg = parse_err(&flat_bind_with(
+            "collapse = true, include = [\"editor/**\"]",
+        ));
+        assert_structured_diagnostic(&msg);
+        assert!(
+            msg.contains("include"),
+            "exempting `collapse` must NOT loosen the seal on `include`; got:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn binding_exclude_is_still_rejected_alongside_collapse() {
+        let msg = parse_err(&flat_bind_with("collapse = true, exclude = [\"**/*.swp\"]"));
+        assert_structured_diagnostic(&msg);
+        assert!(
+            msg.contains("exclude"),
+            "exempting `collapse` must NOT loosen the seal on `exclude`; got:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn binding_map_is_still_rejected_alongside_collapse() {
+        let msg = parse_err(&flat_bind_with(
+            "collapse = true, map = { \"a/X.md\" = \"a/x.md\" }",
+        ));
+        assert_structured_diagnostic(&msg);
+        assert!(
+            msg.contains("map"),
+            "exempting `collapse` must NOT loosen the seal on `map`; got:\n{msg}"
         );
     }
 

@@ -364,6 +364,7 @@ fn compose_nested_imports(
             hooks: None,
             imports: None,
             take: BTreeMap::new(),
+            collapse: BTreeMap::new(),
             confine: None,
         };
         ctx.ancestors.push(inner_node);
