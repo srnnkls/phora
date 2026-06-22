@@ -289,6 +289,16 @@ impl SourceBackend for CountingBackend<'_> {
         self.inner
             .list_artifact_files(source, url, commit, root, artifact, selection)
     }
+
+    fn list_source_leaves(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        commit: &str,
+        root: Option<&Path>,
+    ) -> SourceResult<Vec<String>> {
+        self.inner.list_source_leaves(source, url, commit, root)
+    }
 }
 
 // ── config helpers (target-less so Phase 2/3 are no-ops) ───────
@@ -1163,6 +1173,15 @@ impl SourceBackend for FailingExportBackend<'_> {
     ) -> SourceResult<Vec<std::path::PathBuf>> {
         self.inner
             .list_artifact_files(source, url, commit, root, artifact, selection)
+    }
+    fn list_source_leaves(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        commit: &str,
+        root: Option<&Path>,
+    ) -> SourceResult<Vec<String>> {
+        self.inner.list_source_leaves(source, url, commit, root)
     }
 }
 
@@ -2248,6 +2267,15 @@ impl SourceBackend for PartialStagingExportBackend<'_> {
         self.inner
             .list_artifact_files(source, url, commit, root, artifact, selection)
     }
+    fn list_source_leaves(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        commit: &str,
+        root: Option<&Path>,
+    ) -> SourceResult<Vec<String>> {
+        self.inner.list_source_leaves(source, url, commit, root)
+    }
 }
 
 #[test]
@@ -2662,11 +2690,13 @@ fn sync_runs_recovery_sweep_finishing_a_swapped_but_unrecorded_artifact() {
     std::fs::create_dir_all(&crashed_dst).expect("mkdir crashed dst");
     std::fs::write(crashed_dst.join("recovered.txt"), b"recovered\n").expect("write dst file");
 
-    let crashed_key = artifact_key("dest", "editor-src", "orphan-artifact");
+    // The crashed record's source `ghost-src` is bound to no target, so D9's offer check skips
+    // it (offered.get(..) is None) — keeping this a pure recovery test, not a sealed-offer one.
+    let crashed_key = artifact_key("dest", "ghost-src", "orphan-artifact");
     let record = RegistryRecord {
         version: 1,
         key: crashed_key.clone(),
-        source: "editor-src".to_owned(),
+        source: "ghost-src".to_owned(),
         commit: fx.head_sha.clone(),
         digest: "blake3:recovered".to_owned(),
         projected_at: "2026-01-01T00:00:00Z".to_owned(),
@@ -3927,6 +3957,93 @@ fn prune_removes_stale_linked_symlink_without_following_it() {
     );
 }
 
+/// SMR-030 FIX-1: the live deploy path records a DIRECTORY-granular key (`alpha`), but a
+/// Link-mode plan with a within-dir exclude resolves leaf-granular (`alpha/a.md`). An
+/// exact-match prune would miss `alpha` and DELETE the live directory artifact. Containment
+/// must treat the dir record as still-expected because a planned leaf sits under `alpha/`.
+#[cfg(unix)]
+#[test]
+fn prune_keeps_a_dir_record_when_the_plan_resolves_it_leaf_granular() {
+    use std::os::unix::fs::symlink;
+
+    let wt = TempDir::new().expect("worktree tempdir");
+    std::fs::create_dir_all(wt.path().join("alpha")).expect("mkdir alpha");
+    std::fs::write(wt.path().join("alpha").join("a.md"), b"keep\n").expect("write alpha/a.md");
+    std::fs::write(wt.path().join("alpha").join("secret.md"), b"drop\n")
+        .expect("write alpha/secret.md");
+
+    let td = TargetDir::new();
+    // Link + a within-dir exclude (`alpha/secret.md`) blocks collapse, so the plan resolves
+    // the dir leaf-granular to `alpha/a.md` — never the dir key `alpha`.
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.linked-src]\ngit = \"{}\"\nbranch = \"main\"\ndeploy = \"link\"\n\
+         include = [\"alpha/a.md\"]\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\"linked-src\"]\nlayout = \"by-source\"\n",
+        wt.path().display(),
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("link within-dir-exclude config parses");
+
+    let by_source = crate::config::LayoutConfig {
+        kind: LayoutKind::BySource,
+        separator: String::new(),
+    };
+    let dir_dst = td.artifact_dst(&by_source, "linked-src", "alpha");
+    std::fs::create_dir_all(dir_dst.parent().expect("dst parent")).expect("mkdir dst parent");
+    symlink(wt.path().join("alpha"), &dir_dst).expect("deploy the live `alpha` dir as a symlink");
+
+    let registry = fx_registry();
+    // The OLD deploy path recorded `alpha` directory-granularly.
+    registry
+        .put(&RegistryRecord {
+            version: 1,
+            key: artifact_key("dest", "linked-src", "alpha"),
+            source: "linked-src".to_owned(),
+            commit: "link".to_owned(),
+            digest: "link:".to_owned(),
+            projected_at: "2026-06-08T12:00:00Z".to_owned(),
+            layout: "by-source".to_owned(),
+            kind: RecordKind::Dir,
+            allow_symlinks: false,
+            preserve_executable: true,
+            files: vec![],
+            linked: true,
+            vars_digest: None,
+        })
+        .expect("seed the dir-granular live record");
+
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let commits = one_commit(&parsed, "linked-src", "link");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+    let protected = test_protected(&std::env::temp_dir());
+
+    prune_orphans(
+        &cfg,
+        &parsed,
+        &remotes,
+        &fx_backend(),
+        &registry,
+        &commits,
+        &protected,
+    )
+    .expect("prune runs");
+
+    assert!(
+        std::fs::symlink_metadata(&dir_dst).is_ok(),
+        "CONTAINMENT: prune must NOT delete the live `alpha` directory artifact — the plan's \
+         leaf `alpha/a.md` is a descendant of the recorded dir key `alpha`; it survived at {}",
+        dir_dst.display()
+    );
+    assert!(
+        registry
+            .get(&artifact_key("dest", "linked-src", "alpha"))
+            .expect("registry read")
+            .is_some(),
+        "the dir-granular `alpha` record must survive prune via bidirectional containment"
+    );
+}
+
 /// A real `GitBackend` over a throwaway mirror dir; link-source rebuild/prune
 /// never reach it, but the signature requires a backend.
 fn fx_backend() -> GitBackend {
@@ -5008,6 +5125,15 @@ impl SourceBackend for RecordingBackend<'_> {
         self.inner
             .list_artifact_files(source, url, commit, root, artifact, selection)
     }
+    fn list_source_leaves(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        commit: &str,
+        root: Option<&Path>,
+    ) -> SourceResult<Vec<String>> {
+        self.inner.list_source_leaves(source, url, commit, root)
+    }
 }
 
 /// A repo at `<parent>/<name>` (name shared across calls) whose `editor/init.lua`
@@ -5326,6 +5452,16 @@ impl SourceBackend for CountingRouter {
     ) -> SourceResult<Vec<std::path::PathBuf>> {
         self.inner
             .list_artifact_files(source, url, commit, root, artifact, selection)
+    }
+
+    fn list_source_leaves(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        commit: &str,
+        root: Option<&Path>,
+    ) -> SourceResult<Vec<String>> {
+        self.inner.list_source_leaves(source, url, commit, root)
     }
 }
 
@@ -7571,7 +7707,11 @@ fn plan_target_without_override_discovers_full_source_level_set() {
         .iter()
         .find(|p| p.target == "dest")
         .expect("plan must include target `dest`");
-    let mut artifacts: Vec<&str> = dest.entries.iter().map(|e| e.artifact.as_str()).collect();
+    let mut artifacts: Vec<String> = dest
+        .bindings
+        .iter()
+        .flat_map(expected_artifact_keys)
+        .collect();
     artifacts.sort_unstable();
     assert_eq!(
         artifacts,
@@ -8670,6 +8810,15 @@ impl SourceBackend for SyncRecordingBackend<'_> {
         self.inner
             .list_artifact_files(source, url, commit, root, artifact, selection)
     }
+    fn list_source_leaves(
+        &self,
+        source: &crate::kernel::SourceName,
+        url: &str,
+        commit: &str,
+        root: Option<&Path>,
+    ) -> SourceResult<Vec<String>> {
+        self.inner.list_source_leaves(source, url, commit, root)
+    }
 }
 
 /// A [`SyncInput`] carrying an explicit `jobs` pool size. Mirrors [`input`] but
@@ -8959,4 +9108,190 @@ fn serial_and_parallel_runs_produce_identical_lock_and_registry() {
     );
 
     drop((src_a, src_b, src_c));
+}
+
+// ── list_source_leaves seam (SMR-030) ──────────────────────────
+
+#[test]
+fn list_source_leaves_returns_full_unfiltered_leaf_set() {
+    let fx = build_sync_fixture();
+    let name = sn("editor-src");
+    fx.backend
+        .fetch(&name, &fx.url)
+        .expect("fetch the fixture mirror");
+
+    let leaves = fx
+        .backend
+        .list_source_leaves(&name, &fx.url, &fx.head_sha, None)
+        .expect("list_source_leaves reads the mirror tree");
+
+    assert_eq!(
+        leaves,
+        vec![
+            "docs/readme.md".to_string(),
+            "editor/init.lua".to_string(),
+            "editor/notes.bak".to_string(),
+        ],
+        "list_source_leaves returns the FULL sorted root-relative leaf set with NO selection \
+         applied — the `.bak` is present and nothing is excluded; got: {leaves:?}"
+    );
+}
+
+// ── sealed offer (D9): recorded-but-no-longer-offered is a hard error ──
+
+/// Seed a managed registry record for `(dest, source, artifact)` as if a prior sync
+/// deployed it, so a later sync can be made to find it recorded.
+fn seed_recorded_artifact(reg: &FileRegistry, source: &str, artifact: &str) {
+    let record = RegistryRecord {
+        version: 1,
+        key: artifact_key("dest", source, artifact),
+        source: source.to_owned(),
+        commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
+        digest: "blake3:recorded".to_owned(),
+        projected_at: "2026-01-01T00:00:00Z".to_owned(),
+        layout: "flat".to_owned(),
+        kind: RecordKind::Dir,
+        allow_symlinks: false,
+        preserve_executable: true,
+        files: vec![],
+        linked: false,
+        vars_digest: None,
+    };
+    reg.put(&record).expect("seed recorded artifact");
+}
+
+#[test]
+fn sealed_offer_locked_artifact_dropped_from_offer_is_hard_error() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\ninclude = [\"docs/**\"]\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\"editor-src\"]\nlayout = \"flat\"\n",
+        fx.url,
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("sealed-offer config parses");
+
+    seed_recorded_artifact(&fx.registry, "editor-src", "editor");
+
+    let in_ = input(&cfg, None, None, None, false);
+    let Err(err) = sync(&in_, &fx.backend, &fx.registry) else {
+        panic!("a recorded artifact no longer in the source's OFFER must be a hard error (D9)");
+    };
+    let msg = err.to_string();
+    assert_sealed_offer_diagnostic(&msg, "dest", "editor-src", "editor");
+}
+
+fn assert_sealed_offer_diagnostic(rendered: &str, target: &str, source: &str, artifact: &str) {
+    use crate::diagnostic::{MATCHED_AGAINST, REMEDY, SELECTION};
+    for phrase in [SELECTION, MATCHED_AGAINST, REMEDY] {
+        assert!(
+            rendered.contains(phrase),
+            "the sealed-offer rejection must render `{phrase}`; got:\n{rendered}"
+        );
+    }
+    for named in [target, source, artifact] {
+        assert!(
+            rendered.contains(named),
+            "the sealed-offer rejection must name `{named}` (target/binding/artifact); got:\n{rendered}"
+        );
+    }
+}
+
+#[test]
+fn sealed_offer_take_subsetting_a_leaf_is_allowed_not_a_violation() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = {{ editor-src = {{ take = [\"docs\"] }} }}\n\
+         layout = \"flat\"\n",
+        fx.url,
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("take-subsetting config parses");
+
+    seed_recorded_artifact(&fx.registry, "editor-src", "editor");
+
+    let in_ = input(&cfg, None, None, None, false);
+    sync(&in_, &fx.backend, &fx.registry).expect(
+        "a leaf the source still OFFERS but `take` drops must NOT trip the sealed-offer check; \
+         offer-vs-take is the crux — only an un-offered recorded artifact is a D9 violation",
+    );
+}
+
+#[test]
+fn sealed_offer_validates_crash_recovered_record_finalized_by_the_sweep() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    // `editor-src` is bound and scoped to docs/**, so it offers `docs/...` but NOT `editor`.
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\ninclude = [\"docs/**\"]\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\"editor-src\"]\nlayout = \"flat\"\n",
+        fx.url,
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("sealed-offer recovery config parses");
+
+    // A swap-completed crash whose record is for the BOUND-but-no-longer-offered `editor`.
+    // It exists in the registry ONLY after recovery_sweep, so a pre-sweep D9 snapshot would
+    // miss it. Post-recovery, D9 must validate it and reject.
+    let crashed_dst = td.target_path().join("editor");
+    std::fs::create_dir_all(&crashed_dst).expect("mkdir crashed dst");
+    std::fs::write(crashed_dst.join("init.lua"), b"-- init\n").expect("write crashed file");
+
+    let crashed_key = artifact_key("dest", "editor-src", "editor");
+    let record = RegistryRecord {
+        version: 1,
+        key: crashed_key.clone(),
+        source: "editor-src".to_owned(),
+        commit: fx.head_sha.clone(),
+        digest: "blake3:recovered".to_owned(),
+        projected_at: "2026-01-01T00:00:00Z".to_owned(),
+        layout: "flat".to_owned(),
+        kind: RecordKind::Dir,
+        allow_symlinks: false,
+        preserve_executable: true,
+        files: vec![ManifestFile {
+            path: PathBuf::from("init.lua"),
+            size: 8,
+            mtime: 1_700_000_000,
+            blake3: "blake3:recovered".to_owned(),
+        }],
+        linked: false,
+        vars_digest: None,
+    };
+
+    let staging_base = td.parent_path.join(".phora-stage");
+    let staging = staging_base.join("editor-deadbeef");
+    let journal = Journal::open(&fx.registry.locks_dir()).expect("open journal");
+    journal
+        .append(&JournalEntry {
+            staging_base,
+            staging,
+            dst: crashed_dst,
+            record,
+            swap_completed: true,
+        })
+        .expect("seed swap-completed crash intent");
+
+    assert!(
+        fx.registry
+            .get(&crashed_key)
+            .expect("pre-sync get")
+            .is_none(),
+        "premise: the crashed `editor` record exists only once recovery_sweep finalizes it"
+    );
+
+    let in_ = input(&cfg, None, None, None, false);
+    let Err(err) = sync(&in_, &fx.backend, &fx.registry) else {
+        panic!(
+            "a crash-recovered, STILL-BOUND, no-longer-offered artifact must trip D9 once the \
+             sealed-offer snapshot is taken AFTER recovery_sweep, not before"
+        );
+    };
+    assert_sealed_offer_diagnostic(&err.to_string(), "dest", "editor-src", "editor");
 }

@@ -1,13 +1,34 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 use crate::config::{Config, ParsedSource};
 use crate::error::{Error, Result};
 use crate::source::SourceBackend;
-use crate::store::{ArtifactKey, Registry};
+use crate::store::Registry;
 
 use super::confine::{ProtectedPathSet, confine_destination};
-use super::plan::plan_targets;
+use super::plan::{expected_artifact_keys, plan_targets};
 use super::remove_orphan_path;
+
+/// `(target, source) → expected leaf artifacts`. `deploy_target` records directory-granular
+/// keys (`editor`) while the plan here is leaf-granular (`editor/init.lua`); either can be the
+/// ancestor of the other, so an orphan is a record with no bidirectional containment match.
+type ExpectedByBinding = BTreeMap<(String, String), Vec<String>>;
+
+fn is_still_expected(
+    expected: &ExpectedByBinding,
+    target: &str,
+    source: &str,
+    artifact: &str,
+) -> bool {
+    let Some(leaves) = expected.get(&(target.to_owned(), source.to_owned())) else {
+        return false;
+    };
+    leaves.iter().any(|expected_key| {
+        expected_key == artifact
+            || expected_key.starts_with(&format!("{artifact}/"))
+            || artifact.starts_with(&format!("{expected_key}/"))
+    })
+}
 
 pub(super) fn prune_orphans(
     config: &Config,
@@ -19,19 +40,23 @@ pub(super) fn prune_orphans(
     protected: &ProtectedPathSet,
 ) -> Result<()> {
     let plans = plan_targets(config, parsed, remotes, backend, resolved_commits)?;
-    let mut expected: HashSet<ArtifactKey> = HashSet::new();
+    let mut expected: ExpectedByBinding = BTreeMap::new();
     for plan in &plans {
-        for entry in &plan.entries {
-            expected.insert(ArtifactKey {
-                target: plan.target.clone(),
-                source: entry.identity.clone(),
-                artifact: entry.artifact.clone(),
-            });
+        for binding in &plan.bindings {
+            let bucket = expected
+                .entry((plan.target.clone(), binding.identity.clone()))
+                .or_default();
+            bucket.extend(expected_artifact_keys(binding));
         }
     }
 
     for record in registry.list_all()? {
-        if expected.contains(&record.key) {
+        if is_still_expected(
+            &expected,
+            &record.key.target,
+            &record.key.source,
+            &record.key.artifact,
+        ) {
             continue;
         }
         if let Some(target) = config.targets.get(&record.key.target) {
