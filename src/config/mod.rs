@@ -86,8 +86,12 @@ impl Config {
     /// Returns [`Error::Config`] if the document is not valid TOML, contains an
     /// unknown key, or a source sets more than one of `branch`/`tag`/`rev`.
     pub fn parse(s: &str) -> Result<Self> {
-        reject_legacy_binding_arrays(s)?;
+        if let Ok(doc) = toml::from_str::<toml::Value>(s) {
+            reject_legacy_binding_arrays(&doc)?;
+            reject_binding_scope_keys(&doc)?;
+        }
         let config: Self = toml::from_str(s).map_err(|e| Error::Config(e.to_string()))?;
+        config.reject_malformed_take_globs()?;
         for (name, host) in &config.hosts {
             if let Some(remote) = &host.remote
                 && remote.https_template().is_none()
@@ -242,6 +246,18 @@ impl Config {
         Ok(())
     }
 
+    fn reject_malformed_take_globs(&self) -> Result<()> {
+        for target in self.targets.values() {
+            for binding in target.sources.iter().flatten().map(|(_, b)| b) {
+                reject_malformed_take_entries(binding.take.iter().flatten())?;
+            }
+            for entries in target.take.values() {
+                reject_malformed_take_entries(entries.iter())?;
+            }
+        }
+        Ok(())
+    }
+
     fn effective_host(&self, name: &str) -> Option<Host> {
         effective_host(&self.hosts, name)
     }
@@ -268,11 +284,7 @@ impl Config {
     }
 }
 
-fn reject_legacy_binding_arrays(s: &str) -> Result<()> {
-    let doc: toml::Value = match toml::from_str(s) {
-        Ok(value) => value,
-        Err(_) => return Ok(()),
-    };
+fn reject_legacy_binding_arrays(doc: &toml::Value) -> Result<()> {
     let Some(targets) = doc.get("targets").and_then(toml::Value::as_table) else {
         return Ok(());
     };
@@ -300,6 +312,77 @@ fn reject_legacy_binding_arrays(s: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn reject_malformed_take_entries<'a>(
+    entries: impl Iterator<Item = &'a target::TakeEntry>,
+) -> Result<()> {
+    for entry in entries {
+        let target::TakeEntry::Leaf(pattern) = entry else {
+            continue;
+        };
+        if is_glob(pattern)
+            && let Err(e) = globset::Glob::new(pattern)
+        {
+            return Err(Error::Config(format!(
+                "`take` entry `{pattern}` is not a well-formed glob: {e}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn is_glob(pattern: &str) -> bool {
+    pattern.ends_with('/') || pattern.contains(['*', '?', '[', ']'])
+}
+
+const BINDING_SCOPE_KEYS: [&str; 4] = ["root", "include", "exclude", "map"];
+
+fn reject_binding_scope_keys(doc: &toml::Value) -> Result<()> {
+    let Some(targets) = doc.get("targets").and_then(toml::Value::as_table) else {
+        return Ok(());
+    };
+    for (target_name, target) in targets {
+        let Some(bindings) = target.get("sources").and_then(toml::Value::as_table) else {
+            continue;
+        };
+        for (binding_name, binding) in bindings {
+            let Some(table) = binding.as_table() else {
+                continue;
+            };
+            for key in BINDING_SCOPE_KEYS {
+                if table.contains_key(key) {
+                    return Err(binding_scope_diagnostic(target_name, binding_name, key).config());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn binding_scope_diagnostic(
+    target_name: &str,
+    binding_name: &str,
+    key: &str,
+) -> crate::diagnostic::SelectionDiagnostic {
+    let remedy = if key == "map" {
+        format!(
+            "rename via the target `take` table; binding-level `map` is gone, \
+             e.g. `[targets.{target_name}.take]`"
+        )
+    } else {
+        format!(
+            "move `{key}` to the source offer on `[sources.{binding_name}]`; scope is owned by the source, not the binding"
+        )
+    };
+    crate::diagnostic::SelectionDiagnostic {
+        entry: key.to_string(),
+        matched_against: format!("binding `{binding_name}` of target `{target_name}`"),
+        why: "binding-level scope is removed".to_string(),
+        did_you_mean: None,
+        remedy,
+        debug_hint: None,
+    }
 }
 
 fn reject_url_slice(source_name: &str, binding: &Binding, source: &Source) -> Result<()> {

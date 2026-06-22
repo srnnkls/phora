@@ -13,6 +13,6 @@ pub use name::safe_relpath;
 pub use name::{ArtifactName, KernelError, SourceName, TargetName};
 pub use path::RelPath;
 pub use project_id::ProjectId;
-pub use selection::Selection;
+pub use selection::{OfferSelection, Selection};
 
 pub(crate) use name::safe_component;

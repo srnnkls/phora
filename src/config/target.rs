@@ -156,6 +156,12 @@ impl<'de> Deserialize<'de> for TakeEntry {
                         "a `take` rename table must carry one source-to-destination pair",
                     ));
                 };
+                if let Some((extra_src, _)) = map.next_entry::<String, String>()? {
+                    return Err(serde::de::Error::custom(format!(
+                        "a `take` rename entry must carry exactly one pair; \
+                         drop the extra pair `{extra_src}` into its own entry"
+                    )));
+                }
                 Ok(TakeEntry::Rename { src, dest })
             }
         }
