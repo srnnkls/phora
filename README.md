@@ -691,11 +691,12 @@ your config, you import it and phora composes its targets straight into your
 workspace.
 
 Take [`srnnkls/tropos`](https://github.com/srnnkls/tropos), a toolkit of
-agent-harness artifacts — skills, commands, agents, workflows. It doesn't reinvent
-language-specific coding guidelines, though; it leans on a separate repo,
-[`srnnkls/loqui`](https://github.com/srnnkls/loqui), for those, and declares loqui as
-one of its own sources. Mark tropos `transitive = true`, import it, and phora follows
-that edge: you asked for one repo and got its dependency wired up for free.
+agent-harness artifacts — skills, commands, agents, workflows. Its `loqui` skill
+hands the agent language-specific coding guidelines, but those live in a separate
+repo, [`srnnkls/loqui`](https://github.com/srnnkls/loqui), and the skill expects them
+vendored underneath it at `skills/loqui/reference/loqui/`. So tropos declares loqui
+as one of its own sources and lets phora compose it into that spot. Mark tropos
+`transitive = true`, import it, and phora follows that edge.
 
 ```toml
 # your phora.toml
@@ -714,29 +715,30 @@ imports = ["tropos"]      # mount tropos's own targets under ~/.claude
 # inside srnnkls/tropos, its own phora.toml — the slice that matters here:
 [sources.loqui]
 host = "github"
-repo = "srnnkls/loqui"    # the language guidelines tropos's skills lean on
+repo = "srnnkls/loqui"    # the language guidelines the loqui skill leans on
 
-[targets.guidelines]
-path = "loqui"            # relative — it composes UNDER the importing anchor
+[targets.loqui]
+path = "skills/loqui/reference/loqui"   # relative — composes UNDER the importing anchor
 sources = ["loqui"]
 ```
 
 A `phora sync` now fetches tropos, parses its manifest, resolves its `loqui`
-source, and deploys loqui's artifacts (`languages/`, `resources/`) at
-`~/.claude/loqui/…`. One `imports` line, and tropos's dependency rode along. A target
-can import several at once — `imports = ["tropos", "work-config"]` — each composing
-under the same anchor.
+source, and deploys loqui's artifacts (its `languages/` and `resources/` trees) at
+`~/.claude/skills/loqui/reference/loqui/…`, exactly where the skill looks for them.
+One `imports` line, and tropos's dependency rode along. A target can import several at
+once — `imports = ["tropos", "work-config"]` — each composing under the same anchor.
 
 ### How composition works
 
 - The importing target's `path` is the anchor. Each dep target's own `path` is
-  taken as relative and joined under it — tropos's `guidelines` target at `path =
-  "loqui"`, imported into your target at `~/.claude`, deploys to `~/.claude/loqui`.
-- The dep's own layout governs its artifacts, not yours. If tropos's
-  `guidelines` target declares `layout = "by-source"`, loqui's artifacts land under a
-  per-source subdirectory (`~/.claude/loqui/loqui/languages/…`) rather than flat —
-  and that's tropos's call, not yours, even when your `claude` target is `prefixed`.
-  The anchor's layout is never re-applied to a mounted subtree.
+  taken as relative and joined under it — tropos's `loqui` target at `path =
+  "skills/loqui/reference/loqui"`, imported into your target at `~/.claude`, deploys
+  to `~/.claude/skills/loqui/reference/loqui`.
+- The dep's own layout governs its artifacts, not yours. If that target declares
+  `layout = "by-source"`, loqui's trees nest one level deeper under the source
+  identity rather than landing flat — and that's tropos's call, not yours, even when
+  your `claude` target is `prefixed`. The anchor's layout is never re-applied to a
+  mounted subtree.
 - Nothing silently merges. A dep's sources are namespaced per dep instance. If
   both you and tropos define a source named `loqui` pointing at different repos, your
   `loqui` serves your targets and tropos's is a distinct instance serving its own.
