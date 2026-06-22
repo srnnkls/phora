@@ -95,18 +95,26 @@ pub fn upsert_source(
 ///
 /// # Errors
 ///
-/// Returns [`crate::error::Error::Config`] if `doc_text` is not valid TOML.
+/// Returns [`crate::error::Error::Config`] if `doc_text` is not valid TOML, or
+/// if a named source has no `[sources.<name>]` table in this document — the
+/// source is declared in the other config file, so writing here would silently
+/// drop the requested `root`.
 pub fn set_source_roots(doc_text: &str, names: &[String], root: &str) -> Result<String> {
     let mut doc = parse_doc(doc_text)?;
     for name in names {
-        if let Some(table) = doc
+        let table = doc
             .get_mut("sources")
             .and_then(Item::as_table_like_mut)
             .and_then(|sources| sources.get_mut(name))
             .and_then(Item::as_table_like_mut)
-        {
-            table.insert("root", value(root));
-        }
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "cannot set `root` on source `{name}`: it is not declared in this config file \
+                     (source selection is source-owned; declare the source here, or set its `root` \
+                     where the source is defined rather than via a `--local` bind)"
+                ))
+            })?;
+        table.insert("root", value(root));
     }
     Ok(doc.to_string())
 }
@@ -1328,6 +1336,20 @@ mod tests {
             binding.take.is_none() && binding.source.is_none(),
             "the binding stays bare; root is source-owned, got:\n{out}"
         );
+    }
+
+    #[test]
+    fn set_source_roots_errors_when_source_absent_from_this_file_not_silently_dropped() {
+        let local_only = "version = 1\n\n[targets.t]\npath = \"~/x\"\nsources = [\"dotfiles\"]\n";
+        let err = set_source_roots(local_only, &names(&["dotfiles"]), "nvim")
+            .expect_err("a source missing from this file must error, never silently drop `root`");
+        match err {
+            Error::Config(msg) => assert!(
+                msg.contains("dotfiles") && msg.contains("root"),
+                "the error must name the source and `root`, got:\n{msg}"
+            ),
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
     }
 
     #[test]
