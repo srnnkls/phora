@@ -294,60 +294,6 @@ fn dep_cannot_write_into_the_consumer_cwd_git_directory() {
 }
 
 #[test]
-fn dep_cannot_overwrite_the_consumer_phora_manifest() {
-    let leaf = TempDir::new().expect("leaf repo");
-    commit_repo(
-        leaf.path(),
-        &[("phora.toml", "version = 999\n")],
-        "version = 1\n",
-    );
-
-    let dep = TempDir::new().expect("dep repo");
-    let dep_manifest = "version = 1\n\n\
-         [sources.editor]\ngit = \"https://github.com/mock/leaf.git\"\n\n\
-         [targets.t]\npath = \".\"\n[targets.t.sources.editor]\nmap = { \"phora.toml\" = \"phora.toml\" }\n";
-    commit_repo(dep.path(), &[], dep_manifest);
-
-    let mut fixture = build_fixture();
-    fixture.map_url("https://github.com/mock/leaf.git", leaf.path());
-    fixture.finish_gitconfig();
-    let consumer_manifest = format!(
-        "version = 1\n\n[sources.mydeps]\ngit = \"{dep}\"\ntransitive = true\n\n\
-         [targets.root]\npath = \".\"\nimports = [\"mydeps\"]\n",
-        dep = dep.path().display(),
-    );
-    let manifest_path = fixture.cwd.path().join("phora.toml");
-    write(&manifest_path, consumer_manifest.as_bytes());
-
-    let out = run(&fixture, &["sync"]);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    reject_unknown_field_stub(&stderr);
-
-    assert!(
-        !out.status.success(),
-        "overwriting the consumer's own `phora.toml` must fail closed (non-zero exit); a diagnostic \
-         printed alongside exit 0 is a silent success. stderr: {stderr}"
-    );
-
-    let after = std::fs::read_to_string(&manifest_path).unwrap_or_default();
-    assert!(
-        !after.contains("version = 999"),
-        "a dep must NOT overwrite the consumer's own `phora.toml` (a ProtectedPathSet member); \
-         the consumer manifest was clobbered. stderr: {stderr}"
-    );
-    // Attribution: the no-overwrite must come from CONFINE, not the orthogonal foreign-content guard.
-    assert!(
-        !stderr.contains(CONFINE_FOREIGN_SKIP),
-        "the rejection must be attributable to confinement, not the foreign-content guard \
-         (`{CONFINE_FOREIGN_SKIP}`), which would block this overwrite with zero confinement; got: {stderr}"
-    );
-    assert!(
-        stderr.contains(CONFINE_PROTECTED_PATH),
-        "overwriting the consumer manifest must emit `{CONFINE_PROTECTED_PATH}`; got: {stderr}"
-    );
-}
-
-#[test]
 fn copy_staging_stays_under_the_confined_anchor_not_the_raw_target_parent() {
     let leaf = TempDir::new().expect("leaf repo");
     leaf_repo(leaf.path(), "owned.txt", "payload\n");

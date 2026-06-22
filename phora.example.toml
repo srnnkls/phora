@@ -29,12 +29,14 @@ auth = { type = "token", env = "GITHUB_TOKEN" }
 remote = { https = "https://git.company.com/{path}.git", ssh = "git@git.company.com:{path}.git" }
 auth = { type = "ssh", key = "~/.ssh/id_ed25519" }
 
-# A source is a git repo. Top-level directories under `root` are its artifacts.
+# A source is a git repo, and it OWNS its selection: `root` re-anchors the slice,
+# `include`/`exclude` compose `include − exclude` (exclude wins; no `!` negation).
 # Pin with exactly one of branch / tag / rev (defaults to branch `main`).
 # Pick exactly one source kind: forge (host + repo), local (path), literal (git),
 # or url. A bare `repo = "owner/repo"` defaults to github; a bare `path` is LOCAL.
 
-# Forge source: resolves via the host's `remote` template at sync time.
+# Forge source: resolves via the host's `remote` template at sync time. `root`
+# re-anchors the offer at `modules`, so artifacts are named relative to it.
 [sources.dotfiles]
 host = "github"          # omit to default to github when `repo` is set
 repo = "me/dotfiles"     # deprecated alias: `path` (forge owner/repo) under a host
@@ -91,25 +93,31 @@ include = ["fzf"]
 # allow-list: list names to deploy them, or set `[]` (or omit the key) to deploy
 # nothing. Manage the list with `phora bind`/`phora unbind`. A `sources` entry is a
 # bare source name, or a table that refines how THIS target consumes the source:
-# `source` = provenance, the rest is this target's own slice.
+# `source` = provenance, `take` = this target's own subset/rename of the offer.
 [targets.neovim]
 path = "~/.config/nvim"
 [targets.neovim.sources]
-nvim = { source = "dotfiles", root = "nvim" }
+# Alias the `dotfiles` source under a distinct `nvim` identity, then subset its
+# offer to just the editor's tree with `take` (the new way a target slices a source).
+nvim = { source = "dotfiles", take = ["nvim/**"] }
 
 # One source feeding one target as two independent slices: distinct identities
-# (the table keys) re-root the same source, and `by-source` labels each slice by identity.
+# (the table keys) each `take` a different subtree, and `by-source` labels each slice.
 [targets.editors]
 path = "~/.config"
 layout = "by-source"
 [targets.editors.sources]
-nvim  = { source = "dotfiles", root = "nvim" }
-helix = { source = "dotfiles", root = "helix" }
+nvim  = { source = "dotfiles", take = ["nvim/**"] }
+helix = { source = "dotfiles", take = ["helix/**"] }
 
+# `take` can rename as it subsets: `{ src = dest }` projects one offered path to a
+# new destination name, alongside literal/glob leaves it keeps as-is.
 [targets.vscode]
 path = "~/.config/Code/User"
-sources = ["dotfiles", "internal"]
 layout = "flat"
+[targets.vscode.sources]
+dotfiles = { take = ["vscode/**", { "vscode/settings.json" = "settings.json" }] }
+internal = { }
 
 [targets.policies]
 path = "~/.cupcake/policies/claude"
@@ -131,25 +139,3 @@ layout = "by-source"
 [targets.tools.sources]
 stable = { source = "fzf", tag = "v0.55.0" }
 canary = { source = "fzf", tag = "v0.56.0" }
-
-# Mapped leaves: a binding's `map = { "<source-leaf>" = "<dest>" }` aliases a single
-# source file to a renamed destination at the target root, bypassing the layout (and
-# any `by-source`/`prefixed` nesting). The canonical use is fanning one shared file
-# out under the names different tools expect — here one `AGENTS.md` lands three times,
-# with no copies in the source tree. Give each binding a distinct identity (the table
-# key): identity must be unique within a target.
-[targets.agents]
-path = "~/myproject"
-[targets.agents.sources]
-dotfiles = { map = { "AGENTS.md" = "AGENTS.md" } }
-claude   = { source = "dotfiles", map = { "AGENTS.md" = "CLAUDE.md" } }
-codex    = { source = "dotfiles", map = { "AGENTS.md" = "codex.md" } }
-# A key may sit in a subdirectory of the source root, e.g. "lint/rules.toml" = "rules.toml".
-
-# Rejected at config load — each is a hard error:
-#   { source = "dotfiles", map = { "AGENTS.md" = "CLAUDE.md" }, include = ["editor"] }
-#     `map` cannot be combined with `include` (or `exclude`) on the same binding.
-#   { source = "dotfiles", map = { "AGENTS.md" = "ai/CLAUDE.md" } }
-#     a dest must be ONE safe filename — no `/`, `\`, `.`, or `..` (nested dests are v2).
-#   { source = "dotfiles", map = { "../secrets.md" = "CLAUDE.md" } }
-#     a key may not be absolute or escape the source root via `..`.

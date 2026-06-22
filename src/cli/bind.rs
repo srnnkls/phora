@@ -94,14 +94,19 @@ pub(super) fn run_bind(
     }
 
     let file = target_config_file(local);
-    let text = read_config_text(file)?;
+    let original = read_config_text(file)?;
 
-    if !target_exists(&text, to)? {
+    if !target_exists(&original, to)? {
         return Err(Error::Config(missing_target_message(to)));
     }
 
+    let mut text = original.clone();
+    if let Some(root) = refinement.root.as_deref() {
+        text = config_edit::set_source_roots(&text, sources, root)?;
+    }
+
     let result = config_edit::bind(&text, to, sources, refinement)?;
-    if !result.changed {
+    if !result.changed && result.text == original {
         render::print_bind_unchanged(sources, to);
         return Ok(());
     }

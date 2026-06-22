@@ -20,6 +20,8 @@ pub(super) fn run_add(
     branch: Option<String>,
     tag: Option<String>,
     root: Option<String>,
+    include: Vec<String>,
+    exclude: Vec<String>,
     local: bool,
     symlink: bool,
     refinement: &BindRefinement,
@@ -31,8 +33,7 @@ pub(super) fn run_add(
     }
     if !refinement.is_bare() && targets.is_empty() {
         return Err(Error::Config(
-            "refinement flags (`--as`/`--include`/`--exclude`) need at least one `--to` target"
-                .to_owned(),
+            "refinement flags (`--as`/`--take`) need at least one `--to` target".to_owned(),
         ));
     }
     if (local || symlink) && (!targets.is_empty() || !refinement.is_bare()) {
@@ -48,6 +49,9 @@ pub(super) fn run_add(
             name,
             branch,
             tag.as_deref(),
+            root.as_deref(),
+            include,
+            exclude,
             local,
             symlink,
             refinement,
@@ -57,14 +61,20 @@ pub(super) fn run_add(
         return add_local(
             url,
             name,
-            branch.as_deref(),
-            tag.as_deref(),
-            root.as_deref(),
+            LocalSourceSpec {
+                branch: branch.as_deref(),
+                tag: tag.as_deref(),
+                root: root.as_deref(),
+                include,
+                exclude,
+            },
             symlink,
         );
     }
 
-    let parsed = resolve_add_source(url)?;
+    let mut parsed = resolve_add_source(url)?;
+    parsed.include = include;
+    parsed.exclude = exclude;
 
     let name = name.unwrap_or_else(|| parsed.name.clone());
     let branch = branch.or_else(|| parsed.branch.clone());
@@ -199,6 +209,8 @@ fn local_path_source(url: &str) -> Result<AddTarget> {
         protocol: None,
         branch: None,
         root: None,
+        include: Vec::new(),
+        exclude: Vec::new(),
     })
 }
 
@@ -230,6 +242,8 @@ fn resolve_local_source(url: &str, name: Option<String>) -> Result<(String, AddT
         protocol: None,
         branch: None,
         root: None,
+        include: Vec::new(),
+        exclude: Vec::new(),
     };
     Ok((name, target))
 }
@@ -242,20 +256,29 @@ fn inject_deploy_link(text: &str, name: &str) -> Result<String> {
     Ok(doc.to_string())
 }
 
+struct LocalSourceSpec<'a> {
+    branch: Option<&'a str>,
+    tag: Option<&'a str>,
+    root: Option<&'a str>,
+    include: Vec<String>,
+    exclude: Vec<String>,
+}
+
 fn add_local(
     url: &str,
     name: Option<String>,
-    branch: Option<&str>,
-    tag: Option<&str>,
-    root: Option<&str>,
+    spec: LocalSourceSpec<'_>,
     symlink: bool,
 ) -> Result<()> {
-    let (name, target) = resolve_local_source(url, name)?;
+    let (name, mut target) = resolve_local_source(url, name)?;
+    target.include = spec.include;
+    target.exclude = spec.exclude;
     let path = target.path.clone().unwrap_or_default();
 
     let doc_text =
         std::fs::read_to_string("phora.local.toml").unwrap_or_else(|_| "version = 1\n".to_owned());
-    let mut updated = config_edit::upsert_source(&doc_text, &name, &target, branch, tag, root)?;
+    let mut updated =
+        config_edit::upsert_source(&doc_text, &name, &target, spec.branch, spec.tag, spec.root)?;
     if symlink {
         updated = inject_deploy_link(&updated, &name)?;
     }
@@ -275,12 +298,15 @@ fn run_add_to_targets(
     name: Option<String>,
     branch: Option<String>,
     tag: Option<&str>,
+    root: Option<&str>,
+    include: Vec<String>,
+    exclude: Vec<String>,
     local: bool,
     symlink: bool,
     refinement: &BindRefinement,
 ) -> Result<()> {
     let overlay = local || symlink;
-    let (name, source, branch) = if overlay {
+    let (name, mut source, branch) = if overlay {
         let (name, source) = resolve_local_source(url, name)?;
         (name, source, branch)
     } else {
@@ -289,11 +315,13 @@ fn run_add_to_targets(
         let branch = branch.or_else(|| parsed.branch.clone());
         (name, parsed, branch)
     };
+    source.include = include;
+    source.exclude = exclude;
 
     let file = target_config_file(overlay);
     let text = read_config_text(file)?;
 
-    let source_root = source.root.clone();
+    let source_root = root.map(ToOwned::to_owned).or_else(|| source.root.clone());
     let mut updated = add_with_binds(
         &text,
         &name,
@@ -349,6 +377,8 @@ pub struct AddTarget {
     pub protocol: Option<Protocol>,
     pub branch: Option<String>,
     pub root: Option<String>,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
 }
 
 /// Expands an `add` URL/shorthand into an [`AddTarget`] using the built-in
@@ -410,6 +440,8 @@ fn symbolic_source(host: String, repo: &str, root: Option<String>) -> AddTarget 
         protocol: None,
         branch: None,
         root,
+        include: Vec::new(),
+        exclude: Vec::new(),
     }
 }
 
@@ -454,6 +486,8 @@ fn literal_source(
         protocol: None,
         branch,
         root,
+        include: Vec::new(),
+        exclude: Vec::new(),
     }
 }
 

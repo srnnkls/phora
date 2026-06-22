@@ -1716,6 +1716,16 @@ fn shipped_example_toml_parses_and_validates() {
         .expect("the shipped phora.example.toml must parse");
     cfg.validate()
         .expect("the shipped phora.example.toml must pass post-merge validation");
+
+    let source_owns_selection = cfg
+        .sources
+        .values()
+        .any(|s| s.root.is_some() && s.include.is_some() && s.exclude.is_some());
+    assert!(
+        source_owns_selection,
+        "selection is SOURCE-owned: the example must show a source carrying root/include/exclude \
+         together (e.g. [sources.internal])"
+    );
 }
 
 // HTP-007: the shipped example must demonstrate a url source with an integrity digest
@@ -1749,7 +1759,8 @@ fn shipped_example_toml_includes_a_url_source() {
     );
 }
 
-// PBR-008: the shipped example must teach per-binding refinement (aliasing via `as`)
+// PBR-008: the shipped example must teach per-binding refinement — aliasing via the
+// `source` key (survives) plus subsetting/renaming via `take` (the new selection model)
 
 #[test]
 fn shipped_example_toml_demonstrates_a_refined_binding_alias() {
@@ -1765,14 +1776,44 @@ fn shipped_example_toml_demonstrates_a_refined_binding_alias() {
         .find(|(identity, binding)| binding.effective_source(identity) != identity.as_str())
         .expect(
             "the shipped phora.example.toml must demonstrate a binding whose keyed identity \
-             differs from its source (e.g. [targets.editors.sources] nvim = { source = \
-             \"dotfiles\", root = \"nvim\" })",
+             differs from its source (e.g. [targets.neovim.sources] nvim = { source = \
+             \"dotfiles\", take = [\"nvim/**\"] })",
         );
 
     assert_ne!(
         identity.as_str(),
         binding.effective_source(identity),
         "the binding must alias the source to a distinct identity to teach the feature"
+    );
+    assert!(
+        binding.take.is_some(),
+        "the aliased binding must subset the source's offer via `take` — the new way a target \
+         slices a source, replacing the removed binding-level root/include/exclude; got: {binding:?}"
+    );
+
+    let takes_a_subtree = cfg
+        .targets
+        .values()
+        .flat_map(|target| target.sources.iter().flatten())
+        .filter_map(|(_, binding)| binding.take.as_deref())
+        .flatten()
+        .any(|entry| matches!(entry, crate::config::target::TakeEntry::Leaf(p) if p.ends_with("/**")));
+    assert!(
+        takes_a_subtree,
+        "the example must demonstrate `take` subsetting a source subtree (a `**` glob leaf)"
+    );
+
+    let renames = cfg
+        .targets
+        .values()
+        .flat_map(|target| target.sources.iter().flatten())
+        .filter_map(|(_, binding)| binding.take.as_deref())
+        .flatten()
+        .any(|entry| matches!(entry, crate::config::target::TakeEntry::Rename { .. }));
+    assert!(
+        renames,
+        "the example must demonstrate a `take` `{{ src = dest }}` rename, projecting one offered \
+         path to a new destination name"
     );
 }
 
@@ -3268,58 +3309,6 @@ mod per_binding_refinement {
     }
 
     #[test]
-    fn refinement_table_parses_to_keyed_binding_with_all_fields() {
-        let t = target(
-            "version = 1\n\n[targets.t]\npath = \"~/x\"\n\
-             [targets.t.sources]\n\
-             nvim = { source = \"dotfiles\", root = \"nvim\", \
-             include = [\"init.lua\"], exclude = [\"**/*.bak\"] }\n",
-            "t",
-        );
-        let bindings = bindings_of(&t);
-        assert_eq!(bindings.len(), 1, "exactly one binding in the map");
-        let (identity, binding) = bindings.iter().next().expect("one keyed binding");
-        let Binding {
-            source,
-            root,
-            include,
-            exclude,
-            branch,
-            tag,
-            rev,
-            template: _,
-            map: _,
-        } = binding;
-        assert_eq!(
-            identity, "nvim",
-            "the map key carries the binding identity (the former `as`)"
-        );
-        assert_eq!(
-            source.as_deref(),
-            Some("dotfiles"),
-            "the `source` key carries the referenced source name"
-        );
-        assert_eq!(
-            root.as_deref(),
-            Some(Path::new("nvim")),
-            "the `root` key is captured as a PathBuf"
-        );
-        assert_eq!(
-            include.as_deref(),
-            Some(["init.lua".to_string()].as_slice()),
-            "the `include` key is captured as a Vec<String>"
-        );
-        assert_eq!(
-            exclude.as_deref(),
-            Some(["**/*.bak".to_string()].as_slice()),
-            "the `exclude` key is captured as a Vec<String>"
-        );
-        assert_eq!(branch.as_deref(), None, "no `branch` set in this table");
-        assert_eq!(tag.as_deref(), None, "no `tag` set in this table");
-        assert_eq!(rev.as_deref(), None, "no `rev` set in this table");
-    }
-
-    #[test]
     fn refinement_table_with_unknown_key_is_rejected_naming_it() {
         let toml = "version = 1\n\n[targets.t]\npath = \"~/x\"\n\
              [targets.t.sources]\nnvim = { source = \"dotfiles\", bogus = 1 }\n";
@@ -3333,62 +3322,6 @@ mod per_binding_refinement {
             ),
             other => panic!("expected Error::Config, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn resolve_overrides_root_independently_and_inherits_include_exclude() {
-        let toml = "version = 1\n\n\
-            [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\
-            root = \"base-root\"\ninclude = [\"src-inc\"]\nexclude = [\"src-exc\"]\n\n\
-            [targets.t]\npath = \"~/x\"\n\
-            [targets.t.sources]\ndotfiles = { root = \"override-root\" }\n";
-        let t = target(toml, "t");
-        let all = sources(toml);
-
-        let resolved = t.resolve_sources(&all);
-        let b = find_resolved(&resolved, "dotfiles");
-
-        assert_eq!(b.source, "dotfiles", "the binding still names its source");
-        assert_eq!(
-            b.root,
-            Some(Path::new("override-root")),
-            "a binding that sets `root` must override the source's `root`"
-        );
-        assert_eq!(
-            b.include,
-            ["src-inc"],
-            "an omitted binding `include` must inherit the source's include verbatim"
-        );
-        assert_eq!(
-            b.exclude,
-            ["src-exc"],
-            "an omitted binding `exclude` must inherit the source's exclude verbatim"
-        );
-    }
-
-    #[test]
-    fn resolve_overrides_include_independently_and_inherits_root() {
-        let toml = "version = 1\n\n\
-            [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\
-            root = \"base-root\"\ninclude = [\"src-inc\"]\n\n\
-            [targets.t]\npath = \"~/x\"\n\
-            [targets.t.sources]\ndotfiles = { include = [\"only-binding\"] }\n";
-        let t = target(toml, "t");
-        let all = sources(toml);
-
-        let resolved = t.resolve_sources(&all);
-        let b = find_resolved(&resolved, "dotfiles");
-
-        assert_eq!(
-            b.include,
-            ["only-binding"],
-            "a binding that sets `include` must override the source's include (no concatenation)"
-        );
-        assert_eq!(
-            b.root,
-            Some(Path::new("base-root")),
-            "an omitted binding `root` must inherit the source's root"
-        );
     }
 
     #[test]
@@ -3562,41 +3495,11 @@ mod per_binding_refinement {
     }
 
     #[test]
-    fn resolve_overrides_exclude_independently_and_inherits_root_include() {
-        let toml = "version = 1\n\n\
-            [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\
-            root = \"base-root\"\ninclude = [\"src-inc\"]\nexclude = [\"src-exc\"]\n\n\
-            [targets.t]\npath = \"~/x\"\n\
-            [targets.t.sources]\ndotfiles = { exclude = [\"binding-exc\"] }\n";
-        let t = target(toml, "t");
-        let all = sources(toml);
-
-        let resolved = t.resolve_sources(&all);
-        let b = find_resolved(&resolved, "dotfiles");
-
-        assert_eq!(
-            b.exclude,
-            ["binding-exc"],
-            "a binding that sets `exclude` must override the source's exclude (no concatenation)"
-        );
-        assert_eq!(
-            b.root,
-            Some(Path::new("base-root")),
-            "an omitted binding `root` must inherit the source's root verbatim"
-        );
-        assert_eq!(
-            b.include,
-            ["src-inc"],
-            "an omitted binding `include` must inherit the source's include verbatim"
-        );
-    }
-
-    #[test]
     fn merge_wholesale_replace_holds_when_base_has_refined_binding() {
         let base = Config::parse(
             "version = 1\n\n\
              [targets.t]\npath = \"~/x\"\n\
-             [targets.t.sources]\nx = { source = \"a\", root = \"r\" }\nb = {}\n",
+             [targets.t.sources]\nx = { source = \"a\", branch = \"r\" }\nb = {}\n",
         )
         .expect("base parses");
         let local = Config::parse(
@@ -3616,34 +3519,6 @@ mod per_binding_refinement {
             ["c"],
             "a local `sources` overlay must WHOLESALE-REPLACE a base list containing a refined \
              binding (no concatenation, the base entries must be gone regardless of variant)"
-        );
-    }
-
-    #[test]
-    fn resolve_combines_as_identity_with_field_override() {
-        let toml = "version = 1\n\n\
-            [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\
-            root = \"base-root\"\n\n\
-            [targets.t]\npath = \"~/x\"\n\
-            [targets.t.sources]\nnvim = { source = \"dotfiles\", root = \"override-root\" }\n";
-        let t = target(toml, "t");
-        let all = sources(toml);
-
-        let resolved = t.resolve_sources(&all);
-        let b = find_resolved(&resolved, "nvim");
-
-        assert_eq!(
-            b.identity, "nvim",
-            "the binding's identity must come from `as` even when a field override is present"
-        );
-        assert_eq!(
-            b.source, "dotfiles",
-            "the underlying source name is preserved alongside the `as` rename"
-        );
-        assert_eq!(
-            b.root,
-            Some(Path::new("override-root")),
-            "a binding with `as` set must still apply its own per-field `root` override"
         );
     }
 
@@ -3680,22 +3555,6 @@ mod per_binding_refinement {
         cfg.validate().expect(
             "two keyed bindings of the SAME source are two slices into one target and are valid; \
              an actual destination clash is caught at deploy, not by an identity proxy",
-        );
-    }
-
-    #[test]
-    fn validate_allows_two_mapped_bindings_of_one_source_under_distinct_keys() {
-        let cfg = config(
-            "version = 1\n\n\
-             [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
-             [targets.editor]\npath = \"~/.config\"\n\
-             [targets.editor.sources]\n\
-             one = { source = \"dotfiles\", map = { \"a.toml\" = \"one.toml\" } }\n\
-             two = { source = \"dotfiles\", map = { \"b.toml\" = \"two.toml\" } }\n",
-        );
-        cfg.validate().expect(
-            "two map bindings of one source at one ref project to distinct dests; under distinct \
-             keys they are valid, and any real dest clash is caught at deploy",
         );
     }
 
@@ -3806,20 +3665,6 @@ mod per_binding_refinement {
     }
 
     #[test]
-    fn validate_allows_root_slice_on_git_backed_source() {
-        let cfg = config(
-            "version = 1\n\n\
-             [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
-             [targets.t]\npath = \"~/x\"\n\
-             [targets.t.sources]\ndotfiles = { root = \"sub\" }\n",
-        );
-        cfg.validate().expect(
-            "a binding that slices `root` on a GIT-backed source is valid (git sources carry a \
-             tree to slice); the url-slice rejection must be specific to url-backed sources",
-        );
-    }
-
-    #[test]
     fn validate_allows_plain_binding_to_url_backed_source() {
         let cfg = config(
             "version = 1\n\n\
@@ -3831,87 +3676,6 @@ mod per_binding_refinement {
             "a PLAIN binding to a url-backed source that sets no root/include/exclude must be \
              VALID; only sliced bindings on url sources are rejected",
         );
-    }
-
-    #[test]
-    fn validate_rejects_root_slice_on_url_backed_source() {
-        let cfg = config(
-            "version = 1\n\n\
-             [sources.pkg]\nurl = \"https://example.com/foo.tar.gz\"\n\n\
-             [targets.t]\npath = \"~/x\"\n\
-             [targets.t.sources]\npkg = { root = \"sub\" }\n",
-        );
-        let err = cfg.validate().expect_err(
-            "a binding that sets `root` on a url-backed source must be rejected: url sources \
-             carry no tree to slice",
-        );
-        match err {
-            Error::Config(msg) => {
-                assert!(
-                    msg.contains("pkg"),
-                    "the url-slice error must name the offending source `pkg`, got: {msg}"
-                );
-                assert!(
-                    msg.contains("root"),
-                    "the url-slice error must name the rejected `root` refinement, got: {msg}"
-                );
-            }
-            other => panic!("expected Error::Config, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn validate_rejects_include_slice_on_url_backed_source() {
-        let cfg = config(
-            "version = 1\n\n\
-             [sources.pkg]\nurl = \"https://example.com/foo.tar.gz\"\n\n\
-             [targets.t]\npath = \"~/x\"\n\
-             [targets.t.sources]\npkg = { include = [\"a\"] }\n",
-        );
-        let err = cfg.validate().expect_err(
-            "a binding that sets `include` on a url-backed source must be rejected (url sources \
-             reject slicing, mirroring the source-level rule)",
-        );
-        match err {
-            Error::Config(msg) => {
-                assert!(
-                    msg.contains("pkg"),
-                    "the url-slice error must name the offending source `pkg`, got: {msg}"
-                );
-                assert!(
-                    msg.contains("include"),
-                    "the url-slice error must name the rejected `include` refinement, got: {msg}"
-                );
-            }
-            other => panic!("expected Error::Config, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn validate_rejects_exclude_slice_on_url_backed_source() {
-        let cfg = config(
-            "version = 1\n\n\
-             [sources.pkg]\nurl = \"https://example.com/foo.tar.gz\"\n\n\
-             [targets.t]\npath = \"~/x\"\n\
-             [targets.t.sources]\npkg = { exclude = [\"b\"] }\n",
-        );
-        let err = cfg.validate().expect_err(
-            "a binding that sets `exclude` on a url-backed source must be rejected (url sources \
-             reject slicing, mirroring the source-level rule)",
-        );
-        match err {
-            Error::Config(msg) => {
-                assert!(
-                    msg.contains("pkg"),
-                    "the url-slice error must name the offending source `pkg`, got: {msg}"
-                );
-                assert!(
-                    msg.contains("exclude"),
-                    "the url-slice error must name the rejected `exclude` refinement, got: {msg}"
-                );
-            }
-            other => panic!("expected Error::Config, got {other:?}"),
-        }
     }
 
     // PTV-001: per-target version — binding ref overrides source ref, bare inherits.
@@ -3976,19 +3740,17 @@ mod per_binding_refinement {
             layout: None,
             hooks: None,
             imports: None,
+            take: BTreeMap::new(),
             confine: None,
             sources: Some(BTreeMap::from([(
                 "pinned".to_owned(),
                 Binding {
                     source: Some("fzf".to_owned()),
-                    root: None,
-                    include: None,
-                    exclude: None,
                     branch: Some("develop".to_owned()),
                     tag: Some("v9.9.9".to_owned()),
                     rev: Some("deadbeef".to_owned()),
                     template: None,
-                    map: None,
+                    take: None,
                 },
             )])),
         };
@@ -4020,19 +3782,17 @@ mod per_binding_refinement {
             layout: None,
             hooks: None,
             imports: None,
+            take: BTreeMap::new(),
             confine: None,
             sources: Some(BTreeMap::from([(
                 "pinned".to_owned(),
                 Binding {
                     source: Some("fzf".to_owned()),
-                    root: None,
-                    include: None,
-                    exclude: None,
                     branch: Some("develop".to_owned()),
                     tag: Some("v9.9.9".to_owned()),
                     rev: None,
                     template: None,
-                    map: None,
+                    take: None,
                 },
             )])),
         };
@@ -5651,316 +5411,6 @@ dotfiles = { template = ["*.conf"] }
     );
 }
 
-fn map_config_err(map_body: &str) -> Error {
-    let toml = format!(
-        r#"
-version = 1
-
-[sources.dotfiles]
-git = "https://github.com/me/dotfiles.git"
-
-[targets.t]
-path = "~/x"
-[targets.t.sources]
-dotfiles = {{ {map_body} }}
-"#
-    );
-    let cfg = Config::parse(&toml).expect("a structurally valid `map` binding must parse");
-    cfg.validate()
-        .expect_err("a binding with an invalid `map` must be rejected at validation")
-}
-
-#[test]
-fn binding_map_parses_and_is_visible_on_refined_and_resolved() {
-    let cfg = Config::parse(
-        r#"
-version = 1
-
-[sources.dotfiles]
-git = "https://github.com/me/dotfiles.git"
-
-[targets.t]
-path = "~/x"
-[targets.t.sources]
-dotfiles = { map = { "AGENTS.md" = "CLAUDE.md", "nested/AGENTS.md" = "codex.md" } }
-"#,
-    )
-    .expect("a valid `map` binding must parse and pass load-time validation");
-
-    let map = refined(&cfg, "t")
-        .map
-        .as_ref()
-        .expect("the keyed binding carries the `map`");
-    assert_eq!(
-        map.get("AGENTS.md").map(String::as_str),
-        Some("CLAUDE.md"),
-        "the map selector->dest entry must round-trip on the binding"
-    );
-    assert_eq!(
-        map.get("nested/AGENTS.md").map(String::as_str),
-        Some("codex.md"),
-        "a key containing `/` (a nested source file) is allowed and must round-trip"
-    );
-
-    let resolved = target_of(&cfg, "t").resolve_sources(&cfg.sources);
-    let binding = resolved
-        .iter()
-        .find(|b| b.source == "dotfiles")
-        .expect("the dotfiles binding resolves");
-    let resolved_map = binding
-        .map
-        .as_ref()
-        .expect("the resolved binding carries the `map`");
-    assert_eq!(
-        resolved_map.get("AGENTS.md").map(String::as_str),
-        Some("CLAUDE.md"),
-        "`map` must be threaded onto ResolvedBinding at the resolve_binding site"
-    );
-    assert_eq!(
-        resolved_map.get("nested/AGENTS.md").map(String::as_str),
-        Some("codex.md"),
-        "the resolved map must carry every entry, slashed keys included"
-    );
-}
-
-#[test]
-fn binding_map_with_include_is_rejected() {
-    let err = map_config_err(r#"map = { "AGENTS.md" = "CLAUDE.md" }, include = ["x"]"#);
-    match err {
-        Error::Config(msg) => assert!(
-            msg.contains("dotfiles") && msg.contains("map") && msg.contains("include"),
-            "map+include rejection must name the source and both fields, got: {msg}"
-        ),
-        other => panic!("expected Error::Config, got {other:?}"),
-    }
-}
-
-#[test]
-fn binding_map_with_exclude_is_rejected() {
-    let err = map_config_err(r#"map = { "AGENTS.md" = "CLAUDE.md" }, exclude = ["x"]"#);
-    match err {
-        Error::Config(msg) => assert!(
-            msg.contains("dotfiles") && msg.contains("map") && msg.contains("exclude"),
-            "map+exclude rejection must name the source and both fields, got: {msg}"
-        ),
-        other => panic!("expected Error::Config, got {other:?}"),
-    }
-}
-
-#[test]
-fn binding_map_value_with_slash_is_rejected() {
-    let err = map_config_err(r#"map = { "AGENTS.md" = "sub/CLAUDE.md" }"#);
-    match err {
-        Error::Config(msg) => assert!(
-            msg.contains("dotfiles") && msg.contains("sub/CLAUDE.md"),
-            "a nested map dest must be rejected and the message name the offending value, got: {msg}"
-        ),
-        other => panic!("expected Error::Config, got {other:?}"),
-    }
-}
-
-#[test]
-fn binding_map_value_with_backslash_is_rejected() {
-    let err = map_config_err(r#"map = { "AGENTS.md" = "sub\\CLAUDE.md" }"#);
-    match err {
-        Error::Config(msg) => assert!(
-            msg.contains("dotfiles") && msg.contains(r"sub\CLAUDE.md"),
-            "a map dest with a backslash must be rejected and the message name the offending value, got: {msg}"
-        ),
-        other => panic!("expected Error::Config, got {other:?}"),
-    }
-}
-
-#[test]
-fn binding_map_value_dotdot_is_rejected() {
-    let err = map_config_err(r#"map = { "AGENTS.md" = ".." }"#);
-    match err {
-        Error::Config(msg) => assert!(
-            msg.contains("dotfiles") && msg.contains(".."),
-            "a `..` map dest must be rejected and the message name the offending value, got: {msg}"
-        ),
-        other => panic!("expected Error::Config, got {other:?}"),
-    }
-}
-
-#[test]
-fn binding_map_value_dot_is_rejected() {
-    let err = map_config_err(r#"map = { "AGENTS.md" = "." }"#);
-    match err {
-        Error::Config(msg) => assert!(
-            msg.contains("dotfiles") && (msg.contains("map") || msg.contains("AGENTS.md")),
-            "a `.` map dest must be rejected and the message name the source and the map dest rule, got: {msg}"
-        ),
-        other => panic!("expected Error::Config, got {other:?}"),
-    }
-}
-
-#[test]
-fn binding_map_value_absolute_is_rejected() {
-    let err = map_config_err(r#"map = { "AGENTS.md" = "/etc/passwd" }"#);
-    match err {
-        Error::Config(msg) => assert!(
-            msg.contains("dotfiles") && msg.contains("/etc/passwd"),
-            "an absolute map dest must be rejected and the message name the offending value, got: {msg}"
-        ),
-        other => panic!("expected Error::Config, got {other:?}"),
-    }
-}
-
-#[test]
-fn binding_map_key_absolute_is_rejected() {
-    let err = map_config_err(r#"map = { "/etc/passwd" = "CLAUDE.md" }"#);
-    match err {
-        Error::Config(msg) => assert!(
-            msg.contains("dotfiles") && msg.contains("/etc/passwd"),
-            "an absolute map key must be rejected and named, got: {msg}"
-        ),
-        other => panic!("expected Error::Config, got {other:?}"),
-    }
-}
-
-#[test]
-fn binding_map_key_dotdot_escape_is_rejected() {
-    let err = map_config_err(r#"map = { "../outside.md" = "CLAUDE.md" }"#);
-    match err {
-        Error::Config(msg) => assert!(
-            msg.contains("dotfiles") && msg.contains(".."),
-            "a `..` map key escaping the root must be rejected and named, got: {msg}"
-        ),
-        other => panic!("expected Error::Config, got {other:?}"),
-    }
-}
-
-#[test]
-fn binding_map_key_embedded_dotdot_escape_is_rejected() {
-    let err = map_config_err(r#"map = { "a/../b" = "CLAUDE.md" }"#);
-    match err {
-        Error::Config(msg) => assert!(
-            msg.contains("dotfiles") && msg.contains(".."),
-            "a `..` in any key component (not just leading) escaping the root must be rejected and named, got: {msg}"
-        ),
-        other => panic!("expected Error::Config, got {other:?}"),
-    }
-}
-
-#[test]
-fn binding_map_on_url_source_is_rejected() {
-    let cfg = Config::parse(
-        r#"
-version = 1
-
-[sources.pkg]
-url = "https://example.com/foo.tar.gz"
-
-[targets.t]
-path = "~/x"
-[targets.t.sources]
-pkg = { map = { "AGENTS.md" = "CLAUDE.md" } }
-"#,
-    )
-    .expect("a structurally valid `map` binding on a url source must parse");
-    let err = cfg.validate().expect_err(
-        "a `map` on a url-backed source must be rejected: url sources carry no tree to alias",
-    );
-    match err {
-        Error::Config(msg) => assert!(
-            msg.contains("pkg") && msg.contains("map"),
-            "the url-slice error must name the source `pkg` and the rejected `map`, got: {msg}"
-        ),
-        other => panic!("expected Error::Config, got {other:?}"),
-    }
-}
-
-#[test]
-fn binding_map_key_with_slash_is_accepted() {
-    let cfg = Config::parse(
-        r#"
-version = 1
-
-[sources.dotfiles]
-git = "https://github.com/me/dotfiles.git"
-
-[targets.t]
-path = "~/x"
-[targets.t.sources]
-dotfiles = { map = { "a/b/AGENTS.md" = "CLAUDE.md" } }
-"#,
-    )
-    .expect("a map key containing `/` (a nested source file) must be accepted");
-    let map = refined(&cfg, "t")
-        .map
-        .as_ref()
-        .expect("the keyed binding carries the `map`");
-    assert_eq!(
-        map.get("a/b/AGENTS.md").map(String::as_str),
-        Some("CLAUDE.md"),
-        "a slashed key naming a nested source file must round-trip"
-    );
-
-    let resolved = target_of(&cfg, "t").resolve_sources(&cfg.sources);
-    let binding = resolved
-        .iter()
-        .find(|b| b.source == "dotfiles")
-        .expect("the dotfiles binding resolves");
-    let resolved_map = binding
-        .map
-        .as_ref()
-        .expect("the resolved binding carries the `map`");
-    assert_eq!(
-        resolved_map.get("a/b/AGENTS.md").map(String::as_str),
-        Some("CLAUDE.md"),
-        "a slashed key must survive onto ResolvedBinding at the resolve_binding site"
-    );
-}
-
-#[test]
-fn binding_empty_map_is_rejected() {
-    let err = map_config_err(r"map = {}");
-    match err {
-        Error::Config(msg) => assert!(
-            msg.contains("dotfiles") && msg.contains("map"),
-            "an empty `map` table is ambiguous and must be rejected, got: {msg}"
-        ),
-        other => panic!("expected Error::Config, got {other:?}"),
-    }
-}
-
-#[test]
-fn binding_map_empty_key_is_rejected() {
-    let err = map_config_err(r#"map = { "" = "CLAUDE.md" }"#);
-    match err {
-        Error::Config(msg) => assert!(
-            msg.contains("dotfiles") && msg.contains("map"),
-            "an empty map key must be rejected and the message name the source and the map rule, got: {msg}"
-        ),
-        other => panic!("expected Error::Config, got {other:?}"),
-    }
-}
-
-#[test]
-fn binding_map_empty_value_is_rejected() {
-    let err = map_config_err(r#"map = { "AGENTS.md" = "" }"#);
-    match err {
-        Error::Config(msg) => assert!(
-            msg.contains("dotfiles") && (msg.contains("AGENTS.md") || msg.contains("map")),
-            "an empty map dest must be rejected and the message name the source and the offending key/rule, got: {msg}"
-        ),
-        other => panic!("expected Error::Config, got {other:?}"),
-    }
-}
-
-#[test]
-fn binding_map_duplicate_dest_values_are_rejected() {
-    let err = map_config_err(r#"map = { "A.md" = "OUT.md", "B.md" = "OUT.md" }"#);
-    match err {
-        Error::Config(msg) => assert!(
-            msg.contains("dotfiles") && msg.contains("OUT.md"),
-            "two keys mapping to one dest must be rejected, naming the source and the duplicated dest, got: {msg}"
-        ),
-        other => panic!("expected Error::Config, got {other:?}"),
-    }
-}
-
 // BIND-KEY-001
 mod keyed_bindings {
     use super::*;
@@ -5982,7 +5432,7 @@ mod keyed_bindings {
         let cfg = Config::parse(
             "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\n\n\
              [targets.t]\npath = \"~/x\"\n\n\
-             [targets.t.sources]\ndotfiles = { root = \".config\" }\n",
+             [targets.t.sources]\ndotfiles = {}\n",
         )
         .expect("a keyed-table binding must parse");
         let resolved = target_of(&cfg, "t").resolve_sources(&cfg.sources);
@@ -6054,7 +5504,7 @@ mod keyed_bindings {
         let cfg = Config::parse(
             "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\n\n\
              [targets.t]\npath = \"~/x\"\n\n\
-             [targets.t.sources]\nmy-alias = { source = \"dotfiles\", root = \"sub\" }\n",
+             [targets.t.sources]\nmy-alias = { source = \"dotfiles\" }\n",
         )
         .expect("a keyed binding must parse");
         let resolved = target_of(&cfg, "t").resolve_sources(&cfg.sources);

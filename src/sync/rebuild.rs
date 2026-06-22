@@ -164,18 +164,6 @@ fn rebuild_binding(
         Ok(())
     };
 
-    if let Some(map) = run.binding.map {
-        for (key, dest) in map {
-            reconstruct(
-                &ArtifactName::trusted(dest.as_str()),
-                Some(key.as_str()),
-                managed,
-                report,
-            )?;
-        }
-        return Ok(());
-    }
-
     let discovered = discover_artifacts_for_source(
         run.source,
         run.git,

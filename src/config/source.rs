@@ -1,10 +1,11 @@
 //! Source DTOs and their typed, single-kind parsed form.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::diagnostic::SelectionDiagnostic;
 use crate::error::{Error, Result};
 use crate::source::ExportPolicy;
 
@@ -139,6 +140,8 @@ impl ParsedSource {
                  a forge `host`/`repo`, a literal `git`, or a `url`"
             ))
         })?;
+        reject_bang_patterns(name, "include", source.include.as_deref())?;
+        reject_bang_patterns(name, "exclude", source.exclude.as_deref())?;
         Ok(Self {
             remote,
             branch: source.branch.clone(),
@@ -219,6 +222,16 @@ impl ParsedSource {
         self.exclude.as_deref().unwrap_or(&[])
     }
 
+    /// The config-layer offer this source publishes to the selection engine.
+    #[must_use]
+    pub fn offer(&self) -> Offer<'_> {
+        Offer {
+            includes: self.includes(),
+            excludes: self.excludes(),
+            root: self.root.as_deref(),
+        }
+    }
+
     #[must_use]
     pub fn refspec(&self) -> Refspec {
         if matches!(self.remote, Remote::Url { .. }) {
@@ -267,6 +280,73 @@ impl ParsedSource {
         ]);
         format!("blake3:{}", h.finalize().to_hex())
     }
+}
+
+const VCS_EXCLUDES: &[&str] = &[".git/"];
+
+/// A source's config-layer offer to the selection engine.
+#[derive(Debug, Clone, Copy)]
+pub struct Offer<'a> {
+    includes: &'a [String],
+    excludes: &'a [String],
+    root: Option<&'a Path>,
+}
+
+impl<'a> Offer<'a> {
+    #[must_use]
+    pub fn includes(&self) -> &'a [String] {
+        self.includes
+    }
+
+    #[must_use]
+    pub fn excludes(&self) -> &'a [String] {
+        self.excludes
+    }
+
+    /// True when no `include` was declared — the OCaml `no .mli = public` full offer.
+    #[must_use]
+    pub fn is_implicit_full(&self) -> bool {
+        self.includes.is_empty()
+    }
+
+    #[must_use]
+    pub fn vcs_excludes(&self) -> &[&'static str] {
+        if self.is_implicit_full() {
+            VCS_EXCLUDES
+        } else {
+            &[]
+        }
+    }
+
+    #[must_use]
+    pub fn root(&self) -> Option<&'a Path> {
+        self.root
+    }
+}
+
+/// Rejects gitignore-style `!` negation in a pattern list with a selection diagnostic.
+fn reject_bang_patterns(name: &str, field: &str, patterns: Option<&[String]>) -> Result<()> {
+    let Some(patterns) = patterns else {
+        return Ok(());
+    };
+    for pattern in patterns {
+        if pattern.starts_with('!') {
+            return Err(SelectionDiagnostic {
+                entry: pattern.clone(),
+                matched_against: format!("source `{name}` `{field}` patterns"),
+                why: "`!` negation is not supported — the offer composes `include − exclude`, \
+                      with no gitignore ordering or re-inclusion"
+                    .to_owned(),
+                did_you_mean: None,
+                remedy: "drop the `!` and express the exclusion via `exclude` \
+                         (exclude wins over include)"
+                    .to_owned(),
+                debug_hint: Some(format!("phora explain {name} src")),
+            }
+            .config());
+        }
+    }
+    Ok(())
 }
 
 /// Resolves a forge `host`/`repo` against the built-in registry overlaid by `hosts`.
@@ -489,5 +569,191 @@ impl std::fmt::Display for Refspec {
             Self::Branch(s) | Self::Tag(s) | Self::Rev(s) => write!(f, "{s}"),
             Self::None => write!(f, ""),
         }
+    }
+}
+
+#[cfg(test)]
+mod offer_tests {
+    use std::path::Path;
+
+    use super::{ParsedSource, Source};
+    use crate::diagnostic::{MATCHED_AGAINST, REMEDY, SELECTION, TO_DEBUG};
+
+    fn git_source() -> Source {
+        Source {
+            git: Some("https://example.test/repo.git".into()),
+            url: None,
+            digest: None,
+            host: None,
+            repo: None,
+            path: None,
+            protocol: None,
+            branch: None,
+            tag: None,
+            rev: None,
+            root: None,
+            include: None,
+            exclude: None,
+            allow_symlinks: None,
+            allow_submodules: None,
+            preserve_executable: None,
+            deploy: None,
+            transitive: None,
+        }
+    }
+
+    fn parsed(source: &Source) -> ParsedSource {
+        ParsedSource::parse("dotfiles", source).expect("fixture source must parse")
+    }
+
+    #[test]
+    fn absent_include_is_an_implicit_full_offer() {
+        let parsed = parsed(&git_source());
+        let offer = parsed.offer();
+
+        assert!(
+            offer.is_implicit_full(),
+            "a source with no `include` must expose the OCaml `no .mli = public` implicit full offer"
+        );
+    }
+
+    #[test]
+    fn an_include_makes_the_offer_explicit_not_full() {
+        let mut source = git_source();
+        source.include = Some(vec!["skills/**".into()]);
+        let parsed = parsed(&source);
+        let offer = parsed.offer();
+
+        assert!(
+            !offer.is_implicit_full(),
+            "a declared `include` is an explicit `.mli`; the offer is no longer the implicit full offer"
+        );
+        assert_eq!(
+            offer.includes(),
+            ["skills/**"],
+            "the offer must carry the declared include patterns verbatim"
+        );
+    }
+
+    #[test]
+    fn implicit_full_offer_excludes_vcs_metadata() {
+        let parsed = parsed(&git_source());
+        let offer = parsed.offer();
+
+        assert!(
+            offer
+                .vcs_excludes()
+                .iter()
+                .any(|pattern| pattern.contains(".git")),
+            "the implicit full offer must bound `everything` by pruning `.git/`/VCS metadata (M5); \
+             got vcs excludes: {:?}",
+            offer.vcs_excludes()
+        );
+    }
+
+    #[test]
+    fn offer_carries_both_include_and_exclude_for_set_composition() {
+        let mut source = git_source();
+        source.include = Some(vec!["skills/**".into()]);
+        source.exclude = Some(vec!["skills/private/**".into()]);
+        let parsed = parsed(&source);
+        let offer = parsed.offer();
+
+        assert_eq!(
+            offer.includes(),
+            ["skills/**"],
+            "the offer must expose include patterns for `include − exclude` composition"
+        );
+        assert_eq!(
+            offer.excludes(),
+            ["skills/private/**"],
+            "the offer must expose exclude patterns; exclude-wins composition is resolved at SMR-020"
+        );
+    }
+
+    #[test]
+    fn dotfiles_are_not_opted_out_of_the_offer_surface() {
+        let mut source = git_source();
+        source.include = Some(vec![".config/**".into()]);
+        let parsed = parsed(&source);
+        let offer = parsed.offer();
+
+        assert!(
+            offer
+                .vcs_excludes()
+                .iter()
+                .all(|pattern| pattern.contains(".git")),
+            "the only dotted thing the offer surface prunes is VCS metadata; no blanket dotfile \
+             opt-out may appear (D4/RQ-3 — dotfiles MATCH, 100% gitignore); got: {:?}",
+            offer.vcs_excludes()
+        );
+        assert!(
+            offer.includes().iter().any(|p| p.starts_with('.')),
+            "a dotted include pattern must survive into the offer unchanged"
+        );
+    }
+
+    #[test]
+    fn offer_exposes_root_for_re_anchoring() {
+        let mut source = git_source();
+        source.root = Some("nested/here".into());
+        let parsed = parsed(&source);
+        let offer = parsed.offer();
+
+        assert_eq!(
+            offer.root(),
+            Some(Path::new("nested/here")),
+            "the offer must expose `root` so SMR-020 re-anchors gitignore matching and publishes \
+             a root-relative namespace (D20)"
+        );
+    }
+
+    #[test]
+    fn absent_root_anchors_at_the_source_top() {
+        let parsed = parsed(&git_source());
+        let offer = parsed.offer();
+
+        assert_eq!(
+            offer.root(),
+            None,
+            "no `root` means the offer anchors at the source top; the namespace is the full source"
+        );
+    }
+
+    #[test]
+    fn bang_negation_in_include_is_rejected_with_a_selection_diagnostic() {
+        let mut source = git_source();
+        source.include = Some(vec!["!skills/private/**".into()]);
+
+        let err = ParsedSource::parse("dotfiles", &source)
+            .expect_err("a `!`-prefixed include must be rejected — no gitignore ordering/negation");
+        let rendered = err.to_string();
+
+        for phrase in [SELECTION, MATCHED_AGAINST, REMEDY, TO_DEBUG] {
+            assert!(
+                rendered.contains(phrase),
+                "the `!`-rejection must render the named selection-diagnostic phrase `{phrase}`; \
+                 got:\n{rendered}"
+            );
+        }
+        assert!(
+            rendered.contains('!'),
+            "the diagnostic must surface the offending `!` pattern; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn bang_negation_in_exclude_is_rejected() {
+        let mut source = git_source();
+        source.exclude = Some(vec!["!skills/keep/**".into()]);
+
+        let err = ParsedSource::parse("dotfiles", &source)
+            .expect_err("a `!`-prefixed exclude must be rejected — exclude-wins, no re-inclusion");
+        let rendered = err.to_string();
+
+        assert!(
+            rendered.contains(SELECTION) && rendered.contains(REMEDY),
+            "the exclude `!`-rejection must render a structured selection diagnostic; got:\n{rendered}"
+        );
     }
 }

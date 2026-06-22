@@ -94,20 +94,6 @@ pub fn plan_target(
                 binding.source, binding.effective_ref
             ))
         })?;
-        if let Some(map) = binding.map {
-            for dest in map.values() {
-                entries.push(PlanEntry {
-                    identity: binding.identity.to_owned(),
-                    source: binding.source.to_owned(),
-                    artifact: dest.clone(),
-                    commit: commit.clone(),
-                    destination: path.join(dest),
-                    mapped: true,
-                });
-            }
-            continue;
-        }
-
         let name = SourceName::trusted(binding.source);
         let discovered = discover_binding(
             source,
