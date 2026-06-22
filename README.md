@@ -356,7 +356,7 @@ layout = "flat"          # "flat" | "by-source" | { type = "prefixed", separator
 path = "~/.config/editor"
 
 [targets.editor.sources]
-nvim = { source = "dotfiles", root = "nvim" }
+nvim = { source = "dotfiles", take = ["nvim/**"] }
 ```
 
 Target sources are an explicit allow-list: `["a", "b"]` deploys those two,

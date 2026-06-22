@@ -113,9 +113,55 @@ pub struct Target {
     pub hooks: Option<TargetHooks>,
     #[serde(default)]
     pub imports: Option<Vec<String>>,
+    #[serde(default)]
+    pub take: BTreeMap<String, Vec<TakeEntry>>,
     /// Composition-only anchor every destination must stay under; `Some` iff this is a composed dep target.
     #[serde(skip)]
     pub confine: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub enum TakeEntry {
+    Leaf(String),
+    Rename { src: String, dest: String },
+}
+
+impl<'de> Deserialize<'de> for TakeEntry {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct TakeEntryVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for TakeEntryVisitor {
+            type Value = TakeEntry;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a leaf path string or a single-pair rename table")
+            }
+
+            fn visit_str<E: serde::de::Error>(
+                self,
+                v: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(TakeEntry::Leaf(v.to_owned()))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let Some((src, dest)) = map.next_entry::<String, String>()? else {
+                    return Err(serde::de::Error::custom(
+                        "a `take` rename table must carry one source-to-destination pair",
+                    ));
+                };
+                Ok(TakeEntry::Rename { src, dest })
+            }
+        }
+
+        deserializer.deserialize_any(TakeEntryVisitor)
+    }
 }
 
 /// A per-target binding value. The map key is the binding identity; `source`
@@ -124,16 +170,13 @@ pub struct Target {
 #[serde(deny_unknown_fields)]
 pub struct Binding {
     pub source: Option<String>,
-    pub root: Option<PathBuf>,
-    pub include: Option<Vec<String>>,
-    pub exclude: Option<Vec<String>>,
     pub branch: Option<String>,
     pub tag: Option<String>,
     pub rev: Option<String>,
     #[serde(default)]
     pub template: Option<TemplateOptIn>,
     #[serde(default)]
-    pub map: Option<BTreeMap<String, String>>,
+    pub take: Option<Vec<TakeEntry>>,
 }
 
 impl Binding {
@@ -204,7 +247,24 @@ pub struct ResolvedBinding<'a> {
     pub exclude: &'a [String],
     pub effective_ref: Refspec,
     pub template_opt_in: TemplateOptIn,
-    pub map: Option<&'a BTreeMap<String, String>>,
+    pub take: Option<&'a [TakeEntry]>,
+}
+
+impl ResolvedBinding<'_> {
+    pub fn renames(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.take
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| match entry {
+                TakeEntry::Rename { src, dest } => Some((src.as_str(), dest.as_str())),
+                TakeEntry::Leaf(_) => None,
+            })
+    }
+
+    #[must_use]
+    pub fn has_renames(&self) -> bool {
+        self.renames().next().is_some()
+    }
 }
 
 pub trait SourceFields {
@@ -275,6 +335,9 @@ impl Target {
         if local.imports.is_some() {
             self.imports = local.imports;
         }
+        if !local.take.is_empty() {
+            self.take = local.take;
+        }
         self
     }
 
@@ -324,18 +387,12 @@ fn resolve_binding<'a, S: SourceFields>(
     Some(ResolvedBinding {
         identity,
         source: source_name,
-        root: binding.root.as_deref().or_else(|| source.intrinsic_root()),
-        include: binding
-            .include
-            .as_deref()
-            .unwrap_or_else(|| source.intrinsic_include()),
-        exclude: binding
-            .exclude
-            .as_deref()
-            .unwrap_or_else(|| source.intrinsic_exclude()),
+        root: source.intrinsic_root(),
+        include: source.intrinsic_include(),
+        exclude: source.intrinsic_exclude(),
         effective_ref: binding_refspec(binding).unwrap_or_else(|| source.intrinsic_refspec()),
         template_opt_in: binding.template_opt_in(),
-        map: binding.map.as_ref(),
+        take: binding.take.as_deref(),
     })
 }
 
@@ -445,5 +502,259 @@ impl LayoutKind {
             "prefixed" => Ok(Self::Prefixed),
             other => Err(format!("unknown layout type `{other}`")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::fmt::Write as _;
+    use std::path::{Path, PathBuf};
+
+    use super::{Binding, Source, TakeEntry, Target, resolve_binding};
+
+    fn binding(body: &str) -> Binding {
+        toml::from_str::<Binding>(body).expect("binding DTO deserializes")
+    }
+
+    fn try_binding(body: &str) -> Result<Binding, toml::de::Error> {
+        toml::from_str::<Binding>(body)
+    }
+
+    fn source_with(root: Option<&str>, include: &[&str], exclude: &[&str]) -> Source {
+        let mut toml = String::from("git = \"https://example.com/x.git\"\n");
+        if let Some(r) = root {
+            let _ = writeln!(toml, "root = \"{r}\"");
+        }
+        if !include.is_empty() {
+            let list = include
+                .iter()
+                .map(|p| format!("\"{p}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(toml, "include = [{list}]");
+        }
+        if !exclude.is_empty() {
+            let list = exclude
+                .iter()
+                .map(|p| format!("\"{p}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(toml, "exclude = [{list}]");
+        }
+        toml::from_str::<Source>(&toml).expect("source DTO deserializes")
+    }
+
+    #[test]
+    fn binding_rejects_include_field() {
+        let err = try_binding("include = [\"editor/**\"]\n")
+            .expect_err("binding-level `include` must no longer deserialize");
+        assert!(
+            err.to_string().contains("include"),
+            "the rejection must name the removed `include` field; got:\n{err}"
+        );
+    }
+
+    #[test]
+    fn binding_rejects_exclude_field() {
+        try_binding("exclude = [\"editor/**\"]\n")
+            .expect_err("binding-level `exclude` must no longer deserialize");
+    }
+
+    #[test]
+    fn binding_rejects_root_field() {
+        try_binding("root = \"editor\"\n")
+            .expect_err("binding-level `root` must no longer deserialize");
+    }
+
+    #[test]
+    fn binding_rejects_map_field() {
+        try_binding("map = { \"a/X.md\" = \"a/x.md\" }\n")
+            .expect_err("binding-level `map` must no longer deserialize");
+    }
+
+    #[test]
+    fn take_deserializes_mixed_literal_glob_and_rename() {
+        let b = binding(
+            "take = [\"skills/gestalt/skill.md\", \"skills/**\", { \"a/X.md\" = \"a/x.md\" }]\n",
+        );
+        let take = b.take.as_deref().expect("a present `take` parses to Some");
+        assert_eq!(take.len(), 3, "all three entries parse; got: {take:?}");
+
+        assert!(
+            matches!(&take[0], TakeEntry::Leaf(s) if s == "skills/gestalt/skill.md"),
+            "the first entry is a literal leaf captured verbatim; got: {:?}",
+            take[0]
+        );
+        assert!(
+            matches!(&take[1], TakeEntry::Leaf(s) if s == "skills/**"),
+            "a glob string is captured raw as a leaf entry; classification is SMR-021, not here; got: {:?}",
+            take[1]
+        );
+        match &take[2] {
+            TakeEntry::Rename { src, dest } => {
+                assert_eq!(src, "a/X.md", "rename src captured verbatim; got: {src}");
+                assert_eq!(dest, "a/x.md", "rename dest captured verbatim; got: {dest}");
+            }
+            leaf @ TakeEntry::Leaf(_) => panic!("the third entry is a rename-map; got: {leaf:?}"),
+        }
+    }
+
+    #[test]
+    fn omitted_take_is_none_project_everything() {
+        let b = binding("source = \"s\"\n");
+        assert!(
+            b.take.is_none(),
+            "an omitted `take` must parse to None (project EVERYTHING); got: {:?}",
+            b.take
+        );
+    }
+
+    #[test]
+    fn empty_take_is_some_empty_project_nothing() {
+        let b = binding("take = []\n");
+        let take = b
+            .take
+            .as_deref()
+            .expect("an explicit `take = []` must parse to Some, not None");
+        assert!(
+            take.is_empty(),
+            "`take = []` must parse to Some(empty) (project NOTHING); got: {take:?}"
+        );
+    }
+
+    #[test]
+    fn mount_take_table_parses_anchor_keyed_while_imports_stays_string_list() {
+        let target: Target = toml::from_str(
+            "path = \"~/dst\"\n\
+             imports = [\"dep-a\", \"dep-b\"]\n\
+             [take]\n\
+             \"anchor/one\" = [\"a\", { \"b/X.md\" = \"b/x.md\" }]\n\
+             \"anchor/two\" = [\"c\"]\n",
+        )
+        .expect("a target with a mount take table deserializes");
+
+        assert_eq!(
+            target.imports,
+            Some(vec!["dep-a".to_string(), "dep-b".to_string()]),
+            "`imports` stays a refinement-free Vec<String>; got: {:?}",
+            target.imports
+        );
+
+        let one = target
+            .take
+            .get("anchor/one")
+            .expect("the mount take table is keyed by anchor");
+        assert_eq!(
+            one.len(),
+            2,
+            "anchor/one carries both entries; got: {one:?}"
+        );
+        assert!(
+            matches!(&one[0], TakeEntry::Leaf(s) if s == "a"),
+            "anchor/one first entry is a literal leaf; got: {:?}",
+            one[0]
+        );
+        assert!(
+            matches!(&one[1], TakeEntry::Rename { src, dest } if src == "b/X.md" && dest == "b/x.md"),
+            "anchor/one second entry is a rename-map; got: {:?}",
+            one[1]
+        );
+
+        let two = target
+            .take
+            .get("anchor/two")
+            .expect("anchor/two present in the table");
+        assert!(
+            matches!(two.as_slice(), [TakeEntry::Leaf(s)] if s == "c"),
+            "anchor/two carries one literal leaf; got: {two:?}"
+        );
+    }
+
+    #[test]
+    fn omitted_mount_take_table_is_empty() {
+        let target: Target =
+            toml::from_str("path = \"~/dst\"\n").expect("a bare target deserializes");
+        assert!(
+            target.take.is_empty(),
+            "an omitted mount take table defaults to empty (no anchor subsetting); got: {:?}",
+            target.take
+        );
+    }
+
+    #[test]
+    fn resolved_binding_surfaces_source_root_include_exclude_without_override() {
+        let source = source_with(Some("editor"), &["editor/**"], &["**/*.swp"]);
+        let mut all = BTreeMap::new();
+        all.insert("s".to_string(), source);
+
+        let b = binding("source = \"s\"\n");
+        let resolved =
+            resolve_binding("s", &b, &all).expect("binding resolves against the source map");
+
+        assert_eq!(
+            resolved.root,
+            Some(Path::new("editor")),
+            "ResolvedBinding surfaces the SOURCE root (no binding override); got: {:?}",
+            resolved.root
+        );
+        assert_eq!(
+            resolved.include,
+            &["editor/**".to_string()],
+            "ResolvedBinding surfaces the SOURCE include; got: {:?}",
+            resolved.include
+        );
+        assert_eq!(
+            resolved.exclude,
+            &["**/*.swp".to_string()],
+            "ResolvedBinding surfaces the SOURCE exclude; got: {:?}",
+            resolved.exclude
+        );
+    }
+
+    #[test]
+    fn resolved_binding_carries_take_not_map() {
+        let source = source_with(None, &[], &[]);
+        let mut all = BTreeMap::new();
+        all.insert("s".to_string(), source);
+
+        let b = binding("source = \"s\"\ntake = [\"a\", { \"b/X.md\" = \"b/x.md\" }]\n");
+        let resolved =
+            resolve_binding("s", &b, &all).expect("binding resolves against the source map");
+
+        let take = resolved
+            .take
+            .expect("ResolvedBinding carries the binding `take`");
+        assert_eq!(
+            take.len(),
+            2,
+            "both take entries flow through; got: {take:?}"
+        );
+        assert!(
+            matches!(&take[0], TakeEntry::Leaf(s) if s == "a"),
+            "first resolved take entry is a literal leaf; got: {:?}",
+            take[0]
+        );
+        assert!(
+            matches!(&take[1], TakeEntry::Rename { src, dest } if src == "b/X.md" && dest == "b/x.md"),
+            "second resolved take entry is a rename-map; got: {:?}",
+            take[1]
+        );
+    }
+
+    #[test]
+    fn resolved_binding_take_is_none_when_omitted() {
+        let source = source_with(None, &[], &[]);
+        let mut all: BTreeMap<String, Source> = BTreeMap::new();
+        all.insert("s".to_string(), source);
+
+        let b = binding("source = \"s\"\n");
+        let resolved = resolve_binding("s", &b, &all).expect("binding resolves");
+        assert!(
+            resolved.take.is_none(),
+            "an omitted `take` stays None through resolution (project everything); got: {:?}",
+            resolved.take
+        );
+        let _ = PathBuf::new();
     }
 }

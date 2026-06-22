@@ -130,13 +130,6 @@ pub(super) fn deploy_target(
             Ok(())
         };
 
-        if let Some(map) = binding.map {
-            for (key, dest) in map {
-                deploy_one_entry(&ArtifactName::trusted(dest.as_str()), Some(key.as_str()))?;
-            }
-            continue;
-        }
-
         let discovered = discover_artifacts_for_source(
             source,
             git,
@@ -585,6 +578,7 @@ mod confine_fail_closed_tests {
             layout: None,
             hooks: None,
             imports: None,
+            take: BTreeMap::new(),
             confine: None,
         }
     }
@@ -663,6 +657,7 @@ mod kind_aware_layout_tests {
             }),
             hooks: None,
             imports: None,
+            take: BTreeMap::new(),
             confine: None,
         }
     }

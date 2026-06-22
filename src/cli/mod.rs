@@ -78,18 +78,21 @@ pub enum Command {
         branch: Option<String>,
         #[arg(long)]
         tag: Option<String>,
+        /// Scope the NEW source's offer to `root` (source-owned, not a binding).
         #[arg(long)]
         root: Option<String>,
+        /// Keep only matching paths in the NEW source's offer (repeatable; source-owned).
+        #[arg(long = "include")]
+        include: Vec<String>,
+        /// Drop matching paths from the NEW source's offer (repeatable; source-owned).
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
         #[arg(long)]
         local: bool,
         #[arg(long)]
         symlink: bool,
         #[arg(long = "as")]
         r#as: Option<String>,
-        #[arg(long)]
-        include: Vec<String>,
-        #[arg(long)]
-        exclude: Vec<String>,
     },
     /// Remove a source and scrub it from every target (alias for `source rm`).
     Rm { name: String },
@@ -174,10 +177,8 @@ pub enum Command {
         r#as: Option<String>,
         #[arg(long)]
         root: Option<String>,
-        #[arg(long)]
-        include: Vec<String>,
-        #[arg(long)]
-        exclude: Vec<String>,
+        #[arg(long = "take")]
+        take: Vec<String>,
         #[arg(long)]
         branch: Option<String>,
         #[arg(long)]
@@ -226,8 +227,15 @@ pub enum SourceCmd {
         branch: Option<String>,
         #[arg(long)]
         tag: Option<String>,
+        /// Scope the NEW source's offer to `root` (source-owned, not a binding).
         #[arg(long)]
         root: Option<String>,
+        /// Keep only matching paths in the NEW source's offer (repeatable; source-owned).
+        #[arg(long = "include")]
+        include: Vec<String>,
+        /// Drop matching paths from the NEW source's offer (repeatable; source-owned).
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
         #[arg(long)]
         local: bool,
         #[arg(long)]
@@ -378,25 +386,18 @@ fn dispatch_add(cmd: Command) -> Result<()> {
         branch,
         tag,
         root,
+        include,
+        exclude,
         local,
         symlink,
         r#as,
-        include,
-        exclude,
     } = cmd
     else {
         unreachable!("dispatch_add only handles Command::Add")
     };
-    let to_present = !to.is_empty();
-    let source_root = if to_present { None } else { root.clone() };
     let refinement = BindRefinement {
         r#as,
-        root: if to_present { root } else { None },
-        include,
-        exclude,
-        branch: None,
-        tag: None,
-        rev: None,
+        ..BindRefinement::default()
     };
     add::run_add(
         &url,
@@ -404,7 +405,9 @@ fn dispatch_add(cmd: Command) -> Result<()> {
         name,
         branch,
         tag,
-        source_root,
+        root,
+        include,
+        exclude,
         local,
         symlink,
         &refinement,
@@ -441,8 +444,7 @@ fn dispatch_bind(cmd: Command) -> Result<()> {
         local,
         r#as,
         root,
-        include,
-        exclude,
+        take,
         branch,
         tag,
         rev,
@@ -457,11 +459,13 @@ fn dispatch_bind(cmd: Command) -> Result<()> {
         &BindRefinement {
             r#as,
             root,
-            include,
-            exclude,
             branch,
             tag,
             rev,
+            take: take
+                .iter()
+                .map(|t| config_edit::TakeArg::parse(t))
+                .collect(),
         },
     )
 }
@@ -474,6 +478,8 @@ fn run_source(cmd: SourceCmd) -> Result<()> {
             branch,
             tag,
             root,
+            include,
+            exclude,
             local,
             symlink,
         } => add::run_add(
@@ -483,6 +489,8 @@ fn run_source(cmd: SourceCmd) -> Result<()> {
             branch,
             tag,
             root,
+            include,
+            exclude,
             local,
             symlink,
             &BindRefinement::default(),

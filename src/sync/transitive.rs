@@ -8,11 +8,11 @@ use std::path::{Path, PathBuf};
 
 use crate::config::transitive::{FetchNode, Instance, TransitiveManifest};
 use crate::config::{
-    Binding, Config, DeployMode, HookCommand, Host, ParsedSource, Protocol, Refspec, Remote,
-    SourceMode, Target, admit_transitive_hooks, hook_preimage,
+    Config, DeployMode, HookCommand, Host, ParsedSource, Protocol, Refspec, Remote, SourceMode,
+    Target, admit_transitive_hooks, hook_preimage,
 };
 use crate::error::{Error, Result};
-use crate::kernel::{SourceName, safe_component};
+use crate::kernel::SourceName;
 use crate::source::{SourceBackend, is_local_path};
 
 use super::resolved_remotes;
@@ -363,6 +363,7 @@ fn compose_nested_imports(
             layout: None,
             hooks: None,
             imports: None,
+            take: BTreeMap::new(),
             confine: None,
         };
         ctx.ancestors.push(inner_node);
@@ -502,7 +503,6 @@ fn synthetic_target(
     if let Some(bindings) = target.sources.as_mut() {
         for (identity, binding) in bindings.iter_mut() {
             let effective = binding.source.clone().unwrap_or_else(|| identity.clone());
-            reject_dep_binding(imported, dep_target_name, identity, binding)?;
             let namespaced = source_names.get(&effective).ok_or_else(|| {
                 Error::Config(format!(
                     "imported `{imported}`: target `{dep_target_name}` binds undefined source `{effective}`"
@@ -512,46 +512,6 @@ fn synthetic_target(
         }
     }
     Ok(target)
-}
-
-/// Routes a dep-own binding's `map`/`root` through the same path-safety checks
-/// `Config::validate` applies to consumer bindings (the DTO path skips validate, so
-/// an escaping dep `map` value would otherwise bypass `safe_component`).
-fn reject_dep_binding(
-    imported: &str,
-    dep_target_name: &str,
-    identity: &str,
-    binding: &Binding,
-) -> Result<()> {
-    if let Some(root) = &binding.root
-        && (root.starts_with("~")
-            || root.components().any(|c| {
-                matches!(
-                    c,
-                    std::path::Component::ParentDir | std::path::Component::RootDir
-                )
-            }))
-    {
-        return Err(Error::Config(format!(
-            "imported `{imported}`: target `{dep_target_name}` binding `{identity}`: \
-             `root` must stay inside the source"
-        )));
-    }
-    for (key, value) in binding.map.iter().flatten() {
-        if safe_component(value).is_err() {
-            return Err(Error::Config(format!(
-                "imported `{imported}`: target `{dep_target_name}` binding `{identity}`: \
-                 `map` dest `{value}` must be a single safe filename"
-            )));
-        }
-        if key.starts_with('/') || key.split('/').any(|c| c == "..") {
-            return Err(Error::Config(format!(
-                "imported `{imported}`: target `{dep_target_name}` binding `{identity}`: \
-                 `map` key `{key}` must stay inside the source root"
-            )));
-        }
-    }
-    Ok(())
 }
 
 /// A dep target path must be a relative subpath: absolute, `~/`, or `..` escapes the anchor.

@@ -999,6 +999,8 @@ fn lit(git: &str, branch: Option<&str>) -> AddTarget {
         protocol: None,
         branch: branch.map(str::to_owned),
         root: None,
+        include: Vec::new(),
+        exclude: Vec::new(),
     }
 }
 
@@ -1457,6 +1459,8 @@ fn run_add_end_to_end_persists_symbolic_source_to_phora_toml() {
             None,
             None,
             None,
+            Vec::new(),
+            Vec::new(),
             false,
             false,
             &config_edit::BindRefinement::default(),
@@ -1504,6 +1508,8 @@ fn run_add_persists_local_path_source_for_absolute_dir() {
             None,
             None,
             None,
+            Vec::new(),
+            Vec::new(),
             false,
             false,
             &config_edit::BindRefinement::default(),
@@ -1556,6 +1562,8 @@ fn run_add_to_target_persists_local_path_source() {
             None,
             None,
             None,
+            Vec::new(),
+            Vec::new(),
             false,
             false,
             &config_edit::BindRefinement::default(),
@@ -2433,6 +2441,8 @@ fn add_local_writes_path_local_path_to_phora_local_toml() {
             None,
             None,
             None,
+            Vec::new(),
+            Vec::new(),
             true,
             false,
             &config_edit::BindRefinement::default(),
@@ -2472,6 +2482,8 @@ fn add_symlink_writes_path_and_deploy_link_to_local_toml() {
             None,
             None,
             None,
+            Vec::new(),
+            Vec::new(),
             false,
             true,
             &config_edit::BindRefinement::default(),
@@ -2515,6 +2527,8 @@ fn add_local_infers_name_from_path_basename() {
             None,
             None,
             None,
+            Vec::new(),
+            Vec::new(),
             true,
             false,
             &config_edit::BindRefinement::default(),
@@ -2546,6 +2560,8 @@ fn add_symlink_implies_local_overlay_and_is_valid() {
             None,
             None,
             None,
+            Vec::new(),
+            Vec::new(),
             false,
             true,
             &config_edit::BindRefinement::default(),
@@ -2586,6 +2602,8 @@ fn add_local_and_symlink_together_equals_symlink() {
                 None,
                 None,
                 None,
+                Vec::new(),
+                Vec::new(),
                 local,
                 symlink,
                 &config_edit::BindRefinement::default(),
@@ -2644,6 +2662,8 @@ fn add_without_flags_still_writes_phora_toml() {
             None,
             None,
             None,
+            Vec::new(),
+            Vec::new(),
             false,
             false,
             &config_edit::BindRefinement::default(),
@@ -2683,6 +2703,8 @@ fn add_local_canonicalizes_relative_path_to_absolute() {
             None,
             None,
             None,
+            Vec::new(),
+            Vec::new(),
             true,
             false,
             &config_edit::BindRefinement::default(),
@@ -2718,6 +2740,8 @@ fn add_local_errors_when_path_does_not_exist() {
             None,
             None,
             None,
+            Vec::new(),
+            Vec::new(),
             true,
             false,
             &config_edit::BindRefinement::default(),
@@ -2758,6 +2782,8 @@ fn add_local_rejects_non_directory_path() {
             None,
             None,
             None,
+            Vec::new(),
+            Vec::new(),
             true,
             false,
             &config_edit::BindRefinement::default(),
@@ -2804,6 +2830,8 @@ fn add_local_preserves_siblings_and_replaces_same_name_in_overlay() {
             None,
             None,
             None,
+            Vec::new(),
+            Vec::new(),
             true,
             false,
             &config_edit::BindRefinement::default(),
@@ -2831,6 +2859,8 @@ fn add_local_preserves_siblings_and_replaces_same_name_in_overlay() {
             None,
             None,
             None,
+            Vec::new(),
+            Vec::new(),
             true,
             false,
             &config_edit::BindRefinement::default(),
@@ -2875,6 +2905,8 @@ fn add_symlink_overlay_overrides_base_source_after_merge() {
             None,
             None,
             None,
+            Vec::new(),
+            Vec::new(),
             false,
             true,
             &config_edit::BindRefinement::default(),
@@ -3106,8 +3138,6 @@ fn bind_with_refinement_flags_writes_a_table_entry() {
         &config_edit::BindRefinement {
             r#as: Some("nvim".to_owned()),
             root: Some("nvim".to_owned()),
-            include: Vec::new(),
-            exclude: Vec::new(),
             ..config_edit::BindRefinement::default()
         },
     )
@@ -3127,10 +3157,9 @@ fn bind_with_refinement_flags_writes_a_table_entry() {
         Some("dotfiles"),
         "`--as nvim` must key the binding under `nvim` with explicit `source = \"dotfiles\"`, got:\n{out}"
     );
-    assert_eq!(
-        refined.root.as_deref(),
-        Some(std::path::Path::new("nvim")),
-        "`--root nvim` must land as `root = \"nvim\"` in the table binding, got:\n{out}"
+    assert!(
+        !out.contains("root"),
+        "`config_edit::bind` never writes `root`; it is source-owned and routed by `run_bind`, got:\n{out}"
     );
 }
 
@@ -3328,12 +3357,12 @@ fn unbind_with_zero_identities_is_rejected_by_clap() {
 }
 
 #[test]
-fn bind_root_on_url_source_errors_and_leaves_file_untouched() {
+fn bind_root_alone_is_source_owned_and_leaves_the_binding_bare() {
     let toml = "version = 1\n\n\
         [sources.fonts]\nurl = \"https://example.com/fonts.tar.gz\"\n\n\
         [targets.editor]\npath = \"~/.config\"\nsources = []\n";
 
-    let result = config_edit::bind(
+    let out = config_edit::bind(
         toml,
         "editor",
         &["fonts".to_owned()],
@@ -3341,22 +3370,37 @@ fn bind_root_on_url_source_errors_and_leaves_file_untouched() {
             root: Some("sub".to_owned()),
             ..config_edit::BindRefinement::default()
         },
-    );
+    )
+    .expect("`--root` alone is source-owned; `config_edit::bind` ignores it and stays valid")
+    .text;
 
+    let cfg = Config::parse(&out)
+        .unwrap_or_else(|e| panic!("bind output must be valid phora.toml: {e}\n{out}"));
+    let editor = cfg
+        .targets
+        .get("editor")
+        .expect("target editor survives bind");
+    let bindings = editor.sources.as_ref().expect("editor has bindings");
+    let fonts = bindings
+        .get("fonts")
+        .expect("bind must add a binding keyed `fonts`");
     assert!(
-        result.is_err(),
-        "binding `--root` onto a `url` source writes a config `validate()` rejects; \
-         bind must validate the edited document and refuse, not return a poisoned text"
+        fonts.source.is_none() && fonts.effective_source("fonts") == "fonts",
+        "`--root` is source-owned and routed by `run_bind`; `config_edit::bind` appends a BARE STRING, got:\n{out}"
+    );
+    assert!(
+        cfg.sources["fonts"].root.is_none(),
+        "`config_edit::bind` never roots the source; that is `set_source_roots`' job, got:\n{out}"
     );
 }
 
 #[test]
 fn bind_bare_when_table_entry_exists_preserves_table_and_reports_unchanged() {
     let toml = "version = 1\n\n\
-        [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\n\
+        [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\nroot = \"nvim\"\n\n\
         [targets.editor]\npath = \"~/.config\"\n\n\
         [targets.editor.sources]\n\
-        dotfiles = { root = \"nvim\" }\n";
+        dotfiles = { branch = \"main\" }\n";
 
     let result = config_edit::bind(
         toml,
@@ -3375,9 +3419,15 @@ fn bind_bare_when_table_entry_exists_preserves_table_and_reports_unchanged() {
         .unwrap_or_else(|e| panic!("bind output must be valid phora.toml: {e}\n{}", result.text));
     let refined = refined_binding(&cfg, "editor", "dotfiles");
     assert_eq!(
-        refined.root.as_deref(),
+        refined.branch.as_deref(),
+        Some("main"),
+        "the bare re-bind must PRESERVE the existing table entry, not downgrade it to a bare string, got:\n{}",
+        result.text
+    );
+    assert_eq!(
+        cfg.sources["dotfiles"].root.as_deref(),
         Some(std::path::Path::new("nvim")),
-        "the bare re-bind must PRESERVE the existing table entry's `root`, not downgrade it to a bare string, got:\n{}",
+        "the source root stays put across a bare re-bind, got:\n{}",
         result.text
     );
 }
@@ -3443,9 +3493,9 @@ fn add_to_with_refinement_flags_writes_source_and_table_binding() {
         "`--as nvim` on add must key the binding under `nvim` with explicit `source = \"tropos\"`, got:\n{written}"
     );
     assert_eq!(
-        refined.root.as_deref(),
+        src.root.as_deref(),
         Some(std::path::Path::new("nvim")),
-        "`--root nvim` on `add --to` must land as the BINDING `root = \"nvim\"`, got:\n{written}"
+        "`--root nvim` on `add --to` must land as `root = \"nvim\"` on the source table, got:\n{written}"
     );
 }
 
@@ -3634,7 +3684,7 @@ fn bare_add_without_to_does_not_touch_targets() {
 }
 
 #[test]
-fn add_to_with_root_scopes_the_binding_not_the_source() {
+fn add_to_with_root_scopes_the_source_not_the_binding() {
     let dir = tempfile::TempDir::new().expect("temp project dir");
     let toml_path = dir.path().join("phora.toml");
     std::fs::write(
@@ -3668,18 +3718,18 @@ fn add_to_with_root_scopes_the_binding_not_the_source() {
         .unwrap_or_else(|e| panic!("add output must be valid phora.toml: {e}\n{written}"));
 
     let src = source_from(&written, "tropos");
-    assert!(
-        src.root.is_none(),
-        "`--root` with `--to` scopes the BINDING; the SOURCE must stay pure provenance with NO \
-         root, got: {:?}\n{written}",
+    assert_eq!(
+        src.root.as_deref(),
+        Some(std::path::Path::new("nvim")),
+        "`--root` with `--to` lands on the SOURCE table, not the binding, got: {:?}\n{written}",
         src.root
     );
 
     let refined = refined_binding(&cfg, "editor", "nvim");
     assert_eq!(
-        refined.root.as_deref(),
-        Some(std::path::Path::new("nvim")),
-        "`--root` with `--to` must land on the BINDING `root = \"nvim\"`, got:\n{written}"
+        refined.source.as_deref(),
+        Some("tropos"),
+        "`--as nvim` keys the binding under `nvim` with explicit `source = \"tropos\"`, got:\n{written}"
     );
 }
 
@@ -3741,7 +3791,7 @@ fn add_to_with_url_embedded_root_sets_the_source_root() {
         .and_then(|sources| sources.get("tropos"))
         .expect("target editor must hold a `tropos` binding");
     assert!(
-        binding.source.is_none() && binding.root.is_none(),
+        binding.source.is_none(),
         "with no explicit `--root`, the binding carries no refinement, got:\n{written}"
     );
 }
@@ -3898,7 +3948,7 @@ fn add_to_multiple_targets_writes_a_binding_in_each() {
 }
 
 #[test]
-fn add_to_with_include_exclude_writes_arrays_on_the_binding() {
+fn add_to_with_include_exclude_writes_arrays_on_the_source() {
     let dir = tempfile::TempDir::new().expect("temp project dir");
     let toml_path = dir.path().join("phora.toml");
     std::fs::write(
@@ -3928,20 +3978,74 @@ fn add_to_with_include_exclude_writes_arrays_on_the_binding() {
     });
 
     let written = std::fs::read_to_string(&toml_path).expect("add must leave phora.toml on disk");
+
+    let src = source_from(&written, "tropos");
+    assert_eq!(
+        src.include.as_deref(),
+        Some(&["*.lua".to_owned()][..]),
+        "`--include \"*.lua\"` must land as the SOURCE include array, got:\n{written}"
+    );
+    assert_eq!(
+        src.exclude.as_deref(),
+        Some(&[".git".to_owned()][..]),
+        "`--exclude \".git\"` must land as the SOURCE exclude array, got:\n{written}"
+    );
+}
+
+#[test]
+fn bare_add_routes_repeatable_include_exclude_root_to_the_source_not_the_binding() {
+    let dir = tempfile::TempDir::new().expect("temp project dir");
+    let toml_path = dir.path().join("phora.toml");
+
+    with_cwd(dir.path(), || {
+        run_add(
+            "github:srnnkls/tropos",
+            &[],
+            None,
+            None,
+            None,
+            Some("editor".to_owned()),
+            vec!["skills/**".to_owned(), "*.lua".to_owned()],
+            vec![".git".to_owned()],
+            false,
+            false,
+            &config_edit::BindRefinement::default(),
+        )
+        .expect("`add --include --include --exclude --root` must succeed");
+    });
+
+    let written = std::fs::read_to_string(&toml_path).expect("add must leave phora.toml on disk");
     let cfg = Config::parse(&written)
         .unwrap_or_else(|e| panic!("add output must be valid phora.toml: {e}\n{written}"));
 
-    let refined = refined_binding(&cfg, "editor", "tropos");
+    let src = source_from(&written, "tropos");
     assert_eq!(
-        refined.include.as_deref(),
-        Some(&["*.lua".to_owned()][..]),
-        "`--include \"*.lua\"` must land as the BINDING include array, got:\n{written}"
+        src.root.as_deref(),
+        Some(std::path::Path::new("editor")),
+        "`--root` must land on the SOURCE table, got:\n{written}"
     );
     assert_eq!(
-        refined.exclude.as_deref(),
+        src.include.as_deref(),
+        Some(&["skills/**".to_owned(), "*.lua".to_owned()][..]),
+        "repeatable `--include` must emit every pattern on the SOURCE table, got:\n{written}"
+    );
+    assert_eq!(
+        src.exclude.as_deref(),
         Some(&[".git".to_owned()][..]),
-        "`--exclude \".git\"` must land as the BINDING exclude array, got:\n{written}"
+        "`--exclude` must emit on the SOURCE table, got:\n{written}"
     );
+
+    for (_identity, binding) in cfg
+        .targets
+        .values()
+        .filter_map(|t| t.sources.as_ref())
+        .flatten()
+    {
+        assert!(
+            binding.source.is_none() && binding.take.is_none(),
+            "include/exclude/root are source-owned: every binding stays bare, got:\n{written}"
+        );
+    }
 }
 
 #[test]
@@ -4082,6 +4186,7 @@ fn source_add_carries_same_args_as_top_level_add() {
                 root,
                 local,
                 symlink,
+                ..
             },
     } = sub.command
     else {

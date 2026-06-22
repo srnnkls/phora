@@ -36,6 +36,14 @@ pub(super) fn source_table(source: &AddTarget) -> Table {
     table
 }
 
+fn string_array(items: &[String]) -> Array {
+    let mut array = Array::new();
+    for item in items {
+        array.push(item.as_str());
+    }
+    array
+}
+
 pub(super) fn ensure_sources_table(doc: &mut DocumentMut) {
     if doc.get("sources").is_none() {
         let mut sources = Table::new();
@@ -69,9 +77,37 @@ pub fn upsert_source(
     if let Some(root) = root.or(source.root.as_deref()) {
         table["root"] = value(root);
     }
+    if !source.include.is_empty() {
+        table["include"] = value(string_array(&source.include));
+    }
+    if !source.exclude.is_empty() {
+        table["exclude"] = value(string_array(&source.exclude));
+    }
 
     ensure_sources_table(&mut doc);
     doc["sources"][name] = Item::Table(table);
+    Ok(doc.to_string())
+}
+
+/// Write `root` onto every named source's `[sources.<name>]` table. Source
+/// selection is source-owned, so a bind's `--root` lands here, never on the
+/// binding.
+///
+/// # Errors
+///
+/// Returns [`crate::error::Error::Config`] if `doc_text` is not valid TOML.
+pub fn set_source_roots(doc_text: &str, names: &[String], root: &str) -> Result<String> {
+    let mut doc = parse_doc(doc_text)?;
+    for name in names {
+        if let Some(table) = doc
+            .get_mut("sources")
+            .and_then(Item::as_table_like_mut)
+            .and_then(|sources| sources.get_mut(name))
+            .and_then(Item::as_table_like_mut)
+        {
+            table.insert("root", value(root));
+        }
+    }
     Ok(doc.to_string())
 }
 
@@ -212,28 +248,60 @@ fn target_sources_item<'a>(doc: &'a mut DocumentMut, target: &str) -> Option<&'a
         .get_mut("sources")
 }
 
+/// One `--take` entry. Its TOML form mirrors the config `take` construct's
+/// untagged `String | { src = dest }` so emitted bindings re-parse through
+/// [`crate::config::Binding`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TakeArg {
+    Pattern(String),
+    Rename { src: String, dest: String },
+}
+
+impl TakeArg {
+    #[must_use]
+    pub fn parse(raw: &str) -> Self {
+        match raw.split_once('=') {
+            Some((src, dest)) => TakeArg::Rename {
+                src: src.to_owned(),
+                dest: dest.to_owned(),
+            },
+            None => TakeArg::Pattern(raw.to_owned()),
+        }
+    }
+
+    fn to_value(&self) -> Value {
+        match self {
+            TakeArg::Pattern(p) => p.as_str().into(),
+            TakeArg::Rename { src, dest } => {
+                let mut table = InlineTable::new();
+                table.insert(src, dest.as_str().into());
+                Value::InlineTable(table)
+            }
+        }
+    }
+}
+
 /// Per-binding refinement carried by `bind`/`add --to`: an optional `as`
-/// identity plus optional `root`/`include`/`exclude` overrides.
+/// identity, optional ref pins (`branch`/`tag`/`rev`), and a binding-level
+/// `take` array. `root` is source-owned; it is carried here only to route to
+/// the SOURCE table, never written onto the binding.
 #[derive(Debug, Default)]
 pub struct BindRefinement {
     pub r#as: Option<String>,
     pub root: Option<String>,
-    pub include: Vec<String>,
-    pub exclude: Vec<String>,
     pub branch: Option<String>,
     pub tag: Option<String>,
     pub rev: Option<String>,
+    pub take: Vec<TakeArg>,
 }
 
 impl BindRefinement {
     pub(super) fn is_bare(&self) -> bool {
         self.r#as.is_none()
-            && self.root.is_none()
-            && self.include.is_empty()
-            && self.exclude.is_empty()
             && self.branch.is_none()
             && self.tag.is_none()
             && self.rev.is_none()
+            && self.take.is_empty()
     }
 }
 
@@ -257,20 +325,14 @@ fn keyed_binding_value(source: &str, identity: &str, refinement: &BindRefinement
     if let Some(rev) = &refinement.rev {
         table.insert("rev", rev.as_str().into());
     }
-    if let Some(root) = &refinement.root {
-        table.insert("root", root.as_str().into());
-    }
-    if !refinement.include.is_empty() {
-        table.insert("include", string_array(&refinement.include));
-    }
-    if !refinement.exclude.is_empty() {
-        table.insert("exclude", string_array(&refinement.exclude));
+    if !refinement.take.is_empty() {
+        let mut take = Array::new();
+        for entry in &refinement.take {
+            take.push(entry.to_value());
+        }
+        table.insert("take", Value::Array(take));
     }
     Value::InlineTable(table)
-}
-
-fn string_array(items: &[String]) -> Value {
-    items.iter().map(String::as_str).collect::<Array>().into()
 }
 
 fn list_to_keyed_table(array: &Array, target: &str) -> Result<Table> {
@@ -496,6 +558,8 @@ pub fn validate_source_references(merged: &Config) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use crate::config::Config;
     use crate::error::Error;
@@ -510,6 +574,8 @@ mod tests {
             protocol: None,
             branch: None,
             root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
         }
     }
 
@@ -523,6 +589,8 @@ mod tests {
             protocol: None,
             branch: None,
             root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
         }
     }
 
@@ -536,6 +604,8 @@ mod tests {
             protocol: None,
             branch: None,
             root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
         }
     }
 
@@ -661,6 +731,56 @@ mod tests {
         assert_eq!(
             out, expected,
             "Some branch/tag/root must each be written as keys after the source kind"
+        );
+    }
+
+    #[test]
+    fn upsert_source_emits_include_exclude_root_on_the_source_and_round_trips() {
+        let mut source = lit_source("https://github.com/me/dots.git");
+        source.include = vec!["skills/**".to_owned(), "*.lua".to_owned()];
+        source.exclude = vec!["skills/private/**".to_owned()];
+        source.root = Some("nvim".to_owned());
+
+        let out = upsert_source("version = 1\n", "dots", &source, None, None, None)
+            .expect("upsert with source-owned include/exclude/root");
+
+        let cfg = Config::parse(&out).expect("the rooted, scoped source re-parses through Config");
+        let parsed = &cfg.sources["dots"];
+        assert_eq!(
+            parsed.root.as_deref(),
+            Some(Path::new("nvim")),
+            "`--root` must land on `[sources.dots].root`, got:\n{out}"
+        );
+        assert_eq!(
+            parsed.include.as_deref(),
+            Some(&["skills/**".to_owned(), "*.lua".to_owned()][..]),
+            "repeatable `--include` must emit every pattern on the SOURCE table, got:\n{out}"
+        );
+        assert_eq!(
+            parsed.exclude.as_deref(),
+            Some(&["skills/private/**".to_owned()][..]),
+            "`--exclude` must emit on the SOURCE table, got:\n{out}"
+        );
+        assert!(
+            !out.contains("[targets."),
+            "include/exclude/root are source-owned: no binding table may be written, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn upsert_source_omits_include_exclude_when_empty() {
+        let out = upsert_source(
+            "version = 1\n",
+            "dots",
+            &lit_source("https://github.com/me/dots.git"),
+            None,
+            None,
+            None,
+        )
+        .expect("upsert with no include/exclude");
+        assert!(
+            !out.contains("include") && !out.contains("exclude"),
+            "an empty include/exclude must emit no key, got:\n{out}"
         );
     }
 
@@ -946,7 +1066,7 @@ mod tests {
         let base = "version = 1\n\n[sources.a]\ngit = \"g\"\n\n\
              [targets.t]\npath = \"~/x\"\nsources = [\"a\", \"a\"]\n";
         let refinement = BindRefinement {
-            root: Some("sub".to_owned()),
+            take: vec![TakeArg::Pattern("skills/".to_owned())],
             ..BindRefinement::default()
         };
         let err = bind(base, "t", &names(&["a"]), &refinement)
@@ -1005,6 +1125,107 @@ mod tests {
             .next()
             .map(|(identity, binding)| (identity.as_str(), binding))
             .expect("at least one binding")
+    }
+
+    #[test]
+    fn take_arg_parse_splits_rename_on_first_equals_else_pattern() {
+        assert_eq!(
+            TakeArg::parse("skills/"),
+            TakeArg::Pattern("skills/".to_owned()),
+            "a value with no `=` is a verbatim pattern"
+        );
+        assert_eq!(
+            TakeArg::parse("a/X.md=a/x.md"),
+            TakeArg::Rename {
+                src: "a/X.md".to_owned(),
+                dest: "a/x.md".to_owned(),
+            },
+            "a `src=dest` value splits on the first `=` into a rename"
+        );
+        assert_eq!(
+            TakeArg::parse("k=v=w"),
+            TakeArg::Rename {
+                src: "k".to_owned(),
+                dest: "v=w".to_owned(),
+            },
+            "only the first `=` splits; later ones belong to the destination"
+        );
+    }
+
+    #[test]
+    fn bind_take_emits_array_that_round_trips_through_binding() {
+        let base = "version = 1\n\n[sources.skills]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/x\"\nsources = []\n";
+        let refinement = BindRefinement {
+            take: vec![
+                TakeArg::Pattern("skills/gestalt/skill.md".to_owned()),
+                TakeArg::Pattern("skills/**".to_owned()),
+                TakeArg::Rename {
+                    src: "a/X.md".to_owned(),
+                    dest: "a/x.md".to_owned(),
+                },
+            ],
+            ..BindRefinement::default()
+        };
+        let result = bind(base, "t", &names(&["skills"]), &refinement)
+            .expect("a take-only bind promotes and succeeds");
+
+        let cfg = Config::parse(&result.text).expect("emitted take re-parses through Config");
+        let binding = &cfg.targets["t"].sources.as_ref().unwrap()["skills"];
+        let take = binding
+            .take
+            .as_deref()
+            .expect("the emitted binding carries a `take` array");
+        assert_eq!(
+            take.len(),
+            3,
+            "all three take entries emit and re-parse, got:\n{}",
+            result.text
+        );
+
+        let resolved = cfg.targets["t"].resolve_sources(&cfg.sources);
+        let skills = resolved
+            .iter()
+            .find(|b| b.identity == "skills")
+            .expect("the skills binding resolves");
+        let renames: Vec<(&str, &str)> = skills.renames().collect();
+        assert_eq!(
+            renames,
+            vec![("a/X.md", "a/x.md")],
+            "only the `src=dest` arg re-parses as a rename; the two plain patterns are leaves, \
+             got:\n{}",
+            result.text
+        );
+        assert!(
+            result.text.contains("\"skills/gestalt/skill.md\"")
+                && result.text.contains("\"skills/**\""),
+            "both plain patterns emit verbatim as leaf strings, got:\n{}",
+            result.text
+        );
+        assert!(
+            result.text.contains("\"a/X.md\" = \"a/x.md\""),
+            "the rename emits as a `{{ src = dest }}` inline table, got:\n{}",
+            result.text
+        );
+    }
+
+    #[test]
+    fn bind_empty_take_is_bare_and_emits_no_take_key() {
+        let refinement = BindRefinement::default();
+        assert!(
+            refinement.is_bare(),
+            "an empty take list keeps the refinement bare"
+        );
+
+        let base = "version = 1\n\n[sources.skills]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/x\"\nsources = []\n";
+        let result =
+            bind(base, "t", &names(&["skills"]), &refinement).expect("a bare bind succeeds");
+        assert!(
+            !result.text.contains("take"),
+            "a refinement with no take entries must emit no `take` key, got:\n{}",
+            result.text
+        );
     }
 
     #[test]
@@ -1090,15 +1311,33 @@ mod tests {
     }
 
     #[test]
-    fn bind_root_on_url_source_errors() {
+    fn set_source_roots_writes_root_onto_the_source_table_not_the_binding() {
+        let base = "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\n\n\
+             [targets.t]\npath = \"~/x\"\nsources = [\"dotfiles\"]\n";
+        let out = set_source_roots(base, &names(&["dotfiles"]), "nvim")
+            .expect("writing a source root preserves valid toml");
+
+        let cfg = Config::parse(&out).expect("the rooted source re-parses");
+        assert_eq!(
+            cfg.sources["dotfiles"].root.as_deref(),
+            Some(Path::new("nvim")),
+            "`--root` must land on `[sources.dotfiles].root`, never on the binding, got:\n{out}"
+        );
+        let binding = &cfg.targets["t"].sources.as_ref().unwrap()["dotfiles"];
+        assert!(
+            binding.take.is_none() && binding.source.is_none(),
+            "the binding stays bare; root is source-owned, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn set_source_roots_on_url_source_makes_config_reject() {
         let base = "version = 1\n\n[sources.fonts]\nurl = \"https://example.com/f.tar.gz\"\n\n\
-             [targets.t]\npath = \"~/x\"\nsources = []\n";
-        let refinement = BindRefinement {
-            root: Some("sub".to_owned()),
-            ..BindRefinement::default()
-        };
-        let err = bind(base, "t", &names(&["fonts"]), &refinement)
-            .expect_err("refining a url source's root writes a config validate() rejects");
+             [targets.t]\npath = \"~/x\"\nsources = [\"fonts\"]\n";
+        let out = set_source_roots(base, &names(&["fonts"]), "sub")
+            .expect("set_source_roots emits valid toml even for a url source");
+        let err = Config::parse(&out)
+            .expect_err("a url source carrying a root must be rejected by the config layer");
         assert!(matches!(err, Error::Config(_)));
     }
 
@@ -1214,22 +1453,22 @@ mod tests {
     }
 
     #[test]
-    fn samename_refinement_promotes_and_omits_redundant_source_key() {
+    fn samename_take_refinement_promotes_and_omits_redundant_source_key() {
         let flat = bind(TWO_BARE_SOURCES, "t", &names(&["a"]), &bare())
             .expect("seed a flat list")
             .text;
         let refinement = BindRefinement {
-            root: Some("sub".to_owned()),
+            take: vec![TakeArg::Pattern("skills/".to_owned())],
             ..BindRefinement::default()
         };
         let result = bind(&flat, "t", &names(&["b"]), &refinement)
-            .expect("a same-name refinement over a flat list must succeed")
+            .expect("a same-name take refinement over a flat list must succeed")
             .text;
 
         let sources = target_sources_item(&result, "t");
         assert!(
             sources.is_table_like() && !sources.is_array(),
-            "a refinement must promote the flat list to a keyed table, got:\n{result}"
+            "a take refinement must promote the flat list to a keyed table, got:\n{result}"
         );
         let b_entry = sources
             .get("b")
@@ -1239,13 +1478,23 @@ mod tests {
             "a same-name refinement keyed by `b` must omit the redundant `source` field, \
              got:\n{result}"
         );
-        assert_eq!(
-            b_entry.get("root").and_then(Item::as_str),
-            Some("sub"),
-            "the refinement's `root = \"sub\"` must survive the promotion, got:\n{result}"
+        assert!(
+            b_entry.get("root").is_none(),
+            "`root` is source-owned and must NEVER be written onto the binding, got:\n{result}"
         );
 
         let cfg = Config::parse(&result).expect("promoted same-name table re-parses");
+        let binding = &cfg.targets["t"].sources.as_ref().unwrap()["b"];
+        let take = binding
+            .take
+            .as_deref()
+            .expect("the binding carries its emitted take");
+        assert_eq!(
+            take.len(),
+            1,
+            "the refinement's `--take skills/` must survive the promotion, got:\n{result}"
+        );
+
         let mut pairs = resolved_pairs(&cfg, "t");
         pairs.sort();
         assert_eq!(
