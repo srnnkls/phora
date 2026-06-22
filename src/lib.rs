@@ -21,6 +21,7 @@ pub mod backend;
 pub mod cli;
 pub mod config;
 pub mod deploy;
+pub mod diagnostic;
 pub mod error;
 pub mod http;
 pub mod kernel;
