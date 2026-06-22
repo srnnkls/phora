@@ -281,6 +281,16 @@ impl OfferSelection {
     }
 }
 
+/// Compiles one gitignore pattern through the same translation `OfferSelection`
+/// applies, so a take glob matches offered leaves the way the offer compiled them.
+///
+/// # Errors
+///
+/// Returns an error if the pattern does not translate to a valid glob.
+pub fn compile_take_glob(pattern: &str) -> Result<GlobSet> {
+    OfferSelection::build_globset(std::slice::from_ref(&pattern.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
