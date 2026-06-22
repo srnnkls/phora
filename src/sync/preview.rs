@@ -6,11 +6,12 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{Config, DeployMode, LayoutConfig, ParsedSource, Target};
 use crate::error::{Error, Result};
-use crate::kernel::{ArtifactName, Selection, SourceName};
+use crate::kernel::{Materialization, SourceName};
 use crate::lock::{Lock, ref_discriminator};
 use crate::source::SourceBackend;
 
-use super::plan::discover_binding;
+use super::discover::discover_working_tree_leaves;
+use super::plan::{BindingPlanInput, PlannedItem, ResolvedBindingPlan, resolve_binding_plan};
 use super::remote_for;
 
 /// Whether a binding is renderable now or needs action before it can deploy.
@@ -142,28 +143,23 @@ struct BindingCtx<'a> {
     files: bool,
 }
 
+/// The published artifact key — the collapsed-dir or the renamed/identity leaf dest.
+fn published_key(materialization: &Materialization) -> &str {
+    match materialization {
+        Materialization::CollapsedDir { dir } => dir,
+        Materialization::Leaf(take) => &take.dest,
+    }
+}
+
 fn preview_link(ctx: &BindingCtx, entries: &mut Vec<PreviewEntry>) -> Result<()> {
-    match discover_binding(
-        ctx.source,
-        ctx.name,
-        "link",
-        ctx.binding.include,
-        ctx.binding.exclude,
-        ctx.binding.root,
-        ctx.remotes,
-        ctx.backend,
-    ) {
-        Ok(discovered) => {
-            for artifact in discovered {
-                let mut entry = synced_entry(ctx, artifact.as_str(), "link");
-                if ctx.files {
-                    entry.files = link_files(ctx, artifact.as_str())?;
-                }
-                entries.push(entry);
-            }
-        }
-        Err(err @ Error::Config(_)) => return Err(err),
-        Err(_) => entries.push(annotation(ctx, "link", SyncState::LinkWorkingTreeGone)),
+    let git = remote_for(ctx.remotes, ctx.binding.source)?;
+    let Ok(candidates) = discover_working_tree_leaves(Path::new(git), None) else {
+        entries.push(annotation(ctx, "link", SyncState::LinkWorkingTreeGone));
+        return Ok(());
+    };
+    let plan = resolve_plan(ctx, "link", &candidates)?;
+    for item in &plan.items {
+        push_item(ctx, item, "link", entries);
     }
     Ok(())
 }
@@ -179,128 +175,93 @@ fn preview_copy(
         return Ok(());
     };
 
-    match discover_binding(
-        ctx.source,
-        ctx.name,
-        &locked.commit,
-        ctx.binding.include,
-        ctx.binding.exclude,
-        ctx.binding.root,
-        ctx.remotes,
-        ctx.backend,
-    ) {
-        Ok(discovered) => {
-            for artifact in discovered {
-                let mut entry = synced_entry(ctx, artifact.as_str(), &locked.commit);
-                if ctx.files {
-                    entry.files = copy_files(ctx, artifact.as_str(), &locked.commit)?;
-                }
-                entries.push(entry);
-            }
-        }
-        Err(err @ Error::Config(_)) => return Err(err),
-        Err(_) => entries.push(annotation(ctx, &locked.commit, SyncState::NeedsSync)),
+    let git = remote_for(ctx.remotes, ctx.binding.source)?;
+    let Ok(candidates) = ctx
+        .backend
+        .list_source_leaves(ctx.name, git, &locked.commit, None)
+    else {
+        entries.push(annotation(ctx, &locked.commit, SyncState::NeedsSync));
+        return Ok(());
+    };
+
+    let plan = resolve_plan(ctx, &locked.commit, &candidates)?;
+    for item in &plan.items {
+        push_item(ctx, item, &locked.commit, entries);
     }
     Ok(())
 }
 
-fn copy_files(ctx: &BindingCtx, artifact: &str, commit: &str) -> Result<Vec<PreviewFile>> {
-    let git = remote_for(ctx.remotes, ctx.binding.source)?;
-    let selection = Selection::new(ctx.binding.include, ctx.binding.exclude)?;
-    let rels = ctx.backend.list_artifact_files(
-        ctx.name,
-        git,
-        commit,
-        ctx.binding.root,
-        &ArtifactName::trusted(artifact),
-        &selection,
-    )?;
-    Ok(rels
-        .into_iter()
-        .map(|rel| {
-            let normalized = rel.to_string_lossy().replace('\\', "/");
-            PreviewFile {
-                path: PathBuf::from(ctx.binding.template_opt_in.deployed_name(&normalized)),
-                templated: ctx.binding.template_opt_in.renders(&normalized),
-            }
-        })
-        .collect())
-}
-
-fn link_files(ctx: &BindingCtx, artifact: &str) -> Result<Vec<PreviewFile>> {
-    let git = remote_for(ctx.remotes, ctx.binding.source)?;
-    let selection = Selection::new(ctx.binding.include, ctx.binding.exclude)?;
-    let base = ctx
-        .binding
-        .root
-        .map_or_else(|| PathBuf::from(git), |r| Path::new(git).join(r))
-        .join(artifact);
-    let mut files = Vec::new();
-    collect_working_tree_files(&base, Path::new(""), &selection, &mut files)?;
-    files.sort();
-    Ok(files
-        .into_iter()
-        .map(|path| PreviewFile {
-            path,
-            templated: false,
-        })
-        .collect())
-}
-
-fn collect_working_tree_files(
-    base: &Path,
-    rel: &Path,
-    selection: &Selection,
-    files: &mut Vec<PathBuf>,
-) -> Result<()> {
-    let dir = base.join(rel);
-    let entries = std::fs::read_dir(&dir)
-        .map_err(|e| Error::Sync(format!("scan working tree {}: {e}", dir.display())))?;
-    for entry in entries {
-        let entry =
-            entry.map_err(|e| Error::Sync(format!("read entry in {}: {e}", dir.display())))?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let entry_rel = rel.join(&name);
-        let ft = entry
-            .file_type()
-            .map_err(|e| Error::Sync(format!("stat {}: {e}", entry.path().display())))?;
-        if ft.is_symlink() {
-            continue;
-        }
-        let is_dir = ft.is_dir();
-        if !selection.selects_path(&entry_rel, is_dir) {
-            continue;
-        }
-        if is_dir {
-            collect_working_tree_files(base, &entry_rel, selection, files)?;
-        } else {
-            files.push(entry_rel);
-        }
-    }
-    Ok(())
-}
-
-fn synced_entry(ctx: &BindingCtx, artifact: &str, commit: &str) -> PreviewEntry {
-    let destination = ctx
-        .path
-        .join(ctx.layout.artifact_path(ctx.binding.identity, artifact));
-    synced_entry_at(ctx, artifact, commit, destination)
-}
-
-fn synced_entry_at(
+fn resolve_plan(
     ctx: &BindingCtx,
-    artifact: &str,
     commit: &str,
-    destination: PathBuf,
-) -> PreviewEntry {
-    PreviewEntry {
+    candidates: &[String],
+) -> Result<ResolvedBindingPlan> {
+    let input = BindingPlanInput {
+        identity: ctx.binding.identity,
+        source: ctx.binding.source,
+        commit,
+        offer: ctx.source.offer(),
+        candidate_leaves: candidates,
+        take: ctx.binding.take,
+        mode: ctx.source.deploy_mode(),
+        collapse: ctx.binding.collapse,
+        layout: ctx.layout,
+        target_path: ctx.path,
+        template_opt_in: &ctx.binding.template_opt_in,
+    };
+    resolve_binding_plan(&input)
+}
+
+fn push_item(ctx: &BindingCtx, item: &PlannedItem, commit: &str, entries: &mut Vec<PreviewEntry>) {
+    let key = published_key(&item.materialization).to_owned();
+    let mut entry = PreviewEntry {
         identity: ctx.binding.identity.to_owned(),
         source: ctx.binding.source.to_owned(),
-        artifact: artifact.to_owned(),
+        artifact: key,
         commit: commit.to_owned(),
-        destination,
+        destination: item.destination.clone(),
         state: SyncState::Synced,
         files: Vec::new(),
+    };
+    if ctx.files {
+        entry.files = item_files(ctx, item);
+    }
+    entries.push(entry);
+}
+
+/// Deployed file names under one materialization, derived from the plan: a leaf is its
+/// single dest; a collapsed dir is each kept child's dir-relative deployed name.
+fn item_files(ctx: &BindingCtx, item: &PlannedItem) -> Vec<PreviewFile> {
+    let templated = !matches!(ctx.source.deploy_mode(), DeployMode::Link);
+    match &item.materialization {
+        Materialization::Leaf(take) => {
+            let dest = take.dest.rsplit('/').next().unwrap_or(&take.dest);
+            vec![PreviewFile {
+                path: PathBuf::from(dest),
+                templated: templated && ctx.binding.template_opt_in.renders(&take.source),
+            }]
+        }
+        Materialization::CollapsedDir { dir } => {
+            let prefix = format!("{dir}/");
+            let mut files: Vec<PreviewFile> = item
+                .kept_leaves
+                .iter()
+                .filter_map(|kept| {
+                    let child = kept.dest.strip_prefix(&prefix)?;
+                    let deployed = if templated {
+                        ctx.binding.template_opt_in.deployed_name(child)
+                    } else {
+                        child.to_owned()
+                    };
+                    Some(PreviewFile {
+                        path: PathBuf::from(deployed),
+                        templated: templated && ctx.binding.template_opt_in.renders(&kept.source),
+                    })
+                })
+                .collect();
+            files.sort_by(|a, b| a.path.cmp(&b.path));
+            files
+        }
     }
 }
 

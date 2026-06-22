@@ -1,16 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use crate::config::{Config, DeployMode, LayoutKind, Target, TemplateOptIn};
+use crate::config::{Config, LayoutKind, Target, TemplateOptIn};
 use crate::error::{Error, Result};
-use crate::kernel::{ArtifactName, Selection, SourceName};
-use crate::lock::{Lock, ref_discriminator};
-use crate::source::{ExportRequest, SourceBackend};
+use crate::kernel::{Materialization, SourceName};
+use crate::lock::{Lock, encode_ref, ref_discriminator};
+use crate::source::{ExportLeaf, ExportRequest, SourceBackend};
 use crate::store::{
-    ArtifactKey, MAP_LAYOUT, ManifestFile, ProjectedRecord, RecordKind, Registry, RegistryRecord,
+    ArtifactKey, ManifestFile, ProjectedRecord, RecordKind, Registry, RegistryRecord,
 };
 
-use super::discover::discover_artifacts_for_source;
+use super::plan::{ResolvedBindingPlan, plan_target};
 use super::{StagingGuard, nonce, remote_for, resolved_remotes};
 
 /// Summary of a [`rebuild_registry`] run: which artifacts were reconstructed and
@@ -35,12 +35,58 @@ pub fn rebuild_registry(
     let mut report = RebuildReport::default();
     let parsed = config.parsed_sources()?;
     let remotes = resolved_remotes(config, &parsed)?;
+    let resolved_commits = locked_commits(config, lock, &parsed)?;
 
     for (target_name, target) in &config.targets {
-        let mut managed: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        let mut selections: Vec<Selection> = Vec::new();
+        let plan = plan_target(
+            target_name,
+            target,
+            &parsed,
+            &remotes,
+            backend,
+            &resolved_commits,
+        )?;
 
-        for binding in target.resolve_sources(&parsed) {
+        let mut managed_dests: BTreeSet<PathBuf> = BTreeSet::new();
+        for binding in &plan.bindings {
+            managed_dests.extend(binding.items.iter().map(|item| item.destination.clone()));
+            let source = parsed.get(&binding.source).ok_or_else(|| {
+                Error::Config(format!(
+                    "target references undefined source: {}",
+                    binding.source
+                ))
+            })?;
+            rebuild_binding(
+                &BindingRun {
+                    config,
+                    target_name,
+                    target,
+                    backend,
+                    registry,
+                    binding,
+                    source,
+                    git: remote_for(&remotes, &binding.source)?,
+                },
+                &mut report,
+            )?;
+        }
+
+        report.foreign.extend(scan_foreign(target, &managed_dests)?);
+    }
+
+    Ok(report)
+}
+
+/// The `(name, encoded_ref) -> commit` map `plan_target` needs, drawn from the lock:
+/// every binding's effective ref resolves to its locked commit (link sources included).
+fn locked_commits(
+    config: &Config,
+    lock: &Lock,
+    parsed: &BTreeMap<String, crate::config::ParsedSource>,
+) -> Result<BTreeMap<(String, String), String>> {
+    let mut commits = BTreeMap::new();
+    for target in config.targets.values() {
+        for binding in target.resolve_sources(parsed) {
             let source = parsed.get(binding.source).ok_or_else(|| {
                 Error::Config(format!(
                     "target references undefined source: {}",
@@ -56,33 +102,16 @@ pub fn rebuild_registry(
                         binding.source
                     ))
                 })?;
-            let selection = Selection::new(binding.include, binding.exclude)?;
-            selections.push(selection.clone());
-
-            rebuild_binding(
-                &BindingRun {
-                    config,
-                    target_name,
-                    target,
-                    backend,
-                    registry,
-                    binding: &binding,
-                    source,
-                    commit: &locked.commit,
-                    git: remote_for(&remotes, binding.source)?,
-                    selection: &selection,
-                },
-                &mut managed,
-                &mut report,
-            )?;
+            commits.insert(
+                (
+                    binding.source.to_owned(),
+                    encode_ref(&binding.effective_ref),
+                ),
+                locked.commit.clone(),
+            );
         }
-
-        report
-            .foreign
-            .extend(scan_foreign(target, &managed, &selections)?);
     }
-
-    Ok(report)
+    Ok(commits)
 }
 
 struct BindingRun<'a> {
@@ -91,93 +120,114 @@ struct BindingRun<'a> {
     target: &'a Target,
     backend: &'a dyn SourceBackend,
     registry: &'a dyn Registry,
-    binding: &'a crate::config::ResolvedBinding<'a>,
+    binding: &'a ResolvedBindingPlan,
     source: &'a crate::config::ParsedSource,
-    commit: &'a str,
     git: &'a str,
-    selection: &'a Selection,
 }
 
-fn rebuild_binding(
-    run: &BindingRun<'_>,
-    managed: &mut BTreeMap<String, BTreeSet<String>>,
-    report: &mut RebuildReport,
-) -> Result<()> {
-    let source_name = SourceName::trusted(run.binding.source);
+fn rebuild_binding(run: &BindingRun<'_>, report: &mut RebuildReport) -> Result<()> {
+    let source_name = SourceName::trusted(&run.binding.source);
     let policy = run.source.export_policy();
+    let template_opt_in = run
+        .target
+        .resolve_sources(&run.config.parsed_sources()?)
+        .into_iter()
+        .find(|b| b.identity == run.binding.identity)
+        .map_or(TemplateOptIn::SuffixOnly, |b| b.template_opt_in);
 
-    let reconstruct = |artifact: &ArtifactName,
-                       mapped_source_key: Option<&str>,
-                       managed: &mut BTreeMap<String, BTreeSet<String>>,
-                       report: &mut RebuildReport|
-     -> Result<()> {
+    for item in &run.binding.items {
+        let published_key = published_key(&item.materialization).to_owned();
         let key = ArtifactKey {
             target: run.target_name.to_owned(),
-            source: run.binding.identity.to_owned(),
-            artifact: artifact.as_str().to_owned(),
+            source: run.binding.identity.clone(),
+            artifact: published_key.clone(),
         };
-        let artifact_dst = if mapped_source_key.is_some() {
-            run.target.expanded_path().join(artifact.as_str())
-        } else {
-            run.target.expanded_path().join(
-                run.target
-                    .layout()
-                    .artifact_path(run.binding.identity, artifact.as_str()),
-            )
-        };
+        let artifact_dst = run.target.expanded_path().join(
+            run.target
+                .layout()
+                .artifact_path(&run.binding.identity, &published_key),
+        );
 
-        match run.source.deploy_mode() {
-            DeployMode::Link => rebuild_linked(
+        if run.binding.commit == "link" {
+            rebuild_linked(
                 run.registry,
-                run.binding.source,
+                &run.binding.source,
                 &policy,
                 run.target.layout().kind,
-                mapped_source_key.is_some(),
-                key,
-                report,
-            )?,
-            DeployMode::Copy => rebuild_one(RebuildOne {
+                record_kind(&item.materialization),
+                key.clone(),
+            )?;
+        } else {
+            let leaves = item_leaves(&item.materialization, &item.kept_leaves, &template_opt_in);
+            rebuild_one(RebuildOne {
                 backend: run.backend,
                 registry: run.registry,
                 git: run.git,
                 source_name: &source_name,
-                underlying_source: run.binding.source,
-                root: run.binding.root,
-                commit: run.commit,
-                selection: run.selection,
+                underlying_source: &run.binding.source,
+                root: run.source.offer().root(),
+                commit: &run.binding.commit,
                 policy: &policy,
-                artifact,
+                leaves: &leaves,
+                materialization: &item.materialization,
                 artifact_dst: &artifact_dst,
                 layout_kind: run.target.layout().kind,
-                mapped_source_key,
-                key,
+                key: key.clone(),
                 report,
-                template_opt_in: &run.binding.template_opt_in,
+                template_opt_in: &template_opt_in,
                 vars: &run.config.vars,
-            })?,
+            })?;
         }
-
-        managed
-            .entry(run.binding.identity.to_owned())
-            .or_default()
-            .insert(artifact.as_str().to_owned());
-        Ok(())
-    };
-
-    let discovered = discover_artifacts_for_source(
-        run.source,
-        run.git,
-        &source_name,
-        run.commit,
-        run.backend,
-        run.selection,
-        run.binding.root,
-    )?;
-
-    for artifact in discovered {
-        reconstruct(&artifact, None, managed, report)?;
+        report.reconstructed.push(key);
     }
     Ok(())
+}
+
+/// The published artifact key — the collapsed-dir or the renamed/identity leaf dest.
+fn published_key(materialization: &Materialization) -> &str {
+    match materialization {
+        Materialization::CollapsedDir { dir } => dir,
+        Materialization::Leaf(take) => &take.dest,
+    }
+}
+
+fn record_kind(materialization: &Materialization) -> RecordKind {
+    match materialization {
+        Materialization::CollapsedDir { .. } => RecordKind::Dir,
+        Materialization::Leaf(_) => RecordKind::File,
+    }
+}
+
+/// The export leaf plan for one materialization, mirroring `deploy_one`: a leaf maps
+/// its single dest basename; a collapsed dir maps each kept child to its dir-relative
+/// deployed name.
+fn item_leaves(
+    materialization: &Materialization,
+    kept_leaves: &[crate::kernel::ResolvedTake],
+    template_opt_in: &TemplateOptIn,
+) -> Vec<ExportLeaf> {
+    match materialization {
+        Materialization::CollapsedDir { dir } => {
+            let prefix = format!("{dir}/");
+            kept_leaves
+                .iter()
+                .filter_map(|kept| {
+                    let child = kept.dest.strip_prefix(&prefix)?;
+                    Some(ExportLeaf {
+                        source: PathBuf::from(&kept.source),
+                        dest: PathBuf::from(template_opt_in.deployed_name(child)),
+                    })
+                })
+                .collect()
+        }
+        Materialization::Leaf(take) => {
+            let dest = take.dest.rsplit('/').next().unwrap_or(&take.dest);
+            vec![ExportLeaf {
+                source: PathBuf::from(&take.source),
+                dest: PathBuf::from(dest),
+            }]
+        }
+    }
 }
 
 struct RebuildOne<'a> {
@@ -188,12 +238,11 @@ struct RebuildOne<'a> {
     underlying_source: &'a str,
     root: Option<&'a Path>,
     commit: &'a str,
-    selection: &'a Selection,
     policy: &'a crate::source::ExportPolicy,
-    artifact: &'a ArtifactName,
+    leaves: &'a [ExportLeaf],
+    materialization: &'a Materialization,
     artifact_dst: &'a Path,
     layout_kind: LayoutKind,
-    mapped_source_key: Option<&'a str>,
     key: ArtifactKey,
     report: &'a mut RebuildReport,
     template_opt_in: &'a TemplateOptIn,
@@ -209,24 +258,21 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         underlying_source,
         root,
         commit,
-        selection,
         policy,
-        artifact,
+        leaves,
+        materialization,
         artifact_dst,
         layout_kind,
-        mapped_source_key,
         key,
         report,
         template_opt_in,
         vars,
     } = args;
 
+    let key_label = key.artifact.replace('/', "_");
     let staging_base = std::env::temp_dir().join("phora-rebuild");
-    let staging = staging_base.join(format!("{artifact}-{}-{}", std::process::id(), nonce()));
+    let staging = staging_base.join(format!("{key_label}-{}-{}", std::process::id(), nonce()));
     let _guard = StagingGuard::new(&staging_base, &staging);
-
-    let path_map = mapped_source_key
-        .map(|key| BTreeMap::from([(PathBuf::from(key), PathBuf::from(artifact.as_str()))]));
 
     let commit_time = backend.commit_time(source_name, git, commit)?;
     let export = backend.export_artifact(&ExportRequest {
@@ -234,20 +280,19 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         url: git,
         commit,
         root,
-        artifact,
-        selection,
         policy,
         staging_dir: &staging,
         commit_time,
         template_opt_in,
         vars,
-        path_map: path_map.as_ref(),
+        leaves,
     })?;
 
-    let manifest_base = if mapped_source_key.is_some() {
-        artifact_dst.parent().unwrap_or(artifact_dst)
-    } else {
-        artifact_dst
+    let manifest_base = match materialization {
+        Materialization::CollapsedDir { .. } => artifact_dst.to_path_buf(),
+        Materialization::Leaf(_) => artifact_dst
+            .parent()
+            .map_or_else(|| artifact_dst.to_path_buf(), Path::to_path_buf),
     };
 
     let mut modified = false;
@@ -276,19 +321,14 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         underlying_source,
         commit,
         digest: export.digest,
-        layout: if mapped_source_key.is_some() {
-            MAP_LAYOUT.to_owned()
-        } else {
-            format!("{layout_kind:?}").to_lowercase()
-        },
-        kind: RecordKind::Dir,
+        layout: format!("{layout_kind:?}").to_lowercase(),
+        kind: record_kind(materialization),
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
         files,
         vars_digest: export.vars_digest,
     });
     registry.put(&record)?;
-    report.reconstructed.push(key.clone());
     if modified {
         report.modified.push(key);
     }
@@ -302,23 +342,18 @@ fn rebuild_linked(
     underlying_source: &str,
     policy: &crate::source::ExportPolicy,
     layout_kind: LayoutKind,
-    is_mapped: bool,
+    kind: RecordKind,
     key: ArtifactKey,
-    report: &mut RebuildReport,
 ) -> Result<()> {
     let record = RegistryRecord {
         version: 1,
-        key: key.clone(),
+        key,
         source: underlying_source.to_owned(),
         commit: "link".to_owned(),
         digest: "link:".to_owned(),
         projected_at: chrono::Utc::now().to_rfc3339(),
-        layout: if is_mapped {
-            MAP_LAYOUT.to_owned()
-        } else {
-            format!("{layout_kind:?}").to_lowercase()
-        },
-        kind: RecordKind::Dir,
+        layout: format!("{layout_kind:?}").to_lowercase(),
+        kind,
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
         files: vec![],
@@ -326,7 +361,6 @@ fn rebuild_linked(
         vars_digest: None,
     };
     registry.put(&record)?;
-    report.reconstructed.push(key);
     Ok(())
 }
 
@@ -353,23 +387,18 @@ fn disk_hash(path: &Path) -> Result<Option<DiskHash>> {
     }))
 }
 
-fn admits_for_foreign(name: &str, selections: &[Selection]) -> bool {
-    !name.starts_with('.') || selections.iter().any(|s| s.selects_artifact(name))
-}
-
-/// On-disk artifact dirs under `target` that no managed `(source, artifact)` maps to.
-fn scan_foreign(
-    target: &Target,
-    managed: &BTreeMap<String, BTreeSet<String>>,
-    selections: &[Selection],
-) -> Result<Vec<PathBuf>> {
+/// On-disk top-level entries under `target` that no binding deploys. `managed_dests`
+/// holds every planned destination already composed under the target's layout AND
+/// binding identity (so by-source nests each identity under its own dir, prefixed joins
+/// identity to the key); an entry is spared when it is a managed destination or the
+/// ancestor of one. A user-owned top-level dotfile is never reported foreign — an
+/// orphaned managed dotfile is reclaimed by `sync --prune`, not flagged here.
+fn scan_foreign(target: &Target, managed_dests: &BTreeSet<PathBuf>) -> Result<Vec<PathBuf>> {
     let target_path = target.expanded_path();
-    let layout = target.layout();
-    let mut foreign = Vec::new();
 
     let entries = match std::fs::read_dir(&target_path) {
         Ok(rd) => rd,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(foreign),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => {
             return Err(Error::Sync(format!(
                 "read target dir {}: {e}",
@@ -378,81 +407,26 @@ fn scan_foreign(
         }
     };
 
+    let mut foreign = Vec::new();
     for entry in entries {
         let entry =
             entry.map_err(|e| Error::Sync(format!("read {}: {e}", target_path.display())))?;
-        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+        if entry.file_name().to_string_lossy().starts_with('.') {
             continue;
         }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !admits_for_foreign(&name, selections) {
+        let path = entry.path();
+        if managed_dests.contains(&path) || is_managed_ancestor(&path, managed_dests) {
             continue;
         }
-        foreign.extend(foreign_under(
-            &entry.path(),
-            &name,
-            layout.kind,
-            managed,
-            selections,
-        ));
+        foreign.push(path);
     }
-
+    foreign.sort();
     Ok(foreign)
 }
 
-fn foreign_under(
-    dir: &Path,
-    name: &str,
-    layout_kind: LayoutKind,
-    managed: &BTreeMap<String, BTreeSet<String>>,
-    selections: &[Selection],
-) -> Vec<PathBuf> {
-    let is_managed_artifact = managed.values().any(|arts| arts.contains(name));
-    let is_managed_source = managed.contains_key(name);
-
-    match layout_kind {
-        LayoutKind::Flat | LayoutKind::Prefixed => {
-            if is_managed_artifact || is_managed_prefixed(name, managed) {
-                Vec::new()
-            } else if name.starts_with('.') {
-                vec![dir.to_path_buf()]
-            } else {
-                unmanaged_subdirs(dir, &BTreeSet::new(), selections)
-            }
-        }
-        LayoutKind::BySource => {
-            if is_managed_source {
-                unmanaged_subdirs(dir, &managed[name], selections)
-            } else {
-                unmanaged_subdirs(dir, &BTreeSet::new(), selections)
-            }
-        }
-    }
-}
-
-fn is_managed_prefixed(name: &str, managed: &BTreeMap<String, BTreeSet<String>>) -> bool {
-    managed.iter().any(|(source, arts)| {
-        arts.iter().any(|art| {
-            name.starts_with(source.as_str()) && name.ends_with(art.as_str()) && name != art
-        })
-    })
-}
-
-fn unmanaged_subdirs(
-    dir: &Path,
-    managed_artifacts: &BTreeSet<String>,
-    selections: &[Selection],
-) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    entries
-        .filter_map(std::result::Result::ok)
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .filter(|e| {
-            let n = e.file_name().to_string_lossy().into_owned();
-            admits_for_foreign(&n, selections) && !managed_artifacts.contains(&n)
-        })
-        .map(|e| e.path())
-        .collect()
+/// Whether `dir` is an ancestor of any managed destination, so a parent directory
+/// holding only managed children is not itself reported foreign (by-source layout nests
+/// each identity under its own dir).
+fn is_managed_ancestor(dir: &Path, managed_dests: &BTreeSet<PathBuf>) -> bool {
+    managed_dests.iter().any(|dest| dest.starts_with(dir))
 }

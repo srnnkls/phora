@@ -1,12 +1,11 @@
 //! Read-only commands over config and registry: `list`, `where`, `check-match`.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
 use crate::config::{Config, ParsedSource, Protocol, SourceFields, Target, merge_configs};
 use crate::deploy::check_artifact_state;
 use crate::error::{Error, Result};
-use crate::kernel::Selection;
+use crate::kernel::OfferSelection;
 use crate::lock::{Lock, merge_locks};
 use crate::paths::cache_root_for;
 use crate::source::SourceBackend;
@@ -191,18 +190,25 @@ pub fn where_cmd(registry: &dyn Registry, filter: &WhereFilter) -> Result<Vec<Wh
 }
 
 /// Reports artifact-level and path-level allow decisions for `path` under `source`.
+///
+/// The offer is leaf-granular: `path_allowed` is whether the leaf `path` is selected by
+/// the source offer; `artifact_allowed` is whether the top-level component is reachable —
+/// some leaf at or under it is selectable.
 #[must_use]
 pub fn check_match_cmd(source: &ParsedSource, path: &str) -> CheckMatchReport {
-    let Ok(selection) = Selection::new(source.includes(), source.excludes()) else {
+    let Ok(selection) = OfferSelection::compile(source.includes(), source.excludes(), None) else {
         return CheckMatchReport {
             artifact_allowed: false,
             path_allowed: false,
         };
     };
-    let artifact = path.split('/').next().unwrap_or(path);
+    let component = path.split('/').next().unwrap_or(path);
+    let probe = format!("{component}/.phora-probe");
+    let artifact_allowed = !selection.select(&[component]).is_empty()
+        || !selection.select(&[probe.as_str()]).is_empty();
     CheckMatchReport {
-        artifact_allowed: selection.selects_artifact(artifact),
-        path_allowed: selection.selects_path(Path::new(path), false),
+        artifact_allowed,
+        path_allowed: !selection.select(&[path]).is_empty(),
     }
 }
 

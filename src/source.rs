@@ -7,9 +7,7 @@ use gix::object::tree::EntryKind;
 use thiserror::Error;
 
 use crate::config::{Refspec, TemplateOptIn};
-use crate::kernel::{
-    ArtifactName, Commit, Digest, KernelError, Selection, SourceName, safe_component,
-};
+use crate::kernel::{Commit, Digest, KernelError, OfferSelection, SourceName, safe_component};
 use crate::store::ManifestFile;
 
 /// Errors owned by the source context (`SourceBackend` and its adapters).
@@ -30,9 +28,6 @@ pub enum SourceError {
 
     #[error("root path not found in tree: {root}")]
     RootNotFound { root: std::path::PathBuf },
-
-    #[error("artifact not found in tree: {artifact}")]
-    ArtifactNotFound { artifact: String },
 
     #[error("mapped key not found in source tree: {key}")]
     MappedKeyNotFound { key: PathBuf },
@@ -101,21 +96,28 @@ pub struct ExportResult {
     pub vars_digest: Option<String>,
 }
 
+/// One leaf to export: a source-relative path looked up in the root tree, staged at
+/// the staging-relative `dest` (the deployed name, hashed and recorded verbatim).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportLeaf {
+    pub source: PathBuf,
+    pub dest: PathBuf,
+}
+
 /// Borrowed parameters of [`SourceBackend::export_artifact`].
 pub struct ExportRequest<'a> {
     pub source: &'a SourceName,
     pub url: &'a str,
     pub commit: &'a str,
     pub root: Option<&'a Path>,
-    pub artifact: &'a ArtifactName,
-    pub selection: &'a Selection,
     pub policy: &'a ExportPolicy,
     pub staging_dir: &'a Path,
     pub commit_time: u64,
     pub template_opt_in: &'a TemplateOptIn,
     pub vars: &'a BTreeMap<String, String>,
-    /// When `Some`, export individually-renamed leaves: source-relative key → single-component dest.
-    pub path_map: Option<&'a BTreeMap<PathBuf, PathBuf>>,
+    /// The explicit leaf plan: each source path is looked up in the root tree and
+    /// staged at its `dest`.
+    pub leaves: &'a [ExportLeaf],
 }
 
 /// `source` is the human name (diagnostics); `url` identifies the bare mirror,
@@ -163,43 +165,18 @@ pub trait SourceBackend {
 
     fn commit_time(&self, source: &SourceName, url: &str, commit: &str) -> Result<u64>;
 
-    fn discover_artifacts(
-        &self,
-        source: &SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        selection: &Selection,
-    ) -> Result<Vec<ArtifactName>>;
-
     /// # Errors
     /// - [`SourceError::Render`]: a templated file is invalid or fails to render.
     /// - [`SourceError::DeployedNameCollision`]: two source paths map to the same deployed name.
-    /// - [`SourceError::MappedKeyNotFound`]: a `path_map` key resolves to nothing in the tree.
-    /// - [`SourceError::MappedKeyNotALeaf`]: a `path_map` key resolves to a non-regular-file.
+    /// - [`SourceError::MappedKeyNotFound`]: a leaf's source path resolves to nothing in the tree.
+    /// - [`SourceError::MappedKeyNotALeaf`]: a leaf's source path resolves to a non-regular-file.
     fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult>;
 
-    /// Artifact-relative paths selected at `commit`, read from the mirror without
-    /// staging or writing; the offline counterpart of `export_artifact`.
-    ///
-    /// # Errors
-    /// Errors if the mirror, root, or artifact subtree cannot be read.
-    fn list_artifact_files(
-        &self,
-        source: &SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        artifact: &ArtifactName,
-        selection: &Selection,
-    ) -> Result<Vec<PathBuf>>;
-
-    /// Blake3 fingerprint of the matched subtree at the resolved commit — the
+    /// Blake3 fingerprint of the offer-selected subtree at the resolved commit — the
     /// selected source bytes, not the deploy/artifact set.
     ///
-    /// Filters by path-level selection only (`Selection::selects_path`); the
-    /// artifact dotfile opt-in does not apply, so a top-level `.config` is hashed
-    /// under path rules regardless of that gate.
+    /// Filters by the offer's gitignore-style include/exclude (`OfferSelection`),
+    /// hashing each selected leaf framed by its root-relative path.
     ///
     /// The value written to `LockedSource::digest`; lock reuse is decided by
     /// `lock::source_matches`, not by comparing this digest.
@@ -209,7 +186,8 @@ pub trait SourceBackend {
         url: &str,
         commit: &str,
         root: Option<&Path>,
-        selection: &Selection,
+        include: &[String],
+        exclude: &[String],
     ) -> Result<String>;
 }
 
@@ -626,42 +604,6 @@ impl SourceBackend for GitBackend {
             .map_err(|e| SourceError::Source(format!("author time of {commit} in {source}: {e}")))
     }
 
-    fn discover_artifacts(
-        &self,
-        source: &SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        selection: &Selection,
-    ) -> Result<Vec<ArtifactName>> {
-        let repo = self.open_mirror(source.as_str(), url)?;
-        let subtree = Self::subtree_at_root(&repo, source.as_str(), commit, root)?;
-
-        let mut artifacts = Vec::new();
-        for entry in subtree.iter() {
-            let entry = entry
-                .map_err(|e| SourceError::Source(format!("read tree entry in {source}: {e}")))?;
-            let name = safe_component(&entry.filename().to_string())?.to_string();
-
-            if matches!(entry.kind(), EntryKind::Link) {
-                return Err(SourceError::SymlinkNotAllowed {
-                    path: PathBuf::from(name),
-                });
-            }
-
-            let is_candidate = selection.selects_artifact(&name);
-            if !is_candidate {
-                continue;
-            }
-            if matches!(entry.kind(), EntryKind::Tree) {
-                artifacts.push(ArtifactName::trusted(name));
-            }
-        }
-
-        artifacts.sort();
-        Ok(artifacts)
-    }
-
     fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult> {
         let repo = self.open_mirror(req.source.as_str(), req.url)?;
         let root_tree = Self::subtree_at_root(&repo, req.source.as_str(), req.commit, req.root)?;
@@ -673,7 +615,6 @@ impl SourceBackend for GitBackend {
             repo: &repo,
             source: req.source.as_str(),
             out_base: req.staging_dir,
-            selection: req.selection,
             policy: req.policy,
             commit_time: req.commit_time,
             files: Vec::new(),
@@ -682,17 +623,7 @@ impl SourceBackend for GitBackend {
             deployed_names: BTreeMap::new(),
             rendered_any: false,
         };
-        if let Some(map) = req.path_map {
-            walk.run_mapped(&root_tree, map)?;
-        } else {
-            let artifact_tree = Self::lookup_subtree(
-                &repo,
-                &root_tree,
-                req.source.as_str(),
-                req.artifact.as_str(),
-            )?;
-            walk.run(&artifact_tree, Path::new(""))?;
-        }
+        walk.run(&root_tree, req.leaves)?;
 
         let digest = format!("blake3:{}", walk.hasher.finalize().to_hex());
         let vars_digest = walk.rendered_any.then(|| renderer.vars_digest());
@@ -703,86 +634,73 @@ impl SourceBackend for GitBackend {
         })
     }
 
-    fn list_artifact_files(
-        &self,
-        source: &SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        artifact: &ArtifactName,
-        selection: &Selection,
-    ) -> Result<Vec<PathBuf>> {
-        let repo = self.open_mirror(source.as_str(), url)?;
-        let root_tree = Self::subtree_at_root(&repo, source.as_str(), commit, root)?;
-        let artifact_tree =
-            Self::lookup_subtree(&repo, &root_tree, source.as_str(), artifact.as_str())?;
-
-        let mut files = Vec::new();
-        Self::collect_files(
-            &repo,
-            source.as_str(),
-            &artifact_tree,
-            Path::new(""),
-            selection,
-            &mut files,
-        )?;
-        files.sort();
-        Ok(files)
-    }
-
     fn compute_digest(
         &self,
         source: &SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
-        selection: &Selection,
+        include: &[String],
+        exclude: &[String],
     ) -> Result<String> {
         let repo = self.open_mirror(source.as_str(), url)?;
         let subtree = Self::subtree_at_root(&repo, source.as_str(), commit, root)?;
 
+        let mut leaves = Vec::new();
+        Self::collect_digest_leaves(&repo, source.as_str(), &subtree, Path::new(""), &mut leaves)?;
+
+        let selection = OfferSelection::compile(include, exclude, None)
+            .map_err(|e| SourceError::Source(format!("compile offer for {source}: {e}")))?;
+        let candidates: Vec<&str> = leaves.iter().map(|(path, _, _)| path.as_str()).collect();
+        let selected: BTreeSet<String> = selection.select(&candidates).into_iter().collect();
+
         let mut hasher = blake3::Hasher::new();
-        Self::hash_tree(
-            &repo,
-            source.as_str(),
-            &subtree,
-            Path::new(""),
-            selection,
-            &mut hasher,
-        )?;
+        for (path, tag, oid) in &leaves {
+            if !selected.contains(path) {
+                continue;
+            }
+            let data = Self::find_blob_data(&repo, source.as_str(), *oid)?;
+            hash_framed_entry(&mut hasher, path.as_bytes(), tag, &data);
+        }
         Ok(format!("blake3:{}", hasher.finalize().to_hex()))
     }
 }
 
 impl GitBackend {
-    fn collect_files(
+    /// Every blob leaf under `tree`, breadth-first into `(forward-slashed root-relative
+    /// path, frame tag, oid)`. The tag distinguishes exec/link/file so the digest frames
+    /// match the historical tree-walk byte stream.
+    fn collect_digest_leaves(
         repo: &gix::Repository,
         source: &str,
         tree: &gix::Tree<'_>,
         rel_path: &Path,
-        selection: &Selection,
-        files: &mut Vec<PathBuf>,
+        leaves: &mut Vec<(String, &'static [u8], gix::ObjectId)>,
     ) -> Result<()> {
         for entry in tree.iter() {
             let entry = entry
                 .map_err(|e| SourceError::Source(format!("read tree entry in {source}: {e}")))?;
             let component = safe_component(&entry.filename().to_string())?.to_string();
             let entry_rel = rel_path.join(component);
-            let is_dir = matches!(entry.kind(), EntryKind::Tree);
-
-            if !selection.selects_path(&entry_rel, is_dir) {
-                continue;
-            }
 
             match entry.kind() {
                 EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link => {
-                    files.push(entry_rel);
+                    let tag: &[u8] = match entry.kind() {
+                        EntryKind::BlobExecutable => b"\x00exec\x00",
+                        EntryKind::Link => b"\x00link\x00",
+                        _ => b"\x00file\x00",
+                    };
+                    leaves.push((
+                        entry_rel.to_string_lossy().replace('\\', "/"),
+                        tag,
+                        entry.object_id(),
+                    ));
                 }
                 EntryKind::Tree => {
                     let subtree = repo
                         .find_tree(entry.object_id())
                         .map_err(|e| SourceError::Source(format!("subtree in {source}: {e}")))?;
-                    Self::collect_files(repo, source, &subtree, &entry_rel, selection, files)?;
+                    Self::collect_digest_leaves(repo, source, &subtree, &entry_rel, leaves)?;
                 }
                 EntryKind::Commit => {}
             }
@@ -833,70 +751,11 @@ impl GitBackend {
         }
     }
 
-    fn lookup_subtree<'repo>(
-        repo: &'repo gix::Repository,
-        tree: &gix::Tree<'repo>,
-        source: &str,
-        artifact: &str,
-    ) -> Result<gix::Tree<'repo>> {
-        let entry = tree
-            .lookup_entry_by_path(Path::new(artifact))
-            .map_err(|e| {
-                SourceError::Source(format!("lookup artifact {artifact} in {source}: {e}"))
-            })?
-            .ok_or_else(|| SourceError::ArtifactNotFound {
-                artifact: artifact.to_string(),
-            })?;
-        repo.find_tree(entry.object_id())
-            .map_err(|e| SourceError::Source(format!("artifact tree {artifact} in {source}: {e}")))
-    }
-
     fn find_blob_data(repo: &gix::Repository, source: &str, oid: gix::ObjectId) -> Result<Vec<u8>> {
         let blob = repo
             .find_blob(oid)
             .map_err(|e| SourceError::Source(format!("blob {oid} in {source}: {e}")))?;
         Ok(blob.data.clone())
-    }
-
-    fn hash_tree(
-        repo: &gix::Repository,
-        source: &str,
-        tree: &gix::Tree<'_>,
-        rel_path: &Path,
-        selection: &Selection,
-        hasher: &mut blake3::Hasher,
-    ) -> Result<()> {
-        for entry in tree.iter() {
-            let entry = entry
-                .map_err(|e| SourceError::Source(format!("read tree entry in {source}: {e}")))?;
-            let component = safe_component(&entry.filename().to_string())?.to_string();
-            let entry_rel = rel_path.join(component);
-            let is_dir = matches!(entry.kind(), EntryKind::Tree);
-
-            if !selection.selects_path(&entry_rel, is_dir) {
-                continue;
-            }
-
-            match entry.kind() {
-                EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link => {
-                    let tag: &[u8] = match entry.kind() {
-                        EntryKind::BlobExecutable => b"\x00exec\x00",
-                        EntryKind::Link => b"\x00link\x00",
-                        _ => b"\x00file\x00",
-                    };
-                    let data = Self::find_blob_data(repo, source, entry.object_id())?;
-                    hash_framed_entry(hasher, entry_rel.to_string_lossy().as_bytes(), tag, &data);
-                }
-                EntryKind::Tree => {
-                    let subtree = repo
-                        .find_tree(entry.object_id())
-                        .map_err(|e| SourceError::Source(format!("subtree in {source}: {e}")))?;
-                    Self::hash_tree(repo, source, &subtree, &entry_rel, selection, hasher)?;
-                }
-                EntryKind::Commit => {}
-            }
-        }
-        Ok(())
     }
 }
 
@@ -990,33 +849,8 @@ impl SourceBackend for HttpBackend {
         self.git.list_source_leaves(source, url, commit, root)
     }
 
-    fn discover_artifacts(
-        &self,
-        source: &SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        selection: &Selection,
-    ) -> Result<Vec<ArtifactName>> {
-        self.git
-            .discover_artifacts(source, url, commit, root, selection)
-    }
-
     fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult> {
         self.git.export_artifact(req)
-    }
-
-    fn list_artifact_files(
-        &self,
-        source: &SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        artifact: &ArtifactName,
-        selection: &Selection,
-    ) -> Result<Vec<PathBuf>> {
-        self.git
-            .list_artifact_files(source, url, commit, root, artifact, selection)
     }
 
     fn compute_digest(
@@ -1025,10 +859,11 @@ impl SourceBackend for HttpBackend {
         url: &str,
         commit: &str,
         root: Option<&Path>,
-        selection: &Selection,
+        include: &[String],
+        exclude: &[String],
     ) -> Result<String> {
         self.git
-            .compute_digest(source, url, commit, root, selection)
+            .compute_digest(source, url, commit, root, include, exclude)
     }
 }
 
@@ -1050,11 +885,6 @@ impl<'a> Renderer<'a> {
 
     fn rel_key(entry_rel: &Path) -> String {
         entry_rel.to_string_lossy().replace('\\', "/")
-    }
-
-    fn deployed_rel(&self, entry_rel: &Path) -> PathBuf {
-        let key = Self::rel_key(entry_rel);
-        PathBuf::from(self.opt_in.deployed_name(&key))
     }
 
     fn render(&self, entry_rel: &Path, source_bytes: &[u8]) -> Result<Rendered> {
@@ -1112,7 +942,6 @@ struct ExportWalk<'a, 'r> {
     repo: &'a gix::Repository,
     source: &'a str,
     out_base: &'a Path,
-    selection: &'a Selection,
     policy: &'a ExportPolicy,
     commit_time: u64,
     files: Vec<ManifestFile>,
@@ -1123,40 +952,41 @@ struct ExportWalk<'a, 'r> {
 }
 
 impl ExportWalk<'_, '_> {
-    fn run(&mut self, tree: &gix::Tree<'_>, rel_path: &Path) -> Result<()> {
-        for entry in tree.iter() {
-            let entry = entry.map_err(|e| {
-                SourceError::Source(format!("read tree entry in {}: {e}", self.source))
-            })?;
-            let component = safe_component(&entry.filename().to_string())?.to_string();
-            let entry_rel = rel_path.join(component);
-            let out_path = self.out_base.join(&entry_rel);
-            let is_dir = matches!(entry.kind(), EntryKind::Tree);
-
-            if !self.selection.selects_path(&entry_rel, is_dir) {
-                continue;
+    /// Stages each leaf of the explicit plan: look up its source path in `root_tree`,
+    /// reject a non-blob or a symlink the policy forbids, then stage at the leaf's
+    /// dest. Render keys on the source path; the framed digest and manifest path key
+    /// on the dest.
+    fn run(&mut self, root_tree: &gix::Tree<'_>, leaves: &[ExportLeaf]) -> Result<()> {
+        for leaf in leaves {
+            let entry = root_tree
+                .lookup_entry_by_path(&leaf.source)
+                .map_err(|e| {
+                    SourceError::Source(format!(
+                        "lookup key {} in {}: {e}",
+                        leaf.source.display(),
+                        self.source
+                    ))
+                })?
+                .ok_or_else(|| SourceError::MappedKeyNotFound {
+                    key: leaf.source.clone(),
+                })?;
+            let kind = entry.mode().kind();
+            if !matches!(
+                kind,
+                EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link
+            ) {
+                return Err(SourceError::MappedKeyNotALeaf {
+                    key: leaf.source.clone(),
+                });
             }
-
-            let kind = entry.kind();
+            let bytes = GitBackend::find_blob_data(self.repo, self.source, entry.object_id())?;
             match kind {
-                EntryKind::Blob | EntryKind::BlobExecutable => {
-                    let executable = kind == EntryKind::BlobExecutable;
-                    self.write_blob(&entry, &entry_rel, executable)?;
+                EntryKind::Blob => self.stage_leaf(&leaf.dest, &leaf.source, &bytes, false)?,
+                EntryKind::BlobExecutable => {
+                    self.stage_leaf(&leaf.dest, &leaf.source, &bytes, true)?;
                 }
-                EntryKind::Link => self.write_link(&entry, &entry_rel, &out_path)?,
-                EntryKind::Tree => {
-                    self.register_deployed_name(entry_rel.clone(), &entry_rel)?;
-                    std::fs::create_dir_all(&out_path)?;
-                    let subtree = self.repo.find_tree(entry.object_id()).map_err(|e| {
-                        SourceError::Source(format!("subtree in {}: {e}", self.source))
-                    })?;
-                    self.run(&subtree, &entry_rel)?;
-                }
-                EntryKind::Commit => {
-                    if !self.policy.allow_submodules {
-                        return Err(SourceError::SubmoduleNotAllowed { path: entry_rel });
-                    }
-                }
+                EntryKind::Link => self.stage_link(&leaf.dest, &bytes)?,
+                _ => unreachable!("non-leaf kinds rejected above"),
             }
         }
         Ok(())
@@ -1177,36 +1007,20 @@ impl ExportWalk<'_, '_> {
         Ok(())
     }
 
-    fn write_blob(
-        &mut self,
-        entry: &gix::object::tree::EntryRef<'_, '_>,
-        entry_rel: &Path,
-        executable: bool,
-    ) -> Result<()> {
-        let deployed_rel = self.renderer.deployed_rel(entry_rel);
-        let source_bytes = GitBackend::find_blob_data(self.repo, self.source, entry.object_id())?;
-        self.stage_leaf(deployed_rel, entry_rel, &source_bytes, executable, true)
-    }
-
     fn stage_leaf(
         &mut self,
-        deployed_rel: PathBuf,
+        deployed_rel: &Path,
         source_rel: &Path,
         source_bytes: &[u8],
         executable: bool,
-        render: bool,
     ) -> Result<()> {
-        self.register_deployed_name(deployed_rel.clone(), source_rel)?;
+        self.register_deployed_name(deployed_rel.to_path_buf(), source_rel)?;
 
-        let data = if render {
-            let rendered = self.renderer.render(source_rel, source_bytes)?;
-            self.rendered_any |= rendered.templated;
-            rendered.bytes
-        } else {
-            source_bytes.to_vec()
-        };
+        let rendered = self.renderer.render(source_rel, source_bytes)?;
+        self.rendered_any |= rendered.templated;
+        let data = rendered.bytes;
 
-        let out_path = self.out_base.join(&deployed_rel);
+        let out_path = self.out_base.join(deployed_rel);
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -1236,7 +1050,7 @@ impl ExportWalk<'_, '_> {
         );
 
         self.files.push(ManifestFile {
-            path: deployed_rel,
+            path: deployed_rel.to_path_buf(),
             size: data.len() as u64,
             mtime: self.commit_time,
             blake3: blake3::hash(&data).to_hex().to_string(),
@@ -1244,61 +1058,25 @@ impl ExportWalk<'_, '_> {
         Ok(())
     }
 
-    fn run_mapped(
-        &mut self,
-        root_tree: &gix::Tree<'_>,
-        path_map: &BTreeMap<PathBuf, PathBuf>,
-    ) -> Result<()> {
-        for (key, dest) in path_map {
-            let entry = root_tree
-                .lookup_entry_by_path(key)
-                .map_err(|e| {
-                    SourceError::Source(format!(
-                        "lookup key {} in {}: {e}",
-                        key.display(),
-                        self.source
-                    ))
-                })?
-                .ok_or_else(|| SourceError::MappedKeyNotFound { key: key.clone() })?;
-            let executable = match entry.mode().kind() {
-                EntryKind::Blob => false,
-                EntryKind::BlobExecutable => true,
-                EntryKind::Link => {
-                    return Err(SourceError::SymlinkNotAllowed { path: key.clone() });
-                }
-                _ => return Err(SourceError::MappedKeyNotALeaf { key: key.clone() }),
-            };
-            let bytes = GitBackend::find_blob_data(self.repo, self.source, entry.object_id())?;
-            self.stage_leaf(dest.clone(), key, &bytes, executable, true)?;
-        }
-        Ok(())
-    }
-
-    fn write_link(
-        &mut self,
-        entry: &gix::object::tree::EntryRef<'_, '_>,
-        entry_rel: &Path,
-        out_path: &Path,
-    ) -> Result<()> {
+    fn stage_link(&mut self, deployed_rel: &Path, target: &[u8]) -> Result<()> {
         if !self.policy.allow_symlinks {
             return Err(SourceError::SymlinkNotAllowed {
-                path: entry_rel.to_path_buf(),
+                path: deployed_rel.to_path_buf(),
             });
         }
-        let target = GitBackend::find_blob_data(self.repo, self.source, entry.object_id())?;
+        self.register_deployed_name(deployed_rel.to_path_buf(), deployed_rel)?;
 
-        self.register_deployed_name(entry_rel.to_path_buf(), entry_rel)?;
-
+        let out_path = self.out_base.join(deployed_rel);
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        materialize_symlink(out_path, &target)?;
+        materialize_symlink(&out_path, target)?;
 
         hash_framed_entry(
             &mut self.hasher,
-            entry_rel.to_string_lossy().as_bytes(),
+            deployed_rel.to_string_lossy().as_bytes(),
             b"\x00link\x00",
-            &target,
+            target,
         );
         Ok(())
     }
@@ -1554,10 +1332,6 @@ mod tests {
         SourceName::trusted(name)
     }
 
-    fn an(name: &str) -> ArtifactName {
-        ArtifactName::trusted(name)
-    }
-
     /// Author time on the tagged (first) commit; deliberately != committer time.
     const TAGGED_AUTHOR_TIME: u64 = 1_700_000_000;
     /// Committer time on the tagged commit; `commit_time` must NOT return this.
@@ -1786,7 +1560,6 @@ mod tests {
     const EDITOR_NOTES_CONTENT: &[u8] = b"scratch notes, excluded by **/*.bak\n";
     const LINK_NAME: &str = "link";
     const LINK_TARGET: &str = "init.lua";
-    const ROOT_SYMLINK_NAME: &str = "badlink";
 
     struct ExportFixture {
         _src: TempDir,
@@ -1795,12 +1568,6 @@ mod tests {
         url: String,
         /// Sole commit; its author time equals [`EXPORT_COMMIT_TIME`].
         commit: String,
-    }
-
-    fn matcher(include: &[&str], exclude: &[&str]) -> Selection {
-        let inc: Vec<String> = include.iter().map(|s| (*s).to_string()).collect();
-        let exc: Vec<String> = exclude.iter().map(|s| (*s).to_string()).collect();
-        Selection::new(&inc, &exc).expect("patterns build into a selection")
     }
 
     /// Clean base with no root-level symlink: `editor/` is symlink-free; the
@@ -1861,39 +1628,6 @@ mod tests {
         export_fixture_from(src, commit)
     }
 
-    /// Base layout plus a top-level symlink `badlink`; used ONLY to test that a
-    /// symlink-as-artifact at root is rejected.
-    #[expect(
-        clippy::unwrap_used,
-        reason = "fixture setup fails loudly; git CLI is assumed present"
-    )]
-    fn build_fixture_with_root_symlink() -> ExportFixture {
-        let src = TempDir::new().unwrap();
-        let src_path = src.path();
-
-        init_export_repo(src_path);
-
-        let editor = src_path.join("editor");
-        std::fs::create_dir_all(&editor).unwrap();
-        std::fs::write(editor.join("init.lua"), EDITOR_INIT_CONTENT).unwrap();
-        run_git(src_path, &["add", "-A"]);
-
-        std::os::unix::fs::symlink("editor", src_path.join(ROOT_SYMLINK_NAME)).unwrap();
-        run_git(src_path, &["add", ROOT_SYMLINK_NAME]);
-
-        let commit = commit_export_repo(src_path);
-
-        let badlink_mode =
-            String::from_utf8(run_git(src_path, &["ls-files", "-s", ROOT_SYMLINK_NAME]).stdout)
-                .unwrap();
-        assert!(
-            badlink_mode.starts_with("120000"),
-            "{ROOT_SYMLINK_NAME} must be committed as a git symlink (120000), got: {badlink_mode}"
-        );
-
-        export_fixture_from(src, commit)
-    }
-
     const FILE_TAG: &[u8] = b"\x00file\x00";
 
     fn build_collision_fixture(files: &[(&str, &[u8])]) -> ExportFixture {
@@ -1947,7 +1681,6 @@ mod tests {
     }
 
     fn digest_of_art(fixture: &ExportFixture) -> String {
-        let m = matcher(&[], &[]);
         fixture
             .backend
             .compute_digest(
@@ -1955,7 +1688,8 @@ mod tests {
                 &fixture.url,
                 &fixture.commit,
                 Some(Path::new("art")),
-                &m,
+                &[],
+                &[],
             )
             .expect("digest computes over the art subtree")
     }
@@ -3011,170 +2745,69 @@ path = "srnnkls/tropos"
         }
     }
 
-    // ---- discover_artifacts ----
-
-    #[test]
-    fn discover_returns_top_level_artifact_dirs_sorted() {
-        let fixture = build_export_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
-
-        let m = matcher(&[], &[]);
-        let artifacts = fixture
-            .backend
-            .discover_artifacts(&sn("src"), &fixture.url, &fixture.commit, None, &m)
-            .expect("discover walks the git tree");
-
-        assert_eq!(
-            artifacts,
-            vec![an("editor"), an("linky"), an("lint")],
-            "only top-level trees, sorted; root files and dotdirs excluded"
-        );
-    }
-
-    #[test]
-    fn discover_skips_dotdirs() {
-        let fixture = build_export_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
-
-        let m = matcher(&[], &[]);
-        let artifacts = fixture
-            .backend
-            .discover_artifacts(&sn("src"), &fixture.url, &fixture.commit, None, &m)
-            .expect("discover succeeds");
-
-        assert!(
-            !artifacts.iter().any(|a| a.as_str() == ".hidden"),
-            "names starting with '.' must be skipped"
-        );
-    }
-
-    #[test]
-    fn discover_applies_artifact_level_include() {
-        let fixture = build_export_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
-
-        let m = matcher(&["editor"], &[]);
-        let artifacts = fixture
-            .backend
-            .discover_artifacts(&sn("src"), &fixture.url, &fixture.commit, None, &m)
-            .expect("discover succeeds");
-
-        assert_eq!(
-            artifacts,
-            vec![an("editor")],
-            "artifact-level include must filter discovered names"
-        );
-    }
-
-    // ---- symlink-as-artifact at root ----
-
-    #[test]
-    fn discover_errors_on_symlink_as_artifact_at_root() {
-        let fixture = build_fixture_with_root_symlink();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
-
-        let m = matcher(&[ROOT_SYMLINK_NAME], &[]);
-        let result =
-            fixture
-                .backend
-                .discover_artifacts(&sn("src"), &fixture.url, &fixture.commit, None, &m);
-
-        let err = result
-            .expect_err("v1: a symlink-as-artifact at root must error, not be silently dropped");
-        assert!(
-            matches!(err, SourceError::SymlinkNotAllowed { .. }),
-            "must be a real symlink-at-root rejection, not the unimplemented stub: {err}"
-        );
-        let msg = err.to_string();
-        assert!(
-            msg.contains(ROOT_SYMLINK_NAME),
-            "rejection must name the offending top-level entry {ROOT_SYMLINK_NAME}, got: {msg}"
-        );
-        assert!(
-            msg.contains("symlink"),
-            "rejection must identify a symlink-at-root rejection, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn discover_errors_on_excluded_root_symlink_before_filtering() {
-        let fixture = build_fixture_with_root_symlink();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
-
-        let m = matcher(&[], &[ROOT_SYMLINK_NAME]);
-        let result =
-            fixture
-                .backend
-                .discover_artifacts(&sn("src"), &fixture.url, &fixture.commit, None, &m);
-
-        let err = result.expect_err(
-            "v1: a root symlink must error unconditionally, even when the matcher would exclude it",
-        );
-        assert!(
-            matches!(err, SourceError::SymlinkNotAllowed { .. }),
-            "must be a real symlink-at-root rejection, not the unimplemented stub: {err}"
-        );
-        let msg = err.to_string();
-        assert!(
-            msg.contains(ROOT_SYMLINK_NAME),
-            "the Link check must run before include/exclude filtering and name {ROOT_SYMLINK_NAME}, got: {msg}"
-        );
-        assert!(
-            msg.contains("symlink"),
-            "rejection must identify a symlink-at-root rejection, got: {msg}"
-        );
-    }
-
     // ---- export_artifact ----
 
     fn export_named(
         fixture: &ExportFixture,
-        artifact: &str,
         staging: &Path,
-        m: &Selection,
+        leaves: &[ExportLeaf],
         policy: &ExportPolicy,
     ) -> Result<ExportResult> {
         let source = sn("src");
-        let artifact = an(artifact);
         let req = ExportRequest {
             source: &source,
             url: &fixture.url,
             commit: &fixture.commit,
             root: None,
-            artifact: &artifact,
-            selection: m,
             policy,
             staging_dir: staging,
             commit_time: EXPORT_COMMIT_TIME,
             template_opt_in: &TemplateOptIn::SuffixOnly,
             vars: &BTreeMap::new(),
-            path_map: None,
+            leaves,
         };
         fixture.backend.export_artifact(&req)
+    }
+
+    /// The `editor` artifact's three non-`.bak` leaves, each mapped to its
+    /// dir-relative deployed path — the leaf-granular expression of `exclude **/*.bak`.
+    fn editor_leaves() -> Vec<ExportLeaf> {
+        vec![
+            ExportLeaf {
+                source: PathBuf::from("editor/init.lua"),
+                dest: PathBuf::from("init.lua"),
+            },
+            ExportLeaf {
+                source: PathBuf::from("editor/lua/opts.lua"),
+                dest: PathBuf::from("lua/opts.lua"),
+            },
+            ExportLeaf {
+                source: PathBuf::from("editor/bin/run.sh"),
+                dest: PathBuf::from("bin/run.sh"),
+            },
+        ]
     }
 
     fn export_editor(
         fixture: &ExportFixture,
         staging: &Path,
-        m: &Selection,
         policy: &ExportPolicy,
     ) -> Result<ExportResult> {
-        export_named(fixture, "editor", staging, m, policy)
+        export_named(fixture, staging, &editor_leaves(), policy)
+    }
+
+    /// The `linky` artifact's blob and symlink leaves, mapped to dir-relative dests.
+    fn linky_leaves() -> Vec<ExportLeaf> {
+        vec![
+            ExportLeaf {
+                source: PathBuf::from("linky/init.lua"),
+                dest: PathBuf::from("init.lua"),
+            },
+            ExportLeaf {
+                source: PathBuf::from(format!("linky/{LINK_NAME}")),
+                dest: PathBuf::from(LINK_NAME),
+            },
+        ]
     }
 
     #[test]
@@ -3186,9 +2819,7 @@ path = "srnnkls/tropos"
             .expect("fetch");
         let staging = TempDir::new().expect("staging dir");
 
-        let m = matcher(&[], &["**/*.bak"]);
-        export_editor(&fixture, staging.path(), &m, &ExportPolicy::default())
-            .expect("export succeeds");
+        export_editor(&fixture, staging.path(), &ExportPolicy::default()).expect("export succeeds");
 
         assert_eq!(
             std::fs::read(staging.path().join("init.lua")).expect("init.lua exists"),
@@ -3209,8 +2840,7 @@ path = "srnnkls/tropos"
             .expect("fetch");
         let staging = TempDir::new().expect("staging dir");
 
-        let m = matcher(&[], &["**/*.bak"]);
-        let result = export_editor(&fixture, staging.path(), &m, &ExportPolicy::default())
+        let result = export_editor(&fixture, staging.path(), &ExportPolicy::default())
             .expect("export succeeds");
 
         assert!(
@@ -3235,8 +2865,7 @@ path = "srnnkls/tropos"
             .expect("fetch");
         let staging = TempDir::new().expect("staging dir");
 
-        let m = matcher(&[], &["**/*.bak"]);
-        let result = export_editor(&fixture, staging.path(), &m, &ExportPolicy::default())
+        let result = export_editor(&fixture, staging.path(), &ExportPolicy::default())
             .expect("export succeeds");
 
         let mut listed: Vec<String> = result
@@ -3269,8 +2898,7 @@ path = "srnnkls/tropos"
             .expect("fetch");
         let staging = TempDir::new().expect("staging dir");
 
-        let m = matcher(&[], &["**/*.bak"]);
-        let result = export_editor(&fixture, staging.path(), &m, &ExportPolicy::default())
+        let result = export_editor(&fixture, staging.path(), &ExportPolicy::default())
             .expect("export succeeds");
 
         assert!(!result.files.is_empty(), "expected exported files");
@@ -3301,9 +2929,7 @@ path = "srnnkls/tropos"
             .expect("fetch");
         let staging = TempDir::new().expect("staging dir");
 
-        let m = matcher(&[], &["**/*.bak"]);
-        export_editor(&fixture, staging.path(), &m, &ExportPolicy::default())
-            .expect("export succeeds");
+        export_editor(&fixture, staging.path(), &ExportPolicy::default()).expect("export succeeds");
 
         let mode = std::fs::metadata(staging.path().join("bin/run.sh"))
             .expect("run.sh exists")
@@ -3326,12 +2952,11 @@ path = "srnnkls/tropos"
             .expect("fetch");
         let staging = TempDir::new().expect("staging dir");
 
-        let m = matcher(&[], &[]);
         let policy = ExportPolicy {
             allow_symlinks: false,
             ..ExportPolicy::default()
         };
-        let err = export_named(&fixture, "linky", staging.path(), &m, &policy)
+        let err = export_named(&fixture, staging.path(), &linky_leaves(), &policy)
             .expect_err("linky/link is a symlink; allow_symlinks=false must error");
 
         assert!(
@@ -3359,12 +2984,11 @@ path = "srnnkls/tropos"
             .expect("fetch");
         let staging = TempDir::new().expect("staging dir");
 
-        let m = matcher(&[], &[]);
         let policy = ExportPolicy {
             allow_symlinks: true,
             ..ExportPolicy::default()
         };
-        export_named(&fixture, "linky", staging.path(), &m, &policy)
+        export_named(&fixture, staging.path(), &linky_leaves(), &policy)
             .expect("export with symlinks allowed");
 
         let link = staging.path().join(LINK_NAME);
@@ -3389,12 +3013,21 @@ path = "srnnkls/tropos"
             .expect("fetch");
         let staging = TempDir::new().expect("staging dir");
 
-        let m = matcher(&[], &[]);
         let policy = ExportPolicy {
             allow_symlinks: true,
             ..ExportPolicy::default()
         };
-        let err = export_named(&fixture, "art", staging.path(), &m, &policy)
+        let leaves = vec![
+            ExportLeaf {
+                source: PathBuf::from("art/link.tmpl"),
+                dest: PathBuf::from(TemplateOptIn::SuffixOnly.deployed_name("link.tmpl")),
+            },
+            ExportLeaf {
+                source: PathBuf::from("art/link"),
+                dest: PathBuf::from("link"),
+            },
+        ];
+        let err = export_named(&fixture, staging.path(), &leaves, &policy)
             .expect_err("symlink `link` and rendered `link.tmpl` both deploy to `link`");
         assert!(
             matches!(err, SourceError::DeployedNameCollision { .. }),
@@ -3411,15 +3044,18 @@ path = "srnnkls/tropos"
             .expect("fetch");
         let staging = TempDir::new().expect("staging dir");
 
-        let m = matcher(&[], &[]);
-        let err = export_named(
-            &fixture,
-            "art",
-            staging.path(),
-            &m,
-            &ExportPolicy::default(),
-        )
-        .expect_err("directory `config` and rendered `config.tmpl` both deploy to `config`");
+        let leaves = vec![
+            ExportLeaf {
+                source: PathBuf::from("art/config.tmpl"),
+                dest: PathBuf::from(TemplateOptIn::SuffixOnly.deployed_name("config.tmpl")),
+            },
+            ExportLeaf {
+                source: PathBuf::from("art/config/inner.txt"),
+                dest: PathBuf::from("config"),
+            },
+        ];
+        let err = export_named(&fixture, staging.path(), &leaves, &ExportPolicy::default())
+            .expect_err("directory `config` and rendered `config.tmpl` both deploy to `config`");
         assert!(
             matches!(err, SourceError::DeployedNameCollision { .. }),
             "a directory and a blob mapping to the same deployed name must collide, not surface a raw fs error, got: {err:?}"
@@ -3436,15 +3072,12 @@ path = "srnnkls/tropos"
             .expect("fetch");
         let staging = TempDir::new().expect("staging dir");
 
-        let m = matcher(&[], &[]);
-        let err = export_named(
-            &fixture,
-            "art",
-            staging.path(),
-            &m,
-            &ExportPolicy::default(),
-        )
-        .expect_err("a template that exhausts the fuel budget must surface an error");
+        let leaves = vec![ExportLeaf {
+            source: PathBuf::from("art/loop.txt.tmpl"),
+            dest: PathBuf::from(TemplateOptIn::SuffixOnly.deployed_name("loop.txt.tmpl")),
+        }];
+        let err = export_named(&fixture, staging.path(), &leaves, &ExportPolicy::default())
+            .expect_err("a template that exhausts the fuel budget must surface an error");
         assert!(
             matches!(err, SourceError::Render { .. }),
             "exceeding the minijinja fuel cap must abort the artifact as a Render error, not panic or hang, got: {err:?}"
@@ -3453,27 +3086,43 @@ path = "srnnkls/tropos"
 
     // ---- ExportResult.vars_digest (TPH-010) ----
 
+    /// Every leaf under the `art` subtree, mapped to its suffix-stripped dir-relative dest.
+    fn art_leaves(fixture: &ExportFixture) -> Vec<ExportLeaf> {
+        fixture
+            .backend
+            .list_source_leaves(
+                &sn("src"),
+                &fixture.url,
+                &fixture.commit,
+                Some(Path::new("art")),
+            )
+            .expect("list art leaves")
+            .into_iter()
+            .map(|rel| ExportLeaf {
+                source: PathBuf::from("art").join(&rel),
+                dest: PathBuf::from(TemplateOptIn::SuffixOnly.deployed_name(&rel)),
+            })
+            .collect()
+    }
+
     fn export_art_with_vars(
         fixture: &ExportFixture,
         staging: &Path,
         vars: &BTreeMap<String, String>,
     ) -> ExportResult {
         let source = sn("src");
-        let artifact = an("art");
-        let m = matcher(&[], &[]);
+        let leaves = art_leaves(fixture);
         let req = ExportRequest {
             source: &source,
             url: &fixture.url,
             commit: &fixture.commit,
             root: None,
-            artifact: &artifact,
-            selection: &m,
             policy: &ExportPolicy::default(),
             staging_dir: staging,
             commit_time: EXPORT_COMMIT_TIME,
             template_opt_in: &TemplateOptIn::SuffixOnly,
             vars,
-            path_map: None,
+            leaves: &leaves,
         };
         fixture.backend.export_artifact(&req).expect("export art")
     }
@@ -3614,34 +3263,30 @@ path = "srnnkls/tropos"
         export_fixture_from(src, commit)
     }
 
-    fn path_map(entries: &[(&str, &str)]) -> BTreeMap<PathBuf, PathBuf> {
-        entries
-            .iter()
-            .map(|(k, v)| (PathBuf::from(k), PathBuf::from(v)))
-            .collect()
-    }
-
     fn export_mapped(
         fixture: &ExportFixture,
         staging: &Path,
-        map: &BTreeMap<PathBuf, PathBuf>,
+        map: &[(&str, &str)],
     ) -> Result<ExportResult> {
         let source = sn("src");
-        let artifact = an("unused-in-mapped-mode");
-        let m = matcher(&[], &[]);
+        let leaves: Vec<ExportLeaf> = map
+            .iter()
+            .map(|(key, dest)| ExportLeaf {
+                source: PathBuf::from(key),
+                dest: PathBuf::from(dest),
+            })
+            .collect();
         let req = ExportRequest {
             source: &source,
             url: &fixture.url,
             commit: &fixture.commit,
             root: None,
-            artifact: &artifact,
-            selection: &m,
             policy: &ExportPolicy::default(),
             staging_dir: staging,
             commit_time: EXPORT_COMMIT_TIME,
             template_opt_in: &TemplateOptIn::SuffixOnly,
             vars: &BTreeMap::new(),
-            path_map: Some(map),
+            leaves: &leaves,
         };
         fixture.backend.export_artifact(&req)
     }
@@ -3655,8 +3300,8 @@ path = "srnnkls/tropos"
             .expect("fetch");
         let staging = TempDir::new().expect("staging dir");
 
-        let map = path_map(&[("AGENTS.md", "CLAUDE.md")]);
-        let result = export_mapped(&fixture, staging.path(), &map).expect("mapped export succeeds");
+        let map = &[("AGENTS.md", "CLAUDE.md")];
+        let result = export_mapped(&fixture, staging.path(), map).expect("mapped export succeeds");
 
         assert_eq!(
             std::fs::read(staging.path().join("CLAUDE.md")).expect("CLAUDE.md staged"),
@@ -3688,8 +3333,8 @@ path = "srnnkls/tropos"
             .expect("fetch");
         let staging = TempDir::new().expect("staging dir");
 
-        let map = path_map(&[("nested/AGENTS.md", "codex.md")]);
-        let result = export_mapped(&fixture, staging.path(), &map).expect("mapped export succeeds");
+        let map = &[("nested/AGENTS.md", "codex.md")];
+        let result = export_mapped(&fixture, staging.path(), map).expect("mapped export succeeds");
 
         assert_eq!(
             std::fs::read(staging.path().join("codex.md")).expect("codex.md staged"),
@@ -3721,8 +3366,8 @@ path = "srnnkls/tropos"
             .expect("fetch");
         let staging = TempDir::new().expect("staging dir");
 
-        let map = path_map(&[("AGENTS.md", "CLAUDE.md"), ("nested/AGENTS.md", "codex.md")]);
-        let result = export_mapped(&fixture, staging.path(), &map).expect("mapped export succeeds");
+        let map = &[("AGENTS.md", "CLAUDE.md"), ("nested/AGENTS.md", "codex.md")];
+        let result = export_mapped(&fixture, staging.path(), map).expect("mapped export succeeds");
 
         assert_eq!(
             std::fs::read(staging.path().join("CLAUDE.md")).expect("CLAUDE.md staged"),
@@ -3760,8 +3405,8 @@ path = "srnnkls/tropos"
             .expect("fetch");
         let staging = TempDir::new().expect("staging dir");
 
-        let map = path_map(&[("tool.sh", "run")]);
-        export_mapped(&fixture, staging.path(), &map).expect("mapped export succeeds");
+        let map = &[("tool.sh", "run")];
+        export_mapped(&fixture, staging.path(), map).expect("mapped export succeeds");
 
         let mode = std::fs::metadata(staging.path().join("run"))
             .expect("run staged")
@@ -3782,8 +3427,8 @@ path = "srnnkls/tropos"
             .expect("fetch");
         let staging = TempDir::new().expect("staging dir");
 
-        let map = path_map(&[("nested", "x.md")]);
-        let err = export_mapped(&fixture, staging.path(), &map)
+        let map = &[("nested", "x.md")];
+        let err = export_mapped(&fixture, staging.path(), map)
             .expect_err("a key resolving to a directory must error; only regular files map");
         assert!(
             !staging.path().join("x.md").exists(),
@@ -3805,8 +3450,8 @@ path = "srnnkls/tropos"
             .expect("fetch");
         let staging = TempDir::new().expect("staging dir");
 
-        let map = path_map(&[("does/not/exist.md", "x.md")]);
-        let err = export_mapped(&fixture, staging.path(), &map)
+        let map = &[("does/not/exist.md", "x.md")];
+        let err = export_mapped(&fixture, staging.path(), map)
             .expect_err("a key resolving to nothing must error");
         assert!(
             !staging.path().join("x.md").exists(),
@@ -3832,8 +3477,8 @@ path = "srnnkls/tropos"
             .expect("fetch");
         let staging = TempDir::new().expect("staging dir");
 
-        let map = path_map(&[("AGENTS.md", "x.md"), ("nested/AGENTS.md", "x.md")]);
-        let err = export_mapped(&fixture, staging.path(), &map)
+        let map = &[("AGENTS.md", "x.md"), ("nested/AGENTS.md", "x.md")];
+        let err = export_mapped(&fixture, staging.path(), map)
             .expect_err("two keys mapping to one dest must collide");
         assert!(
             matches!(err, SourceError::DeployedNameCollision { .. }),
@@ -3856,14 +3501,13 @@ path = "srnnkls/tropos"
             .fetch(&sn("src"), &fixture.url)
             .expect("fetch");
 
-        let m = matcher(&[], &[]);
         let first = fixture
             .backend
-            .compute_digest(&sn("src"), &fixture.url, &fixture.commit, None, &m)
+            .compute_digest(&sn("src"), &fixture.url, &fixture.commit, None, &[], &[])
             .expect("digest computes");
         let second = fixture
             .backend
-            .compute_digest(&sn("src"), &fixture.url, &fixture.commit, None, &m)
+            .compute_digest(&sn("src"), &fixture.url, &fixture.commit, None, &[], &[])
             .expect("digest computes again");
 
         assert!(
@@ -4356,16 +4000,23 @@ path = "srnnkls/tropos"
             .fetch(&sn("src"), &fixture.url)
             .expect("fetch");
 
-        let digest = |m: &Selection| {
+        let digest = |exclude: &[String]| {
             fixture
                 .backend
-                .compute_digest(&sn("src"), &fixture.url, &fixture.commit, None, m)
+                .compute_digest(
+                    &sn("src"),
+                    &fixture.url,
+                    &fixture.commit,
+                    None,
+                    &[],
+                    exclude,
+                )
                 .expect("digest computes")
         };
 
-        let no_exclude = digest(&matcher(&[], &[]));
-        let exclude_nothing = digest(&matcher(&[], &["**/*.nonexistent"]));
-        let exclude_lua = digest(&matcher(&[], &["**/*.lua"]));
+        let no_exclude = digest(&[]);
+        let exclude_nothing = digest(&["**/*.nonexistent".to_owned()]);
+        let exclude_lua = digest(&["**/*.lua".to_owned()]);
 
         assert_eq!(
             no_exclude, exclude_nothing,
@@ -4391,12 +4042,13 @@ path = "srnnkls/tropos"
         use tempfile::TempDir;
 
         use crate::config::Refspec;
-        use crate::kernel::{Digest, Selection};
+        use crate::kernel::Digest;
         use crate::source::{
-            ExportPolicy, ExportRequest, HttpBackend, SourceBackend, SourceError, mirror_path,
+            ExportLeaf, ExportPolicy, ExportRequest, HttpBackend, SourceBackend, SourceError,
+            mirror_path,
         };
 
-        use super::{an, sn};
+        use super::sn;
 
         const HELLO_BODY: &[u8] = b"hi";
         const RUN_BODY: &[u8] = b"#!/bin/sh\n";
@@ -4463,10 +4115,6 @@ path = "srnnkls/tropos"
             encoder.finish().expect("finish gzip")
         }
 
-        fn empty_matcher() -> Selection {
-            Selection::new(&[], &[]).expect("empty selection builds")
-        }
-
         #[test]
         fn fetch_then_resolve_ignores_refspec_and_reads_phora_head() {
             let server = TarServer::spawn(build_pkg_tar_gz());
@@ -4530,16 +4178,14 @@ path = "srnnkls/tropos"
             let commit = backend
                 .resolve(&sn("pkg"), &url, &Refspec::None)
                 .expect("resolve synthetic head");
-            let m = empty_matcher();
 
-            let artifacts = backend
-                .discover_artifacts(&sn("pkg"), &url, &commit, None, &m)
-                .expect("discover artifacts over the synthetic tree");
+            let leaves = backend
+                .list_source_leaves(&sn("pkg"), &url, &commit, None)
+                .expect("list leaves over the synthetic tree");
             assert_eq!(
-                artifacts,
-                vec![an("bin")],
-                "after pkg-1.0/ strip the only top-level directory artifact is `bin`; \
-                 `hello.txt` is a root file, not an artifact dir"
+                leaves,
+                vec!["bin/run.sh".to_string(), "hello.txt".to_string()],
+                "after pkg-1.0/ strip the leaves are `bin/run.sh` and the root file `hello.txt`"
             );
 
             let staging = TempDir::new().expect("staging tempdir");
@@ -4549,21 +4195,22 @@ path = "srnnkls/tropos"
                 preserve_executable: true,
             };
             let source = sn("pkg");
-            let artifact = an("bin");
+            let export_leaves = vec![ExportLeaf {
+                source: PathBuf::from("bin/run.sh"),
+                dest: PathBuf::from("run.sh"),
+            }];
             let export = backend
                 .export_artifact(&ExportRequest {
                     source: &source,
                     url: &url,
                     commit: &commit,
                     root: None,
-                    artifact: &artifact,
-                    selection: &m,
                     policy: &policy,
                     staging_dir: staging.path(),
                     commit_time: 1,
                     template_opt_in: &crate::config::TemplateOptIn::SuffixOnly,
                     vars: &BTreeMap::new(),
-                    path_map: None,
+                    leaves: &export_leaves,
                 })
                 .expect("export the `bin` artifact");
 

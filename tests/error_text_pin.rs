@@ -12,7 +12,7 @@ use std::str::FromStr;
 
 use phora::config::{Config, Refspec};
 use phora::http::verify_digest;
-use phora::kernel::{Digest, Selection, SourceName};
+use phora::kernel::{Digest, SourceName};
 use phora::source::{GitBackend, SourceBackend};
 use phora::store::{ArtifactKey, FileRegistry, Registry};
 use tempfile::TempDir;
@@ -109,12 +109,13 @@ fn source_export_missing_root_renders_root_not_found() {
 
     let err = fixture
         .backend
-        .discover_artifacts(
+        .compute_digest(
             &sn("dots"),
             &fixture.url,
             &fixture.commit,
             Some(Path::new("no-such-root")),
-            &all_selection(),
+            &[],
+            &[],
         )
         .expect_err("a missing root path must error");
     let _ = staging;
@@ -202,10 +203,6 @@ fn verify_digest_mismatch_renders_source_prefixed_mismatch_message() {
 }
 
 // ── fixture ──────────────────────────────────────────────────────
-
-fn all_selection() -> Selection {
-    Selection::new(&[], &[]).expect("empty selection builds")
-}
 
 struct GitArtifactFixture {
     _src: TempDir,

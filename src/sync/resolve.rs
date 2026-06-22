@@ -4,7 +4,7 @@ use rayon::prelude::*;
 
 use crate::config::{Config, DeployMode, ParsedSource, Refspec, SourceMode};
 use crate::error::Result;
-use crate::kernel::{Selection, SourceName};
+use crate::kernel::SourceName;
 use crate::lock::{Lock, LockedSource, encode_ref, entry_matches, ref_discriminator};
 use crate::source::{MirrorKey, NormalizedUrl, SourceBackend, read_local_head};
 
@@ -189,16 +189,15 @@ fn resolve_unit(
     };
 
     let digest = if source.mode() == SourceMode::Url {
-        let full = Selection::new(&[], &[])?;
-        backend.compute_digest(&source_name, git, &commit, None, &full)?
+        backend.compute_digest(&source_name, git, &commit, None, &[], &[])?
     } else {
-        let selection = Selection::new(source.includes(), source.excludes())?;
         backend.compute_digest(
             &source_name,
             git,
             &commit,
             source.root.as_deref(),
-            &selection,
+            source.includes(),
+            source.excludes(),
         )?
     };
 

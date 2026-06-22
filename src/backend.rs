@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::config::{Refspec, SourceMode};
-use crate::kernel::{ArtifactName, Selection, SourceName};
+use crate::kernel::SourceName;
 use crate::source::{ExportRequest, ExportResult, SourceBackend, SourceError};
 
 type Result<T> = std::result::Result<T, SourceError>;
@@ -73,33 +73,8 @@ impl<G: SourceBackend, H: SourceBackend> SourceBackend for RouterBackend<G, H> {
         self.route(source).commit_time(source, url, commit)
     }
 
-    fn discover_artifacts(
-        &self,
-        source: &SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        selection: &Selection,
-    ) -> Result<Vec<ArtifactName>> {
-        self.route(source)
-            .discover_artifacts(source, url, commit, root, selection)
-    }
-
     fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult> {
         self.route(req.source).export_artifact(req)
-    }
-
-    fn list_artifact_files(
-        &self,
-        source: &SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        artifact: &ArtifactName,
-        selection: &Selection,
-    ) -> Result<Vec<std::path::PathBuf>> {
-        self.route(source)
-            .list_artifact_files(source, url, commit, root, artifact, selection)
     }
 
     fn compute_digest(
@@ -108,10 +83,11 @@ impl<G: SourceBackend, H: SourceBackend> SourceBackend for RouterBackend<G, H> {
         url: &str,
         commit: &str,
         root: Option<&Path>,
-        selection: &Selection,
+        include: &[String],
+        exclude: &[String],
     ) -> Result<String> {
         self.route(source)
-            .compute_digest(source, url, commit, root, selection)
+            .compute_digest(source, url, commit, root, include, exclude)
     }
 }
 
@@ -129,7 +105,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::config::{Refspec, SourceMode};
-    use crate::kernel::{ArtifactName, Selection, SourceName};
+    use crate::kernel::SourceName;
     use crate::source::{
         ExportRequest, ExportResult, GitBackend, HttpBackend, RouterBackend, SourceBackend,
         SourceError,
@@ -250,10 +226,6 @@ mod tests {
         (src, url, head)
     }
 
-    fn empty_selection() -> Selection {
-        Selection::new(&[], &[]).expect("empty selection builds")
-    }
-
     // ── behavioral dispatch: real git + real http through the router ──
 
     #[test]
@@ -327,7 +299,6 @@ mod tests {
     struct Spy {
         fetches: Rc<RefCell<Vec<String>>>,
         resolves: Rc<RefCell<Vec<String>>>,
-        discovers: Rc<RefCell<Vec<String>>>,
         digests: Rc<RefCell<Vec<String>>>,
         leaf_walks: Rc<RefCell<Vec<String>>>,
     }
@@ -358,32 +329,8 @@ mod tests {
             Ok(0)
         }
 
-        fn discover_artifacts(
-            &self,
-            source: &SourceName,
-            _url: &str,
-            _commit: &str,
-            _root: Option<&Path>,
-            _selection: &Selection,
-        ) -> Result<Vec<ArtifactName>> {
-            self.discovers.borrow_mut().push(source.to_string());
-            Ok(vec![])
-        }
-
         fn export_artifact(&self, _req: &ExportRequest<'_>) -> Result<ExportResult> {
             Err(SourceError::Source("spy export".into()))
-        }
-
-        fn list_artifact_files(
-            &self,
-            _source: &SourceName,
-            _url: &str,
-            _commit: &str,
-            _root: Option<&Path>,
-            _artifact: &ArtifactName,
-            _selection: &Selection,
-        ) -> Result<Vec<std::path::PathBuf>> {
-            Ok(vec![])
         }
 
         fn compute_digest(
@@ -392,7 +339,8 @@ mod tests {
             _url: &str,
             _commit: &str,
             _root: Option<&Path>,
-            _selection: &Selection,
+            _include: &[String],
+            _exclude: &[String],
         ) -> Result<String> {
             self.digests.borrow_mut().push(source.to_string());
             Ok("blake3:spy".into())
@@ -503,43 +451,33 @@ mod tests {
     }
 
     #[test]
-    fn discover_and_digest_dispatch_by_mode() {
+    fn digest_dispatch_by_mode() {
         let mut modes = BTreeMap::new();
         modes.insert(sn("u"), SourceMode::Url);
         modes.insert(sn("g"), SourceMode::Git);
         let (router, git, http) = spy_router(modes);
-        let m = empty_selection();
 
         router
-            .discover_artifacts(&sn("u"), "http://x/pkg.tgz", "c", None, &m)
-            .expect("url discover");
+            .compute_digest(&sn("u"), "http://x/pkg.tgz", "c", None, &[], &[])
+            .expect("url digest");
         router
-            .compute_digest(&sn("g"), "https://x/y.git", "c", None, &m)
+            .compute_digest(&sn("g"), "https://x/y.git", "c", None, &[], &[])
             .expect("git digest");
 
         assert!(
             git.fetches.borrow().is_empty() && http.fetches.borrow().is_empty(),
-            "discover/digest must not trigger fetch"
+            "digest must not trigger fetch"
         );
 
         assert_eq!(
-            http.discovers.borrow().as_slice(),
+            http.digests.borrow().as_slice(),
             ["u"],
-            "the url-mode source `u` must reach the http backend's discover_artifacts"
+            "the url-mode source `u` must reach the http backend's compute_digest"
         );
-        assert!(
-            git.discovers.borrow().is_empty(),
-            "no source discovered here is git-mode, so git's discover_artifacts must be untouched"
-        );
-
         assert_eq!(
             git.digests.borrow().as_slice(),
             ["g"],
             "the git-mode source `g` must reach the git backend's compute_digest"
-        );
-        assert!(
-            http.digests.borrow().is_empty(),
-            "no source digested here is url-mode, so http's compute_digest must be untouched"
         );
     }
 

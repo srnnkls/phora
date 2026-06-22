@@ -80,13 +80,13 @@ exclude: []
 
 ## Include/exclude matching — an excluded path
 
-`README.md` is a loose root file outside the included subtrees, so its artifact
-is excluded.
+`README.md` is a loose root file outside the included subtrees. The offer selects
+nothing under it, so both its artifact and its full path are excluded.
 
 ```scrut
 $ phora check-match --source dotfiles README.md 2>&1 | normalize
 artifact `README.md`: excluded
-path `README.md`: allowed
+path `README.md`: excluded
 include: ["editor", "lint"]
 exclude: []
 ```
