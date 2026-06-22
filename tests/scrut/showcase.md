@@ -138,6 +138,8 @@ git commit or content digest, so both read as `link`.
 $ phora where 2>&1 | normalize
 Artifact: overlay-machine/config (commit link, digest link:)
   - machine
+Artifact: overlay-machine/notes.txt (commit link, digest link:)
+  - machine
 Artifact: src-dotfiles/editor (commit ca94c83b, digest blake3:2316b2c05d3f72e93270833746381341b70a008daf5af59a2ddb2a8c83206bc0)
   - home
 Artifact: src-dotfiles/lint (commit ca94c83b, digest blake3:d26cc52a7261d7a76fa1f6dadda5cba932687bd6cf626e7ea746e46dc8937cfb)
@@ -154,6 +156,7 @@ home:
   src-dotfiles/lint  ✓ clean
 machine:
   overlay-machine/config  linked
+  overlay-machine/notes.txt  linked
 ```
 
 `phora preview` renders the full projection from the lock, both targets at once —

@@ -1346,24 +1346,7 @@ fn sync_errors_on_flat_layout_collision_naming_artifact_sources_and_target() {
     let Err(err) = sync(&in_, &backend, &registry) else {
         panic!("two sources exposing `shared` into a flat target must collide (return Err)");
     };
-
-    let Error::Collision {
-        artifact,
-        sources,
-        target,
-    } = err
-    else {
-        panic!("flat collision must be reported as Error::Collision, got {err:?}");
-    };
-    assert_eq!(
-        artifact, "shared",
-        "the collision must name the colliding artifact"
-    );
-    assert_eq!(target, "dest", "the collision must name the target");
-    assert!(
-        sources.contains(&"src-a".to_string()) && sources.contains(&"src-b".to_string()),
-        "the collision must name BOTH contributing sources, got {sources:?}"
-    );
+    assert_cross_binding_collision(&err.to_string(), "shared");
 
     drop(fx_a);
     drop(fx_b);
@@ -1565,18 +1548,29 @@ fn flat_layout_collision_detected_between_two_aliases_sharing_a_destination() {
     );
     let cfg = Config::parse(&toml).expect("two-alias flat config parses");
 
-    let Err(Error::Collision {
-        artifact, target, ..
-    }) = sync(&input(&cfg, None, None, None, false), &backend, &registry)
-    else {
+    let Err(err) = sync(&input(&cfg, None, None, None, false), &backend, &registry) else {
         panic!("two aliases of one source into a flat target must collide on the destination");
     };
-    assert_eq!(
-        artifact, "nvim",
-        "the collision must name the shared artifact"
-    );
-    assert_eq!(target, "dest", "the collision must name the target");
+    assert_cross_binding_collision(&err.to_string(), "nvim");
     drop(src);
+}
+
+fn assert_cross_binding_collision(rendered: &str, shared_key: &str) {
+    use crate::diagnostic::{MATCHED_AGAINST, REMEDY, SELECTION};
+    for phrase in [SELECTION, MATCHED_AGAINST, REMEDY] {
+        assert!(
+            rendered.contains(phrase),
+            "the cross-binding dup-dest rejection must render `{phrase}`; got:\n{rendered}"
+        );
+    }
+    assert!(
+        rendered.contains(shared_key),
+        "the rejection must name the shared destination key `{shared_key}`; got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("same destination"),
+        "the rejection must state the two bindings resolve to the same destination; got:\n{rendered}"
+    );
 }
 
 #[test]
@@ -1594,20 +1588,13 @@ fn same_identity_bindings_sharing_a_destination_still_collide() {
     );
     let cfg = Config::parse(&toml).expect("two bare same-source bindings parse");
 
-    let Err(Error::Collision {
-        artifact, target, ..
-    }) = sync(&input(&cfg, None, None, None, false), &backend, &registry)
-    else {
+    let Err(err) = sync(&input(&cfg, None, None, None, false), &backend, &registry) else {
         panic!(
             "two bindings of one source sharing a default identity and projecting `nvim` into a \
              flat target must collide on the destination, not silently overwrite"
         );
     };
-    assert_eq!(
-        artifact, "nvim",
-        "the collision must name the shared artifact"
-    );
-    assert_eq!(target, "dest", "the collision must name the target");
+    assert_cross_binding_collision(&err.to_string(), "nvim");
     drop(src);
 }
 
@@ -1848,8 +1835,14 @@ fn second_deploy_over_correct_link_is_a_noop() {
         vars: &BTreeMap::new(),
         protected: &protected,
     };
-    let selection = Selection::new(source.includes(), source.excludes()).expect("selection");
-    let (entry_source, entry_artifact) = (sn("editor-src"), an("editor"));
+    let entry_source = sn("editor-src");
+    let item = crate::sync::plan::PlannedItem {
+        materialization: crate::kernel::Materialization::CollapsedDir {
+            dir: "editor".to_owned(),
+        },
+        destination: dst.clone(),
+        kept_leaves: Vec::new(),
+    };
     let entry = ArtifactEntry {
         source: &source,
         git: remotes
@@ -1858,16 +1851,13 @@ fn second_deploy_over_correct_link_is_a_noop() {
         source_name: &entry_source,
         identity: "editor-src",
         underlying_source: "editor-src",
-        root: source.root.as_deref(),
         commit: &fx.head_sha,
-        selection: &selection,
-        artifact_name: &entry_artifact,
-        target_path: &target.expanded_path(),
+        item: &item,
+        artifact_dst: &dst,
         layout_kind: LayoutKind::Flat,
         ejected: &[],
         mode_transition: false,
         template_opt_in: &crate::config::TemplateOptIn::SuffixOnly,
-        mapped_source_key: None,
     };
     let state = check_artifact_state(
         &dst,
@@ -9206,7 +9196,7 @@ fn sealed_offer_take_subsetting_a_leaf_is_allowed_not_a_violation() {
     let toml = format!(
         "version = 1\n\n\
          [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
-         [targets.dest]\npath = \"{}\"\nsources = {{ editor-src = {{ take = [\"docs\"] }} }}\n\
+         [targets.dest]\npath = \"{}\"\nsources = {{ editor-src = {{ take = [\"docs/readme.md\"] }} }}\n\
          layout = \"flat\"\n",
         fx.url,
         td.target_path().display(),
@@ -9294,4 +9284,827 @@ fn sealed_offer_validates_crash_recovered_record_finalized_by_the_sweep() {
         );
     };
     assert_sealed_offer_diagnostic(&err.to_string(), "dest", "editor-src", "editor");
+}
+
+mod leaf_granular_deploy_tests {
+    use super::*;
+
+    #[expect(
+        clippy::unwrap_used,
+        reason = "fixture setup fails loudly; git CLI is assumed present"
+    )]
+    fn build_two_leaf_dir_repo() -> (TempDir, String) {
+        let src = TempDir::new().unwrap();
+        let p = src.path();
+        run_git(p, &["init", "-b", "main", "."]);
+        run_git(p, &["config", "user.email", "test@example.com"]);
+        run_git(p, &["config", "user.name", "Test"]);
+        std::fs::create_dir_all(p.join("editor/plug")).unwrap();
+        std::fs::write(p.join("editor/a.md"), b"alpha\n").unwrap();
+        std::fs::write(p.join("editor/b.md"), b"beta\n").unwrap();
+        std::fs::write(p.join("editor/plug/x.md"), b"ex\n").unwrap();
+        std::fs::write(p.join("editor/plug/y.md"), b"why\n").unwrap();
+        run_git(p, &["add", "-A"]);
+        run_git(p, &["commit", "-m", "init"]);
+        let url = p.to_string_lossy().into_owned();
+        (src, url)
+    }
+
+    fn build_link_tree_with_nested_plug_dir() -> TempDir {
+        let td = TempDir::new().expect("link tree tempdir");
+        let base = td.path();
+        std::fs::create_dir_all(base.join("editor/plug")).expect("mkdir editor/plug");
+        std::fs::write(base.join("editor/a.md"), b"alpha\n").expect("write a.md");
+        std::fs::write(base.join("editor/b.md"), b"beta\n").expect("write b.md");
+        std::fs::write(base.join("editor/plug/x.md"), b"ex\n").expect("write x.md");
+        std::fs::write(base.join("editor/plug/y.md"), b"why\n").expect("write y.md");
+        td
+    }
+
+    fn build_flat_two_leaf_link_tree() -> TempDir {
+        let td = TempDir::new().expect("link tree tempdir");
+        let base = td.path();
+        std::fs::create_dir_all(base.join("editor")).expect("mkdir editor");
+        std::fs::write(base.join("editor/a.md"), b"alpha\n").expect("write a.md");
+        std::fs::write(base.join("editor/b.md"), b"beta\n").expect("write b.md");
+        td
+    }
+
+    fn by_source() -> crate::config::LayoutConfig {
+        crate::config::LayoutConfig {
+            kind: LayoutKind::BySource,
+            separator: String::new(),
+        }
+    }
+
+    fn records(reg: &FileRegistry, target: &str) -> Vec<RegistryRecord> {
+        reg.list_target(target).expect("list_target must not error")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_wholly_taken_nested_subtree_collapses_to_one_dir_symlink_keyed_by_subtree() {
+        let wt = build_link_tree_with_nested_plug_dir();
+        let td = TargetDir::new();
+        let toml = format!(
+            "version = 1\n\n\
+             [sources.ed]\ngit = \"{}\"\nbranch = \"main\"\ndeploy = \"link\"\n\n\
+             [targets.dest]\npath = \"{}\"\n\
+             sources = {{ ed = {{ source = \"ed\", take = [\"editor/plug/**\"] }} }}\n\
+             layout = \"by-source\"\n",
+            wt.path().display(),
+            td.target_path().display(),
+        );
+        let cfg = Config::parse(&toml).expect("link collapse config parses");
+        let (_g, _s, backend, registry) = fresh_backend_registry();
+
+        let out = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+            .expect("link-collapse sync runs to deploy");
+        assert!(
+            !out.had_failures,
+            "a clean link-collapse deploy must not fail"
+        );
+
+        let dir_dst = td
+            .target_path()
+            .join(by_source().artifact_path("ed", "editor/plug"));
+        let meta = std::fs::symlink_metadata(&dir_dst)
+            .expect("the collapsed subtree must materialize at <target>/ed/editor/plug");
+        assert!(
+            meta.file_type().is_symlink(),
+            "a wholly-taken link subtree must deploy as ONE directory symlink, not N per-leaf links"
+        );
+        assert_eq!(
+            std::fs::read_link(&dir_dst).expect("collapsed dir symlink readable"),
+            wt.path().join("editor/plug"),
+            "the collapsed symlink must point at <git>/editor/plug, the taken subtree"
+        );
+
+        let recs = records(&registry, "dest");
+        assert_eq!(
+            recs.len(),
+            1,
+            "a wholly-taken subtree collapses to exactly ONE record, not one per top-level dir; got {recs:?}"
+        );
+        assert_eq!(
+            recs[0].kind,
+            RecordKind::Dir,
+            "the collapsed record is kind=Dir"
+        );
+        assert_eq!(
+            recs[0].key.artifact, "editor/plug",
+            "the collapsed record key is the TAKEN subtree key `editor/plug`, not the top-level \
+             `editor` dir the old discovery would record; got {:?}",
+            recs[0].key.artifact
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_within_dir_exclude_falls_back_to_per_leaf_symlinks_and_file_records() {
+        let wt = build_flat_two_leaf_link_tree();
+        let td = TargetDir::new();
+        let toml = format!(
+            "version = 1\n\n\
+             [sources.ed]\ngit = \"{}\"\nbranch = \"main\"\ndeploy = \"link\"\n\
+             exclude = [\"editor/b.md\"]\n\n\
+             [targets.dest]\npath = \"{}\"\nsources = [\"ed\"]\nlayout = \"by-source\"\n",
+            wt.path().display(),
+            td.target_path().display(),
+        );
+        let cfg = Config::parse(&toml).expect("link per-leaf config parses");
+        let (_g, _s, backend, registry) = fresh_backend_registry();
+        let out = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+            .expect("per-leaf link sync runs to deploy");
+        assert!(
+            !out.had_failures,
+            "a clean per-leaf link deploy must not fail"
+        );
+
+        let kept = td
+            .target_path()
+            .join(by_source().artifact_path("ed", "editor/a.md"));
+        let kept_meta = std::fs::symlink_metadata(&kept)
+            .expect("the kept leaf must materialize as its own symlink at <target>/ed/editor/a.md");
+        assert!(
+            kept_meta.file_type().is_symlink(),
+            "a collapse-blocked link must deploy INDIVIDUAL per-leaf symlinks"
+        );
+        let excluded = td
+            .target_path()
+            .join(by_source().artifact_path("ed", "editor/b.md"));
+        assert!(
+            std::fs::symlink_metadata(&excluded).is_err(),
+            "the excluded leaf editor/b.md must be absent on disk; got a present entry"
+        );
+
+        let recs = records(&registry, "dest");
+        assert!(
+            recs.iter().all(|r| r.kind == RecordKind::File),
+            "per-leaf fallback records every kept leaf as kind=File; got {recs:?}"
+        );
+        let keys: BTreeSet<String> = recs.iter().map(|r| r.key.artifact.clone()).collect();
+        assert_eq!(
+            keys,
+            BTreeSet::from(["editor/a.md".to_owned()]),
+            "exactly the kept leaf is recorded, keyed by its leaf path; the excluded leaf is unrecorded; got {keys:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_leaf_points_at_source_file_not_a_directory() {
+        let wt = build_flat_two_leaf_link_tree();
+        let td = TargetDir::new();
+        let toml = format!(
+            "version = 1\n\n\
+             [sources.ed]\ngit = \"{}\"\nbranch = \"main\"\ndeploy = \"link\"\n\
+             exclude = [\"editor/b.md\"]\n\n\
+             [targets.dest]\npath = \"{}\"\nsources = [\"ed\"]\nlayout = \"by-source\"\n",
+            wt.path().display(),
+            td.target_path().display(),
+        );
+        let cfg = Config::parse(&toml).expect("link per-leaf config parses");
+        let (_g, _s, backend, registry) = fresh_backend_registry();
+        let out = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+            .expect("per-leaf link sync runs to deploy");
+        assert!(
+            !out.had_failures,
+            "a clean per-leaf link deploy must not fail"
+        );
+
+        let leaf = td
+            .target_path()
+            .join(by_source().artifact_path("ed", "editor/a.md"));
+        let meta = std::fs::symlink_metadata(&leaf).expect("the link leaf must materialize");
+        assert!(
+            meta.file_type().is_symlink(),
+            "a link-mode leaf must deploy as a symlink"
+        );
+        let target = std::fs::read_link(&leaf).expect("the link leaf must be readable");
+        assert_eq!(
+            target,
+            wt.path().join("editor/a.md"),
+            "a link-mode FILE leaf must point at the source FILE; the kind threaded into \
+             link_artifact must be RecordKind::File so Windows selects symlink_file, not \
+             symlink_dir"
+        );
+        let target_meta =
+            std::fs::metadata(&target).expect("the link target must resolve to the source file");
+        assert!(
+            target_meta.is_file(),
+            "the link target must be a regular FILE, not a directory; got {target_meta:?}"
+        );
+
+        let recs = records(&registry, "dest");
+        assert!(
+            recs.iter().any(|r| r.kind == RecordKind::File && r.linked),
+            "a link-mode leaf must record kind=File and linked=true so the file-symlink choice is \
+             type-driven; got {recs:?}"
+        );
+    }
+
+    #[test]
+    fn copy_single_leaf_take_deploys_one_file_and_one_file_record() {
+        let (src, url) = build_two_leaf_dir_repo();
+        let td = TargetDir::new();
+        let (_g, _s, backend, registry) = fresh_backend_registry();
+        let toml = format!(
+            "version = 1\n\n\
+             [sources.ed]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+             [targets.dest]\npath = \"{}\"\n\
+             sources = {{ ed = {{ source = \"ed\", take = [\"editor/a.md\"] }} }}\n\
+             layout = \"by-source\"\n",
+            td.target_path().display(),
+        );
+        let cfg = Config::parse(&toml).expect("copy single-leaf take config parses");
+
+        let out = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+            .expect("copy single-leaf take must deploy");
+        assert!(!out.had_failures, "a clean single-leaf copy must not fail");
+
+        let leaf_dst = td
+            .target_path()
+            .join(by_source().artifact_path("ed", "editor/a.md"));
+        assert_eq!(
+            std::fs::read(&leaf_dst).expect("the taken leaf must be a real file on disk"),
+            b"alpha\n",
+            "a copy take of one leaf must materialize exactly that file's content"
+        );
+        let other = td
+            .target_path()
+            .join(by_source().artifact_path("ed", "editor/b.md"));
+        assert!(
+            !other.exists(),
+            "the untaken sibling editor/b.md must not be deployed"
+        );
+
+        let recs = records(&registry, "dest");
+        assert_eq!(recs.len(), 1, "exactly one leaf record; got {recs:?}");
+        assert_eq!(
+            recs[0].kind,
+            RecordKind::File,
+            "a copy leaf records kind=File"
+        );
+        assert_eq!(
+            recs[0].key.artifact, "editor/a.md",
+            "the record key is the leaf path; got {:?}",
+            recs[0].key.artifact
+        );
+        drop(src);
+    }
+
+    #[test]
+    fn copy_wholly_taken_subtree_deploys_subtree_and_records_dir_kind_keyed_by_subtree() {
+        let (src, url) = build_two_leaf_dir_repo();
+        let td = TargetDir::new();
+        let (_g, _s, backend, registry) = fresh_backend_registry();
+        let toml = format!(
+            "version = 1\n\n\
+             [sources.ed]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+             [targets.dest]\npath = \"{}\"\n\
+             sources = {{ ed = {{ source = \"ed\", take = [\"editor/plug/**\"] }} }}\n\
+             layout = \"by-source\"\n",
+            td.target_path().display(),
+        );
+        let cfg = Config::parse(&toml).expect("copy whole-dir config parses");
+
+        let out = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+            .expect("copy whole-dir take must deploy");
+        assert!(!out.had_failures, "a clean whole-dir copy must not fail");
+
+        let dir_dst = td
+            .target_path()
+            .join(by_source().artifact_path("ed", "editor/plug"));
+        assert_eq!(
+            std::fs::read(dir_dst.join("x.md")).expect("subtree file x.md deployed"),
+            b"ex\n",
+            "a wholly-taken copy subtree must materialize the whole subtree"
+        );
+        let untaken = td
+            .target_path()
+            .join(by_source().artifact_path("ed", "editor/a.md"));
+        assert!(
+            !untaken.exists(),
+            "the untaken sibling editor/a.md must not be deployed"
+        );
+
+        let recs = records(&registry, "dest");
+        assert_eq!(
+            recs.len(),
+            1,
+            "a collapsed copy subtree is one record; got {recs:?}"
+        );
+        assert_eq!(
+            recs[0].kind,
+            RecordKind::Dir,
+            "a wholly-taken copy subtree records kind=Dir; got {recs:?}"
+        );
+        assert_eq!(
+            recs[0].key.artifact, "editor/plug",
+            "the record key is the TAKEN subtree key `editor/plug`, not the top-level `editor` \
+             dir the old discovery would record; got {:?}",
+            recs[0].key.artifact
+        );
+        drop(src);
+    }
+
+    #[test]
+    fn copy_take_rename_is_destructive_and_record_keyed_by_renamed_dest() {
+        let (src, url) = build_two_leaf_dir_repo();
+        let td = TargetDir::new();
+        let (_g, _s, backend, registry) = fresh_backend_registry();
+        let toml = format!(
+            "version = 1\n\n\
+             [sources.ed]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+             [targets.dest]\npath = \"{}\"\n\
+             sources = {{ ed = {{ source = \"ed\", take = [{{ \"editor/a.md\" = \"editor/renamed.md\" }}] }} }}\n\
+             layout = \"by-source\"\n",
+            td.target_path().display(),
+        );
+        let cfg = Config::parse(&toml).expect("rename take config parses");
+
+        let out = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+            .expect("a rename take must deploy");
+        assert!(!out.had_failures, "a clean rename take must not fail");
+
+        let renamed = td
+            .target_path()
+            .join(by_source().artifact_path("ed", "editor/renamed.md"));
+        assert_eq!(
+            std::fs::read(&renamed).expect("the renamed dest must hold the source content"),
+            b"alpha\n",
+            "a rename deploys the file at its renamed destination"
+        );
+        let original = td
+            .target_path()
+            .join(by_source().artifact_path("ed", "editor/a.md"));
+        assert!(
+            !original.exists(),
+            "a rename is destructive: the original source path must be ABSENT on disk"
+        );
+
+        let recs = records(&registry, "dest");
+        let keys: BTreeSet<String> = recs.iter().map(|r| r.key.artifact.clone()).collect();
+        assert_eq!(
+            keys,
+            BTreeSet::from(["editor/renamed.md".to_owned()]),
+            "the record key is the RENAMED dest, never the source path; got {keys:?}"
+        );
+        drop(src);
+    }
+
+    #[test]
+    fn take_rename_to_reserved_device_name_is_rejected_at_sync() {
+        let (src, url) = build_two_leaf_dir_repo();
+        let td = TargetDir::new();
+        let (_g, _s, backend, registry) = fresh_backend_registry();
+        let toml = format!(
+            "version = 1\n\n\
+             [sources.ed]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+             [targets.dest]\npath = \"{}\"\n\
+             sources = {{ ed = {{ source = \"ed\", take = [{{ \"editor/a.md\" = \"CON\" }}] }} }}\n\
+             layout = \"by-source\"\n",
+            td.target_path().display(),
+        );
+        let cfg = Config::parse(&toml).expect("reserved-dest take config parses");
+
+        let Err(err) = sync(&input(&cfg, None, None, None, false), &backend, &registry) else {
+            panic!(
+                "a rename dest that is a reserved DOS device name (`CON`) must be REJECTED at sync \
+                 time; safe_relpath must not be bypassed for rename dests on the live deploy path"
+            );
+        };
+        assert!(
+            err.to_string().contains("CON"),
+            "the rejection must name the offending dest `CON`; got: {err}"
+        );
+        assert!(
+            !td.target_path().join("CON").exists(),
+            "no write may reach the reserved-name dest"
+        );
+        drop(src);
+    }
+
+    #[test]
+    fn take_rename_to_colon_dest_is_rejected_at_sync() {
+        let (src, url) = build_two_leaf_dir_repo();
+        let td = TargetDir::new();
+        let (_g, _s, backend, registry) = fresh_backend_registry();
+        let toml = format!(
+            "version = 1\n\n\
+             [sources.ed]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+             [targets.dest]\npath = \"{}\"\n\
+             sources = {{ ed = {{ source = \"ed\", take = [{{ \"editor/a.md\" = \"a:b\" }}] }} }}\n\
+             layout = \"by-source\"\n",
+            td.target_path().display(),
+        );
+        let cfg = Config::parse(&toml).expect("colon-dest take config parses");
+
+        let Err(err) = sync(&input(&cfg, None, None, None, false), &backend, &registry) else {
+            panic!(
+                "a rename dest carrying a colon (NTFS ADS / drive separator) must be REJECTED at \
+                 sync; the live deploy path must route rename dests through safe_relpath"
+            );
+        };
+        assert!(
+            err.to_string().contains("a:b"),
+            "the rejection must name the offending dest `a:b`; got: {err}"
+        );
+        drop(src);
+    }
+
+    #[test]
+    fn rename_records_one_leaf_under_active_layout_never_map() {
+        let (src, url) = build_two_leaf_dir_repo();
+        let td = TargetDir::new();
+        let (_g, _s, backend, registry) = fresh_backend_registry();
+        let toml = format!(
+            "version = 1\n\n\
+             [sources.ed]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+             [targets.dest]\npath = \"{}\"\n\
+             sources = {{ ed = {{ source = \"ed\", take = [{{ \"editor/a.md\" = \"editor/renamed.md\" }}] }} }}\n\
+             layout = \"by-source\"\n",
+            td.target_path().display(),
+        );
+        let cfg = Config::parse(&toml).expect("rename layout config parses");
+
+        sync(&input(&cfg, None, None, None, false), &backend, &registry)
+            .expect("rename deploy must succeed");
+
+        let recs = records(&registry, "dest");
+        assert!(
+            recs.iter().all(|r| r.layout != crate::store::MAP_LAYOUT),
+            "no deployed record may carry layout == \"map\"; a rename is a normal leaf record \
+             under the active layout; got {recs:?}"
+        );
+        let keys: BTreeSet<String> = recs.iter().map(|r| r.key.artifact.clone()).collect();
+        assert_eq!(
+            keys,
+            BTreeSet::from(["editor/renamed.md".to_owned()]),
+            "a rename deploys exactly ONE leaf record at the renamed dest key under the active \
+             layout — NOT a dir record keyed `editor` (the old discovery), and NOT a map record; \
+             got {keys:?}"
+        );
+        assert_eq!(
+            recs[0].layout, "bysource",
+            "the rename record carries the active `by-source` layout; got {recs:?}"
+        );
+        assert_eq!(
+            recs[0].kind,
+            RecordKind::File,
+            "a renamed single leaf records kind=File; got {recs:?}"
+        );
+        drop(src);
+    }
+
+    #[expect(
+        clippy::unwrap_used,
+        reason = "fixture setup fails loudly; git CLI is assumed present"
+    )]
+    fn build_templated_leaf_repo() -> (TempDir, String) {
+        let src = TempDir::new().unwrap();
+        let p = src.path();
+        run_git(p, &["init", "-b", "main", "."]);
+        run_git(p, &["config", "user.email", "test@example.com"]);
+        run_git(p, &["config", "user.name", "Test"]);
+        std::fs::create_dir_all(p.join("editor")).unwrap();
+        std::fs::write(p.join("editor/motd.tmpl"), b"hello {{ greeting }}!\n").unwrap();
+        std::fs::write(p.join("editor/plain.md"), b"verbatim\n").unwrap();
+        run_git(p, &["add", "-A"]);
+        run_git(p, &["commit", "-m", "init"]);
+        let url = p.to_string_lossy().into_owned();
+        (src, url)
+    }
+
+    #[test]
+    fn copy_identity_templated_leaf_renders_and_strips_tmpl_suffix() {
+        let (src, url) = build_templated_leaf_repo();
+        let td = TargetDir::new();
+        let (_g, _s, backend, registry) = fresh_backend_registry();
+        let toml = format!(
+            "version = 1\n\n[vars]\ngreeting = \"world\"\n\n\
+             [sources.ed]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+             [targets.dest]\npath = \"{}\"\n\
+             sources = {{ ed = {{ source = \"ed\", take = [\"editor/motd.tmpl\"] }} }}\n\
+             layout = \"by-source\"\n",
+            td.target_path().display(),
+        );
+        let cfg = Config::parse(&toml).expect("templated identity-leaf take config parses");
+
+        let out = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+            .expect("templated leaf copy must deploy");
+        assert!(
+            !out.had_failures,
+            "a clean templated leaf copy must not fail"
+        );
+
+        let rendered = td
+            .target_path()
+            .join(by_source().artifact_path("ed", "editor/motd"));
+        assert_eq!(
+            std::fs::read(&rendered)
+                .expect("the rendered leaf must land at the .tmpl-stripped name `editor/motd`"),
+            b"hello world!\n",
+            "an identity take of a `.tmpl` leaf must RENDER through minijinja with the config \
+             vars and deploy at the stripped name, not the raw source bytes"
+        );
+        let raw = td
+            .target_path()
+            .join(by_source().artifact_path("ed", "editor/motd.tmpl"));
+        assert!(
+            !raw.exists(),
+            "the `.tmpl` suffix must be stripped: no `editor/motd.tmpl` may land at the target"
+        );
+
+        let recs = records(&registry, "dest");
+        assert_eq!(recs.len(), 1, "exactly one leaf record; got {recs:?}");
+        assert!(
+            recs[0].vars_digest.is_some(),
+            "a rendered copy leaf must carry a vars_digest so drift on a var change is detected; \
+             got {recs:?}"
+        );
+        drop(src);
+    }
+
+    #[test]
+    fn copy_rename_templated_leaf_renders_from_source_at_rename_dest() {
+        let (src, url) = build_templated_leaf_repo();
+        let td = TargetDir::new();
+        let (_g, _s, backend, registry) = fresh_backend_registry();
+        let toml = format!(
+            "version = 1\n\n[vars]\ngreeting = \"world\"\n\n\
+             [sources.ed]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+             [targets.dest]\npath = \"{}\"\n\
+             sources = {{ ed = {{ source = \"ed\", take = [{{ \"editor/motd.tmpl\" = \"editor/banner\" }}] }} }}\n\
+             layout = \"by-source\"\n",
+            td.target_path().display(),
+        );
+        let cfg = Config::parse(&toml).expect("templated rename-leaf take config parses");
+
+        let out = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+            .expect("templated rename leaf copy must deploy");
+        assert!(
+            !out.had_failures,
+            "a clean templated rename leaf copy must not fail"
+        );
+
+        let renamed = td
+            .target_path()
+            .join(by_source().artifact_path("ed", "editor/banner"));
+        assert_eq!(
+            std::fs::read(&renamed)
+                .expect("the rendered renamed leaf must land at `editor/banner`"),
+            b"hello world!\n",
+            "a rename take of a `.tmpl` leaf must RENDER from the source content and land at the \
+             explicit rename dest, not deploy the raw template bytes"
+        );
+
+        let recs = records(&registry, "dest");
+        assert_eq!(recs.len(), 1, "exactly one leaf record; got {recs:?}");
+        assert!(
+            recs[0].vars_digest.is_some(),
+            "a rendered renamed copy leaf must carry a vars_digest; got {recs:?}"
+        );
+        drop(src);
+    }
+
+    #[test]
+    fn copy_non_templated_leaf_deploys_byte_identical_without_vars_digest() {
+        let (src, url) = build_templated_leaf_repo();
+        let td = TargetDir::new();
+        let (_g, _s, backend, registry) = fresh_backend_registry();
+        let toml = format!(
+            "version = 1\n\n[vars]\ngreeting = \"world\"\n\n\
+             [sources.ed]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+             [targets.dest]\npath = \"{}\"\n\
+             sources = {{ ed = {{ source = \"ed\", take = [\"editor/plain.md\"] }} }}\n\
+             layout = \"by-source\"\n",
+            td.target_path().display(),
+        );
+        let cfg = Config::parse(&toml).expect("non-templated leaf take config parses");
+
+        let out = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+            .expect("non-templated leaf copy must deploy");
+        assert!(
+            !out.had_failures,
+            "a clean non-templated leaf copy must not fail"
+        );
+
+        let leaf = td
+            .target_path()
+            .join(by_source().artifact_path("ed", "editor/plain.md"));
+        assert_eq!(
+            std::fs::read(&leaf).expect("the plain leaf must deploy at its source name"),
+            b"verbatim\n",
+            "a non-templated copy leaf must deploy byte-identical with no name rewrite"
+        );
+
+        let recs = records(&registry, "dest");
+        assert_eq!(recs.len(), 1, "exactly one leaf record; got {recs:?}");
+        assert!(
+            recs[0].vars_digest.is_none(),
+            "a non-rendered copy leaf must NOT carry a vars_digest (no spurious drift on a var \
+             change); got {recs:?}"
+        );
+        drop(src);
+    }
+
+    #[expect(
+        clippy::unwrap_used,
+        reason = "fixture setup fails loudly; git CLI is assumed present"
+    )]
+    fn build_dir_repo_with_secret() -> (TempDir, String) {
+        let src = TempDir::new().unwrap();
+        let p = src.path();
+        run_git(p, &["init", "-b", "main", "."]);
+        run_git(p, &["config", "user.email", "test@example.com"]);
+        run_git(p, &["config", "user.name", "Test"]);
+        std::fs::create_dir_all(p.join("editor/plug")).unwrap();
+        std::fs::write(p.join("editor/a.md"), b"alpha\n").unwrap();
+        std::fs::write(p.join("editor/b.md"), b"beta\n").unwrap();
+        std::fs::write(p.join("editor/secret"), b"top-secret\n").unwrap();
+        std::fs::write(p.join("editor/plug/x.md"), b"ex\n").unwrap();
+        std::fs::write(p.join("editor/plug/secret"), b"plug-secret\n").unwrap();
+        run_git(p, &["add", "-A"]);
+        run_git(p, &["commit", "-m", "init"]);
+        let url = p.to_string_lossy().into_owned();
+        (src, url)
+    }
+
+    fn build_link_tree_with_secret() -> TempDir {
+        let td = TempDir::new().expect("link tree tempdir");
+        let base = td.path();
+        std::fs::create_dir_all(base.join("editor")).expect("mkdir editor");
+        std::fs::write(base.join("editor/a.md"), b"alpha\n").expect("write a.md");
+        std::fs::write(base.join("editor/b.md"), b"beta\n").expect("write b.md");
+        std::fs::write(base.join("editor/secret"), b"top-secret\n").expect("write secret");
+        td
+    }
+
+    #[test]
+    fn copy_collapse_with_offer_exclude_prunes_excluded_child() {
+        let (src, url) = build_dir_repo_with_secret();
+        let td = TargetDir::new();
+        let (_g, _s, backend, registry) = fresh_backend_registry();
+        let toml = format!(
+            "version = 1\n\n\
+             [sources.ed]\ngit = \"{url}\"\nbranch = \"main\"\n\
+             include = [\"editor/**\"]\nexclude = [\"editor/secret\", \"editor/plug/**\"]\n\n\
+             [targets.dest]\npath = \"{}\"\nsources = [\"ed\"]\nlayout = \"by-source\"\n",
+            td.target_path().display(),
+        );
+        let cfg = Config::parse(&toml).expect("copy collapse offer-exclude config parses");
+
+        let out = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+            .expect("copy collapse deploy must run");
+        assert!(!out.had_failures, "a clean copy collapse must not fail");
+
+        let dir_dst = td
+            .target_path()
+            .join(by_source().artifact_path("ed", "editor"));
+        assert_eq!(
+            std::fs::read(dir_dst.join("a.md")).expect("kept leaf editor/a.md deployed"),
+            b"alpha\n",
+            "the offered-kept leaf must materialize under the collapsed dir"
+        );
+        let leaked = dir_dst.join("secret");
+        assert!(
+            std::fs::symlink_metadata(&leaked).is_err(),
+            "an OFFER-EXCLUDED child must NOT leak into a copy CollapsedDir; found {}",
+            leaked.display()
+        );
+
+        let recs = records(&registry, "dest");
+        assert_eq!(
+            recs.len(),
+            1,
+            "a copy collapse is one dir record; got {recs:?}"
+        );
+        let leaked_in_record = recs[0]
+            .files
+            .iter()
+            .any(|f| f.path.file_name().is_some_and(|n| n == "secret"));
+        assert!(
+            !leaked_in_record,
+            "the excluded child must NOT appear in the dir record's files; got {:?}",
+            recs[0].files
+        );
+        drop(src);
+    }
+
+    #[test]
+    fn copy_partial_take_recollapse_with_offer_exclude_prunes_excluded_child() {
+        let (src, url) = build_dir_repo_with_secret();
+        let td = TargetDir::new();
+        let (_g, _s, backend, registry) = fresh_backend_registry();
+        let toml = format!(
+            "version = 1\n\n\
+             [sources.ed]\ngit = \"{url}\"\nbranch = \"main\"\n\
+             include = [\"editor/**\"]\nexclude = [\"editor/plug/secret\"]\n\n\
+             [targets.dest]\npath = \"{}\"\n\
+             sources = {{ ed = {{ source = \"ed\", take = [\"editor/b.md\", \"editor/plug/**\"] }} }}\n\
+             layout = \"by-source\"\n",
+            td.target_path().display(),
+        );
+        let cfg = Config::parse(&toml).expect("copy partial-take recollapse config parses");
+
+        let out = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+            .expect("copy partial-take recollapse deploy must run");
+        assert!(
+            !out.had_failures,
+            "a clean partial-take recollapse must not fail"
+        );
+
+        let plug_dst = td
+            .target_path()
+            .join(by_source().artifact_path("ed", "editor/plug"));
+        assert_eq!(
+            std::fs::read(plug_dst.join("x.md")).expect("kept leaf editor/plug/x.md deployed"),
+            b"ex\n",
+            "the kept subtree leaf must materialize under the re-collapsed plug dir"
+        );
+        let leaked = plug_dst.join("secret");
+        assert!(
+            std::fs::symlink_metadata(&leaked).is_err(),
+            "an OFFER-EXCLUDED child under the re-collapsed dir must NOT leak; found {}",
+            leaked.display()
+        );
+
+        let recs = records(&registry, "dest");
+        let plug_rec = recs
+            .iter()
+            .find(|r| r.key.artifact == "editor/plug")
+            .expect("a re-collapsed plug dir record must exist");
+        let leaked_in_record = plug_rec
+            .files
+            .iter()
+            .any(|f| f.path.file_name().is_some_and(|n| n == "secret"));
+        assert!(
+            !leaked_in_record,
+            "the excluded child must NOT appear in the re-collapsed dir record's files; got {:?}",
+            plug_rec.files
+        );
+        drop(src);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_offer_excluded_physical_child_falls_back_to_per_leaf_and_omits_excluded() {
+        let wt = build_link_tree_with_secret();
+        let td = TargetDir::new();
+        let toml = format!(
+            "version = 1\n\n\
+             [sources.ed]\ngit = \"{}\"\nbranch = \"main\"\ndeploy = \"link\"\n\
+             include = [\"editor/**\"]\nexclude = [\"editor/secret\"]\n\n\
+             [targets.dest]\npath = \"{}\"\nsources = [\"ed\"]\nlayout = \"by-source\"\n",
+            wt.path().display(),
+            td.target_path().display(),
+        );
+        let cfg = Config::parse(&toml).expect("link offer-exclude config parses");
+        let (_g, _s, backend, registry) = fresh_backend_registry();
+
+        let out = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+            .expect("link offer-exclude sync runs to deploy");
+        assert!(
+            !out.had_failures,
+            "a clean link offer-exclude deploy must not fail"
+        );
+
+        let dir_dst = td
+            .target_path()
+            .join(by_source().artifact_path("ed", "editor"));
+        let dir_is_symlink =
+            std::fs::symlink_metadata(&dir_dst).is_ok_and(|m| m.file_type().is_symlink());
+        assert!(
+            !dir_is_symlink,
+            "an offer-excluded physical child must block the dir symlink so the excluded child \
+             cannot leak through it; the dir must NOT be one symlink"
+        );
+
+        let kept = td
+            .target_path()
+            .join(by_source().artifact_path("ed", "editor/a.md"));
+        assert!(
+            std::fs::symlink_metadata(&kept)
+                .expect("kept leaf editor/a.md symlink present")
+                .file_type()
+                .is_symlink(),
+            "a collapse-blocked link must deploy individual per-leaf symlinks"
+        );
+        let excluded = td
+            .target_path()
+            .join(by_source().artifact_path("ed", "editor/secret"));
+        assert!(
+            std::fs::symlink_metadata(&excluded).is_err(),
+            "the offer-excluded leaf editor/secret must be absent on disk"
+        );
+
+        let recs = records(&registry, "dest");
+        let keys: BTreeSet<String> = recs.iter().map(|r| r.key.artifact.clone()).collect();
+        assert!(
+            !keys.contains("editor/secret"),
+            "the offer-excluded leaf must not be recorded; got {keys:?}"
+        );
+    }
 }

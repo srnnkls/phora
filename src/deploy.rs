@@ -507,9 +507,23 @@ pub fn deploy_artifact(
 }
 
 #[cfg(unix)]
-use std::os::unix::fs::symlink as symlink_dir_impl;
+use std::os::unix::fs::symlink as symlink_unix;
 #[cfg(windows)]
-use std::os::windows::fs::symlink_dir as symlink_dir_impl;
+use std::os::windows::fs::{symlink_dir, symlink_file};
+
+#[cfg(unix)]
+fn create_symlink(target: &Path, link: &Path, _is_file: bool) -> std::io::Result<()> {
+    symlink_unix(target, link)
+}
+
+#[cfg(windows)]
+fn create_symlink(target: &Path, link: &Path, is_file: bool) -> std::io::Result<()> {
+    if is_file {
+        symlink_file(target, link)
+    } else {
+        symlink_dir(target, link)
+    }
+}
 
 /// Crash-safe symlink deploy: stage a fresh symlink beside `dst`, journal the
 /// intent, then atomically `rename` it over `dst`. No copy/swap is involved —
@@ -548,7 +562,8 @@ pub fn link_artifact(
     cleanup.track(backup_path(staging_base, dst));
     cleanup.prune_base_if_empty(staging_base.to_path_buf());
 
-    symlink_dir_impl(target, &staging).map_err(|e| {
+    let is_file = matches!(record.kind, crate::store::RecordKind::File);
+    create_symlink(target, &staging, is_file).map_err(|e| {
         Error::Projection(format!(
             "symlink {} -> {}: {e}",
             staging.display(),

@@ -376,18 +376,22 @@ fn collect_records(artifacts_dir: &Path, out: &mut Vec<RegistryRecord>) -> Resul
         if !source.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
-        let source_path = source.path();
-        let files = std::fs::read_dir(&source_path).map_err(|e| {
-            StoreError::Registry(format!("read dir {}: {e}", source_path.display()))
-        })?;
-        for file in files {
-            let file = file.map_err(|e| {
-                StoreError::Registry(format!("read entry in {}: {e}", source_path.display()))
-            })?;
-            let path = file.path();
-            if path.extension().is_some_and(|ext| ext == "toml") {
-                out.push(read_record(&path)?);
-            }
+        collect_records_under(&source.path(), out)?;
+    }
+    Ok(())
+}
+
+fn collect_records_under(dir: &Path, out: &mut Vec<RegistryRecord>) -> Result<()> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| StoreError::Registry(format!("read dir {}: {e}", dir.display())))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|e| StoreError::Registry(format!("read entry in {}: {e}", dir.display())))?;
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            collect_records_under(&path, out)?;
+        } else if path.extension().is_some_and(|ext| ext == "toml") {
+            out.push(read_record(&path)?);
         }
     }
     Ok(())
