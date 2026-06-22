@@ -14,6 +14,7 @@ mod tests;
 mod transitive_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 use serde::Deserialize;
 
@@ -31,6 +32,15 @@ pub use source::{DeployMode, ParsedSource, Refspec, Remote, Source, SourceMode};
 pub use target::{
     Binding, LayoutConfig, LayoutKind, ResolvedBinding, SourceFields, Target, TemplateOptIn,
 };
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Paths {
+    #[serde(default)]
+    pub cache: Option<PathBuf>,
+    #[serde(default)]
+    pub state: Option<PathBuf>,
+}
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -60,6 +70,8 @@ pub struct Config {
     pub targets: BTreeMap<String, Target>,
     #[serde(default)]
     pub defaults: Defaults,
+    #[serde(default)]
+    pub paths: Paths,
     #[serde(default)]
     pub hooks: Option<GlobalHooks>,
     #[serde(default)]
@@ -484,6 +496,12 @@ pub fn merge_configs(base: Config, local: Option<Config>) -> Config {
     }
     if local.defaults.auto_target.is_some() {
         merged.defaults.auto_target = local.defaults.auto_target;
+    }
+    if local.paths.cache.is_some() {
+        merged.paths.cache = local.paths.cache;
+    }
+    if local.paths.state.is_some() {
+        merged.paths.state = local.paths.state;
     }
     if local.hooks.is_some() {
         merged.hooks = local.hooks;

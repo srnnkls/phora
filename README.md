@@ -67,6 +67,20 @@ Phora keeps its shared state in two XDG-rooted trees:
 | Cache | git mirrors (regenerable)          | `XDG_CACHE_HOME` | `~/.cache/phora`       | `~/Library/Caches/phora`              |
 | State | registry (deploy journal, locks)   | `XDG_STATE_HOME` | `~/.local/state/phora` | `~/Library/Application Support/phora` |
 
+A project may pin either root in `phora.toml` with a `[paths]` table — `cache` and
+`state` are optional and independent — which makes project-local installs and
+hermetic tests possible without exporting the XDG vars:
+
+```toml
+[paths]
+cache = ".phora/cache"   # git mirrors live under <root>/git/
+state = ".phora/state"   # registry, locks, and journal live under <root>/projects/
+```
+
+A configured path is itself the root: relative values resolve under the project
+root, absolute values are used as-is, and no `phora` leaf is appended. Resolution
+precedence is config, then the `XDG_*` env, then the platform default.
+
 An `XDG_*` override is honored only when absolute (per the XDG spec); a relative
 value is ignored and the platform default applies. macOS has no native state
 directory, so the state root falls back to `~/Library/Application Support`.

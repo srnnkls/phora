@@ -8,7 +8,7 @@ use crate::deploy::check_artifact_state;
 use crate::error::{Error, Result};
 use crate::kernel::Selection;
 use crate::lock::{Lock, merge_locks};
-use crate::paths::cache_root;
+use crate::paths::cache_root_for;
 use crate::source::SourceBackend;
 use crate::store::Registry;
 use crate::sync::{PreviewTargetPlan, preview_targets, resolved_remotes};
@@ -19,7 +19,7 @@ use super::{build_router, load_config, load_local_config, load_locks, open_proje
 pub(super) fn run_list(plan: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let config = merge_configs(load_config()?, load_local_config(&cwd)?);
-    let registry = open_project_registry()?;
+    let registry = open_project_registry(&config)?;
     if plan {
         println!("plan: run `phora sync` to apply pending changes");
         return Ok(());
@@ -43,7 +43,8 @@ pub(super) fn run_preview(sel: &PreviewSelectors, json: bool) -> Result<()> {
         |base| Some(merge_locks(&base, local_lock.as_ref())),
     );
 
-    let backend = build_router(&config, cache_root()?.join("git"))?;
+    let cache_git = cache_root_for(config.paths.cache.as_deref(), &cwd)?.join("git");
+    let backend = build_router(&config, cache_git)?;
     let plan = preview_plan(&config, &parsed, &remotes, &backend, lock.as_ref(), sel)?;
 
     print!(

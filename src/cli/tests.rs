@@ -5161,7 +5161,8 @@ fn rebuild_over_merged_vars_agrees_with_deployed_vars_digest() {
              renders motd with the MERGED greeting"
         );
 
-        let reg = open_project_registry().expect("open project registry");
+        let reg = open_project_registry(&load_config().expect("load config"))
+            .expect("open project registry");
         let deployed_vd = reg
             .get(&key)
             .expect("registry get")
@@ -5176,7 +5177,8 @@ fn rebuild_over_merged_vars_agrees_with_deployed_vars_digest() {
 
         super::sync::run_rebuild_registry().expect("rebuild reconstructs the dropped record");
 
-        let reg = open_project_registry().expect("reopen project registry");
+        let reg = open_project_registry(&load_config().expect("load config"))
+            .expect("reopen project registry");
         let rebuilt_vd = reg
             .get(&key)
             .expect("registry get after rebuild")

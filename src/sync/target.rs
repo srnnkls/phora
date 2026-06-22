@@ -610,7 +610,9 @@ mod confine_fail_closed_tests {
     fn composed_target_missing_its_confine_anchor_fails_closed() {
         let outside = Path::new("/home/u/.ssh/authorized_keys");
         let target = composed_target_without_anchor(outside);
-        let protected = ProtectedPathSet::resolve(Path::new("/home/u/proj")).expect("protected");
+        let protected =
+            ProtectedPathSet::resolve(&crate::config::Paths::default(), Path::new("/home/u/proj"))
+                .expect("protected");
         let parsed = BTreeMap::new();
         let commits = BTreeMap::new();
         let remotes = BTreeMap::new();

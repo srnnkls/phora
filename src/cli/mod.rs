@@ -52,7 +52,7 @@ use clap::{Parser, Subcommand};
 use crate::config::{Config, ParsedSource, merge_configs};
 use crate::error::{Error, Result};
 use crate::kernel::{ProjectId, SourceName, TargetName};
-use crate::paths::state_root;
+use crate::paths::state_root_for;
 use crate::source::{GitBackend, HttpBackend, RouterBackend};
 use crate::store::{FileRegistry, StoreError};
 use crate::sync::{Conflict, ConflictResolver, Resolution};
@@ -309,7 +309,8 @@ pub fn run(cli: Cli) -> Result<()> {
                 artifact,
                 commit,
             };
-            let matches = where_cmd(&open_project_registry()?, &filter)?;
+            let config = load_config()?;
+            let matches = where_cmd(&open_project_registry(&config)?, &filter)?;
             render::print_where_matches(&matches, &filter);
             Ok(())
         }
@@ -319,7 +320,7 @@ pub fn run(cli: Cli) -> Result<()> {
             target,
         } => {
             let config = load_config()?;
-            let registry = open_project_registry()?;
+            let registry = open_project_registry(&config)?;
             let _guard = registry.lock_exclusive()?;
             crate::sync::eject(&config, &registry, &artifact, &source, &target)?;
             println!("ejected {source}/{artifact} from {target} (files kept)");
@@ -331,7 +332,7 @@ pub fn run(cli: Cli) -> Result<()> {
             target,
         } => {
             let config = load_config()?;
-            let registry = open_project_registry()?;
+            let registry = open_project_registry(&config)?;
             let _guard = registry.lock_exclusive()?;
             crate::sync::uneject(&config, &registry, &artifact, &source, &target)?;
             println!("unejected {source}/{artifact} in {target}");
@@ -412,7 +413,7 @@ fn dispatch_add(cmd: Command) -> Result<()> {
 
 fn run_verify() -> Result<()> {
     let config = load_config()?;
-    let mismatches = crate::sync::verify(&config, &open_project_registry()?)?;
+    let mismatches = crate::sync::verify(&config, &open_project_registry(&config)?)?;
     render::print_verify(&mismatches);
     if mismatches.is_empty() {
         Ok(())
@@ -534,9 +535,10 @@ fn run_target(cmd: TargetCmd) -> Result<()> {
             Ok(())
         }
         TargetCmd::Show { name } => {
+            let config = load_config()?;
             render::print_target_detail(&target_detail(
-                &load_config()?,
-                &open_project_registry()?,
+                &config,
+                &open_project_registry(&config)?,
                 &name,
             )?);
             Ok(())
@@ -563,7 +565,7 @@ fn run_target_add(name: &str, path: &str, layout: Option<&str>, local: bool) -> 
 }
 
 fn run_target_rm(name: &str, local: bool) -> Result<()> {
-    if target_has_deployed_artifacts(&open_project_registry()?, name)? {
+    if target_has_deployed_artifacts(&open_project_registry(&load_config()?)?, name)? {
         render::warn_target_rm_deployed(name);
     }
     let file = target_config_file(local);
@@ -689,9 +691,12 @@ impl ConflictResolver for TtyResolver {
     }
 }
 
-fn open_project_registry() -> Result<FileRegistry> {
-    let project = ProjectId::for_path(&std::env::current_dir()?)?;
-    let registry_root = state_root()?.join("projects").join(project.as_str());
+fn open_project_registry(config: &Config) -> Result<FileRegistry> {
+    let cwd = std::env::current_dir()?;
+    let project = ProjectId::for_path(&cwd)?;
+    let registry_root = state_root_for(config.paths.state.as_deref(), &cwd)?
+        .join("projects")
+        .join(project.as_str());
     Ok(FileRegistry::open(registry_root)?)
 }
 

@@ -10,6 +10,14 @@ version = 1
 [defaults]
 auto_target = true
 
+# Pin where phora keeps its git-mirror cache and per-project state, overriding the
+# XDG env vars and platform defaults. Both keys are optional and independent. A
+# relative value resolves under the project root; an absolute value is used as-is.
+# The configured path IS the root (no `phora` leaf is appended).
+# [paths]
+# cache = ".phora/cache"   # git mirrors live under <root>/git/
+# state = ".phora/state"   # registry/locks/journal live under <root>/projects/
+
 # github, gitlab, codeberg, sr.ht, bitbucket ship built in (both https + ssh),
 # so a `[hosts]` block is only needed to add a forge or override auth/remote.
 [hosts.github]

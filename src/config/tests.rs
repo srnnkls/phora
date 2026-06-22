@@ -574,6 +574,103 @@ include = []
 }
 
 #[test]
+fn parses_paths_table_cache_and_state() {
+    let config = Config::parse(
+        r#"
+version = 1
+
+[paths]
+cache = ".phora/cache"
+state = ".phora/state"
+"#,
+    )
+    .expect("a [paths] table parses");
+    assert_eq!(
+        config.paths.cache.as_deref(),
+        Some(Path::new(".phora/cache"))
+    );
+    assert_eq!(
+        config.paths.state.as_deref(),
+        Some(Path::new(".phora/state"))
+    );
+}
+
+#[test]
+fn paths_keys_are_independent_and_optional() {
+    let config = Config::parse(
+        r#"
+version = 1
+
+[paths]
+cache = ".phora/cache"
+"#,
+    )
+    .expect("a [paths] table with only cache parses");
+    assert_eq!(
+        config.paths.cache.as_deref(),
+        Some(Path::new(".phora/cache"))
+    );
+    assert!(
+        config.paths.state.is_none(),
+        "an omitted state key must stay None, independent of cache"
+    );
+}
+
+#[test]
+fn paths_defaults_to_empty_when_table_absent() {
+    let config = Config::parse("version = 1\n").expect("no [paths] table parses");
+    assert!(config.paths.cache.is_none() && config.paths.state.is_none());
+}
+
+#[test]
+fn paths_rejects_unknown_key() {
+    Config::parse(
+        r#"
+version = 1
+
+[paths]
+bogus = "x"
+"#,
+    )
+    .expect_err("an unknown key under [paths] must be rejected by deny_unknown_fields");
+}
+
+#[test]
+fn merge_local_paths_key_overrides_base_per_key() {
+    let base = Config::parse(
+        r#"
+version = 1
+
+[paths]
+cache = "base/cache"
+state = "base/state"
+"#,
+    )
+    .expect("base parses");
+    let local = Config::parse(
+        r#"
+version = 1
+
+[paths]
+cache = "local/cache"
+"#,
+    )
+    .expect("local parses");
+
+    let effective = merge_configs(base, Some(local));
+    assert_eq!(
+        effective.paths.cache.as_deref(),
+        Some(Path::new("local/cache")),
+        "a local cache key must override the base cache key"
+    );
+    assert_eq!(
+        effective.paths.state.as_deref(),
+        Some(Path::new("base/state")),
+        "an omitted local state key must keep the base state value"
+    );
+}
+
+#[test]
 fn merge_adds_local_only_source() {
     let base = Config::parse(EXAMPLE_TOML).expect("base parses");
     let local = Config::parse(
