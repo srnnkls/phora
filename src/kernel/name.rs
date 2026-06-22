@@ -30,7 +30,7 @@ pub(crate) fn safe_component(name: &str) -> std::result::Result<&str, KernelErro
     Ok(name)
 }
 
-pub fn safe_relpath(path: &str) -> std::result::Result<&str, KernelError> {
+pub(crate) fn safe_relpath(path: &str) -> std::result::Result<&str, KernelError> {
     if path.contains('\0') {
         return Err(KernelError::UnsafeComponent(path.to_owned()));
     }

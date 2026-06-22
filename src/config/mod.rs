@@ -321,8 +321,8 @@ fn reject_malformed_take_entries<'a>(
         let target::TakeEntry::Leaf(pattern) = entry else {
             continue;
         };
-        if is_glob(pattern)
-            && let Err(e) = globset::Glob::new(pattern)
+        if crate::kernel::is_take_glob(pattern)
+            && let Err(e) = crate::kernel::compile_take_glob(pattern)
         {
             return Err(Error::Config(format!(
                 "`take` entry `{pattern}` is not a well-formed glob: {e}"
@@ -330,10 +330,6 @@ fn reject_malformed_take_entries<'a>(
         }
     }
     Ok(())
-}
-
-fn is_glob(pattern: &str) -> bool {
-    pattern.ends_with('/') || pattern.contains(['*', '?', '[', ']'])
 }
 
 const BINDING_SCOPE_KEYS: [&str; 4] = ["root", "include", "exclude", "map"];
