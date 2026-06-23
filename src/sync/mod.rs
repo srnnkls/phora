@@ -530,7 +530,7 @@ fn sealed_offer_diagnostic(target: &str, source: &str, artifact: &str) -> Error 
         did_you_mean: None,
         remedy: "restore the artifact to the source's offer, or eject it before removing it"
             .to_string(),
-        debug_hint: None,
+        debug_hint: Some(format!("phora explain {target} {source} {artifact}")),
     }
     .sync()
 }

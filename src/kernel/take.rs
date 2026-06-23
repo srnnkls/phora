@@ -209,6 +209,8 @@ fn require_offered(entry: &str, offered: &BTreeSet<&str>) -> Result<()> {
     }
 }
 
+const KERNEL_ATTRIBUTION_HINT: &str = "phora explain <target> <source> <path>";
+
 fn non_offered_diagnostic(entry: &str, offered: &BTreeSet<&str>) -> crate::error::Error {
     SelectionDiagnostic {
         entry: entry.to_string(),
@@ -216,7 +218,7 @@ fn non_offered_diagnostic(entry: &str, offered: &BTreeSet<&str>) -> crate::error
         why: "not present in the offer; `take` may not widen the offer".to_string(),
         did_you_mean: crate::diagnostic::did_you_mean(entry, offered.iter().copied()),
         remedy: "name a leaf the source offers, or add it to the source's include".to_string(),
-        debug_hint: None,
+        debug_hint: Some(KERNEL_ATTRIBUTION_HINT.to_string()),
     }
     .sync()
 }
@@ -228,7 +230,7 @@ fn literal_and_rename_diagnostic(leaf: &str) -> crate::error::Error {
         why: "named both as a literal `take` and as a rename source".to_string(),
         did_you_mean: None,
         remedy: "keep the leaf either literally or as a rename source, not both".to_string(),
-        debug_hint: None,
+        debug_hint: Some(KERNEL_ATTRIBUTION_HINT.to_string()),
     }
     .sync()
 }
@@ -245,7 +247,7 @@ fn rename_fan_out_diagnostic(src: &str, first: &str, second: &str) -> crate::err
         why: "renamed to two different destinations".to_string(),
         did_you_mean: None,
         remedy: format!("keep one rename of `{src}`: either `{a}` or `{b}`, not both"),
-        debug_hint: None,
+        debug_hint: Some(KERNEL_ATTRIBUTION_HINT.to_string()),
     }
     .sync()
 }
@@ -257,7 +259,7 @@ fn unsafe_dest_diagnostic(dest: &str) -> crate::error::Error {
         why: "rename destination is not a portable relative path".to_string(),
         did_you_mean: None,
         remedy: "use a forward-slashed relative path inside the deploy root".to_string(),
-        debug_hint: None,
+        debug_hint: Some(KERNEL_ATTRIBUTION_HINT.to_string()),
     }
     .sync()
 }
@@ -276,7 +278,7 @@ fn duplicate_dest_diagnostic(first: &str, second: &str) -> crate::error::Error {
         why: "two distinct sources resolve to the same destination".to_string(),
         did_you_mean: None,
         remedy: "rename one source so each kept leaf lands at a distinct path".to_string(),
-        debug_hint: None,
+        debug_hint: Some(KERNEL_ATTRIBUTION_HINT.to_string()),
     }
     .sync()
 }
@@ -284,7 +286,7 @@ fn duplicate_dest_diagnostic(first: &str, second: &str) -> crate::error::Error {
 #[cfg(test)]
 mod take_resolution_tests {
     use super::{Take, TakeWarning, is_take_glob, resolve_take};
-    use crate::diagnostic::{DID_YOU_MEAN, MATCHED_AGAINST, REMEDY, SELECTION};
+    use crate::diagnostic::{DID_YOU_MEAN, MATCHED_AGAINST, REMEDY, SELECTION, TO_DEBUG};
 
     fn offer(leaves: &[&str]) -> Vec<String> {
         leaves.iter().map(|s| (*s).to_string()).collect()
@@ -336,7 +338,7 @@ mod take_resolution_tests {
     }
 
     fn assert_named_diagnostic(rendered: &str, entry: &str) {
-        for phrase in [SELECTION, MATCHED_AGAINST, REMEDY] {
+        for phrase in [SELECTION, MATCHED_AGAINST, REMEDY, TO_DEBUG] {
             assert!(
                 rendered.contains(phrase),
                 "the rejection must render the named phrase `{phrase}`; got:\n{rendered}"
@@ -346,6 +348,36 @@ mod take_resolution_tests {
             rendered.contains(entry),
             "the rejection must name the offending entry `{entry}`; got:\n{rendered}"
         );
+        assert!(
+            rendered.contains("to debug: phora explain <target> <source> <path>"),
+            "every kernel take rejection must point at the attribution command with explicit \
+             placeholders the kernel cannot fill; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn each_take_rejection_ends_with_the_attribution_debug_command() {
+        let offer = offer(&["present.md"]);
+        let renderings = [
+            rendered_error(&offer, &[Take::Literal("absent.md")]),
+            rendered_error(
+                &offer,
+                &[Take::Rename {
+                    src: "present.md",
+                    dest: "../escape",
+                }],
+            ),
+        ];
+        for rendered in renderings {
+            let to_debug = rendered
+                .lines()
+                .find(|line| line.starts_with(TO_DEBUG))
+                .unwrap_or_else(|| panic!("a `{TO_DEBUG}` line must exist; got:\n{rendered}"));
+            assert_eq!(
+                to_debug, "to debug: phora explain <target> <source> <path>",
+                "kernel-site debug hints must use the placeholder attribution form verbatim"
+            );
+        }
     }
 
     // ---- 1. set composition is order-independent ----

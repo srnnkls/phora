@@ -198,7 +198,7 @@ fn partial_take_collapse_diagnostic(dir: &str) -> Error {
             .to_owned(),
         did_you_mean: None,
         remedy: "take the whole directory, or omit `collapse`".to_owned(),
-        debug_hint: None,
+        debug_hint: Some("phora preview --files".to_owned()),
     }
     .sync()
 }
@@ -261,27 +261,27 @@ pub fn resolve_target_plan(
         .iter()
         .map(resolve_binding_plan)
         .collect::<Result<Vec<_>>>()?;
-    reject_cross_binding_dups(&bindings)?;
+    reject_cross_binding_dups(target_name, &bindings)?;
     Ok(TargetPlan {
         target: target_name.to_owned(),
         bindings,
     })
 }
 
-fn reject_cross_binding_dups(bindings: &[ResolvedBindingPlan]) -> Result<()> {
+fn reject_cross_binding_dups(target_name: &str, bindings: &[ResolvedBindingPlan]) -> Result<()> {
     let mut seen: BTreeMap<String, String> = BTreeMap::new();
     for binding in bindings {
         for item in &binding.items {
             let dest = item.destination.to_string_lossy().into_owned();
             if let Some(first) = seen.insert(fold_dest(&dest), dest.clone()) {
-                return Err(cross_binding_dup_diagnostic(&first, &dest));
+                return Err(cross_binding_dup_diagnostic(target_name, &first, &dest));
             }
         }
     }
     Ok(())
 }
 
-fn cross_binding_dup_diagnostic(first: &str, second: &str) -> Error {
+fn cross_binding_dup_diagnostic(target_name: &str, first: &str, second: &str) -> Error {
     let entry = if first <= second {
         format!("{first} / {second}")
     } else {
@@ -293,7 +293,7 @@ fn cross_binding_dup_diagnostic(first: &str, second: &str) -> Error {
         why: "two bindings resolve to the same destination".to_string(),
         did_you_mean: None,
         remedy: "rename one source's leaf, or separate the bindings under the layout".to_string(),
-        debug_hint: None,
+        debug_hint: Some(format!("phora preview --target {target_name}")),
     }
     .sync()
 }
@@ -434,7 +434,7 @@ mod leaf_granular_resolver_tests {
     use std::path::{Path, PathBuf};
 
     use crate::config::{DeployMode, LayoutConfig, ParsedSource, Source, TakeEntry, TemplateOptIn};
-    use crate::diagnostic::{MATCHED_AGAINST, REMEDY, SELECTION};
+    use crate::diagnostic::{MATCHED_AGAINST, REMEDY, SELECTION, TO_DEBUG};
     use crate::kernel::Materialization;
 
     use super::{BindingPlanInput, PlannedItem, ResolvedBindingPlan, resolve_binding_plan};
@@ -563,7 +563,7 @@ mod leaf_granular_resolver_tests {
     }
 
     fn assert_named_diagnostic(rendered: &str, entry: &str) {
-        for phrase in [SELECTION, MATCHED_AGAINST, REMEDY] {
+        for phrase in [SELECTION, MATCHED_AGAINST, REMEDY, TO_DEBUG] {
             assert!(
                 rendered.contains(phrase),
                 "the rejection must render `{phrase}`; got:\n{rendered}"
@@ -760,6 +760,10 @@ mod leaf_granular_resolver_tests {
             )
             .to_string();
         assert_named_diagnostic(&rendered, "d");
+        assert!(
+            rendered.contains("to debug: phora preview --files"),
+            "a partial-take collapse block must point at the preview command; got:\n{rendered}"
+        );
     }
 
     #[test]
@@ -870,6 +874,11 @@ mod leaf_granular_resolver_tests {
             )
             .to_string();
         assert_named_diagnostic(&rendered, "shared.md");
+        assert!(
+            rendered.contains("to debug: phora preview --target home"),
+            "a cross-binding dup must point at the preview command scoped to the offending \
+             target; got:\n{rendered}"
+        );
     }
 
     #[test]
