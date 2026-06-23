@@ -49,9 +49,37 @@ impl fmt::Display for SelectionDiagnostic {
     }
 }
 
+/// `None` (not an empty Vec) when nothing is close, so a diagnostic omits its line.
+#[must_use]
+pub fn did_you_mean<'a>(
+    entry: &str,
+    candidates: impl IntoIterator<Item = &'a str>,
+) -> Option<Vec<String>> {
+    let bound = (entry.chars().count() / 3).max(2);
+    let mut scored: Vec<(usize, &str)> = candidates
+        .into_iter()
+        .filter(|cand| *cand != entry)
+        .filter_map(|cand| {
+            let dist = strsim::levenshtein(entry, cand);
+            (dist <= bound).then_some((dist, cand))
+        })
+        .collect();
+    scored.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+    scored.truncate(3);
+    (!scored.is_empty()).then(|| {
+        scored
+            .into_iter()
+            .map(|(_, cand)| cand.to_owned())
+            .collect()
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DID_YOU_MEAN, MATCHED_AGAINST, REMEDY, SELECTION, SelectionDiagnostic, TO_DEBUG};
+    use super::{
+        DID_YOU_MEAN, MATCHED_AGAINST, REMEDY, SELECTION, SelectionDiagnostic, TO_DEBUG,
+        did_you_mean,
+    };
     use crate::error::Error;
 
     fn populated() -> SelectionDiagnostic {
@@ -277,6 +305,38 @@ mod tests {
         assert!(
             suggestion_line.contains("emacs"),
             "the second suggestion must appear after the `{DID_YOU_MEAN}` phrase; got:\n{suggestion_line}"
+        );
+    }
+
+    #[test]
+    fn did_you_mean_orders_by_distance_then_lexically_and_caps_at_three() {
+        let candidates = [
+            "init.lua",
+            "innit.lua",
+            "keymaps.lua",
+            "imit.lua",
+            "irit.lua",
+        ];
+        let got = did_you_mean("init.lua", candidates).expect("close candidates exist");
+        assert_eq!(
+            got,
+            vec![
+                "imit.lua".to_string(),
+                "innit.lua".to_string(),
+                "irit.lua".to_string()
+            ],
+            "the three distance-1 candidates are returned lexically ordered and capped at three; \
+             the self-match `init.lua` and the far `keymaps.lua` are excluded"
+        );
+    }
+
+    #[test]
+    fn did_you_mean_excludes_the_entry_itself_and_far_candidates_returning_none() {
+        assert_eq!(
+            did_you_mean("editor", ["editor", "wholly-different-name"]),
+            None,
+            "an exact self-match is not a suggestion and a far candidate is out of bound, so \
+             nothing close remains -> None (omits the diagnostic line)"
         );
     }
 }
