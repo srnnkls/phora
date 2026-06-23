@@ -2,7 +2,7 @@ use std::path::Path;
 
 use crate::error::{Error, Result};
 
-pub(super) fn discover_working_tree_leaves(git: &Path, root: Option<&Path>) -> Result<Vec<String>> {
+pub(crate) fn discover_working_tree_leaves(git: &Path, root: Option<&Path>) -> Result<Vec<String>> {
     let base = root.map_or_else(|| git.to_path_buf(), |r| git.join(r));
     let mut leaves = Vec::new();
     collect_working_tree_leaves(&base, Path::new(""), &mut leaves)?;

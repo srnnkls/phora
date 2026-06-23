@@ -8,8 +8,9 @@ use crate::error::{Error, Result};
 use crate::sync::{HookOutcome, HookScope, HookStatus, SyncState};
 
 use super::query::{
-    CheckMatchReport, PreviewPlan, SourceResolution, SourceRow, SourceSummary, TargetDetail,
-    TargetListing, TargetRow, WhereFilter, WhereMatch,
+    CheckMatchReport, ExplainBody, ExplainReport, OfferAttribution, PreviewPlan, SourceResolution,
+    SourceRow, SourceSummary, TakeAttribution, TargetDetail, TargetListing, TargetRow, WhereFilter,
+    WhereMatch,
 };
 
 #[must_use]
@@ -144,6 +145,75 @@ pub(super) fn print_check_match(source: &ParsedSource, path: &str, report: &Chec
 
 fn allow_label(allowed: bool) -> &'static str {
     if allowed { "allowed" } else { "excluded" }
+}
+
+#[must_use]
+pub(crate) fn render_explain(report: &ExplainReport) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "{} under {}", report.source, report.target);
+    match &report.body {
+        ExplainBody::Path { path, offer, take } => {
+            render_offer(&mut out, path, offer);
+            if let Some(take) = take {
+                render_take(&mut out, take);
+            }
+        }
+        ExplainBody::Summary { leaves } => {
+            if leaves.is_empty() {
+                let _ = writeln!(out, "  offer is empty");
+            }
+            for leaf in leaves {
+                let _ = write!(out, "  {}: ", leaf.leaf);
+                render_take_inline(&mut out, &leaf.take);
+            }
+        }
+    }
+    for warning in &report.warnings {
+        let _ = writeln!(out, "  warning: {warning}");
+    }
+    out
+}
+
+fn render_offer(out: &mut String, path: &str, offer: &OfferAttribution) {
+    match offer {
+        OfferAttribution::Allowed { include: Some(inc) } => {
+            let _ = writeln!(out, "  offer: `{path}` allowed by include `{inc}`");
+        }
+        OfferAttribution::Allowed { include: None } => {
+            let _ = writeln!(out, "  offer: `{path}` allowed by the implicit-full offer");
+        }
+        OfferAttribution::Vetoed { exclude } => {
+            let _ = writeln!(out, "  offer: `{path}` vetoed by exclude `{exclude}`");
+        }
+        OfferAttribution::Outside { suggestions } => {
+            let _ = writeln!(out, "  offer: `{path}` is outside the offer");
+            if !suggestions.is_empty() {
+                let _ = writeln!(out, "  did you mean: {}", suggestions.join(", "));
+            }
+        }
+    }
+}
+
+fn render_take(out: &mut String, take: &TakeAttribution) {
+    let _ = write!(out, "  take: ");
+    render_take_inline(out, take);
+}
+
+fn render_take_inline(out: &mut String, take: &TakeAttribution) {
+    match take {
+        TakeAttribution::Identity { dest } => {
+            let _ = writeln!(out, "kept at `{dest}`");
+        }
+        TakeAttribution::Renamed { src, dest } => {
+            let _ = writeln!(out, "renamed `{src}` -> `{dest}`");
+        }
+        TakeAttribution::Collapsed { dir } => {
+            let _ = writeln!(out, "collapsed into directory `{dir}`");
+        }
+        TakeAttribution::Dropped => {
+            let _ = writeln!(out, "dropped by a narrowing take (not taken)");
+        }
+    }
 }
 
 pub(super) fn print_source_rows(rows: &[SourceRow]) {
@@ -352,6 +422,92 @@ pub(super) fn render_add_contribution(
         "Opt in with `imports = [\"{name}\"]`, then `phora trust` to admit any hooks."
     );
     out
+}
+
+#[cfg(test)]
+mod explain_render_tests {
+    use super::super::query::{ExplainBody, ExplainReport, OfferAttribution, TakeAttribution};
+    use super::render_explain;
+
+    fn report(body: ExplainBody, warnings: Vec<String>) -> ExplainReport {
+        ExplainReport {
+            target: "home".to_string(),
+            source: "dots".to_string(),
+            body,
+            warnings,
+        }
+    }
+
+    #[test]
+    fn allowed_path_names_target_source_include_and_identity_take() {
+        let rendered = render_explain(&report(
+            ExplainBody::Path {
+                path: "init.lua".to_string(),
+                offer: OfferAttribution::Allowed {
+                    include: Some("*.lua".to_string()),
+                },
+                take: Some(TakeAttribution::Identity {
+                    dest: "init.lua".to_string(),
+                }),
+            },
+            Vec::new(),
+        ));
+        for needle in ["dots", "home", "init.lua", "*.lua", "allowed", "kept"] {
+            assert!(
+                rendered.contains(needle),
+                "the rendering must surface `{needle}`; got:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn renamed_take_shows_src_to_dest_arrow() {
+        let rendered = render_explain(&report(
+            ExplainBody::Path {
+                path: "x.md".to_string(),
+                offer: OfferAttribution::Allowed { include: None },
+                take: Some(TakeAttribution::Renamed {
+                    src: "x.md".to_string(),
+                    dest: "renamed.md".to_string(),
+                }),
+            },
+            Vec::new(),
+        ));
+        assert!(
+            rendered.contains("x.md") && rendered.contains("renamed.md") && rendered.contains("->"),
+            "a rename must render `src -> dest`; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn outside_path_surfaces_did_you_mean_suggestion() {
+        let rendered = render_explain(&report(
+            ExplainBody::Path {
+                path: "init.lus".to_string(),
+                offer: OfferAttribution::Outside {
+                    suggestions: vec!["init.lua".to_string()],
+                },
+                take: None,
+            },
+            Vec::new(),
+        ));
+        assert!(
+            rendered.contains("outside") && rendered.contains("init.lua"),
+            "an outside path must be reported with its nearest suggestion; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn warnings_are_surfaced() {
+        let rendered = render_explain(&report(
+            ExplainBody::Summary { leaves: Vec::new() },
+            vec!["take glob `none/**` matched no offered leaf".to_string()],
+        ));
+        assert!(
+            rendered.contains("warning") && rendered.contains("none/**"),
+            "a carried plan warning must render; got:\n{rendered}"
+        );
+    }
 }
 
 #[cfg(test)]

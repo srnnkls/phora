@@ -214,6 +214,12 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Attribute a path's offer/take decision under a target, offline.
+    Explain {
+        target: String,
+        source: String,
+        path: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -375,6 +381,11 @@ pub fn run(cli: Cli) -> Result<()> {
             },
             json,
         ),
+        Command::Explain {
+            target,
+            source,
+            path,
+        } => query::run_explain(&target, &source, path.as_deref()),
     }
 }
 

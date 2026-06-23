@@ -10,9 +10,9 @@
 
 Phora is a git-based artifact package manager and multiplexer. It mirrors git repositories — or
 imports plain-https resources (tarballs, zips, single files) as content-addressed
-synthetic commits — picks out the top-level directories you want (*artifacts*),
-and projects them into local *target* directories, pinned to exact commits,
-verifiable by content hash, and recoverable after interruption.
+synthetic commits — picks out the paths you want (its *offer*) and projects them
+into local *target* directories, pinned to exact commits, verifiable by content
+hash, and recoverable after interruption.
 
 Use it to distribute shared config, editor setups, prompt/skill bundles, or release
 assets from one or more repos (or URLs) into the places on disk that consume them.
@@ -30,19 +30,22 @@ Requires a Rust toolchain (edition 2024).
 ## Concepts
 
 - *Source* — provenance: where bytes come from, pinned by `branch`, `tag`, or
-  `rev`. The top-level directories under its `root` are its artifacts. Declare its
-  remote as a forge (`host` + `repo`), a local path (`path = "/dir"`), a literal git
-  URL (`git = "…"`), or a downloadable resource (`url = "https://…"`). A source may
-  also carry intrinsic selection defaults (`root`/`include`/`exclude`).
-- *Artifact* — one top-level directory in a source (dotfiles are skipped). Glob
-  `include`/`exclude` rules select which artifacts and which files within them ship.
+  `rev`. A source owns its *offer*: `root` re-anchors the slice and
+  `include`/`exclude` (gitignore syntax) compose `include − exclude` into the leaf
+  set the source publishes. Declare its remote as a forge (`host` + `repo`), a local
+  path (`path = "/dir"`), a literal git URL (`git = "…"`), or a downloadable resource
+  (`url = "https://…"`).
+- *Offer* — the leaf set a source publishes, named relative to its `root`. With no
+  `include` the offer is everything in the source minus VCS metadata (`.git/`); an
+  `include` narrows it and `exclude` prunes it (exclude wins; no `!` re-inclusion).
+  Dotfiles match like any other path.
+- *Artifact* — one offered leaf, identified by its full offered path. The unit a
+  target takes, renames, and deploys.
 - *Target* — a local directory artifacts are projected into, with a chosen
   layout. A target draws from its explicit `sources` allow-list.
-- *Binding* — a target's link to a source. Selection lives here per consumer: a
-  target's `sources` is either a flat list of bare source names (inherit the
-  source's defaults) or a keyed `[targets.<t>.sources]` table whose key is the
-  binding identity and whose value refines `root`/`include`/`exclude` for that
-  target alone. See [Bindings](#bindings).
+- *Binding* — a target's link to a source. The source owns the offer; the binding
+  owns the *take*: its `take` subsets and renames the offer for that target alone,
+  and `collapse` controls how the taken set materializes. See [Bindings](#bindings).
 - *Transitive dependency* — a source that is itself a phora project. Mark it
   `transitive = true`, import it into a target with `imports = [...]`, and its own
   `phora.toml` targets compose into your workspace under that target's path. See
@@ -57,6 +60,15 @@ Requires a Rust toolchain (edition 2024).
   (`XDG_CACHE_HOME` or, by default, `~/.cache/phora` on Linux and
   `~/Library/Caches/phora` on macOS), in its `git/` subdirectory. See
   [State & locations](#state--locations).
+
+The model splits cleanly into who-owns-what:
+
+| Term     | Owner  | What it does                                                        |
+| -------- | ------ | ------------------------------------------------------------------- |
+| offer    | source | the published leaf set: `include − exclude` (gitignore), under `root`; no `include` ⇒ everything minus `.git/` |
+| take     | target | subsets and renames the offer per binding (literal / glob / `{ src = dest }`) |
+| artifact | —      | one leaf, identified by its full offered path                       |
+| collapse | target | how a taken set materializes: per-leaf, or one dir symlink/subtree  |
 
 ### State & locations
 
@@ -103,12 +115,11 @@ phora add git@github.com:me/dotfiles.git --tag v1.2
 # Deep GitLab subgroups go in the config `repo` field (repo = "group/sub/proj"),
 # not the colon alias (segments past owner/repo become `root`).
 
-# Bind sources to a target; refinement flags scope the binding to that target
-phora bind dotfiles --to neovim                          # bare binding, inherits source
-phora bind dotfiles --to neovim --as nvim --root nvim    # refined slice, identity `nvim`
+# Bind sources to a target; --take subsets/renames the offer for that target
+phora bind dotfiles --to neovim                          # bare binding, takes the whole offer
+phora bind dotfiles --to neovim --as nvim --take nvim/**  # take just nvim/** under identity `nvim`
 phora unbind nvim --from neovim                          # remove a binding by identity
-# `phora add <url> --to <target>` takes the same refinement flags; with --to present,
-# --root scopes the binding (a bare add keeps --root on the source).
+# --root/--include/--exclude on `add` shape the SOURCE offer (source-owned), not a binding.
 phora add me/dotfiles --to neovim --as nvim --root nvim
 
 # Fetch sources, resolve commits, project artifacts into targets
@@ -144,6 +155,7 @@ phora uneject <artifact> --source <source> --target <target>
 # Maintenance / debugging
 phora rebuild-registry      # reconstruct registry from lock + on-disk targets
 phora check-match --source <source> <path>   # debug include/exclude matching
+phora explain <target> <source> [path]       # offline: which include/exclude offered a path, and how `take` resolves it
 ```
 
 ### Sources, targets, and bindings
@@ -342,8 +354,8 @@ auth = { type = "token", env = "GITHUB_TOKEN" }   # remote is built in; just add
 host = "github"          # forge remote: host + repo (or use git = "…" for a literal URL)
 repo = "me/dotfiles"
 branch = "main"          # or tag = "...", or rev = "<sha>" (pick one)
-root = "modules"         # repo subdirectory to treat as the artifact root
-include = ["editor"]     # optional artifact/path globs
+root = "modules"         # re-anchor the offer at this subdirectory
+include = ["editor"]     # source-owned offer: include − exclude (gitignore)
 exclude = ["**/*.bak"]
 
 [targets.neovim]
@@ -374,9 +386,9 @@ Hosts supply remote templates and auth. `github`, `gitlab`, `codeberg`,
 adds a new forge or overrides a built-in's `remote`/`auth`. Auth is either
 `{ type = "token", env = "VAR" }` or `{ type = "ssh", key = "~/.ssh/key" }`.
 
-Source flags: `allow_symlinks`, `allow_submodules` (both default off),
-`preserve_executable` (default on), `deploy` (`"copy"` | `"link"`, default
-`"copy"`; `"link"` is local-overlay-only — see [Link mode](#link-mode-local-development)).
+Source flags: `allow_symlinks` (default off), `preserve_executable` (default on),
+`deploy` (`"copy"` | `"link"`, default `"copy"`; `"link"` is local-overlay-only — see
+[Link mode](#link-mode-local-development)).
 
 Layouts decide how an artifact `a` from a binding `i` (its identity — the
 `[targets.<t>.sources]` table key, defaulting to the source name) is placed in a target:
@@ -390,55 +402,76 @@ Layouts decide how an artifact `a` from a binding `i` (its identity — the
 ### Bindings
 
 A target's `sources` says which sources it consumes — and, per source, how. Each
-entry is a binding: the edge from a target to a source. A source defines
-provenance plus intrinsic selection defaults; a binding refines that selection for
-one target without touching the source or any other target.
+entry is a binding: the edge from a target to a source. The source owns the offer
+(`root`/`include`/`exclude`); the binding owns the take — `take` subsets and renames
+that offer for one target, without touching the source or any other target.
 
 A target's `sources` takes one of two forms — never both at once:
 
 - Flat list of bare names — `sources = ["dotfiles", "loqui"]`. Every source is
-  consumed with its intrinsic `root`/`include`/`exclude` defaults. This is the
-  all-bare, zero-settings form (each element is equivalent to `name = {}`).
+  consumed at its whole offer. This is the all-bare, zero-settings form (each
+  element is equivalent to `name = {}`, which omits `take`).
 - Keyed table — `[targets.<t>.sources]`, a map whose key is the binding
   identity and whose value is always a table refining that one binding. The
   key defaults to the source name; `source` is written only on divergence,
   when the identity differs from the source name. A bare entry inside a refined
-  (keyed) target is `name = {}`. Each of `root`/`include`/`exclude` set on the
-  binding overrides the source's same field for this target; any field omitted
-  inherits from the source.
+  (keyed) target is `name = {}`. A binding may set `take`, `collapse`, `template`,
+  and a per-target ref (`branch`/`tag`/`rev`); the offer scope itself
+  (`root`/`include`/`exclude`) is not a binding key.
+
+Take subsets and renames the offer. A binding's `take` is a list whose entries are:
+
+- a literal leaf (a plain offered path, e.g. `"nvim/init.lua"`) — kept verbatim;
+- a gitignore glob (any entry with `*`, `?`, `[`, `]`, or a trailing `/`, e.g.
+  `"nvim/**"`) — expands over the offer set only, never widening it;
+- a rename table `{ "src" = "dest" }` — the offered leaf `src` is consumed and
+  emitted at `dest` instead (destructive: it does not also land at `src`).
+
+A literal or rename `src` that is not in the offer is a hard error (a `take` may not
+widen the offer; the diagnostic suggests the closest offered leaf). A glob that
+matches nothing warns but does not fail. An omitted `take` takes the whole offer;
+`take = []` takes nothing.
 
 ```toml
 [targets.neovim.sources]
-nvim = { source = "dotfiles", root = "nvim" }   # identity `nvim`, diverges from source
+# take just the editor's tree, then rename one leaf as it lands:
+nvim = { source = "dotfiles", take = ["nvim/**", { "nvim/init.lua" = "init.lua" }] }
 ```
 
-Restriction. `root`/`include`/`exclude` on a binding backed by a `url` source
-are config errors — a url source has no git tree to re-root. `branch`/`tag`/`rev`
+Restriction. `take` (or any other refinement) on a binding backed by a `url` source
+is a config error — a url source has no offer to subset. `branch`/`tag`/`rev`
 on a binding backed by a `url` source or a `deploy = "link"` source are config
 errors too — a url has no ref to resolve, and a link source live-links a working
 tree rather than a pinned commit.
+
+Binding scope is rejected. `root`, `include`, `exclude`, and `map` are no longer
+binding keys: setting any of them on a `[targets.<t>.sources]` entry is a hard parse
+error with a did-you-mean diagnostic — it redirects `root`/`include`/`exclude` to the
+source offer (`[sources.<name>]`) and `map` to the target `take` rename form. This is
+pre-alpha; there is no migration shim.
 
 Identity (the table key). A binding's identity is the
 `[targets.<t>.sources]` table key; it defaults to the source name and you write
 `source` only when the identity diverges. The identity keys the registry artifact
 and the `by-source` and `prefixed` layout labels, and is structurally unique because
 TOML keys are unique. To feed one source into one target as two slices, give each a
-distinct key, each re-rooting the same `source`. A genuine destination clash between
-bindings is caught at sync as a collision. Bindings resolve in identity (key) order,
-sorted alphabetically — independent of how a flat `sources` list is written. The
-slices below take distinct keys for legible `by-source` labels (`nvim/…`, `helix/…`):
+distinct key, each `take`-ing a different subtree of the same `source`. A genuine
+destination clash between bindings is caught at sync as a collision. Bindings resolve
+in identity (key) order, sorted alphabetically — independent of how a flat `sources`
+list is written. The slices below take distinct keys for legible `by-source` labels
+(`nvim/…`, `helix/…`):
 
 ```toml
 [targets.editors]
 path = "~/.config"
 layout = "by-source"     # labels each slice by its identity: nvim/… and helix/…
 [targets.editors.sources]
-nvim  = { source = "dotfiles", root = "nvim" }
-helix = { source = "dotfiles", root = "helix" }
+nvim  = { source = "dotfiles", take = ["nvim/**"] }
+helix = { source = "dotfiles", take = ["helix/**"] }
 ```
 
 Per-target version (`branch`/`tag`/`rev`). A binding may also set its own ref —
-exactly as it overrides `root`/`include`/`exclude`. The source's ref is the default;
+exactly as it sets its own `take`. The source's ref is the default;
 a binding's ref overrides it for that target alone; a bare binding inherits the
 source's ref. As on a source, set at most one ref per binding (precedence within a
 binding is `rev` > `tag` > `branch`).
@@ -461,74 +494,102 @@ stable = { source = "fzf", tag = "v0.55.0" }
 canary = { source = "fzf", tag = "v0.56.0" }
 ```
 
-CLI. `phora bind <source>… --to <target>` adds bindings; `--as`, `--root`,
-`--include <glob>…`, `--exclude <glob>…`, and `--branch`/`--tag`/`--rev` refine them.
-Any refinement flag writes a keyed table entry; with no flags it appends a bare
+CLI. `phora bind <source>… --to <target>` adds bindings; `--as`, `--take <entry>…`,
+and `--branch`/`--tag`/`--rev` refine the binding. A `--take` entry is a leaf, a glob,
+or a `src=dest` rename (the `=` form writes the `{ src = dest }` rename table). Any
+binding refinement writes a keyed table entry; with no refinement it appends a bare
 source name to the target's flat list (or, if the target is already a keyed table,
-writes `name = {}`).
-`--branch`/`--tag`/`--rev` write a table binding pinning that ref for the target.
-Because `--as` sets a single binding identity, it cannot apply to multiple sources.
-`phora unbind <identity>… --from <target>` removes bindings by their identity.
-`phora add <url> --to <target>` accepts the same selection refinement flags
-(`--as`/`--root`/`--include`/`--exclude`), scoping the binding rather than the
-source; here `--as` requires exactly one `--to` target (it errors with multiple
-`--to`, or with no `--to` at all). The ref flags are NOT among them: `phora add`'s
-`--branch`/`--tag` stay source-level — a source is added at a version — so
+writes `name = {}`). `--branch`/`--tag`/`--rev` write a table binding pinning that ref
+for the target. Because `--as` sets a single binding identity, it cannot apply to
+multiple sources. `--root` is source-owned, not a binding key: `bind --root` writes
+`root` onto each named `[sources.<name>]` table (and errors if a named source is not
+declared in the file being edited). `phora unbind <identity>… --from <target>`
+removes bindings by their identity.
+
+`phora add <url>` and `phora source add <url>` carry the source-owned offer flags
+`--root`, `--include <glob>…`, and `--exclude <glob>…`, which shape the NEW source's
+offer (they land on `[sources.<name>]`, never on a binding). With `--to <target>`,
+`phora add` also accepts `--as` to set the binding identity (it requires exactly one
+`--to` target, erroring with multiple `--to` or none). The ref flags stay
+source-level on `add`: `phora add`'s `--branch`/`--tag` add a source at a version, so
 per-target ref overrides are a `bind` concern only (`bind --branch/--tag/--rev`).
-Local/symlink overlays (`--local`/`--symlink`) accept neither `--to` nor refinement
-flags.
+Local/symlink overlays (`--local`/`--symlink`) accept neither `--to` nor binding
+refinement flags.
 
-### Aliasing leaves (`map`)
+### Renaming leaves (`take` rename)
 
-A binding's `map` aliases individual source files to renamed destinations,
-without duplicating them in the source repo. Where the rest of phora projects
-top-level directories (artifacts), `map` projects one leaf file to a chosen name —
-the canonical case being a single shared file fanned out under the names different
-tools expect:
+There is no separate `map` construct — renaming is the `{ "src" = "dest" }` form of
+a binding's `take`. Where the rest of phora keeps an offered leaf at its own path, a
+rename entry consumes one offered leaf and emits it at a chosen destination instead.
+The canonical case is a single shared file fanned out under the names different tools
+expect:
 
 ```toml
 [targets.agents]
 path = "~/myproject"
 [targets.agents.sources]
-dotfiles = { map = { "AGENTS.md" = "AGENTS.md" } }
-claude   = { source = "dotfiles", map = { "AGENTS.md" = "CLAUDE.md" } }
-codex    = { source = "dotfiles", map = { "AGENTS.md" = "codex.md" } }
+dotfiles = { take = [{ "AGENTS.md" = "AGENTS.md" }] }
+claude   = { source = "dotfiles", take = [{ "AGENTS.md" = "CLAUDE.md" }] }
+codex    = { source = "dotfiles", take = [{ "AGENTS.md" = "codex.md" }] }
 ```
 
 One `AGENTS.md` in the source now lands three times, under three names, with no
-copies in the source tree. Each `map` entry is `"<source-leaf-path>" = "<dest>"`:
-the key is a file path relative to the binding's source root, the value the name it
-deploys as.
+copies in the source tree. A rename entry is `{ "<offered-leaf>" = "<dest>" }`: the
+key is a path the source offers, the value the path it deploys as under the target's
+layout.
 
-- Lands at the target root, bypassing layout. A mapped dest is placed directly
-  at `<target>/<dest>` — the dir-artifact layout does not apply, and a `by-source`
-  target does not nest the dest under a per-source subdirectory.
-- Single-component dest (v1). A dest must be one safe filename: no `/`, `\`,
-  `.`, or `..`. Nested destinations are deferred to v2. A key may sit in a
-  subdirectory (`lint/rules.toml`) but may not be absolute or escape the root via
-  `..`. A key that resolves to nothing, or to a non-regular-file, errors at sync.
-- Mutually exclusive with `include`/`exclude`. `map` selects exact leaves, so
-  combining it with glob selection on the same binding is a config error.
-- Fan-out without duplication. The same source leaf can map to different dests
-  across bindings and targets — each fan-out is a binding under its own table key,
-  naming the same `source`; their dests differ, so they never clash. The source is
-  fetched once.
+- Destructive. The renamed leaf is emitted only at `dest`, not also at its
+  original path. A `src` already covered by a glob in the same `take` is consumed out
+  of that glob, so it is not double-emitted.
+- The `src` must be offered. A rename whose `src` is not in the offer is a hard
+  error (a `take` may not widen the offer); the diagnostic suggests the closest
+  offered leaf. A leaf named both as a literal `take` and as a rename `src` is also
+  rejected.
+- Portable `dest`. A `dest` must be a forward-slashed relative path inside the
+  target root: an absolute path, a `..` escape, or a backslash is rejected. Nested
+  dests are allowed.
+- No within-binding clash. Two entries resolving to the same destination (case-
+  insensitively, NFC-folded) are a config error; one `src` renamed to two different
+  dests is rejected too.
+- Fan-out without duplication. The same source leaf renamed to different dests
+  across bindings and targets is each its own binding under its own table key, naming
+  the same `source`; their dests differ, so they never clash. The source is fetched
+  once.
 - Copy and link both work. Default `deploy = "copy"` materializes the leaf;
   `deploy = "link"` (local-path only — see [Link mode](#link-mode-local-development))
-  makes the dest a symlink to the source leaf in the working tree. A missing link
-  leaf degrades gracefully: `preview` flags it and `sync` still completes.
-- Rename leaves an orphan. Changing a dest value orphans the old file; it
-  survives until a `phora sync --prune` reclaims it.
-- Collisions are conflicts. Two bindings whose dests resolve to the same path
-  in one target — two mapped dests, or a mapped dest landing on a dir-artifact of
-  the same name — fail the sync, naming the contested artifact and both identities.
-  (Within a single binding, two keys mapping to one dest is caught earlier, at
-  config load.)
+  makes the dest a symlink to the source leaf in the working tree.
 
-Overlay. `map` lives on a binding, and a `phora.local.toml` `sources` list
-replaces the base target's list wholesale — it does not merge per binding. A
+Overlay. A binding's `take` lives on the binding, and a `phora.local.toml` `sources`
+list replaces the base target's list wholesale — it does not merge per binding. A
 local override of a target's `sources` must therefore restate every binding it
-wants, including their maps; base maps it omits are dropped for that target.
+wants, including their `take`; base takes it omits are dropped for that target.
+
+### Collapse (`collapse`)
+
+A binding's `collapse` controls how a taken set materializes: per-leaf artifacts, or
+one directory artifact (a directory symlink under `deploy = "link"`, a subtree copy
+under `deploy = "copy"`). It is a binding-level opt (and has a mount-parity table —
+see [Transitive dependencies](#transitive-dependencies)), exempt from the
+binding-scope rejection alongside `template` and `take`.
+
+- Omitted — algorithmic default. A directory collapses to one artifact exactly
+  when every offered leaf under it is taken at its identity and no per-leaf rename
+  targets it; collapse is maximal, taking the topmost clean directory. Under `link`,
+  a within-dir exclude blocks collapse and the directory falls back per-leaf with a
+  warning; under `copy`, an excluded child is simply pruned from the subtree and the
+  directory still collapses.
+- `collapse = false` — force per-leaf. Every kept leaf stays its own artifact even
+  on a wholly-taken directory (snapshot semantics).
+- `collapse = true` — demand the directory artifact. It is a hard error, naming the
+  directory, if a within-dir exclude (under `link`) or a per-leaf rename makes
+  whole-directory collapse impossible. This is the analogue of dotter's `recurse`:
+  request the directory symlink/subtree, and fail loudly when it cannot be honored.
+
+```toml
+[targets.editors.sources]
+# force a per-leaf snapshot even though the whole tree is taken:
+nvim = { source = "dotfiles", take = ["nvim/**"], collapse = false }
+```
 
 ### Source kinds
 
@@ -748,6 +809,30 @@ once — `imports = ["tropos", "work-config"]` — each composing under the same
 - Real collisions are hard errors. If two composed dep targets resolve to the
   same destination, the sync stops and names the path (`composed targets resolve to
   the same destination`) rather than letting one quietly clobber the other.
+
+### Subsetting a mounted dep
+
+A consumer subsets what a mounted dep contributes with target-owned `[take]` and
+`[collapse]` tables, keyed by the imported dep's anchor (the composed destination
+the dep target lands at). This is the mount-level analogue of a binding's `take` and
+`collapse`: it is the consumer's own slice of a composed subtree, the dep cannot
+override it.
+
+```toml
+[targets.claude]
+path = "~/.claude"
+imports = ["tropos"]
+# keep only the gestalt skill out of tropos's skills tree, and rename one leaf:
+[targets.claude.take]
+"skills" = ["skills/gestalt/**", { "skills/gestalt/SKILL.md" = "skills/gestalt/skill.md" }]
+# force the loqui reference tree to land per-leaf rather than as one dir artifact:
+[targets.claude.collapse]
+"skills/loqui/reference/loqui" = false
+```
+
+An omitted table inherits (no subsetting); a present-but-empty `[take]`/`[collapse]`
+clears any inherited table back to take-all; a non-empty local table replaces the
+base table wholesale on overlay.
 
 ### Confinement
 

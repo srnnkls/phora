@@ -1,7 +1,7 @@
 //! Top-level orchestration: the `sync` pipeline, eject/uneject, and shared helpers.
 
 mod confine;
-mod discover;
+pub(crate) mod discover;
 pub(crate) mod hooks;
 mod plan;
 mod preview;
