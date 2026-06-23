@@ -156,7 +156,7 @@ fn unsafe_dest_diagnostic(dest: &str) -> Error {
         why: "destination is not a portable relative path".to_owned(),
         did_you_mean: None,
         remedy: "use a forward-slashed relative path inside the deploy root".to_owned(),
-        debug_hint: None,
+        debug_hint: Some("phora preview --files".to_owned()),
     }
     .sync()
 }
@@ -686,6 +686,30 @@ mod confine_fail_closed_tests {
             "a composed/transitive target (namespaced name carries `%`) reaching deploy with \
              `confine == None` must fail closed; falling through to an unconfined write lets a dep \
              escape to any absolute path",
+        );
+    }
+
+    #[test]
+    fn unsafe_artifact_dest_diagnostic_points_at_the_preview_command() {
+        let rendered = super::unsafe_dest_diagnostic("../escape").to_string();
+        for phrase in [
+            crate::diagnostic::SELECTION,
+            crate::diagnostic::MATCHED_AGAINST,
+            crate::diagnostic::REMEDY,
+            crate::diagnostic::TO_DEBUG,
+        ] {
+            assert!(
+                rendered.contains(phrase),
+                "the unsafe-dest rejection must render `{phrase}`; got:\n{rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("../escape"),
+            "the rejection must name the offending dest; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("to debug: phora preview --files"),
+            "an unsafe artifact dest must point at the preview command; got:\n{rendered}"
         );
     }
 }

@@ -378,7 +378,7 @@ fn binding_scope_diagnostic(
         why: "binding-level scope is removed".to_string(),
         did_you_mean: None,
         remedy,
-        debug_hint: None,
+        debug_hint: Some(format!("phora explain {target_name} {binding_name}")),
     }
 }
 

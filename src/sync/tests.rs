@@ -9490,8 +9490,8 @@ fn sealed_offer_source_dropped_a_still_wanted_artifact_is_a_hard_error() {
 }
 
 fn assert_sealed_offer_diagnostic(rendered: &str, target: &str, source: &str, artifact: &str) {
-    use crate::diagnostic::{MATCHED_AGAINST, REMEDY, SELECTION};
-    for phrase in [SELECTION, MATCHED_AGAINST, REMEDY] {
+    use crate::diagnostic::{MATCHED_AGAINST, REMEDY, SELECTION, TO_DEBUG};
+    for phrase in [SELECTION, MATCHED_AGAINST, REMEDY, TO_DEBUG] {
         assert!(
             rendered.contains(phrase),
             "the sealed-offer rejection must render `{phrase}`; got:\n{rendered}"
@@ -9503,6 +9503,13 @@ fn assert_sealed_offer_diagnostic(rendered: &str, target: &str, source: &str, ar
             "the sealed-offer rejection must name `{named}` (target/binding/artifact); got:\n{rendered}"
         );
     }
+    assert!(
+        rendered.contains(&format!(
+            "to debug: phora explain {target} {source} {artifact}"
+        )),
+        "the sealed-offer rejection must point at the attribution command for the dropped \
+         artifact; got:\n{rendered}"
+    );
 }
 
 #[test]

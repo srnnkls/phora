@@ -5763,7 +5763,7 @@ mod keyed_bindings {
 
 mod parse_time_structural_validation {
     use crate::config::Config;
-    use crate::diagnostic::{MATCHED_AGAINST, REMEDY, SELECTION};
+    use crate::diagnostic::{MATCHED_AGAINST, REMEDY, SELECTION, TO_DEBUG};
     use crate::error::Error;
 
     fn parse_err(toml: &str) -> String {
@@ -5783,7 +5783,7 @@ mod parse_time_structural_validation {
     }
 
     fn assert_structured_diagnostic(msg: &str) {
-        for phrase in [SELECTION, MATCHED_AGAINST, REMEDY] {
+        for phrase in [SELECTION, MATCHED_AGAINST, REMEDY, TO_DEBUG] {
             assert!(
                 msg.contains(phrase),
                 "binding-scope rejection must render the STRUCTURED SelectionDiagnostic phrase \
@@ -5795,6 +5795,11 @@ mod parse_time_structural_validation {
             !msg.contains("unknown field"),
             "the rejection must be the structured diagnostic, NOT the raw serde \
              `unknown field` error; got:\n{msg}"
+        );
+        assert!(
+            msg.contains("to debug: phora explain t dotfiles"),
+            "the binding-scope rejection must point at the attribution command for the offending \
+             target and binding; got:\n{msg}"
         );
     }
 

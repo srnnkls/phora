@@ -535,6 +535,7 @@ pub(crate) fn explain_cmd(
             "the configured targets",
             "unknown target",
             "add it under `[targets]` or check the spelling",
+            "phora preview",
         )
     })?;
 
@@ -548,6 +549,7 @@ pub(crate) fn explain_cmd(
                 &format!("the sources bound under `{target}`"),
                 "not bound under this target",
                 &format!("bind it with `phora bind {source} --to {target}`, then `phora sync`"),
+                &format!("phora preview --target {target}"),
             )
         })?;
 
@@ -613,14 +615,14 @@ pub(crate) fn explain_cmd(
     explain_path(&input, path)
 }
 
-fn unbound_diagnostic(entry: &str, matched: &str, why: &str, remedy: &str) -> Error {
+fn unbound_diagnostic(entry: &str, matched: &str, why: &str, remedy: &str, debug: &str) -> Error {
     SelectionDiagnostic {
         entry: entry.to_owned(),
         matched_against: matched.to_owned(),
         why: why.to_owned(),
         did_you_mean: None,
         remedy: remedy.to_owned(),
-        debug_hint: None,
+        debug_hint: Some(debug.to_owned()),
     }
     .config()
 }
@@ -632,7 +634,7 @@ fn cache_miss_diagnostic(source: &str, why: &str) -> Error {
         why: why.to_owned(),
         did_you_mean: None,
         remedy: format!("run `phora sync` to fetch and lock `{source}`"),
-        debug_hint: None,
+        debug_hint: Some(format!("phora preview --source {source}")),
     }
     .sync()
 }
@@ -942,7 +944,7 @@ mod explain_tests {
     use std::path::PathBuf;
 
     use crate::config::{DeployMode, LayoutConfig, ParsedSource, Source, TakeEntry, TemplateOptIn};
-    use crate::diagnostic::{MATCHED_AGAINST, REMEDY, SELECTION};
+    use crate::diagnostic::{MATCHED_AGAINST, REMEDY, SELECTION, TO_DEBUG};
 
     use super::{
         ExplainBody, ExplainInput, ExplainReport, OfferAttribution, OfflineCtx, TakeAttribution,
@@ -1217,7 +1219,7 @@ mod explain_tests {
     }
 
     fn assert_named_diagnostic(rendered: &str, entry: &str) {
-        for phrase in [SELECTION, MATCHED_AGAINST, REMEDY] {
+        for phrase in [SELECTION, MATCHED_AGAINST, REMEDY, TO_DEBUG] {
             assert!(
                 rendered.contains(phrase),
                 "the diagnostic must render `{phrase}`; got:\n{rendered}"
@@ -1236,6 +1238,10 @@ mod explain_tests {
             .expect_err("an unknown target must be a structured diagnostic, not a panic")
             .to_string();
         assert_named_diagnostic(&rendered, "ghost");
+        assert!(
+            rendered.contains("to debug: phora preview"),
+            "the unknown-target diagnostic must point at the preview command; got:\n{rendered}"
+        );
     }
 
     #[test]
@@ -1245,6 +1251,11 @@ mod explain_tests {
             .expect_err("a source not bound under the target must be a structured diagnostic")
             .to_string();
         assert_named_diagnostic(&rendered, "dots");
+        assert!(
+            rendered.contains("to debug: phora preview --target home"),
+            "the unbound-source diagnostic must point at the preview command scoped to the \
+             target; got:\n{rendered}"
+        );
     }
 
     #[test]
@@ -1257,6 +1268,11 @@ mod explain_tests {
         assert!(
             rendered.contains("phora sync"),
             "the cache-miss remedy must point at `phora sync`; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("to debug: phora preview --source dots"),
+            "the cache-miss diagnostic must point at the preview command scoped to the source; \
+             got:\n{rendered}"
         );
     }
 

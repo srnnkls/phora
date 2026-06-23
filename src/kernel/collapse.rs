@@ -243,14 +243,14 @@ fn force_collapse_blocked_diagnostic(dir: &str) -> crate::error::Error {
         did_you_mean: None,
         remedy: "drop the within-dir exclude or rename, deploy in copy mode, or omit `collapse`"
             .to_string(),
-        debug_hint: None,
+        debug_hint: Some("phora preview --files".to_string()),
     }
     .sync()
 }
 
 #[cfg(test)]
 mod collapse_tests {
-    use crate::diagnostic::{MATCHED_AGAINST, REMEDY, SELECTION};
+    use crate::diagnostic::{MATCHED_AGAINST, REMEDY, SELECTION, TO_DEBUG};
     use crate::kernel::collapse::{
         CollapseChoice, CollapseMode, CollapsePlan, CollapseWarning, Materialization, plan_collapse,
     };
@@ -325,7 +325,7 @@ mod collapse_tests {
     }
 
     fn assert_named_diagnostic(rendered: &str, entry: &str) {
-        for phrase in [SELECTION, MATCHED_AGAINST, REMEDY] {
+        for phrase in [SELECTION, MATCHED_AGAINST, REMEDY, TO_DEBUG] {
             assert!(
                 rendered.contains(phrase),
                 "the rejection must render the named phrase `{phrase}`; got:\n{rendered}"
@@ -334,6 +334,11 @@ mod collapse_tests {
         assert!(
             rendered.contains(entry),
             "the rejection must name the offending dir `{entry}`; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("to debug: phora preview --files"),
+            "a collapse rejection must point at the preview command so the shape is inspectable; \
+             got:\n{rendered}"
         );
     }
 
