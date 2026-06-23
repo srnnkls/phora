@@ -212,8 +212,16 @@ fn compose_dep(
         namespace_dep_sources(instance, imported, manifest, &imported_inner, ctx, depth)?;
 
     let mount = MountOverride {
-        take: anchor.take.get(imported).map(Vec::as_slice),
-        collapse: anchor.collapse.get(imported).copied(),
+        take: anchor
+            .take
+            .as_ref()
+            .and_then(|t| t.get(imported))
+            .map(Vec::as_slice),
+        collapse: anchor
+            .collapse
+            .as_ref()
+            .and_then(|c| c.get(imported))
+            .copied(),
     };
 
     for (dep_target_name, dep_target) in &manifest.targets {
@@ -369,8 +377,8 @@ fn compose_nested_imports(
             layout: None,
             hooks: None,
             imports: None,
-            take: BTreeMap::new(),
-            collapse: BTreeMap::new(),
+            take: None,
+            collapse: None,
             confine: None,
         };
         ctx.ancestors.push(inner_node);
@@ -515,8 +523,8 @@ fn synthetic_target(
     target.imports = None;
     target.hooks = None;
     target.confine = Some(anchor_path);
-    target.take = BTreeMap::new();
-    target.collapse = BTreeMap::new();
+    target.take = None;
+    target.collapse = None;
     if let Some(bindings) = target.sources.as_mut() {
         for (identity, binding) in bindings.iter_mut() {
             let effective = binding.source.clone().unwrap_or_else(|| identity.clone());
@@ -1247,8 +1255,16 @@ mod tests {
     /// The consumer's mount override for imported `dep`, exactly as `compose_dep` builds it.
     fn mount_for<'a>(anchor: &'a Target, imported: &str) -> MountOverride<'a> {
         MountOverride {
-            take: anchor.take.get(imported).map(Vec::as_slice),
-            collapse: anchor.collapse.get(imported).copied(),
+            take: anchor
+                .take
+                .as_ref()
+                .and_then(|t| t.get(imported))
+                .map(Vec::as_slice),
+            collapse: anchor
+                .collapse
+                .as_ref()
+                .and_then(|c| c.get(imported))
+                .copied(),
         }
     }
 

@@ -72,10 +72,15 @@ pub enum Protocol {
 }
 
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "four independent export toggles mirroring distinct source-config fields, not a state machine"
+)]
 pub struct ExportPolicy {
     pub allow_symlinks: bool,
     pub allow_submodules: bool,
     pub preserve_executable: bool,
+    pub vcs_opt_in: bool,
 }
 
 impl Default for ExportPolicy {
@@ -84,6 +89,7 @@ impl Default for ExportPolicy {
             allow_symlinks: false,
             allow_submodules: false,
             preserve_executable: true,
+            vcs_opt_in: false,
         }
     }
 }
@@ -951,6 +957,10 @@ struct ExportWalk<'a, 'r> {
     rendered_any: bool,
 }
 
+fn dest_has_vcs_component(dest: &Path) -> bool {
+    dest.components().any(|c| c.as_os_str() == ".git")
+}
+
 impl ExportWalk<'_, '_> {
     /// Stages each leaf of the explicit plan: look up its source path in `root_tree`,
     /// reject a non-blob or a symlink the policy forbids, then stage at the leaf's
@@ -958,6 +968,9 @@ impl ExportWalk<'_, '_> {
     /// on the dest.
     fn run(&mut self, root_tree: &gix::Tree<'_>, leaves: &[ExportLeaf]) -> Result<()> {
         for leaf in leaves {
+            if !self.policy.vcs_opt_in && dest_has_vcs_component(&leaf.dest) {
+                continue;
+            }
             let entry = root_tree
                 .lookup_entry_by_path(&leaf.source)
                 .map_err(|e| {
@@ -2856,6 +2869,158 @@ path = "srnnkls/tropos"
         );
     }
 
+    /// A real source blob renamed onto a dest that buries it under a `.git`
+    /// path component — the write-time vector a `take` rename produces. The
+    /// `keep.txt` leaf is the control: it must survive.
+    fn dot_git_dest_leaves(dest: &str) -> Vec<ExportLeaf> {
+        vec![
+            ExportLeaf {
+                source: PathBuf::from("editor/init.lua"),
+                dest: PathBuf::from(dest),
+            },
+            ExportLeaf {
+                source: PathBuf::from("editor/lua/opts.lua"),
+                dest: PathBuf::from("keep.txt"),
+            },
+        ]
+    }
+
+    #[test]
+    fn export_prunes_a_nested_dot_git_dest_at_write() {
+        let fixture = build_export_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+        let staging = TempDir::new().expect("staging dir");
+
+        let result = export_named(
+            &fixture,
+            staging.path(),
+            &dot_git_dest_leaves("nested/.git/config"),
+            &ExportPolicy::default(),
+        )
+        .expect("export succeeds; the .git-dest leaf is pruned, not an error");
+
+        assert!(
+            !staging.path().join("nested/.git/config").exists(),
+            "a leaf whose DEST buries it under a `.git` component must be pruned at write, never \
+             staged under the deploy target where confine cannot guard it"
+        );
+        assert!(
+            !result
+                .files
+                .iter()
+                .any(|f| f.path == Path::new("nested/.git/config")),
+            "the pruned `.git`-dest leaf must be absent from the manifest; got: {:?}",
+            result.files
+        );
+        assert!(
+            staging.path().join("keep.txt").exists()
+                && result.files.iter().any(|f| f.path == Path::new("keep.txt")),
+            "the control leaf with a clean dest must still be staged and recorded; got: {:?}",
+            result.files
+        );
+    }
+
+    #[test]
+    fn export_prunes_a_top_level_dot_git_dest_at_write() {
+        let fixture = build_export_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+        let staging = TempDir::new().expect("staging dir");
+
+        let result = export_named(
+            &fixture,
+            staging.path(),
+            &dot_git_dest_leaves(".git/config"),
+            &ExportPolicy::default(),
+        )
+        .expect("export succeeds; the top-level .git-dest leaf is pruned");
+
+        assert!(
+            !staging.path().join(".git/config").exists(),
+            "a `.git` component at the TOP of the dest must be pruned at write"
+        );
+        assert!(
+            !result
+                .files
+                .iter()
+                .any(|f| f.path == Path::new(".git/config")),
+            "the pruned top-level `.git`-dest leaf must be absent from the manifest; got: {:?}",
+            result.files
+        );
+    }
+
+    #[test]
+    fn export_writes_a_dot_git_dest_when_policy_opts_in() {
+        let fixture = build_export_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+        let staging = TempDir::new().expect("staging dir");
+
+        let policy = ExportPolicy {
+            vcs_opt_in: true,
+            ..ExportPolicy::default()
+        };
+        let result = export_named(
+            &fixture,
+            staging.path(),
+            &dot_git_dest_leaves("nested/.git/config"),
+            &policy,
+        )
+        .expect("export succeeds with the .git opt-in");
+
+        assert!(
+            staging.path().join("nested/.git/config").exists(),
+            "with the `.git` opt-in the write-time prune must be suppressed and the leaf staged"
+        );
+        assert!(
+            result
+                .files
+                .iter()
+                .any(|f| f.path == Path::new("nested/.git/config")),
+            "an opted-in `.git`-dest leaf must appear in the manifest; got: {:?}",
+            result.files
+        );
+    }
+
+    #[test]
+    fn export_writes_a_dot_gitignore_basename_dest_without_opt_in() {
+        let fixture = build_export_fixture();
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+        let staging = TempDir::new().expect("staging dir");
+
+        let result = export_named(
+            &fixture,
+            staging.path(),
+            &dot_git_dest_leaves("nested/.gitignore"),
+            &ExportPolicy::default(),
+        )
+        .expect("export succeeds; a `.gitignore` basename is not a `.git` component");
+
+        assert!(
+            staging.path().join("nested/.gitignore").exists(),
+            "a `.gitignore` basename is NOT a `.git` path component and must be staged even without \
+             the opt-in"
+        );
+        assert!(
+            result
+                .files
+                .iter()
+                .any(|f| f.path == Path::new("nested/.gitignore")),
+            "the `.gitignore` leaf must be recorded in the manifest; got: {:?}",
+            result.files
+        );
+    }
+
     #[test]
     fn export_result_lists_exported_files() {
         let fixture = build_export_fixture();
@@ -4193,6 +4358,7 @@ path = "srnnkls/tropos"
                 allow_symlinks: false,
                 allow_submodules: false,
                 preserve_executable: true,
+                vcs_opt_in: false,
             };
             let source = sn("pkg");
             let export_leaves = vec![ExportLeaf {
