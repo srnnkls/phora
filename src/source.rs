@@ -38,9 +38,6 @@ pub enum SourceError {
     #[error("symlink not allowed: {path} (set allow_symlinks=true to permit)")]
     SymlinkNotAllowed { path: std::path::PathBuf },
 
-    #[error("submodule not allowed: {path} (set allow_submodules=true to permit)")]
-    SubmoduleNotAllowed { path: std::path::PathBuf },
-
     #[error("template render failed for {path}: {message}")]
     Render { path: PathBuf, message: String },
 
@@ -72,13 +69,8 @@ pub enum Protocol {
 }
 
 #[derive(Debug, Clone)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "four independent export toggles mirroring distinct source-config fields, not a state machine"
-)]
 pub struct ExportPolicy {
     pub allow_symlinks: bool,
-    pub allow_submodules: bool,
     pub preserve_executable: bool,
     pub vcs_opt_in: bool,
 }
@@ -87,7 +79,6 @@ impl Default for ExportPolicy {
     fn default() -> Self {
         Self {
             allow_symlinks: false,
-            allow_submodules: false,
             preserve_executable: true,
             vcs_opt_in: false,
         }
@@ -4356,7 +4347,6 @@ path = "srnnkls/tropos"
             let staging = TempDir::new().expect("staging tempdir");
             let policy = ExportPolicy {
                 allow_symlinks: false,
-                allow_submodules: false,
                 preserve_executable: true,
                 vcs_opt_in: false,
             };

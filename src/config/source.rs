@@ -38,7 +38,6 @@ pub struct Source {
     #[serde(default)]
     pub exclude: Option<Vec<String>>,
     pub allow_symlinks: Option<bool>,
-    pub allow_submodules: Option<bool>,
     pub preserve_executable: Option<bool>,
     #[serde(default)]
     pub deploy: Option<DeployMode>,
@@ -113,7 +112,6 @@ pub struct ParsedSource {
     include: Option<Vec<String>>,
     exclude: Option<Vec<String>>,
     allow_symlinks: Option<bool>,
-    allow_submodules: Option<bool>,
     preserve_executable: Option<bool>,
     deploy: Option<DeployMode>,
     transitive: bool,
@@ -151,7 +149,6 @@ impl ParsedSource {
             include: source.include.clone(),
             exclude: source.exclude.clone(),
             allow_symlinks: source.allow_symlinks,
-            allow_submodules: source.allow_submodules,
             preserve_executable: source.preserve_executable,
             deploy: source.deploy,
             transitive: source.is_transitive(),
@@ -251,7 +248,6 @@ impl ParsedSource {
     pub fn export_policy(&self) -> ExportPolicy {
         ExportPolicy {
             allow_symlinks: self.allow_symlinks.unwrap_or(false),
-            allow_submodules: self.allow_submodules.unwrap_or(false),
             preserve_executable: self.preserve_executable.unwrap_or(true),
             vcs_opt_in: self
                 .includes()
@@ -279,7 +275,6 @@ impl ParsedSource {
         let policy = self.export_policy();
         h.update(&[
             u8::from(policy.allow_symlinks),
-            u8::from(policy.allow_submodules),
             u8::from(policy.preserve_executable),
         ]);
         format!("blake3:{}", h.finalize().to_hex())
@@ -444,9 +439,6 @@ impl Source {
         if local.allow_symlinks.is_some() {
             self.allow_symlinks = local.allow_symlinks;
         }
-        if local.allow_submodules.is_some() {
-            self.allow_submodules = local.allow_submodules;
-        }
         if local.preserve_executable.is_some() {
             self.preserve_executable = local.preserve_executable;
         }
@@ -599,7 +591,6 @@ mod offer_tests {
             include: None,
             exclude: None,
             allow_symlinks: None,
-            allow_submodules: None,
             preserve_executable: None,
             deploy: None,
             transitive: None,

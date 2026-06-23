@@ -44,9 +44,6 @@ pub enum Error {
     #[error("symlink not allowed: {path} (set allow_symlinks=true to permit)")]
     SymlinkNotAllowed { path: std::path::PathBuf },
 
-    #[error("submodule not allowed: {path} (set allow_submodules=true to permit)")]
-    SubmoduleNotAllowed { path: std::path::PathBuf },
-
     #[error("registry error: {0}")]
     Registry(String),
 

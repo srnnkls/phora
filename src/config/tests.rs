@@ -432,7 +432,6 @@ fn refspec_uses_branch_when_only_branch_set() {
 fn export_policy_uses_spec_defaults() {
     let policy = source(None, None, None).export_policy();
     assert!(!policy.allow_symlinks);
-    assert!(!policy.allow_submodules);
     assert!(policy.preserve_executable);
 }
 
