@@ -4,14 +4,17 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::config::{Config, DeployMode, LayoutConfig, ParsedSource, Target};
+use crate::config::{Config, DeployMode, LayoutConfig, Offer, ParsedSource, Target, TemplateOptIn};
+use crate::diagnostic::did_you_mean;
 use crate::error::{Error, Result};
-use crate::kernel::{Materialization, SourceName};
+use crate::kernel::{Materialization, OfferSelection, SourceName};
 use crate::lock::{Lock, ref_discriminator};
 use crate::source::SourceBackend;
 
 use super::discover::discover_working_tree_leaves;
-use super::plan::{BindingPlanInput, PlannedItem, ResolvedBindingPlan, resolve_binding_plan};
+use super::plan::{
+    BindingPlanInput, PlanWarning, PlannedItem, ResolvedBindingPlan, resolve_binding_plan,
+};
 use super::remote_for;
 
 /// Whether a binding is renderable now or needs action before it can deploy.
@@ -48,6 +51,30 @@ pub struct PreviewEntry {
     pub state: SyncState,
     /// Deployed file names (empty until `--files` enrichment).
     pub files: Vec<PreviewFile>,
+    /// The source leaf when `take` renamed it; `None` for an identity leaf or a dir.
+    pub rename: Option<String>,
+    /// True when this entry is a collapsed directory deployed as one artifact.
+    pub collapsed: bool,
+}
+
+/// A non-fatal preview warning; `TakeNoMatch.suggestions` are resolved at the preview
+/// boundary from the offer set, never carried by the kernel `take` resolver.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub enum PreviewWarning {
+    TakeNoMatch {
+        pattern: String,
+        suggestions: Vec<String>,
+    },
+    CollapseBlocked {
+        dir: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BindingWarnings {
+    pub identity: String,
+    pub source: String,
+    pub warnings: Vec<PreviewWarning>,
 }
 
 /// A predicted flat-layout clash: two or more identities whose artifacts share one name.
@@ -63,6 +90,7 @@ pub struct PreviewTargetPlan {
     pub target: String,
     pub entries: Vec<PreviewEntry>,
     pub collisions: Vec<PreviewCollision>,
+    pub warnings: Vec<BindingWarnings>,
 }
 
 /// Build every target's offline preview from the lock: never fetches, resolves, or writes.
@@ -98,6 +126,7 @@ fn preview_target(
     let path = target.expanded_path();
     let layout = target.layout();
     let mut entries = Vec::new();
+    let mut warnings = Vec::new();
 
     for binding in target.resolve_sources(parsed) {
         let source = parsed.get(binding.source).ok_or_else(|| {
@@ -119,8 +148,8 @@ fn preview_target(
         };
 
         match source.deploy_mode() {
-            DeployMode::Link => preview_link(&ctx, &mut entries)?,
-            DeployMode::Copy => preview_copy(&ctx, lock, &mut entries)?,
+            DeployMode::Link => preview_link(&ctx, &mut entries, &mut warnings)?,
+            DeployMode::Copy => preview_copy(&ctx, lock, &mut entries, &mut warnings)?,
         }
     }
 
@@ -129,6 +158,7 @@ fn preview_target(
         target: target_name.to_owned(),
         entries,
         collisions,
+        warnings,
     })
 }
 
@@ -151,7 +181,11 @@ fn published_key(materialization: &Materialization) -> &str {
     }
 }
 
-fn preview_link(ctx: &BindingCtx, entries: &mut Vec<PreviewEntry>) -> Result<()> {
+fn preview_link(
+    ctx: &BindingCtx,
+    entries: &mut Vec<PreviewEntry>,
+    warnings: &mut Vec<BindingWarnings>,
+) -> Result<()> {
     let git = remote_for(ctx.remotes, ctx.binding.source)?;
     let Ok(candidates) = discover_working_tree_leaves(Path::new(git), None) else {
         entries.push(annotation(ctx, "link", SyncState::LinkWorkingTreeGone));
@@ -161,6 +195,7 @@ fn preview_link(ctx: &BindingCtx, entries: &mut Vec<PreviewEntry>) -> Result<()>
     for item in &plan.items {
         push_item(ctx, item, "link", entries);
     }
+    collect_warnings(ctx, &plan, &candidates, warnings);
     Ok(())
 }
 
@@ -168,6 +203,7 @@ fn preview_copy(
     ctx: &BindingCtx,
     lock: Option<&Lock>,
     entries: &mut Vec<PreviewEntry>,
+    warnings: &mut Vec<BindingWarnings>,
 ) -> Result<()> {
     let disc = ref_discriminator(&ctx.binding.effective_ref, &ctx.source.refspec());
     let Some(locked) = lock.and_then(|l| l.find_entry(ctx.binding.source, disc.as_deref())) else {
@@ -188,7 +224,68 @@ fn preview_copy(
     for item in &plan.items {
         push_item(ctx, item, &locked.commit, entries);
     }
+    collect_warnings(ctx, &plan, &candidates, warnings);
     Ok(())
+}
+
+fn collect_warnings(
+    ctx: &BindingCtx,
+    plan: &ResolvedBindingPlan,
+    candidates: &[String],
+    warnings: &mut Vec<BindingWarnings>,
+) {
+    if let Some(group) = binding_warnings(
+        ctx.binding.identity,
+        ctx.binding.source,
+        plan,
+        ctx.source.offer(),
+        candidates,
+    ) {
+        warnings.push(group);
+    }
+}
+
+fn binding_warnings(
+    identity: &str,
+    source: &str,
+    plan: &ResolvedBindingPlan,
+    offer: Offer<'_>,
+    candidates: &[String],
+) -> Option<BindingWarnings> {
+    if plan.warnings.is_empty() {
+        return None;
+    }
+    let offered = offered_leaves(&offer, candidates);
+    let warnings = plan
+        .warnings
+        .iter()
+        .map(|w| match w {
+            PlanWarning::TakeNoMatchGlob(pattern) => {
+                let refs = offered.iter().map(String::as_str);
+                PreviewWarning::TakeNoMatch {
+                    pattern: pattern.clone(),
+                    suggestions: did_you_mean(pattern, refs).unwrap_or_default(),
+                }
+            }
+            PlanWarning::LostCollapseToExclude(dir) => {
+                PreviewWarning::CollapseBlocked { dir: dir.clone() }
+            }
+        })
+        .collect();
+    Some(BindingWarnings {
+        identity: identity.to_owned(),
+        source: source.to_owned(),
+        warnings,
+    })
+}
+
+fn offered_leaves(offer: &Offer<'_>, candidates: &[String]) -> Vec<String> {
+    let Ok(selection) = OfferSelection::compile(offer.includes(), offer.excludes(), offer.root())
+    else {
+        return Vec::new();
+    };
+    let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+    selection.select(&refs)
 }
 
 fn resolve_plan(
@@ -222,11 +319,30 @@ fn push_item(ctx: &BindingCtx, item: &PlannedItem, commit: &str, entries: &mut V
         destination: item.destination.clone(),
         state: SyncState::Synced,
         files: Vec::new(),
+        rename: rename_of(
+            ctx.source.deploy_mode(),
+            &ctx.binding.template_opt_in,
+            &item.materialization,
+        ),
+        collapsed: matches!(item.materialization, Materialization::CollapsedDir { .. }),
     };
     if ctx.files {
         entry.files = item_files(ctx, item);
     }
     entries.push(entry);
+}
+
+fn rename_of(
+    mode: DeployMode,
+    template_opt_in: &TemplateOptIn,
+    materialization: &Materialization,
+) -> Option<String> {
+    let Materialization::Leaf(take) = materialization else {
+        return None;
+    };
+    let suffix_strip =
+        mode == DeployMode::Copy && template_opt_in.deployed_name(&take.source) == take.dest;
+    (take.source != take.dest && !suffix_strip).then(|| take.source.clone())
 }
 
 /// Deployed file names under one materialization, derived from the plan: a leaf is its
@@ -274,6 +390,8 @@ fn annotation(ctx: &BindingCtx, commit: &str, state: SyncState) -> PreviewEntry 
         destination: PathBuf::new(),
         state,
         files: Vec::new(),
+        rename: None,
+        collapsed: false,
     }
 }
 
@@ -298,4 +416,164 @@ fn detect_dest_collisions(entries: &[PreviewEntry]) -> Vec<PreviewCollision> {
             sources,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod preview_warning_tests {
+    use std::path::PathBuf;
+
+    use crate::config::{DeployMode, LayoutConfig, ParsedSource, Source, TakeEntry, TemplateOptIn};
+    use crate::sync::plan::{BindingPlanInput, ResolvedBindingPlan, resolve_binding_plan};
+
+    use super::{BindingWarnings, PreviewWarning, binding_warnings};
+
+    fn leaves(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn source_with(include: &[&str], mode: DeployMode) -> ParsedSource {
+        use std::fmt::Write as _;
+        let mut toml = String::from("git = \"https://example.com/x.git\"\n");
+        if !include.is_empty() {
+            let list = include
+                .iter()
+                .map(|p| format!("\"{p}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(toml, "include = [{list}]");
+        }
+        match mode {
+            DeployMode::Link => toml.push_str("deploy = \"link\"\n"),
+            DeployMode::Copy => toml.push_str("deploy = \"copy\"\n"),
+        }
+        let raw = toml::from_str::<Source>(&toml).expect("source DTO deserializes");
+        ParsedSource::parse("s", &raw).expect("source parses")
+    }
+
+    fn plan_for(
+        source: &ParsedSource,
+        candidates: &[String],
+        take: Option<&[TakeEntry]>,
+        collapse: Option<bool>,
+    ) -> ResolvedBindingPlan {
+        let layout = LayoutConfig::default();
+        let target_path = PathBuf::from("/dst");
+        let input = BindingPlanInput {
+            identity: "s",
+            source: "s",
+            commit: "c0ffee",
+            offer: source.offer(),
+            candidate_leaves: candidates,
+            take,
+            mode: source.deploy_mode(),
+            collapse,
+            layout: &layout,
+            target_path: &target_path,
+            template_opt_in: &TemplateOptIn::SuffixOnly,
+        };
+        resolve_binding_plan(&input).expect("plan resolves")
+    }
+
+    #[test]
+    fn take_no_match_glob_carries_a_did_you_mean_over_the_offer_set() {
+        let source = source_with(&["**"], DeployMode::Copy);
+        let candidates = leaves(&["init.lua", "keymaps.lua"]);
+        let take = [TakeEntry::Leaf("init.lus*".to_string())];
+        let plan = plan_for(&source, &candidates, Some(&take), None);
+
+        let group: BindingWarnings = binding_warnings("s", "s", &plan, source.offer(), &candidates)
+            .expect("a no-match-glob take must yield a binding warning group");
+
+        let warning = group
+            .warnings
+            .iter()
+            .find_map(|w| match w {
+                PreviewWarning::TakeNoMatch {
+                    pattern,
+                    suggestions,
+                } => Some((pattern.clone(), suggestions.clone())),
+                PreviewWarning::CollapseBlocked { .. } => None,
+            })
+            .expect("the group must carry a TakeNoMatch warning");
+
+        assert_eq!(
+            warning.0, "init.lus*",
+            "the warning must name the unmatched take pattern; got {:?}",
+            warning.0
+        );
+        assert_eq!(
+            warning.1,
+            vec!["init.lua".to_string()],
+            "the nearest offered leaf `init.lua` must be suggested from the offer set; got {:?}",
+            warning.1
+        );
+    }
+
+    #[test]
+    fn collapse_blocked_under_link_surfaces_a_per_binding_warning() {
+        let source = source_with(&["d/a.md"], DeployMode::Link);
+        let candidates = leaves(&["d/a.md", "d/secret.md"]);
+        let plan = plan_for(&source, &candidates, None, None);
+
+        let group = binding_warnings("s", "s", &plan, source.offer(), &candidates)
+            .expect("a within-dir exclude blocking link collapse must yield a warning group");
+
+        assert!(
+            group.warnings.iter().any(|w| matches!(
+                w,
+                PreviewWarning::CollapseBlocked { dir } if dir == "d"
+            )),
+            "the blocked dir `d` must surface as a CollapseBlocked warning; got {:?}",
+            group.warnings
+        );
+    }
+
+    #[test]
+    fn copy_mode_tmpl_suffix_strip_is_not_a_rename() {
+        let source = source_with(&["**"], DeployMode::Copy);
+        let candidates = leaves(&["config.lua.tmpl"]);
+        let plan = plan_for(&source, &candidates, None, None);
+        assert_eq!(
+            super::rename_of(
+                DeployMode::Copy,
+                &TemplateOptIn::SuffixOnly,
+                &plan.items[0].materialization,
+            ),
+            None,
+            "a copy-mode `.tmpl` identity leaf is suffix-stripped by the template engine, not \
+             renamed by `take`, so preview must not report it as a rename"
+        );
+    }
+
+    #[test]
+    fn a_take_rename_is_reported_as_a_rename() {
+        let source = source_with(&["**"], DeployMode::Copy);
+        let candidates = leaves(&["x.md"]);
+        let take = [TakeEntry::Rename {
+            src: "x.md".to_string(),
+            dest: "renamed.md".to_string(),
+        }];
+        let plan = plan_for(&source, &candidates, Some(&take), None);
+        assert_eq!(
+            super::rename_of(
+                DeployMode::Copy,
+                &TemplateOptIn::SuffixOnly,
+                &plan.items[0].materialization,
+            ),
+            Some("x.md".to_string()),
+            "a genuine `take` rename must surface the source leaf as the rename origin"
+        );
+    }
+
+    #[test]
+    fn a_clean_binding_carries_no_warning_group() {
+        let source = source_with(&["**"], DeployMode::Copy);
+        let candidates = leaves(&["a.md", "b.md"]);
+        let plan = plan_for(&source, &candidates, None, None);
+
+        assert!(
+            binding_warnings("s", "s", &plan, source.offer(), &candidates).is_none(),
+            "a binding with no plan warnings must produce no warning group"
+        );
+    }
 }

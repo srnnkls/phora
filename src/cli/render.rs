@@ -334,6 +334,9 @@ pub(crate) fn render_preview_tree(plan: &PreviewPlan) -> String {
                 collision.sources.join(", ")
             );
         }
+        for group in &tp.warnings {
+            render_binding_warnings(&mut out, group);
+        }
     }
     out
 }
@@ -345,15 +348,51 @@ fn render_synced_entry(out: &mut String, entry: &crate::sync::PreviewEntry) {
         let short = entry.commit.get(..8).unwrap_or(&entry.commit);
         format!("{}@{short}", entry.identity)
     };
+    let artifact = if let Some(src) = &entry.rename {
+        format!("{src} -> {}", entry.artifact)
+    } else if entry.collapsed {
+        format!("{}/", entry.artifact)
+    } else {
+        entry.artifact.clone()
+    };
     let _ = writeln!(
         out,
-        "  {line} {} -> {}",
-        entry.artifact,
+        "  {line} {artifact} -> {}",
         entry.destination.display()
     );
     for file in &entry.files {
         let suffix = if file.templated { " (templated)" } else { "" };
         let _ = writeln!(out, "    {}{suffix}", file.path.display());
+    }
+}
+
+fn render_binding_warnings(out: &mut String, group: &crate::sync::BindingWarnings) {
+    use crate::diagnostic::DID_YOU_MEAN;
+    use crate::sync::PreviewWarning;
+    for warning in &group.warnings {
+        match warning {
+            PreviewWarning::TakeNoMatch {
+                pattern,
+                suggestions,
+            } => {
+                let _ = writeln!(
+                    out,
+                    "  warning: {} take `{pattern}` matched no offered leaf",
+                    group.identity
+                );
+                if !suggestions.is_empty() {
+                    let _ = writeln!(out, "    {DID_YOU_MEAN} {}", suggestions.join(", "));
+                }
+            }
+            PreviewWarning::CollapseBlocked { dir } => {
+                let _ = writeln!(
+                    out,
+                    "  warning: {} `{dir}` could not collapse: a within-dir exclude forced \
+                     per-leaf links",
+                    group.identity
+                );
+            }
+        }
     }
 }
 
@@ -422,6 +461,159 @@ pub(super) fn render_add_contribution(
         "Opt in with `imports = [\"{name}\"]`, then `phora trust` to admit any hooks."
     );
     out
+}
+
+#[cfg(test)]
+mod preview_render_tests {
+    use std::path::PathBuf;
+
+    use super::super::query::PreviewPlan;
+    use super::{render_preview_json, render_preview_tree};
+    use crate::sync::{
+        BindingWarnings, PreviewEntry, PreviewFile, PreviewTargetPlan, PreviewWarning, SyncState,
+    };
+
+    fn synced(identity: &str, artifact: &str, dest: &str) -> PreviewEntry {
+        PreviewEntry {
+            identity: identity.to_string(),
+            source: identity.to_string(),
+            artifact: artifact.to_string(),
+            commit: "c0ffeeba".to_string(),
+            destination: PathBuf::from(dest),
+            state: SyncState::Synced,
+            files: Vec::new(),
+            rename: None,
+            collapsed: false,
+        }
+    }
+
+    fn plan(target: PreviewTargetPlan) -> PreviewPlan {
+        PreviewPlan {
+            targets: vec![target],
+        }
+    }
+
+    #[test]
+    fn renamed_leaf_renders_src_to_dest_legibly() {
+        let mut entry = synced("dots", "renamed.md", "/dst/renamed.md");
+        entry.rename = Some("x.md".to_string());
+        let tp = PreviewTargetPlan {
+            target: "home".to_string(),
+            entries: vec![entry],
+            collisions: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let rendered = render_preview_tree(&plan(tp));
+        assert!(
+            rendered.contains("x.md -> renamed.md"),
+            "a renamed leaf must render `src -> dest` so the rename is legible; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn collapsed_dir_is_marked_as_a_collapsed_artifact() {
+        let mut entry = synced("dots", "d", "/dst/d");
+        entry.collapsed = true;
+        entry.files = vec![PreviewFile {
+            path: PathBuf::from("a.md"),
+            templated: false,
+        }];
+        let tp = PreviewTargetPlan {
+            target: "home".to_string(),
+            entries: vec![entry],
+            collisions: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let rendered = render_preview_tree(&plan(tp));
+        assert!(
+            rendered.contains("d/"),
+            "a collapsed dir must be legible as a directory artifact (`d/`); got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("a.md"),
+            "the `--files` enrichment must still list the collapsed dir's children; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn take_no_match_warning_renders_with_a_did_you_mean_suggestion() {
+        let tp = PreviewTargetPlan {
+            target: "home".to_string(),
+            entries: Vec::new(),
+            collisions: Vec::new(),
+            warnings: vec![BindingWarnings {
+                identity: "dots".to_string(),
+                source: "dots".to_string(),
+                warnings: vec![PreviewWarning::TakeNoMatch {
+                    pattern: "init.lus".to_string(),
+                    suggestions: vec!["init.lua".to_string()],
+                }],
+            }],
+        };
+        let rendered = render_preview_tree(&plan(tp));
+        assert!(
+            rendered.contains("warning") && rendered.contains("init.lus"),
+            "a no-match-glob take must render a warning naming the unmatched pattern; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(crate::diagnostic::DID_YOU_MEAN) && rendered.contains("init.lua"),
+            "the warning must render a `did you mean:` suggestion naming the nearest leaf; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn collapse_blocked_warning_renders_per_binding() {
+        let tp = PreviewTargetPlan {
+            target: "home".to_string(),
+            entries: Vec::new(),
+            collisions: Vec::new(),
+            warnings: vec![BindingWarnings {
+                identity: "dots".to_string(),
+                source: "dots".to_string(),
+                warnings: vec![PreviewWarning::CollapseBlocked {
+                    dir: "d".to_string(),
+                }],
+            }],
+        };
+        let rendered = render_preview_tree(&plan(tp));
+        assert!(
+            rendered.contains("warning") && rendered.contains("`d`"),
+            "a blocked collapse must render a clear per-binding warning naming the dir; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn json_carries_warnings_in_a_structured_form() {
+        let tp = PreviewTargetPlan {
+            target: "home".to_string(),
+            entries: Vec::new(),
+            collisions: Vec::new(),
+            warnings: vec![BindingWarnings {
+                identity: "dots".to_string(),
+                source: "dots".to_string(),
+                warnings: vec![PreviewWarning::TakeNoMatch {
+                    pattern: "init.lus".to_string(),
+                    suggestions: vec!["init.lua".to_string()],
+                }],
+            }],
+        };
+        let json = render_preview_json(&plan(tp)).expect("preview json serializes");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json parses");
+        let warning = &value["targets"][0]["warnings"][0];
+        assert_eq!(
+            warning["identity"], "dots",
+            "the warning group must carry its binding identity in JSON; got:\n{json}"
+        );
+        let take = &warning["warnings"][0]["TakeNoMatch"];
+        assert_eq!(
+            take["pattern"], "init.lus",
+            "the structured JSON must carry the unmatched pattern, not pre-rendered prose; got:\n{json}"
+        );
+        assert_eq!(
+            take["suggestions"][0], "init.lua",
+            "the structured JSON must carry the suggestions array; got:\n{json}"
+        );
+    }
 }
 
 #[cfg(test)]
