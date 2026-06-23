@@ -253,6 +253,10 @@ impl ParsedSource {
             allow_symlinks: self.allow_symlinks.unwrap_or(false),
             allow_submodules: self.allow_submodules.unwrap_or(false),
             preserve_executable: self.preserve_executable.unwrap_or(true),
+            vcs_opt_in: self
+                .includes()
+                .iter()
+                .any(|p| p.split(['/', '\\']).any(|seg| seg == ".git")),
         }
     }
 

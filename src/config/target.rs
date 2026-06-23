@@ -114,9 +114,9 @@ pub struct Target {
     #[serde(default)]
     pub imports: Option<Vec<String>>,
     #[serde(default)]
-    pub take: BTreeMap<String, Vec<TakeEntry>>,
+    pub take: Option<BTreeMap<String, Vec<TakeEntry>>>,
     #[serde(default)]
-    pub collapse: BTreeMap<String, bool>,
+    pub collapse: Option<BTreeMap<String, bool>>,
     /// Composition-only anchor every destination must stay under; `Some` iff this is a composed dep target.
     #[serde(skip)]
     pub confine: Option<PathBuf>,
@@ -346,10 +346,10 @@ impl Target {
         if local.imports.is_some() {
             self.imports = local.imports;
         }
-        if !local.take.is_empty() {
+        if local.take.is_some() {
             self.take = local.take;
         }
-        if !local.collapse.is_empty() {
+        if local.collapse.is_some() {
             self.collapse = local.collapse;
         }
         self
@@ -656,8 +656,11 @@ mod tests {
             target.imports
         );
 
-        let one = target
+        let take = target
             .take
+            .as_ref()
+            .expect("a present mount take table parses to Some");
+        let one = take
             .get("anchor/one")
             .expect("the mount take table is keyed by anchor");
         assert_eq!(
@@ -676,8 +679,7 @@ mod tests {
             one[1]
         );
 
-        let two = target
-            .take
+        let two = take
             .get("anchor/two")
             .expect("anchor/two present in the table");
         assert!(
@@ -691,8 +693,8 @@ mod tests {
         let target: Target =
             toml::from_str("path = \"~/dst\"\n").expect("a bare target deserializes");
         assert!(
-            target.take.is_empty(),
-            "an omitted mount take table defaults to empty (no anchor subsetting); got: {:?}",
+            target.take.is_none(),
+            "an omitted mount take table defaults to None (inherit, no subsetting); got: {:?}",
             target.take
         );
     }
@@ -837,17 +839,19 @@ mod tests {
             "`imports` stays a refinement-free Vec<String>; got: {:?}",
             target.imports
         );
+        let collapse = target
+            .collapse
+            .as_ref()
+            .expect("a present mount collapse table parses to Some");
         assert_eq!(
-            target.collapse.get("anchor/one"),
+            collapse.get("anchor/one"),
             Some(&true),
-            "the mount collapse table is keyed by anchor; got: {:?}",
-            target.collapse
+            "the mount collapse table is keyed by anchor; got: {collapse:?}"
         );
         assert_eq!(
-            target.collapse.get("anchor/two"),
+            collapse.get("anchor/two"),
             Some(&false),
-            "anchor/two present in the collapse table; got: {:?}",
-            target.collapse
+            "anchor/two present in the collapse table; got: {collapse:?}"
         );
     }
 
@@ -856,8 +860,8 @@ mod tests {
         let target: Target =
             toml::from_str("path = \"~/dst\"\n").expect("a bare target deserializes");
         assert!(
-            target.collapse.is_empty(),
-            "an omitted mount collapse table defaults to empty; got: {:?}",
+            target.collapse.is_none(),
+            "an omitted mount collapse table defaults to None (inherit); got: {:?}",
             target.collapse
         );
     }
@@ -871,29 +875,132 @@ mod tests {
         let base = target_toml("path = \"~/dst\"\n[collapse]\n\"anchor/base\" = true\n");
         let local = target_toml("path = \"~/dst\"\n[collapse]\n\"anchor/local\" = false\n");
         let merged = base.merged_with(local);
+        let collapse = merged
+            .collapse
+            .as_ref()
+            .expect("a non-empty local collapse table merges to Some");
         assert_eq!(
-            merged.collapse.get("anchor/local"),
+            collapse.get("anchor/local"),
             Some(&false),
-            "a non-empty local collapse table replaces the base wholesale; got: {:?}",
-            merged.collapse
+            "a non-empty local collapse table replaces the base wholesale; got: {collapse:?}"
         );
         assert!(
-            !merged.collapse.contains_key("anchor/base"),
-            "the base collapse entry must not survive a non-empty local table; got: {:?}",
-            merged.collapse
+            !collapse.contains_key("anchor/base"),
+            "the base collapse entry must not survive a non-empty local table; got: {collapse:?}"
         );
     }
 
     #[test]
-    fn merge_empty_local_collapse_table_leaves_base_intact() {
+    fn merge_omitted_local_collapse_table_inherits_base() {
         let base = target_toml("path = \"~/dst\"\n[collapse]\n\"anchor/base\" = true\n");
         let local = target_toml("path = \"~/dst\"\n");
         let merged = base.merged_with(local);
+        let collapse = merged
+            .collapse
+            .as_ref()
+            .expect("an OMITTED local collapse table inherits the base table (Some), not None");
         assert_eq!(
-            merged.collapse.get("anchor/base"),
+            collapse.get("anchor/base"),
             Some(&true),
-            "an empty local collapse table leaves the base collapse table intact; got: {:?}",
-            merged.collapse
+            "an omitted (None) local collapse table inherits the base collapse table unchanged; \
+             got: {collapse:?}"
+        );
+    }
+
+    #[test]
+    fn merge_explicit_empty_local_collapse_table_clears_base() {
+        let base = target_toml("path = \"~/dst\"\n[collapse]\n\"anchor/base\" = true\n");
+        let local = target_toml("path = \"~/dst\"\n[collapse]\n");
+        let merged = base.merged_with(local);
+        let collapse = merged
+            .collapse
+            .as_ref()
+            .expect("an explicit empty local `[collapse]` parses to Some(empty), not None");
+        assert!(
+            collapse.is_empty(),
+            "an explicit present-but-empty local `[collapse]` must CLEAR the base table back to \
+             take-all (Some(empty)), not be ignored as if unset; got: {collapse:?}"
+        );
+    }
+
+    #[test]
+    fn merge_non_empty_local_take_table_replaces_base() {
+        let base = target_toml("path = \"~/dst\"\n[take]\n\"anchor/base\" = [\"x\"]\n");
+        let local = target_toml("path = \"~/dst\"\n[take]\n\"anchor/local\" = [\"y\"]\n");
+        let merged = base.merged_with(local);
+        let take = merged
+            .take
+            .as_ref()
+            .expect("a non-empty local take table merges to Some");
+        assert!(
+            take.contains_key("anchor/local"),
+            "a non-empty local take table replaces the base wholesale; got: {take:?}"
+        );
+        assert!(
+            !take.contains_key("anchor/base"),
+            "the base take entry must not survive a non-empty local table; got: {take:?}"
+        );
+    }
+
+    #[test]
+    fn merge_omitted_local_take_table_inherits_base() {
+        let base = target_toml("path = \"~/dst\"\n[take]\n\"anchor/base\" = [\"x\"]\n");
+        let local = target_toml("path = \"~/dst\"\n");
+        let merged = base.merged_with(local);
+        let take = merged
+            .take
+            .as_ref()
+            .expect("an OMITTED local take table inherits the base table (Some), not None");
+        assert!(
+            take.contains_key("anchor/base"),
+            "an omitted (None) local take table inherits the base take table unchanged; \
+             got: {take:?}"
+        );
+    }
+
+    #[test]
+    fn merge_explicit_empty_local_take_table_clears_base() {
+        let base = target_toml("path = \"~/dst\"\n[take]\n\"anchor/base\" = [\"x\"]\n");
+        let local = target_toml("path = \"~/dst\"\n[take]\n");
+        let merged = base.merged_with(local);
+        let take = merged
+            .take
+            .as_ref()
+            .expect("an explicit empty local `[take]` parses to Some(empty), not None");
+        assert!(
+            take.is_empty(),
+            "an explicit present-but-empty local `[take]` must CLEAR the base table back to \
+             take-all (Some(empty)), not be ignored as if unset; got: {take:?}"
+        );
+    }
+
+    #[test]
+    fn omitted_take_table_parses_to_none_while_present_empty_parses_to_some_empty() {
+        let omitted = target_toml("path = \"~/dst\"\n");
+        assert!(
+            omitted.take.is_none(),
+            "an OMITTED mount take table must parse to None (inherit); got: {:?}",
+            omitted.take
+        );
+        assert!(
+            omitted.collapse.is_none(),
+            "an OMITTED mount collapse table must parse to None (inherit); got: {:?}",
+            omitted.collapse
+        );
+
+        let present_empty = target_toml("path = \"~/dst\"\n[take]\n[collapse]\n");
+        assert_eq!(
+            present_empty.take.as_ref().map(BTreeMap::len),
+            Some(0),
+            "a present-but-empty `[take]` must parse to Some(empty), distinct from None; got: {:?}",
+            present_empty.take
+        );
+        assert_eq!(
+            present_empty.collapse.as_ref().map(BTreeMap::len),
+            Some(0),
+            "a present-but-empty `[collapse]` must parse to Some(empty), distinct from None; \
+             got: {:?}",
+            present_empty.collapse
         );
     }
 

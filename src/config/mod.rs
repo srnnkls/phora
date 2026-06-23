@@ -252,7 +252,7 @@ impl Config {
             for binding in target.sources.iter().flatten().map(|(_, b)| b) {
                 reject_malformed_take_entries(binding.take.iter().flatten())?;
             }
-            for entries in target.take.values() {
+            for entries in target.take.iter().flatten().map(|(_, e)| e) {
                 reject_malformed_take_entries(entries.iter())?;
             }
         }

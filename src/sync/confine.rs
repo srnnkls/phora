@@ -441,6 +441,30 @@ mod tests {
     }
 
     #[test]
+    fn dep_cannot_overwrite_the_consumer_phora_manifest_via_take_rename() {
+        let cwd = Path::new("/home/u/proj");
+        let anchor = cwd; // a dep target composed at the consumer root
+        let set = protected(cwd);
+        // The dest a `take` rename `{ "anything" = "phora.toml" }` resolves to
+        // after layout composition: the consumer's own manifest.
+        let dst = cwd.join("phora.toml");
+
+        let err = confine_destination(anchor, &dst, &set).expect_err(
+            "a transitive dep must never overwrite the consumer's phora.toml, even via a `take` \
+             rename whose dest resolves onto the manifest",
+        );
+        let msg = err_message(&err);
+        assert!(
+            msg.contains(PROTECTED_PATH),
+            "the rejection must carry the `{PROTECTED_PATH}` diagnostic; got: {msg}"
+        );
+        assert!(
+            msg.contains("phora.toml"),
+            "the rejection must name the protected `phora.toml`; got: {msg}"
+        );
+    }
+
+    #[test]
     fn prune_confinement_rejects_forged_out_of_anchor_record_path() {
         let anchor = Path::new("/home/u/.config");
         let forged = Path::new("/home/u/.config/../.ssh/authorized_keys");
