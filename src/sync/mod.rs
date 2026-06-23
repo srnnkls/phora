@@ -21,7 +21,8 @@ pub use plan::{
     expected_artifact_keys, plan_target, plan_targets, resolve_binding_plan, resolve_target_plan,
 };
 pub use preview::{
-    PreviewCollision, PreviewEntry, PreviewFile, PreviewTargetPlan, SyncState, preview_targets,
+    BindingWarnings, PreviewCollision, PreviewEntry, PreviewFile, PreviewTargetPlan,
+    PreviewWarning, SyncState, preview_targets,
 };
 pub use rebuild::{RebuildReport, rebuild_registry};
 pub use verify::{VerifyMismatch, VerifyReason, verify};

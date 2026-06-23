@@ -16,7 +16,9 @@ exit: 0
           "commit": "<COMMIT>",
           "destination": "<HOME>/deploy/editor",
           "state": "Synced",
-          "files": []
+          "files": [],
+          "rename": null,
+          "collapsed": true
         },
         {
           "identity": "dotfiles",
@@ -25,10 +27,13 @@ exit: 0
           "commit": "<COMMIT>",
           "destination": "<HOME>/deploy/lint",
           "state": "Synced",
-          "files": []
+          "files": [],
+          "rename": null,
+          "collapsed": true
         }
       ],
-      "collisions": []
+      "collisions": [],
+      "warnings": []
     }
   ]
 }--- stderr ---
