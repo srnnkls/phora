@@ -205,16 +205,16 @@ fn require_offered(entry: &str, offered: &BTreeSet<&str>) -> Result<()> {
     if offered.contains(entry) {
         Ok(())
     } else {
-        Err(non_offered_diagnostic(entry))
+        Err(non_offered_diagnostic(entry, offered))
     }
 }
 
-fn non_offered_diagnostic(entry: &str) -> crate::error::Error {
+fn non_offered_diagnostic(entry: &str, offered: &BTreeSet<&str>) -> crate::error::Error {
     SelectionDiagnostic {
         entry: entry.to_string(),
         matched_against: "the offer set".to_string(),
         why: "not present in the offer; `take` may not widen the offer".to_string(),
-        did_you_mean: None,
+        did_you_mean: crate::diagnostic::did_you_mean(entry, offered.iter().copied()),
         remedy: "name a leaf the source offers, or add it to the source's include".to_string(),
         debug_hint: None,
     }
@@ -284,7 +284,7 @@ fn duplicate_dest_diagnostic(first: &str, second: &str) -> crate::error::Error {
 #[cfg(test)]
 mod take_resolution_tests {
     use super::{Take, TakeWarning, is_take_glob, resolve_take};
-    use crate::diagnostic::{MATCHED_AGAINST, REMEDY, SELECTION};
+    use crate::diagnostic::{DID_YOU_MEAN, MATCHED_AGAINST, REMEDY, SELECTION};
 
     fn offer(leaves: &[&str]) -> Vec<String> {
         leaves.iter().map(|s| (*s).to_string()).collect()
@@ -586,6 +586,21 @@ mod take_resolution_tests {
             }],
         );
         assert_named_diagnostic(&rendered, "absent.md");
+    }
+
+    #[test]
+    fn a_non_offered_literal_close_to_an_offered_leaf_suggests_it() {
+        let offer = offer(&["editor/init.lua", "editor/keymaps.lua"]);
+        let rendered = rendered_error(&offer, &[Take::Literal("editor/inti.lua")]);
+        assert!(
+            rendered.contains(DID_YOU_MEAN) && rendered.contains("editor/init.lua"),
+            "a typo'd non-offered literal must suggest the closest offered leaf via the \
+             `did you mean` line; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("editor/keymaps.lua"),
+            "a far-off offered leaf must NOT be suggested (bounded edit distance); got:\n{rendered}"
+        );
     }
 
     // ---- 7. a no-match glob warns, it does not error ----
