@@ -3846,13 +3846,9 @@ fn prune_removes_stale_linked_symlink_without_following_it() {
     );
 }
 
-/// SMR-030 FIX-1: the live deploy path records a DIRECTORY-granular key (`alpha`), but a
-/// Link-mode plan with a within-dir exclude resolves leaf-granular (`alpha/a.md`). An
-/// exact-match prune would miss `alpha` and DELETE the live directory artifact. Containment
-/// must treat the dir record as still-expected because a planned leaf sits under `alpha/`.
 #[cfg(unix)]
 #[test]
-fn prune_keeps_a_dir_record_when_the_plan_resolves_it_leaf_granular() {
+fn prune_drops_a_stale_dir_record_once_the_plan_flips_leaf_granular() {
     use std::os::unix::fs::symlink;
 
     let wt = TempDir::new().expect("worktree tempdir");
@@ -3862,8 +3858,6 @@ fn prune_keeps_a_dir_record_when_the_plan_resolves_it_leaf_granular() {
         .expect("write alpha/secret.md");
 
     let td = TargetDir::new();
-    // Link + a within-dir exclude (`alpha/secret.md`) blocks collapse, so the plan resolves
-    // the dir leaf-granular to `alpha/a.md` — never the dir key `alpha`.
     let toml = format!(
         "version = 1\n\n\
          [sources.linked-src]\ngit = \"{}\"\nbranch = \"main\"\ndeploy = \"link\"\n\
@@ -3880,10 +3874,9 @@ fn prune_keeps_a_dir_record_when_the_plan_resolves_it_leaf_granular() {
     };
     let dir_dst = td.artifact_dst(&by_source, "linked-src", "alpha");
     std::fs::create_dir_all(dir_dst.parent().expect("dst parent")).expect("mkdir dst parent");
-    symlink(wt.path().join("alpha"), &dir_dst).expect("deploy the live `alpha` dir as a symlink");
+    symlink(wt.path().join("alpha"), &dir_dst).expect("deploy the stale `alpha` dir as a symlink");
 
     let registry = fx_registry();
-    // The OLD deploy path recorded `alpha` directory-granularly.
     registry
         .put(&RegistryRecord {
             version: 1,
@@ -3900,7 +3893,7 @@ fn prune_keeps_a_dir_record_when_the_plan_resolves_it_leaf_granular() {
             linked: true,
             vars_digest: None,
         })
-        .expect("seed the dir-granular live record");
+        .expect("seed the stale dir-granular record");
 
     let parsed = cfg.parsed_sources().expect("sources parse");
     let commits = one_commit(&parsed, "linked-src", "link");
@@ -3920,17 +3913,356 @@ fn prune_keeps_a_dir_record_when_the_plan_resolves_it_leaf_granular() {
 
     assert!(
         std::fs::symlink_metadata(&dir_dst).is_ok(),
-        "CONTAINMENT: prune must NOT delete the live `alpha` directory artifact — the plan's \
-         leaf `alpha/a.md` is a descendant of the recorded dir key `alpha`; it survived at {}",
+        "the plan expects `alpha/a.md` UNDER the stale `alpha` path, so prune must NOT delete it: \
+         removing the symlink (or, in the real post-deploy flow, the dir holding the live leaf) \
+         would destroy a live artifact / corrupt the source it points at — it vanished from {}",
         dir_dst.display()
     );
     assert!(
         registry
             .get(&artifact_key("dest", "linked-src", "alpha"))
             .expect("registry read")
-            .is_some(),
-        "the dir-granular `alpha` record must survive prune via bidirectional containment"
+            .is_none(),
+        "the stale dir-granular `alpha` RECORD must still be reconciled out once the plan resolves \
+         leaf-granular, even though its on-disk path is left for the writer to reconcile"
     );
+}
+
+/// A `dir/{a.md,b.md}` source committed and seeded into a fresh mirror, returning
+/// the backend, the resolved commit, and the url so a prune test can plan over it.
+fn seed_two_leaf_dir_repo() -> (TempDir, TempDir, GitBackend, String, String) {
+    let src = TempDir::new().expect("src tempdir");
+    let p = src.path();
+    run_git(p, &["init", "-b", "main", "."]);
+    run_git(p, &["config", "user.email", "test@example.com"]);
+    run_git(p, &["config", "user.name", "Test"]);
+    std::fs::create_dir_all(p.join("editor")).expect("mkdir editor");
+    std::fs::write(p.join("editor/a.md"), b"alpha\n").expect("write a.md");
+    std::fs::write(p.join("editor/b.md"), b"beta\n").expect("write b.md");
+    run_git(p, &["add", "-A"]);
+    run_git(p, &["commit", "-m", "init"]);
+    let url = p.to_string_lossy().into_owned();
+
+    let git_dir = TempDir::new().expect("git dir");
+    let backend = GitBackend::new(git_dir.path().to_path_buf());
+    backend.fetch(&sn("ed"), &url).expect("seed mirror");
+    let commit = backend
+        .resolve(&sn("ed"), &url, &Refspec::Branch("main".into()))
+        .expect("resolve HEAD");
+    (src, git_dir, backend, url, commit)
+}
+
+fn leaf_record(target: &str, identity: &str, key: &str) -> RegistryRecord {
+    RegistryRecord {
+        version: 1,
+        key: artifact_key(target, identity, key),
+        source: "ed".to_owned(),
+        commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
+        digest: "blake3:leaf".to_owned(),
+        projected_at: "2026-01-01T00:00:00Z".to_owned(),
+        layout: "by-source".to_owned(),
+        kind: RecordKind::File,
+        allow_symlinks: false,
+        preserve_executable: true,
+        files: vec![],
+        linked: false,
+        vars_digest: None,
+    }
+}
+
+fn dir_record(target: &str, identity: &str, key: &str) -> RegistryRecord {
+    let mut record = leaf_record(target, identity, key);
+    record.kind = RecordKind::Dir;
+    record.digest = "blake3:dir".to_owned();
+    record
+}
+
+/// `prune_orphans` over a single-source-one-target config keyed `ed`.
+fn prune_one(
+    cfg: &Config,
+    backend: &GitBackend,
+    registry: &FileRegistry,
+    commit: &str,
+) -> Result<()> {
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(cfg, &parsed).expect("remotes resolve");
+    let commits = one_commit(&parsed, "ed", commit);
+    let protected = test_protected(&std::env::temp_dir());
+    prune_orphans(
+        cfg, &parsed, &remotes, backend, registry, &commits, &protected,
+    )
+}
+
+#[test]
+fn prune_reconciles_a_stale_dir_record_without_destroying_a_live_leaf_under_it() {
+    let (src, _git, backend, url, commit) = seed_two_leaf_dir_repo();
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.ed]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\n\
+         sources = {{ ed = {{ source = \"ed\", take = [\"editor/a.md\"] }} }}\n\
+         layout = \"by-source\"\n",
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("narrowing-take config parses");
+    let by_source = crate::config::LayoutConfig {
+        kind: LayoutKind::BySource,
+        separator: String::new(),
+    };
+    let leaf_dst = td.artifact_dst(&by_source, "ed", "editor/a.md");
+    std::fs::create_dir_all(leaf_dst.parent().expect("leaf parent")).expect("mkdir leaf parent");
+    std::fs::write(&leaf_dst, b"alpha\n").expect("write live leaf");
+
+    let registry = fx_registry();
+    registry
+        .put(&dir_record("dest", "ed", "editor"))
+        .expect("seed stale dir record");
+    registry
+        .put(&leaf_record("dest", "ed", "editor/a.md"))
+        .expect("seed live leaf record");
+
+    prune_one(&cfg, &backend, &registry, &commit).expect("prune runs");
+
+    assert!(
+        leaf_dst.exists(),
+        "PROBE: the live taken leaf editor/a.md must SURVIVE prune; pruning the stale `editor` \
+         dir record (remove_dir_all) destroyed it at {}",
+        leaf_dst.display()
+    );
+    drop(src);
+}
+
+#[cfg(unix)]
+#[test]
+fn prune_reconciles_a_stale_leaf_record_without_traversing_a_collapsed_symlink_into_the_source() {
+    use std::os::unix::fs::symlink;
+    let (src, _git, backend, url, commit) = seed_two_leaf_dir_repo();
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.ed]\ngit = \"{url}\"\nbranch = \"main\"\ndeploy = \"link\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\"ed\"]\nlayout = \"by-source\"\n",
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("collapse config parses");
+    let by_source = crate::config::LayoutConfig {
+        kind: LayoutKind::BySource,
+        separator: String::new(),
+    };
+    let dir_dst = td.artifact_dst(&by_source, "ed", "editor");
+    std::fs::create_dir_all(dir_dst.parent().expect("dst parent")).expect("mkdir dst parent");
+    symlink(src.path().join("editor"), &dir_dst).expect("deploy collapsed editor symlink");
+
+    let registry = fx_registry();
+    registry
+        .put(&dir_record("dest", "ed", "editor"))
+        .expect("seed live collapsed dir record");
+    registry
+        .put(&leaf_record("dest", "ed", "editor/a.md"))
+        .expect("seed stale per-leaf record");
+
+    prune_one(&cfg, &backend, &registry, &commit).expect("prune runs");
+
+    assert!(
+        src.path().join("editor/a.md").exists(),
+        "PROBE: pruning stale `editor/a.md` must NOT traverse the collapsed `editor` symlink and \
+         delete the SOURCE file; the source working tree was corrupted"
+    );
+    drop(src);
+}
+
+#[test]
+fn prune_flips_collapse_to_per_leaf_pruning_the_stale_dir_record() {
+    let (src, _git, backend, url, commit) = seed_two_leaf_dir_repo();
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.ed]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\n\
+         sources = {{ ed = {{ source = \"ed\", take = [\"editor/a.md\"] }} }}\n\
+         layout = \"by-source\"\n",
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("narrowing-take config parses");
+
+    let by_source = crate::config::LayoutConfig {
+        kind: LayoutKind::BySource,
+        separator: String::new(),
+    };
+    let dir_dst = td.artifact_dst(&by_source, "ed", "editor");
+    std::fs::create_dir_all(&dir_dst).expect("mkdir stale dir dst");
+    std::fs::write(dir_dst.join("a.md"), b"alpha\n").expect("write stale dir file");
+
+    let registry = fx_registry();
+    registry
+        .put(&dir_record("dest", "ed", "editor"))
+        .expect("seed stale dir record");
+
+    prune_one(&cfg, &backend, &registry, &commit).expect("prune runs");
+
+    assert!(
+        registry
+            .get(&artifact_key("dest", "ed", "editor"))
+            .expect("registry read")
+            .is_none(),
+        "the stale collapsed `editor` dir RECORD is an EXACT-match orphan once the plan resolves \
+         leaf-granular to `editor/a.md`; prune must reconcile it out of the registry"
+    );
+    assert!(
+        dir_dst.join("a.md").exists(),
+        "the live taken leaf editor/a.md under the stale `editor` dir must SURVIVE: prune drops \
+         the stale record but must not remove a path holding a live expected artifact"
+    );
+    drop(src);
+}
+
+#[test]
+fn prune_flips_per_leaf_to_collapse_pruning_the_stale_leaf_records() {
+    let (src, _git, backend, url, commit) = seed_two_leaf_dir_repo();
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.ed]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\"ed\"]\nlayout = \"by-source\"\n",
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("collapse config parses");
+
+    let by_source = crate::config::LayoutConfig {
+        kind: LayoutKind::BySource,
+        separator: String::new(),
+    };
+    for leaf in ["editor/a.md", "editor/b.md"] {
+        let dst = td.artifact_dst(&by_source, "ed", leaf);
+        std::fs::create_dir_all(dst.parent().expect("leaf parent")).expect("mkdir leaf parent");
+        std::fs::write(&dst, b"stale\n").expect("write stale leaf");
+    }
+    let registry = fx_registry();
+    registry
+        .put(&leaf_record("dest", "ed", "editor/a.md"))
+        .expect("seed stale a.md record");
+    registry
+        .put(&leaf_record("dest", "ed", "editor/b.md"))
+        .expect("seed stale b.md record");
+
+    prune_one(&cfg, &backend, &registry, &commit).expect("prune runs");
+
+    for leaf in ["editor/a.md", "editor/b.md"] {
+        assert!(
+            registry
+                .get(&artifact_key("dest", "ed", leaf))
+                .expect("registry read")
+                .is_none(),
+            "the stale per-leaf record `{leaf}` is an EXACT-match orphan once the plan collapses \
+             to dir `editor`; it must be pruned"
+        );
+    }
+    drop(src);
+}
+
+#[test]
+fn prune_narrowing_take_prunes_the_untaken_leaf_keeps_the_taken_one() {
+    let (src, _git, backend, url, commit) = seed_two_leaf_dir_repo();
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.ed]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\n\
+         sources = {{ ed = {{ source = \"ed\", take = [\"editor/a.md\"] }} }}\n\
+         layout = \"by-source\"\n",
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("narrowing-take config parses");
+
+    let by_source = crate::config::LayoutConfig {
+        kind: LayoutKind::BySource,
+        separator: String::new(),
+    };
+    let untaken_dst = td.artifact_dst(&by_source, "ed", "editor/b.md");
+    std::fs::create_dir_all(untaken_dst.parent().expect("parent")).expect("mkdir parent");
+    std::fs::write(&untaken_dst, b"beta\n").expect("write untaken leaf");
+
+    let registry = fx_registry();
+    registry
+        .put(&leaf_record("dest", "ed", "editor/a.md"))
+        .expect("seed taken record");
+    registry
+        .put(&leaf_record("dest", "ed", "editor/b.md"))
+        .expect("seed untaken record");
+
+    prune_one(&cfg, &backend, &registry, &commit).expect("prune runs");
+
+    assert!(
+        registry
+            .get(&artifact_key("dest", "ed", "editor/a.md"))
+            .expect("registry read")
+            .is_some(),
+        "the still-taken leaf `editor/a.md` must survive prune"
+    );
+    assert!(
+        registry
+            .get(&artifact_key("dest", "ed", "editor/b.md"))
+            .expect("registry read")
+            .is_none(),
+        "the now-untaken leaf `editor/b.md` is an orphan and must be pruned"
+    );
+    assert!(
+        !untaken_dst.exists(),
+        "the untaken leaf's on-disk file must be removed"
+    );
+    drop(src);
+}
+
+#[test]
+fn prune_is_instance_granular_across_two_aliases_of_one_source() {
+    let (src, _git, backend, url, commit) = seed_two_leaf_dir_repo();
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.ed]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = {{\n\
+         one = {{ source = \"ed\", take = [\"editor/b.md\"] }},\n\
+         two = {{ source = \"ed\", take = [\"editor/a.md\"] }},\n\
+         }}\nlayout = \"by-source\"\n",
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("two-alias divergent-take config parses");
+
+    let by_source = crate::config::LayoutConfig {
+        kind: LayoutKind::BySource,
+        separator: String::new(),
+    };
+    let one_stale = td.artifact_dst(&by_source, "one", "editor/a.md");
+    std::fs::create_dir_all(one_stale.parent().expect("parent")).expect("mkdir parent");
+    std::fs::write(&one_stale, b"alpha\n").expect("write one's stale a.md");
+
+    let registry = fx_registry();
+    registry
+        .put(&leaf_record("dest", "one", "editor/a.md"))
+        .expect("seed one's stale a.md (now untaken under `one`)");
+    registry
+        .put(&leaf_record("dest", "two", "editor/a.md"))
+        .expect("seed two's a.md (still taken under `two`)");
+
+    prune_one(&cfg, &backend, &registry, &commit).expect("prune runs");
+
+    assert!(
+        registry
+            .get(&artifact_key("dest", "one", "editor/a.md"))
+            .expect("registry read")
+            .is_none(),
+        "alias `one` no longer takes `editor/a.md`; ITS record is an orphan and must be pruned"
+    );
+    assert!(
+        registry
+            .get(&artifact_key("dest", "two", "editor/a.md"))
+            .expect("registry read")
+            .is_some(),
+        "alias `two` still takes its identically-named `editor/a.md`; instance-granular buckets \
+         must keep it — pruning `one` must NOT touch `two`"
+    );
+    drop(src);
 }
 
 /// A real `GitBackend` over a throwaway mirror dir; link-source rebuild/prune
@@ -7474,6 +7806,73 @@ fn preview_files_strips_tmpl_suffix_and_marks_templated_in_copy_mode() {
 }
 
 #[test]
+fn preview_reflects_a_narrowing_take_omitting_the_untaken_sibling() {
+    let src = TempDir::new().unwrap();
+    let p = src.path();
+    run_git(p, &["init", "-b", "main", "."]);
+    run_git(p, &["config", "user.email", "test@example.com"]);
+    run_git(p, &["config", "user.name", "Test"]);
+    std::fs::create_dir_all(p.join("editor")).unwrap();
+    std::fs::write(p.join("editor/a.md"), b"alpha\n").unwrap();
+    std::fs::write(p.join("editor/b.md"), b"beta\n").unwrap();
+    run_git(p, &["add", "-A"]);
+    run_git(p, &["commit", "-m", "init"]);
+    let url = p.to_string_lossy().into_owned();
+
+    let git_dir = TempDir::new().expect("git dir");
+    let backend = GitBackend::new(git_dir.path().to_path_buf());
+    backend.fetch(&sn("ed"), &url).expect("seed mirror");
+    let commit = backend
+        .resolve(&sn("ed"), &url, &Refspec::Branch("main".into()))
+        .expect("resolve HEAD from the seeded mirror");
+
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+             [sources.ed]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+             [targets.dest]\npath = \"{}\"\n\
+             sources = {{ ed = {{ source = \"ed\", take = [\"editor/a.md\"] }} }}\n\
+             layout = \"by-source\"\n",
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("narrowing-take preview config parses");
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+    let lock = lock_with(&cfg, "ed", &url, &commit);
+
+    let plans = preview_targets(&cfg, &parsed, &remotes, &backend, Some(&lock), true)
+        .expect("a --files preview over a narrowing take builds");
+    let plan = only_plan(&plans, "dest");
+
+    let synced = plan
+        .entries
+        .iter()
+        .filter(|e| e.state == SyncState::Synced)
+        .count();
+    assert_eq!(
+        synced, 1,
+        "a take of one leaf previews exactly one synced artifact; got {:?}",
+        plan.entries
+    );
+    let entry = preview_entry(plan, "editor/a.md");
+    assert_eq!(
+        entry.files.len(),
+        1,
+        "a single-leaf take previews as its own Leaf, not a collapsed `editor` dir of many \
+         children; got {:?}",
+        entry.files
+    );
+    file_named(entry, "a.md");
+    assert!(
+        !plan.entries.iter().any(|e| e.artifact.contains("b.md")),
+        "the untaken sibling editor/b.md must be absent from preview just as it is from deploy; \
+         a preview that read_dir'd the source tree would leak it; got {:?}",
+        plan.entries
+    );
+    drop(src);
+}
+
+#[test]
 fn preview_files_in_link_mode_never_marks_templated() {
     let (src, url) = build_templated_artifact_repo();
     let td = TargetDir::new();
@@ -9050,26 +9449,44 @@ fn seed_recorded_artifact(reg: &FileRegistry, source: &str, artifact: &str) {
 }
 
 #[test]
-fn sealed_offer_locked_artifact_dropped_from_offer_is_hard_error() {
-    let fx = build_sync_fixture();
+fn sealed_offer_source_dropped_a_still_wanted_artifact_is_a_hard_error() {
+    let src = TempDir::new().expect("src tempdir");
+    let p = src.path();
+    run_git(p, &["init", "-b", "main", "."]);
+    run_git(p, &["config", "user.email", "test@example.com"]);
+    run_git(p, &["config", "user.name", "Test"]);
+    std::fs::create_dir_all(p.join("docs")).expect("mkdir docs");
+    std::fs::write(p.join("docs/readme.md"), b"# docs\n").expect("write docs");
+    run_git(p, &["add", "-A"]);
+    run_git(p, &["commit", "-m", "init without editor/"]);
+    let url = p.to_string_lossy().into_owned();
+
+    let git_dir = TempDir::new().expect("git dir");
+    let state_dir = TempDir::new().expect("state dir");
+    let backend = GitBackend::new(git_dir.path().to_path_buf());
+    let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+
     let td = TargetDir::new();
     let toml = format!(
         "version = 1\n\n\
-         [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\ninclude = [\"docs/**\"]\n\n\
+         [sources.editor-src]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
          [targets.dest]\npath = \"{}\"\nsources = [\"editor-src\"]\nlayout = \"flat\"\n",
-        fx.url,
         td.target_path().display(),
     );
-    let cfg = Config::parse(&toml).expect("sealed-offer config parses");
+    let cfg = Config::parse(&toml).expect("default-offer config parses");
 
-    seed_recorded_artifact(&fx.registry, "editor-src", "editor");
+    seed_recorded_artifact(&registry, "editor-src", "editor");
 
     let in_ = input(&cfg, None, None, None, false);
-    let Err(err) = sync(&in_, &fx.backend, &fx.registry) else {
-        panic!("a recorded artifact no longer in the source's OFFER must be a hard error (D9)");
+    let Err(err) = sync(&in_, &backend, &registry) else {
+        panic!(
+            "the default offer STILL selects `editor`, but the source dropped it: a silent source \
+             narrowing under an active offer must be a hard error (D9)"
+        );
     };
     let msg = err.to_string();
     assert_sealed_offer_diagnostic(&msg, "dest", "editor-src", "editor");
+    drop(src);
 }
 
 fn assert_sealed_offer_diagnostic(rendered: &str, target: &str, source: &str, artifact: &str) {
@@ -9112,10 +9529,9 @@ fn sealed_offer_take_subsetting_a_leaf_is_allowed_not_a_violation() {
 }
 
 #[test]
-fn sealed_offer_validates_crash_recovered_record_finalized_by_the_sweep() {
+fn sealed_offer_intentional_narrowing_does_not_block_prune_of_the_dropped_artifact() {
     let fx = build_sync_fixture();
     let td = TargetDir::new();
-    // `editor-src` is bound and scoped to docs/**, so it offers `docs/...` but NOT `editor`.
     let toml = format!(
         "version = 1\n\n\
          [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\ninclude = [\"docs/**\"]\n\n\
@@ -9123,11 +9539,63 @@ fn sealed_offer_validates_crash_recovered_record_finalized_by_the_sweep() {
         fx.url,
         td.target_path().display(),
     );
+    let cfg = Config::parse(&toml).expect("intentional-narrowing config parses");
+
+    let stale_dst = td.target_path().join("editor");
+    std::fs::create_dir_all(&stale_dst).expect("mkdir stale editor");
+    std::fs::write(stale_dst.join("init.lua"), b"-- init\n").expect("write stale file");
+    seed_recorded_artifact(&fx.registry, "editor-src", "editor");
+
+    let in_ = SyncInput {
+        prune: true,
+        ..input(&cfg, None, None, None, false)
+    };
+    let out = sync(&in_, &fx.backend, &fx.registry).expect(
+        "intentionally narrowing the offer drops `editor` from BOTH the offer and the plan, so it \
+         is a pure orphan — `--prune` must SUCCEED and clean it, never hard-error on the seal",
+    );
+    assert!(!out.had_failures, "the narrowing prune run must succeed");
+    assert!(
+        fx.registry
+            .get(&artifact_key("dest", "editor-src", "editor"))
+            .expect("registry read")
+            .is_none(),
+        "the dropped `editor` artifact must be PRUNED, not locked behind a sealed-offer error"
+    );
+    assert!(
+        !stale_dst.exists(),
+        "the dropped artifact's on-disk files must be removed by prune"
+    );
+}
+
+#[test]
+fn sealed_offer_validates_crash_recovered_record_finalized_by_the_sweep() {
+    let src = TempDir::new().expect("src tempdir");
+    let p = src.path();
+    run_git(p, &["init", "-b", "main", "."]);
+    run_git(p, &["config", "user.email", "test@example.com"]);
+    run_git(p, &["config", "user.name", "Test"]);
+    std::fs::create_dir_all(p.join("docs")).expect("mkdir docs");
+    std::fs::write(p.join("docs/readme.md"), b"# docs\n").expect("write docs");
+    run_git(p, &["add", "-A"]);
+    run_git(p, &["commit", "-m", "init without editor/"]);
+    let url = p.to_string_lossy().into_owned();
+    let head_sha = rev_parse(p, "HEAD");
+
+    let git_dir = TempDir::new().expect("git dir");
+    let state_dir = TempDir::new().expect("state dir");
+    let backend = GitBackend::new(git_dir.path().to_path_buf());
+    let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.editor-src]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\"editor-src\"]\nlayout = \"flat\"\n",
+        td.target_path().display(),
+    );
     let cfg = Config::parse(&toml).expect("sealed-offer recovery config parses");
 
-    // A swap-completed crash whose record is for the BOUND-but-no-longer-offered `editor`.
-    // It exists in the registry ONLY after recovery_sweep, so a pre-sweep D9 snapshot would
-    // miss it. Post-recovery, D9 must validate it and reject.
     let crashed_dst = td.target_path().join("editor");
     std::fs::create_dir_all(&crashed_dst).expect("mkdir crashed dst");
     std::fs::write(crashed_dst.join("init.lua"), b"-- init\n").expect("write crashed file");
@@ -9137,7 +9605,7 @@ fn sealed_offer_validates_crash_recovered_record_finalized_by_the_sweep() {
         version: 1,
         key: crashed_key.clone(),
         source: "editor-src".to_owned(),
-        commit: fx.head_sha.clone(),
+        commit: head_sha.clone(),
         digest: "blake3:recovered".to_owned(),
         projected_at: "2026-01-01T00:00:00Z".to_owned(),
         layout: "flat".to_owned(),
@@ -9156,7 +9624,7 @@ fn sealed_offer_validates_crash_recovered_record_finalized_by_the_sweep() {
 
     let staging_base = td.parent_path.join(".phora-stage");
     let staging = staging_base.join("editor-deadbeef");
-    let journal = Journal::open(&fx.registry.locks_dir()).expect("open journal");
+    let journal = Journal::open(&registry.locks_dir()).expect("open journal");
     journal
         .append(&JournalEntry {
             staging_base,
@@ -9168,21 +9636,19 @@ fn sealed_offer_validates_crash_recovered_record_finalized_by_the_sweep() {
         .expect("seed swap-completed crash intent");
 
     assert!(
-        fx.registry
-            .get(&crashed_key)
-            .expect("pre-sync get")
-            .is_none(),
+        registry.get(&crashed_key).expect("pre-sync get").is_none(),
         "premise: the crashed `editor` record exists only once recovery_sweep finalizes it"
     );
 
     let in_ = input(&cfg, None, None, None, false);
-    let Err(err) = sync(&in_, &fx.backend, &fx.registry) else {
+    let Err(err) = sync(&in_, &backend, &registry) else {
         panic!(
-            "a crash-recovered, STILL-BOUND, no-longer-offered artifact must trip D9 once the \
+            "a crash-recovered, STILL-WANTED, source-dropped artifact must trip D9 once the \
              sealed-offer snapshot is taken AFTER recovery_sweep, not before"
         );
     };
     assert_sealed_offer_diagnostic(&err.to_string(), "dest", "editor-src", "editor");
+    drop(src);
 }
 
 mod leaf_granular_deploy_tests {

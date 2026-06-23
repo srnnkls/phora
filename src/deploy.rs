@@ -44,9 +44,12 @@ pub fn check_artifact_state(
     key: &ArtifactKey,
     expected_vars_digest: Option<&str>,
 ) -> Result<ArtifactState> {
-    let is_ejected = ejected
-        .iter()
-        .any(|e| e.artifact == artifact_name && e.source == expected_source);
+    let is_ejected = ejected.iter().any(|e| {
+        e.source == expected_source
+            && (e.artifact == artifact_name
+                || artifact_name.starts_with(&format!("{}/", e.artifact))
+                || e.artifact.starts_with(&format!("{artifact_name}/")))
+    });
     if is_ejected {
         return Ok(ArtifactState::Ejected);
     }
@@ -984,6 +987,69 @@ mod tests {
             matches!(st, ArtifactState::Clean),
             "an ejected entry whose artifact matches but whose source differs from expected_source \
              must not eject this artifact: ejection keys on (artifact, source), got {st:?}"
+        );
+    }
+
+    #[test]
+    fn a_dir_eject_blocks_redeploy_of_a_leaf_under_it() {
+        let (_state_dir, reg) = registry();
+        let target = TempDir::new().expect("target dir");
+        let leaf = target.path().join("editor").join("a.md");
+        std::fs::create_dir_all(leaf.parent().expect("leaf parent")).expect("mkdir leaf parent");
+        std::fs::write(&leaf, b"alpha\n").expect("write leaf");
+
+        let leaf_key = ArtifactKey {
+            target: TARGET.to_owned(),
+            source: SOURCE.to_owned(),
+            artifact: "editor/a.md".to_owned(),
+        };
+        let st = check_artifact_state(
+            &leaf,
+            SOURCE,
+            COMMIT,
+            &[ejected(SOURCE, "editor")],
+            "editor/a.md",
+            &reg,
+            &leaf_key,
+            None,
+        )
+        .expect("check_artifact_state");
+
+        assert!(
+            matches!(st, ArtifactState::Ejected),
+            "a dir-ejected `editor` must block redeploy of the leaf `editor/a.md` that falls under \
+             it — the user took over the whole `editor` path; got {st:?}"
+        );
+    }
+
+    #[test]
+    fn a_leaf_eject_blocks_redeploy_of_a_collapsed_dir_over_it() {
+        let (_state_dir, reg) = registry();
+        let target = TempDir::new().expect("target dir");
+        let dir = target.path().join("editor");
+        std::fs::create_dir_all(&dir).expect("mkdir dir");
+
+        let dir_key = ArtifactKey {
+            target: TARGET.to_owned(),
+            source: SOURCE.to_owned(),
+            artifact: "editor".to_owned(),
+        };
+        let st = check_artifact_state(
+            &dir,
+            SOURCE,
+            COMMIT,
+            &[ejected(SOURCE, "editor/a.md")],
+            "editor",
+            &reg,
+            &dir_key,
+            None,
+        )
+        .expect("check_artifact_state");
+
+        assert!(
+            matches!(st, ArtifactState::Ejected),
+            "a leaf-ejected `editor/a.md` must block redeploy of a collapsed `editor` dir that \
+             would overwrite it; got {st:?}"
         );
     }
 

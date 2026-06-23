@@ -455,9 +455,15 @@ fn run_all_hooks(
     Ok((hook_results, stripped))
 }
 
+struct BindingOffer {
+    offered: Vec<String>,
+    selection: crate::kernel::OfferSelection,
+}
+
 /// Compares against the resolved OFFER set, not the take/kept set: a leaf dropped by
-/// `take` while still offered stays allowed. Containment-based: a recorded key survives
-/// if any offered leaf equals it or sits under `<key>/`.
+/// `take` while still offered stays allowed. A recorded key the source no longer provides
+/// only hard-errors when the offer config still ADMITS its path (a silent source narrowing);
+/// when the config itself narrowed past it, it is a pure orphan left to `--prune`.
 fn validate_sealed_offer(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
@@ -468,7 +474,7 @@ fn validate_sealed_offer(
 ) -> Result<()> {
     use crate::kernel::{OfferSelection, SourceName};
 
-    let mut offered: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    let mut offers: BTreeMap<(String, String), BindingOffer> = BTreeMap::new();
     for (target_name, target) in &config.targets {
         for binding in target.resolve_sources(parsed) {
             let Some(source) = parsed.get(binding.source) else {
@@ -491,22 +497,24 @@ fn validate_sealed_offer(
             let selection =
                 OfferSelection::compile(offer.includes(), offer.excludes(), offer.root())?;
             let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
-            offered.insert(
+            let offered = selection.select(&refs);
+            offers.insert(
                 (target_name.clone(), binding.identity.to_owned()),
-                selection.select(&refs),
+                BindingOffer { offered, selection },
             );
         }
     }
 
     for key in recorded {
-        let Some(leaves) = offered.get(&(key.target.clone(), key.source.clone())) else {
+        let Some(offer) = offers.get(&(key.target.clone(), key.source.clone())) else {
             continue;
         };
         let artifact = &key.artifact;
-        let still_offered = leaves
+        let still_offered = offer
+            .offered
             .iter()
             .any(|leaf| leaf == artifact || leaf.starts_with(&format!("{artifact}/")));
-        if !still_offered {
+        if !still_offered && offer.selection.admits_published(artifact) {
             return Err(sealed_offer_diagnostic(&key.target, &key.source, artifact));
         }
     }

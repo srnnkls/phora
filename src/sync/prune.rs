@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use crate::config::{Config, ParsedSource};
 use crate::error::{Error, Result};
@@ -9,10 +10,8 @@ use super::confine::{ProtectedPathSet, confine_destination};
 use super::plan::{expected_artifact_keys, plan_targets};
 use super::remove_orphan_path;
 
-/// `(target, source) → expected leaf artifacts`. `deploy_target` records directory-granular
-/// keys (`editor`) while the plan here is leaf-granular (`editor/init.lua`); either can be the
-/// ancestor of the other, so an orphan is a record with no bidirectional containment match.
 type ExpectedByBinding = BTreeMap<(String, String), Vec<String>>;
+type ExpectedPaths = BTreeMap<String, Vec<PathBuf>>;
 
 fn is_still_expected(
     expected: &ExpectedByBinding,
@@ -20,13 +19,16 @@ fn is_still_expected(
     source: &str,
     artifact: &str,
 ) -> bool {
-    let Some(leaves) = expected.get(&(target.to_owned(), source.to_owned())) else {
+    let Some(keys) = expected.get(&(target.to_owned(), source.to_owned())) else {
         return false;
     };
-    leaves.iter().any(|expected_key| {
-        expected_key == artifact
-            || expected_key.starts_with(&format!("{artifact}/"))
-            || artifact.starts_with(&format!("{expected_key}/"))
+    keys.iter().any(|expected_key| expected_key == artifact)
+}
+
+fn overlaps_live_dest(path: &Path, expected_paths: &ExpectedPaths, target: &str) -> bool {
+    expected_paths.get(target).is_some_and(|live| {
+        live.iter()
+            .any(|dest| dest.starts_with(path) || path.starts_with(dest))
     })
 }
 
@@ -41,12 +43,25 @@ pub(super) fn prune_orphans(
 ) -> Result<()> {
     let plans = plan_targets(config, parsed, remotes, backend, resolved_commits)?;
     let mut expected: ExpectedByBinding = BTreeMap::new();
+    let mut expected_paths: ExpectedPaths = BTreeMap::new();
     for plan in &plans {
+        let target = config.targets.get(&plan.target);
         for binding in &plan.bindings {
-            let bucket = expected
+            let keys = expected_artifact_keys(binding);
+            if let Some(target) = target {
+                let paths = expected_paths.entry(plan.target.clone()).or_default();
+                for key in &keys {
+                    paths.push(
+                        target
+                            .expanded_path()
+                            .join(target.layout().artifact_path(&binding.identity, key)),
+                    );
+                }
+            }
+            expected
                 .entry((plan.target.clone(), binding.identity.clone()))
-                .or_default();
-            bucket.extend(expected_artifact_keys(binding));
+                .or_default()
+                .extend(keys);
         }
     }
 
@@ -73,7 +88,10 @@ pub(super) fn prune_orphans(
                 None => Ok(dst.clone()),
             };
             match confined {
-                Ok(path) if path.exists() => {
+                Ok(path)
+                    if path.exists()
+                        && !overlaps_live_dest(&path, &expected_paths, &record.key.target) =>
+                {
                     eprintln!(
                         "phora: pruning orphaned {}:{}",
                         record.key.source, record.key.artifact
