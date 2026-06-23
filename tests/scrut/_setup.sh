@@ -154,6 +154,27 @@ EOF
 	rm -f "$PWD/phora.toml.bak"
 }
 
+reset_deploy() {
+	rm -rf "$PWD/target-home" "$XDG_STATE_HOME/phora/projects" "$PWD/phora.lock"
+}
+
+# Heredoc-free: scrut folds a `>` heredoc continuation into the command line.
+seed_selection() {
+	url="$1"
+	offer="$2"
+	binding_body="$3"
+	target="$PWD/target-home"
+	mkdir -p "$target"
+	{
+		printf 'version = 1\n\n[sources.dotfiles]\npath = "%s"\nbranch = "main"\n' "$url"
+		if [ -n "$offer" ]; then
+			printf '%s\n' "$offer"
+		fi
+		printf '\n[targets.home]\npath = "%s"\nlayout = "flat"\n' "$target"
+		printf '\n[targets.home.sources.dotfiles]\n%s\n' "$binding_body"
+	} >"$PWD/phora.toml"
+}
+
 # The plain `static.txt` sibling exists to prove non-`.tmpl` files copy untouched.
 make_templated_source() {
 	repo="$PWD/src-$1"
