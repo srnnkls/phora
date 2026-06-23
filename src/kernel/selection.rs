@@ -40,6 +40,11 @@ impl OfferSelection {
         })
     }
 
+    #[must_use]
+    pub fn admits_published(&self, published: &str) -> bool {
+        self.selects_leaf(published) || self.selects_leaf(&format!("{published}/"))
+    }
+
     /// Returns the root-relative published paths of every selected candidate leaf.
     #[must_use]
     pub fn select(&self, candidates: &[&str]) -> Vec<String> {
@@ -170,6 +175,27 @@ mod offer_compiler_tests {
 
     fn selected(sel: &OfferSelection, candidates: &[&str]) -> Vec<String> {
         sel.select(candidates)
+    }
+
+    #[test]
+    fn admits_published_separates_a_config_narrow_from_a_source_drop() {
+        let full = compile(&[], &[]);
+        assert!(
+            full.admits_published("editor"),
+            "a full offer still admits `editor`, so a recorded `editor` the source dropped is a \
+             genuine source narrowing (D9), not a config narrowing"
+        );
+
+        let narrowed = compile(&["docs/**"], &[]);
+        assert!(
+            !narrowed.admits_published("editor"),
+            "an offer narrowed to `docs/**` no longer admits `editor`: the config narrowed past it \
+             on purpose, so the record is a pure orphan for prune, not a seal violation"
+        );
+        assert!(
+            narrowed.admits_published("docs/readme.md"),
+            "the narrowed offer still admits the `docs/**` path it kept"
+        );
     }
 
     fn assert_selects(sel: &OfferSelection, candidates: &[&str], expected: &[&str]) {
