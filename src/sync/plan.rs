@@ -278,7 +278,22 @@ fn reject_cross_binding_dups(target_name: &str, bindings: &[ResolvedBindingPlan]
             }
         }
     }
+    for (folded, dest) in &seen {
+        for ancestor in ancestor_prefixes(folded) {
+            if let Some(ancestor_dest) = seen.get(ancestor) {
+                return Err(cross_binding_dup_diagnostic(
+                    target_name,
+                    ancestor_dest,
+                    dest,
+                ));
+            }
+        }
+    }
     Ok(())
+}
+
+fn ancestor_prefixes(path: &str) -> impl Iterator<Item = &str> {
+    path.match_indices('/').map(|(i, _)| &path[..i])
 }
 
 fn cross_binding_dup_diagnostic(target_name: &str, first: &str, second: &str) -> Error {
@@ -988,6 +1003,56 @@ mod leaf_granular_resolver_tests {
             vec!["top.md".to_string()],
             "prune's expected set derives from the leaf-granular plan's published keys, not from \
              directory-granular discovery; got: {keys:?}"
+        );
+    }
+
+    fn planned(materialization: Materialization, destination: &str) -> PlannedItem {
+        PlannedItem {
+            materialization,
+            destination: PathBuf::from(destination),
+            kept_leaves: Vec::new(),
+        }
+    }
+
+    fn binding(identity: &str, items: Vec<PlannedItem>) -> ResolvedBindingPlan {
+        ResolvedBindingPlan {
+            identity: identity.to_string(),
+            source: "s".to_string(),
+            commit: "c0ffee".to_string(),
+            items,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn cross_binding_collapsed_dir_overlapping_a_leaf_inside_it_is_rejected() {
+        let dir_binding = binding("a", vec![planned(collapsed("d"), "/dst/d")]);
+        let leaf_binding = binding("b", vec![planned(leaf("a.md", "d/a.md"), "/dst/d/a.md")]);
+
+        let rendered = super::reject_cross_binding_dups("home", &[dir_binding, leaf_binding])
+            .expect_err(
+                "a collapsed dir at `d` and a leaf at `d/a.md` overlap as ancestor/descendant — \
+                 `d` deploys as a directory symlink the leaf would escape into — and must be \
+                 rejected, not pass as distinct folded keys",
+            )
+            .to_string();
+        assert_named_diagnostic(&rendered, "d/a.md");
+
+        let dir_binding = binding("a", vec![planned(collapsed("d"), "/dst/d")]);
+        let leaf_binding = binding("b", vec![planned(leaf("a.md", "d/a.md"), "/dst/d/a.md")]);
+        super::reject_cross_binding_dups("home", &[leaf_binding, dir_binding]).expect_err(
+            "overlap rejection must hold with the descendant first — it is not binding-order \
+             dependent",
+        );
+    }
+
+    #[test]
+    fn cross_binding_sibling_sharing_a_string_prefix_is_allowed() {
+        let dir_binding = binding("a", vec![planned(collapsed("d"), "/dst/d")]);
+        let leaf_binding = binding("b", vec![planned(leaf("d.md", "d.md"), "/dst/d.md")]);
+        super::reject_cross_binding_dups("home", &[dir_binding, leaf_binding]).expect(
+            "`/dst/d` and `/dst/d.md` are distinct path components — the ancestor check splits on \
+             `/`, not a raw byte prefix — and must NOT be rejected",
         );
     }
 }
