@@ -91,6 +91,7 @@ pub fn encode_ref(r: &Refspec) -> String {
         Refspec::Branch(s) => format!("branch:{s}"),
         Refspec::Tag(s) => format!("tag:{s}"),
         Refspec::Rev(s) => format!("rev:{s}"),
+        Refspec::Default => "default".to_owned(),
         Refspec::None => "url".to_owned(),
     }
 }

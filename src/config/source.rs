@@ -240,7 +240,7 @@ impl ParsedSource {
         } else if let Some(branch) = &self.branch {
             Refspec::Branch(branch.clone())
         } else {
-            Refspec::Branch("main".into())
+            Refspec::Default
         }
     }
 
@@ -555,6 +555,8 @@ pub enum Refspec {
     Branch(String),
     Tag(String),
     Rev(String),
+    /// No ref named in config: follow the remote's advertised default branch.
+    Default,
     /// A url source has no git ref; its mirror lives at refs/heads/phora.
     None,
 }
@@ -563,6 +565,7 @@ impl std::fmt::Display for Refspec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Branch(s) | Self::Tag(s) | Self::Rev(s) => write!(f, "{s}"),
+            Self::Default => write!(f, "default"),
             Self::None => write!(f, ""),
         }
     }
