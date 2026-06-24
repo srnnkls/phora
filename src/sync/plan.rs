@@ -104,7 +104,7 @@ pub fn resolve_binding_plan(input: &BindingPlanInput<'_>) -> Result<ResolvedBind
     let items = materializations
         .into_iter()
         .map(|materialization| {
-            let key = materialization_key(&materialization);
+            let key = materialization.published_key();
             let destination = input
                 .target_path
                 .join(input.layout.artifact_path(input.identity, key));
@@ -186,7 +186,7 @@ fn reject_partial_take_collapse(
         let sub = plan_collapse(&kept_under, &offered_under, mode, CollapseChoice::Default)?;
         out.extend(sub.items);
     }
-    out.sort_by(|a, b| materialization_key(a).cmp(materialization_key(b)));
+    out.sort_by(|a, b| a.published_key().cmp(b.published_key()));
     Ok(out)
 }
 
@@ -212,13 +212,6 @@ fn map_take_entries(entries: &[TakeEntry]) -> Vec<Take<'_>> {
             TakeEntry::Rename { src, dest } => Take::Rename { src, dest },
         })
         .collect()
-}
-
-fn materialization_key(materialization: &Materialization) -> &str {
-    match materialization {
-        Materialization::CollapsedDir { dir } => dir,
-        Materialization::Leaf(take) => &take.dest,
-    }
 }
 
 fn apply_deployed_name(
@@ -319,7 +312,7 @@ fn cross_binding_dup_diagnostic(target_name: &str, first: &str, second: &str) ->
 pub fn expected_artifact_keys(plan: &ResolvedBindingPlan) -> Vec<String> {
     plan.items
         .iter()
-        .map(|item| materialization_key(&item.materialization).to_owned())
+        .map(|item| item.materialization.published_key().to_owned())
         .collect()
 }
 

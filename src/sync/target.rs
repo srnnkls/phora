@@ -95,7 +95,7 @@ pub(super) fn deploy_target(
         let source_name = SourceName::trusted(&binding.source);
 
         for item in &binding.items {
-            let key = published_key(&item.materialization);
+            let key = item.materialization.published_key();
             safe_relpath(key).map_err(|_| unsafe_dest_diagnostic(key))?;
             let artifact_dst = run.confined(&item.destination)?;
             let dst_is_symlink =
@@ -141,14 +141,6 @@ fn surface_plan_warnings(warnings: &[PlanWarning]) {
     }
 }
 
-/// The published artifact key — the collapsed-dir or the renamed/identity leaf dest.
-fn published_key(materialization: &Materialization) -> &str {
-    match materialization {
-        Materialization::CollapsedDir { dir } => dir,
-        Materialization::Leaf(take) => &take.dest,
-    }
-}
-
 fn unsafe_dest_diagnostic(dest: &str) -> Error {
     crate::diagnostic::SelectionDiagnostic {
         entry: dest.to_owned(),
@@ -178,7 +170,7 @@ pub(super) struct ArtifactEntry<'a> {
 
 impl ArtifactEntry<'_> {
     fn published_key(&self) -> &str {
-        published_key(&self.item.materialization)
+        self.item.materialization.published_key()
     }
 
     fn record_kind(&self) -> RecordKind {

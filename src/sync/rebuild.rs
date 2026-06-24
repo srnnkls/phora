@@ -136,7 +136,7 @@ fn rebuild_binding(run: &BindingRun<'_>, report: &mut RebuildReport) -> Result<(
         .map_or(TemplateOptIn::SuffixOnly, |b| b.template_opt_in);
 
     for item in &run.binding.items {
-        let published_key = published_key(&item.materialization).to_owned();
+        let published_key = item.materialization.published_key().to_owned();
         let key = ArtifactKey {
             target: run.target_name.to_owned(),
             source: run.binding.identity.clone(),
@@ -181,14 +181,6 @@ fn rebuild_binding(run: &BindingRun<'_>, report: &mut RebuildReport) -> Result<(
         report.reconstructed.push(key);
     }
     Ok(())
-}
-
-/// The published artifact key — the collapsed-dir or the renamed/identity leaf dest.
-fn published_key(materialization: &Materialization) -> &str {
-    match materialization {
-        Materialization::CollapsedDir { dir } => dir,
-        Materialization::Leaf(take) => &take.dest,
-    }
 }
 
 fn record_kind(materialization: &Materialization) -> RecordKind {

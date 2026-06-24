@@ -173,14 +173,6 @@ struct BindingCtx<'a> {
     files: bool,
 }
 
-/// The published artifact key — the collapsed-dir or the renamed/identity leaf dest.
-fn published_key(materialization: &Materialization) -> &str {
-    match materialization {
-        Materialization::CollapsedDir { dir } => dir,
-        Materialization::Leaf(take) => &take.dest,
-    }
-}
-
 fn preview_link(
     ctx: &BindingCtx,
     entries: &mut Vec<PreviewEntry>,
@@ -310,7 +302,7 @@ fn resolve_plan(
 }
 
 fn push_item(ctx: &BindingCtx, item: &PlannedItem, commit: &str, entries: &mut Vec<PreviewEntry>) {
-    let key = published_key(&item.materialization).to_owned();
+    let key = item.materialization.published_key().to_owned();
     let mut entry = PreviewEntry {
         identity: ctx.binding.identity.to_owned(),
         source: ctx.binding.source.to_owned(),

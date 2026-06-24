@@ -37,6 +37,17 @@ pub enum Materialization {
     Leaf(ResolvedTake),
 }
 
+impl Materialization {
+    /// The published artifact key: the collapsed dir, or the leaf's destination.
+    #[must_use]
+    pub fn published_key(&self) -> &str {
+        match self {
+            Materialization::CollapsedDir { dir } => dir,
+            Materialization::Leaf(take) => &take.dest,
+        }
+    }
+}
+
 /// Non-fatal collapse outcomes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CollapseWarning {
