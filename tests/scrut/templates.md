@@ -1,227 +1,187 @@
-# Phora Templates
+# One config, filled in per machine
 
-End-to-end behaviour of per-machine minijinja templating: a `*.tmpl` source file
-is rendered with the effective `[vars]` and deployed with its `.tmpl` suffix
-stripped, plain siblings copy untouched, `verify` passes on the rendered bytes
-(INV-5), two machines with different vars render differently yet produce
-byte-identical lock files (INV-6), editing a var re-renders on the next sync with
-no new commit (INV-7), and `rebuild-registry` reconciles against the merged
-base+local vars so a templated artifact stays clean.
+Most config is identical everywhere; a few values are not — your email, a
+hostname, a path that differs between the laptop and the box under the desk.
+phora renders `*.tmpl` files through [minijinja](https://docs.rs/minijinja)
+before they deploy, filling them from a `[vars]` table that `phora.local.toml`
+overrides per machine. This is the one inherently *local* story in the suite, so
+the source here is a small local repo rather than a clone — but it is a real git
+repo, resolved and locked exactly like any other source.
 
-The suite is hermetic: `isolate_state` redirects `HOME` and the XDG cache/state
-roots into scrut's per-document tempdir. Each scenario `cd`s into its own
-subdirectory and re-isolates, giving it a private `HOME`/state. No commit SHAs or
-digests are pinned — assertions are on deployed file contents, `verify`/`list`
-labels, and a self-comparison of two lock files; path-bearing output is piped
-through `normalize`.
+State is hermetic — each machine's block points `HOME` and the XDG cache/state
+roots at scrut's per-document tempdir. No commit hashes are asserted (a freshly
+built local repo has a machine-dependent commit); the assertions are on rendered
+content, `verify`, and a self-comparison of two machines' lock files.
 
-## Setup
+## Start
 
-Source the helpers.
+Build a tiny dotfiles repo: a templated `git/config.tmpl` and a plain
+`git/ignore` sibling beside it.
 
 ```scrut
-$ source "$TESTDIR"/_setup.sh && ROOT="$PWD" && echo ready
-ready
+$ ROOT="$PWD" && export SRC="$ROOT/dotfiles" && mkdir -p "$SRC/git" && printf 'email = {{ email }}\nname = {{ name }}\n' > "$SRC/git/config.tmpl" && printf '*.log\n.DS_Store\n' > "$SRC/git/ignore" && git -c init.defaultBranch=main init -q "$SRC" && git -C "$SRC" -c user.email=a@b.c -c user.name=t add -A && git -C "$SRC" -c user.email=a@b.c -c user.name=t commit -q -m init && echo built
+built
 ```
 
-## Render and strip the .tmpl suffix
-
-The first sync renders `editor/motd.tmpl` with the base `greeting` and deploys it
-as `editor/motd` — suffix stripped.
+The base `[vars]` live in the committed config:
 
 ```scrut
-$ mkdir -p s1 && cd s1 && isolate_state && seed_config_with_vars "$(make_templated_source proj)" && phora sync 2>&1 | normalize
+$ cd "$ROOT" && mkdir -p laptop && cd laptop && export HOME="$PWD" XDG_CACHE_HOME="$PWD/cache" XDG_STATE_HOME="$PWD/state" && mkdir -p cache state && cat > phora.toml <<EOF
+> version = 1
+>
+> [vars]
+> email = "base@example.com"
+> name = "Base"
+>
+> [sources.dotfiles]
+> path = "$SRC"
+> branch = "main"
+> include = ["git"]
+>
+> [targets.home]
+> path = "home-config"
+> layout = "flat"
+> sources = ["dotfiles"]
+> EOF
+```
+
+## Render and strip
+
+The `.tmpl` is rendered and lands with the suffix gone; the plain sibling copies
+byte-for-byte:
+
+```scrut
+$ phora sync
 sync complete
 ```
 
-The deployed file holds the rendered text.
-
 ```scrut
-$ cat "$PWD/target-home/editor/motd"
-hello base!
+$ cat home-config/git/config
+email = base@example.com
+name = Base
 ```
 
-The `.tmpl` source name is gone from the target tree.
-
 ```scrut
-$ test -e "$PWD/target-home/editor/motd.tmpl" && echo present || echo stripped
+$ test ! -e home-config/git/config.tmpl && echo stripped
 stripped
 ```
 
-The plain sibling deployed verbatim.
-
 ```scrut
-$ cat "$PWD/target-home/editor/static.txt"
-plain content
+$ cat home-config/git/ignore
+*.log
+.DS_Store
 ```
 
-## verify passes on rendered output (INV-5)
-
-The manifest hashes the rendered bytes, so `verify` is clean against the rendered
-tree — it does not flag the rendered `motd` as a mismatch against the source.
+`verify` checks the *rendered* bytes — it does not flag the deployed file as
+diverging from its template source:
 
 ```scrut
-$ phora verify 2>&1 | normalize
+$ phora verify
 all verified
 ```
 
-`phora list` shows the templated artifact clean.
+`preview --files` shows the deployed name (suffix stripped) and flags what
+renders; the plain sibling carries no annotation:
 
 ```scrut
-$ phora list 2>&1 | normalize
-home:
-  dotfiles/editor  ✓ clean
+$ phora preview --files 2>&1 | grep -E 'templated|ignore'
+    config (templated)
+    ignore
 ```
 
-## Two machines render differently, locks identical (INV-6)
-
-One shared source repo; two machines each seed against it with a different
-`phora.local.toml` `greeting` overlay.
+The `--json` form carries the same per-file `templated` flag:
 
 ```scrut
-$ cd "$ROOT" && SHARED="$(make_templated_source shared)" && echo seeded
-seeded
+$ phora preview --files --json 2>&1 | grep -E '"path"|"templated"' | sed -e 's/^ *//'
+"path": "config",
+"templated": true
+"path": "ignore",
+"templated": false
 ```
 
+## Two machines, one source
+
+Each machine overrides only the vars it cares about in `phora.local.toml` — the
+keys it omits keep their base value. The laptop is Alice's:
+
 ```scrut
-$ mkdir -p m1 && cd m1 && isolate_state && seed_config_with_vars "$SHARED" && seed_local_vars alice && phora sync 2>&1 | normalize
+$ printf 'version = 1\n[vars]\nemail = "alice@laptop"\n' > phora.local.toml && phora sync
 sync complete
 ```
 
 ```scrut
-$ cd "$ROOT" && mkdir -p m2 && cd m2 && isolate_state && seed_config_with_vars "$SHARED" && seed_local_vars bob && phora sync 2>&1 | normalize
+$ cat home-config/git/config
+email = alice@laptop
+name = Base
+```
+
+A second machine is Bob's, against the very same source:
+
+```scrut
+$ cd "$ROOT" && mkdir -p desktop && cd desktop && export HOME="$PWD" XDG_CACHE_HOME="$PWD/cache" XDG_STATE_HOME="$PWD/state" && mkdir -p cache state && cat > phora.toml <<EOF
+> version = 1
+>
+> [vars]
+> email = "base@example.com"
+> name = "Base"
+>
+> [sources.dotfiles]
+> path = "$SRC"
+> branch = "main"
+> include = ["git"]
+>
+> [targets.home]
+> path = "home-config"
+> layout = "flat"
+> sources = ["dotfiles"]
+> EOF
+```
+
+```scrut
+$ printf 'version = 1\n[vars]\nemail = "bob@desktop"\n' > phora.local.toml && phora sync
 sync complete
 ```
 
-Each machine rendered its own greeting.
-
 ```scrut
-$ cat "$ROOT/m1/target-home/editor/motd"
-hello alice!
+$ cat home-config/git/config
+email = bob@desktop
+name = Base
 ```
 
-```scrut
-$ cat "$ROOT/m2/target-home/editor/motd"
-hello bob!
-```
-
-The lock hashes source bytes only, so the two lock files are byte-identical
-despite the differing vars.
+They rendered differently — but the lock hashes *source* bytes, not rendered
+output, so both machines' locks are byte-identical. The integrity check stays
+machine-independent:
 
 ```scrut
-$ diff "$ROOT/m1/phora.lock" "$ROOT/m2/phora.lock" && echo identical
+$ diff "$ROOT/laptop/phora.lock" "$ROOT/desktop/phora.lock" && echo identical
 identical
 ```
 
-Each machine's manifest hashes its OWN rendered bytes, so `verify` is clean on
-both — not only on the first (INV-5 holds per machine).
+## Editing a value re-renders, without churning the lock
+
+Back on the laptop, Alice changes jobs. Editing the var — no source commit moved
+— re-renders on the next sync:
 
 ```scrut
-$ cd "$ROOT/m1" && phora verify 2>&1 | normalize
+$ cd "$ROOT/laptop" && export HOME="$PWD" XDG_CACHE_HOME="$PWD/cache" XDG_STATE_HOME="$PWD/state" && COMMIT_BEFORE="$(grep '^commit' phora.lock)" && printf 'version = 1\n[vars]\nemail = "alice@newjob"\n' > phora.local.toml && phora sync
+sync complete
+```
+
+```scrut
+$ cat home-config/git/config
+email = alice@newjob
+name = Base
+```
+
+The lock did not move — no new commit, just a re-render — and `verify` is clean
+on the new output:
+
+```scrut
+$ test "$(grep '^commit' phora.lock)" = "$COMMIT_BEFORE" && echo lock-unchanged
+lock-unchanged
+```
+
+```scrut
+$ phora verify
 all verified
-```
-
-```scrut
-$ cd "$ROOT/m2" && phora verify 2>&1 | normalize
-all verified
-```
-
-## Var edit re-renders on next sync (INV-7)
-
-Changing the local `greeting` overlay — with no source commit advance — re-renders
-the artifact on the next sync.
-
-```scrut
-$ cd "$ROOT" && mkdir -p s7 && cd s7 && isolate_state && seed_config_with_vars "$(make_templated_source proj)" && seed_local_vars first && phora sync 2>&1 | normalize
-sync complete
-```
-
-```scrut
-$ cat "$PWD/target-home/editor/motd"
-hello first!
-```
-
-The deployed commit is recorded in the lock; capture it to prove the re-render is
-driven by the var change alone, not a commit advance.
-
-```scrut
-$ COMMIT_BEFORE="$(grep '^commit ' phora.lock)" && echo "${COMMIT_BEFORE:+captured}"
-captured
-```
-
-```scrut
-$ seed_local_vars second && phora sync 2>&1 | normalize
-sync complete
-```
-
-```scrut
-$ cat "$PWD/target-home/editor/motd"
-hello second!
-```
-
-No new commit: the lock's commit is unchanged across the var-driven redeploy, and
-`verify` is clean on the re-rendered output.
-
-```scrut
-$ test "$(grep '^commit ' phora.lock)" = "$COMMIT_BEFORE" && echo same-commit
-same-commit
-```
-
-```scrut
-$ phora verify 2>&1 | normalize
-all verified
-```
-
-## rebuild-registry reconciles against merged vars
-
-With a `phora.local.toml` `[vars]` overlay present, `rebuild-registry` reconciles
-against the merged base+local vars — the same vars sync rendered with — so the
-templated artifact is reconstructed clean, not `modified`.
-
-```scrut
-$ cd "$ROOT" && mkdir -p s5 && cd s5 && isolate_state && seed_config_with_vars "$(make_templated_source proj)" && seed_local_vars overlaid && phora sync 2>&1 | normalize
-sync complete
-```
-
-```scrut
-$ cat "$PWD/target-home/editor/motd"
-hello overlaid!
-```
-
-```scrut
-$ phora rebuild-registry 2>&1 | normalize
-reconstructed 1
-```
-
-```scrut
-$ phora list 2>&1 | normalize
-home:
-  dotfiles/editor  ✓ clean
-```
-
-## preview --files shows the deployed name and annotates templated files (M004)
-
-`phora preview --files` lists the RENDERED deployed name of a templated file
-(`motd`, suffix stripped) annotated `(templated)`, while a plain sibling keeps its
-name with no annotation. The source name `motd.tmpl` never appears.
-
-```scrut
-$ cd "$ROOT" && mkdir -p s6 && cd s6 && isolate_state && seed_config_with_vars "$(make_templated_source proj)" && phora sync 2>&1 | normalize
-sync complete
-```
-
-```scrut
-$ phora preview --files 2>&1 | normalize | grep -E 'motd|static'
-    motd (templated)
-    static.txt
-```
-
-The `--json` form carries the deployed path and a per-file `templated` flag.
-
-```scrut
-$ phora preview --files --json 2>&1 | grep -E '"path"|"templated"' | sed -e 's/^ *//' | grep -E 'motd|true|false|static'
-"path": "motd",
-"templated": true
-"path": "static.txt",
-"templated": false
 ```

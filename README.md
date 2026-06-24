@@ -916,6 +916,18 @@ mise run test-integration   # scrut suites under tests/scrut/ against a release 
 ```
 
 The scrut suites drive the shipped binary end to end and double as runnable usage
-docs. [`tests/scrut/showcase.md`](tests/scrut/showcase.md) is a narrated
-walkthrough — adding a git source, projecting it, then layering a machine-local
-symlink overlay — whose assertions CI keeps honest.
+docs whose assertions CI keeps honest. The hermetic suites
+([`selection.md`](tests/scrut/selection.md), [`query.md`](tests/scrut/query.md),
+[`manage.md`](tests/scrut/manage.md), [`lifecycle.md`](tests/scrut/lifecycle.md))
+build their fixtures locally; the use-case walkthroughs run against real upstreams
+(network required): [`showcase.md`](tests/scrut/showcase.md) pins two of Anthropic's
+public Claude Code skills and walks the link-mode editing loop,
+[`release-assets.md`](tests/scrut/release-assets.md) deploys a digest-checked
+release tarball, [`versions.md`](tests/scrut/versions.md) holds one source at
+two tags side by side, [`drift.md`](tests/scrut/drift.md) edits a deployed
+file behind phora's back and walks the ways out,
+[`mapped.md`](tests/scrut/mapped.md) fans one `AGENTS.md` out to the names every
+agent tool wants with `take` renames, [`hooks.md`](tests/scrut/hooks.md) runs
+commands after a sync, [`templates.md`](tests/scrut/templates.md) fills one config
+in per machine, and [`transitive.md`](tests/scrut/transitive.md) composes a
+dependency that carries its own.
