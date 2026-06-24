@@ -1,12 +1,12 @@
 # One config, filled in per machine
 
 Most config is identical everywhere; a few values are not — your email, a
-hostname, a path that differs between the laptop and the box under the desk.
-phora renders `*.tmpl` files through [minijinja](https://docs.rs/minijinja)
-before they deploy, filling them from a `[vars]` table that `phora.local.toml`
-overrides per machine. This is the one inherently *local* story in the suite, so
-the source here is a small local repo rather than a clone — but it is a real git
-repo, resolved and locked exactly like any other source.
+hostname, a path that differs between machines. phora renders `*.tmpl` files
+through [minijinja](https://docs.rs/minijinja) before they deploy, filling them
+from a `[vars]` table that `phora.local.toml` overrides per machine. Because this
+scenario depends on per-machine values, the source here is a small local repo
+rather than a clone — but it is a real git repo, resolved and locked exactly like
+any other source.
 
 State is hermetic — each machine's block points `HOME` and the XDG cache/state
 roots at scrut's per-document tempdir. No commit hashes are asserted (a freshly
@@ -159,8 +159,8 @@ identical
 
 ## Editing a value re-renders, without churning the lock
 
-Back on the laptop, Alice changes jobs. Editing the var — no source commit moved
-— re-renders on the next sync:
+Back on the laptop, Alice updates her email var. Editing the var — no source
+commit moved — re-renders on the next sync:
 
 ```scrut
 $ cd "$ROOT/laptop" && export HOME="$PWD" XDG_CACHE_HOME="$PWD/cache" XDG_STATE_HOME="$PWD/state" && COMMIT_BEFORE="$(grep '^commit' phora.lock)" && printf 'version = 1\n[vars]\nemail = "alice@newjob"\n' > phora.local.toml && phora sync

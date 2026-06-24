@@ -1,10 +1,9 @@
 # Release assets, without curl | tar
 
-bat ships its shell completions inside the release tarball. The usual move is
-`curl | tar` into somewhere on your fpath plus a mental note about which version
-that was; the mental note does not survive the week. This suite deploys the
-completions from the real v0.24.0 release asset — digest-checked before
-extraction, recorded after — and then shows what a wrong digest looks like.
+bat ships its shell completions inside the release tarball. Piping `curl | tar`
+into your fpath works but records nothing about which version landed. This suite
+deploys the completions from the real v0.24.0 release asset — digest-checked
+before extraction, recorded after — and then shows what a wrong digest looks like.
 
 State is hermetic — the first command points `HOME` and the XDG cache/state
 roots at scrut's per-document tempdir; the download is real. Release assets are
@@ -40,8 +39,8 @@ $ cat > phora.toml <<'EOF'
 
 Download, check the digest against the raw bytes, extract (validating every
 entry path), strip the `bat-v0.24.0-…/` wrapper directory that release tarballs
-love, import the tree, project the selection. The order is the security
-property: nothing touches the target until the bytes check out.
+commonly include, import the tree, project the selection. The order matters: the
+digest is checked before extraction, so a mismatch stops before any file is written.
 
 ```scrut
 $ phora sync
@@ -103,9 +102,8 @@ $ cat > phora.toml <<'EOF'
 > EOF
 ```
 
-A plain `sync` does not even notice — it honors the lock, the lock still
-matches, and nothing is re-downloaded. That is the no-op model doing its job,
-not a gap:
+A plain `sync` does not notice — it honors the lock, the lock still matches, and
+nothing is re-downloaded:
 
 ```scrut
 $ phora sync

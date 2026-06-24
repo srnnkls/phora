@@ -8,7 +8,7 @@ then layers a local working tree on top for the editing loop, and takes it off
 again.
 
 Every command below is the shipped binary and every block asserts its exact
-output, so this document cannot drift from how phora actually behaves. State is
+output, so any divergence from how phora behaves fails the suite. State is
 hermetic — the first command points `HOME` and the XDG cache/state roots at
 scrut's per-document tempdir — but the clone is real: this suite talks to
 github.com, and its assertions hold as long as the pinned upstream commit exists.
@@ -151,10 +151,9 @@ Each skill's whole tree is taken, so it *collapses* to a single directory
 artifact — preview marks a collapsed directory with a trailing slash
 (`mcp-builder/`).
 
-`verify` re-hashes every deployed file against the registry. This is the
-difference between "the files are there" and "the files are exactly what phora
-put there" — a sentence that matters more than usual when the files are prompts
-an agent will follow.
+`verify` re-hashes every deployed file against the registry — the difference
+between "the files are there" and "the files are exactly what phora put there,"
+which matters when the files are prompts an agent will follow.
 
 ```scrut
 $ phora verify
@@ -205,8 +204,7 @@ $ readlink claude-skills/mcp-builder | sed "s#/private$PWD#<ROOT>#g;s#$PWD#<ROOT
 ```
 
 A linked artifact sits outside the integrity model — its bytes change
-underfoot, so hashing them would be meaningless, and the registry says so
-instead of pretending:
+underfoot, so phora records `link` as the digest rather than hashing:
 
 ```scrut
 $ phora where --artifact mcp-builder
@@ -214,9 +212,8 @@ Artifact: skills/mcp-builder (commit link, digest link:)
   - skills
 ```
 
-That is the deal: live edits in exchange for the content guarantee. Done
-editing, remove the overlay, and the next sync puts pinned, verifiable copies
-back:
+Link mode trades the content guarantee for live edits. Done editing, remove the
+overlay, and the next sync puts pinned, verifiable copies back:
 
 ```scrut
 $ rm phora.local.toml && phora sync

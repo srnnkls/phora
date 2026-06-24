@@ -58,7 +58,7 @@ phora did what it did — or what to do when it didn't — you're in the right p
 
 phora moves directory-shaped payloads from where they live (a git repo, or a URL)
 into the places on disk that consume them — and keeps a record precise enough to
-prove, later, that nothing drifted.
+detect, later, whether anything drifted.
 
 The vocabulary splits cleanly by who owns what. A *source* owns its *offer* — the
 set of paths it publishes. A *target binding* owns its *take* — the subset of that
@@ -108,8 +108,8 @@ way:
 3. Project each binding's taken artifacts into their targets.
 4. Record what was deployed, and verify it on demand.
 
-The one idea worth holding onto: the store is git, and *everything becomes a git
-tree* — a cloned repo or a downloaded tarball alike. That is why a URL source
+The store is git, and everything becomes a git tree — a cloned repo or a
+downloaded tarball alike. That is why a URL source
 deploys, locks, and verifies exactly like a git source. Step 1 differs; steps 2–4
 are shared code.
 
@@ -172,8 +172,8 @@ phora list        # per-target status: which artifacts are deployed, and their s
 phora verify      # re-hash every deployed file against the record; exit 0 if all match
 ```
 
-`phora verify` is the payoff for all the bookkeeping: it is the difference between
-"the files are there" and "the files are exactly what phora put there." It exits
+`phora verify` is what the record is for: the difference between "the files are
+there" and "the files are exactly what phora put there." It exits
 non-zero on the first mismatch, so it drops cleanly into a pre-commit hook or CI.
 
 Later, to pick up upstream changes:
@@ -267,9 +267,8 @@ exactly like a git source. A few things are worth knowing up front:
   `include`/`exclude` still shape its offer, filtering the imported tree.
 - Integrity: an optional `digest = "sha256:…"` or `blake3:…` (64 hex chars) is
   verified against the downloaded bytes *before* anything is extracted. A mismatch
-  errors, naming the source and showing expected vs actual. This is a stronger
-  story than `curl | tar`: nothing touches your disk tree until the bytes check
-  out.
+  errors, naming the source and showing expected vs actual. The archive is not
+  extracted until the digest check passes.
 - Determinism: identical bytes always import to the identical commit, so an
   unchanged URL is a true no-op on the next sync, and a changed one advances the
   lock. The [internals](#why-a-url-import-is-deterministic) cover how.
@@ -658,9 +657,8 @@ foreign file sitting where an artifact wants to land, it prompts on a TTY —
 ```
 
 — and on a non-interactive run it skips such files unless you passed `--force`.
-`eject` is the interesting choice: it tells phora to stop managing that artifact
-but leave its files in place (see `phora eject` / `phora uneject` for doing this
-deliberately).
+`eject` tells phora to stop managing that artifact but leave its files in place
+(see `phora eject` / `phora uneject` for doing this deliberately).
 
 `phora update` is the only command that reaches for new commits. Without it, every
 `sync` reproduces the locked state, which is exactly what you want on a fresh
@@ -669,8 +667,8 @@ advances — for a URL source, only if the downloaded content actually changed.
 
 ## Hooks: running commands after a sync
 
-Sometimes deploying the files is only half of it — a font cache wants rebuilding, a
-plugin manager wants a sync, an index wants refreshing. A hook is a shell command
+Deploying the files is sometimes not the last step — a font cache may need
+rebuilding, a plugin manager a sync, an index a refresh. A hook is a shell command
 phora runs *after* it has written the files. Hooks live only in your config
 (`phora.toml` or `phora.local.toml`); a synced source tree that happens to carry its
 own `phora.toml` is inert content, read as files and never executed.
@@ -916,9 +914,9 @@ your local filesystem.
 
 ### Trusting a dependency's hooks
 
-This is the sharp edge. A dependency's target can carry a hook — an `on_change`
-shell command its author wants run after the files land. That command would run on
-your machine, from a repo you do not control, so phora never trusts it implicitly.
+A dependency's target can carry a hook — an `on_change` shell command its author
+wants run after the files land. That command would run on your machine, from a repo
+you do not control, so phora does not run it without explicit approval.
 On the first sync, a discovered dependency hook is *stripped*: recorded, but not run.
 The sync tells you so, and you approve it deliberately:
 
@@ -946,15 +944,15 @@ every approval for a dependency.
 `phora sync --frozen` refuses to fetch or re-resolve anything: every source — root,
 imported dependency, and nested dependency alike — must already be pinned in the
 lock. A miss hard-errors, naming the source and, for a nested dependency, its depth,
-so a drifted or dropped pin cannot pass silently. It is the offline, the-lock-is-the-law
-mode for CI and reproducible checkouts. As with any other field, a `phora.local.toml`
+so a drifted or dropped pin cannot pass silently. It is the offline mode for CI and
+reproducible checkouts, where the lock is the only source of truth. As with any other field, a `phora.local.toml`
 overlay can flip a source to `transitive = true` for one machine alone.
 
 ## Under the hood
 
-Everything above is the contract. This is the machinery behind it. None of it is
-required reading to use phora, but it is what lets you reason about edge cases — and
-it is the honest answer to "what is this thing actually doing to my disk?"
+Everything above is the contract; this is the machinery behind it. None of it is
+needed to use phora, but it is what lets you reason about edge cases — and what
+phora is actually doing to your disk.
 
 ### One store for everything
 
@@ -1054,11 +1052,12 @@ directly. The result is the 40-hex commit that goes into the lock.
 
 ### Fetching and importing a URL source
 
-The URL backend runs four steps, and the order is the security property:
+The URL backend runs four steps, and the order matters — digest verification runs
+before extraction:
 
 1. Download. An `ureq` client (rustls TLS, certificate verification on) streams
    the response body to a temporary file beside the mirror. It follows redirects
-   (release assets love to 302 to a CDN) but strips auth headers across them, and
+   (release assets commonly 302 to a CDN) but strips auth headers across them, and
    it sets connect and body timeouts so a stalled server can't wedge the process.
    A non-2xx status or a transport failure is a clear error; a partially written
    temp file is cleaned up on any failure.
@@ -1070,7 +1069,7 @@ The URL backend runs four steps, and the order is the security property:
    raw-single-file, and unpacks into an in-memory list of entries. Three defenses
    apply during this step: every entry path is validated segment by segment
    (rejecting `..`, absolute paths, drive roots, backslashes, NUL bytes, and
-   non-UTF-8 names), so a malicious archive cannot escape; a single common
+   non-UTF-8 names), so a crafted archive path cannot escape the extraction root; a single common
    top-level directory is stripped; and a cumulative size cap (1 GiB of actual
    decompressed bytes, not the attacker-controlled header) guards against
    decompression bombs. Executable bits and symlinks carry through to the right
@@ -1117,7 +1116,7 @@ the artifact as it goes — framing each entry (its relative path length and byt
 type tag for file/executable/symlink, and its content length and bytes) into the
 hash. The framing matters: without length-prefixing, two different tree shapes
 could collide by smearing a path into the next file's content. With it, the digest
-is an honest fingerprint of the projected tree.
+is a faithful fingerprint of the projected tree.
 
 Moving the staged artifact into the target is an atomic directory swap: phora
 journals its intent, renames staging into place, then records the result, so a
@@ -1243,7 +1242,7 @@ per-project install tree to deduplicate after the fact. Git's content-addressed
 object store is the cache, its commit graph is the version history, and an install
 is a reflink out of that store. Everything phora adds on top — the lock, the
 registry, identity — is bookkeeping about which commit goes where; the storage and
-the versioning fall out of git for free.
+the versioning come from git's object store rather than a custom layer.
 
 ### Verification
 

@@ -1,10 +1,9 @@
 # One source, two versions
 
-fzf's shell integration — completions and key bindings — is the kind of thing
-you deploy once and stop thinking about. Until a new release changes it, and
-you would rather read the difference than discover it. This suite holds fzf
-v0.55.0 and v0.56.0 side by side in one target, from one mirror, then promotes
-the newer one and lets `--prune` clean up.
+fzf's shell integration — completions and key bindings — changes occasionally
+across releases, and reviewing the diff before deploying beats finding out after.
+This suite holds fzf v0.55.0 and v0.56.0 side by side in one target, from one
+mirror, then promotes the newer one and lets `--prune` clean up.
 
 State is hermetic — the first command points `HOME` and the XDG cache/state
 roots at scrut's per-document tempdir; the clone of github.com/junegunn/fzf is
@@ -76,9 +75,8 @@ Artifact: stable/shell (commit fc693080, digest blake3:39cdc3c10ad1b93ac21c9459a
   - shell
 ```
 
-And the point of the exercise — the difference is now an ordinary `diff`
-between two directories on disk. Between these two tags it is the bash
-completion that moved:
+With both versions deployed, the difference is a plain `diff` between two
+directories on disk. Between these two tags, the bash completion changed:
 
 ```scrut
 $ diff -q shell-integration/stable/shell/completion.bash shell-integration/canary/shell/completion.bash
@@ -152,9 +150,8 @@ $ grep -c '\[\[sources\]\]' phora.lock
 1
 ```
 
-One small honesty: prune removes the files it tracked, but the now-empty
-`stable/` and `canary/` identity directories stay behind — `rmdir` them if they
-bother you:
+Note: prune removes the files it tracked, but the now-empty `stable/` and
+`canary/` identity directories stay behind — `rmdir` them if needed:
 
 ```scrut
 $ find shell-integration -mindepth 1 -maxdepth 1 | LC_ALL=C sort

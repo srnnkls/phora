@@ -1,11 +1,11 @@
 # When files drift
 
-A deployed file is just a file. Anyone — you at midnight, a colleague, a
-well-meaning script — can edit it in place, and most tools will never tell you.
-phora records what it deployed precisely so that this is detectable later. This
-suite deploys one skill from Anthropic's public skills repository, edits it
-behind phora's back, and walks the three honest ways out: restore it, adopt it
-upstream, or eject it and own it.
+A deployed file is just a file; anything can edit it in place. A plain copy keeps
+no record of what it should be, so an edit leaves nothing to compare against.
+phora records what it deployed, so a later check can catch the change. This suite
+deploys one skill from Anthropic's public skills repository, edits it behind
+phora's back, and walks the three ways out: restore it, adopt it upstream, or
+eject it and own it.
 
 State is hermetic — the first command points `HOME` and the XDG cache/state
 roots at scrut's per-document tempdir, so nothing touches your real config; the
@@ -138,8 +138,8 @@ $ grep -c 'Local policy' claude-skills/skill-creator/SKILL.md
 1
 ```
 
-The registry still knows where the files came from — it just annotates the
-divorce:
+The registry still records where the files came from — it just marks them as
+ejected:
 
 ```scrut
 $ phora where

@@ -66,8 +66,7 @@ same-file
 
 `where` records each dest's commit and content digest. The two digests differ
 even though the bytes are identical — the digest frames the destination path in,
-so a rename is its own artifact rather than an alias that could be mistaken for
-the original:
+so a rename gets its own artifact identity rather than sharing its source's:
 
 ```scrut
 $ phora where

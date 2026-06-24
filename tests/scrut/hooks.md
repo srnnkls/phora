@@ -1,6 +1,6 @@
 # Running something after a sync
 
-Deploying files is often only half the job — you cache-rebuild, reload a daemon,
+Deploying files is rarely the final step — you cache-rebuild, reload a daemon,
 or re-index whatever just landed. A target's `on_change` hook runs after a sync
 that *changed* that target, and a global `post_sync` hook runs after *every*
 sync. This suite deploys two skills from Anthropic's public
@@ -83,8 +83,8 @@ skill-creator
 
 ## post_sync runs regardless
 
-Add a global `post_sync` hook. It runs after *every* sync — the escape hatch for
-work that should happen whether or not content moved:
+Add a global `post_sync` hook. It runs after *every* sync, for work that should
+happen whether or not content moved:
 
 ```scrut
 $ cat > phora.toml <<'EOF'

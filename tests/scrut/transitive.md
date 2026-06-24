@@ -13,10 +13,10 @@ artifacts; its `loqui` skill expects language guidelines vendored underneath it 
 its own sources, so importing tropos composes loqui straight into the skill.
 
 This suite stays offline and hermetic. The two upstreams are built as local git
-repos, and the dependency's inner remote — which phora resolves against your host
-registry, and which must be a real remote, never a local path — is redirected to the
-local repo with git's `insteadOf`. `HOME` points at scrut's per-document tempdir so
-that redirect is the only git config in play; phora's own cache and state are pinned
+repos, and the dependency's inner remote — which phora resolves as a remote URL,
+not a local filesystem path — is redirected to the local repo with git's
+`insteadOf`. `HOME` points at scrut's per-document tempdir so that redirect is the
+only project-level git config active; phora's own cache and state are pinned
 with a `[paths]` table in `phora.toml`, so the run needs no `XDG_*` juggling and
 nothing lands outside the tempdir. No commit hashes are asserted — a freshly built
 local repo has a machine-dependent commit.
@@ -55,8 +55,8 @@ built
 ```
 
 The tropos repo is the dependency. Its `phora.toml` declares loqui as a source and
-lands it under the skill that needs it — and carries an `on_change` hook, the kind a
-dependency author might use to post-process what was just composed.
+lands it under the skill that needs it — and carries an `on_change` hook to
+post-process what was composed.
 
 ```scrut
 $ mkdir -p "$ROOT/tropos" && cat > "$ROOT/tropos/phora.toml" <<'EOF'
@@ -106,9 +106,9 @@ $ mkdir -p "$ROOT/proj" && cd "$ROOT/proj" && cat > phora.toml <<'EOF'
 > EOF
 ```
 
-The first sync composes the dependency. Its hook is *stripped* — discovered, but not
-run, because phora never trusts a dependency's hooks implicitly — so the sync says so
-and still completes (a non-interactive run stays green; the files are deployed):
+The first sync composes the dependency. Its hook is *stripped* — discovered but not
+run, since a dependency's hooks need explicit approval — so the sync reports it and
+still completes (a non-interactive run stays green; the files are deployed):
 
 ```scrut
 $ phora sync 2>&1
@@ -117,8 +117,8 @@ phora: run `phora trust <name>` to inspect and approve 1 hook(s)
 sync complete
 ```
 
-loqui's `languages/` and `resources/` trees landed exactly where the skill looks for
-them — under the dependency's relative path, composed beneath the import anchor:
+loqui's `languages/` and `resources/` trees landed at the path the skill expects —
+under the dependency's relative path, composed beneath the import anchor:
 
 ```scrut
 $ test -f claude/skills/loqui/reference/loqui/languages/go/style.md && test -f claude/skills/loqui/reference/loqui/resources/shared.md && echo composed
