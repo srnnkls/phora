@@ -9536,6 +9536,30 @@ fn sealed_offer_take_subsetting_a_leaf_is_allowed_not_a_violation() {
 }
 
 #[test]
+fn sealed_offer_recorded_rename_dest_resolves_to_its_offered_source_leaf() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\n\
+         sources = {{ editor-src = {{ take = [{{ \"docs/readme.md\" = \"renamed.md\" }}] }} }}\n\
+         layout = \"flat\"\n",
+        fx.url,
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("rename-take config parses");
+
+    seed_recorded_artifact(&fx.registry, "editor-src", "renamed.md");
+
+    let in_ = input(&cfg, None, None, None, false);
+    sync(&in_, &fx.backend, &fx.registry).expect(
+        "a recorded artifact keyed by a rename DEST must be checked against its offered SOURCE \
+         leaf, not the dest; re-syncing an active rename whose src is still offered is not drift",
+    );
+}
+
+#[test]
 fn sealed_offer_intentional_narrowing_does_not_block_prune_of_the_dropped_artifact() {
     let fx = build_sync_fixture();
     let td = TargetDir::new();

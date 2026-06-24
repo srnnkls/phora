@@ -203,7 +203,7 @@ fn partial_take_collapse_diagnostic(dir: &str) -> Error {
     .sync()
 }
 
-fn map_take_entries(entries: &[TakeEntry]) -> Vec<Take<'_>> {
+pub(crate) fn map_take_entries(entries: &[TakeEntry]) -> Vec<Take<'_>> {
     entries
         .iter()
         .map(|entry| match entry {

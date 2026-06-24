@@ -460,6 +460,7 @@ fn run_all_hooks(
 struct BindingOffer {
     offered: Vec<String>,
     selection: crate::kernel::OfferSelection,
+    dest_to_source: BTreeMap<String, String>,
 }
 
 /// Compares against the resolved OFFER set, not the take/kept set: a leaf dropped by
@@ -500,9 +501,26 @@ fn validate_sealed_offer(
                 OfferSelection::compile(offer.includes(), offer.excludes(), offer.root())?;
             let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
             let offered = selection.select(&refs);
+            let dest_to_source = binding.take.map_or_else(BTreeMap::new, |entries| {
+                let directives = crate::sync::plan::map_take_entries(entries);
+                crate::kernel::resolve_take(&offered, Some(&directives)).map_or_else(
+                    |_| BTreeMap::new(),
+                    |res| {
+                        res.kept
+                            .into_iter()
+                            .filter(|m| m.dest != m.source)
+                            .map(|m| (m.dest, m.source))
+                            .collect()
+                    },
+                )
+            });
             offers.insert(
                 (target_name.clone(), binding.identity.to_owned()),
-                BindingOffer { offered, selection },
+                BindingOffer {
+                    offered,
+                    selection,
+                    dest_to_source,
+                },
             );
         }
     }
@@ -512,11 +530,15 @@ fn validate_sealed_offer(
             continue;
         };
         let artifact = &key.artifact;
+        let leaf = offer
+            .dest_to_source
+            .get(artifact)
+            .map_or(artifact.as_str(), String::as_str);
         let still_offered = offer
             .offered
             .iter()
-            .any(|leaf| leaf == artifact || leaf.starts_with(&format!("{artifact}/")));
-        if !still_offered && offer.selection.admits_published(artifact) {
+            .any(|offered| offered == leaf || offered.starts_with(&format!("{leaf}/")));
+        if !still_offered && offer.selection.admits_published(leaf) {
             return Err(sealed_offer_diagnostic(&key.target, &key.source, artifact));
         }
     }

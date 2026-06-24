@@ -377,14 +377,26 @@ pub(crate) fn explain_path(input: &ExplainInput<'_>, path: Option<&str>) -> Resu
     })
 }
 
+fn source_path(root: Option<&Path>, leaf: &str) -> String {
+    match root {
+        Some(r) => format!("{}/{leaf}", r.display()),
+        None => leaf.to_owned(),
+    }
+}
+
 fn local_path(offer: &Offer<'_>, candidates: &[String], path: &str) -> Option<String> {
+    let full = source_path(offer.root(), path);
     let probe = OfferSelection::compile(&[], &[], offer.root()).ok()?;
-    probe.select(&[path]).into_iter().next().or_else(|| {
-        candidates
-            .iter()
-            .any(|c| c == path)
-            .then(|| path.to_owned())
-    })
+    probe
+        .select(&[full.as_str()])
+        .into_iter()
+        .next()
+        .or_else(|| {
+            candidates
+                .iter()
+                .any(|c| c == &full)
+                .then(|| path.to_owned())
+        })
 }
 
 /// Probes each include/exclude pattern individually to name the one that decides `path`.
@@ -394,16 +406,17 @@ fn attribute_offer(
     path: &str,
 ) -> Result<OfferAttribution> {
     let root = offer.root();
+    let full = source_path(root, path);
     let included = if offer.is_implicit_full() {
         OfferSelection::compile(&[], &[], root)?
-            .select(&[path])
+            .select(&[full.as_str()])
             .iter()
             .any(|p| !p.is_empty())
     } else {
         offer
             .includes()
             .iter()
-            .any(|inc| single_include_selects(inc, root, path))
+            .any(|inc| single_include_selects(inc, root, &full))
     };
 
     if !included {
@@ -417,7 +430,7 @@ fn attribute_offer(
     if let Some(exclude) = offer
         .excludes()
         .iter()
-        .find(|exc| single_exclude_vetoes(exc, root, path))
+        .find(|exc| single_exclude_vetoes(exc, root, &full))
     {
         return Ok(OfferAttribution::Vetoed {
             exclude: exclude.clone(),
@@ -427,7 +440,7 @@ fn attribute_offer(
     let include = offer
         .includes()
         .iter()
-        .find(|inc| single_include_selects(inc, root, path))
+        .find(|inc| single_include_selects(inc, root, &full))
         .cloned();
     Ok(OfferAttribution::Allowed { include })
 }
@@ -1031,6 +1044,31 @@ mod explain_tests {
                 dest: "init.lua".to_string()
             }),
             "with no take the offered leaf is kept at identity; got {take:?}"
+        );
+    }
+
+    #[test]
+    fn path_under_source_root_is_attributed_in_offered_leaf_space() {
+        let raw = toml::from_str::<Source>(
+            "git = \"https://example.com/x.git\"\nroot = \"skills\"\ninclude = [\"skill-creator\"]\n",
+        )
+        .expect("source DTO deserializes");
+        let source = ParsedSource::parse("s", &raw).expect("source parses");
+        let report = explain(
+            &source,
+            &["skills/skill-creator/SKILL.md", "skills/internal/x.md"],
+            None,
+            None,
+            Some("skill-creator/SKILL.md"),
+        );
+        let (offer, _take) = path_body(&report);
+        assert_eq!(
+            *offer,
+            OfferAttribution::Allowed {
+                include: Some("skill-creator".to_string())
+            },
+            "an offered leaf named relative to `root` must attribute to its include, not read as \
+             outside the offer; got {offer:?}"
         );
     }
 
