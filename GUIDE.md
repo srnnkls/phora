@@ -38,6 +38,7 @@ phora did what it did — or what to do when it didn't — you're in the right p
   - [Reproducibility](#reproducibility)
 - [Under the hood](#under-the-hood)
   - [One store for everything](#one-store-for-everything)
+  - [No working tree: the object store is the substrate](#no-working-tree-the-object-store-is-the-substrate)
   - [Fetching a git source](#fetching-a-git-source)
   - [Fetching and importing a URL source](#fetching-and-importing-a-url-source)
   - [Why a URL import is deterministic](#why-a-url-import-is-deterministic)
@@ -996,6 +997,47 @@ as a single commit and points `refs/heads/phora` at it. From the object store's
 perspective there is no difference between the two — both are just commits with
 trees and blobs — which is precisely why the projection and verification code does
 not branch on source kind.
+
+### No working tree: the object store is the substrate
+
+The single design choice that the rest of the machinery falls out of: phora never
+materializes a working tree for a source. There is no `git checkout`, no `git
+worktree add`, no index, no second copy of the files on disk. A mirror is *bare* —
+nothing but the `.git` object database and its refs — and that is the only form a
+source ever takes on disk. Everything downstream reads out of that object store
+directly.
+
+That reframes the three operations you might expect a package manager to perform:
+
+- Resolving a ref is a pure lookup, not a checkout. A `branch`/`tag`/`rev` *peels*
+  to a commit object id; nothing is written to a working directory. The 40-hex
+  commit is the entire answer.
+- Reading a source's files is a tree walk, not a filesystem read. phora opens the
+  commit, descends its tree objects, and pulls blob bytes straight from the object
+  database — touching only the entries a target actually takes, never the whole
+  tree. The mirror is still a full bare clone (all of history, fetched once); what a
+  take avoids is checking that history out — you take one file by reading one blob,
+  not by laying the whole tree down on disk first.
+- Materializing writes those blob bytes into a staging directory and then into your
+  target. The bytes flow object-store → staging → target without git ever owning a
+  checked-out copy in between.
+
+This is what makes a per-binding ref override cheap, and it is worth seeing why.
+Two bindings of one source at different refs — the `stable`/`canary` pair — are two
+commit ids resolved against one bare mirror. Git's object store is
+content-addressed and immutable, so the two commits share every unchanged blob and
+tree and differ only in what genuinely changed between the refs. There is no second
+clone, no per-ref worktree, no duplicated history — the override adds a *ref to
+resolve*, not a copy on disk. A worktree-based design would have to check out each
+ref into its own directory and reconcile them; phora just reads two trees out of the
+same packed store. The cost of holding ten versions side by side is ten commit ids
+and whatever blobs actually differ between them.
+
+The same property underwrites the rest of "Under the hood." A URL import being a
+synthetic commit, projection touching only taken paths, the slice digest being a
+hash over a tree walk, reflink placement out of staging — all of it assumes the
+source lives as objects, not as files. The object store is not an implementation
+detail behind the model; it is the model.
 
 ### Fetching a git source
 
