@@ -90,6 +90,8 @@ pub fn plan_collapse(
         .collect();
     let phys: BTreeSet<&str> = full_tree.iter().map(String::as_str).collect();
 
+    // tradeoff: O(kept^2) per binding — collapsibility re-scans `kept` per candidate dir,
+    // `*_blocked_dir` per leaf. Upgrade path: a dir->leaves prefix index built over `kept`.
     let mut collapsible: BTreeSet<&str> = BTreeSet::new();
     let mut copy_collapsible: BTreeSet<&str> = BTreeSet::new();
     for dir in candidate_dirs(kept) {
