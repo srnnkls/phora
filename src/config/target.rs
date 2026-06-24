@@ -306,7 +306,7 @@ impl SourceFields for Source {
         } else if let Some(branch) = &self.branch {
             Refspec::Branch(branch.clone())
         } else {
-            Refspec::Branch("main".into())
+            Refspec::Default
         }
     }
 }

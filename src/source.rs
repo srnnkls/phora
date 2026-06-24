@@ -400,7 +400,7 @@ fn shallow_ref_name(refspec: &Refspec) -> Option<String> {
     match refspec {
         Refspec::Branch(name) => Some(format!("refs/heads/{name}")),
         Refspec::Tag(name) => Some(format!("refs/tags/{name}")),
-        Refspec::Rev(_) | Refspec::None => None,
+        Refspec::Rev(_) | Refspec::Default | Refspec::None => None,
     }
 }
 
@@ -425,6 +425,9 @@ fn resolve_in(repo: &gix::Repository, source: &SourceName, refspec: &Refspec) ->
             repo.find_commit(oid)
                 .map_err(|e| SourceError::Source(format!("rev {rev} in {source}: {e}")))?
         }
+        Refspec::Default => repo
+            .head_commit()
+            .map_err(|e| SourceError::Source(format!("default branch (HEAD) in {source}: {e}")))?,
         Refspec::None => {
             return Err(SourceError::Source(format!(
                 "source {source}: git backend cannot resolve a url source's empty refspec"
@@ -1859,6 +1862,76 @@ mod tests {
         assert_ne!(
             resolved, fixture.tag_sha,
             "main points at the second commit, not the tagged first commit"
+        );
+    }
+
+    #[expect(
+        clippy::unwrap_used,
+        reason = "fixture setup fails loudly; git CLI is assumed present"
+    )]
+    fn build_trunk_default_repo() -> (TempDir, TempDir, GitBackend, String, String) {
+        let src = TempDir::new().unwrap();
+        let p = src.path();
+        run_git(p, &["init", "-b", "trunk", "."]);
+        run_git(p, &["config", "user.email", "test@example.com"]);
+        run_git(p, &["config", "user.name", "Test"]);
+        std::fs::write(p.join("README.md"), b"on trunk\n").unwrap();
+        run_git(p, &["add", "README.md"]);
+        run_git(p, &["commit", "-m", "initial"]);
+        let trunk_sha = String::from_utf8(run_git(p, &["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let git_dir = TempDir::new().unwrap();
+        let backend = GitBackend::new(git_dir.path().to_path_buf());
+        let url = p.to_string_lossy().into_owned();
+        (src, git_dir, backend, url, trunk_sha)
+    }
+
+    #[test]
+    fn resolve_default_follows_remote_default_branch_when_not_main() {
+        let (_src, _git_dir, backend, url, trunk_sha) = build_trunk_default_repo();
+
+        backend
+            .fetch(&sn("src"), &url)
+            .expect("fetch a repo whose default branch is trunk");
+
+        let resolved = backend
+            .resolve(&sn("src"), &url, &Refspec::Default)
+            .expect("Default must resolve against a repo that has no `main` branch");
+
+        assert_eq!(
+            resolved, trunk_sha,
+            "an unspecified ref must follow the repo's actual default branch (trunk), \
+             not assume `main` — which does not exist here"
+        );
+    }
+
+    #[test]
+    fn resolve_default_survives_an_incremental_fetch() {
+        let (src, _git_dir, backend, url, _first_sha) = build_trunk_default_repo();
+        backend.fetch(&sn("src"), &url).expect("first fetch");
+
+        std::fs::write(src.path().join("SECOND.md"), b"more\n").expect("write");
+        run_git(src.path(), &["add", "SECOND.md"]);
+        run_git(src.path(), &["commit", "-m", "second"]);
+        let advanced = String::from_utf8(run_git(src.path(), &["rev-parse", "HEAD"]).stdout)
+            .expect("utf8")
+            .trim()
+            .to_string();
+
+        backend
+            .fetch(&sn("src"), &url)
+            .expect("incremental fetch on the existing mirror");
+        let resolved = backend
+            .resolve(&sn("src"), &url, &Refspec::Default)
+            .expect("Default still resolves after an incremental fetch");
+
+        assert_eq!(
+            resolved, advanced,
+            "Default must track the default branch tip across an incremental fetch, \
+             not a stale HEAD"
         );
     }
 

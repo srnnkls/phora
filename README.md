@@ -353,7 +353,7 @@ auth = { type = "token", env = "GITHUB_TOKEN" }   # remote is built in; just add
 [sources.dotfiles]
 host = "github"          # forge remote: host + repo (or use git = "…" for a literal URL)
 repo = "me/dotfiles"
-branch = "main"          # or tag = "...", or rev = "<sha>" (pick one)
+branch = "main"          # or tag = "...", or rev = "<sha>"; omit all to follow the repo's default branch
 root = "modules"         # re-anchor the offer at this subdirectory
 include = ["editor"]     # source-owned offer: include − exclude (gitignore)
 exclude = ["**/*.bak"]

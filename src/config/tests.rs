@@ -403,11 +403,11 @@ auth = { type = "token", env = "GITHUB_TOKEN" }
 // PAM-002: refspec priority and export policy defaults
 
 #[test]
-fn refspec_defaults_to_main_branch() {
-    assert!(matches!(
-        source(None, None, None).refspec(),
-        Refspec::Branch(b) if b == "main"
-    ));
+fn refspec_defaults_to_remote_default_branch() {
+    assert!(
+        matches!(source(None, None, None).refspec(), Refspec::Default),
+        "an unspecified ref must defer to the remote's default branch, not assume `main`"
+    );
 }
 
 #[test]
@@ -2584,9 +2584,9 @@ fn refspec_still_branch_tag_rev_for_git_source() {
 
     let default = config_source("g", "git = \"https://x/y.git\"\n");
     assert!(
-        matches!(default.refspec(), Refspec::Branch(b) if b == "main"),
-        "a git source with no explicit ref must still default to Branch(\"main\"); \
-             Refspec::None must not leak into git sources"
+        matches!(default.refspec(), Refspec::Default),
+        "a git source with no explicit ref must default to the remote's default branch; \
+             Refspec::None (url-only) must not leak into git sources"
     );
 }
 
