@@ -114,14 +114,15 @@ impl OfferSelection {
     fn translate(pattern: &str) -> Vec<String> {
         let directory = pattern.ends_with('/');
         let trimmed = pattern.trim_end_matches('/');
+        let dir_suffix = if directory { "/**" } else { "" };
 
         if let Some(anchored) = trimmed.strip_prefix('/') {
-            return vec![Self::as_dir(anchored, directory)];
+            return vec![format!("{anchored}{dir_suffix}")];
         }
         if trimmed.contains('/') {
-            return vec![Self::as_dir(trimmed, directory)];
+            return vec![format!("{trimmed}{dir_suffix}")];
         }
-        let base = Self::as_dir(trimmed, directory);
+        let base = format!("{trimmed}{dir_suffix}");
         if trimmed == "**" {
             return vec![base];
         }
@@ -134,14 +135,6 @@ impl OfferSelection {
             format!("**/{base}/**"),
             format!("{base}/**"),
         ]
-    }
-
-    fn as_dir(pattern: &str, directory: bool) -> String {
-        if directory {
-            format!("{pattern}/**")
-        } else {
-            pattern.to_string()
-        }
     }
 }
 
