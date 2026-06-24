@@ -247,7 +247,7 @@ fn binding_warnings(
     if plan.warnings.is_empty() {
         return None;
     }
-    let offered = offered_leaves(&offer, candidates);
+    let offered = offered_leaves(&offer, candidates).unwrap_or_default();
     let warnings = plan
         .warnings
         .iter()
@@ -271,13 +271,10 @@ fn binding_warnings(
     })
 }
 
-fn offered_leaves(offer: &Offer<'_>, candidates: &[String]) -> Vec<String> {
-    let Ok(selection) = OfferSelection::compile(offer.includes(), offer.excludes(), offer.root())
-    else {
-        return Vec::new();
-    };
+pub(crate) fn offered_leaves(offer: &Offer<'_>, candidates: &[String]) -> Result<Vec<String>> {
+    let selection = OfferSelection::compile(offer.includes(), offer.excludes(), offer.root())?;
     let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
-    selection.select(&refs)
+    Ok(selection.select(&refs))
 }
 
 fn resolve_plan(

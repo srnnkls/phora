@@ -16,8 +16,8 @@ use crate::paths::cache_root_for;
 use crate::source::SourceBackend;
 use crate::store::Registry;
 use crate::sync::{
-    BindingPlanInput, PlanWarning, PreviewTargetPlan, ResolvedBindingPlan, preview_targets,
-    resolve_binding_plan, resolved_remotes,
+    BindingPlanInput, PlanWarning, PreviewTargetPlan, ResolvedBindingPlan, offered_leaves,
+    preview_targets, resolve_binding_plan, resolved_remotes,
 };
 
 use super::render::{print_listings, render_preview_json, render_preview_tree, state_label};
@@ -359,7 +359,7 @@ pub(crate) fn explain_path(input: &ExplainInput<'_>, path: Option<&str>) -> Resu
             }
         }
         None => ExplainBody::Summary {
-            leaves: offered_leaves(&input.offer, input.candidate_leaves)
+            leaves: offered_leaves(&input.offer, input.candidate_leaves)?
                 .into_iter()
                 .map(|leaf| ExplainLeaf {
                     take: attribute_take(&plan, Some(&leaf), input.mode, input.template_opt_in),
@@ -407,7 +407,7 @@ fn attribute_offer(
     };
 
     if !included {
-        let offered = offered_leaves(offer, candidates);
+        let offered = offered_leaves(offer, candidates)?;
         let refs: Vec<&str> = offered.iter().map(String::as_str).collect();
         return Ok(OfferAttribution::Outside {
             suggestions: did_you_mean(path, refs.iter().copied()).unwrap_or_default(),
@@ -446,14 +446,6 @@ fn single_exclude_vetoes(pattern: &str, root: Option<&Path>, path: &str) -> bool
         return false;
     };
     !without.select(&[path]).is_empty() && with.select(&[path]).is_empty()
-}
-
-fn offered_leaves(offer: &Offer<'_>, candidates: &[String]) -> Vec<String> {
-    let Ok(sel) = OfferSelection::compile(offer.includes(), offer.excludes(), offer.root()) else {
-        return Vec::new();
-    };
-    let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
-    sel.select(&refs)
 }
 
 fn attribute_take(

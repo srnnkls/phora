@@ -20,6 +20,7 @@ pub use plan::{
     BindingPlanInput, PlanWarning, PlannedItem, ResolvedBindingPlan, TargetPlan,
     expected_artifact_keys, plan_target, plan_targets, resolve_binding_plan, resolve_target_plan,
 };
+pub(crate) use preview::offered_leaves;
 pub use preview::{
     BindingWarnings, PreviewCollision, PreviewEntry, PreviewFile, PreviewTargetPlan,
     PreviewWarning, SyncState, preview_targets,
