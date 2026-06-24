@@ -230,8 +230,7 @@ fn scan_dir(dir: &Path, allow_symlinks: bool, mode: ScanMode) -> Result<ScanResu
                 ScanMode::Strict if !allow_symlinks => {
                     return Err(Error::SymlinkNotAllowed { path: rel });
                 }
-                ScanMode::Strict => {}
-                ScanMode::Soft => symlinks.push(rel),
+                ScanMode::Strict | ScanMode::Soft => symlinks.push(rel),
             }
             continue;
         }
@@ -298,6 +297,17 @@ pub fn copy_tree(src: &Path, dst: &Path, allow_symlinks: bool) -> Result<()> {
                 .map_err(|e| Error::Projection(format!("create dir {}: {e}", parent.display())))?;
         }
         copy_file(&from, &to)?;
+    }
+    for link in &scan.symlinks {
+        let to = dst.join(link);
+        let target = std::fs::read_link(src.join(link))
+            .map_err(|e| Error::Projection(format!("read link {}: {e}", link.display())))?;
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::Projection(format!("create dir {}: {e}", parent.display())))?;
+        }
+        std::os::unix::fs::symlink(&target, &to)
+            .map_err(|e| Error::Projection(format!("symlink {}: {e}", to.display())))?;
     }
     Ok(())
 }
@@ -871,6 +881,60 @@ mod tests {
             path.ends_with("link.txt"),
             "the error must name the offending symlink (link.txt), got {}",
             path.display()
+        );
+    }
+
+    #[test]
+    fn strict_scan_records_an_allowed_symlink_so_it_survives_the_copy_fallback() {
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("real.txt"), b"hi").expect("write real");
+        symlink("real.txt", dir.path().join("link.txt")).expect("create symlink");
+
+        let scan = scan_dir_strict(dir.path(), true).expect("strict scan with symlinks allowed");
+
+        assert!(
+            scan.symlinks.contains(&PathBuf::from("link.txt")),
+            "an ALLOWED symlink must be recorded, not silently dropped, or copy_tree loses it on \
+             the cross-device fallback; got {:?}",
+            scan.symlinks
+        );
+        assert!(
+            !scan.files.iter().any(|f| f.path == *Path::new("link.txt")),
+            "the symlink must still be excluded from `files`, got {:?}",
+            scan.files
+        );
+    }
+
+    // copy_tree
+
+    #[test]
+    fn copy_tree_recreates_symlinks_not_just_regular_files() {
+        let root = TempDir::new().expect("tempdir");
+        let src = root.path().join("src");
+        let dst = root.path().join("dst");
+        std::fs::create_dir(&src).expect("mkdir src");
+        std::fs::write(src.join("real.txt"), b"payload").expect("write real");
+        symlink("real.txt", src.join("link.txt")).expect("create symlink");
+
+        copy_tree(&src, &dst, true).expect("copy_tree with symlinks allowed");
+
+        assert_eq!(
+            std::fs::read(dst.join("real.txt")).expect("read copied file"),
+            b"payload",
+            "the regular file must be copied"
+        );
+        let link = dst.join("link.txt");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("stat copied link")
+                .file_type()
+                .is_symlink(),
+            "copy_tree must recreate the symlink AS a symlink, not drop it or dereference it"
+        );
+        assert_eq!(
+            std::fs::read_link(&link).expect("read copied link"),
+            PathBuf::from("real.txt"),
+            "the recreated symlink must preserve its original target"
         );
     }
 
