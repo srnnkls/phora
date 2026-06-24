@@ -59,6 +59,7 @@ pub fn rebuild_registry(
             rebuild_binding(
                 &BindingRun {
                     config,
+                    parsed: &parsed,
                     target_name,
                     target,
                     backend,
@@ -116,6 +117,7 @@ fn locked_commits(
 
 struct BindingRun<'a> {
     config: &'a Config,
+    parsed: &'a BTreeMap<String, crate::config::ParsedSource>,
     target_name: &'a str,
     target: &'a Target,
     backend: &'a dyn SourceBackend,
@@ -130,7 +132,7 @@ fn rebuild_binding(run: &BindingRun<'_>, report: &mut RebuildReport) -> Result<(
     let policy = run.source.export_policy();
     let template_opt_in = run
         .target
-        .resolve_sources(&run.config.parsed_sources()?)
+        .resolve_sources(run.parsed)
         .into_iter()
         .find(|b| b.identity == run.binding.identity)
         .map_or(TemplateOptIn::SuffixOnly, |b| b.template_opt_in);
