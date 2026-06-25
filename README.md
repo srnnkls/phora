@@ -109,18 +109,18 @@ next sync.
 phora add owner/repo --name myconfigs --branch main --root configs  # -> host = "github"
 phora add github:srnnkls/tropos             # colon alias -> host = "github"
 phora add gitlab:group/repo                 # any built-in forge (alias caps at owner/repo)
-phora add github.com/me/dotfiles            # domain shorthand -> host = "github"
-phora add https://github.com/me/dotfiles.git  # scheme/scp URLs stay literal (git = "…")
-phora add git@github.com:me/dotfiles.git --tag v1.2
+phora add github.com/srnnkls/dotfiles            # domain shorthand -> host = "github"
+phora add https://github.com/srnnkls/dotfiles.git  # scheme/scp URLs stay literal (git = "…")
+phora add git@github.com:srnnkls/dotfiles.git --tag v1.2
 # Deep GitLab subgroups go in the config `repo` field (repo = "group/sub/proj"),
 # not the colon alias (segments past owner/repo become `root`).
 
 # Bind sources to a target; --take subsets/renames the offer for that target
-phora bind dotfiles --to neovim                          # bare binding, takes the whole offer
-phora bind dotfiles --to neovim --as nvim --take nvim/**  # take just nvim/** under identity `nvim`
-phora unbind nvim --from neovim                          # remove a binding by identity
+phora bind dotfiles --to config                          # bare binding, takes the whole offer
+phora bind dotfiles --to config --as zellij --take zellij/**  # take just zellij/** under identity `zellij`
+phora unbind zellij --from config                          # remove a binding by identity
 # --root/--include/--exclude on `add` shape the SOURCE offer (source-owned), not a binding.
-phora add me/dotfiles --to neovim --as nvim --root nvim
+phora add srnnkls/dotfiles --to config --as zellij --root .config
 
 # Fetch sources, resolve commits, project artifacts into targets
 phora sync
@@ -172,14 +172,14 @@ phora source rm myconfigs          # also scrubs it from every target's `sources
 phora rm myconfigs                 # alias for `source rm`
 
 # Targets (--path required; --layout takes flat | by-source | prefixed)
-phora target add neovim --path ~/.config/nvim --layout by-source
+phora target add config --path ~/.config --layout by-source
 phora target list                  # name, path, source-resolution mode
-phora target show neovim           # effective config + resolved sources + state
-phora target rm neovim             # warns if the registry still has deployed artifacts
+phora target show config           # effective config + resolved sources + state
+phora target rm config             # warns if the registry still has deployed artifacts
 
 # Bindings — edit a target's `sources` list
-phora bind dotfiles loqui --to neovim     # add sources to neovim's list
-phora unbind loqui --from neovim          # remove; emptying it deploys nothing
+phora bind dotfiles loqui --to config     # add sources to config's list
+phora unbind loqui --from config          # remove; emptying it deploys nothing
 ```
 
 `--to`/`--from` name the target an edge attaches to. `phora add <url> --to T1 --to T2`
@@ -213,8 +213,8 @@ is the whole-tree view.
 
 ```
 home
-  dotfiles@a1b2c3d4 editor -> /home/me/deploy/editor
-  dotfiles@a1b2c3d4 lint -> /home/me/deploy/lint
+  dotfiles@a1b2c3d4 zellij -> /home/srnnkls/.config/zellij
+  dotfiles@a1b2c3d4 ripgrep -> /home/srnnkls/.config/ripgrep
 ```
 
 `--files` expands each artifact to the files it would deploy; `--json` emits the
@@ -240,14 +240,14 @@ trigger it — that's what the global `post_sync` escape hatch is for); the glob
 `phora.toml` / `phora.local.toml`.
 
 ```toml
-[targets.neovim.hooks]
+[targets.config.hooks]
 # a bare string runs under `sh -c`
-on_change = "nvim --headless +'Lazy! sync' +qa"
+on_change = "mise install"
 
-[targets.editors.hooks]
+[targets.configs.hooks]
 # a table picks the shell; an array runs several in declared order (deduped)
 on_change = [
-  { run = "stylua .", shell = "bash -c" },
+  { run = "mise trust", shell = "bash -c" },
   "git -C ~/.config add -A",
 ]
 
@@ -273,7 +273,7 @@ the next sync. `phora sync --no-hooks` deploys without running any hook.
 Each hook that ran is reported with its scope and status:
 
 ```
-hook neovim#nvim --headless +'Lazy! sync' +qa#sh -c [on_change] `nvim --headless +'Lazy! sync' +qa` ok
+hook config#mise install#sh -c [on_change] `mise install` ok
 sync complete
 ```
 
@@ -285,27 +285,26 @@ never read as config and never executes.
 
 Files can be rendered per-machine with [minijinja](https://docs.rs/minijinja)
 before they deploy. A source file named `*.tmpl` is rendered and lands with the
-suffix stripped (`motd.tmpl` → `motd`); every other file copies byte-for-byte.
+suffix stripped (`config.toml.tmpl` → `config.toml`); every other file copies byte-for-byte.
 Variables come from a flat `[vars]` table:
 
 ```toml
 [vars]
-greeting = "hello"
-editor = "nvim"
+gobin = "~/go/bin"
 ```
 
 ```jinja
-{# editor/motd.tmpl → deploys as editor/motd #}
-{{ greeting }} from {{ editor }}
+{# mise/config.toml.tmpl → deploys as mise/config.toml #}
+GOBIN = "{{ gobin }}"
 ```
 
 The `.tmpl` suffix is the opt-in by default; a refined binding can widen it to
 arbitrary globs or turn it off:
 
 ```toml
-[targets.editor.sources]
+[targets.config.sources]
 # render these paths too, in addition to *.tmpl:
-wide = { source = "dotfiles", template = ["*.conf", "config/*"] }
+wide = { source = "dotfiles", template = ["*.kdl", "*.toml"] }
 # render nothing, even .tmpl files:
 plain = { source = "dotfiles", template = false }
 ```
@@ -317,7 +316,7 @@ per key — keys it omits keep their base value — so each machine fills in its
 ```toml
 # phora.local.toml — overlays phora.toml, never committed
 [vars]
-greeting = "hi from this laptop"
+gobin = "~/.local/go/bin"
 ```
 
 Integrity. Phora hashes the *rendered* bytes, so `phora verify` checks the
@@ -329,9 +328,9 @@ needed. `phora preview --files` shows the deployed name and flags what renders:
 
 ```
 home
-  dotfiles@a1b2c3d4 editor -> /home/me/.config/editor
-    motd (templated)
-    static.txt
+  dotfiles@a1b2c3d4 mise -> /home/srnnkls/.config/mise
+    config.toml (templated)
+    tasks/init
 ```
 
 ## Configuration
@@ -352,23 +351,23 @@ auth = { type = "token", env = "GITHUB_TOKEN" }   # remote is built in; just add
 
 [sources.dotfiles]
 host = "github"          # forge remote: host + repo (or use git = "…" for a literal URL)
-repo = "me/dotfiles"
+repo = "srnnkls/dotfiles"
 branch = "main"          # or tag = "...", or rev = "<sha>"; omit all to follow the repo's default branch
-root = "modules"         # re-anchor the offer at this subdirectory
-include = ["editor"]     # source-owned offer: include − exclude (gitignore)
-exclude = ["**/*.bak"]
+root = ".config"         # re-anchor the offer at this subdirectory
+include = ["zellij", "ripgrep"]  # source-owned offer: include − exclude (gitignore)
+exclude = ["**/*.local.toml"]
 
-[targets.neovim]
-path = "~/.config/nvim"
+[targets.config]
+path = "~/.config"
 sources = ["dotfiles"]   # all-bare: a flat list of the sources this target deploys
 layout = "flat"          # "flat" | "by-source" | { type = "prefixed", separator = "-" }
 
 # a second target using the keyed-table form (key = identity, defaults to source name):
-[targets.editor]
-path = "~/.config/editor"
+[targets.codex]
+path = "~/.codex"
 
-[targets.editor.sources]
-nvim = { source = "dotfiles", take = ["nvim/**"] }
+[targets.codex.sources]
+codex = { source = "dotfiles", take = [{ "codex/config.toml" = "config.toml" }] }
 ```
 
 Target sources are an explicit allow-list: `["a", "b"]` deploys those two,
@@ -421,9 +420,9 @@ A target's `sources` takes one of two forms — never both at once:
 
 Take subsets and renames the offer. A binding's `take` is a list whose entries are:
 
-- a literal leaf (a plain offered path, e.g. `"nvim/init.lua"`) — kept verbatim;
+- a literal leaf (a plain offered path, e.g. `"zellij/config.kdl"`) — kept verbatim;
 - a gitignore glob (any entry with `*`, `?`, `[`, `]`, or a trailing `/`, e.g.
-  `"nvim/**"`) — expands over the offer set only, never widening it;
+  `"zellij/**"`) — expands over the offer set only, never widening it;
 - a rename table `{ "src" = "dest" }` — the offered leaf `src` is consumed and
   emitted at `dest` instead (destructive: it does not also land at `src`).
 
@@ -433,9 +432,9 @@ matches nothing warns but does not fail. An omitted `take` takes the whole offer
 `take = []` takes nothing.
 
 ```toml
-[targets.neovim.sources]
-# take just the editor's tree, then rename one leaf as it lands:
-nvim = { source = "dotfiles", take = ["nvim/**", { "nvim/init.lua" = "init.lua" }] }
+[targets.config.sources]
+# take just the mise tree, then rename one leaf as it lands:
+mise = { source = "dotfiles", take = ["mise/**", { "mise/config.toml" = "mise.toml" }] }
 ```
 
 Restriction. `take` (or any other refinement) on a binding backed by a `url` source
@@ -455,19 +454,20 @@ Identity (the table key). A binding's identity is the
 `source` only when the identity diverges. The identity keys the registry artifact
 and the `by-source` and `prefixed` layout labels, and is structurally unique because
 TOML keys are unique. To feed one source into one target as two slices, give each a
-distinct key, each `take`-ing a different subtree of the same `source`. A genuine
+distinct key, each `take`-ing a different slice of the same `source`. A genuine
 destination clash between bindings is caught at sync as a collision. Bindings resolve
 in identity (key) order, sorted alphabetically — independent of how a flat `sources`
-list is written. The slices below take distinct keys for legible `by-source` labels
-(`nvim/…`, `helix/…`):
+list is written. The slices below rename two configs to a bare `config.toml` that
+would collide under `flat`, so distinct keys give each a legible `by-source` label
+(`codex/…`, `anax/…`):
 
 ```toml
-[targets.editors]
-path = "~/.config"
-layout = "by-source"     # labels each slice by its identity: nvim/… and helix/…
-[targets.editors.sources]
-nvim  = { source = "dotfiles", take = ["nvim/**"] }
-helix = { source = "dotfiles", take = ["helix/**"] }
+[targets.configs]
+path = "~/configs"
+layout = "by-source"     # labels each slice by its identity: codex/… and anax/…
+[targets.configs.sources]
+codex = { source = "dotfiles", take = [{ "codex/config.toml" = "config.toml" }] }
+anax  = { source = "dotfiles", take = [{ "anax/config.toml" = "config.toml" }] }
 ```
 
 Per-target version (`branch`/`tag`/`rev`). A binding may also set its own ref —
@@ -528,12 +528,12 @@ expect:
 [targets.agents]
 path = "~/myproject"
 [targets.agents.sources]
-dotfiles = { take = [{ "AGENTS.md" = "AGENTS.md" }] }
-claude   = { source = "dotfiles", take = [{ "AGENTS.md" = "CLAUDE.md" }] }
-codex    = { source = "dotfiles", take = [{ "AGENTS.md" = "codex.md" }] }
+dotfiles = { take = [{ ".shared/AGENTS.md" = "AGENTS.md" }] }
+claude   = { source = "dotfiles", take = [{ ".shared/AGENTS.md" = "CLAUDE.md" }] }
+codex    = { source = "dotfiles", take = [{ ".shared/AGENTS.md" = "codex.md" }] }
 ```
 
-One `AGENTS.md` in the source now lands three times, under three names, with no
+One `.shared/AGENTS.md` in the source now lands three times, under three names, with no
 copies in the source tree. A rename entry is `{ "<offered-leaf>" = "<dest>" }`: the
 key is a path the source offers, the value the path it deploys as under the target's
 layout.
@@ -586,9 +586,9 @@ binding-scope rejection alongside `template` and `take`.
   request the directory symlink/subtree, and fail loudly when it cannot be honored.
 
 ```toml
-[targets.editors.sources]
+[targets.config.sources]
 # force a per-leaf snapshot even though the whole tree is taken:
-nvim = { source = "dotfiles", take = ["nvim/**"], collapse = false }
+zellij = { source = "dotfiles", take = ["zellij/**"], collapse = false }
 ```
 
 ### Source kinds
@@ -615,8 +615,8 @@ host = "company"         # defined in [hosts.company]
 repo = "team/sub/proj"   # nested paths are fine
 protocol = "ssh"         # per-source override (default is https)
 
-[sources.scratch]
-path = "~/dev/scratch"   # local checkout, used verbatim as the remote
+[sources.dignity]
+path = "~/projects/dignity"   # local checkout, used verbatim as the remote
 branch = "main"
 ```
 
@@ -735,7 +735,7 @@ skips that artifact, and continues the rest of the sync.
 # phora.local.toml — overlays phora.toml, never committed.
 # Override the `loqui` source onto a local checkout and live-link it.
 [sources.loqui]
-path = "/home/me/dev/loqui"  # local source; the live working tree
+path = "~/projects/loqui"  # local source; the live working tree
 deploy = "link"
 ```
 

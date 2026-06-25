@@ -36,12 +36,12 @@ auth = { type = "ssh", key = "~/.ssh/id_ed25519" }
 # or url. A bare `repo = "owner/repo"` defaults to github; a bare `path` is LOCAL.
 
 # Forge source: resolves via the host's `remote` template at sync time. `root`
-# re-anchors the offer at `modules`, so artifacts are named relative to it.
+# re-anchors the offer at `.config`, so artifacts are named relative to it.
 [sources.dotfiles]
 host = "github"          # omit to default to github when `repo` is set
-repo = "me/dotfiles"     # deprecated alias: `path` (forge owner/repo) under a host
+repo = "srnnkls/dotfiles"  # deprecated alias: `path` (forge owner/repo) under a host
 branch = "main"
-root = "modules"
+root = ".config"
 
 [sources.internal]
 host = "company"
@@ -53,10 +53,9 @@ exclude = ["**/test/**", "**/*.bak"]
 
 # Local source: `path` is a filesystem path used verbatim as the remote, exactly
 # like a `git = "/abs/local/checkout"` alias.
-[sources.scratch]
-path = "~/dev/scratch-configs"
+[sources.dignity]
+path = "~/projects/dignity"
 branch = "main"
-root = "modules"
 
 # Forge source pinned to a tag: the source default ref is `v0.55.0`. A binding may
 # override the ref per target (see [targets.tools]), so one source can serve several
@@ -94,30 +93,31 @@ include = ["fzf"]
 # nothing. Manage the list with `phora bind`/`phora unbind`. A `sources` entry is a
 # bare source name, or a table that refines how THIS target consumes the source:
 # `source` = provenance, `take` = this target's own subset/rename of the offer.
-[targets.neovim]
-path = "~/.config/nvim"
-[targets.neovim.sources]
-# Alias the `dotfiles` source under a distinct `nvim` identity, then subset its
-# offer to just the editor's tree with `take` (the new way a target slices a source).
-nvim = { source = "dotfiles", take = ["nvim/**"] }
+[targets.config]
+path = "~/.config"
+[targets.config.sources]
+# Alias the `dotfiles` source under a distinct `zellij` identity, then subset its
+# offer to just the zellij tree with `take` (the new way a target slices a source).
+zellij = { source = "dotfiles", take = ["zellij/**"] }
 
 # One source feeding one target as two independent slices: distinct identities
-# (the table keys) each `take` a different subtree, and `by-source` labels each slice.
-[targets.editors]
-path = "~/.config"
+# (the table keys) each rename their config to a bare `config.toml`, which would
+# collide under `flat`, so `by-source` labels each slice by its identity.
+[targets.configs]
+path = "~/configs"
 layout = "by-source"
-[targets.editors.sources]
-nvim  = { source = "dotfiles", take = ["nvim/**"] }
-helix = { source = "dotfiles", take = ["helix/**"] }
+[targets.configs.sources]
+codex = { source = "dotfiles", take = [{ "codex/config.toml" = "config.toml" }] }
+anax  = { source = "dotfiles", take = [{ "anax/config.toml" = "config.toml" }] }
 
 # `take` can rename as it subsets: `{ src = dest }` projects one offered path to a
-# new destination name, alongside literal/glob leaves it keeps as-is.
-[targets.vscode]
-path = "~/.config/Code/User"
+# new destination name. Codex reads its config from ~/.codex, not ~/.config/codex,
+# so rename the leaf as it lands.
+[targets.codex]
+path = "~/.codex"
 layout = "flat"
-[targets.vscode.sources]
-dotfiles = { take = ["vscode/**", { "vscode/settings.json" = "settings.json" }] }
-internal = { }
+[targets.codex.sources]
+dotfiles = { take = [{ "codex/config.toml" = "config.toml" }] }
 
 [targets.policies]
 path = "~/.cupcake/policies/claude"
