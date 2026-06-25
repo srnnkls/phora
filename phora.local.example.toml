@@ -13,5 +13,5 @@ version = 1
 
 # Override an existing source onto a local checkout and live-link it.
 [sources.loqui]
-path = "/home/me/dev/loqui"  # local source: the live working tree
+path = "~/projects/loqui"  # local source: the live working tree
 deploy = "link"

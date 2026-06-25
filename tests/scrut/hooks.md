@@ -1,195 +1,251 @@
-# Phora Hooks
+# Running something after a sync
 
-End-to-end behaviour of sync hooks: a target `on_change` hook fires once after a
-sync that adds or changes deployed content, files land before the hook runs, a
-failed hook fails the sync but leaves files in place and re-fires next sync,
-`--no-hooks` suppresses execution, a global `post_sync` hook runs every sync, and
-hook-shaped config inside a *synced source tree* is inert (INV-1).
+Deploying files is rarely the final step — you cache-rebuild, reload a daemon,
+or re-index whatever just landed. A target's `on_change` hook runs after a sync
+that *changed* that target, and a global `post_sync` hook runs after *every*
+sync. This suite deploys two skills from Anthropic's public
+[skills repository](https://github.com/anthropics/skills), pinned to a commit,
+and watches the hooks fire.
 
-The suite is hermetic: `isolate_state` redirects `HOME` and the XDG cache/state
-roots into scrut's per-document tempdir, so nothing touches the developer's real
-config or state. Each scenario `cd`s into its own subdirectory and re-isolates,
-giving it a private `HOME`/state. Hooks leave observable artifacts (a log file
-under `$HOME`) so their effect — and ordering against deploy — is asserted
-directly. Output is piped through `normalize`, which collapses the tempdir prefix
-to `<ROOT>`; the report prints the hook command's literal `$HOME` text (it is a
-format string, not a shell), so it stays byte-stable.
+State is hermetic — the first command points `HOME` and the XDG cache/state
+roots at scrut's per-document tempdir; the clones are real. Hook reports print the
+command as a literal format string — `$HOME` and `$PHORA_CHANGED_NAMES` appear
+verbatim, never expanded — so the output is byte-stable without normalization.
 
-## Setup
-
-Source the helpers.
+## Start
 
 ```scrut
-$ source "$TESTDIR"/_setup.sh && ROOT="$PWD" && echo ready
+$ export HOME="$PWD" XDG_CACHE_HOME="$PWD/cache" XDG_STATE_HOME="$PWD/state" && mkdir -p cache state && ROOT="$PWD" && echo ready
 ready
 ```
 
-## on_change fires once after a changing sync, files first
-
-A target carries an `on_change` hook that appends the *deployed* `editor/init.lua`
-to `$HOME/hook.log`. The first sync deploys the included subtrees, then runs the
-hook once; the report names it with its `on_change` scope and `ok` status.
+The target carries an `on_change` hook that records which artifacts changed.
+phora hands a hook `$PHORA_CHANGED_NAMES` — the newline-separated names of the
+artifacts this sync touched:
 
 ```scrut
-$ mkdir -p s1 && cd s1 && isolate_state && seed_config_with_hooks "$(make_git_source proj)" >/dev/null && phora sync 2>&1 | normalize
-hook home#cat "$HOME/target-home/editor/init.lua" >> "$HOME/hook.log"#sh -c [on_change] `cat "$HOME/target-home/editor/init.lua" >> "$HOME/hook.log"` ok
-sync complete
+$ cat > phora.toml <<'EOF'
+> version = 1
+>
+> [sources.skills]
+> host = "github"
+> repo = "anthropics/skills"
+> rev = "57546260929473d4e0d1c1bb75297be2fdfa1949"
+> root = "skills"
+> include = ["mcp-builder", "skill-creator"]
+>
+> [targets.skills]
+> path = "claude-skills"
+> sources = ["skills"]
+>
+> [targets.skills.hooks]
+> on_change = "echo \"$PHORA_CHANGED_NAMES\" >> \"$HOME/deployed.log\""
+> EOF
 ```
 
-The log holds the deployed file's contents — proof the file landed *before* the
-hook read it.
+## It fires once, after the files land
 
-```scrut
-$ cat "$HOME/hook.log"
--- init
-```
-
-`phora list` reflects the clean, in-sync artifacts.
-
-```scrut
-$ phora list 2>&1 | normalize
-home:
-  dotfiles/editor  ✓ clean
-  dotfiles/lint  ✓ clean
-```
-
-## A no-op sync runs no hook
-
-Re-syncing with no upstream change deploys nothing new, so the hook does not fire
-and the log is unchanged.
-
-```scrut
-$ phora sync 2>&1 | normalize
-sync complete
-```
-
-```scrut
-$ cat "$HOME/hook.log"
--- init
-```
-
-## A failed hook fails the sync, keeps files, and re-fires
-
-A fresh target's `on_change` hook only succeeds once `$HOME/allow` exists. The
-first sync deploys the files, the hook fails, and the sync exits non-zero with the
-failure reported on stderr.
-
-```scrut
-$ cd "$ROOT" && mkdir -p s2 && cd s2 && isolate_state && seed_config_failing_hook "$(make_git_source proj)" && echo seeded
-seeded
-```
+The first sync deploys the two skills, then runs the hook once. The report names
+the hook's target, its command, its scope, and its status:
 
 ```scrut
 $ phora sync 2>&1
-hook home#test -f "$HOME/allow" && echo ran >> "$HOME/hook.log"#sh -c [on_change] `test -f "$HOME/allow" && echo ran >> "$HOME/hook.log"` failed
+hook skills#echo "$PHORA_CHANGED_NAMES" >> "$HOME/deployed.log"#sh -c [on_change] `echo "$PHORA_CHANGED_NAMES" >> "$HOME/deployed.log"` ok
+sync complete
+```
+
+The hook saw both artifacts — and saw them by name, which it could only do after
+they were deployed:
+
+```scrut
+$ cat "$HOME/deployed.log"
+mcp-builder
+skill-creator
+```
+
+## A no-op sync stays quiet
+
+Nothing changed upstream, so the second sync deploys nothing and the `on_change`
+hook does not fire:
+
+```scrut
+$ phora sync 2>&1
+sync complete
+```
+
+The log is unchanged:
+
+```scrut
+$ cat "$HOME/deployed.log"
+mcp-builder
+skill-creator
+```
+
+## post_sync runs regardless
+
+Add a global `post_sync` hook. It runs after *every* sync, for work that should
+happen whether or not content moved:
+
+```scrut
+$ cat > phora.toml <<'EOF'
+> version = 1
+>
+> [hooks]
+> post_sync = "echo synced >> \"$HOME/runs.log\""
+>
+> [sources.skills]
+> host = "github"
+> repo = "anthropics/skills"
+> rev = "57546260929473d4e0d1c1bb75297be2fdfa1949"
+> root = "skills"
+> include = ["mcp-builder", "skill-creator"]
+>
+> [targets.skills]
+> path = "claude-skills"
+> sources = ["skills"]
+>
+> [targets.skills.hooks]
+> on_change = "echo \"$PHORA_CHANGED_NAMES\" >> \"$HOME/deployed.log\""
+> EOF
+```
+
+This sync still changes no content, so `on_change` stays silent while `post_sync`
+runs:
+
+```scrut
+$ phora sync 2>&1
+hook post_sync#echo synced >> "$HOME/runs.log"#sh -c [post_sync] `echo synced >> "$HOME/runs.log"` ok
+sync complete
+```
+
+The `on_change` log did not grow; the `post_sync` log recorded the run:
+
+```scrut
+$ cat "$HOME/deployed.log"
+mcp-builder
+skill-creator
+```
+
+```scrut
+$ cat "$HOME/runs.log"
+synced
+```
+
+## A failing hook fails the sync — and retries
+
+A hook that exits non-zero makes the sync exit non-zero too, but the files are
+already on disk and the failure is *not* recorded — so the next sync retries it.
+Here the hook only succeeds once a sentinel file exists:
+
+```scrut
+$ cd "$ROOT" && mkdir -p retry && cd retry && export HOME="$PWD" XDG_CACHE_HOME="$PWD/cache" XDG_STATE_HOME="$PWD/state" && mkdir -p cache state && echo isolated
+isolated
+```
+
+```scrut
+$ cat > phora.toml <<'EOF'
+> version = 1
+>
+> [sources.skills]
+> host = "github"
+> repo = "anthropics/skills"
+> rev = "57546260929473d4e0d1c1bb75297be2fdfa1949"
+> root = "skills"
+> include = ["skill-creator"]
+>
+> [targets.skills]
+> path = "claude-skills"
+> sources = ["skills"]
+>
+> [targets.skills.hooks]
+> on_change = "test -f \"$HOME/ready\" && echo built >> \"$HOME/build.log\""
+> EOF
+```
+
+The first sync deploys, the hook fails, and the sync exits non-zero:
+
+```scrut
+$ phora sync 2>&1
+hook skills#test -f "$HOME/ready" && echo built >> "$HOME/build.log"#sh -c [on_change] `test -f "$HOME/ready" && echo built >> "$HOME/build.log"` failed
 phora: one or more hooks failed
 [1]
 ```
 
-The files are deployed despite the failed hook.
+The files landed anyway — a failed hook never rolls back a deploy:
 
 ```scrut
-$ test -f "$PWD/target-home/editor/init.lua" && echo deployed
+$ test -f claude-skills/skill-creator/SKILL.md && echo deployed
 deployed
 ```
 
-The failure was *not* recorded, so fixing the cause and re-syncing re-fires the
-hook even though no upstream content changed.
+Fix the cause and sync again. Even though no upstream content changed, the hook
+re-fires because its earlier failure was never recorded as success:
 
 ```scrut
-$ touch "$HOME/allow" && phora sync 2>&1 | normalize
-hook home#test -f "$HOME/allow" && echo ran >> "$HOME/hook.log"#sh -c [on_change] `test -f "$HOME/allow" && echo ran >> "$HOME/hook.log"` ok
+$ touch "$HOME/ready" && phora sync 2>&1
+hook skills#test -f "$HOME/ready" && echo built >> "$HOME/build.log"#sh -c [on_change] `test -f "$HOME/ready" && echo built >> "$HOME/build.log"` ok
 sync complete
 ```
 
 ```scrut
-$ cat "$HOME/hook.log"
-ran
+$ cat "$HOME/build.log"
+built
 ```
 
-Now that the success is recorded, a further no-op sync does not re-fire.
+Now that it has succeeded, a further no-op sync leaves it alone:
 
 ```scrut
-$ phora sync 2>&1 | normalize
+$ phora sync 2>&1
 sync complete
 ```
 
 ```scrut
-$ cat "$HOME/hook.log"
-ran
+$ cat "$HOME/build.log"
+built
 ```
 
-## --no-hooks suppresses execution
+## --no-hooks deploys without running anything
 
-A fresh deployment with `--no-hooks` deploys the files but runs no hook, so no log
-is written.
+When you want the files but not the side effects, `--no-hooks` suppresses every
+hook for that run:
 
 ```scrut
-$ cd "$ROOT" && mkdir -p s3 && cd s3 && isolate_state && seed_config_with_hooks "$(make_git_source proj)" >/dev/null && phora sync --no-hooks 2>&1 | normalize
+$ cd "$ROOT" && mkdir -p quiet && cd quiet && export HOME="$PWD" XDG_CACHE_HOME="$PWD/cache" XDG_STATE_HOME="$PWD/state" && mkdir -p cache state && echo isolated
+isolated
+```
+
+```scrut
+$ cat > phora.toml <<'EOF'
+> version = 1
+>
+> [sources.skills]
+> host = "github"
+> repo = "anthropics/skills"
+> rev = "57546260929473d4e0d1c1bb75297be2fdfa1949"
+> root = "skills"
+> include = ["skill-creator"]
+>
+> [targets.skills]
+> path = "claude-skills"
+> sources = ["skills"]
+>
+> [targets.skills.hooks]
+> on_change = "echo ran >> \"$HOME/hook.log\""
+> EOF
+```
+
+```scrut
+$ phora sync --no-hooks 2>&1
 sync complete
 ```
 
-```scrut
-$ test -f "$PWD/target-home/editor/init.lua" && echo deployed
-deployed
-```
+The skill deployed, but the hook never ran:
 
 ```scrut
-$ test -e "$HOME/hook.log" && echo fired || echo suppressed
-suppressed
+$ test -f claude-skills/skill-creator/SKILL.md && test ! -e "$HOME/hook.log" && echo "deployed, no hook"
+deployed, no hook
 ```
 
-## INV-1 inertness and global post_sync
-
-The source tree itself carries a hook-shaped `phora.toml` under `payload/`. The
-consumer config includes that subtree and declares only a global `post_sync` hook
-(no target hooks).
-
-```scrut
-$ cd "$ROOT" && mkdir -p s4 && cd s4 && isolate_state && seed_config_post_sync "$(make_evil_source)" && echo seeded
-seeded
-```
-
-Syncing runs only the consumer's global `post_sync` hook.
-
-```scrut
-$ phora sync 2>&1 | normalize
-hook post_sync#echo post >> "$HOME/post.log"#sh -c [post_sync] `echo post >> "$HOME/post.log"` ok
-sync complete
-```
-
-The source tree's `phora.toml` lands as ordinary inert content.
-
-```scrut
-$ test -f "$PWD/target-home/payload/phora.toml" && echo present
-present
-```
-
-INV-1: the synced tree's hook never executed.
-
-```scrut
-$ test -e "$HOME/PWNED" && echo PWNED || echo inert
-inert
-```
-
-`post_sync` ran once.
-
-```scrut
-$ cat "$HOME/post.log"
-post
-```
-
-A second sync changes no content, yet the global `post_sync` (default
-`when = always`) runs again.
-
-```scrut
-$ phora sync 2>&1 | normalize
-hook post_sync#echo post >> "$HOME/post.log"#sh -c [post_sync] `echo post >> "$HOME/post.log"` ok
-sync complete
-```
-
-```scrut
-$ cat "$HOME/post.log"
-post
-post
-```
+Hooks come only from *your* config, never from a synced source tree — a
+downloaded repo that happens to carry its own `phora.toml` is inert content, read
+as files and never executed.

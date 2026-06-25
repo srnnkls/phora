@@ -1,191 +1,236 @@
-# Phora Usage Showcase
+# One skill set, every project
 
-A narrated, end-to-end walkthrough that doubles as runnable documentation. It
-follows a new user setting up a real project: declare a target, add a git source
-of editor and lint config, project it, inspect the result, then layer a
-machine-local overlay on top via a symlink. Every command is the shipped binary,
-and every block asserts its exact output — so this document cannot drift from how
-`phora` actually behaves.
+You have accumulated Claude Code skills, and every project that wants them has
+its own slightly different copy. This walkthrough pulls two skills from
+Anthropic's public [skills repository](https://github.com/anthropics/skills)
+into a project's `.claude/skills`-shaped directory, pinned to an exact commit —
+then layers a local working tree on top for the editing loop, and takes it off
+again.
 
-The suite is hermetic: `isolate_state` redirects `HOME` and the XDG cache/state
-roots into scrut's per-document tempdir, so nothing touches the developer's real
-`phora.toml`, `~/.phora`, or XDG roots. Output is piped through `normalize`,
-which collapses the random tempdir prefix (in either its raw or macOS
-`/private`-canonicalized form) to `<ROOT>`. Commit hashes and content digests are
-pinned by the fixture, so they are asserted verbatim.
+Every command below is the shipped binary and every block asserts its exact
+output, so any divergence from how phora behaves fails the suite. State is
+hermetic — the first command points `HOME` and the XDG cache/state roots at
+scrut's per-document tempdir — but the clone is real: this suite talks to
+github.com, and its assertions hold as long as the pinned upstream commit exists.
 
-## Bootstrap
-
-A real project starts with a git repository of config you want to share across
-machines. Source the helpers, isolate state, and build a throwaway source repo
-holding an `editor/`, a `lint/`, and a few loose files.
+## Start
 
 ```scrut
-$ source "$TESTDIR"/_setup.sh && isolate_state && repo="$(make_git_source dotfiles)" && echo ready
+$ export HOME="$PWD" XDG_CACHE_HOME="$PWD/cache" XDG_STATE_HOME="$PWD/state" && mkdir -p cache state && echo ready
 ready
 ```
 
-## Declare a target
+## A target and a source
 
-A target is a named deploy destination. Point one at a directory that stands in
-for your home tree.
+A target is a directory that consumes artifacts. Ours stands in for a project's
+`.claude/skills`.
 
 ```scrut
-$ phora target add home --path "$PWD/target-home" 2>&1 | normalize
-Added target 'home': <ROOT>/target-home
+$ phora target add skills --path claude-skills
+Added target 'skills': claude-skills
 ```
 
-## Add a git source, refined
-
-`phora add` resolves the local repository, records it as a `path =` source, and
-binds it to `home`. Refining the binding with `--include` keeps only the
-subtrees you care about — here the `editor` and `lint` directories, leaving the
-repo's loose root files (`README.md`, `.config/`) out of the projection.
+`phora add` takes the bare `owner/repo` form and records it symbolically —
+intent, not a baked-in URL.
 
 ```scrut
-$ phora add "$repo" --to home --include editor --include lint 2>&1 | normalize
-Added source 'src-dotfiles': <ROOT>/src-dotfiles
-  bound to home
+$ phora add anthropics/skills --to skills --root skills --include mcp-builder --include skill-creator
+Added source 'skills': github:anthropics/skills
+  bound to skills
 ```
 
-## Project it
-
-`phora sync` clones the source into the mirror under `XDG_CACHE_HOME`, locks the
-resolved commit, and copies the included files into the target.
+That tracks `main`, which is the right default for a tool and the wrong one for
+a document that asserts commit hashes. The flags only edit `phora.toml`, and the
+file is ours to edit too — so pin the rev, and while we are in there, move the
+selection onto the source so it becomes the default for every consumer:
 
 ```scrut
-$ phora sync 2>&1 | normalize
+$ cat > phora.toml <<'EOF'
+> version = 1
+>
+> [sources.skills]
+> host = "github"
+> repo = "anthropics/skills"
+> rev = "57546260929473d4e0d1c1bb75297be2fdfa1949"
+> root = "skills"
+> include = ["mcp-builder", "skill-creator"]
+>
+> [targets.skills]
+> path = "claude-skills"
+> sources = ["skills"]
+> EOF
+```
+
+## Sync
+
+One command: mirror the repository into the cache, resolve the rev, write the
+lock, project the two selected skills into the target.
+
+```scrut
+$ phora sync
 sync complete
 ```
 
-## Inspect deployment state
-
-`phora list` reports each target's artifacts and their state. The `✓` glyph
-marks a clean, in-sync artifact; only the two included subtrees appear.
+The upstream repo carries seventeen skills at this commit; the `include` keeps
+exactly two.
 
 ```scrut
-$ phora list 2>&1 | normalize
-home:
-  src-dotfiles/editor  ✓ clean
-  src-dotfiles/lint  ✓ clean
+$ phora list
+skills:
+  skills/mcp-builder  ✓ clean
+  skills/skill-creator  ✓ clean
 ```
 
-`phora where` queries the global registry, reporting each artifact's resolved
-commit (shortened to 8 hex) and content digest — both deterministic for the
-pinned fixture, so they are asserted verbatim.
-
 ```scrut
-$ phora where 2>&1 | normalize
-Artifact: src-dotfiles/editor (commit ca94c83b, digest blake3:2316b2c05d3f72e93270833746381341b70a008daf5af59a2ddb2a8c83206bc0)
-  - home
-Artifact: src-dotfiles/lint (commit ca94c83b, digest blake3:d26cc52a7261d7a76fa1f6dadda5cba932687bd6cf626e7ea746e46dc8937cfb)
-  - home
-```
-
-The included files landed in the target tree, and the excluded root files did
-not.
-
-```scrut
-$ test -f "$PWD/target-home/editor/init.lua" && test ! -e "$PWD/target-home/README.md" && echo projected
+$ test -f claude-skills/mcp-builder/SKILL.md && test ! -e claude-skills/internal-comms && echo projected
 projected
 ```
 
-## Layer a machine-local overlay
-
-Not everything belongs in the shared, committed config. Machine-specific files
-live in `phora.local.toml`, which `phora` reads but never expects to be checked
-in. Declare a *local* target for them.
+`phora where` reads the registry back: which commit, which content digest,
+which targets. Both values are functions of the pinned commit, which is why
+this document can assert them verbatim.
 
 ```scrut
-$ phora target add machine --path "$PWD/target-machine" --local 2>&1 | normalize
-Added target 'machine': <ROOT>/target-machine
+$ phora where
+Artifact: skills/mcp-builder (commit 57546260, digest blake3:d6b9907115af0caed507032d448ac4dc7a47d8ed29e8463bbcb14e730b43d264)
+  - skills
+Artifact: skills/skill-creator (commit 57546260, digest blake3:02ba3bcbf109bf830963d9075dd6e43cf727f6012a0aa8fb6221153763e4c6a9)
+  - skills
 ```
 
-`make_overlay` materializes a plain directory of machine-local files. Adding it
-with `--symlink` registers it as a local overlay source that deploys by linking
-in place rather than copying. Overlay sources go to `phora.local.toml`, so the
-add does not take `--to` or refinement flags; the overlay path is recorded in its
-canonical form (macOS resolves it under `/private`, which `normalize` collapses
-to `<ROOT>`).
+The lock is small enough to read whole. One entry: the source, the resolved
+commit, a digest over the projected content, and a digest over the
+export-affecting config — the latter is how phora notices you changed *what*
+ships even when upstream did not move.
 
 ```scrut
-$ ov="$(make_overlay machine)" && phora add "$ov" --symlink 2>&1 | normalize
-Added local source 'overlay-machine': <ROOT>/overlay-machine
+$ cat phora.lock
+version = 1
+
+[[sources]]
+name = "skills"
+git = "https://github.com/anthropics/skills.git"
+resolved = "57546260929473d4e0d1c1bb75297be2fdfa1949"
+commit = "57546260929473d4e0d1c1bb75297be2fdfa1949"
+digest = "blake3:e1608b00c776c964b9bd32eafac59ebfe5093778e56e1c3cd1c8cfbb75563889"
+config_digest = "blake3:6add44654fda0f665dc64860f646e3cc329bcf3c68e67fd0eeccfbc32dfd558c"
 ```
 
-Bind the overlay to the local `machine` target. `--local` keeps the binding in
-`phora.local.toml` alongside the source.
+## Asking instead of guessing
+
+When a path does or does not ship and the globs are not obvious by eye,
+`check-match` answers for one path:
 
 ```scrut
-$ phora bind overlay-machine --to machine --local 2>&1 | normalize
-Bound overlay-machine to 'machine'
+$ phora check-match --source skills mcp-builder/SKILL.md
+artifact `mcp-builder`: allowed
+path `mcp-builder/SKILL.md`: allowed
+include: ["mcp-builder", "skill-creator"]
+exclude: []
 ```
 
-## Project the overlay
+```scrut
+$ phora check-match --source skills internal-comms/SKILL.md
+artifact `internal-comms`: excluded
+path `internal-comms/SKILL.md`: excluded
+include: ["mcp-builder", "skill-creator"]
+exclude: []
+```
 
-A second `phora sync` deploys the overlay. Because it was added with `--symlink`,
-the target entry is a symlink back to the overlay directory rather than a copy.
+And `preview` shows the whole projection — what a sync would do, from the lock,
+without writing anything:
 
 ```scrut
-$ phora sync 2>&1 | normalize
+$ phora preview
+skills
+  skills@57546260 mcp-builder/ -> claude-skills/mcp-builder
+  skills@57546260 skill-creator/ -> claude-skills/skill-creator
+```
+
+Each skill's whole tree is taken, so it *collapses* to a single directory
+artifact — preview marks a collapsed directory with a trailing slash
+(`mcp-builder/`).
+
+`verify` re-hashes every deployed file against the registry — the difference
+between "the files are there" and "the files are exactly what phora put there,"
+which matters when the files are prompts an agent will follow.
+
+```scrut
+$ phora verify
+all verified
+```
+
+## The editing loop
+
+Editing a skill through copy-and-sync means a commit per keystroke. For the
+loop, point the source at a local checkout and deploy by symlink instead.
+`phora.local.toml` overlays the committed config per-key and is never
+committed; a `deploy = "link"` source is only honored there, so the loop cannot
+leak into shared config. Our stand-in for the checkout is a directory with the
+repo's shape:
+
+```scrut
+$ mkdir -p dev-skills/skills/mcp-builder dev-skills/skills/skill-creator && printf 'name: mcp-builder (work in progress)\n' > dev-skills/skills/mcp-builder/SKILL.md && printf 'name: skill-creator (work in progress)\n' > dev-skills/skills/skill-creator/SKILL.md
+```
+
+```scrut
+$ cat > phora.local.toml <<'EOF'
+> version = 1
+>
+> [sources.skills]
+> path = "./dev-skills"
+> deploy = "link"
+> EOF
+```
+
+```scrut
+$ phora sync
 sync complete
 ```
 
-`phora where` now reports the overlay artifact too. A linked overlay carries no
-git commit or content digest, so both read as `link`.
+The target entries are now symlinks into the working tree — edits show up
+immediately, no re-sync:
 
 ```scrut
-$ phora where 2>&1 | normalize
-Artifact: overlay-machine/config (commit link, digest link:)
-  - machine
-Artifact: overlay-machine/notes.txt (commit link, digest link:)
-  - machine
-Artifact: src-dotfiles/editor (commit ca94c83b, digest blake3:2316b2c05d3f72e93270833746381341b70a008daf5af59a2ddb2a8c83206bc0)
-  - home
-Artifact: src-dotfiles/lint (commit ca94c83b, digest blake3:d26cc52a7261d7a76fa1f6dadda5cba932687bd6cf626e7ea746e46dc8937cfb)
-  - home
+$ phora list
+skills:
+  skills/mcp-builder  linked
+  skills/skill-creator  linked
 ```
 
-`phora list` merges the machine-local config too, so the overlay shows under the
-`machine` target with the `linked` state alongside the git artifacts in `home`.
-
 ```scrut
-$ phora list 2>&1 | normalize
-home:
-  src-dotfiles/editor  ✓ clean
-  src-dotfiles/lint  ✓ clean
-machine:
-  overlay-machine/config  linked
-  overlay-machine/notes.txt  linked
+$ readlink claude-skills/mcp-builder | sed "s#/private$PWD#<ROOT>#g;s#$PWD#<ROOT>#g"
+<ROOT>/dev-skills/skills/mcp-builder
 ```
 
-`phora preview` renders the full projection from the lock, both targets at once —
-the git artifacts copied into `home`, the overlay linked into `machine`.
+A linked artifact sits outside the integrity model — its bytes change
+underfoot, so phora records `link` as the digest rather than hashing:
 
 ```scrut
-$ phora preview 2>&1 | normalize
-home
-  src-dotfiles@ca94c83b editor/ -> <ROOT>/target-home/editor
-  src-dotfiles@ca94c83b lint/ -> <ROOT>/target-home/lint
-machine
-  overlay-machine@link config/ -> <ROOT>/target-machine/config
-  overlay-machine@link notes.txt -> <ROOT>/target-machine/notes.txt
+$ phora where --artifact mcp-builder
+Artifact: skills/mcp-builder (commit link, digest link:)
+  - skills
 ```
 
-The deployed overlay entry is a real symlink pointing back at the source
-directory.
+Link mode trades the content guarantee for live edits. Done editing, remove the
+overlay, and the next sync puts pinned, verifiable copies back:
 
 ```scrut
-$ test -L "$PWD/target-machine/config" && readlink "$PWD/target-machine/config" | normalize
-<ROOT>/overlay-machine/config
+$ rm phora.local.toml && phora sync
+sync complete
 ```
 
-## Verify everything
-
-`phora verify` re-checks every deployed artifact — git files re-hashed against
-the lock, the overlay symlink confirmed in place.
-
 ```scrut
-$ phora verify 2>&1 | normalize
+$ test ! -L claude-skills/mcp-builder && phora verify
 all verified
+```
+
+The half-written `work in progress` edit stayed in the working tree where it
+belongs; the target is back on the locked commit.
+
+```scrut
+$ phora list
+skills:
+  skills/mcp-builder  ✓ clean
+  skills/skill-creator  ✓ clean
 ```
