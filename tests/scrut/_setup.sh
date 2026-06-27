@@ -227,6 +227,83 @@ greeting = "$1"
 EOF
 }
 
+# A leaf repo carrying an `nvim/` subtree (and a root phora.toml outside it), with
+# no hooks of its own — the composed surface a transitive dep binds.
+make_composed_leaf() {
+	repo="$PWD/src-$1"
+	mkdir -p "$repo"
+	_phora_git init -q -b main "$repo"
+
+	_phora_write "$repo/nvim/init.lua" "-- init
+"
+	_phora_write "$repo/nvim/lua/opts.lua" "-- opts
+"
+	_phora_write "$repo/phora.toml" "version = 1
+"
+
+	_phora_git -C "$repo" add -A
+	_phora_commit "$_PHORA_GIT_AUTHOR_DATE" "$_PHORA_GIT_COMMITTER_DATE" \
+		"$repo" "leaf"
+
+	printf '%s\n' "$repo"
+}
+
+# A transitive source must resolve to a real remote, never a bare local path; this
+# rewrites a stable mock URL to the local fixture repo so a committed manifest can
+# pin the URL while git fetches resolve offline.
+map_insteadof() {
+	cat >>"$HOME/.gitconfig" <<EOF
+[url "$2"]
+	insteadOf = $1
+EOF
+}
+
+# A transitive dep repo composing a leaf's `nvim` subtree into a target that
+# carries an on_change hook; `$2` is the mock URL the dep manifest pins for the leaf.
+make_composing_dep() {
+	repo="$PWD/src-$1"
+	leaf_url="$2"
+	mkdir -p "$repo"
+	_phora_git init -q -b main "$repo"
+	cat >"$repo/phora.toml" <<EOF
+version = 1
+
+[sources.editor]
+git = "$leaf_url"
+include = ["nvim"]
+
+[targets.nvim]
+path = "nvim"
+sources = ["editor"]
+
+[targets.nvim.hooks]
+on_change = "touch \"\$HOME/dep-hook.sentinel\""
+EOF
+	_phora_git -C "$repo" add -A
+	_phora_commit "$_PHORA_GIT_AUTHOR_DATE" "$_PHORA_GIT_COMMITTER_DATE" \
+		"$repo" "dep"
+
+	printf '%s\n' "$repo"
+}
+
+# Consumer config importing the transitive dep (pinned by mock URL `$1`) into a target.
+seed_config_transitive() {
+	dep_url="$1"
+	target="$PWD/target-cfg"
+	mkdir -p "$target"
+	cat >"$PWD/phora.toml" <<EOF
+version = 1
+
+[sources.mydeps]
+git = "$dep_url"
+transitive = true
+
+[targets.dotcfg]
+path = "$target"
+imports = ["mydeps"]
+EOF
+}
+
 # A source repo whose own tree carries a hook-shaped phora.toml under payload/ —
 # INV-1 fixture: that hook must stay inert when the tree is synced as content.
 make_evil_source() {

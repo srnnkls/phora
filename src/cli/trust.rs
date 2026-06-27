@@ -247,9 +247,14 @@ fn revoke_source_hooks(
     Ok(())
 }
 
-/// Resolves the `(remote_url, commit)` a `--show` should read, entirely from the lock (offline).
-/// The current candidate commit for `source` wins over a prior trusted commit; a single distinct
-/// non-empty commit is required, so an unsynced or ambiguous source refuses rather than guesses.
+/// Resolves the `(remote_url, commit)` a `--show` reads, entirely from the lock (offline). Both come
+/// from the `LockedSource` the source's candidate (else prior trusted) hook maps to, so a composed
+/// dep's files are read at the bound source's OWN pinned commit, not the composing dep's. A single
+/// distinct target is required; an unsynced or ambiguous source refuses rather than guesses.
+///
+/// Coherence contract: a `--show` reads one `LockedSource` `(url, commit)`, so a target that binds
+/// several distinct sources cannot be fully served — a path living only in a second bound source is
+/// reported absent.
 pub(super) fn resolve_show_target(
     lock: Option<&Lock>,
     source: Option<&str>,
@@ -262,40 +267,40 @@ pub(super) fn resolve_show_target(
         ))
     })?;
 
-    let mut records: Vec<(&str, &str)> = lock
+    let mut instances: Vec<&str> = lock
         .candidate_hooks
         .iter()
         .filter(|c| c.source == source)
-        .map(|c| (c.commit.as_str(), c.dep_instance.as_str()))
+        .map(|c| c.dep_instance.as_str())
         .collect();
-    if records.is_empty() {
-        records = lock
+    if instances.is_empty() {
+        instances = lock
             .trusted_hooks
             .iter()
             .filter(|h| h.source == source)
-            .map(|h| (h.commit.as_str(), h.dep_instance.as_str()))
+            .map(|h| h.dep_instance.as_str())
             .collect();
     }
 
-    let mut distinct: Vec<(&str, &str)> = Vec::new();
-    for (commit, instance) in records {
-        if !commit.is_empty() && !distinct.iter().any(|(c, _)| *c == commit) {
-            distinct.push((commit, instance));
+    let mut targets: Vec<(String, String)> = Vec::new();
+    for instance in instances {
+        let Ok((git, commit)) = locked_target(lock, instance, source) else {
+            continue;
+        };
+        if !commit.is_empty() && !targets.iter().any(|(g, c)| *g == git && *c == commit) {
+            targets.push((git, commit));
         }
     }
 
-    match distinct.as_slice() {
+    match targets.as_slice() {
         [] => Err(Error::Config(format!(
             "no commit recorded for `{source}` — run `phora sync` first"
         ))),
-        [(commit, instance)] => {
-            let url = locked_url(lock, instance, source)?;
-            Ok((source.to_owned(), url, (*commit).to_owned()))
-        }
+        [(git, commit)] => Ok((source.to_owned(), git.clone(), commit.clone())),
         many => {
             let commits = many
                 .iter()
-                .map(|(c, _)| short(c))
+                .map(|(_, c)| short(c))
                 .collect::<Vec<_>>()
                 .join(", ");
             Err(Error::Config(format!(
@@ -305,14 +310,15 @@ pub(super) fn resolve_show_target(
     }
 }
 
-/// The remote URL of the `LockedSource` for `instance` (a transitive node), falling back to the
-/// consumer source named `source`.
-fn locked_url(lock: &Lock, instance: &str, source: &str) -> Result<String> {
+/// The `(git, commit)` of the `LockedSource` for `instance` (a transitive node), falling back to
+/// the consumer source named `source`. Both fields come from the SAME entry, so a `--show` reads a
+/// dep's files at the commit its own mirror actually holds.
+fn locked_target(lock: &Lock, instance: &str, source: &str) -> Result<(String, String)> {
     lock.sources
         .iter()
         .find(|s| s.instance.as_deref() == Some(instance))
         .or_else(|| lock.sources.iter().find(|s| s.name == source))
-        .map(|s| s.git.clone())
+        .map(|s| (s.git.clone(), s.commit.clone()))
         .ok_or_else(|| {
             Error::Config(format!(
                 "no locked remote for `{source}` — run `phora sync` first"
@@ -822,12 +828,17 @@ mod tests {
         }
     }
 
-    fn locked_dep(name: &str, instance: &str, git: &str) -> crate::lock::LockedSource {
+    fn locked_dep(
+        name: &str,
+        instance: &str,
+        git: &str,
+        commit: &str,
+    ) -> crate::lock::LockedSource {
         crate::lock::LockedSource {
             name: name.to_owned(),
             git: git.to_owned(),
             resolved: "main".to_owned(),
-            commit: "c0ffee".to_owned(),
+            commit: commit.to_owned(),
             digest: "blake3:artifact".to_owned(),
             config_digest: "blake3:cfg".to_owned(),
             r#ref: None,
@@ -1019,13 +1030,22 @@ mod tests {
     #[test]
     fn resolve_show_target_prefers_the_candidate_commit_over_trusted() {
         let lock = Lock {
-            candidate_hooks: vec![cand_commit("mydeps", "inst", COMMIT_A)],
-            trusted_hooks: vec![trusted_commit("mydeps", "inst", COMMIT_B)],
-            sources: vec![locked_dep(
-                "mydeps",
-                "inst",
-                "https://github.com/dep/mydeps.git",
-            )],
+            candidate_hooks: vec![cand_commit("mydeps", "cand-inst", COMMIT_ONE)],
+            trusted_hooks: vec![trusted_commit("mydeps", "trust-inst", COMMIT_B)],
+            sources: vec![
+                locked_dep(
+                    "mydeps",
+                    "cand-inst",
+                    "https://github.com/dep/mydeps.git",
+                    COMMIT_A,
+                ),
+                locked_dep(
+                    "mydeps",
+                    "trust-inst",
+                    "https://github.com/dep/prior.git",
+                    COMMIT_B,
+                ),
+            ],
             ..empty_lock()
         };
 
@@ -1034,7 +1054,13 @@ mod tests {
 
         assert_eq!(
             commit, COMMIT_A,
-            "the current candidate commit must win over the prior trusted commit"
+            "the commit must come from the LockedSource of the CANDIDATE's dep_instance (COMMIT_A), \
+             never from the candidate hook record's own commit field (COMMIT_ONE) — a present \
+             candidate wins over the prior trusted instance"
+        );
+        assert_ne!(
+            commit, COMMIT_ONE,
+            "reading the candidate HOOK's commit instead of its LockedSource's is a regression"
         );
         assert_eq!(
             url, "https://github.com/dep/mydeps.git",
@@ -1045,18 +1071,19 @@ mod tests {
     #[test]
     fn resolve_show_target_with_no_commit_directs_to_sync() {
         let lock = Lock {
-            candidate_hooks: vec![cand_commit("mydeps", "inst", "")],
+            candidate_hooks: vec![cand_commit("mydeps", "inst", COMMIT_A)],
             trusted_hooks: Vec::new(),
             sources: vec![locked_dep(
                 "mydeps",
                 "inst",
                 "https://github.com/dep/mydeps.git",
+                "",
             )],
             ..empty_lock()
         };
 
         let err = resolve_show_target(Some(&lock), Some("mydeps"))
-            .expect_err("an empty/absent dep commit cannot be shown offline");
+            .expect_err("a LockedSource with no pinned commit cannot be shown offline");
 
         assert!(
             err.to_string().contains("sync"),
@@ -1068,24 +1095,68 @@ mod tests {
     fn resolve_show_target_refuses_to_guess_between_distinct_commits() {
         let lock = Lock {
             candidate_hooks: vec![
-                cand_commit("mydeps", "inst", COMMIT_ONE),
-                cand_commit("mydeps", "inst", COMMIT_TWO),
+                cand_commit("mydeps", "inst-one", COMMIT_ONE),
+                cand_commit("mydeps", "inst-two", COMMIT_TWO),
             ],
-            sources: vec![locked_dep(
-                "mydeps",
-                "inst",
-                "https://github.com/dep/mydeps.git",
-            )],
+            sources: vec![
+                locked_dep(
+                    "mydeps",
+                    "inst-one",
+                    "https://github.com/dep/one.git",
+                    COMMIT_ONE,
+                ),
+                locked_dep(
+                    "mydeps",
+                    "inst-two",
+                    "https://github.com/dep/two.git",
+                    COMMIT_TWO,
+                ),
+            ],
             ..empty_lock()
         };
 
         let err = resolve_show_target(Some(&lock), Some("mydeps"))
-            .expect_err("two distinct dep commits for one source must not be silently picked");
+            .expect_err("two distinct locked commits for one source must not be silently picked");
 
         let msg = err.to_string();
         assert!(
             msg.contains(&COMMIT_ONE[..12]) && msg.contains(&COMMIT_TWO[..12]),
-            "the error must list BOTH candidate commits so the user can disambiguate, got: {msg:?}"
+            "the error must list BOTH locked commits so the user can disambiguate, got: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_show_target_treats_distinct_remotes_at_one_commit_as_ambiguous() {
+        let lock = Lock {
+            candidate_hooks: vec![
+                cand_commit("mydeps", "inst-one", COMMIT_A),
+                cand_commit("mydeps", "inst-two", COMMIT_A),
+            ],
+            sources: vec![
+                locked_dep(
+                    "mydeps",
+                    "inst-one",
+                    "https://github.com/dep/one.git",
+                    COMMIT_A,
+                ),
+                locked_dep(
+                    "mydeps",
+                    "inst-two",
+                    "https://github.com/dep/two.git",
+                    COMMIT_A,
+                ),
+            ],
+            ..empty_lock()
+        };
+
+        let err = resolve_show_target(Some(&lock), Some("mydeps")).expect_err(
+            "two distinct remotes at the SAME commit are genuinely ambiguous; --show must not \
+             silently read the first mirror",
+        );
+
+        assert!(
+            matches!(err, Error::Config(_)),
+            "the ambiguity must be a clean Error::Config, got: {err:?}"
         );
     }
 }
