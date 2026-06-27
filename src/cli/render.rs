@@ -62,13 +62,13 @@ pub(super) fn format_listings(listings: &[TargetListing]) -> String {
     out
 }
 
-pub(super) fn print_verify(mismatches: &[crate::sync::VerifyMismatch]) {
+pub(super) fn print_verify(report: &crate::sync::VerifyReport) {
     use crate::sync::VerifyReason;
-    if mismatches.is_empty() {
+    if report.is_clean() {
         println!("all verified");
         return;
     }
-    for m in mismatches {
+    for m in &report.mismatches {
         let reason = match &m.reason {
             VerifyReason::Missing => "missing".to_owned(),
             VerifyReason::ContentMismatch { .. } => "content mismatch".to_owned(),
@@ -78,6 +78,13 @@ pub(super) fn print_verify(mismatches: &[crate::sync::VerifyMismatch]) {
             m.key.source,
             m.key.artifact,
             m.path.display()
+        );
+    }
+    for hook in &report.untrusted_hooks {
+        println!(
+            "{}: untrusted stripped hook `{}` — deployed but not post-processed, artifact may be \
+             incomplete; run `phora trust {}` to approve",
+            hook.source, hook.hook_id, hook.source
         );
     }
 }
@@ -502,6 +509,7 @@ mod preview_render_tests {
             entries: vec![entry],
             collisions: Vec::new(),
             warnings: Vec::new(),
+            untrusted_stripped_hook: false,
         };
         let rendered = render_preview_tree(&plan(tp));
         assert!(
@@ -523,6 +531,7 @@ mod preview_render_tests {
             entries: vec![entry],
             collisions: Vec::new(),
             warnings: Vec::new(),
+            untrusted_stripped_hook: false,
         };
         let rendered = render_preview_tree(&plan(tp));
         assert!(
@@ -549,6 +558,7 @@ mod preview_render_tests {
                     suggestions: vec!["init.lua".to_string()],
                 }],
             }],
+            untrusted_stripped_hook: false,
         };
         let rendered = render_preview_tree(&plan(tp));
         assert!(
@@ -574,6 +584,7 @@ mod preview_render_tests {
                     dir: "d".to_string(),
                 }],
             }],
+            untrusted_stripped_hook: false,
         };
         let rendered = render_preview_tree(&plan(tp));
         assert!(
@@ -596,6 +607,7 @@ mod preview_render_tests {
                     suggestions: vec!["init.lua".to_string()],
                 }],
             }],
+            untrusted_stripped_hook: false,
         };
         let json = render_preview_json(&plan(tp)).expect("preview json serializes");
         let value: serde_json::Value = serde_json::from_str(&json).expect("json parses");

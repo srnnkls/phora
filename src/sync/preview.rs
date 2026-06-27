@@ -91,6 +91,9 @@ pub struct PreviewTargetPlan {
     pub entries: Vec<PreviewEntry>,
     pub collisions: Vec<PreviewCollision>,
     pub warnings: Vec<BindingWarnings>,
+    /// True for a composed target whose dep carries a stripped, still-untrusted `on_change` hook:
+    /// deployed but not post-processed, so the artifact may be incomplete until `phora trust`.
+    pub untrusted_stripped_hook: bool,
 }
 
 /// Build every target's offline preview from the lock: never fetches, resolves, or writes.
@@ -107,13 +110,36 @@ pub fn preview_targets(
     lock: Option<&Lock>,
     files: bool,
 ) -> Result<Vec<PreviewTargetPlan>> {
+    let flagged = untrusted_stripped_targets(lock);
     config
         .targets
         .iter()
-        .map(|(name, target)| preview_target(name, target, parsed, remotes, backend, lock, files))
+        .map(|(name, target)| {
+            preview_target(
+                name, target, parsed, remotes, backend, lock, files, &flagged,
+            )
+        })
         .collect()
 }
 
+/// Composed target names (the `composed_target` prefix of each `candidate_hooks` `hook_id`) whose
+/// stripped `on_change` hook is still untrusted, reusing `sync`'s trust predicate (anti-TOFU).
+fn untrusted_stripped_targets(lock: Option<&Lock>) -> std::collections::BTreeSet<String> {
+    let Some(lock) = lock else {
+        return std::collections::BTreeSet::new();
+    };
+    let trusted = super::trusted_preimages(Some(lock));
+    lock.candidate_hooks
+        .iter()
+        .filter(|c| !trusted.contains(&c.preimage))
+        .filter_map(|c| c.hook_id.split('#').next().map(str::to_owned))
+        .collect()
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "offline preview threads config, resolution maps, backend, lock, and the flagged set"
+)]
 fn preview_target(
     target_name: &str,
     target: &Target,
@@ -122,6 +148,7 @@ fn preview_target(
     backend: &dyn SourceBackend,
     lock: Option<&Lock>,
     files: bool,
+    flagged: &std::collections::BTreeSet<String>,
 ) -> Result<PreviewTargetPlan> {
     let path = target.expanded_path();
     let layout = target.layout();
@@ -159,6 +186,7 @@ fn preview_target(
         entries,
         collisions,
         warnings,
+        untrusted_stripped_hook: flagged.contains(target_name),
     })
 }
 

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use crate::config::{Config, LayoutKind, Target, TemplateOptIn};
+use crate::config::{Config, LayoutKind, ParsedSource, Target, TemplateOptIn};
 use crate::error::{Error, Result};
 use crate::kernel::{Materialization, SourceName};
 use crate::lock::{Lock, encode_ref, ref_discriminator};
@@ -32,17 +32,31 @@ pub fn rebuild_registry(
     backend: &dyn SourceBackend,
     registry: &dyn Registry,
 ) -> Result<RebuildReport> {
-    let mut report = RebuildReport::default();
     let parsed = config.parsed_sources()?;
     let remotes = resolved_remotes(config, &parsed)?;
-    let resolved_commits = locked_commits(config, lock, &parsed)?;
+    rebuild_registry_with(config, &parsed, &remotes, lock, backend, registry)
+}
+
+/// Like [`rebuild_registry`] but over caller-supplied `parsed`/`remotes`, so an observer that has
+/// already injected the composed transitive graph rebuilds the namespaced composed sources too.
+pub fn rebuild_registry_with(
+    config: &Config,
+    parsed: &BTreeMap<String, ParsedSource>,
+    remotes: &BTreeMap<String, String>,
+    lock: &Lock,
+    backend: &dyn SourceBackend,
+    registry: &dyn Registry,
+) -> Result<RebuildReport> {
+    let resolved_commits = locked_commits(config, lock, parsed)?;
+
+    let mut report = RebuildReport::default();
 
     for (target_name, target) in &config.targets {
         let plan = plan_target(
             target_name,
             target,
-            &parsed,
-            &remotes,
+            parsed,
+            remotes,
             backend,
             &resolved_commits,
         )?;
@@ -59,14 +73,14 @@ pub fn rebuild_registry(
             rebuild_binding(
                 &BindingRun {
                     config,
-                    parsed: &parsed,
+                    parsed,
                     target_name,
                     target,
                     backend,
                     registry,
                     binding,
                     source,
-                    git: remote_for(&remotes, &binding.source)?,
+                    git: remote_for(remotes, &binding.source)?,
                 },
                 &mut report,
             )?;

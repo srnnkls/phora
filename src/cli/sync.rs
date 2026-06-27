@@ -121,7 +121,7 @@ pub(super) fn run_rebuild_registry() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let base = load_config()?;
     let local = load_local_config(&cwd)?;
-    let config = crate::config::merge_configs(base, local);
+    let mut config = crate::config::merge_configs(base, local);
     config.validate()?;
 
     let registry = open_project_registry(&config)?;
@@ -136,7 +136,17 @@ pub(super) fn run_rebuild_registry() -> Result<()> {
 
     let cache_git = cache_root_for(config.paths.cache.as_deref(), &cwd)?.join("git");
     let backend = build_router(&config, cache_git)?;
-    let report = crate::sync::rebuild_registry(&config, &lock, &backend, &registry)?;
+    let mut parsed = config.parsed_sources()?;
+    let mut remotes = crate::sync::resolved_remotes(&config, &parsed)?;
+    crate::sync::inject_composed_graph(
+        &mut config,
+        &mut parsed,
+        &mut remotes,
+        &backend,
+        Some(&lock),
+    );
+    let report =
+        crate::sync::rebuild_registry_with(&config, &parsed, &remotes, &lock, &backend, &registry)?;
 
     println!("reconstructed {}", report.reconstructed.len());
     if !report.modified.is_empty() {
