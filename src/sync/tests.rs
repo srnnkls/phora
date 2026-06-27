@@ -1780,6 +1780,592 @@ fn sync_with_force_overwrites_modified_registry_artifact() {
     );
 }
 
+// ── DGI-003: sync write-path persists the revalidated stat ─────
+
+fn read_mtime_secs(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .expect("metadata")
+        .modified()
+        .expect("modified time")
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after epoch")
+        .as_secs()
+}
+
+fn touch_to_mtime(path: &Path, secs: u64) {
+    filetime::set_file_mtime(
+        path,
+        filetime::FileTime::from_unix_time(secs.cast_signed(), 0),
+    )
+    .expect("set mtime");
+}
+
+fn manifest_file<'a>(rec: &'a RegistryRecord, rel: &str) -> &'a ManifestFile {
+    rec.files
+        .iter()
+        .find(|f| f.path == *Path::new(rel))
+        .unwrap_or_else(|| panic!("record must list {rel}, got {:?}", rec.files))
+}
+
+fn assert_record_level_fields_unchanged(before: &RegistryRecord, after: &RegistryRecord) {
+    assert_eq!(
+        after.commit, before.commit,
+        "a stat refresh must leave the record-level commit untouched"
+    );
+    assert_eq!(
+        after.digest, before.digest,
+        "a stat refresh must leave the record-level digest untouched"
+    );
+    assert_eq!(
+        after.vars_digest, before.vars_digest,
+        "a stat refresh must leave vars_digest untouched"
+    );
+    assert_eq!(
+        after.linked, before.linked,
+        "a stat refresh must leave the linked flag untouched"
+    );
+    assert_eq!(
+        after.kind, before.kind,
+        "a stat refresh must leave the record kind untouched"
+    );
+    assert_eq!(
+        after
+            .files
+            .iter()
+            .find(|f| f.path == *Path::new("notes.bak")),
+        before
+            .files
+            .iter()
+            .find(|f| f.path == *Path::new("notes.bak")),
+        "an untouched sibling file's record entry must be unchanged by the single-file refresh"
+    );
+}
+
+#[test]
+fn sync_refreshes_record_stat_for_touched_but_identical_file() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let cfg =
+        config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+    let key = artifact_key("dest", "editor-src", "editor");
+
+    let first = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("first sync deploys and records the artifact");
+    assert!(!first.had_failures, "first deploy must succeed");
+
+    let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+    let before = fx
+        .registry
+        .get(&key)
+        .expect("registry get must not error")
+        .expect("record after first sync");
+    let recorded = manifest_file(&before, "init.lua").clone();
+
+    // Touch the deployed file to a NEW whole-second mtime; bytes untouched.
+    let touched_mtime = recorded.mtime + 1000;
+    let file_on_disk = dst.join("init.lua");
+    touch_to_mtime(&file_on_disk, touched_mtime);
+    assert_eq!(
+        read_mtime_secs(&file_on_disk),
+        touched_mtime,
+        "premise: the on-disk mtime must actually move so the file stat-diverges"
+    );
+    assert_eq!(
+        std::fs::read(&file_on_disk)
+            .expect("read deployed file")
+            .len() as u64,
+        recorded.size,
+        "premise: only mtime moved — the byte length must be unchanged"
+    );
+
+    let second = sync(
+        &input(&cfg, None, Some(first.base_lock.clone()), None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("second sync over a touched-but-identical artifact must not error");
+    assert!(
+        !second.had_failures,
+        "a Revalidated artifact is clean-like and must not be a failure"
+    );
+
+    let after = fx
+        .registry
+        .get(&key)
+        .expect("registry get must not error")
+        .expect("record after second sync");
+    let refreshed = manifest_file(&after, "init.lua");
+    assert_eq!(
+        refreshed.mtime, touched_mtime,
+        "the sync write-path must persist the revalidated file's NEW mtime so it returns to the \
+         fast path — pre-DGI-003 the record keeps the stale mtime"
+    );
+    assert_eq!(
+        refreshed.size, recorded.size,
+        "a byte-identical revalidation must carry size through unchanged"
+    );
+    assert_eq!(
+        refreshed.blake3, recorded.blake3,
+        "the refresh must rewrite ONLY size+mtime — blake3 must never be touched"
+    );
+    assert_record_level_fields_unchanged(&before, &after);
+
+    let mut expected = before.clone();
+    let expected_init = expected
+        .files
+        .iter_mut()
+        .find(|f| f.path == *Path::new("init.lua"))
+        .expect("cloned record must list init.lua");
+    expected_init.size = recorded.size;
+    expected_init.mtime = touched_mtime;
+    assert_eq!(
+        after, expected,
+        "a stat refresh must change NOTHING except init.lua's size+mtime — every record-level \
+         field (projected_at, key, source, layout, allow_symlinks, preserve_executable) and \
+         every other file entry must be byte-for-byte identical to the pre-sync record"
+    );
+}
+
+#[test]
+fn second_sync_after_revalidation_hits_fast_path_without_reexport() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let cfg =
+        config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+    let key = artifact_key("dest", "editor-src", "editor");
+
+    let counting = CountingBackend::new(&fx.backend);
+    let first = sync(
+        &input(&cfg, None, None, None, false),
+        &counting,
+        &fx.registry,
+    )
+    .expect("first sync deploys the artifact");
+    assert!(!first.had_failures, "first deploy must succeed");
+
+    let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+    let recorded = manifest_file(
+        &fx.registry
+            .get(&key)
+            .expect("get")
+            .expect("record after first sync"),
+        "init.lua",
+    )
+    .clone();
+    let touched_mtime = recorded.mtime + 1000;
+    touch_to_mtime(&dst.join("init.lua"), touched_mtime);
+
+    // The revalidating sync must persist the fresh stat.
+    let reval = sync(
+        &input(&cfg, None, Some(first.base_lock.clone()), None, false),
+        &counting,
+        &fx.registry,
+    )
+    .expect("revalidating sync must not error");
+    assert!(
+        !reval.had_failures,
+        "a revalidated artifact is not a failure"
+    );
+
+    let state = check_state_at(
+        &dst,
+        &fx.registry,
+        "dest",
+        "editor-src",
+        "editor",
+        &first_commit(&first),
+    );
+    assert!(
+        matches!(state, ArtifactState::Clean),
+        "once the write-path persists the revalidated stat the record matches disk, so the \
+         artifact must read Clean (fast path, no re-hash) — pre-DGI-003 the stale record \
+         re-escalates to Revalidated, got {state:?}"
+    );
+
+    let refreshed_record = fx
+        .registry
+        .get(&key)
+        .expect("get")
+        .expect("record after revalidating sync");
+    let exports_after_reval = counting.export_count();
+    let commit_times_after_reval = counting.commit_time_count();
+
+    // A further untouched sync must be a pure no-op.
+    let third = sync(
+        &input(&cfg, None, Some(first.base_lock.clone()), None, false),
+        &counting,
+        &fx.registry,
+    )
+    .expect("third sync over an untouched refreshed artifact must not error");
+    assert!(
+        !third.had_failures,
+        "an untouched refreshed artifact must be a no-op, not a failure"
+    );
+    assert_eq!(
+        counting.export_count(),
+        exports_after_reval,
+        "the fast-path sync must NOT re-export a Clean (refreshed) artifact"
+    );
+    assert_eq!(
+        counting.commit_time_count(),
+        commit_times_after_reval,
+        "the fast-path sync must short-circuit before any commit_time round-trip"
+    );
+    assert_eq!(
+        fx.registry
+            .get(&key)
+            .expect("get")
+            .expect("record after third sync"),
+        refreshed_record,
+        "a no-op fast-path sync must not rewrite the record"
+    );
+}
+
+#[test]
+fn genuine_content_change_reads_modified_and_persists_no_refresh() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let cfg =
+        config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+    let key = artifact_key("dest", "editor-src", "editor");
+
+    let first = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("first sync deploys the artifact");
+    assert!(!first.had_failures, "first deploy must succeed");
+
+    let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+    let before = fx
+        .registry
+        .get(&key)
+        .expect("get")
+        .expect("record after first sync");
+
+    std::fs::write(
+        dst.join("init.lua"),
+        b"-- genuinely edited, real content change\n",
+    )
+    .expect("rewrite the deployed file with different bytes");
+
+    let state = check_state_at(
+        &dst,
+        &fx.registry,
+        "dest",
+        "editor-src",
+        "editor",
+        &first_commit(&first),
+    );
+    assert!(
+        matches!(state, ArtifactState::Modified { .. }),
+        "a real content change must read Modified, got {state:?}"
+    );
+
+    let out = sync(
+        &input(&cfg, None, Some(first.base_lock.clone()), None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("sync must not error on a Modified artifact without --force");
+    assert!(
+        !out.had_failures,
+        "skipping a Modified artifact without --force is not a failure"
+    );
+
+    let after = fx
+        .registry
+        .get(&key)
+        .expect("get")
+        .expect("record after skip");
+    assert_eq!(
+        after, before,
+        "a Modified artifact must never persist a stat refresh — the record must be byte-identical"
+    );
+}
+
+#[test]
+fn read_only_target_detail_never_refreshes_the_record() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let cfg =
+        config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+    let key = artifact_key("dest", "editor-src", "editor");
+
+    let first = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("first sync deploys the artifact");
+    assert!(!first.had_failures, "first deploy must succeed");
+
+    let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+    let before = fx
+        .registry
+        .get(&key)
+        .expect("get")
+        .expect("record after first sync");
+    let recorded = manifest_file(&before, "init.lua").clone();
+    touch_to_mtime(&dst.join("init.lua"), recorded.mtime + 1000);
+
+    let _detail = crate::cli::target_detail(&cfg, &fx.registry, "dest")
+        .expect("read-only target detail must not error");
+
+    let after = fx
+        .registry
+        .get(&key)
+        .expect("get")
+        .expect("record after the read-only query");
+    assert_eq!(
+        after, before,
+        "the read-only query path must never persist a refresh on a stat-stale-identical file — \
+         the record must be byte-for-byte unchanged"
+    );
+}
+
+#[test]
+fn phora_verify_report_unchanged_by_stat_refresh() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let cfg =
+        config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+    let key = artifact_key("dest", "editor-src", "editor");
+
+    let first = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("first sync deploys the artifact");
+    assert!(!first.had_failures, "first deploy must succeed");
+
+    let verify_before =
+        super::verify::verify(&cfg, &fx.registry).expect("verify before must not error");
+    assert!(
+        verify_before.is_empty(),
+        "a freshly deployed artifact must verify clean, got {verify_before:?}"
+    );
+
+    let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+    let recorded = manifest_file(
+        &fx.registry.get(&key).expect("get").expect("record"),
+        "init.lua",
+    )
+    .clone();
+    touch_to_mtime(&dst.join("init.lua"), recorded.mtime + 1000);
+
+    sync(
+        &input(&cfg, None, Some(first.base_lock.clone()), None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("revalidating sync must not error");
+
+    let verify_after =
+        super::verify::verify(&cfg, &fx.registry).expect("verify after must not error");
+    assert_eq!(
+        verify_after, verify_before,
+        "a stat-only refresh must not change phora verify's report — blake3 stays untouched"
+    );
+    assert!(
+        verify_after.is_empty(),
+        "verify must still pass after a stat refresh, got {verify_after:?}"
+    );
+}
+
+#[test]
+fn sync_refreshes_every_touched_identical_file_in_a_multi_file_artifact() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let cfg =
+        config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+    let key = artifact_key("dest", "editor-src", "editor");
+
+    let first = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("first sync deploys and records the artifact");
+    assert!(!first.had_failures, "first deploy must succeed");
+
+    let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+    let before = fx
+        .registry
+        .get(&key)
+        .expect("registry get must not error")
+        .expect("record after first sync");
+    let init_before = manifest_file(&before, "init.lua").clone();
+    let notes_before = manifest_file(&before, "notes.bak").clone();
+
+    let init_new_mtime = init_before.mtime + 1000;
+    let notes_new_mtime = notes_before.mtime + 2000;
+    assert_ne!(
+        init_new_mtime, notes_new_mtime,
+        "premise: the two files must move to DISTINCT mtimes so a swap would be detectable"
+    );
+    touch_to_mtime(&dst.join("init.lua"), init_new_mtime);
+    touch_to_mtime(&dst.join("notes.bak"), notes_new_mtime);
+    assert_eq!(
+        read_mtime_secs(&dst.join("init.lua")),
+        init_new_mtime,
+        "premise: init.lua mtime must actually move"
+    );
+    assert_eq!(
+        read_mtime_secs(&dst.join("notes.bak")),
+        notes_new_mtime,
+        "premise: notes.bak mtime must actually move"
+    );
+
+    let second = sync(
+        &input(&cfg, None, Some(first.base_lock.clone()), None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("second sync over two touched-but-identical files must not error");
+    assert!(
+        !second.had_failures,
+        "both files hash-match, so the artifact is Revalidated (clean-like), not a failure"
+    );
+
+    let after = fx
+        .registry
+        .get(&key)
+        .expect("registry get must not error")
+        .expect("record after second sync");
+    let init_after = manifest_file(&after, "init.lua");
+    let notes_after = manifest_file(&after, "notes.bak");
+
+    assert_eq!(
+        init_after.mtime, init_new_mtime,
+        "the write-path must refresh init.lua to ITS new on-disk mtime — pre-DGI-003 it keeps the \
+         stale mtime"
+    );
+    assert_eq!(
+        notes_after.mtime, notes_new_mtime,
+        "the write-path must refresh notes.bak to ITS new on-disk mtime — every touched-identical \
+         file in the overlay must be persisted, not just the first"
+    );
+    assert_eq!(
+        init_after.size, init_before.size,
+        "init.lua size must carry through unchanged"
+    );
+    assert_eq!(
+        notes_after.size, notes_before.size,
+        "notes.bak size must carry through unchanged"
+    );
+    assert_eq!(
+        init_after.blake3, init_before.blake3,
+        "init.lua blake3 must never be touched by a stat refresh"
+    );
+    assert_eq!(
+        notes_after.blake3, notes_before.blake3,
+        "notes.bak blake3 must never be touched by a stat refresh"
+    );
+
+    let mut expected = before.clone();
+    for f in &mut expected.files {
+        if f.path == *Path::new("init.lua") {
+            f.mtime = init_new_mtime;
+        } else if f.path == *Path::new("notes.bak") {
+            f.mtime = notes_new_mtime;
+        }
+    }
+    assert_eq!(
+        after, expected,
+        "each file must be matched to its OWN fresh stat by path (no swap), and nothing else in \
+         the record may change"
+    );
+}
+
+#[test]
+fn sync_modified_artifact_persists_no_refresh_for_touched_identical_sibling() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let cfg =
+        config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+    let key = artifact_key("dest", "editor-src", "editor");
+
+    let first = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("first sync deploys and records the artifact");
+    assert!(!first.had_failures, "first deploy must succeed");
+
+    let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+    let before = fx
+        .registry
+        .get(&key)
+        .expect("registry get must not error")
+        .expect("record after first sync");
+    let init_before = manifest_file(&before, "init.lua").clone();
+    let notes_before = manifest_file(&before, "notes.bak").clone();
+
+    let edited = b"-- edit\n";
+    assert_eq!(
+        edited.len() as u64,
+        init_before.size,
+        "premise: the edit must keep init.lua's byte-length so only blake3 (not size) trips"
+    );
+    std::fs::write(dst.join("init.lua"), edited).expect("genuinely edit init.lua");
+    filetime::set_file_mtime(
+        dst.join("init.lua"),
+        filetime::FileTime::from_unix_time((init_before.mtime + 1000).cast_signed(), 0),
+    )
+    .expect("bump edited file mtime");
+
+    let notes_new_mtime = notes_before.mtime + 2000;
+    touch_to_mtime(&dst.join("notes.bak"), notes_new_mtime);
+    assert_eq!(
+        read_mtime_secs(&dst.join("notes.bak")),
+        notes_new_mtime,
+        "premise: the sibling notes.bak mtime must actually move, bytes untouched"
+    );
+
+    let state = check_state_at(
+        &dst,
+        &fx.registry,
+        "dest",
+        "editor-src",
+        "editor",
+        &first_commit(&first),
+    );
+    assert!(
+        matches!(state, ArtifactState::Modified { .. }),
+        "one genuinely edited file (hash-miss) makes the whole artifact Modified, got {state:?}"
+    );
+
+    let out = sync(
+        &input(&cfg, None, Some(first.base_lock.clone()), None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("sync must not error on a Modified artifact without --force");
+    assert!(
+        !out.had_failures,
+        "skipping a Modified artifact without --force is not a failure"
+    );
+
+    let after = fx
+        .registry
+        .get(&key)
+        .expect("registry get must not error")
+        .expect("record after the skip");
+    assert_eq!(
+        after, before,
+        "a Modified artifact must NEVER half-persist: the touched-identical notes.bak sibling must \
+         keep its stale stat — the write-path refresh fires only on Revalidated, never on Modified"
+    );
+}
+
 // ── linked artifact idempotence (DLD-005, H1) ──────────────────
 
 /// H1: without `Linked` in the `matches!` guard at the deploy closure, Linked falls to

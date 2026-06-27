@@ -7,7 +7,7 @@ use crate::error::{Error, Result};
 use crate::kernel::{Materialization, SourceName, safe_relpath};
 use crate::source::{ExportLeaf, ExportRequest, SourceBackend};
 use crate::store::{
-    ArtifactKey, EjectedEntry, ProjectedRecord, RecordKind, Registry, RegistryRecord,
+    ArtifactKey, EjectedEntry, ProjectedRecord, RecordKind, Registry, RegistryRecord, ScannedFile,
 };
 
 use super::confine::{ProtectedPathSet, confine_destination};
@@ -258,6 +258,9 @@ pub(super) fn deploy_artifact_entry(
 
     let resolution = match conflict_kind {
         None if !entry.mode_transition && skips_redeploy(&state) => {
+            if let ArtifactState::Revalidated { fresh } = &state {
+                persist_revalidated_refresh(registry, &key, fresh)?;
+            }
             return Ok(false);
         }
         None => Resolution::Overwrite,
@@ -336,6 +339,25 @@ fn expected_vars_digest(
         }
     };
     Ok(templated.then(|| crate::source::vars_digest(vars)))
+}
+
+fn persist_revalidated_refresh(
+    registry: &dyn Registry,
+    key: &ArtifactKey,
+    fresh: &[ScannedFile],
+) -> Result<()> {
+    let Some(mut record) = registry.get(key)? else {
+        return Ok(());
+    };
+    let refreshed: BTreeMap<&PathBuf, &ScannedFile> = fresh.iter().map(|f| (&f.path, f)).collect();
+    for mf in &mut record.files {
+        if let Some(scanned) = refreshed.get(&mf.path) {
+            mf.size = scanned.size;
+            mf.mtime = scanned.mtime;
+        }
+    }
+    registry.put(&record)?;
+    Ok(())
 }
 
 fn skips_redeploy(state: &ArtifactState) -> bool {
