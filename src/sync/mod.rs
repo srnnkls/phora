@@ -9,7 +9,7 @@ mod prune;
 mod rebuild;
 mod resolve;
 mod target;
-mod transitive;
+pub(crate) mod transitive;
 mod verify;
 
 #[cfg(test)]

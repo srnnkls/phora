@@ -6,7 +6,7 @@ use std::path::Path;
 
 use crate::config::{Refspec, SourceMode};
 use crate::kernel::SourceName;
-use crate::source::{ExportRequest, ExportResult, SourceBackend, SourceError};
+use crate::source::{ExportRequest, ExportResult, SourceBackend, SourceError, TreeEntry};
 
 type Result<T> = std::result::Result<T, SourceError>;
 
@@ -48,6 +48,16 @@ impl<G: SourceBackend, H: SourceBackend> SourceBackend for RouterBackend<G, H> {
         path: &Path,
     ) -> Result<Vec<u8>> {
         self.git.read_file_at(source, url, commit, path)
+    }
+
+    fn list_tree_at(
+        &self,
+        source: &SourceName,
+        url: &str,
+        commit: &str,
+        path: &Path,
+    ) -> Result<Vec<TreeEntry>> {
+        self.git.list_tree_at(source, url, commit, path)
     }
 
     fn fetch(&self, source: &SourceName, url: &str) -> Result<()> {
@@ -108,7 +118,7 @@ mod tests {
     use crate::kernel::SourceName;
     use crate::source::{
         ExportRequest, ExportResult, GitBackend, HttpBackend, RouterBackend, SourceBackend,
-        SourceError,
+        SourceError, TreeEntry,
     };
 
     type Result<T> = std::result::Result<T, SourceError>;
@@ -301,6 +311,7 @@ mod tests {
         resolves: Rc<RefCell<Vec<String>>>,
         digests: Rc<RefCell<Vec<String>>>,
         leaf_walks: Rc<RefCell<Vec<String>>>,
+        tree_lists: Rc<RefCell<Vec<String>>>,
     }
 
     impl SourceBackend for Spy {
@@ -318,6 +329,20 @@ mod tests {
         ) -> Result<Vec<String>> {
             self.leaf_walks.borrow_mut().push(source.to_string());
             Ok(vec![format!("leaf-{source}")])
+        }
+
+        fn list_tree_at(
+            &self,
+            source: &SourceName,
+            _url: &str,
+            _commit: &str,
+            _path: &Path,
+        ) -> Result<Vec<TreeEntry>> {
+            self.tree_lists.borrow_mut().push(source.to_string());
+            Ok(vec![TreeEntry {
+                name: format!("entry-{source}"),
+                is_dir: false,
+            }])
         }
 
         fn resolve(&self, source: &SourceName, _url: &str, _refspec: &Refspec) -> Result<String> {
@@ -424,6 +449,37 @@ mod tests {
             http.leaf_walks.borrow().as_slice(),
             ["u"],
             "a url-mode source must route its leaf walk to the http backend, not be walked as a git tree"
+        );
+    }
+
+    #[test]
+    fn list_tree_at_always_routes_to_the_git_backend() {
+        let mut modes = BTreeMap::new();
+        modes.insert(sn("g"), SourceMode::Git);
+        modes.insert(sn("u"), SourceMode::Url);
+        let (router, git, http) = spy_router(modes);
+
+        router
+            .list_tree_at(&sn("g"), "https://example.com/o/r.git", "c", Path::new("d"))
+            .expect("git-mode tree listing");
+        router
+            .list_tree_at(
+                &sn("u"),
+                "https://example.com/pkg.tar.gz",
+                "c",
+                Path::new("d"),
+            )
+            .expect("url-mode tree listing still reaches the git backend");
+
+        assert_eq!(
+            git.tree_lists.borrow().as_slice(),
+            ["g", "u"],
+            "list_tree_at is the git-only trust read path: BOTH sources (regardless of mode) \
+             must reach the git backend, never be routed by mode"
+        );
+        assert!(
+            http.tree_lists.borrow().is_empty(),
+            "the http backend must never receive a tree listing"
         );
     }
 

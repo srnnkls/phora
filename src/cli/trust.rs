@@ -11,6 +11,7 @@ use crate::config::transitive::TransitiveManifest;
 use crate::error::{Error, Result};
 use crate::lock::{CandidateHookRecord, Lock, TrustedHook};
 use crate::source::GitBackend;
+use crate::sync::transitive::ResolvedGraph;
 
 use super::{load_config, open_project_registry};
 
@@ -34,7 +35,8 @@ pub(super) fn run_trust(source: Option<&str>, list: bool, revoke: bool) -> Resul
     }
 
     let candidates = discover_candidates(&config, &cwd, base_lock.as_ref(), source)?;
-    let differ = TrustDiff::open(&cache_git, base_lock.as_ref());
+    let mut differ = TrustDiff::open(&cache_git, base_lock.as_ref());
+    differ.attach_surface(&config, base_lock.as_ref());
     if list || !std::io::stdin().is_terminal() {
         print_candidates(&candidates, &differ);
         return Ok(());
@@ -49,6 +51,7 @@ struct TrustDiff {
     backend: Option<GitBackend>,
     trusted_hooks: Vec<TrustedHook>,
     dep_urls: Vec<String>,
+    surface: Option<(ResolvedGraph, Lock)>,
 }
 
 impl TrustDiff {
@@ -67,6 +70,22 @@ impl TrustDiff {
             backend,
             trusted_hooks,
             dep_urls,
+            surface: None,
+        }
+    }
+
+    fn attach_surface(&mut self, config: &crate::config::Config, base_lock: Option<&Lock>) {
+        let Some(lock) = base_lock else { return };
+        let Some(backend) = self.backend.as_ref() else {
+            return;
+        };
+        let Ok(parsed) = config.parsed_sources() else {
+            return;
+        };
+        if let Ok(graph) = crate::sync::transitive::resolve_transitive_graph_offline(
+            config, &parsed, backend, lock,
+        ) {
+            self.surface = Some((graph, lock.clone()));
         }
     }
 
@@ -82,7 +101,7 @@ impl TrustDiff {
             })
             .collect();
         if priors.is_empty() {
-            return vec!["  first trust — no prior trusted commit to diff".to_owned()];
+            return self.first_trust_lines(candidate);
         }
         if candidate.commit.is_empty() {
             return vec![
@@ -123,6 +142,35 @@ impl TrustDiff {
         }
         vec![diff_unavailable()]
     }
+
+    fn first_trust_lines(&self, candidate: &CandidateHookRecord) -> Vec<String> {
+        if candidate.commit.is_empty() {
+            return vec![surface_unavailable()];
+        }
+        let (Some((graph, lock)), Some(backend)) = (&self.surface, &self.backend) else {
+            return vec![surface_unavailable()];
+        };
+        let Some(target) = graph.targets.iter().find(|t| {
+            candidate.hook_id == format!("{}#on_change", t.name)
+                || candidate
+                    .hook_id
+                    .starts_with(&format!("{}#on_change#", t.name))
+        }) else {
+            return vec![surface_unavailable()];
+        };
+        match graph.composed_files(&target.name, backend, lock) {
+            Ok(paths) if !paths.is_empty() => {
+                let mut out = vec![format!("  composed files at {}:", short(&candidate.commit))];
+                out.extend(paths.into_iter().map(|p| format!("    {p}")));
+                out
+            }
+            _ => vec![surface_unavailable()],
+        }
+    }
+}
+
+fn surface_unavailable() -> String {
+    "  composed surface unavailable — run `phora sync` first".to_owned()
 }
 
 /// Drops the `<instance-key>%<counter>%` prefix, whose `instance.stable_key()` folds in the resolved commit, so a hook matches across commits.
@@ -395,6 +443,36 @@ mod tests {
         fn confirm(&self, _candidate: &CandidateHookRecord) -> bool {
             self.0
         }
+    }
+
+    #[test]
+    fn offline_transitive_resolve_is_reachable_from_the_trust_layer() {
+        use crate::sync::transitive::{
+            ComposedTarget, ResolvedGraph, resolve_transitive_graph_offline,
+        };
+
+        let config =
+            crate::config::Config::parse("version = 1\n\n[targets.x]\npath = \"/home/me/x\"\n")
+                .expect("import-free config parses");
+        let parsed: std::collections::BTreeMap<String, crate::config::ParsedSource> =
+            std::collections::BTreeMap::new();
+        let lock = empty_lock();
+        let git_dir = tempfile::TempDir::new().expect("temp git dir");
+        let backend = crate::source::GitBackend::new(git_dir.path().to_path_buf());
+
+        let graph: ResolvedGraph =
+            resolve_transitive_graph_offline(&config, &parsed, &backend, &lock)
+                .expect("the offline transitive resolve must be callable from the CLI/trust layer");
+
+        let names: Vec<&str> = graph
+            .targets
+            .iter()
+            .map(|t: &ComposedTarget| t.name.as_str())
+            .collect();
+        assert!(
+            names.is_empty(),
+            "REACHABILITY: an import-free config composes no transitive targets, reached offline with no fetch — and the trust layer can see resolve_transitive_graph_offline, ResolvedGraph, ComposedTarget, and the `name` field"
+        );
     }
 
     #[test]

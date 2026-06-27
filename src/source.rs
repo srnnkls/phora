@@ -93,6 +93,13 @@ pub struct ExportResult {
     pub vars_digest: Option<String>,
 }
 
+/// A direct child of a tree, for the shallow ls-style listing of `phora trust --show <dir>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeEntry {
+    pub name: String,
+    pub is_dir: bool,
+}
+
 /// One leaf to export: a source-relative path looked up in the root tree, staged at
 /// the staging-relative `dest` (the deployed name, hashed and recorded verbatim).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +162,24 @@ pub trait SourceBackend {
         Err(SourceError::Source(
             "list_source_leaves is unsupported on this backend: mirror reads are git-only"
                 .to_owned(),
+        ))
+    }
+
+    /// The direct children of the subtree at `path` (empty path means the repo root),
+    /// shallow and sorted by leaf name; the default errs unsupported and only
+    /// `GitBackend` overrides it.
+    ///
+    /// # Errors
+    /// - the mirror was never fetched, `commit` is unknown, or `path` is absent at `commit`.
+    fn list_tree_at(
+        &self,
+        _source: &SourceName,
+        _url: &str,
+        _commit: &str,
+        _path: &Path,
+    ) -> Result<Vec<TreeEntry>> {
+        Err(SourceError::Source(
+            "list_tree_at is unsupported on this backend: mirror reads are git-only".to_owned(),
         ))
     }
 
@@ -531,6 +556,33 @@ impl SourceBackend for GitBackend {
             .collect();
         leaves.sort_unstable();
         Ok(leaves)
+    }
+
+    fn list_tree_at(
+        &self,
+        source: &SourceName,
+        url: &str,
+        commit: &str,
+        path: &Path,
+    ) -> Result<Vec<TreeEntry>> {
+        let repo = self.open_mirror(source.as_str(), url)?;
+        let root = if path.as_os_str().is_empty() {
+            None
+        } else {
+            Some(path)
+        };
+        let subtree = Self::subtree_at_root(&repo, source.as_str(), commit, root)?;
+        let mut entries = Vec::new();
+        for entry in subtree.iter() {
+            let entry = entry
+                .map_err(|e| SourceError::Source(format!("read tree entry in {source}: {e}")))?;
+            entries.push(TreeEntry {
+                name: entry.filename().to_string(),
+                is_dir: entry.mode().is_tree(),
+            });
+        }
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(entries)
     }
 
     fn fetch(&self, source: &SourceName, url: &str) -> Result<()> {
@@ -2711,6 +2763,140 @@ path = "srnnkls/tropos"
         assert!(
             !matches!(err, SourceError::FileAbsent { .. }),
             "a present-but-non-blob entry is not 'absent'; it must be a distinct failure, got: {err:?}"
+        );
+    }
+
+    // ---- list_tree_at (shallow ls-style listing for `trust --show <dir>`) ----
+
+    fn build_tree_fixture() -> ExportFixture {
+        let src = TempDir::new().expect("tree src tempdir");
+        let src_path = src.path();
+        init_export_repo(src_path);
+
+        let d = src_path.join("d");
+        std::fs::create_dir_all(d.join("sub")).expect("create d/sub");
+        std::fs::write(d.join("a.txt"), b"a\n").expect("write d/a.txt");
+        std::fs::write(d.join("b.txt"), b"b\n").expect("write d/b.txt");
+        std::fs::write(d.join("sub").join("c.txt"), b"c\n").expect("write d/sub/c.txt");
+        std::fs::write(src_path.join("top.txt"), b"top\n").expect("write top.txt");
+        run_git(src_path, &["add", "-A"]);
+        let commit = commit_export_repo(src_path);
+
+        let fixture = export_fixture_from(src, commit);
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch builds the mirror the tree listing reads");
+        fixture
+    }
+
+    #[test]
+    fn list_tree_at_yields_only_the_direct_children_of_the_directory() {
+        let fixture = build_tree_fixture();
+
+        let entries = fixture
+            .backend
+            .list_tree_at(&sn("src"), &fixture.url, &fixture.commit, Path::new("d"))
+            .expect("list_tree_at lists the direct children of `d` at the commit");
+
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["a.txt", "b.txt", "sub"],
+            "list_tree_at must return the DIRECT children of `d` (root-relative leaf names, \
+             sorted), with the subdir `sub` listed as a single entry; got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"c.txt") && !names.iter().any(|n| n.contains('/')),
+            "list_tree_at is shallow: `d/sub/c.txt` must NOT be flattened in (no recursion), \
+             got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn list_tree_at_marks_subdirectories_as_directories_and_files_as_files() {
+        let fixture = build_tree_fixture();
+
+        let entries = fixture
+            .backend
+            .list_tree_at(&sn("src"), &fixture.url, &fixture.commit, Path::new("d"))
+            .expect("list_tree_at lists `d`");
+
+        let sub = entries
+            .iter()
+            .find(|e| e.name == "sub")
+            .expect("the `sub` directory entry must be present");
+        assert!(
+            sub.is_dir,
+            "the `sub` entry is a directory and must be reported as is_dir=true so `--show` can \
+             render it ls-style; got: {sub:?}"
+        );
+        for file in entries.iter().filter(|e| e.name != "sub") {
+            assert!(
+                !file.is_dir,
+                "the regular file `{}` must be reported as is_dir=false, got: {file:?}",
+                file.name
+            );
+        }
+    }
+
+    #[test]
+    fn list_tree_at_with_empty_path_lists_the_repo_root() {
+        let fixture = build_tree_fixture();
+
+        let entries = fixture
+            .backend
+            .list_tree_at(&sn("src"), &fixture.url, &fixture.commit, Path::new(""))
+            .expect("an empty path lists the repo root's top-level entries");
+
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["d", "top.txt"],
+            "listing the repo root (empty path) must yield the top-level entries `d` and \
+             `top.txt`, not the contents of `d`; got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn list_tree_at_errors_when_the_directory_is_absent_at_the_commit() {
+        let fixture = build_tree_fixture();
+
+        let err = fixture
+            .backend
+            .list_tree_at(&sn("src"), &fixture.url, &fixture.commit, Path::new("nope"))
+            .expect_err("listing a path that does not exist must error, not return an empty list");
+
+        assert!(
+            matches!(err, SourceError::RootNotFound { .. }),
+            "an absent directory must surface as RootNotFound (via subtree_at_root), got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn list_tree_at_default_impl_is_unsupported_on_non_git_backend() {
+        let git_dir = TempDir::new().expect("git_dir tempdir");
+        let http = HttpBackend::new(git_dir.path().to_path_buf(), BTreeMap::new());
+
+        let err = http
+            .list_tree_at(
+                &sn("u"),
+                "https://example.com/pkg.tar.gz",
+                ABSENT_SHA,
+                Path::new("d"),
+            )
+            .expect_err(
+                "the default SourceBackend::list_tree_at must error as unsupported; only \
+                 GitBackend overrides it (this is the one git-only trust read path)",
+            );
+
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("unsupported")
+                || msg.contains("not supported")
+                || msg.contains("only git"),
+            "the default list_tree_at error must signal that mirror reads are git-only \
+             (unsupported), got: {msg}"
         );
     }
 

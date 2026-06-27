@@ -12,7 +12,7 @@ use crate::config::{
     TakeEntry, Target, admit_transitive_hooks, hook_preimage,
 };
 use crate::error::{Error, Result};
-use crate::kernel::SourceName;
+use crate::kernel::{OfferSelection, SourceName};
 use crate::source::{SourceBackend, is_local_path};
 
 use super::resolved_remotes;
@@ -27,13 +27,15 @@ const MAX_TRANSITIVE_DEPTH: usize = 64;
 
 /// One dep target composed under a consumer anchor: a synthetic absolute-path
 /// target carrying the dep's own layout, bound to namespaced source instances.
-pub(super) struct ComposedTarget {
-    pub(super) name: String,
+#[derive(Debug)]
+pub(crate) struct ComposedTarget {
+    pub(crate) name: String,
     pub(super) target: Target,
 }
 
 /// An interpreted transitive `on_change` hook pinned to its dep's resolved commit, awaiting
 /// the consumer trust decision in [`sync`](super::sync). Stripped from the deployed target.
+#[derive(Debug)]
 pub(super) struct TransitiveHookCandidate {
     pub(super) dep_instance: String,
     pub(super) hook_id: String,
@@ -61,9 +63,9 @@ impl From<&TransitiveHookCandidate> for crate::lock::CandidateHookRecord {
 
 /// The transitive pre-pass output: composed targets plus the namespaced source
 /// instances (and their resolved remotes) those targets bind.
-#[derive(Default)]
-pub(super) struct ResolvedGraph {
-    pub(super) targets: Vec<ComposedTarget>,
+#[derive(Debug, Default)]
+pub(crate) struct ResolvedGraph {
+    pub(crate) targets: Vec<ComposedTarget>,
     pub(super) sources: BTreeMap<String, ParsedSource>,
     pub(super) remotes: BTreeMap<String, String>,
     /// Namespaced source name → owning `Instance.stable_key()`; the lock stamps this so
@@ -74,6 +76,58 @@ pub(super) struct ResolvedGraph {
 }
 
 impl ResolvedGraph {
+    /// Dep-repo-relative files the named composed target binds, read offline at each binding's own locked commit; `Err` when the target or a commit is unknown.
+    pub(crate) fn composed_files(
+        &self,
+        composed_target_name: &str,
+        backend: &(dyn SourceBackend + Sync),
+        lock: &crate::lock::Lock,
+    ) -> Result<Vec<String>> {
+        let target = self
+            .targets
+            .iter()
+            .find(|t| t.name == composed_target_name)
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "no composed target `{composed_target_name}` in the offline graph"
+                ))
+            })?;
+        let mut out = Vec::new();
+        for binding in target.target.resolve_sources(&self.sources) {
+            let namespaced = binding.source;
+            let remote = self.remotes.get(namespaced).ok_or_else(|| {
+                Error::Config(format!(
+                    "no resolved remote for composed source `{namespaced}`"
+                ))
+            })?;
+            let source = self.sources.get(namespaced).ok_or_else(|| {
+                Error::Config(format!("no parsed composed source `{namespaced}`"))
+            })?;
+            let disc = crate::lock::ref_discriminator(&binding.effective_ref, &source.refspec());
+            let entry = lock
+                .find_entry(namespaced, disc.as_deref())
+                .ok_or_else(|| {
+                    Error::Lock(format!(
+                        "composed source `{namespaced}` is not pinned in the lock"
+                    ))
+                })?;
+            let name = SourceName::trusted(namespaced.to_owned());
+            let leaves = backend
+                .list_source_leaves(&name, remote, &entry.commit, None)
+                .map_err(|e| Error::Source(e.to_string()))?;
+            let offer = source.offer();
+            let selection =
+                OfferSelection::compile(offer.includes(), offer.excludes(), offer.root())?;
+            let refs: Vec<&str> = leaves.iter().map(String::as_str).collect();
+            for published in selection.select(&refs) {
+                out.push(dep_relative_path(binding.root, &published));
+            }
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
     pub(super) fn inject(
         self,
         config: &mut Config,
@@ -87,6 +141,13 @@ impl ResolvedGraph {
         }
         strip_absorbed_anchors(config);
         self.instances
+    }
+}
+
+fn dep_relative_path(root: Option<&Path>, leaf: &str) -> String {
+    match root {
+        Some(r) => format!("{}/{leaf}", r.display()),
+        None => leaf.to_owned(),
     }
 }
 
@@ -163,6 +224,16 @@ pub(super) fn resolve_transitive_graph(
     }
 
     Ok(graph)
+}
+
+/// [`resolve_transitive_graph`] under the frozen gate: lock-pinned commits, mirror-only reads, no fetch.
+pub(crate) fn resolve_transitive_graph_offline(
+    config: &Config,
+    parsed: &BTreeMap<String, ParsedSource>,
+    backend: &(dyn SourceBackend + Sync),
+    lock: &crate::lock::Lock,
+) -> Result<ResolvedGraph> {
+    resolve_transitive_graph(config, parsed, backend, true, Some(lock))
 }
 
 struct WalkCtx<'a> {
@@ -1482,6 +1553,212 @@ mod tests {
             matches!(take, [TakeEntry::Leaf(s)] if s == "dep-local.lua"),
             "with NO consumer mount override, the dep's binding-local `take` must survive \
              unclobbered; got: {take:?}"
+        );
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering as FetchOrdering};
+
+    struct CountingFetchBackend {
+        inner: crate::source::GitBackend,
+        fetches: AtomicUsize,
+    }
+
+    impl CountingFetchBackend {
+        fn over(git_dir: PathBuf) -> Self {
+            Self {
+                inner: crate::source::GitBackend::new(git_dir),
+                fetches: AtomicUsize::new(0),
+            }
+        }
+        fn fetch_count(&self) -> usize {
+            self.fetches.load(FetchOrdering::SeqCst)
+        }
+    }
+
+    impl SourceBackend for CountingFetchBackend {
+        fn fetch(
+            &self,
+            source: &SourceName,
+            url: &str,
+        ) -> std::result::Result<(), crate::source::SourceError> {
+            self.fetches.fetch_add(1, FetchOrdering::SeqCst);
+            self.inner.fetch(source, url)
+        }
+        fn read_file_at(
+            &self,
+            source: &SourceName,
+            url: &str,
+            commit: &str,
+            path: &Path,
+        ) -> std::result::Result<Vec<u8>, crate::source::SourceError> {
+            self.inner.read_file_at(source, url, commit, path)
+        }
+        fn list_source_leaves(
+            &self,
+            source: &SourceName,
+            url: &str,
+            commit: &str,
+            root: Option<&Path>,
+        ) -> std::result::Result<Vec<String>, crate::source::SourceError> {
+            self.inner.list_source_leaves(source, url, commit, root)
+        }
+        fn resolve(
+            &self,
+            source: &SourceName,
+            url: &str,
+            refspec: &Refspec,
+        ) -> std::result::Result<String, crate::source::SourceError> {
+            self.inner.resolve(source, url, refspec)
+        }
+        fn commit_time(
+            &self,
+            source: &SourceName,
+            url: &str,
+            commit: &str,
+        ) -> std::result::Result<u64, crate::source::SourceError> {
+            self.inner.commit_time(source, url, commit)
+        }
+        fn export_artifact(
+            &self,
+            req: &crate::source::ExportRequest<'_>,
+        ) -> std::result::Result<crate::source::ExportResult, crate::source::SourceError> {
+            self.inner.export_artifact(req)
+        }
+        fn compute_digest(
+            &self,
+            source: &SourceName,
+            url: &str,
+            commit: &str,
+            root: Option<&Path>,
+            include: &[String],
+            exclude: &[String],
+        ) -> std::result::Result<String, crate::source::SourceError> {
+            self.inner
+                .compute_digest(source, url, commit, root, include, exclude)
+        }
+    }
+
+    #[expect(
+        clippy::unwrap_used,
+        reason = "fixture setup fails loudly; git CLI is assumed present"
+    )]
+    fn dep_mirror_with_editor_target() -> (tempfile::TempDir, String, String) {
+        let src = tempfile::TempDir::new().unwrap();
+        let src_path = src.path();
+        crate::store::assert_git_sandboxed(src_path);
+        git(src_path, &["init", "-b", "main", "."]);
+        git(src_path, &["config", "user.email", "t@example.com"]);
+        git(src_path, &["config", "user.name", "T"]);
+        std::fs::write(
+            src_path.join("phora.toml"),
+            b"version = 1\n\n\
+              [sources.nvim]\ngit = \"https://github.com/dep/nvim.git\"\n\n\
+              [targets.editor]\npath = \"nvim\"\nsources = [\"nvim\"]\n",
+        )
+        .unwrap();
+        git(src_path, &["add", "-A"]);
+        git(src_path, &["commit", "-m", "dep with an editor target"]);
+
+        let mirror_root = tempfile::TempDir::new().unwrap();
+        let url = src_path.to_string_lossy().into_owned();
+        let mirror = mirror_path(mirror_root.path(), &url);
+        std::fs::create_dir_all(mirror.parent().unwrap()).unwrap();
+        {
+            let _serial = crate::store::guard_git_fork();
+            git(
+                mirror_root.path(),
+                &["clone", "--mirror", &url, mirror.to_str().unwrap()],
+            );
+        }
+        let commit = {
+            let _serial = crate::store::guard_git_fork();
+            let out = std::process::Command::new("git")
+                .args(["-C", mirror.to_str().unwrap(), "rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        drop(src);
+        (mirror_root, url, commit)
+    }
+
+    fn consumer_importing(url: &str) -> Config {
+        let toml = format!(
+            "version = 1\n\n\
+             [sources.dep]\ngit = {url:?}\nbranch = \"main\"\ntransitive = true\n\n\
+             [targets.claude]\npath = \"/home/me/.claude\"\nimports = [\"dep\"]\n"
+        );
+        Config::parse(&toml).expect("a consumer importing a transitive dep parses")
+    }
+
+    fn parsed_of(config: &Config) -> BTreeMap<String, ParsedSource> {
+        config
+            .sources
+            .iter()
+            .map(|(n, s)| {
+                (
+                    n.clone(),
+                    ParsedSource::parse(n, s).expect("consumer source parses"),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn offline_resolve_composes_pinned_dep_without_any_fetch() {
+        let (mirror_root, url, commit) = dep_mirror_with_editor_target();
+        let backend = CountingFetchBackend::over(mirror_root.path().to_path_buf());
+        let config = consumer_importing(&url);
+        let parsed = parsed_of(&config);
+        let lock = lock_of(vec![locked_node("dep", &url, &commit, None)]);
+
+        let graph = resolve_transitive_graph_offline(&config, &parsed, &backend, &lock).expect(
+            "the offline lock-pinned resolve composes the dep from the mirror without fetching",
+        );
+
+        assert_eq!(
+            backend.fetch_count(),
+            0,
+            "NETWORK CONTRACT: trust inspection reads the lock-pinned commit from the mirror only; \
+             resolve_transitive_graph_offline must never call backend.fetch"
+        );
+        assert!(
+            graph.targets.iter().any(|t| t.name.contains("editor")),
+            "the offline resolve must compose the dep's `editor` target; got: {:?}",
+            graph
+                .targets
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn offline_resolve_surfaces_a_commit_absent_from_the_mirror() {
+        let (mirror_root, url, _head) = dep_mirror_with_editor_target();
+        let backend = CountingFetchBackend::over(mirror_root.path().to_path_buf());
+        let config = consumer_importing(&url);
+        let parsed = parsed_of(&config);
+        let absent = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        let lock = lock_of(vec![locked_node("dep", &url, absent, None)]);
+
+        let err = resolve_transitive_graph_offline(&config, &parsed, &backend, &lock).expect_err(
+            "a lock-pinned commit absent from the mirror must surface an error the CLI maps to \
+             'run phora sync first', never a silent empty graph",
+        );
+
+        assert_eq!(
+            backend.fetch_count(),
+            0,
+            "even on the degraded path the offline resolve must not fetch to paper over the \
+             missing commit"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains(absent),
+            "the absent-commit failure must name the missing lock-pinned commit `{absent}` — the \
+             offline mirror read for that SHA is what fails — not surface a generic error that \
+             could be any unrelated config/parse failure; got: {msg}"
         );
     }
 }
