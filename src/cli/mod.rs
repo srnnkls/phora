@@ -202,6 +202,9 @@ pub enum Command {
         list: bool,
         #[arg(long)]
         revoke: bool,
+        /// Print a dep file (or list a dep directory) at the recorded commit, offline.
+        #[arg(long, value_name = "PATH")]
+        show: Option<String>,
     },
     /// Show an offline deployment preview from the lock.
     Preview {
@@ -464,11 +467,12 @@ fn dispatch_trust(cmd: Command) -> Result<()> {
         source,
         list,
         revoke,
+        show,
     } = cmd
     else {
         unreachable!("dispatch_trust only handles Command::Trust")
     };
-    trust::run_trust(source.as_deref(), list, revoke)
+    trust::run_trust(source.as_deref(), list, revoke, show.as_deref())
 }
 
 fn dispatch_bind(cmd: Command) -> Result<()> {

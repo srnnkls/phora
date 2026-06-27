@@ -198,6 +198,40 @@ fn trust_revoke_flag_parses_to_true() {
 }
 
 #[test]
+fn trust_show_flag_parses_path_argument() {
+    use clap::Parser;
+    let cli = Cli::try_parse_from(["phora", "trust", "mydeps", "--show", "some/path"])
+        .expect("`phora trust <source> --show <path>` must parse");
+    let Command::Trust { source, show, .. } = cli.command else {
+        panic!("expected Command::Trust");
+    };
+    assert_eq!(
+        source.as_deref(),
+        Some("mydeps"),
+        "the positional still binds the inspected source name"
+    );
+    assert_eq!(
+        show.as_deref(),
+        Some("some/path"),
+        "--show must capture the dependency-file path to print"
+    );
+}
+
+#[test]
+fn trust_without_show_defaults_to_none() {
+    use clap::Parser;
+    let cli =
+        Cli::try_parse_from(["phora", "trust", "mydeps"]).expect("bare `phora trust` must parse");
+    let Command::Trust { show, .. } = cli.command else {
+        panic!("expected Command::Trust");
+    };
+    assert!(
+        show.is_none(),
+        "absent --show must default show=None, not an empty path"
+    );
+}
+
+#[test]
 fn trust_without_flags_defaults_list_and_revoke_false() {
     use clap::Parser;
     let cli =
