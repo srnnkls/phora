@@ -83,6 +83,15 @@ fn state_label_renders_linked_artifact_as_linked() {
 }
 
 #[test]
+fn state_label_renders_revalidated_like_clean() {
+    assert_eq!(
+        state_label(&ArtifactState::Revalidated { fresh: Vec::new() }),
+        state_label(&ArtifactState::Clean),
+        "a revalidated artifact is clean to the user — its content matches the manifest, so it must render identically to a clean one"
+    );
+}
+
+#[test]
 fn sync_no_hooks_flag_parses_to_true() {
     use clap::Parser;
     let cli =

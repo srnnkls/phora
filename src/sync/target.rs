@@ -257,12 +257,7 @@ pub(super) fn deploy_artifact_entry(
     };
 
     let resolution = match conflict_kind {
-        None if !entry.mode_transition
-            && matches!(
-                state,
-                ArtifactState::Ejected | ArtifactState::Clean | ArtifactState::Linked
-            ) =>
-        {
+        None if !entry.mode_transition && skips_redeploy(&state) => {
             return Ok(false);
         }
         None => Resolution::Overwrite,
@@ -341,6 +336,16 @@ fn expected_vars_digest(
         }
     };
     Ok(templated.then(|| crate::source::vars_digest(vars)))
+}
+
+fn skips_redeploy(state: &ArtifactState) -> bool {
+    matches!(
+        state,
+        ArtifactState::Clean
+            | ArtifactState::Ejected
+            | ArtifactState::Linked
+            | ArtifactState::Revalidated { .. }
+    )
 }
 
 fn conflict_kind_for(
@@ -923,6 +928,108 @@ mod kind_aware_layout_tests {
             base,
             record_artifact_path(&target, &rec),
             "a dir record's manifest base IS the deployed directory, so file paths join under it"
+        );
+    }
+}
+
+#[cfg(test)]
+mod revalidated_treated_like_clean_tests {
+    use super::*;
+    use crate::config::Source;
+    use crate::kernel::ResolvedTake;
+
+    fn parsed_local() -> ParsedSource {
+        let raw: Source = toml::from_str("path = \"/tmp/src\"").expect("local source toml parses");
+        ParsedSource::parse("src", &raw).expect("local source parses to typed form")
+    }
+
+    fn leaf_item() -> PlannedItem {
+        PlannedItem {
+            materialization: Materialization::Leaf(ResolvedTake {
+                source: "a.txt".to_owned(),
+                dest: "a.txt".to_owned(),
+            }),
+            destination: PathBuf::from("/tmp/dst/a.txt"),
+            kept_leaves: Vec::new(),
+        }
+    }
+
+    fn entry<'a>(
+        source: &'a ParsedSource,
+        source_name: &'a SourceName,
+        item: &'a PlannedItem,
+        dst: &'a Path,
+    ) -> ArtifactEntry<'a> {
+        ArtifactEntry {
+            source,
+            git: "git@example.com:org/repo.git",
+            source_name,
+            identity: "src",
+            underlying_source: "src",
+            commit: "0123456789abcdef0123456789abcdef01234567",
+            item,
+            artifact_dst: dst,
+            layout_kind: LayoutKind::Flat,
+            ejected: &[],
+            mode_transition: false,
+            template_opt_in: &TemplateOptIn::SuffixOnly,
+        }
+    }
+
+    #[test]
+    fn revalidated_artifact_is_not_a_conflict() {
+        let source = parsed_local();
+        let source_name = SourceName::trusted("src");
+        let item = leaf_item();
+        let dst = PathBuf::from("/tmp/dst/a.txt");
+        let entry = entry(&source, &source_name, &item, &dst);
+
+        let revalidated = conflict_kind_for(
+            &ArtifactState::Revalidated { fresh: Vec::new() },
+            &entry,
+            false,
+        );
+
+        assert!(
+            revalidated.is_none(),
+            "a revalidated artifact only carries refreshed stats; sync must NOT treat it as a \
+             conflict (got {revalidated:?})"
+        );
+
+        let modified = conflict_kind_for(
+            &ArtifactState::Modified {
+                changed: vec![PathBuf::from("a.txt")],
+            },
+            &entry,
+            false,
+        );
+        assert!(
+            matches!(modified, Some(ConflictKind::Modified { .. })),
+            "positive control: a non-forced Modified artifact IS a conflict — proving \
+             conflict_kind_for discriminates rather than blanket-returning None (got {modified:?})"
+        );
+
+        let foreign = conflict_kind_for(&ArtifactState::Foreign, &entry, false);
+        assert!(
+            matches!(foreign, Some(ConflictKind::Foreign)),
+            "positive control: a non-forced Foreign artifact IS a conflict (got {foreign:?})"
+        );
+    }
+
+    #[test]
+    fn revalidated_state_skips_redeploy_like_clean() {
+        assert!(
+            skips_redeploy(&ArtifactState::Revalidated { fresh: Vec::new() }),
+            "a revalidated artifact returns to the caller WITHOUT writing, exactly like Clean; the \
+             early-skip set must include it"
+        );
+        assert!(
+            skips_redeploy(&ArtifactState::Clean),
+            "premise: Clean is a no-op redeploy"
+        );
+        assert!(
+            !skips_redeploy(&ArtifactState::Foreign),
+            "a foreign artifact is not a silent no-op skip"
         );
     }
 }

@@ -421,7 +421,7 @@ struct PreviewPlanJson<'a> {
 
 pub(super) fn state_label(state: &ArtifactState) -> &'static str {
     match state {
-        ArtifactState::Clean => "✓ clean",
+        ArtifactState::Clean | ArtifactState::Revalidated { .. } => "✓ clean",
         ArtifactState::Outdated => "outdated",
         ArtifactState::Modified { .. } => "modified",
         ArtifactState::Foreign => "foreign",
