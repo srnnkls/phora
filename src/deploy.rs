@@ -7,7 +7,9 @@ use std::time::UNIX_EPOCH;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::store::{ArtifactKey, EjectedEntry, Registry, RegistryRecord, ScannedFile};
+use crate::store::{
+    ArtifactKey, EjectedEntry, ManifestFile, Registry, RegistryRecord, ScannedFile,
+};
 
 #[derive(Debug)]
 pub enum ArtifactState {
@@ -86,6 +88,7 @@ pub fn check_artifact_state(
     };
 
     let mut changed: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut fresh: Vec<ScannedFile> = Vec::new();
 
     for mf in &record.files {
         let file_path = target_path.join(&mf.path);
@@ -108,7 +111,12 @@ pub fn check_artifact_state(
             continue;
         }
         if meta.len() != mf.size || mtime_secs(&meta, &file_path)? != mf.mtime {
-            changed.insert(mf.path.clone());
+            match revalidate_file(&file_path, &meta, mf)? {
+                Some(scanned) => fresh.push(scanned),
+                None => {
+                    changed.insert(mf.path.clone());
+                }
+            }
         }
     }
 
@@ -126,6 +134,7 @@ pub fn check_artifact_state(
     Ok(classify_drift(
         &record,
         changed.into_iter().collect(),
+        fresh,
         expected_commit,
         expected_vars_digest,
     ))
@@ -147,21 +156,22 @@ fn check_file_artifact_state(
 
     let meta = std::fs::symlink_metadata(file_path)
         .map_err(|e| Error::Projection(format!("stat {}: {e}", file_path.display())))?;
-    let modified = match record.files.first() {
-        Some(mf) => {
-            !meta.is_file() || meta.len() != mf.size || mtime_secs(&meta, file_path)? != mf.mtime
+    let (changed, fresh) = match record.files.first() {
+        Some(_) if !meta.is_file() => (vec![file_path.to_path_buf()], vec![]),
+        Some(mf) if meta.len() != mf.size || mtime_secs(&meta, file_path)? != mf.mtime => {
+            match revalidate_file(file_path, &meta, mf)? {
+                Some(scanned) => (vec![], vec![scanned]),
+                None => (vec![file_path.to_path_buf()], vec![]),
+            }
         }
-        None => true,
-    };
-    let changed = if modified {
-        vec![file_path.to_path_buf()]
-    } else {
-        vec![]
+        Some(_) => (vec![], vec![]),
+        None => (vec![file_path.to_path_buf()], vec![]),
     };
 
     Ok(classify_drift(
         &record,
         changed,
+        fresh,
         expected_commit,
         expected_vars_digest,
     ))
@@ -188,6 +198,7 @@ fn artifact_record(
 fn classify_drift(
     record: &RegistryRecord,
     changed: Vec<PathBuf>,
+    fresh: Vec<ScannedFile>,
     expected_commit: &str,
     expected_vars_digest: Option<&str>,
 ) -> ArtifactState {
@@ -198,10 +209,63 @@ fn classify_drift(
     let vars_changed =
         record.vars_digest.is_some() && record.vars_digest.as_deref() != expected_vars_digest;
     if commit_advanced || vars_changed {
-        ArtifactState::Outdated
-    } else {
-        ArtifactState::Clean
+        return ArtifactState::Outdated;
     }
+    if !fresh.is_empty() {
+        return ArtifactState::Revalidated { fresh };
+    }
+    ArtifactState::Clean
+}
+
+/// `None` declines the refresh on any uncertainty (read error, re-stat error, mid-flight
+/// change, hash mismatch); `Some` is a revalidated stat whose bytes matched `mf.blake3`.
+fn revalidate_file(
+    file_path: &Path,
+    meta: &std::fs::Metadata,
+    mf: &ManifestFile,
+) -> Result<Option<ScannedFile>> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(mut file) = std::fs::File::open(file_path) else {
+        return Ok(None);
+    };
+    let Ok(pre) = file.metadata() else {
+        return Ok(None);
+    };
+    if !pre.is_file() {
+        return Ok(None);
+    }
+    // Closes the path-resolution TOCTOU: the opened fd must be the same inode the caller's
+    // no-follow pre-stat saw, else a mid-validation path swap could mask content drift.
+    if pre.ino() != meta.ino() || pre.dev() != meta.dev() {
+        return Ok(None);
+    }
+
+    let mut content = Vec::new();
+    if file.read_to_end(&mut content).is_err() {
+        return Ok(None);
+    }
+
+    let Ok(post) = file.metadata() else {
+        return Ok(None);
+    };
+    let size = post.len();
+    let mtime = mtime_secs(&post, file_path)?;
+    // The held inode's size/mtime moved across the read: an in-place mid-validation change.
+    if size != pre.len() || mtime != mtime_secs(&pre, file_path)? {
+        return Ok(None);
+    }
+
+    if blake3::hash(&content).to_hex().to_string() != mf.blake3 {
+        return Ok(None);
+    }
+
+    Ok(Some(ScannedFile {
+        path: mf.path.clone(),
+        size,
+        mtime,
+    }))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -980,7 +1044,7 @@ mod tests {
                 path: PathBuf::from(rel),
                 size: contents.len() as u64,
                 mtime: mtime_secs(&path),
-                blake3: "blake3:deadbeef".to_owned(),
+                blake3: blake3::hash(contents).to_hex().to_string(),
             });
         }
         RegistryRecord {
@@ -995,6 +1059,35 @@ mod tests {
             allow_symlinks,
             preserve_executable: true,
             files: manifest,
+            linked: false,
+            vars_digest: None,
+        }
+    }
+
+    fn deploy_and_record_file(file_path: &Path, contents: &[u8]) -> RegistryRecord {
+        if let Some(parent) = file_path.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir parent");
+        }
+        std::fs::write(file_path, contents).expect("write file artifact");
+        let leaf = file_path.file_name().expect("file leaf");
+        let mf = ManifestFile {
+            path: PathBuf::from(leaf),
+            size: contents.len() as u64,
+            mtime: mtime_secs(file_path),
+            blake3: blake3::hash(contents).to_hex().to_string(),
+        };
+        RegistryRecord {
+            version: 1,
+            key: key(),
+            source: SOURCE.to_owned(),
+            commit: COMMIT.to_owned(),
+            digest: "blake3:d4e5f6".to_owned(),
+            projected_at: "2026-01-31T12:34:56Z".to_owned(),
+            layout: "flat".to_owned(),
+            kind: crate::store::RecordKind::File,
+            allow_symlinks: false,
+            preserve_executable: true,
+            files: vec![mf],
             linked: false,
             vars_digest: None,
         }
@@ -1363,22 +1456,355 @@ mod tests {
         );
     }
 
+    /// Reframes the former `modified_when_recorded_file_mtime_changed` bug pin.
     #[test]
-    fn modified_when_recorded_file_mtime_changed() {
+    fn revalidated_when_only_mtime_changed_but_bytes_identical() {
         let (_state_dir, reg) = registry();
         let target = TempDir::new().expect("target dir");
         let record = deploy_and_record(target.path(), &[("a.json", b"{}")], false);
         reg.put(&record).expect("put record");
-        set_mtime(&target.path().join("a.json"), record.files[0].mtime + 999);
+        let new_mtime = record.files[0].mtime + 999;
+        set_mtime(&target.path().join("a.json"), new_mtime);
+
+        let st = state(target.path(), &[], &reg);
+
+        let ArtifactState::Revalidated { fresh } = st else {
+            panic!(
+                "a touched-but-byte-identical file must escalate to its recorded blake3, match, \
+                 and reclassify from the false-positive Modified to Revalidated, got {st:?}"
+            );
+        };
+        let entry = fresh
+            .iter()
+            .find(|f| f.path == *Path::new("a.json"))
+            .unwrap_or_else(|| {
+                panic!("Revalidated must carry fresh stat for the revalidated file, got {fresh:?}")
+            });
+        assert_eq!(
+            entry.mtime, new_mtime,
+            "fresh stat must carry the NEW on-disk mtime so the refresh returns it to the fast path"
+        );
+        assert_eq!(
+            entry.size, record.files[0].size,
+            "the byte-identical file's size is unchanged and must be carried through as recorded"
+        );
+    }
+
+    #[test]
+    fn modified_when_bytes_differ_at_same_size_with_bumped_mtime() {
+        let (_state_dir, reg) = registry();
+        let target = TempDir::new().expect("target dir");
+        let record = deploy_and_record(target.path(), &[("a.json", b"{}")], false);
+        reg.put(&record).expect("put record");
+        let edited = target.path().join("a.json");
+        std::fs::write(&edited, b"[]").expect("rewrite to same-length different content");
+        set_mtime(&edited, record.files[0].mtime + 5);
+        assert_eq!(
+            std::fs::metadata(&edited).expect("edited meta").len(),
+            record.files[0].size,
+            "premise: the edit preserves byte length so only mtime + content diverge"
+        );
 
         let st = state(target.path(), &[], &reg);
 
         let ArtifactState::Modified { changed } = st else {
-            panic!("mtime change must yield Modified, got {st:?}");
+            panic!(
+                "a same-size content change must read Modified once the mtime drift forces a \
+                 blake3 escalation that mismatches the recorded hash, got {st:?}"
+            );
         };
         assert!(
             changed.contains(&PathBuf::from("a.json")),
-            "the mtime-changed file must appear in `changed`, got {changed:?}"
+            "the genuinely edited file must appear in `changed`, got {changed:?}"
+        );
+    }
+
+    #[test]
+    fn revalidated_when_all_stat_divergent_files_are_byte_identical() {
+        let (_state_dir, reg) = registry();
+        let target = TempDir::new().expect("target dir");
+        let record = deploy_and_record(
+            target.path(),
+            &[("a.json", b"{}"), ("b.txt", b"hello")],
+            false,
+        );
+        reg.put(&record).expect("put record");
+        let a_mtime = record.files[0].mtime + 100;
+        let b_mtime = record.files[1].mtime + 200;
+        set_mtime(&target.path().join("a.json"), a_mtime);
+        set_mtime(&target.path().join("b.txt"), b_mtime);
+
+        let st = state(target.path(), &[], &reg);
+
+        let ArtifactState::Revalidated { fresh } = st else {
+            panic!(
+                "when every stat-divergent file hash-matches its record the artifact must be \
+                 Revalidated, not Modified, got {st:?}"
+            );
+        };
+        let a = fresh
+            .iter()
+            .find(|f| f.path == *Path::new("a.json"))
+            .unwrap_or_else(|| panic!("fresh must include a.json, got {fresh:?}"));
+        let b = fresh
+            .iter()
+            .find(|f| f.path == *Path::new("b.txt"))
+            .unwrap_or_else(|| panic!("fresh must include b.txt, got {fresh:?}"));
+        assert_eq!(
+            a.mtime, a_mtime,
+            "a.json fresh stat must carry its new mtime"
+        );
+        assert_eq!(
+            b.mtime, b_mtime,
+            "b.txt fresh stat must carry its new mtime"
+        );
+    }
+
+    /// Partial-drift rule (DGI-D4): one real edit collapses the artifact to Modified and the
+    /// touched sibling's revalidation is discarded, never half-persisted.
+    #[test]
+    fn modified_no_refresh_when_one_file_edited_and_sibling_only_touched() {
+        let (_state_dir, reg) = registry();
+        let target = TempDir::new().expect("target dir");
+        let record = deploy_and_record(
+            target.path(),
+            &[("a.json", b"{}"), ("b.txt", b"hello")],
+            false,
+        );
+        reg.put(&record).expect("put record");
+        let a = target.path().join("a.json");
+        std::fs::write(&a, b"[]").expect("same-length edit of a.json");
+        set_mtime(&a, record.files[0].mtime + 13);
+        assert_eq!(
+            std::fs::metadata(&a).expect("a meta").len(),
+            record.files[0].size,
+            "premise: a.json keeps its recorded byte length so the size gate passes and only the \
+             hash-miss can catch the edit"
+        );
+        set_mtime(&target.path().join("b.txt"), record.files[1].mtime + 777);
+
+        let st = state(target.path(), &[], &reg);
+
+        let ArtifactState::Modified { changed } = st else {
+            panic!(
+                "any genuinely changed file must collapse the artifact to Modified — the touched \
+                 sibling's revalidation must be discarded, never surfaced as Revalidated, got {st:?}"
+            );
+        };
+        assert!(
+            changed.contains(&PathBuf::from("a.json")),
+            "the same-size, hash-mismatched file must appear in `changed`, got {changed:?}"
+        );
+        let after = reg
+            .get(&key())
+            .expect("get after classify")
+            .expect("record still present");
+        assert_eq!(
+            after, record,
+            "a Modified artifact must never half-persist a refreshed stat for its touched-but-\
+             identical sibling: the stored record stays byte-for-byte unchanged (DGI-D4)"
+        );
+    }
+
+    /// Hot path (gestalt step 1): a size+mtime stat-match is classified without reading or
+    /// hashing the file. A poisoned recorded blake3 over an untouched file stays invisible.
+    #[test]
+    fn hot_path_never_hashes_a_file_whose_size_and_mtime_match() {
+        let (_state_dir, reg) = registry();
+        let target = TempDir::new().expect("target dir");
+        let mut record = deploy_and_record(target.path(), &[("a.json", b"{}")], false);
+        record.files[0].blake3 = "0".repeat(64);
+        reg.put(&record).expect("put record with poisoned blake3");
+
+        let st = state(target.path(), &[], &reg);
+
+        assert!(
+            matches!(st, ArtifactState::Clean),
+            "a size+mtime stat-match must classify Clean without hashing; the poisoned blake3 must \
+             stay invisible on the hot path, got {st:?}"
+        );
+    }
+
+    /// Hot path holds per-file: a poisoned-but-stat-matching A is never hashed while a
+    /// touched-identical sibling B escalates, so the artifact reads `Revalidated { fresh: [B] }`.
+    #[test]
+    fn hot_path_skips_stat_matching_file_while_sibling_escalates() {
+        let (_state_dir, reg) = registry();
+        let target = TempDir::new().expect("target dir");
+        let mut record = deploy_and_record(
+            target.path(),
+            &[("a.json", b"{}"), ("b.txt", b"hello")],
+            false,
+        );
+        record.files[0].blake3 = "0".repeat(64);
+        reg.put(&record).expect("put record with poisoned A blake3");
+        let b_mtime = record.files[1].mtime + 555;
+        set_mtime(&target.path().join("b.txt"), b_mtime);
+
+        let st = state(target.path(), &[], &reg);
+
+        let ArtifactState::Revalidated { fresh } = st else {
+            panic!(
+                "A is a stat-match and must never be hashed, so its poisoned blake3 stays invisible \
+                 while B escalates and revalidates => Revalidated, got {st:?}"
+            );
+        };
+        assert_eq!(
+            fresh.len(),
+            1,
+            "only the stat-divergent sibling B may be refreshed; the stat-matching A must not \
+             appear in `fresh`, got {fresh:?}"
+        );
+        assert_eq!(
+            fresh[0].path,
+            PathBuf::from("b.txt"),
+            "the single fresh entry must be B, never the stat-matching A, got {fresh:?}"
+        );
+        assert_eq!(
+            fresh[0].mtime, b_mtime,
+            "B's fresh stat must carry its new mtime, got {fresh:?}"
+        );
+    }
+
+    #[test]
+    fn classification_of_revalidation_does_not_persist_or_mutate_the_record() {
+        let (_state_dir, reg) = registry();
+        let target = TempDir::new().expect("target dir");
+        let record = deploy_and_record(target.path(), &[("a.json", b"{}")], false);
+        let recorded_blake3 = record.files[0].blake3.clone();
+        reg.put(&record).expect("put record");
+        set_mtime(&target.path().join("a.json"), record.files[0].mtime + 42);
+
+        let st = state(target.path(), &[], &reg);
+        assert!(
+            matches!(st, ArtifactState::Revalidated { .. }),
+            "premise: the touched-identical file revalidates, got {st:?}"
+        );
+
+        let after = reg
+            .get(&key())
+            .expect("get after classify")
+            .expect("record still present");
+        assert_eq!(
+            after.files[0].blake3, recorded_blake3,
+            "classify must never rewrite mf.blake3 across a revalidation"
+        );
+        assert_eq!(
+            after, record,
+            "the read-only classify path must persist NOTHING: the stored record (including the \
+             stale size/mtime) must be byte-for-byte unchanged"
+        );
+    }
+
+    #[test]
+    fn file_kind_revalidates_when_touched_but_bytes_identical() {
+        let (_state_dir, reg) = registry();
+        let dir = TempDir::new().expect("target dir");
+        let file = dir.path().join("config.json");
+        let record = deploy_and_record_file(&file, b"{}");
+        reg.put(&record).expect("put record");
+        let new_mtime = record.files[0].mtime + 314;
+        set_mtime(&file, new_mtime);
+
+        let st = state(&file, &[], &reg);
+
+        let ArtifactState::Revalidated { fresh } = st else {
+            panic!(
+                "the single-renamed-FILE path must escalate a touched-but-identical file to \
+                 blake3 and read Revalidated, got {st:?}"
+            );
+        };
+        assert_eq!(
+            fresh.len(),
+            1,
+            "a single-file artifact must produce exactly one fresh entry, got {fresh:?}"
+        );
+        assert_eq!(
+            fresh[0].path, record.files[0].path,
+            "the fresh entry must carry the recorded file's path, not the absolute target path or a \
+             wrong leaf, got {fresh:?}"
+        );
+        assert_eq!(
+            fresh[0].size, record.files[0].size,
+            "the byte-identical file's size is unchanged and must be carried through as recorded, \
+             got {fresh:?}"
+        );
+        assert_eq!(
+            fresh[0].mtime, new_mtime,
+            "file-kind revalidation must carry the fresh on-disk mtime of the revalidated file, \
+             got {fresh:?}"
+        );
+    }
+
+    /// Fail-closed (DGI-D5): an unreadable stat-divergent file reads Modified, never Clean.
+    #[cfg(unix)]
+    #[test]
+    fn modified_when_stat_divergent_file_is_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_state_dir, reg) = registry();
+        let target = TempDir::new().expect("target dir");
+        let record = deploy_and_record(target.path(), &[("a.json", b"{}")], false);
+        reg.put(&record).expect("put record");
+        let f = target.path().join("a.json");
+        set_mtime(&f, record.files[0].mtime + 11);
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
+
+        // chmod 0o000 does not deny root: if the file still reads, perms are bypassed (running as
+        // root, e.g. a CI container) and the fail-closed precondition cannot hold — skip.
+        if std::fs::read(&f).is_ok() {
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644))
+                .expect("restore perms");
+            return;
+        }
+
+        let st = state(target.path(), &[], &reg);
+
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644))
+            .expect("restore perms for tempdir cleanup");
+
+        assert!(
+            matches!(st, ArtifactState::Modified { .. }),
+            "a permission/IO error reading a stat-divergent file during escalation must fail \
+             closed to Modified, never silently Clean/Revalidated, got {st:?}"
+        );
+    }
+
+    /// Collapsed/linked fallback (DGI-D6): empty `files[]` takes the stat-only short path.
+    #[test]
+    fn empty_files_record_reads_clean_without_escalation() {
+        let (_state_dir, reg) = registry();
+        let target = TempDir::new().expect("target dir");
+        let record = deploy_and_record(target.path(), &[], false);
+        reg.put(&record).expect("put record");
+
+        let st = state(target.path(), &[], &reg);
+
+        assert!(
+            matches!(st, ArtifactState::Clean),
+            "a record with empty files[] must take the existing stat-only short path and read \
+             Clean, never hash or panic, got {st:?}"
+        );
+    }
+
+    /// Collapsed/linked fallback (DGI-D6): a `linked = true` record short-circuits to Linked
+    /// before any per-file escalation, even with on-disk content that would otherwise be hashed.
+    #[test]
+    fn linked_record_short_circuits_before_escalation() {
+        let (_state_dir, reg) = registry();
+        let target = TempDir::new().expect("target dir");
+        std::fs::write(
+            target.path().join("a.json"),
+            b"content that would be hashed",
+        )
+        .expect("write file under linked target");
+        reg.put(&linked_record()).expect("put linked record");
+
+        let st = state(target.path(), &[], &reg);
+
+        assert!(
+            matches!(st, ArtifactState::Linked),
+            "a linked record must take the Linked short-circuit before per-file revalidation, \
+             never hashing or panicking, got {st:?}"
         );
     }
 
@@ -1518,7 +1944,7 @@ mod tests {
                 path: PathBuf::from(rel),
                 size: contents.len() as u64,
                 mtime: mtime_secs(&staging.join(rel)),
-                blake3: "blake3:deadbeef".to_owned(),
+                blake3: blake3::hash(contents).to_hex().to_string(),
             });
         }
         RegistryRecord {
