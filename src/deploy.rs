@@ -21,6 +21,10 @@ pub enum ArtifactState {
     Missing,
     Ejected,
     Linked,
+    /// Clean-like state carrying refreshed per-file metadata.
+    Revalidated {
+        fresh: Vec<ScannedFile>,
+    },
 }
 
 #[derive(Debug)]
