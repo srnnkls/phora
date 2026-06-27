@@ -637,15 +637,167 @@ fn trust_list_shows_file_paths_changed_since_the_last_trusted_commit() {
     );
 }
 
+fn first_candidate_hook_id(lock_text: &str) -> Option<String> {
+    let mut in_candidate = false;
+    for line in lock_text.lines() {
+        let line = line.trim();
+        if line == "[[candidate_hooks]]" {
+            in_candidate = true;
+        } else if line.starts_with("[[") {
+            in_candidate = false;
+        } else if in_candidate && let Some(rest) = line.strip_prefix("hook_id = \"") {
+            return Some(rest.trim_end_matches('"').to_owned());
+        }
+    }
+    None
+}
+
+// THI-002: first-trust composed-surface listing.
+
+fn dep_composing_editor(dep: &Path, sentinel_abs: &str) {
+    let manifest = format!(
+        "version = 1\n\n\
+         [sources.editor]\ngit = \"https://github.com/mock/leaf.git\"\ninclude = [\"nvim\"]\n\n\
+         [targets.nvim]\npath = \"nvim\"\nsources = [\"editor\"]\n\n\
+         [targets.nvim.hooks]\non_change = \"touch '{sentinel_abs}'\"\n",
+    );
+    commit_repo(dep, &[], &manifest);
+}
+
+fn consumer_with_composed_files() -> (Fixture, PathBuf) {
+    let leaf = TempDir::new().expect("leaf repo");
+    commit_repo(
+        leaf.path(),
+        &[
+            ("nvim/init.lua", "-- init\n"),
+            ("nvim/lua/opts.lua", "-- opts\n"),
+        ],
+        "version = 1\n",
+    );
+    let leaf_path = leaf.path().to_path_buf();
+
+    let mut fixture = build_fixture();
+    let sentinel_path = sentinel(&fixture);
+
+    let dep = TempDir::new().expect("dep repo");
+    dep_composing_editor(dep.path(), &sentinel_path.display().to_string());
+    let dep_path = dep.path().to_path_buf();
+
+    fixture.map_url("https://github.com/mock/leaf.git", &leaf_path);
+    fixture.finish_gitconfig();
+    let config = format!(
+        "version = 1\n\n[sources.mydeps]\ngit = \"{dep}\"\ntransitive = true\n\n\
+         [targets.dotcfg]\npath = \"~/.config\"\nimports = [\"mydeps\"]\n",
+        dep = dep_path.display(),
+    );
+    write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());
+    fixture.repos.push(leaf);
+    fixture.repos.push(dep);
+    (fixture, sentinel_path)
+}
+
 #[test]
-fn trust_list_first_trust_notes_no_prior_commit_to_diff() {
-    let (fixture, _sentinel) = consumer_with_dep_hook();
+fn trust_list_first_trust_shows_the_composed_file_surface_offline() {
+    let (fixture, _sentinel) = consumer_with_composed_files();
 
     let seed = run(&fixture, &["sync", "--no-transitive-hooks"]);
     assert!(
         seed.status.success(),
         "seeding sync must succeed; stderr: {}",
         String::from_utf8_lossy(&seed.stderr)
+    );
+
+    // Leave the cache git mirror as the only surviving source of these paths; never delete it here.
+    for repo in &fixture.repos {
+        std::fs::remove_dir_all(repo.path()).ok();
+    }
+    std::fs::remove_dir_all(fixture.home_path.join(".config")).ok();
+
+    let out = run(&fixture, &["trust", "mydeps", "--list"]);
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        out.status.success(),
+        "`phora trust --list` is read-only and must exit zero; got:\n{shown}"
+    );
+    assert!(
+        !shown.contains("first trust — no prior trusted commit to diff"),
+        "THI-002: a first-trust candidate must NO LONGER print the bare no-prior-commit note — it \
+         must list the composed file surface instead; got:\n{shown}"
+    );
+    assert!(
+        shown.contains("nvim/init.lua") && shown.contains("nvim/lua/opts.lua"),
+        "THI-002: first trust must list the dependency-repo-relative files this consumer composes \
+         from the dep at the candidate commit (the editor source's `nvim/init.lua` and \
+         `nvim/lua/opts.lua`, with their directory so a deployed-surface or unrelated leaf match \
+         cannot false-pass), resolved OFFLINE from the mirror after the source repos AND the \
+         deployed ~/.config surface were deleted; got:\n{shown}"
+    );
+    assert!(
+        !shown
+            .lines()
+            .any(|l| l.trim() == "phora.toml" || l.trim_end().ends_with("/phora.toml")),
+        "THI-002 (AD-1 fidelity): the composed surface must honor the binding's include/exclude — \
+         the editor source declares `include = [\"nvim\"]`, so the leaf's root `phora.toml` (outside \
+         `nvim/`, never composed, never deployed) must NOT appear as a composed-file entry; listing \
+         the entire source subtree leaks it; got:\n{shown}"
+    );
+}
+
+#[test]
+fn trust_list_prior_trusted_still_shows_the_changed_diff_not_the_full_surface() {
+    let (fixture, sentinel_path) = consumer_with_dep_hook();
+    let sentinel_abs = sentinel_path.display().to_string();
+    let dep = dep_path(&fixture);
+
+    // An UNCHANGED tracked file present at both commits, plus a file that changes across them.
+    write(&dep.join("stable/keep.txt"), b"unchanged\n");
+    write(&dep.join("scripts/post.sh"), b"#!/bin/sh\necho original\n");
+    git(&dep, &["add", "-A"]);
+    git(&dep, &["commit", "-m", "add tracked files"]);
+
+    let seed = run(&fixture, &["sync", "--no-transitive-hooks"]);
+    assert!(
+        seed.status.success(),
+        "seeding sync must succeed; stderr: {}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+
+    let lock_path = fixture.cwd.path().join("phora.lock");
+    let lock_text = std::fs::read_to_string(&lock_path).expect("seed sync wrote phora.lock");
+    let preimage =
+        extract_first_preimage(&lock_text).expect("seed records a commit-bound preimage");
+    let commit_a = first_candidate_commit(&lock_text)
+        .expect("seed records the candidate commit so a prior approval can pin it");
+    let hook_id = first_candidate_hook_id(&lock_text).expect("seed records the candidate hook id");
+    let approved = format!(
+        "{lock_text}\n[[trusted_hooks]]\n\
+         dep_instance = \"any\"\n\
+         hook_id = \"{hook_id}\"\n\
+         preimage = \"{preimage}\"\n\
+         approved_at = \"2026-06-20T00:00:00Z\"\n\
+         commit = \"{commit_a}\"\n\
+         source = \"mydeps\"\n",
+    );
+    write(&lock_path, approved.as_bytes());
+
+    write(&dep.join("scripts/post.sh"), b"#!/bin/sh\necho TAMPERED\n");
+    write(
+        &dep.join("phora.toml"),
+        dep_manifest_with_tracked_file(&sentinel_abs).as_bytes(),
+    );
+    git(&dep, &["add", "-A"]);
+    git(&dep, &["commit", "-m", "change tracked script"]);
+
+    let resync = run(&fixture, &["sync", "--no-transitive-hooks"]);
+    assert!(
+        resync.status.success(),
+        "re-sync must succeed; stderr: {}",
+        String::from_utf8_lossy(&resync.stderr)
     );
 
     let out = run(&fixture, &["trust", "mydeps", "--list"]);
@@ -660,25 +812,54 @@ fn trust_list_first_trust_notes_no_prior_commit_to_diff() {
         "`phora trust --list` must exit zero; got:\n{shown}"
     );
     assert!(
-        shown.to_lowercase().contains("first trust"),
-        "R8: with no prior trusted commit the diff is undefined — --list must note `first trust`, \
-         NOT error and NOT print a bogus diff; got:\n{shown}"
+        shown.contains("changed since last trusted"),
+        "AC5: a candidate WITH a prior trusted commit must KEEP the existing file-diff rendering — \
+         THI-002 only replaces the first-trust branch; got:\n{shown}"
+    );
+    assert!(
+        shown.contains("scripts/post.sh"),
+        "AC5: the prior-trusted diff must still name the file that changed between the trusted and \
+         candidate commits; got:\n{shown}"
+    );
+    assert!(
+        !shown.contains("stable/keep.txt"),
+        "AC5: the prior-trusted rendering is a DIFF (changed paths only), not the full composed \
+         surface — an unchanged tracked file must not appear; got:\n{shown}"
     );
 }
 
-fn first_candidate_hook_id(lock_text: &str) -> Option<String> {
-    let mut in_candidate = false;
-    for line in lock_text.lines() {
-        let line = line.trim();
-        if line == "[[candidate_hooks]]" {
-            in_candidate = true;
-        } else if line.starts_with("[[") {
-            in_candidate = false;
-        } else if in_candidate && let Some(rest) = line.strip_prefix("hook_id = \"") {
-            return Some(rest.trim_end_matches('"').to_owned());
-        }
-    }
-    None
+#[test]
+fn trust_list_first_trust_with_no_resolved_commit_degrades_to_a_sync_directive() {
+    let (fixture, _sentinel) = consumer_with_composed_files();
+
+    // No prior sync: discovery yields a first-trust candidate with NO resolved commit (commit = "").
+    assert!(
+        !fixture.cwd.path().join("phora.lock").exists(),
+        "premise: run with NO prior lock so the discovered candidate carries no resolved commit"
+    );
+
+    let out = run(&fixture, &["trust", "mydeps", "--list"]);
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        out.status.success(),
+        "`phora trust --list` must exit zero even when the surface cannot be resolved; got:\n{shown}"
+    );
+    assert!(
+        !shown.contains("first trust — no prior trusted commit to diff"),
+        "THI-002: the bare no-prior-commit note is replaced — an unresolved first-trust candidate \
+         must degrade to a clear sync directive, not the old string; got:\n{shown}"
+    );
+    assert!(
+        shown.contains("phora sync"),
+        "THI-002 degradation: a first-trust candidate whose commit is unresolved/absent from the \
+         mirror must fall back to a `run `phora sync`` directive — never a panic, never a silent \
+         blank; got:\n{shown}"
+    );
 }
 
 fn extract_first_preimage(lock_text: &str) -> Option<String> {
@@ -1025,5 +1206,90 @@ fn trust_list_for_one_dep_does_not_render_another_deps_changed_path() {
         !e2_block.contains("e1-only.sh"),
         "key-collision: the `e2-only.sh` hook block must NOT render the other dep's `e1-only.sh`; \
          got block:\n{e2_block}"
+    );
+}
+
+// THI-002 regression (gpt-5.5): a `#`-containing dep target name must not truncate the hook_id parse.
+
+fn consumer_with_hash_named_composed_target() -> (Fixture, PathBuf) {
+    let leaf = TempDir::new().expect("leaf repo");
+    commit_repo(
+        leaf.path(),
+        &[("editor/init.lua", "-- init\n")],
+        "version = 1\n",
+    );
+    let leaf_path = leaf.path().to_path_buf();
+
+    let mut fixture = build_fixture();
+    let sentinel_path = sentinel(&fixture);
+    let sentinel_abs = sentinel_path.display().to_string();
+
+    let dep = TempDir::new().expect("dep repo");
+    let manifest = format!(
+        "version = 1\n\n\
+         [sources.editor]\ngit = \"https://github.com/mock/leaf.git\"\ninclude = [\"editor\"]\n\n\
+         [targets.\"edit#or\"]\npath = \"editor\"\nsources = [\"editor\"]\n\n\
+         [targets.\"edit#or\".hooks]\non_change = \"touch '{sentinel_abs}'\"\n",
+    );
+    commit_repo(dep.path(), &[], &manifest);
+    let dep_path = dep.path().to_path_buf();
+
+    fixture.map_url("https://github.com/mock/leaf.git", &leaf_path);
+    fixture.finish_gitconfig();
+    let config = format!(
+        "version = 1\n\n[sources.mydeps]\ngit = \"{dep}\"\ntransitive = true\n\n\
+         [targets.dotcfg]\npath = \"~/.config\"\nimports = [\"mydeps\"]\n",
+        dep = dep_path.display(),
+    );
+    write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());
+    fixture.repos.push(leaf);
+    fixture.repos.push(dep);
+    (fixture, sentinel_path)
+}
+
+#[test]
+fn trust_list_first_trust_lists_composed_surface_for_a_hash_named_dep_target() {
+    let (fixture, _sentinel) = consumer_with_hash_named_composed_target();
+
+    let seed = run(&fixture, &["sync", "--no-transitive-hooks"]);
+    let seed_shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&seed.stdout),
+        String::from_utf8_lossy(&seed.stderr)
+    );
+    assert!(
+        seed.status.success(),
+        "premise: a dep target NAME containing `#` (here `[targets.\"edit#or\"]`) must parse and \
+         sync — the finding is only reachable if the `#`-named target is accepted; got {:?}\n{seed_shown}",
+        seed.status.code()
+    );
+
+    let out = run(&fixture, &["trust", "mydeps", "--list"]);
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        out.status.success(),
+        "`phora trust --list` is read-only and must exit zero; got:\n{shown}"
+    );
+    assert!(
+        !shown.contains("composed surface unavailable"),
+        "THI-002 regression: the candidate's composed target name is `...#edit#or`, so parsing the \
+         hook_id with `split('#').next()` truncates at the FIRST `#` and loses the mapping — the \
+         listing must NOT degrade to `composed surface unavailable` when the surface resolves; got:\n{shown}"
+    );
+    assert!(
+        !shown.contains("first trust — no prior trusted commit to diff"),
+        "THI-002: a first-trust candidate must list the composed surface, never the bare \
+         no-prior-commit note; got:\n{shown}"
+    );
+    assert!(
+        shown.lines().any(|l| l.trim() == "editor/init.lua"),
+        "THI-002 regression: the composed surface for the `#`-named target must list the dep's \
+         composed file `editor/init.lua` (matched as a standalone composed-file entry line so a \
+         substring elsewhere cannot false-pass); got:\n{shown}"
     );
 }
