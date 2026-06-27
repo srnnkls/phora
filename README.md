@@ -891,6 +891,17 @@ CI and reproducible checkouts. A `phora.local.toml` overlay can flip a source to
 `transitive = true` for a single machine, exactly like any other per-machine
 override.
 
+### Residual risk
+
+Trust here is behavioral, not a sandbox. An approved hook runs as you, with your
+full privileges and phora's full process environment — phora pins *what* runs and
+re-prompts when it changes, but it does not confine *how* it runs. v1 ships no OS
+sandbox, no environment sanitization, and no signature or provenance check. The
+trust pin is whole-commit, so any change to a dep's commit re-prompts every one of
+its hooks; the file-level diff narrows what you have to read, not what re-prompts.
+For a dependency you would not already trust to run code on your machine, vet it in
+an outer VM or container before you approve its hooks.
+
 ## Worktrees
 
 A worktree is just a directory you run `phora sync` from; sync builds the managed
