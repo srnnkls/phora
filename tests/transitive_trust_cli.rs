@@ -1293,3 +1293,178 @@ fn trust_list_first_trust_lists_composed_surface_for_a_hash_named_dep_target() {
          substring elsewhere cannot false-pass); got:\n{shown}"
     );
 }
+
+// THI-005: real-CLI `phora trust <source> --show <path>` against the actual binary, end-to-end.
+
+fn leaf_path(fixture: &Fixture) -> PathBuf {
+    fixture
+        .repos
+        .first()
+        .expect("consumer_with_composed_files pushes the leaf first")
+        .path()
+        .to_path_buf()
+}
+
+fn seed_sync(fixture: &Fixture) {
+    let seed = run(fixture, &["sync", "--no-transitive-hooks"]);
+    assert!(
+        seed.status.success(),
+        "seeding sync must succeed; stderr: {}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+}
+
+#[test]
+fn trust_show_prints_a_tracked_files_contents_and_exits_zero() {
+    let (fixture, _sentinel) = consumer_with_composed_files();
+    seed_sync(&fixture);
+
+    let out = run(&fixture, &["trust", "mydeps", "--show", "nvim/init.lua"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        out.status.success(),
+        "AC2: `phora trust --show <tracked file>` must exit zero; stderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("-- init"),
+        "AC2: --show on a UTF-8 file must print the file's CONTENTS (the leaf's `nvim/init.lua` body \
+         `-- init`), not a path or a directory listing; got stdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("-- opts"),
+        "AC2: --show on a single file must print only THAT file — never a sibling's body; got:\n{stdout}"
+    );
+}
+
+#[test]
+fn trust_show_lists_a_directorys_direct_entries_without_recursing() {
+    let (fixture, _sentinel) = consumer_with_composed_files();
+    seed_sync(&fixture);
+
+    let out = run(&fixture, &["trust", "mydeps", "--show", "nvim"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        out.status.success(),
+        "AC3: `phora trust --show <dir>` must exit zero; stderr:\n{stderr}"
+    );
+    assert!(
+        stdout.lines().any(|l| l.trim() == "init.lua"),
+        "AC3: --show on a directory must list its direct file entry `init.lua` ls-style; got:\n{stdout}"
+    );
+    assert!(
+        stdout.lines().any(|l| l.trim() == "lua/"),
+        "AC3: --show on a directory must list a subdirectory as a dir entry (`lua/`, slash-suffixed), \
+         not flatten into it; got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("opts.lua"),
+        "AC3: the directory listing must NOT recurse — the nested `lua/opts.lua` must stay behind the \
+         `lua/` entry, never appear flattened at the top level; got:\n{stdout}"
+    );
+}
+
+#[test]
+fn trust_show_errors_clearly_for_an_absent_path() {
+    let (fixture, _sentinel) = consumer_with_composed_files();
+    seed_sync(&fixture);
+
+    let out = run(&fixture, &["trust", "mydeps", "--show", "no/such/path"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        !out.status.success(),
+        "AC4: --show on a path absent at the candidate commit must error (non-zero exit); got success"
+    );
+    assert!(
+        stderr.contains("no/such/path") && stderr.to_lowercase().contains("absent"),
+        "AC4: the error must NAME the missing path and say it is absent/not-found; got stderr:\n{stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "AC4: an absent path must print NO file contents to stdout; got:\n{stdout}"
+    );
+}
+
+#[test]
+fn trust_show_refuses_binary_content_instead_of_dumping_raw_bytes() {
+    let (fixture, _sentinel) = consumer_with_composed_files();
+
+    let leaf = leaf_path(&fixture);
+    write(&leaf.join("nvim/blob.bin"), &[0x00, 0x01, 0xff]);
+    git(&leaf, &["add", "-A"]);
+    git(&leaf, &["commit", "-m", "add binary blob"]);
+
+    seed_sync(&fixture);
+
+    let out = run(&fixture, &["trust", "mydeps", "--show", "nvim/blob.bin"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        !out.status.success(),
+        "AC5: --show on a binary (non-UTF-8) file must refuse with a non-zero exit; got success"
+    );
+    assert!(
+        stderr.to_lowercase().contains("binary") || stderr.to_lowercase().contains("utf-8"),
+        "AC5: the refusal must name the non-UTF-8/binary reason; got stderr:\n{stderr}"
+    );
+    assert!(
+        !out.stdout.iter().any(|&b| b == 0xff || b == 0x00),
+        "AC5: --show must NOT dump the raw bytes of a binary file — the `\\x00`/`\\xff` payload bytes \
+         must never reach stdout; got stdout bytes: {:?}",
+        out.stdout
+    );
+}
+
+#[test]
+fn trust_show_without_a_source_errors_naming_the_missing_source() {
+    let (fixture, _sentinel) = consumer_with_composed_files();
+
+    let out = run(&fixture, &["trust", "--show", "nvim/init.lua"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        !out.status.success(),
+        "AC6: `phora trust --show <path>` with NO source must error (non-zero exit); got success"
+    );
+    assert!(
+        stderr.contains("source"),
+        "AC6: the error must name the missing source (as `--revoke` does); got stderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("-- init"),
+        "AC6: a missing source must short-circuit BEFORE any file read — no contents on stdout; got:\n{stdout}"
+    );
+}
+
+#[test]
+fn trust_show_reads_a_file_offline_from_the_mirror_after_the_source_repos_are_deleted() {
+    let (fixture, _sentinel) = consumer_with_composed_files();
+    seed_sync(&fixture);
+
+    // Leave the cache git mirror as the only surviving source of these paths.
+    for repo in &fixture.repos {
+        std::fs::remove_dir_all(repo.path()).ok();
+    }
+    std::fs::remove_dir_all(fixture.home_path.join(".config")).ok();
+
+    let out = run(&fixture, &["trust", "mydeps", "--show", "nvim/init.lua"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        out.status.success(),
+        "AC7: --show must read the pinned commit OFFLINE from the cache mirror — it must not fetch; \
+         stderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("-- init"),
+        "AC7: with the source repos AND the deployed ~/.config surface deleted, --show must still \
+         print the file's contents resolved from the mirror; got:\n{stdout}"
+    );
+}

@@ -130,10 +130,11 @@ phora sync --frozen         # refuse to fetch or re-resolve — every source mus
 phora sync --no-transitive-hooks  # deploy composed deps, but run none of their hooks
 
 # Transitive (composed-dependency) hooks — inspect and approve before they run
-phora trust                 # list every discovered composed-dep hook across all sources
-phora trust tropos          # inspect tropos's hooks (with file diffs), approve interactively
-phora trust tropos --list   # show tropos's hooks without approving anything
-phora trust tropos --revoke # drop every approval recorded for tropos
+phora trust                       # list every discovered composed-dep hook across all sources
+phora trust tropos                # inspect tropos's hooks, approve interactively
+phora trust tropos --list         # show tropos's hooks without approving anything
+phora trust tropos --show <path>  # print a tropos dep file (or list a dir) at the pinned commit
+phora trust tropos --revoke       # drop every approval recorded for tropos
 
 # Re-resolve to the latest commit, then sync
 phora update                # all sources
@@ -864,9 +865,27 @@ not run — and the sync tells you so. You approve them deliberately:
 
 ```bash
 phora trust tropos --list   # show each hook: its command, its commit-pinned preimage,
-                            # and which dep files changed since you last trusted it
+                            # and the dep surface around it (see below)
 phora trust tropos          # same, then prompt [y/N] per hook; a yes is recorded
 ```
+
+What `--list` shows around each hook depends on whether you have trusted it before.
+A hook you have approved at an earlier commit renders the file-level diff between
+that trusted commit and the current candidate commit, so you can see what moved in
+the dep before re-trusting. A hook with no prior trusted commit instead lists the
+dependency-repo-relative files the consumer composes from the dep at the candidate
+commit — the actual surface the hook will run against, honoring the binding's
+include/exclude. Both are resolved offline from the cache mirror; if the candidate
+commit is unresolved or absent from the mirror, the listing degrades to a
+`run phora sync first` notice rather than guessing.
+
+To read the surrounding tree directly, `phora trust tropos --show <path>` prints a
+dep file at the pinned candidate commit, also offline. A UTF-8 file prints its
+contents; a directory lists its direct entries ls-style, with subdirectories
+slash-suffixed; an absent path errors naming the path; binary (non-UTF-8) content is
+refused rather than dumped; and a commit not yet in the mirror points you at
+`phora sync`. `--show` requires a source and refuses to guess when one source has
+several distinct pinned dep commits — it names them so you can disambiguate.
 
 Approval is consumer-owned and lives in your `phora.lock` (a `[[trusted_hooks]]`
 entry pinned to the hook's command and the exact dep commit it came from);
