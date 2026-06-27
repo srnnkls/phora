@@ -927,9 +927,27 @@ The sync tells you so, and you approve it deliberately:
 
 ```bash
 phora trust tropos --list   # each hook: its command, its commit-pinned preimage,
-                            # and which dependency files changed since you last trusted it
+                            # and the dependency surface around it (see below)
 phora trust tropos          # the same, then prompt [y/N] per hook; a yes is recorded
 ```
+
+What `--list` shows around a hook depends on whether you have trusted it before. A
+hook you approved at an earlier commit renders the file-level diff between that
+trusted commit and the current candidate commit, so you can read what moved in the
+dependency before re-trusting. A hook with no prior trusted commit instead lists
+the dependency-repo-relative files the consumer composes from the dependency at the
+candidate commit — the actual surface the hook will run against, honoring the
+binding's include/exclude. Both are resolved offline from the cache mirror; if the
+candidate commit is unresolved or missing from the mirror, the listing degrades to a
+`run phora sync first` notice rather than guessing.
+
+To read the surrounding tree directly, `phora trust tropos --show <path>` prints a
+dependency file at the pinned candidate commit, also offline. A UTF-8 file prints
+its contents; a directory lists its direct entries ls-style, with subdirectories
+slash-suffixed; an absent path errors naming the path; binary (non-UTF-8) content is
+refused rather than dumped; and a commit not yet in the mirror points you at `phora
+sync`. `--show` requires a source name, and refuses to guess when one source has
+several distinct pinned dependency commits — it names them so you can disambiguate.
 
 Approval is consumer-owned and lives in your `phora.lock`, as a `[[trusted_hooks]]`
 entry pinned to the hook's command and the exact dependency commit it came from;
@@ -943,6 +961,15 @@ non-interactive run stays green, because the files are deployed and only the
 post-processing was skipped. `phora sync --no-transitive-hooks` skips composed-dep
 hooks entirely (your own hooks still run), and `phora trust tropos --revoke` drops
 every approval for a dependency.
+
+One honest limit: trust here is behavioral, not a sandbox. An approved hook runs as
+you, with your full privileges and phora's full process environment — phora pins
+*what* runs and re-prompts when it changes, but it does not confine *how* it runs.
+v1 ships no OS sandbox, no environment sanitization, and no signature or provenance
+check; the trust pin is whole-commit, so any change to a dependency's commit
+re-prompts every one of its hooks (the file-level diff narrows what you have to read,
+not what re-prompts). For a dependency you would not already trust to run code on
+your machine, vet it in an outer VM or container before you approve its hooks.
 
 ### Reproducibility
 
@@ -1262,6 +1289,22 @@ came from. Because every record carries its underlying source, a `phora where
 --source <s>` finds all of `s`'s slices even when they were bound under different
 identities (table keys).
 
+`phora verify` always re-hashes; the *drift gate* that `phora sync` and `phora list`
+use to decide whether an artifact needs redeploying takes a cheaper path. It first
+compares each file's on-disk size and mtime against the manifest, and a match is
+clean without hashing — the hot path, since most files are untouched. Only a file
+whose size or mtime diverges is then hashed and compared against the recorded
+`blake3`: a hash match means the bytes are identical and the stat merely moved (a
+`touch`, a restore-from-backup), so the file is *revalidated* — treated as clean
+rather than flagged, and `sync` persists the fresh size and mtime back to the
+manifest so the file drops to the stat fast path next time instead of re-hashing. A
+hash mismatch is a real edit and stays modified; any read or re-stat error, or a
+non-regular file, fails closed to modified rather than guessing clean. The escalation
+is race-aware — the file is opened once and read and re-stat'd through that one
+descriptor — and partial drift collapses the whole artifact to modified with no
+refresh. The upshot at the command line: a bare timestamp change on byte-identical
+content no longer trips the conflict prompt.
+
 If the registry and the on-disk reality fall out of step — say you hand-edited the
 state root, or restored an old backup — `phora rebuild-registry` reconstructs the
 records from the lock plus what is actually deployed.
@@ -1446,7 +1489,8 @@ Most confusion maps to one question, and each question maps to one command.
   commands after a sync, [`templates.md`](tests/scrut/templates.md) fills one config
   in per machine, and [`transitive.md`](tests/scrut/transitive.md) imports a
   dependency that carries its own — composing it under the anchor, isolating storage
-  with `[paths]`, and stripping its untrusted hook.
+  with `[paths]`, stripping its untrusted hook, and inspecting that hook's surface
+  offline with `trust --list`/`--show` before approval.
 - The source is organized along the pipeline: `config.rs` (parsing and modes),
   `config/source.rs` and `config/target.rs` (the offer and the take/collapse DTOs),
   `config/transitive.rs` (the dependency manifest DTO and graph keys),

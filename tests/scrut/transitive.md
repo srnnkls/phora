@@ -140,26 +140,80 @@ $ test -d .phora/cache/git && test -d .phora/state/projects && test ! -e "$HOME/
 isolated
 ```
 
-`phora verify` re-hashes the composed copy against the registry:
+`phora verify` re-hashes the composed copy against the registry. The bytes match, but
+the dependency's hook was *stripped* rather than run, so the composed artifact may be
+incomplete — verify says so and exits non-zero until the hook is trusted (the
+machine-dependent hook id is matched as a glob):
 
 ```scrut
-$ phora verify
-all verified
+$ phora verify 2>&1
+tropos: untrusted stripped hook * — deployed but not post-processed, artifact may be incomplete; run `phora trust tropos` to approve (glob)
+[1]
 ```
 
 ## Inspecting an untrusted hook
 
 `phora trust <source> --list` shows each discovered hook — its command, the
-environment it would inherit, and (once a prior approval exists) the dependency files
-that changed since you last trusted it — without approving anything. Approval itself
-is interactive and records the hook, pinned to its command and commit, in your
-`phora.lock`; off a terminal the command only lists.
+environment it would inherit, and the dependency surface around it — without approving
+anything. Approval itself is interactive and records the hook, pinned to its command
+and commit, in your `phora.lock`; off a terminal the command only lists.
 
 ```scrut
 $ phora trust tropos --list 2>&1 | grep -E 'command:|env:|note:'
   command: echo composed >> "$HOME/loqui-built.log"
   env: PHORA_TARGET=<composed target path>
   note: the hook inherits the FULL process environment, not only the PHORA_* variables
+```
+
+The surface depends on history. With no prior approval — a first trust — `--list`
+lists the dependency-repo-relative files the hook will run against at the candidate
+commit, resolved offline from the mirror; once you have trusted the hook at an earlier
+commit it renders the file-level diff between that commit and the candidate instead.
+This is a first trust, so the listing is the composed surface (the candidate commit is
+folded to `<HASH>`):
+
+```scrut
+$ phora trust tropos --list 2>&1 | sed -E 's/at [0-9a-f]{7,}:/at <HASH>:/' | grep -A4 'composed files'
+  composed files at <HASH>:
+    languages/go/style.md
+    languages/python/style.md
+    phora.toml
+    resources/shared.md
+```
+
+## Reading the dependency tree with `--show`
+
+`phora trust <source> --show <path>` prints a dependency file — or lists a directory —
+at the pinned candidate commit, offline, so you can read a hook's surroundings before
+approving it. A UTF-8 file prints verbatim:
+
+```scrut
+$ phora trust tropos --show languages/go/style.md 2>&1
+go style
+```
+
+A directory lists its direct entries ls-style, with subdirectories slash-suffixed:
+
+```scrut
+$ phora trust tropos --show languages 2>&1
+go/
+python/
+```
+
+An absent path errors, naming the path and the commit it looked at:
+
+```scrut
+$ phora trust tropos --show no/such/path 2>&1
+error: source error: no/such/path is absent at * in `tropos` (glob)
+[1]
+```
+
+And `--show` refuses to guess without a source name:
+
+```scrut
+$ phora trust --show languages/go/style.md 2>&1
+error: config error: `phora trust --show` needs a source name
+[1]
 ```
 
 ## Skipping dependency hooks

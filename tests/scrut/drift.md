@@ -46,6 +46,24 @@ skills:
   skills/skill-creator  ✓ clean
 ```
 
+## A touch is not a change
+
+Drift detection compares each file's size and mtime first, and re-hashes only when one
+diverges. A bare timestamp bump — a `touch`, or a restore that rewrites mtimes — is
+caught by the stat, re-hashed against the record, found byte-identical, and
+*revalidated*: it stays clean rather than reading as drift, and `sync` records the
+refreshed stat so the next check takes the fast path again.
+
+```scrut
+$ touch -t 202001010000 claude-skills/skill-creator/SKILL.md
+```
+
+```scrut
+$ phora list
+skills:
+  skills/skill-creator  ✓ clean
+```
+
 ## Something edits the file
 
 A skill is executable prose — the agent does what the file says. So a quiet
