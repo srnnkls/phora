@@ -426,10 +426,33 @@ fn dispatch_add(cmd: Command) -> Result<()> {
 }
 
 fn run_verify() -> Result<()> {
-    let config = load_config()?;
-    let mismatches = crate::sync::verify(&config, &open_project_registry(&config)?)?;
-    render::print_verify(&mismatches);
-    if mismatches.is_empty() {
+    let cwd = std::env::current_dir()?;
+    let base = load_config()?;
+    let local = load_local_config(&cwd)?;
+    let mut config = crate::config::merge_configs(base, local);
+
+    let registry = open_project_registry(&config)?;
+    let (base_lock, local_lock) = load_locks(&cwd)?;
+    let lock = base_lock.map_or_else(
+        || local_lock.clone(),
+        |base| Some(crate::lock::merge_locks(&base, local_lock.as_ref())),
+    );
+
+    let cache_git = crate::paths::cache_root_for(config.paths.cache.as_deref(), &cwd)?.join("git");
+    let backend = build_router(&config, cache_git)?;
+    let mut parsed = config.parsed_sources()?;
+    let mut remotes = crate::sync::resolved_remotes(&config, &parsed)?;
+    crate::sync::inject_composed_graph(
+        &mut config,
+        &mut parsed,
+        &mut remotes,
+        &backend,
+        lock.as_ref(),
+    );
+
+    let report = crate::sync::verify(&config, &registry, lock.as_ref())?;
+    render::print_verify(&report);
+    if report.is_clean() {
         Ok(())
     } else {
         std::process::exit(1);

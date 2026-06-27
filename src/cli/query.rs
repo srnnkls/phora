@@ -42,8 +42,9 @@ pub(super) fn run_preview(sel: &PreviewSelectors, json: bool) -> Result<()> {
     let local = load_local_config(&cwd)?;
     let config = merge_configs(base, local);
 
-    let parsed = config.parsed_sources()?;
-    let remotes = resolved_remotes(&config, &parsed)?;
+    let mut config = config;
+    let mut parsed = config.parsed_sources()?;
+    let mut remotes = resolved_remotes(&config, &parsed)?;
     let (base_lock, local_lock) = load_locks(&cwd)?;
     let lock = base_lock.map_or_else(
         || local_lock.clone(),
@@ -52,6 +53,13 @@ pub(super) fn run_preview(sel: &PreviewSelectors, json: bool) -> Result<()> {
 
     let cache_git = cache_root_for(config.paths.cache.as_deref(), &cwd)?.join("git");
     let backend = build_router(&config, cache_git)?;
+    crate::sync::inject_composed_graph(
+        &mut config,
+        &mut parsed,
+        &mut remotes,
+        &backend,
+        lock.as_ref(),
+    );
     let plan = preview_plan(&config, &parsed, &remotes, &backend, lock.as_ref(), sel)?;
 
     print!(

@@ -25,8 +25,8 @@ pub use preview::{
     BindingWarnings, PreviewCollision, PreviewEntry, PreviewFile, PreviewTargetPlan,
     PreviewWarning, SyncState, preview_targets,
 };
-pub use rebuild::{RebuildReport, rebuild_registry};
-pub use verify::{VerifyMismatch, VerifyReason, verify};
+pub use rebuild::{RebuildReport, rebuild_registry, rebuild_registry_with};
+pub use verify::{UntrustedHookFinding, VerifyMismatch, VerifyReason, VerifyReport, verify};
 
 #[cfg(feature = "bench")]
 pub use resolve::resolve_sources_for_bench;
@@ -177,7 +177,7 @@ pub(super) fn nonce() -> u64 {
 }
 
 /// Trust comes ONLY from `trusted_hooks`; a `candidate_hooks` record grants none (anti-TOFU).
-fn trusted_preimages(effective_lock: Option<&Lock>) -> BTreeSet<String> {
+pub(super) fn trusted_preimages(effective_lock: Option<&Lock>) -> BTreeSet<String> {
     let Some(lock) = effective_lock else {
         return BTreeSet::new();
     };
@@ -556,6 +556,23 @@ fn sealed_offer_diagnostic(target: &str, source: &str, artifact: &str) -> Error 
         debug_hint: Some(format!("phora explain {target} {source} {artifact}")),
     }
     .sync()
+}
+
+/// Resolves the composed transitive graph OFFLINE (frozen reads of the pinned dep manifests
+/// already in the git mirror) and injects its synthetic confined targets and namespaced sources
+/// so a read-only observer sees them. Degrades silently — if a dep is unpinned, the mirror is
+/// absent, or the graph is otherwise unresolvable, config/parsed/remotes are left un-injected
+/// rather than failing the observer.
+pub(crate) fn inject_composed_graph(
+    config: &mut Config,
+    parsed: &mut BTreeMap<String, ParsedSource>,
+    remotes: &mut BTreeMap<String, String>,
+    backend: &(dyn SourceBackend + Sync),
+    lock: Option<&Lock>,
+) {
+    if let Ok(graph) = transitive::resolve_transitive_graph(config, parsed, backend, true, lock) {
+        graph.inject(config, parsed, remotes);
+    }
 }
 
 fn validate_link_mode(

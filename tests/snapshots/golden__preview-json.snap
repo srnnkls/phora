@@ -33,7 +33,8 @@ exit: 0
         }
       ],
       "collisions": [],
-      "warnings": []
+      "warnings": [],
+      "untrusted_stripped_hook": false
     }
   ]
 }--- stderr ---
