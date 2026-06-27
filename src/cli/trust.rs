@@ -6,11 +6,12 @@
 //! discovery-only mirror that lacks the prior commit degrades to a "run `phora sync` first" note.
 
 use std::io::IsTerminal;
+use std::path::Path;
 
 use crate::config::transitive::TransitiveManifest;
 use crate::error::{Error, Result};
 use crate::lock::{CandidateHookRecord, Lock, TrustedHook};
-use crate::source::GitBackend;
+use crate::source::{GitBackend, SourceBackend, SourceError};
 use crate::sync::transitive::ResolvedGraph;
 
 use super::{load_config, open_project_registry};
@@ -18,7 +19,12 @@ use super::{load_config, open_project_registry};
 /// A discovery-only candidate carries no real preimage: it is resolved on first sync.
 const UNRESOLVED_PREIMAGE: &str = "";
 
-pub(super) fn run_trust(source: Option<&str>, list: bool, revoke: bool) -> Result<()> {
+pub(super) fn run_trust(
+    source: Option<&str>,
+    list: bool,
+    revoke: bool,
+    show: Option<&str>,
+) -> Result<()> {
     let config = load_config()?;
     let registry = open_project_registry(&config)?;
     let _guard = registry.lock_exclusive()?;
@@ -32,6 +38,15 @@ pub(super) fn run_trust(source: Option<&str>, list: bool, revoke: bool) -> Resul
             Error::Config("`phora trust --revoke` needs a source name".to_owned())
         })?;
         return revoke_source_hooks(&cwd, base_lock.as_mut(), local_lock.as_ref(), source);
+    }
+
+    if let Some(path) = show {
+        let (source, url, commit) = resolve_show_target(base_lock.as_ref(), source)?;
+        let backend = GitBackend::new(cache_git.clone());
+        for line in render_show(&backend, &source, &url, &commit, Path::new(path))? {
+            println!("{line}");
+        }
+        return Ok(());
     }
 
     let candidates = discover_candidates(&config, &cwd, base_lock.as_ref(), source)?;
@@ -230,6 +245,124 @@ fn revoke_source_hooks(
     super::sync::write_locks(cwd, lock, local_lock)?;
     println!("phora: revoked {removed} transitive hook approval(s) for `{source}`");
     Ok(())
+}
+
+/// Resolves the `(remote_url, commit)` a `--show` should read, entirely from the lock (offline).
+/// The current candidate commit for `source` wins over a prior trusted commit; a single distinct
+/// non-empty commit is required, so an unsynced or ambiguous source refuses rather than guesses.
+pub(super) fn resolve_show_target(
+    lock: Option<&Lock>,
+    source: Option<&str>,
+) -> Result<(String, String, String)> {
+    let source = source
+        .ok_or_else(|| Error::Config("`phora trust --show` needs a source name".to_owned()))?;
+    let lock = lock.ok_or_else(|| {
+        Error::Config(format!(
+            "no commit recorded for `{source}` — run `phora sync` first"
+        ))
+    })?;
+
+    let mut records: Vec<(&str, &str)> = lock
+        .candidate_hooks
+        .iter()
+        .filter(|c| c.source == source)
+        .map(|c| (c.commit.as_str(), c.dep_instance.as_str()))
+        .collect();
+    if records.is_empty() {
+        records = lock
+            .trusted_hooks
+            .iter()
+            .filter(|h| h.source == source)
+            .map(|h| (h.commit.as_str(), h.dep_instance.as_str()))
+            .collect();
+    }
+
+    let mut distinct: Vec<(&str, &str)> = Vec::new();
+    for (commit, instance) in records {
+        if !commit.is_empty() && !distinct.iter().any(|(c, _)| *c == commit) {
+            distinct.push((commit, instance));
+        }
+    }
+
+    match distinct.as_slice() {
+        [] => Err(Error::Config(format!(
+            "no commit recorded for `{source}` — run `phora sync` first"
+        ))),
+        [(commit, instance)] => {
+            let url = locked_url(lock, instance, source)?;
+            Ok((source.to_owned(), url, (*commit).to_owned()))
+        }
+        many => {
+            let commits = many
+                .iter()
+                .map(|(c, _)| short(c))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(Error::Config(format!(
+                "`{source}` has several recorded commits ({commits}); sync to pin one before --show"
+            )))
+        }
+    }
+}
+
+/// The remote URL of the `LockedSource` for `instance` (a transitive node), falling back to the
+/// consumer source named `source`.
+fn locked_url(lock: &Lock, instance: &str, source: &str) -> Result<String> {
+    lock.sources
+        .iter()
+        .find(|s| s.instance.as_deref() == Some(instance))
+        .or_else(|| lock.sources.iter().find(|s| s.name == source))
+        .map(|s| s.git.clone())
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "no locked remote for `{source}` — run `phora sync` first"
+            ))
+        })
+}
+
+/// Renders a dep `path` at `commit` from the mirror, offline: a UTF-8 file as its text lines, a
+/// directory as an ls-style listing (subdirectories suffixed `/`), refusing binary content and
+/// reporting an absent path. Dispatch is by backend outcome, never by matching error strings.
+pub(super) fn render_show(
+    backend: &dyn SourceBackend,
+    source: &str,
+    url: &str,
+    commit: &str,
+    path: &Path,
+) -> Result<Vec<String>> {
+    let name = crate::kernel::SourceName::trusted(source.to_owned());
+    match backend.read_file_at(&name, url, commit, path) {
+        Ok(bytes) => match std::str::from_utf8(&bytes) {
+            Ok(text) => Ok(text.lines().map(str::to_owned).collect()),
+            Err(_) => Err(Error::Source(format!(
+                "{} at {} is not UTF-8 text — binary content is not shown",
+                path.display(),
+                short(commit)
+            ))),
+        },
+        Err(_) => match backend.list_tree_at(&name, url, commit, path) {
+            Ok(entries) => Ok(entries
+                .into_iter()
+                .map(|e| {
+                    if e.is_dir {
+                        format!("{}/", e.name)
+                    } else {
+                        e.name
+                    }
+                })
+                .collect()),
+            Err(SourceError::RootNotFound { .. }) => Err(Error::Source(format!(
+                "{} is absent at {} in `{source}`",
+                path.display(),
+                short(commit)
+            ))),
+            Err(_) => Err(Error::Source(format!(
+                "`{}` cannot be shown — its commit `{}` is not in the mirror; run `phora sync` first",
+                path.display(),
+                short(commit)
+            ))),
+        },
+    }
 }
 
 fn discover_candidates(
@@ -546,6 +679,413 @@ mod tests {
         assert!(
             scoped.is_empty(),
             "an unknown source must scope to EMPTY, never fall back to every dep's candidates"
+        );
+    }
+
+    use crate::source::{SourceBackend, SourceError, TreeEntry};
+    use std::path::Path;
+
+    /// What the mocked mirror reader should hand back for `<path>` at the pinned commit.
+    enum FileOutcome {
+        Bytes(Vec<u8>),
+        Absent,
+        NotRegular,
+        MirrorError,
+    }
+
+    enum TreeOutcome {
+        Entries(Vec<TreeEntry>),
+        Absent,
+        MirrorError,
+    }
+
+    /// A `SourceBackend` whose only live methods are the two mirror reads `--show` drives;
+    /// every other port method is irrelevant to the renderer and must never be touched.
+    struct ShowBackend {
+        file: FileOutcome,
+        tree: TreeOutcome,
+    }
+
+    impl SourceBackend for ShowBackend {
+        fn read_file_at(
+            &self,
+            _source: &crate::kernel::SourceName,
+            _url: &str,
+            commit: &str,
+            path: &Path,
+        ) -> std::result::Result<Vec<u8>, SourceError> {
+            match &self.file {
+                FileOutcome::Bytes(bytes) => Ok(bytes.clone()),
+                FileOutcome::Absent => Err(SourceError::FileAbsent {
+                    source_name: "mydeps".to_owned(),
+                    commit: commit.to_owned(),
+                    path: path.to_path_buf(),
+                }),
+                FileOutcome::NotRegular => Err(SourceError::Source(format!(
+                    "{} is not a regular file",
+                    path.display()
+                ))),
+                FileOutcome::MirrorError => Err(SourceError::Source(format!(
+                    "open mirror for {commit}: missing"
+                ))),
+            }
+        }
+
+        fn list_tree_at(
+            &self,
+            _source: &crate::kernel::SourceName,
+            _url: &str,
+            commit: &str,
+            path: &Path,
+        ) -> std::result::Result<Vec<TreeEntry>, SourceError> {
+            match &self.tree {
+                TreeOutcome::Entries(entries) => Ok(entries.clone()),
+                TreeOutcome::Absent => Err(SourceError::RootNotFound {
+                    root: path.to_path_buf(),
+                }),
+                TreeOutcome::MirrorError => Err(SourceError::Source(format!(
+                    "commit {commit} in mirror: missing"
+                ))),
+            }
+        }
+
+        fn fetch(
+            &self,
+            _source: &crate::kernel::SourceName,
+            _url: &str,
+        ) -> std::result::Result<(), SourceError> {
+            unimplemented!("`--show` is offline; it must not fetch")
+        }
+
+        fn resolve(
+            &self,
+            _source: &crate::kernel::SourceName,
+            _url: &str,
+            _refspec: &crate::config::Refspec,
+        ) -> std::result::Result<String, SourceError> {
+            unimplemented!("`--show` reads a pinned commit; it must not resolve refs")
+        }
+
+        fn commit_time(
+            &self,
+            _source: &crate::kernel::SourceName,
+            _url: &str,
+            _commit: &str,
+        ) -> std::result::Result<u64, SourceError> {
+            unimplemented!()
+        }
+
+        fn export_artifact(
+            &self,
+            _req: &crate::source::ExportRequest<'_>,
+        ) -> std::result::Result<crate::source::ExportResult, SourceError> {
+            unimplemented!()
+        }
+
+        fn compute_digest(
+            &self,
+            _source: &crate::kernel::SourceName,
+            _url: &str,
+            _commit: &str,
+            _root: Option<&Path>,
+            _include: &[String],
+            _exclude: &[String],
+        ) -> std::result::Result<String, SourceError> {
+            unimplemented!()
+        }
+    }
+
+    const COMMIT_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const COMMIT_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const COMMIT_ONE: &str = "111111111111111111111111111111111111aaaa";
+    const COMMIT_TWO: &str = "222222222222222222222222222222222222bbbb";
+
+    fn cand_commit(source: &str, instance: &str, commit: &str) -> CandidateHookRecord {
+        CandidateHookRecord {
+            dep_instance: instance.to_owned(),
+            hook_id: format!("{source}#editor#on_change"),
+            preimage: "blake3:p".to_owned(),
+            command: "touch sentinel".to_owned(),
+            source: source.to_owned(),
+            commit: commit.to_owned(),
+        }
+    }
+
+    fn trusted_commit(source: &str, instance: &str, commit: &str) -> TrustedHook {
+        TrustedHook {
+            dep_instance: instance.to_owned(),
+            hook_id: format!("{source}#editor#on_change"),
+            preimage: "blake3:p".to_owned(),
+            approved_at: "2026-01-01T00:00:00Z".to_owned(),
+            source: source.to_owned(),
+            commit: commit.to_owned(),
+        }
+    }
+
+    fn locked_dep(name: &str, instance: &str, git: &str) -> crate::lock::LockedSource {
+        crate::lock::LockedSource {
+            name: name.to_owned(),
+            git: git.to_owned(),
+            resolved: "main".to_owned(),
+            commit: "c0ffee".to_owned(),
+            digest: "blake3:artifact".to_owned(),
+            config_digest: "blake3:cfg".to_owned(),
+            r#ref: None,
+            instance: Some(instance.to_owned()),
+        }
+    }
+
+    #[test]
+    fn render_show_prints_utf8_file_contents() {
+        let backend = ShowBackend {
+            file: FileOutcome::Bytes(b"hello\nworld\n".to_vec()),
+            tree: TreeOutcome::Absent,
+        };
+
+        let lines = render_show(
+            &backend,
+            "mydeps",
+            "https://github.com/dep/mydeps.git",
+            COMMIT_A,
+            Path::new("README.md"),
+        )
+        .expect("a tracked UTF-8 file must render its contents");
+
+        let body = lines.join("\n");
+        assert!(
+            body.contains("hello") && body.contains("world"),
+            "the file's text must be printed verbatim, got: {body:?}"
+        );
+    }
+
+    #[test]
+    fn render_show_refuses_non_utf8_binary_content() {
+        let backend = ShowBackend {
+            file: FileOutcome::Bytes(vec![0xff, 0xfe, 0x00]),
+            tree: TreeOutcome::Absent,
+        };
+
+        let err = render_show(
+            &backend,
+            "mydeps",
+            "https://github.com/dep/mydeps.git",
+            COMMIT_A,
+            Path::new("logo.png"),
+        )
+        .expect_err("binary content must be refused, never dumped as raw bytes");
+
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("utf-8") || msg.contains("utf8") || msg.contains("binary"),
+            "the refusal must name the binary / non-UTF-8 reason, got: {msg:?}"
+        );
+        assert!(
+            !msg.contains('\u{0}'),
+            "the refusal must not leak the raw NUL byte of the content"
+        );
+    }
+
+    #[test]
+    fn render_show_errors_when_path_is_absent_at_commit() {
+        let backend = ShowBackend {
+            file: FileOutcome::Absent,
+            tree: TreeOutcome::Absent,
+        };
+
+        let err = render_show(
+            &backend,
+            "mydeps",
+            "https://github.com/dep/mydeps.git",
+            COMMIT_A,
+            Path::new("missing/thing.txt"),
+        )
+        .expect_err("a path absent at the commit must error, not print nothing");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing/thing.txt"),
+            "the not-found error must name the requested path, got: {msg:?}"
+        );
+        assert!(
+            msg.to_lowercase().contains("absent"),
+            "a genuinely-absent path must report absence, got: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn render_show_directs_to_sync_when_the_mirror_or_commit_is_missing() {
+        let backend = ShowBackend {
+            file: FileOutcome::MirrorError,
+            tree: TreeOutcome::MirrorError,
+        };
+
+        let err = render_show(
+            &backend,
+            "mydeps",
+            "https://github.com/dep/mydeps.git",
+            COMMIT_A,
+            Path::new("README.md"),
+        )
+        .expect_err("a missing mirror / commit must error, not pretend the path is absent");
+
+        let msg = err.to_string();
+        let lower = msg.to_lowercase();
+        assert!(
+            lower.contains("sync"),
+            "a commit not yet in the mirror must direct the user to run `phora sync`, got: {msg:?}"
+        );
+        assert!(
+            !lower.contains("absent"),
+            "a missing mirror / commit is not a genuinely-absent path and must not be reported as absent, got: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn render_show_lists_direct_directory_entries_ls_style() {
+        let backend = ShowBackend {
+            file: FileOutcome::NotRegular,
+            tree: TreeOutcome::Entries(vec![
+                TreeEntry {
+                    name: "a.txt".to_owned(),
+                    is_dir: false,
+                },
+                TreeEntry {
+                    name: "sub".to_owned(),
+                    is_dir: true,
+                },
+                TreeEntry {
+                    name: "weird name.txt".to_owned(),
+                    is_dir: false,
+                },
+            ]),
+        };
+
+        let lines = render_show(
+            &backend,
+            "mydeps",
+            "https://github.com/dep/mydeps.git",
+            COMMIT_A,
+            Path::new("d"),
+        )
+        .expect("a directory path must list its direct children");
+
+        let body = lines.join("\n");
+        let file_idx = lines
+            .iter()
+            .position(|l| l.contains("a.txt"))
+            .unwrap_or_else(|| panic!("the listing must include the file `a.txt`, got: {body:?}"));
+        let dir_idx = lines
+            .iter()
+            .position(|l| l.contains("sub"))
+            .unwrap_or_else(|| {
+                panic!("the listing must include the directory `sub`, got: {body:?}")
+            });
+        let file_line = &lines[file_idx];
+        let dir_line = &lines[dir_idx];
+        assert!(
+            dir_line.trim_end().ends_with('/'),
+            "an ls-style directory entry must be marked with a trailing slash, got: {dir_line:?}"
+        );
+        assert!(
+            !file_line.trim_end().ends_with('/'),
+            "a regular-file entry must NOT carry the directory slash, got: {file_line:?}"
+        );
+        assert!(
+            file_idx < dir_idx,
+            "the renderer must preserve the order `list_tree_at` returned (a.txt before sub), got: {body:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("weird name.txt")),
+            "the renderer must emit each returned entry verbatim, including names with spaces, got: {body:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_show_target_requires_a_source_name() {
+        let err = resolve_show_target(None, None)
+            .expect_err("`--show` without a source must error cleanly, mirroring `--revoke`");
+
+        assert!(
+            matches!(err, Error::Config(_)),
+            "the missing-source failure must be a clean Error::Config, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--show") && msg.contains("source"),
+            "the message must name `--show` and the missing source, got: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_show_target_prefers_the_candidate_commit_over_trusted() {
+        let lock = Lock {
+            candidate_hooks: vec![cand_commit("mydeps", "inst", COMMIT_A)],
+            trusted_hooks: vec![trusted_commit("mydeps", "inst", COMMIT_B)],
+            sources: vec![locked_dep(
+                "mydeps",
+                "inst",
+                "https://github.com/dep/mydeps.git",
+            )],
+            ..empty_lock()
+        };
+
+        let (_source, url, commit) = resolve_show_target(Some(&lock), Some("mydeps"))
+            .expect("a candidate commit must resolve a show target");
+
+        assert_eq!(
+            commit, COMMIT_A,
+            "the current candidate commit must win over the prior trusted commit"
+        );
+        assert_eq!(
+            url, "https://github.com/dep/mydeps.git",
+            "the remote URL must come from the LockedSource matching the candidate's dep_instance"
+        );
+    }
+
+    #[test]
+    fn resolve_show_target_with_no_commit_directs_to_sync() {
+        let lock = Lock {
+            candidate_hooks: vec![cand_commit("mydeps", "inst", "")],
+            trusted_hooks: Vec::new(),
+            sources: vec![locked_dep(
+                "mydeps",
+                "inst",
+                "https://github.com/dep/mydeps.git",
+            )],
+            ..empty_lock()
+        };
+
+        let err = resolve_show_target(Some(&lock), Some("mydeps"))
+            .expect_err("an empty/absent dep commit cannot be shown offline");
+
+        assert!(
+            err.to_string().contains("sync"),
+            "the user must be told to run `phora sync`, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_show_target_refuses_to_guess_between_distinct_commits() {
+        let lock = Lock {
+            candidate_hooks: vec![
+                cand_commit("mydeps", "inst", COMMIT_ONE),
+                cand_commit("mydeps", "inst", COMMIT_TWO),
+            ],
+            sources: vec![locked_dep(
+                "mydeps",
+                "inst",
+                "https://github.com/dep/mydeps.git",
+            )],
+            ..empty_lock()
+        };
+
+        let err = resolve_show_target(Some(&lock), Some("mydeps"))
+            .expect_err("two distinct dep commits for one source must not be silently picked");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&COMMIT_ONE[..12]) && msg.contains(&COMMIT_TWO[..12]),
+            "the error must list BOTH candidate commits so the user can disambiguate, got: {msg:?}"
         );
     }
 }
