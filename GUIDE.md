@@ -1,13 +1,13 @@
 # The phora guide
 
 This is the long-form companion to the [README](README.md). The README is the
-map — terse, every flag in one place. This guide is the walkthrough: it starts
-with a working setup, explains how phora works, and then goes under the hood
-into how phora actually stores, fetches, and verifies things. Read it top to
+reference — terse, every flag in one place. This guide is the walkthrough: it
+starts with a working setup, explains how phora works, and then goes under the
+hood into how phora actually stores, fetches, and verifies things. Read it top to
 bottom the first time; after that, jump to the section you need.
 
-If you just want the command, it's in the README. If you want to understand why
-phora did what it did — or what to do when it didn't — you're in the right place.
+If you just want the command, it's in the README. This guide is for understanding
+why phora did what it did — or what to do when it didn't.
 
 ## Contents
 
@@ -60,7 +60,7 @@ phora moves directory-shaped payloads from where they live (a git repo, or a URL
 into the places on disk that consume them — and keeps a record precise enough to
 detect, later, whether anything drifted.
 
-The vocabulary splits cleanly by who owns what. A *source* owns its *offer* — the
+The vocabulary splits by who owns what. A *source* owns its *offer* — the
 set of paths it publishes. A *target binding* owns its *take* — the subset of that
 offer it actually wants, possibly renamed. Nothing in between merges silently:
 
@@ -175,7 +175,7 @@ phora verify      # re-hash every deployed file against the record; exit 0 if al
 
 `phora verify` is what the record is for: the difference between "the files are
 there" and "the files are exactly what phora put there." It exits
-non-zero on the first mismatch, so it drops cleanly into a pre-commit hook or CI.
+non-zero on the first mismatch, so it fits into a pre-commit hook or CI check.
 
 Later, to pick up upstream changes:
 
@@ -184,8 +184,8 @@ phora update      # re-resolve sources to their latest commit, then sync
 ```
 
 `sync` honors the lock; `update` advances it. That distinction runs through the
-whole tool, and it is worth internalizing early: a plain `sync` is reproducible
-and offline-friendly, an `update` reaches for new commits.
+whole tool: a plain `sync` is reproducible and offline-friendly, an `update`
+reaches for new commits.
 
 ## Sources
 
@@ -235,7 +235,7 @@ A bare `path = "owner/repo"` (no `host`) is a *local* path, not a forge shorthan
 the github shorthand is the bare `repo = "owner/repo"`. A local source is what
 [link mode](#the-local-dev-loop-link-mode) live-links against.
 
-A useful property falls out of how the store is keyed: the literal and symbolic
+Because the store is keyed by a normalized remote, the literal and symbolic
 forms of one repo, and its https and ssh remotes, all share a single mirror.
 Switching between them never re-clones. (The [internals](#fetching-a-git-source)
 explain why.)
@@ -260,7 +260,7 @@ exactly like a git source. A few things are worth knowing up front:
   the file extension. Anything that is not a recognized archive becomes a single
   file, named from the URL's basename.
 - Auto-strip: if an archive has exactly one top-level directory — the
-  `fzf-0.55.0/` that release tarballs love — phora strips it, so a version bump
+  `fzf-0.55.0/` wrapper common in release tarballs — phora strips it, so a version bump
   doesn't reshuffle your paths or your lock.
 - No refs, no re-rooting: a URL source is a single imported snapshot, not a
   repository, so it has no history to point into and no subtree to descend into —
@@ -271,7 +271,7 @@ exactly like a git source. A few things are worth knowing up front:
   errors, naming the source and showing expected vs actual. The archive is not
   extracted until the digest check passes.
 - Determinism: identical bytes always import to the identical commit, so an
-  unchanged URL is a true no-op on the next sync, and a changed one advances the
+  unchanged URL is a no-op on the next sync, and a changed one advances the
   lock. The [internals](#why-a-url-import-is-deterministic) cover how.
 
 ### Which to reach for
@@ -439,8 +439,8 @@ anax  = { source = "dotfiles", take = [{ "anax/config.toml" = "config.toml" }] }
 
 One source, one mirror — but two bindings taking two slices into the same target,
 each renamed to a bare `config.toml` that would collide under `flat` and is kept
-apart by its identity. This is the headline thing per-binding `take` buys
-you: a target composes slices, not whole sources.
+apart by its identity. This is what per-binding `take` is for: a target composes
+slices, not whole sources.
 
 ### Per-target versions: one source, many refs
 
@@ -468,16 +468,16 @@ canary = { source = "fzf", tag = "v0.56.0" }
 The two bindings share one mirror and one fetch, but resolve to two different
 commits and project independently. Under the hood each distinct ref gets its own
 lock entry; bindings that don't override the ref collapse onto the source's ref and
-share a single entry, so a config that names no binding refs locks byte-for-byte as
-it did before this existed (see [the lock](#the-lock-and-content-identity)).
+share a single entry, so a config that names no binding refs produces a lock
+identical to one with no per-binding refs at all (see [the
+lock](#the-lock-and-content-identity)).
 
 ### Binding scope is rejected
 
-`root`, `include`, `exclude`, and `map` are *not* binding keys — they were, before
-the offer/take split, and setting any of them on a `[targets.<t>.sources]` entry is
-now a hard parse error with a did-you-mean redirect. `root`/`include`/`exclude`
-redirect to the source offer (`[sources.<name>]`); `map` redirects to the `take`
-rename form. This is pre-alpha — there is no migration shim, the error just points
+`root`, `include`, `exclude`, and `map` are *not* binding keys — setting any of
+them on a `[targets.<t>.sources]` entry is a hard parse error with a did-you-mean
+redirect. `root`/`include`/`exclude` redirect to the source offer
+(`[sources.<name>]`); `map` redirects to the `take` rename form. The error points
 you at the new home:
 
 ```
@@ -785,8 +785,7 @@ Two rules apply:
   absolute path syncs but prints a non-fatal warning naming the source; a committed
   link over a *relative* (portable) path warns nothing; and a link in
   `phora.local.toml` — where machine-specific checkouts belong — never warns. The
-  earlier hard rejection of committed link mode is gone: the warning nudges you
-  toward portability without blocking a deliberate choice.
+  warning nudges you toward portability without blocking a deliberate choice.
 
 One consequence to keep in mind: a linked artifact sits *outside* the integrity
 model. Its registry record carries a `linked` marker and no per-file hashes, so
@@ -962,11 +961,12 @@ post-processing was skipped. `phora sync --no-transitive-hooks` skips composed-d
 hooks entirely (your own hooks still run), and `phora trust tropos --revoke` drops
 every approval for a dependency.
 
-One honest limit: trust here is behavioral, not a sandbox. An approved hook runs as
-you, with your full privileges and phora's full process environment — phora pins
-*what* runs and re-prompts when it changes, but it does not confine *how* it runs.
-v1 ships no OS sandbox, no environment sanitization, and no signature or provenance
-check; the trust pin is whole-commit, so any change to a dependency's commit
+One limit worth stating plainly: trust here is behavioral, not a sandbox. An
+approved hook runs as you, with your full privileges and phora's full process
+environment — phora pins *what* runs and re-prompts when it changes, but it does
+not confine *how* it runs. There is no OS sandbox, no environment sanitization, and
+no signature or provenance check; the trust pin is whole-commit, so any change to a
+dependency's commit
 re-prompts every one of its hooks (the file-level diff narrows what you have to read,
 not what re-prompts). For a dependency you would not already trust to run code on
 your machine, vet it in an outer VM or container before you approve its hooks.
@@ -997,9 +997,9 @@ records that cannot be regenerated:
   `~/Library/Caches/phora` on macOS). The `MirrorKey` is the first 16 hex characters
   of `blake3` over a *normalized* form of the remote URL. Normalization strips a
   trailing `.git`, rewrites scp-style `git@host:owner/repo` to `host/owner/repo`,
-  drops the scheme and any userinfo, and lowercases the host. That is the trick
-  behind "https and ssh share a mirror": both normalize to the same string, so both
-  hash to the same key.
+  drops the scheme and any userinfo, and lowercases the host. Both forms normalize
+  to the same string and hash to the same key — which is why https and ssh share a
+  mirror.
 - Per-project state, under the state root (`XDG_STATE_HOME`, or by default
   `~/.local/state/phora` on Linux and `~/Library/Application Support/phora` on
   macOS), keyed by a `ProjectId` — the first 16 hex characters of `blake3` over the
@@ -1063,11 +1063,11 @@ ref into its own directory and reconcile them; phora just reads two trees out of
 same packed store. The cost of holding ten versions side by side is ten commit ids
 and whatever blobs actually differ between them.
 
-The same property underwrites the rest of "Under the hood." A URL import being a
+The same property runs through the rest of "Under the hood." A URL import being a
 synthetic commit, projection touching only taken paths, the slice digest being a
 hash over a tree walk, reflink placement out of staging — all of it assumes the
-source lives as objects, not as files. The object store is not an implementation
-detail behind the model; it is the model.
+source lives as objects, not as files. The object store isn't hidden behind the
+model — it is the substrate the model rests on.
 
 ### Fetching a git source
 
@@ -1147,8 +1147,9 @@ selected files into a staging directory, computing a single `blake3` digest over
 the artifact as it goes — framing each entry (its relative path length and bytes, a
 type tag for file/executable/symlink, and its content length and bytes) into the
 hash. The framing matters: without length-prefixing, two different tree shapes
-could collide by smearing a path into the next file's content. With it, the digest
-is a faithful fingerprint of the projected tree.
+could hash the same if a path's bytes ran into the next entry's content with no
+boundary between them. With it, the digest is a faithful fingerprint of the
+projected tree.
 
 Moving the staged artifact into the target is an atomic directory swap: phora
 journals its intent, renames staging into place, then records the result, so a
@@ -1178,8 +1179,8 @@ with `take`, they all share the single entry at the source's own ref.
 A ref-overriding binding is the one thing that splits it — each distinct
 `branch`/`tag`/`rev` resolves to its own commit and records its own entry. Each entry
 carries an optional ref discriminator that is *present only on an override* and absent
-on the default, so a config that names no binding refs serializes byte-for-byte as it
-did before per-target versions existed.
+on the default, so a config that names no binding refs serializes byte-for-byte
+identical to one with no binding ref entries at all.
 
 Each locked entry records its name, the remote (or URL), a resolved field, the commit,
 the artifact digest, and a config digest. That last one — a `blake3` over the
@@ -1222,7 +1223,7 @@ does not move.
 [Templating](#templating-per-machine-values) renders `*.tmpl` files at stage time —
 in the staging directory, before the atomic swap — so the artifact materialized into
 the target is already the rendered output. Two digests then part ways, and the split
-is the whole trick:
+is what matters:
 
 - The *manifest* hashes the *rendered* bytes. That is what `phora verify` and drift
   detection compare against, so they check the file you actually deployed.
@@ -1316,9 +1317,9 @@ serially behind a lock. phora fetches, resolves, and digests its sources across 
 rayon thread pool — sized to one thread per resolution unit, capped at twice the
 core count (from `available_parallelism`, fallback 8) and overridable with `phora
 sync --jobs N` / `-j N` — then deploys the results one at a time. The parallelism is
-purely a throughput win — the deploy loop and the recorded state are byte-identical
-to the old serial path, so nothing about a lock or a registry record depends on how
-many threads ran.
+purely a throughput win — the deploy loop and the recorded state are identical
+however many threads ran, so nothing about a lock or a registry record depends on
+the thread count.
 
 Fetch is network-bound — resolving a source is mostly I/O wait — so overlapping
 those waits across the pool is the available throughput win. The concurrency phora
@@ -1345,7 +1346,7 @@ takes seriously is mutual exclusion and crash safety:
   operation in a deploy journal. If a run is interrupted — a crash, a Ctrl-C, a
   killed terminal — the next run's recovery sweep reads the journal and cleans up
   the partial state before doing anything else. This is why an interrupted sync
-  leaves you recoverable rather than half-deployed.
+  leaves the state recoverable rather than half-deployed.
 - Interrupt-aware fetches. The git network operations check an interrupt flag, so
   cancelling mid-fetch unwinds without leaving a broken mirror.
 
@@ -1405,8 +1406,8 @@ diff (last trusted commit → candidate commit) is computed from. Because trust 
 on the preimage, any change to the command — or to the dependency commit it rode in
 on — invalidates the match, and the hook reverts to a stripped candidate until you
 re-approve. The lock keeps `trusted_hooks` and `candidate_hooks` skip-serialized when
-empty, so a config with no transitive hooks serializes byte-for-byte as it did before
-any of this existed. Under `--frozen`, the resolver consults the lock and refuses to
+empty, so a config with no transitive hooks serializes byte-for-byte identical to one
+with no transitive hooks at all. Under `--frozen`, the resolver consults the lock and refuses to
 fetch, erroring on the first source — at any depth — that is not already pinned.
 
 ### Integrity boundaries
