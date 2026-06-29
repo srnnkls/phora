@@ -132,11 +132,25 @@ pub enum HookWhen {
     Always,
 }
 
+/// Disposition when a target's `pre_deploy` gate fails: `abort` halts the whole sync, `skip`
+/// skips only that target's deploy and continues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PreDeployOnFail {
+    #[default]
+    Abort,
+    Skip,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TargetHooks {
     #[serde(default, deserialize_with = "deserialize_commands")]
     pub on_change: Option<Vec<HookCommand>>,
+    #[serde(default, deserialize_with = "deserialize_commands")]
+    pub pre_deploy: Option<Vec<HookCommand>>,
+    #[serde(default)]
+    pub pre_deploy_on_fail: PreDeployOnFail,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -576,6 +590,140 @@ mod tests {
             "HOOK-PRESYNC-001: `pre_sync = \"\"` must be rejected through the same validated \
              command deserializer as `post_sync` (an emptiness error), not the generic \
              unknown-field rejection; got: {err}"
+        );
+    }
+
+    // HOOK-PREDEPLOY-001: the per-target `[targets.X.hooks]` table accepts a `pre_deploy`
+    // field in every surface form `on_change` accepts, plus a `pre_deploy_on_fail` enum
+    // (default abort). Today `TargetHooks` carries `deny_unknown_fields` with neither key,
+    // so each of these is rejected as an unknown field.
+
+    #[test]
+    fn target_hooks_accepts_pre_deploy_string() {
+        toml::from_str::<TargetHooks>("pre_deploy = \"gate\"").expect(
+            "HOOK-PREDEPLOY-001: `[targets.X.hooks]` must accept a bare-string `pre_deploy` hook; \
+             today deny_unknown_fields rejects the `pre_deploy` key",
+        );
+    }
+
+    #[test]
+    fn target_hooks_accepts_pre_deploy_run_shell_table() {
+        let custom_shell =
+            toml::from_str::<TargetHooks>("pre_deploy = { run = \"gate\", shell = \"bash -c\" }")
+                .expect(
+                    "HOOK-PREDEPLOY-001: `pre_deploy` must accept the `{ run, shell }` table form \
+                     like `on_change` does",
+                );
+        let default_shell = toml::from_str::<TargetHooks>("pre_deploy = \"gate\"")
+            .expect("a bare-string `pre_deploy` parses with the default shell");
+        assert_ne!(
+            custom_shell, default_shell,
+            "HOOK-PREDEPLOY-001: a custom `shell = \"bash -c\"` must SURVIVE parsing — the \
+             `{{ run, shell }}` table must parse to a DIFFERENT value than the same `run` with the \
+             default shell; an impl that accepts the table but drops the custom `shell` would pass \
+             the bare parse yet fail this"
+        );
+    }
+
+    #[test]
+    fn target_hooks_accepts_pre_deploy_array() {
+        let two = toml::from_str::<TargetHooks>("pre_deploy = [\"first\", \"second\"]").expect(
+            "HOOK-PREDEPLOY-001: `pre_deploy` must accept an array of commands like `on_change` does",
+        );
+        let one = toml::from_str::<TargetHooks>("pre_deploy = [\"first\"]")
+            .expect("a single-entry pre_deploy array parses");
+        assert_ne!(
+            two, one,
+            "HOOK-PREDEPLOY-001: a two-command `pre_deploy` array must parse to a DIFFERENT value \
+             than a one-command array — a stub dropping array entries would fail this"
+        );
+    }
+
+    #[test]
+    fn target_hooks_accepts_pre_deploy_cmd_exec_table() {
+        let exec = toml::from_str::<TargetHooks>("pre_deploy = { cmd = [\"echo\", \"hi\"] }")
+            .expect(
+                "HOOK-PREDEPLOY-001: `pre_deploy` must accept the shell-free `{ cmd = [...] }` exec \
+                 form like `on_change` does",
+            );
+        let shell = toml::from_str::<TargetHooks>("pre_deploy = \"echo hi\"")
+            .expect("a shell-form pre_deploy parses");
+        assert_ne!(
+            exec, shell,
+            "HOOK-PREDEPLOY-001: the `{{ cmd = [...] }}` exec form must parse to a DIFFERENT \
+             command than the shell-string form — a stub coercing every form to Shell would fail \
+             this"
+        );
+    }
+
+    #[test]
+    fn empty_pre_deploy_command_is_rejected_naming_emptiness() {
+        let err = toml::from_str::<TargetHooks>("pre_deploy = \"\"")
+            .expect_err("an empty `pre_deploy` command must be rejected");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("empty"),
+            "HOOK-PREDEPLOY-001: `pre_deploy = \"\"` must be rejected through the same validated \
+             command deserializer as `on_change` (an emptiness error), not the generic \
+             unknown-field rejection; got: {err}"
+        );
+    }
+
+    #[test]
+    fn pre_deploy_on_fail_abort_and_skip_parse_to_distinct_values() {
+        let abort = toml::from_str::<TargetHooks>(
+            "pre_deploy = \"gate\"\npre_deploy_on_fail = \"abort\"",
+        )
+        .expect(
+            "HOOK-PREDEPLOY-001: `pre_deploy_on_fail = \"abort\"` must parse; today the key \
+                     is rejected by deny_unknown_fields",
+        );
+        let skip =
+            toml::from_str::<TargetHooks>("pre_deploy = \"gate\"\npre_deploy_on_fail = \"skip\"")
+                .expect(
+                    "HOOK-PREDEPLOY-001: `pre_deploy_on_fail = \"skip\"` must parse; today the key \
+                     is rejected by deny_unknown_fields",
+                );
+        assert_ne!(
+            abort, skip,
+            "HOOK-PREDEPLOY-001: `abort` and `skip` must parse to DIFFERENT on-fail values — a stub \
+             that ignores the field (parsing both identically) would fail this"
+        );
+    }
+
+    #[test]
+    fn omitting_pre_deploy_on_fail_defaults_to_abort() {
+        let defaulted = toml::from_str::<TargetHooks>("pre_deploy = \"gate\"").expect(
+            "HOOK-PREDEPLOY-001: a `pre_deploy` hook with no `pre_deploy_on_fail` must parse",
+        );
+        let explicit_abort =
+            toml::from_str::<TargetHooks>("pre_deploy = \"gate\"\npre_deploy_on_fail = \"abort\"")
+                .expect("explicit abort must parse");
+        let explicit_skip =
+            toml::from_str::<TargetHooks>("pre_deploy = \"gate\"\npre_deploy_on_fail = \"skip\"")
+                .expect("explicit skip must parse");
+        assert_eq!(
+            defaulted, explicit_abort,
+            "HOOK-PREDEPLOY-001: omitting `pre_deploy_on_fail` must default to `abort` — the \
+             defaulted value must equal the explicit `abort` value"
+        );
+        assert_ne!(
+            defaulted, explicit_skip,
+            "HOOK-PREDEPLOY-001: the default must NOT be `skip` — abort is the documented default"
+        );
+    }
+
+    #[test]
+    fn invalid_pre_deploy_on_fail_is_rejected_naming_valid_variants() {
+        let err =
+            toml::from_str::<TargetHooks>("pre_deploy = \"gate\"\npre_deploy_on_fail = \"bogus\"")
+                .expect_err("an unknown `pre_deploy_on_fail` value must be rejected");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("abort") || msg.contains("skip") || msg.contains("variant"),
+            "HOOK-PREDEPLOY-001: an invalid `pre_deploy_on_fail` value must fail with an \
+             unknown-variant error naming the valid `abort`/`skip` choices, not the generic \
+             `unknown field` rejection; got: {err}"
         );
     }
 

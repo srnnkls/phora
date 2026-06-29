@@ -48,7 +48,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::config::{Config, DeployMode, ParsedSource, Protocol, SourceMode, merge_configs};
+use crate::config::{
+    Config, DeployMode, ParsedSource, PreDeployOnFail, Protocol, SourceMode, merge_configs,
+};
 use crate::deploy::{Journal, recovery_sweep};
 use crate::error::{Error, Result};
 use crate::lock::{Lock, merge_locks, split_locks};
@@ -269,10 +271,47 @@ struct DeployAll<'a> {
     journal: &'a Journal,
 }
 
-fn deploy_all_targets(ctx: &DeployAll<'_>) -> Result<bool> {
-    let mut had_failures = false;
+/// Outcome of the per-target deploy loop. `aborted` means a `pre_deploy` gate with the default
+/// `abort` fired and short-circuited the loop (later targets unprocessed); `had_failures`
+/// folds in skip-induced failures so it can suppress `--prune`.
+struct DeployRun {
+    had_failures: bool,
+    pre_deploy: Vec<hooks::HookOutcome>,
+    aborted: bool,
+}
+
+fn deploy_all_targets(ctx: &DeployAll<'_>) -> Result<DeployRun> {
+    let mut run = DeployRun {
+        had_failures: false,
+        pre_deploy: Vec::new(),
+        aborted: false,
+    };
     for (target_name, target) in &ctx.config.targets {
-        had_failures |= deploy_target(
+        if !ctx.input.no_hooks
+            && let Some(hooks) = &target.hooks
+            && hooks.pre_deploy.is_some()
+        {
+            let outcomes = hooks::dispatch_pre_deploy(hooks, target_name, &target.expanded_path())?;
+            let failed = outcomes
+                .iter()
+                .any(|o| o.status == hooks::HookStatus::Failure);
+            run.pre_deploy.extend(outcomes);
+            if failed {
+                match hooks.pre_deploy_on_fail {
+                    // abort halts the whole sync: break before this target deploys.
+                    PreDeployOnFail::Abort => {
+                        run.aborted = true;
+                        break;
+                    }
+                    // skip drops only this target's deploy but marks had_failures (suppresses prune).
+                    PreDeployOnFail::Skip => {
+                        run.had_failures = true;
+                        continue;
+                    }
+                }
+            }
+        }
+        run.had_failures |= deploy_target(
             TargetRun {
                 parsed: ctx.parsed,
                 target_name,
@@ -290,7 +329,7 @@ fn deploy_all_targets(ctx: &DeployAll<'_>) -> Result<bool> {
             ctx.journal,
         )?;
     }
-    Ok(had_failures)
+    Ok(run)
 }
 
 fn maybe_prune(ctx: &DeployAll<'_>, had_failures: bool) -> Result<()> {
@@ -406,7 +445,7 @@ pub fn sync(
         .iter()
         .any(|o| o.status == hooks::HookStatus::Failure)
     {
-        return Ok(aborted_at_pre_sync(
+        return Ok(aborted_before_deploy_phase(
             base_lock,
             local_lock,
             pre_sync_outcomes,
@@ -424,17 +463,47 @@ pub fn sync(
         registry,
         journal: &journal,
     };
-    let mut had_failures = deploy_all_targets(&deploy)?;
-    maybe_prune(&deploy, had_failures)?;
-
-    let (hook_results, stripped_transitive_hooks) = run_all_hooks(
-        input,
-        &effective_config,
-        registry,
-        &mut base_lock,
+    deploy_and_run_hooks(
+        &deploy,
+        base_lock,
+        local_lock,
         &hook_candidates,
         effective_lock.as_ref(),
         pre_sync_outcomes,
+    )
+}
+
+fn deploy_and_run_hooks(
+    deploy: &DeployAll<'_>,
+    mut base_lock: Lock,
+    local_lock: Option<Lock>,
+    hook_candidates: &[transitive::TransitiveHookCandidate],
+    effective_lock: Option<&Lock>,
+    pre_sync_outcomes: Vec<hooks::HookOutcome>,
+) -> Result<SyncOutput> {
+    let run = deploy_all_targets(deploy)?;
+    // pre_deploy renders after pre_sync, before post_sync/on_change.
+    let mut early_hooks = pre_sync_outcomes;
+    early_hooks.extend(run.pre_deploy);
+    if run.aborted {
+        // An abort gate short-circuits like pre_sync: no prune, no further hook phases.
+        return Ok(aborted_before_deploy_phase(
+            base_lock,
+            local_lock,
+            early_hooks,
+        ));
+    }
+    let mut had_failures = run.had_failures;
+    maybe_prune(deploy, had_failures)?;
+
+    let (hook_results, stripped_transitive_hooks) = run_all_hooks(
+        deploy.input,
+        deploy.config,
+        deploy.registry,
+        &mut base_lock,
+        hook_candidates,
+        effective_lock,
+        early_hooks,
     )?;
     let deploy_failures = had_failures;
     had_failures |= hook_results
@@ -451,7 +520,10 @@ pub fn sync(
     })
 }
 
-fn aborted_at_pre_sync(
+/// Short-circuit shared by a failed `pre_sync` gate and a `pre_deploy` abort: files already
+/// deployed stay, but no prune and no post-deploy hook phase run. `deploy_failures` is false
+/// because a gate failure is a hook failure, not a per-artifact deploy failure.
+fn aborted_before_deploy_phase(
     base_lock: Lock,
     local_lock: Option<Lock>,
     hook_results: Vec<hooks::HookOutcome>,
@@ -486,10 +558,10 @@ fn run_all_hooks(
     base_lock: &mut Lock,
     hook_candidates: &[transitive::TransitiveHookCandidate],
     effective_lock: Option<&Lock>,
-    pre_sync: Vec<hooks::HookOutcome>,
+    early_hooks: Vec<hooks::HookOutcome>,
 ) -> Result<(Vec<hooks::HookOutcome>, usize)> {
-    // pre_sync renders before post_sync/on_change, so it seeds the result vec.
-    let mut hook_results = pre_sync;
+    // pre_sync + pre_deploy render before post_sync/on_change, so they seed the result vec.
+    let mut hook_results = early_hooks;
     if !input.no_hooks {
         hook_results.append(&mut hooks::dispatch_hooks(config, registry)?);
     }

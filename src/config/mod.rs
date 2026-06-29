@@ -23,8 +23,8 @@ pub use crate::source::Protocol;
 
 pub(crate) use hooks::DEFAULT_SHELL_PREFIX;
 pub use hooks::{
-    CandidateHook, GlobalHooks, HookCommand, HookWhen, TargetHooks, admit_transitive_hooks,
-    hook_preimage,
+    CandidateHook, GlobalHooks, HookCommand, HookWhen, PreDeployOnFail, TargetHooks,
+    admit_transitive_hooks, hook_preimage,
 };
 pub use host::{AuthConfig, Host, RemoteConfig, builtin_forges};
 pub use migrate::MigrationWarning;

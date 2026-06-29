@@ -11,6 +11,7 @@ use crate::store::{Registry, RegistryRecord};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookScope {
     PreSync,
+    PreDeploy,
     OnChange,
     PostSync,
 }
@@ -121,6 +122,38 @@ pub(super) fn dispatch_pre_sync(config: &Config, target_names: &str) -> Result<V
             hook_id: format!("pre_sync#{body}#{suffix}"),
             command: hook.display(),
             scope: HookScope::PreSync,
+            status,
+        });
+    }
+    Ok(outcomes)
+}
+
+/// Runs every `pre_deploy` hook for one target with `PHORA_TARGET`/`PHORA_TARGET_PATH`.
+/// Ids are per-target so two targets sharing a command get distinct outcomes.
+///
+/// # Errors
+///
+/// Returns an error if a hook process fails to spawn.
+pub(super) fn dispatch_pre_deploy(
+    hooks: &crate::config::TargetHooks,
+    target_name: &str,
+    target_path: &std::path::Path,
+) -> Result<Vec<HookOutcome>> {
+    let Some(pre_deploy) = hooks.pre_deploy.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let path = target_path.to_string_lossy();
+    let mut outcomes = Vec::new();
+    for hook in dedupe(pre_deploy) {
+        let status = run_hook(
+            hook,
+            &[("PHORA_TARGET", target_name), ("PHORA_TARGET_PATH", &path)],
+        )?;
+        let (body, suffix) = hook_key(hook);
+        outcomes.push(HookOutcome {
+            hook_id: format!("{target_name}#pre_deploy#{body}#{suffix}"),
+            command: hook.display(),
+            scope: HookScope::PreDeploy,
             status,
         });
     }
