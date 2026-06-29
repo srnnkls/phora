@@ -128,6 +128,31 @@ EOF
 	rm -f "$PWD/phora.toml.bak"
 }
 
+# Exec (shell-free) on_change hook; the argv `$HOME` token must reach the file verbatim — a shell would expand it. Two identical entries also exercise enum-aware dedupe.
+seed_config_exec_hook() {
+	url="$1"
+	target="$PWD/target-home"
+	mkdir -p "$target"
+	cat >"$PWD/phora.toml" <<'EOF'
+version = 1
+
+[sources.dotfiles]
+path = "__URL__"
+branch = "main"
+include = ["editor"]
+
+[targets.home]
+path = "__TARGET__"
+sources = ["dotfiles"]
+layout = "flat"
+
+[targets.home.hooks]
+on_change = [{ cmd = ["touch", "exec_ran_$HOME"] }, { cmd = ["touch", "exec_ran_$HOME"] }]
+EOF
+	sed -i.bak -e "s#__URL__#$url#" -e "s#__TARGET__#$target#" "$PWD/phora.toml"
+	rm -f "$PWD/phora.toml.bak"
+}
+
 # on_change hook that succeeds only once $HOME/allow exists: lets a scenario fail
 # a hook, then fix the cause and prove it re-fires.
 seed_config_failing_hook() {

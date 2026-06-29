@@ -53,11 +53,8 @@ pub(super) fn dispatch_hooks(config: &Config, registry: &dyn Registry) -> Result
         let target_path = target.expanded_path();
 
         for hook in dedupe(on_change) {
-            let id = format!(
-                "{target_name}#{}#{}",
-                hook.run,
-                hook.shell.as_deref().unwrap_or(DEFAULT_SHELL_PREFIX)
-            );
+            let (body, suffix) = hook_key(hook);
+            let id = format!("{target_name}#{body}#{suffix}");
             let recorded = recorded_set(registry, target_name, &id)?;
             let changed = changed_records(&records, &recorded);
             if changed.is_empty() {
@@ -79,7 +76,7 @@ pub(super) fn dispatch_hooks(config: &Config, registry: &dyn Registry) -> Result
             }
             outcomes.push(HookOutcome {
                 hook_id: id,
-                command: hook.run.clone(),
+                command: hook.display(),
                 scope: HookScope::OnChange,
                 status,
             });
@@ -92,13 +89,10 @@ pub(super) fn dispatch_hooks(config: &Config, registry: &dyn Registry) -> Result
     {
         for hook in dedupe(post_sync) {
             let status = run_hook(hook, &[])?;
+            let (body, suffix) = hook_key(hook);
             outcomes.push(HookOutcome {
-                hook_id: format!(
-                    "post_sync#{}#{}",
-                    hook.run,
-                    hook.shell.as_deref().unwrap_or(DEFAULT_SHELL_PREFIX)
-                ),
-                command: hook.run.clone(),
+                hook_id: format!("post_sync#{body}#{suffix}"),
+                command: hook.display(),
                 scope: HookScope::PostSync,
                 status,
             });
@@ -150,7 +144,8 @@ impl TrustPrompt for TtyTrustPrompt {
     fn confirm(&self, candidate: &TransitiveHookRun<'_>) -> bool {
         prompt_yes_on_stdin(&format!(
             "phora: composed dep `{}` wants to run on_change hook `{}` — trust it? [y/N] ",
-            candidate.dep_instance, candidate.command.run
+            candidate.dep_instance,
+            candidate.command.display()
         ))
     }
 }
@@ -204,7 +199,7 @@ pub(super) fn dispatch_transitive_hooks(
         )?;
         outcomes.push(HookOutcome {
             hook_id: candidate.hook_id.to_owned(),
-            command: candidate.command.run.clone(),
+            command: candidate.command.display(),
             scope: HookScope::OnChange,
             status,
         });
@@ -212,11 +207,35 @@ pub(super) fn dispatch_transitive_hooks(
     Ok((outcomes, approvals))
 }
 
+fn hook_key(hook: &HookCommand) -> (String, String) {
+    match hook {
+        HookCommand::Shell { run, shell } => (
+            run.clone(),
+            shell.as_deref().unwrap_or(DEFAULT_SHELL_PREFIX).to_owned(),
+        ),
+        HookCommand::Exec { cmd } => (cmd.join(" "), "exec".to_owned()),
+    }
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum DedupeKey<'a> {
+    Shell(&'a str, &'a str),
+    Exec(&'a [String]),
+}
+
 fn dedupe(commands: &[HookCommand]) -> Vec<&HookCommand> {
     let mut seen = BTreeSet::new();
     commands
         .iter()
-        .filter(|cmd| seen.insert((cmd.run.as_str(), cmd.shell.as_deref())))
+        .filter(|cmd| {
+            let key = match cmd {
+                HookCommand::Shell { run, shell } => {
+                    DedupeKey::Shell(run, shell.as_deref().unwrap_or(DEFAULT_SHELL_PREFIX))
+                }
+                HookCommand::Exec { cmd } => DedupeKey::Exec(cmd),
+            };
+            seen.insert(key)
+        })
         .collect()
 }
 
@@ -269,21 +288,33 @@ fn changed_paths(
 ///
 /// Returns an error if the hook shell is empty or the process fails to spawn.
 fn run_hook(hook: &HookCommand, env: &[(&str, &str)]) -> Result<HookStatus> {
-    let shell = hook.shell.as_deref().unwrap_or(DEFAULT_SHELL_PREFIX);
-    let mut parts = shell.split_whitespace();
-    let program = parts
-        .next()
-        .ok_or_else(|| Error::Sync(format!("hook shell `{shell}` is empty")))?;
-
-    let mut command = Command::new(program);
-    command.args(parts).arg(&hook.run);
+    let mut command = match hook {
+        HookCommand::Shell { run, shell } => {
+            let shell = shell.as_deref().unwrap_or(DEFAULT_SHELL_PREFIX);
+            let mut parts = shell.split_whitespace();
+            let program = parts
+                .next()
+                .ok_or_else(|| Error::Sync(format!("hook shell `{shell}` is empty")))?;
+            let mut command = Command::new(program);
+            command.args(parts).arg(run);
+            command
+        }
+        HookCommand::Exec { cmd } => {
+            let (program, args) = cmd
+                .split_first()
+                .ok_or_else(|| Error::Sync("hook command `cmd` must not be empty".to_owned()))?;
+            let mut command = Command::new(program);
+            command.args(args);
+            command
+        }
+    };
     for (key, value) in env {
         command.env(key, value);
     }
 
     let status = command
         .status()
-        .map_err(|e| Error::Sync(format!("failed to run hook `{}`: {e}", hook.run)))?;
+        .map_err(|e| Error::Sync(format!("failed to run hook `{}`: {e}", hook.display())))?;
     Ok(if status.success() {
         HookStatus::Success
     } else {
@@ -321,7 +352,7 @@ mod transitive_trust_tests {
     }
 
     fn noop_hook() -> HookCommand {
-        HookCommand {
+        HookCommand::Shell {
             run: "true".to_owned(),
             shell: Some("sh -c".to_owned()),
         }

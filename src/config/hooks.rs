@@ -6,6 +6,11 @@ use crate::config::transitive::Instance;
 
 pub(crate) const DEFAULT_SHELL_PREFIX: &str = "sh -c";
 
+/// Keyed blake3 is cryptographically independent of the unkeyed `Shell` hash, so an Exec
+/// hook can never share a preimage or discriminator with a Shell hook — a swap re-prompts.
+const EXEC_PREIMAGE_CONTEXT: &str = "phora hook exec preimage v1";
+const EXEC_DISCRIMINATOR_CONTEXT: &str = "phora hook exec discriminator v1";
+
 /// An interpreted transitive `on_change` hook awaiting the trust decision; trust is
 /// consumer-owned, so a candidate carries no approval state — a dep can never self-approve.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,32 +67,62 @@ pub fn admit_transitive_hooks(
 /// the export set still re-prompts.
 #[must_use]
 pub fn hook_preimage(command: &HookCommand, kind: &str, commit_sha: &str) -> String {
-    let shell = command.shell.as_deref().unwrap_or(DEFAULT_SHELL_PREFIX);
-    let mut hasher = blake3::Hasher::new();
-    for field in [command.run.as_str(), shell, kind, commit_sha] {
-        hasher.update(&(field.len() as u64).to_le_bytes());
-        hasher.update(field.as_bytes());
-    }
-    format!("blake3:{}", hasher.finalize().to_hex())
+    let digest = match command {
+        HookCommand::Shell { run, shell } => {
+            let shell = shell.as_deref().unwrap_or(DEFAULT_SHELL_PREFIX);
+            frame(
+                blake3::Hasher::new(),
+                [run.as_str(), shell, kind, commit_sha],
+            )
+        }
+        HookCommand::Exec { cmd } => frame(
+            blake3::Hasher::new_derive_key(EXEC_PREIMAGE_CONTEXT),
+            cmd.iter().map(String::as_str).chain([kind, commit_sha]),
+        ),
+    };
+    format!("blake3:{digest}")
 }
 
 /// Length-framed so an injected `#` cannot forge a trust key by colliding two distinct commands.
 fn command_discriminator(command: &HookCommand) -> String {
-    let shell = command.shell.as_deref().unwrap_or(DEFAULT_SHELL_PREFIX);
-    let mut hasher = blake3::Hasher::new();
-    for field in [command.run.as_str(), shell] {
+    let digest = match command {
+        HookCommand::Shell { run, shell } => {
+            let shell = shell.as_deref().unwrap_or(DEFAULT_SHELL_PREFIX);
+            frame(blake3::Hasher::new(), [run.as_str(), shell])
+        }
+        HookCommand::Exec { cmd } => frame(
+            blake3::Hasher::new_derive_key(EXEC_DISCRIMINATOR_CONTEXT),
+            cmd.iter().map(String::as_str),
+        ),
+    };
+    digest[..16].to_owned()
+}
+
+fn frame<'a>(mut hasher: blake3::Hasher, fields: impl IntoIterator<Item = &'a str>) -> String {
+    for field in fields {
         hasher.update(&(field.len() as u64).to_le_bytes());
         hasher.update(field.as_bytes());
     }
-    hasher.finalize().to_hex()[..16].to_owned()
+    hasher.finalize().to_hex().to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HookCommand {
-    pub run: String,
-    /// Defaults to `sh -c`. Split on whitespace at dispatch, so an interpreter
+pub enum HookCommand {
+    /// `shell` defaults to `sh -c`. Split on whitespace at dispatch, so an interpreter
     /// path containing spaces is unsupported.
-    pub shell: Option<String>,
+    Shell { run: String, shell: Option<String> },
+    /// Shell-free argv: spawned directly, no shell, no `$VAR` expansion. Non-empty.
+    Exec { cmd: Vec<String> },
+}
+
+impl HookCommand {
+    #[must_use]
+    pub fn display(&self) -> String {
+        match self {
+            HookCommand::Shell { run, .. } => run.clone(),
+            HookCommand::Exec { cmd } => cmd.join(" "),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -116,8 +151,9 @@ pub struct GlobalHooks {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HookTable {
-    run: String,
+    run: Option<String>,
     shell: Option<String>,
+    cmd: Option<Vec<String>>,
 }
 
 impl<'de> Deserialize<'de> for HookCommand {
@@ -131,14 +167,19 @@ impl<'de> Deserialize<'de> for HookCommand {
             type Value = HookCommand;
 
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a command string or a `{ run, shell }` table")
+                f.write_str(
+                    "a command string, a `{ run, shell }` table, or a `{ cmd = [...] }` table",
+                )
             }
 
             fn visit_str<E: serde::de::Error>(
                 self,
                 v: &str,
             ) -> std::result::Result<Self::Value, E> {
-                validated_command(v.to_owned(), None)
+                Ok(HookCommand::Shell {
+                    run: validated_run(v.to_owned(), None)?,
+                    shell: None,
+                })
             }
 
             fn visit_map<A: serde::de::MapAccess<'de>>(
@@ -147,7 +188,7 @@ impl<'de> Deserialize<'de> for HookCommand {
             ) -> std::result::Result<Self::Value, A::Error> {
                 let table =
                     HookTable::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
-                validated_command(table.run, table.shell)
+                validated_command(table.run, table.shell, table.cmd)
             }
         }
 
@@ -156,18 +197,43 @@ impl<'de> Deserialize<'de> for HookCommand {
 }
 
 fn validated_command<E: serde::de::Error>(
-    run: String,
+    run: Option<String>,
     shell: Option<String>,
+    cmd: Option<Vec<String>>,
 ) -> std::result::Result<HookCommand, E> {
+    match (run, cmd) {
+        (Some(_), Some(_)) => Err(E::custom(
+            "hook command must set either `run` (shell) or `cmd` (exec), not both",
+        )),
+        (None, None) => Err(E::custom(
+            "hook command must set `run` (shell) or `cmd` (exec)",
+        )),
+        (Some(run), None) => Ok(HookCommand::Shell {
+            run: validated_run(run, shell.as_deref())?,
+            shell,
+        }),
+        (None, Some(cmd)) => {
+            if cmd.is_empty() {
+                return Err(E::custom("hook command `cmd` must not be empty"));
+            }
+            Ok(HookCommand::Exec { cmd })
+        }
+    }
+}
+
+fn validated_run<E: serde::de::Error>(
+    run: String,
+    shell: Option<&str>,
+) -> std::result::Result<String, E> {
     if run.trim().is_empty() {
         return Err(E::custom("hook command `run` must not be empty"));
     }
-    if let Some(shell) = &shell
+    if let Some(shell) = shell
         && shell.trim().is_empty()
     {
         return Err(E::custom("hook command `shell` must not be empty"));
     }
-    Ok(HookCommand { run, shell })
+    Ok(run)
 }
 
 fn deserialize_commands<'de, D>(
@@ -186,7 +252,10 @@ where
         }
 
         fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
-            Ok(vec![validated_command(v.to_owned(), None)?])
+            Ok(vec![HookCommand::Shell {
+                run: validated_run(v.to_owned(), None)?,
+                shell: None,
+            }])
         }
 
         fn visit_map<A: serde::de::MapAccess<'de>>(
@@ -218,7 +287,7 @@ mod tests {
     use crate::config::transitive::{FetchNode, Instance};
 
     fn cmd(run: &str, shell: Option<&str>) -> HookCommand {
-        HookCommand {
+        HookCommand::Shell {
             run: run.to_owned(),
             shell: shell.map(str::to_owned),
         }
@@ -327,6 +396,134 @@ mod tests {
         assert!(
             diagnostics.iter().any(|d| d.contains("editor")),
             "the parse-failure diagnostic must name the offending dep target `editor`, got: {diagnostics:?}"
+        );
+    }
+
+    // HOOK-EXEC-001: shell-free argv form `{ cmd = [...] }` deserialization + validation.
+
+    #[test]
+    fn cmd_table_parses_as_an_exec_hook() {
+        let parsed = toml::from_str::<TargetHooks>("on_change = { cmd = [\"echo\", \"hi\"] }");
+        let hooks = parsed.expect(
+            "HOOK-EXEC-001: a `{ cmd = [...] }` table must deserialize into the Exec variant; today \
+             deny_unknown_fields on HookTable rejects `cmd` before any branching",
+        );
+        let commands = hooks
+            .on_change
+            .expect("a parsed `on_change` cmd table must yield a command list");
+        assert_eq!(
+            commands.len(),
+            1,
+            "a single `{{ cmd = [...] }}` table must produce exactly one hook command"
+        );
+        assert!(
+            matches!(&commands[0], HookCommand::Exec { cmd } if cmd.as_slice() == ["echo", "hi"]),
+            "HOOK-EXEC-001: `{{ cmd = [...] }}` must parse into the Exec variant carrying the exact \
+             argv in order, not a shell command; got {:?}",
+            commands[0]
+        );
+    }
+
+    #[test]
+    fn array_of_cmd_tables_parses_to_two_exec_hooks() {
+        let parsed = toml::from_str::<TargetHooks>(
+            "on_change = [{ cmd = [\"a\"] }, { cmd = [\"b\", \"c\"] }]",
+        );
+        let hooks = parsed.expect(
+            "HOOK-EXEC-001: an array of `{ cmd = [...] }` tables must deserialize (array-of-either \
+             back-compat extends to the exec form)",
+        );
+        let commands = hooks.on_change.expect("array must yield commands");
+        assert_eq!(
+            commands.len(),
+            2,
+            "two cmd-table entries must produce two hook commands"
+        );
+        assert!(
+            matches!(&commands[0], HookCommand::Exec { cmd } if cmd.as_slice() == ["a"]),
+            "HOOK-EXEC-001: the first array entry must parse into the Exec variant with argv \
+             [\"a\"], not a shell command; got {:?}",
+            commands[0]
+        );
+        assert!(
+            matches!(&commands[1], HookCommand::Exec { cmd } if cmd.as_slice() == ["b", "c"]),
+            "HOOK-EXEC-001: the second array entry must parse into the Exec variant with the exact \
+             argv [\"b\", \"c\"] in order, not a shell command; got {:?}",
+            commands[1]
+        );
+    }
+
+    #[test]
+    fn both_run_and_cmd_is_a_descriptive_combination_error() {
+        let err = toml::from_str::<TargetHooks>(
+            "on_change = { run = \"echo hi\", cmd = [\"echo\", \"hi\"] }",
+        )
+        .expect_err("specifying both `run` and `cmd` must be rejected at deserialize time");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("both"),
+            "HOOK-EXEC-001: a hook giving BOTH `run` and `cmd` must fail with a descriptive \
+             combination error naming the conflict, not the generic `unknown field` rejection; \
+             got: {err}"
+        );
+    }
+
+    #[test]
+    fn neither_run_nor_cmd_is_a_descriptive_error() {
+        let err = toml::from_str::<TargetHooks>("on_change = {}")
+            .expect_err("a hook table with neither `run` nor `cmd` must be rejected");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("cmd"),
+            "HOOK-EXEC-001: a hook giving NEITHER `run` nor `cmd` must fail with an error naming \
+             `cmd` as an alternative (not the run-only `missing field run`); got: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_cmd_is_rejected_at_the_deserialize_layer() {
+        let err = toml::from_str::<TargetHooks>("on_change = { cmd = [] }")
+            .expect_err("an empty `cmd` array must be rejected, mirroring the empty-`run` guard");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("empty"),
+            "HOOK-EXEC-001: `cmd = []` must be rejected at deserialize time with an emptiness \
+             error (mirror `validated_command`'s empty-run guard), not the generic unknown-field \
+             rejection; got: {err}"
+        );
+    }
+
+    #[test]
+    fn bare_string_hook_still_parses() {
+        let hooks = toml::from_str::<TargetHooks>("on_change = \"echo hi\"")
+            .expect("back-compat: a bare command string must keep parsing");
+        assert_eq!(
+            hooks.on_change.expect("bare string yields a command").len(),
+            1,
+            "a bare string must remain a single shell hook"
+        );
+    }
+
+    #[test]
+    fn run_shell_table_still_parses() {
+        let hooks =
+            toml::from_str::<TargetHooks>("on_change = { run = \"echo hi\", shell = \"bash -c\" }")
+                .expect("back-compat: a `{ run, shell }` table must keep parsing");
+        assert_eq!(
+            hooks.on_change.expect("table yields a command").len(),
+            1,
+            "a `{{ run, shell }}` table must remain a single shell hook"
+        );
+    }
+
+    #[test]
+    fn mixed_array_of_string_and_run_table_still_parses() {
+        let hooks = toml::from_str::<TargetHooks>("on_change = [\"echo a\", { run = \"echo b\" }]")
+            .expect("back-compat: an array mixing a string and a run table must keep parsing");
+        assert_eq!(
+            hooks.on_change.expect("array yields commands").len(),
+            2,
+            "a mixed string + run-table array must remain two shell hooks"
         );
     }
 

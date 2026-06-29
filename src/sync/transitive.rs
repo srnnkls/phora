@@ -54,7 +54,7 @@ impl From<&TransitiveHookCandidate> for crate::lock::CandidateHookRecord {
             dep_instance: c.dep_instance.clone(),
             hook_id: c.hook_id.clone(),
             preimage: c.preimage.clone(),
-            command: c.command.run.clone(),
+            command: c.command.display(),
             source: c.source.clone(),
             commit: c.commit.clone(),
         }
