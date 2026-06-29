@@ -2146,9 +2146,9 @@ fn phora_verify_report_unchanged_by_stat_refresh() {
     assert!(!first.had_failures, "first deploy must succeed");
 
     let verify_before =
-        super::verify::verify(&cfg, &fx.registry).expect("verify before must not error");
+        super::verify::verify(&cfg, &fx.registry, None).expect("verify before must not error");
     assert!(
-        verify_before.is_empty(),
+        verify_before.is_clean(),
         "a freshly deployed artifact must verify clean, got {verify_before:?}"
     );
 
@@ -2168,13 +2168,13 @@ fn phora_verify_report_unchanged_by_stat_refresh() {
     .expect("revalidating sync must not error");
 
     let verify_after =
-        super::verify::verify(&cfg, &fx.registry).expect("verify after must not error");
+        super::verify::verify(&cfg, &fx.registry, None).expect("verify after must not error");
     assert_eq!(
         verify_after, verify_before,
         "a stat-only refresh must not change phora verify's report — blake3 stays untouched"
     );
     assert!(
-        verify_after.is_empty(),
+        verify_after.is_clean(),
         "verify must still pass after a stat refresh, got {verify_after:?}"
     );
 }
