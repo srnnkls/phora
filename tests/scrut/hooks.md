@@ -194,6 +194,83 @@ post
 post
 ```
 
+## A failing pre_sync hook aborts the whole sync before any file deploys
+
+A global `pre_sync` hook that exits non-zero must gate the entire sync: the failure
+is reported with its `[pre_sync]` scope, the sync exits non-zero, and NO target file
+is deployed — pre_sync runs after fetch but before the deploy loop.
+
+```scrut
+$ cd "$ROOT" && mkdir -p p1 && cd p1 && isolate_state && seed_config_failing_pre_sync "$(make_git_source proj)" && echo seeded
+seeded
+```
+
+The pre_sync failure is reported with the `[pre_sync]` scope and `failed` status.
+
+```scrut
+$ phora sync 2>&1 | normalize | grep -F '[pre_sync]'
+hook pre_sync#exit 1#sh -c [pre_sync] `exit 1` failed
+```
+
+The sync exits non-zero.
+
+```scrut
+$ phora sync >/dev/null 2>&1; test $? -ne 0 && echo nonzero
+nonzero
+```
+
+No file was deployed — the gate aborted before the deploy loop ran.
+
+```scrut
+$ test -e "$PWD/target-home/editor/init.lua" && echo deployed || echo absent
+absent
+```
+
+## A passing pre_sync runs before deploy and sees PHORA_TARGETS
+
+A global `pre_sync` hook records its `PHORA_TARGETS` env, then the sync proceeds to
+deploy. The report names the hook with its `pre_sync` scope and `ok` status.
+
+```scrut
+$ cd "$ROOT" && mkdir -p p2 && cd p2 && isolate_state && seed_config_pre_sync "$(make_git_source proj)" && phora sync 2>&1 | normalize
+hook pre_sync#echo "$PHORA_TARGETS" > "$HOME/pre.log"#sh -c [pre_sync] `echo "$PHORA_TARGETS" > "$HOME/pre.log"` ok
+sync complete
+```
+
+The deploy ran after the passing gate.
+
+```scrut
+$ test -e "$PWD/target-home/editor/init.lua" && echo deployed
+deployed
+```
+
+`PHORA_TARGETS` listed the target that would deploy.
+
+```scrut
+$ cat "$HOME/pre.log"
+home
+```
+
+## --no-hooks suppresses pre_sync too
+
+`--no-hooks` deploys the files but runs no pre_sync hook, so no log is written and no
+gate report appears.
+
+```scrut
+$ cd "$ROOT" && mkdir -p p3 && cd p3 && isolate_state && seed_config_pre_sync "$(make_git_source proj)" && phora sync --no-hooks 2>&1 | normalize
+sync complete
+```
+
+```scrut
+$ test -e "$PWD/target-home/editor/init.lua" && echo deployed
+deployed
+```
+
+```scrut
+$ test -e "$HOME/pre.log" && echo fired || echo suppressed
+suppressed
+```
+
 ## Exec form runs shell-free with no $VAR expansion
 
 A target's `on_change` is the shell-free argv form `{ cmd = [...] }`. The argv carries a

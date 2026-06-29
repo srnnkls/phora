@@ -523,6 +523,72 @@ fn changing_the_dep_commit_invalidates_a_commit_pinned_trust_approval() {
     );
 }
 
+#[test]
+fn pre_sync_abort_preserves_recorded_candidate_hooks() {
+    let leaf = TempDir::new().expect("leaf repo");
+    leaf_repo(leaf.path(), "leaf.txt", "payload\n");
+
+    let fixture = build_fixture();
+    let sentinel_path = sentinel(&fixture);
+
+    let dep = TempDir::new().expect("dep repo");
+    dep_with_on_change_hook(dep.path(), &sentinel_path.display().to_string());
+
+    let mut fixture = fixture;
+    fixture.map_url("https://github.com/mock/leaf.git", leaf.path());
+    fixture.finish_gitconfig();
+
+    let config_base = format!(
+        "version = 1\n\n[sources.mydeps]\ngit = \"{dep}\"\ntransitive = true\n\n\
+         [targets.dotcfg]\npath = \"~/.config\"\nimports = [\"mydeps\"]\n",
+        dep = dep.path().display(),
+    );
+    let manifest_path = fixture.cwd.path().join("phora.toml");
+    write(&manifest_path, config_base.as_bytes());
+
+    // Run 1: a clean sync RECORDS the transitive candidate into the consumer lock.
+    let first = run(&fixture, &["sync"]);
+    assert!(
+        first.status.success(),
+        "seeding sync must exit zero; stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let lock_path = fixture.cwd.path().join("phora.lock");
+    let lock_after_seed = std::fs::read_to_string(&lock_path).expect("seed sync wrote phora.lock");
+    assert!(
+        extract_first_preimage(&lock_after_seed).is_some(),
+        "premise: the seeding sync must have RECORDED the candidate's commit-bound preimage so it \
+         exists to be (wrongly) wiped; phora.lock:\n{lock_after_seed}"
+    );
+
+    // Add a global pre_sync gate that FAILS, so the next sync aborts before deploy.
+    let config_with_gate = format!("{config_base}\n[hooks]\npre_sync = \"exit 1\"\n");
+    write(&manifest_path, config_with_gate.as_bytes());
+
+    // Run 2: the pre_sync gate fails, aborting the sync.
+    let aborted = run(&fixture, &["sync"]);
+    let stderr = String::from_utf8_lossy(&aborted.stderr);
+    assert!(
+        !aborted.status.success(),
+        "a failing global pre_sync gate must abort the sync with a non-zero exit; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("[pre_sync]"),
+        "the abort must surface the failed pre_sync hook in its report; stderr: {stderr}"
+    );
+
+    // KEY: the abort must NOT wipe the previously-recorded candidate from the persisted lock.
+    let lock_after_abort =
+        std::fs::read_to_string(&lock_path).expect("the aborted sync still rewrote phora.lock");
+    assert!(
+        extract_first_preimage(&lock_after_abort).is_some(),
+        "HOOK-PRESYNC-001 regression: a pre_sync abort must PRESERVE the candidate_hooks already \
+         recorded in the consumer lock — the anti-TOFU surface `phora trust`/`phora verify` read. \
+         The abort path returns a lock without re-recording candidates, yet the CLI writes it \
+         unconditionally, wiping the candidate. phora.lock after abort:\n{lock_after_abort}"
+    );
+}
+
 /// Pulls the first `preimage = "blake3:..."` value out of a serialized lock.
 fn extract_first_preimage(lock_text: &str) -> Option<String> {
     for line in lock_text.lines() {

@@ -4413,15 +4413,15 @@ fn unknown_global_hooks_key_is_rejected_naming_it() {
 version = 1
 
 [hooks]
-pre_sync = "x"
+post_deploy = "x"
 "#;
     let err = Config::parse(toml).expect_err(
         "an unknown key in the global [hooks] table must be rejected \
-         (no `pre` hooks in v1)",
+         (deny_unknown_fields)",
     );
     match err {
         Error::Config(msg) => assert!(
-            msg.contains("pre_sync"),
+            msg.contains("post_deploy"),
             "error should name the offending key, got: {msg}"
         ),
         other => panic!("expected Error::Config, got {other:?}"),

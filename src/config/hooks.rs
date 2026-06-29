@@ -142,6 +142,9 @@ pub struct TargetHooks {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GlobalHooks {
+    /// Lifecycle gate: runs once after fetch, before deploy; a non-zero exit aborts the sync.
+    #[serde(default, deserialize_with = "deserialize_commands")]
+    pub pre_sync: Option<Vec<HookCommand>>,
     #[serde(default, deserialize_with = "deserialize_commands")]
     pub post_sync: Option<Vec<HookCommand>>,
     #[serde(default)]
@@ -524,6 +527,55 @@ mod tests {
             hooks.on_change.expect("array yields commands").len(),
             2,
             "a mixed string + run-table array must remain two shell hooks"
+        );
+    }
+
+    // HOOK-PRESYNC-001: the global `[hooks]` table accepts a `pre_sync` field in every
+    // surface form `post_sync` accepts. Today GlobalHooks carries `deny_unknown_fields`
+    // with no `pre_sync`, so each of these is rejected as an unknown field.
+
+    #[test]
+    fn global_hooks_accepts_pre_sync_string() {
+        toml::from_str::<GlobalHooks>("pre_sync = \"reload-everything\"").expect(
+            "HOOK-PRESYNC-001: the global `[hooks]` table must accept a bare-string `pre_sync` \
+             hook; today deny_unknown_fields rejects the `pre_sync` key",
+        );
+    }
+
+    #[test]
+    fn global_hooks_accepts_pre_sync_run_shell_table() {
+        toml::from_str::<GlobalHooks>("pre_sync = { run = \"reload\", shell = \"bash -c\" }")
+            .expect(
+                "HOOK-PRESYNC-001: `pre_sync` must accept the `{ run, shell }` table form like \
+             `post_sync` does",
+            );
+    }
+
+    #[test]
+    fn global_hooks_accepts_pre_sync_array() {
+        toml::from_str::<GlobalHooks>("pre_sync = [\"first\", \"second\"]").expect(
+            "HOOK-PRESYNC-001: `pre_sync` must accept an array of commands like `post_sync` does",
+        );
+    }
+
+    #[test]
+    fn global_hooks_accepts_both_pre_sync_and_post_sync() {
+        toml::from_str::<GlobalHooks>("pre_sync = \"gate\"\npost_sync = \"reload\"").expect(
+            "HOOK-PRESYNC-001: `pre_sync` is additive — declaring it alongside `post_sync` must \
+             parse, not replace or conflict with `post_sync`",
+        );
+    }
+
+    #[test]
+    fn empty_pre_sync_command_is_rejected_naming_emptiness() {
+        let err = toml::from_str::<GlobalHooks>("pre_sync = \"\"")
+            .expect_err("an empty `pre_sync` command must be rejected");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("empty"),
+            "HOOK-PRESYNC-001: `pre_sync = \"\"` must be rejected through the same validated \
+             command deserializer as `post_sync` (an emptiness error), not the generic \
+             unknown-field rejection; got: {err}"
         );
     }
 

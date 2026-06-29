@@ -293,6 +293,25 @@ fn deploy_all_targets(ctx: &DeployAll<'_>) -> Result<bool> {
     Ok(had_failures)
 }
 
+fn maybe_prune(ctx: &DeployAll<'_>, had_failures: bool) -> Result<()> {
+    if !ctx.input.prune {
+        return Ok(());
+    }
+    if had_failures {
+        eprintln!("phora: skipping --prune because some artifacts failed to deploy");
+        return Ok(());
+    }
+    prune_orphans(
+        ctx.config,
+        ctx.parsed,
+        ctx.remotes,
+        ctx.backend,
+        ctx.registry,
+        ctx.resolved_commits,
+        ctx.protected,
+    )
+}
+
 fn sweep_target_parents(config: &Config, journal: &Journal, registry: &dyn Registry) -> Result<()> {
     let mut swept_parents: BTreeSet<PathBuf> = BTreeSet::new();
     for target in config.targets.values() {
@@ -370,6 +389,7 @@ pub fn sync(
         .as_ref()
         .map(|lock| lock.trusted_hooks.clone())
         .unwrap_or_default();
+    record_candidate_hooks(&mut base_lock, &hook_candidates);
 
     validate_sealed_offer(
         &effective_config,
@@ -380,7 +400,20 @@ pub fn sync(
         &recorded_after_recovery,
     )?;
 
-    let mut had_failures = deploy_all_targets(&DeployAll {
+    // pre_sync gates the run: a failure aborts before deploy, leaving zero files deployed.
+    let pre_sync_outcomes = run_pre_sync(input, &effective_config)?;
+    if pre_sync_outcomes
+        .iter()
+        .any(|o| o.status == hooks::HookStatus::Failure)
+    {
+        return Ok(aborted_at_pre_sync(
+            base_lock,
+            local_lock,
+            pre_sync_outcomes,
+        ));
+    }
+
+    let deploy = DeployAll {
         config: &effective_config,
         parsed: &parsed,
         remotes: &remotes,
@@ -390,21 +423,9 @@ pub fn sync(
         backend,
         registry,
         journal: &journal,
-    })?;
-
-    if input.prune && !had_failures {
-        prune_orphans(
-            &effective_config,
-            &parsed,
-            &remotes,
-            backend,
-            registry,
-            &resolved_commits,
-            &protected,
-        )?;
-    } else if input.prune {
-        eprintln!("phora: skipping --prune because some artifacts failed to deploy");
-    }
+    };
+    let mut had_failures = deploy_all_targets(&deploy)?;
+    maybe_prune(&deploy, had_failures)?;
 
     let (hook_results, stripped_transitive_hooks) = run_all_hooks(
         input,
@@ -413,6 +434,7 @@ pub fn sync(
         &mut base_lock,
         &hook_candidates,
         effective_lock.as_ref(),
+        pre_sync_outcomes,
     )?;
     let deploy_failures = had_failures;
     had_failures |= hook_results
@@ -429,6 +451,34 @@ pub fn sync(
     })
 }
 
+fn aborted_at_pre_sync(
+    base_lock: Lock,
+    local_lock: Option<Lock>,
+    hook_results: Vec<hooks::HookOutcome>,
+) -> SyncOutput {
+    SyncOutput {
+        base_lock,
+        local_lock,
+        had_failures: true,
+        deploy_failures: false,
+        hook_results,
+        stripped_transitive_hooks: 0,
+    }
+}
+
+fn run_pre_sync(input: &SyncInput<'_>, config: &Config) -> Result<Vec<hooks::HookOutcome>> {
+    if input.no_hooks {
+        return Ok(Vec::new());
+    }
+    let target_names = config
+        .targets
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(" ");
+    hooks::dispatch_pre_sync(config, &target_names)
+}
+
 fn run_all_hooks(
     input: &SyncInput<'_>,
     config: &Config,
@@ -436,13 +486,13 @@ fn run_all_hooks(
     base_lock: &mut Lock,
     hook_candidates: &[transitive::TransitiveHookCandidate],
     effective_lock: Option<&Lock>,
+    pre_sync: Vec<hooks::HookOutcome>,
 ) -> Result<(Vec<hooks::HookOutcome>, usize)> {
-    let mut hook_results = if input.no_hooks {
-        Vec::new()
-    } else {
-        hooks::dispatch_hooks(config, registry)?
-    };
-    record_candidate_hooks(base_lock, hook_candidates);
+    // pre_sync renders before post_sync/on_change, so it seeds the result vec.
+    let mut hook_results = pre_sync;
+    if !input.no_hooks {
+        hook_results.append(&mut hooks::dispatch_hooks(config, registry)?);
+    }
     let mut stripped = 0;
     if !input.no_hooks && !input.no_transitive_hooks {
         let mut decision = decide_transitive_hooks(
