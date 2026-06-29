@@ -153,6 +153,59 @@ EOF
 	rm -f "$PWD/phora.toml.bak"
 }
 
+# Global pre_sync hook that records its PHORA_TARGETS env to a log. The report prints
+# the literal `$PHORA_TARGETS`/`$HOME` text (format string, not a shell); the values
+# expand only when the hook runs, after fetch and before deploy.
+seed_config_pre_sync() {
+	url="$1"
+	target="$PWD/target-home"
+	mkdir -p "$target"
+	cat >"$PWD/phora.toml" <<'EOF'
+version = 1
+
+[sources.dotfiles]
+path = "__URL__"
+branch = "main"
+include = ["editor"]
+
+[targets.home]
+path = "__TARGET__"
+sources = ["dotfiles"]
+layout = "flat"
+
+[hooks]
+pre_sync = "echo \"$PHORA_TARGETS\" > \"$HOME/pre.log\""
+EOF
+	sed -i.bak -e "s#__URL__#$url#" -e "s#__TARGET__#$target#" "$PWD/phora.toml"
+	rm -f "$PWD/phora.toml.bak"
+}
+
+# Global pre_sync hook that always fails (exit 1): the gate must abort the whole sync
+# before any file is deployed.
+seed_config_failing_pre_sync() {
+	url="$1"
+	target="$PWD/target-home"
+	mkdir -p "$target"
+	cat >"$PWD/phora.toml" <<'EOF'
+version = 1
+
+[sources.dotfiles]
+path = "__URL__"
+branch = "main"
+include = ["editor"]
+
+[targets.home]
+path = "__TARGET__"
+sources = ["dotfiles"]
+layout = "flat"
+
+[hooks]
+pre_sync = "exit 1"
+EOF
+	sed -i.bak -e "s#__URL__#$url#" -e "s#__TARGET__#$target#" "$PWD/phora.toml"
+	rm -f "$PWD/phora.toml.bak"
+}
+
 # on_change hook that succeeds only once $HOME/allow exists: lets a scenario fail
 # a hook, then fix the cause and prove it re-fires.
 seed_config_failing_hook() {

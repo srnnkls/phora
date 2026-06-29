@@ -10,6 +10,7 @@ use crate::store::{Registry, RegistryRecord};
 /// Which hook table a [`HookOutcome`] came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookScope {
+    PreSync,
     OnChange,
     PostSync,
 }
@@ -99,6 +100,30 @@ pub(super) fn dispatch_hooks(config: &Config, registry: &dyn Registry) -> Result
         }
     }
 
+    Ok(outcomes)
+}
+
+/// Runs every global `pre_sync` hook with `PHORA_TARGETS`. Unconditional: `when` governs
+/// `post_sync` re-fire, never the per-run `pre_sync` gate.
+///
+/// # Errors
+///
+/// Returns an error if a hook process fails to spawn.
+pub(super) fn dispatch_pre_sync(config: &Config, target_names: &str) -> Result<Vec<HookOutcome>> {
+    let Some(pre_sync) = config.hooks.as_ref().and_then(|g| g.pre_sync.as_ref()) else {
+        return Ok(Vec::new());
+    };
+    let mut outcomes = Vec::new();
+    for hook in dedupe(pre_sync) {
+        let status = run_hook(hook, &[("PHORA_TARGETS", target_names)])?;
+        let (body, suffix) = hook_key(hook);
+        outcomes.push(HookOutcome {
+            hook_id: format!("pre_sync#{body}#{suffix}"),
+            command: hook.display(),
+            scope: HookScope::PreSync,
+            status,
+        });
+    }
     Ok(outcomes)
 }
 
