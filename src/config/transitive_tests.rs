@@ -392,7 +392,7 @@ fn admission_interprets_opaque_into_structured_candidate_keyed_by_instance() {
     );
     assert_eq!(
         candidate.command,
-        crate::config::HookCommand {
+        crate::config::HookCommand::Shell {
             run: "./install.sh".to_owned(),
             shell: None,
         },

@@ -193,3 +193,23 @@ $ cat "$HOME/post.log"
 post
 post
 ```
+
+## Exec form runs shell-free with no $VAR expansion
+
+A target's `on_change` is the shell-free argv form `{ cmd = [...] }`. The argv carries a
+literal `$HOME` token; with no shell, `touch` receives it verbatim and creates a file named
+`exec_ran_$HOME`. The report names the hook with a `#exec` suffix and `cmd.join(" ")` as the
+command, and the two identical entries dedupe to a single line.
+
+```scrut
+$ cd "$ROOT" && mkdir -p s5 && cd s5 && isolate_state && seed_config_exec_hook "$(make_git_source proj)" && phora sync 2>&1 | normalize
+hook home#touch exec_ran_$HOME#exec [on_change] `touch exec_ran_$HOME` ok
+sync complete
+```
+
+No shell ran, so the `$HOME` token was not expanded — the file is named verbatim.
+
+```scrut
+$ test -e 'exec_ran_$HOME' && echo verbatim
+verbatim
+```

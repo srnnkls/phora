@@ -4067,11 +4067,23 @@ fn post_sync_of(cfg: &Config) -> &[HookCommand] {
 }
 
 fn runs(commands: &[HookCommand]) -> Vec<&str> {
-    commands.iter().map(|c| c.run.as_str()).collect()
+    commands
+        .iter()
+        .map(|c| match c {
+            HookCommand::Shell { run, .. } => run.as_str(),
+            HookCommand::Exec { .. } => panic!("expected a shell hook, got an exec hook"),
+        })
+        .collect()
 }
 
 fn shells(commands: &[HookCommand]) -> Vec<Option<&str>> {
-    commands.iter().map(|c| c.shell.as_deref()).collect()
+    commands
+        .iter()
+        .map(|c| match c {
+            HookCommand::Shell { shell, .. } => shell.as_deref(),
+            HookCommand::Exec { .. } => panic!("expected a shell hook, got an exec hook"),
+        })
+        .collect()
 }
 
 #[test]
