@@ -230,6 +230,11 @@ fn validated_command<E: serde::de::Error>(
             shell,
         }),
         (None, Some(cmd)) => {
+            if shell.is_some() {
+                return Err(E::custom(
+                    "hook command `cmd` (exec form) runs no shell, so `shell` is not allowed",
+                ));
+            }
             if cmd.is_empty() {
                 return Err(E::custom("hook command `cmd` must not be empty"));
             }
@@ -482,6 +487,23 @@ mod tests {
             "HOOK-EXEC-001: a hook giving BOTH `run` and `cmd` must fail with a descriptive \
              combination error naming the conflict, not the generic `unknown field` rejection; \
              got: {err}"
+        );
+    }
+
+    #[test]
+    fn cmd_with_shell_is_rejected_exec_form_takes_no_shell() {
+        let err = toml::from_str::<TargetHooks>(
+            "on_change = { cmd = [\"echo\", \"hi\"], shell = \"bash -c\" }",
+        )
+        .expect_err(
+            "a `{ cmd, shell }` table must be rejected: the exec form runs no shell, so `shell` \
+             cannot silently be dropped",
+        );
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("shell") && (msg.contains("cmd") || msg.contains("exec")),
+            "HOOK-EXEC-001: pairing `cmd` with `shell` must fail with an error naming the conflict \
+             (`shell` plus `cmd`/`exec`), not silently route to Exec and drop `shell`; got: {err}"
         );
     }
 
