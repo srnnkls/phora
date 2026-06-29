@@ -290,3 +290,151 @@ No shell ran, so the `$HOME` token was not expanded — the file is named verbat
 $ test -e 'exec_ran_$HOME' && echo verbatim
 verbatim
 ```
+
+## A passing pre_deploy runs before its target's deploy and sees PHORA_TARGET(_PATH)
+
+A target's `pre_deploy` hook records `PHORA_TARGET` and `PHORA_TARGET_PATH`, then probes
+whether the target file already exists. The hook fires *before* that target's deploy, so the
+probe sees the file absent; the report names the hook with its `pre_deploy` scope and `ok`.
+
+```scrut
+$ cd "$ROOT" && mkdir -p d1 && cd d1 && isolate_state && seed_config_pre_deploy_pass "$(make_git_source proj)" && phora sync 2>&1 | normalize | grep -F '[pre_deploy]'
+hook * [pre_deploy] * ok (glob)
+```
+
+`PHORA_TARGET` was the deploying target's name.
+
+```scrut
+$ head -1 "$HOME/predeploy.log" | cut -d' ' -f1
+home
+```
+
+`PHORA_TARGET_PATH` was that target's exact absolute deploy directory — `$PWD/target-home`,
+the target's real deploy dir in this scenario, not merely a path ending in `target-home`.
+
+```scrut
+$ [ "$(head -1 "$HOME/predeploy.log" | cut -d' ' -f2)" = "$PWD/target-home" ] && echo path-exact
+path-exact
+```
+
+The hook ran before the deploy — at hook time the target file did not yet exist.
+
+```scrut
+$ grep -qx ABSENT-AT-HOOK "$HOME/predeploy.log" && echo before-deploy
+before-deploy
+```
+
+After the passing gate, the deploy landed the file.
+
+```scrut
+$ test -e "$PWD/target-home/editor/init.lua" && echo deployed
+deployed
+```
+
+## A failing pre_deploy with default on-fail aborts the whole sync
+
+Two targets share one source. BTreeMap iteration deploys `aaa` first, then reaches `zzz`,
+whose `pre_deploy` exits non-zero under the default `abort`. The gate halts the entire sync:
+`zzz` never deploys, the failure renders with `[pre_deploy]`, and the global `post_sync` never
+runs. `aaa` — already deployed before `zzz` was reached — is NOT rolled back.
+
+```scrut
+$ cd "$ROOT" && mkdir -p d2 && cd d2 && isolate_state && seed_config_pre_deploy_abort "$(make_git_source proj)" && echo seeded
+seeded
+```
+
+The pre_deploy failure is reported with the `[pre_deploy]` scope and `failed` status.
+
+```scrut
+$ phora sync 2>&1 | normalize | grep -F '[pre_deploy]'
+hook * [pre_deploy] * failed (glob)
+```
+
+The sync exits non-zero.
+
+```scrut
+$ phora sync >/dev/null 2>&1; test $? -ne 0 && echo nonzero
+nonzero
+```
+
+The earlier target `aaa` stayed deployed — abort does not roll back targets that already landed.
+
+```scrut
+$ test -e "$PWD/target-aaa/editor/init.lua" && echo first-present
+first-present
+```
+
+The aborting target `zzz` deployed nothing — the gate fired before its deploy.
+
+```scrut
+$ test -e "$PWD/target-zzz/editor/init.lua" && echo second-deployed || echo second-absent
+second-absent
+```
+
+The global `post_sync` never ran — the abort halted before the post-deploy hook phase.
+
+```scrut
+$ test -e "$HOME/post.log" && echo post-ran || echo post-skipped
+post-skipped
+```
+
+## A failing pre_deploy with on-fail skip skips only that target and continues
+
+Same two targets, but `zzz` sets `pre_deploy_on_fail = "skip"`. The failing gate skips only
+`zzz`'s deploy, sets `had_failures`, and continues: `aaa` deploys, the global `post_sync` still
+runs, and the sync exits non-zero.
+
+```scrut
+$ cd "$ROOT" && mkdir -p d3 && cd d3 && isolate_state && seed_config_pre_deploy_skip "$(make_git_source proj)" && echo seeded
+seeded
+```
+
+The skip is reported with the `[pre_deploy]` scope and `failed` status.
+
+```scrut
+$ phora sync 2>&1 | normalize | grep -F '[pre_deploy]'
+hook * [pre_deploy] * failed (glob)
+```
+
+The other target `aaa` deployed normally.
+
+```scrut
+$ test -e "$PWD/target-aaa/editor/init.lua" && echo other-present
+other-present
+```
+
+The skipped target `zzz` deployed nothing.
+
+```scrut
+$ test -e "$PWD/target-zzz/editor/init.lua" && echo skipped-deployed || echo skipped-absent
+skipped-absent
+```
+
+The global `post_sync` still ran — skip continues the sync rather than aborting it.
+
+```scrut
+$ cat "$HOME/post.log"
+post
+```
+
+The sync still exits non-zero because a target was skipped.
+
+```scrut
+$ phora sync >/dev/null 2>&1; test $? -ne 0 && echo nonzero
+nonzero
+```
+
+## A skipped target suppresses --prune
+
+A skipped pre_deploy target sets `had_failures`, which gates `--prune`: prune must not run, so
+phora emits the skip notice on stderr.
+
+```scrut
+$ cd "$ROOT" && mkdir -p d4 && cd d4 && isolate_state && seed_config_pre_deploy_skip "$(make_git_source proj)" && echo seeded
+seeded
+```
+
+```scrut
+$ phora sync --prune 2>&1 | grep -F 'skipping --prune'
+phora: skipping --prune because some artifacts failed to deploy
+```

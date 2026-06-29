@@ -572,6 +572,66 @@ include = []
     );
 }
 
+// HOOK-PREDEPLOY-001: `Target::merged_with` replaces the hooks table wholesale, so a local
+// overlay that sets ANY hook drops the base `pre_deploy_on_fail`, reverting it to the default
+// abort. Today these configs do not even parse (the `pre_deploy*` keys are unknown fields).
+
+#[test]
+fn local_hook_overlay_drops_base_pre_deploy_on_fail_reverting_to_abort() {
+    let base = Config::parse(
+        r#"
+version = 1
+
+[sources.dotfiles]
+git = "https://example.com/x.git"
+
+[targets.x]
+path = "~/x"
+sources = ["dotfiles"]
+
+[targets.x.hooks]
+pre_deploy = "base-cmd"
+pre_deploy_on_fail = "skip"
+"#,
+    )
+    .expect("base config with a pre_deploy skip hook parses");
+    let local = Config::parse(
+        r#"
+version = 1
+
+[targets.x]
+path = "~/x"
+
+[targets.x.hooks]
+pre_deploy = "local-cmd"
+"#,
+    )
+    .expect("local overlay setting only pre_deploy parses");
+
+    let effective = merge_configs(base, Some(local));
+    let merged_hooks = target_of(&effective, "x")
+        .hooks
+        .as_ref()
+        .expect("merged target retains a hooks table");
+
+    let expected_default = toml::from_str::<TargetHooks>("pre_deploy = \"local-cmd\"")
+        .expect("a pre_deploy hook with no on_fail parses to the default");
+    let with_skip =
+        toml::from_str::<TargetHooks>("pre_deploy = \"local-cmd\"\npre_deploy_on_fail = \"skip\"")
+            .expect("an explicit skip overlay parses");
+
+    assert_eq!(
+        *merged_hooks, expected_default,
+        "HOOK-PREDEPLOY-001: the local overlay replaces the hooks table wholesale, so the base \
+         `pre_deploy_on_fail = skip` is dropped and the merged value reverts to the default abort"
+    );
+    assert_ne!(
+        *merged_hooks, with_skip,
+        "HOOK-PREDEPLOY-001: the base `skip` must NOT survive the wholesale-replace merge — if it \
+         leaked through, the merged hooks would equal the explicit-skip table"
+    );
+}
+
 #[test]
 fn parses_paths_table_cache_and_state() {
     let config = Config::parse(

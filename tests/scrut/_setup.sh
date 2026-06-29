@@ -206,6 +206,106 @@ EOF
 	rm -f "$PWD/phora.toml.bak"
 }
 
+# Two targets sharing one source, named so BTreeMap iteration deploys `aaa` first and
+# reaches `zzz` second. `zzz`'s pre_deploy fails (exit 1) under the default on-fail (abort):
+# the gate must halt the whole sync — `aaa` (already deployed) stays, `zzz` never deploys,
+# and the global post_sync never runs.
+seed_config_pre_deploy_abort() {
+	url="$1"
+	taaa="$PWD/target-aaa"
+	tzzz="$PWD/target-zzz"
+	mkdir -p "$taaa" "$tzzz"
+	cat >"$PWD/phora.toml" <<'EOF'
+version = 1
+
+[sources.dotfiles]
+path = "__URL__"
+branch = "main"
+include = ["editor"]
+
+[targets.aaa]
+path = "__TAAA__"
+sources = ["dotfiles"]
+layout = "flat"
+
+[targets.zzz]
+path = "__TZZZ__"
+sources = ["dotfiles"]
+layout = "flat"
+
+[targets.zzz.hooks]
+pre_deploy = "exit 1"
+
+[hooks]
+post_sync = "echo post >> \"$HOME/post.log\""
+EOF
+	sed -i.bak -e "s#__URL__#$url#" -e "s#__TAAA__#$taaa#" -e "s#__TZZZ__#$tzzz#" "$PWD/phora.toml"
+	rm -f "$PWD/phora.toml.bak"
+}
+
+# Same two-target layout, but `zzz` declares `pre_deploy_on_fail = "skip"`: a failing
+# pre_deploy must skip only `zzz`'s deploy (its files absent), set had_failures, and
+# continue — `aaa` deploys and the global post_sync still runs.
+seed_config_pre_deploy_skip() {
+	url="$1"
+	taaa="$PWD/target-aaa"
+	tzzz="$PWD/target-zzz"
+	mkdir -p "$taaa" "$tzzz"
+	cat >"$PWD/phora.toml" <<'EOF'
+version = 1
+
+[sources.dotfiles]
+path = "__URL__"
+branch = "main"
+include = ["editor"]
+
+[targets.aaa]
+path = "__TAAA__"
+sources = ["dotfiles"]
+layout = "flat"
+
+[targets.zzz]
+path = "__TZZZ__"
+sources = ["dotfiles"]
+layout = "flat"
+
+[targets.zzz.hooks]
+pre_deploy = "exit 1"
+pre_deploy_on_fail = "skip"
+
+[hooks]
+post_sync = "echo post >> \"$HOME/post.log\""
+EOF
+	sed -i.bak -e "s#__URL__#$url#" -e "s#__TAAA__#$taaa#" -e "s#__TZZZ__#$tzzz#" "$PWD/phora.toml"
+	rm -f "$PWD/phora.toml.bak"
+}
+
+# A passing per-target pre_deploy that records PHORA_TARGET + PHORA_TARGET_PATH, then probes
+# whether the target's file already exists — proving the hook runs BEFORE that target's deploy.
+seed_config_pre_deploy_pass() {
+	url="$1"
+	target="$PWD/target-home"
+	mkdir -p "$target"
+	cat >"$PWD/phora.toml" <<'EOF'
+version = 1
+
+[sources.dotfiles]
+path = "__URL__"
+branch = "main"
+include = ["editor"]
+
+[targets.home]
+path = "__TARGET__"
+sources = ["dotfiles"]
+layout = "flat"
+
+[targets.home.hooks]
+pre_deploy = "echo \"$PHORA_TARGET $PHORA_TARGET_PATH\" > \"$HOME/predeploy.log\"; test -e \"$PHORA_TARGET_PATH/editor/init.lua\" && echo PRESENT-AT-HOOK >> \"$HOME/predeploy.log\" || echo ABSENT-AT-HOOK >> \"$HOME/predeploy.log\""
+EOF
+	sed -i.bak -e "s#__URL__#$url#" -e "s#__TARGET__#$target#" "$PWD/phora.toml"
+	rm -f "$PWD/phora.toml.bak"
+}
+
 # on_change hook that succeeds only once $HOME/allow exists: lets a scenario fail
 # a hook, then fix the cause and prove it re-fires.
 seed_config_failing_hook() {

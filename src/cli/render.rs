@@ -19,6 +19,7 @@ pub(super) fn render_hook_report(outcomes: &[HookOutcome]) -> String {
     for outcome in outcomes {
         let scope = match outcome.scope {
             HookScope::PreSync => "pre_sync",
+            HookScope::PreDeploy => "pre_deploy",
             HookScope::OnChange => "on_change",
             HookScope::PostSync => "post_sync",
         };
