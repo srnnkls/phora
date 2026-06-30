@@ -1617,7 +1617,9 @@ mod tests {
     const EDITOR_OPTS_CONTENT: &[u8] = b"-- nested opts\nreturn {}\n";
     const EDITOR_RUN_CONTENT: &[u8] = b"#!/bin/sh\necho run\n";
     const EDITOR_NOTES_CONTENT: &[u8] = b"scratch notes, excluded by **/*.bak\n";
+    #[cfg(unix)]
     const LINK_NAME: &str = "link";
+    #[cfg(unix)]
     const LINK_TARGET: &str = "init.lua";
 
     struct ExportFixture {
@@ -1665,17 +1667,24 @@ mod tests {
             &["update-index", "--chmod=+x", "editor/bin/run.sh"],
         );
 
-        std::os::unix::fs::symlink(LINK_TARGET, linky.join(LINK_NAME)).unwrap();
-        run_git(src_path, &["add", "linky/link"]);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(LINK_TARGET, linky.join(LINK_NAME)).unwrap();
+            run_git(src_path, &["add", "linky/link"]);
+        }
 
         let commit = commit_export_repo(src_path);
 
-        let link_mode =
-            String::from_utf8(run_git(src_path, &["ls-files", "-s", "linky/link"]).stdout).unwrap();
-        assert!(
-            link_mode.starts_with("120000"),
-            "linky/link must be committed as a git symlink (120000), got: {link_mode}"
-        );
+        #[cfg(unix)]
+        {
+            let link_mode =
+                String::from_utf8(run_git(src_path, &["ls-files", "-s", "linky/link"]).stdout)
+                    .unwrap();
+            assert!(
+                link_mode.starts_with("120000"),
+                "linky/link must be committed as a git symlink (120000), got: {link_mode}"
+            );
+        }
         let run_mode =
             String::from_utf8(run_git(src_path, &["ls-files", "-s", "editor/bin/run.sh"]).stdout)
                 .unwrap();
@@ -1705,6 +1714,7 @@ mod tests {
         export_fixture_from(src, commit)
     }
 
+    #[cfg(unix)]
     #[expect(
         clippy::unwrap_used,
         reason = "fixture setup fails loudly; git CLI is assumed present"
@@ -3060,6 +3070,7 @@ path = "srnnkls/tropos"
     }
 
     /// The `linky` artifact's blob and symlink leaves, mapped to dir-relative dests.
+    #[cfg(unix)]
     fn linky_leaves() -> Vec<ExportLeaf> {
         vec![
             ExportLeaf {
@@ -3358,6 +3369,7 @@ path = "srnnkls/tropos"
 
     // ---- in-artifact symlink policy ----
 
+    #[cfg(unix)]
     #[test]
     fn export_rejects_symlink_when_policy_disallows() {
         let fixture = build_export_fixture();
@@ -3419,6 +3431,7 @@ path = "srnnkls/tropos"
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn export_rejects_symlink_colliding_with_rendered_deployed_name() {
         let fixture = build_symlink_template_collision_fixture();

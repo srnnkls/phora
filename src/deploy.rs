@@ -217,6 +217,27 @@ fn classify_drift(
     ArtifactState::Clean
 }
 
+#[cfg(unix)]
+fn same_file_identity(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.ino() == b.ino() && a.dev() == b.dev()
+}
+
+#[cfg(windows)]
+fn same_file_identity(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    match (
+        a.file_index(),
+        b.file_index(),
+        a.volume_serial_number(),
+        b.volume_serial_number(),
+    ) {
+        (Some(ai), Some(bi), Some(av), Some(bv)) => ai == bi && av == bv,
+        // identity unconfirmable on Windows -> don't falsely flag drift; the content hash check below is the real safety net
+        _ => true,
+    }
+}
+
 /// `None` declines the refresh on any uncertainty (read error, re-stat error, mid-flight
 /// change, hash mismatch); `Some` is a revalidated stat whose bytes matched `mf.blake3`.
 fn revalidate_file(
@@ -225,7 +246,6 @@ fn revalidate_file(
     mf: &ManifestFile,
 ) -> Result<Option<ScannedFile>> {
     use std::io::Read;
-    use std::os::unix::fs::MetadataExt;
 
     let Ok(mut file) = std::fs::File::open(file_path) else {
         return Ok(None);
@@ -238,7 +258,7 @@ fn revalidate_file(
     }
     // Closes the path-resolution TOCTOU: the opened fd must be the same inode the caller's
     // no-follow pre-stat saw, else a mid-validation path swap could mask content drift.
-    if pre.ino() != meta.ino() || pre.dev() != meta.dev() {
+    if !same_file_identity(&pre, meta) {
         return Ok(None);
     }
 
@@ -368,13 +388,15 @@ pub fn copy_tree(src: &Path, dst: &Path, allow_symlinks: bool) -> Result<()> {
     }
     for link in &scan.symlinks {
         let to = dst.join(link);
-        let target = std::fs::read_link(src.join(link))
+        let from = src.join(link);
+        let target = std::fs::read_link(&from)
             .map_err(|e| Error::Projection(format!("read link {}: {e}", link.display())))?;
         if let Some(parent) = to.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| Error::Projection(format!("create dir {}: {e}", parent.display())))?;
         }
-        std::os::unix::fs::symlink(&target, &to)
+        let is_file = std::fs::metadata(&from).map_or(true, |m| m.is_file());
+        create_symlink(&target, &to, is_file)
             .map_err(|e| Error::Projection(format!("symlink {}: {e}", to.display())))?;
     }
     Ok(())
@@ -818,6 +840,7 @@ mod tests {
     use crate::store::{FileRegistry, HookState, ManifestFile, StoreError};
 
     type StoreResult<T> = std::result::Result<T, StoreError>;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
 
@@ -908,6 +931,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn soft_scan_reports_symlink_without_error_and_excludes_it_from_files() {
         let dir = TempDir::new().expect("tempdir");
@@ -933,6 +957,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn strict_scan_errors_on_disallowed_symlink() {
         let dir = TempDir::new().expect("tempdir");
@@ -952,6 +977,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn strict_scan_records_an_allowed_symlink_so_it_survives_the_copy_fallback() {
         let dir = TempDir::new().expect("tempdir");
@@ -975,6 +1001,7 @@ mod tests {
 
     // copy_tree
 
+    #[cfg(unix)]
     #[test]
     fn copy_tree_recreates_symlinks_not_just_regular_files() {
         let root = TempDir::new().expect("tempdir");
@@ -1345,6 +1372,7 @@ mod tests {
     /// A symlink deployed at the key, pointing at a live directory, with a linked record
     /// whose sentinel commit deliberately mismatches `expected_commit`. The linked
     /// short-circuit must fire BEFORE the commit/source Foreign check, yielding Linked.
+    #[cfg(unix)]
     #[test]
     fn linked_record_reads_linked_not_foreign_despite_commit_mismatch() {
         let (_state_dir, reg) = registry();
@@ -1369,6 +1397,7 @@ mod tests {
 
     /// Even when the symlink target's content diverges from anything recorded, a linked
     /// artifact must never be reported Modified — it is quarantined from per-file drift.
+    #[cfg(unix)]
     #[test]
     fn linked_record_never_reads_modified_when_target_content_differs() {
         let (_state_dir, reg) = registry();
@@ -1393,6 +1422,7 @@ mod tests {
 
     /// A dangling linked symlink (its target deleted): `try_exists` follows the link and
     /// returns Ok(false), so the state is Missing — and the call must not crash.
+    #[cfg(unix)]
     #[test]
     fn dangling_linked_symlink_reads_missing_without_crashing() {
         let (_state_dir, reg) = registry();
@@ -1846,6 +1876,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn modified_when_symlink_present_and_disallowed() {
         let (_state_dir, reg) = registry();

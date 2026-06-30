@@ -2370,6 +2370,7 @@ fn sync_modified_artifact_persists_no_refresh_for_touched_identical_sibling() {
 
 /// H1: without `Linked` in the `matches!` guard at the deploy closure, Linked falls to
 /// `None => Overwrite` and re-deploys every sync; this pins the no-op.
+#[cfg(unix)]
 #[test]
 fn second_deploy_over_correct_link_is_a_noop() {
     use std::os::unix::fs::symlink;
