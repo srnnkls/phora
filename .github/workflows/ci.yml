@@ -13,18 +13,22 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# ubuntu-latest only. macOS is deferred: xdg-base-dirs adds a macOS-specific
-# state fallback (~/Library/Application Support) that stays E2E-uncovered
-# until a macOS runner is added here.
 jobs:
   lint-test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
         with:
           experimental: true
           install: true
+          # scrut/hk/pkl ship no windows asset; scope the install to rust so
+          # the windows runner can't fail on a missing POSIX-only binary.
+          install_args: rust
           cache: true
       - uses: Swatinem/rust-cache@v2
       # mise caches the toolchain but not its rustup components; add them every
@@ -34,7 +38,12 @@ jobs:
       - run: mise run test
 
   integration:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # scrut suite is POSIX-only sh; no windows runner.
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2

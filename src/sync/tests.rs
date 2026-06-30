@@ -88,6 +88,7 @@ fn test_protected(cwd: &Path) -> super::confine::ProtectedPathSet {
         .expect("protected set")
 }
 
+#[cfg(unix)]
 fn linked_flat_record(target: &str, source: &str, artifact: &str) -> RegistryRecord {
     RegistryRecord {
         version: 1,
@@ -2370,6 +2371,7 @@ fn sync_modified_artifact_persists_no_refresh_for_touched_identical_sibling() {
 
 /// H1: without `Linked` in the `matches!` guard at the deploy closure, Linked falls to
 /// `None => Overwrite` and re-deploys every sync; this pins the no-op.
+#[cfg(unix)]
 #[test]
 fn second_deploy_over_correct_link_is_a_noop() {
     use std::os::unix::fs::symlink;
@@ -4865,6 +4867,7 @@ fn prune_is_instance_granular_across_two_aliases_of_one_source() {
 
 /// A real `GitBackend` over a throwaway mirror dir; link-source rebuild/prune
 /// never reach it, but the signature requires a backend.
+#[cfg(unix)]
 fn fx_backend() -> GitBackend {
     let git_dir = TempDir::new().expect("backend mirror dir");
     let backend = GitBackend::new(git_dir.path().to_path_buf());
@@ -5484,6 +5487,7 @@ fn stale_link_with_wrong_target_is_repointed() {
 // legs is the dst TYPE (real dir vs symlink), which is what these tests assert.
 
 /// A by-source copy config for `dev-src` sharing the link leg's dst path.
+#[cfg(unix)]
 fn by_source_copy_config(url: &str, target_path: &Path) -> Config {
     config_one_source_one_target("dev-src", url, "dest", target_path, "by-source")
 }
@@ -10311,6 +10315,7 @@ mod leaf_granular_deploy_tests {
         (src, url)
     }
 
+    #[cfg(unix)]
     fn build_link_tree_with_nested_plug_dir() -> TempDir {
         let td = TempDir::new().expect("link tree tempdir");
         let base = td.path();
@@ -10322,6 +10327,7 @@ mod leaf_granular_deploy_tests {
         td
     }
 
+    #[cfg(unix)]
     fn build_flat_two_leaf_link_tree() -> TempDir {
         let td = TempDir::new().expect("link tree tempdir");
         let base = td.path();
@@ -10933,6 +10939,7 @@ mod leaf_granular_deploy_tests {
         (src, url)
     }
 
+    #[cfg(unix)]
     fn build_link_tree_with_secret() -> TempDir {
         let td = TempDir::new().expect("link tree tempdir");
         let base = td.path();
