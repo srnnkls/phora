@@ -29,7 +29,9 @@ footer = """
                 https://github.com/srnnkls/phora/compare/{{ release.previous.version }}..{{ release.version }}
         {% endif -%}
     {% else -%}
-        [unreleased]: https://github.com/srnnkls/phora/compare/{{ release.previous.version }}..HEAD
+        {% if release.previous.version -%}
+            [unreleased]: https://github.com/srnnkls/phora/compare/{{ release.previous.version }}..HEAD
+        {% endif -%}
     {% endif -%}
 {% endfor %}
 """
