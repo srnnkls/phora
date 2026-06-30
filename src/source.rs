@@ -290,6 +290,42 @@ pub(crate) fn lock_mirror(git_dir: &Path, source: &SourceName, url: &str) -> Res
     Ok(lock)
 }
 
+/// Idle window above any real clone; a staging dir older than this lost its
+/// owning process before `Drop` could clean it up.
+const STAGING_ORPHAN_GRACE: std::time::Duration = std::time::Duration::from_hours(1);
+
+/// Removes staging dirs abandoned by a killed clone of `url`'s mirror.
+///
+/// Caller must hold the per-mirror lock: it excludes a concurrent full fetch of
+/// this key, and [`STAGING_ORPHAN_GRACE`] excludes the lock-free shallow clone.
+/// Errors are ignored; a sweep must never fail the fetch it precedes.
+fn sweep_orphan_staging(git_dir: &Path, url: &str) {
+    let key = MirrorKey::from_url(&NormalizedUrl::parse(url));
+    let prefix = format!(".{}.staging-", key.as_str());
+    let Ok(entries) = std::fs::read_dir(git_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with(&prefix) || staging_is_recent(&entry) {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(entry.path());
+    }
+}
+
+/// An unreadable or future mtime returns `true`, keeping a possibly-live dir.
+fn staging_is_recent(entry: &std::fs::DirEntry) -> bool {
+    let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+        return true;
+    };
+    modified
+        .elapsed()
+        .map_or(true, |age| age < STAGING_ORPHAN_GRACE)
+}
+
 /// A scratch mirror renamed into the canonical path on success, removed on drop otherwise.
 struct MirrorStaging {
     path: PathBuf,
@@ -587,11 +623,11 @@ impl SourceBackend for GitBackend {
 
     fn fetch(&self, source: &SourceName, url: &str) -> Result<()> {
         let _lock = lock_mirror(&self.git_dir, source, url)?;
+        sweep_orphan_staging(&self.git_dir, url);
         let mirror = self.mirror_path(url);
 
-        if mirror.exists() {
-            let repo = gix::open(&mirror)
-                .map_err(|e| SourceError::Source(format!("open mirror {source}: {e}")))?;
+        let healthy = mirror.exists().then(|| gix::open(&mirror).ok()).flatten();
+        if let Some(repo) = healthy {
             let mut remote = repo
                 .find_remote("origin")
                 .map_err(|e| SourceError::Source(format!("find origin in {source}: {e}")))?;
@@ -612,6 +648,11 @@ impl SourceBackend for GitBackend {
                 .receive(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
                 .map_err(|e| SourceError::Source(format!("receive pack in {source}: {e}")))?;
         } else {
+            if mirror.exists() {
+                std::fs::remove_dir_all(&mirror).map_err(|e| {
+                    SourceError::Source(format!("remove corrupt mirror {source}: {e}"))
+                })?;
+            }
             let staging = MirrorStaging::create(&self.git_dir, url);
             gix::prepare_clone_bare(url, &staging.path)
                 .map_err(|e| SourceError::Source(format!("prepare clone {source}: {e}")))?
@@ -1894,6 +1935,80 @@ mod tests {
         assert_eq!(
             resolved, third_sha,
             "fetch on an existing mirror must pull new commits, not no-op"
+        );
+    }
+
+    #[test]
+    fn fetch_reclones_a_corrupt_canonical_mirror() {
+        let fixture = build_git_fixture();
+        let mirror = fixture.backend.mirror_path(&fixture.url);
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("first fetch clones");
+
+        std::fs::remove_dir_all(&mirror).expect("drop the real mirror");
+        std::fs::create_dir_all(&mirror).expect("recreate an empty mirror dir");
+        std::fs::write(mirror.join("garbage"), b"not a repo").expect("write garbage");
+        assert!(gix::open(&mirror).is_err(), "corrupt mirror must not open");
+
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch must self-heal a corrupt mirror, not error");
+
+        assert!(
+            is_bare_repo(&mirror),
+            "mirror must be a valid bare repo after self-heal"
+        );
+        let resolved = fixture
+            .backend
+            .resolve(&sn("src"), &fixture.url, &Refspec::Branch("main".into()))
+            .expect("branch resolves after self-heal");
+        assert_eq!(resolved, fixture.head_sha);
+    }
+
+    #[test]
+    fn fetch_sweeps_a_stale_orphan_staging_dir() {
+        let fixture = build_git_fixture();
+        let git_dir = fixture.backend.git_dir.clone();
+        std::fs::create_dir_all(&git_dir).expect("git dir");
+        let key = MirrorKey::from_url(&NormalizedUrl::parse(&fixture.url));
+        let orphan = git_dir.join(format!(".{}.staging-424242-0", key.as_str()));
+        std::fs::create_dir_all(&orphan).expect("create orphan staging");
+        std::fs::write(orphan.join("partial-pack"), b"x").expect("write partial");
+        let stale = filetime::FileTime::from_unix_time(1_600_000_000, 0);
+        filetime::set_file_mtime(&orphan, stale).expect("backdate orphan past grace");
+
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+
+        assert!(
+            !orphan.exists(),
+            "a stale orphan staging dir must be swept by fetch"
+        );
+        assert!(is_bare_repo(&fixture.backend.mirror_path(&fixture.url)));
+    }
+
+    #[test]
+    fn fetch_keeps_a_recent_staging_dir() {
+        let fixture = build_git_fixture();
+        let git_dir = fixture.backend.git_dir.clone();
+        std::fs::create_dir_all(&git_dir).expect("git dir");
+        let key = MirrorKey::from_url(&NormalizedUrl::parse(&fixture.url));
+        let live = git_dir.join(format!(".{}.staging-424242-1", key.as_str()));
+        std::fs::create_dir_all(&live).expect("create live staging");
+
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+
+        assert!(
+            live.exists(),
+            "a recently-touched staging dir must be left in place"
         );
     }
 
