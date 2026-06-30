@@ -69,7 +69,7 @@ mise exec -- actionlint .github/workflows/*.yml
    - when `steps.release.outputs.releases_created == 'true'`, dispatches the build: `gh workflow run release.yml --ref "$TAG" -f tag="$TAG"`, where `$TAG` is `fromJSON(steps.release.outputs.releases)[0].tag`.
 4. `release.yml` then:
    - `plan` computes the matrix,
-   - `build-local-artifacts` builds the 7-target matrix (`x86_64`/`aarch64` linux-gnu, `x86_64`/`aarch64` linux-musl, `aarch64`/`x86_64` apple-darwin, `x86_64-pc-windows-msvc`) and produces SLSA attestations,
+   - `build-local-artifacts` builds the 6-target matrix (`x86_64`/`aarch64` linux-gnu, `x86_64`/`aarch64` linux-musl, `aarch64`/`x86_64` apple-darwin) and produces SLSA attestations,
    - `build-global-artifacts` and `host` upload artifacts and create the GitHub Release,
    - `publish-homebrew-formula` pushes the formula to `srnnkls/homebrew-phora` using `HOMEBREW_TAP_TOKEN`,
    - `announce` finalizes.
