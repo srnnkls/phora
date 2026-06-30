@@ -38,7 +38,7 @@ Do these once, in order, before the first release:
 Treat the very first `0.1.x` release as a throwaway end-to-end proof of the release-plz to cargo-dist dispatch handoff — its purpose is to exercise the path, not to ship a meaningful artifact.
 
 1. Push to `main`. `release-plz.yml` opens a release PR.
-2. Merge the release PR. The `release` job publishes to crates.io, pushes the `v0.1.x` tag, and (because `releases_created` is true) runs `gh workflow run release.yml -f tag=v0.1.x`.
+2. Merge the release PR. The `release` job publishes to crates.io, pushes the `v0.1.x` tag, and (because `releases_created` is true) runs `gh workflow run release.yml --ref v0.1.x -f tag=v0.1.x`.
 3. Watch `release.yml` complete the matrix build, the GitHub Release, and the Homebrew formula push.
 4. If any stage fails, use the recovery steps below; the dispatch handoff is the stage most likely to need a manual retry on the first run.
 
@@ -66,7 +66,7 @@ mise exec -- actionlint .github/workflows/*.yml
    - bumps the version and regenerates `CHANGELOG` via git-cliff (`cliff.toml`),
    - publishes the crate to crates.io,
    - pushes the `v*` tag. Because `git_release_enable = false` in `release-plz.toml`, release-plz does not create a GitHub Release — cargo-dist owns that.
-   - when `steps.release.outputs.releases_created == 'true'`, dispatches the build: `gh workflow run release.yml -f tag="$TAG"`, where `$TAG` is `fromJSON(steps.release.outputs.releases)[0].tag`.
+   - when `steps.release.outputs.releases_created == 'true'`, dispatches the build: `gh workflow run release.yml --ref "$TAG" -f tag="$TAG"`, where `$TAG` is `fromJSON(steps.release.outputs.releases)[0].tag`.
 4. `release.yml` then:
    - `plan` computes the matrix,
    - `build-local-artifacts` builds the 7-target matrix (`x86_64`/`aarch64` linux-gnu, `x86_64`/`aarch64` linux-musl, `aarch64`/`x86_64` apple-darwin, `x86_64-pc-windows-msvc`) and produces SLSA attestations,
@@ -83,10 +83,10 @@ The dispatch handoff between the two workflows is the key failure mode: the crat
 The `release` job succeeded through publish and tag but the dispatch step was missed or failed. Manually dispatch the build with the exact emitted tag:
 
 ```bash
-gh workflow run release.yml -f tag=v<x.y.z>
+gh workflow run release.yml --ref v<x.y.z> -f tag=v<x.y.z>
 ```
 
-This is the same `release.yml` + `-f tag=` contract the `release` job uses, so it resumes the build identically. Do not re-run the `release` job — the crate is already published and the tag already exists; re-publishing the same version fails.
+This is the same `release.yml` + `--ref`/`-f tag=` contract the `release` job uses, so it resumes the build identically. Do not re-run the `release` job — the crate is already published and the tag already exists; re-publishing the same version fails.
 
 ### Build started but a later job failed
 
@@ -99,4 +99,4 @@ If crates.io publish failed, no tag was pushed. Fix the cause (token, name owner
 
 ## Residual risk
 
-The automatic dispatch from `release-plz.yml` to `release.yml` has no role-model precedent — uv and similar projects dispatch `release.yml` manually rather than chaining it from the version-bump job. The first real `0.1.x` release is the only true end-to-end test of this handoff. Until it has run green once, treat the dispatch step as unproven and keep the manual `gh workflow run release.yml -f tag=v<x.y.z>` recovery command ready.
+The automatic dispatch from `release-plz.yml` to `release.yml` has no role-model precedent — uv and similar projects dispatch `release.yml` manually rather than chaining it from the version-bump job. The first real `0.1.x` release is the only true end-to-end test of this handoff. Until it has run green once, treat the dispatch step as unproven and keep the manual `gh workflow run release.yml --ref v<x.y.z> -f tag=v<x.y.z>` recovery command ready.
