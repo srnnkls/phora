@@ -57,3 +57,7 @@ required-features = ["bench"]
 
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }
+
+[profile.dist]
+inherits = "release"
+lto = "thin"
