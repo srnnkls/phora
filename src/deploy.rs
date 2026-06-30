@@ -224,18 +224,10 @@ fn same_file_identity(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
 }
 
 #[cfg(windows)]
-fn same_file_identity(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    match (
-        a.file_index(),
-        b.file_index(),
-        a.volume_serial_number(),
-        b.volume_serial_number(),
-    ) {
-        (Some(ai), Some(bi), Some(av), Some(bv)) => ai == bi && av == bv,
-        // identity unconfirmable on Windows -> don't falsely flag drift; the content hash check below is the real safety net
-        _ => true,
-    }
+fn same_file_identity(_a: &std::fs::Metadata, _b: &std::fs::Metadata) -> bool {
+    // No stable Metadata-based file identity on Windows (file_index/volume_serial_number
+    // are nightly-only); the content-hash check in revalidate_file is the safety net.
+    true
 }
 
 /// `None` declines the refresh on any uncertainty (read error, re-stat error, mid-flight

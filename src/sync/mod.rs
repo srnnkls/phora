@@ -37,10 +37,11 @@ pub(crate) use target::record_artifact_path;
 use target::{TargetRun, deploy_target};
 
 #[cfg(test)]
+use {crate::config::LayoutKind, crate::lock::LockedSource};
+
+#[cfg(all(test, unix))]
 use {
-    crate::config::LayoutKind,
     crate::deploy::check_artifact_state,
-    crate::lock::LockedSource,
     target::{ArtifactEntry, deploy_artifact_entry},
 };
 
