@@ -2,6 +2,15 @@
 name = "phora"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.96"
+description = "A git-based artifact package manager and multiplexer for content-addressed file distribution"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/srnnkls/phora"
+homepage = "https://github.com/srnnkls/phora"
+documentation = "https://docs.rs/phora"
+keywords = ["git", "artifact", "deploy", "sync", "content-addressed"]
+categories = ["command-line-utilities", "development-tools", "filesystem"]
 
 [dependencies]
 blake3 = "1.8.5"

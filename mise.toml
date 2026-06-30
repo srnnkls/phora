@@ -3,6 +3,10 @@ rust = { version = "1.96.0", profile = "default" }   # pinned; default profile s
 "github:facebookincubator/scrut" = "0.4.3"   # deliberate one-minor bump over fas's 0.4.2
 hk = { version = "1.47.0", postinstall = "hk install --mise", depends = ["pkl"] }
 pkl = "0.31.0"
+actionlint = "1.7.12"
+git-cliff = "2.13.1"
+cargo-dist = "0.32.0"
+release-plz = "0.3.159"
 
 [tasks.build]
 run = "cargo build"
