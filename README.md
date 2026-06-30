@@ -19,7 +19,47 @@ assets from one or more repos (or URLs) into the places on disk that consume the
 
 ## Installation
 
-```bash
+### Shell (Linux, macOS)
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/srnnkls/phora/releases/latest/download/phora-installer.sh | sh
+```
+
+### PowerShell (Windows)
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://github.com/srnnkls/phora/releases/latest/download/phora-installer.ps1 | iex"
+```
+
+### Homebrew
+
+```sh
+brew install srnnkls/phora/phora
+```
+
+### Cargo
+
+```sh
+cargo install phora
+```
+
+### Prebuilt binaries
+
+Download an archive for your platform from the [releases page](https://github.com/srnnkls/phora/releases). Prebuilt targets:
+
+- `x86_64-unknown-linux-gnu`
+- `aarch64-unknown-linux-gnu`
+- `x86_64-unknown-linux-musl`
+- `aarch64-unknown-linux-musl`
+- `x86_64-apple-darwin`
+- `aarch64-apple-darwin`
+- `x86_64-pc-windows-msvc`
+
+Every release artifact ships with a SHA-256 checksum and an SLSA build-provenance attestation, verifiable with `gh attestation verify <file> --repo srnnkls/phora`.
+
+### From source
+
+```sh
 cargo install --path .
 # or, during development:
 mise run build      # cargo build
