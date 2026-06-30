@@ -10,6 +10,7 @@ mod common;
 /// Named-diagnostic contract phrases the confinement layer must own; each test asserts
 /// the one phrase for its vector, never a disjunction of attacker substrings.
 const CONFINE_LINK_REJECTED: &str = "transitive source cannot use deploy = \"link\"";
+#[cfg(unix)]
 const CONFINE_SYMLINK_ANCESTOR: &str = "anchor ancestor is a symlink";
 const CONFINE_PROTECTED_PATH: &str = "protected path";
 /// Phrase owned by the orthogonal foreign-content guard; a CONFINE pass must NOT be attributable to it.
