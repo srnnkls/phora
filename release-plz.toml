@@ -1,0 +1,4 @@
+[workspace]
+changelog_config = "cliff.toml"
+git_tag_enable = true
+git_release_enable = false # cargo-dist owns the GitHub Release; release-plz only creates the tag
