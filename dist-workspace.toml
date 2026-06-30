@@ -10,9 +10,8 @@ targets = [
     "aarch64-unknown-linux-musl",
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
-    "x86_64-pc-windows-msvc",
 ]
-installers = ["shell", "powershell", "homebrew"]
+installers = ["shell", "homebrew"]
 tap = "srnnkls/homebrew-phora"
 publish-jobs = ["homebrew"]
 create-release = true
