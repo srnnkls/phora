@@ -326,13 +326,15 @@ fn sweep_orphan_staging(git_dir: &Path, url: &str) {
 
 /// A clone writes its pack into `objects/pack/` subdirs, so the staging root's own
 /// mtime freezes early; liveness must consider the newest mtime in the whole tree.
-/// An unreadable or future mtime counts as recent, keeping a possibly-live dir.
 fn staging_is_recent(path: &Path) -> bool {
     let mut saw_mtime = false;
-    for entry in walkdir::WalkDir::new(path).into_iter().flatten() {
-        let Ok(meta) = entry.metadata() else { continue };
+    for entry in walkdir::WalkDir::new(path) {
+        let Ok(entry) = entry else { return true };
+        let Ok(meta) = entry.metadata() else {
+            return true;
+        };
         let Ok(modified) = meta.modified() else {
-            continue;
+            return true;
         };
         saw_mtime = true;
         if modified
