@@ -59,7 +59,11 @@ use crate::sync::{Conflict, ConflictResolver, Resolution};
 use std::str::FromStr;
 
 #[derive(Parser, Debug)]
-#[command(name = "phora", version, about = "Git-based artifact package manager")]
+#[command(
+    name = "phora",
+    version,
+    about = "A git-based artifact package manager and multiplexer for content-addressed file distribution"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,

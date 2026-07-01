@@ -88,6 +88,7 @@ pub struct PreviewCollision {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PreviewTargetPlan {
     pub target: String,
+    pub path: PathBuf,
     pub entries: Vec<PreviewEntry>,
     pub collisions: Vec<PreviewCollision>,
     pub warnings: Vec<BindingWarnings>,
@@ -183,6 +184,7 @@ fn preview_target(
     let collisions = detect_dest_collisions(&entries);
     Ok(PreviewTargetPlan {
         target: target_name.to_owned(),
+        path,
         entries,
         collisions,
         warnings,

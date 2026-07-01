@@ -320,7 +320,7 @@ pub(super) fn warn_unbind_tombstone(target: &str) {
 pub(crate) fn render_preview_tree(plan: &PreviewPlan) -> String {
     let mut out = String::new();
     for tp in &plan.targets {
-        let _ = writeln!(out, "{}", tp.target);
+        let _ = writeln!(out, "{} -> {}", tp.target, tp.path.display());
         for entry in &tp.entries {
             match entry.state {
                 SyncState::Synced => render_synced_entry(&mut out, entry),
@@ -508,6 +508,7 @@ mod preview_render_tests {
         entry.rename = Some("x.md".to_string());
         let tp = PreviewTargetPlan {
             target: "home".to_string(),
+            path: PathBuf::from("/dst"),
             entries: vec![entry],
             collisions: Vec::new(),
             warnings: Vec::new(),
@@ -530,6 +531,7 @@ mod preview_render_tests {
         }];
         let tp = PreviewTargetPlan {
             target: "home".to_string(),
+            path: PathBuf::from("/dst"),
             entries: vec![entry],
             collisions: Vec::new(),
             warnings: Vec::new(),
@@ -550,6 +552,7 @@ mod preview_render_tests {
     fn take_no_match_warning_renders_with_a_did_you_mean_suggestion() {
         let tp = PreviewTargetPlan {
             target: "home".to_string(),
+            path: PathBuf::from("/dst"),
             entries: Vec::new(),
             collisions: Vec::new(),
             warnings: vec![BindingWarnings {
@@ -577,6 +580,7 @@ mod preview_render_tests {
     fn collapse_blocked_warning_renders_per_binding() {
         let tp = PreviewTargetPlan {
             target: "home".to_string(),
+            path: PathBuf::from("/dst"),
             entries: Vec::new(),
             collisions: Vec::new(),
             warnings: vec![BindingWarnings {
@@ -599,6 +603,7 @@ mod preview_render_tests {
     fn json_carries_warnings_in_a_structured_form() {
         let tp = PreviewTargetPlan {
             target: "home".to_string(),
+            path: PathBuf::from("/dst"),
             entries: Vec::new(),
             collisions: Vec::new(),
             warnings: vec![BindingWarnings {
