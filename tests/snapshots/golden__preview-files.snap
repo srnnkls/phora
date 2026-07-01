@@ -4,7 +4,7 @@ expression: "snapshot(&run(&fixture, &[\"preview\", \"--files\"]))"
 ---
 exit: 0
 --- stdout ---
-home
+home -> <HOME>/deploy
   dotfiles@<COMMIT8> editor/ -> <HOME>/deploy/editor
     init.lua
     lua/opts.lua

@@ -249,7 +249,7 @@ and carries a no-match glob whose warning suggests the nearest leaf.
 
 ```scrut
 $ reset_deploy && seed_selection "$repo" 'include = ["editor", "lint"]' 'take = ["editor/**", { "lint/rules.toml" = "lint/local.toml" }, "editor/nonexist*.lua"]' && phora sync >/dev/null 2>&1; phora preview 2>&1 | normalize
-home
+home -> <ROOT>/target-home
   dotfiles@ca94c83b editor/ -> <ROOT>/target-home/editor
   dotfiles@ca94c83b lint/rules.toml -> lint/local.toml -> <ROOT>/target-home/lint/local.toml
   warning: dotfiles take `editor/nonexist*.lua` matched no offered leaf
@@ -261,7 +261,7 @@ renamed leaf's deployed file; the rename and the warning stay.
 
 ```scrut
 $ phora preview --files 2>&1 | normalize
-home
+home -> <ROOT>/target-home
   dotfiles@ca94c83b editor/ -> <ROOT>/target-home/editor
     init.lua
     lua/opts.lua

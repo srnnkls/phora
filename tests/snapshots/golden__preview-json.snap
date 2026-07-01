@@ -8,6 +8,7 @@ exit: 0
   "targets": [
     {
       "target": "home",
+      "path": "<HOME>/deploy",
       "entries": [
         {
           "identity": "dotfiles",
