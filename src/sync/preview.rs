@@ -86,6 +86,7 @@ pub struct PreviewCollision {
 
 /// One target's offline preview: every binding's entries plus predicted collisions.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[non_exhaustive]
 pub struct PreviewTargetPlan {
     pub target: String,
     pub path: PathBuf,
