@@ -85,10 +85,12 @@ fn fetch_distinct_mirrors(
         if source.deploy_mode() == DeployMode::Link {
             continue;
         }
-        if lock_hit(config, source, unit, effective_lock, force).is_some() {
+        let git = remote_for(remotes, &unit.name)?;
+        if lock_hit(config, source, unit, effective_lock, force).is_some()
+            && backend.mirror_ready(git)
+        {
             continue;
         }
-        let git = remote_for(remotes, &unit.name)?;
         let key = MirrorKey::from_url(&NormalizedUrl::parse(git))
             .as_str()
             .to_owned();
