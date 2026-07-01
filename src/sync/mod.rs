@@ -409,8 +409,23 @@ pub fn sync(
 
     sweep_target_parents(&effective_config, &journal, registry)?;
 
-    let recorded_after_recovery: Vec<ArtifactKey> =
-        registry.list_all()?.into_iter().map(|r| r.key).collect();
+    let mut ejected_by_target: BTreeMap<String, Vec<EjectedEntry>> = BTreeMap::new();
+    let recorded_after_recovery: Vec<ArtifactKey> = registry
+        .list_all()?
+        .into_iter()
+        .map(|r| r.key)
+        .filter(|key| {
+            let ejected = match ejected_by_target.entry(key.target.clone()) {
+                std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::btree_map::Entry::Vacant(e) => {
+                    e.insert(registry.load_ejected(&key.target).unwrap_or_default())
+                }
+            };
+            !ejected
+                .iter()
+                .any(|e| e.source == key.source && e.artifact == key.artifact)
+        })
+        .collect();
 
     let (routed, resolved_commits) = resolve_sources(
         &effective_config,

@@ -10101,6 +10101,45 @@ fn sealed_offer_source_dropped_a_still_wanted_artifact_is_a_hard_error() {
     drop(src);
 }
 
+#[test]
+fn sealed_offer_ejecting_a_source_dropped_artifact_unblocks_sync() {
+    let src = TempDir::new().expect("src tempdir");
+    let p = src.path();
+    run_git(p, &["init", "-b", "main", "."]);
+    run_git(p, &["config", "user.email", "test@example.com"]);
+    run_git(p, &["config", "user.name", "Test"]);
+    std::fs::create_dir_all(p.join("docs")).expect("mkdir docs");
+    std::fs::write(p.join("docs/readme.md"), b"# docs\n").expect("write docs");
+    run_git(p, &["add", "-A"]);
+    run_git(p, &["commit", "-m", "init without editor/"]);
+    let url = p.to_string_lossy().into_owned();
+
+    let git_dir = TempDir::new().expect("git dir");
+    let state_dir = TempDir::new().expect("state dir");
+    let backend = GitBackend::new(git_dir.path().to_path_buf());
+    let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.editor-src]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\"editor-src\"]\nlayout = \"flat\"\n",
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("default-offer config parses");
+
+    seed_recorded_artifact(&registry, "editor-src", "editor");
+    crate::sync::eject(&cfg, &registry, "editor", "editor-src", "dest")
+        .expect("ejecting a managed record must succeed");
+
+    let in_ = input(&cfg, None, None, None, false);
+    sync(&in_, &backend, &registry).expect(
+        "the diagnostic's own remedy is `eject it`; once `editor` is ejected the sealed-offer \
+         guard must skip it and let sync proceed — otherwise the prescribed remedy is inert",
+    );
+    drop(src);
+}
+
 fn assert_sealed_offer_diagnostic(rendered: &str, target: &str, source: &str, artifact: &str) {
     use crate::diagnostic::{MATCHED_AGAINST, REMEDY, SELECTION, TO_DEBUG};
     for phrase in [SELECTION, MATCHED_AGAINST, REMEDY, TO_DEBUG] {
