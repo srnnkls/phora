@@ -184,7 +184,7 @@ fn artifact_record(
     expected_source: &str,
 ) -> Result<std::result::Result<RegistryRecord, ArtifactState>> {
     let Some(record) = registry.get(key)? else {
-        if managed_under_sibling_shape(registry, key)? {
+        if managed_under_sibling_shape(registry, key, expected_source)? {
             return Ok(Err(ArtifactState::Outdated));
         }
         return Ok(Err(ArtifactState::Foreign));
@@ -198,15 +198,21 @@ fn artifact_record(
     Ok(Ok(record))
 }
 
-/// True when the same source holds a record under the collapsed-dir/per-leaf counterpart of `key`.
-fn managed_under_sibling_shape(registry: &dyn Registry, key: &ArtifactKey) -> Result<bool> {
-    let child_prefix = format!("{}/", key.artifact);
+/// True when `expected_source` holds a record under the collapsed-dir/per-leaf counterpart of `key`.
+fn managed_under_sibling_shape(
+    registry: &dyn Registry,
+    key: &ArtifactKey,
+    expected_source: &str,
+) -> Result<bool> {
+    let under = |child: &str, parent: &str| {
+        child
+            .strip_prefix(parent)
+            .is_some_and(|r| r.starts_with('/'))
+    };
     Ok(registry.list_target(&key.target)?.iter().any(|record| {
-        record.key.source == key.source
-            && (record.key.artifact.starts_with(&child_prefix)
-                || key
-                    .artifact
-                    .starts_with(&format!("{}/", record.key.artifact)))
+        record.key.source == expected_source
+            && (under(&record.key.artifact, &key.artifact)
+                || under(&key.artifact, &record.key.artifact))
     }))
 }
 
