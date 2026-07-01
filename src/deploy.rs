@@ -177,13 +177,16 @@ fn check_file_artifact_state(
     ))
 }
 
-/// `Err(state)` is not a failure: it carries the early Linked/Foreign `ArtifactState` to return.
+/// `Err(state)` is not a failure: it carries the early Linked/Outdated/Foreign `ArtifactState`.
 fn artifact_record(
     registry: &dyn Registry,
     key: &ArtifactKey,
     expected_source: &str,
 ) -> Result<std::result::Result<RegistryRecord, ArtifactState>> {
     let Some(record) = registry.get(key)? else {
+        if managed_under_sibling_shape(registry, key, expected_source)? {
+            return Ok(Err(ArtifactState::Outdated));
+        }
         return Ok(Err(ArtifactState::Foreign));
     };
     if record.linked {
@@ -193,6 +196,24 @@ fn artifact_record(
         return Ok(Err(ArtifactState::Foreign));
     }
     Ok(Ok(record))
+}
+
+/// True when `expected_source` holds a record under the collapsed-dir/per-leaf counterpart of `key`.
+fn managed_under_sibling_shape(
+    registry: &dyn Registry,
+    key: &ArtifactKey,
+    expected_source: &str,
+) -> Result<bool> {
+    let under = |child: &str, parent: &str| {
+        child
+            .strip_prefix(parent)
+            .is_some_and(|r| r.starts_with('/'))
+    };
+    Ok(registry.list_target(&key.target)?.iter().any(|record| {
+        record.key.source == expected_source
+            && (under(&record.key.artifact, &key.artifact)
+                || under(&key.artifact, &record.key.artifact))
+    }))
 }
 
 fn classify_drift(
@@ -1239,6 +1260,142 @@ mod tests {
         assert!(
             matches!(st, ArtifactState::Foreign),
             "existing target with no registry record => Foreign, got {st:?}"
+        );
+    }
+
+    fn sibling_record(
+        artifact: &str,
+        kind: crate::store::RecordKind,
+        linked: bool,
+    ) -> RegistryRecord {
+        RegistryRecord {
+            version: 1,
+            key: ArtifactKey {
+                target: TARGET.to_owned(),
+                source: SOURCE.to_owned(),
+                artifact: artifact.to_owned(),
+            },
+            source: SOURCE.to_owned(),
+            commit: if linked {
+                "link".to_owned()
+            } else {
+                COMMIT.to_owned()
+            },
+            digest: "link:".to_owned(),
+            projected_at: "2026-01-31T12:34:56Z".to_owned(),
+            layout: "flat".to_owned(),
+            kind,
+            allow_symlinks: false,
+            preserve_executable: true,
+            files: vec![],
+            linked,
+            vars_digest: None,
+        }
+    }
+
+    #[test]
+    fn collapsed_dir_key_over_recorded_per_leaf_reads_outdated_not_foreign() {
+        let (_state_dir, reg) = registry();
+        let target = TempDir::new().expect("target dir");
+        let dir = target.path().join("snippets");
+        std::fs::create_dir_all(&dir).expect("mkdir dir");
+
+        reg.put(&sibling_record(
+            "snippets/a.json",
+            crate::store::RecordKind::File,
+            true,
+        ))
+        .expect("put per-leaf record");
+
+        let dir_key = ArtifactKey {
+            target: TARGET.to_owned(),
+            source: SOURCE.to_owned(),
+            artifact: "snippets".to_owned(),
+        };
+        let st = check_artifact_state(&dir, SOURCE, COMMIT, &[], "snippets", &reg, &dir_key, None)
+            .expect("check_artifact_state");
+
+        assert!(
+            matches!(st, ArtifactState::Outdated),
+            "a plan that collapsed `snippets` this run while the prior run recorded it per-leaf \
+             (`snippets/a.json`) must redeploy under the new key, not read it as Foreign; got {st:?}"
+        );
+    }
+
+    #[test]
+    fn per_leaf_key_under_recorded_collapsed_dir_reads_outdated_not_foreign() {
+        let (_state_dir, reg) = registry();
+        let target = TempDir::new().expect("target dir");
+        let leaf = target.path().join("snippets").join("a.json");
+        std::fs::create_dir_all(leaf.parent().expect("leaf parent")).expect("mkdir");
+        std::fs::write(&leaf, b"{}").expect("write leaf");
+
+        reg.put(&sibling_record(
+            "snippets",
+            crate::store::RecordKind::Dir,
+            true,
+        ))
+        .expect("put collapsed record");
+
+        let leaf_key = ArtifactKey {
+            target: TARGET.to_owned(),
+            source: SOURCE.to_owned(),
+            artifact: "snippets/a.json".to_owned(),
+        };
+        let st = check_artifact_state(
+            &leaf,
+            SOURCE,
+            COMMIT,
+            &[],
+            "snippets/a.json",
+            &reg,
+            &leaf_key,
+            None,
+        )
+        .expect("check_artifact_state");
+
+        assert!(
+            matches!(st, ArtifactState::Outdated),
+            "a plan that split `snippets` into per-leaf this run while the prior run recorded the \
+             collapsed dir must redeploy under the new key, not read it as Foreign; got {st:?}"
+        );
+    }
+
+    #[test]
+    fn unrelated_source_sibling_stays_foreign() {
+        let (_state_dir, reg) = registry();
+        let target = TempDir::new().expect("target dir");
+        let dir = target.path().join("snippets");
+        std::fs::create_dir_all(&dir).expect("mkdir dir");
+
+        reg.put(&sibling_record(
+            "snippets/a.json",
+            crate::store::RecordKind::File,
+            true,
+        ))
+        .expect("put per-leaf record");
+
+        let dir_key = ArtifactKey {
+            target: TARGET.to_owned(),
+            source: "other-source".to_owned(),
+            artifact: "snippets".to_owned(),
+        };
+        let st = check_artifact_state(
+            &dir,
+            "other-source",
+            COMMIT,
+            &[],
+            "snippets",
+            &reg,
+            &dir_key,
+            None,
+        )
+        .expect("check_artifact_state");
+
+        assert!(
+            matches!(st, ArtifactState::Foreign),
+            "a sibling-shaped record from a DIFFERENT source is not this artifact under another \
+             shape; the dir stays Foreign, got {st:?}"
         );
     }
 
