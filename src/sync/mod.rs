@@ -409,21 +409,13 @@ pub fn sync(
 
     sweep_target_parents(&effective_config, &journal, registry)?;
 
-    let mut ejected_by_target: BTreeMap<String, Vec<EjectedEntry>> = BTreeMap::new();
-    let recorded_after_recovery: Vec<ArtifactKey> = registry
-        .list_all()?
+    let recorded = registry.list_all()?;
+    let ejected = crate::store::ejected_index(registry, &recorded)?;
+    let recorded_after_recovery: Vec<ArtifactKey> = recorded
         .into_iter()
         .map(|r| r.key)
         .filter(|key| {
-            let ejected = match ejected_by_target.entry(key.target.clone()) {
-                std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
-                std::collections::btree_map::Entry::Vacant(e) => {
-                    e.insert(registry.load_ejected(&key.target).unwrap_or_default())
-                }
-            };
-            !ejected
-                .iter()
-                .any(|e| e.source == key.source && e.artifact == key.artifact)
+            !ejected.contains(&(key.target.clone(), key.source.clone(), key.artifact.clone()))
         })
         .collect();
 
