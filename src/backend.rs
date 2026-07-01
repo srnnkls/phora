@@ -64,6 +64,10 @@ impl<G: SourceBackend, H: SourceBackend> SourceBackend for RouterBackend<G, H> {
         self.route(source).fetch(source, url)
     }
 
+    fn mirror_ready(&self, url: &str) -> bool {
+        self.git.mirror_ready(url)
+    }
+
     fn list_source_leaves(
         &self,
         source: &SourceName,

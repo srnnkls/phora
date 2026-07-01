@@ -129,6 +129,14 @@ pub struct ExportRequest<'a> {
 pub trait SourceBackend {
     fn fetch(&self, source: &SourceName, url: &str) -> Result<()>;
 
+    /// Whether a valid local mirror for `url` exists, letting a locked source skip
+    /// the fetch. A missing or corrupt mirror returns `false` so the caller still
+    /// fetches on a lock hit after the mirror cache was cleared. The default assumes
+    /// no mirror; only mirror-backed backends override it.
+    fn mirror_ready(&self, _url: &str) -> bool {
+        false
+    }
+
     /// Reads `path` from the already-fetched mirror at `commit`, offline. Mirror
     /// reads are git-only; the default errs unsupported and only `GitBackend` overrides it.
     ///
@@ -309,21 +317,94 @@ fn sweep_orphan_staging(git_dir: &Path, url: &str) {
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if !name.starts_with(&prefix) || staging_is_recent(&entry) {
+        if !name.starts_with(&prefix) || staging_is_recent(&entry.path()) {
             continue;
         }
         let _ = std::fs::remove_dir_all(entry.path());
     }
 }
 
-/// An unreadable or future mtime returns `true`, keeping a possibly-live dir.
-fn staging_is_recent(entry: &std::fs::DirEntry) -> bool {
-    let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
-        return true;
-    };
-    modified
-        .elapsed()
-        .map_or(true, |age| age < STAGING_ORPHAN_GRACE)
+/// A clone writes its pack into `objects/pack/` subdirs, so the staging root's own
+/// mtime freezes early; liveness must consider the newest mtime in the whole tree.
+/// An unreadable or future mtime counts as recent, keeping a possibly-live dir.
+fn staging_is_recent(path: &Path) -> bool {
+    let mut saw_mtime = false;
+    for entry in walkdir::WalkDir::new(path).into_iter().flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        saw_mtime = true;
+        if modified
+            .elapsed()
+            .map_or(true, |age| age < STAGING_ORPHAN_GRACE)
+        {
+            return true;
+        }
+    }
+    !saw_mtime
+}
+
+/// Opens the canonical mirror, distinguishing "re-clone" from "leave untouched".
+///
+/// `Ok(None)` means absent or genuinely not a repository — safe to re-clone. Any
+/// other open failure (I/O, permissions, unreadable config) may be transient, so it
+/// propagates rather than destroying a possibly-healthy cache.
+fn open_mirror(source: &SourceName, mirror: &Path) -> Result<Option<gix::Repository>> {
+    if !mirror.exists() {
+        return Ok(None);
+    }
+    match gix::open(mirror) {
+        Ok(repo) => Ok(Some(repo)),
+        Err(gix::open::Error::NotARepository { .. }) => Ok(None),
+        Err(e) => Err(SourceError::Source(format!("open mirror {source}: {e}"))),
+    }
+}
+
+fn fetch_into_mirror(source: &SourceName, repo: &gix::Repository) -> Result<()> {
+    let mut remote = repo
+        .find_remote("origin")
+        .map_err(|e| SourceError::Source(format!("find origin in {source}: {e}")))?;
+    remote
+        .replace_refspecs(
+            MIRROR_REFSPECS.iter().copied(),
+            gix::remote::Direction::Fetch,
+        )
+        .map_err(|e| SourceError::Source(format!("set mirror refspec in {source}: {e}")))?;
+    remote
+        .connect(gix::remote::Direction::Fetch)
+        .map_err(|e| SourceError::Source(format!("connect origin in {source}: {e}")))?
+        .prepare_fetch(
+            gix::progress::Discard,
+            gix::remote::ref_map::Options::default(),
+        )
+        .map_err(|e| SourceError::Source(format!("prepare fetch in {source}: {e}")))?
+        .receive(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
+        .map_err(|e| SourceError::Source(format!("receive pack in {source}: {e}")))?;
+    Ok(())
+}
+
+/// Clones a fresh mirror into staging, then replaces `mirror`. The canonical mirror
+/// is removed only after the clone succeeds, so a failed clone (unreachable remote)
+/// leaves an existing mirror intact rather than trading it for nothing.
+fn reclone_mirror(git_dir: &Path, source: &SourceName, url: &str, mirror: &Path) -> Result<()> {
+    let staging = MirrorStaging::create(git_dir, url);
+    gix::prepare_clone_bare(url, &staging.path)
+        .map_err(|e| SourceError::Source(format!("prepare clone {source}: {e}")))?
+        .configure_remote(|mut remote| {
+            remote.replace_refspecs(
+                MIRROR_REFSPECS.iter().copied(),
+                gix::remote::Direction::Fetch,
+            )?;
+            Ok(remote)
+        })
+        .fetch_only(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
+        .map_err(|e| SourceError::Source(format!("clone bare {source}: {e}")))?;
+    if mirror.exists() {
+        std::fs::remove_dir_all(mirror)
+            .map_err(|e| SourceError::Source(format!("remove corrupt mirror {source}: {e}")))?;
+    }
+    staging.commit_to(mirror, source.as_str())
 }
 
 /// A scratch mirror renamed into the canonical path on success, removed on drop otherwise.
@@ -626,49 +707,16 @@ impl SourceBackend for GitBackend {
         sweep_orphan_staging(&self.git_dir, url);
         let mirror = self.mirror_path(url);
 
-        let healthy = mirror.exists().then(|| gix::open(&mirror).ok()).flatten();
-        if let Some(repo) = healthy {
-            let mut remote = repo
-                .find_remote("origin")
-                .map_err(|e| SourceError::Source(format!("find origin in {source}: {e}")))?;
-            remote
-                .replace_refspecs(
-                    MIRROR_REFSPECS.iter().copied(),
-                    gix::remote::Direction::Fetch,
-                )
-                .map_err(|e| SourceError::Source(format!("set mirror refspec in {source}: {e}")))?;
-            remote
-                .connect(gix::remote::Direction::Fetch)
-                .map_err(|e| SourceError::Source(format!("connect origin in {source}: {e}")))?
-                .prepare_fetch(
-                    gix::progress::Discard,
-                    gix::remote::ref_map::Options::default(),
-                )
-                .map_err(|e| SourceError::Source(format!("prepare fetch in {source}: {e}")))?
-                .receive(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
-                .map_err(|e| SourceError::Source(format!("receive pack in {source}: {e}")))?;
-        } else {
-            if mirror.exists() {
-                std::fs::remove_dir_all(&mirror).map_err(|e| {
-                    SourceError::Source(format!("remove corrupt mirror {source}: {e}"))
-                })?;
-            }
-            let staging = MirrorStaging::create(&self.git_dir, url);
-            gix::prepare_clone_bare(url, &staging.path)
-                .map_err(|e| SourceError::Source(format!("prepare clone {source}: {e}")))?
-                .configure_remote(|mut remote| {
-                    remote.replace_refspecs(
-                        MIRROR_REFSPECS.iter().copied(),
-                        gix::remote::Direction::Fetch,
-                    )?;
-                    Ok(remote)
-                })
-                .fetch_only(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
-                .map_err(|e| SourceError::Source(format!("clone bare {source}: {e}")))?;
-            staging.commit_to(&mirror, source.as_str())?;
+        if let Some(repo) = open_mirror(source, &mirror)?
+            && fetch_into_mirror(source, &repo).is_ok()
+        {
+            return Ok(());
         }
+        reclone_mirror(&self.git_dir, source, url, &mirror)
+    }
 
-        Ok(())
+    fn mirror_ready(&self, url: &str) -> bool {
+        gix::open(self.mirror_path(url)).is_ok()
     }
 
     fn resolve(&self, source: &SourceName, url: &str, refspec: &Refspec) -> Result<String> {
@@ -913,6 +961,10 @@ impl SourceBackend for HttpBackend {
         let _lock = lock_mirror(&self.git_dir, source, url)?;
         import_tree(&self.git_dir, url, &entries)?;
         Ok(())
+    }
+
+    fn mirror_ready(&self, url: &str) -> bool {
+        self.git.mirror_ready(url)
     }
 
     /// Resolve ignores the refspec: url sources live at refs/heads/phora.
@@ -1969,16 +2021,45 @@ mod tests {
     }
 
     #[test]
+    fn mirror_ready_tracks_fetch_and_a_cleared_cache() {
+        let fixture = build_git_fixture();
+        let mirror = fixture.backend.mirror_path(&fixture.url);
+
+        assert!(
+            !fixture.backend.mirror_ready(&fixture.url),
+            "no mirror yet: not ready"
+        );
+
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch clones");
+        assert!(
+            fixture.backend.mirror_ready(&fixture.url),
+            "a freshly cloned mirror is ready"
+        );
+
+        std::fs::remove_dir_all(&mirror).expect("clear the mirror cache");
+        assert!(
+            !fixture.backend.mirror_ready(&fixture.url),
+            "a cleared cache is not ready, forcing a re-fetch on the next lock hit"
+        );
+    }
+
+    #[test]
     fn fetch_sweeps_a_stale_orphan_staging_dir() {
         let fixture = build_git_fixture();
         let git_dir = fixture.backend.git_dir.clone();
         std::fs::create_dir_all(&git_dir).expect("git dir");
         let key = MirrorKey::from_url(&NormalizedUrl::parse(&fixture.url));
         let orphan = git_dir.join(format!(".{}.staging-424242-0", key.as_str()));
-        std::fs::create_dir_all(&orphan).expect("create orphan staging");
-        std::fs::write(orphan.join("partial-pack"), b"x").expect("write partial");
+        std::fs::create_dir_all(orphan.join("objects/pack")).expect("create orphan staging");
+        std::fs::write(orphan.join("objects/pack/partial-pack"), b"x").expect("write partial");
         let stale = filetime::FileTime::from_unix_time(1_600_000_000, 0);
-        filetime::set_file_mtime(&orphan, stale).expect("backdate orphan past grace");
+        for entry in walkdir::WalkDir::new(&orphan) {
+            let path = entry.expect("walk orphan").into_path();
+            filetime::set_file_mtime(&path, stale).expect("backdate orphan past grace");
+        }
 
         fixture
             .backend
@@ -1993,13 +2074,17 @@ mod tests {
     }
 
     #[test]
-    fn fetch_keeps_a_recent_staging_dir() {
+    fn fetch_keeps_a_staging_dir_with_recent_inner_writes() {
         let fixture = build_git_fixture();
         let git_dir = fixture.backend.git_dir.clone();
         std::fs::create_dir_all(&git_dir).expect("git dir");
         let key = MirrorKey::from_url(&NormalizedUrl::parse(&fixture.url));
         let live = git_dir.join(format!(".{}.staging-424242-1", key.as_str()));
-        std::fs::create_dir_all(&live).expect("create live staging");
+        let pack = live.join("objects/pack");
+        std::fs::create_dir_all(&pack).expect("create live staging");
+        std::fs::write(pack.join("tmp_pack_incoming"), b"receiving").expect("write partial pack");
+        let stale = filetime::FileTime::from_unix_time(1_600_000_000, 0);
+        filetime::set_file_mtime(&live, stale).expect("backdate staging root past grace");
 
         fixture
             .backend
@@ -2008,8 +2093,40 @@ mod tests {
 
         assert!(
             live.exists(),
-            "a recently-touched staging dir must be left in place"
+            "a staging dir whose root mtime is stale but whose pack write is recent is a live \
+             clone and must survive"
         );
+    }
+
+    #[test]
+    fn fetch_reclones_when_in_place_fetch_fails() {
+        let fixture = build_git_fixture();
+        let mirror = fixture.backend.mirror_path(&fixture.url);
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("first fetch clones");
+        assert!(gix::open(&mirror).is_ok(), "mirror opens after first clone");
+
+        run_git(
+            &mirror,
+            &["remote", "set-url", "origin", "/nonexistent/repo.git"],
+        );
+
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch must self-heal when an in-place fetch fails, not error");
+
+        assert!(
+            is_bare_repo(&mirror),
+            "mirror must be a valid bare repo after self-heal"
+        );
+        let resolved = fixture
+            .backend
+            .resolve(&sn("src"), &fixture.url, &Refspec::Branch("main".into()))
+            .expect("branch resolves after self-heal");
+        assert_eq!(resolved, fixture.head_sha);
     }
 
     #[test]

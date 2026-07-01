@@ -61,6 +61,16 @@ home:
   src-proj/editor  ✓ clean
 ```
 
+## Re-sync after the mirror cache is cleared
+
+The mirror cache under `XDG_CACHE_HOME` is regenerable; clearing it while the
+lock survives must self-heal by re-fetching, not error opening a vanished mirror.
+
+```scrut
+$ rm -rf "$XDG_CACHE_HOME/phora/git" && phora sync 2>&1 | normalize
+sync complete
+```
+
 ## Verify deployed contents
 
 `phora verify` re-hashes every deployed file against the lock.

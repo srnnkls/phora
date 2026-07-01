@@ -222,6 +222,10 @@ impl SourceBackend for CountingBackend<'_> {
         self.inner.fetch(source, url)
     }
 
+    fn mirror_ready(&self, url: &str) -> bool {
+        self.inner.mirror_ready(url)
+    }
+
     fn resolve(
         &self,
         source: &crate::kernel::SourceName,
@@ -6201,6 +6205,9 @@ impl SourceBackend for CountingRouter {
     fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> SourceResult<()> {
         self.fetches.fetch_add(1, AtomicOrdering::SeqCst);
         self.inner.fetch(source, url)
+    }
+    fn mirror_ready(&self, url: &str) -> bool {
+        self.inner.mirror_ready(url)
     }
     fn resolve(
         &self,
