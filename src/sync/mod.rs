@@ -409,8 +409,15 @@ pub fn sync(
 
     sweep_target_parents(&effective_config, &journal, registry)?;
 
-    let recorded_after_recovery: Vec<ArtifactKey> =
-        registry.list_all()?.into_iter().map(|r| r.key).collect();
+    let recorded = registry.list_all()?;
+    let ejected = crate::store::ejected_index(registry, &recorded)?;
+    let recorded_after_recovery: Vec<ArtifactKey> = recorded
+        .into_iter()
+        .map(|r| r.key)
+        .filter(|key| {
+            !ejected.contains(&(key.target.clone(), key.source.clone(), key.artifact.clone()))
+        })
+        .collect();
 
     let (routed, resolved_commits) = resolve_sources(
         &effective_config,
