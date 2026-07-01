@@ -164,10 +164,10 @@ the git artifacts copied into `home`, the overlay linked into `machine`.
 
 ```scrut
 $ phora preview 2>&1 | normalize
-home
+home -> <ROOT>/target-home
   src-dotfiles@ca94c83b editor/ -> <ROOT>/target-home/editor
   src-dotfiles@ca94c83b lint/ -> <ROOT>/target-home/lint
-machine
+machine -> <ROOT>/target-machine
   overlay-machine@link config/ -> <ROOT>/target-machine/config
   overlay-machine@link notes.txt -> <ROOT>/target-machine/notes.txt
 ```
