@@ -10392,6 +10392,47 @@ fn fast_forward_still_seals_a_same_commit_narrowing() {
 }
 
 #[test]
+fn ref_transition_lines_reports_only_moved_pins() {
+    let toml = "version = 1\n\n\
+         [sources.dotfiles]\ngit = \"https://example.test/repo.git\"\nbranch = \"main\"\n\n\
+         [targets.home]\npath = \"out\"\nsources = [\"dotfiles\"]\n";
+    let cfg = Config::parse(toml).expect("config parses");
+    let parsed = cfg.parsed_sources().expect("parsed sources");
+    let refspec = parsed_of(&cfg, "dotfiles").refspec();
+    let key = ("dotfiles".to_owned(), crate::lock::encode_ref(&refspec));
+    let old = "1111111111111111111111111111111111111111";
+    let lock = lock_with(&cfg, "dotfiles", "https://example.test/repo.git", old);
+
+    let mut moved = BTreeMap::new();
+    moved.insert(
+        key.clone(),
+        "2222222222222222222222222222222222222222".to_owned(),
+    );
+    let lines = ref_transition_lines(&cfg, &parsed, Some(&lock), &moved);
+    assert_eq!(
+        lines.len(),
+        1,
+        "a moved pin must emit one line; got {lines:?}"
+    );
+    assert!(
+        lines[0].contains("dotfiles → home") && lines[0].contains("main"),
+        "the transition line must name the source→target binding and the ref; got {lines:?}"
+    );
+
+    let mut unchanged = BTreeMap::new();
+    unchanged.insert(key.clone(), old.to_owned());
+    assert!(
+        ref_transition_lines(&cfg, &parsed, Some(&lock), &unchanged).is_empty(),
+        "an unchanged pin must stay silent so steady-state syncs print nothing"
+    );
+
+    assert!(
+        ref_transition_lines(&cfg, &parsed, None, &moved).is_empty(),
+        "a first sync with no prior lock must stay silent, not announce a bogus transition"
+    );
+}
+
+#[test]
 fn sealed_offer_validates_crash_recovered_record_finalized_by_the_sweep() {
     let src = TempDir::new().expect("src tempdir");
     let p = src.path();
