@@ -10291,16 +10291,7 @@ fn init_editorless_source(p: &Path) -> (String, String) {
     std::fs::write(p.join("docs/readme.md"), b"# docs\n").expect("write docs");
     run_git(p, &["add", "-A"]);
     run_git(p, &["commit", "-m", "init without editor/"]);
-    let out = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(p)
-        .output()
-        .expect("rev-parse HEAD");
-    let sha = String::from_utf8(out.stdout)
-        .expect("utf8 sha")
-        .trim()
-        .to_owned();
-    (p.to_string_lossy().into_owned(), sha)
+    (p.to_string_lossy().into_owned(), rev_parse(p, "HEAD"))
 }
 
 #[test]
