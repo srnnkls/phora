@@ -15,6 +15,7 @@ use super::{
 
 #[expect(
     clippy::fn_params_excessive_bools,
+    clippy::too_many_arguments,
     reason = "independent CLI run flags, not a state machine"
 )]
 pub(super) fn run_sync(
@@ -23,6 +24,7 @@ pub(super) fn run_sync(
     no_hooks: bool,
     no_transitive_hooks: bool,
     frozen: bool,
+    fast_forward: bool,
     drop: Option<DropSources>,
     jobs: Option<usize>,
 ) -> Result<()> {
@@ -56,6 +58,7 @@ pub(super) fn run_sync(
             no_hooks,
             no_transitive_hooks,
             frozen,
+            fast_forward,
             resolver: interactive.then_some(&resolver as &dyn ConflictResolver),
             jobs,
         },
@@ -168,9 +171,18 @@ pub(super) fn run_rebuild_registry() -> Result<()> {
     Ok(())
 }
 
-pub(super) fn run_update(source: Option<&str>) -> Result<()> {
+pub(super) fn run_update(source: Option<&str>, fast_forward: bool) -> Result<()> {
     let drop = source.map_or(DropSources::All, |s| DropSources::One(s.to_owned()));
-    run_sync(false, false, false, false, false, Some(drop), None)
+    run_sync(
+        false,
+        false,
+        false,
+        false,
+        false,
+        fast_forward,
+        Some(drop),
+        None,
+    )
 }
 
 /// Writes the base lock to `<dir>/phora.lock` and, when `local` is `Some`, the

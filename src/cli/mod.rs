@@ -112,11 +112,19 @@ pub enum Command {
         no_transitive_hooks: bool,
         #[arg(long)]
         frozen: bool,
+        /// Follow a moved pin: delete artifacts the new commit dropped instead of erroring.
+        #[arg(long)]
+        fast_forward: bool,
         #[arg(long, short = 'j')]
         jobs: Option<usize>,
     },
     /// Bump the lock to latest, then sync.
-    Update { source: Option<String> },
+    Update {
+        source: Option<String>,
+        /// Follow a moved pin: delete artifacts the new commit dropped instead of erroring.
+        #[arg(long)]
+        fast_forward: bool,
+    },
     /// Show sources and deployment state.
     List {
         #[arg(long)]
@@ -299,23 +307,7 @@ pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
         cmd @ Command::Add { .. } => dispatch_add(cmd),
         Command::Rm { name } => run_source_rm(&name),
-        Command::Sync {
-            prune,
-            force,
-            no_hooks,
-            no_transitive_hooks,
-            frozen,
-            jobs,
-        } => sync::run_sync(
-            prune,
-            force,
-            no_hooks,
-            no_transitive_hooks,
-            frozen,
-            None,
-            jobs,
-        ),
-        Command::Update { source } => sync::run_update(source.as_deref()),
+        cmd @ (Command::Sync { .. } | Command::Update { .. }) => dispatch_sync(cmd),
         Command::List { plan } => query::run_list(plan),
         Command::Verify => run_verify(),
         Command::Where {
@@ -393,6 +385,34 @@ pub fn run(cli: Cli) -> Result<()> {
             source,
             path,
         } => query::run_explain(&target, &source, path.as_deref()),
+    }
+}
+
+fn dispatch_sync(cmd: Command) -> Result<()> {
+    match cmd {
+        Command::Sync {
+            prune,
+            force,
+            no_hooks,
+            no_transitive_hooks,
+            frozen,
+            fast_forward,
+            jobs,
+        } => sync::run_sync(
+            prune,
+            force,
+            no_hooks,
+            no_transitive_hooks,
+            frozen,
+            fast_forward,
+            None,
+            jobs,
+        ),
+        Command::Update {
+            source,
+            fast_forward,
+        } => sync::run_update(source.as_deref(), fast_forward),
+        _ => unreachable!("dispatch_sync only receives Sync or Update"),
     }
 }
 

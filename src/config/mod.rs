@@ -379,6 +379,7 @@ fn binding_scope_diagnostic(
         did_you_mean: None,
         remedy,
         debug_hint: Some(format!("phora explain {target_name} {binding_name}")),
+        details: Vec::new(),
     }
 }
 

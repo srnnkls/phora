@@ -149,6 +149,7 @@ fn unsafe_dest_diagnostic(dest: &str) -> Error {
         did_you_mean: None,
         remedy: "use a forward-slashed relative path inside the deploy root".to_owned(),
         debug_hint: Some("phora preview --files".to_owned()),
+        details: Vec::new(),
     }
     .sync()
 }

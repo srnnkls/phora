@@ -312,6 +312,7 @@ fn input<'a>(
         no_hooks: false,
         no_transitive_hooks: false,
         frozen: false,
+        fast_forward: false,
         resolver: None,
         jobs: None,
     }
@@ -2622,6 +2623,7 @@ fn sync_with_prune_removes_orphan_files_and_record_but_keeps_current() {
         no_hooks: false,
         no_transitive_hooks: false,
         frozen: false,
+        fast_forward: false,
         resolver: None,
         jobs: None,
     };
@@ -2695,6 +2697,7 @@ fn sync_skips_prune_when_a_deploy_failed() {
         no_hooks: false,
         no_transitive_hooks: false,
         frozen: false,
+        fast_forward: false,
         resolver: None,
         jobs: None,
     };
@@ -2911,6 +2914,7 @@ fn interactive_input<'a>(
         no_hooks: false,
         no_transitive_hooks: false,
         frozen: false,
+        fast_forward: false,
         resolver: Some(resolver),
         jobs: None,
     }
@@ -9152,6 +9156,7 @@ fn prune_only_sync_skips_on_change_but_runs_post_sync() {
         no_hooks: false,
         no_transitive_hooks: false,
         frozen: false,
+        fast_forward: false,
         resolver: None,
         jobs: None,
     };
@@ -9755,6 +9760,7 @@ fn input_with_jobs(base: &Config, jobs: usize) -> SyncInput<'_> {
         no_hooks: false,
         no_transitive_hooks: false,
         frozen: false,
+        fast_forward: false,
         resolver: None,
         jobs: Some(jobs),
     }
@@ -10042,11 +10048,20 @@ fn list_source_leaves_returns_full_unfiltered_leaf_set() {
 /// Seed a managed registry record for `(dest, source, artifact)` as if a prior sync
 /// deployed it, so a later sync can be made to find it recorded.
 fn seed_recorded_artifact(reg: &FileRegistry, source: &str, artifact: &str) {
+    seed_recorded_artifact_at(
+        reg,
+        source,
+        artifact,
+        "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    );
+}
+
+fn seed_recorded_artifact_at(reg: &FileRegistry, source: &str, artifact: &str, commit: &str) {
     let record = RegistryRecord {
         version: 1,
         key: artifact_key("dest", source, artifact),
         source: source.to_owned(),
-        commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
+        commit: commit.to_owned(),
         digest: "blake3:recorded".to_owned(),
         projected_at: "2026-01-01T00:00:00Z".to_owned(),
         layout: "flat".to_owned(),
@@ -10098,6 +10113,23 @@ fn sealed_offer_source_dropped_a_still_wanted_artifact_is_a_hard_error() {
     };
     let msg = err.to_string();
     assert_sealed_offer_diagnostic(&msg, "dest", "editor-src", "editor");
+    assert!(
+        msg.contains("--fast-forward"),
+        "the pin moved off the recorded commit, so the remedy must surface `--fast-forward` as \
+         the way to follow the drop; got:\n{msg}"
+    );
+    assert!(
+        msg.contains("binding: source `editor-src` → target `dest`"),
+        "the rejection must name the source→target binding in plain terms; got:\n{msg}"
+    );
+    assert!(
+        msg.contains("pin: recorded ") && msg.contains(" → now "),
+        "the rejection must show the pin transition (recorded commit → resolved ref); got:\n{msg}"
+    );
+    assert!(
+        msg.contains("path: ") && msg.contains("editor"),
+        "the rejection must name the affected deploy path; got:\n{msg}"
+    );
     drop(src);
 }
 
@@ -10248,6 +10280,115 @@ fn sealed_offer_intentional_narrowing_does_not_block_prune_of_the_dropped_artifa
         !stale_dst.exists(),
         "the dropped artifact's on-disk files must be removed by prune"
     );
+}
+
+/// Init a source repo with only `docs/` (no `editor/`), returning its url and HEAD sha.
+fn init_editorless_source(p: &Path) -> (String, String) {
+    run_git(p, &["init", "-b", "main", "."]);
+    run_git(p, &["config", "user.email", "test@example.com"]);
+    run_git(p, &["config", "user.name", "Test"]);
+    std::fs::create_dir_all(p.join("docs")).expect("mkdir docs");
+    std::fs::write(p.join("docs/readme.md"), b"# docs\n").expect("write docs");
+    run_git(p, &["add", "-A"]);
+    run_git(p, &["commit", "-m", "init without editor/"]);
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(p)
+        .output()
+        .expect("rev-parse HEAD");
+    let sha = String::from_utf8(out.stdout)
+        .expect("utf8 sha")
+        .trim()
+        .to_owned();
+    (p.to_string_lossy().into_owned(), sha)
+}
+
+#[test]
+fn fast_forward_deletes_an_artifact_the_new_commit_dropped() {
+    let src = TempDir::new().expect("src tempdir");
+    let (url, _sha) = init_editorless_source(src.path());
+
+    let git_dir = TempDir::new().expect("git dir");
+    let state_dir = TempDir::new().expect("state dir");
+    let backend = GitBackend::new(git_dir.path().to_path_buf());
+    let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.editor-src]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\"editor-src\"]\nlayout = \"flat\"\n",
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("default-offer config parses");
+
+    let stale_dst = td.target_path().join("editor");
+    std::fs::create_dir_all(&stale_dst).expect("mkdir stale editor");
+    std::fs::write(stale_dst.join("init.lua"), b"-- init\n").expect("write stale file");
+    seed_recorded_artifact(&registry, "editor-src", "editor");
+
+    let in_ = SyncInput {
+        fast_forward: true,
+        ..input(&cfg, None, None, None, false)
+    };
+    let out = sync(&in_, &backend, &registry).expect(
+        "fast-forward must follow the moved pin: an artifact the new commit dropped is deleted, \
+         not sealed",
+    );
+    assert!(!out.had_failures, "the fast-forward run must succeed");
+    assert!(
+        !stale_dst.exists(),
+        "fast-forward must delete the on-disk copy of the upstream-removed artifact",
+    );
+    assert!(
+        registry
+            .get(&artifact_key("dest", "editor-src", "editor"))
+            .expect("registry read")
+            .is_none(),
+        "fast-forward must drop the record for the upstream-removed artifact",
+    );
+    drop(src);
+}
+
+#[test]
+fn fast_forward_still_seals_a_same_commit_narrowing() {
+    let src = TempDir::new().expect("src tempdir");
+    let (url, sha) = init_editorless_source(src.path());
+
+    let git_dir = TempDir::new().expect("git dir");
+    let state_dir = TempDir::new().expect("state dir");
+    let backend = GitBackend::new(git_dir.path().to_path_buf());
+    let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.editor-src]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\"editor-src\"]\nlayout = \"flat\"\n",
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("default-offer config parses");
+
+    seed_recorded_artifact_at(&registry, "editor-src", "editor", &sha);
+
+    let in_ = SyncInput {
+        fast_forward: true,
+        ..input(&cfg, None, None, None, false)
+    };
+    let Err(err) = sync(&in_, &backend, &registry) else {
+        panic!(
+            "the pin did not move (recorded commit == resolved commit): the drop can only be a \
+             silent narrowing, so fast-forward must NOT relax the sealed-offer guard"
+        );
+    };
+    let msg = err.to_string();
+    assert_sealed_offer_diagnostic(&msg, "dest", "editor-src", "editor");
+    assert!(
+        !msg.contains("--fast-forward"),
+        "the pin did not move, so `--fast-forward` cannot help here; suggesting it would misdirect \
+         — the remedy must stay restore-or-eject; got:\n{msg}"
+    );
+    drop(src);
 }
 
 #[test]

@@ -55,7 +55,7 @@ use crate::deploy::{Journal, recovery_sweep};
 use crate::error::{Error, Result};
 use crate::lock::{Lock, merge_locks, split_locks};
 use crate::source::{SourceBackend, is_local_path};
-use crate::store::{ArtifactKey, EjectedEntry, Registry};
+use crate::store::{ArtifactKey, EjectedEntry, Registry, RegistryRecord};
 
 /// Borrowed inputs to [`sync`]: the configs and locks plus run flags. Bundled so
 /// the orchestration entry point stays stable as later phases add fields.
@@ -76,6 +76,8 @@ pub struct SyncInput<'a> {
     pub no_transitive_hooks: bool,
     /// Refuse to fetch or re-resolve: a source absent from or drifted in the lock hard-errors.
     pub frozen: bool,
+    /// Follow a moved pin: delete an artifact the new commit dropped rather than sealing; a same-commit narrowing still hard-errors.
+    pub fast_forward: bool,
     pub resolver: Option<&'a dyn ConflictResolver>,
     /// Worker-pool size for parallel fetch/resolve/digest. `None` derives a
     /// default of `min(resolution_units, 8)`; `Some(n)` pins the pool to `n`.
@@ -409,15 +411,7 @@ pub fn sync(
 
     sweep_target_parents(&effective_config, &journal, registry)?;
 
-    let recorded = registry.list_all()?;
-    let ejected = crate::store::ejected_index(registry, &recorded)?;
-    let recorded_after_recovery: Vec<ArtifactKey> = recorded
-        .into_iter()
-        .map(|r| r.key)
-        .filter(|key| {
-            !ejected.contains(&(key.target.clone(), key.source.clone(), key.artifact.clone()))
-        })
-        .collect();
+    let recorded_after_recovery = live_recorded_artifacts(registry)?;
 
     let (routed, resolved_commits) = resolve_sources(
         &effective_config,
@@ -437,14 +431,22 @@ pub fn sync(
         .unwrap_or_default();
     record_candidate_hooks(&mut base_lock, &hook_candidates);
 
-    validate_sealed_offer(
+    report_ref_transitions(
+        &effective_config,
+        &parsed,
+        effective_lock.as_ref(),
+        &resolved_commits,
+    );
+    let fast_forward_drops = validate_sealed_offer(
         &effective_config,
         &parsed,
         &remotes,
         backend,
         &resolved_commits,
         &recorded_after_recovery,
+        input.fast_forward,
     )?;
+    prune_fast_forward_drops(&effective_config, registry, &protected, &fast_forward_drops)?;
 
     // pre_sync gates the run: a failure aborts before deploy, leaving zero files deployed.
     let pre_sync_outcomes = run_pre_sync(input, &effective_config)?;
@@ -590,20 +592,25 @@ struct BindingOffer {
     offered: Vec<String>,
     selection: crate::kernel::OfferSelection,
     dest_to_source: BTreeMap<String, String>,
+    commit: String,
+    ref_label: String,
 }
 
 /// Compares against the resolved OFFER set, not the take/kept set: a leaf dropped by
 /// `take` while still offered stays allowed. A recorded key the source no longer provides
 /// only hard-errors when the offer config still ADMITS its path (a silent source narrowing);
-/// when the config itself narrowed past it, it is a pure orphan left to `--prune`.
+/// when the config itself narrowed past it, it is a pure orphan left to `--prune`. Under
+/// `fast_forward`, a drop whose recorded commit differs from the resolved one is returned for
+/// deletion instead of sealing; a same-commit drop still hard-errors.
 fn validate_sealed_offer(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
     remotes: &BTreeMap<String, String>,
     backend: &(dyn SourceBackend + Sync),
     resolved_commits: &BTreeMap<(String, String), String>,
-    recorded: &[ArtifactKey],
-) -> Result<()> {
+    recorded: &[RegistryRecord],
+    fast_forward: bool,
+) -> Result<Vec<RegistryRecord>> {
     use crate::kernel::{OfferSelection, SourceName};
 
     let mut offers: BTreeMap<(String, String), BindingOffer> = BTreeMap::new();
@@ -649,12 +656,16 @@ fn validate_sealed_offer(
                     offered,
                     selection,
                     dest_to_source,
+                    commit: commit.clone(),
+                    ref_label: binding.effective_ref.to_string(),
                 },
             );
         }
     }
 
-    for key in recorded {
+    let mut dropped = Vec::new();
+    for record in recorded {
+        let key = &record.key;
         let Some(offer) = offers.get(&(key.target.clone(), key.source.clone())) else {
             continue;
         };
@@ -667,24 +678,181 @@ fn validate_sealed_offer(
             .offered
             .iter()
             .any(|offered| offered == leaf || offered.starts_with(&format!("{leaf}/")));
-        if !still_offered && offer.selection.admits_published(leaf) {
-            return Err(sealed_offer_diagnostic(&key.target, &key.source, artifact));
+        if still_offered || !offer.selection.admits_published(leaf) {
+            continue;
         }
+        if fast_forward && record.commit != offer.commit {
+            dropped.push(record.clone());
+            continue;
+        }
+        let deploy_path = config.targets.get(&key.target).map(|target| {
+            target::record_artifact_path(target, record)
+                .display()
+                .to_string()
+        });
+        return Err(sealed_offer_diagnostic(&SealedOffer {
+            target: &key.target,
+            source: &key.source,
+            artifact,
+            deploy_path: deploy_path.as_deref(),
+            recorded_commit: &record.commit,
+            resolved_commit: &offer.commit,
+            resolved_ref: &offer.ref_label,
+        }));
+    }
+    Ok(dropped)
+}
+
+fn prune_fast_forward_drops(
+    config: &Config,
+    registry: &dyn Registry,
+    protected: &confine::ProtectedPathSet,
+    drops: &[RegistryRecord],
+) -> Result<()> {
+    for record in drops {
+        let Some(target) = config.targets.get(&record.key.target) else {
+            continue;
+        };
+        let dst = target::record_artifact_path(target, record);
+        let confined = match &target.confine {
+            Some(anchor) => confine::confine_destination(anchor, &dst, protected),
+            None if target::is_composed_target(&record.key.target) => Err(Error::Config(format!(
+                "confinement: composed target `{}` reached fast-forward prune without a confine \
+                 anchor; refusing an unconfined delete",
+                record.key.target
+            ))),
+            None => Ok(dst.clone()),
+        };
+        match confined {
+            Ok(path) => {
+                eprintln!(
+                    "phora: fast-forward dropped {}:{} (removed upstream)",
+                    record.key.source, record.key.artifact
+                );
+                remove_orphan_path(&path).map_err(|e| {
+                    Error::Sync(format!("fast-forward prune {}: {e}", path.display()))
+                })?;
+            }
+            Err(e) => {
+                eprintln!(
+                    "phora: refusing to fast-forward out-of-anchor {}: {e}",
+                    dst.display()
+                );
+                continue;
+            }
+        }
+        registry.remove(&record.key)?;
     }
     Ok(())
 }
 
-fn sealed_offer_diagnostic(target: &str, source: &str, artifact: &str) -> Error {
+struct SealedOffer<'a> {
+    target: &'a str,
+    source: &'a str,
+    artifact: &'a str,
+    deploy_path: Option<&'a str>,
+    recorded_commit: &'a str,
+    resolved_commit: &'a str,
+    resolved_ref: &'a str,
+}
+
+fn sealed_offer_diagnostic(ctx: &SealedOffer<'_>) -> Error {
+    let &SealedOffer {
+        target,
+        source,
+        artifact,
+        deploy_path,
+        recorded_commit,
+        resolved_commit,
+        resolved_ref,
+    } = ctx;
+    let pin_moved = recorded_commit != resolved_commit;
+    let now = if resolved_ref.is_empty() {
+        short_commit(resolved_commit).to_string()
+    } else {
+        format!("{resolved_ref} ({})", short_commit(resolved_commit))
+    };
+    let mut details = vec![
+        format!("binding: source `{source}` → target `{target}`"),
+        format!(
+            "pin: recorded {} → now {now}",
+            short_commit(recorded_commit)
+        ),
+    ];
+    if let Some(path) = deploy_path {
+        details.push(format!("path: {path}"));
+    }
+    let remedy = if pin_moved {
+        "re-sync with `--fast-forward` to drop it, or eject it before removing it".to_string()
+    } else {
+        "restore the artifact to the source's offer, or eject it before removing it".to_string()
+    };
     crate::diagnostic::SelectionDiagnostic {
         entry: format!("{target}:{source}:{artifact}"),
         matched_against: format!("the current offer of source `{source}` in target `{target}`"),
         why: "a recorded artifact is no longer in the source's offer".to_string(),
         did_you_mean: None,
-        remedy: "restore the artifact to the source's offer, or eject it before removing it"
-            .to_string(),
+        remedy,
         debug_hint: Some(format!("phora explain {target} {source} {artifact}")),
+        details,
     }
     .sync()
+}
+
+fn short_commit(commit: &str) -> &str {
+    commit.get(..7).unwrap_or(commit)
+}
+
+fn live_recorded_artifacts(registry: &dyn Registry) -> Result<Vec<RegistryRecord>> {
+    let recorded = registry.list_all()?;
+    let ejected = crate::store::ejected_index(registry, &recorded)?;
+    Ok(recorded
+        .into_iter()
+        .filter(|r| {
+            !ejected.contains(&(
+                r.key.target.clone(),
+                r.key.source.clone(),
+                r.key.artifact.clone(),
+            ))
+        })
+        .collect())
+}
+
+fn report_ref_transitions(
+    config: &Config,
+    parsed: &BTreeMap<String, ParsedSource>,
+    effective_lock: Option<&Lock>,
+    resolved_commits: &BTreeMap<(String, String), String>,
+) {
+    for (target_name, target) in &config.targets {
+        for binding in target.resolve_sources(parsed) {
+            let Some(source) = parsed.get(binding.source) else {
+                continue;
+            };
+            let encoded_ref = crate::lock::encode_ref(&binding.effective_ref);
+            let Some(new_commit) = resolved_commits.get(&(binding.source.to_owned(), encoded_ref))
+            else {
+                continue;
+            };
+            let discriminator =
+                crate::lock::ref_discriminator(&binding.effective_ref, &source.refspec());
+            let old_commit = effective_lock
+                .and_then(|lock| lock.find_entry(binding.source, discriminator.as_deref()))
+                .map(|entry| entry.commit.as_str());
+            let ref_label = binding.effective_ref.to_string();
+            let pin = if ref_label.is_empty() {
+                short_commit(new_commit).to_string()
+            } else {
+                format!("{ref_label}@{}", short_commit(new_commit))
+            };
+            let status = match old_commit {
+                None => format!("{pin} (new)"),
+                Some(old) if old == new_commit => format!("{pin} (unchanged)"),
+                Some(old) => format!("{} → {pin}", short_commit(old)),
+            };
+            eprintln!("phora: {} → {target_name}: {status}", binding.source);
+        }
+    }
 }
 
 /// Resolves the composed transitive graph OFFLINE (frozen reads of the pinned dep manifests

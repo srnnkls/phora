@@ -636,6 +636,7 @@ fn unbound_diagnostic(entry: &str, matched: &str, why: &str, remedy: &str, debug
         did_you_mean: None,
         remedy: remedy.to_owned(),
         debug_hint: Some(debug.to_owned()),
+        details: Vec::new(),
     }
     .config()
 }
@@ -648,6 +649,7 @@ fn cache_miss_diagnostic(source: &str, why: &str) -> Error {
         did_you_mean: None,
         remedy: format!("run `phora sync` to fetch and lock `{source}`"),
         debug_hint: Some(format!("phora preview --source {source}")),
+        details: Vec::new(),
     }
     .sync()
 }
