@@ -767,11 +767,7 @@ fn sealed_offer_diagnostic(ctx: &SealedOffer<'_>) -> Error {
         resolved_ref,
     } = ctx;
     let pin_moved = recorded_commit != resolved_commit;
-    let now = if resolved_ref.is_empty() {
-        short_commit(resolved_commit).to_string()
-    } else {
-        format!("{resolved_ref} ({})", short_commit(resolved_commit))
-    };
+    let now = pin_label(resolved_ref, resolved_commit);
     let mut details = vec![
         format!("binding: source `{source}` → target `{target}`"),
         format!(
@@ -800,7 +796,7 @@ fn sealed_offer_diagnostic(ctx: &SealedOffer<'_>) -> Error {
 }
 
 fn short_commit(commit: &str) -> &str {
-    commit.get(..7).unwrap_or(commit)
+    commit.get(..8).unwrap_or(commit)
 }
 
 fn live_recorded_artifacts(registry: &dyn Registry) -> Result<Vec<RegistryRecord>> {
@@ -818,12 +814,32 @@ fn live_recorded_artifacts(registry: &dyn Registry) -> Result<Vec<RegistryRecord
         .collect())
 }
 
+fn pin_label(ref_label: &str, commit: &str) -> String {
+    if ref_label.is_empty() {
+        short_commit(commit).to_string()
+    } else {
+        format!("{ref_label} ({})", short_commit(commit))
+    }
+}
+
 fn report_ref_transitions(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
     effective_lock: Option<&Lock>,
     resolved_commits: &BTreeMap<(String, String), String>,
 ) {
+    for line in ref_transition_lines(config, parsed, effective_lock, resolved_commits) {
+        eprintln!("{line}");
+    }
+}
+
+fn ref_transition_lines(
+    config: &Config,
+    parsed: &BTreeMap<String, ParsedSource>,
+    effective_lock: Option<&Lock>,
+    resolved_commits: &BTreeMap<(String, String), String>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
     for (target_name, target) in &config.targets {
         for binding in target.resolve_sources(parsed) {
             let Some(source) = parsed.get(binding.source) else {
@@ -836,23 +852,23 @@ fn report_ref_transitions(
             };
             let discriminator =
                 crate::lock::ref_discriminator(&binding.effective_ref, &source.refspec());
-            let old_commit = effective_lock
+            let Some(old) = effective_lock
                 .and_then(|lock| lock.find_entry(binding.source, discriminator.as_deref()))
-                .map(|entry| entry.commit.as_str());
-            let ref_label = binding.effective_ref.to_string();
-            let pin = if ref_label.is_empty() {
-                short_commit(new_commit).to_string()
-            } else {
-                format!("{ref_label}@{}", short_commit(new_commit))
+            else {
+                continue;
             };
-            let status = match old_commit {
-                None => format!("{pin} (new)"),
-                Some(old) if old == new_commit => format!("{pin} (unchanged)"),
-                Some(old) => format!("{} → {pin}", short_commit(old)),
-            };
-            eprintln!("phora: {} → {target_name}: {status}", binding.source);
+            if &old.commit == new_commit {
+                continue;
+            }
+            let from = pin_label(&old.resolved, &old.commit);
+            let to = pin_label(&binding.effective_ref.to_string(), new_commit);
+            lines.push(format!(
+                "phora: {} → {target_name}: {from} → {to}",
+                binding.source
+            ));
         }
     }
+    lines
 }
 
 /// Resolves the composed transitive graph OFFLINE (frozen reads of the pinned dep manifests
