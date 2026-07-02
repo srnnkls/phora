@@ -341,6 +341,7 @@ fn reject_bang_patterns(name: &str, field: &str, patterns: Option<&[String]>) ->
                          (exclude wins over include)"
                     .to_owned(),
                 debug_hint: Some(format!("phora explain {name} src")),
+                details: Vec::new(),
             }
             .config());
         }

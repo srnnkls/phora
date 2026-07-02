@@ -9,6 +9,7 @@ pub const DID_YOU_MEAN: &str = "did you mean:";
 pub const REMEDY: &str = "remedy:";
 pub const TO_DEBUG: &str = "to debug:";
 
+#[derive(Default)]
 pub struct SelectionDiagnostic {
     pub entry: String,
     pub matched_against: String,
@@ -16,6 +17,7 @@ pub struct SelectionDiagnostic {
     pub did_you_mean: Option<Vec<String>>,
     pub remedy: String,
     pub debug_hint: Option<String>,
+    pub details: Vec<String>,
 }
 
 impl SelectionDiagnostic {
@@ -34,6 +36,10 @@ impl fmt::Display for SelectionDiagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{SELECTION} {} — {}", self.entry, self.why)?;
         write!(f, "\n{MATCHED_AGAINST} {}", self.matched_against)?;
+
+        for detail in &self.details {
+            write!(f, "\n{detail}")?;
+        }
 
         if let Some(suggestions) = self.did_you_mean.as_deref().filter(|s| !s.is_empty()) {
             write!(f, "\n{DID_YOU_MEAN} {}", suggestions.join(", "))?;
@@ -90,6 +96,7 @@ mod tests {
             did_you_mean: Some(vec!["neovim".to_string()]),
             remedy: "add `include = [\"nvim/**\"]` to the source".to_string(),
             debug_hint: Some("phora explain dotfiles src nvim".to_string()),
+            details: Vec::new(),
         }
     }
 
@@ -151,6 +158,24 @@ mod tests {
         assert!(
             remedy < to_debug,
             "remedy must precede to-debug; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn detail_lines_render_between_matched_against_and_remedy() {
+        let mut d = populated();
+        d.details = vec!["binding: source `a` → target `b`".to_string()];
+        let rendered = d.to_string();
+
+        let position = |needle: &str| {
+            rendered
+                .find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` must appear in:\n{rendered}"))
+        };
+        assert!(
+            position(MATCHED_AGAINST) < position("binding:")
+                && position("binding:") < position(REMEDY),
+            "a detail line must render after matched-against and before remedy; got:\n{rendered}"
         );
     }
 

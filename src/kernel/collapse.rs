@@ -257,6 +257,7 @@ fn force_collapse_blocked_diagnostic(dir: &str) -> crate::error::Error {
         remedy: "drop the within-dir exclude or rename, deploy in copy mode, or omit `collapse`"
             .to_string(),
         debug_hint: Some("phora preview --files".to_string()),
+        details: Vec::new(),
     }
     .sync()
 }

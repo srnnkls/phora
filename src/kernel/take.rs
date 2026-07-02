@@ -219,6 +219,7 @@ fn non_offered_diagnostic(entry: &str, offered: &BTreeSet<&str>) -> crate::error
         did_you_mean: crate::diagnostic::did_you_mean(entry, offered.iter().copied()),
         remedy: "name a leaf the source offers, or add it to the source's include".to_string(),
         debug_hint: Some(KERNEL_ATTRIBUTION_HINT.to_string()),
+        details: Vec::new(),
     }
     .sync()
 }
@@ -231,6 +232,7 @@ fn literal_and_rename_diagnostic(leaf: &str) -> crate::error::Error {
         did_you_mean: None,
         remedy: "keep the leaf either literally or as a rename source, not both".to_string(),
         debug_hint: Some(KERNEL_ATTRIBUTION_HINT.to_string()),
+        details: Vec::new(),
     }
     .sync()
 }
@@ -248,6 +250,7 @@ fn rename_fan_out_diagnostic(src: &str, first: &str, second: &str) -> crate::err
         did_you_mean: None,
         remedy: format!("keep one rename of `{src}`: either `{a}` or `{b}`, not both"),
         debug_hint: Some(KERNEL_ATTRIBUTION_HINT.to_string()),
+        details: Vec::new(),
     }
     .sync()
 }
@@ -260,6 +263,7 @@ fn unsafe_dest_diagnostic(dest: &str) -> crate::error::Error {
         did_you_mean: None,
         remedy: "use a forward-slashed relative path inside the deploy root".to_string(),
         debug_hint: Some(KERNEL_ATTRIBUTION_HINT.to_string()),
+        details: Vec::new(),
     }
     .sync()
 }
@@ -279,6 +283,7 @@ fn duplicate_dest_diagnostic(first: &str, second: &str) -> crate::error::Error {
         did_you_mean: None,
         remedy: "rename one source so each kept leaf lands at a distinct path".to_string(),
         debug_hint: Some(KERNEL_ATTRIBUTION_HINT.to_string()),
+        details: Vec::new(),
     }
     .sync()
 }

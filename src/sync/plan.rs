@@ -199,6 +199,7 @@ fn partial_take_collapse_diagnostic(dir: &str) -> Error {
         did_you_mean: None,
         remedy: "take the whole directory, or omit `collapse`".to_owned(),
         debug_hint: Some("phora preview --files".to_owned()),
+        details: Vec::new(),
     }
     .sync()
 }
@@ -302,6 +303,7 @@ fn cross_binding_dup_diagnostic(target_name: &str, first: &str, second: &str) ->
         did_you_mean: None,
         remedy: "rename one source's leaf, or separate the bindings under the layout".to_string(),
         debug_hint: Some(format!("phora preview --target {target_name}")),
+        details: Vec::new(),
     }
     .sync()
 }
