@@ -25,11 +25,42 @@ fn is_still_expected(
     keys.iter().any(|expected_key| expected_key == artifact)
 }
 
-fn overlaps_live_dest(path: &Path, expected_paths: &ExpectedPaths, target: &str) -> bool {
+pub(super) fn overlaps_live_dest(
+    path: &Path,
+    expected_paths: &ExpectedPaths,
+    target: &str,
+) -> bool {
     expected_paths.get(target).is_some_and(|live| {
         live.iter()
             .any(|dest| dest.starts_with(path) || path.starts_with(dest))
     })
+}
+
+pub(super) fn expected_live_paths(
+    config: &Config,
+    parsed: &BTreeMap<String, ParsedSource>,
+    remotes: &BTreeMap<String, String>,
+    backend: &dyn SourceBackend,
+    resolved_commits: &BTreeMap<(String, String), String>,
+) -> Result<ExpectedPaths> {
+    let plans = plan_targets(config, parsed, remotes, backend, resolved_commits)?;
+    let mut expected_paths: ExpectedPaths = BTreeMap::new();
+    for plan in &plans {
+        let Some(target) = config.targets.get(&plan.target) else {
+            continue;
+        };
+        let paths = expected_paths.entry(plan.target.clone()).or_default();
+        for binding in &plan.bindings {
+            for key in &expected_artifact_keys(binding) {
+                paths.push(
+                    target
+                        .expanded_path()
+                        .join(target.layout().artifact_path(&binding.identity, key)),
+                );
+            }
+        }
+    }
+    Ok(expected_paths)
 }
 
 pub(super) fn prune_orphans(

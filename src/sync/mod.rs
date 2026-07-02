@@ -446,7 +446,16 @@ pub fn sync(
         &recorded_after_recovery,
         input.fast_forward,
     )?;
-    prune_fast_forward_drops(&effective_config, registry, &protected, &fast_forward_drops)?;
+    prune_fast_forward_drops(
+        &effective_config,
+        &parsed,
+        &remotes,
+        backend,
+        &resolved_commits,
+        registry,
+        &protected,
+        &fast_forward_drops,
+    )?;
 
     // pre_sync gates the run: a failure aborts before deploy, leaving zero files deployed.
     let pre_sync_outcomes = run_pre_sync(input, &effective_config)?;
@@ -703,12 +712,25 @@ fn validate_sealed_offer(
     Ok(dropped)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "threads the plan inputs needed to guard deletes against live sibling artifacts"
+)]
 fn prune_fast_forward_drops(
     config: &Config,
+    parsed: &BTreeMap<String, ParsedSource>,
+    remotes: &BTreeMap<String, String>,
+    backend: &(dyn SourceBackend + Sync),
+    resolved_commits: &BTreeMap<(String, String), String>,
     registry: &dyn Registry,
     protected: &confine::ProtectedPathSet,
     drops: &[RegistryRecord],
 ) -> Result<()> {
+    if drops.is_empty() {
+        return Ok(());
+    }
+    let expected_paths =
+        prune::expected_live_paths(config, parsed, remotes, backend, resolved_commits)?;
     for record in drops {
         let Some(target) = config.targets.get(&record.key.target) else {
             continue;
@@ -723,23 +745,26 @@ fn prune_fast_forward_drops(
             ))),
             None => Ok(dst.clone()),
         };
-        match confined {
-            Ok(path) => {
-                eprintln!(
-                    "phora: fast-forward dropped {}:{} (removed upstream)",
-                    record.key.source, record.key.artifact
-                );
-                remove_orphan_path(&path).map_err(|e| {
-                    Error::Sync(format!("fast-forward prune {}: {e}", path.display()))
-                })?;
-            }
-            Err(e) => {
-                eprintln!(
-                    "phora: refusing to fast-forward out-of-anchor {}: {e}",
-                    dst.display()
-                );
-                continue;
-            }
+        let path = confined.map_err(|e| {
+            Error::Sync(format!(
+                "fast-forward refuses out-of-anchor {}: {e}; eject it instead",
+                dst.display()
+            ))
+        })?;
+        if prune::overlaps_live_dest(&path, &expected_paths, &record.key.target) {
+            eprintln!(
+                "phora: fast-forward unrecorded {}:{} but kept {} (a live artifact sits there)",
+                record.key.source,
+                record.key.artifact,
+                path.display()
+            );
+        } else {
+            eprintln!(
+                "phora: fast-forward dropped {}:{} (removed upstream)",
+                record.key.source, record.key.artifact
+            );
+            remove_orphan_path(&path)
+                .map_err(|e| Error::Sync(format!("fast-forward prune {}: {e}", path.display())))?;
         }
         registry.remove(&record.key)?;
     }
