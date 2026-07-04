@@ -2723,6 +2723,155 @@ fn sync_skips_prune_when_a_deploy_failed() {
     drop(src);
 }
 
+/// Seed a bare orphan registry record (no files on disk) for `(dest, source, artifact)`.
+/// A flat layout maps the record to `<target>/<artifact>` by artifact name alone, so an
+/// `artifact` that a live binding also publishes lands on that live destination.
+fn seed_orphan_record(reg: &FileRegistry, source: &str, artifact: &str) {
+    let record = RegistryRecord {
+        version: 1,
+        key: artifact_key("dest", source, artifact),
+        source: source.to_owned(),
+        commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
+        digest: "blake3:orphan".to_owned(),
+        projected_at: "2026-01-01T00:00:00Z".to_owned(),
+        layout: "flat".to_owned(),
+        kind: RecordKind::Dir,
+        allow_symlinks: false,
+        preserve_executable: true,
+        files: vec![ManifestFile {
+            path: PathBuf::from("init.lua"),
+            size: 6,
+            mtime: 1_700_000_000,
+            blake3: "blake3:orphan".to_owned(),
+        }],
+        linked: false,
+        vars_digest: None,
+    };
+    reg.put(&record).expect("seed overlapping orphan record");
+}
+
+#[test]
+fn prune_keeps_record_when_orphan_path_overlaps_a_live_dest() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let cfg =
+        config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+
+    seed_orphan_record(&fx.registry, "gone-src", "editor");
+
+    let in_ = SyncInput {
+        base_config: &cfg,
+        local_config: None,
+        base_lock: None,
+        local_lock: None,
+        force: false,
+        interactive: false,
+        prune: true,
+        no_hooks: false,
+        no_transitive_hooks: false,
+        frozen: false,
+        fast_forward: false,
+        resolver: None,
+        jobs: None,
+    };
+
+    let out = sync(&in_, &fx.backend, &fx.registry).expect("prune sync runs");
+    assert!(!out.had_failures, "prune run must succeed");
+
+    let live_dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+    assert!(
+        live_dst.join("init.lua").exists(),
+        "the live destination overlapping the orphan must NOT be deleted by prune"
+    );
+    assert!(
+        fx.registry
+            .get(&artifact_key("dest", "gone-src", "editor"))
+            .expect("get overlapping orphan record")
+            .is_some(),
+        "when prune skips the physical delete because the orphan overlaps a live dest, the file \
+         stays on disk and its record MUST be kept so the file remains tracked"
+    );
+}
+
+#[test]
+fn prune_drops_record_when_orphan_path_is_already_absent() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let cfg =
+        config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+
+    seed_orphan_record(&fx.registry, "gone-src", "obsolete");
+
+    let in_ = SyncInput {
+        base_config: &cfg,
+        local_config: None,
+        base_lock: None,
+        local_lock: None,
+        force: false,
+        interactive: false,
+        prune: true,
+        no_hooks: false,
+        no_transitive_hooks: false,
+        frozen: false,
+        fast_forward: false,
+        resolver: None,
+        jobs: None,
+    };
+
+    let out = sync(&in_, &fx.backend, &fx.registry).expect("prune sync runs");
+    assert!(!out.had_failures, "prune run must succeed");
+
+    assert!(
+        fx.registry
+            .get(&artifact_key("dest", "gone-src", "obsolete"))
+            .expect("get absent-path orphan record")
+            .is_none(),
+        "an orphan whose path is already absent has nothing to keep tracked, so its record MUST \
+         be removed even though prune skipped the physical delete"
+    );
+}
+
+#[test]
+fn prune_deletes_file_and_drops_record_for_a_normal_orphan() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let cfg =
+        config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+
+    let orphan_dst = seed_orphan(&td, &fx.registry, &flat_layout());
+
+    let in_ = SyncInput {
+        base_config: &cfg,
+        local_config: None,
+        base_lock: None,
+        local_lock: None,
+        force: false,
+        interactive: false,
+        prune: true,
+        no_hooks: false,
+        no_transitive_hooks: false,
+        frozen: false,
+        fast_forward: false,
+        resolver: None,
+        jobs: None,
+    };
+
+    let out = sync(&in_, &fx.backend, &fx.registry).expect("prune sync runs");
+    assert!(!out.had_failures, "prune run must succeed");
+
+    assert!(
+        !orphan_dst.exists(),
+        "a non-overlapping orphan's files must be deleted by prune"
+    );
+    assert!(
+        fx.registry
+            .get(&artifact_key("dest", "gone-src", "obsolete"))
+            .expect("get normal orphan record")
+            .is_none(),
+        "a non-overlapping orphan's record must be removed once its files are deleted"
+    );
+}
+
 // ── undefined source reference: graceful Err, not panic ────────
 
 #[test]
@@ -4871,6 +5020,123 @@ fn prune_is_instance_granular_across_two_aliases_of_one_source() {
     drop(src);
 }
 
+#[test]
+fn prune_keeps_a_foreign_orphan_dir_that_ancestors_a_live_leaf_of_another_binding() {
+    let (src, _git, backend, url, commit) = seed_two_leaf_dir_repo();
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.ed]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\n\
+         sources = {{ ed = {{ source = \"ed\", take = [\"editor/a.md\"] }} }}\n\
+         layout = \"flat\"\n",
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("flat narrowing-take config parses");
+
+    let orphan_dir = td.artifact_dst(&flat_layout(), "gone-src", "editor");
+    std::fs::create_dir_all(&orphan_dir).expect("mkdir orphan dir");
+    let sibling = orphan_dir.join("legacy.txt");
+    std::fs::write(&sibling, b"legacy\n").expect("write orphan sibling");
+
+    let registry = fx_registry();
+    registry
+        .put(&RegistryRecord {
+            version: 1,
+            key: artifact_key("dest", "gone-src", "editor"),
+            source: "gone-src".to_owned(),
+            commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
+            digest: "blake3:orphan".to_owned(),
+            projected_at: "2026-01-01T00:00:00Z".to_owned(),
+            layout: "flat".to_owned(),
+            kind: RecordKind::Dir,
+            allow_symlinks: false,
+            preserve_executable: true,
+            files: vec![ManifestFile {
+                path: PathBuf::from("legacy.txt"),
+                size: 7,
+                mtime: 1_700_000_000,
+                blake3: "blake3:orphan".to_owned(),
+            }],
+            linked: false,
+            vars_digest: None,
+        })
+        .expect("seed foreign orphan dir record");
+
+    prune_one(&cfg, &backend, &registry, &commit).expect("prune runs");
+
+    assert!(
+        sibling.exists(),
+        "the cross-binding overlap skips the physical delete, so the orphan dir's sibling must \
+         SURVIVE at {}",
+        sibling.display()
+    );
+    assert!(
+        registry
+            .get(&artifact_key("dest", "gone-src", "editor"))
+            .expect("registry read")
+            .is_some(),
+        "UNTRACKED-FILE INVARIANT: a different binding's live leaf sits UNDER this orphan dir, but \
+         that leaf's record does not track the dir's sibling; the file stays on disk, so the \
+         orphan record MUST be kept or the sibling becomes untracked"
+    );
+    drop(src);
+}
+
+#[test]
+fn prune_keeps_a_foreign_orphan_leaf_nested_under_a_live_collapsed_dir_of_another_binding() {
+    let (src, _git, backend, url, commit) = seed_two_leaf_dir_repo();
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.ed]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\"ed\"]\nlayout = \"flat\"\n",
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("flat collapse config parses");
+
+    let orphan_leaf = td.artifact_dst(&flat_layout(), "gone-src", "editor/legacy.txt");
+    std::fs::create_dir_all(orphan_leaf.parent().expect("leaf parent")).expect("mkdir leaf parent");
+    std::fs::write(&orphan_leaf, b"legacy\n").expect("write orphan leaf");
+
+    let registry = fx_registry();
+    registry
+        .put(&RegistryRecord {
+            version: 1,
+            key: artifact_key("dest", "gone-src", "editor/legacy.txt"),
+            source: "gone-src".to_owned(),
+            commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
+            digest: "blake3:orphan".to_owned(),
+            projected_at: "2026-01-01T00:00:00Z".to_owned(),
+            layout: "flat".to_owned(),
+            kind: RecordKind::File,
+            allow_symlinks: false,
+            preserve_executable: true,
+            files: vec![],
+            linked: false,
+            vars_digest: None,
+        })
+        .expect("seed foreign orphan leaf record");
+
+    prune_one(&cfg, &backend, &registry, &commit).expect("prune runs");
+
+    assert!(
+        orphan_leaf.exists(),
+        "the overlap under the live collapsed dir skips the delete; the foreign orphan leaf must \
+         SURVIVE at {}",
+        orphan_leaf.display()
+    );
+    assert!(
+        registry
+            .get(&artifact_key("dest", "gone-src", "editor/legacy.txt"))
+            .expect("registry read")
+            .is_some(),
+        "UNTRACKED-FILE INVARIANT: the live collapsed `editor` dir belongs to ANOTHER binding and \
+         does not track this foreign leaf; kept on disk, its record MUST be kept so it stays tracked"
+    );
+    drop(src);
+}
+
 /// A real `GitBackend` over a throwaway mirror dir; link-source rebuild/prune
 /// never reach it, but the signature requires a backend.
 fn fx_backend() -> GitBackend {
@@ -5702,6 +5968,198 @@ fn linked_record_over_real_dir_redeploys_symlink() {
         .expect("registry read")
         .expect("record present after re-link");
     assert!(rec.linked, "the re-linked record must remain linked=true");
+}
+
+// ── BUG-MODE-002: transitions must not clobber Modified/Foreign dst ─────
+
+#[cfg(unix)]
+#[test]
+fn copy_to_link_transition_skips_foreign_dst_without_force() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let dst = link_dst(&td.target_path(), "dev-src", "editor");
+    std::fs::create_dir_all(&dst).expect("plant a foreign real dir at the link dst");
+    let marker = b"hand-written, not phora-managed\n";
+    std::fs::write(dst.join("local-only.txt"), marker).expect("write foreign marker");
+
+    let st = check_state_at(
+        &dst,
+        &fx.registry,
+        "dest",
+        "dev-src",
+        "editor",
+        &fx.head_sha,
+    );
+    assert!(
+        matches!(st, ArtifactState::Foreign),
+        "premise: an unmanaged real dir at the link dst must read Foreign, got {st:?}"
+    );
+
+    let (base, local) = base_link_overlay_pair("dev-src", fx.src.path(), &td.target_path());
+    let out = sync(
+        &input(&base, Some(&local), None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("sync must not error on a Foreign dst during a copy→link transition");
+    assert!(!out.had_failures, "skipping a Foreign dst is not a failure");
+
+    let meta = std::fs::symlink_metadata(&dst).expect("dst present after sync");
+    assert!(
+        !meta.file_type().is_symlink(),
+        "without --force a copy→link transition onto Foreign content must be SKIPPED, not \
+         replace the real dir with a symlink"
+    );
+    assert_eq!(
+        std::fs::read(dst.join("local-only.txt")).expect("foreign marker still present"),
+        marker,
+        "the unmanaged content must be left intact on disk"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn copy_to_link_transition_skips_modified_dst_without_force() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let dst = link_dst(&td.target_path(), "dev-src", "editor");
+    let key = artifact_key("dest", "dev-src", "editor");
+
+    let copy_cfg = by_source_copy_config(&fx.url, &td.target_path());
+    let out = sync(
+        &input(&copy_cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("copy leg deploys and records the artifact");
+    assert!(!out.had_failures, "the copy leg must deploy cleanly");
+    assert!(
+        fx.registry.get(&key).expect("registry read").is_some(),
+        "premise: the copy leg must record a managed artifact"
+    );
+
+    let edited = b"-- locally edited, do not clobber\n";
+    std::fs::write(dst.join("init.lua"), edited).expect("edit the deployed file");
+    let st = check_state_at(
+        &dst,
+        &fx.registry,
+        "dest",
+        "dev-src",
+        "editor",
+        &fx.head_sha,
+    );
+    assert!(
+        matches!(st, ArtifactState::Modified { .. }),
+        "premise: an edited managed copy at the link dst must read Modified, got {st:?}"
+    );
+
+    let (base, local) = base_link_overlay_pair("dev-src", fx.src.path(), &td.target_path());
+    let out = sync(
+        &input(&base, Some(&local), None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("sync must not error on a Modified dst during a copy→link transition");
+    assert!(
+        !out.had_failures,
+        "skipping a Modified dst is not a failure"
+    );
+
+    let meta = std::fs::symlink_metadata(&dst).expect("dst present after sync");
+    assert!(
+        !meta.file_type().is_symlink(),
+        "without --force a copy→link transition onto a Modified artifact must be SKIPPED, not \
+         replace the edited copy with a symlink"
+    );
+    assert_eq!(
+        std::fs::read(dst.join("init.lua")).expect("edited file still present"),
+        edited,
+        "the local edit must be preserved on disk"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn link_to_copy_transition_skips_foreign_symlink_without_force() {
+    use std::os::unix::fs::symlink;
+
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let dst = link_dst(&td.target_path(), "dev-src", "editor");
+    std::fs::create_dir_all(dst.parent().expect("dst parent")).expect("mkdir dst parent");
+
+    let foreign_target = td.target_path().join("foreign-elsewhere");
+    std::fs::create_dir_all(&foreign_target).expect("mkdir foreign symlink target");
+    std::fs::write(foreign_target.join("keep.txt"), b"external\n").expect("write foreign target");
+    symlink(&foreign_target, &dst).expect("plant a foreign symlink at the copy dst");
+
+    let st = check_state_at(
+        &dst,
+        &fx.registry,
+        "dest",
+        "dev-src",
+        "editor",
+        &fx.head_sha,
+    );
+    assert!(
+        matches!(st, ArtifactState::Foreign),
+        "premise: an unmanaged symlink at the copy dst must read Foreign, got {st:?}"
+    );
+
+    let copy_cfg = by_source_copy_config(&fx.url, &td.target_path());
+    let out = sync(
+        &input(&copy_cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("sync must not error on a Foreign symlink during a link→copy transition");
+    assert!(
+        !out.had_failures,
+        "skipping a Foreign symlink is not a failure"
+    );
+
+    let meta = std::fs::symlink_metadata(&dst).expect("dst present after sync");
+    assert!(
+        meta.file_type().is_symlink(),
+        "without --force a link→copy transition onto a Foreign symlink must be SKIPPED, not \
+         materialize a real copy over it"
+    );
+    assert_eq!(
+        std::fs::read_link(&dst).expect("foreign symlink still readable"),
+        foreign_target,
+        "the unmanaged symlink must be left intact on disk"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn force_still_applies_copy_to_link_transition_over_foreign() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let dst = link_dst(&td.target_path(), "dev-src", "editor");
+    std::fs::create_dir_all(&dst).expect("plant a foreign real dir at the link dst");
+    std::fs::write(dst.join("local-only.txt"), b"squatter\n").expect("write foreign marker");
+
+    let (base, local) = base_link_overlay_pair("dev-src", fx.src.path(), &td.target_path());
+    let out = sync(
+        &input(&base, Some(&local), None, None, true),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("forced copy→link transition deploys over Foreign content");
+    assert!(!out.had_failures, "forced transition must succeed");
+
+    let meta = std::fs::symlink_metadata(&dst).expect("dst present after forced sync");
+    assert!(
+        meta.file_type().is_symlink(),
+        "--force must still apply the copy→link transition, replacing Foreign content with a \
+         symlink"
+    );
+    assert_eq!(
+        std::fs::read_link(&dst).expect("forced symlink readable"),
+        fx.src.path().join("editor"),
+        "the materialized symlink must point at the absolute working-tree <source>/<artifact>"
+    );
 }
 
 /// REGRESSION GUARD (must stay green): a correctly-deployed link, resynced with

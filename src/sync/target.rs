@@ -377,7 +377,14 @@ fn conflict_kind_for(
     force: bool,
 ) -> Option<ConflictKind> {
     match state {
-        _ if entry.mode_transition => None,
+        ArtifactState::Clean
+        | ArtifactState::Ejected
+        | ArtifactState::Linked
+        | ArtifactState::Revalidated { .. }
+            if entry.mode_transition =>
+        {
+            None
+        }
         ArtifactState::Modified { changed } if !force => Some(ConflictKind::Modified {
             changed: changed.clone(),
         }),
@@ -1054,5 +1061,144 @@ mod revalidated_treated_like_clean_tests {
             !skips_redeploy(&ArtifactState::Foreign),
             "a foreign artifact is not a silent no-op skip"
         );
+    }
+}
+
+#[cfg(test)]
+mod mode_transition_conflict_tests {
+    use super::*;
+    use crate::config::Source;
+    use crate::kernel::ResolvedTake;
+
+    fn parsed_source(link: bool) -> ParsedSource {
+        let toml = if link {
+            "path = \"/tmp/src\"\ndeploy = \"link\""
+        } else {
+            "path = \"/tmp/src\""
+        };
+        let raw: Source = toml::from_str(toml).expect("source toml parses");
+        let parsed = ParsedSource::parse("src", &raw).expect("source parses to typed form");
+        assert_eq!(
+            matches!(parsed.deploy_mode(), DeployMode::Link),
+            link,
+            "premise: the parsed source deploy mode must match the requested direction"
+        );
+        parsed
+    }
+
+    fn leaf_item() -> PlannedItem {
+        PlannedItem {
+            materialization: Materialization::Leaf(ResolvedTake {
+                source: "a.txt".to_owned(),
+                dest: "a.txt".to_owned(),
+            }),
+            destination: PathBuf::from("/tmp/dst/a.txt"),
+            kept_leaves: Vec::new(),
+        }
+    }
+
+    fn transition_entry<'a>(
+        source: &'a ParsedSource,
+        source_name: &'a SourceName,
+        item: &'a PlannedItem,
+        dst: &'a Path,
+    ) -> ArtifactEntry<'a> {
+        ArtifactEntry {
+            source,
+            git: "/tmp/src",
+            source_name,
+            identity: "src",
+            underlying_source: "src",
+            commit: "0123456789abcdef0123456789abcdef01234567",
+            item,
+            artifact_dst: dst,
+            layout_kind: LayoutKind::BySource,
+            ejected: &[],
+            mode_transition: true,
+            template_opt_in: &TemplateOptIn::SuffixOnly,
+        }
+    }
+
+    fn modified_state() -> ArtifactState {
+        ArtifactState::Modified {
+            changed: vec![PathBuf::from("a.txt")],
+        }
+    }
+
+    fn conflict_for(link: bool, state: &ArtifactState, force: bool) -> Option<ConflictKind> {
+        let source = parsed_source(link);
+        let source_name = SourceName::trusted("src");
+        let item = leaf_item();
+        let dst = PathBuf::from("/tmp/dst/a.txt");
+        let entry = transition_entry(&source, &source_name, &item, &dst);
+        conflict_kind_for(state, &entry, force)
+    }
+
+    #[test]
+    fn copy_to_link_transition_onto_modified_is_a_conflict() {
+        let kind = conflict_for(true, &modified_state(), false);
+        assert!(
+            matches!(kind, Some(ConflictKind::Modified { .. })),
+            "a copy→link transition onto a locally-modified managed artifact must still classify a \
+             Modified conflict (skip unless --force); the mode_transition arm must not swallow it \
+             (got {kind:?})"
+        );
+    }
+
+    #[test]
+    fn copy_to_link_transition_onto_foreign_is_a_conflict() {
+        let kind = conflict_for(true, &ArtifactState::Foreign, false);
+        assert!(
+            matches!(kind, Some(ConflictKind::Foreign)),
+            "a copy→link transition onto unmanaged (Foreign) content must still classify a Foreign \
+             conflict, not silently replace it with a symlink (got {kind:?})"
+        );
+    }
+
+    #[test]
+    fn link_to_copy_transition_onto_modified_is_a_conflict() {
+        let kind = conflict_for(false, &modified_state(), false);
+        assert!(
+            matches!(kind, Some(ConflictKind::Modified { .. })),
+            "a link→copy transition onto a locally-modified managed artifact must still classify a \
+             Modified conflict (got {kind:?})"
+        );
+    }
+
+    #[test]
+    fn link_to_copy_transition_onto_foreign_is_a_conflict() {
+        let kind = conflict_for(false, &ArtifactState::Foreign, false);
+        assert!(
+            matches!(kind, Some(ConflictKind::Foreign)),
+            "a link→copy transition onto unmanaged (Foreign) content must still classify a Foreign \
+             conflict (got {kind:?})"
+        );
+    }
+
+    #[test]
+    fn force_overrides_a_transition_conflict() {
+        assert!(
+            conflict_for(true, &modified_state(), true).is_none(),
+            "--force must still apply a copy→link transition over Modified content (no conflict)"
+        );
+        assert!(
+            conflict_for(false, &ArtifactState::Foreign, true).is_none(),
+            "--force must still apply a link→copy transition over Foreign content (no conflict)"
+        );
+    }
+
+    #[test]
+    fn clean_like_transitions_stay_silent() {
+        for state in [
+            ArtifactState::Clean,
+            ArtifactState::Linked,
+            ArtifactState::Revalidated { fresh: Vec::new() },
+        ] {
+            assert!(
+                conflict_for(true, &state, false).is_none(),
+                "a mode transition over {state:?} must proceed silently — only Modified/Foreign \
+                 destinations are conflicts"
+            );
+        }
     }
 }

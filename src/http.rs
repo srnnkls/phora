@@ -4,6 +4,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use sha2::{Digest as _, Sha256};
+use ureq::http::{self, Uri, header};
 
 use crate::kernel::{Algo, Digest};
 use crate::source::SourceError;
@@ -12,28 +13,85 @@ type Result<T> = std::result::Result<T, SourceError>;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const BODY_TIMEOUT: Duration = Duration::from_mins(5);
+const MAX_REDIRECTS: u32 = 10;
 
-/// Streams the body at `url` into `dest`, following redirects.
+/// Streams the body at `url` into `dest`, following redirects whose scheme is `https`,
+/// or `http` when the original `url` was itself `http`, up to [`MAX_REDIRECTS`] hops.
 ///
 /// # Errors
 ///
 /// Returns [`SourceError::Source`] on a non-2xx status (message names the status and
-/// url), on transport/connection failure, or on a filesystem error writing `dest`.
+/// url), on a redirect to a disallowed scheme (message names the scheme), on exceeding
+/// the redirect limit, on transport/connection failure, or on a filesystem error
+/// writing `dest`.
 pub fn download(url: &str, dest: &Path) -> Result<()> {
     let agent = ureq::Agent::config_builder()
         .timeout_connect(Some(CONNECT_TIMEOUT))
         .timeout_recv_body(Some(BODY_TIMEOUT))
+        .max_redirects(0)
+        .max_redirects_will_error(false)
         .build()
         .new_agent();
 
-    let response = match agent.get(url).call() {
-        Ok(response) => response,
-        Err(ureq::Error::StatusCode(code)) => {
+    let origin: Uri = url
+        .parse()
+        .map_err(|err| SourceError::Source(format!("GET {url} has an invalid url: {err}")))?;
+    let origin_is_http = origin
+        .scheme_str()
+        .is_some_and(|s| s.eq_ignore_ascii_case("http"));
+
+    let mut current = origin;
+    let mut hops = 0u32;
+    let response = loop {
+        let response = match agent.get(current.clone()).call() {
+            Ok(response) => response,
+            Err(ureq::Error::StatusCode(code)) => {
+                return Err(SourceError::Source(format!(
+                    "GET {url} failed with status {code}"
+                )));
+            }
+            Err(err) => return Err(SourceError::Source(format!("GET {url} failed: {err}"))),
+        };
+
+        let location = response
+            .status()
+            .is_redirection()
+            .then(|| response.headers().get(header::LOCATION))
+            .flatten();
+        let Some(location) = location else {
+            break response;
+        };
+
+        let location = location.to_str().map_err(|err| {
+            SourceError::Source(format!(
+                "GET {url} redirect has a non-ascii Location: {err}"
+            ))
+        })?;
+
+        let scheme = scheme_of(location).map_or_else(
+            || if origin_is_http { "http" } else { "https" }.to_string(),
+            str::to_ascii_lowercase,
+        );
+        let allowed = scheme == "https" || (scheme == "http" && origin_is_http);
+        if !allowed {
             return Err(SourceError::Source(format!(
-                "GET {url} failed with status {code}"
+                "GET {url} refused redirect to disallowed scheme `{scheme}`"
             )));
         }
-        Err(err) => return Err(SourceError::Source(format!("GET {url} failed: {err}"))),
+
+        let next = resolve_redirect(&current, location).map_err(|err| {
+            SourceError::Source(format!(
+                "GET {url} redirect to `{location}` is not a valid url: {err}"
+            ))
+        })?;
+
+        hops += 1;
+        if hops > MAX_REDIRECTS {
+            return Err(SourceError::Source(format!(
+                "GET {url} exceeded {MAX_REDIRECTS} redirects"
+            )));
+        }
+        current = next;
     };
 
     let mut reader = response.into_body().into_reader();
@@ -51,6 +109,87 @@ pub fn download(url: &str, dest: &Path) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn scheme_of(location: &str) -> Option<&str> {
+    let colon = location.find(':')?;
+    let scheme = &location[..colon];
+    let mut chars = scheme.chars();
+    let starts_alpha = chars.next().is_some_and(|c| c.is_ascii_alphabetic());
+    let rest_ok = chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    (starts_alpha && rest_ok).then_some(scheme)
+}
+
+fn resolve_redirect(base: &Uri, location: &str) -> std::result::Result<Uri, http::uri::InvalidUri> {
+    if scheme_of(location).is_some() {
+        return location.parse();
+    }
+
+    let base_scheme = base.scheme_str().unwrap_or("https");
+    let reference = location.split('#').next().unwrap_or_default();
+
+    if reference.starts_with("//") {
+        return format!("{base_scheme}:{reference}").parse();
+    }
+
+    let (ref_path, ref_query) = match reference.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (reference, None),
+    };
+
+    let authority = base
+        .authority()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    let (path, query) = if ref_path.is_empty() {
+        (base.path().to_string(), ref_query.or_else(|| base.query()))
+    } else if ref_path.starts_with('/') {
+        (remove_dot_segments(ref_path), ref_query)
+    } else {
+        (
+            remove_dot_segments(&merge_paths(base.path(), ref_path)),
+            ref_query,
+        )
+    };
+
+    let mut resolved = format!("{base_scheme}://{authority}{path}");
+    if let Some(query) = query {
+        resolved.push('?');
+        resolved.push_str(query);
+    }
+    resolved.parse()
+}
+
+/// RFC 3986 §5.2.3 path merge; `base` always has an authority (it is an absolute url).
+fn merge_paths(base_path: &str, ref_path: &str) -> String {
+    match base_path.rfind('/') {
+        Some(slash) => format!("{}{ref_path}", &base_path[..=slash]),
+        None => format!("/{ref_path}"),
+    }
+}
+
+/// RFC 3986 §5.2.4 dot-segment removal.
+fn remove_dot_segments(path: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let trailing_slash = path.ends_with('/');
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    let mut resolved = String::with_capacity(path.len());
+    if path.starts_with('/') {
+        resolved.push('/');
+    }
+    resolved.push_str(&out.join("/"));
+    if trailing_slash && !resolved.ends_with('/') {
+        resolved.push('/');
+    }
+    resolved
 }
 
 /// Verifies `bytes` against `expected`, hashing with the matching algorithm.

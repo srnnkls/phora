@@ -12,6 +12,7 @@ use super::remove_orphan_path;
 
 type ExpectedByBinding = BTreeMap<(String, String), Vec<String>>;
 type ExpectedPaths = BTreeMap<String, Vec<PathBuf>>;
+type LivePathsBySource = BTreeMap<String, Vec<(String, PathBuf)>>;
 
 fn is_still_expected(
     expected: &ExpectedByBinding,
@@ -30,9 +31,30 @@ pub(super) fn overlaps_live_dest(
     expected_paths: &ExpectedPaths,
     target: &str,
 ) -> bool {
-    expected_paths.get(target).is_some_and(|live| {
-        live.iter()
-            .any(|dest| dest.starts_with(path) || path.starts_with(dest))
+    expected_paths
+        .get(target)
+        .is_some_and(|live| live.iter().any(|dest| touches(path, dest)))
+}
+
+fn touches(path: &Path, dest: &Path) -> bool {
+    dest.starts_with(path) || path.starts_with(dest)
+}
+
+fn overlaps_any_live_dest(path: &Path, live: &LivePathsBySource, target: &str) -> bool {
+    live.get(target)
+        .is_some_and(|dests| dests.iter().any(|(_, dest)| touches(path, dest)))
+}
+
+fn overlaps_foreign_live_dest(
+    path: &Path,
+    live: &LivePathsBySource,
+    target: &str,
+    source: &str,
+) -> bool {
+    live.get(target).is_some_and(|dests| {
+        dests
+            .iter()
+            .any(|(dest_source, dest)| dest_source != source && touches(path, dest))
     })
 }
 
@@ -74,19 +96,20 @@ pub(super) fn prune_orphans(
 ) -> Result<()> {
     let plans = plan_targets(config, parsed, remotes, backend, resolved_commits)?;
     let mut expected: ExpectedByBinding = BTreeMap::new();
-    let mut expected_paths: ExpectedPaths = BTreeMap::new();
+    let mut live_paths: LivePathsBySource = BTreeMap::new();
     for plan in &plans {
         let target = config.targets.get(&plan.target);
         for binding in &plan.bindings {
             let keys = expected_artifact_keys(binding);
             if let Some(target) = target {
-                let paths = expected_paths.entry(plan.target.clone()).or_default();
+                let dests = live_paths.entry(plan.target.clone()).or_default();
                 for key in &keys {
-                    paths.push(
+                    dests.push((
+                        binding.identity.clone(),
                         target
                             .expanded_path()
                             .join(target.layout().artifact_path(&binding.identity, key)),
-                    );
+                    ));
                 }
             }
             expected
@@ -121,7 +144,7 @@ pub(super) fn prune_orphans(
             match confined {
                 Ok(path)
                     if path.exists()
-                        && !overlaps_live_dest(&path, &expected_paths, &record.key.target) =>
+                        && !overlaps_any_live_dest(&path, &live_paths, &record.key.target) =>
                 {
                     eprintln!(
                         "phora: pruning orphaned {}:{}",
@@ -129,6 +152,17 @@ pub(super) fn prune_orphans(
                     );
                     remove_orphan_path(&path)
                         .map_err(|e| Error::Sync(format!("prune {}: {e}", path.display())))?;
+                }
+                Ok(path)
+                    if path.exists()
+                        && overlaps_foreign_live_dest(
+                            &path,
+                            &live_paths,
+                            &record.key.target,
+                            &record.key.source,
+                        ) =>
+                {
+                    continue;
                 }
                 Ok(_) => {}
                 Err(e) => {

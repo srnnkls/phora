@@ -1146,12 +1146,10 @@ impl ExportWalk<'_, '_> {
         Ok(())
     }
 
-    fn register_deployed_name(&mut self, deployed_rel: PathBuf, source_rel: &Path) -> Result<()> {
-        let name = deployed_rel.to_string_lossy().into_owned();
-        if let Some(prior) = self
-            .deployed_names
-            .insert(deployed_rel, source_rel.to_path_buf())
-        {
+    fn register_deployed_name(&mut self, deployed_rel: &Path, source_rel: &Path) -> Result<()> {
+        let folded = crate::sync::confine::fold_path(deployed_rel);
+        let name = folded.to_string_lossy().into_owned();
+        if let Some(prior) = self.deployed_names.insert(folded, source_rel.to_path_buf()) {
             return Err(SourceError::DeployedNameCollision {
                 name,
                 first: prior,
@@ -1168,7 +1166,7 @@ impl ExportWalk<'_, '_> {
         source_bytes: &[u8],
         executable: bool,
     ) -> Result<()> {
-        self.register_deployed_name(deployed_rel.to_path_buf(), source_rel)?;
+        self.register_deployed_name(deployed_rel, source_rel)?;
 
         let rendered = self.renderer.render(source_rel, source_bytes)?;
         self.rendered_any |= rendered.templated;
@@ -1218,7 +1216,7 @@ impl ExportWalk<'_, '_> {
                 path: deployed_rel.to_path_buf(),
             });
         }
-        self.register_deployed_name(deployed_rel.to_path_buf(), deployed_rel)?;
+        self.register_deployed_name(deployed_rel, deployed_rel)?;
 
         let out_path = self.out_base.join(deployed_rel);
         if let Some(parent) = out_path.parent() {
@@ -4137,6 +4135,46 @@ path = "srnnkls/tropos"
         assert!(
             msg.contains("x.md"),
             "the collision must name the shared dest, got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn export_rejects_deployed_names_colliding_only_by_ascii_case() {
+        let fixture = build_collision_fixture(&[
+            ("first.md", b"upper deploys to README.md\n"),
+            ("second.md", b"lower deploys to readme.md\n"),
+        ]);
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+        let staging = TempDir::new().expect("staging dir");
+
+        let leaves = vec![
+            ExportLeaf {
+                source: PathBuf::from("art/first.md"),
+                dest: PathBuf::from("README.md"),
+            },
+            ExportLeaf {
+                source: PathBuf::from("art/second.md"),
+                dest: PathBuf::from("readme.md"),
+            },
+        ];
+        let err = export_named(&fixture, staging.path(), &leaves, &ExportPolicy::default())
+            .expect_err("`README.md` and `readme.md` fold to one deployed name and must collide");
+        assert!(
+            matches!(err, SourceError::DeployedNameCollision { .. }),
+            "a case-only deployed-name clash must be a hard DeployedNameCollision, not \
+             last-writer-wins, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("first.md") && msg.contains("second.md"),
+            "the collision must name both colliding source paths, got {msg:?}"
+        );
+        assert!(
+            msg.to_lowercase().contains("readme.md"),
+            "the collision must name the case-folded deployed name, got {msg:?}"
         );
     }
 

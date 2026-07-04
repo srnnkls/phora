@@ -910,6 +910,72 @@ fn tree_url_stays_literal_and_extracts_branch_and_root() {
 }
 
 #[test]
+fn nested_group_full_url_names_source_from_last_segment() {
+    let parsed = parse("https://gitlab.com/group/subgroup/project");
+    assert_eq!(
+        parsed.name, "project",
+        "a GitLab subgroup URL must name the source from the LAST path segment (`project`), not the second (`subgroup`)"
+    );
+}
+
+#[test]
+fn nested_group_full_url_keeps_full_path_in_remote() {
+    let parsed = parse("https://gitlab.com/group/subgroup/project");
+    assert_eq!(
+        parsed.git.as_deref(),
+        Some("https://gitlab.com/group/subgroup/project.git"),
+        "the literal remote must retain the full nested path and end with subgroup/project.git"
+    );
+    assert!(
+        parsed.host.is_none() && parsed.repo.is_none(),
+        "a nested-group scheme URL stays a literal remote, not a symbolic host/path source"
+    );
+    assert!(parsed.branch.is_none() && parsed.root.is_none());
+}
+
+#[test]
+fn trailing_slash_full_url_normalizes_git_suffix() {
+    let parsed = parse("https://github.com/owner/repo/");
+    assert_eq!(
+        parsed.git.as_deref(),
+        Some("https://github.com/owner/repo.git"),
+        "a trailing slash must be trimmed before appending .git, not yield `repo/.git`"
+    );
+    assert_eq!(
+        parsed.name, "repo",
+        "a trailing slash must not change the derived source name"
+    );
+}
+
+#[test]
+fn two_segment_full_url_unchanged_pin() {
+    let parsed = parse("https://github.com/owner/repo");
+    assert_eq!(
+        parsed.git.as_deref(),
+        Some("https://github.com/owner/repo.git"),
+        "a plain two-segment scheme URL is unchanged: literal remote with .git appended"
+    );
+    assert_eq!(parsed.name, "repo");
+    assert!(parsed.branch.is_none() && parsed.root.is_none());
+}
+
+#[test]
+fn tree_full_url_unchanged_pin() {
+    let parsed = parse("https://github.com/company/configs/tree/main/editor");
+    assert_eq!(
+        parsed.git.as_deref(),
+        Some("https://github.com/company/configs.git"),
+        "a tree URL is unchanged: literal remote with the /tree/<ref>/<path> tail stripped"
+    );
+    assert_eq!(parsed.branch.as_deref(), Some("main"));
+    assert_eq!(parsed.root.as_deref(), Some("editor"));
+    assert_eq!(
+        parsed.name, "configs",
+        "name is the repo, not the path tail"
+    );
+}
+
+#[test]
 fn gitlab_domain_shorthand_maps_to_symbolic_gitlab_host() {
     let parsed = parse("gitlab.com/owner/repo");
     assert_eq!(

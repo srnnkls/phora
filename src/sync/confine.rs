@@ -186,6 +186,10 @@ fn fold_key(component: &std::ffi::OsStr) -> String {
         .to_lowercase()
 }
 
+pub(crate) fn fold_path(path: &Path) -> PathBuf {
+    path.components().map(|c| fold_key(c.as_os_str())).collect()
+}
+
 fn strip_prefix_folded(path: &Path, prefix: &Path) -> Option<PathBuf> {
     let mut tail = path.components();
     for pc in prefix.components() {
