@@ -3530,6 +3530,7 @@ mod per_binding_refinement {
             files: vec![],
             linked: false,
             vars_digest: None,
+            deploy_root: None,
         };
         reg.put(&rec).expect("put bare-binding record");
 

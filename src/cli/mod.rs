@@ -15,7 +15,6 @@ mod tests;
 use {
     crate::config::{Host, LayoutKind},
     crate::deploy::ArtifactState,
-    crate::store::Registry,
     add::{
         MissingTarget, MissingTargetDecider, add_to_default_target, add_with_binds,
         insert_source_with_ref, run_add,
@@ -54,7 +53,7 @@ use crate::error::{Error, Result};
 use crate::kernel::{ProjectId, SourceName, TargetName};
 use crate::paths::state_root_for;
 use crate::source::{GitBackend, HttpBackend, RouterBackend};
-use crate::store::{FileRegistry, StoreError};
+use crate::store::{FileRegistry, Registry, StoreError};
 use crate::sync::{Conflict, ConflictResolver, Resolution};
 use std::str::FromStr;
 
@@ -287,6 +286,9 @@ pub enum TargetCmd {
         name: String,
         #[arg(long)]
         local: bool,
+        /// Remove the target block even while it still has deployed artifacts.
+        #[arg(long)]
+        force: bool,
     },
     /// List targets over the merged config.
     List,
@@ -599,7 +601,7 @@ fn run_target(cmd: TargetCmd) -> Result<()> {
             layout,
             local,
         } => run_target_add(&name, &path, layout.as_deref(), local),
-        TargetCmd::Rm { name, local } => run_target_rm(&name, local),
+        TargetCmd::Rm { name, local, force } => run_target_rm(&name, local, force),
         TargetCmd::List => {
             render::print_target_rows(&target_listing(&load_config()?));
             Ok(())
@@ -634,9 +636,14 @@ fn run_target_add(name: &str, path: &str, layout: Option<&str>, local: bool) -> 
     Ok(())
 }
 
-fn run_target_rm(name: &str, local: bool) -> Result<()> {
-    if target_has_deployed_artifacts(&open_project_registry(&load_config()?)?, name)? {
-        render::warn_target_rm_deployed(name);
+fn run_target_rm(name: &str, local: bool, force: bool) -> Result<()> {
+    if !force {
+        let config = merge_configs(load_config()?, load_local_config(Path::new("."))?);
+        let registry = open_project_registry(&config)?;
+        let deployed = registry.list_target(name)?;
+        if !deployed.is_empty() {
+            return Err(Error::Config(render::target_rm_refusal(name, &deployed)));
+        }
     }
     let file = target_config_file(local);
     let text = read_config_text(file)?;

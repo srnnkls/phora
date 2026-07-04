@@ -52,6 +52,9 @@ pub struct RegistryRecord {
     /// Digest of the full effective vars map at deploy time; `None` for feature-free artifacts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vars_digest: Option<String>,
+    /// Deploy-time snapshot of the target's expanded absolute path; never re-expanded at read time. `None` on legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy_root: Option<String>,
 }
 
 /// Borrowed inputs shared by every record-construction site (`deploy_one`, `rebuild_one`).
@@ -66,6 +69,7 @@ pub struct ProjectedRecord<'a> {
     pub preserve_executable: bool,
     pub files: Vec<ManifestFile>,
     pub vars_digest: Option<String>,
+    pub deploy_root: Option<String>,
 }
 
 impl RegistryRecord {
@@ -86,6 +90,7 @@ impl RegistryRecord {
             files: p.files,
             linked: false,
             vars_digest: p.vars_digest,
+            deploy_root: p.deploy_root,
         }
     }
 }
@@ -559,6 +564,7 @@ mod tests {
             files: vec![],
             linked: true,
             vars_digest: None,
+            deploy_root: None,
         };
 
         let toml = toml::to_string(&rec).expect("serialize linked record");
@@ -631,6 +637,7 @@ artifact = "snippets"
             files: vec![],
             linked: false,
             vars_digest: None,
+            deploy_root: None,
         };
 
         let toml = toml::to_string(&rec).expect("serialize aliased record");
@@ -738,6 +745,7 @@ artifact = "snippets"
             files: vec![],
             linked: false,
             vars_digest: None,
+            deploy_root: None,
         };
 
         let toml = toml::to_string(&rec).expect("serialize file-kind record");
@@ -778,6 +786,7 @@ artifact = "snippets"
             files: vec![],
             linked: false,
             vars_digest: None,
+            deploy_root: None,
         };
 
         let toml = toml::to_string(&rec).expect("serialize dir-kind record");
@@ -811,6 +820,7 @@ artifact = "snippets"
             preserve_executable: true,
             files: vec![],
             vars_digest: None,
+            deploy_root: None,
         };
 
         let rec = RegistryRecord::projected(projected);
@@ -843,6 +853,7 @@ artifact = "snippets"
             files: vec![],
             linked: false,
             vars_digest: vars_digest.map(str::to_owned),
+            deploy_root: None,
         }
     }
 
@@ -925,6 +936,129 @@ artifact = "snippets"
         );
     }
 
+    // ── persisted deploy root (CLIFF-DEPLOYROOT-007) ───────────────
+
+    /// A record must persist the target's expanded absolute deploy root so an
+    /// orphaned record (its config `Target` gone) stays locatable; the field
+    /// and its value must survive a TOML round-trip.
+    #[test]
+    fn record_persists_deploy_root_through_toml_round_trip() {
+        let stored = r#"
+version = 1
+source = "nvim-src"
+commit = "def456789abc123"
+digest = "blake3:d4e5f6"
+projected_at = "2026-01-31T12:34:56Z"
+layout = "by-source"
+allow_symlinks = false
+preserve_executable = true
+files = []
+deploy_root = "/home/alice/.config/nvim"
+
+[key]
+target = "home"
+source = "nvim"
+artifact = "init"
+"#;
+
+        let rec: RegistryRecord =
+            toml::from_str(stored).expect("a record carrying deploy_root must deserialize");
+        let round_tripped = toml::to_string(&rec).expect("re-serialize record");
+
+        assert!(
+            round_tripped.contains("deploy_root"),
+            "a record's persisted deploy_root must survive a TOML round-trip (the field is dropped \
+             until CLIFF-DEPLOYROOT-007 adds it), got:\n{round_tripped}"
+        );
+        assert!(
+            round_tripped.contains("/home/alice/.config/nvim"),
+            "the expanded absolute deploy root value must survive the round-trip, got:\n{round_tripped}"
+        );
+    }
+
+    #[test]
+    fn deploy_root_snapshots_targets_expanded_path() {
+        let target = crate::config::Config::parse(
+            "version = 1\n\n[targets.home]\npath = \"~/.config/nvim\"\n",
+        )
+        .expect("minimal config parses")
+        .targets
+        .remove("home")
+        .expect("target `home` present");
+        let expanded = target.expanded_path();
+        let expanded_str = expanded.to_string_lossy().into_owned();
+        assert!(
+            expanded.is_absolute() && !expanded_str.contains('~'),
+            "premise: a `~/`-target must expand to an absolute tilde-free path (home resolved), got {expanded_str}"
+        );
+        assert_ne!(
+            expanded_str, "~/.config/nvim",
+            "premise: expanded_path must actually expand the tilde, not echo the raw config path"
+        );
+
+        let stored = format!(
+            "version = 1\n\
+             source = \"nvim-src\"\n\
+             commit = \"def456789abc123\"\n\
+             digest = \"blake3:d4e5f6\"\n\
+             projected_at = \"2026-01-31T12:34:56Z\"\n\
+             layout = \"by-source\"\n\
+             allow_symlinks = false\n\
+             preserve_executable = true\n\
+             files = []\n\
+             deploy_root = \"{expanded_str}\"\n\n\
+             [key]\n\
+             target = \"home\"\n\
+             source = \"nvim\"\n\
+             artifact = \"init\"\n"
+        );
+
+        let rec: RegistryRecord =
+            toml::from_str(&stored).expect("record with expanded deploy_root must deserialize");
+        let round_tripped = toml::to_string(&rec).expect("re-serialize record");
+        let value: toml::Value =
+            toml::from_str(&round_tripped).expect("re-parse serialized record as a table");
+
+        let persisted = value
+            .get("deploy_root")
+            .and_then(toml::Value::as_str)
+            .expect("re-serialized record must expose a deploy_root string");
+        assert_eq!(
+            persisted, expanded_str,
+            "the persisted deploy root must equal the target's expanded absolute path (post tilde expansion)"
+        );
+    }
+
+    /// Records written before the deploy-root field existed have no
+    /// `deploy_root` key; adding the field must not break them (additive, no
+    /// migration) — a legacy record must still deserialize cleanly.
+    #[test]
+    fn legacy_record_without_deploy_root_still_loads() {
+        let legacy = r#"
+version = 1
+commit = "def456789abc123"
+digest = "blake3:d4e5f6"
+projected_at = "2026-01-31T12:34:56Z"
+layout = "flat"
+allow_symlinks = false
+preserve_executable = true
+files = []
+
+[key]
+target = "vscode"
+source = "company-configs"
+artifact = "snippets"
+"#;
+
+        let rec: RegistryRecord =
+            toml::from_str(legacy).expect("legacy record without `deploy_root` must still parse");
+
+        assert_eq!(
+            rec.key.artifact, "snippets",
+            "a record predating the deploy-root field must load with its other fields intact"
+        );
+    }
+
     fn record(target: &str, source: &str, artifact: &str) -> RegistryRecord {
         RegistryRecord {
             version: 1,
@@ -949,6 +1083,7 @@ artifact = "snippets"
             }],
             linked: false,
             vars_digest: None,
+            deploy_root: None,
         }
     }
 

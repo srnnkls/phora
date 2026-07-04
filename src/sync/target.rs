@@ -231,13 +231,15 @@ pub(super) fn deploy_artifact_entry(
 
     let conflict_kind = conflict_kind_for(&state, entry, run.force);
 
+    let deploy_root = run.target.deploy_root();
     let deploy = |key: ArtifactKey| match entry.source.deploy_mode() {
-        DeployMode::Link => deploy_link(registry, journal, entry, key),
+        DeployMode::Link => deploy_link(registry, journal, entry, key, deploy_root.clone()),
         DeployMode::Copy => deploy_one(
             backend,
             registry,
             journal,
             DeployContext {
+                deploy_root: deploy_root.clone(),
                 layout_kind: entry.layout_kind,
                 source: entry.source,
                 git: entry.git,
@@ -412,6 +414,7 @@ fn warn_skip(source: &str, artifact: &str, kind: &ConflictKind, dst: &Path) {
 }
 
 struct DeployContext<'a> {
+    deploy_root: String,
     layout_kind: LayoutKind,
     source: &'a ParsedSource,
     git: &'a str,
@@ -494,6 +497,7 @@ fn deploy_one(
         preserve_executable: policy.preserve_executable,
         files,
         vars_digest: export.vars_digest,
+        deploy_root: Some(ctx.deploy_root),
     });
 
     if matches!(ctx.kind, RecordKind::Dir) {
@@ -514,6 +518,7 @@ fn deploy_link(
     journal: &Journal,
     entry: &ArtifactEntry<'_>,
     key: ArtifactKey,
+    deploy_root: String,
 ) -> Result<()> {
     let policy = entry.source.export_policy();
     let record = RegistryRecord {
@@ -530,6 +535,7 @@ fn deploy_link(
         files: vec![],
         linked: true,
         vars_digest: None,
+        deploy_root: Some(deploy_root),
     };
     let staging_base = target_parent(entry.artifact_dst).join(".phora-stage");
     link_artifact(
@@ -790,6 +796,7 @@ mod kind_aware_layout_tests {
             }],
             linked: false,
             vars_digest: None,
+            deploy_root: None,
         }
     }
 
@@ -928,6 +935,7 @@ mod kind_aware_layout_tests {
             }],
             linked: false,
             vars_digest: None,
+            deploy_root: None,
         };
 
         let base = record_manifest_base(&target, &rec);

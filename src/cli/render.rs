@@ -304,11 +304,17 @@ pub(super) fn print_unbound(sources: &[String], target: &str) {
     println!("Unbound {} from '{target}'", sources.join(", "));
 }
 
-pub(super) fn warn_target_rm_deployed(name: &str) {
-    eprintln!(
-        "phora: target `{name}` still has deployed artifacts registered; \
-         run `phora sync --prune` to remove them"
-    );
+pub(super) fn target_rm_refusal(name: &str, deployed: &[crate::store::RegistryRecord]) -> String {
+    let artifacts = deployed
+        .iter()
+        .map(|rec| format!("  {}/{}", rec.key.source, rec.key.artifact))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "target `{name}` still has deployed artifacts registered:\n{artifacts}\n\
+         unbind these sources and run `phora sync --prune` to remove them, \
+         or pass `--force` to delete the target block and strand the deployed files"
+    )
 }
 
 pub(super) fn warn_unbind_tombstone(target: &str) {

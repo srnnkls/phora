@@ -1082,6 +1082,7 @@ mod tests {
             files: manifest,
             linked: false,
             vars_digest: None,
+            deploy_root: None,
         }
     }
 
@@ -1111,6 +1112,7 @@ mod tests {
             files: vec![mf],
             linked: false,
             vars_digest: None,
+            deploy_root: None,
         }
     }
 
@@ -1290,6 +1292,7 @@ mod tests {
             files: vec![],
             linked,
             vars_digest: None,
+            deploy_root: None,
         }
     }
 
@@ -1496,6 +1499,7 @@ mod tests {
             files: vec![],
             linked: true,
             vars_digest: None,
+            deploy_root: None,
         }
     }
 
@@ -2118,6 +2122,7 @@ mod tests {
             files: manifest,
             linked: false,
             vars_digest: None,
+            deploy_root: None,
         }
     }
 

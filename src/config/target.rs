@@ -389,6 +389,12 @@ impl Target {
         }
         self.path.clone()
     }
+
+    /// Deploy-time snapshot of the target's expanded absolute path, as a lossy string.
+    #[must_use]
+    pub fn deploy_root(&self) -> String {
+        self.expanded_path().to_string_lossy().into_owned()
+    }
 }
 
 fn resolve_binding<'a, S: SourceFields>(

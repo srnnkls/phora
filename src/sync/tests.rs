@@ -103,6 +103,7 @@ fn linked_flat_record(target: &str, source: &str, artifact: &str) -> RegistryRec
         files: vec![],
         linked: true,
         vars_digest: None,
+        deploy_root: None,
     }
 }
 
@@ -2598,6 +2599,7 @@ fn seed_orphan(
         }],
         linked: false,
         vars_digest: None,
+        deploy_root: None,
     };
     reg.put(&record).expect("seed orphan record");
     dst
@@ -2746,6 +2748,7 @@ fn seed_orphan_record(reg: &FileRegistry, source: &str, artifact: &str) {
         }],
         linked: false,
         vars_digest: None,
+        deploy_root: None,
     };
     reg.put(&record).expect("seed overlapping orphan record");
 }
@@ -3407,6 +3410,7 @@ fn sync_runs_recovery_sweep_finishing_a_swapped_but_unrecorded_artifact() {
         }],
         linked: false,
         vars_digest: None,
+        deploy_root: None,
     };
 
     let staging_base = td.parent_path.join(".phora-stage");
@@ -3542,6 +3546,7 @@ fn sync_runs_recovery_before_phase1_even_when_resolve_fails() {
         }],
         linked: false,
         vars_digest: None,
+        deploy_root: None,
     };
 
     let staging_base = td.parent_path.join(".phora-stage");
@@ -3628,6 +3633,7 @@ fn seed_managed_artifact(
         }],
         linked: false,
         vars_digest: None,
+        deploy_root: None,
     };
     reg.put(&record).expect("seed managed record");
     dst
@@ -3804,6 +3810,7 @@ fn seed_verifiable_artifact(
         files: manifest,
         linked: false,
         vars_digest: None,
+        deploy_root: None,
     };
     reg.put(&record).expect("seed verifiable record");
     dst
@@ -4400,6 +4407,7 @@ fn verify_skips_linked_record_even_with_stray_manifest_file() {
         }],
         linked: true,
         vars_digest: None,
+        deploy_root: None,
     };
     fx.registry
         .put(&stray)
@@ -4450,6 +4458,7 @@ fn verify_skips_linked_record_over_edited_symlink_target() {
         files: vec![],
         linked: true,
         vars_digest: None,
+        deploy_root: None,
     };
     fx.registry.put(&linked).expect("seed linked record");
 
@@ -4563,6 +4572,7 @@ fn prune_removes_stale_linked_symlink_without_following_it() {
             files: vec![],
             linked: true,
             vars_digest: None,
+            deploy_root: None,
         })
         .expect("seed the orphaned linked record");
 
@@ -4647,6 +4657,7 @@ fn prune_drops_a_stale_dir_record_once_the_plan_flips_leaf_granular() {
             files: vec![],
             linked: true,
             vars_digest: None,
+            deploy_root: None,
         })
         .expect("seed the stale dir-granular record");
 
@@ -4722,6 +4733,7 @@ fn leaf_record(target: &str, identity: &str, key: &str) -> RegistryRecord {
         files: vec![],
         linked: false,
         vars_digest: None,
+        deploy_root: None,
     }
 }
 
@@ -5060,6 +5072,7 @@ fn prune_keeps_a_foreign_orphan_dir_that_ancestors_a_live_leaf_of_another_bindin
             }],
             linked: false,
             vars_digest: None,
+            deploy_root: None,
         })
         .expect("seed foreign orphan dir record");
 
@@ -5115,6 +5128,7 @@ fn prune_keeps_a_foreign_orphan_leaf_nested_under_a_live_collapsed_dir_of_anothe
             files: vec![],
             linked: false,
             vars_digest: None,
+            deploy_root: None,
         })
         .expect("seed foreign orphan leaf record");
 
@@ -7856,6 +7870,7 @@ fn preview_writes_nothing_to_the_registry_or_the_target() {
         }],
         linked: false,
         vars_digest: None,
+        deploy_root: None,
     };
     fx.registry.put(&seeded).expect("seed registry record");
     let before = fx.registry.list_all().expect("snapshot registry");
@@ -10529,6 +10544,7 @@ fn seed_recorded_artifact_at(reg: &FileRegistry, source: &str, artifact: &str, c
         files: vec![],
         linked: false,
         vars_digest: None,
+        deploy_root: None,
     };
     reg.put(&record).expect("seed recorded artifact");
 }
@@ -10933,6 +10949,7 @@ fn sealed_offer_validates_crash_recovered_record_finalized_by_the_sweep() {
         }],
         linked: false,
         vars_digest: None,
+        deploy_root: None,
     };
 
     let staging_base = td.parent_path.join(".phora-stage");
