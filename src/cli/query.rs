@@ -20,19 +20,41 @@ use crate::sync::{
     preview_targets, resolve_binding_plan, resolved_remotes,
 };
 
-use super::render::{print_listings, render_preview_json, render_preview_tree, state_label};
+use super::render::{
+    print_listings, print_orphan_listings, render_preview_json, render_preview_tree, state_label,
+};
 use super::{build_router, load_config, load_local_config, load_locks, open_project_registry};
 
-pub(super) fn run_list(plan: bool) -> Result<()> {
+/// Which slice `phora list` renders, resolved once from the command's flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ListView {
+    Deployed,
+    Plan,
+    Orphans,
+}
+
+impl ListView {
+    #[must_use]
+    pub(crate) fn from_flags(plan: bool, orphans: bool) -> Self {
+        if orphans {
+            Self::Orphans
+        } else if plan {
+            Self::Plan
+        } else {
+            Self::Deployed
+        }
+    }
+}
+
+pub(super) fn run_list(view: ListView) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let config = merge_configs(load_config()?, load_local_config(&cwd)?);
     let registry = open_project_registry(&config)?;
-    if plan {
-        println!("plan: run `phora sync` to apply pending changes");
-        return Ok(());
+    match view {
+        ListView::Orphans => print_orphan_listings(&list_orphans(&config, &registry)?),
+        ListView::Plan => println!("plan: run `phora sync` to apply pending changes"),
+        ListView::Deployed => print_listings(&list_statuses(&config, &registry)?),
     }
-    let listings = list_statuses(&config, &registry)?;
-    print_listings(&listings);
     Ok(())
 }
 
@@ -670,6 +692,16 @@ pub struct TargetListing {
     pub artifacts: Vec<ArtifactStatus>,
 }
 
+/// A `phora list --orphans` row: a registry record whose target left config;
+/// `path` is `None` for legacy records predating the persisted deploy root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanListing {
+    pub target: String,
+    pub source: String,
+    pub artifact: String,
+    pub path: Option<String>,
+}
+
 /// One `phora source list` row: a source's name, its resolved remote, and refspec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceRow {
@@ -862,6 +894,24 @@ pub fn list_statuses(config: &Config, registry: &dyn Registry) -> Result<Vec<Tar
             })
         })
         .collect()
+}
+
+/// Registry-driven orphan report: records whose target left config, each with
+/// its reconstructed on-disk path (or `None` for legacy records).
+///
+/// # Errors
+///
+/// Returns an error if the registry cannot be read.
+pub fn list_orphans(config: &Config, registry: &dyn Registry) -> Result<Vec<OrphanListing>> {
+    Ok(crate::sync::orphan_records(config, registry)?
+        .into_iter()
+        .map(|record| OrphanListing {
+            path: crate::sync::orphan_artifact_path(&record).map(|p| p.display().to_string()),
+            target: record.key.target,
+            source: record.key.source,
+            artifact: record.key.artifact,
+        })
+        .collect())
 }
 
 fn target_artifact_statuses(

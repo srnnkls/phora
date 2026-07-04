@@ -55,6 +55,9 @@ pub struct RegistryRecord {
     /// Deploy-time snapshot of the target's expanded absolute path; never re-expanded at read time. `None` on legacy records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deploy_root: Option<String>,
+    /// Prefixed layout's separator, persisted so an orphan's path reconstructs exactly. `None` for non-prefixed and legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout_separator: Option<String>,
 }
 
 /// Borrowed inputs shared by every record-construction site (`deploy_one`, `rebuild_one`).
@@ -70,6 +73,7 @@ pub struct ProjectedRecord<'a> {
     pub files: Vec<ManifestFile>,
     pub vars_digest: Option<String>,
     pub deploy_root: Option<String>,
+    pub layout_separator: Option<String>,
 }
 
 impl RegistryRecord {
@@ -91,6 +95,7 @@ impl RegistryRecord {
             linked: false,
             vars_digest: p.vars_digest,
             deploy_root: p.deploy_root,
+            layout_separator: p.layout_separator,
         }
     }
 }
@@ -320,6 +325,92 @@ impl FileRegistry {
             ))),
         }
     }
+}
+
+pub const ADOPTION_MARKER: &str = ".phora-adopted";
+
+/// Adopt a legacy path-hash registry into an identity-keyed directory under
+/// `projects_base`, returning the identity it is adopted into. The marker
+/// (written *inside* `legacy`, never replacing the directory — that would
+/// ENOTDIR old binaries) records that identity, so a run interrupted between
+/// adoption and the caller's identity-file write reuses the recorded id on
+/// rerun instead of minting a fresh one and spawning a duplicate registry.
+/// Idempotent (no-op when `legacy` is absent or the target already exists);
+/// staging is named from the stable `legacy` component so interrupted copies
+/// are reclaimed rather than leaked.
+pub fn adopt_registry_dir(legacy: &Path, projects_base: &Path, adopter: &str) -> Result<String> {
+    if !legacy.is_dir() {
+        return Ok(adopter.to_owned());
+    }
+    let target_id = read_adoption_marker(legacy)?.unwrap_or_else(|| adopter.to_owned());
+    let new = projects_base.join(&target_id);
+    if new.exists() {
+        return Ok(target_id);
+    }
+    let staging = projects_base.join(format!(".{}.adopting", file_component(legacy)?));
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging).map_err(|e| {
+            StoreError::Registry(format!("clear stale staging {}: {e}", staging.display()))
+        })?;
+    }
+    copy_tree(legacy, &staging)?;
+    atomic_write(&legacy.join(ADOPTION_MARKER), &format!("{target_id}\n"))?;
+    std::fs::rename(&staging, &new).map_err(|e| {
+        let _ = std::fs::remove_dir_all(&staging);
+        StoreError::Registry(format!(
+            "rename staging {} -> {}: {e}",
+            staging.display(),
+            new.display()
+        ))
+    })?;
+    Ok(target_id)
+}
+
+fn read_adoption_marker(legacy: &Path) -> Result<Option<String>> {
+    let path = legacy.join(ADOPTION_MARKER);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(text
+            .lines()
+            .next()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(StoreError::Registry(format!(
+            "read adoption marker {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
+fn file_component(path: &Path) -> Result<&str> {
+    path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+        StoreError::Registry(format!(
+            "registry path has no file name: {}",
+            path.display()
+        ))
+    })
+}
+
+fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)
+        .map_err(|e| StoreError::Registry(format!("create dir {}: {e}", dst.display())))?;
+    let entries = std::fs::read_dir(src)
+        .map_err(|e| StoreError::Registry(format!("read dir {}: {e}", src.display())))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|e| StoreError::Registry(format!("read entry in {}: {e}", src.display())))?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            copy_tree(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to).map_err(|e| {
+                StoreError::Registry(format!("copy {} -> {}: {e}", from.display(), to.display()))
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn read_record(path: &Path) -> Result<RegistryRecord> {
@@ -565,6 +656,7 @@ mod tests {
             linked: true,
             vars_digest: None,
             deploy_root: None,
+            layout_separator: None,
         };
 
         let toml = toml::to_string(&rec).expect("serialize linked record");
@@ -638,6 +730,7 @@ artifact = "snippets"
             linked: false,
             vars_digest: None,
             deploy_root: None,
+            layout_separator: None,
         };
 
         let toml = toml::to_string(&rec).expect("serialize aliased record");
@@ -746,6 +839,7 @@ artifact = "snippets"
             linked: false,
             vars_digest: None,
             deploy_root: None,
+            layout_separator: None,
         };
 
         let toml = toml::to_string(&rec).expect("serialize file-kind record");
@@ -787,6 +881,7 @@ artifact = "snippets"
             linked: false,
             vars_digest: None,
             deploy_root: None,
+            layout_separator: None,
         };
 
         let toml = toml::to_string(&rec).expect("serialize dir-kind record");
@@ -821,6 +916,7 @@ artifact = "snippets"
             files: vec![],
             vars_digest: None,
             deploy_root: None,
+            layout_separator: None,
         };
 
         let rec = RegistryRecord::projected(projected);
@@ -854,6 +950,7 @@ artifact = "snippets"
             linked: false,
             vars_digest: vars_digest.map(str::to_owned),
             deploy_root: None,
+            layout_separator: None,
         }
     }
 
@@ -1084,6 +1181,7 @@ artifact = "snippets"
             linked: false,
             vars_digest: None,
             deploy_root: None,
+            layout_separator: None,
         }
     }
 
@@ -1118,6 +1216,52 @@ artifact = "snippets"
         let second = ProjectId::for_path(dir.path()).expect("second id");
 
         assert_eq!(first, second, "same canonical path => same project id");
+    }
+
+    // registry adoption
+
+    #[test]
+    fn adopt_copies_records_into_new_dir_marks_legacy_and_is_idempotent() {
+        let base = TempDir::new().expect("projects base");
+        let legacy = base.path().join("pathhash");
+        let new = base.path().join("uuid");
+        let legacy_reg = FileRegistry::open(legacy.clone()).expect("open legacy");
+        legacy_reg
+            .put(&record("home", "dotfiles", "init"))
+            .expect("seed legacy record");
+
+        let adopted = adopt_registry_dir(&legacy, base.path(), "uuid").expect("adopt");
+        assert_eq!(
+            adopted, "uuid",
+            "a fresh adoption uses the caller's minted id"
+        );
+
+        assert!(
+            new.join("targets/home/artifacts/dotfiles/init.toml")
+                .is_file(),
+            "adopted registry must carry the legacy record"
+        );
+        assert!(
+            legacy.join(ADOPTION_MARKER).is_file(),
+            "marker must land inside the legacy directory"
+        );
+        assert!(
+            legacy.is_dir(),
+            "legacy must remain a directory (ENOTDIR guard)"
+        );
+
+        let rerun = adopt_registry_dir(&legacy, base.path(), "different-uuid")
+            .expect("rerun must not error");
+        assert_eq!(
+            rerun, "uuid",
+            "a rerun after adoption must reuse the id recorded in the marker, never the fresh \
+             one — so an interrupted first run converges instead of spawning a duplicate"
+        );
+        assert!(new.is_dir(), "rerun stays idempotent — no clobber");
+        assert!(
+            !base.path().join("different-uuid").exists(),
+            "reusing the marker id must not spawn a second registry under the fresh id"
+        );
     }
 
     // put / get / remove

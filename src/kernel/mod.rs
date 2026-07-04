@@ -16,7 +16,7 @@ pub use commit::Commit;
 pub use digest::{Algo, Digest};
 pub use name::{ArtifactName, KernelError, SourceName, TargetName};
 pub use path::RelPath;
-pub use project_id::ProjectId;
+pub use project_id::{IDENTITY_FILE, ProjectId, exclude_identity_from_git};
 pub use selection::{OfferSelection, compile_take_glob};
 pub use take::{ResolvedTake, Take, TakeResolution, TakeWarning, is_take_glob, resolve_take};
 

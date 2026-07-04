@@ -104,6 +104,7 @@ fn linked_flat_record(target: &str, source: &str, artifact: &str) -> RegistryRec
         linked: true,
         vars_digest: None,
         deploy_root: None,
+        layout_separator: None,
     }
 }
 
@@ -1367,6 +1368,57 @@ fn aliased_binding_records_underlying_source_at_identity_path() {
     drop(src);
 }
 
+/// A prefixed-layout deploy with a CUSTOM separator must persist that separator on the
+/// record so an orphaned record reconstructs its on-disk path exactly, not with a
+/// hardcoded dash.
+#[test]
+fn prefixed_custom_separator_persists_on_record_and_reconstructs_orphan_path() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n[sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\"editor-src\"]\n\
+         layout = {{ type = \"prefixed\", separator = \"_\" }}\n",
+        fx.url,
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("prefixed custom-separator config parses");
+
+    sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("prefixed deploy must succeed");
+
+    let rec = fx
+        .registry
+        .get(&artifact_key("dest", "editor-src", "editor"))
+        .expect("registry get")
+        .expect("the editor artifact must record under the prefixed layout");
+    assert_eq!(
+        rec.layout, "prefixed",
+        "the record must carry the canonical `prefixed` label; got {rec:?}"
+    );
+    assert_eq!(
+        rec.layout_separator.as_deref(),
+        Some("_"),
+        "a prefixed record must persist its custom `_` separator so orphan paths reconstruct \
+         exactly; got {rec:?}"
+    );
+
+    let deploy_root = rec
+        .deploy_root
+        .clone()
+        .expect("prefixed record persists deploy_root");
+    assert_eq!(
+        super::orphan_artifact_path(&rec),
+        Some(Path::new(&deploy_root).join("editor-src_editor")),
+        "the orphan path must join deploy_root with <source>_<artifact> using the persisted `_`, \
+         not a hardcoded dash"
+    );
+}
+
 /// PBR-004: two aliases of ONE source must not collide — distinct record paths keyed
 /// by identity, both carrying the SAME underlying `source`.
 #[test]
@@ -2430,7 +2482,10 @@ fn second_deploy_over_correct_link_is_a_noop() {
         commit: &fx.head_sha,
         item: &item,
         artifact_dst: &dst,
-        layout_kind: LayoutKind::Flat,
+        layout: crate::config::LayoutConfig {
+            kind: crate::config::LayoutKind::Flat,
+            separator: String::new(),
+        },
         ejected: &[],
         mode_transition: false,
         template_opt_in: &crate::config::TemplateOptIn::SuffixOnly,
@@ -2600,6 +2655,7 @@ fn seed_orphan(
         linked: false,
         vars_digest: None,
         deploy_root: None,
+        layout_separator: None,
     };
     reg.put(&record).expect("seed orphan record");
     dst
@@ -2749,6 +2805,7 @@ fn seed_orphan_record(reg: &FileRegistry, source: &str, artifact: &str) {
         linked: false,
         vars_digest: None,
         deploy_root: None,
+        layout_separator: None,
     };
     reg.put(&record).expect("seed overlapping orphan record");
 }
@@ -3411,6 +3468,7 @@ fn sync_runs_recovery_sweep_finishing_a_swapped_but_unrecorded_artifact() {
         linked: false,
         vars_digest: None,
         deploy_root: None,
+        layout_separator: None,
     };
 
     let staging_base = td.parent_path.join(".phora-stage");
@@ -3547,6 +3605,7 @@ fn sync_runs_recovery_before_phase1_even_when_resolve_fails() {
         linked: false,
         vars_digest: None,
         deploy_root: None,
+        layout_separator: None,
     };
 
     let staging_base = td.parent_path.join(".phora-stage");
@@ -3634,6 +3693,7 @@ fn seed_managed_artifact(
         linked: false,
         vars_digest: None,
         deploy_root: None,
+        layout_separator: None,
     };
     reg.put(&record).expect("seed managed record");
     dst
@@ -3811,6 +3871,7 @@ fn seed_verifiable_artifact(
         linked: false,
         vars_digest: None,
         deploy_root: None,
+        layout_separator: None,
     };
     reg.put(&record).expect("seed verifiable record");
     dst
@@ -4408,6 +4469,7 @@ fn verify_skips_linked_record_even_with_stray_manifest_file() {
         linked: true,
         vars_digest: None,
         deploy_root: None,
+        layout_separator: None,
     };
     fx.registry
         .put(&stray)
@@ -4459,6 +4521,7 @@ fn verify_skips_linked_record_over_edited_symlink_target() {
         linked: true,
         vars_digest: None,
         deploy_root: None,
+        layout_separator: None,
     };
     fx.registry.put(&linked).expect("seed linked record");
 
@@ -4573,6 +4636,7 @@ fn prune_removes_stale_linked_symlink_without_following_it() {
             linked: true,
             vars_digest: None,
             deploy_root: None,
+            layout_separator: None,
         })
         .expect("seed the orphaned linked record");
 
@@ -4658,6 +4722,7 @@ fn prune_drops_a_stale_dir_record_once_the_plan_flips_leaf_granular() {
             linked: true,
             vars_digest: None,
             deploy_root: None,
+            layout_separator: None,
         })
         .expect("seed the stale dir-granular record");
 
@@ -4734,6 +4799,7 @@ fn leaf_record(target: &str, identity: &str, key: &str) -> RegistryRecord {
         linked: false,
         vars_digest: None,
         deploy_root: None,
+        layout_separator: None,
     }
 }
 
@@ -5073,6 +5139,7 @@ fn prune_keeps_a_foreign_orphan_dir_that_ancestors_a_live_leaf_of_another_bindin
             linked: false,
             vars_digest: None,
             deploy_root: None,
+            layout_separator: None,
         })
         .expect("seed foreign orphan dir record");
 
@@ -5129,6 +5196,7 @@ fn prune_keeps_a_foreign_orphan_leaf_nested_under_a_live_collapsed_dir_of_anothe
             linked: false,
             vars_digest: None,
             deploy_root: None,
+            layout_separator: None,
         })
         .expect("seed foreign orphan leaf record");
 
@@ -7871,6 +7939,7 @@ fn preview_writes_nothing_to_the_registry_or_the_target() {
         linked: false,
         vars_digest: None,
         deploy_root: None,
+        layout_separator: None,
     };
     fx.registry.put(&seeded).expect("seed registry record");
     let before = fx.registry.list_all().expect("snapshot registry");
@@ -10545,6 +10614,7 @@ fn seed_recorded_artifact_at(reg: &FileRegistry, source: &str, artifact: &str, c
         linked: false,
         vars_digest: None,
         deploy_root: None,
+        layout_separator: None,
     };
     reg.put(&record).expect("seed recorded artifact");
 }
@@ -10950,6 +11020,7 @@ fn sealed_offer_validates_crash_recovered_record_finalized_by_the_sweep() {
         linked: false,
         vars_digest: None,
         deploy_root: None,
+        layout_separator: None,
     };
 
     let staging_base = td.parent_path.join(".phora-stage");
@@ -11442,8 +11513,9 @@ mod leaf_granular_deploy_tests {
              got {keys:?}"
         );
         assert_eq!(
-            recs[0].layout, "bysource",
-            "the rename record carries the active `by-source` layout; got {recs:?}"
+            recs[0].layout, "by-source",
+            "the rename record carries the active `by-source` layout label (canonical, matching \
+             config), not the Debug-lowercased `bysource`; got {recs:?}"
         );
         assert_eq!(
             recs[0].kind,
@@ -11802,4 +11874,109 @@ mod leaf_granular_deploy_tests {
             "the offer-excluded leaf must not be recorded; got {keys:?}"
         );
     }
+}
+
+// CLIFF-ORPHANS-002: registry-driven orphan physical prune
+
+fn by_source_layout() -> crate::config::LayoutConfig {
+    crate::config::LayoutConfig {
+        kind: LayoutKind::BySource,
+        separator: String::new(),
+    }
+}
+
+#[test]
+fn prune_deletes_orphan_files_using_persisted_deploy_root() {
+    let orphan_root = TempDir::new().expect("orphan deploy root");
+    let orphan_dst = orphan_root
+        .path()
+        .join(by_source_layout().artifact_path("ed", "orphaned"));
+    std::fs::create_dir_all(orphan_dst.parent().expect("orphan parent"))
+        .expect("mkdir orphan parent");
+    std::fs::write(&orphan_dst, b"orphaned bytes\n").expect("plant orphan file on disk");
+
+    let registry = fx_registry();
+    let mut orphan = leaf_record("gone", "ed", "orphaned");
+    orphan.deploy_root = Some(orphan_root.path().to_string_lossy().into_owned());
+    registry
+        .put(&orphan)
+        .expect("seed orphan record carrying a persisted deploy_root");
+    let legacy_key = artifact_key("also-gone", "ed", "legacy");
+    registry
+        .put(&leaf_record("also-gone", "ed", "legacy"))
+        .expect("seed legacy pathless orphan record (deploy_root: None)");
+
+    let cfg = Config::parse(
+        "version = 1\n\n[sources.ed]\ngit = \"https://example.com/ed.git\"\nbranch = \"main\"\n",
+    )
+    .expect("source-only config parses");
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+    let commits = one_commit(&parsed, "ed", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+    let protected = test_protected(&std::env::temp_dir());
+
+    prune_orphans(
+        &cfg,
+        &parsed,
+        &remotes,
+        &fx_backend(),
+        &registry,
+        &commits,
+        &protected,
+    )
+    .expect("prune runs over an orphaned registry");
+
+    assert!(
+        !orphan_dst.exists(),
+        "prune must physically DELETE the orphan's on-disk file at {} using the persisted \
+         deploy_root; today an out-of-config target skips file deletion and strands the file",
+        orphan_dst.display()
+    );
+    assert!(
+        registry
+            .get(&artifact_key("gone", "ed", "orphaned"))
+            .expect("registry read")
+            .is_none(),
+        "prune must drop the orphan record AFTER removing its files"
+    );
+    assert!(
+        registry.get(&legacy_key).expect("registry read").is_none(),
+        "a legacy pathless orphan (deploy_root: None) gets record-only cleanup"
+    );
+}
+
+#[test]
+fn prune_keeps_orphan_record_when_its_path_overlaps_a_live_destination() {
+    let (src, _git, backend, url, commit) = seed_two_leaf_dir_repo();
+    let td = TargetDir::new();
+    let cfg = config_one_source_one_target("ed", &url, "dest", &td.target_path(), "by-source");
+
+    let live_leaf = td.artifact_dst(&by_source_layout(), "ed", "editor/a.md");
+    std::fs::create_dir_all(live_leaf.parent().expect("live parent")).expect("mkdir live parent");
+    std::fs::write(&live_leaf, b"alpha\n").expect("plant the live deployed leaf");
+
+    let registry = fx_registry();
+    let mut orphan = dir_record("gone", "ed", "editor");
+    orphan.deploy_root = Some(td.target_path().to_string_lossy().into_owned());
+    registry
+        .put(&orphan)
+        .expect("seed overlapping orphan record");
+
+    prune_one(&cfg, &backend, &registry, &commit).expect("prune runs");
+
+    assert!(
+        live_leaf.exists(),
+        "overlap guard: prune must NOT delete the live leaf {} that lies under the orphan's \
+         reconstructed directory path",
+        live_leaf.display()
+    );
+    assert!(
+        registry
+            .get(&artifact_key("gone", "ed", "editor"))
+            .expect("registry read")
+            .is_some(),
+        "overlap guard skips+keeps: an orphan record whose files overlap a live destination must \
+         be KEPT, not dropped (a dropped-but-file-kept record would leak, per BUG-PRUNE-004)"
+    );
+    drop(src);
 }

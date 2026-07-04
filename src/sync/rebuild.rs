@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use crate::config::{Config, LayoutKind, ParsedSource, Target, TemplateOptIn};
+use crate::config::{Config, LayoutConfig, ParsedSource, Target, TemplateOptIn};
 use crate::error::{Error, Result};
 use crate::kernel::{Materialization, SourceName};
 use crate::lock::{Lock, encode_ref, ref_discriminator};
@@ -170,7 +170,7 @@ fn rebuild_binding(run: &BindingRun<'_>, report: &mut RebuildReport) -> Result<(
                 run.registry,
                 &run.binding.source,
                 &policy,
-                run.target.layout().kind,
+                &run.target.layout(),
                 record_kind(&item.materialization),
                 key.clone(),
                 deploy_root.clone(),
@@ -189,7 +189,7 @@ fn rebuild_binding(run: &BindingRun<'_>, report: &mut RebuildReport) -> Result<(
                 leaves: &leaves,
                 materialization: &item.materialization,
                 artifact_dst: &artifact_dst,
-                layout_kind: run.target.layout().kind,
+                layout: run.target.layout(),
                 key: key.clone(),
                 report,
                 template_opt_in: &template_opt_in,
@@ -253,7 +253,7 @@ struct RebuildOne<'a> {
     leaves: &'a [ExportLeaf],
     materialization: &'a Materialization,
     artifact_dst: &'a Path,
-    layout_kind: LayoutKind,
+    layout: LayoutConfig,
     key: ArtifactKey,
     report: &'a mut RebuildReport,
     template_opt_in: &'a TemplateOptIn,
@@ -274,7 +274,7 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         leaves,
         materialization,
         artifact_dst,
-        layout_kind,
+        layout,
         key,
         report,
         template_opt_in,
@@ -334,13 +334,14 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         underlying_source,
         commit,
         digest: export.digest,
-        layout: format!("{layout_kind:?}").to_lowercase(),
+        layout: layout.kind.label().to_owned(),
         kind: record_kind(materialization),
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
         files,
         vars_digest: export.vars_digest,
         deploy_root: Some(deploy_root),
+        layout_separator: layout.persisted_separator(),
     });
     registry.put(&record)?;
     if modified {
@@ -355,7 +356,7 @@ fn rebuild_linked(
     registry: &dyn Registry,
     underlying_source: &str,
     policy: &crate::source::ExportPolicy,
-    layout_kind: LayoutKind,
+    layout: &LayoutConfig,
     kind: RecordKind,
     key: ArtifactKey,
     deploy_root: String,
@@ -367,7 +368,7 @@ fn rebuild_linked(
         commit: "link".to_owned(),
         digest: "link:".to_owned(),
         projected_at: chrono::Utc::now().to_rfc3339(),
-        layout: format!("{layout_kind:?}").to_lowercase(),
+        layout: layout.kind.label().to_owned(),
         kind,
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
@@ -375,6 +376,7 @@ fn rebuild_linked(
         linked: true,
         vars_digest: None,
         deploy_root: Some(deploy_root),
+        layout_separator: layout.persisted_separator(),
     };
     registry.put(&record)?;
     Ok(())

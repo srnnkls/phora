@@ -8,9 +8,9 @@ use crate::error::{Error, Result};
 use crate::sync::{HookOutcome, HookScope, HookStatus, SyncState};
 
 use super::query::{
-    CheckMatchReport, ExplainBody, ExplainReport, OfferAttribution, PreviewPlan, SourceResolution,
-    SourceRow, SourceSummary, TakeAttribution, TargetDetail, TargetListing, TargetRow, WhereFilter,
-    WhereMatch,
+    CheckMatchReport, ExplainBody, ExplainReport, OfferAttribution, OrphanListing, PreviewPlan,
+    SourceResolution, SourceRow, SourceSummary, TakeAttribution, TargetDetail, TargetListing,
+    TargetRow, WhereFilter, WhereMatch,
 };
 
 #[must_use]
@@ -59,6 +59,39 @@ pub(super) fn format_listings(listings: &[TargetListing]) -> String {
                 "  {}/{}  {}",
                 artifact.source, artifact.artifact, artifact.state
             );
+        }
+    }
+    out
+}
+
+pub(super) fn print_orphan_listings(orphans: &[OrphanListing]) {
+    print!("{}", format_orphans(orphans));
+}
+
+#[must_use]
+pub(super) fn format_orphans(orphans: &[OrphanListing]) -> String {
+    let mut out = String::new();
+    if orphans.is_empty() {
+        let _ = writeln!(out, "No orphaned records.");
+        return out;
+    }
+    let _ = writeln!(out, "orphaned records (no config target):");
+    for orphan in orphans {
+        match &orphan.path {
+            Some(path) => {
+                let _ = writeln!(
+                    out,
+                    "  {}/{}  {path}  [was {}]",
+                    orphan.source, orphan.artifact, orphan.target
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    out,
+                    "  {}/{}  path unknown (legacy record — no deploy root)  [was {}]",
+                    orphan.source, orphan.artifact, orphan.target
+                );
+            }
         }
     }
     out

@@ -32,6 +32,7 @@ pub use verify::{UntrustedHookFinding, VerifyMismatch, VerifyReason, VerifyRepor
 pub use resolve::resolve_sources_for_bench;
 
 use prune::prune_orphans;
+pub(crate) use prune::{orphan_artifact_path, orphan_records};
 use resolve::resolve_sources;
 pub(crate) use target::record_artifact_path;
 use target::{TargetRun, deploy_target};
@@ -334,6 +335,17 @@ fn deploy_all_targets(ctx: &DeployAll<'_>) -> Result<DeployRun> {
     Ok(run)
 }
 
+fn notify_orphans(config: &Config, registry: &dyn Registry) -> Result<()> {
+    let count = orphan_records(config, registry)?.len();
+    if count > 0 {
+        eprintln!(
+            "phora: {count} orphaned record(s) with no config target — \
+             run `phora list --orphans` to inspect, `phora sync --prune` to remove"
+        );
+    }
+    Ok(())
+}
+
 fn maybe_prune(ctx: &DeployAll<'_>, had_failures: bool) -> Result<()> {
     if !ctx.input.prune {
         return Ok(());
@@ -513,6 +525,9 @@ fn deploy_and_run_hooks(
     }
     let mut had_failures = run.had_failures;
     maybe_prune(deploy, had_failures)?;
+    if !deploy.input.prune {
+        notify_orphans(deploy.config, deploy.registry)?;
+    }
 
     let (hook_results, stripped_transitive_hooks) = run_all_hooks(
         deploy.input,

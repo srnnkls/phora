@@ -128,6 +128,9 @@ pub enum Command {
     List {
         #[arg(long)]
         plan: bool,
+        /// Report registry records whose target left config, with their on-disk paths.
+        #[arg(long)]
+        orphans: bool,
     },
     /// Verify deployed files by hashing contents.
     Verify,
@@ -310,7 +313,9 @@ pub fn run(cli: Cli) -> Result<()> {
         cmd @ Command::Add { .. } => dispatch_add(cmd),
         Command::Rm { name } => run_source_rm(&name),
         cmd @ (Command::Sync { .. } | Command::Update { .. }) => dispatch_sync(cmd),
-        Command::List { plan } => query::run_list(plan),
+        Command::List { plan, orphans } => {
+            query::run_list(query::ListView::from_flags(plan, orphans))
+        }
         Command::Verify => run_verify(),
         Command::Where {
             digest,
@@ -770,7 +775,7 @@ impl ConflictResolver for TtyResolver {
 
 fn open_project_registry(config: &Config) -> Result<FileRegistry> {
     let cwd = std::env::current_dir()?;
-    let project = ProjectId::for_path(&cwd)?;
+    let project = ProjectId::resolve(&cwd)?;
     let registry_root = state_root_for(config.paths.state.as_deref(), &cwd)?
         .join("projects")
         .join(project.as_str());
