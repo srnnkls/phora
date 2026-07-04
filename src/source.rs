@@ -1446,6 +1446,9 @@ pub fn is_local_path(git: &str) -> bool {
     if git.contains("://") {
         return false;
     }
+    if matches!(git.as_bytes(), [drive, b':', ..] if drive.is_ascii_alphabetic()) {
+        return true;
+    }
     let first_slash = git.find('/');
     if let Some(colon) = git.find(':')
         && first_slash.is_none_or(|slash| colon < slash)
@@ -2718,6 +2721,34 @@ mod tests {
         assert!(
             is_local_path(&nonce),
             "a relative name that exists under cwd on disk is a local path"
+        );
+    }
+
+    #[test]
+    fn is_local_path_accepts_windows_drive_letter_path() {
+        assert!(
+            is_local_path("C:/Users/foo/project"),
+            "a single-letter drive prefix like `C:` is a filesystem path on every platform \
+             (`C:` is even a legal directory name on POSIX), so it must classify as local — \
+             not fall through to colon-alias parsing that fabricates host=\"C\", repo=\"Users/foo\""
+        );
+    }
+
+    #[test]
+    fn is_local_path_accepts_lowercase_drive_letter_path() {
+        assert!(
+            is_local_path("c:/x"),
+            "the drive-letter prefix is case-insensitive; a lowercase `c:` prefix is still a \
+             filesystem path, not a colon alias with host=\"c\""
+        );
+    }
+
+    #[test]
+    fn is_local_path_keeps_multiletter_colon_alias_non_local() {
+        assert!(
+            !is_local_path("github:owner/repo"),
+            "a multi-letter host before the colon is a forge alias, not a drive letter — the \
+             drive-letter special case must not swallow `github:owner/repo` into a local path"
         );
     }
 
