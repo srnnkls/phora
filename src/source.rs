@@ -38,6 +38,14 @@ pub enum SourceError {
     #[error("symlink not allowed: {path} (set allow_symlinks=true to permit)")]
     SymlinkNotAllowed { path: std::path::PathBuf },
 
+    #[error(
+        "symlink {path} escapes the artifact root: target {target} resolves outside the deploy tree"
+    )]
+    SymlinkEscape {
+        path: std::path::PathBuf,
+        target: String,
+    },
+
     #[error("template render failed for {path}: {message}")]
     Render { path: PathBuf, message: String },
 
@@ -1216,6 +1224,12 @@ impl ExportWalk<'_, '_> {
                 path: deployed_rel.to_path_buf(),
             });
         }
+        if symlink_target_escapes(deployed_rel, target) {
+            return Err(SourceError::SymlinkEscape {
+                path: deployed_rel.to_path_buf(),
+                target: String::from_utf8_lossy(target).into_owned(),
+            });
+        }
         self.register_deployed_name(deployed_rel, deployed_rel)?;
 
         let out_path = self.out_base.join(deployed_rel);
@@ -1455,6 +1469,30 @@ fn set_deterministic_mtime(path: &Path, commit_time: u64) -> Result<()> {
         .map_err(|e| SourceError::Source(format!("commit_time out of range: {e}")))?;
     filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(seconds, 0))?;
     Ok(())
+}
+
+fn symlink_target_escapes(deployed_rel: &Path, target: &[u8]) -> bool {
+    if matches!(target.first(), Some(b'/' | b'\\')) {
+        return true;
+    }
+    if matches!(target, [drive, b':', ..] if drive.is_ascii_alphabetic()) {
+        return true;
+    }
+    let parent_depth = deployed_rel.parent().map_or(0, |p| p.components().count());
+    let mut depth = i64::try_from(parent_depth).unwrap_or(i64::MAX);
+    for step in target.split(|&b| b == b'/' || b == b'\\') {
+        match step {
+            b"" | b"." => {}
+            b".." => {
+                depth -= 1;
+                if depth < 0 {
+                    return true;
+                }
+            }
+            _ => depth += 1,
+        }
+    }
+    false
 }
 
 #[cfg(unix)]
@@ -3651,6 +3689,154 @@ path = "srnnkls/tropos"
         );
     }
 
+    #[cfg(unix)]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "fixture setup fails loudly; git CLI is assumed present"
+    )]
+    fn build_symlink_target_fixture(rel: &str, target: &str) -> ExportFixture {
+        let src = TempDir::new().unwrap();
+        let src_path = src.path();
+        init_export_repo(src_path);
+
+        let art = src_path.join("art");
+        let link_path = art.join(rel);
+        std::fs::create_dir_all(link_path.parent().unwrap()).unwrap();
+        std::fs::write(art.join("sibling"), b"sib\n").unwrap();
+        std::os::unix::fs::symlink(target, &link_path).unwrap();
+
+        run_git(src_path, &["add", "-A"]);
+        let commit = commit_export_repo(src_path);
+
+        let mode =
+            String::from_utf8(run_git(src_path, &["ls-files", "-s", &format!("art/{rel}")]).stdout)
+                .unwrap();
+        assert!(
+            mode.starts_with("120000"),
+            "art/{rel} must be committed as a git symlink (120000), got: {mode}"
+        );
+
+        export_fixture_from(src, commit)
+    }
+
+    #[cfg(unix)]
+    fn symlink_leaf(rel: &str) -> Vec<ExportLeaf> {
+        vec![ExportLeaf {
+            source: PathBuf::from(format!("art/{rel}")),
+            dest: PathBuf::from(rel),
+        }]
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_rejects_symlink_with_absolute_target() {
+        let fixture = build_symlink_target_fixture("link", "/etc/passwd");
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+        let staging = TempDir::new().expect("staging dir");
+
+        let policy = ExportPolicy {
+            allow_symlinks: true,
+            ..ExportPolicy::default()
+        };
+        let err = export_named(&fixture, staging.path(), &symlink_leaf("link"), &policy)
+            .expect_err(
+                "an absolute symlink target (/etc/passwd) escapes the artifact tree and must be \
+                 rejected at stage time even with allow_symlinks=true",
+            );
+
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("link"),
+            "escape diagnostic must name the offending symlink path `link`, got: {err}"
+        );
+        assert!(
+            msg.contains("/etc/passwd"),
+            "escape diagnostic must name the escaping target `/etc/passwd`, got: {err}"
+        );
+        assert!(
+            msg.contains("symlink") && msg.contains("escape"),
+            "diagnostic must read as a symlink-escape rejection, not an unrelated export failure, \
+             got: {err}"
+        );
+        assert!(
+            std::fs::symlink_metadata(staging.path().join("link")).is_err(),
+            "nothing must be materialized when an escaping symlink is rejected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_rejects_symlink_target_escaping_root_via_dotdot() {
+        let fixture = build_symlink_target_fixture("dir/link", "../../outside");
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+        let staging = TempDir::new().expect("staging dir");
+
+        let policy = ExportPolicy {
+            allow_symlinks: true,
+            ..ExportPolicy::default()
+        };
+        let err = export_named(&fixture, staging.path(), &symlink_leaf("dir/link"), &policy)
+            .expect_err(
+                "dir/link -> ../../outside escapes the artifact root (parent `dir`, then two `..` \
+                 steps climb above root) and must be rejected at stage time",
+            );
+
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("dir/link"),
+            "escape diagnostic must name the offending symlink path `dir/link`, got: {err}"
+        );
+        assert!(
+            msg.contains("../../outside"),
+            "escape diagnostic must name the escaping target `../../outside`, got: {err}"
+        );
+        assert!(
+            msg.contains("symlink") && msg.contains("escape"),
+            "diagnostic must read as a symlink-escape rejection, not an unrelated export failure, \
+             got: {err}"
+        );
+        assert!(
+            std::fs::symlink_metadata(staging.path().join("dir/link")).is_err(),
+            "nothing must be materialized when an escaping symlink is rejected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_materializes_symlink_with_in_root_dotdot_target() {
+        let fixture = build_symlink_target_fixture("dir/link", "../sibling");
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+        let staging = TempDir::new().expect("staging dir");
+
+        let policy = ExportPolicy {
+            allow_symlinks: true,
+            ..ExportPolicy::default()
+        };
+        export_named(&fixture, staging.path(), &symlink_leaf("dir/link"), &policy)
+            .expect("dir/link -> ../sibling stays inside the artifact root and must materialize");
+
+        let link = staging.path().join("dir/link");
+        let meta = std::fs::symlink_metadata(&link).expect("in-root symlink must be materialized");
+        assert!(
+            meta.file_type().is_symlink(),
+            "an in-root `..` target must be materialized as a symlink, not rejected or dereferenced"
+        );
+        assert_eq!(
+            std::fs::read_link(&link).expect("readlink"),
+            Path::new("../sibling"),
+            "an accepted in-root symlink must preserve its target bytes verbatim"
+        );
+    }
+
     #[test]
     fn export_rejects_symlink_colliding_with_rendered_deployed_name() {
         let fixture = build_symlink_template_collision_fixture();
@@ -3679,6 +3865,31 @@ path = "srnnkls/tropos"
         assert!(
             matches!(err, SourceError::DeployedNameCollision { .. }),
             "a symlink and a blob mapping to the same deployed name must collide, not last-writer-wins, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn symlink_validator_rejects_windows_style_escapes() {
+        let dir_link = Path::new("dir/link");
+        for target in [
+            "C:/Windows/System32",
+            "C:\\Windows",
+            "\\\\host\\share",
+            "\\evil",
+            "..\\..\\outside",
+        ] {
+            assert!(
+                symlink_target_escapes(dir_link, target.as_bytes()),
+                "{target} escapes the artifact root and must be rejected on every platform"
+            );
+        }
+    }
+
+    #[test]
+    fn symlink_validator_accepts_in_root_dotdot() {
+        assert!(
+            !symlink_target_escapes(Path::new("dir/link"), b"../sibling"),
+            "dir/link -> ../sibling stays inside the artifact root and must be accepted"
         );
     }
 
