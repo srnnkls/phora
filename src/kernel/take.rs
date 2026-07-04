@@ -931,4 +931,71 @@ mod take_resolution_tests {
         let res = resolve(&offer, &[Take::Literal("a/SKILL.md")]);
         assert_kept(&res, &[("a/SKILL.md", "a/SKILL.md")]);
     }
+
+    // ---- 16. CLIFF-UNIFOLD-005: non-ASCII dest case-collision + casefold divergence ----
+
+    #[test]
+    fn cyrillic_case_colliding_dests_are_a_hard_error() {
+        let offer = offer(&["a", "b"]);
+        let rendered = rendered_error(
+            &offer,
+            &[
+                Take::Rename {
+                    src: "a",
+                    dest: "\u{0401}.txt", // Ё.txt
+                },
+                Take::Rename {
+                    src: "b",
+                    dest: "\u{0451}.txt", // ё.txt
+                },
+            ],
+        );
+        assert_named_diagnostic(&rendered, "\u{0401}.txt");
+    }
+
+    #[test]
+    fn latin_accented_case_colliding_dests_are_a_hard_error() {
+        let offer = offer(&["a", "b"]);
+        let rendered = rendered_error(
+            &offer,
+            &[
+                Take::Rename {
+                    src: "a",
+                    dest: "\u{00c9}", // É
+                },
+                Take::Rename {
+                    src: "b",
+                    dest: "\u{00e9}", // é
+                },
+            ],
+        );
+        assert_named_diagnostic(&rendered, "\u{00c9}");
+    }
+
+    #[test]
+    fn fold_dest_keeps_eszett_and_ss_distinct_documented_limitation() {
+        assert_ne!(
+            super::fold_dest("stra\u{00df}e"),
+            super::fold_dest("strasse"),
+            "documented UNIFOLD limitation: fold_dest is simple lowercase, not full case-folding; \
+             `stra\u{00df}e` and `strasse` stay DISTINCT so the dup-dest check matches APFS/NTFS \
+             simple-fold collision and does not over-reject"
+        );
+    }
+
+    #[test]
+    fn fold_dest_keeps_final_sigma_distinct_but_folds_capital_sigma() {
+        assert_ne!(
+            super::fold_dest("\u{03c2}"), // ς final sigma
+            super::fold_dest("\u{03c3}"), // σ small sigma
+            "documented UNIFOLD limitation: final sigma `\u{03c2}` stays DISTINCT from `\u{03c3}` \
+             under simple lowercase; only full case-folding would merge them"
+        );
+        assert_eq!(
+            super::fold_dest("\u{03a3}"), // Σ capital sigma
+            super::fold_dest("\u{03c3}"), // σ small sigma
+            "the fold IS full-Unicode for ordinary case pairs: `\u{03a3}` lowercases to \
+             `\u{03c3}`; only the final-sigma special case diverges from full folding"
+        );
+    }
 }

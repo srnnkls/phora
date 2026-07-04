@@ -414,6 +414,7 @@ fn record(
         }],
         linked: false,
         vars_digest: None,
+        deploy_root: None,
     }
 }
 
@@ -2032,6 +2033,7 @@ fn record_for(
         files,
         linked: false,
         vars_digest: None,
+        deploy_root: None,
     }
 }
 
@@ -2322,6 +2324,7 @@ fn mapped_record(
         files,
         linked: false,
         vars_digest: None,
+        deploy_root: None,
     }
 }
 
@@ -4414,7 +4417,7 @@ fn target_rm_parses_name_and_local() {
         matches!(
             &cli.command,
             Command::Target {
-                cmd: TargetCmd::Rm { name, local: true }
+                cmd: TargetCmd::Rm { name, local: true, force: false }
             } if name == "nvim"
         ),
         "target rm must carry name + local, got {cli:?}"
@@ -5556,5 +5559,235 @@ fn format_where_renders_matches() {
     assert!(
         out.contains("claude"),
         "a non-empty result must list the deployed-to target, got: {out}"
+    );
+}
+
+// CLIFF-TARGETRM-001: `target rm` refuses while artifacts are deployed.
+
+const TARGET_HOME_BLOCK: &str =
+    "\n[targets.home]\npath = \"./out\"\nlayout = \"flat\"\nsources = []\n";
+
+fn seed_deployed_record(state_root: &Path, project_dir: &Path, target: &str) {
+    let project = crate::kernel::ProjectId::for_path(project_dir).expect("project id for seed");
+    let registry_root = state_root.join("projects").join(project.as_str());
+    let reg = FileRegistry::open(registry_root).expect("open seeded project registry");
+    reg.put(&record(target, "dotfiles", "init", "aaa111", "blake3:d1"))
+        .expect("seed a deployed record for the target");
+}
+
+fn run_target_rm_cli(project_dir: &Path, args: &[&str]) -> (Result<()>, String, Option<String>) {
+    use clap::Parser;
+    let cli = Cli::try_parse_from(args).expect("`target rm` args must parse");
+    let main_path = project_dir.join("phora.toml");
+    let local_path = project_dir.join("phora.local.toml");
+    with_cwd(project_dir, || {
+        let result = run(cli);
+        let main_after = std::fs::read_to_string(&main_path).unwrap_or_default();
+        let local_after = std::fs::read_to_string(&local_path).ok();
+        (result, main_after, local_after)
+    })
+}
+
+#[test]
+fn target_rm_refuses_when_registry_holds_live_records() {
+    let project = tempfile::TempDir::new().expect("project dir");
+    let state = tempfile::TempDir::new().expect("state root");
+    let main_path = project.path().join("phora.toml");
+    let main_text = format!(
+        "version = 1\n\n[paths]\nstate = \"{}\"\n{}",
+        state.path().display(),
+        TARGET_HOME_BLOCK
+    );
+    std::fs::write(&main_path, &main_text).expect("seed phora.toml");
+    seed_deployed_record(state.path(), project.path(), "home");
+
+    let (result, main_after, _local) =
+        run_target_rm_cli(project.path(), &["phora", "target", "rm", "home"]);
+
+    assert!(
+        result.is_err(),
+        "target rm must REFUSE while the registry holds a live record for `home` (deployed \
+         files would be stranded), but it returned Ok"
+    );
+    assert_eq!(
+        main_after, main_text,
+        "a refused target rm must leave phora.toml byte-for-byte unchanged; the [targets.home] \
+         block must survive"
+    );
+    assert!(
+        main_after.contains("[targets.home]"),
+        "the target block must NOT be deleted when rm is refused, got:\n{main_after}"
+    );
+}
+
+#[test]
+fn target_rm_refusal_lists_artifacts_and_remedy() {
+    let project = tempfile::TempDir::new().expect("project dir");
+    let state = tempfile::TempDir::new().expect("state root");
+    let main_text = format!(
+        "version = 1\n\n[paths]\nstate = \"{}\"\n{}",
+        state.path().display(),
+        TARGET_HOME_BLOCK
+    );
+    std::fs::write(project.path().join("phora.toml"), &main_text).expect("seed phora.toml");
+    seed_deployed_record(state.path(), project.path(), "home");
+
+    let (result, _main_after, _local) =
+        run_target_rm_cli(project.path(), &["phora", "target", "rm", "home"]);
+
+    let err = result.expect_err("rm with live records must error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("home"),
+        "the refusal must name the target `home`, got: {msg}"
+    );
+    assert!(
+        msg.contains("init"),
+        "the refusal must LIST the deployed artifact (`dotfiles/init`), got: {msg}"
+    );
+    assert!(
+        msg.contains("--force"),
+        "the refusal must point at the `--force` escape hatch, got: {msg}"
+    );
+    assert!(
+        msg.contains("prune"),
+        "the refusal must point at the `sync --prune` remedy, got: {msg}"
+    );
+}
+
+#[test]
+fn target_rm_force_removes_block_despite_live_records() {
+    let project = tempfile::TempDir::new().expect("project dir");
+    let state = tempfile::TempDir::new().expect("state root");
+    let main_text = format!(
+        "version = 1\n\n[paths]\nstate = \"{}\"\n{}",
+        state.path().display(),
+        TARGET_HOME_BLOCK
+    );
+    std::fs::write(project.path().join("phora.toml"), &main_text).expect("seed phora.toml");
+    seed_deployed_record(state.path(), project.path(), "home");
+
+    let (result, main_after, _local) = run_target_rm_cli(
+        project.path(),
+        &["phora", "target", "rm", "home", "--force"],
+    );
+
+    result.expect("target rm --force must PROCEED with removal even with live records");
+    assert!(
+        !main_after.contains("[targets.home]"),
+        "target rm --force must delete the [targets.home] block (today's behavior), got:\n{main_after}"
+    );
+}
+
+#[test]
+fn target_rm_without_records_proceeds_without_force() {
+    let project = tempfile::TempDir::new().expect("project dir");
+    let state = tempfile::TempDir::new().expect("state root");
+    let main_text = format!(
+        "version = 1\n\n[paths]\nstate = \"{}\"\n{}",
+        state.path().display(),
+        TARGET_HOME_BLOCK
+    );
+    std::fs::write(project.path().join("phora.toml"), &main_text).expect("seed phora.toml");
+
+    let (result, main_after, _local) =
+        run_target_rm_cli(project.path(), &["phora", "target", "rm", "home"]);
+
+    result.expect("target rm must proceed without --force when NO records are deployed");
+    assert!(
+        !main_after.contains("[targets.home]"),
+        "with no deployed records the block must be removed as before, got:\n{main_after}"
+    );
+}
+
+#[test]
+fn target_rm_refusal_keys_on_the_named_target_only() {
+    let project = tempfile::TempDir::new().expect("project dir");
+    let state = tempfile::TempDir::new().expect("state root");
+    let main_text = format!(
+        "version = 1\n\n[paths]\nstate = \"{}\"\n{}",
+        state.path().display(),
+        TARGET_HOME_BLOCK
+    );
+    std::fs::write(project.path().join("phora.toml"), &main_text).expect("seed phora.toml");
+    seed_deployed_record(state.path(), project.path(), "other");
+
+    let (result, main_after, _local) =
+        run_target_rm_cli(project.path(), &["phora", "target", "rm", "home"]);
+
+    result.expect("rm home must proceed: only `other` has deployed records, not `home`");
+    assert!(
+        !main_after.contains("[targets.home]"),
+        "refusal must key on the named target's records, not any records at all, got:\n{main_after}"
+    );
+}
+
+#[test]
+fn target_rm_refuses_local_only_target_via_merged_state_root() {
+    let project = tempfile::TempDir::new().expect("project dir");
+    let base_state = tempfile::TempDir::new().expect("base state root (empty)");
+    let local_state = tempfile::TempDir::new().expect("local state root (has records)");
+
+    let main_text = format!(
+        "version = 1\n\n[paths]\nstate = \"{}\"\n",
+        base_state.path().display()
+    );
+    std::fs::write(project.path().join("phora.toml"), &main_text).expect("seed phora.toml");
+
+    let local_text = format!(
+        "version = 1\n\n[paths]\nstate = \"{}\"\n{}",
+        local_state.path().display(),
+        TARGET_HOME_BLOCK
+    );
+    std::fs::write(project.path().join("phora.local.toml"), &local_text).expect("seed local toml");
+    seed_deployed_record(local_state.path(), project.path(), "home");
+
+    let (result, _main_after, local_after) = run_target_rm_cli(
+        project.path(),
+        &["phora", "target", "rm", "home", "--local"],
+    );
+
+    assert!(
+        result.is_err(),
+        "a target defined only in phora.local.toml (with its state root there) must still be \
+         refused; the check must resolve the MERGED config, not base only"
+    );
+    assert_eq!(
+        local_after.as_deref(),
+        Some(local_text.as_str()),
+        "a refused local-target rm must leave phora.local.toml unchanged"
+    );
+}
+
+#[test]
+fn target_rm_refuses_overridden_target_with_live_records() {
+    let project = tempfile::TempDir::new().expect("project dir");
+    let state = tempfile::TempDir::new().expect("state root");
+
+    let main_text = format!(
+        "version = 1\n\n[paths]\nstate = \"{}\"\n\n[targets.home]\npath = \"./base-out\"\nlayout = \"flat\"\nsources = []\n",
+        state.path().display()
+    );
+    std::fs::write(project.path().join("phora.toml"), &main_text).expect("seed phora.toml");
+    let local_text =
+        "version = 1\n\n[targets.home]\npath = \"./local-out\"\nlayout = \"flat\"\nsources = []\n";
+    std::fs::write(project.path().join("phora.local.toml"), local_text).expect("seed local toml");
+    seed_deployed_record(state.path(), project.path(), "home");
+
+    let (result, main_after, local_after) =
+        run_target_rm_cli(project.path(), &["phora", "target", "rm", "home"]);
+
+    assert!(
+        result.is_err(),
+        "an overridden target with live records must be refused just like a base-only one"
+    );
+    assert_eq!(
+        main_after, main_text,
+        "a refused rm must leave phora.toml unchanged for an overridden target"
+    );
+    assert_eq!(
+        local_after.as_deref(),
+        Some(local_text),
+        "a refused rm must leave phora.local.toml unchanged for an overridden target"
     );
 }

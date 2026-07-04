@@ -150,6 +150,7 @@ fn rebuild_binding(run: &BindingRun<'_>, report: &mut RebuildReport) -> Result<(
         .into_iter()
         .find(|b| b.identity == run.binding.identity)
         .map_or(TemplateOptIn::SuffixOnly, |b| b.template_opt_in);
+    let deploy_root = run.target.deploy_root();
 
     for item in &run.binding.items {
         let published_key = item.materialization.published_key().to_owned();
@@ -172,6 +173,7 @@ fn rebuild_binding(run: &BindingRun<'_>, report: &mut RebuildReport) -> Result<(
                 run.target.layout().kind,
                 record_kind(&item.materialization),
                 key.clone(),
+                deploy_root.clone(),
             )?;
         } else {
             let leaves = item_leaves(&item.materialization, &item.kept_leaves, &template_opt_in);
@@ -192,6 +194,7 @@ fn rebuild_binding(run: &BindingRun<'_>, report: &mut RebuildReport) -> Result<(
                 report,
                 template_opt_in: &template_opt_in,
                 vars: &run.config.vars,
+                deploy_root: deploy_root.clone(),
             })?;
         }
         report.reconstructed.push(key);
@@ -255,6 +258,7 @@ struct RebuildOne<'a> {
     report: &'a mut RebuildReport,
     template_opt_in: &'a TemplateOptIn,
     vars: &'a BTreeMap<String, String>,
+    deploy_root: String,
 }
 
 fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
@@ -275,6 +279,7 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         report,
         template_opt_in,
         vars,
+        deploy_root,
     } = args;
 
     let key_label = key.artifact.replace('/', "_");
@@ -335,6 +340,7 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         preserve_executable: policy.preserve_executable,
         files,
         vars_digest: export.vars_digest,
+        deploy_root: Some(deploy_root),
     });
     registry.put(&record)?;
     if modified {
@@ -352,6 +358,7 @@ fn rebuild_linked(
     layout_kind: LayoutKind,
     kind: RecordKind,
     key: ArtifactKey,
+    deploy_root: String,
 ) -> Result<()> {
     let record = RegistryRecord {
         version: 1,
@@ -367,6 +374,7 @@ fn rebuild_linked(
         files: vec![],
         linked: true,
         vars_digest: None,
+        deploy_root: Some(deploy_root),
     };
     registry.put(&record)?;
     Ok(())

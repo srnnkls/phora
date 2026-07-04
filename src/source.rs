@@ -4420,6 +4420,112 @@ path = "srnnkls/tropos"
         );
     }
 
+    // ---- CLIFF-UNIFOLD-005: non-ASCII deployed-name case-collision + casefold divergence ----
+
+    #[test]
+    fn export_rejects_deployed_names_colliding_only_by_latin_accented_case() {
+        let fixture = build_collision_fixture(&[
+            ("first.md", b"upper accented deploy\n"),
+            ("second.md", b"lower accented deploy\n"),
+        ]);
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+        let staging = TempDir::new().expect("staging dir");
+
+        let leaves = vec![
+            ExportLeaf {
+                source: PathBuf::from("art/first.md"),
+                dest: PathBuf::from("\u{00c9}.md"), // É.md
+            },
+            ExportLeaf {
+                source: PathBuf::from("art/second.md"),
+                dest: PathBuf::from("\u{00e9}.md"), // é.md
+            },
+        ];
+        let err = export_named(&fixture, staging.path(), &leaves, &ExportPolicy::default())
+            .expect_err(
+                "`\u{00c9}.md` and `\u{00e9}.md` fold to one deployed name and must collide",
+            );
+        assert!(
+            matches!(err, SourceError::DeployedNameCollision { .. }),
+            "a non-ASCII case-only deployed-name clash must be a hard DeployedNameCollision (the \
+             registration fold is not ASCII-only), not last-writer-wins, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn export_rejects_deployed_names_colliding_only_by_cyrillic_case() {
+        let fixture = build_collision_fixture(&[
+            ("first.md", b"upper cyrillic deploy\n"),
+            ("second.md", b"lower cyrillic deploy\n"),
+        ]);
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+        let staging = TempDir::new().expect("staging dir");
+
+        let leaves = vec![
+            ExportLeaf {
+                source: PathBuf::from("art/first.md"),
+                dest: PathBuf::from("\u{0401}.md"), // Ё.md
+            },
+            ExportLeaf {
+                source: PathBuf::from("art/second.md"),
+                dest: PathBuf::from("\u{0451}.md"), // ё.md
+            },
+        ];
+        let err = export_named(&fixture, staging.path(), &leaves, &ExportPolicy::default())
+            .expect_err("Cyrillic `\u{0401}.md` and `\u{0451}.md` fold to one deployed name");
+        assert!(
+            matches!(err, SourceError::DeployedNameCollision { .. }),
+            "a Cyrillic case-only deployed-name clash must be a hard DeployedNameCollision, got \
+             {err:?}"
+        );
+    }
+
+    #[test]
+    fn export_keeps_eszett_and_ss_deployed_names_distinct_documented_limitation() {
+        let fixture = build_collision_fixture(&[
+            ("sharp.md", b"deploys to strasse.md\n"),
+            (
+                "plain.md",
+                b"deploys to strasse.md too but folded distinctly\n",
+            ),
+        ]);
+        fixture
+            .backend
+            .fetch(&sn("src"), &fixture.url)
+            .expect("fetch");
+        let staging = TempDir::new().expect("staging dir");
+
+        let leaves = vec![
+            ExportLeaf {
+                source: PathBuf::from("art/sharp.md"),
+                dest: PathBuf::from("stra\u{00df}e.md"), // straße.md
+            },
+            ExportLeaf {
+                source: PathBuf::from("art/plain.md"),
+                dest: PathBuf::from("strasse.md"),
+            },
+        ];
+        export_named(&fixture, staging.path(), &leaves, &ExportPolicy::default()).expect(
+            "documented UNIFOLD limitation: the registration fold is simple lowercase, so \
+             `stra\u{00df}e.md` and `strasse.md` are DISTINCT deployed names and must NOT collide \
+             — full case-folding would over-reject this",
+        );
+        assert!(
+            staging.path().join("stra\u{00df}e.md").exists(),
+            "the `stra\u{00df}e.md` leaf must materialize as its own deployed name"
+        );
+        assert!(
+            staging.path().join("strasse.md").exists(),
+            "the `strasse.md` leaf must materialize distinctly alongside `stra\u{00df}e.md`"
+        );
+    }
+
     // ---- compute_digest ----
 
     #[test]

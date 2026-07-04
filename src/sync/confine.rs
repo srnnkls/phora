@@ -177,7 +177,9 @@ fn starts_with_components(path: &Path, prefix: &Path) -> bool {
     strip_prefix_folded(path, prefix).is_some()
 }
 
-/// NFC-normalizes, then ASCII-folds only; non-ASCII case-variants are not folded.
+/// NFC-normalizes, then applies simple Unicode lowercase (`to_lowercase`), not
+/// full case-folding: this matches how APFS/NTFS collide names, so `ß`/`ss` and
+/// final sigma `ς`/`σ` stay distinct rather than over-rejecting.
 fn fold_key(component: &std::ffi::OsStr) -> String {
     component
         .to_string_lossy()
@@ -483,6 +485,78 @@ mod tests {
             msg.contains("escapes its anchor"),
             "the prune-side confinement rejection must carry the `escapes its anchor` diagnostic \
              so prune logs a refusal instead of deleting; got: {msg}"
+        );
+    }
+
+    // ---- CLIFF-UNIFOLD-005: non-ASCII case-collision pins + casefold divergence ----
+
+    #[test]
+    fn confine_fold_folds_latin_accented_case_variant_to_one_key() {
+        assert_eq!(
+            fold_path(Path::new("/x/\u{00c9}/init.lua")),
+            fold_path(Path::new("/x/\u{00e9}/init.lua")),
+            "confine folding must treat `\u{00c9}` and `\u{00e9}` as one key (NFC + full-Unicode \
+             to_lowercase); the fold is not ASCII-only, so a case-only variant cannot smuggle a \
+             second path past a fold-based confinement check"
+        );
+    }
+
+    #[test]
+    fn confine_fold_folds_cyrillic_case_variant_to_one_key() {
+        assert_eq!(
+            fold_path(Path::new("/x/\u{0401}/f")),
+            fold_path(Path::new("/x/\u{0451}/f")),
+            "confine folding must fold Cyrillic `\u{0401}`/`\u{0451}` (\u{0401}/\u{0451}) to one \
+             key; folding covers non-ASCII case pairs, not just ASCII"
+        );
+    }
+
+    #[test]
+    fn confine_treats_cyrillic_case_variant_anchor_as_the_same_path() {
+        let anchor = Path::new("/home/u/\u{0401}"); // Ё
+        let dst = Path::new("/home/u/\u{0451}/init.lua"); // ё
+        let set = protected(Path::new("/home/u/proj"));
+
+        let confined = confine_destination(anchor, dst, &set).expect(
+            "a dst differing from the anchor only by Cyrillic case (\u{0401} vs \u{0451}) must \
+             confine as the SAME path under fold identity, not be rejected as a prefix-sibling \
+             escape",
+        );
+        assert_eq!(
+            confined
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned()),
+            Some("init.lua".to_owned()),
+            "the case-variant anchor must keep confining the descendant leaf; got {}",
+            confined.display()
+        );
+    }
+
+    #[test]
+    fn confine_fold_keeps_eszett_and_ss_distinct_documented_limitation() {
+        assert_ne!(
+            fold_path(Path::new("/x/stra\u{00df}e")), // straße
+            fold_path(Path::new("/x/strasse")),
+            "documented UNIFOLD limitation: the fold is simple lowercase, NOT full Unicode \
+             case-folding, so `stra\u{00df}e` and `strasse` stay DISTINCT keys — this matches \
+             APFS/NTFS simple-fold collision; a switch to full case-folding would over-collide \
+             them and must fail this guard"
+        );
+    }
+
+    #[test]
+    fn confine_fold_keeps_final_sigma_distinct_but_folds_capital_sigma() {
+        assert_ne!(
+            fold_path(Path::new("/x/\u{03c2}")), // ς final sigma
+            fold_path(Path::new("/x/\u{03c3}")), // σ small sigma
+            "documented UNIFOLD limitation: final sigma `\u{03c2}` stays DISTINCT from `\u{03c3}` \
+             under simple lowercase; only full case-folding merges them"
+        );
+        assert_eq!(
+            fold_path(Path::new("/x/\u{03a3}")), // Σ capital sigma
+            fold_path(Path::new("/x/\u{03c3}")), // σ small sigma
+            "the fold IS full-Unicode for ordinary case pairs: capital `\u{03a3}` still lowercases \
+             to `\u{03c3}`; only the final-sigma special case diverges from full folding"
         );
     }
 }
