@@ -506,18 +506,22 @@ fn parse_full_url(input: &str, scheme: &str, rest: &str) -> Result<AddTarget> {
             "expected <owner>/<repo> in `{input}`"
         )));
     };
-    let name = strip_git(repo).to_owned();
-
     if let ["tree", git_ref, root_segments @ ..] = tail {
         return Ok(literal_source(
-            name,
+            strip_git(repo).to_owned(),
             with_git_suffix(&format!("{scheme}://{host}/{owner}/{repo}")),
             Some((*git_ref).to_owned()),
             join_root(root_segments),
         ));
     }
 
-    Ok(literal_source(name, with_git_suffix(input), None, None))
+    let remote = format!("{scheme}://{host}/{}", segments.join("/"));
+    Ok(literal_source(
+        repo_name(&remote),
+        with_git_suffix(&remote),
+        None,
+        None,
+    ))
 }
 
 fn parse_shorthand(input: &str, domains: &BTreeMap<String, String>) -> Result<AddTarget> {
@@ -665,7 +669,9 @@ pub(super) fn add_with_binds(
                     current = config_edit::upsert_target(&current, target, &path, Some("flat"))?;
                 }
                 MissingTarget::Reject => {
-                    return Err(Error::Config(super::bind::missing_target_message(target)));
+                    return Err(Error::Config(super::bind::missing_target_message(
+                        target, false,
+                    )));
                 }
             }
         }

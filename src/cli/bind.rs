@@ -13,12 +13,14 @@ use crate::error::{Error, Result};
 use crate::kernel::{SourceName, TargetName};
 
 /// Error text for a target that is not defined: names the target and the
-/// `phora target add <name> --path <path>` create hint.
+/// `phora target add <name> --path <path>` create hint, suffixed with `--local`
+/// when the bind writes to the local config.
 #[must_use]
-pub fn missing_target_message(target: &str) -> String {
+pub fn missing_target_message(target: &str, local: bool) -> String {
+    let local_flag = if local { " --local" } else { "" };
     format!(
         "target '{target}' does not exist\n  \
-         create it with: phora target add {target} --path <path>"
+         create it with: phora target add {target} --path <path>{local_flag}"
     )
 }
 
@@ -57,11 +59,10 @@ fn validate_merged_references(main_text: &str, local_text: &str) -> Result<()> {
     config_edit::validate_source_references(&merged)
 }
 
-fn merged_source_names(cwd: &Path) -> Result<Vec<String>> {
+fn merged_config(cwd: &Path) -> Result<crate::config::Config> {
     let base = load_config_from(cwd)?;
     let local = load_local_config(cwd)?;
-    let merged = merge_configs(base, local);
-    Ok(merged.sources.into_keys().collect())
+    Ok(merge_configs(base, local))
 }
 
 fn target_exists(text: &str, target: &str) -> Result<bool> {
@@ -86,21 +87,24 @@ pub(super) fn run_bind(
     TargetName::from_str(to)?;
 
     let cwd = Path::new(".");
-    let all_source_names = merged_source_names(cwd)?;
+    let merged = merged_config(cwd)?;
     for source in sources {
-        if !all_source_names.contains(source) {
+        if !merged.sources.contains_key(source) {
             return Err(Error::Config(missing_source_message(source)));
         }
     }
 
+    let Some(target) = merged.targets.get(to) else {
+        return Err(Error::Config(missing_target_message(to, local)));
+    };
+
     let file = target_config_file(local);
     let original = read_config_text(file)?;
 
-    if !target_exists(&original, to)? {
-        return Err(Error::Config(missing_target_message(to)));
-    }
-
     let mut text = original.clone();
+    if !target_exists(&text, to)? {
+        text = config_edit::upsert_target(&text, to, &target.path.to_string_lossy(), None)?;
+    }
     if let Some(root) = refinement.root.as_deref() {
         text = config_edit::set_source_roots(&text, sources, root)?;
     }
@@ -126,7 +130,7 @@ pub(super) fn run_unbind(sources: &[String], from: &str, local: bool) -> Result<
     let text = read_config_text(file)?;
 
     if !target_exists(&text, from)? {
-        return Err(Error::Config(missing_target_message(from)));
+        return Err(Error::Config(missing_target_message(from, local)));
     }
 
     let result = config_edit::unbind(&text, from, sources)?;
@@ -166,7 +170,7 @@ mod tests {
 
     #[test]
     fn missing_target_message_names_target_and_create_hint() {
-        let msg = missing_target_message("staging");
+        let msg = missing_target_message("staging", false);
         assert!(msg.contains("staging"), "must name the target");
         assert!(
             msg.contains("does not exist"),
@@ -175,6 +179,14 @@ mod tests {
         assert!(
             msg.contains("phora target add staging --path"),
             "must give the `phora target add <name> --path` create hint"
+        );
+        assert!(
+            !msg.contains("--local"),
+            "a non-local remedy must not suggest --local"
+        );
+        assert!(
+            missing_target_message("staging", true).contains("--path <path> --local"),
+            "a local remedy must suffix the create hint with --local"
         );
     }
 

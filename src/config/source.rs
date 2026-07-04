@@ -407,6 +407,9 @@ impl Source {
             self.url = None;
             self.digest = None;
         } else if local_url_kind {
+            if self.url != local.url {
+                self.digest = None;
+            }
             self.url = local.url;
             self.git = None;
             self.host = None;
@@ -753,6 +756,94 @@ mod offer_tests {
         assert!(
             rendered.contains(SELECTION) && rendered.contains(REMEDY),
             "the exclude `!`-rejection must render a structured selection diagnostic; got:\n{rendered}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod merge_url_digest_tests {
+    use super::Source;
+
+    const OLD_DIGEST: &str =
+        "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const NEW_DIGEST: &str =
+        "sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+    fn bare() -> Source {
+        Source {
+            git: None,
+            url: None,
+            digest: None,
+            host: None,
+            repo: None,
+            path: None,
+            protocol: None,
+            branch: None,
+            tag: None,
+            rev: None,
+            root: None,
+            include: None,
+            exclude: None,
+            allow_symlinks: None,
+            preserve_executable: None,
+            deploy: None,
+            transitive: None,
+        }
+    }
+
+    fn url_source(url: &str, digest: Option<&str>) -> Source {
+        Source {
+            url: Some(url.to_owned()),
+            digest: digest.map(str::to_owned),
+            ..bare()
+        }
+    }
+
+    #[test]
+    fn url_override_changing_url_without_digest_drops_the_stale_base_pin() {
+        let base = url_source("https://example.com/old.tar.gz", Some(OLD_DIGEST));
+        let local = url_source("https://example.com/new.tar.gz", None);
+
+        let merged = base.merged_with(local);
+
+        assert_eq!(
+            merged.url.as_deref(),
+            Some("https://example.com/new.tar.gz"),
+            "the override url must win"
+        );
+        assert!(
+            merged.digest.is_none(),
+            "changing the url without restating a digest must drop the stale base pin so the \
+             next sync does not fail a spurious digest mismatch; got {:?}",
+            merged.digest
+        );
+    }
+
+    #[test]
+    fn url_override_restating_url_and_digest_keeps_the_new_pin() {
+        let base = url_source("https://example.com/old.tar.gz", Some(OLD_DIGEST));
+        let local = url_source("https://example.com/new.tar.gz", Some(NEW_DIGEST));
+
+        let merged = base.merged_with(local);
+
+        assert_eq!(
+            merged.digest.as_deref(),
+            Some(NEW_DIGEST),
+            "restating a digest alongside the new url must pin to the override digest"
+        );
+    }
+
+    #[test]
+    fn url_override_restating_same_url_without_digest_keeps_the_base_pin() {
+        let base = url_source("https://example.com/pkg.tar.gz", Some(OLD_DIGEST));
+        let local = url_source("https://example.com/pkg.tar.gz", None);
+
+        let merged = base.merged_with(local);
+
+        assert_eq!(
+            merged.digest.as_deref(),
+            Some(OLD_DIGEST),
+            "restating the same url without a digest must keep the valid base pin, not drop it"
         );
     }
 }
