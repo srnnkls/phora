@@ -451,6 +451,12 @@ impl LayoutConfig {
             LayoutKind::Prefixed => PathBuf::from(format!("{source}{}{artifact}", self.separator)),
         }
     }
+
+    /// `Some` separator to persist for reconstruction only under `Prefixed`, which is the sole layout that joins with one.
+    #[must_use]
+    pub fn persisted_separator(&self) -> Option<String> {
+        matches!(self.kind, LayoutKind::Prefixed).then(|| self.separator.clone())
+    }
 }
 
 enum LayoutConfigRaw {
@@ -522,6 +528,26 @@ impl LayoutKind {
             "by-source" => Ok(Self::BySource),
             "prefixed" => Ok(Self::Prefixed),
             other => Err(format!("unknown layout type `{other}`")),
+        }
+    }
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Flat => "flat",
+            Self::BySource => "by-source",
+            Self::Prefixed => "prefixed",
+        }
+    }
+
+    #[must_use]
+    pub fn from_record_label(label: &str) -> Option<Self> {
+        match label {
+            "flat" => Some(Self::Flat),
+            // `bysource` is the label pre-hardening builds wrote via Debug-lowercasing.
+            "by-source" | "bysource" => Some(Self::BySource),
+            "prefixed" => Some(Self::Prefixed),
+            _ => None,
         }
     }
 }

@@ -415,6 +415,7 @@ fn record(
         linked: false,
         vars_digest: None,
         deploy_root: None,
+        layout_separator: None,
     }
 }
 
@@ -2034,6 +2035,7 @@ fn record_for(
         linked: false,
         vars_digest: None,
         deploy_root: None,
+        layout_separator: None,
     }
 }
 
@@ -2325,6 +2327,7 @@ fn mapped_record(
         linked: false,
         vars_digest: None,
         deploy_root: None,
+        layout_separator: None,
     }
 }
 

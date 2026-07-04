@@ -3,15 +3,46 @@
 use std::io::IsTerminal;
 use std::path::Path;
 
+use crate::config::Config;
 use crate::error::{Error, Result};
+use crate::kernel::ProjectId;
 use crate::lock::{Lock, merge_locks};
-use crate::paths::cache_root_for;
+use crate::paths::{cache_root_for, state_root_for};
+use crate::store::FileRegistry;
 use crate::sync::{ConflictResolver, SyncInput, SyncOutput, sync};
 
 use super::{
     DropSources, TtyResolver, build_router, drop_sources, load_config, load_local_config,
     open_project_registry,
 };
+
+/// Open the per-clone registry, generating `.phora-id` and adopting a legacy
+/// path-hash registry when the file is absent. Generation is confined to this
+/// sync path; read-only commands resolve identity without ever writing it.
+fn open_sync_registry(cwd: &Path, config: &Config) -> Result<FileRegistry> {
+    let projects_base = state_root_for(config.paths.state.as_deref(), cwd)?.join("projects");
+    let project = if let Some(id) = ProjectId::read_identity_file(cwd)? {
+        id
+    } else {
+        let generated = ProjectId::generate()?;
+        let legacy = ProjectId::for_path(cwd)?;
+        let adopted = crate::store::adopt_registry_dir(
+            &projects_base.join(legacy.as_str()),
+            &projects_base,
+            generated.as_str(),
+        )?;
+        let project = ProjectId::from_raw(adopted);
+        project.write_identity_file(cwd)?;
+        project
+    };
+    if let Err(e) = crate::kernel::exclude_identity_from_git(cwd) {
+        eprintln!(
+            "phora: could not exclude {} from git ({e}); sync continues",
+            crate::kernel::IDENTITY_FILE
+        );
+    }
+    Ok(FileRegistry::open(projects_base.join(project.as_str()))?)
+}
 
 #[expect(
     clippy::fn_params_excessive_bools,
@@ -41,7 +72,7 @@ pub(super) fn run_sync(
     let effective = crate::config::merge_configs(base.clone(), local.clone());
     let cache_git = cache_root_for(effective.paths.cache.as_deref(), &cwd)?.join("git");
     let backend = build_router(&effective, cache_git)?;
-    let registry = open_project_registry(&effective)?;
+    let registry = open_sync_registry(&cwd, &effective)?;
     let _guard = registry.lock_exclusive()?;
     let interactive = std::io::stdin().is_terminal();
     let resolver = TtyResolver;

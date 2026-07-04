@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::config::{DeployMode, LayoutKind, ParsedSource, Target, TemplateOptIn};
+use crate::config::{DeployMode, LayoutConfig, ParsedSource, Target, TemplateOptIn};
 use crate::deploy::{ArtifactState, Journal, check_artifact_state, deploy_artifact, link_artifact};
 use crate::error::{Error, Result};
 use crate::kernel::{Materialization, SourceName, safe_relpath};
@@ -57,7 +57,7 @@ pub(super) fn deploy_target(
     registry: &dyn Registry,
     journal: &Journal,
 ) -> Result<bool> {
-    let layout_kind = run.target.layout().kind;
+    let layout = run.target.layout();
     let ejected = registry.load_ejected(run.target_name)?;
     let mut had_failures = false;
 
@@ -113,7 +113,7 @@ pub(super) fn deploy_target(
                 commit: &binding.commit,
                 item,
                 artifact_dst: &artifact_dst,
-                layout_kind,
+                layout: layout.clone(),
                 ejected: &ejected,
                 mode_transition,
                 template_opt_in,
@@ -163,7 +163,7 @@ pub(super) struct ArtifactEntry<'a> {
     pub(super) commit: &'a str,
     pub(super) item: &'a PlannedItem,
     pub(super) artifact_dst: &'a Path,
-    pub(super) layout_kind: LayoutKind,
+    pub(super) layout: LayoutConfig,
     pub(super) ejected: &'a [EjectedEntry],
     pub(super) mode_transition: bool,
     pub(super) template_opt_in: &'a TemplateOptIn,
@@ -240,7 +240,7 @@ pub(super) fn deploy_artifact_entry(
             journal,
             DeployContext {
                 deploy_root: deploy_root.clone(),
-                layout_kind: entry.layout_kind,
+                layout: entry.layout.clone(),
                 source: entry.source,
                 git: entry.git,
                 source_name: entry.source_name,
@@ -415,7 +415,7 @@ fn warn_skip(source: &str, artifact: &str, kind: &ConflictKind, dst: &Path) {
 
 struct DeployContext<'a> {
     deploy_root: String,
-    layout_kind: LayoutKind,
+    layout: LayoutConfig,
     source: &'a ParsedSource,
     git: &'a str,
     source_name: &'a SourceName,
@@ -491,13 +491,14 @@ fn deploy_one(
         underlying_source: ctx.underlying_source,
         commit: ctx.commit,
         digest: export.digest,
-        layout: format!("{:?}", ctx.layout_kind).to_lowercase(),
+        layout: ctx.layout.kind.label().to_owned(),
         kind: ctx.kind,
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
         files,
         vars_digest: export.vars_digest,
         deploy_root: Some(ctx.deploy_root),
+        layout_separator: ctx.layout.persisted_separator(),
     });
 
     if matches!(ctx.kind, RecordKind::Dir) {
@@ -528,7 +529,7 @@ fn deploy_link(
         commit: "link".to_owned(),
         digest: "link:".to_owned(),
         projected_at: chrono::Utc::now().to_rfc3339(),
-        layout: format!("{:?}", entry.layout_kind).to_lowercase(),
+        layout: entry.layout.kind.label().to_owned(),
         kind: entry.record_kind(),
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
@@ -536,6 +537,7 @@ fn deploy_link(
         linked: true,
         vars_digest: None,
         deploy_root: Some(deploy_root),
+        layout_separator: entry.layout.persisted_separator(),
     };
     let staging_base = target_parent(entry.artifact_dst).join(".phora-stage");
     link_artifact(
@@ -797,6 +799,7 @@ mod kind_aware_layout_tests {
             linked: false,
             vars_digest: None,
             deploy_root: None,
+            layout_separator: None,
         }
     }
 
@@ -936,6 +939,7 @@ mod kind_aware_layout_tests {
             linked: false,
             vars_digest: None,
             deploy_root: None,
+            layout_separator: None,
         };
 
         let base = record_manifest_base(&target, &rec);
@@ -1007,7 +1011,10 @@ mod revalidated_treated_like_clean_tests {
             commit: "0123456789abcdef0123456789abcdef01234567",
             item,
             artifact_dst: dst,
-            layout_kind: LayoutKind::Flat,
+            layout: LayoutConfig {
+                kind: crate::config::LayoutKind::Flat,
+                separator: String::new(),
+            },
             ejected: &[],
             mode_transition: false,
             template_opt_in: &TemplateOptIn::SuffixOnly,
@@ -1120,7 +1127,10 @@ mod mode_transition_conflict_tests {
             commit: "0123456789abcdef0123456789abcdef01234567",
             item,
             artifact_dst: dst,
-            layout_kind: LayoutKind::BySource,
+            layout: LayoutConfig {
+                kind: crate::config::LayoutKind::BySource,
+                separator: String::new(),
+            },
             ejected: &[],
             mode_transition: true,
             template_opt_in: &TemplateOptIn::SuffixOnly,
