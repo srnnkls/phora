@@ -135,6 +135,25 @@ config root (config is project-local `phora.toml`). Neither tree is migrated —
 legacy `~/.phora` is abandoned; mirrors re-clone and the registry rebuilds on the
 next sync.
 
+### Locking
+
+Each sync takes an exclusive OS lock on `state.lock` under the project's registry
+directory, so two syncs of the same project on one machine serialize and never
+corrupt the registry or journal.
+
+That lock is only reliable on a local filesystem. On a network filesystem — NFS,
+SMB, or CIFS — file locks are advisory and best-effort: the kernel may not honor
+them across hosts, so two machines syncing the same state root at once are not
+mutually excluded. Phora cannot build a cross-host lock over these mounts (there is
+no lock server); when it detects the state root on a network filesystem it prints a
+one-line advisory and proceeds. Cross-machine safety there is your responsibility.
+
+This matters most for a shared `$HOME` (the state root defaults under your home
+directory). If the same home directory is mounted on several machines — a common
+lab/cluster setup — do not run concurrent syncs of the same project from two
+machines; serialize them, or give each machine its own state root by pointing
+`[paths].state` at machine-local storage.
+
 ## Usage
 
 ```bash

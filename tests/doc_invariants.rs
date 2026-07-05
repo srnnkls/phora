@@ -176,3 +176,30 @@ fn readme_drops_multiline_array_of_tables() {
         "README.md: must not document the legacy multiline array-of-tables binding form"
     );
 }
+
+#[test]
+fn readme_documents_network_filesystem_lock_limitation() {
+    let doc = README.to_lowercase();
+
+    assert!(
+        doc.contains("nfs")
+            || doc.contains("network filesystem")
+            || doc.contains("network file system"),
+        "README.md: locking docs must name the network-filesystem (NFS) limitation"
+    );
+    assert!(
+        doc.contains("smb") || doc.contains("cifs"),
+        "README.md: locking docs must name SMB/CIFS alongside NFS as an unreliable-lock filesystem"
+    );
+    assert!(
+        doc.contains("advisory") || doc.contains("unreliable") || doc.contains("best-effort"),
+        "README.md: locking docs must state the lock is advisory / unreliable over network mounts"
+    );
+    assert!(
+        doc.contains("shared")
+            && (doc.contains("$home")
+                || doc.contains("home directory")
+                || doc.contains("home dir")),
+        "README.md: locking docs must carry the shared-$HOME concurrent-sync guidance"
+    );
+}

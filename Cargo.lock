@@ -2485,6 +2485,7 @@ dependencies = [
  "gix",
  "globset",
  "insta",
+ "libc",
  "minijinja",
  "rayon",
  "reflink-copy",

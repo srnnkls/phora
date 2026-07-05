@@ -41,6 +41,9 @@ ureq = "3.3.0"
 walkdir = "2.5.0"
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [features]
 # Re-exports internals (resolve_sources) for benchmarking only; off by default.
 bench = []

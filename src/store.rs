@@ -359,6 +359,102 @@ impl FileRegistry {
             StoreError::Registry(format!("{what} {}: {e}", path.display()))
         }
     }
+
+    /// One-line advisory when the state root sits on a network filesystem whose
+    /// `state.lock` flock is unreliable across hosts; `None` on local storage.
+    #[must_use]
+    pub fn lock_advisory(&self) -> Option<String> {
+        statfs_fstype(&self.state_root)
+            .as_deref()
+            .and_then(network_lock_advisory)
+    }
+}
+
+fn is_network_fstype(fstype: &str) -> bool {
+    const NETWORK_FSTYPES: &[&str] = &[
+        "nfs", "nfs4", "smbfs", "smb", "smb2", "cifs", "afpfs", "webdav",
+    ];
+    NETWORK_FSTYPES.contains(&fstype.trim().to_ascii_lowercase().as_str())
+}
+
+// Best-effort warning only: detecting the mount never builds a cross-host lock (scope constraint).
+fn network_lock_advisory(fstype: &str) -> Option<String> {
+    is_network_fstype(fstype).then(|| {
+        format!(
+            "phora: state root is on a network filesystem ({fstype}); the state.lock is \
+             advisory over NFS/SMB and may not block concurrent syncs from other machines"
+        )
+    })
+}
+
+#[cfg(test)]
+fn is_network_fs(path: &Path) -> bool {
+    statfs_fstype(path).is_some_and(|fstype| is_network_fstype(&fstype))
+}
+
+#[cfg(target_os = "macos")]
+fn statfs_fstype(path: &Path) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut buf = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `c_path` is a valid NUL-terminated path; the kernel initializes
+    // `buf` on success (rc == 0) before we read it.
+    let buf = unsafe {
+        if libc::statfs(c_path.as_ptr(), buf.as_mut_ptr()) != 0 {
+            return None;
+        }
+        buf.assume_init()
+    };
+    let bytes = buf.f_fstypename.map(i8::cast_unsigned);
+    let name = std::ffi::CStr::from_bytes_until_nul(&bytes).ok()?;
+    Some(name.to_string_lossy().into_owned())
+}
+
+// Linux statfs yields a numeric magic, not a name; the fstype string lives in mountinfo instead.
+#[cfg(target_os = "linux")]
+fn statfs_fstype(path: &Path) -> Option<String> {
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let mut best: Option<(usize, String)> = None;
+    for line in mountinfo.lines() {
+        let (pre, post) = line.split_once(" - ")?;
+        let mount_point = pre.split_whitespace().nth(4).map(unescape_octal)?;
+        let fstype = post.split_whitespace().next()?;
+        if target.starts_with(&mount_point) {
+            let depth = Path::new(&mount_point).components().count();
+            if best.as_ref().is_none_or(|(d, _)| depth >= *d) {
+                best = Some((depth, fstype.to_owned()));
+            }
+        }
+    }
+    best.map(|(_, fstype)| fstype)
+}
+
+#[cfg(target_os = "linux")]
+fn unescape_octal(field: &str) -> String {
+    let mut out: Vec<u8> = Vec::with_capacity(field.len());
+    let mut chars = field.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            let digits: String = chars.by_ref().take(3).collect();
+            if let Ok(byte) = u8::from_str_radix(&digits, 8) {
+                out.push(byte);
+                continue;
+            }
+            out.push(b'\\');
+            out.extend_from_slice(digits.as_bytes());
+        } else {
+            let mut b = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut b).as_bytes());
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn statfs_fstype(_path: &Path) -> Option<String> {
+    None
 }
 
 pub const ADOPTION_MARKER: &str = ".phora-adopted";
@@ -1268,6 +1364,66 @@ artifact = "snippets"
         assert_eq!(
             rec.key.artifact, "snippets",
             "a record predating the deploy-root field must load with its other fields intact"
+        );
+    }
+
+    // ── network-filesystem lock advisory (CLIFF-NFSDOC-006) ────────
+
+    #[test]
+    fn known_network_fstype_yields_a_single_line_lock_advisory() {
+        for fstype in ["nfs", "smbfs", "cifs"] {
+            let advisory = network_lock_advisory(fstype).unwrap_or_else(|| {
+                panic!("a known network fstype ({fstype}) must yield a lock advisory")
+            });
+            let lower = advisory.to_lowercase();
+            assert!(
+                lower.contains("lock"),
+                "the {fstype} advisory must be about locking, got: {advisory:?}"
+            );
+            assert!(
+                lower.contains("network") || lower.contains("nfs") || lower.contains("smb"),
+                "the {fstype} advisory must name the network-filesystem limitation, got: {advisory:?}"
+            );
+            assert!(
+                !advisory.trim_end().contains('\n'),
+                "the advisory must be a single line, got: {advisory:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_fstype_yields_no_lock_advisory() {
+        for fstype in ["apfs", "ext4", "xfs", "btrfs", "tmpfs"] {
+            assert_eq!(
+                network_lock_advisory(fstype),
+                None,
+                "a local fstype ({fstype}) must not trigger the network lock advisory"
+            );
+        }
+    }
+
+    #[test]
+    fn local_temp_dir_is_not_falsely_flagged_as_network() {
+        let dir = TempDir::new().expect("temp state root");
+        assert!(
+            !is_network_fs(dir.path()),
+            "the real detection call on a real local path must not misfire — the local temp dir \
+             every test uses must never be classified as a network filesystem"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unescape_octal_reassembles_multibyte_utf8_mount_points() {
+        assert_eq!(
+            unescape_octal(r"/mnt/caf\303\251"),
+            "/mnt/café",
+            "octal-escaped multi-byte UTF-8 bytes must reassemble, not decode byte-by-byte as Latin-1"
+        );
+        assert_eq!(
+            unescape_octal(r"/mnt/space\040dir"),
+            "/mnt/space dir",
+            "single-byte ASCII escapes must still round-trip"
         );
     }
 
