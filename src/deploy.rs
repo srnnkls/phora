@@ -465,10 +465,7 @@ impl Journal {
     pub fn readonly_error(&self) -> Error {
         match &self.mode {
             JournalMode::ReadOnly { root } => {
-                Error::StoreCtx(crate::store::StoreError::ReadOnly(format!(
-                    "state root {} is read-only: a frozen sync cannot write here",
-                    root.display()
-                )))
+                Error::StoreCtx(crate::store::readonly_root_error(root))
             }
             JournalMode::Writable => {
                 unreachable!("readonly_error called on a writable journal")

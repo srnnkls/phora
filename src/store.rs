@@ -346,18 +346,7 @@ impl FileRegistry {
     }
 
     fn lock_io_error(&self, what: &str, path: &Path, e: &std::io::Error) -> StoreError {
-        if matches!(
-            e.kind(),
-            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
-        ) {
-            StoreError::ReadOnly(format!(
-                "state root {} is read-only ({what} {}: {e})",
-                self.state_root.display(),
-                path.display()
-            ))
-        } else {
-            StoreError::Registry(format!("{what} {}: {e}", path.display()))
-        }
+        classify_io_error(&self.state_root, what, path, e)
     }
 
     /// One-line advisory when the state root sits on a network filesystem whose
@@ -483,15 +472,11 @@ pub fn adopt_registry_dir(legacy: &Path, projects_base: &Path, adopter: &str) ->
             StoreError::Registry(format!("clear stale staging {}: {e}", staging.display()))
         })?;
     }
-    copy_tree(legacy, &staging)?;
+    copy_tree(projects_base, legacy, &staging)?;
     atomic_write(&legacy.join(ADOPTION_MARKER), &format!("{target_id}\n"))?;
     std::fs::rename(&staging, &new).map_err(|e| {
         let _ = std::fs::remove_dir_all(&staging);
-        StoreError::Registry(format!(
-            "rename staging {} -> {}: {e}",
-            staging.display(),
-            new.display()
-        ))
+        classify_io_error(projects_base, "rename adopted registry into", &new, &e)
     })?;
     Ok(target_id)
 }
@@ -522,22 +507,41 @@ fn file_component(path: &Path) -> Result<&str> {
     })
 }
 
-fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst)
-        .map_err(|e| StoreError::Registry(format!("create dir {}: {e}", dst.display())))?;
-    let entries = std::fs::read_dir(src)
-        .map_err(|e| StoreError::Registry(format!("read dir {}: {e}", src.display())))?;
+fn classify_io_error(root: &Path, what: &str, path: &Path, e: &std::io::Error) -> StoreError {
+    if matches!(
+        e.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+    ) {
+        StoreError::ReadOnly(format!(
+            "state root {} is read-only ({what} {}: {e})",
+            root.display(),
+            path.display()
+        ))
+    } else {
+        StoreError::Registry(format!("{what} {}: {e}", path.display()))
+    }
+}
+
+#[must_use]
+pub fn readonly_root_error(root: &Path) -> StoreError {
+    StoreError::ReadOnly(format!(
+        "state root {} is read-only: a frozen sync cannot write here",
+        root.display()
+    ))
+}
+
+fn copy_tree(root: &Path, src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst).map_err(|e| classify_io_error(root, "create dir", dst, &e))?;
+    let entries =
+        std::fs::read_dir(src).map_err(|e| classify_io_error(root, "read dir", src, &e))?;
     for entry in entries {
-        let entry = entry
-            .map_err(|e| StoreError::Registry(format!("read entry in {}: {e}", src.display())))?;
+        let entry = entry.map_err(|e| classify_io_error(root, "read entry in", src, &e))?;
         let from = entry.path();
         let to = dst.join(entry.file_name());
         if entry.file_type().is_ok_and(|t| t.is_dir()) {
-            copy_tree(&from, &to)?;
+            copy_tree(root, &from, &to)?;
         } else {
-            std::fs::copy(&from, &to).map_err(|e| {
-                StoreError::Registry(format!("copy {} -> {}: {e}", from.display(), to.display()))
-            })?;
+            std::fs::copy(&from, &to).map_err(|e| classify_io_error(root, "copy", &from, &e))?;
         }
     }
     Ok(())
@@ -752,10 +756,7 @@ impl<'a> FrozenReadOnlyRegistry<'a> {
     }
 
     fn refuse(&self) -> StoreError {
-        StoreError::ReadOnly(format!(
-            "state root {} is read-only: a frozen sync cannot write here",
-            self.root.display()
-        ))
+        readonly_root_error(&self.root)
     }
 }
 

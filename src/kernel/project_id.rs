@@ -62,7 +62,7 @@ impl ProjectId {
     /// Persist this identity to `root/.phora-id` atomically (temp + rename).
     pub fn write_identity_file(&self, root: &Path) -> Result<()> {
         let path = root.join(IDENTITY_FILE);
-        let tmp = root.join(concat!(".phora-id", ".tmp"));
+        let tmp = root.join(format!("{IDENTITY_FILE}.tmp"));
         {
             let mut file = std::fs::File::create(&tmp)?;
             file.write_all(self.0.as_bytes())?;
