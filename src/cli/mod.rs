@@ -37,8 +37,7 @@ pub use config_edit::remove_source;
 pub use query::{
     ArtifactStatus, CheckMatchReport, SourceResolution, SourceRow, SourceSummary, TargetDetail,
     TargetListing, TargetRow, WhereFilter, WhereMatch, check_match_cmd, list_statuses,
-    source_listing, source_summary, target_detail, target_has_deployed_artifacts, target_listing,
-    targets_receiving, where_cmd,
+    source_listing, source_summary, target_detail, target_listing, targets_receiving, where_cmd,
 };
 pub use sync::{load_locks, write_locks};
 

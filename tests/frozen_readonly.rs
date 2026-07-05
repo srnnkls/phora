@@ -298,6 +298,29 @@ fn frozen_sync_without_identity_or_registry_on_readonly_root_fails_early() {
 }
 
 #[test]
+fn frozen_adoption_of_legacy_registry_on_readonly_root_fails_naming_root() {
+    let fixture = build_fixture();
+    deploy_clean(&fixture);
+
+    let base = phora_state_base(&fixture);
+    let projects = base.join("projects");
+    let current = registry_dir(&fixture);
+    let legacy = projects.join(
+        ProjectId::for_path(fixture.cwd.path())
+            .expect("legacy path-hash id")
+            .as_str(),
+    );
+    std::fs::rename(&current, &legacy).expect("relocate registry to legacy path-hash key");
+    std::fs::remove_file(fixture.cwd.path().join(".phora-id")).expect("drop .phora-id");
+
+    let _readonly = ReadOnlyTree::lock(&base);
+
+    let out = run(&fixture, &["sync", "--frozen"]);
+
+    assert_frozen_fails_naming_root(&out, &base);
+}
+
+#[test]
 fn frozen_sync_with_pending_deploy_on_readonly_root_fails_early() {
     let fixture = build_fixture();
     deploy_clean(&fixture);

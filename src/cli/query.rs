@@ -867,16 +867,6 @@ pub fn target_detail(config: &Config, registry: &dyn Registry, name: &str) -> Re
     })
 }
 
-/// Whether the registry still holds deployed records for `target` — the warning
-/// predicate for `phora target rm`.
-///
-/// # Errors
-///
-/// Returns an error if the registry cannot be read.
-pub fn target_has_deployed_artifacts(registry: &dyn Registry, target: &str) -> Result<bool> {
-    Ok(!registry.list_target(target)?.is_empty())
-}
-
 /// Registry-driven `phora list`: per target, the status of every managed artifact,
 /// computed via [`check_artifact_state`](crate::deploy::check_artifact_state).
 ///

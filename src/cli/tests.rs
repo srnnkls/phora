@@ -4713,24 +4713,6 @@ fn target_detail_unknown_name_errors() {
     );
 }
 
-#[test]
-fn target_has_deployed_artifacts_is_true_when_records_exist() {
-    let (_dir, reg) = seeded_registry();
-    assert!(
-        target_has_deployed_artifacts(&reg, "nvim").expect("predicate reads the registry"),
-        "a target with registry records must report having deployed artifacts (warning path)"
-    );
-}
-
-#[test]
-fn target_has_deployed_artifacts_is_false_for_clean_target() {
-    let (_dir, reg) = seeded_registry();
-    assert!(
-        !target_has_deployed_artifacts(&reg, "never-deployed").expect("predicate reads registry"),
-        "a target with no registry records must report no deployed artifacts (no warning)"
-    );
-}
-
 // CLI-005: add/rm sugar — clap surface + atomic desugar (pure helper).
 
 #[test]
