@@ -81,6 +81,9 @@ pub(super) fn run_sync(
     };
     let lockless = guard.is_none();
     let _guard = guard;
+    if !lockless && let Some(advisory) = registry.lock_advisory() {
+        eprintln!("{advisory}");
+    }
     let interactive = std::io::stdin().is_terminal();
     let resolver = TtyResolver;
 
