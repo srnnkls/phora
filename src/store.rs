@@ -13,6 +13,9 @@ pub enum StoreError {
 
     #[error("lock error: {0}")]
     Lock(String),
+
+    #[error("{0}")]
+    ReadOnly(String),
 }
 
 type Result<T> = std::result::Result<T, StoreError>;
@@ -163,6 +166,21 @@ pub trait Registry {
 
     /// Directory holding the deploy journal and `state.lock`.
     fn locks_dir(&self) -> PathBuf;
+
+    /// Whether this registry refuses writes — a frozen sync's read-only wrapper. Default: writable.
+    fn refuses_writes(&self) -> bool {
+        false
+    }
+
+    /// The read-only pending-work error naming the state root; meaningful only when
+    /// [`refuses_writes`](Self::refuses_writes) holds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called on a writable registry — callers gate it on `refuses_writes`.
+    fn readonly_error(&self) -> StoreError {
+        unreachable!("readonly_error called on a writable registry")
+    }
 }
 
 /// `(target, source, artifact)` keys ejected across every target `records` span — lets readers tell a kept-but-ejected record from a managed one.
@@ -301,19 +319,20 @@ impl FileRegistry {
 
     pub fn lock_exclusive(&self) -> Result<StateLockGuard> {
         let locks_dir = self.state_root.join("locks");
-        std::fs::create_dir_all(&locks_dir).map_err(|e| {
-            StoreError::Registry(format!("create locks dir {}: {e}", locks_dir.display()))
-        })?;
+        if let Err(e) = std::fs::create_dir_all(&locks_dir) {
+            return Err(self.lock_io_error("create locks dir", &locks_dir, &e));
+        }
         let lock_path = locks_dir.join("state.lock");
-        let file = std::fs::OpenOptions::new()
+        let file = match std::fs::OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .truncate(false)
             .open(&lock_path)
-            .map_err(|e| {
-                StoreError::Registry(format!("open lock file {}: {e}", lock_path.display()))
-            })?;
+        {
+            Ok(file) => file,
+            Err(e) => return Err(self.lock_io_error("open lock file", &lock_path, &e)),
+        };
         match file.try_lock() {
             Ok(()) => Ok(StateLockGuard { _file: file }),
             Err(std::fs::TryLockError::WouldBlock) => Err(StoreError::Lock(
@@ -323,6 +342,21 @@ impl FileRegistry {
                 "acquire lock on {}: {e}",
                 lock_path.display()
             ))),
+        }
+    }
+
+    fn lock_io_error(&self, what: &str, path: &Path, e: &std::io::Error) -> StoreError {
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+        ) {
+            StoreError::ReadOnly(format!(
+                "state root {} is read-only ({what} {}: {e})",
+                self.state_root.display(),
+                path.display()
+            ))
+        } else {
+            StoreError::Registry(format!("{what} {}: {e}", path.display()))
         }
     }
 }
@@ -600,6 +634,87 @@ impl Registry for FileRegistry {
 
     fn locks_dir(&self) -> PathBuf {
         self.state_root.join("locks")
+    }
+}
+
+/// Delegates every read to `inner` but refuses writes, naming the root: a frozen sync
+/// plans against a read-only state root, so any write it reaches is pending work
+/// surfaced as `ReadOnly` rather than a raw permission error.
+pub struct FrozenReadOnlyRegistry<'a> {
+    inner: &'a dyn Registry,
+    root: PathBuf,
+}
+
+impl<'a> FrozenReadOnlyRegistry<'a> {
+    #[must_use]
+    pub fn new(inner: &'a dyn Registry) -> Self {
+        let root = inner
+            .locks_dir()
+            .parent()
+            .map_or_else(|| inner.locks_dir(), Path::to_path_buf);
+        Self { inner, root }
+    }
+
+    fn refuse(&self) -> StoreError {
+        StoreError::ReadOnly(format!(
+            "state root {} is read-only: a frozen sync cannot write here",
+            self.root.display()
+        ))
+    }
+}
+
+impl Registry for FrozenReadOnlyRegistry<'_> {
+    fn get(&self, key: &ArtifactKey) -> Result<Option<RegistryRecord>> {
+        self.inner.get(key)
+    }
+
+    fn put(&self, _record: &RegistryRecord) -> Result<()> {
+        Err(self.refuse())
+    }
+
+    fn remove(&self, _key: &ArtifactKey) -> Result<()> {
+        Err(self.refuse())
+    }
+
+    fn list_target(&self, target: &str) -> Result<Vec<RegistryRecord>> {
+        self.inner.list_target(target)
+    }
+
+    fn list_all(&self) -> Result<Vec<RegistryRecord>> {
+        self.inner.list_all()
+    }
+
+    fn load_ejected(&self, target: &str) -> Result<Vec<EjectedEntry>> {
+        self.inner.load_ejected(target)
+    }
+
+    fn save_ejected(&self, _target: &str, _ejected: &[EjectedEntry]) -> Result<()> {
+        Err(self.refuse())
+    }
+
+    fn load_hook_state(&self, target: &str) -> Result<Vec<HookState>> {
+        self.inner.load_hook_state(target)
+    }
+
+    fn record_hook_success(
+        &self,
+        _target: &str,
+        _hook_id: &str,
+        _digest_set: &std::collections::BTreeSet<String>,
+    ) -> Result<()> {
+        Err(self.refuse())
+    }
+
+    fn locks_dir(&self) -> PathBuf {
+        self.inner.locks_dir()
+    }
+
+    fn refuses_writes(&self) -> bool {
+        true
+    }
+
+    fn readonly_error(&self) -> StoreError {
+        self.refuse()
     }
 }
 

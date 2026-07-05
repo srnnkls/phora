@@ -314,6 +314,7 @@ fn input<'a>(
         no_hooks: false,
         no_transitive_hooks: false,
         frozen: false,
+        lockless: false,
         fast_forward: false,
         resolver: None,
         jobs: None,
@@ -2661,6 +2662,165 @@ fn seed_orphan(
     dst
 }
 
+fn frozen_lockless_input(base: &Config, base_lock: Option<Lock>, prune: bool) -> SyncInput<'_> {
+    SyncInput {
+        base_config: base,
+        local_config: None,
+        base_lock,
+        local_lock: None,
+        force: false,
+        interactive: false,
+        prune,
+        no_hooks: false,
+        no_transitive_hooks: false,
+        frozen: true,
+        lockless: true,
+        fast_forward: false,
+        resolver: None,
+        jobs: None,
+    }
+}
+
+#[test]
+fn frozen_lockless_prune_with_a_pending_orphan_refuses_before_deleting_files() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let cfg =
+        config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+
+    let first = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("initial writable sync deploys editor cleanly");
+    assert!(!first.had_failures, "premise: the initial deploy is clean");
+
+    let orphan_dst = seed_orphan(&td, &fx.registry, &flat_layout());
+    assert!(
+        orphan_dst.exists(),
+        "premise: the orphan's files are on disk before the frozen run"
+    );
+
+    let result = sync(
+        &frozen_lockless_input(&cfg, Some(first.base_lock.clone()), true),
+        &fx.backend,
+        &fx.registry,
+    );
+    let Err(err) = result else {
+        panic!("a frozen lockless --prune with a pending orphan must fail early, not delete");
+    };
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&fx.registry.state_root().display().to_string())
+            && msg.to_lowercase().contains("read-only"),
+        "the refusal must name the read-only state root, got: {msg}"
+    );
+    assert!(
+        orphan_dst.exists(),
+        "zero mutation: the orphan's files must survive a refused frozen prune"
+    );
+    assert!(
+        fx.registry
+            .get(&artifact_key("dest", "gone-src", "obsolete"))
+            .expect("get orphan record")
+            .is_some(),
+        "the orphan's registry record must remain — nothing was pruned"
+    );
+}
+
+#[test]
+fn frozen_lockless_fast_forward_with_pending_drops_refuses_before_pruning() {
+    let fx = build_sync_fixture();
+    let readonly = crate::store::FrozenReadOnlyRegistry::new(&fx.registry);
+    let cwd = TempDir::new().expect("cwd tempdir");
+    let protected = test_protected(cwd.path());
+    let cfg = Config::parse("version = 1\n").expect("empty config parses");
+    let drops = vec![RegistryRecord {
+        version: 1,
+        key: artifact_key("dest", "gone-src", "obsolete"),
+        source: "gone-src".to_owned(),
+        commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
+        digest: "blake3:drop".to_owned(),
+        projected_at: "2026-01-01T00:00:00Z".to_owned(),
+        layout: "flat".to_owned(),
+        kind: RecordKind::Dir,
+        allow_symlinks: false,
+        preserve_executable: true,
+        files: vec![],
+        linked: false,
+        vars_digest: None,
+        deploy_root: None,
+        layout_separator: None,
+    }];
+
+    let err = prune_fast_forward_drops(
+        &cfg,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &fx.backend,
+        &BTreeMap::new(),
+        &readonly,
+        &protected,
+        &drops,
+    )
+    .expect_err("a read-only fast-forward carrying pending drops must refuse before any delete");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&fx.registry.state_root().display().to_string())
+            && msg.to_lowercase().contains("read-only"),
+        "the refusal must name the read-only state root, got: {msg}"
+    );
+}
+
+#[test]
+fn frozen_lockless_sync_refuses_a_would_fire_on_change_hook_before_spawning_it() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let log = td.parent_path.join("hook.log");
+
+    let plain =
+        config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+    let first = sync(
+        &input(&plain, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("initial writable sync deploys editor without any hook");
+    assert!(
+        !first.had_failures,
+        "premise: clean deploy, no hook recorded"
+    );
+
+    let hooked = config_with_target_hooks(
+        &fx.url,
+        &td.target_path(),
+        &format!("\"{}\"", append_cmd(&log, "fired").replace('"', "\\\"")),
+    );
+
+    let result = sync(
+        &frozen_lockless_input(&hooked, Some(first.base_lock.clone()), false),
+        &fx.backend,
+        &fx.registry,
+    );
+    let Err(err) = result else {
+        panic!("a frozen lockless sync must refuse a would-fire on_change hook, not spawn it");
+    };
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&fx.registry.state_root().display().to_string())
+            && msg.to_lowercase().contains("read-only"),
+        "the refusal must name the read-only state root, got: {msg}"
+    );
+    assert!(
+        log_lines(&log).is_empty(),
+        "zero side effects: the on_change hook must NOT run before the write is refused"
+    );
+}
+
 #[test]
 fn sync_with_prune_removes_orphan_files_and_record_but_keeps_current() {
     let fx = build_sync_fixture();
@@ -2681,6 +2841,7 @@ fn sync_with_prune_removes_orphan_files_and_record_but_keeps_current() {
         no_hooks: false,
         no_transitive_hooks: false,
         frozen: false,
+        lockless: false,
         fast_forward: false,
         resolver: None,
         jobs: None,
@@ -2755,6 +2916,7 @@ fn sync_skips_prune_when_a_deploy_failed() {
         no_hooks: false,
         no_transitive_hooks: false,
         frozen: false,
+        lockless: false,
         fast_forward: false,
         resolver: None,
         jobs: None,
@@ -2830,6 +2992,7 @@ fn prune_keeps_record_when_orphan_path_overlaps_a_live_dest() {
         no_hooks: false,
         no_transitive_hooks: false,
         frozen: false,
+        lockless: false,
         fast_forward: false,
         resolver: None,
         jobs: None,
@@ -2873,6 +3036,7 @@ fn prune_drops_record_when_orphan_path_is_already_absent() {
         no_hooks: false,
         no_transitive_hooks: false,
         frozen: false,
+        lockless: false,
         fast_forward: false,
         resolver: None,
         jobs: None,
@@ -2911,6 +3075,7 @@ fn prune_deletes_file_and_drops_record_for_a_normal_orphan() {
         no_hooks: false,
         no_transitive_hooks: false,
         frozen: false,
+        lockless: false,
         fast_forward: false,
         resolver: None,
         jobs: None,
@@ -3123,6 +3288,7 @@ fn interactive_input<'a>(
         no_hooks: false,
         no_transitive_hooks: false,
         frozen: false,
+        lockless: false,
         fast_forward: false,
         resolver: Some(resolver),
         jobs: None,
@@ -9698,6 +9864,7 @@ fn prune_only_sync_skips_on_change_but_runs_post_sync() {
         no_hooks: false,
         no_transitive_hooks: false,
         frozen: false,
+        lockless: false,
         fast_forward: false,
         resolver: None,
         jobs: None,
@@ -10302,6 +10469,7 @@ fn input_with_jobs(base: &Config, jobs: usize) -> SyncInput<'_> {
         no_hooks: false,
         no_transitive_hooks: false,
         frozen: false,
+        lockless: false,
         fast_forward: false,
         resolver: None,
         jobs: Some(jobs),

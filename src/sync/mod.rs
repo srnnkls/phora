@@ -77,6 +77,9 @@ pub struct SyncInput<'a> {
     pub no_transitive_hooks: bool,
     /// Refuse to fetch or re-resolve: a source absent from or drifted in the lock hard-errors.
     pub frozen: bool,
+    /// Proceed without the project lock because the state root is read-only (frozen only).
+    /// Legal only when the sync is write-free; any pending write is refused, naming the root.
+    pub lockless: bool,
     /// Follow a moved pin: delete an artifact the new commit dropped rather than sealing; a same-commit narrowing still hard-errors.
     pub fast_forward: bool,
     pub resolver: Option<&'a dyn ConflictResolver>,
@@ -387,6 +390,50 @@ fn effective_lock(input: &SyncInput<'_>) -> Option<Lock> {
     }
 }
 
+fn open_sync_journal(lockless: bool, registry: &dyn Registry) -> Result<Journal> {
+    if lockless {
+        Ok(Journal::open_readonly(&registry.locks_dir()))
+    } else {
+        Journal::open(&registry.locks_dir())
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "threads the resolution maps needed to seal or delete a moved-pin drop"
+)]
+fn apply_fast_forward_drops(
+    config: &Config,
+    parsed: &BTreeMap<String, ParsedSource>,
+    remotes: &BTreeMap<String, String>,
+    backend: &(dyn SourceBackend + Sync),
+    resolved_commits: &BTreeMap<(String, String), String>,
+    recorded: &[RegistryRecord],
+    registry: &dyn Registry,
+    protected: &confine::ProtectedPathSet,
+    fast_forward: bool,
+) -> Result<()> {
+    let drops = validate_sealed_offer(
+        config,
+        parsed,
+        remotes,
+        backend,
+        resolved_commits,
+        recorded,
+        fast_forward,
+    )?;
+    prune_fast_forward_drops(
+        config,
+        parsed,
+        remotes,
+        backend,
+        resolved_commits,
+        registry,
+        protected,
+        &drops,
+    )
+}
+
 pub fn sync(
     input: &SyncInput<'_>,
     backend: &(dyn SourceBackend + Sync),
@@ -416,7 +463,14 @@ pub fn sync(
         .map(|lc| lc.sources.keys().cloned().collect())
         .unwrap_or_default();
 
-    let journal = Journal::open(&registry.locks_dir())?;
+    let readonly_registry;
+    let registry: &dyn Registry = if input.lockless {
+        readonly_registry = crate::store::FrozenReadOnlyRegistry::new(registry);
+        &readonly_registry
+    } else {
+        registry
+    };
+    let journal = open_sync_journal(input.lockless, registry)?;
     let cwd = std::env::current_dir()
         .map_err(|e| Error::Sync(format!("resolve current dir for confinement: {e}")))?;
     let protected = confine::ProtectedPathSet::resolve(&effective_config.paths, &cwd)?;
@@ -449,24 +503,16 @@ pub fn sync(
         effective_lock.as_ref(),
         &resolved_commits,
     );
-    let fast_forward_drops = validate_sealed_offer(
+    apply_fast_forward_drops(
         &effective_config,
         &parsed,
         &remotes,
         backend,
         &resolved_commits,
         &recorded_after_recovery,
-        input.fast_forward,
-    )?;
-    prune_fast_forward_drops(
-        &effective_config,
-        &parsed,
-        &remotes,
-        backend,
-        &resolved_commits,
         registry,
         &protected,
-        &fast_forward_drops,
+        input.fast_forward,
     )?;
 
     // pre_sync gates the run: a failure aborts before deploy, leaving zero files deployed.
@@ -743,6 +789,9 @@ fn prune_fast_forward_drops(
 ) -> Result<()> {
     if drops.is_empty() {
         return Ok(());
+    }
+    if registry.refuses_writes() {
+        return Err(registry.readonly_error().into());
     }
     let expected_paths =
         prune::expected_live_paths(config, parsed, remotes, backend, resolved_commits)?;

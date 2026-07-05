@@ -231,6 +231,14 @@ pub(super) fn deploy_artifact_entry(
 
     let conflict_kind = conflict_kind_for(&state, entry, run.force);
 
+    // A read-only frozen sync is legal only as a no-op: anything but a silent clean skip is
+    // pending work, refused before staging. (A Revalidated skip still writes; the read-only
+    // registry refuses that put.)
+    let clean_skip = conflict_kind.is_none() && !entry.mode_transition && skips_redeploy(&state);
+    if journal.refuses_writes() && !clean_skip {
+        return Err(journal.readonly_error());
+    }
+
     let deploy_root = run.target.deploy_root();
     let deploy = |key: ArtifactKey| match entry.source.deploy_mode() {
         DeployMode::Link => deploy_link(registry, journal, entry, key, deploy_root.clone()),
