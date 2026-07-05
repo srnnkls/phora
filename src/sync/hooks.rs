@@ -62,6 +62,9 @@ pub(super) fn dispatch_hooks(config: &Config, registry: &dyn Registry) -> Result
             if changed.is_empty() {
                 continue;
             }
+            if registry.refuses_writes() {
+                return Err(registry.readonly_error().into());
+            }
 
             let names = changed_names(&changed);
             let paths = changed_paths(&changed, &target_path, &layout);

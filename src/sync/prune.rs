@@ -130,6 +130,25 @@ pub(super) fn expected_live_paths(
     Ok(expected_paths)
 }
 
+fn refuse_readonly_prune(
+    registry: &dyn Registry,
+    records: &[RegistryRecord],
+    expected: &ExpectedByBinding,
+) -> Result<()> {
+    let has_pending = records.iter().any(|record| {
+        !is_still_expected(
+            expected,
+            &record.key.target,
+            &record.key.source,
+            &record.key.artifact,
+        )
+    });
+    if registry.refuses_writes() && has_pending {
+        return Err(registry.readonly_error().into());
+    }
+    Ok(())
+}
+
 pub(super) fn prune_orphans(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
@@ -164,7 +183,10 @@ pub(super) fn prune_orphans(
         }
     }
 
-    for record in registry.list_all()? {
+    let records = registry.list_all()?;
+    refuse_readonly_prune(registry, &records, &expected)?;
+
+    for record in records {
         if is_still_expected(
             &expected,
             &record.key.target,

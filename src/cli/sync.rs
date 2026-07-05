@@ -8,7 +8,7 @@ use crate::error::{Error, Result};
 use crate::kernel::ProjectId;
 use crate::lock::{Lock, merge_locks};
 use crate::paths::{cache_root_for, state_root_for};
-use crate::store::FileRegistry;
+use crate::store::{FileRegistry, StoreError};
 use crate::sync::{ConflictResolver, SyncInput, SyncOutput, sync};
 
 use super::{
@@ -73,7 +73,14 @@ pub(super) fn run_sync(
     let cache_git = cache_root_for(effective.paths.cache.as_deref(), &cwd)?.join("git");
     let backend = build_router(&effective, cache_git)?;
     let registry = open_sync_registry(&cwd, &effective)?;
-    let _guard = registry.lock_exclusive()?;
+    // Only a read-only root under --frozen falls back lockless; contention (exit 75) still propagates.
+    let guard = match registry.lock_exclusive() {
+        Ok(guard) => Some(guard),
+        Err(StoreError::ReadOnly(_)) if frozen => None,
+        Err(e) => return Err(e.into()),
+    };
+    let lockless = guard.is_none();
+    let _guard = guard;
     let interactive = std::io::stdin().is_terminal();
     let resolver = TtyResolver;
 
@@ -89,6 +96,7 @@ pub(super) fn run_sync(
             no_hooks,
             no_transitive_hooks,
             frozen,
+            lockless,
             fast_forward,
             resolver: interactive.then_some(&resolver as &dyn ConflictResolver),
             jobs,

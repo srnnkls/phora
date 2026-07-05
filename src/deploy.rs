@@ -404,6 +404,12 @@ pub fn copy_tree(src: &Path, dst: &Path, allow_symlinks: bool) -> Result<()> {
 /// Write-ahead journal of in-flight swaps, persisted under a `locks/` dir.
 pub struct Journal {
     path: PathBuf,
+    mode: JournalMode,
+}
+
+enum JournalMode {
+    Writable,
+    ReadOnly { root: PathBuf },
 }
 
 /// One intent record: enough to replay or roll back a single artifact swap.
@@ -431,7 +437,43 @@ impl Journal {
         })?;
         Ok(Self {
             path: locks_dir.join("journal.toml"),
+            mode: JournalMode::Writable,
         })
+    }
+
+    /// A frozen sync's read-only journal: never creates `locks_dir`, replays existing
+    /// entries, and refuses any write, naming the state root instead of raising EACCES.
+    #[must_use]
+    pub fn open_readonly(locks_dir: &Path) -> Self {
+        let root = locks_dir
+            .parent()
+            .map_or_else(|| locks_dir.to_path_buf(), Path::to_path_buf);
+        Self {
+            path: locks_dir.join("journal.toml"),
+            mode: JournalMode::ReadOnly { root },
+        }
+    }
+
+    #[must_use]
+    pub fn refuses_writes(&self) -> bool {
+        matches!(self.mode, JournalMode::ReadOnly { .. })
+    }
+
+    /// The read-only pending-work error naming the state root; meaningful only when
+    /// [`refuses_writes`](Self::refuses_writes) holds.
+    #[must_use]
+    pub fn readonly_error(&self) -> Error {
+        match &self.mode {
+            JournalMode::ReadOnly { root } => {
+                Error::StoreCtx(crate::store::StoreError::ReadOnly(format!(
+                    "state root {} is read-only: a frozen sync cannot write here",
+                    root.display()
+                )))
+            }
+            JournalMode::Writable => {
+                unreachable!("readonly_error called on a writable journal")
+            }
+        }
     }
 
     fn load(&self) -> Result<JournalFile> {
@@ -448,6 +490,9 @@ impl Journal {
     }
 
     fn persist(&self, file: &JournalFile) -> Result<()> {
+        if self.refuses_writes() {
+            return Err(self.readonly_error());
+        }
         let serialized = toml::to_string(file)
             .map_err(|e| Error::Projection(format!("serialize journal: {e}")))?;
         let tmp = self.path.with_extension("toml.tmp");
@@ -779,7 +824,11 @@ pub fn recovery_sweep(
     journal: &Journal,
     registry: &dyn Registry,
 ) -> Result<()> {
-    for entry in journal.entries()? {
+    let entries = journal.entries()?;
+    if journal.refuses_writes() && !entries.is_empty() {
+        return Err(journal.readonly_error());
+    }
+    for entry in entries {
         if entry.swap_completed {
             registry.put(&entry.record)?;
         } else {
@@ -2574,6 +2623,38 @@ mod tests {
                 .expect("read journal after sweep")
                 .is_empty(),
             "the journal entry for the discarded incomplete swap must be cleared after the sweep"
+        );
+    }
+
+    #[test]
+    fn frozen_recovery_sweep_with_a_pending_entry_refuses_before_discarding_staging() {
+        let (_state_dir, reg) = registry();
+        let parent = TempDir::new().expect("target parent");
+        let dst = parent.path().join("vscode");
+        let files: &[(&str, &[u8])] = &[("a.json", b"NEW")];
+        let base = staging_base(parent.path());
+        let staging = make_staging(&base, files);
+        let record = record_for(&staging, files);
+
+        journal_for(&reg)
+            .append(&entry(&base, &staging, &dst, &record, false))
+            .expect("seed a crashed-swap intent through a writable journal");
+
+        let readonly = Journal::open_readonly(&reg.state_root().join("locks"));
+        let err = recovery_sweep(parent.path(), &readonly, &reg).expect_err(
+            "a frozen recovery sweep with a pending journal entry must refuse before mutating",
+        );
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&reg.state_root().display().to_string())
+                && msg.to_lowercase().contains("read-only"),
+            "the refusal must name the read-only state root, got: {msg}"
+        );
+        assert!(
+            staging.exists(),
+            "the sweep must fail BEFORE discarding the pending swap's staging dir — a read-only \
+             frozen sync performs zero mutation when there is pending recovery work"
         );
     }
 
