@@ -83,10 +83,6 @@ fn build_fixture() -> Fixture {
         target = target_path.display(),
     );
     write(&cwd.path().join("phora.toml"), config.as_bytes());
-    write(
-        &cwd.path().join(".phora-id"),
-        b"00000000-0000-4000-8000-000000000001\n",
-    );
 
     Fixture {
         _home: home,
@@ -112,7 +108,7 @@ fn run(fixture: &Fixture, args: &[&str]) -> Output {
 }
 
 fn state_root(fixture: &Fixture) -> PathBuf {
-    let project = ProjectId::resolve(fixture.cwd.path()).expect("project id");
+    let project = ProjectId::for_path(fixture.cwd.path()).expect("project id");
     fixture
         .xdg_state
         .join("phora")

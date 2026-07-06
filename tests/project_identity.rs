@@ -1,6 +1,5 @@
-//! CLIFF-PROJID-003: per-clone `.phora-id` identity survives relocation, keeps
-//! clones isolated, and adopts a legacy path-hash registry (idempotent,
-//! interruption-safe, marker inside the old directory — never replacing it).
+//! CLIFF-PROJID-003: registry identity is a path hash — sync writes nothing into
+//! the project tree beyond `phora.toml`/`phora.lock` and never touches git.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -9,8 +8,6 @@ use phora::kernel::ProjectId;
 use tempfile::TempDir;
 
 mod common;
-
-const PHORA_ID_FILE: &str = ".phora-id";
 
 struct Fixture {
     _home: TempDir,
@@ -160,88 +157,82 @@ fn has_records(registry_dir: &Path) -> bool {
     any_toml(&registry_dir.join("targets"))
 }
 
-/// Top-level regular files directly inside `dir` (the adoption marker lands here).
-fn top_level_files(dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    entries
-        .map(|e| e.expect("entry").path())
-        .filter(|p| p.is_file())
-        .collect()
+/// Names of every entry directly inside the project working tree.
+fn project_entries(project: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(project)
+        .expect("read project dir")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
 }
 
-// ── generation ────────────────────────────────────────────────────
+// ── no pollution ──────────────────────────────────────────────────
 
-/// First sync must materialize the per-clone identity file next to `phora.toml`.
+/// Sync must leave the project tree holding only `phora.toml` and `phora.lock` —
+/// no `.phora-id`, no adoption marker, no other phora-owned dotfile.
 #[test]
-fn first_sync_writes_phora_id_next_to_config() {
+fn sync_leaves_only_config_and_lock_in_the_project_tree() {
     let fx = build_fixture();
 
-    let out = run(&fx, &fx.project, &["sync"]);
-    assert_sync_ok(&out, "first sync");
+    assert_sync_ok(&run(&fx, &fx.project, &["sync"]), "sync");
 
-    let id_path = fx.project.join(PHORA_ID_FILE);
-    assert!(
-        id_path.is_file(),
-        "first `phora sync` must generate a per-clone `.phora-id` beside phora.toml at {}",
-        id_path.display(),
-    );
-    let id = std::fs::read_to_string(&id_path).expect("read .phora-id");
-    assert!(
-        !id.trim().is_empty(),
-        "`.phora-id` must hold a non-empty per-clone identity (UUID v4), got {id:?}"
+    assert_eq!(
+        project_entries(&fx.project),
+        vec!["phora.lock".to_owned(), "phora.toml".to_owned()],
+        "sync must not write any file into the project tree beyond phora.toml and phora.lock"
     );
 }
 
-// ── relocation (INV-3) ────────────────────────────────────────────
+// ── no git mutation ───────────────────────────────────────────────
 
-/// A synced project that is renamed on disk keeps its registry via the
-/// travelling `.phora-id`: the second sync at the new path reuses the single
-/// existing registry rather than hashing the new path into a fresh, empty one.
+/// Sync inside a git repo must not touch `.git/info/exclude` or the shared
+/// `.gitignore` — phora never edits the user's git state.
 #[test]
-fn moved_project_keeps_single_registry_via_phora_id() {
+fn sync_never_writes_into_git_or_gitignore() {
+    let fx = build_fixture();
+    git(&fx.project, &["init", "-b", "main", "."]);
+
+    let exclude = fx.project.join(".git").join("info").join("exclude");
+    let before = std::fs::read_to_string(&exclude).unwrap_or_default();
+
+    assert_sync_ok(&run(&fx, &fx.project, &["sync"]), "sync in git repo");
+
+    let after = std::fs::read_to_string(&exclude).unwrap_or_default();
+    assert_eq!(
+        before, after,
+        "sync must leave .git/info/exclude byte-for-byte unchanged, got:\n{after}"
+    );
+    assert!(
+        !fx.project.join(".gitignore").exists(),
+        "sync must never create the shared .gitignore"
+    );
+}
+
+// ── path-hash identity ────────────────────────────────────────────
+
+/// First sync creates exactly one registry, keyed by the path hash.
+#[test]
+fn first_sync_creates_one_path_hash_registry() {
     let fx = build_fixture();
 
-    assert_sync_ok(&run(&fx, &fx.project, &["sync"]), "sync before move");
+    assert_sync_ok(&run(&fx, &fx.project, &["sync"]), "first sync");
+
+    let expected = projects_base(&fx).join(
+        ProjectId::for_path(&fx.project)
+            .expect("path-hash id")
+            .as_str(),
+    );
     assert_eq!(
-        project_dirs(&fx).len(),
-        1,
-        "premise: the first sync creates exactly one registry directory"
-    );
-
-    let moved = fx.project.parent().expect("parent").join("proj-renamed");
-    std::fs::rename(&fx.project, &moved).expect("rename project directory");
-
-    assert!(
-        moved.join(PHORA_ID_FILE).is_file(),
-        "the `.phora-id` must travel with the directory (it lives beside phora.toml)"
-    );
-
-    let out = run(&fx, &moved, &["sync"]);
-    assert_sync_ok(&out, "sync after move");
-
-    let dirs = project_dirs(&fx);
-    assert_eq!(
-        dirs.len(),
-        1,
-        "moving the project must NOT spawn a second path-hash registry — the identity \
-         file keeps it stable; found {dirs:?}"
-    );
-    assert!(
-        has_records(&dirs[0]),
-        "prior deployments must remain in the single adopted registry (recognized as \
-         phora-owned, not reclassified Foreign into an empty second registry)"
+        project_dirs(&fx),
+        vec![expected],
+        "first sync must create exactly the path-hash-keyed registry"
     );
 }
 
-// ── clone isolation (INV-3) ───────────────────────────────────────
-
-/// Two independent clones of the same repo on one machine each get their own
-/// `.phora-id`, so their registries stay isolated (a committed identity would
-/// collapse both onto one — the rejected design).
+/// Two clones at distinct paths hash to distinct registries — no cross-contamination.
 #[test]
-fn two_clones_get_distinct_phora_ids() {
+fn two_clones_get_isolated_registries() {
     let fx = build_fixture();
 
     let clone_b = fx.project.parent().expect("parent").join("clone-b");
@@ -251,211 +242,43 @@ fn two_clones_get_distinct_phora_ids() {
     assert_sync_ok(&run(&fx, &fx.project, &["sync"]), "sync clone a");
     assert_sync_ok(&run(&fx, &clone_b, &["sync"]), "sync clone b");
 
-    let id_a = std::fs::read_to_string(fx.project.join(PHORA_ID_FILE))
-        .expect("clone a must have a .phora-id");
-    let id_b = std::fs::read_to_string(clone_b.join(PHORA_ID_FILE))
-        .expect("clone b must have a .phora-id");
-
-    assert_ne!(
-        id_a.trim(),
-        id_b.trim(),
-        "each clone must generate a distinct per-clone identity so their registries \
-         never cross-contaminate"
-    );
     assert_eq!(
         project_dirs(&fx).len(),
         2,
-        "two clones must keep two isolated registries, one per identity"
+        "two clones at distinct paths must keep two isolated registries"
     );
 }
 
-// ── git-exclude wiring ────────────────────────────────────────────
+// ── relocation is a known rehash ──────────────────────────────────
 
-/// The identity file must be excluded per-clone via `.git/info/exclude`, never
-/// by editing the shared, committed `.gitignore`.
+/// The registry key is the path, so moving the project rehashes to a fresh
+/// registry at the new path and orphans the old one — its records are left
+/// behind, surfaced by orphan tooling and reclaimable by prune. This test pins
+/// the accepted tradeoff of path-hash identity.
 #[test]
-fn first_sync_excludes_phora_id_via_git_info_exclude_not_gitignore() {
-    let fx = build_fixture();
-    git(&fx.project, &["init", "-b", "main", "."]);
-
-    assert_sync_ok(&run(&fx, &fx.project, &["sync"]), "sync in git repo");
-
-    let exclude = fx.project.join(".git").join("info").join("exclude");
-    let exclude_body = std::fs::read_to_string(&exclude).expect("read .git/info/exclude");
-    assert!(
-        exclude_body.lines().any(|l| l.trim() == PHORA_ID_FILE),
-        "first sync must append `.phora-id` to .git/info/exclude, got:\n{exclude_body}"
-    );
-
-    let gitignore = fx.project.join(".gitignore");
-    let gitignore_body = std::fs::read_to_string(&gitignore).unwrap_or_default();
-    assert!(
-        !gitignore_body.contains(PHORA_ID_FILE),
-        "phora must never write `.phora-id` into the shared .gitignore, got:\n{gitignore_body}"
-    );
-}
-
-#[test]
-fn exclude_self_heals_on_a_later_sync_after_identity_file_exists() {
-    let fx = build_fixture();
-    git(&fx.project, &["init", "-b", "main", "."]);
-
-    assert_sync_ok(
-        &run(&fx, &fx.project, &["sync"]),
-        "first sync wires the exclude",
-    );
-    assert!(
-        fx.project.join(PHORA_ID_FILE).is_file(),
-        "premise: the first sync materializes .phora-id"
-    );
-    let exclude = fx.project.join(".git").join("info").join("exclude");
-    assert!(
-        std::fs::read_to_string(&exclude)
-            .unwrap_or_default()
-            .lines()
-            .any(|l| l.trim() == PHORA_ID_FILE),
-        "premise: the first sync appended the exclude entry"
-    );
-
-    std::fs::write(&exclude, b"").expect("empty the exclude, as a prior exclude failure would");
-
-    assert_sync_ok(
-        &run(&fx, &fx.project, &["sync"]),
-        "second sync self-heals the exclude",
-    );
-
-    let healed = std::fs::read_to_string(&exclude).expect("read .git/info/exclude");
-    assert!(
-        healed.lines().any(|l| l.trim() == PHORA_ID_FILE),
-        "a later sync must re-exclude .phora-id even though the identity file already exists — \
-         the exclude runs every sync so a prior failure self-heals, got:\n{healed}"
-    );
-}
-
-// ── adoption (INV-4) ──────────────────────────────────────────────
-
-/// A project whose only registry is a legacy path-hash one (no `.phora-id`)
-/// must, on the next sync, generate an identity and adopt that registry into an
-/// identity-keyed one — leaving a marker file INSIDE the old directory (never
-/// replacing the directory, which would ENOTDIR old binaries). Re-running is
-/// idempotent: no second adopted registry, no error.
-#[test]
-fn adoption_migrates_legacy_registry_leaves_marker_inside_old_dir_and_is_idempotent() {
+fn moved_project_rehashes_and_orphans_the_old_registry() {
     let fx = build_fixture();
 
-    assert_sync_ok(&run(&fx, &fx.project, &["sync"]), "seed sync");
-    let seeded = project_dirs(&fx);
-    assert_eq!(seeded.len(), 1, "premise: one registry after the seed sync");
-
-    let legacy_id = ProjectId::for_path(&fx.project).expect("path-hash id");
-    let legacy_dir = projects_base(&fx).join(legacy_id.as_str());
-    if seeded[0] != legacy_dir {
-        std::fs::rename(&seeded[0], &legacy_dir).expect("reshape into legacy path-hash registry");
-    }
-    let _ = std::fs::remove_file(fx.project.join(PHORA_ID_FILE));
-    assert!(
-        has_records(&legacy_dir),
-        "premise: the legacy path-hash registry holds records to adopt"
-    );
-    assert!(
-        top_level_files(&legacy_dir).is_empty(),
-        "premise: the legacy registry has no top-level marker file yet"
-    );
-
-    let out = run(&fx, &fx.project, &["sync"]);
-    assert_sync_ok(&out, "adoption sync");
-
-    assert!(
-        fx.project.join(PHORA_ID_FILE).is_file(),
-        "adoption must generate the missing `.phora-id`"
-    );
-
-    let adopted: Vec<PathBuf> = project_dirs(&fx)
-        .into_iter()
-        .filter(|d| *d != legacy_dir && has_records(d))
-        .collect();
+    assert_sync_ok(&run(&fx, &fx.project, &["sync"]), "sync before move");
+    let original = projects_base(&fx).join(ProjectId::for_path(&fx.project).expect("id").as_str());
     assert_eq!(
-        adopted.len(),
-        1,
-        "adoption must produce exactly one identity-keyed registry carrying the old \
-         records (via the path-hash fallback locating the legacy dir); found {adopted:?}"
+        project_dirs(&fx),
+        vec![original.clone()],
+        "premise: the first sync creates exactly the original path-hash registry"
     );
 
-    assert!(
-        legacy_dir.is_dir(),
-        "the old registry must remain a DIRECTORY after adoption — replacing it with a \
-         tombstone file would ENOTDIR concurrent old binaries"
-    );
-    assert!(
-        !top_level_files(&legacy_dir).is_empty(),
-        "adoption must drop a marker file INSIDE the old registry directory"
-    );
+    let moved = fx.project.parent().expect("parent").join("proj-renamed");
+    std::fs::rename(&fx.project, &moved).expect("rename project directory");
 
-    let before = project_dirs(&fx).len();
-    assert_sync_ok(&run(&fx, &fx.project, &["sync"]), "idempotent rerun");
+    assert_sync_ok(&run(&fx, &moved, &["sync"]), "sync after move");
+
     assert_eq!(
         project_dirs(&fx).len(),
-        before,
-        "a rerun after adoption must not spawn another registry (idempotent, INV-4)"
+        2,
+        "moving rehashes to a second registry beside the orphaned original"
     );
-}
-
-/// A sync interrupted AFTER adoption but BEFORE the identity file lands (simulated
-/// by deleting `.phora-id` while the adoption marker and adopted registry remain)
-/// must, on rerun, reuse the id recorded in the marker instead of minting a fresh
-/// one — so the run converges onto the single adopted registry rather than
-/// re-adopting into a duplicate.
-#[test]
-fn interrupted_adoption_reruns_converge_on_the_marker_recorded_registry() {
-    let fx = build_fixture();
-
-    assert_sync_ok(&run(&fx, &fx.project, &["sync"]), "seed sync");
-    let seeded = project_dirs(&fx);
-    assert_eq!(seeded.len(), 1, "premise: one registry after the seed sync");
-
-    let legacy_id = ProjectId::for_path(&fx.project).expect("path-hash id");
-    let legacy_dir = projects_base(&fx).join(legacy_id.as_str());
-    if seeded[0] != legacy_dir {
-        std::fs::rename(&seeded[0], &legacy_dir).expect("reshape into legacy path-hash registry");
-    }
-    let _ = std::fs::remove_file(fx.project.join(PHORA_ID_FILE));
-
-    assert_sync_ok(&run(&fx, &fx.project, &["sync"]), "adoption sync");
-    let adopted_id = std::fs::read_to_string(fx.project.join(PHORA_ID_FILE))
-        .expect("adoption writes the identity file")
-        .trim()
-        .to_owned();
-    let adopted_dir = projects_base(&fx).join(&adopted_id);
     assert!(
-        has_records(&adopted_dir),
-        "premise: the adopted registry carries the records"
-    );
-
-    std::fs::remove_file(fx.project.join(PHORA_ID_FILE))
-        .expect("simulate a crash before the identity file is durably written");
-
-    assert_sync_ok(
-        &run(&fx, &fx.project, &["sync"]),
-        "rerun after interruption",
-    );
-
-    let rewritten = std::fs::read_to_string(fx.project.join(PHORA_ID_FILE))
-        .expect("rerun re-materializes the identity file")
-        .trim()
-        .to_owned();
-    assert_eq!(
-        rewritten, adopted_id,
-        "the rerun must reuse the marker-recorded identity, not mint a fresh UUID"
-    );
-
-    let with_records: Vec<PathBuf> = project_dirs(&fx)
-        .into_iter()
-        .filter(|d| *d != legacy_dir && has_records(d))
-        .collect();
-    assert_eq!(
-        with_records,
-        vec![adopted_dir],
-        "the interrupted-then-rerun sequence must converge on the single adopted registry, never \
-         spawn a second one keyed by a freshly minted UUID; found {with_records:?}"
+        has_records(&original),
+        "the prior deployments are orphaned in the original registry (prune reclaims it)"
     );
 }
