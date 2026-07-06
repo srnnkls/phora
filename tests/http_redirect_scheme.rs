@@ -32,6 +32,27 @@ fn serve_ok(mut stream: TcpStream, body: &[u8]) {
     let _ = stream.flush();
 }
 
+/// One-shot `127.0.0.1` stub answering with a 3xx that carries no `Location`.
+fn spawn_locationless_redirect(body: &'static [u8]) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let port = listener.local_addr().expect("local addr").port();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 300 Multiple Choices\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.write_all(body);
+            let _ = stream.flush();
+        }
+    });
+    port
+}
+
 /// One-shot `127.0.0.1` stub answering the first request with a `302` to `location`.
 fn spawn_redirect(location: String) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
@@ -152,6 +173,28 @@ fn download_refuses_redirect_to_disallowed_scheme() {
     assert!(
         !dest.exists(),
         "a refused cross-scheme redirect must not write any file to dest"
+    );
+}
+
+#[test]
+fn download_refuses_3xx_without_location_and_writes_nothing() {
+    let port = spawn_locationless_redirect(b"error page body");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dest = dir.path().join("out.bin");
+
+    let err = download(&format!("http://127.0.0.1:{port}/start"), &dest)
+        .expect_err("a 3xx with no Location must be a non-success error, not streamed to disk");
+
+    match err {
+        SourceError::Source(msg) => assert!(
+            msg.contains("300"),
+            "the error must name the non-success status, got: {msg}"
+        ),
+        other => panic!("expected SourceError::Source for a non-success status, got: {other:?}"),
+    }
+    assert!(
+        !dest.exists(),
+        "a non-success 3xx response must not write any file to dest"
     );
 }
 

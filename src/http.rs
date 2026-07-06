@@ -94,6 +94,13 @@ pub fn download(url: &str, dest: &Path) -> Result<()> {
         current = next;
     };
 
+    if !response.status().is_success() {
+        return Err(SourceError::Source(format!(
+            "GET {url} failed with status {}",
+            response.status().as_u16()
+        )));
+    }
+
     let mut reader = response.into_body().into_reader();
     let mut file = std::fs::File::create(dest).map_err(|err| {
         SourceError::Source(format!(
