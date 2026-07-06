@@ -154,7 +154,7 @@ fn consumer_with_dep_hook() -> (Fixture, PathBuf) {
 }
 
 fn state_root(fixture: &Fixture) -> PathBuf {
-    let project = ProjectId::resolve(fixture.cwd.path()).expect("project id");
+    let project = ProjectId::for_path(fixture.cwd.path()).expect("project id");
     fixture
         .xdg_state
         .join("phora")

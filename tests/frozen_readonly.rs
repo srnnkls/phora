@@ -114,14 +114,8 @@ fn phora_state_base(fixture: &Fixture) -> PathBuf {
 
 fn registry_dir(fixture: &Fixture) -> PathBuf {
     let base = phora_state_base(fixture).join("projects");
-    let id = match std::fs::read_to_string(fixture.cwd.path().join(".phora-id")) {
-        Ok(text) => text.trim().to_owned(),
-        Err(_) => ProjectId::for_path(fixture.cwd.path())
-            .expect("project id")
-            .as_str()
-            .to_owned(),
-    };
-    base.join(id)
+    let id = ProjectId::for_path(fixture.cwd.path()).expect("project id");
+    base.join(id.as_str())
 }
 
 fn assert_success(out: &Output, what: &str) {
@@ -282,37 +276,13 @@ fn frozen_clean_sync_on_readonly_root_with_existing_lock_file_exits_zero() {
 }
 
 #[test]
-fn frozen_sync_without_identity_or_registry_on_readonly_root_fails_early() {
+fn frozen_sync_without_registry_on_readonly_root_fails_early() {
     let fixture = build_fixture();
     deploy_clean(&fixture);
 
     std::fs::remove_dir_all(registry_dir(&fixture)).expect("drop registry dir");
-    std::fs::remove_file(fixture.cwd.path().join(".phora-id")).expect("drop .phora-id");
 
     let base = phora_state_base(&fixture);
-    let _readonly = ReadOnlyTree::lock(&base);
-
-    let out = run(&fixture, &["sync", "--frozen"]);
-
-    assert_frozen_fails_naming_root(&out, &base);
-}
-
-#[test]
-fn frozen_adoption_of_legacy_registry_on_readonly_root_fails_naming_root() {
-    let fixture = build_fixture();
-    deploy_clean(&fixture);
-
-    let base = phora_state_base(&fixture);
-    let projects = base.join("projects");
-    let current = registry_dir(&fixture);
-    let legacy = projects.join(
-        ProjectId::for_path(fixture.cwd.path())
-            .expect("legacy path-hash id")
-            .as_str(),
-    );
-    std::fs::rename(&current, &legacy).expect("relocate registry to legacy path-hash key");
-    std::fs::remove_file(fixture.cwd.path().join(".phora-id")).expect("drop .phora-id");
-
     let _readonly = ReadOnlyTree::lock(&base);
 
     let out = run(&fixture, &["sync", "--frozen"]);

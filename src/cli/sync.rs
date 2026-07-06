@@ -16,31 +16,9 @@ use super::{
     open_project_registry,
 };
 
-/// Open the per-clone registry, generating `.phora-id` and adopting a legacy
-/// path-hash registry when the file is absent. Generation is confined to this
-/// sync path; read-only commands resolve identity without ever writing it.
 fn open_sync_registry(cwd: &Path, config: &Config) -> Result<FileRegistry> {
     let projects_base = state_root_for(config.paths.state.as_deref(), cwd)?.join("projects");
-    let project = if let Some(id) = ProjectId::read_identity_file(cwd)? {
-        id
-    } else {
-        let generated = ProjectId::generate()?;
-        let legacy = ProjectId::for_path(cwd)?;
-        let adopted = crate::store::adopt_registry_dir(
-            &projects_base.join(legacy.as_str()),
-            &projects_base,
-            generated.as_str(),
-        )?;
-        let project = ProjectId::from_raw(adopted);
-        project.write_identity_file(cwd)?;
-        project
-    };
-    if let Err(e) = crate::kernel::exclude_identity_from_git(cwd) {
-        eprintln!(
-            "phora: could not exclude {} from git ({e}); sync continues",
-            crate::kernel::IDENTITY_FILE
-        );
-    }
+    let project = ProjectId::for_path(cwd)?;
     Ok(FileRegistry::open(projects_base.join(project.as_str()))?)
 }
 

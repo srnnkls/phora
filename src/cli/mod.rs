@@ -774,7 +774,7 @@ impl ConflictResolver for TtyResolver {
 
 fn open_project_registry(config: &Config) -> Result<FileRegistry> {
     let cwd = std::env::current_dir()?;
-    let project = ProjectId::resolve(&cwd)?;
+    let project = ProjectId::for_path(&cwd)?;
     let registry_root = state_root_for(config.paths.state.as_deref(), &cwd)?
         .join("projects")
         .join(project.as_str());
