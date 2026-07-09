@@ -1492,7 +1492,7 @@ fn symlink_target_escapes(deployed_rel: &Path, target: &[u8]) -> bool {
                     return true;
                 }
             }
-            _ => depth += 1,
+            _ => depth = depth.saturating_add(1),
         }
     }
     false
