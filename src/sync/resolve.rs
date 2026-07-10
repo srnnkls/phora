@@ -225,10 +225,10 @@ fn resolve_unit(
     }))
 }
 
-/// Default rayon pool size when `--jobs` is unset. The floor of 50 is measured,
-/// not derived from cores: fetch is network-wait-bound and parked threads cost
-/// memory, not CPU, so many small fetches stall on the pool ceiling long before
-/// the box is busy (`benches/fetch_sweep.sh`).
+/// Default rayon pool size when `--jobs` is unset. The cap's floor of 50 is
+/// measured, not derived from cores: fetch is network-wait-bound and parked
+/// threads cost memory, not CPU, so many small fetches stall on the pool
+/// ceiling long before the box is busy (`benches/fetch_sweep.sh`).
 fn default_thread_count(units: usize, cores: usize) -> usize {
     units.min((2 * cores).max(50))
 }
