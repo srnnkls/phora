@@ -40,7 +40,7 @@ export XDG_STATE_HOME="$WORK/state"
 
 emit() { # label -> reads $WORK/t.txt
   awk -v l="$1" '/^real/{r=$2}/^user/{u=$2}/^sys/{s=$2}
-    END{c=u+s; printf "%-18s real=%7.2fs cpu=%6.2fs io_wait=%7.2fs (%2.0f%% wait)\n", l, r, c, r-c, r>0?100*(r-c)/r:0}' "$WORK/t.txt"
+    END{c=u+s; w=0; if(r>0) w=100*(r-c)/r; printf "%-18s real=%7.2fs cpu=%6.2fs io_wait=%7.2fs (%2.0f%% wait)\n", l, r, c, r-c, w}' "$WORK/t.txt"
 }
 sync_timed() { # jobs cold|warm -> exit nonzero on phora failure
   local jobs="$1" mode="$2"
