@@ -225,11 +225,12 @@ fn resolve_unit(
     }))
 }
 
-/// Default rayon pool size when `--jobs` is unset: one thread per unit, capped at
-/// twice the core count so network-bound fetch overlaps I/O waits without unbounded
-/// oversubscription of the CPU resolve/digest phase.
+/// Default rayon pool size when `--jobs` is unset. The floor of 50 is measured,
+/// not derived from cores: fetch is network-wait-bound and parked threads cost
+/// memory, not CPU, so many small fetches stall on the pool ceiling long before
+/// the box is busy (`benches/fetch_sweep.sh`).
 fn default_thread_count(units: usize, cores: usize) -> usize {
-    units.min(2 * cores)
+    units.min((2 * cores).max(50))
 }
 
 #[expect(
@@ -346,8 +347,18 @@ mod tests {
     }
 
     #[test]
-    fn default_thread_count_caps_at_twice_cores() {
-        assert_eq!(default_thread_count(20, 8), 16);
+    fn default_thread_count_uses_one_thread_per_unit_up_to_floor() {
+        assert_eq!(default_thread_count(50, 8), 50);
+    }
+
+    #[test]
+    fn default_thread_count_caps_at_floor_when_twice_cores_is_below_it() {
+        assert_eq!(default_thread_count(60, 8), 50);
+    }
+
+    #[test]
+    fn default_thread_count_caps_at_twice_cores_when_above_floor() {
+        assert_eq!(default_thread_count(200, 32), 64);
     }
 
     #[test]
@@ -356,8 +367,8 @@ mod tests {
     }
 
     #[test]
-    fn default_thread_count_single_core_caps_at_two() {
-        assert_eq!(default_thread_count(5, 1), 2);
+    fn default_thread_count_single_core_uses_floor_not_cores() {
+        assert_eq!(default_thread_count(60, 1), 50);
     }
 
     #[test]
