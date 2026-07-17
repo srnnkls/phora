@@ -10,7 +10,7 @@ use crate::store::{
     ArtifactKey, ManifestFile, ProjectedRecord, RecordKind, Registry, RegistryRecord,
 };
 
-use super::plan::{ResolvedBindingPlan, plan_target};
+use super::plan::{BindingProjection, plan_target};
 use super::{StagingGuard, nonce, remote_for, resolved_remotes};
 
 /// Summary of a [`rebuild_registry`] run: which artifacts were reconstructed and
@@ -63,7 +63,12 @@ pub fn rebuild_registry_with(
 
         let mut managed_dests: BTreeSet<PathBuf> = BTreeSet::new();
         for binding in &plan.bindings {
-            managed_dests.extend(binding.items.iter().map(|item| item.destination.clone()));
+            managed_dests.extend(
+                binding
+                    .artifacts
+                    .iter()
+                    .map(|item| target.expanded_path().join(item.destination.as_str())),
+            );
             let source = parsed.get(&binding.source).ok_or_else(|| {
                 Error::Config(format!(
                     "target references undefined source: {}",
@@ -136,7 +141,7 @@ struct BindingRun<'a> {
     target: &'a Target,
     backend: &'a dyn SourceBackend,
     registry: &'a dyn Registry,
-    binding: &'a ResolvedBindingPlan,
+    binding: &'a BindingProjection,
     source: &'a crate::config::ParsedSource,
     git: &'a str,
 }
@@ -152,7 +157,7 @@ fn rebuild_binding(run: &BindingRun<'_>, report: &mut RebuildReport) -> Result<(
         .map_or(TemplateOptIn::SuffixOnly, |b| b.template_opt_in);
     let deploy_root = run.target.deploy_root();
 
-    for item in &run.binding.items {
+    for item in &run.binding.artifacts {
         let published_key = item.materialization.published_key().to_owned();
         let key = ArtifactKey {
             target: run.target_name.to_owned(),

@@ -2465,12 +2465,14 @@ fn second_deploy_over_correct_link_is_a_noop() {
         protected: &protected,
     };
     let entry_source = sn("editor-src");
-    let item = crate::sync::plan::PlannedItem {
+    let item = crate::sync::plan::ProjectedArtifact {
+        destination: crate::sync::TargetPath::new("editor").expect("valid dest"),
+        source: crate::sync::ResolvedSourceRef::new("editor-src", &fx.head_sha),
         materialization: crate::kernel::Materialization::CollapsedDir {
             dir: "editor".to_owned(),
         },
-        destination: dst.clone(),
         kept_leaves: Vec::new(),
+        leaves: Vec::new(),
     };
     let entry = ArtifactEntry {
         source: &source,
@@ -9369,23 +9371,64 @@ fn plan_target_without_override_discovers_full_source_level_set() {
         .expect("seed editor-src mirror");
     let commits = one_commit(&parsed, "editor-src", &fx.head_sha);
 
-    let plans = plan_targets(&cfg, &parsed, &remotes, &fx.backend, &commits)
-        .expect("plan builds over the seeded mirror");
+    let projection = project_workspace(&cfg, &parsed, &remotes, &fx.backend, &commits)
+        .expect("projection builds over the seeded mirror");
 
-    let dest = plans
+    let dest = projection
+        .targets
         .iter()
         .find(|p| p.target == "dest")
-        .expect("plan must include target `dest`");
+        .expect("projection must include target `dest`");
     let mut artifacts: Vec<String> = dest
         .bindings
         .iter()
-        .flat_map(expected_artifact_keys)
+        .flat_map(projected_artifact_keys)
         .collect();
     artifacts.sort_unstable();
     assert_eq!(
         artifacts,
         vec!["docs", "editor"],
         "a plain binding (no override) inherits the source's full set, got {artifacts:?}"
+    );
+}
+
+#[test]
+fn project_workspace_aggregates_per_target_warnings() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nlayout = \"by-source\"\n\
+         sources = {{ editor-src = {{ take = [\"*.nomatch\"] }} }}\n",
+        fx.url,
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("warning-producing config parses");
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+    fx.backend
+        .fetch(&sn("editor-src"), &fx.url)
+        .expect("seed editor-src mirror");
+    let commits = one_commit(&parsed, "editor-src", &fx.head_sha);
+
+    let projection = project_workspace(&cfg, &parsed, &remotes, &fx.backend, &commits)
+        .expect("projection builds over the seeded mirror");
+
+    let aggregated: Vec<ProjectionWarning> = projection
+        .targets
+        .iter()
+        .flat_map(|t| t.warnings.iter().cloned())
+        .collect();
+    assert!(
+        !aggregated.is_empty(),
+        "premise: a `take` glob matching no offered leaf must produce a per-target \
+         TakeNoMatchGlob warning; got none"
+    );
+    assert_eq!(
+        projection.warnings, aggregated,
+        "the workspace-level warnings vector must aggregate every target's warnings, not drop them \
+         as an empty vec"
     );
 }
 

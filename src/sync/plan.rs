@@ -1,143 +1,721 @@
-//! Registry-free, network-free plan builder shared by sync, prune, and preview.
+//! Registry-free, network-free projection builder shared by sync, prune, and preview.
+//!
+//! The pure core (`project_binding`/`project_target`) computes the desired target
+//! structure from projection specs and a source inventory. The sync-owned
+//! orchestrators (`plan_target`/`project_workspace`) discover leaves through the
+//! source seam, convert config into specs, and drive the pure core.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use crate::config::{
-    Config, DeployMode, LayoutConfig, Offer, ParsedSource, TakeEntry, Target, TemplateOptIn,
-};
+use globset::GlobSet;
+
+use crate::config::{Config, DeployMode, ParsedSource, TakeEntry, Target};
 use crate::diagnostic::SelectionDiagnostic;
 use crate::error::{Error, Result};
+use crate::kernel::KernelError;
 use crate::kernel::{
-    CollapseChoice, CollapseMode, Materialization, OfferSelection, SourceName, Take, fold_dest,
-    is_take_glob, plan_collapse, resolve_take,
+    CollapseChoice, CollapseMode, CollapseWarning, Materialization, OfferSelection, ResolvedTake,
+    SourceName, Take, TakeWarning, fold_dest, is_take_glob, plan_collapse, resolve_take,
+    safe_relpath,
 };
 use crate::lock::encode_ref;
-use crate::source::SourceBackend;
+use crate::source::{SourceBackend, SourceInventory, SourcePath};
 
 use super::discover::discover_working_tree_leaves;
 use super::remote_for;
 
-/// One target's deployment plan: every binding's resolved leaf-granular plan.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TargetPlan {
-    pub target: String,
-    pub bindings: Vec<ResolvedBindingPlan>,
+// ---- projection input specs: one-way conversions from config DTOs ----
+
+/// A source's offer compiled into an owned, config-free spec.
+#[derive(Debug, Clone)]
+pub struct OfferSpec {
+    includes: Vec<String>,
+    excludes: Vec<String>,
+    root: Option<PathBuf>,
 }
 
-/// One binding's leaf-granular plan: the offer-sealed, take-projected, collapse-folded
-/// materializations and their layout-composed destinations.
+impl OfferSpec {
+    #[must_use]
+    pub fn new(includes: Vec<String>, excludes: Vec<String>, root: Option<PathBuf>) -> Self {
+        Self {
+            includes,
+            excludes,
+            root,
+        }
+    }
+
+    /// The implicit full offer: no include patterns, anchored at the source root.
+    #[must_use]
+    pub fn implicit_full() -> Self {
+        Self {
+            includes: Vec::new(),
+            excludes: Vec::new(),
+            root: None,
+        }
+    }
+
+    #[must_use]
+    pub fn includes(&self) -> &[String] {
+        &self.includes
+    }
+
+    #[must_use]
+    pub fn excludes(&self) -> &[String] {
+        &self.excludes
+    }
+
+    #[must_use]
+    pub fn root(&self) -> Option<&Path> {
+        self.root.as_deref()
+    }
+
+    /// True when no include was declared — the implicit full offer.
+    #[must_use]
+    pub fn is_implicit_full(&self) -> bool {
+        self.includes.is_empty()
+    }
+}
+
+/// A binding's `take` directive classified into a config-free spec.
+#[derive(Debug, Clone)]
+pub enum TakeSpec {
+    /// An omitted `take`: project every offered leaf at identity.
+    ProjectAll,
+    /// An explicit `take`; an all-empty spec projects nothing.
+    Explicit {
+        literals: Vec<String>,
+        globs: Vec<String>,
+        renames: Vec<(String, String)>,
+    },
+}
+
+impl TakeSpec {
+    #[must_use]
+    pub fn from_entries(entries: Option<&[TakeEntry]>) -> Self {
+        let Some(entries) = entries else {
+            return Self::ProjectAll;
+        };
+        let mut literals = Vec::new();
+        let mut globs = Vec::new();
+        let mut renames = Vec::new();
+        for entry in entries {
+            match entry {
+                TakeEntry::Leaf(leaf) if is_take_glob(leaf) => globs.push(leaf.clone()),
+                TakeEntry::Leaf(leaf) => literals.push(leaf.clone()),
+                TakeEntry::Rename { src, dest } => renames.push((src.clone(), dest.clone())),
+            }
+        }
+        Self::Explicit {
+            literals,
+            globs,
+            renames,
+        }
+    }
+
+    #[must_use]
+    pub fn is_project_all(&self) -> bool {
+        matches!(self, Self::ProjectAll)
+    }
+
+    #[must_use]
+    pub fn is_project_none(&self) -> bool {
+        matches!(
+            self,
+            Self::Explicit { literals, globs, renames }
+                if literals.is_empty() && globs.is_empty() && renames.is_empty()
+        )
+    }
+
+    #[must_use]
+    pub fn literals(&self) -> Vec<String> {
+        match self {
+            Self::Explicit { literals, .. } => literals.clone(),
+            Self::ProjectAll => Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn globs(&self) -> Vec<String> {
+        let mut globs = match self {
+            Self::Explicit { globs, .. } => globs.clone(),
+            Self::ProjectAll => Vec::new(),
+        };
+        globs.sort();
+        globs
+    }
+
+    #[must_use]
+    pub fn renames(&self) -> Vec<(String, String)> {
+        match self {
+            Self::Explicit { renames, .. } => renames.clone(),
+            Self::ProjectAll => Vec::new(),
+        }
+    }
+
+    fn directives(&self) -> Option<Vec<Take<'_>>> {
+        match self {
+            Self::ProjectAll => None,
+            Self::Explicit {
+                literals,
+                globs,
+                renames,
+            } => {
+                let mut directives = Vec::new();
+                for literal in literals {
+                    directives.push(Take::Literal(literal));
+                }
+                for glob in globs {
+                    directives.push(Take::Glob(glob));
+                }
+                for (src, dest) in renames {
+                    directives.push(Take::Rename { src, dest });
+                }
+                Some(directives)
+            }
+        }
+    }
+}
+
+/// How a target composes each binding's identity with its artifact key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutStyle {
+    Flat,
+    BySource,
+    Prefixed,
+}
+
+/// The target layout compiled into an owned spec.
+#[derive(Debug, Clone)]
+pub struct LayoutSpec {
+    style: LayoutStyle,
+    separator: String,
+}
+
+impl LayoutSpec {
+    #[must_use]
+    pub fn new(style: LayoutStyle, separator: String) -> Self {
+        Self { style, separator }
+    }
+
+    #[must_use]
+    pub fn artifact_path(&self, identity: &str, key: &str) -> PathBuf {
+        match self.style {
+            LayoutStyle::Flat => PathBuf::from(key),
+            LayoutStyle::BySource => PathBuf::from(identity).join(key),
+            LayoutStyle::Prefixed => PathBuf::from(format!("{identity}{}{key}", self.separator)),
+        }
+    }
+}
+
+/// A binding's template opt-in compiled into a render policy.
+#[derive(Debug, Clone)]
+pub struct TemplatePolicy {
+    rule: TemplateRule,
+}
+
+#[derive(Debug, Clone)]
+enum TemplateRule {
+    SuffixOnly,
+    Globs(GlobSet),
+    Disabled,
+}
+
+const TMPL_SUFFIX: &str = ".tmpl";
+
+impl TemplatePolicy {
+    #[must_use]
+    pub fn suffix_only() -> Self {
+        Self {
+            rule: TemplateRule::SuffixOnly,
+        }
+    }
+
+    #[must_use]
+    pub fn globs(set: GlobSet) -> Self {
+        Self {
+            rule: TemplateRule::Globs(set),
+        }
+    }
+
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            rule: TemplateRule::Disabled,
+        }
+    }
+
+    #[must_use]
+    pub fn renders(&self, path: &str) -> bool {
+        let suffix_opts_in = path.ends_with(TMPL_SUFFIX) && path != TMPL_SUFFIX;
+        match &self.rule {
+            TemplateRule::SuffixOnly => suffix_opts_in,
+            TemplateRule::Globs(set) => set.is_match(path) || suffix_opts_in,
+            TemplateRule::Disabled => false,
+        }
+    }
+
+    #[must_use]
+    pub fn deployed_name(&self, path: &str) -> String {
+        if self.renders(path)
+            && let Some(stripped) = path.strip_suffix(TMPL_SUFFIX)
+            && !stripped.is_empty()
+        {
+            return stripped.to_owned();
+        }
+        path.to_owned()
+    }
+}
+
+/// How a binding materializes its artifacts: a link symlink or a subtree copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaterializationPolicy {
+    Copy,
+    Link,
+}
+
+impl MaterializationPolicy {
+    fn collapse_mode(self) -> CollapseMode {
+        match self {
+            Self::Link => CollapseMode::Link,
+            Self::Copy => CollapseMode::Copy,
+        }
+    }
+
+    fn is_copy(self) -> bool {
+        matches!(self, Self::Copy)
+    }
+}
+
+/// A binding's `collapse` override compiled into a preference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CollapsePreference {
+    #[default]
+    Default,
+    ForcePerLeaf,
+    ForceCollapse,
+}
+
+impl CollapsePreference {
+    fn choice(self) -> CollapseChoice {
+        match self {
+            Self::Default => CollapseChoice::Default,
+            Self::ForcePerLeaf => CollapseChoice::ForcePerLeaf,
+            Self::ForceCollapse => CollapseChoice::ForceCollapse,
+        }
+    }
+
+    fn as_bool(self) -> Option<bool> {
+        match self {
+            Self::Default => None,
+            Self::ForcePerLeaf => Some(false),
+            Self::ForceCollapse => Some(true),
+        }
+    }
+}
+
+/// The content transform a projected leaf carries: verbatim, or template-rendered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentTransform {
+    Identity,
+    Template,
+}
+
+/// A resolved source identity: the source name and its resolved commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedBindingPlan {
+pub struct ResolvedSourceRef {
+    name: String,
+    commit: String,
+}
+
+impl ResolvedSourceRef {
+    pub fn new(name: impl Into<String>, commit: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            commit: commit.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub fn commit(&self) -> &str {
+        &self.commit
+    }
+}
+
+// ---- lexical target-relative path newtypes ----
+
+/// A target-relative destination path validated by the lexical `safe_relpath` rule,
+/// preserved verbatim (no case fold, no NFC), ordered by UTF-8 bytes. Sync joins the
+/// target root; the projection never absolutizes.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TargetPath(String);
+
+impl TargetPath {
+    /// # Errors
+    /// Returns [`KernelError`] when `path` is not a safe forward-slashed relative path.
+    pub fn new(path: &str) -> std::result::Result<Self, KernelError> {
+        safe_relpath(path)?;
+        Ok(Self(path.to_owned()))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::str::FromStr for TargetPath {
+    type Err = KernelError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Self::new(s)
+    }
+}
+
+impl std::fmt::Display for TargetPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// An artifact-relative leaf destination validated by the lexical `safe_relpath` rule,
+/// preserved verbatim, ordered by UTF-8 bytes.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ArtifactRelativePath(String);
+
+impl ArtifactRelativePath {
+    /// # Errors
+    /// Returns [`KernelError`] when `path` is not a safe forward-slashed relative path.
+    pub fn new(path: &str) -> std::result::Result<Self, KernelError> {
+        safe_relpath(path)?;
+        Ok(Self(path.to_owned()))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::str::FromStr for ArtifactRelativePath {
+    type Err = KernelError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Self::new(s)
+    }
+}
+
+impl std::fmt::Display for ArtifactRelativePath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+// ---- projection output ----
+
+/// A whole workspace's desired structure: one projection per target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Projection {
+    pub targets: Vec<TargetProjection>,
+    pub warnings: Vec<ProjectionWarning>,
+}
+
+/// One target's desired structure: its bindings, their union of artifacts, and warnings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetProjection {
+    pub target: String,
+    pub bindings: Vec<BindingProjection>,
+    pub artifacts: Vec<ProjectedArtifact>,
+    pub warnings: Vec<ProjectionWarning>,
+}
+
+/// One binding's projected artifacts under its identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindingProjection {
     pub identity: String,
     pub source: String,
     pub commit: String,
-    pub items: Vec<PlannedItem>,
-    pub warnings: Vec<PlanWarning>,
+    pub artifacts: Vec<ProjectedArtifact>,
+    pub warnings: Vec<ProjectionWarning>,
 }
 
-/// A single planned deployment unit and its destination under the target.
+/// A single projected deployment unit and its target-relative destination.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlannedItem {
+pub struct ProjectedArtifact {
+    pub destination: TargetPath,
+    pub source: ResolvedSourceRef,
     pub materialization: Materialization,
-    pub destination: PathBuf,
-    pub kept_leaves: Vec<crate::kernel::ResolvedTake>,
+    /// Transitional kernel-typed field still read by target.rs/preview.rs/rebuild.rs;
+    /// retires with T015 once they consume `leaves`.
+    pub kept_leaves: Vec<ResolvedTake>,
+    pub leaves: Vec<ProjectedLeaf>,
 }
 
-/// A non-fatal take/collapse outcome carried up from the kernel.
+/// One projected leaf under an artifact: its source path, artifact-relative
+/// destination, and content transform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectedLeaf {
+    pub source: SourcePath,
+    pub destination: ArtifactRelativePath,
+    pub transform: ContentTransform,
+}
+
+/// A non-fatal take/collapse outcome carried up from the projection.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum PlanWarning {
+pub enum ProjectionWarning {
     TakeNoMatchGlob(String),
     LostCollapseToExclude(String),
 }
 
-/// Config-typed inputs the resolver maps onto the kernel for one binding.
-pub struct BindingPlanInput<'a> {
-    pub identity: &'a str,
-    pub source: &'a str,
-    pub commit: &'a str,
-    pub offer: Offer<'a>,
-    pub candidate_leaves: &'a [String],
-    pub take: Option<&'a [TakeEntry]>,
-    pub mode: DeployMode,
-    pub collapse: Option<bool>,
-    pub layout: &'a LayoutConfig,
-    pub target_path: &'a Path,
-    pub template_opt_in: &'a TemplateOptIn,
+/// A structured projection failure. Each variant preserves the rendered diagnostic
+/// so the CLI boundary shows the same text; `From<ProjectionError>` unwraps it.
+#[derive(Debug, thiserror::Error)]
+pub enum ProjectionError {
+    #[error("{rendered}")]
+    LeafNotOffered { rendered: Box<Error> },
+    #[error("{rendered}")]
+    DuplicateDestination { rendered: Box<Error> },
+    #[error("{rendered}")]
+    CollapseBlocked { rendered: Box<Error> },
+    #[error("{rendered}")]
+    Other { rendered: Box<Error> },
 }
 
-/// Resolves one binding: compile the offer, seal `take` over it, fold collapse, then
-/// compose each materialization's destination under the layout.
+impl From<ProjectionError> for Error {
+    fn from(error: ProjectionError) -> Self {
+        match error {
+            ProjectionError::LeafNotOffered { rendered }
+            | ProjectionError::DuplicateDestination { rendered }
+            | ProjectionError::CollapseBlocked { rendered }
+            | ProjectionError::Other { rendered } => *rendered,
+        }
+    }
+}
+
+/// Config-free inputs the projection maps onto the kernel for one binding.
+pub struct BindingProjectionInput<'a> {
+    pub identity: &'a str,
+    pub source: &'a ResolvedSourceRef,
+    pub offer: &'a OfferSpec,
+    pub inventory: &'a SourceInventory,
+    pub take: &'a TakeSpec,
+    pub collapse: CollapsePreference,
+    pub materialization: MaterializationPolicy,
+    pub layout: &'a LayoutSpec,
+    pub templates: &'a TemplatePolicy,
+}
+
+/// Projects one binding: compile the offer over the inventory, seal `take` over it,
+/// fold collapse, then compose each materialization's target-relative destination.
 ///
 /// # Errors
-/// Errors if the offer fails to compile, `take` references a non-offered leaf, two kept
-/// leaves collide, or a demanded collapse is blocked.
-pub fn resolve_binding_plan(input: &BindingPlanInput<'_>) -> Result<ResolvedBindingPlan> {
-    let candidates: Vec<&str> = input.candidate_leaves.iter().map(String::as_str).collect();
+/// Errors if the offer fails to compile, `take` references a non-offered leaf, two
+/// kept leaves collide, or a demanded collapse is blocked.
+pub fn project_binding(
+    input: &BindingProjectionInput<'_>,
+) -> std::result::Result<BindingProjection, ProjectionError> {
+    let candidates: Vec<&str> = input
+        .inventory
+        .entries
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect();
     let selection = OfferSelection::compile(
         input.offer.includes(),
         input.offer.excludes(),
         input.offer.root(),
-    )?;
+    )
+    .map_err(other)?;
     let offer = selection.select(&candidates);
-    let physical_tree = OfferSelection::compile(&[], &[], input.offer.root())?.select(&candidates);
+    let physical_tree = OfferSelection::compile(&[], &[], input.offer.root())
+        .map_err(other)?
+        .select(&candidates);
 
-    let takes = input.take.map(map_take_entries);
-    let resolution = resolve_take(&offer, takes.as_deref())?;
+    let directives = input.take.directives();
+    let resolution = resolve_take(&offer, directives.as_deref())
+        .map_err(|error| classify_take_error(error, &offer, input.take))?;
 
-    let mode = match input.mode {
-        DeployMode::Link => CollapseMode::Link,
-        DeployMode::Copy => CollapseMode::Copy,
-    };
-    let choice = match input.collapse {
-        None => CollapseChoice::Default,
-        Some(false) => CollapseChoice::ForcePerLeaf,
-        Some(true) => CollapseChoice::ForceCollapse,
-    };
-    let plan = plan_collapse(&resolution.kept, &physical_tree, mode, choice)?;
-    let materializations =
-        reject_partial_take_collapse(plan.items, &resolution.kept, &offer, input.collapse)?
-            .into_iter()
-            .map(|m| apply_deployed_name(m, input))
-            .collect::<Vec<_>>();
+    let mode = input.materialization.collapse_mode();
+    let choice = input.collapse.choice();
+    let plan =
+        plan_collapse(&resolution.kept, &physical_tree, mode, choice).map_err(collapse_blocked)?;
+    let materializations = reject_partial_take_collapse(
+        plan.items,
+        &resolution.kept,
+        &offer,
+        input.collapse.as_bool(),
+    )
+    .map_err(collapse_blocked)?
+    .into_iter()
+    .map(|materialization| {
+        apply_deployed_name(materialization, input.materialization, input.templates)
+    })
+    .collect::<Vec<_>>();
 
-    let items = materializations
-        .into_iter()
-        .map(|materialization| {
-            let key = materialization.published_key();
-            let destination = input
-                .target_path
-                .join(input.layout.artifact_path(input.identity, key));
-            let kept_leaves = kept_leaves_under(&materialization, &resolution.kept);
-            PlannedItem {
-                materialization,
-                destination,
-                kept_leaves,
-            }
-        })
-        .collect();
+    let mut artifacts = Vec::with_capacity(materializations.len());
+    for materialization in materializations {
+        let key = materialization.published_key().to_owned();
+        let layout_path = input.layout.artifact_path(input.identity, &key);
+        let dest = layout_path.to_string_lossy();
+        let destination = TargetPath::new(&dest).map_err(|_| ProjectionError::Other {
+            rendered: Box::new(unsafe_target_path(&dest)),
+        })?;
+        let kept_leaves = kept_leaves_under(&materialization, &resolution.kept);
+        let leaves = build_leaves(
+            &materialization,
+            &kept_leaves,
+            input.materialization,
+            input.templates,
+            offer_root_prefix(input.offer).as_deref(),
+        )?;
+        artifacts.push(ProjectedArtifact {
+            destination,
+            source: input.source.clone(),
+            materialization,
+            kept_leaves,
+            leaves,
+        });
+    }
 
-    let mut warnings: Vec<PlanWarning> = resolution
+    let mut warnings: Vec<ProjectionWarning> = resolution
         .warnings
         .into_iter()
-        .map(|w| {
-            let crate::kernel::TakeWarning::NoMatchGlob(p) = w;
-            PlanWarning::TakeNoMatchGlob(p)
+        .map(|warning| {
+            let TakeWarning::NoMatchGlob(pattern) = warning;
+            ProjectionWarning::TakeNoMatchGlob(pattern)
         })
-        .chain(plan.warnings.into_iter().map(|w| {
-            let crate::kernel::CollapseWarning::LostCollapseToExclude { dir } = w;
-            PlanWarning::LostCollapseToExclude(dir)
+        .chain(plan.warnings.into_iter().map(|warning| {
+            let CollapseWarning::LostCollapseToExclude { dir } = warning;
+            ProjectionWarning::LostCollapseToExclude(dir)
         }))
         .collect();
     warnings.sort();
 
-    Ok(ResolvedBindingPlan {
+    Ok(BindingProjection {
         identity: input.identity.to_owned(),
-        source: input.source.to_owned(),
-        commit: input.commit.to_owned(),
-        items,
+        source: input.source.name().to_owned(),
+        commit: input.source.commit().to_owned(),
+        artifacts,
         warnings,
     })
+}
+
+fn other(error: Error) -> ProjectionError {
+    ProjectionError::Other {
+        rendered: Box::new(error),
+    }
+}
+
+fn collapse_blocked(error: Error) -> ProjectionError {
+    ProjectionError::CollapseBlocked {
+        rendered: Box::new(error),
+    }
+}
+
+/// A take failure is `LeafNotOffered` when a literal or rename source is not in the
+/// offer set; the offer seal rejects it first, so it dominates any other take fault.
+fn classify_take_error(error: Error, offer: &[String], take: &TakeSpec) -> ProjectionError {
+    if let TakeSpec::Explicit {
+        literals, renames, ..
+    } = take
+    {
+        let offered: BTreeSet<&str> = offer.iter().map(String::as_str).collect();
+        let unoffered = literals.iter().any(|leaf| !offered.contains(leaf.as_str()))
+            || renames
+                .iter()
+                .any(|(src, _)| !offered.contains(src.as_str()));
+        if unoffered {
+            return ProjectionError::LeafNotOffered {
+                rendered: Box::new(error),
+            };
+        }
+    }
+    ProjectionError::Other {
+        rendered: Box::new(error),
+    }
+}
+
+fn offer_root_prefix(offer: &OfferSpec) -> Option<String> {
+    offer.root().and_then(|root| {
+        let trimmed = root.to_string_lossy().trim_end_matches('/').to_owned();
+        (!trimmed.is_empty()).then_some(trimmed)
+    })
+}
+
+fn build_leaves(
+    materialization: &Materialization,
+    kept_leaves: &[ResolvedTake],
+    policy: MaterializationPolicy,
+    templates: &TemplatePolicy,
+    root: Option<&str>,
+) -> std::result::Result<Vec<ProjectedLeaf>, ProjectionError> {
+    let transform_of = |source: &str| {
+        if policy.is_copy() && templates.renders(source) {
+            ContentTransform::Template
+        } else {
+            ContentTransform::Identity
+        }
+    };
+    let inventory_source = |source: &str| match root {
+        Some(root) => format!("{root}/{source}"),
+        None => source.to_owned(),
+    };
+    match materialization {
+        Materialization::Leaf(take) => {
+            let dest = take.dest.rsplit('/').next().unwrap_or(&take.dest);
+            Ok(vec![ProjectedLeaf {
+                source: SourcePath::new(&inventory_source(&take.source)).map_err(unsafe_leaf)?,
+                destination: ArtifactRelativePath::new(dest).map_err(unsafe_leaf)?,
+                transform: transform_of(&take.source),
+            }])
+        }
+        Materialization::CollapsedDir { dir } => {
+            let prefix = format!("{dir}/");
+            let mut leaves = Vec::new();
+            for kept in kept_leaves {
+                let Some(child) = kept.dest.strip_prefix(&prefix) else {
+                    continue;
+                };
+                let deployed = if policy.is_copy() {
+                    templates.deployed_name(child)
+                } else {
+                    child.to_owned()
+                };
+                leaves.push(ProjectedLeaf {
+                    source: SourcePath::new(&inventory_source(&kept.source))
+                        .map_err(unsafe_leaf)?,
+                    destination: ArtifactRelativePath::new(&deployed).map_err(unsafe_leaf)?,
+                    transform: transform_of(&kept.source),
+                });
+            }
+            Ok(leaves)
+        }
+    }
+}
+
+fn unsafe_leaf(error: KernelError) -> ProjectionError {
+    let KernelError::UnsafeComponent(entry) = error;
+    ProjectionError::Other {
+        rendered: Box::new(unsafe_target_path(&entry)),
+    }
+}
+
+fn unsafe_target_path(dest: &str) -> Error {
+    SelectionDiagnostic {
+        entry: dest.to_owned(),
+        matched_against: "the target root".to_owned(),
+        why: "destination is not a portable relative path".to_owned(),
+        did_you_mean: None,
+        remedy: "use a forward-slashed relative path inside the target".to_owned(),
+        debug_hint: Some("phora preview --files".to_owned()),
+        details: Vec::new(),
+    }
+    .sync()
 }
 
 /// A `CollapsedDir` is sound only when every *offered* leaf under it is kept at
@@ -146,11 +724,11 @@ pub fn resolve_binding_plan(input: &BindingPlanInput<'_>) -> Result<ResolvedBind
 /// wholly-taken sub-dir still collapses while the dropped siblings stay out.
 fn reject_partial_take_collapse(
     items: Vec<Materialization>,
-    kept: &[crate::kernel::ResolvedTake],
+    kept: &[ResolvedTake],
     offer: &[String],
     collapse: Option<bool>,
 ) -> Result<Vec<Materialization>> {
-    let kept_at_identity: std::collections::BTreeSet<&str> = kept
+    let kept_at_identity: BTreeSet<&str> = kept
         .iter()
         .filter(|r| r.source == r.dest)
         .map(|r| r.source.as_str())
@@ -173,7 +751,7 @@ fn reject_partial_take_collapse(
         if collapse == Some(true) {
             return Err(partial_take_collapse_diagnostic(dir));
         }
-        let kept_under: Vec<crate::kernel::ResolvedTake> = kept
+        let kept_under: Vec<ResolvedTake> = kept
             .iter()
             .filter(|r| r.source.starts_with(&prefix))
             .cloned()
@@ -217,21 +795,22 @@ pub(crate) fn map_take_entries(entries: &[TakeEntry]) -> Vec<Take<'_>> {
 
 fn apply_deployed_name(
     materialization: Materialization,
-    input: &BindingPlanInput<'_>,
+    policy: MaterializationPolicy,
+    templates: &TemplatePolicy,
 ) -> Materialization {
     let Materialization::Leaf(mut take) = materialization else {
         return materialization;
     };
-    if input.mode == DeployMode::Copy && take.source == take.dest {
-        take.dest = input.template_opt_in.deployed_name(&take.source);
+    if policy.is_copy() && take.source == take.dest {
+        take.dest = templates.deployed_name(&take.source);
     }
     Materialization::Leaf(take)
 }
 
 fn kept_leaves_under(
     materialization: &Materialization,
-    kept: &[crate::kernel::ResolvedTake],
-) -> Vec<crate::kernel::ResolvedTake> {
+    kept: &[ResolvedTake],
+) -> Vec<ResolvedTake> {
     let Materialization::CollapsedDir { dir } = materialization else {
         return Vec::new();
     };
@@ -242,48 +821,63 @@ fn kept_leaves_under(
         .collect()
 }
 
-/// Resolves every binding of one target, then rejects any destination two bindings
+/// Projects every binding of one target, then rejects any destination two bindings
 /// land on, folded the way `take` folds within a binding (NFC + simple-lowercase).
 ///
 /// # Errors
 /// Errors if any binding fails to resolve or two bindings collide on a destination.
-pub fn resolve_target_plan(
+pub fn project_target(
     target_name: &str,
-    inputs: &[BindingPlanInput<'_>],
-) -> Result<TargetPlan> {
+    inputs: &[BindingProjectionInput<'_>],
+) -> std::result::Result<TargetProjection, ProjectionError> {
     let bindings = inputs
         .iter()
-        .map(resolve_binding_plan)
-        .collect::<Result<Vec<_>>>()?;
+        .map(project_binding)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     reject_cross_binding_dups(target_name, &bindings)?;
-    Ok(TargetPlan {
+    let artifacts: Vec<ProjectedArtifact> = bindings
+        .iter()
+        .flat_map(|binding| binding.artifacts.iter().cloned())
+        .collect();
+    let warnings: Vec<ProjectionWarning> = bindings
+        .iter()
+        .flat_map(|binding| binding.warnings.iter().cloned())
+        .collect();
+    Ok(TargetProjection {
         target: target_name.to_owned(),
         bindings,
+        artifacts,
+        warnings,
     })
 }
 
-fn reject_cross_binding_dups(target_name: &str, bindings: &[ResolvedBindingPlan]) -> Result<()> {
+fn reject_cross_binding_dups(
+    target_name: &str,
+    bindings: &[BindingProjection],
+) -> std::result::Result<(), ProjectionError> {
     let mut seen: BTreeMap<String, String> = BTreeMap::new();
     for binding in bindings {
-        for item in &binding.items {
-            let dest = item.destination.to_string_lossy().into_owned();
+        for artifact in &binding.artifacts {
+            let dest = artifact.destination.as_str().to_owned();
             if let Some(first) = seen.insert(fold_dest(&dest), dest.clone()) {
-                return Err(cross_binding_dup_diagnostic(target_name, &first, &dest));
+                return Err(duplicate_destination(target_name, &first, &dest));
             }
         }
     }
     for (folded, dest) in &seen {
         for ancestor in ancestor_prefixes(folded) {
             if let Some(ancestor_dest) = seen.get(ancestor) {
-                return Err(cross_binding_dup_diagnostic(
-                    target_name,
-                    ancestor_dest,
-                    dest,
-                ));
+                return Err(duplicate_destination(target_name, ancestor_dest, dest));
             }
         }
     }
     Ok(())
+}
+
+fn duplicate_destination(target_name: &str, first: &str, second: &str) -> ProjectionError {
+    ProjectionError::DuplicateDestination {
+        rendered: Box::new(cross_binding_dup_diagnostic(target_name, first, second)),
+    }
 }
 
 fn ancestor_prefixes(path: &str) -> impl Iterator<Item = &str> {
@@ -308,23 +902,23 @@ fn cross_binding_dup_diagnostic(target_name: &str, first: &str, second: &str) ->
     .sync()
 }
 
-/// The published artifact keys prune republishes for one binding: each item's
-/// collapsed-dir or leaf destination key.
+/// The published artifact keys prune republishes for one binding: each artifact's
+/// collapsed-dir or leaf destination key, in native projected order.
 #[must_use]
-pub fn expected_artifact_keys(plan: &ResolvedBindingPlan) -> Vec<String> {
-    plan.items
+pub fn projected_artifact_keys(binding: &BindingProjection) -> Vec<String> {
+    binding
+        .artifacts
         .iter()
-        .map(|item| item.materialization.published_key().to_owned())
+        .map(|artifact| artifact.materialization.published_key().to_owned())
         .collect()
 }
 
-/// Plan one target's deployments: registry-free and network-free, discovering each
-/// binding's candidate leaves via the source seam and resolving the leaf-granular plan,
-/// taking resolved commits as a precondition; it never fetches or writes.
+/// Projects one target's deployments: registry-free and network-free, discovering each
+/// binding's candidate leaves via the source seam and projecting the leaf-granular
+/// structure, taking resolved commits as a precondition; it never fetches or writes.
 ///
 /// # Errors
 /// Errors if a referenced source is undefined, has no resolved commit, or discovery fails.
-#[must_use = "a plan describes deployments but performs none; consume the returned TargetPlan"]
 pub fn plan_target(
     target_name: &str,
     target: &Target,
@@ -332,9 +926,8 @@ pub fn plan_target(
     remotes: &BTreeMap<String, String>,
     backend: &dyn SourceBackend,
     resolved_commits: &BTreeMap<(String, String), String>,
-) -> Result<TargetPlan> {
-    let path = target.expanded_path();
-    let layout = target.layout();
+) -> Result<TargetProjection> {
+    let layout = LayoutSpec::from(&target.layout());
 
     let mut discovered = Vec::new();
     for binding in target.resolve_sources(parsed) {
@@ -361,47 +954,43 @@ pub fn plan_target(
         let leaves = discover_binding_leaves(source, &name, &commit, remotes, backend)?;
         discovered.push(DiscoveredBinding {
             identity: binding.identity.to_owned(),
-            source: binding.source.to_owned(),
-            commit,
-            offer: source.offer(),
-            leaves,
-            take: binding.take.map(<[TakeEntry]>::to_vec),
-            mode: source.deploy_mode(),
-            collapse: binding.collapse,
-            template_opt_in: binding.template_opt_in,
+            source: ResolvedSourceRef::new(binding.source, commit),
+            inventory: SourceInventory::from_paths(leaves)?,
+            offer: OfferSpec::from(source.offer()),
+            take: TakeSpec::from_entries(binding.take),
+            materialization: MaterializationPolicy::from(&source.deploy_mode()),
+            collapse: CollapsePreference::from(binding.collapse),
+            templates: TemplatePolicy::from(&binding.template_opt_in),
         });
     }
 
-    let inputs: Vec<BindingPlanInput<'_>> = discovered
+    let inputs: Vec<BindingProjectionInput<'_>> = discovered
         .iter()
-        .map(|d| BindingPlanInput {
+        .map(|d| BindingProjectionInput {
             identity: &d.identity,
             source: &d.source,
-            commit: &d.commit,
-            offer: d.offer,
-            candidate_leaves: &d.leaves,
-            take: d.take.as_deref(),
-            mode: d.mode,
+            offer: &d.offer,
+            inventory: &d.inventory,
+            take: &d.take,
             collapse: d.collapse,
+            materialization: d.materialization,
             layout: &layout,
-            target_path: &path,
-            template_opt_in: &d.template_opt_in,
+            templates: &d.templates,
         })
         .collect();
 
-    resolve_target_plan(target_name, &inputs)
+    Ok(project_target(target_name, &inputs)?)
 }
 
-struct DiscoveredBinding<'a> {
+struct DiscoveredBinding {
     identity: String,
-    source: String,
-    commit: String,
-    offer: Offer<'a>,
-    leaves: Vec<String>,
-    take: Option<Vec<TakeEntry>>,
-    mode: DeployMode,
-    collapse: Option<bool>,
-    template_opt_in: TemplateOptIn,
+    source: ResolvedSourceRef,
+    inventory: SourceInventory,
+    offer: OfferSpec,
+    take: TakeSpec,
+    materialization: MaterializationPolicy,
+    collapse: CollapsePreference,
+    templates: TemplatePolicy,
 }
 
 /// Every candidate leaf one binding offers at `commit`, unfiltered: the offer's
@@ -420,45 +1009,46 @@ fn discover_binding_leaves(
     }
 }
 
-/// Plan every target in `config`, forwarding to `plan_target` for each.
+/// Projects every target in `config`, forwarding to `plan_target` for each.
 ///
 /// # Errors
 /// Errors if a referenced source is undefined, has no resolved commit, or discovery fails.
-#[must_use = "a plan describes deployments but performs none; consume the returned TargetPlans"]
-pub fn plan_targets(
+#[must_use = "a projection describes deployments but performs none; consume the returned Projection"]
+pub fn project_workspace(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
     remotes: &BTreeMap<String, String>,
     backend: &dyn SourceBackend,
     resolved_commits: &BTreeMap<(String, String), String>,
-) -> Result<Vec<TargetPlan>> {
-    config
+) -> Result<Projection> {
+    let targets = config
         .targets
         .iter()
         .map(|(name, target)| plan_target(name, target, parsed, remotes, backend, resolved_commits))
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    let warnings = targets
+        .iter()
+        .flat_map(|target| target.warnings.iter().cloned())
+        .collect();
+    Ok(Projection { targets, warnings })
 }
 
 #[cfg(test)]
-mod leaf_granular_resolver_tests {
-    use std::path::{Path, PathBuf};
+mod projection_builder_tests {
+    use std::path::Path;
 
     use crate::config::{DeployMode, LayoutConfig, ParsedSource, Source, TakeEntry, TemplateOptIn};
     use crate::diagnostic::{MATCHED_AGAINST, REMEDY, SELECTION, TO_DEBUG};
     use crate::kernel::Materialization;
+    use crate::source::SourceInventory;
 
-    use super::{BindingPlanInput, PlannedItem, ResolvedBindingPlan, resolve_binding_plan};
+    use super::{
+        BindingProjection, BindingProjectionInput, CollapsePreference, LayoutSpec,
+        MaterializationPolicy, OfferSpec, ProjectionError, ResolvedSourceRef, TakeSpec,
+        TemplatePolicy, project_binding, project_target, projected_artifact_keys,
+    };
 
-    fn leaves(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| (*s).to_string()).collect()
-    }
-
-    fn take_leaves(items: &[&str]) -> Vec<TakeEntry> {
-        items
-            .iter()
-            .map(|s| TakeEntry::Leaf((*s).to_string()))
-            .collect()
-    }
+    const COMMIT: &str = "c0ffee";
 
     fn source_with(
         root: Option<&str>,
@@ -505,57 +1095,66 @@ mod leaf_granular_resolver_tests {
             .expect("layout parses")
     }
 
-    struct Args<'a> {
+    struct Case<'a> {
         source: &'a ParsedSource,
-        candidate_leaves: Vec<String>,
+        leaves: Vec<String>,
         take: Option<Vec<TakeEntry>>,
+        collapse: Option<bool>,
         layout: LayoutConfig,
-        target_path: PathBuf,
         identity: &'a str,
     }
 
-    impl<'a> Args<'a> {
-        fn flat(source: &'a ParsedSource, candidates: &[&str]) -> Self {
+    impl<'a> Case<'a> {
+        fn flat(source: &'a ParsedSource, leaves: &[&str]) -> Self {
             Self {
                 source,
-                candidate_leaves: leaves(candidates),
+                leaves: leaves.iter().map(|s| (*s).to_string()).collect(),
                 take: None,
+                collapse: None,
                 layout: LayoutConfig::default(),
-                target_path: PathBuf::from("/dst"),
                 identity: "s",
             }
         }
 
-        fn resolve(&self) -> ResolvedBindingPlan {
-            self.try_resolve().expect("binding plan resolves")
+        fn project(&self) -> BindingProjection {
+            self.try_project().expect("binding projects")
         }
 
-        fn try_resolve(&self) -> crate::error::Result<ResolvedBindingPlan> {
-            let input = BindingPlanInput {
+        fn try_project(&self) -> std::result::Result<BindingProjection, ProjectionError> {
+            let inventory = SourceInventory::from_paths(self.leaves.iter().map(String::as_str))
+                .expect("valid paths");
+            let offer = OfferSpec::from(self.source.offer());
+            let take = TakeSpec::from_entries(self.take.as_deref());
+            let templates = TemplatePolicy::from(&TemplateOptIn::SuffixOnly);
+            let layout = LayoutSpec::from(&self.layout);
+            let source = ResolvedSourceRef::new("s", COMMIT);
+            project_binding(&BindingProjectionInput {
                 identity: self.identity,
-                source: "s",
-                commit: "c0ffee",
-                offer: self.source.offer(),
-                candidate_leaves: &self.candidate_leaves,
-                take: self.take.as_deref(),
-                mode: self.source.deploy_mode(),
-                collapse: None,
-                layout: &self.layout,
-                target_path: &self.target_path,
-                template_opt_in: &TemplateOptIn::SuffixOnly,
-            };
-            resolve_binding_plan(&input)
+                source: &source,
+                offer: &offer,
+                inventory: &inventory,
+                take: &take,
+                collapse: CollapsePreference::from(self.collapse),
+                materialization: MaterializationPolicy::from(&self.source.deploy_mode()),
+                layout: &layout,
+                templates: &templates,
+            })
         }
     }
 
-    fn dest_paths(plan: &ResolvedBindingPlan) -> Vec<PathBuf> {
-        plan.items.iter().map(|i| i.destination.clone()).collect()
+    fn dests(binding: &BindingProjection) -> Vec<String> {
+        binding
+            .artifacts
+            .iter()
+            .map(|a| a.destination.as_str().to_owned())
+            .collect()
     }
 
-    fn materializations(plan: &ResolvedBindingPlan) -> Vec<Materialization> {
-        plan.items
+    fn materializations(binding: &BindingProjection) -> Vec<Materialization> {
+        binding
+            .artifacts
             .iter()
-            .map(|i| i.materialization.clone())
+            .map(|a| a.materialization.clone())
             .collect()
     }
 
@@ -585,469 +1184,236 @@ mod leaf_granular_resolver_tests {
         );
     }
 
+    fn rendered(error: ProjectionError) -> String {
+        crate::error::Error::from(error).to_string()
+    }
+
     #[test]
-    fn flat_bind_resolves_source_offer_to_root_relative_leaf_set() {
+    fn flat_bind_projects_source_offer_to_root_relative_leaf_set() {
         let source = source_with(Some("editor"), &["*.lua"], &[], DeployMode::Copy);
-        let args = Args::flat(
+        let case = Case::flat(
             &source,
             &["editor/init.lua", "editor/README.md", "other/x.lua"],
         );
-        let plan = args.resolve();
+        let binding = case.project();
         assert_eq!(
-            materializations(&plan),
+            materializations(&binding),
             vec![leaf("init.lua", "init.lua")],
             "the offer re-anchors at root `editor`, drops the unmatched sibling, and publishes \
-             the root-relative `init.lua`; got: {:?}",
-            materializations(&plan)
+             the root-relative `init.lua`"
         );
     }
 
     #[test]
     fn link_bind_discovers_working_tree_leaves_with_dotfiles_matching() {
         let source = source_with(None, &[], &[], DeployMode::Link);
-        let args = Args::flat(&source, &[".zshrc", ".config/nvim/init.lua", "plain.txt"]);
-        let plan = args.resolve();
+        let case = Case::flat(&source, &[".zshrc", ".config/nvim/init.lua", "plain.txt"]);
+        let binding = case.project();
         assert_eq!(
-            dest_paths(&plan),
+            dests(&binding),
             vec![
-                PathBuf::from("/dst/.config"),
-                PathBuf::from("/dst/.zshrc"),
-                PathBuf::from("/dst/plain.txt"),
+                ".config".to_string(),
+                ".zshrc".to_string(),
+                "plain.txt".to_string()
             ],
             "an implicit-full offer keeps offered dotfiles with no opt-in, and a wholly-taken \
-             dot-dir collapses; got: {:?}",
-            dest_paths(&plan)
+             dot-dir collapses"
         );
     }
 
     #[test]
     fn omitted_take_keeps_every_offered_leaf_at_identity() {
         let source = source_with(None, &["*.md"], &[], DeployMode::Copy);
-        let args = Args::flat(&source, &["a.md", "b.md", "skip.txt"]);
-        let plan = args.resolve();
+        let case = Case::flat(&source, &["a.md", "b.md", "skip.txt"]);
+        let binding = case.project();
         assert_eq!(
-            dest_paths(&plan),
-            vec![PathBuf::from("/dst/a.md"), PathBuf::from("/dst/b.md")],
-            "an omitted take projects every offered leaf at identity; got: {:?}",
-            dest_paths(&plan)
+            dests(&binding),
+            vec!["a.md".to_string(), "b.md".to_string()],
+            "an omitted take projects every offered leaf at identity"
         );
     }
 
     #[test]
-    fn take_literal_outside_offer_is_a_hard_error_at_plan_time() {
+    fn take_literal_outside_offer_is_a_hard_error() {
         let source = source_with(None, &["*.md"], &[], DeployMode::Copy);
-        let mut args = Args::flat(&source, &["present.md"]);
-        args.take = Some(take_leaves(&["absent.md"]));
-        let rendered = args
-            .try_resolve()
-            .expect_err("a take literal outside the offer must hard-error at plan time")
-            .to_string();
-        assert_named_diagnostic(&rendered, "absent.md");
-    }
-
-    #[test]
-    fn take_glob_subsets_the_offer_and_never_widens_it() {
-        let source = source_with(None, &["**"], &[], DeployMode::Copy);
-        let mut args = Args::flat(
-            &source,
-            &["skills/a/SKILL.md", "skills/b/SKILL.md", "editor/init.lua"],
+        let mut case = Case::flat(&source, &["present.md"]);
+        case.take = Some(vec![TakeEntry::Leaf("absent.md".to_string())]);
+        let err = case
+            .try_project()
+            .expect_err("a take literal outside the offer must hard-error");
+        assert!(
+            matches!(err, ProjectionError::LeafNotOffered { .. }),
+            "an unoffered take literal is a structured LeafNotOffered; got {err:?}"
         );
-        args.take = Some(vec![TakeEntry::Leaf("skills/**".to_string())]);
-        let plan = args.resolve();
-        assert_eq!(
-            dest_paths(&plan),
-            vec![PathBuf::from("/dst/skills")],
-            "a take glob subsets the offer to the skills subtree (collapsed) and never widens to \
-             `editor/init.lua`; got: {:?}",
-            dest_paths(&plan)
-        );
+        assert_named_diagnostic(&rendered(err), "absent.md");
     }
 
     #[test]
     fn take_rename_maps_leaf_to_dest_destructively() {
         let source = source_with(None, &["**"], &[], DeployMode::Copy);
-        let mut args = Args::flat(&source, &["x.md", "untouched.md"]);
-        args.take = Some(vec![TakeEntry::Rename {
+        let mut case = Case::flat(&source, &["x.md", "untouched.md"]);
+        case.take = Some(vec![TakeEntry::Rename {
             src: "x.md".to_string(),
             dest: "renamed.md".to_string(),
         }]);
-        let plan = args.resolve();
+        let binding = case.project();
         assert_eq!(
-            materializations(&plan),
+            materializations(&binding),
             vec![leaf("x.md", "renamed.md")],
-            "a rename emits the leaf only at its destination and consumes the original; got: {:?}",
-            materializations(&plan)
+            "a rename emits the leaf only at its destination and consumes the original"
         );
-        assert_eq!(
-            dest_paths(&plan),
-            vec![PathBuf::from("/dst/renamed.md")],
-            "the destination is the renamed published key joined under the target; got: {:?}",
-            dest_paths(&plan)
-        );
+        assert_eq!(dests(&binding), vec!["renamed.md".to_string()]);
     }
 
     #[test]
     fn collapse_link_default_wholly_taken_dir_becomes_one_collapsed_dir() {
         let source = source_with(None, &["**"], &[], DeployMode::Link);
-        let args = Args::flat(&source, &["d/a.md", "d/b.md"]);
-        let plan = args.resolve();
-        assert_eq!(
-            materializations(&plan),
-            vec![collapsed("d")],
-            "a wholly-taken dir under link collapses to one CollapsedDir; got: {:?}",
-            materializations(&plan)
-        );
-        assert_eq!(
-            dest_paths(&plan),
-            vec![PathBuf::from("/dst/d")],
-            "the collapsed dir destination is the dir key under the target; got: {:?}",
-            dest_paths(&plan)
-        );
-    }
-
-    #[test]
-    fn collapse_copy_default_within_dir_exclude_still_collapses() {
-        let source = source_with(None, &["d/a.md"], &[], DeployMode::Copy);
-        let args = Args::flat(&source, &["d/a.md", "d/secret.md"]);
-        let plan = args.resolve();
-        assert_eq!(
-            materializations(&plan),
-            vec![collapsed("d")],
-            "under copy a within-dir exclude does not block collapse; got: {:?}",
-            materializations(&plan)
-        );
-        assert!(
-            plan.warnings.is_empty(),
-            "copy collapse with an excluded child emits no warning; got: {:?}",
-            plan.warnings
-        );
-    }
-
-    #[test]
-    fn collapse_force_per_leaf_emits_each_leaf() {
-        let source = source_with(None, &["**"], &[], DeployMode::Link);
-        let input = BindingPlanInput {
-            identity: "s",
-            source: "s",
-            commit: "c0ffee",
-            offer: source.offer(),
-            candidate_leaves: &leaves(&["d/a.md", "d/b.md"]),
-            take: None,
-            mode: DeployMode::Link,
-            collapse: Some(false),
-            layout: &LayoutConfig::default(),
-            target_path: Path::new("/dst"),
-            template_opt_in: &TemplateOptIn::SuffixOnly,
-        };
-        let plan = resolve_binding_plan(&input).expect("plan resolves");
-        assert_eq!(
-            materializations(&plan),
-            vec![leaf("d/a.md", "d/a.md"), leaf("d/b.md", "d/b.md")],
-            "`collapse = false` (ForcePerLeaf) emits every leaf even for a wholly-taken dir; got: {:?}",
-            materializations(&plan)
-        );
-    }
-
-    #[test]
-    fn collapse_force_collapse_blocked_under_link_is_hard_error() {
-        let source = source_with(None, &["d/a.md"], &[], DeployMode::Link);
-        let input = BindingPlanInput {
-            identity: "s",
-            source: "s",
-            commit: "c0ffee",
-            offer: source.offer(),
-            candidate_leaves: &leaves(&["d/a.md", "d/secret.md"]),
-            take: None,
-            mode: DeployMode::Link,
-            collapse: Some(true),
-            layout: &LayoutConfig::default(),
-            target_path: Path::new("/dst"),
-            template_opt_in: &TemplateOptIn::SuffixOnly,
-        };
-        let rendered = resolve_binding_plan(&input)
-            .expect_err(
-                "`collapse = true` blocked by a within-dir exclude under link is a hard error",
-            )
-            .to_string();
-        assert_named_diagnostic(&rendered, "d");
-        assert!(
-            rendered.contains("to debug: phora preview --files"),
-            "a partial-take collapse block must point at the preview command; got:\n{rendered}"
-        );
+        let case = Case::flat(&source, &["d/a.md", "d/b.md"]);
+        let binding = case.project();
+        assert_eq!(materializations(&binding), vec![collapsed("d")]);
+        assert_eq!(dests(&binding), vec!["d".to_string()]);
     }
 
     #[test]
     fn deploy_mode_copy_maps_to_collapse_mode_copy() {
         let source = source_with(None, &["d/a.md"], &[], DeployMode::Copy);
-        let args = Args::flat(&source, &["d/a.md", "d/secret.md"]);
-        let plan = args.resolve();
+        let case = Case::flat(&source, &["d/a.md", "d/secret.md"]);
         assert_eq!(
-            materializations(&plan),
+            materializations(&case.project()),
             vec![collapsed("d")],
-            "DeployMode::Copy maps to CollapseMode::Copy: the within-dir exclude does NOT block \
-             collapse; got: {:?}",
-            materializations(&plan)
+            "DeployMode::Copy maps to CollapseMode::Copy: a within-dir exclude does NOT block collapse"
         );
     }
 
     #[test]
     fn deploy_mode_link_maps_to_collapse_mode_link() {
         let source = source_with(None, &["d/a.md"], &[], DeployMode::Link);
-        let args = Args::flat(&source, &["d/a.md", "d/secret.md"]);
-        let plan = args.resolve();
+        let case = Case::flat(&source, &["d/a.md", "d/secret.md"]);
         assert_eq!(
-            materializations(&plan),
+            materializations(&case.project()),
             vec![leaf("d/a.md", "d/a.md")],
-            "DeployMode::Link maps to CollapseMode::Link: the within-dir exclude blocks collapse \
-             and falls back per-leaf; got: {:?}",
-            materializations(&plan)
+            "DeployMode::Link maps to CollapseMode::Link: the within-dir exclude blocks collapse"
         );
     }
 
     #[test]
-    fn layout_flat_destination_is_target_join_published_key() {
-        let source = source_with(None, &["**"], &[], DeployMode::Copy);
-        let mut args = Args::flat(&source, &["top.md"]);
-        args.layout = LayoutConfig::default();
-        let plan = args.resolve();
-        assert_eq!(
-            dest_paths(&plan),
-            vec![PathBuf::from("/dst/top.md")],
-            "flat layout: destination is target_path.join(published_key); got: {:?}",
-            dest_paths(&plan)
+    fn collapse_force_collapse_blocked_under_link_is_hard_error() {
+        let source = source_with(None, &["d/a.md"], &[], DeployMode::Link);
+        let mut case = Case::flat(&source, &["d/a.md", "d/secret.md"]);
+        case.collapse = Some(true);
+        let err = case.try_project().expect_err(
+            "`collapse = true` blocked by a within-dir exclude under link is a hard error",
         );
+        assert!(matches!(err, ProjectionError::CollapseBlocked { .. }));
+        let text = rendered(err);
+        assert_named_diagnostic(&text, "d");
+        assert!(
+            text.contains("to debug: phora preview --files"),
+            "a partial-take collapse block must point at the preview command; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn layout_flat_destination_is_published_key() {
+        let source = source_with(None, &["**"], &[], DeployMode::Copy);
+        let case = Case::flat(&source, &["top.md"]);
+        assert_eq!(dests(&case.project()), vec!["top.md".to_string()]);
     }
 
     #[test]
     fn layout_by_source_prefixes_identity() {
         let source = source_with(None, &["**"], &[], DeployMode::Copy);
-        let mut args = Args::flat(&source, &["top.md"]);
-        args.identity = "mysrc";
-        args.layout = named_layout("by-source");
-        let plan = args.resolve();
-        assert_eq!(
-            dest_paths(&plan),
-            vec![PathBuf::from("/dst/mysrc/top.md")],
-            "by-source layout: destination joins target/identity/key; got: {:?}",
-            dest_paths(&plan)
-        );
+        let mut case = Case::flat(&source, &["top.md"]);
+        case.identity = "mysrc";
+        case.layout = named_layout("by-source");
+        assert_eq!(dests(&case.project()), vec!["mysrc/top.md".to_string()]);
     }
 
     #[test]
     fn layout_prefixed_joins_with_separator() {
         let source = source_with(None, &["**"], &[], DeployMode::Copy);
-        let mut args = Args::flat(&source, &["a/deep.md"]);
-        args.identity = "mysrc";
-        args.layout = named_layout("prefixed");
-        let plan = args.resolve();
-        assert_eq!(
-            dest_paths(&plan),
-            vec![PathBuf::from("/dst/mysrc-a")],
-            "prefixed layout joins identity and the multi-segment published key `a` with the \
-             default `-` separator (a wholly-taken `a/` collapses to `a`); got: {:?}",
-            dest_paths(&plan)
-        );
+        let mut case = Case::flat(&source, &["a/deep.md"]);
+        case.identity = "mysrc";
+        case.layout = named_layout("prefixed");
+        assert_eq!(dests(&case.project()), vec!["mysrc-a".to_string()]);
+    }
+
+    fn binding_input<'a>(
+        identity: &'a str,
+        source: &'a ResolvedSourceRef,
+        inventory: &'a SourceInventory,
+        offer: &'a OfferSpec,
+        take: &'a TakeSpec,
+        templates: &'a TemplatePolicy,
+        layout: &'a LayoutSpec,
+    ) -> BindingProjectionInput<'a> {
+        BindingProjectionInput {
+            identity,
+            source,
+            offer,
+            inventory,
+            take,
+            collapse: CollapsePreference::default(),
+            materialization: MaterializationPolicy::Copy,
+            layout,
+            templates,
+        }
     }
 
     #[test]
     fn cross_binding_duplicate_dest_across_all_bindings_is_rejected() {
         let source = source_with(None, &["**"], &[], DeployMode::Copy);
-        let first = BindingPlanInput {
-            identity: "one",
-            source: "s",
-            commit: "c0ffee",
-            offer: source.offer(),
-            candidate_leaves: &leaves(&["shared.md"]),
-            take: None,
-            mode: DeployMode::Copy,
-            collapse: Some(false),
-            layout: &LayoutConfig::default(),
-            target_path: Path::new("/dst"),
-            template_opt_in: &TemplateOptIn::SuffixOnly,
-        };
-        let second = BindingPlanInput {
-            identity: "two",
-            source: "s",
-            commit: "c0ffee",
-            offer: source.offer(),
-            candidate_leaves: &leaves(&["shared.md"]),
-            take: None,
-            mode: DeployMode::Copy,
-            collapse: Some(false),
-            layout: &LayoutConfig::default(),
-            target_path: Path::new("/dst"),
-            template_opt_in: &TemplateOptIn::SuffixOnly,
-        };
-        let rendered = super::resolve_target_plan("home", &[first, second])
-            .expect_err(
-                "two bindings landing the same /dst/shared.md must be rejected target-globally",
-            )
-            .to_string();
-        assert_named_diagnostic(&rendered, "shared.md");
+        let offer = OfferSpec::from(source.offer());
+        let take = TakeSpec::from_entries(None);
+        let templates = TemplatePolicy::from(&TemplateOptIn::SuffixOnly);
+        let layout = LayoutSpec::from(&LayoutConfig::default());
+        let inv = SourceInventory::from_paths(["shared.md"]).expect("valid paths");
+        let one = ResolvedSourceRef::new("s", COMMIT);
+        let two = ResolvedSourceRef::new("s", COMMIT);
+        let inputs = [
+            binding_input("one", &one, &inv, &offer, &take, &templates, &layout),
+            binding_input("two", &two, &inv, &offer, &take, &templates, &layout),
+        ];
+        let err = project_target("home", &inputs)
+            .expect_err("two bindings landing the same shared.md must be rejected target-globally");
+        assert!(matches!(err, ProjectionError::DuplicateDestination { .. }));
+        let text = rendered(err);
+        assert_named_diagnostic(&text, "shared.md");
         assert!(
-            rendered.contains("to debug: phora preview --target home"),
-            "a cross-binding dup must point at the preview command scoped to the offending \
-             target; got:\n{rendered}"
+            text.contains("to debug: phora preview --target home"),
+            "a cross-binding dup must point at the preview command scoped to the target; got:\n{text}"
         );
     }
 
     #[test]
-    fn cross_binding_dup_dest_uses_simple_fold_not_full_casefold() {
+    fn prune_expected_set_is_derived_from_projected_keys() {
         let source = source_with(None, &["**"], &[], DeployMode::Copy);
-        let upper = BindingPlanInput {
-            identity: "one",
-            source: "s",
-            commit: "c0ffee",
-            offer: source.offer(),
-            candidate_leaves: &leaves(&["C"]),
-            take: None,
-            mode: DeployMode::Copy,
-            collapse: Some(false),
-            layout: &LayoutConfig::default(),
-            target_path: Path::new("/dst"),
-            template_opt_in: &TemplateOptIn::SuffixOnly,
-        };
-        let lower = BindingPlanInput {
-            identity: "two",
-            source: "s",
-            commit: "c0ffee",
-            offer: source.offer(),
-            candidate_leaves: &leaves(&["c"]),
-            take: None,
-            mode: DeployMode::Copy,
-            collapse: Some(false),
-            layout: &LayoutConfig::default(),
-            target_path: Path::new("/dst"),
-            template_opt_in: &TemplateOptIn::SuffixOnly,
-        };
-        super::resolve_target_plan("home", &[upper, lower]).expect_err(
-            "`C` and `c` collide under simple fold and must be rejected across bindings",
-        );
-
-        let sharp_s = BindingPlanInput {
-            identity: "one",
-            source: "s",
-            commit: "c0ffee",
-            offer: source.offer(),
-            candidate_leaves: &leaves(&["straße"]),
-            take: None,
-            mode: DeployMode::Copy,
-            collapse: Some(false),
-            layout: &LayoutConfig::default(),
-            target_path: Path::new("/dst"),
-            template_opt_in: &TemplateOptIn::SuffixOnly,
-        };
-        let ss = BindingPlanInput {
-            identity: "two",
-            source: "s",
-            commit: "c0ffee",
-            offer: source.offer(),
-            candidate_leaves: &leaves(&["strasse"]),
-            take: None,
-            mode: DeployMode::Copy,
-            collapse: Some(false),
-            layout: &LayoutConfig::default(),
-            target_path: Path::new("/dst"),
-            template_opt_in: &TemplateOptIn::SuffixOnly,
-        };
-        super::resolve_target_plan("home", &[sharp_s, ss]).expect(
-            "`straße` and `strasse` are distinct under simple fold (not full case-fold) and must \
-             NOT collide",
-        );
-    }
-
-    #[test]
-    fn fold_dest_is_crate_visible_for_cross_binding_reuse() {
-        let fold: fn(&str) -> String = crate::kernel::fold_dest;
+        let mut case = Case::flat(&source, &["d/a.md", "d/b.md", "top.md"]);
+        case.take = Some(vec![TakeEntry::Leaf("top.md".to_string())]);
+        let binding = case.project();
         assert_eq!(
-            fold("C"),
-            fold("c"),
-            "the cross-binding dup-dest check reuses take's fold; `C` and `c` collide under it"
-        );
-        assert_ne!(
-            fold("straße"),
-            fold("strasse"),
-            "fold_dest must stay reachable as a crate item AND remain SIMPLE fold, not full \
-             case-fold: `straße` and `strasse` are distinct"
-        );
-    }
-
-    #[test]
-    fn mapped_field_is_removed_from_plan_entry() {
-        let source = source_with(None, &["**"], &[], DeployMode::Copy);
-        let args = Args::flat(&source, &["top.md"]);
-        let plan = args.resolve();
-        let item: &PlannedItem = &plan.items[0];
-        assert_eq!(
-            item.destination,
-            PathBuf::from("/dst/top.md"),
-            "a PlannedItem carries `materialization` + `destination` only — the dead `mapped` \
-             field is gone; got: {item:?}"
-        );
-    }
-
-    #[test]
-    fn prune_expected_set_is_derived_from_leaf_granular_plan() {
-        let source = source_with(None, &["**"], &[], DeployMode::Copy);
-        let mut args = Args::flat(&source, &["d/a.md", "d/b.md", "top.md"]);
-        args.take = Some(take_leaves(&["top.md"]));
-        let plan = args.resolve();
-        let keys: Vec<String> = super::expected_artifact_keys(&plan);
-        assert_eq!(
-            keys,
+            projected_artifact_keys(&binding),
             vec!["top.md".to_string()],
-            "prune's expected set derives from the leaf-granular plan's published keys, not from \
-             directory-granular discovery; got: {keys:?}"
-        );
-    }
-
-    fn planned(materialization: Materialization, destination: &str) -> PlannedItem {
-        PlannedItem {
-            materialization,
-            destination: PathBuf::from(destination),
-            kept_leaves: Vec::new(),
-        }
-    }
-
-    fn binding(identity: &str, items: Vec<PlannedItem>) -> ResolvedBindingPlan {
-        ResolvedBindingPlan {
-            identity: identity.to_string(),
-            source: "s".to_string(),
-            commit: "c0ffee".to_string(),
-            items,
-            warnings: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn cross_binding_collapsed_dir_overlapping_a_leaf_inside_it_is_rejected() {
-        let dir_binding = binding("a", vec![planned(collapsed("d"), "/dst/d")]);
-        let leaf_binding = binding("b", vec![planned(leaf("a.md", "d/a.md"), "/dst/d/a.md")]);
-
-        let rendered = super::reject_cross_binding_dups("home", &[dir_binding, leaf_binding])
-            .expect_err(
-                "a collapsed dir at `d` and a leaf at `d/a.md` overlap as ancestor/descendant — \
-                 `d` deploys as a directory symlink the leaf would escape into — and must be \
-                 rejected, not pass as distinct folded keys",
-            )
-            .to_string();
-        assert_named_diagnostic(&rendered, "d/a.md");
-
-        let dir_binding = binding("a", vec![planned(collapsed("d"), "/dst/d")]);
-        let leaf_binding = binding("b", vec![planned(leaf("a.md", "d/a.md"), "/dst/d/a.md")]);
-        super::reject_cross_binding_dups("home", &[leaf_binding, dir_binding]).expect_err(
-            "overlap rejection must hold with the descendant first — it is not binding-order \
-             dependent",
+            "prune's expected set derives from the projected published keys"
         );
     }
 
     #[test]
-    fn cross_binding_sibling_sharing_a_string_prefix_is_allowed() {
-        let dir_binding = binding("a", vec![planned(collapsed("d"), "/dst/d")]);
-        let leaf_binding = binding("b", vec![planned(leaf("d.md", "d.md"), "/dst/d.md")]);
-        super::reject_cross_binding_dups("home", &[dir_binding, leaf_binding]).expect(
-            "`/dst/d` and `/dst/d.md` are distinct path components — the ancestor check splits on \
-             `/`, not a raw byte prefix — and must NOT be rejected",
+    fn destinations_stay_target_relative() {
+        let source = source_with(None, &["**"], &[], DeployMode::Copy);
+        let mut case = Case::flat(&source, &["a.md"]);
+        case.identity = "editor";
+        case.layout = named_layout("by-source");
+        let binding = case.project();
+        let dest = binding.artifacts[0].destination.as_str();
+        assert!(
+            !dest.starts_with('/'),
+            "the projection keeps the destination target-relative, joining the root is sync's job; got `{dest}`"
+        );
+        assert_eq!(
+            Path::new("/home/u/deploy").join(dest),
+            Path::new("/home/u/deploy/editor/a.md"),
+            "a consumer reconstructs the absolute deploy path by joining the target root"
         );
     }
 }
