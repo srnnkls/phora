@@ -531,6 +531,159 @@ fn helper_comment_or_string_cannot_fake_or_trip_materialization_ownership() {
     );
 }
 
+fn extract_comment_text(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '/' && chars.get(i + 1) == Some(&'/') {
+            i += 2;
+            while i < chars.len() && chars[i] != '\n' {
+                out.push(chars[i]);
+                i += 1;
+            }
+            out.push('\n');
+        } else if c == '/' && chars.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                out.push(chars[i]);
+                i += 1;
+            }
+            i = (i + 2).min(chars.len());
+            out.push('\n');
+        } else if c == '"' {
+            i += 1;
+            while i < chars.len() && chars[i] != '"' {
+                if chars[i] == '\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+fn projection_reexport_comment_context() -> String {
+    let src = read_src("kernel/mod.rs");
+    let lines: Vec<&str> = src.lines().collect();
+    let hits: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.contains("pub use crate::projection"))
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        !hits.is_empty(),
+        "src/kernel/mod.rs must contain a `pub use crate::projection::…` re-export block"
+    );
+    let first = hits[0];
+    let mut block_end = *hits.last().unwrap();
+    while block_end < lines.len() && !lines[block_end].contains(';') {
+        block_end += 1;
+    }
+    let start = first.saturating_sub(6);
+    let end = (block_end + 6).min(lines.len() - 1);
+    extract_comment_text(&lines[start..=end].join("\n"))
+}
+
+const COMPAT_VOCAB: &[&str] = &[
+    "compat",
+    "facade",
+    "phase",
+    "temporary",
+    "transitional",
+    "shim",
+    "migration",
+];
+
+const COMPAT_PURPOSE: &[&str] = &["re-export", "reexport", "compat", "callers", "kernel"];
+
+const COMPAT_NEGATORS: &[&str] = &["not", "never", "no", "isn", "aren"];
+
+const COMPAT_NEG_WINDOW: usize = 3;
+
+fn line_has_positive_vocab(line: &str) -> bool {
+    let toks: Vec<String> = line
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    toks.iter().enumerate().any(|(i, tok)| {
+        COMPAT_VOCAB.contains(&tok.as_str())
+            && !toks[i.saturating_sub(COMPAT_NEG_WINDOW)..i]
+                .iter()
+                .any(|w| COMPAT_NEGATORS.contains(&w.as_str()))
+    })
+}
+
+fn comment_states_phase_scoped_facade(comments: &str) -> bool {
+    comments.lines().any(|line| {
+        let lower = line.to_lowercase();
+        line_has_positive_vocab(line) && COMPAT_PURPOSE.iter().any(|p| lower.contains(p))
+    })
+}
+
+#[test]
+fn kernel_reexport_block_carries_a_phase_scoped_compat_constraint_comment() {
+    let comments = projection_reexport_comment_context();
+    assert!(
+        comment_states_phase_scoped_facade(&comments),
+        "src/kernel/mod.rs must carry a constraint comment ADJACENT to its \
+         `pub use crate::projection::…` re-export block that POSITIVELY attributes the facade as a \
+         phase-scoped backward-compat shim: a compat/facade vocabulary word ({COMPAT_VOCAB:?}) not \
+         governed by a negation marker (not/never/no/isn't/aren't) AND co-occurring in the same \
+         comment with a re-export/compat purpose reference ({COMPAT_PURPOSE:?}). A negated \
+         \"NOT a temporary shim\" or an unrelated \"migration happens elsewhere\" note must not \
+         satisfy it. Comment text near block:\n{comments}"
+    );
+}
+
+#[test]
+fn helper_extract_comment_text_and_reexport_context_are_substance_based() {
+    assert_eq!(
+        extract_comment_text("let x = 1; // facade shim\npub use a;").trim(),
+        "facade shim",
+        "line-comment content after `//` must be extracted"
+    );
+    assert_eq!(
+        extract_comment_text("/* phase-scoped compat */\npub use a;").trim(),
+        "phase-scoped compat",
+        "block-comment content must be extracted"
+    );
+    assert!(
+        extract_comment_text("const S: &str = \"facade compat phase\";")
+            .trim()
+            .is_empty(),
+        "compat vocabulary inside a string literal must NOT count as a comment"
+    );
+}
+
+#[test]
+fn helper_compat_constraint_requires_positive_attribution_and_purpose() {
+    assert!(
+        comment_states_phase_scoped_facade(
+            "Phase-scoped compat facade: keeps kernel:: callers green until the kernel dissolves (T030)"
+        ),
+        "a legitimate phase-scoped compat facade note (non-negated vocab + a compat/callers/kernel \
+         purpose reference) must satisfy"
+    );
+    assert!(
+        !comment_states_phase_scoped_facade("NOT a temporary shim — this is permanent kernel API"),
+        "a negation marker governing the vocab word (NOT a temporary shim) must not satisfy, even \
+         though the line mentions kernel"
+    );
+    assert!(
+        !comment_states_phase_scoped_facade("migration of unrelated code happens elsewhere"),
+        "a bare vocab word (migration) with no re-export/compat/callers/kernel purpose reference \
+         must not satisfy — an unrelated note must not game the oracle"
+    );
+}
+
 #[test]
 fn helper_string_literal_cannot_fake_test_retention() {
     let faked = "const SNIPPET: &str = \"#[test]\nfn admits_published_x() {}\";";
