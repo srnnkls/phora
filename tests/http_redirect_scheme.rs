@@ -2,8 +2,8 @@ use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
-use phora::http::download;
 use phora::source::SourceError;
+use phora::source::http::download;
 
 const PAYLOAD: &[u8] = b"phora-redirect-fixture\n";
 

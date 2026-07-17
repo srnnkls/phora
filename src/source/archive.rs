@@ -235,8 +235,10 @@ fn strip_single_top_level(mut entries: Vec<ExtractedEntry>) -> Vec<ExtractedEntr
 
 #[cfg(test)]
 mod tests {
-    use crate::archive::{EntryKind, ExtractedEntry, extract, extract_archive, safe_archive_path};
     use crate::source::SourceError;
+    use crate::source::archive::{
+        EntryKind, ExtractedEntry, extract, extract_archive, safe_archive_path,
+    };
     use std::collections::BTreeMap;
     use std::io::Write;
     use std::path::{Path, PathBuf};

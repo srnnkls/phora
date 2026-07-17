@@ -16,14 +16,11 @@
     reason = "stub signatures return NotImplemented; per-fn `# Errors` docs land with the real bodies"
 )]
 
-pub mod archive;
-pub mod backend;
 pub mod cli;
 pub mod config;
 pub mod deploy;
 pub mod diagnostic;
 pub mod error;
-pub mod http;
 pub mod kernel;
 pub mod lock;
 pub mod paths;
