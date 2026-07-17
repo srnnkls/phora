@@ -11,7 +11,7 @@ use super::cache::{
     sweep_orphan_staging,
 };
 use super::inventory::{populate_inventory, snapshot_commit};
-use super::snapshot::{ResolvedSource, SourceEntry, SourceStore};
+use super::snapshot::{ResolvedSource, SourceEntry, SourceStore, frame_tag};
 use super::{
     ExportRequest, ExportResult, ExportWalk, Renderer, Result, SourceBackend, SourceEntryKind,
     SourceEntryMeta, SourceError, SourceInventory, SourcePath, TreeEntry, hash_framed_entry,
@@ -369,17 +369,13 @@ impl SourceBackend for GitBackend {
         let selection = OfferSelection::compile(include, exclude, None)
             .map_err(|e| SourceError::Source(format!("compile offer for {source}: {e}")))?;
         let candidates: Vec<&str> = leaves.iter().map(|(path, _, _)| path.as_str()).collect();
-        let selected: BTreeSet<String> = selection.select(&candidates).into_iter().collect();
+        let selected = selection
+            .select(&candidates)
+            .iter()
+            .map(|path| SourcePath::new(path))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        let mut hasher = blake3::Hasher::new();
-        for (path, tag, oid) in &leaves {
-            if !selected.contains(path) {
-                continue;
-            }
-            let data = Self::find_blob_data(&repo, source.as_str(), *oid)?;
-            hash_framed_entry(&mut hasher, path.as_bytes(), tag, &data);
-        }
-        Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+        Self::digest_leaves_in(&repo, source.as_str(), commit, &subtree, &selected)
     }
 }
 
@@ -478,6 +474,45 @@ impl GitBackend {
             .map_err(|e| SourceError::Source(format!("blob {oid} in {source}: {e}")))?;
         Ok(blob.data.clone())
     }
+
+    fn digest_leaves_in(
+        repo: &gix::Repository,
+        source: &str,
+        commit: &str,
+        tree: &gix::Tree<'_>,
+        leaves: &[SourcePath],
+    ) -> Result<String> {
+        let mut sorted: Vec<&SourcePath> = leaves.iter().collect();
+        sorted.sort_unstable();
+        sorted.dedup();
+
+        let mut hasher = blake3::Hasher::new();
+        for path in sorted {
+            let entry = tree
+                .lookup_entry_by_path(Path::new(path.as_str()))
+                .map_err(|e| {
+                    SourceError::Source(format!("lookup {path} at {commit} in {source}: {e}"))
+                })?
+                .ok_or_else(|| SourceError::FileAbsent {
+                    source_name: source.to_owned(),
+                    commit: commit.to_owned(),
+                    path: PathBuf::from(path.as_str()),
+                })?;
+            let kind = kind_of_entry(entry.mode().kind()).ok_or_else(|| {
+                SourceError::MappedKeyNotALeaf {
+                    key: PathBuf::from(path.as_str()),
+                }
+            })?;
+            let data = Self::find_blob_data(repo, source, entry.object_id())?;
+            hash_framed_entry(
+                &mut hasher,
+                path.as_str().as_bytes(),
+                frame_tag(kind),
+                &data,
+            );
+        }
+        Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+    }
 }
 
 fn kind_of_tag(tag: &[u8]) -> SourceEntryKind {
@@ -510,6 +545,14 @@ impl SourceStore for GitBackend {
                 .into_iter()
                 .map(|(path, tag, _)| (path, kind_of_tag(tag))),
         )
+    }
+
+    fn digest_snapshot(&self, source: &ResolvedSource, leaves: &[SourcePath]) -> Result<String> {
+        let name = source.name.as_str();
+        let commit = snapshot_commit(&source.snapshot);
+        let repo = self.open_mirror(name, &source.url)?;
+        let tree = Self::commit_tree(&repo, name, commit)?;
+        Self::digest_leaves_in(&repo, name, commit, &tree, leaves)
     }
 
     fn read(&self, source: &ResolvedSource, path: &SourcePath) -> Result<SourceEntry> {
