@@ -11,8 +11,8 @@ use std::process::Command;
 use std::str::FromStr;
 
 use phora::config::{Config, Refspec};
-use phora::http::verify_digest;
 use phora::kernel::{Digest, SourceName};
+use phora::source::http::verify_digest;
 use phora::source::{GitBackend, SourceBackend};
 use phora::store::{ArtifactKey, FileRegistry, Registry};
 use tempfile::TempDir;

@@ -371,12 +371,20 @@ fn assert_all_defined(rel: &str, names: &[&str], what: &str) {
 }
 
 #[test]
-fn contract_source_rs_defines_pure_source_value_types() {
-    assert_all_defined(
-        "source.rs",
-        SOURCE_VALUE_TYPES,
+fn contract_source_module_defines_pure_source_value_types() {
+    let monolith = strip(&read_src("source.rs"));
+    let model = strip(&read_src("source/model.rs"));
+    let missing: Vec<&str> = SOURCE_VALUE_TYPES
+        .iter()
+        .copied()
+        .filter(|name| !defines_pub_type(&monolith, name) && !defines_pub_type(&model, name))
+        .collect();
+    assert!(
+        missing.is_empty(),
         "the pure source-owned value types (SourcePath/SourceEntryKind/SourceEntryMeta/\
-         SourceInventory — no I/O; PR5 adds the store that populates them)",
+         SourceInventory — no I/O; PR5 adds the store that populates them) must be defined in \
+         src/source.rs (pre-T011) or src/source/model.rs (post-T011 split); absent from both: \
+         {missing:?}"
     );
 }
 

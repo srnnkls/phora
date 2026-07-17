@@ -7,13 +7,17 @@ REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 LEGACY_ALLOWLIST=(
   $'src/deploy.rs\tT024'
   $'src/store.rs\tT025'
-  $'src/source.rs\tT016'
+  $'src/source/archive.rs\tT016'
+  $'src/source/cache.rs\tT016'
+  $'src/source/git.rs\tT016'
+  $'src/source/http.rs\tT016'
+  $'src/source/import.rs\tT016'
+  $'src/source/mod.rs\tT016'
+  $'src/source/worktree.rs\tT016'
   $'src/sync/transitive.rs\tT029'
 )
 
 LEGACY_INFRA=(
-  src/archive.rs
-  src/http.rs
   src/main.rs
 )
 

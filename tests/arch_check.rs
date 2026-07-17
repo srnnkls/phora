@@ -363,7 +363,13 @@ fn allowlist_is_exactly_the_phase_scoped_legacy_set() {
     let mut want: Vec<(String, String)> = [
         ("src/deploy.rs", "T024"),
         ("src/store.rs", "T025"),
-        ("src/source.rs", "T016"),
+        ("src/source/archive.rs", "T016"),
+        ("src/source/cache.rs", "T016"),
+        ("src/source/git.rs", "T016"),
+        ("src/source/http.rs", "T016"),
+        ("src/source/import.rs", "T016"),
+        ("src/source/mod.rs", "T016"),
+        ("src/source/worktree.rs", "T016"),
         ("src/sync/transitive.rs", "T029"),
     ]
     .into_iter()
@@ -863,15 +869,12 @@ fn legacy_infra_grandfather_set_is_pinned_exactly() {
         .collect();
     got.sort();
 
-    let mut want: Vec<String> = ["src/archive.rs", "src/http.rs", "src/main.rs"]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-    want.sort();
+    let want = vec!["src/main.rs".to_string()];
 
     assert_eq!(
         got, want,
-        "the LEGACY_INFRA grandfather set must be exactly these three infrastructure \
-         modules; adding a fourth entry (the set may only ever shrink) must fail this pin"
+        "after T011 moved src/archive.rs and src/http.rs into src/source/, the LEGACY_INFRA \
+         grandfather set must be exactly src/main.rs; re-adding an entry (the set may only \
+         ever shrink) must fail this pin"
     );
 }
