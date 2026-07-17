@@ -10,9 +10,11 @@ use super::cache::{
     MirrorStaging, fetch_into_mirror, lock_mirror, mirror_path, open_mirror, reclone_mirror,
     sweep_orphan_staging,
 };
+use super::inventory::{populate_inventory, snapshot_commit};
+use super::snapshot::{ResolvedSource, SourceEntry, SourceStore};
 use super::{
-    ExportRequest, ExportResult, ExportWalk, Renderer, Result, SourceBackend, SourceError,
-    TreeEntry, hash_framed_entry,
+    ExportRequest, ExportResult, ExportWalk, Renderer, Result, SourceBackend, SourceEntryKind,
+    SourceEntryMeta, SourceError, SourceInventory, SourcePath, TreeEntry, hash_framed_entry,
 };
 
 pub struct GitBackend {
@@ -475,5 +477,66 @@ impl GitBackend {
             .find_blob(oid)
             .map_err(|e| SourceError::Source(format!("blob {oid} in {source}: {e}")))?;
         Ok(blob.data.clone())
+    }
+}
+
+fn kind_of_tag(tag: &[u8]) -> SourceEntryKind {
+    match tag {
+        b"\x00exec\x00" => SourceEntryKind::Executable,
+        b"\x00link\x00" => SourceEntryKind::Symlink,
+        _ => SourceEntryKind::File,
+    }
+}
+
+fn kind_of_entry(kind: EntryKind) -> Option<SourceEntryKind> {
+    match kind {
+        EntryKind::Blob => Some(SourceEntryKind::File),
+        EntryKind::BlobExecutable => Some(SourceEntryKind::Executable),
+        EntryKind::Link => Some(SourceEntryKind::Symlink),
+        EntryKind::Tree | EntryKind::Commit => None,
+    }
+}
+
+impl SourceStore for GitBackend {
+    fn inventory(&self, source: &ResolvedSource) -> Result<SourceInventory> {
+        let name = source.name.as_str();
+        let commit = snapshot_commit(&source.snapshot);
+        let repo = self.open_mirror(name, &source.url)?;
+        let tree = Self::commit_tree(&repo, name, commit)?;
+        let mut leaves = Vec::new();
+        Self::collect_digest_leaves(&repo, name, &tree, Path::new(""), &mut leaves)?;
+        populate_inventory(
+            leaves
+                .into_iter()
+                .map(|(path, tag, _)| (path, kind_of_tag(tag))),
+        )
+    }
+
+    fn read(&self, source: &ResolvedSource, path: &SourcePath) -> Result<SourceEntry> {
+        let name = source.name.as_str();
+        let commit = snapshot_commit(&source.snapshot);
+        let repo = self.open_mirror(name, &source.url)?;
+        let tree = Self::commit_tree(&repo, name, commit)?;
+        let entry = tree
+            .lookup_entry_by_path(Path::new(path.as_str()))
+            .map_err(|e| SourceError::Source(format!("read {path} at {commit} in {name}: {e}")))?
+            .ok_or_else(|| SourceError::FileAbsent {
+                source_name: name.to_owned(),
+                commit: commit.to_owned(),
+                path: PathBuf::from(path.as_str()),
+            })?;
+        let kind = kind_of_entry(entry.mode().kind()).ok_or_else(|| {
+            SourceError::Source(format!(
+                "{path} at {commit} in {name} is not a regular file"
+            ))
+        })?;
+        let bytes = Self::find_blob_data(&repo, name, entry.object_id())?;
+        Ok(SourceEntry {
+            meta: SourceEntryMeta {
+                path: path.clone(),
+                kind,
+            },
+            bytes,
+        })
     }
 }

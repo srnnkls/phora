@@ -5,8 +5,11 @@ mod cache;
 mod git;
 pub mod http;
 mod import;
+mod inventory;
 mod model;
+mod resolve;
 mod router;
+mod snapshot;
 mod worktree;
 
 #[cfg(test)]
@@ -14,8 +17,10 @@ pub(crate) use cache::mirror_path;
 pub use git::GitBackend;
 pub use import::HttpBackend;
 pub use model::{SourceEntryKind, SourceEntryMeta, SourceInventory, SourcePath};
+pub use resolve::resolve_worktree;
 pub use router::RouterBackend;
-pub use worktree::{is_local_path, read_local_head};
+pub use snapshot::{ResolvedSource, SnapshotId, SourceEntry, SourceStore};
+pub use worktree::{capture_worktree, is_local_path, read_local_head};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
