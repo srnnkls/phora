@@ -37,6 +37,7 @@ pub use resolve::resolve_sources_for_bench;
 use prune::prune_orphans;
 pub(crate) use prune::{orphan_artifact_path, orphan_records};
 use resolve::resolve_sources;
+pub use target::StageBridge;
 pub(crate) use target::record_artifact_path;
 use target::{TargetRun, deploy_target};
 

@@ -11,7 +11,7 @@ use crate::store::{
 };
 
 use super::confine::{ProtectedPathSet, confine_destination};
-use super::plan::{ProjectedArtifact, ProjectionWarning, plan_target};
+use super::plan::{ProjectedArtifact, ProjectionWarning, TargetProjection, plan_target};
 use super::{
     Conflict, ConflictKind, ConflictResolver, Resolution, StagingGuard, nonce, remote_for,
     target_parent,
@@ -119,7 +119,11 @@ pub(super) fn deploy_target(
                 mode_transition,
                 template_opt_in,
             };
-            had_failures |= deploy_artifact_entry(run, &entry, backend, registry, journal)?;
+            let bridge = StageBridge {
+                artifact: item,
+                target: &plan,
+            };
+            had_failures |= deploy_entry(run, &entry, bridge, backend, registry, journal)?;
         }
     }
 
@@ -203,9 +207,31 @@ pub(super) fn record_manifest_base(target: &Target, record: &RegistryRecord) -> 
     }
 }
 
+#[cfg(test)]
 pub(super) fn deploy_artifact_entry(
     run: TargetRun<'_>,
     entry: &ArtifactEntry<'_>,
+    backend: &dyn SourceBackend,
+    registry: &dyn Registry,
+    journal: &Journal,
+) -> Result<bool> {
+    let projection = TargetProjection {
+        target: run.target_name.to_owned(),
+        bindings: Vec::new(),
+        artifacts: Vec::new(),
+        warnings: Vec::new(),
+    };
+    let bridge = StageBridge {
+        artifact: entry.item,
+        target: &projection,
+    };
+    deploy_entry(run, entry, bridge, backend, registry, journal)
+}
+
+fn deploy_entry(
+    run: TargetRun<'_>,
+    entry: &ArtifactEntry<'_>,
+    bridge: StageBridge<'_>,
     backend: &dyn SourceBackend,
     registry: &dyn Registry,
     journal: &Journal,
@@ -256,8 +282,7 @@ pub(super) fn deploy_artifact_entry(
                 underlying_source: entry.underlying_source,
                 root: entry.source.offer().root(),
                 commit: entry.commit,
-                materialization: &entry.item.materialization,
-                kept_leaves: &entry.item.kept_leaves,
+                bridge,
                 kind: entry.record_kind(),
                 artifact_dst,
                 key,
@@ -422,6 +447,11 @@ fn warn_skip(source: &str, artifact: &str, kind: &ConflictKind, dst: &Path) {
     }
 }
 
+pub struct StageBridge<'a> {
+    pub artifact: &'a ProjectedArtifact,
+    pub target: &'a TargetProjection,
+}
+
 struct DeployContext<'a> {
     deploy_root: String,
     layout: LayoutConfig,
@@ -431,8 +461,7 @@ struct DeployContext<'a> {
     underlying_source: &'a str,
     root: Option<&'a Path>,
     commit: &'a str,
-    materialization: &'a Materialization,
-    kept_leaves: &'a [crate::kernel::ResolvedTake],
+    bridge: StageBridge<'a>,
     kind: RecordKind,
     artifact_dst: &'a Path,
     key: ArtifactKey,
@@ -456,9 +485,10 @@ fn deploy_one(
     let commit_time = backend.commit_time(ctx.source_name, git, ctx.commit)?;
     let policy = ctx.source.export_policy();
 
-    let (leaves, staging_payload) = match ctx.materialization {
+    let (leaves, staging_payload) = match &ctx.bridge.artifact.materialization {
         Materialization::CollapsedDir { dir } => {
-            let leaves = collapsed_dir_leaves(dir, ctx.kept_leaves, ctx.template_opt_in);
+            let leaves =
+                collapsed_dir_leaves(dir, &ctx.bridge.artifact.kept_leaves, ctx.template_opt_in);
             (leaves, staging.clone())
         }
         Materialization::Leaf(take) => {
