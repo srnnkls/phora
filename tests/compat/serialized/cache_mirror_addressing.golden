@@ -1,0 +1,18 @@
+https://github.com/user/repo.git
+  normalized = github.com/user/repo
+  mirror_dir = e4fe0aa6833f13bc.git
+https://github.com/user/repo
+  normalized = github.com/user/repo
+  mirror_dir = e4fe0aa6833f13bc.git
+git@github.com:user/repo.git
+  normalized = github.com/user/repo
+  mirror_dir = e4fe0aa6833f13bc.git
+https://GitHub.com/User/Repo.git
+  normalized = github.com/User/Repo
+  mirror_dir = ad4e7f178bcb40da.git
+https://gitlab.com/group/sub/project.git
+  normalized = gitlab.com/group/sub/project
+  mirror_dir = b50a4e5ee5353d43.git
+ssh://git@example.com/team/tool.git
+  normalized = example.com/team/tool
+  mirror_dir = c0f99814f77c2fe5.git

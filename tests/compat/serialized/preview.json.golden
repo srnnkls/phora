@@ -1,0 +1,37 @@
+exit: 0
+--- stdout ---
+{
+  "targets": [
+    {
+      "target": "home",
+      "path": "<TARGET>",
+      "entries": [
+        {
+          "identity": "dotfiles",
+          "source": "dotfiles",
+          "artifact": "editor",
+          "commit": "ca94c83b3a51aab8dea8315a9baa986e178c599d",
+          "destination": "<TARGET>/editor",
+          "state": "Synced",
+          "files": [],
+          "rename": null,
+          "collapsed": true
+        },
+        {
+          "identity": "dotfiles",
+          "source": "dotfiles",
+          "artifact": "lint",
+          "commit": "ca94c83b3a51aab8dea8315a9baa986e178c599d",
+          "destination": "<TARGET>/lint",
+          "state": "Synced",
+          "files": [],
+          "rename": null,
+          "collapsed": true
+        }
+      ],
+      "collisions": [],
+      "warnings": [],
+      "untrusted_stripped_hook": false
+    }
+  ]
+}--- stderr ---

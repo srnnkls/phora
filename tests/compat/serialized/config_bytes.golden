@@ -1,0 +1,11 @@
+version = 1
+
+[sources.dotfiles]
+path = "<SRC>"
+branch = "main"
+include = ["editor"]
+
+[targets.home]
+path = "<TARGET>"
+layout = "flat"
+sources = ["dotfiles"]

@@ -1,0 +1,61 @@
+--- locks/journal.toml ---
+entry = []
+--- targets/home/artifacts/dotfiles/editor.toml ---
+version = 1
+source = "dotfiles"
+commit = "ca94c83b3a51aab8dea8315a9baa986e178c599d"
+digest = "blake3:2316b2c05d3f72e93270833746381341b70a008daf5af59a2ddb2a8c83206bc0"
+projected_at = "NNNN-NN-NNTNN:NN:NN.NNNNNN+NN:NN"
+layout = "flat"
+kind = "dir"
+allow_symlinks = false
+preserve_executable = true
+linked = false
+deploy_root = "<TARGET>"
+
+[key]
+target = "home"
+source = "dotfiles"
+artifact = "editor"
+
+[[files]]
+path = "init.lua"
+size = 8
+mtime = 1700000000
+blake3 = "6f65cb0a072fd2d7597889093ceb9aab1ee3018f6308726ac722ab8264652fff"
+
+[[files]]
+path = "lua/opts.lua"
+size = 10
+mtime = 1700000000
+blake3 = "e3a2a38ea650a80d1d6e017b207f47ce37c73d06eb5b1bea7d1007a79ab6e673"
+--- targets/home/artifacts/dotfiles/lint.toml ---
+version = 1
+source = "dotfiles"
+commit = "ca94c83b3a51aab8dea8315a9baa986e178c599d"
+digest = "blake3:d26cc52a7261d7a76fa1f6dadda5cba932687bd6cf626e7ea746e46dc8937cfb"
+projected_at = "NNNN-NN-NNTNN:NN:NN.NNNNNN+NN:NN"
+layout = "flat"
+kind = "dir"
+allow_symlinks = false
+preserve_executable = true
+linked = false
+deploy_root = "<TARGET>"
+
+[key]
+target = "home"
+source = "dotfiles"
+artifact = "lint"
+
+[[files]]
+path = "rules.toml"
+size = 8
+mtime = 1700000000
+blake3 = "d52137575e8858a7357d9cf31a4a00f2da179326d37d9849075282904b077c4c"
+--- targets/home/meta.toml ---
+version = 1
+
+[[ejected]]
+source = "dotfiles"
+artifact = "editor"
+ejected_at = "NNNN-NN-NNTNN:NN:NN.NNNNNN+NN:NN"

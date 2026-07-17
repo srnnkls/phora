@@ -1,0 +1,4 @@
+exit: 1
+--- stdout ---
+--- stderr ---
+error: source error: clone bare dotfiles: Could not verify that "/nonexistent/phora-compat-fixture" url is a valid git directory before attempting to use it
