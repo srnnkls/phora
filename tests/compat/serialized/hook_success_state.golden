@@ -1,0 +1,6 @@
+version = 1
+ejected = []
+
+[[hooks]]
+hook_id = "home#0123456789abcdef#fedcba9876543210"
+last_success = ["blake3:aaaa1111", "blake3:bbbb2222"]

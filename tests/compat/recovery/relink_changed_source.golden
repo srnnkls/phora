@@ -1,0 +1,4 @@
+dst_link_target = <ROOT>/worktree-b/app.conf
+record_commit = link
+record_linked = true
+journal_entries = 0

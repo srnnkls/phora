@@ -1,0 +1,3 @@
+record_committed = true
+committed_commit = abc123def456
+journal_entries = 0

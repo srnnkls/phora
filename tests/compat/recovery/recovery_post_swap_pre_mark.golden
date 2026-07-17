@@ -1,0 +1,5 @@
+dst_after_recovery = Some("original body\n")
+staging_exists = false
+backup_exists = false
+record_committed = false
+journal_entries = 0

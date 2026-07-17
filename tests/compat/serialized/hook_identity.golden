@@ -1,0 +1,12 @@
+dep_instance = 9dd8a0658c02347b
+hook_id = ns%1%editor#on_change#97c766296031c835
+command = ./install.sh
+on_change_preimage = blake3:551b5c40a1ea0959ce66f6535bc06bbb16856b2f7578a6f19add6a537b4b9b28
+pre_deploy_preimage = blake3:be85742a7167690b9de0d451a3dbcf3639f64a98ec238c135751d0bfa5dc77c1
+
+dep_instance = 9dd8a0658c02347b
+hook_id = ns%1%editor#on_change#2d38bdb748a79c2b
+command = setup --yes
+on_change_preimage = blake3:79120e68e6c1ccc30e64439993fa1e79953143482630f90751c822e89d1c5d5d
+pre_deploy_preimage = blake3:0046dd5d6a6bf2df2160d58e839c2b50e19714e8f8ac043eaed0630b2e4132de
+

@@ -1,0 +1,4 @@
+exit: 1
+--- stdout ---
+--- stderr ---
+error: state root <XDG_STATE>/phora/projects/<PROJECT> is read-only: a frozen sync cannot write here

@@ -1,0 +1,4 @@
+exit: 75
+--- stdout ---
+--- stderr ---
+error: lock error: another phora process is running for this project (state.lock held)
