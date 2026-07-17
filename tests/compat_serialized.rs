@@ -10,7 +10,7 @@
 //! source path) — plus wall-clock timestamps and temp paths, are normalized,
 //! each by its own literal value so an unrelated 16-hex token is never scrubbed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
@@ -19,12 +19,17 @@ use std::process::{Command, Output};
 use std::str::FromStr as _;
 
 use phora::config::transitive::{FetchNode, Instance};
-use phora::config::{TemplateOptIn, admit_transitive_hooks, hook_preimage};
+use phora::config::{Config, TemplateOptIn, admit_transitive_hooks, hook_preimage};
 use phora::kernel::SourceName;
 use phora::lock::{CandidateHookRecord, LOCK_SCHEMA_VERSION, Lock, TrustedHook};
+use phora::projection::model::{
+    BindingProjection, BindingProjectionInput, CollapsePreference, LayoutSpec, LayoutStyle,
+    Materialization, MaterializationPolicy, OfferSpec, ResolvedSourceRef, TakeSpec,
+    TargetProjection, TemplatePolicy,
+};
 use phora::source::{
     ExportLeaf, ExportPolicy, ExportRequest, GitBackend, MirrorKey, NormalizedUrl,
-    SourceBackend as _, vars_digest,
+    SourceBackend as _, SourceInventory, vars_digest,
 };
 use phora::store::{FileRegistry, Registry as _};
 use tempfile::TempDir;
@@ -392,7 +397,17 @@ fn normalize_iso_timestamps(s: &str) -> String {
                 None
             };
             if let Some(end) = end {
-                for &byte in &b[i..end] {
+                for &byte in &b[i..i + 19] {
+                    out.push(if byte.is_ascii_digit() {
+                        'N'
+                    } else {
+                        byte as char
+                    });
+                }
+                if b.get(i + 19) == Some(&b'.') {
+                    out.push_str(".NNNNNN");
+                }
+                for &byte in &b[j..end] {
                     out.push(if byte.is_ascii_digit() {
                         'N'
                     } else {
@@ -502,20 +517,31 @@ fn normalize_scrubs_only_fixture_ids_and_preserves_unrelated_hex() {
 }
 
 #[test]
-fn normalize_iso_timestamps_preserves_offset_and_precision_shape() {
+fn normalize_iso_timestamps_masks_fractions_fixed_width_and_keeps_offset_shape() {
     assert_eq!(
         normalize_iso_timestamps("at 2026-07-17T00:31:44.156086+00:00 done"),
         "at NNNN-NN-NNTNN:NN:NN.NNNNNN+NN:NN done",
     );
-    // Distinct offset flavor and fractional precision must yield distinct masks,
-    // so a Z→+00:00 or precision drift breaks the golden rather than hiding.
+    assert_eq!(
+        normalize_iso_timestamps("2026-07-17T00:31:44.156Z"),
+        normalize_iso_timestamps("2026-07-17T00:31:44.156086231Z"),
+        "chrono's AutoSi emits 0/3/6/9 fractional digits per value; every present \
+         fraction must mask to one fixed-width token or the goldens flake on \
+         trailing-zero micros"
+    );
+    assert_eq!(
+        normalize_iso_timestamps("2026-07-17T00:31:44.156Z"),
+        "NNNN-NN-NNTNN:NN:NN.NNNNNNZ",
+    );
+    assert_eq!(
+        normalize_iso_timestamps("2026-07-17T00:31:44Z"),
+        "NNNN-NN-NNTNN:NN:NNZ",
+        "an absent fraction stays absent; only a present fraction masks fixed-width"
+    );
     assert_ne!(
         normalize_iso_timestamps("2026-07-17T00:31:44Z"),
         normalize_iso_timestamps("2026-07-17T00:31:44+00:00"),
-    );
-    assert_ne!(
-        normalize_iso_timestamps("2026-07-17T00:31:44.156086Z"),
-        normalize_iso_timestamps("2026-07-17T00:31:44.156Z"),
+        "a Z↔+00:00 offset drift must still break the golden rather than hide"
     );
 }
 
@@ -1083,4 +1109,360 @@ fn hook_dedup_behavior_is_byte_identical() {
     let runs = std::fs::read_to_string(fx.cwd.path().join("invocations.txt"))
         .map_or(0, |s| s.lines().count());
     assert_golden("hook_dedup.golden", &format!("invocations = {runs}\n"));
+}
+
+// ─── T010: the moved projection paths vs the T002 goldens ───────────────────
+
+fn read_golden(name: &str) -> String {
+    std::fs::read_to_string(golden_dir().join(name)).expect("read golden fixture")
+}
+
+fn snapshot_stdout(snapshot: &str) -> &str {
+    let marker = "--- stdout ---\n";
+    let start = snapshot.find(marker).expect("snapshot has a stdout marker") + marker.len();
+    let end = snapshot
+        .rfind("--- stderr ---")
+        .expect("snapshot has a stderr marker");
+    &snapshot[start..end]
+}
+
+fn preview_json_artifact_commit_pairs(json: &str) -> Vec<(String, String)> {
+    let doc: serde_json::Value = serde_json::from_str(json).expect("preview json parses");
+    let field = |entry: &serde_json::Value, key: &str| {
+        entry[key]
+            .as_str()
+            .unwrap_or_else(|| panic!("entry carries a string `{key}`"))
+            .to_owned()
+    };
+    doc["targets"][0]["entries"]
+        .as_array()
+        .expect("preview json has entries")
+        .iter()
+        .map(|entry| (field(entry, "artifact"), field(entry, "commit")))
+        .collect()
+}
+
+fn golden_tree_commit_dest_pairs() -> Vec<(String, String)> {
+    read_golden("projection_tree.golden")
+        .lines()
+        .filter_map(|line| {
+            let (head, dest) = line.split_once(" -> <TARGET>/")?;
+            let commit = head.trim_start().split_once('@')?.1.split_once(' ')?.0;
+            Some((commit.to_owned(), dest.to_owned()))
+        })
+        .collect()
+}
+
+fn golden_lock_commit() -> String {
+    read_golden("lock.toml.golden")
+        .lines()
+        .find_map(|line| line.strip_prefix("commit = "))
+        .expect("the lock golden records a resolved commit")
+        .trim_matches('"')
+        .to_owned()
+}
+
+fn golden_registry_leaf_paths(artifact: &str) -> Vec<String> {
+    let text = read_golden("registry_records.golden");
+    let header = format!("--- targets/home/artifacts/dotfiles/{artifact}.toml ---\n");
+    let (_, rest) = text
+        .split_once(&header)
+        .unwrap_or_else(|| panic!("the registry golden has a section for `{artifact}`"));
+    let mut paths: Vec<String> = rest
+        .split("\n--- ")
+        .next()
+        .expect("a split yields a first chunk")
+        .lines()
+        .filter_map(|line| line.strip_prefix("path = "))
+        .map(|value| value.trim_matches('"').to_owned())
+        .collect();
+    paths.sort();
+    paths
+}
+
+fn fixture_source_commit(fx: &Fixture) -> String {
+    let out = Command::new("git")
+        .current_dir(&fx.src_path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("rev-parse runs");
+    assert!(out.status.success(), "rev-parse succeeds");
+    String::from_utf8(out.stdout)
+        .expect("utf8 sha")
+        .trim()
+        .to_owned()
+}
+
+fn moved_path_projection(fx: &Fixture, layout_override: Option<LayoutSpec>) -> TargetProjection {
+    let cfg = Config::parse(&git_source_config(fx)).expect("fixture config parses");
+    let parsed = cfg.parsed_sources().expect("fixture sources parse");
+    let target = &cfg.targets["home"];
+    let commit = fixture_source_commit(fx);
+
+    let bindings = target.resolve_sources(&parsed);
+    assert_eq!(
+        bindings.len(),
+        1,
+        "the fixture declares exactly one binding"
+    );
+    let binding = &bindings[0];
+    let source = &parsed[binding.source];
+
+    let git_dir = TempDir::new().expect("git dir tempdir");
+    let backend = GitBackend::new(git_dir.path().to_path_buf());
+    let url = fx.src_path.to_string_lossy().into_owned();
+    let name = sn(binding.source);
+    backend.fetch(&name, &url).expect("fetch builds mirror");
+    let leaves = backend
+        .list_source_leaves(&name, &url, &commit, None)
+        .expect("list source leaves");
+
+    let inventory =
+        SourceInventory::from_paths(leaves.iter().map(String::as_str)).expect("valid inventory");
+    let offer = OfferSpec::from(source.offer());
+    let take = TakeSpec::from_entries(binding.take);
+    let templates = TemplatePolicy::from(&binding.template_opt_in);
+    let layout = layout_override.unwrap_or_else(|| LayoutSpec::from(&target.layout()));
+    let resolved = ResolvedSourceRef::new(binding.source, commit);
+
+    let input = BindingProjectionInput {
+        identity: binding.identity,
+        source: &resolved,
+        offer: &offer,
+        inventory: &inventory,
+        take: &take,
+        collapse: CollapsePreference::from(binding.collapse),
+        materialization: MaterializationPolicy::from(&source.deploy_mode()),
+        layout: &layout,
+        templates: &templates,
+    };
+    phora::projection::build::project_target("home", &[input]).expect("the fixture projects")
+}
+
+fn destinations_of(projection: &TargetProjection) -> Vec<String> {
+    projection
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.destination.as_str().to_owned())
+        .collect()
+}
+
+#[test]
+fn moved_projection_output_equals_projection_tree_and_artifact_identity_goldens() {
+    let fx = build_fixture();
+    let projection = moved_path_projection(&fx, None);
+
+    let tree = golden_tree_commit_dest_pairs();
+    assert!(
+        !tree.is_empty(),
+        "the projection-tree golden pins at least one artifact"
+    );
+    let destinations = destinations_of(&projection);
+    assert_eq!(
+        destinations,
+        tree.iter()
+            .map(|(_, dest)| dest.clone())
+            .collect::<Vec<_>>(),
+        "the moved projection's target-relative destinations must equal the T002 \
+         projection-tree golden"
+    );
+
+    assert_eq!(projection.bindings.len(), 1, "one binding projects");
+    let binding = &projection.bindings[0];
+    let lock_commit = golden_lock_commit();
+    assert_eq!(
+        binding.commit, lock_commit,
+        "the moved projection's resolved commit must equal the lock golden's artifact identity"
+    );
+    for (abbreviated, _) in &tree {
+        assert_eq!(
+            abbreviated,
+            &lock_commit[..abbreviated.len()],
+            "the tree golden abbreviates that same commit"
+        );
+    }
+
+    let entries =
+        preview_json_artifact_commit_pairs(snapshot_stdout(&read_golden("preview.json.golden")));
+    assert_eq!(
+        phora::projection::build::projected_artifact_keys(binding),
+        entries
+            .iter()
+            .map(|(artifact, _)| artifact.clone())
+            .collect::<Vec<_>>(),
+        "the moved projected_artifact_keys must equal the preview-json golden's artifact keys"
+    );
+    for (artifact, commit) in &entries {
+        assert_eq!(
+            commit, &binding.commit,
+            "preview-json golden entry `{artifact}` carries the projected commit"
+        );
+    }
+
+    for artifact in &binding.artifacts {
+        let key = artifact.materialization.published_key();
+        let mut leaf_destinations: Vec<String> = artifact
+            .leaves
+            .iter()
+            .map(|leaf| leaf.destination.as_str().to_owned())
+            .collect();
+        leaf_destinations.sort();
+        let golden_paths = golden_registry_leaf_paths(key);
+        assert!(
+            !golden_paths.is_empty(),
+            "the registry golden pins leaves for `{key}`"
+        );
+        assert_eq!(
+            leaf_destinations, golden_paths,
+            "artifact `{key}`: the moved projection's leaf set must equal the registry \
+             golden's manifest paths"
+        );
+    }
+
+    let perturbed = moved_path_projection(
+        &fx,
+        Some(LayoutSpec::new(LayoutStyle::BySource, String::new())),
+    );
+    assert_ne!(
+        destinations_of(&perturbed),
+        destinations,
+        "a divergent projection (by-source layout) must not satisfy the golden equality"
+    );
+}
+
+#[test]
+fn preview_sync_and_prune_share_one_projected_artifact_identity_set() {
+    let fx = build_fixture();
+    fx.write_config(&git_source_config(&fx));
+    assert_success(&fx.run(&["sync"]), "sync");
+    let out = fx.run(&["preview", "--json"]);
+    assert_success(&out, "preview --json");
+
+    let previewed: BTreeSet<String> =
+        preview_json_artifact_commit_pairs(&String::from_utf8_lossy(&out.stdout))
+            .into_iter()
+            .map(|(artifact, _)| artifact)
+            .collect();
+
+    let artifacts_dir = fx.registry_dir().join("targets/home/artifacts/dotfiles");
+    let synced: BTreeSet<String> = std::fs::read_dir(&artifacts_dir)
+        .expect("sync recorded artifact records")
+        .map(|entry| {
+            entry
+                .expect("dir entry")
+                .path()
+                .file_stem()
+                .expect("record file stem")
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+
+    let projection = moved_path_projection(&fx, None);
+    let prune_protected: BTreeSet<String> = projection
+        .bindings
+        .iter()
+        .flat_map(phora::projection::build::projected_artifact_keys)
+        .collect();
+
+    let expected: BTreeSet<String> = ["editor", "lint"].map(str::to_owned).into_iter().collect();
+    assert_eq!(
+        previewed, expected,
+        "preview derives the projected artifact identities"
+    );
+    assert_eq!(
+        synced, expected,
+        "sync manages the projected artifact identities"
+    );
+    assert_eq!(
+        prune_protected, expected,
+        "the keys prune protects are the moved projection's projected_artifact_keys"
+    );
+}
+
+#[test]
+fn deploy_joins_the_target_root_with_moved_target_relative_destinations() {
+    let fx = build_fixture();
+    fx.write_config(&git_source_config(&fx));
+    assert_success(&fx.run(&["sync"]), "sync");
+
+    let projection = moved_path_projection(&fx, None);
+    assert!(
+        !projection.artifacts.is_empty(),
+        "the fixture projects artifacts"
+    );
+    for artifact in &projection.artifacts {
+        let dest = artifact.destination.as_str();
+        assert!(
+            !dest.starts_with('/'),
+            "the moved projection keeps `{dest}` target-relative; joining the root is sync's job"
+        );
+        let deployed = fx.target_path.join(dest);
+        match &artifact.materialization {
+            Materialization::Leaf(_) => assert!(
+                deployed.is_file(),
+                "deploy must materialize the leaf by joining the target root with `{dest}`"
+            ),
+            Materialization::CollapsedDir { .. } => {
+                assert!(
+                    deployed.is_dir(),
+                    "deploy must materialize the dir by joining the target root with `{dest}`"
+                );
+                for leaf in &artifact.leaves {
+                    let file = deployed.join(leaf.destination.as_str());
+                    assert!(
+                        file.is_file(),
+                        "deploy must materialize leaf `{}` under the joined destination",
+                        file.display()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn sync_facade_projection_exports_are_the_moved_symbols() {
+    let inventory = SourceInventory::from_paths(["d/a.md", "d/b.md"]).expect("valid paths");
+    let offer = OfferSpec::implicit_full();
+    let take = TakeSpec::from_entries(None);
+    let templates = TemplatePolicy::suffix_only();
+    let layout = LayoutSpec::new(LayoutStyle::Flat, String::new());
+    let source = ResolvedSourceRef::new("s", "c0ffee");
+    let input = BindingProjectionInput {
+        identity: "s",
+        source: &source,
+        offer: &offer,
+        inventory: &inventory,
+        take: &take,
+        collapse: CollapsePreference::Default,
+        materialization: MaterializationPolicy::Copy,
+        layout: &layout,
+        templates: &templates,
+    };
+
+    let via_facade: BindingProjection =
+        phora::sync::project_binding(&input).expect("facade projects");
+    let direct = phora::projection::build::project_binding(&input).expect("direct path projects");
+    assert_eq!(
+        via_facade, direct,
+        "facade and moved path yield one projection"
+    );
+
+    let facade_keys: fn(&BindingProjection) -> Vec<String> = phora::sync::projected_artifact_keys;
+    assert_eq!(
+        facade_keys(&direct),
+        phora::projection::build::projected_artifact_keys(&direct),
+        "facade and moved projected_artifact_keys agree"
+    );
+    assert_eq!(
+        phora::projection::build::projected_artifact_keys(&direct),
+        vec!["d".to_owned()],
+        "the wholly-taken dir projects as the collapsed key `d`"
+    );
+
+    let moved_destination: phora::projection::model::TargetPath =
+        direct.artifacts[0].destination.clone();
+    let facade_destination: phora::sync::TargetPath = moved_destination;
+    assert_eq!(facade_destination.as_str(), "d");
 }
