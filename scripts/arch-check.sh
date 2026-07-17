@@ -213,7 +213,8 @@ projection_use_ok() {
     globset|globset::*) return 0 ;;
     unicode_normalization|unicode_normalization::*) return 0 ;;
     crate::source::*) leaf_in_set "${u#crate::source::}" "SourcePath SourceInventory SourceEntryMeta SourceEntryKind" ;;
-    crate::kernel::*) leaf_in_set "${u#crate::kernel::}" "TargetName ArtifactName SourceName Commit" ;;
+    # safe_relpath: pure path guard shared with kernel identity types; expires with the kernel leaf entry (T029).
+    crate::kernel::*) leaf_in_set "${u#crate::kernel::}" "TargetName ArtifactName SourceName Commit safe_relpath" ;;
     crate::*|crate) return 1 ;;
     std::fs|std::fs::*|std::process|std::process::*|std::net|std::net::*|std::io|std::io::*|std::os|std::os::*) return 1 ;;
     std|std::*) return 0 ;;
@@ -254,6 +255,28 @@ check_uses() {
   done <<< "$uses"
 }
 
+check_fq_crate() {
+  local file="$1" validator="$2" label="$3" rel="$4" stripped path
+  stripped="$(stripped_or_die "$file")"
+  while IFS= read -r path; do
+    [[ -z "$path" ]] && continue
+    if ! "$validator" "$path"; then
+      echo "arch-check: $label forbidden fully-qualified crate path in ${rel}: $path" >&2
+      violations=$((violations + 1))
+    fi
+  done < <(perl -e '
+    local $/;
+    my $s = <STDIN>;
+    $s =~ s/\buse\s+[^;]+;//gs;
+    $s =~ s/\s*::\s*/::/g;
+    while ($s =~ /\bcrate((?:::[A-Za-z_]\w*)+)/g) {
+      my @seg = split /::/, "crate$1";
+      @seg = @seg[0..2] if @seg > 3;
+      print join("::", @seg), "\n";
+    }
+  ' <<< "$stripped")
+}
+
 check_fq_io() {
   local file="$1" label="$2" rel="$3" stripped re alias
   stripped="$(stripped_or_die "$file")"
@@ -281,6 +304,7 @@ if [[ -d "$SRC/projection" ]]; then
     rel="${f#"$SCAN_ROOT"/}"
     check_uses "$f" projection_use_ok "projection" "$rel"
     check_fq_io "$f" "projection" "$rel"
+    check_fq_crate "$f" projection_use_ok "projection" "$rel"
   done < <(find "$SRC/projection" -type f -name '*.rs' | sort)
 fi
 

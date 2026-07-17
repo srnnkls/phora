@@ -6,6 +6,8 @@ mod name;
 mod path;
 mod project_id;
 
+// Phase-scoped compat facade: these `pub use crate::projection::…` re-exports keep
+// kernel:: callers green until the kernel dissolves (T030).
 pub use crate::projection::collapse::{
     CollapseChoice, CollapseMode, CollapsePlan, CollapseWarning, plan_collapse,
 };

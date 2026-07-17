@@ -752,6 +752,91 @@ fn projection_non_io_alias_passes() {
     );
 }
 
+#[test]
+fn projection_fully_qualified_non_allowlisted_crate_call_fails() {
+    let bypasses = [
+        (
+            "crate::config",
+            "pub fn build() { let _ = crate::config::load(\"x\"); }\n",
+        ),
+        (
+            "crate::source::GitBackend",
+            "pub fn build() { let _ = crate::source::GitBackend::new(\"x\"); }\n",
+        ),
+        (
+            "crate::sync",
+            "pub fn build() { let _ = crate::sync::plan::plan_target(\"x\"); }\n",
+        ),
+        (
+            "crate::store",
+            "pub fn build() { let _ = crate::store::guard_git_fork(\"x\"); }\n",
+        ),
+    ];
+    for (label, body) in bypasses {
+        let tree = base_tree();
+        tree.write("src/projection/build.rs", body);
+        tree.check().assert_fail(&format!(
+            "projection reaching a NON-allowlisted crate module via a fully-qualified body \
+             call (`{label}::…`) with no use statement — full qualification must not bypass \
+             the positive use-allowlist (INV-1 fully-qualified crate-path bypass)"
+        ));
+    }
+}
+
+#[test]
+fn projection_whitespace_separated_fq_path_fails() {
+    let bypasses = [
+        (
+            "crate :: sync (spaces around ::)",
+            "pub fn build() { let _ = crate :: sync :: foo(); }\n",
+        ),
+        (
+            "crate ::\\n config (newline-split ::)",
+            "pub fn build() { let _ = crate ::\n    config :: load(\"x\"); }\n",
+        ),
+    ];
+    for (label, body) in bypasses {
+        let tree = base_tree();
+        tree.write("src/projection/build.rs", body);
+        tree.check().assert_fail(&format!(
+            "projection reaching a NON-allowlisted crate module via a fully-qualified body \
+             call whose `::` separators carry surrounding whitespace (`{label}`) — legal Rust \
+             spacing/newlines around path separators must not bypass the INV-1 positive \
+             use-allowlist"
+        ));
+    }
+}
+
+#[test]
+fn projection_fully_qualified_allowlisted_kernel_identity_passes() {
+    let tree = base_tree();
+    tree.write(
+        "src/projection/build.rs",
+        "pub fn build() -> crate::kernel::TargetName {\n    \
+         let _err: Option<crate::error::Error> = None;\n    \
+         let _path: Option<crate::source::SourcePath> = None;\n    \
+         crate::kernel::TargetName::from(\"x\")\n}\n",
+    );
+    tree.check().assert_pass(
+        "projection referencing ALLOWLISTED leaves via fully-qualified body paths with no use \
+         statement — a kernel identity (`crate::kernel::TargetName`), the crate error type \
+         (`crate::error::Error`), and a pure source value type (`crate::source::SourcePath`), each \
+         on projection_use_ok's positive allowlist — closing the FQ bypass must not over-reject the \
+         same leaf allowlist the use-scan already permits",
+    );
+}
+
+#[test]
+fn arch_check_real_tree_root_scan_stays_green() {
+    run_arch_check(&manifest()).assert_pass(
+        "`bash scripts/arch-check.sh .` scanning the real repository tree — however the \
+         INV-1 fully-qualified `crate::kernel::safe_relpath` bypass in projection/take.rs is \
+         resolved (relocate the pure helper into projection, or extend the body-scan and admit \
+         the leaf), the live tree must remain exit 0; safe_relpath itself must not be pinned \
+         forbidden",
+    );
+}
+
 fn print_infra() -> Option<String> {
     match Command::new(script_path())
         .arg("--print-infra")
