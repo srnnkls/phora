@@ -286,8 +286,35 @@ impl Config {
 }
 
 use crate::sync::{
-    CollapsePreference, LayoutSpec, LayoutStyle, MaterializationPolicy, OfferSpec, TemplatePolicy,
+    CollapsePreference, LayoutSpec, LayoutStyle, MaterializationPolicy, OfferSpec, TakeSpec,
+    TemplatePolicy,
 };
+
+impl TakeSpec {
+    #[must_use]
+    pub fn from_entries(entries: Option<&[TakeEntry]>) -> Self {
+        let Some(entries) = entries else {
+            return Self::ProjectAll;
+        };
+        let mut literals = Vec::new();
+        let mut globs = Vec::new();
+        let mut renames = Vec::new();
+        for entry in entries {
+            match entry {
+                TakeEntry::Leaf(leaf) if crate::kernel::is_take_glob(leaf) => {
+                    globs.push(leaf.clone());
+                }
+                TakeEntry::Leaf(leaf) => literals.push(leaf.clone()),
+                TakeEntry::Rename { src, dest } => renames.push((src.clone(), dest.clone())),
+            }
+        }
+        Self::Explicit {
+            literals,
+            globs,
+            renames,
+        }
+    }
+}
 
 impl From<Offer<'_>> for OfferSpec {
     fn from(offer: Offer<'_>) -> Self {

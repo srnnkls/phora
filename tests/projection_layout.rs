@@ -373,6 +373,25 @@ fn projection_mod_declares_the_four_file_backed_submodules() {
 }
 
 #[test]
+fn projection_build_and_diagnostic_modules_exist_and_are_declared() {
+    let mod_rs = read_src("projection/mod.rs");
+    for (file, module) in [("build.rs", "build"), ("diagnostic.rs", "diagnostic")] {
+        let rel = format!("projection/{file}");
+        assert!(
+            src_path(&rel).is_file(),
+            "src/{rel} must exist after the T009 move of the projection cluster out of \
+             sync/plan.rs (specs and output types → model.rs, verbs and validation → build.rs, \
+             ProjectionWarning/ProjectionError → diagnostic.rs)"
+        );
+        assert!(
+            declares_file_module(&mod_rs, module),
+            "src/projection/mod.rs must declare `mod {module};` so src/{rel} is a live \
+             file-backed module, not an orphaned placeholder file"
+        );
+    }
+}
+
+#[test]
 fn moved_kernel_source_files_are_gone() {
     for file in ["selection.rs", "take.rs", "collapse.rs"] {
         let rel = format!("kernel/{file}");

@@ -22,5 +22,4 @@ pub use name::{ArtifactName, KernelError, SourceName, TargetName};
 pub use path::RelPath;
 pub use project_id::ProjectId;
 
-pub(crate) use crate::projection::take::fold_dest;
 pub(crate) use name::{safe_component, safe_relpath};
