@@ -1,0 +1,2 @@
+run.sh exec_bits=000
+digest=blake3:7f4977d4d1a384d646645534fe1c31a0d23dccd22263cd5cfa9517950beeb971

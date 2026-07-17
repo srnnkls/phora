@@ -1,0 +1,3 @@
+staged a/b/c.txt exists=true len=17
+nested leaf body
+manifest a/b/c.txt size=17 blake3=d53b3899f8a64c771c42f20476efe9a256eeb5621cae0d26ade451a7e58105ed

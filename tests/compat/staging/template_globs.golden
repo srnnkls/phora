@@ -1,0 +1,5 @@
+--- app.conf (len=10) ---
+cfg=world
+--- notes.txt (len=16) ---
+note {{ name }}
+vars_digest=blake3:dea18f0f6b7960414e9aa3224898bbcd270b41ed69b0df07ab63d3620fe82df0
