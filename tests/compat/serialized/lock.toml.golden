@@ -1,0 +1,9 @@
+version = 1
+
+[[sources]]
+name = "dotfiles"
+git = "<SRC>"
+resolved = "main"
+commit = "ca94c83b3a51aab8dea8315a9baa986e178c599d"
+digest = "blake3:11b617bf6382560c7adb2d6543f9843c8e36d168dc23b6735611c5656ff17624"
+config_digest = "blake3:b8e08f8762862914cb929c8180e62a901e1c24410f47ac2742b299166f16a58e"

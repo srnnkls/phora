@@ -1,0 +1,6 @@
+exit: 0
+--- stdout ---
+home -> <TARGET>
+  dotfiles@ca94c83b editor/ -> <TARGET>/editor
+  dotfiles@ca94c83b lint/ -> <TARGET>/lint
+--- stderr ---

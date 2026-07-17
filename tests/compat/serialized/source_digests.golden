@@ -1,0 +1,17 @@
+[aggregate-selection-digest]
+full-tree = blake3:adb5db5a95d0f370724c5c05b8a61c88900c1f263b6364826892f0f7d45d59a6
+exclude-root-loose = blake3:89e74c9f0dd36af889e36ea0d461a901eb9051fdb973afab1118421655bb0c90
+exclude-dotfile-dir = blake3:9849930cff3cb8477d40355117d2fa7d46e11a09e81aa10a19ff14e43f5db5c6
+editor-subtree = blake3:a4bf87d47664c474e7f850b59219ea1c918a63ca3547150365e17d54c5d1a142
+rooted-dotfile = blake3:32e42c4bbae6cf07138cf5da986cd54f16724aaed61429c45b9f5b3201113e9c
+
+[artifact-digest]
+digest = blake3:adb5db5a95d0f370724c5c05b8a61c88900c1f263b6364826892f0f7d45d59a6
+vars_digest = <none>
+
+[per-file-blake3]
+.config/settings.json size=8 mtime=1700000000 blake3=34aa344b03cece0dd0faae70a9a200b02c75a1495a4fe3869e677c618d9e4135
+README.md size=16 mtime=1700000000 blake3=b71d23e48932da94d6dbdbd7efafdbb566f9fbe9c6e1980677e9c863cd0fd13f
+editor/init.lua size=8 mtime=1700000000 blake3=6f65cb0a072fd2d7597889093ceb9aab1ee3018f6308726ac722ab8264652fff
+editor/lua/opts.lua size=10 mtime=1700000000 blake3=e3a2a38ea650a80d1d6e017b207f47ce37c73d06eb5b1bea7d1007a79ab6e673
+lint/rules.toml size=8 mtime=1700000000 blake3=d52137575e8858a7357d9cf31a4a00f2da179326d37d9849075282904b077c4c

@@ -1,0 +1,5 @@
+exit: 0
+--- stdout ---
+sync complete
+--- stderr ---
+phora: 2 orphaned record(s) with no config target â run `phora list --orphans` to inspect, `phora sync --prune` to remove
