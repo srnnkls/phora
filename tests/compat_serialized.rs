@@ -941,6 +941,7 @@ fn url_synthetic_commit_is_byte_identical() {
     let tar_path = staging.path().join("src.tar");
     let tar = Command::new("tar")
         .current_dir(staging.path())
+        .env("COPYFILE_DISABLE", "1")
         .args(["-cf", "src.tar", "a", "b"])
         .status()
         .expect("tar runs");

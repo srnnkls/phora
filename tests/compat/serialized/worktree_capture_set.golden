@@ -1,0 +1,8 @@
+.config/settings.json File
+.gitignore File
+README.md File
+bin/run.sh Executable
+ignored.log File
+nested/inner.txt File
+plain-dir/data.txt File
+untracked.txt File
