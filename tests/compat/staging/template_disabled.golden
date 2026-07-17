@@ -1,0 +1,3 @@
+--- greet.txt.tmpl (len=17) ---
+hello {{ name }}
+vars_digest=<none>

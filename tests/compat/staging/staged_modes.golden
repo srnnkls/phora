@@ -1,0 +1,3 @@
+greet.txt exec_bits=000
+plain.txt exec_bits=000
+run.sh exec_bits=111

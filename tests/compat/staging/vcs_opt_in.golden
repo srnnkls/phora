@@ -1,0 +1,2 @@
+default: files=0 digest=blake3:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262 staged=false
+vcs_opt_in: files=1 digest=blake3:701875bc9facafb91b406c501e59797cac82e1aa2b8edc8b866f8f4dc53c5799 staged=true

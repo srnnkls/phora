@@ -1,0 +1,7 @@
+--- greet.txt (len=12 final_newline=present) ---
+hello world
+--- plain.txt (len=11 final_newline=present) ---
+plain body
+--- run.sh (len=18 final_newline=present) ---
+#!/bin/sh
+echo hi
