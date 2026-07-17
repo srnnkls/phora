@@ -27,6 +27,7 @@ pub mod http;
 pub mod kernel;
 pub mod lock;
 pub mod paths;
+pub mod projection;
 pub mod source;
 pub mod store;
 pub mod sync;

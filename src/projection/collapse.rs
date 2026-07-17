@@ -6,7 +6,8 @@ use std::collections::BTreeSet;
 
 use crate::diagnostic::SelectionDiagnostic;
 use crate::error::Result;
-use crate::kernel::take::ResolvedTake;
+use crate::projection::model::Materialization;
+use crate::projection::take::ResolvedTake;
 
 /// How a collapsed directory materializes downstream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,26 +27,6 @@ pub enum CollapseChoice {
     ForcePerLeaf,
     /// Demand collapse: a dir that would collapse but is blocked is a hard error.
     ForceCollapse,
-}
-
-/// One planned deployment unit: a collapsed directory or a single kept leaf.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Materialization {
-    /// A whole directory deployed as one artifact, rooted at `dir`.
-    CollapsedDir { dir: String },
-    /// A single kept leaf deployed on its own.
-    Leaf(ResolvedTake),
-}
-
-impl Materialization {
-    /// The published artifact key: the collapsed dir, or the leaf's destination.
-    #[must_use]
-    pub fn published_key(&self) -> &str {
-        match self {
-            Materialization::CollapsedDir { dir } => dir,
-            Materialization::Leaf(take) => &take.dest,
-        }
-    }
 }
 
 /// Non-fatal collapse outcomes.
@@ -264,11 +245,10 @@ fn force_collapse_blocked_diagnostic(dir: &str) -> crate::error::Error {
 
 #[cfg(test)]
 mod collapse_tests {
+    use super::{CollapseChoice, CollapseMode, CollapsePlan, CollapseWarning, plan_collapse};
     use crate::diagnostic::{MATCHED_AGAINST, REMEDY, SELECTION, TO_DEBUG};
-    use crate::kernel::collapse::{
-        CollapseChoice, CollapseMode, CollapsePlan, CollapseWarning, Materialization, plan_collapse,
-    };
-    use crate::kernel::take::ResolvedTake;
+    use crate::projection::model::Materialization;
+    use crate::projection::take::ResolvedTake;
 
     fn kept(pairs: &[(&str, &str)]) -> Vec<ResolvedTake> {
         pairs

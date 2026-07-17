@@ -958,7 +958,7 @@ mod leaf_granular_resolver_tests {
 
     #[test]
     fn fold_dest_is_crate_visible_for_cross_binding_reuse() {
-        let fold: fn(&str) -> String = crate::kernel::take::fold_dest;
+        let fold: fn(&str) -> String = crate::kernel::fold_dest;
         assert_eq!(
             fold("C"),
             fold("c"),
