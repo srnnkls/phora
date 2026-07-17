@@ -133,3 +133,22 @@ the end of the migration.
 | 18 | architecture checks prevent forbidden dependencies | T005 | tests/doc_invariants.rs |
 | 19 | crate-level documentation describes the feature-oriented architecture | T031 | tests/doc_invariants.rs |
 | 20 | all compatibility fixtures, unit tests, integration suites, Clippy, and formatting checks pass | T031 | tests/compat_serialized.rs |
+
+## SourceBackend caller-migration table
+
+`SourceBackend` is the legacy compat port and only shrinks: a method leaves the
+trait once repo-wide caller checks show zero consumers outside `src/source/`.
+As of T013 every consumer below is still live, so every method keeps its
+surface; T020/T030 migrate the callers onto the `SourceStore` path.
+
+| Method | Disposition | Successor | Consumers to migrate |
+| --- | --- | --- | --- |
+| `fetch` | retained | none until the T020/T030 caller migration | src/sync/resolve.rs, src/sync/transitive.rs |
+| `mirror_ready` | retained | none until the T020/T030 caller migration | src/sync/resolve.rs |
+| `read_file_at` | retained | `SourceStore::read` | src/sync/transitive.rs, src/cli/trust.rs |
+| `list_source_leaves` | retained | `SourceStore::inventory` | src/sync/{mod,plan,preview,target,transitive}.rs, src/cli/query.rs |
+| `list_tree_at` | retained | none until the T020/T030 caller migration | src/cli/trust.rs |
+| `resolve` | retained | snapshot resolution beside `resolve_worktree` | src/sync/resolve.rs, src/sync/transitive.rs |
+| `commit_time` | retained | none until the T020/T030 caller migration | src/sync/target.rs, src/sync/rebuild.rs |
+| `export_artifact` | retained | none until the T020/T030 caller migration | src/sync/target.rs, src/sync/rebuild.rs |
+| `compute_digest` | delegates | `SourceStore::digest_snapshot` | src/sync/resolve.rs |
