@@ -7,8 +7,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::diagnostic::SelectionDiagnostic;
 use crate::error::Result;
-use crate::kernel::safe_relpath;
-use crate::kernel::selection::compile_take_glob;
+use crate::projection::offer::compile_take_glob;
 
 /// A take entry is a glob iff it ends in `/` or carries any of `* ? [ ]`;
 /// brace expansion (`{a,b}`) is not a glob marker.
@@ -136,7 +135,7 @@ fn collect_renames<'a>(
         if literals.contains(src) {
             return Err(literal_and_rename_diagnostic(src));
         }
-        safe_relpath(dest).map_err(|_| unsafe_dest_diagnostic(dest))?;
+        crate::kernel::safe_relpath(dest).map_err(|_| unsafe_dest_diagnostic(dest))?;
         match dest_of.insert(src, dest) {
             Some(prior) if prior != *dest => {
                 return Err(rename_fan_out_diagnostic(src, prior, dest));
