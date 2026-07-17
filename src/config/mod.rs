@@ -285,6 +285,60 @@ impl Config {
     }
 }
 
+use crate::sync::{
+    CollapsePreference, LayoutSpec, LayoutStyle, MaterializationPolicy, OfferSpec, TemplatePolicy,
+};
+
+impl From<Offer<'_>> for OfferSpec {
+    fn from(offer: Offer<'_>) -> Self {
+        Self::new(
+            offer.includes().to_vec(),
+            offer.excludes().to_vec(),
+            offer.root().map(std::path::Path::to_path_buf),
+        )
+    }
+}
+
+impl From<&LayoutConfig> for LayoutSpec {
+    fn from(layout: &LayoutConfig) -> Self {
+        let style = match layout.kind {
+            LayoutKind::Flat => LayoutStyle::Flat,
+            LayoutKind::BySource => LayoutStyle::BySource,
+            LayoutKind::Prefixed => LayoutStyle::Prefixed,
+        };
+        Self::new(style, layout.separator.clone())
+    }
+}
+
+impl From<&TemplateOptIn> for TemplatePolicy {
+    fn from(opt_in: &TemplateOptIn) -> Self {
+        match opt_in {
+            TemplateOptIn::SuffixOnly => Self::suffix_only(),
+            TemplateOptIn::Globs(set) => Self::globs(set.clone()),
+            TemplateOptIn::Disabled => Self::disabled(),
+        }
+    }
+}
+
+impl From<&DeployMode> for MaterializationPolicy {
+    fn from(mode: &DeployMode) -> Self {
+        match mode {
+            DeployMode::Link => Self::Link,
+            DeployMode::Copy => Self::Copy,
+        }
+    }
+}
+
+impl From<Option<bool>> for CollapsePreference {
+    fn from(collapse: Option<bool>) -> Self {
+        match collapse {
+            None => Self::Default,
+            Some(false) => Self::ForcePerLeaf,
+            Some(true) => Self::ForceCollapse,
+        }
+    }
+}
+
 fn reject_legacy_binding_arrays(doc: &toml::Value) -> Result<()> {
     let Some(targets) = doc.get("targets").and_then(toml::Value::as_table) else {
         return Ok(());

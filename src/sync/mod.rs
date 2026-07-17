@@ -17,8 +17,11 @@ mod tests;
 
 pub use hooks::{HookOutcome, HookScope, HookStatus};
 pub use plan::{
-    BindingPlanInput, PlanWarning, PlannedItem, ResolvedBindingPlan, TargetPlan,
-    expected_artifact_keys, plan_target, plan_targets, resolve_binding_plan, resolve_target_plan,
+    ArtifactRelativePath, BindingProjection, BindingProjectionInput, CollapsePreference,
+    ContentTransform, LayoutSpec, LayoutStyle, MaterializationPolicy, OfferSpec, ProjectedArtifact,
+    ProjectedLeaf, Projection, ProjectionError, ProjectionWarning, ResolvedSourceRef, TakeSpec,
+    TargetPath, TargetProjection, TemplatePolicy, plan_target, project_binding, project_target,
+    project_workspace, projected_artifact_keys,
 };
 pub(crate) use preview::offered_leaves;
 pub use preview::{

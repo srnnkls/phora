@@ -13,11 +13,12 @@ use crate::error::{Error, Result};
 use crate::kernel::{Materialization, OfferSelection};
 use crate::lock::{Lock, merge_locks, ref_discriminator};
 use crate::paths::cache_root_for;
-use crate::source::SourceBackend;
+use crate::source::{SourceBackend, SourceInventory};
 use crate::store::Registry;
 use crate::sync::{
-    BindingPlanInput, PlanWarning, PreviewTargetPlan, ResolvedBindingPlan, offered_leaves,
-    preview_targets, resolve_binding_plan, resolved_remotes,
+    BindingProjection, BindingProjectionInput, CollapsePreference, LayoutSpec,
+    MaterializationPolicy, OfferSpec, PreviewTargetPlan, ProjectionWarning, ResolvedSourceRef,
+    TakeSpec, TemplatePolicy, offered_leaves, preview_targets, project_binding, resolved_remotes,
 };
 
 use super::render::{
@@ -334,7 +335,7 @@ pub struct ExplainReport {
 }
 
 /// Config-typed inputs the attribution maps onto the offer + resolved plan; the
-/// same shape `BindingPlanInput` consumes, so `explain` reuses the take resolver.
+/// same shape `BindingProjectionInput` consumes, so `explain` reuses the take resolver.
 pub(crate) struct ExplainInput<'a> {
     pub target: &'a str,
     pub source: &'a str,
@@ -345,7 +346,6 @@ pub(crate) struct ExplainInput<'a> {
     pub mode: DeployMode,
     pub collapse: Option<bool>,
     pub layout: &'a LayoutConfig,
-    pub target_path: &'a Path,
     pub template_opt_in: &'a TemplateOptIn,
 }
 
@@ -355,18 +355,22 @@ pub(crate) struct ExplainInput<'a> {
 /// # Errors
 /// Errors if the offer fails to compile or the take resolver rejects the binding.
 pub(crate) fn explain_path(input: &ExplainInput<'_>, path: Option<&str>) -> Result<ExplainReport> {
-    let plan = resolve_binding_plan(&BindingPlanInput {
+    let inventory = SourceInventory::from_paths(input.candidate_leaves.iter().map(String::as_str))?;
+    let offer_spec = OfferSpec::from(input.offer);
+    let take = TakeSpec::from_entries(input.take);
+    let templates = TemplatePolicy::from(input.template_opt_in);
+    let layout = LayoutSpec::from(input.layout);
+    let source_ref = ResolvedSourceRef::new(input.source, input.commit);
+    let plan = project_binding(&BindingProjectionInput {
         identity: input.source,
-        source: input.source,
-        commit: input.commit,
-        offer: input.offer,
-        candidate_leaves: input.candidate_leaves,
-        take: input.take,
-        mode: input.mode,
-        collapse: input.collapse,
-        layout: input.layout,
-        target_path: input.target_path,
-        template_opt_in: input.template_opt_in,
+        source: &source_ref,
+        offer: &offer_spec,
+        inventory: &inventory,
+        take: &take,
+        collapse: CollapsePreference::from(input.collapse),
+        materialization: MaterializationPolicy::from(&input.mode),
+        layout: &layout,
+        templates: &templates,
     })?;
 
     let body = match path {
@@ -403,7 +407,7 @@ pub(crate) fn explain_path(input: &ExplainInput<'_>, path: Option<&str>) -> Resu
         target: input.target.to_owned(),
         source: input.source.to_owned(),
         body,
-        warnings: plan_warning_phrases(&plan),
+        warnings: projection_warning_phrases(&plan),
     })
 }
 
@@ -492,7 +496,7 @@ fn single_exclude_vetoes(pattern: &str, root: Option<&Path>, path: &str) -> bool
 }
 
 fn attribute_take(
-    plan: &ResolvedBindingPlan,
+    plan: &BindingProjection,
     local: Option<&str>,
     mode: DeployMode,
     template_opt_in: &TemplateOptIn,
@@ -500,7 +504,7 @@ fn attribute_take(
     let Some(local) = local else {
         return TakeAttribution::Dropped;
     };
-    for item in &plan.items {
+    for item in &plan.artifacts {
         match &item.materialization {
             Materialization::Leaf(take) if take.source == local => {
                 let kept_with_suffix_strip = mode == DeployMode::Copy
@@ -529,12 +533,14 @@ fn attribute_take(
     TakeAttribution::Dropped
 }
 
-fn plan_warning_phrases(plan: &ResolvedBindingPlan) -> Vec<String> {
+fn projection_warning_phrases(plan: &BindingProjection) -> Vec<String> {
     plan.warnings
         .iter()
         .map(|w| match w {
-            PlanWarning::TakeNoMatchGlob(p) => format!("take glob `{p}` matched no offered leaf"),
-            PlanWarning::LostCollapseToExclude(dir) => {
+            ProjectionWarning::TakeNoMatchGlob(p) => {
+                format!("take glob `{p}` matched no offered leaf")
+            }
+            ProjectionWarning::LostCollapseToExclude(dir) => {
                 format!("`{dir}` could not collapse: a within-dir exclude forced per-leaf links")
             }
         })
@@ -644,7 +650,6 @@ pub(crate) fn explain_cmd(
         mode: src.deploy_mode(),
         collapse: binding.collapse,
         layout: &layout,
-        target_path: &target_cfg.expanded_path(),
         template_opt_in: &binding.template_opt_in,
     };
     explain_path(&input, path)
@@ -1046,7 +1051,6 @@ mod explain_tests {
     ) -> ExplainReport {
         let candidate_leaves = leaves(candidates);
         let layout = LayoutConfig::default();
-        let target_path = PathBuf::from("/dst");
         let input = ExplainInput {
             target: "home",
             source: "s",
@@ -1057,7 +1061,6 @@ mod explain_tests {
             mode: source.deploy_mode(),
             collapse,
             layout: &layout,
-            target_path: &target_path,
             template_opt_in: &TemplateOptIn::SuffixOnly,
         };
         explain_path(&input, path).expect("attribution resolves")

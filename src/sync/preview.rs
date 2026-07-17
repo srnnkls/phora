@@ -9,11 +9,13 @@ use crate::diagnostic::did_you_mean;
 use crate::error::{Error, Result};
 use crate::kernel::{Materialization, OfferSelection, SourceName};
 use crate::lock::{Lock, ref_discriminator};
-use crate::source::SourceBackend;
+use crate::source::{SourceBackend, SourceInventory};
 
 use super::discover::discover_working_tree_leaves;
 use super::plan::{
-    BindingPlanInput, PlanWarning, PlannedItem, ResolvedBindingPlan, resolve_binding_plan,
+    BindingProjection, BindingProjectionInput, CollapsePreference, LayoutSpec,
+    MaterializationPolicy, OfferSpec, ProjectedArtifact, ProjectionWarning, ResolvedSourceRef,
+    TakeSpec, TemplatePolicy, project_binding,
 };
 use super::remote_for;
 
@@ -215,7 +217,7 @@ fn preview_link(
         return Ok(());
     };
     let plan = resolve_plan(ctx, "link", &candidates)?;
-    for item in &plan.items {
+    for item in &plan.artifacts {
         push_item(ctx, item, "link", entries);
     }
     collect_warnings(ctx, &plan, &candidates, warnings);
@@ -244,7 +246,7 @@ fn preview_copy(
     };
 
     let plan = resolve_plan(ctx, &locked.commit, &candidates)?;
-    for item in &plan.items {
+    for item in &plan.artifacts {
         push_item(ctx, item, &locked.commit, entries);
     }
     collect_warnings(ctx, &plan, &candidates, warnings);
@@ -253,7 +255,7 @@ fn preview_copy(
 
 fn collect_warnings(
     ctx: &BindingCtx,
-    plan: &ResolvedBindingPlan,
+    plan: &BindingProjection,
     candidates: &[String],
     warnings: &mut Vec<BindingWarnings>,
 ) {
@@ -271,7 +273,7 @@ fn collect_warnings(
 fn binding_warnings(
     identity: &str,
     source: &str,
-    plan: &ResolvedBindingPlan,
+    plan: &BindingProjection,
     offer: Offer<'_>,
     candidates: &[String],
 ) -> Option<BindingWarnings> {
@@ -283,14 +285,14 @@ fn binding_warnings(
         .warnings
         .iter()
         .map(|w| match w {
-            PlanWarning::TakeNoMatchGlob(pattern) => {
+            ProjectionWarning::TakeNoMatchGlob(pattern) => {
                 let refs = offered.iter().map(String::as_str);
                 PreviewWarning::TakeNoMatch {
                     pattern: pattern.clone(),
                     suggestions: did_you_mean(pattern, refs).unwrap_or_default(),
                 }
             }
-            PlanWarning::LostCollapseToExclude(dir) => {
+            ProjectionWarning::LostCollapseToExclude(dir) => {
                 PreviewWarning::CollapseBlocked { dir: dir.clone() }
             }
         })
@@ -312,31 +314,40 @@ fn resolve_plan(
     ctx: &BindingCtx,
     commit: &str,
     candidates: &[String],
-) -> Result<ResolvedBindingPlan> {
-    let input = BindingPlanInput {
+) -> Result<BindingProjection> {
+    let inventory = SourceInventory::from_paths(candidates.iter().map(String::as_str))?;
+    let offer = OfferSpec::from(ctx.source.offer());
+    let take = TakeSpec::from_entries(ctx.binding.take);
+    let templates = TemplatePolicy::from(&ctx.binding.template_opt_in);
+    let layout = LayoutSpec::from(ctx.layout);
+    let source = ResolvedSourceRef::new(ctx.binding.source, commit);
+    let input = BindingProjectionInput {
         identity: ctx.binding.identity,
-        source: ctx.binding.source,
-        commit,
-        offer: ctx.source.offer(),
-        candidate_leaves: candidates,
-        take: ctx.binding.take,
-        mode: ctx.source.deploy_mode(),
-        collapse: ctx.binding.collapse,
-        layout: ctx.layout,
-        target_path: ctx.path,
-        template_opt_in: &ctx.binding.template_opt_in,
+        source: &source,
+        offer: &offer,
+        inventory: &inventory,
+        take: &take,
+        collapse: CollapsePreference::from(ctx.binding.collapse),
+        materialization: MaterializationPolicy::from(&ctx.source.deploy_mode()),
+        layout: &layout,
+        templates: &templates,
     };
-    resolve_binding_plan(&input)
+    Ok(project_binding(&input)?)
 }
 
-fn push_item(ctx: &BindingCtx, item: &PlannedItem, commit: &str, entries: &mut Vec<PreviewEntry>) {
+fn push_item(
+    ctx: &BindingCtx,
+    item: &ProjectedArtifact,
+    commit: &str,
+    entries: &mut Vec<PreviewEntry>,
+) {
     let key = item.materialization.published_key().to_owned();
     let mut entry = PreviewEntry {
         identity: ctx.binding.identity.to_owned(),
         source: ctx.binding.source.to_owned(),
         artifact: key,
         commit: commit.to_owned(),
-        destination: item.destination.clone(),
+        destination: ctx.path.join(item.destination.as_str()),
         state: SyncState::Synced,
         files: Vec::new(),
         rename: rename_of(
@@ -367,7 +378,7 @@ fn rename_of(
 
 /// Deployed file names under one materialization, derived from the plan: a leaf is its
 /// single dest; a collapsed dir is each kept child's dir-relative deployed name.
-fn item_files(ctx: &BindingCtx, item: &PlannedItem) -> Vec<PreviewFile> {
+fn item_files(ctx: &BindingCtx, item: &ProjectedArtifact) -> Vec<PreviewFile> {
     let templated = !matches!(ctx.source.deploy_mode(), DeployMode::Link);
     match &item.materialization {
         Materialization::Leaf(take) => {
@@ -440,10 +451,13 @@ fn detect_dest_collisions(entries: &[PreviewEntry]) -> Vec<PreviewCollision> {
 
 #[cfg(test)]
 mod preview_warning_tests {
-    use std::path::PathBuf;
-
     use crate::config::{DeployMode, LayoutConfig, ParsedSource, Source, TakeEntry, TemplateOptIn};
-    use crate::sync::plan::{BindingPlanInput, ResolvedBindingPlan, resolve_binding_plan};
+    use crate::source::SourceInventory;
+    use crate::sync::plan::{
+        BindingProjection, BindingProjectionInput, CollapsePreference, LayoutSpec,
+        MaterializationPolicy, OfferSpec, ResolvedSourceRef, TakeSpec, TemplatePolicy,
+        project_binding,
+    };
 
     use super::{BindingWarnings, PreviewWarning, binding_warnings};
 
@@ -475,23 +489,26 @@ mod preview_warning_tests {
         candidates: &[String],
         take: Option<&[TakeEntry]>,
         collapse: Option<bool>,
-    ) -> ResolvedBindingPlan {
-        let layout = LayoutConfig::default();
-        let target_path = PathBuf::from("/dst");
-        let input = BindingPlanInput {
+    ) -> BindingProjection {
+        let inventory = SourceInventory::from_paths(candidates.iter().map(String::as_str))
+            .expect("valid paths");
+        let offer = OfferSpec::from(source.offer());
+        let take = TakeSpec::from_entries(take);
+        let templates = TemplatePolicy::from(&TemplateOptIn::SuffixOnly);
+        let layout = LayoutSpec::from(&LayoutConfig::default());
+        let source_ref = ResolvedSourceRef::new("s", "c0ffee");
+        let input = BindingProjectionInput {
             identity: "s",
-            source: "s",
-            commit: "c0ffee",
-            offer: source.offer(),
-            candidate_leaves: candidates,
-            take,
-            mode: source.deploy_mode(),
-            collapse,
+            source: &source_ref,
+            offer: &offer,
+            inventory: &inventory,
+            take: &take,
+            collapse: CollapsePreference::from(collapse),
+            materialization: MaterializationPolicy::from(&source.deploy_mode()),
             layout: &layout,
-            target_path: &target_path,
-            template_opt_in: &TemplateOptIn::SuffixOnly,
+            templates: &templates,
         };
-        resolve_binding_plan(&input).expect("plan resolves")
+        project_binding(&input).expect("projection resolves")
     }
 
     #[test]
@@ -557,7 +574,7 @@ mod preview_warning_tests {
             super::rename_of(
                 DeployMode::Copy,
                 &TemplateOptIn::SuffixOnly,
-                &plan.items[0].materialization,
+                &plan.artifacts[0].materialization,
             ),
             None,
             "a copy-mode `.tmpl` identity leaf is suffix-stripped by the template engine, not \
@@ -578,7 +595,7 @@ mod preview_warning_tests {
             super::rename_of(
                 DeployMode::Copy,
                 &TemplateOptIn::SuffixOnly,
-                &plan.items[0].materialization,
+                &plan.artifacts[0].materialization,
             ),
             Some("x.md".to_string()),
             "a genuine `take` rename must surface the source leaf as the rename origin"

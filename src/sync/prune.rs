@@ -7,7 +7,7 @@ use crate::source::SourceBackend;
 use crate::store::{Registry, RegistryRecord};
 
 use super::confine::{ProtectedPathSet, confine_destination};
-use super::plan::{expected_artifact_keys, plan_targets};
+use super::plan::{project_workspace, projected_artifact_keys};
 use super::remove_orphan_path;
 
 type ExpectedByBinding = BTreeMap<(String, String), Vec<String>>;
@@ -110,15 +110,15 @@ pub(super) fn expected_live_paths(
     backend: &dyn SourceBackend,
     resolved_commits: &BTreeMap<(String, String), String>,
 ) -> Result<ExpectedPaths> {
-    let plans = plan_targets(config, parsed, remotes, backend, resolved_commits)?;
+    let projection = project_workspace(config, parsed, remotes, backend, resolved_commits)?;
     let mut expected_paths: ExpectedPaths = BTreeMap::new();
-    for plan in &plans {
+    for plan in &projection.targets {
         let Some(target) = config.targets.get(&plan.target) else {
             continue;
         };
         let paths = expected_paths.entry(plan.target.clone()).or_default();
         for binding in &plan.bindings {
-            for key in &expected_artifact_keys(binding) {
+            for key in &projected_artifact_keys(binding) {
                 paths.push(
                     target
                         .expanded_path()
@@ -158,13 +158,13 @@ pub(super) fn prune_orphans(
     resolved_commits: &BTreeMap<(String, String), String>,
     protected: &ProtectedPathSet,
 ) -> Result<()> {
-    let plans = plan_targets(config, parsed, remotes, backend, resolved_commits)?;
+    let projection = project_workspace(config, parsed, remotes, backend, resolved_commits)?;
     let mut expected: ExpectedByBinding = BTreeMap::new();
     let mut live_paths: LivePathsBySource = BTreeMap::new();
-    for plan in &plans {
+    for plan in &projection.targets {
         let target = config.targets.get(&plan.target);
         for binding in &plan.bindings {
-            let keys = expected_artifact_keys(binding);
+            let keys = projected_artifact_keys(binding);
             if let Some(target) = target {
                 let dests = live_paths.entry(plan.target.clone()).or_default();
                 for key in &keys {

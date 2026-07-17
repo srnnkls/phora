@@ -11,7 +11,7 @@ use crate::store::{
 };
 
 use super::confine::{ProtectedPathSet, confine_destination};
-use super::plan::{PlanWarning, PlannedItem, plan_target};
+use super::plan::{ProjectedArtifact, ProjectionWarning, plan_target};
 use super::{
     Conflict, ConflictKind, ConflictResolver, Resolution, StagingGuard, nonce, remote_for,
     target_parent,
@@ -78,7 +78,7 @@ pub(super) fn deploy_target(
         .collect();
 
     for binding in &plan.bindings {
-        surface_plan_warnings(&binding.warnings);
+        surface_projection_warnings(&binding.warnings);
         let template_opt_in = template_opt_ins.get(&binding.identity).ok_or_else(|| {
             Error::Sync(format!(
                 "binding `{}` planned without a resolved template opt-in",
@@ -94,10 +94,11 @@ pub(super) fn deploy_target(
         let git = remote_for(run.remotes, &binding.source)?;
         let source_name = SourceName::trusted(&binding.source);
 
-        for item in &binding.items {
+        for item in &binding.artifacts {
             let key = item.materialization.published_key();
             safe_relpath(key).map_err(|_| unsafe_dest_diagnostic(key))?;
-            let artifact_dst = run.confined(&item.destination)?;
+            let deploy_dst = run.target.expanded_path().join(item.destination.as_str());
+            let artifact_dst = run.confined(&deploy_dst)?;
             let dst_is_symlink =
                 std::fs::symlink_metadata(&artifact_dst).is_ok_and(|m| m.file_type().is_symlink());
             let mode_transition = match source.deploy_mode() {
@@ -125,13 +126,13 @@ pub(super) fn deploy_target(
     Ok(had_failures)
 }
 
-fn surface_plan_warnings(warnings: &[PlanWarning]) {
+fn surface_projection_warnings(warnings: &[ProjectionWarning]) {
     for warning in warnings {
         match warning {
-            PlanWarning::TakeNoMatchGlob(pattern) => {
+            ProjectionWarning::TakeNoMatchGlob(pattern) => {
                 eprintln!("phora: take pattern matched no offered leaf: {pattern}");
             }
-            PlanWarning::LostCollapseToExclude(dir) => {
+            ProjectionWarning::LostCollapseToExclude(dir) => {
                 eprintln!(
                     "phora: dir `{dir}` cannot collapse to one symlink under a within-dir exclude; \
                      falling back to per-leaf links"
@@ -161,7 +162,7 @@ pub(super) struct ArtifactEntry<'a> {
     pub(super) identity: &'a str,
     pub(super) underlying_source: &'a str,
     pub(super) commit: &'a str,
-    pub(super) item: &'a PlannedItem,
+    pub(super) item: &'a ProjectedArtifact,
     pub(super) artifact_dst: &'a Path,
     pub(super) layout: LayoutConfig,
     pub(super) ejected: &'a [EjectedEntry],
@@ -993,21 +994,23 @@ mod revalidated_treated_like_clean_tests {
         ParsedSource::parse("src", &raw).expect("local source parses to typed form")
     }
 
-    fn leaf_item() -> PlannedItem {
-        PlannedItem {
+    fn leaf_item() -> ProjectedArtifact {
+        ProjectedArtifact {
+            destination: crate::sync::TargetPath::new("a.txt").expect("valid dest"),
+            source: crate::sync::ResolvedSourceRef::new("src", "0123"),
             materialization: Materialization::Leaf(ResolvedTake {
                 source: "a.txt".to_owned(),
                 dest: "a.txt".to_owned(),
             }),
-            destination: PathBuf::from("/tmp/dst/a.txt"),
             kept_leaves: Vec::new(),
+            leaves: Vec::new(),
         }
     }
 
     fn entry<'a>(
         source: &'a ParsedSource,
         source_name: &'a SourceName,
-        item: &'a PlannedItem,
+        item: &'a ProjectedArtifact,
         dst: &'a Path,
     ) -> ArtifactEntry<'a> {
         ArtifactEntry {
@@ -1109,21 +1112,23 @@ mod mode_transition_conflict_tests {
         parsed
     }
 
-    fn leaf_item() -> PlannedItem {
-        PlannedItem {
+    fn leaf_item() -> ProjectedArtifact {
+        ProjectedArtifact {
+            destination: crate::sync::TargetPath::new("a.txt").expect("valid dest"),
+            source: crate::sync::ResolvedSourceRef::new("src", "0123"),
             materialization: Materialization::Leaf(ResolvedTake {
                 source: "a.txt".to_owned(),
                 dest: "a.txt".to_owned(),
             }),
-            destination: PathBuf::from("/tmp/dst/a.txt"),
             kept_leaves: Vec::new(),
+            leaves: Vec::new(),
         }
     }
 
     fn transition_entry<'a>(
         source: &'a ParsedSource,
         source_name: &'a SourceName,
-        item: &'a PlannedItem,
+        item: &'a ProjectedArtifact,
         dst: &'a Path,
     ) -> ArtifactEntry<'a> {
         ArtifactEntry {
