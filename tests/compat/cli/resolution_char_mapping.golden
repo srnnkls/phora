@@ -1,0 +1,6 @@
+'s' -> Some(Skip)
+'o' -> Some(Overwrite)
+'e' -> Some(Eject)
+'a' -> Some(Abort)
+'x' -> None
+'S' -> None

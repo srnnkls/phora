@@ -1,0 +1,4 @@
+dst_exists = false
+staging_exists = false
+record_committed = false
+journal_entries = 0

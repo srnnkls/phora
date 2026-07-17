@@ -1,0 +1,18 @@
+version = 1
+sources = []
+
+[[trusted_hooks]]
+dep_instance = "9dd8a0658c02347b"
+hook_id = "ns%1%editor#on_change#97c766296031c835"
+preimage = "blake3:551b5c40a1ea0959ce66f6535bc06bbb16856b2f7578a6f19add6a537b4b9b28"
+approved_at = "2026-01-31T12:34:56+00:00"
+source = "editor"
+commit = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+[[candidate_hooks]]
+dep_instance = "9dd8a0658c02347b"
+hook_id = "ns%1%editor#on_change#2d38bdb748a79c2b"
+preimage = "blake3:79120e68e6c1ccc30e64439993fa1e79953143482630f90751c822e89d1c5d5d"
+command = "setup --yes"
+source = "editor"
+commit = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"

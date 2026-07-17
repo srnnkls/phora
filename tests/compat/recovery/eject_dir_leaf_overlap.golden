@@ -1,0 +1,51 @@
+--- targets/vscode/artifacts/company-configs/editor.toml ---
+version = 1
+source = "company-configs"
+commit = "abc123def456"
+digest = "blake3:28ec0171ffe16d6f978b63406b3e39692b426f578dad83f029cf17ee2749cbaf"
+projected_at = "2026-01-31T12:34:56Z"
+layout = "flat"
+kind = "dir"
+allow_symlinks = false
+preserve_executable = true
+linked = false
+
+[key]
+target = "vscode"
+source = "company-configs"
+artifact = "editor"
+
+[[files]]
+path = "editor"
+size = 15
+mtime = 1700000000
+blake3 = "28ec0171ffe16d6f978b63406b3e39692b426f578dad83f029cf17ee2749cbaf"
+--- targets/vscode/artifacts/company-configs/editor/init.lua.toml ---
+version = 1
+source = "company-configs"
+commit = "abc123def456"
+digest = "blake3:6f65cb0a072fd2d7597889093ceb9aab1ee3018f6308726ac722ab8264652fff"
+projected_at = "2026-01-31T12:34:56Z"
+layout = "flat"
+kind = "file"
+allow_symlinks = false
+preserve_executable = true
+linked = false
+
+[key]
+target = "vscode"
+source = "company-configs"
+artifact = "editor/init.lua"
+
+[[files]]
+path = "editor/init.lua"
+size = 8
+mtime = 1700000000
+blake3 = "6f65cb0a072fd2d7597889093ceb9aab1ee3018f6308726ac722ab8264652fff"
+--- targets/vscode/meta.toml ---
+version = 1
+
+[[ejected]]
+source = "company-configs"
+artifact = "editor"
+ejected_at = "2026-01-31T12:34:56Z"

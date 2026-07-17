@@ -1,0 +1,8 @@
+exit: 0
+--- stdout ---
+home -> <TARGET>
+  dotfiles@baa05721 editor/ -> <TARGET>/editor
+    init.lua
+  dotfiles@baa05721 lint/ -> <TARGET>/lint
+    rules.toml
+--- stderr ---

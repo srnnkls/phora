@@ -33,6 +33,7 @@ jobs:
       # mise caches the toolchain but not its rustup components; add them every
       # run so a cache hit can't leave clippy/rustfmt missing (idempotent).
       - run: mise exec -- rustup component add clippy rustfmt
+      - run: ./scripts/arch-check.sh .
       - run: mise run lint
       - run: mise run test
 

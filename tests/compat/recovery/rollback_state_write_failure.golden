@@ -1,0 +1,36 @@
+put_time_dst_bytes = Some("new body\n")
+put_time_journal_bytes =
+[[entry]]
+staging_base = "<ROOT>/deploy/.phora-stage"
+staging = "<ROOT>/deploy/.phora-stage/app.conf.new"
+dst = "<ROOT>/deploy/app.conf"
+swap_completed = true
+
+[entry.record]
+version = 1
+source = "company-configs"
+commit = "abc123def456"
+digest = "blake3:d4e5f6"
+projected_at = "2026-01-31T12:34:56Z"
+layout = "flat"
+kind = "dir"
+allow_symlinks = false
+preserve_executable = true
+linked = false
+
+[entry.record.key]
+target = "vscode"
+source = "company-configs"
+artifact = "app.conf"
+
+[[entry.record.files]]
+path = "app.conf"
+size = 9
+mtime = 1700000000
+blake3 = "85f88c81142185f1301839ef53264620a89a2e1b253374bce7cc8f0be749bc68"
+
+error = registry error: simulated state-write failure
+dst_after_rollback = Some("original body\n")
+staging_exists = false
+journal_entries = 0
+record_committed = false

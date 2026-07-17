@@ -1,0 +1,6 @@
+exit: 0
+--- stdout ---
+sync complete
+--- stderr ---
+phora: pruning orphaned dotfiles:editor
+phora: pruning orphaned dotfiles:lint

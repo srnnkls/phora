@@ -1,0 +1,35 @@
+put_time_journal_bytes =
+[[entry]]
+staging_base = "<ROOT>/deploy/.phora-stage"
+staging = "<ROOT>/deploy/.phora-stage/link-app.conf-0"
+dst = "<ROOT>/deploy/app.conf"
+swap_completed = true
+
+[entry.record]
+version = 1
+source = "company-configs"
+commit = "link"
+digest = "blake3:d4e5f6"
+projected_at = "2026-01-31T12:34:56Z"
+layout = "flat"
+kind = "file"
+allow_symlinks = false
+preserve_executable = true
+linked = true
+
+[entry.record.key]
+target = "vscode"
+source = "company-configs"
+artifact = "app.conf"
+
+[[entry.record.files]]
+path = "app.conf"
+size = 12
+mtime = 1700000000
+blake3 = "25484c09dc9aef6460ce66843d0765d18e3ace3c1dcac9b64a5a6c7460c36987"
+
+put_time_dst_is_symlink = true
+dst_is_symlink = true
+dst_link_target = <ROOT>/worktree/app.conf
+record_linked = true
+journal_entries = 0

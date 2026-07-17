@@ -18,12 +18,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::str::FromStr as _;
 
-use phora::config::TemplateOptIn;
+use phora::config::transitive::{FetchNode, Instance};
+use phora::config::{TemplateOptIn, admit_transitive_hooks, hook_preimage};
 use phora::kernel::SourceName;
+use phora::lock::{CandidateHookRecord, LOCK_SCHEMA_VERSION, Lock, TrustedHook};
 use phora::source::{
     ExportLeaf, ExportPolicy, ExportRequest, GitBackend, MirrorKey, NormalizedUrl,
     SourceBackend as _, vars_digest,
 };
+use phora::store::{FileRegistry, Registry as _};
 use tempfile::TempDir;
 
 mod common;
@@ -941,4 +944,143 @@ fn url_synthetic_commit_is_byte_identical() {
         "synthetic commit must be a 40-hex git id, got {commit:?}"
     );
     assert_golden("url_synthetic_commit.golden", &format!("{commit}\n"));
+}
+
+// ─── hooks: identity/discriminator, trust-lock variants, success recording ──────
+
+/// A fixed dep commit so every commit-bound preimage in the hook goldens is constant.
+const HOOK_DEP_COMMIT: &str = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+/// Admits one Shell and one Exec candidate from a fixed opaque `[targets.editor.hooks]`
+/// payload, so each hook's identity (`command_discriminator`-derived `hook_id`) and its
+/// commit-bound preimage are derived by production, then pinned.
+fn transitive_hook_candidates() -> Vec<phora::config::CandidateHook> {
+    let opaque: toml::Value = toml::from_str(
+        "[editor]\non_change = [\"./install.sh\", { cmd = [\"setup\", \"--yes\"] }]\n",
+    )
+    .expect("opaque hooks payload parses as toml");
+    let node = FetchNode::new("https://github.com/dep/nvim.git", "main", HOOK_DEP_COMMIT);
+    let instance = Instance::new("root", "editor", "anchor", node);
+    let (candidates, diagnostics) =
+        admit_transitive_hooks(&opaque, "editor", "ns%1%editor", &instance);
+    assert!(
+        diagnostics.is_empty(),
+        "the fixture hooks payload must admit cleanly, got: {diagnostics:?}"
+    );
+    assert_eq!(
+        candidates.len(),
+        2,
+        "the fixture must yield exactly one Shell and one Exec candidate"
+    );
+    candidates
+}
+
+#[test]
+fn hook_identity_and_command_discriminator_serialized_are_byte_identical() {
+    let candidates = transitive_hook_candidates();
+    let mut doc = String::new();
+    for c in &candidates {
+        let _ = writeln!(doc, "dep_instance = {}", c.dep_instance);
+        let _ = writeln!(doc, "hook_id = {}", c.hook_id);
+        let _ = writeln!(doc, "command = {}", c.command.display());
+        let _ = writeln!(
+            doc,
+            "on_change_preimage = {}",
+            hook_preimage(&c.command, "on_change", HOOK_DEP_COMMIT)
+        );
+        let _ = writeln!(
+            doc,
+            "pre_deploy_preimage = {}",
+            hook_preimage(&c.command, "pre_deploy", HOOK_DEP_COMMIT)
+        );
+        doc.push('\n');
+    }
+    assert_golden("hook_identity.golden", &doc);
+}
+
+#[test]
+fn hook_trust_lock_variants_serialized_are_byte_identical() {
+    let candidates = transitive_hook_candidates();
+    let trusted = &candidates[0];
+    let candidate = &candidates[1];
+    let lock = Lock {
+        version: LOCK_SCHEMA_VERSION,
+        sources: Vec::new(),
+        trusted_hooks: vec![TrustedHook {
+            dep_instance: trusted.dep_instance.clone(),
+            hook_id: trusted.hook_id.clone(),
+            preimage: hook_preimage(&trusted.command, "on_change", HOOK_DEP_COMMIT),
+            approved_at: "2026-01-31T12:34:56+00:00".to_owned(),
+            source: "editor".to_owned(),
+            commit: HOOK_DEP_COMMIT.to_owned(),
+        }],
+        candidate_hooks: vec![CandidateHookRecord {
+            dep_instance: candidate.dep_instance.clone(),
+            hook_id: candidate.hook_id.clone(),
+            preimage: hook_preimage(&candidate.command, "on_change", HOOK_DEP_COMMIT),
+            command: candidate.command.display(),
+            source: "editor".to_owned(),
+            commit: HOOK_DEP_COMMIT.to_owned(),
+        }],
+    };
+    let text = toml::to_string(&lock).expect("hook-trust lock serializes to toml");
+    assert_golden("hook_trust_lock.toml.golden", &text);
+}
+
+#[test]
+fn hook_success_state_serialized_is_byte_identical() {
+    let root = TempDir::new().expect("state tempdir");
+    let registry = FileRegistry::open(root.path().join("state")).expect("open registry");
+    let set: std::collections::BTreeSet<String> = ["blake3:aaaa1111", "blake3:bbbb2222"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    registry
+        .record_hook_success("home", "home#0123456789abcdef#fedcba9876543210", &set)
+        .expect("record hook success");
+
+    let meta = std::fs::read_to_string(root.path().join("state/targets/home/meta.toml"))
+        .expect("record_hook_success wrote the target meta");
+    assert_golden("hook_success_state.golden", &meta);
+}
+
+// ─── hooks: environment construction + dedup (subprocess, via `sync`) ────────────
+
+#[test]
+fn hook_environment_construction_is_byte_identical() {
+    let fx = build_fixture();
+    write(
+        &fx.cwd.path().join("dump-env.sh"),
+        b"#!/bin/sh\n\
+          printf 'PHORA_TARGET=%s\\n' \"$PHORA_TARGET\" > hookenv.txt\n\
+          printf 'PHORA_CHANGED_NAMES=%s\\n' \"$PHORA_CHANGED_NAMES\" >> hookenv.txt\n\
+          printf 'PHORA_CHANGED=%s\\n' \"$PHORA_CHANGED\" >> hookenv.txt\n",
+    );
+    fx.write_config(&format!(
+        "{}\n[targets.home.hooks]\non_change = \"sh dump-env.sh\"\n",
+        git_source_config(&fx)
+    ));
+    assert_success(&fx.run(&["sync"]), "sync fires the on_change hook");
+
+    let captured = std::fs::read_to_string(fx.cwd.path().join("hookenv.txt"))
+        .expect("the on_change hook captured its PHORA_* environment");
+    assert_golden("hook_environment.golden", &fx.normalize(&captured));
+}
+
+#[test]
+fn hook_dedup_behavior_is_byte_identical() {
+    let fx = build_fixture();
+    write(
+        &fx.cwd.path().join("count.sh"),
+        b"#!/bin/sh\nprintf 'ran\\n' >> invocations.txt\n",
+    );
+    fx.write_config(&format!(
+        "{}\n[targets.home.hooks]\non_change = [\"sh count.sh\", \"sh count.sh\"]\n",
+        git_source_config(&fx)
+    ));
+    assert_success(&fx.run(&["sync"]), "sync fires the deduped on_change hooks");
+
+    let runs = std::fs::read_to_string(fx.cwd.path().join("invocations.txt"))
+        .map_or(0, |s| s.lines().count());
+    assert_golden("hook_dedup.golden", &format!("invocations = {runs}\n"));
 }

@@ -1,0 +1,5 @@
+PHORA_TARGET=home
+PHORA_CHANGED_NAMES=editor
+lint
+PHORA_CHANGED=<TARGET>/editor
+<TARGET>/lint

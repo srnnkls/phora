@@ -1,0 +1,3 @@
+config/app.conf file "app = 1\n"
+config/nested/deep.toml file "[deep]\n"
+link.conf symlink -> config/app.conf
