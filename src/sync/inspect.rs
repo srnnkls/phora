@@ -2,9 +2,14 @@ use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
-use crate::store::{ArtifactKey, EjectedEntry, ManifestFile, Registry, RegistryRecord};
-use crate::sync::model::ScannedFile;
+use crate::store::{
+    ArtifactKey, EjectedEntry, HookState, ManifestFile, Registry, RegistryRecord, StoreError,
+};
+use crate::sync::model::{ManagedArtifact, ManagedCondition, ObservedArtifact, ScannedFile};
 use crate::sync::scan::{mtime_secs, scan_dir_soft};
+use crate::sync::state::StateStore;
+
+type StoreResult<T> = std::result::Result<T, StoreError>;
 
 #[derive(Debug)]
 pub enum ArtifactState {
@@ -275,6 +280,117 @@ fn revalidate_file(
         size,
         mtime,
     }))
+}
+
+pub fn inspect(
+    target_path: &Path,
+    expected_source: &str,
+    expected_commit: &str,
+    ejected: &[EjectedEntry],
+    store: &dyn StateStore,
+    key: &ArtifactKey,
+    expected_vars_digest: Option<&str>,
+) -> Result<ObservedArtifact<RegistryRecord>> {
+    let registry = StoreRegistry { store };
+    let state = check_artifact_state(
+        target_path,
+        expected_source,
+        expected_commit,
+        ejected,
+        &key.artifact,
+        &registry,
+        key,
+        expected_vars_digest,
+    )?;
+    let managed = |condition| -> Result<ObservedArtifact<RegistryRecord>> {
+        Ok(ObservedArtifact::Managed(ManagedArtifact {
+            record: managed_record(&registry, key, expected_source)?,
+            condition,
+        }))
+    };
+    match state {
+        ArtifactState::Missing => Ok(ObservedArtifact::Missing),
+        ArtifactState::Foreign => Ok(ObservedArtifact::Foreign(target_path.to_path_buf())),
+        ArtifactState::Ejected => Ok(ObservedArtifact::Ejected),
+        ArtifactState::Clean => managed(ManagedCondition::Clean),
+        ArtifactState::Outdated => managed(ManagedCondition::Outdated),
+        ArtifactState::Modified { changed } => managed(ManagedCondition::Modified { changed }),
+        ArtifactState::Linked => managed(ManagedCondition::Linked),
+        ArtifactState::Revalidated { fresh } => {
+            managed(ManagedCondition::MetadataChangedButContentClean { refreshed: fresh })
+        }
+    }
+}
+
+fn managed_record(
+    registry: &dyn Registry,
+    key: &ArtifactKey,
+    expected_source: &str,
+) -> Result<RegistryRecord> {
+    if let Some(record) = registry.get(key)? {
+        return Ok(record);
+    }
+    let sibling = |child: &str, parent: &str| {
+        child
+            .strip_prefix(parent)
+            .is_some_and(|rest| rest.starts_with('/'))
+    };
+    registry
+        .list_target(&key.target)?
+        .into_iter()
+        .find(|record| {
+            record.key.source == expected_source
+                && (sibling(&record.key.artifact, &key.artifact)
+                    || sibling(&key.artifact, &record.key.artifact))
+        })
+        .ok_or_else(|| {
+            Error::Projection(format!(
+                "managed record for {} vanished mid-observation",
+                key.artifact
+            ))
+        })
+}
+
+struct StoreRegistry<'a> {
+    store: &'a dyn StateStore,
+}
+
+impl Registry for StoreRegistry<'_> {
+    fn get(&self, key: &ArtifactKey) -> StoreResult<Option<RegistryRecord>> {
+        self.store.artifact(key)
+    }
+    fn put(&self, record: &RegistryRecord) -> StoreResult<()> {
+        self.store.put_artifact(record)
+    }
+    fn remove(&self, key: &ArtifactKey) -> StoreResult<()> {
+        self.store.remove_artifact(key)
+    }
+    fn list_target(&self, target: &str) -> StoreResult<Vec<RegistryRecord>> {
+        self.store.target_artifacts(target)
+    }
+    fn list_all(&self) -> StoreResult<Vec<RegistryRecord>> {
+        self.store.all_artifacts()
+    }
+    fn load_ejected(&self, target: &str) -> StoreResult<Vec<EjectedEntry>> {
+        self.store.ejections(target)
+    }
+    fn save_ejected(&self, target: &str, ejected: &[EjectedEntry]) -> StoreResult<()> {
+        self.store.save_ejections(target, ejected)
+    }
+    fn load_hook_state(&self, target: &str) -> StoreResult<Vec<HookState>> {
+        self.store.hook_state(target)
+    }
+    fn record_hook_success(
+        &self,
+        target: &str,
+        hook_id: &str,
+        digest_set: &BTreeSet<String>,
+    ) -> StoreResult<()> {
+        self.store.record_hook_success(target, hook_id, digest_set)
+    }
+    fn locks_dir(&self) -> PathBuf {
+        self.store.journal_root()
+    }
 }
 
 #[cfg(test)]
