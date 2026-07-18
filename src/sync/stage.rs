@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::config::TemplateOptIn;
-use crate::projection::model::{ArtifactRelativePath, ProjectedArtifact, TargetProjection};
+use crate::projection::model::{
+    ArtifactRelativePath, ProjectedArtifact, ProjectedLeaf, TargetProjection,
+};
 use crate::source::{ExportPolicy, SourceEntryKind, SourceError, hash_framed_entry, vars_digest};
 
 type Result<T> = std::result::Result<T, SourceError>;
@@ -24,6 +26,99 @@ pub struct StagedFile {
     pub size: u64,
     pub mtime: u64,
     pub blake3: String,
+}
+
+/// # Errors
+/// - render failures, forbidden or escaping symlinks, deployed-name collisions,
+///   leaf resolution failures, and staging I/O.
+pub fn stage_artifact(
+    request: &StageRequest<'_>,
+    root: Option<&Path>,
+    policy: &ExportPolicy,
+    staging_dir: &Path,
+    commit_time: u64,
+    template_opt_in: &TemplateOptIn,
+    mut resolve: impl FnMut(&Path) -> Result<(Vec<u8>, SourceEntryKind)>,
+) -> Result<StagedArtifact> {
+    std::fs::create_dir_all(staging_dir)?;
+
+    let leaves: Vec<PlannedLeaf<'_>> = request
+        .artifact
+        .leaves
+        .iter()
+        .map(|leaf| PlannedLeaf::new(leaf, root))
+        .collect();
+    let repo_relative_sources: BTreeMap<&Path, &Path> = leaves
+        .iter()
+        .map(|leaf| (leaf.root_relative, leaf.repo_relative))
+        .collect();
+
+    let renderer = Renderer::new(template_opt_in, request.variables);
+    let mut walk = ExportWalk {
+        out_base: staging_dir,
+        policy,
+        commit_time,
+        files: Vec::new(),
+        hasher: blake3::Hasher::new(),
+        renderer: &renderer,
+        deployed_names: BTreeMap::new(),
+        rendered_any: false,
+    };
+    walk.run(&leaves, |rel| {
+        resolve(repo_relative_sources.get(rel).copied().unwrap_or(rel))
+    })?;
+
+    let digest = format!("blake3:{}", walk.hasher.finalize().to_hex());
+    let vars_digest = walk.rendered_any.then(|| renderer.vars_digest());
+    Ok(StagedArtifact {
+        files: walk.files,
+        digest,
+        vars_digest,
+    })
+}
+
+struct PlannedLeaf<'a> {
+    repo_relative: &'a Path,
+    root_relative: &'a Path,
+    dest: &'a Path,
+}
+
+impl<'a> PlannedLeaf<'a> {
+    fn new(leaf: &'a ProjectedLeaf, root: Option<&Path>) -> Self {
+        let repo_relative = Path::new(leaf.source.as_str());
+        let root_relative = root
+            .and_then(|r| repo_relative.strip_prefix(r).ok())
+            .unwrap_or(repo_relative);
+        Self {
+            repo_relative,
+            root_relative,
+            dest: Path::new(leaf.destination.as_str()),
+        }
+    }
+}
+
+impl StageLeaf for PlannedLeaf<'_> {
+    fn source(&self) -> &Path {
+        self.root_relative
+    }
+
+    fn dest(&self) -> &Path {
+        self.dest
+    }
+}
+
+impl StagedRecord for StagedFile {
+    fn staged(destination: &Path, size: u64, mtime: u64, blake3: String) -> Self {
+        let destination = destination.to_string_lossy().replace('\\', "/");
+        let destination = ArtifactRelativePath::new(&destination)
+            .expect("staged destinations originate from validated artifact-relative paths");
+        Self {
+            destination,
+            size,
+            mtime,
+            blake3,
+        }
+    }
 }
 
 pub(crate) trait StageLeaf {
