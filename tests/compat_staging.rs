@@ -1,6 +1,7 @@
 //! T003 staging-matrix baselines (INV-5): byte-exact golden fixtures pinning the
-//! staging surface of `SourceBackend::export_artifact` on unmoved `main`, so every
-//! staged byte stays identical through the source → projection → sync refactor.
+//! staging surface (driven through `phora::sync::stage_artifact`, captured on
+//! unmoved `main` from the pre-relocation export port), so every staged byte
+//! stays identical through the source → projection → sync refactor.
 //!
 //! Every pinned value is either content-addressed (the artifact/manifest blake3
 //! digests frame the deployed path + kind tag + rendered bytes, independent of the
@@ -23,10 +24,14 @@ use std::str::FromStr as _;
 use std::time::UNIX_EPOCH;
 
 use phora::config::TemplateOptIn;
-use phora::kernel::SourceName;
+use phora::kernel::{Materialization, SourceName};
 use phora::source::{
-    ExportLeaf, ExportPolicy, ExportRequest, ExportResult, GitBackend, SourceBackend as _,
-    SourceError,
+    ExportPolicy, GitBackend, ResolvedSource, SnapshotId, SourceBackend as _, SourceError,
+    SourcePath, SourceStore,
+};
+use phora::sync::{
+    ArtifactRelativePath, ContentTransform, ProjectedArtifact, ProjectedLeaf, ResolvedSourceRef,
+    StageRequest, StagedArtifact, TargetPath, TargetProjection, stage_artifact,
 };
 use tempfile::TempDir;
 
@@ -332,10 +337,32 @@ fn build_staging_fixture() -> StagingFixture {
     }
 }
 
-fn leaf(source: &str, dest: &str) -> ExportLeaf {
-    ExportLeaf {
-        source: PathBuf::from(source),
-        dest: PathBuf::from(dest),
+fn leaf(source: &str, dest: &str) -> ProjectedLeaf {
+    ProjectedLeaf {
+        source: SourcePath::new(source).expect("valid source path"),
+        destination: ArtifactRelativePath::new(dest).expect("valid dest path"),
+        transform: ContentTransform::Identity,
+    }
+}
+
+fn artifact_of(fx: &StagingFixture, leaves: &[ProjectedLeaf]) -> ProjectedArtifact {
+    ProjectedArtifact {
+        destination: TargetPath::new("artifact").expect("valid dest"),
+        source: ResolvedSourceRef::new("fixture", &fx.commit),
+        materialization: Materialization::CollapsedDir {
+            dir: "artifact".to_owned(),
+        },
+        kept_leaves: Vec::new(),
+        leaves: leaves.to_vec(),
+    }
+}
+
+fn empty_projection() -> TargetProjection {
+    TargetProjection {
+        target: "dest".to_owned(),
+        bindings: Vec::new(),
+        artifacts: Vec::new(),
+        warnings: Vec::new(),
     }
 }
 
@@ -351,11 +378,48 @@ fn name_var() -> BTreeMap<String, String> {
 struct Staged {
     _staging: TempDir,
     dir: PathBuf,
-    result: ExportResult,
+    result: StagedArtifact,
 }
 
 /// The deployed names of the success plan, sorted, so byte/mode/mtime dumps are order-stable.
 const STAGED_DESTS: [&str; 3] = ["greet.txt", "plain.txt", "run.sh"];
+
+fn run_export(
+    fx: &StagingFixture,
+    source: &SourceName,
+    policy: &ExportPolicy,
+    staging_dir: &Path,
+    template_opt_in: &TemplateOptIn,
+    vars: &BTreeMap<String, String>,
+    leaves: &[ProjectedLeaf],
+) -> std::result::Result<StagedArtifact, SourceError> {
+    let artifact = artifact_of(fx, leaves);
+    let projection = empty_projection();
+    let resolved = ResolvedSource {
+        name: source.clone(),
+        url: fx.url.clone(),
+        snapshot: SnapshotId::Git {
+            commit: fx.commit.clone(),
+        },
+    };
+    stage_artifact(
+        &StageRequest {
+            artifact: &artifact,
+            target: &projection,
+            variables: vars,
+        },
+        None,
+        policy,
+        staging_dir,
+        COMMIT_TIME,
+        template_opt_in,
+        |repo_relative| {
+            let path = SourcePath::new(&repo_relative.to_string_lossy().replace('\\', "/"))?;
+            let entry = SourceStore::read(&fx.backend, &resolved, &path)?;
+            Ok((entry.bytes, entry.meta.kind))
+        },
+    )
+}
 
 fn run_success_export(fx: &StagingFixture) -> Staged {
     let staging = TempDir::new().expect("staging tempdir");
@@ -366,21 +430,16 @@ fn run_success_export(fx: &StagingFixture) -> Staged {
         leaf("run.sh", "run.sh"),
         leaf("greet.txt.tmpl", "greet.txt"),
     ];
-    let result = fx
-        .backend
-        .export_artifact(&ExportRequest {
-            source: &sn("fixture"),
-            url: &fx.url,
-            commit: &fx.commit,
-            root: None,
-            policy: &policy,
-            staging_dir: staging.path(),
-            commit_time: COMMIT_TIME,
-            template_opt_in: &TemplateOptIn::SuffixOnly,
-            vars: &vars,
-            leaves: &leaves,
-        })
-        .expect("export_artifact stages the success plan");
+    let result = run_export(
+        fx,
+        &sn("fixture"),
+        &policy,
+        staging.path(),
+        &TemplateOptIn::SuffixOnly,
+        &vars,
+        &leaves,
+    )
+    .expect("export_artifact stages the success plan");
     Staged {
         dir: staging.path().to_path_buf(),
         _staging: staging,
@@ -485,17 +544,14 @@ fn staging_manifest_is_byte_identical() {
     let staged = run_success_export(&fx);
 
     let mut files: Vec<&_> = staged.result.files.iter().collect();
-    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files.sort_by(|a, b| a.destination.cmp(&b.destination));
 
     let mut doc = String::new();
     for f in files {
         let _ = writeln!(
             doc,
             "{} size={} mtime={} blake3={}",
-            f.path.to_string_lossy().replace('\\', "/"),
-            f.size,
-            f.mtime,
-            f.blake3,
+            f.destination, f.size, f.mtime, f.blake3,
         );
     }
     assert_golden("staging_manifest.golden", &doc);
@@ -511,21 +567,17 @@ fn symlink_rejection_error_is_byte_identical() {
     let vars = BTreeMap::new();
     let leaves = [leaf("link", "deployed_copy")];
 
-    let err = fx
-        .backend
-        .export_artifact(&ExportRequest {
-            source: &sn("fixture"),
-            url: &fx.url,
-            commit: &fx.commit,
-            root: None,
-            policy: &policy,
-            staging_dir: staging.path(),
-            commit_time: COMMIT_TIME,
-            template_opt_in: &TemplateOptIn::SuffixOnly,
-            vars: &vars,
-            leaves: &leaves,
-        })
-        .expect_err("staging a symlink under the default policy must be rejected");
+    let err = run_export(
+        &fx,
+        &sn("fixture"),
+        &policy,
+        staging.path(),
+        &TemplateOptIn::SuffixOnly,
+        &vars,
+        &leaves,
+    )
+    .err()
+    .expect("staging a symlink under the default policy must be rejected");
 
     let rendered = format!("{err}\n");
     assert!(
@@ -547,21 +599,17 @@ fn template_render_error_is_byte_identical() {
     let vars = BTreeMap::new();
     let leaves = [leaf("boom.txt.tmpl", "boom.txt")];
 
-    let err = fx
-        .backend
-        .export_artifact(&ExportRequest {
-            source: &sn("fixture"),
-            url: &fx.url,
-            commit: &fx.commit,
-            root: None,
-            policy: &policy,
-            staging_dir: staging.path(),
-            commit_time: COMMIT_TIME,
-            template_opt_in: &TemplateOptIn::SuffixOnly,
-            vars: &vars,
-            leaves: &leaves,
-        })
-        .expect_err("a template referencing an undefined variable must fail strict rendering");
+    let err = run_export(
+        &fx,
+        &sn("fixture"),
+        &policy,
+        staging.path(),
+        &TemplateOptIn::SuffixOnly,
+        &vars,
+        &leaves,
+    )
+    .err()
+    .expect("a template referencing an undefined variable must fail strict rendering");
 
     assert_golden("template_error.golden", &format!("{err}\n"));
 }
@@ -624,29 +672,6 @@ fn build_extended_fixture() -> StagingFixture {
     }
 }
 
-fn run_export(
-    fx: &StagingFixture,
-    source: &SourceName,
-    policy: &ExportPolicy,
-    staging_dir: &Path,
-    template_opt_in: &TemplateOptIn,
-    vars: &BTreeMap<String, String>,
-    leaves: &[ExportLeaf],
-) -> std::result::Result<ExportResult, SourceError> {
-    fx.backend.export_artifact(&ExportRequest {
-        source,
-        url: &fx.url,
-        commit: &fx.commit,
-        root: None,
-        policy,
-        staging_dir,
-        commit_time: COMMIT_TIME,
-        template_opt_in,
-        vars,
-        leaves,
-    })
-}
-
 // ─── 8. nested destinations materialize their parent directories ─────────────
 
 #[test]
@@ -679,9 +704,7 @@ fn nested_destination_materializes_directories() {
         let _ = writeln!(
             doc,
             "manifest {} size={} blake3={}",
-            f.path.to_string_lossy().replace('\\', "/"),
-            f.size,
-            f.blake3,
+            f.destination, f.size, f.blake3,
         );
     }
     assert_golden("nested_destination.golden", &doc);
@@ -739,7 +762,8 @@ fn deployed_name_collision_error_is_byte_identical() {
         &vars,
         &[leaf("plain.txt", "dup.txt"), leaf("run.sh", "dup.txt")],
     )
-    .expect_err("two leaves mapping to the same dest must collide");
+    .err()
+    .expect("two leaves mapping to the same dest must collide");
 
     let rendered = format!("{err}\n");
     assert!(
@@ -767,7 +791,8 @@ fn template_fuel_exhaustion_error_is_byte_identical() {
         &vars,
         &[leaf("runaway.txt.tmpl", "runaway.txt")],
     )
-    .expect_err("a runaway template must exhaust the render fuel");
+    .err()
+    .expect("a runaway template must exhaust the render fuel");
 
     let rendered = format!("{err}\n");
     assert!(
@@ -984,7 +1009,8 @@ fn escaping_symlink_error_is_byte_identical() {
         &vars,
         &[leaf("escape", "escape")],
     )
-    .expect_err("a symlink whose target escapes the deploy tree must be rejected");
+    .err()
+    .expect("a symlink whose target escapes the deploy tree must be rejected");
 
     let rendered = format!("{err}\n");
     assert!(

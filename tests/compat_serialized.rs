@@ -23,15 +23,17 @@ use phora::config::{Config, TemplateOptIn, admit_transitive_hooks, hook_preimage
 use phora::kernel::SourceName;
 use phora::lock::{CandidateHookRecord, LOCK_SCHEMA_VERSION, Lock, TrustedHook};
 use phora::projection::model::{
-    BindingProjection, BindingProjectionInput, CollapsePreference, LayoutSpec, LayoutStyle,
-    Materialization, MaterializationPolicy, OfferSpec, ResolvedSourceRef, TakeSpec,
-    TargetProjection, TemplatePolicy,
+    ArtifactRelativePath, BindingProjection, BindingProjectionInput, CollapsePreference,
+    ContentTransform, LayoutSpec, LayoutStyle, Materialization, MaterializationPolicy, OfferSpec,
+    ProjectedArtifact, ProjectedLeaf, ResolvedSourceRef, TakeSpec, TargetPath, TargetProjection,
+    TemplatePolicy,
 };
 use phora::source::{
-    ExportLeaf, ExportPolicy, ExportRequest, GitBackend, MirrorKey, NormalizedUrl,
-    SourceBackend as _, SourceInventory, vars_digest,
+    ExportPolicy, GitBackend, MirrorKey, NormalizedUrl, ResolvedSource, SnapshotId,
+    SourceBackend as _, SourceInventory, SourcePath, SourceStore, vars_digest,
 };
 use phora::store::{FileRegistry, Registry as _};
+use phora::sync::{StageRequest, stage_artifact};
 use tempfile::TempDir;
 
 mod common;
@@ -804,31 +806,57 @@ fn source_and_file_digests_are_byte_identical() {
         .backend
         .list_source_leaves(&sn("fixture"), &fx.url, &fx.commit, None)
         .expect("list source leaves");
-    let leaves: Vec<ExportLeaf> = leaf_paths
+    let leaves: Vec<ProjectedLeaf> = leaf_paths
         .iter()
-        .map(|p| ExportLeaf {
-            source: PathBuf::from(p),
-            dest: PathBuf::from(p),
+        .map(|p| ProjectedLeaf {
+            source: SourcePath::new(p).expect("valid source path"),
+            destination: ArtifactRelativePath::new(p).expect("valid dest path"),
+            transform: ContentTransform::Identity,
         })
         .collect();
+    let artifact = ProjectedArtifact {
+        destination: TargetPath::new("artifact").expect("valid dest"),
+        source: ResolvedSourceRef::new("fixture", &fx.commit),
+        materialization: Materialization::CollapsedDir {
+            dir: "artifact".to_owned(),
+        },
+        kept_leaves: Vec::new(),
+        leaves,
+    };
+    let projection = TargetProjection {
+        target: "dest".to_owned(),
+        bindings: Vec::new(),
+        artifacts: Vec::new(),
+        warnings: Vec::new(),
+    };
+    let resolved = ResolvedSource {
+        name: sn("fixture"),
+        url: fx.url.clone(),
+        snapshot: SnapshotId::Git {
+            commit: fx.commit.clone(),
+        },
+    };
     let staging = TempDir::new().expect("staging tempdir");
     let policy = ExportPolicy::default();
     let vars: BTreeMap<String, String> = BTreeMap::new();
-    let export = fx
-        .backend
-        .export_artifact(&ExportRequest {
-            source: &sn("fixture"),
-            url: &fx.url,
-            commit: &fx.commit,
-            root: None,
-            policy: &policy,
-            staging_dir: staging.path(),
-            commit_time,
-            template_opt_in: &TemplateOptIn::SuffixOnly,
-            vars: &vars,
-            leaves: &leaves,
-        })
-        .expect("export_artifact succeeds");
+    let export = stage_artifact(
+        &StageRequest {
+            artifact: &artifact,
+            target: &projection,
+            variables: &vars,
+        },
+        None,
+        &policy,
+        staging.path(),
+        commit_time,
+        &TemplateOptIn::SuffixOnly,
+        |repo_relative| {
+            let path = SourcePath::new(&repo_relative.to_string_lossy().replace('\\', "/"))?;
+            let entry = SourceStore::read(&fx.backend, &resolved, &path)?;
+            Ok((entry.bytes, entry.meta.kind))
+        },
+    )
+    .expect("export_artifact succeeds");
 
     doc.push_str("\n[artifact-digest]\n");
     doc.push_str("digest = ");
@@ -840,15 +868,12 @@ fn source_and_file_digests_are_byte_identical() {
 
     doc.push_str("\n[per-file-blake3]\n");
     let mut files = export.files;
-    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files.sort_by(|a, b| a.destination.cmp(&b.destination));
     for f in &files {
         let _ = writeln!(
             doc,
             "{} size={} mtime={} blake3={}",
-            f.path.to_string_lossy().replace('\\', "/"),
-            f.size,
-            f.mtime,
-            f.blake3,
+            f.destination, f.size, f.mtime, f.blake3,
         );
     }
 
