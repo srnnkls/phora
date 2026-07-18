@@ -25,7 +25,6 @@ pub use worktree::{capture_worktree, is_local_path, read_local_head};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use gix::object::tree::EntryKind;
 use thiserror::Error;
 
 use crate::config::{Refspec, TemplateOptIn};
@@ -370,8 +369,6 @@ struct Rendered {
 }
 
 struct ExportWalk<'a, 'r> {
-    repo: &'a gix::Repository,
-    source: &'a str,
     out_base: &'a Path,
     policy: &'a ExportPolicy,
     commit_time: u64,
@@ -387,44 +384,24 @@ fn dest_has_vcs_component(dest: &Path) -> bool {
 }
 
 impl ExportWalk<'_, '_> {
-    /// Stages each leaf of the explicit plan: look up its source path in `root_tree`,
-    /// reject a non-blob or a symlink the policy forbids, then stage at the leaf's
-    /// dest. Render keys on the source path; the framed digest and manifest path key
-    /// on the dest.
-    fn run(&mut self, root_tree: &gix::Tree<'_>, leaves: &[ExportLeaf]) -> Result<()> {
+    fn run(
+        &mut self,
+        leaves: &[ExportLeaf],
+        mut resolve: impl FnMut(&Path) -> Result<(Vec<u8>, SourceEntryKind)>,
+    ) -> Result<()> {
         for leaf in leaves {
             if !self.policy.vcs_opt_in && dest_has_vcs_component(&leaf.dest) {
                 continue;
             }
-            let entry = root_tree
-                .lookup_entry_by_path(&leaf.source)
-                .map_err(|e| {
-                    SourceError::Source(format!(
-                        "lookup key {} in {}: {e}",
-                        leaf.source.display(),
-                        self.source
-                    ))
-                })?
-                .ok_or_else(|| SourceError::MappedKeyNotFound {
-                    key: leaf.source.clone(),
-                })?;
-            let kind = entry.mode().kind();
-            if !matches!(
-                kind,
-                EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link
-            ) {
-                return Err(SourceError::MappedKeyNotALeaf {
-                    key: leaf.source.clone(),
-                });
-            }
-            let bytes = GitBackend::find_blob_data(self.repo, self.source, entry.object_id())?;
+            let (bytes, kind) = resolve(&leaf.source)?;
             match kind {
-                EntryKind::Blob => self.stage_leaf(&leaf.dest, &leaf.source, &bytes, false)?,
-                EntryKind::BlobExecutable => {
+                SourceEntryKind::File => {
+                    self.stage_leaf(&leaf.dest, &leaf.source, &bytes, false)?;
+                }
+                SourceEntryKind::Executable => {
                     self.stage_leaf(&leaf.dest, &leaf.source, &bytes, true)?;
                 }
-                EntryKind::Link => self.stage_link(&leaf.dest, &bytes)?,
-                _ => unreachable!("non-leaf kinds rejected above"),
+                SourceEntryKind::Symlink => self.stage_link(&leaf.dest, &bytes)?,
             }
         }
         Ok(())
@@ -582,6 +559,8 @@ fn materialize_symlink(out_path: &Path, target: &[u8]) -> Result<()> {
 mod tests {
     use super::import::import_tree;
     use super::*;
+
+    use gix::object::tree::EntryKind;
 
     use crate::kernel::safe_component;
 
