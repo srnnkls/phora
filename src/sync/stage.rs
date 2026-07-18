@@ -3,10 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::TemplateOptIn;
 use crate::projection::model::{ArtifactRelativePath, ProjectedArtifact, TargetProjection};
-use crate::source::{
-    ExportPolicy, SourceEntryKind, SourceError, hash_framed_entry, materialize_symlink,
-    symlink_target_escapes, vars_digest,
-};
+use crate::source::{ExportPolicy, SourceEntryKind, SourceError, hash_framed_entry, vars_digest};
 
 type Result<T> = std::result::Result<T, SourceError>;
 
@@ -230,5 +227,44 @@ fn set_deterministic_mtime(path: &Path, commit_time: u64) -> Result<()> {
     let seconds = i64::try_from(commit_time)
         .map_err(|e| SourceError::Source(format!("commit_time out of range: {e}")))?;
     filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(seconds, 0))?;
+    Ok(())
+}
+
+pub(crate) fn symlink_target_escapes(deployed_rel: &Path, target: &[u8]) -> bool {
+    if matches!(target.first(), Some(b'/' | b'\\')) {
+        return true;
+    }
+    if matches!(target, [drive, b':', ..] if drive.is_ascii_alphabetic()) {
+        return true;
+    }
+    let parent_depth = deployed_rel.parent().map_or(0, |p| p.components().count());
+    let mut depth = i64::try_from(parent_depth).unwrap_or(i64::MAX);
+    for step in target.split(|&b| b == b'/' || b == b'\\') {
+        match step {
+            b"" | b"." => {}
+            b".." => {
+                depth -= 1;
+                if depth < 0 {
+                    return true;
+                }
+            }
+            _ => depth = depth.saturating_add(1),
+        }
+    }
+    false
+}
+
+#[cfg(unix)]
+fn materialize_symlink(out_path: &Path, target: &[u8]) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let target = std::ffi::OsStr::from_bytes(target);
+    std::os::unix::fs::symlink(target, out_path)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn materialize_symlink(out_path: &Path, target: &[u8]) -> Result<()> {
+    let target = String::from_utf8_lossy(target);
+    std::os::windows::fs::symlink_file(target.as_ref(), out_path)?;
     Ok(())
 }
