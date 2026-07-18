@@ -1,7 +1,7 @@
 use phora::projection::model::Materialization;
 use phora::sync::model::{
-    ChangeSet, ManagedArtifact, ManagedCondition, ObservedArtifact, ObservedProjectState,
-    ReconciliationPolicy, SyncChange,
+    ChangeSet, ManagedArtifact, ManagedCondition, ObservedArtifact, ObservedEntry,
+    ObservedProjectState, ReconciliationPolicy, SyncChange,
 };
 use phora::sync::reconcile::reconcile;
 use phora::sync::{ProjectedArtifact, Projection, ResolvedSourceRef, TargetPath, TargetProjection};
@@ -46,12 +46,17 @@ fn conflicting_pair() -> (Projection, ObservedProjectState) {
         warnings: Vec::new(),
     };
     let observed = ObservedProjectState {
-        artifacts: vec![ObservedArtifact::Managed(ManagedArtifact {
-            record: (),
-            condition: ManagedCondition::Modified {
-                changed: vec![PathBuf::from("a.json")],
-            },
-        })],
+        artifacts: vec![ObservedEntry {
+            target: "vscode".to_owned(),
+            source: "company-configs".to_owned(),
+            artifact: "snippets".to_owned(),
+            observation: ObservedArtifact::Managed(ManagedArtifact {
+                record: (),
+                condition: ManagedCondition::Modified {
+                    changed: vec![PathBuf::from("a.json")],
+                },
+            }),
+        }],
     };
     (projection, observed)
 }

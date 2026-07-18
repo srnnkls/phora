@@ -10,7 +10,15 @@ pub struct ScannedFile {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservedProjectState<R = ()> {
-    pub artifacts: Vec<ObservedArtifact<R>>,
+    pub artifacts: Vec<ObservedEntry<R>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedEntry<R = ()> {
+    pub target: String,
+    pub source: String,
+    pub artifact: String,
+    pub observation: ObservedArtifact<R>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,9 +97,26 @@ pub struct ReconciliationPolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncError {
-    Unmatched {
+    UnmatchedArtifact {
         target: String,
         source: String,
         artifact: String,
     },
 }
+
+impl std::fmt::Display for SyncError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SyncError::UnmatchedArtifact {
+                target,
+                source,
+                artifact,
+            } => write!(
+                f,
+                "no observed state for desired artifact {source}/{artifact} in target {target}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SyncError {}

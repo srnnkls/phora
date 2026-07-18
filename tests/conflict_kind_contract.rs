@@ -1,7 +1,7 @@
 use phora::projection::model::Materialization;
 use phora::sync::model::{
-    ConflictKind, ManagedArtifact, ManagedCondition, ObservedArtifact, ObservedProjectState,
-    ReconciliationPolicy, SyncChange,
+    ConflictKind, ManagedArtifact, ManagedCondition, ObservedArtifact, ObservedEntry,
+    ObservedProjectState, ReconciliationPolicy, SyncChange,
 };
 use phora::sync::reconcile::reconcile;
 use phora::sync::{
@@ -39,10 +39,15 @@ fn projection_of(destination: &str) -> Projection {
 
 fn modified_observation(changed: Vec<PathBuf>) -> ObservedProjectState {
     ObservedProjectState {
-        artifacts: vec![ObservedArtifact::Managed(ManagedArtifact {
-            record: (),
-            condition: ManagedCondition::Modified { changed },
-        })],
+        artifacts: vec![ObservedEntry {
+            target: "vscode".to_owned(),
+            source: "company-configs".to_owned(),
+            artifact: "snippets".to_owned(),
+            observation: ObservedArtifact::Managed(ManagedArtifact {
+                record: (),
+                condition: ManagedCondition::Modified { changed },
+            }),
+        }],
     }
 }
 
