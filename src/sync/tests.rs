@@ -3493,9 +3493,9 @@ fn interactive_abort_stops_sync_without_processing_remaining() {
     );
     assert_eq!(
         resolver.consulted(),
-        1,
-        "Abort must stop after the FIRST conflict: the resolver must be consulted exactly once, \
-             not once per remaining artifact (got {})",
+        2,
+        "whole-run preflight resolves EVERY conflict before the global Abort check: both Foreign \
+             conflicts are consulted, then the Abort verdict fails the run (got {})",
         resolver.consulted()
     );
     assert!(
@@ -3543,6 +3543,561 @@ fn non_interactive_still_warns_and_skips_modified_without_resolver() {
         std::fs::read(dst.join("init.lua")).expect("read preserved init.lua"),
         b"-- locally edited\n",
         "without interactive mode a Modified artifact must still be skipped, preserving the edit"
+    );
+}
+
+// ── preflight conflict resolution: resolve-before-staging & abort fail-fast (T033) ──
+
+fn phora_staging_present(dirs: &[PathBuf]) -> bool {
+    dirs.iter().any(|dir| dir_has_phora_descendant(dir))
+}
+
+fn dir_has_phora_descendant(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry.file_name().to_string_lossy().starts_with(".phora-")
+            || (entry.file_type().is_ok_and(|t| t.is_dir())
+                && dir_has_phora_descendant(&entry.path()))
+    })
+}
+
+#[test]
+fn phora_staging_probe_detects_a_nested_staging_path() {
+    let root = TempDir::new().expect("probe root");
+    let nested = root.path().join("dest").join("multi");
+    std::fs::create_dir_all(&nested).expect("mkdir nested target subtree");
+    let roots = [root.path().to_path_buf()];
+
+    assert!(
+        !phora_staging_present(&roots),
+        "a clean target subtree must not read as staged"
+    );
+
+    std::fs::create_dir_all(nested.join(".phora-stage")).expect("plant staging dir");
+    assert!(
+        phora_staging_present(&roots),
+        "a .phora-stage planted at <root>/dest/multi — the real by-source staging depth \
+         (target_parent(artifact_dst).join(\".phora-stage\")) — must be detected: the probe walks \
+         the whole subtree, not just the root's direct children"
+    );
+}
+
+/// Verdicts keyed by consultation order (Nth conflict → verdicts[N], saturating), not by artifact.
+struct OrderedResolver {
+    verdicts: Vec<Resolution>,
+    staging_dirs: Vec<PathBuf>,
+    consulted: AtomicUsize,
+    seen: Mutex<Vec<Conflict>>,
+    staging_seen: Mutex<bool>,
+}
+
+impl OrderedResolver {
+    fn new(verdicts: Vec<Resolution>, staging_dirs: Vec<PathBuf>) -> Self {
+        Self {
+            verdicts,
+            staging_dirs,
+            consulted: AtomicUsize::new(0),
+            seen: Mutex::new(Vec::new()),
+            staging_seen: Mutex::new(false),
+        }
+    }
+
+    fn consulted(&self) -> usize {
+        self.consulted.load(AtomicOrdering::SeqCst)
+    }
+
+    fn staging_seen(&self) -> bool {
+        *self.staging_seen.lock().expect("staging mutex")
+    }
+}
+
+impl ConflictResolver for OrderedResolver {
+    fn resolve(&self, conflict: &Conflict) -> Resolution {
+        let n = self.consulted.fetch_add(1, AtomicOrdering::SeqCst);
+        self.seen.lock().expect("seen mutex").push(conflict.clone());
+        if phora_staging_present(&self.staging_dirs) {
+            *self.staging_seen.lock().expect("staging mutex") = true;
+        }
+        *self
+            .verdicts
+            .get(n)
+            .or_else(|| self.verdicts.last())
+            .expect("OrderedResolver needs at least one verdict")
+    }
+}
+
+/// A non-zero reading proves a deploy landed at a probed destination before resolution finished.
+struct StageWatchResolver {
+    probes: Vec<(PathBuf, Vec<u8>)>,
+    staging_dirs: Vec<PathBuf>,
+    max_staged_at_resolve: Mutex<usize>,
+    consulted: AtomicUsize,
+    staging_seen: Mutex<bool>,
+}
+
+impl StageWatchResolver {
+    fn new(probes: Vec<(PathBuf, Vec<u8>)>, staging_dirs: Vec<PathBuf>) -> Self {
+        Self {
+            probes,
+            staging_dirs,
+            max_staged_at_resolve: Mutex::new(0),
+            consulted: AtomicUsize::new(0),
+            staging_seen: Mutex::new(false),
+        }
+    }
+
+    fn max_staged_at_resolve(&self) -> usize {
+        *self.max_staged_at_resolve.lock().expect("max mutex")
+    }
+
+    fn consulted(&self) -> usize {
+        self.consulted.load(AtomicOrdering::SeqCst)
+    }
+
+    fn staging_seen(&self) -> bool {
+        *self.staging_seen.lock().expect("staging mutex")
+    }
+}
+
+impl ConflictResolver for StageWatchResolver {
+    fn resolve(&self, _conflict: &Conflict) -> Resolution {
+        self.consulted.fetch_add(1, AtomicOrdering::SeqCst);
+        let staged = self
+            .probes
+            .iter()
+            .filter(|(path, upstream)| {
+                std::fs::read(path).ok().as_deref() == Some(upstream.as_slice())
+            })
+            .count();
+        let mut max = self.max_staged_at_resolve.lock().expect("max mutex");
+        *max = (*max).max(staged);
+        if phora_staging_present(&self.staging_dirs) {
+            *self.staging_seen.lock().expect("staging mutex") = true;
+        }
+        Resolution::Overwrite
+    }
+}
+
+fn deploy_two_modified(
+    backend: &GitBackend,
+    registry: &FileRegistry,
+    td: &TargetDir,
+    cfg: &Config,
+) -> (Lock, PathBuf, PathBuf) {
+    let first = sync(&input(cfg, None, None, None, false), backend, registry)
+        .expect("first sync deploys both artifacts");
+    assert!(!first.had_failures, "premise: the first deploy is clean");
+    let editor_dir = td.target_path().join("multi").join("editor");
+    let widget_dir = td.target_path().join("multi").join("widget");
+    std::fs::write(editor_dir.join("init.lua"), b"-- locally edited\n").expect("edit editor");
+    std::fs::write(widget_dir.join("conf.toml"), b"-- locally edited\n").expect("edit widget");
+    let commit = first
+        .base_lock
+        .find_source("multi")
+        .expect("multi present in base lock")
+        .commit
+        .clone();
+    for (dir, artifact) in [(&editor_dir, "editor"), (&widget_dir, "widget")] {
+        let st = check_state_at(dir, registry, "dest", "multi", artifact, &commit);
+        assert!(
+            matches!(st, ArtifactState::Modified { .. }),
+            "premise: edited {artifact} must read Modified, got {st:?}"
+        );
+    }
+    (first.base_lock, editor_dir, widget_dir)
+}
+
+#[test]
+fn eject_then_abort_persists_no_ejection_and_leaves_disk_untouched() {
+    let (src, url) = build_two_artifact_repo();
+    let git_dir = TempDir::new().expect("git dir");
+    let state_dir = TempDir::new().expect("state dir");
+    let backend = GitBackend::new(git_dir.path().to_path_buf());
+    let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let td = TargetDir::new();
+    let cfg = config_one_source_one_target("multi", &url, "dest", &td.target_path(), "by-source");
+
+    let (base_lock, editor_dir, widget_dir) = deploy_two_modified(&backend, &registry, &td, &cfg);
+    let before = registry.list_all().expect("snapshot records before abort");
+
+    let resolver = OrderedResolver::new(
+        vec![Resolution::Eject, Resolution::Abort],
+        vec![td.parent_path.clone()],
+    );
+    let result = sync(
+        &interactive_input(&cfg, Some(base_lock), &resolver),
+        &backend,
+        &registry,
+    );
+
+    let Err(err) = result else {
+        panic!("an Eject-then-Abort ChangeSet must abort the whole run, got Ok");
+    };
+    assert!(
+        matches!(err, Error::Aborted),
+        "the run must surface Error::Aborted, got {err:?}"
+    );
+    assert_eq!(
+        resolver.consulted(),
+        2,
+        "preflight must resolve BOTH conflicts into the decision set before the global Abort \
+         check, got {}",
+        resolver.consulted()
+    );
+    assert!(
+        !resolver.staging_seen(),
+        "no .phora-* staging path may exist at ANY resolve consultation — preflight resolution \
+         must precede staging, so a stage-then-clean-on-abort pipeline is forbidden"
+    );
+    assert_aborted_zero_mutation(&registry, &before, &[("dest", &td)]);
+    assert_eq!(
+        std::fs::read(editor_dir.join("init.lua")).expect("read editor init.lua"),
+        b"-- locally edited\n",
+        "no Eject/deploy side effect may reach disk once the run aborts"
+    );
+    assert_eq!(
+        std::fs::read(widget_dir.join("conf.toml")).expect("read widget conf.toml"),
+        b"-- locally edited\n",
+        "the not-yet-applied artifact's edit must survive the abort too"
+    );
+
+    drop(src);
+}
+
+#[test]
+fn overwrite_then_abort_stages_no_deploy() {
+    let (src, url) = build_two_artifact_repo();
+    let git_dir = TempDir::new().expect("git dir");
+    let state_dir = TempDir::new().expect("state dir");
+    let backend = GitBackend::new(git_dir.path().to_path_buf());
+    let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let td = TargetDir::new();
+    let cfg = config_one_source_one_target("multi", &url, "dest", &td.target_path(), "by-source");
+
+    let (base_lock, editor_dir, widget_dir) = deploy_two_modified(&backend, &registry, &td, &cfg);
+    let before = registry.list_all().expect("snapshot records before abort");
+
+    let resolver = OrderedResolver::new(
+        vec![Resolution::Overwrite, Resolution::Abort],
+        vec![td.parent_path.clone()],
+    );
+    let result = sync(
+        &interactive_input(&cfg, Some(base_lock), &resolver),
+        &backend,
+        &registry,
+    );
+
+    let Err(err) = result else {
+        panic!("an Overwrite-then-Abort ChangeSet must abort the whole run, got Ok");
+    };
+    assert!(
+        matches!(err, Error::Aborted),
+        "the run must surface Error::Aborted, got {err:?}"
+    );
+    assert!(
+        !resolver.staging_seen(),
+        "no .phora-* staging path may exist at ANY resolve consultation — the Overwrite must not \
+         be staged before preflight discovers the sibling Abort"
+    );
+    assert_eq!(
+        std::fs::read(editor_dir.join("init.lua")).expect("read editor init.lua"),
+        b"-- locally edited\n",
+        "resolve-before-staging: the Overwrite-resolved artifact must NOT be redeployed — \
+         preflight discovers the sibling Abort before ANY staging or deploy runs"
+    );
+    assert_eq!(
+        std::fs::read(widget_dir.join("conf.toml")).expect("read widget conf.toml"),
+        b"-- locally edited\n",
+        "the abort artifact's own content is untouched as well"
+    );
+    assert_aborted_zero_mutation(&registry, &before, &[("dest", &td)]);
+
+    drop(src);
+}
+
+#[test]
+fn every_conflict_is_resolved_before_any_artifact_is_deployed() {
+    let (src, url) = build_two_artifact_repo();
+    let git_dir = TempDir::new().expect("git dir");
+    let state_dir = TempDir::new().expect("state dir");
+    let backend = GitBackend::new(git_dir.path().to_path_buf());
+    let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let td = TargetDir::new();
+    let cfg = config_one_source_one_target("multi", &url, "dest", &td.target_path(), "by-source");
+
+    let (base_lock, editor_dir, widget_dir) = deploy_two_modified(&backend, &registry, &td, &cfg);
+
+    let resolver = StageWatchResolver::new(
+        vec![
+            (editor_dir.join("init.lua"), b"-- init\n".to_vec()),
+            (widget_dir.join("conf.toml"), b"[w]\n".to_vec()),
+        ],
+        vec![td.parent_path.clone()],
+    );
+    let out = sync(
+        &interactive_input(&cfg, Some(base_lock), &resolver),
+        &backend,
+        &registry,
+    )
+    .expect("an all-Overwrite run must succeed");
+
+    assert!(!out.had_failures, "an all-overwrite run is clean");
+    assert_eq!(
+        resolver.consulted(),
+        2,
+        "both Modified conflicts must be resolved, got {}",
+        resolver.consulted()
+    );
+    assert_eq!(
+        resolver.max_staged_at_resolve(),
+        0,
+        "resolve-before-staging: while ANY conflict was being resolved, no earlier artifact may \
+         have been deployed yet — preflight resolves the whole ChangeSet before staging any of it"
+    );
+    assert!(
+        !resolver.staging_seen(),
+        "no .phora-* staging path may exist at ANY resolve consultation — staging must not begin \
+         until the whole ChangeSet is resolved"
+    );
+    assert_eq!(
+        std::fs::read(editor_dir.join("init.lua")).expect("read editor init.lua"),
+        b"-- init\n",
+        "the apply pass must eventually overwrite editor with upstream"
+    );
+    assert_eq!(
+        std::fs::read(widget_dir.join("conf.toml")).expect("read widget conf.toml"),
+        b"[w]\n",
+        "the apply pass must eventually overwrite widget with upstream"
+    );
+
+    drop(src);
+}
+
+fn config_one_source_two_targets(
+    source: &str,
+    url: &str,
+    target_a: &str,
+    path_a: &Path,
+    target_b: &str,
+    path_b: &Path,
+    layout: &str,
+) -> Config {
+    let toml = format!(
+        "version = 1\n\n\
+             [sources.{source}]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+             [targets.{target_a}]\npath = \"{}\"\nsources = [\"{source}\"]\nlayout = \"{layout}\"\n\n\
+             [targets.{target_b}]\npath = \"{}\"\nsources = [\"{source}\"]\nlayout = \"{layout}\"\n",
+        path_a.display(),
+        path_b.display(),
+    );
+    Config::parse(&toml).expect("one-source two-target config parses")
+}
+
+fn sort_records(mut records: Vec<RegistryRecord>) -> Vec<RegistryRecord> {
+    records.sort_by(|a, b| {
+        (&a.key.target, &a.key.source, &a.key.artifact).cmp(&(
+            &b.key.target,
+            &b.key.source,
+            &b.key.artifact,
+        ))
+    });
+    records
+}
+
+fn assert_aborted_zero_mutation(
+    registry: &FileRegistry,
+    before_records: &[RegistryRecord],
+    targets: &[(&str, &TargetDir)],
+) {
+    let journal = Journal::open(&registry.locks_dir()).expect("open journal");
+    assert!(
+        journal.entries().expect("read journal entries").is_empty(),
+        "abort fail-fast: the deploy journal must hold ZERO entries — no staging intent may be \
+         journaled before the global Abort check"
+    );
+    assert_eq!(
+        sort_records(registry.list_all().expect("list all records")),
+        sort_records(before_records.to_vec()),
+        "abort must leave every registry record byte-identical — no put/remove may run before the \
+         global Abort check"
+    );
+    for (name, td) in targets {
+        assert!(
+            registry
+                .load_ejected(name)
+                .expect("load ejected")
+                .is_empty(),
+            "abort must persist ZERO ejections for target {name}"
+        );
+        assert!(
+            !td.has_phora_leftover(),
+            "abort must leave no .phora-* staging path under target {name}'s parent {}",
+            td.parent_path.display()
+        );
+    }
+}
+
+fn deploy_two_targets_modified(
+    fx: &SyncFixture,
+    registry: &FileRegistry,
+    td_a: &TargetDir,
+    td_b: &TargetDir,
+    cfg: &Config,
+) -> (Lock, PathBuf, PathBuf) {
+    let first = sync(&input(cfg, None, None, None, false), &fx.backend, registry)
+        .expect("first sync deploys both targets");
+    assert!(!first.had_failures, "premise: the first deploy is clean");
+    let dir_a = td_a.target_path().join("solo").join("editor");
+    let dir_b = td_b.target_path().join("solo").join("editor");
+    std::fs::write(dir_a.join("init.lua"), b"-- edited a\n").expect("edit target a");
+    std::fs::write(dir_b.join("init.lua"), b"-- edited b\n").expect("edit target b");
+    let commit = first
+        .base_lock
+        .find_source("solo")
+        .expect("solo present in base lock")
+        .commit
+        .clone();
+    for (dir, target) in [(&dir_a, "alpha"), (&dir_b, "beta")] {
+        let st = check_state_at(dir, registry, target, "solo", "editor", &commit);
+        assert!(
+            matches!(st, ArtifactState::Modified { .. }),
+            "premise: edited {target} copy must read Modified, got {st:?}"
+        );
+    }
+    (
+        first.base_lock,
+        dir_a.join("init.lua"),
+        dir_b.join("init.lua"),
+    )
+}
+
+#[test]
+fn cross_target_eject_then_abort_mutates_neither_target() {
+    let fx = build_sync_fixture();
+    let td_a = TargetDir::new();
+    let td_b = TargetDir::new();
+    let cfg = config_one_source_two_targets(
+        "solo",
+        &fx.url,
+        "alpha",
+        &td_a.target_path(),
+        "beta",
+        &td_b.target_path(),
+        "by-source",
+    );
+
+    let (base_lock, file_a, file_b) =
+        deploy_two_targets_modified(&fx, &fx.registry, &td_a, &td_b, &cfg);
+    let before = fx
+        .registry
+        .list_all()
+        .expect("snapshot records before abort");
+
+    let resolver = OrderedResolver::new(
+        vec![Resolution::Eject, Resolution::Abort],
+        vec![td_a.parent_path.clone(), td_b.parent_path.clone()],
+    );
+    let result = sync(
+        &interactive_input(&cfg, Some(base_lock), &resolver),
+        &fx.backend,
+        &fx.registry,
+    );
+
+    let Err(err) = result else {
+        panic!("an Eject (target A) then Abort (target B) run must abort the WHOLE sync, got Ok");
+    };
+    assert!(
+        matches!(err, Error::Aborted),
+        "the run must surface Error::Aborted, got {err:?}"
+    );
+    assert_eq!(
+        resolver.consulted(),
+        2,
+        "whole-run preflight must resolve BOTH targets' conflicts before the global Abort check — \
+         a per-target preflight that applies target A before consulting target B is forbidden; \
+         got {}",
+        resolver.consulted()
+    );
+    assert!(
+        !resolver.staging_seen(),
+        "no .phora-* staging path may exist under EITHER target at any resolve consultation — \
+         whole-run preflight resolves every target's conflict before any target is staged"
+    );
+    assert_aborted_zero_mutation(&fx.registry, &before, &[("alpha", &td_a), ("beta", &td_b)]);
+    assert_eq!(
+        std::fs::read(&file_a).expect("read target a init.lua"),
+        b"-- edited a\n",
+        "target alpha's edit must survive — no Eject may be applied when a SIBLING TARGET aborts"
+    );
+    assert_eq!(
+        std::fs::read(&file_b).expect("read target b init.lua"),
+        b"-- edited b\n",
+        "target beta's edit must survive the abort too"
+    );
+}
+
+#[test]
+fn cross_target_conflicts_all_resolve_before_any_target_is_deployed() {
+    let fx = build_sync_fixture();
+    let td_a = TargetDir::new();
+    let td_b = TargetDir::new();
+    let cfg = config_one_source_two_targets(
+        "solo",
+        &fx.url,
+        "alpha",
+        &td_a.target_path(),
+        "beta",
+        &td_b.target_path(),
+        "by-source",
+    );
+
+    let (base_lock, file_a, file_b) =
+        deploy_two_targets_modified(&fx, &fx.registry, &td_a, &td_b, &cfg);
+
+    let resolver = StageWatchResolver::new(
+        vec![
+            (file_a.clone(), b"-- init\n".to_vec()),
+            (file_b.clone(), b"-- init\n".to_vec()),
+        ],
+        vec![td_a.parent_path.clone(), td_b.parent_path.clone()],
+    );
+    let out = sync(
+        &interactive_input(&cfg, Some(base_lock), &resolver),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("an all-Overwrite run across two targets must succeed");
+
+    assert!(!out.had_failures, "an all-overwrite run is clean");
+    assert_eq!(
+        resolver.consulted(),
+        2,
+        "both targets' Modified conflicts must be resolved, got {}",
+        resolver.consulted()
+    );
+    assert_eq!(
+        resolver.max_staged_at_resolve(),
+        0,
+        "whole-run resolve-before-staging ACROSS TARGETS: no target may be deployed while another \
+         target's conflict is still being resolved — preflight spans the entire sync() run, not \
+         one deploy_target call"
+    );
+    assert!(
+        !resolver.staging_seen(),
+        "no .phora-* staging path may exist under EITHER target at any resolve consultation — \
+         staging across the whole run starts only after every target's conflict is resolved"
+    );
+    assert_eq!(
+        std::fs::read(&file_a).expect("read target a init.lua"),
+        b"-- init\n",
+        "the apply pass must eventually overwrite target alpha with upstream"
+    );
+    assert_eq!(
+        std::fs::read(&file_b).expect("read target b init.lua"),
+        b"-- init\n",
+        "the apply pass must eventually overwrite target beta with upstream"
     );
 }
 

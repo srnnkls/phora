@@ -36,6 +36,13 @@ pub enum ManagedCondition {
     Linked,
 }
 
+/// What kind of conflict surfaced at an artifact destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConflictKind {
+    Modified { changed: Vec<PathBuf> },
+    Foreign,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncChange {
     Deploy {
@@ -52,7 +59,7 @@ pub enum SyncChange {
         target: String,
         source: String,
         artifact: String,
-        changed: Vec<PathBuf>,
+        kind: ConflictKind,
     },
     Remove {
         target: String,

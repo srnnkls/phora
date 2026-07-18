@@ -53,11 +53,26 @@ pub(super) fn is_composed_target(target_name: &str) -> bool {
     target_name.contains('%')
 }
 
-pub(super) fn deploy_target(
+pub(super) struct ConflictOutcome {
+    resolution: Resolution,
+    kind: ConflictKind,
+    warn: bool,
+}
+
+pub(super) type ConflictDecisions = BTreeMap<(String, String, String), ConflictOutcome>;
+
+pub(super) fn decisions_abort(decisions: &ConflictDecisions) -> bool {
+    decisions
+        .values()
+        .any(|outcome| matches!(outcome.resolution, Resolution::Abort))
+}
+
+fn walk_target(
     run: TargetRun<'_>,
     backend: &dyn StageSource,
     registry: &dyn Registry,
-    journal: &Journal,
+    surface_warnings: bool,
+    mut visit: impl FnMut(&TargetRun<'_>, &ArtifactEntry<'_>, StageBridge<'_>) -> Result<bool>,
 ) -> Result<bool> {
     let layout = run.target.layout();
     let ejected = registry.load_ejected(run.target_name)?;
@@ -80,7 +95,9 @@ pub(super) fn deploy_target(
         .collect();
 
     for binding in &plan.bindings {
-        surface_projection_warnings(&binding.warnings);
+        if surface_warnings {
+            surface_projection_warnings(&binding.warnings);
+        }
         let template_opt_in = template_opt_ins.get(&binding.identity).ok_or_else(|| {
             Error::Sync(format!(
                 "binding `{}` planned without a resolved template opt-in",
@@ -125,11 +142,36 @@ pub(super) fn deploy_target(
                 artifact: item,
                 target: &plan,
             };
-            had_failures |= deploy_entry(run, &entry, bridge, backend, registry, journal)?;
+            had_failures |= visit(&run, &entry, bridge)?;
         }
     }
 
     Ok(had_failures)
+}
+
+pub(super) fn preflight_target(
+    run: TargetRun<'_>,
+    backend: &dyn StageSource,
+    registry: &dyn Registry,
+    decisions: &mut ConflictDecisions,
+) -> Result<()> {
+    walk_target(run, backend, registry, false, |run, entry, _bridge| {
+        preflight_entry(run, entry, backend, registry, decisions)?;
+        Ok(false)
+    })?;
+    Ok(())
+}
+
+pub(super) fn deploy_target(
+    run: TargetRun<'_>,
+    backend: &dyn StageSource,
+    registry: &dyn Registry,
+    journal: &Journal,
+    decisions: &ConflictDecisions,
+) -> Result<bool> {
+    walk_target(run, backend, registry, true, |run, entry, bridge| {
+        apply_entry(run, entry, bridge, backend, registry, journal, decisions)
+    })
 }
 
 fn surface_projection_warnings(warnings: &[ProjectionWarning]) {
@@ -227,16 +269,77 @@ pub(super) fn deploy_artifact_entry(
         artifact: entry.item,
         target: &projection,
     };
-    deploy_entry(run, entry, bridge, backend, registry, journal)
+    let mut decisions = ConflictDecisions::new();
+    preflight_entry(&run, entry, backend, registry, &mut decisions)?;
+    apply_entry(&run, entry, bridge, backend, registry, journal, &decisions)
 }
 
-fn deploy_entry(
-    run: TargetRun<'_>,
+fn conflict_triplet(run: &TargetRun<'_>, entry: &ArtifactEntry<'_>) -> (String, String, String) {
+    (
+        run.target_name.to_owned(),
+        entry.identity.to_owned(),
+        entry.published_key().to_owned(),
+    )
+}
+
+fn preflight_entry(
+    run: &TargetRun<'_>,
+    entry: &ArtifactEntry<'_>,
+    backend: &dyn StageSource,
+    registry: &dyn Registry,
+    decisions: &mut ConflictDecisions,
+) -> Result<()> {
+    let published_key = entry.published_key().to_owned();
+    let key = ArtifactKey {
+        target: run.target_name.to_owned(),
+        source: entry.identity.to_owned(),
+        artifact: published_key.clone(),
+    };
+    let expected_vars_digest = expected_vars_digest(entry, backend, registry, &key, run.vars)?;
+    let state = check_artifact_state(
+        entry.artifact_dst,
+        entry.identity,
+        entry.commit,
+        entry.ejected,
+        &published_key,
+        registry,
+        &key,
+        expected_vars_digest.as_deref(),
+    )?;
+    let Some(kind) = conflict_kind_for(&state, entry, run.force) else {
+        return Ok(());
+    };
+    let (resolution, warn) = match run.resolver {
+        Some(resolver) if run.interactive => (
+            resolver.resolve(&Conflict {
+                target: run.target_name.to_owned(),
+                source: entry.identity.to_owned(),
+                artifact: published_key.clone(),
+                kind: kind.clone(),
+            }),
+            false,
+        ),
+        _ => (Resolution::Skip, true),
+    };
+    decisions.insert(
+        conflict_triplet(run, entry),
+        ConflictOutcome {
+            resolution,
+            kind,
+            warn,
+        },
+    );
+    Ok(())
+}
+
+fn apply_entry(
+    run: &TargetRun<'_>,
     entry: &ArtifactEntry<'_>,
     bridge: StageBridge<'_>,
     backend: &dyn StageSource,
     registry: &dyn Registry,
     journal: &Journal,
+    decisions: &ConflictDecisions,
 ) -> Result<bool> {
     let artifact_dst = entry.artifact_dst;
     let published_key = entry.published_key().to_owned();
@@ -303,18 +406,17 @@ fn deploy_entry(
             return Ok(false);
         }
         None => Resolution::Overwrite,
-        Some(kind) => match run.resolver {
-            Some(resolver) if run.interactive => resolver.resolve(&Conflict {
-                target: run.target_name.to_owned(),
-                source: entry.identity.to_owned(),
-                artifact: published_key.clone(),
-                kind,
-            }),
-            _ => {
+        Some(kind) => {
+            if let Some(outcome) = decisions.get(&conflict_triplet(run, entry)) {
+                if outcome.warn {
+                    warn_skip(entry.identity, &published_key, &outcome.kind, artifact_dst);
+                }
+                outcome.resolution
+            } else {
                 warn_skip(entry.identity, &published_key, &kind, artifact_dst);
                 Resolution::Skip
             }
-        },
+        }
     };
 
     match resolution {

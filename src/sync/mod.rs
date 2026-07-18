@@ -46,7 +46,7 @@ use resolve::resolve_sources;
 pub use stage::{StageRequest, StagedArtifact, StagedFile, stage_artifact};
 pub use target::StageBridge;
 pub(crate) use target::record_artifact_path;
-use target::{TargetRun, deploy_target};
+use target::{ConflictDecisions, TargetRun, decisions_abort, deploy_target, preflight_target};
 
 #[cfg(test)]
 use {
@@ -112,12 +112,7 @@ pub enum Resolution {
     Abort,
 }
 
-/// What kind of conflict surfaced at an artifact destination.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConflictKind {
-    Modified { changed: Vec<std::path::PathBuf> },
-    Foreign,
-}
+pub use model::ConflictKind;
 
 /// A single conflict presented to a [`ConflictResolver`] during interactive sync.
 #[derive(Debug, Clone)]
@@ -301,7 +296,43 @@ struct DeployRun {
     aborted: bool,
 }
 
+fn target_run<'a>(
+    ctx: &DeployAll<'a>,
+    target_name: &'a str,
+    target: &'a crate::config::Target,
+) -> TargetRun<'a> {
+    TargetRun {
+        parsed: ctx.parsed,
+        target_name,
+        target,
+        commits: ctx.resolved_commits,
+        remotes: ctx.remotes,
+        force: ctx.input.force,
+        interactive: ctx.input.interactive,
+        resolver: ctx.input.resolver,
+        vars: &ctx.config.vars,
+        protected: ctx.protected,
+    }
+}
+
+fn preflight_all_targets(ctx: &DeployAll<'_>) -> Result<ConflictDecisions> {
+    let mut decisions = ConflictDecisions::new();
+    for (target_name, target) in &ctx.config.targets {
+        preflight_target(
+            target_run(ctx, target_name, target),
+            ctx.backend,
+            ctx.registry,
+            &mut decisions,
+        )?;
+    }
+    if decisions_abort(&decisions) {
+        return Err(Error::Aborted);
+    }
+    Ok(decisions)
+}
+
 fn deploy_all_targets(ctx: &DeployAll<'_>) -> Result<DeployRun> {
+    let decisions = preflight_all_targets(ctx)?;
     let mut run = DeployRun {
         had_failures: false,
         pre_deploy: Vec::new(),
@@ -333,21 +364,11 @@ fn deploy_all_targets(ctx: &DeployAll<'_>) -> Result<DeployRun> {
             }
         }
         run.had_failures |= deploy_target(
-            TargetRun {
-                parsed: ctx.parsed,
-                target_name,
-                target,
-                commits: ctx.resolved_commits,
-                remotes: ctx.remotes,
-                force: ctx.input.force,
-                interactive: ctx.input.interactive,
-                resolver: ctx.input.resolver,
-                vars: &ctx.config.vars,
-                protected: ctx.protected,
-            },
+            target_run(ctx, target_name, target),
             ctx.backend,
             ctx.registry,
             ctx.journal,
+            &decisions,
         )?;
     }
     Ok(run)
