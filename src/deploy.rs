@@ -2132,8 +2132,8 @@ mod tests {
         target_parent.join(".phora-stage")
     }
 
-    /// Create the already-exported staging dir with the given files, mirroring what
-    /// `backend.export_artifact` leaves before the swap.
+    /// Create the already-staged dir with the given files, mirroring what
+    /// `stage_artifact` leaves before the swap.
     fn make_staging(staging_base: &Path, files: &[(&str, &[u8])]) -> PathBuf {
         let staging = staging_base.join("snippets-deadbeef");
         for (rel, contents) in files {

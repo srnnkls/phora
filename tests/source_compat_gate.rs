@@ -323,7 +323,13 @@ const LEGACY_METHODS: &[&str] = &[
     "compute_digest",
 ];
 
-const REMOVAL_CANDIDATES: &[&str] = &["fetch", "mirror_ready", "read_file_at", "list_tree_at"];
+const REMOVAL_CANDIDATES: &[&str] = &[
+    "fetch",
+    "mirror_ready",
+    "read_file_at",
+    "list_tree_at",
+    "export_artifact",
+];
 
 fn source_files() -> Vec<(String, String)> {
     prod_src_files()

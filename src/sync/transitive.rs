@@ -1618,12 +1618,6 @@ mod tests {
         ) -> std::result::Result<u64, crate::source::SourceError> {
             self.inner.commit_time(source, url, commit)
         }
-        fn export_artifact(
-            &self,
-            req: &crate::source::ExportRequest<'_>,
-        ) -> std::result::Result<crate::source::ExportResult, crate::source::SourceError> {
-            self.inner.export_artifact(req)
-        }
         fn compute_digest(
             &self,
             source: &SourceName,

@@ -8,7 +8,6 @@ mod preview;
 mod prune;
 mod rebuild;
 mod resolve;
-mod source_read;
 pub(crate) mod stage;
 mod target;
 pub(crate) mod transitive;
@@ -62,8 +61,12 @@ use crate::config::{
 use crate::deploy::{Journal, recovery_sweep};
 use crate::error::{Error, Result};
 use crate::lock::{Lock, merge_locks, split_locks};
-use crate::source::{SourceBackend, is_local_path};
+use crate::source::{SourceBackend, SourceStore, is_local_path};
 use crate::store::{ArtifactKey, EjectedEntry, Registry, RegistryRecord};
+
+pub trait StageSource: SourceBackend + SourceStore {}
+
+impl<T: SourceBackend + SourceStore> StageSource for T {}
 
 /// Borrowed inputs to [`sync`]: the configs and locks plus run flags. Bundled so
 /// the orchestration entry point stays stable as later phases add fields.
@@ -279,7 +282,7 @@ struct DeployAll<'a> {
     resolved_commits: &'a BTreeMap<(String, String), String>,
     protected: &'a confine::ProtectedPathSet,
     input: &'a SyncInput<'a>,
-    backend: &'a (dyn SourceBackend + Sync),
+    backend: &'a (dyn StageSource + Sync),
     registry: &'a dyn Registry,
     journal: &'a Journal,
 }
@@ -443,7 +446,7 @@ fn apply_fast_forward_drops(
 
 pub fn sync(
     input: &SyncInput<'_>,
-    backend: &(dyn SourceBackend + Sync),
+    backend: &(dyn StageSource + Sync),
     registry: &dyn Registry,
 ) -> Result<SyncOutput> {
     let mut effective_config =

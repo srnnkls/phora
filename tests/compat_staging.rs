@@ -576,8 +576,7 @@ fn symlink_rejection_error_is_byte_identical() {
         &vars,
         &leaves,
     )
-    .err()
-    .expect("staging a symlink under the default policy must be rejected");
+    .expect_err("staging a symlink under the default policy must be rejected");
 
     let rendered = format!("{err}\n");
     assert!(
@@ -608,8 +607,7 @@ fn template_render_error_is_byte_identical() {
         &vars,
         &leaves,
     )
-    .err()
-    .expect("a template referencing an undefined variable must fail strict rendering");
+    .expect_err("a template referencing an undefined variable must fail strict rendering");
 
     assert_golden("template_error.golden", &format!("{err}\n"));
 }
@@ -762,8 +760,7 @@ fn deployed_name_collision_error_is_byte_identical() {
         &vars,
         &[leaf("plain.txt", "dup.txt"), leaf("run.sh", "dup.txt")],
     )
-    .err()
-    .expect("two leaves mapping to the same dest must collide");
+    .expect_err("two leaves mapping to the same dest must collide");
 
     let rendered = format!("{err}\n");
     assert!(
@@ -791,8 +788,7 @@ fn template_fuel_exhaustion_error_is_byte_identical() {
         &vars,
         &[leaf("runaway.txt.tmpl", "runaway.txt")],
     )
-    .err()
-    .expect("a runaway template must exhaust the render fuel");
+    .expect_err("a runaway template must exhaust the render fuel");
 
     let rendered = format!("{err}\n");
     assert!(
@@ -1009,8 +1005,7 @@ fn escaping_symlink_error_is_byte_identical() {
         &vars,
         &[leaf("escape", "escape")],
     )
-    .err()
-    .expect("a symlink whose target escapes the deploy tree must be rejected");
+    .expect_err("a symlink whose target escapes the deploy tree must be rejected");
 
     let rendered = format!("{err}\n");
     assert!(

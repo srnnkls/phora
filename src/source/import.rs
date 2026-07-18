@@ -7,7 +7,7 @@ use crate::config::Refspec;
 use crate::kernel::{Digest, SourceName, safe_component};
 
 use super::cache::{MirrorStaging, lock_mirror, mirror_path};
-use super::{ExportRequest, ExportResult, GitBackend, Result, SourceBackend, SourceError};
+use super::{GitBackend, Result, SourceBackend, SourceError};
 
 /// A download scratch file under `git_dir`, removed on drop.
 struct TempDownload {
@@ -101,10 +101,6 @@ impl SourceBackend for HttpBackend {
         root: Option<&Path>,
     ) -> Result<Vec<String>> {
         self.git.list_source_leaves(source, url, commit, root)
-    }
-
-    fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult> {
-        self.git.export_artifact(req)
     }
 
     fn compute_digest(

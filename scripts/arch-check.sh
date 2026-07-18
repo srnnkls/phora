@@ -243,6 +243,18 @@ reconcile_use_ok() {
   esac
 }
 
+source_use_ok() {
+  local u="${1#pub }"
+  u="${u#pub(crate) }"
+  case "$u" in
+    crate::projection|crate::projection::*) return 1 ;;
+    crate::sync|crate::sync::*) return 1 ;;
+    crate::store|crate::store::*) return 1 ;;
+    crate::config::TemplateOptIn|crate::config::*::TemplateOptIn) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 FQ_IO_RE='\bstd::(fs|process|net|io|os)::'
 
 violations=0
@@ -321,6 +333,15 @@ if [[ -f "$recon" ]]; then
     echo "arch-check: reconcile reaches the filesystem via a Path fs-method in ${rel}" >&2
     violations=$((violations + 1))
   fi
+fi
+
+if [[ -d "$SRC/source" ]]; then
+  while IFS= read -r f; do
+    case "$f" in */tests.rs | *_tests.rs) continue ;; esac
+    rel="${f#"$SCAN_ROOT"/}"
+    check_uses "$f" source_use_ok "source" "$rel"
+    check_fq_crate "$f" source_use_ok "source" "$rel"
+  done < <(find "$SRC/source" -type f -name '*.rs' | sort)
 fi
 
 LEAK_RE='\bstd::fs\b|\bfs::[A-Za-z]|\bgix::|\bstd::process\b|\bstd::net\b|OpenOptions|File::(create|open)'

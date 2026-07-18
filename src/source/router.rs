@@ -6,7 +6,10 @@ use std::path::Path;
 
 use crate::config::{Refspec, SourceMode};
 use crate::kernel::SourceName;
-use crate::source::{ExportRequest, ExportResult, SourceBackend, SourceError, TreeEntry};
+use crate::source::{
+    ResolvedSource, SourceBackend, SourceEntry, SourceError, SourceInventory, SourcePath,
+    SourceStore, TreeEntry,
+};
 
 type Result<T> = std::result::Result<T, SourceError>;
 
@@ -87,10 +90,6 @@ impl<G: SourceBackend, H: SourceBackend> SourceBackend for RouterBackend<G, H> {
         self.route(source).commit_time(source, url, commit)
     }
 
-    fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult> {
-        self.route(req.source).export_artifact(req)
-    }
-
     fn compute_digest(
         &self,
         source: &SourceName,
@@ -102,6 +101,20 @@ impl<G: SourceBackend, H: SourceBackend> SourceBackend for RouterBackend<G, H> {
     ) -> Result<String> {
         self.route(source)
             .compute_digest(source, url, commit, root, include, exclude)
+    }
+}
+
+impl<G: SourceStore, H> SourceStore for RouterBackend<G, H> {
+    fn inventory(&self, source: &ResolvedSource) -> Result<SourceInventory> {
+        self.git.inventory(source)
+    }
+
+    fn read(&self, source: &ResolvedSource, path: &SourcePath) -> Result<SourceEntry> {
+        self.git.read(source, path)
+    }
+
+    fn digest_snapshot(&self, source: &ResolvedSource, leaves: &[SourcePath]) -> Result<String> {
+        self.git.digest_snapshot(source, leaves)
     }
 }
 
@@ -121,8 +134,7 @@ mod tests {
     use crate::config::{Refspec, SourceMode};
     use crate::kernel::SourceName;
     use crate::source::{
-        ExportRequest, ExportResult, GitBackend, HttpBackend, RouterBackend, SourceBackend,
-        SourceError, TreeEntry,
+        GitBackend, HttpBackend, RouterBackend, SourceBackend, SourceError, TreeEntry,
     };
 
     type Result<T> = std::result::Result<T, SourceError>;
@@ -356,10 +368,6 @@ mod tests {
 
         fn commit_time(&self, _source: &SourceName, _url: &str, _commit: &str) -> Result<u64> {
             Ok(0)
-        }
-
-        fn export_artifact(&self, _req: &ExportRequest<'_>) -> Result<ExportResult> {
-            Err(SourceError::Source("spy export".into()))
         }
 
         fn compute_digest(

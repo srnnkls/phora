@@ -330,6 +330,119 @@ fn reconcile_compliant_file_passes() {
         .assert_pass("reconcile.rs importing only projection + sync::model + std non-I/O");
 }
 
+const COMPLIANT_SOURCE: &str = r"
+use std::collections::BTreeMap;
+
+use crate::config::Refspec;
+use crate::kernel::SourceName;
+use crate::error::Error;
+
+pub fn describe(_r: &Refspec, _n: &SourceName) -> BTreeMap<String, String> {
+    let _ = Error::Sync(String::new());
+    BTreeMap::new()
+}
+";
+
+#[test]
+fn source_direct_forbidden_imports_fail() {
+    let forbidden = [
+        ("projection", "use crate::projection::model::Projection;"),
+        ("sync-staging", "use crate::sync::stage::stage_artifact;"),
+        ("sync-target-path", "use crate::sync::TargetPath;"),
+        ("manifest", "use crate::store::ManifestFile;"),
+        ("registry", "use crate::store::RegistryRecord;"),
+        ("template-policy", "use crate::config::TemplateOptIn;"),
+    ];
+    for (label, import) in forbidden {
+        let tree = base_tree();
+        tree.write(
+            "src/source/probe.rs",
+            &format!("{import}\npub fn probe() {{}}\n"),
+        );
+        tree.check().assert_fail(&format!(
+            "source importing forbidden `{label}` (INV-2 staging clause)"
+        ));
+    }
+}
+
+#[test]
+fn source_indirect_forbidden_import_fails() {
+    let tree = base_tree();
+    tree.write(
+        "src/source/probe.rs",
+        "use crate::source::probe_helper;\npub fn probe() { probe_helper::run(); }\n",
+    );
+    tree.write(
+        "src/source/probe_helper.rs",
+        "use crate::sync::stage::Renderer;\npub fn run() { let _ = Renderer; }\n",
+    );
+    tree.check().assert_fail(
+        "a source submodule pulling in the sync staging module (INV-2 staging clause)",
+    );
+}
+
+#[test]
+fn source_compliant_file_passes() {
+    let tree = base_tree();
+    tree.write("src/source/probe.rs", COMPLIANT_SOURCE);
+    tree.check().assert_pass(
+        "a source file importing only config non-template values, kernel identities, the \
+         crate error type, and std non-I/O — the INV-2 source clause must not over-forbid \
+         source's legitimate config/kernel/std dependencies",
+    );
+}
+
+#[test]
+fn source_forbidden_import_in_cfg_test_is_ignored() {
+    let tree = base_tree();
+    tree.write(
+        "src/source/probe.rs",
+        &format!(
+            "{COMPLIANT_SOURCE}\n\
+             #[cfg(test)]\nmod tests {{\n    use crate::sync::stage::stage_artifact;\n\
+             use crate::store::ManifestFile;\n}}\n"
+        ),
+    );
+    tree.check()
+        .assert_pass("forbidden source imports confined to a #[cfg(test)] module");
+}
+
+#[test]
+fn source_fully_qualified_forbidden_crate_path_fails() {
+    let bypasses = [
+        (
+            "crate::sync::stage body call, no use",
+            "pub fn probe() { let _ = crate::sync::stage::stage_artifact(); }\n",
+        ),
+        (
+            "crate::store body path, no use",
+            "pub fn probe() { let _ = crate::store::ManifestFile::default(); }\n",
+        ),
+        (
+            "crate :: sync (whitespace-separated ::)",
+            "pub fn probe() { let _ = crate :: sync :: stage :: stage_artifact(); }\n",
+        ),
+        (
+            "crate::projection body path, no use",
+            "pub fn probe() { let _ = crate::projection::model::TargetProjection::default(); }\n",
+        ),
+        (
+            "submodule-prefixed template policy import",
+            "use crate::config::target::TemplateOptIn;\npub fn probe() {}\n",
+        ),
+    ];
+    for (label, body) in bypasses {
+        let tree = base_tree();
+        tree.write("src/source/probe.rs", body);
+        tree.check().assert_fail(&format!(
+            "source reaching a forbidden module via `{label}` — full qualification and \
+             submodule-prefixed paths must not bypass the INV-2 source denylist (the exact \
+             FQ bypass class INV-1 closed in T007; the lint needs check_fq_crate over \
+             src/source with prefix-robust patterns)"
+        ));
+    }
+}
+
 fn print_allowlist() -> Option<String> {
     match Command::new(script_path())
         .arg("--print-allowlist")
