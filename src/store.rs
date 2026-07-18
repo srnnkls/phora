@@ -659,6 +659,57 @@ impl Registry for FileRegistry {
     }
 }
 
+impl crate::sync::state::StateStore for FileRegistry {
+    fn artifact(&self, key: &ArtifactKey) -> Result<Option<RegistryRecord>> {
+        self.get(key)
+    }
+
+    fn put_artifact(&self, record: &RegistryRecord) -> Result<()> {
+        self.put(record)
+    }
+
+    fn remove_artifact(&self, key: &ArtifactKey) -> Result<()> {
+        self.remove(key)
+    }
+
+    fn target_artifacts(&self, target: &str) -> Result<Vec<RegistryRecord>> {
+        self.list_target(target)
+    }
+
+    fn all_artifacts(&self) -> Result<Vec<RegistryRecord>> {
+        self.list_all()
+    }
+
+    fn ejections(&self, target: &str) -> Result<Vec<EjectedEntry>> {
+        self.load_ejected(target)
+    }
+
+    fn save_ejections(&self, target: &str, entries: &[EjectedEntry]) -> Result<()> {
+        self.save_ejected(target, entries)
+    }
+
+    fn hook_state(&self, target: &str) -> Result<Vec<HookState>> {
+        self.load_hook_state(target)
+    }
+
+    fn record_hook_success(
+        &self,
+        target: &str,
+        hook_id: &str,
+        digest_set: &std::collections::BTreeSet<String>,
+    ) -> Result<()> {
+        Registry::record_hook_success(self, target, hook_id, digest_set)
+    }
+
+    fn acquire_lock(&self) -> Result<StateLockGuard> {
+        self.lock_exclusive()
+    }
+
+    fn journal_root(&self) -> PathBuf {
+        Registry::locks_dir(self)
+    }
+}
+
 /// Delegates every read to `inner` but refuses writes, naming the root: a frozen sync
 /// plans against a read-only state root, so any write it reaches is pending work
 /// surfaced as `ReadOnly` rather than a raw permission error.
