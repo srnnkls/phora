@@ -1040,3 +1040,77 @@ fn legacy_infra_grandfather_set_is_pinned_exactly() {
          ever shrink) must fail this pin"
     );
 }
+
+#[test]
+fn reconcile_fully_qualified_forbidden_crate_path_fails() {
+    let bypasses = [
+        (
+            "crate::sync::stage body call, no use",
+            "pub fn reconcile() { let _ = crate::sync::stage::stage_artifact(); }\n",
+        ),
+        (
+            "crate::store body path, no use",
+            "pub fn reconcile() { let _ = crate::store::RegistryRecord::default(); }\n",
+        ),
+        (
+            "crate::deploy body path, no use",
+            "pub fn reconcile() { let _ = crate::deploy::Journal::open(); }\n",
+        ),
+        (
+            "crate :: sync :: target (whitespace-separated ::)",
+            "pub fn reconcile() { let _ = crate :: sync :: target :: noop(); }\n",
+        ),
+        (
+            "crate::sync::inspect body path (the new I/O sibling)",
+            "pub fn reconcile() { let _ = crate::sync::inspect::inspect(); }\n",
+        ),
+    ];
+    for (label, body) in bypasses {
+        let tree = base_tree();
+        tree.write("src/sync/reconcile.rs", body);
+        tree.check().assert_fail(&format!(
+            "reconcile.rs reaching a forbidden module via `{label}` — full qualification must \
+             not bypass the INV-8 reconcile denylist (the exact FQ bypass class INV-1 closed \
+             in T007; the reconcile block needs check_fq_crate over reconcile.rs with \
+             reconcile_use_ok and prefix-robust patterns, mirroring the projection/source blocks)"
+        ));
+    }
+}
+
+#[test]
+fn reconcile_pub_use_reexport_of_forbidden_module_fails() {
+    let launderings = [
+        "pub use crate::sync::target::StageBridge;\n",
+        "pub use crate::store::RegistryRecord as Rec;\n",
+        "pub use crate::sync::stage::stage_artifact;\n",
+    ];
+    for body in launderings {
+        let tree = base_tree();
+        tree.write(
+            "src/sync/reconcile.rs",
+            &format!("{body}pub fn reconcile() {{}}\n"),
+        );
+        tree.check().assert_fail(&format!(
+            "reconcile.rs must not launder a forbidden module through a `pub use` re-export on \
+             its own public surface — the use-scan denies every crate::sync sibling except \
+             sync::model and every crate:: leaf except projection/sync::model: {body:?}"
+        ));
+    }
+}
+
+#[test]
+fn reconcile_fully_qualified_allowlisted_paths_pass() {
+    let tree = base_tree();
+    tree.write(
+        "src/sync/reconcile.rs",
+        "pub fn reconcile() -> crate::sync::model::ChangeSet {\n    \
+         let _p: Option<crate::projection::Projection> = None;\n    \
+         crate::sync::model::ChangeSet::default()\n}\n",
+    );
+    tree.check().assert_pass(
+        "reconcile.rs referencing ALLOWLISTED leaves via fully-qualified body paths with no use \
+         statement — the pure sync::model (crate::sync::model::ChangeSet) and a projection value \
+         type (crate::projection::Projection), both on reconcile_use_ok's positive allowlist — \
+         closing the FQ bypass must not over-reject the leaves the use-scan already permits",
+    );
+}

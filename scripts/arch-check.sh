@@ -332,6 +332,7 @@ recon="$SRC/sync/reconcile.rs"
 if [[ -f "$recon" ]]; then
   rel="${recon#"$SCAN_ROOT"/}"
   check_uses "$recon" reconcile_use_ok "reconcile" "$rel"
+  check_fq_crate "$recon" reconcile_use_ok "reconcile" "$rel"
   check_fq_io "$recon" "reconcile" "$rel"
   if grep -Eq '\.(exists|try_exists|metadata|symlink_metadata|is_file|is_dir|read_dir|read_link|canonicalize)[[:space:]]*\(' <<< "$(stripped_or_die "$recon")"; then
     echo "arch-check: reconcile reaches the filesystem via a Path fs-method in ${rel}" >&2
