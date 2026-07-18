@@ -75,6 +75,11 @@ fn build_rooted_source_repo(root: &Path) {
     write(&art.join("greet.txt.tmpl"), b"hello {{ name }}\n");
     write(&art.join("boom.txt.tmpl"), b"value={{ missing }}\n");
     write(&art.join("nested/deep.txt"), b"deep leaf body\n");
+    write(&art.join("nested/motd.md.tmpl"), b"deep {{ name }}\n");
+    write(&art.join("app.conf"), b"cfg={{ name }}\n");
+    write(&art.join("notes.txt"), b"note {{ name }}\n");
+    write(&art.join("dup.txt"), b"offer-root dup body\n");
+    write(&root.join("dup.txt"), b"repo-root dup body\n");
 
     let script = art.join("run.sh");
     write(&script, b"#!/bin/sh\necho hi\n");
@@ -156,13 +161,13 @@ fn projected_target(inventory_paths: &[&str], root: Option<&str>) -> TargetProje
     project_target("home", &[input]).expect("clean fixture projects")
 }
 
-fn adverse_artifact(leaves: &[(&str, &str, ContentTransform)]) -> ProjectedArtifact {
+fn adverse_artifact(dir: &str, leaves: &[(&str, &str, ContentTransform)]) -> ProjectedArtifact {
     let first = leaves.first().expect("at least one leaf");
     ProjectedArtifact {
         destination: phora::sync::TargetPath::new(first.1).expect("valid dest"),
         source: ResolvedSourceRef::new("fixture", "0123456789abcdef0123456789abcdef01234567"),
         materialization: phora::kernel::Materialization::CollapsedDir {
-            dir: OFFER_ROOT.to_owned(),
+            dir: dir.to_owned(),
         },
         kept_leaves: Vec::new(),
         leaves: leaves
@@ -412,6 +417,39 @@ fn assert_staged_file_parity(old_dir: &Path, new_dir: &Path, dest: &str) {
     );
 }
 
+fn assert_artifact_parity(staged: &StagedDirs, label: &str) {
+    assert_eq!(
+        staged.new.digest, staged.old.digest,
+        "the relocated staging must frame the identical artifact digest for {label}"
+    );
+    assert_eq!(
+        staged.new.vars_digest, staged.old.vars_digest,
+        "the relocated staging must produce the identical vars digest (Some iff a template \
+         rendered) for {label}"
+    );
+
+    let old_files = old_manifest_tuples(&staged.old);
+    assert_eq!(
+        new_manifest_tuples(&staged.new),
+        old_files,
+        "the relocated staging must emit the identical per-file manifest framing \
+         (destination, size, mtime, blake3) for {label}"
+    );
+    assert!(
+        !old_files.is_empty(),
+        "guard: an empty manifest would make the per-file comparison vacuous for {label}"
+    );
+
+    for (dest, _, _, _) in &old_files {
+        assert!(
+            !dest.starts_with("art/"),
+            "staged destinations are artifact-relative deployed names — an `art/` prefix means \
+             the offer root leaked into a dest: {dest}"
+        );
+        assert_staged_file_parity(staged.old_dir.path(), staged.new_dir.path(), dest);
+    }
+}
+
 fn assert_staged_parity(fx: &Fixture, target: &TargetProjection, root: Option<&str>) {
     let vars = name_var();
     let mut rendered_any = false;
@@ -432,43 +470,7 @@ fn assert_staged_parity(fx: &Fixture, target: &TargetProjection, root: Option<&s
             &vars,
         );
         rendered_any |= staged.old.vars_digest.is_some();
-
-        assert_eq!(
-            staged.new.digest,
-            staged.old.digest,
-            "the relocated staging must frame the identical artifact digest for {}",
-            artifact.destination.as_str()
-        );
-        assert_eq!(
-            staged.new.vars_digest,
-            staged.old.vars_digest,
-            "the relocated staging must produce the identical vars digest (Some iff a template \
-             rendered) for {}",
-            artifact.destination.as_str()
-        );
-
-        let old_files = old_manifest_tuples(&staged.old);
-        assert_eq!(
-            new_manifest_tuples(&staged.new),
-            old_files,
-            "the relocated staging must emit the identical per-file manifest framing \
-             (destination, size, mtime, blake3) for {}",
-            artifact.destination.as_str()
-        );
-        assert!(
-            !old_files.is_empty(),
-            "guard: an empty manifest would make the per-file comparison vacuous for {}",
-            artifact.destination.as_str()
-        );
-
-        for (dest, _, _, _) in &old_files {
-            assert!(
-                !dest.starts_with("art/"),
-                "staged destinations are artifact-relative deployed names — an `art/` prefix \
-                 means the offer root leaked into a dest: {dest}"
-            );
-            assert_staged_file_parity(staged.old_dir.path(), staged.new_dir.path(), dest);
-        }
+        assert_artifact_parity(&staged, artifact.destination.as_str());
     }
     assert!(
         rendered_any,
@@ -514,8 +516,10 @@ fn empty_offer_root_projects_like_none_and_stages_identically() {
 fn strict_undefined_template_error_matches_old_path() {
     let fx = build_fixture();
     let target = projected_target(&["art/boom.txt.tmpl"], Some(OFFER_ROOT));
-    let artifact =
-        adverse_artifact(&[("art/boom.txt.tmpl", "boom.txt", ContentTransform::Template)]);
+    let artifact = adverse_artifact(
+        OFFER_ROOT,
+        &[("art/boom.txt.tmpl", "boom.txt", ContentTransform::Template)],
+    );
     let (old, new) = both_errors(
         &fx,
         &artifact,
@@ -536,7 +540,10 @@ fn strict_undefined_template_error_matches_old_path() {
 fn symlink_rejection_error_matches_old_path() {
     let fx = build_fixture();
     let target = projected_target(&["art/plain.txt"], Some(OFFER_ROOT));
-    let artifact = adverse_artifact(&[("art/link", "deployed_copy", ContentTransform::Identity)]);
+    let artifact = adverse_artifact(
+        OFFER_ROOT,
+        &[("art/link", "deployed_copy", ContentTransform::Identity)],
+    );
     let (old, new) = both_errors(
         &fx,
         &artifact,
@@ -560,10 +567,13 @@ fn symlink_rejection_error_matches_old_path() {
 fn deployed_name_collision_error_matches_old_path() {
     let fx = build_fixture();
     let target = projected_target(&["art/plain.txt", "art/run.sh"], Some(OFFER_ROOT));
-    let artifact = adverse_artifact(&[
-        ("art/plain.txt", "dup.txt", ContentTransform::Identity),
-        ("art/run.sh", "dup.txt", ContentTransform::Identity),
-    ]);
+    let artifact = adverse_artifact(
+        OFFER_ROOT,
+        &[
+            ("art/plain.txt", "dup.txt", ContentTransform::Identity),
+            ("art/run.sh", "dup.txt", ContentTransform::Identity),
+        ],
+    );
     let (old, new) = both_errors(
         &fx,
         &artifact,
@@ -577,4 +587,144 @@ fn deployed_name_collision_error_matches_old_path() {
         "the deployed-name collision diagnostic must be byte-identical old vs new (the T003 \
          deployed_name_collision golden pins the old side)"
     );
+}
+
+#[test]
+fn root_relative_key_collision_is_refused_not_silently_overwritten() {
+    let fx = build_fixture();
+    let target = projected_target(&["art/plain.txt"], Some(OFFER_ROOT));
+    let artifact = adverse_artifact(
+        OFFER_ROOT,
+        &[
+            ("art/dup.txt", "a.txt", ContentTransform::Identity),
+            ("dup.txt", "b.txt", ContentTransform::Identity),
+        ],
+    );
+    let request = StageRequest {
+        artifact: &artifact,
+        target: &target,
+        variables: &BTreeMap::new(),
+    };
+    let staging = TempDir::new().expect("staging tempdir");
+
+    let Err(err) = new_stage(
+        &fx,
+        &request,
+        &ExportPolicy::default(),
+        staging.path(),
+        &TemplateOptIn::SuffixOnly,
+    ) else {
+        let a = std::fs::read(staging.path().join("a.txt")).expect("read staged a.txt");
+        let b = std::fs::read(staging.path().join("b.txt")).expect("read staged b.txt");
+        panic!(
+            "stage_artifact must refuse a plan where two leaves collapse to the same \
+             root-relative key (`art/dup.txt` and `dup.txt` both key `dup.txt` under \
+             root=Some(\"art\")): the repo_relative_sources map silently overwrites, staging \
+             wrong bytes with no error — unreachable from projection-produced artifacts, but \
+             stage_artifact is pub and T016 wires production through it; staged \
+             a.txt={:?} b.txt={:?}",
+            String::from_utf8_lossy(&a),
+            String::from_utf8_lossy(&b),
+        )
+    };
+    let rendered = format!("{err}");
+    assert!(
+        rendered.contains("dup.txt"),
+        "the collision refusal must name the colliding path so the plan is debuggable: \
+         {rendered}"
+    );
+}
+
+#[test]
+fn globs_opt_in_renders_matched_and_passes_unmatched_like_old_path() {
+    let fx = build_fixture();
+    let target = projected_target(&["art/app.conf", "art/notes.txt"], Some(OFFER_ROOT));
+    let artifact = adverse_artifact(
+        OFFER_ROOT,
+        &[
+            ("art/app.conf", "app.conf", ContentTransform::Template),
+            ("art/notes.txt", "notes.txt", ContentTransform::Identity),
+        ],
+    );
+    let mut builder = globset::GlobSetBuilder::new();
+    builder.add(globset::Glob::new("*.conf").expect("valid glob"));
+    let opt_in = TemplateOptIn::Globs(builder.build().expect("build glob set"));
+    let vars = name_var();
+
+    let staged = stage_both(
+        &fx,
+        &artifact,
+        &target,
+        Some(OFFER_ROOT),
+        &ExportPolicy::default(),
+        &opt_in,
+        &vars,
+    );
+
+    assert_eq!(
+        std::fs::read(staged.new_dir.path().join("app.conf")).expect("read staged app.conf"),
+        b"cfg=world\n",
+        "guard: the offer-root-relative glob `*.conf` must match the root-relative render key \
+         and actually render — a both-sides-unrendered outcome would pass parity vacuously"
+    );
+    assert!(
+        std::fs::read(staged.new_dir.path().join("notes.txt"))
+            .expect("read staged notes.txt")
+            .windows(b"{{ name }}".len())
+            .any(|w| w == b"{{ name }}"),
+        "guard: the unmatched leaf must pass through verbatim, template syntax intact"
+    );
+    assert!(
+        staged.old.vars_digest.is_some(),
+        "guard: the old path must report a rendered template so vars-digest parity is exercised"
+    );
+    assert_artifact_parity(&staged, "globs opt-in artifact");
+}
+
+#[test]
+fn multi_component_offer_root_stages_identically() {
+    let fx = build_fixture();
+    let nested_root = "art/nested";
+    let target = projected_target(
+        &["art/nested/deep.txt", "art/nested/motd.md.tmpl"],
+        Some(nested_root),
+    );
+    let artifact = adverse_artifact(
+        nested_root,
+        &[
+            (
+                "art/nested/deep.txt",
+                "deep.txt",
+                ContentTransform::Identity,
+            ),
+            (
+                "art/nested/motd.md.tmpl",
+                "motd.md",
+                ContentTransform::Template,
+            ),
+        ],
+    );
+    let vars = name_var();
+
+    let staged = stage_both(
+        &fx,
+        &artifact,
+        &target,
+        Some(nested_root),
+        &ExportPolicy::default(),
+        &TemplateOptIn::SuffixOnly,
+        &vars,
+    );
+
+    assert_eq!(
+        std::fs::read(staged.new_dir.path().join("motd.md")).expect("read staged motd.md"),
+        b"deep world\n",
+        "guard: the template under the multi-component root must render — a both-sides-failed \
+         render cannot hide behind parity"
+    );
+    assert!(
+        staged.old.vars_digest.is_some(),
+        "guard: the old path must report a rendered template so vars-digest parity is exercised"
+    );
+    assert_artifact_parity(&staged, "multi-component-root artifact");
 }
