@@ -443,6 +443,55 @@ fn source_fully_qualified_forbidden_crate_path_fails() {
     }
 }
 
+#[test]
+fn source_fq_body_four_segment_leaf_evasion_fails() {
+    let tree = base_tree();
+    tree.write(
+        "src/source/probe.rs",
+        "pub fn probe() -> bool {\n    \
+         matches!(crate::config::target::TemplateOptIn::Disabled, _)\n}\n",
+    );
+    tree.check().assert_fail(
+        "source reaching the banned TemplateOptIn leaf via a FOUR-segment fully-qualified \
+         body path (`crate::config::target::TemplateOptIn::Disabled`, no use statement) — \
+         check_fq_crate's first-three-segments truncation yields `crate::config::target`, \
+         which matches neither TemplateOptIn deny pattern, so the banned leaf slips through \
+         exactly one submodule level deeper than the pinned patterns reach",
+    );
+}
+
+#[test]
+fn source_module_import_laundering_of_banned_leaf_fails() {
+    let tree = base_tree();
+    tree.write(
+        "src/source/probe.rs",
+        "use crate::config::target;\n\
+         pub fn probe() -> bool {\n    matches!(target::TemplateOptIn::Disabled, _)\n}\n",
+    );
+    tree.check().assert_fail(
+        "source importing the bare `crate::config::target` MODULE and naming the banned \
+         leaf unqualified in the body (`target::TemplateOptIn`) — the use-scan sees only \
+         the module path and the body path is not crate-anchored, so neither scan fires; \
+         source has no legitimate need for the submodule path (its config items arrive via \
+         the crate::config facade), so the bare module import itself must be denied",
+    );
+}
+
+#[test]
+fn source_importing_deploy_machinery_fails() {
+    let tree = base_tree();
+    tree.write(
+        "src/source/probe.rs",
+        "use crate::deploy::deploy_artifact;\npub fn probe() { let _ = deploy_artifact; }\n",
+    );
+    tree.check().assert_fail(
+        "source importing crate::deploy machinery — deploy.rs is target-side apply/journal \
+         code, an in-spirit INV-2 breach the denylist must close now rather than waiting \
+         for T024 to dissolve deploy into sync (no live src/source file references \
+         crate::deploy; this pins the door shut)",
+    );
+}
+
 fn print_allowlist() -> Option<String> {
     match Command::new(script_path())
         .arg("--print-allowlist")
