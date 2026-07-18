@@ -350,51 +350,14 @@ pub(crate) fn hash_framed_entry(
     hasher.update(payload);
 }
 
-pub(crate) fn symlink_target_escapes(deployed_rel: &Path, target: &[u8]) -> bool {
-    if matches!(target.first(), Some(b'/' | b'\\')) {
-        return true;
-    }
-    if matches!(target, [drive, b':', ..] if drive.is_ascii_alphabetic()) {
-        return true;
-    }
-    let parent_depth = deployed_rel.parent().map_or(0, |p| p.components().count());
-    let mut depth = i64::try_from(parent_depth).unwrap_or(i64::MAX);
-    for step in target.split(|&b| b == b'/' || b == b'\\') {
-        match step {
-            b"" | b"." => {}
-            b".." => {
-                depth -= 1;
-                if depth < 0 {
-                    return true;
-                }
-            }
-            _ => depth = depth.saturating_add(1),
-        }
-    }
-    false
-}
-
-#[cfg(unix)]
-pub(crate) fn materialize_symlink(out_path: &Path, target: &[u8]) -> Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let target = std::ffi::OsStr::from_bytes(target);
-    std::os::unix::fs::symlink(target, out_path)?;
-    Ok(())
-}
-
-#[cfg(windows)]
-pub(crate) fn materialize_symlink(out_path: &Path, target: &[u8]) -> Result<()> {
-    let target = String::from_utf8_lossy(target);
-    std::os::windows::fs::symlink_file(target.as_ref(), out_path)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::import::import_tree;
     use super::*;
 
     use gix::object::tree::EntryKind;
+
+    use crate::sync::stage::symlink_target_escapes;
 
     use crate::kernel::safe_component;
 
