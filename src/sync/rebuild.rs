@@ -5,15 +5,14 @@ use crate::config::{Config, LayoutConfig, ParsedSource, Target, TemplateOptIn};
 use crate::error::{Error, Result};
 use crate::kernel::{Materialization, SourceName};
 use crate::lock::{Lock, encode_ref, ref_discriminator};
-use crate::source::SourceBackend;
+use crate::source::{ResolvedSource, SnapshotId, SourcePath};
 use crate::store::{
     ArtifactKey, ManifestFile, ProjectedRecord, RecordKind, Registry, RegistryRecord,
 };
 
 use super::plan::{BindingProjection, ProjectedArtifact, TargetProjection, plan_target};
-use super::source_read::{SourceReadRequest, stage_source_reads};
 use super::stage::{StageRequest, stage_artifact};
-use super::{StagingGuard, nonce, remote_for, resolved_remotes};
+use super::{StageSource, StagingGuard, nonce, remote_for, resolved_remotes};
 
 /// Summary of a [`rebuild_registry`] run: which artifacts were reconstructed and
 /// which on-disk content failed to match the recomputed hash or lacked any config
@@ -31,7 +30,7 @@ pub struct RebuildReport {
 pub fn rebuild_registry(
     config: &Config,
     lock: &Lock,
-    backend: &dyn SourceBackend,
+    backend: &dyn StageSource,
     registry: &dyn Registry,
 ) -> Result<RebuildReport> {
     let parsed = config.parsed_sources()?;
@@ -46,7 +45,7 @@ pub fn rebuild_registry_with(
     parsed: &BTreeMap<String, ParsedSource>,
     remotes: &BTreeMap<String, String>,
     lock: &Lock,
-    backend: &dyn SourceBackend,
+    backend: &dyn StageSource,
     registry: &dyn Registry,
 ) -> Result<RebuildReport> {
     let resolved_commits = locked_commits(config, lock, parsed)?;
@@ -142,7 +141,7 @@ struct BindingRun<'a> {
     parsed: &'a BTreeMap<String, crate::config::ParsedSource>,
     target_name: &'a str,
     target: &'a Target,
-    backend: &'a dyn SourceBackend,
+    backend: &'a dyn StageSource,
     registry: &'a dyn Registry,
     projection: &'a TargetProjection,
     binding: &'a BindingProjection,
@@ -218,7 +217,7 @@ fn record_kind(materialization: &Materialization) -> RecordKind {
 }
 
 struct RebuildOne<'a> {
-    backend: &'a dyn SourceBackend,
+    backend: &'a dyn StageSource,
     registry: &'a dyn Registry,
     git: &'a str,
     source_name: &'a SourceName,
@@ -264,23 +263,13 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
     let _guard = StagingGuard::new(&staging_base, &staging);
 
     let commit_time = backend.commit_time(source_name, git, commit)?;
-    let scratch = staging_base.join(format!("{key_label}-{}-{}", std::process::id(), nonce()));
-    let _scratch_guard = StagingGuard::new(&staging_base, &scratch);
-    let reads = stage_source_reads(
-        backend,
-        &SourceReadRequest {
-            source: source_name,
-            url: git,
-            commit,
-            root,
-            policy,
-            scratch_dir: &scratch,
-            commit_time,
-            template_opt_in,
-            artifact: item,
+    let resolved = ResolvedSource {
+        name: source_name.clone(),
+        url: git.to_owned(),
+        snapshot: SnapshotId::Git {
+            commit: commit.to_owned(),
         },
-    )?;
-
+    };
     let staged = stage_artifact(
         &StageRequest {
             artifact: item,
@@ -292,7 +281,11 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         &staging,
         commit_time,
         template_opt_in,
-        |repo_relative| reads.read(repo_relative),
+        |repo_relative| {
+            let path = SourcePath::new(&repo_relative.to_string_lossy().replace('\\', "/"))?;
+            let entry = backend.read(&resolved, &path)?;
+            Ok((entry.bytes, entry.meta.kind))
+        },
     )?;
 
     let manifest_base = match &item.materialization {

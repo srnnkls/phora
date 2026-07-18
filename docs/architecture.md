@@ -150,5 +150,5 @@ surface; T020/T030 migrate the callers onto the `SourceStore` path.
 | `list_tree_at` | retained | none until the T020/T030 caller migration | src/cli/trust.rs |
 | `resolve` | retained | snapshot resolution beside `resolve_worktree` | src/sync/resolve.rs, src/sync/transitive.rs |
 | `commit_time` | retained | none until the T020/T030 caller migration | src/sync/target.rs, src/sync/rebuild.rs |
-| `export_artifact` | retained | none until the T020/T030 caller migration | src/sync/target.rs, src/sync/rebuild.rs |
+| `export_artifact` | removed | `stage_artifact` over `SourceStore::read` (T016) | none |
 | `compute_digest` | delegates | `SourceStore::digest_snapshot` | src/sync/resolve.rs |

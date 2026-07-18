@@ -563,27 +563,6 @@ fn contract_stage_speaks_the_t032_interface_not_the_export_port() {
 }
 
 #[test]
-fn tripwire_old_export_path_survives_until_t016() {
-    assert!(
-        defines_fn(&scan(&read_src("source/git.rs")), "export_artifact"),
-        "TRIPWIRE — src/source/git.rs must keep an export_artifact impl through T015: the old \
-         SourceBackend export path stays alive and byte-identical (delegating to the relocated \
-         machinery) until T016 deletes it after the differential old-vs-new equality. This test \
-         is DESIGNED to fail at T016; closing it there means deleting this tripwire together \
-         with the old path — never resurrecting export_artifact. Failing BEFORE T016 means T015 \
-         broke a consumer (rebuild_one or deploy_one) mid-move"
-    );
-    for consumer in ["sync/rebuild.rs", "sync/target.rs"] {
-        assert!(
-            references_token(&scan(&read_src(consumer)), "export_artifact"),
-            "TRIPWIRE — src/{consumer} must still drive SourceBackend::export_artifact through \
-             T015 (T015's files are stage.rs/source/mod.rs/sync/mod.rs; the consumers rewire at \
-             T016) — both consumers stay green against the T003 goldens at every sub-move"
-        );
-    }
-}
-
-#[test]
 fn helper_fn_signatures_extracts_item_fns_with_modifiers() {
     let stripped = "use x::Y; pub fn stage(req: &StageRequest<'_>, p: &Policy) -> \
                     Result<StagedArtifact, E> { body } impl T { fn helper(&self) { x } } \

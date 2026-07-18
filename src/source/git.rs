@@ -13,8 +13,8 @@ use super::cache::{
 use super::inventory::{populate_inventory, snapshot_commit};
 use super::snapshot::{ResolvedSource, SourceEntry, SourceStore, frame_tag};
 use super::{
-    ExportRequest, ExportResult, ExportWalk, Renderer, Result, SourceBackend, SourceEntryKind,
-    SourceEntryMeta, SourceError, SourceInventory, SourcePath, TreeEntry, hash_framed_entry,
+    Result, SourceBackend, SourceEntryKind, SourceEntryMeta, SourceError, SourceInventory,
+    SourcePath, TreeEntry, hash_framed_entry,
 };
 
 pub struct GitBackend {
@@ -321,36 +321,6 @@ impl SourceBackend for GitBackend {
             .map_err(|e| SourceError::Source(format!("author time of {commit} in {source}: {e}")))
     }
 
-    fn export_artifact(&self, req: &ExportRequest<'_>) -> Result<ExportResult> {
-        let repo = self.open_mirror(req.source.as_str(), req.url)?;
-        let root_tree = Self::subtree_at_root(&repo, req.source.as_str(), req.commit, req.root)?;
-
-        std::fs::create_dir_all(req.staging_dir)?;
-
-        let renderer = Renderer::new(req.template_opt_in, req.vars);
-        let mut walk = ExportWalk {
-            out_base: req.staging_dir,
-            policy: req.policy,
-            commit_time: req.commit_time,
-            files: Vec::new(),
-            hasher: blake3::Hasher::new(),
-            renderer: &renderer,
-            deployed_names: BTreeMap::new(),
-            rendered_any: false,
-        };
-        walk.run(req.leaves, |source_path| {
-            resolve_leaf(&repo, req.source.as_str(), &root_tree, source_path)
-        })?;
-
-        let digest = format!("blake3:{}", walk.hasher.finalize().to_hex());
-        let vars_digest = walk.rendered_any.then(|| renderer.vars_digest());
-        Ok(ExportResult {
-            files: walk.files,
-            digest,
-            vars_digest,
-        })
-    }
-
     fn compute_digest(
         &self,
         source: &SourceName,
@@ -513,28 +483,6 @@ impl GitBackend {
         }
         Ok(format!("blake3:{}", hasher.finalize().to_hex()))
     }
-}
-
-fn resolve_leaf(
-    repo: &gix::Repository,
-    source: &str,
-    root_tree: &gix::Tree<'_>,
-    path: &Path,
-) -> Result<(Vec<u8>, SourceEntryKind)> {
-    let entry = root_tree
-        .lookup_entry_by_path(path)
-        .map_err(|e| {
-            SourceError::Source(format!("lookup key {} in {source}: {e}", path.display()))
-        })?
-        .ok_or_else(|| SourceError::MappedKeyNotFound {
-            key: path.to_path_buf(),
-        })?;
-    let kind =
-        kind_of_entry(entry.mode().kind()).ok_or_else(|| SourceError::MappedKeyNotALeaf {
-            key: path.to_path_buf(),
-        })?;
-    let bytes = GitBackend::find_blob_data(repo, source, entry.object_id())?;
-    Ok((bytes, kind))
 }
 
 fn kind_of_tag(tag: &[u8]) -> SourceEntryKind {

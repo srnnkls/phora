@@ -5,7 +5,7 @@ use crate::config::{DeployMode, LayoutConfig, ParsedSource, Target, TemplateOptI
 use crate::deploy::{ArtifactState, Journal, check_artifact_state, deploy_artifact, link_artifact};
 use crate::error::{Error, Result};
 use crate::kernel::{Materialization, SourceName, safe_relpath};
-use crate::source::SourceBackend;
+use crate::source::{ResolvedSource, SnapshotId, SourceBackend, SourcePath};
 use crate::store::{
     ArtifactKey, EjectedEntry, ManifestFile, ProjectedRecord, RecordKind, Registry, RegistryRecord,
     ScannedFile,
@@ -13,15 +13,11 @@ use crate::store::{
 
 use super::confine::{ProtectedPathSet, confine_destination};
 use super::plan::{ProjectedArtifact, ProjectionWarning, TargetProjection, plan_target};
-use super::source_read::{SourceReadRequest, stage_source_reads};
 use super::stage::{StageRequest, stage_artifact};
 use super::{
-    Conflict, ConflictKind, ConflictResolver, Resolution, StagingGuard, nonce, remote_for,
-    target_parent,
+    Conflict, ConflictKind, ConflictResolver, Resolution, StageSource, StagingGuard, nonce,
+    remote_for, target_parent,
 };
-
-#[cfg(test)]
-use {super::source_read::collapsed_dir_leaves, crate::source::ExportLeaf};
 
 #[derive(Clone, Copy)]
 pub(super) struct TargetRun<'a> {
@@ -59,7 +55,7 @@ pub(super) fn is_composed_target(target_name: &str) -> bool {
 
 pub(super) fn deploy_target(
     run: TargetRun<'_>,
-    backend: &dyn SourceBackend,
+    backend: &dyn StageSource,
     registry: &dyn Registry,
     journal: &Journal,
 ) -> Result<bool> {
@@ -217,7 +213,7 @@ pub(super) fn record_manifest_base(target: &Target, record: &RegistryRecord) -> 
 pub(super) fn deploy_artifact_entry(
     run: TargetRun<'_>,
     entry: &ArtifactEntry<'_>,
-    backend: &dyn SourceBackend,
+    backend: &dyn StageSource,
     registry: &dyn Registry,
     journal: &Journal,
 ) -> Result<bool> {
@@ -238,7 +234,7 @@ fn deploy_entry(
     run: TargetRun<'_>,
     entry: &ArtifactEntry<'_>,
     bridge: StageBridge<'_>,
-    backend: &dyn SourceBackend,
+    backend: &dyn StageSource,
     registry: &dyn Registry,
     journal: &Journal,
 ) -> Result<bool> {
@@ -477,7 +473,7 @@ struct DeployContext<'a> {
 }
 
 fn deploy_one(
-    backend: &dyn SourceBackend,
+    backend: &dyn StageSource,
     registry: &dyn Registry,
     journal: &Journal,
     ctx: DeployContext<'_>,
@@ -495,23 +491,13 @@ fn deploy_one(
         Materialization::Leaf(take) => staging.join(leaf_basename(&take.dest)),
     };
 
-    let scratch = staging_base.join(format!("{key_label}-{}", nonce()));
-    let _scratch_guard = StagingGuard::new(&staging_base, &scratch);
-    let reads = stage_source_reads(
-        backend,
-        &SourceReadRequest {
-            source: ctx.source_name,
-            url: ctx.git,
-            commit: ctx.commit,
-            root: ctx.root,
-            policy: &policy,
-            scratch_dir: &scratch,
-            commit_time,
-            template_opt_in: ctx.template_opt_in,
-            artifact: ctx.bridge.artifact,
+    let resolved = ResolvedSource {
+        name: ctx.source_name.clone(),
+        url: ctx.git.to_owned(),
+        snapshot: SnapshotId::Git {
+            commit: ctx.commit.to_owned(),
         },
-    )?;
-
+    };
     let staged = stage_artifact(
         &StageRequest {
             artifact: ctx.bridge.artifact,
@@ -523,7 +509,11 @@ fn deploy_one(
         &staging,
         commit_time,
         ctx.template_opt_in,
-        |repo_relative| reads.read(repo_relative),
+        |repo_relative| {
+            let path = SourcePath::new(&repo_relative.to_string_lossy().replace('\\', "/"))?;
+            let entry = backend.read(&resolved, &path)?;
+            Ok((entry.bytes, entry.meta.kind))
+        },
     )?;
     let files: Vec<ManifestFile> = staged
         .files
@@ -628,57 +618,8 @@ fn link_target(entry: &ArtifactEntry<'_>) -> PathBuf {
     target
 }
 
-pub(super) fn leaf_basename(dest: &str) -> String {
+fn leaf_basename(dest: &str) -> String {
     dest.rsplit('/').next().unwrap_or(dest).to_owned()
-}
-
-#[cfg(test)]
-mod collapsed_dir_leaves_tests {
-    use super::*;
-    use crate::kernel::ResolvedTake;
-
-    fn kept(source: &str) -> ResolvedTake {
-        ResolvedTake {
-            source: source.to_owned(),
-            dest: source.to_owned(),
-        }
-    }
-
-    #[test]
-    fn kept_leaf_maps_each_child_to_its_dir_relative_deployed_dest() {
-        let kept_leaves = [kept("editor/a.md"), kept("editor/lua/opts.lua")];
-        let leaves = collapsed_dir_leaves("editor", &kept_leaves, &TemplateOptIn::SuffixOnly);
-
-        assert_eq!(
-            leaves,
-            vec![
-                ExportLeaf {
-                    source: PathBuf::from("editor/a.md"),
-                    dest: PathBuf::from("a.md"),
-                },
-                ExportLeaf {
-                    source: PathBuf::from("editor/lua/opts.lua"),
-                    dest: PathBuf::from("lua/opts.lua"),
-                },
-            ],
-            "each kept child stages at its dir-relative path; the source keeps its full path"
-        );
-    }
-
-    #[test]
-    fn kept_template_leaf_strips_the_tmpl_suffix_in_the_dest() {
-        let kept_leaves = [kept("editor/init.lua.tmpl")];
-        let leaves = collapsed_dir_leaves("editor", &kept_leaves, &TemplateOptIn::SuffixOnly);
-
-        assert_eq!(
-            leaves,
-            vec![ExportLeaf {
-                source: PathBuf::from("editor/init.lua.tmpl"),
-                dest: PathBuf::from("init.lua"),
-            }],
-            "a templated child's dest drops the .tmpl suffix via the opt-in"
-        );
-    }
 }
 
 #[cfg(test)]

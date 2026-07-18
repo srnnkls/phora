@@ -9,7 +9,8 @@ use tempfile::TempDir;
 
 use crate::config::Refspec;
 use crate::source::{
-    ExportRequest, ExportResult, GitBackend, HttpBackend, RouterBackend, SourceBackend, SourceError,
+    GitBackend, HttpBackend, ResolvedSource, RouterBackend, SourceBackend, SourceEntry,
+    SourceError, SourceInventory, SourcePath, SourceStore,
 };
 use crate::store::FileRegistry;
 
@@ -168,13 +169,14 @@ impl SyncFixture {
 
 /// Wraps a real `GitBackend`, counting `fetch` calls so a test can prove that
 /// a matching lock entry suppresses the network round-trip. Also counts
-/// `export_artifact`/`commit_time` so a Clean second run can prove it did not
-/// re-export (exports use deterministic mtimes, so an mtime check alone cannot).
+/// staging reads (`SourceStore::read`)/`commit_time` so a Clean second run can
+/// prove it did not re-stage (staged files carry deterministic mtimes, so an
+/// mtime check alone cannot).
 struct CountingBackend<'a> {
     inner: &'a GitBackend,
     fetches: AtomicUsize,
     resolves: AtomicUsize,
-    exports: AtomicUsize,
+    reads: AtomicUsize,
     commit_times: AtomicUsize,
     discovers: AtomicUsize,
     digests: AtomicUsize,
@@ -186,7 +188,7 @@ impl<'a> CountingBackend<'a> {
             inner,
             fetches: AtomicUsize::new(0),
             resolves: AtomicUsize::new(0),
-            exports: AtomicUsize::new(0),
+            reads: AtomicUsize::new(0),
             commit_times: AtomicUsize::new(0),
             discovers: AtomicUsize::new(0),
             digests: AtomicUsize::new(0),
@@ -201,8 +203,8 @@ impl<'a> CountingBackend<'a> {
         self.resolves.load(AtomicOrdering::SeqCst)
     }
 
-    fn export_count(&self) -> usize {
-        self.exports.load(AtomicOrdering::SeqCst)
+    fn read_count(&self) -> usize {
+        self.reads.load(AtomicOrdering::SeqCst)
     }
 
     fn commit_time_count(&self) -> usize {
@@ -248,11 +250,6 @@ impl SourceBackend for CountingBackend<'_> {
         self.inner.commit_time(source, url, commit)
     }
 
-    fn export_artifact(&self, req: &ExportRequest<'_>) -> SourceResult<ExportResult> {
-        self.exports.fetch_add(1, AtomicOrdering::SeqCst);
-        self.inner.export_artifact(req)
-    }
-
     fn compute_digest(
         &self,
         source: &crate::kernel::SourceName,
@@ -276,6 +273,17 @@ impl SourceBackend for CountingBackend<'_> {
     ) -> SourceResult<Vec<String>> {
         self.discovers.fetch_add(1, AtomicOrdering::SeqCst);
         self.inner.list_source_leaves(source, url, commit, root)
+    }
+}
+
+impl SourceStore for CountingBackend<'_> {
+    fn inventory(&self, source: &ResolvedSource) -> SourceResult<SourceInventory> {
+        self.inner.inventory(source)
+    }
+
+    fn read(&self, source: &ResolvedSource, path: &SourcePath) -> SourceResult<SourceEntry> {
+        self.reads.fetch_add(1, AtomicOrdering::SeqCst);
+        self.inner.read(source, path)
     }
 }
 
@@ -642,9 +650,6 @@ impl SourceBackend for DenyNetworkBackend<'_> {
     ) -> SourceResult<u64> {
         self.inner.commit_time(source, url, commit)
     }
-    fn export_artifact(&self, req: &ExportRequest<'_>) -> SourceResult<ExportResult> {
-        self.inner.export_artifact(req)
-    }
     fn compute_digest(
         &self,
         source: &crate::kernel::SourceName,
@@ -656,6 +661,16 @@ impl SourceBackend for DenyNetworkBackend<'_> {
     ) -> SourceResult<String> {
         self.inner
             .compute_digest(source, url, commit, root, include, exclude)
+    }
+}
+
+impl SourceStore for DenyNetworkBackend<'_> {
+    fn inventory(&self, source: &ResolvedSource) -> SourceResult<SourceInventory> {
+        self.inner.inventory(source)
+    }
+
+    fn read(&self, source: &ResolvedSource, path: &SourcePath) -> SourceResult<SourceEntry> {
+        self.inner.read(source, path)
     }
 }
 
@@ -1066,15 +1081,16 @@ fn flat_layout() -> crate::config::LayoutConfig {
     crate::config::LayoutConfig::default()
 }
 
-/// Wraps a real `GitBackend`, returning `Err` from `export_artifact` whenever the
-/// request targets a specific artifact name. Lets a test prove warn-and-continue:
-/// one artifact's export fails while siblings still deploy.
-struct FailingExportBackend<'a> {
+/// Wraps a real `GitBackend`, returning `Err` from the staging read
+/// (`SourceStore::read`) whenever the leaf lies under a specific artifact dir.
+/// Lets a test prove warn-and-continue: one artifact's staging fails while
+/// siblings still deploy.
+struct FailingReadBackend<'a> {
     inner: &'a GitBackend,
     fail_artifact: String,
 }
 
-impl SourceBackend for FailingExportBackend<'_> {
+impl SourceBackend for FailingReadBackend<'_> {
     fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> SourceResult<()> {
         self.inner.fetch(source, url)
     }
@@ -1093,15 +1109,6 @@ impl SourceBackend for FailingExportBackend<'_> {
         commit: &str,
     ) -> SourceResult<u64> {
         self.inner.commit_time(source, url, commit)
-    }
-    fn export_artifact(&self, req: &ExportRequest<'_>) -> SourceResult<ExportResult> {
-        if leaves_under_artifact(req.leaves, &self.fail_artifact) {
-            return Err(SourceError::Source(format!(
-                "injected export failure for {}",
-                self.fail_artifact
-            )));
-        }
-        self.inner.export_artifact(req)
     }
     fn compute_digest(
         &self,
@@ -1126,15 +1133,20 @@ impl SourceBackend for FailingExportBackend<'_> {
     }
 }
 
-/// True when any leaf's source path lies under the `artifact` top-level directory —
-/// the leaf-granular stand-in for the old per-artifact export gate.
-fn leaves_under_artifact(leaves: &[crate::source::ExportLeaf], artifact: &str) -> bool {
-    leaves.iter().any(|leaf| {
-        leaf.source
-            .components()
-            .next()
-            .is_some_and(|c| c.as_os_str() == artifact)
-    })
+impl SourceStore for FailingReadBackend<'_> {
+    fn inventory(&self, source: &ResolvedSource) -> SourceResult<SourceInventory> {
+        self.inner.inventory(source)
+    }
+
+    fn read(&self, source: &ResolvedSource, path: &SourcePath) -> SourceResult<SourceEntry> {
+        if path.as_str().split('/').next() == Some(self.fail_artifact.as_str()) {
+            return Err(SourceError::Source(format!(
+                "injected staging read failure for {}",
+                self.fail_artifact
+            )));
+        }
+        self.inner.read(source, path)
+    }
 }
 
 // ── deploy a Missing artifact ──────────────────────────────────
@@ -1213,7 +1225,7 @@ fn sync_leaves_no_phora_metadata_inside_the_target() {
     );
 }
 
-// ── clean skip (no re-export) ──────────────────────────────────
+// ── clean skip (no re-stage) ───────────────────────────────────
 
 #[test]
 fn sync_skips_clean_artifact_on_second_run_without_re_export() {
@@ -1224,7 +1236,7 @@ fn sync_skips_clean_artifact_on_second_run_without_re_export() {
 
     // First run deploys (may export); count via the same wrapper so the second
     // run's delta is what proves the skip — deterministic mtimes mean an
-    // mtime-equality check would pass even if sync re-exported identically.
+    // mtime-equality check would pass even if sync re-staged identically.
     let counting = CountingBackend::new(&fx.backend);
     let first = sync(
         &input(&cfg, None, None, None, false),
@@ -1239,15 +1251,15 @@ fn sync_skips_clean_artifact_on_second_run_without_re_export() {
         dst.join("init.lua").exists(),
         "premise: the first sync must actually deploy the artifact"
     );
-    let exports_after_first = counting.export_count();
+    let reads_after_first = counting.read_count();
     let commit_times_after_first = counting.commit_time_count();
     assert!(
-        exports_after_first >= 1,
-        "premise: the first run of a Missing artifact must export it at least once, got {exports_after_first}"
+        reads_after_first >= 1,
+        "premise: the first run of a Missing artifact must read its source leaves at least once, got {reads_after_first}"
     );
 
     // Reuse the lock from the first run so Phase 1 also skips refetch; the second
-    // run must find the artifact Clean and NOT re-export/re-deploy it.
+    // run must find the artifact Clean and NOT re-stage/re-deploy it.
     let second = sync(
         &input(&cfg, None, Some(first.base_lock.clone()), None, false),
         &counting,
@@ -1257,10 +1269,10 @@ fn sync_skips_clean_artifact_on_second_run_without_re_export() {
 
     assert!(!second.had_failures, "second clean sync must not fail");
     assert_eq!(
-        counting.export_count(),
-        exports_after_first,
-        "a Clean artifact must NOT be re-exported on the second run: \
-             export_artifact count must not increase"
+        counting.read_count(),
+        reads_after_first,
+        "a Clean artifact must NOT be re-staged on the second run: \
+             the staging read count must not increase"
     );
     assert_eq!(
         counting.commit_time_count(),
@@ -2050,7 +2062,7 @@ fn second_sync_after_revalidation_hits_fast_path_without_reexport() {
         .get(&key)
         .expect("get")
         .expect("record after revalidating sync");
-    let exports_after_reval = counting.export_count();
+    let reads_after_reval = counting.read_count();
     let commit_times_after_reval = counting.commit_time_count();
 
     // A further untouched sync must be a pure no-op.
@@ -2065,9 +2077,9 @@ fn second_sync_after_revalidation_hits_fast_path_without_reexport() {
         "an untouched refreshed artifact must be a no-op, not a failure"
     );
     assert_eq!(
-        counting.export_count(),
-        exports_after_reval,
-        "the fast-path sync must NOT re-export a Clean (refreshed) artifact"
+        counting.read_count(),
+        reads_after_reval,
+        "the fast-path sync must NOT re-stage a Clean (refreshed) artifact"
     );
     assert_eq!(
         counting.commit_time_count(),
@@ -2514,7 +2526,7 @@ fn second_deploy_over_correct_link_is_a_noop() {
 
     assert!(!had_failures, "a no-op linked pass is not a failure");
     assert_eq!(
-        counting.export_count(),
+        counting.read_count(),
         0,
         "a correct linked artifact must NOT be re-exported on a second sync (H1 re-deploy)"
     );
@@ -2587,7 +2599,7 @@ fn sync_warns_and_continues_when_one_artifact_export_fails() {
     let state_dir = TempDir::new().expect("state dir");
     let inner = GitBackend::new(git_dir.path().to_path_buf());
     let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
-    let backend = FailingExportBackend {
+    let backend = FailingReadBackend {
         inner: &inner,
         fail_artifact: "lint".to_owned(),
     };
@@ -2898,7 +2910,7 @@ fn sync_skips_prune_when_a_deploy_failed() {
     let state_dir = TempDir::new().expect("state dir");
     let inner = GitBackend::new(git_dir.path().to_path_buf());
     let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
-    let backend = FailingExportBackend {
+    let backend = FailingReadBackend {
         inner: &inner,
         fail_artifact: "editor".to_owned(),
     };
@@ -3135,70 +3147,6 @@ fn sync_errors_on_target_referencing_undefined_source() {
 
 // ── staging cleanup when export fails ──────────────────────────
 
-/// Wraps a real `GitBackend`, but for the rigged artifact it mirrors a real
-/// partial export: it creates the staging dir and writes a partial file, then
-/// returns `Err` — the way `GitBackend::export_artifact` leaves cruft when the
-/// tree walk fails mid-way (e.g. a disallowed symlink). Siblings export normally.
-struct PartialStagingExportBackend<'a> {
-    inner: &'a GitBackend,
-    fail_artifact: String,
-}
-
-impl SourceBackend for PartialStagingExportBackend<'_> {
-    fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> SourceResult<()> {
-        self.inner.fetch(source, url)
-    }
-    fn resolve(
-        &self,
-        source: &crate::kernel::SourceName,
-        url: &str,
-        refspec: &Refspec,
-    ) -> SourceResult<String> {
-        self.inner.resolve(source, url, refspec)
-    }
-    fn commit_time(
-        &self,
-        source: &crate::kernel::SourceName,
-        url: &str,
-        commit: &str,
-    ) -> SourceResult<u64> {
-        self.inner.commit_time(source, url, commit)
-    }
-    fn export_artifact(&self, req: &ExportRequest<'_>) -> SourceResult<ExportResult> {
-        if leaves_under_artifact(req.leaves, &self.fail_artifact) {
-            std::fs::create_dir_all(req.staging_dir).expect("create partial staging dir");
-            std::fs::write(req.staging_dir.join("partial.txt"), b"half-written\n")
-                .expect("write partial staging file");
-            return Err(SourceError::Source(format!(
-                "injected export failure after partial staging for {}",
-                self.fail_artifact
-            )));
-        }
-        self.inner.export_artifact(req)
-    }
-    fn compute_digest(
-        &self,
-        source: &crate::kernel::SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        include: &[String],
-        exclude: &[String],
-    ) -> SourceResult<String> {
-        self.inner
-            .compute_digest(source, url, commit, root, include, exclude)
-    }
-    fn list_source_leaves(
-        &self,
-        source: &crate::kernel::SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-    ) -> SourceResult<Vec<String>> {
-        self.inner.list_source_leaves(source, url, commit, root)
-    }
-}
-
 #[test]
 fn sync_cleans_staging_when_export_fails() {
     let (src, url) = build_named_artifact_repo("editor", "init.lua", b"-- init\n");
@@ -3207,7 +3155,7 @@ fn sync_cleans_staging_when_export_fails() {
     let state_dir = TempDir::new().expect("state dir");
     let inner = GitBackend::new(git_dir.path().to_path_buf());
     let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
-    let backend = PartialStagingExportBackend {
+    let backend = FailingReadBackend {
         inner: &inner,
         fail_artifact: "editor".to_owned(),
     };
@@ -3704,6 +3652,16 @@ struct FailingResolveBackend<'a> {
     inner: &'a GitBackend,
 }
 
+impl SourceStore for FailingResolveBackend<'_> {
+    fn inventory(&self, source: &ResolvedSource) -> SourceResult<SourceInventory> {
+        self.inner.inventory(source)
+    }
+
+    fn read(&self, source: &ResolvedSource, path: &SourcePath) -> SourceResult<SourceEntry> {
+        self.inner.read(source, path)
+    }
+}
+
 impl SourceBackend for FailingResolveBackend<'_> {
     fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> SourceResult<()> {
         self.inner.fetch(source, url)
@@ -3723,9 +3681,6 @@ impl SourceBackend for FailingResolveBackend<'_> {
         commit: &str,
     ) -> SourceResult<u64> {
         self.inner.commit_time(source, url, commit)
-    }
-    fn export_artifact(&self, req: &ExportRequest<'_>) -> SourceResult<ExportResult> {
-        self.inner.export_artifact(req)
     }
     fn compute_digest(
         &self,
@@ -6608,6 +6563,16 @@ impl<'a> RecordingBackend<'a> {
     }
 }
 
+impl SourceStore for RecordingBackend<'_> {
+    fn inventory(&self, source: &ResolvedSource) -> SourceResult<SourceInventory> {
+        self.inner.inventory(source)
+    }
+
+    fn read(&self, source: &ResolvedSource, path: &SourcePath) -> SourceResult<SourceEntry> {
+        self.inner.read(source, path)
+    }
+}
+
 impl SourceBackend for RecordingBackend<'_> {
     fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> SourceResult<()> {
         self.urls.lock().expect("urls mutex").push(url.to_owned());
@@ -6628,9 +6593,6 @@ impl SourceBackend for RecordingBackend<'_> {
         commit: &str,
     ) -> SourceResult<u64> {
         self.inner.commit_time(source, url, commit)
-    }
-    fn export_artifact(&self, req: &ExportRequest<'_>) -> SourceResult<ExportResult> {
-        self.inner.export_artifact(req)
     }
     fn compute_digest(
         &self,
@@ -6913,6 +6875,16 @@ impl CountingRouter {
     }
 }
 
+impl SourceStore for CountingRouter {
+    fn inventory(&self, source: &ResolvedSource) -> SourceResult<SourceInventory> {
+        self.inner.inventory(source)
+    }
+
+    fn read(&self, source: &ResolvedSource, path: &SourcePath) -> SourceResult<SourceEntry> {
+        self.inner.read(source, path)
+    }
+}
+
 impl SourceBackend for CountingRouter {
     fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> SourceResult<()> {
         self.fetches.fetch_add(1, AtomicOrdering::SeqCst);
@@ -6936,9 +6908,6 @@ impl SourceBackend for CountingRouter {
         commit: &str,
     ) -> SourceResult<u64> {
         self.inner.commit_time(source, url, commit)
-    }
-    fn export_artifact(&self, req: &ExportRequest<'_>) -> SourceResult<ExportResult> {
-        self.inner.export_artifact(req)
     }
     fn compute_digest(
         &self,
@@ -8132,7 +8101,7 @@ fn preview_writes_nothing_to_the_registry_or_the_target() {
         "premise: preview must actually produce the editor entry so the no-write scan is meaningful"
     );
 
-    assert_eq!(counting.export_count(), 0, "preview must export nothing");
+    assert_eq!(counting.read_count(), 0, "preview must export nothing");
     let after = fx.registry.list_all().expect("re-read registry");
     assert_eq!(
         before.len(),
@@ -8680,7 +8649,7 @@ fn preview_plan_is_offline_and_writes_nothing() {
         "preview_plan must reuse the locked commit, never re-resolve a refspec"
     );
     assert_eq!(
-        counting.export_count(),
+        counting.read_count(),
         0,
         "even with --files, preview_plan must not export/write artifacts"
     );
@@ -8801,7 +8770,7 @@ fn list_source_leaves_under_artifact_root_lists_offline_without_fetching() {
         "list_source_leaves must read the seeded mirror, performing NO fetch"
     );
     assert_eq!(
-        counting.export_count(),
+        counting.read_count(),
         0,
         "list_source_leaves must not export/write anything"
     );
@@ -10447,6 +10416,16 @@ impl<'a> SyncRecordingBackend<'a> {
     }
 }
 
+impl SourceStore for SyncRecordingBackend<'_> {
+    fn inventory(&self, source: &ResolvedSource) -> SourceResult<SourceInventory> {
+        self.inner.inventory(source)
+    }
+
+    fn read(&self, source: &ResolvedSource, path: &SourcePath) -> SourceResult<SourceEntry> {
+        self.inner.read(source, path)
+    }
+}
+
 impl SourceBackend for SyncRecordingBackend<'_> {
     fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> SourceResult<()> {
         self.total_fetches.fetch_add(1, AtomicOrdering::SeqCst);
@@ -10471,9 +10450,6 @@ impl SourceBackend for SyncRecordingBackend<'_> {
         commit: &str,
     ) -> SourceResult<u64> {
         self.inner.commit_time(source, url, commit)
-    }
-    fn export_artifact(&self, req: &ExportRequest<'_>) -> SourceResult<ExportResult> {
-        self.inner.export_artifact(req)
     }
     fn compute_digest(
         &self,
@@ -10612,13 +10588,6 @@ impl SourceBackend for UrlFetchRecordingBackend {
         _commit: &str,
     ) -> SourceResult<u64> {
         Ok(1)
-    }
-    fn export_artifact(&self, _req: &ExportRequest<'_>) -> SourceResult<ExportResult> {
-        Ok(ExportResult {
-            files: Vec::new(),
-            digest: "canned".to_owned(),
-            vars_digest: None,
-        })
     }
     fn compute_digest(
         &self,

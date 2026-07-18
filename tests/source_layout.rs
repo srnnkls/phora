@@ -467,7 +467,7 @@ const SOURCE_BACKEND_METHODS: &[&str] = &[
     "resolve",
 ];
 
-const ORIGIN_UNIT_TEST_FLOOR: usize = 158;
+const ORIGIN_UNIT_TEST_FLOOR: usize = 125;
 
 #[test]
 fn source_module_root_exists_and_is_registered_in_lib_rs() {
@@ -763,14 +763,18 @@ fn source_backend_trait_surface_is_unchanged() {
     );
     let got = trait_method_names(&scan(content), "SourceBackend")
         .unwrap_or_else(|| panic!("src/{rel}: SourceBackend trait body could not be extracted"));
-    let want: BTreeSet<String> = SOURCE_BACKEND_METHODS
+    let nine: BTreeSet<String> = SOURCE_BACKEND_METHODS
         .iter()
         .map(|name| (*name).to_owned())
         .collect();
-    assert_eq!(
-        got, want,
-        "T011 keeps SourceBackend unchanged: the trait's method-name set (src/{rel}) must stay \
-         exactly the pinned nine — no method added, dropped, or renamed during the move"
+    let mut eight = nine.clone();
+    eight.remove("export_artifact");
+    assert!(
+        got == nine || got == eight,
+        "the SourceBackend method-name set (src/{rel}) must be exactly the T011 nine, or the \
+         nine minus `export_artifact` once T016 deletes the staging port — no other method may \
+         be added, dropped, or renamed (the migration-table truthfulness gate in \
+         source_compat_gate.rs governs which state is current); got: {got:?}"
     );
 }
 
@@ -784,9 +788,11 @@ fn source_module_tree_retains_the_origin_unit_tests() {
     }
     assert!(
         names.len() >= ORIGIN_UNIT_TEST_FLOOR,
-        "the src/source/ tree must retain the origin files' unit tests (source.rs + http.rs + \
-         archive.rs + backend.rs carried {ORIGIN_UNIT_TEST_FLOOR} distinct `#[test]` fns at \
-         carve time; a move-only split relocates every one); found {} distinct test fns",
+        "the src/source/ tree must retain at least the {ORIGIN_UNIT_TEST_FLOOR} audited \
+         survivor unit tests (the T011 carve relocated 158; T016 deletes/ports the 33 \
+         export-driven tests WITH their machinery — 32 port to src/sync/stage.rs by name, \
+         pinned in stage_deletion_gate.rs — leaving 125 source-owned survivors; any lower \
+         count means source coverage was net-deleted, not migrated); found {} distinct test fns",
         names.len()
     );
 }
@@ -822,68 +828,18 @@ fn source_value_types_keep_resolving_at_their_source_paths() {
 #[test]
 fn source_port_surface_keeps_resolving_with_only_required_methods_implemented() {
     use std::collections::BTreeMap;
-    use std::path::Path;
 
-    use phora::config::Refspec;
-    use phora::kernel::SourceName;
     use phora::source::{
-        ExportLeaf, ExportPolicy, ExportRequest, ExportResult, GitBackend, HttpBackend, MirrorKey,
-        NormalizedUrl, Protocol, RouterBackend, SourceBackend, SourceError, TreeEntry,
+        ExportPolicy, GitBackend, HttpBackend, MirrorKey, NormalizedUrl, Protocol, RouterBackend,
+        TreeEntry,
     };
 
-    struct Probe;
-
     fn pin_surface(
-        _leaf: Option<(ExportLeaf, TreeEntry, Protocol)>,
+        _leaf: Option<(TreeEntry, Protocol)>,
         _router: Option<RouterBackend<GitBackend, HttpBackend>>,
     ) {
     }
 
-    impl SourceBackend for Probe {
-        fn fetch(&self, _source: &SourceName, _url: &str) -> Result<(), SourceError> {
-            Ok(())
-        }
-
-        fn resolve(
-            &self,
-            _source: &SourceName,
-            _url: &str,
-            _refspec: &Refspec,
-        ) -> Result<String, SourceError> {
-            Ok(String::new())
-        }
-
-        fn commit_time(
-            &self,
-            _source: &SourceName,
-            _url: &str,
-            _commit: &str,
-        ) -> Result<u64, SourceError> {
-            Ok(0)
-        }
-
-        fn export_artifact(&self, _req: &ExportRequest<'_>) -> Result<ExportResult, SourceError> {
-            Err(SourceError::Source("probe".to_owned()))
-        }
-
-        fn compute_digest(
-            &self,
-            _source: &SourceName,
-            _url: &str,
-            _commit: &str,
-            _root: Option<&Path>,
-            _include: &[String],
-            _exclude: &[String],
-        ) -> Result<String, SourceError> {
-            Ok(String::new())
-        }
-    }
-
-    assert!(
-        !Probe.mirror_ready("url"),
-        "SourceBackend's default mirror_ready must stay `false` (only mirror-backed backends \
-         override it); implementing only the five required methods must keep compiling"
-    );
     let key = MirrorKey::from_url(&NormalizedUrl::parse("https://Example.com/Owner/repo.git"));
     assert_eq!(
         key.as_str().len(),

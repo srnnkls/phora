@@ -781,13 +781,6 @@ mod tests {
             unimplemented!()
         }
 
-        fn export_artifact(
-            &self,
-            _req: &crate::source::ExportRequest<'_>,
-        ) -> std::result::Result<crate::source::ExportResult, SourceError> {
-            unimplemented!()
-        }
-
         fn compute_digest(
             &self,
             _source: &crate::kernel::SourceName,
