@@ -1,7 +1,7 @@
 use crate::projection::model::Projection;
 use crate::sync::model::{
-    ChangeSet, ManagedCondition, ObservedArtifact, ObservedProjectState, ReconciliationPolicy,
-    SyncChange, SyncError,
+    ChangeSet, ConflictKind, ManagedCondition, ObservedArtifact, ObservedProjectState,
+    ReconciliationPolicy, SyncChange, SyncError,
 };
 
 pub fn reconcile<R>(
@@ -25,7 +25,9 @@ pub fn reconcile<R>(
                     target: desired.target,
                     source: desired.source,
                     artifact: desired.artifact,
-                    changed: changed.clone(),
+                    kind: ConflictKind::Modified {
+                        changed: changed.clone(),
+                    },
                 }
             });
         }
