@@ -9,6 +9,7 @@ mod plan;
 mod preview;
 mod prune;
 mod rebuild;
+pub mod reconcile;
 mod resolve;
 pub(crate) mod scan;
 pub(crate) mod stage;
