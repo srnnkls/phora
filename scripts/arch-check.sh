@@ -250,7 +250,10 @@ source_use_ok() {
     crate::projection|crate::projection::*) return 1 ;;
     crate::sync|crate::sync::*) return 1 ;;
     crate::store|crate::store::*) return 1 ;;
-    crate::config::TemplateOptIn|crate::config::*::TemplateOptIn) return 1 ;;
+    crate::deploy|crate::deploy::*) return 1 ;;
+    crate::config::target|crate::config::target::*) return 1 ;;
+    crate::config::TemplateOptIn|crate::config::TemplateOptIn::*) return 1 ;;
+    crate::config::*::TemplateOptIn|crate::config::*::TemplateOptIn::*) return 1 ;;
     *) return 0 ;;
   esac
 }
@@ -272,7 +275,7 @@ check_uses() {
 }
 
 check_fq_crate() {
-  local file="$1" validator="$2" label="$3" rel="$4" stripped path
+  local file="$1" validator="$2" label="$3" rel="$4" depth="${5:-3}" stripped path
   stripped="$(stripped_or_die "$file")"
   while IFS= read -r path; do
     [[ -z "$path" ]] && continue
@@ -280,14 +283,15 @@ check_fq_crate() {
       echo "arch-check: $label forbidden fully-qualified crate path in ${rel}: $path" >&2
       violations=$((violations + 1))
     fi
-  done < <(perl -e '
+  done < <(FQ_DEPTH="$depth" perl -e '
     local $/;
     my $s = <STDIN>;
+    my $depth = $ENV{FQ_DEPTH};
     $s =~ s/\buse\s+[^;]+;//gs;
     $s =~ s/\s*::\s*/::/g;
     while ($s =~ /\bcrate((?:::[A-Za-z_]\w*)+)/g) {
       my @seg = split /::/, "crate$1";
-      @seg = @seg[0..2] if @seg > 3;
+      @seg = @seg[0 .. $depth - 1] if $depth > 0 && @seg > $depth;
       print join("::", @seg), "\n";
     }
   ' <<< "$stripped")
@@ -340,7 +344,7 @@ if [[ -d "$SRC/source" ]]; then
     case "$f" in */tests.rs | *_tests.rs) continue ;; esac
     rel="${f#"$SCAN_ROOT"/}"
     check_uses "$f" source_use_ok "source" "$rel"
-    check_fq_crate "$f" source_use_ok "source" "$rel"
+    check_fq_crate "$f" source_use_ok "source" "$rel" 0
   done < <(find "$SRC/source" -type f -name '*.rs' | sort)
 fi
 
