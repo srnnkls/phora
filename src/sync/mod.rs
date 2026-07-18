@@ -8,6 +8,7 @@ mod preview;
 mod prune;
 mod rebuild;
 mod resolve;
+mod source_read;
 pub(crate) mod stage;
 mod target;
 pub(crate) mod transitive;

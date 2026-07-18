@@ -5,17 +5,23 @@ use crate::config::{DeployMode, LayoutConfig, ParsedSource, Target, TemplateOptI
 use crate::deploy::{ArtifactState, Journal, check_artifact_state, deploy_artifact, link_artifact};
 use crate::error::{Error, Result};
 use crate::kernel::{Materialization, SourceName, safe_relpath};
-use crate::source::{ExportLeaf, ExportRequest, SourceBackend};
+use crate::source::SourceBackend;
 use crate::store::{
-    ArtifactKey, EjectedEntry, ProjectedRecord, RecordKind, Registry, RegistryRecord, ScannedFile,
+    ArtifactKey, EjectedEntry, ManifestFile, ProjectedRecord, RecordKind, Registry, RegistryRecord,
+    ScannedFile,
 };
 
 use super::confine::{ProtectedPathSet, confine_destination};
 use super::plan::{ProjectedArtifact, ProjectionWarning, TargetProjection, plan_target};
+use super::source_read::{SourceReadRequest, stage_source_reads};
+use super::stage::{StageRequest, stage_artifact};
 use super::{
     Conflict, ConflictKind, ConflictResolver, Resolution, StagingGuard, nonce, remote_for,
     target_parent,
 };
+
+#[cfg(test)]
+use {super::source_read::collapsed_dir_leaves, crate::source::ExportLeaf};
 
 #[derive(Clone, Copy)]
 pub(super) struct TargetRun<'a> {
@@ -481,40 +487,54 @@ fn deploy_one(
     let staging = staging_base.join(format!("{key_label}-{}", nonce()));
     let mut staging_guard = StagingGuard::new(&staging_base, &staging);
 
-    let git = ctx.git;
-    let commit_time = backend.commit_time(ctx.source_name, git, ctx.commit)?;
+    let commit_time = backend.commit_time(ctx.source_name, ctx.git, ctx.commit)?;
     let policy = ctx.source.export_policy();
 
-    let (leaves, staging_payload) = match &ctx.bridge.artifact.materialization {
-        Materialization::CollapsedDir { dir } => {
-            let leaves =
-                collapsed_dir_leaves(dir, &ctx.bridge.artifact.kept_leaves, ctx.template_opt_in);
-            (leaves, staging.clone())
-        }
-        Materialization::Leaf(take) => {
-            let dest_leaf = leaf_basename(&take.dest);
-            let leaves = vec![ExportLeaf {
-                source: PathBuf::from(&take.source),
-                dest: PathBuf::from(&dest_leaf),
-            }];
-            (leaves, staging.join(&dest_leaf))
-        }
+    let staging_payload = match &ctx.bridge.artifact.materialization {
+        Materialization::CollapsedDir { .. } => staging.clone(),
+        Materialization::Leaf(take) => staging.join(leaf_basename(&take.dest)),
     };
 
-    let req = ExportRequest {
-        source: ctx.source_name,
-        url: git,
-        commit: ctx.commit,
-        root: ctx.root,
-        policy: &policy,
-        staging_dir: &staging,
+    let scratch = staging_base.join(format!("{key_label}-{}", nonce()));
+    let _scratch_guard = StagingGuard::new(&staging_base, &scratch);
+    let reads = stage_source_reads(
+        backend,
+        &SourceReadRequest {
+            source: ctx.source_name,
+            url: ctx.git,
+            commit: ctx.commit,
+            root: ctx.root,
+            policy: &policy,
+            scratch_dir: &scratch,
+            commit_time,
+            template_opt_in: ctx.template_opt_in,
+            artifact: ctx.bridge.artifact,
+        },
+    )?;
+
+    let staged = stage_artifact(
+        &StageRequest {
+            artifact: ctx.bridge.artifact,
+            target: ctx.bridge.target,
+            variables: ctx.vars,
+        },
+        ctx.root,
+        &policy,
+        &staging,
         commit_time,
-        template_opt_in: ctx.template_opt_in,
-        vars: ctx.vars,
-        leaves: &leaves,
-    };
-    let export = backend.export_artifact(&req)?;
-    let files = export.files.clone();
+        ctx.template_opt_in,
+        |repo_relative| reads.read(repo_relative),
+    )?;
+    let files: Vec<ManifestFile> = staged
+        .files
+        .iter()
+        .map(|f| ManifestFile {
+            path: PathBuf::from(f.destination.as_str()),
+            size: f.size,
+            mtime: f.mtime,
+            blake3: f.blake3.clone(),
+        })
+        .collect();
 
     if let Some(anchor) = ctx.confine_anchor {
         super::confine::reject_symlink_ancestor_at_write(anchor, ctx.artifact_dst)?;
@@ -529,13 +549,13 @@ fn deploy_one(
         key: ctx.key,
         underlying_source: ctx.underlying_source,
         commit: ctx.commit,
-        digest: export.digest,
+        digest: staged.digest,
         layout: ctx.layout.kind.label().to_owned(),
         kind: ctx.kind,
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
         files,
-        vars_digest: export.vars_digest,
+        vars_digest: staged.vars_digest,
         deploy_root: Some(ctx.deploy_root),
         layout_separator: ctx.layout.persisted_separator(),
     });
@@ -608,29 +628,8 @@ fn link_target(entry: &ArtifactEntry<'_>) -> PathBuf {
     target
 }
 
-fn leaf_basename(dest: &str) -> String {
+pub(super) fn leaf_basename(dest: &str) -> String {
     dest.rsplit('/').next().unwrap_or(dest).to_owned()
-}
-
-/// The collapsed dir's leaf plan: every kept child staged at its dir-relative deployed
-/// name (the child path under `dir/`, run through the template opt-in). The source is the
-/// kept leaf's full source path; the dest is dir-relative so staging mirrors the dir.
-fn collapsed_dir_leaves(
-    dir: &str,
-    kept_leaves: &[crate::kernel::ResolvedTake],
-    template_opt_in: &TemplateOptIn,
-) -> Vec<ExportLeaf> {
-    let prefix = format!("{dir}/");
-    kept_leaves
-        .iter()
-        .filter_map(|kept| {
-            let child = kept.dest.strip_prefix(&prefix)?;
-            Some(ExportLeaf {
-                source: PathBuf::from(&kept.source),
-                dest: PathBuf::from(template_opt_in.deployed_name(child)),
-            })
-        })
-        .collect()
 }
 
 #[cfg(test)]
