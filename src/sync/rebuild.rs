@@ -5,12 +5,14 @@ use crate::config::{Config, LayoutConfig, ParsedSource, Target, TemplateOptIn};
 use crate::error::{Error, Result};
 use crate::kernel::{Materialization, SourceName};
 use crate::lock::{Lock, encode_ref, ref_discriminator};
-use crate::source::{ExportLeaf, ExportRequest, SourceBackend};
+use crate::source::SourceBackend;
 use crate::store::{
     ArtifactKey, ManifestFile, ProjectedRecord, RecordKind, Registry, RegistryRecord,
 };
 
-use super::plan::{BindingProjection, plan_target};
+use super::plan::{BindingProjection, ProjectedArtifact, TargetProjection, plan_target};
+use super::source_read::{SourceReadRequest, stage_source_reads};
+use super::stage::{StageRequest, stage_artifact};
 use super::{StagingGuard, nonce, remote_for, resolved_remotes};
 
 /// Summary of a [`rebuild_registry`] run: which artifacts were reconstructed and
@@ -83,6 +85,7 @@ pub fn rebuild_registry_with(
                     target,
                     backend,
                     registry,
+                    projection: &plan,
                     binding,
                     source,
                     git: remote_for(remotes, &binding.source)?,
@@ -141,6 +144,7 @@ struct BindingRun<'a> {
     target: &'a Target,
     backend: &'a dyn SourceBackend,
     registry: &'a dyn Registry,
+    projection: &'a TargetProjection,
     binding: &'a BindingProjection,
     source: &'a crate::config::ParsedSource,
     git: &'a str,
@@ -181,7 +185,6 @@ fn rebuild_binding(run: &BindingRun<'_>, report: &mut RebuildReport) -> Result<(
                 deploy_root.clone(),
             )?;
         } else {
-            let leaves = item_leaves(&item.materialization, &item.kept_leaves, &template_opt_in);
             rebuild_one(RebuildOne {
                 backend: run.backend,
                 registry: run.registry,
@@ -191,8 +194,8 @@ fn rebuild_binding(run: &BindingRun<'_>, report: &mut RebuildReport) -> Result<(
                 root: run.source.offer().root(),
                 commit: &run.binding.commit,
                 policy: &policy,
-                leaves: &leaves,
-                materialization: &item.materialization,
+                projection: run.projection,
+                item,
                 artifact_dst: &artifact_dst,
                 layout: run.target.layout(),
                 key: key.clone(),
@@ -214,38 +217,6 @@ fn record_kind(materialization: &Materialization) -> RecordKind {
     }
 }
 
-/// The export leaf plan for one materialization, mirroring `deploy_one`: a leaf maps
-/// its single dest basename; a collapsed dir maps each kept child to its dir-relative
-/// deployed name.
-fn item_leaves(
-    materialization: &Materialization,
-    kept_leaves: &[crate::kernel::ResolvedTake],
-    template_opt_in: &TemplateOptIn,
-) -> Vec<ExportLeaf> {
-    match materialization {
-        Materialization::CollapsedDir { dir } => {
-            let prefix = format!("{dir}/");
-            kept_leaves
-                .iter()
-                .filter_map(|kept| {
-                    let child = kept.dest.strip_prefix(&prefix)?;
-                    Some(ExportLeaf {
-                        source: PathBuf::from(&kept.source),
-                        dest: PathBuf::from(template_opt_in.deployed_name(child)),
-                    })
-                })
-                .collect()
-        }
-        Materialization::Leaf(take) => {
-            let dest = take.dest.rsplit('/').next().unwrap_or(&take.dest);
-            vec![ExportLeaf {
-                source: PathBuf::from(&take.source),
-                dest: PathBuf::from(dest),
-            }]
-        }
-    }
-}
-
 struct RebuildOne<'a> {
     backend: &'a dyn SourceBackend,
     registry: &'a dyn Registry,
@@ -255,8 +226,8 @@ struct RebuildOne<'a> {
     root: Option<&'a Path>,
     commit: &'a str,
     policy: &'a crate::source::ExportPolicy,
-    leaves: &'a [ExportLeaf],
-    materialization: &'a Materialization,
+    projection: &'a TargetProjection,
+    item: &'a ProjectedArtifact,
     artifact_dst: &'a Path,
     layout: LayoutConfig,
     key: ArtifactKey,
@@ -276,8 +247,8 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         root,
         commit,
         policy,
-        leaves,
-        materialization,
+        projection,
+        item,
         artifact_dst,
         layout,
         key,
@@ -293,20 +264,38 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
     let _guard = StagingGuard::new(&staging_base, &staging);
 
     let commit_time = backend.commit_time(source_name, git, commit)?;
-    let export = backend.export_artifact(&ExportRequest {
-        source: source_name,
-        url: git,
-        commit,
+    let scratch = staging_base.join(format!("{key_label}-{}-{}", std::process::id(), nonce()));
+    let _scratch_guard = StagingGuard::new(&staging_base, &scratch);
+    let reads = stage_source_reads(
+        backend,
+        &SourceReadRequest {
+            source: source_name,
+            url: git,
+            commit,
+            root,
+            policy,
+            scratch_dir: &scratch,
+            commit_time,
+            template_opt_in,
+            artifact: item,
+        },
+    )?;
+
+    let staged = stage_artifact(
+        &StageRequest {
+            artifact: item,
+            target: projection,
+            variables: vars,
+        },
         root,
         policy,
-        staging_dir: &staging,
+        &staging,
         commit_time,
         template_opt_in,
-        vars,
-        leaves,
-    })?;
+        |repo_relative| reads.read(repo_relative),
+    )?;
 
-    let manifest_base = match materialization {
+    let manifest_base = match &item.materialization {
         Materialization::CollapsedDir { .. } => artifact_dst.to_path_buf(),
         Materialization::Leaf(_) => artifact_dst
             .parent()
@@ -314,23 +303,24 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
     };
 
     let mut modified = false;
-    let mut files = Vec::with_capacity(export.files.len());
-    for mf in export.files {
-        let on_disk = manifest_base.join(&mf.path);
+    let mut files = Vec::with_capacity(staged.files.len());
+    for sf in staged.files {
+        let path = PathBuf::from(sf.destination.as_str());
+        let on_disk = manifest_base.join(&path);
         let (size, mtime) = if let Some(actual) = disk_hash(&on_disk)? {
-            if actual.hash != mf.blake3 {
+            if actual.hash != sf.blake3 {
                 modified = true;
             }
             (actual.size, actual.mtime)
         } else {
             modified = true;
-            (mf.size, mf.mtime)
+            (sf.size, sf.mtime)
         };
         files.push(ManifestFile {
-            path: mf.path,
+            path,
             size,
             mtime,
-            blake3: mf.blake3,
+            blake3: sf.blake3,
         });
     }
 
@@ -338,13 +328,13 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         key: key.clone(),
         underlying_source,
         commit,
-        digest: export.digest,
+        digest: staged.digest,
         layout: layout.kind.label().to_owned(),
-        kind: record_kind(materialization),
+        kind: record_kind(&item.materialization),
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
         files,
-        vars_digest: export.vars_digest,
+        vars_digest: staged.vars_digest,
         deploy_root: Some(deploy_root),
         layout_separator: layout.persisted_separator(),
     });
