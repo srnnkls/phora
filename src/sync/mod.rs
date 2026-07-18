@@ -3,12 +3,14 @@
 pub(crate) mod confine;
 pub(crate) mod discover;
 pub(crate) mod hooks;
+pub mod inspect;
 pub mod model;
 mod plan;
 mod preview;
 mod prune;
 mod rebuild;
 mod resolve;
+pub(crate) mod scan;
 pub(crate) mod stage;
 pub mod state;
 mod target;

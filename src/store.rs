@@ -112,13 +112,7 @@ pub struct ManifestFile {
     pub blake3: String,
 }
 
-/// Filesystem scan entry: stat metadata only, no content hash.
-#[derive(Debug, Clone)]
-pub struct ScannedFile {
-    pub path: PathBuf,
-    pub size: u64,
-    pub mtime: u64,
-}
+pub use crate::sync::model::ScannedFile;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EjectedEntry {
