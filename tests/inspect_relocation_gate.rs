@@ -512,7 +512,6 @@ const DEPLOY: &str = "deploy.rs";
 const STORE: &str = "store.rs";
 const SYNC_MOD: &str = "sync/mod.rs";
 
-// The exact drift-detection cluster relocated verbatim out of deploy.rs (commit 1).
 const CLUSTER_FNS: &[&str] = &[
     "check_artifact_state",
     "check_file_artifact_state",
@@ -522,11 +521,9 @@ const CLUSTER_FNS: &[&str] = &[
     "revalidate_file",
 ];
 
-// Shared filesystem scan helpers relocated into sync/scan.rs (commit 1).
 const SCAN_FNS: &[&str] = &["scan_dir", "scan_dir_soft", "scan_dir_strict", "mtime_secs"];
 const SCAN_TYPES: &[&str] = &["ScanResult", "ScanMode"];
 
-// Pure reconcile-facing value types that must land in sync/model.rs.
 const MODEL_CHANGE_TYPES: &[&str] = &["SyncChange", "ChangeSet", "RemovalReason"];
 
 const RECON_FORBIDDEN_SUBSTR: &[&str] = &[
