@@ -297,52 +297,26 @@ impl MirrorKey {
     }
 }
 
-struct Renderer<'a> {
-    opt_in: &'a TemplateOptIn,
-    env: minijinja::Environment<'static>,
-    vars: &'a BTreeMap<String, String>,
+pub(crate) use crate::sync::stage::{ExportWalk, Renderer};
+
+impl crate::sync::stage::StageLeaf for ExportLeaf {
+    fn source(&self) -> &Path {
+        &self.source
+    }
+
+    fn dest(&self) -> &Path {
+        &self.dest
+    }
 }
 
-impl<'a> Renderer<'a> {
-    fn new(opt_in: &'a TemplateOptIn, vars: &'a BTreeMap<String, String>) -> Self {
-        let mut env = minijinja::Environment::new();
-        env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
-        env.set_keep_trailing_newline(true);
-        // Bounds runaway templates from untrusted sources (e.g. unbounded loops).
-        env.set_fuel(Some(1_000_000));
-        Self { opt_in, env, vars }
-    }
-
-    fn rel_key(entry_rel: &Path) -> String {
-        entry_rel.to_string_lossy().replace('\\', "/")
-    }
-
-    fn render(&self, entry_rel: &Path, source_bytes: &[u8]) -> Result<Rendered> {
-        let key = Self::rel_key(entry_rel);
-        if !self.opt_in.renders(&key) {
-            return Ok(Rendered {
-                bytes: source_bytes.to_vec(),
-                templated: false,
-            });
+impl crate::sync::stage::StagedRecord for ManifestFile {
+    fn staged(destination: &Path, size: u64, mtime: u64, blake3: String) -> Self {
+        Self {
+            path: destination.to_path_buf(),
+            size,
+            mtime,
+            blake3,
         }
-        let template = std::str::from_utf8(source_bytes).map_err(|e| SourceError::Render {
-            path: entry_rel.to_path_buf(),
-            message: format!("template is not valid UTF-8: {e}"),
-        })?;
-        self.env
-            .render_str(template, self.vars)
-            .map(|bytes| Rendered {
-                bytes: bytes.into_bytes(),
-                templated: true,
-            })
-            .map_err(|e| SourceError::Render {
-                path: entry_rel.to_path_buf(),
-                message: e.to_string(),
-            })
-    }
-
-    fn vars_digest(&self) -> String {
-        vars_digest(self.vars)
     }
 }
 
@@ -363,145 +337,12 @@ pub fn vars_digest(vars: &BTreeMap<String, String>) -> String {
     format!("blake3:{}", hasher.finalize().to_hex())
 }
 
-struct Rendered {
-    bytes: Vec<u8>,
-    templated: bool,
-}
-
-struct ExportWalk<'a, 'r> {
-    out_base: &'a Path,
-    policy: &'a ExportPolicy,
-    commit_time: u64,
-    files: Vec<ManifestFile>,
-    hasher: blake3::Hasher,
-    renderer: &'a Renderer<'r>,
-    deployed_names: BTreeMap<PathBuf, PathBuf>,
-    rendered_any: bool,
-}
-
-fn dest_has_vcs_component(dest: &Path) -> bool {
-    dest.components().any(|c| c.as_os_str() == ".git")
-}
-
-impl ExportWalk<'_, '_> {
-    fn run(
-        &mut self,
-        leaves: &[ExportLeaf],
-        mut resolve: impl FnMut(&Path) -> Result<(Vec<u8>, SourceEntryKind)>,
-    ) -> Result<()> {
-        for leaf in leaves {
-            if !self.policy.vcs_opt_in && dest_has_vcs_component(&leaf.dest) {
-                continue;
-            }
-            let (bytes, kind) = resolve(&leaf.source)?;
-            match kind {
-                SourceEntryKind::File => {
-                    self.stage_leaf(&leaf.dest, &leaf.source, &bytes, false)?;
-                }
-                SourceEntryKind::Executable => {
-                    self.stage_leaf(&leaf.dest, &leaf.source, &bytes, true)?;
-                }
-                SourceEntryKind::Symlink => self.stage_link(&leaf.dest, &bytes)?,
-            }
-        }
-        Ok(())
-    }
-
-    fn register_deployed_name(&mut self, deployed_rel: &Path, source_rel: &Path) -> Result<()> {
-        let folded = crate::sync::confine::fold_path(deployed_rel);
-        let name = folded.to_string_lossy().into_owned();
-        if let Some(prior) = self.deployed_names.insert(folded, source_rel.to_path_buf()) {
-            return Err(SourceError::DeployedNameCollision {
-                name,
-                first: prior,
-                second: source_rel.to_path_buf(),
-            });
-        }
-        Ok(())
-    }
-
-    fn stage_leaf(
-        &mut self,
-        deployed_rel: &Path,
-        source_rel: &Path,
-        source_bytes: &[u8],
-        executable: bool,
-    ) -> Result<()> {
-        self.register_deployed_name(deployed_rel, source_rel)?;
-
-        let rendered = self.renderer.render(source_rel, source_bytes)?;
-        self.rendered_any |= rendered.templated;
-        let data = rendered.bytes;
-
-        let out_path = self.out_base.join(deployed_rel);
-        if let Some(parent) = out_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&out_path, &data)?;
-        set_deterministic_mtime(&out_path, self.commit_time)?;
-
-        if executable && self.policy.preserve_executable {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = std::fs::metadata(&out_path)?.permissions();
-                perms.set_mode(perms.mode() | 0o111);
-                std::fs::set_permissions(&out_path, perms)?;
-            }
-        }
-
-        let tag: &[u8] = if executable {
-            b"\x00exec\x00"
-        } else {
-            b"\x00file\x00"
-        };
-        hash_framed_entry(
-            &mut self.hasher,
-            deployed_rel.to_string_lossy().as_bytes(),
-            tag,
-            &data,
-        );
-
-        self.files.push(ManifestFile {
-            path: deployed_rel.to_path_buf(),
-            size: data.len() as u64,
-            mtime: self.commit_time,
-            blake3: blake3::hash(&data).to_hex().to_string(),
-        });
-        Ok(())
-    }
-
-    fn stage_link(&mut self, deployed_rel: &Path, target: &[u8]) -> Result<()> {
-        if !self.policy.allow_symlinks {
-            return Err(SourceError::SymlinkNotAllowed {
-                path: deployed_rel.to_path_buf(),
-            });
-        }
-        if symlink_target_escapes(deployed_rel, target) {
-            return Err(SourceError::SymlinkEscape {
-                path: deployed_rel.to_path_buf(),
-                target: String::from_utf8_lossy(target).into_owned(),
-            });
-        }
-        self.register_deployed_name(deployed_rel, deployed_rel)?;
-
-        let out_path = self.out_base.join(deployed_rel);
-        if let Some(parent) = out_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        materialize_symlink(&out_path, target)?;
-
-        hash_framed_entry(
-            &mut self.hasher,
-            deployed_rel.to_string_lossy().as_bytes(),
-            b"\x00link\x00",
-            target,
-        );
-        Ok(())
-    }
-}
-
-fn hash_framed_entry(hasher: &mut blake3::Hasher, rel_path: &[u8], tag: &[u8], payload: &[u8]) {
+pub(crate) fn hash_framed_entry(
+    hasher: &mut blake3::Hasher,
+    rel_path: &[u8],
+    tag: &[u8],
+    payload: &[u8],
+) {
     hasher.update(&(rel_path.len() as u64).to_le_bytes());
     hasher.update(rel_path);
     hasher.update(tag);
@@ -509,14 +350,7 @@ fn hash_framed_entry(hasher: &mut blake3::Hasher, rel_path: &[u8], tag: &[u8], p
     hasher.update(payload);
 }
 
-fn set_deterministic_mtime(path: &Path, commit_time: u64) -> Result<()> {
-    let seconds = i64::try_from(commit_time)
-        .map_err(|e| SourceError::Source(format!("commit_time out of range: {e}")))?;
-    filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(seconds, 0))?;
-    Ok(())
-}
-
-fn symlink_target_escapes(deployed_rel: &Path, target: &[u8]) -> bool {
+pub(crate) fn symlink_target_escapes(deployed_rel: &Path, target: &[u8]) -> bool {
     if matches!(target.first(), Some(b'/' | b'\\')) {
         return true;
     }
@@ -541,7 +375,7 @@ fn symlink_target_escapes(deployed_rel: &Path, target: &[u8]) -> bool {
 }
 
 #[cfg(unix)]
-fn materialize_symlink(out_path: &Path, target: &[u8]) -> Result<()> {
+pub(crate) fn materialize_symlink(out_path: &Path, target: &[u8]) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let target = std::ffi::OsStr::from_bytes(target);
     std::os::unix::fs::symlink(target, out_path)?;
@@ -549,7 +383,7 @@ fn materialize_symlink(out_path: &Path, target: &[u8]) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn materialize_symlink(out_path: &Path, target: &[u8]) -> Result<()> {
+pub(crate) fn materialize_symlink(out_path: &Path, target: &[u8]) -> Result<()> {
     let target = String::from_utf8_lossy(target);
     std::os::windows::fs::symlink_file(target.as_ref(), out_path)?;
     Ok(())
