@@ -48,10 +48,19 @@ pub fn stage_artifact(
         .iter()
         .map(|leaf| PlannedLeaf::new(leaf, root))
         .collect();
-    let repo_relative_sources: BTreeMap<&Path, &Path> = leaves
-        .iter()
-        .map(|leaf| (leaf.root_relative, leaf.repo_relative))
-        .collect();
+    let mut repo_relative_sources: BTreeMap<&Path, &Path> = BTreeMap::new();
+    for leaf in &leaves {
+        if let Some(prior) = repo_relative_sources.insert(leaf.root_relative, leaf.repo_relative)
+            && prior != leaf.repo_relative
+        {
+            return Err(SourceError::Source(format!(
+                "root-relative source {} is ambiguous: {} and {} both key it",
+                leaf.root_relative.display(),
+                prior.display(),
+                leaf.repo_relative.display()
+            )));
+        }
+    }
 
     let renderer = Renderer::new(template_opt_in, request.variables);
     let mut walk = ExportWalk {
