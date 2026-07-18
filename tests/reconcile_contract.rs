@@ -20,8 +20,6 @@ fn empty_observation() -> ObservedProjectState {
     }
 }
 
-// Single coupling point: rewire to the committed ReconciliationPolicy constructor. `force`
-// is the field the matrix reads to choose Conflict vs Overwrite; the rest default.
 fn policy(force: bool) -> ReconciliationPolicy {
     ReconciliationPolicy {
         force,
@@ -29,10 +27,6 @@ fn policy(force: bool) -> ReconciliationPolicy {
     }
 }
 
-// Single coupling point: build a projection that WANTS a destination the observation reports
-// as a drifted (Modified) managed artifact — the minimal desired×observed collision. Rewire
-// the fixture body to the committed Projection/ObservedProjectState shapes; the assertions on
-// the emitted ChangeSet below are the contract.
 fn conflicting_pair() -> (Projection, ObservedProjectState) {
     let projection = Projection {
         targets: vec![TargetProjection {
@@ -62,8 +56,6 @@ fn conflicting_pair() -> (Projection, ObservedProjectState) {
     (projection, observed)
 }
 
-// Single coupling point: rewire to the committed ChangeSet accessor — this assumes a public
-// `changes: Vec<SyncChange>` field.
 fn changes(set: &ChangeSet) -> Vec<SyncChange> {
     set.changes.clone()
 }

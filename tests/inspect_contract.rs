@@ -77,8 +77,6 @@ fn ejected(source: &str, artifact: &str) -> EjectedEntry {
     }
 }
 
-// Single coupling point: rewire this call to the committed `inspect` signature. Everything
-// below asserts the design §7.3 ArtifactState → ObservedArtifact mapping, not the call shape.
 fn observe(
     store: &dyn StateStore,
     target_path: &Path,
