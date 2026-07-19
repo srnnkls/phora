@@ -1,10 +1,12 @@
-use phora::projection::model::Materialization;
+use phora::projection::model::{
+    BindingProjection, Materialization, ProjectedArtifact, Projection, ResolvedSourceRef,
+    TargetPath, TargetProjection,
+};
 use phora::sync::model::{
     ChangeSet, ManagedArtifact, ManagedCondition, ObservedArtifact, ObservedEntry,
     ObservedProjectState, ReconciliationPolicy, SyncChange,
 };
 use phora::sync::reconcile::reconcile;
-use phora::sync::{ProjectedArtifact, Projection, ResolvedSourceRef, TargetPath, TargetProjection};
 use std::path::PathBuf;
 
 fn empty_projection() -> Projection {
@@ -28,19 +30,26 @@ fn policy(force: bool) -> ReconciliationPolicy {
 }
 
 fn conflicting_pair() -> (Projection, ObservedProjectState) {
+    let artifact = || ProjectedArtifact {
+        destination: TargetPath::new("snippets").expect("valid target path"),
+        source: ResolvedSourceRef::new("company-configs", "abc123def456"),
+        materialization: Materialization::CollapsedDir {
+            dir: "snippets".to_owned(),
+        },
+        kept_leaves: Vec::new(),
+        leaves: Vec::new(),
+    };
     let projection = Projection {
         targets: vec![TargetProjection {
             target: "vscode".to_owned(),
-            bindings: Vec::new(),
-            artifacts: vec![ProjectedArtifact {
-                destination: TargetPath::new("snippets").expect("valid target path"),
-                source: ResolvedSourceRef::new("company-configs", "abc123def456"),
-                materialization: Materialization::CollapsedDir {
-                    dir: "snippets".to_owned(),
-                },
-                kept_leaves: Vec::new(),
-                leaves: Vec::new(),
+            bindings: vec![BindingProjection {
+                identity: "company-configs".to_owned(),
+                source: "company-configs".to_owned(),
+                commit: "abc123def456".to_owned(),
+                artifacts: vec![artifact()],
+                warnings: Vec::new(),
             }],
+            artifacts: vec![artifact()],
             warnings: Vec::new(),
         }],
         warnings: Vec::new(),

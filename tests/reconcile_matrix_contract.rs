@@ -1,10 +1,12 @@
-use phora::projection::model::Materialization;
+use phora::projection::model::{
+    BindingProjection, Materialization, ProjectedArtifact, Projection, ResolvedSourceRef,
+    TargetPath, TargetProjection,
+};
 use phora::sync::model::{
     ConflictKind, ManagedArtifact, ManagedCondition, ObservedArtifact, ObservedEntry,
     ObservedProjectState, ReconciliationPolicy, RemovalReason, SyncChange, SyncError,
 };
 use phora::sync::reconcile::reconcile;
-use phora::sync::{ProjectedArtifact, Projection, ResolvedSourceRef, TargetPath, TargetProjection};
 use std::path::PathBuf;
 
 const TARGET: &str = "vscode";
@@ -24,11 +26,21 @@ fn projected(source: &str, dest: &str) -> ProjectedArtifact {
     }
 }
 
+fn binding_of(source: &str, dest: &str) -> BindingProjection {
+    BindingProjection {
+        identity: source.to_owned(),
+        source: source.to_owned(),
+        commit: COMMIT.to_owned(),
+        artifacts: vec![projected(source, dest)],
+        warnings: Vec::new(),
+    }
+}
+
 fn projection_of(target: &str, arts: &[(&str, &str)]) -> Projection {
     Projection {
         targets: vec![TargetProjection {
             target: target.to_owned(),
-            bindings: Vec::new(),
+            bindings: arts.iter().map(|(s, d)| binding_of(s, d)).collect(),
             artifacts: arts.iter().map(|(s, d)| projected(s, d)).collect(),
             warnings: Vec::new(),
         }],
