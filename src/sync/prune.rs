@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::config::{Config, LayoutConfig, LayoutKind};
@@ -6,7 +6,7 @@ use crate::error::{Error, Result};
 use crate::store::{Registry, RegistryRecord};
 
 use super::confine::{ProtectedPathSet, confine_destination};
-use super::remove_orphan_path;
+use super::{persisted_manifest_relative_path, remove_orphan_path};
 use crate::projection::build::projected_artifact_keys;
 use crate::projection::model::Projection;
 
@@ -142,21 +142,6 @@ fn refuse_readonly_prune(
     Ok(())
 }
 
-#[cfg(test)]
-pub(super) fn prune_orphans(
-    config: &Config,
-    parsed: &BTreeMap<String, crate::config::ParsedSource>,
-    remotes: &BTreeMap<String, String>,
-    backend: &dyn crate::source::SourceBackend,
-    registry: &dyn Registry,
-    resolved_commits: &BTreeMap<(String, String), String>,
-    protected: &ProtectedPathSet,
-) -> Result<()> {
-    let projection =
-        super::plan::project_workspace(config, parsed, remotes, backend, resolved_commits)?;
-    prune_projected(&projection, config, registry, protected)
-}
-
 pub(super) fn prune_projected(
     projection: &Projection,
     config: &Config,
@@ -235,6 +220,9 @@ pub(super) fn prune_projected(
                 {
                     continue;
                 }
+                Ok(path) if path.exists() => {
+                    prune_stale_manifest_children(&path, &record, &live_paths, &record.key.target)?;
+                }
                 Ok(_) => {}
                 Err(e) => {
                     eprintln!(
@@ -255,6 +243,111 @@ pub(super) fn prune_projected(
         registry.remove(&record.key)?;
     }
     Ok(())
+}
+
+fn prune_stale_manifest_children(
+    artifact_root: &Path,
+    record: &RegistryRecord,
+    live_paths: &LivePathsBySource,
+    target: &str,
+) -> Result<()> {
+    if record.linked || record.kind != crate::store::RecordKind::Dir {
+        return Ok(());
+    }
+    let root_metadata = match std::fs::symlink_metadata(artifact_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(Error::Sync(format!(
+                "inspect stale artifact root {}: {error}",
+                artifact_root.display()
+            )));
+        }
+    };
+    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    let manifest_children = record
+        .files
+        .iter()
+        .map(|file| persisted_manifest_relative_path(&file.path))
+        .collect::<Result<Vec<_>>>()?;
+    let mut empty_dir_candidates = BTreeSet::new();
+    for relative in manifest_children {
+        let stale_path = artifact_root.join(relative.as_str());
+        if overlaps_any_live_dest(&stale_path, live_paths, target) {
+            continue;
+        }
+        if has_symlink_ancestor(artifact_root, &stale_path)? {
+            continue;
+        }
+        match std::fs::symlink_metadata(&stale_path) {
+            Ok(metadata) if metadata.is_dir() => continue,
+            Ok(_) => remove_orphan_path(&stale_path)
+                .map_err(|error| Error::Sync(format!("prune {}: {error}", stale_path.display())))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(Error::Sync(format!(
+                    "inspect stale manifest child {}: {error}",
+                    stale_path.display()
+                )));
+            }
+        }
+        let mut parent = stale_path.parent();
+        while let Some(dir) = parent {
+            if dir == artifact_root || !dir.starts_with(artifact_root) {
+                break;
+            }
+            empty_dir_candidates.insert(dir.to_path_buf());
+            parent = dir.parent();
+        }
+    }
+    let mut empty_dir_candidates: Vec<PathBuf> = empty_dir_candidates.into_iter().collect();
+    empty_dir_candidates.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for dir in empty_dir_candidates {
+        match std::fs::remove_dir(&dir) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                ) => {}
+            Err(error) => {
+                return Err(Error::Sync(format!(
+                    "remove empty stale directory {}: {error}",
+                    dir.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn has_symlink_ancestor(artifact_root: &Path, path: &Path) -> Result<bool> {
+    let Some(parent) = path.parent() else {
+        return Ok(false);
+    };
+    let Ok(relative_parent) = parent.strip_prefix(artifact_root) else {
+        return Ok(true);
+    };
+    let mut ancestor = artifact_root.to_path_buf();
+    for component in relative_parent.components() {
+        ancestor.push(component);
+        match std::fs::symlink_metadata(&ancestor) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Ok(true);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(Error::Sync(format!(
+                    "inspect stale manifest ancestor {}: {error}",
+                    ancestor.display()
+                )));
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn keep_orphan(

@@ -21,25 +21,12 @@ use crate::projection::diagnostic::ProjectionWarning;
 use crate::projection::model::{ProjectedArtifact, TargetProjection};
 use crate::sync::model::{ChangeSet, ConflictKind, ManagedCondition, ObservedArtifact, SyncChange};
 
-#[cfg(test)]
-use crate::deploy::{ArtifactState, check_artifact_state};
-
 #[derive(Clone, Copy)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "force/interactive/resolver feed the cfg(test) single-entry apply shim; the production observe/reconcile path reads state through SyncInput"
-    )
-)]
 pub(super) struct TargetRun<'a> {
     pub(super) parsed: &'a BTreeMap<String, ParsedSource>,
     pub(super) target_name: &'a str,
     pub(super) target: &'a Target,
     pub(super) remotes: &'a BTreeMap<String, String>,
-    pub(super) force: bool,
-    pub(super) interactive: bool,
-    pub(super) resolver: Option<&'a dyn ConflictResolver>,
     pub(super) vars: &'a BTreeMap<String, String>,
     pub(super) protected: &'a ProtectedPathSet,
 }
@@ -504,205 +491,12 @@ pub(super) fn record_manifest_base(target: &Target, record: &RegistryRecord) -> 
     }
 }
 
-#[cfg(test)]
-pub(super) fn deploy_artifact_entry(
-    run: TargetRun<'_>,
-    entry: &ArtifactEntry<'_>,
-    backend: &dyn StageSource,
-    registry: &dyn Registry,
-    journal: &Journal,
-) -> Result<bool> {
-    let projection = TargetProjection {
-        target: run.target_name.to_owned(),
-        bindings: Vec::new(),
-        artifacts: Vec::new(),
-        warnings: Vec::new(),
-    };
-    let mut decisions = ConflictDecisions::new();
-    preflight_entry(&run, entry, backend, registry, &mut decisions)?;
-    apply_entry(
-        &run,
-        entry,
-        &projection,
-        backend,
-        registry,
-        journal,
-        &decisions,
-    )
-}
-
 fn conflict_triplet(run: &TargetRun<'_>, entry: &ArtifactEntry<'_>) -> (String, String, String) {
     (
         run.target_name.to_owned(),
         entry.identity.to_owned(),
         entry.published_key().to_owned(),
     )
-}
-
-#[cfg(test)]
-fn preflight_entry(
-    run: &TargetRun<'_>,
-    entry: &ArtifactEntry<'_>,
-    backend: &dyn StageSource,
-    registry: &dyn Registry,
-    decisions: &mut ConflictDecisions,
-) -> Result<()> {
-    let published_key = entry.published_key().to_owned();
-    let key = ArtifactKey {
-        target: run.target_name.to_owned(),
-        source: entry.identity.to_owned(),
-        artifact: published_key.clone(),
-    };
-    let expected_vars_digest = expected_vars_digest(entry, backend, registry, &key, run.vars)?;
-    let state = check_artifact_state(
-        entry.artifact_dst,
-        entry.identity,
-        entry.commit,
-        entry.ejected,
-        &published_key,
-        registry,
-        &key,
-        expected_vars_digest.as_deref(),
-    )?;
-    let Some(kind) = conflict_kind_for(&state, entry, run.force) else {
-        return Ok(());
-    };
-    let (resolution, warn) = match run.resolver {
-        Some(resolver) if run.interactive => (
-            resolver.resolve(&Conflict {
-                target: run.target_name.to_owned(),
-                source: entry.identity.to_owned(),
-                artifact: published_key.clone(),
-                kind: kind.clone(),
-            }),
-            false,
-        ),
-        _ => (Resolution::Skip, true),
-    };
-    decisions.insert(
-        conflict_triplet(run, entry),
-        ConflictOutcome {
-            resolution,
-            kind,
-            warn,
-        },
-    );
-    Ok(())
-}
-
-#[cfg(test)]
-fn apply_entry(
-    run: &TargetRun<'_>,
-    entry: &ArtifactEntry<'_>,
-    target: &TargetProjection,
-    backend: &dyn StageSource,
-    registry: &dyn Registry,
-    journal: &Journal,
-    decisions: &ConflictDecisions,
-) -> Result<bool> {
-    let artifact_dst = entry.artifact_dst;
-    let published_key = entry.published_key().to_owned();
-    let key = ArtifactKey {
-        target: run.target_name.to_owned(),
-        source: entry.identity.to_owned(),
-        artifact: published_key.clone(),
-    };
-
-    let expected_vars_digest = expected_vars_digest(entry, backend, registry, &key, run.vars)?;
-    let state = check_artifact_state(
-        artifact_dst,
-        entry.identity,
-        entry.commit,
-        entry.ejected,
-        &published_key,
-        registry,
-        &key,
-        expected_vars_digest.as_deref(),
-    )?;
-
-    let conflict_kind = conflict_kind_for(&state, entry, run.force);
-
-    // A read-only frozen sync is legal only as a no-op: anything but a silent clean skip is
-    // pending work, refused before staging. (A Revalidated skip still writes; the read-only
-    // registry refuses that put.)
-    let clean_skip = conflict_kind.is_none() && !entry.mode_transition && skips_redeploy(&state);
-    if journal.refuses_writes() && !clean_skip {
-        return Err(journal.readonly_error());
-    }
-
-    let deploy_root = run.target.deploy_root();
-    let deploy = |key: ArtifactKey| match entry.source.deploy_mode() {
-        DeployMode::Link => deploy_link(registry, journal, entry, key, deploy_root.clone()),
-        DeployMode::Copy => deploy_one(
-            backend,
-            registry,
-            journal,
-            DeployContext {
-                deploy_root: deploy_root.clone(),
-                layout: entry.layout.clone(),
-                source: entry.source,
-                git: entry.git,
-                source_name: entry.source_name,
-                underlying_source: entry.underlying_source,
-                root: entry.source.offer().root(),
-                commit: entry.commit,
-                artifact: entry.item,
-                target,
-                kind: entry.record_kind(),
-                artifact_dst,
-                key,
-                template_opt_in: entry.template_opt_in,
-                vars: run.vars,
-                confine_anchor: run.target.confine.as_deref(),
-            },
-        ),
-    };
-
-    let resolution = match conflict_kind {
-        None if !entry.mode_transition && skips_redeploy(&state) => {
-            if let ArtifactState::Revalidated { fresh } = &state {
-                persist_revalidated_refresh(registry, &key, fresh)?;
-            }
-            return Ok(false);
-        }
-        None => Resolution::Overwrite,
-        Some(kind) => {
-            if let Some(outcome) = decisions.get(&conflict_triplet(run, entry)) {
-                if outcome.warn {
-                    warn_skip(entry.identity, &published_key, &outcome.kind, artifact_dst);
-                }
-                outcome.resolution
-            } else {
-                warn_skip(entry.identity, &published_key, &kind, artifact_dst);
-                Resolution::Skip
-            }
-        }
-    };
-
-    match resolution {
-        Resolution::Skip => Ok(false),
-        Resolution::Overwrite => match deploy(key) {
-            Ok(()) => Ok(false),
-            Err(e) => {
-                eprintln!(
-                    "phora: failed to deploy {}:{published_key}: {e}",
-                    entry.identity
-                );
-                Ok(true)
-            }
-        },
-        Resolution::Eject => {
-            let mut ejected = registry.load_ejected(run.target_name)?;
-            ejected.push(EjectedEntry {
-                source: entry.identity.to_owned(),
-                artifact: published_key.clone(),
-                ejected_at: chrono::Utc::now().to_rfc3339(),
-            });
-            registry.save_ejected(run.target_name, &ejected)?;
-            Ok(false)
-        }
-        Resolution::Abort => Err(Error::Aborted),
-    }
 }
 
 /// `check_artifact_state` compares this only when `record.vars_digest.is_some()`; that lets a
@@ -759,40 +553,6 @@ fn persist_revalidated_refresh(
     }
     registry.put(&record)?;
     Ok(())
-}
-
-#[cfg(test)]
-fn skips_redeploy(state: &ArtifactState) -> bool {
-    matches!(
-        state,
-        ArtifactState::Clean
-            | ArtifactState::Ejected
-            | ArtifactState::Linked
-            | ArtifactState::Revalidated { .. }
-    )
-}
-
-#[cfg(test)]
-fn conflict_kind_for(
-    state: &ArtifactState,
-    entry: &ArtifactEntry<'_>,
-    force: bool,
-) -> Option<ConflictKind> {
-    match state {
-        ArtifactState::Clean
-        | ArtifactState::Ejected
-        | ArtifactState::Linked
-        | ArtifactState::Revalidated { .. }
-            if entry.mode_transition =>
-        {
-            None
-        }
-        ArtifactState::Modified { changed } if !force => Some(ConflictKind::Modified {
-            changed: changed.clone(),
-        }),
-        ArtifactState::Foreign if !force => Some(ConflictKind::Foreign),
-        _ => None,
-    }
 }
 
 fn warn_skip(source: &str, artifact: &str, kind: &ConflictKind, dst: &Path) {
@@ -983,18 +743,87 @@ fn leaf_basename(dest: &str) -> String {
 }
 
 #[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+struct ReconcileTestPolicy {
+    mode_transition: bool,
+    force: bool,
+}
+
+#[cfg(test)]
+impl ReconcileTestPolicy {
+    const STANDARD: Self = Self {
+        mode_transition: false,
+        force: false,
+    };
+    const MODE_TRANSITION: Self = Self {
+        mode_transition: true,
+        force: false,
+    };
+    const FORCED_MODE_TRANSITION: Self = Self {
+        mode_transition: true,
+        force: true,
+    };
+}
+
+#[cfg(test)]
+fn reconciled_test_change(
+    observation: ObservedArtifact<()>,
+    test_policy: ReconcileTestPolicy,
+) -> Option<SyncChange> {
+    let artifact = ProjectedArtifact {
+        destination: crate::projection::model::TargetPath::new("a.txt").expect("valid dest"),
+        source: crate::projection::model::ResolvedSourceRef::new("src", "0123"),
+        materialization: Materialization::Leaf(crate::kernel::ResolvedTake {
+            source: "a.txt".to_owned(),
+            dest: "a.txt".to_owned(),
+        }),
+        kept_leaves: Vec::new(),
+        leaves: Vec::new(),
+    };
+    let binding = crate::projection::model::BindingProjection {
+        identity: "src".to_owned(),
+        source: "src".to_owned(),
+        commit: "0123".to_owned(),
+        attribution: crate::projection::model::BindingAttribution::default(),
+        artifacts: vec![artifact.clone()],
+        warnings: Vec::new(),
+    };
+    let projection = crate::projection::model::Projection {
+        targets: vec![TargetProjection {
+            target: "dest".to_owned(),
+            bindings: vec![binding],
+            artifacts: vec![artifact],
+            warnings: Vec::new(),
+        }],
+        warnings: Vec::new(),
+    };
+    let observed = crate::sync::model::ObservedProjectState {
+        artifacts: vec![crate::sync::model::ObservedEntry {
+            target: "dest".to_owned(),
+            source: "src".to_owned(),
+            artifact: "a.txt".to_owned(),
+            observation: super::observe::absorb_mode_transition(
+                observation,
+                test_policy.mode_transition,
+            ),
+        }],
+    };
+    let policy = crate::sync::model::ReconciliationPolicy {
+        force: test_policy.force,
+        prune: false,
+        follow_moved_pin: false,
+    };
+    super::reconcile::reconcile(&projection, &observed, &policy)
+        .expect("live reconcile accepts the fixture")
+        .changes
+        .into_iter()
+        .next()
+}
+
+#[cfg(test)]
 mod confine_fail_closed_tests {
-    #![allow(clippy::too_many_arguments)]
     use super::*;
     use crate::config::Target;
-    use crate::sync::ConflictResolver;
-
-    struct NeverResolve;
-    impl ConflictResolver for NeverResolve {
-        fn resolve(&self, _conflict: &Conflict) -> Resolution {
-            Resolution::Skip
-        }
-    }
 
     fn composed_target_without_anchor(dst: &Path) -> Target {
         Target {
@@ -1016,16 +845,12 @@ mod confine_fail_closed_tests {
         parsed: &'a BTreeMap<String, ParsedSource>,
         remotes: &'a BTreeMap<String, String>,
         vars: &'a BTreeMap<String, String>,
-        resolver: &'a dyn ConflictResolver,
     ) -> TargetRun<'a> {
         TargetRun {
             parsed,
             target_name,
             target,
             remotes,
-            force: false,
-            interactive: false,
-            resolver: Some(resolver),
             vars,
             protected,
         }
@@ -1041,16 +866,7 @@ mod confine_fail_closed_tests {
         let parsed = BTreeMap::new();
         let remotes = BTreeMap::new();
         let vars = BTreeMap::new();
-        let resolver = NeverResolve;
-        let run = run_for(
-            &target,
-            "root%1%nvim",
-            &protected,
-            &parsed,
-            &remotes,
-            &vars,
-            &resolver,
-        );
+        let run = run_for(&target, "root%1%nvim", &protected, &parsed, &remotes, &vars);
 
         run.confined(outside).expect_err(
             "a composed/transitive target (namespaced name carries `%`) reaching deploy with \
@@ -1312,64 +1128,21 @@ mod kind_aware_layout_tests {
 #[cfg(test)]
 mod revalidated_treated_like_clean_tests {
     use super::*;
-    use crate::config::Source;
-    use crate::kernel::ResolvedTake;
 
-    fn parsed_local() -> ParsedSource {
-        let raw: Source = toml::from_str("path = \"/tmp/src\"").expect("local source toml parses");
-        ParsedSource::parse("src", &raw).expect("local source parses to typed form")
-    }
-
-    fn leaf_item() -> ProjectedArtifact {
-        ProjectedArtifact {
-            destination: crate::projection::model::TargetPath::new("a.txt").expect("valid dest"),
-            source: crate::projection::model::ResolvedSourceRef::new("src", "0123"),
-            materialization: Materialization::Leaf(ResolvedTake {
-                source: "a.txt".to_owned(),
-                dest: "a.txt".to_owned(),
-            }),
-            kept_leaves: Vec::new(),
-            leaves: Vec::new(),
-        }
-    }
-
-    fn entry<'a>(
-        source: &'a ParsedSource,
-        source_name: &'a SourceName,
-        item: &'a ProjectedArtifact,
-        dst: &'a Path,
-    ) -> ArtifactEntry<'a> {
-        ArtifactEntry {
-            source,
-            git: "git@example.com:org/repo.git",
-            source_name,
-            identity: "src",
-            underlying_source: "src",
-            commit: "0123456789abcdef0123456789abcdef01234567",
-            item,
-            artifact_dst: dst,
-            layout: LayoutConfig {
-                kind: crate::config::LayoutKind::Flat,
-                separator: String::new(),
-            },
-            ejected: &[],
-            mode_transition: false,
-            template_opt_in: &TemplateOptIn::SuffixOnly,
-        }
+    fn managed(condition: ManagedCondition) -> ObservedArtifact<()> {
+        ObservedArtifact::Managed(crate::sync::model::ManagedArtifact {
+            record: (),
+            condition,
+        })
     }
 
     #[test]
     fn revalidated_artifact_is_not_a_conflict() {
-        let source = parsed_local();
-        let source_name = SourceName::trusted("src");
-        let item = leaf_item();
-        let dst = PathBuf::from("/tmp/dst/a.txt");
-        let entry = entry(&source, &source_name, &item, &dst);
-
-        let revalidated = conflict_kind_for(
-            &ArtifactState::Revalidated { fresh: Vec::new() },
-            &entry,
-            false,
+        let revalidated = reconciled_test_change(
+            managed(ManagedCondition::MetadataChangedButContentClean {
+                refreshed: Vec::new(),
+            }),
+            ReconcileTestPolicy::STANDARD,
         );
 
         assert!(
@@ -1378,39 +1151,69 @@ mod revalidated_treated_like_clean_tests {
              conflict (got {revalidated:?})"
         );
 
-        let modified = conflict_kind_for(
-            &ArtifactState::Modified {
+        let modified = reconciled_test_change(
+            managed(ManagedCondition::Modified {
                 changed: vec![PathBuf::from("a.txt")],
-            },
-            &entry,
-            false,
+            }),
+            ReconcileTestPolicy::STANDARD,
         );
         assert!(
-            matches!(modified, Some(ConflictKind::Modified { .. })),
-            "positive control: a non-forced Modified artifact IS a conflict — proving \
-             conflict_kind_for discriminates rather than blanket-returning None (got {modified:?})"
+            matches!(
+                modified,
+                Some(SyncChange::Conflict {
+                    kind: ConflictKind::Modified { .. },
+                    ..
+                })
+            ),
+            "positive control: the live reconcile seam classifies a non-forced Modified artifact \
+             as a conflict (got {modified:?})"
         );
 
-        let foreign = conflict_kind_for(&ArtifactState::Foreign, &entry, false);
+        let foreign = reconciled_test_change(
+            ObservedArtifact::Foreign(PathBuf::from("/tmp/dst/a.txt")),
+            ReconcileTestPolicy::STANDARD,
+        );
         assert!(
-            matches!(foreign, Some(ConflictKind::Foreign)),
+            matches!(
+                foreign,
+                Some(SyncChange::Conflict {
+                    kind: ConflictKind::Foreign,
+                    ..
+                })
+            ),
             "positive control: a non-forced Foreign artifact IS a conflict (got {foreign:?})"
         );
     }
 
     #[test]
-    fn revalidated_state_skips_redeploy_like_clean() {
+    fn revalidated_state_reconciles_like_clean() {
         assert!(
-            skips_redeploy(&ArtifactState::Revalidated { fresh: Vec::new() }),
+            reconciled_test_change(
+                managed(ManagedCondition::MetadataChangedButContentClean {
+                    refreshed: Vec::new(),
+                }),
+                ReconcileTestPolicy::STANDARD,
+            )
+            .is_none(),
             "a revalidated artifact returns to the caller WITHOUT writing, exactly like Clean; the \
              early-skip set must include it"
         );
         assert!(
-            skips_redeploy(&ArtifactState::Clean),
+            reconciled_test_change(
+                managed(ManagedCondition::Clean),
+                ReconcileTestPolicy::STANDARD,
+            )
+            .is_none(),
             "premise: Clean is a no-op redeploy"
         );
         assert!(
-            !skips_redeploy(&ArtifactState::Foreign),
+            matches!(
+                reconciled_test_change(
+                    ObservedArtifact::Foreign(PathBuf::from("/tmp/dst/a.txt")),
+                    ReconcileTestPolicy::STANDARD,
+                ),
+                Some(SyncChange::Conflict { .. })
+            ),
             "a foreign artifact is not a silent no-op skip"
         );
     }
@@ -1419,142 +1222,97 @@ mod revalidated_treated_like_clean_tests {
 #[cfg(test)]
 mod mode_transition_conflict_tests {
     use super::*;
-    use crate::config::Source;
-    use crate::kernel::ResolvedTake;
 
-    fn parsed_source(link: bool) -> ParsedSource {
-        let toml = if link {
-            "path = \"/tmp/src\"\ndeploy = \"link\""
-        } else {
-            "path = \"/tmp/src\""
-        };
-        let raw: Source = toml::from_str(toml).expect("source toml parses");
-        let parsed = ParsedSource::parse("src", &raw).expect("source parses to typed form");
-        assert_eq!(
-            matches!(parsed.deploy_mode(), DeployMode::Link),
-            link,
-            "premise: the parsed source deploy mode must match the requested direction"
-        );
-        parsed
+    fn managed(condition: ManagedCondition) -> ObservedArtifact<()> {
+        ObservedArtifact::Managed(crate::sync::model::ManagedArtifact {
+            record: (),
+            condition,
+        })
     }
 
-    fn leaf_item() -> ProjectedArtifact {
-        ProjectedArtifact {
-            destination: crate::projection::model::TargetPath::new("a.txt").expect("valid dest"),
-            source: crate::projection::model::ResolvedSourceRef::new("src", "0123"),
-            materialization: Materialization::Leaf(ResolvedTake {
-                source: "a.txt".to_owned(),
-                dest: "a.txt".to_owned(),
-            }),
-            kept_leaves: Vec::new(),
-            leaves: Vec::new(),
-        }
-    }
-
-    fn transition_entry<'a>(
-        source: &'a ParsedSource,
-        source_name: &'a SourceName,
-        item: &'a ProjectedArtifact,
-        dst: &'a Path,
-    ) -> ArtifactEntry<'a> {
-        ArtifactEntry {
-            source,
-            git: "/tmp/src",
-            source_name,
-            identity: "src",
-            underlying_source: "src",
-            commit: "0123456789abcdef0123456789abcdef01234567",
-            item,
-            artifact_dst: dst,
-            layout: LayoutConfig {
-                kind: crate::config::LayoutKind::BySource,
-                separator: String::new(),
-            },
-            ejected: &[],
-            mode_transition: true,
-            template_opt_in: &TemplateOptIn::SuffixOnly,
-        }
-    }
-
-    fn modified_state() -> ArtifactState {
-        ArtifactState::Modified {
+    fn modified_state() -> ObservedArtifact<()> {
+        managed(ManagedCondition::Modified {
             changed: vec![PathBuf::from("a.txt")],
-        }
-    }
-
-    fn conflict_for(link: bool, state: &ArtifactState, force: bool) -> Option<ConflictKind> {
-        let source = parsed_source(link);
-        let source_name = SourceName::trusted("src");
-        let item = leaf_item();
-        let dst = PathBuf::from("/tmp/dst/a.txt");
-        let entry = transition_entry(&source, &source_name, &item, &dst);
-        conflict_kind_for(state, &entry, force)
+        })
     }
 
     #[test]
-    fn copy_to_link_transition_onto_modified_is_a_conflict() {
-        let kind = conflict_for(true, &modified_state(), false);
+    fn mode_transition_onto_modified_is_a_conflict() {
+        let kind = reconciled_test_change(modified_state(), ReconcileTestPolicy::MODE_TRANSITION);
         assert!(
-            matches!(kind, Some(ConflictKind::Modified { .. })),
-            "a copy→link transition onto a locally-modified managed artifact must still classify a \
+            matches!(
+                kind,
+                Some(SyncChange::Conflict {
+                    kind: ConflictKind::Modified { .. },
+                    ..
+                })
+            ),
+            "a mode transition onto a locally-modified managed artifact must still classify a \
              Modified conflict (skip unless --force); the mode_transition arm must not swallow it \
              (got {kind:?})"
         );
     }
 
     #[test]
-    fn copy_to_link_transition_onto_foreign_is_a_conflict() {
-        let kind = conflict_for(true, &ArtifactState::Foreign, false);
+    fn mode_transition_onto_foreign_is_a_conflict() {
+        let kind = reconciled_test_change(
+            ObservedArtifact::Foreign(PathBuf::from("/tmp/dst/a.txt")),
+            ReconcileTestPolicy::MODE_TRANSITION,
+        );
         assert!(
-            matches!(kind, Some(ConflictKind::Foreign)),
-            "a copy→link transition onto unmanaged (Foreign) content must still classify a Foreign \
+            matches!(
+                kind,
+                Some(SyncChange::Conflict {
+                    kind: ConflictKind::Foreign,
+                    ..
+                })
+            ),
+            "a mode transition onto unmanaged (Foreign) content must still classify a Foreign \
              conflict, not silently replace it with a symlink (got {kind:?})"
-        );
-    }
-
-    #[test]
-    fn link_to_copy_transition_onto_modified_is_a_conflict() {
-        let kind = conflict_for(false, &modified_state(), false);
-        assert!(
-            matches!(kind, Some(ConflictKind::Modified { .. })),
-            "a link→copy transition onto a locally-modified managed artifact must still classify a \
-             Modified conflict (got {kind:?})"
-        );
-    }
-
-    #[test]
-    fn link_to_copy_transition_onto_foreign_is_a_conflict() {
-        let kind = conflict_for(false, &ArtifactState::Foreign, false);
-        assert!(
-            matches!(kind, Some(ConflictKind::Foreign)),
-            "a link→copy transition onto unmanaged (Foreign) content must still classify a Foreign \
-             conflict (got {kind:?})"
         );
     }
 
     #[test]
     fn force_overrides_a_transition_conflict() {
         assert!(
-            conflict_for(true, &modified_state(), true).is_none(),
-            "--force must still apply a copy→link transition over Modified content (no conflict)"
+            matches!(
+                reconciled_test_change(
+                    modified_state(),
+                    ReconcileTestPolicy::FORCED_MODE_TRANSITION,
+                ),
+                Some(SyncChange::Overwrite { .. })
+            ),
+            "--force must still apply a mode transition over Modified content (no conflict)"
         );
         assert!(
-            conflict_for(false, &ArtifactState::Foreign, true).is_none(),
-            "--force must still apply a link→copy transition over Foreign content (no conflict)"
+            matches!(
+                reconciled_test_change(
+                    ObservedArtifact::Foreign(PathBuf::from("/tmp/dst/a.txt")),
+                    ReconcileTestPolicy::FORCED_MODE_TRANSITION,
+                ),
+                Some(SyncChange::Overwrite { .. })
+            ),
+            "--force must still apply a mode transition over Foreign content (no conflict)"
         );
     }
 
     #[test]
     fn clean_like_transitions_stay_silent() {
         for state in [
-            ArtifactState::Clean,
-            ArtifactState::Linked,
-            ArtifactState::Revalidated { fresh: Vec::new() },
+            managed(ManagedCondition::Clean),
+            managed(ManagedCondition::Linked),
+            managed(ManagedCondition::MetadataChangedButContentClean {
+                refreshed: Vec::new(),
+            }),
         ] {
+            let change = reconciled_test_change(state, ReconcileTestPolicy::MODE_TRANSITION);
             assert!(
-                conflict_for(true, &state, false).is_none(),
-                "a mode transition over {state:?} must proceed silently — only Modified/Foreign \
-                 destinations are conflicts"
+                matches!(
+                    change,
+                    Some(SyncChange::Deploy { .. } | SyncChange::Overwrite { .. })
+                ),
+                "a clean-like mode transition must proceed as non-conflicting deploy work; only \
+                 Modified/Foreign destinations conflict (got {change:?})"
             );
         }
     }

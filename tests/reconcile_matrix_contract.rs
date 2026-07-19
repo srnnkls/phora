@@ -31,6 +31,7 @@ fn binding_of(source: &str, dest: &str) -> BindingProjection {
         identity: source.to_owned(),
         source: source.to_owned(),
         commit: COMMIT.to_owned(),
+        attribution: phora::projection::model::BindingAttribution::default(),
         artifacts: vec![projected(source, dest)],
         warnings: Vec::new(),
     }

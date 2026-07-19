@@ -5,9 +5,10 @@ use crate::error::Error;
 use crate::projection::collapse::{CollapseChoice, CollapseMode, CollapseWarning, plan_collapse};
 use crate::projection::diagnostic::{ProjectionError, ProjectionWarning, unsafe_leaf};
 use crate::projection::model::{
-    ArtifactRelativePath, BindingProjection, BindingProjectionInput, ContentTransform,
-    Materialization, MaterializationPolicy, OfferSpec, ProjectedArtifact, ProjectedLeaf,
-    Projection, TakeSpec, TargetPath, TargetProjection, TemplatePolicy, WorkspaceTargetInput,
+    ArtifactRelativePath, BindingAttribution, BindingProjection, BindingProjectionInput,
+    ContentTransform, Materialization, MaterializationPolicy, OfferSpec, ProjectedArtifact,
+    ProjectedLeaf, Projection, TakeSpec, TargetPath, TargetProjection, TemplatePolicy,
+    WorkspaceTargetInput,
 };
 use crate::projection::offer::OfferSelection;
 use crate::projection::take::{ResolvedTake, TakeWarning, fold_dest, resolve_take};
@@ -42,14 +43,16 @@ pub fn project_binding(
     let directives = input.take.directives();
     let resolution = resolve_take(&offer, directives.as_deref())
         .map_err(|error| classify_take_error(error, &offer, input.take))?;
+    let resolved_takes = resolution.kept;
+    let take_warnings = resolution.warnings;
 
     let mode = input.materialization.collapse_mode();
     let choice = input.collapse.choice();
     let plan =
-        plan_collapse(&resolution.kept, &physical_tree, mode, choice).map_err(collapse_blocked)?;
+        plan_collapse(&resolved_takes, &physical_tree, mode, choice).map_err(collapse_blocked)?;
     let materializations = reject_partial_take_collapse(
         plan.items,
-        &resolution.kept,
+        &resolved_takes,
         &offer,
         input.collapse.as_bool(),
     )
@@ -66,7 +69,7 @@ pub fn project_binding(
         let layout_path = input.layout.artifact_path(input.identity, &key);
         let dest = layout_path.to_string_lossy();
         let destination = TargetPath::new(&dest)?;
-        let kept_leaves = kept_leaves_under(&materialization, &resolution.kept);
+        let kept_leaves = kept_leaves_under(&materialization, &resolved_takes);
         let leaves = build_leaves(
             &materialization,
             &kept_leaves,
@@ -83,8 +86,7 @@ pub fn project_binding(
         });
     }
 
-    let mut warnings: Vec<ProjectionWarning> = resolution
-        .warnings
+    let mut warnings: Vec<ProjectionWarning> = take_warnings
         .into_iter()
         .map(|warning| {
             let TakeWarning::NoMatchGlob(pattern) = warning;
@@ -101,6 +103,12 @@ pub fn project_binding(
         identity: input.identity.to_owned(),
         source: input.source.name().to_owned(),
         commit: input.source.commit().to_owned(),
+        attribution: BindingAttribution {
+            offered_leaves: offer,
+            resolved_takes,
+            copy_template_suffix: input.materialization.is_copy()
+                && input.templates.strips_suffix(),
+        },
         artifacts,
         warnings,
     })

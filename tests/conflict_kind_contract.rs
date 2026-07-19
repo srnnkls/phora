@@ -34,6 +34,7 @@ fn projection_of(destination: &str) -> Projection {
                 identity: "company-configs".to_owned(),
                 source: "company-configs".to_owned(),
                 commit: "abc123def456".to_owned(),
+                attribution: phora::projection::model::BindingAttribution::default(),
                 artifacts: vec![artifact()],
                 warnings: Vec::new(),
             }],

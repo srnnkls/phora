@@ -91,10 +91,10 @@ fn observe_entry(
     Ok(absorb_mode_transition(observation, entry.mode_transition))
 }
 
-fn absorb_mode_transition(
-    observation: ObservedArtifact<RegistryRecord>,
+pub(super) fn absorb_mode_transition<R>(
+    observation: ObservedArtifact<R>,
     mode_transition: bool,
-) -> ObservedArtifact<RegistryRecord> {
+) -> ObservedArtifact<R> {
     match observation {
         ObservedArtifact::Managed(managed)
             if mode_transition

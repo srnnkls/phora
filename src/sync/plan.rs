@@ -3,9 +3,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::config::{Config, DeployMode, ParsedSource, TakeEntry, Target};
+use crate::config::{Config, DeployMode, ParsedSource, Target};
 use crate::error::{Error, Result};
-use crate::kernel::{SourceName, Take, is_take_glob};
+use crate::kernel::SourceName;
 use crate::lock::encode_ref;
 use crate::source::{SourceBackend, SourceInventory};
 
@@ -18,17 +18,6 @@ use crate::projection::model::{
     Projection, ResolvedSourceRef, TakeSpec, TargetProjection, TemplatePolicy,
     WorkspaceTargetInput,
 };
-
-pub(crate) fn map_take_entries(entries: &[TakeEntry]) -> Vec<Take<'_>> {
-    entries
-        .iter()
-        .map(|entry| match entry {
-            TakeEntry::Leaf(leaf) if is_take_glob(leaf) => Take::Glob(leaf),
-            TakeEntry::Leaf(leaf) => Take::Literal(leaf),
-            TakeEntry::Rename { src, dest } => Take::Rename { src, dest },
-        })
-        .collect()
-}
 
 /// Projects one target's deployments: registry-free and network-free, discovering each
 /// binding's candidate leaves via the source seam and projecting the leaf-granular
