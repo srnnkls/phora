@@ -446,6 +446,12 @@ pub struct ProjectedLeaf {
     pub transform: ContentTransform,
 }
 
+/// One target's name and its config-free per-binding inputs for the pure builder.
+pub struct WorkspaceTargetInput<'a> {
+    pub target: &'a str,
+    pub bindings: Vec<BindingProjectionInput<'a>>,
+}
+
 /// Config-free inputs the projection maps onto the kernel for one binding.
 pub struct BindingProjectionInput<'a> {
     pub identity: &'a str,
