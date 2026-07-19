@@ -157,7 +157,8 @@ fn scan(src: &str) -> String {
 }
 
 fn despace(s: &str) -> String {
-    s.chars().filter(|c| !c.is_whitespace()).collect()
+    let flat: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    flat.replace(",)", ")")
 }
 
 fn strip_comments(src: &str) -> String {

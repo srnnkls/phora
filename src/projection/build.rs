@@ -327,10 +327,9 @@ pub fn project_target(
 ///
 /// # Errors
 /// Errors if any target fails to project or two of its bindings collide on a destination.
-pub fn build_workspace(targets: &[WorkspaceTargetInput<'_>]) -> Result<Projection, ProjectionError>
-where
-    Projection: Sized,
-{
+pub fn build_workspace(
+    targets: &[WorkspaceTargetInput<'_>],
+) -> Result<Projection, ProjectionError> {
     let projected = targets
         .iter()
         .map(|workspace_target| project_target(workspace_target.target, &workspace_target.bindings))
