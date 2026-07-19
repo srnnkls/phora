@@ -2680,9 +2680,9 @@ fn second_deploy_over_correct_link_is_a_noop() {
         protected: &protected,
     };
     let entry_source = sn("editor-src");
-    let item = crate::sync::plan::ProjectedArtifact {
-        destination: crate::sync::TargetPath::new("editor").expect("valid dest"),
-        source: crate::sync::ResolvedSourceRef::new("editor-src", &fx.head_sha),
+    let item = crate::projection::model::ProjectedArtifact {
+        destination: crate::projection::model::TargetPath::new("editor").expect("valid dest"),
+        source: crate::projection::model::ResolvedSourceRef::new("editor-src", &fx.head_sha),
         materialization: crate::kernel::Materialization::CollapsedDir {
             dir: "editor".to_owned(),
         },

@@ -454,12 +454,12 @@ fn detect_dest_collisions(entries: &[PreviewEntry]) -> Vec<PreviewCollision> {
 #[cfg(test)]
 mod preview_warning_tests {
     use crate::config::{DeployMode, LayoutConfig, ParsedSource, Source, TakeEntry, TemplateOptIn};
-    use crate::source::SourceInventory;
-    use crate::sync::plan::{
+    use crate::projection::build::project_binding;
+    use crate::projection::model::{
         BindingProjection, BindingProjectionInput, CollapsePreference, LayoutSpec,
         MaterializationPolicy, OfferSpec, ResolvedSourceRef, TakeSpec, TemplatePolicy,
-        project_binding,
     };
+    use crate::source::SourceInventory;
 
     use super::{BindingWarnings, PreviewWarning, binding_warnings};
 

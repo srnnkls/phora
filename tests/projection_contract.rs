@@ -7,13 +7,14 @@ use std::path::Path;
 
 use phora::config::{Config, DeployMode, LayoutConfig, TakeEntry, TemplateOptIn};
 use phora::kernel::Materialization;
-use phora::source::{SourceEntryKind, SourceEntryMeta, SourceInventory, SourcePath};
-use phora::sync::{
+use phora::projection::build::{project_binding, project_target, projected_artifact_keys};
+use phora::projection::diagnostic::ProjectionError;
+use phora::projection::model::{
     ArtifactRelativePath, BindingProjection, BindingProjectionInput, CollapsePreference,
     ContentTransform, LayoutSpec, MaterializationPolicy, OfferSpec, ProjectedArtifact,
-    ProjectionError, ResolvedSourceRef, TakeSpec, TargetPath, TargetProjection, TemplatePolicy,
-    project_binding, project_target, projected_artifact_keys,
+    ResolvedSourceRef, TakeSpec, TargetPath, TargetProjection, TemplatePolicy,
 };
+use phora::source::{SourceEntryKind, SourceEntryMeta, SourceInventory, SourcePath};
 
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 

@@ -139,7 +139,7 @@ fn projected_target(inventory_paths: &[&str], root: Option<&str>) -> TargetProje
 fn adverse_artifact(dir: &str, leaves: &[(&str, &str, ContentTransform)]) -> ProjectedArtifact {
     let first = leaves.first().expect("at least one leaf");
     ProjectedArtifact {
-        destination: phora::sync::TargetPath::new(first.1).expect("valid dest"),
+        destination: phora::projection::model::TargetPath::new(first.1).expect("valid dest"),
         source: ResolvedSourceRef::new("fixture", "0123456789abcdef0123456789abcdef01234567"),
         materialization: phora::kernel::Materialization::CollapsedDir {
             dir: dir.to_owned(),
