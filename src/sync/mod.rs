@@ -22,13 +22,18 @@ mod verify;
 mod tests;
 
 pub use hooks::{HookOutcome, HookScope, HookStatus};
-pub use plan::{
-    ArtifactRelativePath, BindingProjection, BindingProjectionInput, CollapsePreference,
-    ContentTransform, LayoutSpec, LayoutStyle, MaterializationPolicy, OfferSpec, ProjectedArtifact,
-    ProjectedLeaf, Projection, ProjectionError, ProjectionWarning, ResolvedSourceRef, TakeSpec,
-    TargetPath, TargetProjection, TemplatePolicy, WorkspaceTargetInput, build_workspace,
-    plan_target, project_binding, project_target, project_workspace, projected_artifact_keys,
-};
+pub use plan::{plan_target, project_workspace};
+
+use crate::projection::build::projected_artifact_keys;
+use crate::projection::model::Projection;
+
+pub type ArtifactRelativePath = crate::projection::model::ArtifactRelativePath;
+pub type ContentTransform = crate::projection::model::ContentTransform;
+pub type ProjectedArtifact = crate::projection::model::ProjectedArtifact;
+pub type ProjectedLeaf = crate::projection::model::ProjectedLeaf;
+pub type ResolvedSourceRef = crate::projection::model::ResolvedSourceRef;
+pub type TargetPath = crate::projection::model::TargetPath;
+pub type TargetProjection = crate::projection::model::TargetProjection;
 pub(crate) use preview::offered_leaves;
 pub use preview::{
     BindingWarnings, PreviewCollision, PreviewEntry, PreviewFile, PreviewTargetPlan,
@@ -53,6 +58,7 @@ use {
     crate::config::LayoutKind,
     crate::deploy::check_artifact_state,
     crate::lock::LockedSource,
+    crate::projection::diagnostic::ProjectionWarning,
     target::{ArtifactEntry, deploy_artifact_entry},
 };
 

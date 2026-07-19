@@ -1070,8 +1070,8 @@ mod revalidated_treated_like_clean_tests {
 
     fn leaf_item() -> ProjectedArtifact {
         ProjectedArtifact {
-            destination: crate::sync::TargetPath::new("a.txt").expect("valid dest"),
-            source: crate::sync::ResolvedSourceRef::new("src", "0123"),
+            destination: crate::projection::model::TargetPath::new("a.txt").expect("valid dest"),
+            source: crate::projection::model::ResolvedSourceRef::new("src", "0123"),
             materialization: Materialization::Leaf(ResolvedTake {
                 source: "a.txt".to_owned(),
                 dest: "a.txt".to_owned(),
@@ -1188,8 +1188,8 @@ mod mode_transition_conflict_tests {
 
     fn leaf_item() -> ProjectedArtifact {
         ProjectedArtifact {
-            destination: crate::sync::TargetPath::new("a.txt").expect("valid dest"),
-            source: crate::sync::ResolvedSourceRef::new("src", "0123"),
+            destination: crate::projection::model::TargetPath::new("a.txt").expect("valid dest"),
+            source: crate::projection::model::ResolvedSourceRef::new("src", "0123"),
             materialization: Materialization::Leaf(ResolvedTake {
                 source: "a.txt".to_owned(),
                 dest: "a.txt".to_owned(),

@@ -12,18 +12,11 @@ use crate::source::{SourceBackend, SourceInventory};
 use super::discover::discover_working_tree_leaves;
 use super::remote_for;
 
-use crate::projection::model as projection_model;
-use crate::projection::{build as projection_build, diagnostic as projection_diagnostic};
-
-pub use projection_build::{
-    build_workspace, project_binding, project_target, projected_artifact_keys,
-};
-pub use projection_diagnostic::{ProjectionError, ProjectionWarning};
-pub use projection_model::{
-    ArtifactRelativePath, BindingProjection, BindingProjectionInput, CollapsePreference,
-    ContentTransform, LayoutSpec, LayoutStyle, MaterializationPolicy, OfferSpec, ProjectedArtifact,
-    ProjectedLeaf, Projection, ResolvedSourceRef, TakeSpec, TargetPath, TargetProjection,
-    TemplatePolicy, WorkspaceTargetInput,
+use crate::projection::build::{build_workspace, project_target};
+use crate::projection::model::{
+    BindingProjectionInput, CollapsePreference, LayoutSpec, MaterializationPolicy, OfferSpec,
+    Projection, ResolvedSourceRef, TakeSpec, TargetProjection, TemplatePolicy,
+    WorkspaceTargetInput,
 };
 
 pub(crate) fn map_take_entries(entries: &[TakeEntry]) -> Vec<Take<'_>> {
