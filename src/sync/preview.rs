@@ -13,12 +13,12 @@ use crate::source::{SourceBackend, SourceInventory};
 
 use super::discover::discover_working_tree_leaves;
 use super::remote_for;
-use crate::projection::build::project_binding;
+use crate::projection::build::build_workspace;
 use crate::projection::diagnostic::ProjectionWarning;
 use crate::projection::model::{
     BindingProjection, BindingProjectionInput, CollapsePreference, LayoutSpec,
     MaterializationPolicy, OfferSpec, ProjectedArtifact, ResolvedSourceRef, TakeSpec,
-    TemplatePolicy,
+    TemplatePolicy, WorkspaceTargetInput,
 };
 
 /// Whether a binding is renderable now or needs action before it can deploy.
@@ -170,6 +170,7 @@ fn preview_target(
         })?;
         let name = SourceName::trusted(binding.source);
         let ctx = BindingCtx {
+            target_name,
             remotes,
             backend,
             path: &path,
@@ -198,6 +199,7 @@ fn preview_target(
 }
 
 struct BindingCtx<'a> {
+    target_name: &'a str,
     remotes: &'a BTreeMap<String, String>,
     backend: &'a dyn SourceBackend,
     path: &'a Path,
@@ -334,7 +336,22 @@ fn resolve_plan(
         layout: &layout,
         templates: &templates,
     };
-    Ok(project_binding(&input)?)
+    project_single_binding(ctx.target_name, input)
+}
+
+fn project_single_binding(
+    target_name: &str,
+    input: BindingProjectionInput<'_>,
+) -> Result<BindingProjection> {
+    let workspace = [WorkspaceTargetInput {
+        target: target_name,
+        bindings: vec![input],
+    }];
+    build_workspace(&workspace)?
+        .targets
+        .pop()
+        .and_then(|mut target| target.bindings.pop())
+        .ok_or_else(|| Error::Sync("preview projection produced no binding".to_owned()))
 }
 
 fn push_item(

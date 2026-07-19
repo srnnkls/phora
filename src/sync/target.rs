@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::config::{DeployMode, LayoutConfig, ParsedSource, Target, TemplateOptIn};
-use crate::deploy::{ArtifactState, Journal, check_artifact_state, deploy_artifact, link_artifact};
+use crate::deploy::{Journal, deploy_artifact, link_artifact};
 use crate::error::{Error, Result};
 use crate::kernel::{Materialization, SourceName, safe_relpath};
 use crate::source::{ResolvedSource, SnapshotId, SourceBackend, SourcePath};
@@ -12,16 +12,23 @@ use crate::store::{
 };
 
 use super::confine::{ProtectedPathSet, confine_destination};
-use super::plan::plan_target;
 use super::stage::{StageRequest, stage_artifact};
 use super::{
-    Conflict, ConflictKind, ConflictResolver, Resolution, StageSource, StagingGuard, nonce,
-    remote_for, target_parent,
+    Conflict, ConflictResolver, Resolution, StageSource, StagingGuard, nonce, remote_for,
+    target_parent,
 };
 use crate::projection::diagnostic::ProjectionWarning;
 use crate::projection::model::{ProjectedArtifact, TargetProjection};
+use crate::sync::model::{ChangeSet, ConflictKind, ManagedCondition, ObservedArtifact, SyncChange};
+
+#[cfg(test)]
+use crate::deploy::{ArtifactState, check_artifact_state};
 
 #[derive(Clone, Copy)]
+#[expect(
+    dead_code,
+    reason = "commits/force/interactive/resolver feed the cfg(test) single-entry apply shim; the production observe/reconcile path reads state through SyncInput"
+)]
 pub(super) struct TargetRun<'a> {
     pub(super) parsed: &'a BTreeMap<String, ParsedSource>,
     pub(super) target_name: &'a str,
@@ -69,25 +76,85 @@ pub(super) fn decisions_abort(decisions: &ConflictDecisions) -> bool {
         .any(|outcome| matches!(outcome.resolution, Resolution::Abort))
 }
 
-fn walk_target(
+pub(super) type ChangeIndex<'a> = BTreeMap<(String, String, String), &'a SyncChange>;
+pub(super) type ObservationIndex<'a> =
+    BTreeMap<(String, String, String), &'a ObservedArtifact<RegistryRecord>>;
+
+pub(super) struct Reconciliation<'a> {
+    observed: ObservationIndex<'a>,
+    changes: ChangeIndex<'a>,
+    decisions: ConflictDecisions,
+}
+
+impl<'a> Reconciliation<'a> {
+    pub(super) fn new(
+        changeset: &'a ChangeSet,
+        observed: &'a super::model::ObservedProjectState<RegistryRecord>,
+        decisions: ConflictDecisions,
+    ) -> Self {
+        Self {
+            observed: observed
+                .artifacts
+                .iter()
+                .map(|entry| {
+                    (
+                        (
+                            entry.target.clone(),
+                            entry.source.clone(),
+                            entry.artifact.clone(),
+                        ),
+                        &entry.observation,
+                    )
+                })
+                .collect(),
+            changes: changeset
+                .changes
+                .iter()
+                .map(|change| (change_key(change), change))
+                .collect(),
+            decisions,
+        }
+    }
+}
+
+fn change_key(change: &SyncChange) -> (String, String, String) {
+    let (target, source, artifact) = match change {
+        SyncChange::Deploy {
+            target,
+            source,
+            artifact,
+        }
+        | SyncChange::Overwrite {
+            target,
+            source,
+            artifact,
+        }
+        | SyncChange::Conflict {
+            target,
+            source,
+            artifact,
+            ..
+        }
+        | SyncChange::Remove {
+            target,
+            source,
+            artifact,
+            ..
+        } => (target, source, artifact),
+    };
+    (target.clone(), source.clone(), artifact.clone())
+}
+
+pub(super) fn walk_projection_target(
     run: TargetRun<'_>,
-    backend: &dyn StageSource,
+    projection: &TargetProjection,
     registry: &dyn Registry,
     surface_warnings: bool,
-    mut visit: impl FnMut(&TargetRun<'_>, &ArtifactEntry<'_>, StageBridge<'_>) -> Result<bool>,
+    mut visit: impl FnMut(&TargetRun<'_>, &ArtifactEntry<'_>) -> Result<bool>,
 ) -> Result<bool> {
     let layout = run.target.layout();
     let ejected = registry.load_ejected(run.target_name)?;
     let mut had_failures = false;
-
-    let plan = plan_target(
-        run.target_name,
-        run.target,
-        run.parsed,
-        run.remotes,
-        backend,
-        run.commits,
-    )?;
 
     let template_opt_ins: BTreeMap<String, TemplateOptIn> = run
         .target
@@ -96,7 +163,7 @@ fn walk_target(
         .map(|b| (b.identity.to_owned(), b.template_opt_in))
         .collect();
 
-    for binding in &plan.bindings {
+    for binding in &projection.bindings {
         if surface_warnings {
             surface_projection_warnings(&binding.warnings);
         }
@@ -140,40 +207,222 @@ fn walk_target(
                 mode_transition,
                 template_opt_in,
             };
-            let bridge = StageBridge {
-                artifact: item,
-                target: &plan,
-            };
-            had_failures |= visit(&run, &entry, bridge)?;
+            had_failures |= visit(&run, &entry)?;
         }
     }
 
     Ok(had_failures)
 }
 
-pub(super) fn preflight_target(
-    run: TargetRun<'_>,
-    backend: &dyn StageSource,
-    registry: &dyn Registry,
-    decisions: &mut ConflictDecisions,
-) -> Result<()> {
-    walk_target(run, backend, registry, false, |run, entry, _bridge| {
-        preflight_entry(run, entry, backend, registry, decisions)?;
-        Ok(false)
-    })?;
-    Ok(())
+pub(super) fn resolve_conflicts(
+    changeset: &ChangeSet,
+    resolver: Option<&dyn ConflictResolver>,
+    interactive: bool,
+) -> Result<ConflictDecisions> {
+    let mut decisions = ConflictDecisions::new();
+    for change in &changeset.changes {
+        let SyncChange::Conflict {
+            target,
+            source,
+            artifact,
+            kind,
+        } = change
+        else {
+            continue;
+        };
+        let (resolution, warn) = match resolver {
+            Some(resolver) if interactive => (
+                resolver.resolve(&Conflict {
+                    target: target.clone(),
+                    source: source.clone(),
+                    artifact: artifact.clone(),
+                    kind: kind.clone(),
+                }),
+                false,
+            ),
+            _ => (Resolution::Skip, true),
+        };
+        decisions.insert(
+            (target.clone(), source.clone(), artifact.clone()),
+            ConflictOutcome {
+                resolution,
+                kind: kind.clone(),
+                warn,
+            },
+        );
+    }
+    if decisions_abort(&decisions) {
+        return Err(Error::Aborted);
+    }
+    Ok(decisions)
 }
 
-pub(super) fn deploy_target(
+pub(super) fn deploy_reconciled_target(
     run: TargetRun<'_>,
+    projection: &TargetProjection,
+    reconciliation: &Reconciliation<'_>,
     backend: &dyn StageSource,
     registry: &dyn Registry,
     journal: &Journal,
-    decisions: &ConflictDecisions,
 ) -> Result<bool> {
-    walk_target(run, backend, registry, true, |run, entry, bridge| {
-        apply_entry(run, entry, bridge, backend, registry, journal, decisions)
+    walk_projection_target(run, projection, registry, true, |run, entry| {
+        apply_reconciled(
+            run,
+            entry,
+            projection,
+            reconciliation,
+            backend,
+            registry,
+            journal,
+        )
     })
+}
+
+fn apply_reconciled(
+    run: &TargetRun<'_>,
+    entry: &ArtifactEntry<'_>,
+    projection: &TargetProjection,
+    reconciliation: &Reconciliation<'_>,
+    backend: &dyn StageSource,
+    registry: &dyn Registry,
+    journal: &Journal,
+) -> Result<bool> {
+    let published_key = entry.published_key().to_owned();
+    let triplet = conflict_triplet(run, entry);
+    let key = ArtifactKey {
+        target: run.target_name.to_owned(),
+        source: entry.identity.to_owned(),
+        artifact: published_key.clone(),
+    };
+    let change = reconciliation.changes.get(&triplet).copied();
+    let writes = matches!(
+        change,
+        Some(
+            SyncChange::Deploy { .. } | SyncChange::Overwrite { .. } | SyncChange::Conflict { .. }
+        )
+    );
+    if journal.refuses_writes() && writes {
+        return Err(journal.readonly_error());
+    }
+
+    let deploy_root = run.target.deploy_root();
+    let deploy = |key: ArtifactKey| match entry.source.deploy_mode() {
+        DeployMode::Link => deploy_link(registry, journal, entry, key, deploy_root.clone()),
+        DeployMode::Copy => deploy_one(
+            backend,
+            registry,
+            journal,
+            DeployContext {
+                deploy_root: deploy_root.clone(),
+                layout: entry.layout.clone(),
+                source: entry.source,
+                git: entry.git,
+                source_name: entry.source_name,
+                underlying_source: entry.underlying_source,
+                root: entry.source.offer().root(),
+                commit: entry.commit,
+                artifact: entry.item,
+                target: projection,
+                kind: entry.record_kind(),
+                artifact_dst: entry.artifact_dst,
+                key,
+                template_opt_in: entry.template_opt_in,
+                vars: run.vars,
+                confine_anchor: run.target.confine.as_deref(),
+            },
+        ),
+    };
+
+    match change {
+        Some(SyncChange::Deploy { .. } | SyncChange::Overwrite { .. }) => {
+            Ok(run_deploy(deploy, key, entry.identity, &published_key))
+        }
+        Some(SyncChange::Conflict { .. }) => match reconciliation.decisions.get(&triplet) {
+            Some(outcome) => {
+                if outcome.warn {
+                    warn_skip(
+                        entry.identity,
+                        &published_key,
+                        &outcome.kind,
+                        entry.artifact_dst,
+                    );
+                }
+                apply_resolution(
+                    outcome.resolution,
+                    deploy,
+                    key,
+                    run,
+                    entry,
+                    &published_key,
+                    registry,
+                )
+            }
+            None => Err(Error::Sync(format!(
+                "unresolved conflict for {}:{published_key} in target {} reached apply without a \
+                 preflight decision",
+                entry.identity, run.target_name
+            ))),
+        },
+        Some(SyncChange::Remove { .. }) | None => {
+            persist_metadata_refresh(&reconciliation.observed, &triplet, registry, &key)?;
+            Ok(false)
+        }
+    }
+}
+
+fn run_deploy(
+    deploy: impl FnOnce(ArtifactKey) -> Result<()>,
+    key: ArtifactKey,
+    identity: &str,
+    published_key: &str,
+) -> bool {
+    match deploy(key) {
+        Ok(()) => false,
+        Err(e) => {
+            eprintln!("phora: failed to deploy {identity}:{published_key}: {e}");
+            true
+        }
+    }
+}
+
+fn apply_resolution(
+    resolution: Resolution,
+    deploy: impl FnOnce(ArtifactKey) -> Result<()>,
+    key: ArtifactKey,
+    run: &TargetRun<'_>,
+    entry: &ArtifactEntry<'_>,
+    published_key: &str,
+    registry: &dyn Registry,
+) -> Result<bool> {
+    match resolution {
+        Resolution::Skip => Ok(false),
+        Resolution::Overwrite => Ok(run_deploy(deploy, key, entry.identity, published_key)),
+        Resolution::Eject => {
+            let mut ejected = registry.load_ejected(run.target_name)?;
+            ejected.push(EjectedEntry {
+                source: entry.identity.to_owned(),
+                artifact: published_key.to_owned(),
+                ejected_at: chrono::Utc::now().to_rfc3339(),
+            });
+            registry.save_ejected(run.target_name, &ejected)?;
+            Ok(false)
+        }
+        Resolution::Abort => Err(Error::Aborted),
+    }
+}
+
+fn persist_metadata_refresh(
+    observed: &ObservationIndex<'_>,
+    triplet: &(String, String, String),
+    registry: &dyn Registry,
+    key: &ArtifactKey,
+) -> Result<()> {
+    if let Some(ObservedArtifact::Managed(managed)) = observed.get(triplet).copied()
+        && let ManagedCondition::MetadataChangedButContentClean { refreshed } = &managed.condition
+    {
+        persist_revalidated_refresh(registry, key, refreshed)?;
+    }
+    Ok(())
 }
 
 fn surface_projection_warnings(warnings: &[ProjectionWarning]) {
@@ -267,13 +516,17 @@ pub(super) fn deploy_artifact_entry(
         artifacts: Vec::new(),
         warnings: Vec::new(),
     };
-    let bridge = StageBridge {
-        artifact: entry.item,
-        target: &projection,
-    };
     let mut decisions = ConflictDecisions::new();
     preflight_entry(&run, entry, backend, registry, &mut decisions)?;
-    apply_entry(&run, entry, bridge, backend, registry, journal, &decisions)
+    apply_entry(
+        &run,
+        entry,
+        &projection,
+        backend,
+        registry,
+        journal,
+        &decisions,
+    )
 }
 
 fn conflict_triplet(run: &TargetRun<'_>, entry: &ArtifactEntry<'_>) -> (String, String, String) {
@@ -284,6 +537,7 @@ fn conflict_triplet(run: &TargetRun<'_>, entry: &ArtifactEntry<'_>) -> (String, 
     )
 }
 
+#[cfg(test)]
 fn preflight_entry(
     run: &TargetRun<'_>,
     entry: &ArtifactEntry<'_>,
@@ -334,10 +588,11 @@ fn preflight_entry(
     Ok(())
 }
 
+#[cfg(test)]
 fn apply_entry(
     run: &TargetRun<'_>,
     entry: &ArtifactEntry<'_>,
-    bridge: StageBridge<'_>,
+    target: &TargetProjection,
     backend: &dyn StageSource,
     registry: &dyn Registry,
     journal: &Journal,
@@ -389,7 +644,8 @@ fn apply_entry(
                 underlying_source: entry.underlying_source,
                 root: entry.source.offer().root(),
                 commit: entry.commit,
-                bridge,
+                artifact: entry.item,
+                target,
                 kind: entry.record_kind(),
                 artifact_dst,
                 key,
@@ -449,7 +705,7 @@ fn apply_entry(
 
 /// `check_artifact_state` compares this only when `record.vars_digest.is_some()`; that lets a
 /// non-templated record skip the git-tree walk here and still resolve Clean (INV-8).
-fn expected_vars_digest(
+pub(super) fn expected_vars_digest(
     entry: &ArtifactEntry<'_>,
     backend: &dyn SourceBackend,
     registry: &dyn Registry,
@@ -503,6 +759,7 @@ fn persist_revalidated_refresh(
     Ok(())
 }
 
+#[cfg(test)]
 fn skips_redeploy(state: &ArtifactState) -> bool {
     matches!(
         state,
@@ -513,6 +770,7 @@ fn skips_redeploy(state: &ArtifactState) -> bool {
     )
 }
 
+#[cfg(test)]
 fn conflict_kind_for(
     state: &ArtifactState,
     entry: &ArtifactEntry<'_>,
@@ -553,11 +811,6 @@ fn warn_skip(source: &str, artifact: &str, kind: &ConflictKind, dst: &Path) {
     }
 }
 
-pub struct StageBridge<'a> {
-    pub artifact: &'a ProjectedArtifact,
-    pub target: &'a TargetProjection,
-}
-
 struct DeployContext<'a> {
     deploy_root: String,
     layout: LayoutConfig,
@@ -567,7 +820,8 @@ struct DeployContext<'a> {
     underlying_source: &'a str,
     root: Option<&'a Path>,
     commit: &'a str,
-    bridge: StageBridge<'a>,
+    artifact: &'a ProjectedArtifact,
+    target: &'a TargetProjection,
     kind: RecordKind,
     artifact_dst: &'a Path,
     key: ArtifactKey,
@@ -590,7 +844,7 @@ fn deploy_one(
     let commit_time = backend.commit_time(ctx.source_name, ctx.git, ctx.commit)?;
     let policy = ctx.source.export_policy();
 
-    let staging_payload = match &ctx.bridge.artifact.materialization {
+    let staging_payload = match &ctx.artifact.materialization {
         Materialization::CollapsedDir { .. } => staging.clone(),
         Materialization::Leaf(take) => staging.join(leaf_basename(&take.dest)),
     };
@@ -604,8 +858,8 @@ fn deploy_one(
     };
     let staged = stage_artifact(
         &StageRequest {
-            artifact: ctx.bridge.artifact,
-            target: ctx.bridge.target,
+            artifact: ctx.artifact,
+            target: ctx.target,
             variables: ctx.vars,
         },
         ctx.root,

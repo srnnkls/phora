@@ -5,6 +5,7 @@ pub(crate) mod discover;
 pub(crate) mod hooks;
 pub mod inspect;
 pub mod model;
+mod observe;
 mod plan;
 mod preview;
 mod prune;
@@ -26,14 +27,8 @@ pub use plan::{plan_target, project_workspace};
 
 use crate::projection::build::projected_artifact_keys;
 use crate::projection::model::Projection;
+use crate::sync::model::ReconciliationPolicy;
 
-pub type ArtifactRelativePath = crate::projection::model::ArtifactRelativePath;
-pub type ContentTransform = crate::projection::model::ContentTransform;
-pub type ProjectedArtifact = crate::projection::model::ProjectedArtifact;
-pub type ProjectedLeaf = crate::projection::model::ProjectedLeaf;
-pub type ResolvedSourceRef = crate::projection::model::ResolvedSourceRef;
-pub type TargetPath = crate::projection::model::TargetPath;
-pub type TargetProjection = crate::projection::model::TargetProjection;
 pub(crate) use preview::offered_leaves;
 pub use preview::{
     BindingWarnings, PreviewCollision, PreviewEntry, PreviewFile, PreviewTargetPlan,
@@ -45,13 +40,14 @@ pub use verify::{UntrustedHookFinding, VerifyMismatch, VerifyReason, VerifyRepor
 #[cfg(feature = "bench")]
 pub use resolve::resolve_sources_for_bench;
 
+#[cfg(test)]
 use prune::prune_orphans;
+use prune::prune_projected;
 pub(crate) use prune::{orphan_artifact_path, orphan_records};
 use resolve::resolve_sources;
 pub use stage::{StageRequest, StagedArtifact, StagedFile, stage_artifact};
-pub use target::StageBridge;
 pub(crate) use target::record_artifact_path;
-use target::{ConflictDecisions, TargetRun, decisions_abort, deploy_target, preflight_target};
+use target::{Reconciliation, TargetRun, deploy_reconciled_target, resolve_conflicts};
 
 #[cfg(test)]
 use {
@@ -321,22 +317,6 @@ fn target_run<'a>(
     }
 }
 
-fn preflight_all_targets(ctx: &DeployAll<'_>) -> Result<ConflictDecisions> {
-    let mut decisions = ConflictDecisions::new();
-    for (target_name, target) in &ctx.config.targets {
-        preflight_target(
-            target_run(ctx, target_name, target),
-            ctx.backend,
-            ctx.registry,
-            &mut decisions,
-        )?;
-    }
-    if decisions_abort(&decisions) {
-        return Err(Error::Aborted);
-    }
-    Ok(decisions)
-}
-
 fn deploy_all_targets(ctx: &DeployAll<'_>) -> Result<DeployRun> {
     let projection = project_workspace(
         ctx.config,
@@ -346,7 +326,17 @@ fn deploy_all_targets(ctx: &DeployAll<'_>) -> Result<DeployRun> {
         ctx.resolved_commits,
     )?;
     reject_cross_target_overlap(&projection, ctx.config)?;
-    let decisions = preflight_all_targets(ctx)?;
+    let observed = observe::observe_workspace(ctx, &projection)?;
+    let policy = ReconciliationPolicy {
+        force: ctx.input.force,
+        prune: false,
+        follow_moved_pin: false,
+    };
+    let changeset = reconcile::reconcile(&projection, &observed, &policy)
+        .map_err(|e| Error::Sync(e.to_string()))?;
+    let decisions = resolve_conflicts(&changeset, ctx.input.resolver, ctx.input.interactive)?;
+    let reconciliation = Reconciliation::new(&changeset, &observed, decisions);
+
     let mut run = DeployRun {
         had_failures: false,
         pre_deploy: Vec::new(),
@@ -377,12 +367,20 @@ fn deploy_all_targets(ctx: &DeployAll<'_>) -> Result<DeployRun> {
                 }
             }
         }
-        run.had_failures |= deploy_target(
+        let Some(target_projection) = projection
+            .targets
+            .iter()
+            .find(|tp| &tp.target == target_name)
+        else {
+            continue;
+        };
+        run.had_failures |= deploy_reconciled_target(
             target_run(ctx, target_name, target),
+            target_projection,
+            &reconciliation,
             ctx.backend,
             ctx.registry,
             ctx.journal,
-            &decisions,
         )?;
     }
     Ok(run)
@@ -462,15 +460,14 @@ fn maybe_prune(ctx: &DeployAll<'_>, had_failures: bool) -> Result<()> {
         eprintln!("phora: skipping --prune because some artifacts failed to deploy");
         return Ok(());
     }
-    prune_orphans(
+    let projection = project_workspace(
         ctx.config,
         ctx.parsed,
         ctx.remotes,
         ctx.backend,
-        ctx.registry,
         ctx.resolved_commits,
-        ctx.protected,
-    )
+    )?;
+    prune_projected(&projection, ctx.config, ctx.registry, ctx.protected)
 }
 
 fn sweep_target_parents(config: &Config, journal: &Journal, registry: &dyn Registry) -> Result<()> {
@@ -898,8 +895,8 @@ fn prune_fast_forward_drops(
     if registry.refuses_writes() {
         return Err(registry.readonly_error().into());
     }
-    let expected_paths =
-        prune::expected_live_paths(config, parsed, remotes, backend, resolved_commits)?;
+    let projection = project_workspace(config, parsed, remotes, backend, resolved_commits)?;
+    let expected_paths = prune::expected_live_paths(&projection, config);
     for record in drops {
         let Some(target) = config.targets.get(&record.key.target) else {
             continue;

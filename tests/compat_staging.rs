@@ -25,14 +25,15 @@ use std::time::UNIX_EPOCH;
 
 use phora::config::TemplateOptIn;
 use phora::kernel::{Materialization, SourceName};
+use phora::projection::model::{
+    ArtifactRelativePath, ContentTransform, ProjectedArtifact, ProjectedLeaf, ResolvedSourceRef,
+    TargetPath, TargetProjection,
+};
 use phora::source::{
     ExportPolicy, GitBackend, ResolvedSource, SnapshotId, SourceBackend as _, SourceError,
     SourcePath, SourceStore,
 };
-use phora::sync::{
-    ArtifactRelativePath, ContentTransform, ProjectedArtifact, ProjectedLeaf, ResolvedSourceRef,
-    StageRequest, StagedArtifact, TargetPath, TargetProjection, stage_artifact,
-};
+use phora::sync::{StageRequest, StagedArtifact, stage_artifact};
 use tempfile::TempDir;
 
 mod common;
