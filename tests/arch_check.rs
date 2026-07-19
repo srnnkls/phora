@@ -550,9 +550,14 @@ fn allowlist_is_exactly_the_phase_scoped_legacy_set() {
 #[test]
 fn legacy_deploy_exemption_does_not_generalize_to_a_new_file() {
     let tree = base_tree();
-    tree.copy_real_src("src/deploy.rs", "src/deploy_leak.rs");
+    tree.copy_real_src("src/sync/apply.rs", "src/deploy.rs");
     tree.check()
-        .assert_fail("a new non-exempt module performing deploy.rs's target-side I/O");
+        .assert_pass("the moved apply payload at the exact allowlisted src/deploy.rs path");
+
+    tree.copy_real_src("src/sync/apply.rs", "src/deploy_leak.rs");
+    tree.check().assert_fail(
+        "the identical moved apply payload at neighboring non-exempt src/deploy_leak.rs",
+    );
 }
 
 #[test]

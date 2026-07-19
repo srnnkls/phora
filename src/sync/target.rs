@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::config::{DeployMode, LayoutConfig, ParsedSource, Target, TemplateOptIn};
-use crate::deploy::{Journal, deploy_artifact, link_artifact};
 use crate::error::{Error, Result};
 use crate::kernel::{Materialization, SourceName, safe_relpath};
 use crate::source::{ResolvedSource, SnapshotId, SourceBackend, SourcePath};
@@ -11,7 +10,9 @@ use crate::store::{
     ScannedFile,
 };
 
+use super::apply::{deploy_artifact, link_artifact};
 use super::confine::{ProtectedPathSet, confine_destination};
+use super::journal::Journal;
 use super::stage::{StageRequest, stage_artifact};
 use super::{
     Conflict, ConflictResolver, Resolution, StageSource, StagingGuard, nonce, remote_for,
