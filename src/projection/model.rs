@@ -246,6 +246,10 @@ impl TemplatePolicy {
         }
         path.to_owned()
     }
+
+    pub(super) fn strips_suffix(&self) -> bool {
+        self.renders("leaf.tmpl") && self.deployed_name("leaf.tmpl") == "leaf"
+    }
 }
 
 /// How a binding materializes its artifacts: a link symlink or a subtree copy.
@@ -421,8 +425,21 @@ pub struct BindingProjection {
     pub identity: String,
     pub source: String,
     pub commit: String,
+    pub attribution: BindingAttribution,
     pub artifacts: Vec<ProjectedArtifact>,
     pub warnings: Vec<ProjectionWarning>,
+}
+
+/// Exact current offer and take attribution captured while projecting one binding.
+///
+/// This stays projection-owned and config-free so later sync phases can use the
+/// current projection without re-reading inventory or reconstructing selection. It
+/// cannot invert arbitrary historical configuration changes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BindingAttribution {
+    pub offered_leaves: Vec<String>,
+    pub resolved_takes: Vec<ResolvedTake>,
+    pub copy_template_suffix: bool,
 }
 
 /// A single projected deployment unit and its target-relative destination.

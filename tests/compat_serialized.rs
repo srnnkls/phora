@@ -1167,6 +1167,50 @@ fn preview_json_artifact_commit_pairs(json: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+type ArtifactIdentity = (String, String, String);
+
+fn preview_json_artifact_identities(json: &str) -> BTreeSet<ArtifactIdentity> {
+    let document: serde_json::Value = serde_json::from_str(json).expect("preview json parses");
+    document["targets"]
+        .as_array()
+        .expect("preview json has targets")
+        .iter()
+        .flat_map(|target| {
+            let target_name = target["target"]
+                .as_str()
+                .expect("preview target has a name")
+                .to_owned();
+            target["entries"]
+                .as_array()
+                .expect("preview target has entries")
+                .iter()
+                .filter(|entry| entry["state"].as_str() == Some("Synced"))
+                .map(move |entry| {
+                    (
+                        target_name.clone(),
+                        entry["identity"]
+                            .as_str()
+                            .expect("synced preview entry has an identity")
+                            .to_owned(),
+                        entry["artifact"]
+                            .as_str()
+                            .expect("synced preview entry has an artifact")
+                            .to_owned(),
+                    )
+                })
+        })
+        .collect()
+}
+
+fn registry_artifact_identities(registry: &FileRegistry) -> BTreeSet<ArtifactIdentity> {
+    registry
+        .list_all()
+        .expect("registry records are readable")
+        .into_iter()
+        .map(|record| (record.key.target, record.key.source, record.key.artifact))
+        .collect()
+}
+
 fn golden_tree_commit_dest_pairs() -> Vec<(String, String)> {
     read_golden("projection_tree.golden")
         .lines()
@@ -1272,6 +1316,72 @@ fn destinations_of(projection: &TargetProjection) -> Vec<String> {
         .collect()
 }
 
+fn seed_projection_identity_axis_controls(fx: &Fixture, registry: &FileRegistry) {
+    let canonical = registry
+        .list_all()
+        .expect("read seeded managed record")
+        .pop()
+        .expect("the fixture sync manages one record");
+
+    let divergent_binding_path = fx.target_path.join("control-alias").join("nested/init.lua");
+    let divergent_artifact_path = fx
+        .target_path
+        .join("editor-alias")
+        .join("nested/control.lua");
+    assert!(
+        !divergent_binding_path.exists() && !divergent_artifact_path.exists(),
+        "CONTROL: the same-target divergent records must resolve to absent paths so prune can \
+         remove their records without touching the live expected artifact"
+    );
+
+    let mut divergent_target = canonical.clone();
+    "control-target".clone_into(&mut divergent_target.key.target);
+    divergent_target.deploy_root = None;
+    registry
+        .put(&divergent_target)
+        .expect("seed target-only divergence");
+    let mut divergent_binding = canonical.clone();
+    "control-alias".clone_into(&mut divergent_binding.key.source);
+    registry
+        .put(&divergent_binding)
+        .expect("seed same-target binding-identity divergence");
+    let mut divergent_artifact = canonical;
+    "nested/control.lua".clone_into(&mut divergent_artifact.key.artifact);
+    registry
+        .put(&divergent_artifact)
+        .expect("seed same-target published-key divergence");
+    let seeded: BTreeSet<ArtifactIdentity> = [
+        (
+            "home".to_owned(),
+            "editor-alias".to_owned(),
+            "nested/init.lua".to_owned(),
+        ),
+        (
+            "control-target".to_owned(),
+            "editor-alias".to_owned(),
+            "nested/init.lua".to_owned(),
+        ),
+        (
+            "home".to_owned(),
+            "control-alias".to_owned(),
+            "nested/init.lua".to_owned(),
+        ),
+        (
+            "home".to_owned(),
+            "editor-alias".to_owned(),
+            "nested/control.lua".to_owned(),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        registry_artifact_identities(registry),
+        seeded,
+        "CONTROL: the registry fixture must contain the canonical record plus records diverging \
+         independently in target, binding identity, and published_key"
+    );
+}
+
 #[test]
 fn moved_projection_output_equals_projection_tree_and_artifact_identity_goldens() {
     let fx = build_fixture();
@@ -1358,50 +1468,98 @@ fn moved_projection_output_equals_projection_tree_and_artifact_identity_goldens(
 #[test]
 fn preview_sync_and_prune_share_one_projected_artifact_identity_set() {
     let fx = build_fixture();
-    fx.write_config(&git_source_config(&fx));
+    let config = format!(
+        "version = 1\n\n\
+         [sources.dotfiles]\npath = \"{}\"\nbranch = \"main\"\n\
+         include = [\"editor/init.lua\"]\n\n\
+         [targets.home]\npath = \"{}\"\n\
+         sources = {{ editor-alias = {{ source = \"dotfiles\", \
+         take = [{{ \"editor/init.lua\" = \"nested/init.lua\" }}] }} }}\n\
+         layout = \"by-source\"\n",
+        fx.src_path.display(),
+        fx.target_path.display(),
+    );
+    fx.write_config(&config);
     assert_success(&fx.run(&["sync"]), "sync");
     let out = fx.run(&["preview", "--json"]);
     assert_success(&out, "preview --json");
 
-    let previewed: BTreeSet<String> =
-        preview_json_artifact_commit_pairs(&String::from_utf8_lossy(&out.stdout))
-            .into_iter()
-            .map(|(artifact, _)| artifact)
-            .collect();
-
-    let artifacts_dir = fx.registry_dir().join("targets/home/artifacts/dotfiles");
-    let synced: BTreeSet<String> = std::fs::read_dir(&artifacts_dir)
-        .expect("sync recorded artifact records")
-        .map(|entry| {
-            entry
-                .expect("dir entry")
-                .path()
-                .file_stem()
-                .expect("record file stem")
-                .to_string_lossy()
-                .into_owned()
-        })
-        .collect();
-
-    let projection = moved_path_projection(&fx, None);
-    let prune_protected: BTreeSet<String> = projection
-        .bindings
-        .iter()
-        .flat_map(phora::projection::build::projected_artifact_keys)
-        .collect();
-
-    let expected: BTreeSet<String> = ["editor", "lint"].map(str::to_owned).into_iter().collect();
+    let previewed = preview_json_artifact_identities(&String::from_utf8_lossy(&out.stdout));
+    let registry = FileRegistry::open(fx.registry_dir()).expect("open live project registry");
+    let synced = registry_artifact_identities(&registry);
+    let expected: BTreeSet<ArtifactIdentity> = [(
+        "home".to_owned(),
+        "editor-alias".to_owned(),
+        "nested/init.lua".to_owned(),
+    )]
+    .into_iter()
+    .collect();
     assert_eq!(
         previewed, expected,
-        "preview derives the projected artifact identities"
+        "preview must expose the canonical (target, binding identity, published_key) triplet; \
+         neither underlying source `dotfiles` nor physical destination \
+         `editor-alias/nested/init.lua` is an identity axis"
     );
     assert_eq!(
         synced, expected,
-        "sync manages the projected artifact identities"
+        "sync must manage exactly the triplets preview exposes"
     );
+    seed_projection_identity_axis_controls(&fx, &registry);
+
+    let prune = fx.run(&["sync", "--prune"]);
+    assert_success(&prune, "sync --prune");
+    let prune_protected = registry_artifact_identities(&registry);
     assert_eq!(
         prune_protected, expected,
-        "the keys prune protects are the moved projection's projected_artifact_keys"
+        "an actual prune run must protect exactly preview's/sync's canonical triplets and remove \
+         controls whose target, binding identity, or published_key diverges"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn link_source_is_projected_once_across_deploy_and_prune() {
+    let fx = build_fixture();
+    let move_editor = format!(
+        "mv '{}' '{}'",
+        fx.src_path.join("editor").display(),
+        fx.src_path.join("editor-after-first-projection").display(),
+    );
+    let config = format!(
+        "version = 1\n\n\
+         [sources.dotfiles]\npath = \"{}\"\nbranch = \"main\"\n\
+         deploy = \"link\"\ninclude = [\"editor\", \"lint\"]\n\n\
+         [targets.home]\npath = \"{}\"\n\
+         sources = {{ linked-alias = {{ source = \"dotfiles\" }} }}\n\
+         layout = \"by-source\"\n\n\
+         [targets.home.hooks]\npre_deploy = \"{}\"\n",
+        fx.src_path.display(),
+        fx.target_path.display(),
+        move_editor.replace('"', "\\\""),
+    );
+    fx.write_config(&config);
+
+    let out = fx.run(&["sync", "--prune"]);
+    assert_success(&out, "link sync --prune");
+
+    let registry = FileRegistry::open(fx.registry_dir()).expect("open live project registry");
+    let actual = registry_artifact_identities(&registry);
+    let expected: BTreeSet<ArtifactIdentity> = ["editor", "lint"]
+        .map(|artifact| {
+            (
+                "home".to_owned(),
+                "linked-alias".to_owned(),
+                artifact.to_owned(),
+            )
+        })
+        .into_iter()
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "one Projection must be threaded from the inventory read through observe/reconcile/apply \
+         and prune. The pre_deploy hook moves `editor` after projection: a second phase-local \
+         projection sees a different link inventory and wrongly prunes the already-managed \
+         `editor` key (the link-mode TOCTOU window)"
     );
 }
 

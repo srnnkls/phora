@@ -74,6 +74,24 @@ fn rev_parse(cwd: &Path, rev: &str) -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
+fn git_show_path(cwd: &Path, commit: &str, path: &str) -> Option<Vec<u8>> {
+    let _serial = crate::store::guard_git_fork();
+    let spec = format!("{commit}:{path}");
+    let output = Command::new("git")
+        .args(["show", spec.as_str()])
+        .current_dir(cwd)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("run git show for fixture premise");
+    if output.status.success() {
+        Some(output.stdout)
+    } else {
+        None
+    }
+}
+
 struct SyncFixture {
     src: TempDir,
     _git_dir: TempDir,
@@ -285,6 +303,34 @@ impl SourceStore for CountingBackend<'_> {
         self.reads.fetch_add(1, AtomicOrdering::SeqCst);
         self.inner.read(source, path)
     }
+}
+
+#[test]
+fn sync_reads_one_projection_inventory_across_drop_deploy_and_prune() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_source_one_target(
+        "editor-src",
+        &fx.url,
+        "dest",
+        &td.target_path(),
+        "by-source",
+    );
+    let counting = CountingBackend::new(&fx.backend);
+    let mut request = input(&cfg, None, None, None, false);
+    request.fast_forward = true;
+    request.prune = true;
+
+    sync(&request, &counting, &fx.registry)
+        .expect("a fresh fast-forward + prune sync must succeed");
+
+    assert_eq!(
+        counting.discover_count(),
+        1,
+        "the source inventory must be read exactly once to build one Projection, then that value \
+         must be threaded through fast-forward/drop guarding, deploy/observe/reconcile/apply, and \
+         prune. A second inventory read reopens the phase-local TOCTOU window"
+    );
 }
 
 // ── config helpers (target-less so Phase 2/3 are no-ops) ───────
@@ -2821,15 +2867,36 @@ fn sync_modified_artifact_persists_no_refresh_for_touched_identical_sibling() {
 
 /// H1: without `Linked` in the `matches!` guard at the deploy closure, Linked falls to
 /// `None => Overwrite` and re-deploys every sync; this pins the no-op.
+fn assert_linked_artifact_state(dst: &Path, registry: &FileRegistry) {
+    let state = check_artifact_state(
+        dst,
+        "editor-src",
+        "link",
+        &[],
+        "editor",
+        registry,
+        &artifact_key("dest", "editor-src", "editor"),
+        None,
+    )
+    .expect("check_artifact_state on the linked dst");
+    assert!(
+        matches!(state, ArtifactState::Linked),
+        "premise: a deployed symlink with a linked record must read Linked, got {state:?}"
+    );
+}
+
 #[test]
 fn second_deploy_over_correct_link_is_a_noop() {
     use std::os::unix::fs::symlink;
     let fx = build_sync_fixture();
     let td = TargetDir::new();
-    let cfg =
-        config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+    let cfg = config_link_source_one_target_with_layout(
+        "editor-src",
+        fx.src.path(),
+        &td.target_path(),
+        "flat",
+    );
     let target = cfg.targets.get("dest").expect("dest target present");
-    let source = parsed_of(&cfg, "editor-src");
 
     let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
     std::fs::create_dir_all(dst.parent().expect("dst parent")).expect("mkdir dst parent");
@@ -2842,65 +2909,59 @@ fn second_deploy_over_correct_link_is_a_noop() {
     let journal = Journal::open(&fx.registry.locks_dir()).expect("open journal");
     let parsed = cfg.parsed_sources().expect("sources parse");
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+    let commits = one_commit(&parsed, "editor-src", "link");
+    let projection = project_workspace(&cfg, &parsed, &remotes, &counting, &commits)
+        .expect("projection builds from the live link inventory");
+    let target_projection = projection
+        .targets
+        .iter()
+        .find(|projected| projected.target == "dest")
+        .expect("projection contains dest");
     let protected = test_protected(fx.src.path());
+    assert_linked_artifact_state(&dst, &fx.registry);
+
+    let si = input(&cfg, None, None, None, false);
+    let ctx = DeployAll {
+        config: &cfg,
+        parsed: &parsed,
+        remotes: &remotes,
+        projection: &projection,
+        protected: &protected,
+        input: &si,
+        backend: &counting,
+        registry: &fx.registry,
+        journal: &journal,
+    };
+    let observed = super::observe::observe_workspace(&ctx, &projection)
+        .expect("live observation pass succeeds");
+    let changeset = reconcile::reconcile(
+        &projection,
+        &observed,
+        &ReconciliationPolicy {
+            force: false,
+            prune: false,
+            follow_moved_pin: false,
+        },
+    )
+    .expect("live reconcile pass succeeds");
+    let reconciliation = Reconciliation::new(&changeset, &observed, BTreeMap::new());
     let run = TargetRun {
         parsed: &parsed,
         target_name: "dest",
         target,
         remotes: &remotes,
-        force: false,
-        interactive: false,
-        resolver: None,
         vars: &BTreeMap::new(),
         protected: &protected,
     };
-    let entry_source = sn("editor-src");
-    let item = crate::projection::model::ProjectedArtifact {
-        destination: crate::projection::model::TargetPath::new("editor").expect("valid dest"),
-        source: crate::projection::model::ResolvedSourceRef::new("editor-src", &fx.head_sha),
-        materialization: crate::kernel::Materialization::CollapsedDir {
-            dir: "editor".to_owned(),
-        },
-        kept_leaves: Vec::new(),
-        leaves: Vec::new(),
-    };
-    let entry = ArtifactEntry {
-        source: &source,
-        git: remotes
-            .get("editor-src")
-            .expect("resolved_remotes covers every source"),
-        source_name: &entry_source,
-        identity: "editor-src",
-        underlying_source: "editor-src",
-        commit: &fx.head_sha,
-        item: &item,
-        artifact_dst: &dst,
-        layout: crate::config::LayoutConfig {
-            kind: crate::config::LayoutKind::Flat,
-            separator: String::new(),
-        },
-        ejected: &[],
-        mode_transition: false,
-        template_opt_in: &crate::config::TemplateOptIn::SuffixOnly,
-    };
-    let state = check_artifact_state(
-        &dst,
-        "editor-src",
-        &fx.head_sha,
-        &[],
-        "editor",
+    let had_failures = deploy_reconciled_target(
+        run,
+        target_projection,
+        &reconciliation,
+        &counting,
         &fx.registry,
-        &artifact_key("dest", "editor-src", "editor"),
-        None,
+        &journal,
     )
-    .expect("check_artifact_state on the linked dst");
-    assert!(
-        matches!(state, ArtifactState::Linked),
-        "premise: a deployed symlink with a linked record must read Linked, got {state:?}"
-    );
-
-    let had_failures = deploy_artifact_entry(run, &entry, &counting, &fx.registry, &journal)
-        .expect("deploy pass over a linked artifact must not error");
+    .expect("deploy pass over a linked artifact must not error");
 
     assert!(!had_failures, "a no-op linked pass is not a failure");
     assert_eq!(
@@ -3146,18 +3207,15 @@ fn frozen_lockless_fast_forward_with_pending_drops_refuses_before_pruning() {
         deploy_root: None,
         layout_separator: None,
     }];
+    let projection = Projection {
+        targets: Vec::new(),
+        warnings: Vec::new(),
+    };
 
-    let err = prune_fast_forward_drops(
-        &cfg,
-        &BTreeMap::new(),
-        &BTreeMap::new(),
-        &fx.backend,
-        &BTreeMap::new(),
-        &readonly,
-        &protected,
-        &drops,
-    )
-    .expect_err("a read-only fast-forward carrying pending drops must refuse before any delete");
+    let err = prune_fast_forward_drops(&projection, &cfg, &readonly, &protected, &drops)
+        .expect_err(
+            "a read-only fast-forward carrying pending drops must refuse before any delete",
+        );
 
     let msg = err.to_string();
     assert!(
@@ -5424,10 +5482,19 @@ fn worktree_scan_missing_root_errors() {
 /// Cross-site invariant (review C2): a Link source must be discovered from
 /// DISK in `rebuild_registry`, never via the backend's `list_source_leaves` seam.
 fn config_link_source_one_target(source: &str, link_git: &Path, target_path: &Path) -> Config {
+    config_link_source_one_target_with_layout(source, link_git, target_path, "by-source")
+}
+
+fn config_link_source_one_target_with_layout(
+    source: &str,
+    link_git: &Path,
+    target_path: &Path,
+    layout: &str,
+) -> Config {
     let toml = format!(
         "version = 1\n\n\
              [sources.{source}]\ngit = \"{}\"\nbranch = \"main\"\ndeploy = \"link\"\n\n\
-             [targets.dest]\npath = \"{}\"\nsources = [\"{source}\"]\nlayout = \"by-source\"\n",
+             [targets.dest]\npath = \"{}\"\nsources = [\"{source}\"]\nlayout = \"{layout}\"\n",
         link_git.display(),
         target_path.display(),
     );
@@ -5646,7 +5713,7 @@ fn rebuild_keeps_linked_and_excludes_symlink_from_foreign() {
     );
 }
 
-/// Guard: `prune_orphans` removes a stale linked symlink by unlinking the symlink
+/// Guard: projected prune removes a stale linked symlink by unlinking the symlink
 /// ONLY — it must never follow the link to `remove_dir_all` the target. Asserts the
 /// symlink target (the working-tree dir + a file inside) survives the prune.
 #[cfg(unix)]
@@ -5701,16 +5768,10 @@ fn prune_removes_stale_linked_symlink_without_following_it() {
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
 
     let protected = test_protected(&std::env::temp_dir());
-    prune_orphans(
-        &cfg,
-        &parsed,
-        &remotes,
-        &fx_backend(),
-        &registry,
-        &commits,
-        &protected,
-    )
-    .expect("prune must remove the orphaned linked artifact");
+    let projection = project_workspace(&cfg, &parsed, &remotes, &fx_backend(), &commits)
+        .expect("projection builds");
+    prune_projected(&projection, &cfg, &registry, &protected)
+        .expect("prune must remove the orphaned linked artifact");
 
     assert!(
         std::fs::symlink_metadata(&dst).is_err(),
@@ -5787,16 +5848,9 @@ fn prune_drops_a_stale_dir_record_once_the_plan_flips_leaf_granular() {
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
     let protected = test_protected(&std::env::temp_dir());
 
-    prune_orphans(
-        &cfg,
-        &parsed,
-        &remotes,
-        &fx_backend(),
-        &registry,
-        &commits,
-        &protected,
-    )
-    .expect("prune runs");
+    let projection = project_workspace(&cfg, &parsed, &remotes, &fx_backend(), &commits)
+        .expect("projection builds");
+    prune_projected(&projection, &cfg, &registry, &protected).expect("prune runs");
 
     assert!(
         std::fs::symlink_metadata(&dir_dst).is_ok(),
@@ -5866,7 +5920,7 @@ fn dir_record(target: &str, identity: &str, key: &str) -> RegistryRecord {
     record
 }
 
-/// `prune_orphans` over a single-source-one-target config keyed `ed`.
+/// Projected prune over a single-source-one-target config keyed `ed`.
 fn prune_one(
     cfg: &Config,
     backend: &GitBackend,
@@ -5877,9 +5931,8 @@ fn prune_one(
     let remotes = resolved_remotes(cfg, &parsed).expect("remotes resolve");
     let commits = one_commit(&parsed, "ed", commit);
     let protected = test_protected(&std::env::temp_dir());
-    prune_orphans(
-        cfg, &parsed, &remotes, backend, registry, &commits, &protected,
-    )
+    let projection = project_workspace(cfg, &parsed, &remotes, backend, &commits)?;
+    prune_projected(&projection, cfg, registry, &protected)
 }
 
 #[test]
@@ -11999,47 +12052,6 @@ fn fast_forward_deletes_an_artifact_the_new_commit_dropped() {
 }
 
 #[test]
-fn fast_forward_still_seals_a_same_commit_narrowing() {
-    let src = TempDir::new().expect("src tempdir");
-    let (url, sha) = init_editorless_source(src.path());
-
-    let git_dir = TempDir::new().expect("git dir");
-    let state_dir = TempDir::new().expect("state dir");
-    let backend = GitBackend::new(git_dir.path().to_path_buf());
-    let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
-
-    let td = TargetDir::new();
-    let toml = format!(
-        "version = 1\n\n\
-         [sources.editor-src]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
-         [targets.dest]\npath = \"{}\"\nsources = [\"editor-src\"]\nlayout = \"flat\"\n",
-        td.target_path().display(),
-    );
-    let cfg = Config::parse(&toml).expect("default-offer config parses");
-
-    seed_recorded_artifact_at(&registry, "editor-src", "editor", &sha);
-
-    let in_ = SyncInput {
-        fast_forward: true,
-        ..input(&cfg, None, None, None, false)
-    };
-    let Err(err) = sync(&in_, &backend, &registry) else {
-        panic!(
-            "the pin did not move (recorded commit == resolved commit): the drop can only be a \
-             silent narrowing, so fast-forward must NOT relax the sealed-offer guard"
-        );
-    };
-    let msg = err.to_string();
-    assert_sealed_offer_diagnostic(&msg, "dest", "editor-src", "editor");
-    assert!(
-        !msg.contains("--fast-forward"),
-        "the pin did not move, so `--fast-forward` cannot help here; suggesting it would misdirect \
-         — the remedy must stay restore-or-eject; got:\n{msg}"
-    );
-    drop(src);
-}
-
-#[test]
 fn ref_transition_lines_reports_only_moved_pins() {
     let toml = "version = 1\n\n\
          [sources.dotfiles]\ngit = \"https://example.test/repo.git\"\nbranch = \"main\"\n\n\
@@ -12080,19 +12092,40 @@ fn ref_transition_lines_reports_only_moved_pins() {
     );
 }
 
+fn build_moved_recovery_source(p: &Path) -> (String, String, String) {
+    run_git(p, &["init", "-b", "main", "."]);
+    run_git(p, &["config", "user.email", "test@example.com"]);
+    run_git(p, &["config", "user.name", "Test"]);
+    std::fs::create_dir_all(p.join("editor")).expect("mkdir editor");
+    std::fs::write(p.join("editor/init.lua"), b"-- init\n").expect("write editor source");
+    run_git(p, &["add", "-A"]);
+    run_git(p, &["commit", "-m", "initial with editor"]);
+    let c0 = rev_parse(p, "HEAD");
+    assert_eq!(
+        git_show_path(p, &c0, "editor/init.lua"),
+        Some(b"-- init\n".to_vec()),
+        "premise: C0 contains the exact source bytes represented by the recovered record"
+    );
+
+    std::fs::remove_dir_all(p.join("editor")).expect("remove editor at C1");
+    std::fs::create_dir_all(p.join("docs")).expect("mkdir docs");
+    std::fs::write(p.join("docs/readme.md"), b"# docs\n").expect("write docs");
+    run_git(p, &["add", "-A"]);
+    run_git(p, &["commit", "-m", "drop editor"]);
+    let c1 = rev_parse(p, "HEAD");
+    assert_ne!(c0, c1, "premise: the source pin moves from C0 to C1");
+    assert!(
+        git_show_path(p, &c1, "editor/init.lua").is_none(),
+        "premise: C1 no longer contains editor/init.lua"
+    );
+    (p.to_string_lossy().into_owned(), c0, c1)
+}
+
 #[test]
 fn sealed_offer_validates_crash_recovered_record_finalized_by_the_sweep() {
     let src = TempDir::new().expect("src tempdir");
     let p = src.path();
-    run_git(p, &["init", "-b", "main", "."]);
-    run_git(p, &["config", "user.email", "test@example.com"]);
-    run_git(p, &["config", "user.name", "Test"]);
-    std::fs::create_dir_all(p.join("docs")).expect("mkdir docs");
-    std::fs::write(p.join("docs/readme.md"), b"# docs\n").expect("write docs");
-    run_git(p, &["add", "-A"]);
-    run_git(p, &["commit", "-m", "init without editor/"]);
-    let url = p.to_string_lossy().into_owned();
-    let head_sha = rev_parse(p, "HEAD");
+    let (url, c0, c1) = build_moved_recovery_source(p);
 
     let git_dir = TempDir::new().expect("git dir");
     let state_dir = TempDir::new().expect("state dir");
@@ -12117,7 +12150,7 @@ fn sealed_offer_validates_crash_recovered_record_finalized_by_the_sweep() {
         version: 1,
         key: crashed_key.clone(),
         source: "editor-src".to_owned(),
-        commit: head_sha.clone(),
+        commit: c0.clone(),
         digest: "blake3:recovered".to_owned(),
         projected_at: "2026-01-01T00:00:00Z".to_owned(),
         layout: "flat".to_owned(),
@@ -12143,8 +12176,8 @@ fn sealed_offer_validates_crash_recovered_record_finalized_by_the_sweep() {
         .append(&JournalEntry {
             staging_base,
             staging,
-            dst: crashed_dst,
-            record,
+            dst: crashed_dst.clone(),
+            record: record.clone(),
             swap_completed: true,
         })
         .expect("seed swap-completed crash intent");
@@ -12152,6 +12185,13 @@ fn sealed_offer_validates_crash_recovered_record_finalized_by_the_sweep() {
     assert!(
         registry.get(&crashed_key).expect("pre-sync get").is_none(),
         "premise: the crashed `editor` record exists only once recovery_sweep finalizes it"
+    );
+    assert!(
+        registry
+            .list_target("dest")
+            .expect("pre-sync target listing")
+            .is_empty(),
+        "premise: the target registry is exactly empty before recovery_sweep"
     );
 
     let in_ = input(&cfg, None, None, None, false);
@@ -12161,7 +12201,27 @@ fn sealed_offer_validates_crash_recovered_record_finalized_by_the_sweep() {
              sealed-offer snapshot is taken AFTER recovery_sweep, not before"
         );
     };
-    assert_sealed_offer_diagnostic(&err.to_string(), "dest", "editor-src", "editor");
+    let rendered = err.to_string();
+    assert_sealed_offer_diagnostic(&rendered, "dest", "editor-src", "editor");
+    assert!(
+        rendered.contains(&c0[..8]) && rendered.contains(&c1[..8]),
+        "the recovery diagnostic must show the moved C0 -> C1 pin: {rendered}"
+    );
+    assert!(
+        rendered.contains("--fast-forward"),
+        "the recovered copy record is from an older immutable commit, so fast-forward may follow \
+         the moved pin: {rendered}"
+    );
+    assert_eq!(
+        registry.get(&crashed_key).expect("post-sync get"),
+        Some(record),
+        "the sealed sync must preserve the exact record finalized by recovery_sweep"
+    );
+    assert_eq!(
+        std::fs::read(crashed_dst.join("init.lua")).expect("read recovered destination"),
+        b"-- init\n",
+        "the sealed sync must preserve the crash-completed destination bytes"
+    );
     drop(src);
 }
 
@@ -12218,6 +12278,827 @@ mod leaf_granular_deploy_tests {
 
     fn records(reg: &FileRegistry, target: &str) -> Vec<RegistryRecord> {
         reg.list_target(target).expect("list_target must not error")
+    }
+
+    fn copy_shape_config(url: &str, target_path: &Path, take: Option<&str>) -> Config {
+        let sources = take.map_or_else(
+            || "sources = [\"ed\"]".to_owned(),
+            |take| format!("sources = {{ ed = {{ source = \"ed\", take = [{take}] }} }}"),
+        );
+        let toml = format!(
+            "version = 1\n\n\
+             [sources.ed]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+             [targets.dest]\npath = \"{}\"\n{sources}\nlayout = \"by-source\"\n",
+            target_path.display(),
+        );
+        Config::parse(&toml).expect("copy shape-transition config parses")
+    }
+
+    fn pruning_sync(config: &Config) -> SyncInput<'_> {
+        SyncInput {
+            prune: true,
+            ..input(config, None, None, None, false)
+        }
+    }
+
+    fn record_keys(registry: &FileRegistry) -> BTreeSet<String> {
+        records(registry, "dest")
+            .into_iter()
+            .map(|record| record.key.artifact)
+            .collect()
+    }
+
+    fn build_single_leaf_repo(relative: &str, contents: &[u8]) -> (TempDir, String, String) {
+        let src = TempDir::new().expect("source tempdir");
+        run_git(src.path(), &["init", "-b", "main", "."]);
+        run_git(src.path(), &["config", "user.email", "test@example.com"]);
+        run_git(src.path(), &["config", "user.name", "Test"]);
+        let source_path = src.path().join(relative);
+        std::fs::create_dir_all(source_path.parent().expect("source leaf has a parent"))
+            .expect("create source parent");
+        std::fs::write(&source_path, contents).expect("write source leaf");
+        run_git(src.path(), &["add", "-A"]);
+        run_git(src.path(), &["commit", "-m", "initial"]);
+        let commit = rev_parse(src.path(), "HEAD");
+        let url = src.path().to_string_lossy().into_owned();
+        (src, url, commit)
+    }
+
+    #[derive(Clone, Copy)]
+    enum PlainOffer {
+        All,
+        TemplatesOnly,
+    }
+
+    fn plain_copy_config(url: &str, target_path: &Path, offer: PlainOffer) -> Config {
+        let include = match offer {
+            PlainOffer::All => "",
+            PlainOffer::TemplatesOnly => "include = [\"*.tmpl\"]\n",
+        };
+        let toml = format!(
+            "version = 1\n\n\
+             [sources.ed]\ngit = \"{url}\"\nbranch = \"main\"\n{include}\n\
+             [targets.dest]\npath = \"{}\"\n\
+             sources = {{ ed = {{ source = \"ed\", collapse = false }} }}\n\
+             layout = \"by-source\"\n",
+            target_path.display(),
+        );
+        Config::parse(&toml).expect("plain copy config parses")
+    }
+
+    #[derive(Clone, Copy)]
+    enum RenameTake<'a> {
+        Destination(&'a str),
+        ExcludeAll,
+    }
+
+    fn rename_transition_config(url: &str, target_path: &Path, take: RenameTake<'_>) -> Config {
+        let take = match take {
+            RenameTake::Destination(destination) => {
+                format!("take = [{{ \"docs/readme.md\" = \"{destination}\" }}]")
+            }
+            RenameTake::ExcludeAll => "take = []".to_owned(),
+        };
+        let toml = format!(
+            "version = 1\n\n\
+             [sources.ed]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+             [targets.dest]\npath = \"{}\"\n\
+             sources = {{ ed = {{ source = \"ed\", {take} }} }}\n\
+             layout = \"by-source\"\n",
+            target_path.display(),
+        );
+        Config::parse(&toml).expect("rename transition config parses")
+    }
+
+    fn assert_historical_old_rename(
+        registry: &FileRegistry,
+        target_path: &Path,
+    ) -> (ArtifactKey, PathBuf) {
+        assert_eq!(
+            record_keys(registry),
+            BTreeSet::from(["old.md".to_owned()]),
+            "premise: the first run records exactly the historical rename destination"
+        );
+        let key = artifact_key("dest", "ed", "old.md");
+        assert!(
+            registry.get(&key).expect("registry read").is_some(),
+            "premise: the historical old.md registry record exists"
+        );
+        let path = target_path.join(by_source().artifact_path("ed", "old.md"));
+        assert_eq!(
+            std::fs::read(&path).expect("read historical old.md"),
+            b"# docs\n",
+            "premise: old.md contains the renamed source bytes"
+        );
+        (key, path)
+    }
+
+    #[test]
+    fn sync_prune_offer_narrowing_does_not_invent_template_history_for_plain_record() {
+        let (src, url, commit) = build_single_leaf_repo("plain.txt", b"plain bytes\n");
+        let td = TargetDir::new();
+        let (_git, _state, backend, registry) = fresh_backend_registry();
+        let initial = plain_copy_config(&url, &td.target_path(), PlainOffer::All);
+
+        let first = sync(
+            &input(&initial, None, None, None, false),
+            &backend,
+            &registry,
+        )
+        .expect("first sync deploys the ordinary plain leaf");
+        let key = artifact_key("dest", "ed", "plain.txt");
+        let record = registry
+            .get(&key)
+            .expect("registry read")
+            .expect("plain record exists after first sync");
+        assert!(
+            record.vars_digest.is_none(),
+            "premise: plain.txt has no historical template evidence"
+        );
+        assert_eq!(
+            first.base_lock.find_source("ed").expect("ed lock").commit,
+            commit,
+            "the first run records the unchanged source commit"
+        );
+        let deployed = td
+            .target_path()
+            .join(by_source().artifact_path("ed", "plain.txt"));
+        assert_eq!(
+            std::fs::read(&deployed).expect("read plain deploy"),
+            b"plain bytes\n"
+        );
+
+        let narrowed = plain_copy_config(&url, &td.target_path(), PlainOffer::TemplatesOnly);
+        let request = SyncInput {
+            base_lock: Some(first.base_lock.clone()),
+            prune: true,
+            ..input(&narrowed, None, None, None, false)
+        };
+        sync(&request, &backend, &registry).expect(
+            "config-only narrowing to *.tmpl must prune the non-template plain record, not invent \
+             a historical plain.txt.tmpl source and false-seal",
+        );
+
+        assert_eq!(
+            rev_parse(src.path(), "HEAD"),
+            commit,
+            "the source commit never moved"
+        );
+        assert!(registry.get(&key).expect("registry read").is_none());
+        assert!(
+            record_keys(&registry).is_empty(),
+            "the narrowed offer desires no artifacts, so the target registry must be exactly empty"
+        );
+        assert!(
+            !deployed.exists(),
+            "the intentionally excluded plain path is pruned"
+        );
+        let fabricated = td
+            .target_path()
+            .join(by_source().artifact_path("ed", "plain.txt.tmpl"));
+        assert!(
+            !fabricated.exists(),
+            "offer narrowing must not fabricate a plain.txt.tmpl replacement deployment"
+        );
+    }
+
+    #[test]
+    fn sync_prune_rename_destination_change_uses_historical_source_provenance() {
+        let (src, url, commit) = build_single_leaf_repo("docs/readme.md", b"# docs\n");
+        let td = TargetDir::new();
+        let (_git, _state, backend, registry) = fresh_backend_registry();
+        let initial =
+            rename_transition_config(&url, &td.target_path(), RenameTake::Destination("old.md"));
+        let first = sync(
+            &input(&initial, None, None, None, false),
+            &backend,
+            &registry,
+        )
+        .expect("first sync deploys old.md through a rename");
+        let (old_key, old_path) = assert_historical_old_rename(&registry, &td.target_path());
+        assert_eq!(
+            first.base_lock.find_source("ed").expect("ed lock").commit,
+            commit
+        );
+
+        let changed =
+            rename_transition_config(&url, &td.target_path(), RenameTake::Destination("new.md"));
+        let request = SyncInput {
+            base_lock: Some(first.base_lock.clone()),
+            prune: true,
+            ..input(&changed, None, None, None, false)
+        };
+        let second = sync(&request, &backend, &registry).expect(
+            "changing only a rename destination at one source commit must converge without a \
+             sealed-offer error",
+        );
+        assert_eq!(
+            second.base_lock.find_source("ed").expect("ed lock").commit,
+            commit
+        );
+        assert_eq!(
+            rev_parse(src.path(), "HEAD"),
+            commit,
+            "the source commit never moved"
+        );
+
+        let new_key = artifact_key("dest", "ed", "new.md");
+        assert!(registry.get(&old_key).expect("registry read").is_none());
+        assert!(registry.get(&new_key).expect("registry read").is_some());
+        assert_eq!(
+            record_keys(&registry),
+            BTreeSet::from(["new.md".to_owned()]),
+            "the rename transition must converge on exactly the new registry key"
+        );
+        let new_path = td
+            .target_path()
+            .join(by_source().artifact_path("ed", "new.md"));
+        assert!(!old_path.exists(), "the old rename destination is pruned");
+        assert_eq!(
+            std::fs::read(new_path).expect("read new rename"),
+            b"# docs\n"
+        );
+    }
+
+    #[test]
+    fn sync_prune_removed_rename_take_uses_historical_source_provenance() {
+        let (src, url, commit) = build_single_leaf_repo("docs/readme.md", b"# docs\n");
+        let td = TargetDir::new();
+        let (_git, _state, backend, registry) = fresh_backend_registry();
+        let initial =
+            rename_transition_config(&url, &td.target_path(), RenameTake::Destination("old.md"));
+        let first = sync(
+            &input(&initial, None, None, None, false),
+            &backend,
+            &registry,
+        )
+        .expect("first sync deploys old.md through a rename");
+        let (old_key, old_path) = assert_historical_old_rename(&registry, &td.target_path());
+        assert_eq!(
+            first.base_lock.find_source("ed").expect("ed lock").commit,
+            commit
+        );
+
+        let removed = rename_transition_config(&url, &td.target_path(), RenameTake::ExcludeAll);
+        let request = SyncInput {
+            base_lock: Some(first.base_lock.clone()),
+            prune: true,
+            ..input(&removed, None, None, None, false)
+        };
+        let second = sync(&request, &backend, &registry).expect(
+            "removing a renamed take at one source commit must prune the old destination without \
+             a sealed-offer error",
+        );
+        assert_eq!(
+            second.base_lock.find_source("ed").expect("ed lock").commit,
+            commit
+        );
+        assert_eq!(
+            rev_parse(src.path(), "HEAD"),
+            commit,
+            "the source commit never moved"
+        );
+
+        assert!(registry.get(&old_key).expect("registry read").is_none());
+        assert!(
+            !old_path.exists(),
+            "the removed rename destination is pruned"
+        );
+        assert!(
+            record_keys(&registry).is_empty(),
+            "no replacement artifact is desired"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_rejects_backslash_manifest_child_without_reinterpreting_nested_path() {
+        let (src, url) = build_two_leaf_dir_repo();
+        let td = TargetDir::new();
+        let (_git, _state, backend, registry) = fresh_backend_registry();
+        let config = copy_shape_config(&url, &td.target_path(), Some("\"editor/a.md\""));
+        let artifact_root = td
+            .target_path()
+            .join(by_source().artifact_path("ed", "editor"));
+        let literal_backslash = artifact_root.join("a\\b");
+        let nested_slash = artifact_root.join("a/b");
+        std::fs::create_dir_all(nested_slash.parent().expect("nested path has parent"))
+            .expect("create distinct nested control parent");
+        std::fs::write(&literal_backslash, b"literal backslash\n")
+            .expect("write literal-backslash sibling");
+        std::fs::write(&nested_slash, b"nested slash\n").expect("write nested slash control");
+
+        let stale_key = artifact_key("dest", "ed", "editor");
+        let mut stale = dir_record("dest", "ed", "editor");
+        stale.files = vec![ManifestFile {
+            path: PathBuf::from("a\\b"),
+            size: 18,
+            mtime: 1_700_000_000,
+            blake3: "blake3:stale".to_owned(),
+        }];
+        registry
+            .put(&stale)
+            .expect("seed non-portable historical manifest record");
+
+        let outcome = sync(&pruning_sync(&config), &backend, &registry);
+        assert!(
+            literal_backslash.exists(),
+            "fail-closed prune must leave the literal-backslash path untouched"
+        );
+        assert!(
+            nested_slash.exists(),
+            "a persisted `a\\b` must never be reinterpreted as `a/b` and delete the distinct \
+             nested control path"
+        );
+        assert!(
+            registry.get(&stale_key).expect("registry read").is_some(),
+            "invalid historical manifest data must retain its stale record"
+        );
+        if let Err(error) = outcome {
+            let rendered = error.to_string().to_lowercase();
+            assert!(
+                rendered.contains("manifest")
+                    && (rendered.contains("backslash")
+                        || rendered.contains("portable")
+                        || rendered.contains("relative")),
+                "a fail-closed rejection must explain the invalid persisted manifest path: {error}"
+            );
+        }
+        drop(src);
+    }
+
+    #[test]
+    fn sync_prune_transitions_collapsed_copy_to_per_leaf_without_sealing() {
+        let (src, url) = build_two_leaf_dir_repo();
+        let td = TargetDir::new();
+        let (_g, _s, backend, registry) = fresh_backend_registry();
+        let collapsed = copy_shape_config(&url, &td.target_path(), None);
+
+        sync(
+            &input(&collapsed, None, None, None, false),
+            &backend,
+            &registry,
+        )
+        .expect("first sync must deploy the collapsed directory");
+        assert_eq!(
+            record_keys(&registry),
+            BTreeSet::from(["editor".to_owned()]),
+            "premise: the first sync must record one collapsed `editor` directory"
+        );
+
+        let per_leaf = copy_shape_config(&url, &td.target_path(), Some("\"editor/a.md\""));
+        let out = sync(&pruning_sync(&per_leaf), &backend, &registry).expect(
+            "changing only the take shape from collapsed to per-leaf must be a normal projection \
+             transition, not a sealed-offer violation",
+        );
+
+        assert!(
+            !out.had_failures,
+            "the shape transition must converge cleanly"
+        );
+        assert_eq!(
+            record_keys(&registry),
+            BTreeSet::from(["editor/a.md".to_owned()]),
+            "sync --prune must replace the stale collapsed record with the desired leaf record"
+        );
+        let leaf = td
+            .target_path()
+            .join(by_source().artifact_path("ed", "editor/a.md"));
+        assert_eq!(
+            std::fs::read(&leaf).expect("the desired leaf must survive the transition"),
+            b"alpha\n"
+        );
+        let editor_dir = leaf
+            .parent()
+            .expect("the desired leaf has an editor parent");
+        for absent in ["b.md", "plug/x.md", "plug/y.md"] {
+            let path = editor_dir.join(absent);
+            assert!(
+                std::fs::symlink_metadata(&path).is_err(),
+                "collapsed→per-leaf prune must remove the unselected path `{absent}`; found {}",
+                path.display()
+            );
+        }
+        drop(src);
+    }
+
+    #[test]
+    fn sync_prune_transitions_per_leaf_copy_to_collapsed_without_sealing() {
+        let (src, url) = build_two_leaf_dir_repo();
+        let td = TargetDir::new();
+        let (_g, _s, backend, registry) = fresh_backend_registry();
+        let per_leaf = copy_shape_config(&url, &td.target_path(), Some("\"editor/a.md\""));
+
+        sync(
+            &input(&per_leaf, None, None, None, false),
+            &backend,
+            &registry,
+        )
+        .expect("first sync must deploy one leaf");
+        assert_eq!(
+            record_keys(&registry),
+            BTreeSet::from(["editor/a.md".to_owned()]),
+            "premise: the first sync must record the narrow per-leaf projection"
+        );
+
+        let collapsed = copy_shape_config(&url, &td.target_path(), None);
+        let out = sync(&pruning_sync(&collapsed), &backend, &registry).expect(
+            "widening only the take shape from per-leaf to collapsed must be a normal projection \
+             transition, not a sealed-offer violation",
+        );
+
+        assert!(
+            !out.had_failures,
+            "the shape transition must converge cleanly"
+        );
+        assert_eq!(
+            record_keys(&registry),
+            BTreeSet::from(["editor".to_owned()]),
+            "sync --prune must replace the stale leaf record with the collapsed directory record"
+        );
+        let dir = td
+            .target_path()
+            .join(by_source().artifact_path("ed", "editor"));
+        for (relative, expected) in [
+            ("a.md", b"alpha\n".as_slice()),
+            ("b.md", b"beta\n".as_slice()),
+            ("plug/x.md", b"ex\n".as_slice()),
+            ("plug/y.md", b"why\n".as_slice()),
+        ] {
+            assert_eq!(
+                std::fs::read(dir.join(relative))
+                    .unwrap_or_else(|error| panic!("read collapsed `{relative}`: {error}")),
+                expected,
+                "per-leaf→collapsed sync must deploy exact source bytes for `{relative}`"
+            );
+        }
+        drop(src);
+    }
+
+    #[cfg(unix)]
+    fn assert_exact_link(path: &Path, source_target: &Path) {
+        let metadata = std::fs::symlink_metadata(path).expect("deployed link must exist");
+        assert!(
+            metadata.file_type().is_symlink(),
+            "the deployed path must remain a symlink"
+        );
+        assert_eq!(
+            std::fs::read_link(path).expect("read deployed link target"),
+            source_target,
+            "the deployed link must keep pointing at its original live source target"
+        );
+    }
+
+    #[cfg(unix)]
+    fn assert_only_target_record(registry: &FileRegistry, expected: &RegistryRecord) {
+        assert_eq!(
+            records(registry, "dest"),
+            vec![expected.clone()],
+            "the target registry must contain exactly the captured editor record"
+        );
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug)]
+    enum RealGitLinkSelection {
+        ImplicitOfferWithTargetGlob,
+        LeafSpecificSourceOffer,
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug)]
+    enum LinkDropPolicy {
+        Ordinary,
+        FastForward,
+    }
+
+    #[cfg(unix)]
+    struct RealGitLinkDropFixture {
+        source: TempDir,
+        _target: TargetDir,
+        _git_dir: TempDir,
+        _state_dir: TempDir,
+        backend: GitBackend,
+        registry: FileRegistry,
+        config: Config,
+        first_lock: Lock,
+        record: RegistryRecord,
+        destination: PathBuf,
+        source_target: PathBuf,
+        head: String,
+    }
+
+    #[cfg(unix)]
+    impl RealGitLinkDropFixture {
+        fn new(selection: RealGitLinkSelection) -> Self {
+            let source = TempDir::new().expect("real Git link source");
+            run_git(source.path(), &["init", "-b", "main", "."]);
+            run_git(source.path(), &["config", "user.email", "test@example.com"]);
+            run_git(source.path(), &["config", "user.name", "Test"]);
+            std::fs::create_dir_all(source.path().join("editor")).expect("mkdir editor");
+            std::fs::write(source.path().join("editor/a.md"), b"alpha\n")
+                .expect("write link source leaf");
+            run_git(source.path(), &["add", "-A"]);
+            run_git(source.path(), &["commit", "-m", "initial"]);
+            let head = rev_parse(source.path(), "HEAD");
+
+            let target = TargetDir::new();
+            let (source_offer, target_sources) = match selection {
+                RealGitLinkSelection::ImplicitOfferWithTargetGlob => (
+                    "",
+                    "sources = { ed = { source = \"ed\", take = [\"editor/*.md\"] } }",
+                ),
+                RealGitLinkSelection::LeafSpecificSourceOffer => {
+                    ("include = [\"editor/*.md\"]\n", "sources = [\"ed\"]")
+                }
+            };
+            let toml = format!(
+                "version = 1\n\n\
+                 [sources.ed]\ngit = \"{}\"\nbranch = \"main\"\ndeploy = \"link\"\n\
+                 {source_offer}\n\
+                 [targets.dest]\npath = \"{}\"\n{target_sources}\nlayout = \"by-source\"\n",
+                source.path().display(),
+                target.target_path().display(),
+            );
+            let config = Config::parse(&toml).expect("real Git link-drop config parses");
+            let (git_dir, state_dir, backend, registry) = fresh_backend_registry();
+
+            let first = sync(
+                &input(&config, None, None, None, false),
+                &backend,
+                &registry,
+            )
+            .expect("first real Git link sync must deploy");
+            assert!(!first.had_failures, "the first link sync must be clean");
+            let first_records = records(&registry, "dest");
+            assert_eq!(
+                first_records.len(),
+                1,
+                "the first sync must persist exactly one collapsed link record"
+            );
+            let record = first_records[0].clone();
+            assert_eq!(
+                record.key.artifact, "editor",
+                "the only source leaf must collapse to the editor directory key"
+            );
+            assert!(
+                record.linked && record.kind == RecordKind::Dir,
+                "the collapsed artifact must persist as one linked Dir record"
+            );
+            assert!(
+                record.files.is_empty(),
+                "a linked directory record intentionally carries no leaf manifest"
+            );
+            assert_eq!(
+                record.commit, "link",
+                "a persisted mutable-link record uses the link sentinel"
+            );
+            let current_commit = &first
+                .base_lock
+                .find_source("ed")
+                .expect("resolved link source must appear in the returned lock")
+                .commit;
+            assert_eq!(
+                current_commit, &head,
+                "the current resolved identity for a real Git link source is its exact HEAD SHA"
+            );
+            assert_ne!(
+                &record.commit, current_commit,
+                "the contract requires the real persisted/current identity mismatch: link != HEAD"
+            );
+
+            let destination = target
+                .target_path()
+                .join(by_source().artifact_path("ed", "editor"));
+            let source_target = source.path().join("editor");
+            assert_only_target_record(&registry, &record);
+            assert_exact_link(&destination, &source_target);
+
+            Self {
+                source,
+                _target: target,
+                _git_dir: git_dir,
+                _state_dir: state_dir,
+                backend,
+                registry,
+                config,
+                first_lock: first.base_lock,
+                record,
+                destination,
+                source_target,
+                head,
+            }
+        }
+
+        fn delete_leaf_without_moving_head(&self) {
+            std::fs::remove_file(self.source.path().join("editor/a.md"))
+                .expect("remove live link source leaf without committing");
+            assert_eq!(
+                rev_parse(self.source.path(), "HEAD"),
+                self.head,
+                "deleting the working-tree leaf must leave real Git HEAD unchanged"
+            );
+        }
+
+        fn request(&self, policy: LinkDropPolicy) -> SyncInput<'_> {
+            SyncInput {
+                base_lock: Some(self.first_lock.clone()),
+                prune: true,
+                fast_forward: matches!(policy, LinkDropPolicy::FastForward),
+                ..input(&self.config, None, None, None, false)
+            }
+        }
+
+        fn assert_exact_state_preserved(&self) {
+            assert_eq!(
+                self.registry.get(&self.record.key).expect("registry read"),
+                Some(self.record.clone()),
+                "a rejected link drop must preserve the exact managed record"
+            );
+            assert_only_target_record(&self.registry, &self.record);
+            assert_exact_link(&self.destination, &self.source_target);
+        }
+
+        fn assert_fail_open_drop_happened(&self, policy: LinkDropPolicy) {
+            assert!(
+                self.registry
+                    .get(&self.record.key)
+                    .expect("registry read")
+                    .is_none(),
+                "the current {policy:?} defect is expected to delete the managed link record"
+            );
+            assert!(
+                std::fs::symlink_metadata(&self.destination).is_err(),
+                "the current {policy:?} defect is expected to unlink the managed destination"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_link_d9_diagnostic(rendered: &str) {
+        assert_sealed_offer_diagnostic(rendered, "dest", "ed", "editor");
+        assert!(
+            rendered.contains("restore") && rendered.contains("eject"),
+            "a mutable-link D9 must retain restore/eject escape guidance; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("--fast-forward"),
+            "a mutable link can never be authorized by commit inequality, so its D9 diagnostic \
+             must not recommend --fast-forward; got:\n{rendered}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn expect_leaf_offer_link_drop_rejected(policy: LinkDropPolicy) {
+        let fixture = RealGitLinkDropFixture::new(RealGitLinkSelection::LeafSpecificSourceOffer);
+        fixture.delete_leaf_without_moving_head();
+        if let Err(error) = sync(
+            &fixture.request(policy),
+            &fixture.backend,
+            &fixture.registry,
+        ) {
+            assert_link_d9_diagnostic(&error.to_string());
+            fixture.assert_exact_state_preserved();
+        } else {
+            fixture.assert_fail_open_drop_happened(policy);
+            panic!(
+                "B21-R3-H2: an unchanged leaf-specific source offer must not launder a \
+                 collapsed mutable-link drop under {policy:?} prune"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sealed_offer_suffix_glob_recovers_source_leaf_from_collapsed_link_record() {
+        let wt = TempDir::new().expect("link working tree");
+        std::fs::create_dir_all(wt.path().join("editor")).expect("mkdir editor");
+        std::fs::write(wt.path().join("editor/a.md"), b"alpha\n").expect("write a.md");
+        let td = TargetDir::new();
+        let toml = format!(
+            "version = 1\n\n\
+             [sources.ed]\ngit = \"{}\"\nbranch = \"main\"\ndeploy = \"link\"\n\n\
+             [targets.dest]\npath = \"{}\"\n\
+             sources = {{ ed = {{ source = \"ed\", take = [\"editor/*.md\"] }} }}\n\
+             layout = \"by-source\"\n",
+            wt.path().display(),
+            td.target_path().display(),
+        );
+        let cfg = Config::parse(&toml).expect("suffix-glob link config parses");
+        let (_g, _s, backend, registry) = fresh_backend_registry();
+
+        sync(&input(&cfg, None, None, None, false), &backend, &registry)
+            .expect("first sync must deploy the collapsed link");
+        let first_records = records(&registry, "dest");
+        assert_eq!(
+            first_records.len(),
+            1,
+            "the first sync must record exactly one target artifact"
+        );
+        let record = first_records[0].clone();
+        assert_eq!(record.key.artifact, "editor");
+        assert!(
+            record.linked && record.kind == RecordKind::Dir,
+            "premise: suffix-glob selection must collapse to one linked directory record"
+        );
+        assert_eq!(
+            record.commit, "link",
+            "premise: a live link deployment records the stable mutable-source identity"
+        );
+        let key = record.key.clone();
+        let dst = td
+            .target_path()
+            .join(by_source().artifact_path("ed", "editor"));
+        let source_target = wt.path().join("editor");
+        assert_only_target_record(&registry, &record);
+        assert_exact_link(&dst, &source_target);
+        std::fs::remove_file(wt.path().join("editor/a.md")).expect("remove offered source leaf");
+
+        let Err(err) = sync(&pruning_sync(&cfg), &backend, &registry) else {
+            panic!(
+                "removing a suffix-glob-selected source leaf must trip the sealed-offer guard; \
+                 synthetic probe names cannot prove that a collapsed record was config-narrowed"
+            );
+        };
+        assert_sealed_offer_diagnostic(&err.to_string(), "dest", "ed", "editor");
+        assert_eq!(
+            registry.get(&key).expect("registry read"),
+            Some(record.clone()),
+            "a rejected ordinary prune must preserve the exact managed record"
+        );
+        assert_only_target_record(&registry, &record);
+        assert_exact_link(&dst, &source_target);
+
+        let fast_forward = SyncInput {
+            fast_forward: true,
+            prune: true,
+            ..input(&cfg, None, None, None, false)
+        };
+        let Err(err) = sync(&fast_forward, &backend, &registry) else {
+            panic!(
+                "fast-forward must not exempt a mutable link source whose leaf disappeared at \
+                 the unchanged `link` identity"
+            );
+        };
+        assert_sealed_offer_diagnostic(&err.to_string(), "dest", "ed", "editor");
+        assert_eq!(
+            registry.get(&key).expect("registry read"),
+            Some(record.clone()),
+            "a rejected fast-forward prune must preserve the exact managed record"
+        );
+        assert_only_target_record(&registry, &record);
+        assert_exact_link(&dst, &source_target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_git_link_record_never_fast_forwards_by_sentinel_sha_inequality() {
+        let fixture =
+            RealGitLinkDropFixture::new(RealGitLinkSelection::ImplicitOfferWithTargetGlob);
+        fixture.delete_leaf_without_moving_head();
+
+        let ordinary_result = sync(
+            &fixture.request(LinkDropPolicy::Ordinary),
+            &fixture.backend,
+            &fixture.registry,
+        );
+        let Err(ordinary_error) = ordinary_result else {
+            panic!(
+                "ordinary prune must seal an ambiguous mutable-link drop at unchanged real Git HEAD"
+            );
+        };
+        let ordinary_rendered = ordinary_error.to_string();
+        assert_sealed_offer_diagnostic(&ordinary_rendered, "dest", "ed", "editor");
+        fixture.assert_exact_state_preserved();
+
+        let fast_forward_result = sync(
+            &fixture.request(LinkDropPolicy::FastForward),
+            &fixture.backend,
+            &fixture.registry,
+        );
+        let Err(fast_forward_error) = fast_forward_result else {
+            fixture.assert_fail_open_drop_happened(LinkDropPolicy::FastForward);
+            panic!(
+                "B21-R3-H1: persisted `link` != current HEAD SHA must never authorize deletion \
+                 of a mutable linked directory under --fast-forward --prune"
+            );
+        };
+
+        assert_link_d9_diagnostic(&ordinary_rendered);
+        assert_link_d9_diagnostic(&fast_forward_error.to_string());
+        fixture.assert_exact_state_preserved();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_git_leaf_specific_offer_seals_collapsed_link_under_ordinary_prune() {
+        expect_leaf_offer_link_drop_rejected(LinkDropPolicy::Ordinary);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_git_leaf_specific_offer_seals_collapsed_link_under_fast_forward_prune() {
+        expect_leaf_offer_link_drop_rejected(LinkDropPolicy::FastForward);
     }
 
     #[cfg(unix)]
@@ -12657,6 +13538,82 @@ mod leaf_granular_deploy_tests {
         (src, url)
     }
 
+    fn suffix_filtered_template_config(url: &str, target_path: &Path) -> Config {
+        let toml = format!(
+            "version = 1\n\n[vars]\ngreeting = \"world\"\n\n\
+             [sources.ed]\ngit = \"{url}\"\nbranch = \"main\"\ninclude = [\"editor/*.tmpl\"]\n\n\
+             [targets.dest]\npath = \"{}\"\n\
+             sources = {{ ed = {{ source = \"ed\", take = [\"editor/*.tmpl\"], collapse = false }} }}\n\
+             layout = \"by-source\"\n",
+            target_path.display(),
+        );
+        Config::parse(&toml).expect("suffix-filtered template config parses")
+    }
+
+    #[test]
+    fn sealed_offer_template_suffix_maps_published_key_back_to_source_leaf() {
+        let (src, url) = build_templated_leaf_repo();
+        let td = TargetDir::new();
+        let cfg = suffix_filtered_template_config(&url, &td.target_path());
+        let (_g, _s, backend, registry) = fresh_backend_registry();
+
+        sync(&input(&cfg, None, None, None, false), &backend, &registry)
+            .expect("first sync must deploy the rendered template leaf");
+        let key = artifact_key("dest", "ed", "editor/motd");
+        assert_eq!(
+            record_keys(&registry),
+            BTreeSet::from(["editor/motd".to_owned()]),
+            "premise: the first sync must record the suffix-stripped published key"
+        );
+        let record = registry
+            .get(&key)
+            .expect("registry read")
+            .expect("the suffix-stripped template record must exist");
+        assert_eq!(record.kind, RecordKind::File);
+        let dst = td
+            .target_path()
+            .join(by_source().artifact_path("ed", "editor/motd"));
+        assert_eq!(
+            std::fs::read(&dst).expect("rendered template is deployed"),
+            b"hello world!\n"
+        );
+
+        std::fs::remove_file(src.path().join("editor/motd.tmpl"))
+            .expect("remove the offered template source leaf");
+        run_git(src.path(), &["add", "-A"]);
+        run_git(src.path(), &["commit", "-m", "drop-template"]);
+
+        let Err(err) = sync(&pruning_sync(&cfg), &backend, &registry) else {
+            panic!(
+                "ordinary sync --prune must seal a source-dropped `.tmpl` leaf even though its \
+                 registry key carries the suffix-stripped published name"
+            );
+        };
+        let rendered = err.to_string();
+        assert_sealed_offer_diagnostic(&rendered, "dest", "ed", "editor/motd");
+        assert!(
+            rendered.contains("--fast-forward"),
+            "the source pin moved, so the diagnostic must offer --fast-forward; got:\n{rendered}"
+        );
+        assert!(
+            registry.get(&key).expect("registry read").is_some() && dst.exists(),
+            "a rejected ordinary prune must preserve both the template record and deployed path"
+        );
+
+        let fast_forward = SyncInput {
+            fast_forward: true,
+            prune: true,
+            ..input(&cfg, None, None, None, false)
+        };
+        sync(&fast_forward, &backend, &registry)
+            .expect("--fast-forward may follow the moved pin and remove the dropped template");
+        assert!(
+            registry.get(&key).expect("registry read").is_none() && !dst.exists(),
+            "fast-forward must remove both the dropped template record and deployed path"
+        );
+        drop(src);
+    }
+
     #[test]
     fn copy_identity_templated_leaf_renders_and_strips_tmpl_suffix() {
         let (src, url) = build_templated_leaf_repo();
@@ -13028,16 +13985,10 @@ fn prune_deletes_orphan_files_using_persisted_deploy_root() {
     let commits = one_commit(&parsed, "ed", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
     let protected = test_protected(&std::env::temp_dir());
 
-    prune_orphans(
-        &cfg,
-        &parsed,
-        &remotes,
-        &fx_backend(),
-        &registry,
-        &commits,
-        &protected,
-    )
-    .expect("prune runs over an orphaned registry");
+    let projection = project_workspace(&cfg, &parsed, &remotes, &fx_backend(), &commits)
+        .expect("empty-target projection builds");
+    prune_projected(&projection, &cfg, &registry, &protected)
+        .expect("prune runs over an orphaned registry");
 
     assert!(
         !orphan_dst.exists(),
@@ -13158,9 +14109,6 @@ fn undecided_conflict_at_apply_errors_unresolved() {
         target_name: "dest",
         target,
         remotes: &remotes,
-        force: false,
-        interactive: false,
-        resolver: None,
         vars: &BTreeMap::new(),
         protected: &protected,
     };
@@ -13205,7 +14153,6 @@ fn observe_workspace_rejects_duplicate_triplet() {
     fx.backend
         .fetch(&sn("editor-src"), &fx.url)
         .expect("seed editor-src mirror");
-    let commits = one_commit(&parsed, "editor-src", &fx.head_sha);
     let protected = test_protected(fx.src.path());
     let journal = Journal::open(&fx.registry.locks_dir()).expect("open journal");
 
@@ -13222,6 +14169,7 @@ fn observe_workspace_rejects_duplicate_triplet() {
         identity: "editor-src".to_owned(),
         source: "editor-src".to_owned(),
         commit: fx.head_sha.clone(),
+        attribution: crate::projection::model::BindingAttribution::default(),
         artifacts: vec![colliding_artifact(), colliding_artifact()],
         warnings: Vec::new(),
     };
@@ -13240,7 +14188,7 @@ fn observe_workspace_rejects_duplicate_triplet() {
         config: &cfg,
         parsed: &parsed,
         remotes: &remotes,
-        resolved_commits: &commits,
+        projection: &projection,
         protected: &protected,
         input: &si,
         backend: &fx.backend,

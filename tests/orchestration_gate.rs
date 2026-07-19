@@ -403,12 +403,20 @@ fn module_aliases(scanned: &str) -> Vec<(String, String)> {
 }
 
 fn references_call(scanned: &str, name: &str) -> bool {
+    reference_call_count(scanned, name) > 0
+}
+
+fn reference_call_count(scanned: &str, name: &str) -> usize {
     let bytes = scanned.as_bytes();
     let needle = format!("{name}(");
-    scanned.match_indices(&needle).any(|(i, _)| {
-        let before_ok = i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
-        before_ok && !ends_with_word(scanned[..i].trim_end(), "fn")
-    })
+    scanned
+        .match_indices(&needle)
+        .filter(|(i, _)| {
+            let before_ok =
+                *i == 0 || (!bytes[*i - 1].is_ascii_alphanumeric() && bytes[*i - 1] != b'_');
+            before_ok && !ends_with_word(scanned[..*i].trim_end(), "fn")
+        })
+        .count()
 }
 
 fn references_call_or_alias(scanned: &str, name: &str) -> bool {
@@ -416,6 +424,15 @@ fn references_call_or_alias(scanned: &str, name: &str) -> bool {
         || module_aliases(scanned)
             .iter()
             .any(|(alias, path)| final_segment(path) == name && references_call(scanned, alias))
+}
+
+fn reference_call_count_or_alias(scanned: &str, name: &str) -> usize {
+    reference_call_count(scanned, name)
+        + module_aliases(scanned)
+            .iter()
+            .filter(|(_, path)| final_segment(path) == name)
+            .map(|(alias, _)| reference_call_count(scanned, alias))
+            .sum::<usize>()
 }
 
 fn final_segment(path: &str) -> &str {
@@ -923,6 +940,86 @@ fn preview_no_longer_reprojects_the_workspace() {
 }
 
 #[test]
+fn one_workspace_projection_is_threaded_across_the_entire_sync_run() {
+    let call_sites: Vec<(String, usize)> = sync_prod_files(&[])
+        .into_iter()
+        .filter_map(|(name, body)| {
+            let calls = reference_call_count_or_alias(&scan_prod(&body), "project_workspace");
+            (calls > 0).then_some((name, calls))
+        })
+        .collect();
+    let total: usize = call_sites.iter().map(|(_, calls)| calls).sum();
+    assert_eq!(
+        total, 1,
+        "T021 one-Projection invariant: a sync run must call project_workspace exactly once, then \
+         thread that Projection through fast-forward/drop guarding, deploy/observe/reconcile/apply, \
+         and prune. Function/module aliases are resolved. Found {total} production call sites: \
+         {call_sites:?}"
+    );
+}
+
+#[test]
+fn test_only_legacy_orchestration_surface_is_fully_retired() {
+    const LEGACY: &[&str] = &[
+        "deploy_artifact_entry",
+        "preflight_entry",
+        "apply_entry",
+        "conflict_kind_for",
+        "skips_redeploy",
+        "prune_orphans",
+    ];
+    let dir = src_dir().join("sync");
+    let mut paths: Vec<PathBuf> = fs::read_dir(&dir)
+        .expect("read src/sync")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .collect();
+    paths.sort();
+
+    let mut offenders = Vec::new();
+    for path in paths {
+        let scanned = scan(&fs::read_to_string(&path).expect("read sync Rust source"));
+        for symbol in LEGACY {
+            if references_token(&scanned, symbol) {
+                offenders.push(format!(
+                    "src/sync/{}: {symbol}",
+                    path.file_name()
+                        .expect("Rust file has a name")
+                        .to_string_lossy()
+                ));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "T021 must migrate tests onto the live projection/reconcile seams and delete the legacy \
+         orchestration surface. Whole-word scanning catches direct declarations/calls plus \
+         `use … as` and `pub use … as` laundering. Still present: {offenders:?}"
+    );
+
+    let target = scan(&read_src("sync/target.rs"));
+    let start = target
+        .find("struct TargetRun")
+        .expect("target.rs defines TargetRun");
+    let open = target[start..]
+        .find('{')
+        .map(|offset| start + offset)
+        .expect("TargetRun has a body");
+    let close = matching_brace(target.as_bytes(), open).expect("TargetRun body is balanced");
+    let body = &target[open + 1..close];
+    let dead_fields: Vec<&str> = ["force", "interactive", "resolver"]
+        .into_iter()
+        .filter(|field| references_token(body, field))
+        .collect();
+    assert!(
+        dead_fields.is_empty(),
+        "TargetRun must not retain cfg_attr(not(test))-laundered fields used only by the retired \
+         single-entry shim. Still present: {dead_fields:?}"
+    );
+}
+
+#[test]
 fn helper_keyword_and_construct_scans_are_word_bounded() {
     assert!(keyword_names(
         &scan("pub fn build_workspace(x: u8) {}"),
@@ -1101,6 +1198,17 @@ fn helper_references_call_rejects_declarations_and_resolves_aliases() {
     assert!(
         references_call_or_alias(&aliased_prod, "reconcile"),
         "a call through `use …::reconcile as rc; rc(…)` must count for a positive caller pin"
+    );
+    assert_eq!(
+        reference_call_count_or_alias(
+            &scan_prod(
+                "use crate::sync::plan::project_workspace as pw;\n\
+                 pub fn f() { let _ = pw(&a); let _ = project_workspace(&b); }\n"
+            ),
+            "project_workspace"
+        ),
+        2,
+        "the one-projection gate must count both a direct call and an alias-laundered call"
     );
 
     let aliased_banned =

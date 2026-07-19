@@ -26,7 +26,7 @@ pub use hooks::{HookOutcome, HookScope, HookStatus};
 pub use plan::{plan_target, project_workspace};
 
 use crate::projection::build::projected_artifact_keys;
-use crate::projection::model::Projection;
+use crate::projection::model::{ArtifactRelativePath, Projection};
 use crate::sync::model::ReconciliationPolicy;
 
 pub(crate) use preview::offered_leaves;
@@ -40,8 +40,6 @@ pub use verify::{UntrustedHookFinding, VerifyMismatch, VerifyReason, VerifyRepor
 #[cfg(feature = "bench")]
 pub use resolve::resolve_sources_for_bench;
 
-#[cfg(test)]
-use prune::prune_orphans;
 use prune::prune_projected;
 pub(crate) use prune::{orphan_artifact_path, orphan_records};
 use resolve::resolve_sources;
@@ -51,11 +49,8 @@ use target::{Reconciliation, TargetRun, deploy_reconciled_target, resolve_confli
 
 #[cfg(test)]
 use {
-    crate::config::LayoutKind,
-    crate::deploy::check_artifact_state,
-    crate::lock::LockedSource,
+    crate::config::LayoutKind, crate::deploy::check_artifact_state, crate::lock::LockedSource,
     crate::projection::diagnostic::ProjectionWarning,
-    target::{ArtifactEntry, deploy_artifact_entry},
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -281,7 +276,7 @@ struct DeployAll<'a> {
     config: &'a Config,
     parsed: &'a BTreeMap<String, ParsedSource>,
     remotes: &'a BTreeMap<String, String>,
-    resolved_commits: &'a BTreeMap<(String, String), String>,
+    projection: &'a Projection,
     protected: &'a confine::ProtectedPathSet,
     input: &'a SyncInput<'a>,
     backend: &'a (dyn StageSource + Sync),
@@ -308,30 +303,19 @@ fn target_run<'a>(
         target_name,
         target,
         remotes: ctx.remotes,
-        force: ctx.input.force,
-        interactive: ctx.input.interactive,
-        resolver: ctx.input.resolver,
         vars: &ctx.config.vars,
         protected: ctx.protected,
     }
 }
 
 fn deploy_all_targets(ctx: &DeployAll<'_>) -> Result<DeployRun> {
-    let projection = project_workspace(
-        ctx.config,
-        ctx.parsed,
-        ctx.remotes,
-        ctx.backend,
-        ctx.resolved_commits,
-    )?;
-    reject_cross_target_overlap(&projection, ctx.config)?;
-    let observed = observe::observe_workspace(ctx, &projection)?;
+    let observed = observe::observe_workspace(ctx, ctx.projection)?;
     let policy = ReconciliationPolicy {
         force: ctx.input.force,
         prune: false,
         follow_moved_pin: false,
     };
-    let changeset = reconcile::reconcile(&projection, &observed, &policy)
+    let changeset = reconcile::reconcile(ctx.projection, &observed, &policy)
         .map_err(|e| Error::Sync(e.to_string()))?;
     let decisions = resolve_conflicts(&changeset, ctx.input.resolver, ctx.input.interactive)?;
     let reconciliation = Reconciliation::new(&changeset, &observed, decisions);
@@ -366,7 +350,8 @@ fn deploy_all_targets(ctx: &DeployAll<'_>) -> Result<DeployRun> {
                 }
             }
         }
-        let Some(target_projection) = projection
+        let Some(target_projection) = ctx
+            .projection
             .targets
             .iter()
             .find(|tp| &tp.target == target_name)
@@ -461,14 +446,7 @@ fn maybe_prune(ctx: &DeployAll<'_>, had_failures: bool) -> Result<()> {
         eprintln!("phora: skipping --prune because some artifacts failed to deploy");
         return Ok(());
     }
-    let projection = project_workspace(
-        ctx.config,
-        ctx.parsed,
-        ctx.remotes,
-        ctx.backend,
-        ctx.resolved_commits,
-    )?;
-    prune_projected(&projection, ctx.config, ctx.registry, ctx.protected)
+    prune_projected(ctx.projection, ctx.config, ctx.registry, ctx.protected)
 }
 
 fn sweep_target_parents(config: &Config, journal: &Journal, registry: &dyn Registry) -> Result<()> {
@@ -493,6 +471,17 @@ fn effective_lock(input: &SyncInput<'_>) -> Option<Lock> {
     }
 }
 
+fn local_source_names(input: &SyncInput<'_>) -> BTreeSet<String> {
+    input
+        .local_config
+        .map(|config| config.sources.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn merged_config(input: &SyncInput<'_>) -> Config {
+    merge_configs(input.base_config.clone(), input.local_config.cloned())
+}
+
 fn open_sync_journal(lockless: bool, registry: &dyn Registry) -> Result<Journal> {
     if lockless {
         Ok(Journal::open_readonly(&registry.locks_dir()))
@@ -501,40 +490,29 @@ fn open_sync_journal(lockless: bool, registry: &dyn Registry) -> Result<Journal>
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "threads the resolution maps needed to seal or delete a moved-pin drop"
-)]
 fn apply_fast_forward_drops(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
-    remotes: &BTreeMap<String, String>,
-    backend: &(dyn SourceBackend + Sync),
-    resolved_commits: &BTreeMap<(String, String), String>,
+    projection: &Projection,
     recorded: &[RegistryRecord],
     registry: &dyn Registry,
     protected: &confine::ProtectedPathSet,
     fast_forward: bool,
 ) -> Result<()> {
-    let drops = validate_sealed_offer(
-        config,
-        parsed,
-        remotes,
-        backend,
-        resolved_commits,
-        recorded,
-        fast_forward,
-    )?;
-    prune_fast_forward_drops(
-        config,
-        parsed,
-        remotes,
-        backend,
-        resolved_commits,
-        registry,
-        protected,
-        &drops,
-    )
+    let drops = validate_sealed_offer(config, parsed, projection, recorded, fast_forward)?;
+    prune_fast_forward_drops(projection, config, registry, protected, &drops)
+}
+
+fn project_sync_workspace(
+    config: &Config,
+    parsed: &BTreeMap<String, ParsedSource>,
+    remotes: &BTreeMap<String, String>,
+    backend: &dyn SourceBackend,
+    resolved_commits: &BTreeMap<(String, String), String>,
+) -> Result<Projection> {
+    let projection = project_workspace(config, parsed, remotes, backend, resolved_commits)?;
+    reject_cross_target_overlap(&projection, config)?;
+    Ok(projection)
 }
 
 pub fn sync(
@@ -542,8 +520,7 @@ pub fn sync(
     backend: &(dyn StageSource + Sync),
     registry: &dyn Registry,
 ) -> Result<SyncOutput> {
-    let mut effective_config =
-        merge_configs(input.base_config.clone(), input.local_config.cloned());
+    let mut effective_config = merged_config(input);
     effective_config.validate()?;
     let mut parsed = effective_config.parsed_sources()?;
     let mut remotes = resolved_remotes(&effective_config, &parsed)?;
@@ -561,10 +538,7 @@ pub fn sync(
         eprintln!("phora: {warning}");
     }
 
-    let local_names: BTreeSet<String> = input
-        .local_config
-        .map(|lc| lc.sources.keys().cloned().collect())
-        .unwrap_or_default();
+    let local_names = local_source_names(input);
 
     let readonly_registry;
     let registry: &dyn Registry = if input.lockless {
@@ -606,12 +580,17 @@ pub fn sync(
         effective_lock.as_ref(),
         &resolved_commits,
     );
-    apply_fast_forward_drops(
+    let projection = project_sync_workspace(
         &effective_config,
         &parsed,
         &remotes,
         backend,
         &resolved_commits,
+    )?;
+    apply_fast_forward_drops(
+        &effective_config,
+        &parsed,
+        &projection,
         &recorded_after_recovery,
         registry,
         &protected,
@@ -635,7 +614,7 @@ pub fn sync(
         config: &effective_config,
         parsed: &parsed,
         remotes: &remotes,
-        resolved_commits: &resolved_commits,
+        projection: &projection,
         protected: &protected,
         input,
         backend,
@@ -761,75 +740,82 @@ fn run_all_hooks(
     Ok((hook_results, stripped))
 }
 
-struct BindingOffer {
-    offered: Vec<String>,
+struct BindingOffer<'projection> {
     selection: crate::kernel::OfferSelection,
-    dest_to_source: BTreeMap<String, String>,
-    commit: String,
+    projected: &'projection crate::projection::model::BindingProjection,
+    deploy_mode: DeployMode,
     ref_label: String,
 }
 
-/// Compares against the resolved OFFER set, not the take/kept set: a leaf dropped by
-/// `take` while still offered stays allowed. A recorded key the source no longer provides
-/// only hard-errors when the offer config still ADMITS its path (a silent source narrowing);
-/// when the config itself narrowed past it, it is a pure orphan left to `--prune`. Under
-/// `fast_forward`, a drop whose recorded commit differs from the resolved one is returned for
-/// deletion instead of sealing; a same-commit drop still hard-errors.
+#[derive(Clone, Copy)]
+struct SealedRecordPolicy {
+    immutable_copy: bool,
+    commit_differs: bool,
+}
+
+impl SealedRecordPolicy {
+    fn classify(record: &RegistryRecord, offer: &BindingOffer<'_>) -> Self {
+        Self {
+            immutable_copy: !record.linked && offer.deploy_mode == DeployMode::Copy,
+            commit_differs: record.commit != offer.projected.commit,
+        }
+    }
+
+    fn same_snapshot_transition(self) -> bool {
+        self.immutable_copy && !self.commit_differs
+    }
+
+    fn fast_forward_actionable(self) -> bool {
+        self.immutable_copy && self.commit_differs
+    }
+}
+
+/// Compares stale records against the resolved OFFER set, not the take/kept set. Positive current
+/// attribution clears a record in every deploy mode, so a leaf dropped only by `take` stays
+/// allowed. Only immutable-copy records may treat exclusion of every candidate by the current
+/// offer as intentional config narrowing, or exact current-commit equality as a projection-shape
+/// transition; both are left to reconciliation/prune. When commits differ, only immutable-copy
+/// records are actionable `--fast-forward` drops. A historical linked record or current Link
+/// binding without positive attribution remains ambiguous and seals, even when the current offer
+/// excludes every available candidate.
 fn validate_sealed_offer(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
-    remotes: &BTreeMap<String, String>,
-    backend: &(dyn SourceBackend + Sync),
-    resolved_commits: &BTreeMap<(String, String), String>,
+    projection: &Projection,
     recorded: &[RegistryRecord],
     fast_forward: bool,
 ) -> Result<Vec<RegistryRecord>> {
-    use crate::kernel::{OfferSelection, SourceName};
+    use crate::kernel::OfferSelection;
 
-    let mut offers: BTreeMap<(String, String), BindingOffer> = BTreeMap::new();
+    let mut offers: BTreeMap<(String, String), BindingOffer<'_>> = BTreeMap::new();
     for (target_name, target) in &config.targets {
+        let Some(target_projection) = projection
+            .targets
+            .iter()
+            .find(|projected| projected.target == *target_name)
+        else {
+            continue;
+        };
         for binding in target.resolve_sources(parsed) {
             let Some(source) = parsed.get(binding.source) else {
                 continue;
             };
-            let commit_key = (
-                binding.source.to_owned(),
-                crate::lock::encode_ref(&binding.effective_ref),
-            );
-            let Some(commit) = resolved_commits.get(&commit_key) else {
+            let Some(projected_binding) = target_projection
+                .bindings
+                .iter()
+                .find(|projected| projected.identity == binding.identity)
+            else {
                 continue;
-            };
-            let name = SourceName::trusted(binding.source);
-            let git = remote_for(remotes, name.as_str())?;
-            let candidates = match source.deploy_mode() {
-                DeployMode::Link => discover::discover_working_tree_leaves(Path::new(git), None)?,
-                DeployMode::Copy => backend.list_source_leaves(&name, git, commit, None)?,
             };
             let offer = source.offer();
             let selection =
                 OfferSelection::compile(offer.includes(), offer.excludes(), offer.root())?;
-            let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
-            let offered = selection.select(&refs);
-            let dest_to_source = binding.take.map_or_else(BTreeMap::new, |entries| {
-                let directives = crate::sync::plan::map_take_entries(entries);
-                crate::kernel::resolve_take(&offered, Some(&directives)).map_or_else(
-                    |_| BTreeMap::new(),
-                    |res| {
-                        res.kept
-                            .into_iter()
-                            .filter(|m| m.dest != m.source)
-                            .map(|m| (m.dest, m.source))
-                            .collect()
-                    },
-                )
-            });
             offers.insert(
                 (target_name.clone(), binding.identity.to_owned()),
                 BindingOffer {
-                    offered,
                     selection,
-                    dest_to_source,
-                    commit: commit.clone(),
+                    projected: projected_binding,
+                    deploy_mode: source.deploy_mode(),
                     ref_label: binding.effective_ref.to_string(),
                 },
             );
@@ -843,18 +829,34 @@ fn validate_sealed_offer(
             continue;
         };
         let artifact = &key.artifact;
-        let leaf = offer
-            .dest_to_source
-            .get(artifact)
-            .map_or(artifact.as_str(), String::as_str);
-        let still_offered = offer
-            .offered
+        if offer
+            .projected
+            .artifacts
             .iter()
-            .any(|offered| offered == leaf || offered.starts_with(&format!("{leaf}/")));
-        if still_offered || !offer.selection.admits_published(leaf) {
+            .any(|projected| projected.materialization.published_key() == artifact)
+        {
             continue;
         }
-        if fast_forward && record.commit != offer.commit {
+        let policy = SealedRecordPolicy::classify(record, offer);
+        if policy.same_snapshot_transition() {
+            continue;
+        }
+        let source_paths = record_source_paths(offer.projected, record)?;
+        let has_current_attribution = source_paths.iter().any(|source_path| {
+            offer
+                .projected
+                .attribution
+                .offered_leaves
+                .iter()
+                .any(|offered| paths_overlap(offered, source_path))
+        });
+        let selection_admits_candidate = source_paths
+            .iter()
+            .any(|source_path| offer.selection.admits_published(source_path));
+        if has_current_attribution || (policy.immutable_copy && !selection_admits_candidate) {
+            continue;
+        }
+        if fast_forward && policy.fast_forward_actionable() {
             dropped.push(record.clone());
             continue;
         }
@@ -869,23 +871,71 @@ fn validate_sealed_offer(
             artifact,
             deploy_path: deploy_path.as_deref(),
             recorded_commit: &record.commit,
-            resolved_commit: &offer.commit,
+            resolved_commit: &offer.projected.commit,
             resolved_ref: &offer.ref_label,
+            fast_forward_actionable: policy.fast_forward_actionable(),
         }));
     }
     Ok(dropped)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "threads the plan inputs needed to guard deletes against live sibling artifacts"
-)]
+fn record_source_paths(
+    binding: &crate::projection::model::BindingProjection,
+    record: &RegistryRecord,
+) -> Result<BTreeSet<String>> {
+    let artifact = record.key.artifact.as_str();
+    let mut paths = BTreeSet::from([artifact.to_owned()]);
+    if !record.linked && record.kind == crate::store::RecordKind::Dir {
+        for file in &record.files {
+            let relative = persisted_manifest_relative_path(&file.path)?;
+            paths.insert(format!("{artifact}/{relative}"));
+        }
+    }
+    for resolved in &binding.attribution.resolved_takes {
+        if paths.iter().any(|path| paths_overlap(path, &resolved.dest)) {
+            paths.insert(resolved.source.clone());
+        }
+    }
+    if binding.attribution.copy_template_suffix && !record.linked && record.vars_digest.is_some() {
+        paths.extend(
+            paths
+                .iter()
+                .filter(|path| path.strip_suffix(".tmpl").is_none())
+                .map(|path| format!("{path}.tmpl"))
+                .collect::<Vec<_>>(),
+        );
+    }
+    Ok(paths)
+}
+
+fn persisted_manifest_relative_path(path: &Path) -> Result<ArtifactRelativePath> {
+    let relative = path.to_str().ok_or_else(|| {
+        Error::Sync(format!(
+            "invalid persisted manifest data path {}: path is not UTF-8",
+            path.display()
+        ))
+    })?;
+    ArtifactRelativePath::new(relative).map_err(|error| {
+        Error::Sync(format!(
+            "invalid persisted manifest data path {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn paths_overlap(first: &str, second: &str) -> bool {
+    first == second
+        || first
+            .strip_prefix(second)
+            .is_some_and(|rest| rest.starts_with('/'))
+        || second
+            .strip_prefix(first)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 fn prune_fast_forward_drops(
+    projection: &Projection,
     config: &Config,
-    parsed: &BTreeMap<String, ParsedSource>,
-    remotes: &BTreeMap<String, String>,
-    backend: &(dyn SourceBackend + Sync),
-    resolved_commits: &BTreeMap<(String, String), String>,
     registry: &dyn Registry,
     protected: &confine::ProtectedPathSet,
     drops: &[RegistryRecord],
@@ -896,9 +946,7 @@ fn prune_fast_forward_drops(
     if registry.refuses_writes() {
         return Err(registry.readonly_error().into());
     }
-    let projection = project_workspace(config, parsed, remotes, backend, resolved_commits)?;
-    reject_cross_target_overlap(&projection, config)?;
-    let expected_paths = prune::expected_live_paths(&projection, config);
+    let expected_paths = prune::expected_live_paths(projection, config);
     for record in drops {
         let Some(target) = config.targets.get(&record.key.target) else {
             continue;
@@ -947,6 +995,7 @@ struct SealedOffer<'a> {
     recorded_commit: &'a str,
     resolved_commit: &'a str,
     resolved_ref: &'a str,
+    fast_forward_actionable: bool,
 }
 
 fn sealed_offer_diagnostic(ctx: &SealedOffer<'_>) -> Error {
@@ -958,8 +1007,8 @@ fn sealed_offer_diagnostic(ctx: &SealedOffer<'_>) -> Error {
         recorded_commit,
         resolved_commit,
         resolved_ref,
+        fast_forward_actionable,
     } = ctx;
-    let pin_moved = recorded_commit != resolved_commit;
     let now = pin_label(resolved_ref, resolved_commit);
     let mut details = vec![
         format!("binding: source `{source}` → target `{target}`"),
@@ -971,7 +1020,7 @@ fn sealed_offer_diagnostic(ctx: &SealedOffer<'_>) -> Error {
     if let Some(path) = deploy_path {
         details.push(format!("path: {path}"));
     }
-    let remedy = if pin_moved {
+    let remedy = if fast_forward_actionable {
         "re-sync with `--fast-forward` to drop it, or eject it before removing it".to_string()
     } else {
         "restore the artifact to the source's offer, or eject it before removing it".to_string()
