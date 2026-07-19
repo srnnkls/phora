@@ -1,9 +1,11 @@
 //! Top-level orchestration: the `sync` pipeline, eject/uneject, and shared helpers.
 
+pub mod apply;
 pub(crate) mod confine;
 pub(crate) mod discover;
 pub(crate) mod hooks;
 pub mod inspect;
+pub mod journal;
 pub mod model;
 mod observe;
 mod plan;
@@ -11,6 +13,7 @@ mod preview;
 mod prune;
 mod rebuild;
 pub mod reconcile;
+pub mod recovery;
 mod resolve;
 pub(crate) mod scan;
 pub(crate) mod stage;
@@ -49,8 +52,8 @@ use target::{Reconciliation, TargetRun, deploy_reconciled_target, resolve_confli
 
 #[cfg(test)]
 use {
-    crate::config::LayoutKind, crate::deploy::check_artifact_state, crate::lock::LockedSource,
-    crate::projection::diagnostic::ProjectionWarning,
+    crate::config::LayoutKind, crate::lock::LockedSource,
+    crate::projection::diagnostic::ProjectionWarning, crate::sync::inspect::check_artifact_state,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -60,11 +63,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::config::{
     Config, DeployMode, ParsedSource, PreDeployOnFail, Protocol, SourceMode, merge_configs,
 };
-use crate::deploy::{Journal, recovery_sweep};
 use crate::error::{Error, Result};
 use crate::lock::{Lock, merge_locks, split_locks};
 use crate::source::{SourceBackend, SourceStore, is_local_path};
 use crate::store::{ArtifactKey, EjectedEntry, Registry, RegistryRecord};
+
+use journal::Journal;
+use recovery::recovery_sweep;
 
 pub trait StageSource: SourceBackend + SourceStore {}
 
