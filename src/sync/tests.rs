@@ -1487,6 +1487,47 @@ fn sync_allows_two_targets_with_disjoint_physical_roots() {
     drop(si);
 }
 
+/// R4 aliasing: a relative and an absolute spelling of one physical destination must
+/// collide exactly like the equal-absolute case, since the guard absolutizes each
+/// target path against `current_dir()` before comparing.
+#[test]
+fn sync_rejects_two_targets_aliasing_one_destination_via_relative_and_absolute_spelling() {
+    let (sa, url_a) = build_named_artifact_repo("shared", "a.txt", b"from-a\n");
+    let (sb, url_b) = build_named_artifact_repo("shared", "b.txt", b"from-b\n");
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+
+    let cwd = std::env::current_dir().expect("resolve process cwd for the aliasing spelling");
+    let rel = format!("phora-r4-alias-{}", std::process::id());
+    let abs = cwd.join(&rel);
+    assert!(
+        !abs.exists(),
+        "premise: the aliased destination must not pre-exist in the run cwd: {}",
+        abs.display()
+    );
+
+    let toml = format!(
+        "version = 1\n\n\
+             [sources.sa]\ngit = \"{url_a}\"\nbranch = \"main\"\n\n\
+             [sources.sb]\ngit = \"{url_b}\"\nbranch = \"main\"\n\n\
+             [targets.alpha]\npath = \"{}\"\nsources = [\"sa\"]\nlayout = \"flat\"\n\n\
+             [targets.beta]\npath = \"{rel}\"\nsources = [\"sb\"]\nlayout = \"flat\"\n",
+        abs.display(),
+    );
+    let cfg = Config::parse(&toml).expect("relative/absolute aliasing two-target config parses");
+
+    let result = sync(&input(&cfg, None, None, None, false), &backend, &registry);
+    assert_overlap_rejected(
+        result,
+        &registry,
+        ("alpha", "beta"),
+        "shared",
+        &[abs.clone(), abs.join("shared")],
+    );
+
+    drop(sa);
+    drop(sb);
+}
+
 #[test]
 fn sync_allows_targets_whose_roots_share_a_string_prefix_but_no_ancestor_relation() {
     let (so, url_o) = build_named_artifact_repo("od", "f.txt", b"outer\n");
@@ -2052,6 +2093,142 @@ fn sync_with_force_overwrites_modified_registry_artifact() {
         b"-- init\n",
         "--force must replace the local edit with the upstream artifact content"
     );
+}
+
+// ── T020 / R7: ejection stays authoritative across a mode transition ────
+
+/// One `link`-deploy source over a single flat target, so a re-sync over an
+/// already-copied dst flips the deploy mode and sets `mode_transition`.
+fn config_one_source_one_target_link(
+    source: &str,
+    url: &str,
+    target: &str,
+    target_path: &Path,
+    layout: &str,
+) -> Config {
+    let toml = format!(
+        "version = 1\n\n\
+             [sources.{source}]\ngit = \"{url}\"\nbranch = \"main\"\ndeploy = \"link\"\n\n\
+             [targets.{target}]\npath = \"{}\"\nsources = [\"{source}\"]\nlayout = \"{layout}\"\n",
+        target_path.display(),
+    );
+    Config::parse(&toml).expect("one-source one-target link config parses")
+}
+
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+}
+
+/// R7: an EJECTED artifact under a copy→link mode transition must be a SILENT
+/// SKIP — the mode flip must NOT redeploy over user-ejected content. The dst
+/// keeps its ejected shape (a real dir), the ejection entry survives, and the run
+/// does not fail.
+#[test]
+fn ejected_copy_to_link_mode_transition_is_a_silent_skip_never_redeploys() {
+    let (src, url) = build_named_artifact_repo("editor", "init.lua", b"-- init\n");
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let td = TargetDir::new();
+    let cfg =
+        config_one_source_one_target_link("editor-src", &url, "dest", &td.target_path(), "flat");
+
+    let dst = seed_managed_artifact(
+        &td,
+        &registry,
+        "editor-src",
+        "editor",
+        "init.lua",
+        b"-- ejected, do not touch\n",
+    );
+    assert!(
+        !is_symlink(&dst) && dst.is_dir(),
+        "premise: the ejected artifact is a real copy directory on disk"
+    );
+    eject(&cfg, &registry, "editor", "editor-src", "dest").expect("eject the managed artifact");
+    let key = artifact_key("dest", "editor-src", "editor");
+    let ejected = registry.load_ejected("dest").expect("load ejected");
+    assert!(
+        ejected
+            .iter()
+            .any(|e| e.source == "editor-src" && e.artifact == "editor"),
+        "premise: (editor-src, editor) must be ejected before the sync"
+    );
+
+    let out = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+        .expect("a sync whose ejected cell carries a mode transition must not error");
+
+    assert!(!out.had_failures, "a silent ejected skip is not a failure");
+    assert!(
+        !is_symlink(&dst) && dst.is_dir(),
+        "R7: the mode transition must NOT redeploy over ejected content as a symlink"
+    );
+    assert_eq!(
+        std::fs::read(dst.join("init.lua")).expect("ejected file still present"),
+        b"-- ejected, do not touch\n",
+        "R7: ejected content must be left byte-for-byte untouched"
+    );
+    assert!(
+        registry
+            .load_ejected("dest")
+            .expect("reload ejected")
+            .iter()
+            .any(|e| e.source == "editor-src" && e.artifact == "editor"),
+        "R7: ejection stays authoritative — the entry must survive the sync"
+    );
+    assert!(
+        registry.get(&key).expect("registry get").is_some(),
+        "R7: the ejected record must be kept, not dropped"
+    );
+
+    drop(src);
+}
+
+/// R7 frozen face: a frozen + lockless sync whose only pending cell is
+/// Ejected + `mode_transition` must be WRITE-FREE — it passes with no read-only
+/// refusal, because an ejected cell reconciles to no change (unlike a Modified or
+/// Foreign conflict, which would count as a pending write and be refused).
+#[test]
+fn frozen_lockless_ejected_mode_transition_is_write_free() {
+    let (src, url) = build_named_artifact_repo("editor", "init.lua", b"-- init\n");
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let td = TargetDir::new();
+    let cfg =
+        config_one_source_one_target_link("editor-src", &url, "dest", &td.target_path(), "flat");
+
+    let dst = seed_managed_artifact(
+        &td,
+        &registry,
+        "editor-src",
+        "editor",
+        "init.lua",
+        b"-- ejected, do not touch\n",
+    );
+    eject(&cfg, &registry, "editor", "editor-src", "dest").expect("eject the managed artifact");
+
+    let out = sync(
+        &frozen_lockless_input(&cfg, None, false),
+        &backend,
+        &registry,
+    )
+    .expect(
+        "a frozen+lockless sync whose only pending cell is Ejected+mode_transition must be \
+         write-free, not refuse with a read-only error",
+    );
+
+    assert!(
+        !out.had_failures,
+        "a write-free frozen sync is not a failure"
+    );
+    assert!(
+        !is_symlink(&dst) && dst.is_dir(),
+        "the frozen run must not redeploy the ejected dst as a symlink"
+    );
+    assert_eq!(
+        std::fs::read(dst.join("init.lua")).expect("ejected file still present"),
+        b"-- ejected, do not touch\n",
+        "the frozen run must leave the ejected content untouched"
+    );
+
+    drop(src);
 }
 
 // ── DGI-003: sync write-path persists the revalidated stat ─────
