@@ -2664,14 +2664,12 @@ fn second_deploy_over_correct_link_is_a_noop() {
     let counting = CountingBackend::new(&fx.backend);
     let journal = Journal::open(&fx.registry.locks_dir()).expect("open journal");
     let parsed = cfg.parsed_sources().expect("sources parse");
-    let commits = one_commit(&parsed, "editor-src", &fx.head_sha);
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
     let protected = test_protected(fx.src.path());
     let run = TargetRun {
         parsed: &parsed,
         target_name: "dest",
         target,
-        commits: &commits,
         remotes: &remotes,
         force: false,
         interactive: false,
@@ -12982,7 +12980,6 @@ fn undecided_conflict_at_apply_errors_unresolved() {
         parsed: &parsed,
         target_name: "dest",
         target,
-        commits: &commits,
         remotes: &remotes,
         force: false,
         interactive: false,
