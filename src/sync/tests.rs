@@ -12918,3 +12918,170 @@ fn prune_keeps_orphan_record_when_its_path_overlaps_a_live_destination() {
     );
     drop(src);
 }
+
+// ── R6: undecided Conflict at the reconcile-based apply seam ────
+
+/// A `SyncChange::Conflict` reaching `deploy_reconciled_target` with an EMPTY
+/// decision set (preflight skipped) must fail closed with an `unresolved conflict`
+/// diagnostic — never silently deploy over, nor silently skip, the conflict.
+#[test]
+fn undecided_conflict_at_apply_errors_unresolved() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_source_one_target(
+        "editor-src",
+        &fx.url,
+        "dest",
+        &td.target_path(),
+        "by-source",
+    );
+    let target = cfg.targets.get("dest").expect("dest target present");
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+    fx.backend
+        .fetch(&sn("editor-src"), &fx.url)
+        .expect("seed editor-src mirror");
+    let commits = one_commit(&parsed, "editor-src", &fx.head_sha);
+
+    let projection = project_workspace(&cfg, &parsed, &remotes, &fx.backend, &commits)
+        .expect("projection builds over the seeded mirror");
+    let target_projection = projection
+        .targets
+        .iter()
+        .find(|p| p.target == "dest")
+        .expect("projection must include target `dest`");
+
+    let changes: Vec<crate::sync::model::SyncChange> = target_projection
+        .bindings
+        .iter()
+        .flat_map(|binding| {
+            binding
+                .artifacts
+                .iter()
+                .map(move |artifact| crate::sync::model::SyncChange::Conflict {
+                    target: "dest".to_owned(),
+                    source: binding.identity.clone(),
+                    artifact: artifact.materialization.published_key().to_owned(),
+                    kind: crate::sync::model::ConflictKind::Foreign,
+                })
+        })
+        .collect();
+    assert!(
+        !changes.is_empty(),
+        "premise: the projection must yield at least one artifact to conflict on"
+    );
+    let changeset = crate::sync::model::ChangeSet { changes };
+    let observed = crate::sync::model::ObservedProjectState::<RegistryRecord> {
+        artifacts: Vec::new(),
+    };
+    let reconciliation = Reconciliation::new(&changeset, &observed, BTreeMap::new());
+
+    let journal = Journal::open(&fx.registry.locks_dir()).expect("open journal");
+    let protected = test_protected(fx.src.path());
+    let run = TargetRun {
+        parsed: &parsed,
+        target_name: "dest",
+        target,
+        commits: &commits,
+        remotes: &remotes,
+        force: false,
+        interactive: false,
+        resolver: None,
+        vars: &BTreeMap::new(),
+        protected: &protected,
+    };
+
+    let err = deploy_reconciled_target(
+        run,
+        target_projection,
+        &reconciliation,
+        &fx.backend,
+        &fx.registry,
+        &journal,
+    )
+    .expect_err(
+        "a Conflict reaching apply with no preflight decision must fail closed, not deploy or skip",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unresolved conflict"),
+        "the apply path must reject an undecided Conflict with an `unresolved conflict` diagnostic, \
+         got: {msg}"
+    );
+}
+
+// ── S6: observation producer rejects a duplicate triplet ───────
+
+/// Two projected artifacts colliding on the (target, identity, `published_key`)
+/// triplet must make the observation producer fail closed — never silently
+/// last-wins by collapsing one observation over the other.
+#[test]
+fn observe_workspace_rejects_duplicate_triplet() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_source_one_target(
+        "editor-src",
+        &fx.url,
+        "dest",
+        &td.target_path(),
+        "by-source",
+    );
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+    fx.backend
+        .fetch(&sn("editor-src"), &fx.url)
+        .expect("seed editor-src mirror");
+    let commits = one_commit(&parsed, "editor-src", &fx.head_sha);
+    let protected = test_protected(fx.src.path());
+    let journal = Journal::open(&fx.registry.locks_dir()).expect("open journal");
+
+    let colliding_artifact = || crate::projection::model::ProjectedArtifact {
+        destination: crate::projection::model::TargetPath::new("editor").expect("valid dest"),
+        source: crate::projection::model::ResolvedSourceRef::new("editor-src", &fx.head_sha),
+        materialization: crate::kernel::Materialization::CollapsedDir {
+            dir: "editor".to_owned(),
+        },
+        kept_leaves: Vec::new(),
+        leaves: Vec::new(),
+    };
+    let binding = crate::projection::model::BindingProjection {
+        identity: "editor-src".to_owned(),
+        source: "editor-src".to_owned(),
+        commit: fx.head_sha.clone(),
+        artifacts: vec![colliding_artifact(), colliding_artifact()],
+        warnings: Vec::new(),
+    };
+    let projection = crate::projection::model::Projection {
+        targets: vec![crate::projection::model::TargetProjection {
+            target: "dest".to_owned(),
+            bindings: vec![binding],
+            artifacts: Vec::new(),
+            warnings: Vec::new(),
+        }],
+        warnings: Vec::new(),
+    };
+
+    let si = input(&cfg, None, None, None, false);
+    let ctx = DeployAll {
+        config: &cfg,
+        parsed: &parsed,
+        remotes: &remotes,
+        resolved_commits: &commits,
+        protected: &protected,
+        input: &si,
+        backend: &fx.backend,
+        registry: &fx.registry,
+        journal: &journal,
+    };
+
+    let err = super::observe::observe_workspace(&ctx, &projection).expect_err(
+        "two observations on the same (target, identity, published_key) triplet must fail closed, \
+         not silently collapse to a last-wins single entry",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("duplicate observed artifact"),
+        "the observation producer must reject a duplicate triplet with a `duplicate observed \
+         artifact` diagnostic, got: {msg}"
+    );
+}
