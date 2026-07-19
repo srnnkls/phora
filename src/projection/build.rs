@@ -1,13 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::diagnostic::SelectionDiagnostic;
-use crate::error::{Error, Result};
+use crate::error::Error;
 use crate::projection::collapse::{CollapseChoice, CollapseMode, CollapseWarning, plan_collapse};
 use crate::projection::diagnostic::{ProjectionError, ProjectionWarning, unsafe_leaf};
 use crate::projection::model::{
     ArtifactRelativePath, BindingProjection, BindingProjectionInput, ContentTransform,
-    Materialization, MaterializationPolicy, OfferSpec, ProjectedArtifact, ProjectedLeaf, TakeSpec,
-    TargetPath, TargetProjection, TemplatePolicy,
+    Materialization, MaterializationPolicy, OfferSpec, ProjectedArtifact, ProjectedLeaf,
+    Projection, TakeSpec, TargetPath, TargetProjection, TemplatePolicy, WorkspaceTargetInput,
 };
 use crate::projection::offer::OfferSelection;
 use crate::projection::take::{ResolvedTake, TakeWarning, fold_dest, resolve_take};
@@ -209,7 +209,7 @@ fn reject_partial_take_collapse(
     kept: &[ResolvedTake],
     offer: &[String],
     collapse: Option<bool>,
-) -> Result<Vec<Materialization>> {
+) -> crate::error::Result<Vec<Materialization>> {
     let kept_at_identity: BTreeSet<&str> = kept
         .iter()
         .filter(|r| r.source == r.dest)
@@ -318,6 +318,29 @@ pub fn project_target(
         target: target_name.to_owned(),
         bindings,
         artifacts,
+        warnings,
+    })
+}
+
+/// Projects every target purely from resolved value inputs, aggregating each target's
+/// projection and the workspace-wide warnings into one [`Projection`].
+///
+/// # Errors
+/// Errors if any target fails to project or two of its bindings collide on a destination.
+pub fn build_workspace(targets: &[WorkspaceTargetInput<'_>]) -> Result<Projection, ProjectionError>
+where
+    Projection: Sized,
+{
+    let projected = targets
+        .iter()
+        .map(|workspace_target| project_target(workspace_target.target, &workspace_target.bindings))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let warnings = projected
+        .iter()
+        .flat_map(|target| target.warnings.iter().cloned())
+        .collect();
+    Ok(Projection {
+        targets: projected,
         warnings,
     })
 }

@@ -12,13 +12,18 @@ use crate::source::{SourceBackend, SourceInventory};
 use super::discover::discover_working_tree_leaves;
 use super::remote_for;
 
-pub use crate::projection::build::{project_binding, project_target, projected_artifact_keys};
-pub use crate::projection::diagnostic::{ProjectionError, ProjectionWarning};
-pub use crate::projection::model::{
+use crate::projection::model as projection_model;
+use crate::projection::{build as projection_build, diagnostic as projection_diagnostic};
+
+pub use projection_build::{
+    build_workspace, project_binding, project_target, projected_artifact_keys,
+};
+pub use projection_diagnostic::{ProjectionError, ProjectionWarning};
+pub use projection_model::{
     ArtifactRelativePath, BindingProjection, BindingProjectionInput, CollapsePreference,
     ContentTransform, LayoutSpec, LayoutStyle, MaterializationPolicy, OfferSpec, ProjectedArtifact,
     ProjectedLeaf, Projection, ResolvedSourceRef, TakeSpec, TargetPath, TargetProjection,
-    TemplatePolicy,
+    TemplatePolicy, WorkspaceTargetInput,
 };
 
 pub(crate) fn map_take_entries(entries: &[TakeEntry]) -> Vec<Take<'_>> {
@@ -46,8 +51,23 @@ pub fn plan_target(
     backend: &dyn SourceBackend,
     resolved_commits: &BTreeMap<(String, String), String>,
 ) -> Result<TargetProjection> {
-    let layout = LayoutSpec::from(&target.layout());
+    let discovery = discover_target(target, parsed, remotes, backend, resolved_commits)?;
+    Ok(project_target(target_name, &binding_inputs(&discovery))?)
+}
 
+struct TargetDiscovery {
+    layout: LayoutSpec,
+    discovered: Vec<DiscoveredBinding>,
+}
+
+fn discover_target(
+    target: &Target,
+    parsed: &BTreeMap<String, ParsedSource>,
+    remotes: &BTreeMap<String, String>,
+    backend: &dyn SourceBackend,
+    resolved_commits: &BTreeMap<(String, String), String>,
+) -> Result<TargetDiscovery> {
+    let layout = LayoutSpec::from(&target.layout());
     let mut discovered = Vec::new();
     for binding in target.resolve_sources(parsed) {
         let source = parsed.get(binding.source).ok_or_else(|| {
@@ -82,8 +102,12 @@ pub fn plan_target(
             templates: TemplatePolicy::from(&binding.template_opt_in),
         });
     }
+    Ok(TargetDiscovery { layout, discovered })
+}
 
-    let inputs: Vec<BindingProjectionInput<'_>> = discovered
+fn binding_inputs(discovery: &TargetDiscovery) -> Vec<BindingProjectionInput<'_>> {
+    discovery
+        .discovered
         .iter()
         .map(|d| BindingProjectionInput {
             identity: &d.identity,
@@ -93,12 +117,10 @@ pub fn plan_target(
             take: &d.take,
             collapse: d.collapse,
             materialization: d.materialization,
-            layout: &layout,
+            layout: &discovery.layout,
             templates: &d.templates,
         })
-        .collect();
-
-    Ok(project_target(target_name, &inputs)?)
+        .collect()
 }
 
 struct DiscoveredBinding {
@@ -140,14 +162,22 @@ pub fn project_workspace(
     backend: &dyn SourceBackend,
     resolved_commits: &BTreeMap<(String, String), String>,
 ) -> Result<Projection> {
-    let targets = config
+    let discoveries = config
         .targets
         .iter()
-        .map(|(name, target)| plan_target(name, target, parsed, remotes, backend, resolved_commits))
+        .map(|(name, target)| {
+            Ok((
+                name.as_str(),
+                discover_target(target, parsed, remotes, backend, resolved_commits)?,
+            ))
+        })
         .collect::<Result<Vec<_>>>()?;
-    let warnings = targets
+    let workspace: Vec<WorkspaceTargetInput<'_>> = discoveries
         .iter()
-        .flat_map(|target| target.warnings.iter().cloned())
+        .map(|(name, discovery)| WorkspaceTargetInput {
+            target: name,
+            bindings: binding_inputs(discovery),
+        })
         .collect();
-    Ok(Projection { targets, warnings })
+    Ok(build_workspace(&workspace)?)
 }
