@@ -135,15 +135,28 @@ struct DesiredArtifact {
     artifact: String,
 }
 
-fn desired_artifacts(projection: &Projection) -> impl Iterator<Item = DesiredArtifact> + '_ {
-    projection.targets.iter().flat_map(|target| {
-        target
-            .artifacts
-            .iter()
-            .map(move |artifact| DesiredArtifact {
-                target: target.target.clone(),
-                source: artifact.source.name().to_owned(),
-                artifact: artifact.destination.as_str().to_owned(),
-            })
-    })
+fn desired_artifacts(projection: &Projection) -> Vec<DesiredArtifact> {
+    let mut desired = Vec::new();
+    for target in &projection.targets {
+        if target.bindings.is_empty() {
+            for artifact in &target.artifacts {
+                desired.push(DesiredArtifact {
+                    target: target.target.clone(),
+                    source: artifact.source.name().to_owned(),
+                    artifact: artifact.materialization.published_key().to_owned(),
+                });
+            }
+            continue;
+        }
+        for binding in &target.bindings {
+            for artifact in &binding.artifacts {
+                desired.push(DesiredArtifact {
+                    target: target.target.clone(),
+                    source: binding.identity.clone(),
+                    artifact: artifact.materialization.published_key().to_owned(),
+                });
+            }
+        }
+    }
+    desired
 }
