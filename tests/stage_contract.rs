@@ -7,7 +7,7 @@ use phora::projection::model::{
     TemplatePolicy,
 };
 use phora::source::SourceInventory;
-use phora::sync::{StageBridge, StageRequest, StagedArtifact, StagedFile};
+use phora::sync::{StageRequest, StagedArtifact, StagedFile};
 
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
@@ -35,34 +35,30 @@ fn projected_home() -> TargetProjection {
 }
 
 #[test]
-fn stage_request_is_a_field_literal_swap_from_the_stage_bridge() {
+fn stage_request_borrows_the_projection_artifact_and_target_directly() {
     let target = projected_home();
     let artifact = target
         .artifacts
         .first()
         .expect("fixture projects at least one artifact");
-    let bridge = StageBridge {
-        artifact,
-        target: &target,
-    };
     let variables: BTreeMap<String, String> = [("name".to_owned(), "world".to_owned())]
         .into_iter()
         .collect();
 
     let request = StageRequest {
-        artifact: bridge.artifact,
-        target: bridge.target,
+        artifact,
+        target: &target,
         variables: &variables,
     };
 
     assert!(
         std::ptr::eq(request.artifact, artifact),
-        "StageRequest.artifact is the very &ProjectedArtifact the T014 bridge carries — T015 \
-         swaps bridge fields into the request literally, no clone, no conversion"
+        "StageRequest.artifact is the very &ProjectedArtifact from the projection — deploy/apply \
+         consumes projection values directly, no clone, no conversion (the PR6 StageBridge is retired)"
     );
     assert!(
-        std::ptr::eq(request.target, bridge.target),
-        "StageRequest.target is the bridge's &TargetProjection, borrowed straight through"
+        std::ptr::eq(request.target, &raw const target),
+        "StageRequest.target is the borrowed &TargetProjection, straight through"
     );
     assert_eq!(
         request.target.target, "home",

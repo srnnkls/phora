@@ -13,13 +13,15 @@ use crate::error::{Error, Result};
 use crate::kernel::{Materialization, OfferSelection};
 use crate::lock::{Lock, merge_locks, ref_discriminator};
 use crate::paths::cache_root_for;
+use crate::projection::build::project_binding;
+use crate::projection::diagnostic::ProjectionWarning;
+use crate::projection::model::{
+    BindingProjection, BindingProjectionInput, CollapsePreference, LayoutSpec,
+    MaterializationPolicy, OfferSpec, ResolvedSourceRef, TakeSpec, TemplatePolicy,
+};
 use crate::source::{SourceBackend, SourceInventory};
 use crate::store::Registry;
-use crate::sync::{
-    BindingProjection, BindingProjectionInput, CollapsePreference, LayoutSpec,
-    MaterializationPolicy, OfferSpec, PreviewTargetPlan, ProjectionWarning, ResolvedSourceRef,
-    TakeSpec, TemplatePolicy, offered_leaves, preview_targets, project_binding, resolved_remotes,
-};
+use crate::sync::{PreviewTargetPlan, offered_leaves, preview_targets, resolved_remotes};
 
 use super::render::{
     print_listings, print_orphan_listings, render_preview_json, render_preview_tree, state_label,

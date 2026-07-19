@@ -12,12 +12,14 @@ use crate::lock::{Lock, ref_discriminator};
 use crate::source::{SourceBackend, SourceInventory};
 
 use super::discover::discover_working_tree_leaves;
-use super::plan::{
-    BindingProjection, BindingProjectionInput, CollapsePreference, LayoutSpec,
-    MaterializationPolicy, OfferSpec, ProjectedArtifact, ProjectionWarning, ResolvedSourceRef,
-    TakeSpec, TemplatePolicy, project_binding,
-};
 use super::remote_for;
+use crate::projection::build::project_binding;
+use crate::projection::diagnostic::ProjectionWarning;
+use crate::projection::model::{
+    BindingProjection, BindingProjectionInput, CollapsePreference, LayoutSpec,
+    MaterializationPolicy, OfferSpec, ProjectedArtifact, ResolvedSourceRef, TakeSpec,
+    TemplatePolicy,
+};
 
 /// Whether a binding is renderable now or needs action before it can deploy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]

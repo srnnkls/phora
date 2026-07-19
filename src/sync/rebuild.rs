@@ -10,9 +10,10 @@ use crate::store::{
     ArtifactKey, ManifestFile, ProjectedRecord, RecordKind, Registry, RegistryRecord,
 };
 
-use super::plan::{BindingProjection, ProjectedArtifact, TargetProjection, plan_target};
+use super::plan::plan_target;
 use super::stage::{StageRequest, stage_artifact};
 use super::{StageSource, StagingGuard, nonce, remote_for, resolved_remotes};
+use crate::projection::model::{BindingProjection, ProjectedArtifact, TargetProjection};
 
 /// Summary of a [`rebuild_registry`] run: which artifacts were reconstructed and
 /// which on-disk content failed to match the recomputed hash or lacked any config
