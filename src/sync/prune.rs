@@ -7,8 +7,9 @@ use crate::source::SourceBackend;
 use crate::store::{Registry, RegistryRecord};
 
 use super::confine::{ProtectedPathSet, confine_destination};
-use super::plan::{project_workspace, projected_artifact_keys};
+use super::plan::project_workspace;
 use super::remove_orphan_path;
+use crate::projection::build::projected_artifact_keys;
 
 type ExpectedByBinding = BTreeMap<(String, String), Vec<String>>;
 type ExpectedPaths = BTreeMap<String, Vec<PathBuf>>;

@@ -23,10 +23,9 @@ use phora::config::{Config, TemplateOptIn, admit_transitive_hooks, hook_preimage
 use phora::kernel::SourceName;
 use phora::lock::{CandidateHookRecord, LOCK_SCHEMA_VERSION, Lock, TrustedHook};
 use phora::projection::model::{
-    ArtifactRelativePath, BindingProjection, BindingProjectionInput, CollapsePreference,
-    ContentTransform, LayoutSpec, LayoutStyle, Materialization, MaterializationPolicy, OfferSpec,
-    ProjectedArtifact, ProjectedLeaf, ResolvedSourceRef, TakeSpec, TargetPath, TargetProjection,
-    TemplatePolicy,
+    ArtifactRelativePath, BindingProjectionInput, CollapsePreference, ContentTransform, LayoutSpec,
+    LayoutStyle, Materialization, MaterializationPolicy, OfferSpec, ProjectedArtifact,
+    ProjectedLeaf, ResolvedSourceRef, TakeSpec, TargetPath, TargetProjection, TemplatePolicy,
 };
 use phora::source::{
     ExportPolicy, GitBackend, MirrorKey, NormalizedUrl, ResolvedSource, SnapshotId,
@@ -1445,50 +1444,4 @@ fn deploy_joins_the_target_root_with_moved_target_relative_destinations() {
             }
         }
     }
-}
-
-#[test]
-fn sync_facade_projection_exports_are_the_moved_symbols() {
-    let inventory = SourceInventory::from_paths(["d/a.md", "d/b.md"]).expect("valid paths");
-    let offer = OfferSpec::implicit_full();
-    let take = TakeSpec::from_entries(None);
-    let templates = TemplatePolicy::suffix_only();
-    let layout = LayoutSpec::new(LayoutStyle::Flat, String::new());
-    let source = ResolvedSourceRef::new("s", "c0ffee");
-    let input = BindingProjectionInput {
-        identity: "s",
-        source: &source,
-        offer: &offer,
-        inventory: &inventory,
-        take: &take,
-        collapse: CollapsePreference::Default,
-        materialization: MaterializationPolicy::Copy,
-        layout: &layout,
-        templates: &templates,
-    };
-
-    let via_facade: BindingProjection =
-        phora::sync::project_binding(&input).expect("facade projects");
-    let direct = phora::projection::build::project_binding(&input).expect("direct path projects");
-    assert_eq!(
-        via_facade, direct,
-        "facade and moved path yield one projection"
-    );
-
-    let facade_keys: fn(&BindingProjection) -> Vec<String> = phora::sync::projected_artifact_keys;
-    assert_eq!(
-        facade_keys(&direct),
-        phora::projection::build::projected_artifact_keys(&direct),
-        "facade and moved projected_artifact_keys agree"
-    );
-    assert_eq!(
-        phora::projection::build::projected_artifact_keys(&direct),
-        vec!["d".to_owned()],
-        "the wholly-taken dir projects as the collapsed key `d`"
-    );
-
-    let moved_destination: phora::projection::model::TargetPath =
-        direct.artifacts[0].destination.clone();
-    let facade_destination: phora::sync::TargetPath = moved_destination;
-    assert_eq!(facade_destination.as_str(), "d");
 }

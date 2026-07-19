@@ -1316,6 +1316,209 @@ fn sync_errors_on_flat_layout_collision_naming_artifact_sources_and_target() {
     drop(fx_b);
 }
 
+// ── R4: cross-target physical destination overlap ──────────────
+
+fn assert_overlap_rejected(
+    result: Result<SyncOutput>,
+    registry: &FileRegistry,
+    targets: (&str, &str),
+    overlap: &str,
+    absent_roots: &[PathBuf],
+) {
+    let Err(err) = result else {
+        panic!(
+            "R4: targets `{}` and `{}` whose physical destinations overlap must hard-error \
+             sync-side (SelectionDiagnostic-shaped) BEFORE any staging/mutation — today sync \
+             warns+skips or deploys",
+            targets.0, targets.1
+        );
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains(targets.0) && msg.contains(targets.1),
+        "R4: the overlap diagnostic must name BOTH offending targets `{}` and `{}`; got: {msg}",
+        targets.0,
+        targets.1
+    );
+    assert!(
+        msg.contains(overlap),
+        "R4: the overlap diagnostic must name the overlapping physical path `{overlap}`; got: {msg}"
+    );
+    let records = registry
+        .list_all()
+        .expect("list_all after a pre-mutation rejection");
+    assert!(
+        records.is_empty(),
+        "R4: zero mutation — registry.list_all() must be empty after the pre-mutation overlap \
+         check errs, got {records:?}"
+    );
+    for root in absent_roots {
+        assert!(
+            !root.exists(),
+            "R4: no target root/artifact may reach disk before the overlap check errs: {}",
+            root.display()
+        );
+    }
+}
+
+#[test]
+fn sync_rejects_two_targets_with_equal_physical_destinations() {
+    let (sa, url_a) = build_named_artifact_repo("shared", "a.txt", b"from-a\n");
+    let (sb, url_b) = build_named_artifact_repo("shared", "b.txt", b"from-b\n");
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let td = TargetDir::new();
+    let base = td.target_path();
+
+    let toml = format!(
+        "version = 1\n\n\
+             [sources.sa]\ngit = \"{url_a}\"\nbranch = \"main\"\n\n\
+             [sources.sb]\ngit = \"{url_b}\"\nbranch = \"main\"\n\n\
+             [targets.alpha]\npath = \"{0}\"\nsources = [\"sa\"]\nlayout = \"flat\"\n\n\
+             [targets.beta]\npath = \"{0}\"\nsources = [\"sb\"]\nlayout = \"flat\"\n",
+        base.display(),
+    );
+    let cfg = Config::parse(&toml).expect("equal-destination two-target config parses");
+
+    let result = sync(&input(&cfg, None, None, None, false), &backend, &registry);
+    assert_overlap_rejected(
+        result,
+        &registry,
+        ("alpha", "beta"),
+        "shared",
+        &[base.clone(), base.join("shared")],
+    );
+
+    drop(sa);
+    drop(sb);
+}
+
+#[test]
+fn sync_rejects_overlap_with_outer_target_lexically_first() {
+    let (so, url_o) = build_named_artifact_repo("od", "f.txt", b"outer\n");
+    let (si, url_i) = build_named_artifact_repo("id", "g.txt", b"inner\n");
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let td = TargetDir::new();
+    let base = td.target_path();
+
+    let toml = format!(
+        "version = 1\n\n\
+             [sources.so]\ngit = \"{url_o}\"\nbranch = \"main\"\n\n\
+             [sources.si]\ngit = \"{url_i}\"\nbranch = \"main\"\n\n\
+             [targets.a_outer]\npath = \"{}\"\nsources = [\"so\"]\nlayout = \"flat\"\n\n\
+             [targets.b_inner]\npath = \"{}\"\nsources = [\"si\"]\nlayout = \"flat\"\n",
+        base.display(),
+        base.join("od").display(),
+    );
+    let cfg = Config::parse(&toml).expect("outer-lexically-first containment config parses");
+
+    let result = sync(&input(&cfg, None, None, None, false), &backend, &registry);
+    assert_overlap_rejected(
+        result,
+        &registry,
+        ("a_outer", "b_inner"),
+        "od",
+        &[base.clone(), base.join("od")],
+    );
+
+    drop(so);
+    drop(si);
+}
+
+#[test]
+fn sync_rejects_overlap_with_inner_target_lexically_first() {
+    let (so, url_o) = build_named_artifact_repo("od", "f.txt", b"outer\n");
+    let (si, url_i) = build_named_artifact_repo("id", "g.txt", b"inner\n");
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let td = TargetDir::new();
+    let base = td.target_path();
+
+    let toml = format!(
+        "version = 1\n\n\
+             [sources.so]\ngit = \"{url_o}\"\nbranch = \"main\"\n\n\
+             [sources.si]\ngit = \"{url_i}\"\nbranch = \"main\"\n\n\
+             [targets.a_inner]\npath = \"{}\"\nsources = [\"si\"]\nlayout = \"flat\"\n\n\
+             [targets.b_outer]\npath = \"{}\"\nsources = [\"so\"]\nlayout = \"flat\"\n",
+        base.join("od").display(),
+        base.display(),
+    );
+    let cfg = Config::parse(&toml).expect("inner-lexically-first containment config parses");
+
+    let result = sync(&input(&cfg, None, None, None, false), &backend, &registry);
+    assert_overlap_rejected(
+        result,
+        &registry,
+        ("a_inner", "b_outer"),
+        "od",
+        &[base.clone(), base.join("od")],
+    );
+
+    drop(so);
+    drop(si);
+}
+
+#[test]
+fn sync_allows_two_targets_with_disjoint_physical_roots() {
+    let (so, url_o) = build_named_artifact_repo("shared", "f.txt", b"outer\n");
+    let (si, url_i) = build_named_artifact_repo("x", "g.txt", b"inner\n");
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let td = TargetDir::new();
+    let base = td.target_path();
+
+    let toml = format!(
+        "version = 1\n\n\
+             [sources.so]\ngit = \"{url_o}\"\nbranch = \"main\"\n\n\
+             [sources.si]\ngit = \"{url_i}\"\nbranch = \"main\"\n\n\
+             [targets.a_side]\npath = \"{}\"\nsources = [\"so\"]\nlayout = \"flat\"\n\n\
+             [targets.b_side]\npath = \"{}\"\nsources = [\"si\"]\nlayout = \"flat\"\n",
+        base.join("a").display(),
+        base.join("b").display(),
+    );
+    let cfg = Config::parse(&toml).expect("disjoint two-target config parses");
+
+    sync(&input(&cfg, None, None, None, false), &backend, &registry)
+        .expect("two targets with disjoint physical roots must sync cleanly");
+
+    assert!(
+        base.join("a/shared/f.txt").exists() && base.join("b/x/g.txt").exists(),
+        "disjoint targets both deploy — the overlap check must not reject non-overlapping roots"
+    );
+
+    drop(so);
+    drop(si);
+}
+
+#[test]
+fn sync_allows_targets_whose_roots_share_a_string_prefix_but_no_ancestor_relation() {
+    let (so, url_o) = build_named_artifact_repo("od", "f.txt", b"outer\n");
+    let (si, url_i) = build_named_artifact_repo("id", "g.txt", b"inner\n");
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let td = TargetDir::new();
+    let base = td.target_path();
+
+    let toml = format!(
+        "version = 1\n\n\
+             [sources.so]\ngit = \"{url_o}\"\nbranch = \"main\"\n\n\
+             [sources.si]\ngit = \"{url_i}\"\nbranch = \"main\"\n\n\
+             [targets.s_a]\npath = \"{}\"\nsources = [\"so\"]\nlayout = \"flat\"\n\n\
+             [targets.s_b]\npath = \"{}\"\nsources = [\"si\"]\nlayout = \"flat\"\n",
+        base.join("shared").display(),
+        base.join("shared-other").display(),
+    );
+    let cfg = Config::parse(&toml).expect("prefix-sibling two-target config parses");
+
+    sync(&input(&cfg, None, None, None, false), &backend, &registry)
+        .expect("targets whose roots share a string prefix but no path-ancestor relation sync Ok");
+
+    assert!(
+        base.join("shared/od/f.txt").exists() && base.join("shared-other/id/g.txt").exists(),
+        "R4 must use path-component ancestor semantics (touches()), not naive string-prefix — \
+         `<base>/shared` and `<base>/shared-other` are siblings, not overlapping"
+    );
+
+    drop(so);
+    drop(si);
+}
+
 // ── binding identity + aliasing + destination collision ──
 
 /// A git repo with two top-level artifact dirs: `nvim/` and `tmux/`. A source may

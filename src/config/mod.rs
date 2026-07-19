@@ -285,7 +285,7 @@ impl Config {
     }
 }
 
-use crate::sync::{
+use crate::projection::model::{
     CollapsePreference, LayoutSpec, LayoutStyle, MaterializationPolicy, OfferSpec, TakeSpec,
     TemplatePolicy,
 };

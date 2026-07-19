@@ -12,12 +12,14 @@ use crate::store::{
 };
 
 use super::confine::{ProtectedPathSet, confine_destination};
-use super::plan::{ProjectedArtifact, ProjectionWarning, TargetProjection, plan_target};
+use super::plan::plan_target;
 use super::stage::{StageRequest, stage_artifact};
 use super::{
     Conflict, ConflictKind, ConflictResolver, Resolution, StageSource, StagingGuard, nonce,
     remote_for, target_parent,
 };
+use crate::projection::diagnostic::ProjectionWarning;
+use crate::projection::model::{ProjectedArtifact, TargetProjection};
 
 #[derive(Clone, Copy)]
 pub(super) struct TargetRun<'a> {

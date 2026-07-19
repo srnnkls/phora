@@ -26,8 +26,8 @@ pub use plan::{
     ArtifactRelativePath, BindingProjection, BindingProjectionInput, CollapsePreference,
     ContentTransform, LayoutSpec, LayoutStyle, MaterializationPolicy, OfferSpec, ProjectedArtifact,
     ProjectedLeaf, Projection, ProjectionError, ProjectionWarning, ResolvedSourceRef, TakeSpec,
-    TargetPath, TargetProjection, TemplatePolicy, plan_target, project_binding, project_target,
-    project_workspace, projected_artifact_keys,
+    TargetPath, TargetProjection, TemplatePolicy, WorkspaceTargetInput, build_workspace,
+    plan_target, project_binding, project_target, project_workspace, projected_artifact_keys,
 };
 pub(crate) use preview::offered_leaves;
 pub use preview::{
@@ -332,6 +332,14 @@ fn preflight_all_targets(ctx: &DeployAll<'_>) -> Result<ConflictDecisions> {
 }
 
 fn deploy_all_targets(ctx: &DeployAll<'_>) -> Result<DeployRun> {
+    let projection = project_workspace(
+        ctx.config,
+        ctx.parsed,
+        ctx.remotes,
+        ctx.backend,
+        ctx.resolved_commits,
+    )?;
+    reject_cross_target_overlap(&projection, ctx.config)?;
     let decisions = preflight_all_targets(ctx)?;
     let mut run = DeployRun {
         had_failures: false,
@@ -372,6 +380,61 @@ fn deploy_all_targets(ctx: &DeployAll<'_>) -> Result<DeployRun> {
         )?;
     }
     Ok(run)
+}
+
+fn reject_cross_target_overlap(projection: &Projection, config: &Config) -> Result<()> {
+    let mut placements: Vec<(&str, PathBuf)> = Vec::new();
+    for target_projection in &projection.targets {
+        let Some(target) = config.targets.get(&target_projection.target) else {
+            continue;
+        };
+        let root = target.expanded_path();
+        let layout = target.layout();
+        for binding in &target_projection.bindings {
+            for key in projected_artifact_keys(binding) {
+                placements.push((
+                    &target_projection.target,
+                    root.join(layout.artifact_path(&binding.identity, &key)),
+                ));
+            }
+        }
+    }
+    for (i, (first_target, first_path)) in placements.iter().enumerate() {
+        for (second_target, second_path) in &placements[i + 1..] {
+            if first_target != second_target
+                && (first_path.starts_with(second_path) || second_path.starts_with(first_path))
+            {
+                return Err(cross_target_overlap_diagnostic(
+                    first_target,
+                    second_target,
+                    first_path,
+                    second_path,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cross_target_overlap_diagnostic(
+    first_target: &str,
+    second_target: &str,
+    first_path: &Path,
+    second_path: &Path,
+) -> Error {
+    crate::diagnostic::SelectionDiagnostic {
+        entry: format!("{first_target} / {second_target}"),
+        matched_against: "the physical deploy destinations across all targets".to_owned(),
+        why: "two targets project artifacts onto overlapping physical paths".to_owned(),
+        did_you_mean: None,
+        remedy: "give each target a disjoint deploy path, or narrow their sources".to_owned(),
+        debug_hint: Some("phora preview".to_owned()),
+        details: vec![
+            format!("target `{first_target}`: {}", first_path.display()),
+            format!("target `{second_target}`: {}", second_path.display()),
+        ],
+    }
+    .sync()
 }
 
 fn notify_orphans(config: &Config, registry: &dyn Registry) -> Result<()> {
