@@ -25,15 +25,17 @@ use crate::sync::model::{ChangeSet, ConflictKind, ManagedCondition, ObservedArti
 use crate::deploy::{ArtifactState, check_artifact_state};
 
 #[derive(Clone, Copy)]
-#[expect(
-    dead_code,
-    reason = "commits/force/interactive/resolver feed the cfg(test) single-entry apply shim; the production observe/reconcile path reads state through SyncInput"
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "force/interactive/resolver feed the cfg(test) single-entry apply shim; the production observe/reconcile path reads state through SyncInput"
+    )
 )]
 pub(super) struct TargetRun<'a> {
     pub(super) parsed: &'a BTreeMap<String, ParsedSource>,
     pub(super) target_name: &'a str,
     pub(super) target: &'a Target,
-    pub(super) commits: &'a BTreeMap<(String, String), String>,
     pub(super) remotes: &'a BTreeMap<String, String>,
     pub(super) force: bool,
     pub(super) interactive: bool,
@@ -1012,7 +1014,6 @@ mod confine_fail_closed_tests {
         target_name: &'a str,
         protected: &'a ProtectedPathSet,
         parsed: &'a BTreeMap<String, ParsedSource>,
-        commits: &'a BTreeMap<(String, String), String>,
         remotes: &'a BTreeMap<String, String>,
         vars: &'a BTreeMap<String, String>,
         resolver: &'a dyn ConflictResolver,
@@ -1021,7 +1022,6 @@ mod confine_fail_closed_tests {
             parsed,
             target_name,
             target,
-            commits,
             remotes,
             force: false,
             interactive: false,
@@ -1039,7 +1039,6 @@ mod confine_fail_closed_tests {
             ProtectedPathSet::resolve(&crate::config::Paths::default(), Path::new("/home/u/proj"))
                 .expect("protected");
         let parsed = BTreeMap::new();
-        let commits = BTreeMap::new();
         let remotes = BTreeMap::new();
         let vars = BTreeMap::new();
         let resolver = NeverResolve;
@@ -1048,7 +1047,6 @@ mod confine_fail_closed_tests {
             "root%1%nvim",
             &protected,
             &parsed,
-            &commits,
             &remotes,
             &vars,
             &resolver,

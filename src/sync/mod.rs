@@ -307,7 +307,6 @@ fn target_run<'a>(
         parsed: ctx.parsed,
         target_name,
         target,
-        commits: ctx.resolved_commits,
         remotes: ctx.remotes,
         force: ctx.input.force,
         interactive: ctx.input.interactive,
@@ -387,12 +386,14 @@ fn deploy_all_targets(ctx: &DeployAll<'_>) -> Result<DeployRun> {
 }
 
 fn reject_cross_target_overlap(projection: &Projection, config: &Config) -> Result<()> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| Error::Sync(format!("resolve current dir for overlap check: {e}")))?;
     let mut placements: Vec<(&str, PathBuf)> = Vec::new();
     for target_projection in &projection.targets {
         let Some(target) = config.targets.get(&target_projection.target) else {
             continue;
         };
-        let root = target.expanded_path();
+        let root = cwd.join(target.expanded_path());
         let layout = target.layout();
         for binding in &target_projection.bindings {
             for key in projected_artifact_keys(binding) {
@@ -896,6 +897,7 @@ fn prune_fast_forward_drops(
         return Err(registry.readonly_error().into());
     }
     let projection = project_workspace(config, parsed, remotes, backend, resolved_commits)?;
+    reject_cross_target_overlap(&projection, config)?;
     let expected_paths = prune::expected_live_paths(&projection, config);
     for record in drops {
         let Some(target) = config.targets.get(&record.key.target) else {

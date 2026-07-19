@@ -1,5 +1,3 @@
-//! Live structural gate for T020: sync-owned I/O orchestrator wiring.
-
 use std::fs;
 use std::path::PathBuf;
 
