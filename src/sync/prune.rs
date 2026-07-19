@@ -1,15 +1,14 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::config::{Config, LayoutConfig, LayoutKind, ParsedSource};
+use crate::config::{Config, LayoutConfig, LayoutKind};
 use crate::error::{Error, Result};
-use crate::source::SourceBackend;
 use crate::store::{Registry, RegistryRecord};
 
 use super::confine::{ProtectedPathSet, confine_destination};
-use super::plan::project_workspace;
 use super::remove_orphan_path;
 use crate::projection::build::projected_artifact_keys;
+use crate::projection::model::Projection;
 
 type ExpectedByBinding = BTreeMap<(String, String), Vec<String>>;
 type ExpectedPaths = BTreeMap<String, Vec<PathBuf>>;
@@ -104,14 +103,7 @@ fn overlaps_foreign_live_dest(
     })
 }
 
-pub(super) fn expected_live_paths(
-    config: &Config,
-    parsed: &BTreeMap<String, ParsedSource>,
-    remotes: &BTreeMap<String, String>,
-    backend: &dyn SourceBackend,
-    resolved_commits: &BTreeMap<(String, String), String>,
-) -> Result<ExpectedPaths> {
-    let projection = project_workspace(config, parsed, remotes, backend, resolved_commits)?;
+pub(super) fn expected_live_paths(projection: &Projection, config: &Config) -> ExpectedPaths {
     let mut expected_paths: ExpectedPaths = BTreeMap::new();
     for plan in &projection.targets {
         let Some(target) = config.targets.get(&plan.target) else {
@@ -128,7 +120,7 @@ pub(super) fn expected_live_paths(
             }
         }
     }
-    Ok(expected_paths)
+    expected_paths
 }
 
 fn refuse_readonly_prune(
@@ -150,16 +142,27 @@ fn refuse_readonly_prune(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn prune_orphans(
     config: &Config,
-    parsed: &BTreeMap<String, ParsedSource>,
+    parsed: &BTreeMap<String, crate::config::ParsedSource>,
     remotes: &BTreeMap<String, String>,
-    backend: &dyn SourceBackend,
+    backend: &dyn crate::source::SourceBackend,
     registry: &dyn Registry,
     resolved_commits: &BTreeMap<(String, String), String>,
     protected: &ProtectedPathSet,
 ) -> Result<()> {
-    let projection = project_workspace(config, parsed, remotes, backend, resolved_commits)?;
+    let projection =
+        super::plan::project_workspace(config, parsed, remotes, backend, resolved_commits)?;
+    prune_projected(&projection, config, registry, protected)
+}
+
+pub(super) fn prune_projected(
+    projection: &Projection,
+    config: &Config,
+    registry: &dyn Registry,
+    protected: &ProtectedPathSet,
+) -> Result<()> {
     let mut expected: ExpectedByBinding = BTreeMap::new();
     let mut live_paths: LivePathsBySource = BTreeMap::new();
     for plan in &projection.targets {
