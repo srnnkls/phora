@@ -9,11 +9,16 @@ use super::confine::{ProtectedPathSet, confine_destination};
 use super::{persisted_manifest_relative_path, remove_orphan_path};
 use crate::projection::build::projected_artifact_keys;
 use crate::projection::model::Projection;
+use crate::sync::model::{ObservedArtifact, ObservedProjectState, SyncChange};
+use crate::sync::request::SyncEvents;
+use crate::sync::{AppliedChange, SyncWarning};
 
+#[cfg(test)]
 type ExpectedByBinding = BTreeMap<(String, String), Vec<String>>;
 type ExpectedPaths = BTreeMap<String, Vec<PathBuf>>;
 type LivePathsBySource = BTreeMap<String, Vec<(String, PathBuf)>>;
 
+#[cfg(test)]
 fn is_still_expected(
     expected: &ExpectedByBinding,
     target: &str,
@@ -123,6 +128,7 @@ pub(super) fn expected_live_paths(projection: &Projection, config: &Config) -> E
     expected_paths
 }
 
+#[cfg(test)]
 fn refuse_readonly_prune(
     registry: &dyn Registry,
     records: &[RegistryRecord],
@@ -142,6 +148,7 @@ fn refuse_readonly_prune(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn prune_projected(
     projection: &Projection,
     config: &Config,
@@ -202,10 +209,6 @@ pub(super) fn prune_projected(
                     if path.exists()
                         && !overlaps_any_live_dest(&path, &live_paths, &record.key.target) =>
                 {
-                    eprintln!(
-                        "phora: pruning orphaned {}:{}",
-                        record.key.source, record.key.artifact
-                    );
                     remove_orphan_path(&path)
                         .map_err(|e| Error::Sync(format!("prune {}: {e}", path.display())))?;
                 }
@@ -224,11 +227,7 @@ pub(super) fn prune_projected(
                     prune_stale_manifest_children(&path, &record, &live_paths, &record.key.target)?;
                 }
                 Ok(_) => {}
-                Err(e) => {
-                    eprintln!(
-                        "phora: refusing to prune out-of-anchor {}: {e}",
-                        dst.display()
-                    );
+                Err(_e) => {
                     // Keep the record: the file is still on disk, so it must stay tracked.
                     continue;
                 }
@@ -243,6 +242,174 @@ pub(super) fn prune_projected(
         registry.remove(&record.key)?;
     }
     Ok(())
+}
+
+pub(super) fn apply_reconciled_removals(
+    changes: &[SyncChange],
+    observed: &ObservedProjectState<RegistryRecord>,
+    projection: &Projection,
+    config: &Config,
+    registry: &dyn Registry,
+    protected: &ProtectedPathSet,
+    events: &mut SyncEvents,
+) -> Result<()> {
+    let removals: Vec<(&str, &str, &str, &crate::sync::model::RemovalReason)> = changes
+        .iter()
+        .filter_map(|change| match change {
+            SyncChange::Remove {
+                target,
+                source,
+                artifact,
+                reason,
+            } => Some((target.as_str(), source.as_str(), artifact.as_str(), reason)),
+            _ => None,
+        })
+        .collect();
+    if registry.refuses_writes() && !removals.is_empty() {
+        return Err(registry.readonly_error().into());
+    }
+
+    let records: BTreeMap<(&str, &str, &str), &RegistryRecord> = observed
+        .artifacts
+        .iter()
+        .filter_map(|entry| match &entry.observation {
+            ObservedArtifact::Managed(managed) => Some((
+                (
+                    entry.target.as_str(),
+                    entry.source.as_str(),
+                    entry.artifact.as_str(),
+                ),
+                &managed.record,
+            )),
+            _ => None,
+        })
+        .collect();
+    let live_paths = live_paths_by_source(projection, config);
+    for (target, source, artifact, reason) in removals {
+        let Some(record) = records.get(&(target, source, artifact)).copied() else {
+            return Err(Error::Sync(format!(
+                "reconciled removal {source}:{artifact} in target {target} has no managed record"
+            )));
+        };
+        if !remove_reconciled_record(record, config, registry, protected, &live_paths, events)? {
+            continue;
+        }
+        events.applied.push(AppliedChange::Removed {
+            target: target.to_owned(),
+            source: source.to_owned(),
+            artifact: artifact.to_owned(),
+            reason: reason.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn live_paths_by_source(projection: &Projection, config: &Config) -> LivePathsBySource {
+    let mut live_paths = LivePathsBySource::new();
+    for target_projection in &projection.targets {
+        let Some(target) = config.targets.get(&target_projection.target) else {
+            continue;
+        };
+        let paths = live_paths
+            .entry(target_projection.target.clone())
+            .or_default();
+        for binding in &target_projection.bindings {
+            for key in projected_artifact_keys(binding) {
+                paths.push((
+                    binding.identity.clone(),
+                    target
+                        .expanded_path()
+                        .join(target.layout().artifact_path(&binding.identity, &key)),
+                ));
+            }
+        }
+    }
+    live_paths
+}
+
+fn remove_reconciled_record(
+    record: &RegistryRecord,
+    config: &Config,
+    registry: &dyn Registry,
+    protected: &ProtectedPathSet,
+    live_paths: &LivePathsBySource,
+    events: &mut SyncEvents,
+) -> Result<bool> {
+    if let Some(target) = config.targets.get(&record.key.target) {
+        let dst = super::target::record_artifact_path(target, record);
+        let confined = match &target.confine {
+            Some(anchor) => confine_destination(anchor, &dst, protected),
+            None if super::target::is_composed_target(&record.key.target) => {
+                Err(Error::Config(format!(
+                    "confinement: composed target `{}` reached prune without a confine anchor; \
+                     refusing an unconfined delete",
+                    record.key.target
+                )))
+            }
+            None => Ok(dst.clone()),
+        };
+        match confined {
+            Ok(path)
+                if path.exists()
+                    && !overlaps_any_live_dest(&path, live_paths, &record.key.target) =>
+            {
+                remove_orphan_path(&path)
+                    .map_err(|error| Error::Sync(format!("prune {}: {error}", path.display())))?;
+            }
+            Ok(path)
+                if path.exists()
+                    && overlaps_foreign_live_dest(
+                        &path,
+                        live_paths,
+                        &record.key.target,
+                        &record.key.source,
+                    ) =>
+            {
+                return Ok(false);
+            }
+            Ok(path) if path.exists() => {
+                prune_stale_manifest_children(&path, record, live_paths, &record.key.target)?;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                events.warnings.push(SyncWarning::Message(format!(
+                    "refusing to prune out-of-anchor {}: {error}",
+                    dst.display()
+                )));
+                return Ok(false);
+            }
+        }
+    } else {
+        let Some(path) = orphan_artifact_path(record) else {
+            if record.deploy_root.is_some() {
+                events.warnings.push(SyncWarning::Message(format!(
+                    "dropping the record for orphaned {}:{} only — its on-disk path cannot be \
+                     reconstructed (layout `{}` unrecognized or missing its separator); any file \
+                     is left in place rather than deleting a guessed path",
+                    record.key.source, record.key.artifact, record.layout
+                )));
+            }
+            registry.remove(&record.key)?;
+            return Ok(true);
+        };
+        if super::target::is_composed_target(&record.key.target) {
+            events.warnings.push(SyncWarning::Message(format!(
+                "refusing to prune out-of-anchor {}: composed target `{}` has no confine anchor",
+                path.display(),
+                record.key.target
+            )));
+            return Ok(false);
+        }
+        if overlaps_any_live_path(&path, live_paths) {
+            return Ok(false);
+        }
+        if path.exists() {
+            remove_orphan_path(&path)
+                .map_err(|error| Error::Sync(format!("prune {}: {error}", path.display())))?;
+        }
+    }
+    registry.remove(&record.key)?;
+    Ok(true)
 }
 
 fn prune_stale_manifest_children(
@@ -350,42 +517,28 @@ fn has_symlink_ancestor(artifact_root: &Path, path: &Path) -> Result<bool> {
     Ok(false)
 }
 
+#[cfg(test)]
 fn keep_orphan(
     record: &RegistryRecord,
     path: &Path,
     live_paths: &LivePathsBySource,
 ) -> Result<bool> {
     if super::target::is_composed_target(&record.key.target) {
-        eprintln!(
-            "phora: refusing to prune out-of-anchor {}: composed target `{}` has no confine anchor",
-            path.display(),
-            record.key.target
-        );
         return Ok(true);
     }
     if overlaps_any_live_path(path, live_paths) {
         return Ok(true);
     }
     if path.exists() {
-        eprintln!(
-            "phora: pruning orphaned {}:{}",
-            record.key.source, record.key.artifact
-        );
         remove_orphan_path(path)
             .map_err(|e| Error::Sync(format!("prune {}: {e}", path.display())))?;
     }
     Ok(false)
 }
 
+#[cfg(test)]
 fn diagnose_unreconstructable_orphan(record: &RegistryRecord) {
-    if record.deploy_root.is_some() {
-        eprintln!(
-            "phora: dropping the record for orphaned {}:{} only — its on-disk path cannot be \
-             reconstructed (layout `{}` unrecognized or missing its separator); any file is left \
-             in place rather than deleting a guessed path",
-            record.key.source, record.key.artifact, record.layout
-        );
-    }
+    let _ = record;
 }
 
 #[cfg(test)]

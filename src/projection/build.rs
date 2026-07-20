@@ -40,7 +40,8 @@ pub fn project_binding(
         .map_err(other)?
         .select(&candidates);
 
-    let directives = input.take.directives();
+    let expanded_take = expand_directory_literals(input.take, &offer);
+    let directives = expanded_take.directives();
     let resolution = resolve_take(&offer, directives.as_deref())
         .map_err(|error| classify_take_error(error, &offer, input.take))?;
     let resolved_takes = resolution.kept;
@@ -112,6 +113,35 @@ pub fn project_binding(
         artifacts,
         warnings,
     })
+}
+
+fn expand_directory_literals(take: &TakeSpec, offer: &[String]) -> TakeSpec {
+    let TakeSpec::Explicit {
+        literals,
+        globs,
+        renames,
+    } = take
+    else {
+        return TakeSpec::ProjectAll;
+    };
+    let (leaf_literals, directory_globs): (Vec<_>, Vec<_>) =
+        literals.iter().cloned().partition(|literal| {
+            offer.iter().any(|offered| offered == literal)
+                || !offer
+                    .iter()
+                    .any(|offered| offered.starts_with(&format!("{literal}/")))
+        });
+    let mut expanded_globs = globs.clone();
+    expanded_globs.extend(
+        directory_globs
+            .into_iter()
+            .map(|directory| format!("{directory}/**")),
+    );
+    TakeSpec::Explicit {
+        literals: leaf_literals,
+        globs: expanded_globs,
+        renames: renames.clone(),
+    }
 }
 
 fn other(error: Error) -> ProjectionError {

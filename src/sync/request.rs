@@ -172,3 +172,10 @@ pub struct SyncReport {
     pub hook_outcomes: Vec<HookOutcome>,
     pub status: SyncStatus,
 }
+
+#[derive(Debug, Default)]
+pub(super) struct SyncEvents {
+    pub(super) applied: Vec<AppliedChange>,
+    pub(super) skipped: Vec<SkippedChange>,
+    pub(super) warnings: Vec<SyncWarning>,
+}

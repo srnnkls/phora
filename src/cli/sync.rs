@@ -12,7 +12,8 @@ use crate::paths::{cache_root_for, state_root_for};
 use crate::store::{FileRegistry, StoreError};
 use crate::sync::{
     Concurrency, ConflictPolicy, ConflictResolver, HookPolicy, LockSet, MovedPinPolicy,
-    PrunePolicy, SourcePolicy, SyncOptions, SyncOutput, SyncRequest, sync_opened_compat,
+    PrunePolicy, SkippedChange, SourcePolicy, SyncOptions, SyncReport, SyncRequest, SyncWarning,
+    sync_opened,
 };
 
 use super::{
@@ -121,7 +122,7 @@ pub(super) fn run_sync(
         },
         resolver: interactive.then_some(&resolver as &dyn ConflictResolver),
     };
-    let out = sync_opened_compat(&request, &backend, &registry, lockless)?;
+    let out = sync_opened(&request, &backend, &registry, lockless)?;
 
     finish_sync(&cwd, &out, interactive)
 }
@@ -142,10 +143,43 @@ fn stripped_hook_notice(stripped: usize, interactive: bool) -> Option<StrippedHo
     })
 }
 
-fn finish_sync(cwd: &Path, out: &SyncOutput, interactive: bool) -> Result<()> {
-    write_locks(cwd, &out.base_lock, out.local_lock.as_ref())?;
-    let report = super::render::render_hook_report(&out.hook_results);
-    if let Some(notice) = stripped_hook_notice(out.stripped_transitive_hooks, interactive) {
+fn finish_sync(cwd: &Path, out: &SyncReport, interactive: bool) -> Result<()> {
+    let base_lock = out
+        .locks
+        .base
+        .as_ref()
+        .ok_or_else(|| Error::Lock("sync completed without a base lock".to_owned()))?;
+    write_locks(cwd, base_lock, out.locks.local.as_ref())?;
+    render_sync_warnings(out);
+    for applied in &out.applied {
+        if let crate::sync::AppliedChange::Removed {
+            source, artifact, ..
+        } = applied
+        {
+            eprintln!("phora: pruning orphaned {source}:{artifact}");
+        }
+    }
+    for skipped in &out.skipped {
+        if let SkippedChange::Failed {
+            source,
+            artifact,
+            message,
+            ..
+        } = skipped
+        {
+            eprintln!("phora: failed to deploy {source}:{artifact}: {message}");
+        }
+    }
+    let report = super::render::render_hook_report(&out.hook_outcomes);
+    let stripped = out
+        .warnings
+        .iter()
+        .find_map(|warning| match warning {
+            SyncWarning::UntrustedTransitiveHooks { count } => Some(*count),
+            _ => None,
+        })
+        .unwrap_or(0);
+    if let Some(notice) = stripped_hook_notice(stripped, interactive) {
         if !report.is_empty() {
             eprint!("{report}");
         }
@@ -154,15 +188,19 @@ fn finish_sync(cwd: &Path, out: &SyncOutput, interactive: bool) -> Result<()> {
             std::process::exit(1);
         }
     }
-    if out.had_failures {
+    if out.status == crate::sync::SyncStatus::Failed {
         if !report.is_empty() {
             eprint!("{report}");
         }
         let hooks_failed = out
-            .hook_results
+            .hook_outcomes
             .iter()
             .any(|o| o.status == crate::sync::HookStatus::Failure);
-        let message = match (out.deploy_failures, hooks_failed) {
+        let deploy_failures = out
+            .skipped
+            .iter()
+            .any(|skipped| matches!(skipped, SkippedChange::Failed { .. }));
+        let message = match (deploy_failures, hooks_failed) {
             (true, true) => "phora: some artifacts failed to deploy and one or more hooks failed",
             (true, false) => "phora: some artifacts failed to deploy",
             (false, _) => "phora: one or more hooks failed",
@@ -175,6 +213,39 @@ fn finish_sync(cwd: &Path, out: &SyncOutput, interactive: bool) -> Result<()> {
     }
     println!("sync complete");
     Ok(())
+}
+
+fn render_sync_warnings(out: &SyncReport) {
+    for warning in &out.warnings {
+        match warning {
+            SyncWarning::Projection(
+                crate::projection::diagnostic::ProjectionWarning::TakeNoMatchGlob(pattern),
+            ) => eprintln!("phora: take pattern matched no offered leaf: {pattern}"),
+            SyncWarning::Projection(
+                crate::projection::diagnostic::ProjectionWarning::LostCollapseToExclude(dir),
+            ) => eprintln!(
+                "phora: dir `{dir}` cannot collapse to one symlink under a within-dir exclude; \
+                 falling back to per-leaf links"
+            ),
+            SyncWarning::Message(message) => eprintln!("phora: {message}"),
+            SyncWarning::ConflictModified {
+                source,
+                artifact,
+                changed,
+            } => {
+                eprintln!("phora: skipping locally modified {source}:{artifact}");
+                for path in changed {
+                    eprintln!("    {}", path.display());
+                }
+                eprintln!("  use --force to overwrite");
+            }
+            SyncWarning::ConflictForeign { path } => eprintln!(
+                "phora: skipping foreign content at {}; use --force to overwrite",
+                path.display()
+            ),
+            SyncWarning::UntrustedTransitiveHooks { .. } => {}
+        }
+    }
 }
 
 pub(super) fn run_rebuild_registry() -> Result<()> {

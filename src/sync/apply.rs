@@ -6,8 +6,10 @@ use crate::error::{Error, Result};
 use crate::store::{Registry, RegistryRecord};
 use crate::sync::scan::scan_dir_strict;
 
+use super::SyncWarning;
 use super::journal::{Journal, JournalEntry};
 use super::recovery::{backup_path, remove_path, rollback_swap};
+use super::request::SyncEvents;
 
 #[cfg(test)]
 use super::recovery::recovery_sweep;
@@ -97,10 +99,6 @@ impl Drop for CleanupGuard {
     }
 }
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "caller hands off ownership of the record being deployed"
-)]
 pub fn apply_artifact(
     staging_base: &Path,
     staging: &Path,
@@ -108,6 +106,31 @@ pub fn apply_artifact(
     record: RegistryRecord,
     journal: &Journal,
     registry: &dyn Registry,
+) -> Result<()> {
+    let mut events = SyncEvents::default();
+    apply_artifact_report(
+        staging_base,
+        staging,
+        dst,
+        record,
+        journal,
+        registry,
+        &mut events,
+    )
+}
+
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "caller hands off ownership of the record being deployed"
+)]
+pub(super) fn apply_artifact_report(
+    staging_base: &Path,
+    staging: &Path,
+    dst: &Path,
+    record: RegistryRecord,
+    journal: &Journal,
+    registry: &dyn Registry,
+    events: &mut SyncEvents,
 ) -> Result<()> {
     let mut cleanup = CleanupGuard::new();
     cleanup.track(staging.to_path_buf());
@@ -138,7 +161,7 @@ pub fn apply_artifact(
         Err(e) => return Err(Error::Projection(format!("stat {}: {e}", dst.display()))),
     };
 
-    swap_into(staging, dst, record.allow_symlinks)?;
+    swap_into(staging, dst, record.allow_symlinks, events)?;
     journal.mark_swap_completed(dst)?;
 
     if let Err(put_err) = registry.put(&record) {
@@ -266,14 +289,19 @@ fn link_nonce() -> u64 {
 }
 
 /// Same-mount `rename` is atomic; a cross-device error falls back to copy+fsync.
-fn swap_into(staging: &Path, dst: &Path, allow_symlinks: bool) -> Result<()> {
+fn swap_into(
+    staging: &Path,
+    dst: &Path,
+    allow_symlinks: bool,
+    events: &mut SyncEvents,
+) -> Result<()> {
     match std::fs::rename(staging, dst) {
         Ok(()) => Ok(()),
         Err(e) if is_cross_device(&e) => {
-            eprintln!(
-                "phora: staging on a different mount than {}; falling back to recursive copy",
+            events.warnings.push(SyncWarning::Message(format!(
+                "staging on a different mount than {}; falling back to recursive copy",
                 dst.display()
-            );
+            )));
             if staging.is_file() {
                 copy_file(staging, dst)
             } else {

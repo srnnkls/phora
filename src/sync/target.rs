@@ -10,7 +10,7 @@ use crate::store::{
     ScannedFile,
 };
 
-use super::apply::{apply_artifact, link_artifact};
+use super::apply::{apply_artifact_report, link_artifact};
 use super::confine::{ProtectedPathSet, confine_destination};
 use super::journal::Journal;
 use super::stage::{StageRequest, stage_artifact};
@@ -21,6 +21,8 @@ use super::{
 use crate::projection::diagnostic::ProjectionWarning;
 use crate::projection::model::{ProjectedArtifact, TargetProjection};
 use crate::sync::model::{ChangeSet, ConflictKind, ManagedCondition, ObservedArtifact, SyncChange};
+use crate::sync::request::SyncEvents;
+use crate::sync::{AppliedChange, SkippedChange, SyncWarning};
 
 #[derive(Clone, Copy)]
 pub(super) struct TargetRun<'a> {
@@ -155,7 +157,8 @@ pub(super) fn walk_projection_target(
 
     for binding in &projection.bindings {
         if surface_warnings {
-            surface_projection_warnings(&binding.warnings);
+            let mut discarded = SyncEvents::default();
+            collect_projection_warnings(&binding.warnings, &mut discarded);
         }
         let template_opt_in = template_opt_ins.get(&binding.identity).ok_or_else(|| {
             Error::Sync(format!(
@@ -247,6 +250,7 @@ pub(super) fn resolve_conflicts(
     Ok(decisions)
 }
 
+#[cfg(test)]
 pub(super) fn deploy_reconciled_target(
     run: TargetRun<'_>,
     projection: &TargetProjection,
@@ -255,7 +259,31 @@ pub(super) fn deploy_reconciled_target(
     registry: &dyn Registry,
     journal: &Journal,
 ) -> Result<bool> {
-    walk_projection_target(run, projection, registry, true, |run, entry| {
+    let mut events = SyncEvents::default();
+    deploy_reconciled_target_report(
+        run,
+        projection,
+        reconciliation,
+        backend,
+        registry,
+        journal,
+        &mut events,
+    )
+}
+
+pub(super) fn deploy_reconciled_target_report(
+    run: TargetRun<'_>,
+    projection: &TargetProjection,
+    reconciliation: &Reconciliation<'_>,
+    backend: &dyn StageSource,
+    registry: &dyn Registry,
+    journal: &Journal,
+    events: &mut SyncEvents,
+) -> Result<bool> {
+    for binding in &projection.bindings {
+        collect_projection_warnings(&binding.warnings, events);
+    }
+    walk_projection_target(run, projection, registry, false, |run, entry| {
         apply_reconciled(
             run,
             entry,
@@ -264,10 +292,16 @@ pub(super) fn deploy_reconciled_target(
             backend,
             registry,
             journal,
+            events,
         )
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "one artifact apply coordinates the projection, reconciliation, I/O ports, journal, and report collector"
+)]
 fn apply_reconciled(
     run: &TargetRun<'_>,
     entry: &ArtifactEntry<'_>,
@@ -276,6 +310,7 @@ fn apply_reconciled(
     backend: &dyn StageSource,
     registry: &dyn Registry,
     journal: &Journal,
+    events: &mut SyncEvents,
 ) -> Result<bool> {
     let published_key = entry.published_key().to_owned();
     let triplet = conflict_triplet(run, entry);
@@ -296,7 +331,7 @@ fn apply_reconciled(
     }
 
     let deploy_root = run.target.deploy_root();
-    let deploy = |key: ArtifactKey| match entry.source.deploy_mode() {
+    let deploy = |key: ArtifactKey, events: &mut SyncEvents| match entry.source.deploy_mode() {
         DeployMode::Link => deploy_link(registry, journal, entry, key, deploy_root.clone()),
         DeployMode::Copy => deploy_one(
             backend,
@@ -319,22 +354,44 @@ fn apply_reconciled(
                 template_opt_in: entry.template_opt_in,
                 vars: run.vars,
                 confine_anchor: run.target.confine.as_deref(),
+                events,
             },
         ),
     };
 
     match change {
         Some(SyncChange::Deploy { .. } | SyncChange::Overwrite { .. }) => {
-            Ok(run_deploy(deploy, key, entry.identity, &published_key))
+            let applied = match change {
+                Some(SyncChange::Overwrite { .. }) => AppliedChange::Overwritten {
+                    target: run.target_name.to_owned(),
+                    source: entry.identity.to_owned(),
+                    artifact: published_key.clone(),
+                },
+                _ => AppliedChange::Deployed {
+                    target: run.target_name.to_owned(),
+                    source: entry.identity.to_owned(),
+                    artifact: published_key.clone(),
+                },
+            };
+            Ok(run_deploy(
+                deploy,
+                key,
+                run.target_name,
+                entry.identity,
+                &published_key,
+                applied,
+                events,
+            ))
         }
         Some(SyncChange::Conflict { .. }) => match reconciliation.decisions.get(&triplet) {
             Some(outcome) => {
                 if outcome.warn {
-                    warn_skip(
+                    collect_conflict_warning(
                         entry.identity,
                         &published_key,
                         &outcome.kind,
                         entry.artifact_dst,
+                        events,
                     );
                 }
                 apply_resolution(
@@ -345,6 +402,8 @@ fn apply_reconciled(
                     entry,
                     &published_key,
                     registry,
+                    &outcome.kind,
+                    events,
                 )
             }
             None => Err(Error::Sync(format!(
@@ -361,32 +420,72 @@ fn apply_reconciled(
 }
 
 fn run_deploy(
-    deploy: impl FnOnce(ArtifactKey) -> Result<()>,
+    deploy: impl FnOnce(ArtifactKey, &mut SyncEvents) -> Result<()>,
     key: ArtifactKey,
+    target: &str,
     identity: &str,
     published_key: &str,
+    applied: AppliedChange,
+    events: &mut SyncEvents,
 ) -> bool {
-    match deploy(key) {
-        Ok(()) => false,
+    match deploy(key, events) {
+        Ok(()) => {
+            events.applied.push(applied);
+            false
+        }
         Err(e) => {
-            eprintln!("phora: failed to deploy {identity}:{published_key}: {e}");
+            events.skipped.push(SkippedChange::Failed {
+                target: target.to_owned(),
+                source: identity.to_owned(),
+                artifact: published_key.to_owned(),
+                message: e.to_string(),
+            });
             true
         }
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "resolution applies one preflight decision with the full artifact identity and report collector"
+)]
 fn apply_resolution(
     resolution: Resolution,
-    deploy: impl FnOnce(ArtifactKey) -> Result<()>,
+    deploy: impl FnOnce(ArtifactKey, &mut SyncEvents) -> Result<()>,
     key: ArtifactKey,
     run: &TargetRun<'_>,
     entry: &ArtifactEntry<'_>,
     published_key: &str,
     registry: &dyn Registry,
+    kind: &ConflictKind,
+    events: &mut SyncEvents,
 ) -> Result<bool> {
     match resolution {
-        Resolution::Skip => Ok(false),
-        Resolution::Overwrite => Ok(run_deploy(deploy, key, entry.identity, published_key)),
+        Resolution::Skip => {
+            events.skipped.push(SkippedChange::Conflict {
+                target: run.target_name.to_owned(),
+                source: entry.identity.to_owned(),
+                artifact: published_key.to_owned(),
+                kind: kind.clone(),
+            });
+            Ok(false)
+        }
+        Resolution::Overwrite => {
+            let applied = AppliedChange::Overwritten {
+                target: run.target_name.to_owned(),
+                source: entry.identity.to_owned(),
+                artifact: published_key.to_owned(),
+            };
+            Ok(run_deploy(
+                deploy,
+                key,
+                run.target_name,
+                entry.identity,
+                published_key,
+                applied,
+                events,
+            ))
+        }
         Resolution::Eject => {
             let mut ejected = registry.load_ejected(run.target_name)?;
             ejected.push(EjectedEntry {
@@ -395,6 +494,11 @@ fn apply_resolution(
                 ejected_at: chrono::Utc::now().to_rfc3339(),
             });
             registry.save_ejected(run.target_name, &ejected)?;
+            events.applied.push(AppliedChange::Ejected {
+                target: run.target_name.to_owned(),
+                source: entry.identity.to_owned(),
+                artifact: published_key.to_owned(),
+            });
             Ok(false)
         }
         Resolution::Abort => Err(Error::Aborted),
@@ -415,19 +519,11 @@ fn persist_metadata_refresh(
     Ok(())
 }
 
-fn surface_projection_warnings(warnings: &[ProjectionWarning]) {
+fn collect_projection_warnings(warnings: &[ProjectionWarning], events: &mut SyncEvents) {
     for warning in warnings {
-        match warning {
-            ProjectionWarning::TakeNoMatchGlob(pattern) => {
-                eprintln!("phora: take pattern matched no offered leaf: {pattern}");
-            }
-            ProjectionWarning::LostCollapseToExclude(dir) => {
-                eprintln!(
-                    "phora: dir `{dir}` cannot collapse to one symlink under a within-dir exclude; \
-                     falling back to per-leaf links"
-                );
-            }
-        }
+        events
+            .warnings
+            .push(SyncWarning::Projection(warning.clone()));
     }
 }
 
@@ -556,20 +652,25 @@ fn persist_revalidated_refresh(
     Ok(())
 }
 
-fn warn_skip(source: &str, artifact: &str, kind: &ConflictKind, dst: &Path) {
+fn collect_conflict_warning(
+    source: &str,
+    artifact: &str,
+    kind: &ConflictKind,
+    dst: &Path,
+    events: &mut SyncEvents,
+) {
     match kind {
         ConflictKind::Modified { changed } => {
-            eprintln!("phora: skipping locally modified {source}:{artifact}");
-            for path in changed {
-                eprintln!("    {}", path.display());
-            }
-            eprintln!("  use --force to overwrite");
+            events.warnings.push(SyncWarning::ConflictModified {
+                source: source.to_owned(),
+                artifact: artifact.to_owned(),
+                changed: changed.clone(),
+            });
         }
         ConflictKind::Foreign => {
-            eprintln!(
-                "phora: skipping foreign content at {}; use --force to overwrite",
-                dst.display()
-            );
+            events.warnings.push(SyncWarning::ConflictForeign {
+                path: dst.to_path_buf(),
+            });
         }
     }
 }
@@ -591,6 +692,7 @@ struct DeployContext<'a> {
     template_opt_in: &'a TemplateOptIn,
     vars: &'a BTreeMap<String, String>,
     confine_anchor: Option<&'a Path>,
+    events: &'a mut SyncEvents,
 }
 
 fn deploy_one(
@@ -674,13 +776,14 @@ fn deploy_one(
     if matches!(ctx.kind, RecordKind::Dir) {
         staging_guard.disarm();
     }
-    apply_artifact(
+    apply_artifact_report(
         &staging_base,
         &staging_payload,
         ctx.artifact_dst,
         record,
         journal,
         registry,
+        ctx.events,
     )
 }
 
