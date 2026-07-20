@@ -12,9 +12,17 @@
 #![cfg(unix)]
 
 use std::fmt::Write as _;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::io::{Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::process::{ExitStatus, Stdio};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::sync::mpsc;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::time::Duration;
 
 use phora::cli::resolution_from_char;
 use phora::kernel::ProjectId;
@@ -307,17 +315,21 @@ fn build_fixture() -> Fixture {
 }
 
 impl Fixture {
-    fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_phora"))
-            .args(args)
+    fn configure(&self, command: &mut Command) {
+        command
             .current_dir(self.cwd.path())
             .env("HOME", &self.home_path)
             .env("XDG_CACHE_HOME", &self.xdg_cache)
             .env("XDG_STATE_HOME", &self.xdg_state)
             .env_remove("GIT_AUTHOR_DATE")
-            .env_remove("GIT_COMMITTER_DATE")
-            .output()
-            .expect("phora binary runs")
+            .env_remove("GIT_COMMITTER_DATE");
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_phora"));
+        command.args(args);
+        self.configure(&mut command);
+        command.output().expect("phora binary runs")
     }
 
     fn write_config(&self, body: &str) {
@@ -365,6 +377,176 @@ impl Fixture {
             s = s.replace(&project, "<PROJECT>");
         }
         s
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct PtyOutput {
+    status: ExitStatus,
+    transcript: Vec<u8>,
+    script_stderr: Vec<u8>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+enum PtyEvent {
+    Data(Vec<u8>),
+    ReadError(String),
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn normalize_pty_crlf(raw: &[u8]) -> String {
+    let mut normalized = Vec::with_capacity(raw.len());
+    let mut offset = 0;
+    while offset < raw.len() {
+        if raw[offset] == b'\r' {
+            assert_eq!(
+                raw.get(offset + 1),
+                Some(&b'\n'),
+                "PTY transcript contained a bare carriage return at byte {offset}: {raw:?}"
+            );
+            normalized.push(b'\n');
+            offset += 2;
+        } else {
+            normalized.push(raw[offset]);
+            offset += 1;
+        }
+    }
+    String::from_utf8(normalized).expect("PTY transcript is UTF-8 after CRLF normalization")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn pty_sync_command(fx: &Fixture) -> Command {
+    let mut command = Command::new("script");
+
+    // BSD script accepts a command as trailing argv; util-linux accepts it via
+    // `-c`. Both `-e` variants propagate the wrapped phora exit status.
+    #[cfg(target_os = "macos")]
+    command
+        .args(["-q", "-e", "/dev/null"])
+        .arg(env!("CARGO_BIN_EXE_phora"))
+        .arg("sync");
+    #[cfg(target_os = "linux")]
+    command
+        .args([
+            "-q",
+            "-e",
+            "-c",
+            "exec \"$PHORA_PTY_BIN\" sync",
+            "/dev/null",
+        ])
+        .env("PHORA_PTY_BIN", env!("CARGO_BIN_EXE_phora"));
+
+    fx.configure(&mut command);
+    command
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run_sync_in_pty(fx: &Fixture, prompt: &str, answer: &[u8]) -> PtyOutput {
+    let mut command = pty_sync_command(fx);
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("installed `script` utility starts a PTY");
+    let mut input = child.stdin.take().expect("script stdin is piped");
+    let mut stdout = child.stdout.take().expect("script stdout is piped");
+    let mut script_stderr = child.stderr.take().expect("script stderr is piped");
+    let (sender, receiver) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut chunk = [0_u8; 4096];
+        loop {
+            match stdout.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => {
+                    if sender
+                        .send(PtyEvent::Data(chunk[..count].to_vec()))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(PtyEvent::ReadError(error.to_string()));
+                    break;
+                }
+            }
+        }
+    });
+
+    let mut transcript = Vec::new();
+    let prompt_bytes = prompt.as_bytes();
+    let mut prompt_seen = false;
+    let mut timed_out = false;
+    loop {
+        match receiver.recv_timeout(Duration::from_secs(15)) {
+            Ok(PtyEvent::Data(chunk)) => {
+                transcript.extend_from_slice(&chunk);
+                if contains_bytes(&transcript, prompt_bytes) {
+                    prompt_seen = true;
+                    break;
+                }
+            }
+            Ok(PtyEvent::ReadError(error)) => panic!("failed to read PTY transcript: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                timed_out = true;
+                break;
+            }
+        }
+    }
+
+    if prompt_seen {
+        input
+            .write_all(answer)
+            .expect("write conflict answer to PTY");
+        input.flush().expect("flush conflict answer to PTY");
+    }
+
+    if !timed_out {
+        loop {
+            match receiver.recv_timeout(Duration::from_secs(15)) {
+                Ok(PtyEvent::Data(chunk)) => transcript.extend_from_slice(&chunk),
+                Ok(PtyEvent::ReadError(error)) => {
+                    panic!("failed to finish reading PTY transcript: {error}")
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    timed_out = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if timed_out {
+        let _ = child.kill();
+    }
+    drop(input);
+    let status = child.wait().expect("wait for PTY script process");
+    reader.join().expect("PTY transcript reader joins");
+    let mut diagnostics = Vec::new();
+    script_stderr
+        .read_to_end(&mut diagnostics)
+        .expect("read script diagnostic output");
+    assert!(
+        !timed_out,
+        "PTY sync timed out waiting for prompt or completion; script stderr:\n{}\ntranscript:\n{}",
+        String::from_utf8_lossy(&diagnostics),
+        String::from_utf8_lossy(&transcript),
+    );
+
+    PtyOutput {
+        status,
+        transcript,
+        script_stderr: diagnostics,
     }
 }
 
@@ -616,6 +798,54 @@ fn noninteractive_foreign_conflict_defaults_to_skip_snapshot() {
         b"user's own edit\n",
         "a non-interactive sync must not clobber the pre-existing Foreign file"
     );
+}
+
+// ─── 9b. TTY conflict: the real CLI prompts and applies Overwrite ──────────────
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn interactive_foreign_conflict_prompts_and_overwrites_through_a_pty() {
+    const PROMPT: &str =
+        "phora: conflict at dotfiles/editor in home — [s]kip/[o]verwrite/[e]ject/[a]bort? ";
+
+    let fx = build_fixture();
+    let foreign_path = fx.target_path.join("editor/init.lua");
+    write(&foreign_path, b"user's own edit\n");
+
+    let out = run_sync_in_pty(&fx, PROMPT, b"o\n");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "interactive overwrite must exit 0; script stderr:\n{}\ntranscript:\n{}",
+        String::from_utf8_lossy(&out.script_stderr),
+        String::from_utf8_lossy(&out.transcript)
+    );
+    let transcript = normalize_pty_crlf(&out.transcript);
+    let after_prompt = transcript.strip_prefix(PROMPT).unwrap_or_else(|| {
+        panic!("real TTY sync must emit the exact conflict prompt; got {transcript:?}")
+    });
+    assert!(
+        after_prompt.starts_with("o\n"),
+        "the PTY must echo the overwrite answer immediately after the exact prompt: {transcript:?}"
+    );
+    assert_eq!(
+        after_prompt.lines().last(),
+        Some("sync complete"),
+        "the successful interactive overwrite must finish with the exact completion line"
+    );
+    assert!(
+        !after_prompt.contains(PROMPT),
+        "one Foreign conflict must produce exactly one prompt: {transcript:?}"
+    );
+    assert_eq!(
+        std::fs::read(&foreign_path).expect("read overwritten Foreign file"),
+        b"-- init\n",
+        "selecting Overwrite must replace the Foreign bytes with the source artifact"
+    );
+
+    // Removing stdin TTY detection or TtyResolver wiring eliminates PROMPT and
+    // fails above; mapping `o` away from Overwrite leaves the foreign bytes and
+    // fails the final byte assertion.
 }
 
 // ─── 10. interactive-conflict resolution mapping (deterministic pure fn) ────────
