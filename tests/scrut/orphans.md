@@ -87,6 +87,15 @@ $ phora sync 2>&1 | normalize | grep -qi 'orphan' && echo orphan-notice
 orphan-notice
 ```
 
+The unfiltered merged stream also pins chronology: moving warning rendering
+after the completion line reverses these exact lines and fails this assertion.
+
+```scrut
+$ phora sync 2>&1 | normalize
+phora: 2 orphaned record(s) with no config target — run `phora list --orphans` to inspect, `phora sync --prune` to remove
+sync complete
+```
+
 The orphaned files are still on disk before pruning.
 
 ```scrut
