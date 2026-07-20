@@ -539,17 +539,24 @@ fn has_active_deploy_t024_allowlist(shell: &str) -> bool {
         .any(|entry| entry == "src/deploy.rs\\tT024")
 }
 
-fn premature_t023_name_hits(sources: &[(&str, String)]) -> Vec<(String, &'static str)> {
-    let mut hits = Vec::new();
-    for (path, source) in sources {
-        let production_source = production(source);
-        for name in ["apply_artifact", "apply_target_changes", "ApplyRun"] {
-            if has_keyword(&production_source, name) {
-                hits.push(((*path).to_owned(), name));
-            }
-        }
-    }
-    hits
+fn sync_production_name_sites<'a>(scans: &'a SourceScans, name: &str) -> Vec<&'a str> {
+    scans
+        .production
+        .iter()
+        .filter_map(|(path, source)| {
+            (path.starts_with("sync/") && has_keyword(source, name)).then_some(path.as_str())
+        })
+        .collect()
+}
+
+fn assert_no_sync_production_name(scans: &SourceScans, old: &str, replacement: &str) {
+    let sites = sync_production_name_sites(scans, old);
+    assert!(
+        sites.is_empty(),
+        "T023 must replace the old internal `{old}` identifier with `{replacement}` everywhere \
+         under src/sync; production sites still containing it: {sites:?}. The compatibility \
+         facade at src/{DEPLOY} is intentionally outside this assertion"
+    );
 }
 
 #[test]
@@ -571,7 +578,7 @@ fn apply_module_owns_the_copy_swap_link_and_apply_cluster() {
         "copy_file",
         "copy_mtime",
         "copy_tree",
-        "deploy_artifact",
+        "apply_artifact",
         "link_artifact",
         "link_nonce",
         "swap_into",
@@ -691,15 +698,30 @@ fn observation_remains_owned_only_by_inspect() {
 }
 
 #[test]
-fn t022_preserves_t023_names_and_t024_allowlist() {
-    let owned_sources =
-        [DEPLOY, APPLY, JOURNAL, RECOVERY, SYNC_MOD].map(|path| (path, read_src(path)));
-    let premature = premature_t023_name_hits(&owned_sources);
-    assert!(
-        premature.is_empty(),
-        "T022 is move-only; T023 names must be absent from deploy.rs, every new ownership \
-         module, and sync/mod.rs (including facade aliases); hits: {premature:?}"
-    );
+fn t023_apply_artifact_replaces_internal_deploy_artifact() {
+    let scans = SourceScans::load();
+    assert_unique_anchor(&scans, "fn", "apply_artifact", APPLY, 1);
+    assert_no_sync_production_name(&scans, "deploy_artifact", "apply_artifact");
+}
+
+#[test]
+fn t023_apply_target_changes_replaces_deploy_target_orchestration() {
+    let scans = SourceScans::load();
+    assert_unique_anchor(&scans, "fn", "apply_target_changes", SYNC_MOD, 1);
+    for old in ["deploy_target", "deploy_all_targets"] {
+        assert_no_sync_production_name(&scans, old, "apply_target_changes");
+    }
+}
+
+#[test]
+fn t023_apply_run_replaces_deploy_run() {
+    let scans = SourceScans::load();
+    assert_unique_anchor(&scans, "struct", "ApplyRun", SYNC_MOD, 1);
+    assert_no_sync_production_name(&scans, "DeployRun", "ApplyRun");
+}
+
+#[test]
+fn t023_preserves_t024_allowlist() {
     let arch_check =
         fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/arch-check.sh"))
             .expect("read architecture guardrail");
@@ -833,27 +855,39 @@ fn free_function_scanner_distinguishes_module_items_from_nested_items() {
 }
 
 #[test]
-fn premature_name_scanner_rejects_facade_aliases() {
-    let alias = [(
-        DEPLOY,
-        "pub use crate::sync::apply::deploy_artifact as apply_artifact;".to_owned(),
-    )];
-    assert_eq!(
-        premature_t023_name_hits(&alias),
-        vec![(DEPLOY.to_owned(), "apply_artifact")],
-        "a T023 alias introduced in the compatibility facade must fail T022's move-only gate"
+fn internal_name_scanner_ignores_compatibility_facade_and_decoys() {
+    let clean = SourceScans::from_raw(&[
+        (
+            DEPLOY,
+            "pub use crate::sync::apply::apply_artifact as deploy_artifact;",
+        ),
+        (
+            APPLY,
+            r#"
+                // deploy_artifact is the legacy facade name.
+                const MESSAGE: &str = "deploy_artifact";
+                fn apply_artifact() {}
+                #[cfg(test)] mod tests { fn deploy_artifact() {} }
+            "#,
+        ),
+    ]);
+    assert!(
+        sync_production_name_sites(&clean, "deploy_artifact").is_empty(),
+        "the retained compatibility alias, comments, strings, and cfg(test)-only decoys must not \
+         count as old sync-production identifiers"
     );
 
-    let decoys = [(
-        DEPLOY,
-        r#"// deploy_artifact as apply_artifact
-            const MESSAGE: &str = "apply_target_changes ApplyRun";
-            pub use crate::sync::apply::deploy_artifact;"#
-            .to_owned(),
-    )];
-    assert!(
-        premature_t023_name_hits(&decoys).is_empty(),
-        "comments and strings must not create premature-name false positives"
+    let stale_internal_use = SourceScans::from_raw(&[
+        (
+            DEPLOY,
+            "pub use crate::sync::apply::apply_artifact as deploy_artifact;",
+        ),
+        ("sync/target.rs", "fn caller() { deploy_artifact(); }"),
+    ]);
+    assert_eq!(
+        sync_production_name_sites(&stale_internal_use, "deploy_artifact"),
+        ["sync/target.rs"],
+        "a real old-name use inside src/sync must remain visible even while the facade retains it"
     );
 }
 

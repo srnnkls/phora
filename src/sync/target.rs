@@ -10,7 +10,7 @@ use crate::store::{
     ScannedFile,
 };
 
-use super::apply::{deploy_artifact, link_artifact};
+use super::apply::{apply_artifact, link_artifact};
 use super::confine::{ProtectedPathSet, confine_destination};
 use super::journal::Journal;
 use super::stage::{StageRequest, stage_artifact};
@@ -674,7 +674,7 @@ fn deploy_one(
     if matches!(ctx.kind, RecordKind::Dir) {
         staging_guard.disarm();
     }
-    deploy_artifact(
+    apply_artifact(
         &staging_base,
         &staging_payload,
         ctx.artifact_dst,
