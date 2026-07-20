@@ -12,9 +12,10 @@ use crate::source::{
     GitBackend, HttpBackend, ResolvedSource, RouterBackend, SourceBackend, SourceEntry,
     SourceError, SourceInventory, SourcePath, SourceStore,
 };
-use crate::store::FileRegistry;
+use crate::store::{EjectedEntry, FileRegistry, HookState, StoreError};
 
 type SourceResult<T> = std::result::Result<T, SourceError>;
+type StoreResult<T> = std::result::Result<T, StoreError>;
 
 fn sn(name: &str) -> crate::kernel::SourceName {
     crate::kernel::SourceName::trusted(name)
@@ -180,6 +181,134 @@ impl SyncFixture {
         run_git(self.src.path(), &["add", "-A"]);
         run_git(self.src.path(), &["commit", "-m", "second"]);
         rev_parse(self.src.path(), "HEAD")
+    }
+}
+
+/// Wraps a real registry and counts either full-scan port. Observation must avoid
+/// both while keeping orphans, and perform exactly one while removing them.
+struct FullScanCountingRegistry<'a> {
+    inner: &'a FileRegistry,
+    full_scans: AtomicUsize,
+}
+
+impl<'a> FullScanCountingRegistry<'a> {
+    fn new(inner: &'a FileRegistry) -> Self {
+        Self {
+            inner,
+            full_scans: AtomicUsize::new(0),
+        }
+    }
+
+    fn reset(&self) {
+        self.full_scans.store(0, AtomicOrdering::SeqCst);
+    }
+
+    fn full_scan_count(&self) -> usize {
+        self.full_scans.load(AtomicOrdering::SeqCst)
+    }
+
+    fn count_full_scan(&self) {
+        self.full_scans.fetch_add(1, AtomicOrdering::SeqCst);
+    }
+}
+
+impl crate::store::Registry for FullScanCountingRegistry<'_> {
+    fn get(&self, key: &crate::store::ArtifactKey) -> StoreResult<Option<RegistryRecord>> {
+        crate::store::Registry::get(self.inner, key)
+    }
+
+    fn put(&self, record: &RegistryRecord) -> StoreResult<()> {
+        crate::store::Registry::put(self.inner, record)
+    }
+
+    fn remove(&self, key: &crate::store::ArtifactKey) -> StoreResult<()> {
+        crate::store::Registry::remove(self.inner, key)
+    }
+
+    fn list_target(&self, target: &str) -> StoreResult<Vec<RegistryRecord>> {
+        crate::store::Registry::list_target(self.inner, target)
+    }
+
+    fn list_all(&self) -> StoreResult<Vec<RegistryRecord>> {
+        self.count_full_scan();
+        crate::store::Registry::list_all(self.inner)
+    }
+
+    fn load_ejected(&self, target: &str) -> StoreResult<Vec<EjectedEntry>> {
+        crate::store::Registry::load_ejected(self.inner, target)
+    }
+
+    fn save_ejected(&self, target: &str, ejected: &[EjectedEntry]) -> StoreResult<()> {
+        crate::store::Registry::save_ejected(self.inner, target, ejected)
+    }
+
+    fn load_hook_state(&self, target: &str) -> StoreResult<Vec<HookState>> {
+        crate::store::Registry::load_hook_state(self.inner, target)
+    }
+
+    fn record_hook_success(
+        &self,
+        target: &str,
+        hook_id: &str,
+        digest_set: &BTreeSet<String>,
+    ) -> StoreResult<()> {
+        crate::store::Registry::record_hook_success(self.inner, target, hook_id, digest_set)
+    }
+
+    fn locks_dir(&self) -> PathBuf {
+        crate::store::Registry::locks_dir(self.inner)
+    }
+}
+
+impl crate::sync::state::StateStore for FullScanCountingRegistry<'_> {
+    fn artifact(&self, key: &crate::store::ArtifactKey) -> StoreResult<Option<RegistryRecord>> {
+        crate::sync::state::StateStore::artifact(self.inner, key)
+    }
+
+    fn put_artifact(&self, record: &RegistryRecord) -> StoreResult<()> {
+        crate::sync::state::StateStore::put_artifact(self.inner, record)
+    }
+
+    fn remove_artifact(&self, key: &crate::store::ArtifactKey) -> StoreResult<()> {
+        crate::sync::state::StateStore::remove_artifact(self.inner, key)
+    }
+
+    fn target_artifacts(&self, target: &str) -> StoreResult<Vec<RegistryRecord>> {
+        crate::sync::state::StateStore::target_artifacts(self.inner, target)
+    }
+
+    fn all_artifacts(&self) -> StoreResult<Vec<RegistryRecord>> {
+        self.count_full_scan();
+        crate::sync::state::StateStore::all_artifacts(self.inner)
+    }
+
+    fn ejections(&self, target: &str) -> StoreResult<Vec<EjectedEntry>> {
+        crate::sync::state::StateStore::ejections(self.inner, target)
+    }
+
+    fn save_ejections(&self, target: &str, entries: &[EjectedEntry]) -> StoreResult<()> {
+        crate::sync::state::StateStore::save_ejections(self.inner, target, entries)
+    }
+
+    fn hook_state(&self, target: &str) -> StoreResult<Vec<HookState>> {
+        crate::sync::state::StateStore::hook_state(self.inner, target)
+    }
+
+    fn record_hook_success(
+        &self,
+        target: &str,
+        hook_id: &str,
+        digest_set: &BTreeSet<String>,
+    ) -> StoreResult<()> {
+        crate::sync::state::StateStore::record_hook_success(self.inner, target, hook_id, digest_set)
+    }
+
+    fn acquire_lock(&self) -> StoreResult<crate::store::StateLockGuard> {
+        crate::sync::state::StateStore::acquire_lock(self.inner)
+    }
+
+    fn journal_root(&self) -> PathBuf {
+        crate::sync::state::StateStore::journal_root(self.inner)
     }
 }
 
@@ -3706,6 +3835,81 @@ fn deploy_then_modify(fx: &SyncFixture, td: &TargetDir, cfg: &Config) -> Lock {
         "premise: edited managed artifact must read Modified, got {st:?}"
     );
     first.base_lock
+}
+
+#[test]
+fn frozen_lockless_conflict_refuses_before_consulting_the_resolver() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let cfg =
+        config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+    let base_lock = deploy_then_modify(&fx, &td, &cfg);
+    let resolver = ScriptedResolver::new(Resolution::Abort);
+    let mut request = interactive_input(&cfg, Some(base_lock), &resolver);
+    request.frozen = true;
+    request.lockless = true;
+
+    let result = sync(&request, &fx.backend, &fx.registry);
+    let Err(error) = result else {
+        panic!("pending work against frozen read-only state must be refused");
+    };
+    let rendered = error.to_string();
+    assert!(
+        rendered.to_lowercase().contains("read-only")
+            && rendered.contains(&fx.registry.state_root().display().to_string()),
+        "readonly refusal must win over an interactive answer for a run that cannot write; got: \
+         {rendered}"
+    );
+    assert_eq!(
+        resolver.consulted(),
+        0,
+        "a frozen lockless run with pending conflict work must refuse before prompting: the \
+         caller cannot make an impossible read-only run writable"
+    );
+}
+
+#[test]
+fn conflict_abort_preflight_runs_before_pre_deploy_hooks() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let plain =
+        config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+    let base_lock = deploy_then_modify(&fx, &td, &plain);
+    let log = td.parent_path.join("pre-deploy.log");
+    let hook = append_cmd(&log, "ran").replace('"', "\\\"");
+    let hooked = Config::parse(&format!(
+        "version = 1\n\n\
+         [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\"editor-src\"]\nlayout = \"flat\"\n\n\
+         [targets.dest.hooks]\npre_deploy = \"{hook}\"\n",
+        fx.url,
+        td.target_path().display(),
+    ))
+    .expect("pre_deploy fixture config parses");
+    let resolver = ScriptedResolver::new(Resolution::Abort);
+
+    let result = sync(
+        &interactive_input(&hooked, Some(base_lock), &resolver),
+        &fx.backend,
+        &fx.registry,
+    );
+
+    let Err(error) = result else {
+        panic!("the whole ChangeSet Abort must surface before the per-target hook phase");
+    };
+    assert!(
+        matches!(error, Error::Aborted),
+        "the whole ChangeSet Abort must surface before the per-target hook phase; got {error:?}"
+    );
+    assert_eq!(
+        resolver.consulted(),
+        1,
+        "the complete conflict preflight must consult the supplied resolver"
+    );
+    assert!(
+        log_lines(&log).is_empty(),
+        "resolve-before-hooks preserves whole-run Abort atomicity: pre_deploy must not run"
+    );
 }
 
 #[test]
@@ -14130,6 +14334,73 @@ fn undecided_conflict_at_apply_errors_unresolved() {
         "the apply path must reject an undecided Conflict with an `unresolved conflict` diagnostic, \
          got: {msg}"
     );
+}
+
+// ── observation scan boundaries and duplicate rejection ───────
+
+#[test]
+fn observe_workspace_full_registry_scan_follows_prune_policy() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = config_one_source_one_target(
+        "editor-src",
+        &fx.url,
+        "dest",
+        &td.target_path(),
+        "by-source",
+    );
+    fx.backend
+        .fetch(&sn("editor-src"), &fx.url)
+        .expect("seed editor-src mirror");
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+    let commits = one_commit(&parsed, "editor-src", &fx.head_sha);
+    let projection = project_workspace(&cfg, &parsed, &remotes, &fx.backend, &commits)
+        .expect("projection builds");
+    let protected = test_protected(fx.src.path());
+    let journal = Journal::open(&fx.registry.locks_dir()).expect("open journal");
+    let orphan_record = linked_flat_record("retired", "legacy", "orphan");
+    let orphan_key = orphan_record.key.clone();
+    fx.registry
+        .put(&orphan_record)
+        .expect("seed registry-only orphan absent from projection");
+    let registry = FullScanCountingRegistry::new(&fx.registry);
+
+    for (prune, expected_scans) in [(false, 0), (true, 1)] {
+        registry.reset();
+        let mut si = input(&cfg, None, None, None, false);
+        si.prune = prune;
+        let ctx = DeployAll {
+            config: &cfg,
+            parsed: &parsed,
+            remotes: &remotes,
+            projection: &projection,
+            protected: &protected,
+            input: &si,
+            backend: &fx.backend,
+            registry: &registry,
+            journal: &journal,
+        };
+
+        let observed = super::observe::observe_workspace(&ctx, &projection)
+            .expect("workspace observation succeeds");
+        let observed_orphan = observed.artifacts.iter().any(|entry| {
+            matches!(
+                &entry.observation,
+                crate::sync::model::ObservedArtifact::Managed(managed)
+                    if managed.record.key == orphan_key
+            )
+        });
+        assert_eq!(
+            registry.full_scan_count(),
+            expected_scans,
+            "KeepOrphans must perform no full registry scan; RemoveOrphans must perform exactly one"
+        );
+        assert_eq!(
+            observed_orphan, prune,
+            "the seeded registry-only row must appear only when RemoveOrphans scans registry state"
+        );
+    }
 }
 
 // ── S6: observation producer rejects a duplicate triplet ───────

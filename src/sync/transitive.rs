@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use crate::config::transitive::{FetchNode, Instance, TransitiveManifest};
 use crate::config::{
-    Config, DeployMode, HookCommand, Host, ParsedSource, Protocol, Refspec, Remote, SourceMode,
-    TakeEntry, Target, admit_transitive_hooks, hook_preimage,
+    Config, DeployMode, HookAdmissionDiagnostic, HookCommand, Host, ParsedSource, Protocol,
+    Refspec, Remote, SourceMode, TakeEntry, Target, admit_transitive_hooks, hook_preimage,
 };
 use crate::error::{Error, Result};
 use crate::kernel::{OfferSelection, SourceName};
@@ -72,7 +72,7 @@ pub(crate) struct ResolvedGraph {
     /// a transitive node is keyed by its instance, not a bare name that never lines up.
     pub(super) instances: BTreeMap<String, String>,
     pub(super) hook_candidates: Vec<TransitiveHookCandidate>,
-    pub(super) hook_diagnostics: Vec<String>,
+    pub(super) hook_diagnostics: Vec<HookAdmissionDiagnostic>,
 }
 
 impl ResolvedGraph {

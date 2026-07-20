@@ -298,10 +298,9 @@ fn swap_into(
     match std::fs::rename(staging, dst) {
         Ok(()) => Ok(()),
         Err(e) if is_cross_device(&e) => {
-            events.warnings.push(SyncWarning::Message(format!(
-                "staging on a different mount than {}; falling back to recursive copy",
-                dst.display()
-            )));
+            events.warnings.push(SyncWarning::CrossDeviceFallback {
+                destination: dst.to_path_buf(),
+            });
             if staging.is_file() {
                 copy_file(staging, dst)
             } else {

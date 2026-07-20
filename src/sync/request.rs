@@ -139,7 +139,45 @@ pub enum SkippedChange {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncWarning {
     Projection(ProjectionWarning),
-    Message(String),
+    MalformedTransitiveHooks {
+        target: String,
+        detail: String,
+    },
+    LinkPathNotPortable {
+        source: String,
+        path: PathBuf,
+    },
+    ReferenceMoved {
+        source: String,
+        target: String,
+        from: String,
+        to: String,
+    },
+    OrphanedRecords {
+        count: usize,
+    },
+    PruneSkippedAfterFailures,
+    PruneRefused {
+        path: PathBuf,
+        reason: String,
+    },
+    OrphanRecordPathUnknown {
+        source: String,
+        artifact: String,
+        layout: String,
+    },
+    FastForwardKeptLive {
+        source: String,
+        artifact: String,
+        path: PathBuf,
+    },
+    FastForwardDropped {
+        source: String,
+        artifact: String,
+    },
+    CrossDeviceFallback {
+        destination: PathBuf,
+    },
     ConflictModified {
         source: String,
         artifact: String,

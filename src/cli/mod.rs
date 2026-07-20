@@ -307,13 +307,37 @@ pub fn exit_code(err: &Error) -> i32 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliOutcome {
+    Success,
+    Failure,
+}
+
+impl CliOutcome {
+    #[must_use]
+    pub fn exit_code(self) -> i32 {
+        match self {
+            Self::Success => 0,
+            Self::Failure => 1,
+        }
+    }
+}
+
+fn completed(result: Result<()>) -> Result<CliOutcome> {
+    result.map(|()| CliOutcome::Success)
+}
+
 pub fn run(cli: Cli) -> Result<()> {
+    run_with_outcome(cli).map(drop)
+}
+
+pub fn run_with_outcome(cli: Cli) -> Result<CliOutcome> {
     match cli.command {
-        cmd @ Command::Add { .. } => dispatch_add(cmd),
-        Command::Rm { name } => run_source_rm(&name),
+        cmd @ Command::Add { .. } => completed(dispatch_add(cmd)),
+        Command::Rm { name } => completed(run_source_rm(&name)),
         cmd @ (Command::Sync { .. } | Command::Update { .. }) => dispatch_sync(cmd),
         Command::List { plan, orphans } => {
-            query::run_list(query::ListView::from_flags(plan, orphans))
+            completed(query::run_list(query::ListView::from_flags(plan, orphans)))
         }
         Command::Verify => run_verify(),
         Command::Where {
@@ -331,7 +355,7 @@ pub fn run(cli: Cli) -> Result<()> {
             let config = load_config()?;
             let matches = where_cmd(&open_project_registry(&config)?, &filter)?;
             render::print_where_matches(&matches, &filter);
-            Ok(())
+            Ok(CliOutcome::Success)
         }
         Command::Eject {
             artifact,
@@ -343,7 +367,7 @@ pub fn run(cli: Cli) -> Result<()> {
             let _guard = registry.lock_exclusive()?;
             crate::sync::eject(&config, &registry, &artifact, &source, &target)?;
             println!("ejected {source}/{artifact} from {target} (files kept)");
-            Ok(())
+            Ok(CliOutcome::Success)
         }
         Command::Uneject {
             artifact,
@@ -355,46 +379,46 @@ pub fn run(cli: Cli) -> Result<()> {
             let _guard = registry.lock_exclusive()?;
             crate::sync::uneject(&config, &registry, &artifact, &source, &target)?;
             println!("unejected {source}/{artifact} in {target}");
-            Ok(())
+            Ok(CliOutcome::Success)
         }
-        Command::RebuildRegistry => sync::run_rebuild_registry(),
+        Command::RebuildRegistry => completed(sync::run_rebuild_registry()),
         Command::CheckMatch { source, path } => {
             let source = load_source(&source)?;
             let report = check_match_cmd(&source, &path);
             render::print_check_match(&source, &path, &report);
-            Ok(())
+            Ok(CliOutcome::Success)
         }
-        Command::Source { cmd } => run_source(cmd),
-        Command::Target { cmd } => run_target(cmd),
-        cmd @ Command::Bind { .. } => dispatch_bind(cmd),
+        Command::Source { cmd } => completed(run_source(cmd)),
+        Command::Target { cmd } => completed(run_target(cmd)),
+        cmd @ Command::Bind { .. } => completed(dispatch_bind(cmd)),
         Command::Unbind {
             sources,
             from,
             local,
-        } => bind::run_unbind(&sources, &from, local),
-        cmd @ Command::Trust { .. } => dispatch_trust(cmd),
+        } => completed(bind::run_unbind(&sources, &from, local)),
+        cmd @ Command::Trust { .. } => completed(dispatch_trust(cmd)),
         Command::Preview {
             source,
             target,
             files,
             json,
-        } => query::run_preview(
+        } => completed(query::run_preview(
             &PreviewSelectors {
                 source,
                 target,
                 files,
             },
             json,
-        ),
+        )),
         Command::Explain {
             target,
             source,
             path,
-        } => query::run_explain(&target, &source, path.as_deref()),
+        } => completed(query::run_explain(&target, &source, path.as_deref())),
     }
 }
 
-fn dispatch_sync(cmd: Command) -> Result<()> {
+fn dispatch_sync(cmd: Command) -> Result<CliOutcome> {
     match cmd {
         Command::Sync {
             prune,
@@ -458,7 +482,7 @@ fn dispatch_add(cmd: Command) -> Result<()> {
     )
 }
 
-fn run_verify() -> Result<()> {
+fn run_verify() -> Result<CliOutcome> {
     let cwd = std::env::current_dir()?;
     let base = load_config()?;
     let local = load_local_config(&cwd)?;
@@ -486,9 +510,9 @@ fn run_verify() -> Result<()> {
     let report = crate::sync::verify(&config, &registry, lock.as_ref())?;
     render::print_verify(&report);
     if report.is_clean() {
-        Ok(())
+        Ok(CliOutcome::Success)
     } else {
-        std::process::exit(1);
+        Ok(CliOutcome::Failure)
     }
 }
 

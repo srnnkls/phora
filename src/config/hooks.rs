@@ -20,6 +20,20 @@ pub struct CandidateHook {
     pub command: HookCommand,
 }
 
+/// A malformed imported target hook table that was stripped during admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookAdmissionDiagnostic {
+    pub target: String,
+    pub detail: String,
+}
+
+impl HookAdmissionDiagnostic {
+    #[cfg(test)]
+    fn contains(&self, needle: &str) -> bool {
+        self.target.contains(needle) || self.detail.contains(needle)
+    }
+}
+
 /// Interprets a dep target's retained opaque `[targets.X.hooks]` into candidate hooks keyed by
 /// the confined [`Instance`], surfacing a diagnostic for each sub-table that fails to deserialize
 /// rather than silently dropping it. Strip-by-default holds: this produces candidates only — it
@@ -30,7 +44,7 @@ pub fn admit_transitive_hooks(
     dep_target_name: &str,
     composed_target_name: &str,
     instance: &Instance,
-) -> (Vec<CandidateHook>, Vec<String>) {
+) -> (Vec<CandidateHook>, Vec<HookAdmissionDiagnostic>) {
     let Some(hooks) = opaque.get(dep_target_name) else {
         return (Vec::new(), Vec::new());
     };
@@ -39,9 +53,10 @@ pub fn admit_transitive_hooks(
         Err(e) => {
             return (
                 Vec::new(),
-                vec![format!(
-                    "imported dep target `{dep_target_name}`: malformed `[targets.{dep_target_name}.hooks]`: {e}"
-                )],
+                vec![HookAdmissionDiagnostic {
+                    target: dep_target_name.to_owned(),
+                    detail: e.to_string(),
+                }],
             );
         }
     };

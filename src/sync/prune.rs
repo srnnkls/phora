@@ -372,32 +372,33 @@ fn remove_reconciled_record(
             }
             Ok(_) => {}
             Err(error) => {
-                events.warnings.push(SyncWarning::Message(format!(
-                    "refusing to prune out-of-anchor {}: {error}",
-                    dst.display()
-                )));
+                events.warnings.push(SyncWarning::PruneRefused {
+                    path: dst.clone(),
+                    reason: error.to_string(),
+                });
                 return Ok(false);
             }
         }
     } else {
         let Some(path) = orphan_artifact_path(record) else {
             if record.deploy_root.is_some() {
-                events.warnings.push(SyncWarning::Message(format!(
-                    "dropping the record for orphaned {}:{} only — its on-disk path cannot be \
-                     reconstructed (layout `{}` unrecognized or missing its separator); any file \
-                     is left in place rather than deleting a guessed path",
-                    record.key.source, record.key.artifact, record.layout
-                )));
+                events.warnings.push(SyncWarning::OrphanRecordPathUnknown {
+                    source: record.key.source.clone(),
+                    artifact: record.key.artifact.clone(),
+                    layout: record.layout.clone(),
+                });
             }
             registry.remove(&record.key)?;
             return Ok(true);
         };
         if super::target::is_composed_target(&record.key.target) {
-            events.warnings.push(SyncWarning::Message(format!(
-                "refusing to prune out-of-anchor {}: composed target `{}` has no confine anchor",
-                path.display(),
-                record.key.target
-            )));
+            events.warnings.push(SyncWarning::PruneRefused {
+                path: path.clone(),
+                reason: format!(
+                    "composed target `{}` has no confine anchor",
+                    record.key.target
+                ),
+            });
             return Ok(false);
         }
         if overlaps_any_live_path(&path, live_paths) {

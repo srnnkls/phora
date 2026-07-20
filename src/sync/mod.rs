@@ -85,11 +85,11 @@ pub trait StageSource: SourceBackend + SourceStore {}
 
 impl<T: SourceBackend + SourceStore> StageSource for T {}
 
-/// Borrowed inputs to [`sync`]: the configs and locks plus run flags. Bundled so
-/// the orchestration entry point stays stable as later phases add fields.
+/// Test-only compatibility input for the pre-T027 unit fixtures.
+#[cfg(test)]
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "independent CLI run flags, not a state machine"
+    reason = "legacy test fixtures exercise the old boolean mapping into SyncOptions"
 )]
 pub struct SyncInput<'a> {
     pub base_config: &'a Config,
@@ -140,8 +140,8 @@ pub trait ConflictResolver {
     fn resolve(&self, conflict: &Conflict) -> Resolution;
 }
 
-/// Result of a sync run: the recomputed base and local locks, plus whether any
-/// per-artifact export/deploy step failed (the CLI maps this to its exit code).
+/// Test-only compatibility output for the pre-T027 unit fixtures.
+#[cfg(test)]
 pub struct SyncOutput {
     pub base_lock: Lock,
     pub local_lock: Option<Lock>,
@@ -152,16 +152,13 @@ pub struct SyncOutput {
     pub stripped_transitive_hooks: usize,
 }
 
-/// Compatibility adapter used while the remaining internal test fixtures still
-/// construct the pre-T027 request shape.
-#[doc(hidden)]
-pub struct SyncRunInput<'a> {
-    pub base_config: &'a Config,
-    pub local_config: Option<&'a Config>,
-    pub locks: LockSet,
-    pub options: SyncOptions,
-    pub resolver: Option<&'a dyn ConflictResolver>,
-    pub lockless: bool,
+struct SyncRunInput<'a> {
+    base_config: &'a Config,
+    local_config: Option<&'a Config>,
+    locks: LockSet,
+    options: SyncOptions,
+    resolver: Option<&'a dyn ConflictResolver>,
+    lockless: bool,
 }
 
 impl SyncRunInput<'_> {
@@ -221,6 +218,7 @@ impl RunOptions for SyncRunInput<'_> {
     }
 }
 
+#[cfg(test)]
 impl RunOptions for SyncInput<'_> {
     fn options(&self) -> SyncOptions {
         self.run_input().options
@@ -235,26 +233,29 @@ impl RunOptions for SyncInput<'_> {
     }
 }
 
-/// Internal execution result from which the public and compatibility reports
-/// are derived.
-#[doc(hidden)]
-pub struct SyncExecution {
-    pub report: SyncReport,
-    pub deploy_failures: bool,
-    pub stripped_transitive_hooks: usize,
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "legacy outcome details remain only for the cfg(test) compatibility adapter"
+    )
+)]
+struct SyncExecution {
+    report: SyncReport,
+    deploy_failures: bool,
+    stripped_transitive_hooks: usize,
 }
 
-/// Sealed-by-convention adapter allowing legacy in-crate fixtures and the new
-/// public request to exercise the same orchestration implementation.
-#[doc(hidden)]
-pub trait SyncInvocation {
+#[cfg(test)]
+trait TestSyncInvocation {
     type Output;
 
     fn run_input(&self) -> SyncRunInput<'_>;
     fn finish(execution: SyncExecution) -> Self::Output;
 }
 
-impl SyncInvocation for SyncRequest<'_> {
+#[cfg(test)]
+impl TestSyncInvocation for SyncRequest<'_> {
     type Output = SyncReport;
 
     fn run_input(&self) -> SyncRunInput<'_> {
@@ -273,7 +274,8 @@ impl SyncInvocation for SyncRequest<'_> {
     }
 }
 
-impl SyncInvocation for SyncInput<'_> {
+#[cfg(test)]
+impl TestSyncInvocation for SyncInput<'_> {
     type Output = SyncOutput;
 
     fn run_input(&self) -> SyncRunInput<'_> {
@@ -333,6 +335,7 @@ impl SyncInvocation for SyncInput<'_> {
     }
 }
 
+#[cfg(test)]
 fn compatibility_output(execution: SyncExecution) -> SyncOutput {
     let SyncExecution {
         report,
@@ -420,9 +423,10 @@ fn take_hook_candidates(
     events: &mut SyncEvents,
 ) -> Vec<transitive::TransitiveHookCandidate> {
     for diagnostic in std::mem::take(&mut graph.hook_diagnostics) {
-        events
-            .warnings
-            .push(SyncWarning::Message(diagnostic.clone()));
+        events.warnings.push(SyncWarning::MalformedTransitiveHooks {
+            target: diagnostic.target,
+            detail: diagnostic.detail,
+        });
     }
     std::mem::take(&mut graph.hook_candidates)
 }
@@ -618,9 +622,9 @@ where
             &mut run.events,
         )?;
     } else if ctx.input.prune() && run.had_failures {
-        run.events.warnings.push(SyncWarning::Message(
-            "skipping --prune because some artifacts failed to deploy".to_owned(),
-        ));
+        run.events
+            .warnings
+            .push(SyncWarning::PruneSkippedAfterFailures);
     }
     Ok(run)
 }
@@ -685,10 +689,7 @@ fn cross_target_overlap_diagnostic(
 fn notify_orphans(config: &Config, registry: &dyn Registry, events: &mut SyncEvents) -> Result<()> {
     let count = orphan_records(config, registry)?.len();
     if count > 0 {
-        events.warnings.push(SyncWarning::Message(format!(
-            "{count} orphaned record(s) with no config target — run `phora list --orphans` to \
-             inspect, `phora sync --prune` to remove"
-        )));
+        events.warnings.push(SyncWarning::OrphanedRecords { count });
     }
     Ok(())
 }
@@ -764,9 +765,29 @@ fn project_sync_workspace(
     Ok(projection)
 }
 
-pub fn sync<I, R>(input: &I, backend: &(dyn StageSource + Sync), registry: &R) -> Result<I::Output>
+/// Synchronizes a workspace from an explicit request and returns structured outcomes.
+///
+/// # Errors
+///
+/// Returns an error when configuration, source resolution, state inspection, reconciliation,
+/// confinement, staging, apply, or hook dispatch fails.
+#[cfg(not(test))]
+pub fn sync<R>(
+    request: &SyncRequest<'_>,
+    backend: &(dyn StageSource + Sync),
+    registry: &R,
+) -> Result<SyncReport>
 where
-    I: SyncInvocation,
+    R: Registry + state::StateStore,
+{
+    let input = request_run_input(request, false);
+    sync_core(&input, backend, registry).map(|execution| execution.report)
+}
+
+#[cfg(test)]
+fn sync<I, R>(input: &I, backend: &(dyn StageSource + Sync), registry: &R) -> Result<I::Output>
+where
+    I: TestSyncInvocation,
     R: Registry + state::StateStore,
 {
     let run_input = input.run_input();
@@ -782,9 +803,19 @@ pub(crate) fn sync_opened<R>(
 where
     R: Registry + state::StateStore,
 {
-    let mut input = request.run_input();
-    input.lockless = lockless;
+    let input = request_run_input(request, lockless);
     sync_core(&input, backend, registry).map(|execution| execution.report)
+}
+
+fn request_run_input<'a>(request: &'a SyncRequest<'a>, lockless: bool) -> SyncRunInput<'a> {
+    SyncRunInput {
+        base_config: request.base_config,
+        local_config: request.local_config,
+        locks: request.locks.clone(),
+        options: request.options,
+        resolver: request.resolver,
+        lockless,
+    }
 }
 
 #[expect(
@@ -815,7 +846,10 @@ where
     let hook_candidates = take_hook_candidates(&mut graph, &mut events);
     let instances = graph.inject(&mut effective_config, &mut parsed, &mut remotes);
     for warning in validate_link_mode(input.base_config, &parsed, &remotes)? {
-        events.warnings.push(SyncWarning::Message(warning));
+        events.warnings.push(SyncWarning::LinkPathNotPortable {
+            source: warning.source,
+            path: warning.path,
+        });
     }
 
     let local_names = local_source_names(input);
@@ -1307,17 +1341,16 @@ fn prune_fast_forward_drops_report(
             ))
         })?;
         if prune::overlaps_live_dest(&path, &expected_paths, &record.key.target) {
-            events.warnings.push(SyncWarning::Message(format!(
-                "fast-forward unrecorded {}:{} but kept {} (a live artifact sits there)",
-                record.key.source,
-                record.key.artifact,
-                path.display()
-            )));
+            events.warnings.push(SyncWarning::FastForwardKeptLive {
+                source: record.key.source.clone(),
+                artifact: record.key.artifact.clone(),
+                path,
+            });
         } else {
-            events.warnings.push(SyncWarning::Message(format!(
-                "fast-forward dropped {}:{} (removed upstream)",
-                record.key.source, record.key.artifact
-            )));
+            events.warnings.push(SyncWarning::FastForwardDropped {
+                source: record.key.source.clone(),
+                artifact: record.key.artifact.clone(),
+            });
             remove_orphan_path(&path)
                 .map_err(|e| Error::Sync(format!("fast-forward prune {}: {e}", path.display())))?;
         }
@@ -1410,20 +1443,49 @@ fn collect_ref_transitions(
     resolved_commits: &BTreeMap<(String, String), String>,
     events: &mut SyncEvents,
 ) {
-    for line in ref_transition_lines(config, parsed, effective_lock, resolved_commits) {
-        events.warnings.push(SyncWarning::Message(
-            line.strip_prefix("phora: ").unwrap_or(&line).to_owned(),
-        ));
+    for transition in ref_transitions(config, parsed, effective_lock, resolved_commits) {
+        events.warnings.push(SyncWarning::ReferenceMoved {
+            source: transition.source,
+            target: transition.target,
+            from: transition.from,
+            to: transition.to,
+        });
     }
 }
 
+#[derive(Debug)]
+struct RefTransition {
+    source: String,
+    target: String,
+    from: String,
+    to: String,
+}
+
+#[cfg(test)]
 fn ref_transition_lines(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
     effective_lock: Option<&Lock>,
     resolved_commits: &BTreeMap<(String, String), String>,
 ) -> Vec<String> {
-    let mut lines = Vec::new();
+    ref_transitions(config, parsed, effective_lock, resolved_commits)
+        .into_iter()
+        .map(|transition| {
+            format!(
+                "phora: {} → {}: {} → {}",
+                transition.source, transition.target, transition.from, transition.to
+            )
+        })
+        .collect()
+}
+
+fn ref_transitions(
+    config: &Config,
+    parsed: &BTreeMap<String, ParsedSource>,
+    effective_lock: Option<&Lock>,
+    resolved_commits: &BTreeMap<(String, String), String>,
+) -> Vec<RefTransition> {
+    let mut transitions = Vec::new();
     for (target_name, target) in &config.targets {
         for binding in target.resolve_sources(parsed) {
             let Some(source) = parsed.get(binding.source) else {
@@ -1446,13 +1508,15 @@ fn ref_transition_lines(
             }
             let from = pin_label(&old.resolved, &old.commit);
             let to = pin_label(&binding.effective_ref.to_string(), new_commit);
-            lines.push(format!(
-                "phora: {} → {target_name}: {from} → {to}",
-                binding.source
-            ));
+            transitions.push(RefTransition {
+                source: binding.source.to_owned(),
+                target: target_name.clone(),
+                from,
+                to,
+            });
         }
     }
-    lines
+    transitions
 }
 
 /// Resolves the composed transitive graph OFFLINE (frozen reads of the pinned dep manifests
@@ -1472,11 +1536,24 @@ pub(crate) fn inject_composed_graph(
     }
 }
 
+#[derive(Debug)]
+struct LinkModeWarning {
+    source: String,
+    path: PathBuf,
+}
+
+impl LinkModeWarning {
+    #[cfg(test)]
+    fn contains(&self, needle: &str) -> bool {
+        self.source.contains(needle) || self.path.to_string_lossy().contains(needle)
+    }
+}
+
 fn validate_link_mode(
     base: &Config,
     effective: &BTreeMap<String, ParsedSource>,
     remotes: &BTreeMap<String, String>,
-) -> Result<Vec<String>> {
+) -> Result<Vec<LinkModeWarning>> {
     let mut warnings = Vec::new();
     for (name, source) in effective {
         if source.deploy_mode() != DeployMode::Link {
@@ -1490,10 +1567,10 @@ fn validate_link_mode(
             )));
         }
         if base.sources.contains_key(name) && Path::new(git).is_absolute() {
-            warnings.push(format!(
-                "source `{name}`: deploy = \"link\" uses the absolute path `{git}`, \
-                 which is not portable across machines"
-            ));
+            warnings.push(LinkModeWarning {
+                source: name.clone(),
+                path: PathBuf::from(git),
+            });
         }
     }
     Ok(warnings)
