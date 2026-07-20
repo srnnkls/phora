@@ -22,7 +22,7 @@ use std::process::{ExitStatus, Stdio};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::sync::mpsc;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use phora::cli::resolution_from_char;
 use phora::kernel::ProjectId;
@@ -34,6 +34,8 @@ mod common;
 
 const BASELINE_COMMIT: &str = "92c784e3b14496be25dcecc8d4500e32b52b1c50";
 const EX_TEMPFAIL: i32 = 75;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const PTY_PHASE_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const PTY_CHILD_STATUS_SENTINEL: &str = "__PHORA_PTY_CHILD_STATUS__=";
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -402,6 +404,35 @@ enum PtyEvent {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn pty_phase_deadline_budget_is_absolute_across_repeated_data() {
+    let phase_start = Instant::now();
+    let deadline = phase_start + PTY_PHASE_TIMEOUT;
+
+    assert_eq!(
+        remaining_until(deadline, phase_start + Duration::from_secs(4)),
+        Some(Duration::from_secs(11))
+    );
+    assert_eq!(
+        remaining_until(deadline, phase_start + Duration::from_secs(14)),
+        Some(Duration::from_secs(1)),
+        "later Data events must consume the original phase budget, not reset it"
+    );
+    assert_eq!(remaining_until(deadline, deadline), None);
+    assert_eq!(
+        remaining_until(deadline, deadline + Duration::from_nanos(1)),
+        None
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn remaining_until(deadline: Instant, now: Instant) -> Option<Duration> {
+    deadline
+        .checked_duration_since(now)
+        .filter(|remaining| !remaining.is_zero())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
@@ -475,6 +506,39 @@ fn pty_sync_command(fx: &Fixture) -> Command {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+fn finish_pty_child(
+    mut child: std::process::Child,
+    input: std::process::ChildStdin,
+    reader: std::thread::JoinHandle<()>,
+    mut script_stderr: std::process::ChildStderr,
+    timed_out: bool,
+    transcript: Vec<u8>,
+) -> PtyOutput {
+    if timed_out {
+        let _ = child.kill();
+    }
+    drop(input);
+    let script_status = child.wait().expect("wait for PTY script process");
+    reader.join().expect("PTY transcript reader joins");
+    let mut diagnostics = Vec::new();
+    script_stderr
+        .read_to_end(&mut diagnostics)
+        .expect("read script diagnostic output");
+    assert!(
+        !timed_out,
+        "PTY sync timed out waiting for prompt or completion; script stderr:\n{}\ntranscript:\n{}",
+        String::from_utf8_lossy(&diagnostics),
+        String::from_utf8_lossy(&transcript),
+    );
+
+    PtyOutput {
+        script_status,
+        transcript,
+        script_stderr: diagnostics,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_sync_in_pty(fx: &Fixture, prompt: &str, answer: &[u8]) -> PtyOutput {
     let mut command = pty_sync_command(fx);
     let mut child = command
@@ -485,7 +549,7 @@ fn run_sync_in_pty(fx: &Fixture, prompt: &str, answer: &[u8]) -> PtyOutput {
         .expect("installed `script` utility starts a PTY");
     let mut input = child.stdin.take().expect("script stdin is piped");
     let mut stdout = child.stdout.take().expect("script stdout is piped");
-    let mut script_stderr = child.stderr.take().expect("script stderr is piped");
+    let script_stderr = child.stderr.take().expect("script stderr is piped");
     let (sender, receiver) = mpsc::channel();
     let reader = std::thread::spawn(move || {
         let mut chunk = [0_u8; 4096];
@@ -512,8 +576,13 @@ fn run_sync_in_pty(fx: &Fixture, prompt: &str, answer: &[u8]) -> PtyOutput {
     let prompt_bytes = prompt.as_bytes();
     let mut prompt_seen = false;
     let mut timed_out = false;
+    let prompt_deadline = Instant::now() + PTY_PHASE_TIMEOUT;
     loop {
-        match receiver.recv_timeout(Duration::from_secs(15)) {
+        let Some(remaining) = remaining_until(prompt_deadline, Instant::now()) else {
+            timed_out = true;
+            break;
+        };
+        match receiver.recv_timeout(remaining) {
             Ok(PtyEvent::Data(chunk)) => {
                 transcript.extend_from_slice(&chunk);
                 if contains_bytes(&transcript, prompt_bytes) {
@@ -538,8 +607,13 @@ fn run_sync_in_pty(fx: &Fixture, prompt: &str, answer: &[u8]) -> PtyOutput {
     }
 
     if !timed_out {
+        let completion_deadline = Instant::now() + PTY_PHASE_TIMEOUT;
         loop {
-            match receiver.recv_timeout(Duration::from_secs(15)) {
+            let Some(remaining) = remaining_until(completion_deadline, Instant::now()) else {
+                timed_out = true;
+                break;
+            };
+            match receiver.recv_timeout(remaining) {
                 Ok(PtyEvent::Data(chunk)) => transcript.extend_from_slice(&chunk),
                 Ok(PtyEvent::ReadError(error)) => {
                     panic!("failed to finish reading PTY transcript: {error}")
@@ -553,28 +627,7 @@ fn run_sync_in_pty(fx: &Fixture, prompt: &str, answer: &[u8]) -> PtyOutput {
         }
     }
 
-    if timed_out {
-        let _ = child.kill();
-    }
-    drop(input);
-    let script_status = child.wait().expect("wait for PTY script process");
-    reader.join().expect("PTY transcript reader joins");
-    let mut diagnostics = Vec::new();
-    script_stderr
-        .read_to_end(&mut diagnostics)
-        .expect("read script diagnostic output");
-    assert!(
-        !timed_out,
-        "PTY sync timed out waiting for prompt or completion; script stderr:\n{}\ntranscript:\n{}",
-        String::from_utf8_lossy(&diagnostics),
-        String::from_utf8_lossy(&transcript),
-    );
-
-    PtyOutput {
-        script_status,
-        transcript,
-        script_stderr: diagnostics,
-    }
+    finish_pty_child(child, input, reader, script_stderr, timed_out, transcript)
 }
 
 fn snapshot(out: &Output) -> String {
