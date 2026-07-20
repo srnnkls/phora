@@ -1,6 +1,7 @@
 //! Mutating commands: `sync`, `update`, `rebuild-registry`, and lock I/O.
 
 use std::io::IsTerminal;
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 use crate::config::Config;
@@ -9,7 +10,10 @@ use crate::kernel::ProjectId;
 use crate::lock::{Lock, merge_locks};
 use crate::paths::{cache_root_for, state_root_for};
 use crate::store::{FileRegistry, StoreError};
-use crate::sync::{ConflictResolver, SyncInput, SyncOutput, sync};
+use crate::sync::{
+    Concurrency, ConflictPolicy, ConflictResolver, HookPolicy, LockSet, MovedPinPolicy,
+    PrunePolicy, SourcePolicy, SyncOptions, SyncOutput, SyncRequest, sync_opened_compat,
+};
 
 use super::{
     DropSources, TtyResolver, build_router, drop_sources, load_config, load_local_config,
@@ -65,26 +69,59 @@ pub(super) fn run_sync(
     let interactive = std::io::stdin().is_terminal();
     let resolver = TtyResolver;
 
-    let out = sync(
-        &SyncInput {
-            base_config: &base,
-            local_config: local.as_ref(),
-            base_lock,
-            local_lock,
-            force,
-            interactive,
-            prune,
-            no_hooks,
-            no_transitive_hooks,
-            frozen,
-            lockless,
-            fast_forward,
-            resolver: interactive.then_some(&resolver as &dyn ConflictResolver),
-            jobs,
+    let source_policy = if frozen {
+        SourcePolicy::Frozen
+    } else if force {
+        SourcePolicy::Refresh
+    } else {
+        SourcePolicy::Locked
+    };
+    let conflict_policy = if force {
+        ConflictPolicy::Overwrite
+    } else if interactive {
+        ConflictPolicy::ResolveInteractively
+    } else {
+        ConflictPolicy::Refuse
+    };
+    let hook_policy = if no_hooks {
+        HookPolicy::None
+    } else if no_transitive_hooks {
+        HookPolicy::NoTransitive
+    } else {
+        HookPolicy::All
+    };
+    let jobs = jobs
+        .map(|jobs| {
+            NonZeroUsize::new(jobs)
+                .ok_or_else(|| Error::Config("--jobs must be greater than zero".to_owned()))
+        })
+        .transpose()?;
+    let request = SyncRequest {
+        base_config: &base,
+        local_config: local.as_ref(),
+        locks: LockSet {
+            base: base_lock,
+            local: local_lock,
         },
-        &backend,
-        &registry,
-    )?;
+        options: SyncOptions {
+            source_policy,
+            conflict_policy,
+            prune_policy: if prune {
+                PrunePolicy::RemoveOrphans
+            } else {
+                PrunePolicy::KeepOrphans
+            },
+            hook_policy,
+            moved_pin_policy: if fast_forward {
+                MovedPinPolicy::FastForward
+            } else {
+                MovedPinPolicy::Seal
+            },
+            concurrency: Concurrency { jobs },
+        },
+        resolver: interactive.then_some(&resolver as &dyn ConflictResolver),
+    };
+    let out = sync_opened_compat(&request, &backend, &registry, lockless)?;
 
     finish_sync(&cwd, &out, interactive)
 }
