@@ -5,7 +5,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 
 LEGACY_ALLOWLIST=(
-  $'src/deploy.rs\tT024'
   $'src/store.rs\tT025'
   $'src/source/archive.rs\tT016'
   $'src/source/cache.rs\tT016'
