@@ -62,7 +62,7 @@ where
             Ok(false)
         })?;
     }
-    for record in registry.list_all()? {
+    for record in registry_only_records(ctx.input.prune(), || Ok(registry.list_all()?))? {
         let triplet = (
             record.key.target.clone(),
             record.key.source.clone(),
@@ -87,6 +87,17 @@ where
     Ok(ObservedProjectState {
         artifacts: observations.into_values().collect(),
     })
+}
+
+fn registry_only_records(
+    remove_orphans: bool,
+    list_all: impl FnOnce() -> Result<Vec<RegistryRecord>>,
+) -> Result<Vec<RegistryRecord>> {
+    if remove_orphans {
+        list_all()
+    } else {
+        Ok(Vec::new())
+    }
 }
 
 fn observe_entry(

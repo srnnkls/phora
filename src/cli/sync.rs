@@ -17,8 +17,8 @@ use crate::sync::{
 };
 
 use super::{
-    DropSources, TtyResolver, build_router, drop_sources, load_config, load_local_config,
-    open_project_registry,
+    CliOutcome, DropSources, TtyResolver, build_router, drop_sources, load_config,
+    load_local_config, open_project_registry,
 };
 
 fn open_sync_registry(cwd: &Path, config: &Config) -> Result<FileRegistry> {
@@ -41,7 +41,7 @@ pub(super) fn run_sync(
     fast_forward: bool,
     drop: Option<DropSources>,
     jobs: Option<usize>,
-) -> Result<()> {
+) -> Result<CliOutcome> {
     let cwd = std::env::current_dir()?;
     let base = load_config()?;
     let local = load_local_config(&cwd)?;
@@ -143,7 +143,7 @@ fn stripped_hook_notice(stripped: usize, interactive: bool) -> Option<StrippedHo
     })
 }
 
-fn finish_sync(cwd: &Path, out: &SyncReport, interactive: bool) -> Result<()> {
+fn finish_sync(cwd: &Path, out: &SyncReport, interactive: bool) -> Result<CliOutcome> {
     let base_lock = out
         .locks
         .base
@@ -185,7 +185,7 @@ fn finish_sync(cwd: &Path, out: &SyncReport, interactive: bool) -> Result<()> {
         }
         eprintln!("{}", notice.message);
         if notice.fail {
-            std::process::exit(1);
+            return Ok(CliOutcome::Failure);
         }
     }
     if out.status == crate::sync::SyncStatus::Failed {
@@ -206,13 +206,13 @@ fn finish_sync(cwd: &Path, out: &SyncReport, interactive: bool) -> Result<()> {
             (false, _) => "phora: one or more hooks failed",
         };
         eprintln!("{message}");
-        std::process::exit(1);
+        return Ok(CliOutcome::Failure);
     }
     if !report.is_empty() {
         print!("{report}");
     }
     println!("sync complete");
-    Ok(())
+    Ok(CliOutcome::Success)
 }
 
 fn render_sync_warnings(out: &SyncReport) {
@@ -227,7 +227,57 @@ fn render_sync_warnings(out: &SyncReport) {
                 "phora: dir `{dir}` cannot collapse to one symlink under a within-dir exclude; \
                  falling back to per-leaf links"
             ),
-            SyncWarning::Message(message) => eprintln!("phora: {message}"),
+            SyncWarning::MalformedTransitiveHooks { target, detail } => eprintln!(
+                "phora: imported dep target `{target}`: malformed `[targets.{target}.hooks]`: \
+                 {detail}"
+            ),
+            SyncWarning::LinkPathNotPortable { source, path } => eprintln!(
+                "phora: source `{source}`: deploy = \"link\" uses the absolute path `{}`, which \
+                 is not portable across machines",
+                path.display()
+            ),
+            SyncWarning::ReferenceMoved {
+                source,
+                target,
+                from,
+                to,
+            } => eprintln!("phora: {source} → {target}: {from} → {to}"),
+            SyncWarning::OrphanedRecords { count } => eprintln!(
+                "phora: {count} orphaned record(s) with no config target — run `phora list \
+                 --orphans` to inspect, `phora sync --prune` to remove"
+            ),
+            SyncWarning::PruneSkippedAfterFailures => {
+                eprintln!("phora: skipping --prune because some artifacts failed to deploy");
+            }
+            SyncWarning::PruneRefused { path, reason } => eprintln!(
+                "phora: refusing to prune out-of-anchor {}: {reason}",
+                path.display()
+            ),
+            SyncWarning::OrphanRecordPathUnknown {
+                source,
+                artifact,
+                layout,
+            } => eprintln!(
+                "phora: dropping the record for orphaned {source}:{artifact} only — its on-disk \
+                 path cannot be reconstructed (layout `{layout}` unrecognized or missing its \
+                 separator); any file is left in place rather than deleting a guessed path"
+            ),
+            SyncWarning::FastForwardKeptLive {
+                source,
+                artifact,
+                path,
+            } => eprintln!(
+                "phora: fast-forward unrecorded {source}:{artifact} but kept {} (a live artifact \
+                 sits there)",
+                path.display()
+            ),
+            SyncWarning::FastForwardDropped { source, artifact } => {
+                eprintln!("phora: fast-forward dropped {source}:{artifact} (removed upstream)");
+            }
+            SyncWarning::CrossDeviceFallback { destination } => eprintln!(
+                "phora: staging on a different mount than {}; falling back to recursive copy",
+                destination.display()
+            ),
             SyncWarning::ConflictModified {
                 source,
                 artifact,
@@ -299,7 +349,7 @@ pub(super) fn run_rebuild_registry() -> Result<()> {
     Ok(())
 }
 
-pub(super) fn run_update(source: Option<&str>, fast_forward: bool) -> Result<()> {
+pub(super) fn run_update(source: Option<&str>, fast_forward: bool) -> Result<CliOutcome> {
     let drop = source.map_or(DropSources::All, |s| DropSources::One(s.to_owned()));
     run_sync(
         false,
