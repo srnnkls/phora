@@ -14,6 +14,7 @@ mod prune;
 mod rebuild;
 pub mod reconcile;
 pub mod recovery;
+mod request;
 mod resolve;
 pub(crate) mod scan;
 pub(crate) mod stage;
@@ -38,6 +39,10 @@ pub use preview::{
     PreviewWarning, SyncState, preview_targets,
 };
 pub use rebuild::{RebuildReport, rebuild_registry, rebuild_registry_with};
+pub use request::{
+    AppliedChange, Concurrency, ConflictPolicy, HookPolicy, LockSet, MovedPinPolicy, PrunePolicy,
+    SkippedChange, SourcePolicy, SyncOptions, SyncReport, SyncRequest, SyncStatus, SyncWarning,
+};
 pub use verify::{UntrustedHookFinding, VerifyMismatch, VerifyReason, VerifyReport, verify};
 
 #[cfg(feature = "bench")]
