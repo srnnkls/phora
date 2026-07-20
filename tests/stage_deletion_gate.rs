@@ -172,6 +172,129 @@ fn references_token(body: &str, token: &str) -> bool {
     })
 }
 
+fn word_at(bytes: &[u8], at: usize, word: &[u8]) -> bool {
+    bytes.get(at..at + word.len()) == Some(word)
+        && (at == 0 || (!bytes[at - 1].is_ascii_alphanumeric() && bytes[at - 1] != b'_'))
+        && bytes
+            .get(at + word.len())
+            .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+}
+
+fn top_level_public_use_references(stripped: &str, token: &str) -> bool {
+    let bytes = stripped.as_bytes();
+    let mut brace_depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => brace_depth += 1,
+            b'}' => brace_depth = brace_depth.saturating_sub(1),
+            b'p' if brace_depth == 0 && word_at(bytes, i, b"pub") => {
+                let mut use_start = i + b"pub".len();
+                while bytes.get(use_start).is_some_and(u8::is_ascii_whitespace) {
+                    use_start += 1;
+                }
+                if word_at(bytes, use_start, b"use") {
+                    let mut end = use_start + b"use".len();
+                    let mut use_tree_depth = 0usize;
+                    while end < bytes.len() {
+                        match bytes[end] {
+                            b'{' => use_tree_depth += 1,
+                            b'}' => use_tree_depth = use_tree_depth.saturating_sub(1),
+                            b';' if use_tree_depth == 0 => {
+                                if references_token(&stripped[i..=end], token) {
+                                    return true;
+                                }
+                                break;
+                            }
+                            _ => {}
+                        }
+                        end += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+fn top_level_field_type<'a>(struct_body: &'a str, field: &str) -> Option<&'a str> {
+    let bytes = struct_body.as_bytes();
+    let mut brace_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut paren_depth = 0usize;
+    let mut angle_depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => brace_depth += 1,
+            b'}' => brace_depth = brace_depth.saturating_sub(1),
+            b'[' => bracket_depth += 1,
+            b']' => bracket_depth = bracket_depth.saturating_sub(1),
+            b'(' => paren_depth += 1,
+            b')' => paren_depth = paren_depth.saturating_sub(1),
+            b'<' if brace_depth == 1 && bracket_depth == 0 && paren_depth == 0 => angle_depth += 1,
+            b'>' if brace_depth == 1 && bracket_depth == 0 && paren_depth == 0 => {
+                angle_depth = angle_depth.saturating_sub(1);
+            }
+            _ if brace_depth == 1
+                && bracket_depth == 0
+                && paren_depth == 0
+                && angle_depth == 0
+                && word_at(bytes, i, field.as_bytes()) =>
+            {
+                let mut colon = i + field.len();
+                while bytes.get(colon).is_some_and(u8::is_ascii_whitespace) {
+                    colon += 1;
+                }
+                if bytes.get(colon) != Some(&b':') || bytes.get(colon + 1) == Some(&b':') {
+                    i += field.len();
+                    continue;
+                }
+
+                let type_start = colon + 1;
+                let mut end = type_start;
+                let mut type_brace_depth = 0usize;
+                let mut type_bracket_depth = 0usize;
+                let mut type_paren_depth = 0usize;
+                let mut angle_depth = 0usize;
+                while end < bytes.len() {
+                    match bytes[end] {
+                        b'{' => type_brace_depth += 1,
+                        b'}' if type_brace_depth > 0 => type_brace_depth -= 1,
+                        b'}' if type_bracket_depth == 0
+                            && type_paren_depth == 0
+                            && angle_depth == 0 =>
+                        {
+                            break;
+                        }
+                        b'[' => type_bracket_depth += 1,
+                        b']' => type_bracket_depth = type_bracket_depth.saturating_sub(1),
+                        b'(' => type_paren_depth += 1,
+                        b')' => type_paren_depth = type_paren_depth.saturating_sub(1),
+                        b'<' => angle_depth += 1,
+                        b'>' => angle_depth = angle_depth.saturating_sub(1),
+                        b',' if type_brace_depth == 0
+                            && type_bracket_depth == 0
+                            && type_paren_depth == 0
+                            && angle_depth == 0 =>
+                        {
+                            break;
+                        }
+                        _ => {}
+                    }
+                    end += 1;
+                }
+                return Some(struct_body[type_start..end].trim());
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 fn keyword_names(stripped: &str, keyword: &str, name: &str) -> bool {
     let bytes = stripped.as_bytes();
     stripped.match_indices(keyword).any(|(i, _)| {
@@ -487,13 +610,44 @@ fn no_production_code_outside_source_calls_export_artifact() {
 // ─── the deletion must not over-reach ────────────────────────────────────────
 
 #[test]
-fn manifest_file_stays_registry_owned() {
+fn manifest_file_remains_registry_state_owned_through_the_compatibility_facade() {
+    let state_file = scan(&read_src("sync/state/file.rs"));
+    let store_facade = scan(&read_src("store.rs"));
+    let definition_sites: Vec<String> = prod_src_files()
+        .into_iter()
+        .filter(|(_, content)| defines_type(&scan(content), "ManifestFile"))
+        .map(|(rel, _)| rel)
+        .collect();
+
     assert!(
-        defines_type(&scan(&read_src("store.rs")), "ManifestFile"),
-        "guard: ManifestFile is a REGISTRY value type (RegistryRecord.files) and stays in \
-         src/store.rs — only the source-side `impl StagedRecord for ManifestFile` and the \
-         `use crate::store::ManifestFile` bridge die. rebuild_one/deploy_one still build \
-         ManifestFile from the StagedArtifact for their records"
+        defines_type(&state_file, "ManifestFile"),
+        "guard: ManifestFile remains a REGISTRY/state value type and must be defined in \
+         src/sync/state/file.rs"
+    );
+    assert_eq!(
+        definition_sites,
+        ["sync/state/file.rs"],
+        "ManifestFile must have exactly one production definition in its registry/state owner; \
+         it must not become source- or staging-owned: {definition_sites:?}"
+    );
+    assert!(
+        !defines_type(&store_facade, "ManifestFile"),
+        "src/store.rs is a compatibility facade and must not retain a ManifestFile definition"
+    );
+    assert!(
+        top_level_public_use_references(&store_facade, "ManifestFile"),
+        "src/store.rs must continue to publicly re-export ManifestFile for compatibility"
+    );
+
+    let registry_record = state_file
+        .find("pub struct RegistryRecord")
+        .and_then(|start| balanced_body(&state_file[start..]))
+        .unwrap_or_default();
+    let files_type = top_level_field_type(&registry_record, "files").unwrap_or_default();
+    assert!(
+        references_token(files_type, "ManifestFile"),
+        "ManifestFile remains the registry/state value stored specifically by \
+         RegistryRecord.files; found type: {files_type:?}"
     );
 }
 
@@ -603,5 +757,49 @@ fn helper_forbidden_import_scan_ignores_comments_and_strings() {
     assert!(
         real.contains("crate::sync"),
         "a real re-export of the sync staging module is caught: {real}"
+    );
+}
+
+#[test]
+fn helper_top_level_public_use_handles_groups_but_rejects_private_modules() {
+    let grouped =
+        scan("pub use crate::sync::state::{\n    RegistryRecord,\n    ManifestFile,\n};\n");
+    assert!(
+        top_level_public_use_references(&grouped, "ManifestFile"),
+        "a grouped multiline top-level public re-export must count"
+    );
+
+    let private_only = scan(
+        "mod private {\n    pub use crate::sync::state::ManifestFile;\n}\n\
+         pub use crate::sync::state::RegistryRecord;\n",
+    );
+    assert!(
+        !top_level_public_use_references(&private_only, "ManifestFile"),
+        "a public use nested in a private module must not count as a facade re-export"
+    );
+}
+
+#[test]
+fn helper_top_level_field_type_binds_the_named_field() {
+    let valid = balanced_body(&scan(
+        "pub struct RegistryRecord {\n    marker: String,\n    pub files: \
+             Vec<ManifestFile>,\n}",
+    ))
+    .expect("valid RegistryRecord body parses");
+    assert!(
+        top_level_field_type(&valid, "files")
+            .is_some_and(|ty| references_token(ty, "ManifestFile")),
+        "the files field's generic ManifestFile type must be extracted"
+    );
+
+    let decoy = balanced_body(&scan(
+        "pub struct RegistryRecord {\n    pub files: Vec<ScannedFile>,\n    \
+             marker: Option<ManifestFile>,\n}",
+    ))
+    .expect("decoy RegistryRecord body parses");
+    assert!(
+        top_level_field_type(&decoy, "files")
+            .is_some_and(|ty| !references_token(ty, "ManifestFile")),
+        "ManifestFile on an unrelated field must not satisfy the files-field contract"
     );
 }

@@ -21,6 +21,7 @@ use crate::projection::model::{
 };
 use crate::source::{SourceBackend, SourceInventory};
 use crate::store::Registry;
+use crate::sync::state::StateStore;
 use crate::sync::{PreviewTargetPlan, offered_leaves, preview_targets, resolved_remotes};
 
 use super::render::{
@@ -843,7 +844,10 @@ pub fn target_listing(config: &Config) -> Vec<TargetRow> {
 /// # Errors
 ///
 /// Returns an error if `name` is not defined, or on-disk state cannot be read.
-pub fn target_detail(config: &Config, registry: &dyn Registry, name: &str) -> Result<TargetDetail> {
+pub fn target_detail<R>(config: &Config, registry: &R, name: &str) -> Result<TargetDetail>
+where
+    R: Registry + StateStore,
+{
     let target = config
         .targets
         .get(name)
@@ -880,7 +884,10 @@ pub fn target_detail(config: &Config, registry: &dyn Registry, name: &str) -> Re
 /// # Errors
 ///
 /// Returns an error if the registry or on-disk targets cannot be read.
-pub fn list_statuses(config: &Config, registry: &dyn Registry) -> Result<Vec<TargetListing>> {
+pub fn list_statuses<R>(config: &Config, registry: &R) -> Result<Vec<TargetListing>>
+where
+    R: Registry + StateStore,
+{
     config
         .targets
         .iter()
@@ -911,11 +918,14 @@ pub fn list_orphans(config: &Config, registry: &dyn Registry) -> Result<Vec<Orph
         .collect())
 }
 
-fn target_artifact_statuses(
+fn target_artifact_statuses<R>(
     target_name: &str,
     target: &crate::config::Target,
-    registry: &dyn Registry,
-) -> Result<Vec<ArtifactStatus>> {
+    registry: &R,
+) -> Result<Vec<ArtifactStatus>>
+where
+    R: Registry + StateStore,
+{
     let ejected = registry.load_ejected(target_name)?;
     let mut artifacts = Vec::new();
     for rec in registry.list_target(target_name)? {

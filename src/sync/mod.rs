@@ -277,7 +277,7 @@ fn decide_transitive_hooks(
     })
 }
 
-struct DeployAll<'a> {
+struct DeployAll<'a, R> {
     config: &'a Config,
     parsed: &'a BTreeMap<String, ParsedSource>,
     remotes: &'a BTreeMap<String, String>,
@@ -285,7 +285,7 @@ struct DeployAll<'a> {
     protected: &'a confine::ProtectedPathSet,
     input: &'a SyncInput<'a>,
     backend: &'a (dyn StageSource + Sync),
-    registry: &'a dyn Registry,
+    registry: &'a R,
     journal: &'a Journal,
 }
 
@@ -298,8 +298,8 @@ struct ApplyRun {
     aborted: bool,
 }
 
-fn target_run<'a>(
-    ctx: &DeployAll<'a>,
+fn target_run<'a, R>(
+    ctx: &DeployAll<'a, R>,
     target_name: &'a str,
     target: &'a crate::config::Target,
 ) -> TargetRun<'a> {
@@ -313,7 +313,10 @@ fn target_run<'a>(
     }
 }
 
-fn apply_target_changes(ctx: &DeployAll<'_>) -> Result<ApplyRun> {
+fn apply_target_changes<R>(ctx: &DeployAll<'_, R>) -> Result<ApplyRun>
+where
+    R: Registry + state::StateStore,
+{
     let observed = observe::observe_workspace(ctx, ctx.projection)?;
     let policy = ReconciliationPolicy {
         force: ctx.input.force,
@@ -324,6 +327,13 @@ fn apply_target_changes(ctx: &DeployAll<'_>) -> Result<ApplyRun> {
         .map_err(|e| Error::Sync(e.to_string()))?;
     let decisions = resolve_conflicts(&changeset, ctx.input.resolver, ctx.input.interactive)?;
     let reconciliation = Reconciliation::new(&changeset, &observed, decisions);
+    let readonly_registry;
+    let registry: &dyn Registry = if ctx.input.lockless {
+        readonly_registry = crate::store::FrozenReadOnlyRegistry::new(ctx.registry);
+        &readonly_registry
+    } else {
+        ctx.registry
+    };
 
     let mut run = ApplyRun {
         had_failures: false,
@@ -368,7 +378,7 @@ fn apply_target_changes(ctx: &DeployAll<'_>) -> Result<ApplyRun> {
             target_projection,
             &reconciliation,
             ctx.backend,
-            ctx.registry,
+            registry,
             ctx.journal,
         )?;
     }
@@ -443,7 +453,10 @@ fn notify_orphans(config: &Config, registry: &dyn Registry) -> Result<()> {
     Ok(())
 }
 
-fn maybe_prune(ctx: &DeployAll<'_>, had_failures: bool) -> Result<()> {
+fn maybe_prune<R>(ctx: &DeployAll<'_, R>, had_failures: bool) -> Result<()>
+where
+    R: Registry,
+{
     if !ctx.input.prune {
         return Ok(());
     }
@@ -451,7 +464,14 @@ fn maybe_prune(ctx: &DeployAll<'_>, had_failures: bool) -> Result<()> {
         eprintln!("phora: skipping --prune because some artifacts failed to deploy");
         return Ok(());
     }
-    prune_projected(ctx.projection, ctx.config, ctx.registry, ctx.protected)
+    let readonly_registry;
+    let registry: &dyn Registry = if ctx.input.lockless {
+        readonly_registry = crate::store::FrozenReadOnlyRegistry::new(ctx.registry);
+        &readonly_registry
+    } else {
+        ctx.registry
+    };
+    prune_projected(ctx.projection, ctx.config, registry, ctx.protected)
 }
 
 fn sweep_target_parents(config: &Config, journal: &Journal, registry: &dyn Registry) -> Result<()> {
@@ -520,11 +540,14 @@ fn project_sync_workspace(
     Ok(projection)
 }
 
-pub fn sync(
+pub fn sync<R>(
     input: &SyncInput<'_>,
     backend: &(dyn StageSource + Sync),
-    registry: &dyn Registry,
-) -> Result<SyncOutput> {
+    registry: &R,
+) -> Result<SyncOutput>
+where
+    R: Registry + state::StateStore,
+{
     let mut effective_config = merged_config(input);
     effective_config.validate()?;
     let mut parsed = effective_config.parsed_sources()?;
@@ -546,20 +569,20 @@ pub fn sync(
     let local_names = local_source_names(input);
 
     let readonly_registry;
-    let registry: &dyn Registry = if input.lockless {
+    let compat_registry: &dyn Registry = if input.lockless {
         readonly_registry = crate::store::FrozenReadOnlyRegistry::new(registry);
         &readonly_registry
     } else {
         registry
     };
-    let journal = open_sync_journal(input.lockless, registry)?;
+    let journal = open_sync_journal(input.lockless, compat_registry)?;
     let cwd = std::env::current_dir()
         .map_err(|e| Error::Sync(format!("resolve current dir for confinement: {e}")))?;
     let protected = confine::ProtectedPathSet::resolve(&effective_config.paths, &cwd)?;
 
-    sweep_target_parents(&effective_config, &journal, registry)?;
+    sweep_target_parents(&effective_config, &journal, compat_registry)?;
 
-    let recorded_after_recovery = live_recorded_artifacts(registry)?;
+    let recorded_after_recovery = live_recorded_artifacts(compat_registry)?;
 
     let (routed, resolved_commits) = resolve_sources(
         &effective_config,
@@ -597,7 +620,7 @@ pub fn sync(
         &parsed,
         &projection,
         &recorded_after_recovery,
-        registry,
+        compat_registry,
         &protected,
         input.fast_forward,
     )?;
@@ -636,14 +659,17 @@ pub fn sync(
     )
 }
 
-fn deploy_and_run_hooks(
-    deploy: &DeployAll<'_>,
+fn deploy_and_run_hooks<R>(
+    deploy: &DeployAll<'_, R>,
     mut base_lock: Lock,
     local_lock: Option<Lock>,
     hook_candidates: &[transitive::TransitiveHookCandidate],
     effective_lock: Option<&Lock>,
     pre_sync_outcomes: Vec<hooks::HookOutcome>,
-) -> Result<SyncOutput> {
+) -> Result<SyncOutput>
+where
+    R: Registry + state::StateStore,
+{
     let run = apply_target_changes(deploy)?;
     // pre_deploy renders after pre_sync, before post_sync/on_change.
     let mut early_hooks = pre_sync_outcomes;
@@ -658,14 +684,21 @@ fn deploy_and_run_hooks(
     }
     let mut had_failures = run.had_failures;
     maybe_prune(deploy, had_failures)?;
+    let readonly_registry;
+    let registry: &dyn Registry = if deploy.input.lockless {
+        readonly_registry = crate::store::FrozenReadOnlyRegistry::new(deploy.registry);
+        &readonly_registry
+    } else {
+        deploy.registry
+    };
     if !deploy.input.prune {
-        notify_orphans(deploy.config, deploy.registry)?;
+        notify_orphans(deploy.config, registry)?;
     }
 
     let (hook_results, stripped_transitive_hooks) = run_all_hooks(
         deploy.input,
         deploy.config,
-        deploy.registry,
+        registry,
         &mut base_lock,
         hook_candidates,
         effective_lock,

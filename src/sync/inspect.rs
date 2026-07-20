@@ -2,14 +2,13 @@ use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
-use crate::store::{
-    ArtifactKey, EjectedEntry, HookState, ManifestFile, Registry, RegistryRecord, StoreError,
-};
+use crate::store::{ArtifactKey, EjectedEntry, ManifestFile, RegistryRecord};
 use crate::sync::model::{ManagedArtifact, ManagedCondition, ObservedArtifact, ScannedFile};
 use crate::sync::scan::{mtime_secs, scan_dir_soft};
 use crate::sync::state::StateStore;
 
-type StoreResult<T> = std::result::Result<T, StoreError>;
+#[cfg(test)]
+use crate::store::Registry;
 
 #[derive(Debug)]
 pub enum ArtifactState {
@@ -29,6 +28,32 @@ pub enum ArtifactState {
     },
 }
 
+struct ArtifactClassification {
+    state: ArtifactState,
+    record: Option<RegistryRecord>,
+}
+
+impl ArtifactClassification {
+    fn unmanaged(state: ArtifactState) -> Self {
+        Self {
+            state,
+            record: None,
+        }
+    }
+
+    fn managed(state: ArtifactState, record: RegistryRecord) -> Self {
+        Self {
+            state,
+            record: Some(record),
+        }
+    }
+}
+
+enum RecordLookup {
+    Managed(RegistryRecord),
+    Classified(ArtifactClassification),
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "drift inputs are independent scalars; bundling them into a struct would only relocate the arity"
@@ -39,10 +64,37 @@ pub fn check_artifact_state(
     expected_commit: &str,
     ejected: &[EjectedEntry],
     artifact_name: &str,
-    registry: &dyn Registry,
+    store: &dyn StateStore,
     key: &ArtifactKey,
     expected_vars_digest: Option<&str>,
 ) -> Result<ArtifactState> {
+    Ok(classify_artifact_state(
+        target_path,
+        expected_source,
+        expected_commit,
+        ejected,
+        artifact_name,
+        store,
+        key,
+        expected_vars_digest,
+    )?
+    .state)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "drift inputs are independent scalars; bundling them into a struct would only relocate the arity"
+)]
+fn classify_artifact_state(
+    target_path: &Path,
+    expected_source: &str,
+    expected_commit: &str,
+    ejected: &[EjectedEntry],
+    artifact_name: &str,
+    store: &dyn StateStore,
+    key: &ArtifactKey,
+    expected_vars_digest: Option<&str>,
+) -> Result<ArtifactClassification> {
     let is_ejected = ejected.iter().any(|e| {
         e.source == expected_source
             && (e.artifact == artifact_name
@@ -50,11 +102,13 @@ pub fn check_artifact_state(
                 || e.artifact.starts_with(&format!("{artifact_name}/")))
     });
     if is_ejected {
-        return Ok(ArtifactState::Ejected);
+        return Ok(ArtifactClassification::unmanaged(ArtifactState::Ejected));
     }
 
     match target_path.try_exists() {
-        Ok(false) => return Ok(ArtifactState::Missing),
+        Ok(false) => {
+            return Ok(ArtifactClassification::unmanaged(ArtifactState::Missing));
+        }
         Ok(true) => {}
         Err(e) => {
             return Err(Error::Projection(format!(
@@ -69,15 +123,15 @@ pub fn check_artifact_state(
             target_path,
             expected_source,
             expected_commit,
-            registry,
+            store,
             key,
             expected_vars_digest,
         );
     }
 
-    let record = match artifact_record(registry, key, expected_source)? {
-        Ok(record) => record,
-        Err(state) => return Ok(state),
+    let record = match artifact_record(store, key, expected_source)? {
+        RecordLookup::Managed(record) => record,
+        RecordLookup::Classified(classification) => return Ok(classification),
     };
 
     let mut changed: BTreeSet<PathBuf> = BTreeSet::new();
@@ -124,13 +178,14 @@ pub fn check_artifact_state(
         changed.extend(scan.symlinks);
     }
 
-    Ok(classify_drift(
+    let state = classify_drift(
         &record,
         changed.into_iter().collect(),
         fresh,
         expected_commit,
         expected_vars_digest,
-    ))
+    );
+    Ok(ArtifactClassification::managed(state, record))
 }
 
 /// Drift check when the target IS a single renamed FILE, not a directory of recorded files.
@@ -138,13 +193,13 @@ fn check_file_artifact_state(
     file_path: &Path,
     expected_source: &str,
     expected_commit: &str,
-    registry: &dyn Registry,
+    store: &dyn StateStore,
     key: &ArtifactKey,
     expected_vars_digest: Option<&str>,
-) -> Result<ArtifactState> {
-    let record = match artifact_record(registry, key, expected_source)? {
-        Ok(record) => record,
-        Err(state) => return Ok(state),
+) -> Result<ArtifactClassification> {
+    let record = match artifact_record(store, key, expected_source)? {
+        RecordLookup::Managed(record) => record,
+        RecordLookup::Classified(classification) => return Ok(classification),
     };
 
     let meta = std::fs::symlink_metadata(file_path)
@@ -161,52 +216,65 @@ fn check_file_artifact_state(
         None => (vec![file_path.to_path_buf()], vec![]),
     };
 
-    Ok(classify_drift(
+    let state = classify_drift(
         &record,
         changed,
         fresh,
         expected_commit,
         expected_vars_digest,
-    ))
+    );
+    Ok(ArtifactClassification::managed(state, record))
 }
 
-/// `Err(state)` is not a failure: it carries the early Linked/Outdated/Foreign `ArtifactState`.
 fn artifact_record(
-    registry: &dyn Registry,
+    store: &dyn StateStore,
     key: &ArtifactKey,
     expected_source: &str,
-) -> Result<std::result::Result<RegistryRecord, ArtifactState>> {
-    let Some(record) = registry.get(key)? else {
-        if managed_under_sibling_shape(registry, key, expected_source)? {
-            return Ok(Err(ArtifactState::Outdated));
+) -> Result<RecordLookup> {
+    let Some(record) = store.artifact(key)? else {
+        if let Some(record) = managed_under_sibling_shape(store, key, expected_source)? {
+            return Ok(RecordLookup::Classified(ArtifactClassification::managed(
+                ArtifactState::Outdated,
+                record,
+            )));
         }
-        return Ok(Err(ArtifactState::Foreign));
+        return Ok(RecordLookup::Classified(ArtifactClassification::unmanaged(
+            ArtifactState::Foreign,
+        )));
     };
     if record.linked {
-        return Ok(Err(ArtifactState::Linked));
+        return Ok(RecordLookup::Classified(ArtifactClassification::managed(
+            ArtifactState::Linked,
+            record,
+        )));
     }
     if record.key.source != expected_source {
-        return Ok(Err(ArtifactState::Foreign));
+        return Ok(RecordLookup::Classified(ArtifactClassification::unmanaged(
+            ArtifactState::Foreign,
+        )));
     }
-    Ok(Ok(record))
+    Ok(RecordLookup::Managed(record))
 }
 
-/// True when `expected_source` holds a record under the collapsed-dir/per-leaf counterpart of `key`.
+/// Finds `expected_source` under the collapsed-dir/per-leaf counterpart of `key`.
 fn managed_under_sibling_shape(
-    registry: &dyn Registry,
+    store: &dyn StateStore,
     key: &ArtifactKey,
     expected_source: &str,
-) -> Result<bool> {
+) -> Result<Option<RegistryRecord>> {
     let under = |child: &str, parent: &str| {
         child
             .strip_prefix(parent)
             .is_some_and(|r| r.starts_with('/'))
     };
-    Ok(registry.list_target(&key.target)?.iter().any(|record| {
-        record.key.source == expected_source
-            && (under(&record.key.artifact, &key.artifact)
-                || under(&key.artifact, &record.key.artifact))
-    }))
+    Ok(store
+        .target_artifacts(&key.target)?
+        .into_iter()
+        .find(|record| {
+            record.key.source == expected_source
+                && (under(&record.key.artifact, &key.artifact)
+                    || under(&key.artifact, &record.key.artifact))
+        }))
 }
 
 fn classify_drift(
@@ -291,106 +359,50 @@ pub fn inspect(
     key: &ArtifactKey,
     expected_vars_digest: Option<&str>,
 ) -> Result<ObservedArtifact<RegistryRecord>> {
-    let registry = StoreRegistry { store };
-    let state = check_artifact_state(
+    let classification = classify_artifact_state(
         target_path,
         expected_source,
         expected_commit,
         ejected,
         &key.artifact,
-        &registry,
+        store,
         key,
         expected_vars_digest,
     )?;
-    let managed = |condition| -> Result<ObservedArtifact<RegistryRecord>> {
-        Ok(ObservedArtifact::Managed(ManagedArtifact {
-            record: managed_record(&registry, key, expected_source)?,
-            condition,
-        }))
-    };
+    let ArtifactClassification { state, record } = classification;
     match state {
         ArtifactState::Missing => Ok(ObservedArtifact::Missing),
         ArtifactState::Foreign => Ok(ObservedArtifact::Foreign(target_path.to_path_buf())),
         ArtifactState::Ejected => Ok(ObservedArtifact::Ejected),
-        ArtifactState::Clean => managed(ManagedCondition::Clean),
-        ArtifactState::Outdated => managed(ManagedCondition::Outdated),
-        ArtifactState::Modified { changed } => managed(ManagedCondition::Modified { changed }),
-        ArtifactState::Linked => managed(ManagedCondition::Linked),
-        ArtifactState::Revalidated { fresh } => {
-            managed(ManagedCondition::MetadataChangedButContentClean { refreshed: fresh })
+        ArtifactState::Clean => managed_observation(record, key, ManagedCondition::Clean),
+        ArtifactState::Outdated => managed_observation(record, key, ManagedCondition::Outdated),
+        ArtifactState::Modified { changed } => {
+            managed_observation(record, key, ManagedCondition::Modified { changed })
         }
+        ArtifactState::Linked => managed_observation(record, key, ManagedCondition::Linked),
+        ArtifactState::Revalidated { fresh } => managed_observation(
+            record,
+            key,
+            ManagedCondition::MetadataChangedButContentClean { refreshed: fresh },
+        ),
     }
 }
 
-fn managed_record(
-    registry: &dyn Registry,
+fn managed_observation(
+    record: Option<RegistryRecord>,
     key: &ArtifactKey,
-    expected_source: &str,
-) -> Result<RegistryRecord> {
-    if let Some(record) = registry.get(key)? {
-        return Ok(record);
-    }
-    let sibling = |child: &str, parent: &str| {
-        child
-            .strip_prefix(parent)
-            .is_some_and(|rest| rest.starts_with('/'))
-    };
-    registry
-        .list_target(&key.target)?
-        .into_iter()
-        .find(|record| {
-            record.key.source == expected_source
-                && (sibling(&record.key.artifact, &key.artifact)
-                    || sibling(&key.artifact, &record.key.artifact))
-        })
-        .ok_or_else(|| {
-            Error::Projection(format!(
-                "managed record for {} vanished mid-observation",
-                key.artifact
-            ))
-        })
-}
-
-struct StoreRegistry<'a> {
-    store: &'a dyn StateStore,
-}
-
-impl Registry for StoreRegistry<'_> {
-    fn get(&self, key: &ArtifactKey) -> StoreResult<Option<RegistryRecord>> {
-        self.store.artifact(key)
-    }
-    fn put(&self, record: &RegistryRecord) -> StoreResult<()> {
-        self.store.put_artifact(record)
-    }
-    fn remove(&self, key: &ArtifactKey) -> StoreResult<()> {
-        self.store.remove_artifact(key)
-    }
-    fn list_target(&self, target: &str) -> StoreResult<Vec<RegistryRecord>> {
-        self.store.target_artifacts(target)
-    }
-    fn list_all(&self) -> StoreResult<Vec<RegistryRecord>> {
-        self.store.all_artifacts()
-    }
-    fn load_ejected(&self, target: &str) -> StoreResult<Vec<EjectedEntry>> {
-        self.store.ejections(target)
-    }
-    fn save_ejected(&self, target: &str, ejected: &[EjectedEntry]) -> StoreResult<()> {
-        self.store.save_ejections(target, ejected)
-    }
-    fn load_hook_state(&self, target: &str) -> StoreResult<Vec<HookState>> {
-        self.store.hook_state(target)
-    }
-    fn record_hook_success(
-        &self,
-        target: &str,
-        hook_id: &str,
-        digest_set: &BTreeSet<String>,
-    ) -> StoreResult<()> {
-        self.store.record_hook_success(target, hook_id, digest_set)
-    }
-    fn locks_dir(&self) -> PathBuf {
-        self.store.journal_root()
-    }
+    condition: ManagedCondition,
+) -> Result<ObservedArtifact<RegistryRecord>> {
+    let record = record.ok_or_else(|| {
+        Error::Projection(format!(
+            "managed record for {} vanished mid-observation",
+            key.artifact
+        ))
+    })?;
+    Ok(ObservedArtifact::Managed(ManagedArtifact {
+        record,
+        condition,
+    }))
 }
 
 #[cfg(test)]
