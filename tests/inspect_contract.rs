@@ -1,6 +1,11 @@
+use std::cell::Cell;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use phora::store::{ArtifactKey, EjectedEntry, FileRegistry, ManifestFile, RegistryRecord};
+use phora::store::{
+    ArtifactKey, EjectedEntry, FileRegistry, HookState, ManifestFile, RegistryRecord,
+    StateLockGuard, StoreError,
+};
 use phora::sync::inspect::inspect;
 use phora::sync::model::{ManagedCondition, ObservedArtifact};
 use phora::sync::state::StateStore;
@@ -97,6 +102,80 @@ fn observe(
     .expect("inspect must not error on a well-formed fixture")
 }
 
+struct OneShotStore {
+    record: RegistryRecord,
+    artifact_reads: Cell<usize>,
+}
+
+impl OneShotStore {
+    fn new(record: RegistryRecord) -> Self {
+        Self {
+            record,
+            artifact_reads: Cell::new(0),
+        }
+    }
+}
+
+impl StateStore for OneShotStore {
+    fn artifact(&self, key: &ArtifactKey) -> Result<Option<RegistryRecord>, StoreError> {
+        assert_eq!(key, &self.record.key, "inspect must request the seeded key");
+        let reads = self.artifact_reads.get();
+        self.artifact_reads.set(reads + 1);
+        if reads == 0 {
+            Ok(Some(self.record.clone()))
+        } else {
+            Err(StoreError::Registry(
+                "artifact record was read more than once".to_owned(),
+            ))
+        }
+    }
+
+    fn put_artifact(&self, _record: &RegistryRecord) -> Result<(), StoreError> {
+        unreachable!("inspection must not write an artifact")
+    }
+
+    fn remove_artifact(&self, _key: &ArtifactKey) -> Result<(), StoreError> {
+        unreachable!("inspection must not remove an artifact")
+    }
+
+    fn target_artifacts(&self, _target: &str) -> Result<Vec<RegistryRecord>, StoreError> {
+        unreachable!("a directly managed artifact must not fall back to a target-wide read")
+    }
+
+    fn all_artifacts(&self) -> Result<Vec<RegistryRecord>, StoreError> {
+        unreachable!("inspection must not list every artifact")
+    }
+
+    fn ejections(&self, _target: &str) -> Result<Vec<EjectedEntry>, StoreError> {
+        unreachable!("inspection receives ejections from its caller")
+    }
+
+    fn save_ejections(&self, _target: &str, _entries: &[EjectedEntry]) -> Result<(), StoreError> {
+        unreachable!("inspection must not save ejections")
+    }
+
+    fn hook_state(&self, _target: &str) -> Result<Vec<HookState>, StoreError> {
+        unreachable!("inspection must not read hook state")
+    }
+
+    fn record_hook_success(
+        &self,
+        _target: &str,
+        _hook_id: &str,
+        _digest_set: &BTreeSet<String>,
+    ) -> Result<(), StoreError> {
+        unreachable!("inspection must not record hook state")
+    }
+
+    fn acquire_lock(&self) -> Result<StateLockGuard, StoreError> {
+        unreachable!("inspection must not acquire the project lock")
+    }
+
+    fn journal_root(&self) -> PathBuf {
+        unreachable!("inspection must not inspect the journal root")
+    }
+}
+
 #[test]
 fn inspect_reads_an_absent_unejected_target_as_missing() {
     let (_dir, reg) = store();
@@ -152,6 +231,37 @@ fn inspect_reads_a_clean_managed_deployment_as_managed_clean() {
         matches!(managed.condition, ManagedCondition::Clean),
         "a byte-for-byte in-sync managed artifact carries ManagedCondition::Clean, got {:?}",
         managed.condition
+    );
+}
+
+#[test]
+fn inspect_reads_a_directly_managed_record_exactly_once() {
+    let target = TempDir::new().expect("target dir");
+    let record = deploy_and_record(target.path(), &[("a.json", b"{}")]);
+    let store = OneShotStore::new(record.clone());
+
+    let observed = inspect(
+        target.path(),
+        SOURCE,
+        COMMIT,
+        &[],
+        &store,
+        &record.key,
+        None,
+    )
+    .expect("a directly managed artifact must not reread its one-shot record");
+
+    let ObservedArtifact::Managed(managed) = observed else {
+        panic!("the seeded artifact must remain managed, got {observed:?}");
+    };
+    assert_eq!(
+        managed.record, record,
+        "inspection must return the original record obtained from its single artifact read"
+    );
+    assert_eq!(
+        store.artifact_reads.get(),
+        1,
+        "one observation of a directly managed artifact performs exactly one artifact(key) read"
     );
 }
 

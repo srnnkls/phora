@@ -550,8 +550,279 @@ fn impls_trait_for(stripped: &str, trait_name: &str, subject: &str) -> bool {
     trait_impl_body(stripped, trait_name, subject).is_some()
 }
 
+fn trait_aliases(stripped: &str, trait_name: &str) -> Vec<String> {
+    let normalized = collapse_colon_ws(stripped);
+    let mut aliases: Vec<String> = use_leaves(&normalized)
+        .into_iter()
+        .filter_map(|leaf| {
+            let words: Vec<&str> = leaf.split_whitespace().collect();
+            let [path, "as", alias] = words.as_slice() else {
+                return None;
+            };
+            let imported = path.rsplit("::").next()?;
+            (imported == trait_name && *alias != "_").then(|| (*alias).to_owned())
+        })
+        .collect();
+    aliases.sort();
+    aliases.dedup();
+    aliases
+}
+
+fn trait_impl_subjects(stripped: &str, trait_name: &str) -> Vec<String> {
+    let mut trait_names = vec![trait_name.to_owned()];
+    trait_names.extend(trait_aliases(stripped, trait_name));
+    let mut subjects: Vec<String> = impl_spans(stripped)
+        .into_iter()
+        .filter_map(|(header, _)| {
+            let rest = skip_generics(header.trim_start().strip_prefix("impl")?.trim_start());
+            let subject = top_level_for_tail(rest)?;
+            let trait_side = &rest[..rest.len() - subject.len() - "for".len()];
+            trait_names
+                .iter()
+                .any(|name| references_token(trait_side, name))
+                .then(|| impl_subject(&header))?
+        })
+        .collect();
+    subjects.sort();
+    subjects
+}
+
+fn production_trait_impl_sites(trait_name: &str) -> Vec<String> {
+    let mut sites: Vec<String> = prod_src_files()
+        .into_iter()
+        .flat_map(|(rel, source)| {
+            trait_impl_subjects(&scan(&source), trait_name)
+                .into_iter()
+                .map(move |subject| format!("{rel}:{subject}"))
+        })
+        .collect();
+    sites.sort();
+    sites
+}
+
+fn production_trait_alias_sites(trait_name: &str) -> Vec<String> {
+    let mut sites: Vec<String> = prod_src_files()
+        .into_iter()
+        .flat_map(|(rel, source)| {
+            trait_aliases(&scan(&source), trait_name)
+                .into_iter()
+                .map(move |alias| format!("{rel}:{alias}"))
+        })
+        .collect();
+    sites.sort();
+    sites
+}
+
+fn top_level_fn_items(body: &str) -> Vec<(String, bool)> {
+    let inner = body
+        .strip_prefix('{')
+        .and_then(|body| body.strip_suffix('}'))
+        .unwrap_or(body);
+    let bytes = inner.as_bytes();
+    let mut items = Vec::new();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                i += 1;
+            }
+            b'f' if depth == 0 => {
+                let before_ok = i == 0 || !is_ident_byte(bytes[i - 1]);
+                let after_ok = inner[i..].starts_with("fn")
+                    && bytes.get(i + 2).is_some_and(|&b| b.is_ascii_whitespace());
+                if !(before_ok && after_ok) {
+                    i += 1;
+                    continue;
+                }
+                let name: String = inner[i + 2..]
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                let prefix = inner[..i].trim_end();
+                let is_public = prefix.strip_suffix("pub").is_some_and(|before| {
+                    before.chars().next_back().is_none_or(char::is_whitespace)
+                });
+                if !name.is_empty() {
+                    items.push((name, is_public));
+                }
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    items
+}
+
+fn locking_seam_sites(rel: &str, source: &str) -> Vec<(String, bool, bool)> {
+    const SEAMS: &[&str] = &["lock_exclusive", "lock_advisory"];
+    let scanned = scan(source);
+    let mut sites: Vec<(String, bool, bool)> = top_level_fn_items(&format!("{{{scanned}}}"))
+        .into_iter()
+        .filter(|(name, _)| SEAMS.contains(&name.as_str()))
+        .map(|(name, is_public)| (format!("{rel}:<free>::{name}"), is_public, false))
+        .collect();
+    for (header, body) in impl_spans(&scanned) {
+        let subject = impl_subject(&header).unwrap_or_else(|| "<unknown>".to_owned());
+        let rest = skip_generics(
+            header
+                .trim_start()
+                .strip_prefix("impl")
+                .unwrap_or_default()
+                .trim_start(),
+        );
+        let is_inherent = top_level_for_tail(rest).is_none();
+        sites.extend(
+            top_level_fn_items(&body)
+                .into_iter()
+                .filter(|(name, _)| SEAMS.contains(&name.as_str()))
+                .map(|(name, is_public)| {
+                    (format!("{rel}:{subject}::{name}"), is_public, is_inherent)
+                }),
+        );
+    }
+    sites.sort();
+    sites
+}
+
+fn production_locking_seam_sites() -> Vec<(String, bool, bool)> {
+    let mut sites: Vec<(String, bool, bool)> = prod_src_files()
+        .into_iter()
+        .flat_map(|(rel, source)| locking_seam_sites(&rel, &source))
+        .collect();
+    sites.sort();
+    sites
+}
+
+fn strip_attributes(stripped: &str) -> String {
+    let chars: Vec<char> = stripped.chars().collect();
+    let mut out = String::with_capacity(stripped.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let bracket = match (chars.get(i), chars.get(i + 1), chars.get(i + 2)) {
+            (Some('#'), Some('['), _) => Some(i + 1),
+            (Some('#'), Some('!'), Some('[')) => Some(i + 2),
+            _ => None,
+        };
+        let Some(bracket) = bracket else {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        };
+        while i <= bracket {
+            out.push(blank(chars[i]));
+            i += 1;
+        }
+        let mut depth = 1i32;
+        while i < chars.len() && depth > 0 {
+            match chars[i] {
+                '[' => depth += 1,
+                ']' => depth -= 1,
+                _ => {}
+            }
+            out.push(blank(chars[i]));
+            i += 1;
+        }
+    }
+    out
+}
+
+fn keyword_at(source: &str, start: usize, keyword: &str) -> Option<usize> {
+    let bytes = source.as_bytes();
+    source[start..]
+        .starts_with(keyword)
+        .then_some(start + keyword.len())
+        .filter(|&end| bytes.get(end).is_none_or(|&b| !is_ident_byte(b)))
+}
+
+fn facade_non_reexport_constructs(source: &str) -> Vec<String> {
+    let stripped = strip_attributes(&scan(source));
+    let bytes = stripped.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        if i == bytes.len() {
+            return Vec::new();
+        }
+
+        let Some(after_pub) = keyword_at(&stripped, i, "pub") else {
+            break;
+        };
+        if !bytes.get(after_pub).is_some_and(u8::is_ascii_whitespace) {
+            break;
+        }
+        let mut after_pub_ws = after_pub;
+        while bytes.get(after_pub_ws).is_some_and(u8::is_ascii_whitespace) {
+            after_pub_ws += 1;
+        }
+        let Some(after_use) = keyword_at(&stripped, after_pub_ws, "use") else {
+            break;
+        };
+        if !bytes.get(after_use).is_some_and(u8::is_ascii_whitespace) {
+            break;
+        }
+
+        let mut brace_depth = 0i32;
+        let mut bracket_depth = 0i32;
+        let mut paren_depth = 0i32;
+        let mut end = None;
+        let mut j = after_use;
+        while j < bytes.len() {
+            match bytes[j] {
+                b'{' => brace_depth += 1,
+                b'}' => brace_depth -= 1,
+                b'[' => bracket_depth += 1,
+                b']' => bracket_depth -= 1,
+                b'(' => paren_depth += 1,
+                b')' => paren_depth -= 1,
+                b';' if brace_depth == 0 && bracket_depth == 0 && paren_depth == 0 => {
+                    end = Some(j + 1);
+                    break;
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        let Some(next) = end else {
+            break;
+        };
+        i = next;
+    }
+
+    let unexpected = stripped[i..].trim();
+    (!unexpected.is_empty())
+        .then(|| unexpected.chars().take(120).collect())
+        .into_iter()
+        .collect()
+}
+
+fn definition_sites(name: &str) -> Vec<String> {
+    let mut sites: Vec<String> = prod_src_files()
+        .into_iter()
+        .filter(|(_, source)| {
+            let scanned = scan(source);
+            ["trait", "struct", "enum", "type"]
+                .into_iter()
+                .any(|keyword| keyword_names(&scanned, keyword, name))
+        })
+        .map(|(rel, _)| rel)
+        .collect();
+    sites.sort();
+    sites
+}
+
 const TRAIT: &str = "StateStore";
 const STATE_MODULE: &str = "sync/state/mod.rs";
+const STATE_FILE: &str = "sync/state/file.rs";
+const STATE_LOCKING: &str = "sync/state/locking.rs";
 const MODEL_MODULE: &str = "sync/model.rs";
 const STORE: &str = "store.rs";
 
@@ -723,6 +994,19 @@ fn state_and_model_modules_are_registered_in_sync() {
 }
 
 #[test]
+fn state_module_registers_file_and_locking_implementation_modules() {
+    let state = scan(&read_src(STATE_MODULE));
+    for module in ["file", "locking"] {
+        assert!(
+            keyword_names(&state, "mod", module),
+            "src/{STATE_MODULE} must register its `{module}` implementation module; merely \
+             creating src/sync/state/{module}.rs without a module declaration compiles no \
+             production code"
+        );
+    }
+}
+
+#[test]
 fn state_store_trait_is_defined_only_in_the_state_module() {
     assert!(
         keyword_names(&scan(&read_src(STATE_MODULE)), "pub trait", TRAIT),
@@ -760,31 +1044,157 @@ fn state_store_trait_declares_exactly_the_design_eight_methods() {
 }
 
 #[test]
-fn file_registry_implements_state_store_in_store_rs() {
+fn file_registry_implements_state_store_only_in_state_file() {
+    let implementation_sites: Vec<String> = prod_src_files()
+        .into_iter()
+        .filter(|(_, source)| impls_trait_for(&scan(source), TRAIT, "FileRegistry"))
+        .map(|(rel, _)| rel)
+        .collect();
     assert!(
-        impls_trait_for(&scan(&read_src(STORE)), TRAIT, "FileRegistry"),
-        "src/{STORE} must carry `impl {TRAIT} for FileRegistry` — T017 implements the port in \
-         place (paths + locking unchanged); production `inspect` reads &dyn {TRAIT} backed by \
-         the real FileRegistry, so the adapter must satisfy the trait where FileRegistry lives"
+        impls_trait_for(&scan(&read_src(STATE_FILE)), TRAIT, "FileRegistry"),
+        "src/{STATE_FILE} must carry the real `impl {TRAIT} for FileRegistry` after T025 moves \
+         file-backed state ownership out of the compatibility facade"
+    );
+    assert_eq!(
+        implementation_sites,
+        [STATE_FILE],
+        "exactly src/{STATE_FILE} must implement {TRAIT} for FileRegistry; a retained impl in \
+         src/{STORE} or a second adapter elsewhere forks the state boundary; found: \
+         {implementation_sites:?}"
     );
 }
 
 #[test]
 fn file_registry_state_store_impl_is_not_hollow() {
     let body =
-        trait_impl_body(&scan(&read_src(STORE)), TRAIT, "FileRegistry").unwrap_or_else(|| {
+        trait_impl_body(&scan(&read_src(STATE_FILE)), TRAIT, "FileRegistry").unwrap_or_else(|| {
             panic!(
-                "src/{STORE} does not carry `impl {TRAIT} for FileRegistry` yet — the hollow-impl \
-                 pin needs the production impl body to scan"
+                "src/{STATE_FILE} does not carry `impl {TRAIT} for FileRegistry` yet — the \
+                 hollow-impl pin needs the relocated production impl body to scan"
             )
         });
     let markers = hollow_markers(&body);
     assert!(
         markers.is_empty(),
-        "the production `impl {TRAIT} for FileRegistry` in src/{STORE} must be REAL — no \
+        "the production `impl {TRAIT} for FileRegistry` in src/{STATE_FILE} must be REAL — no \
          unimplemented!/todo!/panic! stubs; panic stubs are legal only in the in-memory fake on \
          methods the reconcile suite never exercises; found: {markers:?}"
     );
+}
+
+#[test]
+fn file_module_owns_the_relocated_state_implementation() {
+    let file = scan(&read_src(STATE_FILE));
+    assert!(
+        defines_pub_type(&file, "FileRegistry")
+            && defines_pub_type(&file, "RegistryRecord")
+            && keyword_names(&file, "pub trait", "Registry"),
+        "src/{STATE_FILE} must own FileRegistry, RegistryRecord, and the compatibility Registry \
+         port after the whole-file-first move from src/{STORE}"
+    );
+}
+
+#[test]
+fn locking_module_owns_file_registry_locking_seams() {
+    let expected_locking_sites = [
+        (
+            format!("{STATE_LOCKING}:FileRegistry::lock_advisory"),
+            true,
+            true,
+        ),
+        (
+            format!("{STATE_LOCKING}:FileRegistry::lock_exclusive"),
+            true,
+            true,
+        ),
+    ];
+    let locking_sites = production_locking_seam_sites();
+    assert_eq!(
+        locking_sites, expected_locking_sites,
+        "the public lock_exclusive and lock_advisory seams must be inherent methods on \
+         FileRegistry in src/{STATE_LOCKING}, with no old-owner, free-function, or decoy-type \
+         definitions anywhere in production; found: {locking_sites:?}"
+    );
+}
+
+#[test]
+fn registry_impl_subjects_exclude_renamed_state_store_adapters() {
+    let alias_sites = production_trait_alias_sites("Registry");
+    assert!(
+        alias_sites.is_empty(),
+        "production code must not rename Registry before implementing it; a trait alias lets a \
+         renamed StateStore-to-Registry bridge evade a literal trait-subject gate; found: \
+         {alias_sites:?}"
+    );
+    let registry_sites = production_trait_impl_sites("Registry");
+    assert_eq!(
+        registry_sites,
+        [
+            format!("{STATE_FILE}:FileRegistry"),
+            format!("{STATE_FILE}:FrozenReadOnlyRegistry"),
+        ],
+        "Registry may be implemented only by the real file owner and its frozen wrapper after \
+         T025; any renamed StateStore-to-Registry bridge is an unexpected impl subject; found: \
+         {registry_sites:?}"
+    );
+}
+
+#[test]
+fn state_store_impl_subjects_exclude_renamed_registry_adapters() {
+    let alias_sites = production_trait_alias_sites(TRAIT);
+    assert!(
+        alias_sites.is_empty(),
+        "production code must not rename {TRAIT} before implementing it; a trait alias lets a \
+         renamed Registry-to-StateStore bridge evade a literal trait-subject gate; found: \
+         {alias_sites:?}"
+    );
+    let state_store_sites = production_trait_impl_sites(TRAIT);
+    assert_eq!(
+        state_store_sites,
+        [format!("{STATE_FILE}:FileRegistry")],
+        "StateStore may be implemented only by the real file owner after T025; any renamed \
+         Registry-to-StateStore bridge is an unexpected impl subject; found: \
+         {state_store_sites:?}"
+    );
+}
+
+#[test]
+fn store_is_a_reexport_only_compatibility_facade() {
+    let forbidden = facade_non_reexport_constructs(&read_src(STORE));
+    assert!(
+        forbidden.is_empty(),
+        "src/{STORE} must be a re-export-only T030 compatibility facade: after comments, \
+         strings, attributes, and cfg(test) items are stripped, only public use declarations \
+         and whitespace are allowed; unexpected construct: {forbidden:?}"
+    );
+}
+
+#[test]
+fn relocated_public_state_definitions_have_unique_production_owners() {
+    let expected_owners = [
+        ("ArtifactKey", STATE_FILE),
+        ("EjectedEntry", STATE_FILE),
+        ("FileRegistry", STATE_FILE),
+        ("FrozenReadOnlyRegistry", STATE_FILE),
+        ("HookState", STATE_FILE),
+        ("ManifestFile", STATE_FILE),
+        ("ProjectedRecord", STATE_FILE),
+        ("RecordKind", STATE_FILE),
+        ("Registry", STATE_FILE),
+        ("RegistryRecord", STATE_FILE),
+        ("StateLockGuard", STATE_LOCKING),
+        ("StoreError", STATE_FILE),
+    ];
+    for (name, expected) in expected_owners {
+        let sites = definition_sites(name);
+        assert_eq!(
+            sites,
+            [expected],
+            "{name} must have exactly one production definition in src/{expected}; \
+             compatibility through src/{STORE} is by pub use, never a duplicate definition; \
+             found: {sites:?}"
+        );
+    }
 }
 
 #[test]
@@ -1137,6 +1547,157 @@ fn helper_impl_detection_binds_to_subject_type_not_header_mention() {
             "FileRegistry"
         ),
         "merely naming StateStore in another type's method must not count as an impl"
+    );
+}
+
+#[test]
+fn helper_trait_impl_allowlist_rejects_renamed_adapters_and_spares_real_owners() {
+    let renamed_registry_bridge = scan(
+        "use crate::store::Registry as LegacyRegistry;\n\
+         struct AnyBridge<'a> { store: &'a dyn StateStore }\n\
+         impl LegacyRegistry for AnyBridge<'_> { }",
+    );
+    assert_eq!(
+        trait_aliases(&renamed_registry_bridge, "Registry"),
+        ["LegacyRegistry"],
+        "a Registry alias is itself a forbidden production escape hatch"
+    );
+    assert_eq!(
+        trait_impl_subjects(&renamed_registry_bridge, "Registry"),
+        ["AnyBridge"],
+        "an aliased Registry impl on a renamed StateStore bridge must still surface by subject"
+    );
+
+    let renamed_store_bridge = scan(
+        "use crate::sync::{\n\
+             inspect::Other,\n\
+             state::{StateStore as LegacyStateStore, StateError},\n\
+         };\n\
+         struct OtherBridge<'a> { registry: &'a dyn Registry }\n\
+         impl LegacyStateStore for OtherBridge<'_> { }",
+    );
+    assert_eq!(
+        trait_aliases(&renamed_store_bridge, TRAIT),
+        ["LegacyStateStore"],
+        "a StateStore alias nested in a grouped use tree must be detected"
+    );
+    assert_eq!(
+        trait_impl_subjects(&renamed_store_bridge, TRAIT),
+        ["OtherBridge"],
+        "an aliased StateStore impl on a renamed Registry bridge must still surface by subject"
+    );
+
+    let owners = scan(
+        "impl Registry for FileRegistry { }\n\
+         impl crate::store::Registry for FrozenReadOnlyRegistry<'_> { }\n\
+         impl crate::sync::state::StateStore for FileRegistry { }\n\
+         #[cfg(test)] impl StateStore for TestFake { }",
+    );
+    assert_eq!(
+        trait_impl_subjects(&owners, "Registry"),
+        ["FileRegistry", "FrozenReadOnlyRegistry"],
+        "the two legitimate Registry owners must satisfy the exact subject allowlist"
+    );
+    assert_eq!(
+        trait_impl_subjects(&owners, TRAIT),
+        ["FileRegistry"],
+        "the real FileRegistry StateStore owner must pass and a cfg(test) fake must be excluded"
+    );
+}
+
+#[test]
+fn helper_locking_seam_scan_rejects_free_functions_and_decoy_impl_subjects() {
+    let decoys = locking_seam_sites(
+        STATE_LOCKING,
+        "pub fn lock_exclusive() {}\n\
+         struct LockLookalike;\n\
+         impl LockLookalike { pub fn lock_advisory(&self) {} }",
+    );
+    assert_eq!(
+        decoys,
+        [
+            (
+                format!("{STATE_LOCKING}:<free>::lock_exclusive"),
+                true,
+                false,
+            ),
+            (
+                format!("{STATE_LOCKING}:LockLookalike::lock_advisory"),
+                true,
+                true,
+            ),
+        ],
+        "free functions and methods on another impl subject must not masquerade as \
+         FileRegistry's locking seams"
+    );
+
+    let owner = locking_seam_sites(
+        STATE_LOCKING,
+        "impl FileRegistry {\n\
+             pub fn lock_exclusive(&self) {}\n\
+             pub fn lock_advisory(&self) {}\n\
+         }",
+    );
+    assert_eq!(
+        owner,
+        [
+            (
+                format!("{STATE_LOCKING}:FileRegistry::lock_advisory"),
+                true,
+                true,
+            ),
+            (
+                format!("{STATE_LOCKING}:FileRegistry::lock_exclusive"),
+                true,
+                true,
+            ),
+        ],
+        "both public inherent methods on FileRegistry are the legitimate ownership shape"
+    );
+}
+
+#[test]
+fn helper_facade_grammar_rejects_every_non_reexport_construct() {
+    let forbidden = [
+        ("include!(\"legacy_store.rs\");", "include macro"),
+        (
+            "macro_rules! legacy { () => { impl FileRegistry {} } }\nlegacy!();",
+            "macro definition and invocation",
+        ),
+        ("legacy_items!();", "ordinary macro invocation"),
+        ("mod legacy;", "module declaration"),
+        ("pub trait Port {}", "trait definition"),
+        ("pub struct Owner;", "struct definition"),
+        ("pub fn helper() {}", "function definition"),
+        ("impl Owner {}", "implementation block"),
+    ];
+    for (source, construct) in forbidden {
+        assert!(
+            !facade_non_reexport_constructs(source).is_empty(),
+            "a top-level {construct} must make the compatibility facade substantive: {source}"
+        );
+    }
+
+    let reexports = r#"
+        //! compatibility only
+        #![allow(deprecated)]
+        #[doc = "legacy state names"]
+        pub use crate::sync::state::{
+            ArtifactKey,
+            file::{FileRegistry, Registry},
+            RegistryRecord,
+        };
+
+        #[cfg(test)]
+        mod tests {
+            struct Fixture;
+            impl Fixture { fn helper() {} }
+        }
+    "#;
+    assert!(
+        facade_non_reexport_constructs(reexports).is_empty(),
+        "grouped/multiline public re-exports, harmless attributes, and cfg(test)-only helpers \
+         are allowed in the thin facade"
     );
 }
 

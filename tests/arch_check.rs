@@ -523,7 +523,6 @@ fn allowlist_is_exactly_the_phase_scoped_legacy_set() {
     got.sort();
 
     let mut want: Vec<(String, String)> = [
-        ("src/store.rs", "T025"),
         ("src/source/archive.rs", "T016"),
         ("src/source/cache.rs", "T016"),
         ("src/source/git.rs", "T016"),
@@ -565,9 +564,17 @@ fn target_io_exemption_does_not_generalize_to_a_new_file() {
 #[test]
 fn legacy_store_exemption_does_not_generalize_to_a_new_file() {
     let tree = base_tree();
-    tree.copy_real_src("src/store.rs", "src/store_leak.rs");
+    tree.copy_real_src("src/sync/apply.rs", "src/store_leak.rs");
     tree.check()
-        .assert_fail("a new non-exempt module performing store.rs's target-side I/O");
+        .assert_fail("an I/O-bearing payload at neighboring non-exempt src/store_leak.rs");
+}
+
+#[test]
+fn store_path_is_no_longer_exempt_from_target_io() {
+    let tree = base_tree();
+    tree.copy_real_src("src/sync/apply.rs", "src/store.rs");
+    tree.check()
+        .assert_fail("an I/O-bearing payload at the formerly allowlisted src/store.rs path");
 }
 
 fn strip_yaml_comment(line: &str) -> &str {

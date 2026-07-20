@@ -1,9 +1,11 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use crate::store::{
-    ArtifactKey, EjectedEntry, HookState, RegistryRecord, StateLockGuard, StoreError,
-};
+pub mod file;
+pub mod locking;
+
+use file::{ArtifactKey, EjectedEntry, HookState, RegistryRecord, StoreError};
+use locking::StateLockGuard;
 
 pub trait StateStore {
     fn artifact(&self, key: &ArtifactKey) -> Result<Option<RegistryRecord>, StoreError>;
