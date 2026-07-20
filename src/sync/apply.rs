@@ -101,7 +101,7 @@ impl Drop for CleanupGuard {
     clippy::needless_pass_by_value,
     reason = "caller hands off ownership of the record being deployed"
 )]
-pub fn deploy_artifact(
+pub fn apply_artifact(
     staging_base: &Path,
     staging: &Path,
     dst: &Path,
@@ -410,7 +410,7 @@ mod tests {
         (dir, reg)
     }
 
-    // deploy_artifact / recovery_sweep
+    // apply_artifact / recovery_sweep
 
     /// `<target_parent>/.phora-stage/`: deploy stages here and cleans it up afterward.
     fn staging_base(target_parent: &Path) -> PathBuf {
@@ -431,7 +431,7 @@ mod tests {
         staging
     }
 
-    /// Record describing what `deploy_artifact` should persist; file metadata is filled
+    /// Record describing what `apply_artifact` should persist; file metadata is filled
     /// from the staging dir so a post-deploy `check_artifact_state` reads as Clean.
     fn record_for(staging: &Path, files: &[(&str, &[u8])]) -> RegistryRecord {
         let mut manifest = Vec::new();
@@ -512,7 +512,7 @@ mod tests {
         let record = record_for(&staging, files);
         let jrnl = journal_for(&reg);
 
-        deploy_artifact(&base, &staging, &dst, record, &jrnl, &reg).expect("deploy must succeed");
+        apply_artifact(&base, &staging, &dst, record, &jrnl, &reg).expect("deploy must succeed");
 
         assert_eq!(
             std::fs::read(dst.join("a.json")).expect("read a.json"),
@@ -537,7 +537,7 @@ mod tests {
         let record = record_for(&staging, files);
         let jrnl = journal_for(&reg);
 
-        deploy_artifact(&base, &staging, &dst, record, &jrnl, &reg).expect("deploy must succeed");
+        apply_artifact(&base, &staging, &dst, record, &jrnl, &reg).expect("deploy must succeed");
 
         assert!(
             !has_phora_stage_leftover(parent.path()),
@@ -557,7 +557,7 @@ mod tests {
         let record = record_for(&staging, files);
         let jrnl = journal_for(&reg);
 
-        deploy_artifact(&base, &staging, &dst, record.clone(), &jrnl, &reg)
+        apply_artifact(&base, &staging, &dst, record.clone(), &jrnl, &reg)
             .expect("deploy must succeed");
 
         let got = reg
@@ -591,7 +591,7 @@ mod tests {
         let record = record_for(&staging, files);
         let jrnl = journal_for(&reg);
 
-        deploy_artifact(&base, &staging, &dst, record, &jrnl, &reg).expect("deploy must succeed");
+        apply_artifact(&base, &staging, &dst, record, &jrnl, &reg).expect("deploy must succeed");
 
         assert_eq!(
             std::fs::read(dst.join("a.json")).expect("read new a.json"),
@@ -686,7 +686,7 @@ mod tests {
         };
         let jrnl = Journal::open(&journal_dir).expect("open journal");
 
-        deploy_artifact(&base, &staging, &dst, record, &jrnl, &reg).expect("deploy must succeed");
+        apply_artifact(&base, &staging, &dst, record, &jrnl, &reg).expect("deploy must succeed");
 
         assert!(
             reg.journal_nonempty_at_put.get(),
@@ -760,11 +760,11 @@ mod tests {
         let record = record_for(&staging, files);
         let jrnl = journal_for(&reg.inner);
 
-        let result = deploy_artifact(&base, &staging, &dst, record, &jrnl, &reg);
+        let result = apply_artifact(&base, &staging, &dst, record, &jrnl, &reg);
 
         assert!(
             result.is_err(),
-            "a failing registry put must make deploy_artifact return Err"
+            "a failing registry put must make apply_artifact return Err"
         );
         assert_eq!(
             std::fs::read(dst.join("old.json")).expect("read rolled-back content"),
@@ -800,7 +800,7 @@ mod tests {
         let record = record_for(&staging, files);
         let jrnl = journal_for(&reg.inner);
 
-        let result = deploy_artifact(&base, &staging, &dst, record, &jrnl, &reg);
+        let result = apply_artifact(&base, &staging, &dst, record, &jrnl, &reg);
 
         assert!(result.is_err(), "failing put must yield Err");
         assert!(
@@ -1019,7 +1019,7 @@ mod tests {
 
         let jrnl = journal_for(&reg);
 
-        deploy_artifact(&base, &staging, &dst, record, &jrnl, &reg).expect("deploy A must succeed");
+        apply_artifact(&base, &staging, &dst, record, &jrnl, &reg).expect("deploy A must succeed");
 
         assert_eq!(
             std::fs::read(dst.join("a.json")).expect("read deployed A"),

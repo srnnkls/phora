@@ -292,7 +292,7 @@ struct DeployAll<'a> {
 /// Outcome of the per-target deploy loop. `aborted` means a `pre_deploy` gate with the default
 /// `abort` fired and short-circuited the loop (later targets unprocessed); `had_failures`
 /// folds in skip-induced failures so it can suppress `--prune`.
-struct DeployRun {
+struct ApplyRun {
     had_failures: bool,
     pre_deploy: Vec<hooks::HookOutcome>,
     aborted: bool,
@@ -313,7 +313,7 @@ fn target_run<'a>(
     }
 }
 
-fn deploy_all_targets(ctx: &DeployAll<'_>) -> Result<DeployRun> {
+fn apply_target_changes(ctx: &DeployAll<'_>) -> Result<ApplyRun> {
     let observed = observe::observe_workspace(ctx, ctx.projection)?;
     let policy = ReconciliationPolicy {
         force: ctx.input.force,
@@ -325,7 +325,7 @@ fn deploy_all_targets(ctx: &DeployAll<'_>) -> Result<DeployRun> {
     let decisions = resolve_conflicts(&changeset, ctx.input.resolver, ctx.input.interactive)?;
     let reconciliation = Reconciliation::new(&changeset, &observed, decisions);
 
-    let mut run = DeployRun {
+    let mut run = ApplyRun {
         had_failures: false,
         pre_deploy: Vec::new(),
         aborted: false,
@@ -644,7 +644,7 @@ fn deploy_and_run_hooks(
     effective_lock: Option<&Lock>,
     pre_sync_outcomes: Vec<hooks::HookOutcome>,
 ) -> Result<SyncOutput> {
-    let run = deploy_all_targets(deploy)?;
+    let run = apply_target_changes(deploy)?;
     // pre_deploy renders after pre_sync, before post_sync/on_change.
     let mut early_hooks = pre_sync_outcomes;
     early_hooks.extend(run.pre_deploy);
@@ -1163,7 +1163,7 @@ fn validate_link_mode(
 }
 
 /// Removes a half-exported `staging` dir on drop unless [`disarm`](StagingGuard::disarm)
-/// hands cleanup to [`deploy_artifact`] on the success path.
+/// hands cleanup to [`apply::apply_artifact`] on the success path.
 pub(super) struct StagingGuard<'a> {
     staging_base: &'a Path,
     staging: &'a Path,
