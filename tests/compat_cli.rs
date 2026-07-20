@@ -34,6 +34,14 @@ mod common;
 
 const BASELINE_COMMIT: &str = "92c784e3b14496be25dcecc8d4500e32b52b1c50";
 const EX_TEMPFAIL: i32 = 75;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const PTY_CHILD_STATUS_SENTINEL: &str = "__PHORA_PTY_CHILD_STATUS__=";
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const PTY_CHILD_WRAPPER: &str = r#""$PHORA_PTY_BIN" sync
+phora_status=$?
+printf '__PHORA_PTY_CHILD_STATUS__=%s\n' "$phora_status"
+exit "$phora_status"
+"#;
 
 // ─── golden-fixture harness (reused verbatim from the T003 staging matrix) ──────
 
@@ -382,7 +390,7 @@ impl Fixture {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 struct PtyOutput {
-    status: ExitStatus,
+    script_status: ExitStatus,
     transcript: Vec<u8>,
     script_stderr: Vec<u8>,
 }
@@ -422,27 +430,46 @@ fn normalize_pty_crlf(raw: &[u8]) -> String {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+fn strip_successful_pty_child_status(transcript: &str) -> Result<&str, String> {
+    let Some((child_output, status)) = transcript.rsplit_once(PTY_CHILD_STATUS_SENTINEL) else {
+        return Err("PTY transcript is missing the child-status sentinel".to_owned());
+    };
+    if child_output.contains(PTY_CHILD_STATUS_SENTINEL) {
+        return Err("PTY transcript contains more than one child-status sentinel".to_owned());
+    }
+    if status != "0\n" {
+        return Err(format!(
+            "PTY child-status sentinel must be the exact final line with status 0, got {status:?}"
+        ));
+    }
+    Ok(child_output)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn pty_sync_command(fx: &Fixture) -> Command {
     let mut command = Command::new("script");
 
-    // BSD script accepts a command as trailing argv; util-linux accepts it via
-    // `-c`. Both `-e` variants propagate the wrapped phora exit status.
+    // BSD script accepts a command as trailing argv. Older macOS versions lack
+    // `-e`, so the wrapper records the child status in-band instead.
     #[cfg(target_os = "macos")]
-    command
-        .args(["-q", "-e", "/dev/null"])
-        .arg(env!("CARGO_BIN_EXE_phora"))
-        .arg("sync");
+    command.args(["-q", "/dev/null", "sh", "-c", PTY_CHILD_WRAPPER]);
+
+    // util-linux script accepts the command through `-c`; retain `-e` there so
+    // its outer status also propagates the wrapper's status. Supplying both the
+    // wrapper and binary through quoted environment variables avoids injecting
+    // either path or shell source into this command string.
     #[cfg(target_os = "linux")]
     command
         .args([
             "-q",
             "-e",
             "-c",
-            "exec \"$PHORA_PTY_BIN\" sync",
+            "exec sh -c \"$PHORA_PTY_WRAPPER\"",
             "/dev/null",
         ])
-        .env("PHORA_PTY_BIN", env!("CARGO_BIN_EXE_phora"));
+        .env("PHORA_PTY_WRAPPER", PTY_CHILD_WRAPPER);
 
+    command.env("PHORA_PTY_BIN", env!("CARGO_BIN_EXE_phora"));
     fx.configure(&mut command);
     command
 }
@@ -530,7 +557,7 @@ fn run_sync_in_pty(fx: &Fixture, prompt: &str, answer: &[u8]) -> PtyOutput {
         let _ = child.kill();
     }
     drop(input);
-    let status = child.wait().expect("wait for PTY script process");
+    let script_status = child.wait().expect("wait for PTY script process");
     reader.join().expect("PTY transcript reader joins");
     let mut diagnostics = Vec::new();
     script_stderr
@@ -544,7 +571,7 @@ fn run_sync_in_pty(fx: &Fixture, prompt: &str, answer: &[u8]) -> PtyOutput {
     );
 
     PtyOutput {
-        status,
+        script_status,
         transcript,
         script_stderr: diagnostics,
     }
@@ -809,19 +836,29 @@ fn interactive_foreign_conflict_prompts_and_overwrites_through_a_pty() {
         "phora: conflict at dotfiles/editor in home — [s]kip/[o]verwrite/[e]ject/[a]bort? ";
 
     let fx = build_fixture();
+    #[cfg(target_os = "macos")]
+    assert!(
+        !pty_sync_command(&fx)
+            .get_args()
+            .any(|arg| arg == std::ffi::OsStr::new("-e")),
+        "the macOS PTY command must support older BSD `script` implementations without `-e`"
+    );
     let foreign_path = fx.target_path.join("editor/init.lua");
     write(&foreign_path, b"user's own edit\n");
 
     let out = run_sync_in_pty(&fx, PROMPT, b"o\n");
     assert_eq!(
-        out.status.code(),
+        out.script_status.code(),
         Some(0),
-        "interactive overwrite must exit 0; script stderr:\n{}\ntranscript:\n{}",
+        "the PTY transport must exit 0; script stderr:\n{}\ntranscript:\n{}",
         String::from_utf8_lossy(&out.script_stderr),
         String::from_utf8_lossy(&out.transcript)
     );
     let transcript = normalize_pty_crlf(&out.transcript);
-    let after_prompt = transcript.strip_prefix(PROMPT).unwrap_or_else(|| {
+    let child_output = strip_successful_pty_child_status(&transcript).unwrap_or_else(|error| {
+        panic!("interactive overwrite child must exit 0: {error}; transcript: {transcript:?}")
+    });
+    let after_prompt = child_output.strip_prefix(PROMPT).unwrap_or_else(|| {
         panic!("real TTY sync must emit the exact conflict prompt; got {transcript:?}")
     });
     assert!(
@@ -836,6 +873,19 @@ fn interactive_foreign_conflict_prompts_and_overwrites_through_a_pty() {
     assert!(
         !after_prompt.contains(PROMPT),
         "one Foreign conflict must produce exactly one prompt: {transcript:?}"
+    );
+    let nonzero_transcript = format!("sync complete\n{PTY_CHILD_STATUS_SENTINEL}23\n");
+    let nonzero_error = strip_successful_pty_child_status(&nonzero_transcript)
+        .expect_err("a final nonzero child-status sentinel must never be accepted");
+    assert!(
+        nonzero_error.contains("23"),
+        "the negative control must reject the final nonzero child status explicitly: {nonzero_error}"
+    );
+    let forged_success =
+        format!("{PTY_CHILD_STATUS_SENTINEL}0\nsync complete\n{PTY_CHILD_STATUS_SENTINEL}23\n");
+    assert!(
+        strip_successful_pty_child_status(&forged_success).is_err(),
+        "an earlier success sentinel must not hide the wrapper's final failure status"
     );
     assert_eq!(
         std::fs::read(&foreign_path).expect("read overwritten Foreign file"),
