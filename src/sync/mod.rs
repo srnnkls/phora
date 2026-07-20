@@ -49,12 +49,16 @@ pub use verify::{UntrustedHookFinding, VerifyMismatch, VerifyReason, VerifyRepor
 #[cfg(feature = "bench")]
 pub use resolve::resolve_sources_for_bench;
 
+#[cfg(test)]
 use prune::prune_projected;
 pub(crate) use prune::{orphan_artifact_path, orphan_records};
+use request::SyncEvents;
 use resolve::resolve_sources;
 pub use stage::{StageRequest, StagedArtifact, StagedFile, stage_artifact};
+#[cfg(test)]
+use target::deploy_reconciled_target;
 pub(crate) use target::record_artifact_path;
-use target::{Reconciliation, TargetRun, deploy_reconciled_target, resolve_conflicts};
+use target::{Reconciliation, TargetRun, deploy_reconciled_target_report, resolve_conflicts};
 
 #[cfg(test)]
 use {
@@ -413,9 +417,12 @@ pub(super) fn trusted_preimages(effective_lock: Option<&Lock>) -> BTreeSet<Strin
 
 fn take_hook_candidates(
     graph: &mut transitive::ResolvedGraph,
+    events: &mut SyncEvents,
 ) -> Vec<transitive::TransitiveHookCandidate> {
     for diagnostic in std::mem::take(&mut graph.hook_diagnostics) {
-        eprintln!("phora: {diagnostic}");
+        events
+            .warnings
+            .push(SyncWarning::Message(diagnostic.clone()));
     }
     std::mem::take(&mut graph.hook_candidates)
 }
@@ -500,6 +507,8 @@ struct ApplyRun {
     had_failures: bool,
     pre_deploy: Vec<hooks::HookOutcome>,
     aborted: bool,
+    changes: model::ChangeSet,
+    events: SyncEvents,
 }
 
 fn target_run<'a, R>(
@@ -552,6 +561,8 @@ where
         had_failures: false,
         pre_deploy: Vec::new(),
         aborted: false,
+        changes: changeset.clone(),
+        events: SyncEvents::default(),
     };
     for (target_name, target) in &ctx.config.targets {
         if ctx.input.hooks_enabled()
@@ -586,14 +597,30 @@ where
         else {
             continue;
         };
-        run.had_failures |= deploy_reconciled_target(
+        run.had_failures |= deploy_reconciled_target_report(
             target_run(ctx, target_name, target),
             target_projection,
             &reconciliation,
             ctx.backend,
             registry,
             ctx.journal,
+            &mut run.events,
         )?;
+    }
+    if !run.aborted && !run.had_failures {
+        prune::apply_reconciled_removals(
+            &changeset.changes,
+            &observed,
+            ctx.projection,
+            ctx.config,
+            registry,
+            ctx.protected,
+            &mut run.events,
+        )?;
+    } else if ctx.input.prune() && run.had_failures {
+        run.events.warnings.push(SyncWarning::Message(
+            "skipping --prune because some artifacts failed to deploy".to_owned(),
+        ));
     }
     Ok(run)
 }
@@ -655,36 +682,15 @@ fn cross_target_overlap_diagnostic(
     .sync()
 }
 
-fn notify_orphans(config: &Config, registry: &dyn Registry) -> Result<()> {
+fn notify_orphans(config: &Config, registry: &dyn Registry, events: &mut SyncEvents) -> Result<()> {
     let count = orphan_records(config, registry)?.len();
     if count > 0 {
-        eprintln!(
-            "phora: {count} orphaned record(s) with no config target — \
-             run `phora list --orphans` to inspect, `phora sync --prune` to remove"
-        );
+        events.warnings.push(SyncWarning::Message(format!(
+            "{count} orphaned record(s) with no config target — run `phora list --orphans` to \
+             inspect, `phora sync --prune` to remove"
+        )));
     }
     Ok(())
-}
-
-fn maybe_prune<R>(ctx: &DeployAll<'_, R>, had_failures: bool) -> Result<()>
-where
-    R: Registry,
-{
-    if !ctx.input.prune() {
-        return Ok(());
-    }
-    if had_failures {
-        eprintln!("phora: skipping --prune because some artifacts failed to deploy");
-        return Ok(());
-    }
-    let readonly_registry;
-    let registry: &dyn Registry = if ctx.input.lockless() {
-        readonly_registry = crate::store::FrozenReadOnlyRegistry::new(ctx.registry);
-        &readonly_registry
-    } else {
-        ctx.registry
-    };
-    prune_projected(ctx.projection, ctx.config, registry, ctx.protected)
 }
 
 fn sweep_target_parents(config: &Config, journal: &Journal, registry: &dyn Registry) -> Result<()> {
@@ -728,6 +734,10 @@ fn open_sync_journal(lockless: bool, registry: &dyn Registry) -> Result<Journal>
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "fast-forward validation spans config, projection, persisted state, confinement, policy, and report collection"
+)]
 fn apply_fast_forward_drops(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
@@ -736,9 +746,10 @@ fn apply_fast_forward_drops(
     registry: &dyn Registry,
     protected: &confine::ProtectedPathSet,
     fast_forward: bool,
+    events: &mut SyncEvents,
 ) -> Result<()> {
     let drops = validate_sealed_offer(config, parsed, projection, recorded, fast_forward)?;
-    prune_fast_forward_drops(projection, config, registry, protected, &drops)
+    prune_fast_forward_drops_report(projection, config, registry, protected, &drops, events)
 }
 
 fn project_sync_workspace(
@@ -762,20 +773,24 @@ where
     sync_core(&run_input, backend, registry).map(I::finish)
 }
 
-pub(crate) fn sync_opened_compat<R>(
+pub(crate) fn sync_opened<R>(
     request: &SyncRequest<'_>,
     backend: &(dyn StageSource + Sync),
     registry: &R,
     lockless: bool,
-) -> Result<SyncOutput>
+) -> Result<SyncReport>
 where
     R: Registry + state::StateStore,
 {
     let mut input = request.run_input();
     input.lockless = lockless;
-    sync_core(&input, backend, registry).map(compatibility_output)
+    sync_core(&input, backend, registry).map(|execution| execution.report)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "top-level synchronization intentionally makes the ordered whole-run phases visible"
+)]
 fn sync_core<R>(
     input: &SyncRunInput<'_>,
     backend: &(dyn StageSource + Sync),
@@ -784,6 +799,7 @@ fn sync_core<R>(
 where
     R: Registry + state::StateStore,
 {
+    let mut events = SyncEvents::default();
     let mut effective_config = merged_config(input);
     effective_config.validate()?;
     let mut parsed = effective_config.parsed_sources()?;
@@ -796,10 +812,10 @@ where
         input.frozen(),
         effective_lock.as_ref(),
     )?;
-    let hook_candidates = take_hook_candidates(&mut graph);
+    let hook_candidates = take_hook_candidates(&mut graph, &mut events);
     let instances = graph.inject(&mut effective_config, &mut parsed, &mut remotes);
     for warning in validate_link_mode(input.base_config, &parsed, &remotes)? {
-        eprintln!("phora: {warning}");
+        events.warnings.push(SyncWarning::Message(warning));
     }
 
     let local_names = local_source_names(input);
@@ -838,11 +854,12 @@ where
         .unwrap_or_default();
     record_candidate_hooks(&mut base_lock, &hook_candidates);
 
-    report_ref_transitions(
+    collect_ref_transitions(
         &effective_config,
         &parsed,
         effective_lock.as_ref(),
         &resolved_commits,
+        &mut events,
     );
     let projection = project_sync_workspace(
         &effective_config,
@@ -859,6 +876,7 @@ where
         compat_registry,
         &protected,
         input.fast_forward(),
+        &mut events,
     )?;
 
     // pre_sync gates the run: a failure aborts before deploy, leaving zero files deployed.
@@ -871,6 +889,7 @@ where
             base_lock,
             local_lock,
             pre_sync_outcomes,
+            events,
         ));
     }
 
@@ -892,6 +911,7 @@ where
         &hook_candidates,
         effective_lock.as_ref(),
         pre_sync_outcomes,
+        events,
     )
 }
 
@@ -902,11 +922,15 @@ fn deploy_and_run_hooks<R>(
     hook_candidates: &[transitive::TransitiveHookCandidate],
     effective_lock: Option<&Lock>,
     pre_sync_outcomes: Vec<hooks::HookOutcome>,
+    events: SyncEvents,
 ) -> Result<SyncExecution>
 where
     R: Registry + state::StateStore,
 {
-    let run = apply_target_changes(deploy)?;
+    let mut run = apply_target_changes(deploy)?;
+    run.events.applied.splice(0..0, events.applied);
+    run.events.skipped.splice(0..0, events.skipped);
+    run.events.warnings.splice(0..0, events.warnings);
     // pre_deploy renders after pre_sync, before post_sync/on_change.
     let mut early_hooks = pre_sync_outcomes;
     early_hooks.extend(run.pre_deploy);
@@ -916,10 +940,10 @@ where
             base_lock,
             local_lock,
             early_hooks,
+            run.events,
         ));
     }
     let mut had_failures = run.had_failures;
-    maybe_prune(deploy, had_failures)?;
     let readonly_registry;
     let registry: &dyn Registry = if deploy.input.lockless() {
         readonly_registry = crate::store::FrozenReadOnlyRegistry::new(deploy.registry);
@@ -928,7 +952,7 @@ where
         deploy.registry
     };
     if !deploy.input.prune() {
-        notify_orphans(deploy.config, registry)?;
+        notify_orphans(deploy.config, registry, &mut run.events)?;
     }
 
     let (hook_results, stripped_transitive_hooks) = run_all_hooks(
@@ -940,6 +964,13 @@ where
         effective_lock,
         early_hooks,
     )?;
+    if stripped_transitive_hooks > 0 {
+        run.events
+            .warnings
+            .push(SyncWarning::UntrustedTransitiveHooks {
+                count: stripped_transitive_hooks,
+            });
+    }
     let deploy_failures = had_failures;
     had_failures |= hook_results
         .iter()
@@ -951,10 +982,10 @@ where
                 base: Some(base_lock),
                 local: local_lock,
             },
-            changes: model::ChangeSet::default(),
-            applied: Vec::new(),
-            skipped: Vec::new(),
-            warnings: Vec::new(),
+            changes: run.changes,
+            applied: run.events.applied,
+            skipped: run.events.skipped,
+            warnings: run.events.warnings,
             hook_outcomes: hook_results,
             status: if had_failures {
                 SyncStatus::Failed
@@ -974,6 +1005,7 @@ fn aborted_before_deploy_phase(
     base_lock: Lock,
     local_lock: Option<Lock>,
     hook_results: Vec<hooks::HookOutcome>,
+    events: SyncEvents,
 ) -> SyncExecution {
     SyncExecution {
         report: SyncReport {
@@ -982,9 +1014,9 @@ fn aborted_before_deploy_phase(
                 local: local_lock,
             },
             changes: model::ChangeSet::default(),
-            applied: Vec::new(),
-            skipped: Vec::new(),
-            warnings: Vec::new(),
+            applied: events.applied,
+            skipped: events.skipped,
+            warnings: events.warnings,
             hook_outcomes: hook_results,
             status: SyncStatus::Failed,
         },
@@ -1227,12 +1259,25 @@ fn paths_overlap(first: &str, second: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
+#[cfg(test)]
 fn prune_fast_forward_drops(
     projection: &Projection,
     config: &Config,
     registry: &dyn Registry,
     protected: &confine::ProtectedPathSet,
     drops: &[RegistryRecord],
+) -> Result<()> {
+    let mut events = SyncEvents::default();
+    prune_fast_forward_drops_report(projection, config, registry, protected, drops, &mut events)
+}
+
+fn prune_fast_forward_drops_report(
+    projection: &Projection,
+    config: &Config,
+    registry: &dyn Registry,
+    protected: &confine::ProtectedPathSet,
+    drops: &[RegistryRecord],
+    events: &mut SyncEvents,
 ) -> Result<()> {
     if drops.is_empty() {
         return Ok(());
@@ -1262,17 +1307,17 @@ fn prune_fast_forward_drops(
             ))
         })?;
         if prune::overlaps_live_dest(&path, &expected_paths, &record.key.target) {
-            eprintln!(
-                "phora: fast-forward unrecorded {}:{} but kept {} (a live artifact sits there)",
+            events.warnings.push(SyncWarning::Message(format!(
+                "fast-forward unrecorded {}:{} but kept {} (a live artifact sits there)",
                 record.key.source,
                 record.key.artifact,
                 path.display()
-            );
+            )));
         } else {
-            eprintln!(
-                "phora: fast-forward dropped {}:{} (removed upstream)",
+            events.warnings.push(SyncWarning::Message(format!(
+                "fast-forward dropped {}:{} (removed upstream)",
                 record.key.source, record.key.artifact
-            );
+            )));
             remove_orphan_path(&path)
                 .map_err(|e| Error::Sync(format!("fast-forward prune {}: {e}", path.display())))?;
         }
@@ -1358,14 +1403,17 @@ fn pin_label(ref_label: &str, commit: &str) -> String {
     }
 }
 
-fn report_ref_transitions(
+fn collect_ref_transitions(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
     effective_lock: Option<&Lock>,
     resolved_commits: &BTreeMap<(String, String), String>,
+    events: &mut SyncEvents,
 ) {
     for line in ref_transition_lines(config, parsed, effective_lock, resolved_commits) {
-        eprintln!("{line}");
+        events.warnings.push(SyncWarning::Message(
+            line.strip_prefix("phora: ").unwrap_or(&line).to_owned(),
+        ));
     }
 }
 

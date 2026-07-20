@@ -62,6 +62,28 @@ where
             Ok(false)
         })?;
     }
+    for record in registry.list_all()? {
+        let triplet = (
+            record.key.target.clone(),
+            record.key.source.clone(),
+            record.key.artifact.clone(),
+        );
+        if observations.contains_key(&triplet) {
+            continue;
+        }
+        observations.insert(
+            triplet,
+            ObservedEntry {
+                target: record.key.target.clone(),
+                source: record.key.source.clone(),
+                artifact: record.key.artifact.clone(),
+                observation: ObservedArtifact::Managed(ManagedArtifact {
+                    record,
+                    condition: ManagedCondition::Clean,
+                }),
+            },
+        );
+    }
     Ok(ObservedProjectState {
         artifacts: observations.into_values().collect(),
     })
