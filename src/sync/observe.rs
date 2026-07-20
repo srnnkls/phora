@@ -22,7 +22,7 @@ where
     R: Registry + StateStore,
 {
     let readonly_registry;
-    let registry: &dyn Registry = if ctx.input.lockless {
+    let registry: &dyn Registry = if ctx.input.lockless() {
         readonly_registry = crate::store::FrozenReadOnlyRegistry::new(ctx.registry);
         &readonly_registry
     } else {

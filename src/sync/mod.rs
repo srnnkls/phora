@@ -31,6 +31,7 @@ pub use plan::{plan_target, project_workspace};
 
 use crate::projection::build::projected_artifact_keys;
 use crate::projection::model::{ArtifactRelativePath, Projection};
+#[cfg(test)]
 use crate::sync::model::ReconciliationPolicy;
 
 pub(crate) use preview::offered_leaves;
@@ -145,6 +146,204 @@ pub struct SyncOutput {
     pub hook_results: Vec<hooks::HookOutcome>,
     /// Transitive hooks discovered but left unrun for lack of trust.
     pub stripped_transitive_hooks: usize,
+}
+
+/// Compatibility adapter used while the remaining internal test fixtures still
+/// construct the pre-T027 request shape.
+#[doc(hidden)]
+pub struct SyncRunInput<'a> {
+    pub base_config: &'a Config,
+    pub local_config: Option<&'a Config>,
+    pub locks: LockSet,
+    pub options: SyncOptions,
+    pub resolver: Option<&'a dyn ConflictResolver>,
+    pub lockless: bool,
+}
+
+impl SyncRunInput<'_> {
+    fn refresh_sources(&self) -> bool {
+        matches!(self.options.source_policy, SourcePolicy::Refresh)
+    }
+
+    fn frozen(&self) -> bool {
+        matches!(self.options.source_policy, SourcePolicy::Frozen)
+    }
+
+    fn fast_forward(&self) -> bool {
+        matches!(self.options.moved_pin_policy, MovedPinPolicy::FastForward)
+    }
+
+    fn jobs(&self) -> Option<usize> {
+        self.options.concurrency.jobs.map(std::num::NonZero::get)
+    }
+}
+
+trait RunOptions {
+    fn options(&self) -> SyncOptions;
+    fn resolver(&self) -> Option<&dyn ConflictResolver>;
+    fn lockless(&self) -> bool;
+
+    fn interactive(&self) -> bool {
+        matches!(
+            self.options().conflict_policy,
+            ConflictPolicy::ResolveInteractively
+        )
+    }
+
+    fn prune(&self) -> bool {
+        matches!(self.options().prune_policy, PrunePolicy::RemoveOrphans)
+    }
+
+    fn hooks_enabled(&self) -> bool {
+        !matches!(self.options().hook_policy, HookPolicy::None)
+    }
+
+    fn transitive_hooks_enabled(&self) -> bool {
+        matches!(self.options().hook_policy, HookPolicy::All)
+    }
+}
+
+impl RunOptions for SyncRunInput<'_> {
+    fn options(&self) -> SyncOptions {
+        self.options
+    }
+
+    fn resolver(&self) -> Option<&dyn ConflictResolver> {
+        self.resolver
+    }
+
+    fn lockless(&self) -> bool {
+        self.lockless
+    }
+}
+
+impl RunOptions for SyncInput<'_> {
+    fn options(&self) -> SyncOptions {
+        self.run_input().options
+    }
+
+    fn resolver(&self) -> Option<&dyn ConflictResolver> {
+        self.resolver
+    }
+
+    fn lockless(&self) -> bool {
+        self.lockless
+    }
+}
+
+/// Internal execution result from which the public and compatibility reports
+/// are derived.
+#[doc(hidden)]
+pub struct SyncExecution {
+    pub report: SyncReport,
+    pub deploy_failures: bool,
+    pub stripped_transitive_hooks: usize,
+}
+
+/// Sealed-by-convention adapter allowing legacy in-crate fixtures and the new
+/// public request to exercise the same orchestration implementation.
+#[doc(hidden)]
+pub trait SyncInvocation {
+    type Output;
+
+    fn run_input(&self) -> SyncRunInput<'_>;
+    fn finish(execution: SyncExecution) -> Self::Output;
+}
+
+impl SyncInvocation for SyncRequest<'_> {
+    type Output = SyncReport;
+
+    fn run_input(&self) -> SyncRunInput<'_> {
+        SyncRunInput {
+            base_config: self.base_config,
+            local_config: self.local_config,
+            locks: self.locks.clone(),
+            options: self.options,
+            resolver: self.resolver,
+            lockless: false,
+        }
+    }
+
+    fn finish(execution: SyncExecution) -> Self::Output {
+        execution.report
+    }
+}
+
+impl SyncInvocation for SyncInput<'_> {
+    type Output = SyncOutput;
+
+    fn run_input(&self) -> SyncRunInput<'_> {
+        let source_policy = if self.frozen {
+            SourcePolicy::Frozen
+        } else if self.force {
+            SourcePolicy::Refresh
+        } else {
+            SourcePolicy::Locked
+        };
+        let conflict_policy = if self.force {
+            ConflictPolicy::Overwrite
+        } else if self.interactive {
+            ConflictPolicy::ResolveInteractively
+        } else {
+            ConflictPolicy::Refuse
+        };
+        let hook_policy = if self.no_hooks {
+            HookPolicy::None
+        } else if self.no_transitive_hooks {
+            HookPolicy::NoTransitive
+        } else {
+            HookPolicy::All
+        };
+        SyncRunInput {
+            base_config: self.base_config,
+            local_config: self.local_config,
+            locks: LockSet {
+                base: self.base_lock.clone(),
+                local: self.local_lock.clone(),
+            },
+            options: SyncOptions {
+                source_policy,
+                conflict_policy,
+                prune_policy: if self.prune {
+                    PrunePolicy::RemoveOrphans
+                } else {
+                    PrunePolicy::KeepOrphans
+                },
+                hook_policy,
+                moved_pin_policy: if self.fast_forward {
+                    MovedPinPolicy::FastForward
+                } else {
+                    MovedPinPolicy::Seal
+                },
+                concurrency: Concurrency {
+                    jobs: self.jobs.and_then(std::num::NonZeroUsize::new),
+                },
+            },
+            resolver: self.resolver,
+            lockless: self.lockless,
+        }
+    }
+
+    fn finish(execution: SyncExecution) -> Self::Output {
+        compatibility_output(execution)
+    }
+}
+
+fn compatibility_output(execution: SyncExecution) -> SyncOutput {
+    let SyncExecution {
+        report,
+        deploy_failures,
+        stripped_transitive_hooks,
+    } = execution;
+    let LockSet { base, local } = report.locks;
+    SyncOutput {
+        base_lock: base.expect("sync execution always returns a base lock"),
+        local_lock: local,
+        had_failures: report.status == SyncStatus::Failed,
+        deploy_failures,
+        hook_results: report.hook_outcomes,
+        stripped_transitive_hooks,
+    }
 }
 
 /// A relative target path yields an empty (`""`) or absent parent; both normalize
@@ -288,7 +487,7 @@ struct DeployAll<'a, R> {
     remotes: &'a BTreeMap<String, String>,
     projection: &'a Projection,
     protected: &'a confine::ProtectedPathSet,
-    input: &'a SyncInput<'a>,
+    input: &'a dyn RunOptions,
     backend: &'a (dyn StageSource + Sync),
     registry: &'a R,
     journal: &'a Journal,
@@ -323,22 +522,31 @@ where
     R: Registry + state::StateStore,
 {
     let observed = observe::observe_workspace(ctx, ctx.projection)?;
-    let policy = ReconciliationPolicy {
-        force: ctx.input.force,
-        prune: false,
-        follow_moved_pin: false,
-    };
+    let options = ctx.input.options();
+    let policy = (&options).into();
     let changeset = reconcile::reconcile(ctx.projection, &observed, &policy)
         .map_err(|e| Error::Sync(e.to_string()))?;
-    let decisions = resolve_conflicts(&changeset, ctx.input.resolver, ctx.input.interactive)?;
-    let reconciliation = Reconciliation::new(&changeset, &observed, decisions);
     let readonly_registry;
-    let registry: &dyn Registry = if ctx.input.lockless {
+    let registry: &dyn Registry = if ctx.input.lockless() {
         readonly_registry = crate::store::FrozenReadOnlyRegistry::new(ctx.registry);
         &readonly_registry
     } else {
         ctx.registry
     };
+    let refresh_pending = observed.artifacts.iter().any(|entry| {
+        matches!(
+            entry.observation,
+            model::ObservedArtifact::Managed(model::ManagedArtifact {
+                condition: model::ManagedCondition::MetadataChangedButContentClean { .. },
+                ..
+            })
+        )
+    });
+    if registry.refuses_writes() && (!changeset.changes.is_empty() || refresh_pending) {
+        return Err(registry.readonly_error().into());
+    }
+    let decisions = resolve_conflicts(&changeset, ctx.input.resolver(), ctx.input.interactive())?;
+    let reconciliation = Reconciliation::new(&changeset, &observed, decisions);
 
     let mut run = ApplyRun {
         had_failures: false,
@@ -346,7 +554,7 @@ where
         aborted: false,
     };
     for (target_name, target) in &ctx.config.targets {
-        if !ctx.input.no_hooks
+        if ctx.input.hooks_enabled()
             && let Some(hooks) = &target.hooks
             && hooks.pre_deploy.is_some()
         {
@@ -462,7 +670,7 @@ fn maybe_prune<R>(ctx: &DeployAll<'_, R>, had_failures: bool) -> Result<()>
 where
     R: Registry,
 {
-    if !ctx.input.prune {
+    if !ctx.input.prune() {
         return Ok(());
     }
     if had_failures {
@@ -470,7 +678,7 @@ where
         return Ok(());
     }
     let readonly_registry;
-    let registry: &dyn Registry = if ctx.input.lockless {
+    let registry: &dyn Registry = if ctx.input.lockless() {
         readonly_registry = crate::store::FrozenReadOnlyRegistry::new(ctx.registry);
         &readonly_registry
     } else {
@@ -493,22 +701,22 @@ fn sweep_target_parents(config: &Config, journal: &Journal, registry: &dyn Regis
     Ok(())
 }
 
-fn effective_lock(input: &SyncInput<'_>) -> Option<Lock> {
-    match (&input.base_lock, &input.local_lock) {
+fn effective_lock(input: &SyncRunInput<'_>) -> Option<Lock> {
+    match (&input.locks.base, &input.locks.local) {
         (Some(base), local) => Some(merge_locks(base, local.as_ref())),
         (None, Some(local)) => Some(local.clone()),
         (None, None) => None,
     }
 }
 
-fn local_source_names(input: &SyncInput<'_>) -> BTreeSet<String> {
+fn local_source_names(input: &SyncRunInput<'_>) -> BTreeSet<String> {
     input
         .local_config
         .map(|config| config.sources.keys().cloned().collect())
         .unwrap_or_default()
 }
 
-fn merged_config(input: &SyncInput<'_>) -> Config {
+fn merged_config(input: &SyncRunInput<'_>) -> Config {
     merge_configs(input.base_config.clone(), input.local_config.cloned())
 }
 
@@ -545,11 +753,34 @@ fn project_sync_workspace(
     Ok(projection)
 }
 
-pub fn sync<R>(
-    input: &SyncInput<'_>,
+pub fn sync<I, R>(input: &I, backend: &(dyn StageSource + Sync), registry: &R) -> Result<I::Output>
+where
+    I: SyncInvocation,
+    R: Registry + state::StateStore,
+{
+    let run_input = input.run_input();
+    sync_core(&run_input, backend, registry).map(I::finish)
+}
+
+pub(crate) fn sync_opened_compat<R>(
+    request: &SyncRequest<'_>,
     backend: &(dyn StageSource + Sync),
     registry: &R,
+    lockless: bool,
 ) -> Result<SyncOutput>
+where
+    R: Registry + state::StateStore,
+{
+    let mut input = request.run_input();
+    input.lockless = lockless;
+    sync_core(&input, backend, registry).map(compatibility_output)
+}
+
+fn sync_core<R>(
+    input: &SyncRunInput<'_>,
+    backend: &(dyn StageSource + Sync),
+    registry: &R,
+) -> Result<SyncExecution>
 where
     R: Registry + state::StateStore,
 {
@@ -562,7 +793,7 @@ where
         &effective_config,
         &parsed,
         backend,
-        input.frozen,
+        input.frozen(),
         effective_lock.as_ref(),
     )?;
     let hook_candidates = take_hook_candidates(&mut graph);
@@ -596,9 +827,9 @@ where
         &instances,
         effective_lock.as_ref(),
         backend,
-        input.force,
-        input.frozen,
-        input.jobs,
+        input.refresh_sources(),
+        input.frozen(),
+        input.jobs(),
     )?;
     let (mut base_lock, local_lock) = split_locks(routed, &local_names);
     base_lock.trusted_hooks = effective_lock
@@ -627,7 +858,7 @@ where
         &recorded_after_recovery,
         compat_registry,
         &protected,
-        input.fast_forward,
+        input.fast_forward(),
     )?;
 
     // pre_sync gates the run: a failure aborts before deploy, leaving zero files deployed.
@@ -671,7 +902,7 @@ fn deploy_and_run_hooks<R>(
     hook_candidates: &[transitive::TransitiveHookCandidate],
     effective_lock: Option<&Lock>,
     pre_sync_outcomes: Vec<hooks::HookOutcome>,
-) -> Result<SyncOutput>
+) -> Result<SyncExecution>
 where
     R: Registry + state::StateStore,
 {
@@ -690,13 +921,13 @@ where
     let mut had_failures = run.had_failures;
     maybe_prune(deploy, had_failures)?;
     let readonly_registry;
-    let registry: &dyn Registry = if deploy.input.lockless {
+    let registry: &dyn Registry = if deploy.input.lockless() {
         readonly_registry = crate::store::FrozenReadOnlyRegistry::new(deploy.registry);
         &readonly_registry
     } else {
         deploy.registry
     };
-    if !deploy.input.prune {
+    if !deploy.input.prune() {
         notify_orphans(deploy.config, registry)?;
     }
 
@@ -714,12 +945,24 @@ where
         .iter()
         .any(|o| o.status == hooks::HookStatus::Failure);
 
-    Ok(SyncOutput {
-        base_lock,
-        local_lock,
-        had_failures,
+    Ok(SyncExecution {
+        report: SyncReport {
+            locks: LockSet {
+                base: Some(base_lock),
+                local: local_lock,
+            },
+            changes: model::ChangeSet::default(),
+            applied: Vec::new(),
+            skipped: Vec::new(),
+            warnings: Vec::new(),
+            hook_outcomes: hook_results,
+            status: if had_failures {
+                SyncStatus::Failed
+            } else {
+                SyncStatus::Success
+            },
+        },
         deploy_failures,
-        hook_results,
         stripped_transitive_hooks,
     })
 }
@@ -731,19 +974,27 @@ fn aborted_before_deploy_phase(
     base_lock: Lock,
     local_lock: Option<Lock>,
     hook_results: Vec<hooks::HookOutcome>,
-) -> SyncOutput {
-    SyncOutput {
-        base_lock,
-        local_lock,
-        had_failures: true,
+) -> SyncExecution {
+    SyncExecution {
+        report: SyncReport {
+            locks: LockSet {
+                base: Some(base_lock),
+                local: local_lock,
+            },
+            changes: model::ChangeSet::default(),
+            applied: Vec::new(),
+            skipped: Vec::new(),
+            warnings: Vec::new(),
+            hook_outcomes: hook_results,
+            status: SyncStatus::Failed,
+        },
         deploy_failures: false,
-        hook_results,
         stripped_transitive_hooks: 0,
     }
 }
 
-fn run_pre_sync(input: &SyncInput<'_>, config: &Config) -> Result<Vec<hooks::HookOutcome>> {
-    if input.no_hooks {
+fn run_pre_sync(input: &SyncRunInput<'_>, config: &Config) -> Result<Vec<hooks::HookOutcome>> {
+    if !input.hooks_enabled() {
         return Ok(Vec::new());
     }
     let target_names = config
@@ -756,7 +1007,7 @@ fn run_pre_sync(input: &SyncInput<'_>, config: &Config) -> Result<Vec<hooks::Hoo
 }
 
 fn run_all_hooks(
-    input: &SyncInput<'_>,
+    input: &dyn RunOptions,
     config: &Config,
     registry: &dyn Registry,
     base_lock: &mut Lock,
@@ -766,16 +1017,16 @@ fn run_all_hooks(
 ) -> Result<(Vec<hooks::HookOutcome>, usize)> {
     // pre_sync + pre_deploy render before post_sync/on_change, so they seed the result vec.
     let mut hook_results = early_hooks;
-    if !input.no_hooks {
+    if input.hooks_enabled() {
         hook_results.append(&mut hooks::dispatch_hooks(config, registry)?);
     }
     let mut stripped = 0;
-    if !input.no_hooks && !input.no_transitive_hooks {
+    if input.transitive_hooks_enabled() {
         let mut decision = decide_transitive_hooks(
             base_lock,
             hook_candidates,
             effective_lock,
-            input.interactive,
+            input.interactive(),
         )?;
         stripped = decision.stripped;
         hook_results.append(&mut decision.outcomes);
