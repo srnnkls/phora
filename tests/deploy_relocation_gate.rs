@@ -721,14 +721,15 @@ fn t023_apply_run_replaces_deploy_run() {
 }
 
 #[test]
-fn t023_preserves_t024_allowlist() {
+fn t024_removes_deploy_target_io_allowlist_entry() {
     let arch_check =
         fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/arch-check.sh"))
             .expect("read architecture guardrail");
     assert!(
-        has_active_deploy_t024_allowlist(&arch_check),
-        "the exact active `$'src/deploy.rs\\tT024'` LEGACY_ALLOWLIST array entry expires in \
-         T024, not during T022; parsed active entries: {:?}",
+        !has_active_deploy_t024_allowlist(&arch_check),
+        "T024 must remove the exact active `$'src/deploy.rs\\tT024'` LEGACY_ALLOWLIST array \
+         entry now that src/{DEPLOY} is a re-export-only compatibility facade; parsed active \
+         entries: {:?}",
         active_legacy_allowlist_entries(&arch_check)
     );
 }

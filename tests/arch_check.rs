@@ -523,7 +523,6 @@ fn allowlist_is_exactly_the_phase_scoped_legacy_set() {
     got.sort();
 
     let mut want: Vec<(String, String)> = [
-        ("src/deploy.rs", "T024"),
         ("src/store.rs", "T025"),
         ("src/source/archive.rs", "T016"),
         ("src/source/cache.rs", "T016"),
@@ -548,16 +547,19 @@ fn allowlist_is_exactly_the_phase_scoped_legacy_set() {
 }
 
 #[test]
-fn legacy_deploy_exemption_does_not_generalize_to_a_new_file() {
+fn deploy_path_is_no_longer_exempt_from_target_io() {
     let tree = base_tree();
     tree.copy_real_src("src/sync/apply.rs", "src/deploy.rs");
     tree.check()
-        .assert_pass("the moved apply payload at the exact allowlisted src/deploy.rs path");
+        .assert_fail("an I/O-bearing apply payload at the formerly allowlisted src/deploy.rs path");
+}
 
+#[test]
+fn target_io_exemption_does_not_generalize_to_a_new_file() {
+    let tree = base_tree();
     tree.copy_real_src("src/sync/apply.rs", "src/deploy_leak.rs");
-    tree.check().assert_fail(
-        "the identical moved apply payload at neighboring non-exempt src/deploy_leak.rs",
-    );
+    tree.check()
+        .assert_fail("an I/O-bearing apply payload at neighboring non-exempt src/deploy_leak.rs");
 }
 
 #[test]
