@@ -4,8 +4,8 @@ use rayon::prelude::*;
 
 use crate::config::{Config, DeployMode, ParsedSource, Refspec, SourceMode};
 use crate::error::Result;
-use crate::kernel::SourceName;
 use crate::lock::{Lock, LockedSource, encode_ref, entry_matches, ref_discriminator};
+use crate::source::SourceName;
 use crate::source::{MirrorKey, NormalizedUrl, SourceBackend, read_local_head};
 
 use super::{effective_protocol, remote_for};

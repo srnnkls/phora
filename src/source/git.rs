@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use gix::object::tree::EntryKind;
 
 use crate::config::Refspec;
-use crate::kernel::{Commit, OfferSelection, SourceName, safe_component};
+use crate::kernel::OfferSelection;
+
+use super::{Commit, SourceName, safe_component};
 
 use super::cache::{
     MirrorStaging, fetch_into_mirror, lock_mirror, mirror_path, open_mirror, reclone_mirror,

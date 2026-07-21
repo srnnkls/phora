@@ -130,7 +130,6 @@ use globset::GlobSet;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::source::{SourceEntryKind, SourceEntryMeta, SourceInventory, SourcePath};
-use crate::kernel::{ArtifactName, Commit, SourceName, TargetName};
 use crate::error::Error;
 use crate::diagnostic::Diagnostic;
 
@@ -139,6 +138,13 @@ use crate::projection::model;
 pub fn build() -> BTreeMap<String, String> {
     BTreeMap::new()
 }
+";
+
+const T029_COMPLIANT_PROJECTION: &str = r"
+use crate::projection::model::{ArtifactName, TargetName};
+use crate::source::{Commit, SourceName, safe_component, safe_relpath};
+
+pub fn build() {}
 ";
 
 const COMPLIANT_RECONCILE: &str = r"
@@ -226,9 +232,20 @@ fn projection_compliant_file_passes() {
         "use std::collections::BTreeMap;\npub type Model = BTreeMap<String, String>;\n",
     );
     tree.check().assert_pass(
-        "a projection file importing only positive-allowlist items (pure source \
-         value types, kernel identities, globset, unicode_normalization, crate \
+        "a projection file importing only policy-neutral positive-allowlist items (pure source \
+         value types, globset, unicode_normalization, crate \
          error/diagnostic, own modules, std non-I/O)",
+    );
+}
+
+#[test]
+fn projection_t029_final_owner_imports_pass() {
+    let tree = base_tree();
+    tree.write("src/projection/build.rs", T029_COMPLIANT_PROJECTION);
+    tree.check().assert_pass(
+        "projection importing T029 identities and lexical guards from their final owners: \
+         TargetName/ArtifactName from projection::model and \
+         SourceName/Commit/safe_component/safe_relpath from source",
     );
 }
 
@@ -530,7 +547,6 @@ fn allowlist_is_exactly_the_phase_scoped_legacy_set() {
         ("src/source/import.rs", "T016"),
         ("src/source/mod.rs", "T016"),
         ("src/source/worktree.rs", "T016"),
-        ("src/sync/transitive.rs", "T029"),
     ]
     .into_iter()
     .map(|(path, expiry)| (path.to_string(), expiry.to_string()))
@@ -990,21 +1006,17 @@ fn projection_whitespace_separated_fq_path_fails() {
 }
 
 #[test]
-fn projection_fully_qualified_allowlisted_kernel_identity_passes() {
+fn projection_kernel_identity_allowlist_expires_at_t029() {
     let tree = base_tree();
     tree.write(
         "src/projection/build.rs",
         "pub fn build() -> crate::kernel::TargetName {\n    \
-         let _err: Option<crate::error::Error> = None;\n    \
-         let _path: Option<crate::source::SourcePath> = None;\n    \
          crate::kernel::TargetName::from(\"x\")\n}\n",
     );
-    tree.check().assert_pass(
-        "projection referencing ALLOWLISTED leaves via fully-qualified body paths with no use \
-         statement — a kernel identity (`crate::kernel::TargetName`), the crate error type \
-         (`crate::error::Error`), and a pure source value type (`crate::source::SourcePath`), each \
-         on projection_use_ok's positive allowlist — closing the FQ bypass must not over-reject the \
-         same leaf allowlist the use-scan already permits",
+    tree.check().assert_fail(
+        "projection reaching `crate::kernel::TargetName` after T029 — TargetName and \
+         ArtifactName are projection-owned, SourceName and Commit are source-owned, so the \
+         phase-scoped kernel identity allowance must be gone",
     );
 }
 

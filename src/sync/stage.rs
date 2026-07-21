@@ -393,7 +393,7 @@ mod tests {
         GitBackend, ResolvedSource, SnapshotId, SourceBackend as _, SourcePath, SourceStore,
     };
 
-    use crate::kernel::SourceName;
+    use crate::source::SourceName;
 
     fn sn(name: &str) -> SourceName {
         SourceName::trusted(name)

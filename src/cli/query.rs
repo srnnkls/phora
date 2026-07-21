@@ -632,7 +632,7 @@ pub(crate) fn explain_cmd(
                 .ok_or_else(|| {
                     cache_miss_diagnostic(binding.source, "no locked commit for this binding")
                 })?;
-            let name = crate::kernel::SourceName::trusted(binding.source.to_owned());
+            let name = crate::source::SourceName::trusted(binding.source.to_owned());
             let leaves = backend
                 .list_source_leaves(&name, remote, &locked.commit, None)
                 .map_err(|_| {

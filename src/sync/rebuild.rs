@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{Config, LayoutConfig, ParsedSource, Target, TemplateOptIn};
 use crate::error::{Error, Result};
-use crate::kernel::{Materialization, SourceName};
+use crate::kernel::Materialization;
 use crate::lock::{Lock, encode_ref, ref_discriminator};
+use crate::source::SourceName;
 use crate::source::{ResolvedSource, SnapshotId, SourcePath};
 use crate::store::{
     ArtifactKey, ManifestFile, ProjectedRecord, RecordKind, Registry, RegistryRecord,

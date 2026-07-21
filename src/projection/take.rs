@@ -135,7 +135,7 @@ fn collect_renames<'a>(
         if literals.contains(src) {
             return Err(literal_and_rename_diagnostic(src));
         }
-        crate::kernel::safe_relpath(dest).map_err(|_| unsafe_dest_diagnostic(dest))?;
+        crate::source::safe_relpath(dest).map_err(|_| unsafe_dest_diagnostic(dest))?;
         match dest_of.insert(src, dest) {
             Some(prior) if prior != *dest => {
                 return Err(rename_fan_out_diagnostic(src, prior, dest));

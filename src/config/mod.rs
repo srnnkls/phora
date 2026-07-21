@@ -228,7 +228,7 @@ impl Config {
     fn validate_bindings(&self) -> Result<()> {
         for (target_name, target) in &self.targets {
             for (identity, binding) in target.sources.iter().flatten() {
-                if crate::kernel::safe_component(identity).is_err() {
+                if crate::source::safe_component(identity).is_err() {
                     return Err(Error::Config(format!(
                         "target `{target_name}`: binding identity `{identity}` must be a single safe path component"
                     )));

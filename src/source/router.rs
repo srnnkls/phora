@@ -4,8 +4,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use super::SourceName;
 use crate::config::{Refspec, SourceMode};
-use crate::kernel::SourceName;
 use crate::source::{
     ResolvedSource, SourceBackend, SourceEntry, SourceError, SourceInventory, SourcePath,
     SourceStore, TreeEntry,
@@ -131,8 +131,8 @@ mod tests {
 
     use tempfile::TempDir;
 
+    use super::SourceName;
     use crate::config::{Refspec, SourceMode};
-    use crate::kernel::SourceName;
     use crate::source::{
         GitBackend, HttpBackend, RouterBackend, SourceBackend, SourceError, TreeEntry,
     };

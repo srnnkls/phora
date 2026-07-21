@@ -141,7 +141,7 @@ fn add_contribution_target(
     name: &str,
 ) -> Option<(
     crate::source::GitBackend,
-    crate::kernel::SourceName,
+    crate::source::SourceName,
     String,
     crate::config::Refspec,
 )> {
@@ -163,7 +163,7 @@ fn add_contribution_target(
         .map(|c| c.join("git"))
         .ok()?;
     let backend = GitBackend::new(git_dir);
-    let source_name = crate::kernel::SourceName::trusted(name.to_owned());
+    let source_name = crate::source::SourceName::trusted(name.to_owned());
     Some((backend, source_name, remote, source.refspec()))
 }
 

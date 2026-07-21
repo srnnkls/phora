@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::kernel::SourceName;
+use super::SourceName;
 
 use super::{MIRROR_REFSPECS, MirrorKey, NormalizedUrl, Result, SourceError};
 

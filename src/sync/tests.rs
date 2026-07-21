@@ -17,8 +17,8 @@ use crate::store::{EjectedEntry, FileRegistry, HookState, StoreError};
 type SourceResult<T> = std::result::Result<T, SourceError>;
 type StoreResult<T> = std::result::Result<T, StoreError>;
 
-fn sn(name: &str) -> crate::kernel::SourceName {
-    crate::kernel::SourceName::trusted(name)
+fn sn(name: &str) -> crate::source::SourceName {
+    crate::source::SourceName::trusted(name)
 }
 
 /// A single-entry resolved-commit map keyed by (source, encoded default ref).
@@ -368,7 +368,7 @@ impl<'a> CountingBackend<'a> {
 }
 
 impl SourceBackend for CountingBackend<'_> {
-    fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> SourceResult<()> {
+    fn fetch(&self, source: &crate::source::SourceName, url: &str) -> SourceResult<()> {
         self.fetches.fetch_add(1, AtomicOrdering::SeqCst);
         self.inner.fetch(source, url)
     }
@@ -379,7 +379,7 @@ impl SourceBackend for CountingBackend<'_> {
 
     fn resolve(
         &self,
-        source: &crate::kernel::SourceName,
+        source: &crate::source::SourceName,
         url: &str,
         refspec: &Refspec,
     ) -> SourceResult<String> {
@@ -389,7 +389,7 @@ impl SourceBackend for CountingBackend<'_> {
 
     fn commit_time(
         &self,
-        source: &crate::kernel::SourceName,
+        source: &crate::source::SourceName,
         url: &str,
         commit: &str,
     ) -> SourceResult<u64> {
@@ -399,7 +399,7 @@ impl SourceBackend for CountingBackend<'_> {
 
     fn compute_digest(
         &self,
-        source: &crate::kernel::SourceName,
+        source: &crate::source::SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
@@ -413,7 +413,7 @@ impl SourceBackend for CountingBackend<'_> {
 
     fn list_source_leaves(
         &self,
-        source: &crate::kernel::SourceName,
+        source: &crate::source::SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
@@ -507,7 +507,7 @@ fn input<'a>(
 fn expected_digest(fx: &SyncFixture, name: &str, commit: &str) -> String {
     fx.backend
         .compute_digest(
-            &crate::kernel::SourceName::trusted(name),
+            &crate::source::SourceName::trusted(name),
             &fx.url,
             commit,
             None,
@@ -806,12 +806,12 @@ struct DenyNetworkBackend<'a> {
 }
 
 impl SourceBackend for DenyNetworkBackend<'_> {
-    fn fetch(&self, _source: &crate::kernel::SourceName, _url: &str) -> SourceResult<()> {
+    fn fetch(&self, _source: &crate::source::SourceName, _url: &str) -> SourceResult<()> {
         Err(SourceError::Source("frozen must not fetch".to_owned()))
     }
     fn resolve(
         &self,
-        _source: &crate::kernel::SourceName,
+        _source: &crate::source::SourceName,
         _url: &str,
         _refspec: &Refspec,
     ) -> SourceResult<String> {
@@ -819,7 +819,7 @@ impl SourceBackend for DenyNetworkBackend<'_> {
     }
     fn commit_time(
         &self,
-        source: &crate::kernel::SourceName,
+        source: &crate::source::SourceName,
         url: &str,
         commit: &str,
     ) -> SourceResult<u64> {
@@ -827,7 +827,7 @@ impl SourceBackend for DenyNetworkBackend<'_> {
     }
     fn compute_digest(
         &self,
-        source: &crate::kernel::SourceName,
+        source: &crate::source::SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
@@ -1266,12 +1266,12 @@ struct FailingReadBackend<'a> {
 }
 
 impl SourceBackend for FailingReadBackend<'_> {
-    fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> SourceResult<()> {
+    fn fetch(&self, source: &crate::source::SourceName, url: &str) -> SourceResult<()> {
         self.inner.fetch(source, url)
     }
     fn resolve(
         &self,
-        source: &crate::kernel::SourceName,
+        source: &crate::source::SourceName,
         url: &str,
         refspec: &Refspec,
     ) -> SourceResult<String> {
@@ -1279,7 +1279,7 @@ impl SourceBackend for FailingReadBackend<'_> {
     }
     fn commit_time(
         &self,
-        source: &crate::kernel::SourceName,
+        source: &crate::source::SourceName,
         url: &str,
         commit: &str,
     ) -> SourceResult<u64> {
@@ -1287,7 +1287,7 @@ impl SourceBackend for FailingReadBackend<'_> {
     }
     fn compute_digest(
         &self,
-        source: &crate::kernel::SourceName,
+        source: &crate::source::SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
@@ -1299,7 +1299,7 @@ impl SourceBackend for FailingReadBackend<'_> {
     }
     fn list_source_leaves(
         &self,
-        source: &crate::kernel::SourceName,
+        source: &crate::source::SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
@@ -4858,12 +4858,12 @@ impl SourceStore for FailingResolveBackend<'_> {
 }
 
 impl SourceBackend for FailingResolveBackend<'_> {
-    fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> SourceResult<()> {
+    fn fetch(&self, source: &crate::source::SourceName, url: &str) -> SourceResult<()> {
         self.inner.fetch(source, url)
     }
     fn resolve(
         &self,
-        _source: &crate::kernel::SourceName,
+        _source: &crate::source::SourceName,
         _url: &str,
         _refspec: &Refspec,
     ) -> SourceResult<String> {
@@ -4871,7 +4871,7 @@ impl SourceBackend for FailingResolveBackend<'_> {
     }
     fn commit_time(
         &self,
-        source: &crate::kernel::SourceName,
+        source: &crate::source::SourceName,
         url: &str,
         commit: &str,
     ) -> SourceResult<u64> {
@@ -4879,7 +4879,7 @@ impl SourceBackend for FailingResolveBackend<'_> {
     }
     fn compute_digest(
         &self,
-        source: &crate::kernel::SourceName,
+        source: &crate::source::SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
@@ -7764,13 +7764,13 @@ impl SourceStore for RecordingBackend<'_> {
 }
 
 impl SourceBackend for RecordingBackend<'_> {
-    fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> SourceResult<()> {
+    fn fetch(&self, source: &crate::source::SourceName, url: &str) -> SourceResult<()> {
         self.urls.lock().expect("urls mutex").push(url.to_owned());
         self.inner.fetch(source, url)
     }
     fn resolve(
         &self,
-        source: &crate::kernel::SourceName,
+        source: &crate::source::SourceName,
         url: &str,
         refspec: &Refspec,
     ) -> SourceResult<String> {
@@ -7778,7 +7778,7 @@ impl SourceBackend for RecordingBackend<'_> {
     }
     fn commit_time(
         &self,
-        source: &crate::kernel::SourceName,
+        source: &crate::source::SourceName,
         url: &str,
         commit: &str,
     ) -> SourceResult<u64> {
@@ -7786,7 +7786,7 @@ impl SourceBackend for RecordingBackend<'_> {
     }
     fn compute_digest(
         &self,
-        source: &crate::kernel::SourceName,
+        source: &crate::source::SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
@@ -7798,7 +7798,7 @@ impl SourceBackend for RecordingBackend<'_> {
     }
     fn list_source_leaves(
         &self,
-        source: &crate::kernel::SourceName,
+        source: &crate::source::SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
@@ -8050,7 +8050,7 @@ struct CountingRouter {
 impl CountingRouter {
     fn new(
         git_dir: PathBuf,
-        modes: BTreeMap<crate::kernel::SourceName, crate::config::SourceMode>,
+        modes: BTreeMap<crate::source::SourceName, crate::config::SourceMode>,
     ) -> Self {
         let git = GitBackend::new(git_dir.clone());
         let http = HttpBackend::new(git_dir, BTreeMap::new());
@@ -8076,7 +8076,7 @@ impl SourceStore for CountingRouter {
 }
 
 impl SourceBackend for CountingRouter {
-    fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> SourceResult<()> {
+    fn fetch(&self, source: &crate::source::SourceName, url: &str) -> SourceResult<()> {
         self.fetches.fetch_add(1, AtomicOrdering::SeqCst);
         self.inner.fetch(source, url)
     }
@@ -8085,7 +8085,7 @@ impl SourceBackend for CountingRouter {
     }
     fn resolve(
         &self,
-        source: &crate::kernel::SourceName,
+        source: &crate::source::SourceName,
         url: &str,
         refspec: &Refspec,
     ) -> SourceResult<String> {
@@ -8093,7 +8093,7 @@ impl SourceBackend for CountingRouter {
     }
     fn commit_time(
         &self,
-        source: &crate::kernel::SourceName,
+        source: &crate::source::SourceName,
         url: &str,
         commit: &str,
     ) -> SourceResult<u64> {
@@ -8101,7 +8101,7 @@ impl SourceBackend for CountingRouter {
     }
     fn compute_digest(
         &self,
-        source: &crate::kernel::SourceName,
+        source: &crate::source::SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
@@ -8114,7 +8114,7 @@ impl SourceBackend for CountingRouter {
 
     fn list_source_leaves(
         &self,
-        source: &crate::kernel::SourceName,
+        source: &crate::source::SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
@@ -8123,7 +8123,7 @@ impl SourceBackend for CountingRouter {
     }
 }
 
-fn url_modes(source: &str) -> BTreeMap<crate::kernel::SourceName, crate::config::SourceMode> {
+fn url_modes(source: &str) -> BTreeMap<crate::source::SourceName, crate::config::SourceMode> {
     let mut modes = BTreeMap::new();
     modes.insert(sn(source), crate::config::SourceMode::Url);
     modes
@@ -11617,7 +11617,7 @@ impl SourceStore for SyncRecordingBackend<'_> {
 }
 
 impl SourceBackend for SyncRecordingBackend<'_> {
-    fn fetch(&self, source: &crate::kernel::SourceName, url: &str) -> SourceResult<()> {
+    fn fetch(&self, source: &crate::source::SourceName, url: &str) -> SourceResult<()> {
         self.total_fetches.fetch_add(1, AtomicOrdering::SeqCst);
         self.fetched_urls
             .lock()
@@ -11627,7 +11627,7 @@ impl SourceBackend for SyncRecordingBackend<'_> {
     }
     fn resolve(
         &self,
-        source: &crate::kernel::SourceName,
+        source: &crate::source::SourceName,
         url: &str,
         refspec: &Refspec,
     ) -> SourceResult<String> {
@@ -11635,7 +11635,7 @@ impl SourceBackend for SyncRecordingBackend<'_> {
     }
     fn commit_time(
         &self,
-        source: &crate::kernel::SourceName,
+        source: &crate::source::SourceName,
         url: &str,
         commit: &str,
     ) -> SourceResult<u64> {
@@ -11643,7 +11643,7 @@ impl SourceBackend for SyncRecordingBackend<'_> {
     }
     fn compute_digest(
         &self,
-        source: &crate::kernel::SourceName,
+        source: &crate::source::SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
@@ -11655,7 +11655,7 @@ impl SourceBackend for SyncRecordingBackend<'_> {
     }
     fn list_source_leaves(
         &self,
-        source: &crate::kernel::SourceName,
+        source: &crate::source::SourceName,
         url: &str,
         commit: &str,
         root: Option<&Path>,
@@ -11756,7 +11756,7 @@ impl UrlFetchRecordingBackend {
 }
 
 impl SourceBackend for UrlFetchRecordingBackend {
-    fn fetch(&self, source: &crate::kernel::SourceName, _url: &str) -> SourceResult<()> {
+    fn fetch(&self, source: &crate::source::SourceName, _url: &str) -> SourceResult<()> {
         self.fetched_sources
             .lock()
             .expect("fetched_sources mutex")
@@ -11765,7 +11765,7 @@ impl SourceBackend for UrlFetchRecordingBackend {
     }
     fn resolve(
         &self,
-        _source: &crate::kernel::SourceName,
+        _source: &crate::source::SourceName,
         _url: &str,
         _refspec: &Refspec,
     ) -> SourceResult<String> {
@@ -11773,7 +11773,7 @@ impl SourceBackend for UrlFetchRecordingBackend {
     }
     fn commit_time(
         &self,
-        _source: &crate::kernel::SourceName,
+        _source: &crate::source::SourceName,
         _url: &str,
         _commit: &str,
     ) -> SourceResult<u64> {
@@ -11781,7 +11781,7 @@ impl SourceBackend for UrlFetchRecordingBackend {
     }
     fn compute_digest(
         &self,
-        _source: &crate::kernel::SourceName,
+        _source: &crate::source::SourceName,
         _url: &str,
         _commit: &str,
         _root: Option<&Path>,

@@ -1,12 +1,65 @@
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use globset::GlobSet;
 
-use crate::kernel::safe_relpath;
+use crate::error::{Error, Result};
 use crate::projection::collapse::{CollapseChoice, CollapseMode};
 use crate::projection::diagnostic::{ProjectionError, ProjectionWarning, unsafe_leaf};
 use crate::projection::take::{ResolvedTake, Take};
-use crate::source::{SourceInventory, SourcePath};
+use crate::source::{SourceInventory, SourcePath, safe_component, safe_relpath};
+
+/// A configured target identifier: the `[targets.<name>]` table key.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TargetName(String);
+
+impl TargetName {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for TargetName {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        safe_component(s)?;
+        Ok(Self(s.to_owned()))
+    }
+}
+
+impl std::fmt::Display for TargetName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A single artifact path component discovered in a source tree.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ArtifactName(String);
+
+impl ArtifactName {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for ArtifactName {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        safe_component(s)?;
+        Ok(Self(s.to_owned()))
+    }
+}
+
+impl std::fmt::Display for ArtifactName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 /// One planned deployment unit: a collapsed directory or a single kept leaf.
 #[derive(Debug, Clone, PartialEq, Eq)]

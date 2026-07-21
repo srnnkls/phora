@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use flate2::read::GzDecoder;
 
-use crate::kernel::safe_component;
+use super::safe_component;
 use crate::source::SourceError;
 
 type Result<T> = std::result::Result<T, SourceError>;

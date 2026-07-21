@@ -6,8 +6,8 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::config::Paths;
 use crate::error::{Error, Result};
-use crate::kernel::safe_component;
 use crate::paths::{cache_root_for, state_root_for};
+use crate::source::safe_component;
 
 /// Named diagnostics owned by confinement; tests assert these exact phrases.
 const ANCHOR_SYMLINK: &str = "anchor ancestor is a symlink";

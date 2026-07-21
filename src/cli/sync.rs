@@ -6,10 +6,10 @@ use std::path::Path;
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::kernel::ProjectId;
 use crate::lock::{Lock, merge_locks};
 use crate::paths::{cache_root_for, state_root_for};
 use crate::store::{FileRegistry, StoreError};
+use crate::sync::state::ProjectId;
 use crate::sync::{
     Concurrency, ConflictPolicy, ConflictResolver, HookPolicy, LockSet, MovedPinPolicy,
     PrunePolicy, SkippedChange, SourcePolicy, SyncOptions, SyncReport, SyncRequest, SyncWarning,

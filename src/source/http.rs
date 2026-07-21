@@ -6,7 +6,7 @@ use std::time::Duration;
 use sha2::{Digest as _, Sha256};
 use ureq::http::{self, Uri, header};
 
-use crate::kernel::{Algo, Digest};
+use crate::digest::{Algo, Digest};
 use crate::source::SourceError;
 
 type Result<T> = std::result::Result<T, SourceError>;
@@ -234,7 +234,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::kernel::Digest;
+    use crate::digest::Digest;
     use crate::source::SourceError;
     use crate::source::http::{download, verify_digest};
     use std::io::{Read, Write};

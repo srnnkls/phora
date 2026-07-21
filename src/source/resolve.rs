@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::kernel::SourceName;
+use super::SourceName;
 
 use super::Result;
 use super::snapshot::ResolvedSource;
