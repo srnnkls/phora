@@ -1,6 +1,6 @@
 //! Compatibility facade for state APIs now owned by `sync::state`.
 
-pub use crate::kernel::Digest;
+pub use crate::digest::Digest;
 pub use crate::sync::model::ScannedFile;
 pub use crate::sync::state::file::{
     ArtifactKey, EjectedEntry, FileRegistry, FrozenReadOnlyRegistry, HookState, ManifestFile,

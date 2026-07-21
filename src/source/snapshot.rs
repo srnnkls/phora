@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::kernel::SourceName;
+use super::SourceName;
 
 use super::model::{SourceEntryKind, SourceEntryMeta, SourceInventory, SourcePath};
 use super::{Result, hash_framed_entry};

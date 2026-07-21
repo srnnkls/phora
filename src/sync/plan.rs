@@ -5,8 +5,8 @@ use std::path::Path;
 
 use crate::config::{Config, DeployMode, ParsedSource, Target};
 use crate::error::{Error, Result};
-use crate::kernel::SourceName;
 use crate::lock::encode_ref;
+use crate::source::SourceName;
 use crate::source::{SourceBackend, SourceInventory};
 
 use super::discover::discover_working_tree_leaves;

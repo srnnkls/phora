@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use gix::object::tree::EntryKind;
 
 use crate::config::Refspec;
-use crate::kernel::{Digest, SourceName, safe_component};
+use crate::digest::Digest;
+
+use super::{SourceName, safe_component};
 
 use super::cache::{MirrorStaging, lock_mirror, mirror_path};
 use super::{GitBackend, Result, SourceBackend, SourceError};

@@ -38,12 +38,20 @@ impl TransitiveManifest {
     /// Returns [`Error::Config`] when the document is not valid TOML or its
     /// declarative `[sources]`/`[targets]` fields do not type.
     pub fn parse(text: &str) -> Result<Self> {
-        let document: toml::Value =
-            toml::from_str(text).map_err(|e| Error::Config(e.to_string()))?;
+        Self::parse_toml(text).map_err(|error| Error::Config(error.to_string()))
+    }
+
+    /// Crate-private structured-error parsing path for callers that need the concrete
+    /// [`toml::de::Error`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the document has invalid TOML syntax or its declarative
+    /// fields cannot be deserialized.
+    pub(crate) fn parse_toml(text: &str) -> std::result::Result<Self, toml::de::Error> {
+        let document: toml::Value = toml::from_str(text)?;
         let hooks = collect_opaque_hooks(&document);
-        let graph: ManifestGraph = document
-            .try_into()
-            .map_err(|e| Error::Config(e.to_string()))?;
+        let graph: ManifestGraph = document.try_into()?;
         Ok(Self {
             sources: graph.sources,
             targets: graph.targets,

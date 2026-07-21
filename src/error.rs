@@ -11,14 +11,21 @@
 
 use thiserror::Error;
 
-use crate::kernel::KernelError;
-use crate::source::SourceError;
+use crate::source::{KernelError, SourceError};
 use crate::store::StoreError;
 
 #[derive(Debug, Error)]
 pub enum Error {
     #[error(transparent)]
     SourceCtx(#[from] SourceError),
+
+    #[error("config error: transitive source `{name}` at depth {depth}: {source}")]
+    TransitiveSource {
+        name: String,
+        depth: usize,
+        #[source]
+        source: SourceError,
+    },
 
     #[error(transparent)]
     StoreCtx(#[from] StoreError),

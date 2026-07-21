@@ -10,7 +10,8 @@ use super::config_edit::{self, BindRefinement};
 use super::{load_config_from, load_local_config, read_config_text, render, target_config_file};
 use crate::config::merge_configs;
 use crate::error::{Error, Result};
-use crate::kernel::{SourceName, TargetName};
+use crate::projection::model::TargetName;
+use crate::source::SourceName;
 
 /// Error text for a target that is not defined: names the target and the
 /// `phora target add <name> --path <path>` create hint, suffixed with `--local`

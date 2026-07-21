@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 use crate::config::{Config, DeployMode, LayoutConfig, Offer, ParsedSource, Target, TemplateOptIn};
 use crate::diagnostic::did_you_mean;
 use crate::error::{Error, Result};
-use crate::kernel::{Materialization, OfferSelection, SourceName};
+use crate::kernel::{Materialization, OfferSelection};
 use crate::lock::{Lock, ref_discriminator};
+use crate::source::SourceName;
 use crate::source::{SourceBackend, SourceInventory};
 
 use super::discover::discover_working_tree_leaves;

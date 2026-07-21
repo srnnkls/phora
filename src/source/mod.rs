@@ -10,13 +10,17 @@ mod model;
 mod resolve;
 mod router;
 mod snapshot;
+pub(crate) mod transitive;
 mod worktree;
 
 #[cfg(test)]
 pub(crate) use cache::mirror_path;
 pub use git::GitBackend;
 pub use import::HttpBackend;
-pub use model::{SourceEntryKind, SourceEntryMeta, SourceInventory, SourcePath};
+pub use model::{
+    Commit, KernelError, SourceEntryKind, SourceEntryMeta, SourceInventory, SourceName, SourcePath,
+};
+pub(crate) use model::{safe_component, safe_relpath};
 pub use resolve::resolve_worktree;
 pub use router::RouterBackend;
 pub use snapshot::{ResolvedSource, SnapshotId, SourceEntry, SourceStore};
@@ -28,7 +32,6 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::config::Refspec;
-use crate::kernel::{KernelError, SourceName};
 
 /// Errors owned by the source context (`SourceBackend` and its adapters).
 #[derive(Debug, Error)]
@@ -45,6 +48,31 @@ pub enum SourceError {
         commit: String,
         path: PathBuf,
     },
+
+    #[error("config error: dependency at `{remote}` has no phora.toml")]
+    DependencyManifestMissing {
+        remote: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[error("config error: phora.toml at `{remote}` is not utf-8: {source}")]
+    DependencyManifestUtf8 {
+        remote: String,
+        #[source]
+        source: std::string::FromUtf8Error,
+    },
+
+    #[error("config error: {source}")]
+    DependencyManifestParse {
+        #[source]
+        source: toml::de::Error,
+    },
+
+    #[error(
+        "config error: source `{name}`: transitive remote not allowed — `{remote}` is a local path or file:// remote and does not resolve inside the materialized dependency tree"
+    )]
+    TransitiveRemoteRejected { name: String, remote: String },
 
     #[error("root path not found in tree: {root}")]
     RootNotFound { root: std::path::PathBuf },
@@ -296,7 +324,7 @@ mod tests {
 
     use crate::sync::stage::symlink_target_escapes;
 
-    use crate::kernel::safe_component;
+    use crate::source::safe_component;
 
     use std::process::Command;
 
@@ -2621,7 +2649,7 @@ path = "srnnkls/tropos"
         use tempfile::TempDir;
 
         use crate::config::Refspec;
-        use crate::kernel::Digest;
+        use crate::digest::Digest;
         use crate::source::{HttpBackend, SourceBackend, SourceError, mirror_path};
 
         use super::sn;

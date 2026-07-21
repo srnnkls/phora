@@ -20,6 +20,7 @@ pub mod cli;
 pub mod config;
 pub mod deploy;
 pub mod diagnostic;
+pub mod digest;
 pub mod error;
 pub mod kernel;
 pub mod lock;

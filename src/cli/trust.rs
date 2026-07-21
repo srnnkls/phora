@@ -138,7 +138,7 @@ impl TrustDiff {
         let Some(backend) = &self.backend else {
             return vec![diff_unavailable()];
         };
-        let name = crate::kernel::SourceName::trusted(candidate.source.clone());
+        let name = crate::source::SourceName::trusted(candidate.source.clone());
         // The dep is the mirror holding BOTH commits; this resolves nested deps and discriminates colliding (source, stripped-key) pairs that the lock can't.
         for url in &self.dep_urls {
             for prior in priors {
@@ -336,7 +336,7 @@ pub(super) fn render_show(
     commit: &str,
     path: &Path,
 ) -> Result<Vec<String>> {
-    let name = crate::kernel::SourceName::trusted(source.to_owned());
+    let name = crate::source::SourceName::trusted(source.to_owned());
     match backend.read_file_at(&name, url, commit, path) {
         Ok(bytes) => match std::str::from_utf8(&bytes) {
             Ok(text) => Ok(text.lines().map(str::to_owned).collect()),
@@ -415,7 +415,7 @@ fn discover_via_fetch(
         .map_err(|e| Error::Config(format!("source `{name}`: {e}")))?;
     let git_dir = crate::paths::cache_root_for(config.paths.cache.as_deref(), cwd)?.join("git");
     let backend = GitBackend::new(git_dir);
-    let source_name = crate::kernel::SourceName::trusted(name.to_owned());
+    let source_name = crate::source::SourceName::trusted(name.to_owned());
     let bytes = match backend.fetch_root_manifest(&source_name, &remote, &source.refspec()) {
         Ok(bytes) => bytes,
         Err(SourceError::FileAbsent { .. }) => return Ok(Vec::new()),
@@ -715,7 +715,7 @@ mod tests {
     impl SourceBackend for ShowBackend {
         fn read_file_at(
             &self,
-            _source: &crate::kernel::SourceName,
+            _source: &crate::source::SourceName,
             _url: &str,
             commit: &str,
             path: &Path,
@@ -739,7 +739,7 @@ mod tests {
 
         fn list_tree_at(
             &self,
-            _source: &crate::kernel::SourceName,
+            _source: &crate::source::SourceName,
             _url: &str,
             commit: &str,
             path: &Path,
@@ -757,7 +757,7 @@ mod tests {
 
         fn fetch(
             &self,
-            _source: &crate::kernel::SourceName,
+            _source: &crate::source::SourceName,
             _url: &str,
         ) -> std::result::Result<(), SourceError> {
             unimplemented!("`--show` is offline; it must not fetch")
@@ -765,7 +765,7 @@ mod tests {
 
         fn resolve(
             &self,
-            _source: &crate::kernel::SourceName,
+            _source: &crate::source::SourceName,
             _url: &str,
             _refspec: &crate::config::Refspec,
         ) -> std::result::Result<String, SourceError> {
@@ -774,7 +774,7 @@ mod tests {
 
         fn commit_time(
             &self,
-            _source: &crate::kernel::SourceName,
+            _source: &crate::source::SourceName,
             _url: &str,
             _commit: &str,
         ) -> std::result::Result<u64, SourceError> {
@@ -783,7 +783,7 @@ mod tests {
 
         fn compute_digest(
             &self,
-            _source: &crate::kernel::SourceName,
+            _source: &crate::source::SourceName,
             _url: &str,
             _commit: &str,
             _root: Option<&Path>,

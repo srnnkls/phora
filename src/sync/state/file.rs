@@ -134,7 +134,7 @@ pub struct HookState {
     pub last_success: std::collections::BTreeSet<String>,
 }
 
-pub use crate::kernel::Digest;
+pub use crate::digest::Digest;
 
 pub trait Registry {
     fn get(&self, key: &ArtifactKey) -> Result<Option<RegistryRecord>>;
@@ -618,7 +618,7 @@ impl Registry for FrozenReadOnlyRegistry<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::ProjectId;
+    use crate::sync::state::ProjectId;
     use tempfile::TempDir;
 
     #[test]

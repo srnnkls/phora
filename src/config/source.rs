@@ -79,7 +79,7 @@ pub enum Remote {
     /// A static resource fetched once; no git ref.
     Url {
         url: String,
-        digest: Option<crate::kernel::Digest>,
+        digest: Option<crate::digest::Digest>,
     },
     /// A forge source resolved against the host registry.
     Host {
@@ -197,7 +197,7 @@ impl ParsedSource {
     }
 
     #[must_use]
-    pub fn digest(&self) -> Option<crate::kernel::Digest> {
+    pub fn digest(&self) -> Option<crate::digest::Digest> {
         match &self.remote {
             Remote::Url { digest, .. } => *digest,
             _ => None,
@@ -522,7 +522,7 @@ impl Source {
                 .digest
                 .as_deref()
                 .map(|raw| {
-                    raw.parse::<crate::kernel::Digest>()
+                    raw.parse::<crate::digest::Digest>()
                         .map_err(|e| Error::Config(format!("source `{name}`: {e}")))
                 })
                 .transpose()?;

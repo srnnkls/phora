@@ -49,10 +49,12 @@ use clap::{Parser, Subcommand};
 
 use crate::config::{Config, ParsedSource, merge_configs};
 use crate::error::{Error, Result};
-use crate::kernel::{ProjectId, SourceName, TargetName};
 use crate::paths::state_root_for;
+use crate::projection::model::TargetName;
+use crate::source::SourceName;
 use crate::source::{GitBackend, HttpBackend, RouterBackend};
 use crate::store::{FileRegistry, Registry, StoreError};
+use crate::sync::state::ProjectId;
 use crate::sync::{Conflict, ConflictResolver, Resolution};
 use std::str::FromStr;
 

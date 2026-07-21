@@ -5553,7 +5553,8 @@ const TARGET_HOME_BLOCK: &str =
     "\n[targets.home]\npath = \"./out\"\nlayout = \"flat\"\nsources = []\n";
 
 fn seed_deployed_record(state_root: &Path, project_dir: &Path, target: &str) {
-    let project = crate::kernel::ProjectId::for_path(project_dir).expect("project id for seed");
+    let project =
+        crate::sync::state::ProjectId::for_path(project_dir).expect("project id for seed");
     let registry_root = state_root.join("projects").join(project.as_str());
     let reg = FileRegistry::open(registry_root).expect("open seeded project registry");
     reg.put(&record(target, "dotfiles", "init", "aaa111", "blake3:d1"))

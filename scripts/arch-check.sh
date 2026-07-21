@@ -12,7 +12,6 @@ LEGACY_ALLOWLIST=(
   $'src/source/import.rs\tT016'
   $'src/source/mod.rs\tT016'
   $'src/source/worktree.rs\tT016'
-  $'src/sync/transitive.rs\tT029'
 )
 
 LEGACY_INFRA=(
@@ -214,9 +213,7 @@ projection_use_ok() {
     crate::projection|crate::projection::*) return 0 ;;
     globset|globset::*) return 0 ;;
     unicode_normalization|unicode_normalization::*) return 0 ;;
-    crate::source::*) leaf_in_set "${u#crate::source::}" "SourcePath SourceInventory SourceEntryMeta SourceEntryKind" ;;
-    # safe_relpath: pure path guard shared with kernel identity types; expires with the kernel leaf entry (T029).
-    crate::kernel::*) leaf_in_set "${u#crate::kernel::}" "TargetName ArtifactName SourceName Commit safe_relpath" ;;
+    crate::source::*) leaf_in_set "${u#crate::source::}" "SourcePath SourceInventory SourceEntryMeta SourceEntryKind SourceName Commit safe_component safe_relpath" ;;
     crate::*|crate) return 1 ;;
     std::fs|std::fs::*|std::process|std::process::*|std::net|std::net::*|std::io|std::io::*|std::os|std::os::*) return 1 ;;
     std|std::*) return 0 ;;

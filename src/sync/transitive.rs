@@ -9,11 +9,11 @@ use std::path::{Path, PathBuf};
 use crate::config::transitive::{FetchNode, Instance, TransitiveManifest};
 use crate::config::{
     Config, DeployMode, HookAdmissionDiagnostic, HookCommand, Host, ParsedSource, Protocol,
-    Refspec, Remote, SourceMode, TakeEntry, Target, admit_transitive_hooks, hook_preimage,
+    Refspec, SourceMode, TakeEntry, Target, admit_transitive_hooks, hook_preimage,
 };
 use crate::error::{Error, Result};
-use crate::kernel::{OfferSelection, SourceName};
-use crate::source::{SourceBackend, is_local_path};
+use crate::kernel::OfferSelection;
+use crate::source::{SourceBackend, SourceName};
 
 use super::resolved_remotes;
 
@@ -196,7 +196,7 @@ pub(super) fn resolve_transitive_graph(
             let remote = remotes.get(imported).map(String::as_str).ok_or_else(|| {
                 Error::Config(format!("no resolved remote for source `{imported}`"))
             })?;
-            reject_escaping_remote(imported, source, remote, 1)?;
+            crate::source::transitive::validate_dependency_remote(imported, source, remote, 1)?;
             let (commit, manifest) =
                 fetch_manifest(imported, source, remote, backend, 1, &frozen_gate)?;
             let node = FetchNode::new(remote, &source.refspec().to_string(), &commit);
@@ -369,7 +369,12 @@ fn namespace_dep_sources(
             ctx.default_protocol,
         )
         .map_err(|e| Error::Config(format!("imported `{imported}`: source `{inner_name}`: {e}")))?;
-        reject_escaping_remote(inner_name, &parsed, &remote, depth + 1)?;
+        crate::source::transitive::validate_dependency_remote(
+            inner_name,
+            &parsed,
+            &remote,
+            depth + 1,
+        )?;
         let composed_by_nested_import =
             inner.is_transitive() && imported_inner.contains(inner_name.as_str());
         if inner.is_transitive() && !composed_by_nested_import && !ctx.frozen.frozen {
@@ -418,7 +423,12 @@ fn compose_nested_imports(
             ctx.default_protocol,
         )
         .map_err(|e| at_depth(inner_name, depth + 1, &e.to_string()))?;
-        reject_escaping_remote(inner_name, &inner_parsed, &inner_remote, depth + 1)?;
+        crate::source::transitive::validate_dependency_remote(
+            inner_name,
+            &inner_parsed,
+            &inner_remote,
+            depth + 1,
+        )?;
         let (inner_commit, inner_manifest) = fetch_manifest(
             inner_name,
             &inner_parsed,
@@ -490,7 +500,12 @@ fn descend_for_validation(
             ctx.default_protocol,
         )
         .map_err(|e| at_depth(inner_name, depth + 1, &e.to_string()))?;
-        reject_escaping_remote(inner_name, &inner_parsed, &inner_remote, depth + 1)?;
+        crate::source::transitive::validate_dependency_remote(
+            inner_name,
+            &inner_parsed,
+            &inner_remote,
+            depth + 1,
+        )?;
         if !inner.is_transitive() {
             continue;
         }
@@ -644,21 +659,18 @@ fn fetch_manifest(
     let refspec = source.refspec();
     let pinned = frozen.require_pinned(name, remote, &refspec, depth)?;
     let source_name = SourceName::trusted(name.to_owned());
-    let commit = if let Some(locked_commit) = pinned {
-        locked_commit.to_owned()
-    } else {
-        backend
-            .fetch(&source_name, remote)
-            .map_err(|e| at_depth(name, depth, &e.to_string()))?;
-        backend
-            .resolve(&source_name, remote, &refspec)
-            .map_err(|e| at_depth(name, depth, &e.to_string()))?
-    };
-    let manifest_text = read_manifest(backend, &source_name, remote, &commit)
-        .map_err(|e| at_depth(name, depth, &e.to_string()))?;
-    let manifest = TransitiveManifest::parse(&manifest_text)
-        .map_err(|e| at_depth(name, depth, &e.to_string()))?;
-    Ok((commit, manifest))
+    crate::source::transitive::acquire_dependency_manifest(
+        backend,
+        &source_name,
+        source,
+        remote,
+        pinned,
+    )
+    .map_err(|source| Error::TransitiveSource {
+        name: name.to_owned(),
+        depth,
+        source,
+    })
 }
 
 /// Trust surface: a dep's [`Remote::Host`] source resolves against the CONSUMER's host
@@ -684,59 +696,15 @@ fn inner_remote(
     )
 }
 
-/// A transitive source may not reach a local `path` or `file://` remote resolved on
-/// the consumer host unless it resolves inside the already-materialized dep tree
-/// (nothing is materialized at this phase, so any such remote is rejected). A
-/// literal `git = <local repo>` is the consumer's explicit choice and is allowed.
+#[cfg(test)]
 fn reject_escaping_remote(
     name: &str,
     source: &ParsedSource,
     remote: &str,
     depth: usize,
 ) -> Result<()> {
-    let escapes = matches!(source.remote, Remote::Path(_))
-        || remote.starts_with("file://")
-        || is_relative_fs_remote(remote)
-        || (depth > 1 && is_local_path(remote));
-    if escapes {
-        return Err(Error::Config(format!(
-            "source `{name}`: transitive remote not allowed — `{remote}` is a local path \
-             or file:// remote and does not resolve inside the materialized dependency tree"
-        )));
-    }
+    crate::source::transitive::validate_dependency_remote(name, source, remote, depth)?;
     Ok(())
-}
-
-/// True for a relative filesystem path; false for URL/scp remotes and absolute paths.
-fn is_relative_fs_remote(remote: &str) -> bool {
-    if remote.contains("://") {
-        return false;
-    }
-    if let Some(colon) = remote.find(':') {
-        let first_slash = remote.find('/');
-        if first_slash.is_none_or(|slash| colon < slash) {
-            return false;
-        }
-    }
-    !Path::new(remote).is_absolute()
-}
-
-fn read_manifest(
-    backend: &(dyn SourceBackend + Sync),
-    source: &SourceName,
-    remote: &str,
-    commit: &str,
-) -> Result<String> {
-    let bytes = backend
-        .read_file_at(source, remote, commit, Path::new("phora.toml"))
-        .map_err(|e| match e {
-            crate::source::SourceError::FileAbsent { .. } => {
-                Error::Config(format!("dependency at `{remote}` has no phora.toml"))
-            }
-            other => Error::Source(other.to_string()),
-        })?;
-    String::from_utf8(bytes)
-        .map_err(|e| Error::Config(format!("phora.toml at `{remote}` is not utf-8: {e}")))
 }
 
 fn reject_depth_overflow(name: &str, depth: usize) -> Result<()> {
@@ -758,6 +726,8 @@ fn at_depth(name: &str, depth: usize, detail: &str) -> Error {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as StdError;
+
     use super::*;
     use crate::config::Source;
     use crate::config::{Host, Protocol, transitive::TransitiveManifest};
@@ -768,6 +738,37 @@ mod tests {
         let raw: Source = toml::from_str(&format!("git = {git:?}\ntransitive = true\n"))
             .expect("git source DTO parses");
         ParsedSource::parse("dep", &raw).expect("git source parses")
+    }
+
+    fn error_chain_has<T>(error: &(dyn StdError + 'static)) -> bool
+    where
+        T: StdError + 'static,
+    {
+        let mut current = Some(error);
+        while let Some(item) = current {
+            if item.is::<T>() {
+                return true;
+            }
+            current = item.source();
+        }
+        false
+    }
+
+    fn error_chain_has_source_variant<F>(error: &(dyn StdError + 'static), predicate: F) -> bool
+    where
+        F: Fn(&crate::source::SourceError) -> bool,
+    {
+        let mut current = Some(error);
+        while let Some(item) = current {
+            if item
+                .downcast_ref::<crate::source::SourceError>()
+                .is_some_and(&predicate)
+            {
+                return true;
+            }
+            current = item.source();
+        }
+        false
     }
 
     fn host_source(host: &str, repo: &str, protocol: Option<&str>) -> ParsedSource {
@@ -1084,197 +1085,6 @@ mod tests {
             out.status.success(),
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    #[test]
-    #[expect(
-        clippy::unwrap_used,
-        reason = "fixture setup fails loudly; git CLI is assumed present"
-    )]
-    fn read_manifest_ignores_a_dep_shipped_phora_lock() {
-        let src = tempfile::TempDir::new().unwrap();
-        let src_path = src.path();
-        crate::store::assert_git_sandboxed(src_path);
-        git(src_path, &["init", "-b", "main", "."]);
-        git(src_path, &["config", "user.email", "t@example.com"]);
-        git(src_path, &["config", "user.name", "T"]);
-
-        std::fs::write(
-            src_path.join("phora.toml"),
-            b"version = 1\n\n[sources.nvim]\ngit = \"https://github.com/dep/nvim.git\"\n",
-        )
-        .unwrap();
-        // A malicious dep ships a self-trusting lock alongside its manifest (mise GHSA-436v-8fw5-4mj8).
-        std::fs::write(
-            src_path.join("phora.lock"),
-            b"version = 2\n\n[[trusted_hooks]]\ndep_instance = \"selftrust\"\nhook_id = \"editor#on_change\"\npreimage = \"blake3:evil\"\napproved_at = \"2026-06-20T00:00:00Z\"\n",
-        )
-        .unwrap();
-        git(src_path, &["add", "-A"]);
-        git(src_path, &["commit", "-m", "dep with self-trusting lock"]);
-
-        let mirror_root = tempfile::TempDir::new().unwrap();
-        let url = src_path.to_string_lossy().into_owned();
-        let mirror = mirror_path(mirror_root.path(), &url);
-        std::fs::create_dir_all(mirror.parent().unwrap()).unwrap();
-        {
-            let _serial = crate::store::guard_git_fork();
-            git(
-                mirror_root.path(),
-                &["clone", "--mirror", &url, mirror.to_str().unwrap()],
-            );
-        }
-        let commit = {
-            let _serial = crate::store::guard_git_fork();
-            let out = std::process::Command::new("git")
-                .args(["-C", mirror.to_str().unwrap(), "rev-parse", "HEAD"])
-                .output()
-                .unwrap();
-            String::from_utf8(out.stdout).unwrap().trim().to_owned()
-        };
-
-        let backend = crate::source::GitBackend::new(mirror_root.path().to_path_buf());
-        let text = read_manifest(&backend, &SourceName::trusted("dep"), &url, &commit)
-            .expect("read_manifest reads the dep's phora.toml from its git tree");
-
-        assert!(
-            text.contains("[sources.nvim]"),
-            "read_manifest must return the dep's phora.toml content, got: {text}"
-        );
-        assert!(
-            !text.contains("trusted_hooks") && !text.contains("blake3:evil"),
-            "ISOLATION: read_manifest must NEVER fold a dep-shipped phora.lock into the manifest \
-             text; a self-trusting dep lock must be entirely ignored, got: {text}"
-        );
-    }
-
-    #[test]
-    #[expect(
-        clippy::unwrap_used,
-        reason = "fixture setup fails loudly; git CLI is assumed present"
-    )]
-    fn read_file_at_reads_only_phora_toml_never_a_dep_shipped_lock() {
-        use crate::source::GitBackend;
-
-        let src = tempfile::TempDir::new().unwrap();
-        let src_path = src.path();
-        crate::store::assert_git_sandboxed(src_path);
-        git(src_path, &["init", "-b", "main", "."]);
-        git(src_path, &["config", "user.email", "t@example.com"]);
-        git(src_path, &["config", "user.name", "T"]);
-
-        std::fs::write(
-            src_path.join("phora.toml"),
-            b"version = 1\n\n[sources.nvim]\ngit = \"https://github.com/dep/nvim.git\"\n",
-        )
-        .unwrap();
-        std::fs::write(
-            src_path.join("phora.lock"),
-            b"version = 2\n\n[[trusted_hooks]]\ndep_instance = \"selftrust\"\nhook_id = \"editor#on_change\"\npreimage = \"blake3:evil\"\napproved_at = \"2026-06-20T00:00:00Z\"\n",
-        )
-        .unwrap();
-        git(src_path, &["add", "-A"]);
-        git(src_path, &["commit", "-m", "dep with self-trusting lock"]);
-
-        let git_dir = tempfile::TempDir::new().unwrap();
-        let url = src_path.to_string_lossy().into_owned();
-        let backend = GitBackend::new(git_dir.path().to_path_buf());
-        backend
-            .fetch(&crate::kernel::SourceName::trusted("dep"), &url)
-            .expect("fetch builds the bare mirror the offline read targets");
-        let commit = backend
-            .resolve(
-                &crate::kernel::SourceName::trusted("dep"),
-                &url,
-                &crate::config::Refspec::Branch("main".to_owned()),
-            )
-            .expect("resolve main to a commit");
-
-        let manifest_bytes = backend
-            .read_file_at(
-                &crate::kernel::SourceName::trusted("dep"),
-                &url,
-                &commit,
-                Path::new("phora.toml"),
-            )
-            .expect("read_file_at returns the dep's phora.toml from the fetched mirror");
-        let text = String::from_utf8(manifest_bytes).expect("phora.toml is utf-8");
-
-        assert!(
-            text.contains("[sources.nvim]"),
-            "read_file_at(phora.toml) must return the dep manifest content, got: {text}"
-        );
-        assert!(
-            !text.contains("trusted_hooks") && !text.contains("blake3:evil"),
-            "ISOLATION: read_manifest refactored onto read_file_at(phora.toml) must NEVER reach a \
-             dep-shipped phora.lock; the self-trusting lock must be unreachable, got: {text}"
-        );
-    }
-
-    #[test]
-    #[expect(
-        clippy::unwrap_used,
-        reason = "fixture setup fails loudly; git CLI is assumed present"
-    )]
-    fn read_manifest_says_no_phora_toml_only_when_genuinely_absent() {
-        use crate::source::GitBackend;
-
-        let src = tempfile::TempDir::new().unwrap();
-        let src_path = src.path();
-        crate::store::assert_git_sandboxed(src_path);
-        git(src_path, &["init", "-b", "main", "."]);
-        git(src_path, &["config", "user.email", "t@example.com"]);
-        git(src_path, &["config", "user.name", "T"]);
-        std::fs::write(src_path.join("README.md"), b"hi\n").unwrap();
-        git(src_path, &["add", "-A"]);
-        git(src_path, &["commit", "-m", "no manifest"]);
-
-        let git_dir = tempfile::TempDir::new().unwrap();
-        let url = src_path.to_string_lossy().into_owned();
-        let backend = GitBackend::new(git_dir.path().to_path_buf());
-        let name = SourceName::trusted("dep");
-        backend.fetch(&name, &url).unwrap();
-        let commit = backend
-            .resolve(
-                &name,
-                &url,
-                &crate::config::Refspec::Branch("main".to_owned()),
-            )
-            .unwrap();
-
-        let absent = read_manifest(&backend, &name, &url, &commit)
-            .expect_err("a dep without phora.toml must error");
-        assert!(
-            absent.to_string().contains("no phora.toml"),
-            "a genuinely-absent phora.toml must keep the 'no phora.toml' diagnostic, got: {absent}"
-        );
-    }
-
-    #[test]
-    #[expect(
-        clippy::unwrap_used,
-        reason = "fixture setup fails loudly; git CLI is assumed present"
-    )]
-    fn read_manifest_propagates_underlying_failure_instead_of_no_phora_toml() {
-        use crate::source::GitBackend;
-
-        let git_dir = tempfile::TempDir::new().unwrap();
-        let backend = GitBackend::new(git_dir.path().to_path_buf());
-        let name = SourceName::trusted("dep");
-
-        let err = read_manifest(
-            &backend,
-            &name,
-            "https://github.com/never/fetched.git",
-            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
-        )
-        .expect_err("reading from a mirror that was never fetched must error");
-
-        assert!(
-            !err.to_string().contains("no phora.toml"),
-            "a mirror-open/git failure must NOT be masked as 'no phora.toml'; the underlying error \
-             must surface, got: {err}"
         );
     }
 
@@ -1629,6 +1439,269 @@ mod tests {
         ) -> std::result::Result<String, crate::source::SourceError> {
             self.inner
                 .compute_digest(source, url, commit, root, include, exclude)
+        }
+    }
+
+    struct SourceFailureBackend;
+
+    impl SourceBackend for SourceFailureBackend {
+        fn fetch(
+            &self,
+            _source: &SourceName,
+            _url: &str,
+        ) -> std::result::Result<(), crate::source::SourceError> {
+            Err(crate::source::SourceError::Source(
+                "backend sentinel".to_owned(),
+            ))
+        }
+
+        fn read_file_at(
+            &self,
+            _source: &SourceName,
+            _url: &str,
+            _commit: &str,
+            _path: &Path,
+        ) -> std::result::Result<Vec<u8>, crate::source::SourceError> {
+            unreachable!("fetch fails before the manifest read")
+        }
+
+        fn resolve(
+            &self,
+            _source: &SourceName,
+            _url: &str,
+            _refspec: &Refspec,
+        ) -> std::result::Result<String, crate::source::SourceError> {
+            unreachable!("fetch fails before resolution")
+        }
+
+        fn commit_time(
+            &self,
+            _source: &SourceName,
+            _url: &str,
+            _commit: &str,
+        ) -> std::result::Result<u64, crate::source::SourceError> {
+            unreachable!("manifest acquisition does not read commit time")
+        }
+
+        fn compute_digest(
+            &self,
+            _source: &SourceName,
+            _url: &str,
+            _commit: &str,
+            _root: Option<&Path>,
+            _include: &[String],
+            _exclude: &[String],
+        ) -> std::result::Result<String, crate::source::SourceError> {
+            unreachable!("manifest acquisition does not compute a digest")
+        }
+    }
+
+    #[test]
+    fn sync_contextualizes_source_manifest_error_once() {
+        let remote = "https://example.test/dep.git";
+        let error = fetch_manifest(
+            "dep",
+            &git_source(remote),
+            remote,
+            &SourceFailureBackend,
+            2,
+            &FrozenGate {
+                frozen: false,
+                lock: None,
+            },
+        )
+        .expect_err("the source backend failure must cross the sync boundary");
+        let diagnostic = error.to_string();
+        assert_eq!(
+            diagnostic,
+            "config error: transitive source `dep` at depth 2: source error: backend sentinel",
+            "sync must add its depth/name context exactly once while preserving the existing CLI diagnostic"
+        );
+        assert_eq!(diagnostic.matches("backend sentinel").count(), 1);
+        assert_eq!(
+            diagnostic
+                .matches("transitive source `dep` at depth 2")
+                .count(),
+            1
+        );
+        assert!(
+            error_chain_has::<crate::source::SourceError>(&error),
+            "sync contextualization must retain the concrete SourceError in the aggregate chain: {diagnostic}"
+        );
+        assert!(
+            error_chain_has_source_variant(&error, |source| matches!(
+                source,
+                crate::source::SourceError::Source(message) if message == "backend sentinel"
+            )),
+            "sync must preserve the backend's original SourceError variant: {diagnostic}"
+        );
+    }
+
+    enum SyncManifestRead {
+        Bytes(Vec<u8>),
+        Absent,
+        BackendFailure,
+    }
+
+    struct SyncManifestBackend(SyncManifestRead);
+
+    impl SourceBackend for SyncManifestBackend {
+        fn fetch(
+            &self,
+            _source: &SourceName,
+            _url: &str,
+        ) -> std::result::Result<(), crate::source::SourceError> {
+            Ok(())
+        }
+
+        fn read_file_at(
+            &self,
+            source: &SourceName,
+            _url: &str,
+            commit: &str,
+            path: &Path,
+        ) -> std::result::Result<Vec<u8>, crate::source::SourceError> {
+            match &self.0 {
+                SyncManifestRead::Bytes(bytes) => Ok(bytes.clone()),
+                SyncManifestRead::Absent => Err(crate::source::SourceError::FileAbsent {
+                    source_name: source.as_str().to_owned(),
+                    commit: commit.to_owned(),
+                    path: path.to_path_buf(),
+                }),
+                SyncManifestRead::BackendFailure => Err(crate::source::SourceError::Source(
+                    "backend sentinel".to_owned(),
+                )),
+            }
+        }
+
+        fn resolve(
+            &self,
+            _source: &SourceName,
+            _url: &str,
+            _refspec: &Refspec,
+        ) -> std::result::Result<String, crate::source::SourceError> {
+            Ok("a".repeat(40))
+        }
+
+        fn commit_time(
+            &self,
+            _source: &SourceName,
+            _url: &str,
+            _commit: &str,
+        ) -> std::result::Result<u64, crate::source::SourceError> {
+            unreachable!("manifest acquisition does not read commit time")
+        }
+
+        fn compute_digest(
+            &self,
+            _source: &SourceName,
+            _url: &str,
+            _commit: &str,
+            _root: Option<&Path>,
+            _include: &[String],
+            _exclude: &[String],
+        ) -> std::result::Result<String, crate::source::SourceError> {
+            unreachable!("manifest acquisition does not compute a digest")
+        }
+    }
+
+    fn sync_manifest_error(read: SyncManifestRead) -> Error {
+        let remote = "https://example.test/dep.git";
+        fetch_manifest(
+            "dep",
+            &git_source(remote),
+            remote,
+            &SyncManifestBackend(read),
+            2,
+            &FrozenGate {
+                frozen: false,
+                lock: None,
+            },
+        )
+        .expect_err("the malformed source manifest must cross the sync boundary")
+    }
+
+    enum ExpectedStructuredCause {
+        Missing,
+        Utf8,
+        Parse,
+        Backend,
+    }
+
+    #[test]
+    fn sync_preserves_source_manifest_failure_diagnostics() {
+        for (read, expected, cause) in [
+            (
+                SyncManifestRead::Absent,
+                "dependency at `https://example.test/dep.git` has no phora.toml",
+                ExpectedStructuredCause::Missing,
+            ),
+            (
+                SyncManifestRead::Bytes(vec![0xff]),
+                "phora.toml at `https://example.test/dep.git` is not utf-8",
+                ExpectedStructuredCause::Utf8,
+            ),
+            (
+                SyncManifestRead::Bytes(b"version = [\n".to_vec()),
+                "unclosed array",
+                ExpectedStructuredCause::Parse,
+            ),
+            (
+                SyncManifestRead::BackendFailure,
+                "backend sentinel",
+                ExpectedStructuredCause::Backend,
+            ),
+        ] {
+            let error = sync_manifest_error(read);
+            let diagnostic = error.to_string();
+            assert!(
+                diagnostic.contains(expected),
+                "sync lost the source-owned diagnostic `{expected}`: {diagnostic}"
+            );
+            assert_eq!(
+                diagnostic
+                    .matches("transitive source `dep` at depth 2")
+                    .count(),
+                1,
+                "sync must contextualize the SourceError exactly once: {diagnostic}"
+            );
+            assert_eq!(
+                diagnostic.matches(expected).count(),
+                1,
+                "the source diagnostic must not be duplicated or stringified repeatedly: {diagnostic}"
+            );
+            assert!(
+                error_chain_has::<crate::source::SourceError>(&error),
+                "sync must retain the concrete SourceError in the aggregate chain: {diagnostic}"
+            );
+            let cause_preserved = match cause {
+                ExpectedStructuredCause::Missing => {
+                    error_chain_has_source_variant(&error, |source| {
+                        matches!(
+                            source,
+                            crate::source::SourceError::FileAbsent { path, .. }
+                                if path == Path::new("phora.toml")
+                        )
+                    })
+                }
+                ExpectedStructuredCause::Utf8 => {
+                    error_chain_has::<std::string::FromUtf8Error>(&error)
+                }
+                ExpectedStructuredCause::Parse => error_chain_has::<toml::de::Error>(&error),
+                ExpectedStructuredCause::Backend => {
+                    error_chain_has_source_variant(&error, |source| {
+                        matches!(
+                            source,
+                            crate::source::SourceError::Source(message)
+                                if message == "backend sentinel"
+                        )
+                    })
+                }
+            };
+            assert!(
+                cause_preserved,
+                "sync must preserve the structured source cause for `{expected}`: {diagnostic}"
+            );
         }
     }
 
