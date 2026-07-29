@@ -2,34 +2,27 @@ use std::collections::BTreeMap;
 
 use crate::error::{Error, Result};
 use crate::projection::model::Projection;
-use crate::store::{ArtifactKey, Registry, RegistryRecord};
 use crate::sync::inspect::inspect;
 use crate::sync::model::{
     ManagedArtifact, ManagedCondition, ObservedArtifact, ObservedEntry, ObservedProjectState,
 };
-use crate::sync::state::StateStore;
+use crate::sync::state::{ArtifactKey, ArtifactRecord, StateStore};
 
 use super::target::{self, ArtifactEntry, TargetRun};
-use super::{DeployAll, StageSource, target_run};
+use super::{DeployAll, target_run};
 
 type ObservationKey = (String, String, String);
 
 pub(super) fn observe_workspace<R>(
     ctx: &DeployAll<'_, R>,
     projection: &Projection,
-) -> Result<ObservedProjectState<RegistryRecord>>
+) -> Result<ObservedProjectState<ArtifactRecord>>
 where
-    R: Registry + StateStore,
+    R: StateStore,
 {
-    let readonly_registry;
-    let registry: &dyn Registry = if ctx.input.lockless() {
-        readonly_registry = crate::store::FrozenReadOnlyRegistry::new(ctx.registry);
-        &readonly_registry
-    } else {
-        ctx.registry
-    };
+    let registry: &dyn StateStore = ctx.registry;
     let store: &dyn StateStore = ctx.registry;
-    let mut observations: BTreeMap<ObservationKey, ObservedEntry<RegistryRecord>> = BTreeMap::new();
+    let mut observations: BTreeMap<ObservationKey, ObservedEntry<ArtifactRecord>> = BTreeMap::new();
     for (target_name, target) in &ctx.config.targets {
         let Some(target_projection) = projection
             .targets
@@ -40,7 +33,7 @@ where
         };
         let run = target_run(ctx, target_name, target);
         target::walk_projection_target(run, target_projection, registry, false, |run, entry| {
-            let observation = observe_entry(run, entry, ctx.backend, registry, store)?;
+            let observation = observe_entry(run, entry, registry, store)?;
             let published_key = entry.item.materialization.published_key().to_owned();
             let triplet = (
                 run.target_name.to_owned(),
@@ -62,7 +55,7 @@ where
             Ok(false)
         })?;
     }
-    for record in registry_only_records(ctx.input.prune(), || Ok(registry.list_all()?))? {
+    for record in registry_only_records(ctx.input.prune(), || Ok(registry.all_artifacts()?))? {
         let triplet = (
             record.key.target.clone(),
             record.key.source.clone(),
@@ -91,8 +84,8 @@ where
 
 fn registry_only_records(
     remove_orphans: bool,
-    list_all: impl FnOnce() -> Result<Vec<RegistryRecord>>,
-) -> Result<Vec<RegistryRecord>> {
+    list_all: impl FnOnce() -> Result<Vec<ArtifactRecord>>,
+) -> Result<Vec<ArtifactRecord>> {
     if remove_orphans {
         list_all()
     } else {
@@ -103,16 +96,15 @@ fn registry_only_records(
 fn observe_entry(
     run: &TargetRun<'_>,
     entry: &ArtifactEntry<'_>,
-    backend: &dyn StageSource,
-    registry: &dyn Registry,
+    registry: &dyn StateStore,
     store: &dyn StateStore,
-) -> Result<ObservedArtifact<RegistryRecord>> {
+) -> Result<ObservedArtifact<ArtifactRecord>> {
     let key = ArtifactKey {
         target: run.target_name.to_owned(),
         source: entry.identity.to_owned(),
         artifact: entry.item.materialization.published_key().to_owned(),
     };
-    let vars_digest = target::expected_vars_digest(entry, backend, registry, &key, run.vars)?;
+    let vars_digest = target::expected_vars_digest(entry, registry, &key, run.vars)?;
     let observation = inspect(
         entry.artifact_dst,
         entry.identity,

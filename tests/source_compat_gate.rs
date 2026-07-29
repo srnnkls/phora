@@ -191,12 +191,18 @@ fn trait_method_names(stripped: &str, trait_name: &str) -> Option<BTreeSet<Strin
     Some(names)
 }
 
-fn trait_fn_signature(stripped: &str, trait_name: &str, fn_name: &str) -> Option<String> {
-    let start = stripped.find(&format!("pub trait {trait_name}"))?;
-    let body = balanced_body(&stripped[start..])?;
-    let needle = format!("fn {fn_name}");
-    let bytes = body.as_bytes();
-    body.match_indices(&needle).find_map(|(i, _)| {
+fn top_level_public_fn_signature(stripped: &str, fn_name: &str) -> Option<String> {
+    let needle = format!("pub fn {fn_name}");
+    let bytes = stripped.as_bytes();
+    stripped.match_indices(&needle).find_map(|(i, _)| {
+        let depth = bytes[..i].iter().fold(0i32, |depth, byte| match byte {
+            b'{' => depth + 1,
+            b'}' => depth - 1,
+            _ => depth,
+        });
+        if depth != 0 {
+            return None;
+        }
         let after = i + needle.len();
         let after_ok = bytes
             .get(after)
@@ -204,7 +210,7 @@ fn trait_fn_signature(stripped: &str, trait_name: &str, fn_name: &str) -> Option
         if !after_ok {
             return None;
         }
-        let rest = &body[i..];
+        let rest = &stripped[i..];
         let end = rest.find(['{', ';'])?;
         Some(rest[..end].to_string())
     })
@@ -323,14 +329,6 @@ const LEGACY_METHODS: &[&str] = &[
     "compute_digest",
 ];
 
-const REMOVAL_CANDIDATES: &[&str] = &[
-    "fetch",
-    "mirror_ready",
-    "read_file_at",
-    "list_tree_at",
-    "export_artifact",
-];
-
 fn source_files() -> Vec<(String, String)> {
     prod_src_files()
         .into_iter()
@@ -344,12 +342,6 @@ fn find_trait_scan(trait_name: &str) -> (String, String) {
         .map(|(rel, content)| (rel, scan(&content)))
         .find(|(_, scanned)| scanned.contains(&format!("pub trait {trait_name}")))
         .unwrap_or_else(|| panic!("no file under src/source/ declares `pub trait {trait_name}`"))
-}
-
-fn source_backend_methods() -> BTreeSet<String> {
-    let (rel, scanned) = find_trait_scan("SourceBackend");
-    trait_method_names(&scanned, "SourceBackend")
-        .unwrap_or_else(|| panic!("src/{rel}: SourceBackend trait body must parse"))
 }
 
 fn find_migration_table() -> (&'static str, BTreeMap<String, &'static str>) {
@@ -383,30 +375,63 @@ fn find_migration_table() -> (&'static str, BTreeMap<String, &'static str>) {
 }
 
 #[test]
-fn gate_source_store_declares_digest_snapshot_over_explicit_leaves() {
+fn gate_source_store_declares_the_exact_final_operation_set() {
     let (rel, scanned) = find_trait_scan("SourceStore");
     let methods = trait_method_names(&scanned, "SourceStore")
         .unwrap_or_else(|| panic!("src/{rel}: SourceStore trait body must parse"));
-    assert!(
-        methods.contains("digest_snapshot"),
-        "src/{rel}: SourceStore must declare `fn digest_snapshot` — the additive T013 digest \
-         over a resolved snapshot plus an EXPLICIT leaf set; declared methods: {methods:?}"
+    let expected: BTreeSet<String> = ["resolve", "inventory", "read", "list_directory"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        methods, expected,
+        "src/{rel}: SourceStore's authoritative final operation set is exactly resolve, \
+         inventory, read, and list_directory; digest_snapshot is a source-owned free \
+         operation, not a trait method"
     );
-    let signature = trait_fn_signature(&scanned, "SourceStore", "digest_snapshot")
-        .unwrap_or_else(|| panic!("src/{rel}: digest_snapshot signature must parse"));
-    assert!(
-        references_token(&signature, "leaves"),
-        "digest_snapshot must take the leaf set as an explicit `leaves` parameter; \
-         signature: {signature}"
-    );
+}
+
+#[test]
+fn gate_digest_snapshot_is_a_source_owned_public_free_operation() {
+    let (rel, signature) = source_files()
+        .into_iter()
+        .find_map(|(rel, content)| {
+            top_level_public_fn_signature(&scan(&content), "digest_snapshot")
+                .map(|signature| (rel, signature))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "src/source must export a top-level `pub fn digest_snapshot(store, snapshot, \
+                 leaves)`; a SourceStore trait method does not satisfy the final source contract"
+            )
+        });
+    for required in [
+        "store",
+        "snapshot",
+        "leaves",
+        "SourceStore",
+        "SnapshotId",
+        "SourcePath",
+    ] {
+        assert!(
+            references_token(&signature, required),
+            "src/{rel}: public free digest_snapshot must name its store, snapshot, and explicit \
+             leaf inputs using the source contract types; missing `{required}` in: {signature}"
+        );
+    }
     for banned in ["OfferSelection", "include", "exclude"] {
         assert!(
             !references_token(&signature, banned),
-            "digest_snapshot must NEVER accept selection (`{banned}`): the offer selection \
-             stays a projection concern, the store digests exactly the leaves it is handed \
-             (INV-2); signature: {signature}"
+            "src/{rel}: digest_snapshot must NEVER accept selection (`{banned}`): projection \
+             chooses leaves and the source operation digests exactly those leaves (INV-2); \
+             signature: {signature}"
         );
     }
+    assert!(
+        signature.starts_with("pub fn digest_snapshot"),
+        "src/{rel}: digest_snapshot must be a public top-level source operation; \
+         signature: {signature}"
+    );
 }
 
 #[test]
@@ -420,67 +445,49 @@ fn gate_migration_table_classifies_every_legacy_method() {
 }
 
 #[test]
-fn gate_migration_table_matches_the_trait_surface() {
-    let (name, rows) = find_migration_table();
-    let on_trait = source_backend_methods();
-    for (method, disposition) in &rows {
-        if *disposition == "removed" {
-            assert!(
-                REMOVAL_CANDIDATES.contains(&method.as_str()),
-                "{name}: `{method}` is marked removed but only readiness/fetch/routing/\
-                 bypass may be removed by T013 ({REMOVAL_CANDIDATES:?}); every other \
-                 method is delegating-retained until its consumers migrate (INV-2)"
-            );
-            assert!(
-                !on_trait.contains(method),
-                "{name}: the table marks `{method}` removed, yet SourceBackend still \
-                 declares it — the table must describe the real trait surface"
-            );
-        } else {
-            assert!(
-                on_trait.contains(method),
-                "{name}: the table marks `{method}` retained/delegating, yet SourceBackend \
-                 no longer declares it — a removed method must be marked removed"
-            );
-        }
-    }
-}
-
-#[test]
-fn gate_removed_methods_have_zero_production_callers() {
-    let on_trait = source_backend_methods();
-    let removed: Vec<&str> = LEGACY_METHODS
-        .iter()
-        .copied()
-        .filter(|m| !on_trait.contains(*m))
-        .collect();
-    for method in removed {
-        let callers: Vec<String> = prod_src_files()
-            .into_iter()
-            .filter(|(rel, _)| !rel.starts_with("source/"))
-            .filter(|(_, content)| calls_method(&scan(content), method))
-            .map(|(rel, _)| format!("src/{rel}"))
-            .collect();
-        assert!(
-            callers.is_empty(),
-            "`{method}` was removed from SourceBackend but production code outside \
-             src/source/ still calls it — T013 removes a method only after repo-wide caller \
-             checks show zero consumers; callers: {callers:?}"
-        );
-    }
-}
-
-#[test]
-fn gate_source_backend_surface_never_rewidens() {
-    let on_trait = source_backend_methods();
-    let widened: Vec<&String> = on_trait
-        .iter()
-        .filter(|m| !LEGACY_METHODS.contains(&m.as_str()))
+fn gate_final_source_capability_replaces_the_legacy_trait() {
+    let source_backend_sites: Vec<String> = source_files()
+        .into_iter()
+        .filter(|(_, content)| references_token(&scan(content), "SourceBackend"))
+        .map(|(rel, _)| format!("src/{rel}"))
         .collect();
     assert!(
-        widened.is_empty(),
-        "SourceBackend is the legacy compat port and may only SHRINK: new capability \
-         (digest_snapshot and friends) belongs on SourceStore; unexpected methods: {widened:?}"
+        source_backend_sites.is_empty(),
+        "T030 must remove SourceBackend from the live source capability tree; found: \
+         {source_backend_sites:?}"
+    );
+    let _ = find_trait_scan("SourceStore");
+}
+
+#[test]
+fn gate_source_backend_has_zero_production_callers() {
+    let callers: Vec<String> = prod_src_files()
+        .into_iter()
+        .filter(|(_, content)| references_token(&scan(content), "SourceBackend"))
+        .map(|(rel, _)| format!("src/{rel}"))
+        .collect();
+    assert!(
+        callers.is_empty(),
+        "T030 must leave zero live SourceBackend imports, bounds, impls, UFCS calls, or \
+         consumers anywhere in production; found: {callers:?}"
+    );
+}
+
+#[test]
+fn gate_source_store_surface_excludes_legacy_operations() {
+    let (rel, scanned) = find_trait_scan("SourceStore");
+    let methods = trait_method_names(&scanned, "SourceStore")
+        .unwrap_or_else(|| panic!("src/{rel}: SourceStore trait body must parse"));
+    let legacy_operations: Vec<&str> = LEGACY_METHODS
+        .iter()
+        .copied()
+        .filter(|method| *method != "resolve" && methods.contains(*method))
+        .collect();
+    assert!(
+        legacy_operations.is_empty(),
+        "SourceStore is the final source capability and must not absorb SourceBackend's \
+         readiness/routing/metadata/export operations; found in src/{rel}: \
+         {legacy_operations:?}"
     );
 }
 
@@ -625,20 +632,30 @@ fn helper_calls_method_sees_calls_but_not_definitions_or_prefixes() {
 }
 
 #[test]
-fn helper_trait_fn_signature_stops_before_the_default_body() {
+fn helper_top_level_public_fn_signature_rejects_trait_methods_and_stops_before_the_body() {
     let stripped = strip(
         "pub trait SourceStore {\n    fn read(&self, p: &SourcePath) -> Result<SourceEntry>;\n\
          \n    fn digest_snapshot(&self, source: &ResolvedSource, leaves: &[SourcePath]) \
-         -> Result<String> {\n        unimplemented!()\n    }\n}",
+         -> Result<String> {\n        unimplemented!()\n    }\n}\n\
+         pub fn digest_snapshot(store: &dyn SourceStore, snapshot: &SnapshotId, \
+         leaves: &[SourcePath]) -> Result<String> {\n    unimplemented!()\n}",
     );
-    let signature = trait_fn_signature(&stripped, "SourceStore", "digest_snapshot")
-        .expect("signature extracted");
+    let signature =
+        top_level_public_fn_signature(&stripped, "digest_snapshot").expect("signature extracted");
     assert!(
-        references_token(&signature, "leaves") && !signature.contains("unimplemented"),
-        "the signature must end before the default body, got: {signature}"
+        references_token(&signature, "store")
+            && references_token(&signature, "snapshot")
+            && references_token(&signature, "leaves")
+            && !signature.contains("unimplemented"),
+        "the top-level public signature must be selected over the trait method and end before \
+         its body, got: {signature}"
     );
     assert!(
-        trait_fn_signature(&stripped, "SourceStore", "digest").is_none(),
-        "a method-name prefix must not match a longer-named method"
+        top_level_public_fn_signature(
+            &strip("pub trait SourceStore { fn digest_snapshot(&self, leaves: &[SourcePath]); }"),
+            "digest_snapshot"
+        )
+        .is_none(),
+        "a SourceStore trait method must not satisfy the public free-operation scan"
     );
 }

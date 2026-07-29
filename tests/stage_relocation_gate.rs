@@ -323,9 +323,9 @@ const OLD_PORT_TOKENS: &[&str] = &[
     "ExportResult",
     "ManifestFile",
     "SourceBackend",
-    "Registry",
+    "StateStore",
     "Journal",
-    "RegistryRecord",
+    "ArtifactRecord",
     "StageBridge",
 ];
 

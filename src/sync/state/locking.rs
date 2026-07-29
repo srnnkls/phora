@@ -1,12 +1,12 @@
 use std::path::Path;
 
-use super::file::{FileRegistry, StoreError};
+use super::file::{FileStateStore, StateError};
 
-type Result<T> = std::result::Result<T, StoreError>;
+type Result<T> = std::result::Result<T, StateError>;
 
 /// RAII guard holding an exclusive OS lock on `state.lock`; released on drop.
 #[derive(Debug)]
-pub struct StateLockGuard {
+pub struct StateLock {
     _file: std::fs::File,
 }
 
@@ -39,11 +39,11 @@ pub fn assert_git_sandboxed(cwd: &Path) {
     );
 }
 
-impl FileRegistry {
-    pub fn lock_exclusive(&self) -> Result<StateLockGuard> {
-        let locks_dir = self.state_root.join("locks");
-        if let Err(e) = std::fs::create_dir_all(&locks_dir) {
-            return Err(self.lock_io_error("create locks dir", &locks_dir, &e));
+impl FileStateStore {
+    pub(super) fn acquire_state_lock(&self) -> Result<StateLock> {
+        let locks_dir = &self.journal_root;
+        if let Err(e) = std::fs::create_dir_all(locks_dir) {
+            return Err(self.lock_io_error("create locks dir", locks_dir, &e));
         }
         let lock_path = locks_dir.join("state.lock");
         let file = match std::fs::OpenOptions::new()
@@ -57,18 +57,18 @@ impl FileRegistry {
             Err(e) => return Err(self.lock_io_error("open lock file", &lock_path, &e)),
         };
         match file.try_lock() {
-            Ok(()) => Ok(StateLockGuard { _file: file }),
-            Err(std::fs::TryLockError::WouldBlock) => Err(StoreError::Lock(
+            Ok(()) => Ok(StateLock { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(StateError::Lock(
                 "another phora process is running for this project (state.lock held)".to_owned(),
             )),
-            Err(std::fs::TryLockError::Error(e)) => Err(StoreError::Registry(format!(
+            Err(std::fs::TryLockError::Error(e)) => Err(StateError::StateStore(format!(
                 "acquire lock on {}: {e}",
                 lock_path.display()
             ))),
         }
     }
 
-    fn lock_io_error(&self, what: &str, path: &Path, e: &std::io::Error) -> StoreError {
+    fn lock_io_error(&self, what: &str, path: &Path, e: &std::io::Error) -> StateError {
         classify_io_error(&self.state_root, what, path, e)
     }
 
@@ -169,17 +169,17 @@ fn statfs_fstype(_path: &Path) -> Option<String> {
     None
 }
 
-fn classify_io_error(root: &Path, what: &str, path: &Path, e: &std::io::Error) -> StoreError {
+fn classify_io_error(root: &Path, what: &str, path: &Path, e: &std::io::Error) -> StateError {
     if matches!(
         e.kind(),
         std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
     ) {
-        StoreError::ReadOnly(format!(
+        StateError::ReadOnly(format!(
             "state root {} is read-only ({what} {}: {e})",
             root.display(),
             path.display()
         ))
     } else {
-        StoreError::Registry(format!("{what} {}: {e}", path.display()))
+        StateError::StateStore(format!("{what} {}: {e}", path.display()))
     }
 }

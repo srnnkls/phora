@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::lock::Lock;
-use crate::store::{ArtifactKey, Registry};
+use crate::sync::state::{ArtifactKey, StateStore};
 
 /// Why a deployed file failed verification against its registry record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,7 +47,7 @@ impl VerifyReport {
 
 pub fn verify(
     config: &Config,
-    registry: &dyn Registry,
+    registry: &dyn StateStore,
     lock: Option<&Lock>,
 ) -> Result<VerifyReport> {
     Ok(VerifyReport {
@@ -73,10 +73,10 @@ fn untrusted_hook_findings(lock: Option<&Lock>) -> Vec<UntrustedHookFinding> {
         .collect()
 }
 
-fn verify_mismatches(config: &Config, registry: &dyn Registry) -> Result<Vec<VerifyMismatch>> {
+fn verify_mismatches(config: &Config, registry: &dyn StateStore) -> Result<Vec<VerifyMismatch>> {
     let mut mismatches = Vec::new();
-    let records = registry.list_all()?;
-    let ejected = crate::store::ejected_index(registry, &records)?;
+    let records = registry.all_artifacts()?;
+    let ejected = crate::sync::state::ejected_index(registry, &records)?;
     for record in records {
         if record.linked {
             continue;
@@ -125,12 +125,12 @@ fn verify_mismatches(config: &Config, registry: &dyn Registry) -> Result<Vec<Ver
 mod tests {
     use super::*;
     use crate::lock::{CandidateHookRecord, LOCK_SCHEMA_VERSION, Lock, TrustedHook};
-    use crate::store::FileRegistry;
+    use crate::sync::state::FileStateStore;
     use tempfile::TempDir;
 
-    fn empty_registry() -> (TempDir, FileRegistry) {
+    fn empty_registry() -> (TempDir, FileStateStore) {
         let dir = TempDir::new().expect("temp state root");
-        let reg = FileRegistry::open(dir.path().to_path_buf()).expect("open registry");
+        let reg = FileStateStore::open(dir.path().to_path_buf()).expect("open registry");
         (dir, reg)
     }
 

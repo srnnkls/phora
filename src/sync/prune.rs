@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{Config, LayoutConfig, LayoutKind};
 use crate::error::{Error, Result};
-use crate::store::{Registry, RegistryRecord};
+use crate::sync::state::{ArtifactRecord, StateStore};
 
 use super::confine::{ProtectedPathSet, confine_destination};
 use super::{persisted_manifest_relative_path, remove_orphan_path};
@@ -54,7 +54,7 @@ fn overlaps_any_live_path(path: &Path, live: &LivePathsBySource) -> bool {
     live.values().flatten().any(|(_, dest)| touches(path, dest))
 }
 
-fn reconstruct_layout(record: &RegistryRecord) -> Option<LayoutConfig> {
+fn reconstruct_layout(record: &ArtifactRecord) -> Option<LayoutConfig> {
     let kind = LayoutKind::from_record_label(&record.layout)?;
     let separator = match kind {
         LayoutKind::Prefixed => record.layout_separator.clone()?,
@@ -64,16 +64,16 @@ fn reconstruct_layout(record: &RegistryRecord) -> Option<LayoutConfig> {
 }
 
 #[must_use]
-pub(crate) fn is_orphan(config: &Config, record: &RegistryRecord) -> bool {
+pub(crate) fn is_orphan(config: &Config, record: &ArtifactRecord) -> bool {
     !config.targets.contains_key(&record.key.target)
 }
 
 pub(crate) fn orphan_records(
     config: &Config,
-    registry: &dyn Registry,
-) -> Result<Vec<RegistryRecord>> {
-    let mut orphans: Vec<RegistryRecord> = registry
-        .list_all()?
+    registry: &dyn StateStore,
+) -> Result<Vec<ArtifactRecord>> {
+    let mut orphans: Vec<ArtifactRecord> = registry
+        .all_artifacts()?
         .into_iter()
         .filter(|record| is_orphan(config, record))
         .collect();
@@ -89,7 +89,7 @@ pub(crate) fn orphan_records(
 
 /// `None` rather than a guessed path whenever the path cannot be reconstructed exactly: legacy record without `deploy_root`, unrecognized layout label, or `Prefixed` without its persisted separator.
 #[must_use]
-pub(crate) fn orphan_artifact_path(record: &RegistryRecord) -> Option<PathBuf> {
+pub(crate) fn orphan_artifact_path(record: &ArtifactRecord) -> Option<PathBuf> {
     let root = record.deploy_root.as_deref()?;
     let layout = reconstruct_layout(record)?;
     Some(Path::new(root).join(layout.artifact_path(&record.key.source, &record.key.artifact)))
@@ -129,30 +129,10 @@ pub(super) fn expected_live_paths(projection: &Projection, config: &Config) -> E
 }
 
 #[cfg(test)]
-fn refuse_readonly_prune(
-    registry: &dyn Registry,
-    records: &[RegistryRecord],
-    expected: &ExpectedByBinding,
-) -> Result<()> {
-    let has_pending = records.iter().any(|record| {
-        !is_still_expected(
-            expected,
-            &record.key.target,
-            &record.key.source,
-            &record.key.artifact,
-        )
-    });
-    if registry.refuses_writes() && has_pending {
-        return Err(registry.readonly_error().into());
-    }
-    Ok(())
-}
-
-#[cfg(test)]
 pub(super) fn prune_projected(
     projection: &Projection,
     config: &Config,
-    registry: &dyn Registry,
+    registry: &dyn StateStore,
     protected: &ProtectedPathSet,
 ) -> Result<()> {
     let mut expected: ExpectedByBinding = BTreeMap::new();
@@ -179,8 +159,7 @@ pub(super) fn prune_projected(
         }
     }
 
-    let records = registry.list_all()?;
-    refuse_readonly_prune(registry, &records, &expected)?;
+    let records = registry.all_artifacts()?;
 
     for record in records {
         if is_still_expected(
@@ -239,17 +218,17 @@ pub(super) fn prune_projected(
                 None => diagnose_unreconstructable_orphan(&record),
             }
         }
-        registry.remove(&record.key)?;
+        registry.remove_artifact(&record.key)?;
     }
     Ok(())
 }
 
 pub(super) fn apply_reconciled_removals(
     changes: &[SyncChange],
-    observed: &ObservedProjectState<RegistryRecord>,
+    observed: &ObservedProjectState<ArtifactRecord>,
     projection: &Projection,
     config: &Config,
-    registry: &dyn Registry,
+    registry: &dyn StateStore,
     protected: &ProtectedPathSet,
     events: &mut SyncEvents,
 ) -> Result<()> {
@@ -265,11 +244,7 @@ pub(super) fn apply_reconciled_removals(
             _ => None,
         })
         .collect();
-    if registry.refuses_writes() && !removals.is_empty() {
-        return Err(registry.readonly_error().into());
-    }
-
-    let records: BTreeMap<(&str, &str, &str), &RegistryRecord> = observed
+    let records: BTreeMap<(&str, &str, &str), &ArtifactRecord> = observed
         .artifacts
         .iter()
         .filter_map(|entry| match &entry.observation {
@@ -328,9 +303,9 @@ fn live_paths_by_source(projection: &Projection, config: &Config) -> LivePathsBy
 }
 
 fn remove_reconciled_record(
-    record: &RegistryRecord,
+    record: &ArtifactRecord,
     config: &Config,
-    registry: &dyn Registry,
+    registry: &dyn StateStore,
     protected: &ProtectedPathSet,
     live_paths: &LivePathsBySource,
     events: &mut SyncEvents,
@@ -388,7 +363,7 @@ fn remove_reconciled_record(
                     layout: record.layout.clone(),
                 });
             }
-            registry.remove(&record.key)?;
+            registry.remove_artifact(&record.key)?;
             return Ok(true);
         };
         if super::target::is_composed_target(&record.key.target) {
@@ -409,17 +384,17 @@ fn remove_reconciled_record(
                 .map_err(|error| Error::Sync(format!("prune {}: {error}", path.display())))?;
         }
     }
-    registry.remove(&record.key)?;
+    registry.remove_artifact(&record.key)?;
     Ok(true)
 }
 
 fn prune_stale_manifest_children(
     artifact_root: &Path,
-    record: &RegistryRecord,
+    record: &ArtifactRecord,
     live_paths: &LivePathsBySource,
     target: &str,
 ) -> Result<()> {
-    if record.linked || record.kind != crate::store::RecordKind::Dir {
+    if record.linked || record.kind != crate::sync::state::RecordKind::Dir {
         return Ok(());
     }
     let root_metadata = match std::fs::symlink_metadata(artifact_root) {
@@ -520,7 +495,7 @@ fn has_symlink_ancestor(artifact_root: &Path, path: &Path) -> Result<bool> {
 
 #[cfg(test)]
 fn keep_orphan(
-    record: &RegistryRecord,
+    record: &ArtifactRecord,
     path: &Path,
     live_paths: &LivePathsBySource,
 ) -> Result<bool> {
@@ -538,17 +513,17 @@ fn keep_orphan(
 }
 
 #[cfg(test)]
-fn diagnose_unreconstructable_orphan(record: &RegistryRecord) {
+fn diagnose_unreconstructable_orphan(record: &ArtifactRecord) {
     let _ = record;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{ArtifactKey, RecordKind};
+    use crate::sync::state::{ArtifactKey, RecordKind};
 
-    fn orphan_record(layout: &str, separator: Option<&str>) -> RegistryRecord {
-        RegistryRecord {
+    fn orphan_record(layout: &str, separator: Option<&str>) -> ArtifactRecord {
+        ArtifactRecord {
             version: 1,
             key: ArtifactKey {
                 target: "gone".to_owned(),

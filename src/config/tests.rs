@@ -3457,7 +3457,7 @@ mod per_binding_refinement {
 
     #[test]
     fn r9_golden_bare_string_config_resolves_to_source_identity_and_inherited_fields() {
-        use crate::store::Registry as _;
+        use crate::sync::state::StateStore as _;
         let toml = "version = 1\n\n\
             [sources.dotfiles]\ngit = \"https://github.com/me/dotfiles.git\"\n\
             root = \"modules\"\ninclude = [\"editor\"]\nexclude = [\"**/*.bak\"]\n\n\
@@ -3510,11 +3510,11 @@ mod per_binding_refinement {
         // record at …/artifacts/<source>/<artifact>.toml with `source` == the source,
         // unchanged from the pre-PBR layout.
         let state = tempfile::TempDir::new().expect("state root");
-        let reg = crate::store::FileRegistry::open(state.path().to_path_buf())
+        let reg = crate::sync::state::FileStateStore::open(state.path().to_path_buf())
             .expect("open registry over tempdir");
-        let rec = crate::store::RegistryRecord {
+        let rec = crate::sync::state::ArtifactRecord {
             version: 1,
-            key: crate::store::ArtifactKey {
+            key: crate::sync::state::ArtifactKey {
                 target: "t".to_owned(),
                 source: dotfiles.identity.to_owned(),
                 artifact: "editor".to_owned(),
@@ -3524,7 +3524,7 @@ mod per_binding_refinement {
             digest: "blake3:00".to_owned(),
             projected_at: "2026-01-31T12:34:56Z".to_owned(),
             layout: "flat".to_owned(),
-            kind: crate::store::RecordKind::Dir,
+            kind: crate::sync::state::RecordKind::Dir,
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![],
@@ -3533,7 +3533,7 @@ mod per_binding_refinement {
             deploy_root: None,
             layout_separator: None,
         };
-        reg.put(&rec).expect("put bare-binding record");
+        reg.put_artifact(&rec).expect("put bare-binding record");
 
         let expected = state
             .path()
@@ -3549,7 +3549,10 @@ mod per_binding_refinement {
             expected.display()
         );
         assert_eq!(
-            reg.get(&rec.key).expect("get").expect("present").source,
+            reg.artifact(&rec.key)
+                .expect("get")
+                .expect("present")
+                .source,
             "dotfiles",
             "a bare binding's persisted `source` equals its identity"
         );

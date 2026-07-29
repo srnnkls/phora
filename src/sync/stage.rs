@@ -384,13 +384,14 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::kernel::Materialization;
+    use crate::projection::model::Materialization;
     use crate::projection::model::{
         ContentTransform, ProjectedArtifact, ProjectedLeaf, ResolvedSourceRef, TargetPath,
         TargetProjection,
     };
     use crate::source::{
-        GitBackend, ResolvedSource, SnapshotId, SourceBackend as _, SourcePath, SourceStore,
+        GitBackend, ResolvePolicy, ResolveRequest, RevisionSpec, SourceLocation, SourcePath,
+        SourceStore,
     };
 
     use crate::source::SourceName;
@@ -419,6 +420,23 @@ mod tests {
         commit: String,
     }
 
+    impl ExportFixture {
+        fn refresh(&self) {
+            SourceStore::resolve(
+                &self.backend,
+                &ResolveRequest {
+                    name: sn("src"),
+                    location: SourceLocation::Git {
+                        url: self.url.clone(),
+                    },
+                    revision: RevisionSpec::Branch("main".to_owned()),
+                },
+                ResolvePolicy::Refresh,
+            )
+            .expect("refresh fixture snapshot");
+        }
+    }
+
     #[expect(
         clippy::unwrap_used,
         reason = "fixture setup fails loudly; git CLI is assumed present"
@@ -429,8 +447,8 @@ mod tests {
         author_date: &str,
         committer_date: &str,
     ) -> std::process::Output {
-        crate::store::assert_git_sandboxed(cwd);
-        let _serial = crate::store::guard_git_fork();
+        crate::sync::state::locking::assert_git_sandboxed(cwd);
+        let _serial = crate::sync::state::locking::guard_git_fork();
         let out = Command::new("git")
             .args(args)
             .current_dir(cwd)
@@ -636,13 +654,20 @@ mod tests {
             artifacts: Vec::new(),
             warnings: Vec::new(),
         };
-        let resolved = ResolvedSource {
-            name: sn("src"),
-            url: fixture.url.clone(),
-            snapshot: SnapshotId::Git {
-                commit: fixture.commit.clone(),
+        let resolved = SourceStore::resolve(
+            &fixture.backend,
+            &ResolveRequest {
+                name: sn("src"),
+                location: SourceLocation::Git {
+                    url: fixture.url.clone(),
+                },
+                revision: RevisionSpec::Commit(
+                    fixture.commit.parse().expect("fixture commit is valid hex"),
+                ),
             },
-        };
+            ResolvePolicy::CachedOnly,
+        )
+        .expect("resolve staged fixture snapshot");
         stage_artifact(
             &StageRequest {
                 artifact: &artifact,
@@ -656,7 +681,7 @@ mod tests {
             &TemplateOptIn::SuffixOnly,
             |repo_relative| {
                 let path = SourcePath::new(&repo_relative.to_string_lossy().replace('\\', "/"))?;
-                let entry = SourceStore::read(&fixture.backend, &resolved, &path)?;
+                let entry = SourceStore::read(&fixture.backend, &resolved.snapshot, &path)?;
                 Ok((entry.bytes, entry.meta.kind))
             },
         )
@@ -700,10 +725,7 @@ mod tests {
     #[test]
     fn export_materializes_files_with_exact_content() {
         let fixture = build_export_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
 
         export_editor(&fixture, staging.path(), &ExportPolicy::default()).expect("export succeeds");
@@ -721,10 +743,7 @@ mod tests {
     #[test]
     fn export_excludes_bak_files_by_path_matcher() {
         let fixture = build_export_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
 
         let result = export_editor(&fixture, staging.path(), &ExportPolicy::default())
@@ -756,10 +775,7 @@ mod tests {
     #[test]
     fn export_prunes_a_nested_dot_git_dest_at_write() {
         let fixture = build_export_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
 
         let result = export_named(
@@ -797,10 +813,7 @@ mod tests {
     #[test]
     fn export_prunes_a_top_level_dot_git_dest_at_write() {
         let fixture = build_export_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
 
         let result = export_named(
@@ -828,10 +841,7 @@ mod tests {
     #[test]
     fn export_writes_a_dot_git_dest_when_policy_opts_in() {
         let fixture = build_export_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
 
         let policy = ExportPolicy {
@@ -863,10 +873,7 @@ mod tests {
     #[test]
     fn export_writes_a_dot_gitignore_basename_dest_without_opt_in() {
         let fixture = build_export_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
 
         let result = export_named(
@@ -895,10 +902,7 @@ mod tests {
     #[test]
     fn export_result_lists_exported_files() {
         let fixture = build_export_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
 
         let result = export_editor(&fixture, staging.path(), &ExportPolicy::default())
@@ -928,10 +932,7 @@ mod tests {
     #[test]
     fn export_sets_mtime_to_commit_time() {
         let fixture = build_export_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
 
         let result = export_editor(&fixture, staging.path(), &ExportPolicy::default())
@@ -959,10 +960,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let fixture = build_export_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
 
         export_editor(&fixture, staging.path(), &ExportPolicy::default()).expect("export succeeds");
@@ -980,10 +978,7 @@ mod tests {
     #[test]
     fn export_rejects_symlink_when_policy_disallows() {
         let fixture = build_export_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
 
         let policy = ExportPolicy {
@@ -1012,10 +1007,7 @@ mod tests {
     #[test]
     fn export_materializes_symlink_when_allowed() {
         let fixture = build_export_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
 
         let policy = ExportPolicy {
@@ -1077,10 +1069,7 @@ mod tests {
     #[test]
     fn export_rejects_symlink_with_absolute_target() {
         let fixture = build_symlink_target_fixture("link", "/etc/passwd");
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
 
         let policy = ExportPolicy {
@@ -1117,10 +1106,7 @@ mod tests {
     #[test]
     fn export_rejects_symlink_target_escaping_root_via_dotdot() {
         let fixture = build_symlink_target_fixture("dir/link", "../../outside");
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
 
         let policy = ExportPolicy {
@@ -1157,10 +1143,7 @@ mod tests {
     #[test]
     fn export_materializes_symlink_with_in_root_dotdot_target() {
         let fixture = build_symlink_target_fixture("dir/link", "../sibling");
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
 
         let policy = ExportPolicy {
@@ -1186,10 +1169,7 @@ mod tests {
     #[test]
     fn export_rejects_symlink_colliding_with_rendered_deployed_name() {
         let fixture = build_symlink_template_collision_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
 
         let policy = ExportPolicy {
@@ -1214,10 +1194,7 @@ mod tests {
     #[test]
     fn export_rejects_directory_colliding_with_rendered_deployed_name() {
         let fixture = build_dir_template_collision_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
 
         let leaves = vec![
@@ -1239,10 +1216,7 @@ mod tests {
     fn export_aborts_a_runaway_template_via_fuel_instead_of_hanging() {
         let runaway = b"{% for i in range(100000000) %}x{% endfor %}\n";
         let fixture = build_collision_fixture(&[("loop.txt.tmpl", runaway)]);
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
 
         let leaves = vec![leaf(
@@ -1261,23 +1235,36 @@ mod tests {
 
     /// Every leaf under the `art` subtree, mapped to its suffix-stripped dir-relative dest.
     fn art_leaves(fixture: &ExportFixture) -> Vec<ProjectedLeaf> {
-        fixture
-            .backend
-            .list_source_leaves(
-                &sn("src"),
-                &fixture.url,
-                &fixture.commit,
-                Some(Path::new("art")),
+        let resolved = SourceStore::resolve(
+            &fixture.backend,
+            &ResolveRequest {
+                name: sn("src"),
+                location: SourceLocation::Git {
+                    url: fixture.url.clone(),
+                },
+                revision: RevisionSpec::Commit(
+                    fixture.commit.parse().expect("fixture commit is valid"),
+                ),
+            },
+            ResolvePolicy::CachedOnly,
+        )
+        .expect("resolve cached fixture snapshot");
+        SourceStore::inventory(
+            &fixture.backend,
+            &resolved.snapshot,
+            Some(&SourcePath::new("art").expect("valid source root")),
+        )
+        .expect("inventory art leaves")
+        .entries
+        .into_iter()
+        .map(|entry| {
+            let rel = entry.path.as_str();
+            leaf(
+                &format!("art/{rel}"),
+                &TemplateOptIn::SuffixOnly.deployed_name(rel),
             )
-            .expect("list art leaves")
-            .into_iter()
-            .map(|rel| {
-                leaf(
-                    &format!("art/{rel}"),
-                    &TemplateOptIn::SuffixOnly.deployed_name(&rel),
-                )
-            })
-            .collect()
+        })
+        .collect()
     }
 
     fn export_art_with_vars(
@@ -1292,10 +1279,7 @@ mod tests {
     #[test]
     fn export_vars_digest_is_none_when_no_template_rendered() {
         let fixture = build_collision_fixture(&[("plain.txt", b"static body\n")]);
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
 
         let mut vars = BTreeMap::new();
@@ -1314,10 +1298,7 @@ mod tests {
     #[test]
     fn export_vars_digest_is_some_when_a_template_rendered() {
         let fixture = build_collision_fixture(&[("greeting.txt.tmpl", b"hello {{ name }}\n")]);
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
 
         let mut vars = BTreeMap::new();
@@ -1336,10 +1317,7 @@ mod tests {
     #[test]
     fn export_vars_digest_changes_when_a_var_value_changes() {
         let fixture = build_collision_fixture(&[("greeting.txt.tmpl", b"hello {{ name }}\n")]);
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
 
         let staging_a = TempDir::new().expect("staging a");
         let mut vars_a = BTreeMap::new();
@@ -1365,10 +1343,7 @@ mod tests {
     #[test]
     fn export_vars_digest_hashes_full_vars_not_only_consumed_keys() {
         let fixture = build_collision_fixture(&[("greeting.txt.tmpl", b"hello {{ name }}\n")]);
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
 
         let staging_a = TempDir::new().expect("staging a");
         let mut vars_a = BTreeMap::new();
@@ -1437,10 +1412,7 @@ mod tests {
     #[test]
     fn mapped_export_renames_top_level_blob() {
         let fixture = build_map_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
 
         let map = &[("AGENTS.md", "CLAUDE.md")];
@@ -1470,10 +1442,7 @@ mod tests {
     #[test]
     fn mapped_export_flattens_nested_key_to_dest() {
         let fixture = build_map_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
 
         let map = &[("nested/AGENTS.md", "codex.md")];
@@ -1503,10 +1472,7 @@ mod tests {
     #[test]
     fn mapped_export_stages_all_entries_of_a_multi_key_map() {
         let fixture = build_map_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
 
         let map = &[("AGENTS.md", "CLAUDE.md"), ("nested/AGENTS.md", "codex.md")];
@@ -1542,10 +1508,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let fixture = build_map_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
 
         let map = &[("tool.sh", "run")];
@@ -1564,10 +1527,7 @@ mod tests {
     #[test]
     fn mapped_export_errors_when_key_is_a_directory() {
         let fixture = build_map_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
 
         let map = &[("nested", "x.md")];
@@ -1587,10 +1547,7 @@ mod tests {
     #[test]
     fn mapped_export_errors_when_key_is_missing() {
         let fixture = build_map_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
 
         let map = &[("does/not/exist.md", "x.md")];
@@ -1615,10 +1572,7 @@ mod tests {
     #[test]
     fn mapped_export_errors_when_two_keys_share_a_dest() {
         let fixture = build_map_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
 
         let map = &[("AGENTS.md", "x.md"), ("nested/AGENTS.md", "x.md")];
@@ -1641,10 +1595,7 @@ mod tests {
             ("first.md", b"upper deploys to README.md\n"),
             ("second.md", b"lower deploys to readme.md\n"),
         ]);
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
 
         let leaves = vec![
@@ -1677,10 +1628,7 @@ mod tests {
             ("first.md", b"upper accented deploy\n"),
             ("second.md", b"lower accented deploy\n"),
         ]);
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
 
         let leaves = vec![
@@ -1704,10 +1652,7 @@ mod tests {
             ("first.md", b"upper cyrillic deploy\n"),
             ("second.md", b"lower cyrillic deploy\n"),
         ]);
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
 
         let leaves = vec![
@@ -1732,10 +1677,7 @@ mod tests {
                 b"deploys to strasse.md too but folded distinctly\n",
             ),
         ]);
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
 
         let leaves = vec![

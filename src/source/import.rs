@@ -3,13 +3,18 @@ use std::path::{Path, PathBuf};
 
 use gix::object::tree::EntryKind;
 
-use crate::config::Refspec;
 use crate::digest::Digest;
 
-use super::{SourceName, safe_component};
+use super::{Refspec, SourceName, safe_component};
 
 use super::cache::{MirrorStaging, lock_mirror, mirror_path};
-use super::{GitBackend, Result, SourceBackend, SourceError};
+use super::snapshot::commit_from_hex;
+use super::{
+    GitBackend, MirrorKey, NormalizedUrl, ResolvePolicy, ResolveRequest, ResolvedRevision,
+    ResolvedSource, Result, RevisionSpec, SnapshotId, SourceDirectoryEntry, SourceEntry,
+    SourceError, SourceIdentity, SourceInventory, SourceLocation, SourcePath, SourceStore,
+    SourceTimestamp,
+};
 
 /// A download scratch file under `git_dir`, removed on drop.
 struct TempDownload {
@@ -33,8 +38,8 @@ impl Drop for TempDownload {
     }
 }
 
-/// Url-source adapter: downloads + extracts + imports a synthetic mirror, then
-/// reads it through an inner [`GitBackend`] over the same `git_dir`.
+/// URL source capability: downloads, extracts, and imports a synthetic mirror,
+/// then reads it through an inner [`GitBackend`] over the same `git_dir`.
 pub struct HttpBackend {
     git_dir: PathBuf,
     git: GitBackend,
@@ -51,10 +56,8 @@ impl HttpBackend {
             digests,
         }
     }
-}
 
-impl SourceBackend for HttpBackend {
-    fn fetch(&self, source: &SourceName, url: &str) -> Result<()> {
+    fn refresh_import(&self, source: &SourceName, url: &str) -> Result<()> {
         std::fs::create_dir_all(&self.git_dir)
             .map_err(|e| SourceError::Source(format!("source {source}: create git dir: {e}")))?;
         let temp = TempDownload::create(&self.git_dir);
@@ -74,48 +77,82 @@ impl SourceBackend for HttpBackend {
         Ok(())
     }
 
-    fn mirror_ready(&self, url: &str) -> bool {
-        self.git.mirror_ready(url)
-    }
-
-    /// Resolve ignores the refspec: url sources live at refs/heads/phora.
-    fn resolve(&self, source: &SourceName, url: &str, _refspec: &Refspec) -> Result<String> {
-        let mirror = mirror_path(&self.git_dir, url);
-        let repo = gix::open(&mirror)
-            .map_err(|e| SourceError::Source(format!("open mirror {source}: {e}")))?;
-        let commit = repo
-            .find_reference(IMPORT_REF)
-            .map_err(|e| SourceError::Source(format!("{IMPORT_REF} in {source}: {e}")))?
-            .peel_to_commit()
-            .map_err(|e| SourceError::Source(format!("peel {IMPORT_REF} in {source}: {e}")))?;
-        Ok(commit.id().to_hex().to_string())
-    }
-
-    fn commit_time(&self, source: &SourceName, url: &str, commit: &str) -> Result<u64> {
-        self.git.commit_time(source, url, commit)
-    }
-
-    fn list_source_leaves(
+    fn imported_commit(
         &self,
         source: &SourceName,
         url: &str,
-        commit: &str,
-        root: Option<&Path>,
-    ) -> Result<Vec<String>> {
-        self.git.list_source_leaves(source, url, commit, root)
-    }
-
-    fn compute_digest(
-        &self,
-        source: &SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        include: &[String],
-        exclude: &[String],
+        revision: &RevisionSpec,
     ) -> Result<String> {
-        self.git
-            .compute_digest(source, url, commit, root, include, exclude)
+        match revision {
+            RevisionSpec::None => {
+                let mirror = mirror_path(&self.git_dir, url);
+                let repo = gix::open(&mirror)
+                    .map_err(|e| SourceError::Source(format!("open mirror {source}: {e}")))?;
+                let commit = repo
+                    .find_reference(IMPORT_REF)
+                    .map_err(|e| SourceError::Source(format!("{IMPORT_REF} in {source}: {e}")))?
+                    .peel_to_commit()
+                    .map_err(|e| {
+                        SourceError::Source(format!("peel {IMPORT_REF} in {source}: {e}"))
+                    })?;
+                Ok(commit.id().to_hex().to_string())
+            }
+            RevisionSpec::Commit(commit) => {
+                self.git
+                    .resolve_commit(source, url, &Refspec::Rev(commit.to_string()))
+            }
+            RevisionSpec::Branch(_) | RevisionSpec::Tag(_) | RevisionSpec::Default => Err(
+                SourceError::Source(format!("url source {source} cannot select a git revision")),
+            ),
+        }
+    }
+}
+
+impl SourceStore for HttpBackend {
+    fn resolve(&self, request: &ResolveRequest, policy: ResolvePolicy) -> Result<ResolvedSource> {
+        let SourceLocation::Url { url } = &request.location else {
+            return Err(SourceError::Source(format!(
+                "source {} requires the git/worktree source adapter",
+                request.name
+            )));
+        };
+        if policy == ResolvePolicy::Refresh {
+            self.refresh_import(&request.name, url)?;
+        }
+        let commit = self.imported_commit(&request.name, url, &request.revision)?;
+        let authored_at = self.git.authored_at(&request.name, url, &commit)?;
+        let commit = commit_from_hex(&commit)?;
+        let normalized = NormalizedUrl::parse(url);
+        Ok(ResolvedSource {
+            name: request.name.clone(),
+            snapshot: SnapshotId::Git {
+                mirror: MirrorKey::from_url(&normalized),
+                commit: commit.clone(),
+            },
+            revision: ResolvedRevision::Commit(commit),
+            authored_at: SourceTimestamp::from_unix_seconds(authored_at),
+            normalized_location: SourceIdentity::Url(normalized),
+        })
+    }
+
+    fn inventory(
+        &self,
+        snapshot: &SnapshotId,
+        root: Option<&SourcePath>,
+    ) -> Result<SourceInventory> {
+        SourceStore::inventory(&self.git, snapshot, root)
+    }
+
+    fn read(&self, snapshot: &SnapshotId, path: &SourcePath) -> Result<SourceEntry> {
+        SourceStore::read(&self.git, snapshot, path)
+    }
+
+    fn list_directory(
+        &self,
+        snapshot: &SnapshotId,
+        path: Option<&SourcePath>,
+    ) -> Result<Vec<SourceDirectoryEntry>> {
+        SourceStore::list_directory(&self.git, snapshot, path)
     }
 }
 

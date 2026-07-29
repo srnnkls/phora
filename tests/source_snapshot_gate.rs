@@ -247,11 +247,97 @@ fn pub_use_statements(stripped: &str) -> Vec<String> {
         .collect()
 }
 
-fn documents_link_exception(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    lower.split("\n\n").any(|paragraph| {
-        references_token(paragraph, "link") && references_token(paragraph, "exception")
-    })
+fn paragraph_documents_link_exception(paragraph: &str) -> bool {
+    let words: Vec<String> = paragraph
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    let contains_words = |expected: &[&str]| {
+        words.windows(expected.len()).any(|window| {
+            window
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| actual == expected)
+        })
+    };
+
+    let denies_exception = [
+        &["link", "mode", "artifacts", "are", "not", "an", "exception"][..],
+        &[
+            "link",
+            "mode",
+            "artifacts",
+            "are",
+            "not",
+            "the",
+            "exception",
+        ][..],
+        &["no", "link", "mode", "artifacts", "are", "the", "exception"][..],
+        &[
+            "snapshot",
+            "immutability",
+            "has",
+            "no",
+            "link",
+            "mode",
+            "exception",
+        ][..],
+    ]
+    .iter()
+    .any(|denial| contains_words(denial));
+
+    !denies_exception
+        && contains_words(&[
+            "link",
+            "mode",
+            "artifacts",
+            "are",
+            "the",
+            "exception",
+            "to",
+            "snapshot",
+            "immutability",
+        ])
+        && contains_words(&[
+            "link",
+            "artifacts",
+            "materialize",
+            "as",
+            "symlinks",
+            "into",
+            "the",
+            "live",
+            "worktree",
+        ])
+        && contains_words(&[
+            "snapshotid",
+            "worktree",
+            "freezes",
+            "inventory",
+            "and",
+            "copy",
+            "mode",
+            "reads",
+        ])
+}
+
+fn markdown_docs_link_exception(text: &str) -> bool {
+    let mut paragraph = String::new();
+    for line in text.lines().chain(std::iter::once("")) {
+        if line.trim().is_empty() {
+            if paragraph_documents_link_exception(&paragraph) {
+                return true;
+            }
+            paragraph.clear();
+        } else {
+            if !paragraph.is_empty() {
+                paragraph.push('\n');
+            }
+            paragraph.push_str(line);
+        }
+    }
+    false
 }
 
 fn collect_rs_files(dir: &PathBuf, prefix: &str, out: &mut Vec<(String, String)>) {
@@ -533,32 +619,15 @@ fn contract_capture_digest_stays_internal_to_source() {
 
 #[test]
 fn contract_link_mode_immutability_exception_is_documented() {
-    let mut haystacks: Vec<(String, String)> = ["snapshot", "worktree", "resolve"]
-        .iter()
-        .map(|module| {
-            let rel = format!("source/{module}.rs");
-            let text = read_src(&rel);
-            (format!("src/{rel}"), text)
-        })
-        .collect();
     let doc = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/architecture.md");
-    haystacks.push((
-        "docs/architecture.md".to_owned(),
-        fs::read_to_string(doc).unwrap_or_default(),
-    ));
+    let architecture = fs::read_to_string(doc).unwrap_or_default();
     assert!(
-        haystacks
-            .iter()
-            .any(|(_, text)| documents_link_exception(text)),
+        markdown_docs_link_exception(&architecture),
         "the link-mode immutability EXCEPTION (link artifacts materialize as symlinks into the \
          LIVE worktree; SnapshotId::Worktree freezes inventory and copy-mode reads, link \
-         artifacts do not freeze) must be documented: one paragraph naming both `link` and \
-         `exception` in src/source/{{snapshot,worktree,resolve}}.rs or docs/architecture.md \
-         (codex-R4-H3); none found in {:?}",
-        haystacks
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect::<Vec<_>>()
+         artifacts do not freeze) must be documented: one paragraph naming `link` and \
+         `exception` in the context of snapshot immutability in docs/architecture.md \
+         (codex-R4-H3); none found"
     );
 }
 
@@ -619,20 +688,69 @@ fn helper_pub_use_scan_sees_reexports_but_never_definitions() {
 
 #[test]
 fn helper_link_exception_scan_is_word_bounded_and_paragraph_scoped() {
-    assert!(documents_link_exception(
-        "Link-mode artifacts are a documented exception to snapshot immutability: they \
-         track the live worktree after capture."
+    assert!(markdown_docs_link_exception(
+        "Link-mode artifacts are the exception to snapshot immutability: link artifacts \
+         materialize as symlinks into the live worktree, while SnapshotId::Worktree freezes \
+         inventory and copy-mode reads."
     ));
     assert!(
-        !documents_link_exception("a symlink escape is rejected without exception"),
+        !markdown_docs_link_exception(
+            "Link-mode artifacts are not an exception to snapshot immutability: link artifacts \
+             materialize as symlinks into the live worktree, while SnapshotId::Worktree freezes \
+             inventory and copy-mode reads."
+        ),
+        "explicitly denying the link-mode exception must not satisfy the contract"
+    );
+    assert!(
+        !markdown_docs_link_exception(
+            "No link-mode artifacts are the exception to snapshot immutability: link artifacts \
+             materialize as symlinks into the live worktree, while SnapshotId::Worktree freezes \
+             inventory and copy-mode reads."
+        ),
+        "a `no ... exception` denial must not satisfy the contract"
+    );
+    assert!(
+        !markdown_docs_link_exception(
+            "Link-mode artifacts are the exception to snapshot immutability: link artifacts \
+             materialize as symlinks into the frozen worktree, while SnapshotId::Worktree keeps \
+             inventory and copy-mode reads live."
+        ),
+        "inverting live link artifacts and frozen copy reads must not satisfy the contract"
+    );
+    assert!(
+        !markdown_docs_link_exception(
+            "Symlink-mode artifacts are the exception to snapshot immutability: symlink artifacts \
+             materialize as symlinks into the live worktree, while SnapshotId::Worktree freezes \
+             inventory and copy-mode reads."
+        ),
         "`symlink` must not satisfy the word-bounded `link`"
     );
     assert!(
-        !documents_link_exception("link mode tracks the live tree"),
-        "naming link mode without calling it an exception must not count"
+        !markdown_docs_link_exception(
+            "Link-mode artifacts govern snapshot immutability: link artifacts materialize as \
+             symlinks into the live worktree, while SnapshotId::Worktree freezes inventory and \
+             copy-mode reads."
+        ),
+        "deleting the `exception` concept must not count"
     );
     assert!(
-        !documents_link_exception("link mode exists\n\nan exception applies elsewhere"),
-        "the two words must share one paragraph"
+        !markdown_docs_link_exception(
+            "Local artifacts are the exception to snapshot immutability: local artifacts \
+             materialize as symlinks into the live worktree, while SnapshotId::Worktree freezes \
+             inventory and copy-mode reads."
+        ),
+        "deleting the `link` concept must not count"
+    );
+    assert!(
+        !markdown_docs_link_exception("a link parser reports an exception"),
+        "unrelated adjacent `link` and `exception` tokens must not count"
+    );
+    assert!(
+        !markdown_docs_link_exception(
+            "Link-mode artifacts are the exception to snapshot immutability: link artifacts \
+             materialize as symlinks into the live worktree.\n\nSnapshotId::Worktree freezes \
+             inventory and copy-mode reads."
+        ),
+        "all three semantic clauses must share one paragraph"
     );
 }

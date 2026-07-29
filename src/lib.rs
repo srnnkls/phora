@@ -1,15 +1,8 @@
 //! Phora: a git-based artifact package manager.
 //!
-//! The crate follows a hexagonal layering:
-//! - **domain** — config DTOs ([`config`]), path/identity newtypes ([`paths`]),
-//!   offer selection ([`kernel::OfferSelection`]), and the orchestration in [`sync`]/[`deploy`].
-//! - **ports** — the [`source::SourceBackend`] and [`store::Registry`] traits.
-//! - **adapters** — [`source::GitBackend`] and [`store::FileRegistry`], kept beside
-//!   their port traits rather than in separate directories.
-//!
-//! Boundary inputs are parsed into validated newtypes ([`kernel::ProjectId`],
-//! [`source::NormalizedUrl`], [`source::MirrorKey`], [`kernel::Digest`]) so that
-//! illegal states are unrepresentable downstream — parse, don't validate.
+//! Compatibility is guaranteed for the command-line interface and serialized
+//! configuration, lock, journal, and state formats. The Rust library API is
+//! intentionally unstable and may change between releases.
 
 #![expect(
     clippy::missing_errors_doc,
@@ -18,14 +11,11 @@
 
 pub mod cli;
 pub mod config;
-pub mod deploy;
 pub mod diagnostic;
 pub mod digest;
 pub mod error;
-pub mod kernel;
 pub mod lock;
 pub mod paths;
 pub mod projection;
 pub mod source;
-pub mod store;
 pub mod sync;

@@ -1,22 +1,24 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use gix::object::tree::EntryKind;
 
-use crate::config::Refspec;
-use crate::kernel::OfferSelection;
-
-use super::{Commit, SourceName, safe_component};
+use super::{Commit, Path, Refspec, SourceName, safe_component};
 
 use super::cache::{
-    MirrorStaging, fetch_into_mirror, lock_mirror, mirror_path, open_mirror, reclone_mirror,
-    sweep_orphan_staging,
+    MirrorStaging, fetch_into_mirror, lock_mirror, mirror_path, mirror_path_for_key, open_mirror,
+    reclone_mirror, sweep_orphan_staging,
 };
 use super::inventory::{populate_inventory, snapshot_commit};
-use super::snapshot::{ResolvedSource, SourceEntry, SourceStore, frame_tag};
+use super::resolve::resolve_worktree;
+use super::snapshot::{
+    ResolvePolicy, ResolveRequest, ResolvedRevision, ResolvedSource, RevisionSpec, SnapshotId,
+    SourceDirectoryEntry, SourceDirectoryEntryKind, SourceEntry, SourceIdentity, SourceLocation,
+    SourceStore, SourceTimestamp, commit_from_hex,
+};
 use super::{
-    Result, SourceBackend, SourceEntryKind, SourceEntryMeta, SourceError, SourceInventory,
-    SourcePath, TreeEntry, hash_framed_entry,
+    MirrorKey, NormalizedUrl, Result, SourceEntryKind, SourceEntryMeta, SourceError,
+    SourceInventory, SourcePath,
 };
 
 pub struct GitBackend {
@@ -45,8 +47,8 @@ impl GitBackend {
         refspec: &Refspec,
     ) -> Result<Vec<u8>> {
         if self.mirror_path(url).exists() {
-            let commit = self.resolve(source, url, refspec)?;
-            return self.read_file_at(source, url, &commit, Path::new("phora.toml"));
+            let commit = self.resolve_commit(source, url, refspec)?;
+            return self.read_cached_file(source, url, &commit, Path::new("phora.toml"));
         }
         self.shallow_read_root_manifest(source, url, refspec)
     }
@@ -113,6 +115,63 @@ impl GitBackend {
 
         let commit = resolve_in(&repo, source, refspec)?;
         read_blob_at(&repo, source, &commit, Path::new("phora.toml"))
+    }
+
+    pub(super) fn refresh_mirror(&self, source: &SourceName, url: &str) -> Result<()> {
+        let _lock = lock_mirror(&self.git_dir, source, url)?;
+        sweep_orphan_staging(&self.git_dir, url);
+        let mirror = self.mirror_path(url);
+
+        if let Some(repo) = open_mirror(source, &mirror)?
+            && fetch_into_mirror(source, &repo).is_ok()
+        {
+            return Ok(());
+        }
+        reclone_mirror(&self.git_dir, source, url, &mirror)
+    }
+
+    pub(super) fn resolve_commit(
+        &self,
+        source: &SourceName,
+        url: &str,
+        refspec: &Refspec,
+    ) -> Result<String> {
+        let mirror = self.mirror_path(url);
+        let repo = gix::open(&mirror)
+            .map_err(|e| SourceError::Source(format!("open mirror {source}: {e}")))?;
+        resolve_in(&repo, source, refspec)
+    }
+
+    pub(super) fn authored_at(&self, source: &SourceName, url: &str, commit: &str) -> Result<u64> {
+        let mirror = self.mirror_path(url);
+        let repo = gix::open(&mirror)
+            .map_err(|e| SourceError::Source(format!("open mirror {source}: {e}")))?;
+        let oid = gix::ObjectId::from_hex(commit.as_bytes())
+            .map_err(|e| SourceError::Source(format!("parse commit {commit} in {source}: {e}")))?;
+        let commit_obj = repo
+            .find_commit(oid)
+            .map_err(|e| SourceError::Source(format!("commit {commit} in {source}: {e}")))?;
+        let seconds = commit_obj
+            .author()
+            .map_err(|e| SourceError::Source(format!("author of {commit} in {source}: {e}")))?
+            .time()
+            .map_err(|e| SourceError::Source(format!("author time of {commit} in {source}: {e}")))?
+            .seconds;
+        u64::try_from(seconds)
+            .map_err(|e| SourceError::Source(format!("author time of {commit} in {source}: {e}")))
+    }
+
+    fn read_cached_file(
+        &self,
+        source: &SourceName,
+        url: &str,
+        commit: &str,
+        path: &Path,
+    ) -> Result<Vec<u8>> {
+        let mirror = self.mirror_path(url);
+        let repo = gix::open(&mirror)
+            .map_err(|e| SourceError::Source(format!("open mirror {source}: {e}")))?;
+        read_blob_at(&repo, source, commit, path)
     }
 }
 
@@ -215,142 +274,6 @@ fn read_blob_at(
     Ok(object.data.clone())
 }
 
-impl SourceBackend for GitBackend {
-    fn read_file_at(
-        &self,
-        source: &SourceName,
-        url: &str,
-        commit: &str,
-        path: &Path,
-    ) -> Result<Vec<u8>> {
-        let mirror = self.mirror_path(url);
-        let repo = gix::open(&mirror)
-            .map_err(|e| SourceError::Source(format!("open mirror {source}: {e}")))?;
-        read_blob_at(&repo, source, commit, path)
-    }
-
-    fn list_source_leaves(
-        &self,
-        source: &SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-    ) -> Result<Vec<String>> {
-        let repo = self.open_mirror(source.as_str(), url)?;
-        let subtree = Self::subtree_at_root(&repo, source.as_str(), commit, root)?;
-        let mut recorder = gix::traverse::tree::Recorder::default();
-        subtree
-            .traverse()
-            .breadthfirst(&mut recorder)
-            .map_err(|e| SourceError::Source(format!("walk subtree in {source}: {e}")))?;
-        let mut leaves: Vec<String> = recorder
-            .records
-            .into_iter()
-            .filter(|entry| entry.mode.is_blob())
-            .map(|entry| entry.filepath.to_string())
-            .collect();
-        leaves.sort_unstable();
-        Ok(leaves)
-    }
-
-    fn list_tree_at(
-        &self,
-        source: &SourceName,
-        url: &str,
-        commit: &str,
-        path: &Path,
-    ) -> Result<Vec<TreeEntry>> {
-        let repo = self.open_mirror(source.as_str(), url)?;
-        let root = if path.as_os_str().is_empty() {
-            None
-        } else {
-            Some(path)
-        };
-        let subtree = Self::subtree_at_root(&repo, source.as_str(), commit, root)?;
-        let mut entries = Vec::new();
-        for entry in subtree.iter() {
-            let entry = entry
-                .map_err(|e| SourceError::Source(format!("read tree entry in {source}: {e}")))?;
-            entries.push(TreeEntry {
-                name: entry.filename().to_string(),
-                is_dir: entry.mode().is_tree(),
-            });
-        }
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(entries)
-    }
-
-    fn fetch(&self, source: &SourceName, url: &str) -> Result<()> {
-        let _lock = lock_mirror(&self.git_dir, source, url)?;
-        sweep_orphan_staging(&self.git_dir, url);
-        let mirror = self.mirror_path(url);
-
-        if let Some(repo) = open_mirror(source, &mirror)?
-            && fetch_into_mirror(source, &repo).is_ok()
-        {
-            return Ok(());
-        }
-        reclone_mirror(&self.git_dir, source, url, &mirror)
-    }
-
-    fn mirror_ready(&self, url: &str) -> bool {
-        gix::open(self.mirror_path(url)).is_ok()
-    }
-
-    fn resolve(&self, source: &SourceName, url: &str, refspec: &Refspec) -> Result<String> {
-        let mirror = self.mirror_path(url);
-        let repo = gix::open(&mirror)
-            .map_err(|e| SourceError::Source(format!("open mirror {source}: {e}")))?;
-        resolve_in(&repo, source, refspec)
-    }
-
-    fn commit_time(&self, source: &SourceName, url: &str, commit: &str) -> Result<u64> {
-        let mirror = self.mirror_path(url);
-        let repo = gix::open(&mirror)
-            .map_err(|e| SourceError::Source(format!("open mirror {source}: {e}")))?;
-        let oid = gix::ObjectId::from_hex(commit.as_bytes())
-            .map_err(|e| SourceError::Source(format!("parse commit {commit} in {source}: {e}")))?;
-        let commit_obj = repo
-            .find_commit(oid)
-            .map_err(|e| SourceError::Source(format!("commit {commit} in {source}: {e}")))?;
-        let seconds = commit_obj
-            .author()
-            .map_err(|e| SourceError::Source(format!("author of {commit} in {source}: {e}")))?
-            .time()
-            .map_err(|e| SourceError::Source(format!("author time of {commit} in {source}: {e}")))?
-            .seconds;
-        u64::try_from(seconds)
-            .map_err(|e| SourceError::Source(format!("author time of {commit} in {source}: {e}")))
-    }
-
-    fn compute_digest(
-        &self,
-        source: &SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        include: &[String],
-        exclude: &[String],
-    ) -> Result<String> {
-        let repo = self.open_mirror(source.as_str(), url)?;
-        let subtree = Self::subtree_at_root(&repo, source.as_str(), commit, root)?;
-
-        let mut leaves = Vec::new();
-        Self::collect_digest_leaves(&repo, source.as_str(), &subtree, Path::new(""), &mut leaves)?;
-
-        let selection = OfferSelection::compile(include, exclude, None)
-            .map_err(|e| SourceError::Source(format!("compile offer for {source}: {e}")))?;
-        let candidates: Vec<&str> = leaves.iter().map(|(path, _, _)| path.as_str()).collect();
-        let selected = selection
-            .select(&candidates)
-            .iter()
-            .map(|path| SourcePath::new(path))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-
-        Self::digest_leaves_in(&repo, source.as_str(), commit, &subtree, &selected)
-    }
-}
-
 impl GitBackend {
     /// Every blob leaf under `tree`, breadth-first into `(forward-slashed root-relative
     /// path, frame tag, oid)`. The tag distinguishes exec/link/file so the digest frames
@@ -393,9 +316,14 @@ impl GitBackend {
         Ok(())
     }
 
-    fn open_mirror(&self, source: &str, url: &str) -> Result<gix::Repository> {
-        let mirror = self.mirror_path(url);
-        gix::open(&mirror).map_err(|e| SourceError::Source(format!("open mirror {source}: {e}")))
+    fn open_snapshot(&self, snapshot: &SnapshotId) -> Result<gix::Repository> {
+        let mirror = mirror_path_for_key(&self.git_dir, snapshot.mirror());
+        gix::open(&mirror).map_err(|e| {
+            SourceError::Source(format!(
+                "open snapshot mirror {}: {e}",
+                snapshot.mirror().as_str()
+            ))
+        })
     }
 
     fn commit_tree<'repo>(
@@ -446,45 +374,6 @@ impl GitBackend {
             .map_err(|e| SourceError::Source(format!("blob {oid} in {source}: {e}")))?;
         Ok(blob.data.clone())
     }
-
-    fn digest_leaves_in(
-        repo: &gix::Repository,
-        source: &str,
-        commit: &str,
-        tree: &gix::Tree<'_>,
-        leaves: &[SourcePath],
-    ) -> Result<String> {
-        let mut sorted: Vec<&SourcePath> = leaves.iter().collect();
-        sorted.sort_unstable();
-        sorted.dedup();
-
-        let mut hasher = blake3::Hasher::new();
-        for path in sorted {
-            let entry = tree
-                .lookup_entry_by_path(Path::new(path.as_str()))
-                .map_err(|e| {
-                    SourceError::Source(format!("lookup {path} at {commit} in {source}: {e}"))
-                })?
-                .ok_or_else(|| SourceError::FileAbsent {
-                    source_name: source.to_owned(),
-                    commit: commit.to_owned(),
-                    path: PathBuf::from(path.as_str()),
-                })?;
-            let kind = kind_of_entry(entry.mode().kind()).ok_or_else(|| {
-                SourceError::MappedKeyNotALeaf {
-                    key: PathBuf::from(path.as_str()),
-                }
-            })?;
-            let data = Self::find_blob_data(repo, source, entry.object_id())?;
-            hash_framed_entry(
-                &mut hasher,
-                path.as_str().as_bytes(),
-                frame_tag(kind),
-                &data,
-            );
-        }
-        Ok(format!("blake3:{}", hasher.finalize().to_hex()))
-    }
 }
 
 fn kind_of_tag(tag: &[u8]) -> SourceEntryKind {
@@ -505,11 +394,58 @@ fn kind_of_entry(kind: EntryKind) -> Option<SourceEntryKind> {
 }
 
 impl SourceStore for GitBackend {
-    fn inventory(&self, source: &ResolvedSource) -> Result<SourceInventory> {
-        let name = source.name.as_str();
-        let commit = snapshot_commit(&source.snapshot);
-        let repo = self.open_mirror(name, &source.url)?;
-        let tree = Self::commit_tree(&repo, name, commit)?;
+    fn resolve(&self, request: &ResolveRequest, policy: ResolvePolicy) -> Result<ResolvedSource> {
+        match &request.location {
+            SourceLocation::Git { url } => {
+                if policy == ResolvePolicy::Refresh {
+                    self.refresh_mirror(&request.name, url)?;
+                }
+                let refspec = legacy_refspec(&request.revision);
+                let commit = self.resolve_commit(&request.name, url, &refspec)?;
+                let authored_at = self.authored_at(&request.name, url, &commit)?;
+                let commit = commit_from_hex(&commit)?;
+                let normalized = NormalizedUrl::parse(url);
+                Ok(ResolvedSource {
+                    name: request.name.clone(),
+                    snapshot: SnapshotId::Git {
+                        mirror: MirrorKey::from_url(&normalized),
+                        commit: commit.clone(),
+                    },
+                    revision: ResolvedRevision::Commit(commit),
+                    authored_at: SourceTimestamp::from_unix_seconds(authored_at),
+                    normalized_location: SourceIdentity::Git(normalized),
+                })
+            }
+            SourceLocation::Worktree { root } => {
+                if !matches!(request.revision, RevisionSpec::Default | RevisionSpec::None) {
+                    return Err(SourceError::Source(format!(
+                        "worktree source {} cannot select a git revision",
+                        request.name
+                    )));
+                }
+                resolve_worktree(&self.git_dir, &request.name, root)
+            }
+            SourceLocation::Url { .. } => Err(SourceError::Source(format!(
+                "url source {} requires the url source adapter",
+                request.name
+            ))),
+        }
+    }
+
+    fn inventory(
+        &self,
+        snapshot: &SnapshotId,
+        root: Option<&SourcePath>,
+    ) -> Result<SourceInventory> {
+        let name = snapshot.mirror().as_str();
+        let commit = snapshot_commit(snapshot).as_str();
+        let repo = self.open_snapshot(snapshot)?;
+        let tree = Self::subtree_at_root(
+            &repo,
+            name,
+            commit,
+            root.map(|path| Path::new(path.as_str())),
+        )?;
         let mut leaves = Vec::new();
         Self::collect_digest_leaves(&repo, name, &tree, Path::new(""), &mut leaves)?;
         populate_inventory(
@@ -519,18 +455,10 @@ impl SourceStore for GitBackend {
         )
     }
 
-    fn digest_snapshot(&self, source: &ResolvedSource, leaves: &[SourcePath]) -> Result<String> {
-        let name = source.name.as_str();
-        let commit = snapshot_commit(&source.snapshot);
-        let repo = self.open_mirror(name, &source.url)?;
-        let tree = Self::commit_tree(&repo, name, commit)?;
-        Self::digest_leaves_in(&repo, name, commit, &tree, leaves)
-    }
-
-    fn read(&self, source: &ResolvedSource, path: &SourcePath) -> Result<SourceEntry> {
-        let name = source.name.as_str();
-        let commit = snapshot_commit(&source.snapshot);
-        let repo = self.open_mirror(name, &source.url)?;
+    fn read(&self, snapshot: &SnapshotId, path: &SourcePath) -> Result<SourceEntry> {
+        let name = snapshot.mirror().as_str();
+        let commit = snapshot_commit(snapshot).as_str();
+        let repo = self.open_snapshot(snapshot)?;
         let tree = Self::commit_tree(&repo, name, commit)?;
         let entry = tree
             .lookup_entry_by_path(Path::new(path.as_str()))
@@ -540,11 +468,10 @@ impl SourceStore for GitBackend {
                 commit: commit.to_owned(),
                 path: PathBuf::from(path.as_str()),
             })?;
-        let kind = kind_of_entry(entry.mode().kind()).ok_or_else(|| {
-            SourceError::Source(format!(
-                "{path} at {commit} in {name} is not a regular file"
-            ))
-        })?;
+        let kind =
+            kind_of_entry(entry.mode().kind()).ok_or_else(|| SourceError::MappedKeyNotALeaf {
+                key: PathBuf::from(path.as_str()),
+            })?;
         let bytes = Self::find_blob_data(&repo, name, entry.object_id())?;
         Ok(SourceEntry {
             meta: SourceEntryMeta {
@@ -553,5 +480,59 @@ impl SourceStore for GitBackend {
             },
             bytes,
         })
+    }
+
+    fn list_directory(
+        &self,
+        snapshot: &SnapshotId,
+        path: Option<&SourcePath>,
+    ) -> Result<Vec<SourceDirectoryEntry>> {
+        let name = snapshot.mirror().as_str();
+        let commit = snapshot_commit(snapshot).as_str();
+        let repo = self.open_snapshot(snapshot)?;
+        let subtree = Self::subtree_at_root(
+            &repo,
+            name,
+            commit,
+            path.map(|path| Path::new(path.as_str())),
+        )?;
+        let mut entries = Vec::new();
+        for entry in subtree.iter() {
+            let entry = entry
+                .map_err(|e| SourceError::Source(format!("read tree entry in {name}: {e}")))?;
+            let filename = entry.filename().to_string();
+            let component = safe_component(&filename)?;
+            let child = path.map_or_else(
+                || component.to_owned(),
+                |parent| format!("{}/{component}", parent.as_str()),
+            );
+            let kind = match entry.kind() {
+                EntryKind::Blob => SourceDirectoryEntryKind::File,
+                EntryKind::BlobExecutable => SourceDirectoryEntryKind::Executable,
+                EntryKind::Link => SourceDirectoryEntryKind::Symlink,
+                EntryKind::Tree => SourceDirectoryEntryKind::Directory,
+                EntryKind::Commit => {
+                    return Err(SourceError::Source(format!(
+                        "gitlink {child} in {name} is not a supported source entry"
+                    )));
+                }
+            };
+            entries.push(SourceDirectoryEntry {
+                path: SourcePath::new(&child)?,
+                kind,
+            });
+        }
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(entries)
+    }
+}
+
+fn legacy_refspec(revision: &RevisionSpec) -> Refspec {
+    match revision {
+        RevisionSpec::Branch(name) => Refspec::Branch(name.clone()),
+        RevisionSpec::Tag(name) => Refspec::Tag(name.clone()),
+        RevisionSpec::Commit(commit) => Refspec::Rev(commit.to_string()),
+        RevisionSpec::Default => Refspec::Default,
+        RevisionSpec::None => Refspec::None,
     }
 }

@@ -5,15 +5,17 @@
 //! model that cost.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
-use phora::config::{Config, Refspec};
-use phora::kernel::{ArtifactName, Selection, SourceName};
-use phora::source::{ExportRequest, ExportResult, SourceBackend, SourceError};
+use phora::config::Config;
+use phora::source::{
+    Commit, MirrorKey, NormalizedUrl, ResolvePolicy, ResolveRequest, ResolvedRevision,
+    ResolvedSource, SnapshotId, SourceDirectoryEntry, SourceEntry, SourceError, SourceIdentity,
+    SourceInventory, SourceLocation, SourcePath, SourceStore, SourceTimestamp,
+};
 use phora::sync::resolve_sources_for_bench;
 
 type R<T> = std::result::Result<T, SourceError>;
@@ -26,58 +28,46 @@ struct LatencyBackend {
     latency: Duration,
 }
 
-impl SourceBackend for LatencyBackend {
-    fn fetch(&self, _source: &SourceName, _url: &str) -> R<()> {
+impl SourceStore for LatencyBackend {
+    fn resolve(&self, request: &ResolveRequest, _policy: ResolvePolicy) -> R<ResolvedSource> {
         sleep(self.latency);
-        Ok(())
+        let commit: Commit = "0".repeat(40).parse().expect("fixed commit is valid");
+        let url = match &request.location {
+            SourceLocation::Git { url } | SourceLocation::Url { url } => url,
+            SourceLocation::Worktree { .. } => {
+                unreachable!("the benchmark generates only Git sources")
+            }
+        };
+        let normalized = NormalizedUrl::parse(url);
+        Ok(ResolvedSource {
+            name: request.name.clone(),
+            snapshot: SnapshotId::Git {
+                mirror: MirrorKey::from_url(&normalized),
+                commit: commit.clone(),
+            },
+            revision: ResolvedRevision::Commit(commit),
+            authored_at: SourceTimestamp::from_unix_seconds(0),
+            normalized_location: SourceIdentity::Git(normalized),
+        })
     }
 
-    fn resolve(&self, _source: &SourceName, _url: &str, _refspec: &Refspec) -> R<String> {
+    fn inventory(&self, _snapshot: &SnapshotId, _root: Option<&SourcePath>) -> R<SourceInventory> {
         sleep(self.latency);
-        Ok("0".repeat(40))
+        Ok(SourceInventory::default())
     }
 
-    fn compute_digest(
-        &self,
-        _source: &SourceName,
-        _url: &str,
-        _commit: &str,
-        _root: Option<&Path>,
-        _selection: &Selection,
-    ) -> R<String> {
+    fn read(&self, _snapshot: &SnapshotId, _path: &SourcePath) -> R<SourceEntry> {
         sleep(self.latency);
-        Ok("digest".to_owned())
+        unreachable!("an empty inventory never asks the latency fake to read a leaf")
     }
 
-    fn commit_time(&self, _source: &SourceName, _url: &str, _commit: &str) -> R<u64> {
-        unreachable!("resolve path does not call commit_time")
-    }
-
-    fn discover_artifacts(
+    fn list_directory(
         &self,
-        _source: &SourceName,
-        _url: &str,
-        _commit: &str,
-        _root: Option<&Path>,
-        _selection: &Selection,
-    ) -> R<Vec<ArtifactName>> {
-        unreachable!("resolve path does not call discover_artifacts")
-    }
-
-    fn export_artifact(&self, _req: &ExportRequest<'_>) -> R<ExportResult> {
-        unreachable!("resolve path does not call export_artifact")
-    }
-
-    fn list_artifact_files(
-        &self,
-        _source: &SourceName,
-        _url: &str,
-        _commit: &str,
-        _root: Option<&Path>,
-        _artifact: &ArtifactName,
-        _selection: &Selection,
-    ) -> R<Vec<PathBuf>> {
-        unreachable!("resolve path does not call list_artifact_files")
+        _snapshot: &SnapshotId,
+        _path: Option<&SourcePath>,
+    ) -> R<Vec<SourceDirectoryEntry>> {
+        sleep(self.latency);
+        Ok(Vec::new())
     }
 }
 

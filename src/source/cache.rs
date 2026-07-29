@@ -7,6 +7,10 @@ use super::{MIRROR_REFSPECS, MirrorKey, NormalizedUrl, Result, SourceError};
 /// `<MirrorKey>.git` under `git_dir`; the single source of mirror-directory layout.
 pub(crate) fn mirror_path(git_dir: &Path, url: &str) -> PathBuf {
     let key = MirrorKey::from_url(&NormalizedUrl::parse(url));
+    mirror_path_for_key(git_dir, &key)
+}
+
+pub(super) fn mirror_path_for_key(git_dir: &Path, key: &MirrorKey) -> PathBuf {
     git_dir.join(format!("{}.git", key.as_str()))
 }
 

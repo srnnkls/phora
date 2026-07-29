@@ -17,7 +17,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use phora::config::Config;
 use phora::projection::diagnostic::ProjectionWarning;
 use phora::source::GitBackend;
-use phora::store::{ArtifactKey, FileRegistry, RecordKind, Registry, RegistryRecord};
+use phora::sync::state::{
+    ArtifactKey, ArtifactRecord, FileStateStore, RecordKind, StateStore,
+};
 use phora::sync::model::{ChangeSet, ConflictKind, ReconciliationPolicy, RemovalReason, SyncChange};
 use phora::sync::{
     AppliedChange, Concurrency, Conflict, ConflictPolicy, ConflictResolver, HookOutcome,
@@ -148,9 +150,9 @@ fn assert_request_flow_returns_conflict_warning_and_remove_outcomes() {
         "version = 1\n\n[sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\n\n[targets.dest]\npath = \"{}\"\nlayout = \"flat\"\nsources = {{ editor-src = {{ take = [\"editor/**\", \"*.nomatch\"] }} }}\n",
         source.display(), target.display(),
     )).expect("config parses");
-    let registry = FileRegistry::open(temp.path().join("state")).expect("registry");
+    let registry = FileStateStore::open(temp.path().join("state")).expect("registry");
     let orphan_key = ArtifactKey { target: "gone".into(), source: "old".into(), artifact: "obsolete".into() };
-    registry.put(&RegistryRecord {
+    registry.put_artifact(&ArtifactRecord {
         version: 1,
         key: orphan_key.clone(),
         source: "old".into(),
@@ -204,7 +206,7 @@ fn assert_request_flow_returns_conflict_warning_and_remove_outcomes() {
     ] if target == "gone" && source == "old" && artifact == "obsolete"),
         "the same reconciled orphan Remove must be the sole applied mutation: {:?}", report.applied);
     assert!(!orphan_path.exists(), "the normal workspace apply pass must execute the Remove row");
-    assert!(registry.get(&orphan_key).expect("read orphan record").is_none(), "Remove drops state");
+    assert!(registry.artifact(&orphan_key).expect("read orphan record").is_none(), "Remove drops state");
 }
 
 fn main() {

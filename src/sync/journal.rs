@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::store::RegistryRecord;
+use crate::sync::state::ArtifactRecord;
 
 /// Write-ahead journal of in-flight swaps, persisted under a `locks/` dir.
 pub struct Journal {
@@ -24,7 +24,7 @@ pub struct JournalEntry {
     pub staging_base: PathBuf,
     pub staging: PathBuf,
     pub dst: PathBuf,
-    pub record: RegistryRecord,
+    pub record: ArtifactRecord,
     /// True once the stage→dst rename completed (registry put still pending).
     pub swap_completed: bool,
 }
@@ -71,7 +71,7 @@ impl Journal {
     pub fn readonly_error(&self) -> Error {
         match &self.mode {
             JournalMode::ReadOnly { root } => {
-                Error::StoreCtx(crate::store::readonly_root_error(root))
+                Error::StateCtx(crate::sync::state::readonly_root_error(root))
             }
             JournalMode::Writable => {
                 unreachable!("readonly_error called on a writable journal")

@@ -2,7 +2,7 @@
 //! must stay byte-identical across the per-context error-enum refactor.
 //!
 //! These exercise public entry points (`Config::parse`, `verify_digest`,
-//! `GitBackend`/`FileRegistry` ops) and assert the exact `format!("{err}")`
+//! `GitBackend`/`FileStateStore` ops) and assert the exact `format!("{err}")`
 //! text — the only observable behavior, since no production site matches on
 //! `Error` variants. They pass today; the refactor must keep them green.
 
@@ -10,11 +10,15 @@ use std::path::Path;
 use std::process::Command;
 use std::str::FromStr;
 
-use phora::config::{Config, Refspec};
-use phora::kernel::{Digest, SourceName};
+use phora::config::Config;
+use phora::digest::Digest;
+use phora::source::SourceName;
 use phora::source::http::verify_digest;
-use phora::source::{GitBackend, SourceBackend};
-use phora::store::{ArtifactKey, FileRegistry, Registry};
+use phora::source::{
+    GitBackend, ResolvePolicy, ResolveRequest, ResolvedSource, RevisionSpec, SourceLocation,
+    SourcePath, SourceStore,
+};
+use phora::sync::state::{ArtifactKey, FileStateStore, StateStore};
 use tempfile::TempDir;
 
 fn sn(name: &str) -> SourceName {
@@ -70,10 +74,12 @@ repo = \"me/dotfiles\"
 fn source_resolve_url_source_empty_refspec_renders_exact_message() {
     let fixture = GitArtifactFixture::build();
 
-    let err = fixture
-        .backend
-        .resolve(&sn("dots"), &fixture.url, &Refspec::None)
-        .expect_err("an empty refspec on the git backend cannot resolve");
+    let err = SourceStore::resolve(
+        &fixture.backend,
+        &fixture.request(RevisionSpec::None),
+        ResolvePolicy::CachedOnly,
+    )
+    .expect_err("an empty refspec on the git backend cannot resolve");
 
     assert_eq!(
         err.to_string(),
@@ -87,13 +93,18 @@ fn source_resolve_without_mirror_renders_source_prefixed_open_message() {
     let git_dir = TempDir::new().expect("git dir tempdir");
     let backend = GitBackend::new(git_dir.path().to_path_buf());
 
-    let err = backend
-        .resolve(
-            &sn("dots"),
-            "https://example.com/missing",
-            &Refspec::Branch("main".into()),
-        )
-        .expect_err("resolve without a fetched mirror must error");
+    let err = SourceStore::resolve(
+        &backend,
+        &ResolveRequest {
+            name: sn("dots"),
+            location: SourceLocation::Git {
+                url: "https://example.com/missing".to_owned(),
+            },
+            revision: RevisionSpec::Branch("main".into()),
+        },
+        ResolvePolicy::CachedOnly,
+    )
+    .expect_err("resolve without a fetched mirror must error");
 
     let msg = err.to_string();
     assert!(
@@ -107,17 +118,12 @@ fn source_export_missing_root_renders_root_not_found() {
     let fixture = GitArtifactFixture::build();
     let staging = TempDir::new().expect("staging tempdir");
 
-    let err = fixture
-        .backend
-        .compute_digest(
-            &sn("dots"),
-            &fixture.url,
-            &fixture.commit,
-            Some(Path::new("no-such-root")),
-            &[],
-            &[],
-        )
-        .expect_err("a missing root path must error");
+    let err = SourceStore::inventory(
+        &fixture.backend,
+        &fixture.resolved.snapshot,
+        Some(&SourcePath::new("no-such-root").expect("safe absent root")),
+    )
+    .expect_err("a missing root path must error");
     let _ = staging;
 
     assert_eq!(
@@ -132,12 +138,12 @@ fn source_export_missing_root_renders_root_not_found() {
 #[test]
 fn registry_lock_contention_renders_exact_lock_message() {
     let dir = TempDir::new().expect("temp state root");
-    let first = FileRegistry::open(dir.path().to_path_buf()).expect("open first registry");
-    let second = FileRegistry::open(dir.path().to_path_buf()).expect("open second registry");
+    let first = FileStateStore::open(dir.path().to_path_buf()).expect("open first registry");
+    let second = FileStateStore::open(dir.path().to_path_buf()).expect("open second registry");
 
-    let _held = first.lock_exclusive().expect("first acquires the lock");
+    let _held = first.acquire_lock().expect("first acquires the lock");
     let err = second
-        .lock_exclusive()
+        .acquire_lock()
         .expect_err("second lock must fail while first held");
 
     assert_eq!(
@@ -150,7 +156,7 @@ fn registry_lock_contention_renders_exact_lock_message() {
 #[test]
 fn registry_get_corrupt_record_renders_registry_prefixed_parse_message() {
     let dir = TempDir::new().expect("temp state root");
-    let reg = FileRegistry::open(dir.path().to_path_buf()).expect("open registry");
+    let reg = FileStateStore::open(dir.path().to_path_buf()).expect("open registry");
     let key = ArtifactKey {
         target: "vscode".to_owned(),
         source: "company-configs".to_owned(),
@@ -169,7 +175,7 @@ fn registry_get_corrupt_record_renders_registry_prefixed_parse_message() {
     std::fs::write(&record_path, b"= not valid toml =").expect("write corrupt record");
 
     let err = reg
-        .get(&key)
+        .artifact(&key)
         .expect_err("a corrupt record must surface a parse error");
     let msg = err.to_string();
     assert!(
@@ -209,10 +215,20 @@ struct GitArtifactFixture {
     _git_dir: TempDir,
     backend: GitBackend,
     url: String,
-    commit: String,
+    resolved: ResolvedSource,
 }
 
 impl GitArtifactFixture {
+    fn request(&self, revision: RevisionSpec) -> ResolveRequest {
+        ResolveRequest {
+            name: sn("dots"),
+            location: SourceLocation::Git {
+                url: self.url.clone(),
+            },
+            revision,
+        }
+    }
+
     fn build() -> Self {
         let src = TempDir::new().expect("src tempdir");
         let root = src.path();
@@ -228,29 +244,26 @@ impl GitArtifactFixture {
 
         git(root, &["add", "-A"]);
         git(root, &["commit", "-m", "fixture"]);
-        let out = Command::new("git")
-            .current_dir(root)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .expect("rev-parse runs");
-        let commit = String::from_utf8(out.stdout)
-            .expect("utf8 sha")
-            .trim()
-            .to_owned();
-
         let git_dir = TempDir::new().expect("git dir tempdir");
         let backend = GitBackend::new(git_dir.path().to_path_buf());
         let url = root.to_string_lossy().into_owned();
-        backend
-            .fetch(&sn("dots"), &url)
-            .expect("fetch builds mirror");
+        let resolved = SourceStore::resolve(
+            &backend,
+            &ResolveRequest {
+                name: sn("dots"),
+                location: SourceLocation::Git { url: url.clone() },
+                revision: RevisionSpec::Branch("main".to_owned()),
+            },
+            ResolvePolicy::Refresh,
+        )
+        .expect("refresh builds mirror");
 
         Self {
             _src: src,
             _git_dir: git_dir,
             backend,
             url,
-            commit,
+            resolved,
         }
     }
 }

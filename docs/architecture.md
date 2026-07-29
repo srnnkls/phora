@@ -23,6 +23,10 @@ architectural decision that governs where every responsibility lives.
   disk, reconciles it against the projection, stages and applies changes,
   journals for recovery, and owns state records, ejections, hooks, and locking.
 
+Link-mode artifacts are the exception to snapshot immutability: link artifacts
+materialize as symlinks into the live worktree, while `SnapshotId::Worktree`
+freezes inventory and copy-mode reads.
+
 Data flows one way: source feeds projection, projection feeds sync. Imports run
 the opposite way: a downstream capability may import an upstream one — sync
 imports projection and source, projection imports source's pure value types —
@@ -43,10 +47,8 @@ the module whose sentence below it satisfies:
 If a piece of work needs the filesystem or the network to decide the target
 shape, it does not belong in projection. If it inspects or mutates the machine,
 it belongs in sync. If it acquires origin content, it belongs in source.
-Projection's allowance to import the pure kernel identities it consumes
-(`TargetName`/`ArtifactName`/`SourceName`/`Commit`) is phase-scoped: it expires
-at T029, when the kernel module dissolves — `TargetName`/`ArtifactName` become
-projection-owned and `SourceName`/`Commit` move to `source::model`.
+Projection owns `TargetName` and `ArtifactName`; source owns `SourceName` and
+`Commit`. Projection may import only the pure source values it consumes.
 
 ## Invariants
 
@@ -62,10 +64,10 @@ target structure. The projection module imports no `config` DTO, no source I/O
 (`SourceStore`, `SnapshotId`, resolve, or fetch), and none of `sync`, `cli`,
 `std::fs`, `std::process`, network libraries, `gix`, `serde`, or `chrono`. It may
 import only the pure source value types (`SourcePath`, `SourceInventory`,
-`SourceEntryMeta`, `SourceEntryKind`), the pure kernel identities it consumes,
-the pure external crates it genuinely needs, and its own modules. A positive
-allowlist lint rejects any other import. The kernel-identity allowance is
-phase-scoped and expires at T029, when the kernel module dissolves.
+`SourceEntryMeta`, `SourceEntryKind`, `SourceName`, `Commit`) it consumes, the
+pure external crates it genuinely needs, and its own modules. `TargetName` and
+`ArtifactName` are projection-owned. A positive allowlist lint rejects any other
+import.
 
 ### INV-2 — source boundary
 
@@ -82,9 +84,8 @@ digest.
 design.md is the authoritative specification for these invariants; each line
 below is the durable one-sentence record.
 
-- INV-3 — only `sync` and `cli` perform target-side I/O; source performs only
-  source/cache I/O. The legacy `deploy.rs`/`store.rs` allowlist only shrinks and
-  reaches strict at PR10.
+- INV-3 — only `sync` and `cli` perform target-side I/O; source performs
+  source/cache I/O; projection performs none.
 - INV-4 — serialized formats (lock, registry, journal, config, cache/mirror
   layout) stay byte-identical throughout; no schema or version bump.
 - INV-5 — artifact, source, variable, and file digests, modes, mtimes,
@@ -136,19 +137,19 @@ the end of the migration.
 
 ## SourceBackend caller-migration table
 
-`SourceBackend` is the legacy compat port and only shrinks: a method leaves the
-trait once repo-wide caller checks show zero consumers outside `src/source/`.
-As of T013 every consumer below is still live, so every method keeps its
-surface; T020/T030 migrate the callers onto the `SourceStore` path.
+This table is the historical completion record for the interface removed by
+T030. Every former method is gone; live sync, CLI, transitive, test, and
+benchmark flows use the final four-operation `SourceStore` capability and the
+free digest operation.
 
-| Method | Disposition | Successor | Consumers to migrate |
+| Method | Disposition | Final successor | Remaining consumers |
 | --- | --- | --- | --- |
-| `fetch` | retained | none until the T020/T030 caller migration | src/sync/resolve.rs, src/sync/transitive.rs |
-| `mirror_ready` | retained | none until the T020/T030 caller migration | src/sync/resolve.rs |
-| `read_file_at` | retained | `SourceStore::read` | src/sync/transitive.rs, src/cli/trust.rs |
-| `list_source_leaves` | retained | `SourceStore::inventory` | src/sync/{mod,plan,preview,target,transitive}.rs, src/cli/query.rs |
-| `list_tree_at` | retained | none until the T020/T030 caller migration | src/cli/trust.rs |
-| `resolve` | retained | snapshot resolution beside `resolve_worktree` | src/sync/resolve.rs, src/sync/transitive.rs |
-| `commit_time` | retained | none until the T020/T030 caller migration | src/sync/target.rs, src/sync/rebuild.rs |
+| `fetch` | removed | typed `SourceStore::resolve` with `ResolvePolicy::Refresh` | none |
+| `mirror_ready` | removed | typed cached resolution with `ResolvePolicy::CachedOnly` | none |
+| `read_file_at` | removed | `SourceStore::read` | none |
+| `list_source_leaves` | removed | `SourceStore::inventory` | none |
+| `list_tree_at` | removed | `SourceStore::list_directory` | none |
+| `resolve` | removed | `SourceStore::resolve` returning `ResolvedSource` | none |
+| `commit_time` | removed | `ResolvedSource::authored_at` | none |
 | `export_artifact` | removed | `stage_artifact` over `SourceStore::read` (T016) | none |
-| `compute_digest` | delegates | `SourceStore::digest_snapshot` | src/sync/resolve.rs |
+| `compute_digest` | removed | `source::digest_snapshot` | none |

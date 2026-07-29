@@ -634,9 +634,8 @@ fn check_artifact_state_cluster_lives_in_inspect() {
     assert!(
         defines_pub_type(&scanned, "ArtifactState"),
         "src/{INSPECT} must define `pub enum ArtifactState` — the drift classification moves \
-         WITH check_artifact_state (a `use`/`pub use` re-export does not count); it survives \
-         T018 because cli/render.rs and cli/query.rs still read it via crate::deploy until \
-         their T030 migration"
+         WITH check_artifact_state (a `use`/`pub use` re-export does not count); after T030, \
+         callers reach the type directly through its final `crate::sync::inspect` owner"
     );
 }
 
@@ -650,40 +649,46 @@ fn check_artifact_state_cluster_is_gone_from_deploy() {
     assert!(
         leftover.is_empty(),
         "src/{DEPLOY} must no longer DEFINE the relocated drift cluster ANYWHERE — production \
-         or #[cfg(test)] (a compat `pub use` re-export is fine, a second definition is a copy, \
-         not a move; the cluster's tests move with it); still defined in deploy.rs: {leftover:?}"
+         or #[cfg(test)] — a second definition is a copy, not a move; the cluster's tests move \
+         with it, and T030 removes the deploy facade itself; still defined in deploy.rs: \
+         {leftover:?}"
     );
     assert!(
         !defines_pub_type(&stripped, "ArtifactState"),
         "src/{DEPLOY} must no longer DEFINE `pub enum ArtifactState` after the move — only \
-         re-export it from sync::inspect"
+         src/{INSPECT} owns that type, and T030 removes the deploy facade"
     );
 }
 
 #[test]
-fn deploy_re_exports_check_artifact_state_for_legacy_callers() {
-    let deploy_src = read_src(DEPLOY);
-    let leaves = use_leaves(&collapse_colon_ws(&scan(&deploy_src)));
-    let defines = defines_fn(&strip(&deploy_src), "check_artifact_state");
+fn final_inspect_ownership_has_no_deploy_facade_and_callers_use_owner() {
+    let deploy_rs = src_dir().join(DEPLOY);
+    let deploy_dir = src_dir().join("deploy");
     assert!(
-        !defines
-            && leaves
-                .iter()
-                .any(|leaf| leaf.ends_with("inspect::check_artifact_state")),
-        "src/{DEPLOY} must carry a compat re-export `pub use crate::sync::inspect::\
-         check_artifact_state` (REQUIRED, not transitional): cli/query.rs reaches it through \
-         crate::deploy until T030 and sync/tests.rs binds crate::deploy::check_artifact_state, \
-         so the deploy-path alias must stay live; use-leaves seen: {leaves:?}"
+        !deploy_rs.exists() && !deploy_dir.exists(),
+        "T030 must remove the deploy facade completely after relocating drift inspection: \
+         neither {} nor {} may remain",
+        deploy_rs.display(),
+        deploy_dir.display()
     );
+
+    let lib_rs = scan(&read_src("lib.rs"));
     assert!(
-        leaves
-            .iter()
-            .any(|leaf| leaf.ends_with("inspect::ArtifactState")),
-        "src/{DEPLOY} must ALSO re-export `crate::sync::inspect::ArtifactState` — cli/render.rs, \
-         cli/mod.rs, and sync/target.rs import crate::deploy::ArtifactState until T030, so the \
-         missing re-export must fail here structurally, not as a late compile error; use-leaves \
-         seen: {leaves:?}"
+        !keyword_names(&lib_rs, "mod", "deploy"),
+        "src/lib.rs must not register a deploy module after T030 removes that facade"
     );
+
+    for (caller, owner_leaf) in [
+        ("cli/query.rs", "crate::sync::inspect::check_artifact_state"),
+        ("cli/render.rs", "crate::sync::inspect::ArtifactState"),
+    ] {
+        let leaves = use_leaves(&collapse_colon_ws(&scan(&read_src(caller))));
+        assert!(
+            leaves.iter().any(|leaf| leaf == owner_leaf),
+            "src/{caller} must import `{owner_leaf}` directly after the deploy facade is removed; \
+             use-leaves seen: {leaves:?}"
+        );
+    }
 }
 
 const INSPECT_PIN: ApiPin<'static> = ApiPin {
@@ -978,7 +983,7 @@ fn helper_reconcile_impurity_scan_flags_bypass_classes() {
         "use crate::sync::target::StageBridge;\npub fn reconcile() {}",
         "use crate::sync::inspect::inspect;\npub fn reconcile() {}",
         "use crate::sync::scan::scan_dir_soft;\npub fn reconcile() {}",
-        "use crate::store::RegistryRecord;\npub fn reconcile() {}",
+        "use crate::store::ArtifactRecord;\npub fn reconcile() {}",
         "use crate::config::Config;\npub fn reconcile() {}",
         "use crate::error::Error;\npub fn reconcile() {}",
         "use std::fs;\npub fn reconcile() {}",

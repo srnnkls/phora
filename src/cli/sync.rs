@@ -8,8 +8,8 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::lock::{Lock, merge_locks};
 use crate::paths::{cache_root_for, state_root_for};
-use crate::store::{FileRegistry, StoreError};
 use crate::sync::state::ProjectId;
+use crate::sync::state::{FileStateStore, StateError, StateStore};
 use crate::sync::{
     Concurrency, ConflictPolicy, ConflictResolver, HookPolicy, LockSet, MovedPinPolicy,
     PrunePolicy, SkippedChange, SourcePolicy, SyncOptions, SyncReport, SyncRequest, SyncWarning,
@@ -21,10 +21,10 @@ use super::{
     load_local_config, open_project_registry,
 };
 
-fn open_sync_registry(cwd: &Path, config: &Config) -> Result<FileRegistry> {
+fn open_sync_registry(cwd: &Path, config: &Config) -> Result<FileStateStore> {
     let projects_base = state_root_for(config.paths.state.as_deref(), cwd)?.join("projects");
     let project = ProjectId::for_path(cwd)?;
-    Ok(FileRegistry::open(projects_base.join(project.as_str()))?)
+    Ok(FileStateStore::open(projects_base.join(project.as_str()))?)
 }
 
 #[expect(
@@ -57,9 +57,9 @@ pub(super) fn run_sync(
     let backend = build_router(&effective, cache_git)?;
     let registry = open_sync_registry(&cwd, &effective)?;
     // Only a read-only root under --frozen falls back lockless; contention (exit 75) still propagates.
-    let guard = match registry.lock_exclusive() {
+    let guard = match registry.acquire_lock() {
         Ok(guard) => Some(guard),
-        Err(StoreError::ReadOnly(_)) if frozen => None,
+        Err(StateError::ReadOnly(_)) if frozen => None,
         Err(e) => return Err(e.into()),
     };
     let lockless = guard.is_none();
@@ -306,7 +306,7 @@ pub(super) fn run_rebuild_registry() -> Result<()> {
     config.validate()?;
 
     let registry = open_project_registry(&config)?;
-    let _guard = registry.lock_exclusive()?;
+    let _guard = registry.acquire_lock()?;
 
     let (base_lock, local_lock) = load_locks(&cwd)?;
     let lock = match base_lock {

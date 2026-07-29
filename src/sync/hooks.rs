@@ -5,7 +5,7 @@ use std::process::Command;
 
 use crate::config::{Config, DEFAULT_SHELL_PREFIX, HookCommand, HookWhen, LayoutConfig};
 use crate::error::{Error, Result};
-use crate::store::{Registry, RegistryRecord};
+use crate::sync::state::{ArtifactRecord, StateStore};
 
 /// Which hook table a [`HookOutcome`] came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,7 +40,11 @@ pub struct HookOutcome {
 ///
 /// Returns an error if the registry cannot be read, hook state cannot be
 /// recorded, or a hook process fails to spawn.
-pub(super) fn dispatch_hooks(config: &Config, registry: &dyn Registry) -> Result<Vec<HookOutcome>> {
+pub(super) fn dispatch_hooks(
+    config: &Config,
+    registry: &dyn StateStore,
+    lockless: bool,
+) -> Result<Vec<HookOutcome>> {
     let mut outcomes = Vec::new();
 
     for (target_name, target) in &config.targets {
@@ -49,7 +53,7 @@ pub(super) fn dispatch_hooks(config: &Config, registry: &dyn Registry) -> Result
             continue;
         };
 
-        let records = registry.list_target(target_name)?;
+        let records = registry.target_artifacts(target_name)?;
         let current: BTreeSet<String> = records.iter().map(|r| r.digest.clone()).collect();
         let layout = target.layout();
         let target_path = target.expanded_path();
@@ -62,8 +66,10 @@ pub(super) fn dispatch_hooks(config: &Config, registry: &dyn Registry) -> Result
             if changed.is_empty() {
                 continue;
             }
-            if registry.refuses_writes() {
-                return Err(registry.readonly_error().into());
+            if lockless {
+                let journal_root = registry.journal_root();
+                let state_root = journal_root.parent().unwrap_or(&journal_root);
+                return Err(crate::sync::state::readonly_root_error(state_root).into());
             }
 
             let names = changed_names(&changed);
@@ -300,9 +306,9 @@ fn dedupe(commands: &[HookCommand]) -> Vec<&HookCommand> {
         .collect()
 }
 
-fn recorded_set(registry: &dyn Registry, target: &str, id: &str) -> Result<BTreeSet<String>> {
+fn recorded_set(registry: &dyn StateStore, target: &str, id: &str) -> Result<BTreeSet<String>> {
     Ok(registry
-        .load_hook_state(target)?
+        .hook_state(target)?
         .into_iter()
         .find(|h| h.hook_id == id)
         .map(|h| h.last_success)
@@ -312,22 +318,22 @@ fn recorded_set(registry: &dyn Registry, target: &str, id: &str) -> Result<BTree
 /// Records carrying a digest absent from the hook's last-success set: the
 /// directional changed set (additions/modifications). Pure removals yield none.
 fn changed_records<'a>(
-    records: &'a [RegistryRecord],
+    records: &'a [ArtifactRecord],
     recorded: &BTreeSet<String>,
-) -> Vec<&'a RegistryRecord> {
+) -> Vec<&'a ArtifactRecord> {
     records
         .iter()
         .filter(|record| !recorded.contains(&record.digest))
         .collect()
 }
 
-fn changed_names(changed: &[&RegistryRecord]) -> String {
+fn changed_names(changed: &[&ArtifactRecord]) -> String {
     let names: BTreeSet<&str> = changed.iter().map(|r| r.key.artifact.as_str()).collect();
     names.into_iter().collect::<Vec<_>>().join("\n")
 }
 
 fn changed_paths(
-    changed: &[&RegistryRecord],
+    changed: &[&ArtifactRecord],
     target_path: &std::path::Path,
     layout: &LayoutConfig,
 ) -> String {

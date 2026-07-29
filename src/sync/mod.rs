@@ -53,7 +53,7 @@ pub use resolve::resolve_sources_for_bench;
 use prune::prune_projected;
 pub(crate) use prune::{orphan_artifact_path, orphan_records};
 use request::SyncEvents;
-use resolve::resolve_sources;
+use resolve::{ResolvedSourceMap, resolve_sources};
 pub use stage::{StageRequest, StagedArtifact, StagedFile, stage_artifact};
 #[cfg(test)]
 use target::deploy_reconciled_target;
@@ -75,15 +75,11 @@ use crate::config::{
 };
 use crate::error::{Error, Result};
 use crate::lock::{Lock, merge_locks, split_locks};
-use crate::source::{SourceBackend, SourceStore, is_local_path};
-use crate::store::{ArtifactKey, EjectedEntry, Registry, RegistryRecord};
+use crate::source::{SourceStore, is_local_path};
+use crate::sync::state::{ArtifactKey, ArtifactRecord, Ejection, StateStore};
 
 use journal::Journal;
 use recovery::recovery_sweep;
-
-pub trait StageSource: SourceBackend + SourceStore {}
-
-impl<T: SourceBackend + SourceStore> StageSource for T {}
 
 /// Test-only compatibility input for the pre-T027 unit fixtures.
 #[cfg(test)]
@@ -499,7 +495,8 @@ struct DeployAll<'a, R> {
     projection: &'a Projection,
     protected: &'a confine::ProtectedPathSet,
     input: &'a dyn RunOptions,
-    backend: &'a (dyn StageSource + Sync),
+    resolved_sources: &'a ResolvedSourceMap,
+    backend: &'a dyn SourceStore,
     registry: &'a R,
     journal: &'a Journal,
 }
@@ -525,6 +522,7 @@ fn target_run<'a, R>(
         target_name,
         target,
         remotes: ctx.remotes,
+        resolved_sources: ctx.resolved_sources,
         vars: &ctx.config.vars,
         protected: ctx.protected,
     }
@@ -532,20 +530,14 @@ fn target_run<'a, R>(
 
 fn apply_target_changes<R>(ctx: &DeployAll<'_, R>) -> Result<ApplyRun>
 where
-    R: Registry + state::StateStore,
+    R: StateStore,
 {
     let observed = observe::observe_workspace(ctx, ctx.projection)?;
     let options = ctx.input.options();
     let policy = (&options).into();
     let changeset = reconcile::reconcile(ctx.projection, &observed, &policy)
         .map_err(|e| Error::Sync(e.to_string()))?;
-    let readonly_registry;
-    let registry: &dyn Registry = if ctx.input.lockless() {
-        readonly_registry = crate::store::FrozenReadOnlyRegistry::new(ctx.registry);
-        &readonly_registry
-    } else {
-        ctx.registry
-    };
+    let registry: &dyn StateStore = ctx.registry;
     let refresh_pending = observed.artifacts.iter().any(|entry| {
         matches!(
             entry.observation,
@@ -555,8 +547,8 @@ where
             })
         )
     });
-    if registry.refuses_writes() && (!changeset.changes.is_empty() || refresh_pending) {
-        return Err(registry.readonly_error().into());
+    if ctx.input.lockless() && (!changeset.changes.is_empty() || refresh_pending) {
+        return Err(readonly_state_error(registry));
     }
     let decisions = resolve_conflicts(&changeset, ctx.input.resolver(), ctx.input.interactive())?;
     let reconciliation = Reconciliation::new(&changeset, &observed, decisions);
@@ -686,7 +678,11 @@ fn cross_target_overlap_diagnostic(
     .sync()
 }
 
-fn notify_orphans(config: &Config, registry: &dyn Registry, events: &mut SyncEvents) -> Result<()> {
+fn notify_orphans(
+    config: &Config,
+    registry: &dyn StateStore,
+    events: &mut SyncEvents,
+) -> Result<()> {
     let count = orphan_records(config, registry)?.len();
     if count > 0 {
         events.warnings.push(SyncWarning::OrphanedRecords { count });
@@ -694,7 +690,11 @@ fn notify_orphans(config: &Config, registry: &dyn Registry, events: &mut SyncEve
     Ok(())
 }
 
-fn sweep_target_parents(config: &Config, journal: &Journal, registry: &dyn Registry) -> Result<()> {
+fn sweep_target_parents(
+    config: &Config,
+    journal: &Journal,
+    registry: &dyn StateStore,
+) -> Result<()> {
     let mut swept_parents: BTreeSet<PathBuf> = BTreeSet::new();
     for target in config.targets.values() {
         let parent = match &target.confine {
@@ -727,12 +727,18 @@ fn merged_config(input: &SyncRunInput<'_>) -> Config {
     merge_configs(input.base_config.clone(), input.local_config.cloned())
 }
 
-fn open_sync_journal(lockless: bool, registry: &dyn Registry) -> Result<Journal> {
+fn open_sync_journal(lockless: bool, registry: &dyn StateStore) -> Result<Journal> {
     if lockless {
-        Ok(Journal::open_readonly(&registry.locks_dir()))
+        Ok(Journal::open_readonly(&registry.journal_root()))
     } else {
-        Journal::open(&registry.locks_dir())
+        Journal::open(&registry.journal_root())
     }
+}
+
+fn readonly_state_error(registry: &dyn StateStore) -> Error {
+    let journal_root = registry.journal_root();
+    let state_root = journal_root.parent().unwrap_or(&journal_root);
+    state::readonly_root_error(state_root).into()
 }
 
 #[expect(
@@ -743,24 +749,35 @@ fn apply_fast_forward_drops(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
     projection: &Projection,
-    recorded: &[RegistryRecord],
-    registry: &dyn Registry,
+    recorded: &[ArtifactRecord],
+    registry: &dyn StateStore,
     protected: &confine::ProtectedPathSet,
     fast_forward: bool,
+    lockless: bool,
     events: &mut SyncEvents,
 ) -> Result<()> {
     let drops = validate_sealed_offer(config, parsed, projection, recorded, fast_forward)?;
-    prune_fast_forward_drops_report(projection, config, registry, protected, &drops, events)
+    prune_fast_forward_drops_report(
+        projection, config, registry, protected, &drops, lockless, events,
+    )
 }
 
 fn project_sync_workspace(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
     remotes: &BTreeMap<String, String>,
-    backend: &dyn SourceBackend,
+    backend: &dyn SourceStore,
     resolved_commits: &BTreeMap<(String, String), String>,
+    resolved_sources: &ResolvedSourceMap,
 ) -> Result<Projection> {
-    let projection = project_workspace(config, parsed, remotes, backend, resolved_commits)?;
+    let projection = project_workspace(
+        config,
+        parsed,
+        remotes,
+        backend,
+        resolved_commits,
+        resolved_sources,
+    )?;
     reject_cross_target_overlap(&projection, config)?;
     Ok(projection)
 }
@@ -774,21 +791,21 @@ fn project_sync_workspace(
 #[cfg(not(test))]
 pub fn sync<R>(
     request: &SyncRequest<'_>,
-    backend: &(dyn StageSource + Sync),
+    backend: &dyn SourceStore,
     registry: &R,
 ) -> Result<SyncReport>
 where
-    R: Registry + state::StateStore,
+    R: StateStore,
 {
     let input = request_run_input(request, false);
     sync_core(&input, backend, registry).map(|execution| execution.report)
 }
 
 #[cfg(test)]
-fn sync<I, R>(input: &I, backend: &(dyn StageSource + Sync), registry: &R) -> Result<I::Output>
+fn sync<I, R>(input: &I, backend: &dyn SourceStore, registry: &R) -> Result<I::Output>
 where
     I: TestSyncInvocation,
-    R: Registry + state::StateStore,
+    R: StateStore,
 {
     let run_input = input.run_input();
     sync_core(&run_input, backend, registry).map(I::finish)
@@ -796,12 +813,12 @@ where
 
 pub(crate) fn sync_opened<R>(
     request: &SyncRequest<'_>,
-    backend: &(dyn StageSource + Sync),
+    backend: &dyn SourceStore,
     registry: &R,
     lockless: bool,
 ) -> Result<SyncReport>
 where
-    R: Registry + state::StateStore,
+    R: StateStore,
 {
     let input = request_run_input(request, lockless);
     sync_core(&input, backend, registry).map(|execution| execution.report)
@@ -824,11 +841,11 @@ fn request_run_input<'a>(request: &'a SyncRequest<'a>, lockless: bool) -> SyncRu
 )]
 fn sync_core<R>(
     input: &SyncRunInput<'_>,
-    backend: &(dyn StageSource + Sync),
+    backend: &dyn SourceStore,
     registry: &R,
 ) -> Result<SyncExecution>
 where
-    R: Registry + state::StateStore,
+    R: StateStore,
 {
     let mut events = SyncEvents::default();
     let mut effective_config = merged_config(input);
@@ -854,13 +871,7 @@ where
 
     let local_names = local_source_names(input);
 
-    let readonly_registry;
-    let compat_registry: &dyn Registry = if input.lockless {
-        readonly_registry = crate::store::FrozenReadOnlyRegistry::new(registry);
-        &readonly_registry
-    } else {
-        registry
-    };
+    let compat_registry: &dyn StateStore = registry;
     let journal = open_sync_journal(input.lockless, compat_registry)?;
     let cwd = std::env::current_dir()
         .map_err(|e| Error::Sync(format!("resolve current dir for confinement: {e}")))?;
@@ -870,7 +881,7 @@ where
 
     let recorded_after_recovery = live_recorded_artifacts(compat_registry)?;
 
-    let (routed, resolved_commits) = resolve_sources(
+    let routed = resolve_sources(
         &effective_config,
         &parsed,
         &remotes,
@@ -881,7 +892,7 @@ where
         input.frozen(),
         input.jobs(),
     )?;
-    let (mut base_lock, local_lock) = split_locks(routed, &local_names);
+    let (mut base_lock, local_lock) = split_locks(routed.locks, &local_names);
     base_lock.trusted_hooks = effective_lock
         .as_ref()
         .map(|lock| lock.trusted_hooks.clone())
@@ -892,7 +903,7 @@ where
         &effective_config,
         &parsed,
         effective_lock.as_ref(),
-        &resolved_commits,
+        &routed.commits,
         &mut events,
     );
     let projection = project_sync_workspace(
@@ -900,7 +911,8 @@ where
         &parsed,
         &remotes,
         backend,
-        &resolved_commits,
+        &routed.commits,
+        &routed.resolved,
     )?;
     apply_fast_forward_drops(
         &effective_config,
@@ -910,6 +922,7 @@ where
         compat_registry,
         &protected,
         input.fast_forward(),
+        input.lockless,
         &mut events,
     )?;
 
@@ -932,6 +945,7 @@ where
         parsed: &parsed,
         remotes: &remotes,
         projection: &projection,
+        resolved_sources: &routed.resolved,
         protected: &protected,
         input,
         backend,
@@ -959,7 +973,7 @@ fn deploy_and_run_hooks<R>(
     events: SyncEvents,
 ) -> Result<SyncExecution>
 where
-    R: Registry + state::StateStore,
+    R: StateStore,
 {
     let mut run = apply_target_changes(deploy)?;
     run.events.applied.splice(0..0, events.applied);
@@ -978,13 +992,7 @@ where
         ));
     }
     let mut had_failures = run.had_failures;
-    let readonly_registry;
-    let registry: &dyn Registry = if deploy.input.lockless() {
-        readonly_registry = crate::store::FrozenReadOnlyRegistry::new(deploy.registry);
-        &readonly_registry
-    } else {
-        deploy.registry
-    };
+    let registry: &dyn StateStore = deploy.registry;
     if !deploy.input.prune() {
         notify_orphans(deploy.config, registry, &mut run.events)?;
     }
@@ -1075,7 +1083,7 @@ fn run_pre_sync(input: &SyncRunInput<'_>, config: &Config) -> Result<Vec<hooks::
 fn run_all_hooks(
     input: &dyn RunOptions,
     config: &Config,
-    registry: &dyn Registry,
+    registry: &dyn StateStore,
     base_lock: &mut Lock,
     hook_candidates: &[transitive::TransitiveHookCandidate],
     effective_lock: Option<&Lock>,
@@ -1084,7 +1092,11 @@ fn run_all_hooks(
     // pre_sync + pre_deploy render before post_sync/on_change, so they seed the result vec.
     let mut hook_results = early_hooks;
     if input.hooks_enabled() {
-        hook_results.append(&mut hooks::dispatch_hooks(config, registry)?);
+        hook_results.append(&mut hooks::dispatch_hooks(
+            config,
+            registry,
+            input.lockless(),
+        )?);
     }
     let mut stripped = 0;
     if input.transitive_hooks_enabled() {
@@ -1101,7 +1113,7 @@ fn run_all_hooks(
 }
 
 struct BindingOffer<'projection> {
-    selection: crate::kernel::OfferSelection,
+    selection: crate::projection::offer::OfferSelection,
     projected: &'projection crate::projection::model::BindingProjection,
     deploy_mode: DeployMode,
     ref_label: String,
@@ -1114,7 +1126,7 @@ struct SealedRecordPolicy {
 }
 
 impl SealedRecordPolicy {
-    fn classify(record: &RegistryRecord, offer: &BindingOffer<'_>) -> Self {
+    fn classify(record: &ArtifactRecord, offer: &BindingOffer<'_>) -> Self {
         Self {
             immutable_copy: !record.linked && offer.deploy_mode == DeployMode::Copy,
             commit_differs: record.commit != offer.projected.commit,
@@ -1142,10 +1154,10 @@ fn validate_sealed_offer(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
     projection: &Projection,
-    recorded: &[RegistryRecord],
+    recorded: &[ArtifactRecord],
     fast_forward: bool,
-) -> Result<Vec<RegistryRecord>> {
-    use crate::kernel::OfferSelection;
+) -> Result<Vec<ArtifactRecord>> {
+    use crate::projection::offer::OfferSelection;
 
     let mut offers: BTreeMap<(String, String), BindingOffer<'_>> = BTreeMap::new();
     for (target_name, target) in &config.targets {
@@ -1241,11 +1253,11 @@ fn validate_sealed_offer(
 
 fn record_source_paths(
     binding: &crate::projection::model::BindingProjection,
-    record: &RegistryRecord,
+    record: &ArtifactRecord,
 ) -> Result<BTreeSet<String>> {
     let artifact = record.key.artifact.as_str();
     let mut paths = BTreeSet::from([artifact.to_owned()]);
-    if !record.linked && record.kind == crate::store::RecordKind::Dir {
+    if !record.linked && record.kind == crate::sync::state::RecordKind::Dir {
         for file in &record.files {
             let relative = persisted_manifest_relative_path(&file.path)?;
             paths.insert(format!("{artifact}/{relative}"));
@@ -1293,31 +1305,20 @@ fn paths_overlap(first: &str, second: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-#[cfg(test)]
-fn prune_fast_forward_drops(
-    projection: &Projection,
-    config: &Config,
-    registry: &dyn Registry,
-    protected: &confine::ProtectedPathSet,
-    drops: &[RegistryRecord],
-) -> Result<()> {
-    let mut events = SyncEvents::default();
-    prune_fast_forward_drops_report(projection, config, registry, protected, drops, &mut events)
-}
-
 fn prune_fast_forward_drops_report(
     projection: &Projection,
     config: &Config,
-    registry: &dyn Registry,
+    registry: &dyn StateStore,
     protected: &confine::ProtectedPathSet,
-    drops: &[RegistryRecord],
+    drops: &[ArtifactRecord],
+    lockless: bool,
     events: &mut SyncEvents,
 ) -> Result<()> {
     if drops.is_empty() {
         return Ok(());
     }
-    if registry.refuses_writes() {
-        return Err(registry.readonly_error().into());
+    if lockless {
+        return Err(readonly_state_error(registry));
     }
     let expected_paths = prune::expected_live_paths(projection, config);
     for record in drops {
@@ -1354,7 +1355,7 @@ fn prune_fast_forward_drops_report(
             remove_orphan_path(&path)
                 .map_err(|e| Error::Sync(format!("fast-forward prune {}: {e}", path.display())))?;
         }
-        registry.remove(&record.key)?;
+        registry.remove_artifact(&record.key)?;
     }
     Ok(())
 }
@@ -1413,9 +1414,9 @@ fn short_commit(commit: &str) -> &str {
     commit.get(..8).unwrap_or(commit)
 }
 
-fn live_recorded_artifacts(registry: &dyn Registry) -> Result<Vec<RegistryRecord>> {
-    let recorded = registry.list_all()?;
-    let ejected = crate::store::ejected_index(registry, &recorded)?;
+fn live_recorded_artifacts(registry: &dyn StateStore) -> Result<Vec<ArtifactRecord>> {
+    let recorded = registry.all_artifacts()?;
+    let ejected = crate::sync::state::ejected_index(registry, &recorded)?;
     Ok(recorded
         .into_iter()
         .filter(|r| {
@@ -1528,7 +1529,7 @@ pub(crate) fn inject_composed_graph(
     config: &mut Config,
     parsed: &mut BTreeMap<String, ParsedSource>,
     remotes: &mut BTreeMap<String, String>,
-    backend: &(dyn SourceBackend + Sync),
+    backend: &dyn SourceStore,
     lock: Option<&Lock>,
 ) {
     if let Ok(graph) = transitive::resolve_transitive_graph(config, parsed, backend, true, lock) {
@@ -1619,7 +1620,7 @@ pub(super) fn remove_orphan_path(path: &Path) -> std::io::Result<()> {
 
 pub fn eject(
     config: &Config,
-    registry: &dyn Registry,
+    registry: &dyn StateStore,
     artifact: &str,
     source: &str,
     target: &str,
@@ -1632,23 +1633,23 @@ pub fn eject(
         source: source.to_owned(),
         artifact: artifact.to_owned(),
     };
-    if registry.get(&key)?.is_none() {
-        return Err(Error::Registry(format!(
+    if registry.artifact(&key)?.is_none() {
+        return Err(Error::StateStore(format!(
             "{source}/{artifact} is not managed in target {target}"
         )));
     }
 
-    let mut ejected = registry.load_ejected(target)?;
+    let mut ejected = registry.ejections(target)?;
     let already = ejected
         .iter()
         .any(|e| e.source == source && e.artifact == artifact);
     if !already {
-        ejected.push(EjectedEntry {
+        ejected.push(Ejection {
             source: source.to_owned(),
             artifact: artifact.to_owned(),
             ejected_at: chrono::Utc::now().to_rfc3339(),
         });
-        registry.save_ejected(target, &ejected)?;
+        registry.save_ejections(target, &ejected)?;
     }
     // Record kept (not removed): list/where render `ejected` from it, and uneject restores by clearing the entry alone.
     Ok(())
@@ -1656,7 +1657,7 @@ pub fn eject(
 
 pub fn uneject(
     config: &Config,
-    registry: &dyn Registry,
+    registry: &dyn StateStore,
     artifact: &str,
     source: &str,
     target: &str,
@@ -1664,7 +1665,7 @@ pub fn uneject(
     if !config.targets.contains_key(target) {
         return Err(Error::Config(format!("unknown target: {target}")));
     }
-    let mut ejected = registry.load_ejected(target)?;
+    let mut ejected = registry.ejections(target)?;
     ejected.retain(|e| !(e.source == source && e.artifact == artifact));
-    Ok(registry.save_ejected(target, &ejected)?)
+    Ok(registry.save_ejections(target, &ejected)?)
 }

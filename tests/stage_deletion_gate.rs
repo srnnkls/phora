@@ -482,15 +482,17 @@ fn source_backend_declares_export_artifact() -> bool {
 // ─── end-state: the old export port is gone ──────────────────────────────────
 
 #[test]
-fn export_artifact_is_removed_from_the_source_backend_trait() {
-    let scanned = scan(&read_src("source/mod.rs"));
-    let methods = trait_method_names(&scanned, "SourceBackend")
-        .expect("src/source/mod.rs must declare `pub trait SourceBackend`");
+fn source_backend_is_removed_after_the_staging_rewire() {
+    let survivors: Vec<String> = source_files()
+        .into_iter()
+        .filter(|(_, content)| references_token(&scan(content), "SourceBackend"))
+        .map(|(rel, _)| format!("src/{rel}"))
+        .collect();
     assert!(
-        !methods.contains(&"export_artifact".to_owned()),
-        "T016 removes `export_artifact` from SourceBackend after both consumers rewire onto \
-         stage_artifact — the staging surface is sync-owned now (INV-2 staging clause). Trait \
-         still declares: {methods:?}"
+        survivors.is_empty(),
+        "T030 removes SourceBackend after staging rewires onto sync::stage and source reads \
+         through SourceStore; live source files still naming the legacy capability: \
+         {survivors:?}"
     );
 }
 
@@ -567,7 +569,7 @@ fn rebuild_one_drives_the_relocated_stage_artifact() {
             !references_token(&scanned, old),
             "src/sync/rebuild.rs must not reference the deleted export port `{old}` after the \
              rewire — it stages through stage_artifact and converts StagedFile -> ManifestFile \
-             for the RegistryRecord"
+             for the ArtifactRecord"
         );
     }
 }
@@ -610,9 +612,9 @@ fn no_production_code_outside_source_calls_export_artifact() {
 // ─── the deletion must not over-reach ────────────────────────────────────────
 
 #[test]
-fn manifest_file_remains_registry_state_owned_through_the_compatibility_facade() {
+fn manifest_file_remains_registry_state_owned_after_store_facade_deletion() {
     let state_file = scan(&read_src("sync/state/file.rs"));
-    let store_facade = scan(&read_src("store.rs"));
+    let lib_rs = strip(&read_src("lib.rs"));
     let definition_sites: Vec<String> = prod_src_files()
         .into_iter()
         .filter(|(_, content)| defines_type(&scan(content), "ManifestFile"))
@@ -631,23 +633,23 @@ fn manifest_file_remains_registry_state_owned_through_the_compatibility_facade()
          it must not become source- or staging-owned: {definition_sites:?}"
     );
     assert!(
-        !defines_type(&store_facade, "ManifestFile"),
-        "src/store.rs is a compatibility facade and must not retain a ManifestFile definition"
+        !src_dir().join("store.rs").exists(),
+        "T030 deletes the obsolete src/store.rs compatibility facade"
     );
     assert!(
-        top_level_public_use_references(&store_facade, "ManifestFile"),
-        "src/store.rs must continue to publicly re-export ManifestFile for compatibility"
+        !keyword_names(&lib_rs, "mod", "store"),
+        "T030 removes the obsolete store module declaration from src/lib.rs"
     );
 
     let registry_record = state_file
-        .find("pub struct RegistryRecord")
+        .find("pub struct ArtifactRecord")
         .and_then(|start| balanced_body(&state_file[start..]))
         .unwrap_or_default();
     let files_type = top_level_field_type(&registry_record, "files").unwrap_or_default();
     assert!(
         references_token(files_type, "ManifestFile"),
         "ManifestFile remains the registry/state value stored specifically by \
-         RegistryRecord.files; found type: {files_type:?}"
+         ArtifactRecord.files; found type: {files_type:?}"
     );
 }
 
@@ -763,7 +765,7 @@ fn helper_forbidden_import_scan_ignores_comments_and_strings() {
 #[test]
 fn helper_top_level_public_use_handles_groups_but_rejects_private_modules() {
     let grouped =
-        scan("pub use crate::sync::state::{\n    RegistryRecord,\n    ManifestFile,\n};\n");
+        scan("pub use crate::sync::state::{\n    ArtifactRecord,\n    ManifestFile,\n};\n");
     assert!(
         top_level_public_use_references(&grouped, "ManifestFile"),
         "a grouped multiline top-level public re-export must count"
@@ -771,7 +773,7 @@ fn helper_top_level_public_use_handles_groups_but_rejects_private_modules() {
 
     let private_only = scan(
         "mod private {\n    pub use crate::sync::state::ManifestFile;\n}\n\
-         pub use crate::sync::state::RegistryRecord;\n",
+         pub use crate::sync::state::ArtifactRecord;\n",
     );
     assert!(
         !top_level_public_use_references(&private_only, "ManifestFile"),
@@ -782,10 +784,10 @@ fn helper_top_level_public_use_handles_groups_but_rejects_private_modules() {
 #[test]
 fn helper_top_level_field_type_binds_the_named_field() {
     let valid = balanced_body(&scan(
-        "pub struct RegistryRecord {\n    marker: String,\n    pub files: \
+        "pub struct ArtifactRecord {\n    marker: String,\n    pub files: \
              Vec<ManifestFile>,\n}",
     ))
-    .expect("valid RegistryRecord body parses");
+    .expect("valid ArtifactRecord body parses");
     assert!(
         top_level_field_type(&valid, "files")
             .is_some_and(|ty| references_token(ty, "ManifestFile")),
@@ -793,10 +795,10 @@ fn helper_top_level_field_type_binds_the_named_field() {
     );
 
     let decoy = balanced_body(&scan(
-        "pub struct RegistryRecord {\n    pub files: Vec<ScannedFile>,\n    \
+        "pub struct ArtifactRecord {\n    pub files: Vec<ScannedFile>,\n    \
              marker: Option<ManifestFile>,\n}",
     ))
-    .expect("decoy RegistryRecord body parses");
+    .expect("decoy ArtifactRecord body parses");
     assert!(
         top_level_field_type(&decoy, "files")
             .is_some_and(|ty| !references_token(ty, "ManifestFile")),

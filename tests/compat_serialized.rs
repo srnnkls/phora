@@ -20,25 +20,26 @@ use std::str::FromStr as _;
 
 use phora::config::transitive::{FetchNode, Instance};
 use phora::config::{Config, TemplateOptIn, admit_transitive_hooks, hook_preimage};
-use phora::kernel::SourceName;
 use phora::lock::{CandidateHookRecord, LOCK_SCHEMA_VERSION, Lock, TrustedHook};
 use phora::projection::model::{
     ArtifactRelativePath, BindingProjectionInput, CollapsePreference, ContentTransform, LayoutSpec,
     LayoutStyle, Materialization, MaterializationPolicy, OfferSpec, ProjectedArtifact,
     ProjectedLeaf, ResolvedSourceRef, TakeSpec, TargetPath, TargetProjection, TemplatePolicy,
 };
+use phora::source::SourceName;
 use phora::source::{
-    ExportPolicy, GitBackend, MirrorKey, NormalizedUrl, ResolvedSource, SnapshotId,
-    SourceBackend as _, SourceInventory, SourcePath, SourceStore, vars_digest,
+    ExportPolicy, GitBackend, MirrorKey, NormalizedUrl, ResolvePolicy, ResolveRequest,
+    ResolvedSource, RevisionSpec, SnapshotId, SourceDirectoryEntry, SourceEntry, SourceInventory,
+    SourceLocation, SourcePath, SourceStore, digest_snapshot, vars_digest,
 };
-use phora::store::{FileRegistry, Registry as _};
+use phora::sync::state::{FileStateStore, StateStore as _};
 use phora::sync::{StageRequest, stage_artifact};
 use tempfile::TempDir;
 
 mod common;
 
-/// A `compute_digest` selection case: label, optional root, include globs, exclude globs.
-type DigestCase<'a> = (&'a str, Option<&'a str>, &'a [&'a str], &'a [&'a str]);
+/// A pinned source digest case: label, optional source root, explicit selected leaves.
+type DigestCase<'a> = (&'a str, Option<&'a str>, &'a [&'a str]);
 
 /// The unmoved baseline this whole file is pinned against (INV-4).
 const BASELINE_COMMIT: &str = "92c784e3b14496be25dcecc8d4500e32b52b1c50";
@@ -732,6 +733,7 @@ struct DigestFixture {
     backend: GitBackend,
     url: String,
     commit: String,
+    resolved: ResolvedSource,
 }
 
 fn build_digest_fixture() -> DigestFixture {
@@ -750,9 +752,16 @@ fn build_digest_fixture() -> DigestFixture {
     let git_dir = TempDir::new().expect("git dir tempdir");
     let backend = GitBackend::new(git_dir.path().to_path_buf());
     let url = src.path().to_string_lossy().into_owned();
-    backend
-        .fetch(&sn("fixture"), &url)
-        .expect("fetch builds mirror");
+    let resolved = SourceStore::resolve(
+        &backend,
+        &ResolveRequest {
+            name: sn("fixture"),
+            location: SourceLocation::Git { url: url.clone() },
+            revision: RevisionSpec::Commit(commit.parse().expect("fixture commit is valid hex")),
+        },
+        ResolvePolicy::Refresh,
+    )
+    .expect("refresh builds and resolves the mirror");
 
     DigestFixture {
         _src: src,
@@ -760,51 +769,135 @@ fn build_digest_fixture() -> DigestFixture {
         backend,
         url,
         commit,
+        resolved,
+    }
+}
+
+struct RootedDigestStore<'a> {
+    inner: &'a GitBackend,
+    root: &'a str,
+}
+
+impl SourceStore for RootedDigestStore<'_> {
+    fn resolve(
+        &self,
+        request: &ResolveRequest,
+        policy: ResolvePolicy,
+    ) -> Result<ResolvedSource, phora::source::SourceError> {
+        SourceStore::resolve(self.inner, request, policy)
+    }
+
+    fn inventory(
+        &self,
+        snapshot: &SnapshotId,
+        root: Option<&SourcePath>,
+    ) -> Result<SourceInventory, phora::source::SourceError> {
+        SourceStore::inventory(self.inner, snapshot, root)
+    }
+
+    fn read(
+        &self,
+        snapshot: &SnapshotId,
+        path: &SourcePath,
+    ) -> Result<SourceEntry, phora::source::SourceError> {
+        let rooted = SourcePath::new(&format!("{}/{}", self.root, path.as_str()))
+            .expect("fixture root and leaf form a safe path");
+        let mut entry = SourceStore::read(self.inner, snapshot, &rooted)?;
+        entry.meta.path = path.clone();
+        Ok(entry)
+    }
+
+    fn list_directory(
+        &self,
+        snapshot: &SnapshotId,
+        path: Option<&SourcePath>,
+    ) -> Result<Vec<SourceDirectoryEntry>, phora::source::SourceError> {
+        SourceStore::list_directory(self.inner, snapshot, path)
+    }
+}
+
+fn selected_source_digest(fx: &DigestFixture, root: Option<&str>, leaves: &[&str]) -> String {
+    let leaves: Vec<SourcePath> = leaves
+        .iter()
+        .map(|path| SourcePath::new(path).expect("fixture path is safe"))
+        .collect();
+    match root {
+        Some(root) => digest_snapshot(
+            &RootedDigestStore {
+                inner: &fx.backend,
+                root,
+            },
+            &fx.resolved.snapshot,
+            &leaves,
+        ),
+        None => digest_snapshot(&fx.backend, &fx.resolved.snapshot, &leaves),
+    }
+    .expect("digest_snapshot succeeds")
+}
+
+fn append_aggregate_selection_digests(doc: &mut String, fx: &DigestFixture) {
+    let cases: [DigestCase; 5] = [
+        (
+            "full-tree",
+            None,
+            &[
+                ".config/settings.json",
+                "README.md",
+                "editor/init.lua",
+                "editor/lua/opts.lua",
+                "lint/rules.toml",
+            ],
+        ),
+        (
+            "exclude-root-loose",
+            None,
+            &[
+                ".config/settings.json",
+                "editor/init.lua",
+                "editor/lua/opts.lua",
+                "lint/rules.toml",
+            ],
+        ),
+        (
+            "exclude-dotfile-dir",
+            None,
+            &[
+                "README.md",
+                "editor/init.lua",
+                "editor/lua/opts.lua",
+                "lint/rules.toml",
+            ],
+        ),
+        (
+            "editor-subtree",
+            None,
+            &["editor/init.lua", "editor/lua/opts.lua"],
+        ),
+        ("rooted-dotfile", Some(".config"), &["settings.json"]),
+    ];
+
+    doc.push_str("[aggregate-selection-digest]\n");
+    for (label, root, leaves) in cases {
+        doc.push_str(label);
+        doc.push_str(" = ");
+        doc.push_str(&selected_source_digest(fx, root, leaves));
+        doc.push('\n');
     }
 }
 
 #[test]
 fn source_and_file_digests_are_byte_identical() {
     let fx = build_digest_fixture();
-    let to_vec = |xs: &[&str]| xs.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
-    let digest = |root: Option<&str>, include: &[&str], exclude: &[&str]| {
-        fx.backend
-            .compute_digest(
-                &sn("fixture"),
-                &fx.url,
-                &fx.commit,
-                root.map(Path::new),
-                &to_vec(include),
-                &to_vec(exclude),
-            )
-            .expect("compute_digest succeeds")
-    };
-
-    let cases: [DigestCase; 5] = [
-        ("full-tree", None, &[], &[]),
-        ("exclude-root-loose", None, &[], &["/README.md"]),
-        ("exclude-dotfile-dir", None, &[], &[".config/**"]),
-        ("editor-subtree", None, &["editor/**"], &[]),
-        ("rooted-dotfile", Some(".config"), &[], &[]),
-    ];
-
     let mut doc = String::new();
-    doc.push_str("[aggregate-selection-digest]\n");
-    for (label, root, include, exclude) in cases {
-        doc.push_str(label);
-        doc.push_str(" = ");
-        doc.push_str(&digest(root, include, exclude));
-        doc.push('\n');
-    }
+    append_aggregate_selection_digests(&mut doc, &fx);
 
-    let commit_time = fx
-        .backend
-        .commit_time(&sn("fixture"), &fx.url, &fx.commit)
-        .expect("commit_time");
-    let leaf_paths = fx
-        .backend
-        .list_source_leaves(&sn("fixture"), &fx.url, &fx.commit, None)
-        .expect("list source leaves");
+    let commit_time = fx.resolved.authored_at.unix_seconds();
+    let leaf_paths: Vec<String> = SourceStore::inventory(&fx.backend, &fx.resolved.snapshot, None)
+        .expect("inventory source leaves")
+        .entries
+        .iter()
+        .map(|entry| entry.path.as_str().to_owned())
+        .collect();
     let leaves: Vec<ProjectedLeaf> = leaf_paths
         .iter()
         .map(|p| ProjectedLeaf {
@@ -828,13 +921,18 @@ fn source_and_file_digests_are_byte_identical() {
         artifacts: Vec::new(),
         warnings: Vec::new(),
     };
-    let resolved = ResolvedSource {
-        name: sn("fixture"),
-        url: fx.url.clone(),
-        snapshot: SnapshotId::Git {
-            commit: fx.commit.clone(),
+    let resolved = SourceStore::resolve(
+        &fx.backend,
+        &ResolveRequest {
+            name: sn("fixture"),
+            location: SourceLocation::Git {
+                url: fx.url.clone(),
+            },
+            revision: RevisionSpec::Commit(fx.commit.parse().expect("fixture commit is valid hex")),
         },
-    };
+        ResolvePolicy::CachedOnly,
+    )
+    .expect("resolve digest fixture snapshot");
     let staging = TempDir::new().expect("staging tempdir");
     let policy = ExportPolicy::default();
     let vars: BTreeMap<String, String> = BTreeMap::new();
@@ -851,7 +949,7 @@ fn source_and_file_digests_are_byte_identical() {
         &TemplateOptIn::SuffixOnly,
         |repo_relative| {
             let path = SourcePath::new(&repo_relative.to_string_lossy().replace('\\', "/"))?;
-            let entry = SourceStore::read(&fx.backend, &resolved, &path)?;
+            let entry = SourceStore::read(&fx.backend, &resolved.snapshot, &path)?;
             Ok((entry.bytes, entry.meta.kind))
         },
     )
@@ -1081,7 +1179,7 @@ fn hook_trust_lock_variants_serialized_are_byte_identical() {
 #[test]
 fn hook_success_state_serialized_is_byte_identical() {
     let root = TempDir::new().expect("state tempdir");
-    let registry = FileRegistry::open(root.path().join("state")).expect("open registry");
+    let registry = FileStateStore::open(root.path().join("state")).expect("open registry");
     let set: std::collections::BTreeSet<String> = ["blake3:aaaa1111", "blake3:bbbb2222"]
         .into_iter()
         .map(str::to_owned)
@@ -1202,9 +1300,9 @@ fn preview_json_artifact_identities(json: &str) -> BTreeSet<ArtifactIdentity> {
         .collect()
 }
 
-fn registry_artifact_identities(registry: &FileRegistry) -> BTreeSet<ArtifactIdentity> {
+fn registry_artifact_identities(registry: &FileStateStore) -> BTreeSet<ArtifactIdentity> {
     registry
-        .list_all()
+        .all_artifacts()
         .expect("registry records are readable")
         .into_iter()
         .map(|record| (record.key.target, record.key.source, record.key.artifact))
@@ -1281,13 +1379,18 @@ fn moved_path_projection(fx: &Fixture, layout_override: Option<LayoutSpec>) -> T
     let backend = GitBackend::new(git_dir.path().to_path_buf());
     let url = fx.src_path.to_string_lossy().into_owned();
     let name = sn(binding.source);
-    backend.fetch(&name, &url).expect("fetch builds mirror");
-    let leaves = backend
-        .list_source_leaves(&name, &url, &commit, None)
-        .expect("list source leaves");
-
-    let inventory =
-        SourceInventory::from_paths(leaves.iter().map(String::as_str)).expect("valid inventory");
+    let resolved_source = SourceStore::resolve(
+        &backend,
+        &ResolveRequest {
+            name,
+            location: SourceLocation::Git { url },
+            revision: RevisionSpec::Commit(commit.parse().expect("fixture commit is valid hex")),
+        },
+        ResolvePolicy::Refresh,
+    )
+    .expect("refresh and resolve fixture source");
+    let inventory = SourceStore::inventory(&backend, &resolved_source.snapshot, None)
+        .expect("inventory source leaves");
     let offer = OfferSpec::from(source.offer());
     let take = TakeSpec::from_entries(binding.take);
     let templates = TemplatePolicy::from(&binding.template_opt_in);
@@ -1316,9 +1419,9 @@ fn destinations_of(projection: &TargetProjection) -> Vec<String> {
         .collect()
 }
 
-fn seed_projection_identity_axis_controls(fx: &Fixture, registry: &FileRegistry) {
+fn seed_projection_identity_axis_controls(fx: &Fixture, registry: &FileStateStore) {
     let canonical = registry
-        .list_all()
+        .all_artifacts()
         .expect("read seeded managed record")
         .pop()
         .expect("the fixture sync manages one record");
@@ -1338,17 +1441,17 @@ fn seed_projection_identity_axis_controls(fx: &Fixture, registry: &FileRegistry)
     "control-target".clone_into(&mut divergent_target.key.target);
     divergent_target.deploy_root = None;
     registry
-        .put(&divergent_target)
+        .put_artifact(&divergent_target)
         .expect("seed target-only divergence");
     let mut divergent_binding = canonical.clone();
     "control-alias".clone_into(&mut divergent_binding.key.source);
     registry
-        .put(&divergent_binding)
+        .put_artifact(&divergent_binding)
         .expect("seed same-target binding-identity divergence");
     let mut divergent_artifact = canonical;
     "nested/control.lua".clone_into(&mut divergent_artifact.key.artifact);
     registry
-        .put(&divergent_artifact)
+        .put_artifact(&divergent_artifact)
         .expect("seed same-target published-key divergence");
     let seeded: BTreeSet<ArtifactIdentity> = [
         (
@@ -1485,7 +1588,7 @@ fn preview_sync_and_prune_share_one_projected_artifact_identity_set() {
     assert_success(&out, "preview --json");
 
     let previewed = preview_json_artifact_identities(&String::from_utf8_lossy(&out.stdout));
-    let registry = FileRegistry::open(fx.registry_dir()).expect("open live project registry");
+    let registry = FileStateStore::open(fx.registry_dir()).expect("open live project registry");
     let synced = registry_artifact_identities(&registry);
     let expected: BTreeSet<ArtifactIdentity> = [(
         "home".to_owned(),
@@ -1542,7 +1645,7 @@ fn link_source_is_projected_once_across_deploy_and_prune() {
     let out = fx.run(&["sync", "--prune"]);
     assert_success(&out, "link sync --prune");
 
-    let registry = FileRegistry::open(fx.registry_dir()).expect("open live project registry");
+    let registry = FileStateStore::open(fx.registry_dir()).expect("open live project registry");
     let actual = registry_artifact_identities(&registry);
     let expected: BTreeSet<ArtifactIdentity> = ["editor", "lint"]
         .map(|artifact| {

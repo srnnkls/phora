@@ -1,4 +1,4 @@
-//! Registry-free, network-free projection orchestration shared by sync, prune, and preview.
+//! StateStore-free, network-free projection orchestration shared by sync, prune, and preview.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -6,11 +6,11 @@ use std::path::Path;
 use crate::config::{Config, DeployMode, ParsedSource, Target};
 use crate::error::{Error, Result};
 use crate::lock::encode_ref;
-use crate::source::SourceName;
-use crate::source::{SourceBackend, SourceInventory};
+use crate::source::{SourceInventory, SourceStore};
 
 use super::discover::discover_working_tree_leaves;
 use super::remote_for;
+use super::resolve::ResolvedSourceMap;
 
 use crate::projection::build::{build_workspace, project_target};
 use crate::projection::model::{
@@ -30,10 +30,18 @@ pub fn plan_target(
     target: &Target,
     parsed: &BTreeMap<String, ParsedSource>,
     remotes: &BTreeMap<String, String>,
-    backend: &dyn SourceBackend,
+    store: &dyn SourceStore,
     resolved_commits: &BTreeMap<(String, String), String>,
+    resolved_sources: &ResolvedSourceMap,
 ) -> Result<TargetProjection> {
-    let discovery = discover_target(target, parsed, remotes, backend, resolved_commits)?;
+    let discovery = discover_target(
+        target,
+        parsed,
+        remotes,
+        store,
+        resolved_commits,
+        resolved_sources,
+    )?;
     Ok(project_target(target_name, &binding_inputs(&discovery))?)
 }
 
@@ -46,8 +54,9 @@ fn discover_target(
     target: &Target,
     parsed: &BTreeMap<String, ParsedSource>,
     remotes: &BTreeMap<String, String>,
-    backend: &dyn SourceBackend,
+    store: &dyn SourceStore,
     resolved_commits: &BTreeMap<(String, String), String>,
+    resolved_sources: &ResolvedSourceMap,
 ) -> Result<TargetDiscovery> {
     let layout = LayoutSpec::from(&target.layout());
     let mut discovered = Vec::new();
@@ -71,8 +80,15 @@ fn discover_target(
                 ))
             })?
             .clone();
-        let name = SourceName::trusted(binding.source);
-        let leaves = discover_binding_leaves(source, &name, &commit, remotes, backend)?;
+        let resolved = resolved_sources
+            .get(&(binding.source.to_owned(), commit.clone()))
+            .ok_or_else(|| {
+                Error::Sync(format!(
+                    "no resolved snapshot for {} at {commit}",
+                    binding.source
+                ))
+            })?;
+        let leaves = discover_binding_leaves(source, binding.source, remotes, store, resolved)?;
         discovered.push(DiscoveredBinding {
             identity: binding.identity.to_owned(),
             source: ResolvedSourceRef::new(binding.source, commit),
@@ -120,15 +136,20 @@ struct DiscoveredBinding {
 /// own include/exclude is applied downstream by `OfferSelection`.
 fn discover_binding_leaves(
     source: &ParsedSource,
-    source_name: &SourceName,
-    commit: &str,
+    source_name: &str,
     remotes: &BTreeMap<String, String>,
-    backend: &dyn SourceBackend,
+    store: &dyn SourceStore,
+    resolved: &crate::source::ResolvedSource,
 ) -> Result<Vec<String>> {
-    let git = remote_for(remotes, source_name.as_str())?;
+    let git = remote_for(remotes, source_name)?;
     match source.deploy_mode() {
         DeployMode::Link => Ok(discover_working_tree_leaves(Path::new(git), None)?),
-        DeployMode::Copy => Ok(backend.list_source_leaves(source_name, git, commit, None)?),
+        DeployMode::Copy => Ok(store
+            .inventory(&resolved.snapshot, None)?
+            .entries
+            .into_iter()
+            .map(|entry| entry.path.to_string())
+            .collect()),
     }
 }
 
@@ -141,8 +162,9 @@ pub fn project_workspace(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
     remotes: &BTreeMap<String, String>,
-    backend: &dyn SourceBackend,
+    store: &dyn SourceStore,
     resolved_commits: &BTreeMap<(String, String), String>,
+    resolved_sources: &ResolvedSourceMap,
 ) -> Result<Projection> {
     let discoveries = config
         .targets
@@ -150,7 +172,14 @@ pub fn project_workspace(
         .map(|(name, target)| {
             Ok((
                 name.as_str(),
-                discover_target(target, parsed, remotes, backend, resolved_commits)?,
+                discover_target(
+                    target,
+                    parsed,
+                    remotes,
+                    store,
+                    resolved_commits,
+                    resolved_sources,
+                )?,
             ))
         })
         .collect::<Result<Vec<_>>>()?;

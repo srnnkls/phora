@@ -5,25 +5,57 @@ use super::SourceName;
 use super::archive::{EntryKind, ExtractedEntry};
 use super::cache::lock_mirror;
 use super::import::import_tree;
-use super::snapshot::SnapshotId;
-use super::{Result, SourceError};
+use super::snapshot::{CanonicalSourceRoot, SnapshotId, SourceTimestamp, commit_from_hex};
+use super::{Commit, MirrorKey, NormalizedUrl, Result, SourceError};
 
 pub fn capture_worktree(git_dir: &Path, source: &SourceName, root: &Path) -> Result<SnapshotId> {
+    let root = root.canonicalize().map_err(|error| {
+        SourceError::Source(format!("canonicalize worktree for {source}: {error}"))
+    })?;
     std::fs::create_dir_all(git_dir)
         .map_err(|e| SourceError::Source(format!("create cache dir for {source}: {e}")))?;
-    let cache_rel = contained_cache_rel(root, git_dir);
+    let cache_rel = contained_cache_rel(&root, git_dir);
     let mut entries = Vec::new();
-    collect_capture_entries(root, Path::new(""), cache_rel.as_deref(), &mut entries)?;
+    collect_capture_entries(&root, Path::new(""), cache_rel.as_deref(), &mut entries)?;
     let head = read_local_head(&root.to_string_lossy())
         .map_err(|e| SourceError::Source(format!("read head of {source}: {e}")))?;
     let url = root.to_string_lossy().into_owned();
     let _lock = lock_mirror(git_dir, source, &url)?;
     let capture_digest = import_tree(git_dir, &url, &entries)?;
+    let head = (head != "link")
+        .then(|| commit_from_hex(&head))
+        .transpose()?;
+    let mirror = MirrorKey::from_url(&NormalizedUrl::parse(&url));
+    let capture_digest = commit_from_hex(&capture_digest)?;
     Ok(SnapshotId::Worktree {
-        root: root.to_path_buf(),
+        root: CanonicalSourceRoot::from_canonical(root),
         head,
+        mirror,
         capture_digest,
     })
+}
+
+pub(super) fn worktree_authored_at(root: &Path, head: &Commit) -> Result<SourceTimestamp> {
+    let repo = gix::open(root).map_err(|error| {
+        SourceError::Source(format!("open worktree {}: {error}", root.display()))
+    })?;
+    let commit = repo
+        .find_commit(
+            gix::ObjectId::from_hex(head.as_str().as_bytes()).map_err(|error| {
+                SourceError::Source(format!("parse worktree head {head}: {error}"))
+            })?,
+        )
+        .map_err(|error| SourceError::Source(format!("find worktree head {head}: {error}")))?;
+    let seconds = commit
+        .author()
+        .map_err(|error| SourceError::Source(format!("author of {head}: {error}")))?
+        .time()
+        .map_err(|error| SourceError::Source(format!("author time of {head}: {error}")))?
+        .seconds;
+    Ok(SourceTimestamp::from_unix_seconds(
+        u64::try_from(seconds)
+            .map_err(|error| SourceError::Source(format!("author time of {head}: {error}")))?,
+    ))
 }
 
 fn contained_cache_rel(root: &Path, git_dir: &Path) -> Option<PathBuf> {

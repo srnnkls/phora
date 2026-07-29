@@ -406,12 +406,12 @@ const CONTRACT_FORBIDDEN_TOKENS: &[&str] = &[
     "TemplateOptIn",
     "LayoutConfig",
     "Config",
-    "RegistryRecord",
+    "ArtifactRecord",
     "ManifestFile",
     "ExportRequest",
     "ExportLeaf",
     "SourceBackend",
-    "Registry",
+    "StateStore",
     "Journal",
 ];
 

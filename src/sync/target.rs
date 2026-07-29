@@ -3,21 +3,20 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{DeployMode, LayoutConfig, ParsedSource, Target, TemplateOptIn};
 use crate::error::{Error, Result};
-use crate::kernel::Materialization;
-use crate::source::{ResolvedSource, SnapshotId, SourceBackend, SourcePath};
-use crate::source::{SourceName, safe_relpath};
-use crate::store::{
-    ArtifactKey, EjectedEntry, ManifestFile, ProjectedRecord, RecordKind, Registry, RegistryRecord,
-    ScannedFile,
+use crate::projection::model::{ContentTransform, Materialization};
+use crate::source::{ResolvedSource, SourceIdentity, SourcePath, SourceStore, safe_relpath};
+use crate::sync::state::{
+    ArtifactKey, ArtifactRecord, Ejection, ManifestFile, NewArtifactRecord, RecordKind,
+    ScannedFile, StateStore,
 };
 
 use super::apply::{apply_artifact_report, link_artifact};
 use super::confine::{ProtectedPathSet, confine_destination};
 use super::journal::Journal;
+use super::resolve::ResolvedSourceMap;
 use super::stage::{StageRequest, stage_artifact};
 use super::{
-    Conflict, ConflictResolver, Resolution, StageSource, StagingGuard, nonce, remote_for,
-    target_parent,
+    Conflict, ConflictResolver, Resolution, StagingGuard, nonce, remote_for, target_parent,
 };
 use crate::projection::diagnostic::ProjectionWarning;
 use crate::projection::model::{ProjectedArtifact, TargetProjection};
@@ -31,6 +30,7 @@ pub(super) struct TargetRun<'a> {
     pub(super) target_name: &'a str,
     pub(super) target: &'a Target,
     pub(super) remotes: &'a BTreeMap<String, String>,
+    pub(super) resolved_sources: &'a ResolvedSourceMap,
     pub(super) vars: &'a BTreeMap<String, String>,
     pub(super) protected: &'a ProtectedPathSet,
 }
@@ -71,7 +71,7 @@ pub(super) fn decisions_abort(decisions: &ConflictDecisions) -> bool {
 
 pub(super) type ChangeIndex<'a> = BTreeMap<(String, String, String), &'a SyncChange>;
 pub(super) type ObservationIndex<'a> =
-    BTreeMap<(String, String, String), &'a ObservedArtifact<RegistryRecord>>;
+    BTreeMap<(String, String, String), &'a ObservedArtifact<ArtifactRecord>>;
 
 pub(super) struct Reconciliation<'a> {
     observed: ObservationIndex<'a>,
@@ -82,7 +82,7 @@ pub(super) struct Reconciliation<'a> {
 impl<'a> Reconciliation<'a> {
     pub(super) fn new(
         changeset: &'a ChangeSet,
-        observed: &'a super::model::ObservedProjectState<RegistryRecord>,
+        observed: &'a super::model::ObservedProjectState<ArtifactRecord>,
         decisions: ConflictDecisions,
     ) -> Self {
         Self {
@@ -141,12 +141,12 @@ fn change_key(change: &SyncChange) -> (String, String, String) {
 pub(super) fn walk_projection_target(
     run: TargetRun<'_>,
     projection: &TargetProjection,
-    registry: &dyn Registry,
+    registry: &dyn StateStore,
     surface_warnings: bool,
     mut visit: impl FnMut(&TargetRun<'_>, &ArtifactEntry<'_>) -> Result<bool>,
 ) -> Result<bool> {
     let layout = run.target.layout();
-    let ejected = registry.load_ejected(run.target_name)?;
+    let ejected = registry.ejections(run.target_name)?;
     let mut had_failures = false;
 
     let template_opt_ins: BTreeMap<String, TemplateOptIn> = run
@@ -174,7 +174,15 @@ pub(super) fn walk_projection_target(
             ))
         })?;
         let git = remote_for(run.remotes, &binding.source)?;
-        let source_name = SourceName::trusted(&binding.source);
+        let resolved = run
+            .resolved_sources
+            .get(&(binding.source.clone(), binding.commit.clone()))
+            .ok_or_else(|| {
+                Error::Sync(format!(
+                    "binding `{}` has no immutable source snapshot at {}",
+                    binding.source, binding.commit
+                ))
+            })?;
 
         for item in &binding.artifacts {
             let key = item.materialization.published_key();
@@ -189,8 +197,8 @@ pub(super) fn walk_projection_target(
             };
             let entry = ArtifactEntry {
                 source,
+                resolved,
                 git,
-                source_name: &source_name,
                 identity: &binding.identity,
                 underlying_source: &binding.source,
                 commit: &binding.commit,
@@ -256,8 +264,8 @@ pub(super) fn deploy_reconciled_target(
     run: TargetRun<'_>,
     projection: &TargetProjection,
     reconciliation: &Reconciliation<'_>,
-    backend: &dyn StageSource,
-    registry: &dyn Registry,
+    backend: &dyn SourceStore,
+    registry: &dyn StateStore,
     journal: &Journal,
 ) -> Result<bool> {
     let mut events = SyncEvents::default();
@@ -276,8 +284,8 @@ pub(super) fn deploy_reconciled_target_report(
     run: TargetRun<'_>,
     projection: &TargetProjection,
     reconciliation: &Reconciliation<'_>,
-    backend: &dyn StageSource,
-    registry: &dyn Registry,
+    backend: &dyn SourceStore,
+    registry: &dyn StateStore,
     journal: &Journal,
     events: &mut SyncEvents,
 ) -> Result<bool> {
@@ -301,15 +309,15 @@ pub(super) fn deploy_reconciled_target_report(
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
-    reason = "one artifact apply coordinates the projection, reconciliation, I/O ports, journal, and report collector"
+    reason = "one artifact apply coordinates projection, reconciliation, source/state capabilities, journal, and report collection"
 )]
 fn apply_reconciled(
     run: &TargetRun<'_>,
     entry: &ArtifactEntry<'_>,
     projection: &TargetProjection,
     reconciliation: &Reconciliation<'_>,
-    backend: &dyn StageSource,
-    registry: &dyn Registry,
+    backend: &dyn SourceStore,
+    registry: &dyn StateStore,
     journal: &Journal,
     events: &mut SyncEvents,
 ) -> Result<bool> {
@@ -342,11 +350,10 @@ fn apply_reconciled(
                 deploy_root: deploy_root.clone(),
                 layout: entry.layout.clone(),
                 source: entry.source,
-                git: entry.git,
-                source_name: entry.source_name,
                 underlying_source: entry.underlying_source,
                 root: entry.source.offer().root(),
                 commit: entry.commit,
+                resolved: entry.resolved,
                 artifact: entry.item,
                 target: projection,
                 kind: entry.record_kind(),
@@ -457,7 +464,7 @@ fn apply_resolution(
     run: &TargetRun<'_>,
     entry: &ArtifactEntry<'_>,
     published_key: &str,
-    registry: &dyn Registry,
+    registry: &dyn StateStore,
     kind: &ConflictKind,
     events: &mut SyncEvents,
 ) -> Result<bool> {
@@ -488,13 +495,13 @@ fn apply_resolution(
             ))
         }
         Resolution::Eject => {
-            let mut ejected = registry.load_ejected(run.target_name)?;
-            ejected.push(EjectedEntry {
+            let mut ejected = registry.ejections(run.target_name)?;
+            ejected.push(Ejection {
                 source: entry.identity.to_owned(),
                 artifact: published_key.to_owned(),
                 ejected_at: chrono::Utc::now().to_rfc3339(),
             });
-            registry.save_ejected(run.target_name, &ejected)?;
+            registry.save_ejections(run.target_name, &ejected)?;
             events.applied.push(AppliedChange::Ejected {
                 target: run.target_name.to_owned(),
                 source: entry.identity.to_owned(),
@@ -509,7 +516,7 @@ fn apply_resolution(
 fn persist_metadata_refresh(
     observed: &ObservationIndex<'_>,
     triplet: &(String, String, String),
-    registry: &dyn Registry,
+    registry: &dyn StateStore,
     key: &ArtifactKey,
 ) -> Result<()> {
     if let Some(ObservedArtifact::Managed(managed)) = observed.get(triplet).copied()
@@ -543,15 +550,15 @@ fn unsafe_dest_diagnostic(dest: &str) -> Error {
 
 pub(super) struct ArtifactEntry<'a> {
     pub(super) source: &'a ParsedSource,
+    pub(super) resolved: &'a ResolvedSource,
     pub(super) git: &'a str,
-    pub(super) source_name: &'a SourceName,
     pub(super) identity: &'a str,
     pub(super) underlying_source: &'a str,
     pub(super) commit: &'a str,
     pub(super) item: &'a ProjectedArtifact,
     pub(super) artifact_dst: &'a Path,
     pub(super) layout: LayoutConfig,
-    pub(super) ejected: &'a [EjectedEntry],
+    pub(super) ejected: &'a [Ejection],
     pub(super) mode_transition: bool,
     pub(super) template_opt_in: &'a TemplateOptIn,
 }
@@ -569,7 +576,7 @@ impl ArtifactEntry<'_> {
     }
 }
 
-pub(crate) fn record_artifact_path(target: &Target, record: &RegistryRecord) -> PathBuf {
+pub(crate) fn record_artifact_path(target: &Target, record: &ArtifactRecord) -> PathBuf {
     target.expanded_path().join(
         target
             .layout()
@@ -579,7 +586,7 @@ pub(crate) fn record_artifact_path(target: &Target, record: &RegistryRecord) -> 
 
 /// A `File` record's single manifest file IS the dest, so its base is the dest's parent;
 /// a `Dir` record's base is the deployed directory itself.
-pub(super) fn record_manifest_base(target: &Target, record: &RegistryRecord) -> PathBuf {
+pub(super) fn record_manifest_base(target: &Target, record: &ArtifactRecord) -> PathBuf {
     let artifact_path = record_artifact_path(target, record);
     match record.kind {
         RecordKind::File => artifact_path
@@ -601,45 +608,36 @@ fn conflict_triplet(run: &TargetRun<'_>, entry: &ArtifactEntry<'_>) -> (String, 
 /// non-templated record skip the git-tree walk here and still resolve Clean (INV-8).
 pub(super) fn expected_vars_digest(
     entry: &ArtifactEntry<'_>,
-    backend: &dyn SourceBackend,
-    registry: &dyn Registry,
+    registry: &dyn StateStore,
     key: &ArtifactKey,
     vars: &BTreeMap<String, String>,
 ) -> Result<Option<String>> {
     if !matches!(entry.source.deploy_mode(), DeployMode::Copy) {
         return Ok(None);
     }
-    let Some(record) = registry.get(key)? else {
+    let Some(record) = registry.artifact(key)? else {
         return Ok(None);
     };
     if record.linked || record.vars_digest.is_none() {
         return Ok(None);
     }
-    let offer_root = entry.source.offer().root();
     let templated = match &entry.item.materialization {
         Materialization::Leaf(take) => entry.template_opt_in.renders(&take.source),
-        Materialization::CollapsedDir { dir } => {
-            let subtree = offer_root.map_or_else(|| PathBuf::from(dir), |r| r.join(dir));
-            let leaves = backend.list_source_leaves(
-                entry.source_name,
-                entry.git,
-                entry.commit,
-                Some(&subtree),
-            )?;
-            leaves
-                .iter()
-                .any(|leaf| entry.template_opt_in.renders(&format!("{dir}/{leaf}")))
-        }
+        Materialization::CollapsedDir { .. } => entry
+            .item
+            .leaves
+            .iter()
+            .any(|leaf| leaf.transform == ContentTransform::Template),
     };
     Ok(templated.then(|| crate::source::vars_digest(vars)))
 }
 
 fn persist_revalidated_refresh(
-    registry: &dyn Registry,
+    registry: &dyn StateStore,
     key: &ArtifactKey,
     fresh: &[ScannedFile],
 ) -> Result<()> {
-    let Some(mut record) = registry.get(key)? else {
+    let Some(mut record) = registry.artifact(key)? else {
         return Ok(());
     };
     let refreshed: BTreeMap<&PathBuf, &ScannedFile> = fresh.iter().map(|f| (&f.path, f)).collect();
@@ -649,7 +647,7 @@ fn persist_revalidated_refresh(
             mf.mtime = scanned.mtime;
         }
     }
-    registry.put(&record)?;
+    registry.put_artifact(&record)?;
     Ok(())
 }
 
@@ -680,11 +678,10 @@ struct DeployContext<'a> {
     deploy_root: String,
     layout: LayoutConfig,
     source: &'a ParsedSource,
-    git: &'a str,
-    source_name: &'a SourceName,
     underlying_source: &'a str,
     root: Option<&'a Path>,
     commit: &'a str,
+    resolved: &'a ResolvedSource,
     artifact: &'a ProjectedArtifact,
     target: &'a TargetProjection,
     kind: RecordKind,
@@ -697,8 +694,8 @@ struct DeployContext<'a> {
 }
 
 fn deploy_one(
-    backend: &dyn StageSource,
-    registry: &dyn Registry,
+    backend: &dyn SourceStore,
+    registry: &dyn StateStore,
     journal: &Journal,
     ctx: DeployContext<'_>,
 ) -> Result<()> {
@@ -707,7 +704,6 @@ fn deploy_one(
     let staging = staging_base.join(format!("{key_label}-{}", nonce()));
     let mut staging_guard = StagingGuard::new(&staging_base, &staging);
 
-    let commit_time = backend.commit_time(ctx.source_name, ctx.git, ctx.commit)?;
     let policy = ctx.source.export_policy();
 
     let staging_payload = match &ctx.artifact.materialization {
@@ -715,13 +711,6 @@ fn deploy_one(
         Materialization::Leaf(take) => staging.join(leaf_basename(&take.dest)),
     };
 
-    let resolved = ResolvedSource {
-        name: ctx.source_name.clone(),
-        url: ctx.git.to_owned(),
-        snapshot: SnapshotId::Git {
-            commit: ctx.commit.to_owned(),
-        },
-    };
     let staged = stage_artifact(
         &StageRequest {
             artifact: ctx.artifact,
@@ -731,11 +720,11 @@ fn deploy_one(
         ctx.root,
         &policy,
         &staging,
-        commit_time,
+        ctx.resolved.authored_at.unix_seconds(),
         ctx.template_opt_in,
         |repo_relative| {
             let path = SourcePath::new(&repo_relative.to_string_lossy().replace('\\', "/"))?;
-            let entry = backend.read(&resolved, &path)?;
+            let entry = backend.read(&ctx.resolved.snapshot, &path)?;
             Ok((entry.bytes, entry.meta.kind))
         },
     )?;
@@ -759,7 +748,7 @@ fn deploy_one(
             .map_err(|e| Error::Sync(format!("create target dir {}: {e}", parent.display())))?;
     }
 
-    let record = RegistryRecord::projected(ProjectedRecord {
+    let record = ArtifactRecord::projected(NewArtifactRecord {
         key: ctx.key,
         underlying_source: ctx.underlying_source,
         commit: ctx.commit,
@@ -789,14 +778,14 @@ fn deploy_one(
 }
 
 fn deploy_link(
-    registry: &dyn Registry,
+    registry: &dyn StateStore,
     journal: &Journal,
     entry: &ArtifactEntry<'_>,
     key: ArtifactKey,
     deploy_root: String,
 ) -> Result<()> {
     let policy = entry.source.export_policy();
-    let record = RegistryRecord {
+    let record = ArtifactRecord {
         version: 1,
         key,
         source: entry.underlying_source.to_owned(),
@@ -825,13 +814,19 @@ fn deploy_link(
 }
 
 fn link_target(entry: &ArtifactEntry<'_>) -> PathBuf {
-    let base = Path::new(entry.git);
-    let mut target = if base.is_absolute() {
-        base.to_path_buf()
-    } else {
-        base.canonicalize().unwrap_or_else(|_| {
-            std::env::current_dir().map_or_else(|_| base.to_path_buf(), |c| c.join(base))
-        })
+    let mut target = match &entry.resolved.normalized_location {
+        SourceIdentity::Worktree(root) => root.as_path().to_path_buf(),
+        SourceIdentity::Git(_) | SourceIdentity::Url(_) => {
+            let base = Path::new(entry.git);
+            if base.is_absolute() {
+                base.to_path_buf()
+            } else {
+                base.canonicalize().unwrap_or_else(|_| {
+                    std::env::current_dir()
+                        .map_or_else(|_| base.to_path_buf(), |cwd| cwd.join(base))
+                })
+            }
+        }
     };
     if let Some(root) = entry.source.offer().root() {
         target.push(root);
@@ -878,7 +873,7 @@ fn reconciled_test_change(
     let artifact = ProjectedArtifact {
         destination: crate::projection::model::TargetPath::new("a.txt").expect("valid dest"),
         source: crate::projection::model::ResolvedSourceRef::new("src", "0123"),
-        materialization: Materialization::Leaf(crate::kernel::ResolvedTake {
+        materialization: Materialization::Leaf(crate::projection::take::ResolvedTake {
             source: "a.txt".to_owned(),
             dest: "a.txt".to_owned(),
         }),
@@ -949,6 +944,7 @@ mod confine_fail_closed_tests {
         protected: &'a ProtectedPathSet,
         parsed: &'a BTreeMap<String, ParsedSource>,
         remotes: &'a BTreeMap<String, String>,
+        resolved_sources: &'a ResolvedSourceMap,
         vars: &'a BTreeMap<String, String>,
     ) -> TargetRun<'a> {
         TargetRun {
@@ -956,6 +952,7 @@ mod confine_fail_closed_tests {
             target_name,
             target,
             remotes,
+            resolved_sources,
             vars,
             protected,
         }
@@ -970,8 +967,17 @@ mod confine_fail_closed_tests {
                 .expect("protected");
         let parsed = BTreeMap::new();
         let remotes = BTreeMap::new();
+        let resolved_sources = BTreeMap::new();
         let vars = BTreeMap::new();
-        let run = run_for(&target, "root%1%nvim", &protected, &parsed, &remotes, &vars);
+        let run = run_for(
+            &target,
+            "root%1%nvim",
+            &protected,
+            &parsed,
+            &remotes,
+            &resolved_sources,
+            &vars,
+        );
 
         run.confined(outside).expect_err(
             "a composed/transitive target (namespaced name carries `%`) reaching deploy with \
@@ -1009,7 +1015,7 @@ mod confine_fail_closed_tests {
 mod kind_aware_layout_tests {
     use super::*;
     use crate::config::{LayoutConfig, LayoutKind, Target};
-    use crate::store::{ArtifactKey, ManifestFile, RecordKind, RegistryRecord};
+    use crate::sync::state::{ArtifactKey, ArtifactRecord, ManifestFile, RecordKind};
 
     fn target_with_layout(root: &Path, kind: LayoutKind) -> Target {
         Target {
@@ -1030,8 +1036,8 @@ mod kind_aware_layout_tests {
         }
     }
 
-    fn record(identity: &str, artifact: &str, layout: &str, kind: RecordKind) -> RegistryRecord {
-        RegistryRecord {
+    fn record(identity: &str, artifact: &str, layout: &str, kind: RecordKind) -> ArtifactRecord {
+        ArtifactRecord {
             version: 1,
             key: ArtifactKey {
                 target: "dest".to_owned(),
@@ -1171,7 +1177,7 @@ mod kind_aware_layout_tests {
     fn file_kind_manifest_base_reconstructs_prefixed_path() {
         let root = Path::new("/home/u/dest");
         let target = target_with_layout(root, LayoutKind::Prefixed);
-        let rec = RegistryRecord {
+        let rec = ArtifactRecord {
             version: 1,
             key: ArtifactKey {
                 target: "dest".to_owned(),

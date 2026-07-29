@@ -1,6 +1,6 @@
 //! ARCH-012 contract: each bounded context owns a thiserror enum, ports return
 //! typed errors, and the CLI-edge `Error` aggregates them via `From`. These are
-//! RED by compilation until `SourceError`/`StoreError` exist and the conversions
+//! RED by compilation until `SourceError`/`StateError` exist and the conversions
 //! are wired. The renders pinned here must equal today's text in `error_text_pin`.
 
 use std::error::Error as StdError;
@@ -8,11 +8,13 @@ use std::path::Path;
 use std::process::Command;
 use std::str::FromStr;
 
-use phora::config::Refspec;
 use phora::error::Error;
-use phora::kernel::SourceName;
-use phora::source::{GitBackend, SourceBackend, SourceError};
-use phora::store::{FileRegistry, StoreError};
+use phora::source::SourceName;
+use phora::source::{
+    GitBackend, ResolvePolicy, ResolveRequest, RevisionSpec, SourceError, SourceLocation,
+    SourceStore,
+};
+use phora::sync::state::{FileStateStore, StateError, StateStore};
 use tempfile::TempDir;
 
 fn sn(name: &str) -> SourceName {
@@ -25,10 +27,12 @@ fn assert_std_error<E: StdError>(_e: &E) {}
 fn source_error_is_a_std_error_and_displays() {
     let fixture = GitArtifactFixture::build();
 
-    let err: SourceError = fixture
-        .backend
-        .resolve(&sn("dots"), &fixture.url, &Refspec::None)
-        .expect_err("empty refspec must yield a typed SourceError");
+    let err: SourceError = SourceStore::resolve(
+        &fixture.backend,
+        &fixture.request(RevisionSpec::None),
+        ResolvePolicy::CachedOnly,
+    )
+    .expect_err("empty refspec must yield a typed SourceError");
 
     assert_std_error(&err);
     assert!(
@@ -40,18 +44,18 @@ fn source_error_is_a_std_error_and_displays() {
 #[test]
 fn store_error_is_a_std_error_and_displays() {
     let dir = TempDir::new().expect("temp state root");
-    let first = FileRegistry::open(dir.path().to_path_buf()).expect("open first");
-    let second = FileRegistry::open(dir.path().to_path_buf()).expect("open second");
+    let first = FileStateStore::open(dir.path().to_path_buf()).expect("open first");
+    let second = FileStateStore::open(dir.path().to_path_buf()).expect("open second");
 
-    let _held = first.lock_exclusive().expect("first acquires the lock");
-    let err: StoreError = second
-        .lock_exclusive()
-        .expect_err("contended lock must yield a typed StoreError");
+    let _held = first.acquire_lock().expect("first acquires the lock");
+    let err: StateError = second
+        .acquire_lock()
+        .expect_err("contended lock must yield a typed StateError");
 
     assert_std_error(&err);
     assert!(
         !err.to_string().is_empty(),
-        "a StoreError must render a non-empty Display"
+        "a StateError must render a non-empty Display"
     );
 }
 
@@ -59,10 +63,12 @@ fn store_error_is_a_std_error_and_displays() {
 fn cli_edge_error_converts_from_source_error_preserving_text() {
     let fixture = GitArtifactFixture::build();
 
-    let src_err: SourceError = fixture
-        .backend
-        .resolve(&sn("dots"), &fixture.url, &Refspec::None)
-        .expect_err("empty refspec errors");
+    let src_err: SourceError = SourceStore::resolve(
+        &fixture.backend,
+        &fixture.request(RevisionSpec::None),
+        ResolvePolicy::CachedOnly,
+    )
+    .expect_err("empty refspec errors");
 
     let edge: Error = Error::from(src_err);
 
@@ -76,29 +82,33 @@ fn cli_edge_error_converts_from_source_error_preserving_text() {
 #[test]
 fn cli_edge_error_converts_from_store_error_preserving_text() {
     let dir = TempDir::new().expect("temp state root");
-    let first = FileRegistry::open(dir.path().to_path_buf()).expect("open first");
-    let second = FileRegistry::open(dir.path().to_path_buf()).expect("open second");
+    let first = FileStateStore::open(dir.path().to_path_buf()).expect("open first");
+    let second = FileStateStore::open(dir.path().to_path_buf()).expect("open second");
 
-    let _held = first.lock_exclusive().expect("first acquires the lock");
-    let store_err: StoreError = second.lock_exclusive().expect_err("contended lock errors");
+    let _held = first.acquire_lock().expect("first acquires the lock");
+    let store_err: StateError = second.acquire_lock().expect_err("contended lock errors");
 
     let edge: Error = Error::from(store_err);
 
     assert_eq!(
         edge.to_string(),
         "lock error: another phora process is running for this project (state.lock held)",
-        "From<StoreError> at the CLI edge must render identically to today's lock-contention message"
+        "From<StateError> at the CLI edge must render identically to today's lock-contention message"
     );
 }
 
 #[test]
-fn source_backend_methods_return_source_error() {
+fn source_store_methods_return_source_error() {
     let fixture = GitArtifactFixture::build();
 
-    let typed: Result<u64, SourceError> = fixture.backend.commit_time(
-        &sn("dots"),
-        &fixture.url,
-        "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    let typed: Result<_, SourceError> = SourceStore::resolve(
+        &fixture.backend,
+        &fixture.request(RevisionSpec::Commit(
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+                .parse()
+                .expect("absent commit is valid hex"),
+        )),
+        ResolvePolicy::CachedOnly,
     );
 
     assert!(
@@ -115,6 +125,16 @@ struct GitArtifactFixture {
 }
 
 impl GitArtifactFixture {
+    fn request(&self, revision: RevisionSpec) -> ResolveRequest {
+        ResolveRequest {
+            name: sn("dots"),
+            location: SourceLocation::Git {
+                url: self.url.clone(),
+            },
+            revision,
+        }
+    }
+
     fn build() -> Self {
         let src = TempDir::new().expect("src tempdir");
         let root = src.path();
@@ -130,9 +150,16 @@ impl GitArtifactFixture {
         let git_dir = TempDir::new().expect("git dir tempdir");
         let backend = GitBackend::new(git_dir.path().to_path_buf());
         let url = root.to_string_lossy().into_owned();
-        backend
-            .fetch(&sn("dots"), &url)
-            .expect("fetch builds mirror");
+        SourceStore::resolve(
+            &backend,
+            &ResolveRequest {
+                name: sn("dots"),
+                location: SourceLocation::Git { url: url.clone() },
+                revision: RevisionSpec::Branch("main".to_owned()),
+            },
+            ResolvePolicy::Refresh,
+        )
+        .expect("refresh builds mirror");
 
         Self {
             _src: src,

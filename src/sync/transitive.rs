@@ -12,8 +12,10 @@ use crate::config::{
     Refspec, SourceMode, TakeEntry, Target, admit_transitive_hooks, hook_preimage,
 };
 use crate::error::{Error, Result};
-use crate::kernel::OfferSelection;
-use crate::source::{SourceBackend, SourceName};
+use crate::projection::offer::OfferSelection;
+use crate::source::{
+    Commit, ResolvePolicy, ResolveRequest, RevisionSpec, SourceLocation, SourceName, SourceStore,
+};
 
 use super::resolved_remotes;
 
@@ -80,7 +82,7 @@ impl ResolvedGraph {
     pub(crate) fn composed_files(
         &self,
         composed_target_name: &str,
-        backend: &(dyn SourceBackend + Sync),
+        store: &dyn SourceStore,
         lock: &crate::lock::Lock,
     ) -> Result<Vec<String>> {
         let target = self
@@ -112,9 +114,29 @@ impl ResolvedGraph {
                     ))
                 })?;
             let name = SourceName::trusted(namespaced.to_owned());
-            let leaves = backend
-                .list_source_leaves(&name, remote, &entry.commit, None)
-                .map_err(|e| Error::Source(e.to_string()))?;
+            let revision = RevisionSpec::Commit(entry.commit.parse::<Commit>()?);
+            let location = match source.mode() {
+                SourceMode::Git | SourceMode::Host => SourceLocation::Git {
+                    url: remote.clone(),
+                },
+                SourceMode::Url => SourceLocation::Url {
+                    url: remote.clone(),
+                },
+            };
+            let resolved = store.resolve(
+                &ResolveRequest {
+                    name,
+                    location,
+                    revision,
+                },
+                ResolvePolicy::CachedOnly,
+            )?;
+            let leaves: Vec<String> = store
+                .inventory(&resolved.snapshot, None)?
+                .entries
+                .into_iter()
+                .map(|entry| entry.path.to_string())
+                .collect();
             let offer = source.offer();
             let selection =
                 OfferSelection::compile(offer.includes(), offer.excludes(), offer.root())?;
@@ -168,7 +190,7 @@ fn strip_absorbed_anchors(config: &mut Config) {
 pub(super) fn resolve_transitive_graph(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
-    backend: &(dyn SourceBackend + Sync),
+    backend: &dyn SourceStore,
     frozen: bool,
     effective_lock: Option<&crate::lock::Lock>,
 ) -> Result<ResolvedGraph> {
@@ -230,14 +252,14 @@ pub(super) fn resolve_transitive_graph(
 pub(crate) fn resolve_transitive_graph_offline(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
-    backend: &(dyn SourceBackend + Sync),
+    backend: &dyn SourceStore,
     lock: &crate::lock::Lock,
 ) -> Result<ResolvedGraph> {
     resolve_transitive_graph(config, parsed, backend, true, Some(lock))
 }
 
 struct WalkCtx<'a> {
-    backend: &'a (dyn SourceBackend + Sync),
+    backend: &'a dyn SourceStore,
     /// `visited`: fetch-closure dedup gating `descend_for_validation` (LOCK-001); per-Instance nested composition intentionally ignores it. `ancestors`: current-path cycle guard.
     visited: &'a mut HashSet<FetchNode>,
     ancestors: Vec<FetchNode>,
@@ -652,7 +674,7 @@ fn fetch_manifest(
     name: &str,
     source: &ParsedSource,
     remote: &str,
-    backend: &(dyn SourceBackend + Sync),
+    backend: &dyn SourceStore,
     depth: usize,
     frozen: &FrozenGate<'_>,
 ) -> Result<(String, TransitiveManifest)> {
@@ -1071,7 +1093,7 @@ mod tests {
         reason = "fixture setup fails loudly; git CLI is assumed present"
     )]
     fn git(cwd: &Path, args: &[&str]) {
-        let _serial = crate::store::guard_git_fork();
+        let _serial = crate::sync::state::locking::guard_git_fork();
         let out = std::process::Command::new("git")
             .args(args)
             .current_dir(cwd)
@@ -1385,114 +1407,90 @@ mod tests {
         }
     }
 
-    impl SourceBackend for CountingFetchBackend {
-        fn fetch(
-            &self,
-            source: &SourceName,
-            url: &str,
-        ) -> std::result::Result<(), crate::source::SourceError> {
-            self.fetches.fetch_add(1, FetchOrdering::SeqCst);
-            self.inner.fetch(source, url)
-        }
-        fn read_file_at(
-            &self,
-            source: &SourceName,
-            url: &str,
-            commit: &str,
-            path: &Path,
-        ) -> std::result::Result<Vec<u8>, crate::source::SourceError> {
-            self.inner.read_file_at(source, url, commit, path)
-        }
-        fn list_source_leaves(
-            &self,
-            source: &SourceName,
-            url: &str,
-            commit: &str,
-            root: Option<&Path>,
-        ) -> std::result::Result<Vec<String>, crate::source::SourceError> {
-            self.inner.list_source_leaves(source, url, commit, root)
-        }
+    impl SourceStore for CountingFetchBackend {
         fn resolve(
             &self,
-            source: &SourceName,
-            url: &str,
-            refspec: &Refspec,
-        ) -> std::result::Result<String, crate::source::SourceError> {
-            self.inner.resolve(source, url, refspec)
+            request: &ResolveRequest,
+            policy: ResolvePolicy,
+        ) -> std::result::Result<crate::source::ResolvedSource, crate::source::SourceError>
+        {
+            if policy == ResolvePolicy::Refresh {
+                self.fetches.fetch_add(1, FetchOrdering::SeqCst);
+            }
+            SourceStore::resolve(&self.inner, request, policy)
         }
-        fn commit_time(
+
+        fn inventory(
             &self,
-            source: &SourceName,
-            url: &str,
-            commit: &str,
-        ) -> std::result::Result<u64, crate::source::SourceError> {
-            self.inner.commit_time(source, url, commit)
+            snapshot: &crate::source::SnapshotId,
+            root: Option<&crate::source::SourcePath>,
+        ) -> std::result::Result<crate::source::SourceInventory, crate::source::SourceError>
+        {
+            self.inner.inventory(snapshot, root)
         }
-        fn compute_digest(
+
+        fn read(
             &self,
-            source: &SourceName,
-            url: &str,
-            commit: &str,
-            root: Option<&Path>,
-            include: &[String],
-            exclude: &[String],
-        ) -> std::result::Result<String, crate::source::SourceError> {
-            self.inner
-                .compute_digest(source, url, commit, root, include, exclude)
+            snapshot: &crate::source::SnapshotId,
+            path: &crate::source::SourcePath,
+        ) -> std::result::Result<crate::source::SourceEntry, crate::source::SourceError> {
+            self.inner.read(snapshot, path)
+        }
+
+        fn list_directory(
+            &self,
+            snapshot: &crate::source::SnapshotId,
+            path: Option<&crate::source::SourcePath>,
+        ) -> std::result::Result<Vec<crate::source::SourceDirectoryEntry>, crate::source::SourceError>
+        {
+            self.inner.list_directory(snapshot, path)
         }
     }
 
     struct SourceFailureBackend;
 
-    impl SourceBackend for SourceFailureBackend {
-        fn fetch(
+    impl SourceStore for SourceFailureBackend {
+        fn resolve(
             &self,
-            _source: &SourceName,
-            _url: &str,
-        ) -> std::result::Result<(), crate::source::SourceError> {
+            _request: &ResolveRequest,
+            _policy: ResolvePolicy,
+        ) -> std::result::Result<crate::source::ResolvedSource, crate::source::SourceError>
+        {
             Err(crate::source::SourceError::Source(
                 "backend sentinel".to_owned(),
             ))
         }
 
-        fn read_file_at(
+        fn inventory(
             &self,
-            _source: &SourceName,
-            _url: &str,
-            _commit: &str,
-            _path: &Path,
-        ) -> std::result::Result<Vec<u8>, crate::source::SourceError> {
-            unreachable!("fetch fails before the manifest read")
+            _snapshot: &crate::source::SnapshotId,
+            _root: Option<&crate::source::SourcePath>,
+        ) -> std::result::Result<crate::source::SourceInventory, crate::source::SourceError>
+        {
+            Err(crate::source::SourceError::Source(
+                "backend sentinel".to_owned(),
+            ))
         }
 
-        fn resolve(
+        fn read(
             &self,
-            _source: &SourceName,
-            _url: &str,
-            _refspec: &Refspec,
-        ) -> std::result::Result<String, crate::source::SourceError> {
-            unreachable!("fetch fails before resolution")
+            _snapshot: &crate::source::SnapshotId,
+            _path: &crate::source::SourcePath,
+        ) -> std::result::Result<crate::source::SourceEntry, crate::source::SourceError> {
+            Err(crate::source::SourceError::Source(
+                "backend sentinel".to_owned(),
+            ))
         }
 
-        fn commit_time(
+        fn list_directory(
             &self,
-            _source: &SourceName,
-            _url: &str,
-            _commit: &str,
-        ) -> std::result::Result<u64, crate::source::SourceError> {
-            unreachable!("manifest acquisition does not read commit time")
-        }
-
-        fn compute_digest(
-            &self,
-            _source: &SourceName,
-            _url: &str,
-            _commit: &str,
-            _root: Option<&Path>,
-            _include: &[String],
-            _exclude: &[String],
-        ) -> std::result::Result<String, crate::source::SourceError> {
-            unreachable!("manifest acquisition does not compute a digest")
+            _snapshot: &crate::source::SnapshotId,
+            _path: Option<&crate::source::SourcePath>,
+        ) -> std::result::Result<Vec<crate::source::SourceDirectoryEntry>, crate::source::SourceError>
+        {
+            Err(crate::source::SourceError::Source(
+                "backend sentinel".to_owned(),
+            ))
         }
     }
 
@@ -1545,28 +1543,56 @@ mod tests {
 
     struct SyncManifestBackend(SyncManifestRead);
 
-    impl SourceBackend for SyncManifestBackend {
-        fn fetch(
+    impl SourceStore for SyncManifestBackend {
+        fn resolve(
             &self,
-            _source: &SourceName,
-            _url: &str,
-        ) -> std::result::Result<(), crate::source::SourceError> {
-            Ok(())
+            request: &ResolveRequest,
+            _policy: ResolvePolicy,
+        ) -> std::result::Result<crate::source::ResolvedSource, crate::source::SourceError>
+        {
+            let crate::source::SourceLocation::Git { url } = &request.location else {
+                unreachable!("transitive manifest fixtures use Git sources")
+            };
+            let normalized = crate::source::NormalizedUrl::parse(url);
+            let commit: crate::source::Commit = "a".repeat(40).parse().expect("fixture commit");
+            Ok(crate::source::ResolvedSource {
+                name: request.name.clone(),
+                snapshot: crate::source::SnapshotId::Git {
+                    mirror: crate::source::MirrorKey::from_url(&normalized),
+                    commit: commit.clone(),
+                },
+                revision: crate::source::ResolvedRevision::Commit(commit),
+                authored_at: crate::source::SourceTimestamp::from_unix_seconds(0),
+                normalized_location: crate::source::SourceIdentity::Git(normalized),
+            })
         }
 
-        fn read_file_at(
+        fn inventory(
             &self,
-            source: &SourceName,
-            _url: &str,
-            commit: &str,
-            path: &Path,
-        ) -> std::result::Result<Vec<u8>, crate::source::SourceError> {
+            _snapshot: &crate::source::SnapshotId,
+            _root: Option<&crate::source::SourcePath>,
+        ) -> std::result::Result<crate::source::SourceInventory, crate::source::SourceError>
+        {
+            Ok(crate::source::SourceInventory::default())
+        }
+
+        fn read(
+            &self,
+            snapshot: &crate::source::SnapshotId,
+            path: &crate::source::SourcePath,
+        ) -> std::result::Result<crate::source::SourceEntry, crate::source::SourceError> {
             match &self.0 {
-                SyncManifestRead::Bytes(bytes) => Ok(bytes.clone()),
+                SyncManifestRead::Bytes(bytes) => Ok(crate::source::SourceEntry {
+                    meta: crate::source::SourceEntryMeta {
+                        path: path.clone(),
+                        kind: crate::source::SourceEntryKind::File,
+                    },
+                    bytes: bytes.clone(),
+                }),
                 SyncManifestRead::Absent => Err(crate::source::SourceError::FileAbsent {
-                    source_name: source.as_str().to_owned(),
-                    commit: commit.to_owned(),
-                    path: path.to_path_buf(),
+                    source_name: "dep".to_owned(),
+                    commit: snapshot.commit().to_string(),
+                    path: PathBuf::from(path.as_str()),
                 }),
                 SyncManifestRead::BackendFailure => Err(crate::source::SourceError::Source(
                     "backend sentinel".to_owned(),
@@ -1574,34 +1600,13 @@ mod tests {
             }
         }
 
-        fn resolve(
+        fn list_directory(
             &self,
-            _source: &SourceName,
-            _url: &str,
-            _refspec: &Refspec,
-        ) -> std::result::Result<String, crate::source::SourceError> {
-            Ok("a".repeat(40))
-        }
-
-        fn commit_time(
-            &self,
-            _source: &SourceName,
-            _url: &str,
-            _commit: &str,
-        ) -> std::result::Result<u64, crate::source::SourceError> {
-            unreachable!("manifest acquisition does not read commit time")
-        }
-
-        fn compute_digest(
-            &self,
-            _source: &SourceName,
-            _url: &str,
-            _commit: &str,
-            _root: Option<&Path>,
-            _include: &[String],
-            _exclude: &[String],
-        ) -> std::result::Result<String, crate::source::SourceError> {
-            unreachable!("manifest acquisition does not compute a digest")
+            _snapshot: &crate::source::SnapshotId,
+            _path: Option<&crate::source::SourcePath>,
+        ) -> std::result::Result<Vec<crate::source::SourceDirectoryEntry>, crate::source::SourceError>
+        {
+            Ok(Vec::new())
         }
     }
 
@@ -1712,7 +1717,7 @@ mod tests {
     fn dep_mirror_with_editor_target() -> (tempfile::TempDir, String, String) {
         let src = tempfile::TempDir::new().unwrap();
         let src_path = src.path();
-        crate::store::assert_git_sandboxed(src_path);
+        crate::sync::state::locking::assert_git_sandboxed(src_path);
         git(src_path, &["init", "-b", "main", "."]);
         git(src_path, &["config", "user.email", "t@example.com"]);
         git(src_path, &["config", "user.name", "T"]);
@@ -1731,14 +1736,14 @@ mod tests {
         let mirror = mirror_path(mirror_root.path(), &url);
         std::fs::create_dir_all(mirror.parent().unwrap()).unwrap();
         {
-            let _serial = crate::store::guard_git_fork();
+            let _serial = crate::sync::state::locking::guard_git_fork();
             git(
                 mirror_root.path(),
                 &["clone", "--mirror", &url, mirror.to_str().unwrap()],
             );
         }
         let commit = {
-            let _serial = crate::store::guard_git_fork();
+            let _serial = crate::sync::state::locking::guard_git_fork();
             let out = std::process::Command::new("git")
                 .args(["-C", mirror.to_str().unwrap(), "rev-parse", "HEAD"])
                 .output()

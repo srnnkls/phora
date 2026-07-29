@@ -221,7 +221,7 @@ fn inherent_method_body(source: &str, subject: &str, method: &str) -> Option<Vec
 }
 
 fn lock_advisory_composes_detection(source: &str) -> bool {
-    inherent_method_body(source, "FileRegistry", "lock_advisory").is_some_and(|body| {
+    inherent_method_body(source, "FileStateStore", "lock_advisory").is_some_and(|body| {
         body == lex("statfs_fstype(&self.state_root).as_deref().and_then(network_lock_advisory)")
     })
 }
@@ -296,7 +296,7 @@ fn source(rel: &str) -> String {
 fn file_registry_lock_advisory_composes_state_root_detection_with_formatter() {
     assert!(
         lock_advisory_composes_detection(&source("sync/state/locking.rs")),
-        "FileRegistry::lock_advisory must return statfs_fstype(&self.state_root), dereferenced, \
+        "FileStateStore::lock_advisory must return statfs_fstype(&self.state_root), dereferenced, \
          and composed directly into network_lock_advisory; an always-None implementation must \
          fail this contract"
     );
@@ -315,8 +315,8 @@ fn cli_sync_prints_a_positive_registry_advisory_to_stderr_unless_lockless() {
 fn lexer_consumes_rust_literal_forms_without_exposing_payloads_or_lifetimes() {
     for literal in [
         r####"r###"bare \" } fn run_sync() {}"###"####,
-        r####"br###"bare \" } impl FileRegistry {}"###"####,
-        r####"rb###"bare \" } impl FileRegistry {}"###"####,
+        r####"br###"bare \" } impl FileStateStore {}"###"####,
+        r####"rb###"bare \" } impl FileStateStore {}"###"####,
         r####"cr###"bare \" } fn run_sync() {}"###"####,
         r####"rc###"bare \" } fn run_sync() {}"###"####,
         r#""escaped \" quote and } brace""#,
@@ -351,34 +351,34 @@ fn lexer_consumes_rust_literal_forms_without_exposing_payloads_or_lifetimes() {
 
 #[test]
 fn scanners_reject_always_none_omission_and_lexical_decoys() {
-    let lock_positive = "impl FileRegistry { pub fn lock_advisory(&self) -> Option<String> { \
+    let lock_positive = "impl FileStateStore { pub fn lock_advisory(&self) -> Option<String> { \
         statfs_fstype(&self.state_root).as_deref().and_then(network_lock_advisory) } }";
     assert!(lock_advisory_composes_detection(lock_positive));
     for mutant in [
-        "impl FileRegistry { pub fn lock_advisory(&self) -> Option<String> { None } }",
+        "impl FileStateStore { pub fn lock_advisory(&self) -> Option<String> { None } }",
         "impl Other { pub fn lock_advisory(&self) { \
             statfs_fstype(&self.state_root).as_deref().and_then(network_lock_advisory); } }",
-        "impl FileRegistry { pub fn outer(&self) { fn lock_advisory() { \
+        "impl FileStateStore { pub fn outer(&self) { fn lock_advisory() { \
             statfs_fstype(&self.state_root).as_deref().and_then(network_lock_advisory); } } }",
-        r#"impl FileRegistry { pub fn lock_advisory(&self) -> Option<String> { None } }
-            // impl FileRegistry { pub fn lock_advisory(&self) { statfs_fstype(&self.state_root).as_deref().and_then(network_lock_advisory) } }
+        r#"impl FileStateStore { pub fn lock_advisory(&self) -> Option<String> { None } }
+            // impl FileStateStore { pub fn lock_advisory(&self) { statfs_fstype(&self.state_root).as_deref().and_then(network_lock_advisory) } }
             const DECOY: &str = "statfs_fstype(&self.state_root).as_deref().and_then(network_lock_advisory)";"#,
         r####"fn wrapper() {
-            let decoy = br###"bare " } impl FileRegistry { pub fn lock_advisory(&self) -> Option<String> { statfs_fstype(&self.state_root).as_deref().and_then(network_lock_advisory) } }"###;
+            let decoy = br###"bare " } impl FileStateStore { pub fn lock_advisory(&self) -> Option<String> { statfs_fstype(&self.state_root).as_deref().and_then(network_lock_advisory) } }"###;
         }
-        impl FileRegistry { pub fn lock_advisory(&self) -> Option<String> { None } }"####,
+        impl FileStateStore { pub fn lock_advisory(&self) -> Option<String> { None } }"####,
         r"#[cfg(any())]
-        impl FileRegistry {
+        impl FileStateStore {
             pub fn lock_advisory(&self) -> Option<String> {
                 statfs_fstype(&self.state_root).as_deref().and_then(network_lock_advisory)
             }
         }
-        impl FileRegistry { pub fn lock_advisory(&self) -> Option<String> { None } }",
+        impl FileStateStore { pub fn lock_advisory(&self) -> Option<String> { None } }",
         r"fn wrapper() {
             let promoted = '}';
-            impl FileRegistry { pub fn lock_advisory(&self) -> Option<String> { statfs_fstype(&self.state_root).as_deref().and_then(network_lock_advisory) } }
+            impl FileStateStore { pub fn lock_advisory(&self) -> Option<String> { statfs_fstype(&self.state_root).as_deref().and_then(network_lock_advisory) } }
         }
-        impl FileRegistry { pub fn lock_advisory(&self) -> Option<String> { None } }",
+        impl FileStateStore { pub fn lock_advisory(&self) -> Option<String> { None } }",
     ] {
         assert!(
             !lock_advisory_composes_detection(mutant),

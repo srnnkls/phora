@@ -1,22 +1,22 @@
-//! Registry port (`Registry`) and its file adapter (`FileRegistry`).
+//! Sync-owned persistent state through `StateStore` and `FileStateStore`.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::locking::StateLockGuard;
+use super::{StateStore, locking::StateLock};
 
 #[cfg(all(test, target_os = "linux"))]
 use super::locking::unescape_octal;
 #[cfg(test)]
 use super::locking::{STATE_LOCK_SERIAL, is_network_fs, network_lock_advisory};
 
-/// Errors owned by the store context (`Registry` and its file adapter).
+/// Errors from sync-owned state and its file-backed implementation.
 #[derive(Debug, Error)]
-pub enum StoreError {
+pub enum StateError {
     #[error("registry error: {0}")]
-    Registry(String),
+    StateStore(String),
 
     #[error("lock error: {0}")]
     Lock(String),
@@ -25,7 +25,7 @@ pub enum StoreError {
     ReadOnly(String),
 }
 
-type Result<T> = std::result::Result<T, StoreError>;
+type Result<T> = std::result::Result<T, StateError>;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -43,7 +43,7 @@ pub struct ArtifactKey {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-pub struct RegistryRecord {
+pub struct ArtifactRecord {
     pub version: u32,
     pub key: ArtifactKey,
     #[serde(default)]
@@ -71,7 +71,7 @@ pub struct RegistryRecord {
 }
 
 /// Borrowed inputs shared by every record-construction site (`deploy_one`, `rebuild_one`).
-pub struct ProjectedRecord<'a> {
+pub struct NewArtifactRecord<'a> {
     pub key: ArtifactKey,
     pub underlying_source: &'a str,
     pub commit: &'a str,
@@ -86,10 +86,10 @@ pub struct ProjectedRecord<'a> {
     pub layout_separator: Option<String>,
 }
 
-impl RegistryRecord {
+impl ArtifactRecord {
     /// Build a managed (`linked = false`) record, stamping `projected_at` to now.
     #[must_use]
-    pub fn projected(p: ProjectedRecord<'_>) -> Self {
+    pub fn projected(p: NewArtifactRecord<'_>) -> Self {
         Self {
             version: 1,
             key: p.key,
@@ -110,7 +110,7 @@ impl RegistryRecord {
     }
 }
 
-/// Registry record file entry (carries the content hash used by `phora verify`).
+/// `StateStore` record file entry (carries the content hash used by `phora verify`).
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct ManifestFile {
     pub path: PathBuf,
@@ -122,7 +122,7 @@ pub struct ManifestFile {
 pub use crate::sync::model::ScannedFile;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct EjectedEntry {
+pub struct Ejection {
     pub source: String,
     pub artifact: String,
     pub ejected_at: String,
@@ -136,76 +136,29 @@ pub struct HookState {
 
 pub use crate::digest::Digest;
 
-pub trait Registry {
-    fn get(&self, key: &ArtifactKey) -> Result<Option<RegistryRecord>>;
-    fn put(&self, record: &RegistryRecord) -> Result<()>;
-    fn remove(&self, key: &ArtifactKey) -> Result<()>;
-    fn list_target(&self, target: &str) -> Result<Vec<RegistryRecord>>;
-    fn list_all(&self) -> Result<Vec<RegistryRecord>>;
-
-    fn load_ejected(&self, target: &str) -> Result<Vec<EjectedEntry>>;
-    fn save_ejected(&self, target: &str, ejected: &[EjectedEntry]) -> Result<()>;
-
-    /// Per-hook last-success digest sets recorded for `target`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the target meta file cannot be read or parsed.
-    fn load_hook_state(&self, target: &str) -> Result<Vec<HookState>>;
-
-    /// Advance one hook's last-success set, leaving sibling hooks untouched.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the target meta file cannot be read, parsed, or written.
-    fn record_hook_success(
-        &self,
-        target: &str,
-        hook_id: &str,
-        digest_set: &std::collections::BTreeSet<String>,
-    ) -> Result<()>;
-
-    /// Directory holding the deploy journal and `state.lock`.
-    fn locks_dir(&self) -> PathBuf;
-
-    /// Whether this registry refuses writes — a frozen sync's read-only wrapper. Default: writable.
-    fn refuses_writes(&self) -> bool {
-        false
-    }
-
-    /// The read-only pending-work error naming the state root; meaningful only when
-    /// [`refuses_writes`](Self::refuses_writes) holds.
-    ///
-    /// # Panics
-    ///
-    /// Panics when called on a writable registry — callers gate it on `refuses_writes`.
-    fn readonly_error(&self) -> StoreError {
-        unreachable!("readonly_error called on a writable registry")
-    }
-}
-
 /// `(target, source, artifact)` keys ejected across every target `records` span — lets readers tell a kept-but-ejected record from a managed one.
 ///
 /// # Errors
 ///
 /// Returns an error if the registry cannot be read.
 pub fn ejected_index(
-    registry: &dyn Registry,
-    records: &[RegistryRecord],
+    registry: &dyn StateStore,
+    records: &[ArtifactRecord],
 ) -> Result<std::collections::HashSet<(String, String, String)>> {
     let targets: std::collections::BTreeSet<&str> =
         records.iter().map(|r| r.key.target.as_str()).collect();
     let mut index = std::collections::HashSet::new();
     for target in targets {
-        for entry in registry.load_ejected(target)? {
+        for entry in registry.ejections(target)? {
             index.insert((target.to_owned(), entry.source, entry.artifact));
         }
     }
     Ok(index)
 }
 
-pub struct FileRegistry {
+pub struct FileStateStore {
     pub(super) state_root: PathBuf,
+    pub(super) journal_root: PathBuf,
 }
 
 const META_VERSION: u32 = 1;
@@ -214,7 +167,7 @@ const META_VERSION: u32 = 1;
 struct TargetMeta {
     version: u32,
     #[serde(default)]
-    ejected: Vec<EjectedEntry>,
+    ejected: Vec<Ejection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     hooks: Vec<HookState>,
 }
@@ -229,9 +182,13 @@ impl Default for TargetMeta {
     }
 }
 
-impl FileRegistry {
+impl FileStateStore {
     pub fn open(state_root: PathBuf) -> Result<Self> {
-        Ok(Self { state_root })
+        let journal_root = state_root.join("locks");
+        Ok(Self {
+            state_root,
+            journal_root,
+        })
     }
 
     #[must_use]
@@ -259,9 +216,9 @@ impl FileRegistry {
         let path = self.meta_path(target);
         match std::fs::read_to_string(&path) {
             Ok(text) => toml::from_str(&text)
-                .map_err(|e| StoreError::Registry(format!("parse meta {}: {e}", path.display()))),
+                .map_err(|e| StateError::StateStore(format!("parse meta {}: {e}", path.display()))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(TargetMeta::default()),
-            Err(e) => Err(StoreError::Registry(format!(
+            Err(e) => Err(StateError::StateStore(format!(
                 "read meta {}: {e}",
                 path.display()
             ))),
@@ -271,7 +228,7 @@ impl FileRegistry {
     fn write_meta(&self, target: &str, mut meta: TargetMeta) -> Result<()> {
         meta.version = META_VERSION;
         let serialized = toml::to_string(&meta)
-            .map_err(|e| StoreError::Registry(format!("serialize meta: {e}")))?;
+            .map_err(|e| StateError::StateStore(format!("serialize meta: {e}")))?;
         atomic_write(&self.meta_path(target), &serialized)
     }
 
@@ -289,44 +246,44 @@ impl FileRegistry {
 }
 
 #[must_use]
-pub fn readonly_root_error(root: &Path) -> StoreError {
-    StoreError::ReadOnly(format!(
+pub fn readonly_root_error(root: &Path) -> StateError {
+    StateError::ReadOnly(format!(
         "state root {} is read-only: a frozen sync cannot write here",
         root.display()
     ))
 }
 
-fn read_record(path: &Path) -> Result<RegistryRecord> {
+fn read_record(path: &Path) -> Result<ArtifactRecord> {
     let text = std::fs::read_to_string(path)
-        .map_err(|e| StoreError::Registry(format!("read record {}: {e}", path.display())))?;
+        .map_err(|e| StateError::StateStore(format!("read record {}: {e}", path.display())))?;
     toml::from_str(&text)
-        .map_err(|e| StoreError::Registry(format!("parse record {}: {e}", path.display())))
+        .map_err(|e| StateError::StateStore(format!("parse record {}: {e}", path.display())))
 }
 
 fn atomic_write(path: &Path, contents: &str) -> Result<()> {
     let parent = path
         .parent()
-        .ok_or_else(|| StoreError::Registry(format!("path has no parent: {}", path.display())))?;
+        .ok_or_else(|| StateError::StateStore(format!("path has no parent: {}", path.display())))?;
     std::fs::create_dir_all(parent)
-        .map_err(|e| StoreError::Registry(format!("create dir {}: {e}", parent.display())))?;
+        .map_err(|e| StateError::StateStore(format!("create dir {}: {e}", parent.display())))?;
     let file_name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
-        StoreError::Registry(format!("path has no file name: {}", path.display()))
+        StateError::StateStore(format!("path has no file name: {}", path.display()))
     })?;
     let tmp = parent.join(format!(".{file_name}.tmp"));
     {
         use std::io::Write as _;
         let mut handle = std::fs::File::create(&tmp)
-            .map_err(|e| StoreError::Registry(format!("create temp {}: {e}", tmp.display())))?;
+            .map_err(|e| StateError::StateStore(format!("create temp {}: {e}", tmp.display())))?;
         handle
             .write_all(contents.as_bytes())
-            .map_err(|e| StoreError::Registry(format!("write temp {}: {e}", tmp.display())))?;
+            .map_err(|e| StateError::StateStore(format!("write temp {}: {e}", tmp.display())))?;
         handle
             .sync_all()
-            .map_err(|e| StoreError::Registry(format!("fsync temp {}: {e}", tmp.display())))?;
+            .map_err(|e| StateError::StateStore(format!("fsync temp {}: {e}", tmp.display())))?;
     }
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
-        StoreError::Registry(format!(
+        StateError::StateStore(format!(
             "rename {} -> {}: {e}",
             tmp.display(),
             path.display()
@@ -334,12 +291,12 @@ fn atomic_write(path: &Path, contents: &str) -> Result<()> {
     })
 }
 
-fn collect_records(artifacts_dir: &Path, out: &mut Vec<RegistryRecord>) -> Result<()> {
+fn collect_records(artifacts_dir: &Path, out: &mut Vec<ArtifactRecord>) -> Result<()> {
     let source_dirs = match std::fs::read_dir(artifacts_dir) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => {
-            return Err(StoreError::Registry(format!(
+            return Err(StateError::StateStore(format!(
                 "read dir {}: {e}",
                 artifacts_dir.display()
             )));
@@ -347,7 +304,7 @@ fn collect_records(artifacts_dir: &Path, out: &mut Vec<RegistryRecord>) -> Resul
     };
     for source in source_dirs {
         let source = source.map_err(|e| {
-            StoreError::Registry(format!("read entry in {}: {e}", artifacts_dir.display()))
+            StateError::StateStore(format!("read entry in {}: {e}", artifacts_dir.display()))
         })?;
         if !source.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
@@ -357,12 +314,12 @@ fn collect_records(artifacts_dir: &Path, out: &mut Vec<RegistryRecord>) -> Resul
     Ok(())
 }
 
-fn collect_records_under(dir: &Path, out: &mut Vec<RegistryRecord>) -> Result<()> {
+fn collect_records_under(dir: &Path, out: &mut Vec<ArtifactRecord>) -> Result<()> {
     let entries = std::fs::read_dir(dir)
-        .map_err(|e| StoreError::Registry(format!("read dir {}: {e}", dir.display())))?;
+        .map_err(|e| StateError::StateStore(format!("read dir {}: {e}", dir.display())))?;
     for entry in entries {
         let entry = entry
-            .map_err(|e| StoreError::Registry(format!("read entry in {}: {e}", dir.display())))?;
+            .map_err(|e| StateError::StateStore(format!("read entry in {}: {e}", dir.display())))?;
         let path = entry.path();
         if entry.file_type().is_ok_and(|t| t.is_dir()) {
             collect_records_under(&path, out)?;
@@ -373,7 +330,7 @@ fn collect_records_under(dir: &Path, out: &mut Vec<RegistryRecord>) -> Result<()
     Ok(())
 }
 
-fn sort_records(records: &mut [RegistryRecord]) {
+fn sort_records(records: &mut [ArtifactRecord]) {
     records.sort_by(|a, b| {
         (&a.key.target, &a.key.source, &a.key.artifact).cmp(&(
             &b.key.target,
@@ -383,8 +340,8 @@ fn sort_records(records: &mut [RegistryRecord]) {
     });
 }
 
-impl Registry for FileRegistry {
-    fn get(&self, key: &ArtifactKey) -> Result<Option<RegistryRecord>> {
+impl StateStore for FileStateStore {
+    fn artifact(&self, key: &ArtifactKey) -> Result<Option<ArtifactRecord>> {
         let path = self.record_path(key);
         if path.exists() {
             Ok(Some(read_record(&path)?))
@@ -393,26 +350,26 @@ impl Registry for FileRegistry {
         }
     }
 
-    fn put(&self, record: &RegistryRecord) -> Result<()> {
+    fn put_artifact(&self, record: &ArtifactRecord) -> Result<()> {
         let path = self.record_path(&record.key);
         let serialized = toml::to_string(record)
-            .map_err(|e| StoreError::Registry(format!("serialize record: {e}")))?;
+            .map_err(|e| StateError::StateStore(format!("serialize record: {e}")))?;
         atomic_write(&path, &serialized)
     }
 
-    fn remove(&self, key: &ArtifactKey) -> Result<()> {
+    fn remove_artifact(&self, key: &ArtifactKey) -> Result<()> {
         let path = self.record_path(key);
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(StoreError::Registry(format!(
+            Err(e) => Err(StateError::StateStore(format!(
                 "remove record {}: {e}",
                 path.display()
             ))),
         }
     }
 
-    fn list_target(&self, target: &str) -> Result<Vec<RegistryRecord>> {
+    fn target_artifacts(&self, target: &str) -> Result<Vec<ArtifactRecord>> {
         let artifacts_dir = self
             .state_root
             .join("targets")
@@ -424,13 +381,13 @@ impl Registry for FileRegistry {
         Ok(records)
     }
 
-    fn list_all(&self) -> Result<Vec<RegistryRecord>> {
+    fn all_artifacts(&self) -> Result<Vec<ArtifactRecord>> {
         let targets_dir = self.state_root.join("targets");
         let target_dirs = match std::fs::read_dir(&targets_dir) {
             Ok(rd) => rd,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => {
-                return Err(StoreError::Registry(format!(
+                return Err(StateError::StateStore(format!(
                     "read dir {}: {e}",
                     targets_dir.display()
                 )));
@@ -439,7 +396,7 @@ impl Registry for FileRegistry {
         let mut records = Vec::new();
         for target in target_dirs {
             let target = target.map_err(|e| {
-                StoreError::Registry(format!("read entry in {}: {e}", targets_dir.display()))
+                StateError::StateStore(format!("read entry in {}: {e}", targets_dir.display()))
             })?;
             if !target.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
@@ -450,17 +407,17 @@ impl Registry for FileRegistry {
         Ok(records)
     }
 
-    fn load_ejected(&self, target: &str) -> Result<Vec<EjectedEntry>> {
+    fn ejections(&self, target: &str) -> Result<Vec<Ejection>> {
         Ok(self.read_meta(target)?.ejected)
     }
 
-    fn save_ejected(&self, target: &str, ejected: &[EjectedEntry]) -> Result<()> {
+    fn save_ejections(&self, target: &str, ejected: &[Ejection]) -> Result<()> {
         let mut meta = self.read_meta(target)?;
         meta.ejected = ejected.to_vec();
         self.write_meta(target, meta)
     }
 
-    fn load_hook_state(&self, target: &str) -> Result<Vec<HookState>> {
+    fn hook_state(&self, target: &str) -> Result<Vec<HookState>> {
         Ok(self.read_meta(target)?.hooks)
     }
 
@@ -471,7 +428,7 @@ impl Registry for FileRegistry {
         digest_set: &std::collections::BTreeSet<String>,
     ) -> Result<()> {
         let mut meta = self.read_meta(target)?;
-        match meta.hooks.iter_mut().find(|h| h.hook_id == hook_id) {
+        match meta.hooks.iter_mut().find(|hook| hook.hook_id == hook_id) {
             Some(existing) => existing.last_success.clone_from(digest_set),
             None => meta.hooks.push(HookState {
                 hook_id: hook_id.to_owned(),
@@ -481,137 +438,12 @@ impl Registry for FileRegistry {
         self.write_meta(target, meta)
     }
 
-    fn locks_dir(&self) -> PathBuf {
-        self.state_root.join("locks")
-    }
-}
-
-impl crate::sync::state::StateStore for FileRegistry {
-    fn artifact(&self, key: &ArtifactKey) -> Result<Option<RegistryRecord>> {
-        self.get(key)
-    }
-
-    fn put_artifact(&self, record: &RegistryRecord) -> Result<()> {
-        self.put(record)
-    }
-
-    fn remove_artifact(&self, key: &ArtifactKey) -> Result<()> {
-        self.remove(key)
-    }
-
-    fn target_artifacts(&self, target: &str) -> Result<Vec<RegistryRecord>> {
-        self.list_target(target)
-    }
-
-    fn all_artifacts(&self) -> Result<Vec<RegistryRecord>> {
-        self.list_all()
-    }
-
-    fn ejections(&self, target: &str) -> Result<Vec<EjectedEntry>> {
-        self.load_ejected(target)
-    }
-
-    fn save_ejections(&self, target: &str, entries: &[EjectedEntry]) -> Result<()> {
-        self.save_ejected(target, entries)
-    }
-
-    fn hook_state(&self, target: &str) -> Result<Vec<HookState>> {
-        self.load_hook_state(target)
-    }
-
-    fn record_hook_success(
-        &self,
-        target: &str,
-        hook_id: &str,
-        digest_set: &std::collections::BTreeSet<String>,
-    ) -> Result<()> {
-        Registry::record_hook_success(self, target, hook_id, digest_set)
-    }
-
-    fn acquire_lock(&self) -> Result<StateLockGuard> {
-        self.lock_exclusive()
+    fn acquire_lock(&self) -> Result<StateLock> {
+        self.acquire_state_lock()
     }
 
     fn journal_root(&self) -> PathBuf {
-        Registry::locks_dir(self)
-    }
-}
-
-/// Delegates every read to `inner` but refuses writes, naming the root: a frozen sync
-/// plans against a read-only state root, so any write it reaches is pending work
-/// surfaced as `ReadOnly` rather than a raw permission error.
-pub struct FrozenReadOnlyRegistry<'a> {
-    inner: &'a dyn Registry,
-    root: PathBuf,
-}
-
-impl<'a> FrozenReadOnlyRegistry<'a> {
-    #[must_use]
-    pub fn new(inner: &'a dyn Registry) -> Self {
-        let root = inner
-            .locks_dir()
-            .parent()
-            .map_or_else(|| inner.locks_dir(), Path::to_path_buf);
-        Self { inner, root }
-    }
-
-    fn refuse(&self) -> StoreError {
-        readonly_root_error(&self.root)
-    }
-}
-
-impl Registry for FrozenReadOnlyRegistry<'_> {
-    fn get(&self, key: &ArtifactKey) -> Result<Option<RegistryRecord>> {
-        self.inner.get(key)
-    }
-
-    fn put(&self, _record: &RegistryRecord) -> Result<()> {
-        Err(self.refuse())
-    }
-
-    fn remove(&self, _key: &ArtifactKey) -> Result<()> {
-        Err(self.refuse())
-    }
-
-    fn list_target(&self, target: &str) -> Result<Vec<RegistryRecord>> {
-        self.inner.list_target(target)
-    }
-
-    fn list_all(&self) -> Result<Vec<RegistryRecord>> {
-        self.inner.list_all()
-    }
-
-    fn load_ejected(&self, target: &str) -> Result<Vec<EjectedEntry>> {
-        self.inner.load_ejected(target)
-    }
-
-    fn save_ejected(&self, _target: &str, _ejected: &[EjectedEntry]) -> Result<()> {
-        Err(self.refuse())
-    }
-
-    fn load_hook_state(&self, target: &str) -> Result<Vec<HookState>> {
-        self.inner.load_hook_state(target)
-    }
-
-    fn record_hook_success(
-        &self,
-        _target: &str,
-        _hook_id: &str,
-        _digest_set: &std::collections::BTreeSet<String>,
-    ) -> Result<()> {
-        Err(self.refuse())
-    }
-
-    fn locks_dir(&self) -> PathBuf {
-        self.inner.locks_dir()
-    }
-
-    fn refuses_writes(&self) -> bool {
-        true
-    }
-
-    fn readonly_error(&self) -> StoreError {
-        self.refuse()
+        self.journal_root.clone()
     }
 }
 
@@ -649,7 +481,7 @@ mod tests {
     /// TOML round-trip with `linked = true` intact and the empty `files` preserved.
     #[test]
     fn linked_record_round_trips_with_sentinels_and_empty_files() {
-        let rec = RegistryRecord {
+        let rec = ArtifactRecord {
             version: 1,
             key: ArtifactKey {
                 target: "vscode".to_owned(),
@@ -672,7 +504,7 @@ mod tests {
         };
 
         let toml = toml::to_string(&rec).expect("serialize linked record");
-        let back: RegistryRecord = toml::from_str(&toml).expect("deserialize linked record");
+        let back: ArtifactRecord = toml::from_str(&toml).expect("deserialize linked record");
 
         assert_eq!(
             back, rec,
@@ -707,7 +539,7 @@ source = "company-configs"
 artifact = "snippets"
 "#;
 
-        let rec: RegistryRecord =
+        let rec: ArtifactRecord =
             toml::from_str(legacy).expect("legacy record without `linked` must still parse");
 
         assert!(
@@ -723,7 +555,7 @@ artifact = "snippets"
     /// TOML round-trip independently so `rebuild-registry` can reconstruct provenance.
     #[test]
     fn record_round_trips_underlying_source_distinct_from_identity() {
-        let rec = RegistryRecord {
+        let rec = ArtifactRecord {
             version: 1,
             key: ArtifactKey {
                 target: "dest".to_owned(),
@@ -746,7 +578,7 @@ artifact = "snippets"
         };
 
         let toml = toml::to_string(&rec).expect("serialize aliased record");
-        let back: RegistryRecord = toml::from_str(&toml).expect("deserialize aliased record");
+        let back: ArtifactRecord = toml::from_str(&toml).expect("deserialize aliased record");
 
         assert_eq!(
             back, rec,
@@ -782,7 +614,7 @@ source = "company-configs"
 artifact = "snippets"
 "#;
 
-        let rec: RegistryRecord =
+        let rec: ArtifactRecord =
             toml::from_str(legacy).expect("legacy record without `source` must still parse");
 
         assert_eq!(
@@ -820,7 +652,7 @@ source = "company-configs"
 artifact = "snippets"
 "#;
 
-        let rec: RegistryRecord =
+        let rec: ArtifactRecord =
             toml::from_str(legacy).expect("legacy record without `kind` must still parse");
 
         assert_eq!(
@@ -832,7 +664,7 @@ artifact = "snippets"
 
     #[test]
     fn file_kind_record_round_trips_as_lowercase_file() {
-        let rec = RegistryRecord {
+        let rec = ArtifactRecord {
             version: 1,
             key: ArtifactKey {
                 target: "dest".to_owned(),
@@ -860,7 +692,7 @@ artifact = "snippets"
             "a file-kind record must serialize the lowercase tag `kind = \"file\"`, got:\n{toml}"
         );
 
-        let back: RegistryRecord = toml::from_str(&toml).expect("deserialize file-kind record");
+        let back: ArtifactRecord = toml::from_str(&toml).expect("deserialize file-kind record");
         assert_eq!(
             back.kind,
             RecordKind::File,
@@ -874,7 +706,7 @@ artifact = "snippets"
 
     #[test]
     fn dir_kind_record_serializes_as_lowercase_dir() {
-        let rec = RegistryRecord {
+        let rec = ArtifactRecord {
             version: 1,
             key: ArtifactKey {
                 target: "dest".to_owned(),
@@ -902,7 +734,7 @@ artifact = "snippets"
             "a dir-kind record must serialize the lowercase tag `kind = \"dir\"`, got:\n{toml}"
         );
 
-        let back: RegistryRecord = toml::from_str(&toml).expect("deserialize dir-kind record");
+        let back: ArtifactRecord = toml::from_str(&toml).expect("deserialize dir-kind record");
         assert_eq!(
             back.kind,
             RecordKind::Dir,
@@ -912,7 +744,7 @@ artifact = "snippets"
 
     #[test]
     fn projected_threads_file_kind_from_projected_record() {
-        let projected = ProjectedRecord {
+        let projected = NewArtifactRecord {
             key: ArtifactKey {
                 target: "dest".to_owned(),
                 source: "agents-src".to_owned(),
@@ -931,19 +763,19 @@ artifact = "snippets"
             layout_separator: None,
         };
 
-        let rec = RegistryRecord::projected(projected);
+        let rec = ArtifactRecord::projected(projected);
 
         assert_eq!(
             rec.kind,
             RecordKind::File,
-            "projected() must carry the kind from the ProjectedRecord verbatim"
+            "projected() must carry the kind from the NewArtifactRecord verbatim"
         );
     }
 
     // ── per-artifact vars digest (TPH-010) ─────────────────────────
 
-    fn vars_digest_record(vars_digest: Option<&str>) -> RegistryRecord {
-        RegistryRecord {
+    fn vars_digest_record(vars_digest: Option<&str>) -> ArtifactRecord {
+        ArtifactRecord {
             version: 1,
             key: ArtifactKey {
                 target: "vscode".to_owned(),
@@ -981,7 +813,7 @@ artifact = "snippets"
              so feature-free records stay byte-identical to the pre-feature format (INV-8), got:\n{toml}"
         );
 
-        let back: RegistryRecord = toml::from_str(&toml).expect("deserialize feature-free record");
+        let back: ArtifactRecord = toml::from_str(&toml).expect("deserialize feature-free record");
         assert_eq!(
             back, rec,
             "a None vars_digest must round-trip field-for-field through TOML"
@@ -1004,7 +836,7 @@ artifact = "snippets"
             "a record whose vars_digest is Some(..) must serialize the key, got:\n{toml}"
         );
 
-        let back: RegistryRecord = toml::from_str(&toml).expect("deserialize templated record");
+        let back: ArtifactRecord = toml::from_str(&toml).expect("deserialize templated record");
         assert_eq!(
             back, rec,
             "a Some(vars_digest) record must round-trip field-for-field through TOML"
@@ -1036,7 +868,7 @@ source = "company-configs"
 artifact = "snippets"
 "#;
 
-        let rec: RegistryRecord =
+        let rec: ArtifactRecord =
             toml::from_str(legacy).expect("legacy record without `vars_digest` must still parse");
 
         assert_eq!(
@@ -1070,7 +902,7 @@ source = "nvim"
 artifact = "init"
 "#;
 
-        let rec: RegistryRecord =
+        let rec: ArtifactRecord =
             toml::from_str(stored).expect("a record carrying deploy_root must deserialize");
         let round_tripped = toml::to_string(&rec).expect("re-serialize record");
 
@@ -1122,7 +954,7 @@ artifact = "init"
              artifact = \"init\"\n"
         );
 
-        let rec: RegistryRecord =
+        let rec: ArtifactRecord =
             toml::from_str(&stored).expect("record with expanded deploy_root must deserialize");
         let round_tripped = toml::to_string(&rec).expect("re-serialize record");
         let value: toml::Value =
@@ -1159,7 +991,7 @@ source = "company-configs"
 artifact = "snippets"
 "#;
 
-        let rec: RegistryRecord =
+        let rec: ArtifactRecord =
             toml::from_str(legacy).expect("legacy record without `deploy_root` must still parse");
 
         assert_eq!(
@@ -1228,8 +1060,8 @@ artifact = "snippets"
         );
     }
 
-    fn record(target: &str, source: &str, artifact: &str) -> RegistryRecord {
-        RegistryRecord {
+    fn record(target: &str, source: &str, artifact: &str) -> ArtifactRecord {
+        ArtifactRecord {
             version: 1,
             key: ArtifactKey {
                 target: target.to_owned(),
@@ -1257,9 +1089,9 @@ artifact = "snippets"
         }
     }
 
-    fn registry() -> (TempDir, FileRegistry) {
+    fn registry() -> (TempDir, FileStateStore) {
         let dir = TempDir::new().expect("temp state root");
-        let reg = FileRegistry::open(dir.path().to_path_buf()).expect("open registry");
+        let reg = FileStateStore::open(dir.path().to_path_buf()).expect("open registry");
         (dir, reg)
     }
 
@@ -1301,7 +1133,9 @@ artifact = "snippets"
             artifact: "snippets".to_owned(),
         };
 
-        let got = reg.get(&key).expect("get must not error on absent key");
+        let got = reg
+            .artifact(&key)
+            .expect("get must not error on absent key");
 
         assert!(got.is_none(), "absent key yields Ok(None)");
     }
@@ -1311,9 +1145,9 @@ artifact = "snippets"
         let (_dir, reg) = registry();
         let rec = record("vscode", "company-configs", "snippets");
 
-        reg.put(&rec).expect("put record");
+        reg.put_artifact(&rec).expect("put record");
         let got = reg
-            .get(&rec.key)
+            .artifact(&rec.key)
             .expect("get record")
             .expect("record present");
 
@@ -1325,7 +1159,7 @@ artifact = "snippets"
         let (dir, reg) = registry();
         let rec = record("vscode", "company-configs", "snippets");
 
-        reg.put(&rec).expect("put record");
+        reg.put_artifact(&rec).expect("put record");
 
         let expected = dir
             .path()
@@ -1340,7 +1174,7 @@ artifact = "snippets"
             expected.display()
         );
         assert_eq!(
-            reg.get(&rec.key)
+            reg.artifact(&rec.key)
                 .expect("get record")
                 .expect("record present"),
             rec,
@@ -1357,7 +1191,7 @@ artifact = "snippets"
         );
         let rec = record("vscode", "company-configs", "snippets");
 
-        reg.put(&rec).expect("put must create parent dirs");
+        reg.put_artifact(&rec).expect("put must create parent dirs");
 
         let expected = dir
             .path()
@@ -1372,7 +1206,7 @@ artifact = "snippets"
             expected.display()
         );
         assert_eq!(
-            reg.get(&rec.key)
+            reg.artifact(&rec.key)
                 .expect("get record")
                 .expect("record present"),
             rec,
@@ -1384,12 +1218,12 @@ artifact = "snippets"
     fn remove_deletes_the_record() {
         let (_dir, reg) = registry();
         let rec = record("vscode", "company-configs", "snippets");
-        reg.put(&rec).expect("put record");
+        reg.put_artifact(&rec).expect("put record");
 
-        reg.remove(&rec.key).expect("remove record");
+        reg.remove_artifact(&rec.key).expect("remove record");
 
         assert!(
-            reg.get(&rec.key).expect("get after remove").is_none(),
+            reg.artifact(&rec.key).expect("get after remove").is_none(),
             "removed record must no longer be found"
         );
     }
@@ -1398,7 +1232,7 @@ artifact = "snippets"
     fn put_leaves_no_temp_file() {
         let (dir, reg) = registry();
 
-        reg.put(&record("vscode", "company-configs", "snippets"))
+        reg.put_artifact(&record("vscode", "company-configs", "snippets"))
             .expect("put record");
 
         let artifact_dir = dir
@@ -1421,7 +1255,7 @@ artifact = "snippets"
 
     // list_target / list_all
 
-    fn contains_artifact(records: &[RegistryRecord], source: &str, artifact: &str) -> bool {
+    fn contains_artifact(records: &[ArtifactRecord], source: &str, artifact: &str) -> bool {
         records.iter().any(|r| {
             r.key.source == source && r.key.artifact == artifact && r.commit == "def456789abc123"
         })
@@ -1430,13 +1264,14 @@ artifact = "snippets"
     #[test]
     fn list_target_returns_only_records_under_that_target() {
         let (_dir, reg) = registry();
-        reg.put(&record("vscode", "company-configs", "snippets"))
+        reg.put_artifact(&record("vscode", "company-configs", "snippets"))
             .expect("put a");
-        reg.put(&record("vscode", "dotfiles", "settings"))
+        reg.put_artifact(&record("vscode", "dotfiles", "settings"))
             .expect("put b");
-        reg.put(&record("nvim", "dotfiles", "init")).expect("put c");
+        reg.put_artifact(&record("nvim", "dotfiles", "init"))
+            .expect("put c");
 
-        let vscode = reg.list_target("vscode").expect("list vscode");
+        let vscode = reg.target_artifacts("vscode").expect("list vscode");
 
         assert_eq!(vscode.len(), 2, "two records under vscode");
         assert!(
@@ -1462,7 +1297,7 @@ artifact = "snippets"
         let (_dir, reg) = registry();
 
         let records = reg
-            .list_target("never-projected")
+            .target_artifacts("never-projected")
             .expect("listing an absent target must not error");
 
         assert_eq!(records, vec![], "absent target dir => empty record list");
@@ -1471,12 +1306,12 @@ artifact = "snippets"
     #[test]
     fn list_all_returns_records_across_all_targets() {
         let (_dir, reg) = registry();
-        reg.put(&record("vscode", "company-configs", "snippets"))
+        reg.put_artifact(&record("vscode", "company-configs", "snippets"))
             .expect("put vscode");
-        reg.put(&record("nvim", "dotfiles", "init"))
+        reg.put_artifact(&record("nvim", "dotfiles", "init"))
             .expect("put nvim");
 
-        let all = reg.list_all().expect("list all");
+        let all = reg.all_artifacts().expect("list all");
 
         assert_eq!(all.len(), 2, "records from every target appear");
         assert!(
@@ -1496,13 +1331,13 @@ artifact = "snippets"
     #[test]
     fn list_target_orders_records_by_source_then_artifact() {
         let (_dir, reg) = registry();
-        reg.put(&record("home", "second", "COPY.md"))
+        reg.put_artifact(&record("home", "second", "COPY.md"))
             .expect("put second");
-        reg.put(&record("home", "dotfiles", "READER.md"))
+        reg.put_artifact(&record("home", "dotfiles", "READER.md"))
             .expect("put dotfiles");
 
         let keys: Vec<(String, String)> = reg
-            .list_target("home")
+            .target_artifacts("home")
             .expect("list home")
             .into_iter()
             .map(|r| (r.key.source, r.key.artifact))
@@ -1521,15 +1356,15 @@ artifact = "snippets"
     #[test]
     fn list_all_orders_records_by_target_then_source_then_artifact() {
         let (_dir, reg) = registry();
-        reg.put(&record("nvim", "dotfiles", "init"))
+        reg.put_artifact(&record("nvim", "dotfiles", "init"))
             .expect("put nvim");
-        reg.put(&record("home", "second", "COPY.md"))
+        reg.put_artifact(&record("home", "second", "COPY.md"))
             .expect("put home second");
-        reg.put(&record("home", "dotfiles", "READER.md"))
+        reg.put_artifact(&record("home", "dotfiles", "READER.md"))
             .expect("put home dotfiles");
 
         let keys: Vec<(String, String, String)> = reg
-            .list_all()
+            .all_artifacts()
             .expect("list all")
             .into_iter()
             .map(|r| (r.key.target, r.key.source, r.key.artifact))
@@ -1557,7 +1392,7 @@ artifact = "snippets"
         let (_dir, reg) = registry();
 
         let ejected = reg
-            .load_ejected("vscode")
+            .ejections("vscode")
             .expect("missing meta must not error");
 
         assert!(ejected.is_empty(), "no meta file => empty ejected list");
@@ -1567,20 +1402,21 @@ artifact = "snippets"
     fn save_then_load_ejected_round_trips() {
         let (_dir, reg) = registry();
         let entries = vec![
-            EjectedEntry {
+            Ejection {
                 source: "company-configs".to_owned(),
                 artifact: "snippets".to_owned(),
                 ejected_at: "2026-01-31T14:00:00Z".to_owned(),
             },
-            EjectedEntry {
+            Ejection {
                 source: "dotfiles".to_owned(),
                 artifact: "old-config".to_owned(),
                 ejected_at: "2026-01-30T10:00:00Z".to_owned(),
             },
         ];
 
-        reg.save_ejected("vscode", &entries).expect("save ejected");
-        let loaded = reg.load_ejected("vscode").expect("load ejected");
+        reg.save_ejections("vscode", &entries)
+            .expect("save ejected");
+        let loaded = reg.ejections("vscode").expect("load ejected");
 
         assert_eq!(
             loaded, entries,
@@ -1591,13 +1427,14 @@ artifact = "snippets"
     #[test]
     fn save_ejected_writes_meta_at_target_path() {
         let (dir, reg) = registry();
-        let entries = vec![EjectedEntry {
+        let entries = vec![Ejection {
             source: "company-configs".to_owned(),
             artifact: "snippets".to_owned(),
             ejected_at: "2026-01-31T14:00:00Z".to_owned(),
         }];
 
-        reg.save_ejected("vscode", &entries).expect("save ejected");
+        reg.save_ejections("vscode", &entries)
+            .expect("save ejected");
 
         let expected = dir.path().join("targets").join("vscode").join("meta.toml");
         assert!(
@@ -1613,7 +1450,7 @@ artifact = "snippets"
     fn lock_exclusive_succeeds_when_unheld() {
         let (_dir, reg) = registry();
 
-        let guard = reg.lock_exclusive();
+        let guard = reg.acquire_lock();
 
         assert!(guard.is_ok(), "first exclusive lock must succeed");
     }
@@ -1622,7 +1459,7 @@ artifact = "snippets"
     fn lock_exclusive_creates_lock_file_at_locks_state_lock() {
         let (dir, reg) = registry();
 
-        let _held = reg.lock_exclusive().expect("first lock acquired");
+        let _held = reg.acquire_lock().expect("first lock acquired");
 
         let expected = dir.path().join("locks").join("state.lock");
         assert!(
@@ -1635,17 +1472,17 @@ artifact = "snippets"
     #[test]
     fn second_exclusive_lock_fails_while_first_held() {
         let dir = TempDir::new().expect("temp state root");
-        let first = FileRegistry::open(dir.path().to_path_buf()).expect("open first registry");
-        let second = FileRegistry::open(dir.path().to_path_buf()).expect("open second registry");
+        let first = FileStateStore::open(dir.path().to_path_buf()).expect("open first registry");
+        let second = FileStateStore::open(dir.path().to_path_buf()).expect("open second registry");
 
         let _held = first
-            .lock_exclusive()
+            .acquire_lock()
             .expect("first instance acquires the lock");
 
-        let blocked = second.lock_exclusive();
+        let blocked = second.acquire_lock();
 
         let err = blocked.expect_err(
-            "a second FileRegistry on the same state_root must fail to lock while the first holds it",
+            "a second FileStateStore on the same state_root must fail to lock while the first holds it",
         );
         let msg = err.to_string();
         assert!(
@@ -1660,16 +1497,16 @@ artifact = "snippets"
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = TempDir::new().expect("temp state root");
-        let first = FileRegistry::open(dir.path().to_path_buf()).expect("open first registry");
-        let second = FileRegistry::open(dir.path().to_path_buf()).expect("open second registry");
+        let first = FileStateStore::open(dir.path().to_path_buf()).expect("open first registry");
+        let second = FileStateStore::open(dir.path().to_path_buf()).expect("open second registry");
 
         {
             let _held = first
-                .lock_exclusive()
+                .acquire_lock()
                 .expect("first instance acquires the lock");
         }
 
-        let reacquired = second.lock_exclusive();
+        let reacquired = second.acquire_lock();
 
         assert!(
             reacquired.is_ok(),
@@ -1697,7 +1534,7 @@ artifact = "snippets"
 
         reg.save_hook_state("vscode", &states)
             .expect("save hook state");
-        let loaded = reg.load_hook_state("vscode").expect("load hook state");
+        let loaded = reg.hook_state("vscode").expect("load hook state");
 
         assert_eq!(
             loaded, states,
@@ -1712,7 +1549,7 @@ artifact = "snippets"
         let (_dir, reg) = registry();
 
         let states = reg
-            .load_hook_state("never-synced")
+            .hook_state("never-synced")
             .expect("missing hook state must not error");
 
         assert!(
@@ -1743,7 +1580,7 @@ artifact = "snippets"
         reg.record_hook_success("vscode", "vscode#0", &digest_set(&["blake3:ccc"]))
             .expect("record success only for the hook that exited 0");
 
-        let loaded = reg.load_hook_state("vscode").expect("load hook state");
+        let loaded = reg.hook_state("vscode").expect("load hook state");
         let succeeded = loaded
             .iter()
             .find(|s| s.hook_id == "vscode#0")
@@ -1772,7 +1609,7 @@ artifact = "snippets"
         reg.record_hook_success("vscode", "vscode#0", &digest_set(&["blake3:aaa"]))
             .expect("record first-ever success");
 
-        let loaded = reg.load_hook_state("vscode").expect("load hook state");
+        let loaded = reg.hook_state("vscode").expect("load hook state");
         assert_eq!(
             loaded,
             vec![HookState {
@@ -1789,7 +1626,7 @@ artifact = "snippets"
     #[test]
     fn hook_state_and_ejected_meta_coexist_for_same_target() {
         let (_dir, reg) = registry();
-        let ejected = vec![EjectedEntry {
+        let ejected = vec![Ejection {
             source: "company-configs".to_owned(),
             artifact: "snippets".to_owned(),
             ejected_at: "2026-06-13T10:00:00Z".to_owned(),
@@ -1799,17 +1636,18 @@ artifact = "snippets"
             last_success: digest_set(&["blake3:aaa"]),
         }];
 
-        reg.save_ejected("vscode", &ejected).expect("save ejected");
+        reg.save_ejections("vscode", &ejected)
+            .expect("save ejected");
         reg.save_hook_state("vscode", &hooks)
             .expect("save hook state");
 
         assert_eq!(
-            reg.load_ejected("vscode").expect("load ejected"),
+            reg.ejections("vscode").expect("load ejected"),
             ejected,
             "saving hook state must not clobber existing ejected entries"
         );
         assert_eq!(
-            reg.load_hook_state("vscode").expect("load hook state"),
+            reg.hook_state("vscode").expect("load hook state"),
             hooks,
             "hook state must persist alongside ejected entries"
         );
@@ -1821,13 +1659,14 @@ artifact = "snippets"
     #[test]
     fn hook_free_target_meta_serializes_byte_identical_to_pre_feature() {
         let (dir, reg) = registry();
-        let ejected = vec![EjectedEntry {
+        let ejected = vec![Ejection {
             source: "company-configs".to_owned(),
             artifact: "snippets".to_owned(),
             ejected_at: "2026-01-31T14:00:00Z".to_owned(),
         }];
 
-        reg.save_ejected("vscode", &ejected).expect("save ejected");
+        reg.save_ejections("vscode", &ejected)
+            .expect("save ejected");
 
         let meta_path = dir.path().join("targets").join("vscode").join("meta.toml");
         let written = std::fs::read_to_string(&meta_path).expect("read meta.toml");

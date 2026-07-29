@@ -3,8 +3,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
-use crate::store::{Registry, RegistryRecord};
 use crate::sync::scan::scan_dir_strict;
+use crate::sync::state::{ArtifactRecord, StateStore};
 
 use super::SyncWarning;
 use super::journal::{Journal, JournalEntry};
@@ -103,9 +103,9 @@ pub fn apply_artifact(
     staging_base: &Path,
     staging: &Path,
     dst: &Path,
-    record: RegistryRecord,
+    record: ArtifactRecord,
     journal: &Journal,
-    registry: &dyn Registry,
+    registry: &dyn StateStore,
 ) -> Result<()> {
     let mut events = SyncEvents::default();
     apply_artifact_report(
@@ -127,9 +127,9 @@ pub(super) fn apply_artifact_report(
     staging_base: &Path,
     staging: &Path,
     dst: &Path,
-    record: RegistryRecord,
+    record: ArtifactRecord,
     journal: &Journal,
-    registry: &dyn Registry,
+    registry: &dyn StateStore,
     events: &mut SyncEvents,
 ) -> Result<()> {
     let mut cleanup = CleanupGuard::new();
@@ -164,7 +164,7 @@ pub(super) fn apply_artifact_report(
     swap_into(staging, dst, record.allow_symlinks, events)?;
     journal.mark_swap_completed(dst)?;
 
-    if let Err(put_err) = registry.put(&record) {
+    if let Err(put_err) = registry.put_artifact(&record) {
         rollback_swap(dst, backup.as_deref())?;
         journal.remove(dst)?;
         return Err(put_err.into());
@@ -204,9 +204,9 @@ pub fn link_artifact(
     staging_base: &Path,
     dst: &Path,
     target: &Path,
-    record: RegistryRecord,
+    record: ArtifactRecord,
     journal: &Journal,
-    registry: &dyn Registry,
+    registry: &dyn StateStore,
 ) -> Result<()> {
     let parent = dst
         .parent()
@@ -230,7 +230,7 @@ pub fn link_artifact(
     cleanup.track(backup_path(staging_base, dst));
     cleanup.prune_base_if_empty(staging_base.to_path_buf());
 
-    let is_file = matches!(record.kind, crate::store::RecordKind::File);
+    let is_file = matches!(record.kind, crate::sync::state::RecordKind::File);
     create_symlink(target, &staging, is_file).map_err(|e| {
         Error::Projection(format!(
             "symlink {} -> {}: {e}",
@@ -272,7 +272,7 @@ pub fn link_artifact(
     })?;
     journal.mark_swap_completed(dst)?;
 
-    if let Err(put_err) = registry.put(&record) {
+    if let Err(put_err) = registry.put_artifact(&record) {
         rollback_swap(dst, backup.as_deref())?;
         journal.remove(dst)?;
         return Err(put_err.into());
@@ -322,11 +322,11 @@ fn is_cross_device(e: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{
-        ArtifactKey, EjectedEntry, FileRegistry, HookState, ManifestFile, StoreError,
+    use crate::sync::state::{
+        ArtifactKey, Ejection, FileStateStore, HookState, ManifestFile, StateError,
     };
 
-    type StoreResult<T> = std::result::Result<T, StoreError>;
+    type StoreResult<T> = std::result::Result<T, StateError>;
     use std::collections::BTreeSet;
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
@@ -431,9 +431,9 @@ mod tests {
         }
     }
 
-    fn registry() -> (TempDir, FileRegistry) {
+    fn registry() -> (TempDir, FileStateStore) {
         let dir = TempDir::new().expect("temp state root");
-        let reg = FileRegistry::open(dir.path().to_path_buf()).expect("open registry");
+        let reg = FileStateStore::open(dir.path().to_path_buf()).expect("open registry");
         (dir, reg)
     }
 
@@ -460,7 +460,7 @@ mod tests {
 
     /// Record describing what `apply_artifact` should persist; file metadata is filled
     /// from the staging dir so a post-deploy `check_artifact_state` reads as Clean.
-    fn record_for(staging: &Path, files: &[(&str, &[u8])]) -> RegistryRecord {
+    fn record_for(staging: &Path, files: &[(&str, &[u8])]) -> ArtifactRecord {
         let mut manifest = Vec::new();
         for (rel, contents) in files {
             manifest.push(ManifestFile {
@@ -470,7 +470,7 @@ mod tests {
                 blake3: blake3::hash(contents).to_hex().to_string(),
             });
         }
-        RegistryRecord {
+        ArtifactRecord {
             version: 1,
             key: key(),
             source: SOURCE.to_owned(),
@@ -478,7 +478,7 @@ mod tests {
             digest: "blake3:d4e5f6".to_owned(),
             projected_at: "2026-01-31T12:34:56Z".to_owned(),
             layout: "flat".to_owned(),
-            kind: crate::store::RecordKind::Dir,
+            kind: crate::sync::state::RecordKind::Dir,
             allow_symlinks: false,
             preserve_executable: true,
             files: manifest,
@@ -508,7 +508,7 @@ mod tests {
             .collect()
     }
 
-    fn journal_for(reg: &FileRegistry) -> Journal {
+    fn journal_for(reg: &FileStateStore) -> Journal {
         Journal::open(&reg.state_root().join("locks")).expect("open journal")
     }
 
@@ -516,7 +516,7 @@ mod tests {
         base: &Path,
         staging: &Path,
         dst: &Path,
-        record: &RegistryRecord,
+        record: &ArtifactRecord,
         swap_completed: bool,
     ) -> JournalEntry {
         JournalEntry {
@@ -588,7 +588,7 @@ mod tests {
             .expect("deploy must succeed");
 
         let got = reg
-            .get(&key())
+            .artifact(&key())
             .expect("get after deploy")
             .expect("record persisted after deploy");
         assert_eq!(
@@ -636,11 +636,11 @@ mod tests {
         );
     }
 
-    /// Registry double that, at `put` time, records whether the write-ahead invariants already
+    /// `StateStore` double that, at `put` time, records whether the write-ahead invariants already
     /// hold: the journal carries the intent and `dst` already holds the staged content. Reads
-    /// delegate to an inner `FileRegistry`; `put` succeeds.
+    /// delegate to an inner `FileStateStore`; `put` succeeds.
     struct OrderingProbeRegistry {
-        inner: FileRegistry,
+        inner: FileStateStore,
         journal_dir: PathBuf,
         dst: PathBuf,
         staged_content: Vec<u8>,
@@ -648,36 +648,36 @@ mod tests {
         dst_held_staged_content_at_put: std::cell::Cell<bool>,
     }
 
-    impl Registry for OrderingProbeRegistry {
-        fn get(&self, key: &ArtifactKey) -> StoreResult<Option<RegistryRecord>> {
-            self.inner.get(key)
+    impl StateStore for OrderingProbeRegistry {
+        fn artifact(&self, key: &ArtifactKey) -> StoreResult<Option<ArtifactRecord>> {
+            self.inner.artifact(key)
         }
-        fn put(&self, record: &RegistryRecord) -> StoreResult<()> {
+        fn put_artifact(&self, record: &ArtifactRecord) -> StoreResult<()> {
             let journal = Journal::open(&self.journal_dir).expect("open journal at put time");
             let entries = journal.entries().expect("read journal at put time");
             self.journal_nonempty_at_put.set(!entries.is_empty());
             let on_disk = std::fs::read(self.dst.join("a.json")).unwrap_or_default();
             self.dst_held_staged_content_at_put
                 .set(on_disk == self.staged_content);
-            self.inner.put(record)
+            self.inner.put_artifact(record)
         }
-        fn remove(&self, key: &ArtifactKey) -> StoreResult<()> {
-            self.inner.remove(key)
+        fn remove_artifact(&self, key: &ArtifactKey) -> StoreResult<()> {
+            self.inner.remove_artifact(key)
         }
-        fn list_target(&self, target: &str) -> StoreResult<Vec<RegistryRecord>> {
-            self.inner.list_target(target)
+        fn target_artifacts(&self, target: &str) -> StoreResult<Vec<ArtifactRecord>> {
+            self.inner.target_artifacts(target)
         }
-        fn list_all(&self) -> StoreResult<Vec<RegistryRecord>> {
-            self.inner.list_all()
+        fn all_artifacts(&self) -> StoreResult<Vec<ArtifactRecord>> {
+            self.inner.all_artifacts()
         }
-        fn load_ejected(&self, target: &str) -> StoreResult<Vec<EjectedEntry>> {
-            self.inner.load_ejected(target)
+        fn ejections(&self, target: &str) -> StoreResult<Vec<Ejection>> {
+            self.inner.ejections(target)
         }
-        fn save_ejected(&self, target: &str, ejected: &[EjectedEntry]) -> StoreResult<()> {
-            self.inner.save_ejected(target, ejected)
+        fn save_ejections(&self, target: &str, ejected: &[Ejection]) -> StoreResult<()> {
+            self.inner.save_ejections(target, ejected)
         }
-        fn load_hook_state(&self, target: &str) -> StoreResult<Vec<HookState>> {
-            self.inner.load_hook_state(target)
+        fn hook_state(&self, target: &str) -> StoreResult<Vec<HookState>> {
+            self.inner.hook_state(target)
         }
         fn record_hook_success(
             &self,
@@ -687,15 +687,18 @@ mod tests {
         ) -> StoreResult<()> {
             self.inner.record_hook_success(target, hook_id, digest_set)
         }
-        fn locks_dir(&self) -> PathBuf {
-            self.inner.locks_dir()
+        fn acquire_lock(&self) -> StoreResult<crate::sync::state::StateLock> {
+            self.inner.acquire_lock()
+        }
+        fn journal_root(&self) -> PathBuf {
+            self.inner.journal_root()
         }
     }
 
     #[test]
     fn deploy_journals_intent_before_put_and_swaps_before_put() {
         let dir = TempDir::new().expect("temp state root");
-        let inner = FileRegistry::open(dir.path().to_path_buf()).expect("open inner registry");
+        let inner = FileStateStore::open(dir.path().to_path_buf()).expect("open inner registry");
         let journal_dir = inner.state_root().join("locks");
         let parent = TempDir::new().expect("target parent");
         let dst = parent.path().join("vscode");
@@ -727,35 +730,35 @@ mod tests {
         );
     }
 
-    /// Registry double whose `put` always fails; all reads delegate to an inner `FileRegistry`.
+    /// `StateStore` double whose `put` always fails; all reads delegate to an inner `FileStateStore`.
     struct FailingPutRegistry {
-        inner: FileRegistry,
+        inner: FileStateStore,
     }
 
-    impl Registry for FailingPutRegistry {
-        fn get(&self, key: &ArtifactKey) -> StoreResult<Option<RegistryRecord>> {
-            self.inner.get(key)
+    impl StateStore for FailingPutRegistry {
+        fn artifact(&self, key: &ArtifactKey) -> StoreResult<Option<ArtifactRecord>> {
+            self.inner.artifact(key)
         }
-        fn put(&self, _record: &RegistryRecord) -> StoreResult<()> {
-            Err(StoreError::Registry("injected put failure".to_owned()))
+        fn put_artifact(&self, _record: &ArtifactRecord) -> StoreResult<()> {
+            Err(StateError::StateStore("injected put failure".to_owned()))
         }
-        fn remove(&self, key: &ArtifactKey) -> StoreResult<()> {
-            self.inner.remove(key)
+        fn remove_artifact(&self, key: &ArtifactKey) -> StoreResult<()> {
+            self.inner.remove_artifact(key)
         }
-        fn list_target(&self, target: &str) -> StoreResult<Vec<RegistryRecord>> {
-            self.inner.list_target(target)
+        fn target_artifacts(&self, target: &str) -> StoreResult<Vec<ArtifactRecord>> {
+            self.inner.target_artifacts(target)
         }
-        fn list_all(&self) -> StoreResult<Vec<RegistryRecord>> {
-            self.inner.list_all()
+        fn all_artifacts(&self) -> StoreResult<Vec<ArtifactRecord>> {
+            self.inner.all_artifacts()
         }
-        fn load_ejected(&self, target: &str) -> StoreResult<Vec<EjectedEntry>> {
-            self.inner.load_ejected(target)
+        fn ejections(&self, target: &str) -> StoreResult<Vec<Ejection>> {
+            self.inner.ejections(target)
         }
-        fn save_ejected(&self, target: &str, ejected: &[EjectedEntry]) -> StoreResult<()> {
-            self.inner.save_ejected(target, ejected)
+        fn save_ejections(&self, target: &str, ejected: &[Ejection]) -> StoreResult<()> {
+            self.inner.save_ejections(target, ejected)
         }
-        fn load_hook_state(&self, target: &str) -> StoreResult<Vec<HookState>> {
-            self.inner.load_hook_state(target)
+        fn hook_state(&self, target: &str) -> StoreResult<Vec<HookState>> {
+            self.inner.hook_state(target)
         }
         fn record_hook_success(
             &self,
@@ -765,8 +768,11 @@ mod tests {
         ) -> StoreResult<()> {
             self.inner.record_hook_success(target, hook_id, digest_set)
         }
-        fn locks_dir(&self) -> PathBuf {
-            self.inner.locks_dir()
+        fn acquire_lock(&self) -> StoreResult<crate::sync::state::StateLock> {
+            self.inner.acquire_lock()
+        }
+        fn journal_root(&self) -> PathBuf {
+            self.inner.journal_root()
         }
     }
 
@@ -774,7 +780,7 @@ mod tests {
     fn deploy_rolls_back_to_original_content_when_put_fails() {
         let dir = TempDir::new().expect("temp state root");
         let reg = FailingPutRegistry {
-            inner: FileRegistry::open(dir.path().to_path_buf()).expect("open inner registry"),
+            inner: FileStateStore::open(dir.path().to_path_buf()).expect("open inner registry"),
         };
         let parent = TempDir::new().expect("target parent");
         let dst = parent.path().join("vscode");
@@ -816,7 +822,7 @@ mod tests {
     fn deploy_rolls_back_to_absent_when_dst_did_not_exist_and_put_fails() {
         let dir = TempDir::new().expect("temp state root");
         let reg = FailingPutRegistry {
-            inner: FileRegistry::open(dir.path().to_path_buf()).expect("open inner registry"),
+            inner: FileStateStore::open(dir.path().to_path_buf()).expect("open inner registry"),
         };
         let parent = TempDir::new().expect("target parent");
         let dst = parent.path().join("vscode");
@@ -871,14 +877,14 @@ mod tests {
             "premise: the staging dir was renamed away, not left behind"
         );
         assert!(
-            reg.get(&key()).expect("pre-sweep get").is_none(),
+            reg.artifact(&key()).expect("pre-sweep get").is_none(),
             "premise: registry has no record yet (the crash happened before put)"
         );
 
         recovery_sweep(parent.path(), &jrnl, &reg).expect("recovery sweep must succeed");
 
         let persisted = reg
-            .get(&key())
+            .artifact(&key())
             .expect("post-sweep get")
             .expect("swap-completed-but-put-missing must be reconciled by finishing the put");
         assert_eq!(
@@ -918,7 +924,7 @@ mod tests {
             "an incomplete swap must leave the destination exactly as it was"
         );
         assert!(
-            reg.get(&key()).expect("post-sweep get").is_none(),
+            reg.artifact(&key()).expect("post-sweep get").is_none(),
             "an incomplete swap must not produce a registry record"
         );
         assert!(
@@ -1016,7 +1022,7 @@ mod tests {
             "the new staged content must NOT be installed for an incomplete swap"
         );
         assert!(
-            reg.get(&key()).expect("post-sweep get").is_none(),
+            reg.artifact(&key()).expect("post-sweep get").is_none(),
             "an incomplete swap must not produce a registry record"
         );
         assert!(

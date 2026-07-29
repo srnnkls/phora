@@ -1,19 +1,24 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use crate::config::{Config, LayoutConfig, ParsedSource, Target, TemplateOptIn};
+use crate::config::{
+    Config, DeployMode, LayoutConfig, ParsedSource, SourceMode, Target, TemplateOptIn,
+};
 use crate::error::{Error, Result};
-use crate::kernel::Materialization;
 use crate::lock::{Lock, encode_ref, ref_discriminator};
-use crate::source::SourceName;
-use crate::source::{ResolvedSource, SnapshotId, SourcePath};
-use crate::store::{
-    ArtifactKey, ManifestFile, ProjectedRecord, RecordKind, Registry, RegistryRecord,
+use crate::projection::model::Materialization;
+use crate::source::{
+    Commit, ResolvePolicy, ResolveRequest, ResolvedSource, RevisionSpec, SourceLocation,
+    SourcePath, SourceStore,
+};
+use crate::sync::state::{
+    ArtifactKey, ArtifactRecord, ManifestFile, NewArtifactRecord, RecordKind, StateStore,
 };
 
 use super::plan::plan_target;
+use super::resolve::ResolvedSourceMap;
 use super::stage::{StageRequest, stage_artifact};
-use super::{StageSource, StagingGuard, nonce, remote_for, resolved_remotes};
+use super::{StagingGuard, nonce, remote_for, resolved_remotes};
 use crate::projection::model::{BindingProjection, ProjectedArtifact, TargetProjection};
 
 /// Summary of a [`rebuild_registry`] run: which artifacts were reconstructed and
@@ -32,8 +37,8 @@ pub struct RebuildReport {
 pub fn rebuild_registry(
     config: &Config,
     lock: &Lock,
-    backend: &dyn StageSource,
-    registry: &dyn Registry,
+    backend: &dyn SourceStore,
+    registry: &dyn StateStore,
 ) -> Result<RebuildReport> {
     let parsed = config.parsed_sources()?;
     let remotes = resolved_remotes(config, &parsed)?;
@@ -47,10 +52,11 @@ pub fn rebuild_registry_with(
     parsed: &BTreeMap<String, ParsedSource>,
     remotes: &BTreeMap<String, String>,
     lock: &Lock,
-    backend: &dyn StageSource,
-    registry: &dyn Registry,
+    backend: &dyn SourceStore,
+    registry: &dyn StateStore,
 ) -> Result<RebuildReport> {
-    let resolved_commits = locked_commits(config, lock, parsed)?;
+    let (resolved_commits, resolved_sources) =
+        locked_sources(config, lock, parsed, remotes, backend)?;
 
     let mut report = RebuildReport::default();
 
@@ -62,6 +68,7 @@ pub fn rebuild_registry_with(
             remotes,
             backend,
             &resolved_commits,
+            &resolved_sources,
         )?;
 
         let mut managed_dests: BTreeSet<PathBuf> = BTreeSet::new();
@@ -85,11 +92,11 @@ pub fn rebuild_registry_with(
                     target_name,
                     target,
                     backend,
+                    resolved_sources: &resolved_sources,
                     registry,
                     projection: &plan,
                     binding,
                     source,
-                    git: remote_for(remotes, &binding.source)?,
                 },
                 &mut report,
             )?;
@@ -103,12 +110,17 @@ pub fn rebuild_registry_with(
 
 /// The `(name, encoded_ref) -> commit` map `plan_target` needs, drawn from the lock:
 /// every binding's effective ref resolves to its locked commit (link sources included).
-fn locked_commits(
+type LockedSourceMaps = (BTreeMap<(String, String), String>, ResolvedSourceMap);
+
+fn locked_sources(
     config: &Config,
     lock: &Lock,
     parsed: &BTreeMap<String, crate::config::ParsedSource>,
-) -> Result<BTreeMap<(String, String), String>> {
+    remotes: &BTreeMap<String, String>,
+    store: &dyn SourceStore,
+) -> Result<LockedSourceMaps> {
     let mut commits = BTreeMap::new();
+    let mut resolved_sources = ResolvedSourceMap::new();
     for target in config.targets.values() {
         for binding in target.resolve_sources(parsed) {
             let source = parsed.get(binding.source).ok_or_else(|| {
@@ -133,9 +145,45 @@ fn locked_commits(
                 ),
                 locked.commit.clone(),
             );
+
+            let resolved_key = (binding.source.to_owned(), locked.commit.clone());
+            if resolved_sources.contains_key(&resolved_key) {
+                continue;
+            }
+
+            let remote = remote_for(remotes, binding.source)?;
+            let (location, revision) = match source.deploy_mode() {
+                DeployMode::Link => (
+                    SourceLocation::Worktree {
+                        root: remote.into(),
+                    },
+                    RevisionSpec::Default,
+                ),
+                DeployMode::Copy if source.mode() == SourceMode::Url => (
+                    SourceLocation::Url {
+                        url: remote.to_owned(),
+                    },
+                    RevisionSpec::Commit(locked.commit.parse::<Commit>()?),
+                ),
+                DeployMode::Copy => (
+                    SourceLocation::Git {
+                        url: remote.to_owned(),
+                    },
+                    RevisionSpec::Commit(locked.commit.parse::<Commit>()?),
+                ),
+            };
+            let resolved = store.resolve(
+                &ResolveRequest {
+                    name: crate::source::SourceName::trusted(binding.source),
+                    location,
+                    revision,
+                },
+                ResolvePolicy::CachedOnly,
+            )?;
+            resolved_sources.insert(resolved_key, resolved);
         }
     }
-    Ok(commits)
+    Ok((commits, resolved_sources))
 }
 
 struct BindingRun<'a> {
@@ -143,16 +191,24 @@ struct BindingRun<'a> {
     parsed: &'a BTreeMap<String, crate::config::ParsedSource>,
     target_name: &'a str,
     target: &'a Target,
-    backend: &'a dyn StageSource,
-    registry: &'a dyn Registry,
+    backend: &'a dyn SourceStore,
+    resolved_sources: &'a ResolvedSourceMap,
+    registry: &'a dyn StateStore,
     projection: &'a TargetProjection,
     binding: &'a BindingProjection,
     source: &'a crate::config::ParsedSource,
-    git: &'a str,
 }
 
 fn rebuild_binding(run: &BindingRun<'_>, report: &mut RebuildReport) -> Result<()> {
-    let source_name = SourceName::trusted(&run.binding.source);
+    let resolved = run
+        .resolved_sources
+        .get(&(run.binding.source.clone(), run.binding.commit.clone()))
+        .ok_or_else(|| {
+            Error::Sync(format!(
+                "no resolved snapshot for {} at {}",
+                run.binding.source, run.binding.commit
+            ))
+        })?;
     let policy = run.source.export_policy();
     let template_opt_in = run
         .target
@@ -189,11 +245,10 @@ fn rebuild_binding(run: &BindingRun<'_>, report: &mut RebuildReport) -> Result<(
             rebuild_one(RebuildOne {
                 backend: run.backend,
                 registry: run.registry,
-                git: run.git,
-                source_name: &source_name,
                 underlying_source: &run.binding.source,
                 root: run.source.offer().root(),
                 commit: &run.binding.commit,
+                resolved,
                 policy: &policy,
                 projection: run.projection,
                 item,
@@ -219,13 +274,12 @@ fn record_kind(materialization: &Materialization) -> RecordKind {
 }
 
 struct RebuildOne<'a> {
-    backend: &'a dyn StageSource,
-    registry: &'a dyn Registry,
-    git: &'a str,
-    source_name: &'a SourceName,
+    backend: &'a dyn SourceStore,
+    registry: &'a dyn StateStore,
     underlying_source: &'a str,
     root: Option<&'a Path>,
     commit: &'a str,
+    resolved: &'a ResolvedSource,
     policy: &'a crate::source::ExportPolicy,
     projection: &'a TargetProjection,
     item: &'a ProjectedArtifact,
@@ -242,11 +296,10 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
     let RebuildOne {
         backend,
         registry,
-        git,
-        source_name,
         underlying_source,
         root,
         commit,
+        resolved,
         policy,
         projection,
         item,
@@ -264,14 +317,6 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
     let staging = staging_base.join(format!("{key_label}-{}-{}", std::process::id(), nonce()));
     let _guard = StagingGuard::new(&staging_base, &staging);
 
-    let commit_time = backend.commit_time(source_name, git, commit)?;
-    let resolved = ResolvedSource {
-        name: source_name.clone(),
-        url: git.to_owned(),
-        snapshot: SnapshotId::Git {
-            commit: commit.to_owned(),
-        },
-    };
     let staged = stage_artifact(
         &StageRequest {
             artifact: item,
@@ -281,11 +326,11 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         root,
         policy,
         &staging,
-        commit_time,
+        resolved.authored_at.unix_seconds(),
         template_opt_in,
         |repo_relative| {
             let path = SourcePath::new(&repo_relative.to_string_lossy().replace('\\', "/"))?;
-            let entry = backend.read(&resolved, &path)?;
+            let entry = backend.read(&resolved.snapshot, &path)?;
             Ok((entry.bytes, entry.meta.kind))
         },
     )?;
@@ -319,7 +364,7 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         });
     }
 
-    let record = RegistryRecord::projected(ProjectedRecord {
+    let record = ArtifactRecord::projected(NewArtifactRecord {
         key: key.clone(),
         underlying_source,
         commit,
@@ -333,7 +378,7 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         deploy_root: Some(deploy_root),
         layout_separator: layout.persisted_separator(),
     });
-    registry.put(&record)?;
+    registry.put_artifact(&record)?;
     if modified {
         report.modified.push(key);
     }
@@ -343,7 +388,7 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
 /// Reconstruct a linked artifact's registry record without hashing or export:
 /// a link source has no mirror, so its marker is synthesized from disk discovery.
 fn rebuild_linked(
-    registry: &dyn Registry,
+    registry: &dyn StateStore,
     underlying_source: &str,
     policy: &crate::source::ExportPolicy,
     layout: &LayoutConfig,
@@ -351,7 +396,7 @@ fn rebuild_linked(
     key: ArtifactKey,
     deploy_root: String,
 ) -> Result<()> {
-    let record = RegistryRecord {
+    let record = ArtifactRecord {
         version: 1,
         key,
         source: underlying_source.to_owned(),
@@ -368,7 +413,7 @@ fn rebuild_linked(
         deploy_root: Some(deploy_root),
         layout_separator: layout.persisted_separator(),
     };
-    registry.put(&record)?;
+    registry.put_artifact(&record)?;
     Ok(())
 }
 

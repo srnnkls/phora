@@ -5,11 +5,10 @@ use std::path::Path;
 use std::process::Command;
 use std::str::FromStr as _;
 
-use phora::config::Refspec;
-use phora::kernel::SourceName;
+use phora::source::SourceName;
 use phora::source::{
-    GitBackend, HttpBackend, ResolvedSource, SnapshotId, SourceBackend as _, SourceEntryKind,
-    SourcePath, SourceStore,
+    GitBackend, HttpBackend, ResolvePolicy, ResolveRequest, ResolvedSource, RevisionSpec,
+    SourceEntryKind, SourceLocation, SourcePath, SourceStore,
 };
 use tempfile::TempDir;
 
@@ -85,10 +84,17 @@ fn build_git_fixture() -> GitFixture {
     let git_dir = TempDir::new().expect("git dir tempdir");
     let backend = GitBackend::new(git_dir.path().to_path_buf());
     let url = p.to_string_lossy().into_owned();
-    backend.fetch(&sn("g"), &url).expect("fetch git fixture");
-    let commit = backend
-        .resolve(&sn("g"), &url, &Refspec::Branch("main".into()))
-        .expect("resolve main");
+    let resolved = SourceStore::resolve(
+        &backend,
+        &ResolveRequest {
+            name: sn("g"),
+            location: SourceLocation::Git { url: url.clone() },
+            revision: RevisionSpec::Branch("main".into()),
+        },
+        ResolvePolicy::Refresh,
+    )
+    .expect("refresh and resolve Git fixture");
+    let commit = resolved.snapshot.commit().to_string();
 
     GitFixture {
         _src: src,
@@ -137,49 +143,67 @@ fn build_tree_tar() -> Vec<u8> {
 struct UrlFixture {
     _git_dir: TempDir,
     backend: HttpBackend,
-    /// The synthetic mirror the url import materializes is read back through
-    /// a plain `GitBackend` over the same `git_dir` — url sources have no
-    /// store of their own (INV-6: one snapshot representation).
-    store: GitBackend,
     url: String,
-    commit: String,
 }
 
 fn build_url_fixture() -> UrlFixture {
     let url = serve_bytes_forever(build_tree_tar());
     let git_dir = TempDir::new().expect("git dir tempdir");
     let backend = HttpBackend::new(git_dir.path().to_path_buf(), BTreeMap::new());
-    backend.fetch(&sn("u"), &url).expect("import url fixture");
-    let commit = backend
-        .resolve(&sn("u"), &url, &Refspec::None)
-        .expect("resolve synthetic commit");
-    let store = GitBackend::new(git_dir.path().to_path_buf());
-
+    SourceStore::resolve(
+        &backend,
+        &ResolveRequest {
+            name: sn("u"),
+            location: SourceLocation::Url { url: url.clone() },
+            revision: RevisionSpec::None,
+        },
+        ResolvePolicy::Refresh,
+    )
+    .expect("import and resolve URL fixture");
     UrlFixture {
         _git_dir: git_dir,
         backend,
-        store,
         url,
-        commit,
     }
 }
 
-fn resolved(name: &str, url: &str, commit: &str) -> ResolvedSource {
-    ResolvedSource {
-        name: sn(name),
-        url: url.to_owned(),
-        snapshot: SnapshotId::Git {
-            commit: commit.to_owned(),
+fn resolved_git(fixture: &GitFixture) -> ResolvedSource {
+    SourceStore::resolve(
+        &fixture.backend,
+        &ResolveRequest {
+            name: sn("g"),
+            location: SourceLocation::Git {
+                url: fixture.url.clone(),
+            },
+            revision: RevisionSpec::Commit(
+                fixture.commit.parse().expect("fixture commit is valid hex"),
+            ),
         },
-    }
+        ResolvePolicy::CachedOnly,
+    )
+    .expect("typed Git resolution finds the cached fixture commit")
+}
+
+fn resolved_url(fixture: &UrlFixture) -> ResolvedSource {
+    SourceStore::resolve(
+        &fixture.backend,
+        &ResolveRequest {
+            name: sn("u"),
+            location: SourceLocation::Url {
+                url: fixture.url.clone(),
+            },
+            revision: RevisionSpec::None,
+        },
+        ResolvePolicy::CachedOnly,
+    )
+    .expect("typed URL resolution finds the cached synthetic commit")
 }
 
 fn inventory_pairs(
     store: &dyn SourceStore,
     source: &ResolvedSource,
 ) -> Vec<(String, SourceEntryKind)> {
-    store
-        .inventory(source)
+    SourceStore::inventory(store, &source.snapshot, None)
         .expect("snapshot inventory")
         .entries
         .iter()
@@ -209,7 +233,7 @@ fn all_leaves() -> Vec<SourcePath> {
 #[test]
 fn git_snapshot_store_serves_the_fixture_tree() {
     let fx = build_git_fixture();
-    let source = resolved("g", &fx.url, &fx.commit);
+    let source = resolved_git(&fx);
 
     assert_eq!(
         inventory_pairs(&fx.backend, &source),
@@ -218,9 +242,7 @@ fn git_snapshot_store_serves_the_fixture_tree() {
          the exec bit surviving as SourceEntryKind::Executable"
     );
     for (path, bytes, _) in TREE {
-        let entry = fx
-            .backend
-            .read(&source, &sp(path))
+        let entry = SourceStore::read(&fx.backend, &source.snapshot, &sp(path))
             .unwrap_or_else(|e| panic!("store read of `{path}`: {e}"));
         assert_eq!(
             entry.bytes, *bytes,
@@ -233,18 +255,16 @@ fn git_snapshot_store_serves_the_fixture_tree() {
 #[test]
 fn url_snapshot_store_serves_the_fixture_tree() {
     let fx = build_url_fixture();
-    let source = resolved("u", &fx.url, &fx.commit);
+    let source = resolved_url(&fx);
 
     assert_eq!(
-        inventory_pairs(&fx.store, &source),
+        inventory_pairs(&fx.backend, &source),
         expected_pairs(),
         "a url source's synthetic snapshot must inventory the identical tree a git source \
          would (INV-6), including the exec bit from the tar mode"
     );
     for (path, bytes, _) in TREE {
-        let entry = fx
-            .store
-            .read(&source, &sp(path))
+        let entry = SourceStore::read(&fx.backend, &source.snapshot, &sp(path))
             .unwrap_or_else(|e| panic!("store read of `{path}` from the synthetic mirror: {e}"));
         assert_eq!(
             entry.bytes, *bytes,
@@ -253,128 +273,26 @@ fn url_snapshot_store_serves_the_fixture_tree() {
     }
 }
 
-#[test]
-fn git_legacy_read_surfaces_match_the_snapshot_store() {
-    let fx = build_git_fixture();
-    let source = resolved("g", &fx.url, &fx.commit);
-
-    let legacy_leaves = fx
-        .backend
-        .list_source_leaves(&sn("g"), &fx.url, &fx.commit, None)
-        .expect("legacy leaf walk");
-    let store_paths: Vec<String> = fx
-        .backend
-        .inventory(&source)
-        .expect("snapshot inventory")
-        .entries
-        .iter()
-        .map(|entry| entry.path.as_str().to_owned())
-        .collect();
-    assert_eq!(
-        legacy_leaves, store_paths,
-        "legacy list_source_leaves and the SourceStore inventory must agree leaf-for-leaf: \
-         the compat SourceBackend delegates, it does not fork the walk"
-    );
-
-    for path in &legacy_leaves {
-        let legacy = fx
-            .backend
-            .read_file_at(&sn("g"), &fx.url, &fx.commit, Path::new(path))
-            .unwrap_or_else(|e| panic!("legacy read of `{path}`: {e}"));
-        let entry = fx
-            .backend
-            .read(&source, &sp(path))
-            .unwrap_or_else(|e| panic!("store read of `{path}`: {e}"));
-        assert_eq!(
-            legacy, entry.bytes,
-            "legacy read_file_at and SourceStore::read must return identical bytes for `{path}`"
-        );
-    }
-
-    let legacy_digest = fx
-        .backend
-        .compute_digest(&sn("g"), &fx.url, &fx.commit, None, &[], &[])
-        .expect("legacy full-tree digest");
-    let snapshot_digest = fx
-        .backend
-        .digest_snapshot(&source, &all_leaves())
-        .expect("digest_snapshot over the full leaf set");
-    assert_eq!(
-        legacy_digest, snapshot_digest,
-        "digest_snapshot over the complete leaf set must equal the legacy unselected \
-         compute_digest — lock digests may not drift when callers migrate (INV-4/INV-6)"
-    );
-}
-
-#[test]
-fn url_legacy_read_surfaces_match_the_snapshot_store() {
-    let fx = build_url_fixture();
-    let source = resolved("u", &fx.url, &fx.commit);
-
-    let legacy_leaves = fx
-        .backend
-        .list_source_leaves(&sn("u"), &fx.url, &fx.commit, None)
-        .expect("legacy leaf walk over the synthetic mirror");
-    let store_paths: Vec<String> = fx
-        .store
-        .inventory(&source)
-        .expect("snapshot inventory")
-        .entries
-        .iter()
-        .map(|entry| entry.path.as_str().to_owned())
-        .collect();
-    assert_eq!(
-        legacy_leaves, store_paths,
-        "for a url source the legacy leaf walk and the SourceStore inventory must agree"
-    );
-
-    for path in &legacy_leaves {
-        let legacy = fx
-            .store
-            .read_file_at(&sn("u"), &fx.url, &fx.commit, Path::new(path))
-            .unwrap_or_else(|e| panic!("legacy mirror read of `{path}`: {e}"));
-        let entry = fx
-            .store
-            .read(&source, &sp(path))
-            .unwrap_or_else(|e| panic!("store read of `{path}`: {e}"));
-        assert_eq!(
-            legacy, entry.bytes,
-            "the legacy mirror read and SourceStore::read must agree on `{path}`"
-        );
-    }
-
-    let legacy_digest = fx
-        .backend
-        .compute_digest(&sn("u"), &fx.url, &fx.commit, None, &[], &[])
-        .expect("legacy url digest");
-    let snapshot_digest = fx
-        .store
-        .digest_snapshot(&source, &all_leaves())
-        .expect("digest_snapshot over the synthetic snapshot");
-    assert_eq!(
-        legacy_digest, snapshot_digest,
-        "url-source digests must be identical through the legacy and snapshot paths"
-    );
-}
-
 // ─── INV-6: identical trees are indistinguishable across git and url ────────
 
 #[test]
 fn identical_git_and_url_trees_yield_equivalent_inventories_reads_and_digests() {
     let g = build_git_fixture();
     let u = build_url_fixture();
-    let gs = resolved("g", &g.url, &g.commit);
-    let us = resolved("u", &u.url, &u.commit);
+    let gs = resolved_git(&g);
+    let us = resolved_url(&u);
 
     assert_eq!(
         inventory_pairs(&g.backend, &gs),
-        inventory_pairs(&u.store, &us),
+        inventory_pairs(&u.backend, &us),
         "identical trees must produce identical inventories whether the source is git or url \
          (INV-6)"
     );
     for (path, _, _) in TREE {
-        let from_git = g.backend.read(&gs, &sp(path)).expect("git store read");
-        let from_url = u.store.read(&us, &sp(path)).expect("url store read");
+        let from_git =
+            SourceStore::read(&g.backend, &gs.snapshot, &sp(path)).expect("git store read");
+        let from_url =
+            SourceStore::read(&u.backend, &us.snapshot, &sp(path)).expect("url store read");
         assert_eq!(
             from_git.bytes, from_url.bytes,
             "identical trees must serve identical bytes for `{path}`"
@@ -385,69 +303,29 @@ fn identical_git_and_url_trees_yield_equivalent_inventories_reads_and_digests() 
         );
     }
 
-    let git_digest = g
-        .backend
-        .compute_digest(&sn("g"), &g.url, &g.commit, None, &[], &[])
-        .expect("git digest");
-    let url_digest = u
-        .backend
-        .compute_digest(&sn("u"), &u.url, &u.commit, None, &[], &[])
-        .expect("url digest");
+    let git_digest = phora::source::digest_snapshot(&g.backend, &gs.snapshot, &all_leaves())
+        .expect("Git final-capability digest");
+    let url_digest = phora::source::digest_snapshot(&u.backend, &us.snapshot, &all_leaves())
+        .expect("URL final-capability digest");
     assert_eq!(
         git_digest, url_digest,
         "the digest is a pure function of the selected tree bytes: identical trees must \
          digest identically across git and url sources (INV-6)"
-    );
-    let git_snapshot = g
-        .backend
-        .digest_snapshot(&gs, &all_leaves())
-        .expect("git digest_snapshot");
-    let url_snapshot = u
-        .store
-        .digest_snapshot(&us, &all_leaves())
-        .expect("url digest_snapshot");
-    assert_eq!(
-        git_snapshot, git_digest,
-        "git digest_snapshot equals the legacy digest"
-    );
-    assert_eq!(
-        url_snapshot, git_digest,
-        "url digest_snapshot equals the legacy digest"
     );
 }
 
 // ─── digest_snapshot: explicit leaves, never a selection ────────────────────
 
 #[test]
-fn digest_snapshot_matches_legacy_digest_for_an_explicit_subset() {
+fn digest_snapshot_honors_an_explicit_subset() {
     let fx = build_git_fixture();
-    let source = resolved("g", &fx.url, &fx.commit);
+    let source = resolved_git(&fx);
 
-    let legacy_subset = fx
-        .backend
-        .compute_digest(
-            &sn("g"),
-            &fx.url,
-            &fx.commit,
-            None,
-            &["README.md".to_owned()],
-            &[],
-        )
-        .expect("legacy digest with an include selecting one leaf");
-    let snapshot_subset = fx
-        .backend
-        .digest_snapshot(&source, &[sp("README.md")])
-        .expect("digest_snapshot over one explicit leaf");
-    assert_eq!(
-        legacy_subset, snapshot_subset,
-        "for the same effective leaf set, the explicit-leaves digest must equal the \
-         selection-derived legacy digest: the leaf PLAN moves to the caller, the digest \
-         bytes stay put (INV-2)"
-    );
+    let snapshot_subset =
+        phora::source::digest_snapshot(&fx.backend, &source.snapshot, &[sp("README.md")])
+            .expect("digest_snapshot over one explicit leaf");
 
-    let full = fx
-        .backend
-        .digest_snapshot(&source, &all_leaves())
+    let full = phora::source::digest_snapshot(&fx.backend, &source.snapshot, &all_leaves())
         .expect("full-set digest_snapshot");
     assert_ne!(
         snapshot_subset, full,
@@ -459,63 +337,40 @@ fn digest_snapshot_matches_legacy_digest_for_an_explicit_subset() {
 #[test]
 fn digest_snapshot_is_order_insensitive_through_dyn_source_store() {
     let fx = build_git_fixture();
-    let source = resolved("g", &fx.url, &fx.commit);
+    let source = resolved_git(&fx);
     let store: &dyn SourceStore = &fx.backend;
 
     let sorted = all_leaves();
     let reversed: Vec<SourcePath> = sorted.iter().rev().cloned().collect();
     assert_eq!(
-        store
-            .digest_snapshot(&source, &sorted)
+        phora::source::digest_snapshot(store, &source.snapshot, &sorted)
             .expect("sorted-order digest"),
-        store
-            .digest_snapshot(&source, &reversed)
+        phora::source::digest_snapshot(store, &source.snapshot, &reversed)
             .expect("reversed-order digest"),
         "caller-side leaf order must not leak into the digest (parity with the legacy \
-         sorted walk), and digest_snapshot must stay callable through &dyn SourceStore"
+         sorted walk), and the free digest_snapshot operation must accept &dyn SourceStore"
     );
 }
 
 #[test]
 fn digest_snapshot_of_an_empty_leaf_set_is_the_defined_empty_digest() {
     let fx = build_git_fixture();
-    let source = resolved("g", &fx.url, &fx.commit);
+    let source = resolved_git(&fx);
 
-    let legacy_empty = fx
-        .backend
-        .compute_digest(
-            &sn("g"),
-            &fx.url,
-            &fx.commit,
-            None,
-            &["matches-nothing-zzz".to_owned()],
-            &[],
-        )
-        .expect("legacy digest with a selection matching no leaf is defined, not an error");
+    let empty = phora::source::digest_snapshot(&fx.backend, &source.snapshot, &[])
+        .expect("an empty leaf set digests zero frames");
     assert_eq!(
-        legacy_empty, "blake3:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
-        "guard: the legacy empty selection hashes zero frames — the blake3 of the empty stream"
-    );
-
-    let empty = fx
-        .backend
-        .digest_snapshot(&source, &[])
-        .expect("an empty leaf set digests zero frames, mirroring the legacy empty selection");
-    assert_eq!(
-        empty, legacy_empty,
-        "digest_snapshot over zero leaves must equal the legacy zero-selection digest — an \
-         empty plan is a defined state, not an error"
+        empty, "blake3:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+        "digest_snapshot over zero leaves is the pinned BLAKE3 empty-stream digest"
     );
 }
 
 #[test]
 fn digest_snapshot_rejects_a_directory_leaf_instead_of_expanding_it() {
     let fx = build_git_fixture();
-    let source = resolved("g", &fx.url, &fx.commit);
+    let source = resolved_git(&fx);
 
-    let err = fx
-        .backend
-        .digest_snapshot(&source, &[sp("subdir")])
+    let err = phora::source::digest_snapshot(&fx.backend, &source.snapshot, &[sp("subdir")])
         .expect_err(
             "a leaf naming a tree must err: explicit leaves address blobs, they never \
              glob-expand a directory the way the legacy include selection does (INV-2)",
@@ -529,11 +384,9 @@ fn digest_snapshot_rejects_a_directory_leaf_instead_of_expanding_it() {
 #[test]
 fn digest_snapshot_names_an_absent_leaf_in_its_error() {
     let fx = build_git_fixture();
-    let source = resolved("g", &fx.url, &fx.commit);
+    let source = resolved_git(&fx);
 
-    let err = fx
-        .backend
-        .digest_snapshot(&source, &[sp("missing.txt")])
+    let err = phora::source::digest_snapshot(&fx.backend, &source.snapshot, &[sp("missing.txt")])
         .expect_err("a leaf absent from the snapshot must err, not digest a partial set");
     assert!(
         err.to_string().contains("missing.txt"),

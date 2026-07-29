@@ -455,18 +455,6 @@ const IMPL_HOMES: &[(&str, &str)] = &[
     ("SourceInventory", "source/model.rs"),
 ];
 
-const SOURCE_BACKEND_METHODS: &[&str] = &[
-    "commit_time",
-    "compute_digest",
-    "export_artifact",
-    "fetch",
-    "list_source_leaves",
-    "list_tree_at",
-    "mirror_ready",
-    "read_file_at",
-    "resolve",
-];
-
 const ORIGIN_UNIT_TEST_FLOOR: usize = 125;
 
 #[test]
@@ -512,21 +500,16 @@ fn monolithic_source_rs_is_gone() {
 }
 
 #[test]
-fn top_level_origin_files_are_rewired_away_or_thin_reexport_shims() {
+fn top_level_origin_files_and_compatibility_shims_are_gone() {
     let lib = read_rel("lib.rs");
     for name in ["archive", "backend", "http"] {
         let rel = format!("{name}.rs");
         let declared = declares_file_module(&lib, name);
         let exists = src_dir().join(&rel).is_file();
-        let rewired = !declared && !exists;
-        let shimmed = declared && exists && is_thin_source_reexport_shim(&read_rel(&rel));
         assert!(
-            rewired || shimmed,
-            "src/{rel} must end T011 in one of two states: REWIRED (no `mod {name};` in lib.rs \
-             and the file deleted — its code lives under src/source/) or SHIM (still declared, \
-             but the file reduced to `pub use crate::source::…` re-exports with no fn/struct/\
-             enum/trait/impl definitions; T030 removes the shim). Currently declared={declared}, \
-             file-exists={exists}, thin-shim={shimmed}"
+            !declared && !exists,
+            "T030 must remove the top-level `{name}` compatibility module and src/{rel}; \
+             currently declared={declared}, file-exists={exists}"
         );
     }
 }
@@ -589,10 +572,10 @@ fn router_destination_holds_the_router_backend() {
     assert!(
         impl_blocks(&scan(&read_rel("source/router.rs")))
             .iter()
-            .any(|(header, _)| references_token(header, "SourceBackend")
+            .any(|(header, _)| references_token(header, "SourceStore")
                 && references_token(header, "RouterBackend")),
-        "src/source/router.rs must carry the `impl SourceBackend for RouterBackend<…>` block \
-         alongside the type it moves with"
+        "src/source/router.rs must carry the final `impl SourceStore for RouterBackend<…>` \
+         alongside the router type"
     );
 }
 
@@ -608,10 +591,10 @@ fn git_destination_holds_the_git_adapter() {
     assert!(
         impl_blocks(&scan(&read_rel("source/git.rs")))
             .iter()
-            .any(|(header, _)| references_token(header, "SourceBackend")
+            .any(|(header, _)| references_token(header, "SourceStore")
                 && references_token(header, "GitBackend")),
-        "src/source/git.rs must carry the `impl SourceBackend for GitBackend` block alongside \
-         the type it moves with"
+        "src/source/git.rs must carry the final `impl SourceStore for GitBackend` block \
+         alongside the Git adapter"
     );
 }
 
@@ -644,10 +627,10 @@ fn import_destination_holds_the_synthetic_import_cluster() {
     assert!(
         impl_blocks(&scanned)
             .iter()
-            .any(|(header, _)| references_token(header, "SourceBackend")
+            .any(|(header, _)| references_token(header, "SourceStore")
                 && references_token(header, "HttpBackend")),
-        "src/source/import.rs must carry the `impl SourceBackend for HttpBackend` block \
-         alongside the type it moves with"
+        "src/source/import.rs must carry the final `impl SourceStore for HttpBackend` block \
+         alongside the HTTP adapter"
     );
     assert!(
         has_impl_referencing(&scanned, "TempDownload"),
@@ -744,37 +727,47 @@ fn adapter_impl_blocks_live_only_in_their_destination_files() {
 }
 
 #[test]
-fn source_backend_trait_surface_is_unchanged() {
+fn source_store_is_the_only_live_source_capability() {
     let files = prod_src_files();
-    let holders: Vec<&(String, String)> = files
+    let source_backend_sites: Vec<&str> = files
         .iter()
-        .filter(|(_, content)| keyword_names(&scan(content), "pub trait", "SourceBackend"))
+        .filter(|(_, content)| references_token(&scan(content), "SourceBackend"))
+        .map(|(rel, _)| rel.as_str())
         .collect();
-    let names: Vec<&str> = holders.iter().map(|(rel, _)| rel.as_str()).collect();
+    assert!(
+        source_backend_sites.is_empty(),
+        "T030 must remove every live production SourceBackend trait/import/bound/impl/call; \
+         found in: {source_backend_sites:?}"
+    );
+
+    let source_store_sites: Vec<&str> = files
+        .iter()
+        .filter(|(_, content)| keyword_names(&scan(content), "pub trait", "SourceStore"))
+        .map(|(rel, _)| rel.as_str())
+        .collect();
     assert_eq!(
-        names.len(),
-        1,
-        "exactly one production file must define `pub trait SourceBackend`; found: {names:?}"
+        source_store_sites,
+        ["source/snapshot.rs"],
+        "SourceStore must remain the one live source capability, defined in \
+         src/source/snapshot.rs"
     );
-    let (rel, content) = holders[0];
+
+    let source_root = scan(&read_rel("source/mod.rs"));
+    let worktree_resolver = scan(&read_rel("source/resolve.rs"));
+    let mut alternate_resolution_paths = Vec::new();
+    if source_root.split(';').any(|statement| {
+        statement.contains("pub use") && references_token(statement, "resolve_worktree")
+    }) {
+        alternate_resolution_paths.push("src/source/mod.rs publicly re-exports resolve_worktree");
+    }
+    if keyword_names(&worktree_resolver, "pub fn", "resolve_worktree") {
+        alternate_resolution_paths.push("src/source/resolve.rs defines pub fn resolve_worktree");
+    }
     assert!(
-        rel == "source.rs" || rel.starts_with("source/"),
-        "the SourceBackend port must stay inside the source module tree; found in src/{rel}"
-    );
-    let got = trait_method_names(&scan(content), "SourceBackend")
-        .unwrap_or_else(|| panic!("src/{rel}: SourceBackend trait body could not be extracted"));
-    let nine: BTreeSet<String> = SOURCE_BACKEND_METHODS
-        .iter()
-        .map(|name| (*name).to_owned())
-        .collect();
-    let mut eight = nine.clone();
-    eight.remove("export_artifact");
-    assert!(
-        got == nine || got == eight,
-        "the SourceBackend method-name set (src/{rel}) must be exactly the T011 nine, or the \
-         nine minus `export_artifact` once T016 deletes the staging port — no other method may \
-         be added, dropped, or renamed (the migration-table truthfulness gate in \
-         source_compat_gate.rs governs which state is current); got: {got:?}"
+        alternate_resolution_paths.is_empty(),
+        "SourceStore::resolve must be the sole public direct source-resolution capability; \
+         resolve_worktree may remain only as a non-public backend helper: \
+         {alternate_resolution_paths:?}"
     );
 }
 
@@ -830,12 +823,15 @@ fn source_port_surface_keeps_resolving_with_only_required_methods_implemented() 
     use std::collections::BTreeMap;
 
     use phora::source::{
-        ExportPolicy, GitBackend, HttpBackend, MirrorKey, NormalizedUrl, Protocol, RouterBackend,
-        TreeEntry,
+        GitBackend, HttpBackend, MirrorKey, NormalizedUrl, ResolvedSource, RouterBackend,
+        SnapshotId, SourceEntry, SourceStore,
     };
 
     fn pin_surface(
-        _leaf: Option<(TreeEntry, Protocol)>,
+        _store: Option<&dyn SourceStore>,
+        _resolved: Option<ResolvedSource>,
+        _snapshot: Option<SnapshotId>,
+        _entry: Option<SourceEntry>,
         _router: Option<RouterBackend<GitBackend, HttpBackend>>,
     ) {
     }
@@ -862,11 +858,7 @@ fn source_port_surface_keeps_resolving_with_only_required_methods_implemented() 
         "source::read_local_head must keep resolving and yielding the `link` sentinel for a \
          non-repo directory"
     );
-    assert!(
-        ExportPolicy::default().preserve_executable,
-        "source::ExportPolicy must keep resolving with its executable-preserving default"
-    );
-    pin_surface(None, None);
+    pin_surface(None, None, None, None, None);
 }
 
 #[test]

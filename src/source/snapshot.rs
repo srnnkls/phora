@@ -1,6 +1,6 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use super::SourceName;
+use super::{Commit, MirrorKey, NormalizedUrl, SourceError, SourceName};
 
 use super::model::{SourceEntryKind, SourceEntryMeta, SourceInventory, SourcePath};
 use super::{Result, hash_framed_entry};
@@ -16,23 +16,118 @@ pub(super) fn frame_tag(kind: SourceEntryKind) -> &'static [u8] {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SnapshotId {
     Git {
-        commit: String,
+        mirror: MirrorKey,
+        commit: Commit,
     },
-    /// Link-mode artifacts are the exception to snapshot immutability: they
-    /// deploy as symlinks that track the live worktree, while this snapshot
-    /// freezes the inventory and copy-mode reads against the captured tree.
     Worktree {
-        root: PathBuf,
-        head: String,
-        capture_digest: String,
+        root: CanonicalSourceRoot,
+        head: Option<Commit>,
+        mirror: MirrorKey,
+        capture_digest: Commit,
     },
+}
+
+impl SnapshotId {
+    #[must_use]
+    pub fn mirror(&self) -> &MirrorKey {
+        match self {
+            Self::Git { mirror, .. } | Self::Worktree { mirror, .. } => mirror,
+        }
+    }
+
+    #[must_use]
+    pub fn commit(&self) -> &Commit {
+        match self {
+            Self::Git { commit, .. } => commit,
+            Self::Worktree { capture_digest, .. } => capture_digest,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalSourceRoot(PathBuf);
+
+impl CanonicalSourceRoot {
+    /// # Errors
+    /// Returns an I/O error when the source root cannot be canonicalized.
+    pub fn new(root: &Path) -> Result<Self> {
+        Ok(Self(root.canonicalize()?))
+    }
+
+    pub(super) fn from_canonical(root: PathBuf) -> Self {
+        Self(root)
+    }
+
+    #[must_use]
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceLocation {
+    Git { url: String },
+    Url { url: String },
+    Worktree { root: PathBuf },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevisionSpec {
+    Branch(String),
+    Tag(String),
+    Commit(Commit),
+    Default,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvePolicy {
+    Refresh,
+    CachedOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveRequest {
+    pub name: SourceName,
+    pub location: SourceLocation,
+    pub revision: RevisionSpec,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedRevision {
+    Commit(Commit),
+    WorktreeHead(Option<Commit>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceIdentity {
+    Git(NormalizedUrl),
+    Url(NormalizedUrl),
+    Worktree(CanonicalSourceRoot),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceTimestamp(u64);
+
+impl SourceTimestamp {
+    #[must_use]
+    pub fn from_unix_seconds(seconds: u64) -> Self {
+        Self(seconds)
+    }
+
+    #[must_use]
+    pub fn unix_seconds(self) -> u64 {
+        self.0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedSource {
     pub name: SourceName,
-    pub url: String,
     pub snapshot: SnapshotId,
+    pub revision: ResolvedRevision,
+    pub authored_at: SourceTimestamp,
+    pub normalized_location: SourceIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,26 +136,64 @@ pub struct SourceEntry {
     pub bytes: Vec<u8>,
 }
 
-pub trait SourceStore {
-    fn inventory(&self, source: &ResolvedSource) -> Result<SourceInventory>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceDirectoryEntryKind {
+    File,
+    Executable,
+    Symlink,
+    Directory,
+}
 
-    fn read(&self, source: &ResolvedSource, path: &SourcePath) -> Result<SourceEntry>;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceDirectoryEntry {
+    pub path: SourcePath,
+    pub kind: SourceDirectoryEntryKind,
+}
 
-    fn digest_snapshot(&self, source: &ResolvedSource, leaves: &[SourcePath]) -> Result<String> {
-        let mut sorted: Vec<&SourcePath> = leaves.iter().collect();
-        sorted.sort_unstable();
-        sorted.dedup();
+pub trait SourceStore: Send + Sync {
+    fn resolve(&self, request: &ResolveRequest, policy: ResolvePolicy) -> Result<ResolvedSource>;
 
-        let mut hasher = blake3::Hasher::new();
-        for path in sorted {
-            let entry = self.read(source, path)?;
-            hash_framed_entry(
-                &mut hasher,
-                path.as_str().as_bytes(),
-                frame_tag(entry.meta.kind),
-                &entry.bytes,
-            );
-        }
-        Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+    fn inventory(
+        &self,
+        snapshot: &SnapshotId,
+        root: Option<&SourcePath>,
+    ) -> Result<SourceInventory>;
+
+    fn read(&self, snapshot: &SnapshotId, path: &SourcePath) -> Result<SourceEntry>;
+
+    fn list_directory(
+        &self,
+        snapshot: &SnapshotId,
+        path: Option<&SourcePath>,
+    ) -> Result<Vec<SourceDirectoryEntry>>;
+}
+
+/// # Errors
+/// Returns the first source-read error, including directory and missing-leaf errors.
+pub fn digest_snapshot(
+    store: &dyn SourceStore,
+    snapshot: &SnapshotId,
+    leaves: &[SourcePath],
+) -> Result<String> {
+    let mut sorted: Vec<&SourcePath> = leaves.iter().collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+
+    let mut hasher = blake3::Hasher::new();
+    for path in sorted {
+        let entry = store.read(snapshot, path)?;
+        hash_framed_entry(
+            &mut hasher,
+            path.as_str().as_bytes(),
+            frame_tag(entry.meta.kind),
+            &entry.bytes,
+        );
     }
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+}
+
+pub(super) fn commit_from_hex(value: &str) -> Result<Commit> {
+    value
+        .parse()
+        .map_err(|error| SourceError::Source(format!("{error}")))
 }

@@ -570,72 +570,87 @@ pub(crate) use transitive::{
 
 #[cfg(test)]
 mod t029_callable_boundary_probe {
-    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{SourceBackend, SourceName};
-    use crate::config::{ParsedSource, Refspec, Source};
+    use super::{
+        Commit, MirrorKey, NormalizedUrl, ResolvePolicy, ResolveRequest, ResolvedRevision,
+        ResolvedSource, RevisionSpec, SnapshotId, SourceDirectoryEntry, SourceEntry,
+        SourceEntryKind, SourceEntryMeta, SourceError, SourceIdentity, SourceInventory,
+        SourceLocation, SourceName, SourcePath, SourceStore, SourceTimestamp,
+    };
+    use crate::config::{ParsedSource, Source};
 
-    struct ManifestBackend {
-        fetches: AtomicUsize,
+    struct ManifestStore {
         resolves: AtomicUsize,
         reads: AtomicUsize,
     }
 
-    impl SourceBackend for ManifestBackend {
-        fn fetch(&self, source: &SourceName, url: &str) -> super::Result<()> {
-            assert_eq!(source.as_str(), "dep");
-            assert_eq!(url, "https://example.test/dep.git");
-            self.fetches.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-
-        fn read_file_at(
-            &self,
-            source: &SourceName,
-            url: &str,
-            commit: &str,
-            path: &Path,
-        ) -> super::Result<Vec<u8>> {
-            assert_eq!(source.as_str(), "dep");
-            assert_eq!(url, "https://example.test/dep.git");
-            assert_eq!(commit, "a".repeat(40));
-            assert_eq!(path, Path::new("phora.toml"));
-            self.reads.fetch_add(1, Ordering::SeqCst);
-            Ok(b"version = 1\n\n[sources.leaf]\ngit = \"https://example.test/leaf.git\"\n".to_vec())
-        }
-
+    impl SourceStore for ManifestStore {
         fn resolve(
             &self,
-            source: &SourceName,
-            url: &str,
-            _refspec: &Refspec,
-        ) -> super::Result<String> {
-            assert_eq!(source.as_str(), "dep");
-            assert_eq!(url, "https://example.test/dep.git");
+            request: &ResolveRequest,
+            policy: ResolvePolicy,
+        ) -> super::Result<ResolvedSource> {
+            assert_eq!(request.name.as_str(), "dep");
+            assert_eq!(
+                request.location,
+                SourceLocation::Git {
+                    url: "https://example.test/dep.git".to_owned(),
+                }
+            );
+            assert!(matches!(request.revision, RevisionSpec::Default));
+            assert_eq!(policy, ResolvePolicy::Refresh);
             self.resolves.fetch_add(1, Ordering::SeqCst);
-            Ok("a".repeat(40))
+            let commit: Commit = "a".repeat(40).parse().expect("fixture commit is valid");
+            let normalized = NormalizedUrl::parse("https://example.test/dep.git");
+            Ok(ResolvedSource {
+                name: request.name.clone(),
+                snapshot: SnapshotId::Git {
+                    mirror: MirrorKey::from_url(&normalized),
+                    commit: commit.clone(),
+                },
+                revision: ResolvedRevision::Commit(commit),
+                authored_at: SourceTimestamp::from_unix_seconds(0),
+                normalized_location: SourceIdentity::Git(normalized),
+            })
         }
 
-        fn commit_time(
+        fn inventory(
             &self,
-            _source: &SourceName,
-            _url: &str,
-            _commit: &str,
-        ) -> super::Result<u64> {
-            Ok(0)
+            _snapshot: &SnapshotId,
+            _root: Option<&SourcePath>,
+        ) -> super::Result<SourceInventory> {
+            Err(SourceError::Source(
+                "manifest acquisition unexpectedly requested an inventory".to_owned(),
+            ))
         }
 
-        fn compute_digest(
+        fn read(
             &self,
-            _source: &SourceName,
-            _url: &str,
-            _commit: &str,
-            _root: Option<&Path>,
-            _include: &[String],
-            _exclude: &[String],
-        ) -> super::Result<String> {
-            Ok("blake3:probe".to_owned())
+            snapshot: &SnapshotId,
+            path: &SourcePath,
+        ) -> super::Result<SourceEntry> {
+            assert_eq!(snapshot.commit().to_string(), "a".repeat(40));
+            assert_eq!(path.as_str(), "phora.toml");
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(SourceEntry {
+                meta: SourceEntryMeta {
+                    path: path.clone(),
+                    kind: SourceEntryKind::File,
+                },
+                bytes: b"version = 1\n\n[sources.leaf]\ngit = \"https://example.test/leaf.git\"\n"
+                    .to_vec(),
+            })
+        }
+
+        fn list_directory(
+            &self,
+            _snapshot: &SnapshotId,
+            _path: Option<&SourcePath>,
+        ) -> super::Result<Vec<SourceDirectoryEntry>> {
+            Err(SourceError::Source(
+                "manifest acquisition unexpectedly listed a directory".to_owned(),
+            ))
         }
     }
 
@@ -648,8 +663,7 @@ mod t029_callable_boundary_probe {
         super::T029_ACQUIRE_ARGS.lock().expect("acquire args").clear();
         super::T029_VALIDATE_ARGS.lock().expect("validate args").clear();
 
-        let backend = ManifestBackend {
-            fetches: AtomicUsize::new(0),
+        let store = ManifestStore {
             resolves: AtomicUsize::new(0),
             reads: AtomicUsize::new(0),
         };
@@ -660,7 +674,7 @@ mod t029_callable_boundary_probe {
         let parsed = ParsedSource::parse("dep", &raw).expect("source parses");
         let name = SourceName::trusted("dep".to_owned());
         let (commit, manifest) = super::transitive::acquire_dependency_manifest(
-            &backend,
+            &store,
             &name,
             &parsed,
             "https://example.test/dep.git",
@@ -669,9 +683,8 @@ mod t029_callable_boundary_probe {
         .expect("the source boundary acquires and decodes the dependency manifest");
         assert_eq!(commit, "a".repeat(40));
         assert!(manifest.sources.contains_key("leaf"));
-        assert_eq!(backend.fetches.load(Ordering::SeqCst), 1);
-        assert_eq!(backend.resolves.load(Ordering::SeqCst), 1);
-        assert_eq!(backend.reads.load(Ordering::SeqCst), 1);
+        assert_eq!(store.resolves.load(Ordering::SeqCst), 1);
+        assert_eq!(store.reads.load(Ordering::SeqCst), 1);
         assert_eq!(super::T029_ACQUIRE_CALLS.load(Ordering::SeqCst), 1);
         assert_eq!(
             *super::T029_ACQUIRE_ARGS.lock().expect("acquire args"),
@@ -699,75 +712,63 @@ const SYNC_DELEGATION_PROBE: &str = r#"
 
 #[cfg(test)]
 mod t029_source_delegation_probe {
-    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::config::Refspec;
-    use crate::kernel::SourceName;
     use crate::source::{
-        SourceBackend, SourceError, T029_ACQUIRE_ARGS, T029_ACQUIRE_CALLS, T029_ACQUIRE_OVERRIDE,
-        T029_VALIDATE_ARGS, T029_VALIDATE_CALLS, T029_VALIDATE_OVERRIDE,
+        ResolvePolicy, ResolveRequest, ResolvedSource, SnapshotId, SourceDirectoryEntry,
+        SourceEntry, SourceError, SourceInventory, SourceName, SourcePath, SourceStore,
+        T029_ACQUIRE_ARGS, T029_ACQUIRE_CALLS, T029_ACQUIRE_OVERRIDE, T029_VALIDATE_ARGS,
+        T029_VALIDATE_CALLS, T029_VALIDATE_OVERRIDE,
     };
 
-    struct NoManifestReadBackend {
-        fetches: AtomicUsize,
+    struct NoManifestReadStore {
         resolves: AtomicUsize,
         reads: AtomicUsize,
     }
 
-    impl SourceBackend for NoManifestReadBackend {
-        fn fetch(
+    impl SourceStore for NoManifestReadStore {
+        fn resolve(
             &self,
-            _source: &SourceName,
-            _url: &str,
-        ) -> std::result::Result<(), SourceError> {
-            self.fetches.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            request: &ResolveRequest,
+            _policy: ResolvePolicy,
+        ) -> std::result::Result<ResolvedSource, SourceError> {
+            let _: &SourceName = &request.name;
+            self.resolves.fetch_add(1, Ordering::SeqCst);
+            Err(SourceError::Source(
+                "sync duplicated the source-owned resolve".to_owned(),
+            ))
         }
 
-        fn read_file_at(
+        fn inventory(
             &self,
-            _source: &SourceName,
-            _url: &str,
-            _commit: &str,
-            _path: &Path,
-        ) -> std::result::Result<Vec<u8>, SourceError> {
+            _snapshot: &SnapshotId,
+            _root: Option<&SourcePath>,
+        ) -> std::result::Result<SourceInventory, SourceError> {
+            Err(SourceError::Source(
+                "sync unexpectedly requested a source inventory".to_owned(),
+            ))
+        }
+
+        fn read(
+            &self,
+            _snapshot: &SnapshotId,
+            _path: &SourcePath,
+        ) -> std::result::Result<SourceEntry, SourceError> {
             self.reads.fetch_add(1, Ordering::SeqCst);
             Err(SourceError::Source(
                 "sync duplicated the source-owned manifest read".to_owned(),
             ))
         }
 
-        fn resolve(
+        fn list_directory(
             &self,
-            _source: &SourceName,
-            _url: &str,
-            _refspec: &Refspec,
-        ) -> std::result::Result<String, SourceError> {
-            self.resolves.fetch_add(1, Ordering::SeqCst);
-            Ok("b".repeat(40))
-        }
-
-        fn commit_time(
-            &self,
-            _source: &SourceName,
-            _url: &str,
-            _commit: &str,
-        ) -> std::result::Result<u64, SourceError> {
-            Ok(0)
-        }
-
-        fn compute_digest(
-            &self,
-            _source: &SourceName,
-            _url: &str,
-            _commit: &str,
-            _root: Option<&Path>,
-            _include: &[String],
-            _exclude: &[String],
-        ) -> std::result::Result<String, SourceError> {
-            Ok("blake3:probe".to_owned())
+            _snapshot: &SnapshotId,
+            _path: Option<&SourcePath>,
+        ) -> std::result::Result<Vec<SourceDirectoryEntry>, SourceError> {
+            Err(SourceError::Source(
+                "sync unexpectedly listed a source directory".to_owned(),
+            ))
         }
     }
 
@@ -783,8 +784,7 @@ mod t029_source_delegation_probe {
 
     #[test]
     fn t029_boundary_sync_delegates_without_duplicate_source_logic() {
-        let backend = NoManifestReadBackend {
-            fetches: AtomicUsize::new(0),
+        let store = NoManifestReadStore {
             resolves: AtomicUsize::new(0),
             reads: AtomicUsize::new(0),
         };
@@ -796,7 +796,7 @@ mod t029_source_delegation_probe {
         T029_VALIDATE_OVERRIDE.store(false, Ordering::SeqCst);
 
         let (config, parsed) = consumer("git = \"https://example.test/dep.git\"");
-        let graph = resolve_transitive_graph(&config, &parsed, &backend, false, None)
+        let graph = resolve_transitive_graph(&config, &parsed, &store, false, None)
             .expect("sync must consume the manifest supplied by the source boundary");
         assert_eq!(graph.targets.len(), 1, "the injected boundary manifest must drive composition");
         assert!(
@@ -814,9 +814,8 @@ mod t029_source_delegation_probe {
             *T029_VALIDATE_ARGS.lock().expect("validate args"),
             [("dep".to_owned(), "https://example.test/dep.git".to_owned(), 1, true)]
         );
-        assert_eq!(backend.fetches.load(Ordering::SeqCst), 0, "sync must not duplicate the source-owned fetch");
-        assert_eq!(backend.resolves.load(Ordering::SeqCst), 0, "sync must not duplicate the source-owned resolve");
-        assert_eq!(backend.reads.load(Ordering::SeqCst), 0, "sync must not duplicate the manifest read");
+        assert_eq!(store.resolves.load(Ordering::SeqCst), 0, "sync must not duplicate the source-owned resolve");
+        assert_eq!(store.reads.load(Ordering::SeqCst), 0, "sync must not duplicate the manifest read");
 
         T029_ACQUIRE_CALLS.store(0, Ordering::SeqCst);
         T029_VALIDATE_CALLS.store(0, Ordering::SeqCst);
@@ -824,7 +823,7 @@ mod t029_source_delegation_probe {
         T029_VALIDATE_ARGS.lock().expect("validate args").clear();
         T029_VALIDATE_OVERRIDE.store(true, Ordering::SeqCst);
         let (config, parsed) = consumer("path = \"/etc\"");
-        let graph = resolve_transitive_graph(&config, &parsed, &backend, false, None)
+        let graph = resolve_transitive_graph(&config, &parsed, &store, false, None)
             .expect("the source boundary override must be authoritative; duplicate sync confinement would reject");
         assert!(graph.targets[0].target.path.ends_with("boundary"));
         assert_eq!(T029_ACQUIRE_CALLS.load(Ordering::SeqCst), 1);
@@ -837,9 +836,8 @@ mod t029_source_delegation_probe {
             *T029_VALIDATE_ARGS.lock().expect("validate args"),
             [("dep".to_owned(), "/etc".to_owned(), 1, true)]
         );
-        assert_eq!(backend.fetches.load(Ordering::SeqCst), 0);
-        assert_eq!(backend.resolves.load(Ordering::SeqCst), 0);
-        assert_eq!(backend.reads.load(Ordering::SeqCst), 0);
+        assert_eq!(store.resolves.load(Ordering::SeqCst), 0);
+        assert_eq!(store.reads.load(Ordering::SeqCst), 0);
 
         T029_ACQUIRE_OVERRIDE.store(false, Ordering::SeqCst);
         T029_VALIDATE_OVERRIDE.store(false, Ordering::SeqCst);
