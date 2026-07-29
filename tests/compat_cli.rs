@@ -25,9 +25,9 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use phora::cli::resolution_from_char;
-use phora::kernel::ProjectId;
-use phora::store::{FileRegistry, Registry};
 use phora::sync::Resolution;
+use phora::sync::state::ProjectId;
+use phora::sync::state::{FileStateStore, StateStore};
 use tempfile::TempDir;
 
 mod common;
@@ -736,10 +736,10 @@ fn sync_prune_orphan_removal_snapshot_is_byte_identical() {
             f.display()
         );
     }
-    let registry_before = FileRegistry::open(fx.state_root()).expect("open registry before");
+    let registry_before = FileStateStore::open(fx.state_root()).expect("open registry before");
     assert!(
         !registry_before
-            .list_target("home")
+            .target_artifacts("home")
             .expect("list_target before")
             .is_empty(),
         "precondition: the registry must hold the target's records before the prune"
@@ -766,10 +766,10 @@ fn sync_prune_orphan_removal_snapshot_is_byte_identical() {
             f.display()
         );
     }
-    let registry_after = FileRegistry::open(fx.state_root()).expect("open registry after");
+    let registry_after = FileStateStore::open(fx.state_root()).expect("open registry after");
     assert!(
         registry_after
-            .list_target("home")
+            .target_artifacts("home")
             .expect("list_target after")
             .is_empty(),
         "--prune must drop the orphan's registry records, so the pruned target holds none"
@@ -971,7 +971,7 @@ fn interactive_resolution_char_mapping_is_byte_identical() {
 #[test]
 fn lock_advisory_is_none_on_local_state_root() {
     let dir = TempDir::new().expect("state root tempdir");
-    let registry = FileRegistry::open(dir.path().to_path_buf()).expect("open registry");
+    let registry = FileStateStore::open(dir.path().to_path_buf()).expect("open registry");
     let doc = format!("lock_advisory = {:?}\n", registry.lock_advisory());
     assert_golden("lock_advisory_local.golden", &doc);
 }

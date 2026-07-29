@@ -3,7 +3,8 @@
 
 use std::str::FromStr;
 
-use phora::kernel::{ArtifactName, SourceName};
+use phora::projection::model::ArtifactName;
+use phora::source::SourceName;
 
 #[test]
 fn artifact_name_accepts_normal_single_components() {

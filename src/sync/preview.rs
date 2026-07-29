@@ -4,13 +4,18 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::config::{Config, DeployMode, LayoutConfig, Offer, ParsedSource, Target, TemplateOptIn};
+use crate::config::{
+    Config, DeployMode, LayoutConfig, Offer, ParsedSource, SourceMode, Target, TemplateOptIn,
+};
 use crate::diagnostic::did_you_mean;
 use crate::error::{Error, Result};
-use crate::kernel::{Materialization, OfferSelection};
 use crate::lock::{Lock, ref_discriminator};
-use crate::source::SourceName;
-use crate::source::{SourceBackend, SourceInventory};
+use crate::projection::model::Materialization;
+use crate::projection::offer::OfferSelection;
+use crate::source::{
+    Commit, ResolvePolicy, ResolveRequest, RevisionSpec, SourceInventory, SourceLocation,
+    SourceStore,
+};
 
 use super::discover::discover_working_tree_leaves;
 use super::remote_for;
@@ -113,7 +118,7 @@ pub fn preview_targets(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
     remotes: &BTreeMap<String, String>,
-    backend: &dyn SourceBackend,
+    backend: &dyn SourceStore,
     lock: Option<&Lock>,
     files: bool,
 ) -> Result<Vec<PreviewTargetPlan>> {
@@ -152,7 +157,7 @@ fn preview_target(
     target: &Target,
     parsed: &BTreeMap<String, ParsedSource>,
     remotes: &BTreeMap<String, String>,
-    backend: &dyn SourceBackend,
+    backend: &dyn SourceStore,
     lock: Option<&Lock>,
     files: bool,
     flagged: &std::collections::BTreeSet<String>,
@@ -169,7 +174,6 @@ fn preview_target(
                 binding.source
             ))
         })?;
-        let name = SourceName::trusted(binding.source);
         let ctx = BindingCtx {
             target_name,
             remotes,
@@ -178,7 +182,6 @@ fn preview_target(
             layout: &layout,
             source,
             binding: &binding,
-            name: &name,
             files,
         };
 
@@ -202,12 +205,11 @@ fn preview_target(
 struct BindingCtx<'a> {
     target_name: &'a str,
     remotes: &'a BTreeMap<String, String>,
-    backend: &'a dyn SourceBackend,
+    backend: &'a dyn SourceStore,
     path: &'a Path,
     layout: &'a LayoutConfig,
     source: &'a ParsedSource,
     binding: &'a crate::config::ResolvedBinding<'a>,
-    name: &'a SourceName,
     files: bool,
 }
 
@@ -242,13 +244,38 @@ fn preview_copy(
     };
 
     let git = remote_for(ctx.remotes, ctx.binding.source)?;
-    let Ok(candidates) = ctx
-        .backend
-        .list_source_leaves(ctx.name, git, &locked.commit, None)
-    else {
+    let location = match ctx.source.mode() {
+        SourceMode::Git | SourceMode::Host => SourceLocation::Git {
+            url: git.to_owned(),
+        },
+        SourceMode::Url => SourceLocation::Url {
+            url: git.to_owned(),
+        },
+    };
+    let Ok(commit) = locked.commit.parse::<Commit>() else {
         entries.push(annotation(ctx, &locked.commit, SyncState::NeedsSync));
         return Ok(());
     };
+    let Ok(resolved) = ctx.backend.resolve(
+        &ResolveRequest {
+            name: crate::source::SourceName::trusted(ctx.binding.source),
+            location,
+            revision: RevisionSpec::Commit(commit),
+        },
+        ResolvePolicy::CachedOnly,
+    ) else {
+        entries.push(annotation(ctx, &locked.commit, SyncState::NeedsSync));
+        return Ok(());
+    };
+    let Ok(inventory) = ctx.backend.inventory(&resolved.snapshot, None) else {
+        entries.push(annotation(ctx, &locked.commit, SyncState::NeedsSync));
+        return Ok(());
+    };
+    let candidates = inventory
+        .entries
+        .into_iter()
+        .map(|entry| entry.path.to_string())
+        .collect::<Vec<_>>();
 
     let plan = resolve_plan(ctx, &locked.commit, &candidates)?;
     for item in &plan.artifacts {

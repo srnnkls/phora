@@ -1,27 +1,59 @@
 use std::path::Path;
 
 use crate::config::transitive::TransitiveManifest;
-use crate::config::{ParsedSource, Remote};
+use crate::config::{ParsedSource, Refspec, Remote, SourceMode};
 
-use super::{Result, SourceBackend, SourceError, SourceName, is_local_path};
+use super::{
+    Commit, ResolvePolicy, ResolveRequest, ResolvedRevision, Result, RevisionSpec, SourceError,
+    SourceLocation, SourceName, SourcePath, SourceStore, is_local_path,
+};
 
 /// Acquires and decodes a dependency's `phora.toml` at either its pinned commit
 /// or a freshly resolved commit.
 pub(crate) fn acquire_dependency_manifest(
-    backend: &(dyn SourceBackend + Sync),
+    store: &(dyn SourceStore + Sync),
     source_name: &SourceName,
     parsed_source: &ParsedSource,
     remote: &str,
     pinned_commit: Option<&str>,
 ) -> Result<(String, TransitiveManifest)> {
-    let commit = if let Some(commit) = pinned_commit {
-        commit.to_owned()
+    let revision = if let Some(commit) = pinned_commit {
+        RevisionSpec::Commit(parse_commit(commit)?)
     } else {
-        backend.fetch(source_name, remote)?;
-        backend.resolve(source_name, remote, &parsed_source.refspec())?
+        revision_spec(&parsed_source.refspec())?
     };
-    let bytes = backend
-        .read_file_at(source_name, remote, &commit, Path::new("phora.toml"))
+    let location = match parsed_source.mode() {
+        SourceMode::Git | SourceMode::Host => SourceLocation::Git {
+            url: remote.to_owned(),
+        },
+        SourceMode::Url => SourceLocation::Url {
+            url: remote.to_owned(),
+        },
+    };
+    let resolved = store.resolve(
+        &ResolveRequest {
+            name: source_name.clone(),
+            location,
+            revision,
+        },
+        if pinned_commit.is_some() {
+            ResolvePolicy::CachedOnly
+        } else {
+            ResolvePolicy::Refresh
+        },
+    )?;
+    let commit = match &resolved.revision {
+        ResolvedRevision::Commit(commit) => commit.to_string(),
+        ResolvedRevision::WorktreeHead(_) => {
+            return Err(SourceError::Source(format!(
+                "transitive source {source_name} resolved to a worktree"
+            )));
+        }
+    };
+    let manifest_path = SourcePath::new("phora.toml")?;
+    let bytes = store
+        .read(&resolved.snapshot, &manifest_path)
+        .map(|entry| entry.bytes)
         .map_err(|error| match error {
             absent @ SourceError::FileAbsent { .. } => SourceError::DependencyManifestMissing {
                 remote: remote.to_owned(),
@@ -37,6 +69,22 @@ pub(crate) fn acquire_dependency_manifest(
     let manifest = TransitiveManifest::parse_toml(&manifest_text)
         .map_err(|source| SourceError::DependencyManifestParse { source })?;
     Ok((commit, manifest))
+}
+
+fn revision_spec(refspec: &Refspec) -> Result<RevisionSpec> {
+    Ok(match refspec {
+        Refspec::Branch(branch) => RevisionSpec::Branch(branch.clone()),
+        Refspec::Tag(tag) => RevisionSpec::Tag(tag.clone()),
+        Refspec::Rev(commit) => RevisionSpec::Commit(parse_commit(commit)?),
+        Refspec::Default => RevisionSpec::Default,
+        Refspec::None => RevisionSpec::None,
+    })
+}
+
+fn parse_commit(commit: &str) -> Result<Commit> {
+    commit
+        .parse::<Commit>()
+        .map_err(|error| SourceError::Source(error.to_string()))
 }
 
 /// Rejects a transitive remote that could escape into the consumer's local filesystem.
@@ -80,8 +128,12 @@ mod tests {
     use std::process::Command;
 
     use super::*;
-    use crate::config::{Refspec, Source};
-    use crate::source::{GitBackend, mirror_path};
+    use crate::config::Source;
+    use crate::source::{
+        GitBackend, MirrorKey, NormalizedUrl, ResolvedSource, SnapshotId, SourceDirectoryEntry,
+        SourceEntry, SourceEntryKind, SourceEntryMeta, SourceIdentity, SourceInventory,
+        SourceTimestamp, mirror_path,
+    };
 
     enum ManifestRead {
         Bytes(Vec<u8>),
@@ -94,28 +146,64 @@ mod tests {
         fail_fetch: bool,
     }
 
-    impl SourceBackend for ManifestBackend {
-        fn fetch(&self, _source: &SourceName, _url: &str) -> super::super::Result<()> {
-            if self.fail_fetch {
+    impl SourceStore for ManifestBackend {
+        fn resolve(
+            &self,
+            request: &ResolveRequest,
+            policy: ResolvePolicy,
+        ) -> super::super::Result<ResolvedSource> {
+            if self.fail_fetch && policy == ResolvePolicy::Refresh {
                 Err(SourceError::Source("backend sentinel".to_owned()))
             } else {
-                Ok(())
+                let commit = match &request.revision {
+                    RevisionSpec::Commit(commit) => commit.clone(),
+                    _ => "a".repeat(40).parse().expect("fixture commit is valid"),
+                };
+                let url = match &request.location {
+                    SourceLocation::Git { url } | SourceLocation::Url { url } => url,
+                    SourceLocation::Worktree { .. } => {
+                        unreachable!("manifest tests use only Git sources")
+                    }
+                };
+                let normalized = NormalizedUrl::parse(url);
+                Ok(ResolvedSource {
+                    name: request.name.clone(),
+                    snapshot: SnapshotId::Git {
+                        mirror: MirrorKey::from_url(&normalized),
+                        commit: commit.clone(),
+                    },
+                    revision: ResolvedRevision::Commit(commit),
+                    authored_at: SourceTimestamp::from_unix_seconds(0),
+                    normalized_location: SourceIdentity::Git(normalized),
+                })
             }
         }
 
-        fn read_file_at(
+        fn inventory(
             &self,
-            source: &SourceName,
-            _url: &str,
-            commit: &str,
-            path: &Path,
-        ) -> super::super::Result<Vec<u8>> {
+            _snapshot: &SnapshotId,
+            _root: Option<&SourcePath>,
+        ) -> super::super::Result<SourceInventory> {
+            Ok(SourceInventory::default())
+        }
+
+        fn read(
+            &self,
+            snapshot: &SnapshotId,
+            path: &SourcePath,
+        ) -> super::super::Result<SourceEntry> {
             match &self.read {
-                ManifestRead::Bytes(bytes) => Ok(bytes.clone()),
+                ManifestRead::Bytes(bytes) => Ok(SourceEntry {
+                    meta: SourceEntryMeta {
+                        path: path.clone(),
+                        kind: SourceEntryKind::File,
+                    },
+                    bytes: bytes.clone(),
+                }),
                 ManifestRead::Absent => Err(SourceError::FileAbsent {
-                    source_name: source.as_str().to_owned(),
-                    commit: commit.to_owned(),
-                    path: path.to_path_buf(),
+                    source_name: "dep".to_owned(),
+                    commit: snapshot.commit().to_string(),
+                    path: Path::new(path.as_str()).to_path_buf(),
                 }),
                 ManifestRead::BackendFailure => {
                     Err(SourceError::Source("backend sentinel".to_owned()))
@@ -123,34 +211,12 @@ mod tests {
             }
         }
 
-        fn resolve(
+        fn list_directory(
             &self,
-            _source: &SourceName,
-            _url: &str,
-            _refspec: &Refspec,
-        ) -> super::super::Result<String> {
-            Ok("a".repeat(40))
-        }
-
-        fn commit_time(
-            &self,
-            _source: &SourceName,
-            _url: &str,
-            _commit: &str,
-        ) -> super::super::Result<u64> {
-            Ok(0)
-        }
-
-        fn compute_digest(
-            &self,
-            _source: &SourceName,
-            _url: &str,
-            _commit: &str,
-            _root: Option<&Path>,
-            _include: &[String],
-            _exclude: &[String],
-        ) -> super::super::Result<String> {
-            Ok("blake3:test".to_owned())
+            _snapshot: &SnapshotId,
+            _path: Option<&SourcePath>,
+        ) -> super::super::Result<Vec<SourceDirectoryEntry>> {
+            Ok(Vec::new())
         }
     }
 
@@ -379,8 +445,8 @@ mod tests {
     }
 
     fn git(cwd: &Path, args: &[&str]) {
-        crate::store::assert_git_sandboxed(cwd);
-        let _serial = crate::store::guard_git_fork();
+        crate::sync::state::locking::assert_git_sandboxed(cwd);
+        let _serial = crate::sync::state::locking::guard_git_fork();
         let output = Command::new("git")
             .current_dir(cwd)
             .args(args)
@@ -432,7 +498,7 @@ mod tests {
             ],
         );
         let commit_output = {
-            let _serial = crate::store::guard_git_fork();
+            let _serial = crate::sync::state::locking::guard_git_fork();
             Command::new("git")
                 .args([
                     "-C",

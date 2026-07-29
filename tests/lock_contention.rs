@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use phora::kernel::ProjectId;
+use phora::sync::state::ProjectId;
 use tempfile::TempDir;
 
 const CONTENDED_MSG: &str = "another phora process is running for this project";

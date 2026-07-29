@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
-use crate::store::Registry;
+use crate::sync::state::StateStore;
 
 use super::journal::Journal;
 
@@ -44,7 +44,7 @@ pub(super) fn backup_path(staging_base: &Path, dst: &Path) -> PathBuf {
 pub fn recovery_sweep(
     target_parent: &Path,
     journal: &Journal,
-    registry: &dyn Registry,
+    registry: &dyn StateStore,
 ) -> Result<()> {
     let entries = journal.entries()?;
     if journal.refuses_writes() && !entries.is_empty() {
@@ -52,7 +52,7 @@ pub fn recovery_sweep(
     }
     for entry in entries {
         if entry.swap_completed {
-            registry.put(&entry.record)?;
+            registry.put_artifact(&entry.record)?;
         } else {
             let backup = backup_path(&entry.staging_base, &entry.dst);
             if backup

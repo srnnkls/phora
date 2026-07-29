@@ -383,7 +383,7 @@ fn reconcile_never_names_resolution_or_execution_effects() {
         );
     }
     assert!(
-        !references_token(&scanned, "EjectedEntry") && !references_token(&scanned, "Journal"),
+        !references_token(&scanned, "Ejection") && !references_token(&scanned, "Journal"),
         "src/{RECONCILE} must never name eject-persistence or journal effects — Eject/Abort \
          EXECUTION stays in target.rs (INV-8)"
     );

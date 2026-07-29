@@ -367,7 +367,7 @@ fn source_direct_forbidden_imports_fail() {
         ("sync-staging", "use crate::sync::stage::stage_artifact;"),
         ("sync-target-path", "use crate::sync::TargetPath;"),
         ("manifest", "use crate::store::ManifestFile;"),
-        ("registry", "use crate::store::RegistryRecord;"),
+        ("registry", "use crate::store::ArtifactRecord;"),
         ("template-policy", "use crate::config::TemplateOptIn;"),
     ];
     for (label, import) in forbidden {
@@ -1076,7 +1076,7 @@ fn reconcile_fully_qualified_forbidden_crate_path_fails() {
         ),
         (
             "crate::store body path, no use",
-            "pub fn reconcile() { let _ = crate::store::RegistryRecord::default(); }\n",
+            "pub fn reconcile() { let _ = crate::store::ArtifactRecord::default(); }\n",
         ),
         (
             "crate::deploy body path, no use",
@@ -1107,7 +1107,7 @@ fn reconcile_fully_qualified_forbidden_crate_path_fails() {
 fn reconcile_pub_use_reexport_of_forbidden_module_fails() {
     let launderings = [
         "pub use crate::sync::target::StageBridge;\n",
-        "pub use crate::store::RegistryRecord as Rec;\n",
+        "pub use crate::store::ArtifactRecord as Rec;\n",
         "pub use crate::sync::stage::stage_artifact;\n",
     ];
     for body in launderings {

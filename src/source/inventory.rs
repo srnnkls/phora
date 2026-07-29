@@ -1,12 +1,10 @@
+use super::Commit;
 use super::Result;
 use super::model::{SourceEntryKind, SourceEntryMeta, SourceInventory, SourcePath};
 use super::snapshot::SnapshotId;
 
-pub(super) fn snapshot_commit(snapshot: &SnapshotId) -> &str {
-    match snapshot {
-        SnapshotId::Git { commit } => commit,
-        SnapshotId::Worktree { capture_digest, .. } => capture_digest,
-    }
+pub(super) fn snapshot_commit(snapshot: &SnapshotId) -> &Commit {
+    snapshot.commit()
 }
 
 pub(super) fn populate_inventory<I>(leaves: I) -> Result<SourceInventory>

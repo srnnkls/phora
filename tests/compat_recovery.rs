@@ -1,6 +1,6 @@
 //! T004 journal/recovery baselines (INV-9): byte-exact golden fixtures pinning the
-//! crash-safety surface of `deploy::{Journal, JournalEntry, recovery_sweep,
-//! deploy_artifact, link_artifact, copy_tree}` on unmoved `main`, so every journaled
+//! crash-safety surface of `sync::{Journal, JournalEntry, recovery_sweep,
+//! apply_artifact, link_artifact, copy_tree}` on unmoved `main`, so every journaled
 //! intent, recovery outcome, and rollback path stays identical through the source →
 //! projection → sync refactor. These are the INV-9 oracle the PR9/PR11 diffs measure
 //! against (C1).
@@ -22,12 +22,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 
-use phora::deploy::{
-    Journal, JournalEntry, copy_tree, deploy_artifact, link_artifact, recovery_sweep,
-};
-use phora::store::{
-    ArtifactKey, EjectedEntry, HookState, ManifestFile, RecordKind, Registry, RegistryRecord,
-    StoreError,
+use phora::sync::apply::{apply_artifact, copy_tree, link_artifact};
+use phora::sync::journal::{Journal, JournalEntry};
+use phora::sync::recovery::recovery_sweep;
+use phora::sync::state::{
+    ArtifactKey, ArtifactRecord, Ejection, HookState, ManifestFile, RecordKind, StateError,
+    StateStore,
 };
 use tempfile::TempDir;
 
@@ -244,8 +244,8 @@ fn key() -> ArtifactKey {
 }
 
 /// A managed dir record over one file with content-addressed blake3 and a fixed mtime.
-fn record(contents: &[u8], kind: RecordKind, linked: bool) -> RegistryRecord {
-    RegistryRecord {
+fn record(contents: &[u8], kind: RecordKind, linked: bool) -> ArtifactRecord {
+    ArtifactRecord {
         version: 1,
         key: key(),
         source: SOURCE.to_owned(),
@@ -290,8 +290,8 @@ fn read_journal_bytes(locks_dir: &Path) -> String {
     std::fs::read_to_string(locks_dir.join("journal.toml")).expect("read journal.toml")
 }
 
-fn open_registry(root: &Path) -> phora::store::FileRegistry {
-    phora::store::FileRegistry::open(root.join("state")).expect("open registry")
+fn open_registry(root: &Path) -> phora::sync::state::FileStateStore {
+    phora::sync::state::FileStateStore::open(root.join("state")).expect("open registry")
 }
 
 // ─── 1. journal serialization: intent appended before the swap ──────────────────
@@ -433,7 +433,7 @@ fn assert_swap_interruption_recovers(case: &SwapInterruption) {
     let _ = writeln!(
         doc,
         "record_committed = {}",
-        registry.get(&key()).expect("registry get").is_some()
+        registry.artifact(&key()).expect("registry get").is_some()
     );
     let _ = writeln!(
         doc,
@@ -503,7 +503,7 @@ fn recovery_sweep_commits_record_on_completed_swap() {
     let registry = open_registry(root.path());
     recovery_sweep(&deploy, &journal, &registry).expect("recovery sweep");
 
-    let committed = registry.get(&key()).expect("registry get");
+    let committed = registry.artifact(&key()).expect("registry get");
     let mut doc = String::new();
     let _ = writeln!(doc, "record_committed = {}", committed.is_some());
     let _ = writeln!(
@@ -560,7 +560,7 @@ struct PutProbe {
 }
 
 struct ProbingRegistry {
-    inner: phora::store::FileRegistry,
+    inner: phora::sync::state::FileStateStore,
     journal_path: PathBuf,
     dst: PathBuf,
     fail: bool,
@@ -587,11 +587,11 @@ impl ProbingRegistry {
     }
 }
 
-impl Registry for ProbingRegistry {
-    fn get(&self, key: &ArtifactKey) -> Result<Option<RegistryRecord>, StoreError> {
-        self.inner.get(key)
+impl StateStore for ProbingRegistry {
+    fn artifact(&self, key: &ArtifactKey) -> Result<Option<ArtifactRecord>, StateError> {
+        self.inner.artifact(key)
     }
-    fn put(&self, record: &RegistryRecord) -> Result<(), StoreError> {
+    fn put_artifact(&self, record: &ArtifactRecord) -> Result<(), StateError> {
         let dst_is_symlink =
             std::fs::symlink_metadata(&self.dst).is_ok_and(|m| m.file_type().is_symlink());
         let dst_bytes = if dst_is_symlink {
@@ -605,40 +605,43 @@ impl Registry for ProbingRegistry {
             dst_is_symlink,
         });
         if self.fail {
-            return Err(StoreError::Registry(
+            return Err(StateError::StateStore(
                 "simulated state-write failure".to_owned(),
             ));
         }
-        self.inner.put(record)
+        self.inner.put_artifact(record)
     }
-    fn remove(&self, key: &ArtifactKey) -> Result<(), StoreError> {
-        self.inner.remove(key)
+    fn remove_artifact(&self, key: &ArtifactKey) -> Result<(), StateError> {
+        self.inner.remove_artifact(key)
     }
-    fn list_target(&self, target: &str) -> Result<Vec<RegistryRecord>, StoreError> {
-        self.inner.list_target(target)
+    fn target_artifacts(&self, target: &str) -> Result<Vec<ArtifactRecord>, StateError> {
+        self.inner.target_artifacts(target)
     }
-    fn list_all(&self) -> Result<Vec<RegistryRecord>, StoreError> {
-        self.inner.list_all()
+    fn all_artifacts(&self) -> Result<Vec<ArtifactRecord>, StateError> {
+        self.inner.all_artifacts()
     }
-    fn load_ejected(&self, target: &str) -> Result<Vec<EjectedEntry>, StoreError> {
-        self.inner.load_ejected(target)
+    fn ejections(&self, target: &str) -> Result<Vec<Ejection>, StateError> {
+        self.inner.ejections(target)
     }
-    fn save_ejected(&self, target: &str, ejected: &[EjectedEntry]) -> Result<(), StoreError> {
-        self.inner.save_ejected(target, ejected)
+    fn save_ejections(&self, target: &str, ejected: &[Ejection]) -> Result<(), StateError> {
+        self.inner.save_ejections(target, ejected)
     }
-    fn load_hook_state(&self, target: &str) -> Result<Vec<HookState>, StoreError> {
-        self.inner.load_hook_state(target)
+    fn hook_state(&self, target: &str) -> Result<Vec<HookState>, StateError> {
+        self.inner.hook_state(target)
     }
     fn record_hook_success(
         &self,
         target: &str,
         hook_id: &str,
         digest_set: &std::collections::BTreeSet<String>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<(), StateError> {
         self.inner.record_hook_success(target, hook_id, digest_set)
     }
-    fn locks_dir(&self) -> PathBuf {
-        self.inner.locks_dir()
+    fn acquire_lock(&self) -> Result<phora::sync::state::StateLock, StateError> {
+        self.inner.acquire_lock()
+    }
+    fn journal_root(&self) -> PathBuf {
+        self.inner.journal_root()
     }
 }
 
@@ -658,7 +661,7 @@ fn deploy_artifact_rolls_back_target_when_state_write_fails() {
     let journal = Journal::open(&locks).expect("open journal");
     let registry = ProbingRegistry::new(root.path(), &locks, &dst, true);
 
-    let err = deploy_artifact(
+    let err = apply_artifact(
         &staging_base,
         &staging,
         &dst,
@@ -706,7 +709,7 @@ fn deploy_artifact_rolls_back_target_when_state_write_fails() {
     let _ = writeln!(
         doc,
         "record_committed = {}",
-        registry.get(&key()).expect("get").is_some()
+        registry.artifact(&key()).expect("get").is_some()
     );
     assert_golden(
         "rollback_state_write_failure.golden",
@@ -731,7 +734,7 @@ fn deploy_artifact_rollback_removes_target_when_no_prior_destination() {
     let journal = Journal::open(&locks).expect("open journal");
     let registry = ProbingRegistry::new(root.path(), &locks, &dst, true);
 
-    let err = deploy_artifact(
+    let err = apply_artifact(
         &staging_base,
         &staging,
         &dst,
@@ -775,7 +778,7 @@ fn deploy_artifact_rollback_removes_target_when_no_prior_destination() {
     let _ = writeln!(
         doc,
         "record_committed = {}",
-        registry.get(&key()).expect("get").is_some()
+        registry.artifact(&key()).expect("get").is_some()
     );
     assert_golden(
         "rollback_no_prior_destination.golden",
@@ -852,7 +855,10 @@ fn link_artifact_deploys_crash_safe_symlink() {
     let _ = writeln!(
         doc,
         "record_linked = {}",
-        registry.get(&key()).expect("get").is_some_and(|r| r.linked)
+        registry
+            .artifact(&key())
+            .expect("get")
+            .is_some_and(|r| r.linked)
     );
     let _ = writeln!(
         doc,
@@ -901,7 +907,7 @@ fn recovery_sweep_discards_pre_rename_staged_symlink() {
     let _ = writeln!(
         doc,
         "record_committed = {}",
-        registry.get(&key()).expect("get").is_some()
+        registry.artifact(&key()).expect("get").is_some()
     );
     let _ = writeln!(
         doc,
@@ -971,7 +977,7 @@ fn recovery_sweep_keeps_post_rename_symlink_uncommitted() {
     let _ = writeln!(
         doc,
         "record_committed = {}",
-        registry.get(&key()).expect("get").is_some()
+        registry.artifact(&key()).expect("get").is_some()
     );
     let _ = writeln!(
         doc,
@@ -1076,8 +1082,8 @@ fn dump_state_toml(root: &Path) -> String {
     doc
 }
 
-fn overlap_record(artifact: &str, kind: RecordKind, contents: &[u8]) -> RegistryRecord {
-    RegistryRecord {
+fn overlap_record(artifact: &str, kind: RecordKind, contents: &[u8]) -> ArtifactRecord {
+    ArtifactRecord {
         version: 1,
         key: ArtifactKey {
             target: TARGET.to_owned(),
@@ -1112,15 +1118,15 @@ fn eject_directory_over_leaf_overlap_metadata_is_byte_identical() {
 
     let dir = overlap_record("editor", RecordKind::Dir, b"-- editor tree\n");
     let leaf = overlap_record("editor/init.lua", RecordKind::File, b"-- init\n");
-    registry.put(&dir).expect("put directory record");
+    registry.put_artifact(&dir).expect("put directory record");
     registry
-        .put(&leaf)
+        .put_artifact(&leaf)
         .expect("put overlapping nested leaf record");
 
     registry
-        .save_ejected(
+        .save_ejections(
             TARGET,
-            &[EjectedEntry {
+            &[Ejection {
                 source: SOURCE.to_owned(),
                 artifact: "editor".to_owned(),
                 ejected_at: PROJECTED_AT.to_owned(),
@@ -1171,7 +1177,7 @@ fn relink_at_changed_source_pins_second_outcome() {
     )
     .expect("re-link re-points dst at the changed source B");
 
-    let committed = registry.get(&key()).expect("registry get");
+    let committed = registry.artifact(&key()).expect("registry get");
     let mut doc = String::new();
     let _ = writeln!(
         doc,

@@ -24,14 +24,15 @@ use std::str::FromStr as _;
 use std::time::UNIX_EPOCH;
 
 use phora::config::TemplateOptIn;
-use phora::kernel::{Materialization, SourceName};
+use phora::projection::model::Materialization;
 use phora::projection::model::{
     ArtifactRelativePath, ContentTransform, ProjectedArtifact, ProjectedLeaf, ResolvedSourceRef,
     TargetPath, TargetProjection,
 };
+use phora::source::SourceName;
 use phora::source::{
-    ExportPolicy, GitBackend, ResolvedSource, SnapshotId, SourceBackend as _, SourceError,
-    SourcePath, SourceStore,
+    ExportPolicy, GitBackend, ResolvePolicy, ResolveRequest, RevisionSpec, SourceError,
+    SourceLocation, SourcePath, SourceStore,
 };
 use phora::sync::{StageRequest, StagedArtifact, stage_artifact};
 use tempfile::TempDir;
@@ -325,9 +326,16 @@ fn build_staging_fixture() -> StagingFixture {
     let git_dir = TempDir::new().expect("git dir tempdir");
     let backend = GitBackend::new(git_dir.path().to_path_buf());
     let url = src.path().to_string_lossy().into_owned();
-    backend
-        .fetch(&sn("fixture"), &url)
-        .expect("fetch builds mirror");
+    SourceStore::resolve(
+        &backend,
+        &ResolveRequest {
+            name: sn("fixture"),
+            location: SourceLocation::Git { url: url.clone() },
+            revision: RevisionSpec::Branch("main".to_owned()),
+        },
+        ResolvePolicy::Refresh,
+    )
+    .expect("refresh builds mirror");
 
     StagingFixture {
         _src: src,
@@ -396,13 +404,18 @@ fn run_export(
 ) -> std::result::Result<StagedArtifact, SourceError> {
     let artifact = artifact_of(fx, leaves);
     let projection = empty_projection();
-    let resolved = ResolvedSource {
-        name: source.clone(),
-        url: fx.url.clone(),
-        snapshot: SnapshotId::Git {
-            commit: fx.commit.clone(),
+    let resolved = SourceStore::resolve(
+        &fx.backend,
+        &ResolveRequest {
+            name: source.clone(),
+            location: SourceLocation::Git {
+                url: fx.url.clone(),
+            },
+            revision: RevisionSpec::Commit(fx.commit.parse().expect("fixture commit is valid hex")),
         },
-    };
+        ResolvePolicy::CachedOnly,
+    )
+    .expect("resolve staged fixture snapshot");
     stage_artifact(
         &StageRequest {
             artifact: &artifact,
@@ -416,7 +429,7 @@ fn run_export(
         template_opt_in,
         |repo_relative| {
             let path = SourcePath::new(&repo_relative.to_string_lossy().replace('\\', "/"))?;
-            let entry = SourceStore::read(&fx.backend, &resolved, &path)?;
+            let entry = SourceStore::read(&fx.backend, &resolved.snapshot, &path)?;
             Ok((entry.bytes, entry.meta.kind))
         },
     )
@@ -658,9 +671,16 @@ fn build_extended_fixture() -> StagingFixture {
     let git_dir = TempDir::new().expect("git dir tempdir");
     let backend = GitBackend::new(git_dir.path().to_path_buf());
     let url = src.path().to_string_lossy().into_owned();
-    backend
-        .fetch(&sn("extended"), &url)
-        .expect("fetch builds mirror");
+    SourceStore::resolve(
+        &backend,
+        &ResolveRequest {
+            name: sn("extended"),
+            location: SourceLocation::Git { url: url.clone() },
+            revision: RevisionSpec::Branch("main".to_owned()),
+        },
+        ResolvePolicy::Refresh,
+    )
+    .expect("refresh builds mirror");
 
     StagingFixture {
         _src: src,

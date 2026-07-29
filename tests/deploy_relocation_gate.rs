@@ -466,23 +466,6 @@ fn assert_carrier_tokens(
     );
 }
 
-fn has_pub_reexport_from(src: &str, module: &str) -> bool {
-    production(src).split(';').any(|statement| {
-        let compact: String = statement.chars().filter(|c| !c.is_whitespace()).collect();
-        if !compact.starts_with("pubuse") {
-            return false;
-        }
-        let direct = format!("crate::sync::{module}::");
-        if compact.contains(&direct) {
-            return true;
-        }
-        let Some(group) = compact.split_once("crate::sync::{").map(|(_, group)| group) else {
-            return false;
-        };
-        group.starts_with(&format!("{module}::")) || group.contains(&format!(",{module}::"))
-    })
-}
-
 fn shell_without_comment(line: &str) -> String {
     let mut out = String::new();
     let mut quote = None;
@@ -554,8 +537,7 @@ fn assert_no_sync_production_name(scans: &SourceScans, old: &str, replacement: &
     assert!(
         sites.is_empty(),
         "T023 must replace the old internal `{old}` identifier with `{replacement}` everywhere \
-         under src/sync; production sites still containing it: {sites:?}. The compatibility \
-         facade at src/{DEPLOY} is intentionally outside this assertion"
+         under src/sync; production sites still containing it: {sites:?}"
     );
 }
 
@@ -656,28 +638,20 @@ fn recovery_module_owns_sweep_and_rollback_helpers() {
 }
 
 #[test]
-fn deploy_is_a_reexport_only_compatibility_facade() {
-    let deploy_src = read_src(DEPLOY);
-    let stripped = strip_non_code(&deploy_src);
-    let forbidden_items: Vec<&&str> = [
-        "fn", "struct", "enum", "union", "trait", "impl", "type", "const", "static",
-    ]
-    .iter()
-    .filter(|keyword| has_keyword(&stripped, keyword))
-    .collect();
+fn deploy_compatibility_facade_and_crate_root_module_are_absent() {
+    let deploy_path = src_dir().join(DEPLOY);
     assert!(
-        forbidden_items.is_empty(),
-        "src/{DEPLOY} must be a compatibility re-export facade with no function/type \
-         implementation, including under cfg(test); item keywords still present: \
-         {forbidden_items:?}"
+        !deploy_path.exists(),
+        "T030 must remove the deploy compatibility facade at {}",
+        deploy_path.display()
     );
-    for module in ["apply", "journal", "recovery", "inspect"] {
-        assert!(
-            has_pub_reexport_from(&deploy_src, module),
-            "src/{DEPLOY} must publicly re-export the relocated sync::{module} API for legacy \
-             phora::deploy callers; comments, strings, private uses, and cfg(test) do not count"
-        );
-    }
+
+    let crate_root = production(&read_src("lib.rs"));
+    assert!(
+        !has_keyword(&crate_root, "deploy"),
+        "T030 must remove every production deploy module declaration or re-export from the crate \
+         root; comments, strings, and cfg(test)-only declarations do not count"
+    );
 }
 
 #[test]
@@ -728,25 +702,25 @@ fn t024_removes_deploy_target_io_allowlist_entry() {
     assert!(
         !has_active_deploy_t024_allowlist(&arch_check),
         "T024 must remove the exact active `$'src/deploy.rs\\tT024'` LEGACY_ALLOWLIST array \
-         entry now that src/{DEPLOY} is a re-export-only compatibility facade; parsed active \
-         entries: {:?}",
+         entry now that deploy ownership lives under sync and T030 removes src/{DEPLOY}; parsed \
+         active entries: {:?}",
         active_legacy_allowlist_entries(&arch_check)
     );
 }
 
 #[test]
-fn legacy_deploy_api_remains_importable() {
+fn relocated_sync_api_remains_importable() {
     fn accepts<T>(_: T) {}
 
-    accepts(phora::deploy::copy_file);
-    accepts(phora::deploy::copy_tree);
-    accepts(phora::deploy::deploy_artifact);
-    accepts(phora::deploy::link_artifact);
-    accepts(phora::deploy::recovery_sweep);
-    accepts(phora::deploy::Journal::open);
-    accepts(phora::deploy::check_artifact_state);
-    let _ = std::mem::size_of::<phora::deploy::JournalEntry>();
-    let _ = std::mem::size_of::<phora::deploy::ArtifactState>();
+    accepts(phora::sync::apply::copy_file);
+    accepts(phora::sync::apply::copy_tree);
+    accepts(phora::sync::apply::apply_artifact);
+    accepts(phora::sync::apply::link_artifact);
+    accepts(phora::sync::recovery::recovery_sweep);
+    accepts(phora::sync::journal::Journal::open);
+    accepts(phora::sync::inspect::check_artifact_state);
+    let _ = std::mem::size_of::<phora::sync::journal::JournalEntry>();
+    let _ = std::mem::size_of::<phora::sync::inspect::ArtifactState>();
 }
 
 #[test]

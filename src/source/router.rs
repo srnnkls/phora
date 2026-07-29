@@ -1,140 +1,74 @@
-//! Mode-aware source routing: dispatches each `SourceBackend` call to the git or
-//! http adapter by the source's declared mode.
+//! Typed request routing for Git, URL, and worktree source capabilities.
 
-use std::collections::BTreeMap;
-use std::path::Path;
-
-use super::SourceName;
-use crate::config::{Refspec, SourceMode};
 use crate::source::{
-    ResolvedSource, SourceBackend, SourceEntry, SourceError, SourceInventory, SourcePath,
-    SourceStore, TreeEntry,
+    ResolvePolicy, ResolveRequest, ResolvedSource, SnapshotId, SourceDirectoryEntry, SourceEntry,
+    SourceError, SourceInventory, SourceLocation, SourcePath, SourceStore,
 };
 
 type Result<T> = std::result::Result<T, SourceError>;
 
-/// Routes each `SourceBackend` call to `git` or `http` by the source's declared
-/// mode, looked up by name. An unmapped name defaults to the git backend.
-// not sealed: single binary, in-crate test doubles need to impl SourceBackend.
+/// Routes each source request by its typed location.
 pub struct RouterBackend<G, H> {
     git: G,
     http: H,
-    modes: BTreeMap<SourceName, SourceMode>,
 }
 
 impl<G, H> RouterBackend<G, H> {
-    pub fn new(git: G, http: H, modes: BTreeMap<SourceName, SourceMode>) -> Self {
-        Self { git, http, modes }
-    }
-
-    fn is_url(&self, source: &SourceName) -> bool {
-        matches!(self.modes.get(source), Some(SourceMode::Url))
+    pub fn new(git: G, http: H) -> Self {
+        Self { git, http }
     }
 }
 
-impl<G: SourceBackend, H: SourceBackend> RouterBackend<G, H> {
-    fn route(&self, source: &SourceName) -> &dyn SourceBackend {
-        if self.is_url(source) {
-            &self.http
-        } else {
-            &self.git
+impl<G: SourceStore, H: SourceStore> SourceStore for RouterBackend<G, H> {
+    fn resolve(&self, request: &ResolveRequest, policy: ResolvePolicy) -> Result<ResolvedSource> {
+        match &request.location {
+            SourceLocation::Url { .. } => SourceStore::resolve(&self.http, request, policy),
+            SourceLocation::Git { .. } | SourceLocation::Worktree { .. } => {
+                SourceStore::resolve(&self.git, request, policy)
+            }
         }
     }
-}
 
-impl<G: SourceBackend, H: SourceBackend> SourceBackend for RouterBackend<G, H> {
-    fn read_file_at(
+    fn inventory(
         &self,
-        source: &SourceName,
-        url: &str,
-        commit: &str,
-        path: &Path,
-    ) -> Result<Vec<u8>> {
-        self.git.read_file_at(source, url, commit, path)
+        snapshot: &SnapshotId,
+        root: Option<&SourcePath>,
+    ) -> Result<SourceInventory> {
+        SourceStore::inventory(&self.git, snapshot, root)
     }
 
-    fn list_tree_at(
+    fn read(&self, snapshot: &SnapshotId, path: &SourcePath) -> Result<SourceEntry> {
+        SourceStore::read(&self.git, snapshot, path)
+    }
+
+    fn list_directory(
         &self,
-        source: &SourceName,
-        url: &str,
-        commit: &str,
-        path: &Path,
-    ) -> Result<Vec<TreeEntry>> {
-        self.git.list_tree_at(source, url, commit, path)
-    }
-
-    fn fetch(&self, source: &SourceName, url: &str) -> Result<()> {
-        self.route(source).fetch(source, url)
-    }
-
-    fn mirror_ready(&self, url: &str) -> bool {
-        self.git.mirror_ready(url)
-    }
-
-    fn list_source_leaves(
-        &self,
-        source: &SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-    ) -> Result<Vec<String>> {
-        self.route(source)
-            .list_source_leaves(source, url, commit, root)
-    }
-
-    fn resolve(&self, source: &SourceName, url: &str, refspec: &Refspec) -> Result<String> {
-        self.route(source).resolve(source, url, refspec)
-    }
-
-    fn commit_time(&self, source: &SourceName, url: &str, commit: &str) -> Result<u64> {
-        self.route(source).commit_time(source, url, commit)
-    }
-
-    fn compute_digest(
-        &self,
-        source: &SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        include: &[String],
-        exclude: &[String],
-    ) -> Result<String> {
-        self.route(source)
-            .compute_digest(source, url, commit, root, include, exclude)
-    }
-}
-
-impl<G: SourceStore, H> SourceStore for RouterBackend<G, H> {
-    fn inventory(&self, source: &ResolvedSource) -> Result<SourceInventory> {
-        self.git.inventory(source)
-    }
-
-    fn read(&self, source: &ResolvedSource, path: &SourcePath) -> Result<SourceEntry> {
-        self.git.read(source, path)
-    }
-
-    fn digest_snapshot(&self, source: &ResolvedSource, leaves: &[SourcePath]) -> Result<String> {
-        self.git.digest_snapshot(source, leaves)
+        snapshot: &SnapshotId,
+        path: Option<&SourcePath>,
+    ) -> Result<Vec<SourceDirectoryEntry>> {
+        SourceStore::list_directory(&self.git, snapshot, path)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::path::Path;
     use std::process::Command;
-    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use tempfile::TempDir;
 
-    use super::SourceName;
-    use crate::config::{Refspec, SourceMode};
+    use crate::source::model::SourceName;
     use crate::source::{
-        GitBackend, HttpBackend, RouterBackend, SourceBackend, SourceError, TreeEntry,
+        Commit, GitBackend, HttpBackend, MirrorKey, NormalizedUrl, ResolvePolicy, ResolveRequest,
+        ResolvedRevision, ResolvedSource, RevisionSpec, RouterBackend, SnapshotId,
+        SourceDirectoryEntry, SourceEntry, SourceEntryKind, SourceEntryMeta, SourceError,
+        SourceIdentity, SourceInventory, SourceLocation, SourcePath, SourceStore, SourceTimestamp,
+        digest_snapshot,
     };
 
     type Result<T> = std::result::Result<T, SourceError>;
@@ -207,8 +141,8 @@ mod tests {
         reason = "fixture setup fails loudly; git CLI is assumed present"
     )]
     fn run_git(cwd: &Path, args: &[&str]) {
-        crate::store::assert_git_sandboxed(cwd);
-        let _serial = crate::store::guard_git_fork();
+        crate::sync::state::locking::assert_git_sandboxed(cwd);
+        let _serial = crate::sync::state::locking::guard_git_fork();
         let out = Command::new("git")
             .args(args)
             .current_dir(cwd)
@@ -240,7 +174,7 @@ mod tests {
         run_git(p, &["add", "-A"]);
         run_git(p, &["commit", "-m", "initial"]);
         let head = {
-            let _serial = crate::store::guard_git_fork();
+            let _serial = crate::sync::state::locking::guard_git_fork();
             let out = Command::new("git")
                 .args(["rev-parse", "HEAD"])
                 .current_dir(p)
@@ -264,30 +198,32 @@ mod tests {
         let git = GitBackend::new(git_dir.path().to_path_buf());
         let http = HttpBackend::new(git_dir.path().to_path_buf(), BTreeMap::new());
 
-        let mut modes = BTreeMap::new();
-        modes.insert(sn("g"), SourceMode::Git);
-        modes.insert(sn("u"), SourceMode::Url);
-        let router = RouterBackend::new(git, http, modes);
+        let router = RouterBackend::new(git, http);
 
-        router
-            .fetch(&sn("g"), &g_url)
-            .expect("router fetches git source");
-        router
-            .fetch(&sn("u"), &u_url)
-            .expect("router fetches url source");
-
-        // url source resolved with a bogus git ref: only succeeds if routed to Http
-        // (which ignores the refspec and reads refs/heads/phora).
-        let u_commit = router
-            .resolve(&sn("u"), &u_url, &Refspec::Branch("main".into()))
-            .expect("url source must route to Http and resolve despite a git-style refspec");
+        let u_source = SourceStore::resolve(
+            &router,
+            &ResolveRequest {
+                name: sn("u"),
+                location: SourceLocation::Url { url: u_url },
+                revision: RevisionSpec::None,
+            },
+            ResolvePolicy::Refresh,
+        )
+        .expect("url source must route to Http and import a synthetic snapshot");
+        let u_commit = u_source.snapshot.commit().to_string();
         assert_eq!(u_commit.len(), 40, "synthetic phora commit is 40-hex");
 
-        // git source resolved with Refspec::None would fail on Http; routing to Git
-        // with Branch(main) is what makes it succeed and match the real head.
-        let g_commit = router
-            .resolve(&sn("g"), &g_url, &Refspec::Branch("main".into()))
-            .expect("git source must route to Git and resolve branch main");
+        let g_source = SourceStore::resolve(
+            &router,
+            &ResolveRequest {
+                name: sn("g"),
+                location: SourceLocation::Git { url: g_url },
+                revision: RevisionSpec::Branch("main".into()),
+            },
+            ResolvePolicy::Refresh,
+        )
+        .expect("git source must route to Git and resolve branch main");
+        let g_commit = g_source.snapshot.commit().to_string();
         assert_eq!(
             g_commit, g_head,
             "the git source must resolve to its real HEAD commit, proving it was routed to Git"
@@ -307,13 +243,29 @@ mod tests {
         let git_dir = TempDir::new().expect("git_dir tempdir");
 
         let http = HttpBackend::new(git_dir.path().to_path_buf(), BTreeMap::new());
-        http.fetch(&sn("u"), &u_url)
-            .expect("import synthetic mirror");
+        SourceStore::resolve(
+            &http,
+            &ResolveRequest {
+                name: sn("u"),
+                location: SourceLocation::Url { url: u_url.clone() },
+                revision: RevisionSpec::None,
+            },
+            ResolvePolicy::Refresh,
+        )
+        .expect("import synthetic mirror");
 
         let git = GitBackend::new(git_dir.path().to_path_buf());
         assert!(
-            git.resolve(&sn("u"), &u_url, &Refspec::Branch("main".into()))
-                .is_err(),
+            SourceStore::resolve(
+                &git,
+                &ResolveRequest {
+                    name: sn("u"),
+                    location: SourceLocation::Git { url: u_url },
+                    revision: RevisionSpec::Branch("main".into()),
+                },
+                ResolvePolicy::CachedOnly,
+            )
+            .is_err(),
             "a url source mis-sent to Git with Branch(main) must fail: there is no such branch, \
              only refs/heads/phora. This is why dispatch-on-mode (not url-scheme) is load-bearing."
         );
@@ -323,175 +275,188 @@ mod tests {
 
     #[derive(Default, Clone)]
     struct Spy {
-        fetches: Rc<RefCell<Vec<String>>>,
-        resolves: Rc<RefCell<Vec<String>>>,
-        digests: Rc<RefCell<Vec<String>>>,
-        leaf_walks: Rc<RefCell<Vec<String>>>,
-        tree_lists: Rc<RefCell<Vec<String>>>,
+        resolves: Arc<Mutex<Vec<String>>>,
+        inventories: Arc<Mutex<usize>>,
+        reads: Arc<Mutex<usize>>,
+        directory_lists: Arc<Mutex<usize>>,
     }
 
-    impl SourceBackend for Spy {
-        fn fetch(&self, source: &SourceName, _url: &str) -> Result<()> {
-            self.fetches.borrow_mut().push(source.to_string());
-            Ok(())
-        }
-
-        fn list_source_leaves(
+    impl SourceStore for Spy {
+        fn resolve(
             &self,
-            source: &SourceName,
-            _url: &str,
-            _commit: &str,
-            _root: Option<&Path>,
-        ) -> Result<Vec<String>> {
-            self.leaf_walks.borrow_mut().push(source.to_string());
-            Ok(vec![format!("leaf-{source}")])
+            request: &ResolveRequest,
+            _policy: ResolvePolicy,
+        ) -> Result<ResolvedSource> {
+            self.resolves
+                .lock()
+                .expect("resolve recorder lock")
+                .push(request.name.to_string());
+            let url = match &request.location {
+                SourceLocation::Git { url } | SourceLocation::Url { url } => url,
+                SourceLocation::Worktree { .. } => {
+                    unreachable!("router spy tests use Git and URL sources")
+                }
+            };
+            let normalized = NormalizedUrl::parse(url);
+            let commit: Commit = "0".repeat(40).parse().expect("fixture commit is valid");
+            let identity = match request.location {
+                SourceLocation::Url { .. } => SourceIdentity::Url(normalized.clone()),
+                SourceLocation::Git { .. } => SourceIdentity::Git(normalized.clone()),
+                SourceLocation::Worktree { .. } => unreachable!(),
+            };
+            Ok(ResolvedSource {
+                name: request.name.clone(),
+                snapshot: SnapshotId::Git {
+                    mirror: MirrorKey::from_url(&normalized),
+                    commit: commit.clone(),
+                },
+                revision: ResolvedRevision::Commit(commit),
+                authored_at: SourceTimestamp::from_unix_seconds(0),
+                normalized_location: identity,
+            })
         }
 
-        fn list_tree_at(
+        fn inventory(
             &self,
-            source: &SourceName,
-            _url: &str,
-            _commit: &str,
-            _path: &Path,
-        ) -> Result<Vec<TreeEntry>> {
-            self.tree_lists.borrow_mut().push(source.to_string());
-            Ok(vec![TreeEntry {
-                name: format!("entry-{source}"),
-                is_dir: false,
-            }])
+            _snapshot: &SnapshotId,
+            _root: Option<&SourcePath>,
+        ) -> Result<SourceInventory> {
+            *self.inventories.lock().expect("inventory recorder lock") += 1;
+            Ok(SourceInventory::default())
         }
 
-        fn resolve(&self, source: &SourceName, _url: &str, _refspec: &Refspec) -> Result<String> {
-            self.resolves.borrow_mut().push(source.to_string());
-            Ok(format!("resolved-{source}"))
+        fn read(&self, _snapshot: &SnapshotId, path: &SourcePath) -> Result<SourceEntry> {
+            *self.reads.lock().expect("read recorder lock") += 1;
+            Ok(SourceEntry {
+                meta: SourceEntryMeta {
+                    path: path.clone(),
+                    kind: SourceEntryKind::File,
+                },
+                bytes: b"spy".to_vec(),
+            })
         }
 
-        fn commit_time(&self, _source: &SourceName, _url: &str, _commit: &str) -> Result<u64> {
-            Ok(0)
-        }
-
-        fn compute_digest(
+        fn list_directory(
             &self,
-            source: &SourceName,
-            _url: &str,
-            _commit: &str,
-            _root: Option<&Path>,
-            _include: &[String],
-            _exclude: &[String],
-        ) -> Result<String> {
-            self.digests.borrow_mut().push(source.to_string());
-            Ok("blake3:spy".into())
+            _snapshot: &SnapshotId,
+            _path: Option<&SourcePath>,
+        ) -> Result<Vec<SourceDirectoryEntry>> {
+            *self
+                .directory_lists
+                .lock()
+                .expect("directory recorder lock") += 1;
+            Ok(Vec::new())
         }
     }
 
-    // git and http share recorded state with their in-router twins via Rc.
-    fn spy_router(modes: BTreeMap<SourceName, SourceMode>) -> (RouterBackend<Spy, Spy>, Spy, Spy) {
+    // Git and HTTP share recorded state with their in-router twins via Arc.
+    fn spy_router() -> (RouterBackend<Spy, Spy>, Spy, Spy) {
         let git = Spy::default();
         let http = Spy::default();
-        let router = RouterBackend::new(git.clone(), http.clone(), modes);
+        let router = RouterBackend::new(git.clone(), http.clone());
         (router, git, http)
+    }
+
+    fn request(name: &str, location: SourceLocation, revision: RevisionSpec) -> ResolveRequest {
+        ResolveRequest {
+            name: sn(name),
+            location,
+            revision,
+        }
+    }
+
+    fn snapshot() -> SnapshotId {
+        let normalized = NormalizedUrl::parse("https://example.com/o/r.git");
+        SnapshotId::Git {
+            mirror: MirrorKey::from_url(&normalized),
+            commit: "0".repeat(40).parse().expect("fixture commit is valid"),
+        }
     }
 
     #[test]
     fn dispatch_sends_url_mode_to_http_and_git_mode_to_git_by_name() {
-        let mut modes = BTreeMap::new();
-        modes.insert(sn("g"), SourceMode::Git);
-        modes.insert(sn("u"), SourceMode::Url);
-        let (router, git, http) = spy_router(modes);
+        let (router, git, http) = spy_router();
 
-        router
-            .fetch(&sn("g"), "https://example.com/o/r.git")
-            .expect("git fetch");
-        router
-            .fetch(&sn("u"), "https://example.com/pkg.tar.gz")
-            .expect("url fetch");
-        router
-            .resolve(&sn("u"), "https://example.com/pkg.tar.gz", &Refspec::None)
-            .expect("url resolve");
-        router
-            .resolve(
-                &sn("g"),
-                "https://example.com/o/r.git",
-                &Refspec::Branch("main".into()),
-            )
-            .expect("git resolve");
+        SourceStore::resolve(
+            &router,
+            &request(
+                "u",
+                SourceLocation::Url {
+                    url: "https://example.com/pkg.tar.gz".to_owned(),
+                },
+                RevisionSpec::None,
+            ),
+            ResolvePolicy::Refresh,
+        )
+        .expect("url resolve");
+        SourceStore::resolve(
+            &router,
+            &request(
+                "g",
+                SourceLocation::Git {
+                    url: "https://example.com/o/r.git".to_owned(),
+                },
+                RevisionSpec::Branch("main".into()),
+            ),
+            ResolvePolicy::Refresh,
+        )
+        .expect("git resolve");
 
         assert_eq!(
-            git.fetches.borrow().as_slice(),
+            git.resolves
+                .lock()
+                .expect("git resolve recorder")
+                .as_slice(),
             ["g"],
-            "only the git-mode source `g` may reach the git backend's fetch"
+            "only the git-mode source `g` may reach the Git store's resolve"
         );
         assert_eq!(
-            http.fetches.borrow().as_slice(),
+            http.resolves
+                .lock()
+                .expect("HTTP resolve recorder")
+                .as_slice(),
             ["u"],
-            "only the url-mode source `u` may reach the http backend's fetch"
-        );
-        assert_eq!(
-            git.resolves.borrow().as_slice(),
-            ["g"],
-            "git-mode resolve routes to git"
-        );
-        assert_eq!(
-            http.resolves.borrow().as_slice(),
-            ["u"],
-            "url-mode resolve routes to http"
+            "only the URL-mode source `u` may reach the HTTP store's resolve"
         );
     }
 
     #[test]
-    fn list_source_leaves_routes_url_mode_to_http_and_git_mode_to_git() {
-        let mut modes = BTreeMap::new();
-        modes.insert(sn("g"), SourceMode::Git);
-        modes.insert(sn("u"), SourceMode::Url);
-        let (router, git, http) = spy_router(modes);
+    fn immutable_snapshot_inventory_uses_the_shared_git_representation() {
+        let (router, git, http) = spy_router();
 
-        router
-            .list_source_leaves(&sn("g"), "https://example.com/o/r.git", "c", None)
-            .expect("git leaf walk");
-        router
-            .list_source_leaves(&sn("u"), "https://example.com/pkg.tar.gz", "c", None)
-            .expect("url leaf walk");
+        SourceStore::inventory(&router, &snapshot(), None).expect("first snapshot inventory");
+        SourceStore::inventory(&router, &snapshot(), None).expect("second snapshot inventory");
 
         assert_eq!(
-            git.leaf_walks.borrow().as_slice(),
-            ["g"],
-            "only the git-mode source `g` may reach the git backend's list_source_leaves"
+            *git.inventories.lock().expect("git inventory recorder"),
+            2,
+            "Git and URL resolutions converge on the Git snapshot representation"
         );
         assert_eq!(
-            http.leaf_walks.borrow().as_slice(),
-            ["u"],
-            "a url-mode source must route its leaf walk to the http backend, not be walked as a git tree"
+            *http.inventories.lock().expect("HTTP inventory recorder"),
+            0,
+            "the HTTP adapter imports snapshots but does not own immutable tree walks"
         );
     }
 
     #[test]
-    fn list_tree_at_always_routes_to_the_git_backend() {
-        let mut modes = BTreeMap::new();
-        modes.insert(sn("g"), SourceMode::Git);
-        modes.insert(sn("u"), SourceMode::Url);
-        let (router, git, http) = spy_router(modes);
+    fn list_directory_uses_the_shared_git_snapshot_representation() {
+        let (router, git, http) = spy_router();
 
-        router
-            .list_tree_at(&sn("g"), "https://example.com/o/r.git", "c", Path::new("d"))
-            .expect("git-mode tree listing");
-        router
-            .list_tree_at(
-                &sn("u"),
-                "https://example.com/pkg.tar.gz",
-                "c",
-                Path::new("d"),
-            )
-            .expect("url-mode tree listing still reaches the git backend");
+        SourceStore::list_directory(&router, &snapshot(), Some(&SourcePath::new("d").unwrap()))
+            .expect("first directory listing");
+        SourceStore::list_directory(&router, &snapshot(), Some(&SourcePath::new("d").unwrap()))
+            .expect("second directory listing");
 
         assert_eq!(
-            git.tree_lists.borrow().as_slice(),
-            ["g", "u"],
-            "list_tree_at is the git-only trust read path: BOTH sources (regardless of mode) \
-             must reach the git backend, never be routed by mode"
+            *git.directory_lists.lock().expect("git list recorder"),
+            2,
+            "directory listing is an immutable Git snapshot operation for both source kinds"
         );
-        assert!(
-            http.tree_lists.borrow().is_empty(),
-            "the http backend must never receive a tree listing"
+        assert_eq!(
+            *http.directory_lists.lock().expect("HTTP list recorder"),
+            0,
+            "the HTTP adapter must not receive immutable snapshot directory listings"
         );
     }
 
@@ -499,53 +464,56 @@ mod tests {
     fn git_url_ending_in_dot_git_routes_to_git_not_http() {
         // Routing must be by declared mode, never by url scheme/suffix. A `.git`
         // url under SourceMode::Git must hit the git backend, never http.
-        let mut modes = BTreeMap::new();
-        modes.insert(sn("g"), SourceMode::Git);
-        let (router, git, http) = spy_router(modes);
+        let (router, git, http) = spy_router();
 
-        router
-            .fetch(&sn("g"), "https://example.com/o/r.git")
-            .expect("git fetch");
+        SourceStore::resolve(
+            &router,
+            &request(
+                "g",
+                SourceLocation::Git {
+                    url: "https://example.com/o/r.git".to_owned(),
+                },
+                RevisionSpec::Branch("main".into()),
+            ),
+            ResolvePolicy::Refresh,
+        )
+        .expect("Git resolve");
 
         assert_eq!(
-            git.fetches.borrow().as_slice(),
+            git.resolves
+                .lock()
+                .expect("git resolve recorder")
+                .as_slice(),
             ["g"],
-            "a `.git` url declared Git-mode must route to the git backend"
+            "a `.git` URL declared Git-mode must route to the Git store"
         );
         assert!(
-            http.fetches.borrow().is_empty(),
+            http.resolves
+                .lock()
+                .expect("HTTP resolve recorder")
+                .is_empty(),
             "a `.git` url must NOT reach the http backend regardless of its scheme/suffix"
         );
     }
 
     #[test]
-    fn digest_dispatch_by_mode() {
-        let mut modes = BTreeMap::new();
-        modes.insert(sn("u"), SourceMode::Url);
-        modes.insert(sn("g"), SourceMode::Git);
-        let (router, git, http) = spy_router(modes);
+    fn digest_reads_immutable_snapshots_through_the_git_store() {
+        let (router, git, http) = spy_router();
 
-        router
-            .compute_digest(&sn("u"), "http://x/pkg.tgz", "c", None, &[], &[])
-            .expect("url digest");
-        router
-            .compute_digest(&sn("g"), "https://x/y.git", "c", None, &[], &[])
-            .expect("git digest");
-
-        assert!(
-            git.fetches.borrow().is_empty() && http.fetches.borrow().is_empty(),
-            "digest must not trigger fetch"
-        );
+        digest_snapshot(&router, &snapshot(), &[SourcePath::new("a").unwrap()])
+            .expect("first digest");
+        digest_snapshot(&router, &snapshot(), &[SourcePath::new("b").unwrap()])
+            .expect("second digest");
 
         assert_eq!(
-            http.digests.borrow().as_slice(),
-            ["u"],
-            "the url-mode source `u` must reach the http backend's compute_digest"
+            *git.reads.lock().expect("git read recorder"),
+            2,
+            "digest_snapshot reads both Git and imported URL snapshots from the Git store"
         );
         assert_eq!(
-            git.digests.borrow().as_slice(),
-            ["g"],
-            "the git-mode source `g` must reach the git backend's compute_digest"
+            *http.reads.lock().expect("HTTP read recorder"),
+            0,
+            "digest_snapshot must not send immutable reads to the HTTP importer"
         );
     }
 
@@ -553,32 +521,57 @@ mod tests {
     fn unknown_source_name_has_a_defined_route() {
         // A name absent from the modes map must resolve to the git backend (the
         // default), never panic and never silently hit http.
-        let (router, git, http) = spy_router(BTreeMap::new());
-        let _ = router.fetch(&sn("mystery"), "https://example.com/o/r.git");
+        let (router, git, http) = spy_router();
+        SourceStore::resolve(
+            &router,
+            &request(
+                "mystery",
+                SourceLocation::Git {
+                    url: "https://example.com/o/r.git".to_owned(),
+                },
+                RevisionSpec::Branch("main".into()),
+            ),
+            ResolvePolicy::CachedOnly,
+        )
+        .expect("unmapped source resolves through the default route");
         assert_eq!(
-            git.fetches.borrow().as_slice(),
+            git.resolves
+                .lock()
+                .expect("git resolve recorder")
+                .as_slice(),
             ["mystery"],
             "a source with no recorded mode must default to the git backend"
         );
         assert!(
-            http.fetches.borrow().is_empty(),
+            http.resolves
+                .lock()
+                .expect("HTTP resolve recorder")
+                .is_empty(),
             "an unmapped source must never be routed to http"
         );
     }
 
     #[test]
-    fn router_is_usable_as_dyn_source_backend() {
-        let mut modes = BTreeMap::new();
-        modes.insert(sn("g"), SourceMode::Git);
-        let (router, _git, _http) = spy_router(modes);
-        let as_dyn: &dyn SourceBackend = &router;
+    fn router_is_usable_as_dyn_source_store() {
+        let (router, _git, _http) = spy_router();
+        let as_dyn: &dyn SourceStore = &router;
         let result = as_dyn
-            .resolve(&sn("g"), "https://x/y.git", &Refspec::Branch("main".into()))
-            .expect("router is a SourceBackend so sync(&dyn SourceBackend) keeps working");
+            .resolve(
+                &request(
+                    "g",
+                    SourceLocation::Git {
+                        url: "https://x/y.git".to_owned(),
+                    },
+                    RevisionSpec::Branch("main".into()),
+                ),
+                ResolvePolicy::CachedOnly,
+            )
+            .expect("router is a SourceStore so sync(&dyn SourceStore) keeps working");
         assert_eq!(
-            result, "resolved-g",
-            "the value must come back through the vtable from the git-routed Spy, \
-             pinning runtime dispatch through &dyn SourceBackend rather than mere compilation"
+            result.name,
+            sn("g"),
+            "the typed value must come back through the vtable from the Git-routed Spy, \
+             pinning runtime dispatch through &dyn SourceStore rather than mere compilation"
         );
     }
 }

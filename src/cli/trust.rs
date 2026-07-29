@@ -11,7 +11,11 @@ use std::path::Path;
 use crate::config::transitive::TransitiveManifest;
 use crate::error::{Error, Result};
 use crate::lock::{CandidateHookRecord, Lock, TrustedHook};
-use crate::source::{GitBackend, SourceBackend, SourceError};
+use crate::source::{
+    Commit, GitBackend, ResolvePolicy, ResolveRequest, RevisionSpec, SourceDirectoryEntryKind,
+    SourceError, SourceLocation, SourcePath, SourceStore,
+};
+use crate::sync::state::StateStore;
 use crate::sync::transitive::ResolvedGraph;
 
 use super::{load_config, open_project_registry};
@@ -27,7 +31,7 @@ pub(super) fn run_trust(
 ) -> Result<()> {
     let config = load_config()?;
     let registry = open_project_registry(&config)?;
-    let _guard = registry.lock_exclusive()?;
+    let _guard = registry.acquire_lock()?;
 
     let cwd = std::env::current_dir()?;
     let cache_git = crate::paths::cache_root_for(config.paths.cache.as_deref(), &cwd)?.join("git");
@@ -328,17 +332,54 @@ fn locked_target(lock: &Lock, instance: &str, source: &str) -> Result<(String, S
 
 /// Renders a dep `path` at `commit` from the mirror, offline: a UTF-8 file as its text lines, a
 /// directory as an ls-style listing (subdirectories suffixed `/`), refusing binary content and
-/// reporting an absent path. Dispatch is by backend outcome, never by matching error strings.
+/// reporting an absent path. Dispatch is by source-capability outcome, never by matching error
+/// strings.
 pub(super) fn render_show(
-    backend: &dyn SourceBackend,
+    backend: &dyn SourceStore,
     source: &str,
     url: &str,
     commit: &str,
     path: &Path,
 ) -> Result<Vec<String>> {
     let name = crate::source::SourceName::trusted(source.to_owned());
-    match backend.read_file_at(&name, url, commit, path) {
-        Ok(bytes) => match std::str::from_utf8(&bytes) {
+    let commit_id = commit.parse::<Commit>().map_err(|_| {
+        Error::Source(format!(
+            "`{}` cannot be shown — its commit `{}` is invalid; run `phora sync` first",
+            path.display(),
+            short(commit)
+        ))
+    })?;
+    let resolved = backend
+        .resolve(
+            &ResolveRequest {
+                name,
+                location: SourceLocation::Git {
+                    url: url.to_owned(),
+                },
+                revision: RevisionSpec::Commit(commit_id),
+            },
+            ResolvePolicy::CachedOnly,
+        )
+        .map_err(|_| {
+            Error::Source(format!(
+                "`{}` cannot be shown — its commit `{}` is not in the mirror; run `phora sync` first",
+                path.display(),
+                short(commit)
+            ))
+        })?;
+    let source_path = if path.as_os_str().is_empty() {
+        None
+    } else {
+        Some(SourcePath::new(&path.to_string_lossy().replace('\\', "/"))?)
+    };
+    let read = match source_path.as_ref() {
+        Some(path) => backend.read(&resolved.snapshot, path),
+        None => Err(SourceError::RootNotFound {
+            root: Path::new("").to_path_buf(),
+        }),
+    };
+    match read {
+        Ok(entry) => match std::str::from_utf8(&entry.bytes) {
             Ok(text) => Ok(text.lines().map(str::to_owned).collect()),
             Err(_) => Err(Error::Source(format!(
                 "{} at {} is not UTF-8 text — binary content is not shown",
@@ -346,14 +387,20 @@ pub(super) fn render_show(
                 short(commit)
             ))),
         },
-        Err(_) => match backend.list_tree_at(&name, url, commit, path) {
+        Err(_) => match backend.list_directory(&resolved.snapshot, source_path.as_ref()) {
             Ok(entries) => Ok(entries
                 .into_iter()
                 .map(|e| {
-                    if e.is_dir {
-                        format!("{}/", e.name)
+                    let name = e
+                        .path
+                        .as_str()
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(e.path.as_str());
+                    if e.kind == SourceDirectoryEntryKind::Directory {
+                        format!("{name}/")
                     } else {
-                        e.name
+                        name.to_owned()
                     }
                 })
                 .collect()),
@@ -688,8 +735,12 @@ mod tests {
         );
     }
 
-    use crate::source::{SourceBackend, SourceError, TreeEntry};
-    use std::path::Path;
+    use crate::source::{
+        MirrorKey, NormalizedUrl, ResolvedRevision, ResolvedSource, SnapshotId,
+        SourceDirectoryEntry, SourceDirectoryEntryKind, SourceEntry, SourceEntryKind,
+        SourceEntryMeta, SourceError, SourceIdentity, SourceInventory, SourceTimestamp,
+    };
+    use std::path::{Path, PathBuf};
 
     /// What the mocked mirror reader should hand back for `<path>` at the pinned commit.
     enum FileOutcome {
@@ -700,36 +751,77 @@ mod tests {
     }
 
     enum TreeOutcome {
-        Entries(Vec<TreeEntry>),
+        Entries(Vec<SourceDirectoryEntry>),
         Absent,
         MirrorError,
     }
 
-    /// A `SourceBackend` whose only live methods are the two mirror reads `--show` drives;
-    /// every other port method is irrelevant to the renderer and must never be touched.
-    struct ShowBackend {
+    /// A source store whose configured outcomes exercise the offline reads `--show` drives.
+    struct ShowStore {
         file: FileOutcome,
         tree: TreeOutcome,
     }
 
-    impl SourceBackend for ShowBackend {
-        fn read_file_at(
+    impl SourceStore for ShowStore {
+        fn resolve(
             &self,
-            _source: &crate::source::SourceName,
-            _url: &str,
-            commit: &str,
-            path: &Path,
-        ) -> std::result::Result<Vec<u8>, SourceError> {
+            request: &ResolveRequest,
+            policy: ResolvePolicy,
+        ) -> std::result::Result<ResolvedSource, SourceError> {
+            assert_eq!(
+                policy,
+                ResolvePolicy::CachedOnly,
+                "`trust --show` must resolve the pinned snapshot without refreshing"
+            );
+            let SourceLocation::Git { url } = &request.location else {
+                unreachable!("`trust --show` resolves a Git mirror")
+            };
+            let RevisionSpec::Commit(commit) = &request.revision else {
+                unreachable!("`trust --show` resolves an exact lock-pinned commit")
+            };
+            let normalized = NormalizedUrl::parse(url);
+            Ok(ResolvedSource {
+                name: request.name.clone(),
+                snapshot: SnapshotId::Git {
+                    mirror: MirrorKey::from_url(&normalized),
+                    commit: commit.clone(),
+                },
+                revision: ResolvedRevision::Commit(commit.clone()),
+                authored_at: SourceTimestamp::from_unix_seconds(0),
+                normalized_location: SourceIdentity::Git(normalized),
+            })
+        }
+
+        fn inventory(
+            &self,
+            _snapshot: &SnapshotId,
+            _root: Option<&SourcePath>,
+        ) -> std::result::Result<SourceInventory, SourceError> {
+            Ok(SourceInventory::default())
+        }
+
+        fn read(
+            &self,
+            snapshot: &SnapshotId,
+            path: &SourcePath,
+        ) -> std::result::Result<SourceEntry, SourceError> {
+            let commit = snapshot.commit().as_str();
             match &self.file {
-                FileOutcome::Bytes(bytes) => Ok(bytes.clone()),
+                FileOutcome::Bytes(bytes) => Ok(SourceEntry {
+                    meta: SourceEntryMeta {
+                        path: path.clone(),
+                        kind: SourceEntryKind::File,
+                    },
+                    bytes: bytes.clone(),
+                }),
                 FileOutcome::Absent => Err(SourceError::FileAbsent {
                     source_name: "mydeps".to_owned(),
                     commit: commit.to_owned(),
-                    path: path.to_path_buf(),
+                    path: Path::new(path.as_str()).to_path_buf(),
                 }),
                 FileOutcome::NotRegular => Err(SourceError::Source(format!(
                     "{} is not a regular file",
-                    path.display()
+                    path.as_str()
                 ))),
                 FileOutcome::MirrorError => Err(SourceError::Source(format!(
                     "open mirror for {commit}: missing"
@@ -737,60 +829,21 @@ mod tests {
             }
         }
 
-        fn list_tree_at(
+        fn list_directory(
             &self,
-            _source: &crate::source::SourceName,
-            _url: &str,
-            commit: &str,
-            path: &Path,
-        ) -> std::result::Result<Vec<TreeEntry>, SourceError> {
+            snapshot: &SnapshotId,
+            path: Option<&SourcePath>,
+        ) -> std::result::Result<Vec<SourceDirectoryEntry>, SourceError> {
+            let commit = snapshot.commit().as_str();
             match &self.tree {
                 TreeOutcome::Entries(entries) => Ok(entries.clone()),
                 TreeOutcome::Absent => Err(SourceError::RootNotFound {
-                    root: path.to_path_buf(),
+                    root: path.map_or_else(PathBuf::new, |path| PathBuf::from(path.as_str())),
                 }),
                 TreeOutcome::MirrorError => Err(SourceError::Source(format!(
                     "commit {commit} in mirror: missing"
                 ))),
             }
-        }
-
-        fn fetch(
-            &self,
-            _source: &crate::source::SourceName,
-            _url: &str,
-        ) -> std::result::Result<(), SourceError> {
-            unimplemented!("`--show` is offline; it must not fetch")
-        }
-
-        fn resolve(
-            &self,
-            _source: &crate::source::SourceName,
-            _url: &str,
-            _refspec: &crate::config::Refspec,
-        ) -> std::result::Result<String, SourceError> {
-            unimplemented!("`--show` reads a pinned commit; it must not resolve refs")
-        }
-
-        fn commit_time(
-            &self,
-            _source: &crate::source::SourceName,
-            _url: &str,
-            _commit: &str,
-        ) -> std::result::Result<u64, SourceError> {
-            unimplemented!()
-        }
-
-        fn compute_digest(
-            &self,
-            _source: &crate::source::SourceName,
-            _url: &str,
-            _commit: &str,
-            _root: Option<&Path>,
-            _include: &[String],
-            _exclude: &[String],
-        ) -> std::result::Result<String, SourceError> {
-            unimplemented!()
         }
     }
 
@@ -841,7 +894,7 @@ mod tests {
 
     #[test]
     fn render_show_prints_utf8_file_contents() {
-        let backend = ShowBackend {
+        let backend = ShowStore {
             file: FileOutcome::Bytes(b"hello\nworld\n".to_vec()),
             tree: TreeOutcome::Absent,
         };
@@ -864,7 +917,7 @@ mod tests {
 
     #[test]
     fn render_show_refuses_non_utf8_binary_content() {
-        let backend = ShowBackend {
+        let backend = ShowStore {
             file: FileOutcome::Bytes(vec![0xff, 0xfe, 0x00]),
             tree: TreeOutcome::Absent,
         };
@@ -891,7 +944,7 @@ mod tests {
 
     #[test]
     fn render_show_errors_when_path_is_absent_at_commit() {
-        let backend = ShowBackend {
+        let backend = ShowStore {
             file: FileOutcome::Absent,
             tree: TreeOutcome::Absent,
         };
@@ -918,7 +971,7 @@ mod tests {
 
     #[test]
     fn render_show_directs_to_sync_when_the_mirror_or_commit_is_missing() {
-        let backend = ShowBackend {
+        let backend = ShowStore {
             file: FileOutcome::MirrorError,
             tree: TreeOutcome::MirrorError,
         };
@@ -946,20 +999,20 @@ mod tests {
 
     #[test]
     fn render_show_lists_direct_directory_entries_ls_style() {
-        let backend = ShowBackend {
+        let backend = ShowStore {
             file: FileOutcome::NotRegular,
             tree: TreeOutcome::Entries(vec![
-                TreeEntry {
-                    name: "a.txt".to_owned(),
-                    is_dir: false,
+                SourceDirectoryEntry {
+                    path: SourcePath::new("d/a.txt").expect("safe fixture path"),
+                    kind: SourceDirectoryEntryKind::File,
                 },
-                TreeEntry {
-                    name: "sub".to_owned(),
-                    is_dir: true,
+                SourceDirectoryEntry {
+                    path: SourcePath::new("d/sub").expect("safe fixture path"),
+                    kind: SourceDirectoryEntryKind::Directory,
                 },
-                TreeEntry {
-                    name: "weird name.txt".to_owned(),
-                    is_dir: false,
+                SourceDirectoryEntry {
+                    path: SourcePath::new("d/weird name.txt").expect("safe fixture path"),
+                    kind: SourceDirectoryEntryKind::File,
                 },
             ]),
         };

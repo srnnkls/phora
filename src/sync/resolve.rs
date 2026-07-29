@@ -5,15 +5,24 @@ use rayon::prelude::*;
 use crate::config::{Config, DeployMode, ParsedSource, Refspec, SourceMode};
 use crate::error::Result;
 use crate::lock::{Lock, LockedSource, encode_ref, entry_matches, ref_discriminator};
-use crate::source::SourceName;
-use crate::source::{MirrorKey, NormalizedUrl, SourceBackend, read_local_head};
+use crate::projection::offer::OfferSelection;
+use crate::source::{
+    Commit, MirrorKey, NormalizedUrl, ResolvePolicy, ResolveRequest, ResolvedRevision,
+    ResolvedSource, RevisionSpec, SnapshotId, SourceDirectoryEntry, SourceEntry, SourceError,
+    SourceInventory, SourceLocation, SourceName, SourcePath, SourceStore, digest_snapshot,
+};
 
 use super::{effective_protocol, remote_for};
 
-pub type RoutedSources = (
-    Vec<(String, LockedSource)>,
-    BTreeMap<(String, String), String>,
-);
+type SourceResult<T> = std::result::Result<T, SourceError>;
+
+pub struct RoutedSources {
+    pub locks: Vec<(String, LockedSource)>,
+    pub commits: BTreeMap<(String, String), String>,
+    pub resolved: ResolvedSourceMap,
+}
+
+pub type ResolvedSourceMap = BTreeMap<(String, String), ResolvedSource>;
 
 /// A distinct resolution unit: one (source, effective ref) pair to resolve and lock.
 struct Unit {
@@ -61,50 +70,38 @@ struct Resolved {
     encoded_ref: String,
     commit: String,
     locked: LockedSource,
+    source: ResolvedSource,
 }
 
-/// Concurrent fetches into one bare mirror corrupt it, so fetches sharing a
-/// [`MirrorKey`] run serially while distinct keys fetch in parallel. Git-mode
-/// fetch is idempotent (one per key); url-mode fetch validates each source's own
-/// integrity digest, so every url-mode source must fetch — deduping by key would
-/// silently bypass the second source's digest pin.
-fn fetch_distinct_mirrors(
-    config: &Config,
+/// Units sharing a mirror resolve serially; distinct mirrors resolve in parallel.
+/// URL units remain distinct within a group because each source's integrity pin
+/// must validate its own download.
+fn resolution_groups<'a>(
     parsed: &BTreeMap<String, ParsedSource>,
     remotes: &BTreeMap<String, String>,
-    effective_lock: Option<&Lock>,
-    backend: &(dyn SourceBackend + Sync),
-    force: bool,
-    units: &[Unit],
-) -> Result<()> {
-    let mut groups: BTreeMap<String, Vec<(SourceName, String)>> = BTreeMap::new();
+    units: &'a [Unit],
+) -> Result<Vec<Vec<&'a Unit>>> {
+    let mut groups: BTreeMap<String, Vec<&Unit>> = BTreeMap::new();
     for unit in units {
-        let Some(source) = parsed.get(&unit.name) else {
-            continue;
-        };
-        if source.deploy_mode() == DeployMode::Link {
+        if !parsed.contains_key(&unit.name) {
             continue;
         }
         let git = remote_for(remotes, &unit.name)?;
-        if lock_hit(config, source, unit, effective_lock, force).is_some()
-            && backend.mirror_ready(git)
-        {
-            continue;
-        }
         let key = MirrorKey::from_url(&NormalizedUrl::parse(git))
             .as_str()
             .to_owned();
-        let fetches = groups.entry(key).or_default();
-        if source.mode() == SourceMode::Url || fetches.is_empty() {
-            fetches.push((SourceName::trusted(unit.name.clone()), git.to_owned()));
-        }
+        groups.entry(key).or_default().push(unit);
     }
+    Ok(groups.into_values().collect())
+}
 
-    groups.into_par_iter().try_for_each(|(_key, fetches)| {
-        for (name, git) in &fetches {
-            backend.fetch(name, git)?;
-        }
-        Ok(())
+fn revision_spec(refspec: &Refspec) -> Result<RevisionSpec> {
+    Ok(match refspec {
+        Refspec::Branch(branch) => RevisionSpec::Branch(branch.clone()),
+        Refspec::Tag(tag) => RevisionSpec::Tag(tag.clone()),
+        Refspec::Rev(commit) => RevisionSpec::Commit(commit.parse::<Commit>()?),
+        Refspec::Default => RevisionSpec::Default,
+        Refspec::None => RevisionSpec::None,
     })
 }
 
@@ -148,22 +145,46 @@ fn resolve_unit(
     remotes: &BTreeMap<String, String>,
     instances: &BTreeMap<String, String>,
     effective_lock: Option<&Lock>,
-    backend: &(dyn SourceBackend + Sync),
+    store: &dyn SourceStore,
     force: bool,
     frozen: bool,
     unit: &Unit,
+    mirror_refreshed: &mut bool,
 ) -> Result<Option<Resolved>> {
     let Some(source) = parsed.get(&unit.name) else {
         return Ok(None);
     };
     let git = remote_for(remotes, &unit.name)?;
-    let source_name = SourceName::trusted(unit.name.clone());
+
+    let lock_entry = lock_hit(config, source, unit, effective_lock, force);
+    if lock_entry.is_none() && frozen && source.deploy_mode() != DeployMode::Link {
+        return Err(frozen_miss(&unit.name, instances.contains_key(&unit.name)));
+    }
+
+    let request = resolve_request(source, unit, git, lock_entry)?;
+    let source_resolution = resolve_source(
+        store,
+        &request,
+        source,
+        lock_entry,
+        frozen,
+        mirror_refreshed,
+    )?;
 
     if source.deploy_mode() == DeployMode::Link {
         if unit.encoded_ref != encode_ref(&source.refspec()) {
             return Ok(None);
         }
-        let commit = read_local_head(git)?;
+        let commit = match &source_resolution.revision {
+            ResolvedRevision::WorktreeHead(Some(head)) => head.to_string(),
+            ResolvedRevision::WorktreeHead(None) => "link".to_owned(),
+            ResolvedRevision::Commit(_) => {
+                return Err(crate::error::Error::Source(format!(
+                    "link source {} resolved to a git snapshot",
+                    unit.name
+                )));
+            }
+        };
         return Ok(Some(Resolved {
             name: unit.name.clone(),
             encoded_ref: unit.encoded_ref.clone(),
@@ -178,30 +199,22 @@ fn resolve_unit(
                 r#ref: None,
                 instance: instances.get(&unit.name).cloned(),
             },
+            source: source_resolution,
         }));
     }
 
     let discriminator = ref_discriminator(&unit.effective_ref, &source.refspec());
-    let commit = match lock_hit(config, source, unit, effective_lock, force) {
-        Some(l) => l.commit.clone(),
-        None if frozen => {
-            return Err(frozen_miss(&unit.name, instances.contains_key(&unit.name)));
+    let commit = match &source_resolution.revision {
+        ResolvedRevision::Commit(commit) => commit.to_string(),
+        ResolvedRevision::WorktreeHead(_) => {
+            return Err(crate::error::Error::Source(format!(
+                "copy source {} resolved to a worktree snapshot",
+                unit.name
+            )));
         }
-        None => backend.resolve(&source_name, git, &unit.effective_ref)?,
     };
 
-    let digest = if source.mode() == SourceMode::Url {
-        backend.compute_digest(&source_name, git, &commit, None, &[], &[])?
-    } else {
-        backend.compute_digest(
-            &source_name,
-            git,
-            &commit,
-            source.root.as_deref(),
-            source.includes(),
-            source.excludes(),
-        )?
-    };
+    let digest = selected_source_digest(store, &source_resolution, source)?;
 
     let resolved = if source.mode() == SourceMode::Url {
         "url".to_owned()
@@ -222,7 +235,166 @@ fn resolve_unit(
             r#ref: discriminator,
             instance: instances.get(&unit.name).cloned(),
         },
+        source: source_resolution,
     }))
+}
+
+fn resolve_request(
+    source: &ParsedSource,
+    unit: &Unit,
+    git: &str,
+    lock_entry: Option<&LockedSource>,
+) -> Result<ResolveRequest> {
+    let revision = match lock_entry {
+        Some(locked) => RevisionSpec::Commit(locked.commit.parse::<Commit>()?),
+        None if source.deploy_mode() == DeployMode::Link => RevisionSpec::Default,
+        None => revision_spec(&unit.effective_ref)?,
+    };
+    let location = match source.deploy_mode() {
+        DeployMode::Link => SourceLocation::Worktree { root: git.into() },
+        DeployMode::Copy if source.mode() == SourceMode::Url => SourceLocation::Url {
+            url: git.to_owned(),
+        },
+        DeployMode::Copy => SourceLocation::Git {
+            url: git.to_owned(),
+        },
+    };
+    Ok(ResolveRequest {
+        name: SourceName::trusted(unit.name.clone()),
+        location,
+        revision,
+    })
+}
+
+fn resolve_source(
+    store: &dyn SourceStore,
+    request: &ResolveRequest,
+    source: &ParsedSource,
+    lock_entry: Option<&LockedSource>,
+    frozen: bool,
+    mirror_refreshed: &mut bool,
+) -> Result<ResolvedSource> {
+    if source.deploy_mode() == DeployMode::Link {
+        return store
+            .resolve(request, ResolvePolicy::CachedOnly)
+            .map_err(Into::into);
+    }
+    let resolved = if lock_entry.is_some() {
+        match store.resolve(request, ResolvePolicy::CachedOnly) {
+            Ok(resolved) => return Ok(resolved),
+            Err(error) if frozen => return Err(error.into()),
+            Err(_) => store.resolve(request, ResolvePolicy::Refresh)?,
+        }
+    } else if source.mode() == SourceMode::Url || !*mirror_refreshed {
+        store.resolve(request, ResolvePolicy::Refresh)?
+    } else {
+        return store
+            .resolve(request, ResolvePolicy::CachedOnly)
+            .map_err(Into::into);
+    };
+    *mirror_refreshed = true;
+    Ok(resolved)
+}
+
+fn selected_source_digest(
+    store: &dyn SourceStore,
+    resolved: &ResolvedSource,
+    source: &ParsedSource,
+) -> Result<String> {
+    let inventory = store.inventory(&resolved.snapshot, None)?;
+    let root = (source.mode() != SourceMode::Url)
+        .then_some(source.root.as_deref())
+        .flatten();
+    let selection = OfferSelection::compile(
+        if source.mode() == SourceMode::Url {
+            &[]
+        } else {
+            source.includes()
+        },
+        if source.mode() == SourceMode::Url {
+            &[]
+        } else {
+            source.excludes()
+        },
+        root,
+    )?;
+    let candidates: Vec<&str> = inventory
+        .entries
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect();
+    let leaves = selection
+        .select(&candidates)
+        .into_iter()
+        .map(|path| SourcePath::new(&path))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    match root {
+        Some(root) => {
+            let root = SourcePath::new(&root.to_string_lossy().replace('\\', "/"))?;
+            digest_snapshot(
+                &RootedSnapshotStore { store, root },
+                &resolved.snapshot,
+                &leaves,
+            )
+            .map_err(Into::into)
+        }
+        None => digest_snapshot(store, &resolved.snapshot, &leaves).map_err(Into::into),
+    }
+}
+
+struct RootedSnapshotStore<'a> {
+    store: &'a dyn SourceStore,
+    root: SourcePath,
+}
+
+impl RootedSnapshotStore<'_> {
+    fn rooted(
+        &self,
+        path: &SourcePath,
+    ) -> std::result::Result<SourcePath, crate::source::KernelError> {
+        SourcePath::new(&format!("{}/{}", self.root.as_str(), path.as_str()))
+    }
+}
+
+impl SourceStore for RootedSnapshotStore<'_> {
+    fn resolve(
+        &self,
+        request: &ResolveRequest,
+        policy: ResolvePolicy,
+    ) -> SourceResult<ResolvedSource> {
+        self.store.resolve(request, policy)
+    }
+
+    fn inventory(
+        &self,
+        snapshot: &SnapshotId,
+        root: Option<&SourcePath>,
+    ) -> SourceResult<SourceInventory> {
+        let root = match root {
+            Some(root) => self.rooted(root)?,
+            None => self.root.clone(),
+        };
+        self.store.inventory(snapshot, Some(&root))
+    }
+
+    fn read(&self, snapshot: &SnapshotId, path: &SourcePath) -> SourceResult<SourceEntry> {
+        let rooted = self.rooted(path)?;
+        let mut entry = self.store.read(snapshot, &rooted)?;
+        entry.meta.path = path.clone();
+        Ok(entry)
+    }
+
+    fn list_directory(
+        &self,
+        snapshot: &SnapshotId,
+        path: Option<&SourcePath>,
+    ) -> SourceResult<Vec<SourceDirectoryEntry>> {
+        let path = match path {
+            Some(path) => self.rooted(path)?,
+            None => self.root.clone(),
+        };
+        self.store.list_directory(snapshot, Some(&path))
+    }
 }
 
 /// Default rayon pool size when `--jobs` is unset: one thread per unit, capped at
@@ -242,12 +414,13 @@ pub(super) fn resolve_sources(
     remotes: &BTreeMap<String, String>,
     instances: &BTreeMap<String, String>,
     effective_lock: Option<&Lock>,
-    backend: &(dyn SourceBackend + Sync),
+    store: &dyn SourceStore,
     force: bool,
     frozen: bool,
     jobs: Option<usize>,
 ) -> Result<RoutedSources> {
     let units = resolution_units(config, parsed);
+    let groups = resolution_groups(parsed, remotes, &units)?;
 
     let cores = std::thread::available_parallelism().map_or(8, std::num::NonZero::get);
     let threads = jobs
@@ -259,42 +432,49 @@ pub(super) fn resolve_sources(
         .map_err(|e| crate::error::Error::Source(e.to_string()))?;
 
     pool.install(|| -> Result<RoutedSources> {
-        if !frozen {
-            fetch_distinct_mirrors(
-                config,
-                parsed,
-                remotes,
-                effective_lock,
-                backend,
-                force,
-                &units,
-            )?;
-        }
-
-        let resolved: Vec<Option<Resolved>> = units
-            .par_iter()
-            .map(|unit| {
-                resolve_unit(
-                    config,
-                    parsed,
-                    remotes,
-                    instances,
-                    effective_lock,
-                    backend,
-                    force,
-                    frozen,
-                    unit,
-                )
+        let resolved: Vec<Option<Resolved>> = groups
+            .into_par_iter()
+            .map(|units| {
+                let mut mirror_refreshed = false;
+                units
+                    .into_iter()
+                    .map(|unit| {
+                        resolve_unit(
+                            config,
+                            parsed,
+                            remotes,
+                            instances,
+                            effective_lock,
+                            store,
+                            force,
+                            frozen,
+                            unit,
+                            &mut mirror_refreshed,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
 
         let mut routed = Vec::new();
         let mut resolved_commits = BTreeMap::new();
+        let mut resolved_sources = BTreeMap::new();
         for entry in resolved.into_iter().flatten() {
-            resolved_commits.insert((entry.name.clone(), entry.encoded_ref), entry.commit);
+            resolved_commits.insert(
+                (entry.name.clone(), entry.encoded_ref),
+                entry.commit.clone(),
+            );
+            resolved_sources.insert((entry.name.clone(), entry.commit), entry.source);
             routed.push((entry.name, entry.locked));
         }
-        Ok((routed, resolved_commits))
+        Ok(RoutedSources {
+            locks: routed,
+            commits: resolved_commits,
+            resolved: resolved_sources,
+        })
     })
 }
 
@@ -304,7 +484,7 @@ pub fn resolve_sources_for_bench(
     parsed: &BTreeMap<String, ParsedSource>,
     remotes: &BTreeMap<String, String>,
     effective_lock: Option<&Lock>,
-    backend: &(dyn SourceBackend + Sync),
+    store: &dyn SourceStore,
     force: bool,
     jobs: Option<usize>,
 ) -> Result<RoutedSources> {
@@ -314,7 +494,7 @@ pub fn resolve_sources_for_bench(
         remotes,
         &BTreeMap::new(),
         effective_lock,
-        backend,
+        store,
         force,
         false,
         jobs,

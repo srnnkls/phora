@@ -3,7 +3,9 @@
 use std::path::Path;
 use std::str::FromStr;
 
-use phora::kernel::{Commit, Digest, RelPath};
+use phora::digest::Digest;
+use phora::paths::RelPath;
+use phora::source::Commit;
 
 const SHA256_HEX: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const BLAKE3_HEX: &str = "2316b2c05d3f72e93270833746381341b70a008daf5af59a2ddb2a8c83206bc0";

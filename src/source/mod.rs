@@ -1,4 +1,4 @@
-//! Source port (`SourceBackend`) and its git adapter (`GitBackend`).
+//! Immutable source resolution, inventories, reads, and directory listings.
 
 mod archive;
 mod cache;
@@ -21,9 +21,12 @@ pub use model::{
     Commit, KernelError, SourceEntryKind, SourceEntryMeta, SourceInventory, SourceName, SourcePath,
 };
 pub(crate) use model::{safe_component, safe_relpath};
-pub use resolve::resolve_worktree;
 pub use router::RouterBackend;
-pub use snapshot::{ResolvedSource, SnapshotId, SourceEntry, SourceStore};
+pub use snapshot::{
+    CanonicalSourceRoot, ResolvePolicy, ResolveRequest, ResolvedRevision, ResolvedSource,
+    RevisionSpec, SnapshotId, SourceDirectoryEntry, SourceDirectoryEntryKind, SourceEntry,
+    SourceIdentity, SourceLocation, SourceStore, SourceTimestamp, digest_snapshot,
+};
 pub use worktree::{capture_worktree, is_local_path, read_local_head};
 
 use std::collections::BTreeMap;
@@ -33,7 +36,7 @@ use thiserror::Error;
 
 use crate::config::Refspec;
 
-/// Errors owned by the source context (`SourceBackend` and its adapters).
+/// Errors owned by the source capability.
 #[derive(Debug, Error)]
 pub enum SourceError {
     #[error("io error: {0}")]
@@ -138,103 +141,6 @@ impl Default for ExportPolicy {
     }
 }
 
-/// A direct child of a tree, for the shallow ls-style listing of `phora trust --show <dir>`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TreeEntry {
-    pub name: String,
-    pub is_dir: bool,
-}
-
-/// `source` is the human name (diagnostics); `url` identifies the bare mirror,
-/// keyed by normalized-URL hash.
-pub trait SourceBackend {
-    fn fetch(&self, source: &SourceName, url: &str) -> Result<()>;
-
-    /// Whether a valid local mirror for `url` exists, letting a locked source skip
-    /// the fetch. A missing or corrupt mirror returns `false` so the caller still
-    /// fetches on a lock hit after the mirror cache was cleared. The default assumes
-    /// no mirror; only mirror-backed backends override it.
-    fn mirror_ready(&self, _url: &str) -> bool {
-        false
-    }
-
-    /// Reads `path` from the already-fetched mirror at `commit`, offline. Mirror
-    /// reads are git-only; the default errs unsupported and only `GitBackend` overrides it.
-    ///
-    /// # Errors
-    /// - the mirror was never fetched, `commit` is unknown, or `path` is absent at `commit`.
-    fn read_file_at(
-        &self,
-        _source: &SourceName,
-        _url: &str,
-        _commit: &str,
-        _path: &Path,
-    ) -> Result<Vec<u8>> {
-        Err(SourceError::Source(
-            "read_file_at is unsupported on this backend: mirror reads are git-only".to_owned(),
-        ))
-    }
-
-    /// Every blob path in the subtree at `root`, forward-slashed, sorted, and
-    /// root-relative, with no selection applied; the default errs unsupported and
-    /// only `GitBackend` overrides it.
-    ///
-    /// # Errors
-    /// - the mirror was never fetched, `commit` is unknown, or `root` is absent at `commit`.
-    fn list_source_leaves(
-        &self,
-        _source: &SourceName,
-        _url: &str,
-        _commit: &str,
-        _root: Option<&Path>,
-    ) -> Result<Vec<String>> {
-        Err(SourceError::Source(
-            "list_source_leaves is unsupported on this backend: mirror reads are git-only"
-                .to_owned(),
-        ))
-    }
-
-    /// The direct children of the subtree at `path` (empty path means the repo root),
-    /// shallow and sorted by leaf name; the default errs unsupported and only
-    /// `GitBackend` overrides it.
-    ///
-    /// # Errors
-    /// - the mirror was never fetched, `commit` is unknown, or `path` is absent at `commit`.
-    fn list_tree_at(
-        &self,
-        _source: &SourceName,
-        _url: &str,
-        _commit: &str,
-        _path: &Path,
-    ) -> Result<Vec<TreeEntry>> {
-        Err(SourceError::Source(
-            "list_tree_at is unsupported on this backend: mirror reads are git-only".to_owned(),
-        ))
-    }
-
-    fn resolve(&self, source: &SourceName, url: &str, refspec: &Refspec) -> Result<String>;
-
-    fn commit_time(&self, source: &SourceName, url: &str, commit: &str) -> Result<u64>;
-
-    /// Blake3 fingerprint of the offer-selected subtree at the resolved commit — the
-    /// selected source bytes, not the deploy/artifact set.
-    ///
-    /// Filters by the offer's gitignore-style include/exclude (`OfferSelection`),
-    /// hashing each selected leaf framed by its root-relative path.
-    ///
-    /// The value written to `LockedSource::digest`; lock reuse is decided by
-    /// `lock::source_matches`, not by comparing this digest.
-    fn compute_digest(
-        &self,
-        source: &SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        include: &[String],
-        exclude: &[String],
-    ) -> Result<String>;
-}
-
 /// Canonical git URL: equivalent forms collapse to one mirror key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedUrl(String);
@@ -334,9 +240,75 @@ mod tests {
         SourceName::trusted(name)
     }
 
+    fn git_request(name: &str, url: &str, revision: RevisionSpec) -> ResolveRequest {
+        ResolveRequest {
+            name: sn(name),
+            location: SourceLocation::Git {
+                url: url.to_owned(),
+            },
+            revision,
+        }
+    }
+
+    fn url_request(name: &str, url: &str) -> ResolveRequest {
+        ResolveRequest {
+            name: sn(name),
+            location: SourceLocation::Url {
+                url: url.to_owned(),
+            },
+            revision: RevisionSpec::None,
+        }
+    }
+
+    fn refresh_git(
+        backend: &GitBackend,
+        name: &str,
+        url: &str,
+        revision: RevisionSpec,
+    ) -> Result<ResolvedSource> {
+        SourceStore::resolve(
+            backend,
+            &git_request(name, url, revision),
+            ResolvePolicy::Refresh,
+        )
+    }
+
+    fn cached_git(
+        backend: &GitBackend,
+        name: &str,
+        url: &str,
+        revision: RevisionSpec,
+    ) -> Result<ResolvedSource> {
+        SourceStore::resolve(
+            backend,
+            &git_request(name, url, revision),
+            ResolvePolicy::CachedOnly,
+        )
+    }
+
+    fn refresh_url(backend: &HttpBackend, name: &str, url: &str) -> Result<ResolvedSource> {
+        SourceStore::resolve(backend, &url_request(name, url), ResolvePolicy::Refresh)
+    }
+
+    fn snapshot_at(
+        backend: &GitBackend,
+        name: &str,
+        url: &str,
+        commit: &str,
+    ) -> Result<ResolvedSource> {
+        cached_git(
+            backend,
+            name,
+            url,
+            RevisionSpec::Commit(commit.parse().map_err(|error| {
+                SourceError::Source(format!("invalid fixture commit: {error}"))
+            })?),
+        )
+    }
+
     /// Author time on the tagged (first) commit; deliberately != committer time.
     const TAGGED_AUTHOR_TIME: u64 = 1_700_000_000;
-    /// Committer time on the tagged commit; `commit_time` must NOT return this.
+    /// Committer time on the tagged commit; `ResolvedSource.authored_at` must NOT return this.
     const TAGGED_COMMITTER_TIME: u64 = 1_800_000_000;
     /// Well-formed 40-hex SHA that is guaranteed absent from the repo.
     const ABSENT_SHA: &str = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
@@ -376,8 +348,8 @@ mod tests {
         author_date: &str,
         committer_date: &str,
     ) -> std::process::Output {
-        crate::store::assert_git_sandboxed(cwd);
-        let _serial = crate::store::guard_git_fork();
+        crate::sync::state::locking::assert_git_sandboxed(cwd);
+        let _serial = crate::sync::state::locking::guard_git_fork();
         let out = Command::new("git")
             .args(args)
             .current_dir(cwd)
@@ -483,7 +455,7 @@ mod tests {
         run_git(src_path, &["branch", "-D", "orphanbranch"]);
 
         let is_ancestor_of_main = {
-            let _serial = crate::store::guard_git_fork();
+            let _serial = crate::sync::state::locking::guard_git_fork();
             Command::new("git")
                 .args(["merge-base", "--is-ancestor", &orphan_sha, "main"])
                 .current_dir(src_path)
@@ -497,7 +469,7 @@ mod tests {
         );
 
         let is_ancestor_of_develop = {
-            let _serial = crate::store::guard_git_fork();
+            let _serial = crate::sync::state::locking::guard_git_fork();
             Command::new("git")
                 .args(["merge-base", "--is-ancestor", &orphan_sha, "develop"])
                 .current_dir(src_path)
@@ -644,18 +616,71 @@ mod tests {
         export_fixture_from(src, commit)
     }
 
+    struct RootedTestStore<'a> {
+        inner: &'a GitBackend,
+        root: &'a str,
+    }
+
+    impl SourceStore for RootedTestStore<'_> {
+        fn resolve(
+            &self,
+            request: &ResolveRequest,
+            policy: ResolvePolicy,
+        ) -> Result<ResolvedSource> {
+            SourceStore::resolve(self.inner, request, policy)
+        }
+
+        fn inventory(
+            &self,
+            snapshot: &SnapshotId,
+            root: Option<&SourcePath>,
+        ) -> Result<SourceInventory> {
+            SourceStore::inventory(self.inner, snapshot, root)
+        }
+
+        fn read(&self, snapshot: &SnapshotId, path: &SourcePath) -> Result<SourceEntry> {
+            let rooted = SourcePath::new(&format!("{}/{}", self.root, path.as_str()))?;
+            let mut entry = SourceStore::read(self.inner, snapshot, &rooted)?;
+            entry.meta.path = path.clone();
+            Ok(entry)
+        }
+
+        fn list_directory(
+            &self,
+            snapshot: &SnapshotId,
+            path: Option<&SourcePath>,
+        ) -> Result<Vec<SourceDirectoryEntry>> {
+            SourceStore::list_directory(self.inner, snapshot, path)
+        }
+    }
+
     fn digest_of_art(fixture: &ExportFixture) -> String {
-        fixture
-            .backend
-            .compute_digest(
-                &sn("src"),
-                &fixture.url,
-                &fixture.commit,
-                Some(Path::new("art")),
-                &[],
-                &[],
-            )
-            .expect("digest computes over the art subtree")
+        let resolved = refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Commit(fixture.commit.parse().expect("fixture commit is valid")),
+        )
+        .expect("refresh and resolve artifact fixture");
+        let leaves: Vec<SourcePath> = SourceStore::inventory(
+            &fixture.backend,
+            &resolved.snapshot,
+            Some(&SourcePath::new("art").expect("safe fixture root")),
+        )
+        .expect("inventory art subtree")
+        .entries
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect();
+        digest_snapshot(
+            &RootedTestStore {
+                inner: &fixture.backend,
+                root: "art",
+            },
+            &resolved.snapshot,
+            &leaves,
+        )
+        .expect("digest computes over the art subtree")
     }
 
     fn init_export_repo(src_path: &Path) {
@@ -666,7 +691,7 @@ mod tests {
     }
 
     #[test]
-    fn list_source_leaves_under_a_root_yields_root_relative_leaves_without_the_root_prefix() {
+    fn inventory_under_a_root_yields_root_relative_leaves_without_the_root_prefix() {
         let src = TempDir::new().expect("leaf-root src tempdir");
         let src_path = src.path();
         init_export_repo(src_path);
@@ -682,20 +707,23 @@ mod tests {
         let commit = commit_export_repo(src_path);
 
         let fixture = export_fixture_from(src, commit);
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch builds the mirror the leaf walk reads");
-
-        let leaves = fixture
-            .backend
-            .list_source_leaves(
-                &sn("src"),
-                &fixture.url,
-                &fixture.commit,
-                Some(Path::new("art")),
-            )
-            .expect("leaf walk under root = art succeeds");
+        let resolved = refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Commit(fixture.commit.parse().expect("fixture commit is valid")),
+        )
+        .expect("refresh builds and resolves the mirror");
+        let leaves: Vec<String> = SourceStore::inventory(
+            &fixture.backend,
+            &resolved.snapshot,
+            Some(&SourcePath::new("art").expect("safe fixture root")),
+        )
+        .expect("inventory under root = art succeeds")
+        .entries
+        .iter()
+        .map(|entry| entry.path.as_str().to_owned())
+        .collect();
 
         assert_eq!(
             leaves,
@@ -747,14 +775,17 @@ mod tests {
     }
 
     #[test]
-    fn fetch_creates_real_bare_mirror() {
+    fn refresh_creates_real_bare_mirror() {
         let fixture = build_git_fixture();
         let mirror = fixture.backend.mirror_path(&fixture.url);
 
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch clones bare mirror");
+        refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Branch("main".into()),
+        )
+        .expect("refresh clones bare mirror");
 
         assert!(mirror.exists(), "mirror dir should exist after fetch");
         assert!(
@@ -764,13 +795,16 @@ mod tests {
     }
 
     #[test]
-    fn fetch_updates_existing_mirror_with_new_commits() {
+    fn refresh_updates_existing_mirror_with_new_commits() {
         let fixture = build_git_fixture();
 
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("first fetch clones");
+        refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Branch("main".into()),
+        )
+        .expect("first refresh clones");
 
         std::fs::write(fixture.src.path().join("THIRD.md"), b"third commit\n")
             .expect("write third file");
@@ -779,80 +813,102 @@ mod tests {
         let third_sha = fixture.rev_parse("HEAD");
         assert_ne!(third_sha, fixture.head_sha, "third commit must be new");
 
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("second fetch updates existing mirror");
-
-        let resolved = fixture
-            .backend
-            .resolve(&sn("src"), &fixture.url, &Refspec::Branch("main".into()))
-            .expect("branch resolves after update fetch");
+        let resolved = refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Branch("main".into()),
+        )
+        .expect("second refresh updates and resolves the existing mirror");
 
         assert_eq!(
-            resolved, third_sha,
-            "fetch on an existing mirror must pull new commits, not no-op"
+            resolved.snapshot.commit().as_str(),
+            third_sha,
+            "refresh on an existing mirror must pull new commits, not no-op"
         );
     }
 
     #[test]
-    fn fetch_reclones_a_corrupt_canonical_mirror() {
+    fn refresh_reclones_a_corrupt_canonical_mirror() {
         let fixture = build_git_fixture();
         let mirror = fixture.backend.mirror_path(&fixture.url);
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("first fetch clones");
+        refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Branch("main".into()),
+        )
+        .expect("first refresh clones");
 
         std::fs::remove_dir_all(&mirror).expect("drop the real mirror");
         std::fs::create_dir_all(&mirror).expect("recreate an empty mirror dir");
         std::fs::write(mirror.join("garbage"), b"not a repo").expect("write garbage");
         assert!(gix::open(&mirror).is_err(), "corrupt mirror must not open");
 
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch must self-heal a corrupt mirror, not error");
+        let resolved = refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Branch("main".into()),
+        )
+        .expect("refresh must self-heal a corrupt mirror, not error");
 
         assert!(
             is_bare_repo(&mirror),
             "mirror must be a valid bare repo after self-heal"
         );
-        let resolved = fixture
-            .backend
-            .resolve(&sn("src"), &fixture.url, &Refspec::Branch("main".into()))
-            .expect("branch resolves after self-heal");
-        assert_eq!(resolved, fixture.head_sha);
+        assert_eq!(resolved.snapshot.commit().as_str(), fixture.head_sha);
     }
 
     #[test]
-    fn mirror_ready_tracks_fetch_and_a_cleared_cache() {
+    fn cached_only_tracks_refresh_and_a_cleared_cache() {
         let fixture = build_git_fixture();
         let mirror = fixture.backend.mirror_path(&fixture.url);
 
         assert!(
-            !fixture.backend.mirror_ready(&fixture.url),
+            cached_git(
+                &fixture.backend,
+                "src",
+                &fixture.url,
+                RevisionSpec::Branch("main".into())
+            )
+            .is_err(),
             "no mirror yet: not ready"
         );
 
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch clones");
+        refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Branch("main".into()),
+        )
+        .expect("refresh clones");
         assert!(
-            fixture.backend.mirror_ready(&fixture.url),
+            cached_git(
+                &fixture.backend,
+                "src",
+                &fixture.url,
+                RevisionSpec::Branch("main".into())
+            )
+            .is_ok(),
             "a freshly cloned mirror is ready"
         );
 
         std::fs::remove_dir_all(&mirror).expect("clear the mirror cache");
         assert!(
-            !fixture.backend.mirror_ready(&fixture.url),
-            "a cleared cache is not ready, forcing a re-fetch on the next lock hit"
+            cached_git(
+                &fixture.backend,
+                "src",
+                &fixture.url,
+                RevisionSpec::Branch("main".into())
+            )
+            .is_err(),
+            "a cleared cache is unavailable to CachedOnly, forcing Refresh on the next lock hit"
         );
     }
 
     #[test]
-    fn fetch_sweeps_a_stale_orphan_staging_dir() {
+    fn refresh_sweeps_a_stale_orphan_staging_dir() {
         let fixture = build_git_fixture();
         let git_dir = fixture.backend.git_dir.clone();
         std::fs::create_dir_all(&git_dir).expect("git dir");
@@ -866,10 +922,13 @@ mod tests {
             filetime::set_file_mtime(&path, stale).expect("backdate orphan past grace");
         }
 
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Branch("main".into()),
+        )
+        .expect("refresh");
 
         assert!(
             !orphan.exists(),
@@ -879,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn fetch_keeps_a_staging_dir_with_recent_inner_writes() {
+    fn refresh_keeps_a_staging_dir_with_recent_inner_writes() {
         let fixture = build_git_fixture();
         let git_dir = fixture.backend.git_dir.clone();
         std::fs::create_dir_all(&git_dir).expect("git dir");
@@ -891,10 +950,13 @@ mod tests {
         let stale = filetime::FileTime::from_unix_time(1_600_000_000, 0);
         filetime::set_file_mtime(&live, stale).expect("backdate staging root past grace");
 
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Branch("main".into()),
+        )
+        .expect("refresh");
 
         assert!(
             live.exists(),
@@ -904,13 +966,16 @@ mod tests {
     }
 
     #[test]
-    fn fetch_reclones_when_in_place_fetch_fails() {
+    fn refresh_reclones_when_in_place_refresh_fails() {
         let fixture = build_git_fixture();
         let mirror = fixture.backend.mirror_path(&fixture.url);
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("first fetch clones");
+        refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Branch("main".into()),
+        )
+        .expect("first refresh clones");
         assert!(gix::open(&mirror).is_ok(), "mirror opens after first clone");
 
         run_git(
@@ -918,38 +983,36 @@ mod tests {
             &["remote", "set-url", "origin", "/nonexistent/repo.git"],
         );
 
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch must self-heal when an in-place fetch fails, not error");
+        let resolved = refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Branch("main".into()),
+        )
+        .expect("refresh must self-heal when an in-place update fails, not error");
 
         assert!(
             is_bare_repo(&mirror),
             "mirror must be a valid bare repo after self-heal"
         );
-        let resolved = fixture
-            .backend
-            .resolve(&sn("src"), &fixture.url, &Refspec::Branch("main".into()))
-            .expect("branch resolves after self-heal");
-        assert_eq!(resolved, fixture.head_sha);
+        assert_eq!(resolved.snapshot.commit().as_str(), fixture.head_sha);
     }
 
     #[test]
     fn resolve_branch_main_returns_second_commit_not_tag() {
         let fixture = build_git_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        let resolved = refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Branch("main".into()),
+        )
+        .expect("refresh resolves the branch head");
 
-        let resolved = fixture
-            .backend
-            .resolve(&sn("src"), &fixture.url, &Refspec::Branch("main".into()))
-            .expect("branch resolves to head commit");
-
-        assert_eq!(resolved, fixture.head_sha);
+        assert_eq!(resolved.snapshot.commit().as_str(), fixture.head_sha);
         assert_ne!(
-            resolved, fixture.tag_sha,
+            resolved.snapshot.commit().as_str(),
+            fixture.tag_sha,
             "main points at the second commit, not the tagged first commit"
         );
     }
@@ -982,25 +1045,21 @@ mod tests {
     fn resolve_default_follows_remote_default_branch_when_not_main() {
         let (_src, _git_dir, backend, url, trunk_sha) = build_trunk_default_repo();
 
-        backend
-            .fetch(&sn("src"), &url)
-            .expect("fetch a repo whose default branch is trunk");
-
-        let resolved = backend
-            .resolve(&sn("src"), &url, &Refspec::Default)
+        let resolved = refresh_git(&backend, "src", &url, RevisionSpec::Default)
             .expect("Default must resolve against a repo that has no `main` branch");
 
         assert_eq!(
-            resolved, trunk_sha,
+            resolved.snapshot.commit().as_str(),
+            trunk_sha,
             "an unspecified ref must follow the repo's actual default branch (trunk), \
              not assume `main` — which does not exist here"
         );
     }
 
     #[test]
-    fn resolve_default_survives_an_incremental_fetch() {
+    fn resolve_default_survives_an_incremental_refresh() {
         let (src, _git_dir, backend, url, _first_sha) = build_trunk_default_repo();
-        backend.fetch(&sn("src"), &url).expect("first fetch");
+        refresh_git(&backend, "src", &url, RevisionSpec::Default).expect("first refresh");
 
         std::fs::write(src.path().join("SECOND.md"), b"more\n").expect("write");
         run_git(src.path(), &["add", "SECOND.md"]);
@@ -1010,16 +1069,13 @@ mod tests {
             .trim()
             .to_string();
 
-        backend
-            .fetch(&sn("src"), &url)
-            .expect("incremental fetch on the existing mirror");
-        let resolved = backend
-            .resolve(&sn("src"), &url, &Refspec::Default)
-            .expect("Default still resolves after an incremental fetch");
+        let resolved = refresh_git(&backend, "src", &url, RevisionSpec::Default)
+            .expect("Default still resolves after an incremental refresh");
 
         assert_eq!(
-            resolved, advanced,
-            "Default must track the default branch tip across an incremental fetch, \
+            resolved.snapshot.commit().as_str(),
+            advanced,
+            "Default must track the default branch tip across an incremental refresh, \
              not a stale HEAD"
         );
     }
@@ -1027,10 +1083,13 @@ mod tests {
     #[test]
     fn file_diff_between_reads_both_commits_and_reports_the_changed_path() {
         let fixture = build_git_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Branch("main".into()),
+        )
+        .expect("refresh");
 
         let changed = fixture
             .backend
@@ -1058,18 +1117,17 @@ mod tests {
     fn resolve_non_default_branch_after_first_clone() {
         let fixture = build_git_fixture();
 
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("first fetch clones bare mirror");
-
-        let resolved = fixture
-            .backend
-            .resolve(&sn("src"), &fixture.url, &Refspec::Branch("develop".into()))
-            .expect("non-default branch resolves after a single first-clone fetch");
+        let resolved = refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Branch("develop".into()),
+        )
+        .expect("non-default branch resolves after a single first-clone refresh");
 
         assert_eq!(
-            resolved, fixture.develop_sha,
+            resolved.snapshot.commit().as_str(),
+            fixture.develop_sha,
             "first clone must mirror all heads, not only the default branch"
         );
     }
@@ -1077,19 +1135,18 @@ mod tests {
     #[test]
     fn resolve_tag_returns_tagged_commit_not_head() {
         let fixture = build_git_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        let resolved = refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Tag("v1.0".into()),
+        )
+        .expect("tag resolves to tagged commit");
 
-        let resolved = fixture
-            .backend
-            .resolve(&sn("src"), &fixture.url, &Refspec::Tag("v1.0".into()))
-            .expect("tag resolves to tagged commit");
-
-        assert_eq!(resolved, fixture.tag_sha);
+        assert_eq!(resolved.snapshot.commit().as_str(), fixture.tag_sha);
         assert_ne!(
-            resolved, fixture.head_sha,
+            resolved.snapshot.commit().as_str(),
+            fixture.head_sha,
             "tag must resolve to its commit, not HEAD/main"
         );
     }
@@ -1097,18 +1154,17 @@ mod tests {
     #[test]
     fn resolve_tag_unreachable_from_any_head_after_single_fetch() {
         let fixture = build_git_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
-
-        let resolved = fixture
-            .backend
-            .resolve(&sn("src"), &fixture.url, &Refspec::Tag("v-orphan".into()))
-            .expect("a tag unreachable from every branch head resolves after one fetch");
+        let resolved = refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Tag("v-orphan".into()),
+        )
+        .expect("a tag unreachable from every branch head resolves after one refresh");
 
         assert_eq!(
-            resolved, fixture.orphan_sha,
+            resolved.snapshot.commit().as_str(),
+            fixture.orphan_sha,
             "the mirror must fetch tags, not only commits reachable from heads"
         );
     }
@@ -1116,22 +1172,17 @@ mod tests {
     #[test]
     fn resolve_rev_unreachable_from_any_head_after_single_fetch() {
         let fixture = build_git_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
-
-        let resolved = fixture
-            .backend
-            .resolve(
-                &sn("src"),
-                &fixture.url,
-                &Refspec::Rev(fixture.orphan_sha.clone()),
-            )
-            .expect("a bare sha unreachable from every head resolves after one fetch");
+        let resolved = refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Commit(fixture.orphan_sha.parse().expect("fixture commit is valid")),
+        )
+        .expect("a bare sha unreachable from every head resolves after one refresh");
 
         assert_eq!(
-            resolved, fixture.orphan_sha,
+            resolved.snapshot.commit().as_str(),
+            fixture.orphan_sha,
             "fetching tags must bring the tagged object into the mirror, not just the ref"
         );
     }
@@ -1141,84 +1192,96 @@ mod tests {
         clippy::unwrap_used,
         reason = "removing the source repo fails loudly if the fixture path is gone"
     )]
-    fn single_fetch_covers_reachable_and_unreachable_tags() {
+    fn single_refresh_covers_reachable_and_unreachable_tags() {
         let fixture = build_git_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("single fetch");
+        refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Branch("main".into()),
+        )
+        .expect("single refresh");
 
         std::fs::remove_dir_all(fixture.src.path()).unwrap();
         assert!(
-            fixture.backend.fetch(&sn("src"), &fixture.url).is_err(),
-            "guard: after removing the source repo a fresh fetch from url MUST fail; \
-             otherwise this test cannot prove the single fetch was self-contained"
+            refresh_git(
+                &fixture.backend,
+                "src",
+                &fixture.url,
+                RevisionSpec::Branch("main".into())
+            )
+            .is_err(),
+            "guard: after removing the source repo Refresh MUST fail; \
+             otherwise this test cannot prove the first refresh was self-contained"
         );
 
-        let reachable = fixture
-            .backend
-            .resolve(&sn("src"), &fixture.url, &Refspec::Tag("v1.0".into()))
-            .expect(
-                "reachable tag resolves from the mirror after the remote is gone — \
+        let reachable = cached_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Tag("v1.0".into()),
+        )
+        .expect(
+            "reachable tag resolves from the mirror after the remote is gone — \
                  no hidden refetch needed",
-            );
-        let unreachable = fixture
-            .backend
-            .resolve(&sn("src"), &fixture.url, &Refspec::Tag("v-orphan".into()))
-            .expect(
-                "unreachable tag resolves from the mirror after the remote is gone; \
+        );
+        let unreachable = cached_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Tag("v-orphan".into()),
+        )
+        .expect(
+            "unreachable tag resolves from the mirror after the remote is gone; \
                  if resolve relied on a fallback fetch-on-miss this would fail, \
                  proving one fetch per source was NOT achieved",
-            );
-        let orphan_rev = fixture
-            .backend
-            .resolve(
-                &sn("src"),
-                &fixture.url,
-                &Refspec::Rev(fixture.orphan_sha.clone()),
-            )
-            .expect(
-                "the bare orphan sha resolves from the mirror after the remote is gone; \
+        );
+        let orphan_rev = cached_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Commit(fixture.orphan_sha.parse().expect("fixture commit is valid")),
+        )
+        .expect(
+            "the bare orphan sha resolves from the mirror after the remote is gone; \
                  the single fetch must have brought the tagged object in, not just the ref",
-            );
+        );
 
-        assert_eq!(reachable, fixture.tag_sha);
-        assert_eq!(unreachable, fixture.orphan_sha);
-        assert_eq!(orphan_rev, fixture.orphan_sha);
+        assert_eq!(reachable.snapshot.commit().as_str(), fixture.tag_sha);
+        assert_eq!(unreachable.snapshot.commit().as_str(), fixture.orphan_sha);
+        assert_eq!(orphan_rev.snapshot.commit().as_str(), fixture.orphan_sha);
     }
 
     #[test]
     fn resolve_rev_returns_same_sha() {
         let fixture = build_git_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
+        let resolved = refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Commit(fixture.head_sha.parse().expect("fixture commit is valid")),
+        )
+        .expect("rev resolves to itself");
 
-        let resolved = fixture
-            .backend
-            .resolve(
-                &sn("src"),
-                &fixture.url,
-                &Refspec::Rev(fixture.head_sha.clone()),
-            )
-            .expect("rev resolves to itself");
-
-        assert_eq!(resolved, fixture.head_sha);
+        assert_eq!(resolved.snapshot.commit().as_str(), fixture.head_sha);
     }
 
     #[test]
     fn resolve_rev_for_absent_sha_errors() {
         let fixture = build_git_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
-
-        let result =
-            fixture
-                .backend
-                .resolve(&sn("src"), &fixture.url, &Refspec::Rev(ABSENT_SHA.into()));
+        refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Branch("main".into()),
+        )
+        .expect("seed mirror");
+        let result = cached_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Commit(ABSENT_SHA.parse().expect("absent SHA is valid")),
+        );
 
         assert!(
             result.is_err(),
@@ -1229,51 +1292,57 @@ mod tests {
     #[test]
     fn resolve_nonexistent_branch_errors() {
         let fixture = build_git_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
-
-        let result =
-            fixture
-                .backend
-                .resolve(&sn("src"), &fixture.url, &Refspec::Branch("nope".into()));
+        refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Branch("main".into()),
+        )
+        .expect("seed mirror");
+        let result = cached_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Branch("nope".into()),
+        );
 
         assert!(result.is_err(), "missing branch must error");
     }
 
     #[test]
-    fn resolve_without_fetch_errors() {
+    fn cached_only_without_refresh_errors() {
         let fixture = build_git_fixture();
 
-        let result =
-            fixture
-                .backend
-                .resolve(&sn("src"), &fixture.url, &Refspec::Branch("main".into()));
+        let result = cached_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Branch("main".into()),
+        );
 
         assert!(result.is_err(), "resolve without a mirror must error");
     }
 
     #[test]
-    fn commit_time_returns_author_time_not_committer_time() {
+    fn resolved_source_carries_author_time_not_committer_time() {
         let fixture = build_git_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
-
-        let time = fixture
-            .backend
-            .commit_time(&sn("src"), &fixture.url, &fixture.tag_sha)
-            .expect("commit time resolves");
+        let time = refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Tag("v1.0".into()),
+        )
+        .expect("tag resolves")
+        .authored_at
+        .unix_seconds();
 
         assert_eq!(
             time, TAGGED_AUTHOR_TIME,
-            "commit_time must return the author timestamp"
+            "ResolvedSource.authored_at must return the author timestamp"
         );
         assert_ne!(
             time, TAGGED_COMMITTER_TIME,
-            "commit_time must NOT return the committer timestamp"
+            "ResolvedSource.authored_at must NOT return the committer timestamp"
         );
     }
 
@@ -1326,7 +1395,7 @@ mod tests {
     }
 
     #[test]
-    fn fetch_blocks_on_held_per_mirror_lock_then_succeeds_when_released() {
+    fn refresh_blocks_on_held_per_mirror_lock_then_succeeds_when_released() {
         let fixture = build_git_fixture();
         let git_dir = fixture.backend.git_dir.clone();
         let url = fixture.url.clone();
@@ -1338,13 +1407,18 @@ mod tests {
         let backend = GitBackend::new(git_dir.clone());
         let url_for_thread = url.clone();
         let worker = std::thread::spawn(move || {
-            let result = backend.fetch(&sn("src"), &url_for_thread);
-            tx.send(result).expect("send fetch result");
+            let result = refresh_git(
+                &backend,
+                "src",
+                &url_for_thread,
+                RevisionSpec::Branch("main".into()),
+            );
+            tx.send(result).expect("send refresh result");
         });
 
         assert!(
             rx.recv_timeout(Duration::from_millis(750)).is_err(),
-            "fetch must BLOCK while the per-mirror lock is held; it completed \
+            "Refresh must BLOCK while the per-mirror lock is held; it completed \
              within the window, so it took no blocking lock on {}",
             lock_path.display()
         );
@@ -1353,9 +1427,9 @@ mod tests {
 
         let result = rx
             .recv_timeout(Duration::from_secs(10))
-            .expect("fetch must complete promptly once the mirror lock is released");
-        worker.join().expect("fetch thread joins");
-        result.expect("fetch succeeds after waiting for the lock (blocking, not error)");
+            .expect("Refresh must complete promptly once the mirror lock is released");
+        worker.join().expect("refresh thread joins");
+        result.expect("Refresh succeeds after waiting for the lock (blocking, not error)");
 
         let mirror = mirror_path(&git_dir, &url);
         assert!(
@@ -1370,30 +1444,33 @@ mod tests {
     }
 
     #[test]
-    fn fetch_does_not_create_lock_at_mirror_path_without_locking() {
+    fn refresh_creates_the_per_mirror_lock_file() {
         let fixture = build_git_fixture();
         let git_dir = fixture.backend.git_dir.clone();
         let lock_path = mirror_lock_path(&git_dir, &fixture.url);
 
         assert!(
             !lock_path.exists(),
-            "precondition: no lock file before fetch"
+            "precondition: no lock file before Refresh"
         );
 
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch clones bare mirror");
+        refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Branch("main".into()),
+        )
+        .expect("Refresh clones bare mirror");
 
         assert!(
             lock_path.exists(),
-            "fetch must create/use the per-mirror lock file at {}",
+            "Refresh must create/use the per-mirror lock file at {}",
             lock_path.display()
         );
     }
 
     #[test]
-    fn holding_one_mirror_lock_does_not_block_fetch_of_a_different_mirror() {
+    fn holding_one_mirror_lock_does_not_block_refresh_of_a_different_mirror() {
         let fixture_a = build_git_fixture();
         let git_dir = fixture_a.backend.git_dir.clone();
 
@@ -1412,16 +1489,21 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let backend = GitBackend::new(git_dir.clone());
         let worker = std::thread::spawn(move || {
-            let result = backend.fetch(&sn("srcb"), &url_b);
-            tx.send(result).expect("send fetch-b result");
+            let result = refresh_git(
+                &backend,
+                "srcb",
+                &url_b,
+                RevisionSpec::Branch("main".into()),
+            );
+            tx.send(result).expect("send refresh-b result");
         });
 
         let result = rx.recv_timeout(Duration::from_secs(5)).expect(
-            "fetching a DIFFERENT mirror must not block on mirror A's lock; \
+            "refreshing a DIFFERENT mirror must not block on mirror A's lock; \
              the per-mirror lock must be keyed per MirrorKey",
         );
-        worker.join().expect("fetch-b thread joins");
-        result.expect("fetch of mirror B succeeds while A's lock is held");
+        worker.join().expect("refresh-b thread joins");
+        result.expect("Refresh of mirror B succeeds while A's lock is held");
 
         drop(held_a);
     }
@@ -1667,50 +1749,50 @@ path = "srnnkls/tropos"
         );
     }
 
-    // ---- read_file_at (offline mirror read; the read_manifest seam) ----
+    // ---- immutable snapshot reads (the read_manifest seam) ----
 
     #[test]
-    fn read_file_at_returns_bytes_of_a_file_present_at_the_commit() {
+    fn snapshot_read_returns_bytes_of_a_file_present_at_the_commit() {
         let fixture = build_git_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch builds the bare mirror");
-
-        let bytes = fixture
-            .backend
-            .read_file_at(
-                &sn("src"),
-                &fixture.url,
-                &fixture.head_sha,
-                Path::new("README.md"),
-            )
-            .expect("read_file_at reads a tracked file from the fetched mirror at HEAD");
+        let resolved = refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Commit(fixture.head_sha.parse().expect("fixture commit is valid")),
+        )
+        .expect("refresh builds and resolves the bare mirror");
+        let bytes = SourceStore::read(
+            &fixture.backend,
+            &resolved.snapshot,
+            &SourcePath::new("README.md").expect("safe fixture path"),
+        )
+        .expect("read returns a tracked file from the immutable snapshot")
+        .bytes;
 
         assert_eq!(
             bytes, b"hello\n",
-            "read_file_at must return the exact bytes of README.md at the commit, not a digest or path"
+            "read must return the exact bytes of README.md at the commit, not a digest or path"
         );
     }
 
     #[test]
-    fn read_file_at_errors_when_the_file_is_absent_at_that_commit() {
+    fn snapshot_read_errors_when_the_file_is_absent_at_that_commit() {
         let fixture = build_git_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch builds the bare mirror");
+        let resolved = refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Commit(fixture.tag_sha.parse().expect("fixture commit is valid")),
+        )
+        .expect("refresh builds and resolves the bare mirror");
 
         // SECOND.md was added on the second commit (head_sha); it does NOT exist at tag_sha.
-        let err = fixture
-            .backend
-            .read_file_at(
-                &sn("src"),
-                &fixture.url,
-                &fixture.tag_sha,
-                Path::new("SECOND.md"),
-            )
-            .expect_err("a file absent at the requested commit must be an error, not empty bytes");
+        let err = SourceStore::read(
+            &fixture.backend,
+            &resolved.snapshot,
+            &SourcePath::new("SECOND.md").expect("safe fixture path"),
+        )
+        .expect_err("a file absent at the requested commit must be an error, not empty bytes");
 
         let msg = err.to_string();
         assert!(
@@ -1720,18 +1802,21 @@ path = "srnnkls/tropos"
     }
 
     #[test]
-    fn read_file_at_errors_when_the_mirror_is_missing() {
+    fn snapshot_read_errors_when_the_mirror_is_missing() {
         let git_dir = TempDir::new().expect("git_dir tempdir");
         let backend = GitBackend::new(git_dir.path().to_path_buf());
 
-        let err = backend
-            .read_file_at(
-                &sn("src"),
-                "https://github.com/never/fetched.git",
-                ABSENT_SHA,
-                Path::new("phora.toml"),
-            )
-            .expect_err("reading from a mirror that was never fetched must error, not panic");
+        let normalized = NormalizedUrl::parse("https://github.com/never/fetched.git");
+        let snapshot = SnapshotId::Git {
+            mirror: MirrorKey::from_url(&normalized),
+            commit: ABSENT_SHA.parse().expect("absent SHA is valid"),
+        };
+        let err = SourceStore::read(
+            &backend,
+            &snapshot,
+            &SourcePath::new("phora.toml").expect("safe fixture path"),
+        )
+        .expect_err("reading from a mirror that was never fetched must error, not panic");
 
         assert!(
             !err.to_string().is_empty(),
@@ -1740,56 +1825,55 @@ path = "srnnkls/tropos"
     }
 
     #[test]
-    fn read_file_at_default_impl_is_unsupported_on_non_git_backend() {
+    fn cached_resolution_is_required_before_snapshot_reads() {
         let git_dir = TempDir::new().expect("git_dir tempdir");
         let http = HttpBackend::new(git_dir.path().to_path_buf(), BTreeMap::new());
 
-        let err = http
-            .read_file_at(
-                &sn("u"),
-                "https://example.com/pkg.tar.gz",
-                ABSENT_SHA,
-                Path::new("phora.toml"),
-            )
-            .expect_err(
-                "the default SourceBackend::read_file_at must error as unsupported; only GitBackend overrides it",
-            );
-
-        let msg = err.to_string().to_lowercase();
+        let err = SourceStore::resolve(
+            &http,
+            &url_request("u", "https://example.com/pkg.tar.gz"),
+            ResolvePolicy::CachedOnly,
+        )
+        .expect_err("CachedOnly must reject a URL source that was never imported");
+        let msg = err.to_string();
         assert!(
-            msg.contains("unsupported")
-                || msg.contains("not supported")
-                || msg.contains("only git"),
-            "the default read_file_at error must signal that mirror reads are git-only (unsupported), got: {msg}"
+            !msg.is_empty(),
+            "a missing immutable snapshot must retain a diagnostic"
         );
     }
 
     #[test]
-    fn read_file_at_signals_absent_distinctly_from_other_failures() {
+    fn snapshot_read_signals_absent_distinctly_from_other_failures() {
         let fixture = build_git_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch builds the bare mirror");
+        let resolved = refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Commit(fixture.tag_sha.parse().expect("fixture commit is valid")),
+        )
+        .expect("refresh builds and resolves the bare mirror");
 
-        let absent = fixture
-            .backend
-            .read_file_at(
-                &sn("src"),
-                &fixture.url,
-                &fixture.tag_sha,
-                Path::new("SECOND.md"),
-            )
-            .expect_err("an absent file must error");
+        let absent = SourceStore::read(
+            &fixture.backend,
+            &resolved.snapshot,
+            &SourcePath::new("SECOND.md").expect("safe fixture path"),
+        )
+        .expect_err("an absent file must error");
         assert!(
             matches!(absent, SourceError::FileAbsent { .. }),
             "an absent entry must surface as FileAbsent so callers can stay silent, got: {absent:?}"
         );
 
-        let other = fixture
-            .backend
-            .read_file_at(&sn("src"), &fixture.url, ABSENT_SHA, Path::new("README.md"))
-            .expect_err("an unknown commit must error");
+        let other_snapshot = SnapshotId::Git {
+            mirror: resolved.snapshot.mirror().clone(),
+            commit: ABSENT_SHA.parse().expect("absent SHA is valid"),
+        };
+        let other = SourceStore::read(
+            &fixture.backend,
+            &other_snapshot,
+            &SourcePath::new("README.md").expect("safe fixture path"),
+        )
+        .expect_err("an unknown commit must error");
         assert!(
             !matches!(other, SourceError::FileAbsent { .. }),
             "a git/commit failure must NOT be mislabelled as an absent file, got: {other:?}"
@@ -1797,7 +1881,7 @@ path = "srnnkls/tropos"
     }
 
     #[test]
-    fn read_file_at_errors_clearly_when_entry_is_a_tree_not_a_blob() {
+    fn snapshot_read_errors_clearly_when_entry_is_a_tree_not_a_blob() {
         let src = TempDir::new().expect("src tempdir");
         let src_path = src.path();
         run_git(src_path, &["init", "-b", "main", "."]);
@@ -1815,11 +1899,19 @@ path = "srnnkls/tropos"
         let git_dir = TempDir::new().expect("git_dir tempdir");
         let backend = GitBackend::new(git_dir.path().to_path_buf());
         let url = src_path.to_string_lossy().into_owned();
-        backend.fetch(&sn("src"), &url).expect("fetch mirror");
-
-        let err = backend
-            .read_file_at(&sn("src"), &url, &commit, Path::new("nested"))
-            .expect_err("a directory entry must not be returned as file bytes");
+        let resolved = refresh_git(
+            &backend,
+            "src",
+            &url,
+            RevisionSpec::Commit(commit.parse().expect("fixture commit is valid")),
+        )
+        .expect("refresh mirror");
+        let err = SourceStore::read(
+            &backend,
+            &resolved.snapshot,
+            &SourcePath::new("nested").expect("safe fixture path"),
+        )
+        .expect_err("a directory entry must not be returned as file bytes");
         let msg = err.to_string();
         assert!(
             msg.contains("nested"),
@@ -1831,7 +1923,7 @@ path = "srnnkls/tropos"
         );
     }
 
-    // ---- list_tree_at (shallow ls-style listing for `trust --show <dir>`) ----
+    // ---- list_directory (shallow ls-style listing for `trust --show <dir>`) ----
 
     fn build_tree_fixture() -> ExportFixture {
         let src = TempDir::new().expect("tree src tempdir");
@@ -1848,73 +1940,98 @@ path = "srnnkls/tropos"
         let commit = commit_export_repo(src_path);
 
         let fixture = export_fixture_from(src, commit);
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch builds the mirror the tree listing reads");
+        refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Commit(fixture.commit.parse().expect("fixture commit is valid")),
+        )
+        .expect("refresh builds the mirror the directory listing reads");
         fixture
     }
 
     #[test]
-    fn list_tree_at_yields_only_the_direct_children_of_the_directory() {
+    fn list_directory_yields_only_the_direct_children_of_the_directory() {
         let fixture = build_tree_fixture();
+        let resolved = snapshot_at(&fixture.backend, "src", &fixture.url, &fixture.commit)
+            .expect("resolve fixture snapshot");
 
-        let entries = fixture
-            .backend
-            .list_tree_at(&sn("src"), &fixture.url, &fixture.commit, Path::new("d"))
-            .expect("list_tree_at lists the direct children of `d` at the commit");
+        let entries = SourceStore::list_directory(
+            &fixture.backend,
+            &resolved.snapshot,
+            Some(&SourcePath::new("d").expect("safe fixture path")),
+        )
+        .expect("list_directory lists the direct children of `d` at the commit");
 
-        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .path
+                    .as_str()
+                    .rsplit_once('/')
+                    .map_or(entry.path.as_str(), |(_, name)| name)
+            })
+            .collect();
         assert_eq!(
             names,
             vec!["a.txt", "b.txt", "sub"],
-            "list_tree_at must return the DIRECT children of `d` (root-relative leaf names, \
+            "list_directory must return the DIRECT children of `d` (root-relative leaf names, \
              sorted), with the subdir `sub` listed as a single entry; got: {names:?}"
         );
         assert!(
             !names.contains(&"c.txt") && !names.iter().any(|n| n.contains('/')),
-            "list_tree_at is shallow: `d/sub/c.txt` must NOT be flattened in (no recursion), \
+            "list_directory is shallow: `d/sub/c.txt` must NOT be flattened in (no recursion), \
              got: {names:?}"
         );
     }
 
     #[test]
-    fn list_tree_at_marks_subdirectories_as_directories_and_files_as_files() {
+    fn list_directory_marks_subdirectories_as_directories_and_files_as_files() {
         let fixture = build_tree_fixture();
+        let resolved = snapshot_at(&fixture.backend, "src", &fixture.url, &fixture.commit)
+            .expect("resolve fixture snapshot");
 
-        let entries = fixture
-            .backend
-            .list_tree_at(&sn("src"), &fixture.url, &fixture.commit, Path::new("d"))
-            .expect("list_tree_at lists `d`");
+        let entries = SourceStore::list_directory(
+            &fixture.backend,
+            &resolved.snapshot,
+            Some(&SourcePath::new("d").expect("safe fixture path")),
+        )
+        .expect("list_directory lists `d`");
 
         let sub = entries
             .iter()
-            .find(|e| e.name == "sub")
+            .find(|entry| entry.path.as_str() == "d/sub")
             .expect("the `sub` directory entry must be present");
-        assert!(
-            sub.is_dir,
+        assert_eq!(
+            sub.kind,
+            SourceDirectoryEntryKind::Directory,
             "the `sub` entry is a directory and must be reported as is_dir=true so `--show` can \
              render it ls-style; got: {sub:?}"
         );
-        for file in entries.iter().filter(|e| e.name != "sub") {
-            assert!(
-                !file.is_dir,
-                "the regular file `{}` must be reported as is_dir=false, got: {file:?}",
-                file.name
+        for file in entries
+            .iter()
+            .filter(|entry| entry.path.as_str() != "d/sub")
+        {
+            assert_eq!(
+                file.kind,
+                SourceDirectoryEntryKind::File,
+                "the regular file `{}` must be reported as a file, got: {file:?}",
+                file.path
             );
         }
     }
 
     #[test]
-    fn list_tree_at_with_empty_path_lists_the_repo_root() {
+    fn list_directory_with_none_lists_the_repo_root() {
         let fixture = build_tree_fixture();
+        let resolved = snapshot_at(&fixture.backend, "src", &fixture.url, &fixture.commit)
+            .expect("resolve fixture snapshot");
 
-        let entries = fixture
-            .backend
-            .list_tree_at(&sn("src"), &fixture.url, &fixture.commit, Path::new(""))
+        let entries = SourceStore::list_directory(&fixture.backend, &resolved.snapshot, None)
             .expect("an empty path lists the repo root's top-level entries");
 
-        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        let names: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
         assert_eq!(
             names,
             vec!["d", "top.txt"],
@@ -1924,13 +2041,17 @@ path = "srnnkls/tropos"
     }
 
     #[test]
-    fn list_tree_at_errors_when_the_directory_is_absent_at_the_commit() {
+    fn list_directory_errors_when_the_directory_is_absent_at_the_commit() {
         let fixture = build_tree_fixture();
+        let resolved = snapshot_at(&fixture.backend, "src", &fixture.url, &fixture.commit)
+            .expect("resolve fixture snapshot");
 
-        let err = fixture
-            .backend
-            .list_tree_at(&sn("src"), &fixture.url, &fixture.commit, Path::new("nope"))
-            .expect_err("listing a path that does not exist must error, not return an empty list");
+        let err = SourceStore::list_directory(
+            &fixture.backend,
+            &resolved.snapshot,
+            Some(&SourcePath::new("nope").expect("safe absent path")),
+        )
+        .expect_err("listing a path that does not exist must error, not return an empty list");
 
         assert!(
             matches!(err, SourceError::RootNotFound { .. }),
@@ -1939,29 +2060,19 @@ path = "srnnkls/tropos"
     }
 
     #[test]
-    fn list_tree_at_default_impl_is_unsupported_on_non_git_backend() {
-        let git_dir = TempDir::new().expect("git_dir tempdir");
-        let http = HttpBackend::new(git_dir.path().to_path_buf(), BTreeMap::new());
-
-        let err = http
-            .list_tree_at(
-                &sn("u"),
-                "https://example.com/pkg.tar.gz",
-                ABSENT_SHA,
-                Path::new("d"),
-            )
-            .expect_err(
-                "the default SourceBackend::list_tree_at must error as unsupported; only \
-                 GitBackend overrides it (this is the one git-only trust read path)",
-            );
-
-        let msg = err.to_string().to_lowercase();
+    fn list_directory_rejects_a_file_path() {
+        let fixture = build_tree_fixture();
+        let resolved = snapshot_at(&fixture.backend, "src", &fixture.url, &fixture.commit)
+            .expect("resolve fixture snapshot");
+        let err = SourceStore::list_directory(
+            &fixture.backend,
+            &resolved.snapshot,
+            Some(&SourcePath::new("d/a.txt").expect("safe file path")),
+        )
+        .expect_err("list_directory requires a directory, not a file leaf");
         assert!(
-            msg.contains("unsupported")
-                || msg.contains("not supported")
-                || msg.contains("only git"),
-            "the default list_tree_at error must signal that mirror reads are git-only \
-             (unsupported), got: {msg}"
+            err.to_string().contains("d/a.txt"),
+            "the non-directory error must name the requested path: {err}"
         );
     }
 
@@ -2005,10 +2116,13 @@ path = "srnnkls/tropos"
     #[test]
     fn fetch_root_manifest_reuses_a_cached_mirror_offline() {
         let fixture = build_git_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("prime the mirror cache");
+        refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Branch("main".into()),
+        )
+        .expect("prime the mirror cache");
         std::fs::write(
             fixture.src.path().join("phora.toml"),
             b"version = 1\n\n[sources.x]\ngit = \"https://github.com/dep/x.git\"\n",
@@ -2016,10 +2130,13 @@ path = "srnnkls/tropos"
         .expect("write manifest");
         run_git(fixture.src.path(), &["add", "-A"]);
         run_git(fixture.src.path(), &["commit", "-m", "add manifest"]);
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("refresh cached mirror");
+        refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Branch("main".into()),
+        )
+        .expect("refresh cached mirror");
 
         let bytes = fixture
             .backend
@@ -2098,23 +2215,28 @@ path = "srnnkls/tropos"
         );
     }
 
-    // ---- compute_digest ----
+    // ---- digest_snapshot ----
 
     #[test]
-    fn compute_digest_is_blake3_prefixed_and_stable() {
+    fn digest_snapshot_is_blake3_prefixed_and_stable() {
         let fixture = build_export_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
-
-        let first = fixture
-            .backend
-            .compute_digest(&sn("src"), &fixture.url, &fixture.commit, None, &[], &[])
+        let resolved = refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Commit(fixture.commit.parse().expect("fixture commit is valid")),
+        )
+        .expect("refresh and resolve fixture");
+        let leaves: Vec<SourcePath> =
+            SourceStore::inventory(&fixture.backend, &resolved.snapshot, None)
+                .expect("inventory fixture")
+                .entries
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect();
+        let first = digest_snapshot(&fixture.backend, &resolved.snapshot, &leaves)
             .expect("digest computes");
-        let second = fixture
-            .backend
-            .compute_digest(&sn("src"), &fixture.url, &fixture.commit, None, &[], &[])
+        let second = digest_snapshot(&fixture.backend, &resolved.snapshot, &leaves)
             .expect("digest computes again");
 
         assert!(
@@ -2128,7 +2250,7 @@ path = "srnnkls/tropos"
     }
 
     #[test]
-    fn compute_digest_frames_entries_so_content_cannot_bleed_into_next_path() {
+    fn digest_snapshot_frames_entries_so_content_cannot_bleed_into_next_path() {
         let mut bled_content = b"X".to_vec();
         bled_content.extend_from_slice(b"b");
         bled_content.extend_from_slice(FILE_TAG);
@@ -2136,15 +2258,6 @@ path = "srnnkls/tropos"
 
         let one_file = build_collision_fixture(&[("a", &bled_content)]);
         let two_files = build_collision_fixture(&[("a", b"X"), ("b", b"Y")]);
-        one_file
-            .backend
-            .fetch(&sn("src"), &one_file.url)
-            .expect("fetch one-file tree");
-        two_files
-            .backend
-            .fetch(&sn("src"), &two_files.url)
-            .expect("fetch two-file tree");
-
         assert_ne!(
             digest_of_art(&one_file),
             digest_of_art(&two_files),
@@ -2441,7 +2554,7 @@ path = "srnnkls/tropos"
         let mirror = dir.path().join(format!("{}.git", key.as_str()));
 
         let out = {
-            let _serial = crate::store::guard_git_fork();
+            let _serial = crate::sync::state::locking::guard_git_fork();
             Command::new("git")
                 .args([
                     "--git-dir",
@@ -2600,30 +2713,37 @@ path = "srnnkls/tropos"
     }
 
     #[test]
-    fn compute_digest_reflects_matched_tree_not_matcher_config() {
+    fn digest_snapshot_reflects_selected_leaves_not_unused_matcher_config() {
         let fixture = build_export_fixture();
-        fixture
-            .backend
-            .fetch(&sn("src"), &fixture.url)
-            .expect("fetch");
-
-        let digest = |exclude: &[String]| {
-            fixture
-                .backend
-                .compute_digest(
-                    &sn("src"),
-                    &fixture.url,
-                    &fixture.commit,
-                    None,
-                    &[],
-                    exclude,
-                )
-                .expect("digest computes")
-        };
-
-        let no_exclude = digest(&[]);
-        let exclude_nothing = digest(&["**/*.nonexistent".to_owned()]);
-        let exclude_lua = digest(&["**/*.lua".to_owned()]);
+        let resolved = refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Commit(fixture.commit.parse().expect("fixture commit is valid")),
+        )
+        .expect("refresh and resolve fixture");
+        let leaves: Vec<SourcePath> =
+            SourceStore::inventory(&fixture.backend, &resolved.snapshot, None)
+                .expect("inventory fixture")
+                .entries
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect();
+        let no_exclude = digest_snapshot(&fixture.backend, &resolved.snapshot, &leaves)
+            .expect("full digest computes");
+        let exclude_nothing = digest_snapshot(&fixture.backend, &resolved.snapshot, &leaves)
+            .expect("same effective leaf set digests identically");
+        let non_lua: Vec<SourcePath> = leaves
+            .iter()
+            .filter(|path| {
+                Path::new(path.as_str())
+                    .extension()
+                    .is_none_or(|extension| extension != "lua")
+            })
+            .cloned()
+            .collect();
+        let exclude_lua = digest_snapshot(&fixture.backend, &resolved.snapshot, &non_lua)
+            .expect("non-Lua digest computes");
 
         assert_eq!(
             no_exclude, exclude_nothing,
@@ -2648,11 +2768,10 @@ path = "srnnkls/tropos"
         use gix::object::tree::EntryKind;
         use tempfile::TempDir;
 
-        use crate::config::Refspec;
         use crate::digest::Digest;
-        use crate::source::{HttpBackend, SourceBackend, SourceError, mirror_path};
+        use crate::source::{HttpBackend, ResolvePolicy, SourceError, SourceStore, mirror_path};
 
-        use super::sn;
+        use super::{refresh_url, sn, url_request};
 
         const HELLO_BODY: &[u8] = b"hi";
         const RUN_BODY: &[u8] = b"#!/bin/sh\n";
@@ -2720,51 +2839,45 @@ path = "srnnkls/tropos"
         }
 
         #[test]
-        fn fetch_then_resolve_ignores_refspec_and_reads_phora_head() {
+        fn refresh_resolves_the_synthetic_phora_head() {
             let server = TarServer::spawn(build_pkg_tar_gz());
             let url = server.url();
             let git_dir = TempDir::new().expect("git_dir tempdir");
             let backend = HttpBackend::new(git_dir.path().to_path_buf(), BTreeMap::new());
 
-            backend
-                .fetch(&sn("pkg"), &url)
-                .expect("fetch downloads, extracts, and imports a tree");
+            let resolved = refresh_url(&backend, "pkg", &url)
+                .expect("Refresh downloads, extracts, imports, and resolves the synthetic tree");
+            let commit = resolved.snapshot.commit().to_string();
 
-            let resolved = backend
-                .resolve(&sn("pkg"), &url, &Refspec::Branch("main".into()))
-                .expect("resolve must read refs/heads/phora, ignoring the bogus Branch(main)");
-
-            assert_eq!(resolved.len(), 40, "resolve returns a 40-hex commit id");
+            assert_eq!(commit.len(), 40, "resolve returns a 40-hex commit id");
             assert!(
-                resolved.chars().all(|c| c.is_ascii_hexdigit()),
-                "resolve returns a hex commit id, got: {resolved}"
+                commit.chars().all(|c| c.is_ascii_hexdigit()),
+                "resolve returns a hex commit id, got: {commit}"
             );
 
-            let none_resolved = backend
-                .resolve(&sn("pkg"), &url, &Refspec::None)
-                .expect("resolve with Refspec::None must also read the synthetic phora head");
+            let cached = SourceStore::resolve(
+                &backend,
+                &url_request("pkg", &url),
+                ResolvePolicy::CachedOnly,
+            )
+            .expect("CachedOnly reads the synthetic phora head");
             assert_eq!(
-                none_resolved, resolved,
-                "resolve must yield the same synthetic commit regardless of the passed refspec, \
-                 proving it ignores the refspec and reads refs/heads/phora"
+                cached.snapshot, resolved.snapshot,
+                "Refresh and CachedOnly must yield the same synthetic snapshot"
             );
         }
 
         #[test]
-        fn commit_time_of_synthetic_commit_is_epoch_plus_one() {
+        fn resolved_synthetic_source_authored_at_is_epoch_plus_one() {
             let server = TarServer::spawn(build_pkg_tar_gz());
             let url = server.url();
             let git_dir = TempDir::new().expect("git_dir tempdir");
             let backend = HttpBackend::new(git_dir.path().to_path_buf(), BTreeMap::new());
 
-            backend.fetch(&sn("pkg"), &url).expect("fetch");
-            let commit = backend
-                .resolve(&sn("pkg"), &url, &Refspec::None)
-                .expect("resolve synthetic head");
-
-            let time = backend
-                .commit_time(&sn("pkg"), &url, &commit)
-                .expect("commit_time of synthetic commit");
+            let time = refresh_url(&backend, "pkg", &url)
+                .expect("refresh synthetic source")
+                .authored_at
+                .unix_seconds();
             assert_eq!(
                 time, 1,
                 "the synthetic import commit's author time is epoch+1 (==1)"
@@ -2772,7 +2885,7 @@ path = "srnnkls/tropos"
         }
 
         #[test]
-        fn matching_digest_lets_fetch_succeed() {
+        fn matching_digest_lets_refresh_succeed() {
             let tar_gz = build_pkg_tar_gz();
             let server = TarServer::spawn(tar_gz.clone());
             let url = server.url();
@@ -2783,13 +2896,8 @@ path = "srnnkls/tropos"
             let git_dir = TempDir::new().expect("git_dir tempdir");
             let backend = HttpBackend::new(git_dir.path().to_path_buf(), digests);
 
-            backend
-                .fetch(&sn("pkg"), &url)
-                .expect("a matching configured digest must let fetch succeed");
-
-            backend
-                .resolve(&sn("pkg"), &url, &Refspec::None)
-                .expect("a verified fetch must create refs/heads/phora");
+            refresh_url(&backend, "pkg", &url)
+                .expect("a matching configured digest must let Refresh create the snapshot");
         }
 
         #[test]
@@ -2804,9 +2912,8 @@ path = "srnnkls/tropos"
             let git_dir = TempDir::new().expect("git_dir tempdir");
             let backend = HttpBackend::new(git_dir.path().to_path_buf(), digests);
 
-            let err = backend
-                .fetch(&sn("pkg"), &url)
-                .expect_err("a non-matching configured digest must fail fetch");
+            let err = refresh_url(&backend, "pkg", &url)
+                .expect_err("a non-matching configured digest must fail Refresh");
             match err {
                 SourceError::Source(msg) => assert!(
                     msg.contains("pkg"),
@@ -2826,7 +2933,12 @@ path = "srnnkls/tropos"
                  must not even be initialized"
             );
             assert!(
-                backend.resolve(&sn("pkg"), &url, &Refspec::None).is_err(),
+                SourceStore::resolve(
+                    &backend,
+                    &url_request("pkg", &url),
+                    ResolvePolicy::CachedOnly
+                )
+                .is_err(),
                 "with no synthetic head imported, resolve must fail after a rejected fetch"
             );
         }
@@ -2845,10 +2957,11 @@ path = "srnnkls/tropos"
             let git_dir = TempDir::new().expect("git_dir tempdir");
             let backend = HttpBackend::new(git_dir.path().to_path_buf(), BTreeMap::new());
 
-            backend.fetch(&sn("pkg"), &url).expect("fetch");
-            let commit = backend
-                .resolve(&sn("pkg"), &url, &Refspec::None)
-                .expect("resolve synthetic head");
+            let commit = refresh_url(&backend, "pkg", &url)
+                .expect("refresh synthetic source")
+                .snapshot
+                .commit()
+                .to_string();
 
             let mirror = mirror_path(git_dir.path(), &url);
             let repo = gix::open(&mirror).expect("open synthetic mirror");
@@ -2873,7 +2986,7 @@ path = "srnnkls/tropos"
             );
         }
 
-        // ---- MIRROR-LOCK-002: HttpBackend::fetch takes the SAME per-mirror flock ----
+        // ---- MIRROR-LOCK-002: URL Refresh takes the SAME per-mirror flock ----
 
         use std::path::PathBuf;
         use std::sync::mpsc;
@@ -2903,7 +3016,7 @@ path = "srnnkls/tropos"
         }
 
         #[test]
-        fn http_fetch_blocks_on_held_per_mirror_lock_then_succeeds_when_released() {
+        fn http_refresh_blocks_on_held_per_mirror_lock_then_succeeds_when_released() {
             let server = TarServer::spawn(build_pkg_tar_gz());
             let url = server.url();
             let git_dir = TempDir::new().expect("git_dir tempdir");
@@ -2916,13 +3029,13 @@ path = "srnnkls/tropos"
             let backend = HttpBackend::new(git_dir_path.clone(), BTreeMap::new());
             let url_for_thread = url.clone();
             let worker = std::thread::spawn(move || {
-                let result = backend.fetch(&sn("pkg"), &url_for_thread);
-                tx.send(result).expect("send fetch result");
+                let result = refresh_url(&backend, "pkg", &url_for_thread);
+                tx.send(result).expect("send refresh result");
             });
 
             assert!(
                 rx.recv_timeout(Duration::from_millis(750)).is_err(),
-                "HttpBackend::fetch must BLOCK while the per-mirror lock is held; it \
+                "URL Refresh must BLOCK while the per-mirror lock is held; it \
                  completed within the window, so it took no blocking lock on {} \
                  around its shared-mirror import",
                 lock_path.display()
@@ -2932,9 +3045,9 @@ path = "srnnkls/tropos"
 
             let result = rx
                 .recv_timeout(Duration::from_secs(10))
-                .expect("http fetch must complete promptly once the mirror lock is released");
-            worker.join().expect("fetch thread joins");
-            result.expect("http fetch succeeds after waiting for the lock (blocking, not error)");
+                .expect("URL Refresh must complete promptly once the mirror lock is released");
+            worker.join().expect("refresh thread joins");
+            result.expect("URL Refresh succeeds after waiting for the lock (blocking, not error)");
 
             let mirror = mirror_path(&git_dir_path, &url);
             let repo = gix::open(&mirror).expect("the serialized fetch leaves a valid mirror");
@@ -2945,7 +3058,7 @@ path = "srnnkls/tropos"
         }
 
         #[test]
-        fn http_holding_one_mirror_lock_does_not_block_fetch_of_a_different_mirror() {
+        fn http_holding_one_mirror_lock_does_not_block_refresh_of_a_different_mirror() {
             let server_a = TarServer::spawn(build_pkg_tar_gz());
             let server_b = TarServer::spawn(build_pkg_tar_gz());
             let url_a = server_a.url();
@@ -2964,16 +3077,16 @@ path = "srnnkls/tropos"
             let (tx, rx) = mpsc::channel();
             let backend = HttpBackend::new(git_dir_path.clone(), BTreeMap::new());
             let worker = std::thread::spawn(move || {
-                let result = backend.fetch(&sn("pkgb"), &url_b);
-                tx.send(result).expect("send fetch-b result");
+                let result = refresh_url(&backend, "pkgb", &url_b);
+                tx.send(result).expect("send refresh-b result");
             });
 
             let result = rx.recv_timeout(Duration::from_secs(10)).expect(
-                "fetching a DIFFERENT mirror must not block on mirror A's lock; \
+                "refreshing a DIFFERENT mirror must not block on mirror A's lock; \
                  the per-mirror lock must be keyed per MirrorKey",
             );
-            worker.join().expect("fetch-b thread joins");
-            result.expect("http fetch of mirror B succeeds while A's lock is held");
+            worker.join().expect("refresh-b thread joins");
+            result.expect("URL Refresh of mirror B succeeds while A's lock is held");
 
             drop(held_a);
         }

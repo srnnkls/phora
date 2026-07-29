@@ -4,19 +4,26 @@
 
 use phora::cli::exit_code;
 use phora::error::Error;
-use phora::store::StoreError;
+use phora::sync::state::StateError;
 
 #[test]
 fn contended_lock_maps_to_ex_tempfail() {
-    let err = Error::StoreCtx(StoreError::Lock(
+    let state_error = StateError::Lock(
         "another phora process is running for this project (state.lock held)".to_owned(),
-    ));
+    );
+    let state_display = state_error.to_string();
+    let err = Error::StateCtx(state_error);
 
     assert_eq!(
         exit_code(&err),
         75,
-        "a contended StoreError::Lock must surface as EX_TEMPFAIL (75) so callers \
+        "a contended StateError::Lock must surface as EX_TEMPFAIL (75) so callers \
          can distinguish 'busy, retry' from a hard failure"
+    );
+    assert_eq!(
+        err.to_string(),
+        state_display,
+        "the CLI-edge StateCtx variant must preserve StateError's transparent Display"
     );
 }
 
@@ -32,12 +39,19 @@ fn other_errors_keep_exit_code_one() {
 }
 
 #[test]
-fn store_registry_error_is_not_treated_as_tempfail() {
-    let err = Error::StoreCtx(StoreError::Registry("corrupt record".to_owned()));
+fn state_registry_error_is_not_treated_as_tempfail() {
+    let state_error = StateError::StateStore("corrupt record".to_owned());
+    let state_display = state_error.to_string();
+    let err = Error::StateCtx(state_error);
 
     assert_eq!(
         exit_code(&err),
         1,
         "only the Lock variant is EX_TEMPFAIL; a registry error is a hard failure"
+    );
+    assert_eq!(
+        err.to_string(),
+        state_display,
+        "the CLI-edge StateCtx variant must preserve StateError's transparent Display"
     );
 }

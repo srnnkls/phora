@@ -301,7 +301,7 @@ impl TakeSpec {
         let mut renames = Vec::new();
         for entry in entries {
             match entry {
-                TakeEntry::Leaf(leaf) if crate::kernel::is_take_glob(leaf) => {
+                TakeEntry::Leaf(leaf) if crate::projection::take::is_take_glob(leaf) => {
                     globs.push(leaf.clone());
                 }
                 TakeEntry::Leaf(leaf) => literals.push(leaf.clone()),
@@ -403,8 +403,8 @@ fn reject_malformed_take_entries<'a>(
         let target::TakeEntry::Leaf(pattern) = entry else {
             continue;
         };
-        if crate::kernel::is_take_glob(pattern)
-            && let Err(e) = crate::kernel::compile_take_glob(pattern)
+        if crate::projection::take::is_take_glob(pattern)
+            && let Err(e) = crate::projection::offer::compile_take_glob(pattern)
         {
             return Err(Error::Config(format!(
                 "`take` entry `{pattern}` is not a well-formed glob: {e}"

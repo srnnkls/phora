@@ -6,15 +6,16 @@ use std::process::Command;
 use std::str::FromStr as _;
 
 use phora::config::TemplateOptIn;
-use phora::kernel::SourceName;
 use phora::projection::build::project_target;
 use phora::projection::model::{
     ArtifactRelativePath, BindingProjectionInput, CollapsePreference, ContentTransform, LayoutSpec,
     LayoutStyle, MaterializationPolicy, OfferSpec, ProjectedArtifact, ProjectedLeaf,
     ResolvedSourceRef, TakeSpec, TargetProjection, TemplatePolicy,
 };
+use phora::source::SourceName;
 use phora::source::{
-    ExportPolicy, GitBackend, SourceBackend as _, SourceError, SourceInventory, SourcePath,
+    ExportPolicy, GitBackend, ResolvePolicy, ResolveRequest, RevisionSpec, SourceError,
+    SourceInventory, SourceLocation, SourcePath, SourceStore,
 };
 use phora::sync::{StageRequest, StagedArtifact, stage_artifact};
 use tempfile::TempDir;
@@ -101,9 +102,16 @@ fn build_fixture() -> Fixture {
     let git_dir = TempDir::new().expect("git dir tempdir");
     let backend = GitBackend::new(git_dir.path().to_path_buf());
     let url = src.path().to_string_lossy().into_owned();
-    backend
-        .fetch(&sn("fixture"), &url)
-        .expect("fetch builds mirror");
+    SourceStore::resolve(
+        &backend,
+        &ResolveRequest {
+            name: sn("fixture"),
+            location: SourceLocation::Git { url: url.clone() },
+            revision: RevisionSpec::Branch("main".to_owned()),
+        },
+        ResolvePolicy::Refresh,
+    )
+    .expect("refresh builds mirror");
 
     Fixture {
         _src: src,
@@ -141,7 +149,7 @@ fn adverse_artifact(dir: &str, leaves: &[(&str, &str, ContentTransform)]) -> Pro
     ProjectedArtifact {
         destination: phora::projection::model::TargetPath::new(first.1).expect("valid dest"),
         source: ResolvedSourceRef::new("fixture", "0123456789abcdef0123456789abcdef01234567"),
-        materialization: phora::kernel::Materialization::CollapsedDir {
+        materialization: phora::projection::model::Materialization::CollapsedDir {
             dir: dir.to_owned(),
         },
         kept_leaves: Vec::new(),
@@ -163,16 +171,21 @@ fn new_stage(
     staging_dir: &Path,
     opt_in: &TemplateOptIn,
 ) -> Result<StagedArtifact, SourceError> {
-    let resolved = phora::source::ResolvedSource {
-        name: sn("fixture"),
-        url: fx.url.clone(),
-        snapshot: phora::source::SnapshotId::Git {
-            commit: fx.commit.clone(),
+    let resolved = SourceStore::resolve(
+        &fx.backend,
+        &ResolveRequest {
+            name: sn("fixture"),
+            location: SourceLocation::Git {
+                url: fx.url.clone(),
+            },
+            revision: RevisionSpec::Commit(fx.commit.parse().expect("fixture commit is valid hex")),
         },
-    };
+        ResolvePolicy::CachedOnly,
+    )
+    .expect("resolve staged fixture snapshot");
     let root = match &request.artifact.materialization {
-        phora::kernel::Materialization::CollapsedDir { dir } => Some(PathBuf::from(dir)),
-        phora::kernel::Materialization::Leaf(_) => None,
+        phora::projection::model::Materialization::CollapsedDir { dir } => Some(PathBuf::from(dir)),
+        phora::projection::model::Materialization::Leaf(_) => None,
     };
     stage_artifact(
         request,
@@ -183,7 +196,7 @@ fn new_stage(
         opt_in,
         |repo_relative| {
             let path = SourcePath::new(&repo_relative.to_string_lossy().replace('\\', "/"))?;
-            let entry = phora::source::SourceStore::read(&fx.backend, &resolved, &path)?;
+            let entry = SourceStore::read(&fx.backend, &resolved.snapshot, &path)?;
             Ok((entry.bytes, entry.meta.kind))
         },
     )

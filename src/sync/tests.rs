@@ -7,18 +7,54 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use tempfile::TempDir;
 
-use crate::config::Refspec;
 use crate::source::{
-    GitBackend, HttpBackend, ResolvedSource, RouterBackend, SourceBackend, SourceEntry,
-    SourceError, SourceInventory, SourcePath, SourceStore,
+    GitBackend, HttpBackend, ResolvePolicy, ResolveRequest, ResolvedSource, RevisionSpec,
+    RouterBackend, SnapshotId, SourceDirectoryEntry, SourceEntry, SourceError, SourceInventory,
+    SourceLocation, SourcePath, SourceStore, digest_snapshot,
 };
-use crate::store::{EjectedEntry, FileRegistry, HookState, StoreError};
+use crate::sync::state::{Ejection, FileStateStore, HookState, StateError, StateStore};
 
 type SourceResult<T> = std::result::Result<T, SourceError>;
-type StoreResult<T> = std::result::Result<T, StoreError>;
+type StoreResult<T> = std::result::Result<T, StateError>;
 
 fn sn(name: &str) -> crate::source::SourceName {
     crate::source::SourceName::trusted(name)
+}
+
+fn resolve_git_source(
+    store: &dyn SourceStore,
+    name: &str,
+    url: &str,
+    revision: RevisionSpec,
+    policy: ResolvePolicy,
+) -> ResolvedSource {
+    store
+        .resolve(
+            &ResolveRequest {
+                name: sn(name),
+                location: SourceLocation::Git {
+                    url: url.to_owned(),
+                },
+                revision,
+            },
+            policy,
+        )
+        .expect("resolve fixture Git source")
+}
+
+fn seed_git_mirror(store: &dyn SourceStore, name: &str, url: &str) {
+    let _ = resolve_git_source(
+        store,
+        name,
+        url,
+        RevisionSpec::Default,
+        ResolvePolicy::Refresh,
+    );
+}
+
+fn canonical_fixture_target(path: &Path) -> PathBuf {
+    path.canonicalize()
+        .unwrap_or_else(|error| panic!("canonicalize fixture target {}: {error}", path.display()))
 }
 
 /// A single-entry resolved-commit map keyed by (source, encoded default ref).
@@ -34,6 +70,50 @@ fn one_commit(
     std::iter::once((key, commit.to_owned())).collect()
 }
 
+fn one_resolved_source(
+    name: &str,
+    resolved_commit: &str,
+    resolved: ResolvedSource,
+) -> ResolvedSourceMap {
+    let key = (name.to_owned(), resolved_commit.to_owned());
+    std::iter::once((key, resolved)).collect()
+}
+
+fn resolved_git_map(
+    store: &dyn SourceStore,
+    name: &str,
+    url: &str,
+    commit: &str,
+) -> ResolvedSourceMap {
+    one_resolved_source(
+        name,
+        commit,
+        resolve_git_source(
+            store,
+            name,
+            url,
+            RevisionSpec::Commit(commit.parse().expect("fixture commit is valid")),
+            ResolvePolicy::CachedOnly,
+        ),
+    )
+}
+
+fn resolved_worktree_map(store: &dyn SourceStore, name: &str, root: &Path) -> ResolvedSourceMap {
+    let resolved = store
+        .resolve(
+            &ResolveRequest {
+                name: sn(name),
+                location: SourceLocation::Worktree {
+                    root: root.to_path_buf(),
+                },
+                revision: RevisionSpec::None,
+            },
+            ResolvePolicy::Refresh,
+        )
+        .expect("capture fixture worktree");
+    one_resolved_source(name, "link", resolved)
+}
+
 // ── git fixture ────────────────────────────────────────────────
 
 #[expect(
@@ -41,8 +121,8 @@ fn one_commit(
     reason = "fixture setup fails loudly; git CLI is assumed present"
 )]
 fn run_git(cwd: &Path, args: &[&str]) {
-    crate::store::assert_git_sandboxed(cwd);
-    let _serial = crate::store::guard_git_fork();
+    crate::sync::state::locking::assert_git_sandboxed(cwd);
+    let _serial = crate::sync::state::locking::guard_git_fork();
     let out = Command::new("git")
         .args(args)
         .current_dir(cwd)
@@ -65,7 +145,7 @@ fn run_git(cwd: &Path, args: &[&str]) {
     reason = "fixture setup fails loudly; git CLI is assumed present"
 )]
 fn rev_parse(cwd: &Path, rev: &str) -> String {
-    let _serial = crate::store::guard_git_fork();
+    let _serial = crate::sync::state::locking::guard_git_fork();
     let out = Command::new("git")
         .args(["rev-parse", rev])
         .current_dir(cwd)
@@ -76,7 +156,7 @@ fn rev_parse(cwd: &Path, rev: &str) -> String {
 }
 
 fn git_show_path(cwd: &Path, commit: &str, path: &str) -> Option<Vec<u8>> {
-    let _serial = crate::store::guard_git_fork();
+    let _serial = crate::sync::state::locking::guard_git_fork();
     let spec = format!("{commit}:{path}");
     let output = Command::new("git")
         .args(["show", spec.as_str()])
@@ -98,7 +178,7 @@ struct SyncFixture {
     _git_dir: TempDir,
     _state_dir: TempDir,
     backend: GitBackend,
-    registry: FileRegistry,
+    registry: FileStateStore,
     url: String,
     head_sha: String,
 }
@@ -108,8 +188,8 @@ fn test_protected(cwd: &Path) -> super::confine::ProtectedPathSet {
         .expect("protected set")
 }
 
-fn linked_flat_record(target: &str, source: &str, artifact: &str) -> RegistryRecord {
-    RegistryRecord {
+fn linked_flat_record(target: &str, source: &str, artifact: &str) -> ArtifactRecord {
+    ArtifactRecord {
         version: 1,
         key: artifact_key(target, source, artifact),
         source: source.to_owned(),
@@ -156,7 +236,7 @@ fn build_sync_fixture() -> SyncFixture {
     let state_dir = TempDir::new().unwrap();
     let backend = GitBackend::new(git_dir.path().to_path_buf());
     let registry =
-        FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry over tempdir");
+        FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry over tempdir");
     let url = src_path.to_string_lossy().into_owned();
 
     SyncFixture {
@@ -187,12 +267,12 @@ impl SyncFixture {
 /// Wraps a real registry and counts either full-scan port. Observation must avoid
 /// both while keeping orphans, and perform exactly one while removing them.
 struct FullScanCountingRegistry<'a> {
-    inner: &'a FileRegistry,
+    inner: &'a FileStateStore,
     full_scans: AtomicUsize,
 }
 
 impl<'a> FullScanCountingRegistry<'a> {
-    fn new(inner: &'a FileRegistry) -> Self {
+    fn new(inner: &'a FileStateStore) -> Self {
         Self {
             inner,
             full_scans: AtomicUsize::new(0),
@@ -212,81 +292,36 @@ impl<'a> FullScanCountingRegistry<'a> {
     }
 }
 
-impl crate::store::Registry for FullScanCountingRegistry<'_> {
-    fn get(&self, key: &crate::store::ArtifactKey) -> StoreResult<Option<RegistryRecord>> {
-        crate::store::Registry::get(self.inner, key)
-    }
-
-    fn put(&self, record: &RegistryRecord) -> StoreResult<()> {
-        crate::store::Registry::put(self.inner, record)
-    }
-
-    fn remove(&self, key: &crate::store::ArtifactKey) -> StoreResult<()> {
-        crate::store::Registry::remove(self.inner, key)
-    }
-
-    fn list_target(&self, target: &str) -> StoreResult<Vec<RegistryRecord>> {
-        crate::store::Registry::list_target(self.inner, target)
-    }
-
-    fn list_all(&self) -> StoreResult<Vec<RegistryRecord>> {
-        self.count_full_scan();
-        crate::store::Registry::list_all(self.inner)
-    }
-
-    fn load_ejected(&self, target: &str) -> StoreResult<Vec<EjectedEntry>> {
-        crate::store::Registry::load_ejected(self.inner, target)
-    }
-
-    fn save_ejected(&self, target: &str, ejected: &[EjectedEntry]) -> StoreResult<()> {
-        crate::store::Registry::save_ejected(self.inner, target, ejected)
-    }
-
-    fn load_hook_state(&self, target: &str) -> StoreResult<Vec<HookState>> {
-        crate::store::Registry::load_hook_state(self.inner, target)
-    }
-
-    fn record_hook_success(
-        &self,
-        target: &str,
-        hook_id: &str,
-        digest_set: &BTreeSet<String>,
-    ) -> StoreResult<()> {
-        crate::store::Registry::record_hook_success(self.inner, target, hook_id, digest_set)
-    }
-
-    fn locks_dir(&self) -> PathBuf {
-        crate::store::Registry::locks_dir(self.inner)
-    }
-}
-
 impl crate::sync::state::StateStore for FullScanCountingRegistry<'_> {
-    fn artifact(&self, key: &crate::store::ArtifactKey) -> StoreResult<Option<RegistryRecord>> {
+    fn artifact(
+        &self,
+        key: &crate::sync::state::ArtifactKey,
+    ) -> StoreResult<Option<ArtifactRecord>> {
         crate::sync::state::StateStore::artifact(self.inner, key)
     }
 
-    fn put_artifact(&self, record: &RegistryRecord) -> StoreResult<()> {
+    fn put_artifact(&self, record: &ArtifactRecord) -> StoreResult<()> {
         crate::sync::state::StateStore::put_artifact(self.inner, record)
     }
 
-    fn remove_artifact(&self, key: &crate::store::ArtifactKey) -> StoreResult<()> {
+    fn remove_artifact(&self, key: &crate::sync::state::ArtifactKey) -> StoreResult<()> {
         crate::sync::state::StateStore::remove_artifact(self.inner, key)
     }
 
-    fn target_artifacts(&self, target: &str) -> StoreResult<Vec<RegistryRecord>> {
+    fn target_artifacts(&self, target: &str) -> StoreResult<Vec<ArtifactRecord>> {
         crate::sync::state::StateStore::target_artifacts(self.inner, target)
     }
 
-    fn all_artifacts(&self) -> StoreResult<Vec<RegistryRecord>> {
+    fn all_artifacts(&self) -> StoreResult<Vec<ArtifactRecord>> {
         self.count_full_scan();
         crate::sync::state::StateStore::all_artifacts(self.inner)
     }
 
-    fn ejections(&self, target: &str) -> StoreResult<Vec<EjectedEntry>> {
+    fn ejections(&self, target: &str) -> StoreResult<Vec<Ejection>> {
         crate::sync::state::StateStore::ejections(self.inner, target)
     }
 
-    fn save_ejections(&self, target: &str, entries: &[EjectedEntry]) -> StoreResult<()> {
+    fn save_ejections(&self, target: &str, entries: &[Ejection]) -> StoreResult<()> {
         crate::sync::state::StateStore::save_ejections(self.inner, target, entries)
     }
 
@@ -303,7 +338,7 @@ impl crate::sync::state::StateStore for FullScanCountingRegistry<'_> {
         crate::sync::state::StateStore::record_hook_success(self.inner, target, hook_id, digest_set)
     }
 
-    fn acquire_lock(&self) -> StoreResult<crate::store::StateLockGuard> {
+    fn acquire_lock(&self) -> StoreResult<crate::sync::state::locking::StateLock> {
         crate::sync::state::StateStore::acquire_lock(self.inner)
     }
 
@@ -316,17 +351,17 @@ impl crate::sync::state::StateStore for FullScanCountingRegistry<'_> {
 
 /// Wraps a real `GitBackend`, counting `fetch` calls so a test can prove that
 /// a matching lock entry suppresses the network round-trip. Also counts
-/// staging reads (`SourceStore::read`)/`commit_time` so a Clean second run can
-/// prove it did not re-stage (staged files carry deterministic mtimes, so an
-/// mtime check alone cannot).
+/// non-exact ref resolutions separately from required immutable exact-snapshot
+/// resolutions. The read probe counts a staging read only when the same
+/// snapshot leaf is read twice within one reset window: once for digesting,
+/// then again for staging.
 struct CountingBackend<'a> {
     inner: &'a GitBackend,
     fetches: AtomicUsize,
     resolves: AtomicUsize,
     reads: AtomicUsize,
-    commit_times: AtomicUsize,
+    seen_reads: Mutex<BTreeSet<(String, String, String)>>,
     discovers: AtomicUsize,
-    digests: AtomicUsize,
 }
 
 impl<'a> CountingBackend<'a> {
@@ -336,9 +371,8 @@ impl<'a> CountingBackend<'a> {
             fetches: AtomicUsize::new(0),
             resolves: AtomicUsize::new(0),
             reads: AtomicUsize::new(0),
-            commit_times: AtomicUsize::new(0),
+            seen_reads: Mutex::new(BTreeSet::new()),
             discovers: AtomicUsize::new(0),
-            digests: AtomicUsize::new(0),
         }
     }
 
@@ -354,83 +388,58 @@ impl<'a> CountingBackend<'a> {
         self.reads.load(AtomicOrdering::SeqCst)
     }
 
-    fn commit_time_count(&self) -> usize {
-        self.commit_times.load(AtomicOrdering::SeqCst)
+    fn reset_read_probe(&self) {
+        self.reads.store(0, AtomicOrdering::SeqCst);
+        self.seen_reads.lock().expect("seen reads").clear();
     }
 
     fn discover_count(&self) -> usize {
         self.discovers.load(AtomicOrdering::SeqCst)
     }
-
-    fn digest_count(&self) -> usize {
-        self.digests.load(AtomicOrdering::SeqCst)
-    }
-}
-
-impl SourceBackend for CountingBackend<'_> {
-    fn fetch(&self, source: &crate::source::SourceName, url: &str) -> SourceResult<()> {
-        self.fetches.fetch_add(1, AtomicOrdering::SeqCst);
-        self.inner.fetch(source, url)
-    }
-
-    fn mirror_ready(&self, url: &str) -> bool {
-        self.inner.mirror_ready(url)
-    }
-
-    fn resolve(
-        &self,
-        source: &crate::source::SourceName,
-        url: &str,
-        refspec: &Refspec,
-    ) -> SourceResult<String> {
-        self.resolves.fetch_add(1, AtomicOrdering::SeqCst);
-        self.inner.resolve(source, url, refspec)
-    }
-
-    fn commit_time(
-        &self,
-        source: &crate::source::SourceName,
-        url: &str,
-        commit: &str,
-    ) -> SourceResult<u64> {
-        self.commit_times.fetch_add(1, AtomicOrdering::SeqCst);
-        self.inner.commit_time(source, url, commit)
-    }
-
-    fn compute_digest(
-        &self,
-        source: &crate::source::SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        include: &[String],
-        exclude: &[String],
-    ) -> SourceResult<String> {
-        self.digests.fetch_add(1, AtomicOrdering::SeqCst);
-        self.inner
-            .compute_digest(source, url, commit, root, include, exclude)
-    }
-
-    fn list_source_leaves(
-        &self,
-        source: &crate::source::SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-    ) -> SourceResult<Vec<String>> {
-        self.discovers.fetch_add(1, AtomicOrdering::SeqCst);
-        self.inner.list_source_leaves(source, url, commit, root)
-    }
 }
 
 impl SourceStore for CountingBackend<'_> {
-    fn inventory(&self, source: &ResolvedSource) -> SourceResult<SourceInventory> {
-        self.inner.inventory(source)
+    fn resolve(
+        &self,
+        request: &ResolveRequest,
+        policy: ResolvePolicy,
+    ) -> SourceResult<ResolvedSource> {
+        if policy == ResolvePolicy::Refresh {
+            self.fetches.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+        if !matches!(&request.revision, RevisionSpec::Commit(_)) {
+            self.resolves.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+        SourceStore::resolve(self.inner, request, policy)
     }
 
-    fn read(&self, source: &ResolvedSource, path: &SourcePath) -> SourceResult<SourceEntry> {
-        self.reads.fetch_add(1, AtomicOrdering::SeqCst);
-        self.inner.read(source, path)
+    fn inventory(
+        &self,
+        snapshot: &SnapshotId,
+        root: Option<&SourcePath>,
+    ) -> SourceResult<SourceInventory> {
+        self.discovers.fetch_add(1, AtomicOrdering::SeqCst);
+        SourceStore::inventory(self.inner, snapshot, root)
+    }
+
+    fn read(&self, snapshot: &SnapshotId, path: &SourcePath) -> SourceResult<SourceEntry> {
+        let key = (
+            snapshot.mirror().as_str().to_owned(),
+            snapshot.commit().to_string(),
+            path.as_str().to_owned(),
+        );
+        if !self.seen_reads.lock().expect("seen reads").insert(key) {
+            self.reads.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+        SourceStore::read(self.inner, snapshot, path)
+    }
+
+    fn list_directory(
+        &self,
+        snapshot: &SnapshotId,
+        path: Option<&SourcePath>,
+    ) -> SourceResult<Vec<SourceDirectoryEntry>> {
+        SourceStore::list_directory(self.inner, snapshot, path)
     }
 }
 
@@ -455,10 +464,11 @@ fn sync_reads_one_projection_inventory_across_drop_deploy_and_prune() {
 
     assert_eq!(
         counting.discover_count(),
-        1,
-        "the source inventory must be read exactly once to build one Projection, then that value \
-         must be threaded through fast-forward/drop guarding, deploy/observe/reconcile/apply, and \
-         prune. A second inventory read reopens the phase-local TOCTOU window"
+        2,
+        "the final store performs exactly one inventory for lock digest selection and exactly one \
+         to build the Projection. The projection inventory must then be threaded through \
+         fast-forward/drop guarding, deploy/observe/reconcile/apply, and prune; any third inventory \
+         would reopen the phase-local TOCTOU window"
     );
 }
 
@@ -505,19 +515,72 @@ fn input<'a>(
 }
 
 fn expected_digest(fx: &SyncFixture, name: &str, commit: &str) -> String {
-    fx.backend
-        .compute_digest(
-            &crate::source::SourceName::trusted(name),
-            &fx.url,
-            commit,
-            None,
-            &[],
-            &[],
-        )
+    let resolved = resolve_git_source(
+        &fx.backend,
+        name,
+        &fx.url,
+        RevisionSpec::Commit(commit.parse().expect("fixture commit")),
+        ResolvePolicy::CachedOnly,
+    );
+    let inventory = fx
+        .backend
+        .inventory(&resolved.snapshot, None)
+        .expect("inventory fixture tree");
+    let leaves: Vec<SourcePath> = inventory
+        .entries
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect();
+    digest_snapshot(&fx.backend, &resolved.snapshot, &leaves)
         .expect("digest computes over fixture tree")
 }
 
-/// Oracle digest computed with the SAME matcher and root the source declares.
+struct RootedFixtureStore<'a> {
+    inner: &'a dyn SourceStore,
+    root: SourcePath,
+}
+
+impl RootedFixtureStore<'_> {
+    fn prefixed(&self, path: &SourcePath) -> SourcePath {
+        SourcePath::new(&format!("{}/{}", self.root.as_str(), path.as_str()))
+            .expect("rooted fixture path")
+    }
+}
+
+impl SourceStore for RootedFixtureStore<'_> {
+    fn resolve(
+        &self,
+        request: &ResolveRequest,
+        policy: ResolvePolicy,
+    ) -> SourceResult<ResolvedSource> {
+        self.inner.resolve(request, policy)
+    }
+
+    fn inventory(
+        &self,
+        snapshot: &SnapshotId,
+        root: Option<&SourcePath>,
+    ) -> SourceResult<SourceInventory> {
+        self.inner.inventory(snapshot, root)
+    }
+
+    fn read(&self, snapshot: &SnapshotId, path: &SourcePath) -> SourceResult<SourceEntry> {
+        let mut entry = self.inner.read(snapshot, &self.prefixed(path))?;
+        entry.meta.path = path.clone();
+        Ok(entry)
+    }
+
+    fn list_directory(
+        &self,
+        snapshot: &SnapshotId,
+        path: Option<&SourcePath>,
+    ) -> SourceResult<Vec<SourceDirectoryEntry>> {
+        let prefixed = path.map(|path| self.prefixed(path));
+        self.inner.list_directory(snapshot, prefixed.as_ref())
+    }
+}
+
+/// Oracle digest computed with the same public selection policy and root the source declares.
 /// Differs from [`expected_digest`] whenever sync ignores include/exclude/root.
 fn expected_digest_for_source(
     fx: &SyncFixture,
@@ -525,16 +588,46 @@ fn expected_digest_for_source(
     name: &str,
     commit: &str,
 ) -> String {
-    fx.backend
-        .compute_digest(
-            &sn(name),
-            &fx.url,
-            commit,
-            source.root.as_deref(),
-            source.includes(),
-            source.excludes(),
+    let resolved = resolve_git_source(
+        &fx.backend,
+        name,
+        &fx.url,
+        RevisionSpec::Commit(commit.parse().expect("fixture commit")),
+        ResolvePolicy::CachedOnly,
+    );
+    let inventory = fx
+        .backend
+        .inventory(&resolved.snapshot, None)
+        .expect("inventory fixture tree");
+    let candidates: Vec<&str> = inventory
+        .entries
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect();
+    let selection = crate::projection::offer::OfferSelection::compile(
+        source.includes(),
+        source.excludes(),
+        source.root.as_deref(),
+    )
+    .expect("source selection compiles");
+    let leaves: Vec<SourcePath> = selection
+        .select(&candidates)
+        .into_iter()
+        .map(|path| SourcePath::new(&path).expect("selected fixture path"))
+        .collect();
+    match source.root.as_deref() {
+        Some(root) => digest_snapshot(
+            &RootedFixtureStore {
+                inner: &fx.backend,
+                root: SourcePath::new(&root.to_string_lossy()).expect("fixture root"),
+            },
+            &resolved.snapshot,
+            &leaves,
         )
-        .expect("scoped digest computes over fixture tree")
+        .expect("scoped digest computes over fixture tree"),
+        None => digest_snapshot(&fx.backend, &resolved.snapshot, &leaves)
+            .expect("selected digest computes over fixture tree"),
+    }
 }
 
 fn parsed_of(cfg: &Config, name: &str) -> ParsedSource {
@@ -625,7 +718,7 @@ fn link_source_resolves_without_mirror_into_audit_lock_entry() {
     let counting = CountingBackend::new(&fx.backend);
     let parsed = cfg.parsed_sources().expect("sources parse");
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
-    let (routed, _commits) = resolve_sources(
+    let routed = resolve_sources(
         &cfg,
         &parsed,
         &remotes,
@@ -639,6 +732,7 @@ fn link_source_resolves_without_mirror_into_audit_lock_entry() {
     .expect("link source resolves with no reachable mirror");
 
     let (_name, locked) = routed
+        .locks
         .iter()
         .find(|(n, _)| n == "dev-src")
         .expect("link source routed into a lock entry");
@@ -662,8 +756,8 @@ fn link_source_resolves_without_mirror_into_audit_lock_entry() {
     );
 }
 
-/// The link carve-out is observable on the backend: zero fetches and zero
-/// mirror digest computations for the link source.
+/// The link carve-out is observable on the store: zero refreshes and zero
+/// snapshot reads for the link source.
 #[test]
 fn link_source_skips_fetch_and_mirror_digest() {
     let fx = build_sync_fixture();
@@ -691,9 +785,9 @@ fn link_source_skips_fetch_and_mirror_digest() {
         "a link source must not fetch the git mirror"
     );
     assert_eq!(
-        counting.digest_count(),
+        counting.read_count(),
         0,
-        "a link source must not compute a mirror digest"
+        "a link source must not read a mirror snapshot to compute a digest"
     );
 }
 
@@ -706,9 +800,7 @@ fn matching_lock_reuses_commit_without_refetch() {
     let source = parsed_of(&cfg, "editor-src");
 
     // Pre-seed the mirror so compute_digest can read the tree without sync fetching.
-    fx.backend
-        .fetch(&sn("editor-src"), &fx.url)
-        .expect("seed fetch");
+    seed_git_mirror(&fx.backend, "editor-src", &fx.url);
 
     let prior = Lock {
         version: 1,
@@ -805,47 +897,36 @@ struct DenyNetworkBackend<'a> {
     inner: &'a GitBackend,
 }
 
-impl SourceBackend for DenyNetworkBackend<'_> {
-    fn fetch(&self, _source: &crate::source::SourceName, _url: &str) -> SourceResult<()> {
-        Err(SourceError::Source("frozen must not fetch".to_owned()))
-    }
+impl SourceStore for DenyNetworkBackend<'_> {
     fn resolve(
         &self,
-        _source: &crate::source::SourceName,
-        _url: &str,
-        _refspec: &Refspec,
-    ) -> SourceResult<String> {
-        Err(SourceError::Source("frozen must not resolve".to_owned()))
-    }
-    fn commit_time(
-        &self,
-        source: &crate::source::SourceName,
-        url: &str,
-        commit: &str,
-    ) -> SourceResult<u64> {
-        self.inner.commit_time(source, url, commit)
-    }
-    fn compute_digest(
-        &self,
-        source: &crate::source::SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        include: &[String],
-        exclude: &[String],
-    ) -> SourceResult<String> {
-        self.inner
-            .compute_digest(source, url, commit, root, include, exclude)
-    }
-}
-
-impl SourceStore for DenyNetworkBackend<'_> {
-    fn inventory(&self, source: &ResolvedSource) -> SourceResult<SourceInventory> {
-        self.inner.inventory(source)
+        request: &ResolveRequest,
+        policy: ResolvePolicy,
+    ) -> SourceResult<ResolvedSource> {
+        if policy == ResolvePolicy::Refresh {
+            return Err(SourceError::Source("frozen must not fetch".to_owned()));
+        }
+        SourceStore::resolve(self.inner, request, policy)
     }
 
-    fn read(&self, source: &ResolvedSource, path: &SourcePath) -> SourceResult<SourceEntry> {
-        self.inner.read(source, path)
+    fn inventory(
+        &self,
+        snapshot: &SnapshotId,
+        root: Option<&SourcePath>,
+    ) -> SourceResult<SourceInventory> {
+        SourceStore::inventory(self.inner, snapshot, root)
+    }
+
+    fn read(&self, snapshot: &SnapshotId, path: &SourcePath) -> SourceResult<SourceEntry> {
+        SourceStore::read(self.inner, snapshot, path)
+    }
+
+    fn list_directory(
+        &self,
+        snapshot: &SnapshotId,
+        path: Option<&SourcePath>,
+    ) -> SourceResult<Vec<SourceDirectoryEntry>> {
+        SourceStore::list_directory(self.inner, snapshot, path)
     }
 }
 
@@ -868,7 +949,8 @@ fn frozen_errors_naming_source_when_no_lock_entry() {
         true,
         None,
     )
-    .expect_err("frozen with no lock entry must hard-error instead of fetching");
+    .err()
+    .expect("frozen with no lock entry must hard-error instead of fetching");
 
     assert!(
         err.to_string().contains("editor-src"),
@@ -881,9 +963,7 @@ fn frozen_reuses_matching_lock_without_touching_network() {
     let fx = build_sync_fixture();
     let cfg = config_with_source("editor-src", &fx.url);
     let source = parsed_of(&cfg, "editor-src");
-    fx.backend
-        .fetch(&sn("editor-src"), &fx.url)
-        .expect("seed mirror so compute_digest can read the tree");
+    seed_git_mirror(&fx.backend, "editor-src", &fx.url);
 
     let prior = Lock {
         version: crate::lock::LOCK_SCHEMA_VERSION,
@@ -904,7 +984,7 @@ fn frozen_reuses_matching_lock_without_touching_network() {
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
 
     let backend = DenyNetworkBackend { inner: &fx.backend };
-    let (routed, _commits) = resolve_sources(
+    let routed = resolve_sources(
         &cfg,
         &parsed,
         &remotes,
@@ -918,6 +998,7 @@ fn frozen_reuses_matching_lock_without_touching_network() {
     .expect("frozen with a matching lock must reuse it without fetch/resolve");
 
     let (_name, locked) = routed
+        .locks
         .iter()
         .find(|(n, _)| n == "editor-src")
         .expect("the matched source is routed from the lock");
@@ -962,7 +1043,8 @@ fn frozen_errors_on_drifted_lock_entry() {
         true,
         None,
     )
-    .expect_err("frozen with a drifted lock entry must hard-error, not re-resolve");
+    .err()
+    .expect("frozen with a drifted lock entry must hard-error, not re-resolve");
 
     assert!(
         err.to_string().contains("editor-src"),
@@ -994,7 +1076,7 @@ fn non_frozen_reresolves_drifted_lock_entry() {
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
 
     let counting = CountingBackend::new(&fx.backend);
-    let (routed, _commits) = resolve_sources(
+    let routed = resolve_sources(
         &cfg,
         &parsed,
         &remotes,
@@ -1008,6 +1090,7 @@ fn non_frozen_reresolves_drifted_lock_entry() {
     .expect("without --frozen a drifted lock must re-resolve, not error");
 
     let (_name, locked) = routed
+        .locks
         .iter()
         .find(|(n, _)| n == "editor-src")
         .expect("source re-resolved");
@@ -1024,9 +1107,7 @@ fn force_refetches_even_when_lock_matches() {
     let fx = build_sync_fixture();
     let cfg = config_with_source("editor-src", &fx.url);
     let source = parsed_of(&cfg, "editor-src");
-    fx.backend
-        .fetch(&sn("editor-src"), &fx.url)
-        .expect("seed fetch");
+    seed_git_mirror(&fx.backend, "editor-src", &fx.url);
 
     let matching = Lock {
         version: 1,
@@ -1150,10 +1231,10 @@ fn base_only_run_produces_no_local_lock() {
 
 use std::path::PathBuf;
 
-use crate::deploy::JournalEntry;
+use crate::sync::journal::JournalEntry;
 
-use crate::deploy::ArtifactState;
-use crate::store::{ArtifactKey, ManifestFile, RecordKind, RegistryRecord};
+use crate::sync::inspect::ArtifactState;
+use crate::sync::state::{ArtifactKey, ArtifactRecord, ManifestFile, RecordKind};
 
 /// A target deployed beside this dir: `<root>/target` plus the `.phora-stage`
 /// sibling sync owns. The tempdir is the target's parent so staging has somewhere
@@ -1263,64 +1344,57 @@ fn flat_layout() -> crate::config::LayoutConfig {
 struct FailingReadBackend<'a> {
     inner: &'a GitBackend,
     fail_artifact: String,
+    reads_by_path: Mutex<BTreeMap<String, usize>>,
 }
 
-impl SourceBackend for FailingReadBackend<'_> {
-    fn fetch(&self, source: &crate::source::SourceName, url: &str) -> SourceResult<()> {
-        self.inner.fetch(source, url)
-    }
-    fn resolve(
-        &self,
-        source: &crate::source::SourceName,
-        url: &str,
-        refspec: &Refspec,
-    ) -> SourceResult<String> {
-        self.inner.resolve(source, url, refspec)
-    }
-    fn commit_time(
-        &self,
-        source: &crate::source::SourceName,
-        url: &str,
-        commit: &str,
-    ) -> SourceResult<u64> {
-        self.inner.commit_time(source, url, commit)
-    }
-    fn compute_digest(
-        &self,
-        source: &crate::source::SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        include: &[String],
-        exclude: &[String],
-    ) -> SourceResult<String> {
-        self.inner
-            .compute_digest(source, url, commit, root, include, exclude)
-    }
-    fn list_source_leaves(
-        &self,
-        source: &crate::source::SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-    ) -> SourceResult<Vec<String>> {
-        self.inner.list_source_leaves(source, url, commit, root)
+impl<'a> FailingReadBackend<'a> {
+    fn new(inner: &'a GitBackend, fail_artifact: &str) -> Self {
+        Self {
+            inner,
+            fail_artifact: fail_artifact.to_owned(),
+            reads_by_path: Mutex::new(BTreeMap::new()),
+        }
     }
 }
 
 impl SourceStore for FailingReadBackend<'_> {
-    fn inventory(&self, source: &ResolvedSource) -> SourceResult<SourceInventory> {
-        self.inner.inventory(source)
+    fn resolve(
+        &self,
+        request: &ResolveRequest,
+        policy: ResolvePolicy,
+    ) -> SourceResult<ResolvedSource> {
+        SourceStore::resolve(self.inner, request, policy)
     }
 
-    fn read(&self, source: &ResolvedSource, path: &SourcePath) -> SourceResult<SourceEntry> {
+    fn inventory(
+        &self,
+        snapshot: &SnapshotId,
+        root: Option<&SourcePath>,
+    ) -> SourceResult<SourceInventory> {
+        SourceStore::inventory(self.inner, snapshot, root)
+    }
+
+    fn read(&self, snapshot: &SnapshotId, path: &SourcePath) -> SourceResult<SourceEntry> {
         if path.as_str().split('/').next() == Some(self.fail_artifact.as_str()) {
-            return Err(SourceError::Source(format!(
-                "injected staging read failure for {}",
-                self.fail_artifact
-            )));
+            let mut reads = self.reads_by_path.lock().expect("read counters");
+            let count = reads.entry(path.as_str().to_owned()).or_default();
+            *count += 1;
+            if *count > 1 {
+                return Err(SourceError::Source(format!(
+                    "injected staging read failure for {}",
+                    self.fail_artifact
+                )));
+            }
         }
-        self.inner.read(source, path)
+        SourceStore::read(self.inner, snapshot, path)
+    }
+
+    fn list_directory(
+        &self,
+        snapshot: &SnapshotId,
+        path: Option<&SourcePath>,
+    ) -> SourceResult<Vec<SourceDirectoryEntry>> {
+        SourceStore::list_directory(self.inner, snapshot, path)
     }
 }
 
@@ -1360,7 +1434,7 @@ fn sync_records_the_deployed_artifact_in_the_registry() {
 
     let rec = fx
         .registry
-        .get(&artifact_key("dest", "editor-src", "editor"))
+        .artifact(&artifact_key("dest", "editor-src", "editor"))
         .expect("registry get must not error")
         .expect("deploy must persist a registry record for (dest,editor-src,editor)");
     assert_eq!(rec.key.target, "dest");
@@ -1426,12 +1500,13 @@ fn sync_skips_clean_artifact_on_second_run_without_re_export() {
         dst.join("init.lua").exists(),
         "premise: the first sync must actually deploy the artifact"
     );
-    let reads_after_first = counting.read_count();
-    let commit_times_after_first = counting.commit_time_count();
+    let staging_reads_after_first = counting.read_count();
     assert!(
-        reads_after_first >= 1,
-        "premise: the first run of a Missing artifact must read its source leaves at least once, got {reads_after_first}"
+        staging_reads_after_first >= 1,
+        "premise: the first run of a Missing artifact must read its source leaves again for \
+         staging after digesting, got {staging_reads_after_first} repeated reads"
     );
+    counting.reset_read_probe();
 
     // Reuse the lock from the first run so Phase 1 also skips refetch; the second
     // run must find the artifact Clean and NOT re-stage/re-deploy it.
@@ -1445,15 +1520,10 @@ fn sync_skips_clean_artifact_on_second_run_without_re_export() {
     assert!(!second.had_failures, "second clean sync must not fail");
     assert_eq!(
         counting.read_count(),
-        reads_after_first,
+        0,
         "a Clean artifact must NOT be re-staged on the second run: \
-             the staging read count must not increase"
-    );
-    assert_eq!(
-        counting.commit_time_count(),
-        commit_times_after_first,
-        "a Clean artifact must short-circuit before commit_time: \
-             commit_time count must not increase on the second run"
+             each immutable source leaf may be read once for digesting, but none may be read \
+             again for staging"
     );
 }
 
@@ -1467,7 +1537,7 @@ fn sync_errors_on_flat_layout_collision_naming_artifact_sources_and_target() {
     let git_dir = TempDir::new().expect("git dir");
     let state_dir = TempDir::new().expect("state dir");
     let backend = GitBackend::new(git_dir.path().to_path_buf());
-    let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let registry = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
     let td = TargetDir::new();
 
     let toml = format!(
@@ -1495,7 +1565,7 @@ fn sync_errors_on_flat_layout_collision_naming_artifact_sources_and_target() {
 
 fn assert_overlap_rejected(
     result: Result<SyncOutput>,
-    registry: &FileRegistry,
+    registry: &FileStateStore,
     targets: (&str, &str),
     overlap: &str,
     absent_roots: &[PathBuf],
@@ -1520,11 +1590,11 @@ fn assert_overlap_rejected(
         "R4: the overlap diagnostic must name the overlapping physical path `{overlap}`; got: {msg}"
     );
     let records = registry
-        .list_all()
+        .all_artifacts()
         .expect("list_all after a pre-mutation rejection");
     assert!(
         records.is_empty(),
-        "R4: zero mutation — registry.list_all() must be empty after the pre-mutation overlap \
+        "R4: zero mutation — registry.all_artifacts() must be empty after the pre-mutation overlap \
          check errs, got {records:?}"
     );
     for root in absent_roots {
@@ -1759,11 +1829,11 @@ fn build_multi_root_repo() -> (TempDir, String) {
     (src, url)
 }
 
-fn fresh_backend_registry() -> (TempDir, TempDir, GitBackend, FileRegistry) {
+fn fresh_backend_registry() -> (TempDir, TempDir, GitBackend, FileStateStore) {
     let git_dir = TempDir::new().expect("git dir");
     let state_dir = TempDir::new().expect("state dir");
     let backend = GitBackend::new(git_dir.path().to_path_buf());
-    let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let registry = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
     (git_dir, state_dir, backend, registry)
 }
 
@@ -1786,7 +1856,7 @@ fn aliased_binding_records_underlying_source_at_identity_path() {
         .expect("sync over an aliased binding must succeed");
 
     let rec = registry
-        .get(&artifact_key("dest", "nvim", "init"))
+        .artifact(&artifact_key("dest", "nvim", "init"))
         .expect("registry get")
         .expect("the record must be keyed by identity `nvim` at …/artifacts/nvim/init.toml");
     assert_eq!(
@@ -1825,7 +1895,7 @@ fn prefixed_custom_separator_persists_on_record_and_reconstructs_orphan_path() {
 
     let rec = fx
         .registry
-        .get(&artifact_key("dest", "editor-src", "editor"))
+        .artifact(&artifact_key("dest", "editor-src", "editor"))
         .expect("registry get")
         .expect("the editor artifact must record under the prefixed layout");
     assert_eq!(
@@ -1872,11 +1942,11 @@ fn two_aliases_of_one_source_each_record_the_shared_underlying_source() {
         .expect("two aliases of one source must deploy without collision");
 
     let nvim = registry
-        .get(&artifact_key("dest", "one", "nvim"))
+        .artifact(&artifact_key("dest", "one", "nvim"))
         .expect("registry get")
         .expect("the record keyed by identity `one` must exist at its own identity path");
     let tmux = registry
-        .get(&artifact_key("dest", "two", "tmux"))
+        .artifact(&artifact_key("dest", "two", "tmux"))
         .expect("registry get")
         .expect("the record keyed by identity `tmux` must exist at its own identity path");
     assert_eq!(
@@ -1909,7 +1979,7 @@ fn bare_binding_records_source_equal_to_identity() {
 
     let rec = fx
         .registry
-        .get(&artifact_key("dest", "editor-src", "editor"))
+        .artifact(&artifact_key("dest", "editor-src", "editor"))
         .expect("registry get")
         .expect("bare binding must record at …/artifacts/editor-src/editor.toml");
     assert_eq!(
@@ -1941,9 +2011,11 @@ fn rebuild_round_trips_aliased_underlying_source() {
         .expect("seeding sync over an aliased binding must succeed");
 
     let key = artifact_key("dest", "nvim", "init");
-    registry.remove(&key).expect("drop the aliased record");
+    registry
+        .remove_artifact(&key)
+        .expect("drop the aliased record");
     assert!(
-        registry.get(&key).expect("get after remove").is_none(),
+        registry.artifact(&key).expect("get after remove").is_none(),
         "premise: the record must be gone before rebuild"
     );
 
@@ -1951,7 +2023,7 @@ fn rebuild_round_trips_aliased_underlying_source() {
         .expect("rebuild reconstructs the aliased record");
 
     let rebuilt = registry
-        .get(&key)
+        .artifact(&key)
         .expect("registry get")
         .expect("rebuild must reconstruct the record at the IDENTITY path …/artifacts/nvim/");
     assert_eq!(
@@ -2173,7 +2245,7 @@ fn sync_without_force_skips_modified_registry_artifact() {
     let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
     assert!(
         fx.registry
-            .get(&artifact_key("dest", "editor-src", "editor"))
+            .artifact(&artifact_key("dest", "editor-src", "editor"))
             .expect("registry get must not error")
             .is_some(),
         "premise: the first sync must create a registry record so the artifact is MANAGED"
@@ -2233,7 +2305,7 @@ fn sync_with_force_overwrites_modified_registry_artifact() {
     let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
     assert!(
         fx.registry
-            .get(&artifact_key("dest", "editor-src", "editor"))
+            .artifact(&artifact_key("dest", "editor-src", "editor"))
             .expect("registry get must not error")
             .is_some(),
         "premise: the first sync must create a registry record so the artifact is MANAGED"
@@ -2320,7 +2392,7 @@ fn ejected_copy_to_link_mode_transition_is_a_silent_skip_never_redeploys() {
     );
     eject(&cfg, &registry, "editor", "editor-src", "dest").expect("eject the managed artifact");
     let key = artifact_key("dest", "editor-src", "editor");
-    let ejected = registry.load_ejected("dest").expect("load ejected");
+    let ejected = registry.ejections("dest").expect("load ejected");
     assert!(
         ejected
             .iter()
@@ -2343,14 +2415,14 @@ fn ejected_copy_to_link_mode_transition_is_a_silent_skip_never_redeploys() {
     );
     assert!(
         registry
-            .load_ejected("dest")
+            .ejections("dest")
             .expect("reload ejected")
             .iter()
             .any(|e| e.source == "editor-src" && e.artifact == "editor"),
         "R7: ejection stays authoritative — the entry must survive the sync"
     );
     assert!(
-        registry.get(&key).expect("registry get").is_some(),
+        registry.artifact(&key).expect("registry get").is_some(),
         "R7: the ejected record must be kept, not dropped"
     );
 
@@ -2426,14 +2498,14 @@ fn touch_to_mtime(path: &Path, secs: u64) {
     .expect("set mtime");
 }
 
-fn manifest_file<'a>(rec: &'a RegistryRecord, rel: &str) -> &'a ManifestFile {
+fn manifest_file<'a>(rec: &'a ArtifactRecord, rel: &str) -> &'a ManifestFile {
     rec.files
         .iter()
         .find(|f| f.path == *Path::new(rel))
         .unwrap_or_else(|| panic!("record must list {rel}, got {:?}", rec.files))
 }
 
-fn assert_record_level_fields_unchanged(before: &RegistryRecord, after: &RegistryRecord) {
+fn assert_record_level_fields_unchanged(before: &ArtifactRecord, after: &ArtifactRecord) {
     assert_eq!(
         after.commit, before.commit,
         "a stat refresh must leave the record-level commit untouched"
@@ -2486,7 +2558,7 @@ fn sync_refreshes_record_stat_for_touched_but_identical_file() {
     let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
     let before = fx
         .registry
-        .get(&key)
+        .artifact(&key)
         .expect("registry get must not error")
         .expect("record after first sync");
     let recorded = manifest_file(&before, "init.lua").clone();
@@ -2521,7 +2593,7 @@ fn sync_refreshes_record_stat_for_touched_but_identical_file() {
 
     let after = fx
         .registry
-        .get(&key)
+        .artifact(&key)
         .expect("registry get must not error")
         .expect("record after second sync");
     let refreshed = manifest_file(&after, "init.lua");
@@ -2576,7 +2648,7 @@ fn second_sync_after_revalidation_hits_fast_path_without_reexport() {
     let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
     let recorded = manifest_file(
         &fx.registry
-            .get(&key)
+            .artifact(&key)
             .expect("get")
             .expect("record after first sync"),
         "init.lua",
@@ -2614,11 +2686,10 @@ fn second_sync_after_revalidation_hits_fast_path_without_reexport() {
 
     let refreshed_record = fx
         .registry
-        .get(&key)
+        .artifact(&key)
         .expect("get")
         .expect("record after revalidating sync");
-    let reads_after_reval = counting.read_count();
-    let commit_times_after_reval = counting.commit_time_count();
+    counting.reset_read_probe();
 
     // A further untouched sync must be a pure no-op.
     let third = sync(
@@ -2633,17 +2704,13 @@ fn second_sync_after_revalidation_hits_fast_path_without_reexport() {
     );
     assert_eq!(
         counting.read_count(),
-        reads_after_reval,
-        "the fast-path sync must NOT re-stage a Clean (refreshed) artifact"
-    );
-    assert_eq!(
-        counting.commit_time_count(),
-        commit_times_after_reval,
-        "the fast-path sync must short-circuit before any commit_time round-trip"
+        0,
+        "the fast-path sync must NOT re-stage a Clean (refreshed) artifact: each immutable source \
+         leaf may be read once for digesting, but none may be read again for staging"
     );
     assert_eq!(
         fx.registry
-            .get(&key)
+            .artifact(&key)
             .expect("get")
             .expect("record after third sync"),
         refreshed_record,
@@ -2670,7 +2737,7 @@ fn genuine_content_change_reads_modified_and_persists_no_refresh() {
     let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
     let before = fx
         .registry
-        .get(&key)
+        .artifact(&key)
         .expect("get")
         .expect("record after first sync");
 
@@ -2706,7 +2773,7 @@ fn genuine_content_change_reads_modified_and_persists_no_refresh() {
 
     let after = fx
         .registry
-        .get(&key)
+        .artifact(&key)
         .expect("get")
         .expect("record after skip");
     assert_eq!(
@@ -2734,7 +2801,7 @@ fn read_only_target_detail_never_refreshes_the_record() {
     let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
     let before = fx
         .registry
-        .get(&key)
+        .artifact(&key)
         .expect("get")
         .expect("record after first sync");
     let recorded = manifest_file(&before, "init.lua").clone();
@@ -2745,7 +2812,7 @@ fn read_only_target_detail_never_refreshes_the_record() {
 
     let after = fx
         .registry
-        .get(&key)
+        .artifact(&key)
         .expect("get")
         .expect("record after the read-only query");
     assert_eq!(
@@ -2780,7 +2847,7 @@ fn phora_verify_report_unchanged_by_stat_refresh() {
 
     let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
     let recorded = manifest_file(
-        &fx.registry.get(&key).expect("get").expect("record"),
+        &fx.registry.artifact(&key).expect("get").expect("record"),
         "init.lua",
     )
     .clone();
@@ -2824,7 +2891,7 @@ fn sync_refreshes_every_touched_identical_file_in_a_multi_file_artifact() {
     let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
     let before = fx
         .registry
-        .get(&key)
+        .artifact(&key)
         .expect("registry get must not error")
         .expect("record after first sync");
     let init_before = manifest_file(&before, "init.lua").clone();
@@ -2862,7 +2929,7 @@ fn sync_refreshes_every_touched_identical_file_in_a_multi_file_artifact() {
 
     let after = fx
         .registry
-        .get(&key)
+        .artifact(&key)
         .expect("registry get must not error")
         .expect("record after second sync");
     let init_after = manifest_file(&after, "init.lua");
@@ -2929,7 +2996,7 @@ fn sync_modified_artifact_persists_no_refresh_for_touched_identical_sibling() {
     let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
     let before = fx
         .registry
-        .get(&key)
+        .artifact(&key)
         .expect("registry get must not error")
         .expect("record after first sync");
     let init_before = manifest_file(&before, "init.lua").clone();
@@ -2982,7 +3049,7 @@ fn sync_modified_artifact_persists_no_refresh_for_touched_identical_sibling() {
 
     let after = fx
         .registry
-        .get(&key)
+        .artifact(&key)
         .expect("registry get must not error")
         .expect("record after the skip");
     assert_eq!(
@@ -2996,7 +3063,7 @@ fn sync_modified_artifact_persists_no_refresh_for_touched_identical_sibling() {
 
 /// H1: without `Linked` in the `matches!` guard at the deploy closure, Linked falls to
 /// `None => Overwrite` and re-deploys every sync; this pins the no-op.
-fn assert_linked_artifact_state(dst: &Path, registry: &FileRegistry) {
+fn assert_linked_artifact_state(dst: &Path, registry: &FileStateStore) {
     let state = check_artifact_state(
         dst,
         "editor-src",
@@ -3032,15 +3099,23 @@ fn second_deploy_over_correct_link_is_a_noop() {
     symlink(fx.src.path().join("editor"), &dst).expect("deploy artifact as a symlink");
 
     fx.registry
-        .put(&linked_flat_record("dest", "editor-src", "editor"))
+        .put_artifact(&linked_flat_record("dest", "editor-src", "editor"))
         .expect("seed linked registry record");
     let counting = CountingBackend::new(&fx.backend);
-    let journal = Journal::open(&fx.registry.locks_dir()).expect("open journal");
+    let journal = Journal::open(&fx.registry.journal_root()).expect("open journal");
     let parsed = cfg.parsed_sources().expect("sources parse");
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
     let commits = one_commit(&parsed, "editor-src", "link");
-    let projection = project_workspace(&cfg, &parsed, &remotes, &counting, &commits)
-        .expect("projection builds from the live link inventory");
+    let resolved_sources = resolved_worktree_map(&counting, "editor-src", fx.src.path());
+    let projection = project_workspace(
+        &cfg,
+        &parsed,
+        &remotes,
+        &counting,
+        &commits,
+        &resolved_sources,
+    )
+    .expect("projection builds from the live link inventory");
     let target_projection = projection
         .targets
         .iter()
@@ -3054,6 +3129,7 @@ fn second_deploy_over_correct_link_is_a_noop() {
         config: &cfg,
         parsed: &parsed,
         remotes: &remotes,
+        resolved_sources: &resolved_sources,
         projection: &projection,
         protected: &protected,
         input: &si,
@@ -3079,6 +3155,7 @@ fn second_deploy_over_correct_link_is_a_noop() {
         target_name: "dest",
         target,
         remotes: &remotes,
+        resolved_sources: &resolved_sources,
         vars: &BTreeMap::new(),
         protected: &protected,
     };
@@ -3097,11 +3174,6 @@ fn second_deploy_over_correct_link_is_a_noop() {
         counting.read_count(),
         0,
         "a correct linked artifact must NOT be re-exported on a second sync (H1 re-deploy)"
-    );
-    assert_eq!(
-        counting.commit_time_count(),
-        0,
-        "a no-op linked pass must not perform any backend round-trip"
     );
     assert!(
         std::fs::symlink_metadata(&dst)
@@ -3123,13 +3195,13 @@ fn first_commit(out: &SyncOutput) -> String {
 
 fn check_state_at(
     dst: &Path,
-    reg: &FileRegistry,
+    reg: &FileStateStore,
     target: &str,
     source: &str,
     artifact: &str,
     commit: &str,
 ) -> ArtifactState {
-    crate::deploy::check_artifact_state(
+    crate::sync::inspect::check_artifact_state(
         dst,
         source,
         commit,
@@ -3166,11 +3238,8 @@ fn sync_warns_and_continues_when_one_artifact_export_fails() {
     let git_dir = TempDir::new().expect("git dir");
     let state_dir = TempDir::new().expect("state dir");
     let inner = GitBackend::new(git_dir.path().to_path_buf());
-    let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
-    let backend = FailingReadBackend {
-        inner: &inner,
-        fail_artifact: "lint".to_owned(),
-    };
+    let registry = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
+    let backend = FailingReadBackend::new(&inner, "lint");
     let td = TargetDir::new();
     let cfg = config_one_source_one_target("multi", &url, "dest", &td.target_path(), "by-source");
     let in_ = input(&cfg, None, None, None, false);
@@ -3190,14 +3259,14 @@ fn sync_warns_and_continues_when_one_artifact_export_fails() {
     );
     assert!(
         registry
-            .get(&artifact_key("dest", "multi", "editor"))
+            .artifact(&artifact_key("dest", "multi", "editor"))
             .expect("get good record")
             .is_some(),
         "the successfully deployed artifact must have a registry record"
     );
     assert!(
         registry
-            .get(&artifact_key("dest", "multi", "lint"))
+            .artifact(&artifact_key("dest", "multi", "lint"))
             .expect("get failed record")
             .is_none(),
         "the failed artifact must NOT leave a registry record"
@@ -3212,13 +3281,13 @@ fn sync_warns_and_continues_when_one_artifact_export_fails() {
 /// registry record, for an artifact that no current source exposes.
 fn seed_orphan(
     td: &TargetDir,
-    reg: &FileRegistry,
+    reg: &FileStateStore,
     layout: &crate::config::LayoutConfig,
 ) -> PathBuf {
     let dst = td.artifact_dst(layout, "gone-src", "obsolete");
     std::fs::create_dir_all(&dst).expect("mkdir orphan dst");
     std::fs::write(dst.join("old.txt"), b"stale\n").expect("write orphan file");
-    let record = RegistryRecord {
+    let record = ArtifactRecord {
         version: 1,
         key: artifact_key("dest", "gone-src", "obsolete"),
         source: "gone-src".to_owned(),
@@ -3240,7 +3309,7 @@ fn seed_orphan(
         deploy_root: None,
         layout_separator: None,
     };
-    reg.put(&record).expect("seed orphan record");
+    reg.put_artifact(&record).expect("seed orphan record");
     dst
 }
 
@@ -3305,7 +3374,7 @@ fn frozen_lockless_prune_with_a_pending_orphan_refuses_before_deleting_files() {
     );
     assert!(
         fx.registry
-            .get(&artifact_key("dest", "gone-src", "obsolete"))
+            .artifact(&artifact_key("dest", "gone-src", "obsolete"))
             .expect("get orphan record")
             .is_some(),
         "the orphan's registry record must remain — nothing was pruned"
@@ -3315,11 +3384,10 @@ fn frozen_lockless_prune_with_a_pending_orphan_refuses_before_deleting_files() {
 #[test]
 fn frozen_lockless_fast_forward_with_pending_drops_refuses_before_pruning() {
     let fx = build_sync_fixture();
-    let readonly = crate::store::FrozenReadOnlyRegistry::new(&fx.registry);
     let cwd = TempDir::new().expect("cwd tempdir");
     let protected = test_protected(cwd.path());
     let cfg = Config::parse("version = 1\n").expect("empty config parses");
-    let drops = vec![RegistryRecord {
+    let drops = vec![ArtifactRecord {
         version: 1,
         key: artifact_key("dest", "gone-src", "obsolete"),
         source: "gone-src".to_owned(),
@@ -3341,10 +3409,17 @@ fn frozen_lockless_fast_forward_with_pending_drops_refuses_before_pruning() {
         warnings: Vec::new(),
     };
 
-    let err = prune_fast_forward_drops(&projection, &cfg, &readonly, &protected, &drops)
-        .expect_err(
-            "a read-only fast-forward carrying pending drops must refuse before any delete",
-        );
+    let mut events = SyncEvents::default();
+    let err = prune_fast_forward_drops_report(
+        &projection,
+        &cfg,
+        &fx.registry,
+        &protected,
+        &drops,
+        true,
+        &mut events,
+    )
+    .expect_err("a read-only fast-forward carrying pending drops must refuse before any delete");
 
     let msg = err.to_string();
     assert!(
@@ -3435,14 +3510,14 @@ fn sync_with_prune_removes_orphan_files_and_record_but_keeps_current() {
     );
     assert!(
         fx.registry
-            .get(&artifact_key("dest", "gone-src", "obsolete"))
+            .artifact(&artifact_key("dest", "gone-src", "obsolete"))
             .expect("get orphan record")
             .is_none(),
         "--prune must remove the orphan's registry record"
     );
     assert!(
         fx.registry
-            .get(&artifact_key("dest", "editor-src", "editor"))
+            .artifact(&artifact_key("dest", "editor-src", "editor"))
             .expect("get current record")
             .is_some(),
         "a still-current artifact must NOT be pruned"
@@ -3474,11 +3549,8 @@ fn sync_skips_prune_when_a_deploy_failed() {
     let git_dir = TempDir::new().expect("git dir");
     let state_dir = TempDir::new().expect("state dir");
     let inner = GitBackend::new(git_dir.path().to_path_buf());
-    let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
-    let backend = FailingReadBackend {
-        inner: &inner,
-        fail_artifact: "editor".to_owned(),
-    };
+    let registry = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
+    let backend = FailingReadBackend::new(&inner, "editor");
     let td = TargetDir::new();
     let cfg = config_one_source_one_target("only", &url, "dest", &td.target_path(), "flat");
 
@@ -3513,7 +3585,7 @@ fn sync_skips_prune_when_a_deploy_failed() {
     );
     assert!(
         registry
-            .get(&artifact_key("dest", "gone-src", "obsolete"))
+            .artifact(&artifact_key("dest", "gone-src", "obsolete"))
             .expect("get orphan record")
             .is_some(),
         "--prune must be SKIPPED on failure: the orphan's registry record must remain"
@@ -3525,8 +3597,8 @@ fn sync_skips_prune_when_a_deploy_failed() {
 /// Seed a bare orphan registry record (no files on disk) for `(dest, source, artifact)`.
 /// A flat layout maps the record to `<target>/<artifact>` by artifact name alone, so an
 /// `artifact` that a live binding also publishes lands on that live destination.
-fn seed_orphan_record(reg: &FileRegistry, source: &str, artifact: &str) {
-    let record = RegistryRecord {
+fn seed_orphan_record(reg: &FileStateStore, source: &str, artifact: &str) {
+    let record = ArtifactRecord {
         version: 1,
         key: artifact_key("dest", source, artifact),
         source: source.to_owned(),
@@ -3548,7 +3620,8 @@ fn seed_orphan_record(reg: &FileRegistry, source: &str, artifact: &str) {
         deploy_root: None,
         layout_separator: None,
     };
-    reg.put(&record).expect("seed overlapping orphan record");
+    reg.put_artifact(&record)
+        .expect("seed overlapping orphan record");
 }
 
 #[test]
@@ -3587,7 +3660,7 @@ fn prune_keeps_record_when_orphan_path_overlaps_a_live_dest() {
     );
     assert!(
         fx.registry
-            .get(&artifact_key("dest", "gone-src", "editor"))
+            .artifact(&artifact_key("dest", "gone-src", "editor"))
             .expect("get overlapping orphan record")
             .is_some(),
         "when prune skips the physical delete because the orphan overlaps a live dest, the file \
@@ -3626,7 +3699,7 @@ fn prune_drops_record_when_orphan_path_is_already_absent() {
 
     assert!(
         fx.registry
-            .get(&artifact_key("dest", "gone-src", "obsolete"))
+            .artifact(&artifact_key("dest", "gone-src", "obsolete"))
             .expect("get absent-path orphan record")
             .is_none(),
         "an orphan whose path is already absent has nothing to keep tracked, so its record MUST \
@@ -3669,7 +3742,7 @@ fn prune_deletes_file_and_drops_record_for_a_normal_orphan() {
     );
     assert!(
         fx.registry
-            .get(&artifact_key("dest", "gone-src", "obsolete"))
+            .artifact(&artifact_key("dest", "gone-src", "obsolete"))
             .expect("get normal orphan record")
             .is_none(),
         "a non-overlapping orphan's record must be removed once its files are deleted"
@@ -3719,11 +3792,8 @@ fn sync_cleans_staging_when_export_fails() {
     let git_dir = TempDir::new().expect("git dir");
     let state_dir = TempDir::new().expect("state dir");
     let inner = GitBackend::new(git_dir.path().to_path_buf());
-    let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
-    let backend = FailingReadBackend {
-        inner: &inner,
-        fail_artifact: "editor".to_owned(),
-    };
+    let registry = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
+    let backend = FailingReadBackend::new(&inner, "editor");
     let td = TargetDir::new();
     let cfg = config_one_source_one_target("only", &url, "dest", &td.target_path(), "flat");
     let in_ = input(&cfg, None, None, None, false);
@@ -3937,7 +4007,7 @@ fn interactive_overwrite_redeploys_modified_with_upstream() {
     );
     assert!(
         fx.registry
-            .get(&artifact_key("dest", "editor-src", "editor"))
+            .artifact(&artifact_key("dest", "editor-src", "editor"))
             .expect("registry get must not error")
             .is_some(),
         "Overwrite must leave the registry record in place for the redeployed artifact"
@@ -4024,7 +4094,7 @@ fn interactive_eject_persists_entry_keeps_record_and_files() {
     let git_dir = TempDir::new().expect("git dir");
     let state_dir = TempDir::new().expect("state dir");
     let backend = GitBackend::new(git_dir.path().to_path_buf());
-    let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let registry = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
     let td = TargetDir::new();
     let cfg = config_one_source_one_target("editor-src", &url, "dest", &td.target_path(), "flat");
 
@@ -4051,16 +4121,16 @@ fn interactive_eject_persists_entry_keeps_record_and_files() {
         !out.had_failures,
         "an eject resolution must not fail the run"
     );
-    let ejected = registry.load_ejected("dest").expect("load ejected");
+    let ejected = registry.ejections("dest").expect("load ejected");
     assert!(
         ejected
             .iter()
             .any(|e| e.source == "editor-src" && e.artifact == "editor"),
-        "Eject must persist an EjectedEntry for (editor-src, editor), got {ejected:?}"
+        "Eject must persist an Ejection for (editor-src, editor), got {ejected:?}"
     );
     assert!(
         registry
-            .get(&artifact_key("dest", "editor-src", "editor"))
+            .artifact(&artifact_key("dest", "editor-src", "editor"))
             .expect("registry get must not error")
             .is_some(),
         "Eject must keep the artifact's registry record so list/where render it as ejected"
@@ -4107,7 +4177,7 @@ fn interactive_abort_stops_sync_without_processing_remaining() {
     let git_dir = TempDir::new().expect("git dir");
     let state_dir = TempDir::new().expect("state dir");
     let backend = GitBackend::new(git_dir.path().to_path_buf());
-    let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let registry = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
     let td = TargetDir::new();
     let cfg = config_one_source_one_target("multi", &url, "dest", &td.target_path(), "by-source");
 
@@ -4322,7 +4392,7 @@ impl ConflictResolver for StageWatchResolver {
 
 fn deploy_two_modified(
     backend: &GitBackend,
-    registry: &FileRegistry,
+    registry: &FileStateStore,
     td: &TargetDir,
     cfg: &Config,
 ) -> (Lock, PathBuf, PathBuf) {
@@ -4355,12 +4425,14 @@ fn eject_then_abort_persists_no_ejection_and_leaves_disk_untouched() {
     let git_dir = TempDir::new().expect("git dir");
     let state_dir = TempDir::new().expect("state dir");
     let backend = GitBackend::new(git_dir.path().to_path_buf());
-    let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let registry = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
     let td = TargetDir::new();
     let cfg = config_one_source_one_target("multi", &url, "dest", &td.target_path(), "by-source");
 
     let (base_lock, editor_dir, widget_dir) = deploy_two_modified(&backend, &registry, &td, &cfg);
-    let before = registry.list_all().expect("snapshot records before abort");
+    let before = registry
+        .all_artifacts()
+        .expect("snapshot records before abort");
 
     let resolver = OrderedResolver::new(
         vec![Resolution::Eject, Resolution::Abort],
@@ -4412,12 +4484,14 @@ fn overwrite_then_abort_stages_no_deploy() {
     let git_dir = TempDir::new().expect("git dir");
     let state_dir = TempDir::new().expect("state dir");
     let backend = GitBackend::new(git_dir.path().to_path_buf());
-    let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let registry = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
     let td = TargetDir::new();
     let cfg = config_one_source_one_target("multi", &url, "dest", &td.target_path(), "by-source");
 
     let (base_lock, editor_dir, widget_dir) = deploy_two_modified(&backend, &registry, &td, &cfg);
-    let before = registry.list_all().expect("snapshot records before abort");
+    let before = registry
+        .all_artifacts()
+        .expect("snapshot records before abort");
 
     let resolver = OrderedResolver::new(
         vec![Resolution::Overwrite, Resolution::Abort],
@@ -4463,7 +4537,7 @@ fn every_conflict_is_resolved_before_any_artifact_is_deployed() {
     let git_dir = TempDir::new().expect("git dir");
     let state_dir = TempDir::new().expect("state dir");
     let backend = GitBackend::new(git_dir.path().to_path_buf());
-    let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let registry = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
     let td = TargetDir::new();
     let cfg = config_one_source_one_target("multi", &url, "dest", &td.target_path(), "by-source");
 
@@ -4535,7 +4609,7 @@ fn config_one_source_two_targets(
     Config::parse(&toml).expect("one-source two-target config parses")
 }
 
-fn sort_records(mut records: Vec<RegistryRecord>) -> Vec<RegistryRecord> {
+fn sort_records(mut records: Vec<ArtifactRecord>) -> Vec<ArtifactRecord> {
     records.sort_by(|a, b| {
         (&a.key.target, &a.key.source, &a.key.artifact).cmp(&(
             &b.key.target,
@@ -4547,28 +4621,25 @@ fn sort_records(mut records: Vec<RegistryRecord>) -> Vec<RegistryRecord> {
 }
 
 fn assert_aborted_zero_mutation(
-    registry: &FileRegistry,
-    before_records: &[RegistryRecord],
+    registry: &FileStateStore,
+    before_records: &[ArtifactRecord],
     targets: &[(&str, &TargetDir)],
 ) {
-    let journal = Journal::open(&registry.locks_dir()).expect("open journal");
+    let journal = Journal::open(&registry.journal_root()).expect("open journal");
     assert!(
         journal.entries().expect("read journal entries").is_empty(),
         "abort fail-fast: the deploy journal must hold ZERO entries — no staging intent may be \
          journaled before the global Abort check"
     );
     assert_eq!(
-        sort_records(registry.list_all().expect("list all records")),
+        sort_records(registry.all_artifacts().expect("list all records")),
         sort_records(before_records.to_vec()),
         "abort must leave every registry record byte-identical — no put/remove may run before the \
          global Abort check"
     );
     for (name, td) in targets {
         assert!(
-            registry
-                .load_ejected(name)
-                .expect("load ejected")
-                .is_empty(),
+            registry.ejections(name).expect("load ejected").is_empty(),
             "abort must persist ZERO ejections for target {name}"
         );
         assert!(
@@ -4581,7 +4652,7 @@ fn assert_aborted_zero_mutation(
 
 fn deploy_two_targets_modified(
     fx: &SyncFixture,
-    registry: &FileRegistry,
+    registry: &FileStateStore,
     td_a: &TargetDir,
     td_b: &TargetDir,
     cfg: &Config,
@@ -4632,7 +4703,7 @@ fn cross_target_eject_then_abort_mutates_neither_target() {
         deploy_two_targets_modified(&fx, &fx.registry, &td_a, &td_b, &cfg);
     let before = fx
         .registry
-        .list_all()
+        .all_artifacts()
         .expect("snapshot records before abort");
 
     let resolver = OrderedResolver::new(
@@ -4759,7 +4830,7 @@ fn sync_runs_recovery_sweep_finishing_a_swapped_but_unrecorded_artifact() {
     // The crashed record's source `ghost-src` is bound to no target, so D9's offer check skips
     // it (offered.get(..) is None) — keeping this a pure recovery test, not a sealed-offer one.
     let crashed_key = artifact_key("dest", "ghost-src", "orphan-artifact");
-    let record = RegistryRecord {
+    let record = ArtifactRecord {
         version: 1,
         key: crashed_key.clone(),
         source: "ghost-src".to_owned(),
@@ -4784,7 +4855,7 @@ fn sync_runs_recovery_sweep_finishing_a_swapped_but_unrecorded_artifact() {
 
     let staging_base = td.parent_path.join(".phora-stage");
     let staging = staging_base.join("orphan-artifact-deadbeef");
-    let journal = Journal::open(&fx.registry.locks_dir()).expect("open journal");
+    let journal = Journal::open(&fx.registry.journal_root()).expect("open journal");
     journal
         .append(&JournalEntry {
             staging_base,
@@ -4797,7 +4868,7 @@ fn sync_runs_recovery_sweep_finishing_a_swapped_but_unrecorded_artifact() {
 
     assert!(
         fx.registry
-            .get(&crashed_key)
+            .artifact(&crashed_key)
             .expect("pre-sync get")
             .is_none(),
         "premise: the crashed artifact has no registry record yet"
@@ -4817,7 +4888,7 @@ fn sync_runs_recovery_sweep_finishing_a_swapped_but_unrecorded_artifact() {
 
     assert!(
         fx.registry
-            .get(&crashed_key)
+            .artifact(&crashed_key)
             .expect("post-sync get")
             .is_some(),
         "`orphan-artifact` is not a name Phase 2 discovers (the fixture exposes `editor`), so \
@@ -4825,7 +4896,7 @@ fn sync_runs_recovery_sweep_finishing_a_swapped_but_unrecorded_artifact() {
     );
     assert!(
         fx.registry
-            .get(&artifact_key("dest", "editor-src", "editor"))
+            .artifact(&artifact_key("dest", "editor-src", "editor"))
             .expect("post-sync get for editor")
             .is_some(),
         "premise: Phase 2 deploys the discovered `editor` artifact (distinct from the swept one), \
@@ -4848,46 +4919,32 @@ struct FailingResolveBackend<'a> {
 }
 
 impl SourceStore for FailingResolveBackend<'_> {
-    fn inventory(&self, source: &ResolvedSource) -> SourceResult<SourceInventory> {
-        self.inner.inventory(source)
-    }
-
-    fn read(&self, source: &ResolvedSource, path: &SourcePath) -> SourceResult<SourceEntry> {
-        self.inner.read(source, path)
-    }
-}
-
-impl SourceBackend for FailingResolveBackend<'_> {
-    fn fetch(&self, source: &crate::source::SourceName, url: &str) -> SourceResult<()> {
-        self.inner.fetch(source, url)
-    }
     fn resolve(
         &self,
-        _source: &crate::source::SourceName,
-        _url: &str,
-        _refspec: &Refspec,
-    ) -> SourceResult<String> {
+        _request: &ResolveRequest,
+        _policy: ResolvePolicy,
+    ) -> SourceResult<ResolvedSource> {
         Err(SourceError::Source("injected resolve failure".to_owned()))
     }
-    fn commit_time(
+
+    fn inventory(
         &self,
-        source: &crate::source::SourceName,
-        url: &str,
-        commit: &str,
-    ) -> SourceResult<u64> {
-        self.inner.commit_time(source, url, commit)
+        snapshot: &SnapshotId,
+        root: Option<&SourcePath>,
+    ) -> SourceResult<SourceInventory> {
+        SourceStore::inventory(self.inner, snapshot, root)
     }
-    fn compute_digest(
+
+    fn read(&self, snapshot: &SnapshotId, path: &SourcePath) -> SourceResult<SourceEntry> {
+        SourceStore::read(self.inner, snapshot, path)
+    }
+
+    fn list_directory(
         &self,
-        source: &crate::source::SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        include: &[String],
-        exclude: &[String],
-    ) -> SourceResult<String> {
-        self.inner
-            .compute_digest(source, url, commit, root, include, exclude)
+        snapshot: &SnapshotId,
+        path: Option<&SourcePath>,
+    ) -> SourceResult<Vec<SourceDirectoryEntry>> {
+        SourceStore::list_directory(self.inner, snapshot, path)
     }
 }
 
@@ -4903,7 +4960,7 @@ fn sync_runs_recovery_before_phase1_even_when_resolve_fails() {
     std::fs::write(crashed_dst.join("recovered.txt"), b"recovered\n").expect("write dst file");
 
     let crashed_key = artifact_key("dest", "editor-src", "orphan-artifact");
-    let record = RegistryRecord {
+    let record = ArtifactRecord {
         version: 1,
         key: crashed_key.clone(),
         source: "editor-src".to_owned(),
@@ -4928,7 +4985,7 @@ fn sync_runs_recovery_before_phase1_even_when_resolve_fails() {
 
     let staging_base = td.parent_path.join(".phora-stage");
     let staging = staging_base.join("orphan-artifact-deadbeef");
-    let journal = Journal::open(&fx.registry.locks_dir()).expect("open journal");
+    let journal = Journal::open(&fx.registry.journal_root()).expect("open journal");
     journal
         .append(&JournalEntry {
             staging_base,
@@ -4941,7 +4998,7 @@ fn sync_runs_recovery_before_phase1_even_when_resolve_fails() {
 
     assert!(
         fx.registry
-            .get(&crashed_key)
+            .artifact(&crashed_key)
             .expect("pre-sync get")
             .is_none(),
         "premise: the crashed artifact has no registry record yet"
@@ -4961,7 +5018,7 @@ fn sync_runs_recovery_before_phase1_even_when_resolve_fails() {
 
     assert!(
         fx.registry
-            .get(&crashed_key)
+            .artifact(&crashed_key)
             .expect("post-sync get")
             .is_some(),
         "recovery must run at the TRUE START (before Phase 1): the crashed record exists only \
@@ -4982,7 +5039,7 @@ fn sync_runs_recovery_before_phase1_even_when_resolve_fails() {
 /// deployed files on disk at the flat-layout dst. Returns the deployed artifact dir.
 fn seed_managed_artifact(
     td: &TargetDir,
-    reg: &FileRegistry,
+    reg: &FileStateStore,
     source: &str,
     artifact: &str,
     file: &str,
@@ -4991,7 +5048,7 @@ fn seed_managed_artifact(
     let dst = td.artifact_dst(&flat_layout(), source, artifact);
     std::fs::create_dir_all(&dst).expect("mkdir managed dst");
     std::fs::write(dst.join(file), content).expect("write managed file");
-    let record = RegistryRecord {
+    let record = ArtifactRecord {
         version: 1,
         key: artifact_key("dest", source, artifact),
         source: source.to_owned(),
@@ -5013,7 +5070,7 @@ fn seed_managed_artifact(
         deploy_root: None,
         layout_separator: None,
     };
-    reg.put(&record).expect("seed managed record");
+    reg.put_artifact(&record).expect("seed managed record");
     dst
 }
 
@@ -5037,7 +5094,7 @@ fn eject_adds_ejected_entry_keeps_record_and_files() {
     let key = artifact_key("dest", "editor-src", "editor");
     assert!(
         fx.registry
-            .get(&key)
+            .artifact(&key)
             .expect("registry get must not error")
             .is_some(),
         "premise: the artifact must be MANAGED (record present) before eject"
@@ -5046,21 +5103,21 @@ fn eject_adds_ejected_entry_keeps_record_and_files() {
     eject(&cfg, &fx.registry, "editor", "editor-src", "dest")
         .expect("eject a managed artifact must succeed");
 
-    let ejected = fx.registry.load_ejected("dest").expect("load ejected");
+    let ejected = fx.registry.ejections("dest").expect("load ejected");
     assert!(
         ejected
             .iter()
             .any(|e| e.source == "editor-src" && e.artifact == "editor"),
-        "eject must add an EjectedEntry for (editor-src, editor), got {ejected:?}"
+        "eject must add an Ejection for (editor-src, editor), got {ejected:?}"
     );
     assert!(
         fx.registry
-            .get(&key)
+            .artifact(&key)
             .expect("registry get must not error")
             .is_some(),
         "eject must KEEP the registry record so list/where can render it as ejected"
     );
-    let state = crate::deploy::check_artifact_state(
+    let state = crate::sync::inspect::check_artifact_state(
         &dst,
         "editor-src",
         "any-commit",
@@ -5072,7 +5129,7 @@ fn eject_adds_ejected_entry_keeps_record_and_files() {
     )
     .expect("check_artifact_state");
     assert!(
-        matches!(state, crate::deploy::ArtifactState::Ejected),
+        matches!(state, crate::sync::inspect::ArtifactState::Ejected),
         "a kept record plus its ejected entry must read as Ejected, got {state:?}"
     );
     assert_eq!(
@@ -5088,15 +5145,13 @@ fn eject_persists_entry_across_a_reopened_registry() {
     let fx = build_sync_fixture();
     let td = TargetDir::new();
     let cfg = eject_target_config(&td, &fx);
-    let reg = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let reg = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
     seed_managed_artifact(&td, &reg, "editor-src", "editor", "init.lua", b"-- init\n");
 
     eject(&cfg, &reg, "editor", "editor-src", "dest").expect("eject must succeed");
 
-    let reopened = FileRegistry::open(state_dir.path().to_path_buf()).expect("reopen registry");
-    let ejected = reopened
-        .load_ejected("dest")
-        .expect("load ejected reopened");
+    let reopened = FileStateStore::open(state_dir.path().to_path_buf()).expect("reopen registry");
+    let ejected = reopened.ejections("dest").expect("load ejected reopened");
     assert!(
         ejected
             .iter()
@@ -5112,25 +5167,25 @@ fn uneject_removes_matching_entry_and_leaves_others() {
     let cfg = eject_target_config(&td, &fx);
 
     let seeded = vec![
-        EjectedEntry {
+        Ejection {
             source: "editor-src".to_owned(),
             artifact: "editor".to_owned(),
             ejected_at: "2026-01-31T14:00:00Z".to_owned(),
         },
-        EjectedEntry {
+        Ejection {
             source: "other-src".to_owned(),
             artifact: "widget".to_owned(),
             ejected_at: "2026-01-30T10:00:00Z".to_owned(),
         },
     ];
     fx.registry
-        .save_ejected("dest", &seeded)
+        .save_ejections("dest", &seeded)
         .expect("seed ejected entries");
 
     uneject(&cfg, &fx.registry, "editor", "editor-src", "dest")
         .expect("uneject an ejected artifact must succeed");
 
-    let ejected = fx.registry.load_ejected("dest").expect("load ejected");
+    let ejected = fx.registry.ejections("dest").expect("load ejected");
     assert!(
         !ejected
             .iter()
@@ -5152,7 +5207,7 @@ fn uneject_removes_matching_entry_and_leaves_others() {
 /// `files`: (relative path, content) pairs; all live under the flat-layout dst.
 fn seed_verifiable_artifact(
     td: &TargetDir,
-    reg: &FileRegistry,
+    reg: &FileStateStore,
     source: &str,
     artifact: &str,
     files: &[(&str, &[u8])],
@@ -5174,7 +5229,7 @@ fn seed_verifiable_artifact(
             }
         })
         .collect();
-    let record = RegistryRecord {
+    let record = ArtifactRecord {
         version: 1,
         key: artifact_key("dest", source, artifact),
         source: source.to_owned(),
@@ -5191,7 +5246,7 @@ fn seed_verifiable_artifact(
         deploy_root: None,
         layout_separator: None,
     };
-    reg.put(&record).expect("seed verifiable record");
+    reg.put_artifact(&record).expect("seed verifiable record");
     dst
 }
 
@@ -5242,9 +5297,9 @@ fn verify_skips_ejected_artifacts() {
     );
     std::fs::write(dst.join("init.lua"), b"locally edited after eject").expect("tamper file");
     fx.registry
-        .save_ejected(
+        .save_ejections(
             "dest",
-            &[crate::store::EjectedEntry {
+            &[crate::sync::state::Ejection {
                 source: "editor-src".to_owned(),
                 artifact: "editor".to_owned(),
                 ejected_at: "2026-01-01T00:00:00Z".to_owned(),
@@ -5385,7 +5440,7 @@ fn rebuild_reconstructs_lost_record_with_same_commit_digest_and_files() {
 
     let original = fx
         .registry
-        .get(&key)
+        .artifact(&key)
         .expect("registry get must not error")
         .expect("premise: sync must have recorded the artifact");
     let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
@@ -5395,9 +5450,14 @@ fn rebuild_reconstructs_lost_record_with_same_commit_digest_and_files() {
     );
 
     // Lose the registry state but keep files + mirror + config + lock.
-    fx.registry.remove(&key).expect("drop the registry record");
+    fx.registry
+        .remove_artifact(&key)
+        .expect("drop the registry record");
     assert!(
-        fx.registry.get(&key).expect("get after remove").is_none(),
+        fx.registry
+            .artifact(&key)
+            .expect("get after remove")
+            .is_none(),
         "premise: the record must be gone before rebuild"
     );
 
@@ -5406,7 +5466,7 @@ fn rebuild_reconstructs_lost_record_with_same_commit_digest_and_files() {
 
     let rebuilt = fx
         .registry
-        .get(&key)
+        .artifact(&key)
         .expect("registry get must not error")
         .expect("rebuild must reconstruct the dropped record");
 
@@ -5420,7 +5480,7 @@ fn rebuild_reconstructs_lost_record_with_same_commit_digest_and_files() {
              (recomputed by re-walking the mirror at the locked commit)"
     );
 
-    let file_hashes = |rec: &RegistryRecord| -> BTreeSet<(PathBuf, String)> {
+    let file_hashes = |rec: &ArtifactRecord| -> BTreeSet<(PathBuf, String)> {
         rec.files
             .iter()
             .map(|f| (f.path.clone(), f.blake3.clone()))
@@ -5449,15 +5509,17 @@ fn rebuild_reconstructs_lost_record_with_same_commit_digest_and_files() {
 fn rebuild_preserves_ejected_entries() {
     let (fx, _td, cfg, lock) = rebuild_setup();
     let key = artifact_key("dest", "editor-src", "editor");
-    fx.registry.remove(&key).expect("drop the registry record");
+    fx.registry
+        .remove_artifact(&key)
+        .expect("drop the registry record");
 
-    let ejected = EjectedEntry {
+    let ejected = Ejection {
         source: "editor-src".to_owned(),
         artifact: "other".to_owned(),
         ejected_at: "2026-01-01T00:00:00Z".to_owned(),
     };
     fx.registry
-        .save_ejected("dest", std::slice::from_ref(&ejected))
+        .save_ejections("dest", std::slice::from_ref(&ejected))
         .expect("seed an ejected entry before rebuild");
 
     rebuild_registry(&cfg, &lock, &fx.backend, &fx.registry)
@@ -5465,7 +5527,7 @@ fn rebuild_preserves_ejected_entries() {
 
     let after = fx
         .registry
-        .load_ejected("dest")
+        .ejections("dest")
         .expect("load ejected after rebuild");
     assert!(
         after.contains(&ejected),
@@ -5477,7 +5539,9 @@ fn rebuild_preserves_ejected_entries() {
 fn rebuild_reports_modified_when_disk_content_fails_recomputed_hash() {
     let (fx, td, cfg, lock) = rebuild_setup();
     let key = artifact_key("dest", "editor-src", "editor");
-    fx.registry.remove(&key).expect("drop the registry record");
+    fx.registry
+        .remove_artifact(&key)
+        .expect("drop the registry record");
 
     let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
     let file = dst.join("init.lua");
@@ -5705,6 +5769,24 @@ fn config_link_source_one_target_with_layout(
     Config::parse(&toml).expect("link-source config parses")
 }
 
+fn config_link_source_two_targets(
+    source: &str,
+    link_git: &Path,
+    first_target: &Path,
+    second_target: &Path,
+) -> Config {
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.{source}]\ngit = \"{}\"\nbranch = \"main\"\ndeploy = \"link\"\n\n\
+         [targets.first]\npath = \"{}\"\nsources = [\"{source}\"]\nlayout = \"by-source\"\n\n\
+         [targets.second]\npath = \"{}\"\nsources = [\"{source}\"]\nlayout = \"by-source\"\n",
+        link_git.display(),
+        first_target.display(),
+        second_target.display(),
+    );
+    Config::parse(&toml).expect("shared link-source config parses")
+}
+
 fn link_lock(source: &str, link_git: &Path) -> Lock {
     Lock {
         version: 1,
@@ -5757,9 +5839,57 @@ fn rebuild_discovers_link_source_from_disk_never_via_odb() {
     );
 }
 
-fn fx_registry() -> FileRegistry {
+#[test]
+fn rebuild_resolves_shared_link_source_once_for_multiple_targets() {
+    let wt = build_worktree(None);
+    let first = TargetDir::new();
+    let second = TargetDir::new();
+    let cfg = config_link_source_two_targets(
+        "linked-src",
+        wt.path(),
+        &first.target_path(),
+        &second.target_path(),
+    );
+    let lock = link_lock("linked-src", wt.path());
+    let backend = fx_backend();
+    let counting = CountingBackend::new(&backend);
+    let registry = fx_registry();
+
+    let report = rebuild_registry(&cfg, &lock, &counting, &registry)
+        .expect("rebuild over one shared link source must succeed");
+
+    for target in ["first", "second"] {
+        let key = artifact_key(target, "linked-src", "alpha");
+        assert!(
+            report.reconstructed.contains(&key),
+            "the shared source must reconstruct alpha for target {target}, got {:?}",
+            report.reconstructed
+        );
+        let record = registry
+            .artifact(&key)
+            .expect("registry read")
+            .unwrap_or_else(|| panic!("rebuild must record alpha for target {target}"));
+        assert_eq!(
+            record.commit, "link",
+            "each target must retain the shared link source's effective-ref map entry"
+        );
+        assert!(
+            record.linked,
+            "each target must retain link materialization semantics"
+        );
+    }
+
+    assert_eq!(
+        counting.resolve_count(),
+        1,
+        "registry rebuild must resolve and capture one shared worktree snapshot once, even when \
+         that source is bound by multiple targets"
+    );
+}
+
+fn fx_registry() -> FileStateStore {
     let state = TempDir::new().expect("registry state dir");
-    let reg = FileRegistry::open(state.path().to_path_buf()).expect("open registry");
+    let reg = FileStateStore::open(state.path().to_path_buf()).expect("open registry");
     std::mem::forget(state);
     reg
 }
@@ -5776,7 +5906,7 @@ fn verify_skips_linked_record_even_with_stray_manifest_file() {
     let td = TargetDir::new();
     let cfg = verify_config(&td, &fx);
 
-    let stray = RegistryRecord {
+    let stray = ArtifactRecord {
         version: 1,
         key: artifact_key("dest", "editor-src", "editor"),
         source: "editor-src".to_owned(),
@@ -5799,7 +5929,7 @@ fn verify_skips_linked_record_even_with_stray_manifest_file() {
         layout_separator: None,
     };
     fx.registry
-        .put(&stray)
+        .put_artifact(&stray)
         .expect("seed a linked record carrying a stray manifest file");
 
     let mismatches = verify(&cfg, &fx.registry, None)
@@ -5833,7 +5963,7 @@ fn verify_skips_linked_record_over_edited_symlink_target() {
     let live = fx.src.path().join("editor");
     symlink(&live, &dst).expect("deploy the linked artifact as a symlink");
 
-    let linked = RegistryRecord {
+    let linked = ArtifactRecord {
         version: 1,
         key: artifact_key("dest", "editor-src", "editor"),
         source: "editor-src".to_owned(),
@@ -5850,7 +5980,9 @@ fn verify_skips_linked_record_over_edited_symlink_target() {
         deploy_root: None,
         layout_separator: None,
     };
-    fx.registry.put(&linked).expect("seed linked record");
+    fx.registry
+        .put_artifact(&linked)
+        .expect("seed linked record");
 
     // Edit the live working-tree target through which the symlink resolves.
     std::fs::write(live.join("init.lua"), b"-- EDITED LIVE\n")
@@ -5896,7 +6028,7 @@ fn rebuild_keeps_linked_and_excludes_symlink_from_foreign() {
         .expect("rebuild over a link source must succeed");
 
     let record = registry
-        .get(&artifact_key("dest", "linked-src", "alpha"))
+        .artifact(&artifact_key("dest", "linked-src", "alpha"))
         .expect("registry read")
         .expect("rebuild must reconstruct the alpha record");
     assert!(
@@ -5948,7 +6080,7 @@ fn prune_removes_stale_linked_symlink_without_following_it() {
 
     let registry = fx_registry();
     registry
-        .put(&RegistryRecord {
+        .put_artifact(&ArtifactRecord {
             version: 1,
             key: artifact_key("dest", "linked-src", "stale"),
             source: "linked-src".to_owned(),
@@ -5972,8 +6104,17 @@ fn prune_removes_stale_linked_symlink_without_following_it() {
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
 
     let protected = test_protected(&std::env::temp_dir());
-    let projection = project_workspace(&cfg, &parsed, &remotes, &fx_backend(), &commits)
-        .expect("projection builds");
+    let backend = fx_backend();
+    let resolved_sources = resolved_worktree_map(&backend, "linked-src", wt.path());
+    let projection = project_workspace(
+        &cfg,
+        &parsed,
+        &remotes,
+        &backend,
+        &commits,
+        &resolved_sources,
+    )
+    .expect("projection builds");
     prune_projected(&projection, &cfg, &registry, &protected)
         .expect("prune must remove the orphaned linked artifact");
 
@@ -5989,7 +6130,7 @@ fn prune_removes_stale_linked_symlink_without_following_it() {
     );
     assert!(
         registry
-            .get(&artifact_key("dest", "linked-src", "stale"))
+            .artifact(&artifact_key("dest", "linked-src", "stale"))
             .expect("registry read")
             .is_none(),
         "the orphaned linked record must be removed from the registry"
@@ -6028,7 +6169,7 @@ fn prune_drops_a_stale_dir_record_once_the_plan_flips_leaf_granular() {
 
     let registry = fx_registry();
     registry
-        .put(&RegistryRecord {
+        .put_artifact(&ArtifactRecord {
             version: 1,
             key: artifact_key("dest", "linked-src", "alpha"),
             source: "linked-src".to_owned(),
@@ -6052,8 +6193,17 @@ fn prune_drops_a_stale_dir_record_once_the_plan_flips_leaf_granular() {
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
     let protected = test_protected(&std::env::temp_dir());
 
-    let projection = project_workspace(&cfg, &parsed, &remotes, &fx_backend(), &commits)
-        .expect("projection builds");
+    let backend = fx_backend();
+    let resolved_sources = resolved_worktree_map(&backend, "linked-src", wt.path());
+    let projection = project_workspace(
+        &cfg,
+        &parsed,
+        &remotes,
+        &backend,
+        &commits,
+        &resolved_sources,
+    )
+    .expect("projection builds");
     prune_projected(&projection, &cfg, &registry, &protected).expect("prune runs");
 
     assert!(
@@ -6065,7 +6215,7 @@ fn prune_drops_a_stale_dir_record_once_the_plan_flips_leaf_granular() {
     );
     assert!(
         registry
-            .get(&artifact_key("dest", "linked-src", "alpha"))
+            .artifact(&artifact_key("dest", "linked-src", "alpha"))
             .expect("registry read")
             .is_none(),
         "the stale dir-granular `alpha` RECORD must still be reconciled out once the plan resolves \
@@ -6090,15 +6240,21 @@ fn seed_two_leaf_dir_repo() -> (TempDir, TempDir, GitBackend, String, String) {
 
     let git_dir = TempDir::new().expect("git dir");
     let backend = GitBackend::new(git_dir.path().to_path_buf());
-    backend.fetch(&sn("ed"), &url).expect("seed mirror");
-    let commit = backend
-        .resolve(&sn("ed"), &url, &Refspec::Branch("main".into()))
-        .expect("resolve HEAD");
+    let commit = resolve_git_source(
+        &backend,
+        "ed",
+        &url,
+        RevisionSpec::Branch("main".into()),
+        ResolvePolicy::Refresh,
+    )
+    .snapshot
+    .commit()
+    .to_string();
     (src, git_dir, backend, url, commit)
 }
 
-fn leaf_record(target: &str, identity: &str, key: &str) -> RegistryRecord {
-    RegistryRecord {
+fn leaf_record(target: &str, identity: &str, key: &str) -> ArtifactRecord {
+    ArtifactRecord {
         version: 1,
         key: artifact_key(target, identity, key),
         source: "ed".to_owned(),
@@ -6117,7 +6273,7 @@ fn leaf_record(target: &str, identity: &str, key: &str) -> RegistryRecord {
     }
 }
 
-fn dir_record(target: &str, identity: &str, key: &str) -> RegistryRecord {
+fn dir_record(target: &str, identity: &str, key: &str) -> ArtifactRecord {
     let mut record = leaf_record(target, identity, key);
     record.kind = RecordKind::Dir;
     record.digest = "blake3:dir".to_owned();
@@ -6128,14 +6284,16 @@ fn dir_record(target: &str, identity: &str, key: &str) -> RegistryRecord {
 fn prune_one(
     cfg: &Config,
     backend: &GitBackend,
-    registry: &FileRegistry,
+    registry: &FileStateStore,
     commit: &str,
 ) -> Result<()> {
     let parsed = cfg.parsed_sources().expect("sources parse");
     let remotes = resolved_remotes(cfg, &parsed).expect("remotes resolve");
     let commits = one_commit(&parsed, "ed", commit);
+    let resolved_sources = resolved_git_map(backend, "ed", &remotes["ed"], commit);
     let protected = test_protected(&std::env::temp_dir());
-    let projection = project_workspace(cfg, &parsed, &remotes, backend, &commits)?;
+    let projection =
+        project_workspace(cfg, &parsed, &remotes, backend, &commits, &resolved_sources)?;
     prune_projected(&projection, cfg, registry, &protected)
 }
 
@@ -6162,10 +6320,10 @@ fn prune_reconciles_a_stale_dir_record_without_destroying_a_live_leaf_under_it()
 
     let registry = fx_registry();
     registry
-        .put(&dir_record("dest", "ed", "editor"))
+        .put_artifact(&dir_record("dest", "ed", "editor"))
         .expect("seed stale dir record");
     registry
-        .put(&leaf_record("dest", "ed", "editor/a.md"))
+        .put_artifact(&leaf_record("dest", "ed", "editor/a.md"))
         .expect("seed live leaf record");
 
     prune_one(&cfg, &backend, &registry, &commit).expect("prune runs");
@@ -6202,10 +6360,10 @@ fn prune_reconciles_a_stale_leaf_record_without_traversing_a_collapsed_symlink_i
 
     let registry = fx_registry();
     registry
-        .put(&dir_record("dest", "ed", "editor"))
+        .put_artifact(&dir_record("dest", "ed", "editor"))
         .expect("seed live collapsed dir record");
     registry
-        .put(&leaf_record("dest", "ed", "editor/a.md"))
+        .put_artifact(&leaf_record("dest", "ed", "editor/a.md"))
         .expect("seed stale per-leaf record");
 
     prune_one(&cfg, &backend, &registry, &commit).expect("prune runs");
@@ -6242,14 +6400,14 @@ fn prune_flips_collapse_to_per_leaf_pruning_the_stale_dir_record() {
 
     let registry = fx_registry();
     registry
-        .put(&dir_record("dest", "ed", "editor"))
+        .put_artifact(&dir_record("dest", "ed", "editor"))
         .expect("seed stale dir record");
 
     prune_one(&cfg, &backend, &registry, &commit).expect("prune runs");
 
     assert!(
         registry
-            .get(&artifact_key("dest", "ed", "editor"))
+            .artifact(&artifact_key("dest", "ed", "editor"))
             .expect("registry read")
             .is_none(),
         "the stale collapsed `editor` dir RECORD is an EXACT-match orphan once the plan resolves \
@@ -6286,10 +6444,10 @@ fn prune_flips_per_leaf_to_collapse_pruning_the_stale_leaf_records() {
     }
     let registry = fx_registry();
     registry
-        .put(&leaf_record("dest", "ed", "editor/a.md"))
+        .put_artifact(&leaf_record("dest", "ed", "editor/a.md"))
         .expect("seed stale a.md record");
     registry
-        .put(&leaf_record("dest", "ed", "editor/b.md"))
+        .put_artifact(&leaf_record("dest", "ed", "editor/b.md"))
         .expect("seed stale b.md record");
 
     prune_one(&cfg, &backend, &registry, &commit).expect("prune runs");
@@ -6297,7 +6455,7 @@ fn prune_flips_per_leaf_to_collapse_pruning_the_stale_leaf_records() {
     for leaf in ["editor/a.md", "editor/b.md"] {
         assert!(
             registry
-                .get(&artifact_key("dest", "ed", leaf))
+                .artifact(&artifact_key("dest", "ed", leaf))
                 .expect("registry read")
                 .is_none(),
             "the stale per-leaf record `{leaf}` is an EXACT-match orphan once the plan collapses \
@@ -6331,24 +6489,24 @@ fn prune_narrowing_take_prunes_the_untaken_leaf_keeps_the_taken_one() {
 
     let registry = fx_registry();
     registry
-        .put(&leaf_record("dest", "ed", "editor/a.md"))
+        .put_artifact(&leaf_record("dest", "ed", "editor/a.md"))
         .expect("seed taken record");
     registry
-        .put(&leaf_record("dest", "ed", "editor/b.md"))
+        .put_artifact(&leaf_record("dest", "ed", "editor/b.md"))
         .expect("seed untaken record");
 
     prune_one(&cfg, &backend, &registry, &commit).expect("prune runs");
 
     assert!(
         registry
-            .get(&artifact_key("dest", "ed", "editor/a.md"))
+            .artifact(&artifact_key("dest", "ed", "editor/a.md"))
             .expect("registry read")
             .is_some(),
         "the still-taken leaf `editor/a.md` must survive prune"
     );
     assert!(
         registry
-            .get(&artifact_key("dest", "ed", "editor/b.md"))
+            .artifact(&artifact_key("dest", "ed", "editor/b.md"))
             .expect("registry read")
             .is_none(),
         "the now-untaken leaf `editor/b.md` is an orphan and must be pruned"
@@ -6385,24 +6543,24 @@ fn prune_is_instance_granular_across_two_aliases_of_one_source() {
 
     let registry = fx_registry();
     registry
-        .put(&leaf_record("dest", "one", "editor/a.md"))
+        .put_artifact(&leaf_record("dest", "one", "editor/a.md"))
         .expect("seed one's stale a.md (now untaken under `one`)");
     registry
-        .put(&leaf_record("dest", "two", "editor/a.md"))
+        .put_artifact(&leaf_record("dest", "two", "editor/a.md"))
         .expect("seed two's a.md (still taken under `two`)");
 
     prune_one(&cfg, &backend, &registry, &commit).expect("prune runs");
 
     assert!(
         registry
-            .get(&artifact_key("dest", "one", "editor/a.md"))
+            .artifact(&artifact_key("dest", "one", "editor/a.md"))
             .expect("registry read")
             .is_none(),
         "alias `one` no longer takes `editor/a.md`; ITS record is an orphan and must be pruned"
     );
     assert!(
         registry
-            .get(&artifact_key("dest", "two", "editor/a.md"))
+            .artifact(&artifact_key("dest", "two", "editor/a.md"))
             .expect("registry read")
             .is_some(),
         "alias `two` still takes its identically-named `editor/a.md`; instance-granular buckets \
@@ -6432,7 +6590,7 @@ fn prune_keeps_a_foreign_orphan_dir_that_ancestors_a_live_leaf_of_another_bindin
 
     let registry = fx_registry();
     registry
-        .put(&RegistryRecord {
+        .put_artifact(&ArtifactRecord {
             version: 1,
             key: artifact_key("dest", "gone-src", "editor"),
             source: "gone-src".to_owned(),
@@ -6466,7 +6624,7 @@ fn prune_keeps_a_foreign_orphan_dir_that_ancestors_a_live_leaf_of_another_bindin
     );
     assert!(
         registry
-            .get(&artifact_key("dest", "gone-src", "editor"))
+            .artifact(&artifact_key("dest", "gone-src", "editor"))
             .expect("registry read")
             .is_some(),
         "UNTRACKED-FILE INVARIANT: a different binding's live leaf sits UNDER this orphan dir, but \
@@ -6494,7 +6652,7 @@ fn prune_keeps_a_foreign_orphan_leaf_nested_under_a_live_collapsed_dir_of_anothe
 
     let registry = fx_registry();
     registry
-        .put(&RegistryRecord {
+        .put_artifact(&ArtifactRecord {
             version: 1,
             key: artifact_key("dest", "gone-src", "editor/legacy.txt"),
             source: "gone-src".to_owned(),
@@ -6523,7 +6681,7 @@ fn prune_keeps_a_foreign_orphan_leaf_nested_under_a_live_collapsed_dir_of_anothe
     );
     assert!(
         registry
-            .get(&artifact_key("dest", "gone-src", "editor/legacy.txt"))
+            .artifact(&artifact_key("dest", "gone-src", "editor/legacy.txt"))
             .expect("registry read")
             .is_some(),
         "UNTRACKED-FILE INVARIANT: the live collapsed `editor` dir belongs to ANOTHER binding and \
@@ -6927,7 +7085,7 @@ fn linked_artifact_deploys_as_symlink_to_working_tree() {
         "a link-mode artifact must be deployed as a SYMLINK, not a copied directory"
     );
 
-    let want = fx.src.path().join("editor");
+    let want = canonical_fixture_target(&fx.src.path().join("editor"));
     let got = std::fs::read_link(&dst).expect("the deployed symlink must be readable");
     assert_eq!(
         got, want,
@@ -6947,7 +7105,7 @@ fn linked_artifact_deploys_as_symlink_to_working_tree() {
     let key = artifact_key("dest", "dev-src", "editor");
     let record = fx
         .registry
-        .get(&key)
+        .artifact(&key)
         .expect("registry read")
         .expect("a record must be written for the linked artifact");
     assert!(
@@ -6968,7 +7126,7 @@ fn linked_record_is_linked_not_copy() {
     let key = artifact_key("dest", "dev-src", "editor");
     let record = fx
         .registry
-        .get(&key)
+        .artifact(&key)
         .expect("registry read")
         .expect("a record must be written for the linked artifact");
     assert!(record.linked, "linked record must carry linked=true");
@@ -7057,8 +7215,8 @@ fn symlink_failure_warns_skips_and_continues() {
     );
     assert_eq!(
         std::fs::read_link(&ok_dst).expect("healthy symlink readable"),
-        ok_src.path().join("beta"),
-        "the healthy link must point at its absolute working-tree target"
+        canonical_fixture_target(&ok_src.path().join("beta")),
+        "the healthy link must point at its canonical absolute working-tree target"
     );
     drop((blocked_src, ok_src, copy_src));
 }
@@ -7101,8 +7259,8 @@ fn orphaned_link_staging_does_not_wedge_next_deploy() {
     );
     assert_eq!(
         std::fs::read_link(&dst).expect("the deployed symlink must be readable"),
-        fx.src.path().join("editor"),
-        "the deploy must point at the correct absolute <source>/<artifact> target"
+        canonical_fixture_target(&fx.src.path().join("editor")),
+        "the deploy must point at the correct canonical absolute <source>/<artifact> target"
     );
 }
 
@@ -7138,8 +7296,9 @@ fn stale_link_with_wrong_target_is_repointed() {
     );
     assert_eq!(
         std::fs::read_link(&dst).expect("re-pointed symlink readable"),
-        fx.src.path().join("editor"),
-        "a stale link with the wrong target must be re-pointed to the CORRECT absolute target"
+        canonical_fixture_target(&fx.src.path().join("editor")),
+        "a stale link with the wrong target must be re-pointed to the CORRECT canonical absolute \
+         target"
     );
 }
 
@@ -7178,7 +7337,7 @@ fn transition_copy_to_link_materializes_symlink() {
     let key = artifact_key("dest", "dev-src", "editor");
     let copy_rec = fx
         .registry
-        .get(&key)
+        .artifact(&key)
         .expect("registry read")
         .expect("copy leg writes a record");
     assert!(!copy_rec.linked, "premise: a copy record is linked=false");
@@ -7205,13 +7364,14 @@ fn transition_copy_to_link_materializes_symlink() {
     );
     assert_eq!(
         std::fs::read_link(&dst).expect("transitioned symlink readable"),
-        fx.src.path().join("editor"),
-        "the materialized symlink must point at the absolute working-tree <source>/<artifact>"
+        canonical_fixture_target(&fx.src.path().join("editor")),
+        "the materialized symlink must point at the canonical absolute working-tree \
+         <source>/<artifact>"
     );
 
     let link_rec = fx
         .registry
-        .get(&key)
+        .artifact(&key)
         .expect("registry read")
         .expect("link leg rewrites the record");
     assert!(
@@ -7251,7 +7411,7 @@ fn transition_link_to_copy_materializes_real_copy() {
     );
     let link_rec = fx
         .registry
-        .get(&key)
+        .artifact(&key)
         .expect("registry read")
         .expect("link leg writes a record");
     assert!(link_rec.linked, "premise: a link record is linked=true");
@@ -7278,7 +7438,7 @@ fn transition_link_to_copy_materializes_real_copy() {
 
     let copy_rec = fx
         .registry
-        .get(&key)
+        .artifact(&key)
         .expect("registry read")
         .expect("copy leg rewrites the record");
     assert!(
@@ -7354,12 +7514,12 @@ fn linked_record_over_real_dir_redeploys_symlink() {
     );
     assert_eq!(
         std::fs::read_link(&dst).expect("re-linked symlink readable"),
-        fx.src.path().join("editor"),
-        "the re-linked dst must point at the absolute working-tree target"
+        canonical_fixture_target(&fx.src.path().join("editor")),
+        "the re-linked dst must point at the canonical absolute working-tree target"
     );
     let rec = fx
         .registry
-        .get(&key)
+        .artifact(&key)
         .expect("registry read")
         .expect("record present after re-link");
     assert!(rec.linked, "the re-linked record must remain linked=true");
@@ -7429,7 +7589,7 @@ fn copy_to_link_transition_skips_modified_dst_without_force() {
     .expect("copy leg deploys and records the artifact");
     assert!(!out.had_failures, "the copy leg must deploy cleanly");
     assert!(
-        fx.registry.get(&key).expect("registry read").is_some(),
+        fx.registry.artifact(&key).expect("registry read").is_some(),
         "premise: the copy leg must record a managed artifact"
     );
 
@@ -7552,8 +7712,9 @@ fn force_still_applies_copy_to_link_transition_over_foreign() {
     );
     assert_eq!(
         std::fs::read_link(&dst).expect("forced symlink readable"),
-        fx.src.path().join("editor"),
-        "the materialized symlink must point at the absolute working-tree <source>/<artifact>"
+        canonical_fixture_target(&fx.src.path().join("editor")),
+        "the materialized symlink must point at the canonical absolute working-tree \
+         <source>/<artifact>"
     );
 }
 
@@ -7605,8 +7766,8 @@ fn correct_link_resync_is_still_a_noop() {
     );
     assert_eq!(
         std::fs::read_link(&dst).expect("symlink readable"),
-        fx.src.path().join("editor"),
-        "the correct symlink must still point at the same working-tree target"
+        canonical_fixture_target(&fx.src.path().join("editor")),
+        "the correct symlink must still point at the same canonical working-tree target"
     );
 }
 
@@ -7656,7 +7817,7 @@ fn host_path_source_syncs_identically_to_its_literal_twin() {
     let state_dir_lit = TempDir::new().expect("literal state dir");
     let backend_lit = GitBackend::new(git_dir_lit.path().to_path_buf());
     let registry_lit =
-        FileRegistry::open(state_dir_lit.path().to_path_buf()).expect("literal registry");
+        FileStateStore::open(state_dir_lit.path().to_path_buf()).expect("literal registry");
     let out_lit = sync(&in_lit, &backend_lit, &registry_lit).expect("literal-twin sync deploys");
 
     let td_host = TargetDir::new();
@@ -7667,7 +7828,7 @@ fn host_path_source_syncs_identically_to_its_literal_twin() {
     let state_dir_host = TempDir::new().expect("host state dir");
     let backend_host = GitBackend::new(git_dir_host.path().to_path_buf());
     let registry_host =
-        FileRegistry::open(state_dir_host.path().to_path_buf()).expect("host registry");
+        FileStateStore::open(state_dir_host.path().to_path_buf()).expect("host registry");
     let out_host = sync(&in_host, &backend_host, &registry_host).expect("host+path sync deploys");
 
     let commit_lit = out_lit
@@ -7754,56 +7915,37 @@ impl<'a> RecordingBackend<'a> {
 }
 
 impl SourceStore for RecordingBackend<'_> {
-    fn inventory(&self, source: &ResolvedSource) -> SourceResult<SourceInventory> {
-        self.inner.inventory(source)
-    }
-
-    fn read(&self, source: &ResolvedSource, path: &SourcePath) -> SourceResult<SourceEntry> {
-        self.inner.read(source, path)
-    }
-}
-
-impl SourceBackend for RecordingBackend<'_> {
-    fn fetch(&self, source: &crate::source::SourceName, url: &str) -> SourceResult<()> {
-        self.urls.lock().expect("urls mutex").push(url.to_owned());
-        self.inner.fetch(source, url)
-    }
     fn resolve(
         &self,
-        source: &crate::source::SourceName,
-        url: &str,
-        refspec: &Refspec,
-    ) -> SourceResult<String> {
-        self.inner.resolve(source, url, refspec)
+        request: &ResolveRequest,
+        policy: ResolvePolicy,
+    ) -> SourceResult<ResolvedSource> {
+        if policy == ResolvePolicy::Refresh
+            && let SourceLocation::Git { url } | SourceLocation::Url { url } = &request.location
+        {
+            self.urls.lock().expect("urls mutex").push(url.clone());
+        }
+        SourceStore::resolve(self.inner, request, policy)
     }
-    fn commit_time(
+
+    fn inventory(
         &self,
-        source: &crate::source::SourceName,
-        url: &str,
-        commit: &str,
-    ) -> SourceResult<u64> {
-        self.inner.commit_time(source, url, commit)
+        snapshot: &SnapshotId,
+        root: Option<&SourcePath>,
+    ) -> SourceResult<SourceInventory> {
+        SourceStore::inventory(self.inner, snapshot, root)
     }
-    fn compute_digest(
-        &self,
-        source: &crate::source::SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        include: &[String],
-        exclude: &[String],
-    ) -> SourceResult<String> {
-        self.inner
-            .compute_digest(source, url, commit, root, include, exclude)
+
+    fn read(&self, snapshot: &SnapshotId, path: &SourcePath) -> SourceResult<SourceEntry> {
+        SourceStore::read(self.inner, snapshot, path)
     }
-    fn list_source_leaves(
+
+    fn list_directory(
         &self,
-        source: &crate::source::SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-    ) -> SourceResult<Vec<String>> {
-        self.inner.list_source_leaves(source, url, commit, root)
+        snapshot: &SnapshotId,
+        path: Option<&SourcePath>,
+    ) -> SourceResult<Vec<SourceDirectoryEntry>> {
+        SourceStore::list_directory(self.inner, snapshot, path)
     }
 }
 
@@ -7862,7 +8004,7 @@ fn per_source_protocol_beats_global_default() {
     let state_dir = TempDir::new().expect("state dir");
     let inner = GitBackend::new(git_dir.path().to_path_buf());
     let recording = RecordingBackend::new(&inner);
-    let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("registry");
+    let registry = FileStateStore::open(state_dir.path().to_path_buf()).expect("registry");
 
     let out = sync(&in_, &recording, &registry).expect("dual-protocol sync deploys");
 
@@ -7931,7 +8073,7 @@ fn global_protocol_applies_when_source_omits_protocol() {
     let state_dir = TempDir::new().expect("state dir");
     let inner = GitBackend::new(git_dir.path().to_path_buf());
     let recording = RecordingBackend::new(&inner);
-    let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("registry");
+    let registry = FileStateStore::open(state_dir.path().to_path_buf()).expect("registry");
 
     let out = sync(&in_, &recording, &registry).expect("config-default-protocol sync deploys");
 
@@ -8048,14 +8190,11 @@ struct CountingRouter {
 }
 
 impl CountingRouter {
-    fn new(
-        git_dir: PathBuf,
-        modes: BTreeMap<crate::source::SourceName, crate::config::SourceMode>,
-    ) -> Self {
+    fn new(git_dir: PathBuf) -> Self {
         let git = GitBackend::new(git_dir.clone());
         let http = HttpBackend::new(git_dir, BTreeMap::new());
         Self {
-            inner: RouterBackend::new(git, http, modes),
+            inner: RouterBackend::new(git, http),
             fetches: AtomicUsize::new(0),
         }
     }
@@ -8066,67 +8205,36 @@ impl CountingRouter {
 }
 
 impl SourceStore for CountingRouter {
-    fn inventory(&self, source: &ResolvedSource) -> SourceResult<SourceInventory> {
-        self.inner.inventory(source)
-    }
-
-    fn read(&self, source: &ResolvedSource, path: &SourcePath) -> SourceResult<SourceEntry> {
-        self.inner.read(source, path)
-    }
-}
-
-impl SourceBackend for CountingRouter {
-    fn fetch(&self, source: &crate::source::SourceName, url: &str) -> SourceResult<()> {
-        self.fetches.fetch_add(1, AtomicOrdering::SeqCst);
-        self.inner.fetch(source, url)
-    }
-    fn mirror_ready(&self, url: &str) -> bool {
-        self.inner.mirror_ready(url)
-    }
     fn resolve(
         &self,
-        source: &crate::source::SourceName,
-        url: &str,
-        refspec: &Refspec,
-    ) -> SourceResult<String> {
-        self.inner.resolve(source, url, refspec)
-    }
-    fn commit_time(
-        &self,
-        source: &crate::source::SourceName,
-        url: &str,
-        commit: &str,
-    ) -> SourceResult<u64> {
-        self.inner.commit_time(source, url, commit)
-    }
-    fn compute_digest(
-        &self,
-        source: &crate::source::SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        include: &[String],
-        exclude: &[String],
-    ) -> SourceResult<String> {
-        self.inner
-            .compute_digest(source, url, commit, root, include, exclude)
+        request: &ResolveRequest,
+        policy: ResolvePolicy,
+    ) -> SourceResult<ResolvedSource> {
+        if policy == ResolvePolicy::Refresh {
+            self.fetches.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+        SourceStore::resolve(&self.inner, request, policy)
     }
 
-    fn list_source_leaves(
+    fn inventory(
         &self,
-        source: &crate::source::SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-    ) -> SourceResult<Vec<String>> {
-        self.inner.list_source_leaves(source, url, commit, root)
+        snapshot: &SnapshotId,
+        root: Option<&SourcePath>,
+    ) -> SourceResult<SourceInventory> {
+        SourceStore::inventory(&self.inner, snapshot, root)
     }
-}
 
-fn url_modes(source: &str) -> BTreeMap<crate::source::SourceName, crate::config::SourceMode> {
-    let mut modes = BTreeMap::new();
-    modes.insert(sn(source), crate::config::SourceMode::Url);
-    modes
+    fn read(&self, snapshot: &SnapshotId, path: &SourcePath) -> SourceResult<SourceEntry> {
+        SourceStore::read(&self.inner, snapshot, path)
+    }
+
+    fn list_directory(
+        &self,
+        snapshot: &SnapshotId,
+        path: Option<&SourcePath>,
+    ) -> SourceResult<Vec<SourceDirectoryEntry>> {
+        SourceStore::list_directory(&self.inner, snapshot, path)
+    }
 }
 
 #[test]
@@ -8134,8 +8242,8 @@ fn second_sync_of_unchanged_url_is_a_noop() {
     let server = UrlTarServer::spawn(vec![editor_tar_gz(b"-- v1\n")]);
     let git_dir = TempDir::new().expect("git dir");
     let state_dir = TempDir::new().expect("state dir");
-    let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
-    let backend = CountingRouter::new(git_dir.path().to_path_buf(), url_modes("pkg"));
+    let registry = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
+    let backend = CountingRouter::new(git_dir.path().to_path_buf());
     let td = TargetDir::new();
     let cfg = url_config_one_target("pkg", &server.url, &td.target_path(), "flat");
 
@@ -8193,8 +8301,8 @@ fn update_with_changed_url_content_advances_lock() {
     let server = UrlTarServer::spawn(vec![editor_tar_gz(b"-- v1\n"), editor_tar_gz(b"-- v2\n")]);
     let git_dir = TempDir::new().expect("git dir");
     let state_dir = TempDir::new().expect("state dir");
-    let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
-    let backend = CountingRouter::new(git_dir.path().to_path_buf(), url_modes("pkg"));
+    let registry = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
+    let backend = CountingRouter::new(git_dir.path().to_path_buf());
     let td = TargetDir::new();
     let cfg = url_config_one_target("pkg", &server.url, &td.target_path(), "flat");
 
@@ -8247,8 +8355,8 @@ fn reimport_identical_bytes_does_not_churn() {
     ]);
     let git_dir = TempDir::new().expect("git dir");
     let state_dir = TempDir::new().expect("state dir");
-    let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
-    let backend = CountingRouter::new(git_dir.path().to_path_buf(), url_modes("pkg"));
+    let registry = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
+    let backend = CountingRouter::new(git_dir.path().to_path_buf());
     let td = TargetDir::new();
     let cfg = url_config_one_target("pkg", &server.url, &td.target_path(), "flat");
 
@@ -8369,8 +8477,8 @@ fn url_source_lock_digest_is_full_archive_regardless_of_selection() {
     let (_g2, _s2, _b2, registry_b) = fresh_backend_registry();
     let git_a = TempDir::new().expect("git dir a");
     let git_b = TempDir::new().expect("git dir b");
-    let backend_a = CountingRouter::new(git_a.path().to_path_buf(), url_modes("pkg"));
-    let backend_b = CountingRouter::new(git_b.path().to_path_buf(), url_modes("pkg"));
+    let backend_a = CountingRouter::new(git_a.path().to_path_buf());
+    let backend_b = CountingRouter::new(git_b.path().to_path_buf());
     let td_a = TargetDir::new();
     let td_b = TargetDir::new();
 
@@ -8435,7 +8543,7 @@ fn url_source_lock_digest_equals_full_archive_oracle() {
     let server = UrlTarServer::spawn(vec![two_slice_tar_gz()]);
     let git_dir = TempDir::new().expect("git dir");
     let (_g, _s, _b, registry) = fresh_backend_registry();
-    let backend = CountingRouter::new(git_dir.path().to_path_buf(), url_modes("pkg"));
+    let backend = CountingRouter::new(git_dir.path().to_path_buf());
     let td = TargetDir::new();
     let cfg = Config::parse(&format!(
         "version = 1\n\n[sources.pkg]\nurl = \"{}\"\ninclude = [\"editor/**\"]\n\n\
@@ -8458,8 +8566,32 @@ fn url_source_lock_digest_equals_full_archive_oracle() {
         .find_source("pkg")
         .expect("the single url lock entry is keyed by source `pkg`");
 
-    let full_archive = backend
-        .compute_digest(&sn("pkg"), &server.url, &pkg.commit, None, &[], &[])
+    let resolved = backend
+        .resolve(
+            &ResolveRequest {
+                name: sn("pkg"),
+                location: SourceLocation::Url {
+                    url: server.url.clone(),
+                },
+                revision: RevisionSpec::None,
+            },
+            ResolvePolicy::CachedOnly,
+        )
+        .expect("resolve the cached synthetic snapshot");
+    assert_eq!(
+        resolved.snapshot.commit().as_str(),
+        pkg.commit,
+        "the cached snapshot used by the digest oracle must be the lock-pinned commit"
+    );
+    let inventory = backend
+        .inventory(&resolved.snapshot, None)
+        .expect("inventory the full extracted archive");
+    let leaves: Vec<SourcePath> = inventory
+        .entries
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect();
+    let full_archive = digest_snapshot(&backend, &resolved.snapshot, &leaves)
         .expect("full-archive digest computes");
     assert_eq!(
         pkg.digest, full_archive,
@@ -8523,7 +8655,7 @@ struct VersionedFixture {
     _git_dir: TempDir,
     _state_dir: TempDir,
     backend: GitBackend,
-    registry: FileRegistry,
+    registry: FileStateStore,
     url: String,
     sha_a: String,
     sha_b: String,
@@ -8566,7 +8698,7 @@ fn build_versioned_sync_fixture() -> VersionedFixture {
     let state_dir = TempDir::new().unwrap();
     let backend = GitBackend::new(git_dir.path().to_path_buf());
     let registry =
-        FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry over tempdir");
+        FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry over tempdir");
     let url = p.to_string_lossy().into_owned();
 
     VersionedFixture {
@@ -8649,12 +8781,12 @@ fn two_version_bindings_project_each_their_own_commit_tree() {
 
     let stable = fx
         .registry
-        .get(&artifact_key("dest", "stable", "editor"))
+        .artifact(&artifact_key("dest", "stable", "editor"))
         .expect("registry get")
         .expect("the slice keyed by identity `stable` must record under identity `stable`");
     let canary = fx
         .registry
-        .get(&artifact_key("dest", "canary", "editor"))
+        .artifact(&artifact_key("dest", "canary", "editor"))
         .expect("registry get")
         .expect("the slice keyed by identity `canary` must record under identity `canary`");
 
@@ -8806,20 +8938,24 @@ fn rebuild_round_trips_both_ref_splits_at_their_own_commits() {
 
     let stable_key = artifact_key("dest", "stable", "editor");
     let canary_key = artifact_key("dest", "canary", "editor");
-    fx.registry.remove(&stable_key).expect("drop stable record");
-    fx.registry.remove(&canary_key).expect("drop canary record");
+    fx.registry
+        .remove_artifact(&stable_key)
+        .expect("drop stable record");
+    fx.registry
+        .remove_artifact(&canary_key)
+        .expect("drop canary record");
 
     rebuild_registry(&cfg, &out.base_lock, &fx.backend, &fx.registry)
         .expect("rebuild reconstructs both ref splits");
 
     let stable = fx
         .registry
-        .get(&stable_key)
+        .artifact(&stable_key)
         .expect("registry get")
         .expect("rebuild must reconstruct the stable record");
     let canary = fx
         .registry
-        .get(&canary_key)
+        .artifact(&canary_key)
         .expect("registry get")
         .expect("rebuild must reconstruct the canary record");
 
@@ -8904,7 +9040,7 @@ fn preview_emits_top_level_loose_file_leaf_matching_deploy() {
     let td = TargetDir::new();
     let cfg = config_one_source_one_target("loose-src", &url, "dest", &td.target_path(), "flat");
 
-    backend.fetch(&sn("loose-src"), &url).expect("seed fetch");
+    seed_git_mirror(&backend, "loose-src", &url);
     let lock = lock_with(&cfg, "loose-src", &url, &head);
     let parsed = cfg.parsed_sources().expect("sources parse");
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
@@ -8955,7 +9091,7 @@ fn preview_of_a_rooted_source_emits_root_relative_leaves_matching_deploy() {
     );
     let cfg = Config::parse(&toml).expect("rooted-source config parses");
 
-    backend.fetch(&sn("rooted"), &url).expect("seed fetch");
+    seed_git_mirror(&backend, "rooted", &url);
     let lock = lock_with(&cfg, "rooted", &url, &head);
     let parsed = cfg.parsed_sources().expect("sources parse");
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
@@ -9029,9 +9165,7 @@ fn preview_reads_the_commit_from_the_lock_not_a_fresh_resolution() {
     let cfg =
         config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
     // Seed the mirror at the real HEAD so discovery succeeds offline.
-    fx.backend
-        .fetch(&sn("editor-src"), &fx.url)
-        .expect("seed fetch");
+    seed_git_mirror(&fx.backend, "editor-src", &fx.url);
 
     let locked_commit = fx.head_sha.clone();
     let lock = lock_with(&cfg, "editor-src", &fx.url, &locked_commit);
@@ -9126,7 +9260,7 @@ fn preview_still_plans_other_bindings_when_one_source_needs_sync() {
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
 
     // Seed only src-a's mirror; lock both. src-b's commit is absent => NeedsSync.
-    backend.fetch(&sn("src-a"), &synced.1).expect("seed src-a");
+    seed_git_mirror(&backend, "src-a", &synced.1);
     let a_head = rev_parse(synced.0.path(), "HEAD");
     let b_head = rev_parse(unsynced.0.path(), "HEAD");
     let lock = Lock {
@@ -9241,12 +9375,10 @@ fn preview_writes_nothing_to_the_registry_or_the_target() {
     let td = TargetDir::new();
     let cfg =
         config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
-    fx.backend
-        .fetch(&sn("editor-src"), &fx.url)
-        .expect("seed fetch");
+    seed_git_mirror(&fx.backend, "editor-src", &fx.url);
 
     // Seed a registry record and a target file unrelated to the plan.
-    let seeded = RegistryRecord {
+    let seeded = ArtifactRecord {
         version: 1,
         key: artifact_key("dest", "editor-src", "editor"),
         source: "editor-src".to_owned(),
@@ -9268,8 +9400,10 @@ fn preview_writes_nothing_to_the_registry_or_the_target() {
         deploy_root: None,
         layout_separator: None,
     };
-    fx.registry.put(&seeded).expect("seed registry record");
-    let before = fx.registry.list_all().expect("snapshot registry");
+    fx.registry
+        .put_artifact(&seeded)
+        .expect("seed registry record");
+    let before = fx.registry.all_artifacts().expect("snapshot registry");
 
     std::fs::create_dir_all(td.target_path()).expect("mkdir target");
     std::fs::write(td.target_path().join("pre-existing.txt"), b"keep\n")
@@ -9292,7 +9426,7 @@ fn preview_writes_nothing_to_the_registry_or_the_target() {
     );
 
     assert_eq!(counting.read_count(), 0, "preview must export nothing");
-    let after = fx.registry.list_all().expect("re-read registry");
+    let after = fx.registry.all_artifacts().expect("re-read registry");
     assert_eq!(
         before.len(),
         after.len(),
@@ -9354,8 +9488,8 @@ fn preview_annotates_predicted_flat_collision_as_warning_not_error() {
     let parsed = cfg.parsed_sources().expect("sources parse");
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
 
-    backend.fetch(&sn("src-a"), &fx_a.1).expect("seed src-a");
-    backend.fetch(&sn("src-b"), &fx_b.1).expect("seed src-b");
+    seed_git_mirror(&backend, "src-a", &fx_a.1);
+    seed_git_mirror(&backend, "src-b", &fx_b.1);
     let a_head = rev_parse(fx_a.0.path(), "HEAD");
     let b_head = rev_parse(fx_b.0.path(), "HEAD");
     let lock = Lock {
@@ -9415,9 +9549,7 @@ fn preview_happy_path_renders_synced_artifacts_at_literal_layout_destinations() 
         &td.target_path(),
         "by-source",
     );
-    fx.backend
-        .fetch(&sn("editor-src"), &fx.url)
-        .expect("seed fetch");
+    seed_git_mirror(&fx.backend, "editor-src", &fx.url);
     let lock = lock_with(&cfg, "editor-src", &fx.url, &fx.head_sha);
 
     let parsed = cfg.parsed_sources().expect("sources parse");
@@ -9477,16 +9609,18 @@ fn build_preview_fixture() -> PreviewFixture {
 
     let git_dir = TempDir::new().expect("shared git dir");
     let backend = GitBackend::new(git_dir.path().to_path_buf());
-    backend
-        .fetch(&sn("editor-src"), &fx_a.url)
-        .expect("seed editor-src mirror");
-    backend
-        .fetch(&sn("lint-src"), &url_b)
-        .expect("seed lint-src mirror");
+    seed_git_mirror(&backend, "editor-src", &fx_a.url);
     let head_a = fx_a.head_sha.clone();
-    let head_b = backend
-        .resolve(&sn("lint-src"), &url_b, &Refspec::Branch("main".into()))
-        .expect("resolve lint-src HEAD from the seeded mirror");
+    let head_b = resolve_git_source(
+        &backend,
+        "lint-src",
+        &url_b,
+        RevisionSpec::Branch("main".into()),
+        ResolvePolicy::Refresh,
+    )
+    .snapshot
+    .commit()
+    .to_string();
 
     let home = TargetDir::new();
     let work = TargetDir::new();
@@ -9927,65 +10061,82 @@ fn preview_plan_without_files_leaves_entries_unenriched() {
     );
 }
 
-// ── offline leaf lister (SourceBackend::list_source_leaves) ──
+// ── offline immutable inventory ──
 
 #[test]
-fn list_source_leaves_under_artifact_root_lists_offline_without_fetching() {
+fn source_inventory_under_artifact_root_lists_offline_without_refreshing() {
     let fx = build_sync_fixture();
-    fx.backend
-        .fetch(&sn("editor-src"), &fx.url)
-        .expect("seed mirror so the lister can read the tree without fetching");
+    let resolved = resolve_git_source(
+        &fx.backend,
+        "editor-src",
+        &fx.url,
+        RevisionSpec::Branch("main".into()),
+        ResolvePolicy::Refresh,
+    );
     let counting = CountingBackend::new(&fx.backend);
 
-    let leaves = counting
-        .list_source_leaves(
-            &sn("editor-src"),
-            &fx.url,
-            &fx.head_sha,
-            Some(Path::new("editor")),
+    let inventory = counting
+        .inventory(
+            &resolved.snapshot,
+            Some(&SourcePath::new("editor").expect("safe fixture root")),
         )
-        .expect("listing a synced artifact's leaves must succeed");
+        .expect("inventorying a synced artifact's leaves must succeed");
+    let leaves: Vec<&str> = inventory
+        .entries
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect();
 
-    assert!(
-        leaves.contains(&"init.lua".to_string()),
-        "the editor artifact's leaves must include init.lua, got {leaves:?}"
-    );
-    assert!(
-        leaves.contains(&"notes.bak".to_string()),
-        "the unfiltered leaf walk lists notes.bak too, got {leaves:?}"
+    assert_eq!(
+        leaves,
+        vec!["init.lua", "notes.bak"],
+        "a rooted final inventory must be sorted and relative to the requested `editor` root; it \
+         must include both the ordinary leaf and the unfiltered .bak control"
     );
     assert_eq!(
         counting.fetch_count(),
         0,
-        "list_source_leaves must read the seeded mirror, performing NO fetch"
+        "snapshot inventory must read the seeded mirror without refreshing"
     );
     assert_eq!(
         counting.read_count(),
         0,
-        "list_source_leaves must not export/write anything"
+        "inventory must not export/write anything"
     );
 }
 
 #[test]
 fn offer_selection_exclude_drops_the_leaf_it_matches() {
     let fx = build_sync_fixture();
-    fx.backend
-        .fetch(&sn("editor-src"), &fx.url)
-        .expect("seed mirror");
-
-    let leaves = fx
+    let resolved = resolve_git_source(
+        &fx.backend,
+        "editor-src",
+        &fx.url,
+        RevisionSpec::Branch("main".into()),
+        ResolvePolicy::Refresh,
+    );
+    let inventory = fx
         .backend
-        .list_source_leaves(
-            &sn("editor-src"),
-            &fx.url,
-            &fx.head_sha,
-            Some(Path::new("editor")),
+        .inventory(
+            &resolved.snapshot,
+            Some(&SourcePath::new("editor").expect("safe fixture root")),
         )
-        .expect("leaf walk succeeds");
-    let candidates: Vec<&str> = leaves.iter().map(String::as_str).collect();
+        .expect("snapshot inventory succeeds");
+    let candidates: Vec<&str> = inventory
+        .entries
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect();
+    assert_eq!(
+        candidates,
+        vec!["init.lua", "notes.bak"],
+        "premise: inventory rooted at `editor` returns root-relative candidates, so selection \
+         must not apply the root a second time"
+    );
 
-    let selection = crate::kernel::OfferSelection::compile(&[], &["**/*.bak".to_owned()], None)
-        .expect("exclude offer compiles");
+    let selection =
+        crate::projection::offer::OfferSelection::compile(&[], &["**/*.bak".to_owned()], None)
+            .expect("exclude offer compiles");
     let selected = selection.select(&candidates);
 
     assert!(
@@ -10077,8 +10228,6 @@ fn render_preview_tree_warns_about_a_predicted_collision_naming_both_sources() {
 
     let git_dir = TempDir::new().expect("git dir");
     let backend = GitBackend::new(git_dir.path().to_path_buf());
-    backend.fetch(&sn("src-a"), &fx_a.1).expect("seed src-a");
-    backend.fetch(&sn("src-b"), &fx_b.1).expect("seed src-b");
     let td = TargetDir::new();
     let toml = format!(
         "version = 1\n\n\
@@ -10092,12 +10241,26 @@ fn render_preview_tree_warns_about_a_predicted_collision_naming_both_sources() {
     let cfg = Config::parse(&toml).expect("two-source flat config parses");
     let parsed = cfg.parsed_sources().expect("sources parse");
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
-    let commit_a = backend
-        .resolve(&sn("src-a"), &fx_a.1, &Refspec::Branch("main".into()))
-        .expect("resolve src-a");
-    let commit_b = backend
-        .resolve(&sn("src-b"), &fx_b.1, &Refspec::Branch("main".into()))
-        .expect("resolve src-b");
+    let commit_a = resolve_git_source(
+        &backend,
+        "src-a",
+        &fx_a.1,
+        RevisionSpec::Branch("main".into()),
+        ResolvePolicy::Refresh,
+    )
+    .snapshot
+    .commit()
+    .to_string();
+    let commit_b = resolve_git_source(
+        &backend,
+        "src-b",
+        &fx_b.1,
+        RevisionSpec::Branch("main".into()),
+        ResolvePolicy::Refresh,
+    )
+    .snapshot
+    .commit()
+    .to_string();
     let lock = Lock {
         version: 1,
         sources: vec![
@@ -10246,10 +10409,16 @@ fn preview_files_strips_tmpl_suffix_and_marks_templated_in_copy_mode() {
     let (src, url) = build_templated_artifact_repo();
     let git_dir = TempDir::new().expect("git dir");
     let backend = GitBackend::new(git_dir.path().to_path_buf());
-    backend.fetch(&sn("dotfiles"), &url).expect("seed mirror");
-    let commit = backend
-        .resolve(&sn("dotfiles"), &url, &Refspec::Branch("main".into()))
-        .expect("resolve HEAD from the seeded mirror");
+    let commit = resolve_git_source(
+        &backend,
+        "dotfiles",
+        &url,
+        RevisionSpec::Branch("main".into()),
+        ResolvePolicy::Refresh,
+    )
+    .snapshot
+    .commit()
+    .to_string();
 
     let td = TargetDir::new();
     let toml = format!(
@@ -10305,10 +10474,16 @@ fn preview_reflects_a_narrowing_take_omitting_the_untaken_sibling() {
 
     let git_dir = TempDir::new().expect("git dir");
     let backend = GitBackend::new(git_dir.path().to_path_buf());
-    backend.fetch(&sn("ed"), &url).expect("seed mirror");
-    let commit = backend
-        .resolve(&sn("ed"), &url, &Refspec::Branch("main".into()))
-        .expect("resolve HEAD from the seeded mirror");
+    let commit = resolve_git_source(
+        &backend,
+        "ed",
+        &url,
+        RevisionSpec::Branch("main".into()),
+        ResolvePolicy::Refresh,
+    )
+    .snapshot
+    .commit()
+    .to_string();
 
     let td = TargetDir::new();
     let toml = format!(
@@ -10396,10 +10571,16 @@ fn render_preview_tree_annotates_templated_files_only() {
     let (src, url) = build_templated_artifact_repo();
     let git_dir = TempDir::new().expect("git dir");
     let backend = GitBackend::new(git_dir.path().to_path_buf());
-    backend.fetch(&sn("dotfiles"), &url).expect("seed mirror");
-    let commit = backend
-        .resolve(&sn("dotfiles"), &url, &Refspec::Branch("main".into()))
-        .expect("resolve HEAD");
+    let commit = resolve_git_source(
+        &backend,
+        "dotfiles",
+        &url,
+        RevisionSpec::Branch("main".into()),
+        ResolvePolicy::Refresh,
+    )
+    .snapshot
+    .commit()
+    .to_string();
 
     let td = TargetDir::new();
     let toml = format!(
@@ -10447,10 +10628,16 @@ fn render_preview_json_carries_deployed_name_and_templated_flag() {
     let (src, url) = build_templated_artifact_repo();
     let git_dir = TempDir::new().expect("git dir");
     let backend = GitBackend::new(git_dir.path().to_path_buf());
-    backend.fetch(&sn("dotfiles"), &url).expect("seed mirror");
-    let commit = backend
-        .resolve(&sn("dotfiles"), &url, &Refspec::Branch("main".into()))
-        .expect("resolve HEAD");
+    let commit = resolve_git_source(
+        &backend,
+        "dotfiles",
+        &url,
+        RevisionSpec::Branch("main".into()),
+        ResolvePolicy::Refresh,
+    )
+    .snapshot
+    .commit()
+    .to_string();
 
     let td = TargetDir::new();
     let toml = format!(
@@ -10525,13 +10712,19 @@ fn plan_target_without_override_discovers_full_source_level_set() {
     let cfg = Config::parse(&toml).expect("plain-binding config parses");
     let parsed = cfg.parsed_sources().expect("sources parse");
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
-    fx.backend
-        .fetch(&sn("editor-src"), &fx.url)
-        .expect("seed editor-src mirror");
+    seed_git_mirror(&fx.backend, "editor-src", &fx.url);
     let commits = one_commit(&parsed, "editor-src", &fx.head_sha);
+    let resolved_sources = resolved_git_map(&fx.backend, "editor-src", &fx.url, &fx.head_sha);
 
-    let projection = project_workspace(&cfg, &parsed, &remotes, &fx.backend, &commits)
-        .expect("projection builds over the seeded mirror");
+    let projection = project_workspace(
+        &cfg,
+        &parsed,
+        &remotes,
+        &fx.backend,
+        &commits,
+        &resolved_sources,
+    )
+    .expect("projection builds over the seeded mirror");
 
     let dest = projection
         .targets
@@ -10566,13 +10759,19 @@ fn project_workspace_aggregates_per_target_warnings() {
     let cfg = Config::parse(&toml).expect("warning-producing config parses");
     let parsed = cfg.parsed_sources().expect("sources parse");
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
-    fx.backend
-        .fetch(&sn("editor-src"), &fx.url)
-        .expect("seed editor-src mirror");
+    seed_git_mirror(&fx.backend, "editor-src", &fx.url);
     let commits = one_commit(&parsed, "editor-src", &fx.head_sha);
+    let resolved_sources = resolved_git_map(&fx.backend, "editor-src", &fx.url, &fx.head_sha);
 
-    let projection = project_workspace(&cfg, &parsed, &remotes, &fx.backend, &commits)
-        .expect("projection builds over the seeded mirror");
+    let projection = project_workspace(
+        &cfg,
+        &parsed,
+        &remotes,
+        &fx.backend,
+        &commits,
+        &resolved_sources,
+    )
+    .expect("projection builds over the seeded mirror");
 
     let aggregated: Vec<ProjectionWarning> = projection
         .targets
@@ -10632,14 +10831,18 @@ fn config_with_target_hooks(url: &str, target_path: &Path, on_change_toml: &str)
 
 /// The single `on_change` hook id recorded under `target` (panics unless exactly
 /// one exists): lets a test reuse the id without reconstructing TOML escaping.
-fn sole_hook_id(reg: &FileRegistry, target: &str) -> String {
-    let mut states = reg.load_hook_state(target).expect("load hook state");
+fn sole_hook_id(reg: &FileStateStore, target: &str) -> String {
+    let mut states = reg.hook_state(target).expect("load hook state");
     assert_eq!(states.len(), 1, "expected exactly one recorded hook id");
     states.remove(0).hook_id
 }
 
-fn recorded_hook(reg: &FileRegistry, target: &str, id: &str) -> Option<crate::store::HookState> {
-    reg.load_hook_state(target)
+fn recorded_hook(
+    reg: &FileStateStore,
+    target: &str,
+    id: &str,
+) -> Option<crate::sync::state::HookState> {
+    reg.hook_state(target)
         .expect("load hook state")
         .into_iter()
         .find(|h| h.hook_id == id)
@@ -10757,9 +10960,7 @@ fn failed_hook_fails_sync_keeps_files_and_refires_next_sync() {
         "INV-2: a hook failure NEVER rolls back files — the artifact stays deployed"
     );
     assert_eq!(
-        fx.registry
-            .load_hook_state("dest")
-            .expect("load hook state"),
+        fx.registry.hook_state("dest").expect("load hook state"),
         vec![],
         "INV-4: a failed hook must NOT record last-success — with this target's single \
          hook failing, the registry holds NO recorded success under ANY id"
@@ -10847,7 +11048,7 @@ fn same_run_different_shell_are_distinct_hooks() {
     );
     let mut ids: Vec<String> = fx
         .registry
-        .load_hook_state("dest")
+        .hook_state("dest")
         .expect("load hook state")
         .into_iter()
         .map(|h| h.hook_id)
@@ -11106,7 +11307,7 @@ fn prune_only_sync_skips_on_change_but_runs_post_sync() {
 // Every test drives the observable sync/deploy boundary, robust to how the
 // template_opt_in / vars plumbing lands internally.
 
-/// A live `GitBackend` + `FileRegistry` whose backing tempdirs outlive the run,
+/// A live `GitBackend` + `FileStateStore` whose backing tempdirs outlive the run,
 /// paired with a source repo. Lets a render test sync end-to-end against real
 /// staging/swap and then read back deployed files, the manifest, and the lock.
 struct RenderHarness {
@@ -11114,7 +11315,7 @@ struct RenderHarness {
     _git_dir: TempDir,
     _state_dir: TempDir,
     backend: GitBackend,
-    registry: FileRegistry,
+    registry: FileStateStore,
     url: String,
     #[expect(
         dead_code,
@@ -11128,7 +11329,7 @@ impl RenderHarness {
         let git_dir = TempDir::new().expect("git dir");
         let state_dir = TempDir::new().expect("state dir");
         let backend = GitBackend::new(git_dir.path().to_path_buf());
-        let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+        let registry = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
         Self {
             src,
             _git_dir: git_dir,
@@ -11249,7 +11450,7 @@ fn manifest_hashes_rendered_bytes_so_verify_passes_on_rendered_output() {
 
     let rec = h
         .registry
-        .get(&artifact_key("dest", "ed", "editor"))
+        .artifact(&artifact_key("dest", "ed", "editor"))
         .expect("registry get")
         .expect("deployed record present");
     let motd = rec
@@ -11367,7 +11568,7 @@ fn render_error_on_undefined_var_aborts_that_artifact_and_sibling_still_deploys(
     );
     assert!(
         h.registry
-            .get(&artifact_key("dest", "multi", "bad"))
+            .artifact(&artifact_key("dest", "multi", "bad"))
             .expect("get bad record")
             .is_none(),
         "a render-aborted artifact must leave no registry record"
@@ -11518,7 +11719,7 @@ fn deployed_name_collision_within_an_artifact_is_a_clear_failure_not_last_writer
     );
     assert!(
         h.registry
-            .get(&artifact_key("dest", "ed", "editor"))
+            .artifact(&artifact_key("dest", "ed", "editor"))
             .expect("get record")
             .is_none(),
         "a collided artifact must NOT be deployed (no record), never last-writer-wins"
@@ -11607,60 +11808,41 @@ impl<'a> SyncRecordingBackend<'a> {
 }
 
 impl SourceStore for SyncRecordingBackend<'_> {
-    fn inventory(&self, source: &ResolvedSource) -> SourceResult<SourceInventory> {
-        self.inner.inventory(source)
-    }
-
-    fn read(&self, source: &ResolvedSource, path: &SourcePath) -> SourceResult<SourceEntry> {
-        self.inner.read(source, path)
-    }
-}
-
-impl SourceBackend for SyncRecordingBackend<'_> {
-    fn fetch(&self, source: &crate::source::SourceName, url: &str) -> SourceResult<()> {
-        self.total_fetches.fetch_add(1, AtomicOrdering::SeqCst);
-        self.fetched_urls
-            .lock()
-            .expect("fetched_urls mutex")
-            .push(url.to_owned());
-        self.inner.fetch(source, url)
-    }
     fn resolve(
         &self,
-        source: &crate::source::SourceName,
-        url: &str,
-        refspec: &Refspec,
-    ) -> SourceResult<String> {
-        self.inner.resolve(source, url, refspec)
+        request: &ResolveRequest,
+        policy: ResolvePolicy,
+    ) -> SourceResult<ResolvedSource> {
+        if policy == ResolvePolicy::Refresh
+            && let SourceLocation::Git { url } | SourceLocation::Url { url } = &request.location
+        {
+            self.total_fetches.fetch_add(1, AtomicOrdering::SeqCst);
+            self.fetched_urls
+                .lock()
+                .expect("fetched_urls mutex")
+                .push(url.clone());
+        }
+        SourceStore::resolve(self.inner, request, policy)
     }
-    fn commit_time(
+
+    fn inventory(
         &self,
-        source: &crate::source::SourceName,
-        url: &str,
-        commit: &str,
-    ) -> SourceResult<u64> {
-        self.inner.commit_time(source, url, commit)
+        snapshot: &SnapshotId,
+        root: Option<&SourcePath>,
+    ) -> SourceResult<SourceInventory> {
+        SourceStore::inventory(self.inner, snapshot, root)
     }
-    fn compute_digest(
-        &self,
-        source: &crate::source::SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-        include: &[String],
-        exclude: &[String],
-    ) -> SourceResult<String> {
-        self.inner
-            .compute_digest(source, url, commit, root, include, exclude)
+
+    fn read(&self, snapshot: &SnapshotId, path: &SourcePath) -> SourceResult<SourceEntry> {
+        SourceStore::read(self.inner, snapshot, path)
     }
-    fn list_source_leaves(
+
+    fn list_directory(
         &self,
-        source: &crate::source::SourceName,
-        url: &str,
-        commit: &str,
-        root: Option<&Path>,
-    ) -> SourceResult<Vec<String>> {
-        self.inner.list_source_leaves(source, url, commit, root)
+        snapshot: &SnapshotId,
+        path: Option<&SourcePath>,
+    ) -> SourceResult<Vec<SourceDirectoryEntry>> {
+        SourceStore::list_directory(self.inner, snapshot, path)
     }
 }
 
@@ -11730,65 +11912,80 @@ fn two_sources_sharing_one_url_fetch_the_shared_mirror_once() {
     );
 }
 
-/// `Send + Sync` canned backend recording the per-source `SourceName` handed to
-/// `fetch`; the `Mutex` makes it shareable across rayon workers.
-struct UrlFetchRecordingBackend {
-    fetched_sources: Mutex<Vec<String>>,
+/// `Send + Sync` canned store recording each URL source refreshed for its
+/// per-source integrity validation.
+struct UrlRefreshRecordingStore {
+    refreshed_sources: Mutex<Vec<String>>,
 }
 
-impl UrlFetchRecordingBackend {
+impl UrlRefreshRecordingStore {
     fn new() -> Self {
         Self {
-            fetched_sources: Mutex::new(Vec::new()),
+            refreshed_sources: Mutex::new(Vec::new()),
         }
     }
 
-    fn fetched_source_names(&self) -> Vec<String> {
-        self.fetched_sources
+    fn refreshed_source_names(&self) -> Vec<String> {
+        self.refreshed_sources
             .lock()
-            .expect("fetched_sources mutex")
+            .expect("refreshed_sources mutex")
             .clone()
     }
 
-    fn was_fetched(&self, source: &str) -> bool {
-        self.fetched_source_names().iter().any(|s| s == source)
+    fn was_refreshed(&self, source: &str) -> bool {
+        self.refreshed_source_names().iter().any(|s| s == source)
     }
 }
 
-impl SourceBackend for UrlFetchRecordingBackend {
-    fn fetch(&self, source: &crate::source::SourceName, _url: &str) -> SourceResult<()> {
-        self.fetched_sources
-            .lock()
-            .expect("fetched_sources mutex")
-            .push(source.as_str().to_owned());
-        Ok(())
-    }
+impl SourceStore for UrlRefreshRecordingStore {
     fn resolve(
         &self,
-        _source: &crate::source::SourceName,
-        _url: &str,
-        _refspec: &Refspec,
-    ) -> SourceResult<String> {
-        Ok("0000000000000000000000000000000000000000".to_owned())
+        request: &ResolveRequest,
+        policy: ResolvePolicy,
+    ) -> SourceResult<ResolvedSource> {
+        let SourceLocation::Url { url } = &request.location else {
+            unreachable!("the integrity fixture contains only URL sources")
+        };
+        if policy == ResolvePolicy::Refresh {
+            self.refreshed_sources
+                .lock()
+                .expect("refreshed_sources mutex")
+                .push(request.name.as_str().to_owned());
+        }
+        let normalized = crate::source::NormalizedUrl::parse(url);
+        let commit: crate::source::Commit = "0".repeat(40).parse().expect("fixture commit");
+        Ok(ResolvedSource {
+            name: request.name.clone(),
+            snapshot: SnapshotId::Git {
+                mirror: crate::source::MirrorKey::from_url(&normalized),
+                commit: commit.clone(),
+            },
+            revision: crate::source::ResolvedRevision::Commit(commit),
+            authored_at: crate::source::SourceTimestamp::from_unix_seconds(1),
+            normalized_location: crate::source::SourceIdentity::Url(normalized),
+        })
     }
-    fn commit_time(
+
+    fn inventory(
         &self,
-        _source: &crate::source::SourceName,
-        _url: &str,
-        _commit: &str,
-    ) -> SourceResult<u64> {
-        Ok(1)
+        _snapshot: &SnapshotId,
+        _root: Option<&SourcePath>,
+    ) -> SourceResult<SourceInventory> {
+        Ok(SourceInventory::default())
     }
-    fn compute_digest(
+
+    fn read(&self, _snapshot: &SnapshotId, path: &SourcePath) -> SourceResult<SourceEntry> {
+        Err(SourceError::MappedKeyNotFound {
+            key: PathBuf::from(path.as_str()),
+        })
+    }
+
+    fn list_directory(
         &self,
-        _source: &crate::source::SourceName,
-        _url: &str,
-        _commit: &str,
-        _root: Option<&Path>,
-        _include: &[String],
-        _exclude: &[String],
-    ) -> SourceResult<String> {
-        Ok("canned-digest".to_owned())
+        _snapshot: &SnapshotId,
+        _path: Option<&SourcePath>,
+    ) -> SourceResult<Vec<SourceDirectoryEntry>> {
+        Ok(Vec::new())
     }
 }
 
@@ -11820,7 +12017,7 @@ fn url_sources_sharing_one_url_each_fetch_so_per_source_digest_is_validated() {
     let url = "https://example.com/pkg.tar.gz";
     let cfg = config_two_url_sources_one_url(url, &td_a.target_path(), &td_b.target_path());
 
-    let recording = UrlFetchRecordingBackend::new();
+    let recording = UrlRefreshRecordingStore::new();
     let parsed = cfg.parsed_sources().expect("sources parse");
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
 
@@ -11838,18 +12035,18 @@ fn url_sources_sharing_one_url_each_fetch_so_per_source_digest_is_validated() {
     .expect("two url sources sharing one url resolve");
 
     assert!(
-        recording.was_fetched("alpha"),
-        "url-source `alpha` must be fetched so its per-source digest is validated; \
-         fetched sources were {:?}",
-        recording.fetched_source_names()
+        recording.was_refreshed("alpha"),
+        "url-source `alpha` must be refreshed so its per-source digest is validated; \
+         refreshed sources were {:?}",
+        recording.refreshed_source_names()
     );
     assert!(
-        recording.was_fetched("beta"),
-        "url-source `beta` shares the upstream url with `alpha`, but its fetch must NOT be \
-         deduped away: each url-source's fetch validates ITS OWN integrity digest, so dropping \
-         beta's fetch silently skips beta's digest check (integrity-pin bypass); \
-         fetched sources were {:?}",
-        recording.fetched_source_names()
+        recording.was_refreshed("beta"),
+        "url-source `beta` shares the upstream url with `alpha`, but its refresh must NOT be \
+         deduped away: each url-source refresh validates ITS OWN integrity digest, so dropping \
+         beta's refresh silently skips beta's digest check (integrity-pin bypass); \
+         refreshed sources were {:?}",
+        recording.refreshed_source_names()
     );
 }
 
@@ -11889,14 +12086,14 @@ fn serial_and_parallel_runs_produce_identical_lock_and_registry() {
         let state_dir = TempDir::new().expect("state dir");
         let backend = GitBackend::new(git_dir.path().to_path_buf());
         let registry =
-            FileRegistry::open(state_dir.path().to_path_buf()).expect("registry over tempdir");
+            FileStateStore::open(state_dir.path().to_path_buf()).expect("registry over tempdir");
 
         let in_ = input_with_jobs(&cfg, jobs);
         let out = sync(&in_, &backend, &registry).expect("multi-source sync");
 
         let lock_toml = toml::to_string(&out.base_lock).expect("base lock serializes to toml");
         let mut records: Vec<(ArtifactKey, String, String)> = registry
-            .list_all()
+            .all_artifacts()
             .expect("registry records")
             .into_iter()
             .map(|r| (r.key, r.commit, r.digest))
@@ -11928,20 +12125,27 @@ fn serial_and_parallel_runs_produce_identical_lock_and_registry() {
     drop((src_a, src_b, src_c));
 }
 
-// ── list_source_leaves seam (SMR-030) ──────────────────────────
+// ── immutable inventory seam (SMR-030) ──────────────────────────
 
 #[test]
-fn list_source_leaves_returns_full_unfiltered_leaf_set() {
+fn source_inventory_returns_full_unfiltered_leaf_set() {
     let fx = build_sync_fixture();
-    let name = sn("editor-src");
-    fx.backend
-        .fetch(&name, &fx.url)
-        .expect("fetch the fixture mirror");
-
-    let leaves = fx
+    let resolved = resolve_git_source(
+        &fx.backend,
+        "editor-src",
+        &fx.url,
+        RevisionSpec::Branch("main".into()),
+        ResolvePolicy::Refresh,
+    );
+    let inventory = fx
         .backend
-        .list_source_leaves(&name, &fx.url, &fx.head_sha, None)
-        .expect("list_source_leaves reads the mirror tree");
+        .inventory(&resolved.snapshot, None)
+        .expect("inventory reads the immutable snapshot");
+    let leaves: Vec<String> = inventory
+        .entries
+        .iter()
+        .map(|entry| entry.path.as_str().to_owned())
+        .collect();
 
     assert_eq!(
         leaves,
@@ -11950,7 +12154,7 @@ fn list_source_leaves_returns_full_unfiltered_leaf_set() {
             "editor/init.lua".to_string(),
             "editor/notes.bak".to_string(),
         ],
-        "list_source_leaves returns the FULL sorted root-relative leaf set with NO selection \
+        "inventory returns the FULL sorted root-relative leaf set with NO selection \
          applied — the `.bak` is present and nothing is excluded; got: {leaves:?}"
     );
 }
@@ -11959,7 +12163,7 @@ fn list_source_leaves_returns_full_unfiltered_leaf_set() {
 
 /// Seed a managed registry record for `(dest, source, artifact)` as if a prior sync
 /// deployed it, so a later sync can be made to find it recorded.
-fn seed_recorded_artifact(reg: &FileRegistry, source: &str, artifact: &str) {
+fn seed_recorded_artifact(reg: &FileStateStore, source: &str, artifact: &str) {
     seed_recorded_artifact_at(
         reg,
         source,
@@ -11968,8 +12172,8 @@ fn seed_recorded_artifact(reg: &FileRegistry, source: &str, artifact: &str) {
     );
 }
 
-fn seed_recorded_artifact_at(reg: &FileRegistry, source: &str, artifact: &str, commit: &str) {
-    let record = RegistryRecord {
+fn seed_recorded_artifact_at(reg: &FileStateStore, source: &str, artifact: &str, commit: &str) {
+    let record = ArtifactRecord {
         version: 1,
         key: artifact_key("dest", source, artifact),
         source: source.to_owned(),
@@ -11986,7 +12190,7 @@ fn seed_recorded_artifact_at(reg: &FileRegistry, source: &str, artifact: &str, c
         deploy_root: None,
         layout_separator: None,
     };
-    reg.put(&record).expect("seed recorded artifact");
+    reg.put_artifact(&record).expect("seed recorded artifact");
 }
 
 #[test]
@@ -12005,7 +12209,7 @@ fn sealed_offer_source_dropped_a_still_wanted_artifact_is_a_hard_error() {
     let git_dir = TempDir::new().expect("git dir");
     let state_dir = TempDir::new().expect("state dir");
     let backend = GitBackend::new(git_dir.path().to_path_buf());
-    let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let registry = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
 
     let td = TargetDir::new();
     let toml = format!(
@@ -12063,7 +12267,7 @@ fn sealed_offer_ejecting_a_source_dropped_artifact_unblocks_sync() {
     let git_dir = TempDir::new().expect("git dir");
     let state_dir = TempDir::new().expect("state dir");
     let backend = GitBackend::new(git_dir.path().to_path_buf());
-    let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let registry = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
 
     let td = TargetDir::new();
     let toml = format!(
@@ -12185,7 +12389,7 @@ fn sealed_offer_intentional_narrowing_does_not_block_prune_of_the_dropped_artifa
     assert!(!out.had_failures, "the narrowing prune run must succeed");
     assert!(
         fx.registry
-            .get(&artifact_key("dest", "editor-src", "editor"))
+            .artifact(&artifact_key("dest", "editor-src", "editor"))
             .expect("registry read")
             .is_none(),
         "the dropped `editor` artifact must be PRUNED, not locked behind a sealed-offer error"
@@ -12216,7 +12420,7 @@ fn fast_forward_deletes_an_artifact_the_new_commit_dropped() {
     let git_dir = TempDir::new().expect("git dir");
     let state_dir = TempDir::new().expect("state dir");
     let backend = GitBackend::new(git_dir.path().to_path_buf());
-    let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let registry = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
 
     let td = TargetDir::new();
     let toml = format!(
@@ -12247,7 +12451,7 @@ fn fast_forward_deletes_an_artifact_the_new_commit_dropped() {
     );
     assert!(
         registry
-            .get(&artifact_key("dest", "editor-src", "editor"))
+            .artifact(&artifact_key("dest", "editor-src", "editor"))
             .expect("registry read")
             .is_none(),
         "fast-forward must drop the record for the upstream-removed artifact",
@@ -12334,7 +12538,7 @@ fn sealed_offer_validates_crash_recovered_record_finalized_by_the_sweep() {
     let git_dir = TempDir::new().expect("git dir");
     let state_dir = TempDir::new().expect("state dir");
     let backend = GitBackend::new(git_dir.path().to_path_buf());
-    let registry = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let registry = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
 
     let td = TargetDir::new();
     let toml = format!(
@@ -12350,7 +12554,7 @@ fn sealed_offer_validates_crash_recovered_record_finalized_by_the_sweep() {
     std::fs::write(crashed_dst.join("init.lua"), b"-- init\n").expect("write crashed file");
 
     let crashed_key = artifact_key("dest", "editor-src", "editor");
-    let record = RegistryRecord {
+    let record = ArtifactRecord {
         version: 1,
         key: crashed_key.clone(),
         source: "editor-src".to_owned(),
@@ -12375,7 +12579,7 @@ fn sealed_offer_validates_crash_recovered_record_finalized_by_the_sweep() {
 
     let staging_base = td.parent_path.join(".phora-stage");
     let staging = staging_base.join("editor-deadbeef");
-    let journal = Journal::open(&registry.locks_dir()).expect("open journal");
+    let journal = Journal::open(&registry.journal_root()).expect("open journal");
     journal
         .append(&JournalEntry {
             staging_base,
@@ -12387,12 +12591,15 @@ fn sealed_offer_validates_crash_recovered_record_finalized_by_the_sweep() {
         .expect("seed swap-completed crash intent");
 
     assert!(
-        registry.get(&crashed_key).expect("pre-sync get").is_none(),
+        registry
+            .artifact(&crashed_key)
+            .expect("pre-sync get")
+            .is_none(),
         "premise: the crashed `editor` record exists only once recovery_sweep finalizes it"
     );
     assert!(
         registry
-            .list_target("dest")
+            .target_artifacts("dest")
             .expect("pre-sync target listing")
             .is_empty(),
         "premise: the target registry is exactly empty before recovery_sweep"
@@ -12417,7 +12624,7 @@ fn sealed_offer_validates_crash_recovered_record_finalized_by_the_sweep() {
          the moved pin: {rendered}"
     );
     assert_eq!(
-        registry.get(&crashed_key).expect("post-sync get"),
+        registry.artifact(&crashed_key).expect("post-sync get"),
         Some(record),
         "the sealed sync must preserve the exact record finalized by recovery_sweep"
     );
@@ -12480,8 +12687,9 @@ mod leaf_granular_deploy_tests {
         }
     }
 
-    fn records(reg: &FileRegistry, target: &str) -> Vec<RegistryRecord> {
-        reg.list_target(target).expect("list_target must not error")
+    fn records(reg: &FileStateStore, target: &str) -> Vec<ArtifactRecord> {
+        reg.target_artifacts(target)
+            .expect("list_target must not error")
     }
 
     fn copy_shape_config(url: &str, target_path: &Path, take: Option<&str>) -> Config {
@@ -12505,7 +12713,7 @@ mod leaf_granular_deploy_tests {
         }
     }
 
-    fn record_keys(registry: &FileRegistry) -> BTreeSet<String> {
+    fn record_keys(registry: &FileStateStore) -> BTreeSet<String> {
         records(registry, "dest")
             .into_iter()
             .map(|record| record.key.artifact)
@@ -12575,7 +12783,7 @@ mod leaf_granular_deploy_tests {
     }
 
     fn assert_historical_old_rename(
-        registry: &FileRegistry,
+        registry: &FileStateStore,
         target_path: &Path,
     ) -> (ArtifactKey, PathBuf) {
         assert_eq!(
@@ -12585,7 +12793,7 @@ mod leaf_granular_deploy_tests {
         );
         let key = artifact_key("dest", "ed", "old.md");
         assert!(
-            registry.get(&key).expect("registry read").is_some(),
+            registry.artifact(&key).expect("registry read").is_some(),
             "premise: the historical old.md registry record exists"
         );
         let path = target_path.join(by_source().artifact_path("ed", "old.md"));
@@ -12612,7 +12820,7 @@ mod leaf_granular_deploy_tests {
         .expect("first sync deploys the ordinary plain leaf");
         let key = artifact_key("dest", "ed", "plain.txt");
         let record = registry
-            .get(&key)
+            .artifact(&key)
             .expect("registry read")
             .expect("plain record exists after first sync");
         assert!(
@@ -12648,7 +12856,7 @@ mod leaf_granular_deploy_tests {
             commit,
             "the source commit never moved"
         );
-        assert!(registry.get(&key).expect("registry read").is_none());
+        assert!(registry.artifact(&key).expect("registry read").is_none());
         assert!(
             record_keys(&registry).is_empty(),
             "the narrowed offer desires no artifacts, so the target registry must be exactly empty"
@@ -12707,8 +12915,18 @@ mod leaf_granular_deploy_tests {
         );
 
         let new_key = artifact_key("dest", "ed", "new.md");
-        assert!(registry.get(&old_key).expect("registry read").is_none());
-        assert!(registry.get(&new_key).expect("registry read").is_some());
+        assert!(
+            registry
+                .artifact(&old_key)
+                .expect("registry read")
+                .is_none()
+        );
+        assert!(
+            registry
+                .artifact(&new_key)
+                .expect("registry read")
+                .is_some()
+        );
         assert_eq!(
             record_keys(&registry),
             BTreeSet::from(["new.md".to_owned()]),
@@ -12763,7 +12981,12 @@ mod leaf_granular_deploy_tests {
             "the source commit never moved"
         );
 
-        assert!(registry.get(&old_key).expect("registry read").is_none());
+        assert!(
+            registry
+                .artifact(&old_key)
+                .expect("registry read")
+                .is_none()
+        );
         assert!(
             !old_path.exists(),
             "the removed rename destination is pruned"
@@ -12801,7 +13024,7 @@ mod leaf_granular_deploy_tests {
             blake3: "blake3:stale".to_owned(),
         }];
         registry
-            .put(&stale)
+            .put_artifact(&stale)
             .expect("seed non-portable historical manifest record");
 
         let outcome = sync(&pruning_sync(&config), &backend, &registry);
@@ -12815,7 +13038,10 @@ mod leaf_granular_deploy_tests {
              nested control path"
         );
         assert!(
-            registry.get(&stale_key).expect("registry read").is_some(),
+            registry
+                .artifact(&stale_key)
+                .expect("registry read")
+                .is_some(),
             "invalid historical manifest data must retain its stale record"
         );
         if let Err(error) = outcome {
@@ -12948,13 +13174,13 @@ mod leaf_granular_deploy_tests {
         );
         assert_eq!(
             std::fs::read_link(path).expect("read deployed link target"),
-            source_target,
-            "the deployed link must keep pointing at its original live source target"
+            canonical_fixture_target(source_target),
+            "the deployed link must keep pointing at its canonical original live source target"
         );
     }
 
     #[cfg(unix)]
-    fn assert_only_target_record(registry: &FileRegistry, expected: &RegistryRecord) {
+    fn assert_only_target_record(registry: &FileStateStore, expected: &ArtifactRecord) {
         assert_eq!(
             records(registry, "dest"),
             vec![expected.clone()],
@@ -12983,10 +13209,10 @@ mod leaf_granular_deploy_tests {
         _git_dir: TempDir,
         _state_dir: TempDir,
         backend: GitBackend,
-        registry: FileRegistry,
+        registry: FileStateStore,
         config: Config,
         first_lock: Lock,
-        record: RegistryRecord,
+        record: ArtifactRecord,
         destination: PathBuf,
         source_target: PathBuf,
         head: String,
@@ -13115,7 +13341,9 @@ mod leaf_granular_deploy_tests {
 
         fn assert_exact_state_preserved(&self) {
             assert_eq!(
-                self.registry.get(&self.record.key).expect("registry read"),
+                self.registry
+                    .artifact(&self.record.key)
+                    .expect("registry read"),
                 Some(self.record.clone()),
                 "a rejected link drop must preserve the exact managed record"
             );
@@ -13126,7 +13354,7 @@ mod leaf_granular_deploy_tests {
         fn assert_fail_open_drop_happened(&self, policy: LinkDropPolicy) {
             assert!(
                 self.registry
-                    .get(&self.record.key)
+                    .artifact(&self.record.key)
                     .expect("registry read")
                     .is_none(),
                 "the current {policy:?} defect is expected to delete the managed link record"
@@ -13226,7 +13454,7 @@ mod leaf_granular_deploy_tests {
         };
         assert_sealed_offer_diagnostic(&err.to_string(), "dest", "ed", "editor");
         assert_eq!(
-            registry.get(&key).expect("registry read"),
+            registry.artifact(&key).expect("registry read"),
             Some(record.clone()),
             "a rejected ordinary prune must preserve the exact managed record"
         );
@@ -13246,7 +13474,7 @@ mod leaf_granular_deploy_tests {
         };
         assert_sealed_offer_diagnostic(&err.to_string(), "dest", "ed", "editor");
         assert_eq!(
-            registry.get(&key).expect("registry read"),
+            registry.artifact(&key).expect("registry read"),
             Some(record.clone()),
             "a rejected fast-forward prune must preserve the exact managed record"
         );
@@ -13340,8 +13568,8 @@ mod leaf_granular_deploy_tests {
         );
         assert_eq!(
             std::fs::read_link(&dir_dst).expect("collapsed dir symlink readable"),
-            wt.path().join("editor/plug"),
-            "the collapsed symlink must point at <git>/editor/plug, the taken subtree"
+            canonical_fixture_target(&wt.path().join("editor/plug")),
+            "the collapsed symlink must point at canonical <git>/editor/plug, the taken subtree"
         );
 
         let recs = records(&registry, "dest");
@@ -13448,9 +13676,9 @@ mod leaf_granular_deploy_tests {
         let target = std::fs::read_link(&leaf).expect("the link leaf must be readable");
         assert_eq!(
             target,
-            wt.path().join("editor/a.md"),
-            "a link-mode FILE leaf must point at the source FILE; the kind threaded into \
-             link_artifact must be RecordKind::File so Windows selects symlink_file, not \
+            canonical_fixture_target(&wt.path().join("editor/a.md")),
+            "a link-mode FILE leaf must point at the canonical source FILE; the kind threaded \
+             into link_artifact must be RecordKind::File so Windows selects symlink_file, not \
              symlink_dir"
         );
         let target_meta =
@@ -13770,7 +13998,7 @@ mod leaf_granular_deploy_tests {
             "premise: the first sync must record the suffix-stripped published key"
         );
         let record = registry
-            .get(&key)
+            .artifact(&key)
             .expect("registry read")
             .expect("the suffix-stripped template record must exist");
         assert_eq!(record.kind, RecordKind::File);
@@ -13800,7 +14028,7 @@ mod leaf_granular_deploy_tests {
             "the source pin moved, so the diagnostic must offer --fast-forward; got:\n{rendered}"
         );
         assert!(
-            registry.get(&key).expect("registry read").is_some() && dst.exists(),
+            registry.artifact(&key).expect("registry read").is_some() && dst.exists(),
             "a rejected ordinary prune must preserve both the template record and deployed path"
         );
 
@@ -13812,7 +14040,7 @@ mod leaf_granular_deploy_tests {
         sync(&fast_forward, &backend, &registry)
             .expect("--fast-forward may follow the moved pin and remove the dropped template");
         assert!(
-            registry.get(&key).expect("registry read").is_none() && !dst.exists(),
+            registry.artifact(&key).expect("registry read").is_none() && !dst.exists(),
             "fast-forward must remove both the dropped template record and deployed path"
         );
         drop(src);
@@ -14173,11 +14401,11 @@ fn prune_deletes_orphan_files_using_persisted_deploy_root() {
     let mut orphan = leaf_record("gone", "ed", "orphaned");
     orphan.deploy_root = Some(orphan_root.path().to_string_lossy().into_owned());
     registry
-        .put(&orphan)
+        .put_artifact(&orphan)
         .expect("seed orphan record carrying a persisted deploy_root");
     let legacy_key = artifact_key("also-gone", "ed", "legacy");
     registry
-        .put(&leaf_record("also-gone", "ed", "legacy"))
+        .put_artifact(&leaf_record("also-gone", "ed", "legacy"))
         .expect("seed legacy pathless orphan record (deploy_root: None)");
 
     let cfg = Config::parse(
@@ -14187,10 +14415,18 @@ fn prune_deletes_orphan_files_using_persisted_deploy_root() {
     let parsed = cfg.parsed_sources().expect("sources parse");
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
     let commits = one_commit(&parsed, "ed", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+    let resolved_sources = BTreeMap::new();
     let protected = test_protected(&std::env::temp_dir());
 
-    let projection = project_workspace(&cfg, &parsed, &remotes, &fx_backend(), &commits)
-        .expect("empty-target projection builds");
+    let projection = project_workspace(
+        &cfg,
+        &parsed,
+        &remotes,
+        &fx_backend(),
+        &commits,
+        &resolved_sources,
+    )
+    .expect("empty-target projection builds");
     prune_projected(&projection, &cfg, &registry, &protected)
         .expect("prune runs over an orphaned registry");
 
@@ -14202,13 +14438,16 @@ fn prune_deletes_orphan_files_using_persisted_deploy_root() {
     );
     assert!(
         registry
-            .get(&artifact_key("gone", "ed", "orphaned"))
+            .artifact(&artifact_key("gone", "ed", "orphaned"))
             .expect("registry read")
             .is_none(),
         "prune must drop the orphan record AFTER removing its files"
     );
     assert!(
-        registry.get(&legacy_key).expect("registry read").is_none(),
+        registry
+            .artifact(&legacy_key)
+            .expect("registry read")
+            .is_none(),
         "a legacy pathless orphan (deploy_root: None) gets record-only cleanup"
     );
 }
@@ -14227,7 +14466,7 @@ fn prune_keeps_orphan_record_when_its_path_overlaps_a_live_destination() {
     let mut orphan = dir_record("gone", "ed", "editor");
     orphan.deploy_root = Some(td.target_path().to_string_lossy().into_owned());
     registry
-        .put(&orphan)
+        .put_artifact(&orphan)
         .expect("seed overlapping orphan record");
 
     prune_one(&cfg, &backend, &registry, &commit).expect("prune runs");
@@ -14240,7 +14479,7 @@ fn prune_keeps_orphan_record_when_its_path_overlaps_a_live_destination() {
     );
     assert!(
         registry
-            .get(&artifact_key("gone", "ed", "editor"))
+            .artifact(&artifact_key("gone", "ed", "editor"))
             .expect("registry read")
             .is_some(),
         "overlap guard skips+keeps: an orphan record whose files overlap a live destination must \
@@ -14268,13 +14507,19 @@ fn undecided_conflict_at_apply_errors_unresolved() {
     let target = cfg.targets.get("dest").expect("dest target present");
     let parsed = cfg.parsed_sources().expect("sources parse");
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
-    fx.backend
-        .fetch(&sn("editor-src"), &fx.url)
-        .expect("seed editor-src mirror");
+    seed_git_mirror(&fx.backend, "editor-src", &fx.url);
     let commits = one_commit(&parsed, "editor-src", &fx.head_sha);
+    let resolved_sources = resolved_git_map(&fx.backend, "editor-src", &fx.url, &fx.head_sha);
 
-    let projection = project_workspace(&cfg, &parsed, &remotes, &fx.backend, &commits)
-        .expect("projection builds over the seeded mirror");
+    let projection = project_workspace(
+        &cfg,
+        &parsed,
+        &remotes,
+        &fx.backend,
+        &commits,
+        &resolved_sources,
+    )
+    .expect("projection builds over the seeded mirror");
     let target_projection = projection
         .targets
         .iter()
@@ -14301,18 +14546,19 @@ fn undecided_conflict_at_apply_errors_unresolved() {
         "premise: the projection must yield at least one artifact to conflict on"
     );
     let changeset = crate::sync::model::ChangeSet { changes };
-    let observed = crate::sync::model::ObservedProjectState::<RegistryRecord> {
+    let observed = crate::sync::model::ObservedProjectState::<ArtifactRecord> {
         artifacts: Vec::new(),
     };
     let reconciliation = Reconciliation::new(&changeset, &observed, BTreeMap::new());
 
-    let journal = Journal::open(&fx.registry.locks_dir()).expect("open journal");
+    let journal = Journal::open(&fx.registry.journal_root()).expect("open journal");
     let protected = test_protected(fx.src.path());
     let run = TargetRun {
         parsed: &parsed,
         target_name: "dest",
         target,
         remotes: &remotes,
+        resolved_sources: &resolved_sources,
         vars: &BTreeMap::new(),
         protected: &protected,
     };
@@ -14349,20 +14595,26 @@ fn observe_workspace_full_registry_scan_follows_prune_policy() {
         &td.target_path(),
         "by-source",
     );
-    fx.backend
-        .fetch(&sn("editor-src"), &fx.url)
-        .expect("seed editor-src mirror");
+    seed_git_mirror(&fx.backend, "editor-src", &fx.url);
     let parsed = cfg.parsed_sources().expect("sources parse");
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
     let commits = one_commit(&parsed, "editor-src", &fx.head_sha);
-    let projection = project_workspace(&cfg, &parsed, &remotes, &fx.backend, &commits)
-        .expect("projection builds");
+    let resolved_sources = resolved_git_map(&fx.backend, "editor-src", &fx.url, &fx.head_sha);
+    let projection = project_workspace(
+        &cfg,
+        &parsed,
+        &remotes,
+        &fx.backend,
+        &commits,
+        &resolved_sources,
+    )
+    .expect("projection builds");
     let protected = test_protected(fx.src.path());
-    let journal = Journal::open(&fx.registry.locks_dir()).expect("open journal");
+    let journal = Journal::open(&fx.registry.journal_root()).expect("open journal");
     let orphan_record = linked_flat_record("retired", "legacy", "orphan");
     let orphan_key = orphan_record.key.clone();
     fx.registry
-        .put(&orphan_record)
+        .put_artifact(&orphan_record)
         .expect("seed registry-only orphan absent from projection");
     let registry = FullScanCountingRegistry::new(&fx.registry);
 
@@ -14374,6 +14626,7 @@ fn observe_workspace_full_registry_scan_follows_prune_policy() {
             config: &cfg,
             parsed: &parsed,
             remotes: &remotes,
+            resolved_sources: &resolved_sources,
             projection: &projection,
             protected: &protected,
             input: &si,
@@ -14421,16 +14674,15 @@ fn observe_workspace_rejects_duplicate_triplet() {
     );
     let parsed = cfg.parsed_sources().expect("sources parse");
     let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
-    fx.backend
-        .fetch(&sn("editor-src"), &fx.url)
-        .expect("seed editor-src mirror");
+    seed_git_mirror(&fx.backend, "editor-src", &fx.url);
+    let resolved_sources = resolved_git_map(&fx.backend, "editor-src", &fx.url, &fx.head_sha);
     let protected = test_protected(fx.src.path());
-    let journal = Journal::open(&fx.registry.locks_dir()).expect("open journal");
+    let journal = Journal::open(&fx.registry.journal_root()).expect("open journal");
 
     let colliding_artifact = || crate::projection::model::ProjectedArtifact {
         destination: crate::projection::model::TargetPath::new("editor").expect("valid dest"),
         source: crate::projection::model::ResolvedSourceRef::new("editor-src", &fx.head_sha),
-        materialization: crate::kernel::Materialization::CollapsedDir {
+        materialization: crate::projection::model::Materialization::CollapsedDir {
             dir: "editor".to_owned(),
         },
         kept_leaves: Vec::new(),
@@ -14459,6 +14711,7 @@ fn observe_workspace_rejects_duplicate_triplet() {
         config: &cfg,
         parsed: &parsed,
         remotes: &remotes,
+        resolved_sources: &resolved_sources,
         projection: &projection,
         protected: &protected,
         input: &si,

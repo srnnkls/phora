@@ -2,13 +2,13 @@ use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use phora::store::{
-    ArtifactKey, EjectedEntry, FileRegistry, HookState, ManifestFile, RegistryRecord,
-    StateLockGuard, StoreError,
-};
 use phora::sync::inspect::inspect;
 use phora::sync::model::{ManagedCondition, ObservedArtifact};
 use phora::sync::state::StateStore;
+use phora::sync::state::{
+    ArtifactKey, ArtifactRecord, Ejection, FileStateStore, HookState, ManifestFile, StateError,
+    StateLock,
+};
 use tempfile::TempDir;
 
 const SOURCE: &str = "company-configs";
@@ -16,9 +16,9 @@ const COMMIT: &str = "abc123def456";
 const ARTIFACT: &str = "snippets";
 const TARGET: &str = "vscode";
 
-fn store() -> (TempDir, FileRegistry) {
+fn store() -> (TempDir, FileStateStore) {
     let dir = TempDir::new().expect("temp state root");
-    let reg = FileRegistry::open(dir.path().to_path_buf()).expect("open store");
+    let reg = FileStateStore::open(dir.path().to_path_buf()).expect("open store");
     (dir, reg)
 }
 
@@ -40,7 +40,7 @@ fn mtime_secs(path: &Path) -> u64 {
         .as_secs()
 }
 
-fn deploy_and_record(target: &Path, files: &[(&str, &[u8])]) -> RegistryRecord {
+fn deploy_and_record(target: &Path, files: &[(&str, &[u8])]) -> ArtifactRecord {
     let mut manifest = Vec::new();
     for (rel, contents) in files {
         let path = target.join(rel);
@@ -55,7 +55,7 @@ fn deploy_and_record(target: &Path, files: &[(&str, &[u8])]) -> RegistryRecord {
             blake3: blake3::hash(contents).to_hex().to_string(),
         });
     }
-    RegistryRecord {
+    ArtifactRecord {
         version: 1,
         key: key(),
         source: SOURCE.to_owned(),
@@ -63,7 +63,7 @@ fn deploy_and_record(target: &Path, files: &[(&str, &[u8])]) -> RegistryRecord {
         digest: "blake3:d4e5f6".to_owned(),
         projected_at: "2026-01-31T12:34:56Z".to_owned(),
         layout: "flat".to_owned(),
-        kind: phora::store::RecordKind::Dir,
+        kind: phora::sync::state::RecordKind::Dir,
         allow_symlinks: false,
         preserve_executable: true,
         files: manifest,
@@ -74,8 +74,8 @@ fn deploy_and_record(target: &Path, files: &[(&str, &[u8])]) -> RegistryRecord {
     }
 }
 
-fn ejected(source: &str, artifact: &str) -> EjectedEntry {
-    EjectedEntry {
+fn ejected(source: &str, artifact: &str) -> Ejection {
+    Ejection {
         source: source.to_owned(),
         artifact: artifact.to_owned(),
         ejected_at: "2026-01-31T14:00:00Z".to_owned(),
@@ -88,8 +88,8 @@ fn observe(
     key: &ArtifactKey,
     expected_source: &str,
     expected_commit: &str,
-    ejections: &[EjectedEntry],
-) -> ObservedArtifact<RegistryRecord> {
+    ejections: &[Ejection],
+) -> ObservedArtifact<ArtifactRecord> {
     inspect(
         target_path,
         expected_source,
@@ -103,12 +103,12 @@ fn observe(
 }
 
 struct OneShotStore {
-    record: RegistryRecord,
+    record: ArtifactRecord,
     artifact_reads: Cell<usize>,
 }
 
 impl OneShotStore {
-    fn new(record: RegistryRecord) -> Self {
+    fn new(record: ArtifactRecord) -> Self {
         Self {
             record,
             artifact_reads: Cell::new(0),
@@ -117,44 +117,44 @@ impl OneShotStore {
 }
 
 impl StateStore for OneShotStore {
-    fn artifact(&self, key: &ArtifactKey) -> Result<Option<RegistryRecord>, StoreError> {
+    fn artifact(&self, key: &ArtifactKey) -> Result<Option<ArtifactRecord>, StateError> {
         assert_eq!(key, &self.record.key, "inspect must request the seeded key");
         let reads = self.artifact_reads.get();
         self.artifact_reads.set(reads + 1);
         if reads == 0 {
             Ok(Some(self.record.clone()))
         } else {
-            Err(StoreError::Registry(
+            Err(StateError::StateStore(
                 "artifact record was read more than once".to_owned(),
             ))
         }
     }
 
-    fn put_artifact(&self, _record: &RegistryRecord) -> Result<(), StoreError> {
+    fn put_artifact(&self, _record: &ArtifactRecord) -> Result<(), StateError> {
         unreachable!("inspection must not write an artifact")
     }
 
-    fn remove_artifact(&self, _key: &ArtifactKey) -> Result<(), StoreError> {
+    fn remove_artifact(&self, _key: &ArtifactKey) -> Result<(), StateError> {
         unreachable!("inspection must not remove an artifact")
     }
 
-    fn target_artifacts(&self, _target: &str) -> Result<Vec<RegistryRecord>, StoreError> {
+    fn target_artifacts(&self, _target: &str) -> Result<Vec<ArtifactRecord>, StateError> {
         unreachable!("a directly managed artifact must not fall back to a target-wide read")
     }
 
-    fn all_artifacts(&self) -> Result<Vec<RegistryRecord>, StoreError> {
+    fn all_artifacts(&self) -> Result<Vec<ArtifactRecord>, StateError> {
         unreachable!("inspection must not list every artifact")
     }
 
-    fn ejections(&self, _target: &str) -> Result<Vec<EjectedEntry>, StoreError> {
+    fn ejections(&self, _target: &str) -> Result<Vec<Ejection>, StateError> {
         unreachable!("inspection receives ejections from its caller")
     }
 
-    fn save_ejections(&self, _target: &str, _entries: &[EjectedEntry]) -> Result<(), StoreError> {
+    fn save_ejections(&self, _target: &str, _entries: &[Ejection]) -> Result<(), StateError> {
         unreachable!("inspection must not save ejections")
     }
 
-    fn hook_state(&self, _target: &str) -> Result<Vec<HookState>, StoreError> {
+    fn hook_state(&self, _target: &str) -> Result<Vec<HookState>, StateError> {
         unreachable!("inspection must not read hook state")
     }
 
@@ -163,11 +163,11 @@ impl StateStore for OneShotStore {
         _target: &str,
         _hook_id: &str,
         _digest_set: &BTreeSet<String>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<(), StateError> {
         unreachable!("inspection must not record hook state")
     }
 
-    fn acquire_lock(&self) -> Result<StateLockGuard, StoreError> {
+    fn acquire_lock(&self) -> Result<StateLock, StateError> {
         unreachable!("inspection must not acquire the project lock")
     }
 

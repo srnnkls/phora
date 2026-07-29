@@ -1,18 +1,18 @@
 //! Crate-wide error aggregate at the CLI edge.
 //!
-//! Bounded contexts own their own enums ([`crate::source::SourceError`],
-//! [`crate::store::StoreError`]); this type aggregates them via `From` for
-//! propagation and exit-code mapping at the binary boundary.
+//! Source and sync state own their error enums ([`crate::source::SourceError`],
+//! [`crate::sync::state::StateError`]); this type aggregates them via `From`
+//! for propagation and exit-code mapping at the binary boundary.
 //!
-//! Construction rule: port adapters raise their context enum; orchestration
-//! code (`sync`, `deploy`, `cli`) and kernel value objects construct this edge
-//! type directly. The remaining message-bearing variants exist for the latter
-//! — do not add new context-owned failures here.
+//! Capability owners raise their structured errors; sync and CLI orchestration
+//! construct this edge type for cross-capability failures. The remaining
+//! message-bearing variants exist for boundary composition — do not add new
+//! owner-specific failures here.
 
 use thiserror::Error;
 
 use crate::source::{KernelError, SourceError};
-use crate::store::StoreError;
+use crate::sync::state::StateError;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -28,7 +28,7 @@ pub enum Error {
     },
 
     #[error(transparent)]
-    StoreCtx(#[from] StoreError),
+    StateCtx(#[from] StateError),
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -52,7 +52,7 @@ pub enum Error {
     SymlinkNotAllowed { path: std::path::PathBuf },
 
     #[error("registry error: {0}")]
-    Registry(String),
+    StateStore(String),
 
     #[error("projection error: {0}")]
     Projection(String),

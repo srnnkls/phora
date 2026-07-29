@@ -1,5 +1,5 @@
 use super::*;
-use crate::store::{ArtifactKey, FileRegistry, ManifestFile, RecordKind, RegistryRecord};
+use crate::sync::state::{ArtifactKey, ArtifactRecord, FileStateStore, ManifestFile, RecordKind};
 use clap::CommandFactory;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -390,8 +390,8 @@ fn record(
     artifact: &str,
     commit: &str,
     digest: &str,
-) -> RegistryRecord {
-    RegistryRecord {
+) -> ArtifactRecord {
+    ArtifactRecord {
         version: 1,
         key: ArtifactKey {
             target: target.to_owned(),
@@ -419,12 +419,12 @@ fn record(
     }
 }
 
-fn seeded_registry() -> (TempDir, FileRegistry) {
+fn seeded_registry() -> (TempDir, FileStateStore) {
     let dir = TempDir::new().expect("temp state root");
-    let reg = FileRegistry::open(dir.path().to_path_buf()).expect("open registry");
-    reg.put(&record("nvim", "dotfiles", "init", "aaa111", "blake3:d1"))
+    let reg = FileStateStore::open(dir.path().to_path_buf()).expect("open registry");
+    reg.put_artifact(&record("nvim", "dotfiles", "init", "aaa111", "blake3:d1"))
         .expect("put nvim/dotfiles/init");
-    reg.put(&record(
+    reg.put_artifact(&record(
         "vscode",
         "dotfiles",
         "settings",
@@ -432,7 +432,7 @@ fn seeded_registry() -> (TempDir, FileRegistry) {
         "blake3:d2",
     ))
     .expect("put vscode/dotfiles/settings");
-    reg.put(&record(
+    reg.put_artifact(&record(
         "vscode",
         "company-configs",
         "python",
@@ -440,7 +440,7 @@ fn seeded_registry() -> (TempDir, FileRegistry) {
         "blake3:dpy",
     ))
     .expect("put vscode/company-configs/python");
-    reg.put(&record(
+    reg.put_artifact(&record(
         "agent-1",
         "company-configs",
         "python",
@@ -644,9 +644,9 @@ fn where_with_no_match_is_empty() {
 #[test]
 fn where_marks_ejected_targets() {
     let (_dir, reg) = seeded_registry();
-    reg.save_ejected(
+    reg.save_ejections(
         "nvim",
-        &[crate::store::EjectedEntry {
+        &[crate::sync::state::Ejection {
             source: "dotfiles".to_owned(),
             artifact: "init".to_owned(),
             ejected_at: "2026-01-01T00:00:00Z".to_owned(),
@@ -2015,8 +2015,8 @@ fn record_for(
     artifact: &str,
     commit: &str,
     files: Vec<ManifestFile>,
-) -> RegistryRecord {
-    RegistryRecord {
+) -> ArtifactRecord {
+    ArtifactRecord {
         version: 1,
         key: ArtifactKey {
             target: target.to_owned(),
@@ -2083,12 +2083,12 @@ fn status_for<'a>(
 #[test]
 fn list_statuses_reports_clean_for_matching_deployment() {
     let state_dir = TempDir::new().expect("state root");
-    let reg = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let reg = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
     let target_root = TempDir::new().expect("target root");
     let cfg = config_one_flat_target("dest", "editor-src", target_root.path());
 
     let mf = deploy_matching_file(target_root.path(), "editor", "init.lua", b"-- init\n");
-    reg.put(&record_for(
+    reg.put_artifact(&record_for(
         "dest",
         "editor-src",
         "editor",
@@ -2120,12 +2120,12 @@ fn list_statuses_reports_clean_for_matching_deployment() {
 #[test]
 fn list_statuses_reports_modified_for_edited_deployment() {
     let state_dir = TempDir::new().expect("state root");
-    let reg = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let reg = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
     let target_root = TempDir::new().expect("target root");
     let cfg = config_one_flat_target("dest", "editor-src", target_root.path());
 
     let mf = deploy_matching_file(target_root.path(), "editor", "init.lua", b"-- init\n");
-    reg.put(&record_for(
+    reg.put_artifact(&record_for(
         "dest",
         "editor-src",
         "editor",
@@ -2160,12 +2160,12 @@ fn list_statuses_reports_modified_for_edited_deployment() {
 #[test]
 fn list_statuses_reports_ejected_for_ejected_artifact() {
     let state_dir = TempDir::new().expect("state root");
-    let reg = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let reg = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
     let target_root = TempDir::new().expect("target root");
     let cfg = config_one_flat_target("dest", "editor-src", target_root.path());
 
     let mf = deploy_matching_file(target_root.path(), "editor", "init.lua", b"-- init\n");
-    reg.put(&record_for(
+    reg.put_artifact(&record_for(
         "dest",
         "editor-src",
         "editor",
@@ -2173,9 +2173,9 @@ fn list_statuses_reports_ejected_for_ejected_artifact() {
         vec![mf],
     ))
     .expect("seed registry record");
-    reg.save_ejected(
+    reg.save_ejections(
         "dest",
-        &[crate::store::EjectedEntry {
+        &[crate::sync::state::Ejection {
             source: "editor-src".to_owned(),
             artifact: "editor".to_owned(),
             ejected_at: "2026-01-31T14:00:00Z".to_owned(),
@@ -2197,7 +2197,7 @@ fn list_statuses_reports_ejected_for_ejected_artifact() {
 #[test]
 fn list_statuses_groups_by_target_and_names_source_and_artifact() {
     let state_dir = TempDir::new().expect("state root");
-    let reg = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let reg = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
     let root_a = TempDir::new().expect("target a root");
     let root_b = TempDir::new().expect("target b root");
     let cfg = config_two_flat_targets(
@@ -2210,7 +2210,7 @@ fn list_statuses_groups_by_target_and_names_source_and_artifact() {
     );
 
     let lua = deploy_matching_file(root_a.path(), "editor", "init.lua", b"-- init\n");
-    reg.put(&record_for(
+    reg.put_artifact(&record_for(
         "home",
         "editor-src",
         "editor",
@@ -2219,7 +2219,7 @@ fn list_statuses_groups_by_target_and_names_source_and_artifact() {
     ))
     .expect("seed editor record under home");
     let json = deploy_matching_file(root_b.path(), "snippets", "py.json", b"{}\n");
-    reg.put(&record_for(
+    reg.put_artifact(&record_for(
         "xdg",
         "snippets-src",
         "snippets",
@@ -2307,8 +2307,8 @@ fn mapped_record(
     dest: &str,
     commit: &str,
     files: Vec<ManifestFile>,
-) -> RegistryRecord {
-    RegistryRecord {
+) -> ArtifactRecord {
+    ArtifactRecord {
         version: 1,
         key: ArtifactKey {
             target: target.to_owned(),
@@ -2344,8 +2344,8 @@ fn config_one_by_source_target(target: &str, source: &str, target_path: &Path) -
 #[test]
 fn where_resolves_a_mapped_record_under_its_dest_name() {
     let dir = TempDir::new().expect("state root");
-    let reg = FileRegistry::open(dir.path().to_path_buf()).expect("open registry");
-    reg.put(&mapped_record(
+    let reg = FileStateStore::open(dir.path().to_path_buf()).expect("open registry");
+    reg.put_artifact(&mapped_record(
         "dest",
         "fzf-src",
         "fzf.zsh",
@@ -2378,12 +2378,12 @@ fn where_resolves_a_mapped_record_under_its_dest_name() {
 #[test]
 fn list_statuses_reports_mapped_dest_path_without_layout_leak() {
     let state_dir = TempDir::new().expect("state root");
-    let reg = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let reg = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
     let target_root = TempDir::new().expect("target root");
     let cfg = config_one_by_source_target("dest", "fzf-src", target_root.path());
 
     let mf = deploy_mapped_file(target_root.path(), "fzf-src", "fzf.zsh", b"# fzf\n");
-    reg.put(&mapped_record(
+    reg.put_artifact(&mapped_record(
         "dest",
         "fzf-src",
         "fzf.zsh",
@@ -2417,12 +2417,12 @@ fn list_statuses_reports_mapped_dest_path_without_layout_leak() {
 #[test]
 fn eject_keeps_mapped_file_and_marks_record_ejected() {
     let state_dir = TempDir::new().expect("state root");
-    let reg = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let reg = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
     let target_root = TempDir::new().expect("target root");
     let cfg = config_one_by_source_target("dest", "fzf-src", target_root.path());
 
     let mf = deploy_mapped_file(target_root.path(), "fzf-src", "fzf.zsh", b"# fzf\n");
-    reg.put(&mapped_record(
+    reg.put_artifact(&mapped_record(
         "dest",
         "fzf-src",
         "fzf.zsh",
@@ -2450,12 +2450,12 @@ fn eject_keeps_mapped_file_and_marks_record_ejected() {
 #[test]
 fn uneject_round_trips_a_mapped_record_back_to_managed() {
     let state_dir = TempDir::new().expect("state root");
-    let reg = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let reg = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
     let target_root = TempDir::new().expect("target root");
     let cfg = config_one_by_source_target("dest", "fzf-src", target_root.path());
 
     let mf = deploy_mapped_file(target_root.path(), "fzf-src", "fzf.zsh", b"# fzf\n");
-    reg.put(&mapped_record(
+    reg.put_artifact(&mapped_record(
         "dest",
         "fzf-src",
         "fzf.zsh",
@@ -4652,7 +4652,7 @@ fn target_listing_derives_explicit_vs_all_resolution_mode() {
 #[test]
 fn target_detail_no_key_target_binds_nothing() {
     let state_dir = TempDir::new().expect("state root");
-    let reg = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let reg = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
     let cfg = config_with_targets(
         "version = 1\n\n[sources.a]\ngit = \"g\"\n\n[sources.b]\ngit = \"h\"\n\n\
          [targets.everything]\npath = \"~/x\"\n",
@@ -4669,12 +4669,12 @@ fn target_detail_no_key_target_binds_nothing() {
 #[test]
 fn target_detail_reports_per_artifact_deployment_state() {
     let state_dir = TempDir::new().expect("state root");
-    let reg = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let reg = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
     let target_root = TempDir::new().expect("target root");
     let cfg = config_one_flat_target("dest", "editor-src", target_root.path());
 
     let mf = deploy_matching_file(target_root.path(), "editor", "init.lua", b"-- init\n");
-    reg.put(&record_for(
+    reg.put_artifact(&record_for(
         "dest",
         "editor-src",
         "editor",
@@ -4703,7 +4703,7 @@ fn target_detail_reports_per_artifact_deployment_state() {
 #[test]
 fn target_detail_unknown_name_errors() {
     let state_dir = TempDir::new().expect("state root");
-    let reg = FileRegistry::open(state_dir.path().to_path_buf()).expect("open registry");
+    let reg = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
     let cfg = config_with_targets("version = 1\n\n[targets.real]\npath = \"~/x\"\n");
     let err = target_detail(&cfg, &reg, "ghost")
         .expect_err("target show on an undefined name must error");
@@ -5274,7 +5274,7 @@ fn preview_selectors_are_long_flags_not_positionals() {
 )]
 fn git_init_with_template(dir: &std::path::Path, body: &[u8]) -> String {
     let run = |args: &[&str]| {
-        let _serial = crate::store::guard_git_fork();
+        let _serial = crate::sync::state::locking::guard_git_fork();
         let status = std::process::Command::new("git")
             .current_dir(dir)
             .args(args)
@@ -5351,7 +5351,7 @@ fn rebuild_over_merged_vars_agrees_with_deployed_vars_digest() {
     };
 
     let (deployed_vd, rebuilt_vd) = with_cwd(project.path(), || {
-        let _serial = crate::store::STATE_LOCK_SERIAL
+        let _serial = crate::sync::state::locking::STATE_LOCK_SERIAL
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _state = EnvVarGuard::set("XDG_STATE_HOME", state.path());
@@ -5371,7 +5371,7 @@ fn rebuild_over_merged_vars_agrees_with_deployed_vars_digest() {
         let reg = open_project_registry(&load_config().expect("load config"))
             .expect("open project registry");
         let deployed_vd = reg
-            .get(&key)
+            .artifact(&key)
             .expect("registry get")
             .expect("deploy recorded the artifact")
             .vars_digest;
@@ -5380,14 +5380,15 @@ fn rebuild_over_merged_vars_agrees_with_deployed_vars_digest() {
             "premise: a templated artifact's deployed record must stamp a vars_digest"
         );
 
-        reg.remove(&key).expect("drop the record to force rebuild");
+        reg.remove_artifact(&key)
+            .expect("drop the record to force rebuild");
 
         super::sync::run_rebuild_registry().expect("rebuild reconstructs the dropped record");
 
         let reg = open_project_registry(&load_config().expect("load config"))
             .expect("reopen project registry");
         let rebuilt_vd = reg
-            .get(&key)
+            .artifact(&key)
             .expect("registry get after rebuild")
             .expect("rebuild reconstructed the record")
             .vars_digest;
@@ -5556,8 +5557,8 @@ fn seed_deployed_record(state_root: &Path, project_dir: &Path, target: &str) {
     let project =
         crate::sync::state::ProjectId::for_path(project_dir).expect("project id for seed");
     let registry_root = state_root.join("projects").join(project.as_str());
-    let reg = FileRegistry::open(registry_root).expect("open seeded project registry");
-    reg.put(&record(target, "dotfiles", "init", "aaa111", "blake3:d1"))
+    let reg = FileStateStore::open(registry_root).expect("open seeded project registry");
+    reg.put_artifact(&record(target, "dotfiles", "init", "aaa111", "blake3:d1"))
         .expect("seed a deployed record for the target");
 }
 

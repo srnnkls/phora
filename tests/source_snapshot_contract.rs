@@ -6,11 +6,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::str::FromStr as _;
 
-use phora::config::Refspec;
-use phora::kernel::SourceName;
+use phora::source::SourceName;
 use phora::source::{
-    GitBackend, HttpBackend, ResolvedSource, SnapshotId, SourceBackend as _, SourceEntry,
-    SourceEntryKind, SourceError, SourceInventory, SourcePath, SourceStore, capture_worktree,
+    GitBackend, HttpBackend, ResolvePolicy, ResolveRequest, ResolvedRevision, ResolvedSource,
+    RevisionSpec, SnapshotId, SourceDirectoryEntryKind, SourceEntry, SourceEntryKind,
+    SourceIdentity, SourceInventory, SourceLocation, SourcePath, SourceStore, SourceTimestamp,
+    capture_worktree,
 };
 use tempfile::TempDir;
 
@@ -241,9 +242,28 @@ fn build_capture_matrix(root: &Path) {
 }
 
 fn resolved_worktree(root: &Path, snapshot: SnapshotId) -> ResolvedSource {
+    let SnapshotId::Worktree {
+        root: canonical_root,
+        head,
+        ..
+    } = &snapshot
+    else {
+        panic!("expected a worktree snapshot, got {snapshot:?}");
+    };
+    assert_eq!(
+        canonical_root.as_path(),
+        root.canonicalize().expect("canonicalize fixture root"),
+        "the resolved worktree identity must retain the canonical source root"
+    );
     ResolvedSource {
         name: sn("wt"),
-        url: root.to_string_lossy().into_owned(),
+        revision: ResolvedRevision::WorktreeHead(head.clone()),
+        authored_at: SourceTimestamp::from_unix_seconds(if head.is_some() {
+            1_700_000_000
+        } else {
+            0
+        }),
+        normalized_location: SourceIdentity::Worktree(canonical_root.clone()),
         snapshot,
     }
 }
@@ -259,7 +279,7 @@ fn cache_entries(cache_dir: &Path) -> BTreeSet<String> {
 
 fn worktree_digest(snapshot: &SnapshotId) -> String {
     match snapshot {
-        SnapshotId::Worktree { capture_digest, .. } => capture_digest.clone(),
+        SnapshotId::Worktree { capture_digest, .. } => capture_digest.to_string(),
         other @ SnapshotId::Git { .. } => panic!("expected a worktree snapshot, got {other:?}"),
     }
 }
@@ -278,8 +298,7 @@ fn render_inventory(inventory: &SourceInventory) -> String {
 }
 
 fn read_bytes(store: &GitBackend, resolved: &ResolvedSource, path: &str) -> Vec<u8> {
-    let entry: SourceEntry = store
-        .read(resolved, &sp(path))
+    let entry: SourceEntry = SourceStore::read(store, &resolved.snapshot, &sp(path))
         .unwrap_or_else(|e| panic!("read captured `{path}`: {e}"));
     entry.bytes
 }
@@ -302,21 +321,22 @@ fn worktree_capture_set_matches_the_pinned_fixture() {
         panic!("a local working tree must capture as SnapshotId::Worktree, got {snapshot:?}");
     };
     assert_eq!(
-        root.canonicalize().expect("canonicalize captured root"),
+        root.as_path(),
         src.path()
             .canonicalize()
             .expect("canonicalize fixture root"),
         "SnapshotId::Worktree must record the captured root"
     );
     assert_eq!(
-        head,
-        &rev_parse_head(src.path()),
+        head.as_ref().map(ToString::to_string),
+        Some(rev_parse_head(src.path())),
         "SnapshotId::Worktree must record the worktree's HEAD commit"
     );
 
     let store = GitBackend::new(cache.path().to_path_buf());
     let resolved = resolved_worktree(src.path(), snapshot);
-    let inventory = store.inventory(&resolved).expect("captured inventory");
+    let inventory =
+        SourceStore::inventory(&store, &resolved.snapshot, None).expect("captured inventory");
 
     let paths: Vec<&str> = inventory
         .entries
@@ -329,7 +349,7 @@ fn worktree_capture_set_matches_the_pinned_fixture() {
          sync::discover::collect_working_tree_leaves): {paths:?}"
     );
     assert!(
-        store.read(&resolved, &sp("link-to-readme")).is_err(),
+        SourceStore::read(&store, &resolved.snapshot, &sp("link-to-readme")).is_err(),
         "reading a skipped symlink path must err, not serve link bytes"
     );
     assert!(
@@ -338,7 +358,7 @@ fn worktree_capture_set_matches_the_pinned_fixture() {
          captured: {paths:?}"
     );
     assert!(
-        store.read(&resolved, &sp("tracked-deleted.txt")).is_err(),
+        SourceStore::read(&store, &resolved.snapshot, &sp("tracked-deleted.txt")).is_err(),
         "reading a deleted-tracked path must err, not resurrect the committed blob"
     );
     let run_sh = inventory
@@ -397,7 +417,8 @@ fn worktree_capture_ignores_special_files() {
         .expect("a special file (socket/FIFO/device) must be skipped, not read or fail capture");
     let store = GitBackend::new(cache.path().to_path_buf());
     let resolved = resolved_worktree(src.path(), snapshot);
-    let inventory = store.inventory(&resolved).expect("captured inventory");
+    let inventory =
+        SourceStore::inventory(&store, &resolved.snapshot, None).expect("captured inventory");
     let paths: Vec<&str> = inventory
         .entries
         .iter()
@@ -409,7 +430,7 @@ fn worktree_capture_ignores_special_files() {
         "only regular files enter the capture set; the socket must be skipped like a symlink"
     );
     assert!(
-        store.read(&resolved, &sp("live.sock")).is_err(),
+        SourceStore::read(&store, &resolved.snapshot, &sp("live.sock")).is_err(),
         "reading a skipped special file's path must err, not serve bytes"
     );
 }
@@ -436,7 +457,8 @@ fn contained_cache_is_excluded_from_capture_empty_and_prepopulated() {
             .expect("capture with an in-source cache succeeds");
         let store = GitBackend::new(cache_dir.clone());
         let resolved = resolved_worktree(src.path(), snapshot);
-        let inventory = store.inventory(&resolved).expect("captured inventory");
+        let inventory =
+            SourceStore::inventory(&store, &resolved.snapshot, None).expect("captured inventory");
         assert_golden("worktree_capture_set.golden", &render_inventory(&inventory));
     }
 }
@@ -468,12 +490,11 @@ fn capture_into_a_contained_cache_publishes_atomically() {
     );
 
     let store = GitBackend::new(cache_dir.clone());
-    let inv_first = store
-        .inventory(&resolved_worktree(src.path(), first))
-        .expect("first inventory");
-    let inv_second = store
-        .inventory(&resolved_worktree(src.path(), second))
-        .expect("second inventory");
+    let first = resolved_worktree(src.path(), first);
+    let second = resolved_worktree(src.path(), second);
+    let inv_first = SourceStore::inventory(&store, &first.snapshot, None).expect("first inventory");
+    let inv_second =
+        SourceStore::inventory(&store, &second.snapshot, None).expect("second inventory");
     assert_eq!(
         inv_first, inv_second,
         "cache growth from the first capture must be invisible to the second capture set"
@@ -507,8 +528,7 @@ fn copy_reads_resolve_against_the_captured_tree_not_the_live_worktree() {
         capture_worktree(cache.path(), &sn("wt"), src.path()).expect("worktree capture succeeds");
     let store = GitBackend::new(cache.path().to_path_buf());
     let resolved = resolved_worktree(src.path(), snapshot);
-    let before = store
-        .inventory(&resolved)
+    let before = SourceStore::inventory(&store, &resolved.snapshot, None)
         .expect("inventory before mutation");
 
     write(&src.path().join("README.md"), b"changed-after-capture\n");
@@ -517,9 +537,8 @@ fn copy_reads_resolve_against_the_captured_tree_not_the_live_worktree() {
     std::fs::create_dir(src.path().join("plain-dir/data.txt")).expect("replace file with dir");
     write(&src.path().join("plain-dir/data.txt/child.txt"), b"child\n");
 
-    let after = store
-        .inventory(&resolved)
-        .expect("inventory after mutation");
+    let after =
+        SourceStore::inventory(&store, &resolved.snapshot, None).expect("inventory after mutation");
     assert_eq!(
         after, before,
         "the frozen inventory must not track live mutation, deletion, or file→dir replacement"
@@ -571,7 +590,7 @@ fn capture_digest_tracks_content_not_capture_time() {
 // ─── plain dirs, non-UTF8 names, submodules ─────────────────────────────────
 
 #[test]
-fn plain_non_git_dir_captures_with_the_link_head_sentinel() {
+fn plain_non_git_dir_captures_without_a_repository_head() {
     let src = TempDir::new().expect("src tempdir");
     write(&src.path().join("a.txt"), b"a\n");
     write(&src.path().join("sub/b.txt"), b"b\n");
@@ -583,13 +602,14 @@ fn plain_non_git_dir_captures_with_the_link_head_sentinel() {
         panic!("a plain directory must capture as SnapshotId::Worktree, got {snapshot:?}");
     };
     assert_eq!(
-        head, "link",
-        "a non-repo worktree must carry the `link` head sentinel (read_local_head parity)"
+        head, &None,
+        "a non-repository worktree has no resolved Git head; link mode remains a caller policy"
     );
 
     let store = GitBackend::new(cache.path().to_path_buf());
     let resolved = resolved_worktree(src.path(), snapshot);
-    let inventory = store.inventory(&resolved).expect("captured inventory");
+    let inventory =
+        SourceStore::inventory(&store, &resolved.snapshot, None).expect("captured inventory");
     let paths: Vec<&str> = inventory
         .entries
         .iter()
@@ -653,7 +673,8 @@ fn submodule_files_are_captured_without_git_internals() {
         capture_worktree(cache.path(), &sn("wt"), src.path()).expect("submodule capture succeeds");
     let store = GitBackend::new(cache.path().to_path_buf());
     let resolved = resolved_worktree(src.path(), snapshot);
-    let inventory = store.inventory(&resolved).expect("captured inventory");
+    let inventory =
+        SourceStore::inventory(&store, &resolved.snapshot, None).expect("captured inventory");
     let paths: Vec<&str> = inventory
         .entries
         .iter()
@@ -712,25 +733,41 @@ fn url_source_resolves_to_the_pinned_synthetic_git_snapshot() {
     let url = serve_bytes_forever(build_url_fixture_tar());
     let git_dir = TempDir::new().expect("git dir tempdir");
     let http = HttpBackend::new(git_dir.path().to_path_buf(), BTreeMap::new());
-    http.fetch(&sn("web"), &url).expect("url fetch imports");
-    let commit = http
-        .resolve(&sn("web"), &url, &Refspec::Default)
-        .expect("url resolve");
+    let resolved = SourceStore::resolve(
+        &http,
+        &ResolveRequest {
+            name: sn("web"),
+            location: SourceLocation::Url { url: url.clone() },
+            revision: RevisionSpec::None,
+        },
+        ResolvePolicy::Refresh,
+    )
+    .expect("typed url resolve imports and pins the synthetic snapshot");
+    let commit = resolved.snapshot.commit().to_string();
     assert_eq!(
         commit,
         read_golden("url_synthetic_commit.golden").trim(),
         "the synthetic commit id must stay byte-identical to the T002 baseline (INV-6)"
     );
+    assert_eq!(
+        resolved.authored_at.unix_seconds(),
+        1,
+        "the final resolved URL value preserves the synthetic import's author time"
+    );
+    assert!(matches!(
+        resolved.revision,
+        ResolvedRevision::Commit(ref resolved_commit) if resolved_commit == resolved.snapshot.commit()
+    ));
+    assert!(matches!(
+        resolved.normalized_location,
+        SourceIdentity::Url(ref normalized)
+            if normalized.as_str()
+                == url.strip_prefix("http://").expect("fixture URL is HTTP")
+    ));
 
     let store = GitBackend::new(git_dir.path().to_path_buf());
-    let resolved = ResolvedSource {
-        name: sn("web"),
-        url,
-        snapshot: SnapshotId::Git {
-            commit: commit.clone(),
-        },
-    };
-    let inventory = store.inventory(&resolved).expect("url-source inventory");
+    let inventory =
+        SourceStore::inventory(&store, &resolved.snapshot, None).expect("url-source inventory");
     let entries: Vec<(&str, SourceEntryKind)> = inventory
         .entries
         .iter()
@@ -748,7 +785,7 @@ fn url_source_resolves_to_the_pinned_synthetic_git_snapshot() {
 }
 
 #[test]
-fn git_source_snapshot_store_agrees_with_the_backend() {
+fn git_source_snapshot_store_serves_inventory_directory_and_read_capabilities() {
     let src = TempDir::new().expect("src tempdir");
     git(src.path(), &["init", "-b", "main", "."]);
     git(src.path(), &["config", "user.email", "test@example.com"]);
@@ -761,19 +798,28 @@ fn git_source_snapshot_store_agrees_with_the_backend() {
     let git_dir = TempDir::new().expect("git dir tempdir");
     let backend = GitBackend::new(git_dir.path().to_path_buf());
     let url = src.path().to_string_lossy().into_owned();
-    backend.fetch(&sn("fixture"), &url).expect("fetch mirror");
-    let commit = backend
-        .resolve(&sn("fixture"), &url, &Refspec::Branch("main".to_owned()))
-        .expect("resolve main");
-
-    let resolved = ResolvedSource {
-        name: sn("fixture"),
-        url: url.clone(),
-        snapshot: SnapshotId::Git {
-            commit: commit.clone(),
+    let resolved = SourceStore::resolve(
+        &backend,
+        &ResolveRequest {
+            name: sn("fixture"),
+            location: SourceLocation::Git { url: url.clone() },
+            revision: RevisionSpec::Branch("main".to_owned()),
         },
-    };
-    let inventory = backend.inventory(&resolved).expect("git-source inventory");
+        ResolvePolicy::Refresh,
+    )
+    .expect("typed resolve refreshes and pins the Git snapshot");
+    assert_eq!(
+        resolved.revision,
+        ResolvedRevision::Commit(resolved.snapshot.commit().clone()),
+        "the resolved revision must name the immutable snapshot commit"
+    );
+    assert_eq!(
+        resolved.authored_at.unix_seconds(),
+        1_700_000_000,
+        "typed resolution preserves author time rather than committer time"
+    );
+    let inventory =
+        SourceStore::inventory(&backend, &resolved.snapshot, None).expect("git-source inventory");
     let paths: Vec<String> = inventory
         .entries
         .iter()
@@ -781,21 +827,39 @@ fn git_source_snapshot_store_agrees_with_the_backend() {
         .collect();
     assert_eq!(
         paths,
-        backend
-            .list_source_leaves(&sn("fixture"), &url, &commit, None)
-            .expect("list source leaves"),
-        "the store inventory must equal the backend's leaf listing for one commit"
+        ["editor/init.lua", "lint/rules.toml"],
+        "the inventory must return every fixture leaf in stable repository-relative order"
     );
-    let entry = backend
-        .read(&resolved, &sp("editor/init.lua"))
+    let root_entries = SourceStore::list_directory(&backend, &resolved.snapshot, None)
+        .expect("list repository root");
+    assert_eq!(
+        root_entries
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry.kind))
+            .collect::<Vec<_>>(),
+        [
+            ("editor", SourceDirectoryEntryKind::Directory),
+            ("lint", SourceDirectoryEntryKind::Directory),
+        ],
+        "root directory listing must expose both top-level directories as directories"
+    );
+    let editor_entries =
+        SourceStore::list_directory(&backend, &resolved.snapshot, Some(&sp("editor")))
+            .expect("list editor directory");
+    assert_eq!(
+        editor_entries
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry.kind))
+            .collect::<Vec<_>>(),
+        [("editor/init.lua", SourceDirectoryEntryKind::File)],
+        "directory listing must retain repository-relative paths and leaf kinds"
+    );
+    let entry = SourceStore::read(&backend, &resolved.snapshot, &sp("editor/init.lua"))
         .expect("store read");
     assert_eq!(entry.meta.path.as_str(), "editor/init.lua");
     assert_eq!(
-        entry.bytes,
-        backend
-            .read_file_at(&sn("fixture"), &url, &commit, Path::new("editor/init.lua"))
-            .expect("backend read"),
-        "store reads and backend reads must agree byte-for-byte"
+        entry.bytes, b"-- init\n",
+        "the immutable snapshot read must return the committed bytes"
     );
 }
 
@@ -812,7 +876,8 @@ fn source_path_root_join_parity_over_the_captured_set() {
         capture_worktree(cache.path(), &sn("wt"), src.path()).expect("worktree capture succeeds");
     let store = GitBackend::new(cache.path().to_path_buf());
     let resolved = resolved_worktree(src.path(), snapshot);
-    let inventory = store.inventory(&resolved).expect("captured inventory");
+    let inventory =
+        SourceStore::inventory(&store, &resolved.snapshot, None).expect("captured inventory");
     assert!(!inventory.entries.is_empty(), "the fixture captures leaves");
 
     for entry in &inventory.entries {
@@ -1034,39 +1099,8 @@ fn link_mode_artifacts_track_the_live_worktree_after_capture() {
 // ─── SourceStore trait shape ────────────────────────────────────────────────
 
 #[test]
-fn source_store_probe_object_is_usable_with_required_methods_only() {
-    struct Probe;
+fn source_store_trait_object_is_send_sync() {
+    fn assert_send_sync<T: ?Sized + Send + Sync>() {}
 
-    impl SourceStore for Probe {
-        fn inventory(&self, _source: &ResolvedSource) -> Result<SourceInventory, SourceError> {
-            Ok(SourceInventory::default())
-        }
-
-        fn read(
-            &self,
-            _source: &ResolvedSource,
-            _path: &SourcePath,
-        ) -> Result<SourceEntry, SourceError> {
-            Err(SourceError::Source("probe".to_owned()))
-        }
-    }
-
-    let probe = Probe;
-    let store: &dyn SourceStore = &probe;
-    let resolved = ResolvedSource {
-        name: sn("probe"),
-        url: String::new(),
-        snapshot: SnapshotId::Git {
-            commit: "0".repeat(40),
-        },
-    };
-    assert!(
-        store
-            .inventory(&resolved)
-            .expect("probe inventory")
-            .entries
-            .is_empty(),
-        "SourceStore must stay implementable with only inventory/read and stay object-safe"
-    );
-    assert!(store.read(&resolved, &sp("a")).is_err());
+    assert_send_sync::<dyn SourceStore>();
 }

@@ -132,10 +132,6 @@ fn unaliased_projection_leaves(stripped: &str) -> BTreeSet<String> {
     leaves
 }
 
-fn projection_reexport_leaves() -> BTreeSet<String> {
-    unaliased_projection_leaves(&strip_comments(&read_src("kernel/mod.rs")))
-}
-
 fn keyword_names_type(src: &str, keyword: &str, name: &str) -> bool {
     let bytes = src.as_bytes();
     src.match_indices(keyword).any(|(i, _)| {
@@ -212,23 +208,6 @@ fn assert_retained(rel: &str, pinned: &[&str]) {
          kernel unit tests); absent from the moved file: {missing:?}"
     );
 }
-
-const MOVED_PUBLIC_SYMBOLS: &[&str] = &[
-    "OfferSelection",
-    "compile_take_glob",
-    "ResolvedTake",
-    "Take",
-    "TakeResolution",
-    "TakeWarning",
-    "is_take_glob",
-    "resolve_take",
-    "CollapseChoice",
-    "CollapseMode",
-    "CollapsePlan",
-    "CollapseWarning",
-    "plan_collapse",
-    "Materialization",
-];
 
 const OFFER_UNIT_TESTS: &[&str] = &[
     "admits_published_separates_a_config_narrow_from_a_source_drop",
@@ -404,23 +383,48 @@ fn moved_kernel_source_files_are_gone() {
 }
 
 #[test]
-fn kernel_mod_re_exports_every_moved_public_symbol_unaliased() {
-    let leaves = projection_reexport_leaves();
-    let missing: Vec<&str> = MOVED_PUBLIC_SYMBOLS
-        .iter()
-        .copied()
-        .filter(|sym| !leaves.contains(*sym))
-        .collect();
+fn kernel_facade_is_absent_and_moved_symbols_are_public_from_projection_owners() {
+    use phora::projection::collapse::{
+        CollapseChoice, CollapseMode, CollapsePlan, CollapseWarning, plan_collapse,
+    };
+    use phora::projection::model::Materialization;
+    use phora::projection::offer::{OfferSelection, compile_take_glob};
+    use phora::projection::take::{
+        ResolvedTake, Take, TakeResolution, TakeWarning, is_take_glob, resolve_take,
+    };
+
+    fn assert_public_type<T>() {}
+    fn assert_public_item<T>(_: T) {}
+
     assert!(
-        missing.is_empty(),
-        "src/kernel/mod.rs must keep `kernel::` callers green by re-exporting every moved symbol \
-         under its original name via an UNALIASED `pub use crate::projection::…` leaf; names not \
-         preserved (absent or aliased away): {missing:?}"
+        !src_path("kernel/mod.rs").exists(),
+        "src/kernel/mod.rs must be absent after the T030 compatibility facade expires"
     );
+    assert!(
+        !declares_file_module(&read_src("lib.rs"), "kernel"),
+        "src/lib.rs must not register the removed file-backed kernel module"
+    );
+
+    assert_public_type::<OfferSelection>();
+    assert_public_type::<ResolvedTake>();
+    assert_public_type::<Take<'static>>();
+    assert_public_type::<TakeResolution>();
+    assert_public_type::<TakeWarning>();
+    assert_public_type::<CollapseChoice>();
+    assert_public_type::<CollapseMode>();
+    assert_public_type::<CollapsePlan>();
+    assert_public_type::<CollapseWarning>();
+    assert_public_type::<Materialization>();
+    assert_public_item(compile_take_glob);
+    assert_public_item(is_take_glob);
+    assert_public_item(resolve_take);
+    assert_public_item(plan_collapse);
 }
 
 #[test]
 fn materialization_is_owned_by_projection_model_exclusively() {
+    fn assert_public_type<T>() {}
+
     let model = read_src("projection/model.rs");
     assert!(
         owns_materialization(&model),
@@ -429,10 +433,11 @@ fn materialization_is_owned_by_projection_model_exclusively() {
          not merely re-export or reference it"
     );
     assert!(
-        projection_reexport_leaves().contains("Materialization"),
-        "src/kernel/mod.rs must re-export Materialization from crate::projection (unaliased) so \
-         existing `kernel::Materialization` callers keep compiling"
+        declares_file_module(&read_src("projection/mod.rs"), "model"),
+        "src/projection/mod.rs must publicly expose the file-backed model module so the final \
+         projection::model::Materialization path remains available"
     );
+    assert_public_type::<phora::projection::model::Materialization>();
     for file in ["offer.rs", "take.rs", "collapse.rs", "mod.rs"] {
         let rel = format!("projection/{file}");
         assert!(
@@ -587,29 +592,6 @@ fn extract_comment_text(src: &str) -> String {
     out
 }
 
-fn projection_reexport_comment_context() -> String {
-    let src = read_src("kernel/mod.rs");
-    let lines: Vec<&str> = src.lines().collect();
-    let hits: Vec<usize> = lines
-        .iter()
-        .enumerate()
-        .filter(|(_, l)| l.contains("pub use crate::projection"))
-        .map(|(i, _)| i)
-        .collect();
-    assert!(
-        !hits.is_empty(),
-        "src/kernel/mod.rs must contain a `pub use crate::projection::…` re-export block"
-    );
-    let first = hits[0];
-    let mut block_end = *hits.last().unwrap();
-    while block_end < lines.len() && !lines[block_end].contains(';') {
-        block_end += 1;
-    }
-    let start = first.saturating_sub(6);
-    let end = (block_end + 6).min(lines.len() - 1);
-    extract_comment_text(&lines[start..=end].join("\n"))
-}
-
 const COMPAT_VOCAB: &[&str] = &[
     "compat",
     "facade",
@@ -647,18 +629,35 @@ fn comment_states_phase_scoped_facade(comments: &str) -> bool {
     })
 }
 
+fn publicly_exposes_kernel_facade(src: &str) -> bool {
+    strip_comments(src).split(';').any(|item| {
+        let words: Vec<&str> = item
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .filter(|word| !word.is_empty())
+            .collect();
+        let Some(public) = words.iter().position(|word| *word == "pub") else {
+            return false;
+        };
+        let tail = &words[public + 1..];
+        tail.windows(2).any(|pair| pair == ["mod", "kernel"])
+            || tail
+                .iter()
+                .position(|word| *word == "use")
+                .is_some_and(|use_pos| tail[use_pos + 1..].contains(&"kernel"))
+    })
+}
+
 #[test]
-fn kernel_reexport_block_carries_a_phase_scoped_compat_constraint_comment() {
-    let comments = projection_reexport_comment_context();
+fn phase_scoped_kernel_compatibility_shim_has_expired() {
+    let lib_rs = read_src("lib.rs");
     assert!(
-        comment_states_phase_scoped_facade(&comments),
-        "src/kernel/mod.rs must carry a constraint comment ADJACENT to its \
-         `pub use crate::projection::…` re-export block that POSITIVELY attributes the facade as a \
-         phase-scoped backward-compat shim: a compat/facade vocabulary word ({COMPAT_VOCAB:?}) not \
-         governed by a negation marker (not/never/no/isn't/aren't) AND co-occurring in the same \
-         comment with a re-export/compat purpose reference ({COMPAT_PURPOSE:?}). A negated \
-         \"NOT a temporary shim\" or an unrelated \"migration happens elsewhere\" note must not \
-         satisfy it. Comment text near block:\n{comments}"
+        !src_path("kernel/mod.rs").exists(),
+        "the phase-scoped kernel compatibility shim must expire by removing src/kernel/mod.rs"
+    );
+    assert!(
+        !publicly_exposes_kernel_facade(&lib_rs),
+        "src/lib.rs must not recreate the expired kernel compatibility surface through either a \
+         module declaration or a public-use alias"
     );
 }
 

@@ -1,20 +1,20 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use phora::store::{
-    ArtifactKey, EjectedEntry, FileRegistry, HookState, RegistryRecord, StateLockGuard, StoreError,
-};
 use phora::sync::state::StateStore;
+use phora::sync::state::{
+    ArtifactKey, ArtifactRecord, Ejection, FileStateStore, HookState, StateError, StateLock,
+};
 use tempfile::TempDir;
 
-fn store() -> (TempDir, FileRegistry) {
+fn store() -> (TempDir, FileStateStore) {
     let dir = TempDir::new().expect("temp state root");
-    let reg = FileRegistry::open(dir.path().to_path_buf()).expect("open store");
+    let reg = FileStateStore::open(dir.path().to_path_buf()).expect("open store");
     (dir, reg)
 }
 
-fn record(target: &str, source: &str, artifact: &str) -> RegistryRecord {
-    RegistryRecord {
+fn record(target: &str, source: &str, artifact: &str) -> ArtifactRecord {
+    ArtifactRecord {
         version: 1,
         key: ArtifactKey {
             target: target.to_owned(),
@@ -26,7 +26,7 @@ fn record(target: &str, source: &str, artifact: &str) -> RegistryRecord {
         digest: "blake3:d4e5f6".to_owned(),
         projected_at: "2026-01-31T12:34:56Z".to_owned(),
         layout: "flat".to_owned(),
-        kind: phora::store::RecordKind::Dir,
+        kind: phora::sync::state::RecordKind::Dir,
         allow_symlinks: false,
         preserve_executable: true,
         files: vec![],
@@ -41,11 +41,11 @@ fn digest_set(digests: &[&str]) -> BTreeSet<String> {
     digests.iter().map(|d| (*d).to_owned()).collect()
 }
 
-fn as_store(reg: &FileRegistry) -> &dyn StateStore {
+fn as_store(reg: &FileStateStore) -> &dyn StateStore {
     reg
 }
 
-fn sorted_keys(records: &[RegistryRecord]) -> Vec<(String, String, String)> {
+fn sorted_keys(records: &[ArtifactRecord]) -> Vec<(String, String, String)> {
     let mut keys: Vec<(String, String, String)> = records
         .iter()
         .map(|r| {
@@ -147,7 +147,7 @@ fn state_store_lists_per_target_and_across_all_targets() {
 fn state_store_round_trips_ejections() {
     let (_dir, reg) = store();
     let store = as_store(&reg);
-    let entries = vec![EjectedEntry {
+    let entries = vec![Ejection {
         source: "company-configs".to_owned(),
         artifact: "snippets".to_owned(),
         ejected_at: "2026-01-31T14:00:00Z".to_owned(),
@@ -199,8 +199,8 @@ fn state_store_records_and_reads_hook_state() {
 #[test]
 fn state_store_acquires_and_releases_the_project_lock() {
     let dir = TempDir::new().expect("temp state root");
-    let first = FileRegistry::open(dir.path().to_path_buf()).expect("open first");
-    let second = FileRegistry::open(dir.path().to_path_buf()).expect("open second");
+    let first = FileStateStore::open(dir.path().to_path_buf()).expect("open first");
+    let second = FileStateStore::open(dir.path().to_path_buf()).expect("open second");
 
     {
         let _held = as_store(&first)
@@ -232,7 +232,7 @@ fn state_store_journal_root_is_the_locks_dir_under_the_state_root() {
 }
 
 struct InMemoryStore {
-    records: std::sync::Mutex<Vec<RegistryRecord>>,
+    records: std::sync::Mutex<Vec<ArtifactRecord>>,
 }
 
 impl InMemoryStore {
@@ -244,7 +244,7 @@ impl InMemoryStore {
 }
 
 impl StateStore for InMemoryStore {
-    fn artifact(&self, key: &ArtifactKey) -> Result<Option<RegistryRecord>, StoreError> {
+    fn artifact(&self, key: &ArtifactKey) -> Result<Option<ArtifactRecord>, StateError> {
         Ok(self
             .records
             .lock()
@@ -254,19 +254,19 @@ impl StateStore for InMemoryStore {
             .cloned())
     }
 
-    fn put_artifact(&self, record: &RegistryRecord) -> Result<(), StoreError> {
+    fn put_artifact(&self, record: &ArtifactRecord) -> Result<(), StateError> {
         let mut recs = self.records.lock().expect("lock");
         recs.retain(|r| r.key != record.key);
         recs.push(record.clone());
         Ok(())
     }
 
-    fn remove_artifact(&self, key: &ArtifactKey) -> Result<(), StoreError> {
+    fn remove_artifact(&self, key: &ArtifactKey) -> Result<(), StateError> {
         self.records.lock().expect("lock").retain(|r| &r.key != key);
         Ok(())
     }
 
-    fn target_artifacts(&self, target: &str) -> Result<Vec<RegistryRecord>, StoreError> {
+    fn target_artifacts(&self, target: &str) -> Result<Vec<ArtifactRecord>, StateError> {
         Ok(self
             .records
             .lock()
@@ -277,19 +277,19 @@ impl StateStore for InMemoryStore {
             .collect())
     }
 
-    fn all_artifacts(&self) -> Result<Vec<RegistryRecord>, StoreError> {
+    fn all_artifacts(&self) -> Result<Vec<ArtifactRecord>, StateError> {
         Ok(self.records.lock().expect("lock").clone())
     }
 
-    fn ejections(&self, _target: &str) -> Result<Vec<EjectedEntry>, StoreError> {
+    fn ejections(&self, _target: &str) -> Result<Vec<Ejection>, StateError> {
         Ok(Vec::new())
     }
 
-    fn save_ejections(&self, _target: &str, _entries: &[EjectedEntry]) -> Result<(), StoreError> {
+    fn save_ejections(&self, _target: &str, _entries: &[Ejection]) -> Result<(), StateError> {
         unimplemented!("the reconcile suite does not exercise fake ejection writes")
     }
 
-    fn hook_state(&self, _target: &str) -> Result<Vec<HookState>, StoreError> {
+    fn hook_state(&self, _target: &str) -> Result<Vec<HookState>, StateError> {
         Ok(Vec::new())
     }
 
@@ -298,11 +298,11 @@ impl StateStore for InMemoryStore {
         _target: &str,
         _hook_id: &str,
         _digest_set: &BTreeSet<String>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<(), StateError> {
         unimplemented!("the reconcile suite does not exercise fake hook writes")
     }
 
-    fn acquire_lock(&self) -> Result<StateLockGuard, StoreError> {
+    fn acquire_lock(&self) -> Result<StateLock, StateError> {
         unimplemented!("the reconcile suite does not exercise fake lock acquisition")
     }
 
@@ -335,18 +335,18 @@ fn in_memory_fake_is_reachable_through_the_trait_object() {
 
 #[test]
 fn state_store_matches_the_legacy_registry_for_shared_reads() {
-    use phora::store::Registry;
+    use phora::sync::state::StateStore;
 
     let (_dir, reg) = store();
-    reg.put(&record("vscode", "company-configs", "snippets"))
+    reg.put_artifact(&record("vscode", "company-configs", "snippets"))
         .expect("seed via legacy trait");
-    reg.put(&record("nvim", "dotfiles", "init"))
+    reg.put_artifact(&record("nvim", "dotfiles", "init"))
         .expect("seed via legacy trait");
 
     let via_store = as_store(&reg).all_artifacts().expect("store list");
-    let via_registry = Registry::list_all(&reg).expect("registry list");
+    let via_registry = StateStore::all_artifacts(&reg).expect("registry list");
     assert_eq!(
         via_store, via_registry,
-        "reading through StateStore must equal reading the same data through the legacy Registry"
+        "reading through StateStore must equal reading the same data through the legacy StateStore"
     );
 }

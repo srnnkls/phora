@@ -3,8 +3,8 @@
 use std::fmt::Write;
 
 use crate::config::ParsedSource;
-use crate::deploy::ArtifactState;
 use crate::error::{Error, Result};
+use crate::sync::inspect::ArtifactState;
 use crate::sync::{HookOutcome, HookScope, HookStatus, SyncState};
 
 use super::query::{
@@ -337,7 +337,10 @@ pub(super) fn print_unbound(sources: &[String], target: &str) {
     println!("Unbound {} from '{target}'", sources.join(", "));
 }
 
-pub(super) fn target_rm_refusal(name: &str, deployed: &[crate::store::RegistryRecord]) -> String {
+pub(super) fn target_rm_refusal(
+    name: &str,
+    deployed: &[crate::sync::state::ArtifactRecord],
+) -> String {
     let artifacts = deployed
         .iter()
         .map(|rec| format!("  {}/{}", rec.key.source, rec.key.artifact))

@@ -420,7 +420,7 @@ mod projection_builder_tests {
 
     use crate::config::{DeployMode, LayoutConfig, ParsedSource, Source, TakeEntry, TemplateOptIn};
     use crate::diagnostic::{MATCHED_AGAINST, REMEDY, SELECTION, TO_DEBUG};
-    use crate::kernel::Materialization;
+    use crate::projection::model::Materialization;
     use crate::source::SourceInventory;
 
     use super::{project_binding, project_target, projected_artifact_keys};
@@ -541,7 +541,7 @@ mod projection_builder_tests {
     }
 
     fn leaf(source: &str, dest: &str) -> Materialization {
-        Materialization::Leaf(crate::kernel::ResolvedTake {
+        Materialization::Leaf(crate::projection::take::ResolvedTake {
             source: source.to_string(),
             dest: dest.to_string(),
         })

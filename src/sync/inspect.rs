@@ -2,13 +2,9 @@ use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
-use crate::store::{ArtifactKey, EjectedEntry, ManifestFile, RegistryRecord};
 use crate::sync::model::{ManagedArtifact, ManagedCondition, ObservedArtifact, ScannedFile};
 use crate::sync::scan::{mtime_secs, scan_dir_soft};
-use crate::sync::state::StateStore;
-
-#[cfg(test)]
-use crate::store::Registry;
+use crate::sync::state::{ArtifactKey, ArtifactRecord, Ejection, ManifestFile, StateStore};
 
 #[derive(Debug)]
 pub enum ArtifactState {
@@ -30,7 +26,7 @@ pub enum ArtifactState {
 
 struct ArtifactClassification {
     state: ArtifactState,
-    record: Option<RegistryRecord>,
+    record: Option<ArtifactRecord>,
 }
 
 impl ArtifactClassification {
@@ -41,7 +37,7 @@ impl ArtifactClassification {
         }
     }
 
-    fn managed(state: ArtifactState, record: RegistryRecord) -> Self {
+    fn managed(state: ArtifactState, record: ArtifactRecord) -> Self {
         Self {
             state,
             record: Some(record),
@@ -50,7 +46,7 @@ impl ArtifactClassification {
 }
 
 enum RecordLookup {
-    Managed(RegistryRecord),
+    Managed(ArtifactRecord),
     Classified(ArtifactClassification),
 }
 
@@ -62,7 +58,7 @@ pub fn check_artifact_state(
     target_path: &Path,
     expected_source: &str,
     expected_commit: &str,
-    ejected: &[EjectedEntry],
+    ejected: &[Ejection],
     artifact_name: &str,
     store: &dyn StateStore,
     key: &ArtifactKey,
@@ -89,7 +85,7 @@ fn classify_artifact_state(
     target_path: &Path,
     expected_source: &str,
     expected_commit: &str,
-    ejected: &[EjectedEntry],
+    ejected: &[Ejection],
     artifact_name: &str,
     store: &dyn StateStore,
     key: &ArtifactKey,
@@ -261,7 +257,7 @@ fn managed_under_sibling_shape(
     store: &dyn StateStore,
     key: &ArtifactKey,
     expected_source: &str,
-) -> Result<Option<RegistryRecord>> {
+) -> Result<Option<ArtifactRecord>> {
     let under = |child: &str, parent: &str| {
         child
             .strip_prefix(parent)
@@ -278,7 +274,7 @@ fn managed_under_sibling_shape(
 }
 
 fn classify_drift(
-    record: &RegistryRecord,
+    record: &ArtifactRecord,
     changed: Vec<PathBuf>,
     fresh: Vec<ScannedFile>,
     expected_commit: &str,
@@ -354,11 +350,11 @@ pub fn inspect(
     target_path: &Path,
     expected_source: &str,
     expected_commit: &str,
-    ejected: &[EjectedEntry],
+    ejected: &[Ejection],
     store: &dyn StateStore,
     key: &ArtifactKey,
     expected_vars_digest: Option<&str>,
-) -> Result<ObservedArtifact<RegistryRecord>> {
+) -> Result<ObservedArtifact<ArtifactRecord>> {
     let classification = classify_artifact_state(
         target_path,
         expected_source,
@@ -389,10 +385,10 @@ pub fn inspect(
 }
 
 fn managed_observation(
-    record: Option<RegistryRecord>,
+    record: Option<ArtifactRecord>,
     key: &ArtifactKey,
     condition: ManagedCondition,
-) -> Result<ObservedArtifact<RegistryRecord>> {
+) -> Result<ObservedArtifact<ArtifactRecord>> {
     let record = record.ok_or_else(|| {
         Error::Projection(format!(
             "managed record for {} vanished mid-observation",
@@ -408,7 +404,7 @@ fn managed_observation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::FileRegistry;
+    use crate::sync::state::FileStateStore;
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
 
@@ -443,9 +439,9 @@ mod tests {
         }
     }
 
-    fn registry() -> (TempDir, FileRegistry) {
+    fn registry() -> (TempDir, FileStateStore) {
         let dir = TempDir::new().expect("temp state root");
-        let reg = FileRegistry::open(dir.path().to_path_buf()).expect("open registry");
+        let reg = FileStateStore::open(dir.path().to_path_buf()).expect("open registry");
         (dir, reg)
     }
 
@@ -454,7 +450,7 @@ mod tests {
         target: &Path,
         files: &[(&str, &[u8])],
         allow_symlinks: bool,
-    ) -> RegistryRecord {
+    ) -> ArtifactRecord {
         let mut manifest = Vec::new();
         for (rel, contents) in files {
             let path = target.join(rel);
@@ -469,7 +465,7 @@ mod tests {
                 blake3: blake3::hash(contents).to_hex().to_string(),
             });
         }
-        RegistryRecord {
+        ArtifactRecord {
             version: 1,
             key: key(),
             source: SOURCE.to_owned(),
@@ -477,7 +473,7 @@ mod tests {
             digest: "blake3:d4e5f6".to_owned(),
             projected_at: "2026-01-31T12:34:56Z".to_owned(),
             layout: "flat".to_owned(),
-            kind: crate::store::RecordKind::Dir,
+            kind: crate::sync::state::RecordKind::Dir,
             allow_symlinks,
             preserve_executable: true,
             files: manifest,
@@ -488,7 +484,7 @@ mod tests {
         }
     }
 
-    fn deploy_and_record_file(file_path: &Path, contents: &[u8]) -> RegistryRecord {
+    fn deploy_and_record_file(file_path: &Path, contents: &[u8]) -> ArtifactRecord {
         if let Some(parent) = file_path.parent() {
             std::fs::create_dir_all(parent).expect("mkdir parent");
         }
@@ -500,7 +496,7 @@ mod tests {
             mtime: read_mtime_secs(file_path),
             blake3: blake3::hash(contents).to_hex().to_string(),
         };
-        RegistryRecord {
+        ArtifactRecord {
             version: 1,
             key: key(),
             source: SOURCE.to_owned(),
@@ -508,7 +504,7 @@ mod tests {
             digest: "blake3:d4e5f6".to_owned(),
             projected_at: "2026-01-31T12:34:56Z".to_owned(),
             layout: "flat".to_owned(),
-            kind: crate::store::RecordKind::File,
+            kind: crate::sync::state::RecordKind::File,
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![mf],
@@ -519,15 +515,15 @@ mod tests {
         }
     }
 
-    fn ejected(source: &str, artifact: &str) -> EjectedEntry {
-        EjectedEntry {
+    fn ejected(source: &str, artifact: &str) -> Ejection {
+        Ejection {
             source: source.to_owned(),
             artifact: artifact.to_owned(),
             ejected_at: "2026-01-31T14:00:00Z".to_owned(),
         }
     }
 
-    fn state(target: &Path, ejected: &[EjectedEntry], reg: &FileRegistry) -> ArtifactState {
+    fn state(target: &Path, ejected: &[Ejection], reg: &FileStateStore) -> ArtifactState {
         check_artifact_state(target, SOURCE, COMMIT, ejected, ARTIFACT, reg, &key(), None)
             .expect("check_artifact_state")
     }
@@ -551,7 +547,7 @@ mod tests {
         let (_state_dir, reg) = registry();
         let target = TempDir::new().expect("target dir");
         let record = deploy_and_record(target.path(), &[("a.json", b"{}")], false);
-        reg.put(&record).expect("put record");
+        reg.put_artifact(&record).expect("put record");
 
         let st = state(target.path(), &[ejected(SOURCE, ARTIFACT)], &reg);
 
@@ -566,7 +562,7 @@ mod tests {
         let (_state_dir, reg) = registry();
         let target = TempDir::new().expect("target dir");
         let record = deploy_and_record(target.path(), &[("a.json", b"{}")], false);
-        reg.put(&record).expect("put record");
+        reg.put_artifact(&record).expect("put record");
 
         let st = state(target.path(), &[ejected("other-source", ARTIFACT)], &reg);
 
@@ -670,10 +666,10 @@ mod tests {
 
     fn sibling_record(
         artifact: &str,
-        kind: crate::store::RecordKind,
+        kind: crate::sync::state::RecordKind,
         linked: bool,
-    ) -> RegistryRecord {
-        RegistryRecord {
+    ) -> ArtifactRecord {
+        ArtifactRecord {
             version: 1,
             key: ArtifactKey {
                 target: TARGET.to_owned(),
@@ -707,9 +703,9 @@ mod tests {
         let dir = target.path().join("snippets");
         std::fs::create_dir_all(&dir).expect("mkdir dir");
 
-        reg.put(&sibling_record(
+        reg.put_artifact(&sibling_record(
             "snippets/a.json",
-            crate::store::RecordKind::File,
+            crate::sync::state::RecordKind::File,
             true,
         ))
         .expect("put per-leaf record");
@@ -737,9 +733,9 @@ mod tests {
         std::fs::create_dir_all(leaf.parent().expect("leaf parent")).expect("mkdir");
         std::fs::write(&leaf, b"{}").expect("write leaf");
 
-        reg.put(&sibling_record(
+        reg.put_artifact(&sibling_record(
             "snippets",
-            crate::store::RecordKind::Dir,
+            crate::sync::state::RecordKind::Dir,
             true,
         ))
         .expect("put collapsed record");
@@ -775,9 +771,9 @@ mod tests {
         let dir = target.path().join("snippets");
         std::fs::create_dir_all(&dir).expect("mkdir dir");
 
-        reg.put(&sibling_record(
+        reg.put_artifact(&sibling_record(
             "snippets/a.json",
-            crate::store::RecordKind::File,
+            crate::sync::state::RecordKind::File,
             true,
         ))
         .expect("put per-leaf record");
@@ -811,7 +807,7 @@ mod tests {
         let (_state_dir, reg) = registry();
         let target = TempDir::new().expect("target dir");
         let record = deploy_and_record(target.path(), &[("a.json", b"{}")], false);
-        reg.put(&record).expect("put record");
+        reg.put_artifact(&record).expect("put record");
 
         let st = check_artifact_state(
             target.path(),
@@ -837,7 +833,7 @@ mod tests {
         let (_state_dir, reg) = registry();
         let target = TempDir::new().expect("target dir");
         let record = deploy_and_record(target.path(), &[("a.json", b"{}")], false);
-        reg.put(&record).expect("put record");
+        reg.put_artifact(&record).expect("put record");
 
         let st = check_artifact_state(
             target.path(),
@@ -863,7 +859,7 @@ mod tests {
         let (_state_dir, reg) = registry();
         let target = TempDir::new().expect("target dir");
         let record = deploy_and_record(target.path(), &[("a.json", b"{}")], false);
-        reg.put(&record).expect("put record");
+        reg.put_artifact(&record).expect("put record");
         std::fs::write(target.path().join("a.json"), b"locally edited").expect("tamper file");
 
         let st = check_artifact_state(
@@ -888,8 +884,8 @@ mod tests {
     // ── linked artifacts (DLD-005) ─────────────────────────────────
 
     /// A linked record: no manifest files, sentinel commit/digest, `linked = true`.
-    fn linked_record() -> RegistryRecord {
-        RegistryRecord {
+    fn linked_record() -> ArtifactRecord {
+        ArtifactRecord {
             version: 1,
             key: key(),
             source: SOURCE.to_owned(),
@@ -897,7 +893,7 @@ mod tests {
             digest: "link:".to_owned(),
             projected_at: "2026-06-08T12:00:00Z".to_owned(),
             layout: "flat".to_owned(),
-            kind: crate::store::RecordKind::Dir,
+            kind: crate::sync::state::RecordKind::Dir,
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![],
@@ -921,7 +917,8 @@ mod tests {
         let dst = parent.path().join("deployed-link");
         symlink(&live, &dst).expect("deploy symlink");
 
-        reg.put(&linked_record()).expect("put linked record");
+        reg.put_artifact(&linked_record())
+            .expect("put linked record");
 
         let st = check_artifact_state(&dst, SOURCE, COMMIT, &[], ARTIFACT, &reg, &key(), None)
             .expect("check_artifact_state on a linked symlink");
@@ -946,7 +943,8 @@ mod tests {
         let dst = parent.path().join("deployed-link");
         symlink(&live, &dst).expect("deploy symlink");
 
-        reg.put(&linked_record()).expect("put linked record");
+        reg.put_artifact(&linked_record())
+            .expect("put linked record");
 
         let st = state(&dst, &[], &reg);
 
@@ -971,7 +969,8 @@ mod tests {
             "premise: the symlink target must be absent so the link dangles"
         );
 
-        reg.put(&linked_record()).expect("put linked record");
+        reg.put_artifact(&linked_record())
+            .expect("put linked record");
 
         let st = state(&dst, &[], &reg);
 
@@ -991,7 +990,7 @@ mod tests {
             &[("a.json", b"{}"), ("b.txt", b"hello")],
             false,
         );
-        reg.put(&record).expect("put record");
+        reg.put_artifact(&record).expect("put record");
 
         let st = state(target.path(), &[], &reg);
 
@@ -1006,7 +1005,7 @@ mod tests {
         let (_state_dir, reg) = registry();
         let target = TempDir::new().expect("target dir");
         let record = deploy_and_record(target.path(), &[("a.json", b"{}")], false);
-        reg.put(&record).expect("put record");
+        reg.put_artifact(&record).expect("put record");
         let edited = target.path().join("a.json");
         std::fs::write(&edited, b"{\"changed\": true}").expect("rewrite file");
         set_mtime(&edited, record.files[0].mtime);
@@ -1028,7 +1027,7 @@ mod tests {
         let (_state_dir, reg) = registry();
         let target = TempDir::new().expect("target dir");
         let record = deploy_and_record(target.path(), &[("a.json", b"{}")], false);
-        reg.put(&record).expect("put record");
+        reg.put_artifact(&record).expect("put record");
         let new_mtime = record.files[0].mtime + 999;
         set_mtime(&target.path().join("a.json"), new_mtime);
 
@@ -1061,7 +1060,7 @@ mod tests {
         let (_state_dir, reg) = registry();
         let target = TempDir::new().expect("target dir");
         let record = deploy_and_record(target.path(), &[("a.json", b"{}")], false);
-        reg.put(&record).expect("put record");
+        reg.put_artifact(&record).expect("put record");
         let edited = target.path().join("a.json");
         std::fs::write(&edited, b"[]").expect("rewrite to same-length different content");
         set_mtime(&edited, record.files[0].mtime + 5);
@@ -1094,7 +1093,7 @@ mod tests {
             &[("a.json", b"{}"), ("b.txt", b"hello")],
             false,
         );
-        reg.put(&record).expect("put record");
+        reg.put_artifact(&record).expect("put record");
         let a_mtime = record.files[0].mtime + 100;
         let b_mtime = record.files[1].mtime + 200;
         set_mtime(&target.path().join("a.json"), a_mtime);
@@ -1137,7 +1136,7 @@ mod tests {
             &[("a.json", b"{}"), ("b.txt", b"hello")],
             false,
         );
-        reg.put(&record).expect("put record");
+        reg.put_artifact(&record).expect("put record");
         let a = target.path().join("a.json");
         std::fs::write(&a, b"[]").expect("same-length edit of a.json");
         set_mtime(&a, record.files[0].mtime + 13);
@@ -1162,7 +1161,7 @@ mod tests {
             "the same-size, hash-mismatched file must appear in `changed`, got {changed:?}"
         );
         let after = reg
-            .get(&key())
+            .artifact(&key())
             .expect("get after classify")
             .expect("record still present");
         assert_eq!(
@@ -1180,7 +1179,8 @@ mod tests {
         let target = TempDir::new().expect("target dir");
         let mut record = deploy_and_record(target.path(), &[("a.json", b"{}")], false);
         record.files[0].blake3 = "0".repeat(64);
-        reg.put(&record).expect("put record with poisoned blake3");
+        reg.put_artifact(&record)
+            .expect("put record with poisoned blake3");
 
         let st = state(target.path(), &[], &reg);
 
@@ -1203,7 +1203,8 @@ mod tests {
             false,
         );
         record.files[0].blake3 = "0".repeat(64);
-        reg.put(&record).expect("put record with poisoned A blake3");
+        reg.put_artifact(&record)
+            .expect("put record with poisoned A blake3");
         let b_mtime = record.files[1].mtime + 555;
         set_mtime(&target.path().join("b.txt"), b_mtime);
 
@@ -1238,7 +1239,7 @@ mod tests {
         let target = TempDir::new().expect("target dir");
         let record = deploy_and_record(target.path(), &[("a.json", b"{}")], false);
         let recorded_blake3 = record.files[0].blake3.clone();
-        reg.put(&record).expect("put record");
+        reg.put_artifact(&record).expect("put record");
         set_mtime(&target.path().join("a.json"), record.files[0].mtime + 42);
 
         let st = state(target.path(), &[], &reg);
@@ -1248,7 +1249,7 @@ mod tests {
         );
 
         let after = reg
-            .get(&key())
+            .artifact(&key())
             .expect("get after classify")
             .expect("record still present");
         assert_eq!(
@@ -1268,7 +1269,7 @@ mod tests {
         let dir = TempDir::new().expect("target dir");
         let file = dir.path().join("config.json");
         let record = deploy_and_record_file(&file, b"{}");
-        reg.put(&record).expect("put record");
+        reg.put_artifact(&record).expect("put record");
         let new_mtime = record.files[0].mtime + 314;
         set_mtime(&file, new_mtime);
 
@@ -1310,7 +1311,7 @@ mod tests {
         let (_state_dir, reg) = registry();
         let target = TempDir::new().expect("target dir");
         let record = deploy_and_record(target.path(), &[("a.json", b"{}")], false);
-        reg.put(&record).expect("put record");
+        reg.put_artifact(&record).expect("put record");
         let f = target.path().join("a.json");
         set_mtime(&f, record.files[0].mtime + 11);
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
@@ -1341,7 +1342,7 @@ mod tests {
         let (_state_dir, reg) = registry();
         let target = TempDir::new().expect("target dir");
         let record = deploy_and_record(target.path(), &[], false);
-        reg.put(&record).expect("put record");
+        reg.put_artifact(&record).expect("put record");
 
         let st = state(target.path(), &[], &reg);
 
@@ -1363,7 +1364,8 @@ mod tests {
             b"content that would be hashed",
         )
         .expect("write file under linked target");
-        reg.put(&linked_record()).expect("put linked record");
+        reg.put_artifact(&linked_record())
+            .expect("put linked record");
 
         let st = state(target.path(), &[], &reg);
 
@@ -1379,7 +1381,7 @@ mod tests {
         let (_state_dir, reg) = registry();
         let target = TempDir::new().expect("target dir");
         let record = deploy_and_record(target.path(), &[("a.json", b"{}"), ("b.txt", b"x")], false);
-        reg.put(&record).expect("put record");
+        reg.put_artifact(&record).expect("put record");
         std::fs::remove_file(target.path().join("b.txt")).expect("delete file");
 
         let st = state(target.path(), &[], &reg);
@@ -1398,7 +1400,7 @@ mod tests {
         let (_state_dir, reg) = registry();
         let target = TempDir::new().expect("target dir");
         let record = deploy_and_record(target.path(), &[("a.json", b"{}")], false);
-        reg.put(&record).expect("put record");
+        reg.put_artifact(&record).expect("put record");
         std::fs::write(target.path().join("extra.tmp"), b"stray").expect("write extra");
 
         let st = state(target.path(), &[], &reg);
@@ -1417,7 +1419,7 @@ mod tests {
         let (_state_dir, reg) = registry();
         let target = TempDir::new().expect("target dir");
         let record = deploy_and_record(target.path(), &[("a.json", b"{}")], false);
-        reg.put(&record).expect("put record");
+        reg.put_artifact(&record).expect("put record");
         symlink("a.json", target.path().join("link.json")).expect("create symlink");
 
         let st = state(target.path(), &[], &reg);
@@ -1437,7 +1439,7 @@ mod tests {
         let (_state_dir, reg) = registry();
         let target = TempDir::new().expect("target dir");
         let record = deploy_and_record(target.path(), &[("a.json", b"{}")], true);
-        reg.put(&record).expect("put record");
+        reg.put_artifact(&record).expect("put record");
 
         let recorded_path = target.path().join("a.json");
         let recorded_size = record.files[0].size;
@@ -1488,7 +1490,7 @@ mod tests {
         target: &Path,
         files: &[(&str, &[u8])],
         vars_digest: Option<&str>,
-    ) -> RegistryRecord {
+    ) -> ArtifactRecord {
         let mut record = deploy_and_record(target, files, false);
         record.vars_digest = vars_digest.map(str::to_owned);
         record
@@ -1500,7 +1502,7 @@ mod tests {
         let target = TempDir::new().expect("target dir");
         let record =
             deploy_and_record_with_vars(target.path(), &[("a.json", b"{}")], Some("blake3:old"));
-        reg.put(&record).expect("put record");
+        reg.put_artifact(&record).expect("put record");
 
         let st = check_artifact_state(
             target.path(),
@@ -1528,7 +1530,7 @@ mod tests {
         let target = TempDir::new().expect("target dir");
         let record =
             deploy_and_record_with_vars(target.path(), &[("a.json", b"{}")], Some("blake3:same"));
-        reg.put(&record).expect("put record");
+        reg.put_artifact(&record).expect("put record");
 
         let st = check_artifact_state(
             target.path(),
@@ -1554,7 +1556,7 @@ mod tests {
         let (_state_dir, reg) = registry();
         let target = TempDir::new().expect("target dir");
         let record = deploy_and_record_with_vars(target.path(), &[("a.json", b"{}")], None);
-        reg.put(&record).expect("put record");
+        reg.put_artifact(&record).expect("put record");
 
         let st = check_artifact_state(
             target.path(),

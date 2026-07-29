@@ -6,7 +6,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use phora::kernel::ProjectId;
+use phora::sync::state::ProjectId;
 use tempfile::TempDir;
 
 mod common;

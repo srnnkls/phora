@@ -14,7 +14,7 @@ mod tests;
 #[cfg(test)]
 use {
     crate::config::{Host, LayoutKind},
-    crate::deploy::ArtifactState,
+    crate::sync::inspect::ArtifactState,
     add::{
         MissingTarget, MissingTargetDecider, add_to_default_target, add_with_binds,
         insert_source_with_ref, run_add,
@@ -53,8 +53,8 @@ use crate::paths::state_root_for;
 use crate::projection::model::TargetName;
 use crate::source::SourceName;
 use crate::source::{GitBackend, HttpBackend, RouterBackend};
-use crate::store::{FileRegistry, Registry, StoreError};
 use crate::sync::state::ProjectId;
+use crate::sync::state::{FileStateStore, StateError, StateStore};
 use crate::sync::{Conflict, ConflictResolver, Resolution};
 use std::str::FromStr;
 
@@ -304,7 +304,7 @@ pub enum TargetCmd {
 #[must_use]
 pub fn exit_code(err: &Error) -> i32 {
     match err {
-        Error::StoreCtx(StoreError::Lock(_)) => 75,
+        Error::StateCtx(StateError::Lock(_)) => 75,
         _ => 1,
     }
 }
@@ -366,7 +366,7 @@ pub fn run_with_outcome(cli: Cli) -> Result<CliOutcome> {
         } => {
             let config = load_config()?;
             let registry = open_project_registry(&config)?;
-            let _guard = registry.lock_exclusive()?;
+            let _guard = registry.acquire_lock()?;
             crate::sync::eject(&config, &registry, &artifact, &source, &target)?;
             println!("ejected {source}/{artifact} from {target} (files kept)");
             Ok(CliOutcome::Success)
@@ -378,7 +378,7 @@ pub fn run_with_outcome(cli: Cli) -> Result<CliOutcome> {
         } => {
             let config = load_config()?;
             let registry = open_project_registry(&config)?;
-            let _guard = registry.lock_exclusive()?;
+            let _guard = registry.acquire_lock()?;
             crate::sync::uneject(&config, &registry, &artifact, &source, &target)?;
             println!("unejected {source}/{artifact} in {target}");
             Ok(CliOutcome::Success)
@@ -670,7 +670,7 @@ fn run_target_rm(name: &str, local: bool, force: bool) -> Result<()> {
     if !force {
         let config = merge_configs(load_config()?, load_local_config(Path::new("."))?);
         let registry = open_project_registry(&config)?;
-        let deployed = registry.list_target(name)?;
+        let deployed = registry.target_artifacts(name)?;
         if !deployed.is_empty() {
             return Err(Error::Config(render::target_rm_refusal(name, &deployed)));
         }
@@ -683,25 +683,22 @@ fn run_target_rm(name: &str, local: bool, force: bool) -> Result<()> {
     Ok(())
 }
 
-/// Builds the mode-aware router for `config`, parsing each url source's `digest`.
+/// Builds the typed source router, parsing each URL source's `digest`.
 fn build_router(
     config: &Config,
     git_dir: std::path::PathBuf,
 ) -> Result<RouterBackend<GitBackend, HttpBackend>> {
     std::fs::create_dir_all(&git_dir)
         .map_err(|e| Error::Config(format!("create mirror dir {}: {e}", git_dir.display())))?;
-    let mut modes = BTreeMap::new();
     let mut digests = BTreeMap::new();
     for (name, source) in &config.parsed_sources()? {
-        let source_name = SourceName::trusted(name.clone());
         if let Some(digest) = source.digest() {
-            digests.insert(source_name.clone(), digest);
+            digests.insert(SourceName::trusted(name.clone()), digest);
         }
-        modes.insert(source_name, source.mode());
     }
     let git = GitBackend::new(git_dir.clone());
     let http = HttpBackend::new(git_dir, digests);
-    Ok(RouterBackend::new(git, http, modes))
+    Ok(RouterBackend::new(git, http))
 }
 
 /// Which locked source entries to drop before a sync so they get re-resolved.
@@ -798,13 +795,13 @@ impl ConflictResolver for TtyResolver {
     }
 }
 
-fn open_project_registry(config: &Config) -> Result<FileRegistry> {
+fn open_project_registry(config: &Config) -> Result<FileStateStore> {
     let cwd = std::env::current_dir()?;
     let project = ProjectId::for_path(&cwd)?;
     let registry_root = state_root_for(config.paths.state.as_deref(), &cwd)?
         .join("projects")
         .join(project.as_str());
-    Ok(FileRegistry::open(registry_root)?)
+    Ok(FileStateStore::open(registry_root)?)
 }
 
 fn load_config() -> Result<Config> {

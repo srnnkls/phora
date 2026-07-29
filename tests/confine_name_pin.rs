@@ -4,7 +4,8 @@
 use std::str::FromStr;
 
 use phora::error::Error;
-use phora::kernel::{ArtifactName, KernelError};
+use phora::projection::model::ArtifactName;
+use phora::source::KernelError;
 use phora::source::SourceError;
 
 fn is_unsafe_component_rejection(err: &Error) -> bool {

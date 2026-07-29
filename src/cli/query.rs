@@ -7,20 +7,22 @@ use crate::config::{
     Config, DeployMode, LayoutConfig, Offer, ParsedSource, Protocol, SourceFields, TakeEntry,
     Target, TemplateOptIn, merge_configs,
 };
-use crate::deploy::check_artifact_state;
 use crate::diagnostic::{SelectionDiagnostic, did_you_mean};
 use crate::error::{Error, Result};
-use crate::kernel::{Materialization, OfferSelection};
 use crate::lock::{Lock, merge_locks, ref_discriminator};
 use crate::paths::cache_root_for;
 use crate::projection::build::project_binding;
 use crate::projection::diagnostic::ProjectionWarning;
 use crate::projection::model::{
-    BindingProjection, BindingProjectionInput, CollapsePreference, LayoutSpec,
+    BindingProjection, BindingProjectionInput, CollapsePreference, LayoutSpec, Materialization,
     MaterializationPolicy, OfferSpec, ResolvedSourceRef, TakeSpec, TemplatePolicy,
 };
-use crate::source::{SourceBackend, SourceInventory};
-use crate::store::Registry;
+use crate::projection::offer::OfferSelection;
+use crate::source::{
+    Commit, ResolvePolicy, ResolveRequest, RevisionSpec, SourceInventory, SourceLocation,
+    SourceStore,
+};
+use crate::sync::inspect::check_artifact_state;
 use crate::sync::state::StateStore;
 use crate::sync::{PreviewTargetPlan, offered_leaves, preview_targets, resolved_remotes};
 
@@ -149,7 +151,7 @@ pub(crate) fn preview_plan(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
     remotes: &BTreeMap<String, String>,
-    backend: &dyn SourceBackend,
+    backend: &dyn SourceStore,
     lock: Option<&Lock>,
     sel: &PreviewSelectors,
 ) -> Result<PreviewPlan> {
@@ -187,7 +189,7 @@ pub struct WhereFilter {
 }
 
 impl WhereFilter {
-    fn matches(&self, record: &crate::store::RegistryRecord) -> bool {
+    fn matches(&self, record: &crate::sync::state::ArtifactRecord) -> bool {
         let eq = |want: &Option<String>, have: &str| want.as_deref().is_none_or(|w| w == have);
         eq(&self.digest, &record.digest)
             && eq(&self.source, &record.key.source)
@@ -219,9 +221,9 @@ pub struct CheckMatchReport {
 /// # Errors
 ///
 /// Returns an error if the registry cannot be read.
-pub fn where_cmd(registry: &dyn Registry, filter: &WhereFilter) -> Result<Vec<WhereMatch>> {
-    let records = registry.list_all()?;
-    let ejected = crate::store::ejected_index(registry, &records)?;
+pub fn where_cmd(registry: &dyn StateStore, filter: &WhereFilter) -> Result<Vec<WhereMatch>> {
+    let records = registry.all_artifacts()?;
+    let ejected = crate::sync::state::ejected_index(registry, &records)?;
     let mut groups: BTreeMap<(String, String), WhereMatch> = BTreeMap::new();
 
     for record in records {
@@ -555,7 +557,7 @@ pub(crate) struct OfflineCtx<'a> {
     pub config: &'a Config,
     pub parsed: &'a BTreeMap<String, ParsedSource>,
     pub remotes: &'a BTreeMap<String, String>,
-    pub backend: &'a dyn SourceBackend,
+    pub backend: &'a dyn SourceStore,
     pub lock: Option<&'a Lock>,
 }
 
@@ -632,13 +634,7 @@ pub(crate) fn explain_cmd(
                 .ok_or_else(|| {
                     cache_miss_diagnostic(binding.source, "no locked commit for this binding")
                 })?;
-            let name = crate::source::SourceName::trusted(binding.source.to_owned());
-            let leaves = backend
-                .list_source_leaves(&name, remote, &locked.commit, None)
-                .map_err(|_| {
-                    cache_miss_diagnostic(binding.source, "its cached export is missing")
-                })?;
-            (locked.commit.clone(), leaves)
+            cached_copy_snapshot(backend, binding.source, src.mode(), remote, &locked.commit)?
         }
     };
 
@@ -656,6 +652,44 @@ pub(crate) fn explain_cmd(
         template_opt_in: &binding.template_opt_in,
     };
     explain_path(&input, path)
+}
+
+fn cached_copy_snapshot(
+    backend: &dyn SourceStore,
+    source: &str,
+    source_mode: crate::config::SourceMode,
+    remote: &str,
+    locked_commit: &str,
+) -> Result<(String, Vec<String>)> {
+    let location = match source_mode {
+        crate::config::SourceMode::Git | crate::config::SourceMode::Host => SourceLocation::Git {
+            url: remote.to_owned(),
+        },
+        crate::config::SourceMode::Url => SourceLocation::Url {
+            url: remote.to_owned(),
+        },
+    };
+    let commit = locked_commit
+        .parse::<Commit>()
+        .map_err(|_| cache_miss_diagnostic(source, "its locked commit is invalid"))?;
+    let resolved = backend
+        .resolve(
+            &ResolveRequest {
+                name: crate::source::SourceName::trusted(source.to_owned()),
+                location,
+                revision: RevisionSpec::Commit(commit),
+            },
+            ResolvePolicy::CachedOnly,
+        )
+        .map_err(|_| cache_miss_diagnostic(source, "its cached export is missing"))?;
+    let leaves = backend
+        .inventory(&resolved.snapshot, None)
+        .map_err(|_| cache_miss_diagnostic(source, "its cached export is missing"))?
+        .entries
+        .into_iter()
+        .map(|entry| entry.path.to_string())
+        .collect();
+    Ok((locked_commit.to_owned(), leaves))
 }
 
 fn unbound_diagnostic(entry: &str, matched: &str, why: &str, remedy: &str, debug: &str) -> Error {
@@ -846,7 +880,7 @@ pub fn target_listing(config: &Config) -> Vec<TargetRow> {
 /// Returns an error if `name` is not defined, or on-disk state cannot be read.
 pub fn target_detail<R>(config: &Config, registry: &R, name: &str) -> Result<TargetDetail>
 where
-    R: Registry + StateStore,
+    R: StateStore,
 {
     let target = config
         .targets
@@ -878,15 +912,15 @@ where
     })
 }
 
-/// Registry-driven `phora list`: per target, the status of every managed artifact,
-/// computed via [`check_artifact_state`](crate::deploy::check_artifact_state).
+/// StateStore-driven `phora list`: per target, the status of every managed artifact,
+/// computed via [`check_artifact_state`](crate::sync::inspect::check_artifact_state).
 ///
 /// # Errors
 ///
 /// Returns an error if the registry or on-disk targets cannot be read.
 pub fn list_statuses<R>(config: &Config, registry: &R) -> Result<Vec<TargetListing>>
 where
-    R: Registry + StateStore,
+    R: StateStore,
 {
     config
         .targets
@@ -900,13 +934,13 @@ where
         .collect()
 }
 
-/// Registry-driven orphan report: records whose target left config, each with
+/// StateStore-driven orphan report: records whose target left config, each with
 /// its reconstructed on-disk path (or `None` for legacy records).
 ///
 /// # Errors
 ///
 /// Returns an error if the registry cannot be read.
-pub fn list_orphans(config: &Config, registry: &dyn Registry) -> Result<Vec<OrphanListing>> {
+pub fn list_orphans(config: &Config, registry: &dyn StateStore) -> Result<Vec<OrphanListing>> {
     Ok(crate::sync::orphan_records(config, registry)?
         .into_iter()
         .map(|record| OrphanListing {
@@ -924,11 +958,11 @@ fn target_artifact_statuses<R>(
     registry: &R,
 ) -> Result<Vec<ArtifactStatus>>
 where
-    R: Registry + StateStore,
+    R: StateStore,
 {
-    let ejected = registry.load_ejected(target_name)?;
+    let ejected = registry.ejections(target_name)?;
     let mut artifacts = Vec::new();
-    for rec in registry.list_target(target_name)? {
+    for rec in registry.target_artifacts(target_name)? {
         let artifact_dst = crate::sync::record_artifact_path(target, &rec);
         let state = check_artifact_state(
             &artifact_dst,
@@ -952,12 +986,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::FileRegistry;
+    use crate::sync::state::FileStateStore;
     use tempfile::TempDir;
 
-    fn empty_registry() -> (TempDir, FileRegistry) {
+    fn empty_registry() -> (TempDir, FileStateStore) {
         let dir = TempDir::new().expect("temp state root");
-        let reg = FileRegistry::open(dir.path().to_path_buf()).expect("open registry");
+        let reg = FileStateStore::open(dir.path().to_path_buf()).expect("open registry");
         (dir, reg)
     }
 
