@@ -4,14 +4,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 
-LEGACY_ALLOWLIST=(
-  $'src/source/archive.rs\tT016'
-  $'src/source/cache.rs\tT016'
-  $'src/source/git.rs\tT016'
-  $'src/source/http.rs\tT016'
-  $'src/source/import.rs\tT016'
-  $'src/source/mod.rs\tT016'
-  $'src/source/worktree.rs\tT016'
+LEGACY_ALLOWLIST=()
+
+SOURCE_IO_OWNERS=(
+  src/source/archive.rs
+  src/source/cache.rs
+  src/source/git.rs
+  src/source/http.rs
+  src/source/import.rs
+  src/source/worktree.rs
 )
 
 LEGACY_INFRA=(
@@ -19,7 +20,9 @@ LEGACY_INFRA=(
 )
 
 if [[ "${1:-}" == "--print-allowlist" ]]; then
-  printf '%s\n' "${LEGACY_ALLOWLIST[@]}"
+  for entry in "${LEGACY_ALLOWLIST[@]-}"; do
+    [[ -z "$entry" ]] || printf '%s\n' "$entry"
+  done
   exit 0
 fi
 
@@ -352,7 +355,11 @@ inv3_exempt() {
     */tests.rs | *_tests.rs) return 0 ;;
     src/projection/*|src/sync/*|src/cli/*) return 0 ;;
   esac
-  for entry in "${LEGACY_ALLOWLIST[@]}"; do
+  for entry in "${SOURCE_IO_OWNERS[@]}"; do
+    [[ "$rel" == "$entry" ]] && return 0
+  done
+  for entry in "${LEGACY_ALLOWLIST[@]-}"; do
+    [[ -z "$entry" ]] && continue
     [[ "$rel" == "${entry%%$'\t'*}" ]] && return 0
   done
   for entry in "${LEGACY_INFRA[@]}"; do
@@ -365,7 +372,7 @@ while IFS= read -r f; do
   rel="${f#"$SCAN_ROOT"/}"
   inv3_exempt "$rel" && continue
   if grep -Eq "$LEAK_RE" <<< "$(stripped_or_die "$f")"; then
-    echo "arch-check: new module ${rel} performs target-side I/O outside the migration allowlist" >&2
+    echo "arch-check: new module ${rel} performs target-side I/O outside approved I/O owners" >&2
     violations=$((violations + 1))
   fi
 done < <(find "$SRC" -type f -name '*.rs' | sort)

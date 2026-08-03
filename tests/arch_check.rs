@@ -521,43 +521,52 @@ fn print_allowlist() -> Option<String> {
 }
 
 #[test]
-fn allowlist_is_exactly_the_phase_scoped_legacy_set() {
+fn t031_final_architecture_allowlist_is_empty() {
     let text = print_allowlist().expect(
         "arch-check.sh --print-allowlist must exit 0 and emit `path<TAB>expiry-task` \
          lines so the approved legacy set is inspectable and cannot silently grow",
     );
 
-    let mut got: Vec<(String, String)> = text
+    let got: Vec<&str> = text
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            let (path, expiry) = line.split_once('\t').unwrap_or_else(|| {
-                panic!("allowlist line is not `path<TAB>expiry-task`: {line:?}")
-            });
-            (path.trim().to_string(), expiry.trim().to_string())
-        })
         .collect();
-    got.sort();
 
-    let mut want: Vec<(String, String)> = [
-        ("src/source/archive.rs", "T016"),
-        ("src/source/cache.rs", "T016"),
-        ("src/source/git.rs", "T016"),
-        ("src/source/http.rs", "T016"),
-        ("src/source/import.rs", "T016"),
-        ("src/source/mod.rs", "T016"),
-        ("src/source/worktree.rs", "T016"),
-    ]
-    .into_iter()
-    .map(|(path, expiry)| (path.to_string(), expiry.to_string()))
-    .collect();
-    want.sort();
+    assert!(
+        got.is_empty(),
+        "the final architecture has no compatibility or migration exceptions: \
+         arch-check.sh --print-allowlist must emit no non-blank entries, but found {got:?}"
+    );
+}
 
-    assert_eq!(
-        got, want,
-        "the arch-check legacy allowlist must be exactly the phase-scoped set, each \
-         tied to its expiry task; adding, dropping, or re-annotating an entry (the \
-         allowlist may only ever shrink) must fail this pin"
+#[test]
+fn t031_empty_allowlist_print_and_scan_succeed_under_system_bash() {
+    let print = Command::new("/bin/bash")
+        .arg(script_path())
+        .arg("--print-allowlist")
+        .current_dir(manifest())
+        .output()
+        .expect("/bin/bash must execute arch-check.sh --print-allowlist");
+
+    let tree = base_tree();
+    let scan = Command::new("/bin/bash")
+        .arg(script_path())
+        .arg(&tree.root)
+        .current_dir(manifest())
+        .output()
+        .expect("/bin/bash must execute the normal arch-check.sh scan path");
+
+    assert!(
+        print.status.success() && scan.status.success(),
+        "an empty final LEGACY_ALLOWLIST must be safe under the system /bin/bash with set -u \
+         on both script paths\n--print-allowlist status: {:?}\nstdout:\n{}stderr:\n{}\n\
+         normal scan status: {:?}\nstdout:\n{}stderr:\n{}",
+        print.status.code(),
+        String::from_utf8_lossy(&print.stdout),
+        String::from_utf8_lossy(&print.stderr),
+        scan.status.code(),
+        String::from_utf8_lossy(&scan.stdout),
+        String::from_utf8_lossy(&scan.stderr),
     );
 }
 
@@ -824,6 +833,21 @@ fn inv3_new_top_level_io_file_fails_at_repo_root_scan() {
         "a NEW top-level module (src/evil_leak.rs — not sync/cli, not on the legacy \
          allowlist) performing filesystem I/O, scanned CI-style with the repo tree \
          root as the single argument",
+    );
+}
+
+#[test]
+fn t031_unapproved_new_source_module_cannot_mutate_target_io() {
+    let tree = base_tree();
+    tree.write(
+        "src/source/unapproved_target_io.rs",
+        "pub fn erase_target(target: &std::path::Path) {\n    \
+         let _ = std::fs::remove_dir_all(target);\n}\n",
+    );
+    tree.check().assert_fail(
+        "an unapproved new source module performing target-mutating std I/O; existing \
+         source/cache I/O owners remain present in the copied real tree, so INV-3 must use a \
+         narrow permanent owner set instead of exempting every src/source/* file",
     );
 }
 
