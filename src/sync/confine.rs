@@ -1,5 +1,6 @@
 //! Destination confinement for composed transitive targets (TDEP-CONFINE-001).
 
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 use unicode_normalization::UnicodeNormalization;
@@ -169,6 +170,60 @@ fn canonical_lexical(path: &Path) -> PathBuf {
                 existing = parent;
             }
             _ => return lexical,
+        }
+    }
+}
+
+/// Resolves a path to its physical identity without requiring the final path to exist.
+pub(super) fn normalize_physical(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        return Err(Error::Config(format!(
+            "overlap check: physical path {} is not absolute",
+            path.display()
+        )));
+    }
+    let mut existing = path.to_path_buf();
+    let mut tail: Vec<OsString> = Vec::new();
+    loop {
+        match std::fs::canonicalize(&existing) {
+            Ok(mut physical) => {
+                physical.extend(tail.iter().rev());
+                return Ok(physical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(Error::Config(format!(
+                    "overlap check: resolve physical prefix {}: {error}",
+                    existing.display()
+                )));
+            }
+        }
+        if std::fs::symlink_metadata(&existing).is_ok() {
+            return Err(Error::Config(format!(
+                "overlap check: existing path {} has no resolvable physical identity",
+                existing.display()
+            )));
+        }
+        match existing.components().next_back() {
+            Some(Component::Normal(name)) => {
+                tail.push(name.to_os_string());
+                existing.pop();
+            }
+            Some(Component::CurDir) => {
+                existing.pop();
+            }
+            Some(Component::ParentDir) => {
+                return Err(Error::Config(format!(
+                    "overlap check: unresolved parent traversal in {} cannot be normalized safely",
+                    path.display()
+                )));
+            }
+            Some(Component::RootDir | Component::Prefix(_)) | None => {
+                return Err(Error::Config(format!(
+                    "overlap check: no existing physical prefix for {}",
+                    path.display()
+                )));
+            }
         }
     }
 }

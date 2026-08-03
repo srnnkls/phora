@@ -58,7 +58,10 @@ pub use stage::{StageRequest, StagedArtifact, StagedFile, stage_artifact};
 #[cfg(test)]
 use target::deploy_reconciled_target;
 pub(crate) use target::record_artifact_path;
-use target::{Reconciliation, TargetRun, deploy_reconciled_target_report, resolve_conflicts};
+use target::{
+    Reconciliation, TargetRun, deploy_reconciled_target_report, resolve_conflicts,
+    resolve_conflicts_reusing,
+};
 
 #[cfg(test)]
 use {
@@ -501,8 +504,13 @@ struct DeployAll<'a, R> {
     journal: &'a Journal,
 }
 
-/// Outcome of the per-target deploy loop. `aborted` means a `pre_deploy` gate with the default
-/// `abort` fired and short-circuited the loop (later targets unprocessed); `had_failures`
+struct DeployProtocol<'a, R> {
+    workspace: DeployAll<'a, R>,
+    fast_forward_drops: &'a [FastForwardDrop],
+}
+
+/// Outcome of the all-gates-before-mutation deploy protocol. `aborted` means a `pre_deploy` gate
+/// stopped hook processing before planned drops or target changes were applied; `had_failures`
 /// folds in skip-induced failures so it can suppress `--prune`.
 struct ApplyRun {
     had_failures: bool,
@@ -528,16 +536,54 @@ fn target_run<'a, R>(
     }
 }
 
-fn apply_target_changes<R>(ctx: &DeployAll<'_, R>) -> Result<ApplyRun>
-where
-    R: StateStore,
-{
-    let observed = observe::observe_workspace(ctx, ctx.projection)?;
-    let options = ctx.input.options();
-    let policy = (&options).into();
-    let changeset = reconcile::reconcile(ctx.projection, &observed, &policy)
-        .map_err(|e| Error::Sync(e.to_string()))?;
-    let registry: &dyn StateStore = ctx.registry;
+#[derive(Default)]
+struct PreDeployRun {
+    outcomes: Vec<hooks::HookOutcome>,
+    skipped_targets: BTreeSet<String>,
+    aborted: bool,
+    ran: bool,
+}
+
+fn run_pre_deploy<R>(ctx: &DeployAll<'_, R>) -> Result<PreDeployRun> {
+    let mut run = PreDeployRun::default();
+    if !ctx.input.hooks_enabled() {
+        return Ok(run);
+    }
+    for (target_name, target) in &ctx.config.targets {
+        let Some(hooks) = &target.hooks else {
+            continue;
+        };
+        if hooks.pre_deploy.is_none() {
+            continue;
+        }
+        let outcomes = hooks::dispatch_pre_deploy(hooks, target_name, &target.expanded_path())?;
+        run.ran |= !outcomes.is_empty();
+        let failed = outcomes
+            .iter()
+            .any(|outcome| outcome.status == hooks::HookStatus::Failure);
+        run.outcomes.extend(outcomes);
+        if !failed {
+            continue;
+        }
+        match hooks.pre_deploy_on_fail {
+            PreDeployOnFail::Abort => {
+                run.aborted = true;
+                break;
+            }
+            PreDeployOnFail::Skip => {
+                run.skipped_targets.insert(target_name.clone());
+            }
+        }
+    }
+    Ok(run)
+}
+
+fn refuse_lockless_mutation(
+    input: &dyn RunOptions,
+    registry: &dyn StateStore,
+    observed: &model::ObservedProjectState<ArtifactRecord>,
+    changeset: &model::ChangeSet,
+) -> Result<()> {
     let refresh_pending = observed.artifacts.iter().any(|entry| {
         matches!(
             entry.observation,
@@ -547,43 +593,80 @@ where
             })
         )
     });
-    if ctx.input.lockless() && (!changeset.changes.is_empty() || refresh_pending) {
+    if input.lockless() && (!changeset.changes.is_empty() || refresh_pending) {
         return Err(readonly_state_error(registry));
     }
-    let decisions = resolve_conflicts(&changeset, ctx.input.resolver(), ctx.input.interactive())?;
-    let reconciliation = Reconciliation::new(&changeset, &observed, decisions);
+    Ok(())
+}
 
+fn apply_target_changes<R>(
+    ctx: &DeployAll<'_, R>,
+    fast_forward_drops: &[FastForwardDrop],
+) -> Result<ApplyRun>
+where
+    R: StateStore,
+{
+    let initial_observed = observe::observe_workspace(ctx, ctx.projection)?;
+    let options = ctx.input.options();
+    let policy = (&options).into();
+    let initial_changeset = reconcile::reconcile(ctx.projection, &initial_observed, &policy)
+        .map_err(|e| Error::Sync(e.to_string()))?;
+    let registry: &dyn StateStore = ctx.registry;
+    refuse_lockless_mutation(ctx.input, registry, &initial_observed, &initial_changeset)?;
+    let initial_decisions = resolve_conflicts(
+        &initial_changeset,
+        ctx.input.resolver(),
+        ctx.input.interactive(),
+    )?;
+    let PreDeployRun {
+        outcomes,
+        skipped_targets,
+        aborted,
+        ran,
+    } = run_pre_deploy(ctx)?;
+    if aborted {
+        return Ok(ApplyRun {
+            had_failures: false,
+            pre_deploy: outcomes,
+            aborted: true,
+            changes: initial_changeset,
+            events: SyncEvents::default(),
+        });
+    }
+
+    let (observed, changeset, decisions) = if ran {
+        let observed = observe::observe_workspace(ctx, ctx.projection)?;
+        let changeset = reconcile::reconcile(ctx.projection, &observed, &policy)
+            .map_err(|error| Error::Sync(error.to_string()))?;
+        refuse_lockless_mutation(ctx.input, registry, &observed, &changeset)?;
+        let decisions = resolve_conflicts_reusing(
+            &changeset,
+            &initial_decisions,
+            &skipped_targets,
+            ctx.input.resolver(),
+            ctx.input.interactive(),
+        )?;
+        (observed, changeset, decisions)
+    } else {
+        (initial_observed, initial_changeset, initial_decisions)
+    };
+    let reconciliation = Reconciliation::new(&changeset, &observed, decisions);
     let mut run = ApplyRun {
-        had_failures: false,
-        pre_deploy: Vec::new(),
+        had_failures: !skipped_targets.is_empty(),
+        pre_deploy: outcomes,
         aborted: false,
         changes: changeset.clone(),
         events: SyncEvents::default(),
     };
+    apply_fast_forward_drops(
+        fast_forward_drops,
+        registry,
+        &skipped_targets,
+        &mut run.events,
+    )?;
     for (target_name, target) in &ctx.config.targets {
-        if ctx.input.hooks_enabled()
-            && let Some(hooks) = &target.hooks
-            && hooks.pre_deploy.is_some()
-        {
-            let outcomes = hooks::dispatch_pre_deploy(hooks, target_name, &target.expanded_path())?;
-            let failed = outcomes
-                .iter()
-                .any(|o| o.status == hooks::HookStatus::Failure);
-            run.pre_deploy.extend(outcomes);
-            if failed {
-                match hooks.pre_deploy_on_fail {
-                    // abort halts the whole sync: break before this target deploys.
-                    PreDeployOnFail::Abort => {
-                        run.aborted = true;
-                        break;
-                    }
-                    // skip drops only this target's deploy but marks had_failures (suppresses prune).
-                    PreDeployOnFail::Skip => {
-                        run.had_failures = true;
-                        continue;
-                    }
-                }
-            }
+        if skipped_targets.contains(target_name) {
+            continue;
         }
         let Some(target_projection) = ctx
             .projection
@@ -603,7 +686,7 @@ where
             &mut run.events,
         )?;
     }
-    if !run.aborted && !run.had_failures {
+    if !run.had_failures {
         prune::apply_reconciled_removals(
             &changeset.changes,
             &observed,
@@ -624,7 +707,7 @@ where
 fn reject_cross_target_overlap(projection: &Projection, config: &Config) -> Result<()> {
     let cwd = std::env::current_dir()
         .map_err(|e| Error::Sync(format!("resolve current dir for overlap check: {e}")))?;
-    let mut placements: Vec<(&str, PathBuf)> = Vec::new();
+    let mut placements: Vec<(&str, PathBuf, PathBuf)> = Vec::new();
     for target_projection in &projection.targets {
         let Some(target) = config.targets.get(&target_projection.target) else {
             continue;
@@ -633,17 +716,18 @@ fn reject_cross_target_overlap(projection: &Projection, config: &Config) -> Resu
         let layout = target.layout();
         for binding in &target_projection.bindings {
             for key in projected_artifact_keys(binding) {
-                placements.push((
-                    &target_projection.target,
-                    root.join(layout.artifact_path(&binding.identity, &key)),
-                ));
+                let path = root.join(layout.artifact_path(&binding.identity, &key));
+                let physical = confine::normalize_physical(&path)?;
+                let identity = confine::fold_path(&physical);
+                placements.push((&target_projection.target, physical, identity));
             }
         }
     }
-    for (i, (first_target, first_path)) in placements.iter().enumerate() {
-        for (second_target, second_path) in &placements[i + 1..] {
+    for (i, (first_target, first_path, first_identity)) in placements.iter().enumerate() {
+        for (second_target, second_path, second_identity) in &placements[i + 1..] {
             if first_target != second_target
-                && (first_path.starts_with(second_path) || second_path.starts_with(first_path))
+                && (first_identity.starts_with(second_identity)
+                    || second_identity.starts_with(first_identity))
             {
                 return Err(cross_target_overlap_diagnostic(
                     first_target,
@@ -741,25 +825,68 @@ fn readonly_state_error(registry: &dyn StateStore) -> Error {
     state::readonly_root_error(state_root).into()
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "fast-forward validation spans config, projection, persisted state, confinement, policy, and report collection"
-)]
-fn apply_fast_forward_drops(
-    config: &Config,
-    parsed: &BTreeMap<String, ParsedSource>,
+enum FastForwardDrop {
+    Remove {
+        record: ArtifactRecord,
+        path: PathBuf,
+    },
+    KeepLive {
+        record: ArtifactRecord,
+        path: PathBuf,
+    },
+}
+
+impl FastForwardDrop {
+    fn record(&self) -> &ArtifactRecord {
+        match self {
+            Self::Remove { record, .. } | Self::KeepLive { record, .. } => record,
+        }
+    }
+}
+
+fn plan_fast_forward_drops(
     projection: &Projection,
-    recorded: &[ArtifactRecord],
+    config: &Config,
     registry: &dyn StateStore,
     protected: &confine::ProtectedPathSet,
-    fast_forward: bool,
+    drops: Vec<ArtifactRecord>,
     lockless: bool,
-    events: &mut SyncEvents,
-) -> Result<()> {
-    let drops = validate_sealed_offer(config, parsed, projection, recorded, fast_forward)?;
-    prune_fast_forward_drops_report(
-        projection, config, registry, protected, &drops, lockless, events,
-    )
+) -> Result<Vec<FastForwardDrop>> {
+    if drops.is_empty() {
+        return Ok(Vec::new());
+    }
+    if lockless {
+        return Err(readonly_state_error(registry));
+    }
+    let expected_paths = prune::expected_live_paths(projection, config);
+    let mut plan = Vec::new();
+    for record in drops {
+        let Some(target) = config.targets.get(&record.key.target) else {
+            continue;
+        };
+        let dst = target::record_artifact_path(target, &record);
+        let confined = match &target.confine {
+            Some(anchor) => confine::confine_destination(anchor, &dst, protected),
+            None if target::is_composed_target(&record.key.target) => Err(Error::Config(format!(
+                "confinement: composed target `{}` reached fast-forward prune without a confine \
+                 anchor; refusing an unconfined delete",
+                record.key.target
+            ))),
+            None => Ok(dst.clone()),
+        };
+        let path = confined.map_err(|error| {
+            Error::Sync(format!(
+                "fast-forward refuses out-of-anchor {}: {error}; eject it instead",
+                dst.display()
+            ))
+        })?;
+        if prune::overlaps_live_dest(&path, &expected_paths, &record.key.target) {
+            plan.push(FastForwardDrop::KeepLive { record, path });
+        } else {
+            plan.push(FastForwardDrop::Remove { record, path });
+        }
+    }
+    Ok(plan)
 }
 
 fn project_sync_workspace(
@@ -914,19 +1041,23 @@ where
         &routed.commits,
         &routed.resolved,
     )?;
-    apply_fast_forward_drops(
+    let pending_fast_forward_drops = validate_sealed_offer(
         &effective_config,
         &parsed,
         &projection,
         &recorded_after_recovery,
+        input.fast_forward(),
+    )?;
+    let fast_forward_drops = plan_fast_forward_drops(
+        &projection,
+        &effective_config,
         compat_registry,
         &protected,
-        input.fast_forward(),
+        pending_fast_forward_drops,
         input.lockless,
-        &mut events,
     )?;
 
-    // pre_sync gates the run: a failure aborts before deploy, leaving zero files deployed.
+    // pre_sync gates the run before planned drops or ordinary target changes are applied.
     let pre_sync_outcomes = run_pre_sync(input, &effective_config)?;
     if pre_sync_outcomes
         .iter()
@@ -940,17 +1071,20 @@ where
         ));
     }
 
-    let deploy = DeployAll {
-        config: &effective_config,
-        parsed: &parsed,
-        remotes: &remotes,
-        projection: &projection,
-        resolved_sources: &routed.resolved,
-        protected: &protected,
-        input,
-        backend,
-        registry,
-        journal: &journal,
+    let deploy = DeployProtocol {
+        workspace: DeployAll {
+            config: &effective_config,
+            parsed: &parsed,
+            remotes: &remotes,
+            projection: &projection,
+            resolved_sources: &routed.resolved,
+            protected: &protected,
+            input,
+            backend,
+            registry,
+            journal: &journal,
+        },
+        fast_forward_drops: &fast_forward_drops,
     };
     deploy_and_run_hooks(
         &deploy,
@@ -964,7 +1098,7 @@ where
 }
 
 fn deploy_and_run_hooks<R>(
-    deploy: &DeployAll<'_, R>,
+    protocol: &DeployProtocol<'_, R>,
     mut base_lock: Lock,
     local_lock: Option<Lock>,
     hook_candidates: &[transitive::TransitiveHookCandidate],
@@ -975,7 +1109,11 @@ fn deploy_and_run_hooks<R>(
 where
     R: StateStore,
 {
-    let mut run = apply_target_changes(deploy)?;
+    let DeployProtocol {
+        workspace: deploy,
+        fast_forward_drops,
+    } = protocol;
+    let mut run = apply_target_changes(deploy, fast_forward_drops)?;
     run.events.applied.splice(0..0, events.applied);
     run.events.skipped.splice(0..0, events.skipped);
     run.events.warnings.splice(0..0, events.warnings);
@@ -1040,9 +1178,9 @@ where
     })
 }
 
-/// Short-circuit shared by a failed `pre_sync` gate and a `pre_deploy` abort: files already
-/// deployed stay, but no prune and no post-deploy hook phase run. `deploy_failures` is false
-/// because a gate failure is a hook failure, not a per-artifact deploy failure.
+/// Short-circuit shared by a failed `pre_sync` gate and a `pre_deploy` abort. Both return before
+/// planned drops or ordinary target changes are applied; hook side effects remain external.
+/// `deploy_failures` is false because a gate failure is a hook failure, not a deploy failure.
 fn aborted_before_deploy_phase(
     base_lock: Lock,
     local_lock: Option<Lock>,
@@ -1305,6 +1443,41 @@ fn paths_overlap(first: &str, second: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
+fn apply_fast_forward_drops(
+    drops: &[FastForwardDrop],
+    registry: &dyn StateStore,
+    skipped_targets: &BTreeSet<String>,
+    events: &mut SyncEvents,
+) -> Result<()> {
+    for drop in drops {
+        let record = drop.record();
+        if skipped_targets.contains(&record.key.target) {
+            continue;
+        }
+        match drop {
+            FastForwardDrop::KeepLive { path, .. } => {
+                events.warnings.push(SyncWarning::FastForwardKeptLive {
+                    source: record.key.source.clone(),
+                    artifact: record.key.artifact.clone(),
+                    path: path.clone(),
+                });
+            }
+            FastForwardDrop::Remove { path, .. } => {
+                events.warnings.push(SyncWarning::FastForwardDropped {
+                    source: record.key.source.clone(),
+                    artifact: record.key.artifact.clone(),
+                });
+                remove_orphan_path(path).map_err(|error| {
+                    Error::Sync(format!("fast-forward prune {}: {error}", path.display()))
+                })?;
+            }
+        }
+        registry.remove_artifact(&record.key)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn prune_fast_forward_drops_report(
     projection: &Projection,
     config: &Config,
@@ -1314,50 +1487,15 @@ fn prune_fast_forward_drops_report(
     lockless: bool,
     events: &mut SyncEvents,
 ) -> Result<()> {
-    if drops.is_empty() {
-        return Ok(());
-    }
-    if lockless {
-        return Err(readonly_state_error(registry));
-    }
-    let expected_paths = prune::expected_live_paths(projection, config);
-    for record in drops {
-        let Some(target) = config.targets.get(&record.key.target) else {
-            continue;
-        };
-        let dst = target::record_artifact_path(target, record);
-        let confined = match &target.confine {
-            Some(anchor) => confine::confine_destination(anchor, &dst, protected),
-            None if target::is_composed_target(&record.key.target) => Err(Error::Config(format!(
-                "confinement: composed target `{}` reached fast-forward prune without a confine \
-                 anchor; refusing an unconfined delete",
-                record.key.target
-            ))),
-            None => Ok(dst.clone()),
-        };
-        let path = confined.map_err(|e| {
-            Error::Sync(format!(
-                "fast-forward refuses out-of-anchor {}: {e}; eject it instead",
-                dst.display()
-            ))
-        })?;
-        if prune::overlaps_live_dest(&path, &expected_paths, &record.key.target) {
-            events.warnings.push(SyncWarning::FastForwardKeptLive {
-                source: record.key.source.clone(),
-                artifact: record.key.artifact.clone(),
-                path,
-            });
-        } else {
-            events.warnings.push(SyncWarning::FastForwardDropped {
-                source: record.key.source.clone(),
-                artifact: record.key.artifact.clone(),
-            });
-            remove_orphan_path(&path)
-                .map_err(|e| Error::Sync(format!("fast-forward prune {}: {e}", path.display())))?;
-        }
-        registry.remove_artifact(&record.key)?;
-    }
-    Ok(())
+    let plan = plan_fast_forward_drops(
+        projection,
+        config,
+        registry,
+        protected,
+        drops.to_vec(),
+        lockless,
+    )?;
+    apply_fast_forward_drops(&plan, registry, &BTreeSet::new(), events)
 }
 
 struct SealedOffer<'a> {
