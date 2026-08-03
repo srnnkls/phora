@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::config::{DeployMode, LayoutConfig, ParsedSource, Target, TemplateOptIn};
@@ -55,6 +55,7 @@ pub(super) fn is_composed_target(target_name: &str) -> bool {
     target_name.contains('%')
 }
 
+#[derive(Clone)]
 pub(super) struct ConflictOutcome {
     resolution: Resolution,
     kind: ConflictKind,
@@ -221,6 +222,22 @@ pub(super) fn resolve_conflicts(
     resolver: Option<&dyn ConflictResolver>,
     interactive: bool,
 ) -> Result<ConflictDecisions> {
+    resolve_conflicts_reusing(
+        changeset,
+        &ConflictDecisions::new(),
+        &BTreeSet::new(),
+        resolver,
+        interactive,
+    )
+}
+
+pub(super) fn resolve_conflicts_reusing(
+    changeset: &ChangeSet,
+    previous: &ConflictDecisions,
+    excluded_targets: &BTreeSet<String>,
+    resolver: Option<&dyn ConflictResolver>,
+    interactive: bool,
+) -> Result<ConflictDecisions> {
     let mut decisions = ConflictDecisions::new();
     for change in &changeset.changes {
         let SyncChange::Conflict {
@@ -232,6 +249,16 @@ pub(super) fn resolve_conflicts(
         else {
             continue;
         };
+        if excluded_targets.contains(target) {
+            continue;
+        }
+        let key = (target.clone(), source.clone(), artifact.clone());
+        if let Some(outcome) = previous.get(&key)
+            && &outcome.kind == kind
+        {
+            decisions.insert(key, outcome.clone());
+            continue;
+        }
         let (resolution, warn) = match resolver {
             Some(resolver) if interactive => (
                 resolver.resolve(&Conflict {
@@ -245,7 +272,7 @@ pub(super) fn resolve_conflicts(
             _ => (Resolution::Skip, true),
         };
         decisions.insert(
-            (target.clone(), source.clone(), artifact.clone()),
+            key,
             ConflictOutcome {
                 resolution,
                 kind: kind.clone(),

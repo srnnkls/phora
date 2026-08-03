@@ -1773,6 +1773,175 @@ fn sync_rejects_two_targets_aliasing_one_destination_via_relative_and_absolute_s
     drop(sb);
 }
 
+#[cfg(unix)]
+#[test]
+fn sync_rejects_targets_aliasing_through_an_existing_directory_symlink_before_mutation() {
+    use std::os::unix::fs::symlink;
+
+    let (sa, url_a) = build_named_artifact_repo("shared", "a.txt", b"from-a\n");
+    let (sb, url_b) = build_named_artifact_repo("shared", "b.txt", b"from-b\n");
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let td = TargetDir::new();
+    let base = td.target_path();
+    let physical = base.join("physical");
+    let alias = base.join("alias");
+    std::fs::create_dir_all(&physical).expect("create existing physical target root");
+    symlink(&physical, &alias).expect("create directory symlink alias for target root");
+
+    let toml = format!(
+        "version = 1\n\n\
+             [sources.sa]\ngit = \"{url_a}\"\nbranch = \"main\"\n\n\
+             [sources.sb]\ngit = \"{url_b}\"\nbranch = \"main\"\n\n\
+             [targets.alpha]\npath = \"{}\"\nsources = [\"sa\"]\nlayout = \"flat\"\n\n\
+             [targets.beta]\npath = \"{}\"\nsources = [\"sb\"]\nlayout = \"flat\"\n",
+        physical.display(),
+        alias.display(),
+    );
+    let cfg = Config::parse(&toml).expect("directory-symlink alias config parses");
+
+    let result = sync(&input(&cfg, None, None, None, false), &backend, &registry);
+    assert_overlap_rejected(
+        result,
+        &registry,
+        ("alpha", "beta"),
+        "shared",
+        &[physical.join("shared")],
+    );
+
+    drop(sa);
+    drop(sb);
+}
+
+#[test]
+fn sync_rejects_equivalent_target_roots_with_parent_components_before_mutation() {
+    let (sa, url_a) = build_named_artifact_repo("shared", "a.txt", b"from-a\n");
+    let (sb, url_b) = build_named_artifact_repo("shared", "b.txt", b"from-b\n");
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let td = TargetDir::new();
+    let base = td.target_path();
+    let physical = base.join("physical");
+    let parent_spelling = base.join("existing").join("..").join("physical");
+    std::fs::create_dir_all(base.join("existing"))
+        .expect("create the existing prefix needed to traverse a parent component");
+
+    let toml = format!(
+        "version = 1\n\n\
+             [sources.sa]\ngit = \"{url_a}\"\nbranch = \"main\"\n\n\
+             [sources.sb]\ngit = \"{url_b}\"\nbranch = \"main\"\n\n\
+             [targets.alpha]\npath = \"{}\"\nsources = [\"sa\"]\nlayout = \"flat\"\n\n\
+             [targets.beta]\npath = \"{}\"\nsources = [\"sb\"]\nlayout = \"flat\"\n",
+        physical.display(),
+        parent_spelling.display(),
+    );
+    let cfg = Config::parse(&toml).expect("parent-component alias config parses");
+
+    let result = sync(&input(&cfg, None, None, None, false), &backend, &registry);
+    assert_overlap_rejected(
+        result,
+        &registry,
+        ("alpha", "beta"),
+        "shared",
+        &[physical.clone(), physical.join("shared")],
+    );
+
+    drop(sa);
+    drop(sb);
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_rejects_symlink_then_parent_alias_with_nonexistent_artifact_tail_before_mutation() {
+    use std::os::unix::fs::symlink;
+
+    let (sa, url_a) = build_named_artifact_repo("shared", "a.txt", b"from-a\n");
+    let (sb, url_b) = build_named_artifact_repo("shared", "b.txt", b"from-b\n");
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let td = TargetDir::new();
+    let base = td.target_path();
+    let physical = base.join("physical");
+    let symlink_destination = physical.join("child");
+    let alias = base.join("jump");
+    std::fs::create_dir_all(&symlink_destination)
+        .expect("create the existing directory reached by the symlink");
+    symlink(&symlink_destination, &alias)
+        .expect("create directory symlink before parent component");
+
+    let through_symlink_then_parent = alias.join("..");
+    let shared = physical.join("shared");
+    assert!(
+        !shared.exists(),
+        "premise: the aliased artifact tail must not exist before overlap validation"
+    );
+
+    let toml = format!(
+        "version = 1\n\n\
+             [sources.sa]\ngit = \"{url_a}\"\nbranch = \"main\"\n\n\
+             [sources.sb]\ngit = \"{url_b}\"\nbranch = \"main\"\n\n\
+             [targets.alpha]\npath = \"{}\"\nsources = [\"sa\"]\nlayout = \"flat\"\n\n\
+             [targets.beta]\npath = \"{}\"\nsources = [\"sb\"]\nlayout = \"flat\"\n",
+        physical.display(),
+        through_symlink_then_parent.display(),
+    );
+    let cfg = Config::parse(&toml).expect("symlink-then-parent alias config parses");
+
+    let result = sync(&input(&cfg, None, None, None, false), &backend, &registry);
+    assert_overlap_rejected(
+        result,
+        &registry,
+        ("alpha", "beta"),
+        "shared",
+        &[shared, base.join("shared")],
+    );
+
+    drop(sa);
+    drop(sb);
+}
+
+#[test]
+fn sync_rejects_nonexistent_case_variant_placements_on_case_insensitive_filesystems() {
+    let (sa, url_a) = build_named_artifact_repo("Shared", "a.txt", b"from-a\n");
+    let (sb, url_b) = build_named_artifact_repo("shared", "b.txt", b"from-b\n");
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let td = TargetDir::new();
+    let base = td.target_path();
+
+    let case_probe = base.join("PhoraCaseProbe");
+    std::fs::create_dir_all(&case_probe).expect("create filesystem case-sensitivity probe");
+    if !base.join("phoracaseprobe").is_dir() {
+        return;
+    }
+
+    let upper_root = base.join("TargetCase");
+    let lower_root = base.join("targetcase");
+    assert!(
+        !upper_root.exists() && !lower_root.exists(),
+        "premise: both case-variant target roots must be nonexistent before validation"
+    );
+
+    let toml = format!(
+        "version = 1\n\n\
+             [sources.sa]\ngit = \"{url_a}\"\nbranch = \"main\"\n\n\
+             [sources.sb]\ngit = \"{url_b}\"\nbranch = \"main\"\n\n\
+             [targets.alpha]\npath = \"{}\"\nsources = [\"sa\"]\nlayout = \"flat\"\n\n\
+             [targets.beta]\npath = \"{}\"\nsources = [\"sb\"]\nlayout = \"flat\"\n",
+        upper_root.display(),
+        lower_root.display(),
+    );
+    let cfg = Config::parse(&toml).expect("case-variant placement config parses");
+
+    let result = sync(&input(&cfg, None, None, None, false), &backend, &registry);
+    assert_overlap_rejected(
+        result,
+        &registry,
+        ("alpha", "beta"),
+        "hared",
+        &[upper_root.clone(), upper_root.join("Shared"), lower_root],
+    );
+
+    drop(sa);
+    drop(sb);
+}
+
 #[test]
 fn sync_allows_targets_whose_roots_share_a_string_prefix_but_no_ancestor_relation() {
     let (so, url_o) = build_named_artifact_repo("od", "f.txt", b"outer\n");
@@ -3980,6 +4149,463 @@ fn conflict_abort_preflight_runs_before_pre_deploy_hooks() {
         log_lines(&log).is_empty(),
         "resolve-before-hooks preserves whole-run Abort atomicity: pre_deploy must not run"
     );
+}
+
+#[test]
+fn successful_pre_deploy_creation_rechecks_missing_and_preserves_local_content_without_force() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+    let local_file = dst.join("hook-created.txt");
+    let hook = format!(
+        "mkdir -p '{}' && printf '%s' 'created by pre-deploy' > '{}'",
+        dst.display(),
+        local_file.display(),
+    )
+    .replace('"', "\\\"");
+    let cfg = Config::parse(&format!(
+        "version = 1\n\n\
+         [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\"editor-src\"]\nlayout = \"flat\"\n\n\
+         [targets.dest.hooks]\npre_deploy = \"{hook}\"\n",
+        fx.url,
+        td.target_path().display(),
+    ))
+    .expect("hook-created Missing fixture config parses");
+
+    let out = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("an unforced hook-created Foreign artifact must retain skip semantics");
+
+    assert!(
+        !out.had_failures,
+        "skipping content created by a successful pre_deploy hook is not a failure"
+    );
+    assert_eq!(
+        std::fs::read(&local_file).ok(),
+        Some(b"created by pre-deploy".to_vec()),
+        "the destination was Missing when first observed, but content created by pre_deploy must \
+         be reclassified as Foreign and preserved without --force"
+    );
+    assert!(
+        !dst.join("init.lua").exists(),
+        "no upstream file may be deployed after pre_deploy turns Missing into Foreign"
+    );
+    assert!(
+        fx.registry
+            .artifact(&artifact_key("dest", "editor-src", "editor"))
+            .expect("registry lookup after hook-created skip")
+            .is_none(),
+        "a skipped hook-created Foreign artifact must not gain a managed registry record"
+    );
+}
+
+#[test]
+fn successful_pre_deploy_edit_rechecks_outdated_and_preserves_local_content_without_force() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let plain =
+        config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+    let first = sync(
+        &input(&plain, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("first sync deploys and records the original commit");
+    assert!(!first.had_failures, "premise: first deploy must succeed");
+
+    let key = artifact_key("dest", "editor-src", "editor");
+    let record_before = fx
+        .registry
+        .artifact(&key)
+        .expect("registry lookup before source advance")
+        .expect("first sync records the managed artifact");
+    let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+    let new_head = fx.advance_head();
+    let before_hook = check_state_at(
+        &dst,
+        &fx.registry,
+        "dest",
+        "editor-src",
+        "editor",
+        &new_head,
+    );
+    assert!(
+        matches!(before_hook, ArtifactState::Outdated),
+        "premise: an unchanged managed destination at the advanced commit must be Outdated, got \
+         {before_hook:?}"
+    );
+
+    let hook = format!(
+        "printf '%s' 'edited by pre-deploy' > '{}'",
+        dst.join("init.lua").display(),
+    )
+    .replace('"', "\\\"");
+    let hooked = Config::parse(&format!(
+        "version = 1\n\n\
+         [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\"editor-src\"]\nlayout = \"flat\"\n\n\
+         [targets.dest.hooks]\npre_deploy = \"{hook}\"\n",
+        fx.url,
+        td.target_path().display(),
+    ))
+    .expect("hook-edited Outdated fixture config parses");
+
+    let out = sync(
+        &input(&hooked, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("an unforced hook-modified Outdated artifact must retain skip semantics");
+    assert_eq!(
+        first_commit(&out),
+        new_head,
+        "premise: the second sync must resolve the advanced source commit"
+    );
+    assert!(
+        !out.had_failures,
+        "skipping an Outdated artifact modified by a successful pre_deploy hook is not a failure"
+    );
+    assert_eq!(
+        std::fs::read(dst.join("init.lua")).ok(),
+        Some(b"edited by pre-deploy".to_vec()),
+        "pre_deploy changed the observed Outdated artifact to Modified; without --force or an \
+         overwrite decision, the hook's local value must be preserved"
+    );
+    assert!(
+        !dst.join("extra.lua").exists(),
+        "a post-hook Modified artifact must be skipped as a unit; no file from the advanced \
+         source may be partially deployed"
+    );
+    assert_eq!(
+        fx.registry
+            .artifact(&key)
+            .expect("registry lookup after hook-modified skip"),
+        Some(record_before),
+        "skipping the post-hook Modified artifact must leave its prior registry record unchanged"
+    );
+}
+
+fn pre_deploy_hook_table(target: &str, hook: Option<(&str, Option<&str>)>) -> String {
+    let Some((command, on_fail)) = hook else {
+        return String::new();
+    };
+    let on_fail = on_fail
+        .map(|value| format!("pre_deploy_on_fail = \"{value}\"\n"))
+        .unwrap_or_default();
+    format!(
+        "\n[targets.{target}.hooks]\npre_deploy = \"{}\"\n{on_fail}",
+        command.replace('"', "\\\""),
+    )
+}
+
+fn config_two_source_targets_with_pre_deploy_hooks(
+    alpha_url: &str,
+    beta_url: &str,
+    alpha_path: &Path,
+    beta_path: &Path,
+    alpha_hook: Option<(&str, Option<&str>)>,
+    beta_hook: Option<(&str, Option<&str>)>,
+) -> Config {
+    let alpha_hooks = pre_deploy_hook_table("alpha", alpha_hook);
+    let beta_hooks = pre_deploy_hook_table("beta", beta_hook);
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.sa]\ngit = \"{alpha_url}\"\nbranch = \"main\"\n\n\
+         [sources.sb]\ngit = \"{beta_url}\"\nbranch = \"main\"\n\n\
+         [targets.alpha]\npath = \"{}\"\nsources = [\"sa\"]\nlayout = \"flat\"\n\n\
+         [targets.beta]\npath = \"{}\"\nsources = [\"sb\"]\nlayout = \"flat\"\n\
+         {alpha_hooks}{beta_hooks}",
+        alpha_path.display(),
+        beta_path.display(),
+    );
+    Config::parse(&toml).expect("two-source target-hook config parses")
+}
+
+#[test]
+fn successful_earlier_target_hook_rechecks_later_target_without_a_hook() {
+    let (sa, url_a) = build_named_artifact_repo("alpha-art", "a.txt", b"from-alpha\n");
+    let (sb, url_b) = build_named_artifact_repo("beta-art", "b.txt", b"from-beta\n");
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let alpha = TargetDir::new();
+    let beta = TargetDir::new();
+    let alpha_dst = alpha.target_path().join("alpha-art");
+    let beta_dst = beta.target_path().join("beta-art");
+    let beta_local = beta_dst.join("created-by-alpha-hook.txt");
+    let hook = format!(
+        "mkdir -p '{}' && printf '%s' 'alpha hook value' > '{}'",
+        beta_dst.display(),
+        beta_local.display(),
+    );
+    let cfg = config_two_source_targets_with_pre_deploy_hooks(
+        &url_a,
+        &url_b,
+        &alpha.target_path(),
+        &beta.target_path(),
+        Some((&hook, None)),
+        None,
+    );
+
+    let out = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+        .expect("an unforced cross-target hook conflict retains skip semantics");
+
+    assert!(
+        !out.had_failures,
+        "skipping beta after alpha's successful hook creates Foreign content is not a failure"
+    );
+    assert!(
+        alpha_dst.join("a.txt").exists(),
+        "alpha remains deployable after its successful hook"
+    );
+    assert_eq!(
+        std::fs::read(&beta_local).ok(),
+        Some(b"alpha hook value".to_vec()),
+        "alpha's hook changed beta from Missing to Foreign; beta has no hook of its own but must \
+         still be reobserved and preserve the local value"
+    );
+    assert!(
+        !beta_dst.join("b.txt").exists(),
+        "beta must not deploy upstream content over alpha's hook side effect without --force"
+    );
+    assert!(
+        registry
+            .artifact(&artifact_key("beta", "sb", "beta-art"))
+            .expect("lookup beta after cross-target skip")
+            .is_none(),
+        "the skipped beta artifact must not gain a registry record"
+    );
+
+    drop(sa);
+    drop(sb);
+}
+
+#[test]
+fn failed_earlier_target_hook_with_skip_rechecks_later_target_side_effect() {
+    let (sa, url_a) = build_named_artifact_repo("alpha-art", "a.txt", b"from-alpha\n");
+    let (sb, url_b) = build_named_artifact_repo("beta-art", "b.txt", b"from-beta\n");
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let alpha = TargetDir::new();
+    let beta = TargetDir::new();
+    let alpha_dst = alpha.target_path().join("alpha-art");
+    let beta_dst = beta.target_path().join("beta-art");
+    let beta_local = beta_dst.join("left-by-failed-alpha-hook.txt");
+    let hook = format!(
+        "mkdir -p '{}' && printf '%s' 'failed hook value' > '{}' && exit 7",
+        beta_dst.display(),
+        beta_local.display(),
+    );
+    let cfg = config_two_source_targets_with_pre_deploy_hooks(
+        &url_a,
+        &url_b,
+        &alpha.target_path(),
+        &beta.target_path(),
+        Some((&hook, Some("skip"))),
+        None,
+    );
+
+    sync(&input(&cfg, None, None, None, false), &backend, &registry)
+        .expect("pre_deploy_on_fail=skip continues to later targets");
+
+    assert_eq!(
+        std::fs::read(&beta_local).ok(),
+        Some(b"failed hook value".to_vec()),
+        "a failed alpha hook can leave a real side effect before skip; beta must reobserve and \
+         preserve that Foreign value"
+    );
+    assert!(
+        !beta_dst.join("b.txt").exists(),
+        "beta must not trust its pre-hook Missing observation after alpha's failed hook"
+    );
+    assert!(
+        !alpha_dst.exists(),
+        "pre_deploy_on_fail=skip must skip alpha's own deployment"
+    );
+    assert!(
+        registry
+            .all_artifacts()
+            .expect("list artifact records after failed-hook skips")
+            .is_empty(),
+        "neither skipped target may mutate the artifact registry"
+    );
+
+    drop(sa);
+    drop(sb);
+}
+
+#[test]
+fn successful_hook_cannot_bless_modified_bytes_with_a_stale_metadata_refresh() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let plain =
+        config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+    let first = sync(
+        &input(&plain, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("first sync deploys the metadata-refresh fixture");
+    assert!(!first.had_failures, "premise: first deploy must succeed");
+
+    let key = artifact_key("dest", "editor-src", "editor");
+    let record_before = fx
+        .registry
+        .artifact(&key)
+        .expect("lookup record before metadata change")
+        .expect("first sync records the artifact");
+    let init_before = manifest_file(&record_before, "init.lua").clone();
+    let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+    let init = dst.join("init.lua");
+    let refreshed_mtime = init_before.mtime + 1000;
+    touch_to_mtime(&init, refreshed_mtime);
+    let mtime_reference = td.parent_path.join("mtime-reference");
+    std::fs::write(&mtime_reference, b"reference").expect("write mtime reference file");
+    touch_to_mtime(&mtime_reference, refreshed_mtime);
+
+    let before_hook = check_state_at(
+        &dst,
+        &fx.registry,
+        "dest",
+        "editor-src",
+        "editor",
+        &first_commit(&first),
+    );
+    assert!(
+        matches!(before_hook, ArtifactState::Revalidated { .. }),
+        "premise: changed mtime with identical bytes must classify as \
+         MetadataChangedButContentClean/Revalidated, got {before_hook:?}"
+    );
+
+    let hook = format!(
+        "printf '%s' 'changed!' > '{}' && touch -r '{}' '{}'",
+        init.display(),
+        mtime_reference.display(),
+        init.display(),
+    )
+    .replace('"', "\\\"");
+    let hooked = Config::parse(&format!(
+        "version = 1\n\n\
+         [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\"editor-src\"]\nlayout = \"flat\"\n\n\
+         [targets.dest.hooks]\npre_deploy = \"{hook}\"\n",
+        fx.url,
+        td.target_path().display(),
+    ))
+    .expect("metadata-refresh hook config parses");
+
+    let out = sync(
+        &input(&hooked, None, Some(first.base_lock.clone()), None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("an unforced metadata-clean-to-Modified transition retains skip semantics");
+    assert!(
+        !out.had_failures,
+        "skipping content modified by a successful pre_deploy hook is not a failure"
+    );
+    assert_eq!(
+        std::fs::read(&init).ok(),
+        Some(b"changed!".to_vec()),
+        "premise: the hook must leave its same-size modified bytes on disk"
+    );
+
+    let after_state = check_state_at(
+        &dst,
+        &fx.registry,
+        "dest",
+        "editor-src",
+        "editor",
+        &first_commit(&first),
+    );
+    assert!(
+        matches!(after_state, ArtifactState::Modified { .. }),
+        "the hook changed bytes while restoring the refreshed size+mtime; a stale metadata \
+         refresh must not bless those bytes as Clean, got {after_state:?}"
+    );
+    assert_eq!(
+        fx.registry
+            .artifact(&key)
+            .expect("lookup record after hook-modified metadata refresh"),
+        Some(record_before),
+        "the conflict skip must leave the pre-hook artifact record byte-identical"
+    );
+}
+
+#[test]
+fn later_target_post_hook_abort_leaves_earlier_target_and_registry_untouched() {
+    let (sa, url_a) = build_named_artifact_repo("alpha-art", "a.txt", b"from-alpha\n");
+    let (sb, url_b) = build_named_artifact_repo("beta-art", "b.txt", b"from-beta\n");
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let alpha = TargetDir::new();
+    let beta = TargetDir::new();
+    let alpha_dst = alpha.target_path().join("alpha-art");
+    let beta_dst = beta.target_path().join("beta-art");
+    let beta_local = beta_dst.join("created-before-abort.txt");
+    let hook = format!(
+        "mkdir -p '{}' && printf '%s' 'beta hook value' > '{}'",
+        beta_dst.display(),
+        beta_local.display(),
+    );
+    let cfg = config_two_source_targets_with_pre_deploy_hooks(
+        &url_a,
+        &url_b,
+        &alpha.target_path(),
+        &beta.target_path(),
+        None,
+        Some((&hook, None)),
+    );
+    let records_before = registry
+        .all_artifacts()
+        .expect("snapshot empty artifact registry before abort");
+    let resolver = ScriptedResolver::new(Resolution::Abort);
+
+    let result = sync(
+        &interactive_input(&cfg, None, &resolver),
+        &backend,
+        &registry,
+    );
+
+    let Err(error) = result else {
+        panic!("beta's post-hook Foreign conflict resolved as Abort must abort the whole run");
+    };
+    assert!(
+        matches!(error, Error::Aborted),
+        "the post-hook conflict must surface Error::Aborted, got {error:?}"
+    );
+    assert_eq!(
+        resolver.consulted(),
+        1,
+        "only beta's hook-created Foreign conflict requires a decision"
+    );
+    assert_eq!(
+        resolver.last_conflict().target,
+        "beta",
+        "the post-hook conflict must identify the later beta target"
+    );
+    assert!(
+        !alpha_dst.exists(),
+        "whole-run Abort atomicity: alpha must not deploy before beta's post-hook conflict is \
+         resolved"
+    );
+    assert_eq!(
+        std::fs::read(&beta_local).ok(),
+        Some(b"beta hook value".to_vec()),
+        "Abort must not roll back or overwrite the external side effect that exposed the conflict"
+    );
+    assert!(
+        !beta_dst.join("b.txt").exists(),
+        "beta's upstream content must not deploy after its conflict resolves Abort"
+    );
+    assert_aborted_zero_mutation(
+        &registry,
+        &records_before,
+        &[("alpha", &alpha), ("beta", &beta)],
+    );
+
+    drop(sa);
+    drop(sb);
 }
 
 #[test]
@@ -12457,6 +13083,260 @@ fn fast_forward_deletes_an_artifact_the_new_commit_dropped() {
         "fast-forward must drop the record for the upstream-removed artifact",
     );
     drop(src);
+}
+
+fn prepare_real_pending_fast_forward_drop(
+    fx: &SyncFixture,
+    target: &TargetDir,
+) -> (PathBuf, Vec<ArtifactRecord>) {
+    let initial =
+        config_one_source_one_target("editor-src", &fx.url, "dest", &target.target_path(), "flat");
+    let first = sync(
+        &input(&initial, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("initial sync deploys genuine records before the upstream drop");
+    assert!(!first.had_failures, "premise: initial deploy must succeed");
+
+    let stale_dst = target.target_path().join("editor");
+    assert_eq!(
+        std::fs::read(stale_dst.join("init.lua")).ok(),
+        Some(b"-- init\n".to_vec()),
+        "premise: the soon-to-be-dropped editor artifact is genuinely deployed"
+    );
+    assert!(
+        fx.registry
+            .artifact(&artifact_key("dest", "editor-src", "editor"))
+            .expect("lookup editor before upstream drop")
+            .is_some(),
+        "premise: the initial deploy creates a real editor registry record"
+    );
+
+    std::fs::remove_dir_all(fx.src.path().join("editor"))
+        .expect("remove editor from the source working tree");
+    run_git(fx.src.path(), &["add", "-A"]);
+    run_git(fx.src.path(), &["commit", "-m", "drop editor"]);
+    let new_head = rev_parse(fx.src.path(), "HEAD");
+    assert_ne!(
+        new_head,
+        first_commit(&first),
+        "premise: the source pin must advance to the commit that dropped editor"
+    );
+
+    let records = fx
+        .registry
+        .all_artifacts()
+        .expect("snapshot genuine records before fast-forward");
+    (stale_dst, records)
+}
+
+fn config_pending_drop_with_later_target(
+    dropped_url: &str,
+    later_url: &str,
+    dropped_target: &Path,
+    later_target: &Path,
+    later_pre_deploy: Option<&str>,
+    pre_sync: Option<&str>,
+) -> Config {
+    let later_hooks =
+        pre_deploy_hook_table("later", later_pre_deploy.map(|command| (command, None)));
+    let global_hooks = pre_sync
+        .map(|command| {
+            format!(
+                "\n[hooks]\npre_sync = \"{}\"\n",
+                command.replace('"', "\\\"")
+            )
+        })
+        .unwrap_or_default();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.editor-src]\ngit = \"{dropped_url}\"\nbranch = \"main\"\n\n\
+         [sources.later-src]\ngit = \"{later_url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\"editor-src\"]\nlayout = \"flat\"\n\n\
+         [targets.later]\npath = \"{}\"\nsources = [\"later-src\"]\nlayout = \"flat\"\n\
+         {later_hooks}{global_hooks}",
+        dropped_target.display(),
+        later_target.display(),
+    );
+    Config::parse(&toml).expect("pending-drop gate config parses")
+}
+
+#[test]
+fn fast_forward_drop_waits_for_later_post_hook_conflict_abort_before_mutating() {
+    let fx = build_sync_fixture();
+    let dropped_target = TargetDir::new();
+    let (stale_dst, records_before) = prepare_real_pending_fast_forward_drop(&fx, &dropped_target);
+    let editor_record_before = fx
+        .registry
+        .artifact(&artifact_key("dest", "editor-src", "editor"))
+        .expect("lookup editor before abort")
+        .expect("pending drop retains its real editor record");
+
+    let (later_src, later_url) =
+        build_named_artifact_repo("later-art", "later.txt", b"from-later\n");
+    let later_target = TargetDir::new();
+    let later_dst = later_target.target_path().join("later-art");
+    let hook_value = later_dst.join("created-before-abort.txt");
+    let hook = format!(
+        "mkdir -p '{}' && printf '%s' 'later hook value' > '{}'",
+        later_dst.display(),
+        hook_value.display(),
+    );
+    let cfg = config_pending_drop_with_later_target(
+        &fx.url,
+        &later_url,
+        &dropped_target.target_path(),
+        &later_target.target_path(),
+        Some(&hook),
+        None,
+    );
+    let resolver = ScriptedResolver::new(Resolution::Abort);
+    let mut request = interactive_input(&cfg, None, &resolver);
+    request.fast_forward = true;
+
+    let result = sync(&request, &fx.backend, &fx.registry);
+
+    let Err(error) = result else {
+        panic!("the later hook-created Foreign conflict resolved as Abort must abort the run");
+    };
+    assert!(
+        matches!(error, Error::Aborted),
+        "the later post-hook conflict must surface Error::Aborted, got {error:?}"
+    );
+    assert_eq!(
+        resolver.consulted(),
+        1,
+        "only the later target's hook-created Foreign artifact requires resolution"
+    );
+    let conflict = resolver.last_conflict();
+    assert_eq!(
+        (
+            conflict.target.as_str(),
+            conflict.source.as_str(),
+            conflict.artifact.as_str(),
+        ),
+        ("later", "later-src", "later-art"),
+        "the sole conflict must retain the later target/source/artifact identity"
+    );
+    assert_eq!(
+        std::fs::read(stale_dst.join("init.lua")).ok(),
+        Some(b"-- init\n".to_vec()),
+        "fast-forward may plan the upstream drop, but the stale artifact bytes must survive a \
+         later Abort byte-identically"
+    );
+    assert_eq!(
+        fx.registry
+            .artifact(&artifact_key("dest", "editor-src", "editor"))
+            .expect("lookup editor after abort"),
+        Some(editor_record_before),
+        "the pending-drop registry record must survive the later Abort byte-identically"
+    );
+    assert_eq!(
+        std::fs::read(&hook_value).ok(),
+        Some(b"later hook value".to_vec()),
+        "premise: the later hook ran and exposed the conflict that aborted the run"
+    );
+    assert!(
+        !later_dst.join("later.txt").exists(),
+        "no later target deployment may occur once its conflict resolves Abort"
+    );
+    assert_aborted_zero_mutation(
+        &fx.registry,
+        &records_before,
+        &[("dest", &dropped_target), ("later", &later_target)],
+    );
+
+    drop(later_src);
+}
+
+#[test]
+fn fast_forward_drop_waits_for_failing_pre_sync_before_mutating() {
+    let fx = build_sync_fixture();
+    let dropped_target = TargetDir::new();
+    let (stale_dst, records_before) = prepare_real_pending_fast_forward_drop(&fx, &dropped_target);
+    let editor_record_before = fx
+        .registry
+        .artifact(&artifact_key("dest", "editor-src", "editor"))
+        .expect("lookup editor before pre_sync")
+        .expect("pending drop retains its real editor record");
+
+    let (later_src, later_url) =
+        build_named_artifact_repo("later-art", "later.txt", b"from-later\n");
+    let later_target = TargetDir::new();
+    let pre_sync_log = dropped_target.parent_path.join("pre-sync.log");
+    let failing_gate = append_then_fail_cmd(&pre_sync_log, "ran");
+    let cfg = config_pending_drop_with_later_target(
+        &fx.url,
+        &later_url,
+        &dropped_target.target_path(),
+        &later_target.target_path(),
+        None,
+        Some(&failing_gate),
+    );
+    let mut request = input(&cfg, None, None, None, false);
+    request.fast_forward = true;
+
+    let out = sync(&request, &fx.backend, &fx.registry)
+        .expect("a failed pre_sync gate is reported through the sync output");
+
+    assert!(
+        out.had_failures,
+        "a non-zero pre_sync gate must mark the overall sync output failed"
+    );
+    assert_eq!(
+        out.hook_results.len(),
+        1,
+        "the aborting run must report exactly the single configured pre_sync hook outcome"
+    );
+    let failed_gate = &out.hook_results[0];
+    assert_eq!(
+        (failed_gate.scope, failed_gate.status),
+        (HookScope::PreSync, HookStatus::Failure),
+        "the sole hook outcome must report a failed pre_sync gate"
+    );
+    assert!(
+        failed_gate.command.contains("ran")
+            && failed_gate
+                .command
+                .contains(&pre_sync_log.display().to_string())
+            && failed_gate.command.contains("exit 7"),
+        "the failed pre_sync outcome must identify the configured marker, log path, and exit; \
+         got {:?}",
+        failed_gate.command
+    );
+
+    assert_eq!(
+        log_lines(&pre_sync_log),
+        vec!["ran".to_owned()],
+        "premise: the failing pre_sync gate must run exactly once"
+    );
+    assert_eq!(
+        std::fs::read(stale_dst.join("init.lua")).ok(),
+        Some(b"-- init\n".to_vec()),
+        "a failing pre_sync gate must leave the planned fast-forward drop's bytes byte-identical"
+    );
+    assert_eq!(
+        fx.registry
+            .artifact(&artifact_key("dest", "editor-src", "editor"))
+            .expect("lookup editor after pre_sync failure"),
+        Some(editor_record_before),
+        "a failing pre_sync gate must leave the pending-drop registry record byte-identical"
+    );
+    assert!(
+        !later_target
+            .target_path()
+            .join("later-art/later.txt")
+            .exists(),
+        "no target deployment may occur after pre_sync fails"
+    );
+    assert_aborted_zero_mutation(
+        &fx.registry,
+        &records_before,
+        &[("dest", &dropped_target), ("later", &later_target)],
+    );
+
+    drop(later_src);
 }
 
 #[test]
