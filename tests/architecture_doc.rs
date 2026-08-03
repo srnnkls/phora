@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 
@@ -369,9 +369,8 @@ fn task_numbers(text: &str) -> Vec<u32> {
     out
 }
 
-fn rs_path(cell: &str) -> Option<String> {
+fn rs_path_at(cell: &str, idx: usize) -> Option<String> {
     let bytes = cell.as_bytes();
-    let idx = cell.find(".rs")?;
     let end = idx + 3;
     if end < bytes.len() && bytes[end].is_ascii_alphanumeric() {
         return None;
@@ -392,6 +391,16 @@ fn rs_path(cell: &str) -> Option<String> {
     Some(token.to_string())
 }
 
+fn rs_paths(cell: &str) -> Vec<String> {
+    cell.match_indices(".rs")
+        .filter_map(|(idx, _)| rs_path_at(cell, idx))
+        .collect()
+}
+
+fn rs_path(cell: &str) -> Option<String> {
+    rs_paths(cell).into_iter().next()
+}
+
 fn referenced_test_file(row: &[String]) -> Option<PathBuf> {
     for cell in row {
         if let Some(rel) = rs_path(cell) {
@@ -399,6 +408,111 @@ fn referenced_test_file(row: &[String]) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn referenced_test_paths(row: &[String]) -> Vec<String> {
+    row.iter().flat_map(|cell| rs_paths(cell)).collect()
+}
+
+fn traceability_rows_by_item() -> BTreeMap<u32, Vec<String>> {
+    table_rows(&traceability_region(&read_doc()))
+        .into_iter()
+        .filter_map(|row| {
+            let item = row.first().and_then(|cell| leading_number(cell))?;
+            (1..=DOD_ITEM_COUNT).contains(&item).then_some((item, row))
+        })
+        .collect()
+}
+
+fn relevant_task_ids(item: u32) -> &'static [u32] {
+    match item {
+        1 => &[6, 11, 20, 31],
+        2 => &[30],
+        3 => &[7, 9],
+        4 => &[5, 8, 9],
+        5 => &[5, 13, 16, 29],
+        6 => &[12],
+        7 => &[13, 30],
+        8 => &[15, 16],
+        9 => &[8, 9, 20],
+        10 => &[17, 18],
+        11 => &[18],
+        12 => &[20, 21],
+        13 => &[18, 19],
+        14 => &[17, 25],
+        15 => &[22, 24],
+        16 => &[27, 28],
+        17 => &[2, 3, 4, 10, 16, 21, 24, 26, 28],
+        18 => &[5, 31],
+        19 | 20 => &[31],
+        _ => &[],
+    }
+}
+
+fn relevant_test_paths(item: u32) -> &'static [&'static str] {
+    match item {
+        1 | 2 | 19 => &["tests/final_architecture.rs"],
+        3..=5 | 18 => &["tests/arch_check.rs"],
+        6 => &[
+            "tests/source_snapshot_contract.rs",
+            "tests/source_snapshot_gate.rs",
+            "tests/source_compat_contract.rs",
+        ],
+        7 => &["tests/source_layout.rs"],
+        8 => &["tests/compat_staging.rs", "tests/stage_deletion_gate.rs"],
+        9 => &[
+            "tests/projection_contract.rs",
+            "tests/projection_contract_gate.rs",
+        ],
+        10 | 11 | 13 => &[
+            "tests/reconcile_matrix_contract.rs",
+            "tests/reconcile_matrix_gate.rs",
+        ],
+        12 => &["tests/compat_serialized.rs", "tests/orchestration_gate.rs"],
+        14 => &["tests/state_store_contract.rs", "tests/state_store_gate.rs"],
+        15 => &[
+            "tests/compat_recovery.rs",
+            "tests/deploy_relocation_gate.rs",
+        ],
+        16 => &["tests/sync_request_contract.rs", "tests/compat_cli.rs"],
+        17 | 20 => &["tests/compat_serialized.rs"],
+        _ => &[],
+    }
+}
+
+fn required_test_paths(item: u32) -> &'static [&'static str] {
+    match item {
+        17 => &[
+            "tests/compat_serialized.rs",
+            "tests/compat_recovery.rs",
+            "tests/compat_cli.rs",
+        ],
+        20 => &[
+            "tests/compat_serialized.rs",
+            "tests/compat_staging.rs",
+            "tests/compat_recovery.rs",
+            "tests/compat_cli.rs",
+        ],
+        _ => &[],
+    }
+}
+
+fn fenced_blocks(doc: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut current = Vec::new();
+    let mut in_fence = false;
+    for line in doc.lines() {
+        if line.trim_start().starts_with("```") {
+            if in_fence {
+                blocks.push(current.join("\n"));
+                current.clear();
+            }
+            in_fence = !in_fence;
+        } else if in_fence {
+            current.push(line);
+        }
+    }
+    blocks
 }
 
 struct Traceability {
@@ -522,6 +636,41 @@ fn documents_module_placement_rule() {
 }
 
 #[test]
+fn t031_documents_the_capability_chain_in_an_architecture_diagram() {
+    let has_diagram = fenced_blocks(&read_doc()).into_iter().any(|block| {
+        let compact: String = block
+            .to_lowercase()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let source_to_projection = [
+            "source->projection",
+            "source-->projection",
+            "source→projection",
+            "source──►projection",
+        ]
+        .iter()
+        .any(|edge| compact.contains(edge));
+        let projection_to_sync = [
+            "projection->sync",
+            "projection-->sync",
+            "projection→sync",
+            "projection──►sync",
+        ]
+        .iter()
+        .any(|edge| compact.contains(edge));
+        source_to_projection && projection_to_sync
+    });
+
+    assert!(
+        has_diagram,
+        "docs/architecture.md must contain a fenced text or Mermaid architecture diagram with \
+         directed source -> projection and projection -> sync edges; prose naming the modules is \
+         not a durable substitute for the requested end-state diagram"
+    );
+}
+
+#[test]
 fn traceability_table_maps_every_dod_item_to_task_and_test() {
     let analysis = analyze_traceability();
     let missing: Vec<u32> = (1..=DOD_ITEM_COUNT)
@@ -558,6 +707,107 @@ fn traceability_table_cites_multiple_distinct_test_files() {
          whose rows all point at one trivially-existing path proves no real coverage; found {}: {:?}",
         analysis.distinct_test_files.len(),
         analysis.distinct_test_files
+    );
+}
+
+#[test]
+fn t031_traceability_rows_cite_relevant_tasks_and_pinning_tests() {
+    let rows = traceability_rows_by_item();
+    let mut problems = Vec::new();
+    for item in 1..=DOD_ITEM_COUNT {
+        let Some(row) = rows.get(&item) else {
+            problems.push(format!("DoD {item}: row missing"));
+            continue;
+        };
+
+        let cited_tasks = row
+            .iter()
+            .flat_map(|cell| task_numbers(cell))
+            .collect::<BTreeSet<_>>();
+        let expected_tasks = relevant_task_ids(item);
+        if !expected_tasks.iter().any(|task| cited_tasks.contains(task)) {
+            problems.push(format!(
+                "DoD {item}: tasks {cited_tasks:?} do not include a delivering task from {expected_tasks:?}"
+            ));
+        }
+
+        let cited_paths = referenced_test_paths(row);
+        let expected_paths = relevant_test_paths(item);
+        let missing_cited_on_disk: Vec<&str> = cited_paths
+            .iter()
+            .map(String::as_str)
+            .filter(|path| {
+                !PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join(*path)
+                    .is_file()
+            })
+            .collect();
+        if !missing_cited_on_disk.is_empty() {
+            problems.push(format!(
+                "DoD {item}: cited test paths do not exist on disk: {missing_cited_on_disk:?}"
+            ));
+        }
+
+        let nonexistent_accepted: Vec<&str> = expected_paths
+            .iter()
+            .chain(required_test_paths(item).iter())
+            .copied()
+            .filter(|path| {
+                !PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join(*path)
+                    .is_file()
+            })
+            .collect();
+        if !nonexistent_accepted.is_empty() {
+            problems.push(format!(
+                "DoD {item}: relevance oracle accepts test paths absent from disk: {nonexistent_accepted:?}"
+            ));
+        }
+
+        if !cited_paths
+            .iter()
+            .any(|path| expected_paths.contains(&path.as_str()))
+        {
+            problems.push(format!(
+                "DoD {item}: tests {cited_paths:?} do not include a relevant pin from {expected_paths:?}"
+            ));
+        }
+
+        let missing_required: Vec<&str> = required_test_paths(item)
+            .iter()
+            .copied()
+            .filter(|required| !cited_paths.iter().any(|path| path == *required))
+            .collect();
+        if !missing_required.is_empty() {
+            problems.push(format!(
+                "DoD {item}: broad compatibility requirement is missing test paths {missing_required:?}"
+            ));
+        }
+
+        if item == 20 {
+            let text = row.join(" ").to_lowercase();
+            let missing_commands: Vec<&str> = [
+                ("cargo test", "cargo test"),
+                ("cargo clippy", "cargo clippy"),
+                ("cargo fmt --check", "cargo fmt --check"),
+                ("integration suites", "integration"),
+            ]
+            .into_iter()
+            .filter_map(|(label, needle)| (!text.contains(needle)).then_some(label))
+            .collect();
+            if !missing_commands.is_empty() {
+                problems.push(format!(
+                    "DoD 20: verification gate is missing {missing_commands:?}"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        problems.is_empty(),
+        "the DoD traceability table must cite tests that actually pin each requirement, not \
+         merely any existing tests/*.rs path:\n{}",
+        problems.join("\n")
     );
 }
 

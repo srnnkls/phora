@@ -13,6 +13,12 @@ structure is calculated, and machine state is reconciled to match it.
 The crate's capability chain is **source → projection → sync**, and this is the
 architectural decision that governs where every responsibility lives.
 
+```mermaid
+flowchart LR
+    source --> projection
+    projection --> sync
+```
+
 - *source* obtains immutable content. Given a Git, HTTP, or worktree origin it
   resolves a snapshot and exposes an inventory of entries and their bytes. It
   performs source and cache I/O only.
@@ -114,26 +120,26 @@ the end of the migration.
 
 | DoD | Requirement (plan §16) | Task | Pinning test |
 | --- | --- | --- | --- |
-| 1 | source, projection, and sync are the three capability modules | T006 | tests/golden.rs |
-| 2 | no top-level backend, deploy, store, or kernel | T030 | tests/golden.rs |
-| 3 | projection performs no I/O | T007 | tests/compat_serialized.rs |
-| 4 | projection imports no config DTOs or source traits | T009 | tests/compat_serialized.rs |
-| 5 | source imports no projection, sync-state, target-path, template-policy, or manifest types | T013 / T016 / T029 | tests/transitive_resolve.rs |
-| 6 | every Git, HTTP, and worktree source resolves to a snapshot abstraction | T012 | tests/digest_pin.rs |
-| 7 | SourceBackend and unsupported default methods are gone | T013 / T030 | tests/http_redirect_scheme.rs |
-| 8 | target-specific rendering and manifest generation live under sync | T015 | tests/golden.rs |
-| 9 | desired state is represented by a Projection | T020 | tests/compat_serialized.rs |
-| 10 | current machine state is represented by ObservedProjectState | T017 | tests/project_identity.rs |
-| 11 | pending work is represented by a ChangeSet | T018 | tests/golden.rs |
-| 12 | preview, sync, and prune share the same projected artifact identities | T021 | tests/compat_serialized.rs |
-| 13 | drift classification after inspection is pure | T019 | tests/golden.rs |
-| 14 | state records, ejections, hooks, and locking live under sync::state | T025 | tests/lock_contention.rs |
-| 15 | journaling and recovery live under sync | T022 | tests/frozen_readonly.rs |
-| 16 | the CLI constructs dependencies, renders reports, and maps exit codes, but does not implement sync behavior | T027 | tests/exit_code.rs |
-| 17 | existing config, lock, registry, journal, digest, and CLI behavior remains compatible | T002 / T004 | tests/migration_warnings.rs |
-| 18 | architecture checks prevent forbidden dependencies | T005 | tests/doc_invariants.rs |
-| 19 | crate-level documentation describes the feature-oriented architecture | T031 | tests/doc_invariants.rs |
-| 20 | all compatibility fixtures, unit tests, integration suites, Clippy, and formatting checks pass | T031 | tests/compat_serialized.rs |
+| 1 | source, projection, and sync are the three capability modules | T031 | tests/final_architecture.rs |
+| 2 | no top-level backend, deploy, store, or kernel | T030 | tests/final_architecture.rs |
+| 3 | projection performs no I/O | T007 | tests/arch_check.rs |
+| 4 | projection imports no config DTOs or source traits | T009 | tests/arch_check.rs |
+| 5 | source imports no projection, sync-state, target-path, template-policy, or manifest types | T029 | tests/arch_check.rs |
+| 6 | every Git, HTTP, and worktree source resolves to a snapshot abstraction | T012 | tests/source_snapshot_contract.rs; tests/source_snapshot_gate.rs; tests/source_compat_contract.rs |
+| 7 | SourceBackend and unsupported default methods are gone | T030 | tests/source_layout.rs |
+| 8 | target-specific rendering and manifest generation live under sync | T016 | tests/compat_staging.rs; tests/stage_deletion_gate.rs |
+| 9 | desired state is represented by a Projection | T020 | tests/projection_contract.rs; tests/projection_contract_gate.rs |
+| 10 | current machine state is represented by ObservedProjectState | T017 | tests/reconcile_matrix_contract.rs; tests/reconcile_matrix_gate.rs |
+| 11 | pending work is represented by a ChangeSet | T018 | tests/reconcile_matrix_contract.rs; tests/reconcile_matrix_gate.rs |
+| 12 | preview, sync, and prune share the same projected artifact identities | T021 | tests/compat_serialized.rs; tests/orchestration_gate.rs |
+| 13 | drift classification after inspection is pure | T019 | tests/reconcile_matrix_contract.rs; tests/reconcile_matrix_gate.rs |
+| 14 | state records, ejections, hooks, and locking live under sync::state | T025 | tests/state_store_contract.rs; tests/state_store_gate.rs |
+| 15 | journaling and recovery live under sync | T022 | tests/compat_recovery.rs; tests/deploy_relocation_gate.rs |
+| 16 | the CLI constructs dependencies, renders reports, and maps exit codes, but does not implement sync behavior | T027 | tests/sync_request_contract.rs; tests/compat_cli.rs |
+| 17 | existing config, lock, registry, journal, digest, and CLI behavior remains compatible | T002 / T004 / T024 / T028 | tests/compat_serialized.rs; tests/compat_recovery.rs; tests/compat_cli.rs |
+| 18 | architecture checks prevent forbidden dependencies | T031 | tests/arch_check.rs |
+| 19 | crate-level documentation describes the feature-oriented architecture | T031 | tests/final_architecture.rs |
+| 20 | `cargo test`, `cargo clippy`, `cargo fmt --check`, and the integration suites pass, including all compatibility fixtures and unit tests | T031 | tests/compat_serialized.rs; tests/compat_staging.rs; tests/compat_recovery.rs; tests/compat_cli.rs |
 
 ## SourceBackend caller-migration table
 

@@ -1,8 +1,9 @@
-//! Phora: a git-based artifact package manager.
-//!
-//! Compatibility is guaranteed for the command-line interface and serialized
-//! configuration, lock, journal, and state formats. The Rust library API is
-//! intentionally unstable and may change between releases.
+//! Phora is organized as source → projection → sync.
+//! Source obtains immutable content.
+//! Projection is a pure, I/O-free calculation of desired target structure.
+//! Sync is the sole owner of target-side machine state.
+//! Compatibility is guaranteed for the command-line interface and all serialized formats.
+//! The Rust library API is intentionally unstable and may change between releases.
 
 #![expect(
     clippy::missing_errors_doc,
