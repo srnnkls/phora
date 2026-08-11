@@ -1,9 +1,9 @@
 # phora, by use case
 
-Start with the situation that matches yours; the sections are independent. Each
-full recipe states its limits and then gives a working configuration, and the
-final catalogue only sketches smaller fits. Use the [README](README.md) for
-reference and the [guide](GUIDE.md) for internals.
+Start with the situation that matches yours; the sections are independent. Every
+full recipe puts its limits first and a working configuration after. The closing
+catalogue only sketches smaller fits. Use the [README](README.md) for reference
+and the [guide](GUIDE.md) for internals.
 
 ## Contents
 
@@ -17,11 +17,11 @@ reference and the [guide](GUIDE.md) for internals.
 
 ## Dotfiles
 
-You keep one directory per tool in a dotfiles repository and want a pinned
-source version deployed under `~/.config` on every machine, with drift
-detection. Before migrating, note that phora deploys copies by default and
-provides no secret storage, encryption, or automatic machine facts; if those are
-central, use [dotter](https://github.com/SuperCuber/dotter) or
+A dotfiles repository, one directory per tool. Every machine should get that
+same pinned version under `~/.config`, and you want to hear about it when a
+deployed copy drifts. Before migrating: phora deploys copies by default, and it
+has no secret storage, no encryption, and no machine facts gathered for you. If
+those are central, use [dotter](https://github.com/SuperCuber/dotter) or
 [chezmoi](https://www.chezmoi.io) instead.
 
 ```
@@ -49,9 +49,8 @@ sources = ["dotfiles"]
 
 Selection belongs to the source. A source's `root`, `include`, and `exclude`
 decide what it puts on *offer*; a target's binding may subset that offer but
-never widen it. Here the offer is the four named directories, so the repo's
-loose root files never leave the repository, and `phora list` reports one
-artifact per directory:
+never widen it. Here the offer is the four named directories. The repo's loose
+root files never leave it, and `phora list` reports one artifact per directory:
 
 ```
 config:
@@ -62,7 +61,7 @@ config:
 ```
 
 When a destination does not sit under a shared parent, give it its own source
-with a `root`. That re-anchors the offer at the subtree, so its contents land
+with a `root`. That re-anchors the offer at the subtree: its contents land
 directly at the target path rather than one directory deeper:
 
 ```toml
@@ -76,12 +75,12 @@ path = "~/.config/nvim"
 sources = ["nvim"]
 ```
 
-Several sources naming the same repository share a single mirror, so the second
-one costs a lock entry rather than a second clone.
+Several sources naming the same repository share a single mirror; the second one
+costs a lock entry rather than a second clone.
 
-`phora sync` deploys everything and `phora.lock` pins the commit, so this
-non-templated configuration produces byte-identical files on another machine.
-Template outputs can differ when local variables differ, as described below.
+`phora sync` deploys everything; `phora.lock` pins the commit. Nothing here is
+templated, so another machine gets byte-identical files. Template outputs can
+differ when local variables differ, as described below.
 When you change something upstream, `phora update` pulls it forward —
 deliberately, not as a side effect of some other command.
 
@@ -102,7 +101,7 @@ branch that drifts from `main` forever.
 
 Per-machine *values* — as opposed to per-machine files — live in `[vars]`. A
 source file whose name ends in `.tmpl` is rendered with the effective variables
-and deployed with the suffix stripped, so `git/config.tmpl` in the repository
+and deployed with the suffix stripped: `git/config.tmpl` in the repository
 becomes `git/config` in the target:
 
 ```toml
@@ -121,7 +120,7 @@ git_email = "me@work.example"
 
 The lock hashes the source bytes, so two machines rendering different values
 still produce byte-identical lock files. The registry hashes the rendered
-bytes, so each machine verifies clean against what it actually deployed.
+bytes, and each machine verifies clean against what it actually deployed.
 Editing a variable re-renders on the next sync without advancing any commit.
 
 Post-install steps run as hooks. A target's `on_change` fires once after a sync
@@ -134,9 +133,9 @@ on_change = "fc-cache -f"
 
 A no-op sync runs nothing. A hook that exits non-zero fails the sync, leaves
 the deployed files in place, and re-fires on the next sync rather than being
-recorded as done. If you need a check that runs *before* anything is written,
-use `pre_deploy` instead: every target's gate runs ahead of every deploy, so a
-failure under the default `abort` leaves the whole run unapplied rather than
+recorded as done. For a check that has to run before anything is written, use
+`pre_deploy` instead. Every target's gate runs ahead of every deploy; under the
+default `abort`, a failure leaves the whole run unapplied rather than
 half-applied.
 
 While you are actively editing a config, the copy model can feel slow — change,
@@ -154,11 +153,11 @@ deploy = "link"
 
 A source `path` is used verbatim as the remote, so write it out in full — `~`
 expands in a target `path`, not in a source's. The artifact destinations become
-symlinks into your working tree, so edits are visible immediately with no
-re-sync. `phora add --symlink ~/dev/dotfiles` writes that block for you, with
-the shell expanding the path and phora naming the source after the directory —
-which is what makes it override the source of the same name. Delete the overlay
-and the next sync puts a verifiable copy back.
+symlinks into your working tree; edits are visible immediately, no re-sync.
+`phora add --symlink ~/dev/dotfiles` writes that block for you, with the shell
+expanding the path and phora naming the source after the directory — which is
+what makes it override the source of the same name. Delete the overlay and the
+next sync puts a verifiable copy back.
 
 ### Where phora stops
 
@@ -222,16 +221,16 @@ sources = ["configs"]
 ```
 
 This consumer takes only `lint` and `editor`; the `ci` bundle is not deployed.
-The selected directories land as `etc/lint` and `etc/editor`, so this recipe
-works only for tools configured to read those paths. Root-level files such as
+The selected directories land as `etc/lint` and `etc/editor`, which limits the
+recipe to tools you can configure to read those paths. Root-level files such as
 `.editorconfig` and files required under `.github/workflows` need separate
 targets and, where necessary, binding renames.
 
 Updates are explicit and per repo. Each consumer has its own lock, so a new
 `v8` of the lint rules rolls out one repository at a time, as a reviewable diff
 (`phora update && git diff`), not as a surprise to whoever pushes next. A repo
-that is not ready simply stays on `v7` — pinning *is* the mechanism, not a
-workaround. State is keyed by the project directory, so two checkouts of the
+that is not ready simply stays on `v7`; the pin is doing its job, not being
+worked around. State is keyed by the project directory, so two checkouts of the
 same repository on one machine track their deployments independently.
 
 `phora verify` in CI detects hand edits to files phora deployed and fails the
@@ -257,12 +256,12 @@ current = { source = "configs" }              # inherits the source's v7
 next    = { source = "configs", tag = "v8" }
 ```
 
-The two identities become the directory labels under `by-source`, so
-`etc/current/lint` and `etc/next/lint` cannot collide, and the difference is a
-plain `diff` between two directories. One mirror serves both; the lock carries
-one entry per distinct ref. When the canary holds up, move the source's tag
-forward, drop back to a single bare binding, and `phora sync --prune` reclaims
-the artifacts the config no longer names.
+The two identities become the directory labels under `by-source`.
+`etc/current/lint` and `etc/next/lint` cannot collide, and the difference
+between the rule sets is a plain `diff` between two directories. One mirror
+serves both; the lock carries one entry per distinct ref. When the canary holds
+up, move the source's tag forward, drop back to a single bare binding, and
+`phora sync --prune` reclaims the artifacts the config no longer names.
 
 Upstream removals are not silent. If a directory you were taking disappears
 from the new commit, `phora update` stops and says so, naming the recorded
@@ -277,10 +276,10 @@ has left the shared set.
 
 ## Pinned agent skills across projects
 
-You have accumulated Claude Code skills and want each project and machine to
-receive an explicitly chosen, pinned set instead of another copy-paste fork.
-phora treats skill files as opaque bytes: it does not validate them or prove
-that an agent loads or follows them.
+Claude Code skills accumulate, and every project ends up with its own copy-paste
+fork of them. What each project and machine should get instead is an explicitly
+chosen, pinned set. phora treats skill files as opaque bytes: it does not
+validate them or prove that an agent loads or follows them.
 
 Keep the artifacts in one repository, one directory per skill:
 
@@ -385,33 +384,33 @@ layout = "flat"
 A url source is fetched once and imported; it takes no `branch`, `tag`, `rev`,
 or `root`, because there is no history to point at. Compared with `curl | tar`:
 
-- The digest is checked against the raw bytes before extraction, so a corrupted
-  or substituted download never touches your tree.
-- Archive entries are validated path by path, so a malicious archive cannot
-  write outside the target.
+- The digest is checked against the raw bytes before extraction; a corrupted or
+  substituted download never touches your tree.
+- Archive entries are validated path by path. A malicious archive cannot write
+  outside the target.
 - A single top-level directory is stripped automatically, so the version-stamped
   wrapper that release tarballs commonly carry does not reshuffle your paths
-  when the version moves. An archive whose payload sits at the root, as fzf's
-  does, needs nothing special either way.
-- The executable bit survives, so the deployed `fzf` is runnable.
-- The content is recorded in the lock and the registry: `phora list` tells you
-  what is deployed, `phora where` tells you where a binary came from, and
-  `phora verify` tells you it has not been tampered with since.
+  when the version moves. fzf's payload sits at the root and needs nothing
+  special either way.
+- The executable bit survives. The deployed `fzf` runs.
+- Lock and registry both record the content: `phora list` names what is
+  deployed, `phora where` traces a binary back to where it came from, and
+  `phora verify` catches any tampering since.
 
-Upgrading is editing the URL and the digest and running `phora update`. A plain
-`sync` deliberately does not reach for the network — it honors the lock — so
-`update` is the command that re-downloads and re-checks. Because identical
-bytes always import to the identical synthetic commit, an update that finds
-unchanged content is a true no-op and the lock does not churn.
+To upgrade, edit the URL and the digest, then run `phora update`. A plain `sync`
+deliberately does not reach for the network; it honors the lock. `update` is the
+command that re-downloads and re-checks. Because identical bytes always import
+to the identical synthetic commit, an update that finds unchanged content is a
+true no-op and the lock does not churn.
 
 Where phora stops: both the URL and the digest are yours to edit, and the digest
 is the only thing standing between you and whatever the URL serves next.
 
 ## Vendoring a subtree from a larger repo
 
-Other repositories manually copy protobuf definitions, JSON schemas, design
-tokens, or a documentation theme from a larger repository — often a monorepo —
-and nobody can readily identify each copy's version. phora can pin and deliver
+Protobuf definitions, JSON schemas, design tokens, a documentation theme: other
+repositories copy them out of a larger repository by hand — often a monorepo —
+and nobody can say what version any given copy is at. phora can pin and deliver
 those source files; it does not run generators or detect compatibility breaks.
 
 The producing repo needs no changes at all. Each consumer declares its slice:
@@ -447,9 +446,7 @@ Two commands answer "would this ship?" before you sync. `phora preview` renders
 the whole projection from the lock, one line per artifact, showing renames and
 the exact destination path; add `--files` to expand a collapsed directory into
 the files it folds in. `phora explain <target> <source> [path]` attributes a
-single path: which `include` offered it, and how `take` resolved it. Use them
-together to inspect both the complete projection and the rule responsible for
-one path.
+single path: which `include` offered it, and how `take` resolved it.
 
 Where phora stops: it will not run `protoc`, regenerate stubs, or notice that
 the schema you just pulled forward is incompatible with your code. Vendoring is
@@ -459,8 +456,8 @@ a delivery step; the build step after it is still yours.
 
 These are fit checks, not complete recipes.
 
-Your repositories carry duplicated Git hook scripts, and you want every checkout
-to use the same pinned set. Deploy a `hooks/` artifact into a directory and
+Duplicated Git hook scripts sit in every repository, and each checkout should be
+running the same pinned set. Deploy a `hooks/` artifact into a directory and
 point `core.hooksPath` at it. phora delivers the files and pins the version, and
 a target `on_change` hook can do the wiring once the files land:
 
@@ -477,17 +474,17 @@ During incidents, responders lose time switching from a service repository to a
 separate wiki. Project an `ops/runbooks` source into each service repository so
 the relevant docs are present at a pinned version.
 
-You want pinned, read-only copies of upstream source trees nearby for browsing.
-Project them into a target and update them explicitly; sources naming the same
-remote share one bare mirror under the cache root. These are exported files, not
-Git checkouts: they contain no `.git` directory, branches, or working-tree
-workflow.
+You read upstream source trees often enough to want pinned, read-only copies
+nearby. Project them into a target and update them explicitly; sources naming
+the same remote share one bare mirror under the cache root. These are exported
+files, not Git checkouts: they contain no `.git` directory, branches, or
+working-tree workflow.
 
 You maintain course material, examples, or starter kits that several local
 directories should receive at a known, verifiable version.
 
-These situations share one constraint: directory-shaped content must move from
-its source to a local consumer at a pinned, later-verifiable version.
+The shared constraint: directory-shaped content moving from its source to a
+local consumer at a pinned, later-verifiable version.
 
 ## Where to look next
 
