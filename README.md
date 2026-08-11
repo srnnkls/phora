@@ -8,20 +8,21 @@
 
 ## About
 
-Phora is a git-based artifact package manager and multiplexer. It mirrors git repositories — or
-imports plain-https resources (tarballs, zips, single files) as content-addressed synthetic
-commits — picks out the paths you want and projects them into local directories, pinned to exact
-commits, verifiable by content hash, and recoverable after interruption.
+Phora keeps selected files from git repositories, local directories, and HTTPS downloads in sync
+with the directories on your machine that consume them. You decide which files from each source go
+to each destination; phora pins remote content to exact commits, verifies deployed files by content
+hash, and recovers after an interruption.
 
-Use it to distribute shared config, editor setups, prompt/skill bundles, or release assets from
-one or more repos (or URLs) into the places on disk that consume them.
+Use phora when shared configuration, editor setups, prompt or skill bundles, or release assets live
+in one or more repositories but must appear in the places other tools expect them.
 
-This README is the reference: the commands, their flags, and every configuration key. For the
-mental model, the pipeline a source runs through, and the reasoning behind the design, read
-[the guide](GUIDE.md). For worked configurations organized by situation, read
-[the use cases](USE-CASES.md).
+Use this README for installation and the complete command and configuration reference. Read
+[the guide](GUIDE.md) for the mental model and the reasoning behind the design, and
+[the use cases](USE-CASES.md) for situation-based configurations.
 
 ## Installation
+
+Choose one of the following installation methods.
 
 ### Shell (Linux, macOS)
 
@@ -61,81 +62,78 @@ verifiable with `gh attestation verify <file> --repo srnnkls/phora`.
 cargo install --path .
 ```
 
-Requires a Rust toolchain (edition 2024).
+From a repository checkout, this requires a Rust toolchain with Rust 2024 edition support.
 
 ## Getting started
 
-Phora is configured by a `phora.toml` in the directory you run it from. This one mirrors a
-repository and projects its files into `~/.config`:
+After installing phora, create a disposable project with a complete configuration:
 
-```toml
+```sh
+mkdir phora-quickstart
+cd phora-quickstart
+cat > phora.toml <<'TOML'
 version = 1
 
-[sources.dotfiles]
-repo = "me/dotfiles"     # github shorthand; branch defaults to the repo's own
+[sources.phora]
+repo = "srnnkls/phora"
 branch = "main"
+include = ["README.md"]
 
-[targets.home]
-path = "~/.config"
-sources = ["dotfiles"]
+[targets.demo]
+path = "./out"
+sources = ["phora"]
+TOML
 ```
 
-Run a sync. Phora fetches the source, resolves `main` to an exact commit, writes that commit into
-`phora.lock`, and materializes the files:
+The source is a public repository and the target is the local `out` directory, so the example runs
+unchanged:
 
 ```console
 $ phora sync
 sync complete
-```
 
-Ask what landed, and whether it is still the bytes phora deployed:
-
-```console
 $ phora list
-home:
-  dotfiles/editor  ✓ clean
+demo:
+  phora/README.md  ✓ clean
 
 $ phora verify
 all verified
 ```
 
-`phora verify` re-hashes every deployed file and exits non-zero on any mismatch, which makes it a
-usable CI gate. From here, [`phora preview`](#inspection) shows what a sync would do before it does
-it, and `phora add`/`phora bind` edit the config for you instead of by hand.
+`phora sync` resolves `main` to an exact commit, records it in `phora.lock`, and deploys the
+selected file into `out`. `phora list` reports what was deployed, and `phora verify` re-hashes the
+deployed bytes against phora's record. Verification exits non-zero on a mismatch, so it also serves
+as a CI check.
+
+From here, `phora preview` shows what a sync would do before it does it, and `phora add` and
+`phora bind` edit the configuration for you instead of by hand.
 
 ## Concepts
 
-A *source* is provenance: where bytes come from, pinned by `branch`, `tag`, or `rev`. A source
-declares its remote as a forge (`host` + `repo`), a local path (`path`), a literal git URL
-(`git`), or a downloadable resource (`url`).
+Phora moves content through a short pipeline: a source publishes an offer, a binding selects from
+that offer, and phora deploys the resulting artifacts into a target.
 
-A source owns its *offer* — the set of leaves it publishes, named relative to its `root`. With no
-`include`, the offer is everything in the source minus `.git/`; `include` narrows it and `exclude`
-prunes it. Each offered leaf is an *artifact*, identified by its full offered path.
+| Term | Meaning |
+| --- | --- |
+| *source* | a git repository, local directory, or HTTPS download phora reads content from, pinned by `branch`, `tag`, or `rev` |
+| *offer* | the paths a source makes available, after applying `root`, `include`, and `exclude` |
+| *artifact* | one file or directory phora manages as a single deployment unit, named by its full offered path |
+| *target* | the local directory artifacts are deployed into, drawing only from its explicit `sources` allow-list |
+| *binding* | the connection from one source to one target |
+| *take* | the subset and renaming rules one binding applies to the offer |
+| *collapse* | whether a binding deploys the taken paths separately or as one directory |
+| *layout* | the rule that places an artifact's path inside a target |
+| *lock* | `phora.lock`, which records the exact commit resolved for each source |
+| *registry* | the machine-local record of what phora deployed, where it landed, and which commit and content digest produced it |
 
-A *target* is a local directory artifacts are projected into, under a chosen *layout*. A target
-draws only from its explicit `sources` allow-list.
-
-A *binding* is the edge from a target to a source. Where the source owns the offer, the binding
-owns the *take*: `take` subsets and renames the offer for that one target, and `collapse` decides
-whether the taken set materializes per leaf or as a single directory.
-
-| Term     | Owner  | What it does                                                                      |
-| -------- | ------ | --------------------------------------------------------------------------------- |
-| offer    | source | the published leaf set: `include − exclude` under `root`; no `include` ⇒ everything but `.git/` |
-| take     | target | subsets and renames the offer, per binding (literal / glob / `{ src = dest }`)     |
-| artifact | —      | one leaf, identified by its full offered path                                      |
-| collapse | target | how a taken set materializes: per leaf, or one directory symlink or subtree        |
-
-Two pieces of state sit underneath. The *lock* (`phora.lock`) pins each source to a resolved
-commit so syncs are reproducible; `phora update` bumps it. The *registry* records what was deployed
-where, by commit and content digest, so phora can detect drift, conflicts, and orphans. See
+`phora update` moves the commits recorded in the lock. The registry is what lets phora detect local
+changes, conflicting files, and deployments the configuration no longer selects. See
 [State & locations](#state--locations) for where each lives.
 
-A source that is itself a phora project is a *transitive dependency*: mark it `transitive = true`,
-import it into a target with `imports`, and its own targets compose into your workspace under that
-target's path. The guide covers composition, confinement, and hook trust in
-[Transitive dependencies](GUIDE.md#transitive-dependencies).
+A source that carries its own `phora.toml` can be used as a *transitive dependency*. Set
+`transitive = true` on the source and name it in a target's `imports`, and that source's own targets
+are deployed beneath the importing target. See
+[Transitive dependencies](GUIDE.md#transitive-dependencies) for composition and hook trust.
 
 ## Command reference
 
@@ -145,53 +143,69 @@ the overlay.
 
 ### Deployment
 
-`phora sync` — fetch every source, resolve its ref to a commit, and project artifacts into their
-targets. Repeated syncs are cheap: an unchanged lock refetches nothing.
+#### `phora sync`
+
+Fetch every source, resolve its ref to a commit, and deploy its artifacts into their targets.
+Repeated syncs are cheap: an unchanged lock refetches nothing.
 
 | Flag | Meaning |
 | --- | --- |
-| `--prune` | also delete artifacts the config no longer selects |
+| `--prune` | delete artifacts the configuration no longer selects |
 | `--force` | overwrite locally-modified files instead of prompting |
 | `--no-hooks` | deploy without running any hook |
 | `--no-transitive-hooks` | deploy composed dependencies but run none of their hooks; your own hooks still run |
 | `--frozen` | refuse to fetch or re-resolve; every source, nested dependencies included, must already be pinned in the lock |
-| `--fast-forward` | when a moved pin drops an artifact that is still deployed, delete it rather than erroring |
-| `-j`, `--jobs <N>` | fixed resolution worker count; unset derives a pool size from the work |
+| `--fast-forward` | delete deployed artifacts that disappear when the pin moves, rather than erroring |
+| `-j`, `--jobs <N>` | set the resolution worker count; when omitted, derive it from the work |
 
-`phora update [SOURCE]` — re-resolve to the latest commit and then sync. With no argument it bumps
-every source; with a source name it bumps that one.
+#### `phora update [SOURCE]`
+
+Re-resolve to the latest commit and then sync. With no argument it bumps every source; with a
+source name it bumps that one.
 
 | Flag | Meaning |
 | --- | --- |
-| `--fast-forward` | as on `sync` |
+| `--fast-forward` | delete deployed artifacts that disappear when the updated pin moves |
 
 ### Inspection
 
-`phora list` — per-target deployment state, one line per artifact.
+#### `phora list`
+
+Report per-target deployment state, one line per artifact.
 
 | Flag | Meaning |
 | --- | --- |
-| `--plan` | prints a pointer to `phora sync`; `phora preview` is the actual dry run |
-| `--orphans` | report registry records whose target left the config, with their on-disk paths |
+| `--plan` | print a pointer to `phora sync`; use `phora preview` for a dry run |
+| `--orphans` | report registry records whose target left the configuration, with their on-disk paths |
 
-`phora verify` — re-hash every deployed file against its recorded digest. Exits non-zero on any
-mismatch. Linked artifacts carry no per-file hashes and are skipped. Takes no flags.
+Each artifact has exactly one state: `✓ clean`; `outdated` when the configuration or variables moved
+ahead of the deployed copy; `modified` when its files changed outside phora; `foreign` when a file
+phora did not deploy sits where the artifact wants to land; `missing`; `ejected`; or `linked`.
 
-`phora where` — reverse-lookup over the registry. Every flag given is an AND constraint; with none,
-it lists everything deployed.
+#### `phora verify`
+
+Re-hash every deployed file against its recorded digest. Exits non-zero on any mismatch. Linked
+artifacts carry no per-file hashes and are skipped. Takes no flags.
+
+#### `phora where`
+
+Reverse-lookup over the registry. Every flag given is an AND constraint; with none, it lists
+everything deployed.
 
 | Flag | Meaning |
 | --- | --- |
-| `--source <NAME>` | artifacts deployed from this source |
-| `--artifact <NAME>` | artifacts under this offered path |
-| `--commit <SHA>` | artifacts deployed at this commit |
-| `--digest <DIGEST>` | artifacts with this content digest |
+| `--source <NAME>` | show artifacts deployed from this source |
+| `--artifact <NAME>` | show artifacts under this offered path |
+| `--commit <SHA>` | show artifacts deployed at this commit |
+| `--digest <DIGEST>` | show artifacts with this content digest |
 
-`phora preview` — the offline dry-run projection. Per target it shows each binding's identity, the
-artifacts it selects, and where they would land, taking commits from the lock and trees from the
-mirror without touching the network. A collapsed directory carries a trailing slash. An unsynced
-source is annotated (`not locked`, `needs sync`, or `link working tree gone`) rather than fetched,
-and the command still exits 0. Predicted flat-layout collisions render as warnings.
+#### `phora preview`
+
+Show the offline dry run. Per target it reports each binding's identity, the artifacts it selects,
+and where they would land, taking commits from the lock and trees from the mirror without touching
+the network. A collapsed directory carries a trailing slash. An unsynced source is annotated
+(`not locked`, `needs sync`, or `link working tree gone`) rather than fetched, and the command still
+exits 0. Predicted flat-layout collisions render as warnings.
 
 | Flag | Meaning |
 | --- | --- |
@@ -200,32 +214,36 @@ and the command still exits 0. Predicted flat-layout collisions render as warnin
 | `--files` | expand each artifact to the files it would deploy |
 | `--json` | emit the same plan as a machine-readable document |
 
-`phora explain <TARGET> <SOURCE> [PATH]` — attribute a projection decision offline. With a path, it
-reports which `include`/`exclude` rule offered that path and how the binding's `take` resolved it;
-without one, it summarizes the whole offer. Takes no flags.
+#### `phora explain <TARGET> <SOURCE> [PATH]`
 
-`phora check-match --source <SOURCE> <PATH>` — probe one path against a source's `include`/`exclude`
-rules and print the verdict alongside the rules themselves. Where `explain` accounts for the whole
-binding, `check-match` isolates the offer.
+Attribute a deployment decision offline. With a path, it reports which `include` or `exclude` rule
+offered that path and how the binding's `take` resolved it; without one, it summarizes the whole
+offer. Takes no flags.
+
+#### `phora check-match --source <SOURCE> <PATH>`
+
+Probe one path against a source's `include` and `exclude` rules and print the verdict alongside the
+rules themselves. Where `explain` accounts for the whole binding, `check-match` isolates the offer.
 
 ### Editing configuration
 
-`phora add <URL>` — parse a URL, add it as a source, and optionally bind it to targets. Shorthands
-persist as a forge source (`host` + `repo`), not an expanded URL; scheme and scp-style URLs stay
-literal as `git`.
+#### `phora add <URL>`
+
+Parse a URL, add it as a source, and optionally bind it to targets. Shorthands persist as a forge
+source (`host` + `repo`), not an expanded URL; scheme and scp-style URLs stay literal as `git`.
 
 | Flag | Meaning |
 | --- | --- |
 | `--to <TARGET>` | bind the new source into this target; repeatable |
-| `--name <NAME>` | source name, otherwise derived from the URL |
+| `--name <NAME>` | set the source name; when omitted, derive it from the URL |
 | `--branch <BRANCH>` | pin the source to a branch |
 | `--tag <TAG>` | pin the source to a tag |
 | `--root <PATH>` | re-anchor the new source's offer at this subdirectory |
 | `--include <GLOB>` | keep only matching paths in the new source's offer; repeatable |
 | `--exclude <GLOB>` | drop matching paths from the new source's offer; repeatable |
-| `--as <IDENTITY>` | binding identity, requiring exactly one `--to` |
+| `--as <IDENTITY>` | set the binding identity; requires exactly one `--to` |
 | `--local` | write `phora.local.toml`, recording the path as a local source |
-| `--symlink` | as `--local`, plus `deploy = "link"` to live-link the working tree |
+| `--symlink` | write `phora.local.toml` and set `deploy = "link"` to live-link the working tree |
 
 ```sh
 phora add owner/repo --name myconfigs --branch main --root configs  # host = "github"
@@ -238,66 +256,88 @@ phora add git@github.com:me/dotfiles.git --tag v1.2
 The colon alias caps at `owner/repo`; segments past that become `root`, so a deep GitLab subgroup
 belongs in the config's `repo` key (`repo = "group/sub/proj"`) rather than the alias.
 
-With no `--to`, a bare `phora add` ensures `[targets.default]` (path `.`, flat layout) and binds the
-source into it. Setting `[defaults] auto_target = false` makes a bare `add` declare-only, so the
-source deploys nowhere until it is bound. `--to` is unaffected: it always routes to exactly the
-named targets and never touches `[targets.default]`. A `--to` target that does not exist prompts to
-create it (flat layout, path `./T`) on an interactive terminal, and errors with a `phora target add`
-hint off a TTY. The whole desugar is applied to one config-text string and written once, so a
-failure leaves nothing behind.
+With no `--to`, `phora add` creates `[targets.default]` if needed (path `.`, flat layout) and binds
+the source to it. Set `[defaults] auto_target = false` to make bare `add` declare the source without
+deploying it. An explicit `--to` always uses only the named targets and never touches
+`[targets.default]`. If a named target does not exist, phora offers to create it (flat layout, path
+`./<name>`) when run interactively; in a non-interactive run it exits with a `phora target add`
+suggestion. Configuration edits are atomic: if the command fails, it leaves the configuration
+unchanged.
 
-`phora rm <NAME>` — remove a source and scrub it from every target's `sources`. An alias for
-`phora source rm`. Because the scrub spans both config files, it takes no `--local`.
+#### `phora rm <NAME>`
 
-`phora source add <URL>` — identical to top-level `add` minus the binding flags: it accepts
-`--name`, `--branch`, `--tag`, `--root`, `--include`, `--exclude`, `--local`, and `--symlink`.
+Remove a source and scrub it from every target's `sources`. An alias for `phora source rm`. Because
+the scrub spans both config files, it takes no `--local`.
 
-`phora source rm <NAME>` — as `phora rm`.
+#### `phora source add <URL>`
 
-`phora source list` — every source over the merged config: name, resolved remote, refspec.
+Identical to top-level `add` minus the binding flags: it accepts `--name`, `--branch`, `--tag`,
+`--root`, `--include`, `--exclude`, `--local`, and `--symlink`.
 
-`phora source show <NAME>` — one source's effective config and the targets that deploy it.
+#### `phora source rm <NAME>`
 
-`phora target add <NAME> --path <PATH>` — declare a target.
+As `phora rm`.
+
+#### `phora source list`
+
+List every source over the merged config: name, resolved remote, and selected branch, tag, or
+commit.
+
+#### `phora source show <NAME>`
+
+Show one source's effective config and the targets that deploy it.
+
+#### `phora target add <NAME> --path <PATH>`
+
+Declare a target.
 
 | Flag | Meaning |
 | --- | --- |
-| `--path <PATH>` | deployment directory; required |
-| `--layout <LAYOUT>` | `flat`, `by-source`, or `prefixed`; defaults to `flat` |
+| `--path <PATH>` | set the deployment directory; required |
+| `--layout <LAYOUT>` | set the layout to `flat`, `by-source`, or `prefixed`; defaults to `flat` |
 | `--local` | write `phora.local.toml` |
 
-`phora target rm <NAME>` — remove a target.
+#### `phora target rm <NAME>`
+
+Remove a target.
 
 | Flag | Meaning |
 | --- | --- |
 | `--local` | write `phora.local.toml` |
 | `--force` | remove the block even while the registry still has deployed artifacts |
 
-`phora target list` — every target over the merged config: name, path, bound sources.
+#### `phora target list`
 
-`phora target show <NAME>` — one target's effective config, resolved sources, and deployment state.
+List every target over the merged config: name, path, bound sources.
 
-`phora bind <SOURCE>... --to <TARGET>` — add bindings to a target's `sources`. With no refinement it
-appends a bare source name to the target's flat list, or writes `name = {}` if that target is
-already a keyed table; any refinement writes a keyed table entry.
+#### `phora target show <NAME>`
+
+Show one target's effective config, resolved sources, and deployment state.
+
+#### `phora bind <SOURCE>... --to <TARGET>`
+
+Add bindings to a target's `sources`. With no refinement it appends a bare source name to the
+target's flat list, or writes `name = {}` if that target is already a keyed table; any refinement
+writes a keyed table entry.
 
 | Flag | Meaning |
 | --- | --- |
-| `--to <TARGET>` | target the bindings attach to; required |
-| `--as <IDENTITY>` | binding identity; applies to a single source only |
+| `--to <TARGET>` | choose the target for these bindings; required |
+| `--as <IDENTITY>` | set the binding identity; valid for one source only |
 | `--take <ENTRY>` | subset or rename the offer: a leaf, a glob, or `src=dest`; repeatable |
 | `--branch <BRANCH>` | pin this binding to a branch, overriding the source's ref for this target |
 | `--tag <TAG>` | pin this binding to a tag |
-| `--rev <SHA>` | pin this binding to a commit |
-| `--root <PATH>` | source-owned: writes `root` onto each named `[sources.<name>]`, erroring if a named source is not declared in the file being edited |
+| `--rev <SHA>` | pin this binding to a full commit id |
+| `--root <PATH>` | write `root` onto each named `[sources.<name>]`, since `root` is source-owned; error if a named source is not declared in the file being edited |
 | `--local` | write `phora.local.toml` |
 
-`phora unbind <IDENTITY>... --from <TARGET>` — remove bindings by their identity. Emptying a
-target's list leaves it deploying nothing.
+#### `phora unbind <IDENTITY>... --from <TARGET>`
+
+Remove bindings by their identity. Emptying a target's list leaves it deploying nothing.
 
 | Flag | Meaning |
 | --- | --- |
-| `--from <TARGET>` | target the bindings are removed from; required |
+| `--from <TARGET>` | choose the target from which to remove the bindings; required |
 | `--local` | write `phora.local.toml` |
 
 ```sh
@@ -308,17 +348,21 @@ phora unbind nvim --from neovim
 
 ### Managing individual artifacts
 
-`phora eject <ARTIFACT> --source <SOURCE> --target <TARGET>` — stop managing an artifact while
-keeping its files on disk. Both flags are required.
+#### `phora eject <ARTIFACT> --source <SOURCE> --target <TARGET>`
 
-`phora uneject <ARTIFACT> --source <SOURCE> --target <TARGET>` — resume managing a previously
-ejected artifact. Both flags are required.
+Stop managing an artifact while keeping its files on disk. Both flags are required.
+
+#### `phora uneject <ARTIFACT> --source <SOURCE> --target <TARGET>`
+
+Resume managing a previously ejected artifact. Both flags are required.
 
 ### Transitive hooks
 
-`phora trust [SOURCE]` — inspect and approve hooks discovered in composed dependencies. With a
-source and no flags, it shows that dependency's hooks and prompts per hook; with no source, it
-lists every discovered hook across all sources.
+#### `phora trust [SOURCE]`
+
+Inspect and approve hooks discovered in composed dependencies. With a source and no flags, it shows
+that dependency's hooks and prompts per hook; with no source, it lists every discovered hook across
+all sources.
 
 | Flag | Meaning |
 | --- | --- |
@@ -333,8 +377,10 @@ back to needing approval. The guide explains the trust model in
 
 ### Maintenance
 
-`phora rebuild-registry` — reconstruct the registry from the lock and the on-disk targets. Takes no
-flags. Reach for it when the registry is lost or inconsistent with what is actually deployed.
+#### `phora rebuild-registry`
+
+Reconstruct the registry from the lock and the on-disk targets. Takes no flags. Reach for it when
+the registry is lost or inconsistent with what is actually deployed.
 
 ## Configuration
 
@@ -449,12 +495,12 @@ than one.
 | `repo` | string | — | `owner/repo` on the forge; nested paths are fine |
 | `path` | string | — | local filesystem path, used verbatim as the remote |
 | `git` | string | — | literal remote: https, `ssh://`, or scp-style `git@host:path` |
-| `url` | string | — | downloadable resource imported as a synthetic commit |
+| `url` | string | — | downloadable resource imported as a single snapshot |
 | `digest` | string | none | `sha256:<hex>` or `blake3:<hex>`, verified before a url source is extracted |
 | `protocol` | `"https"` \| `"ssh"` | top-level `protocol` | per-source template selection for a forge source |
 | `branch` | string | repo's default branch | pin to a branch |
 | `tag` | string | — | pin to a tag |
-| `rev` | string | — | pin to a commit; precedence within a source is `rev` > `tag` > `branch` |
+| `rev` | string | — | pin to a commit, written in full as 40 or 64 hex characters; an abbreviated sha is an error. Precedence within a source is `rev` > `tag` > `branch` |
 | `root` | path | source root | re-anchor the offer at this subdirectory |
 | `include` | array of glob | everything but `.git/` | gitignore-syntax patterns kept in the offer |
 | `exclude` | array of glob | empty | gitignore-syntax patterns pruned from the offer; exclude wins, and there is no `!` re-inclusion |
@@ -464,9 +510,9 @@ than one.
 | `transitive` | bool | `false` | recurse into the source's own `phora.toml` so it can be imported |
 
 A url source is a single imported snapshot, so `branch`, `tag`, `rev`, and `root` are config errors
-on one; `include`/`exclude` still select files. Archives in tar, tar.gz/tgz, and zip are recognized
-by magic bytes and a lone top-level directory is stripped, so version-stamped release tarballs need
-no per-version `root`; anything else becomes one file named from the URL basename.
+on one; `include` and `exclude` still select files. Archives in tar, tar.gz/tgz, and zip are
+recognized by magic bytes and a lone top-level directory is stripped, so version-stamped release
+tarballs need no per-version `root`; anything else becomes one file named from the URL basename.
 
 A `link` source must be a local path — `deploy = "link"` on a remote is a config error naming the
 source, and a relative path counts as local only if it already exists relative to the working
@@ -503,9 +549,9 @@ table back to take-all, and a non-empty local table replaces the base table whol
 ### Bindings: `[targets.<name>.sources]`
 
 The table key is the binding identity. It defaults to the source name, and `source` is written only
-when the two diverge. The identity keys the registry artifact and labels the `by-source` and
-`prefixed` layouts, and it is structurally unique because TOML keys are unique. Bindings resolve in
-identity order, sorted alphabetically, independent of how a flat list is written.
+when the two diverge. Phora uses the identity in registry records and in the `by-source` and
+`prefixed` layouts. Because the identity is a TOML key, it may appear only once. Bindings are
+processed alphabetically by identity, regardless of their order in a flat list.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -515,7 +561,7 @@ identity order, sorted alphabetically, independent of how a flat list is written
 | `template` | array of glob \| `false` | `.tmpl` suffix only | widen rendering to more paths, or disable it entirely |
 | `branch` | string | the source's ref | pin this binding to a branch for this target alone |
 | `tag` | string | the source's ref | pin this binding to a tag |
-| `rev` | string | the source's ref | pin this binding to a commit; precedence is `rev` > `tag` > `branch` |
+| `rev` | string | the source's ref | pin this binding to a commit, written in full as 40 or 64 hex characters; precedence is `rev` > `tag` > `branch` |
 
 A `take` entry is a literal leaf kept verbatim, a gitignore glob that expands over the offer set
 only, or a rename table `{ "src" = "dest" }` that consumes one offered leaf and emits it at `dest`
@@ -531,11 +577,12 @@ Each distinct binding ref gets its own lock entry at its own commit, while bindi
 override the ref share the source's single entry. Resolution still does one fetch per source,
 covering every ref its bindings name.
 
-`root`, `include`, `exclude`, and `map` are not binding keys. Setting any of them on a binding is a
-hard parse error with a did-you-mean diagnostic redirecting scope to `[sources.<name>]` and `map`
-to the `take` rename form. A binding backed by a url source accepts no refinement at all — there is
-no offer to subset and no ref to resolve — and a `deploy = "link"` source rejects
-`branch`/`tag`/`rev`, since it live-links a working tree rather than a pinned commit.
+`root`, `include`, `exclude`, and `map` are not valid binding keys, and setting one is a parse
+error. Put `root`, `include`, and `exclude` under `[sources.<name>]`, and express a rename with the
+`take` table form; the error names where the key belongs. A binding backed by a url source accepts
+no refinement at all — there is no offer to subset and no ref to resolve — and a `deploy = "link"`
+source rejects `branch`, `tag`, and `rev`, since it live-links a working tree rather than a pinned
+commit.
 
 The guide works through identity, renaming, and collapse in
 [Bindings](GUIDE.md#bindings-per-target-selection).
@@ -564,15 +611,15 @@ you approve them with `phora trust`.
 | --- | --- | --- | --- |
 | `[hooks] pre_sync` | hook | none | runs once after fetch and before any deploy; a non-zero exit aborts the sync |
 | `[hooks] post_sync` | hook | none | runs after every sync |
-| `[hooks] when` | `"always"` | `"always"` | governs `post_sync` re-fire |
+| `[hooks] when` | `"always"` | `"always"` | controls whether `post_sync` runs again |
 | `[targets.<t>.hooks] pre_deploy` | hook | none | gates one target's deploy; every gate runs before any target mutates |
 | `[targets.<t>.hooks] pre_deploy_on_fail` | `"abort"` \| `"skip"` | `"abort"` | on a failed gate, halt the whole sync or skip only that target |
 | `[targets.<t>.hooks] on_change` | hook | none | runs once after a sync that added or modified this target's artifacts |
 
-A hook value is a command string run under `sh -c`, a table, or an array mixing both that runs in
-declared order with duplicates removed. A table is either `{ run = "...", shell = "..." }`, where
-`shell` defaults to `sh -c`, or `{ cmd = ["prog", "arg"] }`, which spawns argv directly with no
-shell and no variable expansion.
+A hook can be a command string run by `sh -c`, a table, or an array of strings and tables. Array
+entries run in declared order, with duplicates removed. A table is either
+`{ run = "...", shell = "..." }`, where `shell` defaults to `sh -c`, or `{ cmd = ["prog", "arg"] }`,
+which runs the listed program and arguments directly, with no shell and no variable expansion.
 
 ```toml
 [hooks]
@@ -591,9 +638,9 @@ on_change = [
 ]
 ```
 
-Every hook inherits phora's full environment, plus a scope-specific set:
+Every hook inherits phora's full environment, plus the variables for that hook type:
 
-| Scope | Variables |
+| Hook | Variables |
 | --- | --- |
 | `pre_sync` | `PHORA_TARGETS` — the target names in this run |
 | `pre_deploy` | `PHORA_TARGET`, `PHORA_TARGET_PATH` |
@@ -627,100 +674,18 @@ greeting = "hi from this laptop"
 source; `phora add --symlink <path>` does the same and adds `deploy = "link"`. The guide covers the
 workflow in [the link-mode chapter](GUIDE.md).
 
-## Troubleshooting
-
-What would a sync actually deploy, before I run it? — `phora preview`. It resolves commits from the
-lock and trees from the mirror without touching the network, so it is safe to run anywhere.
-`phora preview --files` expands each artifact into the files behind it.
-
-```console
-$ phora preview --files
-home -> ./out
-  dotfiles@4daaa43a editor/ -> ./out/editor
-    init.lua
-    theme.lua
-```
-
-Why is this file not deploying? — `phora explain <target> <source> <path>` attributes the decision
-to a rule: which `include` or `exclude` offered the path, and how the binding's `take` resolved it.
-Without a path it summarizes the whole offer.
-
-```console
-$ phora explain home dotfiles editor/init.lua
-dotfiles under home
-  offer: `editor/init.lua` allowed by the implicit-full offer
-  take: collapsed into directory `editor`
-```
-
-Is my `include`/`exclude` doing what I think? — `phora check-match --source <source> <path>` probes
-one path against the source's rules alone and prints the rules alongside the verdict, which isolates
-an offer problem from a binding problem.
-
-```console
-$ phora check-match --source dotfiles editor/init.lua
-artifact `editor`: allowed
-path `editor/init.lua`: allowed
-include: []
-exclude: []
-```
-
-Has anything changed on disk since phora deployed it? — `phora verify` re-hashes every deployed
-file and names each mismatch, exiting non-zero.
-
-```console
-$ phora verify
-dotfiles/editor: init.lua (content mismatch)
-```
-
-`phora list` then shows the same artifact as `modified`. The artifact states are `✓ clean`,
-`outdated` (config or vars moved ahead of what is deployed), `modified` (edited outside phora),
-`foreign` (a file phora did not deploy sits where an artifact wants to land), `missing`, `ejected`,
-and `linked`.
-
-Where did this file come from? — `phora where` queries the registry in reverse, by source,
-artifact, commit, or digest, and reports the commit, the content digest, and every target the
-artifact reached.
-
-```console
-$ phora where --source dotfiles
-Artifact: dotfiles/editor (commit 4daaa43a, digest blake3:bcc182f4…)
-  - home
-```
-
-Sync keeps stopping on a file it did not deploy. — That is the conflict prompt. When a sync finds a
-target file modified outside phora, or a foreign file where an artifact wants to land, it asks on a
-TTY:
-
-```
-[s]kip / [o]verwrite / [e]ject / [a]bort
-```
-
-Non-interactive runs skip such files unless `--force` is given. To keep a file and stop managing it,
-`phora eject` it.
-
-Sync refuses to delete an artifact that upstream removed. — The pin moved and an artifact that is
-still deployed is no longer offered. Re-run with `phora sync --fast-forward` to follow the pin and
-delete it, or `phora eject` it first to keep the files.
-
-The registry is out of step with what is on disk. — `phora rebuild-registry` reconstructs it from
-the lock and the on-disk targets, hashing what it finds and restoring `linked` markers without
-hashing. `phora list --orphans` reports records whose target left the config, and
-`phora sync --prune` removes them.
-
-The guide has a longer diagnostic walkthrough in [When something looks wrong](GUIDE.md).
-
 ## State & locations
 
-Phora keeps its shared state in two XDG-rooted trees:
+Phora keeps its shared state in the platform's standard cache and state directories:
 
 | Root | Holds | Override | Linux default | macOS default |
 | ----- | ---- | -------- | ------------- | ------------- |
 | Cache | git mirrors, regenerable | `XDG_CACHE_HOME` | `~/.cache/phora` | `~/Library/Caches/phora` |
 | State | registry, locks, journal | `XDG_STATE_HOME` | `~/.local/state/phora` | `~/Library/Application Support/phora` |
 
-A project may pin either root with a [`[paths]`](#paths) table, which makes project-local installs
-and hermetic tests possible without exporting the XDG variables. Resolution precedence is config,
-then the `XDG_*` environment, then the platform default.
+A project may pin either root with a [`[paths]`](#paths) table, which makes self-contained project
+setups possible without exporting the XDG variables. Resolution precedence is config, then the
+`XDG_*` environment, then the platform default.
 
 An `XDG_*` override is honored only when absolute, per the XDG spec; a relative value is ignored and
 the platform default applies. macOS has no native state directory, so the state root falls back to
@@ -750,6 +715,101 @@ the same home directory is mounted on several machines — a common lab or clust
 concurrent syncs of the same project from two machines. Serialize them, or give each machine its own
 state root by pointing `[paths].state` at machine-local storage.
 
+## Troubleshooting
+
+### What would a sync deploy?
+
+Run `phora preview` before syncing. It resolves commits from the lock and trees from the mirror
+without touching the network, so it is safe to run anywhere. `phora preview --files` expands each
+artifact into the files behind it.
+
+```console
+$ phora preview --files
+demo -> ./out
+  phora@61831974 README.md -> ./out/README.md
+    README.md
+```
+
+### Why is this file not deploying?
+
+`phora explain <target> <source> <path>` attributes the decision to a rule: which `include` or
+`exclude` offered the path, and how the binding's `take` resolved it. Without a path it summarizes
+the whole offer.
+
+```console
+$ phora explain demo phora README.md
+phora under demo
+  offer: `README.md` allowed by include `README.md`
+  take: kept at `README.md`
+```
+
+### Is my `include` and `exclude` doing what I think?
+
+`phora check-match --source <source> <path>` probes one path against the source's rules alone and
+prints the rules alongside the verdict, which isolates an offer problem from a binding problem.
+
+```console
+$ phora check-match --source phora README.md
+artifact `README.md`: allowed
+path `README.md`: allowed
+include: ["README.md"]
+exclude: []
+```
+
+### Has anything changed on disk since phora deployed it?
+
+`phora verify` re-hashes every deployed file, names each mismatch, and exits non-zero.
+
+```console
+$ phora verify
+phora/README.md: README.md (content mismatch)
+```
+
+`phora list` then reports the same artifact as `modified`.
+
+### Where did this file come from?
+
+`phora where` queries the registry in reverse — by source, artifact, commit, or digest — and reports
+the commit, the content digest, and every target the artifact reached.
+
+```console
+$ phora where --source phora
+Artifact: phora/README.md (commit 61831974, digest blake3:a0bb899173da5d73300c6e3ba93b24872407f27969d794321b17efc892cae50c)
+  - demo
+```
+
+### Sync keeps stopping on a file it did not deploy
+
+That is the conflict prompt. When a sync finds a target file modified outside phora, or a foreign
+file where an artifact wants to land, it asks interactively:
+
+```
+[s]kip / [o]verwrite / [e]ject / [a]bort
+```
+
+Non-interactive runs skip such files unless `--force` is given. To keep a file and stop managing it,
+`phora eject` it.
+
+### Sync refuses to delete an artifact that upstream removed
+
+The pin moved, and an artifact that is still deployed is no longer offered. Re-run with
+`phora sync --fast-forward` to follow the pin and delete it, or `phora eject` it first to keep the
+files.
+
+### The registry is out of step with what is on disk
+
+`phora rebuild-registry` reconstructs the registry from the lock and the on-disk targets, hashing
+what it finds and restoring `linked` markers without hashing. `phora list --orphans` reports records
+whose target left the configuration, and `phora sync --prune` removes them.
+
+The guide has a longer diagnostic walkthrough in [When something looks wrong](GUIDE.md).
+
+## Further reading
+
+- [The phora guide](GUIDE.md) — how phora works, the pipeline every source runs through, and what
+  happens under the hood.
+- [Use cases](USE-CASES.md) — situations, each with a working configuration.
+
 ## Development
 
 ```sh
@@ -762,16 +822,9 @@ mise run build     # cargo build
 ### Testing
 
 ```sh
-mise run test-integration   # scrut suites under tests/scrut/ against a release build
+mise run test-integration   # integration suites under tests/scrut/ against a release build
 ```
 
-The scrut suites drive the shipped binary end to end and double as runnable usage docs.
-[`tests/scrut/showcase.md`](tests/scrut/showcase.md) is a narrated walkthrough — adding a git
-source, projecting it, then layering a machine-local symlink overlay — whose assertions CI keeps
-honest.
-
-## Further reading
-
-- [The phora guide](GUIDE.md) — how phora works, the pipeline every source runs through, and what
-  happens under the hood.
-- [Use cases](USE-CASES.md) — situations, each with a working configuration.
+The integration suites exercise the shipped binary end to end. CI also runs the narrated workflow in
+[`tests/scrut/showcase.md`](tests/scrut/showcase.md), which adds a git source, deploys it, then
+layers a machine-local symlink overlay.
