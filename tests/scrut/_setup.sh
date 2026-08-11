@@ -128,6 +128,30 @@ EOF
 	rm -f "$PWD/phora.toml.bak"
 }
 
+seed_config_changed_env() {
+	url="$1"
+	target="$PWD/target-home"
+	mkdir -p "$target"
+	cat >"$PWD/phora.toml" <<'EOF'
+version = 1
+
+[sources.dotfiles]
+path = "__URL__"
+branch = "main"
+include = ["editor", "lint"]
+
+[targets.home]
+path = "__TARGET__"
+sources = ["dotfiles"]
+layout = "flat"
+
+[targets.home.hooks]
+on_change = "echo \"$PHORA_CHANGED_NAMES\" > \"$HOME/names.log\"; echo \"$PHORA_CHANGED\" > \"$HOME/paths.log\""
+EOF
+	sed -i.bak -e "s#__URL__#$url#" -e "s#__TARGET__#$target#" "$PWD/phora.toml"
+	rm -f "$PWD/phora.toml.bak"
+}
+
 # Exec (shell-free) on_change hook; the argv `$HOME` token must reach the file verbatim — a shell would expand it. Two identical entries also exercise enum-aware dedupe.
 seed_config_exec_hook() {
 	url="$1"

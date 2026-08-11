@@ -76,13 +76,13 @@ Artifact: speckit/AGENTS.md (commit 2262359d, digest blake3:da624a4a2e65f152094a
   - agents
 ```
 
-`preview` shows the renames straight from the lock — a rename entry reads
-`src -> dest -> destination`, so you can see the offered leaf, the name it takes,
-and where it lands:
+`preview` shows the renames straight from the lock — the target header names the
+path it deploys to, and a rename entry reads `src -> dest -> destination`, so you
+can see the offered leaf, the name it takes, and where it lands:
 
 ```scrut
 $ phora preview
-agents
+agents -> agent-config
   claude@2262359d AGENTS.md -> CLAUDE.md -> agent-config/CLAUDE.md
   speckit@2262359d AGENTS.md -> agent-config/AGENTS.md
 ```
@@ -91,7 +91,8 @@ agents
 
 Rename two bindings to the *same* dest and phora refuses rather than letting one
 silently clobber the other — the structured selection diagnostic names the
-contested destination and points at `phora preview` to see the whole tree:
+contested destination relative to the target root, and points at `phora preview`
+to see the whole tree:
 
 ```scrut
 $ cat > phora.toml <<'EOF'
@@ -115,7 +116,7 @@ $ cat > phora.toml <<'EOF'
 
 ```scrut
 $ phora sync 2>&1
-error: sync error: selection: agent-config/CLAUDE.md / agent-config/CLAUDE.md — two bindings resolve to the same destination
+error: sync error: selection: CLAUDE.md / CLAUDE.md — two bindings resolve to the same destination
 matched against: the target's destinations across all bindings
 remedy: rename one source's leaf, or separate the bindings under the layout
 to debug: phora preview --target agents
