@@ -59,7 +59,7 @@ shell:
 
 ```scrut
 $ phora preview
-shell
+shell -> shell-integration
   canary@ff168774 shell/ -> shell-integration/canary/shell
   stable@fc693080 shell/ -> shell-integration/stable/shell
 ```
@@ -121,11 +121,13 @@ $ cat > phora.toml <<'EOF'
 > EOF
 ```
 
-The mirror already holds the tag, so no network is needed; `--prune` also
-removes the two artifacts the config no longer names:
+The mirror already holds the tag, so no network is needed; sync reports the move
+as a version transition, and `--prune` also removes the two artifacts the config
+no longer names:
 
 ```scrut
 $ phora sync --prune 2>&1
+phora: fzf → shell: v0.55.0 (fc693080) → v0.56.0 (ff168774)
 phora: pruning orphaned canary:shell
 phora: pruning orphaned stable:shell
 sync complete
