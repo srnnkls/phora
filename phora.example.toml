@@ -31,7 +31,8 @@ auth = { type = "ssh", key = "~/.ssh/id_ed25519" }
 
 # A source is a git repo, and it OWNS its selection: `root` re-anchors the slice,
 # `include`/`exclude` compose `include − exclude` (exclude wins; no `!` negation).
-# Pin with exactly one of branch / tag / rev (defaults to branch `main`).
+# Pin with exactly one of branch / tag / rev; omit all three to follow the repo's
+# default branch. A `rev` is a full 40-char commit id, never an abbreviation.
 # Pick exactly one source kind: forge (host + repo), local (path), literal (git),
 # or url. A bare `repo = "owner/repo"` defaults to github; a bare `path` is LOCAL.
 
@@ -52,9 +53,11 @@ include = ["editor", "lint"]
 exclude = ["**/test/**", "**/*.bak"]
 
 # Local source: `path` is a filesystem path used verbatim as the remote, exactly
-# like a `git = "/abs/local/checkout"` alias.
+# like a `git = "/abs/local/checkout"` alias. Tilde expansion applies to target
+# paths only, so write a source `path` absolute; a leading `~` fails as a literal
+# directory name.
 [sources.scratch]
-path = "~/dev/scratch-configs"
+path = "/home/me/dev/scratch-configs"
 branch = "main"
 root = "modules"
 
@@ -69,7 +72,7 @@ include = ["bin"]
 # Literal remote: any https, ssh://, or scp-style URL, unchanged from before.
 [sources.loqui]
 git = "https://github.com/srnnkls/loqui.git"
-rev = "9f1c2ab"
+rev = "9e5d4de28b21871d2b67f40943e1d6d6ffa701a3"
 root = "languages"
 allow_symlinks = false
 preserve_executable = true
@@ -81,10 +84,10 @@ preserve_executable = true
 # a single top-level dir is auto-stripped, so version-stamped release tarballs need
 # no per-version `root`. `branch`/`tag`/`rev`/`root` are rejected on a url source.
 [sources.fzf-bin]
-url = "https://github.com/junegunn/fzf/releases/download/0.55.0/fzf-0.55.0-linux_amd64.tar.gz"
+url = "https://github.com/junegunn/fzf/releases/download/v0.55.0/fzf-0.55.0-linux_amd64.tar.gz"
 # Optional integrity check, verified before extraction; a mismatch errors.
-digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-# digest = "blake3:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+digest = "sha256:4df2393776942780ddab2cea713ddaac06cd5c3886cd23bc9119a6d3aa1e02bd"
+# digest = "blake3:85b10cf79042093b9fa75bd72220d13c122e5922e18e04ee5aa8548f96871e1f"
 include = ["fzf"]
 # Content is imported as a deterministic, content-addressed synthetic git commit:
 # identical bytes ⇒ identical commit ⇒ no lock churn.
