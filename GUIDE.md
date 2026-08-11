@@ -1,10 +1,10 @@
 # The phora guide
 
-This is the long-form companion to the [README](README.md). The README is the
-reference — terse, every flag in one place. This guide is the walkthrough: it
-starts with a working setup, explains how phora works, and then goes under the
-hood into how phora actually stores, fetches, and verifies things. Read it top to
-bottom the first time; after that, jump to the section you need.
+This is the long-form companion to the [README](README.md). Where the README
+stays terse — every flag in one place — the guide walks you through: it starts
+with a working setup, explains how phora works, and then goes under the hood into
+how phora actually stores, fetches, and verifies things. Read it top to bottom
+the first time; after that, jump to the section you need.
 
 ## Contents
 
@@ -1334,17 +1334,17 @@ sense: not atomic, and mostly useful as a hint that your target and its parent a
 not where you thought they were.
 
 A source can contain things a deploy should not blindly reproduce, and an export
-policy decides what happens at those edges. Symlinks are refused by default: a
+policy decides what happens at those edges. phora refuses symlinks by default: a
 symlink in the source aborts that artifact's staging unless the source sets
-`allow_symlinks = true`, and even then a link whose target points outside the
-artifact is rejected, since a link that escapes its own artifact is a link that
-escapes phora's accounting of what it deployed. The executable bit is preserved by
-default (`preserve_executable`). Submodules are not exportable at all — a gitlink
-entry is skipped rather than followed, because what it names is another repository,
-not content this source has to give. And a destination path containing a `.git`
-component is not written at all unless the source's own `include` list names one
-explicitly, so vendoring a repository's metadata is something you have to ask for by
-name rather than something a broad glob can do to you by accident.
+`allow_symlinks = true`, and even then it rejects a link whose target points
+outside the artifact, since a link that escapes its own artifact is a link that
+escapes phora's accounting of what it deployed. It preserves the executable bit by
+default (`preserve_executable`), and skips a gitlink entry rather than following
+it — a submodule is not exportable at all, because what it names is another
+repository, not content this source has to give. Nor does it write a destination
+path containing a `.git` component, unless the source's own `include` list names
+one explicitly, so vendoring a repository's metadata is something you have to ask
+for by name rather than something a broad glob can do to you by accident.
 
 Drift detection is symlink-aware in the other direction too — it stats without
 following links, so a recorded regular file later swapped for a symlink reads as
@@ -1598,10 +1598,10 @@ runs it every time. `when` governs `post_sync` and nothing else; it never gates
 `pre_sync`, which runs on every sync that runs hooks at all. A gate that could be
 switched off by a setting meant for something else would not be much of a gate.
 
-The trust boundary is structural, not a scan: hooks are only ever read from the
-consumer's own `phora.toml`/`phora.local.toml`. A synced source tree is projected as
-content and never parsed as configuration, so a `phora.toml` that rides along inside
-a source can declare any hook it likes and none of it will ever run.
+The trust boundary is structural, not a scan: phora reads hooks only from the
+consumer's own `phora.toml`/`phora.local.toml`. It projects a synced source tree as
+content and never parses it as configuration, so a `phora.toml` that rides along
+inside a source can declare any hook it likes and none of it will ever run.
 
 ### Composing a dependency graph
 

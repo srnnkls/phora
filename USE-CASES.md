@@ -1,9 +1,9 @@
 # phora, by use case
 
-Start with the situation that matches yours; the sections are independent. Every
-full recipe puts its limits first and a working configuration after. The closing
-catalogue only sketches smaller fits. Use the [README](README.md) for reference
-and the [guide](GUIDE.md) for internals.
+Start with the situation that matches yours — the sections are independent, and
+every full recipe puts its limits first, a working configuration after. The
+closing catalogue only sketches smaller fits. Use the [README](README.md) for
+reference and the [guide](GUIDE.md) for internals.
 
 ## Contents
 

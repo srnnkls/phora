@@ -9,16 +9,18 @@
 ## About
 
 Phora keeps selected files from git repositories, local directories, and HTTPS downloads in sync
-with the directories on your machine that consume them. You pick which files from each source land
-where. Remote content is pinned to an exact commit and every deployed file is checked by content
-hash; an interrupted run picks up where it stopped.
+with the directories on your machine that consume them. Each source publishes an offer of paths;
+each target takes the slice it wants. `phora.lock` pins every source to one commit, the registry
+records a blake3 digest per deployed file, and an interrupted run resumes where it
+stopped.
 
 Reach for it when shared configuration, editor setups, prompt or skill bundles, or release assets
 live in one or more repositories but have to show up wherever other tools look for them.
 
-This README is the reference: install steps, every command, every configuration key.
-[The guide](GUIDE.md) explains the mental model and why the design landed where it did.
-[The use cases](USE-CASES.md) are worked configurations, one per situation.
+This README is the reference: install steps, every command, every configuration key. Read [the
+guide](GUIDE.md) for what sits underneath — the offer/take split, the bare mirrors phora reads out
+of — and why the design landed there; [the use cases](USE-CASES.md) are worked configurations, one
+per situation.
 
 ## Installation
 
@@ -99,9 +101,9 @@ all verified
 ```
 
 `phora sync` resolves `main` to an exact commit, records it in `phora.lock`, and deploys the
-selected file into `out`. `phora list` reports what landed. `phora verify` re-hashes the deployed
-bytes against phora's record and exits non-zero when the two disagree, which makes it a serviceable
-CI check.
+selected file into `out`; `phora list` then reports what landed. `phora verify` re-hashes the
+deployed bytes against phora's record and exits non-zero when the two disagree, which makes it a
+serviceable CI check.
 
 From there: `phora preview` shows what a sync would do before it does it, and `phora add` and
 `phora bind` edit the configuration so you don't have to.
@@ -201,9 +203,9 @@ everything deployed.
 
 Show the offline dry run. Per target it reports each binding's identity, the artifacts it selects,
 and where they would land; commits come from the lock and trees from the mirror, so nothing touches
-the network. A collapsed directory carries a trailing slash. An unsynced source is annotated
-(`not locked`, `needs sync`, or `link working tree gone`) rather than fetched, and the command still
-exits 0. Predicted flat-layout collisions render as warnings.
+the network. A collapsed directory carries a trailing slash, and predicted flat-layout collisions
+render as warnings. Rather than fetch an unsynced source, phora annotates it — `not locked`,
+`needs sync`, or `link working tree gone` — and still exits 0.
 
 | Flag | Meaning |
 | --- | --- |
