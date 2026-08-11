@@ -1,10 +1,7 @@
 # The phora guide
 
-This is the long-form companion to the [README](README.md). Where the README
-stays terse — every flag in one place — the guide walks you through: it starts
-with a working setup, explains how phora works, and then goes under the hood into
-how phora actually stores, fetches, and verifies things. Read it top to bottom
-the first time; after that, jump to the section you need.
+The [README](README.md) has the flags; this guide explains the machinery. Start
+at the top the first time — later chapters lean on earlier ones.
 
 ## Contents
 
