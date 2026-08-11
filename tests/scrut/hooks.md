@@ -333,10 +333,10 @@ deployed
 
 ## A failing pre_deploy with default on-fail aborts the whole sync
 
-Two targets share one source. BTreeMap iteration deploys `aaa` first, then reaches `zzz`,
-whose `pre_deploy` exits non-zero under the default `abort`. The gate halts the entire sync:
-`zzz` never deploys, the failure renders with `[pre_deploy]`, and the global `post_sync` never
-runs. `aaa` — already deployed before `zzz` was reached — is NOT rolled back.
+Two targets share one source. Every target's `pre_deploy` gate runs before any target mutates,
+and `zzz`'s exits non-zero under the default `abort`. The gate halts the entire sync before the
+first deploy: neither `aaa` nor `zzz` deploys, the failure renders with `[pre_deploy]`, and the
+global `post_sync` never runs. Nothing is rolled back, because nothing was applied.
 
 ```scrut
 $ cd "$ROOT" && mkdir -p d2 && cd d2 && isolate_state && seed_config_pre_deploy_abort "$(make_git_source proj)" && echo seeded
@@ -357,11 +357,12 @@ $ phora sync >/dev/null 2>&1; test $? -ne 0 && echo nonzero
 nonzero
 ```
 
-The earlier target `aaa` stayed deployed — abort does not roll back targets that already landed.
+The earlier target `aaa` never deployed — the gates run ahead of every deploy, so an abort
+leaves the whole run unapplied.
 
 ```scrut
-$ test -e "$PWD/target-aaa/editor/init.lua" && echo first-present
-first-present
+$ test -e "$PWD/target-aaa/editor/init.lua" && echo first-present || echo first-absent
+first-absent
 ```
 
 The aborting target `zzz` deployed nothing — the gate fired before its deploy.
