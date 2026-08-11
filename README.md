@@ -11,8 +11,7 @@
 Phora keeps selected files from git repositories, local directories, and HTTPS downloads in sync
 with the directories on your machine that consume them. Each source publishes an offer of paths;
 each target takes the slice it wants. `phora.lock` pins every source to one commit, the registry
-records a blake3 digest per deployed file, and an interrupted run resumes where it
-stopped.
+records a blake3 digest per deployed file, and an interrupted run resumes where it stopped.
 
 Reach for it when shared configuration, editor setups, prompt or skill bundles, or release assets
 live in one or more repositories but have to show up wherever other tools look for them.
