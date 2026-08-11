@@ -90,6 +90,126 @@ $ test -f "$PWD/target-home/editor/init.lua" && test ! -e "$PWD/target-home/READ
 projected
 ```
 
+## Ask instead of guessing
+
+When a path does or does not ship and the refinement is not obvious by eye,
+`phora check-match` answers for a single path, and shows the include and exclude
+lists it judged against.
+
+```scrut
+$ phora check-match --source src-dotfiles editor/init.lua 2>&1 | normalize
+artifact `editor`: allowed
+path `editor/init.lua`: allowed
+include: ["editor", "lint"]
+exclude: []
+```
+
+```scrut
+$ phora check-match --source src-dotfiles README.md 2>&1 | normalize
+artifact `README.md`: excluded
+path `README.md`: excluded
+include: ["editor", "lint"]
+exclude: []
+```
+
+## Read the lock
+
+The lock is small enough to read whole. One entry per source: where it came
+from, the revision that was asked for, the commit that revision resolved to, a
+digest over the projected content, and a digest over the export-affecting
+config. The last of those is how phora notices you changed *what* ships even
+when upstream has not moved.
+
+```scrut
+$ cat phora.lock | normalize
+version = 1
+
+[[sources]]
+name = "src-dotfiles"
+git = "<ROOT>/src-dotfiles"
+resolved = "default"
+commit = "ca94c83b3a51aab8dea8315a9baa986e178c599d"
+digest = "blake3:11b617bf6382560c7adb2d6543f9843c8e36d168dc23b6735611c5656ff17624"
+config_digest = "blake3:b8e08f8762862914cb929c8180e62a901e1c24410f47ac2742b299166f16a58e"
+```
+
+## Edit against a working tree
+
+Iterating on the config through commit-and-sync means a commit per keystroke.
+For that loop, point the source at a local checkout and deploy it by symlink
+instead. `phora.local.toml` overlays the committed config key by key and is
+never committed, so the loop cannot leak into shared config. A directory shaped
+like the repo stands in for the checkout.
+
+```scrut
+$ mkdir -p dev-dotfiles/editor dev-dotfiles/lint && printf -- '-- work in progress\n' > dev-dotfiles/editor/init.lua && printf '[rules]\n' > dev-dotfiles/lint/rules.toml && echo staged
+staged
+```
+
+```scrut
+$ printf 'version = 1\n\n[sources.src-dotfiles]\npath = "./dev-dotfiles"\ndeploy = "link"\n' > phora.local.toml && echo overlaid
+overlaid
+```
+
+The next sync reports the transition it is making — the source moves from the
+locked commit to link mode — and relinks the target.
+
+```scrut
+$ phora sync 2>&1 | normalize
+phora: src-dotfiles → home: default (ca94c83b) → default (link)
+sync complete
+```
+
+Both artifacts are now symlinks into the working tree, so edits show up without
+re-syncing.
+
+```scrut
+$ phora list 2>&1 | normalize
+home:
+  src-dotfiles/editor  linked
+  src-dotfiles/lint  linked
+```
+
+```scrut
+$ readlink "$PWD/target-home/editor" | normalize
+<ROOT>/dev-dotfiles/editor
+```
+
+A linked artifact sits outside the integrity model: its bytes change underfoot,
+so phora records `link` in place of a commit and a content digest rather than
+hashing something that will not stay true. `--artifact` narrows the query to one
+artifact.
+
+```scrut
+$ phora where --artifact editor 2>&1 | normalize
+Artifact: src-dotfiles/editor (commit link, digest link:)
+  - home
+```
+
+Link mode trades that content guarantee for live edits. Removing the overlay
+ends the loop, and the next sync puts the pinned, verifiable copies back.
+
+```scrut
+$ rm phora.local.toml && phora sync 2>&1 | normalize
+phora: src-dotfiles → home: link (link) → default (ca94c83b)
+sync complete
+```
+
+The half-written edit stayed in the working tree where it belongs; the target is
+back on the locked commit, hashed and clean.
+
+```scrut
+$ test ! -L "$PWD/target-home/editor" && cat "$PWD/target-home/editor/init.lua"
+-- init
+```
+
+```scrut
+$ phora list 2>&1 | normalize
+home:
+  src-dotfiles/editor  ✓ clean
+  src-dotfiles/lint  ✓ clean
+```
+
 ## Layer a machine-local overlay
 
 Not everything belongs in the shared, committed config. Machine-specific files
@@ -171,6 +291,10 @@ machine -> <ROOT>/target-machine
   overlay-machine@link config/ -> <ROOT>/target-machine/config
   overlay-machine@link notes.txt -> <ROOT>/target-machine/notes.txt
 ```
+
+Where a whole directory ships as one artifact it collapses to a single entry,
+which preview marks with a trailing slash; `notes.txt` is a lone file and
+carries none.
 
 The deployed overlay entry is a real symlink pointing back at the source
 directory.
