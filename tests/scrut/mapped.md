@@ -5,18 +5,19 @@ You keep one `AGENTS.md`. Then Claude wants it as `CLAUDE.md`, Codex wants
 A binding's `take` can *rename* as it subsets — `{ "<source-leaf>" = "<dest>" }`
 projects one offered file to a new destination name — so one upstream file lands
 under as many names as you need, with no copies in the source tree. This suite
-drives the real [github/spec-kit](https://github.com/github/spec-kit) repository,
-which carries an `AGENTS.md` at its root, pinned to tag `v0.9.5`.
+drives a source repository that carries an `AGENTS.md` at its root — the shape a
+spec or toolkit repo publishes — pinned to tag `v0.9.5`.
 
-State is hermetic — the first command points `HOME` and the XDG cache/state
-roots at scrut's per-document tempdir; the clone is real. Both the commit and
-the content digests are functions of the pinned tag, so they are asserted
-verbatim.
+State is hermetic — `isolate_state` points `HOME` and the XDG cache/state roots
+at scrut's per-document tempdir, and the clone is a real git clone whose remote
+URL is redirected onto a local fixture repo through git's `insteadOf`, so the
+run never leaves the machine. Both the commit and the content digests are
+functions of the pinned tag, so they are asserted verbatim.
 
 ## Start
 
 ```scrut
-$ export HOME="$PWD" XDG_CACHE_HOME="$PWD/cache" XDG_STATE_HOME="$PWD/state" && mkdir -p cache state && echo ready
+$ source "$TESTDIR"/_setup.sh && isolate_state && SPECKIT="$(make_agents_source speckit v0.9.5)" && map_insteadof https://github.com/mock/spec-kit.git "$SPECKIT" && echo ready
 ready
 ```
 
@@ -29,8 +30,7 @@ $ cat > phora.toml <<'EOF'
 > version = 1
 >
 > [sources.speckit]
-> host = "github"
-> repo = "github/spec-kit"
+> git = "https://github.com/mock/spec-kit.git"
 > tag = "v0.9.5"
 >
 > [targets.agents]
@@ -70,9 +70,9 @@ so a rename gets its own artifact identity rather than sharing its source's:
 
 ```scrut
 $ phora where
-Artifact: claude/CLAUDE.md (commit 2262359d, digest blake3:38d1217ec20920f27c44f77ff41e5fd86ca20d4333cbb82d1500e08506b6b7e7)
+Artifact: claude/CLAUDE.md (commit 5aba8ba6, digest blake3:18edef6025f6e39a436927839fb730686e71611cf058344220f168e9b8933ef9)
   - agents
-Artifact: speckit/AGENTS.md (commit 2262359d, digest blake3:da624a4a2e65f152094aa3ec6ba4286e34077996b699368e92fda50a3bd3551c)
+Artifact: speckit/AGENTS.md (commit 5aba8ba6, digest blake3:cc6e38348c0ce69167b988ed3678d3587e3f1a344c21d76ab0d852bb055dcf01)
   - agents
 ```
 
@@ -83,8 +83,8 @@ can see the offered leaf, the name it takes, and where it lands:
 ```scrut
 $ phora preview
 agents -> agent-config
-  claude@2262359d AGENTS.md -> CLAUDE.md -> agent-config/CLAUDE.md
-  speckit@2262359d AGENTS.md -> agent-config/AGENTS.md
+  claude@5aba8ba6 AGENTS.md -> CLAUDE.md -> agent-config/CLAUDE.md
+  speckit@5aba8ba6 AGENTS.md -> agent-config/AGENTS.md
 ```
 
 ## Two names that fight
@@ -99,8 +99,7 @@ $ cat > phora.toml <<'EOF'
 > version = 1
 >
 > [sources.speckit]
-> host = "github"
-> repo = "github/spec-kit"
+> git = "https://github.com/mock/spec-kit.git"
 > tag = "v0.9.5"
 >
 > [targets.agents]
@@ -130,8 +129,7 @@ $ cat > phora.toml <<'EOF'
 > version = 1
 >
 > [sources.speckit]
-> host = "github"
-> repo = "github/spec-kit"
+> git = "https://github.com/mock/spec-kit.git"
 > tag = "v0.9.5"
 >
 > [targets.agents]
@@ -163,8 +161,7 @@ $ cat > phora.toml <<'EOF'
 > version = 1
 >
 > [sources.speckit]
-> host = "github"
-> repo = "github/spec-kit"
+> git = "https://github.com/mock/spec-kit.git"
 > tag = "v0.9.5"
 >
 > [targets.agents]
@@ -224,8 +221,7 @@ $ cat > phora.toml <<'EOF'
 > version = 1
 >
 > [sources.speckit]
-> host = "github"
-> repo = "github/spec-kit"
+> git = "https://github.com/mock/spec-kit.git"
 > tag = "v0.9.5"
 >
 > [targets.agents]

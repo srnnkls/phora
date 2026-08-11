@@ -1,18 +1,20 @@
 # One source, two versions
 
-fzf's shell integration — completions and key bindings — changes occasionally
+A tool's shell integration — completions and key bindings — changes occasionally
 across releases, and reviewing the diff before deploying beats finding out after.
-This suite holds fzf v0.55.0 and v0.56.0 side by side in one target, from one
-mirror, then promotes the newer one and lets `--prune` clean up.
+This suite holds a source's v0.55.0 and v0.56.0 side by side in one target, from
+one mirror, then promotes the newer one and lets `--prune` clean up.
 
-State is hermetic — the first command points `HOME` and the XDG cache/state
-roots at scrut's per-document tempdir; the clone of github.com/junegunn/fzf is
-real. Both refs are release tags, so every hash below is stable.
+State is hermetic — `isolate_state` points `HOME` and the XDG cache/state roots
+at scrut's per-document tempdir, and the clone is a real git clone whose remote
+URL is redirected onto a local fixture repo through git's `insteadOf`, so the
+run never leaves the machine. The fixture carries both release tags, so every
+hash below is stable.
 
 ## Start
 
 ```scrut
-$ export HOME="$PWD" XDG_CACHE_HOME="$PWD/cache" XDG_STATE_HOME="$PWD/state" && mkdir -p cache state && echo ready
+$ source "$TESTDIR"/_setup.sh && isolate_state && SHELLKIT="$(make_two_tag_source shellkit v0.55.0 v0.56.0)" && map_insteadof https://github.com/mock/shellkit.git "$SHELLKIT" && echo ready
 ready
 ```
 
@@ -26,8 +28,8 @@ directory labels, so the two versions cannot collide:
 $ cat > phora.toml <<'EOF'
 > version = 1
 >
-> [sources.fzf]
-> git = "https://github.com/junegunn/fzf.git"
+> [sources.shellkit]
+> git = "https://github.com/mock/shellkit.git"
 > tag = "v0.55.0"
 > include = ["shell"]
 >
@@ -36,8 +38,8 @@ $ cat > phora.toml <<'EOF'
 > layout = "by-source"
 >
 > [targets.shell.sources]
-> stable = { source = "fzf" }
-> canary = { source = "fzf", tag = "v0.56.0" }
+> stable = { source = "shellkit" }
+> canary = { source = "shellkit", tag = "v0.56.0" }
 > EOF
 ```
 
@@ -60,8 +62,8 @@ shell:
 ```scrut
 $ phora preview
 shell -> shell-integration
-  canary@ff168774 shell/ -> shell-integration/canary/shell
-  stable@fc693080 shell/ -> shell-integration/stable/shell
+  canary@7f2085f6 shell/ -> shell-integration/canary/shell
+  stable@02c9b936 shell/ -> shell-integration/stable/shell
 ```
 
 Two different commits, two different content digests — same source, same
@@ -69,9 +71,9 @@ mirror:
 
 ```scrut
 $ phora where
-Artifact: canary/shell (commit ff168774, digest blake3:2de40a4c3e2bd2e47e08233f7b66e2562007bb2a4d023225b24631a1ab37b698)
+Artifact: canary/shell (commit 7f2085f6, digest blake3:345bb599d66321076f56b55943d1aab0f93a298559536e24f8897be38ffda5af)
   - shell
-Artifact: stable/shell (commit fc693080, digest blake3:39cdc3c10ad1b93ac21c9459a1c8296be2fe8b230427faf3907c99dbb9bfc4ab)
+Artifact: stable/shell (commit 02c9b936, digest blake3:def4f177464644f9387fd4373997f6aa64d3b2bff25400268a00172b010d0599)
   - shell
 ```
 
@@ -109,14 +111,14 @@ bare binding:
 $ cat > phora.toml <<'EOF'
 > version = 1
 >
-> [sources.fzf]
-> git = "https://github.com/junegunn/fzf.git"
+> [sources.shellkit]
+> git = "https://github.com/mock/shellkit.git"
 > tag = "v0.56.0"
 > include = ["shell"]
 >
 > [targets.shell]
 > path = "shell-integration"
-> sources = ["fzf"]
+> sources = ["shellkit"]
 > layout = "by-source"
 > EOF
 ```
@@ -127,7 +129,7 @@ no longer names:
 
 ```scrut
 $ phora sync --prune 2>&1
-phora: fzf → shell: v0.55.0 (fc693080) → v0.56.0 (ff168774)
+phora: shellkit → shell: v0.55.0 (02c9b936) → v0.56.0 (7f2085f6)
 phora: pruning orphaned canary:shell
 phora: pruning orphaned stable:shell
 sync complete
@@ -136,12 +138,12 @@ sync complete
 ```scrut
 $ phora list
 shell:
-  fzf/shell  ✓ clean
+  shellkit/shell  ✓ clean
 ```
 
 ```scrut
 $ phora where
-Artifact: fzf/shell (commit ff168774, digest blake3:2de40a4c3e2bd2e47e08233f7b66e2562007bb2a4d023225b24631a1ab37b698)
+Artifact: shellkit/shell (commit 7f2085f6, digest blake3:345bb599d66321076f56b55943d1aab0f93a298559536e24f8897be38ffda5af)
   - shell
 ```
 
@@ -158,6 +160,6 @@ Note: prune removes the files it tracked, but the now-empty `stable/` and
 ```scrut
 $ find shell-integration -mindepth 1 -maxdepth 1 | LC_ALL=C sort
 shell-integration/canary
-shell-integration/fzf
+shell-integration/shellkit
 shell-integration/stable
 ```

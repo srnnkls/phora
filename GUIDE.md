@@ -252,8 +252,8 @@ single file:
 
 ```toml
 [sources.fzf-bin]
-url = "https://github.com/junegunn/fzf/releases/download/0.55.0/fzf-0.55.0-linux_amd64.tar.gz"
-digest = "sha256:0123…"   # optional; verified before extraction
+url = "https://github.com/junegunn/fzf/releases/download/v0.55.0/fzf-0.55.0-linux_amd64.tar.gz"
+digest = "sha256:4df2393776942780ddab2cea713ddaac06cd5c3886cd23bc9119a6d3aa1e02bd"   # optional; verified before extraction
 include = ["fzf"]
 ```
 
