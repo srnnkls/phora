@@ -27,7 +27,12 @@ why phora did what it did — or what to do when it didn't.
 - [Renaming leaves: one file under another name](#renaming-leaves-one-file-under-another-name)
 - [Collapse: how a taken set materializes](#collapse-how-a-taken-set-materializes)
 - [Staying in sync](#staying-in-sync)
-- [Hooks: running commands after a sync](#hooks-running-commands-after-a-sync)
+  - [When upstream drops something you deployed](#when-upstream-drops-something-you-deployed)
+  - [Orphans: records whose target left the config](#orphans-records-whose-target-left-the-config)
+- [Hooks: running commands around a sync](#hooks-running-commands-around-a-sync)
+  - [Gates: `pre_sync` and `pre_deploy`](#gates-pre_sync-and-pre_deploy)
+  - [After the files land: `on_change` and `post_sync`](#after-the-files-land-on_change-and-post_sync)
+  - [How a hook is written](#how-a-hook-is-written)
 - [Templating: per-machine values](#templating-per-machine-values)
 - [The local dev loop: link mode](#the-local-dev-loop-link-mode)
 - [Transitive dependencies](#transitive-dependencies)
@@ -42,7 +47,7 @@ why phora did what it did — or what to do when it didn't.
   - [Fetching a git source](#fetching-a-git-source)
   - [Fetching and importing a URL source](#fetching-and-importing-a-url-source)
   - [Why a URL import is deterministic](#why-a-url-import-is-deterministic)
-  - [Projection and the content digest](#projection-and-the-content-digest)
+  - [Staging and the content digest](#staging-and-the-content-digest)
   - [The lock and content identity](#the-lock-and-content-identity)
   - [Templating and the two digests](#templating-and-the-two-digests)
   - [Versioning, the git way](#versioning-the-git-way)
@@ -174,8 +179,9 @@ phora verify      # re-hash every deployed file against the record; exit 0 if al
 ```
 
 `phora verify` is what the record is for: the difference between "the files are
-there" and "the files are exactly what phora put there." It exits
-non-zero on the first mismatch, so it fits into a pre-commit hook or CI check.
+there" and "the files are exactly what phora put there." It reports every
+mismatch it finds and exits non-zero if there was one, so it fits into a
+pre-commit hook or CI check.
 
 Later, to pick up upstream changes:
 
@@ -192,7 +198,11 @@ reaches for new commits.
 ### Git sources
 
 A git source names a repository and a point in its history. Pin exactly one of
-`branch`, `tag`, or `rev`; setting two is a config error.
+`branch`, `tag`, or `rev`; setting two is a config error. A `rev` is a whole commit
+id — forty hex characters, or sixty-four for a SHA-256 repository. An abbreviated sha
+is rejected rather than expanded, because an abbreviation is only unique until it is
+not, and a lockfile that silently starts pointing somewhere else is precisely the
+failure a lockfile exists to prevent.
 
 You can declare the remote two ways. Literally:
 
@@ -227,9 +237,16 @@ A third form names a local checkout directly:
 
 ```toml
 [sources.dignity]
-path = "~/projects/dignity"   # a local filesystem path, used verbatim as the remote
+path = "/home/me/projects/dignity"   # a local filesystem path, used verbatim as the remote
 branch = "main"
 ```
+
+Write that path out in full. "Used verbatim" is meant literally: a source's `path`
+goes to git exactly as you wrote it, with no expansion of any kind, so a leading `~`
+is read as a directory actually named `~` and the source fails to open. Tilde
+expansion is a *target* feature — a target's `path` is a destination phora itself
+creates and writes into, so it does the expanding — and it does not reach across to
+the source side.
 
 A bare `path = "owner/repo"` (no `host`) is a *local* path, not a forge shorthand —
 the github shorthand is the bare `repo = "owner/repo"`. A local source is what
@@ -358,6 +375,13 @@ so a target with no `sources` key — or an empty `sources = []` — deploys not
 all. The [next section](#bindings-per-target-selection) is entirely about that edge.
 You can edit the set with `phora bind <source> --to <target>` and `phora unbind
 <identity> --from <target>`, or write the table by hand.
+
+Deleting a target is guarded, because deleting the block does not delete the files
+it put on disk. `phora target rm <name>` reads the registry first, and if that target
+still has artifacts deployed it refuses, listing them, and tells you to unbind and
+`phora sync --prune` instead. `--force` deletes the target block anyway and strands
+the deployed files, which is occasionally what you want and never what you want by
+accident.
 
 A config can declare as many targets as you like, each with its own path, layout,
 and bindings. One source can fan out across several targets — a `dotfiles` source
@@ -644,7 +668,7 @@ leaves.
 ## Staying in sync
 
 `phora sync` is the workhorse. It resolves each source against the lock, projects
-artifacts, and reconciles what is on disk with what should be there. Two flags
+artifacts, and reconciles what is on disk with what should be there. Three flags
 change its disposition:
 
 - `--prune` also removes artifacts that the registry tracks but the config no
@@ -653,6 +677,8 @@ change its disposition:
   the now-unselected leaves, never its siblings.
 - `--force` overwrites locally modified or foreign files instead of stopping to
   ask.
+- `--fast-forward` lets a moved pin delete what the new commit no longer offers,
+  instead of stopping (below).
 
 About that asking: when sync finds a file that was changed outside phora, or a
 foreign file sitting where an artifact wants to land, it prompts on a TTY —
@@ -670,18 +696,121 @@ foreign file sitting where an artifact wants to land, it prompts on a TTY —
 checkout or in CI. With it, sources re-resolve to their latest commit and the lock
 advances — for a URL source, only if the downloaded content actually changed.
 
-## Hooks: running commands after a sync
+### When upstream drops something you deployed
 
-Deploying the files is sometimes not the last step — a font cache may need
-rebuilding, a plugin manager a sync, an index a refresh. A hook is a shell command
-phora runs *after* it has written the files. Hooks live only in your config
-(`phora.toml` or `phora.local.toml`); a synced source tree that happens to carry its
-own `phora.toml` is inert content, read as files and never executed.
+Advancing a pin can withdraw an artifact: you deployed `y/` at one commit, upstream
+deleted it, and at the new commit the source no longer offers it. phora's default
+here is to stop rather than to act, because "the config still asks for it and the
+upstream no longer has it" is more often a mistake than an instruction:
 
-There are two kinds. A target's `on_change` fires once after a sync that *added or
-changed* that target's artifacts — a pure no-op sync runs nothing, and pure removals
-don't count either. The global `[hooks] post_sync` runs after *every* sync, change
-or not:
+```
+error: sync error: selection: one:demo:y — a recorded artifact is no longer in the source's offer
+matched against: the current offer of source `demo` in target `one`
+binding: source `demo` → target `one`
+pin: recorded 4f36e737 → now main (1b7efaa0)
+path: out/y
+remedy: re-sync with `--fast-forward` to drop it, or eject it before removing it
+```
+
+`sync --fast-forward` (and `update --fast-forward`) opts into following the pin:
+phora deletes the artifacts the new commit dropped and says so, one line per drop.
+Only an ordinary immutable copy is ever deleted this way — a linked artifact, or a
+link binding phora cannot positively attribute, always seals, because there is no
+content record to justify removing someone's live checkout.
+
+### Orphans: records whose target left the config
+
+Deleting a `[targets.<t>]` block removes the *instruction* to deploy; the files it
+already deployed stay where they are, and so does their registry record. Such a
+record is an *orphan*. phora will not clean it up behind your back, but it will not
+let you forget about it either — every sync that finds one says so:
+
+```
+phora: 1 orphaned record(s) with no config target — run `phora list --orphans` to inspect, `phora sync --prune` to remove
+```
+
+`phora list --orphans` shows each orphan with the path it actually occupies on
+disk, reconstructed from the record rather than guessed from the current config:
+
+```
+orphaned records (no config target):
+  demo/cfg  out2/cfg  [was two]
+```
+
+That reconstruction is why the record stores a snapshot of the target's expanded
+path at deploy time — the config that would have told you where the files went is
+gone. `sync --prune` then deletes the files as well as the record. In the rare case
+where the on-disk path cannot be reconstructed exactly, phora drops the record and
+warns instead of deleting a path it inferred; better a stale directory than a
+wrong deletion.
+
+## Hooks: running commands around a sync
+
+Writing the files is rarely the whole job. A font cache may need rebuilding, a
+plugin manager a sync, an index a refresh — and sometimes a check has to pass
+*before* phora is allowed to touch anything at all. A hook is a command phora runs
+at one of four points in a sync, two of them before the deploy and two after it.
+
+Hooks live only in your config (`phora.toml` or `phora.local.toml`). A synced source
+tree that happens to carry its own `phora.toml` is inert content: phora reads it as
+files and never as configuration, so it cannot smuggle a hook onto your machine.
+(An imported [transitive dependency](#trusting-a-dependencys-hooks) is the one place
+a foreign hook can exist at all, and it does not run until you approve it by hand.)
+`phora sync --no-hooks` deploys with every hook — gates included — switched off.
+
+### Gates: `pre_sync` and `pre_deploy`
+
+A gate is a hook whose exit status decides whether the sync proceeds. Both gates run
+after phora has fetched, resolved and planned everything, and before it has written
+a single byte to a target. That ordering is the point: by the time a gate runs, phora
+knows exactly what it is about to do, and nothing it is about to do has happened yet.
+
+The global `[hooks] pre_sync` runs once per sync, and a non-zero exit aborts the
+whole run — no target deploys, nothing is pruned, and no later hook fires. It is the
+place for a precondition that is about the machine rather than about any one target:
+
+```toml
+[hooks]
+pre_sync = "test -w ~/.config"
+```
+
+A `pre_sync` hook is handed `$PHORA_TARGETS`, the space-separated names of the
+targets this run will touch.
+
+Per-target `[targets.<t>.hooks] pre_deploy` gates one target, and is handed
+`$PHORA_TARGET` and `$PHORA_TARGET_PATH` — the target's name and its path. The
+useful case is a tool that must be told about a directory before content appears in
+it, or a check that this particular destination is safe to write:
+
+```toml
+[targets.editor.hooks]
+pre_deploy = { cmd = ["mise", "trust"] }
+pre_deploy_on_fail = "skip"
+```
+
+What a failing `pre_deploy` means is yours to choose, and the default is the strict
+reading. Under `pre_deploy_on_fail = "abort"` — the default — a failed gate aborts
+the entire sync, not just its own target. That is deliberate, and it is the reason
+every target's gate runs before any target is written: a config where three targets
+must land together is far more common than one where they are genuinely independent,
+and a half-applied sync is the state that is hardest to reason about afterwards. If
+your targets really are independent, `pre_deploy_on_fail = "skip"` says so, and a
+failed gate skips only its own target while the rest deploy normally.
+
+Either way the run reports the failure and `phora sync` exits non-zero, so a gate
+that fails is never mistaken for a sync that had nothing to do.
+
+Because a gate can itself change the disk — that is often exactly what it is for —
+phora re-reads the workspace and re-plans after the gates have run, rather than
+acting on the picture it had before.
+
+### After the files land: `on_change` and `post_sync`
+
+The other two hooks run once the deploy has committed, which means a run a gate
+aborted reaches neither of them. A target's `on_change` fires after a sync that
+*added or changed* that target's artifacts; a sync that changed nothing runs nothing,
+and so does a sync that only removed things. The global `[hooks] post_sync` runs after
+every sync that gets as far as deploying, change or not:
 
 ```toml
 [targets.config.hooks]
@@ -691,19 +820,30 @@ on_change = "mise install"
 post_sync = "git -C ~/.config add -A"
 ```
 
-A hook value is a command string, a `{ run = "…", shell = "…" }` table (the shell
-defaults to `sh -c`), or an array of either, run in declared order and deduplicated.
-An `on_change` hook is handed what changed — `$PHORA_CHANGED` (deployed paths),
-`$PHORA_CHANGED_NAMES` (artifact names), and `$PHORA_TARGET` — and it runs only
-after the files are on disk, so it can read them.
+An `on_change` hook is handed what changed — `$PHORA_CHANGED` (the deployed paths,
+one per line), `$PHORA_CHANGED_NAMES` (the artifact names, one per line), and
+`$PHORA_TARGET` — and it runs only once the files are on disk, so it can read them.
 
-The recording rules are what make hooks idempotent without you tracking anything:
+The recording rules are what make these idempotent without you tracking anything:
 
 - A hook that succeeds is recorded, so the next no-op sync does not re-run it.
 - A hook that exits non-zero is *not* recorded: `phora sync` exits non-zero too, the
   deployed files stay in place, and the hook re-fires on the next sync. Fix the
   cause, sync again, and it runs — even though no content changed.
-- `phora sync --no-hooks` deploys without running any hook.
+
+### How a hook is written
+
+Every one of the four takes the same shapes. A hook value is a command string, a
+`{ run = "…", shell = "…" }` table (the shell defaults to `sh -c`), a
+`{ cmd = ["prog", "arg"] }` table, or an array of any of those, run in declared
+order and deduplicated.
+
+The `cmd` form is the shell-free one: phora spawns the argv directly, with no shell
+between it and the process, so nothing in it is word-split and `$VAR` is a literal
+dollar sign rather than an expansion. Reach for it when an argument contains spaces
+or characters a shell would interpret; reach for `run` when you actually want shell
+features. The two forms are distinct identities as far as phora is concerned, so the
+same command written both ways is two hooks, not one.
 
 Each hook that ran is reported with its scope and status, so a sync that triggers
 one reads:
@@ -712,6 +852,9 @@ one reads:
 hook config#mise install#sh -c [on_change] `mise install` ok
 sync complete
 ```
+
+The exact set of environment variables each phase receives is tabulated in the
+[README](README.md#hooks).
 
 ## Templating: per-machine values
 
@@ -742,7 +885,11 @@ The `.tmpl` suffix is the opt-in; a binding can widen it to arbitrary globs
 (`template = ["*.conf"]`, rendered *in addition to* `*.tmpl`) or switch it off
 entirely (`template = false`). Rendering is strict: a reference to an undefined
 variable aborts that one artifact's export — its siblings still deploy — so a typo
-fails loudly instead of shipping a half-rendered file.
+fails loudly instead of shipping a half-rendered file. It is also bounded. A
+template comes from a source, and a source is not necessarily something you wrote,
+so the rendering environment is given a fixed budget of a million operations; a
+template that loops without end runs out of budget and fails that artifact rather
+than hanging the sync.
 
 The integrity story is the subtle part, and it is deliberate. phora hashes the
 *rendered* bytes into the registry, so `phora verify` checks the output you actually
@@ -756,11 +903,10 @@ name and flags what renders (`mise/config.toml (templated)`).
 ## The local dev loop: link mode
 
 The default deploy mode, `copy`, materializes each artifact from the committed git
-object store: a point-in-time, content-hashed, verifiable copy (a copy-on-write
-reflink where the filesystem supports it — see [projection](#projection-and-the-content-digest)).
-That is the right default, but it is the wrong loop when you are actively editing
-the source — you do
-not want to commit and re-sync after every keystroke.
+object store: a point-in-time, content-hashed, verifiable copy, moved into place in
+a single atomic step (see [staging](#staging-and-the-content-digest)). That is the
+right default, but it is the wrong loop when you are actively editing the source —
+you do not want to commit and re-sync after every keystroke.
 
 `deploy = "link"` swaps the copy for a symlink pointing at the source's live
 working tree. Edits show up through the target immediately, no re-sync:
@@ -768,17 +914,21 @@ working tree. Edits show up through the target immediately, no re-sync:
 ```toml
 # phora.local.toml — overlays phora.toml, never committed
 [sources.loqui]
-path = "~/projects/loqui"   # a local checkout
+path = "/home/me/projects/loqui"   # a local checkout, spelled out in full
 deploy = "link"
 ```
 
 Two rules apply:
 
-- The source must be a local filesystem path. A `path = "/dir"` source (or the
-  `git = "/dir"` alias) qualifies; linking a remote URL is a config error that
-  names the source. A relative path counts as local only if it resolves against the
-  working directory — a relative path that does not yet exist is rejected as "not
-  local".
+- The source must be a local filesystem path, written out rather than abbreviated.
+  A `path = "/dir"` source (or the `git = "/dir"` alias) qualifies; linking a remote
+  URL is a config error that names the source. A relative path counts as local only
+  if it resolves against the working directory — a relative path that does not yet
+  exist is rejected as "not local". A `~/` prefix does not expand on a source path,
+  and since a directory literally named `~` almost never exists, the usual result is
+  that link mode rejects the source as not a local filesystem path — a confusing
+  thing to be told about a checkout sitting right there in your home directory. Give
+  it the absolute path.
 - Link mode is allowed in either `phora.toml` or `phora.local.toml`, but a
   committed link over an *absolute* path is rarely portable — an absolute checkout
   path means something different on every machine. So a committed link over an
@@ -905,8 +1055,10 @@ untrusted and boxes it in. A composed dependency can only ever write *inside* it
 anchor. phora rejects, at compose or write time, a dependency target path that
 escapes the anchor with `..`, is absolute, or carries an unsafe component; a write
 whose anchor ancestor is a symlink (so a planted link cannot redirect the write out
-of the tree); and any write into a protected path — your `phora.toml`/`phora.lock`,
-`.git`, and phora's own cache and state roots. A transitive source may not use
+of the tree); and any write into a protected path — your `phora.toml`,
+`phora.local.toml`, `phora.lock` and `phora.local.lock`, the project's `.git`,
+phora's cache root, and the `projects/` tree under its state root. A transitive
+source may not use
 `deploy = "link"` either, since a link would point at an unconfinable mirror path;
 your own link sources are unaffected.
 
@@ -980,6 +1132,22 @@ so a drifted or dropped pin cannot pass silently. It is the offline mode for CI 
 reproducible checkouts, where the lock is the only source of truth. As with any other field, a `phora.local.toml`
 overlay can flip a source to `transitive = true` for one machine alone.
 
+`--frozen` also relaxes one thing, for the environment it was built for: a
+read-only state root. In CI, or from a container that mounts the state directory
+without write access, phora would ordinarily fail on taking its own lock. Under
+`--frozen` alone, a state root it cannot write to is not an error — phora carries on
+without the lock, reading the journal but never appending to it. Contention is a
+different matter and stays fatal: if another phora process really is holding the
+lock, `--frozen` still exits `75`, because there is nothing safe about reading state
+a live writer is in the middle of changing.
+
+The bargain is that a lockless run must genuinely be a no-op. If such a run turns
+out to have something to do — an artifact to deploy, a stale record to refresh, a
+hook success to record — it errors out and names the read-only state root rather
+than acting and failing to record it. That is exactly what you want from a check:
+`--frozen` on a read-only state root either confirms the workspace already matches
+the lock, or tells you it does not.
+
 ## Under the hood
 
 Everything above is the contract; this is the machinery behind it. None of it is
@@ -988,29 +1156,31 @@ phora is actually doing to your disk.
 
 ### One store for everything
 
-phora keeps its state in two XDG-rooted trees, split by who owns the bytes — a
-*cache root* for regenerable git mirrors and a *state root* for the machine-local
-records that cannot be regenerated:
+phora keeps its state in two trees, XDG-rooted by default and split by who owns the
+bytes — a *cache root* for regenerable git mirrors and a *state root* for the
+machine-local records that cannot be regenerated:
 
-- `<cache>/git/<MirrorKey>.git` — bare git mirrors, one per source, under the cache
-  root (`XDG_CACHE_HOME`, or by default `~/.cache/phora` on Linux and
-  `~/Library/Caches/phora` on macOS). The `MirrorKey` is the first 16 hex characters
-  of `blake3` over a *normalized* form of the remote URL. Normalization strips a
-  trailing `.git`, rewrites scp-style `git@host:owner/repo` to `host/owner/repo`,
-  drops the scheme and any userinfo, and lowercases the host. Both forms normalize
-  to the same string and hash to the same key — which is why https and ssh share a
+- `<cache>/git/<MirrorKey>.git` — bare git mirrors under the cache root
+  (`XDG_CACHE_HOME`, or by default `~/.cache/phora` on Linux and
+  `~/Library/Caches/phora` on macOS). There is one mirror per *normalized remote
+  URL*, not one per source: two sources naming the same repository share a single
+  mirror and a single fetch. The `MirrorKey` is the first 16 hex characters of
+  `blake3` over that normalized form. Normalization strips a trailing `.git`,
+  rewrites scp-style `git@host:owner/repo` to `host/owner/repo`, drops the scheme
+  and any userinfo, and lowercases the host. Every equivalent spelling normalizes to
+  the same string and hashes to the same key — which is why https and ssh share a
   mirror.
-- Per-project state, under the state root (`XDG_STATE_HOME`, or by default
-  `~/.local/state/phora` on Linux and `~/Library/Application Support/phora` on
-  macOS), keyed by a `ProjectId` — the first 16 hex characters of `blake3` over the
-  canonical project root path. This holds the deploy journal and the lock that
-  serializes phora runs, plus the registry records describing what is deployed. A
-  record lives at
+- `<state>/projects/<ProjectId>/…` — per-project state under the state root
+  (`XDG_STATE_HOME`, or by default `~/.local/state/phora` on Linux and
+  `~/Library/Application Support/phora` on macOS). The `ProjectId` is the first 16
+  hex characters of `blake3` over the project root path, canonicalized first, so two
+  paths that resolve to the same directory — a symlinked checkout, say — share one
+  id and one set of records rather than silently forking into two. This holds the
+  deploy journal, the `locks/state.lock` that serializes phora runs, and the registry
+  records describing what is deployed. A record lives at
   `…/targets/<target>/artifacts/<identity>/<artifact>.toml` — keyed by the
   *binding identity*, not the source, which is exactly what lets two slices of one
-  source coexist under one target. The record's own `source` field carries the
-  underlying source name, so `phora where --source <s>` can still find every slice
-  that draws from `s`.
+  source coexist under one target.
 
 The split is deliberate: the cache root is disposable — delete it and the next sync
 re-clones — while the state root is the authoritative record of what is on disk. An
@@ -1021,11 +1191,28 @@ the state root falls back to `~/Library/Application Support`. `XDG_DATA_HOME` an
 registry is machine-local, the mirrors regenerable) and no global config (config is
 the project-local `phora.toml`).
 
-A git source's mirror has ordinary refs (`refs/heads/*`). A URL source's mirror is
-synthetic: phora writes the downloaded content into the same bare-repo object store
-as a single commit and points `refs/heads/phora` at it. From the object store's
+A project can also place both roots itself, which is what you want when a checkout
+should be self-contained — a test fixture, a throwaway sandbox, a workspace you can
+delete in one `rm -rf`:
+
+```toml
+[paths]
+cache = ".phora-cache"
+state = ".phora-state"
+```
+
+A `[paths]` value *is* the root; phora appends no `phora` leaf to it. An absolute
+value is used verbatim, a relative one is joined under the project directory, and
+either beats both `XDG_*` and the platform default. The setting moves the protected
+set along with the roots, so [confinement](#confinement) still guards phora's own
+storage wherever you put it.
+
+A git source's mirror has ordinary refs — `refs/heads/*` and `refs/tags/*` both. A
+URL source's mirror is synthetic: phora writes the downloaded content into the same
+bare-repo object store as a single commit and points `refs/heads/phora` at it. From
+the object store's
 perspective there is no difference between the two — both are just commits with
-trees and blobs — which is precisely why the projection and verification code does
+trees and blobs — which is precisely why the staging and verification code does
 not branch on source kind.
 
 ### No working tree: the object store is the substrate
@@ -1033,9 +1220,14 @@ not branch on source kind.
 The single design choice that the rest of the machinery falls out of: phora never
 materializes a working tree for a source. There is no `git checkout`, no `git
 worktree add`, no index, no second copy of the files on disk. A mirror is *bare* —
-nothing but the `.git` object database and its refs — and that is the only form a
-source ever takes on disk. Everything downstream reads out of that object store
-directly.
+nothing but the `.git` object database and its refs — and everything downstream
+reads out of that object store directly.
+
+The one source that is not read from an object store is the one where a working tree
+already exists and is yours: a `path = "/dir"` source in [link
+mode](#the-local-dev-loop-link-mode) reads your live checkout in place, frozen for
+the run by a capture digest of what it saw. Even there phora creates nothing — the
+rule is not that a working tree never appears, it is that phora never lays one down.
 
 That reframes the three operations you might expect a package manager to perform:
 
@@ -1064,55 +1256,84 @@ same packed store. The cost of holding ten versions side by side is ten commit i
 and whatever blobs actually differ between them.
 
 The same property runs through the rest of "Under the hood." A URL import being a
-synthetic commit, projection touching only taken paths, the slice digest being a
-hash over a tree walk, reflink placement out of staging — all of it assumes the
-source lives as objects, not as files. The object store isn't hidden behind the
-model — it is the substrate the model rests on.
+synthetic commit, staging touching only taken paths, the slice digest being a
+hash over a tree walk — all of it assumes the source lives as objects, not as files.
+The object store isn't hidden behind the model — it is the substrate the model rests
+on.
 
 ### Fetching a git source
 
-The git backend uses `gix` (gitoxide) directly, no shelling out. On the first
-fetch it clones the remote as a bare repository with a mirror refspec
-(`+refs/heads/*:refs/heads/*`), so the local mirror's `refs/heads/*` track the
-remote's heads exactly. On subsequent fetches it opens the existing mirror and
-updates those refs in place. Fetches honor the interrupt flag, so a Ctrl-C during
-a network operation unwinds cleanly rather than corrupting the mirror.
+The git backend uses `gix` (gitoxide) directly, no shelling out. On the first fetch
+it clones the remote as a bare repository with two mirror refspecs,
+`+refs/heads/*:refs/heads/*` and `+refs/tags/*:refs/tags/*`, so the local mirror's
+heads and tags track the remote's exactly. Both matter: a plain clone would leave
+tags — and any commit reachable only through a tag — unresolvable without a second
+network round trip, which for a `tag`-pinned source is the common case rather than
+the exotic one. On subsequent fetches phora opens the existing mirror and updates
+those refs in place.
 
-Resolving is then a local lookup: a `branch` peels `refs/heads/<name>` to a
-commit, a `tag` peels `refs/tags/<name>`, and a `rev` is parsed as an object id
-directly. The result is the 40-hex commit that goes into the lock.
+Resolving is then a local lookup: a `branch` peels `refs/heads/<name>` to a commit,
+a `tag` peels `refs/tags/<name>`, a `rev` is parsed as an object id directly, and a
+source that names no ref at all takes the mirror's `HEAD` — the remote's own
+advertised default branch, which is why `main`-versus-`master` is a question you
+never have to answer in the config. The result is the 40-hex commit that goes into
+the lock.
+
+The mirror is treated as disposable but never destroyed carelessly. A clone is built
+into a staging directory beside the mirror and renamed into place only once it has
+succeeded, so an interrupted clone can never leave a half-written mirror for the next
+run to trip over — and a staging directory abandoned by a killed process is swept
+away before the next fetch of that key, after an hour's grace so a slow clone in
+another process is not mistaken for wreckage. If a later fetch finds the mirror
+unopenable, or the fetch itself fails, phora re-clones the same way and only removes
+the old mirror once the replacement is complete. An unreachable remote therefore
+costs you a failed command, never a working cache.
 
 ### Fetching and importing a URL source
 
 The URL backend runs four steps, and the order matters — digest verification runs
 before extraction:
 
-1. Download. An `ureq` client (rustls TLS, certificate verification on) streams
-   the response body to a temporary file beside the mirror. It follows redirects
-   (release assets commonly 302 to a CDN) but strips auth headers across them, and
-   it sets connect and body timeouts so a stalled server can't wedge the process.
-   A non-2xx status or a transport failure is a clear error; a partially written
+1. Download. An `ureq` client streams the response body to a temporary file beside
+   the mirror; TLS is rustls, with certificate verification on by that client's
+   defaults. phora follows redirects itself rather than letting the HTTP client do
+   it — release assets commonly 302 to a CDN — which is what lets it enforce two
+   rules per hop. A redirect may target `https`, or `http` only if the original URL
+   was already `http`; anything else is refused with an error naming the scheme, so
+   a redirect can never quietly downgrade a secure download to a plaintext one. And
+   a chain is capped at ten hops, so a redirect loop fails instead of spinning.
+   Connect and body timeouts keep a stalled server from wedging the process, a
+   non-2xx status or a transport failure is a clear error, and a partially written
    temp file is cleaned up on any failure.
 2. Verify. If the source declares a `digest`, phora hashes the downloaded bytes
    with the matching algorithm (`sha256` or `blake3`) and compares. A mismatch
    stops here — before extraction — naming the source with expected and actual
    hex. Nothing has touched your tree yet.
 3. Extract. phora sniffs the magic bytes to pick tar, gzip-then-tar, zip, or
-   raw-single-file, and unpacks into an in-memory list of entries. Three defenses
-   apply during this step: every entry path is validated segment by segment
-   (rejecting `..`, absolute paths, drive roots, backslashes, NUL bytes, and
-   non-UTF-8 names), so a crafted archive path cannot escape the extraction root; a single common
-   top-level directory is stripped; and a cumulative size cap (1 GiB of actual
-   decompressed bytes, not the attacker-controlled header) guards against
-   decompression bombs. Executable bits and symlinks carry through to the right
-   git entry kind.
+   raw-single-file, and unpacks into an in-memory list of entries. Nothing is
+   written to a directory at this step, which is worth saying plainly: there is no
+   extraction root to escape from, because the entries go straight on to become git
+   blobs and trees. What the path guard protects is the tree that comes next. Every
+   entry path is validated segment by segment — rejecting `.` and `..`, absolute
+   paths, drive roots, backslashes, colons, NUL bytes, Windows reserved device
+   names, and non-UTF-8 names — so a crafted archive name cannot produce a malformed
+   git path, and an archive whose entries collide (the same path twice, or a file
+   where a directory already is) errors by name rather than resolving the ambiguity
+   for you. Alongside the guard, a single common top-level directory is stripped, and
+   a cumulative size cap of 1 GiB — of actual decompressed bytes, not the
+   attacker-controlled header — guards against decompression bombs. Executable bits
+   and symlinks carry through to the right git entry kind.
 4. Import. The entries become git objects in the mirror, and `refs/heads/phora`
    moves to the new commit (see the next section for why this is deterministic).
 
-Resolving a URL source afterward is trivial: read `refs/heads/phora`. The backend
-ignores any refspec it is handed, which matters because the rest of the system
-defaults a source's refspec to `branch = "main"` — a default that would otherwise
-send a URL source looking for a branch that does not exist.
+Resolving a URL source afterward is trivial: read `refs/heads/phora`. Which backend
+handles a source is decided by the source's *mode* — git, worktree, or url — and not
+by anything phora sniffs out of the URL string, so a source's kind is settled at
+parse time by what you wrote in the config and stays settled. A URL source carries no
+refspec to resolve, and asking one to select a git revision is an error naming the
+source rather than a silently ignored request — a config that asks a single imported
+snapshot for a branch has a misunderstanding in it, and saying so is more useful than
+quietly doing something else.
 
 ### Why a URL import is deterministic
 
@@ -1125,9 +1346,10 @@ nailing down everything that is not content:
 
 - Fixed author and committer identity, a constant commit message, and no parents.
 - A fixed timestamp of one second past the epoch. Not zero — some filesystems
-  (FAT32, HFS+) clamp a zero mtime, which would make `phora verify` report every
-  URL-sourced file as modified forever after. One second sidesteps that while
-  staying constant.
+  (FAT32, HFS+) clamp a zero mtime, and a clamped mtime is one that never matches
+  what phora recorded, which would send every URL-sourced file down the slow
+  re-hashing path of the [drift gate](#verification) on every single sync. One
+  second sidesteps that while staying constant.
 - Tree entries written in true git tree order. Git sorts entries by name with a
   subtlety — a directory sorts as if its name had a trailing slash — and the
   object writer assumes that order. phora sorts every level explicitly before
@@ -1140,56 +1362,104 @@ the ref to the same place (a no-op in effect); importing changed bytes yields a
 new id and the lock advances. You can sanity-check the result yourself: the
 synthetic commits pass `git fsck --strict`.
 
-### Projection and the content digest
+### Staging and the content digest
 
-Projection does not write straight into your target. It first materializes the
-selected files into a staging directory, computing a single `blake3` digest over
-the artifact as it goes — framing each entry (its relative path length and bytes, a
-type tag for file/executable/symlink, and its content length and bytes) into the
-hash. The framing matters: without length-prefixing, two different tree shapes
-could hash the same if a path's bytes ran into the next entry's content with no
-boundary between them. With it, the digest is a faithful fingerprint of the
-projected tree.
+Two different pieces of phora are at work between "which files should this target
+get?" and "the files are in the target," and it helps to keep them apart.
 
-Moving the staged artifact into the target is an atomic directory swap: phora
-journals its intent, renames staging into place, then records the result, so a
-crash mid-swap is replayable rather than leaving a half-written target (the same
-write-ahead journal the [execution model](#execution-model-parallel-reads-one-serial-writer)
-relies on). Within a swap each file is placed with a reflink — a copy-on-write
-clone, so on filesystems that support it (APFS, Btrfs, XFS) the bytes are shared
-with the staged copy and the placement is near-free — falling back to a plain byte
-copy elsewhere or across devices. Either way the commit-time mtime is set
-explicitly, since a reflink does not carry mtime; that is what makes a
-re-projection of unchanged content produce byte-identical metadata.
+*Projection* answers the first question and touches nothing. It takes the offer, the
+binding's take, the collapse rule and the layout, and computes the shape the target
+should have: which artifacts exist, which leaves each is made of, and where each one
+lands. It reads no files and writes none — it is a calculation over the config and
+the source's inventory, which is why `phora preview` can show you the whole plan
+offline and why an error in selection surfaces as a diagnostic rather than as a
+half-written directory.
 
-An `ExportPolicy` governs the edges: symlinks and submodules are refused unless
-explicitly allowed (`allow_symlinks`, `allow_submodules`, both off by default), and
-the executable bit is preserved by default (`preserve_executable`). Drift detection
-is symlink-aware in the other direction too — it stats without following links, so
-a recorded regular file later swapped for a symlink reads as modified rather than as
-its target's contents.
+*Staging* then carries it out, and it does not write straight into your target
+either. It materializes the artifact's files into a staging directory beside the
+target — `<target parent>/.phora-stage/` — computing a single `blake3` digest over
+the artifact as it goes, framing each entry into the hash: its relative path length
+and bytes, a type tag for file, executable or symlink, and its content length and
+bytes. The framing matters. Without length-prefixing, two different tree shapes
+could hash the same, because a path's bytes would run straight into the next entry's
+content with no boundary to tell them apart. With it, the digest is a faithful
+fingerprint of the staged tree. Each file's mtime is set explicitly to the commit
+time as it is written, which is what makes re-staging unchanged content produce
+byte-identical metadata rather than a fresh timestamp every sync.
+
+Moving the staged artifact into the target is one atomic swap. phora journals its
+intent, renames any existing destination aside to a backup, renames the staging
+directory into place, marks the swap complete, writes the registry record, and only
+then drops the journal entry (the same write-ahead journal the [execution
+model](#execution-model-parallel-reads-one-serial-writer) relies on). The backup step
+is what makes the sequence reversible: if writing the record fails after the swap
+succeeded, phora puts the old destination back rather than leaving a deployed
+directory that nothing knows about. A crash anywhere in the middle is replayable, in
+whichever direction the journal says the run had got to.
+
+Because the swap is a rename, the normal path copies no bytes at all — the staged
+tree *becomes* the deployed tree. Rename only works within one filesystem, so if the
+staging directory and the target turn out to be on different mounts phora says so and
+falls back to copying file by file:
+
+```
+phora: staging on a different mount than /home/you/.config/nvim; falling back to recursive copy
+```
+
+That fallback prefers a reflink — a copy-on-write clone, near-free where the
+filesystem supports one — before an ordinary byte copy. It is the slow path in every
+sense: it is not atomic, and it is worth knowing about mainly as a hint that your
+target and its parent are not where you thought they were.
+
+A source can contain things a deploy should not blindly reproduce, and an export
+policy decides what happens at those edges. Symlinks are refused by default: a
+symlink in the source aborts that artifact's staging unless the source sets
+`allow_symlinks = true`, and even then a link whose target points outside the
+artifact is rejected, since a link that escapes its own artifact is a link that
+escapes phora's accounting of what it deployed. The executable bit is preserved by
+default (`preserve_executable`). Submodules are not exportable at all — a gitlink
+entry is skipped rather than followed, because what it names is another repository,
+not content this source has to give. And a destination path containing a `.git`
+component is not written at all unless the source's own `include` list names one
+explicitly, so vendoring a repository's metadata is something you have to ask for by
+name rather than something a broad glob can do to you by accident.
+
+Drift detection is symlink-aware in the other direction too — it stats without
+following links, so a recorded regular file later swapped for a symlink reads as
+modified rather than as its target's contents.
 
 ### The lock and content identity
 
-The lock is keyed per *(source, resolved commit)* — one entry for each distinct ref
-a source's bindings resolve to. The common case, where no binding overrides the ref,
-collapses to one entry per source, exactly as before: the lock is *take-neutral*
+A lock entry is identified by its source name plus a *ref discriminator* — one entry
+for each distinct ref a source's bindings resolve to. The commit is the entry's
+value, not part of what identifies it, which is the whole point: an entry stays the
+same entry while the commit it holds moves. The common case, where no binding
+overrides the ref, collapses to one entry per source: the lock is *take-neutral*
 toward bindings, so however many targets bind a source and however each subsets it
 with `take`, they all share the single entry at the source's own ref.
 A ref-overriding binding is the one thing that splits it — each distinct
-`branch`/`tag`/`rev` resolves to its own commit and records its own entry. Each entry
-carries an optional ref discriminator that is *present only on an override* and absent
-on the default, so a config that names no binding refs serializes byte-for-byte
-identical to one with no binding ref entries at all.
+`branch`/`tag`/`rev` resolves to its own commit and records its own entry. The
+discriminator is *present only on an override* and absent on the default, so a config
+that names no binding refs serializes byte-for-byte identical to one with no binding
+ref entries at all.
 
 Each locked entry records its name, the remote (or URL), a resolved field, the commit,
 the artifact digest, and a config digest. That last one — a `blake3` over the
 export-affecting settings — is how phora notices that you changed *what* ships even
-when the upstream commit did not move; it is computed from the *source's* offer —
-its `include`/`exclude`/`root` (a URL source's digest covers the full archive) —
-never from a binding's `take`, and is therefore shared across every split of a
-source. The artifact digest, by contrast, is recomputed per entry at that entry's own
-commit.
+when the upstream commit did not move. It is computed from the *source's* offer: its
+`include`, `exclude` and `root`, plus the two export-policy bits `allow_symlinks` and
+`preserve_executable`, which belong there because flipping either genuinely changes
+the exported bytes. A URL source's digest covers the full archive. A binding's `take`
+never enters it, so the digest is shared across every split of a source. The artifact
+digest, by contrast, is recomputed per entry at that entry's own commit.
+
+Two further fields are easy to miss. An entry belonging to a [transitive
+dependency](#transitive-dependencies) carries the identity of the instance that owns
+it, absent on a source of your own; that is what stops a dependency's `loqui` from
+merging with your `loqui` when a local lock is overlaid on the base one, and what
+lets `phora update <source>` drop a dependency and everything underneath it in one
+move. The lock also holds the `[[trusted_hooks]]` and `[[candidate_hooks]]` entries
+described under [hook trust](#trusting-a-dependencys-hooks).
 
 The split that follows is worth holding onto. The lock answers "which commit?", and a
 binding's *take* has nothing to do with that — so a change that narrows one target's
@@ -1211,7 +1481,10 @@ and it is worth being precise:
 - A URL source has no meaningful remote-vs-refspec story, so it matches on its URL
   identity plus its config digest. Its lock carries the literal URL and a `"url"`
   sentinel in the resolved field. The synthetic commit is content-addressed, so the
-  URL plus the config digest is a complete identity.
+  URL plus the config digest is a complete identity. The stored URL is literal, but
+  the comparison normalizes both sides the same way a git remote is normalized, so
+  a difference in scheme, userinfo or a trailing `.git` does not force a re-import
+  of bytes phora already has.
 
 The consequence is the no-op model you feel at the command line: a plain `sync`
 finds the lock matches and does not re-download; only `update` (or `--force`)
@@ -1273,22 +1546,40 @@ This is where phora diverges most from a conventional package manager. There is 
 central index to publish to, no resolver to satisfy a version range, and no
 per-project install tree to deduplicate after the fact. Git's content-addressed
 object store is the cache, its commit graph is the version history, and an install
-is a reflink out of that store. Everything phora adds on top — the lock, the
-registry, identity — is bookkeeping about which commit goes where; the storage and
-the versioning come from git's object store rather than a custom layer.
+is a tree walk out of that store, staged and renamed into place. Everything phora
+adds on top — the lock, the registry, identity — is bookkeeping about which commit
+goes where; the storage and the versioning come from git's object store rather than
+a custom layer.
 
 ### Verification
 
 The registry stores, per deployed artifact — keyed by binding identity within its
 target — the underlying source, the commit, the artifact digest, the layout and
 policy in effect, and a manifest of every file with its size, mtime, and `blake3`
-hash. `phora verify` re-hashes the files on disk and compares them against that
-manifest, so it catches both content edits and missing files. `phora list` reads
-the same records to show per-target status, and `phora where` queries them in
-reverse — given a source, artifact, commit, or digest, it tells you where things
-came from. Because every record carries its underlying source, a `phora where
---source <s>` finds all of `s`'s slices even when they were bound under different
-identities (table keys).
+hash. Two more fields exist for the sake of a record that has outlived its config:
+the target's expanded path as it stood at deploy time, and, for a `prefixed` layout,
+the separator that was in effect. Neither is ever re-derived at read time, which is
+what lets an [orphan](#orphans-records-whose-target-left-the-config) name the exact
+place its files sit rather than a place they probably sit.
+
+`phora verify` re-hashes the files on disk and compares them against the manifest,
+so it catches both content edits and missing files, and it reports every mismatch it
+finds rather than stopping at the first. It is worth being exact about what it does
+not cover. It skips linked and ejected records, which have no content guarantee to
+check. It checks the files the manifest lists, so an unrecognized *extra* file inside
+an artifact's directory is not a verify failure — noticing that is the drift gate's
+job, on the next sync. And it can fail for a reason that has nothing to do with the
+bytes on disk: an untrusted transitive hook candidate makes `verify` exit non-zero on
+a byte-perfect tree, on the grounds that a workspace with an unreviewed hook waiting
+in it is not a workspace you should call verified.
+
+`phora list` reads the same records to show per-target status, and `phora where`
+queries them in reverse — given a source, artifact, commit, or digest, it tells you
+where things came from. One thing to know about `where --source`: it matches the
+*binding identity*, the key in the `[targets.<t>.sources]` table, not the underlying
+source name. Where the two coincide — which is the ordinary case, since the key
+defaults to the source name — the distinction never comes up. Where you deliberately
+bound a source under another identity, query that identity.
 
 `phora verify` always re-hashes; the *drift gate* that `phora sync` and `phora list`
 use to decide whether an artifact needs redeploying takes a cheaper path. It first
@@ -1304,7 +1595,7 @@ non-regular file, fails closed to modified rather than guessing clean. The escal
 is race-aware — the file is opened once and read and re-stat'd through that one
 descriptor — and partial drift collapses the whole artifact to modified with no
 refresh. The upshot at the command line: a bare timestamp change on byte-identical
-content no longer trips the conflict prompt.
+content does not trip the conflict prompt.
 
 If the registry and the on-disk reality fall out of step — say you hand-edited the
 state root, or restored an old backup — `phora rebuild-registry` reconstructs the
@@ -1314,23 +1605,33 @@ records from the lock plus what is actually deployed.
 
 The read-and-resolve half of a sync runs in parallel; the half that *writes* runs
 serially behind a lock. phora fetches, resolves, and digests its sources across a
-rayon thread pool — sized to one thread per resolution unit, capped at twice the
-core count (from `available_parallelism`, fallback 8) and overridable with `phora
-sync --jobs N` / `-j N` — then deploys the results one at a time. The parallelism is
-purely a throughput win — the deploy loop and the recorded state are identical
-however many threads ran, so nothing about a lock or a registry record depends on
-the thread count.
+rayon thread pool, then deploys the results one at a time. The parallelism is purely
+a throughput win — the deploy loop and the recorded state are identical however many
+threads ran, so nothing about a lock or a registry record depends on the thread
+count.
 
-Fetch is network-bound — resolving a source is mostly I/O wait — so overlapping
-those waits across the pool is the available throughput win. The concurrency phora
-takes seriously is mutual exclusion and crash safety:
+Work dispatches per *mirror*, not per source. Sources that share a mirror resolve one
+after another so the remote is fetched once; distinct mirrors run concurrently. The
+pool is sized to the number of things there are to resolve, capped at twice the core
+count — or fifty, whichever is larger — with `available_parallelism` falling back to
+eight cores when the platform will not say. That floor of fifty is not arithmetic, it
+is a measurement: fetching is almost entirely waiting on a network, a parked thread
+costs memory rather than CPU, and a cap tied strictly to core count leaves a laptop
+stalled on the pool ceiling long before it is anywhere near busy. `phora sync --jobs
+N` / `-j N` overrides the whole calculation when you know better than it does.
 
-- One writer per project. A state-mutating command (`sync`, `eject`, `uneject`,
-  `rebuild-registry`) takes an exclusive OS lock on a `state.lock` file in the
-  project's state root, held for the whole run. A second phora invoked against the
-  same project while the first runs fails fast with "another phora process is
-  running" and exits `75` (`EX_TEMPFAIL`), rather than racing it into a corrupt
-  registry.
+The concurrency phora takes seriously is mutual exclusion and crash safety:
+
+- One writer per project. A state-mutating command — `sync`, `update`, `eject`,
+  `uneject`, `rebuild-registry`, `trust` — takes an exclusive OS lock on
+  `<state root>/projects/<ProjectId>/locks/state.lock`, held for the whole run. A
+  second phora invoked against the same project while the first runs fails fast with
+  "another phora process is running" and exits `75` (`EX_TEMPFAIL`), rather than
+  racing it into a corrupt registry. One caveat is printed rather than assumed away:
+  if the state root is on a network filesystem — NFS, SMB, AFP, WebDAV — phora warns
+  once that the lock is advisory there and may not actually exclude a sync running on
+  another machine. It does not attempt a cross-host lock; it tells you the guarantee
+  is weaker than it looks and lets you arrange matters accordingly.
 - One writer per mirror. The git mirror cache lives under the *cache* root, which
   is shared across every project — so the per-project state lock alone would not
   stop two phora runs in *different* projects from fetching the same bare mirror at
@@ -1339,16 +1640,27 @@ takes seriously is mutual exclusion and crash safety:
   mirrors run concurrently; two fetches of the *same* mirror serialize on this lock.
   Git-mode fetch is idempotent and dedupes to one fetch per mirror; a url-mode source
   still fetches per source even when its key coincides, because each validates its own
-  integrity digest and deduping would silently bypass the second pin. Mirror creation
-  is atomic — built in a temp directory and renamed into place — so a crashed clone
-  never leaves a half-written mirror for the next run to trip over.
+  integrity digest and deduping would silently bypass the second pin. A url source
+  takes the mirror lock late — after the download, the digest check and the extraction,
+  immediately before its objects are written — so two machines pulling the same tarball
+  overlap on the slow part and serialize only on the write.
 - Crash safety via a journal. Before mutating a target, phora records the intended
   operation in a deploy journal. If a run is interrupted — a crash, a Ctrl-C, a
-  killed terminal — the next run's recovery sweep reads the journal and cleans up
-  the partial state before doing anything else. This is why an interrupted sync
-  leaves the state recoverable rather than half-deployed.
-- Interrupt-aware fetches. The git network operations check an interrupt flag, so
-  cancelling mid-fetch unwinds without leaving a broken mirror.
+  killed terminal — the next run sweeps the journal before doing anything else, and
+  the sweep is direction-aware: an entry whose swap had completed but whose record
+  had not been written is replayed *forward*, while an entry that never got as far as
+  the swap is rolled *back*. The journal says which of the two happened, so recovery
+  never has to guess. The sweep then removes any `.phora-stage` directory a killed run
+  abandoned. This is why an interrupted sync leaves the state recoverable rather than
+  half-deployed.
+
+Interruption deserves one honest note. A Ctrl-C is an ordinary process kill; phora
+installs no signal handler and does not unwind gracefully. What protects your mirrors
+and your targets from a killed process is structural rather than cooperative — a
+clone is built aside and renamed in, a deploy is staged aside and renamed in, and
+anything left over is journalled and swept next run. The design assumes the process
+can die at any instant, which is a better assumption than assuming it will be asked
+politely.
 
 Deploy stays sequential on purpose: it is the write side, governed by the one-writer
 lock and the journal, where ordering and crash safety matter more than overlap. The
@@ -1356,20 +1668,46 @@ parallelism lives where the waiting is.
 
 ### Hook dispatch and recording
 
-[Hooks](#hooks-running-commands-after-a-sync) run after the deploy commits, never
-during it — the files are on disk and the journal settled before a hook sees them,
-which is why an `on_change` hook can read what it just received. Each hook has a
-stable id derived from its scope, shell, and command (the shell is part of the id,
-so the same command under two shells is two hooks, and the same command listed twice
-under one shell is deduplicated to a single run).
+[Hooks](#hooks-running-commands-around-a-sync) fall into two groups by when they run,
+and the boundary is the deploy itself. `pre_sync` and each target's `pre_deploy` run
+before any target is touched — after fetching, resolving and projection, so the plan
+is fully known, but before the first swap. `on_change` and `post_sync` run after the
+deploy commits, never during it: the files are on disk and the journal settled before
+either sees them, which is why an `on_change` hook can read what it just received.
 
-"Recorded on success" has a concrete shape: when a hook succeeds, phora stores,
-per hook, the set of artifact content digests that were live at that success. The
-next sync recomputes the current digest-set for the hook's scope and skips the
-`on_change` when it matches — that is what makes a no-op sync quiet. A non-zero exit
-records nothing, so the set never matches and the hook re-fires until it succeeds.
-The global `post_sync` carries `when = "always"`, which bypasses the digest-set
-check and runs every time.
+Between the gates and the deploy, phora observes the workspace and reconciles again.
+A gate that changed something on disk — created a directory, moved a file out of the
+way — would otherwise leave the run acting on a plan drawn before its own hook ran.
+
+A gate failure short-circuits the run at exactly the same point whichever gate it
+was: a failed `pre_sync`, and a failed `pre_deploy` under the default `abort`, both
+return with an empty changeset before any planned drop or target change is applied.
+Nothing deploys, nothing is pruned, and no later hook runs. The one thing phora
+cannot undo is whatever the hook itself did before it failed; a gate's own side
+effects are outside the transaction, which is a good reason to keep a gate a check
+rather than a procedure.
+
+Each hook has a stable id derived from its scope, its command, and how the command is
+run — the shell's name, or a marker for the shell-free `cmd` form. Because that last
+part is in the id, the same command under two shells is two hooks, and so is the same
+command written once as `run` and once as `cmd`; the same command listed twice
+identically is deduplicated to a single run.
+
+"Recorded on success" has a concrete shape: when an `on_change` hook succeeds, phora
+stores, per hook, the set of artifact content digests that were live at that success.
+The next sync compares the target's current records against that stored set and keeps
+the ones whose digest is *absent from* it. If nothing is left over, the hook does not
+run. The comparison is directional rather than an equality test, and that is what
+gives removals their behavior: deleting an artifact leaves every surviving digest
+still inside the recorded set, so nothing is left over and the hook stays quiet,
+while adding or modifying one introduces a digest the set has never seen and fires
+it. A non-zero exit records nothing, so the next run finds the same leftovers and
+the hook re-fires until it succeeds.
+
+The global `post_sync` carries `when = "always"`, which bypasses the comparison and
+runs it every time. `when` governs `post_sync` and nothing else; it never gates
+`pre_sync`, which runs on every sync that runs hooks at all. A gate that could be
+switched off by a setting meant for something else would not be much of a gate.
 
 The trust boundary is structural, not a scan: hooks are only ever read from the
 consumer's own `phora.toml`/`phora.local.toml`. A synced source tree is projected as
@@ -1394,8 +1732,13 @@ namespaces a dependency's sources and hooks so two dependencies with a same-name
 inner source never collapse into one node. Confinement is enforced by resolving the
 anchor and checking every composed destination against it segment by segment,
 rejecting `..`, absolute paths, unsafe components, and symlinked ancestors, plus a
-fixed set of protected paths (your config, lock, `.git`, and phora's cache/state
-roots).
+fixed protected set: `phora.toml`, `phora.local.toml`, `phora.lock`,
+`phora.local.lock`, the project's `.git`, the cache root, and the `projects/` tree
+under the state root. That last one is deliberately the `projects/` subtree and not
+the whole state root, which is what keeps the guard meaningful when `[paths] state`
+puts the state root somewhere with other things in it. Matching ignores case-fold
+differences and resolves symlinked spellings, so a path cannot slip through by being
+written another way.
 
 Hook trust is a content gate, not a name check. Each composed hook is reduced to a
 *preimage* — a commit-bound blake3 over its command — and the gate admits it only
@@ -1415,10 +1758,10 @@ fetch, erroring on the first source — at any depth — that is not already pin
 It is worth naming the one place the content guarantee deliberately stops: linked
 artifacts (`deploy = "link"`). Because a symlink points at a live working tree
 whose bytes change underfoot, hashing it would be meaningless, so phora doesn't.
-Linked records carry a `linked` marker and no manifest; verify and drift detection
-skip them; `--prune` removes an orphaned link by deleting the symlink only;
-`rebuild-registry` reconstructs the marker without hashing. Everything else —
-every `copy` artifact from a git or URL source — is inside the integrity model.
+Linked records carry a `linked` marker and no manifest; `phora verify` and drift
+detection skip them, and `--prune` removes an orphaned link by deleting the symlink
+only. Everything else — every `copy` artifact from a git or URL source — is inside
+the integrity model.
 
 ## When something looks wrong
 
@@ -1449,8 +1792,9 @@ Most confusion maps to one question, and each question maps to one command.
   binding scope, a take that would widen the offer, a rename escaping the deploy root
   — all point here.
 - "Is what's on disk really what phora put there?" Run `phora verify`. It re-hashes
-  every tracked file and exits non-zero on the first mismatch. A file you edited by
-  hand will show up here; so will a truncated or replaced one.
+  every tracked file, lists every mismatch it found, and exits non-zero if there was
+  one. A file you edited by hand will show up here; so will a truncated or replaced
+  one.
 - "Where did this file come from?" Run `phora where --source <source>` (or query by
   artifact, commit, or digest). It reverse-looks-up the registry. When nothing
   matches it says so — naming the active filter and pointing you at `phora
@@ -1461,9 +1805,13 @@ Most confusion maps to one question, and each question maps to one command.
   doing its job. Either another phora really is running for this project, or a
   previous one died without releasing the lock; once you're sure none is running,
   the stale lock clears on the next clean run.
-- "Every URL-sourced file shows as modified." Your filesystem is mangling
-  timestamps — some clamp or round old mtimes. phora's epoch+1 import time dodges
-  the common case; if you still hit it, that's a bug worth filing.
+- "Every URL-sourced file shows as modified in `phora list`." Your filesystem is
+  mangling timestamps — some clamp or round old mtimes, which defeats the drift
+  gate's stat comparison. phora's epoch+1 import time dodges the common case; if you
+  still hit it, that's a bug worth filing.
+- "A gate hook keeps aborting the whole sync." A failed `pre_deploy` halts every
+  target by default. If that target really is independent of the others, set
+  `pre_deploy_on_fail = "skip"` on it; see [gates](#gates-pre_sync-and-pre_deploy).
 - "My registry looks wrong after I touched the state root." Run `phora
   rebuild-registry` to reconstruct it from the lock plus the deployed files.
 - "Sync keeps stopping on a file it didn't deploy." That is the conflict prompt
@@ -1477,28 +1825,47 @@ Most confusion maps to one question, and each question maps to one command.
   specific option.
 - [`phora.example.toml`](phora.example.toml) is a complete, annotated config you
   can crib from.
-- The [scrut suites](tests/scrut/) drive the shipped binary end to end against real
-  upstreams and double as runnable, CI-verified usage docs — this guide with
-  assertions instead of prose. [`showcase.md`](tests/scrut/showcase.md) pins two of
-  Anthropic's public Claude Code skills and walks the link-mode editing loop;
+- The [scrut suites](tests/scrut/) drive the shipped binary end to end and double as
+  runnable, CI-verified usage docs — this guide with assertions instead of prose.
+  Most build their sources locally so a run needs no network; a few pin a real
+  upstream by tag. [`showcase.md`](tests/scrut/showcase.md) walks a sync end to end,
+  asks `check-match` why a path was selected, reads the lock, and runs the link-mode
+  editing loop;
   [`release-assets.md`](tests/scrut/release-assets.md),
   [`versions.md`](tests/scrut/versions.md), and [`drift.md`](tests/scrut/drift.md)
   cover digest-checked tarballs, one source at two tags, and what happens when a
   deployed file is edited behind phora's back;
   [`mapped.md`](tests/scrut/mapped.md) fans one `AGENTS.md` out to the names every
-  agent tool wants with `take` renames, [`hooks.md`](tests/scrut/hooks.md) runs
-  commands after a sync, [`templates.md`](tests/scrut/templates.md) fills one config
+  agent tool wants with `take` renames, [`hooks.md`](tests/scrut/hooks.md) walks all
+  four hook phases including what each on-fail policy does to a run,
+  [`orphans.md`](tests/scrut/orphans.md) covers orphan visibility and physical prune,
+  [`templates.md`](tests/scrut/templates.md) fills one config
   in per machine, and [`transitive.md`](tests/scrut/transitive.md) imports a
   dependency that carries its own — composing it under the anchor, isolating storage
   with `[paths]`, stripping its untrusted hook, and inspecting that hook's surface
   offline with `trust --list`/`--show` before approval.
-- The source is organized along the pipeline: `config.rs` (parsing and modes),
-  `config/source.rs` and `config/target.rs` (the offer and the take/collapse DTOs),
-  `config/transitive.rs` (the dependency manifest DTO and graph keys),
-  `kernel/selection.rs` (the offer compiler), `kernel/take.rs` (take resolution),
-  `kernel/collapse.rs` (directory collapse), `diagnostic.rs` (structured selection
-  diagnostics and `did_you_mean`), `source.rs` (the git backend, the
-  synthetic-commit import, projection), `http.rs` (download and digest), `archive.rs`
-  (extraction and the path guard), `backend.rs` (the source-mode router), `sync.rs`
-  (the orchestration), `sync/transitive.rs` and `sync/confine.rs` (composition and
-  destination confinement), `lock.rs` and `registry.rs` (identity and records).
+- The source is organized by ownership, one directory per stage of the pipeline, and
+  the boundaries between them are the ones this guide describes:
+  - `src/config/` — parsing. `source.rs` and `target.rs` hold the offer and the
+    take/collapse types, `transitive.rs` the dependency manifest and the graph keys,
+    `hooks.rs` the hook tables, `host.rs` the forge aliases, `migrate.rs` the
+    version upgrades.
+  - `src/projection/` — the pure calculation, no I/O anywhere in it. `offer.rs`
+    compiles a source's offer, `take.rs` resolves a binding's take, `collapse.rs`
+    decides directory collapse, `build.rs` assembles the result, `diagnostic.rs`
+    renders the selection errors.
+  - `src/source/` — getting the bytes. `git.rs` and `http.rs` are the two fetchers,
+    `archive.rs` the extraction and its path guard, `import.rs` the synthetic-commit
+    import, `router.rs` the source-mode dispatch, `cache.rs` the mirror store,
+    `worktree.rs` and `snapshot.rs` the link-mode side, `inventory.rs` and
+    `resolve.rs` the reading, `transitive.rs` the dependency fetch.
+  - `src/sync/` — the orchestration and everything that writes. `mod.rs` drives a
+    run; `resolve.rs`, `plan.rs`, `observe.rs` and `reconcile.rs` work out what to
+    do; `stage.rs` and `apply.rs` do it; `journal.rs` and `recovery.rs` make it
+    survivable; `prune.rs`, `verify.rs`, `inspect.rs`, `rebuild.rs` and `preview.rs`
+    are the inspection and maintenance side; `hooks.rs`, `transitive.rs` and
+    `confine.rs` cover hooks, composition and destination confinement; and
+    `sync/state/` is the registry, its file format and its locking.
+  - At the top level, `lock.rs` and `paths.rs` own the lock and the two roots,
+    `digest.rs` the framed hashing, `diagnostic.rs` the structured diagnostics and
+    `did_you_mean`, and `src/cli/` the commands themselves.
