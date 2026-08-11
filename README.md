@@ -16,10 +16,8 @@ records a blake3 digest per deployed file, and an interrupted run resumes where 
 Reach for it when shared configuration, editor setups, prompt or skill bundles, or release assets
 live in one or more repositories but have to show up wherever other tools look for them.
 
-This README is the reference: install steps, every command, every configuration key. Read [the
-guide](GUIDE.md) for what sits underneath — the offer/take split, the bare mirrors phora reads out
-of — and why the design landed there; [the use cases](USE-CASES.md) are worked configurations, one
-per situation.
+[GUIDE.md](GUIDE.md) explains how it works. [USE-CASES.md](USE-CASES.md) has worked configs for
+dotfiles, lint config shared across repos, release binaries, and vendored protos.
 
 ## Installation
 
@@ -804,9 +802,10 @@ The guide has a longer diagnostic walkthrough in [When something looks wrong](GU
 
 ## Further reading
 
-- [The phora guide](GUIDE.md) — how phora works, the pipeline every source runs through, and what
-  happens under the hood.
-- [Use cases](USE-CASES.md) — situations, each with a working configuration.
+- [The phora guide](GUIDE.md) — the long version: what a sync actually does and why it's built
+  that way.
+- [Use cases](USE-CASES.md) — worked configs for dotfiles, shared lint config, release binaries,
+  vendored protos.
 
 ## Development
 

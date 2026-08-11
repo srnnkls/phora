@@ -1,9 +1,9 @@
 # phora, by use case
 
-Start with the situation that matches yours — the sections are independent, and
-every full recipe puts its limits first, a working configuration after. The
-closing catalogue only sketches smaller fits. Use the [README](README.md) for
-reference and the [guide](GUIDE.md) for internals.
+Start with the situation that matches yours; the sections don't depend on each
+other. Each recipe leads with what phora won't do for you, then a config that
+was actually run. Flags are in the [README](README.md), internals in the
+[guide](GUIDE.md).
 
 ## Contents
 
