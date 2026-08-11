@@ -3,18 +3,20 @@
 A deployed file is just a file; anything can edit it in place. A plain copy keeps
 no record of what it should be, so an edit leaves nothing to compare against.
 phora records what it deployed, so a later check can catch the change. This suite
-deploys one skill from Anthropic's public skills repository, edits it behind
-phora's back, and walks the three ways out: restore it, adopt it upstream, or
-eject it and own it.
+deploys one skill from a skills repository — agent skills under a `skills/` root,
+the layout the public collections use — edits it behind phora's back, and walks
+the three ways out: restore it, adopt it upstream, or eject it and own it.
 
-State is hermetic — the first command points `HOME` and the XDG cache/state
-roots at scrut's per-document tempdir, so nothing touches your real config; the
-clone is real, pinned to one commit.
+State is hermetic — `isolate_state` points `HOME` and the XDG cache/state roots
+at scrut's per-document tempdir, so nothing touches your real config. The clone
+is a real git clone, pinned to one commit; the remote URL is redirected onto a
+local fixture repo through git's `insteadOf`, so the run never leaves the
+machine and the commit id below is byte-for-byte stable.
 
 ## Start
 
 ```scrut
-$ export HOME="$PWD" XDG_CACHE_HOME="$PWD/cache" XDG_STATE_HOME="$PWD/state" && mkdir -p cache state && echo ready
+$ source "$TESTDIR"/_setup.sh && isolate_state && SKILLS="$(make_skills_source skills)" && map_insteadof https://github.com/mock/skills.git "$SKILLS" && echo ready
 ready
 ```
 
@@ -23,9 +25,8 @@ $ cat > phora.toml <<'EOF'
 > version = 1
 >
 > [sources.skills]
-> host = "github"
-> repo = "anthropics/skills"
-> rev = "57546260929473d4e0d1c1bb75297be2fdfa1949"
+> git = "https://github.com/mock/skills.git"
+> rev = "7d76b29638271ec3611021def940bda8f4d9024a"
 > root = "skills"
 > include = ["skill-creator"]
 >
@@ -161,7 +162,7 @@ ejected:
 
 ```scrut
 $ phora where
-Artifact: skills/skill-creator (commit 57546260, digest blake3:02ba3bcbf109bf830963d9075dd6e43cf727f6012a0aa8fb6221153763e4c6a9)
+Artifact: skills/skill-creator (commit 7d76b296, digest blake3:0349fcda3f10a1fff1df55127833750e3f6880868cee74f12e24ea3c9fc8f4ad)
   - skills (ejected)
 ```
 
@@ -208,6 +209,6 @@ reconstructed 1
 
 ```scrut
 $ phora where
-Artifact: skills/skill-creator (commit 57546260, digest blake3:02ba3bcbf109bf830963d9075dd6e43cf727f6012a0aa8fb6221153763e4c6a9)
+Artifact: skills/skill-creator (commit 7d76b296, digest blake3:0349fcda3f10a1fff1df55127833750e3f6880868cee74f12e24ea3c9fc8f4ad)
   - skills
 ```
