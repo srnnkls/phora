@@ -8,9 +8,10 @@
 
 ## About
 
-Phora keeps selected files from git repositories, local directories, and HTTPS downloads in sync
-with the directories on your machine that consume them. Each source publishes an offer of paths;
-each target takes the slice it wants. `phora.lock` pins every source to one commit, the registry
+Phora is an artifact manager and multiplexer: it treats ordinary files — in git repositories,
+local checkouts, HTTPS downloads — the way a package manager treats packages, and fans one source
+out to any number of directories that consume it. Each source publishes an offer of paths; each
+target takes the slice it wants. `phora.lock` pins every source to one commit, the registry
 records a blake3 digest per deployed file, and an interrupted run resumes where it stopped.
 
 Reach for it when shared configuration, editor setups, prompt or skill bundles, or release assets
