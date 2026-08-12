@@ -1,9 +1,14 @@
 # Phora Hooks
 
-End-to-end behaviour of sync hooks: a target `on_change` hook fires once after a
-sync that adds or changes deployed content, files land before the hook runs, a
-failed hook fails the sync but leaves files in place and re-fires next sync,
-`--no-hooks` suppresses execution, a global `post_sync` hook runs every sync, and
+Deploying files is rarely the last step — a cache wants rebuilding, a daemon
+wants reloading, an index wants refreshing. Hooks are where that work goes. A
+target's `on_change` hook runs after a sync that changed that target, its
+`pre_deploy` hook gates the target before anything is written to it, and the
+global `pre_sync` and `post_sync` hooks bracket the run as a whole.
+
+This suite walks that surface end to end: when each scope fires and in what
+order against the deploy, the change set a hook is handed, what a failure does to
+the run under each on-fail policy, how `--no-hooks` suppresses execution, and why
 hook-shaped config inside a *synced source tree* is inert (INV-1).
 
 The suite is hermetic: `isolate_state` redirects `HOME` and the XDG cache/state
@@ -66,6 +71,36 @@ sync complete
 ```scrut
 $ cat "$HOME/hook.log"
 -- init
+```
+
+## A hook is handed the change set
+
+An `on_change` hook rarely wants to redo everything — it wants to know what
+moved. phora hands it `$PHORA_CHANGED_NAMES`, the names of the artifacts this
+sync touched, and `$PHORA_CHANGED`, the absolute paths they landed at, one per
+line in both cases.
+
+```scrut
+$ cd "$ROOT" && mkdir -p s6 && cd s6 && isolate_state && seed_config_changed_env "$(make_git_source proj)" && phora sync 2>&1 | normalize
+hook home#echo "$PHORA_CHANGED_NAMES" > "$HOME/names.log"; echo "$PHORA_CHANGED" > "$HOME/paths.log"#sh -c [on_change] `echo "$PHORA_CHANGED_NAMES" > "$HOME/names.log"; echo "$PHORA_CHANGED" > "$HOME/paths.log"` ok
+sync complete
+```
+
+Both included artifacts changed on this first sync, so both are named.
+
+```scrut
+$ cat "$HOME/names.log"
+editor
+lint
+```
+
+The paths are where the artifacts landed in the target, which the hook could
+only be told after the deploy wrote them.
+
+```scrut
+$ cat "$HOME/paths.log" | normalize
+<ROOT>/target-home/editor
+<ROOT>/target-home/lint
 ```
 
 ## A failed hook fails the sync, keeps files, and re-fires
@@ -141,9 +176,11 @@ suppressed
 
 ## INV-1 inertness and global post_sync
 
-The source tree itself carries a hook-shaped `phora.toml` under `payload/`. The
-consumer config includes that subtree and declares only a global `post_sync` hook
-(no target hooks).
+Hooks come only from your own config, never from a synced source tree — a
+downloaded repo that happens to carry its own `phora.toml` is inert content, read
+as files and never executed. Here the source tree carries a hook-shaped
+`phora.toml` under `payload/`, while the consumer config includes that subtree
+and declares only a global `post_sync` hook.
 
 ```scrut
 $ cd "$ROOT" && mkdir -p s4 && cd s4 && isolate_state && seed_config_post_sync "$(make_evil_source)" && echo seeded

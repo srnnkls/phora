@@ -45,6 +45,46 @@ fn fenced_blocks(contents: &str) -> Vec<String> {
     blocks
 }
 
+fn heredoc_delimiter(line: &str) -> Option<&str> {
+    let rest = line.split_once("<<")?.1;
+    if rest.starts_with('<') {
+        return None;
+    }
+    let rest = rest.strip_prefix('-').unwrap_or(rest).trim_start();
+    let delimiter = match rest.chars().next()? {
+        quote @ ('\'' | '"') => rest[quote.len_utf8()..].split_once(quote)?.0,
+        _ => rest.split_whitespace().next()?,
+    };
+    (!delimiter.is_empty()).then_some(delimiter)
+}
+
+fn heredoc_bodies(block: &str) -> Vec<String> {
+    let mut bodies = Vec::new();
+    let mut lines = block.lines();
+    while let Some(line) = lines.next() {
+        let Some(delimiter) = heredoc_delimiter(line) else {
+            continue;
+        };
+        let body: Vec<&str> = lines
+            .by_ref()
+            .take_while(|line| line.trim() != delimiter)
+            .collect();
+        bodies.push(body.join("\n"));
+    }
+    bodies
+}
+
+fn self_contained_configs(contents: &str) -> Vec<String> {
+    fenced_blocks(contents)
+        .into_iter()
+        .flat_map(|block| {
+            let written_by_heredoc = heredoc_bodies(&block);
+            std::iter::once(block).chain(written_by_heredoc)
+        })
+        .filter(|block| block.trim_start().starts_with("version = 1"))
+        .collect()
+}
+
 fn is_sources_array_element(line: &str) -> bool {
     let line = strip_scrut_prompt(line).trim_start();
     line.starts_with('{') || line.contains("{ source")
@@ -151,10 +191,7 @@ fn local_example_toml_drops_legacy_binding_forms() {
 
 #[test]
 fn readme_self_contained_fences_parse_and_validate() {
-    let complete: Vec<String> = fenced_blocks(README)
-        .into_iter()
-        .filter(|block| block.trim_start().starts_with("version = 1"))
-        .collect();
+    let complete = self_contained_configs(README);
     assert!(
         !complete.is_empty(),
         "README.md: expected at least one self-contained `version = 1` config fence"
@@ -167,6 +204,58 @@ fn readme_self_contained_fences_parse_and_validate() {
             panic!("README.md: self-contained config fence must validate: {err}\n---\n{block}")
         });
     }
+}
+
+#[test]
+fn configs_written_by_heredoc_are_extracted_beside_bare_fences() {
+    let doc = r#"
+```toml
+version = 1
+
+[sources.bare]
+repo = "owner/bare"
+```
+
+```sh
+cat > phora.toml <<'TOML'
+version = 1
+
+[sources.quoted]
+repo = "owner/quoted"
+TOML
+```
+
+```sh
+tee phora.local.toml <<EOF
+version = 1
+
+[sources.bare_delimiter]
+repo = "owner/bare-delimiter"
+EOF
+phora sync
+```
+
+```sh
+phora list
+```
+"#;
+
+    let configs = self_contained_configs(doc);
+
+    assert_eq!(
+        configs.len(),
+        3,
+        "expected the bare fence and both heredoc bodies, got: {configs:#?}"
+    );
+    assert!(configs[0].contains("[sources.bare]"));
+    assert_eq!(
+        configs[1],
+        "version = 1\n\n[sources.quoted]\nrepo = \"owner/quoted\""
+    );
+    assert_eq!(
+        configs[2],
+        "version = 1\n\n[sources.bare_delimiter]\nrepo = \"owner/bare-delimiter\""
+    );
 }
 
 #[test]
