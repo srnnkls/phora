@@ -13,6 +13,11 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # mise `exec`/`run` auto-install every mise.toml tool (settings.auto_install
+  # defaults true), silently widening the scoped install_args below.
+  MISE_AUTO_INSTALL: "0"
+
 jobs:
   lint-test:
     runs-on: ${{ matrix.os }}
@@ -50,6 +55,7 @@ jobs:
         with:
           experimental: true
           install: true
+          install_args: rust github:facebookincubator/scrut
           cache: true
       - uses: Swatinem/rust-cache@v2
       - run: mise run test-integration
