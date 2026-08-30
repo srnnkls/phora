@@ -26,6 +26,7 @@ pub enum StateError {
 }
 
 type Result<T> = std::result::Result<T, StateError>;
+type History = bool;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -59,6 +60,8 @@ pub struct ArtifactRecord {
     pub files: Vec<ManifestFile>,
     #[serde(default)]
     pub linked: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub history: History,
     /// Digest of the full effective vars map at deploy time; `None` for feature-free artifacts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vars_digest: Option<String>,
@@ -81,6 +84,7 @@ pub struct NewArtifactRecord<'a> {
     pub allow_symlinks: bool,
     pub preserve_executable: bool,
     pub files: Vec<ManifestFile>,
+    pub history: bool,
     pub vars_digest: Option<String>,
     pub deploy_root: Option<String>,
     pub layout_separator: Option<String>,
@@ -103,6 +107,7 @@ impl ArtifactRecord {
             preserve_executable: p.preserve_executable,
             files: p.files,
             linked: false,
+            history: p.history,
             vars_digest: p.vars_digest,
             deploy_root: p.deploy_root,
             layout_separator: p.layout_separator,
@@ -498,6 +503,7 @@ mod tests {
             preserve_executable: true,
             files: vec![],
             linked: true,
+            history: false,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
@@ -572,6 +578,7 @@ artifact = "snippets"
             preserve_executable: true,
             files: vec![],
             linked: false,
+            history: false,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
@@ -681,6 +688,7 @@ artifact = "snippets"
             preserve_executable: true,
             files: vec![],
             linked: false,
+            history: false,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
@@ -723,6 +731,7 @@ artifact = "snippets"
             preserve_executable: true,
             files: vec![],
             linked: false,
+            history: false,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
@@ -758,6 +767,7 @@ artifact = "snippets"
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![],
+            history: false,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
@@ -792,6 +802,7 @@ artifact = "snippets"
             preserve_executable: true,
             files: vec![],
             linked: false,
+            history: false,
             vars_digest: vars_digest.map(str::to_owned),
             deploy_root: None,
             layout_separator: None,
@@ -1083,6 +1094,7 @@ artifact = "snippets"
                 blake3: "9e8d7c6b5a4f3e2d".to_owned(),
             }],
             linked: false,
+            history: false,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,

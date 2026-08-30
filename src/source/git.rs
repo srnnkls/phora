@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::ErrorKind;
 use std::path::PathBuf;
 
 use gix::object::tree::EntryKind;
@@ -6,8 +7,8 @@ use gix::object::tree::EntryKind;
 use super::{Commit, Path, Refspec, SourceName, safe_component};
 
 use super::cache::{
-    MirrorStaging, fetch_into_mirror, lock_mirror, mirror_path, mirror_path_for_key, open_mirror,
-    reclone_mirror, sweep_orphan_staging,
+    MirrorStaging, fetch_into_mirror, lock_mirror, lock_mirror_for_key, mirror_lock_path_for_key,
+    mirror_path, mirror_path_for_key, open_mirror, reclone_mirror, sweep_orphan_staging,
 };
 use super::inventory::{populate_inventory, snapshot_commit};
 use super::resolve::resolve_worktree;
@@ -18,7 +19,8 @@ use super::snapshot::{
 };
 use super::{
     MirrorKey, NormalizedUrl, Result, SourceEntryKind, SourceEntryMeta, SourceError,
-    SourceInventory, SourcePath,
+    SourceInventory, SourcePath, WorktreeMirrorAddress, WorktreeMirrorGuard,
+    WorktreeObservationRequest, WorktreeObservationResult,
 };
 
 pub struct GitBackend {
@@ -122,10 +124,16 @@ impl GitBackend {
         sweep_orphan_staging(&self.git_dir, url);
         let mirror = self.mirror_path(url);
 
-        if let Some(repo) = open_mirror(source, &mirror)?
-            && fetch_into_mirror(source, &repo).is_ok()
-        {
-            return Ok(());
+        if let Some(repo) = open_mirror(source, &mirror)? {
+            return match fetch_into_mirror(source, &repo) {
+                Ok(()) => Ok(()),
+                Err(SourceError::Source(message))
+                    if message.starts_with("fetch rejected ref update") =>
+                {
+                    Err(SourceError::Source(message))
+                }
+                Err(_) => reclone_mirror(&self.git_dir, source, url, &mirror),
+            };
         }
         reclone_mirror(&self.git_dir, source, url, &mirror)
     }
@@ -524,6 +532,118 @@ impl SourceStore for GitBackend {
         }
         entries.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(entries)
+    }
+
+    fn lock_worktree_mirror(
+        &self,
+        source: &SourceName,
+        key: &MirrorKey,
+    ) -> Result<WorktreeMirrorGuard> {
+        let address = WorktreeMirrorAddress {
+            cache_git_root: self.git_dir.clone(),
+            key: key.clone(),
+        };
+        self.lock_worktree_mirror_at(source, &address)
+    }
+
+    fn lock_worktree_mirror_at(
+        &self,
+        source: &SourceName,
+        address: &WorktreeMirrorAddress,
+    ) -> Result<WorktreeMirrorGuard> {
+        let cache_root = worktree_cache_root(self, address)?;
+        let lock = lock_mirror_for_key(cache_root, source, &address.key)?;
+        let mirror = mirror_path_for_key(cache_root, &address.key);
+        let mirror = gix::open(&mirror).map_err(|error| {
+            SourceError::Source(format!(
+                "open worktree mirror {} for {source}: {error}",
+                address.key.as_str()
+            ))
+        })?;
+        Ok(WorktreeMirrorGuard::new(address.clone(), mirror, lock))
+    }
+
+    fn observe_worktree(
+        &self,
+        request: &WorktreeObservationRequest,
+    ) -> Result<WorktreeObservationResult> {
+        let cache_root = worktree_cache_root(self, &request.address)?;
+        let lock_path = mirror_lock_path_for_key(cache_root, &request.address.key);
+        let lock = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(lock) => lock,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(WorktreeObservationResult::Stale);
+            }
+            Err(error) => {
+                return Err(SourceError::Source(format!(
+                    "open worktree observation lock: {error}"
+                )));
+            }
+        };
+        match request.lock {
+            super::WorktreeObservationLock::Try => match lock.try_lock_shared() {
+                Ok(()) => {}
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Ok(WorktreeObservationResult::Unknown);
+                }
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(SourceError::Source(format!(
+                        "observe worktree lock: {error}"
+                    )));
+                }
+            },
+            super::WorktreeObservationLock::Wait => lock.lock_shared().map_err(|error| {
+                SourceError::Source(format!("lock worktree observation: {error}"))
+            })?,
+        }
+        let admin_dir = mirror_path_for_key(cache_root, &request.address.key)
+            .join("worktrees")
+            .join(format!("ph-{}", request.admin_id.as_str()));
+        Ok(
+            if metadata_is_dir(&admin_dir, "observe worktree administration")?
+                && metadata_is_file(
+                    &request.deploy_root.join(".git"),
+                    "observe worktree gitlink",
+                )?
+            {
+                WorktreeObservationResult::Conformant
+            } else {
+                WorktreeObservationResult::Stale
+            },
+        )
+    }
+}
+
+fn worktree_cache_root<'a>(
+    backend: &GitBackend,
+    address: &'a WorktreeMirrorAddress,
+) -> Result<&'a std::path::Path> {
+    if address.cache_git_root != backend.git_dir {
+        return Err(SourceError::Source(format!(
+            "worktree mirror {} is outside this source cache",
+            address.key.as_str()
+        )));
+    }
+    Ok(&address.cache_git_root)
+}
+
+fn metadata_is_dir(path: &std::path::Path, action: &str) -> Result<bool> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(SourceError::Source(format!("{action}: {error}"))),
+    }
+}
+
+fn metadata_is_file(path: &std::path::Path, action: &str) -> Result<bool> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_file()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(SourceError::Source(format!("{action}: {error}"))),
     }
 }
 

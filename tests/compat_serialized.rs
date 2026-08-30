@@ -1404,6 +1404,7 @@ fn moved_path_projection(fx: &Fixture, layout_override: Option<LayoutSpec>) -> T
         inventory: &inventory,
         take: &take,
         collapse: CollapsePreference::from(binding.collapse),
+        history: false,
         materialization: MaterializationPolicy::from(&source.deploy_mode()),
         layout: &layout,
         templates: &templates,
@@ -1689,7 +1690,7 @@ fn deploy_joins_the_target_root_with_moved_target_relative_destinations() {
                 deployed.is_file(),
                 "deploy must materialize the leaf by joining the target root with `{dest}`"
             ),
-            Materialization::CollapsedDir { .. } => {
+            Materialization::CollapsedDir { .. } | Materialization::WholeRoot { .. } => {
                 assert!(
                     deployed.is_dir(),
                     "deploy must materialize the dir by joining the target root with `{dest}`"

@@ -341,7 +341,7 @@ fn changed_paths(
         .iter()
         .map(|r| {
             target_path
-                .join(layout.artifact_path(&r.key.source, &r.key.artifact))
+                .join(super::target::record_relative_destination(layout, r))
                 .to_string_lossy()
                 .into_owned()
         })

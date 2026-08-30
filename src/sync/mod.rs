@@ -29,7 +29,9 @@ mod tests;
 pub use hooks::{HookOutcome, HookScope, HookStatus};
 pub use plan::{plan_target, project_workspace};
 
+#[cfg(test)]
 use crate::projection::build::projected_artifact_keys;
+use crate::projection::build::projected_artifacts;
 use crate::projection::model::{ArtifactRelativePath, Projection};
 #[cfg(test)]
 use crate::sync::model::ReconciliationPolicy;
@@ -713,10 +715,9 @@ fn reject_cross_target_overlap(projection: &Projection, config: &Config) -> Resu
             continue;
         };
         let root = cwd.join(target.expanded_path());
-        let layout = target.layout();
         for binding in &target_projection.bindings {
-            for key in projected_artifact_keys(binding) {
-                let path = root.join(layout.artifact_path(&binding.identity, &key));
+            for item in projected_artifacts(binding) {
+                let path = root.join(item.destination.as_str());
                 let physical = confine::normalize_physical(&path)?;
                 let identity = confine::fold_path(&physical);
                 placements.push((&target_projection.target, physical, identity));

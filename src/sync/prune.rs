@@ -7,7 +7,7 @@ use crate::sync::state::{ArtifactRecord, StateStore};
 
 use super::confine::{ProtectedPathSet, confine_destination};
 use super::{persisted_manifest_relative_path, remove_orphan_path};
-use crate::projection::build::projected_artifact_keys;
+use crate::projection::build::projected_artifacts;
 use crate::projection::model::Projection;
 use crate::sync::model::{ObservedArtifact, ObservedProjectState, SyncChange};
 use crate::sync::request::SyncEvents;
@@ -92,7 +92,7 @@ pub(crate) fn orphan_records(
 pub(crate) fn orphan_artifact_path(record: &ArtifactRecord) -> Option<PathBuf> {
     let root = record.deploy_root.as_deref()?;
     let layout = reconstruct_layout(record)?;
-    Some(Path::new(root).join(layout.artifact_path(&record.key.source, &record.key.artifact)))
+    Some(Path::new(root).join(super::target::record_relative_destination(&layout, record)))
 }
 
 fn overlaps_foreign_live_dest(
@@ -116,12 +116,8 @@ pub(super) fn expected_live_paths(projection: &Projection, config: &Config) -> E
         };
         let paths = expected_paths.entry(plan.target.clone()).or_default();
         for binding in &plan.bindings {
-            for key in &projected_artifact_keys(binding) {
-                paths.push(
-                    target
-                        .expanded_path()
-                        .join(target.layout().artifact_path(&binding.identity, key)),
-                );
+            for item in projected_artifacts(binding) {
+                paths.push(target.expanded_path().join(item.destination.as_str()));
             }
         }
     }
@@ -140,15 +136,15 @@ pub(super) fn prune_projected(
     for plan in &projection.targets {
         let target = config.targets.get(&plan.target);
         for binding in &plan.bindings {
-            let keys = projected_artifact_keys(binding);
+            let keys: Vec<String> = projected_artifacts(binding)
+                .map(|item| item.materialization.published_key().to_owned())
+                .collect();
             if let Some(target) = target {
                 let dests = live_paths.entry(plan.target.clone()).or_default();
-                for key in &keys {
+                for item in projected_artifacts(binding) {
                     dests.push((
                         binding.identity.clone(),
-                        target
-                            .expanded_path()
-                            .join(target.layout().artifact_path(&binding.identity, key)),
+                        target.expanded_path().join(item.destination.as_str()),
                     ));
                 }
             }
@@ -289,12 +285,10 @@ fn live_paths_by_source(projection: &Projection, config: &Config) -> LivePathsBy
             .entry(target_projection.target.clone())
             .or_default();
         for binding in &target_projection.bindings {
-            for key in projected_artifact_keys(binding) {
+            for item in projected_artifacts(binding) {
                 paths.push((
                     binding.identity.clone(),
-                    target
-                        .expanded_path()
-                        .join(target.layout().artifact_path(&binding.identity, &key)),
+                    target.expanded_path().join(item.destination.as_str()),
                 ));
             }
         }
@@ -540,6 +534,7 @@ mod tests {
             preserve_executable: true,
             files: vec![],
             linked: false,
+            history: false,
             vars_digest: None,
             deploy_root: Some("/deploy".to_owned()),
             layout_separator: separator.map(str::to_owned),

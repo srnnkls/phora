@@ -350,6 +350,7 @@ pub(crate) struct ExplainInput<'a> {
     pub take: Option<&'a [TakeEntry]>,
     pub mode: DeployMode,
     pub collapse: Option<bool>,
+    pub history: bool,
     pub layout: &'a LayoutConfig,
     pub template_opt_in: &'a TemplateOptIn,
 }
@@ -373,6 +374,7 @@ pub(crate) fn explain_path(input: &ExplainInput<'_>, path: Option<&str>) -> Resu
         inventory: &inventory,
         take: &take,
         collapse: CollapsePreference::from(input.collapse),
+        history: input.history,
         materialization: MaterializationPolicy::from(&input.mode),
         layout: &layout,
         templates: &templates,
@@ -532,7 +534,14 @@ fn attribute_take(
                     return TakeAttribution::Collapsed { dir: dir.clone() };
                 }
             }
-            Materialization::Leaf(_) => {}
+            Materialization::WholeRoot { .. }
+                if item.leaves.iter().any(|leaf| leaf.source.as_str() == local) =>
+            {
+                return TakeAttribution::Identity {
+                    dest: local.to_owned(),
+                };
+            }
+            Materialization::Leaf(_) | Materialization::WholeRoot { .. } => {}
         }
     }
     TakeAttribution::Dropped
@@ -648,6 +657,7 @@ pub(crate) fn explain_cmd(
         take: binding.take,
         mode: src.deploy_mode(),
         collapse: binding.collapse,
+        history: src.history(),
         layout: &layout,
         template_opt_in: &binding.template_opt_in,
     };
@@ -1106,6 +1116,7 @@ mod explain_tests {
             take,
             mode: source.deploy_mode(),
             collapse,
+            history: source.history(),
             layout: &layout,
             template_opt_in: &TemplateOptIn::SuffixOnly,
         };

@@ -3529,6 +3529,7 @@ mod per_binding_refinement {
             preserve_executable: true,
             files: vec![],
             linked: false,
+            history: false,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,

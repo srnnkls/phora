@@ -597,18 +597,29 @@ impl ArtifactEntry<'_> {
 
     fn record_kind(&self) -> RecordKind {
         match &self.item.materialization {
-            Materialization::CollapsedDir { .. } => RecordKind::Dir,
+            Materialization::CollapsedDir { .. } | Materialization::WholeRoot { .. } => {
+                RecordKind::Dir
+            }
             Materialization::Leaf(_) => RecordKind::File,
         }
     }
 }
 
+pub(crate) fn record_relative_destination(
+    layout: &LayoutConfig,
+    record: &ArtifactRecord,
+) -> PathBuf {
+    if record.history {
+        PathBuf::from(&record.key.artifact)
+    } else {
+        layout.artifact_path(&record.key.source, &record.key.artifact)
+    }
+}
+
 pub(crate) fn record_artifact_path(target: &Target, record: &ArtifactRecord) -> PathBuf {
-    target.expanded_path().join(
-        target
-            .layout()
-            .artifact_path(&record.key.source, &record.key.artifact),
-    )
+    target
+        .expanded_path()
+        .join(record_relative_destination(&target.layout(), record))
 }
 
 /// A `File` record's single manifest file IS the dest, so its base is the dest's parent;
@@ -650,7 +661,7 @@ pub(super) fn expected_vars_digest(
     }
     let templated = match &entry.item.materialization {
         Materialization::Leaf(take) => entry.template_opt_in.renders(&take.source),
-        Materialization::CollapsedDir { .. } => entry
+        Materialization::CollapsedDir { .. } | Materialization::WholeRoot { .. } => entry
             .item
             .leaves
             .iter()
@@ -734,7 +745,7 @@ fn deploy_one(
     let policy = ctx.source.export_policy();
 
     let staging_payload = match &ctx.artifact.materialization {
-        Materialization::CollapsedDir { .. } => staging.clone(),
+        Materialization::CollapsedDir { .. } | Materialization::WholeRoot { .. } => staging.clone(),
         Materialization::Leaf(take) => staging.join(leaf_basename(&take.dest)),
     };
 
@@ -785,6 +796,10 @@ fn deploy_one(
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
         files,
+        history: matches!(
+            &ctx.artifact.materialization,
+            Materialization::WholeRoot { .. }
+        ),
         vars_digest: staged.vars_digest,
         deploy_root: Some(ctx.deploy_root),
         layout_separator: ctx.layout.persisted_separator(),
@@ -825,6 +840,10 @@ fn deploy_link(
         preserve_executable: policy.preserve_executable,
         files: vec![],
         linked: true,
+        history: matches!(
+            &entry.item.materialization,
+            Materialization::WholeRoot { .. }
+        ),
         vars_digest: None,
         deploy_root: Some(deploy_root),
         layout_separator: entry.layout.persisted_separator(),
@@ -861,6 +880,7 @@ fn link_target(entry: &ArtifactEntry<'_>) -> PathBuf {
     match &entry.item.materialization {
         Materialization::CollapsedDir { dir } => target.push(dir),
         Materialization::Leaf(take) => target.push(&take.source),
+        Materialization::WholeRoot { .. } => {}
     }
     target
 }
@@ -1086,6 +1106,7 @@ mod kind_aware_layout_tests {
                 blake3: "blake3:d4e5f6".to_owned(),
             }],
             linked: false,
+            history: false,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
@@ -1165,6 +1186,19 @@ mod kind_aware_layout_tests {
     }
 
     #[test]
+    fn history_record_deploys_at_binding_identity_without_by_source_composition() {
+        let root = Path::new("/home/u/dest");
+        let target = target_with_layout(root, LayoutKind::BySource);
+        let identity = "dotfiles";
+        let rec = ArtifactRecord {
+            history: true,
+            ..record(identity, identity, "by-source", RecordKind::Dir)
+        };
+
+        assert_eq!(record_artifact_path(&target, &rec), root.join(identity));
+    }
+
+    #[test]
     fn dir_kind_deploys_at_by_source_layout_path_unchanged() {
         let root = Path::new("/home/u/dest");
         let target = target_with_layout(root, LayoutKind::BySource);
@@ -1226,6 +1260,7 @@ mod kind_aware_layout_tests {
                 blake3: "blake3:d4e5f6".to_owned(),
             }],
             linked: false,
+            history: false,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,

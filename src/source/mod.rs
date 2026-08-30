@@ -12,6 +12,7 @@ mod router;
 mod snapshot;
 pub(crate) mod transitive;
 mod worktree;
+mod worktree_deploy;
 
 #[cfg(test)]
 pub(crate) use cache::mirror_path;
@@ -28,9 +29,16 @@ pub use snapshot::{
     SourceIdentity, SourceLocation, SourceStore, SourceTimestamp, digest_snapshot,
 };
 pub use worktree::{capture_worktree, is_local_path, read_local_head};
+pub use worktree_deploy::{
+    WorktreeAdminId, WorktreeDeployRequest, WorktreeDeployment, WorktreeMirrorAddress,
+    WorktreeMirrorGuard, WorktreeObservationLevel, WorktreeObservationLock,
+    WorktreeObservationRequest, WorktreeObservationResult, WorktreeRemoveRequest,
+    worktree_admin_id,
+};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use thiserror::Error;
 
@@ -188,6 +196,24 @@ impl MirrorKey {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl FromStr for MirrorKey {
+    type Err = SourceError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let valid = value.len() == 16
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'));
+        if valid {
+            Ok(Self(value.to_owned()))
+        } else {
+            Err(SourceError::Source(format!(
+                "invalid mirror key `{value}`: expected 16 lowercase hex chars"
+            )))
+        }
     }
 }
 
@@ -3090,5 +3116,69 @@ path = "srnnkls/tropos"
 
             drop(held_a);
         }
+    }
+
+    #[test]
+    fn history_worktree_id_is_deterministic_and_ref_safe() {
+        let project = TempDir::new().expect("project root");
+        let deploy = TempDir::new().expect("deploy root");
+        let first = worktree_admin_id(project.path(), deploy.path(), "target", "bad identity:*")
+            .expect("derive worktree admin id");
+        let repeated = worktree_admin_id(project.path(), deploy.path(), "target", "bad identity:*")
+            .expect("derive same worktree admin id");
+        let changed = worktree_admin_id(project.path(), deploy.path(), "other", "bad identity:*")
+            .expect("derive distinct worktree admin id");
+
+        assert_eq!(
+            first, repeated,
+            "the same deployment identity must keep its admin id"
+        );
+        assert_ne!(
+            first, changed,
+            "the target name is framed input and must change the admin id"
+        );
+        assert_eq!(first.as_str().len(), 16);
+        assert!(
+            first
+                .as_str()
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+            "the ref component must be lowercase hexadecimal, never the raw identity"
+        );
+        assert_eq!(
+            first
+                .as_str()
+                .parse::<WorktreeAdminId>()
+                .expect("persisted id parses"),
+            first
+        );
+    }
+
+    #[test]
+    fn history_worktree_default_lock_api_leaves_cache_absent() {
+        let cache = TempDir::new().expect("cache parent");
+        let git_root = cache.path().join("git");
+        let store = HttpBackend::new(git_root.clone(), BTreeMap::new());
+        let source = SourceName::trusted("url-source");
+        let key = "a1b2c3d4e5f60708"
+            .parse::<MirrorKey>()
+            .expect("valid mirror key");
+        let address = WorktreeMirrorAddress {
+            cache_git_root: git_root.clone(),
+            key: key.clone(),
+        };
+
+        assert!(
+            store.lock_worktree_mirror(&source, &key).is_err(),
+            "the default adapter implementation must reject write locking"
+        );
+        assert!(
+            store.lock_worktree_mirror_at(&source, &address).is_err(),
+            "the persisted-address default must reject write locking"
+        );
+        assert!(
+            !git_root.exists(),
+            "default/read-only worktree administration must not create the cache or lock directory"
+        );
     }
 }

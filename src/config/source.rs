@@ -117,6 +117,7 @@ pub struct ParsedSource {
     preserve_executable: Option<bool>,
     deploy: Option<DeployMode>,
     transitive: bool,
+    history: bool,
 }
 
 impl ParsedSource {
@@ -124,6 +125,11 @@ impl ParsedSource {
     #[must_use]
     pub fn is_transitive(&self) -> bool {
         self.transitive
+    }
+
+    #[must_use]
+    pub fn history(&self) -> bool {
+        self.history
     }
 
     /// Parses a merged raw `Source` into the typed single-kind shape.
@@ -154,6 +160,7 @@ impl ParsedSource {
             preserve_executable: source.preserve_executable,
             deploy: source.deploy,
             transitive: source.is_transitive(),
+            history: source.history.unwrap_or_default(),
         })
     }
 

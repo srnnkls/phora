@@ -225,11 +225,7 @@ fn rebuild_binding(run: &BindingRun<'_>, report: &mut RebuildReport) -> Result<(
             source: run.binding.identity.clone(),
             artifact: published_key.clone(),
         };
-        let artifact_dst = run.target.expanded_path().join(
-            run.target
-                .layout()
-                .artifact_path(&run.binding.identity, &published_key),
-        );
+        let artifact_dst = run.target.expanded_path().join(item.destination.as_str());
 
         if run.binding.commit == "link" {
             rebuild_linked(
@@ -268,7 +264,7 @@ fn rebuild_binding(run: &BindingRun<'_>, report: &mut RebuildReport) -> Result<(
 
 fn record_kind(materialization: &Materialization) -> RecordKind {
     match materialization {
-        Materialization::CollapsedDir { .. } => RecordKind::Dir,
+        Materialization::CollapsedDir { .. } | Materialization::WholeRoot { .. } => RecordKind::Dir,
         Materialization::Leaf(_) => RecordKind::File,
     }
 }
@@ -336,7 +332,9 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
     )?;
 
     let manifest_base = match &item.materialization {
-        Materialization::CollapsedDir { .. } => artifact_dst.to_path_buf(),
+        Materialization::CollapsedDir { .. } | Materialization::WholeRoot { .. } => {
+            artifact_dst.to_path_buf()
+        }
         Materialization::Leaf(_) => artifact_dst
             .parent()
             .map_or_else(|| artifact_dst.to_path_buf(), Path::to_path_buf),
@@ -374,6 +372,7 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
         files,
+        history: matches!(&item.materialization, Materialization::WholeRoot { .. }),
         vars_digest: staged.vars_digest,
         deploy_root: Some(deploy_root),
         layout_separator: layout.persisted_separator(),
@@ -409,6 +408,7 @@ fn rebuild_linked(
         preserve_executable: policy.preserve_executable,
         files: vec![],
         linked: true,
+        history: false,
         vars_digest: None,
         deploy_root: Some(deploy_root),
         layout_separator: layout.persisted_separator(),

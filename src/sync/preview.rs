@@ -360,6 +360,7 @@ fn resolve_plan(
         inventory: &inventory,
         take: &take,
         collapse: CollapsePreference::from(ctx.binding.collapse),
+        history: ctx.source.history(),
         materialization: MaterializationPolicy::from(&ctx.source.deploy_mode()),
         layout: &layout,
         templates: &templates,
@@ -456,6 +457,14 @@ fn item_files(ctx: &BindingCtx, item: &ProjectedArtifact) -> Vec<PreviewFile> {
             files.sort_by(|a, b| a.path.cmp(&b.path));
             files
         }
+        Materialization::WholeRoot { .. } => item
+            .leaves
+            .iter()
+            .map(|leaf| PreviewFile {
+                path: PathBuf::from(leaf.destination.as_str()),
+                templated: false,
+            })
+            .collect(),
     }
 }
 
@@ -551,6 +560,7 @@ mod preview_warning_tests {
             inventory: &inventory,
             take: &take,
             collapse: CollapsePreference::from(collapse),
+            history: false,
             materialization: MaterializationPolicy::from(&source.deploy_mode()),
             layout: &layout,
             templates: &templates,
