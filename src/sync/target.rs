@@ -5,8 +5,9 @@ use crate::config::{DeployMode, LayoutConfig, ParsedSource, Target, TemplateOptI
 use crate::error::{Error, Result};
 use crate::projection::model::{ContentTransform, Materialization};
 use crate::source::{
-    ResolvedSource, SourceIdentity, SourcePath, SourceStore, WorktreeDeployRequest,
-    WorktreeMirrorAddress, WorktreeMirrorGuard, safe_relpath, worktree_admin_id,
+    ResolvedSource, SourceEntryKind, SourceIdentity, SourcePath, SourceStore,
+    WorktreeDeployRequest, WorktreeMirrorAddress, WorktreeMirrorGuard, safe_relpath,
+    worktree_admin_id,
 };
 use crate::sync::state::{
     ArtifactKey, ArtifactRecord, Ejection, ManifestFile, NewArtifactRecord, NewHistoryRecord,
@@ -737,6 +738,7 @@ struct DeployContext<'a> {
 type HistoryDeployment = (
     Option<NewHistoryRecord>,
     Option<(WorktreeMirrorGuard, WorktreeDeployRequest)>,
+    Option<SyncWarning>,
 );
 
 pub(crate) fn history_deployment(
@@ -777,9 +779,12 @@ fn prepare_history_deployment(
     whole_root: bool,
 ) -> Result<HistoryDeployment> {
     if !whole_root {
-        return Ok((None, None));
+        return Ok((None, None, None));
     }
+    let attributes = root_gitattributes_declares_content_filter(backend, ctx.resolved)?;
     let guard = backend.lock_worktree_mirror(&ctx.resolved.name, ctx.resolved.snapshot.mirror())?;
+    let autocrlf = guard.mirror.config_snapshot().boolean("core.autocrlf") == Some(true);
+    let warning = history_content_filter_warning(ctx.underlying_source, attributes, autocrlf);
     let (history, request) = history_deployment(
         &project_root()?,
         ctx.artifact_dst,
@@ -788,7 +793,66 @@ fn prepare_history_deployment(
         &guard.address,
         ctx.commit,
     )?;
-    Ok((Some(history), Some((guard, request))))
+    Ok((Some(history), Some((guard, request)), warning))
+}
+
+fn root_gitattributes_declares_content_filter(
+    backend: &dyn SourceStore,
+    resolved: &ResolvedSource,
+) -> Result<bool> {
+    let attributes_path = SourcePath::new(".gitattributes")?;
+    match backend.read(&resolved.snapshot, &attributes_path) {
+        Ok(entry)
+            if matches!(
+                entry.meta.kind,
+                SourceEntryKind::File | SourceEntryKind::Executable
+            ) =>
+        {
+            Ok(gitattributes_declares_content_filter(&entry.bytes))
+        }
+        Ok(_)
+        | Err(
+            crate::source::SourceError::FileAbsent { .. }
+            | crate::source::SourceError::MappedKeyNotALeaf { .. },
+        ) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn history_content_filter_warning(
+    source: &str,
+    attributes: bool,
+    autocrlf: bool,
+) -> Option<SyncWarning> {
+    (attributes || autocrlf).then(|| SyncWarning::HistoryContentFilter {
+        source: source.to_owned(),
+        attributes,
+        autocrlf,
+    })
+}
+
+fn gitattributes_declares_content_filter(contents: &[u8]) -> bool {
+    gix::attrs::parse(contents)
+        .filter_map(std::result::Result::ok)
+        .any(|(_, assignments, _)| {
+            let Ok(assignments) = assignments.collect::<std::result::Result<Vec<_>, _>>() else {
+                return false;
+            };
+            assignments.into_iter().any(|assignment| {
+                matches!(
+                    assignment.name.as_ref(),
+                    "text" | "eol" | "ident" | "filter"
+                ) && matches!(
+                    assignment.state,
+                    gix::attrs::StateRef::Set | gix::attrs::StateRef::Value(_)
+                )
+            })
+        })
+}
+
+fn staging_path(staging_base: &Path, artifact: &str) -> PathBuf {
+    let artifact_label = artifact.replace('/', "_");
+    staging_base.join(format!("{artifact_label}-{}", nonce()))
 }
 
 fn deploy_one(
@@ -798,10 +862,8 @@ fn deploy_one(
     ctx: DeployContext<'_>,
 ) -> Result<()> {
     let staging_base = target_parent(ctx.artifact_dst).join(".phora-stage");
-    let key_label = ctx.key.artifact.replace('/', "_");
-    let staging = staging_base.join(format!("{key_label}-{}", nonce()));
+    let staging = staging_path(&staging_base, &ctx.key.artifact);
     let mut staging_guard = StagingGuard::new(&staging_base, &staging);
-
     let whole_root = matches!(
         &ctx.artifact.materialization,
         Materialization::WholeRoot { .. }
@@ -863,7 +925,8 @@ fn deploy_one(
             .map_err(|e| Error::Sync(format!("create target dir {}: {e}", parent.display())))?;
     }
 
-    let (history, worktree) = prepare_history_deployment(backend, &ctx, whole_root)?;
+    let (history, worktree, content_filter_warning) =
+        prepare_history_deployment(backend, &ctx, whole_root)?;
 
     let record = ArtifactRecord::projected(NewArtifactRecord {
         key: ctx.key,
@@ -900,7 +963,11 @@ fn deploy_one(
             }
             Ok(())
         },
-    )
+    )?;
+    if let Some(warning) = content_filter_warning {
+        ctx.events.warnings.push(warning);
+    }
+    Ok(())
 }
 
 fn deploy_link(

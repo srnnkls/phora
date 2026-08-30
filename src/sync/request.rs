@@ -189,6 +189,11 @@ pub enum SyncWarning {
     UntrustedTransitiveHooks {
         count: usize,
     },
+    HistoryContentFilter {
+        source: String,
+        attributes: bool,
+        autocrlf: bool,
+    },
 }
 
 /// Overall synchronization outcome used by callers to choose an exit code.

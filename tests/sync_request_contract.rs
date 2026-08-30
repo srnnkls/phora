@@ -1116,7 +1116,7 @@ fn public_sync_tree_escape_hatches(path: &Path) -> Vec<String> {
         .collect()
 }
 
-const ALLOWED_SYNC_WARNING_SHAPES: [&str; 14] = [
+const ALLOWED_SYNC_WARNING_SHAPES: [&str; 15] = [
     "Projection(ProjectionWarning)",
     "MalformedTransitiveHooks{target:String,detail:String}",
     "LinkPathNotPortable{source:String,path:PathBuf}",
@@ -1131,6 +1131,7 @@ const ALLOWED_SYNC_WARNING_SHAPES: [&str; 14] = [
     "ConflictModified{source:String,artifact:String,changed:Vec<PathBuf>}",
     "ConflictForeign{path:PathBuf}",
     "UntrustedTransitiveHooks{count:usize}",
+    "HistoryContentFilter{source:String,attributes:bool,autocrlf:bool}",
 ];
 
 fn render_tokens(tokens: &[Token]) -> String {

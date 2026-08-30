@@ -294,6 +294,21 @@ fn render_sync_warnings(out: &SyncReport) {
                 path.display()
             ),
             SyncWarning::UntrustedTransitiveHooks { .. } => {}
+            SyncWarning::HistoryContentFilter {
+                source,
+                attributes,
+                autocrlf,
+            } => {
+                let cause = match (*attributes, *autocrlf) {
+                    (true, true) => ".gitattributes and core.autocrlf=true",
+                    (true, false) => ".gitattributes",
+                    (false, true) => "core.autocrlf=true",
+                    (false, false) => unreachable!("content-filter warning requires a cause"),
+                };
+                eprintln!(
+                    "phora: history source `{source}` uses content filters ({cause}); its Git overlay may report files modified"
+                );
+            }
         }
     }
 }
