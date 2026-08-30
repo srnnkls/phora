@@ -120,6 +120,7 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         for (name, source) in &self.sources {
             let parsed = ParsedSource::parse(name, source)?;
+            reject_history_source_options(name, source, &parsed)?;
             let Remote::Host {
                 host: host_name,
                 repo,
@@ -241,6 +242,7 @@ impl Config {
                 };
                 reject_url_slice(effective, binding, source)?;
                 reject_link_ref(effective, binding, source)?;
+                reject_history_binding_options(effective, binding, source)?;
                 reject_multi_ref(effective, binding)?;
             }
         }
@@ -462,6 +464,56 @@ fn binding_scope_diagnostic(
         debug_hint: Some(format!("phora explain {target_name} {binding_name}")),
         details: Vec::new(),
     }
+}
+
+fn reject_history_source_options(
+    source_name: &str,
+    source: &Source,
+    parsed: &ParsedSource,
+) -> Result<()> {
+    if source.history != Some(true) {
+        return Ok(());
+    }
+    let option = if matches!(parsed.remote, Remote::Url { .. }) {
+        "url"
+    } else if parsed.deploy_mode() == DeployMode::Link {
+        "deploy"
+    } else if source.root.is_some() {
+        "root"
+    } else if source.include.is_some() {
+        "include"
+    } else if source.exclude.is_some() {
+        "exclude"
+    } else if source.transitive == Some(true) {
+        "transitive"
+    } else {
+        return Ok(());
+    };
+    Err(Error::Config(format!(
+        "source `{source_name}`: `history` cannot be combined with `{option}`"
+    )))
+}
+
+fn reject_history_binding_options(
+    source_name: &str,
+    binding: &Binding,
+    source: &Source,
+) -> Result<()> {
+    if source.history != Some(true) {
+        return Ok(());
+    }
+    let option = if binding.take.is_some() {
+        "take"
+    } else if binding.template.is_some() {
+        "template"
+    } else if binding.collapse.is_some() {
+        "collapse"
+    } else {
+        return Ok(());
+    };
+    Err(Error::Config(format!(
+        "source `{source_name}`: binding option `{option}` cannot be used with `history`"
+    )))
 }
 
 fn reject_url_slice(source_name: &str, binding: &Binding, source: &Source) -> Result<()> {

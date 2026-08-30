@@ -43,6 +43,8 @@ pub struct Source {
     pub deploy: Option<DeployMode>,
     #[serde(default)]
     pub transitive: Option<bool>,
+    #[serde(default)]
+    pub history: Option<bool>,
 }
 
 impl Source {
@@ -452,6 +454,9 @@ impl Source {
         if local.transitive.is_some() {
             self.transitive = local.transitive;
         }
+        if local.history.is_some() {
+            self.history = local.history;
+        }
         self
     }
 
@@ -601,6 +606,7 @@ mod offer_tests {
             preserve_executable: None,
             deploy: None,
             transitive: None,
+            history: None,
         }
     }
 
@@ -788,6 +794,7 @@ mod merge_url_digest_tests {
             preserve_executable: None,
             deploy: None,
             transitive: None,
+            history: None,
         }
     }
 

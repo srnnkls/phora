@@ -1563,19 +1563,20 @@ fn run_add_end_to_end_persists_symbolic_source_to_phora_toml() {
     let toml_path = dir.path().join("phora.toml");
 
     with_cwd(dir.path(), || {
-        run_add(
-            "github:srnnkls/tropos",
-            &[],
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            false,
-            false,
-            &config_edit::BindRefinement::default(),
-        )
+        run_add(AddRequest {
+            url: "github:srnnkls/tropos",
+            targets: &[],
+            name: None,
+            branch: None,
+            tag: None,
+            root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            local: false,
+            symlink: false,
+            refinement: &config_edit::BindRefinement::default(),
+            history: false,
+        })
         .expect("run_add must succeed for a symbolic colon alias");
     });
 
@@ -1612,19 +1613,20 @@ fn run_add_persists_local_path_source_for_absolute_dir() {
     let source_arg = source_path.to_str().expect("utf-8 source path");
 
     with_cwd(project.path(), || {
-        run_add(
-            source_arg,
-            &[],
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            false,
-            false,
-            &config_edit::BindRefinement::default(),
-        )
+        run_add(AddRequest {
+            url: source_arg,
+            targets: &[],
+            name: None,
+            branch: None,
+            tag: None,
+            root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            local: false,
+            symlink: false,
+            refinement: &config_edit::BindRefinement::default(),
+            history: false,
+        })
         .expect("run_add must accept an absolute local path source");
     });
 
@@ -1666,19 +1668,20 @@ fn run_add_to_target_persists_local_path_source() {
     let source_arg = source_path.to_str().expect("utf-8 source path");
 
     with_cwd(project.path(), || {
-        run_add(
-            source_arg,
-            &["home".to_owned()],
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            false,
-            false,
-            &config_edit::BindRefinement::default(),
-        )
+        run_add(AddRequest {
+            url: source_arg,
+            targets: &["home".to_owned()],
+            name: None,
+            branch: None,
+            tag: None,
+            root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            local: false,
+            symlink: false,
+            refinement: &config_edit::BindRefinement::default(),
+            history: false,
+        })
         .expect("run_add --to must accept a local path source");
     });
 
@@ -2551,19 +2554,20 @@ fn add_local_writes_path_local_path_to_phora_local_toml() {
     let abspath = std::fs::canonicalize(src_dir.path()).expect("canonicalize source dir");
 
     with_cwd(dir.path(), || {
-        run_add(
-            src_dir.path().to_str().expect("utf8 source path"),
-            &[],
-            Some("mysrc".to_owned()),
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            true,
-            false,
-            &config_edit::BindRefinement::default(),
-        )
+        run_add(AddRequest {
+            url: src_dir.path().to_str().expect("utf8 source path"),
+            targets: &[],
+            name: Some("mysrc".to_owned()),
+            branch: None,
+            tag: None,
+            root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            local: true,
+            symlink: false,
+            refinement: &config_edit::BindRefinement::default(),
+            history: false,
+        })
         .expect("run_add --local must succeed for an existing dir");
     });
 
@@ -2592,19 +2596,20 @@ fn add_symlink_writes_path_and_deploy_link_to_local_toml() {
     let abspath = std::fs::canonicalize(src_dir.path()).expect("canonicalize source dir");
 
     with_cwd(dir.path(), || {
-        run_add(
-            src_dir.path().to_str().expect("utf8 source path"),
-            &[],
-            Some("linked".to_owned()),
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            false,
-            true,
-            &config_edit::BindRefinement::default(),
-        )
+        run_add(AddRequest {
+            url: src_dir.path().to_str().expect("utf8 source path"),
+            targets: &[],
+            name: Some("linked".to_owned()),
+            branch: None,
+            tag: None,
+            root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            local: false,
+            symlink: true,
+            refinement: &config_edit::BindRefinement::default(),
+            history: false,
+        })
         .expect("run_add --symlink must succeed for an existing dir");
     });
 
@@ -2637,19 +2642,20 @@ fn add_local_infers_name_from_path_basename() {
         .into_owned();
 
     with_cwd(dir.path(), || {
-        run_add(
-            src_dir.to_str().expect("utf8 source path"),
-            &[],
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            true,
-            false,
-            &config_edit::BindRefinement::default(),
-        )
+        run_add(AddRequest {
+            url: src_dir.to_str().expect("utf8 source path"),
+            targets: &[],
+            name: None,
+            branch: None,
+            tag: None,
+            root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            local: true,
+            symlink: false,
+            refinement: &config_edit::BindRefinement::default(),
+            history: false,
+        })
         .expect("run_add --local with no --name must succeed");
     });
 
@@ -2670,19 +2676,20 @@ fn add_symlink_implies_local_overlay_and_is_valid() {
     let abspath = std::fs::canonicalize(src_dir.path()).expect("canonicalize source dir");
 
     with_cwd(dir.path(), || {
-        run_add(
-            src_dir.path().to_str().expect("utf8 source path"),
-            &[],
-            Some("app".to_owned()),
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            false,
-            true,
-            &config_edit::BindRefinement::default(),
-        )
+        run_add(AddRequest {
+            url: src_dir.path().to_str().expect("utf8 source path"),
+            targets: &[],
+            name: Some("app".to_owned()),
+            branch: None,
+            tag: None,
+            root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            local: false,
+            symlink: true,
+            refinement: &config_edit::BindRefinement::default(),
+            history: false,
+        })
         .expect("run_add --symlink must succeed");
     });
 
@@ -2712,19 +2719,20 @@ fn add_local_and_symlink_together_equals_symlink() {
     let overlay_for = |local: bool, symlink: bool| -> String {
         let dir = tempfile::TempDir::new().expect("temp project dir");
         with_cwd(dir.path(), || {
-            run_add(
-                src_dir.path().to_str().expect("utf8 source path"),
-                &[],
-                Some("s".to_owned()),
-                None,
-                None,
-                None,
-                Vec::new(),
-                Vec::new(),
+            run_add(AddRequest {
+                url: src_dir.path().to_str().expect("utf8 source path"),
+                targets: &[],
+                name: Some("s".to_owned()),
+                branch: None,
+                tag: None,
+                root: None,
+                include: Vec::new(),
+                exclude: Vec::new(),
                 local,
                 symlink,
-                &config_edit::BindRefinement::default(),
-            )
+                refinement: &config_edit::BindRefinement::default(),
+                history: false,
+            })
             .expect("run_add must not error");
         });
         std::fs::read_to_string(dir.path().join("phora.local.toml"))
@@ -2772,19 +2780,20 @@ fn add_without_flags_still_writes_phora_toml() {
     let dir = tempfile::TempDir::new().expect("temp project dir");
 
     with_cwd(dir.path(), || {
-        run_add(
-            "github:srnnkls/tropos",
-            &[],
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            false,
-            false,
-            &config_edit::BindRefinement::default(),
-        )
+        run_add(AddRequest {
+            url: "github:srnnkls/tropos",
+            targets: &[],
+            name: None,
+            branch: None,
+            tag: None,
+            root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            local: false,
+            symlink: false,
+            refinement: &config_edit::BindRefinement::default(),
+            history: false,
+        })
         .expect("run_add with no overlay flags must keep its remote behavior");
     });
 
@@ -2813,19 +2822,20 @@ fn add_local_canonicalizes_relative_path_to_absolute() {
     let expected = std::fs::canonicalize(dir.path().join("sub")).expect("canonicalize subdir");
 
     with_cwd(dir.path(), || {
-        run_add(
-            "sub",
-            &[],
-            Some("s".to_owned()),
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            true,
-            false,
-            &config_edit::BindRefinement::default(),
-        )
+        run_add(AddRequest {
+            url: "sub",
+            targets: &[],
+            name: Some("s".to_owned()),
+            branch: None,
+            tag: None,
+            root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            local: true,
+            symlink: false,
+            refinement: &config_edit::BindRefinement::default(),
+            history: false,
+        })
         .expect("run_add --local must accept a relative existing path");
     });
 
@@ -2850,19 +2860,20 @@ fn add_local_errors_when_path_does_not_exist() {
     let missing = "does-not-exist-xyz";
 
     let err = with_cwd(dir.path(), || {
-        run_add(
-            missing,
-            &[],
-            Some("s".to_owned()),
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            true,
-            false,
-            &config_edit::BindRefinement::default(),
-        )
+        run_add(AddRequest {
+            url: missing,
+            targets: &[],
+            name: Some("s".to_owned()),
+            branch: None,
+            tag: None,
+            root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            local: true,
+            symlink: false,
+            refinement: &config_edit::BindRefinement::default(),
+            history: false,
+        })
         .expect_err("--local on a nonexistent path must error")
     });
 
@@ -2892,19 +2903,20 @@ fn add_local_rejects_non_directory_path() {
     let file_str = file.to_str().expect("utf8 file path").to_owned();
 
     let err = with_cwd(dir.path(), || {
-        run_add(
-            &file_str,
-            &[],
-            Some("s".to_owned()),
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            true,
-            false,
-            &config_edit::BindRefinement::default(),
-        )
+        run_add(AddRequest {
+            url: &file_str,
+            targets: &[],
+            name: Some("s".to_owned()),
+            branch: None,
+            tag: None,
+            root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            local: true,
+            symlink: false,
+            refinement: &config_edit::BindRefinement::default(),
+            history: false,
+        })
         .expect_err("--local on a regular file must error")
     });
 
@@ -2940,19 +2952,20 @@ fn add_local_preserves_siblings_and_replaces_same_name_in_overlay() {
     let second_abs = std::fs::canonicalize(second.path()).expect("canonicalize second dir");
 
     with_cwd(dir.path(), || {
-        run_add(
-            first.path().to_str().expect("utf8"),
-            &[],
-            Some("mine".to_owned()),
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            true,
-            false,
-            &config_edit::BindRefinement::default(),
-        )
+        run_add(AddRequest {
+            url: first.path().to_str().expect("utf8"),
+            targets: &[],
+            name: Some("mine".to_owned()),
+            branch: None,
+            tag: None,
+            root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            local: true,
+            symlink: false,
+            refinement: &config_edit::BindRefinement::default(),
+            history: false,
+        })
         .expect("adding a new overlay source must succeed");
     });
 
@@ -2969,19 +2982,20 @@ fn add_local_preserves_siblings_and_replaces_same_name_in_overlay() {
     );
 
     with_cwd(dir.path(), || {
-        run_add(
-            second.path().to_str().expect("utf8"),
-            &[],
-            Some("mine".to_owned()),
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            true,
-            false,
-            &config_edit::BindRefinement::default(),
-        )
+        run_add(AddRequest {
+            url: second.path().to_str().expect("utf8"),
+            targets: &[],
+            name: Some("mine".to_owned()),
+            branch: None,
+            tag: None,
+            root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            local: true,
+            symlink: false,
+            refinement: &config_edit::BindRefinement::default(),
+            history: false,
+        })
         .expect("re-adding the same name must succeed");
     });
 
@@ -3015,19 +3029,20 @@ fn add_symlink_overlay_overrides_base_source_after_merge() {
     let abspath = std::fs::canonicalize(src_dir.path()).expect("canonicalize source dir");
 
     with_cwd(dir.path(), || {
-        run_add(
-            src_dir.path().to_str().expect("utf8"),
-            &[],
-            Some("app".to_owned()),
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            false,
-            true,
-            &config_edit::BindRefinement::default(),
-        )
+        run_add(AddRequest {
+            url: src_dir.path().to_str().expect("utf8"),
+            targets: &[],
+            name: Some("app".to_owned()),
+            branch: None,
+            tag: None,
+            root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            local: false,
+            symlink: true,
+            refinement: &config_edit::BindRefinement::default(),
+            history: false,
+        })
         .expect("--symlink --name app must write the overlay");
     });
 
@@ -3572,6 +3587,7 @@ fn add_to_with_refinement_flags_writes_source_and_table_binding() {
                 root: Some("nvim".to_owned()),
                 local: false,
                 symlink: false,
+                history: false,
                 to: vec!["editor".to_owned()],
                 r#as: Some("nvim".to_owned()),
                 include: Vec::new(),
@@ -3637,6 +3653,7 @@ fn add_to_with_no_refinement_flags_writes_a_bare_string_binding() {
                 root: None,
                 local: false,
                 symlink: false,
+                history: false,
                 to: vec!["editor".to_owned()],
                 r#as: None,
                 include: Vec::new(),
@@ -3692,6 +3709,7 @@ fn add_as_with_multiple_targets_errors() {
                 root: None,
                 local: false,
                 symlink: false,
+                history: false,
                 to: vec!["editor".to_owned(), "shell".to_owned()],
                 r#as: Some("nvim".to_owned()),
                 include: Vec::new(),
@@ -3728,6 +3746,7 @@ fn add_to_a_single_target_with_as_is_the_happy_path() {
                 root: None,
                 local: false,
                 symlink: false,
+                history: false,
                 to: vec!["editor".to_owned()],
                 r#as: Some("nvim".to_owned()),
                 include: Vec::new(),
@@ -3771,6 +3790,7 @@ fn bare_add_without_to_does_not_touch_targets() {
                 root: None,
                 local: false,
                 symlink: false,
+                history: false,
                 to: Vec::new(),
                 r#as: None,
                 include: Vec::new(),
@@ -3821,6 +3841,7 @@ fn add_to_with_root_scopes_the_source_not_the_binding() {
                 root: Some("nvim".to_owned()),
                 local: false,
                 symlink: false,
+                history: false,
                 to: vec!["editor".to_owned()],
                 r#as: Some("nvim".to_owned()),
                 include: Vec::new(),
@@ -3871,6 +3892,7 @@ fn add_to_with_url_embedded_root_sets_the_source_root() {
                 root: None,
                 local: false,
                 symlink: false,
+                history: false,
                 to: vec!["editor".to_owned()],
                 r#as: None,
                 include: Vec::new(),
@@ -3929,6 +3951,7 @@ fn bare_add_with_root_still_sets_the_source_root() {
                 root: Some("nvim".to_owned()),
                 local: false,
                 symlink: false,
+                history: false,
                 to: Vec::new(),
                 r#as: None,
                 include: Vec::new(),
@@ -3963,6 +3986,7 @@ fn add_as_without_to_errors() {
                 root: None,
                 local: false,
                 symlink: false,
+                history: false,
                 to: Vec::new(),
                 r#as: Some("nvim".to_owned()),
                 include: Vec::new(),
@@ -4000,6 +4024,7 @@ fn add_local_with_to_errors() {
                 root: None,
                 local: true,
                 symlink: false,
+                history: false,
                 to: vec!["editor".to_owned()],
                 r#as: None,
                 include: Vec::new(),
@@ -4037,6 +4062,7 @@ fn add_to_multiple_targets_writes_a_binding_in_each() {
                 root: None,
                 local: false,
                 symlink: false,
+                history: false,
                 to: vec!["editor".to_owned(), "shell".to_owned()],
                 r#as: None,
                 include: Vec::new(),
@@ -4085,6 +4111,7 @@ fn add_to_with_include_exclude_writes_arrays_on_the_source() {
                 root: None,
                 local: false,
                 symlink: false,
+                history: false,
                 to: vec!["editor".to_owned()],
                 r#as: None,
                 include: vec!["*.lua".to_owned()],
@@ -4115,19 +4142,20 @@ fn bare_add_routes_repeatable_include_exclude_root_to_the_source_not_the_binding
     let toml_path = dir.path().join("phora.toml");
 
     with_cwd(dir.path(), || {
-        run_add(
-            "github:srnnkls/tropos",
-            &[],
-            None,
-            None,
-            None,
-            Some("editor".to_owned()),
-            vec!["skills/**".to_owned(), "*.lua".to_owned()],
-            vec![".git".to_owned()],
-            false,
-            false,
-            &config_edit::BindRefinement::default(),
-        )
+        run_add(AddRequest {
+            url: "github:srnnkls/tropos",
+            targets: &[],
+            name: None,
+            branch: None,
+            tag: None,
+            root: Some("editor".to_owned()),
+            include: vec!["skills/**".to_owned(), "*.lua".to_owned()],
+            exclude: vec![".git".to_owned()],
+            local: false,
+            symlink: false,
+            refinement: &config_edit::BindRefinement::default(),
+            history: false,
+        })
         .expect("`add --include --include --exclude --root` must succeed");
     });
 
@@ -4183,6 +4211,7 @@ fn add_to_target_without_sources_array_creates_the_array_and_binds() {
                 root: None,
                 local: false,
                 symlink: false,
+                history: false,
                 to: vec!["editor".to_owned()],
                 r#as: None,
                 include: Vec::new(),
@@ -4225,6 +4254,7 @@ fn add_to_nonexistent_target_errors_and_leaves_file_untouched() {
                 root: None,
                 local: false,
                 symlink: false,
+                history: false,
                 to: vec!["does-not-exist".to_owned()],
                 r#as: None,
                 include: Vec::new(),
@@ -5777,4 +5807,169 @@ fn target_rm_refuses_overridden_target_with_live_records() {
         Some(local_text),
         "a refused rm must leave phora.local.toml unchanged for an overridden target"
     );
+}
+
+#[test]
+fn add_history_writes_the_selected_config_and_rejects_incompatible_flags() {
+    use clap::Parser;
+
+    let project = tempfile::TempDir::new().expect("base project dir");
+    with_cwd(project.path(), || {
+        let cli = Cli::try_parse_from(["phora", "add", "--history", "github:owner/dotfiles"])
+            .expect("add --history must parse");
+        run(cli).expect("add --history must write the base config");
+    });
+    let base = std::fs::read_to_string(project.path().join("phora.toml"))
+        .expect("add --history must create phora.toml");
+    assert!(
+        base.contains("history = true"),
+        "add --history must persist history = true in phora.toml; got:\n{base}"
+    );
+
+    let local_project = tempfile::TempDir::new().expect("local project dir");
+    let local_source = tempfile::TempDir::new().expect("local source dir");
+    let local_spec = local_source
+        .path()
+        .to_str()
+        .expect("utf-8 local source path");
+    with_cwd(local_project.path(), || {
+        let cli = Cli::try_parse_from(["phora", "add", "--history", "--local", local_spec])
+            .expect("add --history --local must parse");
+        run(cli).expect("add --history --local must write the local config");
+    });
+    assert!(
+        !local_project.path().join("phora.toml").exists(),
+        "add --history --local must not create phora.toml"
+    );
+    let local = std::fs::read_to_string(local_project.path().join("phora.local.toml"))
+        .expect("add --history --local must create phora.local.toml");
+    assert!(
+        local.contains("history = true"),
+        "add --history --local must persist history = true in phora.local.toml; got:\n{local}"
+    );
+
+    for flag in ["--symlink", "--root", "--include", "--exclude"] {
+        let mut args = vec!["phora", "add", "--history", flag];
+        if flag != "--symlink" {
+            args.push("value");
+        }
+        args.push("github:owner/dotfiles");
+        let error = Cli::try_parse_from(args)
+            .expect_err("--history must reject incompatible add flags")
+            .to_string();
+        assert!(
+            error.contains("--history") && error.contains(flag),
+            "the CLI diagnostic must name --history and its incompatible {flag} option; got: {error}"
+        );
+    }
+}
+
+fn assert_history_error_mentions(error: &str, option: &str) {
+    assert!(
+        error.contains("history") && error.contains(option),
+        "history rejection must name history and {option}; got: {error}"
+    );
+}
+
+#[test]
+fn add_history_rejects_final_merged_incompatibilities_before_writing() {
+    use clap::Parser;
+
+    for (base, local, args, option) in [
+        (
+            "version = 1\n\n[targets.home]\npath = \"./out\"\nlayout = \"flat\"\nsources = []\n",
+            None,
+            vec![
+                "phora",
+                "add",
+                "--history",
+                "--to",
+                "home",
+                "github:owner/dotfiles/nvim",
+            ],
+            "root",
+        ),
+        (
+            "version = 1\n\n[sources.dotfiles]\ngit = \"https://example.test/dotfiles.git\"\n\n[targets.home]\npath = \"./out\"\nlayout = \"flat\"\n\n[targets.home.sources]\ndotfiles = { take = [\"nvim/**\"] }\n",
+            None,
+            vec![
+                "phora",
+                "add",
+                "--history",
+                "--to",
+                "home",
+                "github:owner/dotfiles",
+            ],
+            "take",
+        ),
+        (
+            "version = 1\n\n[targets.home]\npath = \"./out\"\nlayout = \"flat\"\nsources = []\n",
+            Some(
+                "version = 1\n\n[targets.home]\npath = \"./out\"\nlayout = \"flat\"\n\n[targets.home.sources]\ndotfiles = { template = false }\n",
+            ),
+            vec!["phora", "add", "--history", "github:owner/dotfiles"],
+            "template",
+        ),
+    ] {
+        let project = tempfile::TempDir::new().expect("project dir");
+        let config = project.path().join("phora.toml");
+        std::fs::write(&config, base).expect("seed phora.toml");
+        if let Some(local) = local {
+            std::fs::write(project.path().join("phora.local.toml"), local)
+                .expect("seed phora.local.toml");
+        }
+
+        let error = with_cwd(project.path(), || {
+            run(Cli::try_parse_from(args).expect("add --history must parse"))
+                .expect_err("final merged history incompatibility must reject add")
+                .to_string()
+        });
+
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("read rejected config"),
+            base,
+            "history rejection for {option} must preserve phora.toml byte-for-byte"
+        );
+        assert_history_error_mentions(&error, option);
+    }
+
+    let project = tempfile::TempDir::new().expect("project dir");
+    let local_source = tempfile::TempDir::new().expect("local source dir");
+    let local_spec = local_source
+        .path()
+        .to_str()
+        .expect("utf-8 local source path");
+    let config = project.path().join("phora.toml");
+    let local_config = project.path().join("phora.local.toml");
+    std::fs::write(&local_config, "version = 1\n").expect("seed phora.local.toml");
+    with_cwd(project.path(), || {
+        run(
+            Cli::try_parse_from(["phora", "add", "--history", "github:owner/dotfiles"])
+                .expect("add --history must parse"),
+        )
+        .expect("add --history must establish the base source");
+    });
+    let base = std::fs::read_to_string(&config).expect("read history base config");
+    let local = std::fs::read_to_string(&local_config).expect("read initial local config");
+
+    let error = with_cwd(project.path(), || {
+        run(Cli::try_parse_from([
+            "phora", "add", "--local", "--name", "dotfiles", "--root", "nvim", local_spec,
+        ])
+        .expect("local root add must parse"))
+        .expect_err("merged inherited history must reject a local root override")
+        .to_string()
+    });
+
+    assert_eq!(
+        std::fs::read_to_string(&config).expect("read rejected base config"),
+        base,
+        "rejected inherited history root override must preserve phora.toml byte-for-byte"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&local_config).expect("read rejected local config"),
+        local,
+        "rejected inherited history root override must preserve phora.local.toml byte-for-byte"
+    );
+    assert_history_error_mentions(&error, "root");
 }

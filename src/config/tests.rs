@@ -6164,3 +6164,97 @@ mod parse_time_structural_validation {
         );
     }
 }
+
+#[test]
+fn history_is_git_copy_only_and_merges_as_a_tristate() {
+    let base = Config::parse(
+        "version = 1\n\n\
+         [sources.literal]\ngit = \"https://example.test/dotfiles.git\"\nhistory = true\n\n\
+         [sources.forge]\nhost = \"github\"\nrepo = \"owner/dotfiles\"\nhistory = true\n\n\
+         [sources.local]\npath = \"/tmp/dotfiles\"\nhistory = true\n",
+    )
+    .expect("history must be accepted for literal git, forge, and local path sources");
+    base.validate()
+        .expect("history-enabled git-backed copy sources must validate");
+
+    let inherited = merge_configs(
+        base.clone(),
+        Some(
+            Config::parse("version = 1\n\n[sources.literal]\nbranch = \"main\"\n")
+                .expect("a partial local override parses"),
+        ),
+    );
+    assert_eq!(
+        inherited.sources["literal"].history,
+        Some(true),
+        "an omitted local history setting must inherit the base opt-in"
+    );
+
+    let disabled = merge_configs(
+        base,
+        Some(
+            Config::parse("version = 1\n\n[sources.literal]\nhistory = false\n")
+                .expect("an explicit local history=false override parses"),
+        ),
+    );
+    assert_eq!(
+        disabled.sources["literal"].history,
+        Some(false),
+        "an explicit local history=false must override a base history=true"
+    );
+
+    for (option, source_body) in [
+        ("url", "url = \"https://example.test/dotfiles.tar.gz\""),
+        (
+            "deploy",
+            "git = \"https://example.test/dotfiles.git\"\ndeploy = \"link\"",
+        ),
+        (
+            "root",
+            "git = \"https://example.test/dotfiles.git\"\nroot = \"nested\"",
+        ),
+        (
+            "include",
+            "git = \"https://example.test/dotfiles.git\"\ninclude = [\"**\"]",
+        ),
+        (
+            "exclude",
+            "git = \"https://example.test/dotfiles.git\"\nexclude = [\"**/*.bak\"]",
+        ),
+        (
+            "transitive",
+            "git = \"https://example.test/dotfiles.git\"\ntransitive = true",
+        ),
+    ] {
+        let config = format!("version = 1\n\n[sources.managed]\n{source_body}\nhistory = true\n");
+        let error = Config::parse(&config)
+            .and_then(|config| config.validate())
+            .expect_err("history with an incompatible source option must be rejected")
+            .to_string();
+        assert!(
+            error.contains("managed") && error.contains("history") && error.contains(option),
+            "history validation must name source `managed`, `history`, and `{option}`; got: {error}"
+        );
+    }
+
+    for option in [
+        "take = [\"config/**\"]",
+        "template = false",
+        "collapse = true",
+    ] {
+        let config = format!(
+            "version = 1\n\n[sources.managed]\ngit = \"https://example.test/dotfiles.git\"\nhistory = true\n\n\
+             [targets.home]\npath = \"~/x\"\n\n[targets.home.sources]\nmanaged = {{ {option} }}\n"
+        );
+        let error = Config::parse(&config)
+            .and_then(|config| config.validate())
+            .expect_err("history with a binding refinement must be rejected")
+            .to_string();
+        assert!(
+            error.contains("managed")
+                && error.contains("history")
+                && error.contains(option.split('=').next().unwrap().trim()),
+            "history validation must name source `managed`, `history`, and binding option `{option}`; got: {error}"
+        );
+    }
+}

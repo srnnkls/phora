@@ -16,7 +16,7 @@ use {
     crate::config::{Host, LayoutKind},
     crate::sync::inspect::ArtifactState,
     add::{
-        MissingTarget, MissingTargetDecider, add_to_default_target, add_with_binds,
+        AddRequest, MissingTarget, MissingTargetDecider, add_to_default_target, add_with_binds,
         insert_source_with_ref, run_add,
     },
     render::state_label,
@@ -95,6 +95,8 @@ pub enum Command {
         local: bool,
         #[arg(long)]
         symlink: bool,
+        #[arg(long, conflicts_with_all = ["symlink", "root", "include", "exclude"])]
+        history: bool,
         #[arg(long = "as")]
         r#as: Option<String>,
     },
@@ -460,6 +462,7 @@ fn dispatch_add(cmd: Command) -> Result<()> {
         exclude,
         local,
         symlink,
+        history,
         r#as,
     } = cmd
     else {
@@ -469,9 +472,9 @@ fn dispatch_add(cmd: Command) -> Result<()> {
         r#as,
         ..BindRefinement::default()
     };
-    add::run_add(
-        &url,
-        &to,
+    add::run_add(add::AddRequest {
+        url: &url,
+        targets: &to,
         name,
         branch,
         tag,
@@ -480,8 +483,9 @@ fn dispatch_add(cmd: Command) -> Result<()> {
         exclude,
         local,
         symlink,
-        &refinement,
-    )
+        refinement: &refinement,
+        history,
+    })
 }
 
 fn run_verify() -> Result<CliOutcome> {
@@ -576,9 +580,9 @@ fn run_source(cmd: SourceCmd) -> Result<()> {
             exclude,
             local,
             symlink,
-        } => add::run_add(
-            &url,
-            &[],
+        } => add::run_add(add::AddRequest {
+            url: &url,
+            targets: &[],
             name,
             branch,
             tag,
@@ -587,8 +591,9 @@ fn run_source(cmd: SourceCmd) -> Result<()> {
             exclude,
             local,
             symlink,
-            &BindRefinement::default(),
-        ),
+            refinement: &BindRefinement::default(),
+            history: false,
+        }),
         SourceCmd::Rm { name } => run_source_rm(&name),
         SourceCmd::List => {
             render::print_source_rows(&source_listing(&load_config()?)?);
