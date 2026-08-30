@@ -4,13 +4,16 @@ use std::path::{Path, PathBuf};
 use crate::config::{DeployMode, LayoutConfig, ParsedSource, Target, TemplateOptIn};
 use crate::error::{Error, Result};
 use crate::projection::model::{ContentTransform, Materialization};
-use crate::source::{ResolvedSource, SourceIdentity, SourcePath, SourceStore, safe_relpath};
+use crate::source::{
+    ResolvedSource, SourceIdentity, SourcePath, SourceStore, WorktreeDeployRequest,
+    WorktreeMirrorAddress, WorktreeMirrorGuard, safe_relpath, worktree_admin_id,
+};
 use crate::sync::state::{
-    ArtifactKey, ArtifactRecord, Ejection, ManifestFile, NewArtifactRecord, RecordKind,
-    ScannedFile, StateStore,
+    ArtifactKey, ArtifactRecord, Ejection, ManifestFile, NewArtifactRecord, NewHistoryRecord,
+    RecordKind, ScannedFile, StateStore,
 };
 
-use super::apply::{apply_artifact_report, link_artifact};
+use super::apply::{ApplyPaths, apply_artifact_report, link_artifact};
 use super::confine::{ProtectedPathSet, confine_destination};
 use super::journal::Journal;
 use super::resolve::ResolvedSourceMap;
@@ -731,6 +734,63 @@ struct DeployContext<'a> {
     events: &'a mut SyncEvents,
 }
 
+type HistoryDeployment = (
+    Option<NewHistoryRecord>,
+    Option<(WorktreeMirrorGuard, WorktreeDeployRequest)>,
+);
+
+pub(crate) fn history_deployment(
+    project_root: &Path,
+    artifact_dst: &Path,
+    target_name: &str,
+    source: &str,
+    address: &WorktreeMirrorAddress,
+    commit: &str,
+) -> Result<(NewHistoryRecord, WorktreeDeployRequest)> {
+    let deploy_root = if artifact_dst.is_absolute() {
+        artifact_dst.to_path_buf()
+    } else {
+        project_root.join(artifact_dst)
+    };
+    let admin_id = worktree_admin_id(project_root, &deploy_root, target_name, source)?;
+    let record = NewHistoryRecord {
+        worktree_admin_id: admin_id.as_str().to_owned(),
+        mirror_key: address.key.as_str().to_owned(),
+        cache_git_root: address.cache_git_root.to_string_lossy().into_owned(),
+    };
+    let request = WorktreeDeployRequest {
+        admin_id,
+        deploy_root,
+        commit: commit.parse()?,
+    };
+    Ok((record, request))
+}
+
+pub(crate) fn project_root() -> Result<PathBuf> {
+    std::env::current_dir()
+        .map_err(|error| Error::Sync(format!("resolve project root for history: {error}")))
+}
+
+fn prepare_history_deployment(
+    backend: &dyn SourceStore,
+    ctx: &DeployContext<'_>,
+    whole_root: bool,
+) -> Result<HistoryDeployment> {
+    if !whole_root {
+        return Ok((None, None));
+    }
+    let guard = backend.lock_worktree_mirror(&ctx.resolved.name, ctx.resolved.snapshot.mirror())?;
+    let (history, request) = history_deployment(
+        &project_root()?,
+        ctx.artifact_dst,
+        &ctx.key.target,
+        &ctx.key.source,
+        &guard.address,
+        ctx.commit,
+    )?;
+    Ok((Some(history), Some((guard, request))))
+}
+
 fn deploy_one(
     backend: &dyn SourceStore,
     registry: &dyn StateStore,
@@ -742,7 +802,23 @@ fn deploy_one(
     let staging = staging_base.join(format!("{key_label}-{}", nonce()));
     let mut staging_guard = StagingGuard::new(&staging_base, &staging);
 
-    let policy = ctx.source.export_policy();
+    let whole_root = matches!(
+        &ctx.artifact.materialization,
+        Materialization::WholeRoot { .. }
+    );
+    let policy = ctx.source.export_policy(whole_root);
+    if whole_root
+        && ctx
+            .artifact
+            .leaves
+            .iter()
+            .any(|leaf| leaf.destination.as_str().split(['/', '\\']).next() == Some(".git"))
+    {
+        return Err(Error::Sync(format!(
+            "history source `{}` contains a root `.git` entry",
+            ctx.underlying_source
+        )));
+    }
 
     let staging_payload = match &ctx.artifact.materialization {
         Materialization::CollapsedDir { .. } | Materialization::WholeRoot { .. } => staging.clone(),
@@ -771,6 +847,7 @@ fn deploy_one(
         .iter()
         .map(|f| ManifestFile {
             path: PathBuf::from(f.destination.as_str()),
+            kind: f.kind,
             size: f.size,
             mtime: f.mtime,
             blake3: f.blake3.clone(),
@@ -786,6 +863,8 @@ fn deploy_one(
             .map_err(|e| Error::Sync(format!("create target dir {}: {e}", parent.display())))?;
     }
 
+    let (history, worktree) = prepare_history_deployment(backend, &ctx, whole_root)?;
+
     let record = ArtifactRecord::projected(NewArtifactRecord {
         key: ctx.key,
         underlying_source: ctx.underlying_source,
@@ -796,10 +875,7 @@ fn deploy_one(
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
         files,
-        history: matches!(
-            &ctx.artifact.materialization,
-            Materialization::WholeRoot { .. }
-        ),
+        history,
         vars_digest: staged.vars_digest,
         deploy_root: Some(ctx.deploy_root),
         layout_separator: ctx.layout.persisted_separator(),
@@ -809,13 +885,21 @@ fn deploy_one(
         staging_guard.disarm();
     }
     apply_artifact_report(
-        &staging_base,
-        &staging_payload,
-        ctx.artifact_dst,
+        ApplyPaths {
+            staging_base: &staging_base,
+            staging: &staging_payload,
+            dst: ctx.artifact_dst,
+        },
         record,
         journal,
         registry,
         ctx.events,
+        || {
+            if let Some((guard, request)) = worktree {
+                guard.publish_worktree(&request)?;
+            }
+            Ok(())
+        },
     )
 }
 
@@ -826,7 +910,16 @@ fn deploy_link(
     key: ArtifactKey,
     deploy_root: String,
 ) -> Result<()> {
-    let policy = entry.source.export_policy();
+    if matches!(
+        entry.item.materialization,
+        Materialization::WholeRoot { .. }
+    ) {
+        return Err(Error::Config(format!(
+            "source `{}`: linked deployment cannot use history whole-root materialization",
+            entry.identity
+        )));
+    }
+    let policy = entry.source.export_policy(false);
     let record = ArtifactRecord {
         version: 1,
         key,
@@ -840,10 +933,10 @@ fn deploy_link(
         preserve_executable: policy.preserve_executable,
         files: vec![],
         linked: true,
-        history: matches!(
-            &entry.item.materialization,
-            Materialization::WholeRoot { .. }
-        ),
+        history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: Some(deploy_root),
         layout_separator: entry.layout.persisted_separator(),
@@ -1101,12 +1194,16 @@ mod kind_aware_layout_tests {
             preserve_executable: true,
             files: vec![ManifestFile {
                 path: PathBuf::from(artifact),
+                kind: crate::sync::state::ManifestEntryKind::File,
                 size: 4,
                 mtime: 0,
                 blake3: "blake3:d4e5f6".to_owned(),
             }],
             linked: false,
             history: false,
+            worktree_admin_id: None,
+            mirror_key: None,
+            cache_git_root: None,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
@@ -1192,6 +1289,9 @@ mod kind_aware_layout_tests {
         let identity = "dotfiles";
         let rec = ArtifactRecord {
             history: true,
+            worktree_admin_id: None,
+            mirror_key: None,
+            cache_git_root: None,
             ..record(identity, identity, "by-source", RecordKind::Dir)
         };
 
@@ -1255,12 +1355,16 @@ mod kind_aware_layout_tests {
             preserve_executable: true,
             files: vec![ManifestFile {
                 path: PathBuf::from("agents-src-CLAUDE.md"),
+                kind: crate::sync::state::ManifestEntryKind::File,
                 size: 4,
                 mtime: 0,
                 blake3: "blake3:d4e5f6".to_owned(),
             }],
             linked: false,
             history: false,
+            worktree_admin_id: None,
+            mirror_key: None,
+            cache_git_root: None,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,

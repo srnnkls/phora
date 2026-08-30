@@ -107,6 +107,7 @@ pub(super) fn print_verify(report: &crate::sync::VerifyReport) {
         let reason = match &m.reason {
             VerifyReason::Missing => "missing".to_owned(),
             VerifyReason::ContentMismatch { .. } => "content mismatch".to_owned(),
+            VerifyReason::EntryKindMismatch => "entry kind mismatch".to_owned(),
         };
         println!(
             "{}/{}: {} ({reason})",

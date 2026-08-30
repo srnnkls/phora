@@ -21,7 +21,6 @@ pub(super) struct AddRequest<'a> {
     pub(super) local: bool,
     pub(super) symlink: bool,
     pub(super) refinement: &'a BindRefinement,
-    pub(super) history: bool,
 }
 
 pub(super) fn run_add(request: AddRequest<'_>) -> Result<()> {
@@ -30,9 +29,14 @@ pub(super) fn run_add(request: AddRequest<'_>) -> Result<()> {
             "`--as` sets a single binding identity and needs exactly one `--to` target".to_owned(),
         ));
     }
-    if !request.refinement.is_bare() && request.targets.is_empty() {
+    if !request.refinement.is_bare() && !request.refinement.history && request.targets.is_empty() {
         return Err(Error::Config(
             "refinement flags (`--as`/`--take`) need at least one `--to` target".to_owned(),
+        ));
+    }
+    if request.refinement.history && (request.local || request.symlink) {
+        return Err(Error::Config(
+            "`--local`/`--symlink` overlays do not support `--history`".to_owned(),
         ));
     }
     if (request.local || request.symlink)
@@ -56,7 +60,6 @@ pub(super) fn run_add(request: AddRequest<'_>) -> Result<()> {
             local,
             symlink,
             refinement,
-            history,
         } = request;
         return run_add_to_targets(
             url,
@@ -70,7 +73,6 @@ pub(super) fn run_add(request: AddRequest<'_>) -> Result<()> {
             local,
             symlink,
             refinement,
-            history,
         );
     }
     if request.local || request.symlink {
@@ -83,7 +85,6 @@ pub(super) fn run_add(request: AddRequest<'_>) -> Result<()> {
             include,
             exclude,
             symlink,
-            history,
             ..
         } = request;
         return add_local(
@@ -97,7 +98,6 @@ pub(super) fn run_add(request: AddRequest<'_>) -> Result<()> {
                 exclude,
             },
             symlink,
-            history,
         );
     }
 
@@ -113,7 +113,7 @@ fn run_unbound_add(request: AddRequest<'_>) -> Result<()> {
         root,
         include,
         exclude,
-        history,
+        refinement,
         ..
     } = request;
     let mut parsed = resolve_add_source(url)?;
@@ -127,6 +127,11 @@ fn run_unbound_add(request: AddRequest<'_>) -> Result<()> {
     let doc_text =
         std::fs::read_to_string("phora.toml").unwrap_or_else(|_| "version = 1\n".to_owned());
     let auto_target = super::effective_auto_target();
+    if refinement.history && !auto_target {
+        return Err(Error::Config(
+            "`--history` needs at least one `--to` target".to_owned(),
+        ));
+    }
     let mut updated = if auto_target {
         add_to_default_target(
             &doc_text,
@@ -146,8 +151,9 @@ fn run_unbound_add(request: AddRequest<'_>) -> Result<()> {
             root.as_deref(),
         )?
     };
-    if history {
-        updated = inject_history(&updated, &name)?;
+    if refinement.history {
+        updated =
+            config_edit::bind(&updated, "default", std::slice::from_ref(&name), refinement)?.text;
     }
     super::bind::guard_no_dangling_references(&updated, false)?;
     std::fs::write("phora.toml", &updated)?;
@@ -296,14 +302,6 @@ fn resolve_local_source(url: &str, name: Option<String>) -> Result<(String, AddT
     Ok((name, target))
 }
 
-fn inject_history(text: &str, name: &str) -> Result<String> {
-    let mut doc = text
-        .parse::<toml_edit::DocumentMut>()
-        .map_err(|e| Error::Config(format!("parse config: {e}")))?;
-    doc["sources"][name]["history"] = toml_edit::value(true);
-    Ok(doc.to_string())
-}
-
 fn inject_deploy_link(text: &str, name: &str) -> Result<String> {
     let mut doc = text
         .parse::<toml_edit::DocumentMut>()
@@ -325,7 +323,6 @@ fn add_local(
     name: Option<String>,
     spec: LocalSourceSpec<'_>,
     symlink: bool,
-    history: bool,
 ) -> Result<()> {
     let (name, mut target) = resolve_local_source(url, name)?;
     target.include = spec.include;
@@ -336,9 +333,6 @@ fn add_local(
         std::fs::read_to_string("phora.local.toml").unwrap_or_else(|_| "version = 1\n".to_owned());
     let mut updated =
         config_edit::upsert_source(&doc_text, &name, &target, spec.branch, spec.tag, spec.root)?;
-    if history {
-        updated = inject_history(&updated, &name)?;
-    }
     if symlink {
         updated = inject_deploy_link(&updated, &name)?;
     }
@@ -365,7 +359,6 @@ fn run_add_to_targets(
     local: bool,
     symlink: bool,
     refinement: &BindRefinement,
-    history: bool,
 ) -> Result<()> {
     let overlay = local || symlink;
     let (name, mut source, branch) = if overlay {
@@ -395,9 +388,6 @@ fn run_add_to_targets(
         refinement,
         &super::TtyMissingTarget,
     )?;
-    if history {
-        updated = inject_history(&updated, &name)?;
-    }
     if symlink {
         updated = inject_deploy_link(&updated, &name)?;
     }

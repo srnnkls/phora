@@ -23,7 +23,7 @@ fn bind_parses_sources_target_and_flags() {
         panic!("expected Command::Bind");
     };
     assert_eq!(sources, vec!["tools".to_owned(), "prompts".to_owned()]);
-    assert_eq!(to, "claude");
+    assert_eq!(to, vec!["claude".to_owned()]);
     assert!(local, "--local must set local=true");
 }
 
@@ -408,12 +408,16 @@ fn record(
         preserve_executable: true,
         files: vec![ManifestFile {
             path: PathBuf::from("python.json"),
+            kind: crate::sync::state::ManifestEntryKind::File,
             size: 12_345,
             mtime: 1_738_329_296,
             blake3: "9e8d7c6b5a4f3e2d".to_owned(),
         }],
         linked: false,
         history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -1576,7 +1580,6 @@ fn run_add_end_to_end_persists_symbolic_source_to_phora_toml() {
             local: false,
             symlink: false,
             refinement: &config_edit::BindRefinement::default(),
-            history: false,
         })
         .expect("run_add must succeed for a symbolic colon alias");
     });
@@ -1626,7 +1629,6 @@ fn run_add_persists_local_path_source_for_absolute_dir() {
             local: false,
             symlink: false,
             refinement: &config_edit::BindRefinement::default(),
-            history: false,
         })
         .expect("run_add must accept an absolute local path source");
     });
@@ -1681,7 +1683,6 @@ fn run_add_to_target_persists_local_path_source() {
             local: false,
             symlink: false,
             refinement: &config_edit::BindRefinement::default(),
-            history: false,
         })
         .expect("run_add --to must accept a local path source");
     });
@@ -2007,6 +2008,7 @@ fn deploy_matching_file(
         .as_secs();
     ManifestFile {
         path: PathBuf::from(file),
+        kind: crate::sync::state::ManifestEntryKind::File,
         size: meta.len(),
         mtime,
         blake3: blake3::hash(content).to_hex().to_string(),
@@ -2038,6 +2040,9 @@ fn record_for(
         files,
         linked: false,
         history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -2300,6 +2305,7 @@ fn deploy_mapped_file(target_dir: &Path, source: &str, dest: &str, content: &[u8
         .as_secs();
     ManifestFile {
         path: PathBuf::from(dest),
+        kind: crate::sync::state::ManifestEntryKind::File,
         size: meta.len(),
         mtime,
         blake3: blake3::hash(content).to_hex().to_string(),
@@ -2331,6 +2337,9 @@ fn mapped_record(
         files,
         linked: false,
         history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -2358,6 +2367,7 @@ fn where_resolves_a_mapped_record_under_its_dest_name() {
         "aaa111",
         vec![ManifestFile {
             path: PathBuf::from("fzf.zsh"),
+            kind: crate::sync::state::ManifestEntryKind::File,
             size: 10,
             mtime: 1,
             blake3: "x".to_owned(),
@@ -2569,7 +2579,6 @@ fn add_local_writes_path_local_path_to_phora_local_toml() {
             local: true,
             symlink: false,
             refinement: &config_edit::BindRefinement::default(),
-            history: false,
         })
         .expect("run_add --local must succeed for an existing dir");
     });
@@ -2611,7 +2620,6 @@ fn add_symlink_writes_path_and_deploy_link_to_local_toml() {
             local: false,
             symlink: true,
             refinement: &config_edit::BindRefinement::default(),
-            history: false,
         })
         .expect("run_add --symlink must succeed for an existing dir");
     });
@@ -2657,7 +2665,6 @@ fn add_local_infers_name_from_path_basename() {
             local: true,
             symlink: false,
             refinement: &config_edit::BindRefinement::default(),
-            history: false,
         })
         .expect("run_add --local with no --name must succeed");
     });
@@ -2691,7 +2698,6 @@ fn add_symlink_implies_local_overlay_and_is_valid() {
             local: false,
             symlink: true,
             refinement: &config_edit::BindRefinement::default(),
-            history: false,
         })
         .expect("run_add --symlink must succeed");
     });
@@ -2734,7 +2740,6 @@ fn add_local_and_symlink_together_equals_symlink() {
                 local,
                 symlink,
                 refinement: &config_edit::BindRefinement::default(),
-                history: false,
             })
             .expect("run_add must not error");
         });
@@ -2795,7 +2800,6 @@ fn add_without_flags_still_writes_phora_toml() {
             local: false,
             symlink: false,
             refinement: &config_edit::BindRefinement::default(),
-            history: false,
         })
         .expect("run_add with no overlay flags must keep its remote behavior");
     });
@@ -2837,7 +2841,6 @@ fn add_local_canonicalizes_relative_path_to_absolute() {
             local: true,
             symlink: false,
             refinement: &config_edit::BindRefinement::default(),
-            history: false,
         })
         .expect("run_add --local must accept a relative existing path");
     });
@@ -2875,7 +2878,6 @@ fn add_local_errors_when_path_does_not_exist() {
             local: true,
             symlink: false,
             refinement: &config_edit::BindRefinement::default(),
-            history: false,
         })
         .expect_err("--local on a nonexistent path must error")
     });
@@ -2918,7 +2920,6 @@ fn add_local_rejects_non_directory_path() {
             local: true,
             symlink: false,
             refinement: &config_edit::BindRefinement::default(),
-            history: false,
         })
         .expect_err("--local on a regular file must error")
     });
@@ -2967,7 +2968,6 @@ fn add_local_preserves_siblings_and_replaces_same_name_in_overlay() {
             local: true,
             symlink: false,
             refinement: &config_edit::BindRefinement::default(),
-            history: false,
         })
         .expect("adding a new overlay source must succeed");
     });
@@ -2997,7 +2997,6 @@ fn add_local_preserves_siblings_and_replaces_same_name_in_overlay() {
             local: true,
             symlink: false,
             refinement: &config_edit::BindRefinement::default(),
-            history: false,
         })
         .expect("re-adding the same name must succeed");
     });
@@ -3044,7 +3043,6 @@ fn add_symlink_overlay_overrides_base_source_after_merge() {
             local: false,
             symlink: true,
             refinement: &config_edit::BindRefinement::default(),
-            history: false,
         })
         .expect("--symlink --name app must write the overlay");
     });
@@ -4157,7 +4155,6 @@ fn bare_add_routes_repeatable_include_exclude_root_to_the_source_not_the_binding
             local: false,
             symlink: false,
             refinement: &config_edit::BindRefinement::default(),
-            history: false,
         })
         .expect("`add --include --include --exclude --root` must succeed");
     });
@@ -5813,58 +5810,218 @@ fn target_rm_refuses_overridden_target_with_live_records() {
 }
 
 #[test]
-fn add_history_writes_the_selected_config_and_rejects_incompatible_flags() {
+fn bind_history_writes_each_binding_and_validates_all_targets_before_writing() {
+    assert_add_history_writes_only_its_binding_and_requires_a_target();
+    assert_bind_history_writes_each_binding_and_validates_all_targets_before_writing();
+}
+
+fn assert_add_history_writes_only_its_binding_and_requires_a_target() {
     use clap::Parser;
 
-    let project = tempfile::TempDir::new().expect("base project dir");
+    let project = tempfile::TempDir::new().expect("project dir");
+    std::fs::write(
+        project.path().join("phora.toml"),
+        "version = 1
+
+[targets.home]
+path = \"./out\"
+layout = \"flat\"
+sources = []
+",
+    )
+    .expect("seed target config");
     with_cwd(project.path(), || {
-        let cli = Cli::try_parse_from(["phora", "add", "--history", "github:owner/dotfiles"])
-            .expect("add --history must parse");
-        run(cli).expect("add --history must write the base config");
+        run(Cli::try_parse_from([
+            "phora",
+            "add",
+            "--history",
+            "--to",
+            "home",
+            "github:owner/dotfiles",
+        ])
+        .expect("add --history --to must parse"))
+        .expect("add --history --to must write the selected binding");
     });
     let base = std::fs::read_to_string(project.path().join("phora.toml"))
-        .expect("add --history must create phora.toml");
+        .expect("add --history must update phora.toml");
     assert!(
-        base.contains("history = true"),
-        "add --history must persist history = true in phora.toml; got:\n{base}"
+        base.contains("dotfiles = { history = true }"),
+        "add --history must persist history only on its keyed target binding; got:
+{base}"
+    );
+    let source_section = base
+        .split("[targets.home]")
+        .next()
+        .expect("source section precedes the selected target");
+    assert!(
+        !source_section.contains("history = true"),
+        "add --history must not inject history into the source table; got:
+{base}"
     );
 
-    let local_project = tempfile::TempDir::new().expect("local project dir");
-    let local_source = tempfile::TempDir::new().expect("local source dir");
-    let local_spec = local_source
-        .path()
-        .to_str()
-        .expect("utf-8 local source path");
-    with_cwd(local_project.path(), || {
-        let cli = Cli::try_parse_from(["phora", "add", "--history", "--local", local_spec])
-            .expect("add --history --local must parse");
-        run(cli).expect("add --history --local must write the local config");
+    let no_target = tempfile::TempDir::new().expect("no-target project dir");
+    let untouched = "version = 1
+
+[defaults]
+auto_target = false
+";
+    std::fs::write(no_target.path().join("phora.toml"), untouched).expect("disable auto target");
+    let error = with_cwd(no_target.path(), || {
+        run(
+            Cli::try_parse_from(["phora", "add", "--history", "github:owner/dotfiles"])
+                .expect("add --history must parse"),
+        )
+        .expect_err("history without an explicit or automatic target must reject")
+        .to_string()
     });
     assert!(
-        !local_project.path().join("phora.toml").exists(),
-        "add --history --local must not create phora.toml"
+        error.contains("--to"),
+        "the missing-target diagnostic must direct the user to --to; got: {error}"
     );
-    let local = std::fs::read_to_string(local_project.path().join("phora.local.toml"))
-        .expect("add --history --local must create phora.local.toml");
-    assert!(
-        local.contains("history = true"),
-        "add --history --local must persist history = true in phora.local.toml; got:\n{local}"
+    assert_eq!(
+        std::fs::read_to_string(no_target.path().join("phora.toml")).expect("read rejected config"),
+        untouched,
+        "a rejected target-less history add must not change phora.toml"
     );
 
-    for flag in ["--symlink", "--root", "--include", "--exclude"] {
-        let mut args = vec!["phora", "add", "--history", flag];
-        if flag != "--symlink" {
-            args.push("value");
-        }
-        args.push("github:owner/dotfiles");
-        let error = Cli::try_parse_from(args)
-            .expect_err("--history must reject incompatible add flags")
+    let local_error =
+        Cli::try_parse_from(["phora", "add", "--history", "--local", "/tmp/dotfiles"])
+            .expect_err("--local --history must reject rather than create source-local history")
             .to_string();
+    assert!(
+        local_error.contains("--history") && local_error.contains("--local"),
+        "the local-history diagnostic must name both incompatible flags; got: {local_error}"
+    );
+}
+
+fn assert_bind_history_writes_each_binding_and_validates_all_targets_before_writing() {
+    use clap::Parser;
+
+    let initial = "version = 1
+
+[sources.dotfiles]
+git = \"https://example.test/dotfiles.git\"
+
+[targets.home]
+path = \"./home\"
+layout = \"flat\"
+sources = []
+
+[targets.work]
+path = \"./work\"
+layout = \"flat\"
+sources = []
+";
+    let project = tempfile::TempDir::new().expect("project dir");
+    let config = project.path().join("phora.toml");
+    std::fs::write(&config, initial).expect("seed target config");
+    with_cwd(project.path(), || {
+        run(Cli::try_parse_from([
+            "phora",
+            "bind",
+            "dotfiles",
+            "--history",
+            "--to",
+            "home",
+            "--to",
+            "work",
+        ])
+        .expect("bind --history must accept multiple --to targets"))
+        .expect("bind --history must write every selected binding");
+    });
+    let written = std::fs::read_to_string(&config).expect("bind --history must update phora.toml");
+    let parsed = Config::parse(&written).unwrap_or_else(|error| {
+        panic!(
+            "bind output must remain valid phora.toml: {error}
+{written}"
+        )
+    });
+    for target in ["home", "work"] {
         assert!(
-            error.contains("--history") && error.contains(flag),
-            "the CLI diagnostic must name --history and its incompatible {flag} option; got: {error}"
+            refined_binding(&parsed, target, "dotfiles").history,
+            "bind --history must persist history on the {target} binding; got:
+{written}"
         );
     }
+    let source_section = written
+        .split("[targets.home]")
+        .next()
+        .expect("source section precedes target bindings");
+    assert!(
+        !source_section.contains("history = true"),
+        "bind --history must not persist history on the source; got:
+{written}"
+    );
+
+    Cli::try_parse_from([
+        "phora",
+        "bind",
+        "dotfiles",
+        "--history",
+        "--local",
+        "--to",
+        "home",
+    ])
+    .expect("bind --local --history must remain valid");
+    for (args, option) in [
+        (
+            vec![
+                "phora",
+                "bind",
+                "dotfiles",
+                "--history",
+                "--root",
+                "nvim",
+                "--to",
+                "home",
+            ],
+            "--root",
+        ),
+        (
+            vec![
+                "phora",
+                "bind",
+                "dotfiles",
+                "--history",
+                "--take",
+                "nvim/**",
+                "--to",
+                "home",
+            ],
+            "--take",
+        ),
+    ] {
+        let error = Cli::try_parse_from(args)
+            .expect_err("bind --history must reject source root and binding take refinements")
+            .to_string();
+        assert!(
+            error.contains("--history") && error.contains(option),
+            "the history conflict diagnostic must name --history and {option}; got: {error}"
+        );
+    }
+
+    let rejected = tempfile::TempDir::new().expect("invalid-target project dir");
+    let rejected_config = rejected.path().join("phora.toml");
+    std::fs::write(&rejected_config, initial).expect("seed invalid-target config");
+    with_cwd(rejected.path(), || {
+        run(Cli::try_parse_from([
+            "phora",
+            "bind",
+            "dotfiles",
+            "--history",
+            "--to",
+            "home",
+            "--to",
+            "missing",
+        ])
+        .expect("bind --history must parse before target validation"))
+        .expect_err("a missing later bind target must reject the complete request");
+    });
+    assert_eq!(
+        std::fs::read_to_string(&rejected_config).expect("read rejected config"),
+        initial,
+        "a missing later bind target must leave phora.toml byte-for-byte unchanged"
+    );
 }
 
 fn assert_history_error_mentions(error: &str, option: &str) {
@@ -5881,7 +6038,7 @@ fn add_history_rejects_final_merged_incompatibilities_before_writing() {
     for (base, local, args, option) in [
         (
             "version = 1\n\n[targets.home]\npath = \"./out\"\nlayout = \"flat\"\nsources = []\n",
-            None,
+            None::<&str>,
             vec![
                 "phora",
                 "add",
@@ -5894,7 +6051,7 @@ fn add_history_rejects_final_merged_incompatibilities_before_writing() {
         ),
         (
             "version = 1\n\n[sources.dotfiles]\ngit = \"https://example.test/dotfiles.git\"\n\n[targets.home]\npath = \"./out\"\nlayout = \"flat\"\n\n[targets.home.sources]\ndotfiles = { take = [\"nvim/**\"] }\n",
-            None,
+            None::<&str>,
             vec![
                 "phora",
                 "add",
@@ -5904,14 +6061,6 @@ fn add_history_rejects_final_merged_incompatibilities_before_writing() {
                 "github:owner/dotfiles",
             ],
             "take",
-        ),
-        (
-            "version = 1\n\n[targets.home]\npath = \"./out\"\nlayout = \"flat\"\nsources = []\n",
-            Some(
-                "version = 1\n\n[targets.home]\npath = \"./out\"\nlayout = \"flat\"\n\n[targets.home.sources]\ndotfiles = { template = false }\n",
-            ),
-            vec!["phora", "add", "--history", "github:owner/dotfiles"],
-            "template",
         ),
     ] {
         let project = tempfile::TempDir::new().expect("project dir");

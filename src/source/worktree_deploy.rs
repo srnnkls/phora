@@ -149,11 +149,6 @@ impl WorktreeMirrorGuard {
         }
     }
 
-    #[must_use]
-    pub fn mirror(&self) -> &gix::Repository {
-        &self.mirror
-    }
-
     pub fn publish_worktree(&self, request: &WorktreeDeployRequest) -> Result<WorktreeDeployment> {
         Self::sweep_gitlink_staging(&request.deploy_root)?;
         self.publish_worktree_after_sweep(request).map_err(

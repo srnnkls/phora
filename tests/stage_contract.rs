@@ -7,6 +7,7 @@ use phora::projection::model::{
     TemplatePolicy,
 };
 use phora::source::SourceInventory;
+use phora::sync::state::ManifestEntryKind;
 use phora::sync::{StageRequest, StagedArtifact, StagedFile};
 
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -83,6 +84,7 @@ fn staged_artifact_frames_the_export_result_over_typed_destinations() {
         files: vec![StagedFile {
             destination: ArtifactRelativePath::new("editor/init.lua")
                 .expect("safe leaf destination"),
+            kind: ManifestEntryKind::File,
             size: 8,
             mtime: 1_800_000_000,
             blake3: "aa".repeat(32),
@@ -93,6 +95,7 @@ fn staged_artifact_frames_the_export_result_over_typed_destinations() {
     let templated = StagedArtifact {
         files: vec![StagedFile {
             destination: ArtifactRelativePath::new("motd.md").expect("safe deployed name"),
+            kind: ManifestEntryKind::File,
             size: 12,
             mtime: 1_800_000_000,
             blake3: "bb".repeat(32),
@@ -145,6 +148,7 @@ fn staged_destination_is_the_projection_newtype_itself() {
 
     let staged = StagedFile {
         destination: leaf_destination.clone(),
+        kind: ManifestEntryKind::File,
         size: 0,
         mtime: 0,
         blake3: String::new(),

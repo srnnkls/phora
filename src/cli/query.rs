@@ -657,7 +657,7 @@ pub(crate) fn explain_cmd(
         take: binding.take,
         mode: src.deploy_mode(),
         collapse: binding.collapse,
-        history: src.history(),
+        history: binding.history,
         layout: &layout,
         template_opt_in: &binding.template_opt_in,
     };
@@ -1116,7 +1116,7 @@ mod explain_tests {
             take,
             mode: source.deploy_mode(),
             collapse,
-            history: source.history(),
+            history: false,
             layout: &layout,
             template_opt_in: &TemplateOptIn::SuffixOnly,
         };

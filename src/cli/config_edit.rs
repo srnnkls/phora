@@ -289,10 +289,6 @@ impl TakeArg {
     }
 }
 
-/// Per-binding refinement carried by `bind`/`add --to`: an optional `as`
-/// identity, optional ref pins (`branch`/`tag`/`rev`), and a binding-level
-/// `take` array. `root` is source-owned; it is carried here only to route to
-/// the SOURCE table, never written onto the binding.
 #[derive(Debug, Default)]
 pub struct BindRefinement {
     pub r#as: Option<String>,
@@ -301,6 +297,7 @@ pub struct BindRefinement {
     pub tag: Option<String>,
     pub rev: Option<String>,
     pub take: Vec<TakeArg>,
+    pub history: bool,
 }
 
 impl BindRefinement {
@@ -310,6 +307,7 @@ impl BindRefinement {
             && self.tag.is_none()
             && self.rev.is_none()
             && self.take.is_empty()
+            && !self.history
     }
 }
 
@@ -339,6 +337,9 @@ fn keyed_binding_value(source: &str, identity: &str, refinement: &BindRefinement
             take.push(entry.to_value());
         }
         table.insert("take", Value::Array(take));
+    }
+    if refinement.history {
+        table.insert("history", true.into());
     }
     Value::InlineTable(table)
 }
@@ -378,12 +379,6 @@ fn append_bare_to_list(array: &mut Array, source: &str) -> bool {
     true
 }
 
-#[derive(Clone, Copy)]
-enum UpsertMode {
-    SkipIfPresent,
-    Overwrite,
-}
-
 fn keyed_value_eq(a: &Value, b: &Value) -> bool {
     fn content(v: &Value) -> Option<toml::Value> {
         format!("x = {v}").parse::<toml::Table>().ok()?.remove("x")
@@ -391,27 +386,111 @@ fn keyed_value_eq(a: &Value, b: &Value) -> bool {
     content(a) == content(b)
 }
 
+fn binding_source(item: &Item, identity: &str) -> Result<String> {
+    let source = if let Some(inline) = item.as_value().and_then(Value::as_inline_table) {
+        inline.get("source").and_then(Value::as_str)
+    } else if let Some(binding) = item.as_table() {
+        binding
+            .get("source")
+            .and_then(Item::as_value)
+            .and_then(Value::as_str)
+    } else {
+        return Err(Error::Config(format!(
+            "binding `{identity}` is not a table"
+        )));
+    };
+    Ok(source.unwrap_or(identity).to_owned())
+}
+
+fn merge_refinement(binding: &mut dyn toml_edit::TableLike, refinement: &BindRefinement) -> bool {
+    let mut changed = false;
+    for (key, value) in [
+        ("branch", refinement.branch.as_deref()),
+        ("tag", refinement.tag.as_deref()),
+        ("rev", refinement.rev.as_deref()),
+    ] {
+        if let Some(value) = value
+            && binding
+                .get(key)
+                .and_then(Item::as_value)
+                .and_then(Value::as_str)
+                != Some(value)
+        {
+            binding.insert(key, value.into());
+            changed = true;
+        }
+    }
+    if !refinement.take.is_empty() {
+        let mut take = Array::new();
+        for entry in &refinement.take {
+            take.push(entry.to_value());
+        }
+        let value = Value::Array(take);
+        if binding
+            .get("take")
+            .and_then(Item::as_value)
+            .is_none_or(|existing| !keyed_value_eq(existing, &value))
+        {
+            binding.insert("take", value.into());
+            changed = true;
+        }
+    }
+    if refinement.history
+        && binding
+            .get("history")
+            .and_then(Item::as_value)
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        binding.insert("history", true.into());
+        changed = true;
+    }
+    changed
+}
+
+fn merge_existing_refinement(
+    item: &mut Item,
+    refinement: &BindRefinement,
+    identity: &str,
+) -> Result<bool> {
+    if let Some(inline) = item.as_value_mut().and_then(Value::as_inline_table_mut) {
+        return Ok(merge_refinement(inline, refinement));
+    }
+    if let Some(binding) = item.as_table_mut() {
+        return Ok(merge_refinement(binding, refinement));
+    }
+    Err(Error::Config(format!(
+        "binding `{identity}` is not a table"
+    )))
+}
+
 fn upsert_keyed_entry(
     table: &mut dyn toml_edit::TableLike,
     identity: &str,
-    value: Value,
-    mode: UpsertMode,
-) -> bool {
-    if let Some(existing) = table.get(identity) {
-        match mode {
-            UpsertMode::SkipIfPresent => return false,
-            UpsertMode::Overwrite => {
-                if existing
-                    .as_value()
-                    .is_some_and(|e| keyed_value_eq(e, &value))
-                {
-                    return false;
-                }
-            }
-        }
+    source: &str,
+    refinement: &BindRefinement,
+) -> Result<bool> {
+    let existing_source = table
+        .get(identity)
+        .map(|item| binding_source(item, identity))
+        .transpose()?;
+    if existing_source.as_deref() == Some(source) {
+        let item = table
+            .get_mut(identity)
+            .ok_or_else(|| Error::Config(format!("binding `{identity}` is missing")))?;
+        return merge_existing_refinement(item, refinement, identity);
+    }
+
+    let value = keyed_binding_value(source, identity, refinement);
+    if table
+        .get(identity)
+        .and_then(Item::as_value)
+        .is_some_and(|existing| keyed_value_eq(existing, &value))
+    {
+        return Ok(false);
     }
     table.insert(identity, Item::Value(value));
-    true
+    Ok(true)
 }
 
 /// Tolerates an undefined source (it may live in the sibling file; the caller's
@@ -471,13 +550,7 @@ pub fn bind(
         if let Some(array) = item.as_value_mut().and_then(Value::as_array_mut) {
             changed |= append_bare_to_list(array, source);
         } else if let Some(table) = item.as_table_like_mut() {
-            let value = keyed_binding_value(source, identity, refinement);
-            let mode = if refinement.is_bare() {
-                UpsertMode::SkipIfPresent
-            } else {
-                UpsertMode::Overwrite
-            };
-            changed |= upsert_keyed_entry(table, identity, value, mode);
+            changed |= upsert_keyed_entry(table, identity, source, refinement)?;
         } else {
             return Err(Error::Config(format!(
                 "`{target}.sources` is not a list or table"
@@ -1020,14 +1093,25 @@ mod tests {
     #[test]
     fn bind_reads_keyed_table_and_dedups_by_identity() {
         let base = "version = 1\n\n[sources.dotfiles]\ngit = \"g\"\n\n[sources.a]\ngit = \"h\"\n\n\
+             [sources.foo]\ngit = \"i\"\n\n[sources.old]\ngit = \"j\"\n\n\
              [targets.t]\npath = \"~/x\"\n\n\
-             [targets.t.sources]\na = {}\ndots = { source = \"dotfiles\" }\n";
+             [targets.t.sources]\na = {}\nfoo = { source = \"old\" }\ndots = { source = \"dotfiles\" }\n";
         let result = bind(base, "t", &names(&["a"]), &bare())
             .expect("re-binding a bare source in a keyed table is a no-op");
         assert!(
             !result.changed,
             "binding an already-present identity over a keyed table changes nothing"
         );
+
+        let result =
+            bind(base, "t", &names(&["foo"]), &bare()).expect("a conflicting alias is replaced");
+        let cfg = Config::parse(&result.text).expect("replacement output parses");
+        let bindings = cfg.targets["t"].sources.as_ref().unwrap();
+        let (identity, binding) = bindings
+            .iter()
+            .find(|(identity, _)| *identity == "foo")
+            .expect("replacement alias is present");
+        assert_eq!(binding.effective_source(identity), "foo");
     }
 
     #[test]

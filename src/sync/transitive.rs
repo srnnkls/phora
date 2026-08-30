@@ -24,8 +24,6 @@ const COMPOSED_DEST_COLLISION: &str = "composed targets resolve to the same dest
 
 const TRANSITIVE_LINK_REJECTED: &str = "transitive source cannot use deploy = \"link\"";
 
-const TRANSITIVE_HISTORY_REJECTED: &str = "transitive source cannot use history = true";
-
 /// Fail-closed bound: an acyclic ever-deeper `transitive = true` import chain would otherwise stack-overflow (`DoS`) on untrusted manifests.
 const MAX_TRANSITIVE_DEPTH: usize = 64;
 
@@ -381,11 +379,6 @@ fn namespace_dep_sources(
         let parsed = ParsedSource::parse(inner_name, inner).map_err(|e| {
             Error::Config(format!("imported `{imported}`: source `{inner_name}`: {e}"))
         })?;
-        if inner.history == Some(true) {
-            return Err(Error::Config(format!(
-                "imported `{imported}`: source `{inner_name}`: {TRANSITIVE_HISTORY_REJECTED}"
-            )));
-        }
         if parsed.deploy_mode() == DeployMode::Link {
             return Err(Error::Config(format!(
                 "imported `{imported}`: source `{inner_name}`: {TRANSITIVE_LINK_REJECTED}"
@@ -642,6 +635,11 @@ fn synthetic_target(
     target.collapse = None;
     if let Some(bindings) = target.sources.as_mut() {
         for (identity, binding) in bindings.iter_mut() {
+            if binding.history {
+                return Err(Error::Config(format!(
+                    "imported `{imported}`: target `{dep_target_name}` binding `{identity}` cannot set history"
+                )));
+            }
             let effective = binding.source.clone().unwrap_or_else(|| identity.clone());
             let namespaced = source_names.get(&effective).ok_or_else(|| {
                 Error::Config(format!(
@@ -1838,26 +1836,6 @@ mod tests {
             "the absent-commit failure must name the missing lock-pinned commit `{absent}` — the \
              offline mirror read for that SHA is what fails — not surface a generic error that \
              could be any unrelated config/parse failure; got: {msg}"
-        );
-    }
-
-    #[test]
-    fn composed_dependency_rejects_history_with_import_and_source_context() {
-        let config = consumer_importing("https://example.test/dep.git");
-        let parsed = parsed_of(&config);
-        let backend = SyncManifestBackend(SyncManifestRead::Bytes(
-            b"version = 1\n\n[sources.inner]\ngit = \"https://example.test/inner.git\"\nhistory = true\n"
-                .to_vec(),
-        ));
-
-        let error = resolve_transitive_graph(&config, &parsed, &backend, false, None)
-            .expect_err("a composed dependency must reject history-enabled inner sources")
-            .to_string();
-        assert!(
-            error.contains("imported `dep`")
-                && error.contains("source `inner`")
-                && error.contains("history"),
-            "the transitive-history diagnostic must name imported `dep`, inner source `inner`, and history; got: {error}"
         );
     }
 }

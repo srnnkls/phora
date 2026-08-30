@@ -4,8 +4,9 @@ pub mod file;
 pub mod locking;
 
 pub use file::{
-    ArtifactKey, ArtifactRecord, Ejection, FileStateStore, HookState, ManifestFile,
-    NewArtifactRecord, RecordKind, ScannedFile, StateError, ejected_index, readonly_root_error,
+    ArtifactKey, ArtifactRecord, Ejection, FileStateStore, HookState, ManifestEntryKind,
+    ManifestFile, NewArtifactRecord, NewHistoryRecord, RecordKind, ScannedFile, StateError,
+    ejected_index, readonly_root_error,
 };
 pub use locking::StateLock;
 

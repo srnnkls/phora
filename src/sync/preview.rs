@@ -360,7 +360,7 @@ fn resolve_plan(
         inventory: &inventory,
         take: &take,
         collapse: CollapsePreference::from(ctx.binding.collapse),
-        history: ctx.source.history(),
+        history: ctx.binding.history,
         materialization: MaterializationPolicy::from(&ctx.source.deploy_mode()),
         layout: &layout,
         templates: &templates,

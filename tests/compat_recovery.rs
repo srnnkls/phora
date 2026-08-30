@@ -26,8 +26,8 @@ use phora::sync::apply::{apply_artifact, copy_tree, link_artifact};
 use phora::sync::journal::{Journal, JournalEntry};
 use phora::sync::recovery::recovery_sweep;
 use phora::sync::state::{
-    ArtifactKey, ArtifactRecord, Ejection, HookState, ManifestFile, RecordKind, StateError,
-    StateStore,
+    ArtifactKey, ArtifactRecord, Ejection, HookState, ManifestEntryKind, ManifestFile, RecordKind,
+    StateError, StateStore,
 };
 use tempfile::TempDir;
 
@@ -262,12 +262,16 @@ fn record(contents: &[u8], kind: RecordKind, linked: bool) -> ArtifactRecord {
         preserve_executable: true,
         files: vec![ManifestFile {
             path: PathBuf::from(ARTIFACT),
+            kind: ManifestEntryKind::File,
             size: contents.len() as u64,
             mtime: FIXED_MTIME,
             blake3: blake3::hash(contents).to_hex().to_string(),
         }],
         linked,
         history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -1101,12 +1105,16 @@ fn overlap_record(artifact: &str, kind: RecordKind, contents: &[u8]) -> Artifact
         preserve_executable: true,
         files: vec![ManifestFile {
             path: PathBuf::from(artifact),
+            kind: ManifestEntryKind::File,
             size: contents.len() as u64,
             mtime: FIXED_MTIME,
             blake3: blake3::hash(contents).to_hex().to_string(),
         }],
         linked: false,
         history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,

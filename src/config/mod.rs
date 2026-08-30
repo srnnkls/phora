@@ -120,7 +120,6 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         for (name, source) in &self.sources {
             let parsed = ParsedSource::parse(name, source)?;
-            reject_history_source_options(name, source, &parsed)?;
             let Remote::Host {
                 host: host_name,
                 repo,
@@ -242,7 +241,7 @@ impl Config {
                 };
                 reject_url_slice(effective, binding, source)?;
                 reject_link_ref(effective, binding, source)?;
-                reject_history_binding_options(effective, binding, source)?;
+                reject_history_binding_options(target_name, identity, effective, binding, source)?;
                 reject_multi_ref(effective, binding)?;
             }
         }
@@ -466,17 +465,19 @@ fn binding_scope_diagnostic(
     }
 }
 
-fn reject_history_source_options(
+fn reject_history_binding_options(
+    target_name: &str,
+    identity: &str,
     source_name: &str,
+    binding: &Binding,
     source: &Source,
-    parsed: &ParsedSource,
 ) -> Result<()> {
-    if source.history != Some(true) {
+    if !binding.history {
         return Ok(());
     }
-    let option = if matches!(parsed.remote, Remote::Url { .. }) {
+    let option = if source.url.is_some() {
         "url"
-    } else if parsed.deploy_mode() == DeployMode::Link {
+    } else if source.deploy == Some(DeployMode::Link) {
         "deploy"
     } else if source.root.is_some() {
         "root"
@@ -486,23 +487,9 @@ fn reject_history_source_options(
         "exclude"
     } else if source.transitive == Some(true) {
         "transitive"
-    } else {
-        return Ok(());
-    };
-    Err(Error::Config(format!(
-        "source `{source_name}`: `history` cannot be combined with `{option}`"
-    )))
-}
-
-fn reject_history_binding_options(
-    source_name: &str,
-    binding: &Binding,
-    source: &Source,
-) -> Result<()> {
-    if source.history != Some(true) {
-        return Ok(());
-    }
-    let option = if binding.take.is_some() {
+    } else if source.preserve_executable == Some(false) {
+        "preserve_executable"
+    } else if binding.take.is_some() {
         "take"
     } else if binding.template.is_some() {
         "template"
@@ -512,7 +499,7 @@ fn reject_history_binding_options(
         return Ok(());
     };
     Err(Error::Config(format!(
-        "source `{source_name}`: binding option `{option}` cannot be used with `history`"
+        "target `{target_name}`: binding `{identity}` for source `{source_name}`: `history` cannot be combined with `{option}`"
     )))
 }
 

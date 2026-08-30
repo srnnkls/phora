@@ -95,7 +95,7 @@ fn discover_target(
             inventory: SourceInventory::from_paths(leaves)?,
             offer: OfferSpec::from(source.offer()),
             take: TakeSpec::from_entries(binding.take),
-            history: source.history(),
+            history: binding.history,
             materialization: MaterializationPolicy::from(&source.deploy_mode()),
             collapse: CollapsePreference::from(binding.collapse),
             templates: TemplatePolicy::from(&binding.template_opt_in),

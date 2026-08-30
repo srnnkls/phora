@@ -4,6 +4,14 @@ use std::process::{Command, Output, Stdio};
 
 use tempfile::TempDir;
 
+use phora::config::Config;
+use phora::source::GitBackend;
+use phora::sync::state::{ArtifactRecord, FileStateStore, StateStore};
+use phora::sync::{
+    Concurrency, ConflictPolicy, HookPolicy, LockSet, MovedPinPolicy, PrunePolicy, SourcePolicy,
+    SyncOptions, SyncRequest,
+};
+
 mod common;
 
 const MATERIALIZED_MTIME: i64 = 1_700_000_000;
@@ -267,4 +275,99 @@ fn phora_built_linked_worktree_admin_is_accepted_by_git() {
             target.display()
         );
     }
+}
+
+fn sync_options() -> SyncOptions {
+    SyncOptions {
+        source_policy: SourcePolicy::Refresh,
+        conflict_policy: ConflictPolicy::Refuse,
+        prune_policy: PrunePolicy::KeepOrphans,
+        hook_policy: HookPolicy::None,
+        moved_pin_policy: MovedPinPolicy::Seal,
+        concurrency: Concurrency::default(),
+    }
+}
+
+#[test]
+fn history_whole_root_sync_publishes_the_overlay_and_complete_record_address() {
+    let fixture = TempDir::new().expect("fixture tempdir");
+    let (mirror, _, _, _) = fixture_repository(&fixture);
+    let deploy_root = fixture.path().join("deployment");
+    let config = Config::parse(&format!(
+        "version = 1\n\
+         [sources.history]\n\
+         git = \"{}\"\n\n\
+         [targets.home]\n\
+         path = \"{}\"\n\n\
+         [targets.home.sources]\n\
+         history = {{ history = true }}\n",
+        mirror.display(),
+        deploy_root.display()
+    ))
+    .expect("history config parses");
+    config.validate().expect("history config validates");
+    let registry = FileStateStore::open(fixture.path().join("state")).expect("open registry");
+    let backend = GitBackend::new(fixture.path().join("cache"));
+
+    phora::sync::sync(
+        &SyncRequest {
+            base_config: &config,
+            local_config: None,
+            locks: LockSet::default(),
+            options: sync_options(),
+            resolver: None,
+        },
+        &backend,
+        &registry,
+    )
+    .expect("history sync succeeds");
+
+    let history_root = deploy_root.join("history");
+    assert!(
+        history_root.join(".git").is_file(),
+        "history root has a gitlink"
+    );
+    assert!(
+        history_root.join("vendor").is_dir(),
+        "history gitlinks materialize as empty directories"
+    );
+    let record = registry
+        .all_artifacts()
+        .expect("read history records")
+        .pop()
+        .expect("history sync persists one record");
+    let _: Option<String> = record.worktree_admin_id.clone();
+    let _: Option<String> = record.mirror_key.clone();
+    let _: Option<String> = record.cache_git_root.clone();
+    assert!(
+        record.history,
+        "history deployment persists a history record"
+    );
+    assert!(
+        record.worktree_admin_id.is_some()
+            && record.mirror_key.is_some()
+            && record.cache_git_root.is_some(),
+        "a history record persists its complete linked-worktree address"
+    );
+
+    let legacy: ArtifactRecord = toml::from_str(
+        "version = 1\n\
+         key = { target = \"home\", source = \"ordinary\", artifact = \"artifact\" }\n\
+         source = \"ordinary\"\n\
+         commit = \"abc\"\n\
+         digest = \"blake3:abc\"\n\
+         projected_at = \"2026-01-01T00:00:00Z\"\n\
+         layout = \"flat\"\n\
+         allow_symlinks = false\n\
+         preserve_executable = true\n\
+         files = []\n",
+    )
+    .expect("legacy record deserializes");
+    assert!(
+        !legacy.history
+            && legacy.worktree_admin_id.is_none()
+            && legacy.mirror_key.is_none()
+            && legacy.cache_git_root.is_none(),
+        "legacy and ordinary records leave the history address absent"
+    );
 }

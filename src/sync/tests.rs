@@ -203,6 +203,9 @@ fn linked_flat_record(target: &str, source: &str, artifact: &str) -> ArtifactRec
         files: vec![],
         linked: true,
         history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -3470,12 +3473,16 @@ fn seed_orphan(
         preserve_executable: true,
         files: vec![ManifestFile {
             path: PathBuf::from("old.txt"),
+            kind: crate::sync::state::ManifestEntryKind::File,
             size: 6,
             mtime: 1_700_000_000,
             blake3: "blake3:orphan".to_owned(),
         }],
         linked: false,
         history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -3572,6 +3579,9 @@ fn frozen_lockless_fast_forward_with_pending_drops_refuses_before_pruning() {
         files: vec![],
         linked: false,
         history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -3783,12 +3793,16 @@ fn seed_orphan_record(reg: &FileStateStore, source: &str, artifact: &str) {
         preserve_executable: true,
         files: vec![ManifestFile {
             path: PathBuf::from("init.lua"),
+            kind: crate::sync::state::ManifestEntryKind::File,
             size: 6,
             mtime: 1_700_000_000,
             blake3: "blake3:orphan".to_owned(),
         }],
         linked: false,
         history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -5473,12 +5487,16 @@ fn sync_runs_recovery_sweep_finishing_a_swapped_but_unrecorded_artifact() {
         preserve_executable: true,
         files: vec![ManifestFile {
             path: PathBuf::from("recovered.txt"),
+            kind: crate::sync::state::ManifestEntryKind::File,
             size: 10,
             mtime: 1_700_000_000,
             blake3: "blake3:recovered".to_owned(),
         }],
         linked: false,
         history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -5604,12 +5622,16 @@ fn sync_runs_recovery_before_phase1_even_when_resolve_fails() {
         preserve_executable: true,
         files: vec![ManifestFile {
             path: PathBuf::from("recovered.txt"),
+            kind: crate::sync::state::ManifestEntryKind::File,
             size: 10,
             mtime: 1_700_000_000,
             blake3: "blake3:recovered".to_owned(),
         }],
         linked: false,
         history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -5693,12 +5715,16 @@ fn seed_managed_artifact(
         preserve_executable: true,
         files: vec![ManifestFile {
             path: PathBuf::from(file),
+            kind: crate::sync::state::ManifestEntryKind::File,
             size: content.len() as u64,
             mtime: 1_700_000_000,
             blake3: blake3::hash(content).to_hex().to_string(),
         }],
         linked: false,
         history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -5856,6 +5882,7 @@ fn seed_verifiable_artifact(
             std::fs::write(&path, content).expect("write verify file");
             ManifestFile {
                 path: PathBuf::from(rel),
+                kind: crate::sync::state::ManifestEntryKind::File,
                 size: content.len() as u64,
                 mtime: 1_700_000_000,
                 blake3: blake3::hash(content).to_hex().to_string(),
@@ -5876,6 +5903,9 @@ fn seed_verifiable_artifact(
         files: manifest,
         linked: false,
         history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -6553,12 +6583,16 @@ fn verify_skips_linked_record_even_with_stray_manifest_file() {
         preserve_executable: true,
         files: vec![ManifestFile {
             path: PathBuf::from("ghost.lua"),
+            kind: crate::sync::state::ManifestEntryKind::File,
             size: 7,
             mtime: 1_700_000_000,
             blake3: blake3::hash(b"phantom").to_hex().to_string(),
         }],
         linked: true,
         history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -6612,6 +6646,9 @@ fn verify_skips_linked_record_over_edited_symlink_target() {
         files: vec![],
         linked: true,
         history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -6730,6 +6767,9 @@ fn prune_removes_stale_linked_symlink_without_following_it() {
             files: vec![],
             linked: true,
             history: false,
+            worktree_admin_id: None,
+            mirror_key: None,
+            cache_git_root: None,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
@@ -6820,6 +6860,9 @@ fn prune_drops_a_stale_dir_record_once_the_plan_flips_leaf_granular() {
             files: vec![],
             linked: true,
             history: false,
+            worktree_admin_id: None,
+            mirror_key: None,
+            cache_git_root: None,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
@@ -6906,6 +6949,9 @@ fn leaf_record(target: &str, identity: &str, key: &str) -> ArtifactRecord {
         files: vec![],
         linked: false,
         history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -7242,12 +7288,16 @@ fn prune_keeps_a_foreign_orphan_dir_that_ancestors_a_live_leaf_of_another_bindin
             preserve_executable: true,
             files: vec![ManifestFile {
                 path: PathBuf::from("legacy.txt"),
+                kind: crate::sync::state::ManifestEntryKind::File,
                 size: 7,
                 mtime: 1_700_000_000,
                 blake3: "blake3:orphan".to_owned(),
             }],
             linked: false,
             history: false,
+            worktree_admin_id: None,
+            mirror_key: None,
+            cache_git_root: None,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
@@ -7306,6 +7356,9 @@ fn prune_keeps_a_foreign_orphan_leaf_nested_under_a_live_collapsed_dir_of_anothe
             files: vec![],
             linked: false,
             history: false,
+            worktree_admin_id: None,
+            mirror_key: None,
+            cache_git_root: None,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
@@ -10032,12 +10085,16 @@ fn preview_writes_nothing_to_the_registry_or_the_target() {
         preserve_executable: true,
         files: vec![ManifestFile {
             path: PathBuf::from("init.lua"),
+            kind: crate::sync::state::ManifestEntryKind::File,
             size: 8,
             mtime: 1_700_000_000,
             blake3: "blake3:seeded".to_owned(),
         }],
         linked: false,
         history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -11383,6 +11440,78 @@ fn plan_target_without_override_discovers_full_source_level_set() {
         artifacts,
         vec!["docs", "editor"],
         "a plain binding (no override) inherits the source's full set, got {artifacts:?}"
+    );
+}
+
+#[test]
+fn project_workspace_keeps_history_materialization_on_its_binding() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nlayout = \"by-source\"\n\
+         sources = {{ ordinary = {{ source = \"editor-src\" }}, archive = {{ source = \"editor-src\", history = true }} }}\n",
+        fx.url,
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("two differently owned bindings parse");
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+    seed_git_mirror(&fx.backend, "editor-src", &fx.url);
+    let commits = one_commit(&parsed, "editor-src", &fx.head_sha);
+    let resolved_sources = resolved_git_map(&fx.backend, "editor-src", &fx.url, &fx.head_sha);
+
+    let projection = project_workspace(
+        &cfg,
+        &parsed,
+        &remotes,
+        &fx.backend,
+        &commits,
+        &resolved_sources,
+    )
+    .expect("projection builds over the seeded mirror");
+    let dest = projection
+        .targets
+        .iter()
+        .find(|p| p.target == "dest")
+        .expect("projection must include target `dest`");
+    let ordinary = dest
+        .bindings
+        .iter()
+        .find(|binding| binding.identity == "ordinary")
+        .expect("ordinary binding projects");
+    assert!(
+        ordinary.artifacts.iter().all(|artifact| !matches!(
+            &artifact.materialization,
+            crate::projection::model::Materialization::WholeRoot { .. }
+        )),
+        "the ordinary binding must retain normal materialization"
+    );
+    let mut ordinary_artifacts = projected_artifact_keys(ordinary);
+    ordinary_artifacts.sort_unstable();
+    assert_eq!(
+        ordinary_artifacts,
+        vec!["docs", "editor"],
+        "the ordinary binding must retain the source's normal artifact set"
+    );
+    let archive = dest
+        .bindings
+        .iter()
+        .find(|binding| binding.identity == "archive")
+        .expect("history binding projects");
+    assert!(
+        matches!(
+            archive.artifacts.as_slice(),
+            [artifact]
+                if matches!(
+                    &artifact.materialization,
+                    crate::projection::model::Materialization::WholeRoot { identity }
+                        if identity == "archive"
+                )
+        ),
+        "only the history binding must project one WholeRoot at its identity; got: {:?}",
+        archive.artifacts
     );
 }
 
@@ -12829,6 +12958,9 @@ fn seed_recorded_artifact_at(reg: &FileStateStore, source: &str, artifact: &str,
         files: vec![],
         linked: false,
         history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -13426,6 +13558,36 @@ fn build_moved_recovery_source(p: &Path) -> (String, String, String) {
     (p.to_string_lossy().into_owned(), c0, c1)
 }
 
+fn crashed_recovery_record(key: ArtifactKey, commit: &str) -> ArtifactRecord {
+    ArtifactRecord {
+        version: 1,
+        key,
+        source: "editor-src".to_owned(),
+        commit: commit.to_owned(),
+        digest: "blake3:recovered".to_owned(),
+        projected_at: "2026-01-01T00:00:00Z".to_owned(),
+        layout: "flat".to_owned(),
+        kind: RecordKind::Dir,
+        allow_symlinks: false,
+        preserve_executable: true,
+        files: vec![ManifestFile {
+            path: PathBuf::from("init.lua"),
+            kind: crate::sync::state::ManifestEntryKind::File,
+            size: 8,
+            mtime: 1_700_000_000,
+            blake3: "blake3:recovered".to_owned(),
+        }],
+        linked: false,
+        history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
+        vars_digest: None,
+        deploy_root: None,
+        layout_separator: None,
+    }
+}
+
 #[test]
 fn sealed_offer_validates_crash_recovered_record_finalized_by_the_sweep() {
     let src = TempDir::new().expect("src tempdir");
@@ -13451,29 +13613,7 @@ fn sealed_offer_validates_crash_recovered_record_finalized_by_the_sweep() {
     std::fs::write(crashed_dst.join("init.lua"), b"-- init\n").expect("write crashed file");
 
     let crashed_key = artifact_key("dest", "editor-src", "editor");
-    let record = ArtifactRecord {
-        version: 1,
-        key: crashed_key.clone(),
-        source: "editor-src".to_owned(),
-        commit: c0.clone(),
-        digest: "blake3:recovered".to_owned(),
-        projected_at: "2026-01-01T00:00:00Z".to_owned(),
-        layout: "flat".to_owned(),
-        kind: RecordKind::Dir,
-        allow_symlinks: false,
-        preserve_executable: true,
-        files: vec![ManifestFile {
-            path: PathBuf::from("init.lua"),
-            size: 8,
-            mtime: 1_700_000_000,
-            blake3: "blake3:recovered".to_owned(),
-        }],
-        linked: false,
-        history: false,
-        vars_digest: None,
-        deploy_root: None,
-        layout_separator: None,
-    };
+    let record = crashed_recovery_record(crashed_key.clone(), &c0);
 
     let staging_base = td.parent_path.join(".phora-stage");
     let staging = staging_base.join("editor-deadbeef");
@@ -13917,6 +14057,7 @@ mod leaf_granular_deploy_tests {
         let mut stale = dir_record("dest", "ed", "editor");
         stale.files = vec![ManifestFile {
             path: PathBuf::from("a\\b"),
+            kind: crate::sync::state::ManifestEntryKind::File,
             size: 18,
             mtime: 1_700_000_000,
             blake3: "blake3:stale".to_owned(),

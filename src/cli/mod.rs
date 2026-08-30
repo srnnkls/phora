@@ -95,7 +95,7 @@ pub enum Command {
         local: bool,
         #[arg(long)]
         symlink: bool,
-        #[arg(long, conflicts_with_all = ["symlink", "root", "include", "exclude"])]
+        #[arg(long, conflicts_with_all = ["local", "symlink", "root", "include", "exclude"])]
         history: bool,
         #[arg(long = "as")]
         r#as: Option<String>,
@@ -186,10 +186,12 @@ pub enum Command {
     Bind {
         #[arg(required = true)]
         sources: Vec<String>,
-        #[arg(long)]
-        to: String,
+        #[arg(long, required = true)]
+        to: Vec<String>,
         #[arg(long)]
         local: bool,
+        #[arg(long, conflicts_with_all = ["root", "take"])]
+        history: bool,
         #[arg(long = "as")]
         r#as: Option<String>,
         #[arg(long)]
@@ -470,6 +472,7 @@ fn dispatch_add(cmd: Command) -> Result<()> {
     };
     let refinement = BindRefinement {
         r#as,
+        history,
         ..BindRefinement::default()
     };
     add::run_add(add::AddRequest {
@@ -484,7 +487,6 @@ fn dispatch_add(cmd: Command) -> Result<()> {
         local,
         symlink,
         refinement: &refinement,
-        history,
     })
 }
 
@@ -540,6 +542,7 @@ fn dispatch_bind(cmd: Command) -> Result<()> {
         sources,
         to,
         local,
+        history,
         r#as,
         root,
         take,
@@ -564,6 +567,7 @@ fn dispatch_bind(cmd: Command) -> Result<()> {
                 .iter()
                 .map(|t| config_edit::TakeArg::parse(t))
                 .collect(),
+            history,
         },
     )
 }
@@ -592,7 +596,6 @@ fn run_source(cmd: SourceCmd) -> Result<()> {
             local,
             symlink,
             refinement: &BindRefinement::default(),
-            history: false,
         }),
         SourceCmd::Rm { name } => run_source_rm(&name),
         SourceCmd::List => {

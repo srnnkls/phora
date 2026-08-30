@@ -43,8 +43,6 @@ pub struct Source {
     pub deploy: Option<DeployMode>,
     #[serde(default)]
     pub transitive: Option<bool>,
-    #[serde(default)]
-    pub history: Option<bool>,
 }
 
 impl Source {
@@ -117,7 +115,6 @@ pub struct ParsedSource {
     preserve_executable: Option<bool>,
     deploy: Option<DeployMode>,
     transitive: bool,
-    history: bool,
 }
 
 impl ParsedSource {
@@ -125,11 +122,6 @@ impl ParsedSource {
     #[must_use]
     pub fn is_transitive(&self) -> bool {
         self.transitive
-    }
-
-    #[must_use]
-    pub fn history(&self) -> bool {
-        self.history
     }
 
     /// Parses a merged raw `Source` into the typed single-kind shape.
@@ -160,7 +152,6 @@ impl ParsedSource {
             preserve_executable: source.preserve_executable,
             deploy: source.deploy,
             transitive: source.is_transitive(),
-            history: source.history.unwrap_or_default(),
         })
     }
 
@@ -254,14 +245,15 @@ impl ParsedSource {
     }
 
     #[must_use]
-    pub fn export_policy(&self) -> ExportPolicy {
+    pub fn export_policy(&self, history: bool) -> ExportPolicy {
         ExportPolicy {
-            allow_symlinks: self.allow_symlinks.unwrap_or(false),
+            allow_symlinks: self.allow_symlinks.unwrap_or(history),
             preserve_executable: self.preserve_executable.unwrap_or(true),
-            vcs_opt_in: self
-                .includes()
-                .iter()
-                .any(|p| p.split(['/', '\\']).any(|seg| seg == ".git")),
+            vcs_opt_in: history
+                || self
+                    .includes()
+                    .iter()
+                    .any(|p| p.split(['/', '\\']).any(|seg| seg == ".git")),
         }
     }
 
@@ -281,7 +273,7 @@ impl ParsedSource {
             h.update(b"root\x00");
             h.update(r.to_string_lossy().as_bytes());
         }
-        let policy = self.export_policy();
+        let policy = self.export_policy(false);
         h.update(&[
             u8::from(policy.allow_symlinks),
             u8::from(policy.preserve_executable),
@@ -461,9 +453,6 @@ impl Source {
         if local.transitive.is_some() {
             self.transitive = local.transitive;
         }
-        if local.history.is_some() {
-            self.history = local.history;
-        }
         self
     }
 
@@ -613,7 +602,6 @@ mod offer_tests {
             preserve_executable: None,
             deploy: None,
             transitive: None,
-            history: None,
         }
     }
 
@@ -801,7 +789,6 @@ mod merge_url_digest_tests {
             preserve_executable: None,
             deploy: None,
             transitive: None,
-            history: None,
         }
     }
 

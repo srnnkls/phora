@@ -69,6 +69,19 @@ fn relative(path: &Path, base: &Path) -> Result<PathBuf> {
         .map_err(|e| Error::Projection(format!("strip prefix {}: {e}", path.display())))
 }
 
+pub(crate) fn link_target_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    let target = std::fs::read_link(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Ok(target.as_os_str().as_bytes().to_vec())
+    }
+    #[cfg(windows)]
+    {
+        Ok(target.to_string_lossy().into_owned().into_bytes())
+    }
+}
+
 pub(crate) fn mtime_secs(meta: &std::fs::Metadata, path: &Path) -> Result<u64> {
     meta.modified()
         .map_err(|e| Error::Projection(format!("mtime {}: {e}", path.display())))?

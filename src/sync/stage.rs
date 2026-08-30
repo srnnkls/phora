@@ -6,6 +6,7 @@ use crate::projection::model::{
     ArtifactRelativePath, ProjectedArtifact, ProjectedLeaf, TargetProjection,
 };
 use crate::source::{ExportPolicy, SourceEntryKind, SourceError, hash_framed_entry, vars_digest};
+use crate::sync::state::ManifestEntryKind;
 
 type Result<T> = std::result::Result<T, SourceError>;
 
@@ -25,6 +26,7 @@ pub struct StagedArtifact {
 #[derive(Debug)]
 pub struct StagedFile {
     pub destination: ArtifactRelativePath,
+    pub kind: ManifestEntryKind,
     pub size: u64,
     pub mtime: u64,
     pub blake3: String,
@@ -119,12 +121,19 @@ impl StageLeaf for PlannedLeaf<'_> {
 }
 
 impl StagedRecord for StagedFile {
-    fn staged(destination: &Path, size: u64, mtime: u64, blake3: String) -> Self {
+    fn staged(
+        destination: &Path,
+        kind: ManifestEntryKind,
+        size: u64,
+        mtime: u64,
+        blake3: String,
+    ) -> Self {
         let destination = destination.to_string_lossy().replace('\\', "/");
         let destination = ArtifactRelativePath::new(&destination)
             .expect("staged destinations originate from validated artifact-relative paths");
         Self {
             destination,
+            kind,
             size,
             mtime,
             blake3,
@@ -138,7 +147,13 @@ pub(crate) trait StageLeaf {
 }
 
 pub(crate) trait StagedRecord {
-    fn staged(destination: &Path, size: u64, mtime: u64, blake3: String) -> Self;
+    fn staged(
+        destination: &Path,
+        kind: ManifestEntryKind,
+        size: u64,
+        mtime: u64,
+        blake3: String,
+    ) -> Self;
 }
 
 pub(crate) struct Renderer<'a> {
@@ -292,6 +307,7 @@ impl<F: StagedRecord> ExportWalk<'_, '_, F> {
 
         self.files.push(F::staged(
             deployed_rel,
+            ManifestEntryKind::File,
             data.len() as u64,
             self.commit_time,
             blake3::hash(&data).to_hex().to_string(),
@@ -318,6 +334,11 @@ impl<F: StagedRecord> ExportWalk<'_, '_, F> {
             std::fs::create_dir_all(parent)?;
         }
         materialize_symlink(&out_path, target)?;
+        let metadata = std::fs::symlink_metadata(&out_path)?;
+        let mtime = filetime::FileTime::from_last_modification_time(&metadata)
+            .unix_seconds()
+            .try_into()
+            .map_err(|error| SourceError::Source(format!("read symlink mtime: {error}")))?;
 
         hash_framed_entry(
             &mut self.hasher,
@@ -325,6 +346,13 @@ impl<F: StagedRecord> ExportWalk<'_, '_, F> {
             b"\x00link\x00",
             target,
         );
+        self.files.push(F::staged(
+            deployed_rel,
+            ManifestEntryKind::Link,
+            target.len() as u64,
+            mtime,
+            blake3::hash(target).to_hex().to_string(),
+        ));
         Ok(())
     }
 }

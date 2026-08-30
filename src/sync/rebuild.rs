@@ -12,12 +12,15 @@ use crate::source::{
     SourcePath, SourceStore,
 };
 use crate::sync::state::{
-    ArtifactKey, ArtifactRecord, ManifestFile, NewArtifactRecord, RecordKind, StateStore,
+    ArtifactKey, ArtifactRecord, ManifestFile, NewArtifactRecord, NewHistoryRecord, RecordKind,
+    StateStore,
 };
 
 use super::plan::plan_target;
 use super::resolve::ResolvedSourceMap;
+use super::scan::link_target_bytes;
 use super::stage::{StageRequest, stage_artifact};
+use super::target::{history_deployment, project_root};
 use super::{StagingGuard, nonce, remote_for, resolved_remotes};
 use crate::projection::model::{BindingProjection, ProjectedArtifact, TargetProjection};
 
@@ -209,7 +212,6 @@ fn rebuild_binding(run: &BindingRun<'_>, report: &mut RebuildReport) -> Result<(
                 run.binding.source, run.binding.commit
             ))
         })?;
-    let policy = run.source.export_policy();
     let template_opt_in = run
         .target
         .resolve_sources(run.parsed)
@@ -219,6 +221,10 @@ fn rebuild_binding(run: &BindingRun<'_>, report: &mut RebuildReport) -> Result<(
     let deploy_root = run.target.deploy_root();
 
     for item in &run.binding.artifacts {
+        let policy = run.source.export_policy(matches!(
+            item.materialization,
+            Materialization::WholeRoot { .. }
+        ));
         let published_key = item.materialization.published_key().to_owned();
         let key = ArtifactKey {
             target: run.target_name.to_owned(),
@@ -288,6 +294,29 @@ struct RebuildOne<'a> {
     deploy_root: String,
 }
 
+fn rebuilt_history(
+    backend: &dyn SourceStore,
+    resolved: &ResolvedSource,
+    item: &ProjectedArtifact,
+    artifact_dst: &Path,
+    key: &ArtifactKey,
+    commit: &str,
+) -> Result<Option<NewHistoryRecord>> {
+    if !matches!(&item.materialization, Materialization::WholeRoot { .. }) {
+        return Ok(None);
+    }
+    let guard = backend.lock_worktree_mirror(&resolved.name, resolved.snapshot.mirror())?;
+    let (history, _) = history_deployment(
+        &project_root()?,
+        artifact_dst,
+        &key.target,
+        &key.source,
+        &guard.address,
+        commit,
+    )?;
+    Ok(Some(history))
+}
+
 fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
     let RebuildOne {
         backend,
@@ -346,7 +375,7 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         let path = PathBuf::from(sf.destination.as_str());
         let on_disk = manifest_base.join(&path);
         let (size, mtime) = if let Some(actual) = disk_hash(&on_disk)? {
-            if actual.hash != sf.blake3 {
+            if actual.kind != sf.kind || actual.hash != sf.blake3 {
                 modified = true;
             }
             (actual.size, actual.mtime)
@@ -356,11 +385,14 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         };
         files.push(ManifestFile {
             path,
+            kind: sf.kind,
             size,
             mtime,
             blake3: sf.blake3,
         });
     }
+
+    let history = rebuilt_history(backend, resolved, item, artifact_dst, &key, commit)?;
 
     let record = ArtifactRecord::projected(NewArtifactRecord {
         key: key.clone(),
@@ -372,7 +404,7 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
         files,
-        history: matches!(&item.materialization, Materialization::WholeRoot { .. }),
+        history,
         vars_digest: staged.vars_digest,
         deploy_root: Some(deploy_root),
         layout_separator: layout.persisted_separator(),
@@ -409,6 +441,9 @@ fn rebuild_linked(
         files: vec![],
         linked: true,
         history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: Some(deploy_root),
         layout_separator: layout.persisted_separator(),
@@ -418,6 +453,7 @@ fn rebuild_linked(
 }
 
 struct DiskHash {
+    kind: crate::sync::state::ManifestEntryKind,
     hash: String,
     size: u64,
     mtime: u64,
@@ -425,17 +461,28 @@ struct DiskHash {
 
 /// `Ok(None)` when the file is absent on disk.
 fn disk_hash(path: &Path) -> Result<Option<DiskHash>> {
-    let content = match std::fs::read(path) {
-        Ok(bytes) => bytes,
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(Error::Sync(format!("read {}: {e}", path.display()))),
+        Err(e) => return Err(Error::Sync(format!("stat {}: {e}", path.display()))),
     };
-    let meta = std::fs::metadata(path)
-        .map_err(|e| Error::Sync(format!("stat {}: {e}", path.display())))?;
+    let kind = if meta.file_type().is_symlink() {
+        crate::sync::state::ManifestEntryKind::Link
+    } else if meta.is_file() {
+        crate::sync::state::ManifestEntryKind::File
+    } else {
+        return Ok(None);
+    };
+    let content = match kind {
+        crate::sync::state::ManifestEntryKind::File => std::fs::read(path),
+        crate::sync::state::ManifestEntryKind::Link => link_target_bytes(path),
+    }
+    .map_err(|e| Error::Sync(format!("read {}: {e}", path.display())))?;
     let mtime = filetime::FileTime::from_last_modification_time(&meta).unix_seconds();
     Ok(Some(DiskHash {
+        kind,
         hash: blake3::hash(&content).to_hex().to_string(),
-        size: meta.len(),
+        size: content.len() as u64,
         mtime: u64::try_from(mtime).unwrap_or(0),
     }))
 }

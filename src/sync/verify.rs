@@ -1,13 +1,16 @@
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::lock::Lock;
-use crate::sync::state::{ArtifactKey, StateStore};
+use crate::sync::scan::link_target_bytes;
+use crate::sync::state::{ArtifactKey, ManifestEntryKind, StateStore};
 
 /// Why a deployed file failed verification against its registry record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifyReason {
     /// The deployed file's content hash differs from the recorded `blake3`.
     ContentMismatch { expected: String, actual: String },
+    /// The deployed entry type differs from the recorded manifest kind.
+    EntryKindMismatch,
     /// The recorded file is absent on disk at the deployed location.
     Missing,
 }
@@ -91,8 +94,26 @@ fn verify_mismatches(config: &Config, registry: &dyn StateStore) -> Result<Vec<V
         let artifact_dir = super::target::record_manifest_base(target, &record);
         for file in &record.files {
             let dst = artifact_dir.join(&file.path);
-            match std::fs::read(&dst) {
-                Ok(content) => {
+            match std::fs::symlink_metadata(&dst) {
+                Ok(metadata) => {
+                    let actual_kind = if metadata.file_type().is_symlink() {
+                        ManifestEntryKind::Link
+                    } else {
+                        ManifestEntryKind::File
+                    };
+                    if actual_kind != file.kind {
+                        mismatches.push(VerifyMismatch {
+                            key: record.key.clone(),
+                            path: file.path.clone(),
+                            reason: VerifyReason::EntryKindMismatch,
+                        });
+                        continue;
+                    }
+                    let content = match file.kind {
+                        ManifestEntryKind::File => std::fs::read(&dst),
+                        ManifestEntryKind::Link => link_target_bytes(&dst),
+                    }
+                    .map_err(|e| Error::Sync(format!("verify read {}: {e}", dst.display())))?;
                     let actual = blake3::hash(&content).to_hex().to_string();
                     if actual != file.blake3 {
                         mismatches.push(VerifyMismatch {
@@ -113,7 +134,7 @@ fn verify_mismatches(config: &Config, registry: &dyn StateStore) -> Result<Vec<V
                     });
                 }
                 Err(e) => {
-                    return Err(Error::Sync(format!("verify read {}: {e}", dst.display())));
+                    return Err(Error::Sync(format!("verify stat {}: {e}", dst.display())));
                 }
             }
         }
