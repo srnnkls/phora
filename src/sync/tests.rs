@@ -5903,56 +5903,45 @@ fn eject_detaches_history_overlay_from_the_recorded_mirror_before_persisting_eje
     );
 }
 
+fn history_reshape_configs(url: &str, target: &Path) -> (Config, Config) {
+    let history = Config::parse(&format!(
+        "version = 1\n\n[sources.editor]\ngit = \"{url}\"\nbranch = \"main\"\n\n[targets.dest]\npath = \"{}\"\nlayout = \"flat\"\nsources = {{ archive = {{ source = \"editor\", history = true }} }}\n",
+        target.display(),
+    ))
+    .expect("history config parses");
+    let ordinary = Config::parse(&format!(
+        "version = 1\n\n[sources.editor]\ngit = \"{url}\"\nbranch = \"main\"\n\n[targets.dest]\npath = \"{}\"\nlayout = \"flat\"\nsources = {{ archive = {{ source = \"editor\" }} }}\n",
+        target.display(),
+    ))
+    .expect("ordinary config parses");
+    (history, ordinary)
+}
+
 #[test]
 fn history_off_reshape_applies_after_skip_and_retires_the_persisted_overlay() {
     let fx = build_sync_fixture();
     let td = TargetDir::new();
-    let history = Config::parse(&format!(
-        "version = 1\n\n[sources.editor]\ngit = \"{}\"\nbranch = \"main\"\n\n[targets.dest]\npath = \"{}\"\nlayout = \"flat\"\nsources = {{ editor = {{ source = \"editor\", history = true }} }}\n",
-        fx.url,
-        td.target_path().display(),
-    ))
-    .expect("history config parses");
-    let ordinary = Config::parse(&format!(
-        "version = 1\n\n[sources.editor]\ngit = \"{}\"\nbranch = \"main\"\n\n[targets.dest]\npath = \"{}\"\nlayout = \"flat\"\nsources = [\"editor\"]\n",
-        fx.url,
-        td.target_path().display(),
-    ))
-    .expect("ordinary config parses");
-
+    let (history, ordinary) = history_reshape_configs(&fx.url, &td.target_path());
     let first = sync(
         &input(&history, None, None, None, false),
         &fx.backend,
         &fx.registry,
     )
     .expect("history sync deploys");
-    let old_root = td.target_path().join("editor");
-    let old_key = artifact_key("dest", "editor", "editor");
-    let old_record = fx
+    let old_root = td.target_path().join("archive");
+    let old_key = artifact_key("dest", "archive", "archive");
+    let admin_id = fx
         .registry
         .artifact(&old_key)
         .expect("read history record")
-        .expect("history sync writes record");
-    let admin = crate::source::mirror_path(fx.git_dir.path(), &fx.url)
-        .join("worktrees")
-        .join(format!(
-            "ph-{}",
-            old_record
-                .worktree_admin_id
-                .as_deref()
-                .expect("history record has admin id")
-        ));
-    let pin = crate::source::mirror_path(fx.git_dir.path(), &fx.url)
-        .join("refs/phora/worktrees")
-        .join(
-            old_record
-                .worktree_admin_id
-                .as_deref()
-                .expect("history record has admin id"),
-        );
+        .expect("history sync writes record")
+        .worktree_admin_id
+        .expect("history record has admin id");
+    let mirror = crate::source::mirror_path(fx.git_dir.path(), &fx.url);
+    let admin = mirror.join("worktrees").join(format!("ph-{admin_id}"));
+    let pin = mirror.join("refs/phora/worktrees").join(&admin_id);
     std::fs::write(old_root.join("editor/init.lua"), b"-- modified\n")
         .expect("modify history content");
-
     let resolver = ScriptedResolver::new(Resolution::Skip);
     sync(
         &interactive_input(&ordinary, Some(first.base_lock.clone()), &resolver),
@@ -5974,14 +5963,49 @@ fn history_off_reshape_applies_after_skip_and_retires_the_persisted_overlay() {
                 .is_some(),
         "Skip must preserve the old overlay, content, and record"
     );
-
-    let overwrite = ScriptedResolver::new(Resolution::Overwrite);
+    std::fs::write(old_root.join("editor/init.lua"), b"-- init\n")
+        .expect("restore skipped history content");
+    let interrupted_state = TempDir::new().expect("interrupted state directory");
+    let interrupted = FileStateStore::open(interrupted_state.path().to_path_buf())
+        .expect("open interrupted registry");
     sync(
-        &interactive_input(&ordinary, Some(first.base_lock.clone()), &overwrite),
+        &input(&ordinary, None, Some(first.base_lock.clone()), None, false),
+        &fx.backend,
+        &interrupted,
+    )
+    .expect("ordinary artifacts persist before simulated interruption");
+    for record in interrupted.all_artifacts().expect("read artifacts") {
+        fx.registry.put_artifact(&record).expect("persist artifact");
+    }
+    let persisted = fx
+        .registry
+        .target_artifacts("dest")
+        .expect("read ordinary artifacts");
+    assert!(
+        ["docs", "editor"]
+            .into_iter()
+            .all(|artifact| persisted.iter().any(|record| {
+                record.key == artifact_key("dest", "archive", artifact) && !record.history
+            })),
+        "the interrupted state preserves the old overlay beside clean ordinary replacements"
+    );
+
+    assert_frozen_lockless_history_retirement_refusal(
+        &ordinary,
+        first.base_lock.clone(),
+        &fx,
+        &old_root,
+        &admin,
+        &pin,
+        &old_key,
+    );
+
+    sync(
+        &input(&ordinary, None, Some(first.base_lock), None, false),
         &fx.backend,
         &fx.registry,
     )
-    .expect("conflict-resolved ordinary sync applies the reshape");
+    .expect("plain retry retires the persisted overlay after clean replacements");
     assert!(
         !old_root.join(".git").exists()
             && !admin.exists()
@@ -5989,14 +6013,46 @@ fn history_off_reshape_applies_after_skip_and_retires_the_persisted_overlay() {
             && fx
                 .registry
                 .artifact(&old_key)
-                .expect("read reshaped record")
-                .is_some_and(|record| !record.history),
-        "an applied conflict overwrite replaces the WholeRoot record and retires its overlay administration"
+                .expect("read retired history record")
+                .is_none(),
+        "clean ordinary replacements retire the old overlay, record, administration, and pin"
+    );
+}
+
+fn assert_frozen_lockless_history_retirement_refusal(
+    ordinary: &Config,
+    base_lock: crate::lock::Lock,
+    fx: &SyncFixture,
+    old_root: &Path,
+    admin: &Path,
+    pin: &Path,
+    old_key: &ArtifactKey,
+) {
+    let record_before_frozen_lockless = fx
+        .registry
+        .artifact(old_key)
+        .expect("read overlay record before the frozen lockless attempt");
+    let frozen_lockless_result = sync(
+        &frozen_lockless_input(ordinary, Some(base_lock), false),
+        &fx.backend,
+        &fx.registry,
     );
     assert!(
-        td.target_path().join("editor/init.lua").exists()
-            && td.target_path().join("docs/readme.md").exists(),
-        "ordinary projection deploys after the old WholeRoot content is retired"
+        frozen_lockless_result.is_err(),
+        "a frozen lockless sync facing an identity-distinct history-off retirement with ready \
+         ordinary artifacts must refuse before retiring the old overlay, but it succeeded"
+    );
+    assert!(
+        old_root.join(".git").exists()
+            && admin.exists()
+            && pin.exists()
+            && fx
+                .registry
+                .artifact(old_key)
+                .expect("read overlay record after the refused frozen lockless attempt")
+                == record_before_frozen_lockless,
+        "a refused frozen lockless sync must leave the old overlay's content, gitlink \
+         administration, pin, and registry record untouched"
     );
 }
 

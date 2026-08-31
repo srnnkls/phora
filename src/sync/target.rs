@@ -364,7 +364,8 @@ pub(super) fn deploy_reconciled_target_report(
     let live_destinations = live_destinations(run, projection)?;
 
     let mut failed_bindings = BTreeSet::new();
-    let mut replaced_bindings = BTreeSet::new();
+    let mut ready_bindings = BTreeSet::new();
+    let mut unready_bindings = BTreeSet::new();
     let had_failures = walk_projection_target(run, projection, registry, false, |run, entry| {
         if protected_bindings.contains(entry.identity) {
             return Ok(false);
@@ -384,7 +385,9 @@ pub(super) fn deploy_reconciled_target_report(
         if failed {
             failed_bindings.insert(entry.identity.to_owned());
         } else if applied_replacement(change, reconciliation.decisions.get(&triplet)) {
-            replaced_bindings.insert(entry.identity.to_owned());
+            ready_bindings.insert(entry.identity.to_owned());
+        } else {
+            unready_bindings.insert(entry.identity.to_owned());
         }
         Ok(failed)
     })?;
@@ -392,7 +395,8 @@ pub(super) fn deploy_reconciled_target_report(
     for binding in &projection.bindings {
         if protected_bindings.contains(&binding.identity)
             || failed_bindings.contains(&binding.identity)
-            || !replaced_bindings.contains(&binding.identity)
+            || unready_bindings.contains(&binding.identity)
+            || !ready_bindings.contains(&binding.identity)
         {
             continue;
         }
@@ -401,6 +405,9 @@ pub(super) fn deploy_reconciled_target_report(
         else {
             continue;
         };
+        if journal.refuses_writes() {
+            return Err(journal.readonly_error());
+        }
         retire_history_deployment(
             backend,
             registry,
@@ -415,19 +422,21 @@ pub(super) fn deploy_reconciled_target_report(
 }
 
 fn applied_replacement(change: Option<&SyncChange>, outcome: Option<&ConflictOutcome>) -> bool {
-    matches!(
-        change,
-        Some(SyncChange::Deploy { .. } | SyncChange::Overwrite { .. })
-    ) || matches!(
-        (change, outcome),
-        (
-            Some(SyncChange::Conflict { .. }),
-            Some(ConflictOutcome {
-                resolution: Resolution::Overwrite,
-                ..
-            })
+    change.is_none()
+        || matches!(
+            change,
+            Some(SyncChange::Deploy { .. } | SyncChange::Overwrite { .. })
         )
-    )
+        || matches!(
+            (change, outcome),
+            (
+                Some(SyncChange::Conflict { .. }),
+                Some(ConflictOutcome {
+                    resolution: Resolution::Overwrite,
+                    ..
+                })
+            )
+        )
 }
 
 fn protect_history_retirements(
