@@ -20,7 +20,8 @@ use super::snapshot::{
 use super::{
     MirrorKey, NormalizedUrl, Result, SourceEntryKind, SourceEntryMeta, SourceError,
     SourceInventory, SourcePath, WorktreeMirrorAddress, WorktreeMirrorGuard,
-    WorktreeObservationRequest, WorktreeObservationResult,
+    WorktreeObservationRequest, WorktreeObservationResult, physical_cache_git_root,
+    verified_cache_git_root,
 };
 
 pub struct GitBackend {
@@ -548,6 +549,18 @@ impl SourceStore for GitBackend {
                 })?
                 .join(&self.git_dir)
         };
+        std::fs::create_dir_all(&cache_git_root).map_err(|error| {
+            SourceError::Source(format!(
+                "create git cache root {}: {error}",
+                cache_git_root.display()
+            ))
+        })?;
+        let cache_git_root = cache_git_root.canonicalize().map_err(|error| {
+            SourceError::Source(format!(
+                "canonicalize git cache root {}: {error}",
+                cache_git_root.display()
+            ))
+        })?;
         let address = WorktreeMirrorAddress {
             cache_git_root,
             key: key.clone(),
@@ -560,9 +573,13 @@ impl SourceStore for GitBackend {
         source: &SourceName,
         address: &WorktreeMirrorAddress,
     ) -> Result<WorktreeMirrorGuard> {
-        let cache_root = &address.cache_git_root;
-        let lock = lock_mirror_for_key(cache_root, source, &address.key)?;
-        let mirror = mirror_path_for_key(cache_root, &address.key);
+        let cache_root = verified_cache_git_root(&address.cache_git_root)?;
+        let address = WorktreeMirrorAddress {
+            cache_git_root: cache_root,
+            key: address.key.clone(),
+        };
+        let lock = lock_mirror_for_key(&address.cache_git_root, source, &address.key)?;
+        let mirror = mirror_path_for_key(&address.cache_git_root, &address.key);
         let mirror = gix::open(&mirror).map_err(|error| {
             SourceError::Source(format!(
                 "open worktree mirror {} for {source}: {error}",
@@ -581,8 +598,10 @@ impl SourceStore for GitBackend {
 }
 
 fn observe_worktree(request: &WorktreeObservationRequest) -> Result<WorktreeObservationResult> {
-    let cache_root = &request.address.cache_git_root;
-    let lock_path = mirror_lock_path_for_key(cache_root, &request.address.key);
+    let Some(cache_root) = physical_cache_git_root(&request.address.cache_git_root)? else {
+        return Ok(WorktreeObservationResult::Stale);
+    };
+    let lock_path = mirror_lock_path_for_key(&cache_root, &request.address.key);
     let lock = match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -614,12 +633,12 @@ fn observe_worktree(request: &WorktreeObservationRequest) -> Result<WorktreeObse
             .lock_shared()
             .map_err(|error| SourceError::Source(format!("lock worktree observation: {error}")))?,
     }
-    let admin_dir = mirror_path_for_key(cache_root, &request.address.key)
+    let admin_dir = mirror_path_for_key(&cache_root, &request.address.key)
         .join("worktrees")
         .join(format!("ph-{}", request.admin_id.as_str()));
     Ok(
         if worktree_is_conformant(
-            &mirror_path_for_key(cache_root, &request.address.key),
+            &mirror_path_for_key(&cache_root, &request.address.key),
             &admin_dir,
             request,
         )? {
@@ -638,7 +657,9 @@ fn worktree_is_conformant(
     if !metadata_is_dir(admin_dir, "observe worktree administration")? {
         return Ok(false);
     }
-    let gitlink = request.deploy_root.join(".git");
+    let Some(gitlink) = super::worktree_deploy::physical_gitlink_path(&request.deploy_root)? else {
+        return Ok(false);
+    };
     if !gitlink_targets_admin(&gitlink, admin_dir)? {
         return Ok(false);
     }

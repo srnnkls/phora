@@ -2555,7 +2555,15 @@ fn eject_keeps_mapped_file_and_marks_record_ejected() {
     ))
     .expect("seed mapped record");
 
-    crate::sync::eject(&cfg, &reg, "fzf.zsh", "fzf-src", "dest").expect("eject mapped leaf");
+    crate::sync::eject(
+        &cfg,
+        &reg,
+        "fzf.zsh",
+        "fzf-src",
+        "dest",
+        &crate::source::GitBackend::new(std::path::PathBuf::new()),
+    )
+    .expect("eject mapped leaf");
 
     assert!(
         target_root.path().join("fzf-src").join("fzf.zsh").exists(),
@@ -2589,7 +2597,15 @@ fn uneject_round_trips_a_mapped_record_back_to_managed() {
     ))
     .expect("seed mapped record");
 
-    crate::sync::eject(&cfg, &reg, "fzf.zsh", "fzf-src", "dest").expect("eject mapped leaf");
+    crate::sync::eject(
+        &cfg,
+        &reg,
+        "fzf.zsh",
+        "fzf-src",
+        "dest",
+        &crate::source::GitBackend::new(std::path::PathBuf::new()),
+    )
+    .expect("eject mapped leaf");
     crate::sync::uneject(&cfg, &reg, "fzf.zsh", "fzf-src", "dest").expect("uneject mapped leaf");
 
     let listings = list_statuses(&cfg, &reg, &GitBackend::new(state_dir.path().to_path_buf()))

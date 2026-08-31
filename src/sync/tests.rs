@@ -10,7 +10,8 @@ use tempfile::TempDir;
 use crate::source::{
     GitBackend, HttpBackend, ResolvePolicy, ResolveRequest, ResolvedSource, RevisionSpec,
     RouterBackend, SnapshotId, SourceDirectoryEntry, SourceEntry, SourceError, SourceInventory,
-    SourceLocation, SourcePath, SourceStore, digest_snapshot,
+    SourceLocation, SourcePath, SourceStore, WorktreeDeployRequest, digest_snapshot,
+    worktree_admin_id,
 };
 use crate::sync::state::{Ejection, FileStateStore, HookState, StateError, StateStore};
 
@@ -175,7 +176,7 @@ fn git_show_path(cwd: &Path, commit: &str, path: &str) -> Option<Vec<u8>> {
 
 struct SyncFixture {
     src: TempDir,
-    _git_dir: TempDir,
+    git_dir: TempDir,
     _state_dir: TempDir,
     backend: GitBackend,
     registry: FileStateStore,
@@ -245,7 +246,7 @@ fn build_sync_fixture() -> SyncFixture {
 
     SyncFixture {
         src,
-        _git_dir: git_dir,
+        git_dir,
         _state_dir: state_dir,
         backend,
         registry,
@@ -2563,7 +2564,8 @@ fn ejected_copy_to_link_mode_transition_is_a_silent_skip_never_redeploys() {
         !is_symlink(&dst) && dst.is_dir(),
         "premise: the ejected artifact is a real copy directory on disk"
     );
-    eject(&cfg, &registry, "editor", "editor-src", "dest").expect("eject the managed artifact");
+    eject(&cfg, &registry, "editor", "editor-src", "dest", &backend)
+        .expect("eject the managed artifact");
     let key = artifact_key("dest", "editor-src", "editor");
     let ejected = registry.ejections("dest").expect("load ejected");
     assert!(
@@ -2622,7 +2624,8 @@ fn frozen_lockless_ejected_mode_transition_is_write_free() {
         "init.lua",
         b"-- ejected, do not touch\n",
     );
-    eject(&cfg, &registry, "editor", "editor-src", "dest").expect("eject the managed artifact");
+    eject(&cfg, &registry, "editor", "editor-src", "dest", &backend)
+        .expect("eject the managed artifact");
 
     let out = sync(
         &frozen_lockless_input(&cfg, None, false),
@@ -3322,7 +3325,7 @@ fn second_deploy_over_correct_link_is_a_noop() {
         },
     )
     .expect("live reconcile pass succeeds");
-    let reconciliation = Reconciliation::new(&changeset, &observed, BTreeMap::new());
+    let reconciliation = Reconciliation::new(&changeset, &observed, &[], BTreeMap::new());
     let run = TargetRun {
         parsed: &parsed,
         target_name: "dest",
@@ -4733,7 +4736,7 @@ fn build_nested_artifact_repo() -> (TempDir, String) {
 }
 
 #[test]
-fn interactive_eject_persists_entry_keeps_record_and_files() {
+fn interactive_foreign_eject_persists_entry_keeps_files_without_a_record() {
     let (src, url) = build_nested_artifact_repo();
     let git_dir = TempDir::new().expect("git dir");
     let state_dir = TempDir::new().expect("state dir");
@@ -4752,6 +4755,9 @@ fn interactive_eject_persists_entry_keeps_record_and_files() {
     );
     let edited = b"-- locally edited\n";
     std::fs::write(dst.join("init.lua"), edited).expect("edit deployed file");
+    registry
+        .remove_artifact(&artifact_key("dest", "editor-src", "editor"))
+        .expect("remove managed record to make the existing content Foreign");
 
     let resolver = ScriptedResolver::new(Resolution::Eject);
     let out = sync(
@@ -4776,8 +4782,8 @@ fn interactive_eject_persists_entry_keeps_record_and_files() {
         registry
             .artifact(&artifact_key("dest", "editor-src", "editor"))
             .expect("registry get must not error")
-            .is_some(),
-        "Eject must keep the artifact's registry record so list/where render it as ejected"
+            .is_none(),
+        "Foreign Eject must persist without requiring or recreating a managed record"
     );
     assert_eq!(
         std::fs::read(dst.join("init.lua")).expect("read kept init.lua"),
@@ -5759,8 +5765,15 @@ fn eject_adds_ejected_entry_keeps_record_and_files() {
         "premise: the artifact must be MANAGED (record present) before eject"
     );
 
-    eject(&cfg, &fx.registry, "editor", "editor-src", "dest")
-        .expect("eject a managed artifact must succeed");
+    eject(
+        &cfg,
+        &fx.registry,
+        "editor",
+        "editor-src",
+        "dest",
+        &fx.backend,
+    )
+    .expect("eject a managed artifact must succeed");
 
     let ejected = fx.registry.ejections("dest").expect("load ejected");
     assert!(
@@ -5799,6 +5812,195 @@ fn eject_adds_ejected_entry_keeps_record_and_files() {
 }
 
 #[test]
+fn eject_detaches_history_overlay_from_the_recorded_mirror_before_persisting_ejection() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = eject_target_config(&td, &fx);
+    let project = TempDir::new().expect("project root");
+    let deploy = td.target_path().join("history");
+    std::fs::create_dir_all(deploy.join("editor")).expect("create history content directory");
+    std::fs::create_dir_all(deploy.join("docs")).expect("create history docs directory");
+    std::fs::write(deploy.join("editor/init.lua"), b"-- init\n").expect("write history init");
+    std::fs::write(deploy.join("editor/notes.bak"), b"scratch\n").expect("write history notes");
+    std::fs::write(deploy.join("docs/readme.md"), b"# docs\n").expect("write history docs");
+    seed_git_mirror(&fx.backend, "editor-src", &fx.url);
+    let resolved = resolve_git_source(
+        &fx.backend,
+        "editor-src",
+        &fx.url,
+        RevisionSpec::Commit(fx.head_sha.parse().expect("fixture commit")),
+        ResolvePolicy::CachedOnly,
+    );
+    let admin_id = worktree_admin_id(project.path(), &deploy, "dest", "editor-src")
+        .expect("derive persisted worktree id");
+    SourceStore::lock_worktree_mirror(&fx.backend, &sn("editor-src"), resolved.snapshot.mirror())
+        .expect("lock seeded mirror")
+        .publish_worktree(&WorktreeDeployRequest {
+            admin_id: admin_id.clone(),
+            deploy_root: deploy.clone(),
+            commit: fx.head_sha.parse().expect("fixture commit"),
+        })
+        .expect("publish overlay fixture");
+    let mirror = crate::source::mirror_path(fx.git_dir.path(), &fx.url);
+    let admin = mirror
+        .join("worktrees")
+        .join(format!("ph-{}", admin_id.as_str()));
+    let pin = mirror.join("refs/phora/worktrees").join(admin_id.as_str());
+    fx.registry
+        .put_artifact(&ArtifactRecord {
+            version: 1,
+            key: artifact_key("dest", "editor-src", "history"),
+            source: "editor-src".to_owned(),
+            commit: fx.head_sha.clone(),
+            digest: "fixture".to_owned(),
+            projected_at: "2026-08-31T00:00:00Z".to_owned(),
+            layout: "flat".to_owned(),
+            kind: RecordKind::Dir,
+            allow_symlinks: false,
+            preserve_executable: true,
+            files: vec![],
+            linked: false,
+            history: true,
+            worktree_admin_id: Some(admin_id.as_str().to_owned()),
+            mirror_key: Some(resolved.snapshot.mirror().as_str().to_owned()),
+            cache_git_root: Some(
+                fx.git_dir
+                    .path()
+                    .canonicalize()
+                    .expect("physical cache root")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            vars_digest: None,
+            deploy_root: None,
+            layout_separator: None,
+        })
+        .expect("persist history record");
+
+    eject(
+        &cfg,
+        &fx.registry,
+        "history",
+        "editor-src",
+        "dest",
+        &fx.backend,
+    )
+    .expect("eject managed history artifact");
+
+    assert!(
+        !deploy.join(".git").exists() && !admin.exists() && !pin.exists(),
+        "eject must detach gitlink, recorded-mirror administration, and pin before it persists Ejection"
+    );
+    assert!(
+        deploy.join("editor/init.lua").exists()
+            && fx
+                .registry
+                .ejections("dest")
+                .expect("load ejections")
+                .iter()
+                .any(|entry| entry.source == "editor-src" && entry.artifact == "history"),
+        "eject must retain content while recording the ejection"
+    );
+}
+
+#[test]
+fn history_off_reshape_applies_after_skip_and_retires_the_persisted_overlay() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let history = Config::parse(&format!(
+        "version = 1\n\n[sources.editor]\ngit = \"{}\"\nbranch = \"main\"\n\n[targets.dest]\npath = \"{}\"\nlayout = \"flat\"\nsources = {{ editor = {{ source = \"editor\", history = true }} }}\n",
+        fx.url,
+        td.target_path().display(),
+    ))
+    .expect("history config parses");
+    let ordinary = Config::parse(&format!(
+        "version = 1\n\n[sources.editor]\ngit = \"{}\"\nbranch = \"main\"\n\n[targets.dest]\npath = \"{}\"\nlayout = \"flat\"\nsources = [\"editor\"]\n",
+        fx.url,
+        td.target_path().display(),
+    ))
+    .expect("ordinary config parses");
+
+    let first = sync(
+        &input(&history, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("history sync deploys");
+    let old_root = td.target_path().join("editor");
+    let old_key = artifact_key("dest", "editor", "editor");
+    let old_record = fx
+        .registry
+        .artifact(&old_key)
+        .expect("read history record")
+        .expect("history sync writes record");
+    let admin = crate::source::mirror_path(fx.git_dir.path(), &fx.url)
+        .join("worktrees")
+        .join(format!(
+            "ph-{}",
+            old_record
+                .worktree_admin_id
+                .as_deref()
+                .expect("history record has admin id")
+        ));
+    let pin = crate::source::mirror_path(fx.git_dir.path(), &fx.url)
+        .join("refs/phora/worktrees")
+        .join(
+            old_record
+                .worktree_admin_id
+                .as_deref()
+                .expect("history record has admin id"),
+        );
+    std::fs::write(old_root.join("editor/init.lua"), b"-- modified\n")
+        .expect("modify history content");
+
+    let resolver = ScriptedResolver::new(Resolution::Skip);
+    sync(
+        &interactive_input(&ordinary, Some(first.base_lock.clone()), &resolver),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("ordinary sync may skip the modified history deployment");
+    assert!(
+        old_root.join(".git").exists()
+            && std::fs::read(old_root.join("editor/init.lua"))
+                .expect("read skipped modified content")
+                == b"-- modified\n"
+            && admin.exists()
+            && pin.exists()
+            && fx
+                .registry
+                .artifact(&old_key)
+                .expect("read skipped history record")
+                .is_some(),
+        "Skip must preserve the old overlay, content, and record"
+    );
+
+    let overwrite = ScriptedResolver::new(Resolution::Overwrite);
+    sync(
+        &interactive_input(&ordinary, Some(first.base_lock.clone()), &overwrite),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("conflict-resolved ordinary sync applies the reshape");
+    assert!(
+        !old_root.join(".git").exists()
+            && !admin.exists()
+            && !pin.exists()
+            && fx
+                .registry
+                .artifact(&old_key)
+                .expect("read reshaped record")
+                .is_some_and(|record| !record.history),
+        "an applied conflict overwrite replaces the WholeRoot record and retires its overlay administration"
+    );
+    assert!(
+        td.target_path().join("editor/init.lua").exists()
+            && td.target_path().join("docs/readme.md").exists(),
+        "ordinary projection deploys after the old WholeRoot content is retired"
+    );
+}
+
+#[test]
 fn eject_persists_entry_across_a_reopened_registry() {
     let state_dir = TempDir::new().expect("state dir");
     let fx = build_sync_fixture();
@@ -5807,7 +6009,7 @@ fn eject_persists_entry_across_a_reopened_registry() {
     let reg = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
     seed_managed_artifact(&td, &reg, "editor-src", "editor", "init.lua", b"-- init\n");
 
-    eject(&cfg, &reg, "editor", "editor-src", "dest").expect("eject must succeed");
+    eject(&cfg, &reg, "editor", "editor-src", "dest", &fx.backend).expect("eject must succeed");
 
     let reopened = FileStateStore::open(state_dir.path().to_path_buf()).expect("reopen registry");
     let ejected = reopened.ejections("dest").expect("load ejected reopened");
@@ -13054,7 +13256,7 @@ fn sealed_offer_ejecting_a_source_dropped_artifact_unblocks_sync() {
     let cfg = Config::parse(&toml).expect("default-offer config parses");
 
     seed_recorded_artifact(&registry, "editor-src", "editor");
-    crate::sync::eject(&cfg, &registry, "editor", "editor-src", "dest")
+    crate::sync::eject(&cfg, &registry, "editor", "editor-src", "dest", &backend)
         .expect("ejecting a managed record must succeed");
 
     let in_ = input(&cfg, None, None, None, false);
@@ -15588,7 +15790,7 @@ fn undecided_conflict_at_apply_errors_unresolved() {
     let observed = crate::sync::model::ObservedProjectState::<ArtifactRecord> {
         artifacts: Vec::new(),
     };
-    let reconciliation = Reconciliation::new(&changeset, &observed, BTreeMap::new());
+    let reconciliation = Reconciliation::new(&changeset, &observed, &[], BTreeMap::new());
 
     let journal = Journal::open(&fx.registry.journal_root()).expect("open journal");
     let protected = test_protected(fx.src.path());

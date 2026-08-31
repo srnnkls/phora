@@ -152,22 +152,22 @@ impl WorktreeMirrorGuard {
 
     pub fn publish_worktree(&self, request: &WorktreeDeployRequest) -> Result<WorktreeDeployment> {
         Self::sweep_gitlink_staging(&request.deploy_root)?;
-        self.publish_worktree_after_sweep(request).map_err(
-            |error| match Self::sweep_gitlink_staging(&request.deploy_root) {
-                Ok(()) => error,
-                Err(cleanup) => SourceError::Source(format!(
-                    "{error}; clean staged worktree gitlinks: {cleanup}"
-                )),
-            },
-        )
+        self.publish_worktree_unchecked(request)
+            .map_err(
+                |error| match Self::sweep_gitlink_staging(&request.deploy_root) {
+                    Ok(()) => error,
+                    Err(cleanup) => SourceError::Source(format!(
+                        "{error}; clean staged worktree gitlinks: {cleanup}"
+                    )),
+                },
+            )
     }
 
-    fn publish_worktree_after_sweep(
+    fn publish_worktree_unchecked(
         &self,
         request: &WorktreeDeployRequest,
     ) -> Result<WorktreeDeployment> {
-        let mirror =
-            super::cache::mirror_path_for_key(&self.address.cache_git_root, &self.address.key);
+        let mirror = verified_mirror_root(&self.address)?;
         let worktrees = mirror.join("worktrees");
         std::fs::create_dir_all(&worktrees).map_err(|error| {
             SourceError::Source(format!("create worktree administration root: {error}"))
@@ -178,9 +178,16 @@ impl WorktreeMirrorGuard {
 
         let admin_name = format!("ph-{}", request.admin_id.as_str());
         let admin_dir = worktrees.join(&admin_name);
+        let physical_gitlink = canonical_gitlink_path(&request.deploy_root)?;
         let staging = create_transient_dir(&mirror, &admin_name, "staging")?;
         self.create_gitlink_directories(&request.deploy_root, &request.commit)?;
-        self.write_admin(&staging, &admin_dir, &request.deploy_root, &request.commit)?;
+        self.write_admin(
+            &staging,
+            &admin_dir,
+            &request.deploy_root,
+            &physical_gitlink,
+            &request.commit,
+        )?;
         let gitlink = create_gitlink_staging(&request.deploy_root, &admin_dir)?;
 
         let backup = if path_exists(&admin_dir, "inspect worktree administration")? {
@@ -225,10 +232,10 @@ impl WorktreeMirrorGuard {
         staging: &Path,
         admin_dir: &Path,
         deploy_root: &Path,
+        gitlink: &Path,
         commit: &Commit,
     ) -> Result<()> {
         self.write_index(staging, admin_dir, deploy_root, commit)?;
-        let gitlink = deploy_root.join(".git");
         for (path, contents) in [
             (staging.join("HEAD"), format!("{}\n", commit.as_str())),
             (staging.join("commondir"), "../..\n".to_owned()),
@@ -341,15 +348,11 @@ impl WorktreeMirrorGuard {
     }
 
     pub fn remove_worktree(&self, request: &WorktreeRemoveRequest) -> Result<()> {
-        let mirror =
-            super::cache::mirror_path_for_key(&self.address.cache_git_root, &self.address.key);
+        let mirror = verified_mirror_root(&self.address)?;
+        remove_worktree_gitlink(&self.address, &request.admin_id, &request.deploy_root)?;
         let admin_dir = mirror
             .join("worktrees")
             .join(format!("ph-{}", request.admin_id.as_str()));
-        let gitlink = request.deploy_root.join(".git");
-        if gitlink_targets(&gitlink, &admin_dir)? {
-            remove_file_if_exists(&gitlink, "remove worktree gitlink")?;
-        }
         remove_dir_if_exists(&admin_dir, "remove worktree administration")?;
         let pin = mirror
             .join("refs/phora/worktrees")
@@ -359,40 +362,10 @@ impl WorktreeMirrorGuard {
     }
 
     pub fn sweep_worktrees(&self) -> Result<()> {
-        let mirror =
-            super::cache::mirror_path_for_key(&self.address.cache_git_root, &self.address.key);
-        let entries = match std::fs::read_dir(&mirror) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
-            Err(error) => {
-                return Err(SourceError::Source(format!(
-                    "read transient worktree administration: {error}"
-                )));
-            }
-        };
-        for entry in entries {
-            let entry = entry.map_err(|error| {
-                SourceError::Source(format!(
-                    "read transient worktree administration entry: {error}"
-                ))
-            })?;
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let Some((admin_name, kind)) = transient_name(&name) else {
-                continue;
-            };
-            let final_admin = mirror.join("worktrees").join(admin_name);
-            if kind == "backup" && !path_exists(&final_admin, "inspect worktree administration")? {
-                std::fs::rename(entry.path(), final_admin).map_err(|error| {
-                    SourceError::Source(format!("restore worktree administration backup: {error}"))
-                })?;
-            } else {
-                std::fs::remove_dir_all(entry.path()).map_err(|error| {
-                    SourceError::Source(format!("sweep transient worktree administration: {error}"))
-                })?;
-            }
-        }
-        Ok(())
+        let mirror = verified_mirror_root(&self.address)?;
+        let worktrees = mirror.join("worktrees");
+        sweep_stale_worktrees(&mirror, &worktrees)?;
+        sweep_transient_worktrees(&mirror)
     }
 
     fn sweep_gitlink_staging(deploy_root: &Path) -> Result<()> {
@@ -415,6 +388,397 @@ impl WorktreeMirrorGuard {
         }
         Ok(())
     }
+}
+
+pub(crate) fn remove_missing_mirror_worktree_gitlink(
+    address: &WorktreeMirrorAddress,
+    admin_id: &WorktreeAdminId,
+    deploy_root: &Path,
+) -> Result<bool> {
+    let Some(cache_root) = physical_cache_git_root(&address.cache_git_root)? else {
+        remove_worktree_gitlink(address, admin_id, deploy_root)?;
+        return Ok(true);
+    };
+    let mirror = super::cache::mirror_path_for_key(&cache_root, &address.key);
+    match std::fs::symlink_metadata(&mirror) {
+        Ok(_) => Ok(false),
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            remove_worktree_gitlink(address, admin_id, deploy_root)?;
+            Ok(true)
+        }
+        Err(error) => Err(SourceError::Source(format!(
+            "inspect worktree mirror {}: {error}",
+            mirror.display()
+        ))),
+    }
+}
+
+pub(crate) fn verified_cache_git_root(cache_root: &Path) -> Result<PathBuf> {
+    physical_cache_git_root(cache_root)?.ok_or_else(|| {
+        SourceError::Source(format!(
+            "worktree cache root {} is absent",
+            cache_root.display()
+        ))
+    })
+}
+
+pub(crate) fn physical_cache_git_root(cache_root: &Path) -> Result<Option<PathBuf>> {
+    if !cache_root.is_absolute() {
+        return Err(SourceError::Source(format!(
+            "worktree cache root must be absolute: {}",
+            cache_root.display()
+        )));
+    }
+    if cache_root.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::CurDir
+                | std::path::Component::ParentDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return Err(SourceError::Source(format!(
+            "worktree cache root {} has a non-normal component",
+            cache_root.display()
+        )));
+    }
+    let metadata = match std::fs::symlink_metadata(cache_root) {
+        Ok(metadata) => metadata,
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(SourceError::Source(format!(
+                "inspect worktree cache root {}: {error}",
+                cache_root.display()
+            )));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(SourceError::Source(format!(
+            "worktree cache root {} is not a directory without symlinks",
+            cache_root.display()
+        )));
+    }
+    let physical = cache_root.canonicalize().map_err(|error| {
+        SourceError::Source(format!(
+            "canonicalize worktree cache root {}: {error}",
+            cache_root.display()
+        ))
+    })?;
+    Ok(Some(physical))
+}
+
+fn verified_mirror_root(address: &WorktreeMirrorAddress) -> Result<PathBuf> {
+    let cache_root = verified_cache_git_root(&address.cache_git_root)?;
+    let mirror = super::cache::mirror_path_for_key(&cache_root, &address.key);
+    if !real_directory(&mirror, "inspect worktree mirror")? {
+        return Err(SourceError::Source(format!(
+            "inspect worktree mirror {}: path is not a directory without symlinks",
+            mirror.display()
+        )));
+    }
+    Ok(mirror)
+}
+
+pub(crate) fn physical_gitlink_path(deploy_root: &Path) -> Result<Option<PathBuf>> {
+    match deploy_root.canonicalize() {
+        Ok(root) => Ok(Some(root.join(".git"))),
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            Ok(None)
+        }
+        Err(error) => Err(SourceError::Source(format!(
+            "canonicalize worktree deployment root {}: {error}",
+            deploy_root.display()
+        ))),
+    }
+}
+
+fn canonical_gitlink_path(deploy_root: &Path) -> Result<PathBuf> {
+    physical_gitlink_path(deploy_root)?.ok_or_else(|| {
+        SourceError::Source(format!(
+            "worktree deployment root {} is absent",
+            deploy_root.display()
+        ))
+    })
+}
+
+fn remove_worktree_gitlink(
+    address: &WorktreeMirrorAddress,
+    admin_id: &WorktreeAdminId,
+    deploy_root: &Path,
+) -> Result<()> {
+    let _ = physical_cache_git_root(&address.cache_git_root)?;
+    let admin_dir = super::cache::mirror_path_for_key(&address.cache_git_root, &address.key)
+        .join("worktrees")
+        .join(format!("ph-{}", admin_id.as_str()));
+    let Some(gitlink) = physical_gitlink_path(deploy_root)? else {
+        return Ok(());
+    };
+    if gitlink_targets(&gitlink, &admin_dir)? {
+        remove_file_if_exists(&gitlink, "remove worktree gitlink")?;
+    }
+    Ok(())
+}
+
+pub(super) fn sweep_stale_worktrees(mirror: &Path, worktrees: &Path) -> Result<()> {
+    let Some(entries) = read_directory_no_follow(worktrees, "read worktree administration root")?
+    else {
+        return Ok(());
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            SourceError::Source(format!("read worktree administration entry: {error}"))
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(id) = admin_id_from_name(name) else {
+            continue;
+        };
+        let admin = worktrees.join(name);
+        if !administration_is_live(&admin)? {
+            remove_swept_worktree(mirror, &admin, &id)?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn sweep_transient_worktrees(mirror: &Path) -> Result<()> {
+    let Some(entries) = read_directory_no_follow(mirror, "read transient worktree administration")?
+    else {
+        return Ok(());
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            SourceError::Source(format!(
+                "read transient worktree administration entry: {error}"
+            ))
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some((_admin_name, _kind)) = transient_name(name) else {
+            continue;
+        };
+        let transient = entry.path();
+        remove_path_if_exists(&transient, "sweep transient worktree administration")?;
+    }
+    Ok(())
+}
+
+fn administration_is_live(admin: &Path) -> Result<bool> {
+    if !real_directory(admin, "inspect worktree administration")? {
+        return Ok(false);
+    }
+    let Some(gitlink) = read_admin_gitdir(admin)? else {
+        return Ok(false);
+    };
+    if !physical_regular_file(&gitlink, "inspect worktree gitlink")? {
+        return Ok(false);
+    }
+    let Some(back_pointer) = read_gitlink_back_pointer(&gitlink)? else {
+        return Ok(false);
+    };
+    Ok(back_pointer == admin)
+}
+
+fn read_admin_gitdir(admin: &Path) -> Result<Option<PathBuf>> {
+    let Some(value) =
+        read_regular_text_no_follow(&admin.join("gitdir"), "read worktree administration gitdir")?
+    else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(value.trim());
+    if path.is_absolute()
+        && path.file_name().is_some_and(|name| name == ".git")
+        && !path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        Ok(Some(path))
+    } else {
+        Ok(None)
+    }
+}
+
+fn read_gitlink_back_pointer(gitlink: &Path) -> Result<Option<PathBuf>> {
+    let Some(value) = read_regular_text_no_follow(gitlink, "read worktree gitlink")? else {
+        return Ok(None);
+    };
+    let Some(path) = value.trim().strip_prefix("gitdir: ") else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(path);
+    if path.is_absolute()
+        && !path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        Ok(Some(path))
+    } else {
+        Ok(None)
+    }
+}
+
+fn remove_swept_worktree(mirror: &Path, admin: &Path, id: &WorktreeAdminId) -> Result<()> {
+    remove_path_if_exists(admin, "remove stale worktree administration")?;
+    let pin = mirror.join("refs/phora/worktrees").join(id.as_str());
+    if physical_path_within(mirror, &pin)? {
+        remove_path_if_exists(&pin, "remove stale worktree pin ref")?;
+    }
+    Ok(())
+}
+
+fn read_directory_no_follow(path: &Path, action: &str) -> Result<Option<std::fs::ReadDir>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            std::fs::read_dir(path).map(Some).map_err(|error| {
+                SourceError::Source(format!("{action} {}: {error}", path.display()))
+            })
+        }
+        Ok(_) => Err(SourceError::Source(format!(
+            "{action} {}: path is not a directory without symlinks",
+            path.display()
+        ))),
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            Ok(None)
+        }
+        Err(error) => Err(SourceError::Source(format!(
+            "{action} {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn real_directory(path: &Path, action: &str) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.is_dir() && !metadata.file_type().is_symlink()),
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            Ok(false)
+        }
+        Err(error) => Err(SourceError::Source(format!(
+            "{action} {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn physical_regular_file(path: &Path, action: &str) -> Result<bool> {
+    if !path.is_absolute() {
+        return Ok(false);
+    }
+    let mut physical = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir | std::path::Component::ParentDir => return Ok(false),
+            _ => physical.push(component.as_os_str()),
+        }
+        let metadata = match std::fs::symlink_metadata(&physical) {
+            Ok(metadata) => metadata,
+            Err(error)
+                if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => {
+                return Err(SourceError::Source(format!(
+                    "{action} {}: {error}",
+                    physical.display()
+                )));
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            return Ok(false);
+        }
+        if physical != path && !metadata.is_dir() {
+            return Ok(false);
+        }
+        if physical == path && !metadata.is_file() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn physical_path_within(root: &Path, path: &Path) -> Result<bool> {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return Ok(false);
+    };
+    if !real_directory(root, "inspect mirror root")? {
+        return Ok(false);
+    }
+    let mut physical = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Ok(false);
+        };
+        physical.push(component);
+        match std::fs::symlink_metadata(&physical) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(false),
+            Ok(metadata) if physical != path && !metadata.is_dir() => return Ok(false),
+            Ok(_) => {}
+            Err(error)
+                if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => {
+                return Err(SourceError::Source(format!(
+                    "inspect mirror path {}: {error}",
+                    physical.display()
+                )));
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn read_regular_text_no_follow(path: &Path, action: &str) -> Result<Option<String>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            match std::fs::read_to_string(path) {
+                Ok(value) => Ok(Some(value)),
+                Err(error) if error.kind() == ErrorKind::InvalidData => Ok(None),
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) =>
+                {
+                    Ok(None)
+                }
+                Err(error) => Err(SourceError::Source(format!(
+                    "{action} {}: {error}",
+                    path.display()
+                ))),
+            }
+        }
+        Ok(_) => Ok(None),
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            Ok(None)
+        }
+        Err(error) => Err(SourceError::Source(format!(
+            "{action} {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn remove_path_if_exists(path: &Path, action: &str) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            std::fs::remove_dir_all(path)
+                .map_err(|error| SourceError::Source(format!("{action}: {error}")))
+        }
+        Ok(_) => std::fs::remove_file(path)
+            .map_err(|error| SourceError::Source(format!("{action}: {error}"))),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(SourceError::Source(format!("{action}: {error}"))),
+    }
+}
+
+fn admin_id_from_name(name: &str) -> Option<WorktreeAdminId> {
+    name.strip_prefix("ph-")?.parse().ok()
 }
 
 fn create_transient_dir(mirror: &Path, admin_name: &str, kind: &str) -> Result<PathBuf> {
@@ -540,7 +904,11 @@ fn gitlink_targets(gitlink: &Path, admin: &Path) -> Result<bool> {
     let Some(target) = contents.trim().strip_prefix("gitdir: ") else {
         return Ok(false);
     };
-    let target = match std::fs::canonicalize(target) {
+    let target_path = Path::new(target);
+    if target_path == admin {
+        return Ok(true);
+    }
+    let target = match std::fs::canonicalize(target_path) {
         Ok(target) => target,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
         Err(error) => {
@@ -569,9 +937,13 @@ fn transient_name(name: &str) -> Option<(&str, &str)> {
     let id = admin.strip_prefix("ph-")?;
     id.parse::<WorktreeAdminId>().ok()?;
     for kind in ["staging", "backup"] {
-        if suffix.starts_with(&format!("{kind}-")) {
-            return Some((admin, kind));
-        }
+        let Some(nonce) = suffix.strip_prefix(&format!("{kind}-")) else {
+            continue;
+        };
+        let (process, counter) = nonce.split_once('-')?;
+        process.parse::<u32>().ok()?;
+        counter.parse::<u64>().ok()?;
+        return Some((admin, kind));
     }
     None
 }

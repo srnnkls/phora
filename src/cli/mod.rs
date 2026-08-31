@@ -371,7 +371,11 @@ pub fn run_with_outcome(cli: Cli) -> Result<CliOutcome> {
             let config = load_config()?;
             let registry = open_project_registry(&config)?;
             let _guard = registry.acquire_lock()?;
-            crate::sync::eject(&config, &registry, &artifact, &source, &target)?;
+            let cwd = std::env::current_dir()?;
+            let cache_git =
+                crate::paths::cache_root_for(config.paths.cache.as_deref(), &cwd)?.join("git");
+            let backend = GitBackend::new(cache_git);
+            crate::sync::eject(&config, &registry, &artifact, &source, &target, &backend)?;
             println!("ejected {source}/{artifact} from {target} (files kept)");
             Ok(CliOutcome::Success)
         }

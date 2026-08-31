@@ -88,6 +88,48 @@ where
     })
 }
 
+pub(super) fn observe_history_retirements<R>(
+    ctx: &DeployAll<'_, R>,
+) -> Result<Vec<ObservedEntry<ArtifactRecord>>>
+where
+    R: StateStore,
+{
+    let mut retirements = Vec::new();
+    for record in ctx.registry.all_artifacts()? {
+        if !record.history {
+            continue;
+        }
+        let Some(target) = ctx.config.targets.get(&record.key.target) else {
+            continue;
+        };
+        let Some(binding) = target
+            .resolve_sources(ctx.parsed)
+            .into_iter()
+            .find(|binding| binding.identity == record.key.source && !binding.history)
+        else {
+            continue;
+        };
+        let path = super::prune::removal_destination(target, &record);
+        let ejected = ctx.registry.ejections(&record.key.target)?;
+        let observation = inspect(
+            &path,
+            binding.identity,
+            &record.commit,
+            &ejected,
+            ctx.registry,
+            &record.key,
+            None,
+        )?;
+        retirements.push(ObservedEntry {
+            target: record.key.target.clone(),
+            source: record.key.source.clone(),
+            artifact: record.key.artifact.clone(),
+            observation,
+        });
+    }
+    Ok(retirements)
+}
+
 fn registry_only_records(
     remove_orphans: bool,
     list_all: impl FnOnce() -> Result<Vec<ArtifactRecord>>,

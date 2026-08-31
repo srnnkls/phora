@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::projection::model::Projection;
 use crate::sync::model::{
-    ChangeSet, ConflictKind, ManagedCondition, ObservedArtifact, ObservedEntry,
+    ChangeSet, ConflictKind, ManagedArtifact, ManagedCondition, ObservedArtifact, ObservedEntry,
     ObservedProjectState, ReconciliationPolicy, RemovalReason, SyncChange, SyncError,
 };
 
@@ -50,6 +50,42 @@ pub fn reconcile<R>(
     }
 
     Ok(ChangeSet { changes })
+}
+
+pub(super) fn add_history_retirement_conflicts<R>(
+    changeset: &mut ChangeSet,
+    retirements: &[ObservedEntry<R>],
+    policy: ReconciliationPolicy,
+) {
+    if policy.force {
+        return;
+    }
+    for entry in retirements {
+        let Some(kind) = retirement_conflict(&entry.observation) else {
+            continue;
+        };
+        changeset.changes.push(SyncChange::Conflict {
+            target: entry.target.clone(),
+            source: entry.source.clone(),
+            artifact: entry.artifact.clone(),
+            kind,
+        });
+    }
+}
+
+fn retirement_conflict<R>(observation: &ObservedArtifact<R>) -> Option<ConflictKind> {
+    match observation {
+        ObservedArtifact::Managed(ManagedArtifact {
+            condition: ManagedCondition::Modified { changed },
+            ..
+        }) => Some(ConflictKind::Modified {
+            changed: changed.clone(),
+        }),
+        ObservedArtifact::Foreign(_) => Some(ConflictKind::Foreign),
+        ObservedArtifact::Missing | ObservedArtifact::Ejected | ObservedArtifact::Managed(_) => {
+            None
+        }
+    }
 }
 
 fn classify_desired<R>(

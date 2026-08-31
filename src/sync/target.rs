@@ -20,11 +20,14 @@ use super::journal::Journal;
 use super::resolve::ResolvedSourceMap;
 use super::stage::{StageRequest, stage_artifact};
 use super::{
-    Conflict, ConflictResolver, Resolution, StagingGuard, nonce, remote_for, target_parent,
+    Conflict, ConflictResolver, Resolution, StagingGuard, nonce, remote_for, remove_orphan_path,
+    target_parent,
 };
 use crate::projection::diagnostic::ProjectionWarning;
 use crate::projection::model::{ProjectedArtifact, TargetProjection};
-use crate::sync::model::{ChangeSet, ConflictKind, ManagedCondition, ObservedArtifact, SyncChange};
+use crate::sync::model::{
+    ChangeSet, ConflictKind, ManagedCondition, ObservedArtifact, RemovalReason, SyncChange,
+};
 use crate::sync::request::SyncEvents;
 use crate::sync::{AppliedChange, SkippedChange, SyncWarning};
 
@@ -80,6 +83,7 @@ pub(super) type ObservationIndex<'a> =
 
 pub(super) struct Reconciliation<'a> {
     observed: ObservationIndex<'a>,
+    history_retirements: BTreeMap<(String, String), &'a ObservedArtifact<ArtifactRecord>>,
     changes: ChangeIndex<'a>,
     decisions: ConflictDecisions,
 }
@@ -88,6 +92,7 @@ impl<'a> Reconciliation<'a> {
     pub(super) fn new(
         changeset: &'a ChangeSet,
         observed: &'a super::model::ObservedProjectState<ArtifactRecord>,
+        history_retirements: &'a [super::model::ObservedEntry<ArtifactRecord>],
         decisions: ConflictDecisions,
     ) -> Self {
         Self {
@@ -105,6 +110,15 @@ impl<'a> Reconciliation<'a> {
                     )
                 })
                 .collect(),
+            history_retirements: history_retirements
+                .iter()
+                .map(|entry| {
+                    (
+                        (entry.target.clone(), entry.source.clone()),
+                        &entry.observation,
+                    )
+                })
+                .collect(),
             changes: changeset
                 .changes
                 .iter()
@@ -112,6 +126,26 @@ impl<'a> Reconciliation<'a> {
                 .collect(),
             decisions,
         }
+    }
+
+    fn history_retirement(
+        &self,
+        target: &str,
+        source: &str,
+    ) -> Option<(&ObservedArtifact<ArtifactRecord>, Option<&ConflictOutcome>)> {
+        let observation = self
+            .history_retirements
+            .get(&(target.to_owned(), source.to_owned()))?;
+        let artifact = match observation {
+            ObservedArtifact::Managed(managed) => &managed.record.key.artifact,
+            ObservedArtifact::Ejected
+            | ObservedArtifact::Missing
+            | ObservedArtifact::Foreign(_) => {
+                return Some((observation, None));
+            }
+        };
+        let key = (target.to_owned(), source.to_owned(), artifact.clone());
+        Some((observation, self.decisions.get(&key)))
     }
 }
 
@@ -325,11 +359,19 @@ pub(super) fn deploy_reconciled_target_report(
     journal: &Journal,
     events: &mut SyncEvents,
 ) -> Result<bool> {
-    for binding in &projection.bindings {
-        collect_projection_warnings(&binding.warnings, events);
-    }
-    walk_projection_target(run, projection, registry, false, |run, entry| {
-        apply_reconciled(
+    let protected_bindings =
+        protect_history_retirements(run, projection, reconciliation, backend, registry, events)?;
+    let live_destinations = live_destinations(run, projection)?;
+
+    let mut failed_bindings = BTreeSet::new();
+    let mut replaced_bindings = BTreeSet::new();
+    let had_failures = walk_projection_target(run, projection, registry, false, |run, entry| {
+        if protected_bindings.contains(entry.identity) {
+            return Ok(false);
+        }
+        let triplet = conflict_triplet(run, entry);
+        let change = reconciliation.changes.get(&triplet).copied();
+        let failed = apply_reconciled(
             run,
             entry,
             projection,
@@ -338,8 +380,137 @@ pub(super) fn deploy_reconciled_target_report(
             registry,
             journal,
             events,
+        )?;
+        if failed {
+            failed_bindings.insert(entry.identity.to_owned());
+        } else if applied_replacement(change, reconciliation.decisions.get(&triplet)) {
+            replaced_bindings.insert(entry.identity.to_owned());
+        }
+        Ok(failed)
+    })?;
+
+    for binding in &projection.bindings {
+        if protected_bindings.contains(&binding.identity)
+            || failed_bindings.contains(&binding.identity)
+            || !replaced_bindings.contains(&binding.identity)
+        {
+            continue;
+        }
+        let Some((ObservedArtifact::Managed(managed), _)) =
+            reconciliation.history_retirement(run.target_name, &binding.identity)
+        else {
+            continue;
+        };
+        retire_history_deployment(
+            backend,
+            registry,
+            run.target,
+            run.protected,
+            &live_destinations,
+            &managed.record,
+            events,
+        )?;
+    }
+    Ok(had_failures)
+}
+
+fn applied_replacement(change: Option<&SyncChange>, outcome: Option<&ConflictOutcome>) -> bool {
+    matches!(
+        change,
+        Some(SyncChange::Deploy { .. } | SyncChange::Overwrite { .. })
+    ) || matches!(
+        (change, outcome),
+        (
+            Some(SyncChange::Conflict { .. }),
+            Some(ConflictOutcome {
+                resolution: Resolution::Overwrite,
+                ..
+            })
         )
-    })
+    )
+}
+
+fn protect_history_retirements(
+    run: TargetRun<'_>,
+    projection: &TargetProjection,
+    reconciliation: &Reconciliation<'_>,
+    backend: &dyn SourceStore,
+    registry: &dyn StateStore,
+    events: &mut SyncEvents,
+) -> Result<BTreeSet<String>> {
+    let mut protected_bindings = BTreeSet::new();
+    for binding in &projection.bindings {
+        collect_projection_warnings(&binding.warnings, events);
+        let Some((observation, decision)) =
+            reconciliation.history_retirement(run.target_name, &binding.identity)
+        else {
+            continue;
+        };
+        match (observation, decision) {
+            (ObservedArtifact::Ejected, _) => {
+                events.skipped.push(SkippedChange::Conflict {
+                    target: run.target_name.to_owned(),
+                    source: binding.identity.clone(),
+                    artifact: binding.identity.clone(),
+                    kind: ConflictKind::Foreign,
+                });
+                protected_bindings.insert(binding.identity.clone());
+            }
+            (ObservedArtifact::Managed(managed), Some(outcome))
+                if matches!(outcome.resolution, Resolution::Skip | Resolution::Eject) =>
+            {
+                let deploy_root = super::prune::removal_destination(run.target, &managed.record);
+                let old_path =
+                    super::prune::removal_path(run.target, &managed.record, run.protected)?;
+                if outcome.warn {
+                    collect_conflict_warning(
+                        &binding.identity,
+                        &managed.record.key.artifact,
+                        &outcome.kind,
+                        &old_path,
+                        events,
+                    );
+                }
+                match outcome.resolution {
+                    Resolution::Skip => events.skipped.push(SkippedChange::Conflict {
+                        target: run.target_name.to_owned(),
+                        source: binding.identity.clone(),
+                        artifact: managed.record.key.artifact.clone(),
+                        kind: outcome.kind.clone(),
+                    }),
+                    Resolution::Eject => {
+                        super::eject_artifact(
+                            &managed.record.key,
+                            Some(&managed.record),
+                            &deploy_root,
+                            backend,
+                            registry,
+                        )?;
+                        events.applied.push(AppliedChange::Ejected {
+                            target: run.target_name.to_owned(),
+                            source: binding.identity.clone(),
+                            artifact: managed.record.key.artifact.clone(),
+                        });
+                    }
+                    Resolution::Overwrite | Resolution::Abort => {
+                        unreachable!("protected retirement")
+                    }
+                }
+                protected_bindings.insert(binding.identity.clone());
+            }
+            _ => {}
+        }
+    }
+    Ok(protected_bindings)
+}
+
+fn live_destinations(run: TargetRun<'_>, projection: &TargetProjection) -> Result<Vec<PathBuf>> {
+    projection
+        .bindings
+        .iter()
+        .flat_map(|binding| binding.artifacts.iter())
+        .map(|item| run.confined(&run.target.expanded_path().join(item.destination.as_str())))
+        .collect()
 }
 
 #[expect(
@@ -474,7 +645,9 @@ fn apply_reconciled(
                     key,
                     run,
                     entry,
+                    reconciliation,
                     &published_key,
+                    backend,
                     registry,
                     &outcome.kind,
                     events,
@@ -561,7 +734,9 @@ fn apply_resolution(
     key: ArtifactKey,
     run: &TargetRun<'_>,
     entry: &ArtifactEntry<'_>,
+    reconciliation: &Reconciliation<'_>,
     published_key: &str,
+    backend: &dyn SourceStore,
     registry: &dyn StateStore,
     kind: &ConflictKind,
     events: &mut SyncEvents,
@@ -593,13 +768,25 @@ fn apply_resolution(
             ))
         }
         Resolution::Eject => {
-            let mut ejected = registry.ejections(run.target_name)?;
-            ejected.push(Ejection {
-                source: entry.identity.to_owned(),
-                artifact: published_key.to_owned(),
-                ejected_at: chrono::Utc::now().to_rfc3339(),
-            });
-            registry.save_ejections(run.target_name, &ejected)?;
+            let observation_key = (key.target.clone(), key.source.clone(), key.artifact.clone());
+            let record = reconciliation
+                .observed
+                .get(&observation_key)
+                .and_then(|observation| match observation {
+                    ObservedArtifact::Managed(managed) => Some(&managed.record),
+                    ObservedArtifact::Foreign(_)
+                    | ObservedArtifact::Missing
+                    | ObservedArtifact::Ejected => None,
+                });
+            let deploy_root =
+                record.map(|record| super::prune::removal_destination(run.target, record));
+            super::eject_artifact(
+                &key,
+                record,
+                deploy_root.as_deref().unwrap_or(entry.artifact_dst),
+                backend,
+                registry,
+            )?;
             events.applied.push(AppliedChange::Ejected {
                 target: run.target_name.to_owned(),
                 source: entry.identity.to_owned(),
@@ -918,20 +1105,37 @@ fn staging_path(staging_base: &Path, artifact: &str) -> PathBuf {
     staging_base.join(format!("{artifact_label}-{}", nonce()))
 }
 
-fn deploy_one(
+fn retire_history_deployment(
     backend: &dyn SourceStore,
     registry: &dyn StateStore,
-    journal: &Journal,
-    ctx: DeployContext<'_>,
+    target: &Target,
+    protected: &ProtectedPathSet,
+    live_destinations: &[PathBuf],
+    record: &ArtifactRecord,
+    events: &mut SyncEvents,
 ) -> Result<()> {
-    let staging_base = target_parent(ctx.artifact_dst).join(".phora-stage");
-    let staging = staging_path(&staging_base, &ctx.key.artifact);
-    let mut staging_guard = StagingGuard::new(&staging_base, &staging);
-    let whole_root = matches!(
-        &ctx.artifact.materialization,
-        Materialization::WholeRoot { .. }
-    );
-    let policy = ctx.source.export_policy(whole_root);
+    let replaced = registry
+        .artifact(&record.key)?
+        .is_some_and(|current| !current.history);
+    let path = super::prune::removal_path(target, record, protected)?;
+    super::detach_history_overlay(record, &path, backend)?;
+    if !replaced {
+        if !super::prune::contains_live_destination(&path, live_destinations) {
+            remove_orphan_path(&path)
+                .map_err(|error| Error::Sync(format!("retire {}: {error}", path.display())))?;
+        }
+        registry.remove_artifact(&record.key)?;
+        events.applied.push(AppliedChange::Removed {
+            target: record.key.target.clone(),
+            source: record.key.source.clone(),
+            artifact: record.key.artifact.clone(),
+            reason: RemovalReason::Pruned,
+        });
+    }
+    Ok(())
+}
+
+fn reject_history_git_entry(ctx: &DeployContext<'_>, whole_root: bool) -> Result<()> {
     if whole_root
         && ctx
             .artifact
@@ -944,6 +1148,24 @@ fn deploy_one(
             ctx.underlying_source
         )));
     }
+    Ok(())
+}
+
+fn deploy_one(
+    backend: &dyn SourceStore,
+    registry: &dyn StateStore,
+    journal: &Journal,
+    ctx: DeployContext<'_>,
+) -> Result<()> {
+    let whole_root = matches!(
+        &ctx.artifact.materialization,
+        Materialization::WholeRoot { .. }
+    );
+    reject_history_git_entry(&ctx, whole_root)?;
+    let staging_base = target_parent(ctx.artifact_dst).join(".phora-stage");
+    let staging = staging_path(&staging_base, &ctx.key.artifact);
+    let mut staging_guard = StagingGuard::new(&staging_base, &staging);
+    let policy = ctx.source.export_policy(whole_root);
 
     let staging_payload = match &ctx.artifact.materialization {
         Materialization::CollapsedDir { .. } | Materialization::WholeRoot { .. } => staging.clone(),
