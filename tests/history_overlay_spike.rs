@@ -288,6 +288,49 @@ fn sync_options() -> SyncOptions {
     }
 }
 
+fn sync_history(
+    config: &Config,
+    registry: &FileStateStore,
+    backend: &GitBackend,
+    options: SyncOptions,
+) {
+    phora::sync::sync(
+        &SyncRequest {
+            base_config: config,
+            local_config: None,
+            locks: LockSet::default(),
+            options,
+            resolver: None,
+        },
+        backend,
+        registry,
+    )
+    .expect("history sync succeeds");
+}
+
+fn assert_legacy_record_defaults() {
+    let legacy: ArtifactRecord = toml::from_str(
+        "version = 1\n\
+         key = { target = \"home\", source = \"ordinary\", artifact = \"artifact\" }\n\
+         source = \"ordinary\"\n\
+         commit = \"abc\"\n\
+         digest = \"blake3:abc\"\n\
+         projected_at = \"2026-01-01T00:00:00Z\"\n\
+         layout = \"flat\"\n\
+         allow_symlinks = false\n\
+         preserve_executable = true\n\
+         files = []\n",
+    )
+    .expect("legacy record deserializes");
+    assert!(
+        !legacy.history
+            && legacy.worktree_admin_id.is_none()
+            && legacy.mirror_key.is_none()
+            && legacy.cache_git_root.is_none(),
+        "legacy and ordinary records leave the history address absent"
+    );
+}
+
 #[test]
 fn history_whole_root_sync_publishes_the_overlay_and_complete_record_address() {
     let fixture = TempDir::new().expect("fixture tempdir");
@@ -309,18 +352,7 @@ fn history_whole_root_sync_publishes_the_overlay_and_complete_record_address() {
     let registry = FileStateStore::open(fixture.path().join("state")).expect("open registry");
     let backend = GitBackend::new(fixture.path().join("cache"));
 
-    phora::sync::sync(
-        &SyncRequest {
-            base_config: &config,
-            local_config: None,
-            locks: LockSet::default(),
-            options: sync_options(),
-            resolver: None,
-        },
-        &backend,
-        &registry,
-    )
-    .expect("history sync succeeds");
+    sync_history(&config, &registry, &backend, sync_options());
 
     let history_root = deploy_root.join("history");
     assert!(
@@ -349,25 +381,130 @@ fn history_whole_root_sync_publishes_the_overlay_and_complete_record_address() {
             && record.cache_git_root.is_some(),
         "a history record persists its complete linked-worktree address"
     );
+    assert_eq!(
+        git_stdout(&history_root, &["status", "--porcelain=v1"]),
+        "",
+        "a phora-deployed history root is clean to real git"
+    );
+    assert_eq!(
+        git_stdout(&history_root, &["log", "-1", "--format=%H"]),
+        record.commit,
+        "the deployed history root exposes the recorded pin"
+    );
 
-    let legacy: ArtifactRecord = toml::from_str(
-        "version = 1\n\
-         key = { target = \"home\", source = \"ordinary\", artifact = \"artifact\" }\n\
-         source = \"ordinary\"\n\
-         commit = \"abc\"\n\
-         digest = \"blake3:abc\"\n\
-         projected_at = \"2026-01-01T00:00:00Z\"\n\
-         layout = \"flat\"\n\
-         allow_symlinks = false\n\
-         preserve_executable = true\n\
-         files = []\n",
-    )
-    .expect("legacy record deserializes");
+    std::fs::write(history_root.join("plain.txt"), b"edited\n").expect("edit deployed content");
+    std::fs::remove_file(history_root.join(".git")).expect("remove overlay gitlink");
+
+    let verification =
+        phora::sync::verify(&config, &registry, None, &backend).expect("verify runs");
     assert!(
-        !legacy.history
-            && legacy.worktree_admin_id.is_none()
-            && legacy.mirror_key.is_none()
-            && legacy.cache_git_root.is_none(),
-        "legacy and ordinary records leave the history address absent"
+        verification
+            .mismatches
+            .iter()
+            .any(|mismatch| mismatch.path.ends_with("plain.txt")),
+        "verify hashes an edited history deployment file"
+    );
+    assert_eq!(
+        verification.overlay_findings.len(),
+        1,
+        "verify separately reports the damaged history overlay"
+    );
+
+    let mut forced_options = sync_options();
+    forced_options.conflict_policy = ConflictPolicy::Overwrite;
+    sync_history(&config, &registry, &backend, forced_options);
+    assert_eq!(
+        std::fs::read(history_root.join("plain.txt")).expect("read repaired content"),
+        b"one\n"
+    );
+    assert_eq!(
+        git_stdout(&history_root, &["status", "--porcelain=v1"]),
+        "",
+        "forced sync restores a clean real-git worktree"
+    );
+    assert_eq!(
+        git_stdout(&history_root, &["log", "-1", "--format=%H"]),
+        record.commit,
+        "forced sync restores the recorded pin"
+    );
+
+    assert_legacy_record_defaults();
+}
+
+#[test]
+fn history_prune_removes_deployment_and_overlay_administration() {
+    let fixture = TempDir::new().expect("fixture tempdir");
+    let (mirror, _, _, _) = fixture_repository(&fixture);
+    let deploy_root = fixture.path().join("deployment");
+    let config = Config::parse(&format!(
+        "version = 1\n\
+         [sources.history]\n\
+         git = \"{}\"\n\n\
+         [targets.home]\n\
+         path = \"{}\"\n\n\
+         [targets.home.sources]\n\
+         history = {{ history = true }}\n",
+        mirror.display(),
+        deploy_root.display()
+    ))
+    .expect("history config parses");
+    let registry = FileStateStore::open(fixture.path().join("state")).expect("open registry");
+    let backend = GitBackend::new(fixture.path().join("cache"));
+    sync_history(&config, &registry, &backend, sync_options());
+
+    let record = registry
+        .all_artifacts()
+        .expect("read history records")
+        .pop()
+        .expect("history sync persists one record");
+    let history_root = deploy_root.join("history");
+    let gitlink = std::fs::read_to_string(history_root.join(".git")).expect("read gitlink");
+    let admin = PathBuf::from(
+        gitlink
+            .strip_prefix("gitdir: ")
+            .expect("gitlink prefix")
+            .trim(),
+    );
+    let mirror = admin
+        .parent()
+        .and_then(Path::parent)
+        .expect("admin directory belongs to a mirror")
+        .to_path_buf();
+    let pin_ref = format!(
+        "refs/phora/worktrees/{}",
+        record
+            .worktree_admin_id
+            .as_ref()
+            .expect("history record has admin id")
+    );
+    assert!(
+        git_output(&mirror, &["show-ref", "--verify", pin_ref.as_str()])
+            .status
+            .success(),
+        "a deployed history overlay keeps its pin ref"
+    );
+
+    let pruned_config = Config::parse(&format!(
+        "version = 1\n\n[targets.home]\npath = \"{}\"\n",
+        deploy_root.display()
+    ))
+    .expect("pruned config parses");
+    let mut prune_options = sync_options();
+    prune_options.prune_policy = PrunePolicy::RemoveOrphans;
+    sync_history(&pruned_config, &registry, &backend, prune_options);
+
+    assert!(
+        !history_root.exists(),
+        "prune removes the retired history deployment directory"
+    );
+    assert!(
+        !admin.exists(),
+        "prune removes the retired history worktree administration"
+    );
+    assert!(
+        !git_output(&mirror, &["show-ref", "--verify", pin_ref.as_str()])
+            .status
+            .success(),
+        "prune removes the retired history pin ref"
     );
 }
