@@ -2107,7 +2107,8 @@ fn list_statuses_reports_clean_for_matching_deployment() {
     ))
     .expect("seed registry record");
 
-    let listings = list_statuses(&cfg, &reg).expect("list statuses");
+    let listings = list_statuses(&cfg, &reg, &GitBackend::new(state_dir.path().to_path_buf()))
+        .expect("list statuses");
 
     let st = status_for(&listings, "dest", "editor")
         .expect("the editor artifact must appear under target dest");
@@ -2151,7 +2152,8 @@ fn list_statuses_reports_modified_for_edited_deployment() {
     )
     .expect("edit deployed file on disk");
 
-    let listings = list_statuses(&cfg, &reg).expect("list statuses");
+    let listings = list_statuses(&cfg, &reg, &GitBackend::new(state_dir.path().to_path_buf()))
+        .expect("list statuses");
 
     let st = status_for(&listings, "dest", "editor")
         .expect("the editor artifact must appear even when modified");
@@ -2164,6 +2166,109 @@ fn list_statuses_reports_modified_for_edited_deployment() {
         !st.state.contains('✓'),
         "a Modified artifact must NOT be shown as clean (✓), got {:?}",
         st.state
+    );
+}
+
+#[test]
+fn history_file_root_status_skips_overlay_observation_for_list_and_target_detail() {
+    use crate::source::{
+        ResolvePolicy, ResolveRequest, ResolvedSource, SourceDirectoryEntry, SourceEntry,
+        SourceInventory, SourceStore, WorktreeObservationRequest, WorktreeObservationResult,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct ObservationRecordingStore {
+        observed: AtomicBool,
+    }
+
+    impl SourceStore for ObservationRecordingStore {
+        fn resolve(
+            &self,
+            _request: &ResolveRequest,
+            _policy: ResolvePolicy,
+        ) -> std::result::Result<ResolvedSource, crate::source::SourceError> {
+            panic!("status inspection must not resolve a source")
+        }
+
+        fn inventory(
+            &self,
+            _snapshot: &crate::source::SnapshotId,
+            _root: Option<&crate::source::SourcePath>,
+        ) -> std::result::Result<SourceInventory, crate::source::SourceError> {
+            panic!("status inspection must not inventory a source")
+        }
+
+        fn read(
+            &self,
+            _snapshot: &crate::source::SnapshotId,
+            _path: &crate::source::SourcePath,
+        ) -> std::result::Result<SourceEntry, crate::source::SourceError> {
+            panic!("status inspection must not read a source")
+        }
+
+        fn list_directory(
+            &self,
+            _snapshot: &crate::source::SnapshotId,
+            _path: Option<&crate::source::SourcePath>,
+        ) -> std::result::Result<Vec<SourceDirectoryEntry>, crate::source::SourceError> {
+            panic!("status inspection must not list a source")
+        }
+
+        fn observe_worktree(
+            &self,
+            _request: &WorktreeObservationRequest,
+        ) -> std::result::Result<WorktreeObservationResult, crate::source::SourceError> {
+            self.observed.store(true, Ordering::SeqCst);
+            Ok(WorktreeObservationResult::Conformant)
+        }
+    }
+
+    let state_dir = TempDir::new().expect("state root");
+    let registry = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
+    let target_root = TempDir::new().expect("target root");
+    let config = config_one_flat_target("dest", "editor-src", target_root.path());
+    let manifest = deploy_matching_file(target_root.path(), "editor", "init.lua", b"-- init\n");
+    let mut record = record_for(
+        "dest",
+        "editor-src",
+        "editor",
+        "0123456789abcdef0123456789abcdef01234567",
+        vec![manifest],
+    );
+    record.history = true;
+    record.worktree_admin_id = Some("0123456789abcdef".to_owned());
+    record.mirror_key = Some("a1b2c3d4e5f60708".to_owned());
+    record.cache_git_root = Some(state_dir.path().display().to_string());
+    registry.put_artifact(&record).expect("seed history record");
+
+    let deploy_root = target_root.path().join("editor");
+    std::fs::remove_dir_all(&deploy_root).expect("replace valid history deployment directory");
+    std::fs::write(&deploy_root, b"replacement file").expect("write replacement deployment file");
+
+    let backend = ObservationRecordingStore {
+        observed: AtomicBool::new(false),
+    };
+    let listings = list_statuses(&config, &registry, &backend).expect("list status");
+    let detail = target_detail(&config, &registry, &backend, "dest").expect("target detail");
+
+    assert!(
+        status_for(&listings, "dest", "editor")
+            .expect("list includes history artifact")
+            .state
+            .to_lowercase()
+            .contains("modified"),
+        "a history deployment root replaced by a regular file must retain its Modified content state"
+    );
+    assert!(
+        detail.artifacts[0]
+            .state
+            .to_lowercase()
+            .contains("modified"),
+        "target detail must retain the same Modified content state"
+    );
+    assert!(
+        !backend.observed.load(Ordering::SeqCst),
+        "list and target detail must not observe a history overlay after content inspection finds a regular-file deployment root"
     );
 }
 
@@ -2193,7 +2298,8 @@ fn list_statuses_reports_ejected_for_ejected_artifact() {
     )
     .expect("mark editor ejected");
 
-    let listings = list_statuses(&cfg, &reg).expect("list statuses");
+    let listings = list_statuses(&cfg, &reg, &GitBackend::new(state_dir.path().to_path_buf()))
+        .expect("list statuses");
 
     let st =
         status_for(&listings, "dest", "editor").expect("an ejected artifact must still be listed");
@@ -2238,7 +2344,8 @@ fn list_statuses_groups_by_target_and_names_source_and_artifact() {
     ))
     .expect("seed snippets record under xdg");
 
-    let listings = list_statuses(&cfg, &reg).expect("list statuses");
+    let listings = list_statuses(&cfg, &reg, &GitBackend::new(state_dir.path().to_path_buf()))
+        .expect("list statuses");
 
     assert_eq!(
         listings.len(),
@@ -2408,7 +2515,8 @@ fn list_statuses_reports_mapped_dest_path_without_layout_leak() {
     ))
     .expect("seed mapped record");
 
-    let listings = list_statuses(&cfg, &reg).expect("list statuses");
+    let listings = list_statuses(&cfg, &reg, &GitBackend::new(state_dir.path().to_path_buf()))
+        .expect("list statuses");
 
     let st = status_for(&listings, "dest", "fzf.zsh")
         .expect("the mapped artifact must appear under target dest by its dest name");
@@ -2453,7 +2561,8 @@ fn eject_keeps_mapped_file_and_marks_record_ejected() {
         target_root.path().join("fzf-src").join("fzf.zsh").exists(),
         "eject must keep the mapped dest file on disk"
     );
-    let listings = list_statuses(&cfg, &reg).expect("list statuses after eject");
+    let listings = list_statuses(&cfg, &reg, &GitBackend::new(state_dir.path().to_path_buf()))
+        .expect("list statuses after eject");
     let st = status_for(&listings, "dest", "fzf.zsh")
         .expect("an ejected mapped artifact must still be listed");
     assert!(
@@ -2483,7 +2592,8 @@ fn uneject_round_trips_a_mapped_record_back_to_managed() {
     crate::sync::eject(&cfg, &reg, "fzf.zsh", "fzf-src", "dest").expect("eject mapped leaf");
     crate::sync::uneject(&cfg, &reg, "fzf.zsh", "fzf-src", "dest").expect("uneject mapped leaf");
 
-    let listings = list_statuses(&cfg, &reg).expect("list statuses after uneject");
+    let listings = list_statuses(&cfg, &reg, &GitBackend::new(state_dir.path().to_path_buf()))
+        .expect("list statuses after uneject");
     let st = status_for(&listings, "dest", "fzf.zsh")
         .expect("an unejected mapped artifact must still be listed");
     assert!(
@@ -4688,7 +4798,13 @@ fn target_detail_no_key_target_binds_nothing() {
          [targets.everything]\npath = \"~/x\"\n",
     );
 
-    let detail = target_detail(&cfg, &reg, "everything").expect("target everything is defined");
+    let detail = target_detail(
+        &cfg,
+        &reg,
+        &GitBackend::new(state_dir.path().to_path_buf()),
+        "everything",
+    )
+    .expect("target everything is defined");
     assert!(
         detail.bound_sources.is_empty(),
         "a target with no `sources` key binds NO sources, got {:?}",
@@ -4713,7 +4829,13 @@ fn target_detail_reports_per_artifact_deployment_state() {
     ))
     .expect("seed a clean record");
 
-    let detail = target_detail(&cfg, &reg, "dest").expect("target dest is defined");
+    let detail = target_detail(
+        &cfg,
+        &reg,
+        &GitBackend::new(state_dir.path().to_path_buf()),
+        "dest",
+    )
+    .expect("target dest is defined");
     let editor = detail
         .artifacts
         .iter()
@@ -4735,8 +4857,13 @@ fn target_detail_unknown_name_errors() {
     let state_dir = TempDir::new().expect("state root");
     let reg = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
     let cfg = config_with_targets("version = 1\n\n[targets.real]\npath = \"~/x\"\n");
-    let err = target_detail(&cfg, &reg, "ghost")
-        .expect_err("target show on an undefined name must error");
+    let err = target_detail(
+        &cfg,
+        &reg,
+        &GitBackend::new(state_dir.path().to_path_buf()),
+        "ghost",
+    )
+    .expect_err("target show on an undefined name must error");
     assert!(
         matches!(err, Error::Config(msg) if msg.contains("ghost")),
         "target show on an undefined target must Err naming it"

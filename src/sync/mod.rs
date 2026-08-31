@@ -7,7 +7,7 @@ pub(crate) mod hooks;
 pub mod inspect;
 pub mod journal;
 pub mod model;
-mod observe;
+pub(crate) mod observe;
 mod plan;
 mod preview;
 mod prune;
@@ -46,7 +46,9 @@ pub use request::{
     AppliedChange, Concurrency, ConflictPolicy, HookPolicy, LockSet, MovedPinPolicy, PrunePolicy,
     SkippedChange, SourcePolicy, SyncOptions, SyncReport, SyncRequest, SyncStatus, SyncWarning,
 };
-pub use verify::{UntrustedHookFinding, VerifyMismatch, VerifyReason, VerifyReport, verify};
+pub use verify::{
+    OverlayFinding, UntrustedHookFinding, VerifyMismatch, VerifyReason, VerifyReport, verify,
+};
 
 #[cfg(feature = "bench")]
 pub use resolve::resolve_sources_for_bench;
@@ -593,9 +595,22 @@ fn refuse_lockless_mutation(
                 condition: model::ManagedCondition::MetadataChangedButContentClean { .. },
                 ..
             })
-        )
+        ) && !changeset.changes.iter().any(|change| {
+            matches!(
+                change,
+                model::SyncChange::RewriteOverlay {
+                    target,
+                    source,
+                    artifact,
+                } if target == &entry.target && source == &entry.source && artifact == &entry.artifact
+            )
+        })
     });
-    if input.lockless() && (!changeset.changes.is_empty() || refresh_pending) {
+    let other_mutation = changeset
+        .changes
+        .iter()
+        .any(|change| !matches!(change, model::SyncChange::RewriteOverlay { .. }));
+    if input.lockless() && (other_mutation || refresh_pending) {
         return Err(readonly_state_error(registry));
     }
     Ok(())

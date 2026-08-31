@@ -515,7 +515,7 @@ fn run_verify() -> Result<CliOutcome> {
         lock.as_ref(),
     );
 
-    let report = crate::sync::verify(&config, &registry, lock.as_ref())?;
+    let report = crate::sync::verify(&config, &registry, lock.as_ref(), &backend)?;
     render::print_verify(&report);
     if report.is_clean() {
         Ok(CliOutcome::Success)
@@ -646,9 +646,14 @@ fn run_target(cmd: TargetCmd) -> Result<()> {
         }
         TargetCmd::Show { name } => {
             let config = load_config()?;
+            let cwd = std::env::current_dir()?;
+            let cache_git =
+                crate::paths::cache_root_for(config.paths.cache.as_deref(), &cwd)?.join("git");
+            let backend = GitBackend::new(cache_git);
             render::print_target_detail(&target_detail(
                 &config,
                 &open_project_registry(&config)?,
+                &backend,
                 &name,
             )?);
             Ok(())

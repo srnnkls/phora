@@ -1,7 +1,12 @@
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::projection::model::Projection;
+use crate::source::{
+    SourceStore, WorktreeAdminId, WorktreeMirrorAddress, WorktreeObservationLevel,
+    WorktreeObservationLock, WorktreeObservationRequest, WorktreeObservationResult,
+};
 use crate::sync::inspect::inspect;
 use crate::sync::model::{
     ManagedArtifact, ManagedCondition, ObservedArtifact, ObservedEntry, ObservedProjectState,
@@ -33,7 +38,7 @@ where
         };
         let run = target_run(ctx, target_name, target);
         target::walk_projection_target(run, target_projection, registry, false, |run, entry| {
-            let observation = observe_entry(run, entry, registry, store)?;
+            let observation = observe_entry(run, entry, registry, store, ctx.backend)?;
             let published_key = entry.item.materialization.published_key().to_owned();
             let triplet = (
                 run.target_name.to_owned(),
@@ -73,6 +78,7 @@ where
                 observation: ObservedArtifact::Managed(ManagedArtifact {
                     record,
                     condition: ManagedCondition::Clean,
+                    overlay_stale: false,
                 }),
             },
         );
@@ -98,6 +104,7 @@ fn observe_entry(
     entry: &ArtifactEntry<'_>,
     registry: &dyn StateStore,
     store: &dyn StateStore,
+    backend: &dyn SourceStore,
 ) -> Result<ObservedArtifact<ArtifactRecord>> {
     let key = ArtifactKey {
         target: run.target_name.to_owned(),
@@ -114,7 +121,124 @@ fn observe_entry(
         &key,
         vars_digest.as_deref(),
     )?;
-    Ok(absorb_mode_transition(observation, entry.mode_transition))
+    let observation = absorb_mode_transition(observation, entry.mode_transition);
+    observe_overlay(backend, entry, observation)
+}
+
+fn observe_overlay(
+    backend: &dyn SourceStore,
+    entry: &ArtifactEntry<'_>,
+    observation: ObservedArtifact<ArtifactRecord>,
+) -> Result<ObservedArtifact<ArtifactRecord>> {
+    let ObservedArtifact::Managed(mut managed) = observation else {
+        return Ok(observation);
+    };
+    let Some(request) = history_observation_request(
+        &managed.record,
+        entry.resolved.name.clone(),
+        entry.artifact_dst,
+        WorktreeObservationLock::Wait,
+        WorktreeObservationLevel::Semantic,
+    )?
+    else {
+        return Ok(ObservedArtifact::Managed(managed));
+    };
+    managed.overlay_stale = backend.observe_worktree(&request)? == WorktreeObservationResult::Stale;
+    Ok(ObservedArtifact::Managed(managed))
+}
+
+pub(crate) fn history_observation_request(
+    record: &ArtifactRecord,
+    source: crate::source::SourceName,
+    deploy_root: &Path,
+    lock: WorktreeObservationLock,
+    level: WorktreeObservationLevel,
+) -> Result<Option<WorktreeObservationRequest>> {
+    if record.linked {
+        return Ok(None);
+    }
+    let Some((address, admin_id)) = history_address(record)? else {
+        return Ok(None);
+    };
+    let deploy_root = normalize_history_deploy_root(deploy_root)?;
+    match std::fs::symlink_metadata(&deploy_root) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(Error::Sync(format!(
+                "stat history deployment root {}: {error}",
+                deploy_root.display()
+            )));
+        }
+    }
+    let expected_commit = record.commit.parse().map_err(|error| {
+        Error::Sync(format!(
+            "parse history record commit {}: {error}",
+            record.commit
+        ))
+    })?;
+    Ok(Some(WorktreeObservationRequest {
+        source,
+        address,
+        admin_id,
+        deploy_root,
+        expected_commit,
+        lock,
+        level,
+    }))
+}
+
+pub(crate) fn normalize_history_deploy_root(deploy_root: &Path) -> Result<PathBuf> {
+    Ok(normalize_history_deploy_root_at(
+        &super::target::project_root()?,
+        deploy_root,
+    ))
+}
+
+pub(crate) fn normalize_history_deploy_root_at(project_root: &Path, deploy_root: &Path) -> PathBuf {
+    if deploy_root.is_absolute() {
+        deploy_root.to_path_buf()
+    } else {
+        project_root.join(deploy_root)
+    }
+}
+
+pub(crate) fn history_address(
+    record: &ArtifactRecord,
+) -> Result<Option<(WorktreeMirrorAddress, WorktreeAdminId)>> {
+    if !record.history {
+        return Ok(None);
+    }
+    let (Some(cache_git_root), Some(mirror_key), Some(worktree_admin_id)) = (
+        record.cache_git_root.as_deref(),
+        record.mirror_key.as_deref(),
+        record.worktree_admin_id.as_deref(),
+    ) else {
+        return Ok(None);
+    };
+    let cache_git_root = PathBuf::from(cache_git_root);
+    if !cache_git_root.is_absolute() {
+        return Err(Error::Sync(format!(
+            "history cache git root must be absolute: {}",
+            cache_git_root.display()
+        )));
+    }
+    let key = mirror_key
+        .parse()
+        .map_err(|error| Error::Sync(format!("parse history mirror key {mirror_key}: {error}")))?;
+    let admin_id = worktree_admin_id.parse().map_err(|error| {
+        Error::Sync(format!(
+            "parse history worktree administration ID {worktree_admin_id}: {error}"
+        ))
+    })?;
+    Ok(Some((
+        WorktreeMirrorAddress {
+            cache_git_root,
+            key,
+        },
+        admin_id,
+    )))
 }
 
 pub(super) fn absorb_mode_transition<R>(
@@ -134,6 +258,7 @@ pub(super) fn absorb_mode_transition<R>(
             ObservedArtifact::Managed(ManagedArtifact {
                 record: managed.record,
                 condition: ManagedCondition::Outdated,
+                overlay_stale: managed.overlay_stale,
             })
         }
         other => other,

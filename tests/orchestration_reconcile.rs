@@ -71,6 +71,7 @@ fn managed(condition: ManagedCondition) -> ObservedArtifact {
     ObservedArtifact::Managed(ManagedArtifact {
         record: (),
         condition,
+        overlay_stale: false,
     })
 }
 

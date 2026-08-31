@@ -127,6 +127,11 @@ fn change_key(change: &SyncChange) -> (String, String, String) {
             source,
             artifact,
         }
+        | SyncChange::RewriteOverlay {
+            target,
+            source,
+            artifact,
+        }
         | SyncChange::Conflict {
             target,
             source,
@@ -422,6 +427,36 @@ fn apply_reconciled(
                 events,
             ))
         }
+        Some(SyncChange::RewriteOverlay { .. }) => {
+            if journal.refuses_writes() {
+                events.skipped.push(SkippedChange::ReadonlyOverlayRewrite {
+                    target: run.target_name.to_owned(),
+                    source: entry.identity.to_owned(),
+                    artifact: published_key,
+                });
+                return Ok(false);
+            }
+            match rewrite_overlay(backend, reconciliation, &triplet, entry) {
+                Ok(()) => {
+                    events.applied.push(AppliedChange::OverlayRewritten {
+                        target: run.target_name.to_owned(),
+                        source: entry.identity.to_owned(),
+                        artifact: published_key,
+                    });
+                    persist_metadata_refresh(&reconciliation.observed, &triplet, registry, &key)?;
+                    Ok(false)
+                }
+                Err(error) => {
+                    events.skipped.push(SkippedChange::Failed {
+                        target: run.target_name.to_owned(),
+                        source: entry.identity.to_owned(),
+                        artifact: published_key,
+                        message: error.to_string(),
+                    });
+                    Ok(true)
+                }
+            }
+        }
         Some(SyncChange::Conflict { .. }) => match reconciliation.decisions.get(&triplet) {
             Some(outcome) => {
                 if outcome.warn {
@@ -456,6 +491,38 @@ fn apply_reconciled(
             Ok(false)
         }
     }
+}
+
+fn rewrite_overlay(
+    backend: &dyn SourceStore,
+    reconciliation: &Reconciliation<'_>,
+    triplet: &(String, String, String),
+    entry: &ArtifactEntry<'_>,
+) -> Result<()> {
+    let Some(ObservedArtifact::Managed(managed)) = reconciliation.observed.get(triplet).copied()
+    else {
+        return Ok(());
+    };
+    let Some(request) = super::observe::history_observation_request(
+        &managed.record,
+        entry.resolved.name.clone(),
+        entry.artifact_dst,
+        crate::source::WorktreeObservationLock::Wait,
+        crate::source::WorktreeObservationLevel::Semantic,
+    )?
+    else {
+        return Err(Error::Sync(format!(
+            "history overlay observation is unavailable for {}",
+            entry.artifact_dst.display()
+        )));
+    };
+    let guard = backend.lock_worktree_mirror_at(&entry.resolved.name, &request.address)?;
+    guard.publish_worktree(&WorktreeDeployRequest {
+        admin_id: request.admin_id,
+        deploy_root: request.deploy_root,
+        commit: request.expected_commit,
+    })?;
+    Ok(())
 }
 
 fn run_deploy(
@@ -749,11 +816,7 @@ pub(crate) fn history_deployment(
     address: &WorktreeMirrorAddress,
     commit: &str,
 ) -> Result<(NewHistoryRecord, WorktreeDeployRequest)> {
-    let deploy_root = if artifact_dst.is_absolute() {
-        artifact_dst.to_path_buf()
-    } else {
-        project_root.join(artifact_dst)
-    };
+    let deploy_root = super::observe::normalize_history_deploy_root_at(project_root, artifact_dst);
     let admin_id = worktree_admin_id(project_root, &deploy_root, target_name, source)?;
     let record = NewHistoryRecord {
         worktree_admin_id: admin_id.as_str().to_owned(),
@@ -1477,6 +1540,7 @@ mod revalidated_treated_like_clean_tests {
         ObservedArtifact::Managed(crate::sync::model::ManagedArtifact {
             record: (),
             condition,
+            overlay_stale: false,
         })
     }
 
@@ -1571,6 +1635,7 @@ mod mode_transition_conflict_tests {
         ObservedArtifact::Managed(crate::sync::model::ManagedArtifact {
             record: (),
             condition,
+            overlay_stale: false,
         })
     }
 

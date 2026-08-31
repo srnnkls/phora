@@ -70,6 +70,15 @@ fn classify_desired<R>(
                 },
                 policy,
             )),
+            ManagedCondition::Clean | ManagedCondition::MetadataChangedButContentClean { .. }
+                if managed.overlay_stale =>
+            {
+                Some(SyncChange::RewriteOverlay {
+                    target: desired.target,
+                    source: desired.source,
+                    artifact: desired.artifact,
+                })
+            }
             ManagedCondition::Clean
             | ManagedCondition::MetadataChangedButContentClean { .. }
             | ManagedCondition::Linked => None,

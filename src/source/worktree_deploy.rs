@@ -125,6 +125,7 @@ pub struct WorktreeObservationRequest {
     pub address: WorktreeMirrorAddress,
     pub admin_id: WorktreeAdminId,
     pub deploy_root: PathBuf,
+    pub expected_commit: Commit,
     pub lock: WorktreeObservationLock,
     pub level: WorktreeObservationLevel,
 }

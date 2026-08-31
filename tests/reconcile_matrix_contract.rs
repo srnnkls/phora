@@ -86,6 +86,15 @@ fn managed(condition: ManagedCondition) -> ObservedArtifact {
     ObservedArtifact::Managed(ManagedArtifact {
         record: (),
         condition,
+        overlay_stale: false,
+    })
+}
+
+fn stale_managed(condition: ManagedCondition) -> ObservedArtifact {
+    ObservedArtifact::Managed(ManagedArtifact {
+        record: (),
+        condition,
+        overlay_stale: true,
     })
 }
 
@@ -99,6 +108,14 @@ fn deploy(target: &str, source: &str, artifact: &str) -> SyncChange {
 
 fn overwrite(target: &str, source: &str, artifact: &str) -> SyncChange {
     SyncChange::Overwrite {
+        target: target.to_owned(),
+        source: source.to_owned(),
+        artifact: artifact.to_owned(),
+    }
+}
+
+fn rewrite_overlay(target: &str, source: &str, artifact: &str) -> SyncChange {
+    SyncChange::RewriteOverlay {
         target: target.to_owned(),
         source: source.to_owned(),
         artifact: artifact.to_owned(),
@@ -398,6 +415,40 @@ fn reconcile_matrix_maps_every_cell_to_its_change() {
                 );
             }
         }
+    }
+
+    for (name, observation, expected) in [
+        (
+            "clean-stale→rewrite-overlay",
+            stale_managed(ManagedCondition::Clean),
+            rewrite_overlay(TARGET, SOURCE, ARTIFACT),
+        ),
+        (
+            "modified-stale→conflict-modified",
+            stale_managed(ManagedCondition::Modified {
+                changed: vec![PathBuf::from("a.json")],
+            }),
+            conflict(
+                TARGET,
+                SOURCE,
+                ARTIFACT,
+                ConflictKind::Modified {
+                    changed: vec![PathBuf::from("a.json")],
+                },
+            ),
+        ),
+    ] {
+        let set = reconcile(
+            &projection_of(TARGET, &[(SOURCE, ARTIFACT)]),
+            &observed(vec![entry(TARGET, SOURCE, ARTIFACT, observation)]),
+            &policy(false, false),
+        )
+        .unwrap_or_else(|error| panic!("[{name}] reconcile errored: {error:?}"));
+        assert_eq!(
+            set.changes,
+            vec![expected],
+            "[{name}] stale overlay reconciliation must preserve precedence and emit exactly one change"
+        );
     }
 }
 

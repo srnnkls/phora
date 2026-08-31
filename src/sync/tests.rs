@@ -2980,7 +2980,7 @@ fn read_only_target_detail_never_refreshes_the_record() {
     let recorded = manifest_file(&before, "init.lua").clone();
     touch_to_mtime(&dst.join("init.lua"), recorded.mtime + 1000);
 
-    let _detail = crate::cli::target_detail(&cfg, &fx.registry, "dest")
+    let _detail = crate::cli::target_detail(&cfg, &fx.registry, &fx.backend, "dest")
         .expect("read-only target detail must not error");
 
     let after = fx
@@ -3011,8 +3011,8 @@ fn phora_verify_report_unchanged_by_stat_refresh() {
     .expect("first sync deploys the artifact");
     assert!(!first.had_failures, "first deploy must succeed");
 
-    let verify_before =
-        super::verify::verify(&cfg, &fx.registry, None).expect("verify before must not error");
+    let verify_before = super::verify::verify(&cfg, &fx.registry, None, &fx.backend)
+        .expect("verify before must not error");
     assert!(
         verify_before.is_clean(),
         "a freshly deployed artifact must verify clean, got {verify_before:?}"
@@ -3033,8 +3033,8 @@ fn phora_verify_report_unchanged_by_stat_refresh() {
     )
     .expect("revalidating sync must not error");
 
-    let verify_after =
-        super::verify::verify(&cfg, &fx.registry, None).expect("verify after must not error");
+    let verify_after = super::verify::verify(&cfg, &fx.registry, None, &fx.backend)
+        .expect("verify after must not error");
     assert_eq!(
         verify_after, verify_before,
         "a stat-only refresh must not change phora verify's report — blake3 stays untouched"
@@ -5934,7 +5934,7 @@ fn verify_reports_no_mismatch_when_content_matches_recorded_hash() {
         ],
     );
 
-    let mismatches = verify(&cfg, &fx.registry, None)
+    let mismatches = verify(&cfg, &fx.registry, None, &fx.backend)
         .expect("verify must not error")
         .mismatches;
 
@@ -5971,7 +5971,7 @@ fn verify_skips_ejected_artifacts() {
         )
         .expect("mark the artifact ejected");
 
-    let mismatches = verify(&cfg, &fx.registry, None)
+    let mismatches = verify(&cfg, &fx.registry, None, &fx.backend)
         .expect("verify must not error")
         .mismatches;
 
@@ -6006,7 +6006,7 @@ fn verify_reports_mismatch_for_edited_deployed_file() {
     let edited_hash = blake3::hash(edited).to_hex().to_string();
     assert_ne!(recorded_hash, edited_hash);
 
-    let mismatches = verify(&cfg, &fx.registry, None)
+    let mismatches = verify(&cfg, &fx.registry, None, &fx.backend)
         .expect("verify must not error")
         .mismatches;
 
@@ -6056,7 +6056,7 @@ fn verify_reports_missing_recorded_file() {
     // Delete a recorded file: it is in the record but absent on disk.
     std::fs::remove_file(dst.join("gone.lua")).expect("remove recorded file");
 
-    let mismatches = verify(&cfg, &fx.registry, None)
+    let mismatches = verify(&cfg, &fx.registry, None, &fx.backend)
         .expect("verify must not error")
         .mismatches;
 
@@ -6601,7 +6601,7 @@ fn verify_skips_linked_record_even_with_stray_manifest_file() {
         .put_artifact(&stray)
         .expect("seed a linked record carrying a stray manifest file");
 
-    let mismatches = verify(&cfg, &fx.registry, None)
+    let mismatches = verify(&cfg, &fx.registry, None, &fx.backend)
         .expect("verify must not error")
         .mismatches;
 
@@ -6661,7 +6661,7 @@ fn verify_skips_linked_record_over_edited_symlink_target() {
     std::fs::write(live.join("init.lua"), b"-- EDITED LIVE\n")
         .expect("edit the symlink target content");
 
-    let mismatches = verify(&cfg, &fx.registry, None)
+    let mismatches = verify(&cfg, &fx.registry, None, &fx.backend)
         .expect("verify must not error")
         .mismatches;
 
@@ -8035,7 +8035,7 @@ fn transition_copy_to_link_materializes_symlink() {
         .expect("registry read")
         .expect("copy leg writes a record");
     assert!(!copy_rec.linked, "premise: a copy record is linked=false");
-    let copy_mismatches = verify(&copy_cfg, &fx.registry, None)
+    let copy_mismatches = verify(&copy_cfg, &fx.registry, None, &fx.backend)
         .expect("verify must not error")
         .mismatches;
     assert!(
@@ -8074,7 +8074,7 @@ fn transition_copy_to_link_materializes_symlink() {
     );
 
     let effective = effective_of(&base, &local);
-    let link_mismatches = verify(&effective, &fx.registry, None)
+    let link_mismatches = verify(&effective, &fx.registry, None, &fx.backend)
         .expect("verify must not error")
         .mismatches;
     assert!(
@@ -8149,7 +8149,7 @@ fn transition_link_to_copy_materializes_real_copy() {
         copy_rec.files
     );
 
-    let copy_mismatches = verify(&copy_cfg, &fx.registry, None)
+    let copy_mismatches = verify(&copy_cfg, &fx.registry, None, &fx.backend)
         .expect("verify must not error")
         .mismatches;
     assert!(
@@ -12237,7 +12237,7 @@ fn manifest_hashes_rendered_bytes_so_verify_passes_on_rendered_output() {
         motd.blake3
     );
 
-    let report = crate::sync::verify(&cfg, &h.registry, None).expect("verify runs");
+    let report = crate::sync::verify(&cfg, &h.registry, None, &h.backend).expect("verify runs");
     assert!(
         report.mismatches.is_empty(),
         "INV-5: verify re-hashes the deployed rendered file and must match the manifest; \

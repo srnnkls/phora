@@ -152,22 +152,30 @@ fn finish_sync(cwd: &Path, out: &SyncReport, interactive: bool) -> Result<CliOut
     write_locks(cwd, base_lock, out.locks.local.as_ref())?;
     render_sync_warnings(out);
     for applied in &out.applied {
-        if let crate::sync::AppliedChange::Removed {
-            source, artifact, ..
-        } = applied
-        {
-            eprintln!("phora: pruning orphaned {source}:{artifact}");
+        match applied {
+            crate::sync::AppliedChange::Removed {
+                source, artifact, ..
+            } => eprintln!("phora: pruning orphaned {source}:{artifact}"),
+            crate::sync::AppliedChange::OverlayRewritten {
+                source, artifact, ..
+            } => eprintln!("phora: rewrote history overlay {source}:{artifact}"),
+            _ => {}
         }
     }
     for skipped in &out.skipped {
-        if let SkippedChange::Failed {
-            source,
-            artifact,
-            message,
-            ..
-        } = skipped
-        {
-            eprintln!("phora: failed to deploy {source}:{artifact}: {message}");
+        match skipped {
+            SkippedChange::Failed {
+                source,
+                artifact,
+                message,
+                ..
+            } => eprintln!("phora: failed to deploy {source}:{artifact}: {message}"),
+            SkippedChange::ReadonlyOverlayRewrite {
+                source, artifact, ..
+            } => eprintln!(
+                "phora: skipped history overlay rewrite {source}:{artifact}: read-only state"
+            ),
+            SkippedChange::Conflict { .. } => {}
         }
     }
     let report = super::render::render_hook_report(&out.hook_outcomes);

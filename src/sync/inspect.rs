@@ -178,7 +178,7 @@ fn classify_artifact_state(
     let scan = scan_dir_soft(target_path)?;
     let known: HashSet<&PathBuf> = record.files.iter().map(|f| &f.path).collect();
     for cf in &scan.files {
-        if !known.contains(&cf.path) {
+        if !known.contains(&cf.path) && (!record.history || cf.path != Path::new(".git")) {
             changed.insert(cf.path.clone());
         }
     }
@@ -429,6 +429,7 @@ fn managed_observation(
     Ok(ObservedArtifact::Managed(ManagedArtifact {
         record,
         condition,
+        overlay_stale: false,
     }))
 }
 
