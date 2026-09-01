@@ -153,11 +153,16 @@ fn local_example_toml_drops_legacy_binding_forms() {
 fn readme_self_contained_fences_parse_and_validate() {
     let complete: Vec<String> = fenced_blocks(README)
         .into_iter()
-        .filter(|block| block.trim_start().starts_with("version = 1"))
+        .filter(|block| {
+            let lines: Vec<&str> = block.lines().collect();
+            lines.iter().any(|line| line.starts_with("[sources."))
+                && lines.iter().any(|line| line.starts_with("[targets."))
+        })
         .collect();
     assert!(
         !complete.is_empty(),
-        "README.md: expected at least one self-contained `version = 1` config fence"
+        "README.md: expected at least one self-contained config fence declaring both \
+         a [sources.<s>] and a [targets.<t>] table"
     );
     for block in &complete {
         let config = Config::parse(block).unwrap_or_else(|err| {
