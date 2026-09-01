@@ -12,6 +12,7 @@ mod router;
 mod snapshot;
 pub(crate) mod transitive;
 mod worktree;
+mod worktree_deploy;
 
 #[cfg(test)]
 pub(crate) use cache::mirror_path;
@@ -28,9 +29,19 @@ pub use snapshot::{
     SourceIdentity, SourceLocation, SourceStore, SourceTimestamp, digest_snapshot,
 };
 pub use worktree::{capture_worktree, is_local_path, read_local_head};
+pub use worktree_deploy::{
+    WorktreeAdminId, WorktreeDeployRequest, WorktreeDeployment, WorktreeMirrorAddress,
+    WorktreeMirrorGuard, WorktreeObservationLevel, WorktreeObservationLock,
+    WorktreeObservationRequest, WorktreeObservationResult, WorktreeRemoveRequest,
+    worktree_admin_id,
+};
+pub(crate) use worktree_deploy::{
+    physical_cache_git_root, remove_missing_mirror_worktree_gitlink, verified_cache_git_root,
+};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use thiserror::Error;
 
@@ -188,6 +199,24 @@ impl MirrorKey {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl FromStr for MirrorKey {
+    type Err = SourceError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let valid = value.len() == 16
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'));
+        if valid {
+            Ok(Self(value.to_owned()))
+        } else {
+            Err(SourceError::Source(format!(
+                "invalid mirror key `{value}`: expected 16 lowercase hex chars"
+            )))
+        }
     }
 }
 
@@ -3090,5 +3119,255 @@ path = "srnnkls/tropos"
 
             drop(held_a);
         }
+    }
+
+    #[test]
+    fn history_worktree_id_is_deterministic_and_ref_safe() {
+        let project = TempDir::new().expect("project root");
+        let deploy = TempDir::new().expect("deploy root");
+        let first = worktree_admin_id(project.path(), deploy.path(), "target", "bad identity:*")
+            .expect("derive worktree admin id");
+        let repeated = worktree_admin_id(project.path(), deploy.path(), "target", "bad identity:*")
+            .expect("derive same worktree admin id");
+        let changed = worktree_admin_id(project.path(), deploy.path(), "other", "bad identity:*")
+            .expect("derive distinct worktree admin id");
+
+        assert_eq!(
+            first, repeated,
+            "the same deployment identity must keep its admin id"
+        );
+        assert_ne!(
+            first, changed,
+            "the target name is framed input and must change the admin id"
+        );
+        assert_eq!(first.as_str().len(), 16);
+        assert!(
+            first
+                .as_str()
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+            "the ref component must be lowercase hexadecimal, never the raw identity"
+        );
+        assert_eq!(
+            first
+                .as_str()
+                .parse::<WorktreeAdminId>()
+                .expect("persisted id parses"),
+            first
+        );
+    }
+
+    #[test]
+    fn history_worktree_default_lock_api_leaves_cache_absent() {
+        let cache = TempDir::new().expect("cache parent");
+        let git_root = cache.path().join("git");
+        let store = HttpBackend::new(git_root.clone(), BTreeMap::new());
+        let source = SourceName::trusted("url-source");
+        let key = "a1b2c3d4e5f60708"
+            .parse::<MirrorKey>()
+            .expect("valid mirror key");
+        let address = WorktreeMirrorAddress {
+            cache_git_root: git_root.clone(),
+            key: key.clone(),
+        };
+
+        assert!(
+            store.lock_worktree_mirror(&source, &key).is_err(),
+            "the default adapter implementation must reject write locking"
+        );
+        assert!(
+            store.lock_worktree_mirror_at(&source, &address).is_err(),
+            "the persisted-address default must reject write locking"
+        );
+        assert!(
+            !git_root.exists(),
+            "default/read-only worktree administration must not create the cache or lock directory"
+        );
+    }
+
+    struct SweepAdministration {
+        dangling: WorktreeAdminId,
+        mismatched: WorktreeAdminId,
+        live: WorktreeAdminId,
+        foreign_deploy: TempDir,
+    }
+
+    fn seed_sweep_administration(
+        worktrees: &std::path::Path,
+        pins: &std::path::Path,
+    ) -> SweepAdministration {
+        let dangling = "1111111111111111"
+            .parse::<WorktreeAdminId>()
+            .expect("valid dangling admin id");
+        let mismatched = "2222222222222222"
+            .parse::<WorktreeAdminId>()
+            .expect("valid mismatched admin id");
+        let live = "3333333333333333"
+            .parse::<WorktreeAdminId>()
+            .expect("valid live admin id");
+        for id in [&dangling, &mismatched, &live] {
+            std::fs::create_dir_all(worktrees.join(format!("ph-{}", id.as_str())))
+                .expect("create administration");
+            std::fs::create_dir_all(pins).expect("create pin parent");
+            std::fs::write(pins.join(id.as_str()), "pin\n").expect("write pin");
+        }
+        std::fs::write(
+            worktrees
+                .join(format!("ph-{}", dangling.as_str()))
+                .join("gitdir"),
+            "/missing/history-overlay/.git\n",
+        )
+        .expect("write dangling gitdir");
+        let foreign_deploy = TempDir::new().expect("foreign deployment root");
+        std::fs::write(
+            foreign_deploy.path().join(".git"),
+            "gitdir: /other-mirror/worktrees/ph-2222222222222222\n",
+        )
+        .expect("write foreign gitlink");
+        std::fs::write(
+            worktrees
+                .join(format!("ph-{}", mismatched.as_str()))
+                .join("gitdir"),
+            format!("{}\n", foreign_deploy.path().join(".git").display()),
+        )
+        .expect("write mismatched gitdir");
+        SweepAdministration {
+            dangling,
+            mismatched,
+            live,
+            foreign_deploy,
+        }
+    }
+
+    fn assert_sweep_results(
+        administration: &SweepAdministration,
+        worktrees: &std::path::Path,
+        pins: &std::path::Path,
+        live_admin: &std::path::Path,
+        live_gitlink: &std::path::Path,
+        staging: &std::path::Path,
+        backup: &std::path::Path,
+    ) {
+        for id in [&administration.dangling, &administration.mismatched] {
+            assert!(
+                !worktrees.join(format!("ph-{}", id.as_str())).exists()
+                    && !pins.join(id.as_str()).exists(),
+                "sweep must reclaim stale worktree administration and its pin for {}",
+                id.as_str()
+            );
+        }
+        assert!(
+            live_admin.exists()
+                && pins.join(administration.live.as_str()).exists()
+                && live_gitlink.exists(),
+            "a canonical gitlink below a symlinked deployment ancestor remains live"
+        );
+        assert!(
+            !staging.exists() && !backup.exists(),
+            "sweep must reclaim abandoned sibling staging and backup directories"
+        );
+        assert!(
+            administration.foreign_deploy.path().join(".git").exists(),
+            "a foreign-mirror gitlink is live state owned by the other mirror, not sweep input"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sweep_reclaims_dangling_and_mismatched_overlays_with_their_pins_and_transients() {
+        let cache = TempDir::new().expect("cache root");
+        let mirror = cache.path().join("source.git");
+        let worktrees = mirror.join("worktrees");
+        let pins = mirror.join("refs/phora/worktrees");
+        let administration = seed_sweep_administration(&worktrees, &pins);
+        let deploys = TempDir::new().expect("deployment parent");
+        let physical_deploy = TempDir::new().expect("physical deployment parent");
+        let physical_root = physical_deploy
+            .path()
+            .canonicalize()
+            .expect("canonicalize physical deployment parent");
+        let symlinked_parent = deploys.path().join("linked");
+        std::os::unix::fs::symlink(&physical_root, &symlinked_parent)
+            .expect("create deployment ancestor symlink");
+        let live_deploy = symlinked_parent.join("live");
+        std::fs::create_dir_all(&live_deploy).expect("create live deployment");
+        let live_gitlink = physical_root.join("live/.git");
+        let live_admin = worktrees.join(format!("ph-{}", administration.live.as_str()));
+        std::fs::write(&live_gitlink, format!("gitdir: {}\n", live_admin.display()))
+            .expect("write live gitlink");
+        std::fs::write(
+            live_admin.join("gitdir"),
+            format!("{}\n", live_gitlink.display()),
+        )
+        .expect("write canonical live gitdir");
+        let staging = mirror.join(format!(
+            ".ph-{}.staging-7-0",
+            administration.dangling.as_str()
+        ));
+        let backup = mirror.join(format!(
+            ".ph-{}.backup-7-0",
+            administration.mismatched.as_str()
+        ));
+        let physical_cache = cache
+            .path()
+            .canonicalize()
+            .expect("canonicalize cache root");
+        let missing = "4444444444444444"
+            .parse::<WorktreeAdminId>()
+            .expect("valid missing-mirror administration id");
+        let key = "5555555555555555"
+            .parse::<MirrorKey>()
+            .expect("valid missing-mirror key");
+        let missing_deploy = symlinked_parent.join("missing");
+        std::fs::create_dir_all(&missing_deploy).expect("create missing-mirror deployment");
+        let physical_missing_gitlink = physical_root.join("missing/.git");
+        let expected_admin = physical_cache
+            .join(format!("{}.git", key.as_str()))
+            .join("worktrees")
+            .join(format!("ph-{}", missing.as_str()));
+        std::fs::write(
+            &physical_missing_gitlink,
+            format!("gitdir: {}\n", expected_admin.display()),
+        )
+        .expect("write missing-mirror gitlink");
+        let cache_alias = deploys.path().join("cache-alias");
+        std::os::unix::fs::symlink(&physical_cache, &cache_alias)
+            .expect("create cache-root symlink");
+        let forged = WorktreeMirrorAddress {
+            cache_git_root: cache_alias,
+            key: key.clone(),
+        };
+        assert!(
+            remove_missing_mirror_worktree_gitlink(&forged, &missing, &missing_deploy).is_err()
+                && physical_missing_gitlink.exists(),
+            "a persisted symlinked cache root must fail before missing-mirror cleanup touches its gitlink"
+        );
+        let physical = WorktreeMirrorAddress {
+            cache_git_root: physical_cache,
+            key,
+        };
+        assert!(
+            remove_missing_mirror_worktree_gitlink(&physical, &missing, &missing_deploy)
+                .expect("physical missing-mirror cleanup")
+                && !physical_missing_gitlink.exists(),
+            "physical missing-mirror cleanup must remove the canonical gitlink behind a symlinked deployment ancestor"
+        );
+        std::fs::create_dir_all(&staging).expect("create abandoned staging");
+        std::fs::create_dir_all(&backup).expect("create abandoned backup");
+
+        worktree_deploy::sweep_stale_worktrees(&mirror, &worktrees)
+            .expect("sweep stale overlay administration");
+        worktree_deploy::sweep_transient_worktrees(&mirror)
+            .expect("sweep transient overlay administration");
+
+        assert_sweep_results(
+            &administration,
+            &worktrees,
+            &pins,
+            &live_admin,
+            &live_gitlink,
+            &staging,
+            &backup,
+        );
     }
 }

@@ -54,6 +54,34 @@ impl ProtectedPathSet {
     }
 }
 
+pub(super) fn confine_removal_destination(
+    current_anchor: Option<&Path>,
+    persisted_anchor: Option<&Path>,
+    dst: &Path,
+    composed: bool,
+    protected: &ProtectedPathSet,
+) -> Result<PathBuf> {
+    let anchor = match (current_anchor, persisted_anchor) {
+        (Some(current), _)
+            if strip_prefix_folded(&normalize_lexical(dst), &normalize_lexical(current))
+                .is_some() =>
+        {
+            current
+        }
+        (_, Some(persisted)) => persisted,
+        (Some(current), None) => current,
+        (None, None) if composed => {
+            return Err(Error::Config(
+                "confinement: composed target reached prune without a confine anchor; refusing an unconfined delete"
+                    .to_string(),
+            ));
+        }
+        (None, None) => return Ok(dst.to_path_buf()),
+    };
+    reject_if_symlink(anchor)?;
+    confine_destination(anchor, dst, protected)
+}
+
 /// Returns the path deploy must write verbatim, or rejects any escape of `anchor`.
 pub(super) fn confine_destination(
     anchor: &Path,

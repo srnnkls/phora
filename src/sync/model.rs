@@ -33,6 +33,7 @@ pub enum ObservedArtifact<R = ()> {
 pub struct ManagedArtifact<R = ()> {
     pub record: R,
     pub condition: ManagedCondition,
+    pub overlay_stale: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +60,11 @@ pub enum SyncChange {
         artifact: String,
     },
     Overwrite {
+        target: String,
+        source: String,
+        artifact: String,
+    },
+    RewriteOverlay {
         target: String,
         source: String,
         artifact: String,

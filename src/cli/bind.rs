@@ -57,6 +57,7 @@ fn validate_merged_references(main_text: &str, local_text: &str) -> Result<()> {
     let main = crate::config::Config::parse(main_text)?;
     let local = crate::config::Config::parse(local_text)?;
     let merged = merge_configs(main, Some(local));
+    merged.validate()?;
     config_edit::validate_source_references(&merged)
 }
 
@@ -78,14 +79,16 @@ fn target_exists(text: &str, target: &str) -> Result<bool> {
 
 pub(super) fn run_bind(
     sources: &[String],
-    to: &str,
+    targets: &[String],
     local: bool,
     refinement: &BindRefinement,
 ) -> Result<()> {
     for source in sources {
         SourceName::from_str(source)?;
     }
-    TargetName::from_str(to)?;
+    for target in targets {
+        TargetName::from_str(target)?;
+    }
 
     let cwd = Path::new(".");
     let merged = merged_config(cwd)?;
@@ -94,30 +97,44 @@ pub(super) fn run_bind(
             return Err(Error::Config(missing_source_message(source)));
         }
     }
-
-    let Some(target) = merged.targets.get(to) else {
-        return Err(Error::Config(missing_target_message(to, local)));
-    };
+    let target_paths = targets
+        .iter()
+        .map(|target| {
+            merged
+                .targets
+                .get(target)
+                .map(|target| target.path.to_string_lossy().into_owned())
+                .ok_or_else(|| Error::Config(missing_target_message(target, local)))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     let file = target_config_file(local);
     let original = read_config_text(file)?;
-
     let mut text = original.clone();
-    if !target_exists(&text, to)? {
-        text = config_edit::upsert_target(&text, to, &target.path.to_string_lossy(), None)?;
-    }
+    let mut changed = false;
     if let Some(root) = refinement.root.as_deref() {
         text = config_edit::set_source_roots(&text, sources, root)?;
     }
+    for (target, path) in targets.iter().zip(&target_paths) {
+        if !target_exists(&text, target)? {
+            text = config_edit::upsert_target(&text, target, path, None)?;
+        }
+        let result = config_edit::bind(&text, target, sources, refinement)?;
+        changed |= result.changed;
+        text = result.text;
+    }
 
-    let result = config_edit::bind(&text, to, sources, refinement)?;
-    if !result.changed && result.text == original {
-        render::print_bind_unchanged(sources, to);
+    if !changed && text == original {
+        for target in targets {
+            render::print_bind_unchanged(sources, target);
+        }
         return Ok(());
     }
-    guard_no_dangling_references(&result.text, local)?;
-    std::fs::write(file, &result.text)?;
-    render::print_bound(sources, to);
+    guard_no_dangling_references(&text, local)?;
+    std::fs::write(file, &text)?;
+    for target in targets {
+        render::print_bound(sources, target);
+    }
     Ok(())
 }
 

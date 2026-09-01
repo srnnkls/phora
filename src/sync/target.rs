@@ -4,23 +4,30 @@ use std::path::{Path, PathBuf};
 use crate::config::{DeployMode, LayoutConfig, ParsedSource, Target, TemplateOptIn};
 use crate::error::{Error, Result};
 use crate::projection::model::{ContentTransform, Materialization};
-use crate::source::{ResolvedSource, SourceIdentity, SourcePath, SourceStore, safe_relpath};
+use crate::source::{
+    ResolvedSource, SourceEntryKind, SourceIdentity, SourcePath, SourceStore,
+    WorktreeDeployRequest, WorktreeMirrorAddress, WorktreeMirrorGuard, safe_relpath,
+    worktree_admin_id,
+};
 use crate::sync::state::{
-    ArtifactKey, ArtifactRecord, Ejection, ManifestFile, NewArtifactRecord, RecordKind,
-    ScannedFile, StateStore,
+    ArtifactKey, ArtifactRecord, Ejection, ManifestFile, NewArtifactRecord, NewHistoryRecord,
+    RecordKind, ScannedFile, StateStore,
 };
 
-use super::apply::{apply_artifact_report, link_artifact};
+use super::apply::{ApplyPaths, apply_artifact_report, link_artifact};
 use super::confine::{ProtectedPathSet, confine_destination};
 use super::journal::Journal;
 use super::resolve::ResolvedSourceMap;
 use super::stage::{StageRequest, stage_artifact};
 use super::{
-    Conflict, ConflictResolver, Resolution, StagingGuard, nonce, remote_for, target_parent,
+    Conflict, ConflictResolver, Resolution, StagingGuard, nonce, remote_for, remove_orphan_path,
+    target_parent,
 };
 use crate::projection::diagnostic::ProjectionWarning;
 use crate::projection::model::{ProjectedArtifact, TargetProjection};
-use crate::sync::model::{ChangeSet, ConflictKind, ManagedCondition, ObservedArtifact, SyncChange};
+use crate::sync::model::{
+    ChangeSet, ConflictKind, ManagedCondition, ObservedArtifact, RemovalReason, SyncChange,
+};
 use crate::sync::request::SyncEvents;
 use crate::sync::{AppliedChange, SkippedChange, SyncWarning};
 
@@ -76,6 +83,7 @@ pub(super) type ObservationIndex<'a> =
 
 pub(super) struct Reconciliation<'a> {
     observed: ObservationIndex<'a>,
+    history_retirements: BTreeMap<(String, String), &'a ObservedArtifact<ArtifactRecord>>,
     changes: ChangeIndex<'a>,
     decisions: ConflictDecisions,
 }
@@ -84,6 +92,7 @@ impl<'a> Reconciliation<'a> {
     pub(super) fn new(
         changeset: &'a ChangeSet,
         observed: &'a super::model::ObservedProjectState<ArtifactRecord>,
+        history_retirements: &'a [super::model::ObservedEntry<ArtifactRecord>],
         decisions: ConflictDecisions,
     ) -> Self {
         Self {
@@ -101,6 +110,15 @@ impl<'a> Reconciliation<'a> {
                     )
                 })
                 .collect(),
+            history_retirements: history_retirements
+                .iter()
+                .map(|entry| {
+                    (
+                        (entry.target.clone(), entry.source.clone()),
+                        &entry.observation,
+                    )
+                })
+                .collect(),
             changes: changeset
                 .changes
                 .iter()
@@ -108,6 +126,26 @@ impl<'a> Reconciliation<'a> {
                 .collect(),
             decisions,
         }
+    }
+
+    fn history_retirement(
+        &self,
+        target: &str,
+        source: &str,
+    ) -> Option<(&ObservedArtifact<ArtifactRecord>, Option<&ConflictOutcome>)> {
+        let observation = self
+            .history_retirements
+            .get(&(target.to_owned(), source.to_owned()))?;
+        let artifact = match observation {
+            ObservedArtifact::Managed(managed) => &managed.record.key.artifact,
+            ObservedArtifact::Ejected
+            | ObservedArtifact::Missing
+            | ObservedArtifact::Foreign(_) => {
+                return Some((observation, None));
+            }
+        };
+        let key = (target.to_owned(), source.to_owned(), artifact.clone());
+        Some((observation, self.decisions.get(&key)))
     }
 }
 
@@ -119,6 +157,11 @@ fn change_key(change: &SyncChange) -> (String, String, String) {
             artifact,
         }
         | SyncChange::Overwrite {
+            target,
+            source,
+            artifact,
+        }
+        | SyncChange::RewriteOverlay {
             target,
             source,
             artifact,
@@ -316,11 +359,20 @@ pub(super) fn deploy_reconciled_target_report(
     journal: &Journal,
     events: &mut SyncEvents,
 ) -> Result<bool> {
-    for binding in &projection.bindings {
-        collect_projection_warnings(&binding.warnings, events);
-    }
-    walk_projection_target(run, projection, registry, false, |run, entry| {
-        apply_reconciled(
+    let protected_bindings =
+        protect_history_retirements(run, projection, reconciliation, backend, registry, events)?;
+    let live_destinations = live_destinations(run, projection)?;
+
+    let mut failed_bindings = BTreeSet::new();
+    let mut ready_bindings = BTreeSet::new();
+    let mut unready_bindings = BTreeSet::new();
+    let had_failures = walk_projection_target(run, projection, registry, false, |run, entry| {
+        if protected_bindings.contains(entry.identity) {
+            return Ok(false);
+        }
+        let triplet = conflict_triplet(run, entry);
+        let change = reconciliation.changes.get(&triplet).copied();
+        let failed = apply_reconciled(
             run,
             entry,
             projection,
@@ -329,8 +381,145 @@ pub(super) fn deploy_reconciled_target_report(
             registry,
             journal,
             events,
+        )?;
+        if failed {
+            failed_bindings.insert(entry.identity.to_owned());
+        } else if applied_replacement(change, reconciliation.decisions.get(&triplet)) {
+            ready_bindings.insert(entry.identity.to_owned());
+        } else {
+            unready_bindings.insert(entry.identity.to_owned());
+        }
+        Ok(failed)
+    })?;
+
+    for binding in &projection.bindings {
+        if protected_bindings.contains(&binding.identity)
+            || failed_bindings.contains(&binding.identity)
+            || unready_bindings.contains(&binding.identity)
+            || !ready_bindings.contains(&binding.identity)
+        {
+            continue;
+        }
+        let Some((ObservedArtifact::Managed(managed), _)) =
+            reconciliation.history_retirement(run.target_name, &binding.identity)
+        else {
+            continue;
+        };
+        if journal.refuses_writes() {
+            return Err(journal.readonly_error());
+        }
+        retire_history_deployment(
+            backend,
+            registry,
+            run.target,
+            run.protected,
+            &live_destinations,
+            &managed.record,
+            events,
+        )?;
+    }
+    Ok(had_failures)
+}
+
+fn applied_replacement(change: Option<&SyncChange>, outcome: Option<&ConflictOutcome>) -> bool {
+    change.is_none()
+        || matches!(
+            change,
+            Some(SyncChange::Deploy { .. } | SyncChange::Overwrite { .. })
         )
-    })
+        || matches!(
+            (change, outcome),
+            (
+                Some(SyncChange::Conflict { .. }),
+                Some(ConflictOutcome {
+                    resolution: Resolution::Overwrite,
+                    ..
+                })
+            )
+        )
+}
+
+fn protect_history_retirements(
+    run: TargetRun<'_>,
+    projection: &TargetProjection,
+    reconciliation: &Reconciliation<'_>,
+    backend: &dyn SourceStore,
+    registry: &dyn StateStore,
+    events: &mut SyncEvents,
+) -> Result<BTreeSet<String>> {
+    let mut protected_bindings = BTreeSet::new();
+    for binding in &projection.bindings {
+        collect_projection_warnings(&binding.warnings, events);
+        let Some((observation, decision)) =
+            reconciliation.history_retirement(run.target_name, &binding.identity)
+        else {
+            continue;
+        };
+        match (observation, decision) {
+            (ObservedArtifact::Ejected, _) => {
+                events.skipped.push(SkippedChange::Conflict {
+                    target: run.target_name.to_owned(),
+                    source: binding.identity.clone(),
+                    artifact: binding.identity.clone(),
+                    kind: ConflictKind::Foreign,
+                });
+                protected_bindings.insert(binding.identity.clone());
+            }
+            (ObservedArtifact::Managed(managed), Some(outcome))
+                if matches!(outcome.resolution, Resolution::Skip | Resolution::Eject) =>
+            {
+                let deploy_root = super::prune::removal_destination(run.target, &managed.record);
+                let old_path =
+                    super::prune::removal_path(run.target, &managed.record, run.protected)?;
+                if outcome.warn {
+                    collect_conflict_warning(
+                        &binding.identity,
+                        &managed.record.key.artifact,
+                        &outcome.kind,
+                        &old_path,
+                        events,
+                    );
+                }
+                match outcome.resolution {
+                    Resolution::Skip => events.skipped.push(SkippedChange::Conflict {
+                        target: run.target_name.to_owned(),
+                        source: binding.identity.clone(),
+                        artifact: managed.record.key.artifact.clone(),
+                        kind: outcome.kind.clone(),
+                    }),
+                    Resolution::Eject => {
+                        super::eject_artifact(
+                            &managed.record.key,
+                            Some(&managed.record),
+                            &deploy_root,
+                            backend,
+                            registry,
+                        )?;
+                        events.applied.push(AppliedChange::Ejected {
+                            target: run.target_name.to_owned(),
+                            source: binding.identity.clone(),
+                            artifact: managed.record.key.artifact.clone(),
+                        });
+                    }
+                    Resolution::Overwrite | Resolution::Abort => {
+                        unreachable!("protected retirement")
+                    }
+                }
+                protected_bindings.insert(binding.identity.clone());
+            }
+            _ => {}
+        }
+    }
+    Ok(protected_bindings)
+}
+
+fn live_destinations(run: TargetRun<'_>, projection: &TargetProjection) -> Result<Vec<PathBuf>> {
+    projection
+        .bindings
+        .iter()
+        .flat_map(|binding| binding.artifacts.iter())
+        .map(|item| run.confined(&run.target.expanded_path().join(item.destination.as_str())))
+        .collect()
 }
 
 #[expect(
@@ -418,6 +607,36 @@ fn apply_reconciled(
                 events,
             ))
         }
+        Some(SyncChange::RewriteOverlay { .. }) => {
+            if journal.refuses_writes() {
+                events.skipped.push(SkippedChange::ReadonlyOverlayRewrite {
+                    target: run.target_name.to_owned(),
+                    source: entry.identity.to_owned(),
+                    artifact: published_key,
+                });
+                return Ok(false);
+            }
+            match rewrite_overlay(backend, reconciliation, &triplet, entry) {
+                Ok(()) => {
+                    events.applied.push(AppliedChange::OverlayRewritten {
+                        target: run.target_name.to_owned(),
+                        source: entry.identity.to_owned(),
+                        artifact: published_key,
+                    });
+                    persist_metadata_refresh(&reconciliation.observed, &triplet, registry, &key)?;
+                    Ok(false)
+                }
+                Err(error) => {
+                    events.skipped.push(SkippedChange::Failed {
+                        target: run.target_name.to_owned(),
+                        source: entry.identity.to_owned(),
+                        artifact: published_key,
+                        message: error.to_string(),
+                    });
+                    Ok(true)
+                }
+            }
+        }
         Some(SyncChange::Conflict { .. }) => match reconciliation.decisions.get(&triplet) {
             Some(outcome) => {
                 if outcome.warn {
@@ -435,7 +654,9 @@ fn apply_reconciled(
                     key,
                     run,
                     entry,
+                    reconciliation,
                     &published_key,
+                    backend,
                     registry,
                     &outcome.kind,
                     events,
@@ -452,6 +673,38 @@ fn apply_reconciled(
             Ok(false)
         }
     }
+}
+
+fn rewrite_overlay(
+    backend: &dyn SourceStore,
+    reconciliation: &Reconciliation<'_>,
+    triplet: &(String, String, String),
+    entry: &ArtifactEntry<'_>,
+) -> Result<()> {
+    let Some(ObservedArtifact::Managed(managed)) = reconciliation.observed.get(triplet).copied()
+    else {
+        return Ok(());
+    };
+    let Some(request) = super::observe::history_observation_request(
+        &managed.record,
+        entry.resolved.name.clone(),
+        entry.artifact_dst,
+        crate::source::WorktreeObservationLock::Wait,
+        crate::source::WorktreeObservationLevel::Semantic,
+    )?
+    else {
+        return Err(Error::Sync(format!(
+            "history overlay observation is unavailable for {}",
+            entry.artifact_dst.display()
+        )));
+    };
+    let guard = backend.lock_worktree_mirror_at(&entry.resolved.name, &request.address)?;
+    guard.publish_worktree(&WorktreeDeployRequest {
+        admin_id: request.admin_id,
+        deploy_root: request.deploy_root,
+        commit: request.expected_commit,
+    })?;
+    Ok(())
 }
 
 fn run_deploy(
@@ -490,7 +743,9 @@ fn apply_resolution(
     key: ArtifactKey,
     run: &TargetRun<'_>,
     entry: &ArtifactEntry<'_>,
+    reconciliation: &Reconciliation<'_>,
     published_key: &str,
+    backend: &dyn SourceStore,
     registry: &dyn StateStore,
     kind: &ConflictKind,
     events: &mut SyncEvents,
@@ -522,13 +777,25 @@ fn apply_resolution(
             ))
         }
         Resolution::Eject => {
-            let mut ejected = registry.ejections(run.target_name)?;
-            ejected.push(Ejection {
-                source: entry.identity.to_owned(),
-                artifact: published_key.to_owned(),
-                ejected_at: chrono::Utc::now().to_rfc3339(),
-            });
-            registry.save_ejections(run.target_name, &ejected)?;
+            let observation_key = (key.target.clone(), key.source.clone(), key.artifact.clone());
+            let record = reconciliation
+                .observed
+                .get(&observation_key)
+                .and_then(|observation| match observation {
+                    ObservedArtifact::Managed(managed) => Some(&managed.record),
+                    ObservedArtifact::Foreign(_)
+                    | ObservedArtifact::Missing
+                    | ObservedArtifact::Ejected => None,
+                });
+            let deploy_root =
+                record.map(|record| super::prune::removal_destination(run.target, record));
+            super::eject_artifact(
+                &key,
+                record,
+                deploy_root.as_deref().unwrap_or(entry.artifact_dst),
+                backend,
+                registry,
+            )?;
             events.applied.push(AppliedChange::Ejected {
                 target: run.target_name.to_owned(),
                 source: entry.identity.to_owned(),
@@ -597,18 +864,29 @@ impl ArtifactEntry<'_> {
 
     fn record_kind(&self) -> RecordKind {
         match &self.item.materialization {
-            Materialization::CollapsedDir { .. } => RecordKind::Dir,
+            Materialization::CollapsedDir { .. } | Materialization::WholeRoot { .. } => {
+                RecordKind::Dir
+            }
             Materialization::Leaf(_) => RecordKind::File,
         }
     }
 }
 
+pub(crate) fn record_relative_destination(
+    layout: &LayoutConfig,
+    record: &ArtifactRecord,
+) -> PathBuf {
+    if record.history {
+        PathBuf::from(&record.key.artifact)
+    } else {
+        layout.artifact_path(&record.key.source, &record.key.artifact)
+    }
+}
+
 pub(crate) fn record_artifact_path(target: &Target, record: &ArtifactRecord) -> PathBuf {
-    target.expanded_path().join(
-        target
-            .layout()
-            .artifact_path(&record.key.source, &record.key.artifact),
-    )
+    target
+        .expanded_path()
+        .join(record_relative_destination(&target.layout(), record))
 }
 
 /// A `File` record's single manifest file IS the dest, so its base is the dest's parent;
@@ -650,7 +928,7 @@ pub(super) fn expected_vars_digest(
     }
     let templated = match &entry.item.materialization {
         Materialization::Leaf(take) => entry.template_opt_in.renders(&take.source),
-        Materialization::CollapsedDir { .. } => entry
+        Materialization::CollapsedDir { .. } | Materialization::WholeRoot { .. } => entry
             .item
             .leaves
             .iter()
@@ -720,21 +998,186 @@ struct DeployContext<'a> {
     events: &'a mut SyncEvents,
 }
 
+type HistoryDeployment = (
+    Option<NewHistoryRecord>,
+    Option<(WorktreeMirrorGuard, WorktreeDeployRequest)>,
+    Option<SyncWarning>,
+);
+
+pub(crate) fn history_deployment(
+    project_root: &Path,
+    artifact_dst: &Path,
+    target_name: &str,
+    source: &str,
+    address: &WorktreeMirrorAddress,
+    commit: &str,
+) -> Result<(NewHistoryRecord, WorktreeDeployRequest)> {
+    let deploy_root = super::observe::normalize_history_deploy_root_at(project_root, artifact_dst);
+    let admin_id = worktree_admin_id(project_root, &deploy_root, target_name, source)?;
+    let record = NewHistoryRecord {
+        worktree_admin_id: admin_id.as_str().to_owned(),
+        mirror_key: address.key.as_str().to_owned(),
+        cache_git_root: address.cache_git_root.to_string_lossy().into_owned(),
+    };
+    let request = WorktreeDeployRequest {
+        admin_id,
+        deploy_root,
+        commit: commit.parse()?,
+    };
+    Ok((record, request))
+}
+
+pub(crate) fn project_root() -> Result<PathBuf> {
+    std::env::current_dir()
+        .map_err(|error| Error::Sync(format!("resolve project root for history: {error}")))
+}
+
+fn prepare_history_deployment(
+    backend: &dyn SourceStore,
+    ctx: &DeployContext<'_>,
+    whole_root: bool,
+) -> Result<HistoryDeployment> {
+    if !whole_root {
+        return Ok((None, None, None));
+    }
+    let attributes = root_gitattributes_declares_content_filter(backend, ctx.resolved)?;
+    let guard = backend.lock_worktree_mirror(&ctx.resolved.name, ctx.resolved.snapshot.mirror())?;
+    let autocrlf = guard.mirror.config_snapshot().boolean("core.autocrlf") == Some(true);
+    let warning = history_content_filter_warning(ctx.underlying_source, attributes, autocrlf);
+    let (history, request) = history_deployment(
+        &project_root()?,
+        ctx.artifact_dst,
+        &ctx.key.target,
+        &ctx.key.source,
+        &guard.address,
+        ctx.commit,
+    )?;
+    Ok((Some(history), Some((guard, request)), warning))
+}
+
+fn root_gitattributes_declares_content_filter(
+    backend: &dyn SourceStore,
+    resolved: &ResolvedSource,
+) -> Result<bool> {
+    let attributes_path = SourcePath::new(".gitattributes")?;
+    match backend.read(&resolved.snapshot, &attributes_path) {
+        Ok(entry)
+            if matches!(
+                entry.meta.kind,
+                SourceEntryKind::File | SourceEntryKind::Executable
+            ) =>
+        {
+            Ok(gitattributes_declares_content_filter(&entry.bytes))
+        }
+        Ok(_)
+        | Err(
+            crate::source::SourceError::FileAbsent { .. }
+            | crate::source::SourceError::MappedKeyNotALeaf { .. },
+        ) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn history_content_filter_warning(
+    source: &str,
+    attributes: bool,
+    autocrlf: bool,
+) -> Option<SyncWarning> {
+    (attributes || autocrlf).then(|| SyncWarning::HistoryContentFilter {
+        source: source.to_owned(),
+        attributes,
+        autocrlf,
+    })
+}
+
+fn gitattributes_declares_content_filter(contents: &[u8]) -> bool {
+    gix::attrs::parse(contents)
+        .filter_map(std::result::Result::ok)
+        .any(|(_, assignments, _)| {
+            let Ok(assignments) = assignments.collect::<std::result::Result<Vec<_>, _>>() else {
+                return false;
+            };
+            assignments.into_iter().any(|assignment| {
+                matches!(
+                    assignment.name.as_ref(),
+                    "text" | "eol" | "ident" | "filter"
+                ) && matches!(
+                    assignment.state,
+                    gix::attrs::StateRef::Set | gix::attrs::StateRef::Value(_)
+                )
+            })
+        })
+}
+
+fn staging_path(staging_base: &Path, artifact: &str) -> PathBuf {
+    let artifact_label = artifact.replace('/', "_");
+    staging_base.join(format!("{artifact_label}-{}", nonce()))
+}
+
+fn retire_history_deployment(
+    backend: &dyn SourceStore,
+    registry: &dyn StateStore,
+    target: &Target,
+    protected: &ProtectedPathSet,
+    live_destinations: &[PathBuf],
+    record: &ArtifactRecord,
+    events: &mut SyncEvents,
+) -> Result<()> {
+    let replaced = registry
+        .artifact(&record.key)?
+        .is_some_and(|current| !current.history);
+    let path = super::prune::removal_path(target, record, protected)?;
+    super::detach_history_overlay(record, &path, backend)?;
+    if !replaced {
+        if !super::prune::contains_live_destination(&path, live_destinations) {
+            remove_orphan_path(&path)
+                .map_err(|error| Error::Sync(format!("retire {}: {error}", path.display())))?;
+        }
+        registry.remove_artifact(&record.key)?;
+        events.applied.push(AppliedChange::Removed {
+            target: record.key.target.clone(),
+            source: record.key.source.clone(),
+            artifact: record.key.artifact.clone(),
+            reason: RemovalReason::Pruned,
+        });
+    }
+    Ok(())
+}
+
+fn reject_history_git_entry(ctx: &DeployContext<'_>, whole_root: bool) -> Result<()> {
+    if whole_root
+        && ctx
+            .artifact
+            .leaves
+            .iter()
+            .any(|leaf| leaf.destination.as_str().split(['/', '\\']).next() == Some(".git"))
+    {
+        return Err(Error::Sync(format!(
+            "history source `{}` contains a root `.git` entry",
+            ctx.underlying_source
+        )));
+    }
+    Ok(())
+}
+
 fn deploy_one(
     backend: &dyn SourceStore,
     registry: &dyn StateStore,
     journal: &Journal,
     ctx: DeployContext<'_>,
 ) -> Result<()> {
+    let whole_root = matches!(
+        &ctx.artifact.materialization,
+        Materialization::WholeRoot { .. }
+    );
+    reject_history_git_entry(&ctx, whole_root)?;
     let staging_base = target_parent(ctx.artifact_dst).join(".phora-stage");
-    let key_label = ctx.key.artifact.replace('/', "_");
-    let staging = staging_base.join(format!("{key_label}-{}", nonce()));
+    let staging = staging_path(&staging_base, &ctx.key.artifact);
     let mut staging_guard = StagingGuard::new(&staging_base, &staging);
-
-    let policy = ctx.source.export_policy();
+    let policy = ctx.source.export_policy(whole_root);
 
     let staging_payload = match &ctx.artifact.materialization {
-        Materialization::CollapsedDir { .. } => staging.clone(),
+        Materialization::CollapsedDir { .. } | Materialization::WholeRoot { .. } => staging.clone(),
         Materialization::Leaf(take) => staging.join(leaf_basename(&take.dest)),
     };
 
@@ -760,6 +1203,7 @@ fn deploy_one(
         .iter()
         .map(|f| ManifestFile {
             path: PathBuf::from(f.destination.as_str()),
+            kind: f.kind,
             size: f.size,
             mtime: f.mtime,
             blake3: f.blake3.clone(),
@@ -775,6 +1219,9 @@ fn deploy_one(
             .map_err(|e| Error::Sync(format!("create target dir {}: {e}", parent.display())))?;
     }
 
+    let (history, worktree, content_filter_warning) =
+        prepare_history_deployment(backend, &ctx, whole_root)?;
+
     let record = ArtifactRecord::projected(NewArtifactRecord {
         key: ctx.key,
         underlying_source: ctx.underlying_source,
@@ -785,6 +1232,7 @@ fn deploy_one(
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
         files,
+        history,
         vars_digest: staged.vars_digest,
         deploy_root: Some(ctx.deploy_root),
         layout_separator: ctx.layout.persisted_separator(),
@@ -794,14 +1242,26 @@ fn deploy_one(
         staging_guard.disarm();
     }
     apply_artifact_report(
-        &staging_base,
-        &staging_payload,
-        ctx.artifact_dst,
+        ApplyPaths {
+            staging_base: &staging_base,
+            staging: &staging_payload,
+            dst: ctx.artifact_dst,
+        },
         record,
         journal,
         registry,
         ctx.events,
-    )
+        || {
+            if let Some((guard, request)) = worktree {
+                guard.publish_worktree(&request)?;
+            }
+            Ok(())
+        },
+    )?;
+    if let Some(warning) = content_filter_warning {
+        ctx.events.warnings.push(warning);
+    }
+    Ok(())
 }
 
 fn deploy_link(
@@ -811,7 +1271,16 @@ fn deploy_link(
     key: ArtifactKey,
     deploy_root: String,
 ) -> Result<()> {
-    let policy = entry.source.export_policy();
+    if matches!(
+        entry.item.materialization,
+        Materialization::WholeRoot { .. }
+    ) {
+        return Err(Error::Config(format!(
+            "source `{}`: linked deployment cannot use history whole-root materialization",
+            entry.identity
+        )));
+    }
+    let policy = entry.source.export_policy(false);
     let record = ArtifactRecord {
         version: 1,
         key,
@@ -825,6 +1294,10 @@ fn deploy_link(
         preserve_executable: policy.preserve_executable,
         files: vec![],
         linked: true,
+        history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: Some(deploy_root),
         layout_separator: entry.layout.persisted_separator(),
@@ -861,6 +1334,7 @@ fn link_target(entry: &ArtifactEntry<'_>) -> PathBuf {
     match &entry.item.materialization {
         Materialization::CollapsedDir { dir } => target.push(dir),
         Materialization::Leaf(take) => target.push(&take.source),
+        Materialization::WholeRoot { .. } => {}
     }
     target
 }
@@ -1081,11 +1555,16 @@ mod kind_aware_layout_tests {
             preserve_executable: true,
             files: vec![ManifestFile {
                 path: PathBuf::from(artifact),
+                kind: crate::sync::state::ManifestEntryKind::File,
                 size: 4,
                 mtime: 0,
                 blake3: "blake3:d4e5f6".to_owned(),
             }],
             linked: false,
+            history: false,
+            worktree_admin_id: None,
+            mirror_key: None,
+            cache_git_root: None,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
@@ -1165,6 +1644,22 @@ mod kind_aware_layout_tests {
     }
 
     #[test]
+    fn history_record_deploys_at_binding_identity_without_by_source_composition() {
+        let root = Path::new("/home/u/dest");
+        let target = target_with_layout(root, LayoutKind::BySource);
+        let identity = "dotfiles";
+        let rec = ArtifactRecord {
+            history: true,
+            worktree_admin_id: None,
+            mirror_key: None,
+            cache_git_root: None,
+            ..record(identity, identity, "by-source", RecordKind::Dir)
+        };
+
+        assert_eq!(record_artifact_path(&target, &rec), root.join(identity));
+    }
+
+    #[test]
     fn dir_kind_deploys_at_by_source_layout_path_unchanged() {
         let root = Path::new("/home/u/dest");
         let target = target_with_layout(root, LayoutKind::BySource);
@@ -1221,11 +1716,16 @@ mod kind_aware_layout_tests {
             preserve_executable: true,
             files: vec![ManifestFile {
                 path: PathBuf::from("agents-src-CLAUDE.md"),
+                kind: crate::sync::state::ManifestEntryKind::File,
                 size: 4,
                 mtime: 0,
                 blake3: "blake3:d4e5f6".to_owned(),
             }],
             linked: false,
+            history: false,
+            worktree_admin_id: None,
+            mirror_key: None,
+            cache_git_root: None,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
@@ -1271,6 +1771,7 @@ mod revalidated_treated_like_clean_tests {
         ObservedArtifact::Managed(crate::sync::model::ManagedArtifact {
             record: (),
             condition,
+            overlay_stale: false,
         })
     }
 
@@ -1365,6 +1866,7 @@ mod mode_transition_conflict_tests {
         ObservedArtifact::Managed(crate::sync::model::ManagedArtifact {
             record: (),
             condition,
+            overlay_stale: false,
         })
     }
 

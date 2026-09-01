@@ -7,7 +7,7 @@ pub(crate) mod hooks;
 pub mod inspect;
 pub mod journal;
 pub mod model;
-mod observe;
+pub(crate) mod observe;
 mod plan;
 mod preview;
 mod prune;
@@ -29,7 +29,9 @@ mod tests;
 pub use hooks::{HookOutcome, HookScope, HookStatus};
 pub use plan::{plan_target, project_workspace};
 
+#[cfg(test)]
 use crate::projection::build::projected_artifact_keys;
+use crate::projection::build::projected_artifacts;
 use crate::projection::model::{ArtifactRelativePath, Projection};
 #[cfg(test)]
 use crate::sync::model::ReconciliationPolicy;
@@ -44,7 +46,9 @@ pub use request::{
     AppliedChange, Concurrency, ConflictPolicy, HookPolicy, LockSet, MovedPinPolicy, PrunePolicy,
     SkippedChange, SourcePolicy, SyncOptions, SyncReport, SyncRequest, SyncStatus, SyncWarning,
 };
-pub use verify::{UntrustedHookFinding, VerifyMismatch, VerifyReason, VerifyReport, verify};
+pub use verify::{
+    OverlayFinding, UntrustedHookFinding, VerifyMismatch, VerifyReason, VerifyReport, verify,
+};
 
 #[cfg(feature = "bench")]
 pub use resolve::resolve_sources_for_bench;
@@ -78,7 +82,10 @@ use crate::config::{
 };
 use crate::error::{Error, Result};
 use crate::lock::{Lock, merge_locks, split_locks};
-use crate::source::{SourceStore, is_local_path};
+use crate::source::{
+    SourceName, SourceStore, WorktreeRemoveRequest, is_local_path,
+    remove_missing_mirror_worktree_gitlink,
+};
 use crate::sync::state::{ArtifactKey, ArtifactRecord, Ejection, StateStore};
 
 use journal::Journal;
@@ -591,12 +598,81 @@ fn refuse_lockless_mutation(
                 condition: model::ManagedCondition::MetadataChangedButContentClean { .. },
                 ..
             })
-        )
+        ) && !changeset.changes.iter().any(|change| {
+            matches!(
+                change,
+                model::SyncChange::RewriteOverlay {
+                    target,
+                    source,
+                    artifact,
+                } if target == &entry.target && source == &entry.source && artifact == &entry.artifact
+            )
+        })
     });
-    if input.lockless() && (!changeset.changes.is_empty() || refresh_pending) {
+    let other_mutation = changeset
+        .changes
+        .iter()
+        .any(|change| !matches!(change, model::SyncChange::RewriteOverlay { .. }));
+    if input.lockless() && (other_mutation || refresh_pending) {
         return Err(readonly_state_error(registry));
     }
     Ok(())
+}
+
+fn sweep_history_worktrees<R>(ctx: &DeployAll<'_, R>) -> Result<()>
+where
+    R: StateStore,
+{
+    let mut swept = BTreeSet::new();
+    for record in ctx.registry.all_artifacts()? {
+        let Some((address, admin_id)) = observe::history_address(&record)? else {
+            continue;
+        };
+        let identity = format!(
+            "{}:{}",
+            address.cache_git_root.display(),
+            address.key.as_str()
+        );
+        if swept.contains(&identity) {
+            continue;
+        }
+        let source = SourceName::trusted(record.source.clone());
+        match ctx.backend.lock_worktree_mirror_at(&source, &address) {
+            Ok(guard) => {
+                guard.sweep_worktrees()?;
+                swept.insert(identity);
+            }
+            Err(error) => {
+                let Some(target) = ctx.config.targets.get(&record.key.target) else {
+                    return Err(error.into());
+                };
+                let path = prune::removal_path(target, &record, ctx.protected)?;
+                if !remove_missing_mirror_worktree_gitlink(&address, &admin_id, &path)? {
+                    return Err(error.into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn observe_reconciliation<R>(
+    ctx: &DeployAll<'_, R>,
+    policy: model::ReconciliationPolicy,
+) -> Result<(
+    model::ObservedProjectState<state::ArtifactRecord>,
+    Vec<model::ObservedEntry<state::ArtifactRecord>>,
+    model::ChangeSet,
+)>
+where
+    R: StateStore,
+{
+    let observed = observe::observe_workspace(ctx, ctx.projection)?;
+    let retirements = observe::observe_history_retirements(ctx)?;
+    let mut changeset = reconcile::reconcile(ctx.projection, &observed, &policy)
+        .map_err(|error| Error::Sync(error.to_string()))?;
+    reconcile::add_history_retirement_conflicts(&mut changeset, &retirements, policy);
+    Ok((observed, retirements, changeset))
 }
 
 fn apply_target_changes<R>(
@@ -606,11 +682,13 @@ fn apply_target_changes<R>(
 where
     R: StateStore,
 {
-    let initial_observed = observe::observe_workspace(ctx, ctx.projection)?;
     let options = ctx.input.options();
     let policy = (&options).into();
-    let initial_changeset = reconcile::reconcile(ctx.projection, &initial_observed, &policy)
-        .map_err(|e| Error::Sync(e.to_string()))?;
+    if ctx.input.prune() {
+        sweep_history_worktrees(ctx)?;
+    }
+    let (initial_observed, initial_retirements, initial_changeset) =
+        observe_reconciliation(ctx, policy)?;
     let registry: &dyn StateStore = ctx.registry;
     refuse_lockless_mutation(ctx.input, registry, &initial_observed, &initial_changeset)?;
     let initial_decisions = resolve_conflicts(
@@ -634,10 +712,8 @@ where
         });
     }
 
-    let (observed, changeset, decisions) = if ran {
-        let observed = observe::observe_workspace(ctx, ctx.projection)?;
-        let changeset = reconcile::reconcile(ctx.projection, &observed, &policy)
-            .map_err(|error| Error::Sync(error.to_string()))?;
+    let (observed, changeset, retirements, decisions) = if ran {
+        let (observed, retirements, changeset) = observe_reconciliation(ctx, policy)?;
         refuse_lockless_mutation(ctx.input, registry, &observed, &changeset)?;
         let decisions = resolve_conflicts_reusing(
             &changeset,
@@ -646,11 +722,16 @@ where
             ctx.input.resolver(),
             ctx.input.interactive(),
         )?;
-        (observed, changeset, decisions)
+        (observed, changeset, retirements, decisions)
     } else {
-        (initial_observed, initial_changeset, initial_decisions)
+        (
+            initial_observed,
+            initial_changeset,
+            initial_retirements,
+            initial_decisions,
+        )
     };
-    let reconciliation = Reconciliation::new(&changeset, &observed, decisions);
+    let reconciliation = Reconciliation::new(&changeset, &observed, &retirements, decisions);
     let mut run = ApplyRun {
         had_failures: !skipped_targets.is_empty(),
         pre_deploy: outcomes,
@@ -660,40 +741,21 @@ where
     };
     apply_fast_forward_drops(
         fast_forward_drops,
-        registry,
+        ctx.backend,
+        ctx.registry,
+        ctx.config,
+        ctx.protected,
         &skipped_targets,
         &mut run.events,
     )?;
-    for (target_name, target) in &ctx.config.targets {
-        if skipped_targets.contains(target_name) {
-            continue;
-        }
-        let Some(target_projection) = ctx
-            .projection
-            .targets
-            .iter()
-            .find(|tp| &tp.target == target_name)
-        else {
-            continue;
-        };
-        run.had_failures |= deploy_reconciled_target_report(
-            target_run(ctx, target_name, target),
-            target_projection,
-            &reconciliation,
-            ctx.backend,
-            registry,
-            ctx.journal,
-            &mut run.events,
-        )?;
-    }
+    run.had_failures |=
+        deploy_reconciled_targets(ctx, &reconciliation, &mut run.events, &skipped_targets)?;
     if !run.had_failures {
         prune::apply_reconciled_removals(
             &changeset.changes,
             &observed,
             ctx.projection,
-            ctx.config,
-            registry,
-            ctx.protected,
+            ctx,
             &mut run.events,
         )?;
     } else if ctx.input.prune() && run.had_failures {
@@ -702,6 +764,41 @@ where
             .push(SyncWarning::PruneSkippedAfterFailures);
     }
     Ok(run)
+}
+
+fn deploy_reconciled_targets<R>(
+    ctx: &DeployAll<'_, R>,
+    reconciliation: &Reconciliation<'_>,
+    events: &mut SyncEvents,
+    skipped_targets: &BTreeSet<String>,
+) -> Result<bool>
+where
+    R: StateStore,
+{
+    let mut had_failures = false;
+    for (target_name, target) in &ctx.config.targets {
+        if skipped_targets.contains(target_name) {
+            continue;
+        }
+        let Some(target_projection) = ctx
+            .projection
+            .targets
+            .iter()
+            .find(|target_projection| &target_projection.target == target_name)
+        else {
+            continue;
+        };
+        had_failures |= deploy_reconciled_target_report(
+            target_run(ctx, target_name, target),
+            target_projection,
+            reconciliation,
+            ctx.backend,
+            ctx.registry,
+            ctx.journal,
+            events,
+        )?;
+    }
+    Ok(had_failures)
 }
 
 fn reject_cross_target_overlap(projection: &Projection, config: &Config) -> Result<()> {
@@ -713,10 +810,9 @@ fn reject_cross_target_overlap(projection: &Projection, config: &Config) -> Resu
             continue;
         };
         let root = cwd.join(target.expanded_path());
-        let layout = target.layout();
         for binding in &target_projection.bindings {
-            for key in projected_artifact_keys(binding) {
-                let path = root.join(layout.artifact_path(&binding.identity, &key));
+            for item in projected_artifacts(binding) {
+                let path = root.join(item.destination.as_str());
                 let physical = confine::normalize_physical(&path)?;
                 let identity = confine::fold_path(&physical);
                 placements.push((&target_projection.target, physical, identity));
@@ -826,14 +922,8 @@ fn readonly_state_error(registry: &dyn StateStore) -> Error {
 }
 
 enum FastForwardDrop {
-    Remove {
-        record: ArtifactRecord,
-        path: PathBuf,
-    },
-    KeepLive {
-        record: ArtifactRecord,
-        path: PathBuf,
-    },
+    Remove { record: ArtifactRecord },
+    KeepLive { record: ArtifactRecord },
 }
 
 impl FastForwardDrop {
@@ -864,26 +954,17 @@ fn plan_fast_forward_drops(
         let Some(target) = config.targets.get(&record.key.target) else {
             continue;
         };
-        let dst = target::record_artifact_path(target, &record);
-        let confined = match &target.confine {
-            Some(anchor) => confine::confine_destination(anchor, &dst, protected),
-            None if target::is_composed_target(&record.key.target) => Err(Error::Config(format!(
-                "confinement: composed target `{}` reached fast-forward prune without a confine \
-                 anchor; refusing an unconfined delete",
-                record.key.target
-            ))),
-            None => Ok(dst.clone()),
-        };
-        let path = confined.map_err(|error| {
+        let dst = prune::removal_destination(target, &record);
+        let path = prune::removal_path(target, &record, protected).map_err(|error| {
             Error::Sync(format!(
                 "fast-forward refuses out-of-anchor {}: {error}; eject it instead",
                 dst.display()
             ))
         })?;
         if prune::overlaps_live_dest(&path, &expected_paths, &record.key.target) {
-            plan.push(FastForwardDrop::KeepLive { record, path });
+            plan.push(FastForwardDrop::KeepLive { record });
         } else {
-            plan.push(FastForwardDrop::Remove { record, path });
+            plan.push(FastForwardDrop::Remove { record });
         }
     }
     Ok(plan)
@@ -1445,7 +1526,10 @@ fn paths_overlap(first: &str, second: &str) -> bool {
 
 fn apply_fast_forward_drops(
     drops: &[FastForwardDrop],
+    backend: &dyn SourceStore,
     registry: &dyn StateStore,
+    config: &Config,
+    protected: &confine::ProtectedPathSet,
     skipped_targets: &BTreeSet<String>,
     events: &mut SyncEvents,
 ) -> Result<()> {
@@ -1454,22 +1538,35 @@ fn apply_fast_forward_drops(
         if skipped_targets.contains(&record.key.target) {
             continue;
         }
+        let target = config.targets.get(&record.key.target).ok_or_else(|| {
+            Error::Sync(format!(
+                "fast-forward target `{}` disappeared before removal",
+                record.key.target
+            ))
+        })?;
+        let path = prune::removal_path(target, record, protected).map_err(|error| {
+            Error::Sync(format!(
+                "fast-forward refuses out-of-anchor {}: {error}; eject it instead",
+                record.key.artifact
+            ))
+        })?;
         match drop {
-            FastForwardDrop::KeepLive { path, .. } => {
+            FastForwardDrop::KeepLive { .. } => {
                 events.warnings.push(SyncWarning::FastForwardKeptLive {
                     source: record.key.source.clone(),
                     artifact: record.key.artifact.clone(),
-                    path: path.clone(),
+                    path,
                 });
             }
-            FastForwardDrop::Remove { path, .. } => {
+            FastForwardDrop::Remove { .. } => {
                 events.warnings.push(SyncWarning::FastForwardDropped {
                     source: record.key.source.clone(),
                     artifact: record.key.artifact.clone(),
                 });
-                remove_orphan_path(path).map_err(|error| {
+                remove_orphan_path(&path).map_err(|error| {
                     Error::Sync(format!("fast-forward prune {}: {error}", path.display()))
                 })?;
+                detach_history_overlay(record, &path, backend)?;
             }
         }
         registry.remove_artifact(&record.key)?;
@@ -1495,7 +1592,16 @@ fn prune_fast_forward_drops_report(
         drops.to_vec(),
         lockless,
     )?;
-    apply_fast_forward_drops(&plan, registry, &BTreeSet::new(), events)
+    let backend = crate::source::GitBackend::new(PathBuf::new());
+    apply_fast_forward_drops(
+        &plan,
+        &backend,
+        registry,
+        config,
+        protected,
+        &BTreeSet::new(),
+        events,
+    )
 }
 
 struct SealedOffer<'a> {
@@ -1762,34 +1868,74 @@ pub fn eject(
     artifact: &str,
     source: &str,
     target: &str,
+    backend: &dyn SourceStore,
 ) -> Result<()> {
-    if !config.targets.contains_key(target) {
-        return Err(Error::Config(format!("unknown target: {target}")));
-    }
+    let target_config = config
+        .targets
+        .get(target)
+        .ok_or_else(|| Error::Config(format!("unknown target: {target}")))?;
     let key = ArtifactKey {
         target: target.to_owned(),
         source: source.to_owned(),
         artifact: artifact.to_owned(),
     };
-    if registry.artifact(&key)?.is_none() {
-        return Err(Error::StateStore(format!(
+    let record = registry.artifact(&key)?.ok_or_else(|| {
+        Error::StateStore(format!(
             "{source}/{artifact} is not managed in target {target}"
-        )));
-    }
+        ))
+    })?;
+    let deploy_root = prune::removal_destination(target_config, &record);
+    eject_artifact(&key, Some(&record), &deploy_root, backend, registry)
+}
 
-    let mut ejected = registry.ejections(target)?;
-    let already = ejected
+pub(super) fn eject_artifact(
+    key: &ArtifactKey,
+    record: Option<&ArtifactRecord>,
+    deploy_root: &Path,
+    backend: &dyn SourceStore,
+    registry: &dyn StateStore,
+) -> Result<()> {
+    if let Some(record) = record {
+        detach_history_overlay(record, deploy_root, backend)?;
+    }
+    let mut ejected = registry.ejections(&key.target)?;
+    if !ejected
         .iter()
-        .any(|e| e.source == source && e.artifact == artifact);
-    if !already {
+        .any(|entry| entry.source == key.source && entry.artifact == key.artifact)
+    {
         ejected.push(Ejection {
-            source: source.to_owned(),
-            artifact: artifact.to_owned(),
+            source: key.source.clone(),
+            artifact: key.artifact.clone(),
             ejected_at: chrono::Utc::now().to_rfc3339(),
         });
-        registry.save_ejections(target, &ejected)?;
+        registry.save_ejections(&key.target, &ejected)?;
     }
-    // Record kept (not removed): list/where render `ejected` from it, and uneject restores by clearing the entry alone.
+    Ok(())
+}
+
+pub(super) fn detach_history_overlay(
+    record: &ArtifactRecord,
+    deploy_root: &Path,
+    backend: &dyn SourceStore,
+) -> Result<()> {
+    let Some((address, admin_id)) = observe::history_address(record)? else {
+        return Ok(());
+    };
+    if remove_missing_mirror_worktree_gitlink(&address, &admin_id, deploy_root)? {
+        return Ok(());
+    }
+    let source = SourceName::trusted(record.source.clone());
+    let guard = match backend.lock_worktree_mirror_at(&source, &address) {
+        Ok(guard) => guard,
+        Err(_) if remove_missing_mirror_worktree_gitlink(&address, &admin_id, deploy_root)? => {
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    guard.remove_worktree(&WorktreeRemoveRequest {
+        admin_id,
+        deploy_root: deploy_root.to_path_buf(),
+    })?;
     Ok(())
 }
 

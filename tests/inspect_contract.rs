@@ -6,8 +6,8 @@ use phora::sync::inspect::inspect;
 use phora::sync::model::{ManagedCondition, ObservedArtifact};
 use phora::sync::state::StateStore;
 use phora::sync::state::{
-    ArtifactKey, ArtifactRecord, Ejection, FileStateStore, HookState, ManifestFile, StateError,
-    StateLock,
+    ArtifactKey, ArtifactRecord, Ejection, FileStateStore, HookState, ManifestEntryKind,
+    ManifestFile, StateError, StateLock,
 };
 use tempfile::TempDir;
 
@@ -50,6 +50,7 @@ fn deploy_and_record(target: &Path, files: &[(&str, &[u8])]) -> ArtifactRecord {
         std::fs::write(&path, contents).expect("write artifact file");
         manifest.push(ManifestFile {
             path: PathBuf::from(rel),
+            kind: ManifestEntryKind::File,
             size: contents.len() as u64,
             mtime: mtime_secs(&path),
             blake3: blake3::hash(contents).to_hex().to_string(),
@@ -68,6 +69,10 @@ fn deploy_and_record(target: &Path, files: &[(&str, &[u8])]) -> ArtifactRecord {
         preserve_executable: true,
         files: manifest,
         linked: false,
+        history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,

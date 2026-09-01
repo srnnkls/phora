@@ -109,14 +109,23 @@ pub fn apply_artifact(
 ) -> Result<()> {
     let mut events = SyncEvents::default();
     apply_artifact_report(
-        staging_base,
-        staging,
-        dst,
+        ApplyPaths {
+            staging_base,
+            staging,
+            dst,
+        },
         record,
         journal,
         registry,
         &mut events,
+        || Ok(()),
     )
+}
+
+pub(super) struct ApplyPaths<'a> {
+    pub(super) staging_base: &'a Path,
+    pub(super) staging: &'a Path,
+    pub(super) dst: &'a Path,
 }
 
 #[expect(
@@ -124,53 +133,63 @@ pub fn apply_artifact(
     reason = "caller hands off ownership of the record being deployed"
 )]
 pub(super) fn apply_artifact_report(
-    staging_base: &Path,
-    staging: &Path,
-    dst: &Path,
+    paths: ApplyPaths<'_>,
     record: ArtifactRecord,
     journal: &Journal,
     registry: &dyn StateStore,
     events: &mut SyncEvents,
+    post_swap: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     let mut cleanup = CleanupGuard::new();
-    cleanup.track(staging.to_path_buf());
-    cleanup.track(backup_path(staging_base, dst));
-    cleanup.prune_base_if_empty(staging_base.to_path_buf());
+    cleanup.track(paths.staging.to_path_buf());
+    cleanup.track(backup_path(paths.staging_base, paths.dst));
+    cleanup.prune_base_if_empty(paths.staging_base.to_path_buf());
 
     journal.append(&JournalEntry {
-        staging_base: staging_base.to_path_buf(),
-        staging: staging.to_path_buf(),
-        dst: dst.to_path_buf(),
+        staging_base: paths.staging_base.to_path_buf(),
+        staging: paths.staging.to_path_buf(),
+        dst: paths.dst.to_path_buf(),
         record: record.clone(),
         swap_completed: false,
     })?;
 
-    let backup = match dst.try_exists() {
+    let backup = match paths.dst.try_exists() {
         Ok(true) => {
-            let backup = backup_path(staging_base, dst);
-            std::fs::rename(dst, &backup).map_err(|e| {
+            let backup = backup_path(paths.staging_base, paths.dst);
+            std::fs::rename(paths.dst, &backup).map_err(|e| {
                 Error::Projection(format!(
                     "rename {} -> {}: {e}",
-                    dst.display(),
+                    paths.dst.display(),
                     backup.display()
                 ))
             })?;
             Some(backup)
         }
         Ok(false) => None,
-        Err(e) => return Err(Error::Projection(format!("stat {}: {e}", dst.display()))),
+        Err(e) => {
+            return Err(Error::Projection(format!(
+                "stat {}: {e}",
+                paths.dst.display()
+            )));
+        }
     };
 
-    swap_into(staging, dst, record.allow_symlinks, events)?;
-    journal.mark_swap_completed(dst)?;
+    swap_into(paths.staging, paths.dst, record.allow_symlinks, events)?;
+    journal.mark_swap_completed(paths.dst)?;
+
+    if let Err(error) = post_swap() {
+        rollback_swap(paths.dst, backup.as_deref())?;
+        journal.remove(paths.dst)?;
+        return Err(error);
+    }
 
     if let Err(put_err) = registry.put_artifact(&record) {
-        rollback_swap(dst, backup.as_deref())?;
-        journal.remove(dst)?;
+        rollback_swap(paths.dst, backup.as_deref())?;
+        journal.remove(paths.dst)?;
         return Err(put_err.into());
     }
 
-    journal.remove(dst)?;
+    journal.remove(paths.dst)?;
     Ok(())
 }
 
@@ -465,6 +484,7 @@ mod tests {
         for (rel, contents) in files {
             manifest.push(ManifestFile {
                 path: PathBuf::from(rel),
+                kind: crate::sync::state::ManifestEntryKind::File,
                 size: contents.len() as u64,
                 mtime: read_mtime_secs(&staging.join(rel)),
                 blake3: blake3::hash(contents).to_hex().to_string(),
@@ -483,6 +503,10 @@ mod tests {
             preserve_executable: true,
             files: manifest,
             linked: false,
+            history: false,
+            worktree_admin_id: None,
+            mirror_key: None,
+            cache_git_root: None,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
