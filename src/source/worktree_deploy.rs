@@ -432,13 +432,11 @@ pub(crate) fn physical_cache_git_root(cache_root: &Path) -> Result<Option<PathBu
     if cache_root.components().any(|component| {
         matches!(
             component,
-            std::path::Component::CurDir
-                | std::path::Component::ParentDir
-                | std::path::Component::Prefix(_)
+            std::path::Component::CurDir | std::path::Component::ParentDir
         )
     }) {
         return Err(SourceError::Source(format!(
-            "worktree cache root {} has a non-normal component",
+            "worktree cache root {} has a `.` or `..` component",
             cache_root.display()
         )));
     }
