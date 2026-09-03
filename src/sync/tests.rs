@@ -360,6 +360,7 @@ struct CountingBackend<'a> {
     fetches: AtomicUsize,
     resolves: AtomicUsize,
     reads: AtomicUsize,
+    total_reads: AtomicUsize,
     seen_reads: Mutex<BTreeSet<(String, String, String)>>,
     discovers: AtomicUsize,
 }
@@ -371,6 +372,7 @@ impl<'a> CountingBackend<'a> {
             fetches: AtomicUsize::new(0),
             resolves: AtomicUsize::new(0),
             reads: AtomicUsize::new(0),
+            total_reads: AtomicUsize::new(0),
             seen_reads: Mutex::new(BTreeSet::new()),
             discovers: AtomicUsize::new(0),
         }
@@ -386,6 +388,10 @@ impl<'a> CountingBackend<'a> {
 
     fn read_count(&self) -> usize {
         self.reads.load(AtomicOrdering::SeqCst)
+    }
+
+    fn total_read_count(&self) -> usize {
+        self.total_reads.load(AtomicOrdering::SeqCst)
     }
 
     fn reset_read_probe(&self) {
@@ -423,6 +429,7 @@ impl SourceStore for CountingBackend<'_> {
     }
 
     fn read(&self, snapshot: &SnapshotId, path: &SourcePath) -> SourceResult<SourceEntry> {
+        self.total_reads.fetch_add(1, AtomicOrdering::SeqCst);
         let key = (
             snapshot.mirror().as_str().to_owned(),
             snapshot.commit().to_string(),
@@ -848,6 +855,83 @@ fn matching_lock_reuses_commit_without_refetch() {
     assert_ne!(
         locked.commit, new_head,
         "no refetch means the advanced HEAD must not leak into the lock"
+    );
+}
+
+#[test]
+fn matching_lock_reuses_digest_but_invalidated_lock_recomputes_it() {
+    let fx = build_sync_fixture();
+    let cfg = config_with_source("editor-src", &fx.url);
+    let source = parsed_of(&cfg, "editor-src");
+    seed_git_mirror(&fx.backend, "editor-src", &fx.url);
+    let real_digest = expected_digest(&fx, "editor-src", &fx.head_sha);
+    let sentinel_digest =
+        "blake3:0000000000000000000000000000000000000000000000000000000000000000".to_owned();
+    assert_ne!(sentinel_digest, real_digest, "sentinel must be stale");
+    let matching = Lock {
+        version: crate::lock::LOCK_SCHEMA_VERSION,
+        sources: vec![crate::lock::LockedSource {
+            name: "editor-src".to_owned(),
+            git: fx.url.clone(),
+            resolved: source.refspec().to_string(),
+            commit: fx.head_sha.clone(),
+            digest: sentinel_digest.clone(),
+            config_digest: source.config_digest(),
+            r#ref: None,
+            instance: None,
+        }],
+        trusted_hooks: Vec::new(),
+        candidate_hooks: Vec::new(),
+    };
+
+    let mut invalidated = matching.clone();
+    invalidated.sources[0].config_digest = "blake3:invalidated".to_owned();
+    let invalidated_backend = CountingBackend::new(&fx.backend);
+    let invalidated_out = sync(
+        &input(&cfg, None, Some(invalidated), None, false),
+        &invalidated_backend,
+        &fx.registry,
+    )
+    .expect("invalidated locked source syncs");
+    let recomputed = invalidated_out
+        .base_lock
+        .find_source("editor-src")
+        .expect("invalidated source is relocked");
+
+    assert_eq!(
+        recomputed.commit, fx.head_sha,
+        "the invalidated source still resolves to the same commit"
+    );
+    assert_eq!(
+        recomputed.digest, real_digest,
+        "recomputing the unchanged snapshot replaces the stale locked digest"
+    );
+    assert!(
+        invalidated_backend.total_read_count() > 0,
+        "a nonmatching config digest must still read blobs to recompute the source digest"
+    );
+
+    let matching_backend = CountingBackend::new(&fx.backend);
+    let matching_out = sync(
+        &input(&cfg, None, Some(matching), None, false),
+        &matching_backend,
+        &fx.registry,
+    )
+    .expect("matching locked source syncs");
+
+    assert_eq!(
+        matching_out
+            .base_lock
+            .find_source("editor-src")
+            .expect("matching source remains locked")
+            .digest,
+        sentinel_digest,
+        "a matching unchanged source preserves its locked digest"
+    );
+    assert_eq!(
+        matching_backend.total_read_count(),
+        0,
+        "a matching unchanged source must reuse its locked digest without reading blobs"
     );
 }
 
