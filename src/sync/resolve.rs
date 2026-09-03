@@ -214,7 +214,10 @@ fn resolve_unit(
         }
     };
 
-    let digest = selected_source_digest(store, &source_resolution, source)?;
+    let digest = match lock_entry {
+        Some(locked) if locked.commit == commit => locked.digest.clone(),
+        _ => selected_source_digest(store, &source_resolution, source)?,
+    };
 
     let resolved = if source.mode() == SourceMode::Url {
         "url".to_owned()
