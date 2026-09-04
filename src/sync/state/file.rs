@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::{StateStore, locking::StateLock};
+use super::{StateStore, durable::fsync_barrier, locking::StateLock};
 
 #[cfg(all(test, target_os = "linux"))]
 use super::locking::unescape_octal;
@@ -277,8 +277,7 @@ fn atomic_write(path: &Path, contents: &str) -> Result<()> {
         handle
             .write_all(contents.as_bytes())
             .map_err(|e| StateError::StateStore(format!("write temp {}: {e}", tmp.display())))?;
-        handle
-            .sync_all()
+        fsync_barrier(&handle)
             .map_err(|e| StateError::StateStore(format!("fsync temp {}: {e}", tmp.display())))?;
     }
     std::fs::rename(&tmp, path).map_err(|e| {

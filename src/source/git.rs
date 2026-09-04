@@ -1,5 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use gix::object::tree::EntryKind;
 
@@ -23,16 +24,49 @@ use super::{
 
 pub struct GitBackend {
     pub(super) git_dir: PathBuf,
+    opened_mirrors: Mutex<HashMap<PathBuf, gix::ThreadSafeRepository>>,
 }
 
 impl GitBackend {
     #[must_use]
     pub fn new(git_dir: PathBuf) -> Self {
-        Self { git_dir }
+        Self {
+            git_dir,
+            opened_mirrors: Mutex::new(HashMap::new()),
+        }
     }
 
     pub(super) fn mirror_path(&self, url: &str) -> PathBuf {
         mirror_path(&self.git_dir, url)
+    }
+
+    fn opened_mirror(&self, snapshot: &SnapshotId) -> Result<gix::Repository> {
+        let mirror = mirror_path_for_key(&self.git_dir, snapshot.mirror());
+        let mut opened = self
+            .opened_mirrors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(repo) = opened.get(&mirror) {
+            return Ok(repo.to_thread_local());
+        }
+        let repo = gix::open(&mirror)
+            .map_err(|e| {
+                SourceError::Source(format!(
+                    "open snapshot mirror {}: {e}",
+                    snapshot.mirror().as_str()
+                ))
+            })?
+            .into_sync();
+        let local = repo.to_thread_local();
+        opened.insert(mirror, repo);
+        Ok(local)
+    }
+
+    fn forget_opened_mirror(&self, mirror: &Path) {
+        self.opened_mirrors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(mirror);
     }
 
     /// Reads a remote's root `phora.toml` at `refspec`, reusing an existing mirror
@@ -121,6 +155,7 @@ impl GitBackend {
         let _lock = lock_mirror(&self.git_dir, source, url)?;
         sweep_orphan_staging(&self.git_dir, url);
         let mirror = self.mirror_path(url);
+        self.forget_opened_mirror(&mirror);
 
         if let Some(repo) = open_mirror(source, &mirror)?
             && fetch_into_mirror(source, &repo).is_ok()
@@ -316,16 +351,6 @@ impl GitBackend {
         Ok(())
     }
 
-    fn open_snapshot(&self, snapshot: &SnapshotId) -> Result<gix::Repository> {
-        let mirror = mirror_path_for_key(&self.git_dir, snapshot.mirror());
-        gix::open(&mirror).map_err(|e| {
-            SourceError::Source(format!(
-                "open snapshot mirror {}: {e}",
-                snapshot.mirror().as_str()
-            ))
-        })
-    }
-
     fn commit_tree<'repo>(
         repo: &'repo gix::Repository,
         source: &str,
@@ -423,7 +448,12 @@ impl SourceStore for GitBackend {
                         request.name
                     )));
                 }
-                resolve_worktree(&self.git_dir, &request.name, root)
+                let resolved = resolve_worktree(&self.git_dir, &request.name, root)?;
+                self.forget_opened_mirror(&mirror_path_for_key(
+                    &self.git_dir,
+                    resolved.snapshot.mirror(),
+                ));
+                Ok(resolved)
             }
             SourceLocation::Url { .. } => Err(SourceError::Source(format!(
                 "url source {} requires the url source adapter",
@@ -439,7 +469,7 @@ impl SourceStore for GitBackend {
     ) -> Result<SourceInventory> {
         let name = snapshot.mirror().as_str();
         let commit = snapshot_commit(snapshot).as_str();
-        let repo = self.open_snapshot(snapshot)?;
+        let repo = self.opened_mirror(snapshot)?;
         let tree = Self::subtree_at_root(
             &repo,
             name,
@@ -458,7 +488,7 @@ impl SourceStore for GitBackend {
     fn read(&self, snapshot: &SnapshotId, path: &SourcePath) -> Result<SourceEntry> {
         let name = snapshot.mirror().as_str();
         let commit = snapshot_commit(snapshot).as_str();
-        let repo = self.open_snapshot(snapshot)?;
+        let repo = self.opened_mirror(snapshot)?;
         let tree = Self::commit_tree(&repo, name, commit)?;
         let entry = tree
             .lookup_entry_by_path(Path::new(path.as_str()))
@@ -489,7 +519,7 @@ impl SourceStore for GitBackend {
     ) -> Result<Vec<SourceDirectoryEntry>> {
         let name = snapshot.mirror().as_str();
         let commit = snapshot_commit(snapshot).as_str();
-        let repo = self.open_snapshot(snapshot)?;
+        let repo = self.opened_mirror(snapshot)?;
         let subtree = Self::subtree_at_root(
             &repo,
             name,
