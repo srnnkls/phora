@@ -337,6 +337,10 @@ fn write_leaf(path: &Path, data: &[u8], commit_time: u64, executable: bool) -> R
             file.set_permissions(perms)?;
         }
     }
+    set_deterministic_mtime(&file, commit_time)
+}
+
+fn set_deterministic_mtime(file: &std::fs::File, commit_time: u64) -> Result<()> {
     let mtime = std::time::UNIX_EPOCH
         .checked_add(std::time::Duration::from_secs(commit_time))
         .ok_or_else(|| SourceError::Source(format!("commit_time out of range: {commit_time}")))?;
