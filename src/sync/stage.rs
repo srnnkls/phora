@@ -337,7 +337,10 @@ fn write_leaf(path: &Path, data: &[u8], commit_time: u64, executable: bool) -> R
             file.set_permissions(perms)?;
         }
     }
-    file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(commit_time))?;
+    let mtime = std::time::UNIX_EPOCH
+        .checked_add(std::time::Duration::from_secs(commit_time))
+        .ok_or_else(|| SourceError::Source(format!("commit_time out of range: {commit_time}")))?;
+    file.set_modified(mtime)?;
     Ok(())
 }
 

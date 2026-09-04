@@ -1,8 +1,8 @@
 use std::fs::File;
 use std::io;
 
-/// Rust std maps `sync_all` to `F_FULLFSYNC` on Apple targets; write-then-rename
-/// only needs the ordering `F_BARRIERFSYNC` gives.
+/// Rust std maps `sync_all` to `F_FULLFSYNC` on macOS; write-then-rename only
+/// needs the ordering `F_BARRIERFSYNC` gives.
 #[cfg(target_os = "macos")]
 pub(crate) fn fsync_barrier(file: &File) -> io::Result<()> {
     use std::os::fd::AsRawFd as _;
