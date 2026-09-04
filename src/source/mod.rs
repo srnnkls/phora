@@ -829,6 +829,61 @@ mod tests {
     }
 
     #[test]
+    fn reads_after_refresh_see_the_new_commit_and_the_old_snapshot() {
+        let fixture = build_git_fixture();
+        let main = || RevisionSpec::Branch("main".into());
+        let first = refresh_git(&fixture.backend, "src", &fixture.url, main())
+            .expect("first refresh clones");
+        let readme = SourcePath::new("README.md").expect("valid path");
+        let before = fixture
+            .backend
+            .read(&first.snapshot, &readme)
+            .expect("read README at the first snapshot");
+
+        std::fs::write(fixture.src.path().join("THIRD.md"), b"third commit\n")
+            .expect("write third file");
+        run_git(fixture.src.path(), &["add", "THIRD.md"]);
+        run_git(fixture.src.path(), &["commit", "-m", "third"]);
+        let second = refresh_git(&fixture.backend, "src", &fixture.url, main())
+            .expect("second refresh fetches the new commit");
+        assert_ne!(second.snapshot.commit(), first.snapshot.commit());
+
+        let third = fixture
+            .backend
+            .read(
+                &second.snapshot,
+                &SourcePath::new("THIRD.md").expect("valid path"),
+            )
+            .expect("a refreshed mirror serves the commit it just fetched");
+        assert_eq!(third.bytes, b"third commit\n");
+        assert_eq!(
+            fixture
+                .backend
+                .read(&first.snapshot, &readme)
+                .expect("old snapshot")
+                .bytes,
+            before.bytes
+        );
+
+        let mirror = fixture.backend.mirror_path(&fixture.url);
+        std::fs::remove_dir_all(&mirror).expect("drop the real mirror");
+        std::fs::create_dir_all(&mirror).expect("recreate an empty mirror dir");
+        std::fs::write(mirror.join("garbage"), b"not a repo").expect("write garbage");
+        let recloned = refresh_git(&fixture.backend, "src", &fixture.url, main())
+            .expect("refresh reclones over a corrupt mirror");
+        assert_eq!(recloned.snapshot.commit(), second.snapshot.commit());
+        assert_eq!(
+            fixture
+                .backend
+                .read(&recloned.snapshot, &readme)
+                .expect("recloned")
+                .bytes,
+            before.bytes,
+            "a recloned mirror must be read fresh, not through a handle onto the removed one"
+        );
+    }
+
+    #[test]
     fn refresh_reclones_a_corrupt_canonical_mirror() {
         let fixture = build_git_fixture();
         let mirror = fixture.backend.mirror_path(&fixture.url);

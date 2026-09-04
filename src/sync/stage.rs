@@ -265,18 +265,12 @@ impl<F: StagedRecord> ExportWalk<'_, '_, F> {
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&out_path, &data)?;
-        set_deterministic_mtime(&out_path, self.commit_time)?;
-
-        if executable && self.policy.preserve_executable {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = std::fs::metadata(&out_path)?.permissions();
-                perms.set_mode(perms.mode() | 0o111);
-                std::fs::set_permissions(&out_path, perms)?;
-            }
-        }
+        write_leaf(
+            &out_path,
+            &data,
+            self.commit_time,
+            executable && self.policy.preserve_executable,
+        )?;
 
         let tag: &[u8] = if executable {
             b"\x00exec\x00"
@@ -329,10 +323,21 @@ impl<F: StagedRecord> ExportWalk<'_, '_, F> {
     }
 }
 
-fn set_deterministic_mtime(path: &Path, commit_time: u64) -> Result<()> {
-    let seconds = i64::try_from(commit_time)
-        .map_err(|e| SourceError::Source(format!("commit_time out of range: {e}")))?;
-    filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(seconds, 0))?;
+fn write_leaf(path: &Path, data: &[u8], commit_time: u64, executable: bool) -> Result<()> {
+    use std::io::Write as _;
+
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(data)?;
+    if executable {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = file.metadata()?.permissions();
+            perms.set_mode(perms.mode() | 0o111);
+            file.set_permissions(perms)?;
+        }
+    }
+    file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(commit_time))?;
     Ok(())
 }
 
