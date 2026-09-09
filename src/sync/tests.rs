@@ -1701,6 +1701,80 @@ fn sync_rejects_overlap_with_inner_target_lexically_first() {
     drop(si);
 }
 
+#[cfg(unix)]
+#[test]
+fn sync_repeats_disjoint_link_targets_sharing_files_or_directories() {
+    for collapse in [false, true] {
+        let (source, url) = build_named_artifact_repo("shared", "f.txt", b"linked\n");
+        let (_g, _s, backend, registry) = fresh_backend_registry();
+        let td = TargetDir::new();
+        let alpha = td.target_path().join("alpha");
+        let beta = td.target_path().join("beta");
+        let cfg = Config::parse(&format!(
+            "version = 1\n\n\
+             [sources.linked]\npath = '{url}'\ndeploy = 'link'\n\n\
+             [targets.alpha]\npath = '{}'\nlayout = 'flat'\n\
+             [targets.alpha.sources]\nlinked = {{ collapse = {collapse} }}\n\n\
+             [targets.beta]\npath = '{}'\nlayout = 'flat'\n\
+             [targets.beta.sources]\nlinked = {{ collapse = {collapse} }}\n",
+            alpha.display(),
+            beta.display(),
+        ))
+        .expect("shared link-source config parses");
+
+        let first = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+            .expect("first link sync succeeds");
+        assert!(!first.had_failures);
+        let second = sync(
+            &input(&cfg, None, Some(first.base_lock), None, false),
+            &backend,
+            &registry,
+        )
+        .expect("repeat link sync keeps distinct destination identities");
+        assert!(!second.had_failures);
+        for target in [&alpha, &beta] {
+            let artifact = if collapse { "shared" } else { "shared/f.txt" };
+            assert!(target.join(artifact).is_symlink());
+            assert_eq!(
+                std::fs::read(target.join("shared/f.txt")).expect("read linked content"),
+                b"linked\n"
+            );
+        }
+        assert_eq!(
+            std::fs::read(source.path().join("shared/f.txt")).expect("read source"),
+            b"linked\n"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_rejects_link_targets_sharing_a_destination_or_symlinked_parent() {
+    for alias_parent in [false, true] {
+        let (source, _url) = build_named_artifact_repo("shared", "f.txt", b"linked\n");
+        let (_g, _s, backend, registry) = fresh_backend_registry();
+        let td = TargetDir::new();
+        let physical = td.target_path().join("physical");
+        std::fs::create_dir_all(&physical).expect("create target parent");
+        let second = if alias_parent {
+            let alias = td.target_path().join("alias");
+            std::os::unix::fs::symlink(&physical, &alias).expect("alias target parent");
+            alias
+        } else {
+            physical.clone()
+        };
+        let cfg = config_link_source_two_targets("linked", source.path(), &physical, &second);
+
+        assert_overlap_rejected(
+            sync(&input(&cfg, None, None, None, false), &backend, &registry),
+            &registry,
+            ("first", "second"),
+            "shared",
+            &[physical.join("linked/shared")],
+        );
+    }
+}
+
 #[test]
 fn sync_allows_two_targets_with_disjoint_physical_roots() {
     let (so, url_o) = build_named_artifact_repo("shared", "f.txt", b"outer\n");
