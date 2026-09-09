@@ -977,6 +977,22 @@ where
     let mut events = SyncEvents::default();
     let mut effective_config = merged_config(input);
     effective_config.validate()?;
+    let pre_sync_outcomes = run_pre_sync(input, &effective_config)?;
+    if pre_sync_outcomes
+        .iter()
+        .any(|o| o.status == hooks::HookStatus::Failure)
+    {
+        return Ok(aborted_before_deploy_phase(
+            input
+                .locks
+                .base
+                .clone()
+                .unwrap_or_else(|| split_locks(Vec::new(), &BTreeSet::new()).0),
+            input.locks.local.clone(),
+            pre_sync_outcomes,
+            events,
+        ));
+    }
     let mut parsed = effective_config.parsed_sources()?;
     let mut remotes = resolved_remotes(&effective_config, &parsed)?;
     let effective_lock = effective_lock(input);
@@ -1056,20 +1072,6 @@ where
         pending_fast_forward_drops,
         input.lockless,
     )?;
-
-    // pre_sync gates the run before planned drops or ordinary target changes are applied.
-    let pre_sync_outcomes = run_pre_sync(input, &effective_config)?;
-    if pre_sync_outcomes
-        .iter()
-        .any(|o| o.status == hooks::HookStatus::Failure)
-    {
-        return Ok(aborted_before_deploy_phase(
-            base_lock,
-            local_lock,
-            pre_sync_outcomes,
-            events,
-        ));
-    }
 
     let deploy = DeployProtocol {
         workspace: DeployAll {
