@@ -704,7 +704,11 @@ where
     Ok(run)
 }
 
-fn reject_cross_target_overlap(projection: &Projection, config: &Config) -> Result<()> {
+fn reject_cross_target_overlap(
+    projection: &Projection,
+    config: &Config,
+    parsed: &BTreeMap<String, ParsedSource>,
+) -> Result<()> {
     let cwd = std::env::current_dir()
         .map_err(|e| Error::Sync(format!("resolve current dir for overlap check: {e}")))?;
     let mut placements: Vec<(&str, PathBuf, PathBuf)> = Vec::new();
@@ -717,7 +721,16 @@ fn reject_cross_target_overlap(projection: &Projection, config: &Config) -> Resu
         for binding in &target_projection.bindings {
             for key in projected_artifact_keys(binding) {
                 let path = root.join(layout.artifact_path(&binding.identity, &key));
-                let physical = confine::normalize_physical(&path)?;
+                let physical = match (path.parent(), path.file_name()) {
+                    (Some(parent), Some(name))
+                        if parsed
+                            .get(&binding.source)
+                            .is_some_and(|source| source.deploy_mode() == DeployMode::Link) =>
+                    {
+                        confine::normalize_physical(parent)?.join(name)
+                    }
+                    _ => confine::normalize_physical(&path)?,
+                };
                 let identity = confine::fold_path(&physical);
                 placements.push((&target_projection.target, physical, identity));
             }
@@ -905,7 +918,7 @@ fn project_sync_workspace(
         resolved_commits,
         resolved_sources,
     )?;
-    reject_cross_target_overlap(&projection, config)?;
+    reject_cross_target_overlap(&projection, config, parsed)?;
     Ok(projection)
 }
 
