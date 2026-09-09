@@ -11455,6 +11455,84 @@ fn config_with_target_hooks(url: &str, target_path: &Path, on_change_toml: &str)
     Config::parse(&toml).expect("target-hooks config parses")
 }
 
+#[cfg(unix)]
+#[test]
+fn pre_sync_generates_link_source_before_capture_and_discovery() {
+    for source_exists in [false, true] {
+        let fx = build_sync_fixture();
+        let td = TargetDir::new();
+        let generated = td.parent_path.join("generated");
+        if source_exists {
+            std::fs::create_dir(&generated).expect("create empty source");
+        }
+        let cfg = Config::parse(&format!(
+            "version = 1\n\n\
+             [sources.generated]\npath = '{}'\ndeploy = 'link'\n\n\
+             [targets.dest]\npath = '{}'\nsources = ['generated']\nlayout = 'flat'\n\n\
+             [hooks]\npre_sync = \"mkdir -p '{}' && printf generated > '{}/skill.md'\"\n",
+            generated.display(),
+            td.target_path().display(),
+            generated.display(),
+            generated.display(),
+        ))
+        .expect("generated-source config parses");
+
+        let out = sync(
+            &input(&cfg, None, None, None, false),
+            &fx.backend,
+            &fx.registry,
+        )
+        .expect("pre_sync generates source before resolution");
+
+        assert!(!out.had_failures);
+        assert_eq!(
+            std::fs::read(td.target_path().join("skill.md")).expect("read deployed artifact"),
+            b"generated"
+        );
+        assert!(td.target_path().join("skill.md").is_symlink());
+        assert_eq!(out.hook_results.len(), 1);
+        assert_eq!(out.hook_results[0].scope, HookScope::PreSync);
+    }
+}
+
+#[test]
+fn failing_pre_sync_aborts_before_missing_source_resolution() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let generated = td.parent_path.join("missing");
+    let cfg = Config::parse(&format!(
+        "version = 1\n\n\
+         [sources.generated]\npath = '{}'\ndeploy = 'link'\n\n\
+         [targets.dest]\npath = '{}'\nsources = ['generated']\n\n\
+         [hooks]\npre_sync = 'exit 7'\n",
+        generated.display(),
+        td.target_path().display(),
+    ))
+    .expect("missing-source config parses");
+
+    let out = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("failed hook is reported without resolving the missing source");
+
+    assert!(out.had_failures);
+    assert!(!out.deploy_failures);
+    assert_eq!(out.hook_results.len(), 1);
+    assert_eq!(out.hook_results[0].scope, HookScope::PreSync);
+    assert_eq!(out.hook_results[0].status, HookStatus::Failure);
+    assert!(out.base_lock.sources.is_empty());
+    assert!(
+        fx.registry
+            .all_artifacts()
+            .expect("read registry")
+            .is_empty()
+    );
+    assert!(!generated.exists());
+    assert!(!td.target_path().exists());
+}
+
 /// The single `on_change` hook id recorded under `target` (panics unless exactly
 /// one exists): lets a test reuse the id without reconstructing TOML escaping.
 fn sole_hook_id(reg: &FileStateStore, target: &str) -> String {
