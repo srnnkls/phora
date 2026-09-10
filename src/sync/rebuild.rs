@@ -408,6 +408,7 @@ fn rebuild_linked(
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
         files: vec![],
+        directories: None,
         linked: true,
         vars_digest: None,
         deploy_root: Some(deploy_root),

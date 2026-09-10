@@ -52,7 +52,7 @@ pub fn recovery_sweep(
     }
     for entry in entries {
         if entry.swap_completed {
-            registry.put_artifact(&entry.record)?;
+            registry.put_artifact_journaled(&entry.record, journal.directory())?;
         } else {
             let backup = backup_path(&entry.staging_base, &entry.dst);
             if backup

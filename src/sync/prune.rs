@@ -539,6 +539,7 @@ mod tests {
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![],
+            directories: None,
             linked: false,
             vars_digest: None,
             deploy_root: Some("/deploy".to_owned()),

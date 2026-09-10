@@ -1,9 +1,9 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::sync::model::{ManagedArtifact, ManagedCondition, ObservedArtifact, ScannedFile};
-use crate::sync::scan::{mtime_secs, scan_dir_soft};
+use crate::sync::scan::mtime_secs;
 use crate::sync::state::{ArtifactKey, ArtifactRecord, Ejection, ManifestFile, StateStore};
 
 #[derive(Debug)]
@@ -163,16 +163,7 @@ fn classify_artifact_state(
         }
     }
 
-    let scan = scan_dir_soft(target_path)?;
-    let known: HashSet<&PathBuf> = record.files.iter().map(|f| &f.path).collect();
-    for cf in &scan.files {
-        if !known.contains(&cf.path) {
-            changed.insert(cf.path.clone());
-        }
-    }
-    if !record.allow_symlinks {
-        changed.extend(scan.symlinks);
-    }
+    changed.extend(super::directories::foreign_paths(target_path, &record)?);
 
     let state = classify_drift(
         &record,
@@ -477,6 +468,7 @@ mod tests {
             allow_symlinks,
             preserve_executable: true,
             files: manifest,
+            directories: None,
             linked: false,
             vars_digest: None,
             deploy_root: None,
@@ -508,6 +500,7 @@ mod tests {
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![mf],
+            directories: None,
             linked: false,
             vars_digest: None,
             deploy_root: None,
@@ -689,6 +682,7 @@ mod tests {
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![],
+            directories: None,
             linked,
             vars_digest: None,
             deploy_root: None,
@@ -897,6 +891,7 @@ mod tests {
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![],
+            directories: None,
             linked: true,
             vars_digest: None,
             deploy_root: None,

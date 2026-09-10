@@ -57,6 +57,9 @@ pub struct ArtifactRecord {
     pub allow_symlinks: bool,
     pub preserve_executable: bool,
     pub files: Vec<ManifestFile>,
+    /// Complete directory snapshot from trusted staging; absent on legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directories: Option<Vec<DirectoryStamp>>,
     #[serde(default)]
     pub linked: bool,
     /// Digest of the full effective vars map at deploy time; `None` for feature-free artifacts.
@@ -102,10 +105,34 @@ impl ArtifactRecord {
             allow_symlinks: p.allow_symlinks,
             preserve_executable: p.preserve_executable,
             files: p.files,
+            directories: None,
             linked: false,
             vars_digest: p.vars_digest,
             deploy_root: p.deploy_root,
             layout_separator: p.layout_separator,
+        }
+    }
+}
+
+/// Directory identity and full-resolution entry-change timestamp.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct DirectoryStamp {
+    pub path: PathBuf,
+    pub device: u64,
+    pub inode: u64,
+    pub mtime_secs: i64,
+    pub mtime_nanos: i64,
+}
+
+impl DirectoryStamp {
+    pub(crate) fn new(path: PathBuf, meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        Self {
+            path,
+            device: meta.dev(),
+            inode: meta.ino(),
+            mtime_secs: meta.mtime(),
+            mtime_nanos: meta.mtime_nsec(),
         }
     }
 }
@@ -261,6 +288,14 @@ fn read_record(path: &Path) -> Result<ArtifactRecord> {
 }
 
 fn atomic_write(path: &Path, contents: &str) -> Result<()> {
+    atomic_write_with(path, contents, std::fs::File::sync_all)
+}
+
+fn atomic_write_with(
+    path: &Path,
+    contents: &str,
+    sync: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| StateError::StateStore(format!("path has no parent: {}", path.display())))?;
@@ -277,8 +312,7 @@ fn atomic_write(path: &Path, contents: &str) -> Result<()> {
         handle
             .write_all(contents.as_bytes())
             .map_err(|e| StateError::StateStore(format!("write temp {}: {e}", tmp.display())))?;
-        handle
-            .sync_all()
+        sync(&handle)
             .map_err(|e| StateError::StateStore(format!("fsync temp {}: {e}", tmp.display())))?;
     }
     std::fs::rename(&tmp, path).map_err(|e| {
@@ -355,6 +389,33 @@ impl StateStore for FileStateStore {
         let serialized = toml::to_string(record)
             .map_err(|e| StateError::StateStore(format!("serialize record: {e}")))?;
         atomic_write(&path, &serialized)
+    }
+
+    fn put_artifact_journaled(&self, record: &ArtifactRecord, journal_dir: &Path) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let path = self.record_path(&record.key);
+            let parent = path.parent().expect("record path has parent");
+            std::fs::create_dir_all(parent).map_err(|e| {
+                StateError::StateStore(format!("create dir {}: {e}", parent.display()))
+            })?;
+            // A journal barrier cannot cover another device's cache.
+            let same_device = std::fs::metadata(parent)
+                .and_then(|record_meta| {
+                    std::fs::metadata(journal_dir)
+                        .map(|journal_meta| record_meta.dev() == journal_meta.dev())
+                })
+                .unwrap_or(false);
+            if same_device {
+                let serialized = toml::to_string(record)
+                    .map_err(|e| StateError::StateStore(format!("serialize record: {e}")))?;
+                return atomic_write_with(&path, &serialized, super::sync_to_device);
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = journal_dir;
+        self.put_artifact(record)
     }
 
     fn remove_artifact(&self, key: &ArtifactKey) -> Result<()> {
@@ -454,6 +515,25 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn failed_flush_does_not_publish_the_new_record() {
+        let dir = TempDir::new().expect("state");
+        let path = dir.path().join("record.toml");
+        std::fs::write(&path, "old record").expect("seed");
+        let result = atomic_write_with(&path, "new record", |file| {
+            assert_eq!(file.metadata()?.len(), 10);
+            assert_eq!(std::fs::read_to_string(&path)?, "old record");
+            Err(std::io::Error::other("injected flush failure"))
+        });
+        assert!(
+            result
+                .expect_err("flush must fail")
+                .to_string()
+                .contains("injected flush failure")
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "old record");
+    }
+
+    #[test]
     fn digest_requires_strict_sixty_four_hex_body() {
         use std::str::FromStr as _;
         let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -497,6 +577,7 @@ mod tests {
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![],
+            directories: None,
             linked: true,
             vars_digest: None,
             deploy_root: None,
@@ -571,6 +652,7 @@ artifact = "snippets"
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![],
+            directories: None,
             linked: false,
             vars_digest: None,
             deploy_root: None,
@@ -680,6 +762,7 @@ artifact = "snippets"
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![],
+            directories: None,
             linked: false,
             vars_digest: None,
             deploy_root: None,
@@ -722,6 +805,7 @@ artifact = "snippets"
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![],
+            directories: None,
             linked: false,
             vars_digest: None,
             deploy_root: None,
@@ -791,6 +875,7 @@ artifact = "snippets"
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![],
+            directories: None,
             linked: false,
             vars_digest: vars_digest.map(str::to_owned),
             deploy_root: None,
@@ -1082,6 +1167,7 @@ artifact = "snippets"
                 mtime: 1_738_329_296,
                 blake3: "9e8d7c6b5a4f3e2d".to_owned(),
             }],
+            directories: None,
             linked: false,
             vars_digest: None,
             deploy_root: None,
