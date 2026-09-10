@@ -119,15 +119,11 @@ pub fn apply_artifact(
     )
 }
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "caller hands off ownership of the record being deployed"
-)]
 pub(super) fn apply_artifact_report(
     staging_base: &Path,
     staging: &Path,
     dst: &Path,
-    record: ArtifactRecord,
+    mut record: ArtifactRecord,
     journal: &Journal,
     registry: &dyn StateStore,
     events: &mut SyncEvents,
@@ -136,6 +132,10 @@ pub(super) fn apply_artifact_report(
     cleanup.track(staging.to_path_buf());
     cleanup.track(backup_path(staging_base, dst));
     cleanup.prune_base_if_empty(staging_base.to_path_buf());
+
+    if record.kind == crate::sync::state::RecordKind::Dir {
+        record.directories = super::directories::snapshot(staging, &record)?;
+    }
 
     journal.append(&JournalEntry {
         staging_base: staging_base.to_path_buf(),
@@ -164,7 +164,7 @@ pub(super) fn apply_artifact_report(
     swap_into(staging, dst, record.allow_symlinks, events)?;
     journal.mark_swap_completed(dst)?;
 
-    if let Err(put_err) = registry.put_artifact(&record) {
+    if let Err(put_err) = registry.put_artifact_journaled(&record, journal.directory()) {
         rollback_swap(dst, backup.as_deref())?;
         journal.remove(dst)?;
         return Err(put_err.into());
@@ -272,7 +272,7 @@ pub fn link_artifact(
     })?;
     journal.mark_swap_completed(dst)?;
 
-    if let Err(put_err) = registry.put_artifact(&record) {
+    if let Err(put_err) = registry.put_artifact_journaled(&record, journal.directory()) {
         rollback_swap(dst, backup.as_deref())?;
         journal.remove(dst)?;
         return Err(put_err.into());
@@ -482,6 +482,7 @@ mod tests {
             allow_symlinks: false,
             preserve_executable: true,
             files: manifest,
+            directories: None,
             linked: false,
             vars_digest: None,
             deploy_root: None,
@@ -581,7 +582,9 @@ mod tests {
         let files: &[(&str, &[u8])] = &[("a.json", b"{}")];
         let base = staging_base(parent.path());
         let staging = make_staging(&base, files);
-        let record = record_for(&staging, files);
+        let mut record = record_for(&staging, files);
+        record.directories =
+            super::super::directories::snapshot(&staging, &record).expect("snapshot");
         let jrnl = journal_for(&reg);
 
         apply_artifact(&base, &staging, &dst, record.clone(), &jrnl, &reg)
@@ -652,14 +655,26 @@ mod tests {
         fn artifact(&self, key: &ArtifactKey) -> StoreResult<Option<ArtifactRecord>> {
             self.inner.artifact(key)
         }
-        fn put_artifact(&self, record: &ArtifactRecord) -> StoreResult<()> {
+        fn put_artifact(&self, _record: &ArtifactRecord) -> StoreResult<()> {
+            panic!("deployment must use the journaled record write");
+        }
+        fn put_artifact_journaled(
+            &self,
+            record: &ArtifactRecord,
+            journal_dir: &Path,
+        ) -> StoreResult<()> {
+            assert_eq!(journal_dir, self.journal_dir);
             let journal = Journal::open(&self.journal_dir).expect("open journal at put time");
             let entries = journal.entries().expect("read journal at put time");
-            self.journal_nonempty_at_put.set(!entries.is_empty());
+            self.journal_nonempty_at_put.set(
+                entries
+                    .iter()
+                    .any(|entry| entry.swap_completed && entry.record == *record),
+            );
             let on_disk = std::fs::read(self.dst.join("a.json")).unwrap_or_default();
             self.dst_held_staged_content_at_put
                 .set(on_disk == self.staged_content);
-            self.inner.put_artifact(record)
+            self.inner.put_artifact_journaled(record, journal_dir)
         }
         fn remove_artifact(&self, key: &ArtifactKey) -> StoreResult<()> {
             self.inner.remove_artifact(key)

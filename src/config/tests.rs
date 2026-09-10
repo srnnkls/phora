@@ -3528,6 +3528,7 @@ mod per_binding_refinement {
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![],
+            directories: None,
             linked: false,
             vars_digest: None,
             deploy_root: None,

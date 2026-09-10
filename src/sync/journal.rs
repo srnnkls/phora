@@ -136,6 +136,10 @@ impl Journal {
         self.persist(&file)
     }
 
+    pub(crate) fn directory(&self) -> &Path {
+        self.path.parent().expect("journal path has parent")
+    }
+
     pub fn entries(&self) -> Result<Vec<JournalEntry>> {
         Ok(self.load()?.entries)
     }

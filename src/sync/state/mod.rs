@@ -4,7 +4,7 @@ pub mod file;
 pub mod locking;
 
 pub use file::{
-    ArtifactKey, ArtifactRecord, Ejection, FileStateStore, HookState, ManifestFile,
+    ArtifactKey, ArtifactRecord, DirectoryStamp, Ejection, FileStateStore, HookState, ManifestFile,
     NewArtifactRecord, RecordKind, ScannedFile, StateError, ejected_index, readonly_root_error,
 };
 pub use locking::StateLock;
@@ -12,6 +12,15 @@ pub use locking::StateLock;
 pub trait StateStore {
     fn artifact(&self, key: &ArtifactKey) -> Result<Option<ArtifactRecord>, StateError>;
     fn put_artifact(&self, record: &ArtifactRecord) -> Result<(), StateError>;
+    /// Save under a completed journal intent. The caller must retain that intent
+    /// until a full journal barrier after this write succeeds.
+    fn put_artifact_journaled(
+        &self,
+        record: &ArtifactRecord,
+        _journal_dir: &Path,
+    ) -> Result<(), StateError> {
+        self.put_artifact(record)
+    }
     fn remove_artifact(&self, key: &ArtifactKey) -> Result<(), StateError>;
     fn target_artifacts(&self, target: &str) -> Result<Vec<ArtifactRecord>, StateError>;
     fn all_artifacts(&self) -> Result<Vec<ArtifactRecord>, StateError>;
@@ -50,4 +59,11 @@ impl std::fmt::Display for ProjectId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
+}
+
+/// Submit data and metadata to the device without forcing its entire cache.
+/// Only use when a subsequent journal full flush covers these writes.
+#[cfg(target_os = "macos")]
+pub(super) fn sync_to_device(file: &std::fs::File) -> std::io::Result<()> {
+    rustix::io::retry_on_intr(|| rustix::fs::fsync(file)).map_err(Into::into)
 }

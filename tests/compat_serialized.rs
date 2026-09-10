@@ -426,6 +426,29 @@ fn normalize_iso_timestamps(s: &str) -> String {
     out
 }
 
+// Directory identities and timestamps are cache metadata that vary per deployment.
+// Keep paths and field order visible in the serialization golden.
+fn normalize_directory_stamps(body: &str) -> String {
+    let mut in_directory = false;
+    let mut normalized = String::new();
+    for line in body.lines() {
+        if line.starts_with('[') {
+            in_directory = line == "[[directories]]";
+        }
+        if in_directory
+            && let Some((key, _)) = line.split_once(" = ")
+            && matches!(key, "device" | "inode" | "mtime_secs" | "mtime_nanos")
+        {
+            normalized.push_str(key);
+            normalized.push_str(" = 0\n");
+        } else {
+            normalized.push_str(line);
+            normalized.push('\n');
+        }
+    }
+    normalized
+}
+
 /// Sorted by relative path so the concatenated dump is order-independent.
 fn dump_toml_tree(root: &Path) -> String {
     fn collect(dir: &Path, base: &Path, out: &mut Vec<(String, String)>) {
@@ -442,7 +465,8 @@ fn dump_toml_tree(root: &Path) -> String {
                     .expect("under base")
                     .to_string_lossy()
                     .replace('\\', "/");
-                out.push((rel, std::fs::read_to_string(&path).expect("read toml")));
+                let body = std::fs::read_to_string(&path).expect("read toml");
+                out.push((rel, normalize_directory_stamps(&body)));
             }
         }
     }
@@ -595,13 +619,16 @@ fn lock_serialized_is_byte_identical() {
 // ─── registry record + metadata ────────────────────────────────────────────
 
 #[test]
-fn registry_records_serialized_are_byte_identical() {
+fn registry_records_include_directory_cache() {
     let fx = build_fixture();
     fx.write_config(&git_source_config(&fx));
     assert_success(&fx.run(&["sync"]), "sync");
 
     let dump = dump_toml_tree(&fx.registry_dir());
-    assert_golden("registry_records.golden", &fx.normalize(&dump));
+    assert_golden(
+        "registry_records_with_directories.golden",
+        &fx.normalize(&dump),
+    );
 }
 
 // ─── ejection (recorded in target metadata) ─────────────────────────────────
@@ -619,7 +646,10 @@ fn registry_metadata_after_ejection_is_byte_identical() {
     );
 
     let dump = dump_toml_tree(&fx.registry_dir());
-    assert_golden("registry_after_eject.golden", &fx.normalize(&dump));
+    assert_golden(
+        "registry_after_eject_with_directories.golden",
+        &fx.normalize(&dump),
+    );
 }
 
 // ─── orphan (a record whose config target is gone) ──────────────────────────

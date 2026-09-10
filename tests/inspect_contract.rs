@@ -67,6 +67,7 @@ fn deploy_and_record(target: &Path, files: &[(&str, &[u8])]) -> ArtifactRecord {
         allow_symlinks: false,
         preserve_executable: true,
         files: manifest,
+        directories: None,
         linked: false,
         vars_digest: None,
         deploy_root: None,
