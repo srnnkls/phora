@@ -175,19 +175,21 @@ fn classify_artifact_state(
         }
     }
 
-    let scan = scan_dir_soft(target_path)?;
-    let known: HashSet<&PathBuf> = record.files.iter().map(|f| &f.path).collect();
-    for cf in &scan.files {
-        if !known.contains(&cf.path) && (!record.history || cf.path != Path::new(".git")) {
-            changed.insert(cf.path.clone());
+    if record.history {
+        let scan = scan_dir_soft(target_path)?;
+        let known: HashSet<&PathBuf> = record.files.iter().map(|f| &f.path).collect();
+        for cf in &scan.files {
+            if !known.contains(&cf.path) && cf.path != Path::new(".git") {
+                changed.insert(cf.path.clone());
+            }
         }
-    }
-    if record.history || !record.allow_symlinks {
         for path in scan.symlinks {
             if !known.contains(&path) {
                 changed.insert(path);
             }
         }
+    } else {
+        changed.extend(super::directories::foreign_paths(target_path, &record)?);
     }
 
     let state = classify_drift(
@@ -510,6 +512,7 @@ mod tests {
             allow_symlinks,
             preserve_executable: true,
             files: manifest,
+            directories: None,
             linked: false,
             history: false,
             worktree_admin_id: None,
@@ -546,6 +549,7 @@ mod tests {
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![mf],
+            directories: None,
             linked: false,
             history: false,
             worktree_admin_id: None,
@@ -731,6 +735,7 @@ mod tests {
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![],
+            directories: None,
             linked,
             history: false,
             worktree_admin_id: None,
@@ -943,6 +948,7 @@ mod tests {
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![],
+            directories: None,
             linked: true,
             history: false,
             worktree_admin_id: None,

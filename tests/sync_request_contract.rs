@@ -164,6 +164,7 @@ fn assert_request_flow_returns_conflict_warning_and_remove_outcomes() {
         allow_symlinks: false,
         preserve_executable: true,
         files: vec![],
+        directories: None,
         linked: false,
         history: false,
         worktree_admin_id: None,

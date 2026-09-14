@@ -2,6 +2,7 @@
 
 pub mod apply;
 pub(crate) mod confine;
+mod directories;
 pub(crate) mod discover;
 pub(crate) mod hooks;
 pub mod inspect;

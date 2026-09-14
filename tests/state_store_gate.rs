@@ -736,9 +736,10 @@ const MANAGED_CONDITION_VARIANTS: &[&str] = &[
     "Linked",
 ];
 
-const SKETCH_METHODS: &[&str] = &[
+const STATE_METHODS: &[&str] = &[
     "artifact",
     "put_artifact",
+    "put_artifact_journaled",
     "remove_artifact",
     "target_artifacts",
     "all_artifacts",
@@ -788,17 +789,17 @@ const IO_SYNC_SIBLINGS: &[&str] = &[
 
 fn slot_mismatch(trait_src: &str) -> (Vec<&'static str>, Vec<String>) {
     let Some(body) = trait_body(&scan(trait_src), TRAIT) else {
-        return (SKETCH_METHODS.to_vec(), Vec::new());
+        return (STATE_METHODS.to_vec(), Vec::new());
     };
     let declared = trait_fn_names(&body);
-    let missing = SKETCH_METHODS
+    let missing = STATE_METHODS
         .iter()
         .copied()
         .filter(|name| !declared.iter().any(|d| d == name))
         .collect();
     let extra = declared
         .into_iter()
-        .filter(|d| !SKETCH_METHODS.contains(&d.as_str()))
+        .filter(|d| !STATE_METHODS.contains(&d.as_str()))
         .collect();
     (missing, extra)
 }
@@ -921,20 +922,20 @@ fn state_store_trait_is_defined_only_in_the_state_module() {
 }
 
 #[test]
-fn state_store_trait_declares_exactly_the_eleven_final_methods() {
+fn state_store_trait_declares_exactly_the_supported_methods() {
     let (missing, extra) = slot_mismatch(&read_src(STATE_MODULE));
     assert!(
         missing.is_empty(),
         "src/{STATE_MODULE}'s `pub trait {TRAIT}` must declare every design §8 method under its \
-         sketch name — artifact, put_artifact, remove_artifact, target_artifacts, all_artifacts, \
+         name — artifact, put_artifact, put_artifact_journaled, remove_artifact, target_artifacts, all_artifacts, \
          ejections, save_ejections, hook_state, record_hook_success, acquire_lock, journal_root \
          — missing: {missing:?}"
     );
     assert!(
         extra.is_empty(),
-        "src/{STATE_MODULE}'s `pub trait {TRAIT}` must declare NOTHING beyond the 11 design §8 \
-         methods — T025 relocates the impl unchanged, no widening (a copied-in \
-         refuses_writes/readonly_error is exactly the evasion this rejects); extra fns: {extra:?}"
+        "src/{STATE_MODULE}'s `pub trait {TRAIT}` must contain only the original state methods \
+         plus the journaled record write; unrelated methods such as refuses_writes/readonly_error \
+         remain forbidden; extra fns: {extra:?}"
     );
 }
 
@@ -1143,16 +1144,16 @@ fn model_module_imports_no_io_bearing_module() {
 }
 
 #[test]
-fn helper_slot_scan_requires_exactly_the_sketch_names() {
+fn helper_slot_scan_requires_exactly_the_supported_names() {
     let sketch = "pub trait StateStore {\n\
-        fn artifact(&self) {}\n fn put_artifact(&self) {}\n fn remove_artifact(&self) {}\n\
+        fn artifact(&self) {}\n fn put_artifact(&self) {}\n fn put_artifact_journaled(&self) {}\n fn remove_artifact(&self) {}\n\
         fn target_artifacts(&self) {}\n fn all_artifacts(&self) {}\n fn ejections(&self) {}\n\
         fn save_ejections(&self) {}\n fn hook_state(&self) {}\n fn record_hook_success(&self) {}\n\
         fn acquire_lock(&self) {}\n fn journal_root(&self) {}\n}";
     let (missing, extra) = slot_mismatch(sketch);
     assert!(
         missing.is_empty() && extra.is_empty(),
-        "the exact design §8 sketch names must satisfy the scan cleanly, got missing {missing:?} \
+        "the original methods plus the journaled write must satisfy the scan cleanly, got missing {missing:?} \
          extra {extra:?}"
     );
 
@@ -1169,7 +1170,7 @@ fn helper_slot_scan_requires_exactly_the_sketch_names() {
     );
 
     let widened = "pub trait StateStore {\n\
-        fn artifact(&self) {}\n fn put_artifact(&self) {}\n fn remove_artifact(&self) {}\n\
+        fn artifact(&self) {}\n fn put_artifact(&self) {}\n fn put_artifact_journaled(&self) {}\n fn remove_artifact(&self) {}\n\
         fn target_artifacts(&self) {}\n fn all_artifacts(&self) {}\n fn ejections(&self) {}\n\
         fn save_ejections(&self) {}\n fn hook_state(&self) {}\n fn record_hook_success(&self) {}\n\
         fn acquire_lock(&self) {}\n fn journal_root(&self) {}\n fn refuses_writes(&self) -> bool { false }\n}";
@@ -1189,7 +1190,7 @@ fn helper_slot_scan_requires_exactly_the_sketch_names() {
 
     let (missing, extra) = slot_mismatch("pub fn not_a_trait() {}");
     assert!(
-        missing.len() == SKETCH_METHODS.len() && extra.is_empty(),
+        missing.len() == STATE_METHODS.len() && extra.is_empty(),
         "no trait at all means every method is missing"
     );
 }

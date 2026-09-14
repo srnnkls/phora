@@ -439,6 +439,7 @@ fn rebuild_linked(
         allow_symlinks: policy.allow_symlinks,
         preserve_executable: policy.preserve_executable,
         files: vec![],
+        directories: None,
         linked: true,
         history: false,
         worktree_admin_id: None,

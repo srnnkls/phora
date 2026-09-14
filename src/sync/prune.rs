@@ -563,6 +563,7 @@ mod tests {
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![],
+            directories: None,
             linked: false,
             history: false,
             worktree_admin_id: None,

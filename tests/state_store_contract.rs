@@ -30,6 +30,7 @@ fn record(target: &str, source: &str, artifact: &str) -> ArtifactRecord {
         allow_symlinks: false,
         preserve_executable: true,
         files: vec![],
+        directories: None,
         linked: false,
         history: false,
         worktree_admin_id: None,
