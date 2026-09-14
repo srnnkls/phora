@@ -120,7 +120,7 @@ fn extract_tar<R: Read>(reader: R, max_total: u64) -> Result<Vec<ExtractedEntry>
         let mut entry = entry?;
         let header = entry.header();
         let entry_type = header.entry_type();
-        if entry_type.is_dir() {
+        if entry_type.is_dir() || entry_type.is_pax_global_extensions() {
             continue;
         }
         let mode = header.mode()?;
@@ -376,6 +376,47 @@ mod tests {
                 .data,
             b"world"
         );
+    }
+
+    #[test]
+    fn extract_tar_skips_global_pax_and_preserves_local_pax_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut builder = tar::Builder::new(Vec::new());
+        let metadata = b"52 comment=0123456789012345678901234567890123456789\n";
+        let mut header = tar::Header::new_ustar();
+        header.set_entry_type(tar::EntryType::XGlobalHeader);
+        header.set_size(metadata.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "pax_global_header", &metadata[..])
+            .expect("append global pax header");
+        append_file(&mut builder, "pkg/README", b"readme", 0o644);
+        builder
+            .append_pax_extensions([("path", b"pkg/bin/tool".as_slice())])
+            .expect("append local pax path");
+        append_file(&mut builder, "pkg/placeholder", b"#!/bin/sh\n", 0o755);
+        let tar_bytes = builder.into_inner().expect("finish tar");
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&tar_bytes).expect("gzip tar bytes");
+        let gz_bytes = encoder.finish().expect("finish gzip");
+
+        for (name, bytes) in [("pkg.tar", tar_bytes), ("pkg.tar.gz", gz_bytes)] {
+            let archive = dir.path().join(name);
+            std::fs::write(&archive, bytes).expect("write archive");
+            let entries = by_path(extract(&archive, name).expect("pax archive must extract"));
+
+            assert_eq!(entries.len(), 2, "{name}: metadata must not become files");
+            let readme = entries.get(Path::new("README")).expect("stripped README");
+            assert_eq!(readme.kind, EntryKind::Blob);
+            assert_eq!(readme.data, b"readme");
+            let tool = entries
+                .get(Path::new("bin/tool"))
+                .expect("stripped path from local pax header");
+            assert_eq!(tool.kind, EntryKind::BlobExecutable);
+            assert_eq!(tool.data, b"#!/bin/sh\n");
+        }
     }
 
     #[test]
