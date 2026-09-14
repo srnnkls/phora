@@ -9,40 +9,58 @@ use crate::source::{Protocol, is_local_path};
 use super::config_edit::BindRefinement;
 use super::{config_edit, load_config, read_config_text, render, target_config_file};
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "CLI flag fan-out mirrors the `phora add` argument surface"
-)]
-pub(super) fn run_add(
-    url: &str,
-    targets: &[String],
-    name: Option<String>,
-    branch: Option<String>,
-    tag: Option<String>,
-    root: Option<String>,
-    include: Vec<String>,
-    exclude: Vec<String>,
-    local: bool,
-    symlink: bool,
-    refinement: &BindRefinement,
-) -> Result<()> {
-    if refinement.r#as.is_some() && targets.len() != 1 {
+pub(super) struct AddRequest<'a> {
+    pub(super) url: &'a str,
+    pub(super) targets: &'a [String],
+    pub(super) name: Option<String>,
+    pub(super) branch: Option<String>,
+    pub(super) tag: Option<String>,
+    pub(super) root: Option<String>,
+    pub(super) include: Vec<String>,
+    pub(super) exclude: Vec<String>,
+    pub(super) local: bool,
+    pub(super) symlink: bool,
+    pub(super) refinement: &'a BindRefinement,
+}
+
+pub(super) fn run_add(request: AddRequest<'_>) -> Result<()> {
+    if request.refinement.r#as.is_some() && request.targets.len() != 1 {
         return Err(Error::Config(
             "`--as` sets a single binding identity and needs exactly one `--to` target".to_owned(),
         ));
     }
-    if !refinement.is_bare() && targets.is_empty() {
+    if !request.refinement.is_bare() && !request.refinement.history && request.targets.is_empty() {
         return Err(Error::Config(
             "refinement flags (`--as`/`--take`) need at least one `--to` target".to_owned(),
         ));
     }
-    if (local || symlink) && (!targets.is_empty() || !refinement.is_bare()) {
+    if request.refinement.history && (request.local || request.symlink) {
+        return Err(Error::Config(
+            "`--local`/`--symlink` overlays do not support `--history`".to_owned(),
+        ));
+    }
+    if (request.local || request.symlink)
+        && (!request.targets.is_empty() || !request.refinement.is_bare())
+    {
         return Err(Error::Config(
             "`--local`/`--symlink` overlays do not support `--to`/refinement flags".to_owned(),
         ));
     }
 
-    if !targets.is_empty() {
+    if !request.targets.is_empty() {
+        let AddRequest {
+            url,
+            targets,
+            name,
+            branch,
+            tag,
+            root,
+            include,
+            exclude,
+            local,
+            symlink,
+            refinement,
+        } = request;
         return run_add_to_targets(
             url,
             targets,
@@ -57,7 +75,18 @@ pub(super) fn run_add(
             refinement,
         );
     }
-    if local || symlink {
+    if request.local || request.symlink {
+        let AddRequest {
+            url,
+            name,
+            branch,
+            tag,
+            root,
+            include,
+            exclude,
+            symlink,
+            ..
+        } = request;
         return add_local(
             url,
             name,
@@ -72,6 +101,21 @@ pub(super) fn run_add(
         );
     }
 
+    run_unbound_add(request)
+}
+
+fn run_unbound_add(request: AddRequest<'_>) -> Result<()> {
+    let AddRequest {
+        url,
+        name,
+        branch,
+        tag,
+        root,
+        include,
+        exclude,
+        refinement,
+        ..
+    } = request;
     let mut parsed = resolve_add_source(url)?;
     parsed.include = include;
     parsed.exclude = exclude;
@@ -83,7 +127,12 @@ pub(super) fn run_add(
     let doc_text =
         std::fs::read_to_string("phora.toml").unwrap_or_else(|_| "version = 1\n".to_owned());
     let auto_target = super::effective_auto_target();
-    let updated = if auto_target {
+    if refinement.history && !auto_target {
+        return Err(Error::Config(
+            "`--history` needs at least one `--to` target".to_owned(),
+        ));
+    }
+    let mut updated = if auto_target {
         add_to_default_target(
             &doc_text,
             &name,
@@ -102,6 +151,11 @@ pub(super) fn run_add(
             root.as_deref(),
         )?
     };
+    if refinement.history {
+        updated =
+            config_edit::bind(&updated, "default", std::slice::from_ref(&name), refinement)?.text;
+    }
+    super::bind::guard_no_dangling_references(&updated, false)?;
     std::fs::write("phora.toml", &updated)?;
 
     let refspec = tag
@@ -282,6 +336,7 @@ fn add_local(
     if symlink {
         updated = inject_deploy_link(&updated, &name)?;
     }
+    super::bind::guard_no_dangling_references(&updated, true)?;
     std::fs::write("phora.local.toml", &updated)?;
 
     println!("Added local source '{name}': {path}");

@@ -1104,3 +1104,37 @@ fn source_store_trait_object_is_send_sync() {
 
     assert_send_sync::<dyn SourceStore>();
 }
+
+#[test]
+fn git_decoder_accepts_unaligned_output_after_partial_read() {
+    // zlib-rs <= 0.6.3 could reject valid streams on aarch64 after an unaligned
+    // Adler-32 update: https://github.com/trifectatechfoundation/zlib-rs/pull/504
+    #[repr(align(16))]
+    struct AlignedOutput([u8; 5568]);
+
+    let payload = [0xff; 245 + 5567];
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&payload).expect("encode valid zlib data");
+    let compressed = encoder.finish().expect("finish zlib stream");
+    let mut input = std::io::Cursor::new(compressed);
+    let mut decoder = gix::features::zlib::Decompress::new();
+    let mut prefix = [0; 245];
+    let mut output = AlignedOutput([0; 5568]);
+
+    // A partial read gives the checksum a non-default seed. The next output
+    // starts one byte past a 16-byte boundary and spans a full SIMD chunk.
+    assert_eq!(
+        gix::features::zlib::stream::inflate::read(&mut input, &mut decoder, &mut prefix)
+            .expect("decode prefix"),
+        prefix.len()
+    );
+    assert_eq!(
+        gix::features::zlib::stream::inflate::read(&mut input, &mut decoder, &mut output.0[1..])
+            .expect("valid data must not be reported as a corrupt deflate stream"),
+        5567
+    );
+    assert_eq!(prefix, payload[..245]);
+    assert_eq!(output.0[1..], payload[245..]);
+    assert_eq!(decoder.total_out(), payload.len() as u64);
+    assert_eq!(decoder.total_in(), input.get_ref().len() as u64);
+}

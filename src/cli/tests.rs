@@ -23,7 +23,7 @@ fn bind_parses_sources_target_and_flags() {
         panic!("expected Command::Bind");
     };
     assert_eq!(sources, vec!["tools".to_owned(), "prompts".to_owned()]);
-    assert_eq!(to, "claude");
+    assert_eq!(to, vec!["claude".to_owned()]);
     assert!(local, "--local must set local=true");
 }
 
@@ -408,11 +408,16 @@ fn record(
         preserve_executable: true,
         files: vec![ManifestFile {
             path: PathBuf::from("python.json"),
+            kind: crate::sync::state::ManifestEntryKind::File,
             size: 12_345,
             mtime: 1_738_329_296,
             blake3: "9e8d7c6b5a4f3e2d".to_owned(),
         }],
         linked: false,
+        history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -1563,19 +1568,19 @@ fn run_add_end_to_end_persists_symbolic_source_to_phora_toml() {
     let toml_path = dir.path().join("phora.toml");
 
     with_cwd(dir.path(), || {
-        run_add(
-            "github:srnnkls/tropos",
-            &[],
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            false,
-            false,
-            &config_edit::BindRefinement::default(),
-        )
+        run_add(AddRequest {
+            url: "github:srnnkls/tropos",
+            targets: &[],
+            name: None,
+            branch: None,
+            tag: None,
+            root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            local: false,
+            symlink: false,
+            refinement: &config_edit::BindRefinement::default(),
+        })
         .expect("run_add must succeed for a symbolic colon alias");
     });
 
@@ -1612,19 +1617,19 @@ fn run_add_persists_local_path_source_for_absolute_dir() {
     let source_arg = source_path.to_str().expect("utf-8 source path");
 
     with_cwd(project.path(), || {
-        run_add(
-            source_arg,
-            &[],
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            false,
-            false,
-            &config_edit::BindRefinement::default(),
-        )
+        run_add(AddRequest {
+            url: source_arg,
+            targets: &[],
+            name: None,
+            branch: None,
+            tag: None,
+            root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            local: false,
+            symlink: false,
+            refinement: &config_edit::BindRefinement::default(),
+        })
         .expect("run_add must accept an absolute local path source");
     });
 
@@ -1666,19 +1671,19 @@ fn run_add_to_target_persists_local_path_source() {
     let source_arg = source_path.to_str().expect("utf-8 source path");
 
     with_cwd(project.path(), || {
-        run_add(
-            source_arg,
-            &["home".to_owned()],
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            false,
-            false,
-            &config_edit::BindRefinement::default(),
-        )
+        run_add(AddRequest {
+            url: source_arg,
+            targets: &["home".to_owned()],
+            name: None,
+            branch: None,
+            tag: None,
+            root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            local: false,
+            symlink: false,
+            refinement: &config_edit::BindRefinement::default(),
+        })
         .expect("run_add --to must accept a local path source");
     });
 
@@ -2003,6 +2008,7 @@ fn deploy_matching_file(
         .as_secs();
     ManifestFile {
         path: PathBuf::from(file),
+        kind: crate::sync::state::ManifestEntryKind::File,
         size: meta.len(),
         mtime,
         blake3: blake3::hash(content).to_hex().to_string(),
@@ -2033,6 +2039,10 @@ fn record_for(
         preserve_executable: true,
         files,
         linked: false,
+        history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -2097,7 +2107,8 @@ fn list_statuses_reports_clean_for_matching_deployment() {
     ))
     .expect("seed registry record");
 
-    let listings = list_statuses(&cfg, &reg).expect("list statuses");
+    let listings = list_statuses(&cfg, &reg, &GitBackend::new(state_dir.path().to_path_buf()))
+        .expect("list statuses");
 
     let st = status_for(&listings, "dest", "editor")
         .expect("the editor artifact must appear under target dest");
@@ -2141,7 +2152,8 @@ fn list_statuses_reports_modified_for_edited_deployment() {
     )
     .expect("edit deployed file on disk");
 
-    let listings = list_statuses(&cfg, &reg).expect("list statuses");
+    let listings = list_statuses(&cfg, &reg, &GitBackend::new(state_dir.path().to_path_buf()))
+        .expect("list statuses");
 
     let st = status_for(&listings, "dest", "editor")
         .expect("the editor artifact must appear even when modified");
@@ -2154,6 +2166,109 @@ fn list_statuses_reports_modified_for_edited_deployment() {
         !st.state.contains('✓'),
         "a Modified artifact must NOT be shown as clean (✓), got {:?}",
         st.state
+    );
+}
+
+#[test]
+fn history_file_root_status_skips_overlay_observation_for_list_and_target_detail() {
+    use crate::source::{
+        ResolvePolicy, ResolveRequest, ResolvedSource, SourceDirectoryEntry, SourceEntry,
+        SourceInventory, SourceStore, WorktreeObservationRequest, WorktreeObservationResult,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct ObservationRecordingStore {
+        observed: AtomicBool,
+    }
+
+    impl SourceStore for ObservationRecordingStore {
+        fn resolve(
+            &self,
+            _request: &ResolveRequest,
+            _policy: ResolvePolicy,
+        ) -> std::result::Result<ResolvedSource, crate::source::SourceError> {
+            panic!("status inspection must not resolve a source")
+        }
+
+        fn inventory(
+            &self,
+            _snapshot: &crate::source::SnapshotId,
+            _root: Option<&crate::source::SourcePath>,
+        ) -> std::result::Result<SourceInventory, crate::source::SourceError> {
+            panic!("status inspection must not inventory a source")
+        }
+
+        fn read(
+            &self,
+            _snapshot: &crate::source::SnapshotId,
+            _path: &crate::source::SourcePath,
+        ) -> std::result::Result<SourceEntry, crate::source::SourceError> {
+            panic!("status inspection must not read a source")
+        }
+
+        fn list_directory(
+            &self,
+            _snapshot: &crate::source::SnapshotId,
+            _path: Option<&crate::source::SourcePath>,
+        ) -> std::result::Result<Vec<SourceDirectoryEntry>, crate::source::SourceError> {
+            panic!("status inspection must not list a source")
+        }
+
+        fn observe_worktree(
+            &self,
+            _request: &WorktreeObservationRequest,
+        ) -> std::result::Result<WorktreeObservationResult, crate::source::SourceError> {
+            self.observed.store(true, Ordering::SeqCst);
+            Ok(WorktreeObservationResult::Conformant)
+        }
+    }
+
+    let state_dir = TempDir::new().expect("state root");
+    let registry = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
+    let target_root = TempDir::new().expect("target root");
+    let config = config_one_flat_target("dest", "editor-src", target_root.path());
+    let manifest = deploy_matching_file(target_root.path(), "editor", "init.lua", b"-- init\n");
+    let mut record = record_for(
+        "dest",
+        "editor-src",
+        "editor",
+        "0123456789abcdef0123456789abcdef01234567",
+        vec![manifest],
+    );
+    record.history = true;
+    record.worktree_admin_id = Some("0123456789abcdef".to_owned());
+    record.mirror_key = Some("a1b2c3d4e5f60708".to_owned());
+    record.cache_git_root = Some(state_dir.path().display().to_string());
+    registry.put_artifact(&record).expect("seed history record");
+
+    let deploy_root = target_root.path().join("editor");
+    std::fs::remove_dir_all(&deploy_root).expect("replace valid history deployment directory");
+    std::fs::write(&deploy_root, b"replacement file").expect("write replacement deployment file");
+
+    let backend = ObservationRecordingStore {
+        observed: AtomicBool::new(false),
+    };
+    let listings = list_statuses(&config, &registry, &backend).expect("list status");
+    let detail = target_detail(&config, &registry, &backend, "dest").expect("target detail");
+
+    assert!(
+        status_for(&listings, "dest", "editor")
+            .expect("list includes history artifact")
+            .state
+            .to_lowercase()
+            .contains("modified"),
+        "a history deployment root replaced by a regular file must retain its Modified content state"
+    );
+    assert!(
+        detail.artifacts[0]
+            .state
+            .to_lowercase()
+            .contains("modified"),
+        "target detail must retain the same Modified content state"
+    );
+    assert!(
+        !backend.observed.load(Ordering::SeqCst),
+        "list and target detail must not observe a history overlay after content inspection finds a regular-file deployment root"
     );
 }
 
@@ -2183,7 +2298,8 @@ fn list_statuses_reports_ejected_for_ejected_artifact() {
     )
     .expect("mark editor ejected");
 
-    let listings = list_statuses(&cfg, &reg).expect("list statuses");
+    let listings = list_statuses(&cfg, &reg, &GitBackend::new(state_dir.path().to_path_buf()))
+        .expect("list statuses");
 
     let st =
         status_for(&listings, "dest", "editor").expect("an ejected artifact must still be listed");
@@ -2228,7 +2344,8 @@ fn list_statuses_groups_by_target_and_names_source_and_artifact() {
     ))
     .expect("seed snippets record under xdg");
 
-    let listings = list_statuses(&cfg, &reg).expect("list statuses");
+    let listings = list_statuses(&cfg, &reg, &GitBackend::new(state_dir.path().to_path_buf()))
+        .expect("list statuses");
 
     assert_eq!(
         listings.len(),
@@ -2295,6 +2412,7 @@ fn deploy_mapped_file(target_dir: &Path, source: &str, dest: &str, content: &[u8
         .as_secs();
     ManifestFile {
         path: PathBuf::from(dest),
+        kind: crate::sync::state::ManifestEntryKind::File,
         size: meta.len(),
         mtime,
         blake3: blake3::hash(content).to_hex().to_string(),
@@ -2325,6 +2443,10 @@ fn mapped_record(
         preserve_executable: true,
         files,
         linked: false,
+        history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -2352,6 +2474,7 @@ fn where_resolves_a_mapped_record_under_its_dest_name() {
         "aaa111",
         vec![ManifestFile {
             path: PathBuf::from("fzf.zsh"),
+            kind: crate::sync::state::ManifestEntryKind::File,
             size: 10,
             mtime: 1,
             blake3: "x".to_owned(),
@@ -2392,7 +2515,8 @@ fn list_statuses_reports_mapped_dest_path_without_layout_leak() {
     ))
     .expect("seed mapped record");
 
-    let listings = list_statuses(&cfg, &reg).expect("list statuses");
+    let listings = list_statuses(&cfg, &reg, &GitBackend::new(state_dir.path().to_path_buf()))
+        .expect("list statuses");
 
     let st = status_for(&listings, "dest", "fzf.zsh")
         .expect("the mapped artifact must appear under target dest by its dest name");
@@ -2431,13 +2555,22 @@ fn eject_keeps_mapped_file_and_marks_record_ejected() {
     ))
     .expect("seed mapped record");
 
-    crate::sync::eject(&cfg, &reg, "fzf.zsh", "fzf-src", "dest").expect("eject mapped leaf");
+    crate::sync::eject(
+        &cfg,
+        &reg,
+        "fzf.zsh",
+        "fzf-src",
+        "dest",
+        &crate::source::GitBackend::new(std::path::PathBuf::new()),
+    )
+    .expect("eject mapped leaf");
 
     assert!(
         target_root.path().join("fzf-src").join("fzf.zsh").exists(),
         "eject must keep the mapped dest file on disk"
     );
-    let listings = list_statuses(&cfg, &reg).expect("list statuses after eject");
+    let listings = list_statuses(&cfg, &reg, &GitBackend::new(state_dir.path().to_path_buf()))
+        .expect("list statuses after eject");
     let st = status_for(&listings, "dest", "fzf.zsh")
         .expect("an ejected mapped artifact must still be listed");
     assert!(
@@ -2464,10 +2597,19 @@ fn uneject_round_trips_a_mapped_record_back_to_managed() {
     ))
     .expect("seed mapped record");
 
-    crate::sync::eject(&cfg, &reg, "fzf.zsh", "fzf-src", "dest").expect("eject mapped leaf");
+    crate::sync::eject(
+        &cfg,
+        &reg,
+        "fzf.zsh",
+        "fzf-src",
+        "dest",
+        &crate::source::GitBackend::new(std::path::PathBuf::new()),
+    )
+    .expect("eject mapped leaf");
     crate::sync::uneject(&cfg, &reg, "fzf.zsh", "fzf-src", "dest").expect("uneject mapped leaf");
 
-    let listings = list_statuses(&cfg, &reg).expect("list statuses after uneject");
+    let listings = list_statuses(&cfg, &reg, &GitBackend::new(state_dir.path().to_path_buf()))
+        .expect("list statuses after uneject");
     let st = status_for(&listings, "dest", "fzf.zsh")
         .expect("an unejected mapped artifact must still be listed");
     assert!(
@@ -2551,19 +2693,19 @@ fn add_local_writes_path_local_path_to_phora_local_toml() {
     let abspath = std::fs::canonicalize(src_dir.path()).expect("canonicalize source dir");
 
     with_cwd(dir.path(), || {
-        run_add(
-            src_dir.path().to_str().expect("utf8 source path"),
-            &[],
-            Some("mysrc".to_owned()),
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            true,
-            false,
-            &config_edit::BindRefinement::default(),
-        )
+        run_add(AddRequest {
+            url: src_dir.path().to_str().expect("utf8 source path"),
+            targets: &[],
+            name: Some("mysrc".to_owned()),
+            branch: None,
+            tag: None,
+            root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            local: true,
+            symlink: false,
+            refinement: &config_edit::BindRefinement::default(),
+        })
         .expect("run_add --local must succeed for an existing dir");
     });
 
@@ -2592,19 +2734,19 @@ fn add_symlink_writes_path_and_deploy_link_to_local_toml() {
     let abspath = std::fs::canonicalize(src_dir.path()).expect("canonicalize source dir");
 
     with_cwd(dir.path(), || {
-        run_add(
-            src_dir.path().to_str().expect("utf8 source path"),
-            &[],
-            Some("linked".to_owned()),
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            false,
-            true,
-            &config_edit::BindRefinement::default(),
-        )
+        run_add(AddRequest {
+            url: src_dir.path().to_str().expect("utf8 source path"),
+            targets: &[],
+            name: Some("linked".to_owned()),
+            branch: None,
+            tag: None,
+            root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            local: false,
+            symlink: true,
+            refinement: &config_edit::BindRefinement::default(),
+        })
         .expect("run_add --symlink must succeed for an existing dir");
     });
 
@@ -2637,19 +2779,19 @@ fn add_local_infers_name_from_path_basename() {
         .into_owned();
 
     with_cwd(dir.path(), || {
-        run_add(
-            src_dir.to_str().expect("utf8 source path"),
-            &[],
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            true,
-            false,
-            &config_edit::BindRefinement::default(),
-        )
+        run_add(AddRequest {
+            url: src_dir.to_str().expect("utf8 source path"),
+            targets: &[],
+            name: None,
+            branch: None,
+            tag: None,
+            root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            local: true,
+            symlink: false,
+            refinement: &config_edit::BindRefinement::default(),
+        })
         .expect("run_add --local with no --name must succeed");
     });
 
@@ -2670,19 +2812,19 @@ fn add_symlink_implies_local_overlay_and_is_valid() {
     let abspath = std::fs::canonicalize(src_dir.path()).expect("canonicalize source dir");
 
     with_cwd(dir.path(), || {
-        run_add(
-            src_dir.path().to_str().expect("utf8 source path"),
-            &[],
-            Some("app".to_owned()),
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            false,
-            true,
-            &config_edit::BindRefinement::default(),
-        )
+        run_add(AddRequest {
+            url: src_dir.path().to_str().expect("utf8 source path"),
+            targets: &[],
+            name: Some("app".to_owned()),
+            branch: None,
+            tag: None,
+            root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            local: false,
+            symlink: true,
+            refinement: &config_edit::BindRefinement::default(),
+        })
         .expect("run_add --symlink must succeed");
     });
 
@@ -2712,19 +2854,19 @@ fn add_local_and_symlink_together_equals_symlink() {
     let overlay_for = |local: bool, symlink: bool| -> String {
         let dir = tempfile::TempDir::new().expect("temp project dir");
         with_cwd(dir.path(), || {
-            run_add(
-                src_dir.path().to_str().expect("utf8 source path"),
-                &[],
-                Some("s".to_owned()),
-                None,
-                None,
-                None,
-                Vec::new(),
-                Vec::new(),
+            run_add(AddRequest {
+                url: src_dir.path().to_str().expect("utf8 source path"),
+                targets: &[],
+                name: Some("s".to_owned()),
+                branch: None,
+                tag: None,
+                root: None,
+                include: Vec::new(),
+                exclude: Vec::new(),
                 local,
                 symlink,
-                &config_edit::BindRefinement::default(),
-            )
+                refinement: &config_edit::BindRefinement::default(),
+            })
             .expect("run_add must not error");
         });
         std::fs::read_to_string(dir.path().join("phora.local.toml"))
@@ -2772,19 +2914,19 @@ fn add_without_flags_still_writes_phora_toml() {
     let dir = tempfile::TempDir::new().expect("temp project dir");
 
     with_cwd(dir.path(), || {
-        run_add(
-            "github:srnnkls/tropos",
-            &[],
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            false,
-            false,
-            &config_edit::BindRefinement::default(),
-        )
+        run_add(AddRequest {
+            url: "github:srnnkls/tropos",
+            targets: &[],
+            name: None,
+            branch: None,
+            tag: None,
+            root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            local: false,
+            symlink: false,
+            refinement: &config_edit::BindRefinement::default(),
+        })
         .expect("run_add with no overlay flags must keep its remote behavior");
     });
 
@@ -2813,19 +2955,19 @@ fn add_local_canonicalizes_relative_path_to_absolute() {
     let expected = std::fs::canonicalize(dir.path().join("sub")).expect("canonicalize subdir");
 
     with_cwd(dir.path(), || {
-        run_add(
-            "sub",
-            &[],
-            Some("s".to_owned()),
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            true,
-            false,
-            &config_edit::BindRefinement::default(),
-        )
+        run_add(AddRequest {
+            url: "sub",
+            targets: &[],
+            name: Some("s".to_owned()),
+            branch: None,
+            tag: None,
+            root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            local: true,
+            symlink: false,
+            refinement: &config_edit::BindRefinement::default(),
+        })
         .expect("run_add --local must accept a relative existing path");
     });
 
@@ -2850,19 +2992,19 @@ fn add_local_errors_when_path_does_not_exist() {
     let missing = "does-not-exist-xyz";
 
     let err = with_cwd(dir.path(), || {
-        run_add(
-            missing,
-            &[],
-            Some("s".to_owned()),
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            true,
-            false,
-            &config_edit::BindRefinement::default(),
-        )
+        run_add(AddRequest {
+            url: missing,
+            targets: &[],
+            name: Some("s".to_owned()),
+            branch: None,
+            tag: None,
+            root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            local: true,
+            symlink: false,
+            refinement: &config_edit::BindRefinement::default(),
+        })
         .expect_err("--local on a nonexistent path must error")
     });
 
@@ -2892,19 +3034,19 @@ fn add_local_rejects_non_directory_path() {
     let file_str = file.to_str().expect("utf8 file path").to_owned();
 
     let err = with_cwd(dir.path(), || {
-        run_add(
-            &file_str,
-            &[],
-            Some("s".to_owned()),
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            true,
-            false,
-            &config_edit::BindRefinement::default(),
-        )
+        run_add(AddRequest {
+            url: &file_str,
+            targets: &[],
+            name: Some("s".to_owned()),
+            branch: None,
+            tag: None,
+            root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            local: true,
+            symlink: false,
+            refinement: &config_edit::BindRefinement::default(),
+        })
         .expect_err("--local on a regular file must error")
     });
 
@@ -2940,19 +3082,19 @@ fn add_local_preserves_siblings_and_replaces_same_name_in_overlay() {
     let second_abs = std::fs::canonicalize(second.path()).expect("canonicalize second dir");
 
     with_cwd(dir.path(), || {
-        run_add(
-            first.path().to_str().expect("utf8"),
-            &[],
-            Some("mine".to_owned()),
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            true,
-            false,
-            &config_edit::BindRefinement::default(),
-        )
+        run_add(AddRequest {
+            url: first.path().to_str().expect("utf8"),
+            targets: &[],
+            name: Some("mine".to_owned()),
+            branch: None,
+            tag: None,
+            root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            local: true,
+            symlink: false,
+            refinement: &config_edit::BindRefinement::default(),
+        })
         .expect("adding a new overlay source must succeed");
     });
 
@@ -2969,19 +3111,19 @@ fn add_local_preserves_siblings_and_replaces_same_name_in_overlay() {
     );
 
     with_cwd(dir.path(), || {
-        run_add(
-            second.path().to_str().expect("utf8"),
-            &[],
-            Some("mine".to_owned()),
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            true,
-            false,
-            &config_edit::BindRefinement::default(),
-        )
+        run_add(AddRequest {
+            url: second.path().to_str().expect("utf8"),
+            targets: &[],
+            name: Some("mine".to_owned()),
+            branch: None,
+            tag: None,
+            root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            local: true,
+            symlink: false,
+            refinement: &config_edit::BindRefinement::default(),
+        })
         .expect("re-adding the same name must succeed");
     });
 
@@ -3015,19 +3157,19 @@ fn add_symlink_overlay_overrides_base_source_after_merge() {
     let abspath = std::fs::canonicalize(src_dir.path()).expect("canonicalize source dir");
 
     with_cwd(dir.path(), || {
-        run_add(
-            src_dir.path().to_str().expect("utf8"),
-            &[],
-            Some("app".to_owned()),
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            false,
-            true,
-            &config_edit::BindRefinement::default(),
-        )
+        run_add(AddRequest {
+            url: src_dir.path().to_str().expect("utf8"),
+            targets: &[],
+            name: Some("app".to_owned()),
+            branch: None,
+            tag: None,
+            root: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            local: false,
+            symlink: true,
+            refinement: &config_edit::BindRefinement::default(),
+        })
         .expect("--symlink --name app must write the overlay");
     });
 
@@ -3572,6 +3714,7 @@ fn add_to_with_refinement_flags_writes_source_and_table_binding() {
                 root: Some("nvim".to_owned()),
                 local: false,
                 symlink: false,
+                history: false,
                 to: vec!["editor".to_owned()],
                 r#as: Some("nvim".to_owned()),
                 include: Vec::new(),
@@ -3637,6 +3780,7 @@ fn add_to_with_no_refinement_flags_writes_a_bare_string_binding() {
                 root: None,
                 local: false,
                 symlink: false,
+                history: false,
                 to: vec!["editor".to_owned()],
                 r#as: None,
                 include: Vec::new(),
@@ -3692,6 +3836,7 @@ fn add_as_with_multiple_targets_errors() {
                 root: None,
                 local: false,
                 symlink: false,
+                history: false,
                 to: vec!["editor".to_owned(), "shell".to_owned()],
                 r#as: Some("nvim".to_owned()),
                 include: Vec::new(),
@@ -3728,6 +3873,7 @@ fn add_to_a_single_target_with_as_is_the_happy_path() {
                 root: None,
                 local: false,
                 symlink: false,
+                history: false,
                 to: vec!["editor".to_owned()],
                 r#as: Some("nvim".to_owned()),
                 include: Vec::new(),
@@ -3771,6 +3917,7 @@ fn bare_add_without_to_does_not_touch_targets() {
                 root: None,
                 local: false,
                 symlink: false,
+                history: false,
                 to: Vec::new(),
                 r#as: None,
                 include: Vec::new(),
@@ -3821,6 +3968,7 @@ fn add_to_with_root_scopes_the_source_not_the_binding() {
                 root: Some("nvim".to_owned()),
                 local: false,
                 symlink: false,
+                history: false,
                 to: vec!["editor".to_owned()],
                 r#as: Some("nvim".to_owned()),
                 include: Vec::new(),
@@ -3871,6 +4019,7 @@ fn add_to_with_url_embedded_root_sets_the_source_root() {
                 root: None,
                 local: false,
                 symlink: false,
+                history: false,
                 to: vec!["editor".to_owned()],
                 r#as: None,
                 include: Vec::new(),
@@ -3929,6 +4078,7 @@ fn bare_add_with_root_still_sets_the_source_root() {
                 root: Some("nvim".to_owned()),
                 local: false,
                 symlink: false,
+                history: false,
                 to: Vec::new(),
                 r#as: None,
                 include: Vec::new(),
@@ -3963,6 +4113,7 @@ fn add_as_without_to_errors() {
                 root: None,
                 local: false,
                 symlink: false,
+                history: false,
                 to: Vec::new(),
                 r#as: Some("nvim".to_owned()),
                 include: Vec::new(),
@@ -4000,6 +4151,7 @@ fn add_local_with_to_errors() {
                 root: None,
                 local: true,
                 symlink: false,
+                history: false,
                 to: vec!["editor".to_owned()],
                 r#as: None,
                 include: Vec::new(),
@@ -4037,6 +4189,7 @@ fn add_to_multiple_targets_writes_a_binding_in_each() {
                 root: None,
                 local: false,
                 symlink: false,
+                history: false,
                 to: vec!["editor".to_owned(), "shell".to_owned()],
                 r#as: None,
                 include: Vec::new(),
@@ -4085,6 +4238,7 @@ fn add_to_with_include_exclude_writes_arrays_on_the_source() {
                 root: None,
                 local: false,
                 symlink: false,
+                history: false,
                 to: vec!["editor".to_owned()],
                 r#as: None,
                 include: vec!["*.lua".to_owned()],
@@ -4115,19 +4269,19 @@ fn bare_add_routes_repeatable_include_exclude_root_to_the_source_not_the_binding
     let toml_path = dir.path().join("phora.toml");
 
     with_cwd(dir.path(), || {
-        run_add(
-            "github:srnnkls/tropos",
-            &[],
-            None,
-            None,
-            None,
-            Some("editor".to_owned()),
-            vec!["skills/**".to_owned(), "*.lua".to_owned()],
-            vec![".git".to_owned()],
-            false,
-            false,
-            &config_edit::BindRefinement::default(),
-        )
+        run_add(AddRequest {
+            url: "github:srnnkls/tropos",
+            targets: &[],
+            name: None,
+            branch: None,
+            tag: None,
+            root: Some("editor".to_owned()),
+            include: vec!["skills/**".to_owned(), "*.lua".to_owned()],
+            exclude: vec![".git".to_owned()],
+            local: false,
+            symlink: false,
+            refinement: &config_edit::BindRefinement::default(),
+        })
         .expect("`add --include --include --exclude --root` must succeed");
     });
 
@@ -4183,6 +4337,7 @@ fn add_to_target_without_sources_array_creates_the_array_and_binds() {
                 root: None,
                 local: false,
                 symlink: false,
+                history: false,
                 to: vec!["editor".to_owned()],
                 r#as: None,
                 include: Vec::new(),
@@ -4225,6 +4380,7 @@ fn add_to_nonexistent_target_errors_and_leaves_file_untouched() {
                 root: None,
                 local: false,
                 symlink: false,
+                history: false,
                 to: vec!["does-not-exist".to_owned()],
                 r#as: None,
                 include: Vec::new(),
@@ -4658,7 +4814,13 @@ fn target_detail_no_key_target_binds_nothing() {
          [targets.everything]\npath = \"~/x\"\n",
     );
 
-    let detail = target_detail(&cfg, &reg, "everything").expect("target everything is defined");
+    let detail = target_detail(
+        &cfg,
+        &reg,
+        &GitBackend::new(state_dir.path().to_path_buf()),
+        "everything",
+    )
+    .expect("target everything is defined");
     assert!(
         detail.bound_sources.is_empty(),
         "a target with no `sources` key binds NO sources, got {:?}",
@@ -4683,7 +4845,13 @@ fn target_detail_reports_per_artifact_deployment_state() {
     ))
     .expect("seed a clean record");
 
-    let detail = target_detail(&cfg, &reg, "dest").expect("target dest is defined");
+    let detail = target_detail(
+        &cfg,
+        &reg,
+        &GitBackend::new(state_dir.path().to_path_buf()),
+        "dest",
+    )
+    .expect("target dest is defined");
     let editor = detail
         .artifacts
         .iter()
@@ -4705,8 +4873,13 @@ fn target_detail_unknown_name_errors() {
     let state_dir = TempDir::new().expect("state root");
     let reg = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
     let cfg = config_with_targets("version = 1\n\n[targets.real]\npath = \"~/x\"\n");
-    let err = target_detail(&cfg, &reg, "ghost")
-        .expect_err("target show on an undefined name must error");
+    let err = target_detail(
+        &cfg,
+        &reg,
+        &GitBackend::new(state_dir.path().to_path_buf()),
+        "ghost",
+    )
+    .expect_err("target show on an undefined name must error");
     assert!(
         matches!(err, Error::Config(msg) if msg.contains("ghost")),
         "target show on an undefined target must Err naming it"
@@ -5777,4 +5950,321 @@ fn target_rm_refuses_overridden_target_with_live_records() {
         Some(local_text),
         "a refused rm must leave phora.local.toml unchanged for an overridden target"
     );
+}
+
+#[test]
+fn bind_history_writes_each_binding_and_validates_all_targets_before_writing() {
+    assert_add_history_writes_only_its_binding_and_requires_a_target();
+    assert_bind_history_writes_each_binding_and_validates_all_targets_before_writing();
+}
+
+fn assert_add_history_writes_only_its_binding_and_requires_a_target() {
+    use clap::Parser;
+
+    let project = tempfile::TempDir::new().expect("project dir");
+    std::fs::write(
+        project.path().join("phora.toml"),
+        "version = 1
+
+[targets.home]
+path = \"./out\"
+layout = \"flat\"
+sources = []
+",
+    )
+    .expect("seed target config");
+    with_cwd(project.path(), || {
+        run(Cli::try_parse_from([
+            "phora",
+            "add",
+            "--history",
+            "--to",
+            "home",
+            "github:owner/dotfiles",
+        ])
+        .expect("add --history --to must parse"))
+        .expect("add --history --to must write the selected binding");
+    });
+    let base = std::fs::read_to_string(project.path().join("phora.toml"))
+        .expect("add --history must update phora.toml");
+    assert!(
+        base.contains("dotfiles = { history = true }"),
+        "add --history must persist history only on its keyed target binding; got:
+{base}"
+    );
+    let source_section = base
+        .split("[targets.home]")
+        .next()
+        .expect("source section precedes the selected target");
+    assert!(
+        !source_section.contains("history = true"),
+        "add --history must not inject history into the source table; got:
+{base}"
+    );
+
+    let no_target = tempfile::TempDir::new().expect("no-target project dir");
+    let untouched = "version = 1
+
+[defaults]
+auto_target = false
+";
+    std::fs::write(no_target.path().join("phora.toml"), untouched).expect("disable auto target");
+    let error = with_cwd(no_target.path(), || {
+        run(
+            Cli::try_parse_from(["phora", "add", "--history", "github:owner/dotfiles"])
+                .expect("add --history must parse"),
+        )
+        .expect_err("history without an explicit or automatic target must reject")
+        .to_string()
+    });
+    assert!(
+        error.contains("--to"),
+        "the missing-target diagnostic must direct the user to --to; got: {error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(no_target.path().join("phora.toml")).expect("read rejected config"),
+        untouched,
+        "a rejected target-less history add must not change phora.toml"
+    );
+
+    let local_error =
+        Cli::try_parse_from(["phora", "add", "--history", "--local", "/tmp/dotfiles"])
+            .expect_err("--local --history must reject rather than create source-local history")
+            .to_string();
+    assert!(
+        local_error.contains("--history") && local_error.contains("--local"),
+        "the local-history diagnostic must name both incompatible flags; got: {local_error}"
+    );
+}
+
+fn assert_bind_history_writes_each_binding_and_validates_all_targets_before_writing() {
+    use clap::Parser;
+
+    let initial = "version = 1
+
+[sources.dotfiles]
+git = \"https://example.test/dotfiles.git\"
+
+[targets.home]
+path = \"./home\"
+layout = \"flat\"
+sources = []
+
+[targets.work]
+path = \"./work\"
+layout = \"flat\"
+sources = []
+";
+    let project = tempfile::TempDir::new().expect("project dir");
+    let config = project.path().join("phora.toml");
+    std::fs::write(&config, initial).expect("seed target config");
+    with_cwd(project.path(), || {
+        run(Cli::try_parse_from([
+            "phora",
+            "bind",
+            "dotfiles",
+            "--history",
+            "--to",
+            "home",
+            "--to",
+            "work",
+        ])
+        .expect("bind --history must accept multiple --to targets"))
+        .expect("bind --history must write every selected binding");
+    });
+    let written = std::fs::read_to_string(&config).expect("bind --history must update phora.toml");
+    let parsed = Config::parse(&written).unwrap_or_else(|error| {
+        panic!(
+            "bind output must remain valid phora.toml: {error}
+{written}"
+        )
+    });
+    for target in ["home", "work"] {
+        assert!(
+            refined_binding(&parsed, target, "dotfiles").history,
+            "bind --history must persist history on the {target} binding; got:
+{written}"
+        );
+    }
+    let source_section = written
+        .split("[targets.home]")
+        .next()
+        .expect("source section precedes target bindings");
+    assert!(
+        !source_section.contains("history = true"),
+        "bind --history must not persist history on the source; got:
+{written}"
+    );
+
+    Cli::try_parse_from([
+        "phora",
+        "bind",
+        "dotfiles",
+        "--history",
+        "--local",
+        "--to",
+        "home",
+    ])
+    .expect("bind --local --history must remain valid");
+    for (args, option) in [
+        (
+            vec![
+                "phora",
+                "bind",
+                "dotfiles",
+                "--history",
+                "--root",
+                "nvim",
+                "--to",
+                "home",
+            ],
+            "--root",
+        ),
+        (
+            vec![
+                "phora",
+                "bind",
+                "dotfiles",
+                "--history",
+                "--take",
+                "nvim/**",
+                "--to",
+                "home",
+            ],
+            "--take",
+        ),
+    ] {
+        let error = Cli::try_parse_from(args)
+            .expect_err("bind --history must reject source root and binding take refinements")
+            .to_string();
+        assert!(
+            error.contains("--history") && error.contains(option),
+            "the history conflict diagnostic must name --history and {option}; got: {error}"
+        );
+    }
+
+    let rejected = tempfile::TempDir::new().expect("invalid-target project dir");
+    let rejected_config = rejected.path().join("phora.toml");
+    std::fs::write(&rejected_config, initial).expect("seed invalid-target config");
+    with_cwd(rejected.path(), || {
+        run(Cli::try_parse_from([
+            "phora",
+            "bind",
+            "dotfiles",
+            "--history",
+            "--to",
+            "home",
+            "--to",
+            "missing",
+        ])
+        .expect("bind --history must parse before target validation"))
+        .expect_err("a missing later bind target must reject the complete request");
+    });
+    assert_eq!(
+        std::fs::read_to_string(&rejected_config).expect("read rejected config"),
+        initial,
+        "a missing later bind target must leave phora.toml byte-for-byte unchanged"
+    );
+}
+
+fn assert_history_error_mentions(error: &str, option: &str) {
+    assert!(
+        error.contains("history") && error.contains(option),
+        "history rejection must name history and {option}; got: {error}"
+    );
+}
+
+#[test]
+fn add_history_rejects_final_merged_incompatibilities_before_writing() {
+    use clap::Parser;
+
+    for (base, local, args, option) in [
+        (
+            "version = 1\n\n[targets.home]\npath = \"./out\"\nlayout = \"flat\"\nsources = []\n",
+            None::<&str>,
+            vec![
+                "phora",
+                "add",
+                "--history",
+                "--to",
+                "home",
+                "github:owner/dotfiles/nvim",
+            ],
+            "root",
+        ),
+        (
+            "version = 1\n\n[sources.dotfiles]\ngit = \"https://example.test/dotfiles.git\"\n\n[targets.home]\npath = \"./out\"\nlayout = \"flat\"\n\n[targets.home.sources]\ndotfiles = { take = [\"nvim/**\"] }\n",
+            None::<&str>,
+            vec![
+                "phora",
+                "add",
+                "--history",
+                "--to",
+                "home",
+                "github:owner/dotfiles",
+            ],
+            "take",
+        ),
+    ] {
+        let project = tempfile::TempDir::new().expect("project dir");
+        let config = project.path().join("phora.toml");
+        std::fs::write(&config, base).expect("seed phora.toml");
+        if let Some(local) = local {
+            std::fs::write(project.path().join("phora.local.toml"), local)
+                .expect("seed phora.local.toml");
+        }
+
+        let error = with_cwd(project.path(), || {
+            run(Cli::try_parse_from(args).expect("add --history must parse"))
+                .expect_err("final merged history incompatibility must reject add")
+                .to_string()
+        });
+
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("read rejected config"),
+            base,
+            "history rejection for {option} must preserve phora.toml byte-for-byte"
+        );
+        assert_history_error_mentions(&error, option);
+    }
+
+    let project = tempfile::TempDir::new().expect("project dir");
+    let local_source = tempfile::TempDir::new().expect("local source dir");
+    let local_spec = local_source
+        .path()
+        .to_str()
+        .expect("utf-8 local source path");
+    let config = project.path().join("phora.toml");
+    let local_config = project.path().join("phora.local.toml");
+    std::fs::write(&local_config, "version = 1\n").expect("seed phora.local.toml");
+    with_cwd(project.path(), || {
+        run(
+            Cli::try_parse_from(["phora", "add", "--history", "github:owner/dotfiles"])
+                .expect("add --history must parse"),
+        )
+        .expect("add --history must establish the base source");
+    });
+    let base = std::fs::read_to_string(&config).expect("read history base config");
+    let local = std::fs::read_to_string(&local_config).expect("read initial local config");
+
+    let error = with_cwd(project.path(), || {
+        run(Cli::try_parse_from([
+            "phora", "add", "--local", "--name", "dotfiles", "--root", "nvim", local_spec,
+        ])
+        .expect("local root add must parse"))
+        .expect_err("merged inherited history must reject a local root override")
+        .to_string()
+    });
+
+    assert_eq!(
+        std::fs::read_to_string(&config).expect("read rejected base config"),
+        base,
+        "rejected inherited history root override must preserve phora.toml byte-for-byte"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&local_config).expect("read rejected local config"),
+        local,
+        "rejected inherited history root override must preserve phora.local.toml byte-for-byte"
+    );
+    assert_history_error_mentions(&error, "root");
 }

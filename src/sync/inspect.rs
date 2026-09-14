@@ -3,8 +3,10 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::sync::model::{ManagedArtifact, ManagedCondition, ObservedArtifact, ScannedFile};
-use crate::sync::scan::{mtime_secs, scan_dir_soft};
-use crate::sync::state::{ArtifactKey, ArtifactRecord, Ejection, ManifestFile, StateStore};
+use crate::sync::scan::{link_target_bytes, mtime_secs, scan_dir_soft};
+use crate::sync::state::{
+    ArtifactKey, ArtifactRecord, Ejection, ManifestEntryKind, ManifestFile, StateStore,
+};
 
 #[derive(Debug)]
 pub enum ArtifactState {
@@ -114,7 +116,9 @@ fn classify_artifact_state(
         }
     }
 
-    if std::fs::symlink_metadata(target_path).is_ok_and(|m| m.is_file()) {
+    if std::fs::symlink_metadata(target_path)
+        .is_ok_and(|m| m.is_file() || m.file_type().is_symlink())
+    {
         return check_file_artifact_state(
             target_path,
             expected_source,
@@ -135,7 +139,6 @@ fn classify_artifact_state(
 
     for mf in &record.files {
         let file_path = target_path.join(&mf.path);
-        // No-follow stat: a recorded regular file swapped for a symlink is drift.
         let meta = match std::fs::symlink_metadata(&file_path) {
             Ok(meta) => meta,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -149,14 +152,23 @@ fn classify_artifact_state(
                 )));
             }
         };
-        if !meta.is_file() {
-            changed.insert(mf.path.clone());
-            continue;
-        }
-        if meta.len() != mf.size || mtime_secs(&meta, &file_path)? != mf.mtime {
-            match revalidate_file(&file_path, &meta, mf)? {
-                Some(scanned) => fresh.push(scanned),
-                None => {
+        match mf.kind {
+            ManifestEntryKind::File => {
+                if !meta.is_file() {
+                    changed.insert(mf.path.clone());
+                    continue;
+                }
+                if meta.len() != mf.size || mtime_secs(&meta, &file_path)? != mf.mtime {
+                    match revalidate_file(&file_path, &meta, mf)? {
+                        Some(scanned) => fresh.push(scanned),
+                        None => {
+                            changed.insert(mf.path.clone());
+                        }
+                    }
+                }
+            }
+            ManifestEntryKind::Link => {
+                if !meta.file_type().is_symlink() || !link_matches(&file_path, mf)? {
                     changed.insert(mf.path.clone());
                 }
             }
@@ -166,12 +178,16 @@ fn classify_artifact_state(
     let scan = scan_dir_soft(target_path)?;
     let known: HashSet<&PathBuf> = record.files.iter().map(|f| &f.path).collect();
     for cf in &scan.files {
-        if !known.contains(&cf.path) {
+        if !known.contains(&cf.path) && (!record.history || cf.path != Path::new(".git")) {
             changed.insert(cf.path.clone());
         }
     }
-    if !record.allow_symlinks {
-        changed.extend(scan.symlinks);
+    if record.history || !record.allow_symlinks {
+        for path in scan.symlinks {
+            if !known.contains(&path) {
+                changed.insert(path);
+            }
+        }
     }
 
     let state = classify_drift(
@@ -201,14 +217,23 @@ fn check_file_artifact_state(
     let meta = std::fs::symlink_metadata(file_path)
         .map_err(|e| Error::Projection(format!("stat {}: {e}", file_path.display())))?;
     let (changed, fresh) = match record.files.first() {
-        Some(_) if !meta.is_file() => (vec![file_path.to_path_buf()], vec![]),
-        Some(mf) if meta.len() != mf.size || mtime_secs(&meta, file_path)? != mf.mtime => {
-            match revalidate_file(file_path, &meta, mf)? {
-                Some(scanned) => (vec![], vec![scanned]),
-                None => (vec![file_path.to_path_buf()], vec![]),
+        Some(mf) => match mf.kind {
+            ManifestEntryKind::File if !meta.is_file() => (vec![file_path.to_path_buf()], vec![]),
+            ManifestEntryKind::File
+                if meta.len() != mf.size || mtime_secs(&meta, file_path)? != mf.mtime =>
+            {
+                match revalidate_file(file_path, &meta, mf)? {
+                    Some(scanned) => (vec![], vec![scanned]),
+                    None => (vec![file_path.to_path_buf()], vec![]),
+                }
             }
-        }
-        Some(_) => (vec![], vec![]),
+            ManifestEntryKind::Link
+                if !meta.file_type().is_symlink() || !link_matches(file_path, mf)? =>
+            {
+                (vec![file_path.to_path_buf()], vec![])
+            }
+            ManifestEntryKind::File | ManifestEntryKind::Link => (vec![], vec![]),
+        },
         None => (vec![file_path.to_path_buf()], vec![]),
     };
 
@@ -293,6 +318,12 @@ fn classify_drift(
         return ArtifactState::Revalidated { fresh };
     }
     ArtifactState::Clean
+}
+
+fn link_matches(path: &Path, mf: &ManifestFile) -> Result<bool> {
+    let bytes = link_target_bytes(path)
+        .map_err(|e| Error::Projection(format!("read link {}: {e}", path.display())))?;
+    Ok(bytes.len() as u64 == mf.size && blake3::hash(&bytes).to_hex().as_str() == mf.blake3)
 }
 
 /// `None` declines the refresh on any uncertainty (read error, re-stat error, mid-flight
@@ -398,6 +429,7 @@ fn managed_observation(
     Ok(ObservedArtifact::Managed(ManagedArtifact {
         record,
         condition,
+        overlay_stale: false,
     }))
 }
 
@@ -460,6 +492,7 @@ mod tests {
             std::fs::write(&path, contents).expect("write artifact file");
             manifest.push(ManifestFile {
                 path: PathBuf::from(rel),
+                kind: crate::sync::state::ManifestEntryKind::File,
                 size: contents.len() as u64,
                 mtime: read_mtime_secs(&path),
                 blake3: blake3::hash(contents).to_hex().to_string(),
@@ -478,6 +511,10 @@ mod tests {
             preserve_executable: true,
             files: manifest,
             linked: false,
+            history: false,
+            worktree_admin_id: None,
+            mirror_key: None,
+            cache_git_root: None,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
@@ -492,6 +529,7 @@ mod tests {
         let leaf = file_path.file_name().expect("file leaf");
         let mf = ManifestFile {
             path: PathBuf::from(leaf),
+            kind: crate::sync::state::ManifestEntryKind::File,
             size: contents.len() as u64,
             mtime: read_mtime_secs(file_path),
             blake3: blake3::hash(contents).to_hex().to_string(),
@@ -509,6 +547,10 @@ mod tests {
             preserve_executable: true,
             files: vec![mf],
             linked: false,
+            history: false,
+            worktree_admin_id: None,
+            mirror_key: None,
+            cache_git_root: None,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
@@ -690,6 +732,10 @@ mod tests {
             preserve_executable: true,
             files: vec![],
             linked,
+            history: false,
+            worktree_admin_id: None,
+            mirror_key: None,
+            cache_git_root: None,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
@@ -898,6 +944,10 @@ mod tests {
             preserve_executable: true,
             files: vec![],
             linked: true,
+            history: false,
+            worktree_admin_id: None,
+            mirror_key: None,
+            cache_git_root: None,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
