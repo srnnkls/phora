@@ -10,7 +10,8 @@ use tempfile::TempDir;
 use crate::source::{
     GitBackend, HttpBackend, ResolvePolicy, ResolveRequest, ResolvedSource, RevisionSpec,
     RouterBackend, SnapshotId, SourceDirectoryEntry, SourceEntry, SourceError, SourceInventory,
-    SourceLocation, SourcePath, SourceStore, digest_snapshot,
+    SourceLocation, SourcePath, SourceStore, WorktreeDeployRequest, digest_snapshot,
+    worktree_admin_id,
 };
 use crate::sync::state::{Ejection, FileStateStore, HookState, StateError, StateStore};
 
@@ -175,7 +176,7 @@ fn git_show_path(cwd: &Path, commit: &str, path: &str) -> Option<Vec<u8>> {
 
 struct SyncFixture {
     src: TempDir,
-    _git_dir: TempDir,
+    git_dir: TempDir,
     _state_dir: TempDir,
     backend: GitBackend,
     registry: FileStateStore,
@@ -202,6 +203,10 @@ fn linked_flat_record(target: &str, source: &str, artifact: &str) -> ArtifactRec
         preserve_executable: true,
         files: vec![],
         linked: true,
+        history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -241,7 +246,7 @@ fn build_sync_fixture() -> SyncFixture {
 
     SyncFixture {
         src,
-        _git_dir: git_dir,
+        git_dir,
         _state_dir: state_dir,
         backend,
         registry,
@@ -2559,7 +2564,8 @@ fn ejected_copy_to_link_mode_transition_is_a_silent_skip_never_redeploys() {
         !is_symlink(&dst) && dst.is_dir(),
         "premise: the ejected artifact is a real copy directory on disk"
     );
-    eject(&cfg, &registry, "editor", "editor-src", "dest").expect("eject the managed artifact");
+    eject(&cfg, &registry, "editor", "editor-src", "dest", &backend)
+        .expect("eject the managed artifact");
     let key = artifact_key("dest", "editor-src", "editor");
     let ejected = registry.ejections("dest").expect("load ejected");
     assert!(
@@ -2618,7 +2624,8 @@ fn frozen_lockless_ejected_mode_transition_is_write_free() {
         "init.lua",
         b"-- ejected, do not touch\n",
     );
-    eject(&cfg, &registry, "editor", "editor-src", "dest").expect("eject the managed artifact");
+    eject(&cfg, &registry, "editor", "editor-src", "dest", &backend)
+        .expect("eject the managed artifact");
 
     let out = sync(
         &frozen_lockless_input(&cfg, None, false),
@@ -2976,7 +2983,7 @@ fn read_only_target_detail_never_refreshes_the_record() {
     let recorded = manifest_file(&before, "init.lua").clone();
     touch_to_mtime(&dst.join("init.lua"), recorded.mtime + 1000);
 
-    let _detail = crate::cli::target_detail(&cfg, &fx.registry, "dest")
+    let _detail = crate::cli::target_detail(&cfg, &fx.registry, &fx.backend, "dest")
         .expect("read-only target detail must not error");
 
     let after = fx
@@ -3007,8 +3014,8 @@ fn phora_verify_report_unchanged_by_stat_refresh() {
     .expect("first sync deploys the artifact");
     assert!(!first.had_failures, "first deploy must succeed");
 
-    let verify_before =
-        super::verify::verify(&cfg, &fx.registry, None).expect("verify before must not error");
+    let verify_before = super::verify::verify(&cfg, &fx.registry, None, &fx.backend)
+        .expect("verify before must not error");
     assert!(
         verify_before.is_clean(),
         "a freshly deployed artifact must verify clean, got {verify_before:?}"
@@ -3029,8 +3036,8 @@ fn phora_verify_report_unchanged_by_stat_refresh() {
     )
     .expect("revalidating sync must not error");
 
-    let verify_after =
-        super::verify::verify(&cfg, &fx.registry, None).expect("verify after must not error");
+    let verify_after = super::verify::verify(&cfg, &fx.registry, None, &fx.backend)
+        .expect("verify after must not error");
     assert_eq!(
         verify_after, verify_before,
         "a stat-only refresh must not change phora verify's report — blake3 stays untouched"
@@ -3318,7 +3325,7 @@ fn second_deploy_over_correct_link_is_a_noop() {
         },
     )
     .expect("live reconcile pass succeeds");
-    let reconciliation = Reconciliation::new(&changeset, &observed, BTreeMap::new());
+    let reconciliation = Reconciliation::new(&changeset, &observed, &[], BTreeMap::new());
     let run = TargetRun {
         parsed: &parsed,
         target_name: "dest",
@@ -3469,11 +3476,16 @@ fn seed_orphan(
         preserve_executable: true,
         files: vec![ManifestFile {
             path: PathBuf::from("old.txt"),
+            kind: crate::sync::state::ManifestEntryKind::File,
             size: 6,
             mtime: 1_700_000_000,
             blake3: "blake3:orphan".to_owned(),
         }],
         linked: false,
+        history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -3569,6 +3581,10 @@ fn frozen_lockless_fast_forward_with_pending_drops_refuses_before_pruning() {
         preserve_executable: true,
         files: vec![],
         linked: false,
+        history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -3780,11 +3796,16 @@ fn seed_orphan_record(reg: &FileStateStore, source: &str, artifact: &str) {
         preserve_executable: true,
         files: vec![ManifestFile {
             path: PathBuf::from("init.lua"),
+            kind: crate::sync::state::ManifestEntryKind::File,
             size: 6,
             mtime: 1_700_000_000,
             blake3: "blake3:orphan".to_owned(),
         }],
         linked: false,
+        history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -4715,7 +4736,7 @@ fn build_nested_artifact_repo() -> (TempDir, String) {
 }
 
 #[test]
-fn interactive_eject_persists_entry_keeps_record_and_files() {
+fn interactive_foreign_eject_persists_entry_keeps_files_without_a_record() {
     let (src, url) = build_nested_artifact_repo();
     let git_dir = TempDir::new().expect("git dir");
     let state_dir = TempDir::new().expect("state dir");
@@ -4734,6 +4755,9 @@ fn interactive_eject_persists_entry_keeps_record_and_files() {
     );
     let edited = b"-- locally edited\n";
     std::fs::write(dst.join("init.lua"), edited).expect("edit deployed file");
+    registry
+        .remove_artifact(&artifact_key("dest", "editor-src", "editor"))
+        .expect("remove managed record to make the existing content Foreign");
 
     let resolver = ScriptedResolver::new(Resolution::Eject);
     let out = sync(
@@ -4758,8 +4782,8 @@ fn interactive_eject_persists_entry_keeps_record_and_files() {
         registry
             .artifact(&artifact_key("dest", "editor-src", "editor"))
             .expect("registry get must not error")
-            .is_some(),
-        "Eject must keep the artifact's registry record so list/where render it as ejected"
+            .is_none(),
+        "Foreign Eject must persist without requiring or recreating a managed record"
     );
     assert_eq!(
         std::fs::read(dst.join("init.lua")).expect("read kept init.lua"),
@@ -5469,11 +5493,16 @@ fn sync_runs_recovery_sweep_finishing_a_swapped_but_unrecorded_artifact() {
         preserve_executable: true,
         files: vec![ManifestFile {
             path: PathBuf::from("recovered.txt"),
+            kind: crate::sync::state::ManifestEntryKind::File,
             size: 10,
             mtime: 1_700_000_000,
             blake3: "blake3:recovered".to_owned(),
         }],
         linked: false,
+        history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -5599,11 +5628,16 @@ fn sync_runs_recovery_before_phase1_even_when_resolve_fails() {
         preserve_executable: true,
         files: vec![ManifestFile {
             path: PathBuf::from("recovered.txt"),
+            kind: crate::sync::state::ManifestEntryKind::File,
             size: 10,
             mtime: 1_700_000_000,
             blake3: "blake3:recovered".to_owned(),
         }],
         linked: false,
+        history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -5687,11 +5721,16 @@ fn seed_managed_artifact(
         preserve_executable: true,
         files: vec![ManifestFile {
             path: PathBuf::from(file),
+            kind: crate::sync::state::ManifestEntryKind::File,
             size: content.len() as u64,
             mtime: 1_700_000_000,
             blake3: blake3::hash(content).to_hex().to_string(),
         }],
         linked: false,
+        history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -5726,8 +5765,15 @@ fn eject_adds_ejected_entry_keeps_record_and_files() {
         "premise: the artifact must be MANAGED (record present) before eject"
     );
 
-    eject(&cfg, &fx.registry, "editor", "editor-src", "dest")
-        .expect("eject a managed artifact must succeed");
+    eject(
+        &cfg,
+        &fx.registry,
+        "editor",
+        "editor-src",
+        "dest",
+        &fx.backend,
+    )
+    .expect("eject a managed artifact must succeed");
 
     let ejected = fx.registry.ejections("dest").expect("load ejected");
     assert!(
@@ -5766,6 +5812,251 @@ fn eject_adds_ejected_entry_keeps_record_and_files() {
 }
 
 #[test]
+fn eject_detaches_history_overlay_from_the_recorded_mirror_before_persisting_ejection() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let cfg = eject_target_config(&td, &fx);
+    let project = TempDir::new().expect("project root");
+    let deploy = td.target_path().join("history");
+    std::fs::create_dir_all(deploy.join("editor")).expect("create history content directory");
+    std::fs::create_dir_all(deploy.join("docs")).expect("create history docs directory");
+    std::fs::write(deploy.join("editor/init.lua"), b"-- init\n").expect("write history init");
+    std::fs::write(deploy.join("editor/notes.bak"), b"scratch\n").expect("write history notes");
+    std::fs::write(deploy.join("docs/readme.md"), b"# docs\n").expect("write history docs");
+    seed_git_mirror(&fx.backend, "editor-src", &fx.url);
+    let resolved = resolve_git_source(
+        &fx.backend,
+        "editor-src",
+        &fx.url,
+        RevisionSpec::Commit(fx.head_sha.parse().expect("fixture commit")),
+        ResolvePolicy::CachedOnly,
+    );
+    let admin_id = worktree_admin_id(project.path(), &deploy, "dest", "editor-src")
+        .expect("derive persisted worktree id");
+    SourceStore::lock_worktree_mirror(&fx.backend, &sn("editor-src"), resolved.snapshot.mirror())
+        .expect("lock seeded mirror")
+        .publish_worktree(&WorktreeDeployRequest {
+            admin_id: admin_id.clone(),
+            deploy_root: deploy.clone(),
+            commit: fx.head_sha.parse().expect("fixture commit"),
+        })
+        .expect("publish overlay fixture");
+    let mirror = crate::source::mirror_path(fx.git_dir.path(), &fx.url);
+    let admin = mirror
+        .join("worktrees")
+        .join(format!("ph-{}", admin_id.as_str()));
+    let pin = mirror.join("refs/phora/worktrees").join(admin_id.as_str());
+    fx.registry
+        .put_artifact(&ArtifactRecord {
+            version: 1,
+            key: artifact_key("dest", "editor-src", "history"),
+            source: "editor-src".to_owned(),
+            commit: fx.head_sha.clone(),
+            digest: "fixture".to_owned(),
+            projected_at: "2026-08-31T00:00:00Z".to_owned(),
+            layout: "flat".to_owned(),
+            kind: RecordKind::Dir,
+            allow_symlinks: false,
+            preserve_executable: true,
+            files: vec![],
+            linked: false,
+            history: true,
+            worktree_admin_id: Some(admin_id.as_str().to_owned()),
+            mirror_key: Some(resolved.snapshot.mirror().as_str().to_owned()),
+            cache_git_root: Some(
+                fx.git_dir
+                    .path()
+                    .canonicalize()
+                    .expect("physical cache root")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            vars_digest: None,
+            deploy_root: None,
+            layout_separator: None,
+        })
+        .expect("persist history record");
+
+    eject(
+        &cfg,
+        &fx.registry,
+        "history",
+        "editor-src",
+        "dest",
+        &fx.backend,
+    )
+    .expect("eject managed history artifact");
+
+    assert!(
+        !deploy.join(".git").exists() && !admin.exists() && !pin.exists(),
+        "eject must detach gitlink, recorded-mirror administration, and pin before it persists Ejection"
+    );
+    assert!(
+        deploy.join("editor/init.lua").exists()
+            && fx
+                .registry
+                .ejections("dest")
+                .expect("load ejections")
+                .iter()
+                .any(|entry| entry.source == "editor-src" && entry.artifact == "history"),
+        "eject must retain content while recording the ejection"
+    );
+}
+
+fn history_reshape_configs(url: &str, target: &Path) -> (Config, Config) {
+    let history = Config::parse(&format!(
+        "version = 1\n\n[sources.editor]\ngit = \"{url}\"\nbranch = \"main\"\n\n[targets.dest]\npath = \"{}\"\nlayout = \"flat\"\nsources = {{ archive = {{ source = \"editor\", history = true }} }}\n",
+        target.display(),
+    ))
+    .expect("history config parses");
+    let ordinary = Config::parse(&format!(
+        "version = 1\n\n[sources.editor]\ngit = \"{url}\"\nbranch = \"main\"\n\n[targets.dest]\npath = \"{}\"\nlayout = \"flat\"\nsources = {{ archive = {{ source = \"editor\" }} }}\n",
+        target.display(),
+    ))
+    .expect("ordinary config parses");
+    (history, ordinary)
+}
+
+#[test]
+fn history_off_reshape_applies_after_skip_and_retires_the_persisted_overlay() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let (history, ordinary) = history_reshape_configs(&fx.url, &td.target_path());
+    let first = sync(
+        &input(&history, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("history sync deploys");
+    let old_root = td.target_path().join("archive");
+    let old_key = artifact_key("dest", "archive", "archive");
+    let admin_id = fx
+        .registry
+        .artifact(&old_key)
+        .expect("read history record")
+        .expect("history sync writes record")
+        .worktree_admin_id
+        .expect("history record has admin id");
+    let mirror = crate::source::mirror_path(fx.git_dir.path(), &fx.url);
+    let admin = mirror.join("worktrees").join(format!("ph-{admin_id}"));
+    let pin = mirror.join("refs/phora/worktrees").join(&admin_id);
+    std::fs::write(old_root.join("editor/init.lua"), b"-- modified\n")
+        .expect("modify history content");
+    let resolver = ScriptedResolver::new(Resolution::Skip);
+    sync(
+        &interactive_input(&ordinary, Some(first.base_lock.clone()), &resolver),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("ordinary sync may skip the modified history deployment");
+    assert!(
+        old_root.join(".git").exists()
+            && std::fs::read(old_root.join("editor/init.lua"))
+                .expect("read skipped modified content")
+                == b"-- modified\n"
+            && admin.exists()
+            && pin.exists()
+            && fx
+                .registry
+                .artifact(&old_key)
+                .expect("read skipped history record")
+                .is_some(),
+        "Skip must preserve the old overlay, content, and record"
+    );
+    std::fs::write(old_root.join("editor/init.lua"), b"-- init\n")
+        .expect("restore skipped history content");
+    let interrupted_state = TempDir::new().expect("interrupted state directory");
+    let interrupted = FileStateStore::open(interrupted_state.path().to_path_buf())
+        .expect("open interrupted registry");
+    sync(
+        &input(&ordinary, None, Some(first.base_lock.clone()), None, false),
+        &fx.backend,
+        &interrupted,
+    )
+    .expect("ordinary artifacts persist before simulated interruption");
+    for record in interrupted.all_artifacts().expect("read artifacts") {
+        fx.registry.put_artifact(&record).expect("persist artifact");
+    }
+    let persisted = fx
+        .registry
+        .target_artifacts("dest")
+        .expect("read ordinary artifacts");
+    assert!(
+        ["docs", "editor"]
+            .into_iter()
+            .all(|artifact| persisted.iter().any(|record| {
+                record.key == artifact_key("dest", "archive", artifact) && !record.history
+            })),
+        "the interrupted state preserves the old overlay beside clean ordinary replacements"
+    );
+
+    assert_frozen_lockless_history_retirement_refusal(
+        &ordinary,
+        first.base_lock.clone(),
+        &fx,
+        &old_root,
+        &admin,
+        &pin,
+        &old_key,
+    );
+
+    sync(
+        &input(&ordinary, None, Some(first.base_lock), None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("plain retry retires the persisted overlay after clean replacements");
+    assert!(
+        !old_root.join(".git").exists()
+            && !admin.exists()
+            && !pin.exists()
+            && fx
+                .registry
+                .artifact(&old_key)
+                .expect("read retired history record")
+                .is_none(),
+        "clean ordinary replacements retire the old overlay, record, administration, and pin"
+    );
+}
+
+fn assert_frozen_lockless_history_retirement_refusal(
+    ordinary: &Config,
+    base_lock: crate::lock::Lock,
+    fx: &SyncFixture,
+    old_root: &Path,
+    admin: &Path,
+    pin: &Path,
+    old_key: &ArtifactKey,
+) {
+    let record_before_frozen_lockless = fx
+        .registry
+        .artifact(old_key)
+        .expect("read overlay record before the frozen lockless attempt");
+    let frozen_lockless_result = sync(
+        &frozen_lockless_input(ordinary, Some(base_lock), false),
+        &fx.backend,
+        &fx.registry,
+    );
+    assert!(
+        frozen_lockless_result.is_err(),
+        "a frozen lockless sync facing an identity-distinct history-off retirement with ready \
+         ordinary artifacts must refuse before retiring the old overlay, but it succeeded"
+    );
+    assert!(
+        old_root.join(".git").exists()
+            && admin.exists()
+            && pin.exists()
+            && fx
+                .registry
+                .artifact(old_key)
+                .expect("read overlay record after the refused frozen lockless attempt")
+                == record_before_frozen_lockless,
+        "a refused frozen lockless sync must leave the old overlay's content, gitlink \
+         administration, pin, and registry record untouched"
+    );
+}
+
+#[test]
 fn eject_persists_entry_across_a_reopened_registry() {
     let state_dir = TempDir::new().expect("state dir");
     let fx = build_sync_fixture();
@@ -5774,7 +6065,7 @@ fn eject_persists_entry_across_a_reopened_registry() {
     let reg = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
     seed_managed_artifact(&td, &reg, "editor-src", "editor", "init.lua", b"-- init\n");
 
-    eject(&cfg, &reg, "editor", "editor-src", "dest").expect("eject must succeed");
+    eject(&cfg, &reg, "editor", "editor-src", "dest", &fx.backend).expect("eject must succeed");
 
     let reopened = FileStateStore::open(state_dir.path().to_path_buf()).expect("reopen registry");
     let ejected = reopened.ejections("dest").expect("load ejected reopened");
@@ -5849,6 +6140,7 @@ fn seed_verifiable_artifact(
             std::fs::write(&path, content).expect("write verify file");
             ManifestFile {
                 path: PathBuf::from(rel),
+                kind: crate::sync::state::ManifestEntryKind::File,
                 size: content.len() as u64,
                 mtime: 1_700_000_000,
                 blake3: blake3::hash(content).to_hex().to_string(),
@@ -5868,6 +6160,10 @@ fn seed_verifiable_artifact(
         preserve_executable: true,
         files: manifest,
         linked: false,
+        history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -5896,7 +6192,7 @@ fn verify_reports_no_mismatch_when_content_matches_recorded_hash() {
         ],
     );
 
-    let mismatches = verify(&cfg, &fx.registry, None)
+    let mismatches = verify(&cfg, &fx.registry, None, &fx.backend)
         .expect("verify must not error")
         .mismatches;
 
@@ -5933,7 +6229,7 @@ fn verify_skips_ejected_artifacts() {
         )
         .expect("mark the artifact ejected");
 
-    let mismatches = verify(&cfg, &fx.registry, None)
+    let mismatches = verify(&cfg, &fx.registry, None, &fx.backend)
         .expect("verify must not error")
         .mismatches;
 
@@ -5968,7 +6264,7 @@ fn verify_reports_mismatch_for_edited_deployed_file() {
     let edited_hash = blake3::hash(edited).to_hex().to_string();
     assert_ne!(recorded_hash, edited_hash);
 
-    let mismatches = verify(&cfg, &fx.registry, None)
+    let mismatches = verify(&cfg, &fx.registry, None, &fx.backend)
         .expect("verify must not error")
         .mismatches;
 
@@ -6018,7 +6314,7 @@ fn verify_reports_missing_recorded_file() {
     // Delete a recorded file: it is in the record but absent on disk.
     std::fs::remove_file(dst.join("gone.lua")).expect("remove recorded file");
 
-    let mismatches = verify(&cfg, &fx.registry, None)
+    let mismatches = verify(&cfg, &fx.registry, None, &fx.backend)
         .expect("verify must not error")
         .mismatches;
 
@@ -6545,11 +6841,16 @@ fn verify_skips_linked_record_even_with_stray_manifest_file() {
         preserve_executable: true,
         files: vec![ManifestFile {
             path: PathBuf::from("ghost.lua"),
+            kind: crate::sync::state::ManifestEntryKind::File,
             size: 7,
             mtime: 1_700_000_000,
             blake3: blake3::hash(b"phantom").to_hex().to_string(),
         }],
         linked: true,
+        history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -6558,7 +6859,7 @@ fn verify_skips_linked_record_even_with_stray_manifest_file() {
         .put_artifact(&stray)
         .expect("seed a linked record carrying a stray manifest file");
 
-    let mismatches = verify(&cfg, &fx.registry, None)
+    let mismatches = verify(&cfg, &fx.registry, None, &fx.backend)
         .expect("verify must not error")
         .mismatches;
 
@@ -6602,6 +6903,10 @@ fn verify_skips_linked_record_over_edited_symlink_target() {
         preserve_executable: true,
         files: vec![],
         linked: true,
+        history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -6614,7 +6919,7 @@ fn verify_skips_linked_record_over_edited_symlink_target() {
     std::fs::write(live.join("init.lua"), b"-- EDITED LIVE\n")
         .expect("edit the symlink target content");
 
-    let mismatches = verify(&cfg, &fx.registry, None)
+    let mismatches = verify(&cfg, &fx.registry, None, &fx.backend)
         .expect("verify must not error")
         .mismatches;
 
@@ -6719,6 +7024,10 @@ fn prune_removes_stale_linked_symlink_without_following_it() {
             preserve_executable: true,
             files: vec![],
             linked: true,
+            history: false,
+            worktree_admin_id: None,
+            mirror_key: None,
+            cache_git_root: None,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
@@ -6808,6 +7117,10 @@ fn prune_drops_a_stale_dir_record_once_the_plan_flips_leaf_granular() {
             preserve_executable: true,
             files: vec![],
             linked: true,
+            history: false,
+            worktree_admin_id: None,
+            mirror_key: None,
+            cache_git_root: None,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
@@ -6893,6 +7206,10 @@ fn leaf_record(target: &str, identity: &str, key: &str) -> ArtifactRecord {
         preserve_executable: true,
         files: vec![],
         linked: false,
+        history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -7229,11 +7546,16 @@ fn prune_keeps_a_foreign_orphan_dir_that_ancestors_a_live_leaf_of_another_bindin
             preserve_executable: true,
             files: vec![ManifestFile {
                 path: PathBuf::from("legacy.txt"),
+                kind: crate::sync::state::ManifestEntryKind::File,
                 size: 7,
                 mtime: 1_700_000_000,
                 blake3: "blake3:orphan".to_owned(),
             }],
             linked: false,
+            history: false,
+            worktree_admin_id: None,
+            mirror_key: None,
+            cache_git_root: None,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
@@ -7291,6 +7613,10 @@ fn prune_keeps_a_foreign_orphan_leaf_nested_under_a_live_collapsed_dir_of_anothe
             preserve_executable: true,
             files: vec![],
             linked: false,
+            history: false,
+            worktree_admin_id: None,
+            mirror_key: None,
+            cache_git_root: None,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
@@ -7967,7 +8293,7 @@ fn transition_copy_to_link_materializes_symlink() {
         .expect("registry read")
         .expect("copy leg writes a record");
     assert!(!copy_rec.linked, "premise: a copy record is linked=false");
-    let copy_mismatches = verify(&copy_cfg, &fx.registry, None)
+    let copy_mismatches = verify(&copy_cfg, &fx.registry, None, &fx.backend)
         .expect("verify must not error")
         .mismatches;
     assert!(
@@ -8006,7 +8332,7 @@ fn transition_copy_to_link_materializes_symlink() {
     );
 
     let effective = effective_of(&base, &local);
-    let link_mismatches = verify(&effective, &fx.registry, None)
+    let link_mismatches = verify(&effective, &fx.registry, None, &fx.backend)
         .expect("verify must not error")
         .mismatches;
     assert!(
@@ -8081,7 +8407,7 @@ fn transition_link_to_copy_materializes_real_copy() {
         copy_rec.files
     );
 
-    let copy_mismatches = verify(&copy_cfg, &fx.registry, None)
+    let copy_mismatches = verify(&copy_cfg, &fx.registry, None, &fx.backend)
         .expect("verify must not error")
         .mismatches;
     assert!(
@@ -10017,11 +10343,16 @@ fn preview_writes_nothing_to_the_registry_or_the_target() {
         preserve_executable: true,
         files: vec![ManifestFile {
             path: PathBuf::from("init.lua"),
+            kind: crate::sync::state::ManifestEntryKind::File,
             size: 8,
             mtime: 1_700_000_000,
             blake3: "blake3:seeded".to_owned(),
         }],
         linked: false,
+        history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -11371,6 +11702,78 @@ fn plan_target_without_override_discovers_full_source_level_set() {
 }
 
 #[test]
+fn project_workspace_keeps_history_materialization_on_its_binding() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nlayout = \"by-source\"\n\
+         sources = {{ ordinary = {{ source = \"editor-src\" }}, archive = {{ source = \"editor-src\", history = true }} }}\n",
+        fx.url,
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("two differently owned bindings parse");
+    let parsed = cfg.parsed_sources().expect("sources parse");
+    let remotes = resolved_remotes(&cfg, &parsed).expect("remotes resolve");
+    seed_git_mirror(&fx.backend, "editor-src", &fx.url);
+    let commits = one_commit(&parsed, "editor-src", &fx.head_sha);
+    let resolved_sources = resolved_git_map(&fx.backend, "editor-src", &fx.url, &fx.head_sha);
+
+    let projection = project_workspace(
+        &cfg,
+        &parsed,
+        &remotes,
+        &fx.backend,
+        &commits,
+        &resolved_sources,
+    )
+    .expect("projection builds over the seeded mirror");
+    let dest = projection
+        .targets
+        .iter()
+        .find(|p| p.target == "dest")
+        .expect("projection must include target `dest`");
+    let ordinary = dest
+        .bindings
+        .iter()
+        .find(|binding| binding.identity == "ordinary")
+        .expect("ordinary binding projects");
+    assert!(
+        ordinary.artifacts.iter().all(|artifact| !matches!(
+            &artifact.materialization,
+            crate::projection::model::Materialization::WholeRoot { .. }
+        )),
+        "the ordinary binding must retain normal materialization"
+    );
+    let mut ordinary_artifacts = projected_artifact_keys(ordinary);
+    ordinary_artifacts.sort_unstable();
+    assert_eq!(
+        ordinary_artifacts,
+        vec!["docs", "editor"],
+        "the ordinary binding must retain the source's normal artifact set"
+    );
+    let archive = dest
+        .bindings
+        .iter()
+        .find(|binding| binding.identity == "archive")
+        .expect("history binding projects");
+    assert!(
+        matches!(
+            archive.artifacts.as_slice(),
+            [artifact]
+                if matches!(
+                    &artifact.materialization,
+                    crate::projection::model::Materialization::WholeRoot { identity }
+                        if identity == "archive"
+                )
+        ),
+        "only the history binding must project one WholeRoot at its identity; got: {:?}",
+        archive.artifacts
+    );
+}
+
+#[test]
 fn project_workspace_aggregates_per_target_warnings() {
     let fx = build_sync_fixture();
     let td = TargetDir::new();
@@ -12092,7 +12495,7 @@ fn manifest_hashes_rendered_bytes_so_verify_passes_on_rendered_output() {
         motd.blake3
     );
 
-    let report = crate::sync::verify(&cfg, &h.registry, None).expect("verify runs");
+    let report = crate::sync::verify(&cfg, &h.registry, None, &h.backend).expect("verify runs");
     assert!(
         report.mismatches.is_empty(),
         "INV-5: verify re-hashes the deployed rendered file and must match the manifest; \
@@ -12812,6 +13215,10 @@ fn seed_recorded_artifact_at(reg: &FileStateStore, source: &str, artifact: &str,
         preserve_executable: true,
         files: vec![],
         linked: false,
+        history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
@@ -12905,7 +13312,7 @@ fn sealed_offer_ejecting_a_source_dropped_artifact_unblocks_sync() {
     let cfg = Config::parse(&toml).expect("default-offer config parses");
 
     seed_recorded_artifact(&registry, "editor-src", "editor");
-    crate::sync::eject(&cfg, &registry, "editor", "editor-src", "dest")
+    crate::sync::eject(&cfg, &registry, "editor", "editor-src", "dest", &backend)
         .expect("ejecting a managed record must succeed");
 
     let in_ = input(&cfg, None, None, None, false);
@@ -13409,6 +13816,36 @@ fn build_moved_recovery_source(p: &Path) -> (String, String, String) {
     (p.to_string_lossy().into_owned(), c0, c1)
 }
 
+fn crashed_recovery_record(key: ArtifactKey, commit: &str) -> ArtifactRecord {
+    ArtifactRecord {
+        version: 1,
+        key,
+        source: "editor-src".to_owned(),
+        commit: commit.to_owned(),
+        digest: "blake3:recovered".to_owned(),
+        projected_at: "2026-01-01T00:00:00Z".to_owned(),
+        layout: "flat".to_owned(),
+        kind: RecordKind::Dir,
+        allow_symlinks: false,
+        preserve_executable: true,
+        files: vec![ManifestFile {
+            path: PathBuf::from("init.lua"),
+            kind: crate::sync::state::ManifestEntryKind::File,
+            size: 8,
+            mtime: 1_700_000_000,
+            blake3: "blake3:recovered".to_owned(),
+        }],
+        linked: false,
+        history: false,
+        worktree_admin_id: None,
+        mirror_key: None,
+        cache_git_root: None,
+        vars_digest: None,
+        deploy_root: None,
+        layout_separator: None,
+    }
+}
+
 #[test]
 fn sealed_offer_validates_crash_recovered_record_finalized_by_the_sweep() {
     let src = TempDir::new().expect("src tempdir");
@@ -13434,28 +13871,7 @@ fn sealed_offer_validates_crash_recovered_record_finalized_by_the_sweep() {
     std::fs::write(crashed_dst.join("init.lua"), b"-- init\n").expect("write crashed file");
 
     let crashed_key = artifact_key("dest", "editor-src", "editor");
-    let record = ArtifactRecord {
-        version: 1,
-        key: crashed_key.clone(),
-        source: "editor-src".to_owned(),
-        commit: c0.clone(),
-        digest: "blake3:recovered".to_owned(),
-        projected_at: "2026-01-01T00:00:00Z".to_owned(),
-        layout: "flat".to_owned(),
-        kind: RecordKind::Dir,
-        allow_symlinks: false,
-        preserve_executable: true,
-        files: vec![ManifestFile {
-            path: PathBuf::from("init.lua"),
-            size: 8,
-            mtime: 1_700_000_000,
-            blake3: "blake3:recovered".to_owned(),
-        }],
-        linked: false,
-        vars_digest: None,
-        deploy_root: None,
-        layout_separator: None,
-    };
+    let record = crashed_recovery_record(crashed_key.clone(), &c0);
 
     let staging_base = td.parent_path.join(".phora-stage");
     let staging = staging_base.join("editor-deadbeef");
@@ -13899,6 +14315,7 @@ mod leaf_granular_deploy_tests {
         let mut stale = dir_record("dest", "ed", "editor");
         stale.files = vec![ManifestFile {
             path: PathBuf::from("a\\b"),
+            kind: crate::sync::state::ManifestEntryKind::File,
             size: 18,
             mtime: 1_700_000_000,
             blake3: "blake3:stale".to_owned(),
@@ -15429,7 +15846,7 @@ fn undecided_conflict_at_apply_errors_unresolved() {
     let observed = crate::sync::model::ObservedProjectState::<ArtifactRecord> {
         artifacts: Vec::new(),
     };
-    let reconciliation = Reconciliation::new(&changeset, &observed, BTreeMap::new());
+    let reconciliation = Reconciliation::new(&changeset, &observed, &[], BTreeMap::new());
 
     let journal = Journal::open(&fx.registry.journal_root()).expect("open journal");
     let protected = test_protected(fx.src.path());

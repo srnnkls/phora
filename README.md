@@ -78,7 +78,9 @@ Requires a Rust toolchain (edition 2024).
   layout. A target draws from its explicit `sources` allow-list.
 - *Binding* — a target's link to a source. The source owns the offer; the binding
   owns the *take*: its `take` subsets and renames the offer for that target alone,
-  and `collapse` controls how the taken set materializes. See [Bindings](#bindings).
+  and `collapse` controls how the taken set materializes. A binding can also opt
+  into a *history overlay*, which adds Git metadata to its copy deployment. See
+  [Bindings](#bindings) and [History overlay](#history-overlay).
 - *Transitive dependency* — a source that is itself a phora project. Mark it
   `transitive = true`, import it into a target with `imports = [...]`, and its own
   `phora.toml` targets compose into your workspace under that target's path. See
@@ -102,6 +104,7 @@ The model splits cleanly into who-owns-what:
 | take     | target | subsets and renames the offer per binding (literal / glob / `{ src = dest }`) |
 | artifact | —      | one leaf, identified by its full offered path                       |
 | collapse | target | how a taken set materializes: per-leaf, or one dir symlink/subtree  |
+| history overlay | binding | Git metadata over one copy deployment; copied content remains authoritative |
 
 ### State & locations
 
@@ -170,6 +173,8 @@ phora add git@github.com:me/dotfiles.git --tag v1.2
 # Bind sources to a target; --take subsets/renames the offer for that target
 phora bind dotfiles --to neovim                          # bare binding, takes the whole offer
 phora bind dotfiles --to neovim --as nvim --take nvim/**  # take just nvim/** under identity `nvim`
+phora add --history <source> --to <target>                # add a source with a history-enabled binding
+phora bind gitoxide --history --to resources --to docs    # one history binding per repeated target
 phora unbind nvim --from neovim                          # remove a binding by identity
 # --root/--include/--exclude on `add` shape the SOURCE offer (source-owned), not a binding.
 phora add me/dotfiles --to neovim --as nvim --root nvim
@@ -469,8 +474,10 @@ A target's `sources` takes one of two forms — never both at once:
   key defaults to the source name; `source` is written only on divergence,
   when the identity differs from the source name. A bare entry inside a refined
   (keyed) target is `name = {}`. A binding may set `take`, `collapse`, `template`,
-  and a per-target ref (`branch`/`tag`/`rev`); the offer scope itself
-  (`root`/`include`/`exclude`) is not a binding key.
+  `history` (see [History overlay](#history-overlay)), and a per-target ref
+  (`branch`/`tag`/`rev`). A history binding takes the whole repository and rejects
+  `take`, `collapse`, and `template`; the offer scope itself (`root`/`include`/`exclude`)
+  is not a binding key.
 
 Take subsets and renames the offer. A binding's `take` is a list whose entries are:
 
@@ -750,6 +757,50 @@ re-hashes deployed files with the same guarantees as git sources.
 Out of scope (for now). Auth for private assets and forge release-tag
 resolution (latest tag → asset URL) are future work; v1 targets public URLs.
 
+### History overlay
+
+A history overlay is a binding-level opt-in for a Git-backed copy deployment. Phora
+copies and verifies the content exactly as in ordinary copy mode: the deployed content
+and its manifest remain authoritative. The overlay is orthogonal Git metadata that lets
+`git log`, `git blame`, `git show`, and `git diff` work inside that deployment.
+
+History belongs to `Binding.history`, not the source. The same source can therefore be
+an ordinary copy binding for one target and history-enabled for another. A history
+binding materializes the source's whole repository at the binding identity.
+
+A common use is a project's committed manifest, which pins third-party references under
+`resources/` for agents or other tools to inspect at the pinned version. The manifest
+preserves the source and commit while `resources/gitoxide/` remains readable with its
+upstream history:
+
+```toml
+[sources.gitoxide]
+host = "github"
+repo = "Byron/gitoxide"
+
+[targets.resources]
+path = "resources"
+
+[targets.resources.sources.gitoxide]
+history = true
+```
+
+`phora add --history <source> --to <target>` creates a history-enabled binding. To
+apply the same existing source to several targets in one edit, repeat `--to`:
+
+```bash
+phora bind gitoxide --history --to resources --to docs
+```
+
+The overlay's mirrors are cache state. User branches and commits made inside a history
+deployment are disposable cache-local state: a cache deletion or mirror reclone can lose
+them, so push work elsewhere to retain it. A concurrent mirror refresh can also make a
+user-run `git log` or `git blame` fail transiently; retry the command.
+
+When a history deployment is inside your own Git work tree, the enclosing repository
+sees it as an embedded repository. Add that deployment path to the enclosing
+repository's `.gitignore` unless you intend to manage it there.
+
 ### Link mode (local development)
 
 By default `deploy = "copy"` materializes a reflink-style copy of each artifact
@@ -975,8 +1026,10 @@ an outer VM or container before you approve its hooks.
 
 ## Worktrees
 
-A worktree is just a directory you run `phora sync` from; sync builds the managed
-state there. It is cheap to re-run: an unchanged lock means no refetch.
+Here, a worktree is a source's live working tree in link mode or the project directory
+from which you run `phora sync`; it is not a target history overlay. A history overlay
+is a copy deployment with Git metadata (see [History overlay](#history-overlay)).
+Running `phora sync` is cheap to repeat: an unchanged lock means no refetch.
 
 Carrying ignored or local files (`.env`, editor settings, submodules) across
 worktrees is out of scope — use [`git-worktreeinclude`](https://github.com/srnnkls/git-worktreeinclude)

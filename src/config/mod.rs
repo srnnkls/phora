@@ -241,6 +241,7 @@ impl Config {
                 };
                 reject_url_slice(effective, binding, source)?;
                 reject_link_ref(effective, binding, source)?;
+                reject_history_binding_options(target_name, identity, effective, binding, source)?;
                 reject_multi_ref(effective, binding)?;
             }
         }
@@ -462,6 +463,44 @@ fn binding_scope_diagnostic(
         debug_hint: Some(format!("phora explain {target_name} {binding_name}")),
         details: Vec::new(),
     }
+}
+
+fn reject_history_binding_options(
+    target_name: &str,
+    identity: &str,
+    source_name: &str,
+    binding: &Binding,
+    source: &Source,
+) -> Result<()> {
+    if !binding.history {
+        return Ok(());
+    }
+    let option = if source.url.is_some() {
+        "url"
+    } else if source.deploy == Some(DeployMode::Link) {
+        "deploy"
+    } else if source.root.is_some() {
+        "root"
+    } else if source.include.is_some() {
+        "include"
+    } else if source.exclude.is_some() {
+        "exclude"
+    } else if source.transitive == Some(true) {
+        "transitive"
+    } else if source.preserve_executable == Some(false) {
+        "preserve_executable"
+    } else if binding.take.is_some() {
+        "take"
+    } else if binding.template.is_some() {
+        "template"
+    } else if binding.collapse.is_some() {
+        "collapse"
+    } else {
+        return Ok(());
+    };
+    Err(Error::Config(format!(
+        "target `{target_name}`: binding `{identity}` for source `{source_name}`: `history` cannot be combined with `{option}`"
+    )))
 }
 
 fn reject_url_slice(source_name: &str, binding: &Binding, source: &Source) -> Result<()> {

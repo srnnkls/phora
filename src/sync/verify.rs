@@ -1,13 +1,20 @@
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::lock::Lock;
-use crate::sync::state::{ArtifactKey, StateStore};
+use crate::source::{
+    SourceName, SourceStore, WorktreeObservationLevel, WorktreeObservationLock,
+    WorktreeObservationResult,
+};
+use crate::sync::scan::link_target_bytes;
+use crate::sync::state::{ArtifactKey, ManifestEntryKind, StateStore};
 
 /// Why a deployed file failed verification against its registry record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifyReason {
     /// The deployed file's content hash differs from the recorded `blake3`.
     ContentMismatch { expected: String, actual: String },
+    /// The deployed entry type differs from the recorded manifest kind.
+    EntryKindMismatch,
     /// The recorded file is absent on disk at the deployed location.
     Missing,
 }
@@ -30,15 +37,26 @@ pub struct UntrustedHookFinding {
     pub hook_id: String,
 }
 
-/// What `verify` found: per-file content mismatches plus untrusted stripped-hook gaps. Either
-/// being non-empty fails CI.
+/// A report-only history-overlay finding. It is surfaced to callers but does not make
+/// [`VerifyReport::is_clean`] false.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayFinding {
+    pub key: ArtifactKey,
+    pub reason: String,
+    pub remedy: &'static str,
+}
+
+/// Verification findings. Overlay findings are report-only and do not affect [`Self::is_clean`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VerifyReport {
     pub mismatches: Vec<VerifyMismatch>,
     pub untrusted_hooks: Vec<UntrustedHookFinding>,
+    pub overlay_findings: Vec<OverlayFinding>,
 }
 
 impl VerifyReport {
+    /// Returns whether content and hook verification found no failures; overlay findings are
+    /// report-only.
     #[must_use]
     pub fn is_clean(&self) -> bool {
         self.mismatches.is_empty() && self.untrusted_hooks.is_empty()
@@ -49,10 +67,12 @@ pub fn verify(
     config: &Config,
     registry: &dyn StateStore,
     lock: Option<&Lock>,
+    backend: &dyn SourceStore,
 ) -> Result<VerifyReport> {
     Ok(VerifyReport {
         mismatches: verify_mismatches(config, registry)?,
         untrusted_hooks: untrusted_hook_findings(lock),
+        overlay_findings: overlay_findings(config, registry, backend)?,
     })
 }
 
@@ -73,6 +93,56 @@ fn untrusted_hook_findings(lock: Option<&Lock>) -> Vec<UntrustedHookFinding> {
         .collect()
 }
 
+fn overlay_findings(
+    config: &Config,
+    registry: &dyn StateStore,
+    backend: &dyn SourceStore,
+) -> Result<Vec<OverlayFinding>> {
+    let records = registry.all_artifacts()?;
+    let ejected = crate::sync::state::ejected_index(registry, &records)?;
+    let mut findings = Vec::new();
+    for record in records {
+        if !record.history
+            || record.linked
+            || ejected.contains(&(
+                record.key.target.clone(),
+                record.key.source.clone(),
+                record.key.artifact.clone(),
+            ))
+        {
+            continue;
+        }
+        let Some(target) = config.targets.get(&record.key.target) else {
+            continue;
+        };
+        let artifact_root = super::target::record_artifact_path(target, &record);
+        let Some(request) = crate::sync::observe::history_observation_request(
+            &record,
+            SourceName::trusted(&record.key.source),
+            &artifact_root,
+            WorktreeObservationLock::Try,
+            WorktreeObservationLevel::Semantic,
+        )?
+        else {
+            continue;
+        };
+        match backend.observe_worktree(&request)? {
+            WorktreeObservationResult::Conformant => {}
+            WorktreeObservationResult::Stale => findings.push(OverlayFinding {
+                key: record.key,
+                reason: "history overlay is stale".to_owned(),
+                remedy: "phora sync",
+            }),
+            WorktreeObservationResult::Unknown => findings.push(OverlayFinding {
+                key: record.key,
+                reason: "history overlay could not be observed".to_owned(),
+                remedy: "phora sync",
+            }),
+        }
+    }
+    Ok(findings)
+}
+
 fn verify_mismatches(config: &Config, registry: &dyn StateStore) -> Result<Vec<VerifyMismatch>> {
     let mut mismatches = Vec::new();
     let records = registry.all_artifacts()?;
@@ -91,8 +161,26 @@ fn verify_mismatches(config: &Config, registry: &dyn StateStore) -> Result<Vec<V
         let artifact_dir = super::target::record_manifest_base(target, &record);
         for file in &record.files {
             let dst = artifact_dir.join(&file.path);
-            match std::fs::read(&dst) {
-                Ok(content) => {
+            match std::fs::symlink_metadata(&dst) {
+                Ok(metadata) => {
+                    let actual_kind = if metadata.file_type().is_symlink() {
+                        ManifestEntryKind::Link
+                    } else {
+                        ManifestEntryKind::File
+                    };
+                    if actual_kind != file.kind {
+                        mismatches.push(VerifyMismatch {
+                            key: record.key.clone(),
+                            path: file.path.clone(),
+                            reason: VerifyReason::EntryKindMismatch,
+                        });
+                        continue;
+                    }
+                    let content = match file.kind {
+                        ManifestEntryKind::File => std::fs::read(&dst),
+                        ManifestEntryKind::Link => link_target_bytes(&dst),
+                    }
+                    .map_err(|e| Error::Sync(format!("verify read {}: {e}", dst.display())))?;
                     let actual = blake3::hash(&content).to_hex().to_string();
                     if actual != file.blake3 {
                         mismatches.push(VerifyMismatch {
@@ -113,7 +201,7 @@ fn verify_mismatches(config: &Config, registry: &dyn StateStore) -> Result<Vec<V
                     });
                 }
                 Err(e) => {
-                    return Err(Error::Sync(format!("verify read {}: {e}", dst.display())));
+                    return Err(Error::Sync(format!("verify stat {}: {e}", dst.display())));
                 }
             }
         }
@@ -125,6 +213,7 @@ fn verify_mismatches(config: &Config, registry: &dyn StateStore) -> Result<Vec<V
 mod tests {
     use super::*;
     use crate::lock::{CandidateHookRecord, LOCK_SCHEMA_VERSION, Lock, TrustedHook};
+    use crate::source::GitBackend;
     use crate::sync::state::FileStateStore;
     use tempfile::TempDir;
 
@@ -160,10 +249,11 @@ mod tests {
 
     #[test]
     fn verify_flags_an_untrusted_stripped_hook_candidate() {
-        let (_dir, reg) = empty_registry();
+        let (dir, reg) = empty_registry();
+        let backend = GitBackend::new(dir.path().to_path_buf());
         let lock = lock_with(vec![candidate("blake3:untrusted")], Vec::new());
 
-        let report = verify(&config(), &reg, Some(&lock)).expect("verify runs");
+        let report = verify(&config(), &reg, Some(&lock), &backend).expect("verify runs");
 
         assert!(
             report.mismatches.is_empty(),
@@ -183,7 +273,8 @@ mod tests {
 
     #[test]
     fn verify_does_not_flag_a_candidate_whose_preimage_is_trusted() {
-        let (_dir, reg) = empty_registry();
+        let (dir, reg) = empty_registry();
+        let backend = GitBackend::new(dir.path().to_path_buf());
         let trusted = vec![TrustedHook {
             dep_instance: "inst0001".to_owned(),
             hook_id: "inst0001%1%editor#on_change#abc".to_owned(),
@@ -194,7 +285,7 @@ mod tests {
         }];
         let lock = lock_with(vec![candidate("blake3:approved")], trusted);
 
-        let report = verify(&config(), &reg, Some(&lock)).expect("verify runs");
+        let report = verify(&config(), &reg, Some(&lock), &backend).expect("verify runs");
 
         assert!(
             report.untrusted_hooks.is_empty(),
@@ -206,9 +297,10 @@ mod tests {
 
     #[test]
     fn verify_without_a_lock_surfaces_no_hook_findings() {
-        let (_dir, reg) = empty_registry();
+        let (dir, reg) = empty_registry();
+        let backend = GitBackend::new(dir.path().to_path_buf());
 
-        let report = verify(&config(), &reg, None).expect("verify runs");
+        let report = verify(&config(), &reg, None, &backend).expect("verify runs");
 
         assert!(
             report.untrusted_hooks.is_empty(),
