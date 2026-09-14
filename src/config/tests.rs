@@ -324,6 +324,14 @@ fn parses_version_and_all_sections_from_example() {
 }
 
 #[test]
+fn omitted_version_defaults_to_the_schema_version() {
+    let cfg = Config::parse("[sources.dots]\ngit = \"https://example.com/dots.git\"\n")
+        .expect("a config without a version key should parse");
+    assert_eq!(cfg.version, crate::config::SCHEMA_VERSION);
+    assert_eq!(cfg.sources.len(), 1);
+}
+
+#[test]
 fn parses_source_fields_from_example() {
     let cfg = Config::parse(EXAMPLE_TOML).expect("example toml should parse");
 

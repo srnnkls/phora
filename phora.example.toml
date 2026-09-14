@@ -1,4 +1,4 @@
-version = 1
+# version = 1              # optional; 1 is the only schema version and the default
 
 # protocol selects https vs ssh for host-aliased sources; default https.
 # Uncomment to flip the global default (still overridable per source):

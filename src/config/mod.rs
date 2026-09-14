@@ -57,9 +57,17 @@ impl Defaults {
     }
 }
 
+/// The only schema version phora speaks; omitting `version` selects it.
+pub const SCHEMA_VERSION: u32 = 1;
+
+const fn default_schema_version() -> u32 {
+    SCHEMA_VERSION
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default = "default_schema_version")]
     pub version: u32,
     #[serde(default)]
     pub protocol: Option<Protocol>,

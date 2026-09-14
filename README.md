@@ -399,7 +399,7 @@ Phora reads `phora.toml` from the working directory, optionally overlaid by
 [`phora.example.toml`](phora.example.toml) for a complete example.
 
 ```toml
-version = 1
+# version = 1             # optional; 1 is the only schema version and the default
 # protocol = "ssh"         # global default for forge sources (default https)
 
 # [defaults]
