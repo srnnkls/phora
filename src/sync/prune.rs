@@ -184,10 +184,7 @@ pub(super) fn prune_projected(
                 None => Ok(dst.clone()),
             };
             match confined {
-                Ok(path)
-                    if path.exists()
-                        && !overlaps_any_live_dest(&path, &live_paths, &record.key.target) =>
-                {
+                Ok(path) if !overlaps_any_live_dest(&path, &live_paths, &record.key.target) => {
                     remove_orphan_path(&path)
                         .map_err(|e| Error::Sync(format!("prune {}: {e}", path.display())))?;
                 }
@@ -324,10 +321,7 @@ fn remove_reconciled_record(
             None => Ok(dst.clone()),
         };
         match confined {
-            Ok(path)
-                if path.exists()
-                    && !overlaps_any_live_dest(&path, live_paths, &record.key.target) =>
-            {
+            Ok(path) if !overlaps_any_live_dest(&path, live_paths, &record.key.target) => {
                 remove_orphan_path(&path)
                     .map_err(|error| Error::Sync(format!("prune {}: {error}", path.display())))?;
             }
@@ -379,10 +373,8 @@ fn remove_reconciled_record(
         if overlaps_any_live_path(&path, live_paths) {
             return Ok(false);
         }
-        if path.exists() {
-            remove_orphan_path(&path)
-                .map_err(|error| Error::Sync(format!("prune {}: {error}", path.display())))?;
-        }
+        remove_orphan_path(&path)
+            .map_err(|error| Error::Sync(format!("prune {}: {error}", path.display())))?;
     }
     registry.remove_artifact(&record.key)?;
     Ok(true)
@@ -505,10 +497,7 @@ fn keep_orphan(
     if overlaps_any_live_path(path, live_paths) {
         return Ok(true);
     }
-    if path.exists() {
-        remove_orphan_path(path)
-            .map_err(|e| Error::Sync(format!("prune {}: {e}", path.display())))?;
-    }
+    remove_orphan_path(path).map_err(|e| Error::Sync(format!("prune {}: {e}", path.display())))?;
     Ok(false)
 }
 
