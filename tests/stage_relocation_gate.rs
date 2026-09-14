@@ -313,7 +313,7 @@ const TEMPLATE_POLICY_TOKENS: &[&str] = &[
     "render_str",
 ];
 
-const MATERIALIZATION_TOKENS: &[&str] = &["create_dir_all", "0o111", "set_file_mtime"];
+const MATERIALIZATION_TOKENS: &[&str] = &["create_dir_all", "0o111", "set_modified"];
 
 const GIT_READ_TOKENS: &[&str] = &["gix", "GitBackend", "find_blob_data"];
 
@@ -406,7 +406,7 @@ fn contract_stage_materializes_bytes_modes_mtimes_and_dirs() {
         missing.is_empty(),
         "src/{STAGE} must perform the physical staging after T015: parent-dir materialization \
          (create_dir_all — the staging-dir cluster), the exec-bit mask (0o111), and the \
-         deterministic mtime write (set_file_mtime). These live in free fns or non-contract \
+         deterministic mtime write (set_modified). These live in free fns or non-contract \
          impls — never in an impl of StageRequest/StagedArtifact (T032 purity pin, \
          stage_contract_gate); missing tokens: {missing:?}"
     );

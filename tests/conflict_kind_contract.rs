@@ -54,6 +54,7 @@ fn modified_observation(changed: Vec<PathBuf>) -> ObservedProjectState {
             observation: ObservedArtifact::Managed(ManagedArtifact {
                 record: (),
                 condition: ManagedCondition::Modified { changed },
+                overlay_stale: false,
             }),
         }],
     }

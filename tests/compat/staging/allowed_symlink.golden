@@ -1,4 +1,4 @@
 link_target=plain.txt
 digest=blake3:d4dd9d58b6a2a7d083295ec7c14ec00169f33620ba7d67eddbb2075ab6adf63e
 vars_digest=<none>
-manifest_files=0
+manifest_files=1

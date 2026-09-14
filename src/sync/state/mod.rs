@@ -1,11 +1,14 @@
 use std::path::Path;
 
+mod durable;
 pub mod file;
 pub mod locking;
 
+pub(crate) use durable::fsync_barrier;
 pub use file::{
-    ArtifactKey, ArtifactRecord, DirectoryStamp, Ejection, FileStateStore, HookState, ManifestFile,
-    NewArtifactRecord, RecordKind, ScannedFile, StateError, ejected_index, readonly_root_error,
+    ArtifactKey, ArtifactRecord, DirectoryStamp, Ejection, FileStateStore, HookState,
+    ManifestEntryKind, ManifestFile, NewArtifactRecord, NewHistoryRecord, RecordKind, ScannedFile,
+    StateError, ejected_index, readonly_root_error,
 };
 pub use locking::StateLock;
 

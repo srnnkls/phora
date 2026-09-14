@@ -6,6 +6,7 @@ use crate::projection::model::{
     ArtifactRelativePath, ProjectedArtifact, ProjectedLeaf, TargetProjection,
 };
 use crate::source::{ExportPolicy, SourceEntryKind, SourceError, hash_framed_entry, vars_digest};
+use crate::sync::state::ManifestEntryKind;
 
 type Result<T> = std::result::Result<T, SourceError>;
 
@@ -25,6 +26,7 @@ pub struct StagedArtifact {
 #[derive(Debug)]
 pub struct StagedFile {
     pub destination: ArtifactRelativePath,
+    pub kind: ManifestEntryKind,
     pub size: u64,
     pub mtime: u64,
     pub blake3: String,
@@ -119,12 +121,19 @@ impl StageLeaf for PlannedLeaf<'_> {
 }
 
 impl StagedRecord for StagedFile {
-    fn staged(destination: &Path, size: u64, mtime: u64, blake3: String) -> Self {
+    fn staged(
+        destination: &Path,
+        kind: ManifestEntryKind,
+        size: u64,
+        mtime: u64,
+        blake3: String,
+    ) -> Self {
         let destination = destination.to_string_lossy().replace('\\', "/");
         let destination = ArtifactRelativePath::new(&destination)
             .expect("staged destinations originate from validated artifact-relative paths");
         Self {
             destination,
+            kind,
             size,
             mtime,
             blake3,
@@ -138,7 +147,13 @@ pub(crate) trait StageLeaf {
 }
 
 pub(crate) trait StagedRecord {
-    fn staged(destination: &Path, size: u64, mtime: u64, blake3: String) -> Self;
+    fn staged(
+        destination: &Path,
+        kind: ManifestEntryKind,
+        size: u64,
+        mtime: u64,
+        blake3: String,
+    ) -> Self;
 }
 
 pub(crate) struct Renderer<'a> {
@@ -265,18 +280,12 @@ impl<F: StagedRecord> ExportWalk<'_, '_, F> {
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&out_path, &data)?;
-        set_deterministic_mtime(&out_path, self.commit_time)?;
-
-        if executable && self.policy.preserve_executable {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = std::fs::metadata(&out_path)?.permissions();
-                perms.set_mode(perms.mode() | 0o111);
-                std::fs::set_permissions(&out_path, perms)?;
-            }
-        }
+        write_leaf(
+            &out_path,
+            &data,
+            self.commit_time,
+            executable && self.policy.preserve_executable,
+        )?;
 
         let tag: &[u8] = if executable {
             b"\x00exec\x00"
@@ -292,6 +301,7 @@ impl<F: StagedRecord> ExportWalk<'_, '_, F> {
 
         self.files.push(F::staged(
             deployed_rel,
+            ManifestEntryKind::File,
             data.len() as u64,
             self.commit_time,
             blake3::hash(&data).to_hex().to_string(),
@@ -318,6 +328,11 @@ impl<F: StagedRecord> ExportWalk<'_, '_, F> {
             std::fs::create_dir_all(parent)?;
         }
         materialize_symlink(&out_path, target)?;
+        let metadata = std::fs::symlink_metadata(&out_path)?;
+        let mtime = filetime::FileTime::from_last_modification_time(&metadata)
+            .unix_seconds()
+            .try_into()
+            .map_err(|error| SourceError::Source(format!("read symlink mtime: {error}")))?;
 
         hash_framed_entry(
             &mut self.hasher,
@@ -325,14 +340,39 @@ impl<F: StagedRecord> ExportWalk<'_, '_, F> {
             b"\x00link\x00",
             target,
         );
+        self.files.push(F::staged(
+            deployed_rel,
+            ManifestEntryKind::Link,
+            target.len() as u64,
+            mtime,
+            blake3::hash(target).to_hex().to_string(),
+        ));
         Ok(())
     }
 }
 
-fn set_deterministic_mtime(path: &Path, commit_time: u64) -> Result<()> {
-    let seconds = i64::try_from(commit_time)
-        .map_err(|e| SourceError::Source(format!("commit_time out of range: {e}")))?;
-    filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(seconds, 0))?;
+fn write_leaf(path: &Path, data: &[u8], commit_time: u64, executable: bool) -> Result<()> {
+    use std::io::Write as _;
+
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(data)?;
+    if executable {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = file.metadata()?.permissions();
+            perms.set_mode(perms.mode() | 0o111);
+            file.set_permissions(perms)?;
+        }
+    }
+    set_deterministic_mtime(&file, commit_time)
+}
+
+fn set_deterministic_mtime(file: &std::fs::File, commit_time: u64) -> Result<()> {
+    let mtime = std::time::UNIX_EPOCH
+        .checked_add(std::time::Duration::from_secs(commit_time))
+        .ok_or_else(|| SourceError::Source(format!("commit_time out of range: {commit_time}")))?;
+    file.set_modified(mtime)?;
     Ok(())
 }
 

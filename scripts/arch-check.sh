@@ -13,6 +13,7 @@ SOURCE_IO_OWNERS=(
   src/source/http.rs
   src/source/import.rs
   src/source/worktree.rs
+  src/source/worktree_deploy.rs
 )
 
 LEGACY_INFRA=(

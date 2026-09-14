@@ -635,6 +635,11 @@ fn synthetic_target(
     target.collapse = None;
     if let Some(bindings) = target.sources.as_mut() {
         for (identity, binding) in bindings.iter_mut() {
+            if binding.history {
+                return Err(Error::Config(format!(
+                    "imported `{imported}`: target `{dep_target_name}` binding `{identity}` cannot set history"
+                )));
+            }
             let effective = binding.source.clone().unwrap_or_else(|| identity.clone());
             let namespaced = source_names.get(&effective).ok_or_else(|| {
                 Error::Config(format!(

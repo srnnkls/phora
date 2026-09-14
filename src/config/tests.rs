@@ -324,6 +324,14 @@ fn parses_version_and_all_sections_from_example() {
 }
 
 #[test]
+fn omitted_version_defaults_to_the_schema_version() {
+    let cfg = Config::parse("[sources.dots]\ngit = \"https://example.com/dots.git\"\n")
+        .expect("a config without a version key should parse");
+    assert_eq!(cfg.version, crate::config::SCHEMA_VERSION);
+    assert_eq!(cfg.sources.len(), 1);
+}
+
+#[test]
 fn parses_source_fields_from_example() {
     let cfg = Config::parse(EXAMPLE_TOML).expect("example toml should parse");
 
@@ -430,7 +438,7 @@ fn refspec_uses_branch_when_only_branch_set() {
 
 #[test]
 fn export_policy_uses_spec_defaults() {
-    let policy = source(None, None, None).export_policy();
+    let policy = source(None, None, None).export_policy(false);
     assert!(!policy.allow_symlinks);
     assert!(policy.preserve_executable);
 }
@@ -839,7 +847,8 @@ branch = "main"
     .expect("local parses");
 
     let effective = merge_configs(base, Some(local));
-    let policy = tp("loqui", effective.sources.get("loqui").expect("loqui kept")).export_policy();
+    let policy =
+        tp("loqui", effective.sources.get("loqui").expect("loqui kept")).export_policy(false);
 
     assert!(
         policy.allow_symlinks,
@@ -3530,6 +3539,10 @@ mod per_binding_refinement {
             files: vec![],
             directories: None,
             linked: false,
+            history: false,
+            worktree_admin_id: None,
+            mirror_key: None,
+            cache_git_root: None,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
@@ -3818,6 +3831,7 @@ mod per_binding_refinement {
                     template: None,
                     take: None,
                     collapse: None,
+                    history: false,
                 },
             )])),
         };
@@ -3862,6 +3876,7 @@ mod per_binding_refinement {
                     template: None,
                     take: None,
                     collapse: None,
+                    history: false,
                 },
             )])),
         };
@@ -6162,6 +6177,143 @@ mod parse_time_structural_validation {
         .expect(
             "the arity rule is exactly-one-pair-PER-ENTRY, not one-entry-per-array; an array of \
              two single-pair rename entries must parse",
+        );
+    }
+}
+
+#[test]
+fn history_is_binding_owned_and_rejects_incompatible_source_or_binding_options() {
+    let config = Config::parse(
+        "version = 1\n\n\
+         [sources.dotfiles]\ngit = \"https://example.test/dotfiles.git\"\n\n\
+         [targets.work]\npath = \"~/work\"\nsources = [\"dotfiles\"]\n\n\
+         [targets.home]\npath = \"~/home\"\n\n\
+         [targets.home.sources]\ndotfiles = { history = true }\n",
+    )
+    .expect("a source may be ordinary in one target and history-enabled in another");
+    let work = config.targets["work"]
+        .sources
+        .as_ref()
+        .expect("work bindings");
+    let home = config.targets["home"]
+        .sources
+        .as_ref()
+        .expect("home bindings");
+    assert!(
+        !work["dotfiles"].history,
+        "a bare source binding must default history to false"
+    );
+    assert!(
+        home["dotfiles"].history,
+        "only the keyed history binding owns the history opt-in"
+    );
+    config
+        .validate()
+        .expect("a history binding to a plain git source must validate");
+
+    let source_error = Config::parse(
+        "version = 1\n\n[sources.dotfiles]\ngit = \"https://example.test/dotfiles.git\"\nhistory = true\n",
+    )
+    .expect_err("source tables must reject the removed history key")
+    .to_string();
+    assert!(
+        source_error.contains("history"),
+        "the source-table rejection must identify history; got: {source_error}"
+    );
+
+    for (option, source_body, binding_body) in [
+        (
+            "url",
+            "url = \"https://example.test/dotfiles.tar.gz\"",
+            "history = true",
+        ),
+        (
+            "root",
+            "git = \"https://example.test/dotfiles.git\"\nroot = \"nested\"",
+            "history = true",
+        ),
+        (
+            "include",
+            "git = \"https://example.test/dotfiles.git\"\ninclude = [\"**\"]",
+            "history = true",
+        ),
+        (
+            "exclude",
+            "git = \"https://example.test/dotfiles.git\"\nexclude = [\"**/*.bak\"]",
+            "history = true",
+        ),
+        (
+            "transitive",
+            "git = \"https://example.test/dotfiles.git\"\ntransitive = true",
+            "history = true",
+        ),
+        (
+            "take",
+            "git = \"https://example.test/dotfiles.git\"",
+            "history = true, take = [\"config/**\"]",
+        ),
+        (
+            "template",
+            "git = \"https://example.test/dotfiles.git\"",
+            "history = true, template = false",
+        ),
+        (
+            "collapse",
+            "git = \"https://example.test/dotfiles.git\"",
+            "history = true, collapse = true",
+        ),
+    ] {
+        let config = format!(
+            "version = 1\n\n[sources.managed]\n{source_body}\n\n\
+             [targets.home]\npath = \"~/x\"\n\n[targets.home.sources]\nmanaged = {{ {binding_body} }}\n"
+        );
+        let error = Config::parse(&config)
+            .and_then(|config| config.validate())
+            .expect_err("history must reject incompatible effective source and binding options")
+            .to_string();
+        assert!(
+            error.contains("home")
+                && error.contains("managed")
+                && error.contains("history")
+                && error.contains(option),
+            "history validation must name target `home`, binding/source `managed`, history, and `{option}`; got: {error}"
+        );
+    }
+}
+
+#[test]
+fn history_export_policy_rejects_disabled_executables_and_enables_symlinks() {
+    let disabled = Config::parse(
+        "version = 1\n\
+         [sources.history]\n\
+         git = \"https://example.test/history.git\"\n\
+         preserve_executable = false\n\n\
+         [targets.home]\n\
+         path = \"~/home\"\n\n\
+         [targets.home.sources]\n\
+         history = { history = true }\n",
+    )
+    .expect("config parses before cross-field validation");
+    assert!(
+        disabled.validate().is_err(),
+        "history rejects an explicit preserve_executable = false"
+    );
+
+    for body in ["", "allow_symlinks = true\n"] {
+        let config = Config::parse(&format!(
+            "version = 1\n\
+             [sources.history]\n\
+             git = \"https://example.test/history.git\"\n{body}\n\
+             [targets.home]\n\
+             path = \"~/home\"\n\n\
+             [targets.home.sources]\n\
+             history = {{ history = true }}\n"
+        ))
+        .expect("history config parses");
+        let sources = config.parsed_sources().expect("history source parses");
+        assert!(
+            sources["history"].export_policy(true).allow_symlinks,
+            "history implies symlink export when allow_symlinks is omitted or true"
         );
     }
 }

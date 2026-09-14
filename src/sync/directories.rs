@@ -158,6 +158,7 @@ mod tests {
                 std::fs::write(&path, b"original").expect("write");
                 ManifestFile {
                     path: PathBuf::from(rel),
+                    kind: crate::sync::state::ManifestEntryKind::File,
                     size: 8,
                     mtime: super::super::scan::mtime_secs(
                         &std::fs::metadata(&path).expect("stat"),
@@ -181,6 +182,7 @@ mod tests {
             kind: RecordKind::Dir,
             allow_symlinks: false,
             preserve_executable: true,
+            history: None,
             files,
             vars_digest: None,
             deploy_root: None,

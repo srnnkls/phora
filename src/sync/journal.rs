@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::sync::state::ArtifactRecord;
+use crate::sync::state::{ArtifactRecord, fsync_barrier};
 
 /// Write-ahead journal of in-flight swaps, persisted under a `locks/` dir.
 pub struct Journal {
@@ -106,8 +106,7 @@ impl Journal {
             handle
                 .write_all(serialized.as_bytes())
                 .map_err(|e| Error::Projection(format!("write temp {}: {e}", tmp.display())))?;
-            handle
-                .sync_all()
+            fsync_barrier(&handle)
                 .map_err(|e| Error::Projection(format!("fsync temp {}: {e}", tmp.display())))?;
         }
         std::fs::rename(&tmp, &self.path).map_err(|e| {

@@ -16,7 +16,7 @@ use {
     crate::config::{Host, LayoutKind},
     crate::sync::inspect::ArtifactState,
     add::{
-        MissingTarget, MissingTargetDecider, add_to_default_target, add_with_binds,
+        AddRequest, MissingTarget, MissingTargetDecider, add_to_default_target, add_with_binds,
         insert_source_with_ref, run_add,
     },
     render::state_label,
@@ -95,6 +95,8 @@ pub enum Command {
         local: bool,
         #[arg(long)]
         symlink: bool,
+        #[arg(long, conflicts_with_all = ["local", "symlink", "root", "include", "exclude"])]
+        history: bool,
         #[arg(long = "as")]
         r#as: Option<String>,
     },
@@ -184,10 +186,12 @@ pub enum Command {
     Bind {
         #[arg(required = true)]
         sources: Vec<String>,
-        #[arg(long)]
-        to: String,
+        #[arg(long, required = true)]
+        to: Vec<String>,
         #[arg(long)]
         local: bool,
+        #[arg(long, conflicts_with_all = ["root", "take"])]
+        history: bool,
         #[arg(long = "as")]
         r#as: Option<String>,
         #[arg(long)]
@@ -367,7 +371,11 @@ pub fn run_with_outcome(cli: Cli) -> Result<CliOutcome> {
             let config = load_config()?;
             let registry = open_project_registry(&config)?;
             let _guard = registry.acquire_lock()?;
-            crate::sync::eject(&config, &registry, &artifact, &source, &target)?;
+            let cwd = std::env::current_dir()?;
+            let cache_git =
+                crate::paths::cache_root_for(config.paths.cache.as_deref(), &cwd)?.join("git");
+            let backend = GitBackend::new(cache_git);
+            crate::sync::eject(&config, &registry, &artifact, &source, &target, &backend)?;
             println!("ejected {source}/{artifact} from {target} (files kept)");
             Ok(CliOutcome::Success)
         }
@@ -460,6 +468,7 @@ fn dispatch_add(cmd: Command) -> Result<()> {
         exclude,
         local,
         symlink,
+        history,
         r#as,
     } = cmd
     else {
@@ -467,11 +476,12 @@ fn dispatch_add(cmd: Command) -> Result<()> {
     };
     let refinement = BindRefinement {
         r#as,
+        history,
         ..BindRefinement::default()
     };
-    add::run_add(
-        &url,
-        &to,
+    add::run_add(add::AddRequest {
+        url: &url,
+        targets: &to,
         name,
         branch,
         tag,
@@ -480,8 +490,8 @@ fn dispatch_add(cmd: Command) -> Result<()> {
         exclude,
         local,
         symlink,
-        &refinement,
-    )
+        refinement: &refinement,
+    })
 }
 
 fn run_verify() -> Result<CliOutcome> {
@@ -509,7 +519,7 @@ fn run_verify() -> Result<CliOutcome> {
         lock.as_ref(),
     );
 
-    let report = crate::sync::verify(&config, &registry, lock.as_ref())?;
+    let report = crate::sync::verify(&config, &registry, lock.as_ref(), &backend)?;
     render::print_verify(&report);
     if report.is_clean() {
         Ok(CliOutcome::Success)
@@ -536,6 +546,7 @@ fn dispatch_bind(cmd: Command) -> Result<()> {
         sources,
         to,
         local,
+        history,
         r#as,
         root,
         take,
@@ -560,6 +571,7 @@ fn dispatch_bind(cmd: Command) -> Result<()> {
                 .iter()
                 .map(|t| config_edit::TakeArg::parse(t))
                 .collect(),
+            history,
         },
     )
 }
@@ -576,9 +588,9 @@ fn run_source(cmd: SourceCmd) -> Result<()> {
             exclude,
             local,
             symlink,
-        } => add::run_add(
-            &url,
-            &[],
+        } => add::run_add(add::AddRequest {
+            url: &url,
+            targets: &[],
             name,
             branch,
             tag,
@@ -587,8 +599,8 @@ fn run_source(cmd: SourceCmd) -> Result<()> {
             exclude,
             local,
             symlink,
-            &BindRefinement::default(),
-        ),
+            refinement: &BindRefinement::default(),
+        }),
         SourceCmd::Rm { name } => run_source_rm(&name),
         SourceCmd::List => {
             render::print_source_rows(&source_listing(&load_config()?)?);
@@ -638,9 +650,14 @@ fn run_target(cmd: TargetCmd) -> Result<()> {
         }
         TargetCmd::Show { name } => {
             let config = load_config()?;
+            let cwd = std::env::current_dir()?;
+            let cache_git =
+                crate::paths::cache_root_for(config.paths.cache.as_deref(), &cwd)?.join("git");
+            let backend = GitBackend::new(cache_git);
             render::print_target_detail(&target_detail(
                 &config,
                 &open_project_registry(&config)?,
+                &backend,
                 &name,
             )?);
             Ok(())

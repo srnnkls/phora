@@ -1,11 +1,12 @@
 //! Sync-owned persistent state through `StateStore` and `FileStateStore`.
 
+use std::borrow::Borrow;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::{StateStore, locking::StateLock};
+use super::{StateStore, durable::fsync_barrier, locking::StateLock};
 
 #[cfg(all(test, target_os = "linux"))]
 use super::locking::unescape_octal;
@@ -26,6 +27,7 @@ pub enum StateError {
 }
 
 type Result<T> = std::result::Result<T, StateError>;
+type History = bool;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -40,6 +42,14 @@ pub struct ArtifactKey {
     pub target: String,
     pub source: String,
     pub artifact: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ManifestEntryKind {
+    #[default]
+    File,
+    Link,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -62,6 +72,14 @@ pub struct ArtifactRecord {
     pub directories: Option<Vec<DirectoryStamp>>,
     #[serde(default)]
     pub linked: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub history: History,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_admin_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_git_root: Option<String>,
     /// Digest of the full effective vars map at deploy time; `None` for feature-free artifacts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vars_digest: Option<String>,
@@ -71,6 +89,13 @@ pub struct ArtifactRecord {
     /// Prefixed layout's separator, persisted so an orphan's path reconstructs exactly. `None` for non-prefixed and legacy records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout_separator: Option<String>,
+}
+
+/// Inputs that make a history record's linked-worktree address complete at construction.
+pub struct NewHistoryRecord {
+    pub worktree_admin_id: String,
+    pub mirror_key: String,
+    pub cache_git_root: String,
 }
 
 /// Borrowed inputs shared by every record-construction site (`deploy_one`, `rebuild_one`).
@@ -84,6 +109,7 @@ pub struct NewArtifactRecord<'a> {
     pub allow_symlinks: bool,
     pub preserve_executable: bool,
     pub files: Vec<ManifestFile>,
+    pub history: Option<NewHistoryRecord>,
     pub vars_digest: Option<String>,
     pub deploy_root: Option<String>,
     pub layout_separator: Option<String>,
@@ -93,23 +119,55 @@ impl ArtifactRecord {
     /// Build a managed (`linked = false`) record, stamping `projected_at` to now.
     #[must_use]
     pub fn projected(p: NewArtifactRecord<'_>) -> Self {
+        let NewArtifactRecord {
+            key,
+            underlying_source,
+            commit,
+            digest,
+            layout,
+            kind,
+            allow_symlinks,
+            preserve_executable,
+            files,
+            history,
+            vars_digest,
+            deploy_root,
+            layout_separator,
+        } = p;
+        let (history, worktree_admin_id, mirror_key, cache_git_root) = match history {
+            Some(NewHistoryRecord {
+                worktree_admin_id,
+                mirror_key,
+                cache_git_root,
+            }) => (
+                true,
+                Some(worktree_admin_id),
+                Some(mirror_key),
+                Some(cache_git_root),
+            ),
+            None => (false, None, None, None),
+        };
         Self {
             version: 1,
-            key: p.key,
-            source: p.underlying_source.to_owned(),
-            commit: p.commit.to_owned(),
-            digest: p.digest,
+            key,
+            source: underlying_source.to_owned(),
+            commit: commit.to_owned(),
+            digest,
             projected_at: chrono::Utc::now().to_rfc3339(),
-            layout: p.layout,
-            kind: p.kind,
-            allow_symlinks: p.allow_symlinks,
-            preserve_executable: p.preserve_executable,
-            files: p.files,
+            layout,
+            kind,
+            allow_symlinks,
+            preserve_executable,
+            files,
             directories: None,
             linked: false,
-            vars_digest: p.vars_digest,
-            deploy_root: p.deploy_root,
-            layout_separator: p.layout_separator,
+            history,
+            worktree_admin_id,
+            mirror_key,
+            cache_git_root,
+            vars_digest,
+            deploy_root,
+            layout_separator,
         }
     }
 }
@@ -141,9 +199,15 @@ impl DirectoryStamp {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct ManifestFile {
     pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "is_file_entry")]
+    pub kind: ManifestEntryKind,
     pub size: u64,
     pub mtime: u64,
     pub blake3: String,
+}
+
+fn is_file_entry(kind: impl Borrow<ManifestEntryKind>) -> bool {
+    matches!(kind.borrow(), ManifestEntryKind::File)
 }
 
 pub use crate::sync::model::ScannedFile;
@@ -288,7 +352,7 @@ fn read_record(path: &Path) -> Result<ArtifactRecord> {
 }
 
 fn atomic_write(path: &Path, contents: &str) -> Result<()> {
-    atomic_write_with(path, contents, std::fs::File::sync_all)
+    atomic_write_with(path, contents, fsync_barrier)
 }
 
 fn atomic_write_with(
@@ -579,6 +643,10 @@ mod tests {
             files: vec![],
             directories: None,
             linked: true,
+            history: false,
+            worktree_admin_id: None,
+            mirror_key: None,
+            cache_git_root: None,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
@@ -654,6 +722,10 @@ artifact = "snippets"
             files: vec![],
             directories: None,
             linked: false,
+            history: false,
+            worktree_admin_id: None,
+            mirror_key: None,
+            cache_git_root: None,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
@@ -764,6 +836,10 @@ artifact = "snippets"
             files: vec![],
             directories: None,
             linked: false,
+            history: false,
+            worktree_admin_id: None,
+            mirror_key: None,
+            cache_git_root: None,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
@@ -807,6 +883,10 @@ artifact = "snippets"
             files: vec![],
             directories: None,
             linked: false,
+            history: false,
+            worktree_admin_id: None,
+            mirror_key: None,
+            cache_git_root: None,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
@@ -842,6 +922,7 @@ artifact = "snippets"
             allow_symlinks: false,
             preserve_executable: true,
             files: vec![],
+            history: None,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
@@ -877,6 +958,10 @@ artifact = "snippets"
             files: vec![],
             directories: None,
             linked: false,
+            history: false,
+            worktree_admin_id: None,
+            mirror_key: None,
+            cache_git_root: None,
             vars_digest: vars_digest.map(str::to_owned),
             deploy_root: None,
             layout_separator: None,
@@ -1163,12 +1248,17 @@ artifact = "snippets"
             preserve_executable: true,
             files: vec![ManifestFile {
                 path: PathBuf::from("python.json"),
+                kind: crate::sync::state::ManifestEntryKind::File,
                 size: 12345,
                 mtime: 1_738_329_296,
                 blake3: "9e8d7c6b5a4f3e2d".to_owned(),
             }],
             directories: None,
             linked: false,
+            history: false,
+            worktree_admin_id: None,
+            mirror_key: None,
+            cache_git_root: None,
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
