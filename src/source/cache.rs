@@ -1,8 +1,9 @@
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use super::SourceName;
 
-use super::{MIRROR_REFSPECS, MirrorKey, NormalizedUrl, Result, SourceError};
+use super::{MIRROR_REFSPECS, MirrorKey, NormalizedUrl, Result, SourceError, WorktreeAdminId};
 
 /// `<MirrorKey>.git` under `git_dir`; the single source of mirror-directory layout.
 pub(crate) fn mirror_path(git_dir: &Path, url: &str) -> PathBuf {
@@ -14,13 +15,30 @@ pub(super) fn mirror_path_for_key(git_dir: &Path, key: &MirrorKey) -> PathBuf {
     git_dir.join(format!("{}.git", key.as_str()))
 }
 
-fn mirror_lock_path(git_dir: &Path, url: &str) -> PathBuf {
-    let mut s = mirror_path(git_dir, url).into_os_string();
-    s.push(".lock");
-    PathBuf::from(s)
+pub(super) fn mirror_lock_path(git_dir: &Path, url: &str) -> PathBuf {
+    let key = MirrorKey::from_url(&NormalizedUrl::parse(url));
+    mirror_lock_path_for_key(git_dir, &key)
+}
+
+pub(super) fn mirror_lock_path_for_key(git_dir: &Path, key: &MirrorKey) -> PathBuf {
+    let mut path = mirror_path_for_key(git_dir, key).into_os_string();
+    path.push(".lock");
+    PathBuf::from(path)
+}
+
+pub(super) fn lock_mirror_for_key(
+    git_dir: &Path,
+    source: &SourceName,
+    key: &MirrorKey,
+) -> Result<std::fs::File> {
+    lock_mirror_at(git_dir, source, mirror_lock_path_for_key(git_dir, key))
 }
 
 pub(super) fn lock_mirror(git_dir: &Path, source: &SourceName, url: &str) -> Result<std::fs::File> {
+    lock_mirror_at(git_dir, source, mirror_lock_path(git_dir, url))
+}
+
+fn lock_mirror_at(git_dir: &Path, source: &SourceName, path: PathBuf) -> Result<std::fs::File> {
     std::fs::create_dir_all(git_dir)
         .map_err(|e| SourceError::Source(format!("create git dir for lock {source}: {e}")))?;
     let lock = std::fs::OpenOptions::new()
@@ -28,7 +46,7 @@ pub(super) fn lock_mirror(git_dir: &Path, source: &SourceName, url: &str) -> Res
         .read(true)
         .write(true)
         .truncate(false)
-        .open(mirror_lock_path(git_dir, url))
+        .open(path)
         .map_err(|e| SourceError::Source(format!("open mirror lock {source}: {e}")))?;
     lock.lock()
         .map_err(|e| SourceError::Source(format!("lock mirror {source}: {e}")))?;
@@ -101,6 +119,7 @@ pub(super) fn open_mirror(source: &SourceName, mirror: &Path) -> Result<Option<g
 }
 
 pub(super) fn fetch_into_mirror(source: &SourceName, repo: &gix::Repository) -> Result<()> {
+    detach_managed_worktree_heads(source, repo)?;
     let mut remote = repo
         .find_remote("origin")
         .map_err(|e| SourceError::Source(format!("find origin in {source}: {e}")))?;
@@ -110,7 +129,7 @@ pub(super) fn fetch_into_mirror(source: &SourceName, repo: &gix::Repository) -> 
             gix::remote::Direction::Fetch,
         )
         .map_err(|e| SourceError::Source(format!("set mirror refspec in {source}: {e}")))?;
-    remote
+    let outcome = remote
         .connect(gix::remote::Direction::Fetch)
         .map_err(|e| SourceError::Source(format!("connect origin in {source}: {e}")))?
         .prepare_fetch(
@@ -120,6 +139,82 @@ pub(super) fn fetch_into_mirror(source: &SourceName, repo: &gix::Repository) -> 
         .map_err(|e| SourceError::Source(format!("prepare fetch in {source}: {e}")))?
         .receive(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
         .map_err(|e| SourceError::Source(format!("receive pack in {source}: {e}")))?;
+    let updates = match outcome.status {
+        gix::remote::fetch::Status::NoPackReceived { update_refs, .. }
+        | gix::remote::fetch::Status::Change { update_refs, .. } => update_refs,
+    };
+    if let Some(rejected) = updates.updates.iter().find(|update| {
+        matches!(
+            update.mode,
+            gix::remote::fetch::refs::update::Mode::RejectedSourceObjectNotFound { .. }
+                | gix::remote::fetch::refs::update::Mode::RejectedTagUpdate
+                | gix::remote::fetch::refs::update::Mode::RejectedNonFastForward
+                | gix::remote::fetch::refs::update::Mode::RejectedToReplaceWithUnborn
+                | gix::remote::fetch::refs::update::Mode::RejectedCurrentlyCheckedOut { .. }
+        )
+    }) {
+        return Err(SourceError::Source(format!(
+            "fetch rejected ref update in {source}: {}",
+            rejected.mode
+        )));
+    }
+    Ok(())
+}
+
+fn detach_managed_worktree_heads(source: &SourceName, repo: &gix::Repository) -> Result<()> {
+    let worktrees = repo.path().join("worktrees");
+    let entries = match std::fs::read_dir(&worktrees) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(SourceError::Source(format!(
+                "read worktree administration for {source}: {error}"
+            )));
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            SourceError::Source(format!(
+                "read worktree administration for {source}: {error}"
+            ))
+        })?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(id) = name.strip_prefix("ph-") else {
+            continue;
+        };
+        if id.parse::<WorktreeAdminId>().is_err() || !entry.path().is_dir() {
+            continue;
+        }
+        let head = entry.path().join("HEAD");
+        let contents = match std::fs::read_to_string(&head) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(SourceError::Source(format!(
+                    "read managed worktree HEAD for {source}: {error}"
+                )));
+            }
+        };
+        let Some(reference) = contents.trim().strip_prefix("ref: ") else {
+            continue;
+        };
+        let oid = repo
+            .find_reference(reference)
+            .map_err(|error| {
+                SourceError::Source(format!(
+                    "resolve managed worktree HEAD for {source}: {error}"
+                ))
+            })?
+            .peel_to_id()
+            .map_err(|error| {
+                SourceError::Source(format!("peel managed worktree HEAD for {source}: {error}"))
+            })?;
+        std::fs::write(&head, format!("{}\n", oid.detach())).map_err(|error| {
+            SourceError::Source(format!("detach managed worktree HEAD: {error}"))
+        })?;
+    }
     Ok(())
 }
 
@@ -133,7 +228,7 @@ pub(super) fn reclone_mirror(
     mirror: &Path,
 ) -> Result<()> {
     let staging = MirrorStaging::create(git_dir, url);
-    gix::prepare_clone_bare(url, &staging.path)
+    let (repo, _) = gix::prepare_clone_bare(url, &staging.path)
         .map_err(|e| SourceError::Source(format!("prepare clone {source}: {e}")))?
         .configure_remote(|mut remote| {
             remote.replace_refspecs(
@@ -144,6 +239,7 @@ pub(super) fn reclone_mirror(
         })
         .fetch_only(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
         .map_err(|e| SourceError::Source(format!("clone bare {source}: {e}")))?;
+    carry_managed_worktrees(mirror, &staging.path, &repo, source)?;
     if mirror.exists() {
         std::fs::remove_dir_all(mirror)
             .map_err(|e| SourceError::Source(format!("remove corrupt mirror {source}: {e}")))?;
@@ -151,7 +247,113 @@ pub(super) fn reclone_mirror(
     staging.commit_to(mirror, source.as_str())
 }
 
-/// A scratch mirror renamed into the canonical path on success, removed on drop otherwise.
+fn carry_managed_worktrees(
+    mirror: &Path,
+    staging: &Path,
+    repo: &gix::Repository,
+    source: &SourceName,
+) -> Result<()> {
+    let Some(previous) = open_mirror(source, mirror)? else {
+        return Ok(());
+    };
+    let references = previous.references().map_err(|error| {
+        SourceError::Source(format!("read carried worktree pins for {source}: {error}"))
+    })?;
+    let pins = references
+        .prefixed("refs/phora/worktrees/")
+        .map_err(|error| {
+            SourceError::Source(format!("read carried worktree pins for {source}: {error}"))
+        })?
+        .peeled()
+        .map_err(|error| {
+            SourceError::Source(format!("read carried worktree pins for {source}: {error}"))
+        })?;
+    for pin in pins {
+        let mut pin = pin.map_err(|error| {
+            SourceError::Source(format!("read carried worktree pin for {source}: {error}"))
+        })?;
+        let name = pin.name().to_string();
+        let Some(id) = name.strip_prefix("refs/phora/worktrees/") else {
+            continue;
+        };
+        if id.parse::<WorktreeAdminId>().is_err() {
+            continue;
+        }
+        let oid = pin.peel_to_id().map_err(|error| {
+            SourceError::Source(format!("peel carried worktree pin for {source}: {error}"))
+        })?;
+        let oid = oid.detach();
+        if repo.find_commit(oid).is_err() {
+            continue;
+        }
+        let admin = mirror.join("worktrees").join(format!("ph-{id}"));
+        if !admin_metadata_is_dir(&admin, source)? {
+            continue;
+        }
+        copy_overlay_tree(
+            &admin,
+            &staging.join("worktrees").join(format!("ph-{id}")),
+            source,
+        )?;
+        let pin_path = staging.join("refs/phora/worktrees").join(id);
+        let parent = pin_path.parent().ok_or_else(|| {
+            SourceError::Source(format!(
+                "carried worktree pin has no parent: {}",
+                pin_path.display()
+            ))
+        })?;
+        std::fs::create_dir_all(parent).map_err(|error| {
+            SourceError::Source(format!(
+                "create carried worktree pins for {source}: {error}"
+            ))
+        })?;
+        std::fs::write(pin_path, format!("{oid}\n")).map_err(|error| {
+            SourceError::Source(format!("write carried worktree pin for {source}: {error}"))
+        })?;
+    }
+    Ok(())
+}
+
+fn admin_metadata_is_dir(path: &Path, source: &SourceName) -> Result<bool> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(SourceError::Source(format!(
+            "stat carried worktree administration for {source}: {error}"
+        ))),
+    }
+}
+
+fn copy_overlay_tree(source: &Path, destination: &Path, label: &SourceName) -> Result<()> {
+    std::fs::create_dir_all(destination).map_err(|error| {
+        SourceError::Source(format!("create carried mirror state for {label}: {error}"))
+    })?;
+    for entry in std::fs::read_dir(source).map_err(|error| {
+        SourceError::Source(format!("read carried mirror state for {label}: {error}"))
+    })? {
+        let entry = entry.map_err(|error| {
+            SourceError::Source(format!(
+                "read carried mirror state entry for {label}: {error}"
+            ))
+        })?;
+        let destination = destination.join(entry.file_name());
+        if entry
+            .file_type()
+            .map_err(|error| {
+                SourceError::Source(format!("stat carried mirror state for {label}: {error}"))
+            })?
+            .is_dir()
+        {
+            copy_overlay_tree(&entry.path(), &destination, label)?;
+        } else {
+            std::fs::copy(entry.path(), destination).map_err(|error| {
+                SourceError::Source(format!("copy carried mirror state for {label}: {error}"))
+            })?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) struct MirrorStaging {
     pub(super) path: PathBuf,
     armed: bool,

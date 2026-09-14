@@ -137,6 +137,7 @@ fn projected_target(inventory_paths: &[&str], root: Option<&str>) -> TargetProje
         inventory: &inventory,
         take: &take,
         collapse: CollapsePreference::default(),
+        history: false,
         materialization: MaterializationPolicy::Copy,
         layout: &layout,
         templates: &templates,
@@ -185,7 +186,8 @@ fn new_stage(
     .expect("resolve staged fixture snapshot");
     let root = match &request.artifact.materialization {
         phora::projection::model::Materialization::CollapsedDir { dir } => Some(PathBuf::from(dir)),
-        phora::projection::model::Materialization::Leaf(_) => None,
+        phora::projection::model::Materialization::Leaf(_)
+        | phora::projection::model::Materialization::WholeRoot { .. } => None,
     };
     stage_artifact(
         request,

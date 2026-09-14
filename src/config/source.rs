@@ -245,14 +245,15 @@ impl ParsedSource {
     }
 
     #[must_use]
-    pub fn export_policy(&self) -> ExportPolicy {
+    pub fn export_policy(&self, history: bool) -> ExportPolicy {
         ExportPolicy {
-            allow_symlinks: self.allow_symlinks.unwrap_or(false),
+            allow_symlinks: self.allow_symlinks.unwrap_or(history),
             preserve_executable: self.preserve_executable.unwrap_or(true),
-            vcs_opt_in: self
-                .includes()
-                .iter()
-                .any(|p| p.split(['/', '\\']).any(|seg| seg == ".git")),
+            vcs_opt_in: history
+                || self
+                    .includes()
+                    .iter()
+                    .any(|p| p.split(['/', '\\']).any(|seg| seg == ".git")),
         }
     }
 
@@ -272,7 +273,7 @@ impl ParsedSource {
             h.update(b"root\x00");
             h.update(r.to_string_lossy().as_bytes());
         }
-        let policy = self.export_policy();
+        let policy = self.export_policy(false);
         h.update(&[
             u8::from(policy.allow_symlinks),
             u8::from(policy.preserve_executable),

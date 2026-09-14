@@ -68,6 +68,8 @@ pub enum Materialization {
     CollapsedDir { dir: String },
     /// A single kept leaf deployed on its own.
     Leaf(ResolvedTake),
+    /// The complete repository deployed as one artifact at the binding identity.
+    WholeRoot { identity: String },
 }
 
 impl Materialization {
@@ -77,6 +79,7 @@ impl Materialization {
         match self {
             Materialization::CollapsedDir { dir } => dir,
             Materialization::Leaf(take) => &take.dest,
+            Materialization::WholeRoot { identity } => identity,
         }
     }
 }
@@ -530,6 +533,7 @@ pub struct BindingProjectionInput<'a> {
     pub inventory: &'a SourceInventory,
     pub take: &'a TakeSpec,
     pub collapse: CollapsePreference,
+    pub history: bool,
     pub materialization: MaterializationPolicy,
     pub layout: &'a LayoutSpec,
     pub templates: &'a TemplatePolicy,

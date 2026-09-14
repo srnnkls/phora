@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{Config, LayoutConfig, LayoutKind};
 use crate::error::{Error, Result};
+use crate::source::SourceStore;
 use crate::sync::state::{ArtifactRecord, StateStore};
 
-use super::confine::{ProtectedPathSet, confine_destination};
-use super::{persisted_manifest_relative_path, remove_orphan_path};
-use crate::projection::build::projected_artifact_keys;
+use super::confine::ProtectedPathSet;
+use super::{DeployAll, persisted_manifest_relative_path, remove_orphan_path};
+use crate::projection::build::projected_artifacts;
 use crate::projection::model::Projection;
 use crate::sync::model::{ObservedArtifact, ObservedProjectState, SyncChange};
 use crate::sync::request::SyncEvents;
@@ -39,6 +40,10 @@ pub(super) fn overlaps_live_dest(
     expected_paths
         .get(target)
         .is_some_and(|live| live.iter().any(|dest| touches(path, dest)))
+}
+
+pub(super) fn contains_live_destination(path: &Path, live: &[PathBuf]) -> bool {
+    live.iter().any(|destination| destination.starts_with(path))
 }
 
 fn touches(path: &Path, dest: &Path) -> bool {
@@ -92,7 +97,30 @@ pub(crate) fn orphan_records(
 pub(crate) fn orphan_artifact_path(record: &ArtifactRecord) -> Option<PathBuf> {
     let root = record.deploy_root.as_deref()?;
     let layout = reconstruct_layout(record)?;
-    Some(Path::new(root).join(layout.artifact_path(&record.key.source, &record.key.artifact)))
+    Some(Path::new(root).join(super::target::record_relative_destination(&layout, record)))
+}
+
+pub(crate) fn removal_destination(
+    target: &crate::config::Target,
+    record: &ArtifactRecord,
+) -> PathBuf {
+    orphan_artifact_path(record)
+        .unwrap_or_else(|| super::target::record_artifact_path(target, record))
+}
+
+pub(crate) fn removal_path(
+    target: &crate::config::Target,
+    record: &ArtifactRecord,
+    protected: &ProtectedPathSet,
+) -> Result<PathBuf> {
+    let dst = removal_destination(target, record);
+    super::confine::confine_removal_destination(
+        target.confine.as_deref(),
+        record.deploy_root.as_deref().map(Path::new),
+        &dst,
+        super::target::is_composed_target(&record.key.target),
+        protected,
+    )
 }
 
 fn overlaps_foreign_live_dest(
@@ -116,12 +144,8 @@ pub(super) fn expected_live_paths(projection: &Projection, config: &Config) -> E
         };
         let paths = expected_paths.entry(plan.target.clone()).or_default();
         for binding in &plan.bindings {
-            for key in &projected_artifact_keys(binding) {
-                paths.push(
-                    target
-                        .expanded_path()
-                        .join(target.layout().artifact_path(&binding.identity, key)),
-                );
+            for item in projected_artifacts(binding) {
+                paths.push(target.expanded_path().join(item.destination.as_str()));
             }
         }
     }
@@ -140,15 +164,15 @@ pub(super) fn prune_projected(
     for plan in &projection.targets {
         let target = config.targets.get(&plan.target);
         for binding in &plan.bindings {
-            let keys = projected_artifact_keys(binding);
+            let keys: Vec<String> = projected_artifacts(binding)
+                .map(|item| item.materialization.published_key().to_owned())
+                .collect();
             if let Some(target) = target {
                 let dests = live_paths.entry(plan.target.clone()).or_default();
-                for key in &keys {
+                for item in projected_artifacts(binding) {
                     dests.push((
                         binding.identity.clone(),
-                        target
-                            .expanded_path()
-                            .join(target.layout().artifact_path(&binding.identity, key)),
+                        target.expanded_path().join(item.destination.as_str()),
                     ));
                 }
             }
@@ -173,7 +197,7 @@ pub(super) fn prune_projected(
         if let Some(target) = config.targets.get(&record.key.target) {
             let dst = super::target::record_artifact_path(target, &record);
             let confined = match &target.confine {
-                Some(anchor) => confine_destination(anchor, &dst, protected),
+                Some(anchor) => super::confine::confine_destination(anchor, &dst, protected),
                 None if super::target::is_composed_target(&record.key.target) => {
                     Err(Error::Config(format!(
                         "confinement: composed target `{}` reached prune without a confine \
@@ -223,15 +247,16 @@ pub(super) fn prune_projected(
     Ok(())
 }
 
-pub(super) fn apply_reconciled_removals(
+pub(super) fn apply_reconciled_removals<R>(
     changes: &[SyncChange],
     observed: &ObservedProjectState<ArtifactRecord>,
     projection: &Projection,
-    config: &Config,
-    registry: &dyn StateStore,
-    protected: &ProtectedPathSet,
+    ctx: &DeployAll<'_, R>,
     events: &mut SyncEvents,
-) -> Result<()> {
+) -> Result<()>
+where
+    R: StateStore,
+{
     let removals: Vec<(&str, &str, &str, &crate::sync::model::RemovalReason)> = changes
         .iter()
         .filter_map(|change| match change {
@@ -259,14 +284,22 @@ pub(super) fn apply_reconciled_removals(
             _ => None,
         })
         .collect();
-    let live_paths = live_paths_by_source(projection, config);
+    let live_paths = live_paths_by_source(projection, ctx.config);
     for (target, source, artifact, reason) in removals {
         let Some(record) = records.get(&(target, source, artifact)).copied() else {
             return Err(Error::Sync(format!(
                 "reconciled removal {source}:{artifact} in target {target} has no managed record"
             )));
         };
-        if !remove_reconciled_record(record, config, registry, protected, &live_paths, events)? {
+        if !remove_reconciled_record(
+            record,
+            ctx.config,
+            ctx.backend,
+            ctx.registry,
+            ctx.protected,
+            &live_paths,
+            events,
+        )? {
             continue;
         }
         events.applied.push(AppliedChange::Removed {
@@ -289,12 +322,10 @@ fn live_paths_by_source(projection: &Projection, config: &Config) -> LivePathsBy
             .entry(target_projection.target.clone())
             .or_default();
         for binding in &target_projection.bindings {
-            for key in projected_artifact_keys(binding) {
+            for item in projected_artifacts(binding) {
                 paths.push((
                     binding.identity.clone(),
-                    target
-                        .expanded_path()
-                        .join(target.layout().artifact_path(&binding.identity, &key)),
+                    target.expanded_path().join(item.destination.as_str()),
                 ));
             }
         }
@@ -305,24 +336,15 @@ fn live_paths_by_source(projection: &Projection, config: &Config) -> LivePathsBy
 fn remove_reconciled_record(
     record: &ArtifactRecord,
     config: &Config,
+    backend: &dyn SourceStore,
     registry: &dyn StateStore,
     protected: &ProtectedPathSet,
     live_paths: &LivePathsBySource,
     events: &mut SyncEvents,
 ) -> Result<bool> {
     if let Some(target) = config.targets.get(&record.key.target) {
-        let dst = super::target::record_artifact_path(target, record);
-        let confined = match &target.confine {
-            Some(anchor) => confine_destination(anchor, &dst, protected),
-            None if super::target::is_composed_target(&record.key.target) => {
-                Err(Error::Config(format!(
-                    "confinement: composed target `{}` reached prune without a confine anchor; \
-                     refusing an unconfined delete",
-                    record.key.target
-                )))
-            }
-            None => Ok(dst.clone()),
-        };
+        let dst = removal_destination(target, record);
+        let confined = removal_path(target, record, protected);
         match confined {
             Ok(path)
                 if path.exists()
@@ -354,6 +376,7 @@ fn remove_reconciled_record(
                 return Ok(false);
             }
         }
+        super::detach_history_overlay(record, &dst, backend)?;
     } else {
         let Some(path) = orphan_artifact_path(record) else {
             if record.deploy_root.is_some() {
@@ -383,6 +406,7 @@ fn remove_reconciled_record(
             remove_orphan_path(&path)
                 .map_err(|error| Error::Sync(format!("prune {}: {error}", path.display())))?;
         }
+        super::detach_history_overlay(record, &path, backend)?;
     }
     registry.remove_artifact(&record.key)?;
     Ok(true)
@@ -540,6 +564,10 @@ mod tests {
             preserve_executable: true,
             files: vec![],
             linked: false,
+            history: false,
+            worktree_admin_id: None,
+            mirror_key: None,
+            cache_git_root: None,
             vars_digest: None,
             deploy_root: Some("/deploy".to_owned()),
             layout_separator: separator.map(str::to_owned),
