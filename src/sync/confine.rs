@@ -174,6 +174,14 @@ fn canonical_lexical(path: &Path) -> PathBuf {
     }
 }
 
+/// Resolves ancestors physically without following the final directory entry.
+pub(super) fn normalize_physical_entry(path: &Path) -> Result<PathBuf> {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => Ok(normalize_physical(parent)?.join(name)),
+        _ => normalize_physical(path),
+    }
+}
+
 /// Resolves a path to its physical identity without requiring the final path to exist.
 pub(super) fn normalize_physical(path: &Path) -> Result<PathBuf> {
     if !path.is_absolute() {

@@ -705,9 +705,16 @@ where
 }
 
 fn reject_cross_target_overlap(projection: &Projection, config: &Config) -> Result<()> {
+    struct Placement<'a> {
+        target: &'a str,
+        physical: PathBuf,
+        identity: PathBuf,
+        parent_entries: Vec<PathBuf>,
+    }
+
     let cwd = std::env::current_dir()
         .map_err(|e| Error::Sync(format!("resolve current dir for overlap check: {e}")))?;
-    let mut placements: Vec<(&str, PathBuf, PathBuf)> = Vec::new();
+    let mut placements = Vec::new();
     for target_projection in &projection.targets {
         let Some(target) = config.targets.get(&target_projection.target) else {
             continue;
@@ -717,23 +724,38 @@ fn reject_cross_target_overlap(projection: &Projection, config: &Config) -> Resu
         for binding in &target_projection.bindings {
             for key in projected_artifact_keys(binding) {
                 let path = root.join(layout.artifact_path(&binding.identity, &key));
-                let physical = confine::normalize_physical(&path)?;
+                let physical = confine::normalize_physical_entry(&path)?;
                 let identity = confine::fold_path(&physical);
-                placements.push((&target_projection.target, physical, identity));
+                let parent_entries = path
+                    .ancestors()
+                    .skip(1)
+                    .map(|parent| {
+                        confine::normalize_physical_entry(parent)
+                            .map(|physical| confine::fold_path(&physical))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                placements.push(Placement {
+                    target: &target_projection.target,
+                    physical,
+                    identity,
+                    parent_entries,
+                });
             }
         }
     }
-    for (i, (first_target, first_path, first_identity)) in placements.iter().enumerate() {
-        for (second_target, second_path, second_identity) in &placements[i + 1..] {
-            if first_target != second_target
-                && (first_identity.starts_with(second_identity)
-                    || second_identity.starts_with(first_identity))
+    for (i, first) in placements.iter().enumerate() {
+        for second in &placements[i + 1..] {
+            if first.target != second.target
+                && (first.identity.starts_with(&second.identity)
+                    || second.identity.starts_with(&first.identity)
+                    || first.parent_entries.contains(&second.identity)
+                    || second.parent_entries.contains(&first.identity))
             {
                 return Err(cross_target_overlap_diagnostic(
-                    first_target,
-                    second_target,
-                    first_path,
-                    second_path,
+                    first.target,
+                    second.target,
+                    &first.physical,
+                    &second.physical,
                 ));
             }
         }
