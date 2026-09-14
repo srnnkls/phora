@@ -79,7 +79,11 @@ pub(super) fn confine_removal_destination(
         (None, None) => return Ok(dst.to_path_buf()),
     };
     reject_if_symlink(anchor)?;
-    confine_destination(anchor, dst, protected)
+    let path = confine_path(anchor, dst, protected)?;
+    if let Some(parent) = path.parent() {
+        reject_symlink_ancestor(&normalize_lexical(anchor), parent)?;
+    }
+    Ok(path)
 }
 
 /// Returns the path deploy must write verbatim, or rejects any escape of `anchor`.
@@ -88,6 +92,12 @@ pub(super) fn confine_destination(
     dst: &Path,
     protected: &ProtectedPathSet,
 ) -> Result<PathBuf> {
+    let path = confine_path(anchor, dst, protected)?;
+    reject_symlink_ancestor(&normalize_lexical(anchor), &path)?;
+    Ok(path)
+}
+
+fn confine_path(anchor: &Path, dst: &Path, protected: &ProtectedPathSet) -> Result<PathBuf> {
     let anchor_norm = normalize_lexical(anchor);
     let dst_norm = normalize_lexical(dst);
 
@@ -126,7 +136,6 @@ pub(super) fn confine_destination(
         }
     }
 
-    reject_symlink_ancestor(&anchor_norm, &dst_norm)?;
     Ok(dst_norm)
 }
 
@@ -300,6 +309,41 @@ mod tests {
 
     fn protected(cwd: &Path) -> ProtectedPathSet {
         ProtectedPathSet::resolve(&Paths::default(), cwd).expect("resolve protected set")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removal_allows_leaf_links_but_rejects_linked_parents_and_protected_files() {
+        let root = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        let leaf = root.path().join("leaf");
+        std::os::unix::fs::symlink(root.path().join("missing"), &leaf).expect("dangling leaf");
+        let protected = protected(root.path());
+        assert_eq!(
+            confine_removal_destination(None, Some(root.path()), &leaf, false, &protected)
+                .expect("unlinking the final entry is confined"),
+            leaf
+        );
+        confine_destination(root.path(), &leaf, &protected)
+            .expect_err("writes must still reject a final symlink");
+        let parent = root.path().join("alias");
+        std::os::unix::fs::symlink(outside.path(), &parent).expect("parent alias");
+        confine_removal_destination(
+            None,
+            Some(root.path()),
+            &parent.join("file"),
+            false,
+            &protected,
+        )
+        .expect_err("removal must not traverse a parent symlink");
+        confine_removal_destination(
+            None,
+            Some(root.path()),
+            &root.path().join("phora.toml"),
+            false,
+            &protected,
+        )
+        .expect_err("protected files remain protected");
     }
 
     #[test]
