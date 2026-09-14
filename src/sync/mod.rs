@@ -807,9 +807,16 @@ fn reject_cross_target_overlap(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
 ) -> Result<()> {
+    struct Placement<'a> {
+        target: &'a str,
+        physical: PathBuf,
+        identity: PathBuf,
+        parent_entries: Vec<PathBuf>,
+    }
+
     let cwd = std::env::current_dir()
         .map_err(|e| Error::Sync(format!("resolve current dir for overlap check: {e}")))?;
-    let mut placements: Vec<(&str, PathBuf, PathBuf)> = Vec::new();
+    let mut placements = Vec::new();
     for target_projection in &projection.targets {
         let Some(target) = config.targets.get(&target_projection.target) else {
             continue;
@@ -818,32 +825,45 @@ fn reject_cross_target_overlap(
         for binding in &target_projection.bindings {
             for item in projected_artifacts(binding) {
                 let path = root.join(item.destination.as_str());
-                let physical = match (path.parent(), path.file_name()) {
-                    (Some(parent), Some(name))
-                        if parsed
-                            .get(&binding.source)
-                            .is_some_and(|source| source.deploy_mode() == DeployMode::Link) =>
-                    {
-                        confine::normalize_physical(parent)?.join(name)
-                    }
-                    _ => confine::normalize_physical(&path)?,
+                let physical = if parsed
+                    .get(&binding.source)
+                    .is_some_and(|source| source.deploy_mode() == DeployMode::Link)
+                {
+                    confine::normalize_physical_entry(&path)?
+                } else {
+                    confine::normalize_physical(&path)?
                 };
                 let identity = confine::fold_path(&physical);
-                placements.push((&target_projection.target, physical, identity));
+                let parent_entries = path
+                    .ancestors()
+                    .skip(1)
+                    .map(|parent| {
+                        confine::normalize_physical_entry(parent)
+                            .map(|physical| confine::fold_path(&physical))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                placements.push(Placement {
+                    target: &target_projection.target,
+                    physical,
+                    identity,
+                    parent_entries,
+                });
             }
         }
     }
-    for (i, (first_target, first_path, first_identity)) in placements.iter().enumerate() {
-        for (second_target, second_path, second_identity) in &placements[i + 1..] {
-            if first_target != second_target
-                && (first_identity.starts_with(second_identity)
-                    || second_identity.starts_with(first_identity))
+    for (i, first) in placements.iter().enumerate() {
+        for second in &placements[i + 1..] {
+            if first.target != second.target
+                && (first.identity.starts_with(&second.identity)
+                    || second.identity.starts_with(&first.identity)
+                    || first.parent_entries.contains(&second.identity)
+                    || second.parent_entries.contains(&first.identity))
             {
                 return Err(cross_target_overlap_diagnostic(
-                    first_target,
-                    second_target,
-                    first_path,
-                    second_path,
+                    first.target,
+                    second.target,
+                    &first.physical,
+                    &second.physical,
                 ));
             }
         }
