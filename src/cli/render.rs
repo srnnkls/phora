@@ -99,7 +99,7 @@ pub(super) fn format_orphans(orphans: &[OrphanListing]) -> String {
 
 pub(super) fn print_verify(report: &crate::sync::VerifyReport) {
     use crate::sync::VerifyReason;
-    if report.is_clean() {
+    if report.is_clean() && report.overlay_findings.is_empty() {
         println!("all verified");
         return;
     }
@@ -107,6 +107,7 @@ pub(super) fn print_verify(report: &crate::sync::VerifyReport) {
         let reason = match &m.reason {
             VerifyReason::Missing => "missing".to_owned(),
             VerifyReason::ContentMismatch { .. } => "content mismatch".to_owned(),
+            VerifyReason::EntryKindMismatch => "entry kind mismatch".to_owned(),
         };
         println!(
             "{}/{}: {} ({reason})",
@@ -120,6 +121,12 @@ pub(super) fn print_verify(report: &crate::sync::VerifyReport) {
             "{}: untrusted stripped hook `{}` — deployed but not post-processed, artifact may be \
              incomplete; run `phora trust {}` to approve",
             hook.source, hook.hook_id, hook.source
+        );
+    }
+    for finding in &report.overlay_findings {
+        println!(
+            "{}/{}: {} — run `{}`",
+            finding.key.source, finding.key.artifact, finding.reason, finding.remedy
         );
     }
 }

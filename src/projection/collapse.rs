@@ -137,6 +137,7 @@ fn path_key(m: &Materialization) -> &str {
     match m {
         Materialization::CollapsedDir { dir } => dir,
         Materialization::Leaf(r) => &r.dest,
+        Materialization::WholeRoot { identity } => identity,
     }
 }
 

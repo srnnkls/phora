@@ -105,6 +105,11 @@ pub enum AppliedChange {
         source: String,
         artifact: String,
     },
+    OverlayRewritten {
+        target: String,
+        source: String,
+        artifact: String,
+    },
     Ejected {
         target: String,
         source: String,
@@ -132,6 +137,11 @@ pub enum SkippedChange {
         source: String,
         artifact: String,
         message: String,
+    },
+    ReadonlyOverlayRewrite {
+        target: String,
+        source: String,
+        artifact: String,
     },
 }
 
@@ -188,6 +198,11 @@ pub enum SyncWarning {
     },
     UntrustedTransitiveHooks {
         count: usize,
+    },
+    HistoryContentFilter {
+        source: String,
+        attributes: bool,
+        autocrlf: bool,
     },
 }
 

@@ -23,6 +23,9 @@ use crate::source::SourcePath;
 pub fn project_binding(
     input: &BindingProjectionInput<'_>,
 ) -> std::result::Result<BindingProjection, ProjectionError> {
+    if input.history {
+        return project_whole_root(input);
+    }
     let candidates: Vec<&str> = input
         .inventory
         .entries
@@ -111,6 +114,56 @@ pub fn project_binding(
         },
         artifacts,
         warnings,
+    })
+}
+
+fn project_whole_root(
+    input: &BindingProjectionInput<'_>,
+) -> std::result::Result<BindingProjection, ProjectionError> {
+    let kept_leaves: Vec<ResolvedTake> = input
+        .inventory
+        .entries
+        .iter()
+        .map(|entry| ResolvedTake {
+            source: entry.path.as_str().to_owned(),
+            dest: entry.path.as_str().to_owned(),
+        })
+        .collect();
+    let leaves = input
+        .inventory
+        .entries
+        .iter()
+        .map(|entry| {
+            Ok(ProjectedLeaf {
+                source: entry.path.clone(),
+                destination: ArtifactRelativePath::new(entry.path.as_str())?,
+                transform: ContentTransform::Identity,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, ProjectionError>>()?;
+    let materialization = Materialization::WholeRoot {
+        identity: input.identity.to_owned(),
+    };
+    let destination = TargetPath::new(materialization.published_key())?;
+    let artifact = ProjectedArtifact {
+        destination,
+        source: input.source.clone(),
+        materialization,
+        kept_leaves: kept_leaves.clone(),
+        leaves,
+    };
+
+    Ok(BindingProjection {
+        identity: input.identity.to_owned(),
+        source: input.source.name().to_owned(),
+        commit: input.source.commit().to_owned(),
+        attribution: BindingAttribution {
+            offered_leaves: kept_leaves.iter().map(|leaf| leaf.source.clone()).collect(),
+            resolved_takes: kept_leaves,
+            copy_template_suffix: false,
+        },
+        artifacts: vec![artifact],
+        warnings: Vec::new(),
     })
 }
 
@@ -205,6 +258,16 @@ fn build_leaves(
             }
             Ok(leaves)
         }
+        Materialization::WholeRoot { .. } => kept_leaves
+            .iter()
+            .map(|kept| {
+                Ok(ProjectedLeaf {
+                    source: SourcePath::new(&kept.source).map_err(|_| unsafe_leaf(&kept.source))?,
+                    destination: ArtifactRelativePath::new(&kept.dest)?,
+                    transform: ContentTransform::Identity,
+                })
+            })
+            .collect(),
     }
 }
 
@@ -290,14 +353,17 @@ fn kept_leaves_under(
     materialization: &Materialization,
     kept: &[ResolvedTake],
 ) -> Vec<ResolvedTake> {
-    let Materialization::CollapsedDir { dir } = materialization else {
-        return Vec::new();
-    };
-    let prefix = format!("{dir}/");
-    kept.iter()
-        .filter(|r| r.dest.starts_with(&prefix))
-        .cloned()
-        .collect()
+    match materialization {
+        Materialization::CollapsedDir { dir } => {
+            let prefix = format!("{dir}/");
+            kept.iter()
+                .filter(|r| r.dest.starts_with(&prefix))
+                .cloned()
+                .collect()
+        }
+        Materialization::WholeRoot { .. } => kept.to_vec(),
+        Materialization::Leaf(_) => Vec::new(),
+    }
 }
 
 /// Projects every binding of one target, then rejects any destination two bindings
@@ -403,13 +469,18 @@ fn cross_binding_dup_diagnostic(target_name: &str, first: &str, second: &str) ->
     .sync()
 }
 
+/// The projected artifacts for one binding, in native projected order.
+pub fn projected_artifacts(
+    binding: &BindingProjection,
+) -> impl Iterator<Item = &ProjectedArtifact> {
+    binding.artifacts.iter()
+}
+
 /// The published artifact keys prune republishes for one binding: each artifact's
 /// collapsed-dir or leaf destination key, in native projected order.
 #[must_use]
 pub fn projected_artifact_keys(binding: &BindingProjection) -> Vec<String> {
-    binding
-        .artifacts
-        .iter()
+    projected_artifacts(binding)
         .map(|artifact| artifact.materialization.published_key().to_owned())
         .collect()
 }
@@ -482,6 +553,7 @@ mod projection_builder_tests {
         leaves: Vec<String>,
         take: Option<Vec<TakeEntry>>,
         collapse: Option<bool>,
+        history: bool,
         layout: LayoutConfig,
         identity: &'a str,
     }
@@ -493,6 +565,7 @@ mod projection_builder_tests {
                 leaves: leaves.iter().map(|s| (*s).to_string()).collect(),
                 take: None,
                 collapse: None,
+                history: false,
                 layout: LayoutConfig::default(),
                 identity: "s",
             }
@@ -517,6 +590,7 @@ mod projection_builder_tests {
                 inventory: &inventory,
                 take: &take,
                 collapse: CollapsePreference::from(self.collapse),
+                history: self.history,
                 materialization: MaterializationPolicy::from(&self.source.deploy_mode()),
                 layout: &layout,
                 templates: &templates,
@@ -550,6 +624,12 @@ mod projection_builder_tests {
     fn collapsed(dir: &str) -> Materialization {
         Materialization::CollapsedDir {
             dir: dir.to_string(),
+        }
+    }
+
+    fn whole_root(identity: &str) -> Materialization {
+        Materialization::WholeRoot {
+            identity: identity.to_string(),
         }
     }
 
@@ -720,6 +800,103 @@ mod projection_builder_tests {
         assert_eq!(dests(&case.project()), vec!["mysrc-a".to_string()]);
     }
 
+    #[test]
+    fn history_binding_projects_one_whole_root_at_its_identity_under_every_layout() {
+        let source = source_with(None, &[], &[], DeployMode::Copy);
+
+        for (layout, expected_destination) in [
+            (LayoutConfig::default(), "archive"),
+            (named_layout("by-source"), "archive"),
+            (named_layout("prefixed"), "archive"),
+        ] {
+            let mut case = Case::flat(&source, &["docs/readme.md", "editor/init.lua"]);
+            case.identity = "archive";
+            case.history = true;
+            case.layout = layout;
+
+            let binding = case.project();
+            assert_eq!(
+                materializations(&binding),
+                vec![whole_root("archive")],
+                "a history binding must be represented by Materialization::WholeRoot"
+            );
+            assert_eq!(
+                projected_artifact_keys(&binding),
+                vec!["archive".to_string()],
+                "the WholeRoot published key must be the binding identity"
+            );
+            assert_eq!(
+                dests(&binding),
+                vec![expected_destination.to_string()],
+                "a WholeRoot destination must not compose the identity twice"
+            );
+            assert_eq!(
+                binding.artifacts[0]
+                    .leaves
+                    .iter()
+                    .map(|leaf| (leaf.source.as_str(), leaf.destination.as_str()))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("docs/readme.md", "docs/readme.md"),
+                    ("editor/init.lua", "editor/init.lua"),
+                ],
+                "the WholeRoot must retain every repository leaf at its repository-relative path"
+            );
+        }
+
+        let offer = OfferSpec::from(source.offer());
+        let take = TakeSpec::from_entries(None);
+        let templates = TemplatePolicy::from(&TemplateOptIn::SuffixOnly);
+        let layout = LayoutSpec::from(&LayoutConfig::default());
+        let inventory =
+            SourceInventory::from_paths(["shared/file"]).expect("valid repository leaf");
+        let first = ResolvedSourceRef::new("first", COMMIT);
+        let second = ResolvedSourceRef::new("second", COMMIT);
+        let inputs = [
+            BindingProjectionInput {
+                identity: "first",
+                source: &first,
+                offer: &offer,
+                inventory: &inventory,
+                take: &take,
+                collapse: CollapsePreference::default(),
+                history: true,
+                materialization: MaterializationPolicy::Copy,
+                layout: &layout,
+                templates: &templates,
+            },
+            BindingProjectionInput {
+                identity: "second",
+                source: &second,
+                offer: &offer,
+                inventory: &inventory,
+                take: &take,
+                collapse: CollapsePreference::default(),
+                history: true,
+                materialization: MaterializationPolicy::Copy,
+                layout: &layout,
+                templates: &templates,
+            },
+        ];
+        let target = project_target("home", &inputs)
+            .expect("distinct WholeRoot identities must not collide in a flat target");
+        assert_eq!(
+            target
+                .artifacts
+                .iter()
+                .map(|artifact| (
+                    artifact.materialization.clone(),
+                    artifact.destination.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (whole_root("first"), "first"),
+                (whole_root("second"), "second"),
+            ],
+            "two history bindings must remain side by side in a flat target"
+        );
+    }
+
     fn binding_input<'a>(
         identity: &'a str,
         source: &'a ResolvedSourceRef,
@@ -736,6 +913,7 @@ mod projection_builder_tests {
             inventory,
             take,
             collapse: CollapsePreference::default(),
+            history: false,
             materialization: MaterializationPolicy::Copy,
             layout,
             templates,

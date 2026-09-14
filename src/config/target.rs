@@ -187,6 +187,8 @@ pub struct Binding {
     pub take: Option<Vec<TakeEntry>>,
     #[serde(default)]
     pub collapse: Option<bool>,
+    #[serde(default)]
+    pub history: bool,
 }
 
 impl Binding {
@@ -259,6 +261,7 @@ pub struct ResolvedBinding<'a> {
     pub template_opt_in: TemplateOptIn,
     pub take: Option<&'a [TakeEntry]>,
     pub collapse: Option<bool>,
+    pub history: bool,
 }
 
 impl ResolvedBinding<'_> {
@@ -414,6 +417,7 @@ fn resolve_binding<'a, S: SourceFields>(
         template_opt_in: binding.template_opt_in(),
         take: binding.take.as_deref(),
         collapse: binding.collapse,
+        history: binding.history,
     })
 }
 

@@ -1,6 +1,9 @@
 use std::path::{Path, PathBuf};
 
-use super::{Commit, MirrorKey, NormalizedUrl, SourceError, SourceName};
+use super::{
+    Commit, MirrorKey, NormalizedUrl, SourceError, SourceName, WorktreeMirrorAddress,
+    WorktreeMirrorGuard, WorktreeObservationRequest, WorktreeObservationResult,
+};
 
 use super::model::{SourceEntryKind, SourceEntryMeta, SourceInventory, SourcePath};
 use super::{Result, hash_framed_entry};
@@ -166,6 +169,39 @@ pub trait SourceStore: Send + Sync {
         snapshot: &SnapshotId,
         path: Option<&SourcePath>,
     ) -> Result<Vec<SourceDirectoryEntry>>;
+
+    fn lock_worktree_mirror(
+        &self,
+        source: &SourceName,
+        key: &MirrorKey,
+    ) -> Result<WorktreeMirrorGuard> {
+        Err(SourceError::Source(format!(
+            "source {source} does not support worktree mirror administration for {}",
+            key.as_str()
+        )))
+    }
+
+    fn lock_worktree_mirror_at(
+        &self,
+        source: &SourceName,
+        address: &WorktreeMirrorAddress,
+    ) -> Result<WorktreeMirrorGuard> {
+        Err(SourceError::Source(format!(
+            "source {source} does not support worktree mirror administration for {}",
+            address.key.as_str()
+        )))
+    }
+
+    fn observe_worktree(
+        &self,
+        request: &WorktreeObservationRequest,
+    ) -> Result<WorktreeObservationResult> {
+        Err(SourceError::Source(format!(
+            "source {} does not support worktree observation for {}",
+            request.source,
+            request.address.key.as_str()
+        )))
+    }
 }
 
 /// # Errors

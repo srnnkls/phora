@@ -19,8 +19,9 @@ use crate::projection::model::{
 };
 use crate::projection::offer::OfferSelection;
 use crate::source::{
-    Commit, ResolvePolicy, ResolveRequest, RevisionSpec, SourceInventory, SourceLocation,
-    SourceStore,
+    Commit, GitBackend, ResolvePolicy, ResolveRequest, RevisionSpec, SourceInventory,
+    SourceLocation, SourceStore, WorktreeObservationLevel, WorktreeObservationLock,
+    WorktreeObservationResult,
 };
 use crate::sync::inspect::check_artifact_state;
 use crate::sync::state::StateStore;
@@ -59,7 +60,11 @@ pub(super) fn run_list(view: ListView) -> Result<()> {
     match view {
         ListView::Orphans => print_orphan_listings(&list_orphans(&config, &registry)?),
         ListView::Plan => println!("plan: run `phora sync` to apply pending changes"),
-        ListView::Deployed => print_listings(&list_statuses(&config, &registry)?),
+        ListView::Deployed => {
+            let cache_git = cache_root_for(config.paths.cache.as_deref(), &cwd)?.join("git");
+            let backend = GitBackend::new(cache_git);
+            print_listings(&list_statuses(&config, &registry, &backend)?);
+        }
     }
     Ok(())
 }
@@ -350,6 +355,7 @@ pub(crate) struct ExplainInput<'a> {
     pub take: Option<&'a [TakeEntry]>,
     pub mode: DeployMode,
     pub collapse: Option<bool>,
+    pub history: bool,
     pub layout: &'a LayoutConfig,
     pub template_opt_in: &'a TemplateOptIn,
 }
@@ -373,6 +379,7 @@ pub(crate) fn explain_path(input: &ExplainInput<'_>, path: Option<&str>) -> Resu
         inventory: &inventory,
         take: &take,
         collapse: CollapsePreference::from(input.collapse),
+        history: input.history,
         materialization: MaterializationPolicy::from(&input.mode),
         layout: &layout,
         templates: &templates,
@@ -532,7 +539,14 @@ fn attribute_take(
                     return TakeAttribution::Collapsed { dir: dir.clone() };
                 }
             }
-            Materialization::Leaf(_) => {}
+            Materialization::WholeRoot { .. }
+                if item.leaves.iter().any(|leaf| leaf.source.as_str() == local) =>
+            {
+                return TakeAttribution::Identity {
+                    dest: local.to_owned(),
+                };
+            }
+            Materialization::Leaf(_) | Materialization::WholeRoot { .. } => {}
         }
     }
     TakeAttribution::Dropped
@@ -648,6 +662,7 @@ pub(crate) fn explain_cmd(
         take: binding.take,
         mode: src.deploy_mode(),
         collapse: binding.collapse,
+        history: binding.history,
         layout: &layout,
         template_opt_in: &binding.template_opt_in,
     };
@@ -878,7 +893,12 @@ pub fn target_listing(config: &Config) -> Vec<TargetRow> {
 /// # Errors
 ///
 /// Returns an error if `name` is not defined, or on-disk state cannot be read.
-pub fn target_detail<R>(config: &Config, registry: &R, name: &str) -> Result<TargetDetail>
+pub fn target_detail<R>(
+    config: &Config,
+    registry: &R,
+    backend: &dyn SourceStore,
+    name: &str,
+) -> Result<TargetDetail>
 where
     R: StateStore,
 {
@@ -908,7 +928,7 @@ where
         name: name.to_owned(),
         path: target.path.to_string_lossy().into_owned(),
         bound_sources,
-        artifacts: target_artifact_statuses(name, target, registry)?,
+        artifacts: target_artifact_statuses(name, target, registry, backend)?,
     })
 }
 
@@ -918,7 +938,11 @@ where
 /// # Errors
 ///
 /// Returns an error if the registry or on-disk targets cannot be read.
-pub fn list_statuses<R>(config: &Config, registry: &R) -> Result<Vec<TargetListing>>
+pub fn list_statuses<R>(
+    config: &Config,
+    registry: &R,
+    backend: &dyn SourceStore,
+) -> Result<Vec<TargetListing>>
 where
     R: StateStore,
 {
@@ -928,7 +952,7 @@ where
         .map(|(target_name, target)| {
             Ok(TargetListing {
                 target: target_name.clone(),
-                artifacts: target_artifact_statuses(target_name, target, registry)?,
+                artifacts: target_artifact_statuses(target_name, target, registry, backend)?,
             })
         })
         .collect()
@@ -956,6 +980,7 @@ fn target_artifact_statuses<R>(
     target_name: &str,
     target: &crate::config::Target,
     registry: &R,
+    backend: &dyn SourceStore,
 ) -> Result<Vec<ArtifactStatus>>
 where
     R: StateStore,
@@ -975,12 +1000,48 @@ where
             rec.vars_digest.as_deref(),
         )?;
         artifacts.push(ArtifactStatus {
-            source: rec.key.source,
-            artifact: rec.key.artifact,
-            state: state_label(&state).to_owned(),
+            source: rec.key.source.clone(),
+            artifact: rec.key.artifact.clone(),
+            state: list_state_label(&state, &rec, target, backend)?,
         });
     }
     Ok(artifacts)
+}
+
+fn list_state_label(
+    state: &crate::sync::inspect::ArtifactState,
+    record: &crate::sync::state::ArtifactRecord,
+    target: &Target,
+    backend: &dyn SourceStore,
+) -> Result<String> {
+    if !record.history
+        || matches!(
+            state,
+            crate::sync::inspect::ArtifactState::Missing
+                | crate::sync::inspect::ArtifactState::Foreign
+                | crate::sync::inspect::ArtifactState::Ejected
+                | crate::sync::inspect::ArtifactState::Linked
+        )
+    {
+        return Ok(state_label(state).to_owned());
+    }
+    let mut labels = vec!["history".to_owned(), state_label(state).to_owned()];
+    let Some(request) = crate::sync::observe::history_observation_request(
+        record,
+        crate::source::SourceName::trusted(&record.key.source),
+        &crate::sync::record_artifact_path(target, record),
+        WorktreeObservationLock::Try,
+        WorktreeObservationLevel::Cheap,
+    )?
+    else {
+        return Ok(labels.join(", "));
+    };
+    match backend.observe_worktree(&request)? {
+        WorktreeObservationResult::Conformant => {}
+        WorktreeObservationResult::Stale => labels.push("overlay-stale".to_owned()),
+        WorktreeObservationResult::Unknown => labels.push("overlay-unknown".to_owned()),
+    }
+    Ok(labels.join(", "))
 }
 
 #[cfg(test)]
@@ -1011,9 +1072,15 @@ mod tests {
              [targets.t.sources]\ncanary = { source = \"fzf\", tag = \"v0.56.0\" }\n",
         )
         .expect("config with a ref-pinned binding parses");
-        let (_dir, reg) = empty_registry();
+        let (dir, reg) = empty_registry();
 
-        let detail = target_detail(&config, &reg, "t").expect("target detail");
+        let detail = target_detail(
+            &config,
+            &reg,
+            &GitBackend::new(dir.path().to_path_buf()),
+            "t",
+        )
+        .expect("target detail");
         let entry = bound(&detail);
         assert!(
             entry.contains("canary"),
@@ -1033,9 +1100,15 @@ mod tests {
              [targets.t]\npath = \"~/x\"\nsources = [\"fzf\"]\n",
         )
         .expect("config with a bare binding parses");
-        let (_dir, reg) = empty_registry();
+        let (dir, reg) = empty_registry();
 
-        let detail = target_detail(&config, &reg, "t").expect("target detail");
+        let detail = target_detail(
+            &config,
+            &reg,
+            &GitBackend::new(dir.path().to_path_buf()),
+            "t",
+        )
+        .expect("target detail");
         let entry = bound(&detail);
         assert!(
             !entry.contains("main"),
@@ -1106,6 +1179,7 @@ mod explain_tests {
             take,
             mode: source.deploy_mode(),
             collapse,
+            history: false,
             layout: &layout,
             template_opt_in: &TemplateOptIn::SuffixOnly,
         };
