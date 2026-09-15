@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1](https://github.com/srnnkls/phora/compare/v0.2.0...v0.2.1) - 2026-09-15
+
+### Features
+
+- *(cli)* Emit NDJSON from `phora sync --json` ([#83](https://github.com/srnnkls/phora/pull/83))
+- *(cli)* Draw live progress and a rich summary on a terminal ([#85](https://github.com/srnnkls/phora/pull/85))
+
+### Bug Fixes
+
+- *(add)* Confirm a missing `--to` target instead of asking for its path ([#86](https://github.com/srnnkls/phora/pull/86))
+
+### Refactor
+
+- *(sync)* Collect projection warnings once, from the owned projection ([#82](https://github.com/srnnkls/phora/pull/82))
+- *(sync)* Observe the run through a ProgressSink port ([#80](https://github.com/srnnkls/phora/pull/80))
+
+[0.2.1]: https://github.com/srnnkls/phora/compare/0.2.0..0.2.1
+
 ## [0.2.0](https://github.com/srnnkls/phora/compare/v0.1.2...v0.2.0) - 2026-09-14
 
 ### Features
