@@ -3,6 +3,7 @@
 mod add;
 mod bind;
 mod config_edit;
+mod json;
 mod progress;
 mod query;
 mod render;
@@ -124,6 +125,9 @@ pub enum Command {
         /// Never draw live progress, even on a terminal.
         #[arg(long)]
         no_progress: bool,
+        /// Emit one NDJSON record per event on stdout instead of human output.
+        #[arg(long)]
+        json: bool,
         #[arg(long, short = 'j')]
         jobs: Option<usize>,
     },
@@ -445,6 +449,7 @@ fn dispatch_sync(cmd: Command) -> Result<CliOutcome> {
             frozen,
             fast_forward,
             no_progress,
+            json,
             jobs,
         } => sync::run_sync(
             prune,
@@ -454,6 +459,7 @@ fn dispatch_sync(cmd: Command) -> Result<CliOutcome> {
             frozen,
             fast_forward,
             no_progress,
+            json,
             None,
             jobs,
         ),

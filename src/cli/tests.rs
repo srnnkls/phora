@@ -5563,8 +5563,10 @@ fn rebuild_over_merged_vars_agrees_with_deployed_vars_digest() {
         let _state = EnvVarGuard::set("XDG_STATE_HOME", state.path());
         let _cache = EnvVarGuard::set("XDG_CACHE_HOME", cache.path());
 
-        super::sync::run_sync(false, false, false, false, false, false, true, None, None)
-            .expect("merged-vars deploy succeeds");
+        super::sync::run_sync(
+            false, false, false, false, false, false, true, false, None, None,
+        )
+        .expect("merged-vars deploy succeeds");
 
         let motd = target_path.join("editor").join("motd");
         assert_eq!(

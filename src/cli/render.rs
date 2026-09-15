@@ -4,14 +4,113 @@ use std::fmt::Write;
 
 use crate::config::ParsedSource;
 use crate::error::{Error, Result};
+use crate::projection::diagnostic::ProjectionWarning;
 use crate::sync::inspect::ArtifactState;
-use crate::sync::{HookOutcome, HookScope, HookStatus, SyncState, SyncSummary};
+use crate::sync::{HookOutcome, HookScope, HookStatus, SyncState, SyncSummary, SyncWarning};
 
 use super::query::{
     CheckMatchReport, ExplainBody, ExplainReport, OfferAttribution, OrphanListing, PreviewPlan,
     SourceResolution, SourceRow, SourceSummary, TakeAttribution, TargetDetail, TargetListing,
     TargetRow, WhereFilter, WhereMatch,
 };
+
+/// The stderr text for one warning, or `None` when it is reported elsewhere.
+#[must_use]
+pub(super) fn format_sync_warning(warning: &SyncWarning) -> Option<String> {
+    let rendered = match warning {
+        SyncWarning::Projection(ProjectionWarning::TakeNoMatchGlob(pattern)) => {
+            format!("phora: take pattern matched no offered leaf: {pattern}")
+        }
+        SyncWarning::Projection(ProjectionWarning::LostCollapseToExclude(dir)) => format!(
+            "phora: dir `{dir}` cannot collapse to one symlink under a within-dir exclude; \
+             falling back to per-leaf links"
+        ),
+        SyncWarning::MalformedTransitiveHooks { target, detail } => format!(
+            "phora: imported dep target `{target}`: malformed `[targets.{target}.hooks]`: {detail}"
+        ),
+        SyncWarning::LinkPathNotPortable { source, path } => format!(
+            "phora: source `{source}`: deploy = \"link\" uses the absolute path `{}`, which is \
+             not portable across machines",
+            path.display()
+        ),
+        SyncWarning::ReferenceMoved {
+            source,
+            target,
+            from,
+            to,
+        } => format!("phora: {source} → {target}: {from} → {to}"),
+        SyncWarning::OrphanedRecords { count } => format!(
+            "phora: {count} orphaned record(s) with no config target — run `phora list --orphans` \
+             to inspect, `phora sync --prune` to remove"
+        ),
+        SyncWarning::PruneSkippedAfterFailures => {
+            "phora: skipping --prune because some artifacts failed to deploy".to_owned()
+        }
+        SyncWarning::PruneRefused { path, reason } => format!(
+            "phora: refusing to prune out-of-anchor {}: {reason}",
+            path.display()
+        ),
+        SyncWarning::OrphanRecordPathUnknown {
+            source,
+            artifact,
+            layout,
+        } => format!(
+            "phora: dropping the record for orphaned {source}:{artifact} only — its on-disk path \
+             cannot be reconstructed (layout `{layout}` unrecognized or missing its separator); \
+             any file is left in place rather than deleting a guessed path"
+        ),
+        SyncWarning::FastForwardKeptLive {
+            source,
+            artifact,
+            path,
+        } => format!(
+            "phora: fast-forward unrecorded {source}:{artifact} but kept {} (a live artifact sits \
+             there)",
+            path.display()
+        ),
+        SyncWarning::FastForwardDropped { source, artifact } => {
+            format!("phora: fast-forward dropped {source}:{artifact} (removed upstream)")
+        }
+        SyncWarning::CrossDeviceFallback { destination } => format!(
+            "phora: staging on a different mount than {}; falling back to recursive copy",
+            destination.display()
+        ),
+        SyncWarning::ConflictModified {
+            source,
+            artifact,
+            changed,
+        } => {
+            let mut out = format!("phora: skipping locally modified {source}:{artifact}");
+            for path in changed {
+                let _ = write!(out, "\n    {}", path.display());
+            }
+            out.push_str("\n  use --force to overwrite");
+            out
+        }
+        SyncWarning::ConflictForeign { path } => format!(
+            "phora: skipping foreign content at {}; use --force to overwrite",
+            path.display()
+        ),
+        SyncWarning::UntrustedTransitiveHooks { .. } => return None,
+        SyncWarning::HistoryContentFilter {
+            source,
+            attributes,
+            autocrlf,
+        } => {
+            let cause = match (*attributes, *autocrlf) {
+                (true, true) => ".gitattributes and core.autocrlf=true",
+                (true, false) => ".gitattributes",
+                (false, true) => "core.autocrlf=true",
+                (false, false) => unreachable!("content-filter warning requires a cause"),
+            };
+            format!(
+                "phora: history source `{source}` uses content filters ({cause}); its Git overlay \
+                 may report files modified"
+            )
+        }
+    };
+    Some(rendered)
+}
 
 /// One line replacing the bare `sync complete`, on stdout.
 #[must_use]
