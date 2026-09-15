@@ -3,6 +3,7 @@
 mod add;
 mod bind;
 mod config_edit;
+mod progress;
 mod query;
 mod render;
 mod sync;
@@ -117,6 +118,9 @@ pub enum Command {
         /// Follow a moved pin: delete artifacts the new commit dropped instead of erroring.
         #[arg(long)]
         fast_forward: bool,
+        /// Never draw live progress, even on a terminal.
+        #[arg(long)]
+        no_progress: bool,
         #[arg(long, short = 'j')]
         jobs: Option<usize>,
     },
@@ -437,6 +441,7 @@ fn dispatch_sync(cmd: Command) -> Result<CliOutcome> {
             no_transitive_hooks,
             frozen,
             fast_forward,
+            no_progress,
             jobs,
         } => sync::run_sync(
             prune,
@@ -445,6 +450,7 @@ fn dispatch_sync(cmd: Command) -> Result<CliOutcome> {
             no_transitive_hooks,
             frozen,
             fast_forward,
+            no_progress,
             None,
             jobs,
         ),

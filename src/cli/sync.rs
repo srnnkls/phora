@@ -16,6 +16,7 @@ use crate::sync::{
     sync_opened,
 };
 
+use super::progress::{ProgressMode, TtySink};
 use super::{
     CliOutcome, DropSources, TtyResolver, build_router, drop_sources, load_config,
     load_local_config, open_project_registry,
@@ -39,6 +40,7 @@ pub(super) fn run_sync(
     no_transitive_hooks: bool,
     frozen: bool,
     fast_forward: bool,
+    no_progress: bool,
     drop: Option<DropSources>,
     jobs: Option<usize>,
 ) -> Result<CliOutcome> {
@@ -70,6 +72,8 @@ pub(super) fn run_sync(
     let interactive = std::io::stdin().is_terminal();
     let resolver = TtyResolver;
     let trust_prompt = super::TtyTrustPrompt;
+    let progress = ProgressMode::resolve(no_progress);
+    let sink = TtySink::new(progress);
 
     let source_policy = if frozen {
         SourcePolicy::Frozen
@@ -122,14 +126,17 @@ pub(super) fn run_sync(
             concurrency: Concurrency { jobs },
         },
         resolver: interactive.then_some(&resolver as &dyn ConflictResolver),
-        sink: crate::sync::progress::SILENT,
+        sink: &sink,
         trust_prompt: interactive.then_some(&trust_prompt as &dyn crate::sync::TrustPrompt),
     };
     let out = sync_opened(&request, &backend, &registry, lockless).inspect_err(|error| {
         request.sink.aborted(&error.to_string());
     })?;
 
-    finish_sync(&cwd, &out, interactive)
+    let summary = (progress == ProgressMode::Live)
+        .then(|| sink.summary())
+        .flatten();
+    finish_sync(&cwd, &out, interactive, summary.as_ref())
 }
 
 struct StrippedHookNotice {
@@ -148,7 +155,12 @@ fn stripped_hook_notice(stripped: usize, interactive: bool) -> Option<StrippedHo
     })
 }
 
-fn finish_sync(cwd: &Path, out: &SyncReport, interactive: bool) -> Result<CliOutcome> {
+fn finish_sync(
+    cwd: &Path,
+    out: &SyncReport,
+    interactive: bool,
+    summary: Option<&crate::sync::SyncSummary>,
+) -> Result<CliOutcome> {
     let base_lock = out
         .locks
         .base
@@ -224,7 +236,12 @@ fn finish_sync(cwd: &Path, out: &SyncReport, interactive: bool) -> Result<CliOut
     if !report.is_empty() {
         print!("{report}");
     }
-    println!("sync complete");
+    // `sync complete` is the pinned non-tty stdout contract (src/lib.rs); the
+    // richer summary is terminal decoration only.
+    match summary {
+        Some(summary) => print!("{}", super::render::format_sync_summary(summary)),
+        None => println!("sync complete"),
+    }
     Ok(CliOutcome::Success)
 }
 
@@ -386,6 +403,7 @@ pub(super) fn run_update(source: Option<&str>, fast_forward: bool) -> Result<Cli
         false,
         false,
         fast_forward,
+        false,
         Some(drop),
         None,
     )
