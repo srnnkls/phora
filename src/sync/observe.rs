@@ -37,7 +37,7 @@ where
             continue;
         };
         let run = target_run(ctx, target_name, target);
-        target::walk_projection_target(run, target_projection, registry, false, |run, entry| {
+        target::walk_projection_target(run, target_projection, registry, |run, entry| {
             let observation = observe_entry(run, entry, registry, store, ctx.backend)?;
             let published_key = entry.item.materialization.published_key().to_owned();
             let triplet = (
