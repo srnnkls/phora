@@ -16,6 +16,7 @@ use crate::sync::{
     sync_opened,
 };
 
+use super::json::JsonSink;
 use super::progress::{ProgressMode, TtySink};
 use super::{
     CliOutcome, DropSources, TtyResolver, build_router, drop_sources, load_config,
@@ -41,6 +42,7 @@ pub(super) fn run_sync(
     frozen: bool,
     fast_forward: bool,
     no_progress: bool,
+    json: bool,
     drop: Option<DropSources>,
     jobs: Option<usize>,
 ) -> Result<CliOutcome> {
@@ -72,8 +74,7 @@ pub(super) fn run_sync(
     let interactive = std::io::stdin().is_terminal();
     let resolver = TtyResolver;
     let trust_prompt = super::TtyTrustPrompt;
-    let progress = ProgressMode::resolve(no_progress);
-    let sink = TtySink::new(progress);
+    let reporter = Reporter::select(json, no_progress);
 
     let source_policy = if frozen {
         SourcePolicy::Frozen
@@ -126,17 +127,14 @@ pub(super) fn run_sync(
             concurrency: Concurrency { jobs },
         },
         resolver: interactive.then_some(&resolver as &dyn ConflictResolver),
-        sink: &sink,
+        sink: reporter.sink(),
         trust_prompt: interactive.then_some(&trust_prompt as &dyn crate::sync::TrustPrompt),
     };
     let out = sync_opened(&request, &backend, &registry, lockless).inspect_err(|error| {
         request.sink.aborted(&error.to_string());
     })?;
 
-    let summary = (progress == ProgressMode::Live)
-        .then(|| sink.summary())
-        .flatten();
-    finish_sync(&cwd, &out, interactive, summary.as_ref())
+    finish_sync(&cwd, &out, interactive, &reporter)
 }
 
 struct StrippedHookNotice {
@@ -155,11 +153,48 @@ fn stripped_hook_notice(stripped: usize, interactive: bool) -> Option<StrippedHo
     })
 }
 
+/// Machine output owns stdout under `--json`; human text never shares the stream.
+enum Reporter {
+    Tty { sink: Box<TtySink>, live: bool },
+    Json(JsonSink),
+}
+
+impl Reporter {
+    fn select(json: bool, no_progress: bool) -> Self {
+        if json {
+            return Self::Json(JsonSink::new());
+        }
+        let mode = ProgressMode::resolve(no_progress);
+        Self::Tty {
+            sink: Box::new(TtySink::new(mode)),
+            live: mode == ProgressMode::Live,
+        }
+    }
+
+    fn sink(&self) -> &dyn crate::sync::ProgressSink {
+        match self {
+            Self::Tty { sink, .. } => sink.as_ref(),
+            Self::Json(sink) => sink,
+        }
+    }
+
+    fn is_json(&self) -> bool {
+        matches!(self, Self::Json(_))
+    }
+
+    fn summary(&self) -> Option<crate::sync::SyncSummary> {
+        match self {
+            Self::Tty { sink, live: true } => sink.summary(),
+            Self::Tty { live: false, .. } | Self::Json(_) => None,
+        }
+    }
+}
+
 fn finish_sync(
     cwd: &Path,
     out: &SyncReport,
     interactive: bool,
-    summary: Option<&crate::sync::SyncSummary>,
+    reporter: &Reporter,
 ) -> Result<CliOutcome> {
     let base_lock = out
         .locks
@@ -233,13 +268,19 @@ fn finish_sync(
         eprintln!("{message}");
         return Ok(CliOutcome::Failure);
     }
+    if reporter.is_json() {
+        if !report.is_empty() {
+            eprint!("{report}");
+        }
+        return Ok(CliOutcome::Success);
+    }
     if !report.is_empty() {
         print!("{report}");
     }
     // `sync complete` is the pinned non-tty stdout contract (src/lib.rs); the
     // richer summary is terminal decoration only.
-    match summary {
-        Some(summary) => print!("{}", super::render::format_sync_summary(summary)),
+    match reporter.summary() {
+        Some(summary) => print!("{}", super::render::format_sync_summary(&summary)),
         None => println!("sync complete"),
     }
     Ok(CliOutcome::Success)
@@ -247,98 +288,8 @@ fn finish_sync(
 
 fn render_sync_warnings(out: &SyncReport) {
     for warning in &out.warnings {
-        match warning {
-            SyncWarning::Projection(
-                crate::projection::diagnostic::ProjectionWarning::TakeNoMatchGlob(pattern),
-            ) => eprintln!("phora: take pattern matched no offered leaf: {pattern}"),
-            SyncWarning::Projection(
-                crate::projection::diagnostic::ProjectionWarning::LostCollapseToExclude(dir),
-            ) => eprintln!(
-                "phora: dir `{dir}` cannot collapse to one symlink under a within-dir exclude; \
-                 falling back to per-leaf links"
-            ),
-            SyncWarning::MalformedTransitiveHooks { target, detail } => eprintln!(
-                "phora: imported dep target `{target}`: malformed `[targets.{target}.hooks]`: \
-                 {detail}"
-            ),
-            SyncWarning::LinkPathNotPortable { source, path } => eprintln!(
-                "phora: source `{source}`: deploy = \"link\" uses the absolute path `{}`, which \
-                 is not portable across machines",
-                path.display()
-            ),
-            SyncWarning::ReferenceMoved {
-                source,
-                target,
-                from,
-                to,
-            } => eprintln!("phora: {source} → {target}: {from} → {to}"),
-            SyncWarning::OrphanedRecords { count } => eprintln!(
-                "phora: {count} orphaned record(s) with no config target — run `phora list \
-                 --orphans` to inspect, `phora sync --prune` to remove"
-            ),
-            SyncWarning::PruneSkippedAfterFailures => {
-                eprintln!("phora: skipping --prune because some artifacts failed to deploy");
-            }
-            SyncWarning::PruneRefused { path, reason } => eprintln!(
-                "phora: refusing to prune out-of-anchor {}: {reason}",
-                path.display()
-            ),
-            SyncWarning::OrphanRecordPathUnknown {
-                source,
-                artifact,
-                layout,
-            } => eprintln!(
-                "phora: dropping the record for orphaned {source}:{artifact} only — its on-disk \
-                 path cannot be reconstructed (layout `{layout}` unrecognized or missing its \
-                 separator); any file is left in place rather than deleting a guessed path"
-            ),
-            SyncWarning::FastForwardKeptLive {
-                source,
-                artifact,
-                path,
-            } => eprintln!(
-                "phora: fast-forward unrecorded {source}:{artifact} but kept {} (a live artifact \
-                 sits there)",
-                path.display()
-            ),
-            SyncWarning::FastForwardDropped { source, artifact } => {
-                eprintln!("phora: fast-forward dropped {source}:{artifact} (removed upstream)");
-            }
-            SyncWarning::CrossDeviceFallback { destination } => eprintln!(
-                "phora: staging on a different mount than {}; falling back to recursive copy",
-                destination.display()
-            ),
-            SyncWarning::ConflictModified {
-                source,
-                artifact,
-                changed,
-            } => {
-                eprintln!("phora: skipping locally modified {source}:{artifact}");
-                for path in changed {
-                    eprintln!("    {}", path.display());
-                }
-                eprintln!("  use --force to overwrite");
-            }
-            SyncWarning::ConflictForeign { path } => eprintln!(
-                "phora: skipping foreign content at {}; use --force to overwrite",
-                path.display()
-            ),
-            SyncWarning::UntrustedTransitiveHooks { .. } => {}
-            SyncWarning::HistoryContentFilter {
-                source,
-                attributes,
-                autocrlf,
-            } => {
-                let cause = match (*attributes, *autocrlf) {
-                    (true, true) => ".gitattributes and core.autocrlf=true",
-                    (true, false) => ".gitattributes",
-                    (false, true) => "core.autocrlf=true",
-                    (false, false) => unreachable!("content-filter warning requires a cause"),
-                };
-                eprintln!(
-                    "phora: history source `{source}` uses content filters ({cause}); its Git overlay may report files modified"
-                );
-            }
+        if let Some(rendered) = super::render::format_sync_warning(warning) {
+            eprintln!("{rendered}");
         }
     }
 }
@@ -403,6 +354,7 @@ pub(super) fn run_update(source: Option<&str>, fast_forward: bool) -> Result<Cli
         false,
         false,
         fast_forward,
+        false,
         false,
         Some(drop),
         None,
