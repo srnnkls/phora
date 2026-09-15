@@ -91,6 +91,9 @@ pub enum Command {
         /// Drop matching paths from the NEW source's offer (repeatable; source-owned).
         #[arg(long = "exclude")]
         exclude: Vec<String>,
+        /// Create a missing `--to` target without confirming.
+        #[arg(long = "yes", short = 'y')]
+        assume_yes: bool,
         #[arg(long)]
         local: bool,
         #[arg(long)]
@@ -466,6 +469,7 @@ fn dispatch_add(cmd: Command) -> Result<()> {
         root,
         include,
         exclude,
+        assume_yes,
         local,
         symlink,
         history,
@@ -490,6 +494,7 @@ fn dispatch_add(cmd: Command) -> Result<()> {
         exclude,
         local,
         symlink,
+        assume_yes,
         refinement: &refinement,
     })
 }
@@ -599,6 +604,7 @@ fn run_source(cmd: SourceCmd) -> Result<()> {
             exclude,
             local,
             symlink,
+            assume_yes: false,
             refinement: &BindRefinement::default(),
         }),
         SourceCmd::Rm { name } => run_source_rm(&name),
@@ -761,54 +767,49 @@ pub(super) fn effective_auto_target() -> bool {
     merge_configs(base, local).defaults.auto_target()
 }
 
-/// On a TTY, prompts on stderr to create a missing `--to` target and reads a path
-/// from stdin (empty line keeps the default); off a TTY, rejects.
-pub(super) struct TtyMissingTarget;
+/// Confirms on stderr before phora creates a directory for a missing `--to` target.
+pub(super) struct TtyMissingTarget {
+    pub(super) assume_yes: bool,
+}
 
 impl add::MissingTargetDecider for TtyMissingTarget {
-    fn decide(&self, name: &str, default_path: &str) -> add::MissingTarget {
-        if !std::io::stdin().is_terminal() {
-            return add::MissingTarget::Reject;
-        }
-        eprint!("phora: target '{name}' does not exist — create it at [{default_path}]? ");
-        let _ = std::io::stderr().flush();
-        let mut line = String::new();
-        match std::io::stdin().read_line(&mut line) {
-            Ok(0) | Err(_) => add::MissingTarget::Reject,
-            Ok(_) => {
-                let typed = line.trim();
-                let path = if typed.is_empty() {
-                    default_path.to_owned()
-                } else {
-                    typed.to_owned()
-                };
-                add::MissingTarget::Create { path }
-            }
-        }
+    fn decide(&self, name: &str, path: &str) -> add::MissingTarget {
+        add::missing_target_decision(
+            Path::new(path).is_dir(),
+            self.assume_yes,
+            std::io::stdin().is_terminal(),
+            || prompt_yes_on_stdin(&format!("phora: create target '{name}' at {path}? "), true),
+        )
     }
 }
 
-/// Reads a y/N answer from stdin; only an explicit `y` confirms, EOF and errors decline.
-pub(crate) fn prompt_yes_on_stdin(prompt: &str) -> bool {
+/// Reads a yes/no answer from stdin; an empty line takes `default_yes`, EOF and
+/// errors always decline.
+pub(crate) fn prompt_yes_on_stdin(prompt: &str, default_yes: bool) -> bool {
     use std::io::Write as _;
-    eprint!("{prompt}");
+    eprint!("{prompt}{} ", if default_yes { "[Y/n]" } else { "[y/N]" });
     let _ = std::io::stderr().flush();
     let mut line = String::new();
     match std::io::stdin().read_line(&mut line) {
         Ok(0) | Err(_) => false,
-        Ok(_) => line.trim().eq_ignore_ascii_case("y"),
+        Ok(_) => match line.trim() {
+            "" => default_yes,
+            typed => typed.eq_ignore_ascii_case("y") || typed.eq_ignore_ascii_case("yes"),
+        },
     }
 }
 
-/// Prompts on stderr for each unpinned transitive hook.
 pub(crate) struct TtyTrustPrompt;
 
 impl crate::sync::TrustPrompt for TtyTrustPrompt {
     fn confirm(&self, request: &crate::sync::TrustRequest<'_>) -> bool {
-        prompt_yes_on_stdin(&format!(
-            "phora: composed dep `{}` wants to run on_change hook `{}` — trust it? [y/N] ",
-            request.dep_instance, request.command
-        ))
+        prompt_yes_on_stdin(
+            &format!(
+                "phora: composed dep `{}` wants to run on_change hook `{}` — trust it? ",
+                request.dep_instance, request.command
+            ),
+            false,
+        )
     }
 }
 
