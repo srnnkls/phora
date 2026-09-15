@@ -501,6 +501,8 @@ fn pty_sync_command(fx: &Fixture) -> Command {
         .env("PHORA_PTY_WRAPPER", PTY_CHILD_WRAPPER);
 
     command.env("PHORA_PTY_BIN", env!("CARGO_BIN_EXE_phora"));
+    // The transcript pins `sync complete`; live bars would interleave draw frames.
+    command.env("PHORA_NO_PROGRESS", "1");
     fx.configure(&mut command);
     command
 }
@@ -536,6 +538,75 @@ fn finish_pty_child(
         transcript,
         script_stderr: diagnostics,
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn sync_transcript_with_live_progress(fx: &Fixture) -> String {
+    let mut command = pty_sync_command(fx);
+    command.env_remove("PHORA_NO_PROGRESS");
+    command.env_remove("CI");
+    command.env("TERM", "xterm-256color");
+    let out = command
+        .stdin(Stdio::null())
+        .output()
+        .expect("installed `script` utility starts a PTY");
+    assert!(
+        out.status.success(),
+        "the PTY transport must exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_real_terminal_draws_progress_and_the_rich_summary() {
+    let fx = build_fixture();
+    let transcript = sync_transcript_with_live_progress(&fx);
+
+    assert!(
+        transcript.contains("\u{1b}["),
+        "a real TTY must receive ANSI cursor control: {transcript:?}"
+    );
+    for label in ["Resolving", "Deploying"] {
+        assert!(
+            transcript.contains(label),
+            "the {label} bar must reach a real terminal: {transcript:?}"
+        );
+    }
+    assert!(
+        transcript.contains('━'),
+        "the bar must render with the heavy-line glyph: {transcript:?}"
+    );
+
+    assert!(
+        transcript.contains("synced 1 target:"),
+        "a terminal run must end in the rich summary, not the plain line: {transcript:?}"
+    );
+    assert!(
+        !transcript.contains("sync complete"),
+        "the plain completion line is the non-tty contract only: {transcript:?}"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn no_progress_keeps_a_real_terminal_on_the_plain_contract() {
+    let fx = build_fixture();
+    let mut command = pty_sync_command(&fx);
+    let out = command
+        .stdin(Stdio::null())
+        .output()
+        .expect("installed `script` utility starts a PTY");
+    let transcript = normalize_pty_crlf(&out.stdout);
+    assert!(
+        transcript.contains("sync complete"),
+        "PHORA_NO_PROGRESS must restore the plain completion line: {transcript:?}"
+    );
+    assert!(
+        !transcript.contains("Resolving"),
+        "PHORA_NO_PROGRESS must draw no bars: {transcript:?}"
+    );
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
