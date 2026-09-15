@@ -28,6 +28,7 @@ use crate::projection::model::{ProjectedArtifact, TargetProjection};
 use crate::sync::model::{
     ChangeSet, ConflictKind, ManagedCondition, ObservedArtifact, RemovalReason, SyncChange,
 };
+use crate::sync::progress::ArtifactId;
 use crate::sync::request::SyncEvents;
 use crate::sync::{AppliedChange, SkippedChange, SyncWarning};
 
@@ -202,7 +203,7 @@ pub(super) fn walk_projection_target(
 
     for binding in &projection.bindings {
         if surface_warnings {
-            let mut discarded = SyncEvents::default();
+            let mut discarded = SyncEvents::discarding();
             collect_projection_warnings(&binding.warnings, &mut discarded);
         }
         let template_opt_in = template_opt_ins.get(&binding.identity).ok_or_else(|| {
@@ -338,7 +339,7 @@ pub(super) fn deploy_reconciled_target(
     registry: &dyn StateStore,
     journal: &Journal,
 ) -> Result<bool> {
-    let mut events = SyncEvents::default();
+    let mut events = SyncEvents::discarding();
     deploy_reconciled_target_report(
         run,
         projection,
@@ -457,7 +458,7 @@ fn protect_history_retirements(
         };
         match (observation, decision) {
             (ObservedArtifact::Ejected, _) => {
-                events.skipped.push(SkippedChange::Conflict {
+                events.push_skipped(SkippedChange::Conflict {
                     target: run.target_name.to_owned(),
                     source: binding.identity.clone(),
                     artifact: binding.identity.clone(),
@@ -481,7 +482,7 @@ fn protect_history_retirements(
                     );
                 }
                 match outcome.resolution {
-                    Resolution::Skip => events.skipped.push(SkippedChange::Conflict {
+                    Resolution::Skip => events.push_skipped(SkippedChange::Conflict {
                         target: run.target_name.to_owned(),
                         source: binding.identity.clone(),
                         artifact: managed.record.key.artifact.clone(),
@@ -495,7 +496,7 @@ fn protect_history_retirements(
                             backend,
                             registry,
                         )?;
-                        events.applied.push(AppliedChange::Ejected {
+                        events.push_applied(AppliedChange::Ejected {
                             target: run.target_name.to_owned(),
                             source: binding.identity.clone(),
                             artifact: managed.record.key.artifact.clone(),
@@ -609,7 +610,7 @@ fn apply_reconciled(
         }
         Some(SyncChange::RewriteOverlay { .. }) => {
             if journal.refuses_writes() {
-                events.skipped.push(SkippedChange::ReadonlyOverlayRewrite {
+                events.push_skipped(SkippedChange::ReadonlyOverlayRewrite {
                     target: run.target_name.to_owned(),
                     source: entry.identity.to_owned(),
                     artifact: published_key,
@@ -618,7 +619,7 @@ fn apply_reconciled(
             }
             match rewrite_overlay(backend, reconciliation, &triplet, entry) {
                 Ok(()) => {
-                    events.applied.push(AppliedChange::OverlayRewritten {
+                    events.push_applied(AppliedChange::OverlayRewritten {
                         target: run.target_name.to_owned(),
                         source: entry.identity.to_owned(),
                         artifact: published_key,
@@ -627,7 +628,7 @@ fn apply_reconciled(
                     Ok(false)
                 }
                 Err(error) => {
-                    events.skipped.push(SkippedChange::Failed {
+                    events.push_skipped(SkippedChange::Failed {
                         target: run.target_name.to_owned(),
                         source: entry.identity.to_owned(),
                         artifact: published_key,
@@ -668,8 +669,17 @@ fn apply_reconciled(
                 entry.identity, run.target_name
             ))),
         },
-        Some(SyncChange::Remove { .. }) | None => {
+        Some(SyncChange::Remove { .. }) => {
             persist_metadata_refresh(&reconciliation.observed, &triplet, registry, &key)?;
+            Ok(false)
+        }
+        None => {
+            persist_metadata_refresh(&reconciliation.observed, &triplet, registry, &key)?;
+            events.push_unchanged(&ArtifactId {
+                target: run.target_name.to_owned(),
+                source: entry.identity.to_owned(),
+                artifact: published_key,
+            });
             Ok(false)
         }
     }
@@ -718,11 +728,11 @@ fn run_deploy(
 ) -> bool {
     match deploy(key, events) {
         Ok(()) => {
-            events.applied.push(applied);
+            events.push_applied(applied);
             false
         }
         Err(e) => {
-            events.skipped.push(SkippedChange::Failed {
+            events.push_skipped(SkippedChange::Failed {
                 target: target.to_owned(),
                 source: identity.to_owned(),
                 artifact: published_key.to_owned(),
@@ -752,7 +762,7 @@ fn apply_resolution(
 ) -> Result<bool> {
     match resolution {
         Resolution::Skip => {
-            events.skipped.push(SkippedChange::Conflict {
+            events.push_skipped(SkippedChange::Conflict {
                 target: run.target_name.to_owned(),
                 source: entry.identity.to_owned(),
                 artifact: published_key.to_owned(),
@@ -796,7 +806,7 @@ fn apply_resolution(
                 backend,
                 registry,
             )?;
-            events.applied.push(AppliedChange::Ejected {
+            events.push_applied(AppliedChange::Ejected {
                 target: run.target_name.to_owned(),
                 source: entry.identity.to_owned(),
                 artifact: published_key.to_owned(),
@@ -823,9 +833,7 @@ fn persist_metadata_refresh(
 
 fn collect_projection_warnings(warnings: &[ProjectionWarning], events: &mut SyncEvents) {
     for warning in warnings {
-        events
-            .warnings
-            .push(SyncWarning::Projection(warning.clone()));
+        events.push_warning(SyncWarning::Projection(warning.clone()));
     }
 }
 
@@ -965,21 +973,21 @@ fn collect_conflict_warning(
 ) {
     match kind {
         ConflictKind::Modified { changed } => {
-            events.warnings.push(SyncWarning::ConflictModified {
+            events.push_warning(SyncWarning::ConflictModified {
                 source: source.to_owned(),
                 artifact: artifact.to_owned(),
                 changed: changed.clone(),
             });
         }
         ConflictKind::Foreign => {
-            events.warnings.push(SyncWarning::ConflictForeign {
+            events.push_warning(SyncWarning::ConflictForeign {
                 path: dst.to_path_buf(),
             });
         }
     }
 }
 
-struct DeployContext<'a> {
+struct DeployContext<'a, 's> {
     deploy_root: String,
     layout: LayoutConfig,
     source: &'a ParsedSource,
@@ -995,7 +1003,7 @@ struct DeployContext<'a> {
     template_opt_in: &'a TemplateOptIn,
     vars: &'a BTreeMap<String, String>,
     confine_anchor: Option<&'a Path>,
-    events: &'a mut SyncEvents,
+    events: &'a mut SyncEvents<'s>,
 }
 
 type HistoryDeployment = (
@@ -1034,7 +1042,7 @@ pub(crate) fn project_root() -> Result<PathBuf> {
 
 fn prepare_history_deployment(
     backend: &dyn SourceStore,
-    ctx: &DeployContext<'_>,
+    ctx: &DeployContext<'_, '_>,
     whole_root: bool,
 ) -> Result<HistoryDeployment> {
     if !whole_root {
@@ -1134,7 +1142,7 @@ fn retire_history_deployment(
                 .map_err(|error| Error::Sync(format!("retire {}: {error}", path.display())))?;
         }
         registry.remove_artifact(&record.key)?;
-        events.applied.push(AppliedChange::Removed {
+        events.push_applied(AppliedChange::Removed {
             target: record.key.target.clone(),
             source: record.key.source.clone(),
             artifact: record.key.artifact.clone(),
@@ -1144,7 +1152,7 @@ fn retire_history_deployment(
     Ok(())
 }
 
-fn reject_history_git_entry(ctx: &DeployContext<'_>, whole_root: bool) -> Result<()> {
+fn reject_history_git_entry(ctx: &DeployContext<'_, '_>, whole_root: bool) -> Result<()> {
     if whole_root
         && ctx
             .artifact
@@ -1164,7 +1172,7 @@ fn deploy_one(
     backend: &dyn SourceStore,
     registry: &dyn StateStore,
     journal: &Journal,
-    ctx: DeployContext<'_>,
+    ctx: DeployContext<'_, '_>,
 ) -> Result<()> {
     let whole_root = matches!(
         &ctx.artifact.materialization,
@@ -1259,7 +1267,7 @@ fn deploy_one(
         },
     )?;
     if let Some(warning) = content_filter_warning {
-        ctx.events.warnings.push(warning);
+        ctx.events.push_warning(warning);
     }
     Ok(())
 }

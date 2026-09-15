@@ -12,6 +12,7 @@ use crate::source::{
     SourceInventory, SourceLocation, SourceName, SourcePath, SourceStore, digest_snapshot,
 };
 
+use super::progress::{FetchId, FetchOutcome, ProgressSink};
 use super::{effective_protocol, remote_for};
 
 type SourceResult<T> = std::result::Result<T, SourceError>;
@@ -80,7 +81,7 @@ fn resolution_groups<'a>(
     parsed: &BTreeMap<String, ParsedSource>,
     remotes: &BTreeMap<String, String>,
     units: &'a [Unit],
-) -> Result<Vec<Vec<&'a Unit>>> {
+) -> Result<Vec<(String, Vec<&'a Unit>)>> {
     let mut groups: BTreeMap<String, Vec<&Unit>> = BTreeMap::new();
     for unit in units {
         if !parsed.contains_key(&unit.name) {
@@ -92,7 +93,7 @@ fn resolution_groups<'a>(
             .to_owned();
         groups.entry(key).or_default().push(unit);
     }
-    Ok(groups.into_values().collect())
+    Ok(groups.into_iter().collect())
 }
 
 fn revision_spec(refspec: &Refspec) -> Result<RevisionSpec> {
@@ -408,6 +409,14 @@ fn default_thread_count(units: usize, cores: usize) -> usize {
     units.min((2 * cores).max(50))
 }
 
+fn fetch_outcome<T>(resolved: &Result<T>, mirror_refreshed: bool) -> FetchOutcome {
+    match (resolved, mirror_refreshed) {
+        (Err(_), _) => FetchOutcome::Failed,
+        (Ok(_), true) => FetchOutcome::Fetched,
+        (Ok(_), false) => FetchOutcome::Cached,
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "resolution threads config/parsed/remotes/lock/backend plus the force, frozen, and jobs run flags"
@@ -422,9 +431,11 @@ pub(super) fn resolve_sources(
     force: bool,
     frozen: bool,
     jobs: Option<usize>,
+    sink: &dyn ProgressSink,
 ) -> Result<RoutedSources> {
     let units = resolution_units(config, parsed);
     let groups = resolution_groups(parsed, remotes, &units)?;
+    sink.resolve_planned(groups.len());
 
     let cores = std::thread::available_parallelism().map_or(8, std::num::NonZero::get);
     let threads = jobs
@@ -438,9 +449,14 @@ pub(super) fn resolve_sources(
     pool.install(|| -> Result<RoutedSources> {
         let resolved: Vec<Option<Resolved>> = groups
             .into_par_iter()
-            .map(|units| {
+            .map(|(mirror, units)| {
+                let fetch = FetchId {
+                    mirror,
+                    sources: units.iter().map(|unit| unit.name.clone()).collect(),
+                };
+                sink.fetch_started(&fetch);
                 let mut mirror_refreshed = false;
-                units
+                let resolved = units
                     .into_iter()
                     .map(|unit| {
                         resolve_unit(
@@ -456,7 +472,9 @@ pub(super) fn resolve_sources(
                             &mut mirror_refreshed,
                         )
                     })
-                    .collect::<Result<Vec<_>>>()
+                    .collect::<Result<Vec<_>>>();
+                sink.fetch_finished(&fetch, fetch_outcome(&resolved, mirror_refreshed));
+                resolved
             })
             .collect::<Result<Vec<_>>>()?
             .into_iter()
@@ -502,6 +520,7 @@ pub fn resolve_sources_for_bench(
         force,
         false,
         jobs,
+        super::progress::SILENT,
     )
 }
 

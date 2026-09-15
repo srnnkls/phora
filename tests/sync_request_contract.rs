@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use phora::config::Config;
 use phora::projection::diagnostic::ProjectionWarning;
+use phora::sync::progress::ProgressSink;
 use phora::source::GitBackend;
 use phora::sync::state::{
     ArtifactKey, ArtifactRecord, FileStateStore, RecordKind, StateStore,
@@ -74,12 +75,22 @@ fn assert_policy_mapping_table() {
 }
 
 fn assert_exact_public_shapes<'a>(request: SyncRequest<'a>, report: SyncReport) {
-    let SyncRequest { base_config, local_config, locks, options: request_options, resolver } = request;
+    let SyncRequest {
+        base_config,
+        local_config,
+        locks,
+        options: request_options,
+        resolver,
+        sink,
+        trust_prompt,
+    } = request;
     let _: &'a Config = base_config;
     let _: Option<&'a Config> = local_config;
     let _: LockSet = locks;
     let _: SyncOptions = request_options;
     let _: Option<&'a dyn ConflictResolver> = resolver;
+    let _: &'a dyn ProgressSink = sink;
+    let _: Option<&'a dyn phora::sync::TrustPrompt> = trust_prompt;
 
     let SyncOptions {
         source_policy,
@@ -189,6 +200,8 @@ fn assert_request_flow_returns_conflict_warning_and_remove_outcomes() {
             None,
         ),
         resolver: Some(&spy),
+        sink: phora::sync::progress::SILENT,
+        trust_prompt: None,
     };
     let backend = GitBackend::new(temp.path().join("cache"));
     let report = sync(&request, &backend, &registry).expect("request flow succeeds");

@@ -299,7 +299,7 @@ where
         )? {
             continue;
         }
-        events.applied.push(AppliedChange::Removed {
+        events.push_applied(AppliedChange::Removed {
             target: target.to_owned(),
             source: source.to_owned(),
             artifact: artifact.to_owned(),
@@ -363,7 +363,7 @@ fn remove_reconciled_record(
             }
             Ok(_) => {}
             Err(error) => {
-                events.warnings.push(SyncWarning::PruneRefused {
+                events.push_warning(SyncWarning::PruneRefused {
                     path: dst.clone(),
                     reason: error.to_string(),
                 });
@@ -374,7 +374,7 @@ fn remove_reconciled_record(
     } else {
         let Some(path) = orphan_artifact_path(record) else {
             if record.deploy_root.is_some() {
-                events.warnings.push(SyncWarning::OrphanRecordPathUnknown {
+                events.push_warning(SyncWarning::OrphanRecordPathUnknown {
                     source: record.key.source.clone(),
                     artifact: record.key.artifact.clone(),
                     layout: record.layout.clone(),
@@ -384,7 +384,7 @@ fn remove_reconciled_record(
             return Ok(true);
         };
         if super::target::is_composed_target(&record.key.target) {
-            events.warnings.push(SyncWarning::PruneRefused {
+            events.push_warning(SyncWarning::PruneRefused {
                 path: path.clone(),
                 reason: format!(
                     "composed target `{}` has no confine anchor",

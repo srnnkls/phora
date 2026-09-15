@@ -10,12 +10,35 @@ use crate::projection::diagnostic::ProjectionWarning;
 use super::ConflictResolver;
 use super::hooks::HookOutcome;
 use super::model::{ChangeSet, ConflictKind, ReconciliationPolicy, RemovalReason};
+use super::progress::{self, ProgressSink};
 
 /// The base and optional local lock carried into or returned from synchronization.
 #[derive(Debug, Clone, Default)]
 pub struct LockSet {
     pub base: Option<Lock>,
     pub local: Option<Lock>,
+}
+
+/// One unpinned transitive hook awaiting a trust decision.
+#[derive(Debug, Clone)]
+pub struct TrustRequest<'a> {
+    pub dep_instance: &'a str,
+    pub hook_id: &'a str,
+    pub command: String,
+}
+
+/// Decides whether an unpinned transitive hook may run.
+pub trait TrustPrompt: Sync {
+    fn confirm(&self, request: &TrustRequest<'_>) -> bool;
+}
+
+/// Declines every unpinned transitive hook.
+pub struct DeclineAll;
+
+impl TrustPrompt for DeclineAll {
+    fn confirm(&self, _request: &TrustRequest<'_>) -> bool {
+        false
+    }
 }
 
 /// All caller-controlled inputs to a synchronization run.
@@ -25,6 +48,8 @@ pub struct SyncRequest<'a> {
     pub locks: LockSet,
     pub options: SyncOptions,
     pub resolver: Option<&'a dyn ConflictResolver>,
+    pub sink: &'a dyn ProgressSink,
+    pub trust_prompt: Option<&'a dyn TrustPrompt>,
 }
 
 /// Explicit policies controlling synchronization.
@@ -226,9 +251,62 @@ pub struct SyncReport {
     pub status: SyncStatus,
 }
 
-#[derive(Debug, Default)]
-pub(super) struct SyncEvents {
+/// Accumulates the run's report and forwards each entry to the observation port.
+pub(super) struct SyncEvents<'a> {
+    sink: &'a dyn ProgressSink,
     pub(super) applied: Vec<AppliedChange>,
     pub(super) skipped: Vec<SkippedChange>,
     pub(super) warnings: Vec<SyncWarning>,
+    pub(super) unchanged: usize,
+}
+
+impl std::fmt::Debug for SyncEvents<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SyncEvents")
+            .field("applied", &self.applied)
+            .field("skipped", &self.skipped)
+            .field("warnings", &self.warnings)
+            .finish()
+    }
+}
+
+impl<'a> SyncEvents<'a> {
+    pub(super) fn new(sink: &'a dyn ProgressSink) -> Self {
+        Self {
+            sink,
+            applied: Vec::new(),
+            skipped: Vec::new(),
+            warnings: Vec::new(),
+            unchanged: 0,
+        }
+    }
+
+    /// For a walk whose report is thrown away; observers must not see it either.
+    pub(super) fn discarding() -> SyncEvents<'static> {
+        SyncEvents::new(progress::SILENT)
+    }
+
+    pub(super) fn sink(&self) -> &'a dyn ProgressSink {
+        self.sink
+    }
+
+    pub(super) fn push_applied(&mut self, change: AppliedChange) {
+        self.sink.artifact_applied(&change);
+        self.applied.push(change);
+    }
+
+    pub(super) fn push_skipped(&mut self, change: SkippedChange) {
+        self.sink.artifact_skipped(&change);
+        self.skipped.push(change);
+    }
+
+    pub(super) fn push_warning(&mut self, warning: SyncWarning) {
+        self.sink.warning(&warning);
+        self.warnings.push(warning);
+    }
+
+    pub(super) fn push_unchanged(&mut self, artifact: &progress::ArtifactId) {
+        self.sink.artifact_unchanged(artifact);
+        self.unchanged += 1;
+    }
 }
