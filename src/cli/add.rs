@@ -20,6 +20,7 @@ pub(super) struct AddRequest<'a> {
     pub(super) exclude: Vec<String>,
     pub(super) local: bool,
     pub(super) symlink: bool,
+    pub(super) assume_yes: bool,
     pub(super) refinement: &'a BindRefinement,
 }
 
@@ -59,6 +60,7 @@ pub(super) fn run_add(request: AddRequest<'_>) -> Result<()> {
             exclude,
             local,
             symlink,
+            assume_yes,
             refinement,
         } = request;
         return run_add_to_targets(
@@ -72,6 +74,7 @@ pub(super) fn run_add(request: AddRequest<'_>) -> Result<()> {
             exclude,
             local,
             symlink,
+            assume_yes,
             refinement,
         );
     }
@@ -358,6 +361,7 @@ fn run_add_to_targets(
     exclude: Vec<String>,
     local: bool,
     symlink: bool,
+    assume_yes: bool,
     refinement: &BindRefinement,
 ) -> Result<()> {
     let overlay = local || symlink;
@@ -386,7 +390,7 @@ fn run_add_to_targets(
         source_root.as_deref(),
         targets,
         refinement,
-        &super::TtyMissingTarget,
+        &super::TtyMissingTarget { assume_yes },
     )?;
     if symlink {
         updated = inject_deploy_link(&updated, &name)?;
@@ -650,17 +654,40 @@ pub fn insert_source(
     config_edit::upsert_source(doc_text, name, source, source.branch.as_deref(), None, root)
 }
 
-/// How to handle a `--to` target that does not yet exist: create it at `path`
-/// (flat layout) or reject the whole command.
+/// How to handle a `--to` target absent from the config.
 pub(super) enum MissingTarget {
-    Create { path: String },
+    Create,
     Reject,
 }
 
 /// Decides, per missing `--to` target, whether to create it or reject. The real
 /// impl prompts on a TTY; tests substitute a fake.
 pub(super) trait MissingTargetDecider {
-    fn decide(&self, name: &str, default_path: &str) -> MissingTarget;
+    fn decide(&self, name: &str, path: &str) -> MissingTarget;
+}
+
+/// Whether a `--to` target absent from the config may be created.
+///
+/// `--to` already chose the path, so an existing directory leaves nothing to
+/// ask: the answer would be yes every time. Only a directory phora would have
+/// to create is worth a question.
+pub(super) fn missing_target_decision(
+    path_exists: bool,
+    assume_yes: bool,
+    interactive: bool,
+    confirm: impl FnOnce() -> bool,
+) -> MissingTarget {
+    if path_exists || assume_yes {
+        return MissingTarget::Create;
+    }
+    if !interactive {
+        return MissingTarget::Reject;
+    }
+    if confirm() {
+        MissingTarget::Create
+    } else {
+        MissingTarget::Reject
+    }
 }
 
 /// Upsert `[sources.<name>]` and bind it into `[targets.default]`, creating that
@@ -719,8 +746,9 @@ pub(super) fn add_with_binds(
     let bind_names = [name.to_owned()];
     for target in targets {
         if !target_exists(&current, target)? {
-            match decider.decide(target, &format!("./{target}")) {
-                MissingTarget::Create { path } => {
+            let path = format!("./{target}");
+            match decider.decide(target, &path) {
+                MissingTarget::Create => {
                     current = config_edit::upsert_target(&current, target, &path, Some("flat"))?;
                 }
                 MissingTarget::Reject => {

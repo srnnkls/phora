@@ -1578,6 +1578,7 @@ fn run_add_end_to_end_persists_symbolic_source_to_phora_toml() {
             root: None,
             include: Vec::new(),
             exclude: Vec::new(),
+            assume_yes: false,
             local: false,
             symlink: false,
             refinement: &config_edit::BindRefinement::default(),
@@ -1627,6 +1628,7 @@ fn run_add_persists_local_path_source_for_absolute_dir() {
             root: None,
             include: Vec::new(),
             exclude: Vec::new(),
+            assume_yes: false,
             local: false,
             symlink: false,
             refinement: &config_edit::BindRefinement::default(),
@@ -1681,6 +1683,7 @@ fn run_add_to_target_persists_local_path_source() {
             root: None,
             include: Vec::new(),
             exclude: Vec::new(),
+            assume_yes: false,
             local: false,
             symlink: false,
             refinement: &config_edit::BindRefinement::default(),
@@ -2705,6 +2708,7 @@ fn add_local_writes_path_local_path_to_phora_local_toml() {
             root: None,
             include: Vec::new(),
             exclude: Vec::new(),
+            assume_yes: false,
             local: true,
             symlink: false,
             refinement: &config_edit::BindRefinement::default(),
@@ -2746,6 +2750,7 @@ fn add_symlink_writes_path_and_deploy_link_to_local_toml() {
             root: None,
             include: Vec::new(),
             exclude: Vec::new(),
+            assume_yes: false,
             local: false,
             symlink: true,
             refinement: &config_edit::BindRefinement::default(),
@@ -2791,6 +2796,7 @@ fn add_local_infers_name_from_path_basename() {
             root: None,
             include: Vec::new(),
             exclude: Vec::new(),
+            assume_yes: false,
             local: true,
             symlink: false,
             refinement: &config_edit::BindRefinement::default(),
@@ -2824,6 +2830,7 @@ fn add_symlink_implies_local_overlay_and_is_valid() {
             root: None,
             include: Vec::new(),
             exclude: Vec::new(),
+            assume_yes: false,
             local: false,
             symlink: true,
             refinement: &config_edit::BindRefinement::default(),
@@ -2868,6 +2875,7 @@ fn add_local_and_symlink_together_equals_symlink() {
                 exclude: Vec::new(),
                 local,
                 symlink,
+                assume_yes: false,
                 refinement: &config_edit::BindRefinement::default(),
             })
             .expect("run_add must not error");
@@ -2926,6 +2934,7 @@ fn add_without_flags_still_writes_phora_toml() {
             root: None,
             include: Vec::new(),
             exclude: Vec::new(),
+            assume_yes: false,
             local: false,
             symlink: false,
             refinement: &config_edit::BindRefinement::default(),
@@ -2967,6 +2976,7 @@ fn add_local_canonicalizes_relative_path_to_absolute() {
             root: None,
             include: Vec::new(),
             exclude: Vec::new(),
+            assume_yes: false,
             local: true,
             symlink: false,
             refinement: &config_edit::BindRefinement::default(),
@@ -3004,6 +3014,7 @@ fn add_local_errors_when_path_does_not_exist() {
             root: None,
             include: Vec::new(),
             exclude: Vec::new(),
+            assume_yes: false,
             local: true,
             symlink: false,
             refinement: &config_edit::BindRefinement::default(),
@@ -3046,6 +3057,7 @@ fn add_local_rejects_non_directory_path() {
             root: None,
             include: Vec::new(),
             exclude: Vec::new(),
+            assume_yes: false,
             local: true,
             symlink: false,
             refinement: &config_edit::BindRefinement::default(),
@@ -3094,6 +3106,7 @@ fn add_local_preserves_siblings_and_replaces_same_name_in_overlay() {
             root: None,
             include: Vec::new(),
             exclude: Vec::new(),
+            assume_yes: false,
             local: true,
             symlink: false,
             refinement: &config_edit::BindRefinement::default(),
@@ -3123,6 +3136,7 @@ fn add_local_preserves_siblings_and_replaces_same_name_in_overlay() {
             root: None,
             include: Vec::new(),
             exclude: Vec::new(),
+            assume_yes: false,
             local: true,
             symlink: false,
             refinement: &config_edit::BindRefinement::default(),
@@ -3169,6 +3183,7 @@ fn add_symlink_overlay_overrides_base_source_after_merge() {
             root: None,
             include: Vec::new(),
             exclude: Vec::new(),
+            assume_yes: false,
             local: false,
             symlink: true,
             refinement: &config_edit::BindRefinement::default(),
@@ -3715,6 +3730,7 @@ fn add_to_with_refinement_flags_writes_source_and_table_binding() {
                 branch: None,
                 tag: None,
                 root: Some("nvim".to_owned()),
+                assume_yes: false,
                 local: false,
                 symlink: false,
                 history: false,
@@ -3781,6 +3797,7 @@ fn add_to_with_no_refinement_flags_writes_a_bare_string_binding() {
                 branch: None,
                 tag: None,
                 root: None,
+                assume_yes: false,
                 local: false,
                 symlink: false,
                 history: false,
@@ -3837,6 +3854,7 @@ fn add_as_with_multiple_targets_errors() {
                 branch: None,
                 tag: None,
                 root: None,
+                assume_yes: false,
                 local: false,
                 symlink: false,
                 history: false,
@@ -3874,6 +3892,7 @@ fn add_to_a_single_target_with_as_is_the_happy_path() {
                 branch: None,
                 tag: None,
                 root: None,
+                assume_yes: false,
                 local: false,
                 symlink: false,
                 history: false,
@@ -3918,6 +3937,7 @@ fn bare_add_without_to_does_not_touch_targets() {
                 branch: None,
                 tag: None,
                 root: None,
+                assume_yes: false,
                 local: false,
                 symlink: false,
                 history: false,
@@ -3969,6 +3989,7 @@ fn add_to_with_root_scopes_the_source_not_the_binding() {
                 branch: None,
                 tag: None,
                 root: Some("nvim".to_owned()),
+                assume_yes: false,
                 local: false,
                 symlink: false,
                 history: false,
@@ -4020,6 +4041,7 @@ fn add_to_with_url_embedded_root_sets_the_source_root() {
                 branch: None,
                 tag: None,
                 root: None,
+                assume_yes: false,
                 local: false,
                 symlink: false,
                 history: false,
@@ -4079,6 +4101,7 @@ fn bare_add_with_root_still_sets_the_source_root() {
                 branch: None,
                 tag: None,
                 root: Some("nvim".to_owned()),
+                assume_yes: false,
                 local: false,
                 symlink: false,
                 history: false,
@@ -4114,6 +4137,7 @@ fn add_as_without_to_errors() {
                 branch: None,
                 tag: None,
                 root: None,
+                assume_yes: false,
                 local: false,
                 symlink: false,
                 history: false,
@@ -4152,6 +4176,7 @@ fn add_local_with_to_errors() {
                 branch: None,
                 tag: None,
                 root: None,
+                assume_yes: false,
                 local: true,
                 symlink: false,
                 history: false,
@@ -4190,6 +4215,7 @@ fn add_to_multiple_targets_writes_a_binding_in_each() {
                 branch: None,
                 tag: None,
                 root: None,
+                assume_yes: false,
                 local: false,
                 symlink: false,
                 history: false,
@@ -4239,6 +4265,7 @@ fn add_to_with_include_exclude_writes_arrays_on_the_source() {
                 branch: None,
                 tag: None,
                 root: None,
+                assume_yes: false,
                 local: false,
                 symlink: false,
                 history: false,
@@ -4281,6 +4308,7 @@ fn bare_add_routes_repeatable_include_exclude_root_to_the_source_not_the_binding
             root: Some("editor".to_owned()),
             include: vec!["skills/**".to_owned(), "*.lua".to_owned()],
             exclude: vec![".git".to_owned()],
+            assume_yes: false,
             local: false,
             symlink: false,
             refinement: &config_edit::BindRefinement::default(),
@@ -4338,6 +4366,7 @@ fn add_to_target_without_sources_array_creates_the_array_and_binds() {
                 branch: None,
                 tag: None,
                 root: None,
+                assume_yes: false,
                 local: false,
                 symlink: false,
                 history: false,
@@ -4381,6 +4410,7 @@ fn add_to_nonexistent_target_errors_and_leaves_file_untouched() {
                 branch: None,
                 tag: None,
                 root: None,
+                assume_yes: false,
                 local: false,
                 symlink: false,
                 history: false,
@@ -4985,7 +5015,7 @@ fn rm_routes_to_same_scrub_as_source_rm() {
 struct RejectAll;
 
 impl MissingTargetDecider for RejectAll {
-    fn decide(&self, _name: &str, _default_path: &str) -> MissingTarget {
+    fn decide(&self, _name: &str, _path: &str) -> MissingTarget {
         MissingTarget::Reject
     }
 }
@@ -4993,20 +5023,8 @@ impl MissingTargetDecider for RejectAll {
 struct CreateAtDefault;
 
 impl MissingTargetDecider for CreateAtDefault {
-    fn decide(&self, _name: &str, default_path: &str) -> MissingTarget {
-        MissingTarget::Create {
-            path: default_path.to_owned(),
-        }
-    }
-}
-
-struct CreateAt(&'static str);
-
-impl MissingTargetDecider for CreateAt {
-    fn decide(&self, _name: &str, _default_path: &str) -> MissingTarget {
-        MissingTarget::Create {
-            path: self.0.to_owned(),
-        }
+    fn decide(&self, _name: &str, _path: &str) -> MissingTarget {
+        MissingTarget::Create
     }
 }
 
@@ -5277,26 +5295,38 @@ fn add_with_binds_create_decider_materializes_flat_default_path_target() {
 }
 
 #[test]
-fn add_with_binds_create_decider_honors_entered_path() {
-    let out = add_with_binds(
-        "version = 1\n",
-        "dots",
-        &lit("https://github.com/me/dots.git", None),
-        None,
-        None,
-        None,
-        &["staging".to_owned()],
-        &config_edit::BindRefinement::default(),
-        &CreateAt("~/custom/staging"),
-    )
-    .expect("a Create decider with a typed path must honor it");
+fn an_existing_directory_needs_no_confirmation() {
+    let decision = super::add::missing_target_decision(true, false, false, || {
+        panic!("an existing directory must not be questioned")
+    });
+    assert!(matches!(decision, super::add::MissingTarget::Create));
+}
 
-    let cfg = Config::parse(&out).expect("valid");
-    assert_eq!(
-        cfg.targets["staging"].path,
-        PathBuf::from("~/custom/staging"),
-        "a typed path must override the default ./<name>"
-    );
+#[test]
+fn assume_yes_creates_without_a_terminal() {
+    let decision =
+        super::add::missing_target_decision(false, true, false, || panic!("--yes must not prompt"));
+    assert!(matches!(decision, super::add::MissingTarget::Create));
+}
+
+#[test]
+fn a_new_directory_without_a_terminal_is_refused() {
+    let decision = super::add::missing_target_decision(false, false, false, || {
+        panic!("a non-terminal run must not prompt")
+    });
+    assert!(matches!(decision, super::add::MissingTarget::Reject));
+}
+
+#[test]
+fn a_new_directory_on_a_terminal_follows_the_answer() {
+    assert!(matches!(
+        super::add::missing_target_decision(false, false, true, || true),
+        super::add::MissingTarget::Create
+    ));
+    assert!(matches!(
+        super::add::missing_target_decision(false, false, true, || false),
+        super::add::MissingTarget::Reject
+    ));
 }
 
 #[test]
