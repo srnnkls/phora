@@ -23,7 +23,6 @@ use super::{
     Conflict, ConflictResolver, Resolution, StagingGuard, nonce, remote_for, remove_orphan_path,
     target_parent,
 };
-use crate::projection::diagnostic::ProjectionWarning;
 use crate::projection::model::{ProjectedArtifact, TargetProjection};
 use crate::sync::model::{
     ChangeSet, ConflictKind, ManagedCondition, ObservedArtifact, RemovalReason, SyncChange,
@@ -187,7 +186,6 @@ pub(super) fn walk_projection_target(
     run: TargetRun<'_>,
     projection: &TargetProjection,
     registry: &dyn StateStore,
-    surface_warnings: bool,
     mut visit: impl FnMut(&TargetRun<'_>, &ArtifactEntry<'_>) -> Result<bool>,
 ) -> Result<bool> {
     let layout = run.target.layout();
@@ -202,10 +200,6 @@ pub(super) fn walk_projection_target(
         .collect();
 
     for binding in &projection.bindings {
-        if surface_warnings {
-            let mut discarded = SyncEvents::discarding();
-            collect_projection_warnings(&binding.warnings, &mut discarded);
-        }
         let template_opt_in = template_opt_ins.get(&binding.identity).ok_or_else(|| {
             Error::Sync(format!(
                 "binding `{}` planned without a resolved template opt-in",
@@ -367,7 +361,7 @@ pub(super) fn deploy_reconciled_target_report(
     let mut failed_bindings = BTreeSet::new();
     let mut ready_bindings = BTreeSet::new();
     let mut unready_bindings = BTreeSet::new();
-    let had_failures = walk_projection_target(run, projection, registry, false, |run, entry| {
+    let had_failures = walk_projection_target(run, projection, registry, |run, entry| {
         if protected_bindings.contains(entry.identity) {
             return Ok(false);
         }
@@ -450,7 +444,6 @@ fn protect_history_retirements(
 ) -> Result<BTreeSet<String>> {
     let mut protected_bindings = BTreeSet::new();
     for binding in &projection.bindings {
-        collect_projection_warnings(&binding.warnings, events);
         let Some((observation, decision)) =
             reconciliation.history_retirement(run.target_name, &binding.identity)
         else {
@@ -829,12 +822,6 @@ fn persist_metadata_refresh(
         persist_revalidated_refresh(registry, key, refreshed)?;
     }
     Ok(())
-}
-
-fn collect_projection_warnings(warnings: &[ProjectionWarning], events: &mut SyncEvents) {
-    for warning in warnings {
-        events.push_warning(SyncWarning::Projection(warning.clone()));
-    }
 }
 
 fn unsafe_dest_diagnostic(dest: &str) -> Error {

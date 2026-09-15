@@ -1214,7 +1214,7 @@ where
         &mut events,
     );
     input.sink().phase_started(Phase::Project);
-    let projection = project_sync_workspace(
+    let mut projection = project_sync_workspace(
         &effective_config,
         &parsed,
         &remotes,
@@ -1226,6 +1226,9 @@ where
     input
         .sink()
         .artifacts_planned(projected_artifact_count(&projection));
+    for warning in std::mem::take(&mut projection.warnings) {
+        events.push_warning(SyncWarning::Projection(warning));
+    }
     let pending_fast_forward_drops = validate_sealed_offer(
         &effective_config,
         &parsed,
