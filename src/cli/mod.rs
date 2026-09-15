@@ -788,6 +788,30 @@ impl add::MissingTargetDecider for TtyMissingTarget {
     }
 }
 
+/// Reads a y/N answer from stdin; only an explicit `y` confirms, EOF and errors decline.
+pub(crate) fn prompt_yes_on_stdin(prompt: &str) -> bool {
+    use std::io::Write as _;
+    eprint!("{prompt}");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    match std::io::stdin().read_line(&mut line) {
+        Ok(0) | Err(_) => false,
+        Ok(_) => line.trim().eq_ignore_ascii_case("y"),
+    }
+}
+
+/// Prompts on stderr for each unpinned transitive hook.
+pub(crate) struct TtyTrustPrompt;
+
+impl crate::sync::TrustPrompt for TtyTrustPrompt {
+    fn confirm(&self, request: &crate::sync::TrustRequest<'_>) -> bool {
+        prompt_yes_on_stdin(&format!(
+            "phora: composed dep `{}` wants to run on_change hook `{}` — trust it? [y/N] ",
+            request.dep_instance, request.command
+        ))
+    }
+}
+
 /// Prompts on stderr and reads a resolution character from stdin for each conflict.
 struct TtyResolver;
 

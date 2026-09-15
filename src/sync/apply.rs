@@ -107,7 +107,7 @@ pub fn apply_artifact(
     journal: &Journal,
     registry: &dyn StateStore,
 ) -> Result<()> {
-    let mut events = SyncEvents::default();
+    let mut events = SyncEvents::discarding();
     apply_artifact_report(
         ApplyPaths {
             staging_base,
@@ -318,7 +318,7 @@ fn swap_into(
     match std::fs::rename(staging, dst) {
         Ok(()) => Ok(()),
         Err(e) if is_cross_device(&e) => {
-            events.warnings.push(SyncWarning::CrossDeviceFallback {
+            events.push_warning(SyncWarning::CrossDeviceFallback {
                 destination: dst.to_path_buf(),
             });
             if staging.is_file() {

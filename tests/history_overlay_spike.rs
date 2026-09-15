@@ -301,6 +301,8 @@ fn sync_history(
             locks: LockSet::default(),
             options,
             resolver: None,
+            sink: phora::sync::progress::SILENT,
+            trust_prompt: None,
         },
         backend,
         registry,

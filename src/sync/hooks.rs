@@ -5,6 +5,7 @@ use std::process::Command;
 
 use crate::config::{Config, DEFAULT_SHELL_PREFIX, HookCommand, HookWhen, LayoutConfig};
 use crate::error::{Error, Result};
+use crate::sync::request::{TrustPrompt, TrustRequest};
 use crate::sync::state::{ArtifactRecord, StateStore};
 
 /// Which hook table a [`HookOutcome`] came from.
@@ -189,42 +190,6 @@ pub(super) struct TransitiveApproval {
     pub(super) commit: String,
 }
 
-pub(super) trait TrustPrompt {
-    fn confirm(&self, candidate: &TransitiveHookRun<'_>) -> bool;
-}
-
-/// Reads a y/N answer from stdin; only an explicit `y` confirms, EOF and errors decline.
-pub(crate) fn prompt_yes_on_stdin(prompt: &str) -> bool {
-    use std::io::Write as _;
-    eprint!("{prompt}");
-    let _ = std::io::stderr().flush();
-    let mut line = String::new();
-    match std::io::stdin().read_line(&mut line) {
-        Ok(0) | Err(_) => false,
-        Ok(_) => line.trim().eq_ignore_ascii_case("y"),
-    }
-}
-
-pub(super) struct TtyTrustPrompt;
-
-impl TrustPrompt for TtyTrustPrompt {
-    fn confirm(&self, candidate: &TransitiveHookRun<'_>) -> bool {
-        prompt_yes_on_stdin(&format!(
-            "phora: composed dep `{}` wants to run on_change hook `{}` — trust it? [y/N] ",
-            candidate.dep_instance,
-            candidate.command.display()
-        ))
-    }
-}
-
-pub(super) struct DeclineAll;
-
-impl TrustPrompt for DeclineAll {
-    fn confirm(&self, _candidate: &TransitiveHookRun<'_>) -> bool {
-        false
-    }
-}
-
 /// Runs each commit-pinned transitive hook whose preimage a consumer `trusted_hooks` entry
 /// already pins; an unpinned hook consults `prompt` (approval persists) and is skipped on a
 /// decline. A dep can never self-approve: trust is keyed on the consumer lock.
@@ -244,7 +209,11 @@ pub(super) fn dispatch_transitive_hooks(
         } else if let Some(&prior) = decided.get(candidate.preimage) {
             prior
         } else {
-            let answer = prompt.confirm(candidate);
+            let answer = prompt.confirm(&TrustRequest {
+                dep_instance: candidate.dep_instance,
+                hook_id: candidate.hook_id,
+                command: candidate.command.display(),
+            });
             decided.insert(candidate.preimage, answer);
             answer
         };
@@ -398,22 +367,22 @@ mod transitive_trust_tests {
     struct CannedPrompt(bool);
 
     impl TrustPrompt for CannedPrompt {
-        fn confirm(&self, _candidate: &TransitiveHookRun<'_>) -> bool {
+        fn confirm(&self, _request: &TrustRequest<'_>) -> bool {
             self.0
         }
     }
 
     struct NeverPrompt;
     impl TrustPrompt for NeverPrompt {
-        fn confirm(&self, _candidate: &TransitiveHookRun<'_>) -> bool {
+        fn confirm(&self, _request: &TrustRequest<'_>) -> bool {
             panic!("a hook already pinned in trusted_hooks must run without prompting");
         }
     }
 
-    struct CountingPrompt(std::cell::Cell<usize>, bool);
+    struct CountingPrompt(std::sync::atomic::AtomicUsize, bool);
     impl TrustPrompt for CountingPrompt {
-        fn confirm(&self, _candidate: &TransitiveHookRun<'_>) -> bool {
-            self.0.set(self.0.get() + 1);
+        fn confirm(&self, _request: &TrustRequest<'_>) -> bool {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.1
         }
     }
@@ -533,13 +502,13 @@ mod transitive_trust_tests {
             "blake3:shared",
         );
         let trusted = BTreeSet::new();
-        let prompt = CountingPrompt(std::cell::Cell::new(0), true);
+        let prompt = CountingPrompt(std::sync::atomic::AtomicUsize::new(0), true);
 
         let (outcomes, approvals) = dispatch_transitive_hooks(&[a, b], &trusted, &prompt)
             .expect("dispatch with two same-preimage candidates must succeed");
 
         assert_eq!(
-            prompt.0.get(),
+            prompt.0.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "two candidates sharing a preimage must prompt exactly once"
         );
@@ -574,13 +543,13 @@ mod transitive_trust_tests {
             "blake3:shared",
         );
         let trusted = BTreeSet::new();
-        let prompt = CountingPrompt(std::cell::Cell::new(0), false);
+        let prompt = CountingPrompt(std::sync::atomic::AtomicUsize::new(0), false);
 
         let (outcomes, approvals) = dispatch_transitive_hooks(&[a, b], &trusted, &prompt)
             .expect("dispatch declining a shared preimage must succeed");
 
         assert_eq!(
-            prompt.0.get(),
+            prompt.0.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "a declined preimage must not re-prompt for duplicates"
         );

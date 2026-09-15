@@ -11,6 +11,7 @@ pub mod model;
 pub(crate) mod observe;
 mod plan;
 mod preview;
+pub mod progress;
 mod prune;
 mod rebuild;
 pub mod reconcile;
@@ -42,10 +43,14 @@ pub use preview::{
     BindingWarnings, PreviewCollision, PreviewEntry, PreviewFile, PreviewTargetPlan,
     PreviewWarning, SyncState, preview_targets,
 };
+pub use progress::{
+    ArtifactId, FetchId, FetchOutcome, Phase, ProgressSink, Severity, SilentSink, SyncSummary,
+};
 pub use rebuild::{RebuildReport, rebuild_registry, rebuild_registry_with};
 pub use request::{
-    AppliedChange, Concurrency, ConflictPolicy, HookPolicy, LockSet, MovedPinPolicy, PrunePolicy,
-    SkippedChange, SourcePolicy, SyncOptions, SyncReport, SyncRequest, SyncStatus, SyncWarning,
+    AppliedChange, Concurrency, ConflictPolicy, DeclineAll, HookPolicy, LockSet, MovedPinPolicy,
+    PrunePolicy, SkippedChange, SourcePolicy, SyncOptions, SyncReport, SyncRequest, SyncStatus,
+    SyncWarning, TrustPrompt, TrustRequest,
 };
 pub use verify::{
     OverlayFinding, UntrustedHookFinding, VerifyMismatch, VerifyReason, VerifyReport, verify,
@@ -165,6 +170,8 @@ struct SyncRunInput<'a> {
     locks: LockSet,
     options: SyncOptions,
     resolver: Option<&'a dyn ConflictResolver>,
+    sink: &'a dyn ProgressSink,
+    trust_prompt: Option<&'a dyn TrustPrompt>,
     lockless: bool,
 }
 
@@ -190,6 +197,14 @@ trait RunOptions {
     fn options(&self) -> SyncOptions;
     fn resolver(&self) -> Option<&dyn ConflictResolver>;
     fn lockless(&self) -> bool;
+
+    fn sink(&self) -> &dyn ProgressSink {
+        progress::SILENT
+    }
+
+    fn trust_prompt(&self) -> Option<&dyn TrustPrompt> {
+        None
+    }
 
     fn interactive(&self) -> bool {
         matches!(
@@ -222,6 +237,14 @@ impl RunOptions for SyncRunInput<'_> {
 
     fn lockless(&self) -> bool {
         self.lockless
+    }
+
+    fn sink(&self) -> &dyn ProgressSink {
+        self.sink
+    }
+
+    fn trust_prompt(&self) -> Option<&dyn TrustPrompt> {
+        self.trust_prompt
     }
 }
 
@@ -272,6 +295,8 @@ impl TestSyncInvocation for SyncRequest<'_> {
             locks: self.locks.clone(),
             options: self.options,
             resolver: self.resolver,
+            sink: self.sink,
+            trust_prompt: self.trust_prompt,
             lockless: false,
         }
     }
@@ -333,6 +358,8 @@ impl TestSyncInvocation for SyncInput<'_> {
                 },
             },
             resolver: self.resolver,
+            sink: progress::SILENT,
+            trust_prompt: None,
             lockless: self.lockless,
         }
     }
@@ -430,7 +457,7 @@ fn take_hook_candidates(
     events: &mut SyncEvents,
 ) -> Vec<transitive::TransitiveHookCandidate> {
     for diagnostic in std::mem::take(&mut graph.hook_diagnostics) {
-        events.warnings.push(SyncWarning::MalformedTransitiveHooks {
+        events.push_warning(SyncWarning::MalformedTransitiveHooks {
             target: diagnostic.target,
             detail: diagnostic.detail,
         });
@@ -461,7 +488,7 @@ fn decide_transitive_hooks(
     base_lock: &mut Lock,
     candidates: &[transitive::TransitiveHookCandidate],
     effective_lock: Option<&Lock>,
-    interactive: bool,
+    prompt: Option<&dyn TrustPrompt>,
 ) -> Result<TransitiveHookDecision> {
     let trusted = trusted_preimages(effective_lock);
     let runs: Vec<hooks::TransitiveHookRun<'_>> = candidates
@@ -476,10 +503,9 @@ fn decide_transitive_hooks(
             commit: &c.commit,
         })
         .collect();
-    let (outcomes, approvals) = if interactive {
-        hooks::dispatch_transitive_hooks(&runs, &trusted, &hooks::TtyTrustPrompt)?
-    } else {
-        hooks::dispatch_transitive_hooks(&runs, &trusted, &hooks::DeclineAll)?
+    let (outcomes, approvals) = match prompt {
+        Some(prompt) => hooks::dispatch_transitive_hooks(&runs, &trusted, prompt)?,
+        None => hooks::dispatch_transitive_hooks(&runs, &trusted, &request::DeclineAll)?,
     };
     let now = chrono::Utc::now().to_rfc3339();
     for approval in approvals {
@@ -520,12 +546,12 @@ struct DeployProtocol<'a, R> {
 /// Outcome of the all-gates-before-mutation deploy protocol. `aborted` means a `pre_deploy` gate
 /// stopped hook processing before planned drops or target changes were applied; `had_failures`
 /// folds in skip-induced failures so it can suppress `--prune`.
-struct ApplyRun {
+struct ApplyRun<'a> {
     had_failures: bool,
     pre_deploy: Vec<hooks::HookOutcome>,
     aborted: bool,
     changes: model::ChangeSet,
-    events: SyncEvents,
+    events: SyncEvents<'a>,
 }
 
 fn target_run<'a, R>(
@@ -668,18 +694,20 @@ fn observe_reconciliation<R>(
 where
     R: StateStore,
 {
+    ctx.input.sink().phase_started(Phase::Observe);
     let observed = observe::observe_workspace(ctx, ctx.projection)?;
     let retirements = observe::observe_history_retirements(ctx)?;
     let mut changeset = reconcile::reconcile(ctx.projection, &observed, &policy)
         .map_err(|error| Error::Sync(error.to_string()))?;
     reconcile::add_history_retirement_conflicts(&mut changeset, &retirements, policy);
+    ctx.input.sink().phase_finished(Phase::Observe);
     Ok((observed, retirements, changeset))
 }
 
-fn apply_target_changes<R>(
-    ctx: &DeployAll<'_, R>,
+fn apply_target_changes<'a, R>(
+    ctx: &DeployAll<'a, R>,
     fast_forward_drops: &[FastForwardDrop],
-) -> Result<ApplyRun>
+) -> Result<ApplyRun<'a>>
 where
     R: StateStore,
 {
@@ -709,7 +737,7 @@ where
             pre_deploy: outcomes,
             aborted: true,
             changes: initial_changeset,
-            events: SyncEvents::default(),
+            events: SyncEvents::new(ctx.input.sink()),
         });
     }
 
@@ -738,7 +766,7 @@ where
         pre_deploy: outcomes,
         aborted: false,
         changes: changeset.clone(),
-        events: SyncEvents::default(),
+        events: SyncEvents::new(ctx.input.sink()),
     };
     apply_fast_forward_drops(
         fast_forward_drops,
@@ -749,9 +777,12 @@ where
         &skipped_targets,
         &mut run.events,
     )?;
+    ctx.input.sink().phase_started(Phase::Apply);
     run.had_failures |=
         deploy_reconciled_targets(ctx, &reconciliation, &mut run.events, &skipped_targets)?;
+    ctx.input.sink().phase_finished(Phase::Apply);
     if !run.had_failures {
+        ctx.input.sink().phase_started(Phase::Prune);
         prune::apply_reconciled_removals(
             &changeset.changes,
             &observed,
@@ -759,10 +790,10 @@ where
             ctx,
             &mut run.events,
         )?;
+        ctx.input.sink().phase_finished(Phase::Prune);
     } else if ctx.input.prune() && run.had_failures {
         run.events
-            .warnings
-            .push(SyncWarning::PruneSkippedAfterFailures);
+            .push_warning(SyncWarning::PruneSkippedAfterFailures);
     }
     Ok(run)
 }
@@ -899,7 +930,7 @@ fn notify_orphans(
 ) -> Result<()> {
     let count = orphan_records(config, registry)?.len();
     if count > 0 {
-        events.warnings.push(SyncWarning::OrphanedRecords { count });
+        events.push_warning(SyncWarning::OrphanedRecords { count });
     }
     Ok(())
 }
@@ -1004,6 +1035,15 @@ fn plan_fast_forward_drops(
     Ok(plan)
 }
 
+fn projected_artifact_count(projection: &Projection) -> usize {
+    projection
+        .targets
+        .iter()
+        .flat_map(|target| target.bindings.iter())
+        .map(|binding| binding.artifacts.len())
+        .sum()
+}
+
 fn project_sync_workspace(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
@@ -1073,6 +1113,8 @@ fn request_run_input<'a>(request: &'a SyncRequest<'a>, lockless: bool) -> SyncRu
         locks: request.locks.clone(),
         options: request.options,
         resolver: request.resolver,
+        sink: request.sink,
+        trust_prompt: request.trust_prompt,
         lockless,
     }
 }
@@ -1089,7 +1131,8 @@ fn sync_core<R>(
 where
     R: StateStore,
 {
-    let mut events = SyncEvents::default();
+    let started = std::time::Instant::now();
+    let mut events = SyncEvents::new(input.sink());
     let mut effective_config = merged_config(input);
     effective_config.validate()?;
     let pre_sync_outcomes = run_pre_sync(input, &effective_config)?;
@@ -1106,11 +1149,13 @@ where
             input.locks.local.clone(),
             pre_sync_outcomes,
             events,
+            started,
         ));
     }
     let mut parsed = effective_config.parsed_sources()?;
     let mut remotes = resolved_remotes(&effective_config, &parsed)?;
     let effective_lock = effective_lock(input);
+    input.sink().phase_started(Phase::Compose);
     let mut graph = transitive::resolve_transitive_graph(
         &effective_config,
         &parsed,
@@ -1120,8 +1165,9 @@ where
     )?;
     let hook_candidates = take_hook_candidates(&mut graph, &mut events);
     let instances = graph.inject(&mut effective_config, &mut parsed, &mut remotes);
+    input.sink().phase_finished(Phase::Compose);
     for warning in validate_link_mode(input.base_config, &parsed, &remotes)? {
-        events.warnings.push(SyncWarning::LinkPathNotPortable {
+        events.push_warning(SyncWarning::LinkPathNotPortable {
             source: warning.source,
             path: warning.path,
         });
@@ -1139,6 +1185,7 @@ where
 
     let recorded_after_recovery = live_recorded_artifacts(compat_registry)?;
 
+    input.sink().phase_started(Phase::Resolve);
     let routed = resolve_sources(
         &effective_config,
         &parsed,
@@ -1149,7 +1196,9 @@ where
         input.refresh_sources(),
         input.frozen(),
         input.jobs(),
+        input.sink(),
     )?;
+    input.sink().phase_finished(Phase::Resolve);
     let (mut base_lock, local_lock) = split_locks(routed.locks, &local_names);
     base_lock.trusted_hooks = effective_lock
         .as_ref()
@@ -1164,6 +1213,7 @@ where
         &routed.commits,
         &mut events,
     );
+    input.sink().phase_started(Phase::Project);
     let projection = project_sync_workspace(
         &effective_config,
         &parsed,
@@ -1172,6 +1222,10 @@ where
         &routed.commits,
         &routed.resolved,
     )?;
+    input.sink().phase_finished(Phase::Project);
+    input
+        .sink()
+        .artifacts_planned(projected_artifact_count(&projection));
     let pending_fast_forward_drops = validate_sealed_offer(
         &effective_config,
         &parsed,
@@ -1211,9 +1265,14 @@ where
         effective_lock.as_ref(),
         pre_sync_outcomes,
         events,
+        started,
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the deploy phase threads both locks, both hook sets, the accumulator, and the run clock"
+)]
 fn deploy_and_run_hooks<R>(
     protocol: &DeployProtocol<'_, R>,
     mut base_lock: Lock,
@@ -1222,6 +1281,7 @@ fn deploy_and_run_hooks<R>(
     effective_lock: Option<&Lock>,
     pre_sync_outcomes: Vec<hooks::HookOutcome>,
     events: SyncEvents,
+    started: std::time::Instant,
 ) -> Result<SyncExecution>
 where
     R: StateStore,
@@ -1244,6 +1304,7 @@ where
             local_lock,
             early_hooks,
             run.events,
+            started,
         ));
     }
     let mut had_failures = run.had_failures;
@@ -1252,6 +1313,7 @@ where
         notify_orphans(deploy.config, registry, &mut run.events)?;
     }
 
+    deploy.input.sink().phase_started(Phase::Hooks);
     let (hook_results, stripped_transitive_hooks) = run_all_hooks(
         deploy.input,
         deploy.config,
@@ -1261,10 +1323,13 @@ where
         effective_lock,
         early_hooks,
     )?;
+    deploy.input.sink().phase_finished(Phase::Hooks);
+    for outcome in &hook_results {
+        deploy.input.sink().hook_finished(outcome);
+    }
     if stripped_transitive_hooks > 0 {
         run.events
-            .warnings
-            .push(SyncWarning::UntrustedTransitiveHooks {
+            .push_warning(SyncWarning::UntrustedTransitiveHooks {
                 count: stripped_transitive_hooks,
             });
     }
@@ -1272,6 +1337,16 @@ where
     had_failures |= hook_results
         .iter()
         .any(|o| o.status == hooks::HookStatus::Failure);
+
+    let summary = summarize(
+        deploy.config.targets.len(),
+        run.events.unchanged,
+        &run.events.applied,
+        &run.events.skipped,
+        &hook_results,
+        started.elapsed(),
+    );
+    deploy.input.sink().finished(&summary);
 
     Ok(SyncExecution {
         report: SyncReport {
@@ -1295,6 +1370,45 @@ where
     })
 }
 
+fn summarize(
+    targets: usize,
+    unchanged: usize,
+    applied: &[AppliedChange],
+    skipped: &[SkippedChange],
+    hooks: &[hooks::HookOutcome],
+    elapsed: std::time::Duration,
+) -> SyncSummary {
+    let mut summary = SyncSummary {
+        targets,
+        unchanged,
+        elapsed,
+        ..SyncSummary::default()
+    };
+    for change in applied {
+        match change {
+            AppliedChange::Deployed { .. } => summary.deployed += 1,
+            AppliedChange::Overwritten { .. } => summary.overwritten += 1,
+            AppliedChange::OverlayRewritten { .. } => summary.overlays_rewritten += 1,
+            AppliedChange::Ejected { .. } => summary.ejected += 1,
+            AppliedChange::Removed { .. } => summary.removed += 1,
+        }
+    }
+    for change in skipped {
+        match change {
+            SkippedChange::Conflict { .. } => summary.conflicts += 1,
+            SkippedChange::Failed { .. } | SkippedChange::ReadonlyOverlayRewrite { .. } => {
+                summary.failures += 1;
+            }
+        }
+    }
+    summary.hooks_run = hooks.len();
+    summary.hooks_failed = hooks
+        .iter()
+        .filter(|outcome| outcome.status == hooks::HookStatus::Failure)
+        .count();
+    summary
+}
+
 /// Short-circuit shared by a failed `pre_sync` gate and a `pre_deploy` abort. Both return before
 /// planned drops or ordinary target changes are applied; hook side effects remain external.
 /// `deploy_failures` is false because a gate failure is a hook failure, not a deploy failure.
@@ -1303,7 +1417,17 @@ fn aborted_before_deploy_phase(
     local_lock: Option<Lock>,
     hook_results: Vec<hooks::HookOutcome>,
     events: SyncEvents,
+    started: std::time::Instant,
 ) -> SyncExecution {
+    let summary = summarize(
+        0,
+        events.unchanged,
+        &events.applied,
+        &events.skipped,
+        &hook_results,
+        started.elapsed(),
+    );
+    events.sink().finished(&summary);
     SyncExecution {
         report: SyncReport {
             locks: LockSet {
@@ -1359,7 +1483,7 @@ fn run_all_hooks(
             base_lock,
             hook_candidates,
             effective_lock,
-            input.interactive(),
+            input.interactive().then(|| input.trust_prompt()).flatten(),
         )?;
         stripped = decision.stripped;
         hook_results.append(&mut decision.outcomes);
@@ -1588,14 +1712,14 @@ fn apply_fast_forward_drops(
         })?;
         match drop {
             FastForwardDrop::KeepLive { .. } => {
-                events.warnings.push(SyncWarning::FastForwardKeptLive {
+                events.push_warning(SyncWarning::FastForwardKeptLive {
                     source: record.key.source.clone(),
                     artifact: record.key.artifact.clone(),
                     path,
                 });
             }
             FastForwardDrop::Remove { .. } => {
-                events.warnings.push(SyncWarning::FastForwardDropped {
+                events.push_warning(SyncWarning::FastForwardDropped {
                     source: record.key.source.clone(),
                     artifact: record.key.artifact.clone(),
                 });
@@ -1725,7 +1849,7 @@ fn collect_ref_transitions(
     events: &mut SyncEvents,
 ) {
     for transition in ref_transitions(config, parsed, effective_lock, resolved_commits) {
-        events.warnings.push(SyncWarning::ReferenceMoved {
+        events.push_warning(SyncWarning::ReferenceMoved {
             source: transition.source,
             target: transition.target,
             from: transition.from,

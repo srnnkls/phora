@@ -568,7 +568,7 @@ struct StdinConfirm;
 
 impl Confirm for StdinConfirm {
     fn confirm(&self, candidate: &CandidateHookRecord) -> bool {
-        crate::sync::hooks::prompt_yes_on_stdin(&format!(
+        super::prompt_yes_on_stdin(&format!(
             "phora: trust `{}` (runs `{}`)? [y/N] ",
             candidate.hook_id, candidate.command
         ))

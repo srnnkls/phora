@@ -741,6 +741,7 @@ fn link_source_resolves_without_mirror_into_audit_lock_entry() {
         false,
         false,
         None,
+        crate::sync::progress::SILENT,
     )
     .expect("link source resolves with no reachable mirror");
 
@@ -789,6 +790,7 @@ fn link_source_skips_fetch_and_mirror_digest() {
         false,
         false,
         None,
+        crate::sync::progress::SILENT,
     )
     .expect("link source resolves without touching the mirror");
 
@@ -1038,6 +1040,7 @@ fn frozen_errors_naming_source_when_no_lock_entry() {
         false,
         true,
         None,
+        crate::sync::progress::SILENT,
     )
     .err()
     .expect("frozen with no lock entry must hard-error instead of fetching");
@@ -1084,6 +1087,7 @@ fn frozen_reuses_matching_lock_without_touching_network() {
         false,
         true,
         None,
+        crate::sync::progress::SILENT,
     )
     .expect("frozen with a matching lock must reuse it without fetch/resolve");
 
@@ -1132,6 +1136,7 @@ fn frozen_errors_on_drifted_lock_entry() {
         false,
         true,
         None,
+        crate::sync::progress::SILENT,
     )
     .err()
     .expect("frozen with a drifted lock entry must hard-error, not re-resolve");
@@ -1176,6 +1181,7 @@ fn non_frozen_reresolves_drifted_lock_entry() {
         false,
         false,
         None,
+        crate::sync::progress::SILENT,
     )
     .expect("without --frozen a drifted lock must re-resolve, not error");
 
@@ -3755,7 +3761,7 @@ fn frozen_lockless_fast_forward_with_pending_drops_refuses_before_pruning() {
         warnings: Vec::new(),
     };
 
-    let mut events = SyncEvents::default();
+    let mut events = SyncEvents::discarding();
     let err = prune_fast_forward_drops_report(
         &projection,
         &cfg,
@@ -13313,6 +13319,7 @@ fn url_sources_sharing_one_url_each_fetch_so_per_source_digest_is_validated() {
         false,
         false,
         Some(4),
+        crate::sync::progress::SILENT,
     )
     .expect("two url sources sharing one url resolve");
 

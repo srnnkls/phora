@@ -69,6 +69,7 @@ pub(super) fn run_sync(
     }
     let interactive = std::io::stdin().is_terminal();
     let resolver = TtyResolver;
+    let trust_prompt = super::TtyTrustPrompt;
 
     let source_policy = if frozen {
         SourcePolicy::Frozen
@@ -121,8 +122,12 @@ pub(super) fn run_sync(
             concurrency: Concurrency { jobs },
         },
         resolver: interactive.then_some(&resolver as &dyn ConflictResolver),
+        sink: crate::sync::progress::SILENT,
+        trust_prompt: interactive.then_some(&trust_prompt as &dyn crate::sync::TrustPrompt),
     };
-    let out = sync_opened(&request, &backend, &registry, lockless)?;
+    let out = sync_opened(&request, &backend, &registry, lockless).inspect_err(|error| {
+        request.sink.aborted(&error.to_string());
+    })?;
 
     finish_sync(&cwd, &out, interactive)
 }
