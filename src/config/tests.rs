@@ -6317,3 +6317,63 @@ fn history_export_policy_rejects_disabled_executables_and_enables_symlinks() {
         );
     }
 }
+
+#[test]
+fn home_expansion_resolves_local_sources() {
+    let home = dirs::home_dir().expect("test environment has a home directory");
+    for key in ["path", "git"] {
+        for (value, relative) in [
+            ("~", ""),
+            ("~/projects/tropos", "projects/tropos"),
+            ("~//projects/tropos", "projects/tropos"),
+        ] {
+            let source = parse_remote("local", &format!("{key} = {value:?}\n"))
+                .expect("home-relative source parses");
+            assert_eq!(
+                source
+                    .resolved_remote(&BTreeMap::new(), Protocol::Https)
+                    .unwrap(),
+                home.join(relative).to_string_lossy(),
+                "{key} = {value:?} must resolve relative to home"
+            );
+        }
+    }
+}
+
+#[test]
+fn home_expansion_preserves_literal_source_tildes() {
+    for key in ["path", "git"] {
+        for value in [
+            "~someone/repo",
+            "./~/repo",
+            "projects/~/repo",
+            "git@example.com:~/repo",
+            "ssh://git@example.com/~/repo",
+            "https://git.sr.ht/~someone/repo",
+        ] {
+            let source = parse_remote("literal", &format!("{key} = {value:?}\n"))
+                .expect("literal source parses");
+            assert_eq!(
+                source
+                    .resolved_remote(&BTreeMap::new(), Protocol::Https)
+                    .unwrap(),
+                value,
+                "{key} = {value:?} must preserve its literal tilde"
+            );
+        }
+    }
+}
+
+#[test]
+fn home_expansion_resolves_targets_consistently() {
+    let home = dirs::home_dir().expect("test environment has a home directory");
+    for (value, relative) in [
+        ("~", ""),
+        ("~/.config", ".config"),
+        ("~//.config", ".config"),
+    ] {
+        let config = Config::parse(&format!("[targets.home]\npath = {value:?}\n"))
+            .expect("home-relative target parses");
+        assert_eq!(config.targets["home"].expanded_path(), home.join(relative));
+    }
+}

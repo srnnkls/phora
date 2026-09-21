@@ -14,7 +14,7 @@ mod tests;
 mod transitive_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -33,6 +33,15 @@ pub use target::{
     Binding, LayoutConfig, LayoutKind, ResolvedBinding, SourceFields, TakeEntry, Target,
     TemplateOptIn,
 };
+
+fn expand_home(path: &Path) -> PathBuf {
+    if let Ok(relative) = path.strip_prefix("~")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(relative);
+    }
+    path.to_path_buf()
+}
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
