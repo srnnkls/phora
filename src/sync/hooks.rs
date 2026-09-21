@@ -121,19 +121,49 @@ pub(super) fn dispatch_hooks(
 ///
 /// Returns an error if a hook process fails to spawn.
 pub(super) fn dispatch_pre_sync(config: &Config, target_names: &str) -> Result<Vec<HookOutcome>> {
-    let Some(pre_sync) = config.hooks.as_ref().and_then(|g| g.pre_sync.as_ref()) else {
-        return Ok(Vec::new());
-    };
     let mut outcomes = Vec::new();
-    for hook in dedupe(pre_sync) {
-        let status = run_hook(hook, &[("PHORA_TARGETS", target_names)])?;
-        let (body, suffix) = hook_key(hook);
+    if let Some(pre_sync) = config.hooks.as_ref().and_then(|g| g.pre_sync.as_ref()) {
+        for hook in dedupe(pre_sync) {
+            let status = run_hook(hook, &[("PHORA_TARGETS", target_names)])?;
+            let (body, suffix) = hook_key(hook);
+            outcomes.push(HookOutcome {
+                hook_id: format!("pre_sync#{body}#{suffix}"),
+                command: hook.display(),
+                scope: HookScope::PreSync,
+                status,
+            });
+        }
+    }
+    if outcomes
+        .iter()
+        .any(|outcome| outcome.status == HookStatus::Failure)
+    {
+        return Ok(outcomes);
+    }
+    for (name, source) in config.parsed_sources()? {
+        let Some(input) = source.build_input() else {
+            continue;
+        };
+        let output = source.resolved_remote(&config.hosts, crate::config::Protocol::Https)?;
+        let status = run_hook(
+            &input.recipe.run,
+            &[
+                ("PHORA_TARGETS", target_names),
+                ("PHORA_SOURCE", &name),
+                ("PHORA_SOURCE_PATH", &input.path),
+                ("PHORA_SOURCE_REF", &input.reference),
+                ("PHORA_BUILD_OUTPUT", &output),
+            ],
+        )?;
         outcomes.push(HookOutcome {
-            hook_id: format!("pre_sync#{body}#{suffix}"),
-            command: hook.display(),
+            hook_id: format!("build#{name}"),
+            command: input.recipe.run.display(),
             scope: HookScope::PreSync,
             status,
         });
+        if status == HookStatus::Failure {
+            break;
+        }
     }
     Ok(outcomes)
 }

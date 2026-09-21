@@ -955,6 +955,53 @@ the new package dropped. `phora sync --frozen` replays from the cache. Package
 ownership survives rebuilds, while hook trust remains tied to the actual commit.
 A source marked `transitive = true` still requires an explicit `imports` entry.
 
+### Building a declared local source
+
+A consumer can keep the canonical repository as its source and declare how to
+build a local Git package from it:
+
+```toml
+[sources.tropos]
+path = "~/projects/tropos"
+branch = "prototype/henia-phora"
+transitive = true
+build = { run = "bin/build-tropos", output = ".build/tropos" }
+
+[targets.claude]
+path = "~/.claude"
+imports = ["tropos"]
+
+[targets.codex]
+path = "~/.codex"
+imports = [{ source = "tropos", branch = "codex" }]
+```
+
+`path` and the source's `branch`/`tag`/`rev` identify the build input. `build.output`
+identifies the prepared Git package. Its default ref serves a bare import;
+per-import refs select variants in that output package. Selection fields such as
+`root`, `include` and `exclude` apply to the output.
+
+The build command runs once per declared source after global `pre_sync` hooks
+and before source resolution. `run` accepts the same command forms as a hook.
+The command receives Phora's environment plus:
+
+| Variable | Value |
+| --- | --- |
+| `PHORA_SOURCE` | Source name |
+| `PHORA_SOURCE_PATH` | Declared input path with `~` expanded |
+| `PHORA_SOURCE_REF` | Qualified branch/tag ref, commit, or `HEAD` |
+| `PHORA_BUILD_OUTPUT` | Output path with `~` expanded |
+| `PHORA_TARGETS` | Consumer target names |
+
+The command owns compilation and publication of the output; it should read the
+selected commit and publish only a successful build. Phora resolves and locks
+that output, including the input declaration and command in its configuration
+digest. A failed build aborts before deployment and preserves the existing lock,
+including during `update`. `--no-hooks` skips builds, so `sync --frozen --no-hooks`
+replays cached packages without the input repository or build output present.
+Read-only commands never run builds. Builds require a local `path` input and copy
+deployment; imported manifests cannot declare build commands.
+
 ### How composition works
 
 - The importing target's `path` is the anchor. Each dep target's own `path` is

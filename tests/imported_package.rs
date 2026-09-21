@@ -330,3 +330,138 @@ fn self_source_cannot_override_its_package_pin_in_a_binding() {
     assert!(String::from_utf8_lossy(&result.stderr).contains("self source"));
     assert!(!package.project.join("out").exists());
 }
+
+#[cfg(unix)]
+fn configure_build(package: &Package) {
+    configure(
+        package,
+        "path",
+        &format!(
+            "{CLAUDE}\n[targets.codex]\npath = \"out/codex\"\nimports = [{{ source = \"tropos\", branch = \"codex\" }}]\n"
+        ),
+    );
+    let path = package.project.join("phora.toml");
+    let config = std::fs::read_to_string(&path).expect("config");
+    write(
+        &path,
+        &config.replace(
+            "transitive = true",
+            "transitive = true\nbuild = { run = \"sh build.sh\", output = \".built/tropos\" }",
+        ),
+    );
+    write(
+        &package.project.join("build.sh"),
+        r#"set -eu
+[ "$PHORA_SOURCE" = tropos ]
+[ "$PHORA_SOURCE_REF" = refs/heads/main ]
+printf 'build\n' >> build-runs
+mkdir -p .built
+work="$PHORA_BUILD_OUTPUT.work"
+rm -rf "$work"
+git clone -q --no-hardlinks "$PHORA_SOURCE_PATH" "$work"
+revision=$(git -C "$PHORA_SOURCE_PATH" rev-parse "$PHORA_SOURCE_REF")
+git -C "$work" switch -q -C claude "$revision"
+printf 'built: ' > "$work/skills/code/SKILL.md"
+git -C "$PHORA_SOURCE_PATH" show "$PHORA_SOURCE_REF:skills/code/SKILL.md" >> "$work/skills/code/SKILL.md"
+git -C "$work" add .
+git -C "$work" -c core.hooksPath=/dev/null -c commit.gpgsign=false -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm build
+git -C "$work" switch -q -c codex
+printf 'Codex built\n' > "$work/skills/code/SKILL.md"
+git -C "$work" add .
+git -C "$work" -c core.hooksPath=/dev/null -c commit.gpgsign=false -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm codex
+git -C "$work" switch -q claude
+rm -rf "$PHORA_BUILD_OUTPUT"
+mv "$work" "$PHORA_BUILD_OUTPUT"
+"#,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_declared_source_builds_once_before_its_output_refs_are_imported() {
+    let package = package();
+    configure_build(&package);
+    git(&package.repository, &["switch", "-c", "local-edits"]);
+    write(
+        &package.repository.join("skills/code/SKILL.md"),
+        "uncommitted secret\n",
+    );
+    succeeds(&package, &["sync"]);
+    assert_deployed(&package, "out/claude", "built: Claude skill\n", "Loqui\n");
+    assert_deployed(&package, "out/codex", "Codex built\n", "Loqui\n");
+    let runs = package.project.join("build-runs");
+    assert_eq!(
+        std::fs::read_to_string(&runs).expect("build count"),
+        "build\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(package.repository.join("skills/code/SKILL.md")).expect("original"),
+        "uncommitted secret\n"
+    );
+    std::fs::rename(
+        &package.repository,
+        package.root.path().join("offline-input"),
+    )
+    .expect("hide input");
+    std::fs::remove_dir_all(package.project.join(".built")).expect("hide output");
+    std::fs::remove_dir_all(package.project.join("out")).expect("remove deployment");
+    succeeds(&package, &["sync", "--frozen", "--no-hooks"]);
+    succeeds(&package, &["verify"]);
+    succeeds(&package, &["preview"]);
+    assert_deployed(&package, "out/claude", "built: Claude skill\n", "Loqui\n");
+    assert_deployed(&package, "out/codex", "Codex built\n", "Loqui\n");
+    assert_eq!(
+        std::fs::read_to_string(&runs).expect("build count"),
+        "build\n"
+    );
+    let config_path = package.project.join("phora.toml");
+    let config = std::fs::read_to_string(&config_path).expect("config");
+    write(
+        &config_path,
+        &config.replace("branch = \"main\"", "branch = \"local-edits\""),
+    );
+    let drift = run(&package, &["sync", "--frozen", "--no-hooks"]);
+    assert!(
+        !drift.status.success(),
+        "changing a build input must invalidate its pin"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_source_build_keeps_the_existing_deployment_and_lock() {
+    let package = package();
+    configure_build(&package);
+    succeeds(&package, &["sync"]);
+    let lock = package.project.join("phora.lock");
+    let before = std::fs::read(&lock).expect("lock before failure");
+    write(&package.project.join("build.sh"), "exit 23\n");
+    let result = run(&package, &["update", "tropos", "--fast-forward"]);
+    assert!(!result.status.success());
+    assert_deployed(&package, "out/claude", "built: Claude skill\n", "Loqui\n");
+    assert_deployed(&package, "out/codex", "Codex built\n", "Loqui\n");
+    assert_eq!(std::fs::read(lock).expect("lock after failure"), before);
+}
+
+#[test]
+fn an_imported_manifest_cannot_request_a_source_build() {
+    let package = package();
+    let manifest = manifest("loqui").replace(
+        "path = \".\"\ninclude",
+        "path = \".\"\nbuild = { run = \"touch forbidden-build\", output = \".\" }\ninclude",
+    );
+    write(&package.repository.join("phora.toml"), &manifest);
+    git(&package.repository, &["add", "."]);
+    git(
+        &package.repository,
+        &["commit", "-qm", "Dependency-owned build"],
+    );
+    configure(&package, "path", CLAUDE);
+    let result = run(&package, &["sync"]);
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("builds must be declared by the consumer")
+    );
+    assert!(!package.project.join("forbidden-build").exists());
+    assert!(!package.project.join("out").exists());
+}
