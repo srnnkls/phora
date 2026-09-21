@@ -202,26 +202,18 @@ impl Config {
         Ok(())
     }
 
-    /// A flat fetch bypasses the recursive pre-pass, so a `transitive = true` source that
-    /// no target imports is a silent downgrade past escape-remote rejection and depth fail-fast.
+    /// Every transitive source must be reached through a binding or explicit import.
     fn validate_transitive_sources_are_mounted(&self) -> Result<()> {
         for (name, source) in &self.sources {
             if !source.is_transitive() {
                 continue;
             }
-            if self.is_imported_anywhere(name) {
+            if self.is_imported_anywhere(name) || self.flat_binder_of(name).is_some() {
                 continue;
             }
-            if let Some(target_name) = self.flat_binder_of(name) {
-                return Err(Error::Config(format!(
-                    "source `{name}` is `transitive = true` but flat-bound by target \
-                     `{target_name}` via `sources` and never imported; a transitive source \
-                     must be mounted via a target's `imports`, not flat-bound"
-                )));
-            }
             return Err(Error::Config(format!(
-                "source `{name}` is `transitive = true` but no target imports it; a transitive \
-                 source must be mounted via a target's `imports` or it is never resolved"
+                "source `{name}` is `transitive = true` but no target binds or imports it; a transitive \
+                 source must be reached through `sources` or `imports`"
             )));
         }
         Ok(())

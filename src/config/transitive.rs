@@ -119,6 +119,7 @@ pub struct Instance {
     source_name: String,
     anchor_target: String,
     fetch_node: FetchNode,
+    bound: bool,
 }
 
 impl Instance {
@@ -134,6 +135,22 @@ impl Instance {
             source_name: source_name.to_owned(),
             anchor_target: anchor_target.to_owned(),
             fetch_node,
+            bound: false,
+        }
+    }
+
+    /// A source binding keeps dependency ownership stable when its package is rebuilt.
+    /// Hook trust remains pinned separately to `fetch_node.commit()`.
+    #[must_use]
+    pub fn for_binding(
+        parent: &str,
+        source_name: &str,
+        anchor_target: &str,
+        fetch_node: FetchNode,
+    ) -> Self {
+        Self {
+            bound: true,
+            ..Self::new(parent, source_name, anchor_target, fetch_node)
         }
     }
 
@@ -152,7 +169,11 @@ impl Instance {
             self.anchor_target.as_str(),
             self.fetch_node.url.as_str(),
             self.fetch_node.r#ref.as_str(),
-            self.fetch_node.commit.as_str(),
+            if self.bound {
+                "bound"
+            } else {
+                self.fetch_node.commit.as_str()
+            },
         ] {
             hasher.update(&(field.len() as u64).to_le_bytes());
             hasher.update(field.as_bytes());

@@ -902,6 +902,33 @@ source, and deploys loqui's artifacts (its `languages/` and `resources/` trees) 
 One `imports` line, and tropos's dependency rode along. A target can import several at
 once — `imports = ["tropos", "work-config"]` — each composing under the same anchor.
 
+### Binding a package with its dependencies
+
+Use `transitive = true` on a normally bound source to deploy both its own
+artifacts and the targets advertised in its `phora.toml`:
+
+```toml
+[sources.tropos]
+path = ".build/tropos"
+transitive = true
+exclude = ["phora.toml"]
+
+[targets.claude]
+path = "~/.claude"
+sources.tropos = { branch = "claude", collapse = false }
+
+[targets.codex]
+path = "~/.codex"
+sources.tropos = { branch = "codex", collapse = false }
+```
+
+Each binding reads the dependency manifest at its own selected ref. The package
+and dependency pins replay together with `--frozen`. A directly bound local
+source is consumer-selected; dependency-owned local paths and escaping target
+paths remain rejected. Nested bound sources follow the same composition rules.
+Use `imports` when only the dependency's advertised targets should be mounted;
+do not both import and bind the same source in one target.
+
 ### How composition works
 
 - The importing target's `path` is the anchor. Each dep target's own `path` is

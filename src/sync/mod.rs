@@ -1161,7 +1161,11 @@ where
         &parsed,
         backend,
         input.frozen(),
-        effective_lock.as_ref(),
+        if input.refresh_sources() {
+            None
+        } else {
+            effective_lock.as_ref()
+        },
     )?;
     let hook_candidates = take_hook_candidates(&mut graph, &mut events);
     let instances = graph.inject(&mut effective_config, &mut parsed, &mut remotes);
