@@ -291,6 +291,11 @@ Non-interactive runs skip such files unless `--force` is given.
 
 ### Hooks
 
+`phora -C <directory> <command>` (or `--directory`) selects a project before
+loading configuration or state. Both `phora.toml` and `phora.local.toml`, relative
+source/target paths, locks, and hooks use that directory. This also lets a hook
+acquire inputs from a separate project without shell directory changes.
+
 The global `[hooks] pre_sync` runs before sources are resolved or files selected,
 so it can generate local source directories for the same sync. A failure stops
 before source resolution, recovery, deployment, or pruning and preserves existing
@@ -959,9 +964,10 @@ the new package dropped. `phora sync --frozen` replays from the cache. Package
 ownership survives updates, while hook trust remains tied to the actual commit.
 A source marked `transitive = true` still requires an explicit `imports` entry.
 
-A consumer can stage the canonical input, then call `henia build` from its ordinary
-`post_sync` hook and run a second Phora configuration to deploy the generated local
-directories. Compiler commands belong in hooks; generated output needs no Git
+A consumer can acquire pinned canonical inputs with `phora -C .phora/tropos sync`,
+then call `henia build ... --output .henia` from its ordinary `pre_sync` hook.
+The same outer sync deploys `.henia/claude`, `.henia/codex`, and other generated
+local directories; `post_sync` checks the deployed artifacts. Compiler commands belong in hooks; generated output needs no Git
 packaging or source-specific build setting.
 
 ### How composition works
