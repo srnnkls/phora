@@ -12,6 +12,7 @@ use crate::sync::state::{ArtifactRecord, StateStore};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookScope {
     PreSync,
+    PostPrepare,
     PreDeploy,
     OnChange,
     PostSync,
@@ -134,6 +135,34 @@ pub(super) fn dispatch_pre_sync(config: &Config, target_names: &str) -> Result<V
             scope: HookScope::PreSync,
             status,
         });
+    }
+    Ok(outcomes)
+}
+
+/// Runs the consumer's preparation gate in order, stopping at the first failure.
+pub(super) fn dispatch_post_prepare(config: &Config) -> Result<Vec<HookOutcome>> {
+    let Some(commands) = config.hooks.as_ref().and_then(|g| g.post_prepare.as_ref()) else {
+        return Ok(Vec::new());
+    };
+    let target_names = config
+        .targets
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut outcomes = Vec::new();
+    for hook in dedupe(commands) {
+        let status = run_hook(hook, &[("PHORA_TARGETS", &target_names)])?;
+        let (body, suffix) = hook_key(hook);
+        outcomes.push(HookOutcome {
+            hook_id: format!("post_prepare#{body}#{suffix}"),
+            command: hook.display(),
+            scope: HookScope::PostPrepare,
+            status,
+        });
+        if status == HookStatus::Failure {
+            break;
+        }
     }
     Ok(outcomes)
 }

@@ -10,7 +10,9 @@ pub mod journal;
 pub mod model;
 pub(crate) mod observe;
 mod plan;
+mod prepare;
 mod preview;
+pub(crate) use prepare::merge_lock_sets;
 pub mod progress;
 mod prune;
 mod rebuild;
@@ -263,13 +265,6 @@ impl RunOptions for SyncInput<'_> {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "legacy outcome details remain only for the cfg(test) compatibility adapter"
-    )
-)]
 struct SyncExecution {
     report: SyncReport,
     deploy_failures: bool,
@@ -527,6 +522,7 @@ fn decide_transitive_hooks(
 
 struct DeployAll<'a, R> {
     config: &'a Config,
+    target_scope: &'a prepare::TargetScope,
     parsed: &'a BTreeMap<String, ParsedSource>,
     remotes: &'a BTreeMap<String, String>,
     projection: &'a Projection,
@@ -536,6 +532,12 @@ struct DeployAll<'a, R> {
     backend: &'a dyn SourceStore,
     registry: &'a R,
     journal: &'a Journal,
+}
+
+impl<R: StateStore> DeployAll<'_, R> {
+    fn records(&self) -> Result<Vec<ArtifactRecord>> {
+        Ok(self.target_scope.select(self.registry.all_artifacts()?))
+    }
 }
 
 struct DeployProtocol<'a, R> {
@@ -651,7 +653,7 @@ where
     R: StateStore,
 {
     let mut swept = BTreeSet::new();
-    for record in ctx.registry.all_artifacts()? {
+    for record in ctx.records()? {
         let Some((address, admin_id)) = observe::history_address(&record)? else {
             continue;
         };
@@ -923,12 +925,11 @@ fn cross_target_overlap_diagnostic(
     .sync()
 }
 
-fn notify_orphans(
-    config: &Config,
-    registry: &dyn StateStore,
-    events: &mut SyncEvents,
-) -> Result<()> {
-    let count = orphan_records(config, registry)?.len();
+fn notify_orphans<R: StateStore>(deploy: &DeployAll<'_, R>, events: &mut SyncEvents) -> Result<()> {
+    let count = deploy
+        .target_scope
+        .select(orphan_records(deploy.config, deploy.registry)?)
+        .len();
     if count > 0 {
         events.push_warning(SyncWarning::OrphanedRecords { count });
     }
@@ -1119,10 +1120,6 @@ fn request_run_input<'a>(request: &'a SyncRequest<'a>, lockless: bool) -> SyncRu
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "top-level synchronization intentionally makes the ordered whole-run phases visible"
-)]
 fn sync_core<R>(
     input: &SyncRunInput<'_>,
     backend: &dyn SourceStore,
@@ -1135,6 +1132,7 @@ where
     let mut events = SyncEvents::new(input.sink());
     let mut effective_config = merged_config(input);
     effective_config.validate()?;
+    let mut preparation = prepare::Preparation::new(&effective_config)?;
     let pre_sync_outcomes = run_pre_sync(input, &effective_config)?;
     if pre_sync_outcomes
         .iter()
@@ -1169,15 +1167,83 @@ where
     )?;
     let hook_candidates = take_hook_candidates(&mut graph, &mut events);
     let import_refs = graph.import_refs.clone();
+    preparation.sources.append(&mut graph.prepare_sources);
     let instances = graph.inject(&mut effective_config, &mut parsed, &mut remotes);
     input.sink().phase_finished(Phase::Compose);
+
+    let workspace = SyncWorkspace {
+        config: effective_config,
+        target_scope: prepare::TargetScope::All,
+        parsed,
+        remotes,
+        instances,
+        import_refs,
+        hook_candidates,
+    };
+    if preparation.enabled(&workspace.config) {
+        prepare::sync(
+            input,
+            &workspace,
+            &preparation,
+            backend,
+            registry,
+            pre_sync_outcomes,
+            events,
+            started,
+        )
+    } else {
+        sync_workspace(
+            input,
+            workspace,
+            backend,
+            registry,
+            pre_sync_outcomes,
+            events,
+            started,
+        )
+    }
+}
+
+#[derive(Clone)]
+struct SyncWorkspace {
+    config: Config,
+    target_scope: prepare::TargetScope,
+    parsed: BTreeMap<String, ParsedSource>,
+    remotes: BTreeMap<String, String>,
+    instances: BTreeMap<String, String>,
+    import_refs: Vec<resolve::ImportResolution>,
+    hook_candidates: Vec<transitive::TransitiveHookCandidate>,
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the ordered resolve, project, and apply pipeline is shared by both phases"
+)]
+fn sync_workspace<R: StateStore>(
+    input: &SyncRunInput<'_>,
+    workspace: SyncWorkspace,
+    backend: &dyn SourceStore,
+    registry: &R,
+    pre_sync_outcomes: Vec<hooks::HookOutcome>,
+    mut events: SyncEvents<'_>,
+    started: std::time::Instant,
+) -> Result<SyncExecution> {
+    let SyncWorkspace {
+        config: effective_config,
+        target_scope,
+        parsed,
+        remotes,
+        instances,
+        import_refs,
+        hook_candidates,
+    } = workspace;
+    let effective_lock = effective_lock(input);
     for warning in validate_link_mode(input.base_config, &parsed, &remotes)? {
         events.push_warning(SyncWarning::LinkPathNotPortable {
             source: warning.source,
             path: warning.path,
         });
     }
-
     let local_names = local_source_names(input);
 
     let compat_registry: &dyn StateStore = registry;
@@ -1188,7 +1254,7 @@ where
 
     sweep_target_parents(&effective_config, &journal, compat_registry)?;
 
-    let recorded_after_recovery = live_recorded_artifacts(compat_registry)?;
+    let recorded_after_recovery = target_scope.select(live_recorded_artifacts(compat_registry)?);
 
     input.sink().phase_started(Phase::Resolve);
     let routed = resolve_sources(
@@ -1255,6 +1321,7 @@ where
     let deploy = DeployProtocol {
         workspace: DeployAll {
             config: &effective_config,
+            target_scope: &target_scope,
             parsed: &parsed,
             remotes: &remotes,
             projection: &projection,
@@ -1320,7 +1387,7 @@ where
     let mut had_failures = run.had_failures;
     let registry: &dyn StateStore = deploy.registry;
     if !deploy.input.prune() {
-        notify_orphans(deploy.config, registry, &mut run.events)?;
+        notify_orphans(deploy, &mut run.events)?;
     }
 
     deploy.input.sink().phase_started(Phase::Hooks);

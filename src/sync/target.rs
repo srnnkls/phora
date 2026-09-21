@@ -1431,6 +1431,7 @@ mod confine_fail_closed_tests {
             imports: None,
             take: None,
             collapse: None,
+            phase: None,
             confine: None,
         }
     }
@@ -1529,6 +1530,7 @@ mod kind_aware_layout_tests {
             imports: None,
             take: None,
             collapse: None,
+            phase: None,
             confine: None,
         }
     }

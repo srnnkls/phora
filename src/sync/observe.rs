@@ -60,7 +60,7 @@ where
             Ok(false)
         })?;
     }
-    for record in registry_only_records(ctx.input.prune(), || Ok(registry.all_artifacts()?))? {
+    for record in registry_only_records(ctx.input.prune(), || ctx.records())? {
         let triplet = (
             record.key.target.clone(),
             record.key.source.clone(),
@@ -95,7 +95,7 @@ where
     R: StateStore,
 {
     let mut retirements = Vec::new();
-    for record in ctx.registry.all_artifacts()? {
+    for record in ctx.records()? {
         if !record.history {
             continue;
         }

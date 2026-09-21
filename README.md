@@ -293,8 +293,8 @@ Non-interactive runs skip such files unless `--force` is given.
 
 `phora -C <directory> <command>` (or `--directory`) selects a project before
 loading configuration or state. Both `phora.toml` and `phora.local.toml`, relative
-source/target paths, locks, and hooks use that directory. This also lets a hook
-acquire inputs from a separate project without shell directory changes.
+source/target paths, locks, and hooks use that directory. Use `phase = "prepare"` and `post_prepare` when a generator needs inputs
+from the same project (see below).
 
 The global `[hooks] pre_sync` runs before sources are resolved or files selected,
 so it can generate local source directories for the same sync. A failure stops
@@ -964,11 +964,75 @@ the new package dropped. `phora sync --frozen` replays from the cache. Package
 ownership survives updates, while hook trust remains tied to the actual commit.
 A source marked `transitive = true` still requires an explicit `imports` entry.
 
-A consumer can acquire pinned canonical inputs with `phora -C .phora/tropos sync`,
-then call `henia build ... --output .henia` from its ordinary `pre_sync` hook.
-The same outer sync deploys `.henia/claude`, `.henia/codex`, and other generated
-local directories; `post_sync` checks the deployed artifacts. Compiler commands belong in hooks; generated output needs no Git
-packaging or source-specific build setting.
+### Prepare inputs before generating deployment sources
+
+A target with `phase = "prepare"` materializes its inputs before the consumer's
+`post_prepare` hook. Imported targets inherit their consumer's phase, including
+nested dependencies. The default phase is `"deploy"`.
+
+One root config pair can stage Tropos and its transitive Loqui dependency, run
+Henia, and deploy generated skills. In `phora.toml`:
+
+```toml
+[hooks]
+post_prepare = "henia --config .phora-inputs/tropos/henia.toml build .phora-inputs/tropos --output .henia"
+post_sync = "scrut test tests/scrut/artifacts.md"
+
+[sources.tropos]
+path = "~/projects/tropos"
+branch = "prototype/henia-phora"
+transitive = true
+
+[sources.claude]
+path = "./.henia/claude"
+deploy = "link"
+
+[sources.codex]
+path = "./.henia/codex"
+deploy = "link"
+```
+
+Machine-local destinations belong in the adjacent `phora.local.toml`. This
+example deliberately uses a repository-local home:
+
+```toml
+[targets.tropos]
+phase = "prepare"
+path = ".phora-inputs/tropos"
+imports = ["tropos"]
+
+[targets.claude]
+path = ".probe/home/.claude"
+sources.claude = { collapse = false }
+
+[targets.codex]
+path = ".probe/home/.codex"
+sources.codex = { collapse = false }
+```
+
+`phora sync` runs `pre_sync`, composes package manifests, prepares input targets,
+runs `post_prepare`, then resolves and deploys the remaining sources and runs
+`post_sync`. Generated directories can be absent on the first run. Each phase
+uses the existing reconciliation, ownership, recovery, and target-hook rules;
+preparation does not prune deployment records. The two phases must have separate
+destination trees, including through symlink aliases.
+
+A preparation failure or skipped input stops before `post_prepare`. A failing
+`post_prepare` command stops the remaining commands and the deployment phase.
+Already prepared files and their new pins remain available for retry; unvisited
+deployment pins are retained. Hooks execute arbitrary commands, so their side
+effects are not rolled back. Keep canonical inputs outside a compiler's clean
+output directory, and have the compiler publish output only after a successful
+build. `post_prepare` runs once per sync, regardless of `hooks.when`, with
+`PHORA_TARGETS` listing the consumer targets. `--no-hooks` suppresses it along
+with all other hooks; a frozen replay with that flag needs generated output to
+already exist.
+
+Ordinary `phora sync --prune` uses the current pins. To advance Tropos and remove
+both dropped inputs and obsolete generated links in one run, use
+`phora update tropos --fast-forward --prune`. Pruning remains opt-in and preserves
+foreign files. Compilation stays in a normal hook; no nested Phora invocation,
+wrapper, or source-specific build API is needed.
 
 ### How composition works
 

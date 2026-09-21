@@ -29,6 +29,7 @@ pub type ResolvedSourceMap = BTreeMap<(String, String), ResolvedSource>;
 #[derive(Debug, Clone)]
 pub(super) struct ImportResolution {
     pub source: String,
+    pub phase: crate::config::TargetPhase,
     pub refspec: Refspec,
     pub commit: Option<String>,
 }

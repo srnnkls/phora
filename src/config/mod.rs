@@ -31,7 +31,7 @@ pub use migrate::MigrationWarning;
 pub use source::{DeployMode, Offer, ParsedSource, Refspec, Remote, Source, SourceMode};
 pub use target::{
     Binding, Import, LayoutConfig, LayoutKind, ResolvedBinding, SourceFields, TakeEntry, Target,
-    TemplateOptIn,
+    TargetPhase, TemplateOptIn,
 };
 
 fn expand_home(path: &Path) -> PathBuf {

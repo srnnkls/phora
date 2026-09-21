@@ -137,6 +137,9 @@ pub enum Command {
     /// Bump the lock to latest, then sync.
     Update {
         source: Option<String>,
+        /// Remove managed artifacts absent after updating, including generated links.
+        #[arg(long)]
+        prune: bool,
         /// Follow a moved pin: delete artifacts the new commit dropped instead of erroring.
         #[arg(long)]
         fast_forward: bool,
@@ -473,8 +476,9 @@ fn dispatch_sync(cmd: Command) -> Result<CliOutcome> {
         ),
         Command::Update {
             source,
+            prune,
             fast_forward,
-        } => sync::run_update(source.as_deref(), fast_forward),
+        } => sync::run_update(source.as_deref(), fast_forward, prune),
         _ => unreachable!("dispatch_sync only receives Sync or Update"),
     }
 }

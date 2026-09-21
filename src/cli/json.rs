@@ -205,6 +205,7 @@ impl ProgressSink for JsonSink {
             "command": outcome.command,
             "scope": match outcome.scope {
                 crate::sync::HookScope::PreSync => "pre_sync",
+                crate::sync::HookScope::PostPrepare => "post_prepare",
                 crate::sync::HookScope::PreDeploy => "pre_deploy",
                 crate::sync::HookScope::OnChange => "on_change",
                 crate::sync::HookScope::PostSync => "post_sync",
