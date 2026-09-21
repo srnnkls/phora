@@ -30,7 +30,7 @@ pub use host::{AuthConfig, Host, RemoteConfig, builtin_forges};
 pub use migrate::MigrationWarning;
 pub use source::{DeployMode, Offer, ParsedSource, Refspec, Remote, Source, SourceMode};
 pub use target::{
-    Binding, LayoutConfig, LayoutKind, ResolvedBinding, SourceFields, TakeEntry, Target,
+    Binding, Import, LayoutConfig, LayoutKind, ResolvedBinding, SourceFields, TakeEntry, Target,
     TemplateOptIn,
 };
 
@@ -178,12 +178,18 @@ impl Config {
 
     fn validate_imports(&self) -> Result<()> {
         for (target_name, target) in &self.targets {
-            for imported in target.imports.iter().flatten() {
+            for import in target.imports.iter().flatten() {
+                let imported = &import.source;
                 let Some(source) = self.sources.get(imported) else {
                     return Err(Error::Config(format!(
                         "target `{target_name}`: imports references undefined source `{imported}`"
                     )));
                 };
+                if source.url.is_some() && import.refspec.is_some() {
+                    return Err(Error::Config(format!(
+                        "import `{imported}`: a URL source cannot select a Git ref"
+                    )));
+                }
                 if !source.is_transitive() {
                     return Err(Error::Config(format!(
                         "target `{target_name}`: imports `{imported}` requires a transitive source \
@@ -202,18 +208,26 @@ impl Config {
         Ok(())
     }
 
-    /// Every transitive source must be reached through a binding or explicit import.
+    /// A flat fetch bypasses the recursive pre-pass, so a `transitive = true` source that
+    /// no target imports is a silent downgrade past escape-remote rejection and depth fail-fast.
     fn validate_transitive_sources_are_mounted(&self) -> Result<()> {
         for (name, source) in &self.sources {
             if !source.is_transitive() {
                 continue;
             }
-            if self.is_imported_anywhere(name) || self.flat_binder_of(name).is_some() {
+            if self.is_imported_anywhere(name) {
                 continue;
             }
+            if let Some(target_name) = self.flat_binder_of(name) {
+                return Err(Error::Config(format!(
+                    "source `{name}` is `transitive = true` but flat-bound by target \
+                     `{target_name}` via `sources` and never imported; a transitive source \
+                     must be mounted via a target's `imports`, not flat-bound"
+                )));
+            }
             return Err(Error::Config(format!(
-                "source `{name}` is `transitive = true` but no target binds or imports it; a transitive \
-                 source must be reached through `sources` or `imports`"
+                "source `{name}` is `transitive = true` but no target imports it; a transitive \
+                 source must be mounted via a target's `imports` or it is never resolved"
             )));
         }
         Ok(())
@@ -222,7 +236,7 @@ impl Config {
     fn is_imported_anywhere(&self, name: &str) -> bool {
         self.targets
             .values()
-            .any(|target| target.imports.iter().flatten().any(|i| i == name))
+            .any(|target| target.imports.iter().flatten().any(|i| i.source == name))
     }
 
     fn flat_binder_of(&self, name: &str) -> Option<&str> {

@@ -1168,6 +1168,7 @@ where
         },
     )?;
     let hook_candidates = take_hook_candidates(&mut graph, &mut events);
+    let import_refs = graph.import_refs.clone();
     let instances = graph.inject(&mut effective_config, &mut parsed, &mut remotes);
     input.sink().phase_finished(Phase::Compose);
     for warning in validate_link_mode(input.base_config, &parsed, &remotes)? {
@@ -1195,6 +1196,7 @@ where
         &parsed,
         &remotes,
         &instances,
+        &import_refs,
         effective_lock.as_ref(),
         backend,
         input.refresh_sources(),

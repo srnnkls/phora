@@ -218,9 +218,12 @@ fn imports_accepts_a_bare_source_name_list() {
     let config = Config::parse(toml).expect("a bare-name imports list must parse");
     let target = config.targets.get("home").expect("target `home` present");
     assert_eq!(
-        target.imports,
-        Some(vec!["dep".to_string()]),
-        "`imports` must type as a flat Vec<String> and carry the exact bare source names"
+        target.imports.as_ref().map(|imports| imports
+            .iter()
+            .map(|i| i.source.as_str())
+            .collect::<Vec<_>>()),
+        Some(vec!["dep"]),
+        "bare imports must carry the exact source names"
     );
 }
 
@@ -277,13 +280,21 @@ fn imports_reference_to_a_non_transitive_source_is_rejected() {
 }
 
 #[test]
-fn transitive_source_bound_via_sources_is_valid() {
-    let toml = "[sources.dep]\ngit = \"https://github.com/me/d.git\"\ntransitive = true\n\n\
+fn transitive_source_flat_bound_via_sources_is_rejected() {
+    let toml = "version = 1\n\n[sources.dep]\ngit = \"https://github.com/me/d.git\"\ntransitive = true\n\n\
                 [targets.home]\npath = \"~/deploy\"\nsources = [\"dep\"]\n";
-    Config::parse(toml)
-        .expect("valid TOML")
-        .validate()
-        .expect("a bound transitive source deploys its own files and its dependencies");
+    let config = Config::parse(toml).expect("structurally valid TOML");
+    let err = config.validate().expect_err(
+        "a transitive source flat-bound via `sources` (never imported) must be rejected: \
+                     it would be silently flat-downgraded, bypassing escape-remote rejection",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("dep")
+            && msg.contains("transitive")
+            && (msg.contains("sources") || msg.contains("flat")),
+        "the rejection must name `dep`, mark it transitive, and explain it cannot be flat-bound via `sources`, got: {msg}"
+    );
 }
 
 #[test]

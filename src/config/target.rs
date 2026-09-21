@@ -102,6 +102,81 @@ impl<'de> Deserialize<'de> for TemplateOptIn {
     }
 }
 
+/// An explicit package import. Refinements select a Git ref, never paths or remotes.
+#[derive(Debug, Clone)]
+pub struct Import {
+    pub source: String,
+    pub refspec: Option<Refspec>,
+}
+
+impl<'de> Deserialize<'de> for Import {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Refined {
+            source: String,
+            branch: Option<String>,
+            tag: Option<String>,
+            rev: Option<String>,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Name(String),
+            Refined(Refined),
+        }
+        let (source, refs) = match Wire::deserialize(deserializer)? {
+            Wire::Name(source) => (source, Vec::new()),
+            Wire::Refined(value) => (
+                value.source,
+                [
+                    value.branch.map(Refspec::Branch),
+                    value.tag.map(Refspec::Tag),
+                    value.rev.map(Refspec::Rev),
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
+            ),
+        };
+        if source.is_empty() || refs.len() > 1 || refs.iter().any(|r| r.to_string().is_empty()) {
+            return Err(serde::de::Error::custom(
+                "an import needs a source and at most one nonempty branch, tag or rev",
+            ));
+        }
+        Ok(Self {
+            source,
+            refspec: refs.into_iter().next(),
+        })
+    }
+}
+
+impl Import {
+    /// Refines only the ref of an already resolved source.
+    pub(crate) fn resolve(&self, source: &ParsedSource) -> crate::error::Result<ParsedSource> {
+        let Some(refspec) = &self.refspec else {
+            return Ok(source.clone());
+        };
+        if source.mode() == super::SourceMode::Url {
+            return Err(crate::error::Error::Config(format!(
+                "import `{}`: a URL source cannot select a Git ref",
+                self.source
+            )));
+        }
+        let mut source = source.clone();
+        source.branch = None;
+        source.tag = None;
+        source.rev = None;
+        match refspec {
+            Refspec::Branch(value) => source.branch = Some(value.clone()),
+            Refspec::Tag(value) => source.tag = Some(value.clone()),
+            Refspec::Rev(value) => source.rev = Some(value.clone()),
+            Refspec::Default | Refspec::None => {}
+        }
+        Ok(source)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Target {
@@ -112,7 +187,7 @@ pub struct Target {
     #[serde(default)]
     pub hooks: Option<TargetHooks>,
     #[serde(default)]
-    pub imports: Option<Vec<String>>,
+    pub imports: Option<Vec<Import>>,
     #[serde(default)]
     pub take: Option<BTreeMap<String, Vec<TakeEntry>>>,
     #[serde(default)]
@@ -669,7 +744,7 @@ mod tests {
     }
 
     #[test]
-    fn mount_take_table_parses_anchor_keyed_while_imports_stays_string_list() {
+    fn mount_take_table_accepts_bare_imports() {
         let target: Target = toml::from_str(
             "path = \"~/dst\"\n\
              imports = [\"dep-a\", \"dep-b\"]\n\
@@ -680,10 +755,12 @@ mod tests {
         .expect("a target with a mount take table deserializes");
 
         assert_eq!(
-            target.imports,
-            Some(vec!["dep-a".to_string(), "dep-b".to_string()]),
-            "`imports` stays a refinement-free Vec<String>; got: {:?}",
-            target.imports
+            target.imports.as_ref().map(|imports| imports
+                .iter()
+                .map(|i| i.source.as_str())
+                .collect::<Vec<_>>()),
+            Some(vec!["dep-a", "dep-b"]),
+            "bare imports preserve their source names"
         );
 
         let take = target
@@ -853,7 +930,7 @@ mod tests {
     }
 
     #[test]
-    fn mount_collapse_table_parses_anchor_keyed_while_imports_stays_string_list() {
+    fn mount_collapse_table_accepts_bare_imports() {
         let target: Target = toml::from_str(
             "path = \"~/dst\"\n\
              imports = [\"dep-a\", \"dep-b\"]\n\
@@ -864,10 +941,12 @@ mod tests {
         .expect("a target with a mount collapse table deserializes");
 
         assert_eq!(
-            target.imports,
-            Some(vec!["dep-a".to_string(), "dep-b".to_string()]),
-            "`imports` stays a refinement-free Vec<String>; got: {:?}",
-            target.imports
+            target.imports.as_ref().map(|imports| imports
+                .iter()
+                .map(|i| i.source.as_str())
+                .collect::<Vec<_>>()),
+            Some(vec!["dep-a", "dep-b"]),
+            "bare imports preserve their source names"
         );
         let collapse = target
             .collapse

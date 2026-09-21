@@ -695,14 +695,14 @@ mod t029_callable_boundary_probe {
             .expect("path source DTO parses");
         let parsed = ParsedSource::parse("escape", &raw).expect("path source parses");
         let error = super::transitive::validate_dependency_remote(
-            "escape", &parsed, "/etc", 1,
+            "escape", &parsed, "/etc", 2,
         )
         .expect_err("an escaping transitive path must be rejected by the source boundary");
         assert!(error.to_string().contains("transitive remote not allowed"));
         assert_eq!(super::T029_VALIDATE_CALLS.load(Ordering::SeqCst), 1);
         assert_eq!(
             *super::T029_VALIDATE_ARGS.lock().expect("validate args"),
-            [("escape".to_owned(), "/etc".to_owned(), 1, true)]
+            [("escape".to_owned(), "/etc".to_owned(), 2, true)]
         );
     }
 }
@@ -3306,8 +3306,16 @@ fn sync_has_no_duplicate_source_transitive_implementation() {
 #[test]
 fn source_transitive_carve_preserves_manifest_and_remote_behavior() {
     let rejected = transitive_fixture();
-    let escaping = "version = 1\n\n[sources.dep]\npath = \"/etc\"\ntransitive = true\n\n\
-                    [targets.home]\npath = \"~/deploy\"\nimports = [\"dep\"]\n";
+    let escaping_dep = tempfile::TempDir::new().expect("escaping dependency");
+    commit_transitive_manifest(
+        escaping_dep.path(),
+        "[sources.private]\npath = \"/etc\"\n",
+        "version = 2\n",
+    );
+    let escaping = format!(
+        "[sources.dep]\npath = {:?}\ntransitive = true\n\n[targets.home]\npath = \"~/deploy\"\nimports = [\"dep\"]\n",
+        escaping_dep.path().to_string_lossy(),
+    );
     write_fixture(&rejected.cwd.path().join("phora.toml"), escaping.as_bytes());
     let rejected_output = run_phora(&rejected, &["sync"]);
     let rejected_stderr = String::from_utf8_lossy(&rejected_output.stderr);

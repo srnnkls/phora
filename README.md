@@ -902,32 +902,58 @@ source, and deploys loqui's artifacts (its `languages/` and `resources/` trees) 
 One `imports` line, and tropos's dependency rode along. A target can import several at
 once — `imports = ["tropos", "work-config"]` — each composing under the same anchor.
 
-### Binding a package with its dependencies
+### Importing a locally built package
 
-Use `transitive = true` on a normally bound source to deploy both its own
-artifacts and the targets advertised in its `phora.toml`:
+One source can supply several consumers through explicit imports. A bare name
+uses the source's default ref; a table can select a `branch`, `tag`, or `rev`:
 
 ```toml
 [sources.tropos]
 path = ".build/tropos"
 transitive = true
-exclude = ["phora.toml"]
 
 [targets.claude]
 path = "~/.claude"
-sources.tropos = { branch = "claude", collapse = false }
+imports = ["tropos"]
 
 [targets.codex]
 path = "~/.codex"
-sources.tropos = { branch = "codex", collapse = false }
+imports = [{ source = "tropos", branch = "codex" }]
 ```
 
-Each binding reads the dependency manifest at its own selected ref. The package
-and dependency pins replay together with `--frozen`. A directly bound local
-source is consumer-selected; dependency-owned local paths and escaping target
-paths remain rejected. Nested bound sources follow the same composition rules.
-Use `imports` when only the dependency's advertised targets should be mounted;
-do not both import and bind the same source in one target.
+The package advertises relative targets for both its own artifacts and its
+dependencies. Inside that imported manifest, `path = "."` means the package's
+committed snapshot, never the consumer's working directory or uncommitted files:
+
+```toml
+# .build/tropos/phora.toml, committed alongside the compiled artifacts
+[sources.tropos]
+path = "."
+exclude = ["phora.toml"]
+
+[sources.loqui]
+repo = "srnnkls/loqui"
+include = ["README.md", "languages/**", "resources/**"]
+
+[targets.tropos]
+path = "."
+sources.tropos = { collapse = false }
+
+[targets.loqui]
+path = "skills/loqui/reference/loqui"
+sources.loqui = { collapse = false }
+```
+
+A package's self source cannot select another ref, enable transitive resolution,
+or use link mode. Other dependency-owned local paths and escaping destinations
+remain rejected. Import refinements accept only a source name and one Git ref;
+paths, remotes, renames and root overrides are not import options.
+
+Package artifacts and their manifests use the same pin. Ordinary sync preserves
+that pin; `phora update tropos --fast-forward` advances it and removes resources
+the new package dropped. `phora sync --frozen` replays from the cache. Package
+ownership survives rebuilds, while hook trust remains tied to the actual commit.
+A source marked `transitive = true` still requires an explicit `imports` entry.
 
 ### How composition works
 

@@ -119,7 +119,7 @@ pub struct Instance {
     source_name: String,
     anchor_target: String,
     fetch_node: FetchNode,
-    bound: bool,
+    package: bool,
 }
 
 impl Instance {
@@ -135,22 +135,31 @@ impl Instance {
             source_name: source_name.to_owned(),
             anchor_target: anchor_target.to_owned(),
             fetch_node,
-            bound: false,
+            package: false,
         }
     }
 
-    /// A source binding keeps dependency ownership stable when its package is rebuilt.
-    /// Hook trust remains pinned separately to `fetch_node.commit()`.
+    /// Packages that export their own snapshot keep artifact ownership across rebuilds.
+    /// The actual commit remains in the fetch node and hook trust preimage.
     #[must_use]
-    pub fn for_binding(
+    pub fn for_package(
         parent: &str,
         source_name: &str,
         anchor_target: &str,
         fetch_node: FetchNode,
     ) -> Self {
         Self {
-            bound: true,
+            package: true,
             ..Self::new(parent, source_name, anchor_target, fetch_node)
+        }
+    }
+
+    /// Export names identify package members independently of traversal order.
+    pub(crate) fn member_key(&self, name: &str, counter: usize) -> String {
+        if self.package {
+            format!("{}%{name}", self.stable_key())
+        } else {
+            format!("{}%{counter}%{name}", self.stable_key())
         }
     }
 
@@ -169,8 +178,8 @@ impl Instance {
             self.anchor_target.as_str(),
             self.fetch_node.url.as_str(),
             self.fetch_node.r#ref.as_str(),
-            if self.bound {
-                "bound"
+            if self.package {
+                "package"
             } else {
                 self.fetch_node.commit.as_str()
             },

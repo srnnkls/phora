@@ -17,8 +17,8 @@ use crate::source::{
     Commit, ResolvePolicy, ResolveRequest, RevisionSpec, SourceLocation, SourceName, SourceStore,
 };
 
-use super::{effective_protocol, resolved_remotes};
-use crate::lock::{encode_ref, entry_matches, ref_discriminator};
+use super::resolve::ImportResolution;
+use super::resolved_remotes;
 
 /// Named-diagnostic phrase emitted when two composed dep targets land on one destination.
 const COMPOSED_DEST_COLLISION: &str = "composed targets resolve to the same destination";
@@ -74,6 +74,7 @@ pub(crate) struct ResolvedGraph {
     /// Namespaced source name → owning `Instance.stable_key()`; the lock stamps this so
     /// a transitive node is keyed by its instance, not a bare name that never lines up.
     pub(super) instances: BTreeMap<String, String>,
+    pub(super) import_refs: Vec<ImportResolution>,
     pub(super) hook_candidates: Vec<TransitiveHookCandidate>,
     pub(super) hook_diagnostics: Vec<HookAdmissionDiagnostic>,
 }
@@ -195,7 +196,11 @@ pub(super) fn resolve_transitive_graph(
     frozen: bool,
     effective_lock: Option<&crate::lock::Lock>,
 ) -> Result<ResolvedGraph> {
-    if !parsed.values().any(ParsedSource::is_transitive) {
+    let has_imports = config
+        .targets
+        .values()
+        .any(|t| t.imports.iter().flatten().next().is_some());
+    if !has_imports {
         return Ok(ResolvedGraph::default());
     }
     let remotes = resolved_remotes(config, parsed)?;
@@ -208,67 +213,58 @@ pub(super) fn resolve_transitive_graph(
     let mut counter: usize = 0;
 
     for (anchor_name, anchor) in &config.targets {
-        for (imported, source, bound) in dependency_edges(anchor, parsed)? {
-            let imported = imported.as_str();
+        for import in anchor.imports.iter().flatten() {
+            let imported = import.source.as_str();
+            let source = parsed.get(imported).ok_or_else(|| {
+                Error::Config(format!("no resolved source for imported `{imported}`"))
+            })?;
+            let base = source;
+            let source = import.resolve(base)?;
             let remote = remotes.get(imported).map(String::as_str).ok_or_else(|| {
                 Error::Config(format!("no resolved remote for source `{imported}`"))
             })?;
-            // A directly bound local source is selected by the consumer. Dependency-owned
-            // paths still pass the recursive remote and destination confinement checks.
-            if !bound || !matches!(source.remote, Remote::Path(_)) {
-                crate::source::transitive::validate_dependency_remote(
-                    imported, &source, remote, 1,
-                )?;
-            }
-            let (commit, manifest) = if bound {
-                let base = &parsed[imported];
-                let discriminator = ref_discriminator(&source.refspec(), &base.refspec());
-                let locked = effective_lock
-                    .and_then(|lock| lock.find_entry(imported, discriminator.as_deref()))
-                    .filter(|entry| {
-                        entry_matches(
-                            base,
-                            &source.refspec(),
-                            entry,
-                            &config.hosts,
-                            effective_protocol(base, config),
-                        )
-                    });
-                if frozen && locked.is_none() {
-                    return Err(frozen_transitive_miss(imported, 1));
-                }
-                crate::source::transitive::acquire_dependency_manifest(
-                    backend,
-                    &SourceName::trusted(imported.to_owned()),
-                    &source,
-                    remote,
-                    locked.map(|entry| entry.commit.as_str()),
-                )
-                .map_err(|source| Error::TransitiveSource {
-                    name: imported.to_owned(),
-                    depth: 1,
-                    source,
-                })?
-            } else {
-                fetch_manifest(imported, &source, remote, backend, 1, &frozen_gate)?
-            };
-            let identity_ref = if bound {
-                encode_ref(&source.refspec())
-            } else {
-                source.refspec().to_string()
-            };
-            let node = FetchNode::new(remote, &identity_ref, &commit);
-            visited.insert(node.clone());
-            let instance = if bound {
-                Instance::for_binding("root", imported, anchor_name, node)
-            } else {
-                Instance::new("root", imported, anchor_name, node)
-            };
+            crate::source::transitive::validate_dependency_remote(imported, &source, remote, 1)?;
+            let discriminator = crate::lock::ref_discriminator(&source.refspec(), &base.refspec());
+            let locked = effective_lock
+                .and_then(|lock| lock.find_entry(imported, discriminator.as_deref()))
+                .filter(|entry| {
+                    crate::lock::entry_matches(
+                        base,
+                        &source.refspec(),
+                        entry,
+                        &config.hosts,
+                        super::effective_protocol(base, config),
+                    )
+                });
+            let (commit, manifest) = acquire_import_manifest(
+                imported,
+                &source,
+                remote,
+                backend,
+                frozen,
+                locked.map(|entry| entry.commit.as_str()),
+            )?;
+            graph.import_refs.push(ImportResolution {
+                source: imported.to_owned(),
+                refspec: source.refspec(),
+                commit: Some(commit.clone()),
+            });
+            let instance = package_instance(
+                "root",
+                imported,
+                anchor_name,
+                remote,
+                &source.refspec(),
+                &commit,
+                &manifest,
+            );
+            visited.insert(instance.fetch_node().clone());
             compose_dep(
                 &instance,
                 anchor,
                 imported,
                 &manifest,
+                remote,
                 &mut WalkCtx {
                     backend,
                     visited: &mut visited,
@@ -288,51 +284,44 @@ pub(super) fn resolve_transitive_graph(
     Ok(graph)
 }
 
-/// Explicit imports mount only dependencies; bound transitive sources also keep their
-/// own artifacts. Refined bindings read the manifest from that same effective ref.
-fn dependency_edges(
-    target: &Target,
-    parsed: &BTreeMap<String, ParsedSource>,
-) -> Result<Vec<(String, ParsedSource, bool)>> {
-    let mut edges = Vec::new();
-    let mut seen = HashSet::new();
-    for imported in target.imports.iter().flatten() {
-        let source = parsed.get(imported).ok_or_else(|| {
-            Error::Config(format!("no resolved source for imported `{imported}`"))
-        })?;
-        seen.insert((imported.clone(), encode_ref(&source.refspec())));
-        edges.push((imported.clone(), source.clone(), false));
+/// Packages keep manifest and artifacts pinned together; manifest-only imports retain
+/// their existing refresh-on-sync behavior.
+fn acquire_import_manifest(
+    imported: &str,
+    source: &ParsedSource,
+    remote: &str,
+    backend: &dyn SourceStore,
+    frozen: bool,
+    pin: Option<&str>,
+) -> Result<(String, TransitiveManifest)> {
+    if frozen && pin.is_none() {
+        return Err(frozen_transitive_miss(imported, 1));
     }
-    for binding in target.resolve_sources(parsed) {
-        let source = &parsed[binding.source];
-        if !source.is_transitive() {
-            continue;
-        }
-        if source.deploy_mode() == DeployMode::Link {
-            return Err(Error::Config(format!(
-                "source `{}`: {TRANSITIVE_LINK_REJECTED}",
-                binding.source
-            )));
-        }
-        if !seen.insert((
-            binding.source.to_owned(),
-            encode_ref(&binding.effective_ref),
-        )) {
-            continue;
-        }
-        let mut source = source.clone();
-        source.branch = None;
-        source.tag = None;
-        source.rev = None;
-        match binding.effective_ref {
-            Refspec::Branch(branch) => source.branch = Some(branch),
-            Refspec::Tag(tag) => source.tag = Some(tag),
-            Refspec::Rev(rev) => source.rev = Some(rev),
-            Refspec::Default | Refspec::None => {}
-        }
-        edges.push((binding.source.to_owned(), source, true));
+    let read_manifest = |pin: Option<&str>| {
+        crate::source::transitive::acquire_dependency_manifest(
+            backend,
+            &SourceName::trusted(imported.to_owned()),
+            source,
+            remote,
+            pin,
+        )
+        .map_err(|source| Error::TransitiveSource {
+            name: imported.to_owned(),
+            depth: 1,
+            source,
+        })
+    };
+    let (commit, manifest) = read_manifest(pin)?;
+    if !frozen
+        && pin.is_some()
+        && !manifest
+            .sources
+            .values()
+            .any(|source| source.path.as_deref() == Some("."))
+    {
+        return read_manifest(None);
     }
-    Ok(edges)
+    Ok((commit, manifest))
 }
 
 /// [`resolve_transitive_graph`] under the frozen gate: lock-pinned commits, mirror-only reads, no fetch.
@@ -374,6 +363,7 @@ fn compose_dep(
     anchor: &Target,
     imported: &str,
     manifest: &TransitiveManifest,
+    package_remote: &str,
     ctx: &mut WalkCtx<'_>,
     depth: usize,
 ) -> Result<()> {
@@ -385,11 +375,18 @@ fn compose_dep(
         .targets
         .values()
         .flat_map(|t| t.imports.iter().flatten())
-        .map(String::as_str)
+        .map(|import| import.source.as_str())
         .collect();
 
-    let source_names =
-        namespace_dep_sources(instance, imported, manifest, &imported_inner, ctx, depth)?;
+    let source_names = namespace_dep_sources(
+        instance,
+        imported,
+        manifest,
+        &imported_inner,
+        package_remote,
+        ctx,
+        depth,
+    )?;
 
     let mount = MountOverride {
         take: anchor
@@ -416,6 +413,7 @@ fn compose_dep(
         }
         compose_nested_imports(
             instance,
+            imported,
             dep_target_name,
             dep_target,
             &composed_path,
@@ -457,12 +455,13 @@ fn namespace_dep_sources(
     imported: &str,
     manifest: &TransitiveManifest,
     imported_inner: &HashSet<&str>,
+    package_remote: &str,
     ctx: &mut WalkCtx<'_>,
     depth: usize,
 ) -> Result<BTreeMap<String, String>> {
     let mut source_names: BTreeMap<String, String> = BTreeMap::new();
     for (inner_name, inner) in &manifest.sources {
-        let parsed = ParsedSource::parse(inner_name, inner).map_err(|e| {
+        let mut parsed = ParsedSource::parse(inner_name, inner).map_err(|e| {
             Error::Config(format!("imported `{imported}`: source `{inner_name}`: {e}"))
         })?;
         if parsed.deploy_mode() == DeployMode::Link {
@@ -470,30 +469,65 @@ fn namespace_dep_sources(
                 "imported `{imported}`: source `{inner_name}`: {TRANSITIVE_LINK_REJECTED}"
             )));
         }
-        let remote = inner_remote(
-            inner_name,
-            &parsed,
-            ctx.consumer_hosts,
-            ctx.default_protocol,
-        )
-        .map_err(|e| Error::Config(format!("imported `{imported}`: source `{inner_name}`: {e}")))?;
-        crate::source::transitive::validate_dependency_remote(
-            inner_name,
-            &parsed,
-            &remote,
-            depth + 1,
-        )?;
+        let is_self = matches!(&parsed.remote, Remote::Path(path) if path == ".");
+        let remote = if is_self {
+            let refined_binding = manifest
+                .targets
+                .values()
+                .flat_map(|t| t.sources.iter().flatten())
+                .any(|(identity, binding)| {
+                    binding.effective_source(identity) == inner_name
+                        && (binding.branch.is_some()
+                            || binding.tag.is_some()
+                            || binding.rev.is_some())
+                });
+            if parsed.is_transitive()
+                || inner.branch.is_some()
+                || inner.tag.is_some()
+                || inner.rev.is_some()
+                || refined_binding
+            {
+                return Err(Error::Config(format!(
+                    "imported `{imported}`: self source `{inner_name}` must use its package snapshot without a ref or transitive flag"
+                )));
+            }
+            parsed.remote = Remote::Git(package_remote.to_owned());
+            parsed.rev = Some(instance.fetch_node().commit().to_owned());
+            package_remote.to_owned()
+        } else {
+            let remote = inner_remote(
+                inner_name,
+                &parsed,
+                ctx.consumer_hosts,
+                ctx.default_protocol,
+            )?;
+            crate::source::transitive::validate_dependency_remote(
+                inner_name,
+                &parsed,
+                &remote,
+                depth + 1,
+            )?;
+            remote
+        };
         let composed_by_nested_import =
             inner.is_transitive() && imported_inner.contains(inner_name.as_str());
-        let bound = manifest
-            .targets
-            .values()
-            .any(|target| target.declared_sources().any(|source| source == inner_name));
-        if inner.is_transitive() && !composed_by_nested_import && !bound && !ctx.frozen.frozen {
+        if inner.is_transitive() && !composed_by_nested_import && !ctx.frozen.frozen {
             descend_for_validation(inner_name, &parsed, &remote, ctx, depth + 1)?;
         }
         *ctx.counter += 1;
         let namespaced = namespaced_key(instance, inner_name, *ctx.counter);
+        for import in manifest
+            .targets
+            .values()
+            .flat_map(|t| t.imports.iter().flatten())
+            .filter(|i| i.source == *inner_name)
+        {
+            ctx.graph.import_refs.push(ImportResolution {
+                source: namespaced.clone(),
+                refspec: import.resolve(&parsed)?.refspec(),
+                commit: None,
+            });
+        }
         ctx.graph.remotes.insert(namespaced.clone(), remote);
         ctx.graph.sources.insert(namespaced.clone(), parsed);
         ctx.graph
@@ -506,8 +540,13 @@ fn namespace_dep_sources(
     Ok(source_names)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "nested composition threads parent instance, anchor path, manifest, ctx, and depth together"
+)]
 fn compose_nested_imports(
     parent_instance: &Instance,
+    imported: &str,
     dep_target_name: &str,
     dep_target: &Target,
     composed_path: &Path,
@@ -515,15 +554,16 @@ fn compose_nested_imports(
     ctx: &mut WalkCtx<'_>,
     depth: usize,
 ) -> Result<()> {
-    let parsed = manifest
-        .sources
-        .iter()
-        .map(|(name, source)| {
-            ParsedSource::parse(name, source).map(|source| (name.clone(), source))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
-    for (inner_name, inner_parsed, bound) in dependency_edges(dep_target, &parsed)? {
-        let inner_name = inner_name.as_str();
+    for import in dep_target.imports.iter().flatten() {
+        let inner_name = import.source.as_str();
+        let inner = manifest.sources.get(inner_name).ok_or_else(|| {
+            Error::Config(format!(
+                "imported `{imported}`: target `{dep_target_name}` imports undefined source `{inner_name}`"
+            ))
+        })?;
+        let inner_parsed = import
+            .resolve(&ParsedSource::parse(inner_name, inner)?)
+            .map_err(|e| at_depth(inner_name, depth + 1, &e.to_string()))?;
         let inner_remote = inner_remote(
             inner_name,
             &inner_parsed,
@@ -545,27 +585,20 @@ fn compose_nested_imports(
             depth + 1,
             ctx.frozen,
         )?;
-        let identity_ref = if bound {
-            encode_ref(&inner_parsed.refspec())
-        } else {
-            inner_parsed.refspec().to_string()
-        };
-        let inner_node = FetchNode::new(&inner_remote, &identity_ref, &inner_commit);
+        let inner_instance = package_instance(
+            &parent_instance.stable_key(),
+            inner_name,
+            dep_target_name,
+            &inner_remote,
+            &inner_parsed.refspec(),
+            &inner_commit,
+            &inner_manifest,
+        );
+        let inner_node = inner_instance.fetch_node().clone();
         ctx.visited.insert(inner_node.clone());
         if ctx.ancestors.contains(&inner_node) {
             continue;
         }
-        let constructor = if bound {
-            Instance::for_binding
-        } else {
-            Instance::new
-        };
-        let inner_instance = constructor(
-            &parent_instance.stable_key(),
-            inner_name,
-            dep_target_name,
-            inner_node.clone(),
-        );
         let nested_anchor = Target {
             path: composed_path.to_path_buf(),
             sources: None,
@@ -582,6 +615,7 @@ fn compose_nested_imports(
             &nested_anchor,
             inner_name,
             &inner_manifest,
+            &inner_remote,
             ctx,
             depth + 1,
         );
@@ -668,8 +702,34 @@ fn frozen_transitive_miss(name: &str, depth: usize) -> Error {
     ))
 }
 
+fn package_instance(
+    parent: &str,
+    source: &str,
+    anchor: &str,
+    remote: &str,
+    refspec: &Refspec,
+    commit: &str,
+    manifest: &TransitiveManifest,
+) -> Instance {
+    if manifest
+        .sources
+        .values()
+        .any(|source| source.path.as_deref() == Some("."))
+    {
+        let node = FetchNode::new(remote, &crate::lock::encode_ref(refspec), commit);
+        Instance::for_package(parent, source, anchor, node)
+    } else {
+        Instance::new(
+            parent,
+            source,
+            anchor,
+            FetchNode::new(remote, &refspec.to_string(), commit),
+        )
+    }
+}
+
 fn namespaced_key(instance: &Instance, name: &str, counter: usize) -> String {
-    format!("{}%{counter}%{name}", instance.stable_key())
+    instance.member_key(name, counter)
 }
 
 /// Interprets the dep target's stripped `on_change` hooks into commit-pinned candidates the
@@ -1879,7 +1939,9 @@ mod tests {
         let backend = CountingFetchBackend::over(mirror_root.path().to_path_buf());
         let config = consumer_importing(&url);
         let parsed = parsed_of(&config);
-        let lock = lock_of(vec![locked_node("dep", &url, &commit, None)]);
+        let mut entry = locked_node("dep", &url, &commit, None);
+        entry.config_digest = parsed["dep"].config_digest();
+        let lock = lock_of(vec![entry]);
 
         let graph = resolve_transitive_graph_offline(&config, &parsed, &backend, &lock).expect(
             "the offline lock-pinned resolve composes the dep from the mirror without fetching",
@@ -1909,7 +1971,9 @@ mod tests {
         let config = consumer_importing(&url);
         let parsed = parsed_of(&config);
         let absent = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
-        let lock = lock_of(vec![locked_node("dep", &url, absent, None)]);
+        let mut entry = locked_node("dep", &url, absent, None);
+        entry.config_digest = parsed["dep"].config_digest();
+        let lock = lock_of(vec![entry]);
 
         let err = resolve_transitive_graph_offline(&config, &parsed, &backend, &lock).expect_err(
             "a lock-pinned commit absent from the mirror must surface an error the CLI maps to \
