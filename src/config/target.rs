@@ -377,9 +377,6 @@ impl SourceFields for Source {
     }
 
     fn intrinsic_refspec(&self) -> Refspec {
-        if self.build.is_some() {
-            return Refspec::Default;
-        }
         if let Some(rev) = &self.rev {
             Refspec::Rev(rev.clone())
         } else if let Some(tag) = &self.tag {

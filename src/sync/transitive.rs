@@ -461,11 +461,6 @@ fn namespace_dep_sources(
 ) -> Result<BTreeMap<String, String>> {
     let mut source_names: BTreeMap<String, String> = BTreeMap::new();
     for (inner_name, inner) in &manifest.sources {
-        if inner.build.is_some() {
-            return Err(Error::Config(format!(
-                "imported `{imported}`: source `{inner_name}`: builds must be declared by the consumer"
-            )));
-        }
         let mut parsed = ParsedSource::parse(inner_name, inner).map_err(|e| {
             Error::Config(format!("imported `{imported}`: source `{inner_name}`: {e}"))
         })?;

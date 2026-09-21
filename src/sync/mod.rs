@@ -1241,6 +1241,7 @@ where
         &projection,
         &recorded_after_recovery,
         input.fast_forward(),
+        input.prune(),
     )?;
     let fast_forward_drops = plan_fast_forward_drops(
         &projection,
@@ -1505,6 +1506,7 @@ struct BindingOffer<'projection> {
     projected: &'projection crate::projection::model::BindingProjection,
     deploy_mode: DeployMode,
     ref_label: String,
+    live_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy)]
@@ -1537,13 +1539,15 @@ impl SealedRecordPolicy {
 /// transition; both are left to reconciliation/prune. When commits differ, only immutable-copy
 /// records are actionable `--fast-forward` drops. A historical linked record or current Link
 /// binding without positive attribution remains ambiguous and seals, even when the current offer
-/// excludes every available candidate.
+/// excludes every available candidate. `--prune` also admits a dangling file link
+/// when it still points to an admitted path in the current live source root.
 fn validate_sealed_offer(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
     projection: &Projection,
     recorded: &[ArtifactRecord],
     fast_forward: bool,
+    prune: bool,
 ) -> Result<Vec<ArtifactRecord>> {
     use crate::projection::offer::OfferSelection;
 
@@ -1577,6 +1581,7 @@ fn validate_sealed_offer(
                     projected: projected_binding,
                     deploy_mode: source.deploy_mode(),
                     ref_label: binding.effective_ref.to_string(),
+                    live_root: live_source_root(config, source)?,
                 },
             );
         }
@@ -1616,6 +1621,14 @@ fn validate_sealed_offer(
         if has_current_attribution || (policy.immutable_copy && !selection_admits_candidate) {
             continue;
         }
+        if prune
+            && selection_admits_candidate
+            && config.targets.get(&key.target).is_some_and(|target| {
+                dangling_file_link(record, target, offer.live_root.as_deref(), &source_paths)
+            })
+        {
+            continue;
+        }
         if fast_forward && policy.fast_forward_actionable() {
             dropped.push(record.clone());
             continue;
@@ -1637,6 +1650,43 @@ fn validate_sealed_offer(
         }));
     }
     Ok(dropped)
+}
+
+fn live_source_root(config: &Config, source: &ParsedSource) -> Result<Option<PathBuf>> {
+    if source.deploy_mode() != DeployMode::Link {
+        return Ok(None);
+    }
+    let remote = source.resolved_remote(&config.hosts, crate::config::Protocol::Https)?;
+    let path = PathBuf::from(remote).join(source.offer().root().unwrap_or(Path::new("")));
+    let absolute = std::path::absolute(path)
+        .map_err(|error| Error::Sync(format!("resolve live source: {error}")))?;
+    confine::normalize_physical(&absolute).map(Some)
+}
+
+fn dangling_file_link(
+    record: &ArtifactRecord,
+    target: &crate::config::Target,
+    source_root: Option<&Path>,
+    source_paths: &BTreeSet<String>,
+) -> bool {
+    if !record.linked || record.kind != crate::sync::state::RecordKind::File {
+        return false;
+    }
+    let Some(root) = source_root else {
+        return false;
+    };
+    let destination = prune::removal_destination(target, record);
+    let Ok(link) = std::fs::read_link(&destination) else {
+        return false;
+    };
+    let actual = destination.parent().unwrap_or(Path::new(".")).join(link);
+    source_paths.iter().any(|source| {
+        let expected = root.join(source);
+        matches!(std::fs::symlink_metadata(&expected), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+            && confine::normalize_physical_entry(&actual).ok()
+                .zip(confine::normalize_physical_entry(&expected).ok())
+                .is_some_and(|(actual, expected)| actual == expected)
+    })
 }
 
 fn record_source_paths(

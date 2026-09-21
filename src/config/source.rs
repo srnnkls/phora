@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::source::ExportPolicy;
 
 use super::host::Host;
-use super::{HookCommand, Protocol, effective_host, fill_template};
+use super::{Protocol, effective_host, fill_template};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -43,23 +43,6 @@ pub struct Source {
     pub deploy: Option<DeployMode>,
     #[serde(default)]
     pub transitive: Option<bool>,
-    #[serde(default)]
-    pub build: Option<SourceBuild>,
-}
-
-/// A consumer-owned command that prepares a local Git package from a declared source.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SourceBuild {
-    pub run: HookCommand,
-    pub output: String,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct BuildInput {
-    pub path: String,
-    pub reference: String,
-    pub recipe: SourceBuild,
 }
 
 impl Source {
@@ -132,7 +115,6 @@ pub struct ParsedSource {
     preserve_executable: Option<bool>,
     deploy: Option<DeployMode>,
     transitive: bool,
-    build: Option<BuildInput>,
 }
 
 impl ParsedSource {
@@ -158,7 +140,7 @@ impl ParsedSource {
         })?;
         reject_bang_patterns(name, "include", source.include.as_deref())?;
         reject_bang_patterns(name, "exclude", source.exclude.as_deref())?;
-        let mut parsed = Self {
+        Ok(Self {
             remote,
             branch: source.branch.clone(),
             tag: source.tag.clone(),
@@ -170,54 +152,7 @@ impl ParsedSource {
             preserve_executable: source.preserve_executable,
             deploy: source.deploy,
             transitive: source.is_transitive(),
-            build: None,
-        };
-        if let Some(recipe) = &source.build {
-            parsed.prepare_build(name, recipe)?;
-        }
-        Ok(parsed)
-    }
-
-    fn prepare_build(&mut self, name: &str, recipe: &SourceBuild) -> Result<()> {
-        let Remote::Path(path) = &self.remote else {
-            return Err(Error::Config(format!(
-                "source `{name}`: `build` requires a local `path` source"
-            )));
-        };
-        if path.trim().is_empty()
-            || recipe.output.trim().is_empty()
-            || self.deploy_mode() != DeployMode::Copy
-        {
-            return Err(Error::Config(format!(
-                "source `{name}`: `build` requires nonempty input/output paths and copy deployment"
-            )));
-        }
-        let reference = match self.refspec() {
-            Refspec::Branch(branch) => format!("refs/heads/{branch}"),
-            Refspec::Tag(tag) => format!("refs/tags/{tag}"),
-            Refspec::Rev(rev) => {
-                rev.parse::<crate::source::Commit>()
-                    .map_err(|error| Error::Config(format!("source `{name}`: {error}")))?;
-                rev
-            }
-            Refspec::Default | Refspec::None => "HEAD".to_owned(),
-        };
-        self.build = Some(BuildInput {
-            path: super::expand_home(Path::new(path))
-                .to_string_lossy()
-                .into_owned(),
-            reference,
-            recipe: recipe.clone(),
-        });
-        self.remote = Remote::Path(recipe.output.clone());
-        self.branch = None;
-        self.tag = None;
-        self.rev = None;
-        Ok(())
-    }
-
-    pub(crate) fn build_input(&self) -> Option<&BuildInput> {
-        self.build.as_ref()
+        })
     }
 
     #[must_use]
@@ -339,18 +274,6 @@ impl ParsedSource {
         if let Some(r) = &self.root {
             h.update(b"root\x00");
             h.update(r.to_string_lossy().as_bytes());
-        }
-        if let Some(input) = &self.build {
-            h.update(b"build\x00");
-            let command = super::hook_preimage(&input.recipe.run, "build", &input.reference);
-            for field in [
-                input.path.as_str(),
-                input.reference.as_str(),
-                command.as_str(),
-            ] {
-                h.update(&(field.len() as u64).to_le_bytes());
-                h.update(field.as_bytes());
-            }
         }
         let policy = self.export_policy(false);
         h.update(&[
@@ -529,9 +452,6 @@ impl Source {
         if local.deploy.is_some() {
             self.deploy = local.deploy;
         }
-        if local.build.is_some() {
-            self.build = local.build;
-        }
         if local.transitive.is_some() {
             self.transitive = local.transitive;
         }
@@ -684,7 +604,6 @@ mod offer_tests {
             preserve_executable: None,
             deploy: None,
             transitive: None,
-            build: None,
         }
     }
 
@@ -872,7 +791,6 @@ mod merge_url_digest_tests {
             preserve_executable: None,
             deploy: None,
             transitive: None,
-            build: None,
         }
     }
 

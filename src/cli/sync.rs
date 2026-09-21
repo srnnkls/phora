@@ -196,8 +196,7 @@ fn finish_sync(
     interactive: bool,
     reporter: &Reporter,
 ) -> Result<CliOutcome> {
-    // `update` drops pins in memory before sync. An aborted pre-sync/build gate
-    // must leave the on-disk lock untouched rather than persist those dropped pins.
+    // `update` drops pins in memory. A failed pre-sync gate must not persist that drop.
     let pre_sync_failed = out.hook_outcomes.iter().any(|hook| {
         hook.scope == crate::sync::HookScope::PreSync
             && hook.status == crate::sync::HookStatus::Failure

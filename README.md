@@ -837,7 +837,10 @@ Linked artifacts sit outside the integrity model: their registry record carries
 a `linked` marker and no per-file hashes. `phora verify` skips them, drift detection
 never reports them modified or foreign, `phora list` shows them as `linked`, and
 `phora rebuild-registry` reconstructs the marker without hashing. `--prune` removes
-an orphaned linked artifact by deleting the symlink only. If the working-tree target
+an orphaned linked artifact by deleting the symlink only. It also removes a
+dangling managed file link when that link still points to a path admitted by the
+current source offer. Directory links without current attribution remain sealed.
+A regular file or directory replacing a managed link is preserved. If the working-tree target
 is deleted or renamed the link reads as missing and is redeployed on the next sync.
 Switching a source between `link` and `copy` replaces the destination on the next
 sync (symlink ⇄ materialized copy, with full integrity restored on `copy`). If a
@@ -902,23 +905,24 @@ source, and deploys loqui's artifacts (its `languages/` and `resources/` trees) 
 One `imports` line, and tropos's dependency rode along. A target can import several at
 once — `imports = ["tropos", "work-config"]` — each composing under the same anchor.
 
-### Importing a locally built package
+### Importing a local package
 
 One source can supply several consumers through explicit imports. A bare name
 uses the source's default ref; a table can select a `branch`, `tag`, or `rev`:
 
 ```toml
 [sources.tropos]
-path = ".build/tropos"
+path = "~/projects/tropos"
+branch = "prototype/henia-phora"
 transitive = true
 
-[targets.claude]
-path = "~/.claude"
+[targets.canonical]
+path = ".phora/canonical"
 imports = ["tropos"]
 
-[targets.codex]
-path = "~/.codex"
-imports = [{ source = "tropos", branch = "codex" }]
+[targets.preview]
+path = ".phora/preview"
+imports = [{ source = "tropos", branch = "preview" }]
 ```
 
 The package advertises relative targets for both its own artifacts and its
@@ -926,7 +930,7 @@ dependencies. Inside that imported manifest, `path = "."` means the package's
 committed snapshot, never the consumer's working directory or uncommitted files:
 
 ```toml
-# .build/tropos/phora.toml, committed alongside the compiled artifacts
+# ~/projects/tropos/phora.toml, committed alongside the canonical artifacts
 [sources.tropos]
 path = "."
 exclude = ["phora.toml"]
@@ -952,55 +956,13 @@ paths, remotes, renames and root overrides are not import options.
 Package artifacts and their manifests use the same pin. Ordinary sync preserves
 that pin; `phora update tropos --fast-forward` advances it and removes resources
 the new package dropped. `phora sync --frozen` replays from the cache. Package
-ownership survives rebuilds, while hook trust remains tied to the actual commit.
+ownership survives updates, while hook trust remains tied to the actual commit.
 A source marked `transitive = true` still requires an explicit `imports` entry.
 
-### Building a declared local source
-
-A consumer can keep the canonical repository as its source and declare how to
-build a local Git package from it:
-
-```toml
-[sources.tropos]
-path = "~/projects/tropos"
-branch = "prototype/henia-phora"
-transitive = true
-build = { run = "bin/build-tropos", output = ".build/tropos" }
-
-[targets.claude]
-path = "~/.claude"
-imports = ["tropos"]
-
-[targets.codex]
-path = "~/.codex"
-imports = [{ source = "tropos", branch = "codex" }]
-```
-
-`path` and the source's `branch`/`tag`/`rev` identify the build input. `build.output`
-identifies the prepared Git package. Its default ref serves a bare import;
-per-import refs select variants in that output package. Selection fields such as
-`root`, `include` and `exclude` apply to the output.
-
-The build command runs once per declared source after global `pre_sync` hooks
-and before source resolution. `run` accepts the same command forms as a hook.
-The command receives Phora's environment plus:
-
-| Variable | Value |
-| --- | --- |
-| `PHORA_SOURCE` | Source name |
-| `PHORA_SOURCE_PATH` | Declared input path with `~` expanded |
-| `PHORA_SOURCE_REF` | Qualified branch/tag ref, commit, or `HEAD` |
-| `PHORA_BUILD_OUTPUT` | Output path with `~` expanded |
-| `PHORA_TARGETS` | Consumer target names |
-
-The command owns compilation and publication of the output; it should read the
-selected commit and publish only a successful build. Phora resolves and locks
-that output, including the input declaration and command in its configuration
-digest. A failed build aborts before deployment and preserves the existing lock,
-including during `update`. `--no-hooks` skips builds, so `sync --frozen --no-hooks`
-replays cached packages without the input repository or build output present.
-Read-only commands never run builds. Builds require a local `path` input and copy
-deployment; imported manifests cannot declare build commands.
+A consumer can stage the canonical input, then call `henia build` from its ordinary
+`post_sync` hook and run a second Phora configuration to deploy the generated local
+directories. Compiler commands belong in hooks; generated output needs no Git
+packaging or source-specific build setting.
 
 ### How composition works
 

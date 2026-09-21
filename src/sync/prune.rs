@@ -341,6 +341,13 @@ fn remove_reconciled_record(
 ) -> Result<bool> {
     if let Some(target) = config.targets.get(&record.key.target) {
         let dst = removal_destination(target, record);
+        if record.linked && std::fs::symlink_metadata(&dst).is_ok_and(|meta| !meta.is_symlink()) {
+            events.push_warning(SyncWarning::PruneRefused {
+                path: dst,
+                reason: "managed link was replaced by a regular file or directory".to_owned(),
+            });
+            return Ok(false);
+        }
         let confined = removal_path(target, record, protected);
         match confined {
             Ok(path) if !overlaps_any_live_dest(&path, live_paths, &record.key.target) => {
