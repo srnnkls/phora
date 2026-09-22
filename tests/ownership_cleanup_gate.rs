@@ -679,6 +679,7 @@ mod t029_callable_boundary_probe {
             &parsed,
             "https://example.test/dep.git",
             None,
+            ResolvePolicy::Refresh,
         )
         .expect("the source boundary acquires and decodes the dependency manifest");
         assert_eq!(commit, "a".repeat(40));
@@ -2418,7 +2419,14 @@ fn instrument_source_boundary(path: &Path) {
         return;
     };
     if let Some(parameters) = function_parameter_names(&source, "acquire_dependency_manifest")
-        && let [_, source_name, parsed_source, remote, pinned_commit] = parameters.as_slice()
+        && let [
+            _,
+            source_name,
+            parsed_source,
+            remote,
+            pinned_commit,
+            _policy,
+        ] = parameters.as_slice()
     {
         let statement = r#"
     T029_ACQUIRE_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -3090,6 +3098,7 @@ pub(crate) fn acquire_dependency_manifest(
     parsed_source: &ParsedSource,
     remote: &str,
     pinned_commit: Option<&str>,
+    policy: ResolvePolicy,
 ) -> Result<(String, TransitiveManifest)> {
     todo!()
 }
@@ -3111,6 +3120,7 @@ pub(crate) fn validate_dependency_remote(
             "parsed_source".to_owned(),
             "remote".to_owned(),
             "pinned_commit".to_owned(),
+            "policy".to_owned(),
         ]),
         "the callable probe must parse rustfmt's multiline trailing-comma form"
     );
@@ -3166,7 +3176,7 @@ pub(crate) fn validate_dependency_remote(
         function_parameter_names(&production, "acquire_dependency_manifest")
             .as_deref()
             .map(<[_]>::len),
-        Some(5),
+        Some(6),
         "the production acquisition boundary must remain instrumentable after rustfmt"
     );
     assert_eq!(

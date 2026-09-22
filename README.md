@@ -1034,6 +1034,12 @@ both dropped inputs and obsolete generated links in one run, use
 foreign files. Compilation stays in a normal hook; no nested Phora invocation,
 wrapper, or source-specific build API is needed.
 
+A fresh deployment can start from existing pins without a cache, registry, prepared
+inputs or generated output. Ordinary `phora sync` fetches missing mirrors at the
+locked commits and rebuilds the trees, keeping Tropos and transitive dependency
+pins unchanged. `--frozen` remains offline and fails when a required mirror is
+missing.
+
 ### How composition works
 
 - The importing target's `path` is the anchor. Each dep target's own `path` is

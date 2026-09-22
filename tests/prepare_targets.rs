@@ -209,6 +209,43 @@ fn first_sync_prepares_transitive_inputs_builds_then_deploys_from_one_config_pai
 }
 
 #[test]
+fn sync_recovers_deleted_cache_and_outputs_without_advancing_package_pins() {
+    let fixture = Fixture::new();
+    fixture.succeeds(&["sync"]);
+    let lock_before = fixture.read("phora.lock");
+    fixture.update_package();
+    let dependency = fixture.root.path().join("loqui");
+    write(&dependency.join("languages/rust/README.md"), "Loqui v2\n");
+    git(&dependency, &["add", "."]);
+    git(&dependency, &["commit", "-qm", "new dependency"]);
+    for directory in ["cache", "state", "stage", ".henia", "home"] {
+        std::fs::remove_dir_all(fixture.project.join(directory)).expect("remove generated tree");
+    }
+
+    let frozen = fixture.run(&["sync", "--frozen", "--no-hooks"]);
+    assert!(
+        !frozen.status.success(),
+        "frozen sync must not fetch missing mirrors"
+    );
+    assert_eq!(fixture.read("phora.lock"), lock_before);
+    assert!(!fixture.project.join("stage").exists());
+    assert!(!fixture.project.join(".henia").exists());
+
+    fixture.succeeds(&["sync"]);
+    assert_eq!(fixture.read("stage/skills/code/SKILL.md"), "skill v1\n");
+    assert_eq!(
+        fixture.read("home/.claude/skills/code/SKILL.md"),
+        "skill v1\n"
+    );
+    assert_eq!(
+        fixture.read("home/.claude/skills/loqui/reference/loqui/languages/rust/README.md"),
+        "Loqui\n"
+    );
+    assert_eq!(fixture.read("phora.lock"), lock_before);
+    fixture.succeeds(&["verify"]);
+}
+
+#[test]
 fn failed_build_keeps_deployment_and_its_pin_then_retry_uses_prepared_inputs() {
     let fixture = Fixture::new();
     fixture.succeeds(&["sync"]);

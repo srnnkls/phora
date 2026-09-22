@@ -9,13 +9,15 @@ use super::{
 };
 
 /// Acquires and decodes a dependency's `phora.toml` at either its pinned commit
-/// or a freshly resolved commit.
+/// or a freshly resolved commit. Pinned reads prefer the cache; `Refresh` permits
+/// fetching a missing mirror without changing the selected commit.
 pub(crate) fn acquire_dependency_manifest(
     store: &(dyn SourceStore + Sync),
     source_name: &SourceName,
     parsed_source: &ParsedSource,
     remote: &str,
     pinned_commit: Option<&str>,
+    policy: ResolvePolicy,
 ) -> Result<(String, TransitiveManifest)> {
     let revision = if let Some(commit) = pinned_commit {
         RevisionSpec::Commit(parse_commit(commit)?)
@@ -30,18 +32,20 @@ pub(crate) fn acquire_dependency_manifest(
             url: remote.to_owned(),
         },
     };
-    let resolved = store.resolve(
-        &ResolveRequest {
-            name: source_name.clone(),
-            location,
-            revision,
-        },
-        if pinned_commit.is_some() {
-            ResolvePolicy::CachedOnly
-        } else {
-            ResolvePolicy::Refresh
-        },
-    )?;
+    let request = ResolveRequest {
+        name: source_name.clone(),
+        location,
+        revision,
+    };
+    let resolved = if pinned_commit.is_some() {
+        match store.resolve(&request, ResolvePolicy::CachedOnly) {
+            Ok(resolved) => resolved,
+            Err(error) if policy == ResolvePolicy::CachedOnly => return Err(error),
+            Err(_) => store.resolve(&request, ResolvePolicy::Refresh)?,
+        }
+    } else {
+        store.resolve(&request, policy)?
+    };
     let commit = match &resolved.revision {
         ResolvedRevision::Commit(commit) => commit.to_string(),
         ResolvedRevision::WorktreeHead(_) => {
@@ -297,6 +301,7 @@ mod tests {
             &parsed_git_source(remote),
             remote,
             Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            ResolvePolicy::CachedOnly,
         )
     }
 
@@ -377,6 +382,7 @@ mod tests {
             &parsed_git_source(remote),
             remote,
             None,
+            ResolvePolicy::Refresh,
         )
         .expect_err("a backend fetch failure must fail");
         assert_source_error_type(&fetch_error);
@@ -527,6 +533,7 @@ mod tests {
             &parsed_git_source(&remote),
             &remote,
             Some(&commit),
+            ResolvePolicy::CachedOnly,
         )
         .expect("source boundary reads and parses only phora.toml");
         assert!(manifest.sources.contains_key("nvim"));

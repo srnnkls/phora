@@ -342,6 +342,11 @@ fn acquire_import_manifest(
             source,
             remote,
             pin,
+            if frozen {
+                ResolvePolicy::CachedOnly
+            } else {
+                ResolvePolicy::Refresh
+            },
         )
         .map_err(|source| Error::TransitiveSource {
             name: imported.to_owned(),
@@ -884,6 +889,11 @@ fn fetch_manifest(
         source,
         remote,
         pinned,
+        if frozen.frozen {
+            ResolvePolicy::CachedOnly
+        } else {
+            ResolvePolicy::Refresh
+        },
     )
     .map_err(|source| Error::TransitiveSource {
         name: name.to_owned(),
