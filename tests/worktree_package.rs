@@ -307,8 +307,12 @@ impl Fixture {
     }
 
     fn pin(&self) {
+        self.pin_with("");
+    }
+
+    fn pin_with(&self, consumer: &str) {
         self.configure(
-            BRANCH_PINNED,
+            &format!("{BRANCH_PINNED}{consumer}"),
             &format!(
                 "{LOCAL}[sources.tropos]\npath = {:?}\n",
                 self.package.display().to_string()
@@ -317,8 +321,12 @@ impl Fixture {
     }
 
     fn link(&self, worktree: &Path) {
+        self.link_with(worktree, "");
+    }
+
+    fn link_with(&self, worktree: &Path, consumer: &str) {
         self.configure(
-            BRANCH_PINNED,
+            &format!("{BRANCH_PINNED}{consumer}"),
             &format!(
                 "{LOCAL}[sources.tropos]\npath = {:?}\ndeploy = \"link\"\n",
                 worktree.display().to_string()
@@ -457,4 +465,112 @@ fn self_target_records_carry_a_normalized_deploy_root() {
     assert_quiet(&String::from_utf8_lossy(&out.stderr));
     let state = fixture.state_text();
     assert!(!state.contains("/./"), "{state}");
+}
+
+const PATHS_ONLY: &str = "[paths]\ncache = \"cache\"\nstate = \"state\"\n";
+
+fn linked_source(allow_symlinks: bool) -> String {
+    format!(
+        "[sources.fas]\npath = \"./linked\"\nroot = \"rules\"\ndeploy = \"link\"\n\
+         allow_symlinks = {allow_symlinks}\n\
+         [targets.out]\npath = \"out\"\nsources.fas = {{ collapse = false }}\n"
+    )
+}
+
+fn plant_linked_tree(fixture: &Fixture) {
+    let shared = fixture.root.path().join("shared");
+    write(&shared.join("guidance/hints.cue"), "hints\n");
+    write(&shared.join("top.md"), "top\n");
+    let rules = fixture.project.join("linked/rules");
+    std::fs::create_dir_all(&rules).expect("mkdir");
+    std::os::unix::fs::symlink(shared.join("guidance"), rules.join("guidance")).expect("dir link");
+    std::os::unix::fs::symlink(shared.join("top.md"), rules.join("top.md")).expect("file link");
+    write(&rules.join("own.md"), "own\n");
+}
+
+#[test]
+fn linked_source_allowing_symlinks_offers_what_they_point_to() {
+    let fixture = Fixture::new(PACKAGE_MANIFEST);
+    plant_linked_tree(&fixture);
+    fixture.configure(&linked_source(true), PATHS_ONLY);
+
+    fixture.succeeds(&["sync"]);
+
+    for (path, text) in [
+        ("out/guidance/hints.cue", "hints\n"),
+        ("out/top.md", "top\n"),
+        ("out/own.md", "own\n"),
+    ] {
+        assert!(fixture.is_link(path), "{path} deploys as a link");
+        assert_eq!(fixture.read(path), text);
+    }
+    assert_eq!(
+        std::fs::read_link(fixture.project.join("out/guidance/hints.cue"))
+            .expect("read link")
+            .strip_prefix(fixture.project.canonicalize().expect("project"))
+            .expect("link stays inside the source"),
+        Path::new("linked/rules/guidance/hints.cue"),
+        "the deploy links to the logical path inside the source"
+    );
+
+    write(
+        &fixture.root.path().join("shared/guidance/hints.cue"),
+        "edited\n",
+    );
+    fixture.succeeds(&["sync"]);
+    assert_eq!(fixture.read("out/guidance/hints.cue"), "edited\n");
+}
+
+#[test]
+fn linked_source_without_allow_symlinks_skips_them() {
+    let fixture = Fixture::new(PACKAGE_MANIFEST);
+    plant_linked_tree(&fixture);
+    fixture.configure(&linked_source(false), PATHS_ONLY);
+
+    fixture.succeeds(&["sync"]);
+
+    assert_eq!(fixture.read("out/own.md"), "own\n");
+    for path in ["out/guidance", "out/top.md"] {
+        assert!(
+            std::fs::symlink_metadata(fixture.project.join(path)).is_err(),
+            "{path} is not offered"
+        );
+    }
+}
+
+#[test]
+fn consumer_link_source_over_the_prepared_package_survives_switches() {
+    let fixture = Fixture::new(PACKAGE_MANIFEST);
+    let worktree = fixture.add_worktree();
+    write(&worktree.join("skills/live/SKILL.md"), "live only\n");
+    let reader = "[sources.fas]\npath = \"./.tropos\"\nroot = \"skills\"\ndeploy = \"link\"\n\
+                  allow_symlinks = true\n\
+                  [targets.out]\npath = \"out\"\nsources.fas = { collapse = false }\n";
+
+    fixture.pin_with(reader);
+    assert_quiet(&fixture.sync_prune());
+    assert_eq!(fixture.read("out/code/SKILL.md"), "skill v1\n");
+
+    fixture.link_with(&worktree, reader);
+    assert_quiet(&fixture.sync_prune());
+    assert!(fixture.is_link(".tropos/skills/code/SKILL.md"));
+    assert_eq!(fixture.read("out/code/SKILL.md"), "skill v1\n");
+    assert_eq!(fixture.read("out/live/SKILL.md"), "live only\n");
+    assert!(
+        std::fs::read_link(fixture.project.join("out/code/SKILL.md"))
+            .expect("read link")
+            .starts_with(
+                fixture
+                    .project
+                    .canonicalize()
+                    .expect("project")
+                    .join(".tropos")
+            ),
+        "the consumer links into the prepared tree, not through it into the worktree"
+    );
+
+    fixture.pin_with(reader);
+    assert_quiet(&fixture.sync_prune());
+    assert_eq!(fixture.read("out/code/SKILL.md"), "skill v1\n");
+    assert!(std::fs::symlink_metadata(fixture.project.join("out/live/SKILL.md")).is_err());
 }

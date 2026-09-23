@@ -28,6 +28,7 @@ pub use snapshot::{
     RevisionSpec, SnapshotId, SourceDirectoryEntry, SourceDirectoryEntryKind, SourceEntry,
     SourceIdentity, SourceLocation, SourceStore, SourceTimestamp, digest_snapshot,
 };
+pub(crate) use worktree::walk_worktree;
 pub use worktree::{capture_worktree, is_local_path, read_local_head};
 pub use worktree_deploy::{
     WorktreeAdminId, WorktreeDeployRequest, WorktreeDeployment, WorktreeMirrorAddress,

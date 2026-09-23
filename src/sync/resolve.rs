@@ -282,7 +282,10 @@ fn resolve_request(
         }
     };
     let location = match source.deploy_mode() {
-        DeployMode::Link => SourceLocation::Worktree { root: git.into() },
+        DeployMode::Link => SourceLocation::Worktree {
+            root: git.into(),
+            follow_symlinks: source.export_policy(false).allow_symlinks,
+        },
         DeployMode::Copy if source.mode() == SourceMode::Url => SourceLocation::Url {
             url: git.to_owned(),
         },

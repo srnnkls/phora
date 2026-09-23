@@ -312,8 +312,8 @@ fn worktree_capture_set_matches_the_pinned_fixture() {
     build_capture_matrix(src.path());
     let cache = TempDir::new().expect("cache tempdir");
 
-    let snapshot =
-        capture_worktree(cache.path(), &sn("wt"), src.path()).expect("worktree capture succeeds");
+    let snapshot = capture_worktree(cache.path(), &sn("wt"), src.path(), false)
+        .expect("worktree capture succeeds");
     let SnapshotId::Worktree {
         ref root, ref head, ..
     } = snapshot
@@ -387,8 +387,8 @@ fn worktree_capture_reads_modified_content_from_the_disk_state() {
     build_capture_matrix(src.path());
     let cache = TempDir::new().expect("cache tempdir");
 
-    let snapshot =
-        capture_worktree(cache.path(), &sn("wt"), src.path()).expect("worktree capture succeeds");
+    let snapshot = capture_worktree(cache.path(), &sn("wt"), src.path(), false)
+        .expect("worktree capture succeeds");
     let store = GitBackend::new(cache.path().to_path_buf());
     let resolved = resolved_worktree(src.path(), snapshot);
 
@@ -413,7 +413,7 @@ fn worktree_capture_ignores_special_files() {
         .expect("bind unix socket fixture");
     let cache = TempDir::new().expect("cache tempdir");
 
-    let snapshot = capture_worktree(cache.path(), &sn("wt"), src.path())
+    let snapshot = capture_worktree(cache.path(), &sn("wt"), src.path(), false)
         .expect("a special file (socket/FIFO/device) must be skipped, not read or fail capture");
     let store = GitBackend::new(cache.path().to_path_buf());
     let resolved = resolved_worktree(src.path(), snapshot);
@@ -453,7 +453,7 @@ fn contained_cache_is_excluded_from_capture_empty_and_prepopulated() {
             );
         }
 
-        let snapshot = capture_worktree(&cache_dir, &sn("wt"), src.path())
+        let snapshot = capture_worktree(&cache_dir, &sn("wt"), src.path(), false)
             .expect("capture with an in-source cache succeeds");
         let store = GitBackend::new(cache_dir.clone());
         let resolved = resolved_worktree(src.path(), snapshot);
@@ -471,15 +471,15 @@ fn capture_into_a_contained_cache_publishes_atomically() {
     let cache_dir = src.path().join(".phora-cache/git");
 
     let first =
-        capture_worktree(&cache_dir, &sn("wt"), src.path()).expect("first capture succeeds");
+        capture_worktree(&cache_dir, &sn("wt"), src.path(), false).expect("first capture succeeds");
     let after_first = cache_entries(&cache_dir);
     assert!(
         !after_first.is_empty(),
         "the first capture must publish into the contained cache"
     );
 
-    let second =
-        capture_worktree(&cache_dir, &sn("wt"), src.path()).expect("second capture succeeds");
+    let second = capture_worktree(&cache_dir, &sn("wt"), src.path(), false)
+        .expect("second capture succeeds");
     let after_second = cache_entries(&cache_dir);
 
     assert_eq!(
@@ -524,8 +524,8 @@ fn copy_reads_resolve_against_the_captured_tree_not_the_live_worktree() {
     build_capture_matrix(src.path());
     let cache = TempDir::new().expect("cache tempdir");
 
-    let snapshot =
-        capture_worktree(cache.path(), &sn("wt"), src.path()).expect("worktree capture succeeds");
+    let snapshot = capture_worktree(cache.path(), &sn("wt"), src.path(), false)
+        .expect("worktree capture succeeds");
     let store = GitBackend::new(cache.path().to_path_buf());
     let resolved = resolved_worktree(src.path(), snapshot);
     let before = SourceStore::inventory(&store, &resolved.snapshot, None)
@@ -567,10 +567,10 @@ fn capture_digest_tracks_content_not_capture_time() {
     build_capture_matrix(src.path());
     let cache = TempDir::new().expect("cache tempdir");
 
-    let first =
-        capture_worktree(cache.path(), &sn("wt"), src.path()).expect("first capture succeeds");
-    let second =
-        capture_worktree(cache.path(), &sn("wt"), src.path()).expect("second capture succeeds");
+    let first = capture_worktree(cache.path(), &sn("wt"), src.path(), false)
+        .expect("first capture succeeds");
+    let second = capture_worktree(cache.path(), &sn("wt"), src.path(), false)
+        .expect("second capture succeeds");
     assert_eq!(
         worktree_digest(&first),
         worktree_digest(&second),
@@ -578,8 +578,8 @@ fn capture_digest_tracks_content_not_capture_time() {
     );
 
     write(&src.path().join("README.md"), b"drifted\n");
-    let third =
-        capture_worktree(cache.path(), &sn("wt"), src.path()).expect("third capture succeeds");
+    let third = capture_worktree(cache.path(), &sn("wt"), src.path(), false)
+        .expect("third capture succeeds");
     assert_ne!(
         worktree_digest(&first),
         worktree_digest(&third),
@@ -597,7 +597,7 @@ fn plain_non_git_dir_captures_without_a_repository_head() {
     let cache = TempDir::new().expect("cache tempdir");
 
     let snapshot =
-        capture_worktree(cache.path(), &sn("plain"), src.path()).expect("plain-dir capture");
+        capture_worktree(cache.path(), &sn("plain"), src.path(), false).expect("plain-dir capture");
     let SnapshotId::Worktree { ref head, .. } = snapshot else {
         panic!("a plain directory must capture as SnapshotId::Worktree, got {snapshot:?}");
     };
@@ -629,7 +629,7 @@ fn worktree_capture_rejects_non_utf8_names_with_a_source_error() {
     std::fs::write(src.path().join(bad), b"x\n").expect("write non-utf8-named file");
     let cache = TempDir::new().expect("cache tempdir");
 
-    let err = capture_worktree(cache.path(), &sn("wt"), src.path())
+    let err = capture_worktree(cache.path(), &sn("wt"), src.path(), false)
         .expect_err("a non-UTF8 entry name must fail capture, not panic or vanish silently");
     assert!(
         format!("{err}").to_lowercase().contains("utf"),
@@ -669,8 +669,8 @@ fn submodule_files_are_captured_without_git_internals() {
     git(src.path(), &["commit", "-m", "add submodule"]);
 
     let cache = TempDir::new().expect("cache tempdir");
-    let snapshot =
-        capture_worktree(cache.path(), &sn("wt"), src.path()).expect("submodule capture succeeds");
+    let snapshot = capture_worktree(cache.path(), &sn("wt"), src.path(), false)
+        .expect("submodule capture succeeds");
     let store = GitBackend::new(cache.path().to_path_buf());
     let resolved = resolved_worktree(src.path(), snapshot);
     let inventory =
@@ -872,8 +872,8 @@ fn source_path_root_join_parity_over_the_captured_set() {
     build_capture_matrix(src.path());
     let cache = TempDir::new().expect("cache tempdir");
 
-    let snapshot =
-        capture_worktree(cache.path(), &sn("wt"), src.path()).expect("worktree capture succeeds");
+    let snapshot = capture_worktree(cache.path(), &sn("wt"), src.path(), false)
+        .expect("worktree capture succeeds");
     let store = GitBackend::new(cache.path().to_path_buf());
     let resolved = resolved_worktree(src.path(), snapshot);
     let inventory =
@@ -1037,7 +1037,7 @@ fn worktree_lock_bytes_stay_free_of_capture_digest() {
 
     let scratch = TempDir::new().expect("scratch cache tempdir");
     let digest_value = worktree_digest(
-        &capture_worktree(scratch.path(), &sn("dotfiles"), src.path())
+        &capture_worktree(scratch.path(), &sn("dotfiles"), src.path(), false)
             .expect("capture the same worktree to obtain the digest value"),
     );
     assert!(

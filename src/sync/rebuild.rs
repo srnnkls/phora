@@ -159,6 +159,7 @@ fn locked_sources(
                 DeployMode::Link => (
                     SourceLocation::Worktree {
                         root: remote.into(),
+                        follow_symlinks: source.export_policy(false).allow_symlinks,
                     },
                     RevisionSpec::Default,
                 ),

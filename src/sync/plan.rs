@@ -146,7 +146,11 @@ fn discover_binding_leaves(
 ) -> Result<Vec<String>> {
     let git = remote_for(remotes, source_name)?;
     match source.deploy_mode() {
-        DeployMode::Link => Ok(discover_working_tree_leaves(Path::new(git), None)?),
+        DeployMode::Link => Ok(discover_working_tree_leaves(
+            Path::new(git),
+            None,
+            source.export_policy(false).allow_symlinks,
+        )?),
         DeployMode::Copy => Ok(store
             .inventory(&resolved.snapshot, None)?
             .entries
