@@ -296,6 +296,90 @@ fn preparation_destination_cannot_overlap_deployment() {
     assert!(!fixture.project.join(".henia").exists());
 }
 
+impl Fixture {
+    /// Adds a deploy target rooted at the project, an ancestor of the `stage` preparation tree.
+    fn deploy_from_project_root(&self, include: &[&str], binding: &str) {
+        let config = self.read("phora.toml")
+            + &format!(
+                "[sources.dots]\npath = \"./dots\"\ndeploy = \"link\"\ninclude = {include:?}\n"
+            );
+        write(&self.project.join("phora.toml"), &config);
+        let local =
+            self.read("phora.local.toml") + &format!("[targets.home]\npath = \".\"\n{binding}\n");
+        write(&self.project.join("phora.local.toml"), &local);
+    }
+
+    fn assert_nothing_written(&self, out: &Output) {
+        assert!(!out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("overlap at"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        for path in ["stage", ".henia", "home", "box", ".zshrc"] {
+            assert!(
+                !self.project.join(path).exists(),
+                "{path} written before the overlap check"
+            );
+        }
+    }
+}
+
+#[test]
+fn ancestor_deploy_target_with_disjoint_artifacts_syncs_and_prunes() {
+    let fixture = Fixture::new();
+    write(&fixture.project.join("dots/.zshrc"), "zshrc\n");
+    write(&fixture.project.join("dots/.zfunc/_one"), "one\n");
+    write(&fixture.project.join("dots/.zfunc/_two"), "two\n");
+    fixture.configure(
+        &BUILD.replace("claude tropos", "claude home tropos"),
+        "stage",
+    );
+    fixture.deploy_from_project_root(
+        &["/.zshrc", "/.zfunc/"],
+        "sources.dots = { collapse = false }",
+    );
+    fixture.succeeds(&["sync"]);
+    assert!(fixture.project.join(".zshrc").is_symlink());
+    assert_eq!(fixture.read(".zfunc/_two"), "two\n");
+    assert_eq!(fixture.read("stage/skills/code/SKILL.md"), "skill v1\n");
+    assert_eq!(
+        fixture.read("home/.claude/skills/code/SKILL.md"),
+        "skill v1\n"
+    );
+
+    std::fs::remove_file(fixture.project.join("dots/.zfunc/_two")).expect("remove leaf");
+    fixture.succeeds(&["sync", "--prune"]);
+    assert!(!fixture.project.join(".zfunc/_two").exists());
+    assert_eq!(fixture.read(".zfunc/_one"), "one\n");
+    assert_eq!(fixture.read("stage/skills/code/SKILL.md"), "skill v1\n");
+    assert_eq!(fixture.read("stage/skills/code/resource.md"), "resource\n");
+    fixture.succeeds(&["verify"]);
+}
+
+#[test]
+fn deploy_leaf_inside_preparation_tree_is_rejected_before_any_write() {
+    let fixture = Fixture::new();
+    write(&fixture.project.join("dots/.zshrc"), "zshrc\n");
+    write(&fixture.project.join("dots/stage/leak.md"), "leak\n");
+    fixture.deploy_from_project_root(
+        &["/.zshrc", "/stage/"],
+        "sources.dots = { collapse = false }",
+    );
+    let out = fixture.run(&["sync"]);
+    fixture.assert_nothing_written(&out);
+}
+
+#[test]
+fn collapsed_directory_artifact_containing_preparation_tree_is_rejected() {
+    let fixture = Fixture::new();
+    write(&fixture.project.join("dots/box/readme"), "box\n");
+    fixture.configure(BUILD, "box/inputs");
+    fixture.deploy_from_project_root(&["/box/"], "sources.dots = { collapse = true }");
+    let out = fixture.run(&["sync"]);
+    fixture.assert_nothing_written(&out);
+}
+
 #[test]
 fn preparation_conflict_stops_build_and_deployment() {
     let fixture = Fixture::new();

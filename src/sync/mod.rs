@@ -835,18 +835,62 @@ where
     Ok(had_failures)
 }
 
-fn reject_cross_target_overlap(
+/// A destination's physical identity plus the entry identities of its ancestors, so
+/// overlap is visible through symlink aliases on either side.
+#[derive(Clone, Debug)]
+pub(super) struct Placement {
+    pub target: String,
+    pub physical: PathBuf,
+    identity: PathBuf,
+    parent_entries: Vec<PathBuf>,
+}
+
+impl Placement {
+    pub fn new(target: &str, path: &Path, entry: bool) -> Result<Self> {
+        let physical = if entry {
+            confine::normalize_physical_entry(path)?
+        } else {
+            confine::normalize_physical(path)?
+        };
+        let identity = confine::fold_path(&physical);
+        let parent_entries = path
+            .ancestors()
+            .skip(1)
+            .map(|parent| {
+                confine::normalize_physical_entry(parent)
+                    .map(|physical| confine::fold_path(&physical))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            target: target.to_owned(),
+            physical,
+            identity,
+            parent_entries,
+        })
+    }
+
+    pub fn identity(&self) -> &Path {
+        &self.identity
+    }
+
+    pub fn overlaps(&self, other: &Self) -> bool {
+        self.identity.starts_with(&other.identity)
+            || other.identity.starts_with(&self.identity)
+            || self.parent_entries.contains(&other.identity)
+            || other.parent_entries.contains(&self.identity)
+    }
+
+    /// Whether `other` contains this destination, directly or through an alias.
+    pub fn is_within(&self, other: &Self) -> bool {
+        self.identity.starts_with(&other.identity) || self.parent_entries.contains(&other.identity)
+    }
+}
+
+fn projected_placements(
     projection: &Projection,
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
-) -> Result<()> {
-    struct Placement<'a> {
-        target: &'a str,
-        physical: PathBuf,
-        identity: PathBuf,
-        parent_entries: Vec<PathBuf>,
-    }
-
+) -> Result<Vec<Placement>> {
     let cwd = std::env::current_dir()
         .map_err(|e| Error::Sync(format!("resolve current dir for overlap check: {e}")))?;
     let mut placements = Vec::new();
@@ -856,52 +900,43 @@ fn reject_cross_target_overlap(
         };
         let root = cwd.join(target.expanded_path());
         for binding in &target_projection.bindings {
+            let link = parsed
+                .get(&binding.source)
+                .is_some_and(|source| source.deploy_mode() == DeployMode::Link);
             for item in projected_artifacts(binding) {
-                let path = root.join(item.destination.as_str());
-                let physical = if parsed
-                    .get(&binding.source)
-                    .is_some_and(|source| source.deploy_mode() == DeployMode::Link)
-                {
-                    confine::normalize_physical_entry(&path)?
-                } else {
-                    confine::normalize_physical(&path)?
-                };
-                let identity = confine::fold_path(&physical);
-                let parent_entries = path
-                    .ancestors()
-                    .skip(1)
-                    .map(|parent| {
-                        confine::normalize_physical_entry(parent)
-                            .map(|physical| confine::fold_path(&physical))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                placements.push(Placement {
-                    target: &target_projection.target,
-                    physical,
-                    identity,
-                    parent_entries,
-                });
+                placements.push(Placement::new(
+                    &target_projection.target,
+                    &root.join(item.destination.as_str()),
+                    link,
+                )?);
             }
         }
     }
+    Ok(placements)
+}
+
+/// Rejects artifacts from different targets, or from any target and a reserved
+/// preparation tree, that land on overlapping physical paths.
+fn reject_cross_target_overlap(
+    projection: &Projection,
+    config: &Config,
+    parsed: &BTreeMap<String, ParsedSource>,
+    reserved: &[Placement],
+) -> Result<()> {
+    let placements = projected_placements(projection, config, parsed)?;
     for (i, first) in placements.iter().enumerate() {
         for second in &placements[i + 1..] {
-            if first.target != second.target
-                && (first.identity.starts_with(&second.identity)
-                    || second.identity.starts_with(&first.identity)
-                    || first.parent_entries.contains(&second.identity)
-                    || second.parent_entries.contains(&first.identity))
-            {
+            if first.target != second.target && first.overlaps(second) {
                 return Err(cross_target_overlap_diagnostic(
-                    first.target,
-                    second.target,
+                    &first.target,
+                    &second.target,
                     &first.physical,
                     &second.physical,
                 ));
             }
         }
     }
-    Ok(())
+    prepare::reject_prepared_overlap(&placements, reserved)
 }
 
 fn cross_target_overlap_diagnostic(
@@ -1052,6 +1087,7 @@ fn project_sync_workspace(
     backend: &dyn SourceStore,
     resolved_commits: &BTreeMap<(String, String), String>,
     resolved_sources: &ResolvedSourceMap,
+    reserved: &[Placement],
 ) -> Result<Projection> {
     let projection = project_workspace(
         config,
@@ -1061,8 +1097,40 @@ fn project_sync_workspace(
         resolved_commits,
         resolved_sources,
     )?;
-    reject_cross_target_overlap(&projection, config, parsed)?;
+    reject_cross_target_overlap(&projection, config, parsed, reserved)?;
     Ok(projection)
+}
+
+/// Projects a workspace's destinations without applying it, so preparation can prove
+/// its trees are disjoint from deployment before its first write.
+fn project_placements(
+    input: &SyncRunInput<'_>,
+    workspace: &SyncWorkspace,
+    backend: &dyn SourceStore,
+) -> Result<Vec<Placement>> {
+    let routed = resolve_sources(
+        &workspace.config,
+        &workspace.parsed,
+        &workspace.remotes,
+        &workspace.instances,
+        &workspace.import_refs,
+        effective_lock(input).as_ref(),
+        backend,
+        false,
+        input.frozen(),
+        input.jobs(),
+        &progress::SilentSink,
+    )?;
+    let projection = project_sync_workspace(
+        &workspace.config,
+        &workspace.parsed,
+        &workspace.remotes,
+        backend,
+        &routed.commits,
+        &routed.resolved,
+        &[],
+    )?;
+    projected_placements(&projection, &workspace.config, &workspace.parsed)
 }
 
 /// Synchronizes a workspace from an explicit request and returns structured outcomes.
@@ -1293,6 +1361,7 @@ fn sync_workspace<R: StateStore>(
         backend,
         &routed.commits,
         &routed.resolved,
+        target_scope.reserved(),
     )?;
     input.sink().phase_finished(Phase::Project);
     input
