@@ -86,6 +86,10 @@ pub(super) fn confine_removal_destination(
     Ok(path)
 }
 
+pub(super) fn within_anchor(anchor: &Path, path: &Path) -> bool {
+    starts_with_components(&normalize_lexical(path), &normalize_lexical(anchor))
+}
+
 /// Returns the path deploy must write verbatim, or rejects any escape of `anchor`.
 pub(super) fn confine_destination(
     anchor: &Path,
@@ -176,9 +180,14 @@ fn reject_if_symlink(path: &Path) -> Result<()> {
     }
 }
 
+/// The swap moves any existing `dst` entry aside, so only its ancestors are guarded.
 /// Residual risk: a cross-process TOCTOU race and hardlink-to-directory canonicalization stay unguarded.
 pub(super) fn reject_symlink_ancestor_at_write(anchor: &Path, dst: &Path) -> Result<()> {
-    reject_symlink_ancestor(&normalize_lexical(anchor), &normalize_lexical(dst))
+    let dst = normalize_lexical(dst);
+    match dst.parent() {
+        Some(parent) => reject_symlink_ancestor(&normalize_lexical(anchor), parent),
+        None => Ok(()),
+    }
 }
 
 /// Collapses `.`/`..` without touching the filesystem, so confinement holds for paths that do not yet exist.

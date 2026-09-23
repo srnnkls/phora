@@ -154,8 +154,8 @@ pub(super) fn apply_artifact_report(
         swap_completed: false,
     })?;
 
-    let backup = match paths.dst.try_exists() {
-        Ok(true) => {
+    let backup = match std::fs::symlink_metadata(paths.dst) {
+        Ok(_) => {
             let backup = backup_path(paths.staging_base, paths.dst);
             std::fs::rename(paths.dst, &backup).map_err(|e| {
                 Error::Projection(format!(
@@ -166,7 +166,7 @@ pub(super) fn apply_artifact_report(
             })?;
             Some(backup)
         }
-        Ok(false) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
             return Err(Error::Projection(format!(
                 "stat {}: {e}",

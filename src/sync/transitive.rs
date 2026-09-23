@@ -498,7 +498,7 @@ fn compose_dep(
 
     for (dep_target_name, dep_target) in &manifest.targets {
         reject_dep_target_path(imported, dep_target_name, &dep_target.path)?;
-        let composed_path = anchor_path.join(&dep_target.path);
+        let composed_path: PathBuf = anchor_path.join(&dep_target.path).components().collect();
         if let Some(other) = composed_dests.insert(composed_path.clone(), dep_target_name.clone()) {
             return Err(Error::Config(format!(
                 "{COMPOSED_DEST_COLLISION}: dep targets `{other}` and `{dep_target_name}` of \

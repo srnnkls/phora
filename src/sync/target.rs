@@ -43,9 +43,10 @@ pub(super) struct TargetRun<'a> {
 }
 
 impl TargetRun<'_> {
+    /// Links, and copies replacing a link, swap the destination as one entry.
     fn confined(&self, dst: &Path, mode: DeployMode) -> Result<PathBuf> {
         match &self.target.confine {
-            Some(anchor) if mode == DeployMode::Link => {
+            Some(anchor) if mode == DeployMode::Link || is_symlink(dst) => {
                 confine_entry_destination(anchor, dst, self.protected)
             }
             Some(anchor) => confine_destination(anchor, dst, self.protected),
@@ -185,6 +186,10 @@ fn change_key(change: &SyncChange) -> (String, String, String) {
     (target.clone(), source.clone(), artifact.clone())
 }
 
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+}
+
 pub(super) fn walk_projection_target(
     run: TargetRun<'_>,
     projection: &TargetProjection,
@@ -231,8 +236,7 @@ pub(super) fn walk_projection_target(
             safe_relpath(key).map_err(|_| unsafe_dest_diagnostic(key))?;
             let deploy_dst = run.target.expanded_path().join(item.destination.as_str());
             let artifact_dst = run.confined(&deploy_dst, source.deploy_mode())?;
-            let dst_is_symlink =
-                std::fs::symlink_metadata(&artifact_dst).is_ok_and(|m| m.file_type().is_symlink());
+            let dst_is_symlink = is_symlink(&artifact_dst);
             let mode_transition = match source.deploy_mode() {
                 DeployMode::Link => artifact_dst.exists() && !dst_is_symlink,
                 DeployMode::Copy => dst_is_symlink,

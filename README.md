@@ -998,7 +998,10 @@ included, and the self source deploys as symlinks into that tree; phora writes
 nothing into it. The package locks like any link source (`resolved = "link"`, no
 mirror, so `--frozen` does not need one) and `update` leaves it untouched, while
 its remote dependencies still lock and update at pinned commits. Link mode
-declared inside a package manifest stays rejected. A `phora.local.toml` override
+declared inside a package manifest stays rejected. Switching a package between
+a pin and `deploy = "link"` keeps its artifacts owned: one `phora sync --prune`
+replaces copies with links (or links with copies) and prunes what the other
+snapshot offered. A `phora.local.toml` override
 to `path` + `deploy = "link"` drops the base source's `branch`/`tag`/`rev`:
 
 ```toml

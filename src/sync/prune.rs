@@ -97,7 +97,12 @@ pub(crate) fn orphan_records(
 pub(crate) fn orphan_artifact_path(record: &ArtifactRecord) -> Option<PathBuf> {
     let root = record.deploy_root.as_deref()?;
     let layout = reconstruct_layout(record)?;
-    Some(Path::new(root).join(super::target::record_relative_destination(&layout, record)))
+    Some(
+        Path::new(root)
+            .join(super::target::record_relative_destination(&layout, record))
+            .components()
+            .collect(),
+    )
 }
 
 pub(crate) fn removal_destination(
@@ -390,16 +395,20 @@ fn remove_reconciled_record(
             registry.remove_artifact(&record.key)?;
             return Ok(true);
         };
-        if super::target::is_composed_target(&record.key.target) {
-            events.push_warning(SyncWarning::PruneRefused {
-                path: path.clone(),
-                reason: format!(
-                    "composed target `{}` has no confine anchor",
-                    record.key.target
-                ),
-            });
-            return Ok(false);
-        }
+        let path = if super::target::is_composed_target(&record.key.target) {
+            match confine_orphan(config, record, &path, protected) {
+                Ok(confined) => confined,
+                Err(error) => {
+                    events.push_warning(SyncWarning::PruneRefused {
+                        path,
+                        reason: error.to_string(),
+                    });
+                    return Ok(false);
+                }
+            }
+        } else {
+            path
+        };
         if overlaps_any_live_path(&path, live_paths) {
             return Ok(false);
         }
@@ -409,6 +418,33 @@ fn remove_reconciled_record(
     }
     registry.remove_artifact(&record.key)?;
     Ok(true)
+}
+
+/// A composed target dropped from the graph prunes inside the consumer anchor still holding it.
+fn confine_orphan(
+    config: &Config,
+    record: &ArtifactRecord,
+    path: &Path,
+    protected: &ProtectedPathSet,
+) -> Result<PathBuf> {
+    let anchor = config
+        .targets
+        .values()
+        .filter_map(|target| target.confine.as_deref())
+        .find(|anchor| super::confine::within_anchor(anchor, path))
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "composed target `{}` has no confine anchor",
+                record.key.target
+            ))
+        })?;
+    super::confine::confine_removal_destination(
+        Some(anchor),
+        record.deploy_root.as_deref().map(Path::new),
+        path,
+        true,
+        protected,
+    )
 }
 
 fn prune_stale_manifest_children(
