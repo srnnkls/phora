@@ -496,10 +496,13 @@ Take subsets and renames the offer. A binding's `take` is a list whose entries a
 - a gitignore glob (any entry with `*`, `?`, `[`, `]`, or a trailing `/`, e.g.
   `"nvim/**"`) — expands over the offer set only, never widening it;
 - a rename table `{ "src" = "dest" }` — the offered leaf `src` is consumed and
-  emitted at `dest` instead (destructive: it does not also land at `src`).
+  emitted at `dest` instead (destructive: it does not also land at `src`);
+- a subtree rename `{ "dir/" = "dest" }` — a `src` ending in `/` re-roots every
+  offered leaf under `dir/` at `dest` (`"."` is the target root).
 
-A literal or rename `src` that is not in the offer is a hard error (a `take` may not
-widen the offer; the diagnostic suggests the closest offered leaf). A glob that
+A literal or rename `src` that is not in the offer, or a subtree `src` covering no
+offered leaf, is a hard error (a `take` may not widen the offer; the diagnostic
+suggests the closest offered leaf or directory). A glob that
 matches nothing warns but does not fail. An omitted `take` takes the whole offer;
 `take = []` takes nothing.
 
@@ -629,6 +632,31 @@ layout.
 - Copy and link both work. Default `deploy = "copy"` materializes the leaf;
   `deploy = "link"` (local-path only — see [Link mode](#link-mode-local-development))
   makes the dest a symlink to the source leaf in the working tree.
+
+Subtree renames. A `src` ending in `/` renames a whole directory: every offered
+leaf under it is emitted with that prefix replaced by `dest`. `dest = "."` re-roots
+at the target root; any other `dest` must be a portable relative path. One generated
+tree can then feed several targets:
+
+```toml
+[sources.henia]
+path = "./.henia"
+deploy = "link"
+
+[targets.claude]
+path = "~/.claude"
+sources.henia = { take = [{ "claude/" = "." }] }   # claude/skills/a/SKILL.md -> skills/a/SKILL.md
+
+[targets.codex]
+path = "~/.codex"
+sources.henia = { take = [{ "codex/" = "." }] }
+```
+
+A literal or leaf rename inside the subtree wins for that leaf, a glob in the same
+`take` does not re-emit a re-rooted leaf, and the longest matching subtree `src`
+wins. Duplicate-destination and portable-`dest` rules apply per re-rooted leaf.
+Re-rooted leaves are renames, so they deploy per-leaf: an omitted `collapse` and
+`collapse = false` behave the same, and `collapse = true` is rejected as blocked.
 
 Overlay. A binding's `take` lives on the binding, and a `phora.local.toml` `sources`
 list replaces the base target's list wholesale — it does not merge per binding. A

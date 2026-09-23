@@ -188,9 +188,13 @@ fn classify_take_error(error: Error, offer: &[String], take: &TakeSpec) -> Proje
     {
         let offered: BTreeSet<&str> = offer.iter().map(String::as_str).collect();
         let unoffered = literals.iter().any(|leaf| !offered.contains(leaf.as_str()))
-            || renames
-                .iter()
-                .any(|(src, _)| !offered.contains(src.as_str()));
+            || renames.iter().any(|(src, _)| {
+                if src.ends_with('/') {
+                    !offer.iter().any(|leaf| leaf.starts_with(src.as_str()))
+                } else {
+                    !offered.contains(src.as_str())
+                }
+            });
         if unoffered {
             return ProjectionError::LeafNotOffered {
                 rendered: Box::new(error),
@@ -725,6 +729,61 @@ mod projection_builder_tests {
             "a rename emits the leaf only at its destination and consumes the original"
         );
         assert_eq!(dests(&binding), vec!["renamed.md".to_string()]);
+    }
+
+    fn subtree_case(source: &ParsedSource, collapse: Option<bool>) -> Case<'_> {
+        let mut case = Case::flat(source, &["claude/skills/a/SKILL.md", "claude/CLAUDE.md"]);
+        case.take = Some(vec![TakeEntry::Rename {
+            src: "claude/".to_string(),
+            dest: ".".to_string(),
+        }]);
+        case.collapse = collapse;
+        case
+    }
+
+    #[test]
+    fn take_subtree_rename_deploys_per_leaf_under_default_and_forced_per_leaf_collapse() {
+        let source = source_with(None, &["**"], &[], DeployMode::Link);
+        for collapse in [None, Some(false)] {
+            let binding = subtree_case(&source, collapse).project();
+            assert_eq!(
+                materializations(&binding),
+                vec![
+                    leaf("claude/CLAUDE.md", "CLAUDE.md"),
+                    leaf("claude/skills/a/SKILL.md", "skills/a/SKILL.md"),
+                ],
+                "re-rooted leaves are renames, so collapse `{collapse:?}` keeps them per-leaf"
+            );
+        }
+    }
+
+    #[test]
+    fn take_subtree_rename_with_forced_collapse_is_blocked() {
+        let source = source_with(None, &["**"], &[], DeployMode::Link);
+        let err = subtree_case(&source, Some(true))
+            .try_project()
+            .expect_err("forced collapse over a re-rooted subtree must be rejected");
+        assert!(
+            matches!(err, ProjectionError::CollapseBlocked { .. }),
+            "a re-rooted subtree blocks a forced collapse; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn take_subtree_prefix_outside_offer_is_leaf_not_offered() {
+        let source = source_with(None, &["**"], &[], DeployMode::Copy);
+        let mut case = Case::flat(&source, &["claude/a.md"]);
+        case.take = Some(vec![TakeEntry::Rename {
+            src: "codex/".to_string(),
+            dest: ".".to_string(),
+        }]);
+        let err = case
+            .try_project()
+            .expect_err("a subtree prefix outside the offer must hard-error");
+        assert!(
+            matches!(err, ProjectionError::LeafNotOffered { .. }),
+            "an unoffered subtree prefix is a structured LeafNotOffered; got {err:?}"
+        );
     }
 
     #[test]
