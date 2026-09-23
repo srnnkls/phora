@@ -1,7 +1,6 @@
 //! A preparation boundary inside one synchronization, sharing its registry and journal.
 
-use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -16,9 +15,9 @@ use super::progress::{
 use super::request::SyncEvents;
 use super::state::StateStore;
 use super::{
-    AppliedChange, HookOutcome, HookStatus, LockSet, RunOptions, SkippedChange, SourcePolicy,
-    SyncExecution, SyncRunInput, SyncStatus, SyncWarning, SyncWorkspace, confine, hooks, summarize,
-    sync_workspace,
+    AppliedChange, HookOutcome, HookStatus, LockSet, Placement, RunOptions, SkippedChange,
+    SourcePolicy, SyncExecution, SyncRunInput, SyncStatus, SyncWarning, SyncWorkspace, confine,
+    hooks, summarize, sync_workspace,
 };
 
 /// Select records for reconciliation while retaining the single persistent state owner.
@@ -27,7 +26,10 @@ pub(super) enum TargetScope {
     #[default]
     All,
     Prepare(BTreeSet<String>),
-    Deploy(BTreeSet<String>),
+    Deploy {
+        prepared: BTreeSet<String>,
+        roots: Vec<Placement>,
+    },
 }
 
 impl TargetScope {
@@ -35,7 +37,7 @@ impl TargetScope {
         match self {
             Self::All => true,
             Self::Prepare(targets) => targets.contains(target),
-            Self::Deploy(targets) => !targets.contains(target),
+            Self::Deploy { prepared, .. } => !prepared.contains(target),
         }
     }
 
@@ -45,63 +47,120 @@ impl TargetScope {
             .filter(|r| self.contains(&r.key.target))
             .collect()
     }
+
+    /// Preparation trees that deployed artifacts must stay out of.
+    pub fn reserved(&self) -> &[Placement] {
+        match self {
+            Self::Deploy { roots, .. } => roots,
+            Self::All | Self::Prepare(_) => &[],
+        }
+    }
+}
+
+/// Rejects a deployed artifact inside a preparation tree, or a preparation tree inside
+/// a deployed artifact.
+pub(super) fn reject_prepared_overlap(artifacts: &[Placement], roots: &[Placement]) -> Result<()> {
+    for root in roots {
+        if let Some(artifact) = artifacts.iter().find(|a| a.overlaps(root)) {
+            return Err(Error::Config(format!(
+                "prepare and deploy targets `{}` and `{}` overlap at {}; use separate destination trees",
+                root.target,
+                artifact.target,
+                artifact.physical.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn overlap_error(prepare: &str, deploy: &str) -> Error {
+    Error::Config(format!(
+        "prepare and deploy targets `{prepare}` and `{deploy}` overlap; use separate destination trees"
+    ))
 }
 
 pub(super) struct Preparation {
-    roots: Vec<PathBuf>,
+    roots: Vec<Placement>,
+    /// Deploy targets rooted above a preparation tree; their artifacts decide overlap.
+    ancestors: BTreeMap<String, String>,
     pub sources: BTreeSet<String>,
     deploy_sources: BTreeSet<String>,
 }
 
 impl Preparation {
     pub fn new(config: &Config) -> Result<Self> {
+        let mut preparation = Self {
+            roots: Vec::new(),
+            ancestors: BTreeMap::new(),
+            sources: BTreeSet::new(),
+            deploy_sources: BTreeSet::new(),
+        };
         if !config
             .targets
             .values()
             .any(|t| t.phase() == TargetPhase::Prepare)
         {
-            return Ok(Self {
-                roots: Vec::new(),
-                sources: BTreeSet::new(),
-                deploy_sources: BTreeSet::new(),
-            });
+            return Ok(preparation);
         }
         let cwd = std::env::current_dir()?;
-        let mut roots = Vec::new();
-        let mut sources = BTreeSet::new();
-        let mut deploy_sources = BTreeSet::new();
-        let mut destinations = Vec::new();
+        let mut deploys = Vec::new();
         for (name, target) in &config.targets {
             let names = target
                 .declared_sources()
                 .chain(target.imports.iter().flatten().map(|i| i.source.as_str()));
-            let physical = confine::fold_path(&confine::normalize_physical(
-                &cwd.join(target.expanded_path()),
-            )?);
+            let placement = Placement::new(name, &cwd.join(target.expanded_path()), false)?;
             if target.phase() == TargetPhase::Prepare {
-                sources.extend(names.map(str::to_owned));
-                roots.push(physical.clone());
+                preparation.sources.extend(names.map(str::to_owned));
+                preparation.roots.push(placement);
             } else {
-                deploy_sources.extend(names.map(str::to_owned));
+                preparation.deploy_sources.extend(names.map(str::to_owned));
+                deploys.push(placement);
             }
-            destinations.push((name, target.phase(), physical));
         }
-        for (name, phase, path) in &destinations {
-            for (other, other_phase, other_path) in &destinations {
-                if phase != other_phase
-                    && (path.starts_with(other_path) || other_path.starts_with(path))
-                {
-                    return Err(Error::Config(format!(
-                        "prepare and deploy targets `{name}` and `{other}` overlap; use separate destination trees"
-                    )));
+        for root in &preparation.roots {
+            for deploy in &deploys {
+                if deploy.is_within(root) {
+                    return Err(overlap_error(&root.target, &deploy.target));
+                }
+                if root.overlaps(deploy) {
+                    preparation
+                        .ancestors
+                        .insert(deploy.target.clone(), root.target.clone());
                 }
             }
         }
-        Ok(Self {
-            roots,
-            sources,
-            deploy_sources,
-        })
+        Ok(preparation)
+    }
+
+    /// Proves, before preparation writes, that deploy targets rooted above a preparation
+    /// tree project no artifact into it. A target that cannot be projected yet is rejected.
+    fn reject_ancestor_overlap(
+        &self,
+        input: &SyncRunInput<'_>,
+        deployed: &SyncWorkspace,
+        backend: &dyn SourceStore,
+    ) -> Result<()> {
+        for (name, prepare) in &self.ancestors {
+            let mut part = deployed.clone();
+            part.config.targets.retain(|n, _| n == name);
+            let Some(target) = part.config.targets.get(name) else {
+                continue;
+            };
+            let names: BTreeSet<_> = target
+                .declared_sources()
+                .chain(target.imports.iter().flatten().map(|i| i.source.as_str()))
+                .map(str::to_owned)
+                .collect();
+            part.parsed.retain(|n, _| names.contains(n));
+            part.import_refs.retain(|i| names.contains(&i.source));
+            let artifacts = super::project_placements(input, &part, backend).map_err(|e| {
+                Error::Config(format!(
+                    "prepare and deploy targets `{prepare}` and `{name}` may overlap, and `{name}` cannot be projected before preparation ({e}); use separate destination trees"
+                ))
+            })?;
+            reject_prepared_overlap(&artifacts, &self.roots)?;
+        }
+        Ok(())
     }
 
     pub fn enabled(&self, config: &Config) -> bool {
@@ -116,7 +175,10 @@ impl Preparation {
         let path = confine::fold_path(&confine::normalize_physical(
             &std::env::current_dir()?.join(path),
         )?);
-        Ok(self.roots.iter().any(|root| path.starts_with(root)))
+        Ok(self
+            .roots
+            .iter()
+            .any(|root| path.starts_with(root.identity())))
     }
 
     fn targets(
@@ -227,7 +289,7 @@ pub(super) fn sync<R: StateStore>(
     let mut prepared = preparation.partition(workspace, true)?;
     prepared.target_scope = TargetScope::Prepare(targets.clone());
     let mut deployed = preparation.partition(workspace, false)?;
-    deployed.target_scope = TargetScope::Deploy(targets);
+    preparation.reject_ancestor_overlap(input, &deployed, backend)?;
     let sink = PhaseSink {
         inner: input.sink(),
         summaries: Mutex::new(Vec::new()),
@@ -274,7 +336,10 @@ pub(super) fn sync<R: StateStore>(
         return Ok(result);
     }
     // A generator may create symlinks. Recheck physical target separation before applying outputs.
-    Preparation::new(&super::merged_config(input))?;
+    deployed.target_scope = TargetScope::Deploy {
+        prepared: targets,
+        roots: Preparation::new(&super::merged_config(input))?.roots,
+    };
     phase_input.locks = if input.refresh_sources() {
         result.report.locks.clone()
     } else {
