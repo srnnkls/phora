@@ -3008,8 +3008,7 @@ path = "srnnkls/tropos"
 
             let mirror = mirror_path(git_dir.path(), &url);
             let phora_ref_exists = gix::open(&mirror)
-                .ok()
-                .is_some_and(|repo| repo.find_reference("refs/heads/phora").is_ok());
+                .is_ok_and(|repo| repo.find_reference("refs/heads/phora").is_ok());
             assert!(
                 !phora_ref_exists,
                 "a digest mismatch must abort BEFORE import: a git-level lookup of \

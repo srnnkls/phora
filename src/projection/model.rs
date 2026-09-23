@@ -206,7 +206,7 @@ impl TakeSpec {
                     directives.push(Take::Glob(glob));
                 }
                 for (src, dest) in renames {
-                    directives.push(Take::Rename { src, dest });
+                    directives.push(Take::rename(src, dest));
                 }
                 Some(directives)
             }

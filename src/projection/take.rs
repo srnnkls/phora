@@ -26,6 +26,21 @@ pub enum Take<'a> {
     Glob(&'a str),
     /// A destructive rename: literal `src` is consumed out, emitted at `dest`.
     Rename { src: &'a str, dest: &'a str },
+    /// A subtree rename: every offered leaf under `prefix` (ending in `/`) is
+    /// re-rooted at `dest`; `dest = "."` is the deploy root.
+    Subtree { prefix: &'a str, dest: &'a str },
+}
+
+impl<'a> Take<'a> {
+    /// Classifies a rename pair: a `src` ending in `/` names a subtree.
+    #[must_use]
+    pub fn rename(src: &'a str, dest: &'a str) -> Self {
+        if src.ends_with('/') {
+            Self::Subtree { prefix: src, dest }
+        } else {
+            Self::Rename { src, dest }
+        }
+    }
 }
 
 /// A kept published-leaf mapping: `source` (an offered leaf) deploys at `dest`.
@@ -57,9 +72,10 @@ pub struct TakeResolution {
 ///
 /// # Errors
 ///
-/// Returns an error when a literal/rename-src is not offered, when a leaf is
-/// both literal and rename-src, when two sources resolve to the same dest, or
-/// when a rename dest fails `safe_relpath`.
+/// Returns an error when a literal/rename-src is not offered, when a subtree
+/// prefix covers no offered leaf, when a leaf is both literal and rename-src,
+/// when two sources resolve to the same dest, or when a rename dest fails
+/// `safe_relpath`.
 pub fn resolve_take(offer: &[String], take: Option<&[Take]>) -> Result<TakeResolution> {
     let Some(directives) = take else {
         return Ok(identity(offer));
@@ -69,17 +85,22 @@ pub fn resolve_take(offer: &[String], take: Option<&[Take]>) -> Result<TakeResol
     let literals = collect_literals(directives, &offered)?;
     let renames = collect_renames(directives, &offered, &literals)?;
 
-    let consumed: BTreeSet<&str> = literals
+    let mut consumed: BTreeSet<&str> = literals
         .iter()
         .copied()
         .chain(renames.iter().map(|(src, _)| *src))
         .collect();
+    let subtrees = collect_subtrees(directives, offer, &consumed)?;
+    consumed.extend(subtrees.iter().map(|(src, _)| *src));
 
     let mut kept = Vec::new();
     for &leaf in &literals {
         kept.push(mapping(leaf, leaf));
     }
     for &(src, dest) in &renames {
+        kept.push(mapping(src, dest));
+    }
+    for (src, dest) in &subtrees {
         kept.push(mapping(src, dest));
     }
 
@@ -145,6 +166,58 @@ fn collect_renames<'a>(
         }
     }
     Ok(renames)
+}
+
+/// Re-roots every offered leaf under a subtree prefix not already consumed by a
+/// literal or leaf rename; the longest matching prefix wins.
+fn collect_subtrees<'o>(
+    directives: &[Take],
+    offer: &'o [String],
+    consumed: &BTreeSet<&str>,
+) -> Result<Vec<(&'o str, String)>> {
+    let mut roots: BTreeMap<&str, (&str, String)> = BTreeMap::new();
+    for directive in directives {
+        let Take::Subtree { prefix, dest } = directive else {
+            continue;
+        };
+        if !offer.iter().any(|leaf| leaf.starts_with(prefix)) {
+            return Err(non_offered_subtree_diagnostic(prefix, offer));
+        }
+        let root = subtree_root(dest)?;
+        match roots.get(prefix) {
+            Some((prior, prior_root)) if *prior_root != root => {
+                return Err(rename_fan_out_diagnostic(prefix, prior, dest));
+            }
+            Some(_) => {}
+            None => {
+                roots.insert(prefix, (dest, root));
+            }
+        }
+    }
+    let mut subtrees = Vec::new();
+    for leaf in offer {
+        if consumed.contains(leaf.as_str()) {
+            continue;
+        }
+        let longest = roots
+            .iter()
+            .filter(|(prefix, _)| leaf.starts_with(*prefix))
+            .max_by_key(|(prefix, _)| prefix.len());
+        if let Some((prefix, (_, root))) = longest {
+            subtrees.push((leaf.as_str(), format!("{root}{}", &leaf[prefix.len()..])));
+        }
+    }
+    Ok(subtrees)
+}
+
+/// The dest prefix a subtree re-roots under: empty for `.`, else `dest/`.
+fn subtree_root(dest: &str) -> Result<String> {
+    let trimmed = dest.strip_suffix('/').unwrap_or(dest);
+    if trimmed == "." {
+        return Ok(String::new());
+    }
+    crate::source::safe_relpath(trimmed).map_err(|_| unsafe_dest_diagnostic(dest))?;
+    Ok(format!("{trimmed}/"))
 }
 
 fn expand_globs(
@@ -217,6 +290,23 @@ fn non_offered_diagnostic(entry: &str, offered: &BTreeSet<&str>) -> crate::error
         why: "not present in the offer; `take` may not widen the offer".to_string(),
         did_you_mean: crate::diagnostic::did_you_mean(entry, offered.iter().copied()),
         remedy: "name a leaf the source offers, or add it to the source's include".to_string(),
+        debug_hint: Some(KERNEL_ATTRIBUTION_HINT.to_string()),
+        details: Vec::new(),
+    }
+    .sync()
+}
+
+fn non_offered_subtree_diagnostic(prefix: &str, offer: &[String]) -> crate::error::Error {
+    let dirs: BTreeSet<&str> = offer
+        .iter()
+        .flat_map(|leaf| leaf.match_indices('/').map(|(cut, _)| &leaf[..=cut]))
+        .collect();
+    SelectionDiagnostic {
+        entry: prefix.to_string(),
+        matched_against: "the offer set".to_string(),
+        why: "no offered leaf lies under this subtree; `take` may not widen the offer".to_string(),
+        did_you_mean: crate::diagnostic::did_you_mean(prefix, dirs.iter().copied()),
+        remedy: "name a directory the source offers, or add it to the source's include".to_string(),
         debug_hint: Some(KERNEL_ATTRIBUTION_HINT.to_string()),
         details: Vec::new(),
     }
@@ -995,6 +1085,108 @@ mod take_resolution_tests {
             super::fold_dest("\u{03c3}"), // σ small sigma
             "the fold IS full-Unicode for ordinary case pairs: `\u{03a3}` lowercases to \
              `\u{03c3}`; only the final-sigma special case diverges from full folding"
+        );
+    }
+
+    fn subtree<'a>(prefix: &'a str, dest: &'a str) -> Take<'a> {
+        Take::rename(prefix, dest)
+    }
+
+    #[test]
+    fn a_subtree_rename_to_dot_re_roots_leaves_at_the_deploy_root() {
+        let offer = offer(&[
+            "claude/CLAUDE.md",
+            "claude/skills/a/SKILL.md",
+            "codex/AGENTS.md",
+        ]);
+        let res = resolve(&offer, &[subtree("claude/", ".")]);
+        assert_kept(
+            &res,
+            &[
+                ("claude/CLAUDE.md", "CLAUDE.md"),
+                ("claude/skills/a/SKILL.md", "skills/a/SKILL.md"),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_subtree_rename_to_a_prefix_re_roots_leaves_under_it() {
+        let offer = offer(&["claude/skills/a/SKILL.md", "other.md"]);
+        for dest in ["x/", "x"] {
+            let res = resolve(&offer, &[subtree("claude/", dest)]);
+            assert_kept(&res, &[("claude/skills/a/SKILL.md", "x/skills/a/SKILL.md")]);
+        }
+    }
+
+    #[test]
+    fn a_subtree_prefix_covering_no_offered_leaf_is_rejected_with_a_suggestion() {
+        let offer = offer(&["claude/skills/a/SKILL.md"]);
+        let rendered = rendered_error(&offer, &[subtree("claud/", ".")]);
+        assert_named_diagnostic(&rendered, "claud/");
+        assert!(
+            rendered.contains(DID_YOU_MEAN) && rendered.contains("claude/"),
+            "the rejection must suggest the closest offered directory; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn an_escaping_or_absolute_subtree_dest_is_rejected() {
+        let offer = offer(&["claude/a.md"]);
+        for dest in ["../up", "x/../../up", "/abs", ""] {
+            let rendered = rendered_error(&offer, &[subtree("claude/", dest)]);
+            assert!(
+                rendered.contains("rename destination is not a portable relative path"),
+                "dest `{dest}` must be rejected as unsafe; got:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_glob_overlapping_a_subtree_does_not_emit_its_leaves_twice() {
+        let offer = offer(&["claude/a.md", "top.md"]);
+        let res = resolve(&offer, &[Take::Glob("**/*.md"), subtree("claude/", "c/")]);
+        assert_kept(&res, &[("claude/a.md", "c/a.md"), ("top.md", "top.md")]);
+    }
+
+    #[test]
+    fn a_leaf_rename_inside_a_subtree_wins_for_that_leaf() {
+        let offer = offer(&["claude/a.md", "claude/b.md"]);
+        let res = resolve(
+            &offer,
+            &[
+                subtree("claude/", "."),
+                Take::Rename {
+                    src: "claude/b.md",
+                    dest: "renamed/b.md",
+                },
+            ],
+        );
+        assert_kept(
+            &res,
+            &[("claude/a.md", "a.md"), ("claude/b.md", "renamed/b.md")],
+        );
+    }
+
+    #[test]
+    fn the_longest_subtree_prefix_wins() {
+        let offer = offer(&["claude/a.md", "claude/skills/s.md"]);
+        let res = resolve(
+            &offer,
+            &[subtree("claude/", "."), subtree("claude/skills/", "s/")],
+        );
+        assert_kept(
+            &res,
+            &[("claude/a.md", "a.md"), ("claude/skills/s.md", "s/s.md")],
+        );
+    }
+
+    #[test]
+    fn a_subtree_colliding_with_another_kept_leaf_is_a_duplicate_dest() {
+        let offer = offer(&["claude/a.md", "a.md"]);
+        let rendered = rendered_error(&offer, &[subtree("claude/", "."), Take::Literal("a.md")]);
+        assert!(
+            rendered.contains("two distinct sources resolve to the same destination"),
+            "a subtree dest colliding with a literal must fail the dup-dest check; got:\n{rendered}"
         );
     }
 }

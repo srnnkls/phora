@@ -14,7 +14,7 @@ fn decode_hex32(hex: &str) -> [u8; 32] {
     let bytes = hex.as_bytes();
     assert_eq!(bytes.len(), 64, "fixture hex must be 64 chars");
     let mut out = [0u8; 32];
-    for (slot, pair) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+    for (slot, pair) in out.iter_mut().zip(bytes.as_chunks::<2>().0) {
         let hi = (pair[0] as char).to_digit(16).expect("hex digit");
         let lo = (pair[1] as char).to_digit(16).expect("hex digit");
         *slot = u8::try_from(hi * 16 + lo).expect("hex pair fits in u8");
