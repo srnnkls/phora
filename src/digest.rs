@@ -109,7 +109,7 @@ fn decode_hex32(hex: &str) -> Option<[u8; 32]> {
         return None;
     }
     let mut out = [0u8; 32];
-    for (slot, pair) in out.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
+    for (slot, pair) in out.iter_mut().zip(hex.as_bytes().as_chunks::<2>().0) {
         *slot = (hex_digit(pair[0])? << 4) | hex_digit(pair[1])?;
     }
     Some(out)
