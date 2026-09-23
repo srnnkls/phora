@@ -450,14 +450,18 @@ impl SourceStore for GitBackend {
                     normalized_location: SourceIdentity::Git(normalized),
                 })
             }
-            SourceLocation::Worktree { root } => {
+            SourceLocation::Worktree {
+                root,
+                follow_symlinks,
+            } => {
                 if !matches!(request.revision, RevisionSpec::Default | RevisionSpec::None) {
                     return Err(SourceError::Source(format!(
                         "worktree source {} cannot select a git revision",
                         request.name
                     )));
                 }
-                let resolved = resolve_worktree(&self.git_dir, &request.name, root)?;
+                let resolved =
+                    resolve_worktree(&self.git_dir, &request.name, root, *follow_symlinks)?;
                 self.forget_opened_mirror(&mirror_path_for_key(
                     &self.git_dir,
                     resolved.snapshot.mirror(),

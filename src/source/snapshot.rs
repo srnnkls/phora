@@ -69,9 +69,17 @@ impl CanonicalSourceRoot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceLocation {
-    Git { url: String },
-    Url { url: String },
-    Worktree { root: PathBuf },
+    Git {
+        url: String,
+    },
+    Url {
+        url: String,
+    },
+    /// `follow_symlinks` captures a symlink's target content at the link's logical path.
+    Worktree {
+        root: PathBuf,
+        follow_symlinks: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

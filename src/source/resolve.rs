@@ -12,8 +12,9 @@ pub(super) fn resolve_worktree(
     git_dir: &Path,
     name: &SourceName,
     root: &Path,
+    follow_symlinks: bool,
 ) -> Result<ResolvedSource> {
-    let snapshot = capture_worktree(git_dir, name, root)?;
+    let snapshot = capture_worktree(git_dir, name, root, follow_symlinks)?;
     let SnapshotId::Worktree { root, head, .. } = &snapshot else {
         unreachable!("capture_worktree always returns a worktree snapshot");
     };

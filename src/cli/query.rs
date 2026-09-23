@@ -631,14 +631,14 @@ pub(crate) fn explain_cmd(
 
     let (commit, candidates) = match src.deploy_mode() {
         DeployMode::Link => {
-            let leaves =
-                crate::sync::discover::discover_working_tree_leaves(Path::new(remote), None)
-                    .map_err(|_| {
-                        cache_miss_diagnostic(
-                            binding.source,
-                            "the source working tree is unavailable",
-                        )
-                    })?;
+            let leaves = crate::sync::discover::discover_working_tree_leaves(
+                Path::new(remote),
+                None,
+                src.export_policy(false).allow_symlinks,
+            )
+            .map_err(|_| {
+                cache_miss_diagnostic(binding.source, "the source working tree is unavailable")
+            })?;
             ("link".to_owned(), leaves)
         }
         DeployMode::Copy => {

@@ -219,7 +219,11 @@ fn preview_link(
     warnings: &mut Vec<BindingWarnings>,
 ) -> Result<()> {
     let git = remote_for(ctx.remotes, ctx.binding.source)?;
-    let Ok(candidates) = discover_working_tree_leaves(Path::new(git), None) else {
+    let Ok(candidates) = discover_working_tree_leaves(
+        Path::new(git),
+        None,
+        ctx.source.export_policy(false).allow_symlinks,
+    ) else {
         entries.push(annotation(ctx, "link", SyncState::LinkWorkingTreeGone));
         return Ok(());
     };

@@ -86,6 +86,10 @@ pub(super) fn confine_removal_destination(
     Ok(path)
 }
 
+pub(super) fn within_anchor(anchor: &Path, path: &Path) -> bool {
+    starts_with_components(&normalize_lexical(path), &normalize_lexical(anchor))
+}
+
 /// Returns the path deploy must write verbatim, or rejects any escape of `anchor`.
 pub(super) fn confine_destination(
     anchor: &Path,
@@ -94,6 +98,20 @@ pub(super) fn confine_destination(
 ) -> Result<PathBuf> {
     let path = confine_path(anchor, dst, protected)?;
     reject_symlink_ancestor(&normalize_lexical(anchor), &path)?;
+    Ok(path)
+}
+
+/// Like [`confine_destination`] for a destination replaced or removed as one directory
+/// entry and never written through, so the entry itself may already be a symlink.
+pub(super) fn confine_entry_destination(
+    anchor: &Path,
+    dst: &Path,
+    protected: &ProtectedPathSet,
+) -> Result<PathBuf> {
+    let path = confine_path(anchor, dst, protected)?;
+    if let Some(parent) = path.parent() {
+        reject_symlink_ancestor(&normalize_lexical(anchor), parent)?;
+    }
     Ok(path)
 }
 
@@ -162,9 +180,14 @@ fn reject_if_symlink(path: &Path) -> Result<()> {
     }
 }
 
+/// The swap moves any existing `dst` entry aside, so only its ancestors are guarded.
 /// Residual risk: a cross-process TOCTOU race and hardlink-to-directory canonicalization stay unguarded.
 pub(super) fn reject_symlink_ancestor_at_write(anchor: &Path, dst: &Path) -> Result<()> {
-    reject_symlink_ancestor(&normalize_lexical(anchor), &normalize_lexical(dst))
+    let dst = normalize_lexical(dst);
+    match dst.parent() {
+        Some(parent) => reject_symlink_ancestor(&normalize_lexical(anchor), parent),
+        None => Ok(()),
+    }
 }
 
 /// Collapses `.`/`..` without touching the filesystem, so confinement holds for paths that do not yet exist.
@@ -711,5 +734,29 @@ mod tests {
             "the fold IS full-Unicode for ordinary case pairs: capital `\u{03a3}` still lowercases \
              to `\u{03c3}`; only the final-sigma special case diverges from full folding"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn entry_destination_admits_a_symlink_leaf_but_not_a_symlink_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path();
+        let anchor = root.join("anchor");
+        let escape = root.join("escape");
+        std::fs::create_dir_all(anchor.join("skills")).expect("anchor");
+        std::fs::create_dir_all(&escape).expect("escape");
+        symlink(escape.join("SKILL.md"), anchor.join("skills/SKILL.md")).expect("leaf link");
+        symlink(&escape, anchor.join("linked")).expect("ancestor link");
+        let set = protected(root);
+
+        confine_entry_destination(&anchor, &anchor.join("skills/SKILL.md"), &set)
+            .expect("a symlink leaf is replaced or removed as an entry, never followed");
+        let err = confine_entry_destination(&anchor, &anchor.join("linked/SKILL.md"), &set)
+            .expect_err("a symlink ancestor would be followed");
+        assert!(err_message(&err).contains(ANCHOR_SYMLINK));
+        confine_destination(&anchor, &anchor.join("skills/SKILL.md"), &set)
+            .expect_err("a written-through destination still rejects a symlink leaf");
     }
 }

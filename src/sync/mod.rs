@@ -1580,6 +1580,7 @@ struct BindingOffer<'projection> {
 struct SealedRecordPolicy {
     immutable_copy: bool,
     commit_differs: bool,
+    mode_switched: bool,
 }
 
 impl SealedRecordPolicy {
@@ -1587,6 +1588,7 @@ impl SealedRecordPolicy {
         Self {
             immutable_copy: !record.linked && offer.deploy_mode == DeployMode::Copy,
             commit_differs: record.commit != offer.projected.commit,
+            mode_switched: record.linked != (offer.deploy_mode == DeployMode::Link),
         }
     }
 
@@ -1607,7 +1609,8 @@ impl SealedRecordPolicy {
 /// records are actionable `--fast-forward` drops. A historical linked record or current Link
 /// binding without positive attribution remains ambiguous and seals, even when the current offer
 /// excludes every available candidate. `--prune` also admits a dangling file link
-/// when it still points to an admitted path in the current live source root.
+/// when it still points to an admitted path in the current live source root, and any record
+/// deployed in the other mode: switching between copy and link replaces the whole snapshot.
 fn validate_sealed_offer(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
@@ -1670,7 +1673,7 @@ fn validate_sealed_offer(
             continue;
         }
         let policy = SealedRecordPolicy::classify(record, offer);
-        if policy.same_snapshot_transition() {
+        if policy.same_snapshot_transition() || (prune && policy.mode_switched) {
             continue;
         }
         let source_paths = record_source_paths(offer.projected, record)?;

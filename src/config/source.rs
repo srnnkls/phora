@@ -211,6 +211,15 @@ impl ParsedSource {
         self.deploy.unwrap_or(DeployMode::Copy)
     }
 
+    /// Rebinds this source to a live working tree at `root`, dropping any ref.
+    pub(crate) fn link_worktree(&mut self, root: &str) {
+        self.remote = Remote::Path(root.to_owned());
+        self.deploy = Some(DeployMode::Link);
+        self.branch = None;
+        self.tag = None;
+        self.rev = None;
+    }
+
     #[must_use]
     pub fn includes(&self) -> &[String] {
         self.include.as_deref().unwrap_or(&[])
@@ -388,6 +397,7 @@ impl Source {
         let local_forge_kind = local.host.is_some() || local.repo.is_some();
         let local_local_kind = local.path.is_some() && !local_forge_kind;
         let local_url_kind = local.url.is_some();
+        let local_ref = local.branch.is_some() || local.tag.is_some() || local.rev.is_some();
         if local_git_kind {
             self.git = local.git;
             self.host = None;
@@ -429,7 +439,7 @@ impl Source {
         if local.protocol.is_some() {
             self.protocol = local.protocol;
         }
-        if local.branch.is_some() || local.tag.is_some() || local.rev.is_some() {
+        if local_ref {
             self.branch = local.branch;
             self.tag = local.tag;
             self.rev = local.rev;
@@ -454,6 +464,11 @@ impl Source {
         }
         if local.transitive.is_some() {
             self.transitive = local.transitive;
+        }
+        if local_local_kind && self.deploy == Some(DeployMode::Link) && !local_ref {
+            self.branch = None;
+            self.tag = None;
+            self.rev = None;
         }
         self
     }

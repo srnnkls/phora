@@ -166,6 +166,9 @@ fn scrub_target_bindings(doc: &mut DocumentMut, name: &str) -> Result<()> {
             for key in doomed {
                 table.remove(&key);
             }
+            if table.is_empty() {
+                keep_empty_sources_explicit(sources);
+            }
         }
     }
     Ok(())
@@ -248,11 +251,13 @@ pub fn remove_target(doc_text: &str, name: &str) -> Result<String> {
     Ok(doc.to_string())
 }
 
+fn target_item<'a>(doc: &'a mut DocumentMut, target: &str) -> Option<&'a mut Item> {
+    doc.get_mut("targets")?.as_table_like_mut()?.get_mut(target)
+}
+
 fn target_sources_item<'a>(doc: &'a mut DocumentMut, target: &str) -> Option<&'a mut Item> {
-    doc.get_mut("targets")?
+    target_item(doc, target)?
         .as_table_like_mut()?
-        .get_mut(target)?
-        .as_table_mut()?
         .get_mut("sources")
 }
 
@@ -527,14 +532,11 @@ pub fn bind(
 
     let mut doc = parse_doc(doc_text)?;
     {
-        let table = doc
-            .get_mut("targets")
+        let table = target_item(&mut doc, target)
             .and_then(Item::as_table_like_mut)
-            .and_then(|targets| targets.get_mut(target))
-            .and_then(Item::as_table_mut)
             .ok_or_else(|| Error::Config(format!("target `{target}` is not defined")))?;
         if !table.contains_key("sources") {
-            table["sources"] = value(Array::new());
+            table.insert("sources", value(Array::new()));
         }
     }
 
@@ -558,19 +560,65 @@ pub fn bind(
         }
     }
 
+    if changed {
+        format_inline_bindings(&mut doc, target);
+    }
     let text = doc.to_string();
     validate_edited(&text)?;
 
     Ok(BindResult { text, changed })
 }
 
+/// Appending to an inline table keeps the old last entry's closing-brace padding.
+fn format_inline_bindings(doc: &mut DocumentMut, target: &str) {
+    fn format(table: &mut InlineTable) {
+        table.fmt();
+        for (_, value) in table.iter_mut() {
+            if let Value::InlineTable(nested) = value {
+                format(nested);
+            }
+        }
+    }
+    if let Some(Item::Value(Value::InlineTable(table))) = target_item(doc, target) {
+        format(table);
+    } else if let Some(Item::Value(Value::InlineTable(table))) = target_sources_item(doc, target) {
+        format(table);
+    }
+}
+
+/// An inline target can only hold inline tables, so its list promotes to one.
 fn promote_sources_to_table(doc: &mut DocumentMut, target: &str) -> Result<()> {
+    let inline = target_item(doc, target).is_some_and(|item| item.is_inline_table());
     let item = target_sources_item(doc, target)
         .ok_or_else(|| Error::Config(format!("`{target}.sources` is missing")))?;
     if let Some(array) = item.as_value().and_then(Value::as_array) {
-        *item = Item::Table(list_to_keyed_table(array, target)?);
+        let table = list_to_keyed_table(array, target)?;
+        if inline {
+            *item = value(table.into_inline_table());
+        } else {
+            *item = Item::Table(table);
+            if let Some(mut key) = target_item(doc, target)
+                .and_then(Item::as_table_like_mut)
+                .and_then(|target| target.key_mut("sources"))
+            {
+                key.leaf_decor_mut().clear();
+            }
+        }
     }
     Ok(())
+}
+
+/// Dotted `sources.<id>` keys vanish once empty, which would drop the explicit empty
+/// binding set; it stays as `sources = {}`.
+fn keep_empty_sources_explicit(item: &mut Item) {
+    let dotted = match item {
+        Item::Table(table) => table.is_dotted(),
+        Item::Value(Value::InlineTable(table)) => table.is_dotted(),
+        _ => false,
+    };
+    if dotted {
+        *item = value(InlineTable::new());
+    }
 }
 
 #[derive(Debug)]
@@ -604,7 +652,11 @@ pub fn unbind(doc_text: &str, target: &str, identities: &[String]) -> Result<Unb
         for identity in identities {
             table.remove(identity);
         }
-        table.is_empty()
+        let empty = table.is_empty();
+        if empty {
+            keep_empty_sources_explicit(item);
+        }
+        empty
     } else {
         return Err(Error::Config(format!(
             "target `{target}` has no `sources` list; nothing to unbind"
@@ -1820,5 +1872,138 @@ mod tests {
 
         validate_source_references(&merged)
             .expect("every reference resolves, so validation must pass");
+    }
+
+    // Every target and `sources` form the parser accepts.
+
+    const FORM_SOURCES: &str = "\n[sources.a]\ngit = \"g\"\n\n[sources.b]\ngit = \"h\"\n";
+
+    const TARGET_FORMS: &[(&str, &str)] = &[
+        ("list", "[targets.t]\npath = \"~/x\"\nsources = [\"a\"]\n"),
+        (
+            "keyed table",
+            "[targets.t]\npath = \"~/x\"\n\n[targets.t.sources]\na = { collapse = false }\n",
+        ),
+        (
+            "inline sources table",
+            "[targets.t]\npath = \"~/x\"\nsources = { a = { collapse = false } }\n",
+        ),
+        (
+            "dotted sources keys",
+            "[targets.t]\npath = \"~/x\"\nsources.a = { collapse = false }\n",
+        ),
+        (
+            "inline target, list",
+            "[targets]\nt = { path = \"~/x\", sources = [\"a\"] }\n",
+        ),
+        (
+            "inline target, inline sources table",
+            "[targets]\nt = { path = \"~/x\", sources = { a = { collapse = false } } }\n",
+        ),
+        (
+            "inline target, dotted sources keys",
+            "[targets]\nt = { path = \"~/x\", sources.a = { collapse = false } }\n",
+        ),
+    ];
+
+    fn form_doc(target: &str) -> String {
+        format!("# keep me\nversion = 1\n\n{target}{FORM_SOURCES}")
+    }
+
+    fn bindings(text: &str) -> std::collections::BTreeMap<String, crate::config::Binding> {
+        let config = Config::parse(text).unwrap_or_else(|e| panic!("re-parse {text}: {e}"));
+        config.targets["t"]
+            .sources
+            .clone()
+            .unwrap_or_else(|| panic!("the target keeps an explicit sources set:\n{text}"))
+    }
+
+    fn assert_preserved(form: &str, text: &str) {
+        assert!(
+            text.starts_with("# keep me\nversion = 1\n"),
+            "{form}:\n{text}"
+        );
+        assert!(text.ends_with(FORM_SOURCES), "{form}:\n{text}");
+    }
+
+    #[test]
+    fn bare_bind_adds_to_every_sources_form() {
+        for (form, target) in TARGET_FORMS {
+            let result = bind(&form_doc(target), "t", &names(&["b"]), &bare())
+                .unwrap_or_else(|e| panic!("{form}: {e}"));
+            assert!(result.changed, "{form}");
+            let bound = bindings(&result.text);
+            assert_eq!(
+                bound.keys().collect::<Vec<_>>(),
+                ["a", "b"],
+                "{form}:\n{}",
+                result.text
+            );
+            assert_preserved(form, &result.text);
+        }
+    }
+
+    #[test]
+    fn refined_bind_adds_to_every_sources_form() {
+        let refinement = BindRefinement {
+            take: vec![TakeArg::parse("fas/=rules")],
+            ..BindRefinement::default()
+        };
+        for (form, target) in TARGET_FORMS {
+            let result = bind(&form_doc(target), "t", &names(&["b"]), &refinement)
+                .unwrap_or_else(|e| panic!("{form}: {e}"));
+            let bound = bindings(&result.text);
+            assert!(bound.contains_key("a"), "{form}:\n{}", result.text);
+            assert!(
+                bound["b"].take.as_ref().is_some_and(|take| take.len() == 1),
+                "{form}:\n{}",
+                result.text
+            );
+            assert!(
+                !result.text.contains(" ]") && !result.text.contains(" ,"),
+                "{form}:\n{}",
+                result.text
+            );
+            assert_preserved(form, &result.text);
+        }
+    }
+
+    #[test]
+    fn unbind_removes_from_every_sources_form() {
+        for (form, target) in TARGET_FORMS {
+            let two = bind(&form_doc(target), "t", &names(&["b"]), &bare())
+                .unwrap_or_else(|e| panic!("{form}: {e}"))
+                .text;
+            let result =
+                unbind(&two, "t", &names(&["a"])).unwrap_or_else(|e| panic!("{form}: {e}"));
+            assert!(!result.tombstoned, "{form}");
+            assert_eq!(
+                bindings(&result.text).keys().collect::<Vec<_>>(),
+                ["b"],
+                "{form}:\n{}",
+                result.text
+            );
+            assert_preserved(form, &result.text);
+        }
+    }
+
+    #[test]
+    fn unbinding_the_last_source_leaves_an_explicit_empty_set_in_every_form() {
+        for (form, target) in TARGET_FORMS {
+            let result = unbind(&form_doc(target), "t", &names(&["a"]))
+                .unwrap_or_else(|e| panic!("{form}: {e}"));
+            assert!(result.tombstoned, "{form}");
+            assert!(
+                bindings(&result.text).is_empty(),
+                "{form}:\n{}",
+                result.text
+            );
+            assert_eq!(
+                Config::parse(&result.text).expect("parse").targets["t"].path,
+                std::path::PathBuf::from("~/x"),
+                "{form}"
+            );
+            assert_preserved(form, &result.text);
+        }
     }
 }

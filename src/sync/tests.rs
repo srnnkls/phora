@@ -106,6 +106,7 @@ fn resolved_worktree_map(store: &dyn SourceStore, name: &str, root: &Path) -> Re
                 name: sn(name),
                 location: SourceLocation::Worktree {
                     root: root.to_path_buf(),
+                    follow_symlinks: false,
                 },
                 revision: RevisionSpec::None,
             },
@@ -6755,7 +6756,7 @@ fn build_worktree(root_sub: Option<&str>) -> TempDir {
 fn worktree_scan_returns_sorted_leaves_including_dotdirs_and_loose_files() {
     let wt = build_worktree(None);
 
-    let found = crate::sync::discover::discover_working_tree_leaves(wt.path(), None)
+    let found = crate::sync::discover::discover_working_tree_leaves(wt.path(), None, false)
         .expect("scanning an existing working tree must succeed");
 
     assert_eq!(
@@ -6779,6 +6780,7 @@ fn worktree_scan_honors_root_subdir() {
     let found = crate::sync::discover::discover_working_tree_leaves(
         wt.path(),
         Some(Path::new("languages")),
+        false,
     )
     .expect("scanning <git>/<root> must succeed");
 
@@ -6793,7 +6795,7 @@ fn worktree_scan_honors_root_subdir() {
         ],
         "with root set, leaves nested under <git>/languages must be discovered root-relative"
     );
-    let direct = crate::sync::discover::discover_working_tree_leaves(wt.path(), None)
+    let direct = crate::sync::discover::discover_working_tree_leaves(wt.path(), None, false)
         .expect("scanning the git root itself must succeed");
     assert_eq!(
         direct,
@@ -6817,7 +6819,7 @@ fn worktree_scan_missing_path_errors() {
         "premise: the child path under the tempdir must not exist"
     );
 
-    let err = crate::sync::discover::discover_working_tree_leaves(&missing, None)
+    let err = crate::sync::discover::discover_working_tree_leaves(&missing, None, false)
         .expect_err("an absent local path must be a clear error, not an empty list");
 
     let msg = err.to_string().to_lowercase();
@@ -6836,6 +6838,7 @@ fn worktree_scan_missing_root_errors() {
     let err = crate::sync::discover::discover_working_tree_leaves(
         wt.path(),
         Some(Path::new("absent-root")),
+        false,
     )
     .expect_err("a missing root subdir must error, not silently yield nothing");
 

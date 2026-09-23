@@ -139,8 +139,9 @@ impl Instance {
         }
     }
 
-    /// Packages that export their own snapshot keep artifact ownership across rebuilds.
-    /// The actual commit remains in the fetch node and hook trust preimage.
+    /// Packages that export their own snapshot keep artifact ownership across rebuilds and
+    /// across switches between a pinned remote and a linked working tree. The remote, ref,
+    /// and commit remain in the fetch node and hook trust preimage.
     #[must_use]
     pub fn for_package(
         parent: &str,
@@ -172,18 +173,23 @@ impl Instance {
     #[must_use]
     pub fn stable_key(&self) -> String {
         let mut hasher = blake3::Hasher::new();
+        let snapshot = if self.package {
+            vec!["package"]
+        } else {
+            vec![
+                self.fetch_node.url.as_str(),
+                self.fetch_node.r#ref.as_str(),
+                self.fetch_node.commit.as_str(),
+            ]
+        };
         for field in [
             self.parent.as_str(),
             self.source_name.as_str(),
             self.anchor_target.as_str(),
-            self.fetch_node.url.as_str(),
-            self.fetch_node.r#ref.as_str(),
-            if self.package {
-                "package"
-            } else {
-                self.fetch_node.commit.as_str()
-            },
-        ] {
+        ]
+        .into_iter()
+        .chain(snapshot)
+        {
             hasher.update(&(field.len() as u64).to_le_bytes());
             hasher.update(field.as_bytes());
         }
