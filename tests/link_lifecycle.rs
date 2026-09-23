@@ -202,3 +202,102 @@ fn sync_rejects_descendant_target_through_a_parent_alias_of_a_deployed_link() {
         b"guide\n"
     );
 }
+
+fn generated_file_fixture() -> tempfile::TempDir {
+    let fixture = tempfile::tempdir().expect("generated fixture");
+    let root = fixture.path();
+    fs::create_dir_all(root.join("build/claude/skills/code")).expect("generated directory");
+    for file in ["SKILL.md", "obsolete.txt"] {
+        fs::write(root.join("build/claude/skills/code").join(file), file).expect("generated file");
+    }
+    fs::write(
+        root.join("phora.toml"),
+        r#"
+[paths]
+cache = "cache"
+state = "state"
+[sources.generated]
+path = "build"
+root = "claude"
+deploy = "link"
+[targets.claude]
+path = "deployed"
+sources.generated = { collapse = false }
+"#,
+    )
+    .expect("configuration");
+    phora(root, &["sync"]);
+    fs::write(root.join("deployed/foreign.txt"), "keep me").expect("unmanaged file");
+    fs::remove_file(root.join("build/claude/skills/code/obsolete.txt"))
+        .expect("remove generated file");
+    fixture
+}
+
+#[test]
+fn prune_removes_a_dangling_generated_file_without_changing_the_binding() {
+    let fixture = generated_file_fixture();
+    let root = fixture.path();
+    assert!(
+        !phora_output(root, &["sync"]).status.success(),
+        "pruning requires the flag"
+    );
+    phora(root, &["sync", "--prune"]);
+    assert!(fs::symlink_metadata(root.join("deployed/skills/code/obsolete.txt")).is_err());
+    assert_eq!(
+        fs::read_to_string(root.join("deployed/foreign.txt")).expect("foreign file"),
+        "keep me"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("deployed/skills/code/SKILL.md")).expect("skill"),
+        "SKILL.md"
+    );
+    phora(root, &["sync", "--frozen", "--no-hooks"]);
+}
+
+#[test]
+fn prune_preserves_a_generated_link_replaced_by_a_file() {
+    let fixture = generated_file_fixture();
+    let root = fixture.path();
+    let path = root.join("deployed/skills/code/obsolete.txt");
+    fs::remove_file(&path).expect("remove old link");
+    fs::write(&path, "user data").expect("replacement");
+    assert!(!phora_output(root, &["sync", "--prune"]).status.success());
+    assert_eq!(
+        fs::read_to_string(&path).expect("preserved replacement"),
+        "user data"
+    );
+}
+
+#[test]
+fn prune_preserves_a_file_installed_by_pre_deploy_over_a_dangling_link() {
+    let fixture = generated_file_fixture();
+    let root = fixture.path();
+    let config = root.join("phora.toml");
+    let body = fs::read_to_string(&config).expect("config");
+    fs::write(config, format!("{body}\n[targets.claude.hooks]\npre_deploy = 'rm deployed/skills/code/obsolete.txt && printf user-data > deployed/skills/code/obsolete.txt'\n")).expect("hook");
+    phora(root, &["sync", "--prune"]);
+    assert_eq!(
+        fs::read_to_string(root.join("deployed/skills/code/obsolete.txt"))
+            .expect("preserved replacement"),
+        "user-data"
+    );
+}
+
+#[test]
+fn prune_does_not_infer_a_missing_link_after_the_source_root_changes() {
+    let fixture = generated_file_fixture();
+    let root = fixture.path();
+    fs::create_dir_all(root.join("build/codex/skills/code")).expect("new source root");
+    fs::write(root.join("build/codex/skills/code/SKILL.md"), "Codex").expect("new skill");
+    let config = root.join("phora.toml");
+    let body = fs::read_to_string(&config)
+        .expect("config")
+        .replace("root = \"claude\"", "root = \"codex\"");
+    fs::write(config, body).expect("change root");
+    assert!(!phora_output(root, &["sync", "--prune"]).status.success());
+    assert!(
+        fs::symlink_metadata(root.join("deployed/skills/code/obsolete.txt"))
+            .expect("old link remains")
+            .is_symlink()
+    );
+}

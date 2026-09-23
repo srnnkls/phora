@@ -30,7 +30,7 @@ pub use host::{AuthConfig, Host, RemoteConfig, builtin_forges};
 pub use migrate::MigrationWarning;
 pub use source::{DeployMode, Offer, ParsedSource, Refspec, Remote, Source, SourceMode};
 pub use target::{
-    Binding, LayoutConfig, LayoutKind, ResolvedBinding, SourceFields, TakeEntry, Target,
+    Binding, Import, LayoutConfig, LayoutKind, ResolvedBinding, SourceFields, TakeEntry, Target,
     TemplateOptIn,
 };
 
@@ -178,12 +178,18 @@ impl Config {
 
     fn validate_imports(&self) -> Result<()> {
         for (target_name, target) in &self.targets {
-            for imported in target.imports.iter().flatten() {
+            for import in target.imports.iter().flatten() {
+                let imported = &import.source;
                 let Some(source) = self.sources.get(imported) else {
                     return Err(Error::Config(format!(
                         "target `{target_name}`: imports references undefined source `{imported}`"
                     )));
                 };
+                if source.url.is_some() && import.refspec.is_some() {
+                    return Err(Error::Config(format!(
+                        "import `{imported}`: a URL source cannot select a Git ref"
+                    )));
+                }
                 if !source.is_transitive() {
                     return Err(Error::Config(format!(
                         "target `{target_name}`: imports `{imported}` requires a transitive source \
@@ -230,7 +236,7 @@ impl Config {
     fn is_imported_anywhere(&self, name: &str) -> bool {
         self.targets
             .values()
-            .any(|target| target.imports.iter().flatten().any(|i| i == name))
+            .any(|target| target.imports.iter().flatten().any(|i| i.source == name))
     }
 
     fn flat_binder_of(&self, name: &str) -> Option<&str> {

@@ -1734,6 +1734,7 @@ fn source_rm_command_scrubs_bindings_and_source_def_from_phora_toml() {
 
     with_cwd(dir.path(), || {
         run(Cli {
+            directory: None,
             command: Command::Source {
                 cmd: SourceCmd::Rm {
                     name: "dotfiles".to_owned(),
@@ -3724,6 +3725,7 @@ fn add_to_with_refinement_flags_writes_source_and_table_binding() {
 
     with_cwd(dir.path(), || {
         run(Cli {
+            directory: None,
             command: Command::Add {
                 url: "github:srnnkls/tropos".to_owned(),
                 name: None,
@@ -3791,6 +3793,7 @@ fn add_to_with_no_refinement_flags_writes_a_bare_string_binding() {
 
     with_cwd(dir.path(), || {
         run(Cli {
+            directory: None,
             command: Command::Add {
                 url: "github:srnnkls/tropos".to_owned(),
                 name: None,
@@ -3848,6 +3851,7 @@ fn add_as_with_multiple_targets_errors() {
 
     let result = with_cwd(dir.path(), || {
         run(Cli {
+            directory: None,
             command: Command::Add {
                 url: "github:srnnkls/tropos".to_owned(),
                 name: None,
@@ -3886,6 +3890,7 @@ fn add_to_a_single_target_with_as_is_the_happy_path() {
 
     with_cwd(dir.path(), || {
         run(Cli {
+            directory: None,
             command: Command::Add {
                 url: "github:srnnkls/tropos".to_owned(),
                 name: None,
@@ -3931,6 +3936,7 @@ fn bare_add_without_to_does_not_touch_targets() {
 
     with_cwd(dir.path(), || {
         run(Cli {
+            directory: None,
             command: Command::Add {
                 url: "github:srnnkls/tropos".to_owned(),
                 name: None,
@@ -3983,6 +3989,7 @@ fn add_to_with_root_scopes_the_source_not_the_binding() {
 
     with_cwd(dir.path(), || {
         run(Cli {
+            directory: None,
             command: Command::Add {
                 url: "github:srnnkls/tropos".to_owned(),
                 name: None,
@@ -4035,6 +4042,7 @@ fn add_to_with_url_embedded_root_sets_the_source_root() {
 
     with_cwd(dir.path(), || {
         run(Cli {
+            directory: None,
             command: Command::Add {
                 url: "github:srnnkls/tropos/editor".to_owned(),
                 name: None,
@@ -4095,6 +4103,7 @@ fn bare_add_with_root_still_sets_the_source_root() {
 
     with_cwd(dir.path(), || {
         run(Cli {
+            directory: None,
             command: Command::Add {
                 url: "github:srnnkls/tropos".to_owned(),
                 name: None,
@@ -4131,6 +4140,7 @@ fn add_as_without_to_errors() {
 
     let result = with_cwd(dir.path(), || {
         run(Cli {
+            directory: None,
             command: Command::Add {
                 url: "github:srnnkls/tropos".to_owned(),
                 name: None,
@@ -4170,6 +4180,7 @@ fn add_local_with_to_errors() {
     let src_path = src_dir.path().to_string_lossy().into_owned();
     let result = with_cwd(dir.path(), || {
         run(Cli {
+            directory: None,
             command: Command::Add {
                 url: src_path,
                 name: None,
@@ -4209,6 +4220,7 @@ fn add_to_multiple_targets_writes_a_binding_in_each() {
 
     with_cwd(dir.path(), || {
         run(Cli {
+            directory: None,
             command: Command::Add {
                 url: "github:srnnkls/tropos".to_owned(),
                 name: None,
@@ -4259,6 +4271,7 @@ fn add_to_with_include_exclude_writes_arrays_on_the_source() {
 
     with_cwd(dir.path(), || {
         run(Cli {
+            directory: None,
             command: Command::Add {
                 url: "github:srnnkls/tropos".to_owned(),
                 name: None,
@@ -4360,6 +4373,7 @@ fn add_to_target_without_sources_array_creates_the_array_and_binds() {
 
     with_cwd(dir.path(), || {
         run(Cli {
+            directory: None,
             command: Command::Add {
                 url: "github:srnnkls/tropos".to_owned(),
                 name: None,
@@ -4404,6 +4418,7 @@ fn add_to_nonexistent_target_errors_and_leaves_file_untouched() {
 
     let result = with_cwd(dir.path(), || {
         run(Cli {
+            directory: None,
             command: Command::Add {
                 url: "github:srnnkls/tropos".to_owned(),
                 name: None,

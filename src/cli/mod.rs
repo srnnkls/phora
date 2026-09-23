@@ -45,7 +45,7 @@ pub use sync::{load_locks, write_locks};
 
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
@@ -67,6 +67,9 @@ use std::str::FromStr;
     about = "A git-based artifact package manager and multiplexer for content-addressed file distribution"
 )]
 pub struct Cli {
+    /// Run in this project directory, including relative paths and hooks.
+    #[arg(short = 'C', long, global = true, value_name = "DIRECTORY")]
+    pub directory: Option<PathBuf>,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -349,6 +352,11 @@ pub fn run(cli: Cli) -> Result<()> {
 }
 
 pub fn run_with_outcome(cli: Cli) -> Result<CliOutcome> {
+    if let Some(directory) = cli.directory {
+        std::env::set_current_dir(&directory).map_err(|error| {
+            Error::Config(format!("enter project {}: {error}", directory.display()))
+        })?;
+    }
     match cli.command {
         cmd @ Command::Add { .. } => completed(dispatch_add(cmd)),
         Command::Rm { name } => completed(run_source_rm(&name)),

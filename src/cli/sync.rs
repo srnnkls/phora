@@ -196,12 +196,19 @@ fn finish_sync(
     interactive: bool,
     reporter: &Reporter,
 ) -> Result<CliOutcome> {
-    let base_lock = out
-        .locks
-        .base
-        .as_ref()
-        .ok_or_else(|| Error::Lock("sync completed without a base lock".to_owned()))?;
-    write_locks(cwd, base_lock, out.locks.local.as_ref())?;
+    // `update` drops pins in memory. A failed pre-sync gate must not persist that drop.
+    let pre_sync_failed = out.hook_outcomes.iter().any(|hook| {
+        hook.scope == crate::sync::HookScope::PreSync
+            && hook.status == crate::sync::HookStatus::Failure
+    });
+    if !pre_sync_failed {
+        let base_lock = out
+            .locks
+            .base
+            .as_ref()
+            .ok_or_else(|| Error::Lock("sync completed without a base lock".to_owned()))?;
+        write_locks(cwd, base_lock, out.locks.local.as_ref())?;
+    }
     render_sync_warnings(out);
     for applied in &out.applied {
         match applied {

@@ -25,43 +25,61 @@ pub struct RoutedSources {
 
 pub type ResolvedSourceMap = BTreeMap<(String, String), ResolvedSource>;
 
+/// An explicit import's selected ref, pinned to the manifest already read when available.
+#[derive(Debug, Clone)]
+pub(super) struct ImportResolution {
+    pub source: String,
+    pub refspec: Refspec,
+    pub commit: Option<String>,
+}
+
 /// A distinct resolution unit: one (source, effective ref) pair to resolve and lock.
 struct Unit {
     name: String,
     encoded_ref: String,
     effective_ref: Refspec,
+    manifest_commit: Option<String>,
 }
 
-fn resolution_units(config: &Config, parsed: &BTreeMap<String, ParsedSource>) -> Vec<Unit> {
-    let mut by_key: BTreeMap<(String, String), Refspec> = BTreeMap::new();
-    let mut bound: BTreeSet<String> = BTreeSet::new();
+fn resolution_units(
+    config: &Config,
+    parsed: &BTreeMap<String, ParsedSource>,
+    imports: &[ImportResolution],
+) -> Vec<Unit> {
+    let mut by_key = BTreeMap::new();
+    let mut bound = BTreeSet::new();
+    let mut add = |name: &str, effective_ref: Refspec, manifest_commit: Option<String>| {
+        let encoded_ref = encode_ref(&effective_ref);
+        by_key.insert(
+            (name.to_owned(), encoded_ref.clone()),
+            Unit {
+                name: name.to_owned(),
+                encoded_ref,
+                effective_ref,
+                manifest_commit,
+            },
+        );
+    };
     for target in config.targets.values() {
         for binding in target.resolve_sources(parsed) {
             bound.insert(binding.source.to_owned());
-            by_key.insert(
-                (
-                    binding.source.to_owned(),
-                    encode_ref(&binding.effective_ref),
-                ),
-                binding.effective_ref.clone(),
-            );
+            add(binding.source, binding.effective_ref, None);
         }
+    }
+    for import in imports {
+        bound.insert(import.source.clone());
+        add(
+            &import.source,
+            import.refspec.clone(),
+            import.commit.clone(),
+        );
     }
     for (name, source) in parsed {
-        if bound.contains(name) {
-            continue;
+        if !bound.contains(name) {
+            add(name, source.refspec(), None);
         }
-        let r = source.refspec();
-        by_key.insert((name.clone(), encode_ref(&r)), r);
     }
-    by_key
-        .into_iter()
-        .map(|((name, encoded_ref), effective_ref)| Unit {
-            name,
-            encoded_ref,
-            effective_ref,
-        })
-        .collect()
+    by_key.into_values().collect()
 }
 
 /// Outcome of resolving one unit, carrying its source-routing entry plus the
@@ -163,14 +181,18 @@ fn resolve_unit(
     }
 
     let request = resolve_request(source, unit, git, lock_entry)?;
-    let source_resolution = resolve_source(
-        store,
-        &request,
-        source,
-        lock_entry,
-        frozen,
-        mirror_refreshed,
-    )?;
+    let source_resolution = if unit.manifest_commit.is_some() {
+        store.resolve(&request, ResolvePolicy::CachedOnly)?
+    } else {
+        resolve_source(
+            store,
+            &request,
+            source,
+            lock_entry,
+            frozen,
+            mirror_refreshed,
+        )?
+    };
 
     if source.deploy_mode() == DeployMode::Link {
         if unit.encoded_ref != encode_ref(&source.refspec()) {
@@ -249,10 +271,14 @@ fn resolve_request(
     git: &str,
     lock_entry: Option<&LockedSource>,
 ) -> Result<ResolveRequest> {
-    let revision = match lock_entry {
-        Some(locked) => RevisionSpec::Commit(locked.commit.parse::<Commit>()?),
-        None if source.deploy_mode() == DeployMode::Link => RevisionSpec::Default,
-        None => revision_spec(&unit.effective_ref)?,
+    let revision = if let Some(commit) = &unit.manifest_commit {
+        RevisionSpec::Commit(commit.parse::<Commit>()?)
+    } else {
+        match lock_entry {
+            Some(locked) => RevisionSpec::Commit(locked.commit.parse::<Commit>()?),
+            None if source.deploy_mode() == DeployMode::Link => RevisionSpec::Default,
+            None => revision_spec(&unit.effective_ref)?,
+        }
     };
     let location = match source.deploy_mode() {
         DeployMode::Link => SourceLocation::Worktree { root: git.into() },
@@ -426,6 +452,7 @@ pub(super) fn resolve_sources(
     parsed: &BTreeMap<String, ParsedSource>,
     remotes: &BTreeMap<String, String>,
     instances: &BTreeMap<String, String>,
+    imports: &[ImportResolution],
     effective_lock: Option<&Lock>,
     store: &dyn SourceStore,
     force: bool,
@@ -433,7 +460,7 @@ pub(super) fn resolve_sources(
     jobs: Option<usize>,
     sink: &dyn ProgressSink,
 ) -> Result<RoutedSources> {
-    let units = resolution_units(config, parsed);
+    let units = resolution_units(config, parsed, imports);
     let groups = resolution_groups(parsed, remotes, &units)?;
     sink.resolve_planned(groups.len());
 
@@ -515,6 +542,7 @@ pub fn resolve_sources_for_bench(
         parsed,
         remotes,
         &BTreeMap::new(),
+        &[],
         effective_lock,
         store,
         force,

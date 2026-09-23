@@ -141,31 +141,6 @@ fn fetch_failure_at_depth_writes_no_lock() {
 }
 
 #[test]
-fn transitive_source_with_absolute_path_remote_is_rejected() {
-    let fixture = build_fixture();
-    let config = "version = 1\n\n[sources.dep]\npath = \"/etc\"\ntransitive = true\n\n\
-         [targets.home]\npath = \"~/deploy\"\nimports = [\"dep\"]\n";
-    write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());
-
-    let out = run(&fixture, &["sync"]);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    reject_unknown_field_stub(&stderr);
-    assert!(
-        !out.status.success(),
-        "a transitive source using an absolute local path must be rejected"
-    );
-    assert!(
-        stderr.contains(TRANSITIVE_ESCAPE_DIAGNOSTIC),
-        "the rejection must emit the named escape diagnostic `{TRANSITIVE_ESCAPE_DIAGNOSTIC}`, \
-         not a generic git error echoing the path, got: {stderr}"
-    );
-    assert!(
-        !fixture.cwd.path().join("phora.lock").exists(),
-        "rejecting an escaping transitive remote must write no lock"
-    );
-}
-
-#[test]
 fn transitive_source_with_file_url_remote_is_rejected() {
     let fixture = build_fixture();
     let config = "version = 1\n\n[sources.dep]\ngit = \"file:///etc/passwd\"\ntransitive = true\n\n\

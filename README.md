@@ -291,6 +291,11 @@ Non-interactive runs skip such files unless `--force` is given.
 
 ### Hooks
 
+`phora -C <directory> <command>` (or `--directory`) selects a project before
+loading configuration or state. Both `phora.toml` and `phora.local.toml`, relative
+source/target paths, locks, and hooks use that directory. This also lets a hook
+acquire inputs from a separate project without shell directory changes.
+
 The global `[hooks] pre_sync` runs before sources are resolved or files selected,
 so it can generate local source directories for the same sync. A failure stops
 before source resolution, recovery, deployment, or pruning and preserves existing
@@ -837,7 +842,10 @@ Linked artifacts sit outside the integrity model: their registry record carries
 a `linked` marker and no per-file hashes. `phora verify` skips them, drift detection
 never reports them modified or foreign, `phora list` shows them as `linked`, and
 `phora rebuild-registry` reconstructs the marker without hashing. `--prune` removes
-an orphaned linked artifact by deleting the symlink only. If the working-tree target
+an orphaned linked artifact by deleting the symlink only. It also removes a
+dangling managed file link when that link still points to a path admitted by the
+current source offer. Directory links without current attribution remain sealed.
+A regular file or directory replacing a managed link is preserved. If the working-tree target
 is deleted or renamed the link reads as missing and is redeployed on the next sync.
 Switching a source between `link` and `copy` replaces the destination on the next
 sync (symlink ⇄ materialized copy, with full integrity restored on `copy`). If a
@@ -901,6 +909,66 @@ source, and deploys loqui's artifacts (its `languages/` and `resources/` trees) 
 `~/.claude/skills/loqui/reference/loqui/…`, exactly where the skill looks for them.
 One `imports` line, and tropos's dependency rode along. A target can import several at
 once — `imports = ["tropos", "work-config"]` — each composing under the same anchor.
+
+### Importing a local package
+
+One source can supply several consumers through explicit imports. A bare name
+uses the source's default ref; a table can select a `branch`, `tag`, or `rev`:
+
+```toml
+[sources.tropos]
+path = "~/projects/tropos"
+branch = "prototype/henia-phora"
+transitive = true
+
+[targets.canonical]
+path = ".phora/canonical"
+imports = ["tropos"]
+
+[targets.preview]
+path = ".phora/preview"
+imports = [{ source = "tropos", branch = "preview" }]
+```
+
+The package advertises relative targets for both its own artifacts and its
+dependencies. Inside that imported manifest, `path = "."` means the package's
+committed snapshot, never the consumer's working directory or uncommitted files:
+
+```toml
+# ~/projects/tropos/phora.toml, committed alongside the canonical artifacts
+[sources.tropos]
+path = "."
+exclude = ["phora.toml"]
+
+[sources.loqui]
+repo = "srnnkls/loqui"
+include = ["README.md", "languages/**", "resources/**"]
+
+[targets.tropos]
+path = "."
+sources.tropos = { collapse = false }
+
+[targets.loqui]
+path = "skills/loqui/reference/loqui"
+sources.loqui = { collapse = false }
+```
+
+A package's self source cannot select another ref, enable transitive resolution,
+or use link mode. Other dependency-owned local paths and escaping destinations
+remain rejected. Import refinements accept only a source name and one Git ref;
+paths, remotes, renames and root overrides are not import options.
+
+Package artifacts and their manifests use the same pin. Ordinary sync preserves
+that pin; `phora update tropos --fast-forward` advances it and removes resources
+the new package dropped. `phora sync --frozen` replays from the cache. Package
+ownership survives updates, while hook trust remains tied to the actual commit.
+A source marked `transitive = true` still requires an explicit `imports` entry.
+
+A consumer can acquire pinned canonical inputs with `phora -C .phora/tropos sync`,
+then call `henia build ... --output .henia` from its ordinary `pre_sync` hook.
+The same outer sync deploys `.henia/claude`, `.henia/codex`, and other generated
+local directories; `post_sync` checks the deployed artifacts. Compiler commands belong in hooks; generated output needs no Git
+packaging or source-specific build setting.
 
 ### How composition works
 

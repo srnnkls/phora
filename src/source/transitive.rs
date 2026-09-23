@@ -94,6 +94,9 @@ pub(crate) fn validate_dependency_remote(
     remote: &str,
     depth: usize,
 ) -> Result<()> {
+    if depth == 1 && matches!(parsed_source.remote, Remote::Path(_)) {
+        return Ok(());
+    }
     let escapes = matches!(parsed_source.remote, Remote::Path(_))
         || remote.starts_with("file://")
         || is_relative_fs_remote(remote)
@@ -391,7 +394,7 @@ mod tests {
         let raw: Source =
             toml::from_str("path = \"/etc\"\ntransitive = true\n").expect("path source DTO parses");
         let parsed = ParsedSource::parse("escape", &raw).expect("path source parses");
-        let error = validate_dependency_remote("escape", &parsed, "/etc", 1)
+        let error = validate_dependency_remote("escape", &parsed, "/etc", 2)
             .expect_err("a transitive local path must fail");
         assert_source_error_type(&error);
         assert!(
@@ -413,7 +416,7 @@ mod tests {
         let raw: Source =
             toml::from_str("path = \"/etc\"\ntransitive = true\n").expect("path DTO parses");
         let parsed = ParsedSource::parse("escape", &raw).expect("path source parses");
-        let remote = validate_dependency_remote("escape", &parsed, "/etc", 1)
+        let remote = validate_dependency_remote("escape", &parsed, "/etc", 2)
             .expect_err("a transitive local path must fail");
 
         let categories = [

@@ -218,9 +218,12 @@ fn imports_accepts_a_bare_source_name_list() {
     let config = Config::parse(toml).expect("a bare-name imports list must parse");
     let target = config.targets.get("home").expect("target `home` present");
     assert_eq!(
-        target.imports,
-        Some(vec!["dep".to_string()]),
-        "`imports` must type as a flat Vec<String> and carry the exact bare source names"
+        target.imports.as_ref().map(|imports| imports
+            .iter()
+            .map(|i| i.source.as_str())
+            .collect::<Vec<_>>()),
+        Some(vec!["dep"]),
+        "bare imports must carry the exact source names"
     );
 }
 

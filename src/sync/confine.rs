@@ -172,11 +172,13 @@ fn normalize_lexical(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {
-            Component::ParentDir => {
-                if !out.pop() {
-                    out.push("..");
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
                 }
-            }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => out.push(".."),
+            },
             Component::CurDir => {}
             other => out.push(other.as_os_str()),
         }
@@ -344,6 +346,22 @@ mod tests {
             &protected,
         )
         .expect_err("protected files remain protected");
+    }
+
+    #[test]
+    fn relative_anchors_preserve_leading_parent_components() {
+        let anchor = Path::new("../../.henia/source");
+        let dst = anchor.join("skills/code/SKILL.md");
+        let set = protected(Path::new("/home/u/project/phora/stage"));
+        assert_eq!(
+            confine_destination(anchor, &dst, &set).expect("relative anchor"),
+            dst
+        );
+        assert_eq!(
+            normalize_lexical(Path::new("../../../a/../b")),
+            Path::new("../../../b")
+        );
+        assert_eq!(normalize_lexical(Path::new("/../../b")), Path::new("/b"));
     }
 
     #[test]
