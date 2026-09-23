@@ -35,6 +35,19 @@ pub fn capture_worktree(git_dir: &Path, source: &SourceName, root: &Path) -> Res
     })
 }
 
+pub(super) fn read_worktree_manifest_bytes(root: &Path) -> Result<Vec<u8>> {
+    std::fs::read(root.join("phora.toml")).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            SourceError::DependencyManifestMissing {
+                remote: root.display().to_string(),
+                source: Box::new(error),
+            }
+        } else {
+            SourceError::Io(error)
+        }
+    })
+}
+
 pub(super) fn worktree_authored_at(root: &Path, head: &Commit) -> Result<SourceTimestamp> {
     let repo = gix::open(root).map_err(|error| {
         SourceError::Source(format!("open worktree {}: {error}", root.display()))

@@ -2957,6 +2957,42 @@ host = "github"
 }
 
 #[test]
+fn merge_local_link_override_drops_the_base_ref() {
+    let base = Config::parse(
+        r#"
+[sources.tropos]
+repo = "srnnkls/tropos"
+branch = "main"
+transitive = true
+[targets.tropos]
+path = ".tropos"
+imports = ["tropos"]
+"#,
+    )
+    .expect("base forge source parses");
+    let local = Config::parse(
+        r#"
+[sources.tropos]
+path = "~/dev/tropos"
+deploy = "link"
+"#,
+    )
+    .expect("local link override parses");
+
+    let merged = crate::config::merge_configs(base, Some(local));
+    let tropos = &merged.sources["tropos"];
+
+    assert_eq!(tropos.path.as_deref(), Some("~/dev/tropos"));
+    assert_eq!(tropos.deploy, Some(DeployMode::Link));
+    assert!(tropos.is_transitive());
+    assert!(
+        tropos.branch.is_none() && tropos.tag.is_none() && tropos.rev.is_none(),
+        "a linked worktree override has no ref to inherit; got {tropos:?}"
+    );
+    merged.validate().expect("the merged link source validates");
+}
+
+#[test]
 fn merge_local_path_override_clears_stale_base_forge_repo_and_host() {
     let base = Config::parse(
         r#"

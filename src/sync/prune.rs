@@ -197,7 +197,7 @@ pub(super) fn prune_projected(
         if let Some(target) = config.targets.get(&record.key.target) {
             let dst = super::target::record_artifact_path(target, &record);
             let confined = match &target.confine {
-                Some(anchor) => super::confine::confine_destination(anchor, &dst, protected),
+                Some(anchor) => super::confine::confine_entry_destination(anchor, &dst, protected),
                 None if super::target::is_composed_target(&record.key.target) => {
                     Err(Error::Config(format!(
                         "confinement: composed target `{}` reached prune without a confine \

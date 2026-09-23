@@ -992,6 +992,22 @@ the new package dropped. `phora sync --frozen` replays from the cache. Package
 ownership survives updates, while hook trust remains tied to the actual commit.
 A source marked `transitive = true` still requires an explicit `imports` entry.
 
+To develop a package in place, declare it with `deploy = "link"`. Its manifest
+and self source are then read from the live working tree, uncommitted files
+included, and the self source deploys as symlinks into that tree; phora writes
+nothing into it. The package locks like any link source (`resolved = "link"`, no
+mirror, so `--frozen` does not need one) and `update` leaves it untouched, while
+its remote dependencies still lock and update at pinned commits. Link mode
+declared inside a package manifest stays rejected. A `phora.local.toml` override
+to `path` + `deploy = "link"` drops the base source's `branch`/`tag`/`rev`:
+
+```toml
+# phora.local.toml
+[sources.tropos]
+path = "~/projects/tropos"
+deploy = "link"
+```
+
 ### Prepare inputs before generating deployment sources
 
 A target with `phase = "prepare"` materializes its inputs before the consumer's

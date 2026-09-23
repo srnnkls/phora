@@ -15,7 +15,7 @@ use crate::sync::state::{
 };
 
 use super::apply::{ApplyPaths, apply_artifact_report, link_artifact};
-use super::confine::{ProtectedPathSet, confine_destination};
+use super::confine::{ProtectedPathSet, confine_destination, confine_entry_destination};
 use super::journal::Journal;
 use super::resolve::ResolvedSourceMap;
 use super::stage::{StageRequest, stage_artifact};
@@ -43,8 +43,11 @@ pub(super) struct TargetRun<'a> {
 }
 
 impl TargetRun<'_> {
-    fn confined(&self, dst: &Path) -> Result<PathBuf> {
+    fn confined(&self, dst: &Path, mode: DeployMode) -> Result<PathBuf> {
         match &self.target.confine {
+            Some(anchor) if mode == DeployMode::Link => {
+                confine_entry_destination(anchor, dst, self.protected)
+            }
             Some(anchor) => confine_destination(anchor, dst, self.protected),
             None if is_composed_target(self.target_name) => Err(Error::Config(format!(
                 "confinement: composed target `{}` reached deploy without a confine anchor; \
@@ -227,7 +230,7 @@ pub(super) fn walk_projection_target(
             let key = item.materialization.published_key();
             safe_relpath(key).map_err(|_| unsafe_dest_diagnostic(key))?;
             let deploy_dst = run.target.expanded_path().join(item.destination.as_str());
-            let artifact_dst = run.confined(&deploy_dst)?;
+            let artifact_dst = run.confined(&deploy_dst, source.deploy_mode())?;
             let dst_is_symlink =
                 std::fs::symlink_metadata(&artifact_dst).is_ok_and(|m| m.file_type().is_symlink());
             let mode_transition = match source.deploy_mode() {
@@ -508,12 +511,18 @@ fn protect_history_retirements(
 }
 
 fn live_destinations(run: TargetRun<'_>, projection: &TargetProjection) -> Result<Vec<PathBuf>> {
-    projection
-        .bindings
-        .iter()
-        .flat_map(|binding| binding.artifacts.iter())
-        .map(|item| run.confined(&run.target.expanded_path().join(item.destination.as_str())))
-        .collect()
+    let mut destinations = Vec::new();
+    for binding in &projection.bindings {
+        let mode = run
+            .parsed
+            .get(&binding.source)
+            .map_or(DeployMode::Copy, ParsedSource::deploy_mode);
+        for item in &binding.artifacts {
+            let dst = run.target.expanded_path().join(item.destination.as_str());
+            destinations.push(run.confined(&dst, mode)?);
+        }
+    }
+    Ok(destinations)
 }
 
 #[expect(
@@ -1477,7 +1486,7 @@ mod confine_fail_closed_tests {
             &vars,
         );
 
-        run.confined(outside).expect_err(
+        run.confined(outside, DeployMode::Copy).expect_err(
             "a composed/transitive target (namespaced name carries `%`) reaching deploy with \
              `confine == None` must fail closed; falling through to an unconfined write lets a dep \
              escape to any absolute path",

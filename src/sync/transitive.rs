@@ -25,6 +25,26 @@ const COMPOSED_DEST_COLLISION: &str = "composed targets resolve to the same dest
 
 const TRANSITIVE_LINK_REJECTED: &str = "transitive source cannot use deploy = \"link\"";
 
+/// The fetch-node commit of a package read live from its working tree.
+const WORKTREE_COMMIT: &str = "link";
+
+/// Where a package's manifest and self source (`path = "."`) are read from.
+#[derive(Clone, Copy)]
+enum PackageSnapshot<'a> {
+    /// The package's committed snapshot in its git mirror at `remote`.
+    Mirror(&'a str),
+    /// The consumer's linked working tree at `root`, uncommitted files included.
+    Worktree(&'a str),
+}
+
+impl<'a> PackageSnapshot<'a> {
+    fn remote(self) -> &'a str {
+        match self {
+            Self::Mirror(remote) | Self::Worktree(remote) => remote,
+        }
+    }
+}
+
 /// Fail-closed bound: an acyclic ever-deeper `transitive = true` import chain would otherwise stack-overflow (`DoS`) on untrusted manifests.
 const MAX_TRANSITIVE_DEPTH: usize = 64;
 
@@ -252,31 +272,24 @@ pub(super) fn resolve_transitive_graph(
                 Error::Config(format!("no resolved remote for source `{imported}`"))
             })?;
             crate::source::transitive::validate_dependency_remote(imported, &source, remote, 1)?;
-            let discriminator = crate::lock::ref_discriminator(&source.refspec(), &base.refspec());
-            let locked = effective_lock
-                .and_then(|lock| lock.find_entry(imported, discriminator.as_deref()))
-                .filter(|entry| {
-                    crate::lock::entry_matches(
-                        base,
-                        &source.refspec(),
-                        entry,
-                        &config.hosts,
-                        super::effective_protocol(base, config),
-                    )
-                });
-            let (commit, manifest) = acquire_import_manifest(
-                imported,
-                &source,
-                remote,
-                backend,
-                frozen,
-                locked.map(|entry| entry.commit.as_str()),
-            )?;
+            let (package, commit, manifest) = if source.deploy_mode() == DeployMode::Link {
+                let manifest = read_worktree_manifest(imported, remote)?;
+                (
+                    PackageSnapshot::Worktree(remote),
+                    WORKTREE_COMMIT.to_owned(),
+                    manifest,
+                )
+            } else {
+                let pin = locked_import_commit(config, imported, base, &source, effective_lock);
+                let (commit, manifest) =
+                    acquire_import_manifest(imported, &source, remote, backend, frozen, pin)?;
+                (PackageSnapshot::Mirror(remote), commit, manifest)
+            };
             graph.import_refs.push(ImportResolution {
                 source: imported.to_owned(),
                 phase: anchor.phase(),
                 refspec: source.refspec(),
-                commit: Some(commit.clone()),
+                commit: matches!(package, PackageSnapshot::Mirror(_)).then(|| commit.clone()),
             });
             let instance = package_instance(
                 "root",
@@ -295,7 +308,7 @@ pub(super) fn resolve_transitive_graph(
                 anchor,
                 imported,
                 &manifest,
-                remote,
+                package,
                 &mut WalkCtx {
                     backend,
                     visited: &mut visited,
@@ -320,6 +333,45 @@ pub(super) fn resolve_transitive_graph(
     }
 
     Ok(graph)
+}
+
+fn locked_import_commit<'l>(
+    config: &Config,
+    imported: &str,
+    base: &ParsedSource,
+    source: &ParsedSource,
+    effective_lock: Option<&'l crate::lock::Lock>,
+) -> Option<&'l str> {
+    let discriminator = crate::lock::ref_discriminator(&source.refspec(), &base.refspec());
+    effective_lock
+        .and_then(|lock| lock.find_entry(imported, discriminator.as_deref()))
+        .filter(|entry| {
+            crate::lock::entry_matches(
+                base,
+                &source.refspec(),
+                entry,
+                &config.hosts,
+                super::effective_protocol(base, config),
+            )
+        })
+        .map(|entry| entry.commit.as_str())
+}
+
+/// A linked package is read live; only a local working tree can be linked.
+fn read_worktree_manifest(imported: &str, root: &str) -> Result<TransitiveManifest> {
+    if !crate::source::is_local_path(root) {
+        return Err(Error::Config(format!(
+            "source `{imported}`: deploy = \"link\" requires a local filesystem path, \
+             not a remote URL `{root}`"
+        )));
+    }
+    crate::source::transitive::read_worktree_manifest(root).map_err(|source| {
+        Error::TransitiveSource {
+            name: imported.to_owned(),
+            depth: 1,
+            source,
+        }
+    })
 }
 
 /// Packages keep manifest and artifacts pinned together; manifest-only imports retain
@@ -406,7 +458,7 @@ fn compose_dep(
     anchor: &Target,
     imported: &str,
     manifest: &TransitiveManifest,
-    package_remote: &str,
+    package: PackageSnapshot<'_>,
     ctx: &mut WalkCtx<'_>,
     depth: usize,
 ) -> Result<()> {
@@ -426,7 +478,7 @@ fn compose_dep(
         imported,
         manifest,
         &imported_inner,
-        package_remote,
+        package,
         ctx,
         depth,
     )?;
@@ -498,7 +550,7 @@ fn namespace_dep_sources(
     imported: &str,
     manifest: &TransitiveManifest,
     imported_inner: &HashSet<&str>,
-    package_remote: &str,
+    package: PackageSnapshot<'_>,
     ctx: &mut WalkCtx<'_>,
     depth: usize,
 ) -> Result<BTreeMap<String, String>> {
@@ -534,9 +586,14 @@ fn namespace_dep_sources(
                     "imported `{imported}`: self source `{inner_name}` must use its package snapshot without a ref or transitive flag"
                 )));
             }
-            parsed.remote = Remote::Git(package_remote.to_owned());
-            parsed.rev = Some(instance.fetch_node().commit().to_owned());
-            package_remote.to_owned()
+            match package {
+                PackageSnapshot::Mirror(remote) => {
+                    parsed.remote = Remote::Git(remote.to_owned());
+                    parsed.rev = Some(instance.fetch_node().commit().to_owned());
+                }
+                PackageSnapshot::Worktree(root) => parsed.link_worktree(root),
+            }
+            package.remote().to_owned()
         } else {
             let remote = inner_remote(
                 inner_name,
@@ -660,7 +717,7 @@ fn compose_nested_imports(
             &nested_anchor,
             inner_name,
             &inner_manifest,
-            &inner_remote,
+            PackageSnapshot::Mirror(&inner_remote),
             ctx,
             depth + 1,
         );

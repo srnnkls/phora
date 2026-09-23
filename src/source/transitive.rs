@@ -65,14 +65,23 @@ pub(crate) fn acquire_dependency_manifest(
             },
             other => other,
         })?;
+    Ok((commit, decode_manifest(remote, bytes)?))
+}
+
+/// Reads a linked package's `phora.toml` from its working tree, uncommitted edits included.
+pub(crate) fn read_worktree_manifest(root: &str) -> Result<TransitiveManifest> {
+    let bytes = super::worktree::read_worktree_manifest_bytes(Path::new(root))?;
+    decode_manifest(root, bytes)
+}
+
+fn decode_manifest(remote: &str, bytes: Vec<u8>) -> Result<TransitiveManifest> {
     let manifest_text =
         String::from_utf8(bytes).map_err(|source| SourceError::DependencyManifestUtf8 {
             remote: remote.to_owned(),
             source,
         })?;
-    let manifest = TransitiveManifest::parse_toml(&manifest_text)
-        .map_err(|source| SourceError::DependencyManifestParse { source })?;
-    Ok((commit, manifest))
+    TransitiveManifest::parse_toml(&manifest_text)
+        .map_err(|source| SourceError::DependencyManifestParse { source })
 }
 
 fn revision_spec(refspec: &Refspec) -> Result<RevisionSpec> {
