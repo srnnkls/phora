@@ -664,8 +664,8 @@ A source declares its remote in exactly one kind — never more than one:
 - *Forge:* `host = "<alias>"` + `repo = "<owner/repo>"`, resolved at sync time
   from the host's `remote` template. `host` may be omitted when `repo` is set, in
   which case it defaults to `github` (`repo = "owner/repo"` is github shorthand).
-- *Local:* `path = "<dir-or-file>"`, a filesystem path used verbatim as the
-  remote — exactly like a `git = "/abs/local"` URL.
+- *Local:* `path = "<dir-or-file>"`, a filesystem path used as the remote,
+  with `~` and leading `~/` expanded to the current home directory.
 - *Literal:* `git = "<url>"`, any https, `ssh://`, or scp-style (`git@host:path`)
   remote.
 - *Url:* `url = "https://…"`, a downloadable resource (see below).
@@ -682,12 +682,15 @@ repo = "team/sub/proj"   # nested paths are fine
 protocol = "ssh"         # per-source override (default is https)
 
 [sources.scratch]
-path = "~/dev/scratch"   # local checkout, used verbatim as the remote
+path = "~/dev/scratch"   # local checkout relative to the home directory
 branch = "main"
 ```
 
 Back-compat aliases. `git = "/abs/local"` still declares a local source.
 `host` + `path` (forge owner/repo) is a deprecated alias for `host` + `repo`.
+
+Home expansion also applies to the local `git` alias and target paths.
+`~user` and tildes inside Git URLs remain literal.
 
 > Breaking change: a bare `path = "owner/repo"` (no host) now means a LOCAL
 > path, not a github forge source. The github shorthand moved to bare

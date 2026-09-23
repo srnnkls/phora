@@ -74,7 +74,7 @@ pub enum SourceMode {
 pub enum Remote {
     /// A literal git remote (`git = <url>`) or the `git = <localpath>` alias.
     Git(String),
-    /// A local path source (`path = <local>`), resolved verbatim.
+    /// A local path source (`path = <local>`), with home shorthand expanded on resolution.
     Path(String),
     /// A static resource fetched once; no git ref.
     Url {
@@ -160,8 +160,9 @@ impl ParsedSource {
         self.remote.mode()
     }
 
-    /// Resolves the concrete git remote for `protocol`. `Git`/`Path` resolve
-    /// verbatim; `Host` resolves against the host registry; `Url` has no remote.
+    /// Resolves the concrete git remote for `protocol`. Local `~`/`~/` paths
+    /// expand to the home directory; `Host` resolves against the host registry;
+    /// `Url` has no remote.
     ///
     /// # Errors
     ///
@@ -173,8 +174,9 @@ impl ParsedSource {
         protocol: Protocol,
     ) -> Result<String> {
         match &self.remote {
-            Remote::Git(remote) => Ok(remote.clone()),
-            Remote::Path(path) => Ok(path.clone()),
+            Remote::Git(remote) | Remote::Path(remote) => Ok(super::expand_home(Path::new(remote))
+                .to_string_lossy()
+                .into_owned()),
             Remote::Url { .. } => Ok(String::new()),
             Remote::Host { host, repo, .. } => resolve_forge(hosts, host, repo, protocol),
         }

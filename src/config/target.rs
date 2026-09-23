@@ -384,13 +384,7 @@ impl Target {
 
     #[must_use]
     pub fn expanded_path(&self) -> PathBuf {
-        let path_str = self.path.to_string_lossy();
-        if let Some(rest) = path_str.strip_prefix("~/")
-            && let Some(home) = dirs::home_dir()
-        {
-            return home.join(rest);
-        }
-        self.path.clone()
+        super::expand_home(&self.path)
     }
 
     /// Deploy-time snapshot of the target's expanded absolute path, as a lossy string.
