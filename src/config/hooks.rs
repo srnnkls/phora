@@ -171,9 +171,12 @@ pub struct TargetHooks {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GlobalHooks {
-    /// Lifecycle gate: runs once after fetch, before deploy; a non-zero exit aborts the sync.
+    /// Lifecycle gate: runs once before source resolution; failure aborts the sync.
     #[serde(default, deserialize_with = "deserialize_commands")]
     pub pre_sync: Option<Vec<HookCommand>>,
+    /// Runs after prepare targets and before resolving deployment sources. Failure stops deployment.
+    #[serde(default, deserialize_with = "deserialize_commands")]
+    pub post_prepare: Option<Vec<HookCommand>>,
     #[serde(default, deserialize_with = "deserialize_commands")]
     pub post_sync: Option<Vec<HookCommand>>,
     #[serde(default)]

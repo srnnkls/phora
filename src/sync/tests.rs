@@ -3473,6 +3473,7 @@ fn second_deploy_over_correct_link_is_a_noop() {
 
     let si = input(&cfg, None, None, None, false);
     let ctx = DeployAll {
+        target_scope: &prepare::TargetScope::All,
         config: &cfg,
         parsed: &parsed,
         remotes: &remotes,
@@ -16189,6 +16190,7 @@ fn observe_workspace_full_registry_scan_follows_prune_policy() {
         let mut si = input(&cfg, None, None, None, false);
         si.prune = prune;
         let ctx = DeployAll {
+            target_scope: &prepare::TargetScope::All,
             config: &cfg,
             parsed: &parsed,
             remotes: &remotes,
@@ -16274,6 +16276,7 @@ fn observe_workspace_rejects_duplicate_triplet() {
 
     let si = input(&cfg, None, None, None, false);
     let ctx = DeployAll {
+        target_scope: &prepare::TargetScope::All,
         config: &cfg,
         parsed: &parsed,
         remotes: &remotes,
