@@ -50,7 +50,7 @@ commit_parsers = [
     { message = "^test", group = "<!-- 5 -->Testing" },
     { message = "^style", group = "<!-- 6 -->Styling" },
     { message = "^revert", group = "<!-- 7 -->Revert" },
-    { message = "^chore\\(release\\): prepare for", skip = true },
+    { message = "^chore(\\(release\\))?: (release v|prepare )", skip = true },
     { message = "^chore\\(deps.*\\)", skip = true },
     { message = "^chore|^ci", group = "<!-- 8 -->Miscellaneous Tasks" },
     { body = ".*security", group = "<!-- 9 -->Security" },
