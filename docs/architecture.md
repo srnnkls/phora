@@ -18,6 +18,8 @@ flowchart LR
 - *projection* computes the desired target structure from source values and inventories: a `Projection` of artifacts and their leaves. It performs no I/O.
 - *sync* owns target-side machine state. It observes the disk, reconciles it against the projection, stages and applies changes, journals them for recovery, and owns registry records, ejections, hook state and locking.
 
+Build sources split along the same line: `sync::build` materializes inputs and runs the command, and `source::import` commits the output directory as a content-addressed snapshot.
+
 Link-mode artifacts are the exception to snapshot immutability: link artifacts materialize as symlinks into the live worktree, while `SnapshotId::Worktree` freezes inventory and copy-mode reads.
 
 Data flows one way, from source to projection to sync. Imports follow the same direction: sync imports projection and source, projection imports source's pure value types, and an upstream module imports nothing downstream.
