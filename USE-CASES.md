@@ -1,9 +1,8 @@
 # phora, by use case
 
-Start with the situation that matches yours; the sections don't depend on each
-other. Each recipe leads with what phora won't do for you, then a config that
-was actually run. Flags are in the [README](README.md), internals in the
-[guide](GUIDE.md).
+Pick the situation closest to yours; the sections don't depend on each other.
+Every flag and key is in the [reference](REFERENCE.md), and the model behind
+them is in the [guide](GUIDE.md).
 
 ## Contents
 
@@ -12,17 +11,16 @@ was actually run. Flags are in the [README](README.md), internals in the
 - [Pinned agent skills across projects](#pinned-agent-skills-across-projects)
 - [Release assets, without curl | tar](#release-assets-without-curl--tar)
 - [Vendoring a subtree from a larger repo](#vendoring-a-subtree-from-a-larger-repo)
-- [Smaller situations to recognize](#smaller-situations-to-recognize)
+- [Pinned third-party source for agents to read](#pinned-third-party-source-for-agents-to-read)
+- [Generating per-agent skills from one canonical set](#generating-per-agent-skills-from-one-canonical-set)
+- [Smaller situations](#smaller-situations)
 - [Where to look next](#where-to-look-next)
 
 ## Dotfiles
 
-A dotfiles repository, one directory per tool. Every machine should get that
-same pinned version under `~/.config`, and you want to hear about it when a
-deployed copy drifts. Before migrating: phora deploys copies by default, and it
-has no secret storage, no encryption, and no machine facts gathered for you. If
-those are central, use [dotter](https://github.com/SuperCuber/dotter) or
-[chezmoi](https://www.chezmoi.io) instead.
+You keep one directory per tool in a dotfiles repository, and every machine
+should get the same pinned version under `~/.config`. When a deployed file
+drifts from what you committed, you want to hear about it.
 
 ```
 dotfiles/
@@ -38,7 +36,7 @@ All four destinations share a parent, so one target covers them:
 version = 1
 
 [sources.dotfiles]
-repo = "me/dotfiles"     # bare owner/repo defaults to github
+repo = "mira-sato/dotfiles"     # owner/repo on GitHub
 branch = "main"
 include = ["nvim", "helix", "zsh", "git"]
 
@@ -47,10 +45,9 @@ path = "~/.config"
 sources = ["dotfiles"]
 ```
 
-Selection belongs to the source. A source's `root`, `include`, and `exclude`
-decide what it puts on *offer*; a target's binding may subset that offer but
-never widen it. Here the offer is the four named directories. The repo's loose
-root files never leave it, and `phora list` reports one artifact per directory:
+`phora sync` copies the four directories into `~/.config` and pins the commit
+in `phora.lock`. The repo's loose root files, like its `README.md`, stay behind.
+`phora list` shows one artifact per directory:
 
 ```
 config:
@@ -60,13 +57,12 @@ config:
   dotfiles/zsh  ✓ clean
 ```
 
-When a destination does not sit under a shared parent, give it its own source
-with a `root`. That re-anchors the offer at the subtree: its contents land
-directly at the target path rather than one directory deeper:
+A destination outside the shared parent gets its own source with a `root`, and
+the subtree's contents land directly at the target path:
 
 ```toml
 [sources.nvim]
-repo = "me/dotfiles"
+repo = "mira-sato/dotfiles"
 branch = "main"
 root = "nvim"
 
@@ -75,134 +71,112 @@ path = "~/.config/nvim"
 sources = ["nvim"]
 ```
 
-Several sources naming the same repository share a single mirror; the second one
-costs a lock entry rather than a second clone.
+Upstream changes arrive when you run `phora update`. A plain `sync` keeps the
+locked commit.
 
-`phora sync` deploys everything; `phora.lock` pins the commit. Nothing here is
-templated, so another machine gets byte-identical files. Template outputs can
-differ when local variables differ, as described below.
-When you change something upstream, `phora update` pulls it forward —
-deliberately, not as a side effect of some other command.
+### When a file drifts
 
-Drift shows up instead of festering. `phora verify` re-hashes every deployed
-file against what phora recorded, so the config you hand-tweaked at midnight
-three weeks ago stops being a mystery: it reads as `modified`, and you decide.
-Port the edit back to the repo and `phora update`; or run `phora sync --force`
-to put back what was reviewed; or `phora eject` the artifact and own it
-manually from then on. A plain `sync` will not choose for you — it skips a
-locally modified artifact, names the files that diverged, and tells you
-`--force` exists.
+`phora verify` re-hashes every deployed file and exits non-zero on a mismatch:
 
-Machine differences live in an overlay rather than in branches.
-`phora.local.toml` overlays the committed config per key; keep it out of version
-control. A work machine that needs a different git config can re-point one
-source, or narrow an `include`, without your dotfiles repo growing a `work`
-branch that drifts from `main` forever.
+```
+$ phora verify
+dotfiles/nvim: init.lua (content mismatch)
+```
 
-Per-machine *values* — as opposed to per-machine files — live in `[vars]`. A
-source file whose name ends in `.tmpl` is rendered with the effective variables
-and deployed with the suffix stripped: `git/config.tmpl` in the repository
-becomes `git/config` in the target:
+You have three ways out. Port the edit back to the repo and run `phora update`.
+Run `phora sync --force` to put back the locked version. Or `phora eject` the
+artifact and manage it by hand from then on.
+
+A plain `sync` makes you choose. On a terminal it asks
+`[s]kip/[o]verwrite/[e]ject/[a]bort?` for each modified artifact. Without a
+terminal, in a script or CI, it skips the artifact and names the files:
+
+```
+phora: skipping locally modified dotfiles:nvim
+    init.lua
+  use --force to overwrite
+```
+
+### Per-machine values
+
+A file whose name ends in `.tmpl` is rendered with your `[vars]` and deployed
+without the suffix, so `git/config.tmpl` becomes `~/.config/git/config`. Set the
+shared value in `phora.toml` and override it in `phora.local.toml`, which stays
+out of version control:
 
 ```toml
-# phora.toml, committed
+# phora.toml
 [vars]
-git_email = "me@personal.example"
+git_email = "mira@sato.example"
 ```
 
 ```toml
-# phora.local.toml; keep uncommitted
-version = 1
-
+# phora.local.toml
 [vars]
-git_email = "me@work.example"
+git_email = "mira@larkspur.example"
 ```
 
-The lock hashes the source bytes, so two machines rendering different values
-still produce byte-identical lock files. The registry hashes the rendered
-bytes, and each machine verifies clean against what it actually deployed.
-Editing a variable re-renders on the next sync without advancing any commit.
+Changing a variable re-renders on the next sync without moving the pin. A
+template that uses an undefined variable fails that artifact. See
+[Templating](GUIDE.md#templating).
 
-Post-install steps run as hooks. A target's `on_change` fires once after a sync
-that actually changed that target's content, and files land before it runs:
+The same overlay can re-point a source or narrow an `include` on one machine,
+so the dotfiles repo never needs a `work` branch.
+
+### Post-install steps
+
+A target hook runs after the files land:
 
 ```toml
 [targets.config.hooks]
 on_change = "fc-cache -f"
 ```
 
-A no-op sync runs nothing. A hook that exits non-zero fails the sync, leaves
-the deployed files in place, and re-fires on the next sync rather than being
-recorded as done. For a check that has to run before anything is written, use
-`pre_deploy` instead. Every target's gate runs ahead of every deploy; under the
-default `abort`, a failure leaves the whole run unapplied rather than
-half-applied.
+`on_change` runs once per sync, and only when that target's content changed. If
+it exits non-zero, the sync fails, the files stay, and the hook runs again next
+time. For a check that must pass before anything is written, use `pre_deploy`.
+See [Hooks](GUIDE.md#hooks).
 
-While you are actively editing a config, the copy model can feel slow — change,
-sync, check. For that loop, point the source at your live checkout and deploy it
-by link. Link mode is honored only in the local overlay:
+### Editing live
+
+While you tune a config, change-sync-check gets slow. Point the source at your
+checkout and deploy it by link:
 
 ```toml
 # phora.local.toml
-version = 1
-
 [sources.dotfiles]
-path = "/home/me/dev/dotfiles"
+path = "~/dev/dotfiles"
 deploy = "link"
 ```
 
-A source `path` is used verbatim as the remote, so write it out in full — `~`
-expands in a target `path`, not in a source's. The artifact destinations become
-symlinks into your working tree; edits are visible immediately, no re-sync.
-`phora add --symlink ~/dev/dotfiles` writes that block for you, with the shell
-expanding the path and phora naming the source after the directory — which is
-what makes it override the source of the same name. Delete the overlay and the
-next sync puts a verifiable copy back.
+Each artifact becomes a symlink into `~/dev/dotfiles`, so edits show up without
+a sync. `phora list` labels them `linked`, and `verify` skips them. phora warns
+that the absolute path isn't portable across machines, which is why this block
+lives in the local overlay. `phora add --symlink ~/dev/dotfiles` writes it for
+you. Delete the block and the next sync puts verified copies back. See
+[Link mode](GUIDE.md#link-mode).
 
-### Where phora stops
+If the repo commits symlinks, for example `.zprofile` pointing at `.zshrc`, set
+`allow_symlinks = true` on the source. Otherwise that artifact fails to deploy
+and phora names the file.
 
-Templating is deliberately small. A template sees exactly the strings you put
-in `[vars]` and nothing else: there is no populated namespace of machine facts,
-no hostname or OS to branch on unless you write it down yourself, and no secret
-storage or encryption anywhere in phora. An undefined variable is a hard error
-that fails the artifact, not an empty string.
-
-Hooks are per target, not per file. A target's `on_change` fires once for the
-whole target when its content changed; you cannot attach a script to an
-individual file, and nothing runs for a file that was already up to date.
-
-Copies, not symlinks, by default. Editing `~/.config/nvim/init.lua` does not
-edit your dotfiles repo — it creates drift, which `verify` will dutifully
-report. Link mode is the exception, and it is a narrow one: it is confined to
-`phora.local.toml` and to local sources, and a linked artifact sits outside the
-integrity model, so verify, drift detection, and `rebuild-registry` all skip it
-and `phora list` labels it `linked`.
-
-Symlinks committed inside the source are refused unless that source sets
-`allow_symlinks = true`. A dotfiles repo that keeps, say, `.zprofile` as a link
-to `.zshrc` will fail its first sync with the path named until you opt in.
-
-phora fits dotfiles best when repo-shaped, machine-independent files dominate,
-or when dotfiles share one tool and lock with the other artifact types below.
+phora has no secret storage, no encryption, and no machine facts; a template
+sees only the `[vars]` you write. If you need those, [dotter](https://github.com/SuperCuber/dotter)
+or [chezmoi](https://www.chezmoi.io) fits better. Coming from dotter, its
+`recurse = false`, which links a whole directory, corresponds to phora's
+`collapse = true`. dotter's default, `recurse = true`, links each file.
 
 ## Shared configuration across repositories
 
-A dozen repositories carry diverging copies of lint and editor settings. phora
-can pin and verify copied files, but it cannot merge a shared base with
-repository-specific overrides.
-
-If you already use [vendir](https://github.com/carvel-dev/vendir), compare it
-before adopting this recipe: both tools declare, synchronize, and lock directory
-contents; phora uses Git as its store and records per-file hashes for later
-integrity checks.
-
-Put the canonical copies in one repository:
+A dozen repositories carry diverging copies of the same lint and editor
+settings. You want one canonical copy, pinned per repository, with upgrades you
+can review.
 
 ```
 configs/
   lint/        # ruff.toml, eslint.config.mjs, …
   ci/          # reusable workflow fragments
-  editor/      # .editorconfig and friends
+  editor/      # editorconfig and friends
 ```
 
 Each consuming repo declares what it takes:
@@ -211,7 +185,7 @@ Each consuming repo declares what it takes:
 version = 1
 
 [sources.configs]
-repo = "org/configs"
+repo = "larkspur-labs/configs"
 tag = "v7"
 include = ["lint", "editor"]
 
@@ -220,30 +194,26 @@ path = "etc"
 sources = ["configs"]
 ```
 
-This consumer takes only `lint` and `editor`; the `ci` bundle is not deployed.
-The selected directories land as `etc/lint` and `etc/editor`, which limits the
-recipe to tools you can configure to read those paths. Root-level files such as
-`.editorconfig` and files required under `.github/workflows` need separate
-targets and, where necessary, binding renames.
+You get `etc/lint` and `etc/editor`; `ci` stays behind. Point your tools at
+those paths. Files that must sit at the repo root or under `.github/workflows`
+need their own targets, and renames where the names differ.
 
-Updates are explicit and per repo. Each consumer has its own lock, so a new
-`v8` of the lint rules rolls out one repository at a time, as a reviewable diff
-(`phora update && git diff`), not as a surprise to whoever pushes next. A repo
-that is not ready simply stays on `v7`; the pin is doing its job, not being
-worked around. State is keyed by the project directory, so two checkouts of the
-same repository on one machine track their deployments independently.
+Each repo has its own lock, so `v8` rolls out one repository at a time:
+`phora update && git diff`, then commit. State is keyed by project directory,
+so two checkouts of the same repo on one machine track their deployments
+separately. In CI, `phora verify` fails the build when someone hand-edits a
+deployed file.
 
-`phora verify` in CI detects hand edits to files phora deployed and fails the
-build. It does not prove that the linter, editor, or workflow actually reads
-those files; test that separately.
+### Two versions side by side
 
-One repo can hold two versions at once. Bindings are keyed by identity, and
-each may pin its own ref, so migrating to stricter rules can run as a
-side-by-side comparison inside a single repository before you commit to it:
+Before you move to stricter rules, deploy both and compare. Bindings are keyed
+by identity, and each can pin its own ref:
 
 ```toml
+version = 1
+
 [sources.configs]
-repo = "org/configs"
+repo = "larkspur-labs/configs"
 tag = "v7"
 include = ["lint"]
 
@@ -252,36 +222,51 @@ path = "etc"
 layout = "by-source"
 
 [targets.configs.sources]
-current = { source = "configs" }              # inherits the source's v7
+current = { source = "configs" }              # the source's v7
 next    = { source = "configs", tag = "v8" }
 ```
 
-The two identities become the directory labels under `by-source`.
-`etc/current/lint` and `etc/next/lint` cannot collide, and the difference
-between the rule sets is a plain `diff` between two directories. One mirror
-serves both; the lock carries one entry per distinct ref. When the canary holds
-up, move the source's tag forward, drop back to a single bare binding, and
-`phora sync --prune` reclaims the artifacts the config no longer names.
+`phora preview` shows where each lands:
 
-Upstream removals are not silent. If a directory you were taking disappears
-from the new commit, `phora update` stops and says so, naming the recorded
-artifact, the pin it moved from and to, and the path on disk. Re-run with
-`--fast-forward` to follow the move and delete what upstream dropped, or eject
-the artifact first if you meant to keep it.
+```
+configs -> etc
+  current@648f923b lint/ -> etc/current/lint
+  next@439ad9ff lint/ -> etc/next/lint
+```
 
-Where phora stops: if one repo genuinely needs to deviate, the options are a
-separate artifact for that variant, a rendered `.tmpl` if the difference is a
-value rather than a structure, or ejecting the artifact and accepting that it
-has left the shared set.
+`diff -r etc/current etc/next` shows what changes. When `v8` holds up, move the
+source's tag forward, go back to a single binding, and run `phora sync --prune`
+to remove what the config no longer names. See [Bindings](GUIDE.md#bindings).
+
+### When upstream removes something
+
+If a directory you take disappears upstream, for example when you move the tag
+to `v9`, `phora update` stops:
+
+```
+error: sync error: selection: configs:configs:editor — a recorded artifact is no longer in the source's offer
+matched against: the current offer of source `configs` in target `configs`
+binding: source `configs` → target `configs`
+pin: recorded 439ad9ff → now v9 (d63d7cd5)
+path: etc/editor
+remedy: re-sync with `--fast-forward` to drop it, or eject it before removing it
+to debug: phora explain configs configs editor
+```
+
+`phora update --fast-forward` follows the move and deletes the dropped
+directory. Eject it first if you want to keep it.
+
+phora can't merge a shared base with per-repo overrides. A repo that needs to
+differ takes a separate artifact, renders the difference from a `.tmpl`, or
+ejects the file.
 
 ## Pinned agent skills across projects
 
-Claude Code skills accumulate, and every project ends up with its own copy-paste
-fork of them. What each project and machine should get instead is an explicitly
-chosen, pinned set. phora treats skill files as opaque bytes: it does not
-validate them or prove that an agent loads or follows them.
+Claude Code skills accumulate, and each project ends up with its own
+copy-pasted fork. You want every project and machine to get a chosen set at a
+known version.
 
-Keep the artifacts in one repository, one directory per skill:
+Keep the skills in one repository, one directory each:
 
 ```
 skills/
@@ -291,30 +276,38 @@ skills/
   test/
 ```
 
-Then, in each consuming project:
+In each consuming project:
 
 ```toml
 version = 1
 
 [sources.skills]
-repo = "me/skills"
+repo = "mira-sato/skills"
 tag = "v3"               # or branch = "main" to track
-root = "skills"          # the repo's skills/ dir is the offer
+root = "skills"
 
 [targets.skills]
 path = ".claude/skills"
 sources = ["skills"]
-layout = "flat"          # .claude/skills/scope, .claude/skills/implement, …
 ```
 
-Commit `phora.toml` and `phora.lock` to the project, and everyone who checks it
-out runs `phora sync` and gets the same skills at the same commit — not
-"whatever main was when they cloned." When you cut a new version of the skill
-set, each project moves forward on its own schedule with `phora update`.
+```
+$ phora list
+skills:
+  skills/implement  ✓ clean
+  skills/review  ✓ clean
+  skills/scope  ✓ clean
+  skills/test  ✓ clean
+```
 
-Not every project wants every skill. A binding's `take` subsets the offer for
-one target without touching the source or any other consumer. The binding lives
-in a table keyed by its identity:
+Commit `phora.toml` and `phora.lock`. Everyone who clones the project and runs
+`phora sync` gets the same skills at the same commit, and each project moves to
+a new version with `phora update` when it's ready.
+
+### A subset per project
+
+A binding's `take` narrows what one target gets, without touching the source or
+other consumers:
 
 ```toml
 [targets.skills]
@@ -324,48 +317,66 @@ path = ".claude/skills"
 skills = { take = ["scope/**", "review/**"] }
 ```
 
-A `take` may narrow the offer but never widen it. Naming a leaf the source does
-not offer is an error with a spelling suggestion, and a glob that matches
-nothing is reported as a warning by `phora preview` — either way the mistake
-surfaces rather than silently shipping less than you meant.
+A typo in a literal path fails with a suggestion:
 
-Several bundles can share one directory. Personal skills and team skills land
-side by side under a `by-source` layout, each under its binding's identity:
+```
+error: sync error: selection: reveiw/SKILL.md — not present in the offer; `take` may not widen the offer
+matched against: the offer set
+did you mean: review/SKILL.md, test/SKILL.md
+remedy: name a leaf the source offers, or add it to the source's include
+to debug: phora explain <target> <source> <path>
+```
+
+A glob that matches nothing shows up as a warning in `phora preview`. See
+[take](REFERENCE.md#take).
+
+### Several bundles in one directory
+
+Team skills and your own can share `.claude/skills` under a `by-source` layout,
+each in a directory named after its binding:
 
 ```toml
 [targets.skills]
 path = ".claude/skills"
 sources = ["team-skills", "my-skills"]
-layout = "by-source"   # .claude/skills/team-skills/…, .claude/skills/my-skills/…
+layout = "by-source"
 ```
 
-Writing a skill is a link-mode loop. While developing, overlay the source onto
-your checkout in `phora.local.toml` with `deploy = "link"` — edits show up in
-the consuming project immediately, with no commit-and-sync per keystroke. Drop
-the overlay when you are done and the next sync restores a pinned, verifiable
-copy.
+```
+skills:
+  my-skills/implement  ✓ clean
+  my-skills/review  ✓ clean
+  my-skills/scope  ✓ clean
+  my-skills/test  ✓ clean
+  team-skills/deploy-checklist  ✓ clean
+```
 
-`phora verify` in CI re-hashes every deployed file, names mismatches, and exits
-non-zero if any deployed bytes differ from phora's registry. It does not prove
-that an agent loaded, followed, or correctly interpreted those files.
+### Writing a skill
 
-The same shape covers anything agent-adjacent and directory-shaped: subagent
-definitions into `.claude/agents`, shared `CLAUDE.md` fragments, prompt
-libraries, MCP server configs. One source per bundle, one target per
-destination.
+While you work on a skill, link the source to your checkout in
+`phora.local.toml`. The `root` from `phora.toml` still applies:
 
-Nothing validates frontmatter, checks that a `SKILL.md` exists, or warns you
-that a subagent definition is malformed. phora can verify that the deployed
-bytes still match the pinned artifact; review, format validation, and agent
-behavior remain separate concerns.
+```toml
+[sources.skills]
+path = "~/dev/skills"
+deploy = "link"
+```
+
+Edits appear in the consuming project right away. Remove the block and the next
+sync restores the pinned copy.
+
+The same shape fits subagent definitions in `.claude/agents`, shared
+`CLAUDE.md` fragments, prompt libraries, and MCP server configs: one source per
+bundle, one target per destination.
+
+phora treats skill files as bytes. It doesn't check frontmatter or look for a
+`SKILL.md`, and `verify` can't tell you whether an agent loads the files.
 
 ## Release assets, without curl | tar
 
-You install a tool from a release tarball with `curl | tar`, then lose track of
-the version and cannot verify the bytes later. This recipe pins one known URL
-and digest for one platform. If you need version discovery, platform selection,
-dependency handling, or `PATH` management, use a package or version manager
-instead.
+You install a tool from a release tarball with `curl | tar` and then lose track
+of which version you have. You want the download pinned, checked, and
+verifiable later.
 
 ```toml
 version = 1
@@ -378,48 +389,48 @@ include = ["fzf"]
 [targets.bin]
 path = "~/.local/bin"
 sources = ["fzf-bin"]
-layout = "flat"
 ```
 
-A url source is fetched once and imported; it takes no `branch`, `tag`, `rev`,
-or `root`, because there is no history to point at. Compared with `curl | tar`:
+phora checks the digest before it extracts anything, validates every archive
+path, and keeps the executable bit:
 
-- The digest is checked against the raw bytes before extraction; a corrupted or
-  substituted download never touches your tree.
-- Archive entries are validated path by path. A malicious archive cannot write
-  outside the target.
-- A single top-level directory is stripped automatically, so the version-stamped
-  wrapper that release tarballs commonly carry does not reshuffle your paths
-  when the version moves. fzf's payload sits at the root and needs nothing
-  special either way.
-- The executable bit survives. The deployed `fzf` runs.
-- Lock and registry both record the content: `phora list` names what is
-  deployed, `phora where` traces a binary back to where it came from, and
-  `phora verify` catches any tampering since.
+```
+$ phora list
+bin:
+  fzf-bin/fzf  ✓ clean
+```
 
-To upgrade, edit the URL and the digest, then run `phora update`. A plain `sync`
-deliberately does not reach for the network; it honors the lock. `update` is the
-command that re-downloads and re-checks. Because identical bytes always import
-to the identical synthetic commit, an update that finds unchanged content is a
-true no-op and the lock does not churn.
+`phora where --source fzf-bin` traces the binary back to its source, and
+`phora verify` catches later tampering. See [Sources](REFERENCE.md#sources) for
+what a URL source accepts.
 
-Where phora stops: both the URL and the digest are yours to edit, and the digest
-is the only thing standing between you and whatever the URL serves next.
+To upgrade, change the URL and the digest together, then run `phora sync`. The
+lock records the URL, so a new one triggers a download, and the sync reports the
+move:
+
+```
+phora: fzf-bin → bin: url (242b8dc5) → bdc18d7c
+```
+
+`phora update` downloads and checks the digest again even when the URL hasn't
+changed.
+
+This pins one URL for one platform. phora doesn't discover versions, pick a
+platform, or manage `PATH`, and the digest is your only guard against what the
+URL serves next.
 
 ## Vendoring a subtree from a larger repo
 
-Protobuf definitions, JSON schemas, design tokens, a documentation theme: other
-repositories copy them out of a larger repository by hand — often a monorepo —
-and nobody can say what version any given copy is at. phora can pin and deliver
-those source files; it does not run generators or detect compatibility breaks.
+Several repos copy protobuf definitions out of a monorepo by hand. Nobody can
+say which version any given copy is at.
 
-The producing repo needs no changes at all. Each consumer declares its slice:
+The producing repo needs no changes. Each consumer declares its slice:
 
 ```toml
 version = 1
 
 [sources.platform]
-repo = "org/platform"
+repo = "larkspur-labs/platform"
 tag = "v2.3.0"
 root = "protos"
 
@@ -428,76 +439,195 @@ path = "vendor/protos"
 sources = ["platform"]
 ```
 
-Now the version question has a boring answer: it is in `phora.lock`, in the
-consumer's own repo, under version control. Upgrades are per consumer and
-reviewable, a service that needs more time stays pinned, and the
-stable-versus-next pattern from the
-[configuration section](#shared-configuration-across-repositories) works here
-unchanged when a migration needs both versions in the tree at once.
+The version now lives in the consumer's `phora.lock`, under version control.
+Check what would ship before you sync:
 
-Here, each offered *leaf* is an artifact, not necessarily a top-level
-directory — a single loose file deploys as readily as a tree — but a directory
-that is taken whole collapses into one artifact named after it. That is why
-`root = "protos"` with a `protos/billing/` and a `protos/identity/` yields
-exactly two artifacts, `platform/billing` and `platform/identity`, and why
-widening the offer to a loose file at the root would add a third.
+```
+$ phora preview
+protos -> vendor/protos
+  platform@5d52f43a billing/ -> vendor/protos/billing
+  platform@5d52f43a identity/ -> vendor/protos/identity
+```
 
-Two commands answer "would this ship?" before you sync. `phora preview` renders
-the whole projection from the lock, one line per artifact, showing renames and
-the exact destination path; add `--files` to expand a collapsed directory into
-the files it folds in. `phora explain <target> <source> [path]` attributes a
-single path: which `include` offered it, and how `take` resolved it.
+Each directory taken whole becomes one artifact. `phora preview --files` lists
+the files inside, and `phora explain protos platform billing/invoice.proto`
+says why one path is included. See [Collapse](GUIDE.md#collapse),
+[preview](REFERENCE.md#phora-preview), and [explain](REFERENCE.md#phora-explain).
 
-Where phora stops: it will not run `protoc`, regenerate stubs, or notice that
-the schema you just pulled forward is incompatible with your code. Vendoring is
-a delivery step; the build step after it is still yours.
+Upgrades are per consumer, and the
+[two-versions pattern](#two-versions-side-by-side) works here when a migration
+needs both in the tree at once.
 
-## Smaller situations to recognize
+phora delivers the files. It doesn't run `protoc`, regenerate stubs, or notice
+that a new schema breaks your code.
 
-These are fit checks, not complete recipes.
+## Pinned third-party source for agents to read
 
-Duplicated Git hook scripts sit in every repository, and each checkout should be
-running the same pinned set. Deploy a `hooks/` artifact into a directory and
-point `core.hooksPath` at it. phora delivers the files and pins the version, and
-a target `on_change` hook can do the wiring once the files land:
+Your agents read a dependency's source to answer questions about it, and the
+answer depends on the version you use. You want that source in the project at
+the pinned version, with its history so `git log` and `git blame` work.
 
 ```toml
+version = 1
+
+[sources.axum]
+repo = "tokio-rs/axum"
+tag = "axum-v0.8.4"
+
+[targets.resources]
+path = "resources"
+
+[targets.resources.sources.axum]
+history = true
+```
+
+`phora add --history tokio-rs/axum --to resources` writes the same thing. After
+a sync, `resources/axum` holds the whole repository at the tag, plus a `.git`
+file that points into phora's cache:
+
+```
+$ phora list
+resources:
+  axum/axum  history, ✓ clean
+```
+
+`phora verify` checks the files like any other copy. Inside the directory,
+`git log`, `git blame` and `git show` see the pinned commit and everything
+before it.
+
+Add `resources/` to your project's `.gitignore`. Otherwise git treats
+`resources/axum` as an embedded repository.
+
+Branches and commits you make inside `resources/axum` live in phora's cache and
+disappear when the cache does, so push anything you want to keep elsewhere. A
+history binding takes the whole repository, and phora rejects `take`,
+`collapse`, and `template` on it. See [History overlay](GUIDE.md#history-overlay).
+
+## Generating per-agent skills from one canonical set
+
+You keep one canonical set of skills, and each agent tool wants its own format
+and directory. A generator can translate them, but it needs pinned inputs
+before it runs, and its output still has to land in the right places.
+
+```toml
+version = 1
+
+[hooks]
+post_prepare = "generate --from .phora-inputs/skills --out .generated"
+
+[sources.skills]
+repo = "larkspur-labs/skills"
+tag = "v4"
+
+[sources.generated]
+path = "./.generated"
+deploy = "link"
+
+[targets.inputs]
+path = ".phora-inputs/skills"
+phase = "prepare"
+sources = ["skills"]
+
+[targets.claude]
+path = ".claude"
+sources.generated = { take = [{ "claude/" = "." }] }
+
+[targets.codex]
+path = ".codex"
+sources.generated = { take = [{ "codex/" = "." }] }
+```
+
+`generate` stands in for your generator. Here it writes `claude/skills/…` and
+`codex/skills/…` under `.generated`. One `phora sync` then runs in this order:
+
+1. The `inputs` target, in the prepare phase, copies `skills` at `v4` into
+   `.phora-inputs/skills`.
+2. `post_prepare` runs the generator.
+3. The deploy phase links the generated files. The subtree rename
+   `{ "claude/" = "." }` re-roots everything under `claude/` at the target
+   root, so `claude/skills/triage/SKILL.md` lands at
+   `.claude/skills/triage/SKILL.md`.
+
+```
+$ phora list
+claude:
+  generated/skills/release-notes/SKILL.md  linked
+  generated/skills/triage/SKILL.md  linked
+codex:
+  generated/skills/release-notes/SKILL.md  linked
+  generated/skills/triage/SKILL.md  linked
+inputs:
+  skills/release-notes  ✓ clean
+  skills/triage  ✓ clean
+```
+
+`.generated` can be missing on the first run. If the generator fails, the sync
+stops before the deploy phase and the links from the last good run stay. Have
+the generator write to a temporary directory and move it into place when it
+succeeds, and keep its inputs outside its output directory.
+
+To advance the canonical set and drop links to skills that no longer exist, run
+`phora update skills --fast-forward --prune`. See
+[Preparing inputs](GUIDE.md#preparing-inputs) and
+[Renaming](GUIDE.md#renaming).
+
+phora runs the generator and deploys what it writes; it knows nothing about the
+formats, and it can't undo a hook's side effects.
+
+## Smaller situations
+
+Git hook scripts copied into every repository. Deploy a pinned set and let a
+target hook wire it up once the files land:
+
+```toml
+version = 1
+
+[sources.git-hooks]
+repo = "larkspur-labs/git-hooks"
+tag = "v1.2.0"
+
 [targets.githooks]
 path = ".githooks"
-sources = ["hooks"]
+sources = ["git-hooks"]
 
 [targets.githooks.hooks]
 on_change = "git config core.hooksPath .githooks"
 ```
 
-During incidents, responders lose time switching from a service repository to a
-separate wiki. Project an `ops/runbooks` source into each service repository so
-the relevant docs are present at a pinned version.
+Runbooks in a separate ops repo that responders have to go looking for during
+an incident. Give each service repository the runbooks for its own service:
 
-You read upstream source trees often enough to want pinned, read-only copies
-nearby. Project them into a target and update them explicitly; sources naming
-the same remote share one bare mirror under the cache root. These are exported
-files, not Git checkouts: they contain no `.git` directory, branches, or
-working-tree workflow.
+```toml
+version = 1
 
-You maintain course material, examples, or starter kits that several local
-directories should receive at a known, verifiable version.
+[sources.runbooks]
+repo = "larkspur-labs/ops"
+branch = "main"
+root = "runbooks"
+include = ["billing"]
 
-The shared constraint: directory-shaped content moving from its source to a
-local consumer at a pinned, later-verifiable version.
+[targets.runbooks]
+path = "docs/runbooks"
+sources = ["runbooks"]
+```
 
 ## Where to look next
 
-- The [README](README.md) for every flag and config key in one place.
-- The [guide](GUIDE.md) for the mental model and the internals.
+- The [reference](REFERENCE.md) for every command, flag, and config key.
+- The [guide](GUIDE.md) for how phora works.
 - [`phora.example.toml`](phora.example.toml) and
-  [`phora.local.example.toml`](phora.local.example.toml) for complete, annotated
-  configs.
-- The scrut suites under [`tests/scrut/`](tests/scrut) for CI-verified, runnable
-  walkthroughs: [showcase](tests/scrut/showcase.md) end to end,
+  [`phora.local.example.toml`](phora.local.example.toml) for annotated configs.
+- The scrut suites under [`tests/scrut/`](tests/scrut), each a runnable
+  walkthrough checked in CI: [showcase](tests/scrut/showcase.md) end to end,
   [selection](tests/scrut/selection.md) for offer and take,
-  [templates](tests/scrut/templates.md), [hooks](tests/scrut/hooks.md),
+  [mapped](tests/scrut/mapped.md) for renaming,
   [versions](tests/scrut/versions.md) for two versions side by side,
-  [drift](tests/scrut/drift.md), [mapped](tests/scrut/mapped.md) for renaming,
-  [release-assets](tests/scrut/release-assets.md), and
-  [orphans](tests/scrut/orphans.md).
+  [templates](tests/scrut/templates.md), [hooks](tests/scrut/hooks.md),
+  [drift](tests/scrut/drift.md), [orphans](tests/scrut/orphans.md),
+  [release-assets](tests/scrut/release-assets.md),
+  [history](tests/scrut/history.md) for the history overlay,
+  [prepare](tests/scrut/prepare.md) for prepare-then-deploy,
+  [transitive](tests/scrut/transitive.md) for composed dependencies,
+  [lifecycle](tests/scrut/lifecycle.md) for the core add-sync-verify loop,
+  [manage](tests/scrut/manage.md) for eject, update and rebuild-registry, and
+  [query](tests/scrut/query.md) for `where`, `check-match` and list states.
