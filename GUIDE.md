@@ -95,8 +95,9 @@ all verified
 Here is what the sync did:
 
 1. It read `phora.toml`, plus `phora.local.toml` if one exists.
-2. It cloned `github.com/srnnkls/phora` into its cache, resolved `main` to one
-   commit, and wrote that commit to `phora.lock`.
+2. It resolved `main` to one commit, fetched that commit into its cache, and
+   wrote it to `phora.lock`. The cache gets the commit alone, without history,
+   and only the file contents the source selects: here, one README.
 3. It worked out the offer: just `README.md`.
 4. It copied `README.md` into `./out` and recorded the file's hash.
 
@@ -154,8 +155,8 @@ remote's default branch. A `rev` is a full commit id: 40 hex characters, or 64
 for a SHA-256 repository. phora rejects an abbreviated one, because a short id is
 unique only until the repository grows another commit that starts the same way.
 
-All spellings of one repository share a single cached clone, so switching
-between https, ssh and the `host` form never clones again.
+All spellings of one repository share a single cached mirror, so switching
+between https, ssh and the `host` form never fetches it again.
 
 ### Local directories
 
@@ -354,7 +355,7 @@ stable = { source = "bat", tag = "v0.24.0" }
 canary = { source = "bat", tag = "v0.25.0" }
 ```
 
-Both bindings read from one clone and resolve to two commits. Each distinct ref
+Both bindings read from one mirror and resolve to two commits. Each distinct ref
 gets its own lock entry. A config where no binding sets a ref keeps one entry per
 source.
 
@@ -803,6 +804,12 @@ phora add --history Byron/gitoxide --to resources
 phora bind gitoxide --history --to resources --to docs
 ```
 
+A history binding is the one thing that makes phora fetch a repository's full
+history; every other binding gets only its pinned commits. Once a repository's
+mirror has full history it keeps it. `phora sync --frozen` fails when a history
+binding meets a mirror that holds only pinned commits, because it can't fetch
+the rest.
+
 A history binding takes the whole repository. It cannot be combined with `take`,
 `template`, `collapse`, `root`, `include`, `exclude`, `transitive`, link mode, a
 URL source, or `preserve_executable = false`. It allows symlinks unless the source
@@ -1070,7 +1077,8 @@ phora trust tropos --revoke            # drop every approval
 
 `--list` shows, for a hook you approved before, which files changed since the
 approved commit. For a new hook it lists the files you compose from the
-dependency. Both work offline from the cache.
+dependency. Both read from the cache, fetching a missing commit or file from
+the dependency's remote when the cache lacks it.
 
 Approvals live in your `phora.lock` as `[[trusted_hooks]]`, each pinned to the
 command and the dependency commit. When the dependency moves to any new commit,
@@ -1101,8 +1109,9 @@ phora writes four things:
 - `phora.lock` in your project: the commit for every source. Commit it.
 - `phora.local.lock`: pins for every source named in `phora.local.toml`,
   whether it declares the source or overrides one from `phora.toml`.
-- The cache: a bare clone per repository and imported downloads. You can delete
-  it; the next sync fetches the locked commits again.
+- The cache: one mirror per repository, holding just the pinned commits and the
+  files you deploy from them, plus imported downloads. You can delete it; the
+  next sync fetches the locked commits again.
 - The state directory: the registry of what landed where, with hashes. It is the
   only record of what phora wrote, so treat it like data.
 
