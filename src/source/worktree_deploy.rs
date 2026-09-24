@@ -151,70 +151,94 @@ impl WorktreeMirrorGuard {
     }
 
     pub fn publish_worktree(&self, request: &WorktreeDeployRequest) -> Result<WorktreeDeployment> {
-        Self::sweep_gitlink_staging(&request.deploy_root)?;
-        self.publish_worktree_unchecked(request)
-            .map_err(
-                |error| match Self::sweep_gitlink_staging(&request.deploy_root) {
-                    Ok(()) => error,
-                    Err(cleanup) => SourceError::Source(format!(
-                        "{error}; clean staged worktree gitlinks: {cleanup}"
-                    )),
-                },
-            )
+        self.publish_staged_worktree(request, &request.deploy_root)
+    }
+
+    /// Publish the overlay for files that sit in `content_root` and will be renamed onto
+    /// `request.deploy_root`, so the deployment never appears without its `.git`.
+    pub fn publish_staged_worktree(
+        &self,
+        request: &WorktreeDeployRequest,
+        content_root: &Path,
+    ) -> Result<WorktreeDeployment> {
+        Self::sweep_gitlink_staging(content_root)?;
+        self.publish_worktree_unchecked(request, content_root)
+            .map_err(|error| match Self::sweep_gitlink_staging(content_root) {
+                Ok(()) => error,
+                Err(cleanup) => SourceError::Source(format!(
+                    "{error}; clean staged worktree gitlinks: {cleanup}"
+                )),
+            })
     }
 
     fn publish_worktree_unchecked(
         &self,
         request: &WorktreeDeployRequest,
+        content_root: &Path,
     ) -> Result<WorktreeDeployment> {
         let mirror = verified_mirror_root(&self.address)?;
         let worktrees = mirror.join("worktrees");
         std::fs::create_dir_all(&worktrees).map_err(|error| {
             SourceError::Source(format!("create worktree administration root: {error}"))
         })?;
-        std::fs::create_dir_all(&request.deploy_root).map_err(|error| {
+        std::fs::create_dir_all(content_root).map_err(|error| {
             SourceError::Source(format!("create worktree deployment root: {error}"))
         })?;
 
         let admin_name = format!("ph-{}", request.admin_id.as_str());
         let admin_dir = worktrees.join(&admin_name);
-        let physical_gitlink = canonical_gitlink_path(&request.deploy_root)?;
+        let physical_gitlink = destined_gitlink_path(&request.deploy_root)?;
         let staging = create_transient_dir(&mirror, &admin_name, "staging")?;
-        self.create_gitlink_directories(&request.deploy_root, &request.commit)?;
+        self.create_gitlink_directories(content_root, &request.commit)?;
         self.write_admin(
             &staging,
             &admin_dir,
-            &request.deploy_root,
+            content_root,
             &physical_gitlink,
             &request.commit,
         )?;
-        let gitlink = create_gitlink_staging(&request.deploy_root, &admin_dir)?;
+        let gitlink = create_gitlink_staging(content_root, &admin_dir)?;
 
-        let backup = if path_exists(&admin_dir, "inspect worktree administration")? {
-            let backup = create_transient_dir(&mirror, &admin_name, "backup")?;
-            std::fs::rename(&admin_dir, &backup).map_err(|error| {
-                SourceError::Source(format!("back up prior worktree administration: {error}"))
-            })?;
-            Some(backup)
+        let prior = if path_exists(&admin_dir, "inspect worktree administration")? {
+            match super::cache::exchange_paths(&staging, &admin_dir) {
+                Ok(true) => Some(staging),
+                Ok(false) => {
+                    let backup = create_transient_dir(&mirror, &admin_name, "backup")?;
+                    std::fs::rename(&admin_dir, &backup).map_err(|error| {
+                        SourceError::Source(format!(
+                            "back up prior worktree administration: {error}"
+                        ))
+                    })?;
+                    if let Err(error) = std::fs::rename(&staging, &admin_dir) {
+                        return Err(restore_admin(
+                            &admin_dir,
+                            Some(&backup),
+                            "publish worktree administration",
+                            &error,
+                        ));
+                    }
+                    Some(backup)
+                }
+                Err(error) => {
+                    return Err(SourceError::Source(format!(
+                        "publish worktree administration: {error}"
+                    )));
+                }
+            }
         } else {
+            std::fs::rename(&staging, &admin_dir).map_err(|error| {
+                SourceError::Source(format!("publish worktree administration: {error}"))
+            })?;
             None
         };
-        if let Err(error) = std::fs::rename(&staging, &admin_dir) {
-            return Err(restore_admin(
-                &admin_dir,
-                backup.as_deref(),
-                "publish worktree administration",
-                &error,
-            ));
-        }
         Self::write_pin(&mirror, request)?;
-        if let Err(error) = std::fs::rename(&gitlink, request.deploy_root.join(".git")) {
+        if let Err(error) = std::fs::rename(&gitlink, content_root.join(".git")) {
             return Err(SourceError::Source(format!(
                 "publish worktree gitlink: {error}"
             )));
         }
-        if let Some(backup) = backup {
-            std::fs::remove_dir_all(backup).map_err(|error| {
+        if let Some(prior) = prior {
+            std::fs::remove_dir_all(prior).map_err(|error| {
                 SourceError::Source(format!("remove prior worktree administration: {error}"))
             })?;
         }
@@ -231,11 +255,11 @@ impl WorktreeMirrorGuard {
         &self,
         staging: &Path,
         admin_dir: &Path,
-        deploy_root: &Path,
+        content_root: &Path,
         gitlink: &Path,
         commit: &Commit,
     ) -> Result<()> {
-        self.write_index(staging, admin_dir, deploy_root, commit)?;
+        self.write_index(staging, admin_dir, content_root, commit)?;
         for (path, contents) in [
             (staging.join("HEAD"), format!("{}\n", commit.as_str())),
             (staging.join("commondir"), "../..\n".to_owned()),
@@ -268,7 +292,7 @@ impl WorktreeMirrorGuard {
         &self,
         staging: &Path,
         admin_dir: &Path,
-        deploy_root: &Path,
+        content_root: &Path,
         commit: &Commit,
     ) -> Result<()> {
         let oid = gix::ObjectId::from_hex(commit.as_str().as_bytes()).map_err(|error| {
@@ -287,10 +311,10 @@ impl WorktreeMirrorGuard {
             let path = std::str::from_utf8(path.as_ref()).map_err(|error| {
                 SourceError::Source(format!("read worktree index path: {error}"))
             })?;
-            let metadata = gix::index::fs::Metadata::from_path_no_follow(&deploy_root.join(path))
+            let metadata = gix::index::fs::Metadata::from_path_no_follow(&content_root.join(path))
                 .map_err(|error| {
-                SourceError::Source(format!("stat worktree deployment path {path}: {error}"))
-            })?;
+                    SourceError::Source(format!("stat worktree deployment path {path}: {error}"))
+                })?;
             entry.stat = gix::index::entry::Stat::from_fs(&metadata).map_err(|error| {
                 SourceError::Source(format!("record worktree index stat {path}: {error}"))
             })?;
@@ -492,13 +516,24 @@ pub(crate) fn physical_gitlink_path(deploy_root: &Path) -> Result<Option<PathBuf
     }
 }
 
-fn canonical_gitlink_path(deploy_root: &Path) -> Result<PathBuf> {
-    physical_gitlink_path(deploy_root)?.ok_or_else(|| {
-        SourceError::Source(format!(
-            "worktree deployment root {} is absent",
+/// The physical `.git` path of `deploy_root`, which may not exist yet but whose parent must.
+fn destined_gitlink_path(deploy_root: &Path) -> Result<PathBuf> {
+    if let Some(gitlink) = physical_gitlink_path(deploy_root)? {
+        return Ok(gitlink);
+    }
+    let (Some(parent), Some(name)) = (deploy_root.parent(), deploy_root.file_name()) else {
+        return Err(SourceError::Source(format!(
+            "worktree deployment root {} has no parent",
             deploy_root.display()
+        )));
+    };
+    let parent = parent.canonicalize().map_err(|error| {
+        SourceError::Source(format!(
+            "canonicalize worktree deployment parent {}: {error}",
+            parent.display()
         ))
-    })
+    })?;
+    Ok(parent.join(name).join(".git"))
 }
 
 fn remove_worktree_gitlink(

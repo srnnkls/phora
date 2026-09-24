@@ -434,6 +434,66 @@ fn history_whole_root_sync_publishes_the_overlay_and_complete_record_address() {
 }
 
 #[test]
+fn history_overlay_head_moved_off_the_pin_fails_verify_until_sync_restores_it() {
+    let fixture = TempDir::new().expect("fixture tempdir");
+    let (mirror, _, _, _) = fixture_repository(&fixture);
+    let deploy_root = fixture.path().join("deployment");
+    let config = Config::parse(&format!(
+        "version = 1\n\
+         [sources.history]\n\
+         git = \"{}\"\n\n\
+         [targets.home]\n\
+         path = \"{}\"\n\n\
+         [targets.home.sources]\n\
+         history = {{ history = true }}\n",
+        mirror.display(),
+        deploy_root.display()
+    ))
+    .expect("history config parses");
+    let registry = FileStateStore::open(fixture.path().join("state")).expect("open registry");
+    let backend = GitBackend::new(fixture.path().join("cache"));
+    sync_history(&config, &registry, &backend, sync_options());
+    let record = registry
+        .all_artifacts()
+        .expect("read history records")
+        .pop()
+        .expect("history sync persists one record");
+    let history_root = deploy_root.join("history");
+
+    git_stdout(
+        &history_root,
+        &[
+            "-c",
+            "user.name=phora",
+            "-c",
+            "user.email=phora@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "local",
+        ],
+    );
+    let verification =
+        phora::sync::verify(&config, &registry, None, &backend).expect("verify runs");
+    assert!(
+        !verification.is_clean() && verification.overlay_findings.iter().any(|f| f.stale),
+        "verify fails on an overlay whose HEAD moved off the pin"
+    );
+    sync_history(&config, &registry, &backend, sync_options());
+    assert_eq!(
+        git_stdout(&history_root, &["log", "-1", "--format=%H"]),
+        record.commit,
+        "sync puts a moved HEAD back on the pin"
+    );
+    assert!(
+        phora::sync::verify(&config, &registry, None, &backend)
+            .expect("verify runs")
+            .is_clean(),
+        "a restored overlay verifies clean"
+    );
+}
+
+#[test]
 fn history_prune_removes_deployment_and_overlay_administration() {
     let fixture = TempDir::new().expect("fixture tempdir");
     let (mirror, _, _, _) = fixture_repository(&fixture);

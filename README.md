@@ -106,7 +106,7 @@ The model splits cleanly into who-owns-what:
 | take     | target | subsets and renames the offer per binding (literal / glob / `{ src = dest }`) |
 | artifact | —      | one leaf, identified by its full offered path                       |
 | collapse | target | how a taken set materializes: per-leaf, or one dir symlink/subtree  |
-| history overlay | binding | Git metadata over one copy deployment; copied content remains authoritative |
+| history overlay | binding | read-only Git metadata over one copy deployment; copied content remains authoritative |
 
 ### State & locations
 
@@ -840,10 +840,11 @@ A history binding is the only thing that makes phora clone a source's full histo
 every other mirror holds depth-1 slices of the pinned commits, with file contents
 fetched only for the files phora deploys. Once a mirror has full history it keeps it.
 
-The overlay's mirrors are cache state. User branches and commits made inside a history
-deployment are disposable cache-local state: a cache deletion or mirror reclone can lose
-them, so push work elsewhere to retain it. A concurrent mirror refresh can also make a
-user-run `git log` or `git blame` fail transiently; retry the command.
+A history deployment is read-only: it shows the pinned commit and nothing else. When
+its `HEAD` or index moves off the pin, `phora verify` fails and the next `phora sync`
+puts them back, dropping any commit made there. A branch created inside lands in the
+shared cache mirror, where every other overlay of that repository sees it. To work on the
+code, clone it.
 
 When a history deployment is inside your own Git work tree, the enclosing repository
 sees it as an embedded repository. Add that deployment path to the enclosing

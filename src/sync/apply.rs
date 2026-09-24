@@ -135,7 +135,7 @@ pub(super) fn apply_artifact_report(
     journal: &Journal,
     registry: &dyn StateStore,
     events: &mut SyncEvents,
-    post_swap: impl FnOnce() -> Result<()>,
+    pre_swap: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     let mut cleanup = CleanupGuard::new();
     cleanup.track(paths.staging.to_path_buf());
@@ -153,6 +153,11 @@ pub(super) fn apply_artifact_report(
         record: record.clone(),
         swap_completed: false,
     })?;
+
+    if let Err(error) = pre_swap() {
+        journal.remove(paths.dst)?;
+        return Err(error);
+    }
 
     let backup = match std::fs::symlink_metadata(paths.dst) {
         Ok(_) => {
@@ -177,12 +182,6 @@ pub(super) fn apply_artifact_report(
 
     swap_into(paths.staging, paths.dst, record.allow_symlinks, events)?;
     journal.mark_swap_completed(paths.dst)?;
-
-    if let Err(error) = post_swap() {
-        rollback_swap(paths.dst, backup.as_deref())?;
-        journal.remove(paths.dst)?;
-        return Err(error);
-    }
 
     if let Err(put_err) = registry.put_artifact_journaled(&record, journal.directory()) {
         rollback_swap(paths.dst, backup.as_deref())?;
@@ -576,6 +575,87 @@ mod tests {
             std::fs::read(dst.join("nested/b.txt")).expect("read nested/b.txt"),
             b"hello",
             "dst must contain the staged nested/b.txt byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn pre_swap_writes_arrive_with_the_swap() {
+        let (_state_dir, reg) = registry();
+        let parent = TempDir::new().expect("target parent");
+        let dst = parent.path().join("vscode");
+        std::fs::create_dir_all(&dst).expect("create prior deployment");
+        std::fs::write(dst.join("old.txt"), b"old").expect("write prior file");
+        let files: &[(&str, &[u8])] = &[("a.json", b"{}")];
+        let base = staging_base(parent.path());
+        let staging = make_staging(&base, files);
+        let record = record_for(&staging, files);
+        let jrnl = journal_for(&reg);
+        let mut events = SyncEvents::discarding();
+
+        apply_artifact_report(
+            ApplyPaths {
+                staging_base: &base,
+                staging: &staging,
+                dst: &dst,
+            },
+            record,
+            &jrnl,
+            &reg,
+            &mut events,
+            || {
+                assert!(
+                    dst.join("old.txt").is_file(),
+                    "pre_swap runs while the prior deployment is still in place"
+                );
+                std::fs::write(staging.join(".git"), b"gitdir: /admin\n").expect("stage gitlink");
+                Ok(())
+            },
+        )
+        .expect("deploy must succeed");
+
+        assert_eq!(
+            std::fs::read(dst.join(".git")).expect("read gitlink"),
+            b"gitdir: /admin\n",
+            "a file written by pre_swap is in place the moment the deployment is"
+        );
+    }
+
+    #[test]
+    fn failed_pre_swap_keeps_the_prior_deployment_and_clears_the_journal() {
+        let (_state_dir, reg) = registry();
+        let parent = TempDir::new().expect("target parent");
+        let dst = parent.path().join("vscode");
+        std::fs::create_dir_all(&dst).expect("create prior deployment");
+        std::fs::write(dst.join("old.txt"), b"old").expect("write prior file");
+        let files: &[(&str, &[u8])] = &[("a.json", b"{}")];
+        let base = staging_base(parent.path());
+        let staging = make_staging(&base, files);
+        let record = record_for(&staging, files);
+        let jrnl = journal_for(&reg);
+        let mut events = SyncEvents::discarding();
+
+        let result = apply_artifact_report(
+            ApplyPaths {
+                staging_base: &base,
+                staging: &staging,
+                dst: &dst,
+            },
+            record,
+            &jrnl,
+            &reg,
+            &mut events,
+            || Err(Error::Projection("publish failed".to_owned())),
+        );
+
+        assert!(result.is_err(), "a pre_swap failure fails the deploy");
+        assert_eq!(
+            std::fs::read(dst.join("old.txt")).expect("read prior file"),
+            b"old",
+            "the prior deployment stays in place"
+        );
+        assert!(
+            jrnl.entries().expect("read journal").is_empty(),
+            "the journal entry is removed"
         );
     }
 

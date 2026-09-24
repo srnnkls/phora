@@ -273,12 +273,27 @@ pub(super) fn reclone_mirror(
         }
     };
     carry_managed_worktrees(mirror, &staging.path, &repo, source)?;
-    if mirror.exists() {
-        std::fs::remove_dir_all(mirror)
-            .map_err(|e| SourceError::Source(format!("remove corrupt mirror {source}: {e}")))?;
-    }
     staging.commit_to(mirror, source.as_str())?;
     Ok(session)
+}
+
+/// Atomically swap two existing paths so a reader never finds `dst` missing. Returns
+/// `Ok(false)` when the platform or filesystem cannot exchange; `new` then holds the prior
+/// `dst` on success.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(super) fn exchange_paths(new: &Path, dst: &Path) -> std::io::Result<bool> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+    use rustix::io::Errno;
+    match renameat_with(CWD, new, CWD, dst, RenameFlags::EXCHANGE) {
+        Ok(()) => Ok(true),
+        Err(Errno::INVAL | Errno::NOSYS | Errno::NOTSUP) => Ok(false),
+        Err(errno) => Err(errno.into()),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(super) fn exchange_paths(_new: &Path, _dst: &Path) -> std::io::Result<bool> {
+    Ok(false)
 }
 
 fn clone_full(source: &SourceName, url: &str, path: &Path) -> Result<gix::Repository> {
@@ -446,9 +461,20 @@ impl MirrorStaging {
         }
     }
 
+    /// Replace `mirror` with the staged clone. An exchange keeps the mirror path valid
+    /// throughout, so linked worktrees never point into a missing directory; the prior
+    /// mirror is then removed from the staging path by `Drop`.
     pub(super) fn commit_to(mut self, mirror: &Path, label: &str) -> Result<()> {
-        std::fs::rename(&self.path, mirror)
-            .map_err(|e| SourceError::Source(format!("publish mirror {label}: {e}")))?;
+        let publish =
+            |e: std::io::Error| SourceError::Source(format!("publish mirror {label}: {e}"));
+        if mirror.exists() {
+            if exchange_paths(&self.path, mirror).map_err(publish)? {
+                return Ok(());
+            }
+            std::fs::remove_dir_all(mirror)
+                .map_err(|e| SourceError::Source(format!("remove corrupt mirror {label}: {e}")))?;
+        }
+        std::fs::rename(&self.path, mirror).map_err(publish)?;
         self.armed = false;
         Ok(())
     }
@@ -459,5 +485,48 @@ impl Drop for MirrorStaging {
         if self.armed {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(path: &Path, bytes: &[u8]) {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+        std::fs::write(path, bytes).expect("write file");
+    }
+
+    #[test]
+    fn commit_to_replaces_an_existing_mirror_and_removes_the_prior_one() {
+        let git_dir = tempfile::TempDir::new().expect("cache tempdir");
+        let mirror = git_dir.path().join("mirror.git");
+        write(&mirror.join("prior"), b"prior");
+        let staging = MirrorStaging::create(git_dir.path(), "https://example.invalid/repo.git");
+        write(&staging.path.join("fresh"), b"fresh");
+        let staged = staging.path.clone();
+
+        staging.commit_to(&mirror, "repo").expect("publish mirror");
+
+        assert!(
+            mirror.join("fresh").is_file(),
+            "the staged clone is the mirror"
+        );
+        assert!(!mirror.join("prior").exists(), "the prior mirror is gone");
+        assert!(!staged.exists(), "no staging directory is left behind");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn exchange_paths_swaps_two_directories() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let new = root.path().join("new");
+        let dst = root.path().join("dst");
+        write(&new.join("fresh"), b"fresh");
+        write(&dst.join("prior"), b"prior");
+
+        assert!(exchange_paths(&new, &dst).expect("exchange"));
+
+        assert!(dst.join("fresh").is_file() && new.join("prior").is_file());
     }
 }

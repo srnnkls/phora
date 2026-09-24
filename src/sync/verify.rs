@@ -37,16 +37,17 @@ pub struct UntrustedHookFinding {
     pub hook_id: String,
 }
 
-/// A report-only history-overlay finding. It is surfaced to callers but does not make
-/// [`VerifyReport::is_clean`] false.
+/// A history-overlay finding. A stale overlay makes [`VerifyReport::is_clean`] false; one
+/// that could not be observed is report-only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverlayFinding {
     pub key: ArtifactKey,
     pub reason: String,
     pub remedy: &'static str,
+    pub stale: bool,
 }
 
-/// Verification findings. Overlay findings are report-only and do not affect [`Self::is_clean`].
+/// Verification findings.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VerifyReport {
     pub mismatches: Vec<VerifyMismatch>,
@@ -55,11 +56,12 @@ pub struct VerifyReport {
 }
 
 impl VerifyReport {
-    /// Returns whether content and hook verification found no failures; overlay findings are
-    /// report-only.
+    /// Returns whether content, hook and overlay verification found no failures.
     #[must_use]
     pub fn is_clean(&self) -> bool {
-        self.mismatches.is_empty() && self.untrusted_hooks.is_empty()
+        self.mismatches.is_empty()
+            && self.untrusted_hooks.is_empty()
+            && !self.overlay_findings.iter().any(|finding| finding.stale)
     }
 }
 
@@ -132,11 +134,13 @@ fn overlay_findings(
                 key: record.key,
                 reason: "history overlay is stale".to_owned(),
                 remedy: "phora sync",
+                stale: true,
             }),
             WorktreeObservationResult::Unknown => findings.push(OverlayFinding {
                 key: record.key,
                 reason: "history overlay could not be observed".to_owned(),
                 remedy: "phora sync",
+                stale: false,
             }),
         }
     }
