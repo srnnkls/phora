@@ -1261,7 +1261,7 @@ fn deploy_one(
         ctx.events,
         || {
             if let Some((guard, request)) = worktree {
-                guard.publish_worktree(&request)?;
+                guard.publish_staged_worktree(&request, &staging_payload)?;
             }
             Ok(())
         },
