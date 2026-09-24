@@ -565,7 +565,9 @@ phora: 2 orphaned record(s) with no config target — run `phora list --orphans`
 
 `phora list --orphans` shows where each orphan lives. The registry stores the
 target's path from deploy time, so phora can find the files after the config
-that named them is gone. `phora sync --prune` deletes them. If a path cannot be
+that named them is gone. `phora sync --prune` deletes them. That includes the
+files of an imported dependency once the target that imported it is removed:
+each is deleted only inside the path it was deployed to. If a path cannot be
 reconstructed, phora drops the record and warns instead of deleting anything.
 
 ### Checking the result
