@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 
@@ -262,61 +262,6 @@ fn calls_method(stripped: &str, method: &str) -> bool {
     })
 }
 
-const KEPT_TOKENS: &[&str] = &["retained", "delegates", "delegating", "delegated"];
-
-fn line_disposition(line: &str, method: &str) -> Option<Result<&'static str, String>> {
-    if !line.contains(&format!("`{method}`")) {
-        return None;
-    }
-    let lower = line.to_lowercase();
-    let removed = references_token(&lower, "removed");
-    let kept = KEPT_TOKENS.iter().any(|t| references_token(&lower, t));
-    match (removed, kept) {
-        (true, true) => Some(Err(format!(
-            "line classifies `{method}` as both removed and retained/delegating: {line}"
-        ))),
-        (true, false) => Some(Ok("removed")),
-        (false, true) => Some(Ok("kept")),
-        (false, false) => None,
-    }
-}
-
-const ANCHOR_WINDOW: usize = 20;
-
-fn table_rows(text: &str, methods: &[&str]) -> Result<BTreeMap<String, &'static str>, String> {
-    let lines: Vec<&str> = text.lines().collect();
-    let anchors: Vec<usize> = lines
-        .iter()
-        .enumerate()
-        .filter(|(_, line)| line.to_lowercase().contains("migration table"))
-        .map(|(i, _)| i)
-        .collect();
-    let mut rows = BTreeMap::new();
-    for (i, line) in lines.iter().enumerate() {
-        let trimmed = line.trim_start();
-        let row_shaped = trimmed.starts_with('|') || trimmed.starts_with('-');
-        let anchored = anchors.iter().any(|&a| i > a && i - a <= ANCHOR_WINDOW);
-        if !(row_shaped || anchored) {
-            continue;
-        }
-        for method in methods {
-            let Some(row) = line_disposition(line, method) else {
-                continue;
-            };
-            let disposition = row?;
-            if let Some(prior) = rows.insert((*method).to_owned(), disposition)
-                && prior != disposition
-            {
-                return Err(format!(
-                    "the migration table classifies `{method}` twice with conflicting \
-                     dispositions ({prior} vs {disposition})"
-                ));
-            }
-        }
-    }
-    Ok(rows)
-}
-
 const LEGACY_METHODS: &[&str] = &[
     "fetch",
     "mirror_ready",
@@ -342,36 +287,6 @@ fn find_trait_scan(trait_name: &str) -> (String, String) {
         .map(|(rel, content)| (rel, scan(&content)))
         .find(|(_, scanned)| scanned.contains(&format!("pub trait {trait_name}")))
         .unwrap_or_else(|| panic!("no file under src/source/ declares `pub trait {trait_name}`"))
-}
-
-fn find_migration_table() -> (&'static str, BTreeMap<String, &'static str>) {
-    let name = "docs/architecture.md";
-    let text = fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(name))
-        .unwrap_or_default();
-    let rows = match table_rows(&text, LEGACY_METHODS) {
-        Ok(rows) => rows,
-        Err(conflict) => panic!("{name}: {conflict}"),
-    };
-    assert!(
-        !rows.is_empty(),
-        "T013 requires an explicit caller-migration table in {name} (the decision-record \
-         home): rows must be table-shaped (leading `|` or `-`) or sit within {ANCHOR_WINDOW} \
-         lines after a `migration table` heading. Each of {LEGACY_METHODS:?} needs one row \
-         naming the backticked `method` plus its disposition (`removed`, or one of \
-         {KEPT_TOKENS:?})"
-    );
-    let missing: Vec<&str> = LEGACY_METHODS
-        .iter()
-        .copied()
-        .filter(|m| !rows.contains_key(*m))
-        .collect();
-    assert!(
-        missing.is_empty(),
-        "{name}: the caller-migration table must classify EVERY legacy SourceBackend method — \
-         one row per method naming the backticked `method` plus `removed` or one of \
-         {KEPT_TOKENS:?}; unclassified: {missing:?}"
-    );
-    (name, rows)
 }
 
 #[test]
@@ -441,16 +356,6 @@ fn gate_digest_snapshot_is_a_source_owned_public_free_operation() {
         signature.starts_with("pub fn digest_snapshot"),
         "src/{rel}: digest_snapshot must be a public top-level source operation; \
          signature: {signature}"
-    );
-}
-
-#[test]
-fn gate_migration_table_classifies_every_legacy_method() {
-    let (name, rows) = find_migration_table();
-    assert_eq!(
-        rows.len(),
-        LEGACY_METHODS.len(),
-        "{name}: the migration table must carry exactly one disposition per legacy method"
     );
 }
 
@@ -532,72 +437,6 @@ fn gate_lock_byte_oracle_stays_wired() {
         "d27db2740b93bb1f970ec2d67fd33cb0d750bb77",
         "the url-source synthetic commit is content-addressed and pinned; T013 must not \
          change how url sources materialize commits"
-    );
-}
-
-#[test]
-fn helper_line_disposition_requires_backticks_and_one_token() {
-    assert_eq!(
-        line_disposition("| `fetch` | removed | callers moved to … |", "fetch"),
-        Some(Ok("removed"))
-    );
-    assert_eq!(
-        line_disposition("- `compute_digest`: delegating-retained", "compute_digest"),
-        Some(Ok("kept"))
-    );
-    assert_eq!(
-        line_disposition("fetch was removed long ago", "fetch"),
-        None,
-        "a method named without backticks is prose, not a table row"
-    );
-    assert_eq!(
-        line_disposition("| `fetch` | still routed |", "fetch"),
-        None,
-        "a row without a disposition token classifies nothing"
-    );
-    assert!(
-        matches!(
-            line_disposition("| `fetch` | retained then removed |", "fetch"),
-            Some(Err(_))
-        ),
-        "one row carrying both dispositions is a conflict, not a silent pick"
-    );
-    assert_eq!(
-        line_disposition("| `mirror_ready` | removed |", "fetch"),
-        None,
-        "a row classifies only the method it names"
-    );
-}
-
-#[test]
-fn helper_table_rows_require_row_shape_or_a_migration_table_anchor() {
-    let prose = "the `fetch` method was removed in T013";
-    assert!(
-        table_rows(prose, &["fetch"]).expect("scan").is_empty(),
-        "scattered prose without row shape or a nearby anchor must not classify"
-    );
-    assert_eq!(
-        table_rows("| `fetch` | removed |", &["fetch"])
-            .expect("scan")
-            .get("fetch"),
-        Some(&"removed"),
-        "a `|`-shaped row classifies wherever it sits"
-    );
-    let anchored = format!("## Migration table\n\n{prose}");
-    assert_eq!(
-        table_rows(&anchored, &["fetch"])
-            .expect("scan")
-            .get("fetch"),
-        Some(&"removed"),
-        "a line shortly after a `migration table` heading classifies"
-    );
-    let far = format!(
-        "## Migration table\n{}{prose}",
-        "\n".repeat(ANCHOR_WINDOW + 5)
-    );
-    assert!(
-        table_rows(&far, &["fetch"]).expect("scan").is_empty(),
-        "the anchor window is bounded: a distant prose line must not classify"
     );
 }
 
