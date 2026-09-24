@@ -819,15 +819,26 @@ A history binding takes the whole repository. It cannot be combined with `take`,
 URL source, or `preserve_executable = false`. It allows symlinks unless the source
 sets `allow_symlinks = false`.
 
-Things to know before you work inside one:
+A history deployment is read-only: it shows the pinned commit and nothing else.
+When its `HEAD` or index moves off the pin, `phora verify` fails and the next
+`phora sync` puts them back, dropping any commit made there. A branch created
+inside lands in the shared cache mirror, where every other overlay of that
+repository sees it.
 
-- Branches and commits you make there live in phora's cache. Clearing the cache
-  loses them, so push anything you want to keep.
-- A `git log` or `git blame` can fail while phora refreshes the clone. Run it
-  again.
-- Inside your own repository the deployment looks like an embedded repository.
-  Add its path to `.gitignore` unless you mean to track it.
-- `phora verify` reports a stale overlay without failing.
+To work on the code, eject it:
+
+```bash
+phora eject gitoxide --source gitoxide --target resources
+```
+
+The deployment becomes a standalone clone: a real `.git` directory with its own
+objects, hard-linked from the cache where possible, detached at the pin, with
+`origin` set to the upstream and its branches as `origin/*`. Local edits show up
+in `git status`. phora stops managing the directory, and `phora uneject` refuses
+while the clone's `.git` is there.
+
+Inside your own repository the deployment looks like an embedded repository. Add
+its path to `.gitignore` unless you mean to track it.
 
 ## Preparing inputs
 
