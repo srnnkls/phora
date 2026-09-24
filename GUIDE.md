@@ -67,8 +67,6 @@ way a repository does.
 Start with an empty directory and a `phora.toml` that deploys phora's own README:
 
 ```toml
-version = 1
-
 [sources.phora]
 repo = "srnnkls/phora"
 branch = "main"
@@ -679,6 +677,28 @@ shapes and variables.
 
 The same command under two shells, or once as `run` and once as `cmd`, counts
 as two hooks.
+
+### A worked example
+
+The [dotfiles](https://github.com/srnnkls/dotfiles) repository uses two hooks to
+compile agent skills between the two phases of a sync:
+
+```toml
+[hooks]
+post_prepare = "henia build .tropos --output .henia --clean --harness claude,codex,pi"
+post_sync = "scrut test tests/scrut/tropos.md"
+
+[targets.tropos]
+phase = "prepare"
+path = ".tropos"
+imports = ["tropos"]
+```
+
+The prepare phase stages the pinned tropos package in `.tropos`. `post_prepare`
+compiles it into `.henia`, and the deploy phase links the output into each
+harness's home. `post_sync` then checks the finished deployment. If the compiler
+fails, nothing is deployed and the check doesn't run. The full setup is in
+[Generating per-agent skills](USE-CASES.md#generating-per-agent-skills-from-one-canonical-set).
 
 ## Templating
 

@@ -33,8 +33,6 @@ dotfiles/
 All four destinations share a parent, so one target covers them:
 
 ```toml
-version = 1
-
 [sources.dotfiles]
 repo = "mira-sato/dotfiles"     # owner/repo on GitHub
 branch = "main"
@@ -182,8 +180,6 @@ configs/
 Each consuming repo declares what it takes:
 
 ```toml
-version = 1
-
 [sources.configs]
 repo = "larkspur-labs/configs"
 tag = "v7"
@@ -210,8 +206,6 @@ Before you move to stricter rules, deploy both and compare. Bindings are keyed
 by identity, and each can pin its own ref:
 
 ```toml
-version = 1
-
 [sources.configs]
 repo = "larkspur-labs/configs"
 tag = "v7"
@@ -279,8 +273,6 @@ skills/
 In each consuming project:
 
 ```toml
-version = 1
-
 [sources.skills]
 repo = "mira-sato/skills"
 tag = "v3"               # or branch = "main" to track
@@ -379,8 +371,6 @@ of which version you have. You want the download pinned, checked, and
 verifiable later.
 
 ```toml
-version = 1
-
 [sources.fzf-bin]
 url = "https://github.com/junegunn/fzf/releases/download/v0.55.0/fzf-0.55.0-linux_amd64.tar.gz"
 digest = "sha256:4df2393776942780ddab2cea713ddaac06cd5c3886cd23bc9119a6d3aa1e02bd"
@@ -427,8 +417,6 @@ say which version any given copy is at.
 The producing repo needs no changes. Each consumer declares its slice:
 
 ```toml
-version = 1
-
 [sources.platform]
 repo = "larkspur-labs/platform"
 tag = "v2.3.0"
@@ -468,8 +456,6 @@ answer depends on the version you use. You want that source in the project at
 the pinned version, with its history so `git log` and `git blame` work.
 
 ```toml
-version = 1
-
 [sources.axum]
 repo = "tokio-rs/axum"
 tag = "axum-v0.8.4"
@@ -505,73 +491,111 @@ history binding takes the whole repository, and phora rejects `take`,
 
 ## Generating per-agent skills from one canonical set
 
-You keep one canonical set of skills, and each agent tool wants its own format
-and directory. A generator can translate them, but it needs pinned inputs
-before it runs, and its output still has to land in the right places.
+You keep your agent skills, agents and instructions in one repository, and each
+harness (Claude Code, Codex, pi) wants them in its own format and directory. A
+compiler can translate them, but it needs pinned inputs before it runs, and its
+output still has to land in each harness's home. Hooks are the seam between the
+two.
+
+This is how [srnnkls/dotfiles](https://github.com/srnnkls/dotfiles) deploys
+[tropos](https://github.com/srnnkls/tropos), compiled by
+[henia](https://github.com/srnnkls/henia). Tropos is a phora package: its own
+`phora.toml` offers the canonical files and vendors one dependency under the
+skill that needs it.
 
 ```toml
-version = 1
+# tropos/phora.toml
+[sources.tropos]
+path = "."
+include = ["skills/**", "agents/**", "instructions/**", "rules/fas/**", "henia.toml", ".henia/harnesses/**", "phora.toml"]
 
+[sources.loqui]
+git = "https://github.com/srnnkls/loqui.git"
+branch = "main"
+include = ["README.md", "languages/**", "resources/**"]
+
+[targets.tropos]
+path = "."
+sources.tropos = { collapse = false }
+
+[targets.loqui]
+path = "skills/loqui/reference/loqui"
+sources.loqui = { collapse = false }
+```
+
+The dotfiles repository stages that package, compiles it, and links the result:
+
+```toml
+# dotfiles/phora.toml
 [hooks]
-post_prepare = "generate --from .phora-inputs/skills --out .generated"
+post_prepare = "henia build .tropos --output .henia --clean --harness claude,codex,pi"
+post_sync = "scrut test tests/scrut/tropos.md"
 
-[sources.skills]
-repo = "larkspur-labs/skills"
-tag = "v4"
+[sources]
+tropos = { repo = "srnnkls/tropos", branch = "prototype/henia-phora", transitive = true }
+henia = { path = "./.henia", deploy = "link" }
 
-[sources.generated]
-path = "./.generated"
-deploy = "link"
-
-[targets.inputs]
-path = ".phora-inputs/skills"
+[targets.tropos]
 phase = "prepare"
-sources = ["skills"]
-
-[targets.claude]
-path = ".claude"
-sources.generated = { take = [{ "claude/" = "." }] }
-
-[targets.codex]
-path = ".codex"
-sources.generated = { take = [{ "codex/" = "." }] }
+path = ".tropos"
+imports = ["tropos"]
 ```
 
-`generate` stands in for your generator. Here it writes `claude/skills/…` and
-`codex/skills/…` under `.generated`. One `phora sync` then runs in this order:
+Home directories are machine-local, so the deploy targets live in
+`phora.local.toml`. Each one takes its harness's slice of the compiled output
+and re-roots it at the target:
 
-1. The `inputs` target, in the prepare phase, copies `skills` at `v4` into
-   `.phora-inputs/skills`.
-2. `post_prepare` runs the generator.
-3. The deploy phase links the generated files. The subtree rename
-   `{ "claude/" = "." }` re-roots everything under `claude/` at the target
-   root, so `claude/skills/triage/SKILL.md` lands at
-   `.claude/skills/triage/SKILL.md`.
-
-```
-$ phora list
-claude:
-  generated/skills/release-notes/SKILL.md  linked
-  generated/skills/triage/SKILL.md  linked
-codex:
-  generated/skills/release-notes/SKILL.md  linked
-  generated/skills/triage/SKILL.md  linked
-inputs:
-  skills/release-notes  ✓ clean
-  skills/triage  ✓ clean
+```toml
+# dotfiles/phora.local.toml
+[targets]
+claude = { path = "~/.claude", sources.henia = { take = [{ "claude/" = "." }], collapse = false } }
+codex = { path = "~/.codex", sources.henia = { take = [{ "codex/" = "." }], collapse = false } }
+pi = { path = "~/.pi/agent", sources.henia = { take = [{ "pi/" = "." }], collapse = false } }
 ```
 
-`.generated` can be missing on the first run. If the generator fails, the sync
-stops before the deploy phase and the links from the last good run stay. Have
-the generator write to a temporary directory and move it into place when it
-succeeds, and keep its inputs outside its output directory.
+One `phora sync` then runs:
 
-To advance the canonical set and drop links to skills that no longer exist, run
-`phora update skills --fast-forward --prune`. See
-[Preparing inputs](GUIDE.md#preparing-inputs) and
-[Renaming](GUIDE.md#renaming).
+1. The prepare phase copies tropos at its pinned commit into `.tropos`, with
+   loqui under `.tropos/skills/loqui/reference/loqui`.
+2. `post_prepare` runs henia, which writes `.henia/claude`, `.henia/codex` and
+   `.henia/pi`.
+3. The deploy phase links each harness's files into its home.
+   `{ "claude/" = "." }` turns `claude/skills/bash/SKILL.md` into
+   `~/.claude/skills/bash/SKILL.md`.
+4. `post_sync` runs a scrut check that every slice is linked.
 
-phora runs the generator and deploys what it writes; it knows nothing about the
+`phora preview --target claude` shows the rename for each file:
+
+```
+claude -> ~/.claude
+  henia@link claude/CLAUDE.md -> CLAUDE.md -> ~/.claude/CLAUDE.md
+  henia@link claude/agents/reviewer.md -> agents/reviewer.md -> ~/.claude/agents/reviewer.md
+  henia@link claude/skills/bash/SKILL.md -> skills/bash/SKILL.md -> ~/.claude/skills/bash/SKILL.md
+```
+
+Because the deploy links point into `.henia`, a rebuild shows up in every
+harness at once. `.henia` can be missing on the first run. If henia fails, the
+sync stops before the deploy phase and `post_sync` doesn't run, so the check
+only ever sees a finished deployment. The links stay as they were, and they
+show whatever henia left in `.henia`; a compiler that builds into a temporary
+directory and moves it into place on success keeps them intact.
+
+To work on tropos itself, point the package at a checkout in
+`phora.local.toml`. The prepare phase then reads the working tree, uncommitted
+edits included:
+
+```toml
+[sources.tropos]
+path = "~/projects/tropos"
+deploy = "link"
+```
+
+To move to a newer tropos and drop links to skills it removed, run
+`phora update tropos --fast-forward --prune`. See
+[Preparing inputs](GUIDE.md#preparing-inputs),
+[Local packages](GUIDE.md#local-packages) and [Renaming](GUIDE.md#renaming).
+
+phora runs henia and deploys what it writes; it doesn't know the harness
 formats, and it can't undo a hook's side effects.
 
 ## Smaller situations
@@ -580,8 +604,6 @@ Git hook scripts copied into every repository. Deploy a pinned set and let a
 target hook wire it up once the files land:
 
 ```toml
-version = 1
-
 [sources.git-hooks]
 repo = "larkspur-labs/git-hooks"
 tag = "v1.2.0"
@@ -598,8 +620,6 @@ Runbooks in a separate ops repo that responders have to go looking for during
 an incident. Give each service repository the runbooks for its own service:
 
 ```toml
-version = 1
-
 [sources.runbooks]
 repo = "larkspur-labs/ops"
 branch = "main"

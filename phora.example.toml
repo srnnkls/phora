@@ -1,6 +1,5 @@
-# phora.toml: every configuration key in use. Reference: REFERENCE.md#configuration
+# phora.toml: one example of every section. Reference: REFERENCE.md#configuration
 
-# version = 1                   # optional; 1 is the only schema version
 # protocol = "ssh"              # remote template for forge sources; default "https"
 
 [defaults]
