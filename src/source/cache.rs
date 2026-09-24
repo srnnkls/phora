@@ -118,16 +118,57 @@ pub(super) fn open_mirror(source: &SourceName, mirror: &Path) -> Result<Option<g
     }
 }
 
-pub(super) fn fetch_into_mirror(source: &SourceName, repo: &gix::Repository) -> Result<()> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum MirrorFetch {
+    Full,
+    Slice(Vec<String>),
+}
+
+impl MirrorFetch {
+    fn refspecs(&self) -> Vec<&str> {
+        match self {
+            Self::Full => MIRROR_REFSPECS.to_vec(),
+            Self::Slice(refspecs) => refspecs.iter().map(String::as_str).collect(),
+        }
+    }
+
+    fn tags(&self) -> gix::remote::fetch::Tags {
+        match self {
+            Self::Full => gix::remote::fetch::Tags::Included,
+            Self::Slice(_) => gix::remote::fetch::Tags::None,
+        }
+    }
+}
+
+fn slice_depth() -> gix::remote::fetch::Shallow {
+    gix::remote::fetch::Shallow::DepthAtRemote(std::num::NonZeroU32::MIN)
+}
+
+const SLICED_MARKER: &str = "phora-sliced";
+
+pub(super) fn is_sliced(repo: &gix::Repository) -> bool {
+    repo.path().join(SLICED_MARKER).exists()
+}
+
+#[cfg_attr(feature = "trace", tracing::instrument(skip_all, fields(source = %source)))]
+pub(super) fn fetch_into_mirror(
+    source: &SourceName,
+    repo: &gix::Repository,
+    fetch: &MirrorFetch,
+) -> Result<()> {
     detach_managed_worktree_heads(source, repo)?;
+    let sliced = is_sliced(repo);
+    let (fetch, shallow) = match (fetch, sliced) {
+        (MirrorFetch::Full, true) => (&MirrorFetch::Full, gix::remote::fetch::Shallow::undo()),
+        (_, false) => (&MirrorFetch::Full, gix::remote::fetch::Shallow::NoChange),
+        (slice @ MirrorFetch::Slice(_), true) => (slice, slice_depth()),
+    };
     let mut remote = repo
         .find_remote("origin")
-        .map_err(|e| SourceError::Source(format!("find origin in {source}: {e}")))?;
+        .map_err(|e| SourceError::Source(format!("find origin in {source}: {e}")))?
+        .with_fetch_tags(fetch.tags());
     remote
-        .replace_refspecs(
-            MIRROR_REFSPECS.iter().copied(),
-            gix::remote::Direction::Fetch,
-        )
+        .replace_refspecs(fetch.refspecs(), gix::remote::Direction::Fetch)
         .map_err(|e| SourceError::Source(format!("set mirror refspec in {source}: {e}")))?;
     let outcome = remote
         .connect(gix::remote::Direction::Fetch)
@@ -137,6 +178,7 @@ pub(super) fn fetch_into_mirror(source: &SourceName, repo: &gix::Repository) -> 
             gix::remote::ref_map::Options::default(),
         )
         .map_err(|e| SourceError::Source(format!("prepare fetch in {source}: {e}")))?
+        .with_shallow(shallow)
         .receive(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
         .map_err(|e| SourceError::Source(format!("receive pack in {source}: {e}")))?;
     let updates = match outcome.status {
@@ -157,6 +199,48 @@ pub(super) fn fetch_into_mirror(source: &SourceName, repo: &gix::Repository) -> 
             "fetch rejected ref update in {source}: {}",
             rejected.mode
         )));
+    }
+    pin_symbolic_mappings(source, repo, &outcome.ref_map)?;
+    if sliced && *fetch == MirrorFetch::Full {
+        std::fs::remove_file(repo.path().join(SLICED_MARKER))
+            .map_err(|e| SourceError::Source(format!("unmark sliced mirror {source}: {e}")))?;
+    }
+    Ok(())
+}
+
+fn pin_symbolic_mappings(
+    source: &SourceName,
+    repo: &gix::Repository,
+    ref_map: &gix::protocol::fetch::RefMap,
+) -> Result<()> {
+    use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit};
+    let mut edits = Vec::new();
+    for mapping in &ref_map.mappings {
+        let (
+            gix::protocol::fetch::refmap::Source::Ref(gix::protocol::handshake::Ref::Symbolic {
+                object,
+                ..
+            }),
+            Some(local),
+        ) = (&mapping.remote, &mapping.local)
+        else {
+            continue;
+        };
+        let name = gix::refs::FullName::try_from(local.clone())
+            .map_err(|e| SourceError::Source(format!("pin {local} in {source}: {e}")))?;
+        edits.push(RefEdit {
+            change: Change::Update {
+                log: LogChange::default(),
+                expected: PreviousValue::Any,
+                new: gix::refs::Target::Object(*object),
+            },
+            name,
+            deref: false,
+        });
+    }
+    if !edits.is_empty() {
+        repo.edit_references(edits)
+            .map_err(|e| SourceError::Source(format!("pin symbolic refs in {source}: {e}")))?;
     }
     Ok(())
 }
@@ -221,24 +305,52 @@ fn detach_managed_worktree_heads(source: &SourceName, repo: &gix::Repository) ->
 /// Clones a fresh mirror into staging, then replaces `mirror`. The canonical mirror
 /// is removed only after the clone succeeds, so a failed clone (unreachable remote)
 /// leaves an existing mirror intact rather than trading it for nothing.
+#[cfg_attr(feature = "trace", tracing::instrument(skip_all, fields(source = %source)))]
 pub(super) fn reclone_mirror(
     git_dir: &Path,
     source: &SourceName,
     url: &str,
     mirror: &Path,
+    fetch: &MirrorFetch,
 ) -> Result<()> {
     let staging = MirrorStaging::create(git_dir, url);
-    let (repo, _) = gix::prepare_clone_bare(url, &staging.path)
-        .map_err(|e| SourceError::Source(format!("prepare clone {source}: {e}")))?
-        .configure_remote(|mut remote| {
+    let mut prepare = gix::prepare_clone_bare(url, &staging.path)
+        .map_err(|e| SourceError::Source(format!("prepare clone {source}: {e}")))?;
+    if matches!(fetch, MirrorFetch::Slice(_)) {
+        prepare =
+            prepare
+                .with_shallow(slice_depth())
+                .with_fetch_options(gix::remote::ref_map::Options {
+                    extra_refspecs: vec![
+                        gix::refspec::parse(
+                            "HEAD:refs/remotes/origin/HEAD".into(),
+                            gix::refspec::parse::Operation::Fetch,
+                        )
+                        .map_err(|e| {
+                            SourceError::Source(format!("head refspec for {source}: {e}"))
+                        })?
+                        .to_owned(),
+                    ],
+                    ..Default::default()
+                });
+    }
+    let refspecs: Vec<String> = fetch.refspecs().into_iter().map(str::to_owned).collect();
+    let tags = fetch.tags();
+    let (repo, outcome) = prepare
+        .configure_remote(move |mut remote| {
             remote.replace_refspecs(
-                MIRROR_REFSPECS.iter().copied(),
+                refspecs.iter().map(String::as_str),
                 gix::remote::Direction::Fetch,
             )?;
-            Ok(remote)
+            Ok(remote.with_fetch_tags(tags))
         })
         .fetch_only(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
         .map_err(|e| SourceError::Source(format!("clone bare {source}: {e}")))?;
+    pin_symbolic_mappings(source, &repo, &outcome.ref_map)?;
+    if matches!(fetch, MirrorFetch::Slice(_)) {
+        std::fs::write(staging.path.join(SLICED_MARKER), b"")
+            .map_err(|e| SourceError::Source(format!("mark sliced mirror {source}: {e}")))?;
+    }
     carry_managed_worktrees(mirror, &staging.path, &repo, source)?;
     if mirror.exists() {
         std::fs::remove_dir_all(mirror)

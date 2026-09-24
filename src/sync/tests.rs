@@ -412,6 +412,10 @@ impl<'a> CountingBackend<'a> {
 }
 
 impl SourceStore for CountingBackend<'_> {
+    fn plan_refresh(&self, plan: &crate::source::RefreshPlan) {
+        SourceStore::plan_refresh(self.inner, plan);
+    }
+
     fn resolve(
         &self,
         request: &ResolveRequest,

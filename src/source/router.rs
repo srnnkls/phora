@@ -1,10 +1,10 @@
 //! Typed request routing for Git, URL, and worktree source capabilities.
 
 use crate::source::{
-    MirrorKey, ResolvePolicy, ResolveRequest, ResolvedSource, SnapshotId, SourceDirectoryEntry,
-    SourceEntry, SourceError, SourceInventory, SourceLocation, SourceName, SourcePath, SourceStore,
-    WorktreeMirrorAddress, WorktreeMirrorGuard, WorktreeObservationRequest,
-    WorktreeObservationResult,
+    MirrorKey, RefreshPlan, ResolvePolicy, ResolveRequest, ResolvedSource, SnapshotId,
+    SourceDirectoryEntry, SourceEntry, SourceError, SourceInventory, SourceLocation, SourceName,
+    SourcePath, SourceStore, WorktreeMirrorAddress, WorktreeMirrorGuard,
+    WorktreeObservationRequest, WorktreeObservationResult,
 };
 
 type Result<T> = std::result::Result<T, SourceError>;
@@ -28,6 +28,12 @@ impl<G: SourceStore, H: SourceStore> SourceStore for RouterBackend<G, H> {
             SourceLocation::Git { .. } | SourceLocation::Worktree { .. } => {
                 SourceStore::resolve(&self.git, request, policy)
             }
+        }
+    }
+
+    fn plan_refresh(&self, plan: &RefreshPlan) {
+        if matches!(plan.location, SourceLocation::Git { .. }) {
+            SourceStore::plan_refresh(&self.git, plan);
         }
     }
 

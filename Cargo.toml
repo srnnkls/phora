@@ -28,6 +28,8 @@ globset = "0.4.18"
 indicatif = "0.18"
 minijinja = { version = "2.5.0", features = ["fuel"] }
 rayon = "1.11"
+tracing = { version = "0.1.44", optional = true }
+tracing-subscriber = { version = "0.3.23", optional = true, features = ["env-filter"] }
 reflink-copy = "0.1.29"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
@@ -49,6 +51,8 @@ rustix = { version = "1.1.4", features = ["fs"] }
 [features]
 # Re-exports internals (resolve_sources) for benchmarking only; off by default.
 bench = []
+# Prints gix and phora span timings to stderr, filtered by RUST_LOG; off by default.
+trace = ["gix/tracing-detail", "dep:tracing", "dep:tracing-subscriber"]
 
 [dev-dependencies]
 assert_cmd = "2.0.17"
