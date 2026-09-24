@@ -1,6 +1,7 @@
 use phora::config::Config;
 
 const README: &str = include_str!("../README.md");
+const REFERENCE: &str = include_str!("../REFERENCE.md");
 const EXAMPLE: &str = include_str!("../phora.example.toml");
 const LOCAL_EXAMPLE: &str = include_str!("../phora.local.example.toml");
 
@@ -79,10 +80,23 @@ fn self_contained_configs(contents: &str) -> Vec<String> {
         .into_iter()
         .flat_map(|block| {
             let written_by_heredoc = heredoc_bodies(&block);
-            std::iter::once(block).chain(written_by_heredoc)
+            if written_by_heredoc.is_empty() {
+                vec![block]
+            } else {
+                written_by_heredoc
+            }
         })
-        .filter(|block| block.trim_start().starts_with("version = 1"))
+        .filter(|block| declares_sources_and_targets(block))
         .collect()
+}
+
+fn declares_sources_and_targets(block: &str) -> bool {
+    let declares = |prefix: &str| {
+        block
+            .lines()
+            .any(|line| line.trim_start().starts_with(prefix))
+    };
+    declares("[sources.") && declares("[targets.")
 }
 
 fn is_sources_array_element(line: &str) -> bool {
@@ -156,15 +170,16 @@ fn documents_keyed_sources_table(lines: impl Iterator<Item = impl AsRef<str>>) -
 }
 
 #[test]
-fn readme_drops_legacy_binding_forms() {
+fn docs_drop_legacy_binding_forms() {
     assert_no_legacy_binding_forms_in("README.md", &fenced_lines(README));
+    assert_no_legacy_binding_forms_in("REFERENCE.md", &fenced_lines(REFERENCE));
 }
 
 #[test]
-fn readme_documents_keyed_sources_table() {
+fn reference_documents_keyed_sources_table() {
     assert!(
-        documents_keyed_sources_table(fenced_lines(README).into_iter()),
-        "README.md: must document the keyed binding model with a contiguous \
+        documents_keyed_sources_table(fenced_lines(REFERENCE).into_iter()),
+        "REFERENCE.md: must document the keyed binding model with a contiguous \
          `[targets.<t>.sources]` table header inside a TOML code fence"
     );
 }
@@ -189,31 +204,41 @@ fn local_example_toml_drops_legacy_binding_forms() {
     assert_no_legacy_binding_forms_in("phora.local.example.toml", &lines);
 }
 
-#[test]
-fn readme_self_contained_fences_parse_and_validate() {
-    let complete = self_contained_configs(README);
+fn assert_self_contained_fences_parse_and_validate(file: &str, contents: &str) {
+    let complete = self_contained_configs(contents);
     assert!(
         !complete.is_empty(),
-        "README.md: expected at least one self-contained `version = 1` config fence"
+        "{file}: expected at least one config fence declaring both a source and a target"
     );
     for block in &complete {
         let config = Config::parse(block).unwrap_or_else(|err| {
-            panic!("README.md: self-contained config fence must parse: {err}\n---\n{block}")
+            panic!("{file}: self-contained config fence must parse: {err}\n---\n{block}")
         });
         config.validate().unwrap_or_else(|err| {
-            panic!("README.md: self-contained config fence must validate: {err}\n---\n{block}")
+            panic!("{file}: self-contained config fence must validate: {err}\n---\n{block}")
         });
     }
+}
+
+#[test]
+fn readme_self_contained_fences_parse_and_validate() {
+    assert_self_contained_fences_parse_and_validate("README.md", README);
+}
+
+#[test]
+fn reference_self_contained_fences_parse_and_validate() {
+    assert_self_contained_fences_parse_and_validate("REFERENCE.md", REFERENCE);
 }
 
 #[test]
 fn configs_written_by_heredoc_are_extracted_beside_bare_fences() {
     let doc = r#"
 ```toml
-version = 1
-
 [sources.bare]
 repo = "owner/bare"
+
+[targets.bare]
+path = "out"
 ```
 
 ```sh
@@ -222,17 +247,26 @@ version = 1
 
 [sources.quoted]
 repo = "owner/quoted"
+
+[targets.quoted]
+path = "out"
 TOML
 ```
 
 ```sh
 tee phora.local.toml <<EOF
-version = 1
-
 [sources.bare_delimiter]
 repo = "owner/bare-delimiter"
+
+[targets.bare_delimiter]
+path = "out"
 EOF
 phora sync
+```
+
+```toml
+[sources.fragment]
+repo = "owner/fragment"
 ```
 
 ```sh
@@ -250,25 +284,27 @@ phora list
     assert!(configs[0].contains("[sources.bare]"));
     assert_eq!(
         configs[1],
-        "version = 1\n\n[sources.quoted]\nrepo = \"owner/quoted\""
+        "version = 1\n\n[sources.quoted]\nrepo = \"owner/quoted\"\n\n[targets.quoted]\npath = \"out\""
     );
     assert_eq!(
         configs[2],
-        "version = 1\n\n[sources.bare_delimiter]\nrepo = \"owner/bare-delimiter\""
+        "[sources.bare_delimiter]\nrepo = \"owner/bare-delimiter\"\n\n[targets.bare_delimiter]\npath = \"out\""
     );
 }
 
 #[test]
-fn readme_drops_multiline_array_of_tables() {
-    assert!(
-        !has_multiline_sources_array_of_tables(&fenced_lines(README)),
-        "README.md: must not document the legacy multiline array-of-tables binding form"
-    );
+fn docs_drop_multiline_array_of_tables() {
+    for (file, contents) in [("README.md", README), ("REFERENCE.md", REFERENCE)] {
+        assert!(
+            !has_multiline_sources_array_of_tables(&fenced_lines(contents)),
+            "{file}: must not document the legacy multiline array-of-tables binding form"
+        );
+    }
 }
 
 #[test]
-fn readme_documents_network_filesystem_lock_limitation() {
-    let doc = README.to_lowercase();
+fn reference_documents_network_filesystem_lock_limitation() {
+    let doc = REFERENCE.to_lowercase();
 
     assert!(
         doc.contains("nfs")
