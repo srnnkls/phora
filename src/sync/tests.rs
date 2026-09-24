@@ -5995,7 +5995,7 @@ fn eject_adds_ejected_entry_keeps_record_and_files() {
 }
 
 #[test]
-fn eject_detaches_history_overlay_from_the_recorded_mirror_before_persisting_ejection() {
+fn eject_turns_history_overlay_into_a_standalone_clone_before_persisting_ejection() {
     let fx = build_sync_fixture();
     let td = TargetDir::new();
     let cfg = eject_target_config(&td, &fx);
@@ -6061,7 +6061,7 @@ fn eject_detaches_history_overlay_from_the_recorded_mirror_before_persisting_eje
         })
         .expect("persist history record");
 
-    eject(
+    let clone = eject(
         &cfg,
         &fx.registry,
         "history",
@@ -6071,9 +6071,11 @@ fn eject_detaches_history_overlay_from_the_recorded_mirror_before_persisting_eje
     )
     .expect("eject managed history artifact");
 
+    assert_eq!(clone.as_deref(), Some(deploy.as_path()));
     assert!(
-        !deploy.join(".git").exists() && !admin.exists() && !pin.exists(),
-        "eject must detach gitlink, recorded-mirror administration, and pin before it persists Ejection"
+        deploy.join(".git").is_dir() && !admin.exists() && !pin.exists(),
+        "eject must replace the gitlink with a standalone clone and drop the recorded-mirror \
+         administration and pin before it persists Ejection"
     );
     assert!(
         deploy.join("editor/init.lua").exists()

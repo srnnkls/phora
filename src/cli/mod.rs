@@ -397,8 +397,14 @@ pub fn run_with_outcome(cli: Cli) -> Result<CliOutcome> {
             let cache_git =
                 crate::paths::cache_root_for(config.paths.cache.as_deref(), &cwd)?.join("git");
             let backend = GitBackend::new(cache_git);
-            crate::sync::eject(&config, &registry, &artifact, &source, &target, &backend)?;
-            println!("ejected {source}/{artifact} from {target} (files kept)");
+            match crate::sync::eject(&config, &registry, &artifact, &source, &target, &backend)? {
+                Some(clone) => println!(
+                    "ejected {source}/{artifact} from {target} into a standalone clone at {}; \
+                     add it to .gitignore or make it a submodule",
+                    clone.display()
+                ),
+                None => println!("ejected {source}/{artifact} from {target} (files kept)"),
+            }
             Ok(CliOutcome::Success)
         }
         Command::Uneject {

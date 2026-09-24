@@ -91,8 +91,8 @@ use crate::config::{
 use crate::error::{Error, Result};
 use crate::lock::{Lock, merge_locks, split_locks};
 use crate::source::{
-    SourceName, SourceStore, WorktreeRemoveRequest, is_local_path,
-    remove_missing_mirror_worktree_gitlink,
+    SourceName, SourceStore, WorktreeAdminId, WorktreeDeployRequest, WorktreeMirrorGuard,
+    WorktreeRemoveRequest, is_local_path, remove_missing_mirror_worktree_gitlink,
 };
 use crate::sync::state::{ArtifactKey, ArtifactRecord, Ejection, StateStore};
 
@@ -2227,7 +2227,7 @@ pub fn eject(
     source: &str,
     target: &str,
     backend: &dyn SourceStore,
-) -> Result<()> {
+) -> Result<Option<PathBuf>> {
     let target_config = config
         .targets
         .get(target)
@@ -2246,16 +2246,31 @@ pub fn eject(
     eject_artifact(&key, Some(&record), &deploy_root, backend, registry)
 }
 
+fn standalone_clone_blocks_uneject(
+    target: &crate::config::Target,
+    record: &ArtifactRecord,
+) -> Result<()> {
+    let deploy_root = prune::removal_destination(target, record);
+    if record.history && deploy_root.join(".git").is_dir() {
+        return Err(Error::Sync(format!(
+            "{} is a standalone clone; move its .git away before unejecting",
+            deploy_root.display()
+        )));
+    }
+    Ok(())
+}
+
 pub(super) fn eject_artifact(
     key: &ArtifactKey,
     record: Option<&ArtifactRecord>,
     deploy_root: &Path,
     backend: &dyn SourceStore,
     registry: &dyn StateStore,
-) -> Result<()> {
-    if let Some(record) = record {
-        detach_history_overlay(record, deploy_root, backend)?;
-    }
+) -> Result<Option<PathBuf>> {
+    let clone = match record {
+        Some(record) => eject_history_overlay(record, deploy_root, backend)?,
+        None => None,
+    };
     let mut ejected = registry.ejections(&key.target)?;
     if !ejected
         .iter()
@@ -2268,7 +2283,30 @@ pub(super) fn eject_artifact(
         });
         registry.save_ejections(&key.target, &ejected)?;
     }
-    Ok(())
+    Ok(clone)
+}
+
+fn eject_history_overlay(
+    record: &ArtifactRecord,
+    deploy_root: &Path,
+    backend: &dyn SourceStore,
+) -> Result<Option<PathBuf>> {
+    let Some((guard, admin_id)) = lock_history_overlay(record, deploy_root, backend)? else {
+        return Ok(None);
+    };
+    let request = WorktreeDeployRequest {
+        admin_id: admin_id.clone(),
+        deploy_root: deploy_root.to_path_buf(),
+        commit: record.commit.parse()?,
+    };
+    if guard.eject_worktree(&request)? {
+        return Ok(Some(deploy_root.to_path_buf()));
+    }
+    guard.remove_worktree(&WorktreeRemoveRequest {
+        admin_id,
+        deploy_root: deploy_root.to_path_buf(),
+    })?;
+    Ok(None)
 }
 
 pub(super) fn detach_history_overlay(
@@ -2276,25 +2314,35 @@ pub(super) fn detach_history_overlay(
     deploy_root: &Path,
     backend: &dyn SourceStore,
 ) -> Result<()> {
-    let Some((address, admin_id)) = observe::history_address(record)? else {
+    let Some((guard, admin_id)) = lock_history_overlay(record, deploy_root, backend)? else {
         return Ok(());
-    };
-    if remove_missing_mirror_worktree_gitlink(&address, &admin_id, deploy_root)? {
-        return Ok(());
-    }
-    let source = SourceName::trusted(record.source.clone());
-    let guard = match backend.lock_worktree_mirror_at(&source, &address) {
-        Ok(guard) => guard,
-        Err(_) if remove_missing_mirror_worktree_gitlink(&address, &admin_id, deploy_root)? => {
-            return Ok(());
-        }
-        Err(error) => return Err(error.into()),
     };
     guard.remove_worktree(&WorktreeRemoveRequest {
         admin_id,
         deploy_root: deploy_root.to_path_buf(),
     })?;
     Ok(())
+}
+
+fn lock_history_overlay(
+    record: &ArtifactRecord,
+    deploy_root: &Path,
+    backend: &dyn SourceStore,
+) -> Result<Option<(WorktreeMirrorGuard, WorktreeAdminId)>> {
+    let Some((address, admin_id)) = observe::history_address(record)? else {
+        return Ok(None);
+    };
+    if remove_missing_mirror_worktree_gitlink(&address, &admin_id, deploy_root)? {
+        return Ok(None);
+    }
+    let source = SourceName::trusted(record.source.clone());
+    match backend.lock_worktree_mirror_at(&source, &address) {
+        Ok(guard) => Ok(Some((guard, admin_id))),
+        Err(_) if remove_missing_mirror_worktree_gitlink(&address, &admin_id, deploy_root)? => {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub fn uneject(
@@ -2304,8 +2352,16 @@ pub fn uneject(
     source: &str,
     target: &str,
 ) -> Result<()> {
-    if !config.targets.contains_key(target) {
+    let Some(target_config) = config.targets.get(target) else {
         return Err(Error::Config(format!("unknown target: {target}")));
+    };
+    let key = ArtifactKey {
+        target: target.to_owned(),
+        source: source.to_owned(),
+        artifact: artifact.to_owned(),
+    };
+    if let Some(record) = registry.artifact(&key)? {
+        standalone_clone_blocks_uneject(target_config, &record)?;
     }
     let mut ejected = registry.ejections(target)?;
     ejected.retain(|e| !(e.source == source && e.artifact == artifact));

@@ -843,8 +843,14 @@ fetched only for the files phora deploys. Once a mirror has full history it keep
 A history deployment is read-only: it shows the pinned commit and nothing else. When
 its `HEAD` or index moves off the pin, `phora verify` fails and the next `phora sync`
 puts them back, dropping any commit made there. A branch created inside lands in the
-shared cache mirror, where every other overlay of that repository sees it. To work on the
-code, clone it.
+shared cache mirror, where every other overlay of that repository sees it.
+
+To work on the code, eject it. `phora eject <artifact> --source <s> --target <t>` turns
+a history deployment into a standalone clone: a real `.git` directory with its own
+objects (hard-linked from the cache where possible), detached at the pin, with `origin`
+set to the upstream and its branches as `origin/*`. Local edits show up in `git status`.
+phora stops managing the directory, and `phora uneject` refuses while the clone's `.git`
+is there.
 
 When a history deployment is inside your own Git work tree, the enclosing repository
 sees it as an embedded repository. Add that deployment path to the enclosing

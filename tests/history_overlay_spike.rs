@@ -570,3 +570,93 @@ fn history_prune_removes_deployment_and_overlay_administration() {
         "prune removes the retired history pin ref"
     );
 }
+
+#[test]
+fn ejecting_a_history_overlay_leaves_a_standalone_clone_of_the_upstream() {
+    let fixture = TempDir::new().expect("fixture tempdir");
+    let (mirror, pin_one, _, _) = fixture_repository(&fixture);
+    let deploy_root = fixture.path().join("deployment");
+    let config = Config::parse(&format!(
+        "version = 1\n\
+         [sources.history]\n\
+         git = \"{}\"\n\n\
+         [targets.home]\n\
+         path = \"{}\"\n\n\
+         [targets.home.sources]\n\
+         history = {{ history = true }}\n",
+        mirror.display(),
+        deploy_root.display()
+    ))
+    .expect("history config parses");
+    let registry = FileStateStore::open(fixture.path().join("state")).expect("open registry");
+    let cache = fixture.path().join("cache");
+    let backend = GitBackend::new(cache.clone());
+    sync_history(&config, &registry, &backend, sync_options());
+    let record = registry
+        .all_artifacts()
+        .expect("read history records")
+        .pop()
+        .expect("history sync persists one record");
+    let history_root = deploy_root.join("history");
+    std::fs::write(history_root.join("plain.txt"), b"edited\n").expect("edit deployed content");
+
+    let clone = phora::sync::eject(
+        &config,
+        &registry,
+        &record.key.artifact,
+        "history",
+        "home",
+        &backend,
+    )
+    .expect("eject succeeds");
+
+    assert_eq!(clone.as_deref(), Some(history_root.as_path()));
+    assert!(
+        history_root.join(".git").is_dir(),
+        "the gitlink is replaced by a repository"
+    );
+    let leftover_admin = walkdir::WalkDir::new(&cache)
+        .into_iter()
+        .filter_map(Result::ok)
+        .any(|entry| entry.file_name().to_string_lossy().starts_with("ph-"));
+    assert!(!leftover_admin, "eject drops the overlay's administration");
+    std::fs::remove_dir_all(&cache).expect("clear the cache");
+    assert_eq!(
+        git_stdout(&history_root, &["rev-parse", "HEAD"]),
+        record.commit,
+        "the clone is detached at the pin"
+    );
+    assert_eq!(
+        git_stdout(&history_root, &["status", "--porcelain=v1"]),
+        "M plain.txt",
+        "the clone sees exactly the local edit"
+    );
+    assert_eq!(
+        git_stdout(&history_root, &["remote", "get-url", "origin"]),
+        mirror
+            .canonicalize()
+            .expect("canonical upstream")
+            .display()
+            .to_string(),
+        "origin is the upstream, not the cache"
+    );
+    assert_eq!(
+        git_stdout(
+            &history_root,
+            &["rev-parse", "--verify", "refs/remotes/origin/main"]
+        ),
+        git_stdout(&mirror, &["rev-parse", "refs/heads/main"]),
+        "upstream branches become remote-tracking refs"
+    );
+    git(
+        &history_root,
+        &["fsck", "--connectivity-only", "--no-dangling"],
+    );
+    git(&history_root, &["cat-file", "-e", &pin_one]);
+
+    let refused = phora::sync::uneject(&config, &registry, &record.key.artifact, "history", "home");
+    assert!(
+        refused.is_err(),
+        "uneject refuses to put a standalone clone back under management"
+    );
+}
