@@ -9,6 +9,7 @@ use crate::diagnostic::SelectionDiagnostic;
 use crate::error::{Error, Result};
 use crate::source::ExportPolicy;
 
+use super::HookCommand;
 use super::host::Host;
 use super::{Protocol, effective_host, fill_template};
 
@@ -43,6 +44,41 @@ pub struct Source {
     pub deploy: Option<DeployMode>,
     #[serde(default)]
     pub transitive: Option<bool>,
+    #[serde(default)]
+    pub build: Option<BuildSpec>,
+}
+
+/// A generator whose output, committed into the store, is the source's content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildSpec {
+    /// Sources materialized under `$PHORA_INPUT/<name>` before the command runs.
+    pub inputs: Vec<String>,
+    pub command: HookCommand,
+    /// Runs on every sync; its stdout joins the build key.
+    pub key: Option<HookCommand>,
+}
+
+impl<'de> Deserialize<'de> for BuildSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct BuildTable {
+            inputs: Vec<String>,
+            run: Option<String>,
+            shell: Option<String>,
+            cmd: Option<Vec<String>>,
+            key: Option<HookCommand>,
+        }
+        let table = BuildTable::deserialize(deserializer)?;
+        let command = super::hooks::validated_command(table.run, table.shell, table.cmd)?;
+        Ok(Self {
+            inputs: table.inputs,
+            command,
+            key: table.key,
+        })
+    }
 }
 
 impl Source {
@@ -66,6 +102,7 @@ pub enum SourceMode {
     Git,
     Host,
     Url,
+    Build,
 }
 
 /// A source's resolved kind. Exactly one kind per source; illegal combinations
@@ -87,6 +124,8 @@ pub enum Remote {
         repo: String,
         protocol: Option<Protocol>,
     },
+    /// Generated content: the committed output of a command run over pinned inputs.
+    Build(BuildSpec),
 }
 
 impl Remote {
@@ -96,6 +135,7 @@ impl Remote {
             Self::Git(_) | Self::Path(_) => SourceMode::Git,
             Self::Host { .. } => SourceMode::Host,
             Self::Url { .. } => SourceMode::Url,
+            Self::Build(_) => SourceMode::Build,
         }
     }
 }
@@ -135,7 +175,7 @@ impl ParsedSource {
         let remote = source.classify(name)?.ok_or_else(|| {
             Error::Config(format!(
                 "source `{name}` must resolve to exactly one of a local `path`, \
-                 a forge `host`/`repo`, a literal `git`, or a `url`"
+                 a forge `host`/`repo`, a literal `git`, a `url`, or a `build`"
             ))
         })?;
         reject_bang_patterns(name, "include", source.include.as_deref())?;
@@ -178,6 +218,7 @@ impl ParsedSource {
                 .to_string_lossy()
                 .into_owned()),
             Remote::Url { .. } => Ok(String::new()),
+            Remote::Build(_) => Ok(crate::source::BUILD_MIRROR.to_owned()),
             Remote::Host { host, repo, .. } => resolve_forge(hosts, host, repo, protocol),
         }
     }
@@ -186,6 +227,14 @@ impl ParsedSource {
     pub fn source_url(&self) -> Option<&str> {
         match &self.remote {
             Remote::Url { url, .. } => Some(url),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn build(&self) -> Option<&BuildSpec> {
+        match &self.remote {
+            Remote::Build(spec) => Some(spec),
             _ => None,
         }
     }
@@ -242,7 +291,7 @@ impl ParsedSource {
 
     #[must_use]
     pub fn refspec(&self) -> Refspec {
-        if matches!(self.remote, Remote::Url { .. }) {
+        if matches!(self.remote, Remote::Url { .. } | Remote::Build(_)) {
             Refspec::None
         } else if let Some(rev) = &self.rev {
             Refspec::Rev(rev.clone())
@@ -397,8 +446,23 @@ impl Source {
         let local_forge_kind = local.host.is_some() || local.repo.is_some();
         let local_local_kind = local.path.is_some() && !local_forge_kind;
         let local_url_kind = local.url.is_some();
+        let local_build_kind = local.build.is_some();
         let local_ref = local.branch.is_some() || local.tag.is_some() || local.rev.is_some();
-        if local_git_kind {
+        if local_git_kind || local_forge_kind || local_local_kind || local_url_kind {
+            self.build = None;
+        }
+        if local_build_kind {
+            self.build = local.build;
+            self.git = None;
+            self.host = None;
+            self.repo = None;
+            self.path = None;
+            self.url = None;
+            self.digest = None;
+            self.branch = None;
+            self.tag = None;
+            self.rev = None;
+        } else if local_git_kind {
             self.git = local.git;
             self.host = None;
             self.repo = None;
@@ -513,13 +577,17 @@ impl Source {
         let kinds = u8::from(self.git.is_some())
             + u8::from(self.url.is_some())
             + u8::from(self.is_forge())
-            + u8::from(local.is_some());
+            + u8::from(local.is_some())
+            + u8::from(self.build.is_some());
         if kinds > 1 {
             return Err(Error::Config(format!(
                 "source `{name}` sets more than one source kind \
-                 (local `path`, forge `host`/`repo`, literal `git`, and `url` \
+                 (local `path`, forge `host`/`repo`, literal `git`, `url`, and `build` \
                  are mutually exclusive)"
             )));
+        }
+        if let Some(build) = &self.build {
+            return classify_build(name, self, build).map(Some);
         }
         if let Some(url) = &self.url {
             if self.branch.is_some()
@@ -572,6 +640,44 @@ impl Source {
     }
 }
 
+fn classify_build(name: &str, source: &Source, build: &BuildSpec) -> Result<Remote> {
+    let field = if source.branch.is_some() {
+        "branch"
+    } else if source.tag.is_some() {
+        "tag"
+    } else if source.rev.is_some() {
+        "rev"
+    } else if source.digest.is_some() {
+        "digest"
+    } else if source.protocol.is_some() {
+        "protocol"
+    } else if source.deploy == Some(DeployMode::Link) {
+        "deploy = \"link\""
+    } else if source.transitive == Some(true) {
+        "transitive"
+    } else if source.allow_symlinks.is_some() {
+        "allow_symlinks"
+    } else {
+        ""
+    };
+    if !field.is_empty() {
+        return Err(Error::Config(format!(
+            "source `{name}`: `{field}` is meaningless on a `build` source"
+        )));
+    }
+    if build.inputs.is_empty() {
+        return Err(Error::Config(format!(
+            "source `{name}`: `build.inputs` must name at least one source"
+        )));
+    }
+    if build.inputs.iter().any(|input| input == name) {
+        return Err(Error::Config(format!(
+            "source `{name}`: `build.inputs` cannot name the build source itself"
+        )));
+    }
+    Ok(Remote::Build(build.clone()))
+}
+
 #[derive(Debug, Clone)]
 pub enum Refspec {
     Branch(String),
@@ -619,6 +725,7 @@ mod offer_tests {
             preserve_executable: None,
             deploy: None,
             transitive: None,
+            build: None,
         }
     }
 
@@ -806,6 +913,7 @@ mod merge_url_digest_tests {
             preserve_executable: None,
             deploy: None,
             transitive: None,
+            build: None,
         }
     }
 

@@ -892,6 +892,7 @@ mod tests {
             config_digest: "blake3:cfg".to_owned(),
             r#ref: None,
             instance: Some(instance.to_owned()),
+            build: None,
         }
     }
 

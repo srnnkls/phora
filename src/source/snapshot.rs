@@ -80,6 +80,11 @@ pub enum SourceLocation {
         root: PathBuf,
         follow_symlinks: bool,
     },
+    /// A generator's output. `Some` imports that directory on refresh; `None` reads a pinned commit.
+    Build {
+        output: Option<PathBuf>,
+        follow_symlinks: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

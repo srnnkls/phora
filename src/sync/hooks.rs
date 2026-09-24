@@ -12,7 +12,6 @@ use crate::sync::state::{ArtifactRecord, StateStore};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookScope {
     PreSync,
-    PostPrepare,
     PreDeploy,
     OnChange,
     PostSync,
@@ -135,34 +134,6 @@ pub(super) fn dispatch_pre_sync(config: &Config, target_names: &str) -> Result<V
             scope: HookScope::PreSync,
             status,
         });
-    }
-    Ok(outcomes)
-}
-
-/// Runs the consumer's preparation gate in order, stopping at the first failure.
-pub(super) fn dispatch_post_prepare(config: &Config) -> Result<Vec<HookOutcome>> {
-    let Some(commands) = config.hooks.as_ref().and_then(|g| g.post_prepare.as_ref()) else {
-        return Ok(Vec::new());
-    };
-    let target_names = config
-        .targets
-        .keys()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .join(" ");
-    let mut outcomes = Vec::new();
-    for hook in dedupe(commands) {
-        let status = run_hook(hook, &[("PHORA_TARGETS", &target_names)])?;
-        let (body, suffix) = hook_key(hook);
-        outcomes.push(HookOutcome {
-            hook_id: format!("post_prepare#{body}#{suffix}"),
-            command: hook.display(),
-            scope: HookScope::PostPrepare,
-            status,
-        });
-        if status == HookStatus::Failure {
-            break;
-        }
     }
     Ok(outcomes)
 }
@@ -353,7 +324,28 @@ fn changed_paths(
 ///
 /// Returns an error if the hook shell is empty or the process fails to spawn.
 fn run_hook(hook: &HookCommand, env: &[(&str, &str)]) -> Result<HookStatus> {
-    let mut command = match hook {
+    let mut command = command(hook)?;
+    for (key, value) in env {
+        command.env(key, value);
+    }
+
+    let status = command
+        .status()
+        .map_err(|e| Error::Sync(format!("failed to run hook `{}`: {e}", hook.display())))?;
+    Ok(if status.success() {
+        HookStatus::Success
+    } else {
+        HookStatus::Failure
+    })
+}
+
+/// The process for a configured command: a shell-wrapped `run` or a direct `cmd` argv.
+///
+/// # Errors
+///
+/// Returns an error if the shell or the argv is empty.
+pub(super) fn command(hook: &HookCommand) -> Result<Command> {
+    Ok(match hook {
         HookCommand::Shell { run, shell } => {
             let shell = shell.as_deref().unwrap_or(DEFAULT_SHELL_PREFIX);
             let mut parts = shell.split_whitespace();
@@ -372,18 +364,6 @@ fn run_hook(hook: &HookCommand, env: &[(&str, &str)]) -> Result<HookStatus> {
             command.args(args);
             command
         }
-    };
-    for (key, value) in env {
-        command.env(key, value);
-    }
-
-    let status = command
-        .status()
-        .map_err(|e| Error::Sync(format!("failed to run hook `{}`: {e}", hook.display())))?;
-    Ok(if status.success() {
-        HookStatus::Success
-    } else {
-        HookStatus::Failure
     })
 }
 

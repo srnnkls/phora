@@ -28,10 +28,10 @@ pub use hooks::{
 };
 pub use host::{AuthConfig, Host, RemoteConfig, builtin_forges};
 pub use migrate::MigrationWarning;
-pub use source::{DeployMode, Offer, ParsedSource, Refspec, Remote, Source, SourceMode};
+pub use source::{BuildSpec, DeployMode, Offer, ParsedSource, Refspec, Remote, Source, SourceMode};
 pub use target::{
     Binding, Import, LayoutConfig, LayoutKind, ResolvedBinding, SourceFields, TakeEntry, Target,
-    TargetPhase, TemplateOptIn,
+    TemplateOptIn,
 };
 
 fn expand_home(path: &Path) -> PathBuf {
@@ -173,7 +173,37 @@ impl Config {
         }
         self.validate_bindings()?;
         self.validate_imports()?;
+        self.validate_builds()?;
         Ok(())
+    }
+
+    fn validate_builds(&self) -> Result<()> {
+        for (name, source) in &self.sources {
+            let Some(build) = &source.build else {
+                continue;
+            };
+            for input in &build.inputs {
+                let Some(input_source) = self.sources.get(input) else {
+                    return Err(Error::Config(format!(
+                        "source `{name}`: `build.inputs` references undefined source `{input}`"
+                    )));
+                };
+                if input_source.build.is_some() {
+                    return Err(Error::Config(format!(
+                        "source `{name}`: `build.inputs` names build source `{input}`; \
+                         a build reads only fetched or local sources"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn is_build_input(&self, name: &str) -> bool {
+        self.sources
+            .values()
+            .filter_map(|s| s.build.as_ref())
+            .any(|b| b.inputs.iter().any(|i| i == name))
     }
 
     fn validate_imports(&self) -> Result<()> {
@@ -215,7 +245,7 @@ impl Config {
             if !source.is_transitive() {
                 continue;
             }
-            if self.is_imported_anywhere(name) {
+            if self.is_imported_anywhere(name) || self.is_build_input(name) {
                 continue;
             }
             if let Some(target_name) = self.flat_binder_of(name) {
@@ -263,6 +293,7 @@ impl Config {
                     )));
                 };
                 reject_url_slice(effective, binding, source)?;
+                reject_build_ref(effective, binding, source)?;
                 reject_link_ref(effective, binding, source)?;
                 reject_history_binding_options(target_name, identity, effective, binding, source)?;
                 reject_multi_ref(effective, binding)?;
@@ -500,6 +531,8 @@ fn reject_history_binding_options(
     }
     let option = if source.url.is_some() {
         "url"
+    } else if source.build.is_some() {
+        "build"
     } else if source.deploy == Some(DeployMode::Link) {
         "deploy"
     } else if source.root.is_some() {
@@ -523,6 +556,24 @@ fn reject_history_binding_options(
     };
     Err(Error::Config(format!(
         "target `{target_name}`: binding `{identity}` for source `{source_name}`: `history` cannot be combined with `{option}`"
+    )))
+}
+
+fn reject_build_ref(source_name: &str, binding: &Binding, source: &Source) -> Result<()> {
+    if source.build.is_none() {
+        return Ok(());
+    }
+    let field = if binding.branch.is_some() {
+        "branch"
+    } else if binding.tag.is_some() {
+        "tag"
+    } else if binding.rev.is_some() {
+        "rev"
+    } else {
+        return Ok(());
+    };
+    Err(Error::Config(format!(
+        "source `{source_name}`: `{field}` is meaningless on a `build` source"
     )))
 }
 

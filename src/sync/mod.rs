@@ -1,6 +1,7 @@
 //! Top-level orchestration: the `sync` pipeline, eject/uneject, and shared helpers.
 
 pub mod apply;
+mod build;
 pub(crate) mod confine;
 mod directories;
 pub(crate) mod discover;
@@ -10,9 +11,7 @@ pub mod journal;
 pub mod model;
 pub(crate) mod observe;
 mod plan;
-mod prepare;
 mod preview;
-pub(crate) use prepare::merge_lock_sets;
 pub mod progress;
 mod prune;
 mod rebuild;
@@ -268,7 +267,6 @@ impl RunOptions for SyncInput<'_> {
 struct SyncExecution {
     report: SyncReport,
     deploy_failures: bool,
-    stripped_transitive_hooks: usize,
 }
 
 #[cfg(test)]
@@ -367,8 +365,15 @@ fn compatibility_output(execution: SyncExecution) -> SyncOutput {
     let SyncExecution {
         report,
         deploy_failures,
-        stripped_transitive_hooks,
     } = execution;
+    let stripped_transitive_hooks = report
+        .warnings
+        .iter()
+        .find_map(|w| match w {
+            SyncWarning::UntrustedTransitiveHooks { count } => Some(*count),
+            _ => None,
+        })
+        .unwrap_or_default();
     let LockSet { base, local } = report.locks;
     SyncOutput {
         base_lock: base.expect("sync execution always returns a base lock"),
@@ -520,7 +525,6 @@ fn decide_transitive_hooks(
 
 struct DeployAll<'a, R> {
     config: &'a Config,
-    target_scope: &'a prepare::TargetScope,
     parsed: &'a BTreeMap<String, ParsedSource>,
     remotes: &'a BTreeMap<String, String>,
     projection: &'a Projection,
@@ -534,7 +538,7 @@ struct DeployAll<'a, R> {
 
 impl<R: StateStore> DeployAll<'_, R> {
     fn records(&self) -> Result<Vec<ArtifactRecord>> {
-        Ok(self.target_scope.select(self.registry.all_artifacts()?))
+        Ok(self.registry.all_artifacts()?)
     }
 }
 
@@ -844,12 +848,9 @@ pub(super) struct Placement {
 }
 
 impl Placement {
-    pub fn new(target: &str, path: &Path, entry: bool) -> Result<Self> {
-        let physical = if entry {
-            confine::normalize_physical_entry(path)?
-        } else {
-            confine::normalize_physical(path)?
-        };
+    /// The destination itself is not followed: deploy replaces whatever sits there.
+    pub fn new(target: &str, path: &Path) -> Result<Self> {
+        let physical = confine::normalize_physical_entry(path)?;
         let identity = confine::fold_path(&physical);
         let parent_entries = path
             .ancestors()
@@ -867,28 +868,15 @@ impl Placement {
         })
     }
 
-    pub fn identity(&self) -> &Path {
-        &self.identity
-    }
-
     pub fn overlaps(&self, other: &Self) -> bool {
         self.identity.starts_with(&other.identity)
             || other.identity.starts_with(&self.identity)
             || self.parent_entries.contains(&other.identity)
             || other.parent_entries.contains(&self.identity)
     }
-
-    /// Whether `other` contains this destination, directly or through an alias.
-    pub fn is_within(&self, other: &Self) -> bool {
-        self.identity.starts_with(&other.identity) || self.parent_entries.contains(&other.identity)
-    }
 }
 
-fn projected_placements(
-    projection: &Projection,
-    config: &Config,
-    parsed: &BTreeMap<String, ParsedSource>,
-) -> Result<Vec<Placement>> {
+fn projected_placements(projection: &Projection, config: &Config) -> Result<Vec<Placement>> {
     let cwd = std::env::current_dir()
         .map_err(|e| Error::Sync(format!("resolve current dir for overlap check: {e}")))?;
     let mut placements = Vec::new();
@@ -898,14 +886,10 @@ fn projected_placements(
         };
         let root = cwd.join(target.expanded_path());
         for binding in &target_projection.bindings {
-            let link = parsed
-                .get(&binding.source)
-                .is_some_and(|source| source.deploy_mode() == DeployMode::Link);
             for item in projected_artifacts(binding) {
                 placements.push(Placement::new(
                     &target_projection.target,
                     &root.join(item.destination.as_str()),
-                    link,
                 )?);
             }
         }
@@ -913,15 +897,9 @@ fn projected_placements(
     Ok(placements)
 }
 
-/// Rejects artifacts from different targets, or from any target and a reserved
-/// preparation tree, that land on overlapping physical paths.
-fn reject_cross_target_overlap(
-    projection: &Projection,
-    config: &Config,
-    parsed: &BTreeMap<String, ParsedSource>,
-    reserved: &[Placement],
-) -> Result<()> {
-    let placements = projected_placements(projection, config, parsed)?;
+/// Rejects artifacts from different targets that land on overlapping physical paths.
+fn reject_cross_target_overlap(projection: &Projection, config: &Config) -> Result<()> {
+    let placements = projected_placements(projection, config)?;
     for (i, first) in placements.iter().enumerate() {
         for second in &placements[i + 1..] {
             if first.target != second.target && first.overlaps(second) {
@@ -934,7 +912,7 @@ fn reject_cross_target_overlap(
             }
         }
     }
-    prepare::reject_prepared_overlap(&placements, reserved)
+    Ok(())
 }
 
 fn cross_target_overlap_diagnostic(
@@ -959,10 +937,7 @@ fn cross_target_overlap_diagnostic(
 }
 
 fn notify_orphans<R: StateStore>(deploy: &DeployAll<'_, R>, events: &mut SyncEvents) -> Result<()> {
-    let count = deploy
-        .target_scope
-        .select(orphan_records(deploy.config, deploy.registry)?)
-        .len();
+    let count = orphan_records(deploy.config, deploy.registry)?.len();
     if count > 0 {
         events.push_warning(SyncWarning::OrphanedRecords { count });
     }
@@ -1085,7 +1060,6 @@ fn project_sync_workspace(
     backend: &dyn SourceStore,
     resolved_commits: &BTreeMap<(String, String), String>,
     resolved_sources: &ResolvedSourceMap,
-    reserved: &[Placement],
 ) -> Result<Projection> {
     let projection = project_workspace(
         config,
@@ -1095,40 +1069,8 @@ fn project_sync_workspace(
         resolved_commits,
         resolved_sources,
     )?;
-    reject_cross_target_overlap(&projection, config, parsed, reserved)?;
+    reject_cross_target_overlap(&projection, config)?;
     Ok(projection)
-}
-
-/// Projects a workspace's destinations without applying it, so preparation can prove
-/// its trees are disjoint from deployment before its first write.
-fn project_placements(
-    input: &SyncRunInput<'_>,
-    workspace: &SyncWorkspace,
-    backend: &dyn SourceStore,
-) -> Result<Vec<Placement>> {
-    let routed = resolve_sources(
-        &workspace.config,
-        &workspace.parsed,
-        &workspace.remotes,
-        &workspace.instances,
-        &workspace.import_refs,
-        effective_lock(input).as_ref(),
-        backend,
-        false,
-        input.frozen(),
-        input.jobs(),
-        &progress::SilentSink,
-    )?;
-    let projection = project_sync_workspace(
-        &workspace.config,
-        &workspace.parsed,
-        &workspace.remotes,
-        backend,
-        &routed.commits,
-        &routed.resolved,
-        &[],
-    )?;
-    projected_placements(&projection, &workspace.config, &workspace.parsed)
 }
 
 /// Synchronizes a workspace from an explicit request and returns structured outcomes.
@@ -1198,7 +1140,6 @@ where
     let mut events = SyncEvents::new(input.sink());
     let mut effective_config = merged_config(input);
     effective_config.validate()?;
-    let mut preparation = prepare::Preparation::new(&effective_config)?;
     let pre_sync_outcomes = run_pre_sync(input, &effective_config)?;
     if pre_sync_outcomes
         .iter()
@@ -1217,6 +1158,8 @@ where
         ));
     }
     let mut parsed = effective_config.parsed_sources()?;
+    let builds = build::run(input, &effective_config, &parsed, backend, &mut events)?;
+    let build_failed = builds.failed;
     let mut remotes = resolved_remotes(&effective_config, &parsed)?;
     let effective_lock = effective_lock(input);
     input.sink().phase_started(Phase::Compose);
@@ -1233,57 +1176,46 @@ where
     )?;
     let hook_candidates = take_hook_candidates(&mut graph, &mut events);
     let import_refs = graph.import_refs.clone();
-    preparation.sources.append(&mut graph.prepare_sources);
     let instances = graph.inject(&mut effective_config, &mut parsed, &mut remotes);
     input.sink().phase_finished(Phase::Compose);
 
     let workspace = SyncWorkspace {
         config: effective_config,
-        target_scope: prepare::TargetScope::All,
         parsed,
         remotes,
         instances,
         import_refs,
         hook_candidates,
+        builds,
     };
-    if preparation.enabled(&workspace.config) {
-        prepare::sync(
-            input,
-            &workspace,
-            &preparation,
-            backend,
-            registry,
-            pre_sync_outcomes,
-            events,
-            started,
-        )
-    } else {
-        sync_workspace(
-            input,
-            workspace,
-            backend,
-            registry,
-            pre_sync_outcomes,
-            events,
-            started,
-        )
+    let mut execution = sync_workspace(
+        input,
+        workspace,
+        backend,
+        registry,
+        pre_sync_outcomes,
+        events,
+        started,
+    )?;
+    if build_failed {
+        execution.report.status = SyncStatus::Failed;
     }
+    Ok(execution)
 }
 
-#[derive(Clone)]
 struct SyncWorkspace {
     config: Config,
-    target_scope: prepare::TargetScope,
     parsed: BTreeMap<String, ParsedSource>,
     remotes: BTreeMap<String, String>,
     instances: BTreeMap<String, String>,
     import_refs: Vec<resolve::ImportResolution>,
     hook_candidates: Vec<transitive::TransitiveHookCandidate>,
+    builds: build::Builds,
 }
 
 #[expect(
     clippy::too_many_lines,
-    reason = "the ordered resolve, project, and apply pipeline is shared by both phases"
+    reason = "the ordered resolve, project, and apply pipeline"
 )]
 fn sync_workspace<R: StateStore>(
     input: &SyncRunInput<'_>,
@@ -1296,12 +1228,12 @@ fn sync_workspace<R: StateStore>(
 ) -> Result<SyncExecution> {
     let SyncWorkspace {
         config: effective_config,
-        target_scope,
         parsed,
         remotes,
         instances,
         import_refs,
         hook_candidates,
+        builds,
     } = workspace;
     let effective_lock = effective_lock(input);
     for warning in validate_link_mode(input.base_config, &parsed, &remotes)? {
@@ -1320,10 +1252,10 @@ fn sync_workspace<R: StateStore>(
 
     sweep_target_parents(&effective_config, &journal, compat_registry)?;
 
-    let recorded_after_recovery = target_scope.select(live_recorded_artifacts(compat_registry)?);
+    let recorded_after_recovery = live_recorded_artifacts(compat_registry)?;
 
     input.sink().phase_started(Phase::Resolve);
-    let routed = resolve_sources(
+    let mut routed = resolve_sources(
         &effective_config,
         &parsed,
         &remotes,
@@ -1336,6 +1268,7 @@ fn sync_workspace<R: StateStore>(
         input.jobs(),
         input.sink(),
     )?;
+    builds.route(&mut routed);
     input.sink().phase_finished(Phase::Resolve);
     let (mut base_lock, local_lock) = split_locks(routed.locks, &local_names);
     base_lock.trusted_hooks = effective_lock
@@ -1359,7 +1292,6 @@ fn sync_workspace<R: StateStore>(
         backend,
         &routed.commits,
         &routed.resolved,
-        target_scope.reserved(),
     )?;
     input.sink().phase_finished(Phase::Project);
     input
@@ -1388,7 +1320,6 @@ fn sync_workspace<R: StateStore>(
     let deploy = DeployProtocol {
         workspace: DeployAll {
             config: &effective_config,
-            target_scope: &target_scope,
             parsed: &parsed,
             remotes: &remotes,
             projection: &projection,
@@ -1510,7 +1441,6 @@ where
             },
         },
         deploy_failures,
-        stripped_transitive_hooks,
     })
 }
 
@@ -1586,7 +1516,6 @@ fn aborted_before_deploy_phase(
             status: SyncStatus::Failed,
         },
         deploy_failures: false,
-        stripped_transitive_hooks: 0,
     }
 }
 

@@ -25,7 +25,6 @@ const LOCAL: &str = r#"
 cache = "cache"
 state = "state"
 [targets.tropos]
-phase = "prepare"
 path = ".tropos"
 imports = ["tropos"]
 "#;
@@ -207,7 +206,7 @@ fn linked_package_deploys_uncommitted_files_without_touching_its_worktree() {
     fixture.succeeds(&["sync", "--prune"]);
     assert!(
         std::fs::symlink_metadata(fixture.project.join(".tropos/skills/new/SKILL.md")).is_err(),
-        "a file removed from the package worktree is pruned from the prepared tree"
+        "a file removed from the package worktree is pruned from the deployed tree"
     );
     assert_eq!(fixture.read(".tropos/skills/code/SKILL.md"), "skill edit\n");
 }
@@ -536,41 +535,4 @@ fn linked_source_without_allow_symlinks_skips_them() {
             "{path} is not offered"
         );
     }
-}
-
-#[test]
-fn consumer_link_source_over_the_prepared_package_survives_switches() {
-    let fixture = Fixture::new(PACKAGE_MANIFEST);
-    let worktree = fixture.add_worktree();
-    write(&worktree.join("skills/live/SKILL.md"), "live only\n");
-    let reader = "[sources.fas]\npath = \"./.tropos\"\nroot = \"skills\"\ndeploy = \"link\"\n\
-                  allow_symlinks = true\n\
-                  [targets.out]\npath = \"out\"\nsources.fas = { collapse = false }\n";
-
-    fixture.pin_with(reader);
-    assert_quiet(&fixture.sync_prune());
-    assert_eq!(fixture.read("out/code/SKILL.md"), "skill v1\n");
-
-    fixture.link_with(&worktree, reader);
-    assert_quiet(&fixture.sync_prune());
-    assert!(fixture.is_link(".tropos/skills/code/SKILL.md"));
-    assert_eq!(fixture.read("out/code/SKILL.md"), "skill v1\n");
-    assert_eq!(fixture.read("out/live/SKILL.md"), "live only\n");
-    assert!(
-        std::fs::read_link(fixture.project.join("out/code/SKILL.md"))
-            .expect("read link")
-            .starts_with(
-                fixture
-                    .project
-                    .canonicalize()
-                    .expect("project")
-                    .join(".tropos")
-            ),
-        "the consumer links into the prepared tree, not through it into the worktree"
-    );
-
-    fixture.pin_with(reader);
-    assert_quiet(&fixture.sync_prune());
-    assert_eq!(fixture.read("out/code/SKILL.md"), "skill v1\n");
-    assert!(std::fs::symlink_metadata(fixture.project.join("out/live/SKILL.md")).is_err());
 }

@@ -172,7 +172,7 @@ impl Walk<'_> {
     }
 }
 
-fn capture_entries(
+pub(super) fn capture_entries(
     root: &Path,
     cache_rel: Option<&Path>,
     follow_symlinks: bool,

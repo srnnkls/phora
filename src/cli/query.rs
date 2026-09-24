@@ -683,6 +683,10 @@ fn cached_copy_snapshot(
         crate::config::SourceMode::Url => SourceLocation::Url {
             url: remote.to_owned(),
         },
+        crate::config::SourceMode::Build => SourceLocation::Build {
+            output: None,
+            follow_symlinks: false,
+        },
     };
     let commit = locked_commit
         .parse::<Commit>()
@@ -1491,6 +1495,7 @@ mod explain_tests {
                 config_digest: String::new(),
                 r#ref: None,
                 instance: None,
+                build: None,
             }],
             trusted_hooks: Vec::new(),
             candidate_hooks: Vec::new(),
