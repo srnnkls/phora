@@ -66,14 +66,15 @@ project you run it in. `phora verify` flags any edit, so a reference can't
 quietly turn into a scratch area.
 
 Add `resources/` to the project's `.gitignore`, or git treats `resources/axum`
-as an embedded repository. Branches and commits you make inside a history
-checkout live in phora's cache and disappear with it. A history binding takes
+as an embedded repository. A history checkout is read-only: the next sync puts
+it back at the pin. A history binding takes
 the whole repository and rejects `take`, `collapse` and `template`. See
 [History overlay](GUIDE.md#history-overlay) and
 [Under the hood](GUIDE.md#under-the-hood).
 
 The store saves fetching and history; each project still gets its own copy of
-the files it deploys. To work on a dependency, clone it where you develop.
+the files it deploys. To work on a dependency, `phora eject` the history
+checkout into a standalone clone.
 
 ## Dotfiles
 
@@ -588,8 +589,8 @@ claude -> ~/.claude
   henia@3f9c21ab claude/skills/bash/SKILL.md -> skills/bash/SKILL.md -> ~/.claude/skills/bash/SKILL.md
 ```
 
-henia runs again only when the tropos pin, loqui's pin, or `henia --version`
-changes. Its output is locked and hashed, so `phora verify` catches a hand
+henia runs again only when the files it reads from tropos or loqui change, or
+`henia --version` prints something new. Its output is locked and hashed, so `phora verify` catches a hand
 edit in `~/.claude`. If henia fails, the previous output stays deployed and the
 sync exits non-zero.
 

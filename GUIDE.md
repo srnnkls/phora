@@ -857,9 +857,10 @@ The command then writes into `$PHORA_OUTPUT`, which starts empty. It runs in the
 project directory, like a hook, and its stdout goes to stderr so `sync --json`
 stays readable.
 
-phora reruns the command only when the build key changes. The key hashes the
-command and every input file, so an `update` of an input, or an uncommitted
-edit to a link-mode input, triggers a build; a plain `sync` doesn't. When the
+phora reruns the command when the build key changes, or when the locked output
+is missing from the cache. The key hashes the command and every input file, so
+an `update` of an input that changes its files, or an uncommitted edit to a
+link-mode input, triggers a build; a plain `sync` doesn't. When the
 generator itself changes, name a command whose output reflects it:
 
 ```toml
@@ -872,7 +873,8 @@ build = { inputs = ["input"], run = "gen $PHORA_INPUT $PHORA_OUTPUT", key = "gen
 A build that exits non-zero, or writes nothing, never reaches your targets. If
 the source has built before, the previous output stays deployed, the sync warns
 and exits non-zero, and the next sync tries again. A first build that fails
-stops the sync. `--frozen` never runs a build: it deploys the locked output, or
+stops the sync, and so does a failed `phora update` of the build source, which
+leaves the deployed files as they were. `--frozen` never runs a build: it deploys the locked output, or
 fails when the key no longer matches.
 
 Symlinks in the output are captured as the files they point to. Builds come
@@ -1397,8 +1399,10 @@ stays on one filesystem. For each leaf, staging:
 1. skips a destination with a `.git` path component, unless an `include` pattern
    has a `.git` segment or the binding is a history overlay;
 2. renders `*.tmpl` files with the effective vars;
-3. writes the bytes, sets the executable bit when the source had it and
-   `preserve_executable` is on, and sets the mtime to the commit's author time;
+3. writes the bytes and sets the executable bit when the source had it and
+   `preserve_executable` is on. The file keeps the time it was written, as in a
+   git checkout, so a file updated by a sync is never older than build output
+   made from its previous version;
 4. rejects a symlink unless `allow_symlinks` is on (the default for history
    bindings), and rejects one whose target leaves the artifact;
 5. rejects two leaves whose deployed names fold to the same path;
@@ -1486,8 +1490,9 @@ clean if nothing changed. `sync` writes revalidated stats back to the record so
 the next run takes step 2. A partly modified artifact keeps its old stats.
 
 `phora verify` hashes every manifest file regardless of stat, skips linked and
-ejected records, and also fails on untrusted transitive hook candidates. History
-overlay findings are reported without failing.
+ejected records, and also fails on untrusted transitive hook candidates and on a
+history overlay that drifted from its pin. An overlay phora can't inspect is
+reported without failing.
 
 Templated artifacts carry two digests that answer different questions:
 
@@ -1578,8 +1583,8 @@ cache root. [Confinement](#confinement) lists the rest of the rules.
 ### How a history overlay is built
 
 A [history binding](#history-overlay) deploys the source's whole tree through
-normal staging. phora adds the git metadata after the swap, making the
-destination a linked git worktree of the mirror.
+normal staging. phora writes the git metadata into the staged tree before the
+swap, so the destination arrives as a linked git worktree of the mirror.
 
 The overlay's admin id is the first 16 hex characters of a framed BLAKE3 over
 the canonical project root, the deploy root, the target name and the binding
@@ -1589,13 +1594,14 @@ identity. Publishing runs under the mirror's flock:
    with the detached commit, `commondir` (`../..`), `gitdir` pointing at
    `<deploy root>/.git`, and an index built from the commit's tree with the stat
    data of the deployed files.
-2. Create empty directories in the deploy root for submodule entries.
-3. Write `<deploy root>/.git.phora-staging-<n>` containing
+2. Create empty directories in the staged tree for submodule entries.
+3. Write a staged gitlink in the staged tree containing
    `gitdir: <mirror>/worktrees/ph-<id>`.
-4. Move an existing `worktrees/ph-<id>` aside to `.ph-<id>.backup-<pid>-<n>`,
-   rename the staging directory into place, write the pin
-   `refs/phora/worktrees/<id>`, and rename the staged gitlink to `.git`. Then
-   remove the backup.
+4. Put the administration in place as `worktrees/ph-<id>`. An existing one is
+   swapped out atomically where the filesystem supports it, and otherwise moved
+   aside to `.ph-<id>.backup-<pid>-<n>` first.
+5. Write the pin `refs/phora/worktrees/<id>`, rename the staged gitlink to
+   `.git`, and remove the old administration.
 
 The pin keeps the commit reachable in the mirror. Fetches detach each managed
 `HEAD` first so a ref update is not rejected, and a re-clone carries the

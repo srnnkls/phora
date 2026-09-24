@@ -81,7 +81,7 @@ transitive dependency, from any import, are re-resolved; your other sources stay
 
 | Flag | Meaning |
 | --- | --- |
-| `--prune` | delete artifacts no longer selected after the update, including generated links |
+| `--prune` | delete artifacts no longer selected after the update |
 | `--fast-forward` | delete deployed artifacts that the new pin no longer offers, instead of stopping |
 
 ```sh
@@ -132,7 +132,8 @@ phora verify
 
 Exits 1 on a content mismatch, a missing file, a path that now holds a different kind of entry, or
 when a composed dependency has untrusted hooks that were stripped. Linked artifacts have no digests
-and are skipped. A stale history overlay is reported without failing.
+and are skipped. A history overlay that drifted from its pin also fails; the next sync restores
+it.
 
 ```console
 $ phora verify
@@ -596,7 +597,7 @@ Set at most one of `branch`, `tag` and `rev`. A `url` source rejects `branch`, `
 stripped. Any other file deploys under the URL's basename.
 
 A `build` source rejects `branch`, `tag`, `rev`, `digest`, `protocol`, `allow_symlinks`,
-`transitive` and `deploy = "link"`.
+`transitive = true` and `deploy = "link"`.
 
 `deploy = "link"` needs a local `path` and works in either config file. Phora warns when
 `phora.toml` declares the source and the linked path is absolute. `git = "<local path>"` and
@@ -629,8 +630,9 @@ and `PHORA_SOURCE`. Its stdout goes to stderr. On exit 0, phora commits everythi
 commit like any copy source.
 
 The build key hashes the command, the stdout of `key`, and every materialized input file. A sync
-reruns the command only when the key differs from the one in the lock; `phora update <source>`
-forces a rerun. If a rerun fails, the previous output stays deployed and the sync exits 1.
+reruns the command when the key differs from the one in the lock or the locked output is missing
+from the cache. If that rerun fails, the previous output stays deployed and the sync exits 1.
+`phora update <source>` forces a rerun; if it fails, the sync stops and nothing is deployed.
 `--frozen` never runs a build.
 
 ```toml
@@ -784,7 +786,7 @@ pre_deploy = { cmd = ["test", "-d", "/Volumes/work"] }
 pre_deploy_on_fail = "skip"
 ```
 
-See [GUIDE: hooks](GUIDE.md#hooks) and [preparing inputs](GUIDE.md#preparing-inputs).
+See [GUIDE: hooks](GUIDE.md#hooks) and [building sources](GUIDE.md#building-sources).
 
 ### history
 
@@ -794,7 +796,7 @@ attached. The deployed directory gets a `.git` file pointing at a worktree of th
 
 The source must be a whole-repository forge, `git` or `path` source (see the restrictions under
 [bindings](#bindings)). Symlinks in the source are deployed unless `allow_symlinks = false`.
-`phora verify` reports a stale overlay without failing, and the next sync repairs it.
+`phora verify` fails on an overlay that drifted from its pin, and the next sync restores it.
 
 Every other binding fetches only its pinned commits, without history, and only the file contents it
 deploys. A history binding makes phora fetch the source's full history, and the mirror keeps it from
