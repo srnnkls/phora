@@ -280,7 +280,10 @@ fn resolve_unit(
     };
 
     let digest = match lock_entry {
-        Some(locked) if locked.commit == commit => locked.digest.clone(),
+        Some(locked) if locked.commit == commit => {
+            prefetch_selected_leaves(store, &source_resolution, source)?;
+            locked.digest.clone()
+        }
         _ => selected_source_digest(store, &source_resolution, source)?,
     };
 
@@ -378,6 +381,29 @@ fn selected_source_digest(
     resolved: &ResolvedSource,
     source: &ParsedSource,
 ) -> Result<String> {
+    with_selected_leaves(store, resolved, source, |store, leaves| {
+        digest_snapshot(store, &resolved.snapshot, leaves).map_err(Into::into)
+    })
+}
+
+#[cfg_attr(feature = "trace", tracing::instrument(skip_all))]
+fn prefetch_selected_leaves(
+    store: &dyn SourceStore,
+    resolved: &ResolvedSource,
+    source: &ParsedSource,
+) -> Result<()> {
+    with_selected_leaves(store, resolved, source, |_, _| Ok(()))
+}
+
+fn with_selected_leaves<T, F>(
+    store: &dyn SourceStore,
+    resolved: &ResolvedSource,
+    source: &ParsedSource,
+    f: F,
+) -> Result<T>
+where
+    F: FnOnce(&dyn SourceStore, &[SourcePath]) -> Result<T>,
+{
     let inventory = store.inventory(&resolved.snapshot, None)?;
     let root = (source.mode() != SourceMode::Url)
         .then_some(source.root.as_deref())
@@ -405,17 +431,14 @@ fn selected_source_digest(
         .into_iter()
         .map(|path| SourcePath::new(&path))
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    match root {
-        Some(root) => {
-            let root = SourcePath::new(&root.to_string_lossy().replace('\\', "/"))?;
-            digest_snapshot(
-                &RootedSnapshotStore { store, root },
-                &resolved.snapshot,
-                &leaves,
-            )
-            .map_err(Into::into)
-        }
-        None => digest_snapshot(store, &resolved.snapshot, &leaves).map_err(Into::into),
+    if let Some(root) = root {
+        let root = SourcePath::new(&root.to_string_lossy().replace('\\', "/"))?;
+        let rooted = RootedSnapshotStore { store, root };
+        rooted.prefetch(&resolved.snapshot, &leaves)?;
+        f(&rooted, &leaves)
+    } else {
+        store.prefetch(&resolved.snapshot, &leaves)?;
+        f(store, &leaves)
     }
 }
 
@@ -459,6 +482,14 @@ impl SourceStore for RootedSnapshotStore<'_> {
         let mut entry = self.store.read(snapshot, &rooted)?;
         entry.meta.path = path.clone();
         Ok(entry)
+    }
+
+    fn prefetch(&self, snapshot: &SnapshotId, leaves: &[SourcePath]) -> SourceResult<()> {
+        let rooted = leaves
+            .iter()
+            .map(|leaf| self.rooted(leaf))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        self.store.prefetch(snapshot, &rooted)
     }
 
     fn list_directory(

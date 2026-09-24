@@ -181,6 +181,10 @@ pub trait SourceStore: Send + Sync {
 
     fn read(&self, snapshot: &SnapshotId, path: &SourcePath) -> Result<SourceEntry>;
 
+    fn prefetch(&self, _snapshot: &SnapshotId, _leaves: &[SourcePath]) -> Result<()> {
+        Ok(())
+    }
+
     fn list_directory(
         &self,
         snapshot: &SnapshotId,

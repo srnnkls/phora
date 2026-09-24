@@ -2,6 +2,7 @@
 
 mod archive;
 mod cache;
+mod fetch;
 mod git;
 pub mod http;
 mod import;
@@ -417,6 +418,7 @@ mod tests {
         run_git(src_path, &["init", "-b", "main", "."]);
         run_git(src_path, &["config", "user.email", "test@example.com"]);
         run_git(src_path, &["config", "user.name", "Test"]);
+        run_git(src_path, &["config", "uploadpack.allowFilter", "true"]);
 
         std::fs::write(src_path.join("README.md"), b"hello\n").unwrap();
         run_git(src_path, &["add", "README.md"]);
@@ -1405,6 +1407,53 @@ mod tests {
 
         assert_eq!(parent.snapshot.commit().as_str(), fixture.tag_sha);
         assert!(mirror_is_shallow(&fixture.backend, &fixture.url));
+    }
+
+    fn blob_present(backend: &GitBackend, url: &str, commit: &str, path: &str) -> bool {
+        let repo = gix::open(backend.mirror_path(url)).expect("open mirror");
+        let id = gix::ObjectId::from_hex(commit.as_bytes()).expect("commit id");
+        let entry = repo
+            .find_commit(id)
+            .expect("commit")
+            .tree()
+            .expect("tree")
+            .lookup_entry_by_path(path)
+            .expect("lookup")
+            .expect("entry");
+        repo.has_object(entry.object_id())
+    }
+
+    #[test]
+    fn a_slice_holds_no_blobs_until_prefetched_or_read() {
+        let fixture = build_git_fixture();
+        let resolved = refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Branch("main".into()),
+        )
+        .expect("blobless slice");
+        let present =
+            |path: &str| blob_present(&fixture.backend, &fixture.url, &fixture.head_sha, path);
+        assert!(
+            !present("README.md") && !present("SECOND.md"),
+            "a slice must fetch trees only"
+        );
+
+        let readme = SourcePath::new("README.md").expect("valid path");
+        SourceStore::prefetch(&fixture.backend, &resolved.snapshot, &[readme])
+            .expect("prefetch the selected leaf");
+        assert!(present("README.md"), "prefetch fetches the selected blob");
+        assert!(!present("SECOND.md"), "prefetch fetches nothing else");
+
+        let second = fixture
+            .backend
+            .read(
+                &resolved.snapshot,
+                &SourcePath::new("SECOND.md").expect("valid path"),
+            )
+            .expect("a read of a missing blob fetches it");
+        assert_eq!(second.bytes, b"second commit\n");
     }
 
     #[test]

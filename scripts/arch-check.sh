@@ -9,6 +9,7 @@ LEGACY_ALLOWLIST=()
 SOURCE_IO_OWNERS=(
   src/source/archive.rs
   src/source/cache.rs
+  src/source/fetch.rs
   src/source/git.rs
   src/source/http.rs
   src/source/import.rs
