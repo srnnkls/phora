@@ -6,15 +6,74 @@ them is in the [guide](GUIDE.md).
 
 ## Contents
 
+- [Reference repositories for agents](#reference-repositories-for-agents)
 - [Dotfiles](#dotfiles)
 - [Shared configuration across repositories](#shared-configuration-across-repositories)
 - [Pinned agent skills across projects](#pinned-agent-skills-across-projects)
 - [Release assets, without curl | tar](#release-assets-without-curl--tar)
 - [Vendoring a subtree from a larger repo](#vendoring-a-subtree-from-a-larger-repo)
-- [Pinned third-party source for agents to read](#pinned-third-party-source-for-agents-to-read)
 - [Generating per-agent skills from one canonical set](#generating-per-agent-skills-from-one-canonical-set)
 - [Smaller situations](#smaller-situations)
 - [Where to look next](#where-to-look-next)
+
+## Reference repositories for agents
+
+Agents answer better when they can read the code you depend on, so repositories
+get cloned into a `resources/` directory in project after project. Each clone
+sits at whatever commit it was cloned at, carries its full history, and collects
+build output, and the same repository ends up cloned twice. phora keeps one
+content-addressed store per machine instead and gives each project a pinned
+slice of it.
+
+```toml
+[sources.duckdb]
+repo = "duckdb/duckdb"
+tag = "v1.3.2"
+include = ["/README.md", "src/include/"]
+
+[sources.axum]
+repo = "tokio-rs/axum"
+tag = "axum-v0.8.4"
+
+[targets.resources]
+path = "resources"
+layout = "by-source"
+sources.duckdb = {}
+sources.axum = { history = true }
+```
+
+```
+$ phora list
+resources:
+  axum/axum  history, ✓ clean
+  duckdb/README.md  ✓ clean
+  duckdb/src  ✓ clean
+```
+
+`resources/duckdb` holds the README and the public headers at `v1.3.2`, and
+nothing else. The store fetched that one commit without history, and file
+contents only for what you selected: its duckdb mirror takes 1.7 MB, where a
+full clone takes hundreds of megabytes. `resources/axum` is a
+whole checkout with its history, so `git log` and `git blame` work inside it.
+The history lives in the store, and the checkout's `.git` file points there.
+
+Put the same `phora.toml` in a second project and its sync deploys from the
+same store. Each project deploys its own 11 MB of files, and the one cache
+holding both mirrors, axum's full history included, stays at 9.7 MB.
+
+Each project moves on its own schedule: `phora update axum` advances only the
+project you run it in. `phora verify` flags any edit, so a reference can't
+quietly turn into a scratch area.
+
+Add `resources/` to the project's `.gitignore`, or git treats `resources/axum`
+as an embedded repository. Branches and commits you make inside a history
+checkout live in phora's cache and disappear with it. A history binding takes
+the whole repository and rejects `take`, `collapse` and `template`. See
+[History overlay](GUIDE.md#history-overlay) and
+[Under the hood](GUIDE.md#under-the-hood).
+
+The store saves fetching and history; each project still gets its own copy of
+the files it deploys. To work on a dependency, clone it where you develop.
 
 ## Dotfiles
 
@@ -451,48 +510,6 @@ needs both in the tree at once.
 
 phora delivers the files. It doesn't run `protoc`, regenerate stubs, or notice
 that a new schema breaks your code.
-
-## Pinned third-party source for agents to read
-
-Your agents read a dependency's source to answer questions about it, and the
-answer depends on the version you use. You want that source in the project at
-the pinned version, with its history so `git log` and `git blame` work.
-
-```toml
-[sources.axum]
-repo = "tokio-rs/axum"
-tag = "axum-v0.8.4"
-
-[targets.resources]
-path = "resources"
-
-[targets.resources.sources.axum]
-history = true
-```
-
-`phora add --history tokio-rs/axum --to resources` writes the same thing. After
-a sync, `resources/axum` holds the whole repository at the tag, plus a `.git`
-file that points into phora's cache:
-
-```
-$ phora list
-resources:
-  axum/axum  history, ✓ clean
-```
-
-`phora verify` checks the files like any other copy. Inside the directory,
-`git log`, `git blame` and `git show` see the pinned commit and everything
-before it.
-
-Add `resources/` to your project's `.gitignore`. Otherwise git treats
-`resources/axum` as an embedded repository.
-
-Branches and commits you make inside `resources/axum` live in phora's cache and
-disappear when the cache does, so push anything you want to keep elsewhere. A
-history binding takes the whole repository, and phora rejects `take`,
-`collapse`, and `template` on it. It is also the one kind of binding that makes
-phora fetch the full history, so the first sync of a large repository takes a
-while. See [History overlay](GUIDE.md#history-overlay).
 
 ## Generating per-agent skills from one canonical set
 

@@ -14,8 +14,14 @@ to any number of directories that consume it. Each source publishes an offer of 
 target takes the slice it wants. `phora.lock` pins every source to one commit, the registry
 records a blake3 digest per deployed file, and an interrupted run resumes where it stopped.
 
+Underneath sits one content-addressed store per machine. Every repository is fetched once into a
+shared git mirror that holds only the commits you pin and the files you select, and every project
+gets a verified copy of its slice. A binding that asks for history reads it from the same store,
+so ten projects that reference one repository keep one copy of its history.
+
 Reach for it when shared configuration, editor setups, prompt or skill bundles, or release assets
-live in one or more repositories but have to show up wherever other tools look for them.
+live in one or more repositories but have to show up wherever other tools look for them, or when
+repositories cloned for context have piled up across your projects.
 
 ## Installation
 
