@@ -108,6 +108,9 @@ pub(super) fn format_sync_warning(warning: &SyncWarning) -> Option<String> {
                  may report files modified"
             )
         }
+        SyncWarning::BuildFailed { source, detail } => {
+            format!("phora: build `{source}` failed ({detail}); keeping its previous output")
+        }
     };
     Some(rendered)
 }
@@ -274,7 +277,6 @@ pub(super) fn render_hook_report(outcomes: &[HookOutcome]) -> String {
     for outcome in outcomes {
         let scope = match outcome.scope {
             HookScope::PreSync => "pre_sync",
-            HookScope::PostPrepare => "post_prepare",
             HookScope::PreDeploy => "pre_deploy",
             HookScope::OnChange => "on_change",
             HookScope::PostSync => "post_sync",

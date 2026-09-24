@@ -293,6 +293,7 @@ fn consumer_locked(name: &str, git: &str) -> crate::lock::LockedSource {
         config_digest: "blake3:cfg".to_owned(),
         r#ref: None,
         instance: None,
+        build: None,
     }
 }
 
@@ -1875,6 +1876,7 @@ fn lock_with(name: &str, git: &str, resolved: &str) -> Lock {
             config_digest: "blake3:cfg".to_owned(),
             r#ref: None,
             instance: None,
+            build: None,
         }],
         trusted_hooks: Vec::new(),
         candidate_hooks: Vec::new(),
@@ -5395,6 +5397,7 @@ fn locked_split(name: &str, r#ref: Option<&str>) -> LockedSource {
         config_digest: "blake3:cfg".to_owned(),
         r#ref: r#ref.map(str::to_owned),
         instance: None,
+        build: None,
     }
 }
 

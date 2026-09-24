@@ -29,7 +29,6 @@ pub type ResolvedSourceMap = BTreeMap<(String, String), ResolvedSource>;
 #[derive(Debug, Clone)]
 pub(super) struct ImportResolution {
     pub source: String,
-    pub phase: crate::config::TargetPhase,
     pub refspec: Refspec,
     pub commit: Option<String>,
 }
@@ -87,7 +86,14 @@ fn resolution_units(
             add(name, source.refspec(), None, false);
         }
     }
-    by_key.into_values().collect()
+    by_key
+        .into_values()
+        .filter(|unit| {
+            parsed
+                .get(&unit.name)
+                .is_none_or(|source| source.mode() != SourceMode::Build)
+        })
+        .collect()
 }
 
 fn refresh_plan(
@@ -263,6 +269,7 @@ fn resolve_unit(
                 config_digest: source.config_digest(),
                 r#ref: None,
                 instance: instances.get(&unit.name).cloned(),
+                build: None,
             },
             source: source_resolution,
         }));
@@ -305,6 +312,7 @@ fn resolve_unit(
             config_digest: source.config_digest(),
             r#ref: discriminator,
             instance: instances.get(&unit.name).cloned(),
+            build: None,
         },
         source: source_resolution,
     }))
@@ -376,7 +384,7 @@ fn resolve_source(
 }
 
 #[cfg_attr(feature = "trace", tracing::instrument(skip_all))]
-fn selected_source_digest(
+pub(super) fn selected_source_digest(
     store: &dyn SourceStore,
     resolved: &ResolvedSource,
     source: &ParsedSource,

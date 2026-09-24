@@ -31,6 +31,10 @@ pub(crate) fn acquire_dependency_manifest(
         SourceMode::Url => SourceLocation::Url {
             url: remote.to_owned(),
         },
+        SourceMode::Build => SourceLocation::Build {
+            output: None,
+            follow_symlinks: false,
+        },
     };
     let request = ResolveRequest {
         name: source_name.clone(),
@@ -177,7 +181,7 @@ mod tests {
                 };
                 let url = match &request.location {
                     SourceLocation::Git { url } | SourceLocation::Url { url } => url,
-                    SourceLocation::Worktree { .. } => {
+                    SourceLocation::Worktree { .. } | SourceLocation::Build { .. } => {
                         unreachable!("manifest tests use only Git sources")
                     }
                 };

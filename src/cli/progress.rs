@@ -154,6 +154,7 @@ impl ProgressSink for TtySink {
                 let len = self.planned_artifacts.lock().expect("sink poisoned").take();
                 self.open_aggregate("Deploying", len.unwrap_or(0));
             }
+            Phase::Build => self.open_phase("Building"),
             Phase::Compose => self.open_phase("Composing"),
             Phase::Project => self.open_phase("Projecting"),
             Phase::Observe => self.open_phase("Checking"),

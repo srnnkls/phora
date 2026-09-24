@@ -51,10 +51,6 @@ pub(super) fn run_sync(
     let local = load_local_config(&cwd)?;
     let (mut base_lock, mut local_lock) = load_locks(&cwd)?;
 
-    let original_locks = LockSet {
-        base: base_lock.clone(),
-        local: local_lock.clone(),
-    };
     if let Some(drop) = drop {
         drop_sources(base_lock.as_mut(), &drop);
         drop_sources(local_lock.as_mut(), &drop);
@@ -132,22 +128,10 @@ pub(super) fn run_sync(
         sink: reporter.sink(),
         trust_prompt: interactive.then_some(&trust_prompt as &dyn crate::sync::TrustPrompt),
     };
-    let mut out = sync_opened(&request, &backend, &registry, lockless).inspect_err(|error| {
+    let out = sync_opened(&request, &backend, &registry, lockless).inspect_err(|error| {
         request.sink.aborted(&error.to_string());
     })?;
 
-    if out.status == crate::sync::SyncStatus::Failed
-        && (effective
-            .targets
-            .values()
-            .any(|t| t.phase() == crate::config::TargetPhase::Prepare)
-            || effective
-                .hooks
-                .as_ref()
-                .is_some_and(|h| h.post_prepare.is_some()))
-    {
-        out.locks = crate::sync::merge_lock_sets(&original_locks, &out.locks);
-    }
     finish_sync(&cwd, &out, interactive, &reporter)
 }
 

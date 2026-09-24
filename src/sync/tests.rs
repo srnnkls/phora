@@ -835,6 +835,7 @@ fn matching_lock_reuses_commit_without_refetch() {
             config_digest: source.config_digest(),
             r#ref: None,
             instance: None,
+            build: None,
         }],
         trusted_hooks: Vec::new(),
         candidate_hooks: Vec::new(),
@@ -894,6 +895,7 @@ fn matching_lock_reuses_digest_but_invalidated_lock_recomputes_it() {
             config_digest: source.config_digest(),
             r#ref: None,
             instance: None,
+            build: None,
         }],
         trusted_hooks: Vec::new(),
         candidate_hooks: Vec::new(),
@@ -966,6 +968,7 @@ fn non_matching_lock_triggers_fetch() {
             config_digest: "blake3:stale".to_owned(),
             r#ref: None,
             instance: None,
+            build: None,
         }],
         trusted_hooks: Vec::new(),
         candidate_hooks: Vec::new(),
@@ -1077,6 +1080,7 @@ fn frozen_reuses_matching_lock_without_touching_network() {
             config_digest: source.config_digest(),
             r#ref: None,
             instance: None,
+            build: None,
         }],
         trusted_hooks: Vec::new(),
         candidate_hooks: Vec::new(),
@@ -1127,6 +1131,7 @@ fn frozen_errors_on_drifted_lock_entry() {
             config_digest: "blake3:stale".to_owned(),
             r#ref: None,
             instance: None,
+            build: None,
         }],
         trusted_hooks: Vec::new(),
         candidate_hooks: Vec::new(),
@@ -1173,6 +1178,7 @@ fn non_frozen_reresolves_drifted_lock_entry() {
             config_digest: "blake3:stale".to_owned(),
             r#ref: None,
             instance: None,
+            build: None,
         }],
         trusted_hooks: Vec::new(),
         candidate_hooks: Vec::new(),
@@ -1227,6 +1233,7 @@ fn force_keeps_the_locked_commit_when_upstream_moves() {
             config_digest: source.config_digest(),
             r#ref: None,
             instance: None,
+            build: None,
         }],
         trusted_hooks: Vec::new(),
         candidate_hooks: Vec::new(),
@@ -3479,7 +3486,6 @@ fn second_deploy_over_correct_link_is_a_noop() {
 
     let si = input(&cfg, None, None, None, false);
     let ctx = DeployAll {
-        target_scope: &prepare::TargetScope::All,
         config: &cfg,
         parsed: &parsed,
         remotes: &remotes,
@@ -6911,6 +6917,7 @@ fn link_lock(source: &str, link_git: &Path) -> Lock {
             config_digest: "blake3:link".to_owned(),
             r#ref: None,
             instance: None,
+            build: None,
         }],
         trusted_hooks: Vec::new(),
         candidate_hooks: Vec::new(),
@@ -10135,6 +10142,7 @@ fn lock_with(cfg: &Config, name: &str, git: &str, commit: &str) -> Lock {
             config_digest: source.config_digest(),
             r#ref: None,
             instance: None,
+            build: None,
         }],
         trusted_hooks: Vec::new(),
         candidate_hooks: Vec::new(),
@@ -10802,6 +10810,7 @@ fn build_preview_fixture() -> PreviewFixture {
                 config_digest: parsed_of(&cfg, "editor-src").config_digest(),
                 r#ref: None,
                 instance: None,
+                build: None,
             },
             LockedSource {
                 name: "lint-src".to_owned(),
@@ -10812,6 +10821,7 @@ fn build_preview_fixture() -> PreviewFixture {
                 config_digest: parsed_of(&cfg, "lint-src").config_digest(),
                 r#ref: None,
                 instance: None,
+                build: None,
             },
         ],
         trusted_hooks: Vec::new(),
@@ -11425,6 +11435,7 @@ fn render_preview_tree_warns_about_a_predicted_collision_naming_both_sources() {
                 config_digest: parsed_of(&cfg, "src-a").config_digest(),
                 r#ref: None,
                 instance: None,
+                build: None,
             },
             LockedSource {
                 name: "src-b".to_owned(),
@@ -11435,6 +11446,7 @@ fn render_preview_tree_warns_about_a_predicted_collision_naming_both_sources() {
                 config_digest: parsed_of(&cfg, "src-b").config_digest(),
                 r#ref: None,
                 instance: None,
+                build: None,
             },
         ],
         trusted_hooks: Vec::new(),
@@ -16197,7 +16209,6 @@ fn observe_workspace_full_registry_scan_follows_prune_policy() {
         let mut si = input(&cfg, None, None, None, false);
         si.prune = prune;
         let ctx = DeployAll {
-            target_scope: &prepare::TargetScope::All,
             config: &cfg,
             parsed: &parsed,
             remotes: &remotes,
@@ -16283,7 +16294,6 @@ fn observe_workspace_rejects_duplicate_triplet() {
 
     let si = input(&cfg, None, None, None, false);
     let ctx = DeployAll {
-        target_scope: &prepare::TargetScope::All,
         config: &cfg,
         parsed: &parsed,
         remotes: &remotes,

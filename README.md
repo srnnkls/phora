@@ -295,8 +295,8 @@ Non-interactive runs skip such files unless `--force` is given.
 
 `phora -C <directory> <command>` (or `--directory`) selects a project before
 loading configuration or state. Both `phora.toml` and `phora.local.toml`, relative
-source/target paths, locks, and hooks use that directory. Use `phase = "prepare"` and `post_prepare` when a generator needs inputs
-from the same project (see below).
+source/target paths, locks, and hooks use that directory. A generator that needs pinned inputs
+is a `build` source (see below), not a hook.
 
 The global `[hooks] pre_sync` runs before sources are resolved or files selected,
 so it can generate local source directories for the same sync. A failure stops
@@ -1023,81 +1023,39 @@ path = "~/projects/tropos"
 deploy = "link"
 ```
 
-### Prepare inputs before generating deployment sources
+### Build sources
 
-A target with `phase = "prepare"` materializes its inputs before the consumer's
-`post_prepare` hook. Imported targets inherit their consumer's phase, including
-nested dependencies. The default phase is `"deploy"`.
-
-One root config pair can stage Tropos and its transitive Loqui dependency, run
-Henia, and deploy generated skills. In `phora.toml`:
+A `build` source runs a command over pinned inputs and deploys the committed
+output. One root config pair can compile Tropos and its transitive Loqui
+dependency with Henia. In `phora.toml`:
 
 ```toml
-[hooks]
-post_prepare = "henia --config .phora-inputs/tropos/henia.toml build .phora-inputs/tropos --output .henia"
-post_sync = "scrut test tests/scrut/artifacts.md"
-
 [sources.tropos]
 path = "~/projects/tropos"
-branch = "prototype/henia-phora"
+branch = "main"
 transitive = true
 
-[sources.claude]
-path = "./.henia/claude"
-deploy = "link"
-
-[sources.codex]
-path = "./.henia/codex"
-deploy = "link"
-```
-
-Machine-local destinations belong in the adjacent `phora.local.toml`. This
-example deliberately uses a repository-local home:
-
-```toml
-[targets.tropos]
-phase = "prepare"
-path = ".phora-inputs/tropos"
-imports = ["tropos"]
+[sources.henia]
+build = { inputs = ["tropos"], run = "henia build $PHORA_INPUT/tropos --output $PHORA_OUTPUT", key = "henia --version" }
 
 [targets.claude]
 path = ".probe/home/.claude"
-sources.claude = { collapse = false }
-
-[targets.codex]
-path = ".probe/home/.codex"
-sources.codex = { collapse = false }
+sources.henia = { take = [{ "claude/" = "." }], collapse = false }
 ```
 
-`phora sync` runs `pre_sync`, composes package manifests, prepares input targets,
-runs `post_prepare`, then resolves and deploys the remaining sources and runs
-`post_sync`. Generated directories can be absent on the first run. Each phase
-uses the existing reconciliation, ownership, recovery, and target-hook rules;
-preparation does not prune deployment records. The two phases must have separate
-destination trees, including through symlink aliases.
+Each input deploys into `$PHORA_INPUT/<name>`, with its offer applied and a
+transitive input's dependencies composed. The command writes into an empty
+`$PHORA_OUTPUT`; on exit 0 phora commits the output into its cache, and the
+source locks, deploys, verifies and prunes like any copy source. `run`, `shell`
+and `cmd` take the hook command forms; `key` is a command whose stdout joins the
+build key.
 
-A preparation failure or skipped input stops before `post_prepare`. A failing
-`post_prepare` command stops the remaining commands and the deployment phase.
-Already prepared files and their new pins remain available for retry; unvisited
-deployment pins are retained. Hooks execute arbitrary commands, so their side
-effects are not rolled back. Keep canonical inputs outside a compiler's clean
-output directory, and have the compiler publish output only after a successful
-build. `post_prepare` runs once per sync, regardless of `hooks.when`, with
-`PHORA_TARGETS` listing the consumer targets. `--no-hooks` suppresses it along
-with all other hooks; a frozen replay with that flag needs generated output to
-already exist.
-
-Ordinary `phora sync --prune` uses the current pins. To advance Tropos and remove
-both dropped inputs and obsolete generated links in one run, use
-`phora update tropos --fast-forward --prune`. Pruning remains opt-in and preserves
-foreign files. Compilation stays in a normal hook; no nested Phora invocation,
-wrapper, or source-specific build API is needed.
-
-A fresh deployment can start from existing pins without a cache, registry, prepared
-inputs or generated output. Ordinary `phora sync` fetches missing mirrors at the
-locked commits and rebuilds the trees, keeping Tropos and transitive dependency
-pins unchanged. `--frozen` remains offline and fails when a required mirror is
-missing.
+The build key hashes the command, the `key` output, and every materialized input
+file. A sync reruns the command only when the key differs from the lock; `phora
+update <source>` forces a rerun. A failed rerun keeps the previous output
+deployed and exits 1; a first build that fails stops the sync. `--frozen` never
+runs a build. Builds come only from your own config, never from a dependency's
+`phora.toml`.
 
 ### How composition works
 

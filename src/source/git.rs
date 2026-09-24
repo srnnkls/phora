@@ -584,10 +584,12 @@ impl SourceStore for GitBackend {
                 ));
                 Ok(resolved)
             }
-            SourceLocation::Url { .. } => Err(SourceError::Source(format!(
-                "url source {} requires the url source adapter",
-                request.name
-            ))),
+            SourceLocation::Url { .. } | SourceLocation::Build { .. } => {
+                Err(SourceError::Source(format!(
+                    "url source {} requires the url source adapter",
+                    request.name
+                )))
+            }
         }
     }
 

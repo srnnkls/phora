@@ -3,7 +3,7 @@
 //! parsing each dep manifest, and produce a namespaced composition graph. A failure
 //! at any depth fails the sync fail-fast, before any lock write.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::config::transitive::{FetchNode, Instance, TransitiveManifest};
@@ -95,38 +95,11 @@ pub(crate) struct ResolvedGraph {
     /// a transitive node is keyed by its instance, not a bare name that never lines up.
     pub(super) instances: BTreeMap<String, String>,
     pub(super) import_refs: Vec<ImportResolution>,
-    pub(super) prepare_sources: BTreeSet<String>,
     pub(super) hook_candidates: Vec<TransitiveHookCandidate>,
     pub(super) hook_diagnostics: Vec<HookAdmissionDiagnostic>,
 }
 
 impl ResolvedGraph {
-    /// The consumer chooses the phase of the entire imported subtree, including its pins.
-    fn inherit_phase(
-        &mut self,
-        anchor: &Target,
-        imported: &str,
-        targets_before: usize,
-        refs_before: usize,
-        sources_before: &BTreeSet<String>,
-    ) {
-        for reference in &mut self.import_refs[refs_before..] {
-            reference.phase = anchor.phase();
-        }
-        for target in &mut self.targets[targets_before..] {
-            target.target.phase = anchor.phase;
-        }
-        if anchor.phase() == crate::config::TargetPhase::Prepare {
-            self.prepare_sources.insert(imported.to_owned());
-            self.prepare_sources.extend(
-                self.sources
-                    .keys()
-                    .filter(|name| !sources_before.contains(*name))
-                    .cloned(),
-            );
-        }
-    }
-
     /// Dep-repo-relative files the named composed target binds, read offline at each binding's own locked commit; `Err` when the target or a commit is unknown.
     pub(crate) fn composed_files(
         &self,
@@ -170,6 +143,10 @@ impl ResolvedGraph {
                 },
                 SourceMode::Url => SourceLocation::Url {
                     url: remote.clone(),
+                },
+                SourceMode::Build => SourceLocation::Build {
+                    output: None,
+                    follow_symlinks: false,
                 },
             };
             let resolved = store.resolve(
@@ -261,7 +238,6 @@ pub(super) fn resolve_transitive_graph(
 
     for (anchor_name, anchor) in &config.targets {
         for import in anchor.imports.iter().flatten() {
-            let refs_before = graph.import_refs.len();
             let imported = import.source.as_str();
             let source = parsed.get(imported).ok_or_else(|| {
                 Error::Config(format!("no resolved source for imported `{imported}`"))
@@ -287,7 +263,6 @@ pub(super) fn resolve_transitive_graph(
             };
             graph.import_refs.push(ImportResolution {
                 source: imported.to_owned(),
-                phase: anchor.phase(),
                 refspec: source.refspec(),
                 commit: matches!(package, PackageSnapshot::Mirror(_)).then(|| commit.clone()),
             });
@@ -301,8 +276,6 @@ pub(super) fn resolve_transitive_graph(
                 &manifest,
             );
             visited.insert(instance.fetch_node().clone());
-            let targets_before = graph.targets.len();
-            let sources_before: BTreeSet<_> = graph.sources.keys().cloned().collect();
             compose_dep(
                 &instance,
                 anchor,
@@ -322,13 +295,6 @@ pub(super) fn resolve_transitive_graph(
                 },
                 1,
             )?;
-            graph.inherit_phase(
-                anchor,
-                imported,
-                targets_before,
-                refs_before,
-                &sources_before,
-            );
         }
     }
 
@@ -624,7 +590,6 @@ fn namespace_dep_sources(
         {
             ctx.graph.import_refs.push(ImportResolution {
                 source: namespaced.clone(),
-                phase: crate::config::TargetPhase::default(),
                 refspec: import.resolve(&parsed)?.refspec(),
                 commit: None,
             });
@@ -708,7 +673,6 @@ fn compose_nested_imports(
             imports: None,
             take: None,
             collapse: None,
-            phase: None,
             confine: None,
         };
         ctx.ancestors.push(inner_node);
@@ -1212,6 +1176,7 @@ mod tests {
             config_digest: "blake3:cfg".to_owned(),
             r#ref: None,
             instance: instance.map(str::to_owned),
+            build: None,
         }
     }
 

@@ -177,20 +177,10 @@ impl Import {
     }
 }
 
-/// When a target is materialized within one sync.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TargetPhase {
-    Prepare,
-    #[default]
-    Deploy,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Target {
     pub path: PathBuf,
-    pub phase: Option<TargetPhase>,
     #[serde(default, deserialize_with = "deserialize_bindings")]
     pub sources: Option<BTreeMap<String, Binding>>,
     pub layout: Option<LayoutConfig>,
@@ -421,9 +411,6 @@ impl Target {
     #[must_use]
     pub(super) fn merged_with(mut self, local: Target) -> Target {
         self.path = local.path;
-        if local.phase.is_some() {
-            self.phase = local.phase;
-        }
         if local.sources.is_some() {
             self.sources = local.sources;
         }
@@ -444,11 +431,6 @@ impl Target {
             self.collapse = local.collapse;
         }
         self
-    }
-
-    #[must_use]
-    pub fn phase(&self) -> TargetPhase {
-        self.phase.unwrap_or_default()
     }
 
     #[must_use]

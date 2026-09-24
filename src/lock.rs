@@ -82,7 +82,13 @@ pub struct LockedSource {
     /// Owning `Instance.stable_key()` for a transitive node; `None` for a consumer root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance: Option<String>,
+    /// Build key of a `build` source: its command plus the materialized inputs it ran over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
 }
+
+/// The `resolved` value of a build source's entry.
+pub const BUILD_RESOLVED: &str = "build";
 
 /// Kind-tagged so `Branch("x")` and `Tag("x")` never collide.
 #[must_use]
@@ -157,6 +163,10 @@ pub fn entry_matches(
             && source.config_digest() == locked.config_digest;
     }
 
+    if source.mode() == SourceMode::Build {
+        return locked.resolved == BUILD_RESOLVED && source.config_digest() == locked.config_digest;
+    }
+
     let Ok(resolved) = source.resolved_remote(hosts, protocol) else {
         return false;
     };
@@ -224,6 +234,7 @@ mod tests {
             config_digest: "blake3:cfg".to_owned(),
             r#ref: None,
             instance: None,
+            build: None,
         }
     }
 
@@ -383,6 +394,7 @@ mod tests {
             config_digest: source.config_digest(),
             r#ref: None,
             instance: None,
+            build: None,
         };
 
         assert!(
@@ -404,6 +416,7 @@ mod tests {
             config_digest: source.config_digest(),
             r#ref: None,
             instance: None,
+            build: None,
         };
 
         assert!(
@@ -425,6 +438,7 @@ mod tests {
             config_digest: source.config_digest(),
             r#ref: None,
             instance: None,
+            build: None,
         };
 
         assert!(
@@ -450,6 +464,7 @@ mod tests {
             config_digest: other.config_digest(),
             r#ref: None,
             instance: None,
+            build: None,
         };
 
         assert_ne!(
@@ -477,6 +492,7 @@ mod tests {
             config_digest: source.config_digest(),
             r#ref: None,
             instance: None,
+            build: None,
         };
 
         assert!(
@@ -499,6 +515,7 @@ mod tests {
             config_digest: source.config_digest(),
             r#ref: None,
             instance: None,
+            build: None,
         };
 
         assert!(
@@ -530,6 +547,7 @@ mod tests {
             config_digest: source.config_digest(),
             r#ref: None,
             instance: None,
+            build: None,
         };
 
         assert_ne!(
@@ -562,6 +580,7 @@ mod tests {
             config_digest: source.config_digest(),
             r#ref: None,
             instance: None,
+            build: None,
         };
 
         assert!(
@@ -583,6 +602,7 @@ mod tests {
             config_digest: source.config_digest(),
             r#ref: None,
             instance: None,
+            build: None,
         };
 
         assert!(
@@ -609,6 +629,7 @@ mod tests {
             config_digest: source.config_digest(),
             r#ref: None,
             instance: None,
+            build: None,
         };
 
         assert!(
@@ -669,6 +690,7 @@ config_digest = \"PLACEHOLDER\"
             config_digest: other.config_digest(),
             r#ref: None,
             instance: None,
+            build: None,
         };
 
         assert_ne!(
@@ -708,6 +730,7 @@ config_digest = \"PLACEHOLDER\"
             config_digest: source.config_digest(),
             r#ref: None,
             instance: None,
+            build: None,
         };
 
         assert!(
@@ -730,6 +753,7 @@ config_digest = \"PLACEHOLDER\"
             config_digest: source.config_digest(),
             r#ref: None,
             instance: None,
+            build: None,
         };
 
         assert!(
@@ -751,6 +775,7 @@ config_digest = \"PLACEHOLDER\"
             config_digest: other.config_digest(),
             r#ref: None,
             instance: None,
+            build: None,
         };
 
         assert_ne!(
@@ -777,6 +802,7 @@ config_digest = \"PLACEHOLDER\"
             config_digest: source.config_digest(),
             r#ref: None,
             instance: None,
+            build: None,
         };
 
         assert!(
@@ -800,6 +826,7 @@ config_digest = \"PLACEHOLDER\"
             config_digest: source.config_digest(),
             r#ref: None,
             instance: None,
+            build: None,
         };
 
         assert!(
@@ -842,6 +869,7 @@ config_digest = \"PLACEHOLDER\"
                     config_digest: "blake3:cfg".to_owned(),
                     r#ref: Some("tag:v0.55.0".to_owned()),
                     instance: None,
+                    build: None,
                 },
                 LockedSource {
                     name: "fzf".to_owned(),
@@ -852,6 +880,7 @@ config_digest = \"PLACEHOLDER\"
                     config_digest: "blake3:cfg".to_owned(),
                     r#ref: Some("tag:v0.56.0".to_owned()),
                     instance: None,
+                    build: None,
                 },
             ],
             trusted_hooks: Vec::new(),
@@ -869,6 +898,7 @@ config_digest = \"PLACEHOLDER\"
                 config_digest: "blake3:cfg".to_owned(),
                 r#ref: Some("tag:v0.56.0".to_owned()),
                 instance: None,
+                build: None,
             }],
             trusted_hooks: Vec::new(),
             candidate_hooks: Vec::new(),

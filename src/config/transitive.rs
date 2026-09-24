@@ -52,6 +52,15 @@ impl TransitiveManifest {
         let document: toml::Value = toml::from_str(text)?;
         let hooks = collect_opaque_hooks(&document);
         let graph: ManifestGraph = document.try_into()?;
+        if let Some(name) = graph
+            .sources
+            .iter()
+            .find_map(|(n, s)| s.build.is_some().then_some(n))
+        {
+            return Err(<toml::de::Error as serde::de::Error>::custom(format!(
+                "dependency source `{name}` is a `build` source; builds run only from your own phora.toml"
+            )));
+        }
         Ok(Self {
             sources: graph.sources,
             targets: graph.targets,

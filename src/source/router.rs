@@ -24,7 +24,9 @@ impl<G, H> RouterBackend<G, H> {
 impl<G: SourceStore, H: SourceStore> SourceStore for RouterBackend<G, H> {
     fn resolve(&self, request: &ResolveRequest, policy: ResolvePolicy) -> Result<ResolvedSource> {
         match &request.location {
-            SourceLocation::Url { .. } => SourceStore::resolve(&self.http, request, policy),
+            SourceLocation::Url { .. } | SourceLocation::Build { .. } => {
+                SourceStore::resolve(&self.http, request, policy)
+            }
             SourceLocation::Git { .. } | SourceLocation::Worktree { .. } => {
                 SourceStore::resolve(&self.git, request, policy)
             }
@@ -328,7 +330,7 @@ mod tests {
                 .push(request.name.to_string());
             let url = match &request.location {
                 SourceLocation::Git { url } | SourceLocation::Url { url } => url,
-                SourceLocation::Worktree { .. } => {
+                SourceLocation::Worktree { .. } | SourceLocation::Build { .. } => {
                     unreachable!("router spy tests use Git and URL sources")
                 }
             };
@@ -337,7 +339,7 @@ mod tests {
             let identity = match request.location {
                 SourceLocation::Url { .. } => SourceIdentity::Url(normalized.clone()),
                 SourceLocation::Git { .. } => SourceIdentity::Git(normalized.clone()),
-                SourceLocation::Worktree { .. } => unreachable!(),
+                SourceLocation::Worktree { .. } | SourceLocation::Build { .. } => unreachable!(),
             };
             Ok(ResolvedSource {
                 name: request.name.clone(),

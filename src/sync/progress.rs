@@ -6,6 +6,7 @@ use super::request::{AppliedChange, SkippedChange, SyncWarning};
 /// A stage of the run, in pipeline order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
+    Build,
     Compose,
     Resolve,
     Project,
@@ -20,6 +21,7 @@ impl Phase {
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
+            Self::Build => "build",
             Self::Compose => "compose",
             Self::Resolve => "resolve",
             Self::Project => "project",

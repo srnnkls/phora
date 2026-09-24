@@ -18,7 +18,7 @@ mod worktree_deploy;
 #[cfg(test)]
 pub(crate) use cache::mirror_path;
 pub use git::GitBackend;
-pub use import::HttpBackend;
+pub use import::{BUILD_MIRROR, HttpBackend};
 pub use model::{
     Commit, KernelError, SourceEntryKind, SourceEntryMeta, SourceInventory, SourceName, SourcePath,
 };

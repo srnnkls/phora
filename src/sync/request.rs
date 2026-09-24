@@ -229,6 +229,11 @@ pub enum SyncWarning {
         attributes: bool,
         autocrlf: bool,
     },
+    /// A rebuild failed; the source keeps deploying its previous output.
+    BuildFailed {
+        source: String,
+        detail: String,
+    },
 }
 
 /// Overall synchronization outcome used by callers to choose an exit code.

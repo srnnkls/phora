@@ -77,6 +77,33 @@ impl HttpBackend {
         Ok(())
     }
 
+    fn import_build(
+        &self,
+        request: &ResolveRequest,
+        output: &Path,
+        follow_symlinks: bool,
+    ) -> Result<ResolvedSource> {
+        let entries = super::worktree::capture_entries(output, None, follow_symlinks)?;
+        if entries.is_empty() {
+            return Err(SourceError::Source(format!(
+                "build source {} produced no files",
+                request.name
+            )));
+        }
+        std::fs::create_dir_all(&self.git_dir).map_err(|e| {
+            SourceError::Source(format!("source {}: create git dir: {e}", request.name))
+        })?;
+        let commit = {
+            let _lock = lock_mirror(&self.git_dir, &request.name, BUILD_MIRROR)?;
+            import_tree(&self.git_dir, BUILD_MIRROR, &entries)?
+        };
+        let pinned = ResolveRequest {
+            revision: RevisionSpec::Commit(commit_from_hex(&commit)?),
+            ..request.clone()
+        };
+        self.resolve(&pinned, ResolvePolicy::CachedOnly)
+    }
+
     fn imported_commit(
         &self,
         source: &SourceName,
@@ -110,18 +137,38 @@ impl HttpBackend {
 
 impl SourceStore for HttpBackend {
     fn resolve(&self, request: &ResolveRequest, policy: ResolvePolicy) -> Result<ResolvedSource> {
-        let SourceLocation::Url { url } = &request.location else {
-            return Err(SourceError::Source(format!(
-                "source {} requires the git/worktree source adapter",
-                request.name
-            )));
+        let url = match &request.location {
+            SourceLocation::Url { url } => {
+                if policy == ResolvePolicy::Refresh {
+                    self.refresh_import(&request.name, url)?;
+                }
+                url.as_str()
+            }
+            SourceLocation::Build {
+                output,
+                follow_symlinks,
+            } => {
+                if policy == ResolvePolicy::Refresh {
+                    let output = output.as_deref().ok_or_else(|| {
+                        SourceError::Source(format!(
+                            "build source {} has no output to import",
+                            request.name
+                        ))
+                    })?;
+                    return self.import_build(request, output, *follow_symlinks);
+                }
+                BUILD_MIRROR
+            }
+            SourceLocation::Git { .. } | SourceLocation::Worktree { .. } => {
+                return Err(SourceError::Source(format!(
+                    "source {} requires the git/worktree source adapter",
+                    request.name
+                )));
+            }
         };
-        if policy == ResolvePolicy::Refresh {
-            self.refresh_import(&request.name, url)?;
-        }
-        let commit = self.imported_commit(&request.name, url, &request.revision)?;
-        let authored_at = self.git.authored_at(&request.name, url, &commit)?;
-        let commit = commit_from_hex(&commit)?;
+        let commit =
+            commit_from_hex(&self.imported_commit(&request.name, url, &request.revision)?)?;
+        let authored_at = self.git.authored_at(&request.name, url, commit.as_str())?;
         let normalized = NormalizedUrl::parse(url);
         Ok(ResolvedSource {
             name: request.name.clone(),
@@ -155,6 +202,10 @@ impl SourceStore for HttpBackend {
         SourceStore::list_directory(&self.git, snapshot, path)
     }
 }
+
+/// The one mirror every build output imports into. Commits are content-addressed and always
+/// read by pinned id, so builds from any project share it safely.
+pub const BUILD_MIRROR: &str = "phora-build://outputs";
 
 // Fixed identity/time/message: with no parents and git-sorted trees the commit id is a
 // function of the imported content only — identical entries yield an identical commit id.

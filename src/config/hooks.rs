@@ -174,9 +174,6 @@ pub struct GlobalHooks {
     /// Lifecycle gate: runs once before source resolution; failure aborts the sync.
     #[serde(default, deserialize_with = "deserialize_commands")]
     pub pre_sync: Option<Vec<HookCommand>>,
-    /// Runs after prepare targets and before resolving deployment sources. Failure stops deployment.
-    #[serde(default, deserialize_with = "deserialize_commands")]
-    pub post_prepare: Option<Vec<HookCommand>>,
     #[serde(default, deserialize_with = "deserialize_commands")]
     pub post_sync: Option<Vec<HookCommand>>,
     #[serde(default)]
@@ -231,7 +228,7 @@ impl<'de> Deserialize<'de> for HookCommand {
     }
 }
 
-fn validated_command<E: serde::de::Error>(
+pub(super) fn validated_command<E: serde::de::Error>(
     run: Option<String>,
     shell: Option<String>,
     cmd: Option<Vec<String>>,

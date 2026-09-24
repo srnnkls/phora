@@ -255,6 +255,10 @@ fn preview_copy(
         SourceMode::Url => SourceLocation::Url {
             url: git.to_owned(),
         },
+        SourceMode::Build => SourceLocation::Build {
+            output: None,
+            follow_symlinks: false,
+        },
     };
     let Ok(commit) = locked.commit.parse::<Commit>() else {
         entries.push(annotation(ctx, &locked.commit, SyncState::NeedsSync));
