@@ -170,5 +170,30 @@ mise run build              # cargo build
 
 The scrut suites run the shipped binary end to end, and
 [tests/scrut/showcase.md](tests/scrut/showcase.md) walks through a full session.
-[docs/architecture.md](docs/architecture.md) describes the internals, and
-[docs/RELEASING.md](docs/RELEASING.md) the release process.
+[docs/architecture.md](docs/architecture.md) is the design document, with its decisions and
+invariants, and [docs/RELEASING.md](docs/RELEASING.md) describes the release process.
+
+Where the code lives:
+
+- `src/cli/`: argument parsing, command dispatch, config editing, rendering, progress and JSON
+  sinks, trust prompts, exit codes.
+- `src/config/`: `phora.toml` DTOs and their parsed forms.
+- `src/projection/`: offer selection, take resolution, collapse, projection building and
+  diagnostics.
+- `src/source/`: the `SourceStore` trait, which `RouterBackend` implements by routing URL sources
+  to `HttpBackend` and git and working-tree sources to `GitBackend`; git fetch (filtered fetches
+  drive gix-protocol directly in `fetch.rs`), URL download and import, working-tree capture,
+  history overlay administration and framed hashing.
+- `src/sync/`: the pipeline, resolution, composition, preparation, observation, reconciliation,
+  staging, applying, journal and recovery, prune, hooks, and persistent state under `state/`.
+- `src/lock.rs`, `src/paths.rs`, `src/digest.rs`, `src/diagnostic.rs`, `src/error.rs`: lock
+  files, cache and state roots, URL integrity digests, selection diagnostics, the error type.
+- `scripts/arch-check.sh`: the import and I/O lint.
+
+The `trace` cargo feature prints timing spans for the fetch and resolve path to stderr:
+
+```sh
+cargo build --release --features trace
+RUST_LOG=phora=info target/release/phora sync     # phora's fetch and resolve spans
+RUST_LOG=trace target/release/phora sync          # also gix's detail spans
+```
