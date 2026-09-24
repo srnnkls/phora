@@ -422,6 +422,9 @@ phora eject <ARTIFACT> --source <SOURCE> --target <TARGET>
 
 Both flags are required. `--source` takes the [binding](#bindings) identity.
 
+Ejecting a [history](#history) deployment turns it into a standalone clone, detached at the pin
+with `origin` set to the upstream. `phora uneject` refuses while that clone's `.git` is there.
+
 ```sh
 phora eject nvim/init.lua --source nvim --target neovim
 ```
