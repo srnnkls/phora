@@ -1,7 +1,7 @@
 # The phora guide
 
 Every flag and config key is listed in [REFERENCE.md](REFERENCE.md); the mechanisms behind a sync are in
-[docs/architecture.md](docs/architecture.md).
+[Under the hood](#under-the-hood).
 
 ## Contents
 
@@ -21,7 +21,7 @@ Every flag and config key is listed in [REFERENCE.md](REFERENCE.md); the mechani
 - [History overlay](#history-overlay)
 - [Preparing inputs](#preparing-inputs)
 - [Transitive dependencies](#transitive-dependencies)
-- [What phora keeps on disk](#what-phora-keeps-on-disk)
+- [Under the hood](#under-the-hood)
 - [When something looks wrong](#when-something-looks-wrong)
 - [Where to look next](#where-to-look-next)
 
@@ -1102,7 +1102,9 @@ nothing to pin.
 There it confirms that the workspace matches the lock, and fails if it would have
 to change anything. Another running phora still makes it exit with status `75`.
 
-## What phora keeps on disk
+## Under the hood
+
+### What phora keeps on disk
 
 phora writes four things:
 
@@ -1117,11 +1119,518 @@ phora writes four things:
 
 Both directories follow the XDG conventions and can be moved with `[paths]` or
 environment variables. [Files and state](REFERENCE.md#files-and-state) lists the
-locations, and [docs/architecture.md](docs/architecture.md) explains how staging,
-locking and crash recovery work.
+locations.
 
 Two phora runs in one project never write at once: the second exits with status
 `75`. An interrupted sync is finished or rolled back by the next run.
+
+### Cache and state
+
+phora keeps two trees. The *cache root* holds regenerable git mirrors. The
+*state root* holds per-project records that can't be regenerated.
+
+The cache root contains `git/`:
+
+```
+<cache>/git/
+  <mirror-key>.git/                  bare mirror
+  <mirror-key>.git.lock              per-mirror flock
+  .<mirror-key>.staging-<pid>-<n>/   clone or import in progress
+  .phora-download-<pid>-<n>.tmp      URL download in progress
+```
+
+The state root contains one directory per project:
+
+```
+<state>/projects/<project-id>/
+  locks/state.lock                                  per-project lock
+  locks/journal.toml                                deploy journal
+  targets/<target>/meta.toml                        ejections, hook state
+  targets/<target>/artifacts/<identity>/<artifact>.toml   registry record
+```
+
+The record path uses the binding *identity*, so two bindings of one source in
+the same target keep separate records.
+
+One mirror serves every source that names the same remote. phora maps
+equivalent spellings of a remote to one string:
+
+1. Trim whitespace and a trailing `/`.
+2. Rewrite scp-style `git@host:owner/repo` to `host/owner/repo`.
+3. Otherwise drop the scheme and any `user@` prefix.
+4. Strip a trailing `.git`.
+5. Lowercase the host.
+
+The mirror key is the first 16 hex characters of the BLAKE3 hash of that
+string. HTTPS and SSH spellings of one repository share a mirror.
+
+The project id is the first 16 hex characters of the BLAKE3 hash of the
+canonicalized project root. A symlinked checkout and its target resolve to the
+same id and share records. Two clones at different paths get different ids.
+
+### Mirrors
+
+A mirror is a bare repository. Resolving a ref looks up a commit id, and reading
+a file walks tree objects and reads the blob from the object database. Nothing
+is checked out for copy-mode deployment. Two bindings at different refs of one
+source are two commit ids in one mirror, sharing every unchanged object.
+
+A mirror is either sliced or full:
+
+- A sliced mirror holds depth-1 slices of the revisions its bindings pin
+  (branch, tag, default `HEAD` or commit id), merged into one bare repository.
+  Its fetches carry the `blob:none` filter, so it holds commits and trees but no
+  file contents until something reads them. A `phora-sliced` file in the mirror
+  marks it.
+- A full mirror holds every head and tag with full history. Only a
+  `history = true` binding makes a mirror full, and a full mirror is never
+  narrowed again. A mirror without the marker, including every cache created
+  before slicing existed, is full.
+
+Selection runs on trees, so phora can list what a sliced mirror offers without
+any blobs.
+
+Two exceptions add files outside the object database. A history binding creates
+linked-worktree administration inside the mirror and a gitlink in the target
+(see [How a history overlay is built](#how-a-history-overlay-is-built)). A
+mirror that serves history bindings also carries `refs/phora/worktrees/*` pins.
+
+### Fetching a repository
+
+Before resolving, phora plans one fetch per mirror, with every revision the
+mirror's bindings pin and whether any of them sets `history`. One fetch then
+serves every source on that mirror.
+
+Refreshing a mirror runs under the mirror's flock:
+
+1. Remove `.<mirror-key>.staging-*` directories whose newest mtime is more than
+   an hour old. A younger one may belong to a running clone.
+2. Pick the fetch. A planned history binding asks for a full mirror. Otherwise
+   the fetch is a slice of the planned revisions plus the requested one.
+3. If the mirror opens and is sliced, and a slice is wanted: skip the fetch when
+   the mirror already holds the revision, else fetch the slice at depth 1 with
+   `blob:none`.
+4. If the mirror opens and is full: detach the `HEAD` of every managed linked
+   worktree (`worktrees/ph-*`), then fetch with the refspecs
+   `+refs/heads/*:refs/heads/*` and `+refs/tags/*:refs/tags/*`.
+5. If the fetch reports a rejected ref update, return the error. The mirror
+   stays as it is.
+6. If the mirror is missing, is not a repository, or the fetch fails for any
+   other reason, re-clone. A sliced mirror that now needs history takes this
+   path: its commits would be advertised as already present, and the server
+   would skip blobs it never sent, so it is re-cloned whole.
+
+A sliced clone initializes a bare repository, saves an `origin` remote, writes
+the marker file, and runs one filtered fetch. A full clone is a bare clone with
+the mirror refspecs. Either way the new mirror is built in a staging directory.
+Before the swap, a re-clone carries over every managed worktree whose pin commit
+exists in the new clone: the `worktrees/ph-<id>/` administration directory and
+its `refs/phora/worktrees/<id>` pin. Then it removes the old mirror and renames
+the staging directory into place. A failed clone leaves the old mirror
+untouched. An open failure other than "not a repository" is an error and doesn't
+trigger a re-clone, because it may be transient.
+
+The filtered fetch keeps its connection open for the blob fetch that follows.
+Blobs arrive in two ways:
+
+- After resolving a source, whether it fetched or reused its lock entry, phora
+  fetches the missing blobs of the selected files in one request that names the
+  object ids and sends no haves, over the connection the tree fetch left open.
+- Any other read of a missing blob (a dependency's `phora.toml`,
+  `.gitattributes`, `phora trust --show`) fetches that one blob by id.
+  `phora trust` diffs fetch a trusted commit the mirror lacks the same way.
+
+Resolution is a local lookup. A `branch` peels `refs/heads/<name>`, a `tag`
+peels `refs/tags/<name>`, a `rev` is parsed as a 40- or 64-hex object id, and a
+source with no ref takes the mirror's `HEAD`.
+
+A history binding over a sliced mirror can't use the cached snapshot. On a lock
+hit, sync refreshes that mirror anyway. Under `--frozen`, which never fetches,
+the run fails instead of deploying a truncated history.
+
+### Importing a download
+
+A URL source is imported in four steps:
+
+1. Download into `<cache>/git/.phora-download-<pid>-<n>.tmp`. phora follows
+   redirects itself, up to 10. A redirect may go to `https`, or to `http` only
+   when the original URL was `http`. Connecting times out after 30 seconds and
+   reading the body after 5 minutes. A non-2xx status is an error. The temporary
+   file is removed on every exit path.
+2. Verify. When the source declares a `digest`, hash the downloaded bytes with
+   its algorithm (`sha256` or `blake3`) and compare. A mismatch stops here.
+3. Extract in memory. The format is detected from the bytes: gzip-compressed
+   tar, tar, zip, or a single raw file named after the URL. Each entry path must
+   be relative, contain no `..`, backslash or NUL, and not start with a drive
+   letter. Extraction stops once the decompressed total passes 1 GiB. A single
+   common top-level directory is stripped.
+4. Take the mirror's flock and import the entries as git objects. Colliding
+   entries, or a file where a directory is expected, are rejected.
+   `refs/heads/phora` points at the new commit.
+
+The flock is taken only for step 4, so two runs downloading the same archive
+overlap on the slow part.
+
+The import is deterministic. The commit has a fixed author and committer
+(`phora <phora@localhost>`), the time 1 second after the epoch, the message
+`phora synthetic import`, and no parents. Tree entries are sorted in git order
+before writing. The commit id therefore depends only on file paths, modes and
+contents. Re-importing unchanged bytes produces the same id and leaves the lock
+unchanged.
+
+A URL source resolves to `refs/heads/phora`, or to a pinned commit. Asking it
+for a branch, tag or default ref is an error.
+
+### Capturing a working tree
+
+A `deploy = "link"` source is captured before it resolves. phora walks the
+canonical working-tree root, skipping a cache directory inside it, and imports
+the files into a mirror keyed by the root path, using the same import as URL
+sources. The resulting commit id identifies the capture. Projection and
+copy-mode reads use that frozen tree. Link artifacts point at the live files.
+
+### The sync pipeline
+
+A sync runs these steps. Each step's progress phase, where it has one, is in
+parentheses.
+
+1. Merge `phora.toml` with `phora.local.toml` and validate.
+2. Run the `pre_sync` hooks. If one fails, the run ends here.
+3. Compose transitive dependencies into the config (compose).
+4. If any target has `phase = "prepare"` or `post_prepare` is set, split the run
+   (see [Preparation](#preparation)). Otherwise run the workspace pass once over
+   every target.
+
+A *workspace pass* runs:
+
+1. Open the journal and run the recovery sweep.
+2. Resolve every source (resolve).
+3. Project every target (project), check the sealed offer, and plan
+   `--fast-forward` drops.
+4. With `--prune`, sweep stale history-overlay administration.
+5. Observe the disk and reconcile it against the projection (observe). Resolve
+   conflicts by prompt or policy.
+6. Run each target's `pre_deploy` hooks. A failure under
+   `pre_deploy_on_fail = "abort"` ends the run; under `"skip"` it skips that
+   target.
+7. If any `pre_deploy` hook ran, observe and reconcile again (observe). Earlier
+   conflict answers are reused.
+8. Apply fast-forward drops, then deploy each target's changes (apply).
+9. If nothing failed, apply the reconciled removals (prune). With `--prune`,
+   these include records the projection no longer produces.
+10. Run hooks (hooks): each target's `on_change`, then the global `post_sync`,
+    then trusted transitive `on_change` hooks.
+
+Under `--frozen` on a read-only state root the run holds no lock. If observation
+finds anything to write, including a stat refresh, the run stops with an error
+naming the state root.
+
+### Preparation
+
+[Prepare-phase targets](#preparing-inputs) split one run into two passes that
+share the registry and journal:
+
+1. Partition targets by `phase`. Each pass resolves the sources its own targets
+   bind. A deploy target whose path lies inside a prepare target is rejected. A
+   deploy target above a prepare target is projected first, and rejected if any
+   artifact lands inside the prepare tree.
+2. Run the workspace pass over the prepare targets, with the global `[hooks]`
+   removed.
+3. If that pass skipped or ejected anything, or failed, the run fails. Lock
+   entries resolved so far are merged into the previous lock.
+4. Run `post_prepare` hooks in order, stopping at the first failure. A failure
+   fails the run.
+5. Rebuild the prepare roots from the current config, so symlinks a generator
+   created are seen, and run the workspace pass over the deploy targets. Sources
+   resolve against the lock that the prepare pass produced.
+
+### Resolution and the lock
+
+phora turns the config into resolution units. A unit is one pair of source and
+effective ref. Units group by mirror key. Groups resolve in parallel; units
+inside a group resolve one after another, so a shared remote is fetched once. A
+git unit fetches only if no earlier unit in its group already did. A URL unit
+always downloads when it has no lock hit, because each source verifies its own
+digest.
+
+The number of parallel workers is `--jobs` when given, else
+`min(units, max(50, 2 × cores))`. The ceiling is at least 50 because fetching
+waits on the network. `--jobs 0` is rejected.
+
+Composition, staging and applying run on the main thread. Only resolution is
+parallel.
+
+`phora.lock` holds one entry per unit. An entry records:
+
+- `name`, `git` (the remote or URL), `resolved` (the effective ref, or `url`, or
+  `link`), `commit`;
+- `digest`: the BLAKE3 framed digest of the source's offered bytes at that
+  commit;
+- `config_digest`: BLAKE3 over the source's `include`, `exclude` and `root` and
+  its `allow_symlinks` and `preserve_executable` settings;
+- `ref`: the kind-tagged ref (`branch:x`, `tag:x`, `rev:x`), present only when a
+  binding overrides the source's ref;
+- `instance`: the owning transitive instance, absent for the consumer's own
+  sources.
+
+A binding's `take` never enters the lock. Narrowing a take changes the registry
+records and moves no commit. A source listed in `phora.local.toml` locks into
+`phora.local.lock`; transitive entries always go to the base lock. When merging
+the two, entries match on name, `ref` and `instance`.
+
+A link-mode source locks as `resolved = "link"` and `digest = "link:"`, with the
+working tree's `HEAD` as commit, or `link` when it has none.
+
+The lock also holds `[[trusted_hooks]]` and `[[candidate_hooks]]` for transitive
+hooks. Both are omitted when empty.
+
+A unit reuses its entry when:
+
+- git source: the normalized resolved remote, the effective ref, and
+  `config_digest` all match;
+- URL source: the normalized URL and `config_digest` match. The synthetic commit
+  is content-addressed, so the URL and config fully identify it.
+
+On a match, phora resolves the locked commit from the cache. If the commit is
+missing, it fetches, unless `--frozen` is set, in which case it errors. The
+source digest is reused when the commit is unchanged. Without a match, the unit
+resolves its ref from the network, and `--frozen` fails naming the source.
+`update` drops the entries it advances before running the same path.
+
+### Staging, applying and recovery
+
+phora writes each artifact into a staging directory first:
+
+```
+<parent of the artifact's destination>/.phora-stage/<artifact>-<n>/
+```
+
+The staging directory sits beside the artifact's destination so the final rename
+stays on one filesystem. For each leaf, staging:
+
+1. skips a destination with a `.git` path component, unless an `include` pattern
+   has a `.git` segment or the binding is a history overlay;
+2. renders `*.tmpl` files with the effective vars;
+3. writes the bytes, sets the executable bit when the source had it and
+   `preserve_executable` is on, and sets the mtime to the commit's author time;
+4. rejects a symlink unless `allow_symlinks` is on (the default for history
+   bindings), and rejects one whose target leaves the artifact;
+5. rejects two leaves whose deployed names fold to the same path;
+6. adds the entry to the manifest (size, mtime, BLAKE3) and to the artifact
+   digest.
+
+The artifact digest and the lock's source digest use one framing. Each entry
+contributes its path length as a little-endian u64, the path, a type tag
+(`\0file\0`, `\0exec\0` or `\0link\0`), the payload length and the payload.
+Without the lengths, two different trees could hash alike.
+
+Applying moves a staged artifact into place:
+
+1. Append a journal entry (staging path, destination, record,
+   `swap_completed = false`).
+2. Rename an existing destination to `.phora-stage/.phora-backup-<name>`.
+3. Rename the staging directory onto the destination. If the rename fails with a
+   cross-device error, copy instead (reflink when available) and warn.
+4. Mark the entry `swap_completed = true`.
+5. For a history binding, publish the overlay.
+6. Write the registry record.
+7. Remove the journal entry.
+
+If step 5 or 6 fails, the destination is removed, the backup is restored, and
+the journal entry is dropped. Link-mode artifacts follow the same journal
+protocol with a symlink created in `.phora-stage/` instead of a staged tree.
+
+phora installs no signal handler. Ctrl-C kills the process, and the journal and
+staging directories leave enough to recover on the next run.
+
+The recovery sweep runs at the start of each workspace pass:
+
+1. For each journal entry: if the swap completed, write its record. Otherwise
+   restore the backup if one exists and remove the staging path. Then drop the
+   entry.
+2. Remove `.phora-stage*` entries in the parent of every configured target path,
+   or in the confine anchor of a composed target.
+
+Step 1 covers every journaled deploy. Step 2 scans only target parents, so a
+staging directory abandoned inside a target directory before its journal entry
+was written stays until that directory is next deployed.
+
+Under `--frozen` on a read-only state root, a pending journal entry is an error;
+nothing is discarded.
+
+### Registry and drift
+
+A registry record stores the target, identity and artifact name, the underlying
+source, the commit, the staged artifact digest, the layout, the export policy,
+and a manifest of every file with size, mtime and BLAKE3 hash. Optional fields
+cover:
+
+- `directories`: device, inode and mtime of each staged directory, for spotting
+  added files without a full walk;
+- `linked`, for link-mode artifacts;
+- `history`, `worktree_admin_id`, `mirror_key`, `cache_git_root`, for history
+  overlays;
+- `vars_digest`, for templated artifacts;
+- `deploy_root` and `layout_separator`, the target path and prefixed-layout
+  separator as they were at deploy time.
+
+phora never recomputes `deploy_root` or `layout_separator`, so a record whose
+target left the config still names where its files are.
+
+Records are written to a temporary file and renamed into place.
+
+Drift detection classifies each recorded artifact. For every manifest file:
+
+1. Stat without following links. A missing file, or a file that is no longer a
+   regular file, is modified.
+2. If size and mtime match the manifest, the file is clean without reading it.
+3. Otherwise open the file and check that the descriptor has the inode the stat
+   saw. Read it, stat the descriptor again, and hash the bytes.
+4. If the stat stayed stable and the hash matches, the file is revalidated with
+   its new size and mtime. Any read error, inode mismatch or hash mismatch makes
+   it modified.
+
+A symlink entry matches when the link target's length and hash match. New files
+inside the artifact are found through the `directories` snapshot; history
+artifacts use a full scan that ignores `.git`.
+
+The artifact is modified if any file is. Otherwise it is outdated if the commit
+or the vars digest changed, revalidated if some file only changed stat, and
+clean if nothing changed. `sync` writes revalidated stats back to the record so
+the next run takes step 2. A partly modified artifact keeps its old stats.
+
+`phora verify` hashes every manifest file regardless of stat, skips linked and
+ejected records, and also fails on untrusted transitive hook candidates. History
+overlay findings are reported without failing.
+
+Templated artifacts carry two digests that answer different questions:
+
+- The lock's `digest` covers source bytes before rendering. Two machines with
+  different vars write the same lock.
+- The record's manifest and artifact digest cover rendered bytes. `verify` and
+  drift detection compare against what was deployed.
+
+The record's `vars_digest` is BLAKE3 over the effective vars (base overlaid with
+local), framed per key. When it differs from the current vars, the artifact is
+outdated and redeploys, even though no commit moved. A rendering error fails
+only that artifact.
+
+### Locks
+
+- Per project: `sync`, `update`, `eject`, `uneject`, `rebuild-registry` and
+  `trust` take a non-blocking exclusive lock on `locks/state.lock` for the whole
+  command. If another process holds it, the command exits 75 (`EX_TEMPFAIL`). If
+  the state root is on a network filesystem (NFS, SMB, CIFS, AFP, WebDAV),
+  `sync` prints a one-line warning that the lock may not exclude other machines.
+- Per mirror: fetch, URL import, working-tree capture and history-overlay
+  changes take a blocking flock on `<mirror-key>.git.lock`. The cache root is
+  shared across projects, so this lock serializes two projects fetching one
+  remote.
+
+### Hook dispatch
+
+[Hooks](#hooks) come only from your own config files. In a run, hook scopes go
+in this order:
+
+1. `pre_sync`, before any source is resolved.
+2. The prepare pass, when prepare-phase targets exist: their `pre_deploy` gates,
+   their deploys, their `on_change` hooks, then trusted transitive `on_change`
+   hooks under prepare-target paths. Global `[hooks]` don't run inside this
+   pass.
+3. `post_prepare`, after the prepare pass succeeds.
+4. The deploy pass: `pre_deploy` gates of deploy-phase targets, their deploys,
+   `on_change`, `post_sync`, then trusted transitive `on_change` hooks.
+
+Commands within a scope are deduplicated by command and shell.
+
+`on_change` fires by comparing digests:
+
+1. Each hook has an id: target name, command, and the shell or `exec` for the
+   `cmd` form.
+2. On success, phora stores the set of artifact digests in the target at that
+   moment (`meta.toml`).
+3. On the next run, the hook fires if any current record has a digest outside
+   the stored set.
+
+Removing an artifact leaves every remaining digest in the set, so removals alone
+don't fire the hook. A failed hook records nothing and fires again next run.
+`post_sync` runs on every run that reaches the hook phase. The only accepted
+`when` value is `"always"`.
+
+A gate failure (`pre_sync`, or `pre_deploy` with `abort`) ends the run before
+any drop, deploy or prune in its pass, and later hooks don't run. A deploy-phase
+`pre_deploy` abort comes after the prepare pass, so prepare-phase targets stay
+deployed. What the hook itself did is not undone.
+
+A [transitive hook candidate](#trusting-a-dependencys-hooks) is pinned by a
+preimage: BLAKE3 over the command, shell, hook kind and the dependency's
+resolved commit. It runs only when a `[[trusted_hooks]]` entry pins that
+preimage, or when the user approves it at the prompt. A new dependency commit
+changes the preimage and needs approval again.
+
+### Transitive composition
+
+phora walks `transitive = true` imports one at a time, before resolution:
+
+1. Resolve the dependency and read its `phora.toml` at that commit. Only
+   `[sources]`, `[targets]` and per-target hooks are kept; trust fields and the
+   global `[hooks]` are dropped.
+2. Key the download as a *fetch node*: normalized URL, ref and commit. Two paths
+   to the same node fetch once.
+3. Key its use as an *instance*: parent, source name, anchor target and fetch
+   node. The same node mounted twice is two instances with separate names, hooks
+   and confinement.
+4. Compose each dependency target as a synthetic target at
+   `<anchor path>/<dependency target path>`. Two composed targets with one
+   destination are an error.
+5. Recurse into the dependency's own imports, up to depth 64.
+
+At depth 1 a source may use a local `path`, including the package's self source
+`path = "."`. Deeper, local paths, relative paths and `file://` remotes are
+rejected. Inner sources can't use `deploy = "link"`; the imported source itself
+can.
+
+Every composed write is confined to its anchor. It is also kept out of a
+protected set: the project's `phora.toml`, `phora.local.toml`, `phora.lock`,
+`phora.local.lock` and `.git`, the state root's `projects/` directory, and the
+cache root. [Confinement](#confinement) lists the rest of the rules.
+
+### How a history overlay is built
+
+A [history binding](#history-overlay) deploys the source's whole tree through
+normal staging. phora adds the git metadata after the swap, making the
+destination a linked git worktree of the mirror.
+
+The overlay's admin id is the first 16 hex characters of a framed BLAKE3 over
+the canonical project root, the deploy root, the target name and the binding
+identity. Publishing runs under the mirror's flock:
+
+1. Build the administration in `<mirror>/.ph-<id>.staging-<pid>-<n>/`: `HEAD`
+   with the detached commit, `commondir` (`../..`), `gitdir` pointing at
+   `<deploy root>/.git`, and an index built from the commit's tree with the stat
+   data of the deployed files.
+2. Create empty directories in the deploy root for submodule entries.
+3. Write `<deploy root>/.git.phora-staging-<n>` containing
+   `gitdir: <mirror>/worktrees/ph-<id>`.
+4. Move an existing `worktrees/ph-<id>` aside to `.ph-<id>.backup-<pid>-<n>`,
+   rename the staging directory into place, write the pin
+   `refs/phora/worktrees/<id>`, and rename the staged gitlink to `.git`. Then
+   remove the backup.
+
+The pin keeps the commit reachable in the mirror. Fetches detach each managed
+`HEAD` first so a ref update is not rejected, and a re-clone carries the
+administration and pins across.
+
+Observation checks that `HEAD`, the gitlink back-pointer and the index still
+match the recorded commit. A stale overlay is republished without redeploying
+files. A root `.git` entry in the source tree is rejected. If the source has a
+`.gitattributes` with `text`, `eol`, `ident` or `filter` attributes, or the
+mirror sets `core.autocrlf`, sync warns that `git status` may show changes.
+
+With `--prune`, sync sweeps each mirror that a history record uses: it removes
+`worktrees/ph-*` directories whose gitlink no longer points back, their pins,
+and leftover staging and backup directories. When the mirror is gone, it removes
+the gitlink from the target instead.
 
 ## When something looks wrong
 
@@ -1146,4 +1655,4 @@ rebuilds it from the lock and the files on disk. See
 - [`phora.example.toml`](phora.example.toml) is an annotated config to copy from.
 - The [scrut suites](tests/scrut/) run real syncs in CI. Start with
   [`showcase.md`](tests/scrut/showcase.md).
-- [docs/architecture.md](docs/architecture.md) covers the internals.
+- [Under the hood](#under-the-hood) covers what a sync does to your disk, step by step.
