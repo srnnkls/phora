@@ -356,12 +356,23 @@ fn no_transitive_hooks_flag_suppresses_trusted_dep_hooks_but_keeps_consumer_own_
     let _ = std::fs::remove_file(&consumer_sentinel);
 
     // INV-3 (consumer on_change is change-gated): advance the leaf on `main` so [targets.mine]
-    // deploys new content and its own hook legitimately re-fires. `--force` re-resolves past the
-    // lock pin so the new leaf commit is picked up.
+    // deploys new content and its own hook legitimately re-fires. Dropping `own`'s pin (what
+    // `update own` does) makes the sync resolve the new leaf commit.
     write(&consumer_leaf.path().join("pkg/own.txt"), b"consumer v2\n");
     commit_all(consumer_leaf.path(), "consumer leaf change");
+    let mut lock: toml::Table =
+        toml::from_str(&std::fs::read_to_string(&lock_path).expect("read phora.lock"))
+            .expect("phora.lock parses");
+    lock.get_mut("sources")
+        .and_then(toml::Value::as_array_mut)
+        .expect("lock has sources")
+        .retain(|entry| entry.get("name").and_then(toml::Value::as_str) != Some("own"));
+    write(
+        &lock_path,
+        toml::to_string(&lock).expect("serialize lock").as_bytes(),
+    );
 
-    let out = run(&fixture, &["sync", "--no-transitive-hooks", "--force"]);
+    let out = run(&fixture, &["sync", "--no-transitive-hooks"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),

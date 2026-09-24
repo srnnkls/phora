@@ -308,8 +308,6 @@ impl TestSyncInvocation for SyncInput<'_> {
     fn run_input(&self) -> SyncRunInput<'_> {
         let source_policy = if self.frozen {
             SourcePolicy::Frozen
-        } else if self.force {
-            SourcePolicy::Refresh
         } else {
             SourcePolicy::Locked
         };

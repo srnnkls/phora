@@ -1207,10 +1207,10 @@ fn non_frozen_reresolves_drifted_lock_entry() {
     );
 }
 
-// ── Phase 1: --force re-resolves ───────────────────────────────
+// ── Phase 1: --force keeps the lock ────────────────────────────
 
 #[test]
-fn force_refetches_even_when_lock_matches() {
+fn force_keeps_the_locked_commit_when_upstream_moves() {
     let fx = build_sync_fixture();
     let cfg = config_with_source("editor-src", &fx.url);
     let source = parsed_of(&cfg, "editor-src");
@@ -1232,7 +1232,7 @@ fn force_refetches_even_when_lock_matches() {
         candidate_hooks: Vec::new(),
     };
 
-    // Advance HEAD after seeding the matching lock: force must pick up C2.
+    // Advance HEAD after seeding the matching lock: force must still deploy C.
     let new_head = fx.advance_head();
     assert_ne!(new_head, fx.head_sha, "fixture HEAD must have moved to C2");
 
@@ -1241,21 +1241,22 @@ fn force_refetches_even_when_lock_matches() {
 
     let out = sync(&in_, &counting, &fx.registry).expect("forced sync succeeds");
 
-    assert!(
-        counting.fetch_count() >= 1,
-        "force=true must re-fetch even though the lock matches"
+    assert_eq!(
+        counting.fetch_count(),
+        0,
+        "force must not fetch when the lock matches"
     );
     let locked = out
         .base_lock
         .find_source("editor-src")
         .expect("forced source still in base lock");
     assert_eq!(
-        locked.commit, new_head,
-        "force must re-resolve to the new HEAD (C2), not keep the stale locked commit"
+        locked.commit, fx.head_sha,
+        "force must keep the locked commit C"
     );
     assert_ne!(
-        locked.commit, fx.head_sha,
-        "force must not retain the pre-advance commit C"
+        locked.commit, new_head,
+        "force must not advance to the new HEAD (C2); that is `update`"
     );
 }
 
@@ -9464,17 +9465,14 @@ fn update_with_changed_url_content_advances_lock() {
         .clone();
     let fetches_after_first = backend.fetch_count();
 
-    let second = sync(
-        &input(&cfg, None, Some(first.base_lock.clone()), None, true),
-        &backend,
-        &registry,
-    )
-    .expect("forced second sync re-fetches changed content");
+    // `update` drops the pin before syncing; model that with no lock.
+    let second = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+        .expect("updated second sync re-fetches changed content");
     assert!(!second.had_failures, "second sync must succeed");
 
     assert!(
         backend.fetch_count() > fetches_after_first,
-        "a forced (--force) sync of changed url content MUST re-fetch: fetch_count increases"
+        "an update of changed url content MUST re-fetch: fetch_count increases"
     );
     let second_commit = second
         .base_lock
