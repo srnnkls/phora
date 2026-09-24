@@ -94,8 +94,9 @@ Requires a Rust toolchain (edition 2024).
   detect drift, conflicts, and orphans. Bare mirrors live under the cache root
   (`XDG_CACHE_HOME` or, by default, `~/.cache/phora` on Linux and
   `~/Library/Caches/phora` on macOS), in its `git/` subdirectory. A mirror holds
-  only the commits your bindings pin, fetched at depth 1; it takes full history only
-  when a binding sets `history = true`. See [State & locations](#state--locations).
+  only the commits your bindings pin, fetched at depth 1, and only the contents of
+  the files your bindings select; it takes full history only when a binding sets
+  `history = true`. See [State & locations](#state--locations).
 
 The model splits cleanly into who-owns-what:
 
@@ -836,8 +837,8 @@ phora bind gitoxide --history --to resources --to docs
 ```
 
 A history binding is the only thing that makes phora clone a source's full history:
-every other mirror holds depth-1 slices of the pinned commits. Once a mirror has full
-history it keeps it.
+every other mirror holds depth-1 slices of the pinned commits, with file contents
+fetched only for the files phora deploys. Once a mirror has full history it keeps it.
 
 The overlay's mirrors are cache state. User branches and commits made inside a history
 deployment are disposable cache-local state: a cache deletion or mirror reclone can lose

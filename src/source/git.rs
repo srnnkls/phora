@@ -12,6 +12,7 @@ use super::cache::{
     mirror_lock_path_for_key, mirror_path, mirror_path_for_key, open_mirror, reclone_mirror,
     sweep_orphan_staging,
 };
+use super::fetch::{Session, fetch_objects};
 use super::inventory::{populate_inventory, snapshot_commit};
 use super::resolve::resolve_worktree;
 use super::snapshot::{
@@ -32,6 +33,7 @@ pub struct GitBackend {
     pub(super) git_dir: PathBuf,
     opened_mirrors: Mutex<HashMap<PathBuf, gix::ThreadSafeRepository>>,
     refresh_plans: Mutex<HashMap<PathBuf, RefreshPlan>>,
+    fetch_sessions: Mutex<HashMap<PathBuf, Session>>,
 }
 
 impl GitBackend {
@@ -41,6 +43,7 @@ impl GitBackend {
             git_dir,
             opened_mirrors: Mutex::new(HashMap::new()),
             refresh_plans: Mutex::new(HashMap::new()),
+            fetch_sessions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -185,23 +188,30 @@ impl GitBackend {
         sweep_orphan_staging(&self.git_dir, url);
         self.forget_opened_mirror(&mirror);
 
-        match open_mirror(source, &mirror)? {
+        let session = match open_mirror(source, &mirror)? {
             Some(repo)
                 if matches!(fetch, MirrorFetch::Slice(_)) && holds_revision(&repo, revision) =>
             {
-                Ok(())
+                None
             }
             Some(repo) => match fetch_into_mirror(source, &repo, &fetch) {
-                Ok(()) => Ok(()),
+                Ok(session) => session,
                 Err(SourceError::Source(message))
                     if message.starts_with("fetch rejected ref update") =>
                 {
-                    Err(SourceError::Source(message))
+                    return Err(SourceError::Source(message));
                 }
-                Err(_) => reclone_mirror(&self.git_dir, source, url, &mirror, &fetch),
+                Err(_) => reclone_mirror(&self.git_dir, source, url, &mirror, &fetch)?,
             },
-            None => reclone_mirror(&self.git_dir, source, url, &mirror, &fetch),
+            None => reclone_mirror(&self.git_dir, source, url, &mirror, &fetch)?,
+        };
+        if let Some(session) = session {
+            self.fetch_sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(mirror, session);
         }
+        Ok(())
     }
 
     fn lacks_planned_history(&self, url: &str) -> bool {
@@ -403,10 +413,7 @@ fn read_blob_at(
             "{display} at {commit} in {source} is not a regular file"
         )));
     }
-    let object = entry
-        .object()
-        .map_err(|e| SourceError::Source(format!("read {display} at {commit}: {e}")))?;
-    Ok(object.data.clone())
+    GitBackend::find_blob_data(repo, source.as_str(), entry.object_id())
 }
 
 impl GitBackend {
@@ -494,6 +501,9 @@ impl GitBackend {
         source: &str,
         oid: gix::ObjectId,
     ) -> Result<Vec<u8>> {
+        if is_sliced(repo) && !repo.has_object(oid) {
+            fetch_objects(&SourceName::trusted(source.to_owned()), repo, &[oid], None)?;
+        }
         let blob = repo
             .find_blob(oid)
             .map_err(|e| SourceError::Source(format!("blob {oid} in {source}: {e}")))?;
@@ -629,6 +639,42 @@ impl SourceStore for GitBackend {
             },
             bytes,
         })
+    }
+
+    fn prefetch(&self, snapshot: &SnapshotId, leaves: &[SourcePath]) -> Result<()> {
+        let name = snapshot.mirror().as_str();
+        let repo = self.opened_mirror(snapshot)?;
+        if !is_sliced(&repo) {
+            return Ok(());
+        }
+        let commit = snapshot_commit(snapshot).as_str();
+        let tree = Self::commit_tree(&repo, name, commit)?;
+        let mut missing = Vec::new();
+        for leaf in leaves {
+            let Some(entry) = tree
+                .lookup_entry_by_path(Path::new(leaf.as_str()))
+                .map_err(|e| {
+                    SourceError::Source(format!("read {leaf} at {commit} in {name}: {e}"))
+                })?
+            else {
+                continue;
+            };
+            let id = entry.object_id();
+            if kind_of_entry(entry.mode().kind()).is_some() && !repo.has_object(id) {
+                missing.push(id);
+            }
+        }
+        let session = self
+            .fetch_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&mirror_path_for_key(&self.git_dir, snapshot.mirror()));
+        fetch_objects(
+            &SourceName::trusted(name.to_owned()),
+            &repo,
+            &missing,
+            session,
+        )
     }
 
     fn list_directory(

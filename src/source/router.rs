@@ -49,6 +49,10 @@ impl<G: SourceStore, H: SourceStore> SourceStore for RouterBackend<G, H> {
         SourceStore::read(&self.git, snapshot, path)
     }
 
+    fn prefetch(&self, snapshot: &SnapshotId, leaves: &[SourcePath]) -> Result<()> {
+        SourceStore::prefetch(&self.git, snapshot, leaves)
+    }
+
     fn list_directory(
         &self,
         snapshot: &SnapshotId,
