@@ -24,9 +24,9 @@ pub use model::{
 pub(crate) use model::{safe_component, safe_relpath};
 pub use router::RouterBackend;
 pub use snapshot::{
-    CanonicalSourceRoot, ResolvePolicy, ResolveRequest, ResolvedRevision, ResolvedSource,
-    RevisionSpec, SnapshotId, SourceDirectoryEntry, SourceDirectoryEntryKind, SourceEntry,
-    SourceIdentity, SourceLocation, SourceStore, SourceTimestamp, digest_snapshot,
+    CanonicalSourceRoot, RefreshPlan, ResolvePolicy, ResolveRequest, ResolvedRevision,
+    ResolvedSource, RevisionSpec, SnapshotId, SourceDirectoryEntry, SourceDirectoryEntryKind,
+    SourceEntry, SourceIdentity, SourceLocation, SourceStore, SourceTimestamp, digest_snapshot,
 };
 pub(crate) use worktree::walk_worktree;
 pub use worktree::{capture_worktree, is_local_path, read_local_head};
@@ -1272,6 +1272,170 @@ mod tests {
         );
     }
 
+    fn plan_git(backend: &GitBackend, url: &str, revisions: Vec<RevisionSpec>, history: bool) {
+        SourceStore::plan_refresh(
+            backend,
+            &RefreshPlan {
+                location: SourceLocation::Git {
+                    url: url.to_owned(),
+                },
+                revisions,
+                history,
+            },
+        );
+    }
+
+    fn mirror_refs(backend: &GitBackend, url: &str) -> std::collections::BTreeSet<String> {
+        let repo = gix::open(backend.mirror_path(url)).expect("open mirror");
+        repo.references()
+            .expect("references")
+            .all()
+            .expect("all references")
+            .map(|reference| reference.expect("reference").name().as_bstr().to_string())
+            .collect()
+    }
+
+    fn mirror_is_shallow(backend: &GitBackend, url: &str) -> bool {
+        gix::open(backend.mirror_path(url))
+            .expect("open mirror")
+            .is_shallow()
+    }
+
+    #[test]
+    fn refresh_without_history_clones_a_depth_one_slice_of_the_requested_branch() {
+        let fixture = build_git_fixture();
+        let resolved = refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Branch("main".into()),
+        )
+        .expect("slice refresh");
+
+        assert_eq!(resolved.snapshot.commit().as_str(), fixture.head_sha);
+        assert!(mirror_is_shallow(&fixture.backend, &fixture.url));
+        let refs = mirror_refs(&fixture.backend, &fixture.url);
+        assert!(refs.contains("refs/heads/main"), "got {refs:?}");
+        assert!(
+            !refs.contains("refs/heads/develop")
+                && !refs.iter().any(|r| r.starts_with("refs/tags/")),
+            "a slice must not fetch other branches or tags; got {refs:?}"
+        );
+        assert!(
+            snapshot_at(&fixture.backend, "src", &fixture.url, &fixture.tag_sha).is_err(),
+            "the parent of the sliced tip must not be in the mirror"
+        );
+    }
+
+    #[test]
+    fn one_refresh_fetches_every_planned_revision() {
+        let fixture = build_git_fixture();
+        plan_git(
+            &fixture.backend,
+            &fixture.url,
+            vec![
+                RevisionSpec::Branch("main".into()),
+                RevisionSpec::Branch("develop".into()),
+                RevisionSpec::Tag("v1.0".into()),
+            ],
+            false,
+        );
+        refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Branch("main".into()),
+        )
+        .expect("planned refresh");
+
+        assert!(mirror_is_shallow(&fixture.backend, &fixture.url));
+        for (revision, expected) in [
+            (RevisionSpec::Branch("develop".into()), &fixture.develop_sha),
+            (RevisionSpec::Tag("v1.0".into()), &fixture.tag_sha),
+        ] {
+            let cached = cached_git(&fixture.backend, "src", &fixture.url, revision)
+                .expect("a planned revision resolves without another refresh");
+            assert_eq!(cached.snapshot.commit().as_str(), expected.as_str());
+        }
+    }
+
+    #[test]
+    fn slices_merge_and_default_resolves_from_its_own_slice() {
+        let fixture = build_git_fixture();
+        refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Branch("develop".into()),
+        )
+        .expect("develop slice");
+        let default = refresh_git(&fixture.backend, "src", &fixture.url, RevisionSpec::Default)
+            .expect("default slice merges into the same mirror");
+
+        assert_eq!(default.snapshot.commit().as_str(), fixture.head_sha);
+        let develop = cached_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Branch("develop".into()),
+        )
+        .expect("the earlier slice survives the later one");
+        assert_eq!(develop.snapshot.commit().as_str(), fixture.develop_sha);
+        assert!(mirror_is_shallow(&fixture.backend, &fixture.url));
+    }
+
+    #[test]
+    fn a_commit_missing_from_a_slice_is_fetched_by_id() {
+        let fixture = build_git_fixture();
+        refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Branch("main".into()),
+        )
+        .expect("main slice");
+
+        let parent = refresh_git(
+            &fixture.backend,
+            "src",
+            &fixture.url,
+            RevisionSpec::Commit(fixture.tag_sha.parse().expect("fixture commit is valid")),
+        )
+        .expect("a commit behind the sliced tip is fetched by id");
+
+        assert_eq!(parent.snapshot.commit().as_str(), fixture.tag_sha);
+        assert!(mirror_is_shallow(&fixture.backend, &fixture.url));
+    }
+
+    #[test]
+    fn history_unshallows_a_sliced_mirror_and_a_full_mirror_stays_full() {
+        let fixture = build_git_fixture();
+        let main = || RevisionSpec::Branch("main".into());
+        refresh_git(&fixture.backend, "src", &fixture.url, main()).expect("slice");
+        assert!(mirror_is_shallow(&fixture.backend, &fixture.url));
+
+        plan_git(&fixture.backend, &fixture.url, vec![main()], true);
+        assert!(
+            cached_git(&fixture.backend, "src", &fixture.url, main()).is_err(),
+            "a cached lookup must not serve a history plan from a sliced mirror"
+        );
+        refresh_git(&fixture.backend, "src", &fixture.url, main()).expect("history refresh");
+        cached_git(&fixture.backend, "src", &fixture.url, main())
+            .expect("the unshallowed mirror serves the history plan");
+        assert!(!mirror_is_shallow(&fixture.backend, &fixture.url));
+        let refs = mirror_refs(&fixture.backend, &fixture.url);
+        for expected in ["refs/heads/develop", "refs/tags/v1.0", "refs/tags/v-orphan"] {
+            assert!(refs.contains(expected), "missing {expected}; got {refs:?}");
+        }
+
+        let unplanned = GitBackend::new(fixture.backend.git_dir.clone());
+        refresh_git(&unplanned, "src", &fixture.url, main()).expect("slice request");
+        assert!(
+            !mirror_is_shallow(&unplanned, &fixture.url),
+            "a slice request must never shallow a full mirror"
+        );
+    }
+
     #[test]
     #[expect(
         clippy::unwrap_used,
@@ -1279,6 +1443,12 @@ mod tests {
     )]
     fn single_refresh_covers_reachable_and_unreachable_tags() {
         let fixture = build_git_fixture();
+        plan_git(
+            &fixture.backend,
+            &fixture.url,
+            vec![RevisionSpec::Branch("main".into())],
+            true,
+        );
         refresh_git(
             &fixture.backend,
             "src",

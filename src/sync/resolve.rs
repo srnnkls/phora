@@ -7,7 +7,7 @@ use crate::error::Result;
 use crate::lock::{Lock, LockedSource, encode_ref, entry_matches, ref_discriminator};
 use crate::projection::offer::OfferSelection;
 use crate::source::{
-    Commit, MirrorKey, NormalizedUrl, ResolvePolicy, ResolveRequest, ResolvedRevision,
+    Commit, MirrorKey, NormalizedUrl, RefreshPlan, ResolvePolicy, ResolveRequest, ResolvedRevision,
     ResolvedSource, RevisionSpec, SnapshotId, SourceDirectoryEntry, SourceEntry, SourceError,
     SourceInventory, SourceLocation, SourceName, SourcePath, SourceStore, digest_snapshot,
 };
@@ -40,6 +40,7 @@ struct Unit {
     encoded_ref: String,
     effective_ref: Refspec,
     manifest_commit: Option<String>,
+    history: bool,
 }
 
 fn resolution_units(
@@ -47,24 +48,29 @@ fn resolution_units(
     parsed: &BTreeMap<String, ParsedSource>,
     imports: &[ImportResolution],
 ) -> Vec<Unit> {
-    let mut by_key = BTreeMap::new();
+    let mut by_key: BTreeMap<(String, String), Unit> = BTreeMap::new();
     let mut bound = BTreeSet::new();
-    let mut add = |name: &str, effective_ref: Refspec, manifest_commit: Option<String>| {
-        let encoded_ref = encode_ref(&effective_ref);
-        by_key.insert(
-            (name.to_owned(), encoded_ref.clone()),
-            Unit {
-                name: name.to_owned(),
-                encoded_ref,
-                effective_ref,
-                manifest_commit,
-            },
-        );
-    };
+    let mut add =
+        |name: &str, effective_ref: Refspec, manifest_commit: Option<String>, history: bool| {
+            let encoded_ref = encode_ref(&effective_ref);
+            let earlier_history = by_key
+                .get(&(name.to_owned(), encoded_ref.clone()))
+                .is_some_and(|unit| unit.history);
+            by_key.insert(
+                (name.to_owned(), encoded_ref.clone()),
+                Unit {
+                    name: name.to_owned(),
+                    encoded_ref,
+                    effective_ref,
+                    manifest_commit,
+                    history: history || earlier_history,
+                },
+            );
+        };
     for target in config.targets.values() {
         for binding in target.resolve_sources(parsed) {
             bound.insert(binding.source.to_owned());
-            add(binding.source, binding.effective_ref, None);
+            add(binding.source, binding.effective_ref, None, binding.history);
         }
     }
     for import in imports {
@@ -73,14 +79,48 @@ fn resolution_units(
             &import.source,
             import.refspec.clone(),
             import.commit.clone(),
+            false,
         );
     }
     for (name, source) in parsed {
         if !bound.contains(name) {
-            add(name, source.refspec(), None);
+            add(name, source.refspec(), None, false);
         }
     }
     by_key.into_values().collect()
+}
+
+fn refresh_plan(
+    parsed: &BTreeMap<String, ParsedSource>,
+    remotes: &BTreeMap<String, String>,
+    units: &[&Unit],
+) -> Result<Option<RefreshPlan>> {
+    let Some(first) = units.first() else {
+        return Ok(None);
+    };
+    let Some(source) = parsed.get(&first.name) else {
+        return Ok(None);
+    };
+    if source.deploy_mode() == DeployMode::Link || source.mode() == SourceMode::Url {
+        return Ok(None);
+    }
+    let mut revisions = Vec::new();
+    for unit in units {
+        let revision = match &unit.manifest_commit {
+            Some(commit) => RevisionSpec::Commit(commit.parse::<Commit>()?),
+            None => revision_spec(&unit.effective_ref)?,
+        };
+        if !revisions.contains(&revision) {
+            revisions.push(revision);
+        }
+    }
+    Ok(Some(RefreshPlan {
+        location: SourceLocation::Git {
+            url: remote_for(remotes, &first.name)?.to_owned(),
+        },
+        revisions,
+        history: units.iter().any(|unit| unit.history),
+    }))
 }
 
 /// Outcome of resolving one unit, carrying its source-routing entry plus the
@@ -159,6 +199,7 @@ fn frozen_miss(name: &str, transitive: bool) -> crate::error::Error {
     clippy::too_many_arguments,
     reason = "resolving one unit threads config/parsed/remotes/lock/backend plus the force and frozen run flags"
 )]
+#[cfg_attr(feature = "trace", tracing::instrument(skip_all, fields(unit = %unit.name)))]
 fn resolve_unit(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
@@ -322,14 +363,16 @@ fn resolve_source(
     } else if source.mode() == SourceMode::Url || !*mirror_refreshed {
         store.resolve(request, ResolvePolicy::Refresh)?
     } else {
-        return store
-            .resolve(request, ResolvePolicy::CachedOnly)
-            .map_err(Into::into);
+        match store.resolve(request, ResolvePolicy::CachedOnly) {
+            Ok(resolved) => return Ok(resolved),
+            Err(_) => store.resolve(request, ResolvePolicy::Refresh)?,
+        }
     };
     *mirror_refreshed = true;
     Ok(resolved)
 }
 
+#[cfg_attr(feature = "trace", tracing::instrument(skip_all))]
 fn selected_source_digest(
     store: &dyn SourceStore,
     resolved: &ResolvedSource,
@@ -451,6 +494,7 @@ fn fetch_outcome<T>(resolved: &Result<T>, mirror_refreshed: bool) -> FetchOutcom
     clippy::too_many_arguments,
     reason = "resolution threads config/parsed/remotes/lock/backend plus the force, frozen, and jobs run flags"
 )]
+#[cfg_attr(feature = "trace", tracing::instrument(skip_all))]
 pub(super) fn resolve_sources(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
@@ -486,6 +530,9 @@ pub(super) fn resolve_sources(
                     sources: units.iter().map(|unit| unit.name.clone()).collect(),
                 };
                 sink.fetch_started(&fetch);
+                if let Some(plan) = refresh_plan(parsed, remotes, &units)? {
+                    store.plan_refresh(&plan);
+                }
                 let mut mirror_refreshed = false;
                 let resolved = units
                     .into_iter()

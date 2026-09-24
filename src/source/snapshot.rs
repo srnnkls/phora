@@ -161,8 +161,17 @@ pub struct SourceDirectoryEntry {
     pub kind: SourceDirectoryEntryKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshPlan {
+    pub location: SourceLocation,
+    pub revisions: Vec<RevisionSpec>,
+    pub history: bool,
+}
+
 pub trait SourceStore: Send + Sync {
     fn resolve(&self, request: &ResolveRequest, policy: ResolvePolicy) -> Result<ResolvedSource>;
+
+    fn plan_refresh(&self, _plan: &RefreshPlan) {}
 
     fn inventory(
         &self,

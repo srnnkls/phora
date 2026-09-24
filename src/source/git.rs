@@ -8,15 +8,16 @@ use gix::object::tree::EntryKind;
 use super::{Commit, Path, Refspec, SourceName, safe_component};
 
 use super::cache::{
-    MirrorStaging, fetch_into_mirror, lock_mirror, lock_mirror_for_key, mirror_lock_path_for_key,
-    mirror_path, mirror_path_for_key, open_mirror, reclone_mirror, sweep_orphan_staging,
+    MirrorFetch, MirrorStaging, fetch_into_mirror, is_sliced, lock_mirror, lock_mirror_for_key,
+    mirror_lock_path_for_key, mirror_path, mirror_path_for_key, open_mirror, reclone_mirror,
+    sweep_orphan_staging,
 };
 use super::inventory::{populate_inventory, snapshot_commit};
 use super::resolve::resolve_worktree;
 use super::snapshot::{
-    ResolvePolicy, ResolveRequest, ResolvedRevision, ResolvedSource, RevisionSpec, SnapshotId,
-    SourceDirectoryEntry, SourceDirectoryEntryKind, SourceEntry, SourceIdentity, SourceLocation,
-    SourceStore, SourceTimestamp, commit_from_hex,
+    RefreshPlan, ResolvePolicy, ResolveRequest, ResolvedRevision, ResolvedSource, RevisionSpec,
+    SnapshotId, SourceDirectoryEntry, SourceDirectoryEntryKind, SourceEntry, SourceIdentity,
+    SourceLocation, SourceStore, SourceTimestamp, commit_from_hex,
 };
 use super::{
     MirrorKey, NormalizedUrl, Result, SourceEntryKind, SourceEntryMeta, SourceError,
@@ -25,9 +26,12 @@ use super::{
     verified_cache_git_root,
 };
 
+const DEFAULT_SLICE_REF: &str = "refs/phora/default";
+
 pub struct GitBackend {
     pub(super) git_dir: PathBuf,
     opened_mirrors: Mutex<HashMap<PathBuf, gix::ThreadSafeRepository>>,
+    refresh_plans: Mutex<HashMap<PathBuf, RefreshPlan>>,
 }
 
 impl GitBackend {
@@ -36,6 +40,7 @@ impl GitBackend {
         Self {
             git_dir,
             opened_mirrors: Mutex::new(HashMap::new()),
+            refresh_plans: Mutex::new(HashMap::new()),
         }
     }
 
@@ -83,19 +88,20 @@ impl GitBackend {
         url: &str,
         refspec: &Refspec,
     ) -> Result<Vec<u8>> {
-        if self.mirror_path(url).exists() {
-            let commit = self.resolve_commit(source, url, refspec)?;
+        if self.mirror_path(url).exists()
+            && let Ok(commit) = self.resolve_commit(source, url, refspec)
+        {
             return self.read_cached_file(source, url, &commit, Path::new("phora.toml"));
         }
         self.shallow_read_root_manifest(source, url, refspec)
     }
 
     /// Every path whose blob differs between `from_commit` and `to_commit` (added, removed, or
-    /// modified), read from `url`'s mirror. Backs the `phora trust` inspect-before-trust diff: both
-    /// commits must already be in the mirror (a full `phora sync` clone holds them).
+    /// modified), read from `url`'s mirror. Backs the `phora trust` inspect-before-trust diff;
+    /// a commit missing from a sliced mirror is fetched by id first.
     ///
     /// # Errors
-    /// - the mirror is missing, either commit cannot be resolved, or a tree cannot be walked.
+    /// - either commit cannot be fetched or resolved, or a tree cannot be walked.
     pub fn file_diff_between(
         &self,
         source: &SourceName,
@@ -103,6 +109,18 @@ impl GitBackend {
         from_commit: &str,
         to_commit: &str,
     ) -> Result<Vec<String>> {
+        for commit in [from_commit, to_commit] {
+            let revision = RevisionSpec::Commit(
+                commit
+                    .parse()
+                    .map_err(|e| SourceError::Source(format!("parse commit {commit}: {e}")))?,
+            );
+            let present = open_mirror(source, &self.mirror_path(url))?
+                .is_some_and(|repo| holds_revision(&repo, &revision));
+            if !present {
+                self.refresh_mirror(source, url, &revision)?;
+            }
+        }
         let mirror = self.mirror_path(url);
         let repo = gix::open(&mirror)
             .map_err(|e| SourceError::Source(format!("open mirror {source}: {e}")))?;
@@ -154,24 +172,71 @@ impl GitBackend {
         read_blob_at(&repo, source, &commit, Path::new("phora.toml"))
     }
 
-    pub(super) fn refresh_mirror(&self, source: &SourceName, url: &str) -> Result<()> {
+    #[cfg_attr(feature = "trace", tracing::instrument(skip_all, fields(source = %source)))]
+    pub(super) fn refresh_mirror(
+        &self,
+        source: &SourceName,
+        url: &str,
+        revision: &RevisionSpec,
+    ) -> Result<()> {
+        let mirror = self.mirror_path(url);
+        let fetch = self.mirror_fetch(&mirror, revision);
         let _lock = lock_mirror(&self.git_dir, source, url)?;
         sweep_orphan_staging(&self.git_dir, url);
-        let mirror = self.mirror_path(url);
         self.forget_opened_mirror(&mirror);
 
-        if let Some(repo) = open_mirror(source, &mirror)? {
-            return match fetch_into_mirror(source, &repo) {
+        match open_mirror(source, &mirror)? {
+            Some(repo)
+                if matches!(fetch, MirrorFetch::Slice(_)) && holds_revision(&repo, revision) =>
+            {
+                Ok(())
+            }
+            Some(repo) => match fetch_into_mirror(source, &repo, &fetch) {
                 Ok(()) => Ok(()),
                 Err(SourceError::Source(message))
                     if message.starts_with("fetch rejected ref update") =>
                 {
                     Err(SourceError::Source(message))
                 }
-                Err(_) => reclone_mirror(&self.git_dir, source, url, &mirror),
-            };
+                Err(_) => reclone_mirror(&self.git_dir, source, url, &mirror, &fetch),
+            },
+            None => reclone_mirror(&self.git_dir, source, url, &mirror, &fetch),
         }
-        reclone_mirror(&self.git_dir, source, url, &mirror)
+    }
+
+    fn lacks_planned_history(&self, url: &str) -> bool {
+        let mirror = self.mirror_path(url);
+        let planned = self
+            .refresh_plans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&mirror)
+            .is_some_and(|plan| plan.history);
+        planned && gix::open(&mirror).is_ok_and(|repo| is_sliced(&repo))
+    }
+
+    fn mirror_fetch(&self, mirror: &Path, revision: &RevisionSpec) -> MirrorFetch {
+        let plans = self
+            .refresh_plans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let plan = plans.get(mirror);
+        if plan.is_some_and(|plan| plan.history) {
+            return MirrorFetch::Full;
+        }
+        let mut refspecs = Vec::new();
+        for revision in plan
+            .into_iter()
+            .flat_map(|plan| &plan.revisions)
+            .chain(std::iter::once(revision))
+        {
+            if let Some(refspec) = slice_refspec(revision)
+                && !refspecs.contains(&refspec)
+            {
+                refspecs.push(refspec);
+            }
+        }
+        MirrorFetch::Slice(refspecs)
     }
 
     pub(super) fn resolve_commit(
@@ -219,6 +284,24 @@ impl GitBackend {
     }
 }
 
+fn slice_refspec(revision: &RevisionSpec) -> Option<String> {
+    Some(match revision {
+        RevisionSpec::Branch(name) => format!("+refs/heads/{name}:refs/heads/{name}"),
+        RevisionSpec::Tag(name) => format!("+refs/tags/{name}:refs/tags/{name}"),
+        RevisionSpec::Commit(commit) => format!("+{commit}:refs/phora/commits/{commit}"),
+        RevisionSpec::Default => format!("+HEAD:{DEFAULT_SLICE_REF}"),
+        RevisionSpec::None => return None,
+    })
+}
+
+fn holds_revision(repo: &gix::Repository, revision: &RevisionSpec) -> bool {
+    let RevisionSpec::Commit(commit) = revision else {
+        return false;
+    };
+    gix::ObjectId::from_hex(commit.as_str().as_bytes())
+        .is_ok_and(|oid| repo.find_commit(oid).is_ok())
+}
+
 fn shallow_ref_name(refspec: &Refspec) -> Option<String> {
     match refspec {
         Refspec::Branch(name) => Some(format!("refs/heads/{name}")),
@@ -248,9 +331,17 @@ fn resolve_in(repo: &gix::Repository, source: &SourceName, refspec: &Refspec) ->
             repo.find_commit(oid)
                 .map_err(|e| SourceError::Source(format!("rev {rev} in {source}: {e}")))?
         }
-        Refspec::Default => repo
-            .head_commit()
-            .map_err(|e| SourceError::Source(format!("default branch (HEAD) in {source}: {e}")))?,
+        Refspec::Default => match is_sliced(repo)
+            .then(|| repo.find_reference(DEFAULT_SLICE_REF).ok())
+            .flatten()
+        {
+            Some(mut slice) => slice.peel_to_commit().map_err(|e| {
+                SourceError::Source(format!("peel default branch in {source}: {e}"))
+            })?,
+            None => repo.head_commit().map_err(|e| {
+                SourceError::Source(format!("default branch (HEAD) in {source}: {e}"))
+            })?,
+        },
         Refspec::None => {
             return Err(SourceError::Source(format!(
                 "source {source}: git backend cannot resolve a url source's empty refspec"
@@ -428,11 +519,26 @@ fn kind_of_entry(kind: EntryKind) -> Option<SourceEntryKind> {
 }
 
 impl SourceStore for GitBackend {
+    fn plan_refresh(&self, plan: &RefreshPlan) {
+        let SourceLocation::Git { url } = &plan.location else {
+            return;
+        };
+        self.refresh_plans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(self.mirror_path(url), plan.clone());
+    }
+
     fn resolve(&self, request: &ResolveRequest, policy: ResolvePolicy) -> Result<ResolvedSource> {
         match &request.location {
             SourceLocation::Git { url } => {
                 if policy == ResolvePolicy::Refresh {
-                    self.refresh_mirror(&request.name, url)?;
+                    self.refresh_mirror(&request.name, url, &request.revision)?;
+                } else if self.lacks_planned_history(url) {
+                    return Err(SourceError::Source(format!(
+                        "source {}: a history binding needs the full mirror, which holds only slices",
+                        request.name
+                    )));
                 }
                 let refspec = legacy_refspec(&request.revision);
                 let commit = self.resolve_commit(&request.name, url, &refspec)?;

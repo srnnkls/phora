@@ -381,6 +381,7 @@ fn gate_source_store_declares_the_exact_final_operation_set() {
         .unwrap_or_else(|| panic!("src/{rel}: SourceStore trait body must parse"));
     let expected: BTreeSet<String> = [
         "resolve",
+        "plan_refresh",
         "inventory",
         "read",
         "list_directory",
@@ -394,7 +395,7 @@ fn gate_source_store_declares_the_exact_final_operation_set() {
     assert_eq!(
         methods, expected,
         "src/{rel}: SourceStore's authoritative final operation set is exactly resolve, \
-         inventory, read, list_directory, lock_worktree_mirror, lock_worktree_mirror_at, and \
+         plan_refresh, inventory, read, list_directory, lock_worktree_mirror, lock_worktree_mirror_at, and \
          observe_worktree; digest_snapshot is a source-owned free operation, not a trait method"
     );
 }

@@ -93,8 +93,9 @@ Requires a Rust toolchain (edition 2024).
   on macOS) recording what was deployed where (commit + content digest), so phora can
   detect drift, conflicts, and orphans. Bare mirrors live under the cache root
   (`XDG_CACHE_HOME` or, by default, `~/.cache/phora` on Linux and
-  `~/Library/Caches/phora` on macOS), in its `git/` subdirectory. See
-  [State & locations](#state--locations).
+  `~/Library/Caches/phora` on macOS), in its `git/` subdirectory. A mirror holds
+  only the commits your bindings pin, fetched at depth 1; it takes full history only
+  when a binding sets `history = true`. See [State & locations](#state--locations).
 
 The model splits cleanly into who-owns-what:
 
@@ -834,6 +835,10 @@ apply the same existing source to several targets in one edit, repeat `--to`:
 phora bind gitoxide --history --to resources --to docs
 ```
 
+A history binding is the only thing that makes phora clone a source's full history:
+every other mirror holds depth-1 slices of the pinned commits. Once a mirror has full
+history it keeps it.
+
 The overlay's mirrors are cache state. User branches and commits made inside a history
 deployment are disposable cache-local state: a cache deletion or mirror reclone can lose
 them, so push work elsewhere to retain it. A concurrent mirror refresh can also make a
@@ -1172,9 +1177,10 @@ that trusted commit and the current candidate commit, so you can see what moved 
 the dep before re-trusting. A hook with no prior trusted commit instead lists the
 dependency-repo-relative files the consumer composes from the dep at the candidate
 commit — the actual surface the hook will run against, honoring the binding's
-include/exclude. Both are resolved offline from the cache mirror; if the candidate
-commit is unresolved or absent from the mirror, the listing degrades to a
-`run phora sync first` notice rather than guessing.
+include/exclude. Both are read from the cache mirror. The diff fetches the trusted
+commit by id when the mirror does not hold it; if the candidate commit is unresolved
+or absent from the mirror, the listing degrades to a `run phora sync first` notice
+rather than guessing.
 
 To read the surrounding tree directly, `phora trust tropos --show <path>` prints a
 dep file at the pinned candidate commit, also offline. A UTF-8 file prints its
