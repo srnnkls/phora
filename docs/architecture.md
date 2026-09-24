@@ -117,22 +117,42 @@ One mirror serves every source that names the same remote. `NormalizedUrl::parse
 
 A mirror is a bare repository. Resolving a ref looks up a commit id, and reading a file walks tree objects and reads the blob from the object database. Nothing is checked out for copy-mode deployment. Two bindings at different refs of one source are two commit ids in one mirror, sharing every unchanged object.
 
+A mirror is either sliced or full:
+
+- A sliced mirror holds depth-1 slices of the revisions its bindings pin (branch, tag, default `HEAD` or commit id), merged into one bare repository. Its fetches carry the `blob:none` filter, so it holds commits and trees but no file contents until something reads them. A `phora-sliced` file in the mirror marks it.
+- A full mirror holds every head and tag with full history. Only a `history = true` binding makes a mirror full, and a full mirror is never narrowed again. A mirror without the marker, including every cache created before slicing existed, is full.
+
+Selection runs on trees, so a sliced mirror answers `inventory` without any blobs.
+
 Two exceptions add files outside the object database. A history binding creates linked-worktree administration inside the mirror and a gitlink in the target (see [History overlay](#history-overlay)). A mirror that serves history bindings also carries `refs/phora/worktrees/*` pins.
 
-`RouterBackend` routes each `ResolveRequest` by its `SourceLocation`: `Url` to `HttpBackend`, which imports the download into a git mirror, and `Git` and `Worktree` to `GitBackend`, which also captures working trees. Every other call goes to `GitBackend`. `GitBackend`, `HttpBackend` and `RouterBackend` implement `SourceStore`, which has seven methods: `resolve`, `inventory`, `read` and `list_directory`, plus `lock_worktree_mirror`, `lock_worktree_mirror_at` and `observe_worktree`, which have default implementations that return an error. `GitBackend` implements all seven.
+`RouterBackend` routes each `ResolveRequest` by its `SourceLocation`: `Url` to `HttpBackend`, which imports the download into a git mirror, and `Git` and `Worktree` to `GitBackend`, which also captures working trees. Every other call goes to `GitBackend`. `GitBackend`, `HttpBackend` and `RouterBackend` implement `SourceStore`, which has nine methods: `resolve`, `inventory`, `read` and `list_directory`; `plan_refresh` and `prefetch`, whose defaults do nothing; and `lock_worktree_mirror`, `lock_worktree_mirror_at` and `observe_worktree`, whose defaults return an error. `GitBackend` implements all nine.
 
 ### Fetching a git source
+
+Before resolving, sync calls `plan_refresh` once per mirror group with every revision the group's bindings pin and whether any of them sets `history`. One fetch then serves the whole group.
 
 `GitBackend::refresh_mirror` (`source/git.rs`, `source/cache.rs`) runs under the mirror's flock:
 
 1. Remove `.<MirrorKey>.staging-*` directories whose newest mtime is more than an hour old. A younger one may belong to a running clone.
-2. If the mirror opens, detach the `HEAD` of every managed linked worktree (`worktrees/ph-*`), then fetch with the refspecs `+refs/heads/*:refs/heads/*` and `+refs/tags/*:refs/tags/*`. Heads and tags track the remote, so a tag-pinned commit resolves after one fetch.
-3. If the fetch reports a rejected ref update, return the error. The mirror stays as it is.
-4. If the mirror is missing, is not a repository, or the fetch fails for any other reason, re-clone.
+2. Pick the fetch. A planned history binding asks for a full mirror. Otherwise the fetch is a slice of the planned revisions plus the requested one.
+3. If the mirror opens and is sliced, and a slice is wanted: skip the fetch when the mirror already holds the revision, else fetch the slice at depth 1 with `blob:none`.
+4. If the mirror opens and is full: detach the `HEAD` of every managed linked worktree (`worktrees/ph-*`), then fetch with the refspecs `+refs/heads/*:refs/heads/*` and `+refs/tags/*:refs/tags/*`.
+5. If the fetch reports a rejected ref update, return the error. The mirror stays as it is.
+6. If the mirror is missing, is not a repository, or the fetch fails for any other reason, re-clone. A sliced mirror that now needs history takes this path: its commits would be advertised as already present, and the server would skip blobs it never sent, so it is re-cloned whole.
 
-A re-clone builds a new bare mirror in a staging directory. Before the swap it carries over every managed worktree whose pin commit exists in the new clone: the `worktrees/ph-<id>/` administration directory and its `refs/phora/worktrees/<id>` pin. Then it removes the old mirror and renames the staging directory into place. A failed clone leaves the old mirror untouched. An open failure other than "not a repository" is an error and doesn't trigger a re-clone, because it may be transient.
+A sliced clone is `init_bare`, a saved `origin` remote, the marker file, and one filtered fetch. A full clone is a bare clone with the mirror refspecs. Either way the new mirror is built in a staging directory. Before the swap, a re-clone carries over every managed worktree whose pin commit exists in the new clone: the `worktrees/ph-<id>/` administration directory and its `refs/phora/worktrees/<id>` pin. Then it removes the old mirror and renames the staging directory into place. A failed clone leaves the old mirror untouched. An open failure other than "not a repository" is an error and doesn't trigger a re-clone, because it may be transient.
+
+The filtered fetch (`source/fetch.rs`) drives gix-protocol directly, because gix's high-level fetch can't send a filter or ask for single objects. It opens the transport with the configured credentials, runs the handshake and `ls-refs`, negotiates with the filter added, writes the pack, and edits refs itself. The connection stays open for the blob fetch that follows.
+
+Blobs arrive in two ways:
+
+- After resolving a source, on both the fetch path and the lock-hit path, sync calls `prefetch` with the selected leaves. `GitBackend` fetches their missing blobs in one request that names the object ids and sends no haves, over the connection the tree fetch left open.
+- Any other read of a missing blob (a dependency's `phora.toml`, `.gitattributes`, `phora trust --show`) fetches that one blob by id. `phora trust` diffs fetch a trusted commit the mirror lacks the same way.
 
 Resolution is a local lookup. A `branch` peels `refs/heads/<name>`, a `tag` peels `refs/tags/<name>`, a `rev` is parsed as a 40- or 64-hex object id, and a source with no ref takes the mirror's `HEAD`.
+
+A history binding over a sliced mirror can't use the cached snapshot. On a lock hit, sync refreshes that mirror anyway. Under `--frozen`, which never fetches, the run fails instead of deploying a truncated history.
 
 ### Importing a URL source
 
@@ -382,12 +402,24 @@ The CLI supplies one of two sinks:
 
 The preparation pass wraps the sink so both passes report into one summary.
 
+### Tracing
+
+The opt-in `trace` cargo feature adds timing spans for the fetch and resolve path, plus gix's own detailed spans. Build with it and pick what to print through `RUST_LOG`:
+
+```sh
+cargo build --release --features trace
+RUST_LOG=phora=info target/release/phora sync     # phora's fetch and resolve spans
+RUST_LOG=trace target/release/phora sync          # also gix's detail spans
+```
+
+Each span prints on close to stderr, with its duration, the thread name and the time since start. phora's spans log at `info`, gix's detail spans at `trace`.
+
 ## Where the code lives
 
 - `src/cli/`: argument parsing, command dispatch, config editing (`config_edit.rs`), rendering (`render.rs`), progress and JSON sinks, trust prompts, exit codes.
 - `src/config/`: `phora.toml` DTOs and their parsed forms: sources, targets, hosts, hooks, the dependency manifest and graph keys (`transitive.rs`).
 - `src/projection/`: offer selection (`offer.rs`), take resolution (`take.rs`), collapse (`collapse.rs`), projection building and diagnostics.
-- `src/source/`: the `SourceStore` trait and snapshots (`snapshot.rs`), git fetch and reads (`git.rs`), mirror layout and staging (`cache.rs`), URL download (`http.rs`), archive extraction (`archive.rs`), synthetic import (`import.rs`), working-tree capture (`worktree.rs`), history overlay administration (`worktree_deploy.rs`), dependency manifests (`transitive.rs`), and framed hashing (`hash_framed_entry` and `vars_digest` in `mod.rs`).
+- `src/source/`: the `SourceStore` trait and snapshots (`snapshot.rs`), git fetch and reads (`git.rs`), filtered and by-id fetches (`fetch.rs`), mirror layout and staging (`cache.rs`), URL download (`http.rs`), archive extraction (`archive.rs`), synthetic import (`import.rs`), working-tree capture (`worktree.rs`), history overlay administration (`worktree_deploy.rs`), dependency manifests (`transitive.rs`), and framed hashing (`hash_framed_entry` and `vars_digest` in `mod.rs`).
 - `src/sync/`: the pipeline (`mod.rs`), resolution (`resolve.rs`), composition (`transitive.rs`, `confine.rs`), preparation (`prepare.rs`), observation (`observe.rs`, `inspect.rs`, `scan.rs`, `directories.rs`), reconciliation (`reconcile.rs`, `model.rs`), staging (`stage.rs`), applying (`apply.rs`, `target.rs`), journal and recovery (`journal.rs`, `recovery.rs`), prune (`prune.rs`), hooks (`hooks.rs`), progress port (`progress.rs`), `preview`, `verify` and `rebuild-registry`, and persistent state under `state/`.
 - `src/lock.rs`: lock DTOs, ref encoding, lock merging and reuse matching.
 - `src/paths.rs`: cache and state root resolution.

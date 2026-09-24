@@ -428,6 +428,9 @@ sources = ["platform"]
 ```
 
 The version now lives in the consumer's `phora.lock`, under version control.
+The monorepo's size barely matters: phora fetches the tagged commit without
+history, and only the contents of the files under `protos`.
+
 Check what would ship before you sync:
 
 ```
@@ -487,7 +490,9 @@ Add `resources/` to your project's `.gitignore`. Otherwise git treats
 Branches and commits you make inside `resources/axum` live in phora's cache and
 disappear when the cache does, so push anything you want to keep elsewhere. A
 history binding takes the whole repository, and phora rejects `take`,
-`collapse`, and `template` on it. See [History overlay](GUIDE.md#history-overlay).
+`collapse`, and `template` on it. It is also the one kind of binding that makes
+phora fetch the full history, so the first sync of a large repository takes a
+while. See [History overlay](GUIDE.md#history-overlay).
 
 ## Generating per-agent skills from one canonical set
 

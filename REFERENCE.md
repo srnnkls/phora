@@ -44,7 +44,7 @@ other source deploys at its locked commit. When nothing changed, a sync fetches 
 | `--prune` | delete artifacts the configuration no longer selects, and managed file links whose source file is gone; skipped when a deploy failed |
 | `--force` | overwrite locally modified and foreign files without asking; sources stay at their locked commits |
 | `--fast-forward` | delete deployed artifacts that a moved pin no longer offers, instead of stopping |
-| `--frozen` | fetch and resolve nothing; every source, nested dependencies included, must already be in the lock, except link sources; also runs against a read-only state root when nothing needs writing |
+| `--frozen` | fetch and resolve nothing; every source, nested dependencies included, must already be in the lock, except link sources; fails when a history binding's mirror holds only pinned commits; also runs against a read-only state root when nothing needs writing |
 | `--no-hooks` | run no hooks at all |
 | `--no-transitive-hooks` | run your own hooks, but none from imported dependencies |
 | `--no-progress` | never draw live progress |
@@ -454,7 +454,7 @@ phora trust [SOURCE] [--list] [--revoke] [--show <PATH>]
 ```
 
 With no flags, a terminal prompts once per hook; without a terminal it lists them. A source name
-narrows everything to that dependency. Listings read the cache mirror and need no network.
+narrows everything to that dependency. Listings read the cache mirror. A commit or file the mirror lacks is fetched from the dependency's remote.
 
 | Flag | Meaning |
 | --- | --- |
@@ -755,6 +755,10 @@ attached. The deployed directory gets a `.git` file pointing at a worktree of th
 The source must be a whole-repository forge, `git` or `path` source (see the restrictions under
 [bindings](#bindings)). Symlinks in the source are deployed unless `allow_symlinks = false`.
 `phora verify` reports a stale overlay without failing, and the next sync repairs it.
+
+Every other binding fetches only its pinned commits, without history, and only the file contents it
+deploys. A history binding makes phora fetch the source's full history, and the mirror keeps it from
+then on.
 
 ```toml
 [targets.references.sources]
