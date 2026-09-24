@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1](https://github.com/srnnkls/phora/compare/v0.3.0...v0.3.1) - 2026-09-24
+
+### Features
+
+- *(source)* Build sources replace prepare targets ([#104](https://github.com/srnnkls/phora/pull/104))
+- *(history)* Eject a history overlay into a standalone clone ([#101](https://github.com/srnnkls/phora/pull/101))
+
+### Bug Fixes
+
+- *(sync)* --force overwrites without re-resolving sources ([#102](https://github.com/srnnkls/phora/pull/102))
+- *(sync)* Deploy files with their write time ([#103](https://github.com/srnnkls/phora/pull/103))
+- *(history)* Make overlays read-only and close git race windows ([#100](https://github.com/srnnkls/phora/pull/100))
+
+### Performance
+
+- *(source)* Fetch sliced mirrors without blobs and backfill selected files ([#99](https://github.com/srnnkls/phora/pull/99))
+- *(source)* Clone mirrors as depth-1 slices unless a binding needs history ([#98](https://github.com/srnnkls/phora/pull/98))
+
+### Miscellaneous Tasks
+
+- Keep release commits out of the changelog ([#96](https://github.com/srnnkls/phora/pull/96))
+
+[0.3.1]: https://github.com/srnnkls/phora/compare/0.3.0..0.3.1
+
 ## [0.3.0](https://github.com/srnnkls/phora/compare/v0.2.0...v0.3.0) - 2026-09-23
 
 ### Features
