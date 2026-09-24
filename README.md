@@ -92,6 +92,10 @@ The source is this public repository and the target is `./out`, so it runs as wr
 $ phora sync
 sync complete
 
+$ phora preview
+demo -> ./out
+  phora@54d8a953 README.md -> ./out/README.md
+
 $ phora list
 demo:
   phora/README.md  ✓ clean
@@ -101,11 +105,12 @@ all verified
 ```
 
 `phora sync` resolves `main` to a commit, records it in `phora.lock`, and copies `README.md` into
-`out`. On a terminal it shows progress and a summary instead of `sync complete`. `phora list`
-reports what landed, and `phora verify` re-hashes it and exits 1 if anything changed.
+`out`. On a terminal it shows progress and a summary instead of `sync complete`. `phora preview`
+shows what a sync would deploy, from the locked commit to each file's destination, without touching
+the network; before the first sync it reports the source as `not locked`. `phora list` reports what
+landed, and `phora verify` re-hashes it and exits 1 if anything changed.
 
-Next, try `phora preview` to see what a sync would do, and `phora add` and `phora bind` to edit the
-configuration from the command line.
+Next, try `phora add` and `phora bind` to edit the configuration from the command line.
 
 ## Commands
 
