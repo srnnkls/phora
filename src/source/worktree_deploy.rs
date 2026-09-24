@@ -1,4 +1,4 @@
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -383,6 +383,134 @@ impl WorktreeMirrorGuard {
             .join(request.admin_id.as_str());
         remove_file_if_exists(&pin, "remove worktree pin ref")?;
         Ok(())
+    }
+
+    /// `Ok(false)`: no overlay of this mirror was in place, and nothing changed.
+    pub fn eject_worktree(&self, request: &WorktreeDeployRequest) -> Result<bool> {
+        let mirror = verified_mirror_root(&self.address)?;
+        let admin_dir = mirror
+            .join("worktrees")
+            .join(format!("ph-{}", request.admin_id.as_str()));
+        let Some(gitlink) = physical_gitlink_path(&request.deploy_root)? else {
+            return Ok(false);
+        };
+        if !physical_regular_file(&gitlink, "inspect worktree gitlink")?
+            || !gitlink_targets(&gitlink, &admin_dir)?
+        {
+            return Ok(false);
+        }
+
+        let staging = create_eject_staging(&request.deploy_root)?;
+        if let Err(error) =
+            self.write_standalone_repository(&mirror, &admin_dir, &staging, &request.commit)
+        {
+            return Err(
+                match remove_path_if_exists(&staging, "remove staged clone") {
+                    Ok(()) => error,
+                    Err(cleanup) => SourceError::Source(format!("{error}; {cleanup}")),
+                },
+            );
+        }
+        let exchanged = super::cache::exchange_paths(&staging, &gitlink)
+            .map_err(|error| SourceError::Source(format!("publish standalone clone: {error}")))?;
+        if exchanged {
+            remove_file_if_exists(&staging, "remove ejected worktree gitlink")?;
+        } else {
+            remove_file_if_exists(&gitlink, "remove ejected worktree gitlink")?;
+            std::fs::rename(&staging, &gitlink).map_err(|error| {
+                SourceError::Source(format!("publish standalone clone: {error}"))
+            })?;
+        }
+
+        remove_dir_if_exists(&admin_dir, "remove worktree administration")?;
+        let pin = mirror
+            .join("refs/phora/worktrees")
+            .join(request.admin_id.as_str());
+        remove_file_if_exists(&pin, "remove worktree pin ref")?;
+        Ok(true)
+    }
+
+    fn write_standalone_repository(
+        &self,
+        mirror: &Path,
+        admin_dir: &Path,
+        git_dir: &Path,
+        commit: &Commit,
+    ) -> Result<()> {
+        link_tree(&mirror.join("objects"), &git_dir.join("objects"))?;
+        for dir in ["refs/heads", "refs/tags", "refs/remotes/origin"] {
+            std::fs::create_dir_all(git_dir.join(dir)).map_err(|error| {
+                SourceError::Source(format!("create standalone clone {dir}: {error}"))
+            })?;
+        }
+        self.write_standalone_refs(git_dir)?;
+        std::fs::copy(admin_dir.join("index"), git_dir.join("index")).map_err(|error| {
+            SourceError::Source(format!(
+                "copy worktree index into standalone clone: {error}"
+            ))
+        })?;
+        write_text(&git_dir.join("HEAD"), &format!("{}\n", commit.as_str()))?;
+        write_text(&git_dir.join("config"), &self.standalone_config())
+    }
+
+    fn write_standalone_refs(&self, git_dir: &Path) -> Result<()> {
+        let fail = |error: &dyn fmt::Display| {
+            SourceError::Source(format!("read mirror refs for standalone clone: {error}"))
+        };
+        let references = self.mirror.references().map_err(|error| fail(&error))?;
+        for reference in references.all().map_err(|error| fail(&error))? {
+            let reference = reference.map_err(|error| fail(&error))?;
+            let name = reference.name().as_bstr().to_string();
+            let Some(id) = reference.target().try_id().map(ToOwned::to_owned) else {
+                continue;
+            };
+            let local = if let Some(branch) = name.strip_prefix("refs/heads/") {
+                format!("refs/remotes/origin/{branch}")
+            } else if name.starts_with("refs/tags/") {
+                name
+            } else {
+                continue;
+            };
+            let path = git_dir.join(&local);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    SourceError::Source(format!("create standalone clone ref {local}: {error}"))
+                })?;
+            }
+            write_text(&path, &format!("{id}\n"))?;
+        }
+        if let Ok(Some(head)) = self.mirror.head_name()
+            && let Some(branch) = head.as_bstr().to_string().strip_prefix("refs/heads/")
+        {
+            write_text(
+                &git_dir.join("refs/remotes/origin/HEAD"),
+                &format!("ref: refs/remotes/origin/{branch}\n"),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn standalone_config(&self) -> String {
+        let sha256 = self.mirror.object_hash() != gix::hash::Kind::Sha1;
+        let mut config = format!(
+            "[core]\n\trepositoryformatversion = {}\n\tfilemode = {}\n\tbare = false\n\
+             \tlogallrefupdates = true\n",
+            u8::from(sha256),
+            cfg!(unix)
+        );
+        if sha256 {
+            config.push_str("[extensions]\n\tobjectformat = sha256\n");
+        }
+        if let Ok(remote) = self.mirror.find_remote("origin")
+            && let Some(url) = remote.url(gix::remote::Direction::Fetch)
+        {
+            let _ = write!(
+                config,
+                "[remote \"origin\"]\n\turl = {}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
+                url.to_bstring()
+            );
+        }
+        config
     }
 
     pub fn sweep_worktrees(&self) -> Result<()> {
@@ -878,6 +1006,58 @@ fn create_gitlink_staging(deploy_root: &Path, admin_dir: &Path) -> Result<PathBu
 }
 
 static GITLINK_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn create_eject_staging(deploy_root: &Path) -> Result<PathBuf> {
+    for _ in 0..256 {
+        let path = deploy_root.join(format!(
+            ".git.phora-eject-{}",
+            GITLINK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(SourceError::Source(format!(
+                    "stage standalone clone: {error}"
+                )));
+            }
+        }
+    }
+    Err(SourceError::Source(
+        "allocate staged standalone clone name".to_owned(),
+    ))
+}
+
+/// Hard-link immutable git objects, copying where the filesystem refuses a link.
+fn link_tree(from: &Path, to: &Path) -> Result<()> {
+    let fail = |error: &dyn fmt::Display| {
+        SourceError::Source(format!(
+            "link mirror objects into standalone clone: {error}"
+        ))
+    };
+    for entry in walkdir::WalkDir::new(from).follow_links(false) {
+        let entry = entry.map_err(|error| fail(&error))?;
+        let relative = entry
+            .path()
+            .strip_prefix(from)
+            .map_err(|error| fail(&error))?;
+        let destination = to.join(relative);
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&destination).map_err(|error| fail(&error))?;
+        } else if entry.file_type().is_file()
+            && std::fs::hard_link(entry.path(), &destination).is_err()
+        {
+            reflink_copy::reflink_or_copy(entry.path(), &destination)
+                .map_err(|error| fail(&error))?;
+        }
+    }
+    Ok(())
+}
+
+fn write_text(path: &Path, contents: &str) -> Result<()> {
+    std::fs::write(path, contents)
+        .map_err(|error| SourceError::Source(format!("write {}: {error}", path.display())))
+}
 
 fn path_exists(path: &Path, action: &str) -> Result<bool> {
     match std::fs::metadata(path) {
