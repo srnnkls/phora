@@ -58,9 +58,13 @@ A `phora sync` runs these steps in order:
 10. Run your `on_change` hooks, then `post_sync`, then the approved `on_change`
     hooks of transitive dependencies, and write `phora.lock`.
 
-Everything phora reads becomes a git commit in a local store, including a
-downloaded tarball. That is why a URL source locks, deploys and verifies the same
-way a repository does.
+Everything phora reads becomes a git commit in one content-addressed store per
+machine, including a downloaded tarball. That is why a URL source locks, deploys
+and verifies the same way a repository does. Every project on the machine shares
+the store: a repository is fetched once, only at the commits you pin and only for
+the files you select unless a binding asks for [history](#history-overlay), and
+each project gets a copy of its own slice.
+[Under the hood](#under-the-hood) shows how the store is laid out.
 
 ## Your first sync
 
