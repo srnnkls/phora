@@ -82,8 +82,6 @@ pub(super) fn run_sync(
 
     let source_policy = if frozen {
         SourcePolicy::Frozen
-    } else if force {
-        SourcePolicy::Refresh
     } else {
         SourcePolicy::Locked
     };
