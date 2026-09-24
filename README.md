@@ -31,6 +31,14 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/srnnkls/phora/releases/
 brew install srnnkls/phora/phora
 ```
 
+### mise
+
+```sh
+mise use -g github:srnnkls/phora
+```
+
+Drop `-g` to pin phora in a project's `mise.toml` instead.
+
 ### Cargo
 
 ```sh
