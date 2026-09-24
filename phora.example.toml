@@ -18,7 +18,6 @@ remote = { https = "https://git.company.com/{path}.git", ssh = "git@git.company.
 
 [hooks]
 pre_sync = "test -w ~/.config"                         # gate before any source is resolved; failure stops the sync
-post_prepare = "./scripts/gen-skills build/input build/skills" # runs after prepare targets deploy
 post_sync = "echo 'phora: synced'"                     # runs after target on_change hooks, before trusted transitive ones
 
 [sources.dotfiles]              # forge source, following a branch
@@ -63,12 +62,11 @@ transitive = true
 [sources.rust-book]             # deployed with its git history below
 repo = "rust-lang/book"
 
-[sources.skill-src]             # generator input, deployed by a prepare target
+[sources.skill-src]             # generator input
 repo = "me/skill-sources"
 
-[sources.skills]                # generator output, symlinked from the local working tree
-path = "./build/skills"
-deploy = "link"
+[sources.skills]                # generator output, committed like any other source
+build = { inputs = ["skill-src"], run = "./scripts/gen-skills $PHORA_INPUT/skill-src $PHORA_OUTPUT" }
 
 [targets.neovim]
 path = "~/.config/nvim"
@@ -106,7 +104,7 @@ sources = ["loqui"]
 layout = { type = "prefixed", separator = "/" }
 
 [targets.policies.hooks]
-pre_deploy = { run = "test -d ~/.cupcake", shell = "bash -c" } # gate checked before any deploy-phase target is written
+pre_deploy = { run = "test -d ~/.cupcake", shell = "bash -c" } # gate checked before any target is written
 pre_deploy_on_fail = "skip"     # a failed gate skips this target only
 
 [targets.bin]
@@ -139,11 +137,6 @@ toolkit = ["skills/**"]         # narrow what the package deploys
 
 [targets.toolkit.collapse]
 toolkit = false
-
-[targets.skill-input]
-path = "build/input"
-phase = "prepare"               # deploys before post_prepare runs
-sources = ["skill-src"]
 
 [targets.skills]
 path = "~/.claude/skills"

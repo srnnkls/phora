@@ -568,7 +568,7 @@ remote = { https = "https://git.company.com/{path}.git", ssh = "git@git.company.
 ### sources
 
 Each `[sources.<name>]` sets one kind: forge (`repo`, optionally `host`), local (`path`),
-git remote (`git`), or download (`url`).
+git remote (`git`), download (`url`), or generated (`build`).
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -578,6 +578,7 @@ git remote (`git`), or download (`url`).
 | `git` | string | | git remote: https, `ssh://`, or `git@host:path` |
 | `url` | string | | https download imported as one snapshot |
 | `digest` | string | | `sha256:<hex>` or `blake3:<hex>`, checked before a `url` is extracted |
+| `build` | table | | generator whose output is the source's content; see [build sources](#build-sources) |
 | `protocol` | `"https"` \| `"ssh"` | top-level `protocol` | template for this forge source |
 | `branch` | string | the remote's default branch | follow a branch |
 | `tag` | string | | pin a tag |
@@ -594,6 +595,9 @@ Set at most one of `branch`, `tag` and `rev`. A `url` source rejects `branch`, `
 `root`; tar, tar.gz, tgz and zip archives are unpacked and a single top-level directory is
 stripped. Any other file deploys under the URL's basename.
 
+A `build` source rejects `branch`, `tag`, `rev`, `digest`, `protocol`, `allow_symlinks`,
+`transitive` and `deploy = "link"`.
+
 `deploy = "link"` needs a local `path` and works in either config file. Phora warns when
 `phora.toml` declares the source and the linked path is absolute. `git = "<local path>"` and
 `host` + `path` are deprecated spellings of `path` and `repo`, and phora warns when it reads them.
@@ -606,6 +610,43 @@ root = "modules"
 exclude = ["**/*.bak"]
 ```
 
+#### Build sources
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `inputs` | array of source names | required | sources deployed under `$PHORA_INPUT/<name>` before the command runs |
+| `run` | string | | command run by `shell` |
+| `shell` | string | `"sh -c"` | shell for `run` |
+| `cmd` | array | | program and arguments run directly, instead of `run` |
+| `key` | command | | runs every sync; its stdout joins the build key |
+
+Set exactly one of `run` and `cmd`. An input must be a declared, non-build source; a transitive
+input arrives with its dependencies composed, as an import would deploy it.
+
+The command runs in the project directory with `PHORA_INPUT`, `PHORA_OUTPUT` (an empty directory)
+and `PHORA_SOURCE`. Its stdout goes to stderr. On exit 0, phora commits everything under
+`PHORA_OUTPUT` into its cache, with symlinks captured as the files they point to, and deploys that
+commit like any copy source.
+
+The build key hashes the command, the stdout of `key`, and every materialized input file. A sync
+reruns the command only when the key differs from the one in the lock; `phora update <source>`
+forces a rerun. If a rerun fails, the previous output stays deployed and the sync exits 1.
+`--frozen` never runs a build.
+
+```toml
+[sources.tropos]
+repo = "me/tropos"
+
+[sources.henia]
+build = { inputs = ["tropos"], run = "henia build $PHORA_INPUT/tropos --output $PHORA_OUTPUT" }
+
+[targets.claude]
+path = "~/.claude"
+
+[targets.claude.sources]
+henia = { take = [{ "claude/" = "." }] }
+```
+
 ### targets
 
 | Key | Type | Default | Meaning |
@@ -613,14 +654,12 @@ exclude = ["**/*.bak"]
 | `path` | path | required | deployment directory; `~` expands |
 | `sources` | array \| table | none | bindings; see [bindings](#bindings) |
 | `layout` | string \| table | `"flat"` | see [layouts](#layouts) |
-| `phase` | `"deploy"` \| `"prepare"` | `"deploy"` | `prepare` targets deploy first, before `post_prepare` |
 | `imports` | array | none | transitive sources to compose here; see [imports](#imports) |
 | `take` | table | none | per-import `take`, keyed by the imported source |
 | `collapse` | table | none | per-import `collapse`, keyed by the imported source |
 | `hooks` | table | none | see [hooks](#hooks) |
 
-`sources` is an allow-list: an omitted key or `[]` deploys nothing. Prepare and deploy targets must
-use separate directory trees.
+`sources` is an allow-list: an omitted key or `[]` deploys nothing.
 
 ```toml
 [targets.neovim]
@@ -709,18 +748,16 @@ layout = { type = "prefixed", separator = "/" }
 | Key | Runs | On failure |
 | --- | --- | --- |
 | `[hooks] pre_sync` | first, before any source is read | the remaining entries still run, then the sync stops and the lock is left alone |
-| `[hooks] post_prepare` | after `prepare` targets deploy, before other sources resolve | commands after it are skipped, deploy targets stay as they were, and the sync exits 1 |
 | `[hooks] post_sync` | after your `on_change` hooks, before an imported dependency's `on_change` | the sync exits 1 |
 | `[hooks] when` | reserved; the only value is `"always"` | |
-| `[targets.<t>.hooks] pre_deploy` | once per target, before any target of the same phase is written | see `pre_deploy_on_fail` |
+| `[targets.<t>.hooks] pre_deploy` | once per target, before any target is written | see `pre_deploy_on_fail` |
 | `[targets.<t>.hooks] pre_deploy_on_fail` | `"abort"` (default) stops the sync; `"skip"` skips that target | |
 | `[targets.<t>.hooks] on_change` | after this target's artifacts were added or changed | the sync exits 1 and the hook runs again next time |
 
-A sync runs in this order: `pre_sync`, compose imports, `prepare` targets with their own
-`pre_deploy` and `on_change`, `post_prepare`, then for deploy targets: resolve, plan, `pre_deploy`,
-apply, prune, your `on_change`, `post_sync`, and the trusted `on_change` hooks of imported
-dependencies. A failed `pre_sync` or `post_prepare`, or an aborting `pre_deploy`, skips everything
-after it, `post_sync` included.
+A sync runs in this order: `pre_sync`, [build sources](#build-sources), compose imports, resolve,
+plan, `pre_deploy`, apply, prune, your `on_change`, `post_sync`, and the trusted `on_change` hooks
+of imported dependencies. A failed `pre_sync` or an aborting `pre_deploy` skips everything after it,
+`post_sync` included.
 
 A hook is a string run by `sh -c`, a table, or an array of them run in order with duplicates
 dropped. `{ run = "...", shell = "bash -c" }` picks the shell; `{ cmd = ["prog", "arg"] }` runs the
@@ -728,7 +765,7 @@ program directly, with no shell.
 
 | Hook | Environment |
 | --- | --- |
-| `pre_sync`, `post_prepare` | `PHORA_TARGETS`: every configured target name, space-separated |
+| `pre_sync` | `PHORA_TARGETS`: every configured target name, space-separated |
 | `pre_deploy` | `PHORA_TARGET`, `PHORA_TARGET_PATH` |
 | `on_change` | `PHORA_TARGET`; `PHORA_CHANGED` and `PHORA_CHANGED_NAMES`, newline-separated deployed paths and artifact names |
 | `on_change` from an import | `PHORA_TARGET`: the composed target path |
@@ -816,7 +853,7 @@ version control. Sources it declares or overrides are locked in `phora.local.loc
 | top level, `[paths]`, `[defaults]`, `[vars]` | per key |
 | `[hosts.<name>]` | per key |
 | `[sources.<name>]` | per key; a new kind replaces the old one, and any ref key replaces all three |
-| `[targets.<name>]` | `path` is required; `sources`, `layout`, `phase`, `imports`, `take`, `collapse` and `hooks` each replace the base value whole |
+| `[targets.<name>]` | `path` is required; `sources`, `layout`, `imports`, `take`, `collapse` and `hooks` each replace the base value whole |
 | `[hooks]` | replaces the base table whole |
 
 An empty `take` or `collapse` table in the overlay clears the base one. Overriding a source with a

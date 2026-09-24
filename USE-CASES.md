@@ -516,8 +516,8 @@ that a new schema breaks your code.
 You keep your agent skills, agents and instructions in one repository, and each
 harness (Claude Code, Codex, pi) wants them in its own format and directory. A
 compiler can translate them, but it needs pinned inputs before it runs, and its
-output still has to land in each harness's home. Hooks are the seam between the
-two.
+output still has to land in each harness's home. A build source covers both
+ends.
 
 This is how [srnnkls/dotfiles](https://github.com/srnnkls/dotfiles) deploys
 [tropos](https://github.com/srnnkls/tropos), compiled by
@@ -545,22 +545,16 @@ path = "skills/loqui/reference/loqui"
 sources.loqui = { collapse = false }
 ```
 
-The dotfiles repository stages that package, compiles it, and links the result:
+The dotfiles repository compiles that package into a build source:
 
 ```toml
 # dotfiles/phora.toml
 [hooks]
-post_prepare = "henia build .tropos --output .henia --clean --harness claude,codex,pi"
 post_sync = "scrut test tests/scrut/tropos.md"
 
 [sources]
-tropos = { repo = "srnnkls/tropos", branch = "prototype/henia-phora", transitive = true }
-henia = { path = "./.henia", deploy = "link" }
-
-[targets.tropos]
-phase = "prepare"
-path = ".tropos"
-imports = ["tropos"]
+tropos = { repo = "srnnkls/tropos", branch = "main", transitive = true }
+henia = { build = { inputs = ["tropos"], run = "henia build $PHORA_INPUT/tropos --output $PHORA_OUTPUT --harness claude,codex,pi", key = "henia --version" } }
 ```
 
 Home directories are machine-local, so the deploy targets live in
@@ -577,34 +571,31 @@ pi = { path = "~/.pi/agent", sources.henia = { take = [{ "pi/" = "." }], collaps
 
 One `phora sync` then runs:
 
-1. The prepare phase copies tropos at its pinned commit into `.tropos`, with
-   loqui under `.tropos/skills/loqui/reference/loqui`.
-2. `post_prepare` runs henia, which writes `.henia/claude`, `.henia/codex` and
-   `.henia/pi`.
-3. The deploy phase links each harness's files into its home.
-   `{ "claude/" = "." }` turns `claude/skills/bash/SKILL.md` into
-   `~/.claude/skills/bash/SKILL.md`.
-4. `post_sync` runs a scrut check that every slice is linked.
+1. phora deploys tropos at its pinned commit into a scratch directory, with
+   loqui under `skills/loqui/reference/loqui`.
+2. henia compiles that tree into `$PHORA_OUTPUT/claude`, `codex` and `pi`, and
+   phora commits the output into its cache.
+3. Each harness's files are copied into its home. `{ "claude/" = "." }` turns
+   `claude/skills/bash/SKILL.md` into `~/.claude/skills/bash/SKILL.md`.
+4. `post_sync` runs a scrut check on the finished deployment.
 
 `phora preview --target claude` shows the rename for each file:
 
 ```
 claude -> ~/.claude
-  henia@link claude/CLAUDE.md -> CLAUDE.md -> ~/.claude/CLAUDE.md
-  henia@link claude/agents/reviewer.md -> agents/reviewer.md -> ~/.claude/agents/reviewer.md
-  henia@link claude/skills/bash/SKILL.md -> skills/bash/SKILL.md -> ~/.claude/skills/bash/SKILL.md
+  henia@3f9c21ab claude/CLAUDE.md -> CLAUDE.md -> ~/.claude/CLAUDE.md
+  henia@3f9c21ab claude/agents/reviewer.md -> agents/reviewer.md -> ~/.claude/agents/reviewer.md
+  henia@3f9c21ab claude/skills/bash/SKILL.md -> skills/bash/SKILL.md -> ~/.claude/skills/bash/SKILL.md
 ```
 
-Because the deploy links point into `.henia`, a rebuild shows up in every
-harness at once. `.henia` can be missing on the first run. If henia fails, the
-sync stops before the deploy phase and `post_sync` doesn't run, so the check
-only ever sees a finished deployment. The links stay as they were, and they
-show whatever henia left in `.henia`; a compiler that builds into a temporary
-directory and moves it into place on success keeps them intact.
+henia runs again only when the tropos pin, loqui's pin, or `henia --version`
+changes. Its output is locked and hashed, so `phora verify` catches a hand
+edit in `~/.claude`. If henia fails, the previous output stays deployed and the
+sync exits non-zero.
 
 To work on tropos itself, point the package at a checkout in
-`phora.local.toml`. The prepare phase then reads the working tree, uncommitted
-edits included:
+`phora.local.toml`. The build then reads the working tree, uncommitted edits
+included, and reruns whenever a file changes:
 
 ```toml
 [sources.tropos]
@@ -612,13 +603,13 @@ path = "~/projects/tropos"
 deploy = "link"
 ```
 
-To move to a newer tropos and drop links to skills it removed, run
+To move to a newer tropos and drop skills it removed, run
 `phora update tropos --fast-forward --prune`. See
-[Preparing inputs](GUIDE.md#preparing-inputs),
+[Building sources](GUIDE.md#building-sources),
 [Local packages](GUIDE.md#local-packages) and [Renaming](GUIDE.md#renaming).
 
 phora runs henia and deploys what it writes; it doesn't know the harness
-formats, and it can't undo a hook's side effects.
+formats.
 
 ## Smaller situations
 
@@ -668,7 +659,7 @@ sources = ["runbooks"]
   [drift](tests/scrut/drift.md), [orphans](tests/scrut/orphans.md),
   [release-assets](tests/scrut/release-assets.md),
   [history](tests/scrut/history.md) for the history overlay,
-  [prepare](tests/scrut/prepare.md) for prepare-then-deploy,
+  [build](tests/scrut/build.md) for build sources,
   [transitive](tests/scrut/transitive.md) for composed dependencies,
   [lifecycle](tests/scrut/lifecycle.md) for the core add-sync-verify loop,
   [manage](tests/scrut/manage.md) for eject, update and rebuild-registry, and

@@ -19,7 +19,7 @@ Every flag and config key is listed in [REFERENCE.md](REFERENCE.md); the mechani
 - [Templating](#templating)
 - [Link mode](#link-mode)
 - [History overlay](#history-overlay)
-- [Preparing inputs](#preparing-inputs)
+- [Building sources](#building-sources)
 - [Transitive dependencies](#transitive-dependencies)
 - [Under the hood](#under-the-hood)
 - [When something looks wrong](#when-something-looks-wrong)
@@ -45,14 +45,12 @@ them, and remembers what it put where. A handful of terms carry the whole model:
 A `phora sync` runs these steps in order:
 
 1. Run the global `pre_sync` hook.
-2. Read the manifests of any [transitive dependencies](#transitive-dependencies).
-3. Deploy [prepare-phase targets](#preparing-inputs), with their own
-   `pre_deploy` and `on_change` hooks, then run `post_prepare`, if you have any.
-   The steps below cover the deploy-phase targets.
+2. Run any [build sources](#building-sources) whose inputs changed.
+3. Read the manifests of any [transitive dependencies](#transitive-dependencies).
 4. Resolve every source to one commit, fetching what the cache lacks.
 5. Work out which artifacts each target should hold.
 6. Compare that plan with the disk and the registry, and ask about conflicts.
-7. Run each deploy-phase target's `pre_deploy` gate, then look at the disk again.
+7. Run each target's `pre_deploy` gate, then look at the disk again.
 8. Write the artifacts.
 9. Remove what you asked to prune.
 10. Run your `on_change` hooks, then `post_sync`, then the approved `on_change`
@@ -582,13 +580,12 @@ waits for [your approval](#trusting-a-dependencys-hooks).
 
 ## Hooks
 
-A hook is a command phora runs at a fixed point in a sync. There are five:
+A hook is a command phora runs at a fixed point in a sync. There are four:
 
 | Hook | Scope | Runs |
 | --- | --- | --- |
 | `pre_sync` | `[hooks]` | first, before phora fetches or plans anything |
-| `post_prepare` | `[hooks]` | after prepare-phase targets land |
-| `pre_deploy` | `[targets.<t>.hooks]` | before any target of its phase is written |
+| `pre_deploy` | `[targets.<t>.hooks]` | before any target is written |
 | `on_change` | `[targets.<t>.hooks]` | after that target gained or changed artifacts |
 | `post_sync` | `[hooks]` | at the end of every sync that reaches deploy |
 
@@ -621,11 +618,9 @@ pre_deploy_on_fail = "skip"
 ```
 
 `pre_deploy` runs once phora knows what it will write, and before it writes
-anything. Every deploy-phase target's gate runs before the first deploy-phase
-target is touched, because a half-applied sync is the hardest state to reason
-about. A prepare-phase target's gate runs in the prepare phase, before any
-prepare-phase target is written. The hook receives `$PHORA_TARGET` and
-`$PHORA_TARGET_PATH`.
+anything. Every target's gate runs before the first target is touched, because
+a half-applied sync is the hardest state to reason about. The hook receives
+`$PHORA_TARGET` and `$PHORA_TARGET_PATH`.
 
 By default a failing `pre_deploy` aborts the whole sync. With
 `pre_deploy_on_fail = "skip"`, only that target is skipped and the rest deploy.
@@ -685,24 +680,18 @@ as two hooks.
 
 ### A worked example
 
-The [dotfiles](https://github.com/srnnkls/dotfiles) repository uses two hooks to
-compile agent skills between the two phases of a sync:
+The [dotfiles](https://github.com/srnnkls/dotfiles) repository compiles its
+agent skills with a [build source](#building-sources) and checks the result with
+`post_sync`:
 
 ```toml
 [hooks]
-post_prepare = "henia build .tropos --output .henia --clean --harness claude,codex,pi"
 post_sync = "scrut test tests/scrut/tropos.md"
-
-[targets.tropos]
-phase = "prepare"
-path = ".tropos"
-imports = ["tropos"]
 ```
 
-The prepare phase stages the pinned tropos package in `.tropos`. `post_prepare`
-compiles it into `.henia`, and the deploy phase links the output into each
-harness's home. `post_sync` then checks the finished deployment. If the compiler
-fails, nothing is deployed and the check doesn't run. The full setup is in
+`post_sync` runs after every target has landed, so the check only ever sees a
+finished deployment. If the build fails, the previous output stays deployed and
+the sync exits non-zero. The full setup is in
 [Generating per-agent skills](USE-CASES.md#generating-per-agent-skills-from-one-canonical-set).
 
 ## Templating
@@ -840,72 +829,52 @@ while the clone's `.git` is there.
 Inside your own repository the deployment looks like an embedded repository. Add
 its path to `.gitignore` unless you mean to track it.
 
-## Preparing inputs
+## Building sources
 
-A target with `phase = "prepare"` deploys before everything else, so a generator
-can build from it. The `post_prepare` hook runs the generator, and ordinary
-targets then deploy its output.
+A `build` source runs a command over pinned inputs, and its output becomes the
+source's content. phora commits the output into its cache, so it locks, deploys,
+verifies and prunes like any other copy source.
 
 ```toml
-# phora.toml
 [sources.input]
 path = "./src-input"
 include = ["editor/**"]
 
 [sources.output]
-path = "./generated"
-deploy = "link"
+build = { inputs = ["input"], run = "cp -R $PHORA_INPUT/input/editor $PHORA_OUTPUT/" }
 
-[hooks]
-post_prepare = "mkdir -p generated && cp -R stage/editor generated/"
-post_sync = "test -f deployed/editor/init.lua && echo smoke-ok"
-
-[targets.input]
-path = "stage"
-phase = "prepare"
-sources.input = { collapse = false }
-
-[targets.output]
+[targets.deployed]
 path = "deployed"
 sources.output = { collapse = false }
 ```
 
-One `phora sync` then runs:
+Before the command runs, phora deploys each input into a scratch directory at
+`$PHORA_INPUT/<name>`, with the input's offer applied. A transitive input
+arrives with its dependencies composed, the same way an import would deploy it.
+The command then writes into `$PHORA_OUTPUT`, which starts empty. It runs in the
+project directory, like a hook, and its stdout goes to stderr so `sync --json`
+stays readable.
 
-1. `pre_sync`.
-2. The prepare phase: `input` deploys into `stage/`.
-3. `post_prepare` builds `generated/` from `stage/`.
-4. The deploy phase: `output` links `generated/` into `deployed/`.
-5. `post_sync`.
+phora reruns the command only when the build key changes. The key hashes the
+command and every input file, so an `update` of an input, or an uncommitted
+edit to a link-mode input, triggers a build; a plain `sync` doesn't. When the
+generator itself changes, name a command whose output reflects it:
 
-The default phase is `"deploy"`. A target that imports a
-[dependency](#transitive-dependencies) passes its phase down to everything the
-dependency brings along. The generated directory may be missing on the first run.
+```toml
+[sources.output]
+build = { inputs = ["input"], run = "gen $PHORA_INPUT $PHORA_OUTPUT", key = "gen --version" }
+```
 
-Prepare and deploy targets need separate directory trees. phora rejects any
-overlap before it writes, including overlap through a symlink.
+`phora update output` rebuilds unconditionally.
 
-When a step fails:
+A build that exits non-zero, or writes nothing, never reaches your targets. If
+the source has built before, the previous output stays deployed, the sync warns
+and exits non-zero, and the next sync tries again. A first build that fails
+stops the sync. `--frozen` never runs a build: it deploys the locked output, or
+fails when the key no longer matches.
 
-- A conflict or a failed artifact in the prepare phase stops the sync before
-  `post_prepare`.
-- A failing `post_prepare` command stops the commands after it, and the deploy
-  phase does not run.
-- Prepared files and their new pins stay in place, and the pins of anything not
-  yet visited are kept. Fix the cause and sync again.
-- phora cannot undo what a hook did. Keep your inputs outside the generator's
-  output directory, and have the generator publish its output only after a
-  successful build.
-
-A prepare-phase target's own `pre_deploy` and `on_change` run inside the
-prepare phase, before `post_prepare`. `post_prepare` runs once per sync and
-receives `$PHORA_TARGETS`. `--no-hooks`
-suppresses it with the rest, so a `--frozen --no-hooks` replay needs the
-generated output to exist already.
-
-Pruning in the prepare phase never touches deploy-phase records. To advance an
-input and clear out both dropped inputs and stale generated links, run
-`phora update <source> --fast-forward --prune`.
+Symlinks in the output are captured as the files they point to. Builds come
+only from your own config; a dependency's `phora.toml` can't declare one.
 
 ## Transitive dependencies
 
@@ -1127,8 +1096,8 @@ phora writes four things:
 - `phora.local.lock`: pins for every source named in `phora.local.toml`,
   whether it declares the source or overrides one from `phora.toml`.
 - The cache: one mirror per repository, holding just the pinned commits and the
-  files you deploy from them, plus imported downloads. You can delete it; the
-  next sync fetches the locked commits again.
+  files you deploy from them, plus imported downloads and build outputs. You can
+  delete it; the next sync fetches the locked commits again and reruns builds.
 - The state directory: the registry of what landed where, with hashes. It is the
   only record of what phora wrote, so treat it like data.
 
@@ -1311,10 +1280,9 @@ parentheses.
 
 1. Merge `phora.toml` with `phora.local.toml` and validate.
 2. Run the `pre_sync` hooks. If one fails, the run ends here.
-3. Compose transitive dependencies into the config (compose).
-4. If any target has `phase = "prepare"` or `post_prepare` is set, split the run
-   (see [Preparation](#preparation)). Otherwise run the workspace pass once over
-   every target.
+3. Run build sources (build); see [Builds](#builds).
+4. Compose transitive dependencies into the config (compose).
+5. Run the workspace pass over every target.
 
 A *workspace pass* runs:
 
@@ -1340,24 +1308,25 @@ Under `--frozen` on a read-only state root the run holds no lock. If observation
 finds anything to write, including a stat refresh, the run stops with an error
 naming the state root.
 
-### Preparation
+### Builds
 
-[Prepare-phase targets](#preparing-inputs) split one run into two passes that
-share the registry and journal:
+Each build source runs through these steps:
 
-1. Partition targets by `phase`. Each pass resolves the sources its own targets
-   bind. A deploy target whose path lies inside a prepare target is rejected. A
-   deploy target above a prepare target is projected first, and rejected if any
-   artifact lands inside the prepare tree.
-2. Run the workspace pass over the prepare targets, with the global `[hooks]`
-   removed.
-3. If that pass skipped or ejected anything, or failed, the run fails. Lock
-   entries resolved so far are merged into the previous lock.
-4. Run `post_prepare` hooks in order, stopping at the first failure. A failure
-   fails the run.
-5. Rebuild the prepare roots from the current config, so symlinks a generator
-   created are seen, and run the workspace pass over the deploy targets. Sources
-   resolve against the lock that the prepare pass produced.
+1. Build an input workspace: one target per input under a scratch directory,
+   importing a transitive input and binding any other with `collapse = false`.
+2. Run the workspace pass over it with a private registry, overwriting and
+   without hooks. Its lock entries join the run's lock, so inputs stay pinned.
+3. Hash the command, the `key` output and every materialized file into the build
+   key.
+4. If the lock holds an entry with that key and its commit is in the cache,
+   reuse it. Otherwise, unless `--frozen`, run the command into an empty output
+   directory and import the output as a synthetic commit into one shared build
+   mirror.
+5. Delete the scratch directory.
+
+Build outputs share one mirror because their commits are content-addressed and
+always read by id. The main workspace pass skips build sources during resolution
+and routes their pinned commits into projection directly.
 
 ### Resolution and the lock
 
@@ -1548,13 +1517,8 @@ only that artifact.
 in this order:
 
 1. `pre_sync`, before any source is resolved.
-2. The prepare pass, when prepare-phase targets exist: their `pre_deploy` gates,
-   their deploys, their `on_change` hooks, then trusted transitive `on_change`
-   hooks under prepare-target paths. Global `[hooks]` don't run inside this
-   pass.
-3. `post_prepare`, after the prepare pass succeeds.
-4. The deploy pass: `pre_deploy` gates of deploy-phase targets, their deploys,
-   `on_change`, `post_sync`, then trusted transitive `on_change` hooks.
+2. `pre_deploy` gates, deploys, `on_change`, `post_sync`, then trusted
+   transitive `on_change` hooks.
 
 Commands within a scope are deduplicated by command and shell.
 
@@ -1573,9 +1537,8 @@ don't fire the hook. A failed hook records nothing and fires again next run.
 `when` value is `"always"`.
 
 A gate failure (`pre_sync`, or `pre_deploy` with `abort`) ends the run before
-any drop, deploy or prune in its pass, and later hooks don't run. A deploy-phase
-`pre_deploy` abort comes after the prepare pass, so prepare-phase targets stay
-deployed. What the hook itself did is not undone.
+any drop, deploy or prune, and later hooks don't run. What the hook itself did
+is not undone.
 
 A [transitive hook candidate](#trusting-a-dependencys-hooks) is pinned by a
 preimage: BLAKE3 over the command, shell, hook kind and the dependency's
