@@ -1,141 +1,143 @@
-# version = 1              # optional; 1 is the only schema version and the default
+# phora.toml: one example of every section. Reference: REFERENCE.md#configuration
 
-# protocol selects https vs ssh for host-aliased sources; default https.
-# Uncomment to flip the global default (still overridable per source):
-# protocol = "ssh"
+# protocol = "ssh"              # remote template for forge sources; default "https"
 
-# A bare `phora add <url>` (no --to) ensures [targets.default] (path ".", flat)
-# and binds the source into it. Set auto_target = false to make bare add
-# declare-only (it then deploys nowhere until bound or routed with --to).
 [defaults]
-auto_target = true
+auto_target = true              # `phora add` without --to binds into [targets.default]
 
-# Pin where phora keeps its git-mirror cache and per-project state, overriding the
-# XDG env vars and platform defaults. Both keys are optional and independent. A
-# relative value resolves under the project root; an absolute value is used as-is.
-# The configured path IS the root (no `phora` leaf is appended).
 # [paths]
-# cache = ".phora/cache"   # git mirrors live under <root>/git/
-# state = ".phora/state"   # registry/locks/journal live under <root>/projects/
+# cache = ".phora/cache"        # git mirrors live under <cache>/git/
+# state = ".phora/state"        # registry, journal and state.lock live under <state>/projects/
 
-# github, gitlab, codeberg, sr.ht, bitbucket ship built in (both https + ssh),
-# so a `[hosts]` block is only needed to add a forge or override auth/remote.
-[hosts.github]
-auth = { type = "token", env = "GITHUB_TOKEN" }
+[vars]                          # values for *.tmpl files; phora.local.toml overrides them per key
+email = "me@example.com"
+editor = "nvim"
 
-# A custom forge: `remote` is a string (https only) or a { https, ssh } table.
-# Templates fill {path} verbatim; {owner} is the first segment, {repo} the rest.
-[hosts.company]
+[hosts.company]                 # a custom forge; github, gitlab, codeberg, sr.ht and bitbucket are built in
 remote = { https = "https://git.company.com/{path}.git", ssh = "git@git.company.com:{path}.git" }
-auth = { type = "ssh", key = "~/.ssh/id_ed25519" }
 
-# A source is a git repo, and it OWNS its selection: `root` re-anchors the slice,
-# `include`/`exclude` compose `include − exclude` (exclude wins; no `!` negation).
-# Pin with exactly one of branch / tag / rev (defaults to branch `main`).
-# Pick exactly one source kind: forge (host + repo), local (path), literal (git),
-# or url. A bare `repo = "owner/repo"` defaults to github; a bare `path` is LOCAL.
+[hooks]
+pre_sync = "test -w ~/.config"                         # gate before any source is resolved; failure stops the sync
+post_sync = "echo 'phora: synced'"                     # runs after target on_change hooks, before trusted transitive ones
 
-# Forge source: resolves via the host's `remote` template at sync time. `root`
-# re-anchors the offer at `modules`, so artifacts are named relative to it.
-[sources.dotfiles]
-host = "github"          # omit to default to github when `repo` is set
-repo = "me/dotfiles"     # deprecated alias: `path` (forge owner/repo) under a host
+[sources.dotfiles]              # forge source, following a branch
+host = "github"                 # the default when repo is set
+repo = "me/dotfiles"
 branch = "main"
-root = "modules"
+root = "modules"                # the offer starts at modules/
 
 [sources.internal]
 host = "company"
-repo = "team/sub/proj"   # nested paths are fine ({owner}/{repo} ≡ {path})
-protocol = "ssh"         # per-source opt-in to ssh
+repo = "team/sub/proj"          # nested paths fill {path}
+protocol = "ssh"
 root = "configs"
-include = ["editor", "lint"]
-exclude = ["**/test/**", "**/*.bak"]
+include = ["editor", "lint"]    # gitignore syntax
+exclude = ["**/test/**", "**/*.bak"] # exclude wins over include
 
-# Local source: `path` is a filesystem path used verbatim as the remote, exactly
-# like a `git = "/abs/local/checkout"` alias.
-[sources.scratch]
-path = "~/dev/scratch-configs"
-branch = "main"
-root = "modules"
-
-# Forge source pinned to a tag: the source default ref is `v0.55.0`. A binding may
-# override the ref per target (see [targets.tools]), so one source can serve several
-# versions at once.
-[sources.fzf]
+[sources.fzf]                   # pinned to a tag; bindings can pin other refs
 repo = "junegunn/fzf"
 tag = "v0.55.0"
 include = ["bin"]
 
-# Literal remote: any https, ssh://, or scp-style URL, unchanged from before.
-[sources.loqui]
+[sources.loqui]                 # literal git remote, pinned to a full commit id
 git = "https://github.com/srnnkls/loqui.git"
-rev = "9f1c2ab"
+rev = "9e5d4de28b21871d2b67f40943e1d6d6ffa701a3"
 root = "languages"
 allow_symlinks = false
 preserve_executable = true
-# For a local dev loop, override this source onto a local checkout and live-link
-# it via `deploy = "link"` — local-overlay-only. See phora.local.example.toml.
 
-# Url source: one of the four kinds (forge XOR local XOR git XOR url). A url downloads and
-# extracts (tar, tar.gz/tgz, zip, or a raw single file named from the URL basename);
-# a single top-level dir is auto-stripped, so version-stamped release tarballs need
-# no per-version `root`. `branch`/`tag`/`rev`/`root` are rejected on a url source.
-[sources.fzf-bin]
-url = "https://github.com/junegunn/fzf/releases/download/0.55.0/fzf-0.55.0-linux_amd64.tar.gz"
-# Optional integrity check, verified before extraction; a mismatch errors.
-digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-# digest = "blake3:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+[sources.scratch]               # local checkout; ~ expands to your home directory
+path = "~/dev/scratch-configs"
+branch = "main"
+
+[sources.fzf-bin]               # a download, imported as one snapshot
+url = "https://github.com/junegunn/fzf/releases/download/v0.55.0/fzf-0.55.0-linux_amd64.tar.gz"
+digest = "sha256:4df2393776942780ddab2cea713ddaac06cd5c3886cd23bc9119a6d3aa1e02bd" # checked before extraction
 include = ["fzf"]
-# Content is imported as a deterministic, content-addressed synthetic git commit:
-# identical bytes ⇒ identical commit ⇒ no lock churn.
 
-# A target is a directory artifacts are projected into. `sources` is an explicit
-# allow-list: list names to deploy them, or set `[]` (or omit the key) to deploy
-# nothing. Manage the list with `phora bind`/`phora unbind`. A `sources` entry is a
-# bare source name, or a table that refines how THIS target consumes the source:
-# `source` = provenance, `take` = this target's own subset/rename of the offer.
+[sources.toolkit]               # a package: its own phora.toml targets compose under an importing target
+repo = "me/toolkit"
+transitive = true
+
+[sources.rust-book]             # deployed with its git history below
+repo = "rust-lang/book"
+
+[sources.skill-src]             # generator input
+repo = "me/skill-sources"
+
+[sources.skills]                # generator output, committed like any other source
+build = { inputs = ["skill-src"], run = "./scripts/gen-skills $PHORA_INPUT/skill-src $PHORA_OUTPUT" }
+
 [targets.neovim]
 path = "~/.config/nvim"
+
 [targets.neovim.sources]
-# Alias the `dotfiles` source under a distinct `nvim` identity, then subset its
-# offer to just the editor's tree with `take` (the new way a target slices a source).
-nvim = { source = "dotfiles", take = ["nvim/**"] }
+nvim = { source = "dotfiles", take = ["nvim/**"], template = ["nvim/lua/user.lua"] } # identity nvim, one slice
 
-# One source feeding one target as two independent slices: distinct identities
-# (the table keys) each `take` a different subtree, and `by-source` labels each slice.
+[targets.neovim.hooks]
+on_change = "nvim --headless '+Lazy! sync' +qa" # runs after this target's artifacts change
+
 [targets.editors]
-path = "~/.config"
-layout = "by-source"
-[targets.editors.sources]
-nvim  = { source = "dotfiles", take = ["nvim/**"] }
-helix = { source = "dotfiles", take = ["helix/**"] }
+path = "~/.config/editors"
+layout = "by-source"            # each artifact lands under its binding identity
 
-# `take` can rename as it subsets: `{ src = dest }` projects one offered path to a
-# new destination name, alongside literal/glob leaves it keeps as-is.
+[targets.editors.sources]
+nvim = { source = "dotfiles", take = ["nvim/**"] }
+helix = { source = "dotfiles", take = ["helix/**"], collapse = false } # one artifact per file
+
 [targets.vscode]
 path = "~/.config/Code/User"
-layout = "flat"
+
 [targets.vscode.sources]
-dotfiles = { take = ["vscode/**", { "vscode/settings.json" = "settings.json" }] }
-internal = { }
+dotfiles = { take = ["vscode/**", { "vscode/settings.json" = "settings.json" }] } # glob plus a rename
+internal = {}
+
+[targets.agents]
+path = "~/.config/agents"
+
+[targets.agents.sources]
+dotfiles = { take = [{ "claude/" = "." }] } # subtree rename: claude/ lands at the target root
 
 [targets.policies]
 path = "~/.cupcake/policies/claude"
 sources = ["loqui"]
 layout = { type = "prefixed", separator = "/" }
 
+[targets.policies.hooks]
+pre_deploy = { run = "test -d ~/.cupcake", shell = "bash -c" } # gate checked before any target is written
+pre_deploy_on_fail = "skip"     # a failed gate skips this target only
+
 [targets.bin]
 path = "~/.local/bin"
 sources = ["fzf-bin"]
-layout = "flat"
 
-# One source pinned to two versions in one project: distinct identities (the table
-# keys) each pin their own ref, so a binding's branch/tag/rev overrides the source
-# default for that target alone. Each distinct ref gets its own lock entry (at its own
-# commit); a bare binding would inherit the source ref and share the source's single entry.
+[targets.bin.hooks]
+on_change = { cmd = ["fzf", "--version"] } # runs the program directly, with no shell
+
 [targets.tools]
 path = "~/.local/tools"
 layout = "by-source"
+
 [targets.tools.sources]
-stable = { source = "fzf", tag = "v0.55.0" }
+stable = { source = "fzf", tag = "v0.55.0" } # two identities, two refs, two lock entries
 canary = { source = "fzf", tag = "v0.56.0" }
+
+[targets.references]
+path = "~/src/references"
+
+[targets.references.sources]
+rust-book = { history = true }  # a verified copy with `git log` available
+
+[targets.toolkit]
+path = "~/.config/toolkit"
+imports = [{ source = "toolkit", tag = "v1.2.0" }] # import the package at a tag
+
+[targets.toolkit.take]
+toolkit = ["skills/**"]         # narrow what the package deploys
+
+[targets.toolkit.collapse]
+toolkit = false
+
+[targets.skills]
+path = "~/.claude/skills"
+sources = ["skills"]

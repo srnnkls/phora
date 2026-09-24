@@ -128,6 +128,30 @@ EOF
 	rm -f "$PWD/phora.toml.bak"
 }
 
+seed_config_changed_env() {
+	url="$1"
+	target="$PWD/target-home"
+	mkdir -p "$target"
+	cat >"$PWD/phora.toml" <<'EOF'
+version = 1
+
+[sources.dotfiles]
+path = "__URL__"
+branch = "main"
+include = ["editor", "lint"]
+
+[targets.home]
+path = "__TARGET__"
+sources = ["dotfiles"]
+layout = "flat"
+
+[targets.home.hooks]
+on_change = "echo \"$PHORA_CHANGED_NAMES\" > \"$HOME/names.log\"; echo \"$PHORA_CHANGED\" > \"$HOME/paths.log\""
+EOF
+	sed -i.bak -e "s#__URL__#$url#" -e "s#__TARGET__#$target#" "$PWD/phora.toml"
+	rm -f "$PWD/phora.toml.bak"
+}
+
 # Exec (shell-free) on_change hook; the argv `$HOME` token must reach the file verbatim — a shell would expand it. Two identical entries also exercise enum-aware dedupe.
 seed_config_exec_hook() {
 	url="$1"
@@ -480,6 +504,114 @@ transitive = true
 path = "$target"
 imports = ["mydeps"]
 EOF
+}
+
+serve_http_dir() {
+	dir="$1"
+	port="$(python3 -c 'import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()')"
+	python3 -m http.server "$port" --bind 127.0.0.1 --directory "$dir" \
+		>"$PWD/http.log" 2>&1 </dev/null &
+	printf '%s\n' "$!" >"$PWD/http.pid"
+
+	attempt=0
+	while [ "$attempt" -lt 100 ]; do
+		if python3 -c 'import socket, sys
+socket.create_connection(("127.0.0.1", int(sys.argv[1])), 0.2).close()' "$port" 2>/dev/null; then
+			printf 'http://127.0.0.1:%s\n' "$port"
+			return 0
+		fi
+		attempt=$((attempt + 1))
+		sleep 0.1
+	done
+	return 1
+}
+
+stop_http_dir() {
+	if [ -f "$PWD/http.pid" ]; then
+		kill "$(cat "$PWD/http.pid")" 2>/dev/null
+		rm -f "$PWD/http.pid"
+	fi
+}
+
+sha256_of() {
+	python3 -c 'import hashlib, sys
+print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$1"
+}
+
+make_skills_source() {
+	repo="$PWD/src-$1"
+	mkdir -p "$repo"
+	_phora_git init -q -b main "$repo"
+
+	_phora_write "$repo/skills/skill-creator/SKILL.md" "# Skill creator
+
+Write the skill as instructions the agent follows literally.
+"
+	_phora_write "$repo/skills/skill-creator/reference/checklist.md" "- name the trigger
+"
+	_phora_write "$repo/skills/doc-writer/SKILL.md" "# Doc writer
+"
+	_phora_write "$repo/README.md" "skills collection
+"
+
+	_phora_git -C "$repo" add -A
+	_phora_commit "$_PHORA_GIT_AUTHOR_DATE" "$_PHORA_GIT_COMMITTER_DATE" \
+		"$repo" "skills"
+
+	printf '%s\n' "$repo"
+}
+
+make_agents_source() {
+	repo="$PWD/src-$1"
+	mkdir -p "$repo"
+	_phora_git init -q -b main "$repo"
+
+	_phora_write "$repo/AGENTS.md" "# Agent instructions
+
+Run the test suite before proposing a change.
+"
+	_phora_write "$repo/README.md" "spec toolkit
+"
+
+	_phora_git -C "$repo" add -A
+	_phora_commit "$_PHORA_GIT_AUTHOR_DATE" "$_PHORA_GIT_COMMITTER_DATE" \
+		"$repo" "agents"
+	_phora_git -C "$repo" tag "$2"
+
+	printf '%s\n' "$repo"
+}
+
+make_two_tag_source() {
+	repo="$PWD/src-$1"
+	mkdir -p "$repo"
+	_phora_git init -q -b main "$repo"
+
+	_phora_write "$repo/shell/completion.bash" "# completion v1
+_fixture_complete() { :; }
+"
+	_phora_write "$repo/shell/key-bindings.bash" "# key bindings
+bind '\"\\C-t\": transpose-chars'
+"
+	_phora_write "$repo/README.md" "fixture tool
+"
+
+	_phora_git -C "$repo" add -A
+	_phora_commit "$_PHORA_GIT_AUTHOR_DATE" "$_PHORA_GIT_COMMITTER_DATE" \
+		"$repo" "release one"
+	_phora_git -C "$repo" tag "$2"
+
+	_phora_write "$repo/shell/completion.bash" "# completion v2
+_fixture_complete() { compgen -f; }
+"
+	_phora_git -C "$repo" add -A
+	_phora_commit "@1700000002 +0000" "@1800000002 +0000" "$repo" "release two"
+	_phora_git -C "$repo" tag "$3"
+
+	printf '%s\n' "$repo"
 }
 
 # A source repo whose own tree carries a hook-shaped phora.toml under payload/ —
