@@ -22,7 +22,6 @@ use tempfile::TempDir;
 
 mod common;
 
-const COMMIT_TIME: u64 = 1_700_000_000;
 const OFFER_ROOT: &str = "art";
 
 fn sn(name: &str) -> SourceName {
@@ -194,7 +193,6 @@ fn new_stage(
         root.as_deref(),
         policy,
         staging_dir,
-        COMMIT_TIME,
         opt_in,
         |repo_relative| {
             let path = SourcePath::new(&repo_relative.to_string_lossy().replace('\\', "/"))?;

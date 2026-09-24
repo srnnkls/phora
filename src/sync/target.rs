@@ -1198,7 +1198,6 @@ fn deploy_one(
         ctx.root,
         &policy,
         &staging,
-        ctx.resolved.authored_at.unix_seconds(),
         ctx.template_opt_in,
         |repo_relative| {
             let path = SourcePath::new(&repo_relative.to_string_lossy().replace('\\', "/"))?;

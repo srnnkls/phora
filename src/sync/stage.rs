@@ -40,7 +40,6 @@ pub fn stage_artifact(
     root: Option<&Path>,
     policy: &ExportPolicy,
     staging_dir: &Path,
-    commit_time: u64,
     template_opt_in: &TemplateOptIn,
     mut resolve: impl FnMut(&Path) -> Result<(Vec<u8>, SourceEntryKind)>,
 ) -> Result<StagedArtifact> {
@@ -70,7 +69,6 @@ pub fn stage_artifact(
     let mut walk = ExportWalk {
         out_base: staging_dir,
         policy,
-        commit_time,
         files: Vec::new(),
         hasher: blake3::Hasher::new(),
         renderer: &renderer,
@@ -214,7 +212,6 @@ struct Rendered {
 pub(crate) struct ExportWalk<'a, 'r, F> {
     pub(crate) out_base: &'a Path,
     pub(crate) policy: &'a ExportPolicy,
-    pub(crate) commit_time: u64,
     pub(crate) files: Vec<F>,
     pub(crate) hasher: blake3::Hasher,
     pub(crate) renderer: &'a Renderer<'r>,
@@ -280,10 +277,9 @@ impl<F: StagedRecord> ExportWalk<'_, '_, F> {
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        write_leaf(
+        let mtime = write_leaf(
             &out_path,
             &data,
-            self.commit_time,
             executable && self.policy.preserve_executable,
         )?;
 
@@ -303,7 +299,7 @@ impl<F: StagedRecord> ExportWalk<'_, '_, F> {
             deployed_rel,
             ManifestEntryKind::File,
             data.len() as u64,
-            self.commit_time,
+            mtime,
             blake3::hash(&data).to_hex().to_string(),
         ));
         Ok(())
@@ -328,11 +324,7 @@ impl<F: StagedRecord> ExportWalk<'_, '_, F> {
             std::fs::create_dir_all(parent)?;
         }
         materialize_symlink(&out_path, target)?;
-        let metadata = std::fs::symlink_metadata(&out_path)?;
-        let mtime = filetime::FileTime::from_last_modification_time(&metadata)
-            .unix_seconds()
-            .try_into()
-            .map_err(|error| SourceError::Source(format!("read symlink mtime: {error}")))?;
+        let mtime = written_mtime(&std::fs::symlink_metadata(&out_path)?)?;
 
         hash_framed_entry(
             &mut self.hasher,
@@ -351,7 +343,8 @@ impl<F: StagedRecord> ExportWalk<'_, '_, F> {
     }
 }
 
-fn write_leaf(path: &Path, data: &[u8], commit_time: u64, executable: bool) -> Result<()> {
+/// Returns the write time, which the file keeps: a deployed copy is as new as a git checkout.
+fn write_leaf(path: &Path, data: &[u8], executable: bool) -> Result<u64> {
     use std::io::Write as _;
 
     let mut file = std::fs::File::create(path)?;
@@ -365,15 +358,14 @@ fn write_leaf(path: &Path, data: &[u8], commit_time: u64, executable: bool) -> R
             file.set_permissions(perms)?;
         }
     }
-    set_deterministic_mtime(&file, commit_time)
+    written_mtime(&file.metadata()?)
 }
 
-fn set_deterministic_mtime(file: &std::fs::File, commit_time: u64) -> Result<()> {
-    let mtime = std::time::UNIX_EPOCH
-        .checked_add(std::time::Duration::from_secs(commit_time))
-        .ok_or_else(|| SourceError::Source(format!("commit_time out of range: {commit_time}")))?;
-    file.set_modified(mtime)?;
-    Ok(())
+fn written_mtime(metadata: &std::fs::Metadata) -> Result<u64> {
+    filetime::FileTime::from_last_modification_time(metadata)
+        .unix_seconds()
+        .try_into()
+        .map_err(|error| SourceError::Source(format!("read staged mtime: {error}")))
 }
 
 pub(crate) fn symlink_target_escapes(deployed_rel: &Path, target: &[u8]) -> bool {
@@ -440,10 +432,6 @@ mod tests {
         SourceName::trusted(name)
     }
 
-    /// Author timestamp of the single commit in [`build_export_fixture`]; every
-    /// staged file's mtime must equal this.
-    const EXPORT_COMMIT_TIME: u64 = 1_700_000_000;
-
     const EDITOR_INIT_CONTENT: &[u8] = b"-- editor init\nvim.opt.number = true\n";
     const EDITOR_OPTS_CONTENT: &[u8] = b"-- nested opts\nreturn {}\n";
     const EDITOR_RUN_CONTENT: &[u8] = b"#!/bin/sh\necho run\n";
@@ -456,7 +444,6 @@ mod tests {
         _git_dir: TempDir,
         backend: GitBackend,
         url: String,
-        /// Sole commit; its author time equals [`EXPORT_COMMIT_TIME`].
         commit: String,
     }
 
@@ -657,6 +644,13 @@ mod tests {
         export_fixture_from(src, commit)
     }
 
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_secs()
+    }
+
     fn mtime_secs(path: &Path) -> u64 {
         let ft = filetime::FileTime::from_last_modification_time(
             &std::fs::metadata(path).expect("metadata of staged file"),
@@ -717,7 +711,6 @@ mod tests {
             None,
             policy,
             staging,
-            EXPORT_COMMIT_TIME,
             &TemplateOptIn::SuffixOnly,
             |repo_relative| {
                 let path = SourcePath::new(&repo_relative.to_string_lossy().replace('\\', "/"))?;
@@ -970,26 +963,26 @@ mod tests {
     }
 
     #[test]
-    fn export_sets_mtime_to_commit_time() {
+    fn export_keeps_the_write_time_and_records_it() {
         let fixture = build_export_fixture();
         fixture.refresh();
         let staging = TempDir::new().expect("staging dir");
+        let before = now_secs();
 
         let result = export_editor(&fixture, staging.path(), &ExportPolicy::default())
             .expect("export succeeds");
 
         assert!(!result.files.is_empty(), "expected staged files");
         for file in &result.files {
-            let on_disk = staging.path().join(file.destination.as_str());
-            assert_eq!(
-                mtime_secs(&on_disk),
-                EXPORT_COMMIT_TIME,
-                "staged {} mtime must equal commit_time",
+            let on_disk = mtime_secs(&staging.path().join(file.destination.as_str()));
+            assert!(
+                (before..=now_secs()).contains(&on_disk),
+                "staged {} keeps its write time, got {on_disk}",
                 file.destination
             );
             assert_eq!(
-                file.mtime, EXPORT_COMMIT_TIME,
-                "StagedFile.mtime must equal commit_time"
+                file.mtime, on_disk,
+                "StagedFile.mtime records the on-disk mtime"
             );
         }
     }
