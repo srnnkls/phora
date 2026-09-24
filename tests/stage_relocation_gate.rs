@@ -294,7 +294,7 @@ const STAGE: &str = "sync/stage.rs";
 
 const MOVED_FREE_FNS: &[&str] = &[
     "dest_has_vcs_component",
-    "set_deterministic_mtime",
+    "written_mtime",
     "symlink_target_escapes",
     "materialize_symlink",
 ];
@@ -313,7 +313,7 @@ const TEMPLATE_POLICY_TOKENS: &[&str] = &[
     "render_str",
 ];
 
-const MATERIALIZATION_TOKENS: &[&str] = &["create_dir_all", "0o111", "set_modified"];
+const MATERIALIZATION_TOKENS: &[&str] = &["create_dir_all", "0o111", "written_mtime"];
 
 const GIT_READ_TOKENS: &[&str] = &["gix", "GitBackend", "find_blob_data"];
 
@@ -366,7 +366,7 @@ fn contract_stage_defines_the_relocated_staging_helpers() {
         missing.is_empty(),
         "src/{STAGE} must define the relocated staging helpers — the deployed-name collision \
          check (register_deployed_name), the vcs destination gate (dest_has_vcs_component), \
-         deterministic mtimes (set_deterministic_mtime), and the physical symlink validation + \
+         the recorded write time (written_mtime), and the physical symlink validation + \
          materialization pair (symlink_target_escapes, materialize_symlink) — carved from \
          src/source/mod.rs by T015; missing: {missing:?}"
     );
@@ -406,7 +406,7 @@ fn contract_stage_materializes_bytes_modes_mtimes_and_dirs() {
         missing.is_empty(),
         "src/{STAGE} must perform the physical staging after T015: parent-dir materialization \
          (create_dir_all — the staging-dir cluster), the exec-bit mask (0o111), and the \
-         deterministic mtime write (set_modified). These live in free fns or non-contract \
+         recorded write time (written_mtime). These live in free fns or non-contract \
          impls — never in an impl of StageRequest/StagedArtifact (T032 purity pin, \
          stage_contract_gate); missing tokens: {missing:?}"
     );

@@ -3,7 +3,7 @@
 //! through the source → projection → sync refactor.
 //!
 //! Content-addressed tokens (source commit, digests, per-file blake3,
-//! mirror/project keys of stable inputs, deterministic mtimes) are pinned RAW,
+//! mirror/project keys of stable inputs) are pinned RAW,
 //! since holding those constant is exactly what INV-4 asserts. Only the two
 //! genuinely per-run-varying identifiers of this fixture — the project-id
 //! (blake3 of the random cwd path) and the mirror key (blake3 of the random
@@ -426,18 +426,25 @@ fn normalize_iso_timestamps(s: &str) -> String {
     out
 }
 
-// Directory identities and timestamps are cache metadata that vary per deployment.
+// Directory identities and file and directory timestamps vary per deployment.
 // Keep paths and field order visible in the serialization golden.
 fn normalize_directory_stamps(body: &str) -> String {
-    let mut in_directory = false;
+    let mut section = "";
     let mut normalized = String::new();
     for line in body.lines() {
         if line.starts_with('[') {
-            in_directory = line == "[[directories]]";
+            section = match line {
+                "[[directories]]" => "directories",
+                "[[files]]" => "files",
+                _ => "",
+            };
         }
-        if in_directory
-            && let Some((key, _)) = line.split_once(" = ")
-            && matches!(key, "device" | "inode" | "mtime_secs" | "mtime_nanos")
+        if let Some((key, _)) = line.split_once(" = ")
+            && match section {
+                "directories" => matches!(key, "device" | "inode" | "mtime_secs" | "mtime_nanos"),
+                "files" => key == "mtime",
+                _ => false,
+            }
         {
             normalized.push_str(key);
             normalized.push_str(" = 0\n");
@@ -921,7 +928,6 @@ fn source_and_file_digests_are_byte_identical() {
     let mut doc = String::new();
     append_aggregate_selection_digests(&mut doc, &fx);
 
-    let commit_time = fx.resolved.authored_at.unix_seconds();
     let leaf_paths: Vec<String> = SourceStore::inventory(&fx.backend, &fx.resolved.snapshot, None)
         .expect("inventory source leaves")
         .entries
@@ -975,7 +981,6 @@ fn source_and_file_digests_are_byte_identical() {
         None,
         &policy,
         staging.path(),
-        commit_time,
         &TemplateOptIn::SuffixOnly,
         |repo_relative| {
             let path = SourcePath::new(&repo_relative.to_string_lossy().replace('\\', "/"))?;
@@ -997,11 +1002,7 @@ fn source_and_file_digests_are_byte_identical() {
     let mut files = export.files;
     files.sort_by(|a, b| a.destination.cmp(&b.destination));
     for f in &files {
-        let _ = writeln!(
-            doc,
-            "{} size={} mtime={} blake3={}",
-            f.destination, f.size, f.mtime, f.blake3,
-        );
+        let _ = writeln!(doc, "{} size={} blake3={}", f.destination, f.size, f.blake3);
     }
 
     assert_golden("source_digests.golden", &doc);

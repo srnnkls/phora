@@ -161,8 +161,6 @@ impl SourceStore for HttpBackend {
 const IMPORT_NAME: &str = "phora";
 const IMPORT_EMAIL: &str = "phora@localhost";
 const IMPORT_MESSAGE: &str = "phora synthetic import";
-// epoch+1, not epoch 0: HFS+/FAT32 clamp a 0 mtime on EXPORTED files, making clean checks
-// report Modified; the commit id is pure content, so this never affects determinism.
 const IMPORT_TIME_SECONDS: i64 = 1;
 const IMPORT_REF: &str = "refs/heads/phora";
 

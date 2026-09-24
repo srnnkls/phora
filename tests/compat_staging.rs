@@ -5,11 +5,11 @@
 //!
 //! Every pinned value is either content-addressed (the artifact/manifest blake3
 //! digests frame the deployed path + kind tag + rendered bytes, independent of the
-//! git commit id) or caller-fixed (deterministic mtimes come from a constant
-//! `COMMIT_TIME`; deployed paths are chosen by the leaf plan; exec bits are pinned
-//! as the `mode & 0o111` mask production sets, umask-independent). Nothing here
-//! varies per run, so no path/id normalization or hex sweep is applied — the raw
-//! bytes are the assertion.
+//! git commit id) or caller-fixed (deployed paths are chosen by the leaf plan; exec
+//! bits are pinned as the `mode & 0o111` mask production sets, umask-independent).
+//! Staged mtimes are write times, so they are checked against the clock instead of
+//! pinned. Nothing pinned varies per run, so no path/id normalization or hex sweep
+//! is applied — the raw bytes are the assertion.
 //!
 //! Serialized under `tests/compat/staging/` — a directory distinct from the T002
 //! `tests/compat/serialized/` matrix — so the two baselines never race on a shared
@@ -43,10 +43,6 @@ mod common;
 /// moved past it with test-only commits, so regeneration guards on production parity
 /// (`src/`, `Cargo.toml`, `Cargo.lock` unchanged since here) rather than `HEAD == this`.
 const BASELINE_COMMIT: &str = "92c784e3b14496be25dcecc8d4500e32b52b1c50";
-
-/// Fixed staging clock: every staged file's deterministic mtime is exactly this,
-/// so the mtime baseline is a pinned constant rather than a wall-clock capture.
-const COMMIT_TIME: u64 = 1_700_000_000;
 
 // ─── golden-fixture harness ────────────────────────────────────────────────
 
@@ -425,7 +421,6 @@ fn run_export(
         None,
         policy,
         staging_dir,
-        COMMIT_TIME,
         template_opt_in,
         |repo_relative| {
             let path = SourcePath::new(&repo_relative.to_string_lossy().replace('\\', "/"))?;
@@ -508,29 +503,39 @@ fn staged_file_modes_are_byte_identical() {
     assert_golden("staged_modes.golden", &doc);
 }
 
-// ─── 3. deterministic staged mtimes ─────────────────────────────────────────
+// ─── 3. staged mtimes are write times ───────────────────────────────────────
 
 #[test]
-fn staged_file_mtimes_are_byte_identical() {
+fn staged_files_keep_their_write_time_and_record_it() {
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs()
+    };
     let fx = build_staging_fixture();
+    let before = now();
     let staged = run_success_export(&fx);
 
-    let mut doc = String::new();
-    for dest in STAGED_DESTS {
-        let mtime = std::fs::metadata(staged.dir.join(dest))
+    for file in &staged.result.files {
+        let mtime = std::fs::metadata(staged.dir.join(file.destination.as_str()))
             .expect("stat staged file")
             .modified()
             .expect("staged mtime")
             .duration_since(UNIX_EPOCH)
-            .expect("mtime after epoch");
-        let _ = writeln!(
-            doc,
-            "{dest} mtime={}.{:09}",
-            mtime.as_secs(),
-            mtime.subsec_nanos(),
+            .expect("mtime after epoch")
+            .as_secs();
+        assert!(
+            (before..=now()).contains(&mtime),
+            "{} keeps its write time, got {mtime}",
+            file.destination
+        );
+        assert_eq!(
+            file.mtime, mtime,
+            "{} records its on-disk mtime",
+            file.destination
         );
     }
-    assert_golden("staged_mtimes.golden", &doc);
 }
 
 // ─── 4. artifact + variable digests as staged ───────────────────────────────
@@ -562,11 +567,7 @@ fn staging_manifest_is_byte_identical() {
 
     let mut doc = String::new();
     for f in files {
-        let _ = writeln!(
-            doc,
-            "{} size={} mtime={} blake3={}",
-            f.destination, f.size, f.mtime, f.blake3,
-        );
+        let _ = writeln!(doc, "{} size={} blake3={}", f.destination, f.size, f.blake3);
     }
     assert_golden("staging_manifest.golden", &doc);
 }

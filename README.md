@@ -791,9 +791,8 @@ with expected vs actual.
 
 Determinism. Content is imported as a content-addressed synthetic git commit
 (fixed identity, fixed time, constant message), so identical bytes yield an
-identical commit and no lock churn. The synthetic commit's time is fixed at epoch+1
-(1 second), not epoch 0, since some filesystems (FAT32, HFS+) clamp a 0 mtime —
-which would otherwise make `phora verify` report every url-sourced file as modified.
+identical commit and no lock churn. Deployed files carry the time phora wrote
+them, as with git sources.
 `phora sync` of unchanged content is a no-op; `phora update` (or `--force`)
 re-downloads, and the lock advances only if the content changed. `phora verify`
 re-hashes deployed files with the same guarantees as git sources.
