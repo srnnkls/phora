@@ -420,7 +420,8 @@ fn remove_reconciled_record(
     Ok(true)
 }
 
-/// A composed target dropped from the graph prunes inside the consumer anchor still holding it.
+/// A composed target dropped from the graph prunes inside the consumer anchor still holding
+/// it, or inside its recorded deploy root once the importing target is gone too.
 fn confine_orphan(
     config: &Config,
     record: &ArtifactRecord,
@@ -431,15 +432,9 @@ fn confine_orphan(
         .targets
         .values()
         .filter_map(|target| target.confine.as_deref())
-        .find(|anchor| super::confine::within_anchor(anchor, path))
-        .ok_or_else(|| {
-            Error::Config(format!(
-                "composed target `{}` has no confine anchor",
-                record.key.target
-            ))
-        })?;
+        .find(|anchor| super::confine::within_anchor(anchor, path));
     super::confine::confine_removal_destination(
-        Some(anchor),
+        anchor,
         record.deploy_root.as_deref().map(Path::new),
         path,
         true,

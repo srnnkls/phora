@@ -536,3 +536,30 @@ fn linked_source_without_allow_symlinks_skips_them() {
         );
     }
 }
+
+#[test]
+fn removing_the_importing_target_prunes_its_composed_records() {
+    let fixture = Fixture::new(PACKAGE_MANIFEST);
+    fixture.pin();
+    assert_quiet(&fixture.sync_prune());
+    assert_eq!(fixture.read(".tropos/skills/code/SKILL.md"), "skill v1\n");
+
+    fixture.configure("", "[paths]\ncache = \"cache\"\nstate = \"state\"\n");
+    assert_quiet(&fixture.sync_prune());
+
+    for path in [
+        ".tropos/skills/code/SKILL.md",
+        ".tropos/skills/loqui/reference/loqui/languages/rust/README.md",
+    ] {
+        assert!(
+            std::fs::symlink_metadata(fixture.project.join(path)).is_err(),
+            "{path} is pruned with the target that imported it"
+        );
+    }
+    let orphans = fixture.succeeds(&["list", "--orphans"]);
+    assert!(
+        !String::from_utf8_lossy(&orphans.stdout).contains("tropos"),
+        "no composed record outlives its anchor:\n{}",
+        String::from_utf8_lossy(&orphans.stdout)
+    );
+}
