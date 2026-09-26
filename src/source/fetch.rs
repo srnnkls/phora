@@ -55,6 +55,66 @@ pub(super) fn fetch_objects(
     session.receive(source, repo, &mut negotiate, &Shallow::NoChange)
 }
 
+/// Credential callback for `url`, carrying the `credential.<url>.username` that gix 0.84
+/// resolves but drops before invoking helpers; without it, multi-account helpers
+/// (Git Credential Manager) prompt for an account.
+#[expect(
+    clippy::result_large_err,
+    reason = "the credential callback must return gix_credentials::protocol::Result"
+)]
+pub(super) fn credentials(
+    repo: &gix::Repository,
+    url: gix::Url,
+) -> std::result::Result<
+    impl FnMut(gix::credentials::helper::Action) -> gix::credentials::protocol::Result + use<>,
+    gix::config::credential_helpers::Error,
+> {
+    let (mut cascade, configured, prompt) = repo.config_snapshot().credential_helpers(url)?;
+    let user = configured
+        .context()
+        .and_then(|ctx| ctx.url.as_ref())
+        .and_then(|url| gix::url::parse(url.as_ref()).ok())
+        .and_then(|url| url.user().map(ToOwned::to_owned));
+    Ok(move |mut action| {
+        if let Some(user) = &user {
+            add_username(&mut action, user);
+        }
+        cascade.invoke(action, prompt.clone())
+    })
+}
+
+pub(super) fn use_configured_username<T: Transport>(
+    connection: &mut gix::remote::Connection<'_, '_, T>,
+) -> std::result::Result<(), gix::config::credential_helpers::Error> {
+    let Some(url) = connection
+        .remote()
+        .url(gix::remote::Direction::Fetch)
+        .cloned()
+    else {
+        return Ok(());
+    };
+    let authenticate = credentials(connection.remote().repo(), url)?;
+    connection.set_credentials(authenticate);
+    Ok(())
+}
+
+fn add_username(action: &mut gix::credentials::helper::Action, user: &str) {
+    let Some(ctx) = action.context_mut() else {
+        return;
+    };
+    let Some(mut url) = ctx
+        .url
+        .as_ref()
+        .and_then(|url| gix::url::parse(url.as_ref()).ok())
+    else {
+        return;
+    };
+    if url.user().is_none() {
+        url.set_user(Some(user.to_owned()));
+        ctx.url = Some(url.to_bstring());
+    }
+}
+
 fn fail(source: &SourceName, action: &str, error: impl std::fmt::Display) -> SourceError {
     SourceError::Source(format!("{action} for {source}: {error}"))
 }
@@ -72,10 +132,6 @@ pub(super) struct Session {
 }
 
 impl Session {
-    #[expect(
-        clippy::result_large_err,
-        reason = "the credential callback must return gix_credentials::protocol::Result"
-    )]
     fn open(source: &SourceName, remote: &gix::Remote<'_>, action: &str) -> Result<Self> {
         let failed = |error: &dyn std::fmt::Display| {
             SourceError::Source(format!("{action} {source}: {error}"))
@@ -111,14 +167,15 @@ impl Session {
                 .configure(&*options)
                 .map_err(|e| failed(&e))?;
         }
-        let (mut cascade, _, prompt) = repo
-            .config_snapshot()
-            .credential_helpers(url)
-            .map_err(|e| failed(&e))?;
+        let credentials_url = remote
+            .url(gix::remote::Direction::Fetch)
+            .cloned()
+            .unwrap_or(url);
+        let authenticate = credentials(repo, credentials_url).map_err(|e| failed(&e))?;
         let handshake = gix::protocol::handshake(
             &mut transport.inner,
             gix::protocol::transport::Service::UploadPack,
-            move |credential| cascade.invoke(credential, prompt.clone()),
+            authenticate,
             Vec::new(),
             &mut gix::progress::Discard,
         )
@@ -337,4 +394,38 @@ fn update_refs(source: &SourceName, repo: &gix::Repository, ref_map: &RefMap) ->
             .map_err(|e| fail(source, "update refs", e))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::add_username;
+    use gix::credentials::helper::Action;
+
+    fn action_url(action: &Action) -> String {
+        action
+            .context()
+            .and_then(|ctx| ctx.url.as_ref())
+            .expect("get action carries a url")
+            .to_string()
+    }
+
+    #[test]
+    fn add_username_fills_missing_user() {
+        let mut action = Action::get_for_url("https://github.com/owner/repo.git");
+        add_username(&mut action, "octo");
+        assert_eq!(
+            action_url(&action),
+            "https://octo@github.com/owner/repo.git"
+        );
+    }
+
+    #[test]
+    fn add_username_keeps_url_user() {
+        let mut action = Action::get_for_url("https://first@github.com/owner/repo.git");
+        add_username(&mut action, "octo");
+        assert_eq!(
+            action_url(&action),
+            "https://first@github.com/owner/repo.git"
+        );
+    }
 }

@@ -12,7 +12,7 @@ use super::cache::{
     mirror_lock_path_for_key, mirror_path, mirror_path_for_key, open_mirror, reclone_mirror,
     sweep_orphan_staging,
 };
-use super::fetch::{Session, fetch_objects};
+use super::fetch::{Session, fetch_objects, use_configured_username};
 use super::inventory::{populate_inventory, snapshot_commit};
 use super::resolve::resolve_worktree;
 use super::snapshot::{
@@ -161,7 +161,8 @@ impl GitBackend {
 
         let mut prepare = gix::prepare_clone_bare(url, &staging.path)
             .map_err(|e| SourceError::Source(format!("prepare shallow clone {source}: {e}")))?
-            .with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(depth));
+            .with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(depth))
+            .configure_connection(|connection| Ok(use_configured_username(connection)?));
         if let Some(refname) = shallow_ref_name(refspec) {
             prepare = prepare.with_ref_name(Some(refname.as_str())).map_err(|e| {
                 SourceError::Source(format!("shallow ref {refname} for {source}: {e}"))

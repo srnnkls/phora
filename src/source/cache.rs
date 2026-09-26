@@ -2,7 +2,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use super::SourceName;
-use super::fetch::{Session, fetch_blobless};
+use super::fetch::{Session, fetch_blobless, use_configured_username};
 
 use super::{MIRROR_REFSPECS, MirrorKey, NormalizedUrl, Result, SourceError, WorktreeAdminId};
 
@@ -164,9 +164,12 @@ fn fetch_full(source: &SourceName, repo: &gix::Repository) -> Result<()> {
             gix::remote::Direction::Fetch,
         )
         .map_err(|e| SourceError::Source(format!("set mirror refspec in {source}: {e}")))?;
-    let outcome = remote
+    let mut connection = remote
         .connect(gix::remote::Direction::Fetch)
-        .map_err(|e| SourceError::Source(format!("connect origin in {source}: {e}")))?
+        .map_err(|e| SourceError::Source(format!("connect origin in {source}: {e}")))?;
+    use_configured_username(&mut connection)
+        .map_err(|e| SourceError::Source(format!("credential helpers for {source}: {e}")))?;
+    let outcome = connection
         .prepare_fetch(
             gix::progress::Discard,
             gix::remote::ref_map::Options::default(),
@@ -306,6 +309,7 @@ fn clone_full(source: &SourceName, url: &str, path: &Path) -> Result<gix::Reposi
             )?;
             Ok(remote)
         })
+        .configure_connection(|connection| Ok(use_configured_username(connection)?))
         .fetch_only(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
         .map_err(|e| SourceError::Source(format!("clone bare {source}: {e}")))?;
     Ok(repo)
