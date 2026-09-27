@@ -6111,6 +6111,32 @@ fn history_reshape_configs(url: &str, target: &Path) -> (Config, Config) {
 }
 
 #[test]
+fn history_deploys_template_suffixed_files_verbatim() {
+    let fx = build_sync_fixture();
+    let src = fx.src.path();
+    let foreign_template = b"{{ range .Items }}{{ \"x\" | printf }}{{ end }}\n";
+    std::fs::write(src.join("editor/gen.go.tmpl"), foreign_template).unwrap();
+    run_git(src, &["add", "-A"]);
+    run_git(src, &["commit", "-m", "vendor a go template"]);
+    let td = TargetDir::new();
+    let (history, _) = history_reshape_configs(&fx.url, &td.target_path());
+
+    sync(
+        &input(&history, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("a history checkout deploys a foreign .tmpl file without rendering it");
+
+    let deployed = td.target_path().join("archive/editor/gen.go.tmpl");
+    assert_eq!(
+        std::fs::read(&deployed).expect("the .tmpl file keeps its name"),
+        foreign_template,
+        "history deploys a git checkout verbatim"
+    );
+}
+
+#[test]
 fn history_off_reshape_applies_after_skip_and_retires_the_persisted_overlay() {
     let fx = build_sync_fixture();
     let td = TargetDir::new();
