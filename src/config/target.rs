@@ -274,8 +274,12 @@ impl Binding {
         self.source.as_deref().unwrap_or(identity)
     }
 
+    /// A history binding deploys its git checkout verbatim, so nothing renders.
     #[must_use]
     pub fn template_opt_in(&self) -> TemplateOptIn {
+        if self.history {
+            return TemplateOptIn::Disabled;
+        }
         self.template.clone().unwrap_or(TemplateOptIn::SuffixOnly)
     }
 }
