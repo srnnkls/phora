@@ -1,6 +1,7 @@
 //! Fetches that gix's high-level `receive()` cannot express: a filtered pack
 //! (`blob:none`) and a pack of explicitly wanted objects.
 
+use std::io::IsTerminal;
 use std::sync::atomic::AtomicBool;
 
 use gix::protocol::fetch::{
@@ -69,7 +70,12 @@ pub(super) fn credentials(
     impl FnMut(gix::credentials::helper::Action) -> gix::credentials::protocol::Result + use<>,
     gix::config::credential_helpers::Error,
 > {
-    let (mut cascade, configured, prompt) = repo.config_snapshot().credential_helpers(url)?;
+    let (mut cascade, configured, mut prompt) = repo.config_snapshot().credential_helpers(url)?;
+    prompt.mode = prompt_mode(
+        prompt.mode,
+        std::io::stdin().is_terminal(),
+        std::env::var_os("GIT_TERMINAL_PROMPT").is_some(),
+    );
     let user = configured
         .context()
         .and_then(|ctx| ctx.url.as_ref())
@@ -96,6 +102,14 @@ pub(super) fn use_configured_username<T: Transport>(
     let authenticate = credentials(connection.remote().repo(), url)?;
     connection.set_credentials(authenticate);
     Ok(())
+}
+
+fn prompt_mode(mode: gix::prompt::Mode, attended: bool, explicit: bool) -> gix::prompt::Mode {
+    if attended || explicit {
+        mode
+    } else {
+        gix::prompt::Mode::Disable
+    }
 }
 
 fn add_username(action: &mut gix::credentials::helper::Action, user: &str) {
@@ -398,8 +412,9 @@ fn update_refs(source: &SourceName, repo: &gix::Repository, ref_map: &RefMap) ->
 
 #[cfg(test)]
 mod tests {
-    use super::add_username;
+    use super::{add_username, prompt_mode};
     use gix::credentials::helper::Action;
+    use gix::prompt::Mode;
 
     fn action_url(action: &Action) -> String {
         action
@@ -427,5 +442,20 @@ mod tests {
             action_url(&action),
             "https://first@github.com/owner/repo.git"
         );
+    }
+
+    #[test]
+    fn prompt_mode_disables_the_prompt_without_a_terminal() {
+        assert_eq!(prompt_mode(Mode::Hidden, false, false), Mode::Disable);
+    }
+
+    #[test]
+    fn prompt_mode_keeps_the_prompt_at_a_terminal() {
+        assert_eq!(prompt_mode(Mode::Hidden, true, false), Mode::Hidden);
+    }
+
+    #[test]
+    fn prompt_mode_keeps_an_explicit_choice() {
+        assert_eq!(prompt_mode(Mode::Hidden, false, true), Mode::Hidden);
     }
 }

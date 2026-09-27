@@ -1,8 +1,11 @@
+use std::io::IsTerminal;
+
 use clap::Parser;
 
 use phora::cli::{self, Cli};
 
 fn main() {
+    forbid_helper_prompts_without_terminal();
     #[cfg(feature = "trace")]
     init_tracing();
     let cli = Cli::parse();
@@ -16,6 +19,17 @@ fn main() {
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
+}
+
+/// gix launches credential helpers with this environment and offers no other way to
+/// reach them; without a terminal, Git Credential Manager's account picker would hang
+/// the sync instead of failing it.
+fn forbid_helper_prompts_without_terminal() {
+    if std::io::stdin().is_terminal() || std::env::var_os("GCM_INTERACTIVE").is_some() {
+        return;
+    }
+    // SAFETY: main calls this before it starts any thread.
+    unsafe { std::env::set_var("GCM_INTERACTIVE", "never") };
 }
 
 #[cfg(feature = "trace")]
