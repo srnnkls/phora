@@ -22,7 +22,7 @@ Agents answer better when they can read the code you depend on, so repositories
 get cloned into a `resources/` directory in project after project. Each clone
 sits at whatever commit it was cloned at, carries its full history, and collects
 build output, and the same repository ends up cloned twice. phora keeps one
-content-addressed store per machine instead and gives each project a pinned
+content-addressed store per machine and gives each project a pinned
 slice of it.
 
 ```toml

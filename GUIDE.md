@@ -161,12 +161,12 @@ All spellings of one repository share a single cached mirror, so switching
 between https, ssh and the `host` form never fetches it again.
 
 A private repository authenticates the way git does. Over https, phora asks the
-credential helpers in your git config (`credential.helper`), and passes
-`credential.<url>.username` along, so Git Credential Manager with several
-accounts picks the configured one instead of asking. Over ssh, your ssh client
-and agent authenticate. Without a terminal, as in a hook, a scheduled job or CI,
-nothing prompts: a helper that cannot answer fails the fetch instead of waiting
-(see [troubleshooting](REFERENCE.md#a-private-fetch-fails-without-a-terminal)).
+credential helpers in your git config (`credential.helper`) and passes
+`credential.<url>.username` along, which tells Git Credential Manager which of
+several accounts to use. Over ssh, your ssh client and agent authenticate.
+Without a terminal, as in a hook, a scheduled job or CI, prompts are off, and a
+helper that cannot answer fails the fetch (see
+[troubleshooting](REFERENCE.md#a-private-fetch-fails-without-a-terminal)).
 
 ### Local directories
 
@@ -576,7 +576,7 @@ target's path from deploy time, so phora can find the files after the config
 that named them is gone. `phora sync --prune` deletes them. That includes the
 files of an imported dependency once the target that imported it is removed:
 each is deleted only inside the path it was deployed to. If a path cannot be
-reconstructed, phora drops the record and warns instead of deleting anything.
+reconstructed, phora drops the record, leaves the files in place and warns.
 
 ### Checking the result
 
@@ -1242,7 +1242,7 @@ source with no ref takes the mirror's `HEAD`.
 
 A history binding over a sliced mirror can't use the cached snapshot. On a lock
 hit, sync refreshes that mirror anyway. Under `--frozen`, which never fetches,
-the run fails instead of deploying a truncated history.
+the run fails.
 
 ### Importing a download
 

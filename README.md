@@ -111,7 +111,7 @@ all verified
 ```
 
 `phora sync` resolves `main` to a commit, records it in `phora.lock`, and copies `README.md` into
-`out`. On a terminal it shows progress and a summary instead of `sync complete`. `phora preview`
+`out`. `phora preview`
 shows what a sync would deploy, from the locked commit to each file's destination, without touching
 the network; before the first sync it reports the source as `not locked`. `phora list` reports what
 landed, and `phora verify` re-hashes it and exits 1 if anything changed.

@@ -43,7 +43,7 @@ other source deploys at its locked commit. When nothing changed, a sync fetches 
 | --- | --- |
 | `--prune` | delete artifacts the configuration no longer selects, and managed file links whose source file is gone; skipped when a deploy failed |
 | `--force` | overwrite locally modified and foreign files without asking; sources stay at their locked commits |
-| `--fast-forward` | delete deployed artifacts that a moved pin no longer offers, instead of stopping |
+| `--fast-forward` | delete deployed artifacts that a moved pin no longer offers |
 | `--frozen` | fetch and resolve nothing; every source, nested dependencies included, must already be in the lock, except link sources; fails when a history binding's mirror holds only pinned commits; also runs against a read-only state root when nothing needs writing |
 | `--no-hooks` | run no hooks at all |
 | `--no-transitive-hooks` | run your own hooks, but none from imported dependencies |
@@ -63,7 +63,8 @@ $ phora sync
 sync complete
 ```
 
-On a terminal, a live progress display and a summary replace `sync complete`.
+On a terminal, sync draws live progress and ends with a one-line summary; otherwise it prints
+`sync complete`.
 
 See also: [phora update](#phora-update), [phora preview](#phora-preview), [hooks](#hooks),
 [Environment](#environment).
@@ -82,7 +83,7 @@ transitive dependency, from any import, are re-resolved; your other sources stay
 | Flag | Meaning |
 | --- | --- |
 | `--prune` | delete artifacts no longer selected after the update |
-| `--fast-forward` | delete deployed artifacts that the new pin no longer offers, instead of stopping |
+| `--fast-forward` | delete deployed artifacts that the new pin no longer offers |
 
 ```sh
 phora update dotfiles --fast-forward
@@ -906,7 +907,7 @@ under [hooks](#hooks).
 | state | `~/.local/state/phora` | `~/Library/Application Support/phora` |
 
 Precedence is `[paths]`, then `XDG_*`, then the platform default. A sync holds `state.lock` for
-the whole run, and a second sync of the same project exits 75 instead of waiting.
+the whole run, and a second sync of the same project exits 75 at once.
 
 ## Exit status
 
@@ -960,9 +961,8 @@ Run `phora rebuild-registry`. `phora list --orphans` shows records for removed t
 
 ### A private fetch fails without a terminal
 
-Without a terminal on stdin, phora never waits on a credential prompt. Its own prompt is off, and
-Git Credential Manager runs with `GCM_INTERACTIVE=never`. A helper with no stored credential fails
-the fetch. Store one from a terminal (run `phora sync` there once, or `git fetch` the repository),
+Without a terminal on stdin, credential prompts are off: phora's own, and Git Credential Manager's
+through `GCM_INTERACTIVE=never`. A helper with no stored credential fails the fetch. Store one from a terminal (run `phora sync` there once, or `git fetch` the repository),
 set `credential.<url>.username` when the helper holds several accounts, or use an ssh source.
 `GIT_TERMINAL_PROMPT=1` and `GCM_INTERACTIVE=auto` restore the prompts if something can answer
 them.
