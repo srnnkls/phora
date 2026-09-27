@@ -742,8 +742,8 @@ without moving any commit.
 
 ## Link mode
 
-`deploy = "link"` deploys a symlink into the source's working tree in place of a
-copy. Edits show up in the target at once, committed or not.
+`deploy = "link"` deploys each artifact as a symlink into the source's working
+tree. Edits show up in the target at once, committed or not.
 
 Point the running example at your own checkout of phora, on this machine only:
 
@@ -1032,7 +1032,7 @@ phora now reads the manifest and the self source from the working tree,
 uncommitted files included, and deploys the self source as symlinks into it. It
 writes nothing into the package. The lock records it as `resolved = "link"`, and
 `update` leaves it alone. The package's remote dependencies still lock and
-update at pinned commits. Link mode inside a package's own manifest stays
+update at pinned commits. Link mode inside a package's own manifest is
 rejected.
 
 Moving a package between a pin and a link keeps its artifacts owned. One
@@ -1180,8 +1180,7 @@ A mirror is either sliced or full:
   marks it.
 - A full mirror holds every head and tag with full history. Only a
   `history = true` binding makes a mirror full, and a full mirror is never
-  narrowed again. A mirror without the marker, including every cache created
-  before slicing existed, is full.
+  narrowed again. A mirror without the marker is full.
 
 Selection runs on trees, so phora can list what a sliced mirror offers without
 any blobs.
@@ -1436,7 +1435,7 @@ Applying moves a staged artifact into place:
 
 If step 5 or 6 fails, the destination is removed, the backup is restored, and
 the journal entry is dropped. Link-mode artifacts follow the same journal
-protocol with a symlink created in `.phora-stage/` instead of a staged tree.
+protocol, staging a symlink in `.phora-stage/`.
 
 phora installs no signal handler. Ctrl-C kills the process, and the journal and
 staging directories leave enough to recover on the next run.

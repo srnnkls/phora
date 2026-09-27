@@ -111,10 +111,10 @@ all verified
 ```
 
 `phora sync` resolves `main` to a commit, records it in `phora.lock`, and copies `README.md` into
-`out`. `phora preview`
-shows what a sync would deploy, from the locked commit to each file's destination, without touching
-the network; before the first sync it reports the source as `not locked`. `phora list` reports what
-landed, and `phora verify` re-hashes it and exits 1 if anything changed.
+`out`. `phora preview` shows what a sync would deploy, from the locked commit to each file's
+destination, without touching the network; before the first sync it reports the source as
+`not locked`. `phora list` reports what landed, and `phora verify` re-hashes it and exits 1 if
+anything changed.
 
 Next, try `phora add` and `phora bind` to edit the configuration from the command line.
 
