@@ -1,8 +1,11 @@
+use std::io::IsTerminal;
+
 use clap::Parser;
 
 use phora::cli::{self, Cli};
 
 fn main() {
+    forbid_credential_prompts_without_terminal();
     #[cfg(feature = "trace")]
     init_tracing();
     let cli = Cli::parse();
@@ -15,6 +18,20 @@ fn main() {
     };
     if exit_code != 0 {
         std::process::exit(exit_code);
+    }
+}
+
+/// Credential helpers inherit this environment, and a prompt nobody can answer (Git
+/// Credential Manager's account picker) hangs the sync instead of failing it.
+fn forbid_credential_prompts_without_terminal() {
+    if std::io::stdin().is_terminal() {
+        return;
+    }
+    for (key, value) in [("GIT_TERMINAL_PROMPT", "0"), ("GCM_INTERACTIVE", "never")] {
+        if std::env::var_os(key).is_none() {
+            // SAFETY: main calls this before it starts any thread.
+            unsafe { std::env::set_var(key, value) };
+        }
     }
 }
 
