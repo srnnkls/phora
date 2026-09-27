@@ -160,6 +160,14 @@ unique only until the repository grows another commit that starts the same way.
 All spellings of one repository share a single cached mirror, so switching
 between https, ssh and the `host` form never fetches it again.
 
+A private repository authenticates the way git does. Over https, phora asks the
+credential helpers in your git config (`credential.helper`), and passes
+`credential.<url>.username` along, so Git Credential Manager with several
+accounts picks the configured one instead of asking. Over ssh, your ssh client
+and agent authenticate. Without a terminal, as in a hook, a scheduled job or CI,
+nothing prompts: a helper that cannot answer fails the fetch instead of waiting
+(see [troubleshooting](REFERENCE.md#a-private-fetch-fails-without-a-terminal)).
+
 ### Local directories
 
 `path` names a git repository on your machine:
