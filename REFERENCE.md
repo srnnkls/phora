@@ -883,6 +883,8 @@ email = "me@work.example"
 | `PHORA_NO_PROGRESS` | any non-empty value turns off live progress |
 | `CI` | any non-empty value turns off live progress |
 | `TERM=dumb` | turns off live progress |
+| `GIT_TERMINAL_PROMPT` | when set, decides phora's own credential prompt; unset, the prompt is off without a terminal on stdin |
+| `GCM_INTERACTIVE` | passed to credential helpers; without a terminal on stdin, phora sets `never` unless it is already set |
 
 Live progress also needs stderr to be a terminal. Hooks receive the `PHORA_*` variables listed
 under [hooks](#hooks).
@@ -955,6 +957,15 @@ The pin moved and a deployed artifact is no longer offered. `phora sync --fast-f
 
 Run `phora rebuild-registry`. `phora list --orphans` shows records for removed targets, and
 `phora sync --prune` deletes them.
+
+### A private fetch fails without a terminal
+
+Without a terminal on stdin, phora never waits on a credential prompt. Its own prompt is off, and
+Git Credential Manager runs with `GCM_INTERACTIVE=never`. A helper with no stored credential fails
+the fetch. Store one from a terminal (run `phora sync` there once, or `git fetch` the repository),
+set `credential.<url>.username` when the helper holds several accounts, or use an ssh source.
+`GIT_TERMINAL_PROMPT=1` and `GCM_INTERACTIVE=auto` restore the prompts if something can answer
+them.
 
 ### Exit 75: another phora process is running
 
