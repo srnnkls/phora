@@ -1,9 +1,15 @@
-# Shared capabilities, customer-specific context
+# Share a skill across customer deployments
 
-A consultancy publishes a support skill alongside each customer's terminology
-and escalation procedure. Each target selects the shared skill and its own
-customer subtree. These selections control which files are deployed; they do
-not restrict access to the source repository.
+A consultancy maintains one support skill and separate documents for each
+customer's terminology and escalation procedure. Each deployment receives the
+shared skill and its own customer's documents. Both deployments read from the
+same source repository, so anyone with access to that source can read both
+customers' files.
+
+The example Git URL resolves to a local repository. All files and Phora state
+stay in this walkthrough's temporary directory.
+
+## Prepare the customer deployments
 
 ```scrut
 $ source "$TESTDIR"/_setup.sh && isolate_state && BUNDLES="$(make_git_source bundles)" && map_insteadof https://github.com/mock/bundles.git "$BUNDLES"
@@ -61,8 +67,11 @@ $ cat acme/.agents/skills/support/SKILL.md && cmp acme/.agents/skills/support/SK
 Read the customer procedure before replying.
 ```
 
-A shared skill update reaches both targets while preserving their separate
-customer context.
+## Update the shared skill
+
+Add an instruction to cite the incident identifier, then update both
+deployments. Each receives the revised skill; its customer documents stay
+unchanged.
 
 ```scrut
 $ cp -R acme/context acme-before && cp -R birch/context birch-before && _phora_write "$BUNDLES/skills/support/SKILL.md" $'Read the customer procedure and cite the incident identifier before replying.\n' && _phora_git -C "$BUNDLES" add -A && _phora_commit '@1700000003 +0000' '@1800000003 +0000' "$BUNDLES" 'support update'

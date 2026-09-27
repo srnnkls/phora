@@ -1,9 +1,14 @@
 # Recreate an agent workspace from its lock
 
-A team publishes a review skill, an engineering policy, and an API reference.
-Each workspace selects those files and puts them where its agent expects them.
-The source repository and all consumer state live in this document's temporary
-directory; Git URL rewriting keeps every fetch local.
+A team shares a review skill, engineering instructions and an API reference.
+Each workspace needs the same versions until its owner chooses to update them.
+This walkthrough creates two workspaces, changes the shared files and shows how
+each workspace keeps or updates its chosen version.
+
+All repositories, deployed files and Phora state live in a temporary directory.
+The example Git URLs resolve to local repositories.
+
+## Prepare the first workspace
 
 ```scrut
 $ source "$TESTDIR"/_setup.sh && isolate_state && TEAM="$(make_git_source team)" && map_insteadof https://github.com/mock/team.git "$TEAM"
@@ -49,9 +54,11 @@ $ test ! -e workspace/.agents/skills/deploy && test ! -e workspace/skills && ech
 selected-only
 ```
 
-The upstream skill changes after the first workspace was created. A fresh
-consumer receives the same manifest and lock, so its frozen sync must reproduce
-the earlier files rather than follow the advancing branch.
+## Recreate the workspace after the source changes
+
+The team adds authorization checks to its review skill. Copy the first
+workspace's configuration and lockfile into a second project. The original
+version is already cached, so `phora sync --frozen` can deploy it there.
 
 ```scrut
 $ _phora_write "$TEAM/skills/review/SKILL.md" $'Review error handling and authorization before approving.\n' && _phora_git -C "$TEAM" add -A && _phora_commit '@1700000003 +0000' '@1800000003 +0000' "$TEAM" 'authorization review'
@@ -67,8 +74,10 @@ $ cmp phora.lock ../first/original.lock && cmp workspace/.agents/skills/review/S
 reproduced
 ```
 
-An edit to the deployed policy is visible to verification. Forced sync restores
-the recorded policy without advancing the dependency.
+## Detect and restore a local edit
+
+Edit the second workspace's `AGENTS.md`, then run `phora verify` to see the
+mismatch. `phora sync --force` restores the version recorded in the lockfile.
 
 ```scrut
 $ printf 'Skip all checks.' > workspace/AGENTS.md
@@ -90,8 +99,11 @@ $ cmp workspace/AGENTS.md ../first/workspace/AGENTS.md && phora verify
 all verified
 ```
 
-Updating the first consumer advances its skill. The second consumer's lock and
-skill remain unchanged, including after another frozen sync.
+## Update one workspace
+
+Run `phora update team` in the first project to adopt the revised review skill.
+The second project keeps its original lockfile and skill, including after
+another frozen sync.
 
 ```scrut
 $ cd ../first && phora update team > update.log 2>&1 && cat workspace/.agents/skills/review/SKILL.md

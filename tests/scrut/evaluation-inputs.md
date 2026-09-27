@@ -1,8 +1,14 @@
-# Hold evaluation inputs steady while changing instructions
+# Compare instructions against the same test cases
 
-An evaluation compares two tagged instruction versions against the same fixture
-release. Binding aliases let both versions come from one source. Phora prepares
-and verifies the files; the evaluation runner consumes them separately.
+Compare two versions of an agent's review instructions using the same test
+cases. The baseline asks for each defect's file and line; the candidate also
+asks for steps to reproduce it. Phora prepares a directory for each version
+and copies the same cases into both, ready for an evaluation runner.
+
+The example Git URLs resolve to local repositories. All files and Phora state
+stay in this walkthrough's temporary directory.
+
+## Prepare the two versions
 
 ```scrut
 $ source "$TESTDIR"/_setup.sh && isolate_state && INSTRUCTIONS="$(make_git_source instructions)" && CASES="$(make_git_source cases)" && map_insteadof https://github.com/mock/instructions.git "$INSTRUCTIONS" && map_insteadof https://github.com/mock/cases.git "$CASES"
@@ -62,8 +68,10 @@ $ cat runs/baseline/cases/auth.json && cmp runs/baseline/cases/auth.json runs/ca
 {"request":"GET /admin","role":"guest","expected_status":403}
 ```
 
-Advancing both upstream branches does not change the locked evaluation inputs.
-Frozen sync preserves both the lock and every deployed byte.
+## Keep the chosen versions
+
+Add unreleased changes to both source repositories, leaving their release tags
+in place. A frozen sync keeps the lockfile and deployed inputs unchanged.
 
 ```scrut
 $ cp phora.lock locked && cp -R runs before && _phora_write "$INSTRUCTIONS/AGENTS.md" $'Unreleased instructions.\n' && _phora_git -C "$INSTRUCTIONS" add -A && _phora_commit '@1700000004 +0000' '@1800000004 +0000' "$INSTRUCTIONS" 'next instructions' && _phora_write "$CASES/cases/auth.json" $'{"expected_status":200}\n' && _phora_git -C "$CASES" add -A && _phora_commit '@1700000004 +0000' '@1800000004 +0000' "$CASES" 'next cases'
@@ -75,8 +83,10 @@ sync complete
 all verified
 ```
 
-A runner that edits its fixture makes the candidate's inputs unverifiable,
-while the baseline fixture remains intact.
+## Detect a changed test case
+
+Suppose the runner edits a case in the candidate's directory. `phora verify`
+reports the mismatch. The baseline's copy still matches the original.
 
 ```scrut
 $ printf '{"expected_status":200}' > runs/candidate/cases/auth.json

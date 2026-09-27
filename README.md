@@ -163,8 +163,8 @@ beneath yours. [GUIDE.md](GUIDE.md#transitive-dependencies) covers how that comp
 ## Documentation
 
 - [GUIDE.md](GUIDE.md) explains how phora works, starting at [How phora works](GUIDE.md#how-phora-works).
-- [USE-CASES.md](USE-CASES.md) has complete configs for dotfiles, shared lint config, release
-  binaries and vendored protos, plus [agent workspaces](USE-CASES.md#disposable-agent-workspaces),
+- [USE-CASES.md](USE-CASES.md) shows how to manage dotfiles, shared configuration, release
+  binaries and vendored code. It also covers [agent workspaces](USE-CASES.md#disposable-agent-workspaces),
   [customer bundles](USE-CASES.md#customer-specific-agent-bundles),
   [evaluation inputs](USE-CASES.md#controlled-inputs-for-agent-evaluations) and
   [knowledge collections](USE-CASES.md#maintained-knowledge-collections).

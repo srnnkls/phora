@@ -4,6 +4,11 @@ Pick the situation closest to yours; the sections don't depend on each other.
 Every flag and key is in the [reference](REFERENCE.md), and the model behind
 them is in the [guide](GUIDE.md).
 
+`larkspur-labs` and `mira-sato` are fictional repository owners used in the
+examples. Replace their repository names and refs with your own. The linked
+[Scrut walkthroughs](tests/scrut/) create local repositories and run without
+accessing those URLs.
+
 ## Contents
 
 - [Reference repositories for agents](#reference-repositories-for-agents)
@@ -319,8 +324,9 @@ ejects the file.
 
 ### Standards owned by different teams
 
-The platform team owns the review workflow; the security team owns the release
-checklist. A service repository can take both directly from their owners:
+Your platform team maintains a review workflow, and your security team maintains
+a release checklist. Each keeps its files in its own repository. A service can
+bring both into its agent's skills directory:
 
 ```toml
 [sources.platform]
@@ -339,12 +345,14 @@ sources.platform = { take = ["review/**"] }
 sources.security = { take = ["release-checklist/**"] }
 ```
 
-The service's manifest declares the combination, and each producer maintains
-its own files. To adopt a security release, change its tag and run
-`phora update security`; review the manifest, lock and deployed changes
-together. Other services keep their chosen versions. A shared bundle that
-declares its own dependencies can publish that composition as a
-[transitive package](GUIDE.md#transitive-dependencies).
+The service chooses which skills and versions to use; each team continues to
+maintain its own files. To adopt a new security release, change the security
+source's tag and run `phora update security`. Review the configuration, lockfile
+and deployed files together. Other services stay on their chosen versions.
+
+If several services need the same combination, publish it as a
+[transitive package](GUIDE.md#transitive-dependencies) that declares those
+dependencies once.
 
 ## Pinned agent skills across projects
 
@@ -458,9 +466,10 @@ phora treats skill files as bytes. It doesn't check frontmatter or look for a
 
 ## Disposable agent workspaces
 
-A task starts in a fresh checkout and needs a review skill, the team's
-instructions and an API reference. Declare those inputs with the project so a
-second workspace can receive the same files after the upstream branch moves.
+Each agent task starts in a fresh checkout. Before it can work, it needs a
+review skill, the team's instructions and an API reference. Store that setup
+in the project's configuration and lockfile, and each new workspace can receive
+the same versions—even after the team's repository has changed.
 
 Suppose the team's repository contains:
 
@@ -471,8 +480,8 @@ policy/AGENTS.md
 references/api.md
 ```
 
-The project selects the review workflow and puts each file where the workspace
-expects it:
+The project selects the review skill and its supporting files, then maps them
+into the workspace:
 
 ```toml
 [sources.team]
@@ -489,11 +498,8 @@ sources.team = { take = [
 ] }
 ```
 
-Run `phora sync` and commit `phora.toml` and `phora.lock`. A fresh checkout runs
-`phora sync` to fetch and deploy the locked versions. Once the cache contains
-the required objects, `phora sync --frozen` can assemble another workspace
-without fetching or resolving newer versions. A lockfile alone does not fill
-an empty cache.
+Run `phora sync` to create the workspace, then commit `phora.toml` and
+`phora.lock`. The result is:
 
 ```text
 workspace/
@@ -502,22 +508,29 @@ workspace/
   reference/api.md
 ```
 
-The deploy skill stays out. If an agent edits its installed `AGENTS.md`,
-`phora verify` reports the drift; `phora sync --force` restores the locked
-bytes. An intentional upgrade uses `phora update team` in that project. Other
-checkouts keep their existing pins.
+Only the review skill is selected. In a fresh checkout, `phora sync` fetches
+and deploys the versions recorded in the lockfile. When those versions are
+already cached, `phora sync --frozen` recreates the workspace without fetching
+anything. A machine with an empty cache needs a regular sync first.
 
-Keep the manifest and lock with a task's results to record the file inputs
-supplied to the workspace. Model selection, tool versions and execution settings
-belong in the task runner's record as well.
+If an agent edits the deployed `AGENTS.md`, `phora verify` reports the change.
+Run `phora sync --force` to restore the locked version. To adopt newer files
+from the team's repository, run `phora update team` in that project. Other
+checkouts keep their existing versions.
+
+Save the configuration and lockfile with the task's results so you can identify
+the files it received. Record the model, tool versions and execution settings
+alongside them.
 
 The [workspace walkthrough](tests/scrut/agent-workspaces.md) creates two
-consumers, advances upstream, restores an edited policy and upgrades one consumer.
+workspaces, changes the source repository, restores an edited policy and
+updates just one workspace.
 
 ## Customer-specific agent bundles
 
-A support agent uses the same escalation skill for two customers, but each
-customer has its own vocabulary and procedures. A bundle repository holds:
+A support agent serves two customers. Both use the same escalation skill;
+each has its own terminology and procedures. Keep the shared skill and the
+customer documents together:
 
 ```text
 skills/support/SKILL.md
@@ -527,7 +540,8 @@ customers/birch/terminology.md
 customers/birch/procedure.md
 ```
 
-Each target combines the common skill with its selected customer context:
+Give each customer a target that selects the shared skill and that customer's
+documents:
 
 ```toml
 [sources.bundles]
@@ -550,24 +564,29 @@ sources.bundles = { take = [
 ] }
 ```
 
-Acme receives its own `context/terminology.md` and `context/procedure.md`;
-Birch receives its versions at the same relative paths. Both receive the common
-skill. `phora update bundles` advances the bundle for both targets, while their
-selections stay distinct.
+After `phora sync`, both directories contain the support skill. Acme's
+`context/` contains Acme's terminology and procedure; Birch's contains Birch's.
+The agent can use the same file paths in either deployment.
 
-These targets share a source and cache. Separate access credentials and private
-repositories belong at the source boundary when customers' material must be
-restricted. For independent release schedules, give each deployment its own
-project and lock, or use [binding refs](#two-versions-side-by-side).
+When the shared skill changes, run `phora update bundles` to update both
+deployments. Each target continues to receive only its selected customer
+documents. For separate release schedules, give each deployment its own project
+and lockfile, or use [binding refs](#two-versions-side-by-side).
 
-The [customer bundle walkthrough](tests/scrut/customer-bundles.md) checks the
-complete file sets and contents before and after a shared skill update.
+Both targets read from the same repository and cache. If access to customer
+documents must be restricted, keep them in separate private repositories with
+separate credentials; file selection controls deployment, not access.
+
+The [customer bundle walkthrough](tests/scrut/customer-bundles.md) shows which
+files each customer receives and checks that a shared skill update preserves
+their separate documents.
 
 ## Controlled inputs for agent evaluations
 
-You want to compare two versions of an instruction against the same cases and
-reference answers. Pin the instruction twice and bind the same fixture source
-to both runs:
+You are revising an agent's review instructions and want to compare the new
+version with the old one. Both runs need the same test cases and expected
+answers. Give each run a target, select a different instruction version for
+each, and share one pinned set of cases:
 
 ```toml
 [sources.instructions]
@@ -591,32 +610,35 @@ sources.candidate = { source = "instructions", tag = "candidate" }
 sources.fixtures = {}
 ```
 
-For example, `baseline` asks for a defect's file and line; `candidate` also asks
-for a reproducer. Both receive `cases/auth.json`:
+For example, the baseline asks the agent to report each defect's file and line.
+The candidate also asks for steps to reproduce it. Both receive the same
+`cases/auth.json`:
 
 ```json
 {"request":"GET /admin","role":"guest","expected_status":403}
 ```
 
-After `phora sync`, the two `AGENTS.md` files hold different instructions;
-the `cases` directories have identical bytes. Run the evaluator separately for
-each directory with the same model and tool settings, and keep `phora.toml`
-and `phora.lock` with the results.
+Run `phora sync` to prepare the two directories. Each has its chosen
+`AGENTS.md` and an identical copy of `cases/`. Run your evaluator against each
+directory with the same model and tool settings. Save `phora.toml` and
+`phora.lock` with the results.
 
-`phora verify` checks that the deployed inputs still match the recorded state.
-With the objects cached, `phora sync --frozen` deploys the same pins again.
-Write evaluation output outside the managed input paths. Repeating the file
-inputs controls one part of the experiment; model responses may still vary.
+Use `phora verify` to check that the instructions and cases have not changed
+since deployment. With their contents cached, `phora sync --frozen` can deploy
+the locked versions again. Keep evaluation output outside those managed paths
+so it does not alter the inputs. The files are repeatable; model responses may
+still vary.
 
-The [evaluation walkthrough](tests/scrut/evaluation-inputs.md) checks distinct
-instruction versions, identical fixtures, frozen pins and detection of an
-edited case.
+The [evaluation walkthrough](tests/scrut/evaluation-inputs.md) prepares both
+versions, compares their cases, repeats the sync from the lockfile and detects
+a case edited by the runner.
 
 ## Maintained knowledge collections
 
-A service's agent needs the API contract, an incident runbook and relevant
-examples. The owners maintain them in separate repositories. A project can
-declare the versions it uses and gather them into one local reference tree:
+An agent working on the billing service needs its API documentation, incident
+runbook and code examples. The platform and operations teams maintain these
+in separate repositories. Bring the relevant files into the service's project
+and record which versions it uses:
 
 ```toml
 [sources.api]
@@ -638,17 +660,23 @@ sources.operations = { take = [{ "incident.md" = "runbook.md" }] }
 on_change = "cat resources/knowledge/api.md resources/knowledge/runbook.md > resources/knowledge.txt"
 ```
 
-`phora update operations` adopts a newer runbook. The target's hook rebuilds
-`resources/knowledge.txt` when deployed content changes. The combined file
-sits outside the managed target, so it doesn't become drift in the inputs.
-An indexer can occupy the same hook when the consumer needs a search index.
-See the [hook walkthrough](tests/scrut/hooks.md) for changed, unchanged and
-failed-hook runs.
+The API documentation and examples land in `resources/knowledge/`, alongside
+the incident document renamed to `runbook.md`. After the files change, the hook
+combines the API documentation and runbook into `resources/knowledge.txt`.
+That generated file sits outside the managed directory, keeping it separate
+from the source documents.
 
-When the derived output itself needs a lock and integrity checks, use a
-[build source](GUIDE.md#building-sources). That is the same input → build →
-deployment arrangement used for [per-agent skills](#generating-per-agent-skills-from-one-canonical-set),
-and exercised by the [build walkthrough](tests/scrut/build.md).
+Run `phora update operations` to adopt a newer runbook and rebuild the combined
+file. If the agent needs a search index, the hook can run an indexer instead.
+The [hook walkthrough](tests/scrut/hooks.md) shows when hooks run and how a
+failed hook is retried.
+
+To version and verify the generated output as well, use a
+[build source](GUIDE.md#building-sources). Phora supplies the pinned inputs,
+runs the build and deploys its output. The
+[per-agent skills example](#generating-per-agent-skills-from-one-canonical-set)
+uses this approach, and the [build walkthrough](tests/scrut/build.md)
+demonstrates it with local files.
 
 ## Release assets, without curl | tar
 
