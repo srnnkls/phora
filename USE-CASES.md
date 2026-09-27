@@ -519,8 +519,7 @@ from the team's repository, run `phora update team` in that project. Other
 checkouts keep their existing versions.
 
 Save the configuration and lockfile with the task's results so you can identify
-the files it received. Record the model, tool versions and execution settings
-alongside them.
+the files it received.
 
 The [workspace walkthrough](tests/scrut/agent-workspaces.md) creates two
 workspaces, changes the source repository, restores an edited policy and
@@ -668,8 +667,10 @@ from the source documents.
 
 Run `phora update operations` to adopt a newer runbook and rebuild the combined
 file. If the agent needs a search index, the hook can run an indexer instead.
-The [hook walkthrough](tests/scrut/hooks.md) shows when hooks run and how a
-failed hook is retried.
+The [knowledge walkthrough](tests/scrut/knowledge-collections.md) collects the
+files from both repositories and rebuilds the combined file after a runbook
+update. The [hook walkthrough](tests/scrut/hooks.md) shows when hooks run and
+how a failed hook is retried.
 
 To version and verify the generated output as well, use a
 [build source](GUIDE.md#building-sources). Phora supplies the pinned inputs,
