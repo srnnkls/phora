@@ -774,8 +774,9 @@ program directly, with no shell.
 | `on_change` from an import | `PHORA_TARGET`: the composed target path |
 
 Hooks inherit phora's environment and run in the project directory. `on_change` records success,
-so it skips a sync where nothing changed; removals alone don't trigger it. Hooks come only from
-your own config files. An imported dependency's hooks run after [phora trust](#phora-trust).
+so it skips a sync where nothing changed; removals alone don't trigger it. Hooks come from your own
+config files, and from an imported dependency once you approve its hooks with
+[phora trust](#phora-trust).
 
 ```toml
 [hooks]
@@ -962,9 +963,10 @@ Run `phora rebuild-registry`. `phora list --orphans` shows records for removed t
 ### A private fetch fails without a terminal
 
 Without a terminal on stdin, credential prompts are off: phora's own, and Git Credential Manager's
-through `GCM_INTERACTIVE=never`. A helper with no stored credential fails the fetch. Store one from a terminal (run `phora sync` there once, or `git fetch` the repository),
-set `credential.<url>.username` when the helper holds several accounts, or use an ssh source.
-`GIT_TERMINAL_PROMPT=1` and `GCM_INTERACTIVE=auto` restore the prompts if something can answer
+through `GCM_INTERACTIVE=never`. A helper with no stored credential fails the fetch. Store one
+from a terminal (run `phora sync` there once, or `git fetch` the repository), set
+`credential.<url>.username` when the helper holds several accounts, or use an ssh source.
+`GIT_TERMINAL_PROMPT=1` and `GCM_INTERACTIVE=auto` turn the prompts on when something can answer
 them.
 
 ### Exit 75: another phora process is running

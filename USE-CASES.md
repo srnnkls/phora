@@ -53,8 +53,8 @@ resources:
 `resources/duckdb` holds the README and the public headers at `v1.3.2`, and
 nothing else. The store fetched that one commit without history, and file
 contents only for what you selected: its duckdb mirror takes 1.7 MB, where a
-full clone takes hundreds of megabytes. `resources/axum` is a
-whole checkout with its history, so `git log` and `git blame` work inside it.
+full clone takes hundreds of megabytes. `resources/axum` is a whole checkout
+with its history, so `git log` and `git blame` work inside it.
 The history lives in the store, and the checkout's `.git` file points there.
 
 Put the same `phora.toml` in a second project and its sync deploys from the
@@ -67,8 +67,8 @@ quietly turn into a scratch area.
 
 Add `resources/` to the project's `.gitignore`, or git treats `resources/axum`
 as an embedded repository. A history checkout is read-only: the next sync puts
-it back at the pin. A history binding takes
-the whole repository and rejects `take`, `collapse` and `template`. See
+it back at the pin. A history binding takes the whole repository and rejects
+`take`, `collapse` and `template`. See
 [History overlay](GUIDE.md#history-overlay) and
 [Under the hood](GUIDE.md#under-the-hood).
 
@@ -209,9 +209,8 @@ deploy = "link"
 
 Each artifact becomes a symlink into `~/dev/dotfiles`, so edits show up without
 a sync. `phora list` labels them `linked`, and `verify` skips them. phora warns
-that the absolute path isn't portable across machines, which is why this block
-lives in the local overlay. `phora add --symlink ~/dev/dotfiles` writes it for
-you. Delete the block and the next sync puts verified copies back. See
+that the absolute path isn't portable across machines, so the block belongs in
+the local overlay. `phora add --symlink ~/dev/dotfiles` writes it for you. Delete the block and the next sync puts verified copies back. See
 [Link mode](GUIDE.md#link-mode).
 
 If the repo commits symlinks, for example `.zprofile` pointing at `.zshrc`, set
@@ -487,7 +486,7 @@ path = "vendor/protos"
 sources = ["platform"]
 ```
 
-The version now lives in the consumer's `phora.lock`, under version control.
+The version lives in the consumer's `phora.lock`, under version control.
 The monorepo's size barely matters: phora fetches the tagged commit without
 history, and only the contents of the files under `protos`.
 
@@ -590,9 +589,9 @@ claude -> ~/.claude
 ```
 
 henia runs again only when the files it reads from tropos or loqui change, or
-`henia --version` prints something new. Its output is locked and hashed, so `phora verify` catches a hand
-edit in `~/.claude`. If henia fails, the previous output stays deployed and the
-sync exits non-zero.
+`henia --version` prints something new. Its output is locked and hashed, so
+`phora verify` catches a hand edit in `~/.claude`. If henia fails, the previous
+output stays deployed and the sync exits non-zero.
 
 To work on tropos itself, point the package at a checkout in
 `phora.local.toml`. The build then reads the working tree, uncommitted edits
