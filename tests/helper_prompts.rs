@@ -27,8 +27,7 @@ fn write_helper(dir: &Path, record: &Path) -> std::path::PathBuf {
     std::fs::write(
         &helper,
         format!(
-            "#!/bin/sh\ncat >/dev/null\nprintf '%s %s\\n' \"${{GCM_INTERACTIVE-unset}}\" \
-             \"${{GIT_TERMINAL_PROMPT-unset}}\" >> '{}'\n",
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' \"${{GCM_INTERACTIVE-unset}}\" >> '{}'\n",
             record.display()
         ),
     )
@@ -78,7 +77,6 @@ fn sync_without_terminal(preset: &[(&str, &str)]) -> String {
         .env("GIT_CONFIG_GLOBAL", &gitconfig)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env_remove("GCM_INTERACTIVE")
-        .env_remove("GIT_TERMINAL_PROMPT")
         .envs(preset.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -103,15 +101,15 @@ fn credential_helpers_may_not_prompt_without_a_terminal() {
     let seen = sync_without_terminal(&[]);
     assert!(!seen.is_empty(), "the credential helper was never asked");
     for line in seen.lines() {
-        assert_eq!(line, "never 0");
+        assert_eq!(line, "never");
     }
 }
 
 #[test]
 fn explicit_prompt_settings_survive() {
-    let seen = sync_without_terminal(&[("GCM_INTERACTIVE", "auto"), ("GIT_TERMINAL_PROMPT", "1")]);
+    let seen = sync_without_terminal(&[("GCM_INTERACTIVE", "auto")]);
     assert!(!seen.is_empty(), "the credential helper was never asked");
     for line in seen.lines() {
-        assert_eq!(line, "auto 1");
+        assert_eq!(line, "auto");
     }
 }

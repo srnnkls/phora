@@ -5,7 +5,7 @@ use clap::Parser;
 use phora::cli::{self, Cli};
 
 fn main() {
-    forbid_credential_prompts_without_terminal();
+    forbid_helper_prompts_without_terminal();
     #[cfg(feature = "trace")]
     init_tracing();
     let cli = Cli::parse();
@@ -21,18 +21,15 @@ fn main() {
     }
 }
 
-/// Credential helpers inherit this environment, and a prompt nobody can answer (Git
-/// Credential Manager's account picker) hangs the sync instead of failing it.
-fn forbid_credential_prompts_without_terminal() {
-    if std::io::stdin().is_terminal() {
+/// gix launches credential helpers with this environment and offers no other way to
+/// reach them; without a terminal, Git Credential Manager's account picker would hang
+/// the sync instead of failing it.
+fn forbid_helper_prompts_without_terminal() {
+    if std::io::stdin().is_terminal() || std::env::var_os("GCM_INTERACTIVE").is_some() {
         return;
     }
-    for (key, value) in [("GIT_TERMINAL_PROMPT", "0"), ("GCM_INTERACTIVE", "never")] {
-        if std::env::var_os(key).is_none() {
-            // SAFETY: main calls this before it starts any thread.
-            unsafe { std::env::set_var(key, value) };
-        }
-    }
+    // SAFETY: main calls this before it starts any thread.
+    unsafe { std::env::set_var("GCM_INTERACTIVE", "never") };
 }
 
 #[cfg(feature = "trace")]
