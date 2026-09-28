@@ -212,19 +212,17 @@ pub fn split_locks(
 /// resolves into the local lock, so the base lock would otherwise lose the pin other
 /// checkouts deploy from.
 pub fn carry_shadowed_pins(base: &mut Lock, prior: &Lock, shadowed: &BTreeSet<String>) {
-    let carried: Vec<LockedSource> = prior
-        .sources
-        .iter()
-        .filter(|locked| locked.instance.is_none() && shadowed.contains(&locked.name))
-        .filter(|locked| {
-            !base
-                .sources
-                .iter()
-                .any(|kept| kept.instance.is_none() && kept.name == locked.name)
-        })
-        .cloned()
-        .collect();
-    base.sources.extend(carried);
+    for (position, locked) in prior.sources.iter().enumerate() {
+        let is_shadowed_root = locked.instance.is_none() && shadowed.contains(&locked.name);
+        let already_pinned = base
+            .sources
+            .iter()
+            .any(|kept| kept.instance.is_none() && kept.name == locked.name);
+        if is_shadowed_root && !already_pinned {
+            let at = position.min(base.sources.len());
+            base.sources.insert(at, locked.clone());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -979,6 +977,27 @@ config_digest = \"PLACEHOLDER\"
         );
         assert_eq!(base.sources.len(), 2, "all sources land in the base lock");
         assert!(local.is_none(), "no overrides => no local lock");
+    }
+
+    #[test]
+    fn carry_shadowed_pins_keeps_the_prior_position() {
+        let lock = |names: &[&str]| Lock {
+            version: LOCK_SCHEMA_VERSION,
+            sources: names
+                .iter()
+                .map(|name| locked(name, "https://example.invalid/r.git", "main"))
+                .collect(),
+            trusted_hooks: Vec::new(),
+            candidate_hooks: Vec::new(),
+        };
+        let prior = lock(&["ripgrep", "ordinata", "salsa", "zoekt"]);
+        let mut base = lock(&["ripgrep", "salsa", "zoekt"]);
+        let shadowed: BTreeSet<String> = ["ordinata".to_owned()].into_iter().collect();
+
+        carry_shadowed_pins(&mut base, &prior, &shadowed);
+
+        let names: Vec<&str> = base.sources.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["ripgrep", "ordinata", "salsa", "zoekt"]);
     }
 
     #[test]
