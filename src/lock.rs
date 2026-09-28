@@ -208,6 +208,25 @@ pub fn split_locks(
     (base_lock, local_lock)
 }
 
+/// Keeps `prior`'s shared pin for every root source in `shadowed`: a local override
+/// resolves into the local lock, so the base lock would otherwise lose the pin other
+/// checkouts deploy from.
+pub fn carry_shadowed_pins(base: &mut Lock, prior: &Lock, shadowed: &BTreeSet<String>) {
+    let carried: Vec<LockedSource> = prior
+        .sources
+        .iter()
+        .filter(|locked| locked.instance.is_none() && shadowed.contains(&locked.name))
+        .filter(|locked| {
+            !base
+                .sources
+                .iter()
+                .any(|kept| kept.instance.is_none() && kept.name == locked.name)
+        })
+        .cloned()
+        .collect();
+    base.sources.extend(carried);
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
