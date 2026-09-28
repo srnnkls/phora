@@ -88,7 +88,7 @@ use crate::config::{
     Config, DeployMode, ParsedSource, PreDeployOnFail, Protocol, SourceMode, merge_configs,
 };
 use crate::error::{Error, Result};
-use crate::lock::{Lock, merge_locks, split_locks};
+use crate::lock::{Lock, carry_shadowed_pins, merge_locks, split_locks};
 use crate::source::{
     SourceName, SourceStore, WorktreeAdminId, WorktreeDeployRequest, WorktreeMirrorGuard,
     WorktreeRemoveRequest, is_local_path, remove_missing_mirror_worktree_gitlink,
@@ -1271,6 +1271,14 @@ fn sync_workspace<R: StateStore>(
     builds.route(&mut routed);
     input.sink().phase_finished(Phase::Resolve);
     let (mut base_lock, local_lock) = split_locks(routed.locks, &local_names);
+    if let Some(prior) = &input.locks.base {
+        let shadowed = local_names
+            .iter()
+            .filter(|name| input.base_config.sources.contains_key(*name))
+            .cloned()
+            .collect();
+        carry_shadowed_pins(&mut base_lock, prior, &shadowed);
+    }
     base_lock.trusted_hooks = effective_lock
         .as_ref()
         .map(|lock| lock.trusted_hooks.clone())
