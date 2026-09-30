@@ -4198,6 +4198,47 @@ fn renamed_target_adopts_a_clean_copy_orphan_without_force() {
 }
 
 #[test]
+fn renamed_target_adopts_the_clean_orphan_past_a_stale_one_at_the_same_destination() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let renamed = deploy_then_rename(&fx, &td, false);
+    let clean = fx
+        .registry
+        .artifact(&artifact_key("old", "editor-src", "editor"))
+        .expect("registry read")
+        .expect("premise: the old target records the artifact");
+    let mut stale = clean.clone();
+    stale.key.target = "aaa-stale".to_owned();
+    for file in &mut stale.files {
+        file.mtime = 1;
+        file.blake3 = "0".repeat(64);
+    }
+    fx.registry
+        .put_artifact(&stale)
+        .expect("plant the stale orphan");
+
+    let out = sync(&prune_input(&renamed), &fx.backend, &fx.registry)
+        .expect("prune sync after the rename");
+
+    assert!(!out.had_failures, "adoption is not a failure");
+    assert!(
+        fx.registry
+            .artifact(&artifact_key("new", "editor-src", "editor"))
+            .expect("registry read")
+            .is_some(),
+        "a stale orphan listed first must not block adopting the clean one behind it"
+    );
+    assert_eq!(
+        std::fs::read(
+            td.artifact_dst(&flat_layout(), "editor-src", "editor")
+                .join("init.lua")
+        )
+        .expect("adopted file kept"),
+        b"-- init\n"
+    );
+}
+
+#[test]
 fn renamed_target_adopts_its_orphan_under_prune_without_deleting_files() {
     let fx = build_sync_fixture();
     let td = TargetDir::new();

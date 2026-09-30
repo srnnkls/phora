@@ -171,7 +171,7 @@ where
     R: StateStore,
 {
     let destination: PathBuf = entry.artifact_dst.components().collect();
-    let Some(orphan) = records.iter().find(|record| {
+    for orphan in records.iter().filter(|record| {
         !record.history
             && (record.key.target.as_str(), record.key.source.as_str()) != (target_name, identity)
             && !desired.contains(&(
@@ -180,40 +180,46 @@ where
                 record.key.artifact.clone(),
             ))
             && recorded_destination(ctx, record).as_ref() == Some(&destination)
-    }) else {
-        return Ok(None);
-    };
-    let matches = if orphan.linked {
-        entry.source.deploy_mode() == DeployMode::Link
+    }) {
+        if orphan_matches_destination(orphan, entry, store)? {
+            return Ok(Some(ObservedArtifact::Managed(ManagedArtifact {
+                record: orphan.clone(),
+                condition: ManagedCondition::Outdated,
+                overlay_stale: false,
+            })));
+        }
+    }
+    Ok(None)
+}
+
+fn orphan_matches_destination(
+    orphan: &ArtifactRecord,
+    entry: &ArtifactEntry<'_>,
+    store: &dyn StateStore,
+) -> Result<bool> {
+    if orphan.linked {
+        return Ok(entry.source.deploy_mode() == DeployMode::Link
             && std::fs::read_link(entry.artifact_dst)
-                .is_ok_and(|link| link == target::link_target(entry))
-    } else {
-        let observation = inspect(
-            entry.artifact_dst,
-            &orphan.key.source,
-            &orphan.commit,
-            &[],
-            store,
-            &orphan.key,
-            None,
-        )?;
-        matches!(
-            observation,
-            ObservedArtifact::Managed(ManagedArtifact {
-                condition: ManagedCondition::Clean
-                    | ManagedCondition::MetadataChangedButContentClean { .. }
-                    | ManagedCondition::Outdated,
-                ..
-            })
-        )
-    };
-    Ok(matches.then(|| {
+                .is_ok_and(|link| link == target::link_target(entry)));
+    }
+    let observation = inspect(
+        entry.artifact_dst,
+        &orphan.key.source,
+        &orphan.commit,
+        &[],
+        store,
+        &orphan.key,
+        None,
+    )?;
+    Ok(matches!(
+        observation,
         ObservedArtifact::Managed(ManagedArtifact {
-            record: orphan.clone(),
-            condition: ManagedCondition::Outdated,
-            overlay_stale: false,
+            condition: ManagedCondition::Clean
+                | ManagedCondition::MetadataChangedButContentClean { .. }
+                | ManagedCondition::Outdated,
+            ..
         })
-    }))
+    ))
 }
 
 fn recorded_destination<R>(ctx: &DeployAll<'_, R>, record: &ArtifactRecord) -> Option<PathBuf> {
