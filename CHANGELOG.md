@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3](https://github.com/srnnkls/phora/compare/v0.3.2...v0.3.3) - 2026-09-30
+
+### Bug Fixes
+
+- *(sync)* Adopt bindings moved between live targets at their destinations ([#123](https://github.com/srnnkls/phora/pull/123))
+- *(cli)* List composed import records under their importing target ([#122](https://github.com/srnnkls/phora/pull/122))
+
+### Testing
+
+- *(sync)* Check moved-binding ownership against grouped list output ([#125](https://github.com/srnnkls/phora/pull/125))
+
+[0.3.3]: https://github.com/srnnkls/phora/compare/0.3.2..0.3.3
+
 ## [0.3.2](https://github.com/srnnkls/phora/compare/v0.3.1...v0.3.2) - 2026-09-30
 
 ### Features
