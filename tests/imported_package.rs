@@ -424,9 +424,17 @@ fn bindings_moved_into_an_imported_package_are_adopted_in_one_sync() {
         assert_deployed(&package, "out/claude", "Claude skill\n", "Loqui\n");
         let listed = run(&package, &["list"]);
         let listed = String::from_utf8_lossy(&listed.stdout);
+        let anchor_own: Vec<&str> = listed
+            .lines()
+            .take_while(|line| !line.trim_start().starts_with("via "))
+            .collect();
         assert!(
-            !listed.lines().any(|line| line.contains("skills/")),
+            !anchor_own.iter().any(|line| line.contains("skills/")),
             "the still-configured anchor must no longer own the moved destinations: {listed}"
+        );
+        assert!(
+            listed.contains("via tropos/content:"),
+            "the moved destinations must list under the composed package: {listed}"
         );
         let owners = run(&package, &["where"]);
         let owners = String::from_utf8_lossy(&owners.stdout);
