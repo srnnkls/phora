@@ -21,6 +21,8 @@ pub struct StagedArtifact {
     pub files: Vec<StagedFile>,
     pub digest: String,
     pub vars_digest: Option<String>,
+    /// Content-store objects whose bytes did not match their hash and were rewritten.
+    pub repaired: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -70,6 +72,7 @@ pub fn stage_artifact(
     let mut walk = ExportWalk {
         out_base: staging_dir,
         content_store,
+        repaired: Vec::new(),
         policy,
         files: Vec::new(),
         hasher: blake3::Hasher::new(),
@@ -87,6 +90,7 @@ pub fn stage_artifact(
         files: walk.files,
         digest,
         vars_digest,
+        repaired: walk.repaired,
     })
 }
 
@@ -214,6 +218,7 @@ struct Rendered {
 pub(crate) struct ExportWalk<'a, 'r, F> {
     pub(crate) out_base: &'a Path,
     pub(crate) content_store: Option<&'a Path>,
+    pub(crate) repaired: Vec<PathBuf>,
     pub(crate) policy: &'a ExportPolicy,
     pub(crate) files: Vec<F>,
     pub(crate) hasher: blake3::Hasher,
@@ -286,7 +291,10 @@ impl<F: StagedRecord> ExportWalk<'_, '_, F> {
             .content_store
             .map(|store| clone_leaf(store, &out_path, &data, executable_bits, &blake3));
         let mtime = match cloned {
-            Some(Ok(mtime)) => mtime,
+            Some(Ok(Cloned { mtime, repaired })) => {
+                self.repaired.extend(repaired);
+                mtime
+            }
             failed => {
                 if failed.is_some() {
                     self.content_store = None;
@@ -380,15 +388,23 @@ fn set_executable(_file: &std::fs::File) -> std::io::Result<()> {
     Ok(())
 }
 
+struct Cloned {
+    mtime: u64,
+    repaired: Option<PathBuf>,
+}
+
 /// Reflinks the leaf from the content store, writing the store object on first use, so every
 /// deployment of the same bytes shares one set of blocks. Fails where the filesystem cannot clone.
+///
+/// Every clone is read back against `data`; a store object that no longer holds its bytes is
+/// rewritten and cloned again.
 fn clone_leaf(
     store: &Path,
     path: &Path,
     data: &[u8],
     executable: bool,
     blake3: &str,
-) -> Result<u64> {
+) -> Result<Cloned> {
     let name = if executable {
         format!("{blake3}.x")
     } else {
@@ -396,36 +412,66 @@ fn clone_leaf(
     };
     let shard = store.join(&blake3[..2]);
     let object = shard.join(&name);
-    let stored = std::fs::metadata(&object).is_ok_and(|meta| meta.len() == data.len() as u64);
-    if !stored {
-        std::fs::create_dir_all(&shard)?;
-        let pending = shard.join(format!(
-            ".{name}.{}.{}",
-            std::process::id(),
-            pending_nonce()
-        ));
-        let written = write_leaf(&pending, data, executable)
-            .and_then(|_| std::fs::rename(&pending, &object).map_err(Into::into));
-        if written.is_err() {
-            let _ = std::fs::remove_file(&pending);
+    let mut repaired = None;
+    let written = match std::fs::metadata(&object) {
+        Ok(meta) if meta.len() == data.len() as u64 => false,
+        Ok(_) => {
+            write_object(&shard, &name, data, executable)?;
+            repaired = Some(object.clone());
+            true
         }
-        written?;
-    }
-    if path.symlink_metadata().is_ok() {
-        std::fs::remove_file(path)?;
-    }
-    if let Err(error) = reflink_copy::reflink(&object, path) {
-        if !stored {
+        Err(_) => {
+            write_object(&shard, &name, data, executable)?;
+            true
+        }
+    };
+    let matches = clone_matches(&object, path, data).inspect_err(|_| {
+        if written {
             let _ = std::fs::remove_file(&object);
         }
-        return Err(error.into());
+    })?;
+    if !matches {
+        write_object(&shard, &name, data, executable)?;
+        if !clone_matches(&object, path, data)? {
+            return Err(SourceError::Source(format!(
+                "content store object {} does not hold its bytes after a rewrite",
+                object.display()
+            )));
+        }
+        repaired = Some(object);
     }
     filetime::set_file_mtime(path, filetime::FileTime::now())?;
     let file = std::fs::File::open(path)?;
     if executable {
         set_executable(&file)?;
     }
-    written_mtime(&file.metadata()?)
+    Ok(Cloned {
+        mtime: written_mtime(&file.metadata()?)?,
+        repaired,
+    })
+}
+
+fn write_object(shard: &Path, name: &str, data: &[u8], executable: bool) -> Result<()> {
+    std::fs::create_dir_all(shard)?;
+    let pending = shard.join(format!(
+        ".{name}.{}.{}",
+        std::process::id(),
+        pending_nonce()
+    ));
+    let written = write_leaf(&pending, data, executable)
+        .and_then(|_| std::fs::rename(&pending, shard.join(name)).map_err(Into::into));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&pending);
+    }
+    written
+}
+
+fn clone_matches(object: &Path, path: &Path, data: &[u8]) -> Result<bool> {
+    if path.symlink_metadata().is_ok() {
+        std::fs::remove_file(path)?;
+    }
+    reflink_copy::reflink(object, path)?;
+    Ok(std::fs::read(path)? == data)
 }
 
 fn pending_nonce() -> u64 {
@@ -939,6 +985,55 @@ mod tests {
         assert!(
             mtime_secs(&second.path().join("init.lua")) >= before,
             "a cloned leaf carries its deploy time, not the store object's"
+        );
+    }
+
+    #[test]
+    fn content_store_rewrites_an_object_that_lost_its_bytes() {
+        let fixture = build_export_fixture();
+        fixture.refresh();
+        let store = TempDir::new().expect("store dir");
+        if !clones_within(store.path()) {
+            return;
+        }
+        let first = TempDir::new().expect("first staging dir");
+        let second = TempDir::new().expect("second staging dir");
+        let policy = ExportPolicy::default();
+        let leaves = [leaf("editor/init.lua", "init.lua")];
+        let stage = |staging: &Path| {
+            stage_through(
+                &fixture,
+                staging,
+                Some(store.path()),
+                &leaves,
+                &policy,
+                &BTreeMap::new(),
+            )
+            .expect("staging through the store succeeds")
+        };
+
+        let staged = stage(first.path());
+        let blake3 = &staged.files[0].blake3;
+        let object = store.path().join(&blake3[..2]).join(blake3);
+        let tampered = vec![b'x'; EDITOR_INIT_CONTENT.len()];
+        std::fs::write(&object, &tampered).expect("tamper with the store object");
+
+        let restaged = stage(second.path());
+
+        assert_eq!(
+            std::fs::read(second.path().join("init.lua")).expect("init.lua staged"),
+            EDITOR_INIT_CONTENT,
+            "a tampered object must never reach a deployment"
+        );
+        assert_eq!(
+            std::fs::read(&object).expect("store object kept"),
+            EDITOR_INIT_CONTENT,
+            "the tampered object is rewritten with its bytes"
+        );
+        assert_eq!(restaged.repaired, vec![object]);
+        assert!(
+            staged.repaired.is_empty(),
+            "a clean store reports no repair"
         );
     }
 

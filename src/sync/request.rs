@@ -234,6 +234,10 @@ pub enum SyncWarning {
         source: String,
         detail: String,
     },
+    /// A content-store object no longer held its bytes and was rewritten.
+    ContentStoreRepaired {
+        object: PathBuf,
+    },
 }
 
 /// Overall synchronization outcome used by callers to choose an exit code.

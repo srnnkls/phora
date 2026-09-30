@@ -71,6 +71,10 @@ pub(super) fn format_sync_warning(warning: &SyncWarning) -> Option<String> {
         SyncWarning::FastForwardDropped { source, artifact } => {
             format!("phora: fast-forward dropped {source}:{artifact} (removed upstream)")
         }
+        SyncWarning::ContentStoreRepaired { object } => format!(
+            "phora: content store object {} did not match its hash; rewrote it",
+            object.display()
+        ),
         SyncWarning::CrossDeviceFallback { destination } => format!(
             "phora: staging on a different mount than {}; falling back to recursive copy",
             destination.display()

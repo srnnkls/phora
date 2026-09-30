@@ -91,6 +91,7 @@ fn staged_artifact_frames_the_export_result_over_typed_destinations() {
         }],
         digest: "cc".repeat(32),
         vars_digest: None,
+        repaired: Vec::new(),
     };
     let templated = StagedArtifact {
         files: vec![StagedFile {
@@ -102,6 +103,7 @@ fn staged_artifact_frames_the_export_result_over_typed_destinations() {
         }],
         digest: "dd".repeat(32),
         vars_digest: Some("ee".repeat(32)),
+        repaired: Vec::new(),
     };
 
     assert_eq!(

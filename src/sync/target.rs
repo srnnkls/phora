@@ -1209,6 +1209,11 @@ fn deploy_one(
             Ok((entry.bytes, entry.meta.kind))
         },
     )?;
+    for object in &staged.repaired {
+        ctx.events.push_warning(SyncWarning::ContentStoreRepaired {
+            object: object.clone(),
+        });
+    }
     let files: Vec<ManifestFile> = staged
         .files
         .iter()
