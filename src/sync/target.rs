@@ -616,7 +616,7 @@ fn apply_reconciled(
                 events,
             );
             if !failed {
-                release_adopted_orphan(&reconciliation.observed, &triplet, registry)?;
+                release_adopted_record(&reconciliation.observed, &triplet, registry)?;
             }
             Ok(failed)
         }
@@ -829,14 +829,14 @@ fn apply_resolution(
     }
 }
 
-/// Only orphan adoption observes a destination under another target's record.
-fn release_adopted_orphan(
+/// Only adoption observes a destination under another binding's record.
+fn release_adopted_record(
     observed: &ObservationIndex<'_>,
     triplet: &(String, String, String),
     registry: &dyn StateStore,
 ) -> Result<()> {
     if let Some(ObservedArtifact::Managed(managed)) = observed.get(triplet).copied()
-        && managed.record.key.target != triplet.0
+        && (&managed.record.key.target, &managed.record.key.source) != (&triplet.0, &triplet.1)
     {
         registry.remove_artifact(&managed.record.key)?;
     }

@@ -178,3 +178,28 @@ $ readlink restructured/doom/init.el | normalize && cat restructured/lint/rules.
 <ROOT>/dots/.config/doom/init.el
 [rules]
 ```
+
+## A binding moved to another live target is adopted in one prune sync
+
+Moving the lint binding out of the still-configured `config` target into a new
+`lint` target rooted at the same directory lands on the same destination. The
+new owner adopts the clean copy instead of skipping it as foreign, and
+`--prune` releases the old record without deleting the file.
+
+```scrut
+$ printf '[sources.dots]\npath = "./dots"\nroot = ".config"\ndeploy = "link"\n\n[sources.lint-rules]\npath = "./src-proj"\nbranch = "main"\nroot = "lint"\n\n[targets.config]\npath = "restructured"\n\n[targets.config.sources.dots]\ncollapse = false\ntake = ["doom/"]\n\n[targets.lint]\npath = "restructured/lint"\nsources = ["lint-rules"]\n' > phora.toml && phora sync --prune 2>&1 | normalize
+sync complete
+```
+
+```scrut
+$ phora list 2>&1 | normalize
+config:
+  dots/doom/init.el  linked
+lint:
+  lint-rules/rules.toml  ✓ clean
+```
+
+```scrut
+$ cat restructured/lint/rules.toml
+[rules]
+```

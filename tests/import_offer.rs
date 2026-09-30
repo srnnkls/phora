@@ -314,3 +314,119 @@ fn narrowing_the_offer_prunes_what_the_import_no_longer_admits() {
         ])
     );
 }
+
+fn configure_fas(package: &Package, rules: &str) {
+    write(&package.project.join("dots/config.toml"), "fas\n");
+    write(
+        &package.project.join("phora.toml"),
+        &format!(
+            r#"
+[paths]
+cache = "cache"
+state = "state"
+[sources.fas]
+path = "dots"
+deploy = "link"
+{rules}
+[targets.fas]
+path = "out"
+sources.fas = {{ collapse = false }}
+"#,
+        ),
+    );
+}
+
+fn bind_rules_in_the_fas_target(package: &Package) -> String {
+    format!(
+        r#"
+[sources.fas-rules]
+path = {repository:?}
+branch = "main"
+root = "rules"
+exclude = ["fas/moira/"]
+[sources.moira]
+git = "https://example.invalid/moira.git"
+root = "rules/fas"
+[targets.fas.sources.fas-rules]
+take = [{{ "fas/" = "rules" }}]
+[targets.moira]
+path = "out/rules/moira"
+sources.moira = {{ collapse = false }}
+"#,
+        repository = package.repository.display().to_string()
+    )
+}
+
+fn import_rules_into_their_own_target(package: &Package) -> String {
+    format!(
+        r#"
+[sources.fas-rules]
+path = {repository:?}
+branch = "main"
+transitive = true
+root = "rules/fas"
+[targets.fas-rules]
+path = "out/rules"
+imports = ["fas-rules"]
+"#,
+        repository = package.repository.display().to_string()
+    )
+}
+
+const FAS_RULES: &[&str] = &[
+    "config.toml",
+    "rules/guidance/naming.cue",
+    "rules/moira/du.cue",
+    "rules/security/secrets.cue",
+    "rules/workflow/review.cue",
+];
+
+#[test]
+fn rules_moved_from_a_live_target_into_their_own_import_are_adopted_in_one_sync() {
+    for prune in [false, true] {
+        let package = package(MOIRA_TARGET);
+        configure_fas(&package, &bind_rules_in_the_fas_target(&package));
+        succeeds(&package, &["sync"]);
+        assert_eq!(deployed(&package), set(FAS_RULES), "premise");
+        configure_fas(&package, &import_rules_into_their_own_target(&package));
+
+        let args: &[&str] = if prune {
+            &["sync", "--prune"]
+        } else {
+            &["sync"]
+        };
+        let result = run(&package, args);
+
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(result.status.success(), "phora {args:?}: {stderr}");
+        assert!(
+            !stderr.contains("foreign"),
+            "moved rules must be adopted, not skipped as foreign: {stderr}"
+        );
+        assert_eq!(deployed(&package), set(FAS_RULES), "prune={prune}");
+        let owners = run(&package, &["where"]);
+        let owners = String::from_utf8_lossy(&owners.stdout);
+        let owners: Vec<&str> = owners
+            .lines()
+            .filter_map(|line| line.strip_prefix("  - "))
+            .collect();
+        assert_eq!(
+            owners.len(),
+            FAS_RULES.len(),
+            "one record per file: {owners:?}"
+        );
+        assert_eq!(
+            owners
+                .iter()
+                .filter(|owner| owner.ends_with("%tropos"))
+                .count(),
+            3,
+            "the composed package target owns the moved rules: {owners:?}"
+        );
+        assert!(
+            owners.iter().any(|owner| owner.ends_with("%moira")),
+            "the composed dependency owns its moved file: {owners:?}"
+        );
+        assert!(owners.contains(&"fas"), "prune={prune}: {owners:?}");
+    }
+}

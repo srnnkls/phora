@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::config::DeployMode;
@@ -30,6 +30,7 @@ where
     let store: &dyn StateStore = ctx.registry;
     let mut observations: BTreeMap<ObservationKey, ObservedEntry<ArtifactRecord>> = BTreeMap::new();
     let mut all_records: Option<Vec<ArtifactRecord>> = None;
+    let mut desired: Option<BTreeSet<ObservationKey>> = None;
     for (target_name, target) in &ctx.config.targets {
         let Some(target_projection) = projection
             .targets
@@ -46,7 +47,12 @@ where
                     all_records = Some(ctx.records()?);
                 }
                 let records = all_records.as_deref().unwrap_or_default();
-                if let Some(adopted) = adopt_orphan(ctx, entry, records, store)? {
+                let desired =
+                    desired.get_or_insert_with(|| super::reconcile::desired_keys(projection));
+                let binding = (run.target_name, entry.identity);
+                if let Some(adopted) =
+                    adopt_undesired_record(ctx, binding, entry, records, desired, store)?
+                {
                     observation = adopted;
                 }
             }
@@ -153,10 +159,12 @@ fn registry_only_records(
     }
 }
 
-fn adopt_orphan<R>(
+fn adopt_undesired_record<R>(
     ctx: &DeployAll<'_, R>,
+    (target_name, identity): (&str, &str),
     entry: &ArtifactEntry<'_>,
     records: &[ArtifactRecord],
+    desired: &BTreeSet<ObservationKey>,
     store: &dyn StateStore,
 ) -> Result<Option<ObservedArtifact<ArtifactRecord>>>
 where
@@ -165,8 +173,13 @@ where
     let destination: PathBuf = entry.artifact_dst.components().collect();
     let Some(orphan) = records.iter().find(|record| {
         !record.history
-            && super::prune::is_orphan(ctx.config, record)
-            && super::prune::orphan_artifact_path(record).as_ref() == Some(&destination)
+            && (record.key.target.as_str(), record.key.source.as_str()) != (target_name, identity)
+            && !desired.contains(&(
+                record.key.target.clone(),
+                record.key.source.clone(),
+                record.key.artifact.clone(),
+            ))
+            && recorded_destination(ctx, record).as_ref() == Some(&destination)
     }) else {
         return Ok(None);
     };
@@ -201,6 +214,17 @@ where
             overlay_stale: false,
         })
     }))
+}
+
+fn recorded_destination<R>(ctx: &DeployAll<'_, R>, record: &ArtifactRecord) -> Option<PathBuf> {
+    match ctx.config.targets.get(&record.key.target) {
+        Some(target) => Some(
+            super::prune::removal_destination(target, record)
+                .components()
+                .collect(),
+        ),
+        None => super::prune::orphan_artifact_path(record),
+    }
 }
 
 fn observe_entry(
