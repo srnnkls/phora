@@ -3,6 +3,7 @@
 pub mod apply;
 mod build;
 pub(crate) mod confine;
+pub mod content;
 mod directories;
 pub(crate) mod discover;
 pub(crate) mod hooks;

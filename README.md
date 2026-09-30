@@ -214,6 +214,7 @@ phora uneject <artifact> --source <source> --target <target>
 
 # Maintenance / debugging
 phora rebuild-registry      # reconstruct registry from lock + on-disk targets
+phora cache prune [-n]      # remove content-store objects no recorded deployment uses
 phora check-match --source <source> <path>   # debug include/exclude matching
 phora explain <target> <source> [path]       # offline: which include/exclude offered a path, and how `take` resolves it
 ```
@@ -864,7 +865,14 @@ place, so every deployment of the same content shares its blocks on a
 copy-on-write filesystem (APFS, Btrfs, XFS). Where the cache and target cannot
 clone, files are written directly. Every clone is read back against the
 committed bytes; a store object that no longer holds them is rewritten, and the
-sync warns with the object's path. For a
+sync warns with the object's path.
+
+`phora cache prune` removes store objects that no registry under the state root
+records, skipping objects written in the last hour; `--dry-run` lists them
+instead. A successful sync runs the same prune once a week. Deployed files are
+independent clones, so a prune never changes a deployment. A project whose
+`[paths] state` points elsewhere is invisible to other projects' prunes; its
+objects may be removed and rewritten on its next sync. For a
 tight dev loop, `deploy = "link"` instead symlinks the artifact destination
 at the source's live working tree (`<source path>/<root>/<artifact>`, absolute).
 Uncommitted edits in the checkout are visible through the target immediately, with

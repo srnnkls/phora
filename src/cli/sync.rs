@@ -132,7 +132,11 @@ pub(super) fn run_sync(
         request.sink.aborted(&error.to_string());
     })?;
 
-    finish_sync(&cwd, &out, interactive, &reporter)
+    let outcome = finish_sync(&cwd, &out, interactive, &reporter)?;
+    if outcome == CliOutcome::Success && !lockless {
+        super::cache::auto_prune(&effective.paths, &cwd);
+    }
+    Ok(outcome)
 }
 
 struct StrippedHookNotice {
