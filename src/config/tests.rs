@@ -3896,6 +3896,7 @@ mod per_binding_refinement {
             take: None,
             collapse: None,
             confine: None,
+            mount: None,
             sources: Some(BTreeMap::from([(
                 "pinned".to_owned(),
                 Binding {
@@ -3941,6 +3942,7 @@ mod per_binding_refinement {
             take: None,
             collapse: None,
             confine: None,
+            mount: None,
             sources: Some(BTreeMap::from([(
                 "pinned".to_owned(),
                 Binding {

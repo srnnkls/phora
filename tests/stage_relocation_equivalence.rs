@@ -140,6 +140,7 @@ fn projected_target(inventory_paths: &[&str], root: Option<&str>) -> TargetProje
         materialization: MaterializationPolicy::Copy,
         layout: &layout,
         templates: &templates,
+        mount: None,
     };
     project_target("home", &[input]).expect("clean fixture projects")
 }

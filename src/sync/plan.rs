@@ -14,8 +14,8 @@ use super::resolve::ResolvedSourceMap;
 
 use crate::projection::build::{build_workspace, project_target};
 use crate::projection::model::{
-    BindingProjectionInput, CollapsePreference, LayoutSpec, MaterializationPolicy, OfferSpec,
-    Projection, ResolvedSourceRef, TakeSpec, TargetProjection, TemplatePolicy,
+    BindingProjectionInput, CollapsePreference, LayoutSpec, MaterializationPolicy, MountView,
+    OfferSpec, Projection, ResolvedSourceRef, TakeSpec, TargetProjection, TemplatePolicy,
     WorkspaceTargetInput,
 };
 
@@ -47,6 +47,7 @@ pub fn plan_target(
 
 struct TargetDiscovery {
     layout: LayoutSpec,
+    mount: Option<MountView>,
     discovered: Vec<DiscoveredBinding>,
 }
 
@@ -101,7 +102,11 @@ fn discover_target(
             templates: TemplatePolicy::from(&binding.template_opt_in),
         });
     }
-    Ok(TargetDiscovery { layout, discovered })
+    Ok(TargetDiscovery {
+        layout,
+        mount: target.mount.clone(),
+        discovered,
+    })
 }
 
 fn binding_inputs(discovery: &TargetDiscovery) -> Vec<BindingProjectionInput<'_>> {
@@ -119,6 +124,7 @@ fn binding_inputs(discovery: &TargetDiscovery) -> Vec<BindingProjectionInput<'_>
             materialization: d.materialization,
             layout: &discovery.layout,
             templates: &d.templates,
+            mount: discovery.mount.as_ref(),
         })
         .collect()
 }

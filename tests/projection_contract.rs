@@ -517,6 +517,7 @@ fn binding_input<'a>(
         materialization: copy_policy(),
         layout,
         templates,
+        mount: None,
     }
 }
 
@@ -541,6 +542,7 @@ fn project_mode(
         materialization,
         layout,
         templates,
+        mount: None,
     };
     project_binding(&input)
 }
@@ -587,6 +589,7 @@ fn project_binding_emits_native_published_key_order_with_full_artifact_fields() 
         materialization: link_policy(),
         layout: &layout,
         templates: &templates,
+        mount: None,
     };
     let binding = project_binding(&input).expect("a well-formed link binding projects");
 
@@ -1055,6 +1058,7 @@ fn project_binding_force_collapse_blocked_under_link_is_a_collapse_error() {
         materialization: link_policy(),
         layout: &layout,
         templates: &templates,
+        mount: None,
     };
 
     let err = project_binding(&input)

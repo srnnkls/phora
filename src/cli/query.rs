@@ -15,7 +15,7 @@ use crate::projection::build::project_binding;
 use crate::projection::diagnostic::ProjectionWarning;
 use crate::projection::model::{
     BindingProjection, BindingProjectionInput, CollapsePreference, LayoutSpec, Materialization,
-    MaterializationPolicy, OfferSpec, ResolvedSourceRef, TakeSpec, TemplatePolicy,
+    MaterializationPolicy, MountView, OfferSpec, ResolvedSourceRef, TakeSpec, TemplatePolicy,
 };
 use crate::projection::offer::OfferSelection;
 use crate::source::{
@@ -368,6 +368,7 @@ pub(crate) struct ExplainInput<'a> {
     pub collapse: Option<bool>,
     pub history: bool,
     pub layout: &'a LayoutConfig,
+    pub mount: Option<&'a MountView>,
     pub template_opt_in: &'a TemplateOptIn,
 }
 
@@ -394,6 +395,7 @@ pub(crate) fn explain_path(input: &ExplainInput<'_>, path: Option<&str>) -> Resu
         materialization: MaterializationPolicy::from(&input.mode),
         layout: &layout,
         templates: &templates,
+        mount: input.mount,
     })?;
 
     let body = match path {
@@ -675,6 +677,7 @@ pub(crate) fn explain_cmd(
         collapse: binding.collapse,
         history: binding.history,
         layout: &layout,
+        mount: target_cfg.mount.as_ref(),
         template_opt_in: &binding.template_opt_in,
     };
     explain_path(&input, path)
@@ -1196,6 +1199,7 @@ mod explain_tests {
             collapse,
             history: false,
             layout: &layout,
+            mount: None,
             template_opt_in: &TemplateOptIn::SuffixOnly,
         };
         explain_path(&input, path).expect("attribution resolves")

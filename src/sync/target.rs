@@ -1471,6 +1471,7 @@ mod confine_fail_closed_tests {
             take: None,
             collapse: None,
             confine: None,
+            mount: None,
         }
     }
 
@@ -1570,6 +1571,7 @@ mod kind_aware_layout_tests {
             take: None,
             collapse: None,
             confine: None,
+            mount: None,
         }
     }
 

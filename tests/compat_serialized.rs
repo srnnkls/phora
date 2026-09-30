@@ -1440,6 +1440,7 @@ fn moved_path_projection(fx: &Fixture, layout_override: Option<LayoutSpec>) -> T
         materialization: MaterializationPolicy::from(&source.deploy_mode()),
         layout: &layout,
         templates: &templates,
+        mount: None,
     };
     phora::projection::build::project_target("home", &[input]).expect("the fixture projects")
 }
