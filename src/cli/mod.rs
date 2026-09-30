@@ -2,6 +2,7 @@
 
 mod add;
 mod bind;
+mod cache;
 mod config_edit;
 mod json;
 mod progress;
@@ -198,6 +199,11 @@ pub enum Command {
     Target {
         #[command(subcommand)]
         cmd: TargetCmd,
+    },
+    /// Maintain the shared cache (`prune`).
+    Cache {
+        #[command(subcommand)]
+        cmd: cache::CacheCmd,
     },
     /// Bind one or more sources to a target, optionally refining each binding.
     Bind {
@@ -428,6 +434,7 @@ pub fn run_with_outcome(cli: Cli) -> Result<CliOutcome> {
         }
         Command::Source { cmd } => completed(run_source(cmd)),
         Command::Target { cmd } => completed(run_target(cmd)),
+        Command::Cache { cmd } => completed(cache::run_cache(cmd)),
         cmd @ Command::Bind { .. } => completed(dispatch_bind(cmd)),
         Command::Unbind {
             sources,

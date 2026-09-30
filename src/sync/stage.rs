@@ -405,23 +405,17 @@ fn clone_leaf(
     executable: bool,
     blake3: &str,
 ) -> Result<Cloned> {
-    let name = if executable {
-        format!("{blake3}.x")
-    } else {
-        blake3.to_owned()
-    };
-    let shard = store.join(&blake3[..2]);
-    let object = shard.join(&name);
+    let object = crate::sync::content::object_path(store, blake3, executable);
     let mut repaired = None;
     let written = match std::fs::metadata(&object) {
         Ok(meta) if meta.len() == data.len() as u64 => false,
         Ok(_) => {
-            write_object(&shard, &name, data, executable)?;
+            write_object(&object, data, executable)?;
             repaired = Some(object.clone());
             true
         }
         Err(_) => {
-            write_object(&shard, &name, data, executable)?;
+            write_object(&object, data, executable)?;
             true
         }
     };
@@ -431,7 +425,7 @@ fn clone_leaf(
         }
     })?;
     if !matches {
-        write_object(&shard, &name, data, executable)?;
+        write_object(&object, data, executable)?;
         if !clone_matches(&object, path, data)? {
             return Err(SourceError::Source(format!(
                 "content store object {} does not hold its bytes after a rewrite",
@@ -451,15 +445,22 @@ fn clone_leaf(
     })
 }
 
-fn write_object(shard: &Path, name: &str, data: &[u8], executable: bool) -> Result<()> {
+fn write_object(object: &Path, data: &[u8], executable: bool) -> Result<()> {
+    let (Some(shard), Some(name)) = (object.parent(), object.file_name()) else {
+        return Err(SourceError::Source(format!(
+            "content store object {} has no parent",
+            object.display()
+        )));
+    };
     std::fs::create_dir_all(shard)?;
     let pending = shard.join(format!(
-        ".{name}.{}.{}",
+        ".{}.{}.{}",
+        name.to_string_lossy(),
         std::process::id(),
         pending_nonce()
     ));
     let written = write_leaf(&pending, data, executable)
-        .and_then(|_| std::fs::rename(&pending, shard.join(name)).map_err(Into::into));
+        .and_then(|_| std::fs::rename(&pending, object).map_err(Into::into));
     if written.is_err() {
         let _ = std::fs::remove_file(&pending);
     }
