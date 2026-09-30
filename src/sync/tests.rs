@@ -4411,6 +4411,250 @@ fn prune_drops_orphan_records_overlapping_an_owned_live_destination_and_keeps_fi
     );
 }
 
+// ── moved bindings: a live target takes over another live key's destination ────
+
+fn two_targets_one_root(
+    fx: &SyncFixture,
+    side_url: &str,
+    root: &Path,
+    (alpha_src, beta_src): (&str, &str),
+    link: bool,
+) -> Config {
+    let mode = if link { "deploy = \"link\"\n" } else { "" };
+    Config::parse(&format!(
+        "version = 1\n\n\
+         [sources.editor-src]\ngit = \"{}\"\nbranch = \"main\"\n{mode}\n\
+         [sources.side]\ngit = \"{side_url}\"\nbranch = \"main\"\n\n\
+         [targets.alpha]\npath = \"{}\"\nsources = [\"{alpha_src}\"]\nlayout = \"flat\"\n\n\
+         [targets.beta]\npath = \"{}\"\nsources = [\"{beta_src}\"]\nlayout = \"flat\"\n",
+        fx.url,
+        root.display(),
+        root.display(),
+    ))
+    .expect("two-target config parses")
+}
+
+struct MovedBinding {
+    fx: SyncFixture,
+    td: TargetDir,
+    _side: TempDir,
+    moved: Config,
+}
+
+fn deploy_then_swap_bindings(link: bool) -> MovedBinding {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let (side, side_url) = build_named_artifact_repo("side", "s.txt", b"side\n");
+    let before = two_targets_one_root(
+        &fx,
+        &side_url,
+        &td.target_path(),
+        ("editor-src", "side"),
+        link,
+    );
+    let out = sync(
+        &input(&before, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("initial sync");
+    assert!(!out.had_failures, "premise: both targets deploy cleanly");
+    let moved = two_targets_one_root(
+        &fx,
+        &side_url,
+        &td.target_path(),
+        ("side", "editor-src"),
+        link,
+    );
+    MovedBinding {
+        fx,
+        td,
+        _side: side,
+        moved,
+    }
+}
+
+fn assert_record(fx: &SyncFixture, key: &ArtifactKey, present: bool, why: &str) {
+    assert_eq!(
+        fx.registry.artifact(key).expect("registry read").is_some(),
+        present,
+        "{why}: {key:?}"
+    );
+}
+
+fn assert_swap_adopted(moved: &MovedBinding) {
+    let fx = &moved.fx;
+    for (owner, source, artifact) in [("beta", "editor-src", "editor"), ("alpha", "side", "side")] {
+        assert_record(
+            fx,
+            &artifact_key(owner, source, artifact),
+            true,
+            "the target the binding moved to must own its old destination",
+        );
+    }
+    for (previous, source, artifact) in
+        [("alpha", "editor-src", "editor"), ("beta", "side", "side")]
+    {
+        assert_record(
+            fx,
+            &artifact_key(previous, source, artifact),
+            false,
+            "the adopted record of the still-configured target must leave the registry",
+        );
+    }
+    let root = moved.td.target_path();
+    assert_eq!(
+        std::fs::read(root.join("editor/init.lua")).expect("moved file kept"),
+        b"-- init\n"
+    );
+    assert_eq!(
+        std::fs::read(root.join("side/s.txt")).expect("moved file kept"),
+        b"side\n"
+    );
+}
+
+#[test]
+fn moved_binding_between_live_targets_adopts_a_clean_copy() {
+    let moved = deploy_then_swap_bindings(false);
+    let out = sync(
+        &input(&moved.moved, None, None, None, false),
+        &moved.fx.backend,
+        &moved.fx.registry,
+    )
+    .expect("sync after the move");
+    assert!(!out.had_failures, "adoption is not a failure");
+    assert_swap_adopted(&moved);
+}
+
+#[test]
+fn moved_binding_between_live_targets_adopts_under_prune_without_deleting_files() {
+    let moved = deploy_then_swap_bindings(false);
+    let out = sync(
+        &prune_input(&moved.moved),
+        &moved.fx.backend,
+        &moved.fx.registry,
+    )
+    .expect("prune sync after the move");
+    assert!(!out.had_failures, "adoption under prune is not a failure");
+    assert_swap_adopted(&moved);
+}
+
+#[cfg(unix)]
+#[test]
+fn moved_link_binding_between_live_targets_adopts_the_matching_link() {
+    for prune in [false, true] {
+        let moved = deploy_then_swap_bindings(true);
+        let dst = moved.td.target_path().join("editor");
+        let link_before = std::fs::read_link(&dst).expect("premise: alpha deployed a link");
+        let run = SyncInput {
+            prune,
+            ..input(&moved.moved, None, None, None, false)
+        };
+        let out = sync(&run, &moved.fx.backend, &moved.fx.registry).expect("sync after the move");
+        assert!(
+            !out.had_failures,
+            "adoption is not a failure (prune={prune})"
+        );
+        assert_swap_adopted(&moved);
+        let adopted = moved
+            .fx
+            .registry
+            .artifact(&artifact_key("beta", "editor-src", "editor"))
+            .expect("registry read")
+            .expect("beta records the adopted link");
+        assert!(adopted.linked, "the adopted record stays a link record");
+        assert_eq!(
+            std::fs::read_link(&dst).expect("link kept"),
+            link_before,
+            "the link must stay intact across the move (prune={prune})"
+        );
+    }
+}
+
+#[test]
+fn moved_binding_with_modified_copy_stays_a_conflict_and_prune_deletes_nothing() {
+    for prune in [false, true] {
+        let moved = deploy_then_swap_bindings(false);
+        let init = moved.td.target_path().join("editor/init.lua");
+        let edited = b"-- locally edited\n";
+        std::fs::write(&init, edited).expect("edit the deployed file");
+        let run = SyncInput {
+            prune,
+            ..input(&moved.moved, None, None, None, false)
+        };
+        let out = sync(&run, &moved.fx.backend, &moved.fx.registry).expect("sync after the move");
+        assert!(!out.had_failures, "a skipped conflict is not a failure");
+        assert_eq!(
+            std::fs::read(&init).expect("edited file kept"),
+            edited,
+            "a modified destination must be neither overwritten nor pruned (prune={prune})"
+        );
+        assert_record(
+            &moved.fx,
+            &artifact_key("beta", "editor-src", "editor"),
+            false,
+            "a modified destination is not adopted",
+        );
+        assert_record(
+            &moved.fx,
+            &artifact_key("alpha", "editor-src", "editor"),
+            true,
+            "the unadopted record keeps tracking the modified destination",
+        );
+    }
+}
+
+#[test]
+fn renamed_source_within_a_target_adopts_its_previous_record() {
+    for prune in [false, true] {
+        let fx = build_sync_fixture();
+        let td = TargetDir::new();
+        let before =
+            config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+        let out = sync(
+            &input(&before, None, None, None, false),
+            &fx.backend,
+            &fx.registry,
+        )
+        .expect("initial sync");
+        assert!(!out.had_failures, "premise: the target deploys cleanly");
+        let renamed =
+            config_one_source_one_target("editor", &fx.url, "dest", &td.target_path(), "flat");
+        let run = SyncInput {
+            prune,
+            ..input(&renamed, None, None, None, false)
+        };
+
+        let out = sync(&run, &fx.backend, &fx.registry).expect("sync after the rename");
+
+        assert!(
+            !out.had_failures,
+            "adoption is not a failure (prune={prune})"
+        );
+        assert_record(
+            &fx,
+            &artifact_key("dest", "editor", "editor"),
+            true,
+            "the renamed source must own its previous destination",
+        );
+        assert_record(
+            &fx,
+            &artifact_key("dest", "editor-src", "editor"),
+            false,
+            "the record under the previous source name must leave the registry",
+        );
+        assert_eq!(
+            std::fs::read(
+                td.artifact_dst(&flat_layout(), "editor", "editor")
+                    .join("init.lua")
+            )
+            .expect("adopted file kept"),
+            b"-- init\n",
+            "prune={prune}"
+        );
+    }
+}
+
 // ── undefined source reference: graceful Err, not panic ────────
 
 #[test]

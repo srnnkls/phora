@@ -174,6 +174,12 @@ fn key_of<R>(entry: &ObservedEntry<R>) -> Key {
     )
 }
 
+pub(super) fn desired_keys(projection: &Projection) -> BTreeSet<Key> {
+    desired_artifacts(projection)
+        .map(|desired| (desired.target, desired.source, desired.artifact))
+        .collect()
+}
+
 struct DesiredArtifact {
     target: String,
     source: String,

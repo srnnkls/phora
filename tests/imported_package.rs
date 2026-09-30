@@ -364,3 +364,83 @@ fn imported_package_deploys_at_a_parent_relative_anchor() {
     assert!(!package.project.join("out").exists());
     succeeds(&package, &["verify"]);
 }
+
+fn configure_bindings_before_import(package: &Package) {
+    write(&package.project.join("notes-src/memo/n.md"), "memo\n");
+    write(
+        &package.project.join("phora.toml"),
+        &format!(
+            r#"
+[paths]
+cache = "cache"
+state = "state"
+[sources.skills]
+path = {repository:?}
+include = ["skills/**"]
+[sources.guides]
+git = "https://example.invalid/loqui.git"
+branch = "main"
+include = ["languages/**"]
+[sources.notes]
+path = "notes-src"
+deploy = "link"
+[targets.claude]
+path = "out/claude"
+sources.skills = {{ collapse = false }}
+sources.notes = {{}}
+[targets.guides]
+path = "out/claude/skills/loqui/reference/loqui"
+sources.guides = {{ collapse = false }}
+"#,
+            repository = package.repository.display().to_string()
+        ),
+    );
+}
+
+const CLAUDE_WITH_NOTES: &str = "[sources.notes]\npath = \"notes-src\"\ndeploy = \"link\"\n[targets.claude]\npath = \"out/claude\"\nimports = [\"tropos\"]\nsources.notes = {}\n";
+
+#[test]
+fn bindings_moved_into_an_imported_package_are_adopted_in_one_sync() {
+    for prune in [false, true] {
+        let package = package();
+        configure_bindings_before_import(&package);
+        succeeds(&package, &["sync"]);
+        assert_deployed(&package, "out/claude", "Claude skill\n", "Loqui\n");
+        configure(&package, "path", CLAUDE_WITH_NOTES);
+
+        let args: &[&str] = if prune {
+            &["sync", "--prune"]
+        } else {
+            &["sync"]
+        };
+        let result = run(&package, args);
+
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(result.status.success(), "phora {args:?}: {stderr}");
+        assert!(
+            !stderr.contains("foreign"),
+            "moved bindings must be adopted, not skipped as foreign: {stderr}"
+        );
+        assert_deployed(&package, "out/claude", "Claude skill\n", "Loqui\n");
+        let listed = run(&package, &["list"]);
+        let listed = String::from_utf8_lossy(&listed.stdout);
+        assert!(
+            !listed.lines().any(|line| line.contains("skills/")),
+            "the still-configured anchor must no longer own the moved destinations: {listed}"
+        );
+        let owners = run(&package, &["where"]);
+        let owners = String::from_utf8_lossy(&owners.stdout);
+        let owners: Vec<&str> = owners
+            .lines()
+            .filter_map(|line| line.strip_prefix("  - "))
+            .collect();
+        assert_eq!(owners.len(), 3, "one record per destination: {owners:?}");
+        for composed in ["%content", "%loqui"] {
+            assert!(
+                owners.iter().any(|owner| owner.ends_with(composed)),
+                "the composed target `{composed}` must own its moved destination: {owners:?}"
+            );
+        }
+        assert!(owners.contains(&"claude"), "prune={prune}: {owners:?}");
+    }
+}

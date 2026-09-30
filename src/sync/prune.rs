@@ -286,6 +286,19 @@ where
             _ => None,
         })
         .collect();
+    let adopted: BTreeSet<(&str, &str, &str)> = records
+        .iter()
+        .filter(|((target, source, _), record)| {
+            (record.key.target.as_str(), record.key.source.as_str()) != (*target, *source)
+        })
+        .map(|(_, record)| {
+            (
+                record.key.target.as_str(),
+                record.key.source.as_str(),
+                record.key.artifact.as_str(),
+            )
+        })
+        .collect();
     let live_paths = live_paths_by_source(projection, ctx.config);
     for (target, source, artifact, reason) in removals {
         let Some(record) = records.get(&(target, source, artifact)).copied() else {
@@ -293,6 +306,9 @@ where
                 "reconciled removal {source}:{artifact} in target {target} has no managed record"
             )));
         };
+        if adopted.contains(&(target, source, artifact)) {
+            continue;
+        }
         if !remove_reconciled_record(
             record,
             ctx.config,
@@ -356,6 +372,11 @@ fn remove_reconciled_record(
         let confined = removal_path(target, record, protected);
         match confined {
             Ok(path) if !overlaps_any_live_dest(&path, live_paths, &record.key.target) => {
+                if overlaps_any_live_path(&path, live_paths) {
+                    return release_under_live_destination(
+                        record, &path, live_paths, config, registry,
+                    );
+                }
                 remove_orphan_path(&path)
                     .map_err(|error| Error::Sync(format!("prune {}: {error}", path.display())))?;
             }
@@ -413,15 +434,25 @@ fn remove_reconciled_record(
             path
         };
         if overlaps_any_live_path(&path, live_paths) {
-            if !tracked_by_live_record(&path, live_paths, config, registry)? {
-                return Ok(false);
-            }
-            registry.remove_artifact(&record.key)?;
-            return Ok(true);
+            return release_under_live_destination(record, &path, live_paths, config, registry);
         }
         remove_orphan_path(&path)
             .map_err(|error| Error::Sync(format!("prune {}: {error}", path.display())))?;
         super::detach_history_overlay(record, &path, backend)?;
+    }
+    registry.remove_artifact(&record.key)?;
+    Ok(true)
+}
+
+fn release_under_live_destination(
+    record: &ArtifactRecord,
+    path: &Path,
+    live_paths: &LivePathsBySource,
+    config: &Config,
+    registry: &dyn StateStore,
+) -> Result<bool> {
+    if !tracked_by_live_record(path, live_paths, config, registry)? {
+        return Ok(false);
     }
     registry.remove_artifact(&record.key)?;
     Ok(true)
