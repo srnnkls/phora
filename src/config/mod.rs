@@ -269,6 +269,20 @@ impl Config {
             .any(|target| target.imports.iter().flatten().any(|i| i.source == name))
     }
 
+    /// Sources no target binds or imports and no build reads.
+    #[must_use]
+    pub fn unbound_sources(&self) -> Vec<&str> {
+        self.sources
+            .keys()
+            .map(String::as_str)
+            .filter(|name| {
+                self.flat_binder_of(name).is_none()
+                    && !self.is_imported_anywhere(name)
+                    && !self.is_build_input(name)
+            })
+            .collect()
+    }
+
     fn flat_binder_of(&self, name: &str) -> Option<&str> {
         self.targets.iter().find_map(|(target_name, target)| {
             target

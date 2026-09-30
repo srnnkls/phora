@@ -33,6 +33,9 @@ pub(super) fn format_sync_warning(warning: &SyncWarning) -> Option<String> {
              not portable across machines",
             path.display()
         ),
+        SyncWarning::UnboundSource { source } => {
+            format!("phora: source `{source}` is bound by no target, import, or build")
+        }
         SyncWarning::ReferenceMoved {
             source,
             target,
@@ -100,23 +103,25 @@ pub(super) fn format_sync_warning(warning: &SyncWarning) -> Option<String> {
             source,
             attributes,
             autocrlf,
-        } => {
-            let cause = match (*attributes, *autocrlf) {
-                (true, true) => ".gitattributes and core.autocrlf=true",
-                (true, false) => ".gitattributes",
-                (false, true) => "core.autocrlf=true",
-                (false, false) => unreachable!("content-filter warning requires a cause"),
-            };
-            format!(
-                "phora: history source `{source}` uses content filters ({cause}); its Git overlay \
-                 may report files modified"
-            )
-        }
+        } => format!(
+            "phora: history source `{source}` uses content filters ({}); its Git overlay may \
+             report files modified",
+            content_filter_cause(*attributes, *autocrlf)
+        ),
         SyncWarning::BuildFailed { source, detail } => {
             format!("phora: build `{source}` failed ({detail}); keeping its previous output")
         }
     };
     Some(rendered)
+}
+
+fn content_filter_cause(attributes: bool, autocrlf: bool) -> &'static str {
+    match (attributes, autocrlf) {
+        (true, true) => ".gitattributes and core.autocrlf=true",
+        (true, false) => ".gitattributes",
+        (false, true) => "core.autocrlf=true",
+        (false, false) => unreachable!("content-filter warning requires a cause"),
+    }
 }
 
 /// One line replacing the bare `sync complete`, on stdout.

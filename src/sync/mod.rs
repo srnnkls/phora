@@ -1143,6 +1143,11 @@ where
     let mut events = SyncEvents::new(input.sink());
     let mut effective_config = merged_config(input);
     effective_config.validate()?;
+    for source in effective_config.unbound_sources() {
+        events.push_warning(SyncWarning::UnboundSource {
+            source: source.to_owned(),
+        });
+    }
     let pre_sync_outcomes = run_pre_sync(input, &effective_config)?;
     if pre_sync_outcomes
         .iter()

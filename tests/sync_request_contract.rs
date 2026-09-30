@@ -1130,10 +1130,11 @@ fn public_sync_tree_escape_hatches(path: &Path) -> Vec<String> {
         .collect()
 }
 
-const ALLOWED_SYNC_WARNING_SHAPES: [&str; 17] = [
+const ALLOWED_SYNC_WARNING_SHAPES: [&str; 18] = [
     "Projection(ProjectionWarning)",
     "MalformedTransitiveHooks{target:String,detail:String}",
     "LinkPathNotPortable{source:String,path:PathBuf}",
+    "UnboundSource{source:String}",
     "ReferenceMoved{source:String,target:String,from:String,to:String}",
     "OrphanedRecords{count:usize}",
     "PruneSkippedAfterFailures",
