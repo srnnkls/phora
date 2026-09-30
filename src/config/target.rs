@@ -195,6 +195,9 @@ pub struct Target {
     /// Composition-only anchor every destination must stay under; `Some` iff this is a composed dep target.
     #[serde(skip)]
     pub confine: Option<PathBuf>,
+    /// Composition-only view through the importer's offer; `Some` iff that offer narrows the package.
+    #[serde(skip)]
+    pub mount: Option<crate::projection::model::MountView>,
 }
 
 #[derive(Debug, Clone)]

@@ -8,10 +8,12 @@ use std::path::{Path, PathBuf};
 
 use crate::config::transitive::{FetchNode, Instance, TransitiveManifest};
 use crate::config::{
-    Config, DeployMode, HookAdmissionDiagnostic, HookCommand, Host, ParsedSource, Protocol,
-    Refspec, Remote, SourceMode, TakeEntry, Target, admit_transitive_hooks, hook_preimage,
+    Config, DeployMode, HookAdmissionDiagnostic, HookCommand, Host, LayoutKind, ParsedSource,
+    Protocol, Refspec, Remote, SourceMode, TakeEntry, Target, admit_transitive_hooks,
+    hook_preimage,
 };
 use crate::error::{Error, Result};
+use crate::projection::model::{MountView, OfferSpec};
 use crate::projection::offer::OfferSelection;
 use crate::source::{
     Commit, ResolvePolicy, ResolveRequest, RevisionSpec, SourceLocation, SourceName, SourceStore,
@@ -266,6 +268,7 @@ pub(super) fn resolve_transitive_graph(
                 refspec: source.refspec(),
                 commit: matches!(package, PackageSnapshot::Mirror(_)).then(|| commit.clone()),
             });
+            let view = ImportView::new(&source, anchor.expanded_path());
             let instance = package_instance(
                 "root",
                 imported,
@@ -282,6 +285,7 @@ pub(super) fn resolve_transitive_graph(
                 imported,
                 &manifest,
                 package,
+                view.as_ref(),
                 &mut WalkCtx {
                     backend,
                     visited: &mut visited,
@@ -418,32 +422,44 @@ struct FrozenGate<'a> {
 /// Composes a dep's own targets under `anchor`: each becomes a synthetic target at
 /// `anchor.expanded_path / dep_target.path`, keeping the dep's own per-target layout,
 /// bound to source instances namespaced by the dep [`Instance`]. Two composed targets
-/// sharing a destination is a hard error.
+/// sharing a destination is a hard error. Under an importer `view`, targets are placed
+/// by its root, and a target outside the root is neither composed nor fetched.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "composition threads instance, anchor, manifest, snapshot, view, ctx, and depth together"
+)]
 fn compose_dep(
     instance: &Instance,
     anchor: &Target,
     imported: &str,
     manifest: &TransitiveManifest,
     package: PackageSnapshot<'_>,
+    view: Option<&ImportView>,
     ctx: &mut WalkCtx<'_>,
     depth: usize,
 ) -> Result<()> {
     reject_depth_overflow(imported, depth)?;
     let anchor_path = anchor.expanded_path();
     let mut composed_dests: BTreeMap<PathBuf, String> = BTreeMap::new();
-
-    let imported_inner: HashSet<&str> = manifest
-        .targets
-        .values()
-        .flat_map(|t| t.imports.iter().flatten())
-        .map(|import| import.source.as_str())
-        .collect();
+    let mut placements = place_dep_targets(imported, manifest, &anchor_path, view)?;
+    let needed: Option<HashSet<&str>> = view.map(|_| {
+        manifest
+            .targets
+            .iter()
+            .filter(|(name, _)| matches!(placements[name.as_str()], Placement::Mounted { .. }))
+            .flat_map(|(_, target)| {
+                target
+                    .declared_sources()
+                    .chain(target.imports.iter().flatten().map(|i| i.source.as_str()))
+            })
+            .collect()
+    });
 
     let source_names = namespace_dep_sources(
         instance,
         imported,
         manifest,
-        &imported_inner,
+        needed.as_ref(),
         package,
         ctx,
         depth,
@@ -463,15 +479,22 @@ fn compose_dep(
     };
 
     for (dep_target_name, dep_target) in &manifest.targets {
-        reject_dep_target_path(imported, dep_target_name, &dep_target.path)?;
-        let composed_path: PathBuf = anchor_path.join(&dep_target.path).components().collect();
-        if let Some(other) = composed_dests.insert(composed_path.clone(), dep_target_name.clone()) {
+        let Some(Placement::Mounted {
+            path: composed_path,
+            mount: mount_view,
+        }) = placements.remove(dep_target_name.as_str())
+        else {
+            continue;
+        };
+        let declared_path: PathBuf = anchor_path.join(&dep_target.path).components().collect();
+        if let Some(other) = composed_dests.insert(declared_path.clone(), dep_target_name.clone()) {
             return Err(Error::Config(format!(
                 "{COMPOSED_DEST_COLLISION}: dep targets `{other}` and `{dep_target_name}` of \
                  imported `{imported}` both compose to {}",
-                composed_path.display()
+                declared_path.display()
             )));
         }
+        let nested_view = view.map(|view| view.nested(&dep_target.path));
         compose_nested_imports(
             instance,
             imported,
@@ -479,10 +502,11 @@ fn compose_dep(
             dep_target,
             &composed_path,
             manifest,
+            nested_view.as_ref(),
             ctx,
             depth,
         )?;
-        let synthetic = synthetic_target(
+        let mut synthetic = synthetic_target(
             imported,
             dep_target_name,
             dep_target,
@@ -491,6 +515,7 @@ fn compose_dep(
             &source_names,
             &mount,
         )?;
+        synthetic.mount = mount_view;
         *ctx.counter += 1;
         let composed_name = namespaced_key(instance, dep_target_name, *ctx.counter);
         admit_hook_candidates(
@@ -509,19 +534,49 @@ fn compose_dep(
     Ok(())
 }
 
+fn place_dep_targets<'m>(
+    imported: &str,
+    manifest: &'m TransitiveManifest,
+    anchor_path: &Path,
+    view: Option<&ImportView>,
+) -> Result<BTreeMap<&'m str, Placement>> {
+    let mut placements = BTreeMap::new();
+    for (dep_target_name, dep_target) in &manifest.targets {
+        reject_dep_target_path(imported, dep_target_name, &dep_target.path)?;
+        let placement = match view {
+            Some(view) => view.place(imported, dep_target_name, dep_target)?,
+            None => Placement::Mounted {
+                path: anchor_path.join(&dep_target.path).components().collect(),
+                mount: None,
+            },
+        };
+        placements.insert(dep_target_name.as_str(), placement);
+    }
+    Ok(placements)
+}
+
 /// A source already composed by a nested import is graphed (so the frozen gate can pin it) but
 /// omitted from the returned bind map: it only re-exports its children, binding no target itself.
 fn namespace_dep_sources(
     instance: &Instance,
     imported: &str,
     manifest: &TransitiveManifest,
-    imported_inner: &HashSet<&str>,
+    needed: Option<&HashSet<&str>>,
     package: PackageSnapshot<'_>,
     ctx: &mut WalkCtx<'_>,
     depth: usize,
 ) -> Result<BTreeMap<String, String>> {
+    let imported_inner: HashSet<&str> = manifest
+        .targets
+        .values()
+        .flat_map(|t| t.imports.iter().flatten())
+        .map(|import| import.source.as_str())
+        .collect();
     let mut source_names: BTreeMap<String, String> = BTreeMap::new();
     for (inner_name, inner) in &manifest.sources {
+        if needed.is_some_and(|needed| !needed.contains(inner_name.as_str())) {
+            continue;
+        }
         let mut parsed = ParsedSource::parse(inner_name, inner).map_err(|e| {
             Error::Config(format!("imported `{imported}`: source `{inner_name}`: {e}"))
         })?;
@@ -617,6 +672,7 @@ fn compose_nested_imports(
     dep_target: &Target,
     composed_path: &Path,
     manifest: &TransitiveManifest,
+    view: Option<&ImportView>,
     ctx: &mut WalkCtx<'_>,
     depth: usize,
 ) -> Result<()> {
@@ -674,6 +730,7 @@ fn compose_nested_imports(
             take: None,
             collapse: None,
             confine: None,
+            mount: None,
         };
         ctx.ancestors.push(inner_node);
         let composed = compose_dep(
@@ -682,6 +739,7 @@ fn compose_nested_imports(
             inner_name,
             &inner_manifest,
             PackageSnapshot::Mirror(&inner_remote),
+            view,
             ctx,
             depth + 1,
         );
@@ -826,6 +884,88 @@ fn admit_hook_candidates(
             commit: commit.to_owned(),
         });
     }
+}
+
+/// The importing source's own offer over a package's composed tree. `base` is where the
+/// current anchor sits inside that tree; `anchor` is the consumer's importing target path.
+#[derive(Clone)]
+struct ImportView {
+    offer: OfferSpec,
+    anchor: PathBuf,
+    base: PathBuf,
+}
+
+enum Placement {
+    Mounted {
+        path: PathBuf,
+        mount: Option<MountView>,
+    },
+    Outside,
+}
+
+impl ImportView {
+    /// `None` when the importing source offers its whole package.
+    fn new(source: &ParsedSource, anchor: PathBuf) -> Option<Self> {
+        let offer = OfferSpec::from(source.offer());
+        let narrows = offer
+            .root()
+            .is_some_and(|root| !normalized(root).as_os_str().is_empty())
+            || !offer.includes().is_empty()
+            || !offer.excludes().is_empty();
+        narrows.then(|| Self {
+            offer,
+            anchor,
+            base: PathBuf::new(),
+        })
+    }
+
+    fn nested(&self, dep_target_path: &Path) -> Self {
+        Self {
+            base: normalized(&self.base.join(dep_target_path)),
+            ..self.clone()
+        }
+    }
+
+    /// A target inside the root mounts at its root-relative path; one spanning the root
+    /// mounts at the anchor with root-relative destinations; any other stays unmounted.
+    fn place(
+        &self,
+        imported: &str,
+        dep_target_name: &str,
+        dep_target: &Target,
+    ) -> Result<Placement> {
+        let in_package = normalized(&self.base.join(&dep_target.path));
+        let root = self.offer.root().map(normalized).unwrap_or_default();
+        let (path, rehome) = if let Ok(below_root) = in_package.strip_prefix(&root) {
+            (self.anchor.join(below_root), false)
+        } else if root.starts_with(&in_package) {
+            if dep_target.layout().kind != LayoutKind::Flat {
+                return Err(Error::Config(format!(
+                    "imported `{imported}`: target `{dep_target_name}` at `{}` spans the import \
+                     root `{}`; only a flat-layout target can be re-rooted",
+                    in_package.display(),
+                    root.display()
+                )));
+            }
+            (self.anchor.clone(), true)
+        } else {
+            return Ok(Placement::Outside);
+        };
+        Ok(Placement::Mounted {
+            path: normalized(&path),
+            mount: Some(MountView {
+                path: in_package.to_string_lossy().into_owned(),
+                offer: self.offer.clone(),
+                rehome,
+            }),
+        })
+    }
+}
+
+fn normalized(path: &Path) -> PathBuf {
+    path.components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect()
 }
 
 /// Consumer-owned (D13/C3): the importing anchor's mount take/collapse for one imported dep,

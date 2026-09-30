@@ -23,7 +23,7 @@ use crate::projection::build::build_workspace;
 use crate::projection::diagnostic::ProjectionWarning;
 use crate::projection::model::{
     BindingProjection, BindingProjectionInput, CollapsePreference, LayoutSpec,
-    MaterializationPolicy, OfferSpec, ProjectedArtifact, ResolvedSourceRef, TakeSpec,
+    MaterializationPolicy, MountView, OfferSpec, ProjectedArtifact, ResolvedSourceRef, TakeSpec,
     TemplatePolicy, WorkspaceTargetInput,
 };
 
@@ -180,6 +180,7 @@ fn preview_target(
             backend,
             path: &path,
             layout: &layout,
+            mount: target.mount.as_ref(),
             source,
             binding: &binding,
             files,
@@ -208,6 +209,7 @@ struct BindingCtx<'a> {
     backend: &'a dyn SourceStore,
     path: &'a Path,
     layout: &'a LayoutConfig,
+    mount: Option<&'a MountView>,
     source: &'a ParsedSource,
     binding: &'a crate::config::ResolvedBinding<'a>,
     files: bool,
@@ -372,6 +374,7 @@ fn resolve_plan(
         materialization: MaterializationPolicy::from(&ctx.source.deploy_mode()),
         layout: &layout,
         templates: &templates,
+        mount: ctx.mount,
     };
     project_single_binding(ctx.target_name, input)
 }
@@ -572,6 +575,7 @@ mod preview_warning_tests {
             materialization: MaterializationPolicy::from(&source.deploy_mode()),
             layout: &layout,
             templates: &templates,
+            mount: None,
         };
         project_binding(&input).expect("projection resolves")
     }

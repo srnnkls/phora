@@ -1010,7 +1010,9 @@ sources.loqui = { collapse = false }
 A package's self source cannot select another ref, enable transitive resolution,
 or use link mode. Other dependency-owned local paths and escaping destinations
 remain rejected. Import refinements accept only a source name and one Git ref;
-paths, remotes, renames and root overrides are not import options.
+paths, remotes, renames and root overrides are not import options. The imported
+source's own `root`, `include` and `exclude` still select from the composed
+package; see "How composition works" below.
 
 Package artifacts and their manifests use the same pin. Ordinary sync preserves
 that pin; `phora update tropos --fast-forward` advances it and removes resources
@@ -1077,6 +1079,15 @@ runs a build. Builds come only from your own config, never from a dependency's
   taken as relative and joined under it — tropos's `loqui` target at `path =
   "skills/loqui/reference/loqui"`, imported into your target at `~/.claude`, deploys
   to `~/.claude/skills/loqui/reference/loqui`.
+- The imported source's offer slices the composed tree — package files and
+  dependency mounts alike — the way `root`, `include` and `exclude` slice a flat
+  source. `root = "rules/fas"` deploys only what composes under `rules/fas`,
+  re-rooted at the anchor: a dependency mounted at `rules/fas/moira` lands at
+  `moira`. A dependency mounted entirely outside the root is neither fetched nor
+  deployed; one mounted above the root contributes only its files below the root,
+  re-rooted the same way, and must use the flat layout. `include` and `exclude`
+  match paths relative to the root and filter every mounted file, so a dependency
+  they exclude is still fetched but deploys nothing.
 - The dep's own layout governs its artifacts, not yours. If that target declares
   `layout = "by-source"`, loqui's trees nest one level deeper under the source
   identity rather than landing flat — and that's tropos's call, not yours, even when

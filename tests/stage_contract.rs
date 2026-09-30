@@ -32,6 +32,7 @@ fn projected_home() -> TargetProjection {
         materialization: MaterializationPolicy::Copy,
         layout: &layout,
         templates: &templates,
+        mount: None,
     };
     project_target("home", &[input]).expect("clean fixture projects")
 }
