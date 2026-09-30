@@ -288,3 +288,78 @@ fn preview_degrades_gracefully_when_the_transitive_dep_is_unsynced() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+fn dep_without_hooks(dep: &Path) {
+    commit_repo(
+        dep,
+        &[],
+        "version = 1\n\n\
+         [sources.editor]\ngit = \"https://github.com/mock/leaf.git\"\ninclude = [\"pkg\"]\n\n\
+         [targets.nvim]\npath = \"nvim\"\nsources = [\"editor\"]\n",
+    );
+}
+
+fn synced_import_fixture() -> (Fixture, TempDir, TempDir) {
+    let leaf = TempDir::new().expect("leaf repo");
+    leaf_repo(leaf.path(), "leaf.txt", "payload\n");
+    let mut fixture = build_fixture();
+    let dep = TempDir::new().expect("dep repo");
+    dep_without_hooks(dep.path());
+    consumer_importing(&mut fixture, dep.path(), leaf.path());
+    let synced = run(&fixture, &["sync"]);
+    assert!(
+        synced.status.success(),
+        "seeding sync must succeed; stderr: {}",
+        String::from_utf8_lossy(&synced.stderr)
+    );
+    (fixture, leaf, dep)
+}
+
+#[test]
+fn list_groups_composed_artifacts_under_the_importing_target() {
+    let (fixture, _leaf, _dep) = synced_import_fixture();
+
+    let out = run(&fixture, &["list"]);
+    assert!(
+        out.status.success(),
+        "list must succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "dotcfg:\n  via mydeps/nvim:\n    editor/pkg  ✓ clean\n",
+        "an import-only target lists its composed artifacts grouped by import and dep target, \
+         never under the namespaced composed key"
+    );
+}
+
+#[test]
+fn list_orphans_keeps_composed_records_while_the_importing_target_exists() {
+    let (fixture, _leaf, _dep) = synced_import_fixture();
+
+    let out = run(&fixture, &["list", "--orphans"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "No orphaned records.\n",
+        "composed records anchored by a configured importing target are not orphans"
+    );
+}
+
+#[test]
+fn list_orphans_reports_composed_records_once_the_importing_target_is_removed() {
+    let (fixture, _leaf, _dep) = synced_import_fixture();
+    let removed = run(&fixture, &["target", "rm", "--force", "dotcfg"]);
+    assert!(
+        removed.status.success(),
+        "target rm must succeed; stderr: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+
+    let out = run(&fixture, &["list", "--orphans"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("editor/pkg") && stdout.contains(".config/nvim/pkg"),
+        "without its importing target a composed record is an orphan at its deployed path; \
+         got:\n{stdout}"
+    );
+}

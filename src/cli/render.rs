@@ -316,7 +316,7 @@ pub(super) fn format_listings(listings: &[TargetListing]) -> String {
     }
     for listing in listings {
         let _ = writeln!(out, "{}:", listing.target);
-        if listing.artifacts.is_empty() {
+        if listing.artifacts.is_empty() && listing.composed.is_empty() {
             let _ = writeln!(out, "  (nothing deployed — run `phora sync`)");
             continue;
         }
@@ -326,6 +326,16 @@ pub(super) fn format_listings(listings: &[TargetListing]) -> String {
                 "  {}/{}  {}",
                 artifact.source, artifact.artifact, artifact.state
             );
+        }
+        for group in &listing.composed {
+            let _ = writeln!(out, "  via {}/{}:", group.import, group.dep_target);
+            for artifact in &group.artifacts {
+                let _ = writeln!(
+                    out,
+                    "    {}/{}  {}",
+                    artifact.source, artifact.artifact, artifact.state
+                );
+            }
         }
     }
     out

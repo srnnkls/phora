@@ -25,6 +25,7 @@ use crate::source::{
 };
 use crate::sync::inspect::check_artifact_state;
 use crate::sync::state::StateStore;
+use crate::sync::transitive::ComposedTarget;
 use crate::sync::{
     PreviewTargetPlan, SyncWarning, offered_leaves, preview_targets, resolved_remotes,
 };
@@ -59,16 +60,45 @@ pub(super) fn run_list(view: ListView) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let config = merge_configs(load_config()?, load_local_config(&cwd)?);
     let registry = open_project_registry(&config)?;
-    match view {
-        ListView::Orphans => print_orphan_listings(&list_orphans(&config, &registry)?),
-        ListView::Plan => println!("plan: run `phora sync` to apply pending changes"),
-        ListView::Deployed => {
-            let cache_git = cache_root_for(config.paths.cache.as_deref(), &cwd)?.join("git");
-            let backend = GitBackend::new(cache_git);
-            print_listings(&list_statuses(&config, &registry, &backend)?);
-        }
+    if view == ListView::Plan {
+        println!("plan: run `phora sync` to apply pending changes");
+        return Ok(());
+    }
+    let cache_git = cache_root_for(config.paths.cache.as_deref(), &cwd)?.join("git");
+    let mut composed_config = config.clone();
+    let composed =
+        inject_offline_graph(&mut composed_config, &cwd, cache_git.clone()).unwrap_or_default();
+    if view == ListView::Orphans {
+        print_orphan_listings(&list_orphans(&composed_config, &registry)?);
+    } else {
+        let backend = GitBackend::new(cache_git);
+        print_listings(&list_statuses_with_composed(
+            &config, &composed, &registry, &backend,
+        )?);
     }
     Ok(())
+}
+
+fn inject_offline_graph(
+    config: &mut Config,
+    cwd: &Path,
+    cache_git: std::path::PathBuf,
+) -> Result<Vec<ComposedTarget>> {
+    let mut parsed = config.parsed_sources()?;
+    let mut remotes = resolved_remotes(config, &parsed)?;
+    let (base_lock, local_lock) = load_locks(cwd)?;
+    let lock = base_lock.map_or_else(
+        || local_lock.clone(),
+        |base| Some(merge_locks(&base, local_lock.as_ref())),
+    );
+    let backend = build_router(config, cache_git)?;
+    Ok(crate::sync::inject_composed_graph(
+        config,
+        &mut parsed,
+        &mut remotes,
+        &backend,
+        lock.as_ref(),
+    ))
 }
 
 pub(super) fn run_preview(sel: &PreviewSelectors, json: bool) -> Result<()> {
@@ -765,6 +795,15 @@ pub struct ArtifactStatus {
 pub struct TargetListing {
     pub target: String,
     pub artifacts: Vec<ArtifactStatus>,
+    pub composed: Vec<ComposedListing>,
+}
+
+/// One dependency target composed into a config target through its `imports`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposedListing {
+    pub import: String,
+    pub dep_target: String,
+    pub artifacts: Vec<ArtifactStatus>,
 }
 
 /// A `phora list --orphans` row: a registry record whose target left config;
@@ -964,13 +1003,38 @@ pub fn list_statuses<R>(
 where
     R: StateStore,
 {
+    list_statuses_with_composed(config, &[], registry, backend)
+}
+
+pub(crate) fn list_statuses_with_composed<R>(
+    config: &Config,
+    composed: &[ComposedTarget],
+    registry: &R,
+    backend: &dyn SourceStore,
+) -> Result<Vec<TargetListing>>
+where
+    R: StateStore,
+{
     config
         .targets
         .iter()
         .map(|(target_name, target)| {
+            let mut groups = Vec::new();
+            for dep in composed.iter().filter(|c| &c.anchor == target_name) {
+                let artifacts =
+                    target_artifact_statuses(&dep.name, &dep.target, registry, backend)?;
+                if !artifacts.is_empty() {
+                    groups.push(ComposedListing {
+                        import: dep.import.clone(),
+                        dep_target: dep.dep_target.clone(),
+                        artifacts,
+                    });
+                }
+            }
             Ok(TargetListing {
                 target: target_name.clone(),
                 artifacts: target_artifact_statuses(target_name, target, registry, backend)?,
+                composed: groups,
             })
         })
         .collect()

@@ -30,6 +30,25 @@ $ phora sync --no-transitive-hooks 2>&1 | normalize >/dev/null && echo synced
 synced
 ```
 
+## `list` groups composed artifacts under the importing target
+
+The composed artifacts are recorded under a namespaced composed target; `list`
+shows them under the importing `dotcfg`, labelled by import and dep target.
+
+```scrut
+$ phora list 2>&1 | normalize
+dotcfg:
+  via mydeps/nvim:
+    editor/nvim  ✓ clean
+```
+
+While `dotcfg` still imports `mydeps`, its composed records are not orphans.
+
+```scrut
+$ phora list --orphans 2>&1 | normalize
+No orphaned records.
+```
+
 ## First trust lists the composed file surface, offline
 
 With the source repos and the deployed surface deleted, the candidate's composed
