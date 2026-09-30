@@ -352,6 +352,7 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
         root,
         policy,
         &staging,
+        None,
         template_opt_in,
         |repo_relative| {
             let path = SourcePath::new(&repo_relative.to_string_lossy().replace('\\', "/"))?;

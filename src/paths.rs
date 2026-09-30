@@ -1,6 +1,6 @@
 //! Filesystem locations for Phora's shared state, rooted via XDG base directories.
 //!
-//! [`cache_root`] holds regenerable git mirrors: `XDG_CACHE_HOME` when set,
+//! [`cache_root`] holds regenerable git mirrors and the deployed-content store: `XDG_CACHE_HOME` when set,
 //! else [`dirs::cache_dir`] (macOS `~/Library/Caches`, Linux `~/.cache`), then `/phora`.
 //!
 //! [`state_root`] holds the per-project registry (deploy journal, locks, records):

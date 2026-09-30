@@ -112,10 +112,10 @@ The model splits cleanly into who-owns-what:
 
 Phora keeps its shared state in two XDG-rooted trees:
 
-| Root  | Holds                              | Override         | Linux default          | macOS default                         |
-| ----- | ---------------------------------- | ---------------- | ---------------------- | ------------------------------------- |
-| Cache | git mirrors (regenerable)          | `XDG_CACHE_HOME` | `~/.cache/phora`       | `~/Library/Caches/phora`              |
-| State | registry (deploy journal, locks)   | `XDG_STATE_HOME` | `~/.local/state/phora` | `~/Library/Application Support/phora` |
+| Root  | Holds                                    | Override         | Linux default          | macOS default                         |
+| ----- | ---------------------------------------- | ---------------- | ---------------------- | ------------------------------------- |
+| Cache | git mirrors, content store (regenerable) | `XDG_CACHE_HOME` | `~/.cache/phora`       | `~/Library/Caches/phora`              |
+| State | registry (deploy journal, locks)         | `XDG_STATE_HOME` | `~/.local/state/phora` | `~/Library/Application Support/phora` |
 
 A project may pin either root in `phora.toml` with a `[paths]` table — `cache` and
 `state` are optional and independent — which makes project-local installs and
@@ -857,8 +857,12 @@ repository's `.gitignore` unless you intend to manage it there.
 
 ### Link mode (local development)
 
-By default `deploy = "copy"` materializes a reflink-style copy of each artifact
-from the committed git ODB — point-in-time, content-hashed, verifiable. For a
+By default `deploy = "copy"` materializes each artifact from the committed git
+ODB — point-in-time, content-hashed, verifiable. Each file's bytes are written
+once to a content store under the cache root (`content/`) and reflinked into
+place, so every deployment of the same content shares its blocks on a
+copy-on-write filesystem (APFS, Btrfs, XFS). Where the cache and target cannot
+clone, files are written directly. For a
 tight dev loop, `deploy = "link"` instead symlinks the artifact destination
 at the source's live working tree (`<source path>/<root>/<artifact>`, absolute).
 Uncommitted edits in the checkout are visible through the target immediately, with
