@@ -384,6 +384,9 @@ fn remove_reconciled_record(
         }
         super::detach_history_overlay(record, &dst, backend)?;
     } else {
+        if registry.artifact(&record.key)?.is_none() {
+            return Ok(false);
+        }
         let Some(path) = orphan_artifact_path(record) else {
             if record.deploy_root.is_some() {
                 events.push_warning(SyncWarning::OrphanRecordPathUnknown {
@@ -410,7 +413,11 @@ fn remove_reconciled_record(
             path
         };
         if overlaps_any_live_path(&path, live_paths) {
-            return Ok(false);
+            if !tracked_by_live_record(&path, live_paths, config, registry)? {
+                return Ok(false);
+            }
+            registry.remove_artifact(&record.key)?;
+            return Ok(true);
         }
         remove_orphan_path(&path)
             .map_err(|error| Error::Sync(format!("prune {}: {error}", path.display())))?;
@@ -418,6 +425,30 @@ fn remove_reconciled_record(
     }
     registry.remove_artifact(&record.key)?;
     Ok(true)
+}
+
+fn tracked_by_live_record(
+    path: &Path,
+    live_paths: &LivePathsBySource,
+    config: &Config,
+    registry: &dyn StateStore,
+) -> Result<bool> {
+    for (name, destinations) in live_paths {
+        let Some(target) = config.targets.get(name) else {
+            continue;
+        };
+        if !destinations.iter().any(|(_, dest)| touches(path, dest)) {
+            continue;
+        }
+        if registry
+            .target_artifacts(name)?
+            .iter()
+            .any(|record| touches(path, &removal_destination(target, record)))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// A composed target dropped from the graph prunes inside the consumer anchor still holding

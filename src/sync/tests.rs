@@ -4128,6 +4128,289 @@ fn prune_deletes_file_and_drops_record_for_a_normal_orphan() {
     );
 }
 
+// ── orphan adoption: a restructured target takes over its predecessor's records ────
+
+fn prune_input(base: &Config) -> SyncInput<'_> {
+    SyncInput {
+        prune: true,
+        ..input(base, None, None, None, false)
+    }
+}
+
+/// Deploys `editor-src` under target `old`, then renames the target to `new` over the same path.
+fn deploy_then_rename(fx: &SyncFixture, td: &TargetDir, link: bool) -> Config {
+    let config = if link {
+        config_one_source_one_target_link
+    } else {
+        config_one_source_one_target
+    };
+    let old = config("editor-src", &fx.url, "old", &td.target_path(), "flat");
+    let out = sync(
+        &input(&old, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("initial sync under the old target");
+    assert!(!out.had_failures, "premise: the old target deploys cleanly");
+    assert!(
+        fx.registry
+            .artifact(&artifact_key("old", "editor-src", "editor"))
+            .expect("registry read")
+            .is_some(),
+        "premise: the old target records the artifact"
+    );
+    config("editor-src", &fx.url, "new", &td.target_path(), "flat")
+}
+
+#[test]
+fn renamed_target_adopts_a_clean_copy_orphan_without_force() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let renamed = deploy_then_rename(&fx, &td, false);
+    let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+
+    let out = sync(
+        &input(&renamed, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("sync after the rename");
+
+    assert!(!out.had_failures, "adoption is not a failure");
+    assert!(
+        fx.registry
+            .artifact(&artifact_key("new", "editor-src", "editor"))
+            .expect("registry read")
+            .is_some(),
+        "the renamed target must own the destination its orphaned predecessor recorded"
+    );
+    assert!(
+        fx.registry
+            .artifact(&artifact_key("old", "editor-src", "editor"))
+            .expect("registry read")
+            .is_none(),
+        "the adopted orphan record must leave the registry"
+    );
+    assert_eq!(
+        std::fs::read(dst.join("init.lua")).expect("deployed file kept"),
+        b"-- init\n"
+    );
+}
+
+#[test]
+fn renamed_target_adopts_its_orphan_under_prune_without_deleting_files() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let renamed = deploy_then_rename(&fx, &td, false);
+    let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+
+    let out = sync(&prune_input(&renamed), &fx.backend, &fx.registry)
+        .expect("prune sync after the rename");
+
+    assert!(!out.had_failures, "adoption under prune is not a failure");
+    assert!(
+        fx.registry
+            .artifact(&artifact_key("new", "editor-src", "editor"))
+            .expect("registry read")
+            .is_some(),
+        "the renamed target must own the adopted destination"
+    );
+    assert!(
+        fx.registry
+            .artifact(&artifact_key("old", "editor-src", "editor"))
+            .expect("registry read")
+            .is_none(),
+        "the adopted orphan record must leave the registry"
+    );
+    assert_eq!(
+        std::fs::read(dst.join("init.lua")).expect("adopted file kept"),
+        b"-- init\n",
+        "prune must not delete files the renamed target adopted"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn renamed_target_adopts_a_matching_link_orphan_without_force() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let renamed = deploy_then_rename(&fx, &td, true);
+    let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+    let link_before = std::fs::read_link(&dst).expect("premise: old target deployed a link");
+
+    let out = sync(
+        &input(&renamed, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("sync after the rename");
+
+    assert!(!out.had_failures, "adoption is not a failure");
+    let adopted = fx
+        .registry
+        .artifact(&artifact_key("new", "editor-src", "editor"))
+        .expect("registry read")
+        .expect("the renamed target must record the adopted link");
+    assert!(adopted.linked, "the adopted record stays a link record");
+    assert!(
+        fx.registry
+            .artifact(&artifact_key("old", "editor-src", "editor"))
+            .expect("registry read")
+            .is_none(),
+        "the adopted orphan record must leave the registry"
+    );
+    assert_eq!(
+        std::fs::read_link(&dst).expect("link kept"),
+        link_before,
+        "the link must stay intact across the adoption"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn renamed_target_leaves_a_repointed_link_orphan_foreign() {
+    use std::os::unix::fs::symlink;
+
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let renamed = deploy_then_rename(&fx, &td, true);
+    let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+    let elsewhere = td.target_path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("mkdir repoint target");
+    std::fs::remove_file(&dst).expect("drop the deployed link");
+    symlink(&elsewhere, &dst).expect("repoint the link by hand");
+
+    let out = sync(
+        &input(&renamed, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("sync after the rename");
+
+    assert!(
+        !out.had_failures,
+        "a skipped foreign destination is not a failure"
+    );
+    assert_eq!(
+        std::fs::read_link(&dst).expect("hand-made link kept"),
+        elsewhere,
+        "a link that no longer matches the orphan must not be overwritten without --force"
+    );
+    assert!(
+        fx.registry
+            .artifact(&artifact_key("new", "editor-src", "editor"))
+            .expect("registry read")
+            .is_none(),
+        "a repointed link is not adopted"
+    );
+    assert!(
+        fx.registry
+            .artifact(&artifact_key("old", "editor-src", "editor"))
+            .expect("registry read")
+            .is_some(),
+        "the unadopted orphan record stays"
+    );
+}
+
+#[test]
+fn renamed_target_does_not_adopt_a_modified_copy_orphan() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let renamed = deploy_then_rename(&fx, &td, false);
+    let dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+    let edited = b"-- locally edited\n";
+    std::fs::write(dst.join("init.lua"), edited).expect("edit the deployed file");
+
+    let out = sync(
+        &input(&renamed, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("sync after the rename");
+
+    assert!(!out.had_failures, "a skipped conflict is not a failure");
+    assert_eq!(
+        std::fs::read(dst.join("init.lua")).expect("edited file kept"),
+        edited,
+        "a locally modified orphan must not be silently overwritten"
+    );
+    assert!(
+        fx.registry
+            .artifact(&artifact_key("new", "editor-src", "editor"))
+            .expect("registry read")
+            .is_none(),
+        "a modified orphan is not adopted"
+    );
+    assert!(
+        fx.registry
+            .artifact(&artifact_key("old", "editor-src", "editor"))
+            .expect("registry read")
+            .is_some(),
+        "the unadopted orphan record stays"
+    );
+}
+
+#[test]
+fn prune_drops_orphan_records_overlapping_an_owned_live_destination_and_keeps_files() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let cfg =
+        config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+    let out = sync(
+        &input(&cfg, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("live target deploys");
+    assert!(
+        !out.had_failures,
+        "premise: the live target deploys cleanly"
+    );
+    let live_dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+
+    let deploy_root = |path: &Path| Some(path.to_string_lossy().into_owned());
+    let mut same = dir_record("gone", "editor-src", "editor");
+    same.deploy_root = deploy_root(&td.target_path());
+    same.layout = "flat".to_owned();
+    let mut nested = leaf_record("gone", "editor-src", "editor/init.lua");
+    nested.deploy_root = deploy_root(&td.target_path());
+    nested.layout = "flat".to_owned();
+    let mut containing = leaf_record("also-gone", "editor-src", "dest");
+    containing.deploy_root = deploy_root(td.target_path().parent().expect("target parent"));
+    containing.layout = "flat".to_owned();
+    for record in [&same, &nested, &containing] {
+        fx.registry
+            .put_artifact(record)
+            .expect("seed orphan record");
+    }
+
+    let out = sync(&prune_input(&cfg), &fx.backend, &fx.registry).expect("prune sync runs");
+    assert!(!out.had_failures, "prune run must succeed");
+
+    for record in [&same, &nested, &containing] {
+        assert!(
+            fx.registry
+                .artifact(&record.key)
+                .expect("registry read")
+                .is_none(),
+            "an orphan owned by a live destination must be pruned from the registry: {:?}",
+            record.key
+        );
+    }
+    assert_eq!(
+        std::fs::read(live_dst.join("init.lua")).expect("live file kept"),
+        b"-- init\n",
+        "dropping an overlapped orphan record must keep the live files on disk"
+    );
+    assert!(
+        fx.registry
+            .artifact(&artifact_key("dest", "editor-src", "editor"))
+            .expect("registry read")
+            .is_some(),
+        "the live record stays"
+    );
+}
+
 // ── undefined source reference: graceful Err, not panic ────────
 
 #[test]

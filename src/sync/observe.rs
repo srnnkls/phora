@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::config::DeployMode;
 use crate::error::{Error, Result};
 use crate::projection::model::Projection;
 use crate::source::{
@@ -28,6 +29,7 @@ where
     let registry: &dyn StateStore = ctx.registry;
     let store: &dyn StateStore = ctx.registry;
     let mut observations: BTreeMap<ObservationKey, ObservedEntry<ArtifactRecord>> = BTreeMap::new();
+    let mut all_records: Option<Vec<ArtifactRecord>> = None;
     for (target_name, target) in &ctx.config.targets {
         let Some(target_projection) = projection
             .targets
@@ -38,7 +40,16 @@ where
         };
         let run = target_run(ctx, target_name, target);
         target::walk_projection_target(run, target_projection, registry, |run, entry| {
-            let observation = observe_entry(run, entry, registry, store, ctx.backend)?;
+            let mut observation = observe_entry(run, entry, registry, store, ctx.backend)?;
+            if matches!(observation, ObservedArtifact::Foreign(_)) {
+                if all_records.is_none() {
+                    all_records = Some(ctx.records()?);
+                }
+                let records = all_records.as_deref().unwrap_or_default();
+                if let Some(adopted) = adopt_orphan(ctx, entry, records, store)? {
+                    observation = adopted;
+                }
+            }
             let published_key = entry.item.materialization.published_key().to_owned();
             let triplet = (
                 run.target_name.to_owned(),
@@ -60,7 +71,8 @@ where
             Ok(false)
         })?;
     }
-    for record in registry_only_records(ctx.input.prune(), || ctx.records())? {
+    let list_all = || all_records.map_or_else(|| ctx.records(), Ok);
+    for record in registry_only_records(ctx.input.prune(), list_all)? {
         let triplet = (
             record.key.target.clone(),
             record.key.source.clone(),
@@ -139,6 +151,56 @@ fn registry_only_records(
     } else {
         Ok(Vec::new())
     }
+}
+
+fn adopt_orphan<R>(
+    ctx: &DeployAll<'_, R>,
+    entry: &ArtifactEntry<'_>,
+    records: &[ArtifactRecord],
+    store: &dyn StateStore,
+) -> Result<Option<ObservedArtifact<ArtifactRecord>>>
+where
+    R: StateStore,
+{
+    let destination: PathBuf = entry.artifact_dst.components().collect();
+    let Some(orphan) = records.iter().find(|record| {
+        !record.history
+            && super::prune::is_orphan(ctx.config, record)
+            && super::prune::orphan_artifact_path(record).as_ref() == Some(&destination)
+    }) else {
+        return Ok(None);
+    };
+    let matches = if orphan.linked {
+        entry.source.deploy_mode() == DeployMode::Link
+            && std::fs::read_link(entry.artifact_dst)
+                .is_ok_and(|link| link == target::link_target(entry))
+    } else {
+        let observation = inspect(
+            entry.artifact_dst,
+            &orphan.key.source,
+            &orphan.commit,
+            &[],
+            store,
+            &orphan.key,
+            None,
+        )?;
+        matches!(
+            observation,
+            ObservedArtifact::Managed(ManagedArtifact {
+                condition: ManagedCondition::Clean
+                    | ManagedCondition::MetadataChangedButContentClean { .. }
+                    | ManagedCondition::Outdated,
+                ..
+            })
+        )
+    };
+    Ok(matches.then(|| {
+        ObservedArtifact::Managed(ManagedArtifact {
+            record: orphan.clone(),
+            condition: ManagedCondition::Outdated,
+            overlay_stale: false,
+        })
+    }))
 }
 
 fn observe_entry(

@@ -606,7 +606,7 @@ fn apply_reconciled(
                     artifact: published_key.clone(),
                 },
             };
-            Ok(run_deploy(
+            let failed = run_deploy(
                 deploy,
                 key,
                 run.target_name,
@@ -614,7 +614,11 @@ fn apply_reconciled(
                 &published_key,
                 applied,
                 events,
-            ))
+            );
+            if !failed {
+                release_adopted_orphan(&reconciliation.observed, &triplet, registry)?;
+            }
+            Ok(failed)
         }
         Some(SyncChange::RewriteOverlay { .. }) => {
             if journal.refuses_writes() {
@@ -823,6 +827,20 @@ fn apply_resolution(
         }
         Resolution::Abort => Err(Error::Aborted),
     }
+}
+
+/// Only orphan adoption observes a destination under another target's record.
+fn release_adopted_orphan(
+    observed: &ObservationIndex<'_>,
+    triplet: &(String, String, String),
+    registry: &dyn StateStore,
+) -> Result<()> {
+    if let Some(ObservedArtifact::Managed(managed)) = observed.get(triplet).copied()
+        && managed.record.key.target != triplet.0
+    {
+        registry.remove_artifact(&managed.record.key)?;
+    }
+    Ok(())
 }
 
 fn persist_metadata_refresh(
@@ -1330,7 +1348,7 @@ fn deploy_link(
     )
 }
 
-fn link_target(entry: &ArtifactEntry<'_>) -> PathBuf {
+pub(super) fn link_target(entry: &ArtifactEntry<'_>) -> PathBuf {
     let mut target = match &entry.resolved.normalized_location {
         SourceIdentity::Worktree(root) => root.as_path().to_path_buf(),
         SourceIdentity::Git(_) | SourceIdentity::Url(_) => {

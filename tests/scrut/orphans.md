@@ -143,3 +143,38 @@ With every orphan cleared, `phora list --orphans` exits 0 with no orphan rows.
 $ phora list --orphans >/dev/null 2>&1; echo "exit $?"
 exit 0
 ```
+
+## A restructured target adopts the orphans it lands on
+
+Folding per-program targets into one target keeps the destinations but changes
+every record key. Sync adopts a destination whose content still matches the
+orphaned record: the new target owns it without `--force`, the orphan record is
+released, and the deployed files stay in place. Linked sources keep their link.
+
+```scrut
+$ mkdir -p dots/.config/doom && echo hi > dots/.config/doom/init.el && printf '[sources.doom]\npath = "./dots"\nroot = ".config/doom"\ndeploy = "link"\n\n[sources.lint]\npath = "./src-proj"\nbranch = "main"\nroot = "lint"\n\n[targets.doom]\npath = "restructured/doom"\nsources = ["doom"]\n\n[targets.lint]\npath = "restructured/lint"\nsources = ["lint"]\n' > phora.toml && phora sync 2>&1 | normalize
+sync complete
+```
+
+```scrut
+$ printf '[sources.dots]\npath = "./dots"\nroot = ".config"\ndeploy = "link"\n\n[sources.proj]\npath = "./src-proj"\nbranch = "main"\n\n[targets.config]\npath = "restructured"\n\n[targets.config.sources.dots]\ncollapse = false\ntake = ["doom/"]\n\n[targets.config.sources.proj]\ncollapse = false\ntake = ["lint/"]\n' > phora.toml && phora sync 2>&1 | normalize
+sync complete
+```
+
+```scrut
+$ phora list 2>&1 | normalize
+config:
+  dots/doom/init.el  linked
+  proj/lint/rules.toml  ✓ clean
+```
+
+```scrut
+$ phora list --orphans 2>&1 | normalize
+No orphaned records.
+```
+
+```scrut
+$ readlink restructured/doom/init.el | normalize && cat restructured/lint/rules.toml
+<ROOT>/dots/.config/doom/init.el
+[rules]
+```
