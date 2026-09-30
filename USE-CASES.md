@@ -141,6 +141,29 @@ sources = ["nvim"]
 Upstream changes arrive when you run `phora update`. A plain `sync` keeps the
 locked commit.
 
+### Different tools on each machine
+
+The laptop wants nvim and git; the build box only needs zsh. Declare the source
+in `phora.toml` and let each machine's `phora.local.toml` own the target and
+`take` its tools:
+
+```toml
+# phora.toml
+[sources.dotfiles]
+repo = "mira-sato/dotfiles"
+branch = "main"
+```
+
+```toml
+# phora.local.toml on the build box
+[targets.config]
+path = "~/.config"
+sources.dotfiles = { take = ["zsh/**"] }
+```
+
+Adding a tool to one machine is one `take` entry. A directory taken whole still
+collapses to one artifact.
+
 ### When a file drifts
 
 `phora verify` re-hashes every deployed file and exits non-zero on a mismatch:
@@ -221,6 +244,21 @@ a sync. `phora list` labels them `linked`, and `verify` skips them. phora warns
 that the absolute path isn't portable across machines, so the block belongs in
 the local overlay. `phora add --symlink ~/dev/dotfiles` writes it for you. Delete the block and the next sync puts verified copies back. See
 [Link mode](GUIDE.md#link-mode).
+
+Under link, a directory taken whole becomes one directory symlink. A tool that
+writes backups or state into its own config directory then writes into your
+checkout. `collapse = false` links each file instead, so the directory stays
+real and those writes stay out of the repo:
+
+```toml
+# phora.local.toml
+[targets.config]
+path = "~/.config"
+sources.dotfiles = { take = ["karabiner/**", "zsh/**"], collapse = false }
+```
+
+A file you add to the repo then needs one sync to appear. See
+[Collapse](GUIDE.md#collapse).
 
 If the repo commits symlinks, for example `.zprofile` pointing at `.zshrc`, set
 `allow_symlinks = true` on the source. Otherwise that artifact fails to deploy
