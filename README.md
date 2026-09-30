@@ -862,7 +862,9 @@ ODB — point-in-time, content-hashed, verifiable. Each file's bytes are written
 once to a content store under the cache root (`content/`) and reflinked into
 place, so every deployment of the same content shares its blocks on a
 copy-on-write filesystem (APFS, Btrfs, XFS). Where the cache and target cannot
-clone, files are written directly. For a
+clone, files are written directly. Every clone is read back against the
+committed bytes; a store object that no longer holds them is rewritten, and the
+sync warns with the object's path. For a
 tight dev loop, `deploy = "link"` instead symlinks the artifact destination
 at the source's live working tree (`<source path>/<root>/<artifact>`, absolute).
 Uncommitted edits in the checkout are visible through the target immediately, with

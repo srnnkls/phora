@@ -104,6 +104,7 @@ fn warning_kind(warning: &SyncWarning) -> &'static str {
         SyncWarning::UntrustedTransitiveHooks { .. } => "untrusted_transitive_hooks",
         SyncWarning::HistoryContentFilter { .. } => "history_content_filter",
         SyncWarning::BuildFailed { .. } => "build_failed",
+        SyncWarning::ContentStoreRepaired { .. } => "content_store_repaired",
     }
 }
 
