@@ -15990,6 +15990,99 @@ mod leaf_granular_deploy_tests {
             "the offer-excluded leaf must not be recorded; got {keys:?}"
         );
     }
+
+    fn assert_no_plug_record(registry: &FileStateStore) {
+        let recs = records(registry, "dest");
+        let leaked: Vec<String> = recs
+            .iter()
+            .flat_map(|r| {
+                std::iter::once(r.key.artifact.clone()).chain(
+                    r.files
+                        .iter()
+                        .map(|f| f.path.to_string_lossy().into_owned()),
+                )
+            })
+            .filter(|p| p.contains("plug"))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "an exclude naming the `editor/plug` directory must drop its subtree; got {leaked:?}"
+        );
+    }
+
+    #[test]
+    fn copy_exclude_without_trailing_slash_prunes_a_committed_directory() {
+        let (src, url) = build_dir_repo_with_secret();
+        let td = TargetDir::new();
+        let (_g, _s, backend, registry) = fresh_backend_registry();
+        let toml = format!(
+            "version = 1\n\n\
+             [sources.ed]\ngit = \"{url}\"\nbranch = \"main\"\n\
+             include = [\"editor/**\"]\nexclude = [\"editor/plug\"]\n\n\
+             [targets.dest]\npath = \"{}\"\nsources = [\"ed\"]\nlayout = \"by-source\"\n",
+            td.target_path().display(),
+        );
+        let cfg = Config::parse(&toml).expect("copy dir-exclude config parses");
+
+        let out = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+            .expect("copy dir-exclude deploy must run");
+        assert!(!out.had_failures, "a clean copy deploy must not fail");
+
+        let dir_dst = td
+            .target_path()
+            .join(by_source().artifact_path("ed", "editor"));
+        assert!(
+            dir_dst.join("a.md").exists(),
+            "a sibling of the excluded directory must deploy"
+        );
+        assert!(
+            std::fs::symlink_metadata(dir_dst.join("plug")).is_err(),
+            "the excluded directory must not materialize"
+        );
+        assert_no_plug_record(&registry);
+        drop(src);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_exclude_without_trailing_slash_prunes_a_worktree_directory_and_blocks_collapse() {
+        let wt = build_link_tree_with_secret();
+        std::fs::create_dir_all(wt.path().join("editor/plug")).expect("mkdir plug");
+        std::fs::write(wt.path().join("editor/plug/x.md"), b"ex\n").expect("write plug/x.md");
+        let td = TargetDir::new();
+        let toml = format!(
+            "version = 1\n\n\
+             [sources.ed]\npath = \"{}\"\ndeploy = \"link\"\n\
+             include = [\"editor/**\"]\nexclude = [\"editor/plug\"]\n\n\
+             [targets.dest]\npath = \"{}\"\nsources = [\"ed\"]\nlayout = \"by-source\"\n",
+            wt.path().display(),
+            td.target_path().display(),
+        );
+        let cfg = Config::parse(&toml).expect("link dir-exclude config parses");
+        let (_g, _s, backend, registry) = fresh_backend_registry();
+
+        let out = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+            .expect("link dir-exclude sync runs to deploy");
+        assert!(!out.had_failures, "a clean link deploy must not fail");
+
+        let dir_dst = td
+            .target_path()
+            .join(by_source().artifact_path("ed", "editor"));
+        assert!(
+            !std::fs::symlink_metadata(&dir_dst).is_ok_and(|m| m.file_type().is_symlink()),
+            "the excluded physical directory must block the `editor` dir symlink"
+        );
+        assert!(
+            std::fs::symlink_metadata(dir_dst.join("a.md"))
+                .is_ok_and(|m| m.file_type().is_symlink()),
+            "a sibling of the excluded directory must deploy as a per-leaf link"
+        );
+        assert!(
+            std::fs::symlink_metadata(dir_dst.join("plug")).is_err(),
+            "the excluded directory must not materialize"
+        );
+        assert_no_plug_record(&registry);
+    }
 }
 
 // CLIFF-ORPHANS-002: registry-driven orphan physical prune
