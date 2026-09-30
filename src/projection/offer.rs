@@ -116,11 +116,17 @@ impl OfferSelection {
         let trimmed = pattern.trim_end_matches('/');
         let dir_suffix = if directory { "/**" } else { "" };
 
-        if let Some(anchored) = trimmed.strip_prefix('/') {
-            return vec![format!("{anchored}{dir_suffix}")];
-        }
-        if trimmed.contains('/') {
-            return vec![format!("{trimmed}{dir_suffix}")];
+        let anchored = trimmed
+            .strip_prefix('/')
+            .or_else(|| trimmed.contains('/').then_some(trimmed));
+        if let Some(anchored) = anchored {
+            if directory {
+                return vec![format!("{anchored}/**")];
+            }
+            if anchored.ends_with("**") {
+                return vec![anchored.to_string()];
+            }
+            return vec![anchored.to_string(), format!("{anchored}/**")];
         }
         let base = format!("{trimmed}{dir_suffix}");
         if trimmed == "**" {
@@ -489,6 +495,72 @@ mod offer_compiler_tests {
             &sel,
             &["editor/init.lua", "editor/../outside.txt"],
             &["init.lua"],
+        );
+    }
+
+    // ---- a non-slash pattern with an inner slash is anchored and also names a directory ----
+
+    #[test]
+    fn slash_exclude_without_trailing_slash_prunes_a_directory_subtree() {
+        let sel = compile(&["**"], &["skills/loqui/reference/loqui"]);
+        assert_selects(
+            &sel,
+            &[
+                "skills/loqui/SKILL.md",
+                "skills/loqui/reference/loqui/README.md",
+                "skills/loqui/reference/loqui/deep/x.md",
+                "nested/skills/loqui/reference/loqui/kept.md",
+            ],
+            &[
+                "skills/loqui/SKILL.md",
+                "nested/skills/loqui/reference/loqui/kept.md",
+            ],
+        );
+    }
+
+    #[test]
+    fn slash_exclude_without_trailing_slash_still_excludes_a_file() {
+        let sel = compile(&["**"], &["editor/secret"]);
+        assert_selects(&sel, &["editor/secret", "editor/a.md"], &["editor/a.md"]);
+    }
+
+    #[test]
+    fn leading_slash_exclude_without_trailing_slash_prunes_a_directory_subtree() {
+        let sel = compile(&["**"], &["/cache"]);
+        assert_selects(
+            &sel,
+            &[
+                "cache/x.tmp",
+                "cache/deep/y.tmp",
+                "nested/cache/z.tmp",
+                "app.rs",
+            ],
+            &["nested/cache/z.tmp", "app.rs"],
+        );
+    }
+
+    #[test]
+    fn slash_include_without_trailing_slash_selects_a_directory_subtree() {
+        let sel = compile(&["skills/loqui"], &[]);
+        assert_selects(
+            &sel,
+            &[
+                "skills/loqui/SKILL.md",
+                "skills/loqui/reference/x.md",
+                "skills/loquinox/SKILL.md",
+                "nested/skills/loqui/SKILL.md",
+            ],
+            &["skills/loqui/SKILL.md", "skills/loqui/reference/x.md"],
+        );
+    }
+
+    #[test]
+    fn slash_glob_exclude_matching_a_directory_prunes_its_subtree() {
+        let sel = compile(&["**"], &["skills/*/private"]);
+        assert_selects(
+            &sel,
+            &["skills/a/private/x.md", "skills/a/public.md"],
+            &["skills/a/public.md"],
         );
     }
 }
