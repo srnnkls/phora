@@ -23,6 +23,45 @@ fn shipped_example_configs_parse() {
 }
 
 #[test]
+fn unbound_sources_names_a_source_nothing_references() {
+    let config = Config::parse(
+        "[sources.used]\ngit = \"g\"\n\n[sources.lonely]\ngit = \"g\"\n\n\
+         [targets.t]\npath = \"~/t\"\nsources = [\"used\"]\n",
+    )
+    .expect("config parses");
+    assert_eq!(config.unbound_sources(), vec!["lonely"]);
+}
+
+#[test]
+fn unbound_sources_counts_keyed_source_import_and_build_references() {
+    let config = Config::parse(
+        "[sources.keyed]\ngit = \"g\"\n\n[sources.aliased]\ngit = \"g\"\n\n\
+         [sources.dep]\ngit = \"g\"\ntransitive = true\n\n\
+         [sources.input]\npath = \"in\"\n\n\
+         [sources.built]\nbuild = { inputs = [\"input\"], run = \"true\" }\n\n\
+         [targets.t]\npath = \"~/t\"\nimports = [\"dep\"]\n\n\
+         [targets.t.sources]\nkeyed = {}\nalias = { source = \"aliased\" }\nbuilt = {}\n",
+    )
+    .expect("config parses");
+    config.validate().expect("config validates");
+    assert_eq!(config.unbound_sources(), Vec::<&str>::new());
+}
+
+#[test]
+fn unbound_sources_names_a_local_only_source_nothing_binds() {
+    let base = Config::parse(
+        "[sources.used]\ngit = \"g\"\n\n[targets.t]\npath = \"~/t\"\nsources = [\"used\"]\n",
+    )
+    .expect("base parses");
+    let local = Config::parse("[sources.gestalt]\npath = \"/tmp/gestalt\"\ndeploy = \"link\"\n")
+        .expect("local parses");
+    assert_eq!(
+        merge_configs(base, Some(local)).unbound_sources(),
+        vec!["gestalt"]
+    );
+}
+
+#[test]
 fn parse_git_url_lands_on_remote_git() {
     let parsed = parse_remote("g", "git = \"https://github.com/me/x.git\"\n")
         .expect("a literal git URL parses to a typed source");

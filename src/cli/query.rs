@@ -25,7 +25,9 @@ use crate::source::{
 };
 use crate::sync::inspect::check_artifact_state;
 use crate::sync::state::StateStore;
-use crate::sync::{PreviewTargetPlan, offered_leaves, preview_targets, resolved_remotes};
+use crate::sync::{
+    PreviewTargetPlan, SyncWarning, offered_leaves, preview_targets, resolved_remotes,
+};
 
 use super::render::{
     print_listings, print_orphan_listings, render_preview_json, render_preview_tree, state_label,
@@ -74,6 +76,15 @@ pub(super) fn run_preview(sel: &PreviewSelectors, json: bool) -> Result<()> {
     let base = load_config()?;
     let local = load_local_config(&cwd)?;
     let config = merge_configs(base, local);
+
+    for source in config.unbound_sources() {
+        let warning = SyncWarning::UnboundSource {
+            source: source.to_owned(),
+        };
+        if let Some(rendered) = super::render::format_sync_warning(&warning) {
+            eprintln!("{rendered}");
+        }
+    }
 
     let mut config = config;
     let mut parsed = config.parsed_sources()?;

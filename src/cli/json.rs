@@ -91,6 +91,7 @@ fn warning_kind(warning: &SyncWarning) -> &'static str {
         SyncWarning::Projection(_) => "projection",
         SyncWarning::MalformedTransitiveHooks { .. } => "malformed_transitive_hooks",
         SyncWarning::LinkPathNotPortable { .. } => "link_path_not_portable",
+        SyncWarning::UnboundSource { .. } => "unbound_source",
         SyncWarning::ReferenceMoved { .. } => "reference_moved",
         SyncWarning::OrphanedRecords { .. } => "orphaned_records",
         SyncWarning::PruneSkippedAfterFailures => "prune_skipped_after_failures",

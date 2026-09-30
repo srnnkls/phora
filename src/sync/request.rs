@@ -182,6 +182,9 @@ pub enum SyncWarning {
         source: String,
         path: PathBuf,
     },
+    UnboundSource {
+        source: String,
+    },
     ReferenceMoved {
         source: String,
         target: String,
