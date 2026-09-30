@@ -529,6 +529,7 @@ struct DeployAll<'a, R> {
     remotes: &'a BTreeMap<String, String>,
     projection: &'a Projection,
     protected: &'a confine::ProtectedPathSet,
+    content_store: Option<&'a Path>,
     input: &'a dyn RunOptions,
     resolved_sources: &'a ResolvedSourceMap,
     backend: &'a dyn SourceStore,
@@ -571,6 +572,7 @@ fn target_run<'a, R>(
         resolved_sources: ctx.resolved_sources,
         vars: &ctx.config.vars,
         protected: ctx.protected,
+        content_store: ctx.content_store,
     }
 }
 
@@ -1249,6 +1251,9 @@ fn sync_workspace<R: StateStore>(
     let cwd = std::env::current_dir()
         .map_err(|e| Error::Sync(format!("resolve current dir for confinement: {e}")))?;
     let protected = confine::ProtectedPathSet::resolve(&effective_config.paths, &cwd)?;
+    let content_store =
+        crate::paths::cache_root_for(effective_config.paths.cache.as_deref(), &cwd)?
+            .join("content");
 
     sweep_target_parents(&effective_config, &journal, compat_registry)?;
 
@@ -1333,6 +1338,7 @@ fn sync_workspace<R: StateStore>(
             projection: &projection,
             resolved_sources: &routed.resolved,
             protected: &protected,
+            content_store: Some(&content_store),
             input,
             backend,
             registry,

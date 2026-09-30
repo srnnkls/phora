@@ -3492,6 +3492,7 @@ fn second_deploy_over_correct_link_is_a_noop() {
         resolved_sources: &resolved_sources,
         projection: &projection,
         protected: &protected,
+        content_store: None,
         input: &si,
         backend: &counting,
         registry: &fx.registry,
@@ -3518,6 +3519,7 @@ fn second_deploy_over_correct_link_is_a_noop() {
         resolved_sources: &resolved_sources,
         vars: &BTreeMap::new(),
         protected: &protected,
+        content_store: None,
     };
     let had_failures = deploy_reconciled_target(
         run,
@@ -16173,6 +16175,7 @@ fn undecided_conflict_at_apply_errors_unresolved() {
         resolved_sources: &resolved_sources,
         vars: &BTreeMap::new(),
         protected: &protected,
+        content_store: None,
     };
 
     let err = deploy_reconciled_target(
@@ -16241,6 +16244,7 @@ fn observe_workspace_full_registry_scan_follows_prune_policy() {
             resolved_sources: &resolved_sources,
             projection: &projection,
             protected: &protected,
+            content_store: None,
             input: &si,
             backend: &fx.backend,
             registry: &registry,
@@ -16326,6 +16330,7 @@ fn observe_workspace_rejects_duplicate_triplet() {
         resolved_sources: &resolved_sources,
         projection: &projection,
         protected: &protected,
+        content_store: None,
         input: &si,
         backend: &fx.backend,
         registry: &fx.registry,

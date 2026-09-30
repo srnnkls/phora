@@ -193,6 +193,7 @@ fn new_stage(
         root.as_deref(),
         policy,
         staging_dir,
+        None,
         opt_in,
         |repo_relative| {
             let path = SourcePath::new(&repo_relative.to_string_lossy().replace('\\', "/"))?;

@@ -421,6 +421,7 @@ fn run_export(
         None,
         policy,
         staging_dir,
+        None,
         template_opt_in,
         |repo_relative| {
             let path = SourcePath::new(&repo_relative.to_string_lossy().replace('\\', "/"))?;

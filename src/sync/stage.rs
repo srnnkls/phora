@@ -40,6 +40,7 @@ pub fn stage_artifact(
     root: Option<&Path>,
     policy: &ExportPolicy,
     staging_dir: &Path,
+    content_store: Option<&Path>,
     template_opt_in: &TemplateOptIn,
     mut resolve: impl FnMut(&Path) -> Result<(Vec<u8>, SourceEntryKind)>,
 ) -> Result<StagedArtifact> {
@@ -68,6 +69,7 @@ pub fn stage_artifact(
     let renderer = Renderer::new(template_opt_in, request.variables);
     let mut walk = ExportWalk {
         out_base: staging_dir,
+        content_store,
         policy,
         files: Vec::new(),
         hasher: blake3::Hasher::new(),
@@ -211,6 +213,7 @@ struct Rendered {
 
 pub(crate) struct ExportWalk<'a, 'r, F> {
     pub(crate) out_base: &'a Path,
+    pub(crate) content_store: Option<&'a Path>,
     pub(crate) policy: &'a ExportPolicy,
     pub(crate) files: Vec<F>,
     pub(crate) hasher: blake3::Hasher,
@@ -277,11 +280,20 @@ impl<F: StagedRecord> ExportWalk<'_, '_, F> {
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mtime = write_leaf(
-            &out_path,
-            &data,
-            executable && self.policy.preserve_executable,
-        )?;
+        let executable_bits = executable && self.policy.preserve_executable;
+        let blake3 = blake3::hash(&data).to_hex().to_string();
+        let cloned = self
+            .content_store
+            .map(|store| clone_leaf(store, &out_path, &data, executable_bits, &blake3));
+        let mtime = match cloned {
+            Some(Ok(mtime)) => mtime,
+            failed => {
+                if failed.is_some() {
+                    self.content_store = None;
+                }
+                write_leaf(&out_path, &data, executable_bits)?
+            }
+        };
 
         let tag: &[u8] = if executable {
             b"\x00exec\x00"
@@ -300,7 +312,7 @@ impl<F: StagedRecord> ExportWalk<'_, '_, F> {
             ManifestEntryKind::File,
             data.len() as u64,
             mtime,
-            blake3::hash(&data).to_hex().to_string(),
+            blake3,
         ));
         Ok(())
     }
@@ -350,15 +362,71 @@ fn write_leaf(path: &Path, data: &[u8], executable: bool) -> Result<u64> {
     let mut file = std::fs::File::create(path)?;
     file.write_all(data)?;
     if executable {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = file.metadata()?.permissions();
-            perms.set_mode(perms.mode() | 0o111);
-            file.set_permissions(perms)?;
-        }
+        set_executable(&file)?;
     }
     written_mtime(&file.metadata()?)
+}
+
+#[cfg(unix)]
+fn set_executable(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = file.metadata()?.permissions();
+    perms.set_mode(perms.mode() | 0o111);
+    file.set_permissions(perms)
+}
+
+#[cfg(not(unix))]
+fn set_executable(_file: &std::fs::File) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Reflinks the leaf from the content store, writing the store object on first use, so every
+/// deployment of the same bytes shares one set of blocks. Fails where the filesystem cannot clone.
+fn clone_leaf(
+    store: &Path,
+    path: &Path,
+    data: &[u8],
+    executable: bool,
+    blake3: &str,
+) -> Result<u64> {
+    let name = if executable {
+        format!("{blake3}.x")
+    } else {
+        blake3.to_owned()
+    };
+    let shard = store.join(&blake3[..2]);
+    let object = shard.join(&name);
+    let stored = std::fs::metadata(&object).is_ok_and(|meta| meta.len() == data.len() as u64);
+    if !stored {
+        std::fs::create_dir_all(&shard)?;
+        let pending = shard.join(format!(
+            ".{name}.{}.{}",
+            std::process::id(),
+            pending_nonce()
+        ));
+        let written = write_leaf(&pending, data, executable)
+            .and_then(|_| std::fs::rename(&pending, &object).map_err(Into::into));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&pending);
+        }
+        written?;
+    }
+    if path.symlink_metadata().is_ok() {
+        std::fs::remove_file(path)?;
+    }
+    reflink_copy::reflink(&object, path)?;
+    filetime::set_file_mtime(path, filetime::FileTime::now())?;
+    let file = std::fs::File::open(path)?;
+    if executable {
+        set_executable(&file)?;
+    }
+    written_mtime(&file.metadata()?)
+}
+
+fn pending_nonce() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 fn written_mtime(metadata: &std::fs::Metadata) -> Result<u64> {
@@ -673,6 +741,17 @@ mod tests {
         policy: &ExportPolicy,
         vars: &BTreeMap<String, String>,
     ) -> Result<StagedArtifact> {
+        stage_through(fixture, staging, None, leaves, policy, vars)
+    }
+
+    fn stage_through(
+        fixture: &ExportFixture,
+        staging: &Path,
+        content_store: Option<&Path>,
+        leaves: &[ProjectedLeaf],
+        policy: &ExportPolicy,
+        vars: &BTreeMap<String, String>,
+    ) -> Result<StagedArtifact> {
         let artifact = ProjectedArtifact {
             destination: TargetPath::new("artifact").expect("valid dest"),
             source: ResolvedSourceRef::new("src", &fixture.commit),
@@ -711,6 +790,7 @@ mod tests {
             None,
             policy,
             staging,
+            content_store,
             &TemplateOptIn::SuffixOnly,
             |repo_relative| {
                 let path = SourcePath::new(&repo_relative.to_string_lossy().replace('\\', "/"))?;
@@ -753,6 +833,73 @@ mod tests {
             leaf("linky/init.lua", "init.lua"),
             leaf(&format!("linky/{LINK_NAME}"), LINK_NAME),
         ]
+    }
+
+    #[test]
+    fn content_store_serves_every_staging_from_one_object_per_blob() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let fixture = build_export_fixture();
+        fixture.refresh();
+        let store = TempDir::new().expect("store dir");
+        let first = TempDir::new().expect("first staging dir");
+        let second = TempDir::new().expect("second staging dir");
+        let policy = ExportPolicy::default();
+        let stage = |staging: &Path| {
+            stage_through(
+                &fixture,
+                staging,
+                Some(store.path()),
+                &editor_leaves(),
+                &policy,
+                &BTreeMap::new(),
+            )
+            .expect("staging through the store succeeds")
+        };
+
+        let staged = stage(first.path());
+        let objects: Vec<(PathBuf, u64)> = staged
+            .files
+            .iter()
+            .map(|file| {
+                let name = if file.destination.as_str() == "bin/run.sh" {
+                    format!("{}.x", file.blake3)
+                } else {
+                    file.blake3.clone()
+                };
+                let object = store.path().join(&file.blake3[..2]).join(name);
+                let ino = std::fs::metadata(&object)
+                    .expect("store object exists")
+                    .ino();
+                (object, ino)
+            })
+            .collect();
+        let before = now_secs();
+        stage(second.path());
+
+        for (object, ino) in &objects {
+            assert_eq!(
+                std::fs::metadata(object).expect("store object kept").ino(),
+                *ino,
+                "a second staging must reuse {} instead of rewriting it",
+                object.display()
+            );
+        }
+        for staging in [first.path(), second.path()] {
+            assert_eq!(
+                std::fs::read(staging.join("init.lua")).expect("init.lua staged"),
+                EDITOR_INIT_CONTENT
+            );
+            let mode = std::fs::metadata(staging.join("bin/run.sh"))
+                .expect("run.sh staged")
+                .permissions()
+                .mode();
+            assert_ne!(mode & 0o111, 0, "run.sh keeps its executable bits");
+        }
+        assert!(
+            mtime_secs(&second.path().join("init.lua")) >= before,
+            "a cloned leaf carries its deploy time, not the store object's"
+        );
     }
 
     #[test]

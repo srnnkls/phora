@@ -40,6 +40,7 @@ pub(super) struct TargetRun<'a> {
     pub(super) resolved_sources: &'a ResolvedSourceMap,
     pub(super) vars: &'a BTreeMap<String, String>,
     pub(super) protected: &'a ProtectedPathSet,
+    pub(super) content_store: Option<&'a Path>,
 }
 
 impl TargetRun<'_> {
@@ -585,6 +586,7 @@ fn apply_reconciled(
                 template_opt_in: entry.template_opt_in,
                 vars: run.vars,
                 confine_anchor: run.target.confine.as_deref(),
+                content_store: run.content_store,
                 events,
             },
         ),
@@ -1003,6 +1005,7 @@ struct DeployContext<'a, 's> {
     template_opt_in: &'a TemplateOptIn,
     vars: &'a BTreeMap<String, String>,
     confine_anchor: Option<&'a Path>,
+    content_store: Option<&'a Path>,
     events: &'a mut SyncEvents<'s>,
 }
 
@@ -1198,6 +1201,7 @@ fn deploy_one(
         ctx.root,
         &policy,
         &staging,
+        ctx.content_store,
         ctx.template_opt_in,
         |repo_relative| {
             let path = SourcePath::new(&repo_relative.to_string_lossy().replace('\\', "/"))?;
@@ -1464,6 +1468,7 @@ mod confine_fail_closed_tests {
             resolved_sources,
             vars,
             protected,
+            content_store: None,
         }
     }
 

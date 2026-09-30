@@ -981,6 +981,7 @@ fn source_and_file_digests_are_byte_identical() {
         None,
         &policy,
         staging.path(),
+        None,
         &TemplateOptIn::SuffixOnly,
         |repo_relative| {
             let path = SourcePath::new(&repo_relative.to_string_lossy().replace('\\', "/"))?;
