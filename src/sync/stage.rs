@@ -414,7 +414,12 @@ fn clone_leaf(
     if path.symlink_metadata().is_ok() {
         std::fs::remove_file(path)?;
     }
-    reflink_copy::reflink(&object, path)?;
+    if let Err(error) = reflink_copy::reflink(&object, path) {
+        if !stored {
+            let _ = std::fs::remove_file(&object);
+        }
+        return Err(error.into());
+    }
     filetime::set_file_mtime(path, filetime::FileTime::now())?;
     let file = std::fs::File::open(path)?;
     if executable {
@@ -835,6 +840,30 @@ mod tests {
         ]
     }
 
+    fn clones_within(dir: &Path) -> bool {
+        let probe = dir.join(".clone-probe");
+        std::fs::write(&probe, b"probe").expect("write clone probe");
+        let copy = dir.join(".clone-probe-copy");
+        let cloned = reflink_copy::reflink(&probe, &copy).is_ok();
+        let _ = std::fs::remove_file(&probe);
+        let _ = std::fs::remove_file(&copy);
+        cloned
+    }
+
+    fn store_objects(store: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(store)
+            .expect("read store")
+            .flatten()
+            .filter(|shard| shard.path().is_dir())
+            .flat_map(|shard| {
+                std::fs::read_dir(shard.path())
+                    .expect("read shard")
+                    .flatten()
+            })
+            .map(|object| object.path())
+            .collect()
+    }
+
     #[test]
     fn content_store_serves_every_staging_from_one_object_per_blob() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -858,6 +887,17 @@ mod tests {
         };
 
         let staged = stage(first.path());
+        if !clones_within(store.path()) {
+            assert_eq!(
+                std::fs::read(first.path().join("init.lua")).expect("init.lua staged"),
+                EDITOR_INIT_CONTENT
+            );
+            assert!(
+                store_objects(store.path()).is_empty(),
+                "a store that cannot clone keeps no objects"
+            );
+            return;
+        }
         let objects: Vec<(PathBuf, u64)> = staged
             .files
             .iter()
