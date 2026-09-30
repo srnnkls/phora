@@ -141,3 +141,7 @@ toolkit = false
 [targets.skills]
 path = "~/.claude/skills"
 sources = ["skills"]
+
+[targets.scratch]
+path = "~/.config/scratch"
+sources = ["scratch"]
