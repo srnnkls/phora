@@ -5677,6 +5677,7 @@ fn format_listings_marks_an_empty_target_with_a_sync_hint() {
     let listings = vec![TargetListing {
         target: "claude".to_owned(),
         artifacts: vec![],
+        composed: vec![],
     }];
     let out = render::format_listings(&listings);
     assert!(
@@ -5698,6 +5699,7 @@ fn format_listings_renders_deployed_artifacts_without_the_empty_hint() {
             artifact: "agents".to_owned(),
             state: "clean".to_owned(),
         }],
+        composed: vec![],
     }];
     let out = render::format_listings(&listings);
     assert!(

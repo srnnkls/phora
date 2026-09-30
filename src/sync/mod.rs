@@ -2080,10 +2080,14 @@ pub(crate) fn inject_composed_graph(
     remotes: &mut BTreeMap<String, String>,
     backend: &dyn SourceStore,
     lock: Option<&Lock>,
-) {
-    if let Ok(graph) = transitive::resolve_transitive_graph(config, parsed, backend, true, lock) {
-        graph.inject(config, parsed, remotes);
-    }
+) -> Vec<transitive::ComposedTarget> {
+    let Ok(graph) = transitive::resolve_transitive_graph(config, parsed, backend, true, lock)
+    else {
+        return Vec::new();
+    };
+    let composed = graph.targets.clone();
+    graph.inject(config, parsed, remotes);
+    composed
 }
 
 #[derive(Debug)]

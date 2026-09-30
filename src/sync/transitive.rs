@@ -52,10 +52,15 @@ const MAX_TRANSITIVE_DEPTH: usize = 64;
 
 /// One dep target composed under a consumer anchor: a synthetic absolute-path
 /// target carrying the dep's own layout, bound to namespaced source instances.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ComposedTarget {
     pub(crate) name: String,
-    pub(super) target: Target,
+    pub(crate) target: Target,
+    /// Consumer config target whose `imports` roots this composition.
+    pub(crate) anchor: String,
+    /// Consumer-facing import name rooting this composition.
+    pub(crate) import: String,
+    pub(crate) dep_target: String,
 }
 
 /// An interpreted transitive `on_change` hook pinned to its dep's resolved commit, awaiting
@@ -296,6 +301,7 @@ pub(super) fn resolve_transitive_graph(
                     consumer_hosts: &config.hosts,
                     default_protocol: config.protocol,
                     root_source: imported,
+                    root_anchor: anchor_name,
                 },
                 1,
             )?;
@@ -411,6 +417,7 @@ struct WalkCtx<'a> {
     default_protocol: Option<Protocol>,
     /// Consumer-facing import name rooting this subtree; stamped on every hook candidate it yields.
     root_source: &'a str,
+    root_anchor: &'a str,
 }
 
 /// Checked at the top of every `fetch_manifest` so no depth can fetch an unpinned/drifted node under `--frozen`.
@@ -529,6 +536,9 @@ fn compose_dep(
         ctx.graph.targets.push(ComposedTarget {
             name: composed_name,
             target: synthetic,
+            anchor: ctx.root_anchor.to_owned(),
+            import: ctx.root_source.to_owned(),
+            dep_target: dep_target_name.clone(),
         });
     }
     Ok(())
