@@ -38,15 +38,15 @@ auth = { type = "ssh", key = "~/.ssh/id_ed25519" }
 # Forge source: resolves via the host's `remote` template at sync time. `root`
 # re-anchors the offer at `modules`, so artifacts are named relative to it.
 [sources.dotfiles]
-host = "github"          # omit to default to github when `repo` is set
-repo = "me/dotfiles"     # deprecated alias: `path` (forge owner/repo) under a host
+host = "github"  # omit to default to github when `repo` is set
+repo = "me/dotfiles"  # deprecated alias: `path` (forge owner/repo) under a host
 branch = "main"
 root = "modules"
 
 [sources.internal]
 host = "company"
-repo = "team/sub/proj"   # nested paths are fine ({owner}/{repo} ≡ {path})
-protocol = "ssh"         # per-source opt-in to ssh
+repo = "team/sub/proj"  # nested paths are fine ({owner}/{repo} ≡ {path})
+protocol = "ssh"  # per-source opt-in to ssh
 root = "configs"
 include = ["editor", "lint"]
 exclude = ["**/test/**", "**/*.bak"]
@@ -96,6 +96,7 @@ include = ["fzf"]
 # `source` = provenance, `take` = this target's own subset/rename of the offer.
 [targets.neovim]
 path = "~/.config/nvim"
+
 [targets.neovim.sources]
 # Alias the `dotfiles` source under a distinct `nvim` identity, then subset its
 # offer to just the editor's tree with `take` (the new way a target slices a source).
@@ -106,8 +107,9 @@ nvim = { source = "dotfiles", take = ["nvim/**"] }
 [targets.editors]
 path = "~/.config"
 layout = "by-source"
+
 [targets.editors.sources]
-nvim  = { source = "dotfiles", take = ["nvim/**"] }
+nvim = { source = "dotfiles", take = ["nvim/**"] }
 helix = { source = "dotfiles", take = ["helix/**"] }
 
 # `take` can rename as it subsets: `{ src = dest }` projects one offered path to a
@@ -115,9 +117,10 @@ helix = { source = "dotfiles", take = ["helix/**"] }
 [targets.vscode]
 path = "~/.config/Code/User"
 layout = "flat"
+
 [targets.vscode.sources]
 dotfiles = { take = ["vscode/**", { "vscode/settings.json" = "settings.json" }] }
-internal = { }
+internal = {}
 
 [targets.policies]
 path = "~/.cupcake/policies/claude"
@@ -136,6 +139,7 @@ layout = "flat"
 [targets.tools]
 path = "~/.local/tools"
 layout = "by-source"
+
 [targets.tools.sources]
 stable = { source = "fzf", tag = "v0.55.0" }
 canary = { source = "fzf", tag = "v0.56.0" }
