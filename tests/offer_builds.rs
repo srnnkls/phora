@@ -1,0 +1,396 @@
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use tempfile::TempDir;
+mod common;
+
+struct Fixture {
+    root: TempDir,
+    package: PathBuf,
+    project: PathBuf,
+}
+
+fn write(path: &Path, text: &str) {
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(path, text).expect("write");
+}
+
+fn git(path: &Path, args: &[&str]) {
+    common::assert_sandboxed(path);
+    let out = Command::new("git")
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+        ])
+        .args(args)
+        .current_dir(path)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("git");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+const PACKAGE: &str = r#"
+[sources.loqui]
+git = "https://example.invalid/loqui.git"
+include = ["languages/**"]
+[sources.harnesses]
+build = { builder = "harness" }
+[targets.loqui]
+path = "skills/loqui/reference/loqui"
+sources = ["loqui"]
+[targets.claude]
+path = "dist/claude"
+sources.harnesses = { take = [{ "claude/" = "." }] }
+[offers.claude]
+root = "dist/claude"
+targets = ["claude"]
+"#;
+
+impl Fixture {
+    fn new(package_manifest: &str) -> Self {
+        let root = tempfile::tempdir().expect("sandbox");
+        let package = root.path().join("tropos");
+        let dependency = root.path().join("loqui");
+        let project = root.path().join("consumer");
+        for path in [&package, &dependency, &project] {
+            std::fs::create_dir_all(path).expect("mkdir");
+        }
+        for path in [&package, &dependency] {
+            git(path, &["init", "-q", "-b", "main", "--template="]);
+        }
+        write(&dependency.join("languages/rust/README.md"), "Loqui\n");
+        git(&dependency, &["add", "."]);
+        git(&dependency, &["commit", "-qm", "dependency"]);
+        write(&package.join("skills/code/SKILL.md"), "skill\n");
+        write(&package.join("phora.toml"), package_manifest);
+        git(&package, &["add", "."]);
+        git(&package, &["commit", "-qm", "package"]);
+        write(
+            &root.path().join("gitconfig"),
+            &format!(
+                "[url {:?}]\n\tinsteadOf = https://example.invalid/loqui.git\n",
+                dependency.display().to_string()
+            ),
+        );
+        Self {
+            root,
+            package,
+            project,
+        }
+    }
+
+    fn builds_log(&self) -> PathBuf {
+        self.root.path().join("builds")
+    }
+
+    fn configure(&self, builder: &str, binding: &str) {
+        write(
+            &self.project.join("phora.toml"),
+            &format!(
+                r#"
+[paths]
+cache = "cache"
+state = "state"
+{builder}
+[sources.tropos]
+path = {package:?}
+branch = "main"
+transitive = true
+[targets.claude]
+path = "home/.claude"
+sources.tropos = {{ {binding} }}
+"#,
+                package = self.package.display().to_string()
+            ),
+        );
+    }
+
+    fn harness(&self, run: &str) -> String {
+        format!(
+            "[builders.harness]\nrun = {:?}\n",
+            format!(
+                "printf 'build\\n' >> {log:?} && mkdir -p \"$PHORA_OUTPUT/claude\" && {run}",
+                log = self.builds_log().display().to_string()
+            )
+        )
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_phora"))
+            .args(args)
+            .current_dir(&self.project)
+            .env("GIT_CONFIG_GLOBAL", self.root.path().join("gitconfig"))
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("phora")
+    }
+
+    fn succeeds(&self, args: &[&str]) {
+        let out = self.run(args);
+        assert!(
+            out.status.success(),
+            "phora {args:?}: {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn fails(&self, args: &[&str]) -> String {
+        let out = self.run(args);
+        assert!(
+            !out.status.success(),
+            "phora {args:?} unexpectedly succeeded"
+        );
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    }
+
+    fn builds(&self) -> usize {
+        std::fs::read_to_string(self.builds_log())
+            .map(|log| log.lines().count())
+            .unwrap_or_default()
+    }
+
+    fn deployed(&self) -> BTreeSet<String> {
+        fn walk(dir: &Path, base: &Path, out: &mut BTreeSet<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(&path, base, out);
+                } else {
+                    let relative = path.strip_prefix(base).expect("under base");
+                    out.insert(relative.to_string_lossy().into_owned());
+                }
+            }
+        }
+        let base = self.project.join("home/.claude");
+        let mut out = BTreeSet::new();
+        walk(&base, &base, &mut out);
+        out
+    }
+}
+
+const COPY_INPUT: &str = "cp -R \"$PHORA_INPUT/.\" \"$PHORA_OUTPUT/claude/\"";
+
+fn set(paths: &[&str]) -> BTreeSet<String> {
+    paths.iter().map(|p| (*p).to_owned()).collect()
+}
+
+#[test]
+fn an_offered_build_runs_the_consumer_builder_over_the_repo_offer() {
+    let fixture = Fixture::new(PACKAGE);
+    fixture.configure(&fixture.harness(COPY_INPUT), "offer = \"claude\"");
+    fixture.succeeds(&["sync"]);
+    assert_eq!(
+        fixture.deployed(),
+        set(&[
+            "skills/code/SKILL.md",
+            "skills/loqui/reference/loqui/languages/rust/README.md",
+        ]),
+        "the build reads the default offer without the target that reads the build"
+    );
+    assert_eq!(fixture.builds(), 1);
+    fixture.succeeds(&["sync"]);
+    assert_eq!(fixture.builds(), 1, "an unchanged input skips the build");
+}
+
+#[test]
+fn frozen_replays_an_offered_build_without_running_it() {
+    let fixture = Fixture::new(PACKAGE);
+    fixture.configure(&fixture.harness(COPY_INPUT), "offer = \"claude\"");
+    fixture.succeeds(&["sync"]);
+    std::fs::remove_dir_all(fixture.project.join("home")).expect("remove deployment");
+    fixture.succeeds(&["sync", "--frozen"]);
+    assert_eq!(fixture.builds(), 1);
+    assert!(fixture.deployed().contains("skills/code/SKILL.md"));
+}
+
+#[test]
+fn an_offered_build_needs_the_consumer_to_register_its_builder() {
+    let fixture = Fixture::new(PACKAGE);
+    fixture.configure("", "offer = \"claude\"");
+    let stderr = fixture.fails(&["sync"]);
+    assert!(stderr.contains("[builders.harness]"), "{stderr}");
+    assert_eq!(fixture.builds(), 0);
+}
+
+#[test]
+fn a_dependency_build_with_its_own_command_is_never_offered() {
+    let manifest = PACKAGE.replace(
+        "build = { builder = \"harness\" }",
+        "build = { inputs = [\"loqui\"], run = \"touch \\\"$HOME/pwned\\\"\" }",
+    );
+    let fixture = Fixture::new(&manifest);
+    fixture.configure(&fixture.harness(COPY_INPUT), "offer = \"claude\"");
+    let stderr = fixture.fails(&["sync"]);
+    assert!(stderr.contains("runs its own command"), "{stderr}");
+    fixture.configure(&fixture.harness(COPY_INPUT), "");
+    fixture.succeeds(&["sync"]);
+    assert_eq!(fixture.builds(), 0);
+    assert!(
+        !fixture
+            .deployed()
+            .iter()
+            .any(|path| path.starts_with("dist")),
+        "the default offer skips the target bound to the dependency's own command"
+    );
+}
+
+#[test]
+fn an_offered_build_runs_outside_the_consumer_project() {
+    let fixture = Fixture::new(PACKAGE);
+    fixture.configure(
+        &fixture.harness("pwd > \"$PHORA_OUTPUT/claude/cwd\""),
+        "offer = \"claude\"",
+    );
+    fixture.succeeds(&["sync"]);
+    let cwd = std::fs::read_to_string(fixture.project.join("home/.claude/cwd")).expect("cwd");
+    assert!(
+        !Path::new(cwd.trim()).starts_with(&fixture.project),
+        "the builder ran in the consumer project: {cwd}"
+    );
+}
+
+#[test]
+fn an_offered_build_cannot_emit_a_link_out_of_its_output() {
+    let fixture = Fixture::new(PACKAGE);
+    fixture.configure(
+        &fixture.harness("ln -s /etc/hosts \"$PHORA_OUTPUT/claude/hosts\""),
+        "offer = \"claude\"",
+    );
+    let stderr = fixture.fails(&["sync"]);
+    assert!(stderr.contains("resolves outside"), "{stderr}");
+    assert!(!fixture.project.join("home/.claude/hosts").exists());
+}
+
+#[test]
+fn an_offer_a_build_reads_cannot_select_the_build_itself() {
+    let manifest = format!("{PACKAGE}[offers.loop]\ntargets = [\"claude\"]\n").replace(
+        "build = { builder = \"harness\" }",
+        "build = { builder = \"harness\", offer = \"loop\" }",
+    );
+    let fixture = Fixture::new(&manifest);
+    fixture.configure(&fixture.harness(COPY_INPUT), "offer = \"claude\"");
+    let stderr = fixture.fails(&["sync"]);
+    assert!(stderr.contains("reads its own output"), "{stderr}");
+}
+
+#[test]
+fn a_repo_builds_its_own_offer_when_it_syncs_itself() {
+    let fixture = Fixture::new(PACKAGE);
+    write(
+        &fixture.package.join("phora.toml"),
+        &format!(
+            "[paths]\ncache = \"../cache\"\nstate = \"../state\"\n{}{PACKAGE}",
+            fixture.harness(COPY_INPUT)
+        ),
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_phora"))
+        .arg("sync")
+        .current_dir(&fixture.package)
+        .env("GIT_CONFIG_GLOBAL", fixture.root.path().join("gitconfig"))
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("phora");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.package.join("dist/claude/skills/code/SKILL.md"))
+            .expect("built own files"),
+        "skill\n"
+    );
+    assert!(
+        fixture
+            .package
+            .join("dist/claude/skills/loqui/reference/loqui/languages/rust/README.md")
+            .exists(),
+        "the build reads the targets its offer composes"
+    );
+}
+
+#[test]
+fn an_offered_build_cannot_read_a_link_out_of_its_input() {
+    let manifest = PACKAGE.replace(
+        "include = [\"languages/**\"]",
+        "include = [\"languages/**\"]\nallow_symlinks = true",
+    );
+    let control = Fixture::new(&manifest);
+    control.configure(&control.harness(COPY_INPUT), "offer = \"claude\"");
+    control.succeeds(&["sync"]);
+
+    let fixture = Fixture::new(&manifest);
+    let loqui = fixture.root.path().join("loqui");
+    std::os::unix::fs::symlink("/etc/hosts", loqui.join("languages/hosts")).expect("plant link");
+    git(&loqui, &["add", "."]);
+    git(&loqui, &["commit", "-qm", "link"]);
+    fixture.configure(&fixture.harness(COPY_INPUT), "offer = \"claude\"");
+    fixture.fails(&["sync"]);
+    assert_eq!(
+        fixture.builds(),
+        0,
+        "the builder never sees the planted link"
+    );
+    assert!(
+        !fixture
+            .project
+            .join("home/.claude/skills/loqui/reference/loqui/languages/hosts")
+            .exists()
+    );
+}
+
+#[test]
+fn bindings_sharing_an_offered_build_run_it_once() {
+    let fixture = Fixture::new(PACKAGE);
+    fixture.configure(
+        &fixture.harness(COPY_INPUT),
+        "offer = \"claude\" }\n[targets.again]\npath = \"home/again\"\nsources.tropos = { offer = \"claude\"",
+    );
+    fixture.succeeds(&["sync"]);
+    assert_eq!(fixture.builds(), 1);
+    assert!(
+        fixture
+            .project
+            .join("home/again/skills/code/SKILL.md")
+            .exists()
+    );
+}
+
+#[test]
+fn a_linked_package_builds_from_its_working_tree() {
+    let fixture = Fixture::new(PACKAGE);
+    fixture.configure(
+        &fixture.harness("cp -RL \"$PHORA_INPUT/.\" \"$PHORA_OUTPUT/claude/\""),
+        "offer = \"claude\"",
+    );
+    let config = std::fs::read_to_string(fixture.project.join("phora.toml"))
+        .expect("config")
+        .replace("branch = \"main\"", "deploy = \"link\"");
+    write(&fixture.project.join("phora.toml"), &config);
+    write(
+        &fixture.package.join("skills/code/SKILL.md"),
+        "uncommitted\n",
+    );
+    fixture.succeeds(&["sync"]);
+    assert_eq!(
+        std::fs::read_to_string(fixture.project.join("home/.claude/skills/code/SKILL.md"))
+            .expect("built"),
+        "uncommitted\n"
+    );
+}

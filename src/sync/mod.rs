@@ -1166,8 +1166,14 @@ where
         ));
     }
     let mut parsed = effective_config.parsed_sources()?;
-    let builds = build::run(input, &effective_config, &parsed, backend, &mut events)?;
-    let build_failed = builds.failed;
+    let mut builds = build::run(
+        input,
+        &effective_config,
+        &parsed,
+        backend,
+        &mut events,
+        &build::Scope::Own,
+    )?;
     let mut remotes = resolved_remotes(&effective_config, &parsed)?;
     let effective_lock = effective_lock(input);
     input.sink().phase_started(Phase::Compose);
@@ -1184,8 +1190,21 @@ where
     )?;
     let hook_candidates = take_hook_candidates(&mut graph, &mut events);
     let import_refs = graph.import_refs.clone();
+    let build_inputs = std::mem::take(&mut graph.build_inputs);
     let instances = graph.inject(&mut effective_config, &mut parsed, &mut remotes);
     input.sink().phase_finished(Phase::Compose);
+    builds.extend(build::run(
+        input,
+        &effective_config,
+        &parsed,
+        backend,
+        &mut events,
+        &build::Scope::Composed {
+            inputs: &build_inputs,
+            instances: &instances,
+        },
+    )?);
+    let build_failed = builds.failed;
 
     let workspace = SyncWorkspace {
         config: effective_config,

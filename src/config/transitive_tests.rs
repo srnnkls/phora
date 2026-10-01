@@ -911,3 +911,71 @@ fn local_only_sources_do_not_block_an_import() {
     .expect("sources only the local config binds are not part of any offer");
     assert!(manifest.offer("default").is_ok());
 }
+
+const BUILDS: &str = "version = 1\n\n[builders.henia]\nrun = \"henia build\"\n\n";
+
+#[test]
+fn a_build_names_a_builder_or_its_own_command_not_both() {
+    for (build, needle) in [
+        ("{ builder = \"henia\", run = \"make\" }", "not both"),
+        (
+            "{ builder = \"henia\", key = \"henia --version\" }",
+            "belongs to the builder",
+        ),
+    ] {
+        let err = Config::parse(&format!("{BUILDS}[sources.out]\nbuild = {build}\n"))
+            .expect_err(build)
+            .to_string();
+        assert!(err.contains(needle), "{build}: {err}");
+    }
+}
+
+#[test]
+fn a_build_naming_an_undeclared_builder_fails_validation() {
+    let config = merged(
+        "version = 1\n\n[sources.out]\nbuild = { builder = \"henia\" }\n\n\
+         [targets.dist]\npath = \"dist\"\nsources = [\"out\"]\n",
+    );
+    let msg = config
+        .validate()
+        .expect_err("undeclared builder")
+        .to_string();
+    assert!(msg.contains("[builders.henia]"), "got: {msg}");
+}
+
+#[test]
+fn a_build_offer_needs_transitive_inputs() {
+    let config = merged(&format!(
+        "{BUILDS}[sources.notes]\ngit = \"https://github.com/me/notes.git\"\n\n\
+         [sources.out]\nbuild = {{ builder = \"henia\", inputs = [\"notes\"], offer = \"x\" }}\n\n\
+         [targets.dist]\npath = \"dist\"\nsources = [\"out\"]\n"
+    ));
+    let msg = config.validate().expect_err("flat input").to_string();
+    assert!(msg.contains("notes") && msg.contains("flat"), "got: {msg}");
+}
+
+#[test]
+fn an_offer_never_contains_a_build_that_reads_it() {
+    let manifest = TransitiveManifest::parse(
+        "[sources.out]\nbuild = { builder = \"henia\" }\n\n\
+         [targets.dist]\npath = \"dist\"\nsources = [\"out\"]\n\n\
+         [offers.built]\ntargets = [\"dist\"]\n",
+    )
+    .expect("manifest parses");
+    assert!(
+        manifest
+            .offer("default")
+            .expect("default")
+            .targets
+            .is_empty()
+    );
+    assert_eq!(
+        manifest
+            .offer("built")
+            .expect("built")
+            .targets
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["dist"]
+    );
+}

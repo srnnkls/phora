@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::transitive::{FetchNode, Instance, Member, TransitiveManifest};
 use crate::config::{
-    Binding, Config, DeployMode, HookAdmissionDiagnostic, HookCommand, Host, OfferBinding,
+    Binding, Builder, Config, DeployMode, HookAdmissionDiagnostic, HookCommand, Host, OfferBinding,
     ParsedSource, Protocol, Refspec, Remote, Source, SourceMode, TakeEntry, Target,
     admit_transitive_hooks, hook_preimage,
 };
@@ -103,6 +103,8 @@ pub(crate) struct ResolvedGraph {
     pub(super) import_refs: Vec<ImportResolution>,
     pub(super) hook_candidates: Vec<TransitiveHookCandidate>,
     pub(super) hook_diagnostics: Vec<HookAdmissionDiagnostic>,
+    /// The pinned dependency repos composed builds read, keyed by namespaced name.
+    pub(super) build_inputs: BTreeMap<String, ParsedSource>,
 }
 
 impl ResolvedGraph {
@@ -281,6 +283,7 @@ pub(super) fn resolve_transitive_graph(
                     graph: &mut graph,
                     frozen: &frozen_gate,
                     consumer_hosts: &config.hosts,
+                    consumer_builders: &config.builders,
                     default_protocol: config.protocol,
                     root_source: imported,
                     root_identity: &import.identity,
@@ -439,6 +442,7 @@ struct WalkCtx<'a> {
     graph: &'a mut ResolvedGraph,
     frozen: &'a FrozenGate<'a>,
     consumer_hosts: &'a BTreeMap<String, Host>,
+    consumer_builders: &'a BTreeMap<String, Builder>,
     default_protocol: Option<Protocol>,
     /// Consumer source rooting this subtree; stamped on every hook candidate it yields.
     root_source: &'a str,
@@ -509,7 +513,7 @@ fn compose_dep(
     depth: usize,
 ) -> Result<()> {
     reject_depth_overflow(imported, depth)?;
-    let source_names = namespace_dep_sources(instance, imported, layout, ctx, depth)?;
+    let source_names = namespace_dep_sources(instance, imported, layout, package, ctx, depth)?;
     let target_paths: Vec<PathBuf> = layout
         .targets
         .values()
@@ -608,6 +612,53 @@ fn own_files_target(
     }
 }
 
+fn namespace_dep_build(
+    instance: &Instance,
+    imported: &str,
+    name: &str,
+    source: &Source,
+    package: PackageSnapshot<'_>,
+    ctx: &mut WalkCtx<'_>,
+) -> Result<String> {
+    let fail = |e: Error| Error::Config(format!("source `{imported}`: source `{name}`: {e}"));
+    let repo = instance.key(&Member::Repo);
+    let spec = source
+        .build
+        .as_ref()
+        .map(|build| build.lowered(ctx.consumer_builders, &repo))
+        .transpose()
+        .map_err(fail)?;
+    if !ctx.graph.build_inputs.contains_key(&repo) {
+        let snapshot = match package {
+            PackageSnapshot::Mirror(remote) => format!(
+                "git = {remote:?}\nrev = {:?}\ntransitive = true\n",
+                instance.fetch_node().commit()
+            ),
+            PackageSnapshot::Worktree(root) => {
+                format!("path = {root:?}\ndeploy = \"link\"\ntransitive = true\n")
+            }
+        };
+        let snapshot: Source =
+            toml::from_str(&snapshot).map_err(|e| fail(Error::Config(e.to_string())))?;
+        ctx.graph
+            .build_inputs
+            .insert(repo.clone(), ParsedSource::parse(&repo, &snapshot)?);
+    }
+    let mut parsed = ParsedSource::parse(name, source).map_err(fail)?;
+    if let Some(spec) = spec {
+        parsed.remote = Remote::Build(spec);
+    }
+    let namespaced = instance.key(&Member::Named(name.to_owned()));
+    ctx.graph
+        .remotes
+        .insert(namespaced.clone(), crate::source::BUILD_MIRROR.to_owned());
+    ctx.graph.sources.insert(namespaced.clone(), parsed);
+    ctx.graph
+        .instances
+        .insert(namespaced.clone(), instance.stable_key());
+    Ok(namespaced)
+}
+
 fn namespace_own_files(
     instance: &Instance,
     imported: &str,
@@ -640,6 +691,7 @@ fn namespace_dep_sources(
     instance: &Instance,
     imported: &str,
     layout: &OfferLayout<'_>,
+    package: PackageSnapshot<'_>,
     ctx: &mut WalkCtx<'_>,
     depth: usize,
 ) -> Result<BTreeMap<String, String>> {
@@ -652,6 +704,12 @@ fn namespace_dep_sources(
     let mut source_names: BTreeMap<String, String> = BTreeMap::new();
     for (inner_name, inner) in layout.sources {
         if !needed.contains(inner_name.as_str()) {
+            continue;
+        }
+        if inner.build.is_some() {
+            let namespaced =
+                namespace_dep_build(instance, imported, inner_name, inner, package, ctx)?;
+            source_names.insert(inner_name.clone(), namespaced);
             continue;
         }
         let parsed = ParsedSource::parse(inner_name, inner).map_err(|e| {

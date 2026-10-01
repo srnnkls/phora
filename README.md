@@ -1011,9 +1011,11 @@ targets = ["moira"]
   nor any target's path, so a committed copy of what a target deploys never rides
   along — even when the offer does not select that target.
 - A target is offerable when its path is relative to the repo and every source it
-  binds can be fetched by a consumer: no local `path`, no `deploy = "link"`, no
-  `build`. Local-only targets such as `~/.claude` stay out of `default`; naming one
-  in `targets` is a config error, and so is naming a target outside `root`.
+  binds can be fetched or built by a consumer: no local `path`, no
+  `deploy = "link"`, and no build that carries its own command (see
+  [Offered builds](#offered-builds)). Local-only targets such as `~/.claude` stay
+  out of `default`; naming one in `targets` is a config error, and so is naming a
+  target outside `root`.
 - Offers belong to the committed `phora.toml`; `phora.local.toml` cannot declare them.
 
 A binding picks an offer with `offer`; without one it gets `default`:
@@ -1108,8 +1110,92 @@ The build key hashes the command, the `key` output, and every materialized input
 file. A sync reruns the command only when the key differs from the lock; `phora
 update <source>` forces a rerun. A failed rerun keeps the previous output
 deployed and exits 1; a first build that fails stops the sync. `--frozen` never
-runs a build. Builds come only from your own config, never from a dependency's
-`phora.toml`.
+runs a build.
+
+A build can name a *builder* instead of carrying its own command. Builders are
+declared under `[builders]` and take the same `run`/`shell`/`cmd` and `key` forms;
+`phora.local.toml` may add or override them:
+
+```toml
+[builders.henia]
+run = "henia build \"$PHORA_INPUT\" --output \"$PHORA_OUTPUT\""
+key = "henia --version"
+
+[sources.henia]
+build = { builder = "henia", inputs = ["tropos"], offer = "source" }
+```
+
+`offer` binds the transitive inputs with that offer. Without `inputs`, a build
+reads one of its own repo's offers (`default` when `offer` is omitted),
+materialized at `$PHORA_INPUT` itself: the working tree plus the targets that offer
+composes.
+
+### Offered builds
+
+A repo can offer what a build makes from it without ever handing its consumers a
+command. The repo's build names a builder and reads one of its own offers; a
+target places the output, and an offer selects that target:
+
+```toml
+# tropos/phora.toml
+[builders.henia]           # used when tropos syncs itself; never read by consumers
+run = "henia build \"$PHORA_INPUT\" --output \"$PHORA_OUTPUT\""
+
+[sources.loqui]
+host = "github"
+repo = "srnnkls/loqui"
+
+[sources.harnesses]
+build = { builder = "henia" }        # reads tropos's default offer
+
+[targets.loqui]
+path = "skills/loqui/reference/loqui"
+sources = ["loqui"]
+
+[targets.claude]
+path = "dist/claude"
+sources.harnesses = { take = [{ "claude/" = "." }] }
+
+[offers.claude]
+root = "dist/claude"
+targets = ["claude"]
+```
+
+```toml
+# your phora.toml
+[builders.henia]
+run = "henia build \"$PHORA_INPUT\" --output \"$PHORA_OUTPUT\""
+key = "henia --version"
+
+[sources.tropos]
+host = "github"
+repo = "srnnkls/tropos"
+transitive = true
+
+[targets.claude]
+path = "~/.claude"
+sources.tropos = { offer = "claude" }
+```
+
+- The command is always yours. A dependency's build may only name a builder and
+  an offer of its own repo; your `[builders]` decides what runs, the way your
+  `[hosts]` decide where a dependency's `host` + `repo` resolve. A dependency's
+  `[builders]` table is never read, and a build that carries its own command is
+  never offered. Binding an offer whose builder you have not declared fails and
+  names the table to add.
+- The build reads the dependency's pinned commit (or its linked working tree) with
+  the named offer composed, at `$PHORA_INPUT`. It runs in a scratch directory, not
+  your project, and a symlink that resolves outside its input or output fails the
+  build.
+- An offer never contains a build that reads it: tropos's `default` leaves out the
+  `claude` target, so the build's input is tropos's own files plus loqui, and an
+  offer that selects its own build's target is a config error.
+- The output locks, replays under `--frozen`, and rebuilds when the input or the
+  builder's `key` changes, like any build. One build serves every offer that
+  places it.
+
+A builder runs on dependency content. Register only tools that treat their input
+as data; a builder such as `make` or `sh` hands the dependency code execution.
 
 ### How composition works
 

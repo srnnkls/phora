@@ -51,11 +51,31 @@ pub struct Source {
 /// A generator whose output, committed into the store, is the source's content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildSpec {
-    /// Sources materialized under `$PHORA_INPUT/<name>` before the command runs.
-    pub inputs: Vec<String>,
-    pub command: HookCommand,
-    /// Runs on every sync; its stdout joins the build key.
-    pub key: Option<HookCommand>,
+    pub inputs: BuildInputs,
+    /// The offer a transitive input is bound with; `default` when omitted.
+    pub offer: Option<String>,
+    pub tool: BuildTool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildInputs {
+    /// Each named source, materialized under `$PHORA_INPUT/<name>`.
+    Sources(Vec<String>),
+    /// The repo declaring the build, materialized at `$PHORA_INPUT`.
+    Repo,
+    /// One named source, materialized at `$PHORA_INPUT`.
+    Root(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildTool {
+    /// `key` runs before the build; its stdout joins the build key.
+    Command {
+        command: HookCommand,
+        key: Option<HookCommand>,
+    },
+    /// A consumer-registered `[builders.<name>]`.
+    Builder(String),
 }
 
 impl<'de> Deserialize<'de> for BuildSpec {
@@ -65,18 +85,101 @@ impl<'de> Deserialize<'de> for BuildSpec {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct BuildTable {
-            inputs: Vec<String>,
+            inputs: Option<Vec<String>>,
+            offer: Option<String>,
+            builder: Option<String>,
             run: Option<String>,
             shell: Option<String>,
             cmd: Option<Vec<String>>,
             key: Option<HookCommand>,
         }
         let table = BuildTable::deserialize(deserializer)?;
-        let command = super::hooks::validated_command(table.run, table.shell, table.cmd)?;
+        let tool = match table.builder {
+            Some(builder) => {
+                if table.run.is_some() || table.shell.is_some() || table.cmd.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "a build names a `builder` or its own command, not both",
+                    ));
+                }
+                if table.key.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "`key` belongs to the builder, not to a build that names one",
+                    ));
+                }
+                BuildTool::Builder(builder)
+            }
+            None => BuildTool::Command {
+                command: super::hooks::validated_command(table.run, table.shell, table.cmd)?,
+                key: table.key,
+            },
+        };
         Ok(Self {
-            inputs: table.inputs,
-            command,
+            inputs: table.inputs.map_or(BuildInputs::Repo, BuildInputs::Sources),
+            offer: table.offer,
+            tool,
+        })
+    }
+}
+
+/// A consumer-owned command a build names instead of carrying its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Builder {
+    pub command: HookCommand,
+    pub key: Option<HookCommand>,
+}
+
+impl<'de> Deserialize<'de> for Builder {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct BuilderTable {
+            run: Option<String>,
+            shell: Option<String>,
+            cmd: Option<Vec<String>>,
+            key: Option<HookCommand>,
+        }
+        let table = BuilderTable::deserialize(deserializer)?;
+        Ok(Self {
+            command: super::hooks::validated_command(table.run, table.shell, table.cmd)?,
             key: table.key,
+        })
+    }
+}
+
+impl BuildSpec {
+    #[must_use]
+    pub fn named_inputs(&self) -> &[String] {
+        match &self.inputs {
+            BuildInputs::Sources(names) => names,
+            BuildInputs::Repo | BuildInputs::Root(_) => &[],
+        }
+    }
+
+    pub(crate) fn lowered(&self, builders: &BTreeMap<String, Builder>, repo: &str) -> Result<Self> {
+        let tool = match &self.tool {
+            BuildTool::Builder(name) => {
+                let builder = builders.get(name).ok_or_else(|| {
+                    Error::Config(format!(
+                        "build needs builder `{name}`; declare `[builders.{name}]`"
+                    ))
+                })?;
+                BuildTool::Command {
+                    command: builder.command.clone(),
+                    key: builder.key.clone(),
+                }
+            }
+            command @ BuildTool::Command { .. } => command.clone(),
+        };
+        let inputs = match &self.inputs {
+            BuildInputs::Repo => BuildInputs::Root(repo.to_owned()),
+            inputs => inputs.clone(),
+        };
+        Ok(Self {
+            inputs,
+            offer: self.offer.clone(),
+            tool,
         })
     }
 }
@@ -665,12 +768,12 @@ fn classify_build(name: &str, source: &Source, build: &BuildSpec) -> Result<Remo
             "source `{name}`: `{field}` is meaningless on a `build` source"
         )));
     }
-    if build.inputs.is_empty() {
+    if matches!(&build.inputs, BuildInputs::Sources(inputs) if inputs.is_empty()) {
         return Err(Error::Config(format!(
             "source `{name}`: `build.inputs` must name at least one source"
         )));
     }
-    if build.inputs.iter().any(|input| input == name) {
+    if build.named_inputs().iter().any(|input| input == name) {
         return Err(Error::Config(format!(
             "source `{name}`: `build.inputs` cannot name the build source itself"
         )));

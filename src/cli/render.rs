@@ -333,7 +333,7 @@ pub(super) fn format_listings(listings: &[TargetListing]) -> String {
                 Member::Named(dep_target) => {
                     let _ = writeln!(out, "  via {}/{dep_target}:", group.import);
                 }
-                Member::Files => {
+                Member::Files | Member::Repo => {
                     let _ = writeln!(out, "  via {}:", group.import);
                 }
             }

@@ -4,8 +4,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use crate::config::transitive::{MEMBER_SEPARATOR, Member};
 use crate::config::{
-    BuildSpec, Config, DEFAULT_SHELL_PREFIX, HookCommand, ParsedSource, Refspec, Target,
+    BuildInputs, BuildSpec, BuildTool, Config, DEFAULT_SHELL_PREFIX, DeployMode, HookCommand,
+    ParsedSource, Refspec, Source, Target,
 };
 use crate::error::{Error, Result};
 use crate::lock::{BUILD_RESOLVED, LockedSource, encode_ref};
@@ -36,7 +38,22 @@ pub(super) struct Builds {
     pub failed: bool,
 }
 
+/// The builds one run covers: the config's own, or those composed from dependencies.
+pub(super) enum Scope<'a> {
+    Own,
+    Composed {
+        inputs: &'a BTreeMap<String, ParsedSource>,
+        instances: &'a BTreeMap<String, String>,
+    },
+}
+
 impl Builds {
+    pub fn extend(&mut self, other: Self) {
+        self.built.extend(other.built);
+        self.input_locks.extend(other.input_locks);
+        self.failed |= other.failed;
+    }
+
     pub fn route(self, routed: &mut RoutedSources) {
         for built in self.built {
             let commit = built.locked.commit.clone();
@@ -70,22 +87,40 @@ pub(super) fn run(
     parsed: &BTreeMap<String, ParsedSource>,
     backend: &dyn SourceStore,
     events: &mut SyncEvents<'_>,
+    scope: &Scope<'_>,
 ) -> Result<Builds> {
     let mut builds = Builds::default();
+    let composed = matches!(scope, Scope::Composed { .. });
     let specs: Vec<_> = parsed
         .iter()
+        .filter(|(name, _)| Member::is_namespaced(name) == composed)
         .filter_map(|(name, source)| source.build().map(|spec| (name, source, spec)))
         .collect();
     if specs.is_empty() {
         return Ok(builds);
     }
     input.sink().phase_started(Phase::Build);
+    let mut built_by_key: BTreeMap<String, ResolvedSource> = BTreeMap::new();
     for (name, source, spec) in specs {
+        let mut available = parsed.clone();
+        let spec = match scope {
+            Scope::Own => own_lowered(config, name, spec, &mut available)?,
+            Scope::Composed { inputs, .. } => {
+                available.extend(inputs.iter().map(|(k, v)| (k.clone(), v.clone())));
+                spec.clone()
+            }
+        };
+        let spec = &spec;
         let scratch = Scratch::create()?;
         let inputs = scratch.inputs();
-        let input_locks = materialize(input, config, parsed, backend, name, spec, &scratch)?;
+        let cwd = composed.then_some(scratch.path.as_path());
+        let input_locks = materialize(input, config, &available, backend, name, spec, &scratch)?;
         builds.input_locks.extend(input_locks);
-        let key = build_key(spec, &inputs)?;
+        if composed {
+            let linked = linked_input(spec, &available, config)?;
+            reject_escaping_symlinks(&inputs, linked.as_deref())?;
+        }
+        let key = build_key(spec, &inputs, cwd)?;
         let locked = effective_lock(input).and_then(|lock| {
             lock.find_entry(name, None)
                 .filter(|l| l.resolved == BUILD_RESOLVED)
@@ -99,6 +134,7 @@ pub(super) fn run(
             Some((locked, resolved)) if locked.build.as_deref() == Some(key.as_str()) => {
                 (resolved, key)
             }
+            _ if built_by_key.contains_key(&key) => (built_by_key[&key].clone(), key),
             _ if input.frozen() => {
                 return Err(Error::Lock(format!(
                     "build source `{name}` has no locked output for its inputs; \
@@ -107,7 +143,7 @@ pub(super) fn run(
             }
             previous => {
                 let output = scratch.path.join("output");
-                match execute(name, spec, &inputs, &output, backend) {
+                match execute(name, spec, &inputs, &output, cwd, backend) {
                     Ok(resolved) => (resolved, key),
                     Err(error) => {
                         let Some((locked, resolved)) = previous else {
@@ -123,6 +159,7 @@ pub(super) fn run(
                 }
             }
         };
+        built_by_key.insert(key.clone(), resolved.clone());
         let commit = resolved.snapshot.commit().to_string();
         builds.built.push(Built {
             name: name.clone(),
@@ -134,7 +171,10 @@ pub(super) fn run(
                 digest: selected_source_digest(backend, &resolved, source)?,
                 config_digest: source.config_digest(),
                 r#ref: None,
-                instance: None,
+                instance: match scope {
+                    Scope::Own => None,
+                    Scope::Composed { instances, .. } => instances.get(name).cloned(),
+                },
                 build: Some(key),
             },
             resolved,
@@ -157,20 +197,31 @@ fn materialize(
     let inputs = scratch.inputs();
     let mut config = config.clone();
     config.hooks = None;
-    config.targets = spec
-        .inputs
+    let anchors: Vec<(String, PathBuf, &String)> = match &spec.inputs {
+        BuildInputs::Sources(names) => names
+            .iter()
+            .map(|source| (source.clone(), inputs.join(source), source))
+            .collect(),
+        BuildInputs::Root(source) => vec![("input".to_owned(), inputs.clone(), source)],
+        BuildInputs::Repo => {
+            return Err(Error::Config(format!(
+                "build `{name}`: its repo input was never resolved"
+            )));
+        }
+    };
+    config.targets = anchors
         .iter()
-        .map(|source| {
-            let transitive = parsed.get(source).is_some_and(ParsedSource::is_transitive);
+        .map(|(target, path, source)| {
+            let transitive = parsed.get(*source).is_some_and(ParsedSource::is_transitive);
             Ok((
-                source.clone(),
-                anchor(&inputs.join(source), source, transitive)?,
+                target.clone(),
+                anchor(path, source, transitive, spec.offer.as_deref())?,
             ))
         })
         .collect::<Result<_>>()?;
     let mut parsed: BTreeMap<_, _> = parsed
         .iter()
-        .filter(|(source, _)| spec.inputs.contains(source))
+        .filter(|(source, _)| anchors.iter().any(|(_, _, s)| s == source))
         .map(|(source, parsed)| (source.clone(), parsed.clone()))
         .collect();
     let mut remotes = resolved_remotes(&config, &parsed)?;
@@ -235,7 +286,7 @@ fn materialize(
         .collect())
 }
 
-fn anchor(path: &Path, source: &str, transitive: bool) -> Result<Target> {
+fn anchor(path: &Path, source: &str, transitive: bool, offer: Option<&str>) -> Result<Target> {
     let mut table = toml::value::Table::new();
     table.insert(
         "path".to_owned(),
@@ -245,14 +296,74 @@ fn anchor(path: &Path, source: &str, transitive: bool) -> Result<Target> {
     if !transitive {
         binding.insert("collapse".to_owned(), toml::Value::Boolean(false));
     }
+    if let Some(offer) = offer.filter(|_| transitive) {
+        binding.insert("offer".to_owned(), toml::Value::String(offer.to_owned()));
+    }
+    binding.insert("source".to_owned(), toml::Value::String(source.to_owned()));
     let mut sources = toml::value::Table::new();
-    sources.insert(source.to_owned(), toml::Value::Table(binding));
+    sources.insert("input".to_owned(), toml::Value::Table(binding));
     table.insert("sources".to_owned(), toml::Value::Table(sources));
     let mut target: Target = toml::Value::Table(table)
         .try_into()
         .map_err(|e| Error::Config(format!("build input `{source}`: {e}")))?;
     target.lower_transitive(|_| transitive);
     Ok(target)
+}
+
+fn own_lowered(
+    config: &Config,
+    name: &str,
+    spec: &BuildSpec,
+    available: &mut BTreeMap<String, ParsedSource>,
+) -> Result<BuildSpec> {
+    let repo = format!("{name}{MEMBER_SEPARATOR}repo");
+    if spec.inputs == BuildInputs::Repo {
+        let source: Source = toml::from_str("path = \".\"\ndeploy = \"link\"\ntransitive = true\n")
+            .map_err(|e| Error::Config(format!("build `{name}`: {e}")))?;
+        available.insert(repo.clone(), ParsedSource::parse(&repo, &source)?);
+    }
+    spec.lowered(&config.builders, &repo)
+        .map_err(|e| Error::Config(format!("source `{name}`: {e}")))
+}
+
+fn linked_input(
+    spec: &BuildSpec,
+    available: &BTreeMap<String, ParsedSource>,
+    config: &Config,
+) -> Result<Option<PathBuf>> {
+    let BuildInputs::Root(name) = &spec.inputs else {
+        return Ok(None);
+    };
+    let Some(source) = available
+        .get(name)
+        .filter(|s| s.deploy_mode() == DeployMode::Link)
+    else {
+        return Ok(None);
+    };
+    let root = source.resolved_remote(&config.hosts, crate::config::Protocol::Https)?;
+    Ok(Some(std::fs::canonicalize(&root)?))
+}
+
+/// Links may resolve only inside `root` or the working tree the consumer linked.
+fn reject_escaping_symlinks(root: &Path, linked: Option<&Path>) -> Result<()> {
+    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+        let entry = entry.map_err(|e| Error::Sync(format!("walk {}: {e}", root.display())))?;
+        if !entry.path_is_symlink() {
+            continue;
+        }
+        let resolved = std::fs::canonicalize(entry.path());
+        let contained = resolved.as_deref().is_ok_and(|path| {
+            path.starts_with(root) || linked.is_some_and(|linked| path.starts_with(linked))
+        });
+        if !contained {
+            return Err(Error::Sync(format!(
+                "dependency build: symlink {} resolves outside {}",
+                entry.path().display(),
+                root.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Output symlinks are captured as the files they point to: a linked input is live
@@ -262,22 +373,31 @@ fn execute(
     spec: &BuildSpec,
     inputs: &Path,
     output: &Path,
+    cwd: Option<&Path>,
     backend: &dyn SourceStore,
 ) -> Result<ResolvedSource> {
+    let (command, _) = commands(spec)?;
     std::fs::create_dir_all(output)
         .map_err(|e| Error::Sync(format!("create build output {}: {e}", output.display())))?;
-    let status = hooks::command(&spec.command)?
+    let mut process = hooks::command(command)?;
+    if let Some(cwd) = cwd {
+        process.current_dir(cwd);
+    }
+    let status = process
         .env("PHORA_INPUT", inputs)
         .env("PHORA_OUTPUT", output)
         .env("PHORA_SOURCE", name)
         .stdout(Stdio::from(std::io::stderr()))
         .status()
-        .map_err(|e| Error::Sync(format!("run `{}`: {e}", spec.command.display())))?;
+        .map_err(|e| Error::Sync(format!("run `{}`: {e}", command.display())))?;
     if !status.success() {
         return Err(Error::Sync(format!(
             "`{}` exited with {status}",
-            spec.command.display()
+            command.display()
         )));
+    }
+    if cwd.is_some() {
+        reject_escaping_symlinks(output, None)?;
     }
     backend
         .resolve(
@@ -310,16 +430,30 @@ fn pinned_output(backend: &dyn SourceStore, name: &str, commit: &str) -> Result<
         .map_err(Into::into)
 }
 
-fn build_key(spec: &BuildSpec, inputs: &Path) -> Result<String> {
+fn commands(spec: &BuildSpec) -> Result<(&HookCommand, Option<&HookCommand>)> {
+    match &spec.tool {
+        BuildTool::Command { command, key } => Ok((command, key.as_ref())),
+        BuildTool::Builder(builder) => Err(Error::Config(format!(
+            "build names builder `{builder}`, which was never resolved"
+        ))),
+    }
+}
+
+fn build_key(spec: &BuildSpec, inputs: &Path, cwd: Option<&Path>) -> Result<String> {
+    let (command, key) = commands(spec)?;
     let mut hasher = blake3::Hasher::new();
     let mut field = |bytes: &[u8]| {
         hasher.update(&(bytes.len() as u64).to_le_bytes());
         hasher.update(bytes);
     };
     field(b"phora build key v1");
-    command_fields(&spec.command, &mut field);
-    if let Some(key) = &spec.key {
-        let output = hooks::command(key)?
+    command_fields(command, &mut field);
+    if let Some(key) = key {
+        let mut process = hooks::command(key)?;
+        if let Some(cwd) = cwd {
+            process.current_dir(cwd);
+        }
+        let output = process
             .stderr(Stdio::inherit())
             .output()
             .map_err(|e| Error::Sync(format!("run build key `{}`: {e}", key.display())))?;

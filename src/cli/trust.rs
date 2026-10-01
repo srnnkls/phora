@@ -198,7 +198,7 @@ fn commit_stable_hook_key(hook_id: &str) -> String {
     let (head, tail) = hook_id.split_once('#').unwrap_or((hook_id, ""));
     match Member::of(head) {
         Some(Member::Named(dep_target)) => format!("{dep_target}#{tail}"),
-        Some(Member::Files) | None => format!("{head}#{tail}"),
+        Some(Member::Files | Member::Repo) | None => format!("{head}#{tail}"),
     }
 }
 
