@@ -3,6 +3,7 @@
 use std::fmt::Write;
 
 use crate::config::ParsedSource;
+use crate::config::transitive::Member;
 use crate::error::{Error, Result};
 use crate::projection::diagnostic::ProjectionWarning;
 use crate::sync::inspect::ArtifactState;
@@ -26,7 +27,7 @@ pub(super) fn format_sync_warning(warning: &SyncWarning) -> Option<String> {
              falling back to per-leaf links"
         ),
         SyncWarning::MalformedTransitiveHooks { target, detail } => format!(
-            "phora: imported dep target `{target}`: malformed `[targets.{target}.hooks]`: {detail}"
+            "phora: dependency target `{target}`: malformed `[targets.{target}.hooks]`: {detail}"
         ),
         SyncWarning::LinkPathNotPortable { source, path } => format!(
             "phora: source `{source}`: deploy = \"link\" uses the absolute path `{}`, which is \
@@ -34,7 +35,7 @@ pub(super) fn format_sync_warning(warning: &SyncWarning) -> Option<String> {
             path.display()
         ),
         SyncWarning::UnboundSource { source } => {
-            format!("phora: source `{source}` is bound by no target, import, or build")
+            format!("phora: source `{source}` is bound by no target or build")
         }
         SyncWarning::ReferenceMoved {
             source,
@@ -328,7 +329,14 @@ pub(super) fn format_listings(listings: &[TargetListing]) -> String {
             );
         }
         for group in &listing.composed {
-            let _ = writeln!(out, "  via {}/{}:", group.import, group.dep_target);
+            match &group.member {
+                Member::Named(dep_target) => {
+                    let _ = writeln!(out, "  via {}/{dep_target}:", group.import);
+                }
+                Member::Files => {
+                    let _ = writeln!(out, "  via {}:", group.import);
+                }
+            }
             for artifact in &group.artifacts {
                 let _ = writeln!(
                     out,
@@ -759,41 +767,51 @@ pub(super) fn state_label(state: &ArtifactState) -> &'static str {
     }
 }
 
-/// Summarizes what a dep's root `phora.toml` would contribute if imported: its
-/// targets (with relative paths), any stripped/inert hooks, and the `imports` +
-/// `phora trust` opt-in. Empty for a manifest declaring neither targets nor sources.
+/// Summarizes what a dep's root `phora.toml` would contribute if bound as a transitive
+/// source: each offer's targets (with relative paths), any stripped/inert hooks, and the
+/// `transitive = true` + `phora trust` opt-in. Empty for a manifest declaring nothing.
 #[must_use]
 pub(super) fn render_add_contribution(
     name: &str,
     manifest: &crate::config::transitive::TransitiveManifest,
 ) -> String {
-    if manifest.targets.is_empty() && manifest.sources.is_empty() {
+    if manifest.offers.is_empty() && manifest.targets.is_empty() && manifest.sources.is_empty() {
         return String::new();
     }
-
-    let hooked: std::collections::BTreeSet<&str> = manifest
-        .hooks()
-        .and_then(toml::Value::as_table)
-        .map(|t| t.keys().map(String::as_str).collect())
-        .unwrap_or_default();
 
     let mut out = String::new();
     let _ = writeln!(
         out,
         "Source '{name}' ships a phora.toml that would contribute:"
     );
-    for (target, config) in &manifest.targets {
-        let _ = writeln!(out, "  [targets.{target}] -> {}", config.path.display());
-        if hooked.contains(target.as_str()) {
-            let _ = writeln!(
-                out,
-                "    note: carries a hook, stripped and inert until you `phora trust` it"
-            );
+    let hooked: std::collections::BTreeSet<&str> = manifest
+        .hooks()
+        .and_then(toml::Value::as_table)
+        .map(|t| t.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    for offer_name in manifest.offer_names() {
+        let _ = writeln!(out, "  offer `{offer_name}`");
+        let offer = match manifest.offer(offer_name) {
+            Ok(offer) => offer,
+            Err(error) => {
+                let _ = writeln!(out, "    error: {error}");
+                continue;
+            }
+        };
+        for (target, config) in &offer.targets {
+            let _ = writeln!(out, "    [targets.{target}] -> {}", config.path.display());
+            if hooked.contains(target.as_str()) {
+                let _ = writeln!(
+                    out,
+                    "      note: carries a hook, stripped and inert until you `phora trust` it"
+                );
+            }
         }
     }
     let _ = writeln!(
         out,
-        "Opt in with `imports = [\"{name}\"]`, then `phora trust` to admit any hooks."
+        "Opt in with `transitive = true` on `[sources.{name}]` and bind it from a target, \
+         then `phora trust` to admit any hooks."
     );
     out
 }
@@ -1104,7 +1122,7 @@ mod contribution_tests {
     }
 
     #[test]
-    fn contribution_summary_suggests_the_imports_and_trust_opt_in() {
+    fn contribution_summary_suggests_the_transitive_and_trust_opt_in() {
         let dep = manifest(
             "version = 1\n\n\
              [sources.nvim]\ngit = \"https://github.com/dep/nvim.git\"\n\n\
@@ -1114,8 +1132,8 @@ mod contribution_tests {
         let summary = super::render_add_contribution("dots", &dep);
 
         assert!(
-            summary.contains("imports"),
-            "the summary must point at the `imports = [...]` opt-in path, got:\n{summary}"
+            summary.contains("transitive = true"),
+            "the summary must point at the `transitive = true` opt-in, got:\n{summary}"
         );
         assert!(
             summary.contains("trust"),

@@ -227,6 +227,9 @@ pub enum Command {
         tag: Option<String>,
         #[arg(long)]
         rev: Option<String>,
+        /// Offer of a transitive source to bind; `default` when omitted.
+        #[arg(long)]
+        offer: Option<String>,
     },
     /// Remove one or more bindings from a target by their identity.
     Unbind {
@@ -595,6 +598,7 @@ fn dispatch_bind(cmd: Command) -> Result<()> {
         branch,
         tag,
         rev,
+        offer,
     } = cmd
     else {
         unreachable!("dispatch_bind only handles Command::Bind")
@@ -614,6 +618,7 @@ fn dispatch_bind(cmd: Command) -> Result<()> {
                 .map(|t| config_edit::TakeArg::parse(t))
                 .collect(),
             history,
+            offer,
         },
     )
 }
@@ -782,7 +787,7 @@ fn load_local_config(cwd: &Path) -> Result<Option<Config>> {
     let path = cwd.join("phora.local.toml");
     match std::fs::read_to_string(&path) {
         Ok(text) => {
-            let config = Config::parse(&text)?;
+            let config = Config::parse_local(&text)?;
             for warning in config.migration_warnings(cwd) {
                 eprintln!("phora: phora.local.toml: {warning}");
             }

@@ -172,14 +172,14 @@ fn sync_without_frozen_flag_defaults_to_false() {
 #[test]
 fn trust_parses_source_positional() {
     use clap::Parser;
-    let cli = Cli::try_parse_from(["phora", "trust", "mydeps"])
+    let cli = Cli::try_parse_from(["phora", "trust", "nvim-kit"])
         .expect("`phora trust <source>` must parse");
     let Command::Trust { source, .. } = cli.command else {
         panic!("expected Command::Trust");
     };
     assert_eq!(
         source.as_deref(),
-        Some("mydeps"),
+        Some("nvim-kit"),
         "the positional must bind to the source name being inspected"
     );
 }
@@ -198,7 +198,7 @@ fn trust_list_flag_parses_to_true() {
 #[test]
 fn trust_revoke_flag_parses_to_true() {
     use clap::Parser;
-    let cli = Cli::try_parse_from(["phora", "trust", "mydeps", "--revoke"])
+    let cli = Cli::try_parse_from(["phora", "trust", "nvim-kit", "--revoke"])
         .expect("`phora trust <source> --revoke` must parse");
     let Command::Trust { revoke, .. } = cli.command else {
         panic!("expected Command::Trust");
@@ -209,14 +209,14 @@ fn trust_revoke_flag_parses_to_true() {
 #[test]
 fn trust_show_flag_parses_path_argument() {
     use clap::Parser;
-    let cli = Cli::try_parse_from(["phora", "trust", "mydeps", "--show", "some/path"])
+    let cli = Cli::try_parse_from(["phora", "trust", "nvim-kit", "--show", "some/path"])
         .expect("`phora trust <source> --show <path>` must parse");
     let Command::Trust { source, show, .. } = cli.command else {
         panic!("expected Command::Trust");
     };
     assert_eq!(
         source.as_deref(),
-        Some("mydeps"),
+        Some("nvim-kit"),
         "the positional still binds the inspected source name"
     );
     assert_eq!(
@@ -230,7 +230,7 @@ fn trust_show_flag_parses_path_argument() {
 fn trust_without_show_defaults_to_none() {
     use clap::Parser;
     let cli =
-        Cli::try_parse_from(["phora", "trust", "mydeps"]).expect("bare `phora trust` must parse");
+        Cli::try_parse_from(["phora", "trust", "nvim-kit"]).expect("bare `phora trust` must parse");
     let Command::Trust { show, .. } = cli.command else {
         panic!("expected Command::Trust");
     };
@@ -244,7 +244,7 @@ fn trust_without_show_defaults_to_none() {
 fn trust_without_flags_defaults_list_and_revoke_false() {
     use clap::Parser;
     let cli =
-        Cli::try_parse_from(["phora", "trust", "mydeps"]).expect("bare `phora trust` must parse");
+        Cli::try_parse_from(["phora", "trust", "nvim-kit"]).expect("bare `phora trust` must parse");
     let Command::Trust { list, revoke, .. } = cli.command else {
         panic!("expected Command::Trust");
     };

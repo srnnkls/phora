@@ -2,6 +2,6 @@ exit: 0
 --- stdout ---
 sync complete
 --- stderr ---
-phora: source `dotfiles` is bound by no target, import, or build
+phora: source `dotfiles` is bound by no target or build
 phora: pruning orphaned dotfiles:editor
 phora: pruning orphaned dotfiles:lint

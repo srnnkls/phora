@@ -92,7 +92,7 @@ after the completion line reverses these exact lines and fails this assertion.
 
 ```scrut
 $ phora sync 2>&1 | normalize
-phora: source `dotfiles` is bound by no target, import, or build
+phora: source `dotfiles` is bound by no target or build
 phora: 2 orphaned record(s) with no config target — run `phora list --orphans` to inspect, `phora sync --prune` to remove
 sync complete
 ```

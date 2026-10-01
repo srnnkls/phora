@@ -9,7 +9,7 @@ mod common;
 
 /// Named-diagnostic contract phrases the confinement layer must own; each test asserts
 /// the one phrase for its vector, never a disjunction of attacker substrings.
-const CONFINE_LINK_REJECTED: &str = "transitive source cannot use deploy = \"link\"";
+const CONFINE_LINK_REJECTED: &str = "a linked source";
 const CONFINE_SYMLINK_ANCESTOR: &str = "anchor ancestor is a symlink";
 const CONFINE_PROTECTED_PATH: &str = "protected path";
 /// Phrase owned by the orthogonal foreign-content guard; a CONFINE pass must NOT be attributable to it.
@@ -108,7 +108,7 @@ fn commit_repo(dir: &Path, files: &[(&str, &str)], manifest: &str) {
 fn reject_unknown_field_stub(stderr: &str) {
     assert!(
         !stderr.contains("unknown field"),
-        "`transitive`/`imports` must drive real composition, not be rejected by \
+        "`transitive`/`offers` must drive real composition, not be rejected by \
          deny_unknown_fields; got a parse stub: {stderr}"
     );
 }
@@ -121,8 +121,8 @@ fn leaf_repo(dir: &Path, file: &str, body: &str) {
 /// supplied verbatim so each test crafts its own escape vector.
 fn consumer_with_dep(dep_dir: &Path) -> String {
     format!(
-        "version = 1\n\n[sources.mydeps]\ngit = \"{dep}\"\ntransitive = true\n\n\
-         [targets.dotcfg]\npath = \"~/.config\"\nimports = [\"mydeps\"]\n",
+        "version = 1\n\n[sources.nvim-kit]\ngit = \"{dep}\"\ntransitive = true\n\n\
+         [targets.xdg-config]\npath = \"~/.config\"\nsources = [\"nvim-kit\"]\n",
         dep = dep_dir.display(),
     )
 }
@@ -183,7 +183,8 @@ fn transitive_source_declaring_deploy_link_is_rejected() {
     let dep = TempDir::new().expect("dep repo");
     let dep_manifest = "version = 1\n\n\
          [sources.editor]\ngit = \"https://github.com/mock/leaf.git\"\ndeploy = \"link\"\ninclude = [\"pkg\"]\n\n\
-         [targets.nvim]\npath = \"nvim\"\nsources = [\"editor\"]\n";
+         [targets.nvim]\npath = \"nvim\"\nsources = [\"editor\"]\n\n\
+         [offers.default]\ntargets = [\"nvim\"]\n";
     commit_repo(dep.path(), &[], dep_manifest);
 
     let mut fixture = build_fixture();
@@ -210,6 +211,35 @@ fn transitive_source_declaring_deploy_link_is_rejected() {
     assert!(
         !meta.is_ok_and(|m| m.file_type().is_symlink()),
         "no symlink may be emitted for a rejected transitive link source"
+    );
+}
+
+#[test]
+fn the_default_offer_skips_a_dependency_target_bound_to_a_linked_source() {
+    let leaf = TempDir::new().expect("leaf repo");
+    leaf_repo(leaf.path(), "leaf.txt", "payload\n");
+
+    let dep = TempDir::new().expect("dep repo");
+    let dep_manifest = "version = 1\n\n\
+         [sources.editor]\ngit = \"https://github.com/mock/leaf.git\"\ndeploy = \"link\"\ninclude = [\"pkg\"]\n\n\
+         [targets.nvim]\npath = \"nvim\"\nsources = [\"editor\"]\n";
+    commit_repo(dep.path(), &[], dep_manifest);
+
+    let mut fixture = build_fixture();
+    fixture.map_url("https://github.com/mock/leaf.git", leaf.path());
+    fixture.finish_gitconfig();
+    let config = consumer_with_dep(dep.path());
+    write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());
+
+    let out = run(&fixture, &["sync"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        std::fs::symlink_metadata(fixture.home_path.join(".config/nvim")).is_err(),
+        "a target bound to a linked source is local-only and never composed"
     );
 }
 
@@ -258,8 +288,8 @@ fn dep_cannot_write_into_the_consumer_cwd_git_directory() {
     fixture.map_url("https://github.com/mock/leaf.git", leaf.path());
     fixture.finish_gitconfig();
     let config = format!(
-        "version = 1\n\n[sources.mydeps]\ngit = \"{dep}\"\ntransitive = true\n\n\
-         [targets.root]\npath = \".\"\nimports = [\"mydeps\"]\n",
+        "version = 1\n\n[sources.nvim-kit]\ngit = \"{dep}\"\ntransitive = true\n\n\
+         [targets.root]\npath = \".\"\nsources = [\"nvim-kit\"]\n",
         dep = dep.path().display(),
     );
     write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());

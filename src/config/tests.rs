@@ -39,8 +39,8 @@ fn unbound_sources_counts_keyed_source_import_and_build_references() {
          [sources.dep]\ngit = \"g\"\ntransitive = true\n\n\
          [sources.input]\npath = \"in\"\n\n\
          [sources.built]\nbuild = { inputs = [\"input\"], run = \"true\" }\n\n\
-         [targets.t]\npath = \"~/t\"\nimports = [\"dep\"]\n\n\
-         [targets.t.sources]\nkeyed = {}\nalias = { source = \"aliased\" }\nbuilt = {}\n",
+         [targets.t]\npath = \"~/t\"\n\n\
+         [targets.t.sources]\nkeyed = {}\nalias = { source = \"aliased\" }\nbuilt = {}\ndep = {}\n",
     )
     .expect("config parses");
     config.validate().expect("config validates");
@@ -3005,7 +3005,7 @@ branch = "main"
 transitive = true
 [targets.tropos]
 path = ".tropos"
-imports = ["tropos"]
+sources = ["tropos"]
 "#,
     )
     .expect("base forge source parses");
@@ -3892,11 +3892,8 @@ mod per_binding_refinement {
             path: std::path::PathBuf::from("~/x"),
             layout: None,
             hooks: None,
-            imports: None,
-            take: None,
-            collapse: None,
+            offer_bindings: None,
             confine: None,
-            mount: None,
             sources: Some(BTreeMap::from([(
                 "pinned".to_owned(),
                 Binding {
@@ -3908,6 +3905,7 @@ mod per_binding_refinement {
                     take: None,
                     collapse: None,
                     history: false,
+                    offer: None,
                 },
             )])),
         };
@@ -3938,11 +3936,8 @@ mod per_binding_refinement {
             path: std::path::PathBuf::from("~/x"),
             layout: None,
             hooks: None,
-            imports: None,
-            take: None,
-            collapse: None,
+            offer_bindings: None,
             confine: None,
-            mount: None,
             sources: Some(BTreeMap::from([(
                 "pinned".to_owned(),
                 Binding {
@@ -3954,6 +3949,7 @@ mod per_binding_refinement {
                     take: None,
                     collapse: None,
                     history: false,
+                    offer: None,
                 },
             )])),
         };
@@ -6096,11 +6092,11 @@ mod parse_time_structural_validation {
     }
 
     #[test]
-    fn mount_take_table_rename_with_single_pair_parses() {
+    fn transitive_binding_take_rename_with_single_pair_parses() {
         Config::parse(
             "version = 1\n\n[sources.dep]\ngit = \"g\"\ntransitive = true\n\n\
-             [targets.t]\npath = \"~/x\"\nimports = [\"dep\"]\n\n\
-             [targets.t.take]\n\"dep\" = [{ \"a/X.md\" = \"a/x.md\" }]\n",
+             [targets.t]\npath = \"~/x\"\n\n\
+             [targets.t.sources]\ndep = { take = [{ \"a/X.md\" = \"a/x.md\" }] }\n",
         )
         .expect("a single-pair mount rename is well-formed and must still parse");
     }
@@ -6216,11 +6212,11 @@ mod parse_time_structural_validation {
     }
 
     #[test]
-    fn mount_take_with_malformed_glob_is_rejected() {
+    fn transitive_binding_take_with_malformed_glob_is_rejected() {
         let msg = parse_err(
             "version = 1\n\n[sources.dep]\ngit = \"g\"\ntransitive = true\n\n\
-             [targets.t]\npath = \"~/x\"\nimports = [\"dep\"]\n\n\
-             [targets.t.take]\n\"dep\" = [\"[\"]\n",
+             [targets.t]\npath = \"~/x\"\n\n\
+             [targets.t.sources]\ndep = { take = [\"[\"] }\n",
         );
         assert!(
             msg.contains("take")
@@ -6234,11 +6230,11 @@ mod parse_time_structural_validation {
     }
 
     #[test]
-    fn mount_take_with_well_formed_glob_parses() {
+    fn transitive_binding_take_with_well_formed_glob_parses() {
         Config::parse(
             "version = 1\n\n[sources.dep]\ngit = \"g\"\ntransitive = true\n\n\
-             [targets.t]\npath = \"~/x\"\nimports = [\"dep\"]\n\n\
-             [targets.t.take]\n\"dep\" = [\"skills/**\"]\n",
+             [targets.t]\npath = \"~/x\"\n\n\
+             [targets.t.sources]\ndep = { take = [\"skills/**\"] }\n",
         )
         .expect("a well-formed mount take glob `skills/**` must parse (no over-rejection)");
     }

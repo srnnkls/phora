@@ -62,9 +62,8 @@ impl TargetRun<'_> {
     }
 }
 
-/// `%` marks the namespaced key minted by `transitive::namespaced_key`.
 pub(super) fn is_composed_target(target_name: &str) -> bool {
-    target_name.contains('%')
+    crate::config::transitive::Member::is_namespaced(target_name)
 }
 
 #[derive(Clone)]
@@ -1467,11 +1466,8 @@ mod confine_fail_closed_tests {
             sources: None,
             layout: None,
             hooks: None,
-            imports: None,
-            take: None,
-            collapse: None,
+            offer_bindings: None,
             confine: None,
-            mount: None,
         }
     }
 
@@ -1567,11 +1563,8 @@ mod kind_aware_layout_tests {
                 },
             }),
             hooks: None,
-            imports: None,
-            take: None,
-            collapse: None,
+            offer_bindings: None,
             confine: None,
-            mount: None,
         }
     }
 

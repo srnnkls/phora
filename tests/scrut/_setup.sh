@@ -464,7 +464,7 @@ EOF
 	printf '%s\n' "$repo"
 }
 
-# Consumer config importing the transitive dep (pinned by mock URL `$1`) into a target.
+# Consumer config binding the transitive dep (pinned by mock URL `$1`) from a target.
 seed_config_transitive() {
 	dep_url="$1"
 	target="$PWD/target-cfg"
@@ -472,13 +472,13 @@ seed_config_transitive() {
 	cat >"$PWD/phora.toml" <<EOF
 version = 1
 
-[sources.mydeps]
+[sources.nvim-kit]
 git = "$dep_url"
 transitive = true
 
-[targets.dotcfg]
+[targets.xdg-config]
 path = "$target"
-imports = ["mydeps"]
+sources = ["nvim-kit"]
 EOF
 }
 

@@ -33,16 +33,17 @@ synced
 ## `list` groups composed artifacts under the importing target
 
 The composed artifacts are recorded under a namespaced composed target; `list`
-shows them under the importing `dotcfg`, labelled by import and dep target.
+shows them under the importing `xdg-config`, labelled by import and dep target.
 
 ```scrut
 $ phora list 2>&1 | normalize
-dotcfg:
-  via mydeps/nvim:
-    editor/nvim  ✓ clean
+xdg-config:
+  via nvim-kit/nvim:
+    editor/nvim/init.lua  ✓ clean
+    editor/nvim/lua/opts.lua  ✓ clean
 ```
 
-While `dotcfg` still imports `mydeps`, its composed records are not orphans.
+While `xdg-config` still binds `nvim-kit`, its composed records are not orphans.
 
 ```scrut
 $ phora list --orphans 2>&1 | normalize
@@ -57,7 +58,7 @@ trusted commit) lists the dep-repo-relative files it composes — honoring the
 binding's `include = ["nvim"]`, so the leaf's root `phora.toml` never appears.
 
 ```scrut
-$ rm -rf "$LEAF" "$DEP" "$PWD/target-cfg" && phora trust mydeps --list 2>&1 | normalize | sed -E 's/at [0-9a-f]{7,}:/at <HASH>:/' | grep -A2 'composed files'
+$ rm -rf "$LEAF" "$DEP" "$PWD/target-cfg" && phora trust nvim-kit --list 2>&1 | normalize | sed -E 's/at [0-9a-f]{7,}:/at <HASH>:/' | grep -A2 'composed files'
   composed files at <HASH>:
     nvim/init.lua
     nvim/lua/opts.lua
@@ -68,7 +69,7 @@ $ rm -rf "$LEAF" "$DEP" "$PWD/target-cfg" && phora trust mydeps --list 2>&1 | no
 A UTF-8 file is printed verbatim, resolved offline from the mirror.
 
 ```scrut
-$ phora trust mydeps --show nvim/init.lua 2>&1 | normalize
+$ phora trust nvim-kit --show nvim/init.lua 2>&1 | normalize
 -- init
 ```
 
@@ -78,7 +79,7 @@ A directory lists its direct children without recursing; a subdirectory carries 
 trailing slash.
 
 ```scrut
-$ phora trust mydeps --show nvim 2>&1 | normalize
+$ phora trust nvim-kit --show nvim 2>&1 | normalize
 init.lua
 lua/
 ```
@@ -86,8 +87,8 @@ lua/
 ## `--show` errors clearly for an absent path
 
 ```scrut
-$ phora trust mydeps --show no/such/path 2>&1
-error: source error: no/such/path is absent at * in `mydeps` (glob)
+$ phora trust nvim-kit --show no/such/path 2>&1
+error: source error: no/such/path is absent at * in `nvim-kit` (glob)
 [1]
 ```
 

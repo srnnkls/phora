@@ -303,6 +303,7 @@ pub struct BindRefinement {
     pub rev: Option<String>,
     pub take: Vec<TakeArg>,
     pub history: bool,
+    pub offer: Option<String>,
 }
 
 impl BindRefinement {
@@ -313,6 +314,7 @@ impl BindRefinement {
             && self.rev.is_none()
             && self.take.is_empty()
             && !self.history
+            && self.offer.is_none()
     }
 }
 
@@ -335,6 +337,9 @@ fn keyed_binding_value(source: &str, identity: &str, refinement: &BindRefinement
     }
     if let Some(rev) = &refinement.rev {
         table.insert("rev", rev.as_str().into());
+    }
+    if let Some(offer) = &refinement.offer {
+        table.insert("offer", offer.as_str().into());
     }
     if !refinement.take.is_empty() {
         let mut take = Array::new();
@@ -413,6 +418,7 @@ fn merge_refinement(binding: &mut dyn toml_edit::TableLike, refinement: &BindRef
         ("branch", refinement.branch.as_deref()),
         ("tag", refinement.tag.as_deref()),
         ("rev", refinement.rev.as_deref()),
+        ("offer", refinement.offer.as_deref()),
     ] {
         if let Some(value) = value
             && binding
@@ -677,7 +683,7 @@ pub fn unbind(doc_text: &str, target: &str, identities: &[String]) -> Result<Unb
 /// Returns [`crate::error::Error::Config`] naming the dangling (target, source).
 pub fn validate_source_references(merged: &Config) -> Result<()> {
     for (target_name, target) in &merged.targets {
-        for (identity, binding) in target.sources.iter().flatten() {
+        for (identity, binding) in target.bindings() {
             let effective = binding.effective_source(identity);
             if !merged.sources.contains_key(effective) {
                 return Err(Error::Config(format!(

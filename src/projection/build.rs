@@ -6,9 +6,9 @@ use crate::projection::collapse::{CollapseChoice, CollapseMode, CollapseWarning,
 use crate::projection::diagnostic::{ProjectionError, ProjectionWarning, unsafe_leaf};
 use crate::projection::model::{
     ArtifactRelativePath, BindingAttribution, BindingProjection, BindingProjectionInput,
-    ContentTransform, LayoutSpec, Materialization, MaterializationPolicy, MountView, OfferSpec,
-    ProjectedArtifact, ProjectedLeaf, Projection, TakeSpec, TargetPath, TargetProjection,
-    TemplatePolicy, WorkspaceTargetInput,
+    ContentTransform, Materialization, MaterializationPolicy, OfferSpec, ProjectedArtifact,
+    ProjectedLeaf, Projection, TakeSpec, TargetPath, TargetProjection, TemplatePolicy,
+    WorkspaceTargetInput,
 };
 use crate::projection::offer::OfferSelection;
 use crate::projection::take::{ResolvedTake, TakeWarning, fold_dest, resolve_take};
@@ -46,10 +46,7 @@ pub fn project_binding(
     let directives = input.take.directives();
     let resolution = resolve_take(&offer, directives.as_deref())
         .map_err(|error| classify_take_error(error, &offer, input.take))?;
-    let resolved_takes = match input.mount {
-        Some(view) => narrow_to_mount(view, input.identity, input.layout, resolution.kept)?,
-        None => resolution.kept,
-    };
+    let resolved_takes = resolution.kept;
     let take_warnings = resolution.warnings;
 
     let mode = input.materialization.collapse_mode();
@@ -118,37 +115,6 @@ pub fn project_binding(
         artifacts,
         warnings,
     })
-}
-
-fn narrow_to_mount(
-    view: &MountView,
-    identity: &str,
-    layout: &LayoutSpec,
-    kept: Vec<ResolvedTake>,
-) -> std::result::Result<Vec<ResolvedTake>, ProjectionError> {
-    let selection = OfferSelection::compile(
-        view.offer.includes(),
-        view.offer.excludes(),
-        view.offer.root(),
-    )
-    .map_err(other)?;
-    Ok(kept
-        .into_iter()
-        .filter_map(|mut take| {
-            let dest = layout.artifact_path(identity, &take.dest);
-            let dest = dest.to_string_lossy();
-            let in_package = if view.path.is_empty() {
-                dest.into_owned()
-            } else {
-                format!("{}/{dest}", view.path)
-            };
-            let local = selection.select(&[in_package.as_str()]).pop()?;
-            if view.rehome {
-                take.dest = local;
-            }
-            Some(take)
-        })
-        .collect())
 }
 
 fn project_whole_root(
@@ -632,7 +598,6 @@ mod projection_builder_tests {
                 materialization: MaterializationPolicy::from(&self.source.deploy_mode()),
                 layout: &layout,
                 templates: &templates,
-                mount: None,
             })
         }
     }
@@ -958,7 +923,6 @@ mod projection_builder_tests {
                 materialization: MaterializationPolicy::Copy,
                 layout: &layout,
                 templates: &templates,
-                mount: None,
             },
             BindingProjectionInput {
                 identity: "second",
@@ -971,7 +935,6 @@ mod projection_builder_tests {
                 materialization: MaterializationPolicy::Copy,
                 layout: &layout,
                 templates: &templates,
-                mount: None,
             },
         ];
         let target = project_target("home", &inputs)
@@ -1013,7 +976,6 @@ mod projection_builder_tests {
             materialization: MaterializationPolicy::Copy,
             layout,
             templates,
-            mount: None,
         }
     }
 

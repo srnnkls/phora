@@ -55,7 +55,7 @@ pub(super) fn guard_no_dangling_references(new_text: &str, local: bool) -> Resul
 
 fn validate_merged_references(main_text: &str, local_text: &str) -> Result<()> {
     let main = crate::config::Config::parse(main_text)?;
-    let local = crate::config::Config::parse(local_text)?;
+    let local = crate::config::Config::parse_local(local_text)?;
     let merged = merge_configs(main, Some(local));
     merged.validate()?;
     config_edit::validate_source_references(&merged)

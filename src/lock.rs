@@ -1387,7 +1387,7 @@ config_digest = \"blake3:cfg\"
                 hook_id: "post-deploy".to_owned(),
                 preimage: "blake3:hookpreimage".to_owned(),
                 approved_at: "2026-06-20T00:00:00Z".to_owned(),
-                source: "mydeps".to_owned(),
+                source: "nvim-kit".to_owned(),
                 commit: "c0ffeecommit".to_owned(),
             }],
             candidate_hooks: Vec::new(),

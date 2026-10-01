@@ -136,16 +136,6 @@ impl OfferSpec {
     }
 }
 
-/// A composed target seen through its importer's offer. A destination `t` sits at
-/// `path/t` in the package tree and deploys only if `offer` selects it; with `rehome`,
-/// the target mounts at the offer root and each destination becomes root-relative.
-#[derive(Debug, Clone)]
-pub struct MountView {
-    pub path: String,
-    pub offer: OfferSpec,
-    pub rehome: bool,
-}
-
 /// A binding's `take` directive classified into a config-free spec.
 #[derive(Debug, Clone)]
 pub enum TakeSpec {
@@ -547,5 +537,4 @@ pub struct BindingProjectionInput<'a> {
     pub materialization: MaterializationPolicy,
     pub layout: &'a LayoutSpec,
     pub templates: &'a TemplatePolicy,
-    pub mount: Option<&'a MountView>,
 }

@@ -102,65 +102,46 @@ impl<'de> Deserialize<'de> for TemplateOptIn {
     }
 }
 
-/// An explicit package import. Refinements select a Git ref, never paths or remotes.
+/// A binding of a transitive source, moved out of `sources` by `lower_transitive`.
 #[derive(Debug, Clone)]
-pub struct Import {
-    pub source: String,
-    pub refspec: Option<Refspec>,
+pub struct OfferBinding {
+    pub identity: String,
+    pub binding: Binding,
 }
 
-impl<'de> Deserialize<'de> for Import {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Refined {
-            source: String,
-            branch: Option<String>,
-            tag: Option<String>,
-            rev: Option<String>,
-        }
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Wire {
-            Name(String),
-            Refined(Refined),
-        }
-        let (source, refs) = match Wire::deserialize(deserializer)? {
-            Wire::Name(source) => (source, Vec::new()),
-            Wire::Refined(value) => (
-                value.source,
-                [
-                    value.branch.map(Refspec::Branch),
-                    value.tag.map(Refspec::Tag),
-                    value.rev.map(Refspec::Rev),
-                ]
-                .into_iter()
-                .flatten()
-                .collect(),
-            ),
-        };
-        if source.is_empty() || refs.len() > 1 || refs.iter().any(|r| r.to_string().is_empty()) {
-            return Err(serde::de::Error::custom(
-                "an import needs a source and at most one nonempty branch, tag or rev",
-            ));
-        }
-        Ok(Self {
-            source,
-            refspec: refs.into_iter().next(),
-        })
+impl OfferBinding {
+    #[must_use]
+    pub fn source(&self) -> &str {
+        self.binding.effective_source(&self.identity)
     }
-}
 
-impl Import {
+    #[must_use]
+    pub fn offer(&self) -> &str {
+        self.binding.offer.as_deref().unwrap_or(DEFAULT_OFFER)
+    }
+
+    #[must_use]
+    pub fn refspec(&self) -> Option<Refspec> {
+        let binding = &self.binding;
+        [
+            binding.rev.clone().map(Refspec::Rev),
+            binding.tag.clone().map(Refspec::Tag),
+            binding.branch.clone().map(Refspec::Branch),
+        ]
+        .into_iter()
+        .flatten()
+        .next()
+    }
+
     /// Refines only the ref of an already resolved source.
     pub(crate) fn resolve(&self, source: &ParsedSource) -> crate::error::Result<ParsedSource> {
-        let Some(refspec) = &self.refspec else {
+        let Some(refspec) = self.refspec() else {
             return Ok(source.clone());
         };
         if source.mode() == super::SourceMode::Url {
             return Err(crate::error::Error::Config(format!(
-                "import `{}`: a URL source cannot select a Git ref",
-                self.source
+                "binding `{}`: a URL source cannot select a Git ref",
+                self.identity
             )));
         }
         let mut source = source.clone();
@@ -168,14 +149,17 @@ impl Import {
         source.tag = None;
         source.rev = None;
         match refspec {
-            Refspec::Branch(value) => source.branch = Some(value.clone()),
-            Refspec::Tag(value) => source.tag = Some(value.clone()),
-            Refspec::Rev(value) => source.rev = Some(value.clone()),
+            Refspec::Branch(value) => source.branch = Some(value),
+            Refspec::Tag(value) => source.tag = Some(value),
+            Refspec::Rev(value) => source.rev = Some(value),
             Refspec::Default | Refspec::None => {}
         }
         Ok(source)
     }
 }
+
+/// The offer a binding of a transitive source gets when it names none.
+pub const DEFAULT_OFFER: &str = "default";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -186,18 +170,11 @@ pub struct Target {
     pub layout: Option<LayoutConfig>,
     #[serde(default)]
     pub hooks: Option<TargetHooks>,
-    #[serde(default)]
-    pub imports: Option<Vec<Import>>,
-    #[serde(default)]
-    pub take: Option<BTreeMap<String, Vec<TakeEntry>>>,
-    #[serde(default)]
-    pub collapse: Option<BTreeMap<String, bool>>,
+    #[serde(skip)]
+    pub offer_bindings: Option<Vec<OfferBinding>>,
     /// Composition-only anchor every destination must stay under; `Some` iff this is a composed dep target.
     #[serde(skip)]
     pub confine: Option<PathBuf>,
-    /// Composition-only view through the importer's offer; `Some` iff that offer narrows the package.
-    #[serde(skip)]
-    pub mount: Option<crate::projection::model::MountView>,
 }
 
 #[derive(Debug, Clone)]
@@ -267,6 +244,8 @@ pub struct Binding {
     pub collapse: Option<bool>,
     #[serde(default)]
     pub history: bool,
+    #[serde(default)]
+    pub offer: Option<String>,
 }
 
 impl Binding {
@@ -428,21 +407,45 @@ impl Target {
             // bare [hooks] section replaces base wholesale, matching layout
             self.hooks = local.hooks;
         }
-        if local.imports.is_some() {
-            self.imports = local.imports;
-        }
-        if local.take.is_some() {
-            self.take = local.take;
-        }
-        if local.collapse.is_some() {
-            self.collapse = local.collapse;
-        }
         self
     }
 
     #[must_use]
     pub fn layout(&self) -> LayoutConfig {
         self.layout.clone().unwrap_or_default()
+    }
+
+    /// Every binding, flat and transitive, as `(identity, binding)`.
+    pub fn bindings(&self) -> impl Iterator<Item = (&str, &Binding)> {
+        self.sources
+            .iter()
+            .flatten()
+            .map(|(identity, binding)| (identity.as_str(), binding))
+            .chain(
+                self.offer_bindings
+                    .iter()
+                    .flatten()
+                    .map(|import| (import.identity.as_str(), &import.binding)),
+            )
+    }
+
+    /// Moves bindings of transitive sources into `offer_bindings`.
+    pub(crate) fn lower_transitive(&mut self, is_transitive: impl Fn(&str) -> bool) {
+        let Some(bindings) = self.sources.as_mut() else {
+            return;
+        };
+        let (moved, kept): (BTreeMap<_, _>, BTreeMap<_, _>) = std::mem::take(bindings)
+            .into_iter()
+            .partition(|(identity, binding)| is_transitive(binding.effective_source(identity)));
+        *bindings = kept;
+        if moved.is_empty() {
+            return;
+        }
+        self.offer_bindings.get_or_insert_with(Vec::new).extend(
+            moved
+                .into_iter()
+                .map(|(identity, binding)| OfferBinding { identity, binding }),
+        );
     }
 
     pub fn declared_sources(&self) -> impl Iterator<Item = &str> {
@@ -638,7 +641,7 @@ mod tests {
     use std::fmt::Write as _;
     use std::path::{Path, PathBuf};
 
-    use super::{Binding, Source, TakeEntry, Target, resolve_binding};
+    use super::{Binding, Source, TakeEntry, resolve_binding};
 
     fn binding(body: &str) -> Binding {
         toml::from_str::<Binding>(body).expect("binding DTO deserializes")
@@ -747,69 +750,6 @@ mod tests {
         assert!(
             take.is_empty(),
             "`take = []` must parse to Some(empty) (project NOTHING); got: {take:?}"
-        );
-    }
-
-    #[test]
-    fn mount_take_table_accepts_bare_imports() {
-        let target: Target = toml::from_str(
-            "path = \"~/dst\"\n\
-             imports = [\"dep-a\", \"dep-b\"]\n\
-             [take]\n\
-             \"anchor/one\" = [\"a\", { \"b/X.md\" = \"b/x.md\" }]\n\
-             \"anchor/two\" = [\"c\"]\n",
-        )
-        .expect("a target with a mount take table deserializes");
-
-        assert_eq!(
-            target.imports.as_ref().map(|imports| imports
-                .iter()
-                .map(|i| i.source.as_str())
-                .collect::<Vec<_>>()),
-            Some(vec!["dep-a", "dep-b"]),
-            "bare imports preserve their source names"
-        );
-
-        let take = target
-            .take
-            .as_ref()
-            .expect("a present mount take table parses to Some");
-        let one = take
-            .get("anchor/one")
-            .expect("the mount take table is keyed by anchor");
-        assert_eq!(
-            one.len(),
-            2,
-            "anchor/one carries both entries; got: {one:?}"
-        );
-        assert!(
-            matches!(&one[0], TakeEntry::Leaf(s) if s == "a"),
-            "anchor/one first entry is a literal leaf; got: {:?}",
-            one[0]
-        );
-        assert!(
-            matches!(&one[1], TakeEntry::Rename { src, dest } if src == "b/X.md" && dest == "b/x.md"),
-            "anchor/one second entry is a rename-map; got: {:?}",
-            one[1]
-        );
-
-        let two = take
-            .get("anchor/two")
-            .expect("anchor/two present in the table");
-        assert!(
-            matches!(two.as_slice(), [TakeEntry::Leaf(s)] if s == "c"),
-            "anchor/two carries one literal leaf; got: {two:?}"
-        );
-    }
-
-    #[test]
-    fn omitted_mount_take_table_is_empty() {
-        let target: Target =
-            toml::from_str("path = \"~/dst\"\n").expect("a bare target deserializes");
-        assert!(
-            target.take.is_none(),
-            "an omitted mount take table defaults to None (inherit, no subsetting); got: {:?}",
-            target.take
         );
     }
 
@@ -933,190 +873,6 @@ mod tests {
             resolved.collapse, None,
             "an omitted `collapse` stays None through resolution; got: {:?}",
             resolved.collapse
-        );
-    }
-
-    #[test]
-    fn mount_collapse_table_accepts_bare_imports() {
-        let target: Target = toml::from_str(
-            "path = \"~/dst\"\n\
-             imports = [\"dep-a\", \"dep-b\"]\n\
-             [collapse]\n\
-             \"anchor/one\" = true\n\
-             \"anchor/two\" = false\n",
-        )
-        .expect("a target with a mount collapse table deserializes");
-
-        assert_eq!(
-            target.imports.as_ref().map(|imports| imports
-                .iter()
-                .map(|i| i.source.as_str())
-                .collect::<Vec<_>>()),
-            Some(vec!["dep-a", "dep-b"]),
-            "bare imports preserve their source names"
-        );
-        let collapse = target
-            .collapse
-            .as_ref()
-            .expect("a present mount collapse table parses to Some");
-        assert_eq!(
-            collapse.get("anchor/one"),
-            Some(&true),
-            "the mount collapse table is keyed by anchor; got: {collapse:?}"
-        );
-        assert_eq!(
-            collapse.get("anchor/two"),
-            Some(&false),
-            "anchor/two present in the collapse table; got: {collapse:?}"
-        );
-    }
-
-    #[test]
-    fn omitted_mount_collapse_table_is_empty() {
-        let target: Target =
-            toml::from_str("path = \"~/dst\"\n").expect("a bare target deserializes");
-        assert!(
-            target.collapse.is_none(),
-            "an omitted mount collapse table defaults to None (inherit); got: {:?}",
-            target.collapse
-        );
-    }
-
-    fn target_toml(body: &str) -> Target {
-        toml::from_str::<Target>(body).expect("target DTO deserializes")
-    }
-
-    #[test]
-    fn merge_non_empty_local_collapse_table_replaces_base() {
-        let base = target_toml("path = \"~/dst\"\n[collapse]\n\"anchor/base\" = true\n");
-        let local = target_toml("path = \"~/dst\"\n[collapse]\n\"anchor/local\" = false\n");
-        let merged = base.merged_with(local);
-        let collapse = merged
-            .collapse
-            .as_ref()
-            .expect("a non-empty local collapse table merges to Some");
-        assert_eq!(
-            collapse.get("anchor/local"),
-            Some(&false),
-            "a non-empty local collapse table replaces the base wholesale; got: {collapse:?}"
-        );
-        assert!(
-            !collapse.contains_key("anchor/base"),
-            "the base collapse entry must not survive a non-empty local table; got: {collapse:?}"
-        );
-    }
-
-    #[test]
-    fn merge_omitted_local_collapse_table_inherits_base() {
-        let base = target_toml("path = \"~/dst\"\n[collapse]\n\"anchor/base\" = true\n");
-        let local = target_toml("path = \"~/dst\"\n");
-        let merged = base.merged_with(local);
-        let collapse = merged
-            .collapse
-            .as_ref()
-            .expect("an OMITTED local collapse table inherits the base table (Some), not None");
-        assert_eq!(
-            collapse.get("anchor/base"),
-            Some(&true),
-            "an omitted (None) local collapse table inherits the base collapse table unchanged; \
-             got: {collapse:?}"
-        );
-    }
-
-    #[test]
-    fn merge_explicit_empty_local_collapse_table_clears_base() {
-        let base = target_toml("path = \"~/dst\"\n[collapse]\n\"anchor/base\" = true\n");
-        let local = target_toml("path = \"~/dst\"\n[collapse]\n");
-        let merged = base.merged_with(local);
-        let collapse = merged
-            .collapse
-            .as_ref()
-            .expect("an explicit empty local `[collapse]` parses to Some(empty), not None");
-        assert!(
-            collapse.is_empty(),
-            "an explicit present-but-empty local `[collapse]` must CLEAR the base table back to \
-             take-all (Some(empty)), not be ignored as if unset; got: {collapse:?}"
-        );
-    }
-
-    #[test]
-    fn merge_non_empty_local_take_table_replaces_base() {
-        let base = target_toml("path = \"~/dst\"\n[take]\n\"anchor/base\" = [\"x\"]\n");
-        let local = target_toml("path = \"~/dst\"\n[take]\n\"anchor/local\" = [\"y\"]\n");
-        let merged = base.merged_with(local);
-        let take = merged
-            .take
-            .as_ref()
-            .expect("a non-empty local take table merges to Some");
-        assert!(
-            take.contains_key("anchor/local"),
-            "a non-empty local take table replaces the base wholesale; got: {take:?}"
-        );
-        assert!(
-            !take.contains_key("anchor/base"),
-            "the base take entry must not survive a non-empty local table; got: {take:?}"
-        );
-    }
-
-    #[test]
-    fn merge_omitted_local_take_table_inherits_base() {
-        let base = target_toml("path = \"~/dst\"\n[take]\n\"anchor/base\" = [\"x\"]\n");
-        let local = target_toml("path = \"~/dst\"\n");
-        let merged = base.merged_with(local);
-        let take = merged
-            .take
-            .as_ref()
-            .expect("an OMITTED local take table inherits the base table (Some), not None");
-        assert!(
-            take.contains_key("anchor/base"),
-            "an omitted (None) local take table inherits the base take table unchanged; \
-             got: {take:?}"
-        );
-    }
-
-    #[test]
-    fn merge_explicit_empty_local_take_table_clears_base() {
-        let base = target_toml("path = \"~/dst\"\n[take]\n\"anchor/base\" = [\"x\"]\n");
-        let local = target_toml("path = \"~/dst\"\n[take]\n");
-        let merged = base.merged_with(local);
-        let take = merged
-            .take
-            .as_ref()
-            .expect("an explicit empty local `[take]` parses to Some(empty), not None");
-        assert!(
-            take.is_empty(),
-            "an explicit present-but-empty local `[take]` must CLEAR the base table back to \
-             take-all (Some(empty)), not be ignored as if unset; got: {take:?}"
-        );
-    }
-
-    #[test]
-    fn omitted_take_table_parses_to_none_while_present_empty_parses_to_some_empty() {
-        let omitted = target_toml("path = \"~/dst\"\n");
-        assert!(
-            omitted.take.is_none(),
-            "an OMITTED mount take table must parse to None (inherit); got: {:?}",
-            omitted.take
-        );
-        assert!(
-            omitted.collapse.is_none(),
-            "an OMITTED mount collapse table must parse to None (inherit); got: {:?}",
-            omitted.collapse
-        );
-
-        let present_empty = target_toml("path = \"~/dst\"\n[take]\n[collapse]\n");
-        assert_eq!(
-            present_empty.take.as_ref().map(BTreeMap::len),
-            Some(0),
-            "a present-but-empty `[take]` must parse to Some(empty), distinct from None; got: {:?}",
-            present_empty.take
-        );
-        assert_eq!(
-            present_empty.collapse.as_ref().map(BTreeMap::len),
-            Some(0),
-            "a present-but-empty `[collapse]` must parse to Some(empty), distinct from None; \
-             got: {:?}",
-            present_empty.collapse
         );
     }
 

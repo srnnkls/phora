@@ -776,9 +776,12 @@ mod t029_source_delegation_probe {
     fn consumer(source: &str) -> (Config, BTreeMap<String, ParsedSource>) {
         let text = format!(
             "version = 1\n\n[sources.dep]\n{source}\ntransitive = true\n\n\
-             [targets.home]\npath = \"~/deploy\"\nimports = [\"dep\"]\n"
+             [targets.home]\npath = \"~/deploy\"\nsources = [\"dep\"]\n"
         );
-        let config = Config::parse(&text).expect("consumer config parses");
+        let config = crate::config::merge_configs(
+            Config::parse(&text).expect("consumer config parses"),
+            None,
+        );
         let parsed = config.parsed_sources().expect("consumer sources parse");
         (config, parsed)
     }
@@ -799,11 +802,23 @@ mod t029_source_delegation_probe {
         let (config, parsed) = consumer("git = \"https://example.test/dep.git\"");
         let graph = resolve_transitive_graph(&config, &parsed, &store, false, None)
             .expect("sync must consume the manifest supplied by the source boundary");
-        assert_eq!(graph.targets.len(), 1, "the injected boundary manifest must drive composition");
+        let composed: Vec<crate::config::transitive::Member> = graph
+            .targets
+            .iter()
+            .map(|composed| composed.member.clone())
+            .collect();
+        assert_eq!(
+            composed,
+            [
+                crate::config::transitive::Member::Files,
+                crate::config::transitive::Member::Named("boundary".to_owned())
+            ],
+            "the injected boundary manifest must drive composition alongside the own-files target"
+        );
         assert!(
-            graph.targets[0].target.path.ends_with("boundary"),
+            graph.targets[1].target.path.ends_with("boundary"),
             "the source-owned sentinel target must drive sync composition: {:?}",
-            graph.targets[0].target.path
+            graph.targets[1].target.path
         );
         assert_eq!(T029_ACQUIRE_CALLS.load(Ordering::SeqCst), 1);
         assert_eq!(T029_VALIDATE_CALLS.load(Ordering::SeqCst), 1);
@@ -826,7 +841,7 @@ mod t029_source_delegation_probe {
         let (config, parsed) = consumer("path = \"/etc\"");
         let graph = resolve_transitive_graph(&config, &parsed, &store, false, None)
             .expect("the source boundary override must be authoritative; duplicate sync confinement would reject");
-        assert!(graph.targets[0].target.path.ends_with("boundary"));
+        assert!(graph.targets[1].target.path.ends_with("boundary"));
         assert_eq!(T029_ACQUIRE_CALLS.load(Ordering::SeqCst), 1);
         assert_eq!(T029_VALIDATE_CALLS.load(Ordering::SeqCst), 1);
         assert_eq!(
@@ -1369,6 +1384,9 @@ fn macro_expressions(invocation: &Macro) -> Result<Vec<Expr>, ()> {
         "assert"
             | "assert_eq"
             | "assert_ne"
+            | "debug_assert"
+            | "debug_assert_eq"
+            | "debug_assert_ne"
             | "dbg"
             | "eprint"
             | "eprintln"
@@ -1914,8 +1932,11 @@ impl<'ast> Visit<'ast> for FunctionFacts<'_> {
                     .iter()
                     .any(|argument| self.expression_is_source_backend(argument));
             self.reads_source_file |= source_backend_ufcs || source_backend_argument;
-            self.decodes_transitive_manifest |= path_mentions(&function.path, "TransitiveManifest")
-                || path_arguments_mention(&function.path, "TransitiveManifest")
+            let local_constructor =
+                path_ends_with(&function.path, &["TransitiveManifest", "local"]);
+            self.decodes_transitive_manifest |= !local_constructor
+                && (path_mentions(&function.path, "TransitiveManifest")
+                    || path_arguments_mention(&function.path, "TransitiveManifest"))
                 || function
                     .qself
                     .as_ref()
@@ -3319,11 +3340,12 @@ fn source_transitive_carve_preserves_manifest_and_remote_behavior() {
     let escaping_dep = tempfile::TempDir::new().expect("escaping dependency");
     commit_transitive_manifest(
         escaping_dep.path(),
-        "[sources.private]\npath = \"/etc\"\n",
+        "[sources.private]\ngit = \"/etc\"\n\n\
+         [targets.private]\npath = \"private\"\nsources = [\"private\"]\n",
         "version = 2\n",
     );
     let escaping = format!(
-        "[sources.dep]\npath = {:?}\ntransitive = true\n\n[targets.home]\npath = \"~/deploy\"\nimports = [\"dep\"]\n",
+        "[sources.dep]\npath = {:?}\ntransitive = true\n\n[targets.home]\npath = \"~/deploy\"\nsources = [\"dep\"]\n",
         escaping_dep.path().to_string_lossy(),
     );
     write_fixture(&rejected.cwd.path().join("phora.toml"), escaping.as_bytes());
@@ -3346,13 +3368,13 @@ fn source_transitive_carve_preserves_manifest_and_remote_behavior() {
     let dep = tempfile::TempDir::new().expect("dep repo");
     commit_transitive_manifest(
         dep.path(),
-        "version = 1\n",
+        "version = 1\n\n[offers.default]\n",
         "this is deliberately not a valid lock\npreimage = \"blake3:evil\"\n",
     );
     let isolated = transitive_fixture();
     let consumer = format!(
         "version = 1\n\n[sources.dep]\ngit = {remote:?}\ntransitive = true\n\n\
-         [targets.home]\npath = \"~/deploy\"\nimports = [\"dep\"]\n",
+         [targets.home]\npath = \"~/deploy\"\nsources = [\"dep\"]\n",
         remote = dep.path().to_string_lossy(),
     );
     write_fixture(&isolated.cwd.path().join("phora.toml"), consumer.as_bytes());

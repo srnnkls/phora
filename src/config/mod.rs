@@ -30,8 +30,8 @@ pub use host::{AuthConfig, Host, RemoteConfig, builtin_forges};
 pub use migrate::MigrationWarning;
 pub use source::{BuildSpec, DeployMode, Offer, ParsedSource, Refspec, Remote, Source, SourceMode};
 pub use target::{
-    Binding, Import, LayoutConfig, LayoutKind, ResolvedBinding, SourceFields, TakeEntry, Target,
-    TemplateOptIn,
+    Binding, DEFAULT_OFFER, LayoutConfig, LayoutKind, OfferBinding, ResolvedBinding, SourceFields,
+    TakeEntry, Target, TemplateOptIn,
 };
 
 fn expand_home(path: &Path) -> PathBuf {
@@ -94,6 +94,9 @@ pub struct Config {
     pub hooks: Option<GlobalHooks>,
     #[serde(default)]
     pub vars: BTreeMap<String, String>,
+    /// What this repo publishes to configs that bind it as a transitive source.
+    #[serde(default)]
+    pub offers: BTreeMap<String, transitive::ManifestOffer>,
 }
 
 impl Config {
@@ -126,6 +129,17 @@ impl Config {
         Ok(config)
     }
 
+    pub(crate) fn parse_local(s: &str) -> Result<Self> {
+        let config = Self::parse(s)?;
+        if !config.offers.is_empty() {
+            return Err(Error::Config(
+                "phora.local.toml cannot declare `[offers]`; offers publish what phora.toml commits"
+                    .to_owned(),
+            ));
+        }
+        Ok(config)
+    }
+
     /// Post-merge validation: host references resolve, the effective protocol has
     /// a matching remote template, and every source resolves to exactly one mode.
     ///
@@ -135,7 +149,29 @@ impl Config {
     /// a protocol its host's `remote` does not provide, or does not resolve to a
     /// single complete mode (git, or host+path).
     pub fn validate(&self) -> Result<()> {
+        if let Some(key) =
+            transitive::unnamespaceable_key(self.sources.keys().chain(self.targets.keys()))
+        {
+            return Err(Error::Config(format!(
+                "key `{key}` cannot contain `{}`",
+                transitive::MEMBER_SEPARATOR
+            )));
+        }
         for (name, source) in &self.sources {
+            if source.is_transitive()
+                && let Some(key) = [
+                    ("root", source.root.is_some()),
+                    ("include", source.include.is_some()),
+                    ("exclude", source.exclude.is_some()),
+                ]
+                .into_iter()
+                .find_map(|(key, set)| set.then_some(key))
+            {
+                return Err(Error::Config(format!(
+                    "source `{name}`: a transitive source cannot set `{key}`; its manifest declares \
+                     the offers, and a binding selects one with `offer`"
+                )));
+            }
             let parsed = ParsedSource::parse(name, source)?;
             let Remote::Host {
                 host: host_name,
@@ -172,8 +208,9 @@ impl Config {
             }
         }
         self.validate_bindings()?;
-        self.validate_imports()?;
+        self.validate_transitive_sources_are_bound()?;
         self.validate_builds()?;
+        self.validate_offers()?;
         Ok(())
     }
 
@@ -206,95 +243,63 @@ impl Config {
             .any(|b| b.inputs.iter().any(|i| i == name))
     }
 
-    fn validate_imports(&self) -> Result<()> {
-        for (target_name, target) in &self.targets {
-            for import in target.imports.iter().flatten() {
-                let imported = &import.source;
-                let Some(source) = self.sources.get(imported) else {
-                    return Err(Error::Config(format!(
-                        "target `{target_name}`: imports references undefined source `{imported}`"
-                    )));
-                };
-                if source.url.is_some() && import.refspec.is_some() {
-                    return Err(Error::Config(format!(
-                        "import `{imported}`: a URL source cannot select a Git ref"
-                    )));
-                }
-                if !source.is_transitive() {
-                    return Err(Error::Config(format!(
-                        "target `{target_name}`: imports `{imported}` requires a transitive source \
-                         (set `transitive = true` on `[sources.{imported}]`); a flat source cannot be mounted"
-                    )));
-                }
-                if target.declared_sources().any(|s| s == imported) {
-                    return Err(Error::Config(format!(
-                        "target `{target_name}`: source `{imported}` is referenced by both imports \
-                         (mount) and sources (flat-bind); a source may only be one or the other"
-                    )));
-                }
-            }
-        }
-        self.validate_transitive_sources_are_mounted()?;
-        Ok(())
-    }
-
     /// A flat fetch bypasses the recursive pre-pass, so a `transitive = true` source that
-    /// no target imports is a silent downgrade past escape-remote rejection and depth fail-fast.
-    fn validate_transitive_sources_are_mounted(&self) -> Result<()> {
+    /// no target binds is a silent downgrade past escape-remote rejection and depth fail-fast.
+    fn validate_transitive_sources_are_bound(&self) -> Result<()> {
         for (name, source) in &self.sources {
-            if !source.is_transitive() {
+            if !source.is_transitive() || self.is_bound_anywhere(name) || self.is_build_input(name)
+            {
                 continue;
-            }
-            if self.is_imported_anywhere(name) || self.is_build_input(name) {
-                continue;
-            }
-            if let Some(target_name) = self.flat_binder_of(name) {
-                return Err(Error::Config(format!(
-                    "source `{name}` is `transitive = true` but flat-bound by target \
-                     `{target_name}` via `sources` and never imported; a transitive source \
-                     must be mounted via a target's `imports`, not flat-bound"
-                )));
             }
             return Err(Error::Config(format!(
-                "source `{name}` is `transitive = true` but no target imports it; a transitive \
-                 source must be mounted via a target's `imports` or it is never resolved"
+                "source `{name}` is `transitive = true` but no target binds it; a transitive \
+                 source must be bound by a target or it is never resolved"
             )));
         }
         Ok(())
     }
 
-    fn is_imported_anywhere(&self, name: &str) -> bool {
-        self.targets
-            .values()
-            .any(|target| target.imports.iter().flatten().any(|i| i.source == name))
+    fn validate_offers(&self) -> Result<()> {
+        for name in self
+            .offers
+            .keys()
+            .map(String::as_str)
+            .chain([DEFAULT_OFFER])
+        {
+            transitive::resolve_offer(name, &self.offers, &self.sources, &self.targets)?;
+        }
+        Ok(())
     }
 
-    /// Sources no target binds or imports and no build reads.
+    fn is_bound_anywhere(&self, name: &str) -> bool {
+        self.targets.values().any(|target| {
+            target
+                .bindings()
+                .any(|(identity, binding)| binding.effective_source(identity) == name)
+        })
+    }
+
+    /// Sources no target binds and no build reads.
     #[must_use]
     pub fn unbound_sources(&self) -> Vec<&str> {
         self.sources
             .keys()
             .map(String::as_str)
-            .filter(|name| {
-                self.flat_binder_of(name).is_none()
-                    && !self.is_imported_anywhere(name)
-                    && !self.is_build_input(name)
-            })
+            .filter(|name| !self.is_bound_anywhere(name) && !self.is_build_input(name))
             .collect()
     }
 
-    fn flat_binder_of(&self, name: &str) -> Option<&str> {
-        self.targets.iter().find_map(|(target_name, target)| {
-            target
-                .declared_sources()
-                .any(|s| s == name)
-                .then_some(target_name.as_str())
-        })
+    /// Moves every binding of a `transitive = true` source into its target's `offer_bindings`.
+    pub fn lower_transitive(&mut self) {
+        let sources = &self.sources;
+        for target in self.targets.values_mut() {
+            target.lower_transitive(|name| sources.get(name).is_some_and(Source::is_transitive));
+        }
     }
 
     fn validate_bindings(&self) -> Result<()> {
         for (target_name, target) in &self.targets {
-            for (identity, binding) in target.sources.iter().flatten() {
+            for (identity, binding) in target.bindings() {
                 if crate::source::safe_component(identity).is_err() {
                     return Err(Error::Config(format!(
                         "target `{target_name}`: binding identity `{identity}` must be a single safe path component"
@@ -311,6 +316,7 @@ impl Config {
                 reject_link_ref(effective, binding, source)?;
                 reject_history_binding_options(target_name, identity, effective, binding, source)?;
                 reject_multi_ref(effective, binding)?;
+                reject_offer_mismatch(target_name, identity, effective, binding, source)?;
             }
         }
         Ok(())
@@ -318,11 +324,8 @@ impl Config {
 
     fn reject_malformed_take_globs(&self) -> Result<()> {
         for target in self.targets.values() {
-            for binding in target.sources.iter().flatten().map(|(_, b)| b) {
+            for (_, binding) in target.bindings() {
                 reject_malformed_take_entries(binding.take.iter().flatten())?;
-            }
-            for entries in target.take.iter().flatten().map(|(_, e)| e) {
-                reject_malformed_take_entries(entries.iter())?;
             }
         }
         Ok(())
@@ -513,10 +516,9 @@ fn binding_scope_diagnostic(
     key: &str,
 ) -> crate::diagnostic::SelectionDiagnostic {
     let remedy = if key == "map" {
-        format!(
-            "rename via the target `take` table; binding-level `map` is gone, \
-             e.g. `[targets.{target_name}.take]`"
-        )
+        "rename via the binding's `take`; binding-level `map` is gone, \
+         e.g. `take = [{ \"old\" = \"new\" }]`"
+            .to_owned()
     } else {
         format!(
             "move `{key}` to the source offer on `[sources.{binding_name}]`; scope is owned by the source, not the binding"
@@ -531,6 +533,34 @@ fn binding_scope_diagnostic(
         debug_hint: Some(format!("phora explain {target_name} {binding_name}")),
         details: Vec::new(),
     }
+}
+
+fn reject_offer_mismatch(
+    target_name: &str,
+    identity: &str,
+    source_name: &str,
+    binding: &Binding,
+    source: &Source,
+) -> Result<()> {
+    let option = if source.is_transitive() {
+        if binding.template.is_some() {
+            "template"
+        } else {
+            return Ok(());
+        }
+    } else if binding.offer.is_some() {
+        "offer"
+    } else {
+        return Ok(());
+    };
+    let kind = if source.is_transitive() {
+        "transitive"
+    } else {
+        "flat"
+    };
+    Err(Error::Config(format!(
+        "target `{target_name}`: binding `{identity}` of {kind} source `{source_name}` cannot set `{option}`"
+    )))
 }
 
 fn reject_history_binding_options(
@@ -692,6 +722,12 @@ pub fn fill_template(template: &str, path: &str) -> String {
 /// Computes the effective config: `base` overlaid by `local` per spec merge semantics.
 #[must_use]
 pub fn merge_configs(base: Config, local: Option<Config>) -> Config {
+    let mut merged = overlay(base, local);
+    merged.lower_transitive();
+    merged
+}
+
+fn overlay(base: Config, local: Option<Config>) -> Config {
     let Some(local) = local else { return base };
     let mut merged = base;
     merged.version = local.version;

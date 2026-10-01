@@ -1,5 +1,5 @@
-//! An explicit import applies the importing source's own offer (`root`, `include`,
-//! `exclude`) to the package's composed tree: package files and dependency mounts alike.
+//! A binding of a transitive source composes one of its manifest's offers: the offer's own
+//! files plus the dependencies its targets place, never anything derived from paths.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -50,34 +50,39 @@ fn commit_all(repository: &Path, message: &str) {
     git(repository, &["commit", "-qm", message]);
 }
 
-fn manifest(moira_target: &str) -> String {
-    format!(
-        r#"
-[sources.tropos]
-path = "."
-include = ["skills/**", "rules/fas/**"]
-exclude = ["rules/fas/moira/"]
+fn manifest() -> String {
+    r#"
 [sources.moira]
 git = "https://example.invalid/moira.git"
 root = "rules/fas"
 [sources.loqui]
 git = "https://example.invalid/loqui.git"
 include = ["languages/**"]
-[targets.tropos]
-path = "."
-sources.tropos = {{ collapse = false }}
-{moira_target}
 [targets.loqui]
 path = "skills/loqui/reference/loqui"
-sources.loqui = {{ collapse = false }}
+sources = ["loqui"]
+[targets.moira]
+path = "rules/fas/moira"
+sources = ["moira"]
+[targets.home]
+path = "~/.never-offered"
+sources = ["loqui"]
+[offers.default]
+include = ["skills/**", "rules/fas/**"]
+[offers.fas]
+root = "rules/fas"
+targets = ["moira"]
+[offers.skills]
+include = ["skills/**"]
+targets = ["loqui"]
+[offers.bare]
+include = ["skills/**"]
+targets = []
 "#
-    )
+    .to_owned()
 }
 
-const MOIRA_TARGET: &str =
-    "[targets.moira]\npath = \"rules/fas/moira\"\nsources.moira = { collapse = false }";
-
-fn package(moira_target: &str) -> Package {
+fn package() -> Package {
     let root = tempfile::tempdir().expect("fixture root");
     let repository = root.path().join("tropos");
     let moira = root.path().join("moira");
@@ -94,7 +99,7 @@ fn package(moira_target: &str) -> Package {
     commit_all(&moira, "moira");
     write(&loqui.join("languages/rust/README.md"), "Loqui\n");
     commit_all(&loqui, "loqui");
-    write(&repository.join("phora.toml"), &manifest(moira_target));
+    write(&repository.join("phora.toml"), &manifest());
     for file in [
         "skills/code/SKILL.md",
         "agents/reviewer.md",
@@ -103,6 +108,7 @@ fn package(moira_target: &str) -> Package {
         "rules/fas/security/secrets.cue",
         "rules/fas/workflow/review.cue",
         "rules/fas/moira/stale.cue",
+        "skills/loqui/reference/loqui/stale.md",
     ] {
         write(&repository.join(file), &format!("{file}\n"));
     }
@@ -124,7 +130,7 @@ fn package(moira_target: &str) -> Package {
     }
 }
 
-fn configure(package: &Package, offer: &str) {
+fn configure(package: &Package, binding: &str) {
     write(
         &package.project.join("phora.toml"),
         &format!(
@@ -136,10 +142,9 @@ state = "state"
 path = {repository:?}
 branch = "main"
 transitive = true
-{offer}
 [targets.fas]
 path = "out"
-imports = ["tropos"]
+sources.tropos = {{ {binding} }}
 "#,
             repository = package.repository.display().to_string()
         ),
@@ -192,50 +197,102 @@ fn hide(path: &Path) {
     std::fs::rename(path, path.with_extension("hidden")).expect("hide repository");
 }
 
+const FAS_OFFER: &[&str] = &[
+    "guidance/naming.cue",
+    "moira/du.cue",
+    "security/secrets.cue",
+    "workflow/review.cue",
+];
+
 #[test]
-fn root_reroots_package_files_and_dependency_mounts() {
-    let package = package(MOIRA_TARGET);
-    configure(&package, "root = \"rules/fas\"");
+fn a_named_offer_places_its_dependencies_where_it_declares() {
+    let package = package();
+    configure(&package, "offer = \"fas\"");
     succeeds(&package, &["sync"]);
-    assert_eq!(
-        deployed(&package),
-        set(&[
-            "guidance/naming.cue",
-            "moira/du.cue",
-            "security/secrets.cue",
-            "workflow/review.cue",
-        ])
-    );
+    assert_eq!(deployed(&package), set(FAS_OFFER));
     succeeds(&package, &["verify"]);
 }
 
 #[test]
-fn a_dependency_mounted_outside_the_root_is_never_fetched() {
-    let package = package(MOIRA_TARGET);
+fn a_dependency_the_chosen_offer_does_not_bind_is_never_fetched() {
+    let package = package();
     hide(&package.loqui);
-    configure(&package, "root = \"rules/fas\"");
+    configure(&package, "offer = \"fas\"");
     succeeds(&package, &["sync"]);
     assert!(deployed(&package).contains("moira/du.cue"));
 }
 
 #[test]
-fn include_and_exclude_filter_the_composed_tree_relative_to_the_root() {
-    let package = package(MOIRA_TARGET);
-    configure(
-        &package,
-        "root = \"rules/fas\"\ninclude = [\"guidance/**\", \"security/**\", \"moira/**\"]\nexclude = [\"security/\"]",
-    );
+fn the_default_offer_publishes_own_files_and_every_placed_dependency() {
+    let package = package();
+    configure(&package, "");
     succeeds(&package, &["sync"]);
     assert_eq!(
         deployed(&package),
-        set(&["guidance/naming.cue", "moira/du.cue"])
+        set(&[
+            "rules/fas/guidance/naming.cue",
+            "rules/fas/moira/du.cue",
+            "rules/fas/security/secrets.cue",
+            "rules/fas/workflow/review.cue",
+            "skills/code/SKILL.md",
+            "skills/loqui/reference/loqui/languages/rust/README.md",
+        ]),
+        "own files give way to dependency paths: the committed `rules/fas/moira/stale.cue` never deploys"
     );
 }
 
 #[test]
-fn include_without_root_keeps_a_dependency_under_an_included_path() {
-    let package = package(MOIRA_TARGET);
-    configure(&package, "include = [\"skills/**\"]");
+fn a_target_an_offer_does_not_select_keeps_its_committed_copy_out_of_own_files() {
+    let package = package();
+    configure(&package, "offer = \"bare\"");
+    succeeds(&package, &["sync"]);
+    assert_eq!(deployed(&package), set(&["skills/code/SKILL.md"]));
+}
+
+fn owner_of(package: &Package, artifact: &str) -> String {
+    let output = run(package, &["where"]);
+    let output = String::from_utf8_lossy(&output.stdout).into_owned();
+    let mut lines = output.lines();
+    while let Some(line) = lines.next() {
+        if line.starts_with("Artifact:") && line.contains(artifact) {
+            return lines
+                .next()
+                .and_then(|owner| owner.strip_prefix("  - "))
+                .expect("an owner follows the artifact")
+                .to_owned();
+        }
+    }
+    panic!("no record for {artifact}: {output}");
+}
+
+#[test]
+fn switching_offers_keeps_the_owner_of_a_target_both_place() {
+    let package = package();
+    configure(&package, "");
+    succeeds(&package, &["sync"]);
+    let before = owner_of(&package, "languages/rust/README.md");
+    configure(&package, "offer = \"skills\"");
+    succeeds(&package, &["sync"]);
+    assert_eq!(owner_of(&package, "languages/rust/README.md"), before);
+}
+
+#[test]
+fn an_undeclared_offer_is_rejected_naming_the_declared_ones() {
+    let package = package();
+    configure(&package, "offer = \"agents\"");
+    let result = run(&package, &["sync"]);
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("no offer `agents`") && stderr.contains("default, fas"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn take_shapes_the_offer_output_across_dependencies() {
+    let package = package();
+    configure(&package, "take = [\"skills/**\"]");
     succeeds(&package, &["sync"]);
     assert_eq!(
         deployed(&package),
@@ -247,72 +304,14 @@ fn include_without_root_keeps_a_dependency_under_an_included_path() {
 }
 
 #[test]
-fn exclude_drops_a_dependency_mount() {
-    let package = package(MOIRA_TARGET);
-    configure(&package, "exclude = [\"skills/loqui/\", \"rules/\"]");
-    succeeds(&package, &["sync"]);
-    assert_eq!(deployed(&package), set(&["skills/code/SKILL.md"]));
-}
-
-#[test]
-fn a_dependency_mount_straddling_the_root_is_rerooted_below_it() {
-    let package = package(MOIRA_TARGET);
-    configure(
-        &package,
-        "root = \"skills/loqui/reference/loqui/languages\"",
-    );
-    succeeds(&package, &["sync"]);
-    assert_eq!(deployed(&package), set(&["rust/README.md"]));
-}
-
-#[test]
-fn a_straddled_dependency_mount_keeps_only_files_under_the_root() {
-    let package =
-        package("[targets.moira]\npath = \"rules\"\nsources.moira = { collapse = false }");
-    configure(&package, "root = \"rules/fas\"");
-    succeeds(&package, &["sync"]);
-    assert_eq!(
-        deployed(&package),
-        set(&[
-            "guidance/naming.cue",
-            "security/secrets.cue",
-            "workflow/review.cue",
-        ])
-    );
-}
-
-#[test]
-fn a_non_flat_target_spanning_the_root_is_rejected() {
-    let package = package(
-        "[targets.moira]\npath = \"rules\"\nlayout = \"by-source\"\nsources.moira = { collapse = false }",
-    );
-    configure(&package, "root = \"rules/fas\"");
-    let result = run(&package, &["sync"]);
-    assert!(!result.status.success());
-    assert!(
-        String::from_utf8_lossy(&result.stderr).contains(
-            "spans the import root `rules/fas`; only a flat-layout target can be re-rooted"
-        )
-    );
-}
-
-#[test]
-fn narrowing_the_offer_prunes_what_the_import_no_longer_admits() {
-    let package = package(MOIRA_TARGET);
+fn switching_offers_prunes_what_the_new_offer_no_longer_publishes() {
+    let package = package();
     configure(&package, "");
     succeeds(&package, &["sync"]);
     assert!(deployed(&package).contains("skills/code/SKILL.md"));
-    configure(&package, "include = [\"rules/**\"]");
+    configure(&package, "offer = \"fas\"");
     succeeds(&package, &["sync", "--prune"]);
-    assert_eq!(
-        deployed(&package),
-        set(&[
-            "rules/fas/guidance/naming.cue",
-            "rules/fas/moira/du.cue",
-            "rules/fas/security/secrets.cue",
-            "rules/fas/workflow/review.cue",
-        ])
-    );
+    assert_eq!(deployed(&package), set(FAS_OFFER));
 }
 
 fn configure_fas(package: &Package, rules: &str) {
@@ -364,10 +363,9 @@ fn import_rules_into_their_own_target(package: &Package) -> String {
 path = {repository:?}
 branch = "main"
 transitive = true
-root = "rules/fas"
 [targets.fas-rules]
 path = "out/rules"
-imports = ["fas-rules"]
+sources.fas-rules = {{ offer = "fas" }}
 "#,
         repository = package.repository.display().to_string()
     )
@@ -384,7 +382,7 @@ const FAS_RULES: &[&str] = &[
 #[test]
 fn rules_moved_from_a_live_target_into_their_own_import_are_adopted_in_one_sync() {
     for prune in [false, true] {
-        let package = package(MOIRA_TARGET);
+        let package = package();
         configure_fas(&package, &bind_rules_in_the_fas_target(&package));
         succeeds(&package, &["sync"]);
         assert_eq!(deployed(&package), set(FAS_RULES), "premise");
@@ -416,12 +414,9 @@ fn rules_moved_from_a_live_target_into_their_own_import_are_adopted_in_one_sync(
             "one record per file: {owners:?}"
         );
         assert_eq!(
-            owners
-                .iter()
-                .filter(|owner| owner.ends_with("%tropos"))
-                .count(),
+            owners.iter().filter(|owner| owner.ends_with('%')).count(),
             3,
-            "the composed package target owns the moved rules: {owners:?}"
+            "the composed own-file target owns the moved rules: {owners:?}"
         );
         assert!(
             owners.iter().any(|owner| owner.ends_with("%moira")),

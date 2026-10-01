@@ -8,7 +8,7 @@
 use std::io::IsTerminal;
 use std::path::Path;
 
-use crate::config::transitive::TransitiveManifest;
+use crate::config::transitive::{Member, TransitiveManifest};
 use crate::error::{Error, Result};
 use crate::lock::{CandidateHookRecord, Lock, TrustedHook};
 use crate::source::{
@@ -29,7 +29,8 @@ pub(super) fn run_trust(
     revoke: bool,
     show: Option<&str>,
 ) -> Result<()> {
-    let config = load_config()?;
+    let mut config = load_config()?;
+    config.lower_transitive();
     let registry = open_project_registry(&config)?;
     let _guard = registry.acquire_lock()?;
 
@@ -45,9 +46,9 @@ pub(super) fn run_trust(
     }
 
     if let Some(path) = show {
-        let (source, url, commit) = resolve_show_target(base_lock.as_ref(), source)?;
+        let (source, targets) = resolve_show_targets(base_lock.as_ref(), source)?;
         let backend = GitBackend::new(cache_git.clone());
-        for line in render_show(&backend, &source, &url, &commit, Path::new(path))? {
+        for line in render_first_show(&backend, &source, &targets, Path::new(path))? {
             println!("{line}");
         }
         return Ok(());
@@ -192,11 +193,13 @@ fn surface_unavailable() -> String {
     "  composed surface unavailable — run `phora sync` first".to_owned()
 }
 
-/// Drops the `<instance-key>%<counter>%` prefix, whose `instance.stable_key()` folds in the resolved commit, so a hook matches across commits.
+/// Drops the instance key, which differs per consumer binding, so a hook matches across commits.
 fn commit_stable_hook_key(hook_id: &str) -> String {
     let (head, tail) = hook_id.split_once('#').unwrap_or((hook_id, ""));
-    let dep_target = head.rsplit('%').next().unwrap_or(head);
-    format!("{dep_target}#{tail}")
+    match Member::of(head) {
+        Some(Member::Named(dep_target)) => format!("{dep_target}#{tail}"),
+        Some(Member::Files) | None => format!("{head}#{tail}"),
+    }
 }
 
 fn diff_unavailable() -> String {
@@ -251,18 +254,13 @@ fn revoke_source_hooks(
     Ok(())
 }
 
-/// Resolves the `(remote_url, commit)` a `--show` reads, entirely from the lock (offline). Both come
-/// from the `LockedSource` the source's candidate (else prior trusted) hook maps to, so a composed
-/// dep's files are read at the bound source's OWN pinned commit, not the composing dep's. A single
-/// distinct target is required; an unsynced or ambiguous source refuses rather than guesses.
-///
-/// Coherence contract: a `--show` reads one `LockedSource` `(url, commit)`, so a target that binds
-/// several distinct sources cannot be fully served — a path living only in a second bound source is
-/// reported absent.
-pub(super) fn resolve_show_target(
+/// The `(url, commit)` entries a `--show` for `source` may read, from the lock entries of the
+/// source's candidate (else prior trusted) hook instance: its own files first, then its bound
+/// sources by name. Instances resolving to different entries are ambiguous and refused.
+pub(super) fn resolve_show_targets(
     lock: Option<&Lock>,
     source: Option<&str>,
-) -> Result<(String, String, String)> {
+) -> Result<(String, Vec<(String, String)>)> {
     let source = source
         .ok_or_else(|| Error::Config("`phora trust --show` needs a source name".to_owned()))?;
     let lock = lock.ok_or_else(|| {
@@ -286,61 +284,90 @@ pub(super) fn resolve_show_target(
             .collect();
     }
 
-    let mut targets: Vec<(String, String)> = Vec::new();
+    let mut candidates: Vec<Vec<(String, String)>> = Vec::new();
     for instance in instances {
-        let Ok((git, commit)) = locked_target(lock, instance, source) else {
-            continue;
-        };
-        if !commit.is_empty() && !targets.iter().any(|(g, c)| *g == git && *c == commit) {
-            targets.push((git, commit));
+        let targets: Vec<(String, String)> = locked_targets(lock, instance, source)
+            .into_iter()
+            .filter(|(_, commit)| !commit.is_empty())
+            .collect();
+        if !targets.is_empty() && !candidates.contains(&targets) {
+            candidates.push(targets);
         }
     }
-
-    match targets.as_slice() {
-        [] => Err(Error::Config(format!(
-            "no commit recorded for `{source}` — run `phora sync` first"
-        ))),
-        [(git, commit)] => Ok((source.to_owned(), git.clone(), commit.clone())),
+    let targets = match candidates.as_slice() {
+        [] => {
+            return Err(Error::Config(format!(
+                "no commit recorded for `{source}` — run `phora sync` first"
+            )));
+        }
+        [targets] => targets.clone(),
         many => {
             let commits = many
                 .iter()
+                .flatten()
                 .map(|(_, c)| short(c))
                 .collect::<Vec<_>>()
                 .join(", ");
-            Err(Error::Config(format!(
+            return Err(Error::Config(format!(
                 "`{source}` has several recorded commits ({commits}); sync to pin one before --show"
-            )))
+            )));
         }
-    }
+    };
+    Ok((source.to_owned(), targets))
 }
 
-/// The `(git, commit)` of the `LockedSource` for `instance` (a transitive node), falling back to
-/// the consumer source named `source`. Both fields come from the SAME entry, so a `--show` reads a
-/// dep's files at the commit its own mirror actually holds.
-fn locked_target(lock: &Lock, instance: &str, source: &str) -> Result<(String, String)> {
-    lock.sources
+/// The `(git, commit)` entries for `instance` (a transitive node), its own files first; falls back
+/// to the consumer source named `source`. Both fields of each pair come from the SAME entry, so a
+/// `--show` reads a dep's files at the commit its own mirror actually holds.
+fn locked_targets(lock: &Lock, instance: &str, source: &str) -> Vec<(String, String)> {
+    let mut entries: Vec<&crate::lock::LockedSource> = lock
+        .sources
         .iter()
-        .find(|s| s.instance.as_deref() == Some(instance))
-        .or_else(|| lock.sources.iter().find(|s| s.name == source))
+        .filter(|s| s.instance.as_deref() == Some(instance))
+        .collect();
+    entries.sort_by_key(|s| (Member::of(&s.name) != Some(Member::Files), s.name.clone()));
+    if entries.is_empty() {
+        entries.extend(lock.sources.iter().find(|s| s.name == source));
+    }
+    entries
+        .into_iter()
         .map(|s| (s.git.clone(), s.commit.clone()))
-        .ok_or_else(|| {
-            Error::Config(format!(
-                "no locked remote for `{source}` — run `phora sync` first"
-            ))
-        })
+        .collect()
+}
+
+/// Renders `path` from the first target that holds it; absent from all of them is an error.
+fn render_first_show(
+    backend: &dyn SourceStore,
+    source: &str,
+    targets: &[(String, String)],
+    path: &Path,
+) -> Result<Vec<String>> {
+    for (url, commit) in targets {
+        if let Some(lines) = show_entry(backend, source, url, commit, path)? {
+            return Ok(lines);
+        }
+    }
+    let commits = targets
+        .iter()
+        .map(|(_, c)| short(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(Error::Source(format!(
+        "{} is absent at {commits} in `{source}`",
+        path.display()
+    )))
 }
 
 /// Renders a dep `path` at `commit` from the mirror, offline: a UTF-8 file as its text lines, a
-/// directory as an ls-style listing (subdirectories suffixed `/`), refusing binary content and
-/// reporting an absent path. Dispatch is by source-capability outcome, never by matching error
-/// strings.
-pub(super) fn render_show(
+/// directory as an ls-style listing (subdirectories suffixed `/`), refusing binary content; an
+/// absent path is `None`. Dispatch is by source-capability outcome, never by matching error strings.
+fn show_entry(
     backend: &dyn SourceStore,
     source: &str,
     url: &str,
     commit: &str,
     path: &Path,
-) -> Result<Vec<String>> {
+) -> Result<Option<Vec<String>>> {
     let name = crate::source::SourceName::trusted(source.to_owned());
     let commit_id = commit.parse::<Commit>().map_err(|_| {
         Error::Source(format!(
@@ -380,7 +407,7 @@ pub(super) fn render_show(
     };
     match read {
         Ok(entry) => match std::str::from_utf8(&entry.bytes) {
-            Ok(text) => Ok(text.lines().map(str::to_owned).collect()),
+            Ok(text) => Ok(Some(text.lines().map(str::to_owned).collect())),
             Err(_) => Err(Error::Source(format!(
                 "{} at {} is not UTF-8 text — binary content is not shown",
                 path.display(),
@@ -388,27 +415,25 @@ pub(super) fn render_show(
             ))),
         },
         Err(_) => match backend.list_directory(&resolved.snapshot, source_path.as_ref()) {
-            Ok(entries) => Ok(entries
-                .into_iter()
-                .map(|e| {
-                    let name = e
-                        .path
-                        .as_str()
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or(e.path.as_str());
-                    if e.kind == SourceDirectoryEntryKind::Directory {
-                        format!("{name}/")
-                    } else {
-                        name.to_owned()
-                    }
-                })
-                .collect()),
-            Err(SourceError::RootNotFound { .. }) => Err(Error::Source(format!(
-                "{} is absent at {} in `{source}`",
-                path.display(),
-                short(commit)
-            ))),
+            Ok(entries) => Ok(Some(
+                entries
+                    .into_iter()
+                    .map(|e| {
+                        let name = e
+                            .path
+                            .as_str()
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(e.path.as_str());
+                        if e.kind == SourceDirectoryEntryKind::Directory {
+                            format!("{name}/")
+                        } else {
+                            name.to_owned()
+                        }
+                    })
+                    .collect(),
+            )),
+            Err(SourceError::RootNotFound { .. }) => Ok(None),
             Err(_) => Err(Error::Source(format!(
                 "`{}` cannot be shown — its commit `{}` is not in the mirror; run `phora sync` first",
                 path.display(),
@@ -475,25 +500,28 @@ fn discover_via_fetch(
 }
 
 fn fetched_candidates(name: &str, manifest: &TransitiveManifest) -> Vec<CandidateHookRecord> {
-    let Some(hooks) = manifest.hooks() else {
+    let Some(targets) = manifest.hooks().and_then(toml::Value::as_table) else {
         return Vec::new();
     };
+    let offered: std::collections::BTreeSet<String> = manifest
+        .offer_names()
+        .filter_map(|offer| manifest.offer(offer).ok())
+        .flat_map(|offer| offer.targets.into_keys())
+        .collect();
     let mut out = Vec::new();
-    if let Some(targets) = hooks.as_table() {
-        for (target, block) in targets {
-            let Some(on_change) = block.get("on_change") else {
-                continue;
-            };
-            for command in hook_commands(on_change) {
-                out.push(CandidateHookRecord {
-                    dep_instance: name.to_owned(),
-                    hook_id: format!("{name}#{target}#on_change"),
-                    preimage: UNRESOLVED_PREIMAGE.to_owned(),
-                    command,
-                    source: name.to_owned(),
-                    commit: String::new(),
-                });
-            }
+    for (target, block) in targets.iter().filter(|(t, _)| offered.contains(*t)) {
+        let Some(on_change) = block.get("on_change") else {
+            continue;
+        };
+        for command in hook_commands(on_change) {
+            out.push(CandidateHookRecord {
+                dep_instance: name.to_owned(),
+                hook_id: format!("{name}#{target}#on_change"),
+                preimage: UNRESOLVED_PREIMAGE.to_owned(),
+                command,
+                source: name.to_owned(),
+                commit: String::new(),
+            });
         }
     }
     out
@@ -610,6 +638,21 @@ fn empty_lock() -> Lock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_lists_hooks_only_of_targets_an_offer_composes() {
+        let manifest = TransitiveManifest::parse(
+            "[sources.nvim]\ngit = \"https://github.com/dep/nvim.git\"\n\n\
+             [targets.editor]\npath = \"nvim\"\nsources = [\"nvim\"]\nhooks.on_change = \"./offered.sh\"\n\n\
+             [targets.home]\npath = \"~/.config/nvim\"\nsources = [\"nvim\"]\nhooks.on_change = \"./local.sh\"\n",
+        )
+        .expect("manifest parses");
+        let commands: Vec<String> = fetched_candidates("dep", &manifest)
+            .into_iter()
+            .map(|candidate| candidate.command)
+            .collect();
+        assert_eq!(commands, vec!["./offered.sh".to_owned()]);
+    }
 
     fn candidate(source: &str, preimage: &str) -> CandidateHookRecord {
         CandidateHookRecord {
@@ -818,7 +861,7 @@ mod tests {
                     bytes: bytes.clone(),
                 }),
                 FileOutcome::Absent => Err(SourceError::FileAbsent {
-                    source_name: "mydeps".to_owned(),
+                    source_name: "nvim-kit".to_owned(),
                     commit: commit.to_owned(),
                     path: Path::new(path.as_str()).to_path_buf(),
                 }),
@@ -903,11 +946,13 @@ mod tests {
             tree: TreeOutcome::Absent,
         };
 
-        let lines = render_show(
+        let lines = render_first_show(
             &backend,
-            "mydeps",
-            "https://github.com/dep/mydeps.git",
-            COMMIT_A,
+            "nvim-kit",
+            &[(
+                "https://github.com/dep/nvim-kit.git".to_owned(),
+                COMMIT_A.to_owned(),
+            )],
             Path::new("README.md"),
         )
         .expect("a tracked UTF-8 file must render its contents");
@@ -926,11 +971,13 @@ mod tests {
             tree: TreeOutcome::Absent,
         };
 
-        let err = render_show(
+        let err = render_first_show(
             &backend,
-            "mydeps",
-            "https://github.com/dep/mydeps.git",
-            COMMIT_A,
+            "nvim-kit",
+            &[(
+                "https://github.com/dep/nvim-kit.git".to_owned(),
+                COMMIT_A.to_owned(),
+            )],
             Path::new("logo.png"),
         )
         .expect_err("binary content must be refused, never dumped as raw bytes");
@@ -953,11 +1000,13 @@ mod tests {
             tree: TreeOutcome::Absent,
         };
 
-        let err = render_show(
+        let err = render_first_show(
             &backend,
-            "mydeps",
-            "https://github.com/dep/mydeps.git",
-            COMMIT_A,
+            "nvim-kit",
+            &[(
+                "https://github.com/dep/nvim-kit.git".to_owned(),
+                COMMIT_A.to_owned(),
+            )],
             Path::new("missing/thing.txt"),
         )
         .expect_err("a path absent at the commit must error, not print nothing");
@@ -980,11 +1029,13 @@ mod tests {
             tree: TreeOutcome::MirrorError,
         };
 
-        let err = render_show(
+        let err = render_first_show(
             &backend,
-            "mydeps",
-            "https://github.com/dep/mydeps.git",
-            COMMIT_A,
+            "nvim-kit",
+            &[(
+                "https://github.com/dep/nvim-kit.git".to_owned(),
+                COMMIT_A.to_owned(),
+            )],
             Path::new("README.md"),
         )
         .expect_err("a missing mirror / commit must error, not pretend the path is absent");
@@ -1021,11 +1072,13 @@ mod tests {
             ]),
         };
 
-        let lines = render_show(
+        let lines = render_first_show(
             &backend,
-            "mydeps",
-            "https://github.com/dep/mydeps.git",
-            COMMIT_A,
+            "nvim-kit",
+            &[(
+                "https://github.com/dep/nvim-kit.git".to_owned(),
+                COMMIT_A.to_owned(),
+            )],
             Path::new("d"),
         )
         .expect("a directory path must list its direct children");
@@ -1062,8 +1115,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_show_target_requires_a_source_name() {
-        let err = resolve_show_target(None, None)
+    fn resolve_show_targets_requires_a_source_name() {
+        let err = resolve_show_targets(None, None)
             .expect_err("`--show` without a source must error cleanly, mirroring `--revoke`");
 
         assert!(
@@ -1078,19 +1131,19 @@ mod tests {
     }
 
     #[test]
-    fn resolve_show_target_prefers_the_candidate_commit_over_trusted() {
+    fn resolve_show_targets_prefers_the_candidate_commit_over_trusted() {
         let lock = Lock {
-            candidate_hooks: vec![cand_commit("mydeps", "cand-inst", COMMIT_ONE)],
-            trusted_hooks: vec![trusted_commit("mydeps", "trust-inst", COMMIT_B)],
+            candidate_hooks: vec![cand_commit("nvim-kit", "cand-inst", COMMIT_ONE)],
+            trusted_hooks: vec![trusted_commit("nvim-kit", "trust-inst", COMMIT_B)],
             sources: vec![
                 locked_dep(
-                    "mydeps",
+                    "nvim-kit",
                     "cand-inst",
-                    "https://github.com/dep/mydeps.git",
+                    "https://github.com/dep/nvim-kit.git",
                     COMMIT_A,
                 ),
                 locked_dep(
-                    "mydeps",
+                    "nvim-kit",
                     "trust-inst",
                     "https://github.com/dep/prior.git",
                     COMMIT_B,
@@ -1099,8 +1152,11 @@ mod tests {
             ..empty_lock()
         };
 
-        let (_source, url, commit) = resolve_show_target(Some(&lock), Some("mydeps"))
+        let (_source, targets) = resolve_show_targets(Some(&lock), Some("nvim-kit"))
             .expect("a candidate commit must resolve a show target");
+        let [(url, commit)] = targets.as_slice() else {
+            panic!("one locked entry resolves one target, got: {targets:?}");
+        };
 
         assert_eq!(
             commit, COMMIT_A,
@@ -1113,26 +1169,26 @@ mod tests {
             "reading the candidate HOOK's commit instead of its LockedSource's is a regression"
         );
         assert_eq!(
-            url, "https://github.com/dep/mydeps.git",
+            url, "https://github.com/dep/nvim-kit.git",
             "the remote URL must come from the LockedSource matching the candidate's dep_instance"
         );
     }
 
     #[test]
-    fn resolve_show_target_with_no_commit_directs_to_sync() {
+    fn resolve_show_targets_with_no_commit_directs_to_sync() {
         let lock = Lock {
-            candidate_hooks: vec![cand_commit("mydeps", "inst", COMMIT_A)],
+            candidate_hooks: vec![cand_commit("nvim-kit", "inst", COMMIT_A)],
             trusted_hooks: Vec::new(),
             sources: vec![locked_dep(
-                "mydeps",
+                "nvim-kit",
                 "inst",
-                "https://github.com/dep/mydeps.git",
+                "https://github.com/dep/nvim-kit.git",
                 "",
             )],
             ..empty_lock()
         };
 
-        let err = resolve_show_target(Some(&lock), Some("mydeps"))
+        let err = resolve_show_targets(Some(&lock), Some("nvim-kit"))
             .expect_err("a LockedSource with no pinned commit cannot be shown offline");
 
         assert!(
@@ -1142,21 +1198,21 @@ mod tests {
     }
 
     #[test]
-    fn resolve_show_target_refuses_to_guess_between_distinct_commits() {
+    fn resolve_show_targets_refuses_to_guess_between_distinct_commits() {
         let lock = Lock {
             candidate_hooks: vec![
-                cand_commit("mydeps", "inst-one", COMMIT_ONE),
-                cand_commit("mydeps", "inst-two", COMMIT_TWO),
+                cand_commit("nvim-kit", "inst-one", COMMIT_ONE),
+                cand_commit("nvim-kit", "inst-two", COMMIT_TWO),
             ],
             sources: vec![
                 locked_dep(
-                    "mydeps",
+                    "nvim-kit",
                     "inst-one",
                     "https://github.com/dep/one.git",
                     COMMIT_ONE,
                 ),
                 locked_dep(
-                    "mydeps",
+                    "nvim-kit",
                     "inst-two",
                     "https://github.com/dep/two.git",
                     COMMIT_TWO,
@@ -1165,7 +1221,7 @@ mod tests {
             ..empty_lock()
         };
 
-        let err = resolve_show_target(Some(&lock), Some("mydeps"))
+        let err = resolve_show_targets(Some(&lock), Some("nvim-kit"))
             .expect_err("two distinct locked commits for one source must not be silently picked");
 
         let msg = err.to_string();
@@ -1176,21 +1232,21 @@ mod tests {
     }
 
     #[test]
-    fn resolve_show_target_treats_distinct_remotes_at_one_commit_as_ambiguous() {
+    fn resolve_show_targets_treats_distinct_remotes_at_one_commit_as_ambiguous() {
         let lock = Lock {
             candidate_hooks: vec![
-                cand_commit("mydeps", "inst-one", COMMIT_A),
-                cand_commit("mydeps", "inst-two", COMMIT_A),
+                cand_commit("nvim-kit", "inst-one", COMMIT_A),
+                cand_commit("nvim-kit", "inst-two", COMMIT_A),
             ],
             sources: vec![
                 locked_dep(
-                    "mydeps",
+                    "nvim-kit",
                     "inst-one",
                     "https://github.com/dep/one.git",
                     COMMIT_A,
                 ),
                 locked_dep(
-                    "mydeps",
+                    "nvim-kit",
                     "inst-two",
                     "https://github.com/dep/two.git",
                     COMMIT_A,
@@ -1199,7 +1255,7 @@ mod tests {
             ..empty_lock()
         };
 
-        let err = resolve_show_target(Some(&lock), Some("mydeps")).expect_err(
+        let err = resolve_show_targets(Some(&lock), Some("nvim-kit")).expect_err(
             "two distinct remotes at the SAME commit are genuinely ambiguous; --show must not \
              silently read the first mirror",
         );
@@ -1207,6 +1263,45 @@ mod tests {
         assert!(
             matches!(err, Error::Config(_)),
             "the ambiguity must be a clean Error::Config, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_show_targets_reads_own_files_first_then_bound_sources() {
+        let lock = Lock {
+            candidate_hooks: vec![cand_commit("tropos", "inst", COMMIT_A)],
+            sources: vec![
+                locked_dep(
+                    "inst%loqui",
+                    "inst",
+                    "https://github.com/srnnkls/loqui.git",
+                    COMMIT_B,
+                ),
+                locked_dep(
+                    "inst%",
+                    "inst",
+                    "https://github.com/srnnkls/tropos.git",
+                    COMMIT_A,
+                ),
+            ],
+            ..empty_lock()
+        };
+
+        let (_source, targets) = resolve_show_targets(Some(&lock), Some("tropos"))
+            .expect("one instance with several entries is not ambiguous");
+
+        assert_eq!(
+            targets,
+            vec![
+                (
+                    "https://github.com/srnnkls/tropos.git".to_owned(),
+                    COMMIT_A.to_owned()
+                ),
+                (
+                    "https://github.com/srnnkls/loqui.git".to_owned(),
+                    COMMIT_B.to_owned()
+                ),
+            ]
         );
     }
 }

@@ -1,19 +1,18 @@
 //! Serial, cycle-guarded transitive pre-pass: before the parallel resolve pool,
-//! walk every imported `transitive = true` source's own `phora.toml`, fetching and
+//! walk every bound `transitive = true` source's own `phora.toml`, fetching and
 //! parsing each dep manifest, and produce a namespaced composition graph. A failure
 //! at any depth fails the sync fail-fast, before any lock write.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::config::transitive::{FetchNode, Instance, TransitiveManifest};
+use crate::config::transitive::{FetchNode, Instance, Member, TransitiveManifest};
 use crate::config::{
-    Config, DeployMode, HookAdmissionDiagnostic, HookCommand, Host, LayoutKind, ParsedSource,
-    Protocol, Refspec, Remote, SourceMode, TakeEntry, Target, admit_transitive_hooks,
-    hook_preimage,
+    Binding, Config, DeployMode, HookAdmissionDiagnostic, HookCommand, Host, OfferBinding,
+    ParsedSource, Protocol, Refspec, Remote, Source, SourceMode, TakeEntry, Target,
+    admit_transitive_hooks, hook_preimage,
 };
 use crate::error::{Error, Result};
-use crate::projection::model::{MountView, OfferSpec};
 use crate::projection::offer::OfferSelection;
 use crate::source::{
     Commit, ResolvePolicy, ResolveRequest, RevisionSpec, SourceLocation, SourceName, SourceStore,
@@ -56,11 +55,11 @@ const MAX_TRANSITIVE_DEPTH: usize = 64;
 pub(crate) struct ComposedTarget {
     pub(crate) name: String,
     pub(crate) target: Target,
-    /// Consumer config target whose `imports` roots this composition.
+    /// Consumer config target whose `offer_bindings` roots this composition.
     pub(crate) anchor: String,
-    /// Consumer-facing import name rooting this composition.
+    /// Consumer binding identity rooting this composition.
     pub(crate) import: String,
-    pub(crate) dep_target: String,
+    pub(crate) member: Member,
 }
 
 /// An interpreted transitive `on_change` hook pinned to its dep's resolved commit, awaiting
@@ -206,18 +205,18 @@ fn dep_relative_path(root: Option<&Path>, leaf: &str) -> String {
     }
 }
 
-/// Once composition absorbs its `imports`, a bindingless anchor would deploy as a live empty target.
+/// Once composition absorbs its `offer_bindings`, a bindingless anchor would deploy as a live empty target.
 fn strip_absorbed_anchors(config: &mut Config) {
     config.targets.retain(|_, target| {
-        if target.imports.is_none() {
+        if target.offer_bindings.is_none() {
             return true;
         }
-        target.imports = None;
+        target.offer_bindings = None;
         target.sources.as_ref().is_some_and(|s| !s.is_empty())
     });
 }
 
-/// Walks the transitive graph rooted at the consumer's imported `transitive = true`
+/// Walks the transitive graph rooted at the consumer's bound `transitive = true`
 /// sources, producing the namespaced composition graph. A failure naming a source
 /// below the top level carries `at depth N`.
 pub(super) fn resolve_transitive_graph(
@@ -227,11 +226,17 @@ pub(super) fn resolve_transitive_graph(
     frozen: bool,
     effective_lock: Option<&crate::lock::Lock>,
 ) -> Result<ResolvedGraph> {
-    let has_imports = config
+    debug_assert!(
+        config.targets.values().all(|target| target
+            .declared_sources()
+            .all(|name| !config.sources.get(name).is_some_and(Source::is_transitive))),
+        "transitive bindings must be lowered into offer bindings before composition"
+    );
+    let has_offer_bindings = config
         .targets
         .values()
-        .any(|t| t.imports.iter().flatten().next().is_some());
-    if !has_imports {
+        .any(|t| t.offer_bindings.iter().flatten().next().is_some());
+    if !has_offer_bindings {
         return Ok(ResolvedGraph::default());
     }
     let remotes = resolved_remotes(config, parsed)?;
@@ -241,66 +246,44 @@ pub(super) fn resolve_transitive_graph(
     };
     let mut visited: HashSet<FetchNode> = HashSet::new();
     let mut graph = ResolvedGraph::default();
-    let mut counter: usize = 0;
 
     for (anchor_name, anchor) in &config.targets {
-        for import in anchor.imports.iter().flatten() {
-            let imported = import.source.as_str();
-            let source = parsed.get(imported).ok_or_else(|| {
-                Error::Config(format!("no resolved source for imported `{imported}`"))
-            })?;
-            let base = source;
-            let source = import.resolve(base)?;
-            let remote = remotes.get(imported).map(String::as_str).ok_or_else(|| {
-                Error::Config(format!("no resolved remote for source `{imported}`"))
-            })?;
-            crate::source::transitive::validate_dependency_remote(imported, &source, remote, 1)?;
-            let (package, commit, manifest) = if source.deploy_mode() == DeployMode::Link {
-                let manifest = read_worktree_manifest(imported, remote)?;
-                (
-                    PackageSnapshot::Worktree(remote),
-                    WORKTREE_COMMIT.to_owned(),
-                    manifest,
-                )
-            } else {
-                let pin = locked_import_commit(config, imported, base, &source, effective_lock);
-                let (commit, manifest) =
-                    acquire_import_manifest(imported, &source, remote, backend, frozen, pin)?;
-                (PackageSnapshot::Mirror(remote), commit, manifest)
-            };
-            graph.import_refs.push(ImportResolution {
-                source: imported.to_owned(),
-                refspec: source.refspec(),
-                commit: matches!(package, PackageSnapshot::Mirror(_)).then(|| commit.clone()),
-            });
-            let view = ImportView::new(&source, anchor.expanded_path());
-            let instance = package_instance(
-                "root",
-                imported,
+        for import in anchor.offer_bindings.iter().flatten() {
+            let imported = import.source();
+            let (manifest, snapshot, instance) = acquire_root_import(
+                &RootImport {
+                    config,
+                    parsed,
+                    remotes: &remotes,
+                    backend,
+                    frozen,
+                    effective_lock,
+                },
+                import,
                 anchor_name,
-                remote,
-                &source.refspec(),
-                &commit,
-                &manifest,
-            );
+                &mut graph,
+            )?;
+            let layout = OfferLayout::new(&manifest, import.offer())
+                .map_err(|e| Error::Config(format!("source `{imported}`: {e}")))?;
+            let instance = instance.placed_at(&layout.root);
             visited.insert(instance.fetch_node().clone());
             compose_dep(
                 &instance,
-                anchor,
+                &anchor.expanded_path(),
                 imported,
-                &manifest,
-                package,
-                view.as_ref(),
+                &layout,
+                snapshot,
+                &MountOverride::of(import),
                 &mut WalkCtx {
                     backend,
                     visited: &mut visited,
                     ancestors: Vec::new(),
-                    counter: &mut counter,
                     graph: &mut graph,
                     frozen: &frozen_gate,
                     consumer_hosts: &config.hosts,
                     default_protocol: config.protocol,
                     root_source: imported,
+                    root_identity: &import.identity,
                     root_anchor: anchor_name,
                 },
                 1,
@@ -309,6 +292,63 @@ pub(super) fn resolve_transitive_graph(
     }
 
     Ok(graph)
+}
+
+struct RootImport<'a> {
+    config: &'a Config,
+    parsed: &'a BTreeMap<String, ParsedSource>,
+    remotes: &'a BTreeMap<String, String>,
+    backend: &'a dyn SourceStore,
+    frozen: bool,
+    effective_lock: Option<&'a crate::lock::Lock>,
+}
+
+/// Pins a consumer-bound transitive source and reads its manifest at that pin.
+fn acquire_root_import<'a>(
+    root: &RootImport<'a>,
+    import: &OfferBinding,
+    anchor_name: &str,
+    graph: &mut ResolvedGraph,
+) -> Result<(TransitiveManifest, PackageSnapshot<'a>, Instance)> {
+    let imported = import.source();
+    let base = root
+        .parsed
+        .get(imported)
+        .ok_or_else(|| Error::Config(format!("no resolved source for `{imported}`")))?;
+    let source = import.resolve(base)?;
+    let remote = root
+        .remotes
+        .get(imported)
+        .map(String::as_str)
+        .ok_or_else(|| Error::Config(format!("no resolved remote for source `{imported}`")))?;
+    crate::source::transitive::validate_dependency_remote(imported, &source, remote, 1)?;
+    let (snapshot, commit, manifest) = if source.deploy_mode() == DeployMode::Link {
+        let manifest = read_worktree_manifest(imported, remote)?;
+        (
+            PackageSnapshot::Worktree(remote),
+            WORKTREE_COMMIT.to_owned(),
+            manifest,
+        )
+    } else {
+        let pin = locked_import_commit(root.config, imported, base, &source, root.effective_lock);
+        let (commit, manifest) =
+            acquire_import_manifest(imported, &source, remote, root.backend, root.frozen, pin)?;
+        (PackageSnapshot::Mirror(remote), commit, manifest)
+    };
+    graph.import_refs.push(ImportResolution {
+        source: imported.to_owned(),
+        refspec: source.refspec(),
+        commit: matches!(snapshot, PackageSnapshot::Mirror(_)).then(|| commit.clone()),
+    });
+    let instance = import_instance(
+        "root",
+        &import.identity,
+        anchor_name,
+        remote,
+        &source.refspec(),
+        &commit,
+    );
+    Ok((manifest, snapshot, instance))
 }
 
 fn locked_import_commit<'l>(
@@ -350,8 +390,7 @@ fn read_worktree_manifest(imported: &str, root: &str) -> Result<TransitiveManife
     })
 }
 
-/// Packages keep manifest and artifacts pinned together; manifest-only imports retain
-/// their existing refresh-on-sync behavior.
+/// A manifest and the files its offers publish share one pin.
 fn acquire_import_manifest(
     imported: &str,
     source: &ParsedSource,
@@ -363,36 +402,23 @@ fn acquire_import_manifest(
     if frozen && pin.is_none() {
         return Err(frozen_transitive_miss(imported, 1));
     }
-    let read_manifest = |pin: Option<&str>| {
-        crate::source::transitive::acquire_dependency_manifest(
-            backend,
-            &SourceName::trusted(imported.to_owned()),
-            source,
-            remote,
-            pin,
-            if frozen {
-                ResolvePolicy::CachedOnly
-            } else {
-                ResolvePolicy::Refresh
-            },
-        )
-        .map_err(|source| Error::TransitiveSource {
-            name: imported.to_owned(),
-            depth: 1,
-            source,
-        })
-    };
-    let (commit, manifest) = read_manifest(pin)?;
-    if !frozen
-        && pin.is_some()
-        && !manifest
-            .sources
-            .values()
-            .any(|source| source.path.as_deref() == Some("."))
-    {
-        return read_manifest(None);
-    }
-    Ok((commit, manifest))
+    crate::source::transitive::acquire_dependency_manifest(
+        backend,
+        &SourceName::trusted(imported.to_owned()),
+        source,
+        remote,
+        pin,
+        if frozen {
+            ResolvePolicy::CachedOnly
+        } else {
+            ResolvePolicy::Refresh
+        },
+    )
+    .map_err(|source| Error::TransitiveSource {
+        name: imported.to_owned(),
+        depth: 1,
+        source,
+    })
 }
 
 /// [`resolve_transitive_graph`] under the frozen gate: lock-pinned commits, mirror-only reads, no fetch.
@@ -410,13 +436,14 @@ struct WalkCtx<'a> {
     /// `visited`: fetch-closure dedup gating `descend_for_validation` (LOCK-001); per-Instance nested composition intentionally ignores it. `ancestors`: current-path cycle guard.
     visited: &'a mut HashSet<FetchNode>,
     ancestors: Vec<FetchNode>,
-    counter: &'a mut usize,
     graph: &'a mut ResolvedGraph,
     frozen: &'a FrozenGate<'a>,
     consumer_hosts: &'a BTreeMap<String, Host>,
     default_protocol: Option<Protocol>,
-    /// Consumer-facing import name rooting this subtree; stamped on every hook candidate it yields.
+    /// Consumer source rooting this subtree; stamped on every hook candidate it yields.
     root_source: &'a str,
+    /// Consumer binding identity rooting this subtree; labels its composed targets.
+    root_identity: &'a str,
     root_anchor: &'a str,
 }
 
@@ -426,108 +453,122 @@ struct FrozenGate<'a> {
     lock: Option<&'a crate::lock::Lock>,
 }
 
-/// Composes a dep's own targets under `anchor`: each becomes a synthetic target at
-/// `anchor.expanded_path / dep_target.path`, keeping the dep's own per-target layout,
-/// bound to source instances namespaced by the dep [`Instance`]. Two composed targets
-/// sharing a destination is a hard error. Under an importer `view`, targets are placed
-/// by its root, and a target outside the root is neither composed nor fetched.
+/// One offer of a manifest as composition works over it.
+struct OfferLayout<'m> {
+    root: PathBuf,
+    sources: &'m BTreeMap<String, Source>,
+    files: Option<Source>,
+    targets: BTreeMap<String, Target>,
+    hooks: Option<&'m toml::Value>,
+}
+
+impl<'m> OfferLayout<'m> {
+    fn new(manifest: &'m TransitiveManifest, name: &str) -> Result<Self> {
+        let offer = manifest.offer(name)?;
+        Ok(Self {
+            root: offer.root,
+            sources: &manifest.sources,
+            files: offer.files,
+            targets: offer.targets,
+            hooks: manifest.hooks(),
+        })
+    }
+
+    /// Sources the offer's targets bind or compose; nothing else is namespaced or fetched.
+    fn bound_sources(&self) -> HashSet<&str> {
+        self.targets
+            .values()
+            .flat_map(|target| {
+                target.declared_sources().chain(
+                    target
+                        .offer_bindings
+                        .iter()
+                        .flatten()
+                        .map(OfferBinding::source),
+                )
+            })
+            .collect()
+    }
+}
+
+/// Composes an offer's targets under `anchor_path`: each becomes a synthetic target at
+/// `anchor_path / target.path`, keeping its own layout, bound to source instances
+/// namespaced by the dep [`Instance`]. Two targets sharing a destination is a hard error.
 #[expect(
     clippy::too_many_arguments,
-    reason = "composition threads instance, anchor, manifest, snapshot, view, ctx, and depth together"
+    reason = "composition threads instance, anchor, layout, snapshot, override, ctx, and depth together"
 )]
 fn compose_dep(
     instance: &Instance,
-    anchor: &Target,
+    anchor_path: &Path,
     imported: &str,
-    manifest: &TransitiveManifest,
+    layout: &OfferLayout<'_>,
     package: PackageSnapshot<'_>,
-    view: Option<&ImportView>,
+    mount: &MountOverride<'_>,
     ctx: &mut WalkCtx<'_>,
     depth: usize,
 ) -> Result<()> {
     reject_depth_overflow(imported, depth)?;
-    let anchor_path = anchor.expanded_path();
-    let mut composed_dests: BTreeMap<PathBuf, String> = BTreeMap::new();
-    let mut placements = place_dep_targets(imported, manifest, &anchor_path, view)?;
-    let needed: Option<HashSet<&str>> = view.map(|_| {
-        manifest
-            .targets
-            .iter()
-            .filter(|(name, _)| matches!(placements[name.as_str()], Placement::Mounted { .. }))
-            .flat_map(|(_, target)| {
-                target
-                    .declared_sources()
-                    .chain(target.imports.iter().flatten().map(|i| i.source.as_str()))
-            })
-            .collect()
-    });
-
-    let source_names = namespace_dep_sources(
-        instance,
-        imported,
-        manifest,
-        needed.as_ref(),
-        package,
-        ctx,
-        depth,
-    )?;
-
-    let mount = MountOverride {
-        take: anchor
+    let source_names = namespace_dep_sources(instance, imported, layout, ctx, depth)?;
+    let target_paths: Vec<PathBuf> = layout
+        .targets
+        .values()
+        .map(|target| normalized(&target.path))
+        .collect();
+    if let Some(files) = &layout.files {
+        let namespaced = namespace_own_files(instance, imported, files, package, ctx)?;
+        let take = mount
             .take
-            .as_ref()
-            .and_then(|t| t.get(imported))
-            .map(Vec::as_slice),
-        collapse: anchor
-            .collapse
-            .as_ref()
-            .and_then(|c| c.get(imported))
-            .copied(),
-    };
+            .map(|entries| route_take(imported, entries, Path::new("."), &target_paths))
+            .transpose()?;
+        ctx.graph.targets.push(ComposedTarget {
+            name: instance.key(&Member::Files),
+            target: own_files_target(ctx.root_identity, namespaced, anchor_path, take, mount),
+            anchor: ctx.root_anchor.to_owned(),
+            import: ctx.root_identity.to_owned(),
+            member: Member::Files,
+        });
+    }
+    let mut composed_dests: BTreeMap<PathBuf, String> = BTreeMap::new();
 
-    for (dep_target_name, dep_target) in &manifest.targets {
-        let Some(Placement::Mounted {
-            path: composed_path,
-            mount: mount_view,
-        }) = placements.remove(dep_target_name.as_str())
-        else {
-            continue;
-        };
-        let declared_path: PathBuf = anchor_path.join(&dep_target.path).components().collect();
-        if let Some(other) = composed_dests.insert(declared_path.clone(), dep_target_name.clone()) {
+    for (dep_target_name, dep_target) in &layout.targets {
+        let composed_path = normalized(&anchor_path.join(&dep_target.path));
+        if let Some(other) = composed_dests.insert(composed_path.clone(), dep_target_name.clone()) {
             return Err(Error::Config(format!(
                 "{COMPOSED_DEST_COLLISION}: dep targets `{other}` and `{dep_target_name}` of \
-                 imported `{imported}` both compose to {}",
-                declared_path.display()
+                 source `{imported}` both compose to {}",
+                composed_path.display()
             )));
         }
-        let nested_view = view.map(|view| view.nested(&dep_target.path));
-        compose_nested_imports(
+        compose_nested_offers(
             instance,
             imported,
             dep_target_name,
             dep_target,
             &composed_path,
-            manifest,
-            nested_view.as_ref(),
+            layout,
             ctx,
             depth,
         )?;
-        let mut synthetic = synthetic_target(
+        let take = mount
+            .take
+            .map(|entries| route_take(imported, entries, &dep_target.path, &target_paths))
+            .transpose()?;
+        let synthetic = synthetic_target(
             imported,
             dep_target_name,
             dep_target,
             composed_path.clone(),
-            anchor_path.clone(),
+            anchor_path.to_path_buf(),
             &source_names,
-            &mount,
+            take.as_deref(),
+            mount.collapse,
         )?;
-        synthetic.mount = mount_view;
-        *ctx.counter += 1;
-        let composed_name = namespaced_key(instance, dep_target_name, *ctx.counter);
+        let member = Member::Named(dep_target_name.clone());
+        let composed_name = instance.key(&member);
         admit_hook_candidates(
             instance,
-            manifest,
+            layout,
             dep_target_name,
             &composed_name,
             &composed_path,
@@ -537,32 +578,60 @@ fn compose_dep(
             name: composed_name,
             target: synthetic,
             anchor: ctx.root_anchor.to_owned(),
-            import: ctx.root_source.to_owned(),
-            dep_target: dep_target_name.clone(),
+            import: ctx.root_identity.to_owned(),
+            member,
         });
     }
     Ok(())
 }
 
-fn place_dep_targets<'m>(
-    imported: &str,
-    manifest: &'m TransitiveManifest,
+fn own_files_target(
+    identity: &str,
+    namespaced: String,
     anchor_path: &Path,
-    view: Option<&ImportView>,
-) -> Result<BTreeMap<&'m str, Placement>> {
-    let mut placements = BTreeMap::new();
-    for (dep_target_name, dep_target) in &manifest.targets {
-        reject_dep_target_path(imported, dep_target_name, &dep_target.path)?;
-        let placement = match view {
-            Some(view) => view.place(imported, dep_target_name, dep_target)?,
-            None => Placement::Mounted {
-                path: anchor_path.join(&dep_target.path).components().collect(),
-                mount: None,
-            },
-        };
-        placements.insert(dep_target_name.as_str(), placement);
+    take: Option<Vec<TakeEntry>>,
+    mount: &MountOverride<'_>,
+) -> Target {
+    let binding = Binding {
+        source: Some(namespaced),
+        take,
+        collapse: mount.collapse.or(Some(false)),
+        ..Binding::default()
+    };
+    Target {
+        path: anchor_path.to_path_buf(),
+        sources: Some(BTreeMap::from([(identity.to_owned(), binding)])),
+        layout: None,
+        hooks: None,
+        offer_bindings: None,
+        confine: Some(anchor_path.to_path_buf()),
     }
-    Ok(placements)
+}
+
+fn namespace_own_files(
+    instance: &Instance,
+    imported: &str,
+    files: &Source,
+    package: PackageSnapshot<'_>,
+    ctx: &mut WalkCtx<'_>,
+) -> Result<String> {
+    let mut parsed = ParsedSource::parse(imported, files)?;
+    match package {
+        PackageSnapshot::Mirror(remote) => {
+            parsed.remote = Remote::Git(remote.to_owned());
+            parsed.rev = Some(instance.fetch_node().commit().to_owned());
+        }
+        PackageSnapshot::Worktree(root) => parsed.link_worktree(root),
+    }
+    let namespaced = instance.key(&Member::Files);
+    ctx.graph
+        .remotes
+        .insert(namespaced.clone(), package.remote().to_owned());
+    ctx.graph.sources.insert(namespaced.clone(), parsed);
+    ctx.graph
+        .instances
+        .insert(namespaced.clone(), instance.stable_key());
+    Ok(namespaced)
 }
 
 /// A source already composed by a nested import is graphed (so the frozen gate can pin it) but
@@ -570,89 +639,47 @@ fn place_dep_targets<'m>(
 fn namespace_dep_sources(
     instance: &Instance,
     imported: &str,
-    manifest: &TransitiveManifest,
-    needed: Option<&HashSet<&str>>,
-    package: PackageSnapshot<'_>,
+    layout: &OfferLayout<'_>,
     ctx: &mut WalkCtx<'_>,
     depth: usize,
 ) -> Result<BTreeMap<String, String>> {
-    let imported_inner: HashSet<&str> = manifest
+    let needed = layout.bound_sources();
+    let nested: Vec<&OfferBinding> = layout
         .targets
         .values()
-        .flat_map(|t| t.imports.iter().flatten())
-        .map(|import| import.source.as_str())
+        .flat_map(|t| t.offer_bindings.iter().flatten())
         .collect();
     let mut source_names: BTreeMap<String, String> = BTreeMap::new();
-    for (inner_name, inner) in &manifest.sources {
-        if needed.is_some_and(|needed| !needed.contains(inner_name.as_str())) {
+    for (inner_name, inner) in layout.sources {
+        if !needed.contains(inner_name.as_str()) {
             continue;
         }
-        let mut parsed = ParsedSource::parse(inner_name, inner).map_err(|e| {
-            Error::Config(format!("imported `{imported}`: source `{inner_name}`: {e}"))
+        let parsed = ParsedSource::parse(inner_name, inner).map_err(|e| {
+            Error::Config(format!("source `{imported}`: source `{inner_name}`: {e}"))
         })?;
         if parsed.deploy_mode() == DeployMode::Link {
             return Err(Error::Config(format!(
-                "imported `{imported}`: source `{inner_name}`: {TRANSITIVE_LINK_REJECTED}"
+                "source `{imported}`: source `{inner_name}`: {TRANSITIVE_LINK_REJECTED}"
             )));
         }
-        let is_self = matches!(&parsed.remote, Remote::Path(path) if path == ".");
-        let remote = if is_self {
-            let refined_binding = manifest
-                .targets
-                .values()
-                .flat_map(|t| t.sources.iter().flatten())
-                .any(|(identity, binding)| {
-                    binding.effective_source(identity) == inner_name
-                        && (binding.branch.is_some()
-                            || binding.tag.is_some()
-                            || binding.rev.is_some())
-                });
-            if parsed.is_transitive()
-                || inner.branch.is_some()
-                || inner.tag.is_some()
-                || inner.rev.is_some()
-                || refined_binding
-            {
-                return Err(Error::Config(format!(
-                    "imported `{imported}`: self source `{inner_name}` must use its package snapshot without a ref or transitive flag"
-                )));
-            }
-            match package {
-                PackageSnapshot::Mirror(remote) => {
-                    parsed.remote = Remote::Git(remote.to_owned());
-                    parsed.rev = Some(instance.fetch_node().commit().to_owned());
-                }
-                PackageSnapshot::Worktree(root) => parsed.link_worktree(root),
-            }
-            package.remote().to_owned()
-        } else {
-            let remote = inner_remote(
-                inner_name,
-                &parsed,
-                ctx.consumer_hosts,
-                ctx.default_protocol,
-            )?;
-            crate::source::transitive::validate_dependency_remote(
-                inner_name,
-                &parsed,
-                &remote,
-                depth + 1,
-            )?;
-            remote
-        };
-        let composed_by_nested_import =
-            inner.is_transitive() && imported_inner.contains(inner_name.as_str());
+        let remote = inner_remote(
+            inner_name,
+            &parsed,
+            ctx.consumer_hosts,
+            ctx.default_protocol,
+        )?;
+        crate::source::transitive::validate_dependency_remote(
+            inner_name,
+            &parsed,
+            &remote,
+            depth + 1,
+        )?;
+        let composed_by_nested_import = nested.iter().any(|i| i.source() == inner_name);
         if inner.is_transitive() && !composed_by_nested_import && !ctx.frozen.frozen {
             descend_for_validation(inner_name, &parsed, &remote, ctx, depth + 1)?;
         }
-        *ctx.counter += 1;
-        let namespaced = namespaced_key(instance, inner_name, *ctx.counter);
-        for import in manifest
-            .targets
-            .values()
-            .flat_map(|t| t.imports.iter().flatten())
-            .filter(|i| i.source == *inner_name)
-        {
+        let namespaced = instance.key(&Member::Named(inner_name.clone()));
+        for import in nested.iter().filter(|i| i.source() == inner_name) {
             ctx.graph.import_refs.push(ImportResolution {
                 source: namespaced.clone(),
                 refspec: import.resolve(&parsed)?.refspec(),
@@ -673,24 +700,23 @@ fn namespace_dep_sources(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "nested composition threads parent instance, anchor path, manifest, ctx, and depth together"
+    reason = "nested composition threads parent instance, anchor path, layout, ctx, and depth together"
 )]
-fn compose_nested_imports(
+fn compose_nested_offers(
     parent_instance: &Instance,
     imported: &str,
     dep_target_name: &str,
     dep_target: &Target,
     composed_path: &Path,
-    manifest: &TransitiveManifest,
-    view: Option<&ImportView>,
+    layout: &OfferLayout<'_>,
     ctx: &mut WalkCtx<'_>,
     depth: usize,
 ) -> Result<()> {
-    for import in dep_target.imports.iter().flatten() {
-        let inner_name = import.source.as_str();
-        let inner = manifest.sources.get(inner_name).ok_or_else(|| {
+    for import in dep_target.offer_bindings.iter().flatten() {
+        let inner_name = import.source();
+        let inner = layout.sources.get(inner_name).ok_or_else(|| {
             Error::Config(format!(
-                "imported `{imported}`: target `{dep_target_name}` imports undefined source `{inner_name}`"
+                "source `{imported}`: target `{dep_target_name}` binds undefined source `{inner_name}`"
             ))
         })?;
         let inner_parsed = import
@@ -717,39 +743,30 @@ fn compose_nested_imports(
             depth + 1,
             ctx.frozen,
         )?;
-        let inner_instance = package_instance(
+        let inner_layout = OfferLayout::new(&inner_manifest, import.offer())
+            .map_err(|e| at_depth(inner_name, depth + 1, &e.to_string()))?;
+        let inner_instance = import_instance(
             &parent_instance.stable_key(),
-            inner_name,
+            &import.identity,
             dep_target_name,
             &inner_remote,
             &inner_parsed.refspec(),
             &inner_commit,
-            &inner_manifest,
-        );
+        )
+        .placed_at(&inner_layout.root);
         let inner_node = inner_instance.fetch_node().clone();
         ctx.visited.insert(inner_node.clone());
         if ctx.ancestors.contains(&inner_node) {
             continue;
         }
-        let nested_anchor = Target {
-            path: composed_path.to_path_buf(),
-            sources: None,
-            layout: None,
-            hooks: None,
-            imports: None,
-            take: None,
-            collapse: None,
-            confine: None,
-            mount: None,
-        };
         ctx.ancestors.push(inner_node);
         let composed = compose_dep(
             &inner_instance,
-            &nested_anchor,
+            composed_path,
             inner_name,
-            &inner_manifest,
+            &inner_layout,
             PackageSnapshot::Mirror(&inner_remote),
-            view,
+            &MountOverride::of(import),
             ctx,
             depth + 1,
         );
@@ -836,47 +853,29 @@ fn frozen_transitive_miss(name: &str, depth: usize) -> Error {
     ))
 }
 
-fn package_instance(
+fn import_instance(
     parent: &str,
-    source: &str,
+    identity: &str,
     anchor: &str,
     remote: &str,
     refspec: &Refspec,
     commit: &str,
-    manifest: &TransitiveManifest,
 ) -> Instance {
-    if manifest
-        .sources
-        .values()
-        .any(|source| source.path.as_deref() == Some("."))
-    {
-        let node = FetchNode::new(remote, &crate::lock::encode_ref(refspec), commit);
-        Instance::for_package(parent, source, anchor, node)
-    } else {
-        Instance::new(
-            parent,
-            source,
-            anchor,
-            FetchNode::new(remote, &refspec.to_string(), commit),
-        )
-    }
-}
-
-fn namespaced_key(instance: &Instance, name: &str, counter: usize) -> String {
-    instance.member_key(name, counter)
+    let node = FetchNode::new(remote, &crate::lock::encode_ref(refspec), commit);
+    Instance::new(parent, identity, anchor, node)
 }
 
 /// Interprets the dep target's stripped `on_change` hooks into commit-pinned candidates the
 /// trust decision in [`sync`](super::sync) consumes, recording any parse-failure diagnostic.
 fn admit_hook_candidates(
     instance: &Instance,
-    manifest: &TransitiveManifest,
+    layout: &OfferLayout<'_>,
     dep_target_name: &str,
     composed_name: &str,
     composed_path: &Path,
     ctx: &mut WalkCtx<'_>,
 ) {
-    let Some(opaque) = manifest.hooks() else {
+    let Some(opaque) = layout.hooks else {
         return;
     };
     let (candidates, diagnostics) =
@@ -896,95 +895,98 @@ fn admit_hook_candidates(
     }
 }
 
-/// The importing source's own offer over a package's composed tree. `base` is where the
-/// current anchor sits inside that tree; `anchor` is the consumer's importing target path.
-#[derive(Clone)]
-struct ImportView {
-    offer: OfferSpec,
-    anchor: PathBuf,
-    base: PathBuf,
-}
-
-enum Placement {
-    Mounted {
-        path: PathBuf,
-        mount: Option<MountView>,
-    },
-    Outside,
-}
-
-impl ImportView {
-    /// `None` when the importing source offers its whole package.
-    fn new(source: &ParsedSource, anchor: PathBuf) -> Option<Self> {
-        let offer = OfferSpec::from(source.offer());
-        let narrows = offer
-            .root()
-            .is_some_and(|root| !normalized(root).as_os_str().is_empty())
-            || !offer.includes().is_empty()
-            || !offer.excludes().is_empty();
-        narrows.then(|| Self {
-            offer,
-            anchor,
-            base: PathBuf::new(),
-        })
-    }
-
-    fn nested(&self, dep_target_path: &Path) -> Self {
-        Self {
-            base: normalized(&self.base.join(dep_target_path)),
-            ..self.clone()
-        }
-    }
-
-    /// A target inside the root mounts at its root-relative path; one spanning the root
-    /// mounts at the anchor with root-relative destinations; any other stays unmounted.
-    fn place(
-        &self,
-        imported: &str,
-        dep_target_name: &str,
-        dep_target: &Target,
-    ) -> Result<Placement> {
-        let in_package = normalized(&self.base.join(&dep_target.path));
-        let root = self.offer.root().map(normalized).unwrap_or_default();
-        let (path, rehome) = if let Ok(below_root) = in_package.strip_prefix(&root) {
-            (self.anchor.join(below_root), false)
-        } else if root.starts_with(&in_package) {
-            if dep_target.layout().kind != LayoutKind::Flat {
-                return Err(Error::Config(format!(
-                    "imported `{imported}`: target `{dep_target_name}` at `{}` spans the import \
-                     root `{}`; only a flat-layout target can be re-rooted",
-                    in_package.display(),
-                    root.display()
-                )));
-            }
-            (self.anchor.clone(), true)
-        } else {
-            return Ok(Placement::Outside);
-        };
-        Ok(Placement::Mounted {
-            path: normalized(&path),
-            mount: Some(MountView {
-                path: in_package.to_string_lossy().into_owned(),
-                offer: self.offer.clone(),
-                rehome,
-            }),
-        })
-    }
-}
-
 fn normalized(path: &Path) -> PathBuf {
     path.components()
         .filter(|c| !matches!(c, std::path::Component::CurDir))
         .collect()
 }
 
-/// Consumer-owned (D13/C3): the importing anchor's mount take/collapse for one imported dep,
-/// looked up by the imported name — never the dep's own `take`/`collapse` tables.
+/// A consumer binding's `take`/`collapse` over one composed offer.
 struct MountOverride<'a> {
     take: Option<&'a [TakeEntry]>,
     collapse: Option<bool>,
 }
 
+impl<'a> MountOverride<'a> {
+    fn of(import: &'a OfferBinding) -> Self {
+        Self {
+            take: import.binding.take.as_deref(),
+            collapse: import.binding.collapse,
+        }
+    }
+}
+
+/// Routes a `take` written against the offer's output to one composed target: entries
+/// under the target's path lose that prefix, `**/` globs reach every target, and the
+/// own-files target (at `.`) gets entries under no other target's path.
+fn route_take(
+    imported: &str,
+    entries: &[TakeEntry],
+    target_path: &Path,
+    other_paths: &[PathBuf],
+) -> Result<Vec<TakeEntry>> {
+    let target_path = normalized(target_path);
+    let local = |path: &str| -> Option<String> {
+        if path.starts_with("**/") {
+            return Some(path.to_owned());
+        }
+        let path_buf = normalized(Path::new(path));
+        let subtree = path
+            .strip_suffix("/**")
+            .or_else(|| path.strip_suffix('/'))
+            .map(|dir| normalized(Path::new(dir)));
+        if let Some(dir) = &subtree
+            && !target_path.as_os_str().is_empty()
+            && target_path.starts_with(dir)
+            && &target_path != dir
+        {
+            return Some("**".to_owned());
+        }
+        if target_path.as_os_str().is_empty() {
+            let claimed = other_paths
+                .iter()
+                .any(|other| !other.as_os_str().is_empty() && path_buf.starts_with(other));
+            return (!claimed).then(|| path.to_owned());
+        }
+        let rest = path_buf.strip_prefix(&target_path).ok()?;
+        let mut rest = rest.to_string_lossy().into_owned();
+        if path.ends_with('/') && !rest.is_empty() {
+            rest.push('/');
+        }
+        Some(if rest.is_empty() {
+            "**".to_owned()
+        } else {
+            rest
+        })
+    };
+    let mut routed = Vec::new();
+    for entry in entries {
+        match entry {
+            TakeEntry::Leaf(leaf) => routed.extend(local(leaf).map(TakeEntry::Leaf)),
+            TakeEntry::Rename { src, dest } => {
+                let Some(src_local) = local(src) else {
+                    continue;
+                };
+                let dest_local = local(dest).ok_or_else(|| {
+                    Error::Config(format!(
+                        "source `{imported}`: take rename `{src}` -> `{dest}` leaves the composed target at `{}`",
+                        target_path.display()
+                    ))
+                })?;
+                routed.push(TakeEntry::Rename {
+                    src: src_local,
+                    dest: dest_local,
+                });
+            }
+        }
+    }
+    Ok(routed)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a synthetic target combines the dep target, its placement, namespacing, and the consumer override"
+)]
 fn synthetic_target(
     imported: &str,
     dep_target_name: &str,
@@ -992,55 +994,35 @@ fn synthetic_target(
     composed_path: PathBuf,
     anchor_path: PathBuf,
     source_names: &BTreeMap<String, String>,
-    mount: &MountOverride<'_>,
+    take: Option<&[TakeEntry]>,
+    collapse: Option<bool>,
 ) -> Result<Target> {
     let mut target = dep_target.clone();
     target.path = composed_path;
-    target.imports = None;
+    target.offer_bindings = None;
     target.hooks = None;
     target.confine = Some(anchor_path);
-    target.take = None;
-    target.collapse = None;
     if let Some(bindings) = target.sources.as_mut() {
         for (identity, binding) in bindings.iter_mut() {
             if binding.history {
                 return Err(Error::Config(format!(
-                    "imported `{imported}`: target `{dep_target_name}` binding `{identity}` cannot set history"
+                    "source `{imported}`: target `{dep_target_name}` binding `{identity}` cannot set history"
                 )));
             }
             let effective = binding.source.clone().unwrap_or_else(|| identity.clone());
             let namespaced = source_names.get(&effective).ok_or_else(|| {
                 Error::Config(format!(
-                    "imported `{imported}`: target `{dep_target_name}` binds undefined source `{effective}`"
+                    "source `{imported}`: target `{dep_target_name}` binds undefined source `{effective}`"
                 ))
             })?;
             binding.source = Some(namespaced.clone());
-            if let Some(take) = mount.take {
+            if let Some(take) = take {
                 binding.take = Some(take.to_vec());
             }
-            if let Some(collapse) = mount.collapse {
-                binding.collapse = Some(collapse);
-            }
+            binding.collapse = collapse.or(binding.collapse).or(Some(false));
         }
     }
     Ok(target)
-}
-
-/// A dep target path must be a relative subpath: absolute, `~/`, or `..` escapes the anchor.
-fn reject_dep_target_path(imported: &str, dep_target_name: &str, path: &Path) -> Result<()> {
-    let escapes = path.is_absolute()
-        || path.starts_with("~")
-        || path
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir));
-    if escapes {
-        return Err(Error::Config(format!(
-            "imported `{imported}`: target `{dep_target_name}` path `{}` must be a relative \
-             subpath of the anchor",
-            path.display()
-        )));
-    }
-    Ok(())
 }
 
 fn fetch_manifest(
@@ -1112,7 +1094,7 @@ fn reject_depth_overflow(name: &str, depth: usize) -> Result<()> {
         return Err(at_depth(
             name,
             depth,
-            &format!("transitive import chain exceeds the maximum depth of {MAX_TRANSITIVE_DEPTH}"),
+            &format!("transitive source chain exceeds the maximum depth of {MAX_TRANSITIVE_DEPTH}"),
         ));
     }
     Ok(())
@@ -1415,10 +1397,8 @@ mod tests {
             PathBuf::from("/home/me/deploy/nvim"),
             PathBuf::from("/home/me/deploy"),
             &BTreeMap::new(),
-            &MountOverride {
-                take: None,
-                collapse: None,
-            },
+            None,
+            None,
         )
         .expect("a composed dep target with no bindings synthesizes");
 
@@ -1519,35 +1499,31 @@ mod tests {
             .expect("dep target `editor` present")
     }
 
-    /// The CONSUMER anchor target carrying `imports = ["dep"]` and the mount tables, keyed by the
-    /// imported dep name `dep` (the ground-truth key shape from the config mount-take tests).
-    fn consumer_anchor(mount_body: &str) -> Target {
+    /// The CONSUMER anchor target binding transitive `dep` with `binding` refinements, lowered
+    /// into its import exactly as a sync lowers it.
+    fn consumer_anchor(binding: &str) -> Target {
         let toml = format!(
             "version = 1\n\n\
              [sources.dep]\ngit = \"https://github.com/me/dep.git\"\ntransitive = true\n\n\
-             [targets.claude]\npath = \"~/.claude\"\nimports = [\"dep\"]\n{mount_body}"
+             [targets.claude]\npath = \"~/.claude\"\nsources.dep = {{ {binding} }}\n"
         );
-        crate::config::Config::parse(&toml)
-            .expect("a consumer anchor with mount tables parses")
-            .targets
-            .remove("claude")
-            .expect("consumer target `claude` present")
+        crate::config::merge_configs(
+            crate::config::Config::parse(&toml).expect("a consumer anchor parses"),
+            None,
+        )
+        .targets
+        .remove("claude")
+        .expect("consumer target `claude` present")
     }
 
-    /// The consumer's mount override for imported `dep`, exactly as `compose_dep` builds it.
-    fn mount_for<'a>(anchor: &'a Target, imported: &str) -> MountOverride<'a> {
-        MountOverride {
-            take: anchor
-                .take
-                .as_ref()
-                .and_then(|t| t.get(imported))
-                .map(Vec::as_slice),
-            collapse: anchor
-                .collapse
-                .as_ref()
-                .and_then(|c| c.get(imported))
-                .copied(),
-        }
+    /// The consumer's override for its one import, exactly as `compose_dep` receives it.
+    fn mount_for(anchor: &Target) -> MountOverride<'_> {
+        MountOverride::of(
+            &anchor
+                .offer_bindings
+                .as_deref()
+                .expect("the binding lowered")[0],
+        )
     }
 
     fn namespaced_for(internal: &str, namespaced: &str) -> BTreeMap<String, String> {
@@ -1566,7 +1542,7 @@ mod tests {
     #[test]
     fn mount_take_table_subsets_a_mounted_deps_offer() {
         let dep = dep_target();
-        let anchor = consumer_anchor("[targets.claude.take]\n\"dep\" = [\"lua/init.lua\"]\n");
+        let anchor = consumer_anchor("take = [\"lua/init.lua\"]");
         let synthetic = synthetic_target(
             "dep",
             "editor",
@@ -1574,7 +1550,8 @@ mod tests {
             PathBuf::from("/home/me/.claude/nvim"),
             PathBuf::from("/home/me/.claude"),
             &namespaced_for("nvim", "dep%1%nvim"),
-            &mount_for(&anchor, "dep"),
+            mount_for(&anchor).take,
+            mount_for(&anchor).collapse,
         )
         .expect("a dep mounted under a consumer anchor with a mount take synthesizes");
 
@@ -1582,10 +1559,10 @@ mod tests {
         let take = binding
             .take
             .as_deref()
-            .expect("the consumer's mount take for imported `dep` folds into the binding's `take`");
+            .expect("the consumer's mount take for bound `dep` folds into the binding's `take`");
         assert!(
             matches!(take, [TakeEntry::Leaf(s)] if s == "lua/init.lua"),
-            "the CONSUMER mount take `[\"lua/init.lua\"]` (keyed by imported `dep`) must fold \
+            "the CONSUMER mount take `[\"lua/init.lua\"]` (keyed by bound `dep`) must fold \
              verbatim into the namespaced binding so the resolver stays mount-agnostic; got: {take:?}"
         );
     }
@@ -1593,8 +1570,7 @@ mod tests {
     #[test]
     fn mount_take_table_resolves_against_instance_keyed_published_names() {
         let dep = dep_target();
-        let anchor =
-            consumer_anchor("[targets.claude.take]\n\"dep\" = [{ \"a/X.md\" = \"a/x.md\" }]\n");
+        let anchor = consumer_anchor("take = [{ \"a/X.md\" = \"a/x.md\" }]");
         let synthetic = synthetic_target(
             "dep",
             "editor",
@@ -1602,7 +1578,8 @@ mod tests {
             PathBuf::from("/home/me/.claude/nvim"),
             PathBuf::from("/home/me/.claude"),
             &namespaced_for("nvim", "dep%1%nvim"),
-            &mount_for(&anchor, "dep"),
+            mount_for(&anchor).take,
+            mount_for(&anchor).collapse,
         )
         .expect("a dep with a consumer rename mount take synthesizes");
 
@@ -1627,8 +1604,8 @@ mod tests {
     #[test]
     fn two_anchors_mounting_same_dep_are_independent() {
         let dep = dep_target();
-        let anchor_a = consumer_anchor("[targets.claude.take]\n\"dep\" = [\"only-a.md\"]\n");
-        let anchor_b = consumer_anchor("[targets.claude.take]\n\"dep\" = [\"only-b.md\"]\n");
+        let anchor_a = consumer_anchor("take = [\"only-a.md\"]");
+        let anchor_b = consumer_anchor("take = [\"only-b.md\"]");
         let first = synthetic_target(
             "dep",
             "editor",
@@ -1636,7 +1613,8 @@ mod tests {
             PathBuf::from("/home/me/a/nvim"),
             PathBuf::from("/home/me/a"),
             &namespaced_for("nvim", "dep%1%nvim"),
-            &mount_for(&anchor_a, "dep"),
+            mount_for(&anchor_a).take,
+            mount_for(&anchor_a).collapse,
         )
         .expect("first anchor synthesizes");
         let second = synthetic_target(
@@ -1646,7 +1624,8 @@ mod tests {
             PathBuf::from("/home/me/b/nvim"),
             PathBuf::from("/home/me/b"),
             &namespaced_for("nvim", "dep%2%nvim"),
-            &mount_for(&anchor_b, "dep"),
+            mount_for(&anchor_b).take,
+            mount_for(&anchor_b).collapse,
         )
         .expect("second anchor synthesizes");
 
@@ -1692,7 +1671,7 @@ mod tests {
     #[test]
     fn mount_collapse_table_maps_anchor_bool_to_collapse_choice() {
         let dep = dep_target();
-        let anchor = consumer_anchor("[targets.claude.collapse]\n\"dep\" = false\n");
+        let anchor = consumer_anchor("collapse = true");
         let synthetic = synthetic_target(
             "dep",
             "editor",
@@ -1700,23 +1679,22 @@ mod tests {
             PathBuf::from("/home/me/.claude/nvim"),
             PathBuf::from("/home/me/.claude"),
             &namespaced_for("nvim", "dep%1%nvim"),
-            &mount_for(&anchor, "dep"),
+            mount_for(&anchor).take,
+            mount_for(&anchor).collapse,
         )
         .expect("a dep mounted under a consumer collapse override synthesizes");
 
         assert_eq!(
             binding_of(&synthetic, "nvim").collapse,
-            Some(false),
-            "the CONSUMER mount collapse `false` (keyed by imported `dep`) folds into the \
-             binding's `collapse` (Some(false) = ForcePerLeaf); got: {:?}",
+            Some(true),
+            "the consumer binding's `collapse` overrides the composed default; got: {:?}",
             binding_of(&synthetic, "nvim").collapse
         );
     }
 
     #[test]
-    fn consumer_mount_take_overrides_a_binding_local_take() {
-        let dep = dep_target_with_binding_local_take();
-        let anchor = consumer_anchor("[targets.claude.take]\n\"dep\" = [\"consumer-wins.lua\"]\n");
+    fn composed_bindings_default_to_per_leaf() {
+        let dep = dep_target();
         let synthetic = synthetic_target(
             "dep",
             "editor",
@@ -1724,7 +1702,119 @@ mod tests {
             PathBuf::from("/home/me/.claude/nvim"),
             PathBuf::from("/home/me/.claude"),
             &namespaced_for("nvim", "dep%1%nvim"),
-            &mount_for(&anchor, "dep"),
+            None,
+            None,
+        )
+        .expect("a dep with no collapse anywhere synthesizes");
+        assert_eq!(binding_of(&synthetic, "nvim").collapse, Some(false));
+    }
+
+    fn leaves(entries: &[TakeEntry]) -> Vec<String> {
+        entries
+            .iter()
+            .map(|entry| match entry {
+                TakeEntry::Leaf(leaf) => leaf.clone(),
+                TakeEntry::Rename { src, dest } => format!("{src}->{dest}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn take_routes_by_target_path() {
+        let entries = [
+            TakeEntry::Leaf("skills/gestalt/**".to_owned()),
+            TakeEntry::Leaf("skills/loqui/reference/loqui/languages/**".to_owned()),
+            TakeEntry::Leaf("**/README.md".to_owned()),
+        ];
+        let others = [PathBuf::from("skills/loqui/reference/loqui")];
+        let own = route_take("dep", &entries, Path::new("."), &others).expect("own files route");
+        assert_eq!(leaves(&own), vec!["skills/gestalt/**", "**/README.md"]);
+        let loqui = route_take(
+            "dep",
+            &entries,
+            Path::new("skills/loqui/reference/loqui"),
+            &others,
+        )
+        .expect("loqui routes");
+        assert_eq!(leaves(&loqui), vec!["languages/**", "**/README.md"]);
+    }
+
+    #[test]
+    fn take_of_an_enclosing_subtree_reaches_the_targets_below_it() {
+        let others = [PathBuf::from("skills/loqui/reference/loqui")];
+        for entry in ["skills/**", "skills/"] {
+            let loqui = route_take(
+                "dep",
+                &[TakeEntry::Leaf(entry.to_owned())],
+                Path::new("skills/loqui/reference/loqui"),
+                &others,
+            )
+            .expect("routes");
+            assert_eq!(leaves(&loqui), vec!["**"], "{entry}");
+        }
+    }
+
+    #[test]
+    fn take_reaching_no_entry_projects_nothing_and_a_whole_target_takes_all() {
+        let others = [PathBuf::from("rules/fas/moira")];
+        let none = route_take(
+            "dep",
+            &[TakeEntry::Leaf("skills/**".to_owned())],
+            Path::new("rules/fas/moira"),
+            &others,
+        )
+        .expect("routes");
+        assert!(none.is_empty(), "no entry reaches moira: {none:?}");
+        let all = route_take(
+            "dep",
+            &[TakeEntry::Leaf("rules/fas/moira/".to_owned())],
+            Path::new("rules/fas/moira"),
+            &others,
+        )
+        .expect("routes");
+        assert_eq!(leaves(&all), vec!["**"]);
+    }
+
+    #[test]
+    fn take_rename_leaving_its_target_is_rejected() {
+        let others = [PathBuf::from("rules/fas/moira")];
+        let err = route_take(
+            "dep",
+            &[TakeEntry::Rename {
+                src: "rules/fas/moira/a.cue".to_owned(),
+                dest: "elsewhere/a.cue".to_owned(),
+            }],
+            Path::new("rules/fas/moira"),
+            &others,
+        )
+        .expect_err("the rename escapes moira");
+        assert!(err.to_string().contains("leaves"), "got: {err}");
+        let inside = route_take(
+            "dep",
+            &[TakeEntry::Rename {
+                src: "rules/fas/moira/a.cue".to_owned(),
+                dest: "rules/fas/moira/b.cue".to_owned(),
+            }],
+            Path::new("rules/fas/moira"),
+            &others,
+        )
+        .expect("a rename inside moira routes");
+        assert_eq!(leaves(&inside), vec!["a.cue->b.cue"]);
+    }
+
+    #[test]
+    fn consumer_mount_take_overrides_a_binding_local_take() {
+        let dep = dep_target_with_binding_local_take();
+        let anchor = consumer_anchor("take = [\"consumer-wins.lua\"]");
+        let synthetic = synthetic_target(
+            "dep",
+            "editor",
+            &dep,
+            PathBuf::from("/home/me/.claude/nvim"),
+            PathBuf::from("/home/me/.claude"),
+            &namespaced_for("nvim", "dep%1%nvim"),
+            mount_for(&anchor).take,
+            mount_for(&anchor).collapse,
         )
         .expect(
             "a dep whose binding has its own take, mounted under a consumer override, synthesizes",
@@ -1752,7 +1842,8 @@ mod tests {
             PathBuf::from("/home/me/.claude/nvim"),
             PathBuf::from("/home/me/.claude"),
             &namespaced_for("nvim", "dep%1%nvim"),
-            &mount_for(&anchor, "dep"),
+            mount_for(&anchor).take,
+            mount_for(&anchor).collapse,
         )
         .expect("a dep with a binding-local take and no consumer override synthesizes");
 
@@ -2137,9 +2228,12 @@ mod tests {
         let toml = format!(
             "version = 1\n\n\
              [sources.dep]\ngit = {url:?}\nbranch = \"main\"\ntransitive = true\n\n\
-             [targets.claude]\npath = \"/home/me/.claude\"\nimports = [\"dep\"]\n"
+             [targets.claude]\npath = \"/home/me/.claude\"\nsources = [\"dep\"]\n"
         );
-        Config::parse(&toml).expect("a consumer importing a transitive dep parses")
+        crate::config::merge_configs(
+            Config::parse(&toml).expect("a consumer binding a transitive dep parses"),
+            None,
+        )
     }
 
     fn parsed_of(config: &Config) -> BTreeMap<String, ParsedSource> {

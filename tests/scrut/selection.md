@@ -186,13 +186,13 @@ remedy: move `include` to the source offer on `[sources.dotfiles]`; scope is own
 to debug: phora explain home dotfiles
 ```
 
-A binding-level `map` redirects to the target `take` table instead.
+A binding-level `map` redirects to the binding's `take` instead.
 
 ```scrut
 $ seed_selection "$repo" "" 'map = { "a/X.md" = "a/x.md" }' && phora sync 2>&1 | normalize
 error: config error: selection: map — binding-level scope is removed
 matched against: binding `dotfiles` of target `home`
-remedy: rename via the target `take` table; binding-level `map` is gone, e.g. `[targets.home.take]`
+remedy: rename via the binding's `take`; binding-level `map` is gone, e.g. `take = [{ "old" = "new" }]`
 to debug: phora explain home dotfiles
 ```
 

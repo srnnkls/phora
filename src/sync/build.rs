@@ -241,21 +241,18 @@ fn anchor(path: &Path, source: &str, transitive: bool) -> Result<Target> {
         "path".to_owned(),
         toml::Value::String(path.to_string_lossy().into_owned()),
     );
-    if transitive {
-        table.insert(
-            "imports".to_owned(),
-            toml::Value::Array(vec![toml::Value::String(source.to_owned())]),
-        );
-    } else {
-        let mut binding = toml::value::Table::new();
+    let mut binding = toml::value::Table::new();
+    if !transitive {
         binding.insert("collapse".to_owned(), toml::Value::Boolean(false));
-        let mut sources = toml::value::Table::new();
-        sources.insert(source.to_owned(), toml::Value::Table(binding));
-        table.insert("sources".to_owned(), toml::Value::Table(sources));
     }
-    toml::Value::Table(table)
+    let mut sources = toml::value::Table::new();
+    sources.insert(source.to_owned(), toml::Value::Table(binding));
+    table.insert("sources".to_owned(), toml::Value::Table(sources));
+    let mut target: Target = toml::Value::Table(table)
         .try_into()
-        .map_err(|e| Error::Config(format!("build input `{source}`: {e}")))
+        .map_err(|e| Error::Config(format!("build input `{source}`: {e}")))?;
+    target.lower_transitive(|_| transitive);
+    Ok(target)
 }
 
 /// Output symlinks are captured as the files they point to: a linked input is live
