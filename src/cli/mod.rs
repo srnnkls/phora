@@ -399,7 +399,7 @@ pub fn run_with_outcome(cli: Cli) -> Result<CliOutcome> {
             source,
             target,
         } => {
-            let config = load_config()?;
+            let config = merge_configs(load_config()?, load_local_config(Path::new("."))?);
             let registry = open_project_registry(&config)?;
             let _guard = registry.acquire_lock()?;
             let cwd = std::env::current_dir()?;
@@ -421,7 +421,7 @@ pub fn run_with_outcome(cli: Cli) -> Result<CliOutcome> {
             source,
             target,
         } => {
-            let config = load_config()?;
+            let config = merge_configs(load_config()?, load_local_config(Path::new("."))?);
             let registry = open_project_registry(&config)?;
             let _guard = registry.acquire_lock()?;
             crate::sync::uneject(&config, &registry, &artifact, &source, &target)?;
