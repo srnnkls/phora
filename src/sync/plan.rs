@@ -95,6 +95,9 @@ fn discover_target(
             inventory: SourceInventory::from_paths(leaves)?,
             offer: OfferSpec::from(source.offer()),
             take: TakeSpec::from_entries(binding.take),
+            composed_take: binding
+                .composed_take
+                .map(|take| TakeSpec::from_entries(Some(take))),
             history: binding.history,
             materialization: MaterializationPolicy::from(&source.deploy_mode()),
             collapse: CollapsePreference::from(binding.collapse),
@@ -114,6 +117,7 @@ fn binding_inputs(discovery: &TargetDiscovery) -> Vec<BindingProjectionInput<'_>
             offer: &d.offer,
             inventory: &d.inventory,
             take: &d.take,
+            composed_take: d.composed_take.as_ref(),
             collapse: d.collapse,
             history: d.history,
             materialization: d.materialization,
@@ -129,6 +133,7 @@ struct DiscoveredBinding {
     inventory: SourceInventory,
     offer: OfferSpec,
     take: TakeSpec,
+    composed_take: Option<TakeSpec>,
     history: bool,
     materialization: MaterializationPolicy,
     collapse: CollapsePreference,

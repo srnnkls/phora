@@ -135,6 +135,7 @@ fn projected_target(inventory_paths: &[&str], root: Option<&str>) -> TargetProje
         offer: &offer,
         inventory: &inventory,
         take: &take,
+        composed_take: None,
         collapse: CollapsePreference::default(),
         history: false,
         materialization: MaterializationPolicy::Copy,

@@ -51,11 +51,88 @@ pub struct Source {
 /// A generator whose output, committed into the store, is the source's content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildSpec {
-    /// Sources materialized under `$PHORA_INPUT/<name>` before the command runs.
-    pub inputs: Vec<String>,
-    pub command: HookCommand,
-    /// Runs on every sync; its stdout joins the build key.
-    pub key: Option<HookCommand>,
+    pub inputs: BuildInputs,
+    /// The offer a transitive input is bound with; `default` when omitted.
+    pub offer: Option<String>,
+    pub tool: BuildTool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildInputs {
+    /// Each named source, materialized under `$PHORA_INPUT/<name>`.
+    Sources(Vec<String>),
+    /// The repo declaring the build, materialized at `$PHORA_INPUT`.
+    Repo,
+    /// One named source, materialized at `$PHORA_INPUT`.
+    Root(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildTool {
+    /// `key` runs before the build; its stdout joins the build key.
+    Command {
+        command: HookCommand,
+        key: Option<HookCommand>,
+    },
+    /// A granted tool run as argv, never through a shell.
+    Tool { spec: ToolSpec, argv: Vec<String> },
+}
+
+/// `<identity>@<version>`; the identity doubles as a mise tool spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolSpec {
+    pub identity: String,
+    pub version: String,
+}
+
+impl std::str::FromStr for ToolSpec {
+    type Err = String;
+
+    fn from_str(raw: &str) -> std::result::Result<Self, String> {
+        match raw.rsplit_once('@') {
+            Some((identity, version)) if !identity.is_empty() && !version.is_empty() => Ok(Self {
+                identity: identity.to_owned(),
+                version: version.to_owned(),
+            }),
+            _ => Err(format!(
+                "`tool = \"{raw}\"` needs an identity and a version, as `<identity>@<version>`"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for ToolSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}@{}", self.identity, self.version)
+    }
+}
+
+const SHELL_SYNTAX: &[char] = &[';', '&', '|', '$', '`', '<', '>'];
+
+fn tool_argv(
+    run: Option<String>,
+    cmd: Option<Vec<String>>,
+) -> std::result::Result<Vec<String>, String> {
+    let argv = match (run, cmd) {
+        (Some(_), Some(_)) => return Err("a tool build sets `run` or `cmd`, not both".to_owned()),
+        (None, None) => return Err("a tool build needs `run` or `cmd`".to_owned()),
+        (None, Some(cmd)) => cmd,
+        (Some(run), None) => {
+            if run.contains(SHELL_SYNTAX) {
+                return Err(format!(
+                    "tool builds never run a shell; pass separate arguments instead of `{run}`"
+                ));
+            }
+            shlex::split(&run).ok_or_else(|| format!("`run = \"{run}\"` has unbalanced quotes"))?
+        }
+    };
+    match argv.first() {
+        None => Err("a tool build's command is empty".to_owned()),
+        Some(program) if program.contains('/') => Err(format!(
+            "a tool build names the tool's executable, not a path: `{program}`"
+        )),
+        Some(_) => Ok(argv),
+    }
 }
 
 impl<'de> Deserialize<'de> for BuildSpec {
@@ -65,19 +142,61 @@ impl<'de> Deserialize<'de> for BuildSpec {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct BuildTable {
-            inputs: Vec<String>,
+            inputs: Option<Vec<String>>,
+            offer: Option<String>,
+            tool: Option<String>,
             run: Option<String>,
             shell: Option<String>,
             cmd: Option<Vec<String>>,
             key: Option<HookCommand>,
         }
         let table = BuildTable::deserialize(deserializer)?;
-        let command = super::hooks::validated_command(table.run, table.shell, table.cmd)?;
+        let tool = match table.tool {
+            Some(tool) => {
+                if table.shell.is_some() || table.key.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "a tool build takes no `shell` or `key`: it never runs a shell, and its \
+                         version pin is its key",
+                    ));
+                }
+                BuildTool::Tool {
+                    spec: tool.parse().map_err(serde::de::Error::custom)?,
+                    argv: tool_argv(table.run, table.cmd).map_err(serde::de::Error::custom)?,
+                }
+            }
+            None => BuildTool::Command {
+                command: super::hooks::validated_command(table.run, table.shell, table.cmd)?,
+                key: table.key,
+            },
+        };
         Ok(Self {
-            inputs: table.inputs,
-            command,
-            key: table.key,
+            inputs: table.inputs.map_or(BuildInputs::Repo, BuildInputs::Sources),
+            offer: table.offer,
+            tool,
         })
+    }
+}
+
+impl BuildSpec {
+    #[must_use]
+    pub fn named_inputs(&self) -> &[String] {
+        match &self.inputs {
+            BuildInputs::Sources(names) => names,
+            BuildInputs::Repo | BuildInputs::Root(_) => &[],
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn reading_repo_as(&self, repo: &str) -> Self {
+        let inputs = match &self.inputs {
+            BuildInputs::Repo => BuildInputs::Root(repo.to_owned()),
+            inputs => inputs.clone(),
+        };
+        Self {
+            inputs,
+            offer: self.offer.clone(),
+            tool: self.tool.clone(),
+        }
     }
 }
 
@@ -665,12 +784,12 @@ fn classify_build(name: &str, source: &Source, build: &BuildSpec) -> Result<Remo
             "source `{name}`: `{field}` is meaningless on a `build` source"
         )));
     }
-    if build.inputs.is_empty() {
+    if matches!(&build.inputs, BuildInputs::Sources(inputs) if inputs.is_empty()) {
         return Err(Error::Config(format!(
             "source `{name}`: `build.inputs` must name at least one source"
         )));
     }
-    if build.inputs.iter().any(|input| input == name) {
+    if build.named_inputs().iter().any(|input| input == name) {
         return Err(Error::Config(format!(
             "source `{name}`: `build.inputs` cannot name the build source itself"
         )));

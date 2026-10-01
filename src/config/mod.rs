@@ -2,9 +2,11 @@
 
 mod hooks;
 mod host;
+pub mod link;
 mod migrate;
 mod source;
 mod target;
+pub mod tools;
 pub mod transitive;
 
 #[cfg(test)]
@@ -28,11 +30,15 @@ pub use hooks::{
 };
 pub use host::{AuthConfig, Host, RemoteConfig, builtin_forges};
 pub use migrate::MigrationWarning;
-pub use source::{BuildSpec, DeployMode, Offer, ParsedSource, Refspec, Remote, Source, SourceMode};
+pub use source::{
+    BuildInputs, BuildSpec, BuildTool, DeployMode, Offer, ParsedSource, Refspec, Remote, Source,
+    SourceMode, ToolSpec,
+};
 pub use target::{
     Binding, DEFAULT_OFFER, LayoutConfig, LayoutKind, OfferBinding, ResolvedBinding, SourceFields,
     TakeEntry, Target, TemplateOptIn,
 };
+pub use tools::ToolGrant;
 
 fn expand_home(path: &Path) -> PathBuf {
     if let Ok(relative) = path.strip_prefix("~")
@@ -97,6 +103,8 @@ pub struct Config {
     /// What this repo publishes to configs that bind it as a transitive source.
     #[serde(default)]
     pub offers: BTreeMap<String, transitive::ManifestOffer>,
+    #[serde(default)]
+    pub tools: BTreeMap<String, ToolGrant>,
 }
 
 impl Config {
@@ -219,7 +227,34 @@ impl Config {
             let Some(build) = &source.build else {
                 continue;
             };
-            for input in &build.inputs {
+            if let BuildTool::Tool { spec, .. } = &build.tool
+                && !self.tools.contains_key(&spec.identity)
+            {
+                return Err(Error::Config(format!(
+                    "source `{name}`: build runs tool `{spec}`; {}",
+                    tools::grant_hint(&spec.identity)
+                )));
+            }
+            if build.inputs == BuildInputs::Repo {
+                transitive::resolve_offer(
+                    build.offer.as_deref().unwrap_or(DEFAULT_OFFER),
+                    &self.offers,
+                    &self.sources,
+                    &self.targets,
+                )
+                .map_err(|e| Error::Config(format!("source `{name}`: {e}")))?;
+            }
+            if build.offer.is_some()
+                && let Some(flat) = build
+                    .named_inputs()
+                    .iter()
+                    .find(|input| !self.sources.get(*input).is_some_and(Source::is_transitive))
+            {
+                return Err(Error::Config(format!(
+                    "source `{name}`: `build.offer` binds transitive inputs, but `{flat}` is flat"
+                )));
+            }
+            for input in build.named_inputs() {
                 let Some(input_source) = self.sources.get(input) else {
                     return Err(Error::Config(format!(
                         "source `{name}`: `build.inputs` references undefined source `{input}`"
@@ -240,7 +275,7 @@ impl Config {
         self.sources
             .values()
             .filter_map(|s| s.build.as_ref())
-            .any(|b| b.inputs.iter().any(|i| i == name))
+            .any(|b| b.named_inputs().iter().any(|i| i == name))
     }
 
     /// A flat fetch bypasses the recursive pre-pass, so a `transitive = true` source that
@@ -777,5 +812,6 @@ fn overlay(base: Config, local: Option<Config>) -> Config {
         merged.hooks = local.hooks;
     }
     merged.vars.extend(local.vars);
+    merged.tools.extend(local.tools);
     merged
 }

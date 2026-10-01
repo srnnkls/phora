@@ -3906,6 +3906,7 @@ mod per_binding_refinement {
                     collapse: None,
                     history: false,
                     offer: None,
+                    composed_take: None,
                 },
             )])),
         };
@@ -3950,6 +3951,7 @@ mod per_binding_refinement {
                     collapse: None,
                     history: false,
                     offer: None,
+                    composed_take: None,
                 },
             )])),
         };

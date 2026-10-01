@@ -27,6 +27,7 @@ fn projected_home() -> TargetProjection {
         offer: &offer,
         inventory: &inventory,
         take: &take,
+        composed_take: None,
         collapse: CollapsePreference::default(),
         history: false,
         materialization: MaterializationPolicy::Copy,

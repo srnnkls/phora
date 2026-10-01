@@ -1011,9 +1011,11 @@ targets = ["moira"]
   nor any target's path, so a committed copy of what a target deploys never rides
   along — even when the offer does not select that target.
 - A target is offerable when its path is relative to the repo and every source it
-  binds can be fetched by a consumer: no local `path`, no `deploy = "link"`, no
-  `build`. Local-only targets such as `~/.claude` stay out of `default`; naming one
-  in `targets` is a config error, and so is naming a target outside `root`.
+  binds can be fetched or built by a consumer: no local `path`, no
+  `deploy = "link"`, and no build that carries its own command (see
+  [Offered builds](#offered-builds)). Local-only targets such as `~/.claude` stay
+  out of `default`; naming one in `targets` is a config error, and so is naming a
+  target outside `root`.
 - Offers belong to the committed `phora.toml`; `phora.local.toml` cannot declare them.
 
 A binding picks an offer with `offer`; without one it gets `default`:
@@ -1108,8 +1110,108 @@ The build key hashes the command, the `key` output, and every materialized input
 file. A sync reruns the command only when the key differs from the lock; `phora
 update <source>` forces a rerun. A failed rerun keeps the previous output
 deployed and exits 1; a first build that fails stops the sync. `--frozen` never
-runs a build. Builds come only from your own config, never from a dependency's
-`phora.toml`.
+runs a build.
+
+A build can also run a *tool* instead of its own shell command. `tool` names it as
+`<identity>@<version>`, and the command never goes through a shell: `cmd` is argv
+as written, and a string `run` is split into argv with shell-style quoting but
+rejects shell syntax (`;`, `&`, `|`, `$`, backticks, `<`, `>`). `{input}` and
+`{output}` expand to `$PHORA_INPUT` and `$PHORA_OUTPUT`. The tool must be granted
+under `[tools]`:
+
+```toml
+[tools."github:srnnkls/henia"]
+mise = true                    # or: path = "~/bin/henia"
+
+[sources.henia]
+build = { tool = "github:srnnkls/henia@0.1.0-alpha.4", run = "henia build {input} --output {output}", inputs = ["tropos"], offer = "source" }
+```
+
+A grant sets exactly one route:
+
+- `mise = true` resolves the build's pinned version through
+  [mise](https://mise.jdx.dev): an offline `mise bin-paths` lookup, and
+  `mise install` when the pin is missing (never under `--frozen`). The command's
+  first word must be one of the executables that version provides.
+- `path = "…"` runs that file as the tool, whatever version the build pins;
+  compatibility is yours.
+
+Either way phora runs the resolved file by absolute path, never through `PATH`, and
+refuses a grant that is a shell or interpreter (`sh`, `bash`, `python`, `node`,
+`env`, …), since its arguments could say anything. The build key hashes the tool
+identity, its version, the argv and the executable's contents, so swapping the
+binary or bumping the pin rebuilds. `phora.local.toml` may add or override grants.
+
+`offer` binds the transitive inputs with that offer. Without `inputs`, a build
+reads one of its own repo's offers (`default` when `offer` is omitted),
+materialized at `$PHORA_INPUT` itself: the working tree plus the targets that offer
+composes.
+
+### Offered builds
+
+A repo can offer what a build makes from it without ever handing its consumers a
+shell command. The repo's build runs a tool over one of its own offers; a target
+places the output, and an offer selects that target:
+
+```toml
+# tropos/phora.toml
+[tools."github:srnnkls/henia"]   # used when tropos syncs itself; never read by consumers
+mise = true
+
+[sources.loqui]
+host = "github"
+repo = "srnnkls/loqui"
+
+[sources.harnesses]
+build = { tool = "github:srnnkls/henia@0.1.0-alpha.4", run = "henia build {input} --output {output}" }
+
+[targets.loqui]
+path = "skills/loqui/reference/loqui"
+sources = ["loqui"]
+
+[targets.claude]
+path = "dist/claude"
+sources.harnesses = { take = [{ "claude/" = "." }] }
+
+[offers.claude]
+root = "dist/claude"
+targets = ["claude"]
+```
+
+```toml
+# your phora.toml
+[tools."github:srnnkls/henia"]
+mise = true
+
+[sources.tropos]
+host = "github"
+repo = "srnnkls/tropos"
+transitive = true
+
+[targets.claude]
+path = "~/.claude"
+sources.tropos = { offer = "claude" }
+```
+
+- The dependency describes the whole build, the tool, its version and its
+  arguments, as data; you decide whether that tool may run and how it resolves. A
+  dependency's `[tools]` is never read, and a build that carries its own shell
+  command is never offered. Binding an offer whose tool you have not granted fails
+  with the grant to add and a link to the build in the dependency's `phora.toml` at
+  the pinned commit (see [Hook trust](#hook-trust) for the link format).
+- The build reads the dependency's pinned commit (or its linked working tree) with
+  the named offer composed, at `$PHORA_INPUT`. It runs in a scratch directory, not
+  your project, and a symlink that resolves outside its input or output fails the
+  build.
+- An offer never contains a build that reads it: tropos's `default` leaves out the
+  `claude` target, so the build's input is tropos's own files plus loqui, and an
+  offer that selects its own build's target is a config error.
+- The output locks and replays under `--frozen` like any build; one build serves
+  every offer and binding that places it.
+
+A grant vouches that the tool treats its arguments and input as data. A tool that
+executes code named in its arguments (a plugin flag, an `--eval`) hands the
+dependency code execution.
 
 ### How composition works
 
@@ -1198,6 +1300,13 @@ slash-suffixed; an absent path errors naming the path; binary (non-UTF-8) conten
 refused rather than dumped; and a commit not yet in the mirror points you at
 `phora sync`. `--show` requires a source and refuses to guess when one source has
 several distinct pinned dep commits — it names them so you can disambiguate.
+
+Each listed hook also links to where it is written, at the commit under review:
+`defined: https://github.com/<owner>/<repo>/blob/<commit>/phora.toml#L<line>`. The
+link follows the host the dependency's remote belongs to, through each host's
+`web` template (`{path}`, `{owner}`, `{repo}`, `{commit}`, `{file}`, `{line}`).
+The built-in forges ship one, and `[hosts.<name>] web = "…"` sets your own. A
+remote that matches no host shows its path and line instead.
 
 Approval is consumer-owned and lives in your `phora.lock` (a `[[trusted_hooks]]`
 entry pinned to the hook's command and the exact dep commit it came from);

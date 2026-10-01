@@ -9,7 +9,7 @@ use serde::Deserialize;
 use crate::error::{Error, Result};
 use crate::source::NormalizedUrl;
 
-use super::{DEFAULT_OFFER, DeployMode, Source, Target};
+use super::{BuildInputs, BuildSpec, BuildTool, DEFAULT_OFFER, DeployMode, Source, Target};
 
 /// A transitive dep's `phora.toml`, parsed EXACTLY ONCE into its declarative graph
 /// fields. Trust-control fields (`trust`/`trusted_hooks`/`allow_hooks`) are tolerated
@@ -22,6 +22,7 @@ pub struct TransitiveManifest {
     pub targets: BTreeMap<String, Target>,
     pub offers: BTreeMap<String, ManifestOffer>,
     hooks: Option<toml::Value>,
+    build_lines: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,72 +61,153 @@ pub(crate) fn resolve_offer(
     sources: &BTreeMap<String, Source>,
     targets: &BTreeMap<String, Target>,
 ) -> Result<ResolvedOffer> {
-    let implicit = ManifestOffer::default();
-    let offer = match offers.get(name) {
-        Some(offer) => offer,
-        None if name == DEFAULT_OFFER => &implicit,
-        None => {
-            let declared: Vec<&str> = offers.keys().map(String::as_str).collect();
-            return Err(Error::Config(format!(
-                "no offer `{name}`; declared offers: [{}]",
-                declared.join(", ")
-            )));
-        }
-    };
-    let fail = |detail: String| Error::Config(format!("offer `{name}`: {detail}"));
-    let root = match offer.root.as_deref() {
-        Some(root) if escapes(root) => {
-            return Err(fail(format!(
-                "root `{}` must be a relative subpath of the repo",
-                root.display()
-            )));
-        }
-        Some(root) => normalized(root),
-        None => PathBuf::new(),
-    };
-    let selected: Vec<(&String, &Target)> = match &offer.targets {
-        None => targets
-            .iter()
-            .filter(|(_, target)| {
-                offerable(target, sources).is_ok() && placed(&target.path, &root).is_some()
+    Repo {
+        offers,
+        sources,
+        targets,
+    }
+    .resolve(name, &mut Vec::new())
+}
+
+struct Repo<'a> {
+    offers: &'a BTreeMap<String, ManifestOffer>,
+    sources: &'a BTreeMap<String, Source>,
+    targets: &'a BTreeMap<String, Target>,
+}
+
+impl Repo<'_> {
+    fn resolve(&self, name: &str, resolving: &mut Vec<String>) -> Result<ResolvedOffer> {
+        resolving.push(name.to_owned());
+        let resolved = self.resolve_within(name, resolving);
+        resolving.pop();
+        resolved
+    }
+
+    fn resolve_within(&self, name: &str, resolving: &mut Vec<String>) -> Result<ResolvedOffer> {
+        let implicit = ManifestOffer::default();
+        let offer = match self.offers.get(name) {
+            Some(offer) => offer,
+            None if name == DEFAULT_OFFER => &implicit,
+            None => {
+                let declared: Vec<&str> = self.offers.keys().map(String::as_str).collect();
+                return Err(Error::Config(format!(
+                    "no offer `{name}`; declared offers: [{}]",
+                    declared.join(", ")
+                )));
+            }
+        };
+        let fail = |detail: String| Error::Config(format!("offer `{name}`: {detail}"));
+        let root = match offer.root.as_deref() {
+            Some(root) if escapes(root) => {
+                return Err(fail(format!(
+                    "root `{}` must be a relative subpath of the repo",
+                    root.display()
+                )));
+            }
+            Some(root) => normalized(root),
+            None => PathBuf::new(),
+        };
+        let selected: Vec<(&String, &Target)> = match &offer.targets {
+            None => self
+                .targets
+                .iter()
+                .filter(|(_, target)| {
+                    placed(&target.path, &root).is_some()
+                        && self.offerable(target, resolving).is_ok()
+                })
+                .collect(),
+            Some(keys) => keys
+                .iter()
+                .map(|key| {
+                    let (key, target) = self.targets.get_key_value(key).ok_or_else(|| {
+                        let declared: Vec<&str> = self.targets.keys().map(String::as_str).collect();
+                        fail(format!(
+                            "selects undeclared target `{key}`; declared targets: [{}]",
+                            declared.join(", ")
+                        ))
+                    })?;
+                    self.offerable(target, resolving)
+                        .map_err(|why| fail(format!("target `{key}` cannot be offered: {why}")))?;
+                    if placed(&target.path, &root).is_none() {
+                        return Err(fail(format!(
+                            "target `{key}` at `{}` lies outside the offer root `{}`",
+                            target.path.display(),
+                            root.display()
+                        )));
+                    }
+                    Ok((key, target))
+                })
+                .collect::<Result<_>>()?,
+        };
+        let placed_targets = selected
+            .into_iter()
+            .map(|(key, target)| {
+                let mut target = target.clone();
+                target.path = placed(&target.path, &root).unwrap_or_default();
+                (key.clone(), target)
             })
-            .collect(),
-        Some(keys) => keys
-            .iter()
-            .map(|key| {
-                let (key, target) = targets.get_key_value(key).ok_or_else(|| {
-                    let declared: Vec<&str> = targets.keys().map(String::as_str).collect();
-                    fail(format!(
-                        "selects undeclared target `{key}`; declared targets: [{}]",
-                        declared.join(", ")
-                    ))
-                })?;
-                offerable(target, sources)
-                    .map_err(|why| fail(format!("target `{key}` cannot be offered: {why}")))?;
-                if placed(&target.path, &root).is_none() {
-                    return Err(fail(format!(
-                        "target `{key}` at `{}` lies outside the offer root `{}`",
-                        target.path.display(),
-                        root.display()
-                    )));
-                }
-                Ok((key, target))
-            })
-            .collect::<Result<_>>()?,
-    };
-    let placed_targets = selected
-        .into_iter()
-        .map(|(key, target)| {
-            let mut target = target.clone();
-            target.path = placed(&target.path, &root).unwrap_or_default();
-            (key.clone(), target)
+            .collect();
+        Ok(ResolvedOffer {
+            files: own_files(offer, &root, self.targets)?,
+            targets: placed_targets,
+            root,
         })
-        .collect();
-    Ok(ResolvedOffer {
-        files: own_files(offer, &root, targets)?,
-        targets: placed_targets,
-        root,
-    })
+    }
+
+    fn offerable(
+        &self,
+        target: &Target,
+        resolving: &mut Vec<String>,
+    ) -> std::result::Result<(), String> {
+        if escapes(&target.path) {
+            return Err(format!(
+                "its path `{}` is not a relative subpath of the repo",
+                target.path.display()
+            ));
+        }
+        for (identity, binding) in target.bindings() {
+            let name = binding.effective_source(identity);
+            let Some(source) = self.sources.get(name) else {
+                return Err(format!("it binds undefined source `{name}`"));
+            };
+            if let Some(build) = &source.build {
+                self.offerable_build(name, build, resolving)?;
+                continue;
+            }
+            let kind = if source.path.is_some() {
+                "a local path"
+            } else if source.deploy == Some(DeployMode::Link) {
+                "a linked"
+            } else {
+                continue;
+            };
+            return Err(format!("it binds `{name}`, {kind} source"));
+        }
+        Ok(())
+    }
+
+    fn offerable_build(
+        &self,
+        name: &str,
+        build: &BuildSpec,
+        resolving: &mut Vec<String>,
+    ) -> std::result::Result<(), String> {
+        let (BuildTool::Tool { .. }, BuildInputs::Repo) = (&build.tool, &build.inputs) else {
+            return Err(format!(
+                "it binds `{name}`, a build that runs its own command or reads named \
+                 sources; an offered build names a `tool` and reads this repo's offer"
+            ));
+        };
+        let offer = build.offer.as_deref().unwrap_or(DEFAULT_OFFER);
+        if resolving.iter().any(|o| o == offer) {
+            return Err(format!(
+                "it binds `{name}`, a build that reads its own output through offer `{offer}`"
+            ));
+        }
+        self.resolve(offer, resolving)
+            .map(drop)
+            .map_err(|e| format!("it binds `{name}`, whose input cannot resolve: {e}"))
+    }
 }
 
 fn own_files(
@@ -166,35 +248,6 @@ fn own_files(
         .map_err(|e: toml::de::Error| Error::Config(format!("own files: {e}")))
 }
 
-fn offerable(
-    target: &Target,
-    sources: &BTreeMap<String, Source>,
-) -> std::result::Result<(), String> {
-    if escapes(&target.path) {
-        return Err(format!(
-            "its path `{}` is not a relative subpath of the repo",
-            target.path.display()
-        ));
-    }
-    for (identity, binding) in target.bindings() {
-        let name = binding.effective_source(identity);
-        let Some(source) = sources.get(name) else {
-            return Err(format!("it binds undefined source `{name}`"));
-        };
-        let kind = if source.build.is_some() {
-            "a build"
-        } else if source.path.is_some() {
-            "a local path"
-        } else if source.deploy == Some(DeployMode::Link) {
-            "a linked"
-        } else {
-            continue;
-        };
-        return Err(format!("it binds `{name}`, {kind} source"));
-    }
-    Ok(())
-}
-
 fn placed(path: &Path, root: &Path) -> Option<PathBuf> {
     normalized(path)
         .strip_prefix(root)
@@ -208,6 +261,8 @@ pub const MEMBER_SEPARATOR: char = '%';
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Member {
     Files,
+    /// The whole repo at the instance's snapshot, as a composed build reads it.
+    Repo,
     Named(String),
 }
 
@@ -216,10 +271,10 @@ impl Member {
     #[must_use]
     pub fn of(key: &str) -> Option<Self> {
         let (_, member) = key.split_once(MEMBER_SEPARATOR)?;
-        Some(if member.is_empty() {
-            Self::Files
-        } else {
-            Self::Named(member.to_owned())
+        Some(match member {
+            "" => Self::Files,
+            "%" => Self::Repo,
+            named => Self::Named(named.to_owned()),
         })
     }
 
@@ -260,11 +315,18 @@ impl TransitiveManifest {
         for target in graph.targets.values_mut() {
             target.lower_transitive(|name| sources.get(name).is_some_and(Source::is_transitive));
         }
+        let build_lines = graph
+            .sources
+            .iter()
+            .filter(|(_, source)| source.build.is_some())
+            .filter_map(|(name, _)| Some((name.clone(), super::link::build_line(text, name)?)))
+            .collect();
         Ok(Self {
             sources: graph.sources,
             targets: graph.targets,
             offers: graph.offers,
             hooks,
+            build_lines,
         })
     }
 
@@ -278,6 +340,11 @@ impl TransitiveManifest {
             .then_some(DEFAULT_OFFER)
             .into_iter()
             .chain(self.offers.keys().map(String::as_str))
+    }
+
+    #[must_use]
+    pub fn build_line(&self, source: &str) -> Option<usize> {
+        self.build_lines.get(source).copied()
     }
 
     /// The retained per-target hooks as an uninterpreted payload; never the global `[hooks]`.
@@ -378,6 +445,7 @@ impl Instance {
     pub(crate) fn key(&self, member: &Member) -> String {
         match member {
             Member::Files => format!("{}{MEMBER_SEPARATOR}", self.stable_key()),
+            Member::Repo => format!("{0}{MEMBER_SEPARATOR}{MEMBER_SEPARATOR}", self.stable_key()),
             Member::Named(name) => format!("{}{MEMBER_SEPARATOR}{name}", self.stable_key()),
         }
     }

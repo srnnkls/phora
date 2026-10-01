@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 
 use crate::config::transitive::{FetchNode, Instance, Member, TransitiveManifest};
 use crate::config::{
-    Binding, Config, DeployMode, HookAdmissionDiagnostic, HookCommand, Host, OfferBinding,
-    ParsedSource, Protocol, Refspec, Remote, Source, SourceMode, TakeEntry, Target,
-    admit_transitive_hooks, hook_preimage,
+    Binding, BuildTool, Config, DeployMode, HookAdmissionDiagnostic, HookCommand, Host,
+    OfferBinding, ParsedSource, Protocol, Refspec, Remote, Source, SourceMode, TakeEntry, Target,
+    ToolGrant, admit_transitive_hooks, hook_preimage,
 };
 use crate::error::{Error, Result};
 use crate::projection::offer::OfferSelection;
@@ -103,6 +103,8 @@ pub(crate) struct ResolvedGraph {
     pub(super) import_refs: Vec<ImportResolution>,
     pub(super) hook_candidates: Vec<TransitiveHookCandidate>,
     pub(super) hook_diagnostics: Vec<HookAdmissionDiagnostic>,
+    /// The pinned dependency repos composed builds read, keyed by namespaced name.
+    pub(super) build_inputs: BTreeMap<String, ParsedSource>,
 }
 
 impl ResolvedGraph {
@@ -281,9 +283,11 @@ pub(super) fn resolve_transitive_graph(
                     graph: &mut graph,
                     frozen: &frozen_gate,
                     consumer_hosts: &config.hosts,
+                    consumer_tools: &config.tools,
                     default_protocol: config.protocol,
                     root_source: imported,
                     root_identity: &import.identity,
+                    root_offer: import.offer(),
                     root_anchor: anchor_name,
                 },
                 1,
@@ -439,12 +443,14 @@ struct WalkCtx<'a> {
     graph: &'a mut ResolvedGraph,
     frozen: &'a FrozenGate<'a>,
     consumer_hosts: &'a BTreeMap<String, Host>,
+    consumer_tools: &'a BTreeMap<String, ToolGrant>,
     default_protocol: Option<Protocol>,
     /// Consumer source rooting this subtree; stamped on every hook candidate it yields.
     root_source: &'a str,
     /// Consumer binding identity rooting this subtree; labels its composed targets.
     root_identity: &'a str,
     root_anchor: &'a str,
+    root_offer: &'a str,
 }
 
 /// Checked at the top of every `fetch_manifest` so no depth can fetch an unpinned/drifted node under `--frozen`.
@@ -455,6 +461,7 @@ struct FrozenGate<'a> {
 
 /// One offer of a manifest as composition works over it.
 struct OfferLayout<'m> {
+    manifest: &'m TransitiveManifest,
     root: PathBuf,
     sources: &'m BTreeMap<String, Source>,
     files: Option<Source>,
@@ -466,6 +473,7 @@ impl<'m> OfferLayout<'m> {
     fn new(manifest: &'m TransitiveManifest, name: &str) -> Result<Self> {
         let offer = manifest.offer(name)?;
         Ok(Self {
+            manifest,
             root: offer.root,
             sources: &manifest.sources,
             files: offer.files,
@@ -509,7 +517,7 @@ fn compose_dep(
     depth: usize,
 ) -> Result<()> {
     reject_depth_overflow(imported, depth)?;
-    let source_names = namespace_dep_sources(instance, imported, layout, ctx, depth)?;
+    let source_names = namespace_dep_sources(instance, imported, layout, package, ctx, depth)?;
     let target_paths: Vec<PathBuf> = layout
         .targets
         .values()
@@ -608,6 +616,70 @@ fn own_files_target(
     }
 }
 
+fn namespace_dep_build(
+    instance: &Instance,
+    imported: &str,
+    name: &str,
+    source: &Source,
+    manifest: &TransitiveManifest,
+    package: PackageSnapshot<'_>,
+    ctx: &mut WalkCtx<'_>,
+) -> Result<String> {
+    let fail = |e: Error| Error::Config(format!("source `{imported}`: source `{name}`: {e}"));
+    let repo = instance.key(&Member::Repo);
+    let spec = source
+        .build
+        .as_ref()
+        .map(|build| build.reading_repo_as(&repo));
+    if let Some(BuildTool::Tool { spec: tool, .. }) = spec.as_ref().map(|spec| &spec.tool)
+        && !ctx.consumer_tools.contains_key(&tool.identity)
+    {
+        let defined = crate::config::link::file_link(
+            ctx.consumer_hosts,
+            package.remote(),
+            instance.fetch_node().commit(),
+            "phora.toml",
+            manifest.build_line(name),
+        );
+        return Err(Error::Config(format!(
+            "target `{}`: offer `{}` of `{}` builds with tool `{tool}`; {}\n  defined: {defined}",
+            ctx.root_anchor,
+            ctx.root_offer,
+            ctx.root_identity,
+            crate::config::tools::grant_hint(&tool.identity)
+        )));
+    }
+    if !ctx.graph.build_inputs.contains_key(&repo) {
+        let snapshot = match package {
+            PackageSnapshot::Mirror(remote) => format!(
+                "git = {remote:?}\nrev = {:?}\ntransitive = true\n",
+                instance.fetch_node().commit()
+            ),
+            PackageSnapshot::Worktree(root) => {
+                format!("path = {root:?}\ndeploy = \"link\"\ntransitive = true\n")
+            }
+        };
+        let snapshot: Source =
+            toml::from_str(&snapshot).map_err(|e| fail(Error::Config(e.to_string())))?;
+        ctx.graph
+            .build_inputs
+            .insert(repo.clone(), ParsedSource::parse(&repo, &snapshot)?);
+    }
+    let mut parsed = ParsedSource::parse(name, source).map_err(fail)?;
+    if let Some(spec) = spec {
+        parsed.remote = Remote::Build(spec);
+    }
+    let namespaced = instance.key(&Member::Named(name.to_owned()));
+    ctx.graph
+        .remotes
+        .insert(namespaced.clone(), crate::source::BUILD_MIRROR.to_owned());
+    ctx.graph.sources.insert(namespaced.clone(), parsed);
+    ctx.graph
+        .instances
+        .insert(namespaced.clone(), instance.stable_key());
+    Ok(namespaced)
+}
+
 fn namespace_own_files(
     instance: &Instance,
     imported: &str,
@@ -640,6 +712,7 @@ fn namespace_dep_sources(
     instance: &Instance,
     imported: &str,
     layout: &OfferLayout<'_>,
+    package: PackageSnapshot<'_>,
     ctx: &mut WalkCtx<'_>,
     depth: usize,
 ) -> Result<BTreeMap<String, String>> {
@@ -652,6 +725,19 @@ fn namespace_dep_sources(
     let mut source_names: BTreeMap<String, String> = BTreeMap::new();
     for (inner_name, inner) in layout.sources {
         if !needed.contains(inner_name.as_str()) {
+            continue;
+        }
+        if inner.build.is_some() {
+            let namespaced = namespace_dep_build(
+                instance,
+                imported,
+                inner_name,
+                inner,
+                layout.manifest,
+                package,
+                ctx,
+            )?;
+            source_names.insert(inner_name.clone(), namespaced);
             continue;
         }
         let parsed = ParsedSource::parse(inner_name, inner).map_err(|e| {
@@ -1017,7 +1103,7 @@ fn synthetic_target(
             })?;
             binding.source = Some(namespaced.clone());
             if let Some(take) = take {
-                binding.take = Some(take.to_vec());
+                binding.composed_take = Some(take.to_vec());
             }
             binding.collapse = collapse.or(binding.collapse).or(Some(false));
         }
@@ -1557,7 +1643,7 @@ mod tests {
 
         let binding = binding_of(&synthetic, "nvim");
         let take = binding
-            .take
+            .composed_take
             .as_deref()
             .expect("the consumer's mount take for bound `dep` folds into the binding's `take`");
         assert!(
@@ -1591,7 +1677,7 @@ mod tests {
             binding.source
         );
         let take = binding
-            .take
+            .composed_take
             .as_deref()
             .expect("the consumer mount take folds into the binding");
         assert!(
@@ -1641,11 +1727,11 @@ mod tests {
              two independent instances"
         );
         let take_a = binding_of(&first, "nvim")
-            .take
+            .composed_take
             .as_deref()
             .expect("anchor one take");
         let take_b = binding_of(&second, "nvim")
-            .take
+            .composed_take
             .as_deref()
             .expect("anchor two take");
         assert!(
@@ -1803,7 +1889,7 @@ mod tests {
     }
 
     #[test]
-    fn consumer_mount_take_overrides_a_binding_local_take() {
+    fn a_consumer_take_composes_over_a_binding_local_take() {
         let dep = dep_target_with_binding_local_take();
         let anchor = consumer_anchor("take = [\"consumer-wins.lua\"]");
         let synthetic = synthetic_target(
@@ -1816,18 +1902,18 @@ mod tests {
             mount_for(&anchor).take,
             mount_for(&anchor).collapse,
         )
-        .expect(
-            "a dep whose binding has its own take, mounted under a consumer override, synthesizes",
-        );
+        .expect("a dep whose binding has its own take, under a consumer take, synthesizes");
 
-        let take = binding_of(&synthetic, "nvim")
-            .take
-            .as_deref()
-            .expect("the binding carries a take");
+        let binding = binding_of(&synthetic, "nvim");
         assert!(
-            matches!(take, [TakeEntry::Leaf(s)] if s == "consumer-wins.lua"),
-            "PRECEDENCE: a present consumer mount take must OVERRIDE the dep's binding-local \
-             `take = [\"dep-local.lua\"]`, not be ignored or merged; got: {take:?}"
+            matches!(binding.take.as_deref(), Some([TakeEntry::Leaf(s)]) if s == "dep-local.lua"),
+            "the dep's own take still shapes its output; got: {:?}",
+            binding.take
+        );
+        assert!(
+            matches!(binding.composed_take.as_deref(), Some([TakeEntry::Leaf(s)]) if s == "consumer-wins.lua"),
+            "the consumer take applies to that output; got: {:?}",
+            binding.composed_take
         );
     }
 

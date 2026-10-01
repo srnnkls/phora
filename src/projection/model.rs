@@ -532,6 +532,8 @@ pub struct BindingProjectionInput<'a> {
     pub offer: &'a OfferSpec,
     pub inventory: &'a SourceInventory,
     pub take: &'a TakeSpec,
+    /// A consumer `take` over this binding's output, when a composition placed it.
+    pub composed_take: Option<&'a TakeSpec>,
     pub collapse: CollapsePreference,
     pub history: bool,
     pub materialization: MaterializationPolicy,

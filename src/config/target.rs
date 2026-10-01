@@ -246,6 +246,9 @@ pub struct Binding {
     pub history: bool,
     #[serde(default)]
     pub offer: Option<String>,
+    /// The `take` of the consumer binding that composed this target, applied to its output.
+    #[serde(skip)]
+    pub composed_take: Option<Vec<TakeEntry>>,
 }
 
 impl Binding {
@@ -321,6 +324,7 @@ pub struct ResolvedBinding<'a> {
     pub effective_ref: Refspec,
     pub template_opt_in: TemplateOptIn,
     pub take: Option<&'a [TakeEntry]>,
+    pub composed_take: Option<&'a [TakeEntry]>,
     pub collapse: Option<bool>,
     pub history: bool,
 }
@@ -495,6 +499,7 @@ fn resolve_binding<'a, S: SourceFields>(
         effective_ref: binding_refspec(binding).unwrap_or_else(|| source.intrinsic_refspec()),
         template_opt_in: binding.template_opt_in(),
         take: binding.take.as_deref(),
+        composed_take: binding.composed_take.as_deref(),
         collapse: binding.collapse,
         history: binding.history,
     })
