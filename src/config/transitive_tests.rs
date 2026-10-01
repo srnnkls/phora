@@ -912,42 +912,132 @@ fn local_only_sources_do_not_block_an_import() {
     assert!(manifest.offer("default").is_ok());
 }
 
-const BUILDS: &str = "version = 1\n\n[builders.henia]\nrun = \"henia build\"\n\n";
+const HENIA: &str = "github:srnnkls/henia@0.1.0-alpha.4";
+
+const BUILDS: &str = "version = 1\n\n[tools.\"github:srnnkls/henia\"]\nmise = true\n\n";
+
+fn tool_build(build: &str) -> std::result::Result<crate::config::BuildSpec, String> {
+    let source: Source =
+        toml::from_str(&format!("build = {build}\n")).map_err(|e| e.to_string())?;
+    Ok(source.build.expect("a build"))
+}
+
+fn argv_of(build: &str) -> Vec<String> {
+    match tool_build(build).expect(build).tool {
+        crate::config::BuildTool::Tool { argv, .. } => argv,
+        crate::config::BuildTool::Command { .. } => panic!("{build} is not a tool build"),
+    }
+}
 
 #[test]
-fn a_build_names_a_builder_or_its_own_command_not_both() {
+fn a_tool_build_pins_its_tool_by_identity_and_version() {
+    let build =
+        tool_build(&format!("{{ tool = \"{HENIA}\", cmd = [\"henia\"] }}")).expect("parses");
+    let crate::config::BuildTool::Tool { spec, .. } = build.tool else {
+        panic!("a tool build");
+    };
+    assert_eq!(
+        (spec.identity.as_str(), spec.version.as_str()),
+        ("github:srnnkls/henia", "0.1.0-alpha.4")
+    );
+    let err = tool_build("{ tool = \"github:srnnkls/henia\", cmd = [\"henia\"] }")
+        .expect_err("versionless");
+    assert!(err.contains("<identity>@<version>"), "{err}");
+}
+
+#[test]
+fn a_tool_build_command_never_reaches_a_shell() {
+    assert_eq!(
+        argv_of(&format!(
+            "{{ tool = \"{HENIA}\", run = \"henia build {{input}} --output '{{output}}/a b'\" }}"
+        )),
+        vec!["henia", "build", "{input}", "--output", "{output}/a b"]
+    );
+    assert_eq!(
+        argv_of(&format!(
+            "{{ tool = \"{HENIA}\", cmd = [\"henia\", \"a && b\"] }}"
+        )),
+        vec!["henia", "a && b"]
+    );
+    for run in [
+        "henia build && touch done",
+        "henia $(id)",
+        "henia | tee x",
+        "henia > out",
+    ] {
+        let err = tool_build(&format!("{{ tool = \"{HENIA}\", run = \"{run}\" }}")).expect_err(run);
+        assert!(err.contains("never run a shell"), "{run}: {err}");
+    }
+}
+
+#[test]
+fn a_tool_build_takes_one_command_naming_an_executable() {
     for (build, needle) in [
-        ("{ builder = \"henia\", run = \"make\" }", "not both"),
         (
-            "{ builder = \"henia\", key = \"henia --version\" }",
-            "belongs to the builder",
+            format!("{{ tool = \"{HENIA}\", run = \"henia\", cmd = [\"henia\"] }}"),
+            "not both",
+        ),
+        (format!("{{ tool = \"{HENIA}\" }}"), "needs `run` or `cmd`"),
+        (
+            format!("{{ tool = \"{HENIA}\", cmd = [\"./henia\"] }}"),
+            "not a path",
+        ),
+        (
+            format!("{{ tool = \"{HENIA}\", run = \"henia\", shell = \"bash -c\" }}"),
+            "no `shell` or `key`",
+        ),
+        (
+            format!("{{ tool = \"{HENIA}\", run = \"henia\", key = \"henia --version\" }}"),
+            "no `shell` or `key`",
         ),
     ] {
-        let err = Config::parse(&format!("{BUILDS}[sources.out]\nbuild = {build}\n"))
-            .expect_err(build)
-            .to_string();
+        let err = tool_build(&build).expect_err(&build);
         assert!(err.contains(needle), "{build}: {err}");
     }
 }
 
 #[test]
-fn a_build_naming_an_undeclared_builder_fails_validation() {
-    let config = merged(
-        "version = 1\n\n[sources.out]\nbuild = { builder = \"henia\" }\n\n\
-         [targets.dist]\npath = \"dist\"\nsources = [\"out\"]\n",
-    );
-    let msg = config
-        .validate()
-        .expect_err("undeclared builder")
+fn a_tool_grant_sets_exactly_one_route() {
+    for grant in ["mise = true", "path = \"/usr/local/bin/henia\""] {
+        Config::parse(&format!(
+            "version = 1\n\n[tools.\"github:srnnkls/henia\"]\n{grant}\n"
+        ))
+        .expect(grant);
+    }
+    for grant in ["", "mise = true\npath = \"/bin/henia\"", "mise = false"] {
+        let err = Config::parse(&format!(
+            "version = 1\n\n[tools.\"github:srnnkls/henia\"]\n{grant}\n"
+        ))
+        .expect_err(grant)
         .to_string();
-    assert!(msg.contains("[builders.henia]"), "got: {msg}");
+        assert!(err.contains("exactly one"), "{grant}: {err}");
+    }
+}
+
+#[test]
+fn a_tool_build_needs_its_tool_granted() {
+    let config = merged(&format!(
+        "version = 1\n\n[sources.out]\nbuild = {{ tool = \"{HENIA}\", cmd = [\"henia\"] }}\n\n\
+         [targets.dist]\npath = \"dist\"\nsources = [\"out\"]\n"
+    ));
+    let msg = config.validate().expect_err("ungranted tool").to_string();
+    assert!(
+        msg.contains("[tools.\"github:srnnkls/henia\"]"),
+        "got: {msg}"
+    );
+    merged(&format!(
+        "{BUILDS}[sources.out]\nbuild = {{ tool = \"{HENIA}\", cmd = [\"henia\"] }}\n\n\
+         [targets.dist]\npath = \"dist\"\nsources = [\"out\"]\n"
+    ))
+    .validate()
+    .expect("a granted tool validates");
 }
 
 #[test]
 fn a_build_offer_needs_transitive_inputs() {
     let config = merged(&format!(
         "{BUILDS}[sources.notes]\ngit = \"https://github.com/me/notes.git\"\n\n\
-         [sources.out]\nbuild = {{ builder = \"henia\", inputs = [\"notes\"], offer = \"x\" }}\n\n\
+         [sources.out]\nbuild = {{ tool = \"{HENIA}\", cmd = [\"henia\"], inputs = [\"notes\"], offer = \"x\" }}\n\n\
          [targets.dist]\npath = \"dist\"\nsources = [\"out\"]\n"
     ));
     let msg = config.validate().expect_err("flat input").to_string();
@@ -956,11 +1046,11 @@ fn a_build_offer_needs_transitive_inputs() {
 
 #[test]
 fn an_offer_never_contains_a_build_that_reads_it() {
-    let manifest = TransitiveManifest::parse(
-        "[sources.out]\nbuild = { builder = \"henia\" }\n\n\
+    let manifest = TransitiveManifest::parse(&format!(
+        "[sources.out]\nbuild = {{ tool = \"{HENIA}\", cmd = [\"henia\"] }}\n\n\
          [targets.dist]\npath = \"dist\"\nsources = [\"out\"]\n\n\
-         [offers.built]\ntargets = [\"dist\"]\n",
-    )
+         [offers.built]\ntargets = [\"dist\"]\n"
+    ))
     .expect("manifest parses");
     assert!(
         manifest
@@ -978,4 +1068,63 @@ fn an_offer_never_contains_a_build_that_reads_it() {
             .collect::<Vec<_>>(),
         vec!["dist"]
     );
+    assert_eq!(manifest.build_line("out"), Some(2));
+}
+
+#[test]
+fn a_file_link_follows_the_forge_a_remote_belongs_to() {
+    use crate::config::link::file_link;
+    let hosts = std::collections::BTreeMap::new();
+    for (remote, link) in [
+        (
+            "https://github.com/srnnkls/tropos.git",
+            "https://github.com/srnnkls/tropos/blob/c0ffee/phora.toml#L7",
+        ),
+        (
+            "git@github.com:srnnkls/tropos.git",
+            "https://github.com/srnnkls/tropos/blob/c0ffee/phora.toml#L7",
+        ),
+        (
+            "https://gitlab.com/me/x.git",
+            "https://gitlab.com/me/x/-/blob/c0ffee/phora.toml#L7",
+        ),
+        (
+            "https://codeberg.org/me/x.git",
+            "https://codeberg.org/me/x/src/commit/c0ffee/phora.toml#L7",
+        ),
+        (
+            "https://git.sr.ht/~me/x",
+            "https://git.sr.ht/~me/x/tree/c0ffee/item/phora.toml#L7",
+        ),
+        (
+            "https://bitbucket.org/me/x.git",
+            "https://bitbucket.org/me/x/src/c0ffee/phora.toml#lines-7",
+        ),
+        ("/srv/git/x", "/srv/git/x/phora.toml:7 at c0ffee"),
+    ] {
+        assert_eq!(
+            file_link(&hosts, remote, "c0ffee", "phora.toml", Some(7)),
+            link
+        );
+    }
+    assert_eq!(
+        file_link(
+            &hosts,
+            "https://github.com/srnnkls/tropos.git",
+            "c0ffee",
+            "phora.toml",
+            None
+        ),
+        "https://github.com/srnnkls/tropos/blob/c0ffee/phora.toml"
+    );
+}
+
+#[test]
+fn a_hook_line_points_at_the_command_under_review() {
+    use crate::config::link::hook_line;
+    let manifest = "[targets.nvim]\npath = \"nvim\"\n\n[targets.nvim.hooks]\non_change = [\n  \"./a.sh\",\n  { run = \"./b.sh\" },\n]\n\n[targets.zsh.hooks]\non_change = \"./c.sh\"\n";
+    assert_eq!(hook_line(manifest, "nvim", "./a.sh"), Some(6));
+    assert_eq!(hook_line(manifest, "nvim", "./b.sh"), Some(7));
+    assert_eq!(hook_line(manifest, "zsh", "./c.sh"), Some(11));
+    assert_eq!(hook_line(manifest, "fish", "./d.sh"), None);
 }

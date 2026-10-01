@@ -2,9 +2,11 @@
 
 mod hooks;
 mod host;
+pub mod link;
 mod migrate;
 mod source;
 mod target;
+pub mod tools;
 pub mod transitive;
 
 #[cfg(test)]
@@ -29,13 +31,14 @@ pub use hooks::{
 pub use host::{AuthConfig, Host, RemoteConfig, builtin_forges};
 pub use migrate::MigrationWarning;
 pub use source::{
-    BuildInputs, BuildSpec, BuildTool, Builder, DeployMode, Offer, ParsedSource, Refspec, Remote,
-    Source, SourceMode,
+    BuildInputs, BuildSpec, BuildTool, DeployMode, Offer, ParsedSource, Refspec, Remote, Source,
+    SourceMode, ToolSpec,
 };
 pub use target::{
     Binding, DEFAULT_OFFER, LayoutConfig, LayoutKind, OfferBinding, ResolvedBinding, SourceFields,
     TakeEntry, Target, TemplateOptIn,
 };
+pub use tools::ToolGrant;
 
 fn expand_home(path: &Path) -> PathBuf {
     if let Ok(relative) = path.strip_prefix("~")
@@ -101,7 +104,7 @@ pub struct Config {
     #[serde(default)]
     pub offers: BTreeMap<String, transitive::ManifestOffer>,
     #[serde(default)]
-    pub builders: BTreeMap<String, Builder>,
+    pub tools: BTreeMap<String, ToolGrant>,
 }
 
 impl Config {
@@ -224,11 +227,12 @@ impl Config {
             let Some(build) = &source.build else {
                 continue;
             };
-            if let BuildTool::Builder(builder) = &build.tool
-                && !self.builders.contains_key(builder)
+            if let BuildTool::Tool { spec, .. } = &build.tool
+                && !self.tools.contains_key(&spec.identity)
             {
                 return Err(Error::Config(format!(
-                    "source `{name}`: build needs builder `{builder}`; declare `[builders.{builder}]`"
+                    "source `{name}`: build runs tool `{spec}`; {}",
+                    tools::grant_hint(&spec.identity)
                 )));
             }
             if build.inputs == BuildInputs::Repo {
@@ -808,6 +812,6 @@ fn overlay(base: Config, local: Option<Config>) -> Config {
         merged.hooks = local.hooks;
     }
     merged.vars.extend(local.vars);
-    merged.builders.extend(local.builders);
+    merged.tools.extend(local.tools);
     merged
 }

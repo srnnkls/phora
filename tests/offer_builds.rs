@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tempfile::TempDir;
@@ -46,7 +47,7 @@ const PACKAGE: &str = r#"
 git = "https://example.invalid/loqui.git"
 include = ["languages/**"]
 [sources.harnesses]
-build = { builder = "harness" }
+build = { tool = "test:harness@1", cmd = ["harness"] }
 [targets.loqui]
 path = "skills/loqui/reference/loqui"
 sources = ["loqui"]
@@ -95,7 +96,7 @@ impl Fixture {
         self.root.path().join("builds")
     }
 
-    fn configure(&self, builder: &str, binding: &str) {
+    fn configure(&self, tools: &str, binding: &str) {
         write(
             &self.project.join("phora.toml"),
             &format!(
@@ -103,7 +104,7 @@ impl Fixture {
 [paths]
 cache = "cache"
 state = "state"
-{builder}
+{tools}
 [sources.tropos]
 path = {package:?}
 branch = "main"
@@ -117,20 +118,72 @@ sources.tropos = {{ {binding} }}
         );
     }
 
+    fn harness_script(&self, run: &str) -> PathBuf {
+        let script = self.root.path().join("tools/harness");
+        write(
+            &script,
+            &format!(
+                "#!/bin/sh\nprintf 'build\\n' >> {log:?} && mkdir -p \"$PHORA_OUTPUT/claude\" && {run}\n",
+                log = self.builds_log().display().to_string()
+            ),
+        );
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        script
+    }
+
     fn harness(&self, run: &str) -> String {
         format!(
-            "[builders.harness]\nrun = {:?}\n",
-            format!(
-                "printf 'build\\n' >> {log:?} && mkdir -p \"$PHORA_OUTPUT/claude\" && {run}",
-                log = self.builds_log().display().to_string()
-            )
+            "[tools.\"test:harness\"]\npath = {:?}\n",
+            self.harness_script(run).display().to_string()
         )
+    }
+
+    fn mise_log(&self) -> PathBuf {
+        self.root.path().join("mise.log")
+    }
+
+    fn harness_through_mise(&self, run: &str, installed: bool) -> String {
+        let script = self.harness_script(run);
+        let marker = self.root.path().join("mise-installed");
+        if installed {
+            write(&marker, "");
+        }
+        let mise = self.root.path().join("bin/mise");
+        write(
+            &mise,
+            &format!(
+                "#!/bin/sh\nprintf '%s %s\\n' \"$1\" \"${{MISE_OFFLINE:-online}}\" >> {log:?}\n\
+                 case \"$1\" in\n\
+                 bin-paths) if [ -f {marker:?} ]; then printf '[{{\"name\":\"harness\",\"path\":\"%s\",\"symlink\":false}}]' {script:?}; else printf '[]'; fi ;;\n\
+                 install) touch {marker:?} ;;\n\
+                 esac\n",
+                log = self.mise_log().display().to_string(),
+                marker = marker.display().to_string(),
+                script = script.display().to_string(),
+            ),
+        );
+        std::fs::set_permissions(&mise, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        "[tools.\"test:harness\"]\nmise = true\n".to_owned()
+    }
+
+    fn mise_calls(&self) -> Vec<String> {
+        std::fs::read_to_string(self.mise_log())
+            .map(|log| log.lines().map(str::to_owned).collect())
+            .unwrap_or_default()
     }
 
     fn run(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_phora"))
             .args(args)
             .current_dir(&self.project)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    self.root.path().join("bin").display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
             .env("GIT_CONFIG_GLOBAL", self.root.path().join("gitconfig"))
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .output()
@@ -191,7 +244,7 @@ fn set(paths: &[&str]) -> BTreeSet<String> {
 }
 
 #[test]
-fn an_offered_build_runs_the_consumer_builder_over_the_repo_offer() {
+fn an_offered_build_runs_the_granted_tool_over_the_repo_offer() {
     let fixture = Fixture::new(PACKAGE);
     fixture.configure(&fixture.harness(COPY_INPUT), "offer = \"claude\"");
     fixture.succeeds(&["sync"]);
@@ -220,18 +273,25 @@ fn frozen_replays_an_offered_build_without_running_it() {
 }
 
 #[test]
-fn an_offered_build_needs_the_consumer_to_register_its_builder() {
+fn an_offered_build_needs_its_tool_granted() {
     let fixture = Fixture::new(PACKAGE);
     fixture.configure("", "offer = \"claude\"");
     let stderr = fixture.fails(&["sync"]);
-    assert!(stderr.contains("[builders.harness]"), "{stderr}");
+    assert!(
+        stderr.contains(
+            "target `claude`: offer `claude` of `tropos` builds with tool `test:harness@1`"
+        ) && stderr.contains("[tools.\"test:harness\"]")
+            && stderr.contains("defined:")
+            && stderr.contains("phora.toml:6"),
+        "{stderr}"
+    );
     assert_eq!(fixture.builds(), 0);
 }
 
 #[test]
 fn a_dependency_build_with_its_own_command_is_never_offered() {
     let manifest = PACKAGE.replace(
-        "build = { builder = \"harness\" }",
+        "build = { tool = \"test:harness@1\", cmd = [\"harness\"] }",
         "build = { inputs = [\"loqui\"], run = \"touch \\\"$HOME/pwned\\\"\" }",
     );
     let fixture = Fixture::new(&manifest);
@@ -261,7 +321,7 @@ fn an_offered_build_runs_outside_the_consumer_project() {
     let cwd = std::fs::read_to_string(fixture.project.join("home/.claude/cwd")).expect("cwd");
     assert!(
         !Path::new(cwd.trim()).starts_with(&fixture.project),
-        "the builder ran in the consumer project: {cwd}"
+        "the tool ran in the consumer project: {cwd}"
     );
 }
 
@@ -280,8 +340,8 @@ fn an_offered_build_cannot_emit_a_link_out_of_its_output() {
 #[test]
 fn an_offer_a_build_reads_cannot_select_the_build_itself() {
     let manifest = format!("{PACKAGE}[offers.loop]\ntargets = [\"claude\"]\n").replace(
-        "build = { builder = \"harness\" }",
-        "build = { builder = \"harness\", offer = \"loop\" }",
+        "build = { tool = \"test:harness@1\", cmd = [\"harness\"] }",
+        "build = { tool = \"test:harness@1\", cmd = [\"harness\"], offer = \"loop\" }",
     );
     let fixture = Fixture::new(&manifest);
     fixture.configure(&fixture.harness(COPY_INPUT), "offer = \"claude\"");
@@ -342,11 +402,7 @@ fn an_offered_build_cannot_read_a_link_out_of_its_input() {
     git(&loqui, &["commit", "-qm", "link"]);
     fixture.configure(&fixture.harness(COPY_INPUT), "offer = \"claude\"");
     fixture.fails(&["sync"]);
-    assert_eq!(
-        fixture.builds(),
-        0,
-        "the builder never sees the planted link"
-    );
+    assert_eq!(fixture.builds(), 0, "the tool never sees the planted link");
     assert!(
         !fixture
             .project
@@ -404,4 +460,85 @@ fn a_consumer_take_composes_over_the_dependency_target_take() {
     );
     fixture.succeeds(&["sync"]);
     assert_eq!(fixture.deployed(), set(&["skill"]));
+}
+
+#[test]
+fn a_tool_granted_through_mise_installs_its_pin_then_runs_from_the_listed_path() {
+    let fixture = Fixture::new(PACKAGE);
+    fixture.configure(
+        &fixture.harness_through_mise(COPY_INPUT, false),
+        "offer = \"claude\"",
+    );
+    fixture.succeeds(&["sync"]);
+    assert_eq!(fixture.builds(), 1);
+    assert_eq!(
+        fixture.mise_calls(),
+        vec!["bin-paths 1", "install online", "bin-paths 1"],
+        "resolution is offline; only a missing pin installs"
+    );
+    assert!(fixture.deployed().contains("skills/code/SKILL.md"));
+}
+
+#[test]
+fn frozen_never_asks_mise() {
+    let fixture = Fixture::new(PACKAGE);
+    fixture.configure(
+        &fixture.harness_through_mise(COPY_INPUT, true),
+        "offer = \"claude\"",
+    );
+    fixture.succeeds(&["sync"]);
+    std::fs::remove_file(fixture.mise_log()).expect("reset mise log");
+    std::fs::remove_dir_all(fixture.project.join("home")).expect("remove deployment");
+    fixture.succeeds(&["sync", "--frozen"]);
+    assert!(
+        fixture.mise_calls().is_empty(),
+        "{:?}",
+        fixture.mise_calls()
+    );
+    assert!(fixture.deployed().contains("skills/code/SKILL.md"));
+}
+
+#[test]
+fn a_tool_runs_only_executables_it_provides() {
+    let manifest = PACKAGE.replace(
+        "cmd = [\"harness\"]",
+        "cmd = [\"sh\", \"-c\", \"touch pwned\"]",
+    );
+    let fixture = Fixture::new(&manifest);
+    fixture.configure(
+        &fixture.harness_through_mise(COPY_INPUT, true),
+        "offer = \"claude\"",
+    );
+    let stderr = fixture.fails(&["sync"]);
+    assert!(
+        stderr.contains("provides no executable `sh`") && stderr.contains("[harness]"),
+        "{stderr}"
+    );
+    assert_eq!(fixture.builds(), 0);
+}
+
+#[test]
+fn an_interpreter_cannot_be_granted_as_a_tool() {
+    let fixture = Fixture::new(PACKAGE);
+    fixture.configure(
+        "[tools.\"test:harness\"]\npath = \"/bin/sh\"\n",
+        "offer = \"claude\"",
+    );
+    let stderr = fixture.fails(&["sync"]);
+    assert!(stderr.contains("interpreter `sh`"), "{stderr}");
+}
+
+#[test]
+fn a_changed_tool_binary_rebuilds() {
+    let fixture = Fixture::new(PACKAGE);
+    fixture.configure(&fixture.harness(COPY_INPUT), "offer = \"claude\"");
+    fixture.succeeds(&["sync"]);
+    fixture.succeeds(&["sync"]);
+    assert_eq!(fixture.builds(), 1);
+    fixture.configure(
+        &fixture.harness(&format!("{COPY_INPUT} && true")),
+        "offer = \"claude\"",
+    );
+    fixture.succeeds(&["sync"]);
+    assert_eq!(fixture.builds(), 2);
 }

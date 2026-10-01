@@ -24,6 +24,7 @@ pub(crate) mod scan;
 pub(crate) mod stage;
 pub mod state;
 mod target;
+mod tool;
 pub(crate) mod transitive;
 mod verify;
 

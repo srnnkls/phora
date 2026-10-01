@@ -806,6 +806,21 @@ pub(super) fn render_add_contribution(
                     "      note: carries a hook, stripped and inert until you `phora trust` it"
                 );
             }
+            for (identity, binding) in config.bindings() {
+                let built = manifest
+                    .sources
+                    .get(binding.effective_source(identity))
+                    .and_then(|source| source.build.as_ref());
+                if let Some(crate::config::BuildTool::Tool { spec, .. }) =
+                    built.map(|build| &build.tool)
+                {
+                    let _ = writeln!(
+                        out,
+                        "      builds with tool `{spec}`; {}",
+                        crate::config::tools::grant_hint(&spec.identity)
+                    );
+                }
+            }
         }
     }
     let _ = writeln!(

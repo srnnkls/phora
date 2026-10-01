@@ -22,6 +22,7 @@ pub struct TransitiveManifest {
     pub targets: BTreeMap<String, Target>,
     pub offers: BTreeMap<String, ManifestOffer>,
     hooks: Option<toml::Value>,
+    build_lines: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -191,10 +192,10 @@ impl Repo<'_> {
         build: &BuildSpec,
         resolving: &mut Vec<String>,
     ) -> std::result::Result<(), String> {
-        let (BuildTool::Builder(_), BuildInputs::Repo) = (&build.tool, &build.inputs) else {
+        let (BuildTool::Tool { .. }, BuildInputs::Repo) = (&build.tool, &build.inputs) else {
             return Err(format!(
                 "it binds `{name}`, a build that runs its own command or reads named \
-                 sources; an offered build names a `builder` and reads this repo's offer"
+                 sources; an offered build names a `tool` and reads this repo's offer"
             ));
         };
         let offer = build.offer.as_deref().unwrap_or(DEFAULT_OFFER);
@@ -314,11 +315,18 @@ impl TransitiveManifest {
         for target in graph.targets.values_mut() {
             target.lower_transitive(|name| sources.get(name).is_some_and(Source::is_transitive));
         }
+        let build_lines = graph
+            .sources
+            .iter()
+            .filter(|(_, source)| source.build.is_some())
+            .filter_map(|(name, _)| Some((name.clone(), super::link::build_line(text, name)?)))
+            .collect();
         Ok(Self {
             sources: graph.sources,
             targets: graph.targets,
             offers: graph.offers,
             hooks,
+            build_lines,
         })
     }
 
@@ -332,6 +340,11 @@ impl TransitiveManifest {
             .then_some(DEFAULT_OFFER)
             .into_iter()
             .chain(self.offers.keys().map(String::as_str))
+    }
+
+    #[must_use]
+    pub fn build_line(&self, source: &str) -> Option<usize> {
+        self.build_lines.get(source).copied()
     }
 
     /// The retained per-target hooks as an uninterpreted payload; never the global `[hooks]`.

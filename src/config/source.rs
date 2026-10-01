@@ -74,8 +74,65 @@ pub enum BuildTool {
         command: HookCommand,
         key: Option<HookCommand>,
     },
-    /// A consumer-registered `[builders.<name>]`.
-    Builder(String),
+    /// A granted tool run as argv, never through a shell.
+    Tool { spec: ToolSpec, argv: Vec<String> },
+}
+
+/// `<identity>@<version>`; the identity doubles as a mise tool spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolSpec {
+    pub identity: String,
+    pub version: String,
+}
+
+impl std::str::FromStr for ToolSpec {
+    type Err = String;
+
+    fn from_str(raw: &str) -> std::result::Result<Self, String> {
+        match raw.rsplit_once('@') {
+            Some((identity, version)) if !identity.is_empty() && !version.is_empty() => Ok(Self {
+                identity: identity.to_owned(),
+                version: version.to_owned(),
+            }),
+            _ => Err(format!(
+                "`tool = \"{raw}\"` needs an identity and a version, as `<identity>@<version>`"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for ToolSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}@{}", self.identity, self.version)
+    }
+}
+
+const SHELL_SYNTAX: &[char] = &[';', '&', '|', '$', '`', '<', '>'];
+
+fn tool_argv(
+    run: Option<String>,
+    cmd: Option<Vec<String>>,
+) -> std::result::Result<Vec<String>, String> {
+    let argv = match (run, cmd) {
+        (Some(_), Some(_)) => return Err("a tool build sets `run` or `cmd`, not both".to_owned()),
+        (None, None) => return Err("a tool build needs `run` or `cmd`".to_owned()),
+        (None, Some(cmd)) => cmd,
+        (Some(run), None) => {
+            if run.contains(SHELL_SYNTAX) {
+                return Err(format!(
+                    "tool builds never run a shell; pass separate arguments instead of `{run}`"
+                ));
+            }
+            shlex::split(&run).ok_or_else(|| format!("`run = \"{run}\"` has unbalanced quotes"))?
+        }
+    };
+    match argv.first() {
+        None => Err("a tool build's command is empty".to_owned()),
+        Some(program) if program.contains('/') => Err(format!(
+            "a tool build names the tool's executable, not a path: `{program}`"
+        )),
+        Some(_) => Ok(argv),
+    }
 }
 
 impl<'de> Deserialize<'de> for BuildSpec {
@@ -87,26 +144,25 @@ impl<'de> Deserialize<'de> for BuildSpec {
         struct BuildTable {
             inputs: Option<Vec<String>>,
             offer: Option<String>,
-            builder: Option<String>,
+            tool: Option<String>,
             run: Option<String>,
             shell: Option<String>,
             cmd: Option<Vec<String>>,
             key: Option<HookCommand>,
         }
         let table = BuildTable::deserialize(deserializer)?;
-        let tool = match table.builder {
-            Some(builder) => {
-                if table.run.is_some() || table.shell.is_some() || table.cmd.is_some() {
+        let tool = match table.tool {
+            Some(tool) => {
+                if table.shell.is_some() || table.key.is_some() {
                     return Err(serde::de::Error::custom(
-                        "a build names a `builder` or its own command, not both",
+                        "a tool build takes no `shell` or `key`: it never runs a shell, and its \
+                         version pin is its key",
                     ));
                 }
-                if table.key.is_some() {
-                    return Err(serde::de::Error::custom(
-                        "`key` belongs to the builder, not to a build that names one",
-                    ));
+                BuildTool::Tool {
+                    spec: tool.parse().map_err(serde::de::Error::custom)?,
+                    argv: tool_argv(table.run, table.cmd).map_err(serde::de::Error::custom)?,
                 }
-                BuildTool::Builder(builder)
             }
             None => BuildTool::Command {
                 command: super::hooks::validated_command(table.run, table.shell, table.cmd)?,
@@ -121,33 +177,6 @@ impl<'de> Deserialize<'de> for BuildSpec {
     }
 }
 
-/// A consumer-owned command a build names instead of carrying its own.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Builder {
-    pub command: HookCommand,
-    pub key: Option<HookCommand>,
-}
-
-impl<'de> Deserialize<'de> for Builder {
-    fn deserialize<D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct BuilderTable {
-            run: Option<String>,
-            shell: Option<String>,
-            cmd: Option<Vec<String>>,
-            key: Option<HookCommand>,
-        }
-        let table = BuilderTable::deserialize(deserializer)?;
-        Ok(Self {
-            command: super::hooks::validated_command(table.run, table.shell, table.cmd)?,
-            key: table.key,
-        })
-    }
-}
-
 impl BuildSpec {
     #[must_use]
     pub fn named_inputs(&self) -> &[String] {
@@ -157,30 +186,17 @@ impl BuildSpec {
         }
     }
 
-    pub(crate) fn lowered(&self, builders: &BTreeMap<String, Builder>, repo: &str) -> Result<Self> {
-        let tool = match &self.tool {
-            BuildTool::Builder(name) => {
-                let builder = builders.get(name).ok_or_else(|| {
-                    Error::Config(format!(
-                        "build needs builder `{name}`; declare `[builders.{name}]`"
-                    ))
-                })?;
-                BuildTool::Command {
-                    command: builder.command.clone(),
-                    key: builder.key.clone(),
-                }
-            }
-            command @ BuildTool::Command { .. } => command.clone(),
-        };
+    #[must_use]
+    pub(crate) fn reading_repo_as(&self, repo: &str) -> Self {
         let inputs = match &self.inputs {
             BuildInputs::Repo => BuildInputs::Root(repo.to_owned()),
             inputs => inputs.clone(),
         };
-        Ok(Self {
+        Self {
             inputs,
             offer: self.offer.clone(),
-            tool,
-        })
+            tool: self.tool.clone(),
+        }
     }
 }
 

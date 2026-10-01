@@ -72,6 +72,8 @@ struct TrustDiff {
     trusted_hooks: Vec<TrustedHook>,
     dep_urls: Vec<String>,
     surface: Option<(ResolvedGraph, Lock)>,
+    lock: Option<Lock>,
+    hosts: std::collections::BTreeMap<String, crate::config::Host>,
 }
 
 impl TrustDiff {
@@ -91,10 +93,50 @@ impl TrustDiff {
             trusted_hooks,
             dep_urls,
             surface: None,
+            lock: base_lock.cloned(),
+            hosts: std::collections::BTreeMap::new(),
         }
     }
 
+    /// Where the candidate's hook is written, at the commit under review.
+    fn definition(&self, candidate: &CandidateHookRecord) -> Option<String> {
+        let (head, _) = candidate.hook_id.split_once('#')?;
+        let Some(Member::Named(target)) = Member::of(head) else {
+            return None;
+        };
+        let package = self.lock.as_ref()?.sources.iter().find(|s| {
+            s.instance.as_deref() == Some(candidate.dep_instance.as_str())
+                && matches!(Member::of(&s.name), Some(Member::Files | Member::Repo))
+        })?;
+        let manifest = if package.resolved == "link" {
+            std::fs::read_to_string(Path::new(&package.git).join("phora.toml")).ok()?
+        } else {
+            let backend = self.backend.as_ref()?;
+            show_entry(
+                backend,
+                &candidate.source,
+                &package.git,
+                &candidate.commit,
+                Path::new("phora.toml"),
+            )
+            .ok()??
+            .join("\n")
+        };
+        let line = crate::config::link::hook_line(&manifest, &target, &candidate.command);
+        Some(format!(
+            "  defined: {}",
+            crate::config::link::file_link(
+                &self.hosts,
+                &package.git,
+                &candidate.commit,
+                "phora.toml",
+                line
+            )
+        ))
+    }
+
     fn attach_surface(&mut self, config: &crate::config::Config, base_lock: Option<&Lock>) {
+        self.hosts.clone_from(&config.hosts);
         let Some(lock) = base_lock else { return };
         let Some(backend) = self.backend.as_ref() else {
             return;
@@ -110,6 +152,13 @@ impl TrustDiff {
     }
 
     fn lines_for(&self, candidate: &CandidateHookRecord) -> Vec<String> {
+        self.definition(candidate)
+            .into_iter()
+            .chain(self.review_lines(candidate))
+            .collect()
+    }
+
+    fn review_lines(&self, candidate: &CandidateHookRecord) -> Vec<String> {
         let candidate_key = commit_stable_hook_key(&candidate.hook_id);
         let priors: Vec<&TrustedHook> = self
             .trusted_hooks

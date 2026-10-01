@@ -7,7 +7,7 @@ use std::process::Stdio;
 use crate::config::transitive::{MEMBER_SEPARATOR, Member};
 use crate::config::{
     BuildInputs, BuildSpec, BuildTool, Config, DEFAULT_SHELL_PREFIX, DeployMode, HookCommand,
-    ParsedSource, Refspec, Source, Target,
+    ParsedSource, Refspec, Source, Target, ToolSpec,
 };
 use crate::error::{Error, Result};
 use crate::lock::{BUILD_RESOLVED, LockedSource, encode_ref};
@@ -22,7 +22,7 @@ use super::resolve::{RoutedSources, selected_source_digest};
 use super::state::FileStateStore;
 use super::{
     RunOptions, SyncRunInput, SyncStatus, SyncWarning, SyncWorkspace, effective_lock, hooks,
-    resolved_remotes, sync_workspace, transitive,
+    resolved_remotes, sync_workspace, tool, transitive,
 };
 
 pub(super) struct Built {
@@ -104,7 +104,7 @@ pub(super) fn run(
     for (name, source, spec) in specs {
         let mut available = parsed.clone();
         let spec = match scope {
-            Scope::Own => own_lowered(config, name, spec, &mut available)?,
+            Scope::Own => own_lowered(name, spec, &mut available)?,
             Scope::Composed { inputs, .. } => {
                 available.extend(inputs.iter().map(|(k, v)| (k.clone(), v.clone())));
                 spec.clone()
@@ -120,15 +120,8 @@ pub(super) fn run(
             let linked = linked_input(spec, &available, config)?;
             reject_escaping_symlinks(&inputs, linked.as_deref())?;
         }
-        let key = build_key(spec, &inputs, cwd)?;
-        let locked = effective_lock(input).and_then(|lock| {
-            lock.find_entry(name, None)
-                .filter(|l| l.resolved == BUILD_RESOLVED)
-                .cloned()
-        });
-        let previous = locked
-            .as_ref()
-            .and_then(|l| pinned_output(backend, name, &l.commit).ok().map(|r| (l, r)));
+        let previous = previous_output(input, backend, name);
+        let (program, key) = program_and_key(input, config, spec, &inputs, cwd, previous.as_ref())?;
 
         let (resolved, key) = match previous {
             Some((locked, resolved)) if locked.build.as_deref() == Some(key.as_str()) => {
@@ -143,7 +136,12 @@ pub(super) fn run(
             }
             previous => {
                 let output = scratch.path.join("output");
-                match execute(name, spec, &inputs, &output, cwd, backend) {
+                let Some(program) = &program else {
+                    return Err(Error::Lock(format!(
+                        "build source `{name}` has no locked output; --frozen refuses to run a build"
+                    )));
+                };
+                match execute(name, program, &inputs, &output, cwd, backend) {
                     Ok(resolved) => (resolved, key),
                     Err(error) => {
                         let Some((locked, resolved)) = previous else {
@@ -182,6 +180,40 @@ pub(super) fn run(
     }
     input.sink().phase_finished(Phase::Build);
     Ok(builds)
+}
+
+fn previous_output(
+    input: &SyncRunInput<'_>,
+    backend: &dyn SourceStore,
+    name: &str,
+) -> Option<(LockedSource, ResolvedSource)> {
+    let locked = effective_lock(input).and_then(|lock| {
+        lock.find_entry(name, None)
+            .filter(|l| l.resolved == BUILD_RESOLVED)
+            .cloned()
+    })?;
+    let resolved = pinned_output(backend, name, &locked.commit).ok()?;
+    Some((locked, resolved))
+}
+
+/// A frozen tool build replays its locked key without resolving the tool.
+fn program_and_key<'a>(
+    input: &SyncRunInput<'_>,
+    config: &Config,
+    spec: &'a BuildSpec,
+    inputs: &Path,
+    cwd: Option<&Path>,
+    previous: Option<&(LockedSource, ResolvedSource)>,
+) -> Result<(Option<Program<'a>>, String)> {
+    if input.frozen() && matches!(spec.tool, BuildTool::Tool { .. }) {
+        let key = previous
+            .and_then(|(locked, _)| locked.build.clone())
+            .unwrap_or_default();
+        return Ok((None, key));
+    }
+    let program = program(spec, config)?;
+    let key = build_key(&program, inputs, cwd)?;
+    Ok((Some(program), key))
 }
 
 /// Deploys through a private registry, so inputs land exactly as a target would receive them.
@@ -311,7 +343,6 @@ fn anchor(path: &Path, source: &str, transitive: bool, offer: Option<&str>) -> R
 }
 
 fn own_lowered(
-    config: &Config,
     name: &str,
     spec: &BuildSpec,
     available: &mut BTreeMap<String, ParsedSource>,
@@ -322,8 +353,7 @@ fn own_lowered(
             .map_err(|e| Error::Config(format!("build `{name}`: {e}")))?;
         available.insert(repo.clone(), ParsedSource::parse(&repo, &source)?);
     }
-    spec.lowered(&config.builders, &repo)
-        .map_err(|e| Error::Config(format!("source `{name}`: {e}")))
+    Ok(spec.reading_repo_as(&repo))
 }
 
 fn linked_input(
@@ -370,16 +400,15 @@ fn reject_escaping_symlinks(root: &Path, linked: Option<&Path>) -> Result<()> {
 /// worktree content, and the scratch directory is gone after the build.
 fn execute(
     name: &str,
-    spec: &BuildSpec,
+    program: &Program<'_>,
     inputs: &Path,
     output: &Path,
     cwd: Option<&Path>,
     backend: &dyn SourceStore,
 ) -> Result<ResolvedSource> {
-    let (command, _) = commands(spec)?;
     std::fs::create_dir_all(output)
         .map_err(|e| Error::Sync(format!("create build output {}: {e}", output.display())))?;
-    let mut process = hooks::command(command)?;
+    let mut process = program.command(inputs, output)?;
     if let Some(cwd) = cwd {
         process.current_dir(cwd);
     }
@@ -389,11 +418,11 @@ fn execute(
         .env("PHORA_SOURCE", name)
         .stdout(Stdio::from(std::io::stderr()))
         .status()
-        .map_err(|e| Error::Sync(format!("run `{}`: {e}", command.display())))?;
+        .map_err(|e| Error::Sync(format!("run `{}`: {e}", program.display())))?;
     if !status.success() {
         return Err(Error::Sync(format!(
             "`{}` exited with {status}",
-            command.display()
+            program.display()
         )));
     }
     if cwd.is_some() {
@@ -430,41 +459,103 @@ fn pinned_output(backend: &dyn SourceStore, name: &str, commit: &str) -> Result<
         .map_err(Into::into)
 }
 
-fn commands(spec: &BuildSpec) -> Result<(&HookCommand, Option<&HookCommand>)> {
+enum Program<'a> {
+    Command {
+        command: &'a HookCommand,
+        key: Option<&'a HookCommand>,
+    },
+    Tool {
+        spec: &'a ToolSpec,
+        argv: &'a [String],
+        tool: tool::ResolvedTool,
+    },
+}
+
+fn program<'a>(spec: &'a BuildSpec, config: &Config) -> Result<Program<'a>> {
     match &spec.tool {
-        BuildTool::Command { command, key } => Ok((command, key.as_ref())),
-        BuildTool::Builder(builder) => Err(Error::Config(format!(
-            "build names builder `{builder}`, which was never resolved"
-        ))),
+        BuildTool::Command { command, key } => Ok(Program::Command {
+            command,
+            key: key.as_ref(),
+        }),
+        BuildTool::Tool { spec, argv } => {
+            let grant = config.tools.get(&spec.identity).ok_or_else(|| {
+                Error::Config(format!(
+                    "build runs tool `{spec}`; {}",
+                    crate::config::tools::grant_hint(&spec.identity)
+                ))
+            })?;
+            Ok(Program::Tool {
+                spec,
+                argv,
+                tool: tool::resolve(grant, spec, &argv[0])?,
+            })
+        }
     }
 }
 
-fn build_key(spec: &BuildSpec, inputs: &Path, cwd: Option<&Path>) -> Result<String> {
-    let (command, key) = commands(spec)?;
+impl Program<'_> {
+    fn command(&self, inputs: &Path, output: &Path) -> Result<std::process::Command> {
+        match self {
+            Self::Command { command, .. } => hooks::command(command),
+            Self::Tool { argv, tool, .. } => {
+                let mut process = std::process::Command::new(&tool.path);
+                process.args(argv[1..].iter().map(|arg| {
+                    arg.replace("{input}", &inputs.to_string_lossy())
+                        .replace("{output}", &output.to_string_lossy())
+                }));
+                Ok(process)
+            }
+        }
+    }
+
+    fn display(&self) -> String {
+        match self {
+            Self::Command { command, .. } => command.display(),
+            Self::Tool { argv, tool, .. } => {
+                format!("{} {}", tool.path.display(), argv[1..].join(" "))
+            }
+        }
+    }
+}
+
+fn build_key(program: &Program<'_>, inputs: &Path, cwd: Option<&Path>) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
     let mut field = |bytes: &[u8]| {
         hasher.update(&(bytes.len() as u64).to_le_bytes());
         hasher.update(bytes);
     };
     field(b"phora build key v1");
-    command_fields(command, &mut field);
-    if let Some(key) = key {
-        let mut process = hooks::command(key)?;
-        if let Some(cwd) = cwd {
-            process.current_dir(cwd);
+    match program {
+        Program::Command { command, key } => {
+            command_fields(command, &mut field);
+            if let Some(key) = key {
+                let mut process = hooks::command(key)?;
+                if let Some(cwd) = cwd {
+                    process.current_dir(cwd);
+                }
+                let output = process
+                    .stderr(Stdio::inherit())
+                    .output()
+                    .map_err(|e| Error::Sync(format!("run build key `{}`: {e}", key.display())))?;
+                if !output.status.success() {
+                    return Err(Error::Sync(format!(
+                        "build key `{}` exited with {}",
+                        key.display(),
+                        output.status
+                    )));
+                }
+                field(&output.stdout);
+            }
         }
-        let output = process
-            .stderr(Stdio::inherit())
-            .output()
-            .map_err(|e| Error::Sync(format!("run build key `{}`: {e}", key.display())))?;
-        if !output.status.success() {
-            return Err(Error::Sync(format!(
-                "build key `{}` exited with {}",
-                key.display(),
-                output.status
-            )));
+        Program::Tool { spec, argv, tool } => {
+            field(b"tool");
+            field(spec.identity.as_bytes());
+            field(spec.version.as_bytes());
+            for arg in *argv {
+                field(arg.as_bytes());
+            }
+            field(tool.digest.as_bytes());
         }
-        field(&output.stdout);
     }
     let mut files = Vec::new();
     for entry in walkdir::WalkDir::new(inputs)

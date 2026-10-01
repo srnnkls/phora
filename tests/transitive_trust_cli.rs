@@ -1471,3 +1471,44 @@ fn trust_show_reads_a_file_offline_from_the_mirror_after_the_source_repos_are_de
          print the file's contents resolved from the mirror; got:\n{stdout}"
     );
 }
+
+#[test]
+fn trust_list_links_each_hook_to_its_definition_at_the_candidate_commit() {
+    let leaf = TempDir::new().expect("leaf repo");
+    leaf_repo(leaf.path(), "leaf.txt", "payload\n");
+    let mut fixture = build_fixture();
+    let dep = TempDir::new().expect("dep repo");
+    dep_with_on_change_hook(dep.path(), &sentinel(&fixture).display().to_string());
+    fixture.map_url("https://github.com/mock/leaf.git", leaf.path());
+    fixture.map_url("https://github.com/mock/kit.git", dep.path());
+    fixture.finish_gitconfig();
+    write(
+        &fixture.cwd.path().join("phora.toml"),
+        b"version = 1\n\n[sources.nvim-kit]\ngit = \"https://github.com/mock/kit.git\"\ntransitive = true\n\n\
+          [targets.xdg-config]\npath = \"~/.config\"\nsources = [\"nvim-kit\"]\n",
+    );
+    fixture.repos.push(leaf);
+    fixture.repos.push(dep);
+
+    let seed = run(&fixture, &["sync", "--no-transitive-hooks"]);
+    assert!(
+        seed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+    let out = run(&fixture, &["trust", "nvim-kit", "--list"]);
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let defined = shown
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("defined: "))
+        .unwrap_or_else(|| panic!("no definition link in:\n{shown}"));
+    assert!(
+        defined.starts_with("https://github.com/mock/kit/blob/")
+            && defined.ends_with("/phora.toml#L12"),
+        "{defined}"
+    );
+}

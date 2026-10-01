@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 
 use crate::config::transitive::{FetchNode, Instance, Member, TransitiveManifest};
 use crate::config::{
-    Binding, Builder, Config, DeployMode, HookAdmissionDiagnostic, HookCommand, Host, OfferBinding,
-    ParsedSource, Protocol, Refspec, Remote, Source, SourceMode, TakeEntry, Target,
-    admit_transitive_hooks, hook_preimage,
+    Binding, BuildTool, Config, DeployMode, HookAdmissionDiagnostic, HookCommand, Host,
+    OfferBinding, ParsedSource, Protocol, Refspec, Remote, Source, SourceMode, TakeEntry, Target,
+    ToolGrant, admit_transitive_hooks, hook_preimage,
 };
 use crate::error::{Error, Result};
 use crate::projection::offer::OfferSelection;
@@ -283,10 +283,11 @@ pub(super) fn resolve_transitive_graph(
                     graph: &mut graph,
                     frozen: &frozen_gate,
                     consumer_hosts: &config.hosts,
-                    consumer_builders: &config.builders,
+                    consumer_tools: &config.tools,
                     default_protocol: config.protocol,
                     root_source: imported,
                     root_identity: &import.identity,
+                    root_offer: import.offer(),
                     root_anchor: anchor_name,
                 },
                 1,
@@ -442,13 +443,14 @@ struct WalkCtx<'a> {
     graph: &'a mut ResolvedGraph,
     frozen: &'a FrozenGate<'a>,
     consumer_hosts: &'a BTreeMap<String, Host>,
-    consumer_builders: &'a BTreeMap<String, Builder>,
+    consumer_tools: &'a BTreeMap<String, ToolGrant>,
     default_protocol: Option<Protocol>,
     /// Consumer source rooting this subtree; stamped on every hook candidate it yields.
     root_source: &'a str,
     /// Consumer binding identity rooting this subtree; labels its composed targets.
     root_identity: &'a str,
     root_anchor: &'a str,
+    root_offer: &'a str,
 }
 
 /// Checked at the top of every `fetch_manifest` so no depth can fetch an unpinned/drifted node under `--frozen`.
@@ -459,6 +461,7 @@ struct FrozenGate<'a> {
 
 /// One offer of a manifest as composition works over it.
 struct OfferLayout<'m> {
+    manifest: &'m TransitiveManifest,
     root: PathBuf,
     sources: &'m BTreeMap<String, Source>,
     files: Option<Source>,
@@ -470,6 +473,7 @@ impl<'m> OfferLayout<'m> {
     fn new(manifest: &'m TransitiveManifest, name: &str) -> Result<Self> {
         let offer = manifest.offer(name)?;
         Ok(Self {
+            manifest,
             root: offer.root,
             sources: &manifest.sources,
             files: offer.files,
@@ -617,6 +621,7 @@ fn namespace_dep_build(
     imported: &str,
     name: &str,
     source: &Source,
+    manifest: &TransitiveManifest,
     package: PackageSnapshot<'_>,
     ctx: &mut WalkCtx<'_>,
 ) -> Result<String> {
@@ -625,9 +630,25 @@ fn namespace_dep_build(
     let spec = source
         .build
         .as_ref()
-        .map(|build| build.lowered(ctx.consumer_builders, &repo))
-        .transpose()
-        .map_err(fail)?;
+        .map(|build| build.reading_repo_as(&repo));
+    if let Some(BuildTool::Tool { spec: tool, .. }) = spec.as_ref().map(|spec| &spec.tool)
+        && !ctx.consumer_tools.contains_key(&tool.identity)
+    {
+        let defined = crate::config::link::file_link(
+            ctx.consumer_hosts,
+            package.remote(),
+            instance.fetch_node().commit(),
+            "phora.toml",
+            manifest.build_line(name),
+        );
+        return Err(Error::Config(format!(
+            "target `{}`: offer `{}` of `{}` builds with tool `{tool}`; {}\n  defined: {defined}",
+            ctx.root_anchor,
+            ctx.root_offer,
+            ctx.root_identity,
+            crate::config::tools::grant_hint(&tool.identity)
+        )));
+    }
     if !ctx.graph.build_inputs.contains_key(&repo) {
         let snapshot = match package {
             PackageSnapshot::Mirror(remote) => format!(
@@ -707,8 +728,15 @@ fn namespace_dep_sources(
             continue;
         }
         if inner.build.is_some() {
-            let namespaced =
-                namespace_dep_build(instance, imported, inner_name, inner, package, ctx)?;
+            let namespaced = namespace_dep_build(
+                instance,
+                imported,
+                inner_name,
+                inner,
+                layout.manifest,
+                package,
+                ctx,
+            )?;
             source_names.insert(inner_name.clone(), namespaced);
             continue;
         }

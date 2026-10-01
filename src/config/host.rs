@@ -8,12 +8,13 @@ use serde::Deserialize;
 /// The shipped forge registry: the single source of truth for built-in hosts.
 #[must_use]
 pub fn builtin_forges() -> BTreeMap<String, Host> {
-    fn forge(https: &str, ssh: &str) -> Host {
+    fn forge(https: &str, ssh: &str, web: &str) -> Host {
         Host {
             remote: Some(RemoteConfig {
                 https: Some(https.to_owned()),
                 ssh: Some(ssh.to_owned()),
             }),
+            web: Some(web.to_owned()),
             auth: None,
         }
     }
@@ -21,28 +22,42 @@ pub fn builtin_forges() -> BTreeMap<String, Host> {
     BTreeMap::from([
         (
             "github".to_owned(),
-            forge("https://github.com/{path}.git", "git@github.com:{path}.git"),
+            forge(
+                "https://github.com/{path}.git",
+                "git@github.com:{path}.git",
+                "https://github.com/{path}/blob/{commit}/{file}#L{line}",
+            ),
         ),
         (
             "gitlab".to_owned(),
-            forge("https://gitlab.com/{path}.git", "git@gitlab.com:{path}.git"),
+            forge(
+                "https://gitlab.com/{path}.git",
+                "git@gitlab.com:{path}.git",
+                "https://gitlab.com/{path}/-/blob/{commit}/{file}#L{line}",
+            ),
         ),
         (
             "codeberg".to_owned(),
             forge(
                 "https://codeberg.org/{path}.git",
                 "git@codeberg.org:{path}.git",
+                "https://codeberg.org/{path}/src/commit/{commit}/{file}#L{line}",
             ),
         ),
         (
             "sr.ht".to_owned(),
-            forge("https://git.sr.ht/{path}", "git@git.sr.ht:{path}"),
+            forge(
+                "https://git.sr.ht/{path}",
+                "git@git.sr.ht:{path}",
+                "https://git.sr.ht/{path}/tree/{commit}/item/{file}#L{line}",
+            ),
         ),
         (
             "bitbucket".to_owned(),
             forge(
                 "https://bitbucket.org/{path}.git",
                 "git@bitbucket.org:{path}.git",
+                "https://bitbucket.org/{path}/src/{commit}/{file}#lines-{line}",
             ),
         ),
     ])
@@ -53,6 +68,9 @@ pub fn builtin_forges() -> BTreeMap<String, Host> {
 pub struct Host {
     #[serde(default)]
     pub remote: Option<RemoteConfig>,
+    /// A browsable file link; `remote`'s placeholders plus `{commit}`, `{file}`, `{line}`.
+    #[serde(default)]
+    pub web: Option<String>,
     pub auth: Option<AuthConfig>,
 }
 
@@ -61,6 +79,9 @@ impl Host {
     pub(super) fn merged_with(mut self, local: Host) -> Host {
         if local.remote.is_some() {
             self.remote = local.remote;
+        }
+        if local.web.is_some() {
+            self.web = local.web;
         }
         if local.auth.is_some() {
             self.auth = local.auth;
