@@ -5,7 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.4](https://github.com/srnnkls/phora/compare/v0.3.3...v0.3.4) - 2026-10-01
+## [0.4.0](https://github.com/srnnkls/phora/compare/v0.3.3...v0.4.0) - 2026-10-01
+
+### Breaking Changes
+
+- *(transitive)* A target binds a transitive source through `sources` and picks one of its offers with `offer`; the `imports` key and the target-level `[take]`/`[collapse]` tables are gone (a binding's `take`/`collapse` apply instead).
+- *(transitive)* A dependency publishes through `[offers]`: its top-level `[targets]` are offered by the implicit `default` offer when their paths are relative and their sources can be fetched; a `path = "."` source no longer publishes the repo's own files.
+- *(build)* A dependency build names a tool (`tool = "<identity>@<version>"`) that the consumer grants under `[tools]`; `phora.local.toml` cannot declare `[offers]`.
 
 ### Features
 
@@ -21,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bump hk to 2.4.0 ([#118](https://github.com/srnnkls/phora/pull/118))
 - Format phora.example.toml with tombi ([#126](https://github.com/srnnkls/phora/pull/126))
 
-[0.3.4]: https://github.com/srnnkls/phora/compare/0.3.3..0.3.4
+[0.4.0]: https://github.com/srnnkls/phora/compare/0.3.3..0.4.0
 
 ## [0.3.3](https://github.com/srnnkls/phora/compare/v0.3.2...v0.3.3) - 2026-09-30
 
