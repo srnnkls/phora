@@ -2,13 +2,14 @@
 //! (`FetchNode` for dedup, `Instance` for namespacing).
 
 use std::collections::BTreeMap;
+use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
 use crate::source::NormalizedUrl;
 
-use super::{Source, Target};
+use super::{DEFAULT_OFFER, DeployMode, Source, Target};
 
 /// A transitive dep's `phora.toml`, parsed EXACTLY ONCE into its declarative graph
 /// fields. Trust-control fields (`trust`/`trusted_hooks`/`allow_hooks`) are tolerated
@@ -19,6 +20,7 @@ use super::{Source, Target};
 pub struct TransitiveManifest {
     pub sources: BTreeMap<String, Source>,
     pub targets: BTreeMap<String, Target>,
+    pub offers: BTreeMap<String, ManifestOffer>,
     hooks: Option<toml::Value>,
 }
 
@@ -28,6 +30,203 @@ struct ManifestGraph {
     sources: BTreeMap<String, Source>,
     #[serde(default)]
     targets: BTreeMap<String, Target>,
+    #[serde(default)]
+    offers: BTreeMap<String, ManifestOffer>,
+}
+
+/// A named slice of a repo: own files under `root` plus the targets it selects by key.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestOffer {
+    pub root: Option<PathBuf>,
+    #[serde(default)]
+    pub include: Vec<String>,
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    pub targets: Option<Vec<String>>,
+}
+
+/// Own files are `None` when a target covers the offer root; target paths are relative to it.
+#[derive(Debug, Clone)]
+pub struct ResolvedOffer {
+    pub root: PathBuf,
+    pub files: Option<Source>,
+    pub targets: BTreeMap<String, Target>,
+}
+
+pub(crate) fn resolve_offer(
+    name: &str,
+    offers: &BTreeMap<String, ManifestOffer>,
+    sources: &BTreeMap<String, Source>,
+    targets: &BTreeMap<String, Target>,
+) -> Result<ResolvedOffer> {
+    let implicit = ManifestOffer::default();
+    let offer = match offers.get(name) {
+        Some(offer) => offer,
+        None if name == DEFAULT_OFFER => &implicit,
+        None => {
+            let declared: Vec<&str> = offers.keys().map(String::as_str).collect();
+            return Err(Error::Config(format!(
+                "no offer `{name}`; declared offers: [{}]",
+                declared.join(", ")
+            )));
+        }
+    };
+    let fail = |detail: String| Error::Config(format!("offer `{name}`: {detail}"));
+    let root = match offer.root.as_deref() {
+        Some(root) if escapes(root) => {
+            return Err(fail(format!(
+                "root `{}` must be a relative subpath of the repo",
+                root.display()
+            )));
+        }
+        Some(root) => normalized(root),
+        None => PathBuf::new(),
+    };
+    let selected: Vec<(&String, &Target)> = match &offer.targets {
+        None => targets
+            .iter()
+            .filter(|(_, target)| {
+                offerable(target, sources).is_ok() && placed(&target.path, &root).is_some()
+            })
+            .collect(),
+        Some(keys) => keys
+            .iter()
+            .map(|key| {
+                let (key, target) = targets.get_key_value(key).ok_or_else(|| {
+                    let declared: Vec<&str> = targets.keys().map(String::as_str).collect();
+                    fail(format!(
+                        "selects undeclared target `{key}`; declared targets: [{}]",
+                        declared.join(", ")
+                    ))
+                })?;
+                offerable(target, sources)
+                    .map_err(|why| fail(format!("target `{key}` cannot be offered: {why}")))?;
+                if placed(&target.path, &root).is_none() {
+                    return Err(fail(format!(
+                        "target `{key}` at `{}` lies outside the offer root `{}`",
+                        target.path.display(),
+                        root.display()
+                    )));
+                }
+                Ok((key, target))
+            })
+            .collect::<Result<_>>()?,
+    };
+    let placed_targets = selected
+        .into_iter()
+        .map(|(key, target)| {
+            let mut target = target.clone();
+            target.path = placed(&target.path, &root).unwrap_or_default();
+            (key.clone(), target)
+        })
+        .collect();
+    Ok(ResolvedOffer {
+        files: own_files(offer, &root, targets)?,
+        targets: placed_targets,
+        root,
+    })
+}
+
+fn own_files(
+    offer: &ManifestOffer,
+    root: &Path,
+    targets: &BTreeMap<String, Target>,
+) -> Result<Option<Source>> {
+    let mut exclude = offer.exclude.clone();
+    if offer.include.is_empty() {
+        exclude.extend(["/phora.toml".to_owned(), "/phora.lock".to_owned()]);
+    }
+    for target in targets.values().filter(|target| !escapes(&target.path)) {
+        let path = normalized(&target.path);
+        if path.as_os_str().is_empty() {
+            continue;
+        }
+        match placed(&path, root) {
+            Some(rest) if rest.as_os_str().is_empty() => return Ok(None),
+            Some(rest) => exclude.push(format!("/{}/", rest.display())),
+            None if root.starts_with(&path) => return Ok(None),
+            None => {}
+        }
+    }
+    let mut source = toml::Table::new();
+    source.insert("path".into(), ".".into());
+    if !root.as_os_str().is_empty() {
+        source.insert("root".into(), root.to_string_lossy().into_owned().into());
+    }
+    if !offer.include.is_empty() {
+        source.insert("include".into(), offer.include.clone().into());
+    }
+    if !exclude.is_empty() {
+        source.insert("exclude".into(), exclude.into());
+    }
+    toml::Value::Table(source)
+        .try_into()
+        .map(Some)
+        .map_err(|e: toml::de::Error| Error::Config(format!("own files: {e}")))
+}
+
+fn offerable(
+    target: &Target,
+    sources: &BTreeMap<String, Source>,
+) -> std::result::Result<(), String> {
+    if escapes(&target.path) {
+        return Err(format!(
+            "its path `{}` is not a relative subpath of the repo",
+            target.path.display()
+        ));
+    }
+    for (identity, binding) in target.bindings() {
+        let name = binding.effective_source(identity);
+        let Some(source) = sources.get(name) else {
+            return Err(format!("it binds undefined source `{name}`"));
+        };
+        let kind = if source.build.is_some() {
+            "a build"
+        } else if source.path.is_some() {
+            "a local path"
+        } else if source.deploy == Some(DeployMode::Link) {
+            "a linked"
+        } else {
+            continue;
+        };
+        return Err(format!("it binds `{name}`, {kind} source"));
+    }
+    Ok(())
+}
+
+fn placed(path: &Path, root: &Path) -> Option<PathBuf> {
+    normalized(path)
+        .strip_prefix(root)
+        .ok()
+        .map(Path::to_path_buf)
+}
+
+pub const MEMBER_SEPARATOR: char = '%';
+
+/// What a namespaced key names within one [`Instance`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Member {
+    Files,
+    Named(String),
+}
+
+impl Member {
+    /// `None` for a key no [`Instance`] minted.
+    #[must_use]
+    pub fn of(key: &str) -> Option<Self> {
+        let (_, member) = key.split_once(MEMBER_SEPARATOR)?;
+        Some(if member.is_empty() {
+            Self::Files
+        } else {
+            Self::Named(member.to_owned())
+        })
+    }
+
+    #[must_use]
+    pub fn is_namespaced(key: &str) -> bool {
+        key.contains(MEMBER_SEPARATOR)
+    }
 }
 
 impl TransitiveManifest {
@@ -36,7 +235,7 @@ impl TransitiveManifest {
     /// # Errors
     ///
     /// Returns [`Error::Config`] when the document is not valid TOML or its
-    /// declarative `[sources]`/`[targets]` fields do not type.
+    /// declarative `[sources]`/`[targets]`/`[offers]` fields do not type.
     pub fn parse(text: &str) -> Result<Self> {
         Self::parse_toml(text).map_err(|error| Error::Config(error.to_string()))
     }
@@ -51,46 +250,70 @@ impl TransitiveManifest {
     pub(crate) fn parse_toml(text: &str) -> std::result::Result<Self, toml::de::Error> {
         let document: toml::Value = toml::from_str(text)?;
         let hooks = collect_opaque_hooks(&document);
-        let graph: ManifestGraph = document.try_into()?;
-        if let Some(name) = graph
-            .sources
-            .iter()
-            .find_map(|(n, s)| s.build.is_some().then_some(n))
-        {
+        let mut graph: ManifestGraph = document.try_into()?;
+        if let Some(key) = unnamespaceable_key(graph.sources.keys().chain(graph.targets.keys())) {
             return Err(<toml::de::Error as serde::de::Error>::custom(format!(
-                "dependency source `{name}` is a `build` source; builds run only from your own phora.toml"
+                "key `{key}` cannot contain `{MEMBER_SEPARATOR}`"
             )));
+        }
+        let sources = &graph.sources;
+        for target in graph.targets.values_mut() {
+            target.lower_transitive(|name| sources.get(name).is_some_and(Source::is_transitive));
         }
         Ok(Self {
             sources: graph.sources,
             targets: graph.targets,
+            offers: graph.offers,
             hooks,
         })
     }
 
-    /// The retained per-target hooks as an uninterpreted payload, or `None` when the
-    /// dep declares no per-target hooks. The transitive global `[hooks]` is never here.
+    pub(crate) fn offer(&self, name: &str) -> Result<ResolvedOffer> {
+        resolve_offer(name, &self.offers, &self.sources, &self.targets)
+    }
+
+    /// The declared offers plus the implicit `default`.
+    pub fn offer_names(&self) -> impl Iterator<Item = &str> {
+        (!self.offers.contains_key(DEFAULT_OFFER))
+            .then_some(DEFAULT_OFFER)
+            .into_iter()
+            .chain(self.offers.keys().map(String::as_str))
+    }
+
+    /// The retained per-target hooks as an uninterpreted payload; never the global `[hooks]`.
     #[must_use]
     pub fn hooks(&self) -> Option<&toml::Value> {
         self.hooks.as_ref()
     }
 }
 
-/// Per-target `hooks` sub-tables keyed by target name; the top-level `[hooks]` is
-/// consumer-owned and excluded.
+pub(crate) fn unnamespaceable_key<'k>(
+    mut keys: impl Iterator<Item = &'k String>,
+) -> Option<&'k String> {
+    keys.find(|key| key.contains(MEMBER_SEPARATOR))
+}
+
+fn escapes(path: &Path) -> bool {
+    path.is_absolute()
+        || path.starts_with("~")
+        || path.components().any(|c| matches!(c, Component::ParentDir))
+}
+
+fn normalized(path: &Path) -> PathBuf {
+    path.components()
+        .filter(|c| !matches!(c, Component::CurDir))
+        .collect()
+}
+
+/// Per-target `hooks` keyed by target; the top-level `[hooks]` is consumer-owned.
 fn collect_opaque_hooks(document: &toml::Value) -> Option<toml::Value> {
-    let targets = document.get("targets")?.as_table()?;
-    let mut retained = toml::value::Table::new();
-    for (name, target) in targets {
-        if let Some(hooks) = target.get("hooks") {
-            retained.insert(name.clone(), hooks.clone());
-        }
-    }
-    if retained.is_empty() {
-        None
-    } else {
-        Some(toml::Value::Table(retained))
-    }
+    let retained: toml::value::Table = document
+        .get("targets")?
+        .as_table()?
+        .iter()
+        .filter_map(|(name, target)| Some((name.clone(), target.get("hooks")?.clone())))
+        .collect();
+    (!retained.is_empty()).then_some(toml::Value::Table(retained))
 }
 
 /// Graph dedup key: a fetched node is `(normalized-url, ref, commit)`. A diamond
@@ -119,57 +342,43 @@ impl FetchNode {
     }
 }
 
-/// Namespacing key: the SAME fetched node mounted at two anchors is two distinct
-/// instances. `(parent, source_name, anchor_target, fetch_node)` keys hooks/paths
-/// while still referencing its shared [`FetchNode`].
+/// Namespacing key for one binding composing a fetched node under one anchor. It omits
+/// the snapshot, so ownership survives commit and pin-to-link switches, and offer switches
+/// that keep the offer root.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Instance {
     parent: String,
-    source_name: String,
+    identity: String,
     anchor_target: String,
     fetch_node: FetchNode,
-    package: bool,
+    root: PathBuf,
 }
+
+/// Hash input kept byte-identical so existing ownership keys stay valid.
+const STABLE_KEY_SALT: &str = "package";
 
 impl Instance {
     #[must_use]
-    pub fn new(
-        parent: &str,
-        source_name: &str,
-        anchor_target: &str,
-        fetch_node: FetchNode,
-    ) -> Self {
+    pub fn new(parent: &str, identity: &str, anchor_target: &str, fetch_node: FetchNode) -> Self {
         Self {
             parent: parent.to_owned(),
-            source_name: source_name.to_owned(),
+            identity: identity.to_owned(),
             anchor_target: anchor_target.to_owned(),
             fetch_node,
-            package: false,
+            root: PathBuf::new(),
         }
     }
 
-    /// Packages that export their own snapshot keep artifact ownership across rebuilds and
-    /// across switches between a pinned remote and a linked working tree. The remote, ref,
-    /// and commit remain in the fetch node and hook trust preimage.
     #[must_use]
-    pub fn for_package(
-        parent: &str,
-        source_name: &str,
-        anchor_target: &str,
-        fetch_node: FetchNode,
-    ) -> Self {
-        Self {
-            package: true,
-            ..Self::new(parent, source_name, anchor_target, fetch_node)
-        }
+    pub fn placed_at(mut self, root: &Path) -> Self {
+        self.root = root.to_path_buf();
+        self
     }
 
-    /// Export names identify package members independently of traversal order.
-    pub(crate) fn member_key(&self, name: &str, counter: usize) -> String {
-        if self.package {
-            format!("{}%{name}", self.stable_key())
-        } else {
-            format!("{}%{counter}%{name}", self.stable_key())
+    pub(crate) fn key(&self, member: &Member) -> String {
+        match member {
+            Member::Files => format!("{}{MEMBER_SEPARATOR}", self.stable_key()),
+            Member::Named(name) => format!("{}{MEMBER_SEPARATOR}{name}", self.stable_key()),
         }
     }
 
@@ -182,22 +391,16 @@ impl Instance {
     #[must_use]
     pub fn stable_key(&self) -> String {
         let mut hasher = blake3::Hasher::new();
-        let snapshot = if self.package {
-            vec!["package"]
-        } else {
-            vec![
-                self.fetch_node.url.as_str(),
-                self.fetch_node.r#ref.as_str(),
-                self.fetch_node.commit.as_str(),
-            ]
-        };
+        let root = self.root.to_string_lossy();
+        let placement = (!root.is_empty()).then_some(root.as_ref());
         for field in [
             self.parent.as_str(),
-            self.source_name.as_str(),
+            self.identity.as_str(),
             self.anchor_target.as_str(),
+            STABLE_KEY_SALT,
         ]
         .into_iter()
-        .chain(snapshot)
+        .chain(placement)
         {
             hasher.update(&(field.len() as u64).to_le_bytes());
             hasher.update(field.as_bytes());

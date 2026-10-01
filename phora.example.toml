@@ -143,3 +143,14 @@ layout = "by-source"
 [targets.tools.sources]
 stable = { source = "fzf", tag = "v0.55.0" }
 canary = { source = "fzf", tag = "v0.56.0" }
+
+# A transitive source's own phora.toml declares its offers; `offer` picks one
+# (`default` when omitted).
+[sources.tropos]
+host = "github"
+repo = "srnnkls/tropos"
+transitive = true
+
+[targets.fas-rules]
+path = "~/.config/fas/rules"
+sources.tropos = { offer = "fas" }

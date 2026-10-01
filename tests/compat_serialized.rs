@@ -1143,7 +1143,7 @@ fn transitive_hook_candidates() -> Vec<phora::config::CandidateHook> {
     let node = FetchNode::new("https://github.com/dep/nvim.git", "main", HOOK_DEP_COMMIT);
     let instance = Instance::new("root", "editor", "anchor", node);
     let (candidates, diagnostics) =
-        admit_transitive_hooks(&opaque, "editor", "ns%1%editor", &instance);
+        admit_transitive_hooks(&opaque, "editor", "ns%editor", &instance);
     assert!(
         diagnostics.is_empty(),
         "the fixture hooks payload must admit cleanly, got: {diagnostics:?}"
@@ -1440,7 +1440,6 @@ fn moved_path_projection(fx: &Fixture, layout_override: Option<LayoutSpec>) -> T
         materialization: MaterializationPolicy::from(&source.deploy_mode()),
         layout: &layout,
         templates: &templates,
-        mount: None,
     };
     phora::projection::build::project_target("home", &[input]).expect("the fixture projects")
 }

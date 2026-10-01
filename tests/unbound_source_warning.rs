@@ -3,7 +3,7 @@ use std::process::{Command, Output};
 
 use tempfile::TempDir;
 
-const WARNING: &str = "phora: source `gestalt` is bound by no target, import, or build";
+const WARNING: &str = "phora: source `gestalt` is bound by no target or build";
 
 const BOUND: &str = "version = 1\n\n[sources.used]\npath = \"used\"\n\n\
      [targets.home]\npath = \"~/deploy\"\nsources = [\"used\"]\n";

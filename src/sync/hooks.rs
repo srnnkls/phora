@@ -410,7 +410,7 @@ mod transitive_trust_tests {
             command,
             preimage: "blake3:candidatepreimage",
             target_path: target,
-            source: "mydeps",
+            source: "nvim-kit",
             commit: "c0ffeecommit",
         }
     }
@@ -447,7 +447,7 @@ mod transitive_trust_tests {
         );
         assert_eq!(
             (approval.source.as_str(), approval.commit.as_str()),
-            ("mydeps", "c0ffeecommit"),
+            ("nvim-kit", "c0ffeecommit"),
             "the approval must carry the candidate's source and commit so the persisted \
              trusted_hooks entry can be diffed by `phora trust`, never silently emptied"
         );
@@ -487,7 +487,7 @@ mod transitive_trust_tests {
             command,
             preimage,
             target_path: target,
-            source: "mydeps",
+            source: "nvim-kit",
             commit: "c0ffeecommit",
         }
     }

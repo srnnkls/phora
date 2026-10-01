@@ -2,7 +2,7 @@
 //!
 //! IMPORTS-001 shipped DEPTH-1 composition only. A consumer imports dep D; D's own
 //! targets compose under the anchor. But if D itself declares an inner source E as
-//! `transitive = true` and a D-target that `imports = ["E"]`, E's targets are NOT
+//! `transitive = true` and a D-offer target that binds `sources = ["E"]`, E's targets are NOT
 //! composed today — `walk_recurse` descends for fetch/validate/cycle/fail-fast safety
 //! but never builds an `Instance` or calls `compose_dep` for E. These tests pin the
 //! missing nested composition: E's artifacts must deploy at the composed nested path
@@ -21,8 +21,7 @@ mod common;
 const CONFINE_ESCAPES_ANCHOR: &str = "escapes its anchor";
 /// Phrase the compose chokepoint owns for a `..`/absolute dep-target path; either this
 /// or the confine escape phrase proves the nested path went through the chokepoint.
-const COMPOSE_REL_SUBPATH: &str = "must be a relative \
-     subpath of the anchor";
+const COMPOSE_REL_SUBPATH: &str = "is not a relative subpath";
 
 struct Fixture {
     _home: TempDir,
@@ -119,7 +118,7 @@ fn commit_repo(dir: &Path, files: &[(&str, &str)], manifest: &str) {
 fn reject_unknown_field_stub(stderr: &str) {
     assert!(
         !stderr.contains("unknown field"),
-        "`transitive`/`imports` must drive real composition, not be rejected by \
+        "`transitive` bindings must drive real composition, not be rejected by \
          deny_unknown_fields; got a parse stub: {stderr}"
     );
 }
@@ -150,8 +149,8 @@ fn leaf_repo(dir: &Path, file: &str, body: &str) {
 
 /// Behavior #1 — Nested composition to closure.
 ///
-/// consumer imports D under `~/.config`; D (transitive) declares inner source E
-/// (`transitive = true`) and a D-target `dnode` (path `d`) that `imports = ["E"]`;
+/// consumer binds D under `~/.config`; D (transitive) declares inner source E
+/// (`transitive = true`) and a D-target `dnode` (path `d`) that binds `sources = ["E"]`;
 /// E declares a flat leaf source bound to E-target `enode` (path `e`). The closure
 /// must compose E's `enode` target under D's `dnode` anchor under the consumer anchor,
 /// so E's artifact lands at `~/.config/d/e/pkg/leaf.txt`.
@@ -171,7 +170,7 @@ fn dep_of_dep_targets_compose_to_closure_under_the_parent_anchor() {
     // D: imports E (a dep-of-dep) under D's own target `dnode` at `d`.
     let dep_d = TempDir::new().expect("dep D repo");
     let d_manifest = "version = 1\n\n[sources.einner]\ngit = \"https://github.com/mock/depe.git\"\ntransitive = true\n\n\
-         [targets.dnode]\npath = \"d\"\nimports = [\"einner\"]\n";
+         [targets.dnode]\npath = \"d\"\nsources = [\"einner\"]\n";
     commit_repo(dep_d.path(), &[], d_manifest);
 
     let mut fixture = build_fixture();
@@ -179,8 +178,8 @@ fn dep_of_dep_targets_compose_to_closure_under_the_parent_anchor() {
     fixture.map_url("https://github.com/mock/depe.git", dep_e.path());
     fixture.finish_gitconfig();
     let config = format!(
-        "version = 1\n\n[sources.mydeps]\ngit = \"{dep_d}\"\ntransitive = true\n\n\
-         [targets.dotcfg]\npath = \"~/.config\"\nimports = [\"mydeps\"]\n",
+        "version = 1\n\n[sources.nvim-kit]\ngit = \"{dep_d}\"\ntransitive = true\n\n\
+         [targets.xdg-config]\npath = \"~/.config\"\nsources = [\"nvim-kit\"]\n",
         dep_d = dep_d.path().display(),
     );
     write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());
@@ -247,14 +246,14 @@ fn nested_same_named_dep_of_dep_under_two_parents_do_not_merge() {
         dep_d1.path(),
         &[],
         "version = 1\n\n[sources.einner]\ngit = \"https://github.com/mock/depex.git\"\ntransitive = true\n\n\
-         [targets.dnode]\npath = \"d1\"\nimports = [\"einner\"]\n",
+         [targets.dnode]\npath = \"d1\"\nsources = [\"einner\"]\n",
     );
     let dep_d2 = TempDir::new().expect("D2 repo");
     commit_repo(
         dep_d2.path(),
         &[],
         "version = 1\n\n[sources.einner]\ngit = \"https://github.com/mock/depey.git\"\ntransitive = true\n\n\
-         [targets.dnode]\npath = \"d2\"\nimports = [\"einner\"]\n",
+         [targets.dnode]\npath = \"d2\"\nsources = [\"einner\"]\n",
     );
 
     let mut fixture = build_fixture();
@@ -267,7 +266,7 @@ fn nested_same_named_dep_of_dep_under_two_parents_do_not_merge() {
         "version = 1\n\n\
          [sources.dep1]\ngit = \"{d1}\"\ntransitive = true\n\n\
          [sources.dep2]\ngit = \"{d2}\"\ntransitive = true\n\n\
-         [targets.dotcfg]\npath = \"~/.config\"\nimports = [\"dep1\", \"dep2\"]\n",
+         [targets.xdg-config]\npath = \"~/.config\"\nsources = [\"dep1\", \"dep2\"]\n",
         d1 = dep_d1.path().display(),
         d2 = dep_d2.path().display(),
     );
@@ -315,7 +314,8 @@ fn nested_dep_of_dep_escaping_target_is_confined() {
     // E exposes a target that climbs out of its anchor via `..`.
     let dep_e = TempDir::new().expect("dep E repo");
     let e_manifest = "version = 1\n\n[sources.editor]\ngit = \"https://github.com/mock/eleaf.git\"\ninclude = [\"pkg\"]\n\n\
-         [targets.escape]\npath = \"../../../../escape-e\"\nsources = [\"editor\"]\n";
+         [targets.escape]\npath = \"../../../../escape-e\"\nsources = [\"editor\"]\n\n\
+         [offers.default]\ntargets = [\"escape\"]\n";
     commit_repo(dep_e.path(), &[], e_manifest);
 
     let dep_d = TempDir::new().expect("dep D repo");
@@ -323,7 +323,7 @@ fn nested_dep_of_dep_escaping_target_is_confined() {
         dep_d.path(),
         &[],
         "version = 1\n\n[sources.einner]\ngit = \"https://github.com/mock/depe.git\"\ntransitive = true\n\n\
-         [targets.dnode]\npath = \"d\"\nimports = [\"einner\"]\n",
+         [targets.dnode]\npath = \"d\"\nsources = [\"einner\"]\n",
     );
 
     let mut fixture = build_fixture();
@@ -331,8 +331,8 @@ fn nested_dep_of_dep_escaping_target_is_confined() {
     fixture.map_url("https://github.com/mock/depe.git", dep_e.path());
     fixture.finish_gitconfig();
     let config = format!(
-        "version = 1\n\n[sources.mydeps]\ngit = \"{dep_d}\"\ntransitive = true\n\n\
-         [targets.dotcfg]\npath = \"~/.config\"\nimports = [\"mydeps\"]\n",
+        "version = 1\n\n[sources.nvim-kit]\ngit = \"{dep_d}\"\ntransitive = true\n\n\
+         [targets.xdg-config]\npath = \"~/.config\"\nsources = [\"nvim-kit\"]\n",
         dep_d = dep_d.path().display(),
     );
     write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());
@@ -385,14 +385,14 @@ fn diamond_dep_of_dep_dedups_one_fetch_but_composes_per_instance() {
         dep_d1.path(),
         &[],
         "version = 1\n\n[sources.einner]\ngit = \"https://github.com/mock/depe.git\"\ntransitive = true\n\n\
-         [targets.dnode]\npath = \"d1\"\nimports = [\"einner\"]\n",
+         [targets.dnode]\npath = \"d1\"\nsources = [\"einner\"]\n",
     );
     let dep_d2 = TempDir::new().expect("D2 repo");
     commit_repo(
         dep_d2.path(),
         &[],
         "version = 1\n\n[sources.einner]\ngit = \"https://github.com/mock/depe.git\"\ntransitive = true\n\n\
-         [targets.dnode]\npath = \"d2\"\nimports = [\"einner\"]\n",
+         [targets.dnode]\npath = \"d2\"\nsources = [\"einner\"]\n",
     );
 
     let mut fixture = build_fixture();
@@ -403,7 +403,7 @@ fn diamond_dep_of_dep_dedups_one_fetch_but_composes_per_instance() {
         "version = 1\n\n\
          [sources.dep1]\ngit = \"{d1}\"\ntransitive = true\n\n\
          [sources.dep2]\ngit = \"{d2}\"\ntransitive = true\n\n\
-         [targets.dotcfg]\npath = \"~/.config\"\nimports = [\"dep1\", \"dep2\"]\n",
+         [targets.xdg-config]\npath = \"~/.config\"\nsources = [\"dep1\", \"dep2\"]\n",
         d1 = dep_d1.path().display(),
         d2 = dep_d2.path().display(),
     );

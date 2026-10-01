@@ -237,7 +237,7 @@ mod tests {
             hook_id: "inst0001%1%editor#on_change#abc".to_owned(),
             preimage: preimage.to_owned(),
             command: "./install.sh".to_owned(),
-            source: "mydeps".to_owned(),
+            source: "nvim-kit".to_owned(),
             commit: "c0ffee".to_owned(),
         }
     }
@@ -268,7 +268,7 @@ mod tests {
             1,
             "a candidate hook whose preimage is not approved must surface as a finding"
         );
-        assert_eq!(report.untrusted_hooks[0].source, "mydeps");
+        assert_eq!(report.untrusted_hooks[0].source, "nvim-kit");
         assert!(
             !report.is_clean(),
             "an untrusted stripped hook must make the report non-clean so CI fails non-zero"
@@ -284,7 +284,7 @@ mod tests {
             hook_id: "inst0001%1%editor#on_change#abc".to_owned(),
             preimage: "blake3:approved".to_owned(),
             approved_at: "2026-06-20T00:00:00Z".to_owned(),
-            source: "mydeps".to_owned(),
+            source: "nvim-kit".to_owned(),
             commit: "c0ffee".to_owned(),
         }];
         let lock = lock_with(vec![candidate("blake3:approved")], trusted);

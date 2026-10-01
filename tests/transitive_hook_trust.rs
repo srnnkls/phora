@@ -161,8 +161,8 @@ fn untrusted_transitive_hook_is_skipped_under_non_tty_without_error() {
     fixture.map_url("https://github.com/mock/leaf.git", leaf.path());
     fixture.finish_gitconfig();
     let config = format!(
-        "version = 1\n\n[sources.mydeps]\ngit = \"{dep}\"\ntransitive = true\n\n\
-         [targets.dotcfg]\npath = \"~/.config\"\nimports = [\"mydeps\"]\n",
+        "version = 1\n\n[sources.nvim-kit]\ngit = \"{dep}\"\ntransitive = true\n\n\
+         [targets.xdg-config]\npath = \"~/.config\"\nsources = [\"nvim-kit\"]\n",
         dep = dep.path().display(),
     );
     write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());
@@ -198,8 +198,8 @@ fn recording_a_candidate_does_not_by_itself_trust_it() {
     fixture.map_url("https://github.com/mock/leaf.git", leaf.path());
     fixture.finish_gitconfig();
     let config = format!(
-        "version = 1\n\n[sources.mydeps]\ngit = \"{dep}\"\ntransitive = true\n\n\
-         [targets.dotcfg]\npath = \"~/.config\"\nimports = [\"mydeps\"]\n",
+        "version = 1\n\n[sources.nvim-kit]\ngit = \"{dep}\"\ntransitive = true\n\n\
+         [targets.xdg-config]\npath = \"~/.config\"\nsources = [\"nvim-kit\"]\n",
         dep = dep.path().display(),
     );
     write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());
@@ -253,8 +253,8 @@ fn trusted_transitive_hook_runs_under_non_tty_when_pinned_in_consumer_lock() {
     fixture.map_url("https://github.com/mock/leaf.git", leaf.path());
     fixture.finish_gitconfig();
     let config = format!(
-        "version = 1\n\n[sources.mydeps]\ngit = \"{dep}\"\ntransitive = true\n\n\
-         [targets.dotcfg]\npath = \"~/.config\"\nimports = [\"mydeps\"]\n",
+        "version = 1\n\n[sources.nvim-kit]\ngit = \"{dep}\"\ntransitive = true\n\n\
+         [targets.xdg-config]\npath = \"~/.config\"\nsources = [\"nvim-kit\"]\n",
         dep = dep.path().display(),
     );
     write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());
@@ -321,10 +321,10 @@ fn no_transitive_hooks_flag_suppresses_trusted_dep_hooks_but_keeps_consumer_own_
     let config = format!(
         "version = 1\n\n\
          [sources.own]\ngit = \"{consumer_leaf}\"\ninclude = [\"pkg\"]\n\n\
-         [sources.mydeps]\ngit = \"{dep}\"\ntransitive = true\n\n\
+         [sources.nvim-kit]\ngit = \"{dep}\"\ntransitive = true\n\n\
          [targets.mine]\npath = \"~/mine\"\nsources = [\"own\"]\n\n\
          [targets.mine.hooks]\non_change = \"touch '{consumer_sentinel}'\"\n\n\
-         [targets.dotcfg]\npath = \"~/.config\"\nimports = [\"mydeps\"]\n",
+         [targets.xdg-config]\npath = \"~/.config\"\nsources = [\"nvim-kit\"]\n",
         consumer_leaf = consumer_leaf.path().display(),
         dep = dep.path().display(),
         consumer_sentinel = consumer_sentinel.display(),
@@ -407,8 +407,8 @@ fn matching_trusted_hook_approval_persists_across_a_resync() {
     fixture.map_url("https://github.com/mock/leaf.git", leaf.path());
     fixture.finish_gitconfig();
     let config = format!(
-        "version = 1\n\n[sources.mydeps]\ngit = \"{dep}\"\ntransitive = true\n\n\
-         [targets.dotcfg]\npath = \"~/.config\"\nimports = [\"mydeps\"]\n",
+        "version = 1\n\n[sources.nvim-kit]\ngit = \"{dep}\"\ntransitive = true\n\n\
+         [targets.xdg-config]\npath = \"~/.config\"\nsources = [\"nvim-kit\"]\n",
         dep = dep.path().display(),
     );
     write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());
@@ -470,8 +470,8 @@ fn changing_the_dep_commit_invalidates_a_commit_pinned_trust_approval() {
     fixture.map_url("https://github.com/mock/leaf.git", leaf.path());
     fixture.finish_gitconfig();
     let config = format!(
-        "version = 1\n\n[sources.mydeps]\ngit = \"{dep}\"\ntransitive = true\n\n\
-         [targets.dotcfg]\npath = \"~/.config\"\nimports = [\"mydeps\"]\n",
+        "version = 1\n\n[sources.nvim-kit]\ngit = \"{dep}\"\ntransitive = true\n\n\
+         [targets.xdg-config]\npath = \"~/.config\"\nsources = [\"nvim-kit\"]\n",
         dep = dep.path().display(),
     );
     write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());
@@ -519,7 +519,8 @@ fn changing_the_dep_commit_invalidates_a_commit_pinned_trust_approval() {
     // Wipe any prior decision state so resolution is fresh against commit B.
     let _ = std::fs::remove_file(&sentinel_path);
 
-    let out = run(&fixture, &["sync"]);
+    // The lock pins the dep at commit A; `update` bumps the pin to commit B.
+    let out = run(&fixture, &["update", "nvim-kit"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
@@ -550,8 +551,8 @@ fn pre_sync_abort_preserves_recorded_candidate_hooks() {
     fixture.finish_gitconfig();
 
     let config_base = format!(
-        "version = 1\n\n[sources.mydeps]\ngit = \"{dep}\"\ntransitive = true\n\n\
-         [targets.dotcfg]\npath = \"~/.config\"\nimports = [\"mydeps\"]\n",
+        "version = 1\n\n[sources.nvim-kit]\ngit = \"{dep}\"\ntransitive = true\n\n\
+         [targets.xdg-config]\npath = \"~/.config\"\nsources = [\"nvim-kit\"]\n",
         dep = dep.path().display(),
     );
     let manifest_path = fixture.cwd.path().join("phora.toml");

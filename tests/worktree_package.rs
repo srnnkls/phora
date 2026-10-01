@@ -6,18 +6,14 @@ use tempfile::TempDir;
 mod common;
 
 const PACKAGE_MANIFEST: &str = r#"
-[sources.tropos]
-path = "."
-include = ["skills/**"]
 [sources.loqui]
 git = "https://example.invalid/loqui.git"
 include = ["languages/**"]
-[targets.tropos]
-path = "."
-sources.tropos = { collapse = false }
+[offers.default]
+include = ["skills/**"]
 [targets.loqui]
 path = "skills/loqui/reference/loqui"
-sources.loqui = { collapse = false }
+sources = ["loqui"]
 "#;
 
 const LOCAL: &str = r#"
@@ -26,7 +22,7 @@ cache = "cache"
 state = "state"
 [targets.tropos]
 path = ".tropos"
-imports = ["tropos"]
+sources = ["tropos"]
 "#;
 
 struct Fixture {
@@ -250,14 +246,22 @@ fn linked_package_keeps_its_remote_dependency_at_the_locked_commit() {
 
 #[test]
 fn link_declared_inside_the_package_manifest_stays_rejected() {
-    let manifest =
-        PACKAGE_MANIFEST.replacen("path = \".\"\n", "path = \".\"\ndeploy = \"link\"\n", 1);
+    let manifest = PACKAGE_MANIFEST
+        .replacen(
+            "git = \"https://example.invalid/loqui.git\"\n",
+            "git = \"https://example.invalid/loqui.git\"\ndeploy = \"link\"\n",
+            1,
+        )
+        .replacen(
+            "include = [\"skills/**\"]\n",
+            "include = [\"skills/**\"]\ntargets = [\"loqui\"]\n",
+            1,
+        );
     let fixture = Fixture::new(&manifest);
     let out = fixture.run(&["sync"]);
     assert!(!out.status.success());
     assert!(
-        String::from_utf8_lossy(&out.stderr)
-            .contains("transitive source cannot use deploy = \"link\""),
+        String::from_utf8_lossy(&out.stderr).contains("a linked source"),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );

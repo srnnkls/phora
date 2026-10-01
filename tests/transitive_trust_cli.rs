@@ -143,8 +143,8 @@ fn consumer_with_dep_hook() -> (Fixture, PathBuf) {
     fixture.map_url("https://github.com/mock/leaf.git", &leaf_path);
     fixture.finish_gitconfig();
     let config = format!(
-        "version = 1\n\n[sources.mydeps]\ngit = \"{dep}\"\ntransitive = true\n\n\
-         [targets.dotcfg]\npath = \"~/.config\"\nimports = [\"mydeps\"]\n",
+        "version = 1\n\n[sources.nvim-kit]\ngit = \"{dep}\"\ntransitive = true\n\n\
+         [targets.xdg-config]\npath = \"~/.config\"\nsources = [\"nvim-kit\"]\n",
         dep = dep_path.display(),
     );
     write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());
@@ -192,7 +192,7 @@ fn trust_list_shows_preimage_env_and_full_env_inheritance_note() {
         String::from_utf8_lossy(&seed.stderr)
     );
 
-    let out = run(&fixture, &["trust", "mydeps", "--list"]);
+    let out = run(&fixture, &["trust", "nvim-kit", "--list"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let shown = format!("{stdout}{stderr}");
@@ -236,15 +236,15 @@ fn trust_revoke_removes_the_trusted_hooks_entry() {
 
     let approved = format!(
         "{lock_text}\n[[trusted_hooks]]\n\
-         dep_instance = \"mydeps-instance\"\n\
+         dep_instance = \"nvim-kit-instance\"\n\
          hook_id = \"composed#on_change#deadbeef\"\n\
          preimage = \"{preimage}\"\n\
          approved_at = \"2026-06-20T00:00:00Z\"\n\
-         source = \"mydeps\"\n",
+         source = \"nvim-kit\"\n",
     );
     write(&lock_path, approved.as_bytes());
 
-    let out = run(&fixture, &["trust", "mydeps", "--revoke"]);
+    let out = run(&fixture, &["trust", "nvim-kit", "--revoke"]);
     assert!(
         out.status.success(),
         "`phora trust --revoke` must exit zero; stderr: {}",
@@ -272,7 +272,7 @@ fn trust_discovers_hooks_without_a_prior_add_or_sync() {
         "premise: this test must run with NO prior lock so discovery cannot lean on recorded state"
     );
 
-    let out = run(&fixture, &["trust", "mydeps", "--list"]);
+    let out = run(&fixture, &["trust", "nvim-kit", "--list"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let shown = format!("{stdout}{stderr}");
@@ -288,7 +288,7 @@ fn trust_discovers_hooks_without_a_prior_add_or_sync() {
          through the shared fetch, not a full sync); got:\n{shown}"
     );
 
-    // A full sync would deploy the dep's imports under ~/.config; trust must not deploy.
+    // A full sync would deploy the dep's offers under ~/.config; trust must not deploy.
     assert!(
         !fixture.home_path.join(".config").exists(),
         "AC4: `phora trust` must use the lightweight shared fetch, NOT a full clone+sync — it must \
@@ -358,7 +358,7 @@ fn trust_fails_fast_when_the_project_lock_is_held() {
     );
 
     let held = hold_project_lock(&fixture);
-    let out = run(&fixture, &["trust", "mydeps", "--revoke"]);
+    let out = run(&fixture, &["trust", "nvim-kit", "--revoke"]);
     drop(held);
 
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -419,8 +419,8 @@ fn consumer_with_two_dep_hooks() -> Fixture {
         "version = 1\n\n\
          [sources.depA]\ngit = \"{a}\"\ntransitive = true\n\n\
          [sources.depB]\ngit = \"{b}\"\ntransitive = true\n\n\
-         [targets.acfg]\npath = \"~/.config/a\"\nimports = [\"depA\"]\n\n\
-         [targets.bcfg]\npath = \"~/.config/b\"\nimports = [\"depB\"]\n",
+         [targets.acfg]\npath = \"~/.config/a\"\nsources = [\"depA\"]\n\n\
+         [targets.bcfg]\npath = \"~/.config/b\"\nsources = [\"depB\"]\n",
         a = dep_a_path.display(),
         b = dep_b_path.display(),
     );
@@ -599,7 +599,7 @@ fn trust_list_shows_file_paths_changed_since_the_last_trusted_commit() {
          preimage = \"{preimage}\"\n\
          approved_at = \"2026-06-20T00:00:00Z\"\n\
          commit = \"{commit_a}\"\n\
-         source = \"mydeps\"\n",
+         source = \"nvim-kit\"\n",
     );
     write(&lock_path, approved.as_bytes());
 
@@ -611,14 +611,15 @@ fn trust_list_shows_file_paths_changed_since_the_last_trusted_commit() {
     git(&dep, &["add", "-A"]);
     git(&dep, &["commit", "-m", "change tracked script"]);
 
-    let resync = run(&fixture, &["sync", "--no-transitive-hooks"]);
+    // The lock pins the dep at commit A; `update` moves the pin to the candidate commit.
+    let resync = run(&fixture, &["update", "nvim-kit"]);
     assert!(
         resync.status.success(),
-        "re-sync must succeed; stderr: {}",
+        "update must succeed; stderr: {}",
         String::from_utf8_lossy(&resync.stderr)
     );
 
-    let out = run(&fixture, &["trust", "mydeps", "--list"]);
+    let out = run(&fixture, &["trust", "nvim-kit", "--list"]);
     let shown = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -686,8 +687,8 @@ fn consumer_with_composed_files() -> (Fixture, PathBuf) {
     fixture.map_url("https://github.com/mock/leaf.git", &leaf_path);
     fixture.finish_gitconfig();
     let config = format!(
-        "version = 1\n\n[sources.mydeps]\ngit = \"{dep}\"\ntransitive = true\n\n\
-         [targets.dotcfg]\npath = \"~/.config\"\nimports = [\"mydeps\"]\n",
+        "version = 1\n\n[sources.nvim-kit]\ngit = \"{dep}\"\ntransitive = true\n\n\
+         [targets.xdg-config]\npath = \"~/.config\"\nsources = [\"nvim-kit\"]\n",
         dep = dep_path.display(),
     );
     write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());
@@ -713,7 +714,7 @@ fn trust_list_first_trust_shows_the_composed_file_surface_offline() {
     }
     std::fs::remove_dir_all(fixture.home_path.join(".config")).ok();
 
-    let out = run(&fixture, &["trust", "mydeps", "--list"]);
+    let out = run(&fixture, &["trust", "nvim-kit", "--list"]);
     let shown = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -781,7 +782,7 @@ fn trust_list_prior_trusted_still_shows_the_changed_diff_not_the_full_surface() 
          preimage = \"{preimage}\"\n\
          approved_at = \"2026-06-20T00:00:00Z\"\n\
          commit = \"{commit_a}\"\n\
-         source = \"mydeps\"\n",
+         source = \"nvim-kit\"\n",
     );
     write(&lock_path, approved.as_bytes());
 
@@ -793,14 +794,15 @@ fn trust_list_prior_trusted_still_shows_the_changed_diff_not_the_full_surface() 
     git(&dep, &["add", "-A"]);
     git(&dep, &["commit", "-m", "change tracked script"]);
 
-    let resync = run(&fixture, &["sync", "--no-transitive-hooks"]);
+    // The lock pins the dep at commit A; `update` moves the pin to the candidate commit.
+    let resync = run(&fixture, &["update", "nvim-kit"]);
     assert!(
         resync.status.success(),
-        "re-sync must succeed; stderr: {}",
+        "update must succeed; stderr: {}",
         String::from_utf8_lossy(&resync.stderr)
     );
 
-    let out = run(&fixture, &["trust", "mydeps", "--list"]);
+    let out = run(&fixture, &["trust", "nvim-kit", "--list"]);
     let shown = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -838,7 +840,7 @@ fn trust_list_first_trust_with_no_resolved_commit_degrades_to_a_sync_directive()
         "premise: run with NO prior lock so the discovered candidate carries no resolved commit"
     );
 
-    let out = run(&fixture, &["trust", "mydeps", "--list"]);
+    let out = run(&fixture, &["trust", "nvim-kit", "--list"]);
     let shown = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -917,7 +919,7 @@ fn nested_dep_with_hook(
     let d_manifest = format!(
         "version = 1\n\n\
          [sources.einner]\ngit = \"{inner_mock}\"\ntransitive = true\n\n\
-         [targets.dnode]\npath = \"d\"\nimports = [\"einner\"]\n",
+         [targets.dnode]\npath = \"d\"\nsources = [\"einner\"]\n",
     );
     commit_repo(dep_d, &[], &d_manifest);
     dep_e.to_path_buf()
@@ -944,8 +946,8 @@ fn consumer_with_nested_dep_hook() -> (Fixture, PathBuf, PathBuf) {
     fixture.map_url("https://github.com/mock/depe.git", &dep_e_repo);
     fixture.finish_gitconfig();
     let config = format!(
-        "version = 1\n\n[sources.mydeps]\ngit = \"{dep_d}\"\ntransitive = true\n\n\
-         [targets.dotcfg]\npath = \"~/.config\"\nimports = [\"mydeps\"]\n",
+        "version = 1\n\n[sources.nvim-kit]\ngit = \"{dep_d}\"\ntransitive = true\n\n\
+         [targets.xdg-config]\npath = \"~/.config\"\nsources = [\"nvim-kit\"]\n",
         dep_d = dep_d.path().display(),
     );
     write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());
@@ -982,7 +984,7 @@ fn trust_list_shows_changed_paths_for_a_nested_dep_of_dep_hook() {
          preimage = \"{preimage}\"\n\
          approved_at = \"2026-06-20T00:00:00Z\"\n\
          commit = \"{commit_a}\"\n\
-         source = \"mydeps\"\n",
+         source = \"nvim-kit\"\n",
     );
     write(&lock_path, approved.as_bytes());
 
@@ -996,14 +998,15 @@ fn trust_list_shows_changed_paths_for_a_nested_dep_of_dep_hook() {
         &["commit", "-m", "change tracked script in nested dep"],
     );
 
-    let resync = run(&fixture, &["sync", "--no-transitive-hooks"]);
+    // The lock pins the dep at commit A; `update` moves the pin to the candidate commit.
+    let resync = run(&fixture, &["update", "nvim-kit"]);
     assert!(
         resync.status.success(),
-        "re-sync must succeed; stderr: {}",
+        "update must succeed; stderr: {}",
         String::from_utf8_lossy(&resync.stderr)
     );
 
-    let out = run(&fixture, &["trust", "mydeps", "--list"]);
+    let out = run(&fixture, &["trust", "nvim-kit", "--list"]);
     let shown = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -1074,8 +1077,8 @@ fn consumer_with_two_colliding_nested_hooks() -> (Fixture, PathBuf, PathBuf) {
     let d_manifest = "version = 1\n\n\
          [sources.e1]\ngit = \"https://github.com/mock/depe1.git\"\ntransitive = true\n\n\
          [sources.e2]\ngit = \"https://github.com/mock/depe2.git\"\ntransitive = true\n\n\
-         [targets.d1]\npath = \"d1\"\nimports = [\"e1\"]\n\n\
-         [targets.d2]\npath = \"d2\"\nimports = [\"e2\"]\n";
+         [targets.d1]\npath = \"d1\"\nsources = [\"e1\"]\n\n\
+         [targets.d2]\npath = \"d2\"\nsources = [\"e2\"]\n";
     commit_repo(dep_d.path(), &[], d_manifest);
 
     fixture.map_url("https://github.com/mock/leaf.git", &leaf_path);
@@ -1085,7 +1088,7 @@ fn consumer_with_two_colliding_nested_hooks() -> (Fixture, PathBuf, PathBuf) {
     let config = format!(
         "version = 1\n\n\
          [sources.depA]\ngit = \"{d}\"\ntransitive = true\n\n\
-         [targets.acfg]\npath = \"~/.config/a\"\nimports = [\"depA\"]\n",
+         [targets.acfg]\npath = \"~/.config/a\"\nsources = [\"depA\"]\n",
         d = dep_d.path().display(),
     );
     write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());
@@ -1237,8 +1240,8 @@ fn consumer_with_hash_named_composed_target() -> (Fixture, PathBuf) {
     fixture.map_url("https://github.com/mock/leaf.git", &leaf_path);
     fixture.finish_gitconfig();
     let config = format!(
-        "version = 1\n\n[sources.mydeps]\ngit = \"{dep}\"\ntransitive = true\n\n\
-         [targets.dotcfg]\npath = \"~/.config\"\nimports = [\"mydeps\"]\n",
+        "version = 1\n\n[sources.nvim-kit]\ngit = \"{dep}\"\ntransitive = true\n\n\
+         [targets.xdg-config]\npath = \"~/.config\"\nsources = [\"nvim-kit\"]\n",
         dep = dep_path.display(),
     );
     write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());
@@ -1264,7 +1267,7 @@ fn trust_list_first_trust_lists_composed_surface_for_a_hash_named_dep_target() {
         seed.status.code()
     );
 
-    let out = run(&fixture, &["trust", "mydeps", "--list"]);
+    let out = run(&fixture, &["trust", "nvim-kit", "--list"]);
     let shown = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -1319,7 +1322,7 @@ fn trust_show_prints_a_tracked_files_contents_and_exits_zero() {
     let (fixture, _sentinel) = consumer_with_composed_files();
     seed_sync(&fixture);
 
-    let out = run(&fixture, &["trust", "mydeps", "--show", "nvim/init.lua"]);
+    let out = run(&fixture, &["trust", "nvim-kit", "--show", "nvim/init.lua"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
@@ -1343,7 +1346,7 @@ fn trust_show_lists_a_directorys_direct_entries_without_recursing() {
     let (fixture, _sentinel) = consumer_with_composed_files();
     seed_sync(&fixture);
 
-    let out = run(&fixture, &["trust", "mydeps", "--show", "nvim"]);
+    let out = run(&fixture, &["trust", "nvim-kit", "--show", "nvim"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
@@ -1372,7 +1375,7 @@ fn trust_show_errors_clearly_for_an_absent_path() {
     let (fixture, _sentinel) = consumer_with_composed_files();
     seed_sync(&fixture);
 
-    let out = run(&fixture, &["trust", "mydeps", "--show", "no/such/path"]);
+    let out = run(&fixture, &["trust", "nvim-kit", "--show", "no/such/path"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
@@ -1401,7 +1404,7 @@ fn trust_show_refuses_binary_content_instead_of_dumping_raw_bytes() {
 
     seed_sync(&fixture);
 
-    let out = run(&fixture, &["trust", "mydeps", "--show", "nvim/blob.bin"]);
+    let out = run(&fixture, &["trust", "nvim-kit", "--show", "nvim/blob.bin"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
     assert!(
@@ -1453,7 +1456,7 @@ fn trust_show_reads_a_file_offline_from_the_mirror_after_the_source_repos_are_de
     }
     std::fs::remove_dir_all(fixture.home_path.join(".config")).ok();
 
-    let out = run(&fixture, &["trust", "mydeps", "--show", "nvim/init.lua"]);
+    let out = run(&fixture, &["trust", "nvim-kit", "--show", "nvim/init.lua"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
 

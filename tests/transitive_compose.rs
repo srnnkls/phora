@@ -99,7 +99,7 @@ fn commit_repo(dir: &Path, files: &[(&str, &str)], manifest: &str) {
 fn reject_unknown_field_stub(stderr: &str) {
     assert!(
         !stderr.contains("unknown field"),
-        "`transitive`/`imports` must be accepted wire keys driving real composition, \
+        "`transitive` sources must be accepted bindings driving real composition, \
          not rejected by deny_unknown_fields; got a parse stub: {stderr}"
     );
 }
@@ -171,8 +171,8 @@ fn imported_dep_targets_are_composed_under_the_anchor_path() {
     fixture.map_url("https://github.com/mock/leaf.git", leaf.path());
     fixture.finish_gitconfig();
     let config = format!(
-        "version = 1\n\n[sources.mydeps]\ngit = \"{dep}\"\ntransitive = true\n\n\
-         [targets.dotcfg]\npath = \"~/.config\"\nimports = [\"mydeps\"]\n",
+        "version = 1\n\n[sources.nvim-kit]\ngit = \"{dep}\"\ntransitive = true\n\n\
+         [targets.xdg-config]\npath = \"~/.config\"\nsources = [\"nvim-kit\"]\n",
         dep = dep.path().display(),
     );
     write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());
@@ -210,8 +210,8 @@ fn dep_layout_governs_composed_artifacts_not_consumer_anchor_layout() {
     fixture.map_url("https://github.com/mock/leaf.git", leaf.path());
     fixture.finish_gitconfig();
     let config = format!(
-        "version = 1\n\n[sources.mydeps]\ngit = \"{dep}\"\ntransitive = true\n\n\
-         [targets.dotcfg]\npath = \"~/.config\"\nlayout = \"prefixed\"\nimports = [\"mydeps\"]\n",
+        "version = 1\n\n[sources.nvim-kit]\ngit = \"{dep}\"\ntransitive = true\n\n\
+         [targets.xdg-config]\npath = \"~/.config\"\nlayout = \"prefixed\"\nsources = [\"nvim-kit\"]\n",
         dep = dep.path().display(),
     );
     write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());
@@ -262,9 +262,9 @@ fn consumer_wins_on_consumer_vs_dep_source_name_collision() {
     let config = format!(
         "version = 1\n\n\
          [sources.editor]\ngit = \"{consumer_leaf}\"\ninclude = [\"pkg\"]\n\n\
-         [sources.mydeps]\ngit = \"{dep}\"\ntransitive = true\n\n\
+         [sources.nvim-kit]\ngit = \"{dep}\"\ntransitive = true\n\n\
          [targets.own]\npath = \"~/own\"\nsources = [\"editor\"]\n\n\
-         [targets.dotcfg]\npath = \"~/.config\"\nimports = [\"mydeps\"]\n",
+         [targets.xdg-config]\npath = \"~/.config\"\nsources = [\"nvim-kit\"]\n",
         consumer_leaf = consumer_leaf.path().display(),
         dep = dep.path().display(),
     );
@@ -325,7 +325,7 @@ fn two_deps_with_same_inner_source_name_do_not_silently_merge() {
         "version = 1\n\n\
          [sources.depa]\ngit = \"{dep_a}\"\ntransitive = true\n\n\
          [sources.depb]\ngit = \"{dep_b}\"\ntransitive = true\n\n\
-         [targets.dotcfg]\npath = \"~/.config\"\nimports = [\"depa\", \"depb\"]\n",
+         [targets.xdg-config]\npath = \"~/.config\"\nsources = [\"depa\", \"depb\"]\n",
         dep_a = dep_a.path().display(),
         dep_b = dep_b.path().display(),
     );
@@ -372,8 +372,8 @@ fn two_dep_targets_composing_to_the_same_destination_is_a_hard_error() {
     fixture.map_url("https://github.com/mock/leaf.git", leaf.path());
     fixture.finish_gitconfig();
     let config = format!(
-        "version = 1\n\n[sources.mydeps]\ngit = \"{dep}\"\ntransitive = true\n\n\
-         [targets.dotcfg]\npath = \"~/.config\"\nimports = [\"mydeps\"]\n",
+        "version = 1\n\n[sources.nvim-kit]\ngit = \"{dep}\"\ntransitive = true\n\n\
+         [targets.xdg-config]\npath = \"~/.config\"\nsources = [\"nvim-kit\"]\n",
         dep = dep.path().display(),
     );
     write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());

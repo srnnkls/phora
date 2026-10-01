@@ -59,18 +59,17 @@ fn revision(repository: &Path) -> String {
 fn manifest(reference: &str) -> String {
     format!(
         r#"
-[sources.content]
-path = "."
-include = ["skills/**"]
 [sources.loqui]
 git = "https://example.invalid/loqui.git"
 include = ["languages/**"]
-[targets.content]
-path = "."
-sources.content = {{ collapse = false }}
 [targets.loqui]
 path = "skills/loqui/reference/{reference}"
-sources.loqui = {{ collapse = false }}
+sources = ["loqui"]
+[offers.default]
+include = ["skills/**"]
+[offers.skills]
+include = ["skills/**"]
+targets = []
 "#
     )
 }
@@ -170,7 +169,7 @@ fn assert_deployed(package: &Package, target: &str, skill: &str, guides: &str) {
     assert!(!root.join("phora.toml").exists());
 }
 
-const CLAUDE: &str = "[targets.claude]\npath = \"out/claude\"\nimports = [\"tropos\"]\n";
+const CLAUDE: &str = "[targets.claude]\npath = \"out/claude\"\nsources = [\"tropos\"]\n";
 
 #[test]
 fn consumer_selected_local_package_imports_its_own_files_and_dependency() {
@@ -214,7 +213,7 @@ fn one_imported_package_selects_harness_refs_updates_and_replays_offline() {
         &package,
         "path",
         &format!(
-            "{CLAUDE}\n[targets.codex]\npath = \"out/codex\"\nimports = [{{ source = \"tropos\", branch = \"codex\" }}]\n"
+            "{CLAUDE}\n[targets.codex]\npath = \"out/codex\"\nsources.tropos = {{ branch = \"codex\" }}\n"
         ),
     );
     succeeds(&package, &["sync"]);
@@ -248,7 +247,7 @@ fn one_imported_package_selects_harness_refs_updates_and_replays_offline() {
     configure(
         &package,
         "path",
-        "[targets.codex]\npath = \"out/codex\"\nimports = [{ source = \"tropos\", branch = \"codex\" }]\n",
+        "[targets.codex]\npath = \"out/codex\"\nsources.tropos = { branch = \"codex\" }\n",
     );
     succeeds(&package, &["update", "tropos", "--fast-forward"]);
     assert_deployed(&package, "out/codex", "Codex rebuilt\n", "Updated Loqui\n");
@@ -294,13 +293,13 @@ fn import_branch_tag_and_revision_keep_distinct_pins() {
             r#"
 [targets.branch]
 path = "out/branch"
-imports = [{{ source = "tropos", branch = "variant" }}]
+sources.tropos = {{ branch = "variant" }}
 [targets.tag]
 path = "out/tag"
-imports = [{{ source = "tropos", tag = "variant" }}]
+sources.tropos = {{ tag = "variant" }}
 [targets.revision]
 path = "out/revision"
-imports = [{{ source = "tropos", rev = {pinned:?} }}]
+sources.tropos = {{ rev = {pinned:?} }}
 "#
         ),
     );
@@ -312,23 +311,49 @@ imports = [{{ source = "tropos", rev = {pinned:?} }}]
 }
 
 #[test]
-fn self_source_cannot_override_its_package_pin_in_a_binding() {
+fn a_target_binding_the_repo_itself_is_never_offered() {
     let package = package();
-    let manifest = manifest("loqui").replace(
-        "sources.content = { collapse = false }",
-        "sources.content = { branch = \"other\", collapse = false }",
+    let manifest = format!(
+        "[sources.content]\npath = \".\"\n{}\n[targets.content]\npath = \"content\"\nsources = [\"content\"]\n",
+        manifest("loqui")
     );
     write(&package.repository.join("phora.toml"), &manifest);
     git(&package.repository, &["add", "."]);
-    git(
-        &package.repository,
-        &["commit", "-qm", "Invalid self source"],
-    );
+    git(&package.repository, &["commit", "-qm", "Self path source"]);
     configure(&package, "path", CLAUDE);
     let result = run(&package, &["sync"]);
-    assert!(!result.status.success());
-    assert!(String::from_utf8_lossy(&result.stderr).contains("self source"));
-    assert!(!package.project.join("out").exists());
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!package.project.join("out/claude/content").exists());
+}
+
+#[test]
+fn two_offers_of_one_source_share_one_pin() {
+    let package = package();
+    configure(
+        &package,
+        "path",
+        &format!(
+            "{CLAUDE}\n[targets.skills]\npath = \"out/skills\"\nsources.tropos = {{ offer = \"skills\" }}\n"
+        ),
+    );
+    succeeds(&package, &["sync"]);
+    assert_deployed(&package, "out/claude", "Claude skill\n", "Loqui\n");
+    assert_eq!(
+        std::fs::read_to_string(package.project.join("out/skills/skills/code/SKILL.md"))
+            .expect("skill"),
+        "Claude skill\n"
+    );
+    assert!(!package.project.join("out/skills/skills/loqui").exists());
+    let lock = std::fs::read_to_string(package.project.join("phora.lock")).expect("lock");
+    assert_eq!(
+        lock.matches("name = \"tropos\"").count(),
+        1,
+        "one source, one pin, whichever offers its bindings select: {lock}"
+    );
 }
 
 #[test]
@@ -357,7 +382,7 @@ fn imported_package_deploys_at_a_parent_relative_anchor() {
     configure(
         &package,
         "path",
-        "[targets.tropos]\npath = \"../../out\"\nimports = [\"tropos\"]\n",
+        "[targets.tropos]\npath = \"../../out\"\nsources = [\"tropos\"]\n",
     );
     succeeds(&package, &["sync"]);
     assert_deployed(&package, "../../out", "Claude skill\n", "Loqui\n");
@@ -397,7 +422,7 @@ sources.guides = {{ collapse = false }}
     );
 }
 
-const CLAUDE_WITH_NOTES: &str = "[sources.notes]\npath = \"notes-src\"\ndeploy = \"link\"\n[targets.claude]\npath = \"out/claude\"\nimports = [\"tropos\"]\nsources.notes = {}\n";
+const CLAUDE_WITH_NOTES: &str = "[sources.notes]\npath = \"notes-src\"\ndeploy = \"link\"\n[targets.claude]\npath = \"out/claude\"\nsources.tropos = {}\nsources.notes = {}\n";
 
 #[test]
 fn bindings_moved_into_an_imported_package_are_adopted_in_one_sync() {
@@ -433,7 +458,7 @@ fn bindings_moved_into_an_imported_package_are_adopted_in_one_sync() {
             "the still-configured anchor must no longer own the moved destinations: {listed}"
         );
         assert!(
-            listed.contains("via tropos/content:"),
+            listed.contains("via tropos:"),
             "the moved destinations must list under the composed package: {listed}"
         );
         let owners = run(&package, &["where"]);
@@ -443,7 +468,7 @@ fn bindings_moved_into_an_imported_package_are_adopted_in_one_sync() {
             .filter_map(|line| line.strip_prefix("  - "))
             .collect();
         assert_eq!(owners.len(), 3, "one record per destination: {owners:?}");
-        for composed in ["%content", "%loqui"] {
+        for composed in ["%", "%loqui"] {
             assert!(
                 owners.iter().any(|owner| owner.ends_with(composed)),
                 "the composed target `{composed}` must own its moved destination: {owners:?}"

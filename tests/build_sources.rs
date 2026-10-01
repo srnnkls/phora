@@ -62,18 +62,14 @@ impl Fixture {
         write(
             &package.join("phora.toml"),
             r#"
-[sources.tropos]
-path = "."
-include = ["skills/**"]
 [sources.loqui]
 git = "https://example.invalid/loqui.git"
 include = ["languages/**"]
-[targets.skills]
-path = "."
-sources.tropos = { collapse = false }
 [targets.loqui]
 path = "skills/loqui/reference/loqui"
-sources.loqui = { collapse = false }
+sources = ["loqui"]
+[offers.default]
+include = ["skills/**"]
 "#,
         );
         git(&package, &["add", "."]);

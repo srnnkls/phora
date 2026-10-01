@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::config::transitive::Member;
 use crate::config::{
     Config, DeployMode, LayoutConfig, Offer, ParsedSource, Protocol, SourceFields, TakeEntry,
     Target, TemplateOptIn, merge_configs,
@@ -15,7 +16,7 @@ use crate::projection::build::project_binding;
 use crate::projection::diagnostic::ProjectionWarning;
 use crate::projection::model::{
     BindingProjection, BindingProjectionInput, CollapsePreference, LayoutSpec, Materialization,
-    MaterializationPolicy, MountView, OfferSpec, ResolvedSourceRef, TakeSpec, TemplatePolicy,
+    MaterializationPolicy, OfferSpec, ResolvedSourceRef, TakeSpec, TemplatePolicy,
 };
 use crate::projection::offer::OfferSelection;
 use crate::source::{
@@ -398,7 +399,6 @@ pub(crate) struct ExplainInput<'a> {
     pub collapse: Option<bool>,
     pub history: bool,
     pub layout: &'a LayoutConfig,
-    pub mount: Option<&'a MountView>,
     pub template_opt_in: &'a TemplateOptIn,
 }
 
@@ -425,7 +425,6 @@ pub(crate) fn explain_path(input: &ExplainInput<'_>, path: Option<&str>) -> Resu
         materialization: MaterializationPolicy::from(&input.mode),
         layout: &layout,
         templates: &templates,
-        mount: input.mount,
     })?;
 
     let body = match path {
@@ -707,7 +706,6 @@ pub(crate) fn explain_cmd(
         collapse: binding.collapse,
         history: binding.history,
         layout: &layout,
-        mount: target_cfg.mount.as_ref(),
         template_opt_in: &binding.template_opt_in,
     };
     explain_path(&input, path)
@@ -798,11 +796,11 @@ pub struct TargetListing {
     pub composed: Vec<ComposedListing>,
 }
 
-/// One dependency target composed into a config target through its `imports`.
+/// One dependency target composed into a config target through its `offer_bindings`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComposedListing {
     pub import: String,
-    pub dep_target: String,
+    pub member: Member,
     pub artifacts: Vec<ArtifactStatus>,
 }
 
@@ -1026,7 +1024,7 @@ where
                 if !artifacts.is_empty() {
                     groups.push(ComposedListing {
                         import: dep.import.clone(),
-                        dep_target: dep.dep_target.clone(),
+                        member: dep.member.clone(),
                         artifacts,
                     });
                 }
@@ -1263,7 +1261,6 @@ mod explain_tests {
             collapse,
             history: false,
             layout: &layout,
-            mount: None,
             template_opt_in: &TemplateOptIn::SuffixOnly,
         };
         explain_path(&input, path).expect("attribution resolves")

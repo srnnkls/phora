@@ -113,13 +113,13 @@ fn dep_with_on_change_hook(dep: &Path, sentinel_abs: &str) {
     commit_repo(dep, &[], &manifest);
 }
 
-/// A consumer importing the dep under `~/.config`; the composed target deploys at `~/.config/nvim`.
-fn consumer_importing(fixture: &mut Fixture, dep: &Path, leaf: &Path) {
+/// A consumer binding the dep under `~/.config`; the composed target deploys at `~/.config/nvim`.
+fn consumer_binding(fixture: &mut Fixture, dep: &Path, leaf: &Path) {
     fixture.map_url("https://github.com/mock/leaf.git", leaf);
     fixture.finish_gitconfig();
     let config = format!(
-        "version = 1\n\n[sources.mydeps]\ngit = \"{dep}\"\ntransitive = true\n\n\
-         [targets.dotcfg]\npath = \"~/.config\"\nimports = [\"mydeps\"]\n",
+        "version = 1\n\n[sources.nvim-kit]\ngit = \"{dep}\"\ntransitive = true\n\n\
+         [targets.xdg-config]\npath = \"~/.config\"\nsources = [\"nvim-kit\"]\n",
         dep = dep.display(),
     );
     write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());
@@ -146,7 +146,7 @@ fn verify_hard_gates_an_untrusted_stripped_transitive_hook() {
     let sentinel = fixture.home_path.join("hook-ran.sentinel");
     let dep = TempDir::new().expect("dep repo");
     dep_with_on_change_hook(dep.path(), &sentinel.display().to_string());
-    consumer_importing(&mut fixture, dep.path(), leaf.path());
+    consumer_binding(&mut fixture, dep.path(), leaf.path());
 
     let synced = run(&fixture, &["sync"]);
     assert!(
@@ -182,7 +182,7 @@ fn verify_is_green_once_the_stripped_hook_is_trusted() {
     let sentinel = fixture.home_path.join("hook-ran.sentinel");
     let dep = TempDir::new().expect("dep repo");
     dep_with_on_change_hook(dep.path(), &sentinel.display().to_string());
-    consumer_importing(&mut fixture, dep.path(), leaf.path());
+    consumer_binding(&mut fixture, dep.path(), leaf.path());
 
     let synced = run(&fixture, &["sync"]);
     assert!(synced.status.success(), "seeding sync must succeed");
@@ -226,7 +226,7 @@ fn preview_shows_the_confined_composed_target_path() {
     let sentinel = fixture.home_path.join("hook-ran.sentinel");
     let dep = TempDir::new().expect("dep repo");
     dep_with_on_change_hook(dep.path(), &sentinel.display().to_string());
-    consumer_importing(&mut fixture, dep.path(), leaf.path());
+    consumer_binding(&mut fixture, dep.path(), leaf.path());
 
     let synced = run(&fixture, &["sync"]);
     assert!(synced.status.success(), "seeding sync must succeed");
@@ -254,7 +254,7 @@ fn preview_json_marks_a_composed_target_with_an_untrusted_stripped_hook() {
     let sentinel = fixture.home_path.join("hook-ran.sentinel");
     let dep = TempDir::new().expect("dep repo");
     dep_with_on_change_hook(dep.path(), &sentinel.display().to_string());
-    consumer_importing(&mut fixture, dep.path(), leaf.path());
+    consumer_binding(&mut fixture, dep.path(), leaf.path());
 
     let synced = run(&fixture, &["sync"]);
     assert!(synced.status.success(), "seeding sync must succeed");
@@ -278,7 +278,7 @@ fn preview_degrades_gracefully_when_the_transitive_dep_is_unsynced() {
     let sentinel = fixture.home_path.join("hook-ran.sentinel");
     let dep = TempDir::new().expect("dep repo");
     dep_with_on_change_hook(dep.path(), &sentinel.display().to_string());
-    consumer_importing(&mut fixture, dep.path(), leaf.path());
+    consumer_binding(&mut fixture, dep.path(), leaf.path());
 
     let out = run(&fixture, &["preview"]);
     assert!(
@@ -299,13 +299,13 @@ fn dep_without_hooks(dep: &Path) {
     );
 }
 
-fn synced_import_fixture() -> (Fixture, TempDir, TempDir) {
+fn synced_binding_fixture() -> (Fixture, TempDir, TempDir) {
     let leaf = TempDir::new().expect("leaf repo");
     leaf_repo(leaf.path(), "leaf.txt", "payload\n");
     let mut fixture = build_fixture();
     let dep = TempDir::new().expect("dep repo");
     dep_without_hooks(dep.path());
-    consumer_importing(&mut fixture, dep.path(), leaf.path());
+    consumer_binding(&mut fixture, dep.path(), leaf.path());
     let synced = run(&fixture, &["sync"]);
     assert!(
         synced.status.success(),
@@ -316,8 +316,8 @@ fn synced_import_fixture() -> (Fixture, TempDir, TempDir) {
 }
 
 #[test]
-fn list_groups_composed_artifacts_under_the_importing_target() {
-    let (fixture, _leaf, _dep) = synced_import_fixture();
+fn list_groups_composed_artifacts_under_the_binding_target() {
+    let (fixture, _leaf, _dep) = synced_binding_fixture();
 
     let out = run(&fixture, &["list"]);
     assert!(
@@ -327,28 +327,28 @@ fn list_groups_composed_artifacts_under_the_importing_target() {
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "dotcfg:\n  via mydeps/nvim:\n    editor/pkg  ✓ clean\n",
-        "an import-only target lists its composed artifacts grouped by import and dep target, \
+        "xdg-config:\n  via nvim-kit/nvim:\n    editor/pkg/leaf.txt  ✓ clean\n",
+        "a binding-only target lists its composed artifacts per leaf, grouped by source and offer target, \
          never under the namespaced composed key"
     );
 }
 
 #[test]
-fn list_orphans_keeps_composed_records_while_the_importing_target_exists() {
-    let (fixture, _leaf, _dep) = synced_import_fixture();
+fn list_orphans_keeps_composed_records_while_the_binding_target_exists() {
+    let (fixture, _leaf, _dep) = synced_binding_fixture();
 
     let out = run(&fixture, &["list", "--orphans"]);
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         "No orphaned records.\n",
-        "composed records anchored by a configured importing target are not orphans"
+        "composed records anchored by a configured binding target are not orphans"
     );
 }
 
 #[test]
-fn list_orphans_reports_composed_records_once_the_importing_target_is_removed() {
-    let (fixture, _leaf, _dep) = synced_import_fixture();
-    let removed = run(&fixture, &["target", "rm", "--force", "dotcfg"]);
+fn list_orphans_reports_composed_records_once_the_binding_target_is_removed() {
+    let (fixture, _leaf, _dep) = synced_binding_fixture();
+    let removed = run(&fixture, &["target", "rm", "--force", "xdg-config"]);
     assert!(
         removed.status.success(),
         "target rm must succeed; stderr: {}",
@@ -359,7 +359,7 @@ fn list_orphans_reports_composed_records_once_the_importing_target_is_removed() 
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("editor/pkg") && stdout.contains(".config/nvim/pkg"),
-        "without its importing target a composed record is an orphan at its deployed path; \
+        "without its binding target a composed record is an orphan at its deployed path; \
          got:\n{stdout}"
     );
 }

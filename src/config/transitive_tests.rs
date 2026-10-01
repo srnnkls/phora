@@ -211,121 +211,479 @@ fn instance_distinguishes_parent_and_source_name() {
     );
 }
 
+const TRANSITIVE_DEP: &str = "version = 1\n\n[sources.tropos]\ngit = \"https://github.com/srnnkls/tropos.git\"\ntransitive = true\n\n";
+
+fn merged(toml: &str) -> Config {
+    merge_configs(Config::parse(toml).expect("config parses"), None)
+}
+
 #[test]
-fn imports_accepts_a_bare_source_name_list() {
-    let toml = "version = 1\n\n[sources.dep]\ngit = \"https://github.com/me/d.git\"\ntransitive = true\n\n\
-                [targets.home]\npath = \"~/deploy\"\nimports = [\"dep\"]\n";
-    let config = Config::parse(toml).expect("a bare-name imports list must parse");
-    let target = config.targets.get("home").expect("target `home` present");
+fn binding_a_transitive_source_lowers_into_an_import_with_the_default_offer() {
+    let config = merged(&format!(
+        "{TRANSITIVE_DEP}[targets.claude]\npath = \"~/.claude\"\nsources = [\"tropos\"]\n"
+    ));
+    let target = &config.targets["claude"];
+    assert!(
+        target.sources.iter().flatten().next().is_none(),
+        "a transitive binding must leave `sources`, got: {:?}",
+        target.sources
+    );
+    let imports = target
+        .offer_bindings
+        .as_deref()
+        .expect("the binding became an import");
     assert_eq!(
-        target.imports.as_ref().map(|imports| imports
+        imports
             .iter()
-            .map(|i| i.source.as_str())
-            .collect::<Vec<_>>()),
-        Some(vec!["dep"]),
-        "bare imports must carry the exact source names"
+            .map(|i| (i.identity.as_str(), i.source(), i.offer()))
+            .collect::<Vec<_>>(),
+        vec![("tropos", "tropos", "default")]
     );
-}
-
-#[test]
-fn imports_rejects_a_refined_table_import() {
-    let toml = "version = 1\n\n[sources.dep]\ngit = \"https://github.com/me/d.git\"\ntransitive = true\n\n\
-                [targets.home]\npath = \"~/deploy\"\nimports = [{ source = \"dep\", root = \"../escape\" }]\n";
-    // Security contract: `Vec<String>` makes escape-capable refinements (root/map/as) unrepresentable.
-    assert!(
-        Config::parse(toml).is_err(),
-        "a refined-table import must NOT parse into the bare-name `Vec<String>` field"
-    );
-}
-
-#[test]
-fn imports_rejects_a_map_form_refinement() {
-    let toml = "version = 1\n\n[sources.dep]\ngit = \"https://github.com/me/d.git\"\ntransitive = true\n\n\
-                [targets.home.imports.dep]\nas = \"renamed\"\n";
-    // Security contract: `Vec<String>` makes per-import keyed-table refinement unrepresentable.
-    assert!(
-        Config::parse(toml).is_err(),
-        "a map-form (keyed-table) imports refinement must NOT parse into `Vec<String>`"
-    );
-}
-
-#[test]
-fn source_in_both_imports_and_sources_is_rejected() {
-    let toml = "version = 1\n\n[sources.dep]\ngit = \"https://github.com/me/d.git\"\ntransitive = true\n\n\
-                [targets.home]\npath = \"~/deploy\"\nimports = [\"dep\"]\nsources = [\"dep\"]\n";
-    let config = Config::parse(toml).expect("the document itself is structurally valid TOML");
-    let err = config
+    config
         .validate()
-        .expect_err("a source referenced by BOTH imports (mount) and sources (flat) is an error");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("dep") && (msg.contains("imports") || msg.contains("mount")),
-        "the conflict must name the doubly-referenced source `dep` and the imports/mount conflict, got: {msg}"
+        .expect("a bare transitive binding validates");
+}
+
+#[test]
+fn a_binding_offer_selects_a_named_offer_and_aliases_keep_identities_apart() {
+    let config = merged(&format!(
+        "{TRANSITIVE_DEP}[targets.claude]\npath = \"~/.claude\"\n\
+         sources.tropos = {{ offer = \"fas\" }}\n\
+         sources.skills = {{ source = \"tropos\" }}\n"
+    ));
+    let mut imports: Vec<(String, String, String)> = config.targets["claude"]
+        .offer_bindings
+        .iter()
+        .flatten()
+        .map(|i| {
+            (
+                i.identity.clone(),
+                i.source().to_owned(),
+                i.offer().to_owned(),
+            )
+        })
+        .collect();
+    imports.sort();
+    assert_eq!(
+        imports,
+        vec![
+            ("skills".into(), "tropos".into(), "default".into()),
+            ("tropos".into(), "tropos".into(), "fas".into()),
+        ]
     );
 }
 
 #[test]
-fn imports_reference_to_a_non_transitive_source_is_rejected() {
-    let toml = "version = 1\n\n[sources.flat]\ngit = \"https://github.com/me/d.git\"\n\n\
-                [targets.home]\npath = \"~/deploy\"\nimports = [\"flat\"]\n";
-    let config = Config::parse(toml).expect("structurally valid TOML");
-    let err = config
+fn lowering_is_idempotent() {
+    let mut config = merged(&format!(
+        "{TRANSITIVE_DEP}[targets.claude]\npath = \"~/.claude\"\nsources = [\"tropos\"]\n"
+    ));
+    config.lower_transitive();
+    assert_eq!(
+        config.targets["claude"]
+            .offer_bindings
+            .as_ref()
+            .map(Vec::len),
+        Some(1)
+    );
+}
+
+#[test]
+fn a_transitive_flag_set_only_in_the_overlay_classifies_the_base_binding() {
+    let base = Config::parse(
+        "version = 1\n\n[sources.tropos]\ngit = \"https://github.com/srnnkls/tropos.git\"\n\n\
+         [targets.claude]\npath = \"~/.claude\"\nsources.tropos = { offer = \"fas\" }\n",
+    )
+    .expect("base parses");
+    let local = Config::parse("version = 1\n\n[sources.tropos]\ntransitive = true\n")
+        .expect("local parses");
+    let config = merge_configs(base, Some(local));
+    config
         .validate()
-        .expect_err("mounting a NON-transitive source via imports must be rejected");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("flat") && msg.contains("transitive"),
-        "the rejection must name `flat` and explain a mount requires a transitive source, got: {msg}"
+        .expect("`offer` is legal once the overlay makes the source transitive");
+    assert_eq!(
+        config.targets["claude"]
+            .offer_bindings
+            .as_ref()
+            .map(Vec::len),
+        Some(1)
     );
 }
 
 #[test]
-fn transitive_source_flat_bound_via_sources_is_rejected() {
-    let toml = "version = 1\n\n[sources.dep]\ngit = \"https://github.com/me/d.git\"\ntransitive = true\n\n\
-                [targets.home]\npath = \"~/deploy\"\nsources = [\"dep\"]\n";
-    let config = Config::parse(toml).expect("structurally valid TOML");
-    let err = config.validate().expect_err(
-        "a transitive source flat-bound via `sources` (never imported) must be rejected: \
-                     it would be silently flat-downgraded, bypassing escape-remote rejection",
+fn offer_on_a_flat_binding_is_rejected() {
+    let config = merged(
+        "version = 1\n\n[sources.dotfiles]\ngit = \"https://github.com/srnnkls/tropos.git\"\n\n\
+         [targets.claude]\npath = \"~/.claude\"\nsources.dotfiles = { offer = \"fas\" }\n",
     );
-    let msg = err.to_string();
-    assert!(
-        msg.contains("dep")
-            && msg.contains("transitive")
-            && (msg.contains("sources") || msg.contains("flat")),
-        "the rejection must name `dep`, mark it transitive, and explain it cannot be flat-bound via `sources`, got: {msg}"
-    );
-}
-
-#[test]
-fn transitive_source_declared_but_never_imported_is_rejected() {
-    let toml = "version = 1\n\n[sources.dep]\ngit = \"https://github.com/me/d.git\"\ntransitive = true\n\n\
-                [targets.home]\npath = \"~/deploy\"\n";
-    let config = Config::parse(toml).expect("structurally valid TOML");
-    let err = config.validate().expect_err(
-        "a transitive source that no target imports must be rejected: it would never \
-                     be mounted and its sub-graph never resolved",
-    );
-    let msg = err.to_string();
-    assert!(
-        msg.contains("dep") && msg.contains("transitive") && msg.contains("import"),
-        "the rejection must name `dep`, mark it transitive, and explain no target imports it, got: {msg}"
-    );
-}
-
-#[test]
-fn imports_reference_to_an_undefined_source_is_rejected() {
-    let toml = "version = 1\n\n\
-                [targets.home]\npath = \"~/deploy\"\nimports = [\"ghost\"]\n";
-    let config = Config::parse(toml).expect("structurally valid TOML");
-    let err = config
+    let msg = config
         .validate()
-        .expect_err("an imports reference to an undefined source must be rejected");
-    let msg = err.to_string();
+        .expect_err("offer needs a transitive source")
+        .to_string();
     assert!(
-        msg.contains("ghost"),
-        "the rejection must name the undefined source `ghost`, got: {msg}"
+        msg.contains("dotfiles") && msg.contains("offer"),
+        "got: {msg}"
     );
+}
+
+#[test]
+fn template_on_a_transitive_binding_is_rejected() {
+    let config = merged(&format!(
+        "{TRANSITIVE_DEP}[targets.claude]\npath = \"~/.claude\"\nsources.tropos = {{ template = false }}\n"
+    ));
+    let msg = config
+        .validate()
+        .expect_err("template is flat-only")
+        .to_string();
+    assert!(
+        msg.contains("tropos") && msg.contains("template"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn a_transitive_source_cannot_shape_its_own_offer() {
+    for key in ["root = \"x\"", "include = [\"a\"]", "exclude = [\"b\"]"] {
+        let config = merged(&format!(
+            "version = 1\n\n[sources.tropos]\ngit = \"https://github.com/srnnkls/tropos.git\"\ntransitive = true\n{key}\n\n\
+             [targets.claude]\npath = \"~/.claude\"\nsources = [\"tropos\"]\n"
+        ));
+        let msg = config
+            .validate()
+            .expect_err("the manifest owns the offers")
+            .to_string();
+        assert!(
+            msg.contains("tropos") && msg.contains("offer"),
+            "{key}: {msg}"
+        );
+    }
+}
+
+#[test]
+fn a_transitive_source_no_target_binds_is_rejected() {
+    let config = merged(TRANSITIVE_DEP);
+    let msg = config
+        .validate()
+        .expect_err("an unbound transitive source is never resolved")
+        .to_string();
+    assert!(
+        msg.contains("tropos") && msg.contains("transitive"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn the_imports_key_is_gone() {
+    let err = Config::parse(&format!(
+        "{TRANSITIVE_DEP}[targets.claude]\npath = \"~/.claude\"\nimports = [\"dep\"]\n"
+    ))
+    .expect_err("targets bind transitive sources through `sources`");
+    assert!(err.to_string().contains("imports"), "got: {err}");
+}
+
+const OFFERS_MANIFEST: &str = r#"
+[sources.loqui]
+git = "https://github.com/me/loqui.git"
+
+[sources.moira]
+git = "https://github.com/me/moira.git"
+
+[targets.claude]
+path = "~/.claude"
+sources = ["loqui"]
+
+[targets.loqui]
+path = "skills/loqui/reference/loqui"
+sources = ["loqui"]
+
+[targets.moira]
+path = "rules/fas/moira"
+sources = ["moira"]
+
+[offers.default]
+include = ["skills/**", "rules/fas/**"]
+
+[offers.fas]
+root = "rules/fas"
+targets = ["moira"]
+"#;
+
+#[test]
+fn the_default_offer_selects_every_offerable_target() {
+    let manifest = TransitiveManifest::parse(OFFERS_MANIFEST).expect("manifest parses");
+    let default = manifest.offer("default").expect("default offer");
+    assert_eq!(
+        default.targets.keys().collect::<Vec<_>>(),
+        vec!["loqui", "moira"],
+        "a target outside the repo is local config, never offered"
+    );
+    assert_eq!(
+        default.targets["moira"].path,
+        std::path::PathBuf::from("rules/fas/moira")
+    );
+}
+
+#[test]
+fn an_offer_root_re_roots_a_shared_target() {
+    let manifest = TransitiveManifest::parse(OFFERS_MANIFEST).expect("manifest parses");
+    let fas = manifest.offer("fas").expect("named offer");
+    assert_eq!(fas.targets.keys().collect::<Vec<_>>(), vec!["moira"]);
+    assert_eq!(fas.targets["moira"].path, std::path::PathBuf::from("moira"));
+}
+
+#[test]
+fn an_undeclared_offer_names_the_declared_ones() {
+    let manifest = TransitiveManifest::parse(OFFERS_MANIFEST).expect("manifest parses");
+    let msg = manifest
+        .offer("agents")
+        .expect_err("undeclared offer")
+        .to_string();
+    assert!(
+        msg.contains("agents") && msg.contains("default") && msg.contains("fas"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn the_default_offer_exists_undeclared() {
+    let manifest = TransitiveManifest::parse(
+        "[sources.gestalt]\ngit = \"https://github.com/srnnkls/gestalt.git\"\n\n[targets.gestalt]\npath = \"skills/gestalt\"\nsources = [\"gestalt\"]\n",
+    )
+    .expect("manifest parses");
+    let default = manifest.offer("default").expect("implicit default");
+    assert_eq!(default.targets.keys().collect::<Vec<_>>(), vec!["gestalt"]);
+    assert_eq!(manifest.offer_names().collect::<Vec<_>>(), vec!["default"]);
+}
+
+#[test]
+fn an_offer_selecting_an_undeclared_target_names_the_declared_ones() {
+    let manifest = TransitiveManifest::parse(&format!(
+        "{OFFERS_MANIFEST}\n[offers.agents]\ntargets = [\"agents\"]\n"
+    ))
+    .expect("manifest parses");
+    let msg = manifest
+        .offer("agents")
+        .expect_err("undeclared target")
+        .to_string();
+    assert!(
+        msg.contains("`agents`") && msg.contains("loqui") && msg.contains("moira"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn an_offer_naming_a_target_outside_its_root_is_rejected() {
+    let manifest = TransitiveManifest::parse(&format!(
+        "{OFFERS_MANIFEST}\n[offers.rules]\nroot = \"rules\"\ntargets = [\"loqui\"]\n"
+    ))
+    .expect("manifest parses");
+    let msg = manifest
+        .offer("rules")
+        .expect_err("loqui lies outside rules/")
+        .to_string();
+    assert!(msg.contains("outside the offer root"), "got: {msg}");
+}
+
+const LOCAL_ONLY_TARGETS: &str = r#"
+[sources.notes]
+path = "~/notes"
+
+[sources.henia]
+build = { inputs = ["notes"], run = "henia build" }
+
+[targets.notes]
+path = "notes"
+sources = ["notes"]
+
+[targets.built]
+path = "built"
+sources = ["henia"]
+"#;
+
+#[test]
+fn the_default_offer_skips_targets_binding_unpublishable_sources() {
+    let manifest = TransitiveManifest::parse(LOCAL_ONLY_TARGETS).expect("manifest parses");
+    let default = manifest.offer("default").expect("default offer");
+    assert!(default.targets.is_empty(), "got: {:?}", default.targets);
+}
+
+#[test]
+fn naming_a_target_that_binds_an_unpublishable_source_is_rejected() {
+    for (target, kind) in [("notes", "a local path"), ("built", "a build")] {
+        let manifest = TransitiveManifest::parse(&format!(
+            "{LOCAL_ONLY_TARGETS}\n[offers.x]\ntargets = [\"{target}\"]\n"
+        ))
+        .expect("manifest parses");
+        let msg = manifest.offer("x").expect_err(target).to_string();
+        assert!(
+            msg.contains("cannot be offered") && msg.contains(kind),
+            "{target}: {msg}"
+        );
+    }
+}
+
+#[test]
+fn an_offer_without_include_publishes_own_files_minus_phora_files() {
+    let manifest = TransitiveManifest::parse("[offers.rules]\n").expect("manifest parses");
+    let own = manifest
+        .offer("rules")
+        .expect("rules")
+        .files
+        .expect("own files");
+    assert_eq!(own.path.as_deref(), Some("."));
+    assert_eq!(
+        own.exclude.as_deref(),
+        Some(&["/phora.toml".to_owned(), "/phora.lock".to_owned()][..])
+    );
+}
+
+#[test]
+fn own_files_give_way_to_every_target_path() {
+    let manifest = TransitiveManifest::parse(OFFERS_MANIFEST).expect("manifest parses");
+    let own = manifest
+        .offer("default")
+        .expect("default")
+        .files
+        .expect("own files");
+    assert_eq!(
+        own.exclude.as_deref(),
+        Some(
+            &[
+                "/skills/loqui/reference/loqui/".to_owned(),
+                "/rules/fas/moira/".to_owned()
+            ][..]
+        ),
+        "an offer with `include` publishes phora files only if selected, and every target path yields"
+    );
+    let fas = manifest
+        .offer("fas")
+        .expect("fas")
+        .files
+        .expect("own files");
+    assert_eq!(fas.root.as_deref(), Some(std::path::Path::new("rules/fas")));
+    assert_eq!(
+        fas.exclude.as_deref(),
+        Some(
+            &[
+                "/phora.toml".to_owned(),
+                "/phora.lock".to_owned(),
+                "/moira/".to_owned()
+            ][..]
+        )
+    );
+}
+
+#[test]
+fn own_files_give_way_to_a_target_the_offer_does_not_select() {
+    let manifest = TransitiveManifest::parse(&format!(
+        "{OFFERS_MANIFEST}\n[offers.skills]\ntargets = []\n"
+    ))
+    .expect("manifest parses");
+    let skills = manifest.offer("skills").expect("skills");
+    assert!(skills.targets.is_empty());
+    let own = skills.files.expect("own files");
+    assert!(
+        own.exclude
+            .iter()
+            .flatten()
+            .any(|e| e == "/skills/loqui/reference/loqui/"),
+        "a deselected target's committed copy must not ride along, got: {:?}",
+        own.exclude
+    );
+}
+
+#[test]
+fn a_target_at_the_repo_root_subtracts_nothing() {
+    let manifest = TransitiveManifest::parse(
+        "[sources.dotfiles]\ngit = \"https://github.com/srnnkls/dotfiles.git\"\n\n\
+         [targets.home]\npath = \".\"\nsources = [\"dotfiles\"]\n",
+    )
+    .expect("manifest parses");
+    let own = manifest
+        .offer("default")
+        .expect("default")
+        .files
+        .expect("own files");
+    assert_eq!(
+        own.exclude.as_deref(),
+        Some(&["/phora.toml".to_owned(), "/phora.lock".to_owned()][..])
+    );
+}
+
+#[test]
+fn a_target_covering_the_offer_root_leaves_no_own_files() {
+    let manifest = TransitiveManifest::parse(&format!(
+        "{OFFERS_MANIFEST}\n[offers.moira]\nroot = \"rules/fas/moira\"\n"
+    ))
+    .expect("manifest parses");
+    let moira = manifest.offer("moira").expect("moira");
+    assert!(moira.files.is_none());
+    assert_eq!(moira.targets["moira"].path, std::path::PathBuf::new());
+}
+
+#[test]
+fn manifest_rejects_keys_with_the_member_separator() {
+    for text in [
+        "[sources.\"a%b\"]\ngit = \"https://github.com/srnnkls/tropos.git\"\n",
+        "[targets.\"a%b\"]\npath = \"x\"\n",
+    ] {
+        let err = TransitiveManifest::parse(text).expect_err(text);
+        assert!(err.to_string().contains('%'), "{text}: {err}");
+    }
+}
+
+#[test]
+fn escaping_offer_roots_and_named_target_paths_are_rejected() {
+    for text in [
+        "[offers.fas]\nroot = \"../rules\"\n",
+        "[offers.fas]\nroot = \"/etc/fas\"\n",
+        "[sources.gestalt]\ngit = \"https://github.com/srnnkls/gestalt.git\"\n[targets.gestalt]\npath = \"../gestalt\"\nsources = [\"gestalt\"]\n[offers.fas]\ntargets = [\"gestalt\"]\n",
+        "[sources.gestalt]\ngit = \"https://github.com/srnnkls/gestalt.git\"\n[targets.gestalt]\npath = \"~/gestalt\"\nsources = [\"gestalt\"]\n[offers.fas]\ntargets = [\"gestalt\"]\n",
+    ] {
+        let manifest = TransitiveManifest::parse(text).expect(text);
+        let err = manifest.offer("fas").expect_err(text);
+        assert!(
+            err.to_string().contains("relative subpath"),
+            "{text}: {err}"
+        );
+    }
+}
+
+#[test]
+fn hooks_are_retained_per_target() {
+    let text = r#"
+[sources.gestalt]
+git = "https://github.com/srnnkls/gestalt.git"
+
+[targets.gestalt]
+path = "skills/gestalt"
+sources = ["gestalt"]
+hooks.on_change = "./install-skill.sh"
+
+[targets.rules]
+path = "rules"
+sources = ["gestalt"]
+"#;
+    let manifest = TransitiveManifest::parse(text).expect("manifest parses");
+    let hooks = manifest
+        .hooks()
+        .and_then(toml::Value::as_table)
+        .expect("hooks");
+    assert_eq!(hooks.keys().collect::<Vec<_>>(), vec!["gestalt"]);
+}
+
+#[test]
+fn a_transitive_binding_inside_an_offered_target_lowers_into_an_import() {
+    let manifest = TransitiveManifest::parse(
+        "[sources.moira]\ngit = \"https://github.com/srnnkls/moira.git\"\ntransitive = true\n\n\
+         [targets.rules]\npath = \"rules/fas/moira\"\nsources.moira = { offer = \"fas\" }\n",
+    )
+    .expect("manifest parses");
+    let offer = manifest.offer("default").expect("default");
+    let target = &offer.targets["rules"];
+    assert!(target.sources.iter().flatten().next().is_none());
+    let imports = target.offer_bindings.as_deref().expect("nested import");
+    assert_eq!((imports[0].source(), imports[0].offer()), ("moira", "fas"));
 }
 
 // TDEP-HOOK-GATE-001
@@ -510,4 +868,46 @@ fn hook_id_preserves_greppable_prefix_and_namespacing() {
         id.starts_with("ns%1%editor#on_change#"),
         "the human-readable `composed_target#on_change#` prefix must survive for auditing, got: {id}"
     );
+}
+
+#[test]
+fn a_root_offer_naming_a_local_target_fails_validation() {
+    let config = merged(&format!(
+        "{TRANSITIVE_DEP}[targets.claude]\npath = \"~/.claude\"\nsources = [\"tropos\"]\n\n\
+         [offers.agents]\ntargets = [\"claude\"]\n"
+    ));
+    let msg = config
+        .validate()
+        .expect_err("an absolute target cannot be offered")
+        .to_string();
+    assert!(
+        msg.contains("agents") && msg.contains("claude") && msg.contains("relative subpath"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn a_target_key_with_the_member_separator_fails_validation() {
+    let config = merged("version = 1\n\n[targets.\"a%b\"]\npath = \"x\"\n");
+    let msg = config.validate().expect_err("`%` is reserved").to_string();
+    assert!(msg.contains("a%b"), "got: {msg}");
+}
+
+#[test]
+fn a_local_overlay_cannot_declare_offers() {
+    let err = Config::parse_local("version = 1\n\n[offers.default]\n")
+        .expect_err("offers publish committed content");
+    assert!(err.to_string().contains("offers"), "got: {err}");
+}
+
+#[test]
+fn local_only_sources_do_not_block_an_import() {
+    let manifest = TransitiveManifest::parse(
+        "[sources.tropos]\npath = \".\"\n\n\
+         [sources.henia]\nbuild = { inputs = [\"tropos\"], run = \"henia build\" }\n\n\
+         [targets.claude]\npath = \"~/.claude\"\nsources = [\"henia\"]\n\n\
+         [offers.default]\ninclude = [\"skills/**\"]\n",
+    )
+    .expect("sources only the local config binds are not part of any offer");
+    assert!(manifest.offer("default").is_ok());
 }

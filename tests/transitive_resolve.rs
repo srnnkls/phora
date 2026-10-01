@@ -68,7 +68,7 @@ fn run(fixture: &Fixture, args: &[&str]) -> Output {
 fn reject_unknown_field_stub(stderr: &str) {
     assert!(
         !stderr.contains("unknown field"),
-        "`transitive`/`imports` must be accepted wire keys driving real recursion, \
+        "`transitive`/`offers` must be accepted wire keys driving real recursion, \
          not rejected by deny_unknown_fields; got a parse stub: {stderr}"
     );
 }
@@ -107,7 +107,7 @@ fn fetch_failure_at_depth_writes_no_lock() {
     let fixture = build_fixture();
     let config = format!(
         "version = 1\n\n[sources.dep]\ngit = \"{dep}\"\ntransitive = true\n\n\
-         [targets.home]\npath = \"~/deploy\"\nimports = [\"dep\"]\n",
+         [targets.home]\npath = \"~/deploy\"\nsources = [\"dep\"]\n",
         dep = dep.path().display(),
     );
     write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());
@@ -144,7 +144,7 @@ fn fetch_failure_at_depth_writes_no_lock() {
 fn transitive_source_with_file_url_remote_is_rejected() {
     let fixture = build_fixture();
     let config = "version = 1\n\n[sources.dep]\ngit = \"file:///etc/passwd\"\ntransitive = true\n\n\
-         [targets.home]\npath = \"~/deploy\"\nimports = [\"dep\"]\n";
+         [targets.home]\npath = \"~/deploy\"\nsources = [\"dep\"]\n";
     write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());
 
     let out = run(&fixture, &["sync"]);
@@ -188,7 +188,7 @@ fn transitive_cycle_terminates_via_url_ref_visited_set() {
 
     let config = format!(
         "version = 1\n\n[sources.a]\ngit = \"{a_mock}\"\ntransitive = true\n\n\
-         [targets.home]\npath = \"~/deploy\"\nimports = [\"a\"]\n",
+         [targets.home]\npath = \"~/deploy\"\nsources = [\"a\"]\n",
     );
     write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());
 
@@ -238,7 +238,7 @@ fn local_overlay_can_flip_a_source_to_transitive() {
     );
 
     let overlay = "version = 1\n\n[sources.dep]\ntransitive = true\n\n\
-         [targets.home]\npath = \"~/deploy\"\nimports = [\"dep\"]\n";
+         [targets.home]\npath = \"~/deploy\"\nsources = [\"dep\"]\n";
     write(
         &fixture.cwd.path().join("phora.local.toml"),
         overlay.as_bytes(),
@@ -280,7 +280,7 @@ fn frozen_refuses_to_fetch_an_unpinned_transitive_manifest() {
     let fixture = build_fixture();
     let config = format!(
         "version = 1\n\n[sources.dep]\ngit = \"{dep}\"\ntransitive = true\n\n\
-         [targets.home]\npath = \"~/deploy\"\nimports = [\"dep\"]\n",
+         [targets.home]\npath = \"~/deploy\"\nsources = [\"dep\"]\n",
         dep = dep.path().display(),
     );
     write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());
@@ -321,27 +321,16 @@ fn dep_repo_custom(dir: &Path, manifest_content: &str) {
     git(dir, &["commit", "-m", "dep"]);
 }
 
-fn dep_repo_nested_transitive(dir: &Path, inner_name: &str, inner_mock_url: &str) {
-    git(dir, &["init", "-b", "main", "."]);
-    git(dir, &["config", "user.email", "test@example.com"]);
-    git(dir, &["config", "user.name", "Test"]);
-    let manifest = format!(
-        "version = 1\n\n[sources.{inner_name}]\ngit = \"{inner_mock_url}\"\ntransitive = true\n\n\
-         [targets.t]\npath = \"sub\"\nimports = [\"{inner_name}\"]\n",
-    );
-    write(&dir.join("phora.toml"), manifest.as_bytes());
-    write(&dir.join("sub/file.txt"), b"payload\n");
-    git(dir, &["add", "-A"]);
-    git(dir, &["commit", "-m", "dep"]);
-}
-
 #[test]
 fn frozen_refuses_to_fetch_an_unpinned_nested_transitive_manifest() {
     let leaf = TempDir::new().expect("leaf repo");
     git(leaf.path(), &["init", "-b", "main", "."]);
     git(leaf.path(), &["config", "user.email", "test@example.com"]);
     git(leaf.path(), &["config", "user.name", "Test"]);
-    write(&leaf.path().join("phora.toml"), b"version = 1\n");
+    write(
+        &leaf.path().join("phora.toml"),
+        b"version = 1\n\n[offers.default]\n",
+    );
     write(&leaf.path().join("file.txt"), b"leaf\n");
     git(leaf.path(), &["add", "-A"]);
     git(leaf.path(), &["commit", "-m", "leaf"]);
@@ -350,7 +339,7 @@ fn frozen_refuses_to_fetch_an_unpinned_nested_transitive_manifest() {
     let inner_mock = "https://github.com/mock/inner.git";
 
     let dep = TempDir::new().expect("dep repo");
-    dep_repo_nested_transitive(dep.path(), "inner", inner_mock);
+    dep_repo(dep.path(), "inner", inner_mock);
 
     let fixture = build_fixture();
     // Redirect the mock URL to the leaf repo so the nested fetch is reachable offline:
@@ -360,7 +349,7 @@ fn frozen_refuses_to_fetch_an_unpinned_nested_transitive_manifest() {
 
     let config = format!(
         "version = 1\n\n[sources.dep]\ngit = \"{dep}\"\ntransitive = true\n\n\
-         [targets.home]\npath = \"~/deploy\"\nimports = [\"dep\"]\n",
+         [targets.home]\npath = \"~/deploy\"\nsources = [\"dep\"]\n",
         dep = dep.path().display(),
     );
     write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());
@@ -434,13 +423,16 @@ path = \"/etc\"
 [targets.t]
 path = \"sub\"
 sources = [\"nested_flat\"]
+
+[offers.default]
+targets = [\"t\"]
 ";
     dep_repo_custom(dep.path(), manifest);
 
     let fixture = build_fixture();
     let config = format!(
         "version = 1\n\n[sources.dep]\ngit = \"{dep}\"\ntransitive = true\n\n\
-         [targets.home]\npath = \"~/deploy\"\nimports = [\"dep\"]\n",
+         [targets.home]\npath = \"~/deploy\"\nsources = [\"dep\"]\n",
         dep = dep.path().display(),
     );
     write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());
@@ -453,8 +445,8 @@ sources = [\"nested_flat\"]
         "a transitive source using a nested flat source with absolute path must be rejected"
     );
     assert!(
-        stderr.contains(TRANSITIVE_ESCAPE_DIAGNOSTIC),
-        "the rejection must emit the named escape diagnostic `{TRANSITIVE_ESCAPE_DIAGNOSTIC}`, got: {stderr}"
+        stderr.contains("a local path source"),
+        "an offer naming a target bound to a local path must say why it cannot be offered, got: {stderr}"
     );
 }
 
@@ -477,7 +469,7 @@ sources = [\"nested_git_abs\"]
     let fixture = build_fixture();
     let config = format!(
         "version = 1\n\n[sources.dep]\ngit = \"{dep}\"\ntransitive = true\n\n\
-         [targets.home]\npath = \"~/deploy\"\nimports = [\"dep\"]\n",
+         [targets.home]\npath = \"~/deploy\"\nsources = [\"dep\"]\n",
         dep = dep.path().display(),
     );
     write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());
@@ -573,7 +565,7 @@ fn unfrozen_sync_locks_nested_instance_and_unmodified_frozen_roundtrips() {
     let d_manifest = "version = 1\n\n\
          [sources.einner]\ngit = \"https://github.com/mock/depe.git\"\ntransitive = true\n\n\
          [sources.vonly]\ngit = \"https://github.com/mock/vonly.git\"\ntransitive = true\n\n\
-         [targets.dnode]\npath = \"d\"\nimports = [\"einner\"]\n";
+         [targets.dnode]\npath = \"d\"\nsources = [\"einner\"]\n";
     commit_manifest(dep_d.path(), d_manifest);
 
     let fixture = build_fixture();
@@ -588,8 +580,8 @@ fn unfrozen_sync_locks_nested_instance_and_unmodified_frozen_roundtrips() {
     write(&fixture.home_path.join(".gitconfig"), gitconfig.as_bytes());
 
     let config = format!(
-        "version = 1\n\n[sources.mydeps]\ngit = \"{dep_d}\"\ntransitive = true\n\n\
-         [targets.dotcfg]\npath = \"~/.config\"\nimports = [\"mydeps\"]\n",
+        "version = 1\n\n[sources.nvim-kit]\ngit = \"{dep_d}\"\ntransitive = true\n\n\
+         [targets.xdg-config]\npath = \"~/.config\"\nsources = [\"nvim-kit\"]\n",
         dep_d = dep_d.path().display(),
     );
     write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());
@@ -614,11 +606,11 @@ fn unfrozen_sync_locks_nested_instance_and_unmodified_frozen_roundtrips() {
          instance column was dead. Got lock:\n{full_lock}"
     );
     assert!(
-        full_lock.contains("name = \"mydeps\"")
+        full_lock.contains("name = \"nvim-kit\"")
             && full_lock
                 .split("[[sources]]")
-                .any(|b| b.contains("name = \"mydeps\"") && !b.contains("instance =")),
-        "the depth-1 anchor `mydeps` must remain a consumer-root node (instance = None); got:\n{full_lock}"
+                .any(|b| b.contains("name = \"nvim-kit\"") && !b.contains("instance =")),
+        "the depth-1 anchor `nvim-kit` must remain a consumer-root node (instance = None); got:\n{full_lock}"
     );
 
     let lock_before = std::fs::read(&lock_path).expect("lock readable before frozen run");
@@ -694,8 +686,8 @@ fn frozen_reads_transitive_manifest_offline_without_fetching() {
     write(&fixture.home_path.join(".gitconfig"), reachable.as_bytes());
 
     let config = "version = 1\n\n\
-         [sources.mydeps]\ngit = \"https://github.com/mock/offdep.git\"\ntransitive = true\n\n\
-         [targets.dotcfg]\npath = \"~/.config\"\nimports = [\"mydeps\"]\n";
+         [sources.nvim-kit]\ngit = \"https://github.com/mock/offdep.git\"\ntransitive = true\n\n\
+         [targets.xdg-config]\npath = \"~/.config\"\nsources = [\"nvim-kit\"]\n";
     write(&fixture.cwd.path().join("phora.toml"), config.as_bytes());
 
     let seed = run(&fixture, &["sync"]);
