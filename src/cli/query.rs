@@ -420,6 +420,7 @@ pub(crate) fn explain_path(input: &ExplainInput<'_>, path: Option<&str>) -> Resu
         offer: &offer_spec,
         inventory: &inventory,
         take: &take,
+        composed_take: None,
         collapse: CollapsePreference::from(input.collapse),
         history: input.history,
         materialization: MaterializationPolicy::from(&input.mode),

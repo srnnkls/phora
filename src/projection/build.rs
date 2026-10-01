@@ -11,7 +11,7 @@ use crate::projection::model::{
     WorkspaceTargetInput,
 };
 use crate::projection::offer::OfferSelection;
-use crate::projection::take::{ResolvedTake, TakeWarning, fold_dest, resolve_take};
+use crate::projection::take::{ResolvedTake, TakeResolution, TakeWarning, fold_dest, resolve_take};
 use crate::source::SourcePath;
 
 /// Projects one binding: compile the offer over the inventory, seal `take` over it,
@@ -44,8 +44,11 @@ pub fn project_binding(
         .select(&candidates);
 
     let directives = input.take.directives();
-    let resolution = resolve_take(&offer, directives.as_deref())
+    let mut resolution = resolve_take(&offer, directives.as_deref())
         .map_err(|error| classify_take_error(error, &offer, input.take))?;
+    if let Some(outer) = input.composed_take {
+        resolution = compose_take(resolution, outer)?;
+    }
     let resolved_takes = resolution.kept;
     let take_warnings = resolution.warnings;
 
@@ -181,6 +184,35 @@ fn collapse_blocked(error: Error) -> ProjectionError {
 
 /// A take failure is `LeafNotOffered` when a literal or rename source is not in the
 /// offer set; the offer seal rejects it first, so it dominates any other take fault.
+/// Resolves `outer` over what `inner` produced, keeping each leaf's original source.
+fn compose_take(
+    inner: TakeResolution,
+    outer: &TakeSpec,
+) -> std::result::Result<TakeResolution, ProjectionError> {
+    let produced: Vec<String> = inner.kept.iter().map(|take| take.dest.clone()).collect();
+    let directives = outer.directives();
+    let resolution = resolve_take(&produced, directives.as_deref())
+        .map_err(|error| classify_take_error(error, &produced, outer))?;
+    let sources: BTreeMap<&str, &str> = inner
+        .kept
+        .iter()
+        .map(|take| (take.dest.as_str(), take.source.as_str()))
+        .collect();
+    let kept = resolution
+        .kept
+        .into_iter()
+        .filter_map(|take| {
+            Some(ResolvedTake {
+                source: (*sources.get(take.source.as_str())?).to_owned(),
+                dest: take.dest,
+            })
+        })
+        .collect();
+    let mut warnings = inner.warnings;
+    warnings.extend(resolution.warnings);
+    Ok(TakeResolution { kept, warnings })
+}
+
 fn classify_take_error(error: Error, offer: &[String], take: &TakeSpec) -> ProjectionError {
     if let TakeSpec::Explicit {
         literals, renames, ..
@@ -593,6 +625,7 @@ mod projection_builder_tests {
                 offer: &offer,
                 inventory: &inventory,
                 take: &take,
+                composed_take: None,
                 collapse: CollapsePreference::from(self.collapse),
                 history: self.history,
                 materialization: MaterializationPolicy::from(&self.source.deploy_mode()),
@@ -918,6 +951,7 @@ mod projection_builder_tests {
                 offer: &offer,
                 inventory: &inventory,
                 take: &take,
+                composed_take: None,
                 collapse: CollapsePreference::default(),
                 history: true,
                 materialization: MaterializationPolicy::Copy,
@@ -930,6 +964,7 @@ mod projection_builder_tests {
                 offer: &offer,
                 inventory: &inventory,
                 take: &take,
+                composed_take: None,
                 collapse: CollapsePreference::default(),
                 history: true,
                 materialization: MaterializationPolicy::Copy,
@@ -971,6 +1006,7 @@ mod projection_builder_tests {
             offer,
             inventory,
             take,
+            composed_take: None,
             collapse: CollapsePreference::default(),
             history: false,
             materialization: MaterializationPolicy::Copy,

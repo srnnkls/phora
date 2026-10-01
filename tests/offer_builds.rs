@@ -394,3 +394,14 @@ fn a_linked_package_builds_from_its_working_tree() {
         "uncommitted\n"
     );
 }
+
+#[test]
+fn a_consumer_take_composes_over_the_dependency_target_take() {
+    let fixture = Fixture::new(PACKAGE);
+    fixture.configure(
+        &fixture.harness(COPY_INPUT),
+        "offer = \"claude\", take = [{ \"skills/code/SKILL.md\" = \"skill\" }]",
+    );
+    fixture.succeeds(&["sync"]);
+    assert_eq!(fixture.deployed(), set(&["skill"]));
+}

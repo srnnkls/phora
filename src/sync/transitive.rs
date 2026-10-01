@@ -1075,7 +1075,7 @@ fn synthetic_target(
             })?;
             binding.source = Some(namespaced.clone());
             if let Some(take) = take {
-                binding.take = Some(take.to_vec());
+                binding.composed_take = Some(take.to_vec());
             }
             binding.collapse = collapse.or(binding.collapse).or(Some(false));
         }
@@ -1615,7 +1615,7 @@ mod tests {
 
         let binding = binding_of(&synthetic, "nvim");
         let take = binding
-            .take
+            .composed_take
             .as_deref()
             .expect("the consumer's mount take for bound `dep` folds into the binding's `take`");
         assert!(
@@ -1649,7 +1649,7 @@ mod tests {
             binding.source
         );
         let take = binding
-            .take
+            .composed_take
             .as_deref()
             .expect("the consumer mount take folds into the binding");
         assert!(
@@ -1699,11 +1699,11 @@ mod tests {
              two independent instances"
         );
         let take_a = binding_of(&first, "nvim")
-            .take
+            .composed_take
             .as_deref()
             .expect("anchor one take");
         let take_b = binding_of(&second, "nvim")
-            .take
+            .composed_take
             .as_deref()
             .expect("anchor two take");
         assert!(
@@ -1861,7 +1861,7 @@ mod tests {
     }
 
     #[test]
-    fn consumer_mount_take_overrides_a_binding_local_take() {
+    fn a_consumer_take_composes_over_a_binding_local_take() {
         let dep = dep_target_with_binding_local_take();
         let anchor = consumer_anchor("take = [\"consumer-wins.lua\"]");
         let synthetic = synthetic_target(
@@ -1874,18 +1874,18 @@ mod tests {
             mount_for(&anchor).take,
             mount_for(&anchor).collapse,
         )
-        .expect(
-            "a dep whose binding has its own take, mounted under a consumer override, synthesizes",
-        );
+        .expect("a dep whose binding has its own take, under a consumer take, synthesizes");
 
-        let take = binding_of(&synthetic, "nvim")
-            .take
-            .as_deref()
-            .expect("the binding carries a take");
+        let binding = binding_of(&synthetic, "nvim");
         assert!(
-            matches!(take, [TakeEntry::Leaf(s)] if s == "consumer-wins.lua"),
-            "PRECEDENCE: a present consumer mount take must OVERRIDE the dep's binding-local \
-             `take = [\"dep-local.lua\"]`, not be ignored or merged; got: {take:?}"
+            matches!(binding.take.as_deref(), Some([TakeEntry::Leaf(s)]) if s == "dep-local.lua"),
+            "the dep's own take still shapes its output; got: {:?}",
+            binding.take
+        );
+        assert!(
+            matches!(binding.composed_take.as_deref(), Some([TakeEntry::Leaf(s)]) if s == "consumer-wins.lua"),
+            "the consumer take applies to that output; got: {:?}",
+            binding.composed_take
         );
     }
 

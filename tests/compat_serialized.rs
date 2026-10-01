@@ -1435,6 +1435,7 @@ fn moved_path_projection(fx: &Fixture, layout_override: Option<LayoutSpec>) -> T
         offer: &offer,
         inventory: &inventory,
         take: &take,
+        composed_take: None,
         collapse: CollapsePreference::from(binding.collapse),
         history: false,
         materialization: MaterializationPolicy::from(&source.deploy_mode()),

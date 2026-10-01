@@ -358,6 +358,10 @@ fn resolve_plan(
     let inventory = SourceInventory::from_paths(candidates.iter().map(String::as_str))?;
     let offer = OfferSpec::from(ctx.source.offer());
     let take = TakeSpec::from_entries(ctx.binding.take);
+    let composed_take = ctx
+        .binding
+        .composed_take
+        .map(|take| TakeSpec::from_entries(Some(take)));
     let templates = TemplatePolicy::from(&ctx.binding.template_opt_in);
     let layout = LayoutSpec::from(ctx.layout);
     let source = ResolvedSourceRef::new(ctx.binding.source, commit);
@@ -367,6 +371,7 @@ fn resolve_plan(
         offer: &offer,
         inventory: &inventory,
         take: &take,
+        composed_take: composed_take.as_ref(),
         collapse: CollapsePreference::from(ctx.binding.collapse),
         history: ctx.binding.history,
         materialization: MaterializationPolicy::from(&ctx.source.deploy_mode()),
@@ -567,6 +572,7 @@ mod preview_warning_tests {
             offer: &offer,
             inventory: &inventory,
             take: &take,
+            composed_take: None,
             collapse: CollapsePreference::from(collapse),
             history: false,
             materialization: MaterializationPolicy::from(&source.deploy_mode()),
