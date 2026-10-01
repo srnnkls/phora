@@ -659,6 +659,34 @@ fn registry_metadata_after_ejection_is_byte_identical() {
     );
 }
 
+#[test]
+fn eject_and_uneject_reach_a_target_declared_in_the_local_overlay() {
+    let fx = build_fixture();
+    let config = git_source_config(&fx);
+    let (base, target) = config
+        .split_once("[targets.home]")
+        .expect("config has a [targets.home] section");
+    fx.write_config(&format!("{}\n", base.trim_end()));
+    std::fs::write(
+        fx.cwd.path().join("phora.local.toml"),
+        format!("[targets.home]{target}"),
+    )
+    .expect("write phora.local.toml");
+    assert_success(&fx.run(&["sync"]), "sync");
+    assert_success(
+        &fx.run(&[
+            "eject", "editor", "--source", "dotfiles", "--target", "home",
+        ]),
+        "eject editor from a local-only target",
+    );
+    assert_success(
+        &fx.run(&[
+            "uneject", "editor", "--source", "dotfiles", "--target", "home",
+        ]),
+        "uneject editor from a local-only target",
+    );
+}
+
 // ─── orphan (a record whose config target is gone) ──────────────────────────
 
 #[test]
