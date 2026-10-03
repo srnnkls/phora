@@ -54,6 +54,10 @@ pub(super) fn format_sync_warning(warning: &SyncWarning) -> Option<String> {
             "phora: refusing to prune out-of-anchor {}: {reason}",
             path.display()
         ),
+        SyncWarning::PruneKeptDirectory { path } => format!(
+            "phora: kept directory {}: it still holds files phora does not manage",
+            path.display()
+        ),
         SyncWarning::OrphanRecordPathUnknown {
             source,
             artifact,

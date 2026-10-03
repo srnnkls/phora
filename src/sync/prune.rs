@@ -300,6 +300,7 @@ where
         })
         .collect();
     let live_paths = live_paths_by_source(projection, ctx.config);
+    let mut emptied = EmptiedDirectories::default();
     for (target, source, artifact, reason) in removals {
         let Some(record) = records.get(&(target, source, artifact)).copied() else {
             return Err(Error::Sync(format!(
@@ -320,6 +321,7 @@ where
         )? {
             continue;
         }
+        emptied.record(ctx.config, record);
         events.push_applied(AppliedChange::Removed {
             target: target.to_owned(),
             source: source.to_owned(),
@@ -327,7 +329,7 @@ where
             reason: reason.clone(),
         });
     }
-    Ok(())
+    emptied.sweep(ctx.config, ctx.registry, events)
 }
 
 fn live_paths_by_source(projection: &Projection, config: &Config) -> LivePathsBySource {
@@ -580,6 +582,94 @@ fn prune_stale_manifest_children(
         }
     }
     Ok(())
+}
+
+fn recorded_destination(config: &Config, record: &ArtifactRecord) -> Option<PathBuf> {
+    match config.targets.get(&record.key.target) {
+        Some(target) => Some(removal_destination(target, record)),
+        None => orphan_artifact_path(record),
+    }
+}
+
+#[derive(Default)]
+pub(super) struct EmptiedDirectories {
+    candidates: BTreeSet<PathBuf>,
+}
+
+impl EmptiedDirectories {
+    pub(super) fn record(&mut self, config: &Config, record: &ArtifactRecord) {
+        let Some(removed) = recorded_destination(config, record) else {
+            return;
+        };
+        let root = match record.deploy_root.as_deref() {
+            Some(root) => PathBuf::from(root),
+            None => match config.targets.get(&record.key.target) {
+                Some(target) => target.expanded_path(),
+                None => return,
+            },
+        };
+        let mut parent = removed.parent();
+        while let Some(dir) = parent {
+            if dir == root || !dir.starts_with(&root) {
+                break;
+            }
+            self.candidates.insert(dir.to_path_buf());
+            parent = dir.parent();
+        }
+    }
+
+    pub(super) fn sweep(
+        self,
+        config: &Config,
+        registry: &dyn StateStore,
+        events: &mut SyncEvents,
+    ) -> Result<()> {
+        if self.candidates.is_empty() {
+            return Ok(());
+        }
+        let tracked: Vec<PathBuf> = registry
+            .all_artifacts()?
+            .iter()
+            .filter_map(|record| recorded_destination(config, record))
+            .collect();
+        let mut candidates: Vec<PathBuf> = self.candidates.into_iter().collect();
+        candidates.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+        let mut kept: Vec<PathBuf> = Vec::new();
+        for dir in candidates {
+            if tracked.iter().any(|path| path.starts_with(&dir)) {
+                kept.push(dir);
+                continue;
+            }
+            match std::fs::symlink_metadata(&dir) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(Error::Sync(format!(
+                        "inspect emptied directory {}: {error}",
+                        dir.display()
+                    )));
+                }
+            }
+            match std::fs::remove_dir(&dir) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                    if !kept.iter().any(|path| path.starts_with(&dir)) {
+                        events.push_warning(SyncWarning::PruneKeptDirectory { path: dir.clone() });
+                    }
+                    kept.push(dir);
+                }
+                Err(error) => {
+                    return Err(Error::Sync(format!(
+                        "remove emptied directory {}: {error}",
+                        dir.display()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn has_symlink_ancestor(artifact_root: &Path, path: &Path) -> Result<bool> {
