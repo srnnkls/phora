@@ -1130,7 +1130,7 @@ fn public_sync_tree_escape_hatches(path: &Path) -> Vec<String> {
         .collect()
 }
 
-const ALLOWED_SYNC_WARNING_SHAPES: [&str; 18] = [
+const ALLOWED_SYNC_WARNING_SHAPES: [&str; 19] = [
     "Projection(ProjectionWarning)",
     "MalformedTransitiveHooks{target:String,detail:String}",
     "LinkPathNotPortable{source:String,path:PathBuf}",
@@ -1139,6 +1139,7 @@ const ALLOWED_SYNC_WARNING_SHAPES: [&str; 18] = [
     "OrphanedRecords{count:usize}",
     "PruneSkippedAfterFailures",
     "PruneRefused{path:PathBuf,reason:String}",
+    "PruneKeptDirectory{path:PathBuf}",
     "OrphanRecordPathUnknown{source:String,artifact:String,layout:String}",
     "FastForwardKeptLive{source:String,artifact:String,path:PathBuf}",
     "FastForwardDropped{source:String,artifact:String}",

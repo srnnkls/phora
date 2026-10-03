@@ -96,6 +96,7 @@ fn warning_kind(warning: &SyncWarning) -> &'static str {
         SyncWarning::OrphanedRecords { .. } => "orphaned_records",
         SyncWarning::PruneSkippedAfterFailures => "prune_skipped_after_failures",
         SyncWarning::PruneRefused { .. } => "prune_refused",
+        SyncWarning::PruneKeptDirectory { .. } => "prune_kept_directory",
         SyncWarning::OrphanRecordPathUnknown { .. } => "orphan_record_path_unknown",
         SyncWarning::FastForwardKeptLive { .. } => "fast_forward_kept_live",
         SyncWarning::FastForwardDropped { .. } => "fast_forward_dropped",

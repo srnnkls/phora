@@ -1858,6 +1858,7 @@ fn apply_fast_forward_drops(
     skipped_targets: &BTreeSet<String>,
     events: &mut SyncEvents,
 ) -> Result<()> {
+    let mut emptied = prune::EmptiedDirectories::default();
     for drop in drops {
         let record = drop.record();
         if skipped_targets.contains(&record.key.target) {
@@ -1891,12 +1892,13 @@ fn apply_fast_forward_drops(
                 remove_orphan_path(&path).map_err(|error| {
                     Error::Sync(format!("fast-forward prune {}: {error}", path.display()))
                 })?;
+                emptied.record(config, record);
                 detach_history_overlay(record, &path, backend)?;
             }
         }
         registry.remove_artifact(&record.key)?;
     }
-    Ok(())
+    emptied.sweep(config, registry, events)
 }
 
 #[cfg(test)]
