@@ -199,6 +199,10 @@ pub enum SyncWarning {
         path: PathBuf,
         reason: String,
     },
+    /// A directory emptied of its pruned artifacts still holds unmanaged entries.
+    PruneKeptDirectory {
+        path: PathBuf,
+    },
     OrphanRecordPathUnknown {
         source: String,
         artifact: String,
