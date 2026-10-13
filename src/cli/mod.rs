@@ -57,9 +57,10 @@ use crate::projection::model::TargetName;
 use crate::source::SourceName;
 use crate::source::{GitBackend, HttpBackend, RouterBackend};
 use crate::sync::state::ProjectId;
-use crate::sync::state::{FileStateStore, StateError, StateStore};
+use crate::sync::state::{FileStateStore, StateError, StateLock, StateStore};
 use crate::sync::{Conflict, ConflictResolver, Resolution};
 use std::str::FromStr;
+use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -71,6 +72,16 @@ pub struct Cli {
     /// Run in this project directory, including relative paths and hooks.
     #[arg(short = 'C', long, global = true, value_name = "DIRECTORY")]
     pub directory: Option<PathBuf>,
+    /// Wait this long for another phora process holding the project lock; 0 fails at once.
+    #[arg(
+        long,
+        global = true,
+        value_name = "SECONDS",
+        env = "PHORA_LOCK_TIMEOUT",
+        default_value = "120",
+        value_parser = parse_seconds
+    )]
+    pub lock_timeout: Duration,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -355,6 +366,10 @@ impl CliOutcome {
     }
 }
 
+fn parse_seconds(raw: &str) -> std::result::Result<Duration, std::num::ParseIntError> {
+    raw.parse().map(Duration::from_secs)
+}
+
 fn completed(result: Result<()>) -> Result<CliOutcome> {
     result.map(|()| CliOutcome::Success)
 }
@@ -372,7 +387,9 @@ pub fn run_with_outcome(cli: Cli) -> Result<CliOutcome> {
     match cli.command {
         cmd @ Command::Add { .. } => completed(dispatch_add(cmd)),
         Command::Rm { name } => completed(run_source_rm(&name)),
-        cmd @ (Command::Sync { .. } | Command::Update { .. }) => dispatch_sync(cmd),
+        cmd @ (Command::Sync { .. } | Command::Update { .. }) => {
+            dispatch_sync(cmd, cli.lock_timeout)
+        }
         Command::List { plan, orphans } => {
             completed(query::run_list(query::ListView::from_flags(plan, orphans)))
         }
@@ -400,8 +417,7 @@ pub fn run_with_outcome(cli: Cli) -> Result<CliOutcome> {
             target,
         } => {
             let config = merge_configs(load_config()?, load_local_config(Path::new("."))?);
-            let registry = open_project_registry(&config)?;
-            let _guard = registry.acquire_lock()?;
+            let (registry, _guard) = lock_project_registry(&config, cli.lock_timeout)?;
             let cwd = std::env::current_dir()?;
             let cache_git =
                 crate::paths::cache_root_for(config.paths.cache.as_deref(), &cwd)?.join("git");
@@ -422,13 +438,12 @@ pub fn run_with_outcome(cli: Cli) -> Result<CliOutcome> {
             target,
         } => {
             let config = merge_configs(load_config()?, load_local_config(Path::new("."))?);
-            let registry = open_project_registry(&config)?;
-            let _guard = registry.acquire_lock()?;
+            let (registry, _guard) = lock_project_registry(&config, cli.lock_timeout)?;
             crate::sync::uneject(&config, &registry, &artifact, &source, &target)?;
             println!("unejected {source}/{artifact} in {target}");
             Ok(CliOutcome::Success)
         }
-        Command::RebuildRegistry => completed(sync::run_rebuild_registry()),
+        Command::RebuildRegistry => completed(sync::run_rebuild_registry(cli.lock_timeout)),
         Command::CheckMatch { source, path } => {
             let source = load_source(&source)?;
             let report = check_match_cmd(&source, &path);
@@ -444,7 +459,7 @@ pub fn run_with_outcome(cli: Cli) -> Result<CliOutcome> {
             from,
             local,
         } => completed(bind::run_unbind(&sources, &from, local)),
-        cmd @ Command::Trust { .. } => completed(dispatch_trust(cmd)),
+        cmd @ Command::Trust { .. } => completed(dispatch_trust(cmd, cli.lock_timeout)),
         Command::Preview {
             source,
             target,
@@ -466,7 +481,7 @@ pub fn run_with_outcome(cli: Cli) -> Result<CliOutcome> {
     }
 }
 
-fn dispatch_sync(cmd: Command) -> Result<CliOutcome> {
+fn dispatch_sync(cmd: Command, lock_timeout: Duration) -> Result<CliOutcome> {
     match cmd {
         Command::Sync {
             prune,
@@ -489,12 +504,13 @@ fn dispatch_sync(cmd: Command) -> Result<CliOutcome> {
             json,
             None,
             jobs,
+            lock_timeout,
         ),
         Command::Update {
             source,
             prune,
             fast_forward,
-        } => sync::run_update(source.as_deref(), fast_forward, prune),
+        } => sync::run_update(source.as_deref(), fast_forward, prune, lock_timeout),
         _ => unreachable!("dispatch_sync only receives Sync or Update"),
     }
 }
@@ -573,7 +589,7 @@ fn run_verify() -> Result<CliOutcome> {
     }
 }
 
-fn dispatch_trust(cmd: Command) -> Result<()> {
+fn dispatch_trust(cmd: Command, lock_timeout: Duration) -> Result<()> {
     let Command::Trust {
         source,
         list,
@@ -583,7 +599,13 @@ fn dispatch_trust(cmd: Command) -> Result<()> {
     else {
         unreachable!("dispatch_trust only handles Command::Trust")
     };
-    trust::run_trust(source.as_deref(), list, revoke, show.as_deref())
+    trust::run_trust(
+        source.as_deref(),
+        list,
+        revoke,
+        show.as_deref(),
+        lock_timeout,
+    )
 }
 
 fn dispatch_bind(cmd: Command) -> Result<()> {
@@ -886,6 +908,22 @@ fn open_project_registry(config: &Config) -> Result<FileStateStore> {
         .join("projects")
         .join(project.as_str());
     Ok(FileStateStore::open(registry_root)?)
+}
+
+/// Opens the project registry and takes its `state.lock`, announcing a wait on stderr.
+fn lock_project_registry(
+    config: &Config,
+    lock_timeout: Duration,
+) -> Result<(FileStateStore, StateLock)> {
+    let registry = open_project_registry(config)?
+        .with_lock_timeout(lock_timeout)
+        .on_lock_wait(announce_lock_wait);
+    let guard = registry.acquire_lock()?;
+    Ok((registry, guard))
+}
+
+fn announce_lock_wait() {
+    eprintln!("phora: waiting for another phora process (state.lock held)");
 }
 
 fn load_config() -> Result<Config> {

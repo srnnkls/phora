@@ -250,6 +250,8 @@ pub fn ejected_index(
 pub struct FileStateStore {
     pub(super) state_root: PathBuf,
     pub(super) journal_root: PathBuf,
+    pub(super) lock_timeout: std::time::Duration,
+    pub(super) on_lock_wait: fn(),
 }
 
 const META_VERSION: u32 = 1;
@@ -279,7 +281,23 @@ impl FileStateStore {
         Ok(Self {
             state_root,
             journal_root,
+            lock_timeout: super::locking::DEFAULT_LOCK_TIMEOUT,
+            on_lock_wait: || {},
         })
+    }
+
+    /// How long `acquire_lock` waits for a held `state.lock`; zero fails at once.
+    #[must_use]
+    pub fn with_lock_timeout(mut self, lock_timeout: std::time::Duration) -> Self {
+        self.lock_timeout = lock_timeout;
+        self
+    }
+
+    /// Runs `on_lock_wait` once when `acquire_lock` starts waiting for a held `state.lock`.
+    #[must_use]
+    pub fn on_lock_wait(mut self, on_lock_wait: fn()) -> Self {
+        self.on_lock_wait = on_lock_wait;
+        self
     }
 
     #[must_use]
@@ -576,6 +594,7 @@ impl StateStore for FileStateStore {
 mod tests {
     use super::*;
     use crate::sync::state::ProjectId;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     #[test]
@@ -1649,7 +1668,9 @@ artifact = "snippets"
     fn second_exclusive_lock_fails_while_first_held() {
         let dir = TempDir::new().expect("temp state root");
         let first = FileStateStore::open(dir.path().to_path_buf()).expect("open first registry");
-        let second = FileStateStore::open(dir.path().to_path_buf()).expect("open second registry");
+        let second = FileStateStore::open(dir.path().to_path_buf())
+            .expect("open second registry")
+            .with_lock_timeout(Duration::ZERO);
 
         let _held = first
             .acquire_lock()
@@ -1688,6 +1709,99 @@ artifact = "snippets"
             reacquired.is_ok(),
             "dropping the guard must release the OS lock so another instance can acquire it, got: {:?}",
             reacquired.err()
+        );
+    }
+
+    #[test]
+    fn contended_lock_is_acquired_once_the_holder_releases_it() {
+        let _serial = STATE_LOCK_SERIAL
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = TempDir::new().expect("temp state root");
+        let first = FileStateStore::open(dir.path().to_path_buf()).expect("open first registry");
+        let second = FileStateStore::open(dir.path().to_path_buf())
+            .expect("open second registry")
+            .with_lock_timeout(Duration::from_secs(5));
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+
+        let holder = std::thread::spawn(move || {
+            let guard = first.acquire_lock().expect("holder acquires the lock");
+            held_tx.send(()).expect("signal held");
+            std::thread::sleep(Duration::from_millis(200));
+            drop(guard);
+        });
+        held_rx.recv().expect("holder holds the lock");
+        let started = Instant::now();
+        let acquired = second.acquire_lock();
+        let waited = started.elapsed();
+        holder.join().expect("holder thread");
+
+        assert!(
+            acquired.is_ok(),
+            "a waiting acquisition must succeed once the holder releases, got: {:?}",
+            acquired.err()
+        );
+        assert!(
+            waited >= Duration::from_millis(100) && waited < Duration::from_secs(5),
+            "acquisition must wait for the release, not the deadline; waited {waited:?}"
+        );
+    }
+
+    #[test]
+    fn contended_lock_gives_up_at_the_deadline() {
+        let dir = TempDir::new().expect("temp state root");
+        let first = FileStateStore::open(dir.path().to_path_buf()).expect("open first registry");
+        let second = FileStateStore::open(dir.path().to_path_buf())
+            .expect("open second registry")
+            .with_lock_timeout(Duration::from_millis(300));
+        let _held = first
+            .acquire_lock()
+            .expect("first instance acquires the lock");
+
+        let started = Instant::now();
+        let err = second
+            .acquire_lock()
+            .expect_err("a lock held past the deadline must not be acquired");
+        let waited = started.elapsed();
+
+        assert!(
+            matches!(&err, StateError::Lock(msg) if msg.contains("state.lock held")),
+            "deadline expiry must be the contended-lock error, got: {err:?}"
+        );
+        assert!(
+            waited >= Duration::from_millis(300) && waited < Duration::from_secs(2),
+            "acquisition must give up at roughly the deadline; waited {waited:?}"
+        );
+    }
+
+    #[test]
+    fn zero_lock_timeout_fails_without_waiting() {
+        let dir = TempDir::new().expect("temp state root");
+        let first = FileStateStore::open(dir.path().to_path_buf()).expect("open first registry");
+        let second = FileStateStore::open(dir.path().to_path_buf())
+            .expect("open second registry")
+            .with_lock_timeout(Duration::ZERO);
+        let _held = first
+            .acquire_lock()
+            .expect("first instance acquires the lock");
+
+        let started = Instant::now();
+        let err = second
+            .acquire_lock()
+            .expect_err("a zero timeout must not acquire a held lock");
+        let waited = started.elapsed();
+
+        assert_eq!(
+            err.to_string(),
+            StateError::Lock(
+                "another phora process is running for this project (state.lock held)".to_owned()
+            )
+            .to_string(),
+            "a zero timeout keeps the fail-fast message"
+        );
+        assert!(
+            waited < Duration::from_millis(50),
+            "a zero timeout must fail before the first backoff; waited {waited:?}"
         );
     }
 

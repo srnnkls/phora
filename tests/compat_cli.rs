@@ -873,7 +873,7 @@ fn lock_held_sync_snapshot_exits_ex_tempfail() {
         .expect("open lock file");
     held.try_lock().expect("test holds the project lock first");
 
-    let out = fx.run(&["sync"]);
+    let out = fx.run(&["--lock-timeout", "0", "sync"]);
     assert_eq!(
         out.status.code(),
         Some(EX_TEMPFAIL),

@@ -1,8 +1,18 @@
+use std::fs::{File, TryLockError};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use super::file::{FileStateStore, StateError};
 
 type Result<T> = std::result::Result<T, StateError>;
+
+/// How long a contended `state.lock` is waited for unless the caller overrides it.
+pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_mins(2);
+
+const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
+const MAX_BACKOFF: Duration = Duration::from_secs(1);
+
+const LOCK_HELD: &str = "another phora process is running for this project (state.lock held)";
 
 /// RAII guard holding an exclusive OS lock on `state.lock`; released on drop.
 #[derive(Debug)]
@@ -56,12 +66,16 @@ impl FileStateStore {
             Ok(file) => file,
             Err(e) => return Err(self.lock_io_error("open lock file", &lock_path, &e)),
         };
-        match file.try_lock() {
+        match try_lock_until(&file, self.lock_timeout, self.on_lock_wait) {
             Ok(()) => Ok(StateLock { _file: file }),
-            Err(std::fs::TryLockError::WouldBlock) => Err(StateError::Lock(
-                "another phora process is running for this project (state.lock held)".to_owned(),
-            )),
-            Err(std::fs::TryLockError::Error(e)) => Err(StateError::StateStore(format!(
+            Err(TryLockError::WouldBlock) if self.lock_timeout.is_zero() => {
+                Err(StateError::Lock(LOCK_HELD.to_owned()))
+            }
+            Err(TryLockError::WouldBlock) => Err(StateError::Lock(format!(
+                "{LOCK_HELD}; gave up after {:?}",
+                self.lock_timeout
+            ))),
+            Err(TryLockError::Error(e)) => Err(StateError::StateStore(format!(
                 "acquire lock on {}: {e}",
                 lock_path.display()
             ))),
@@ -79,6 +93,35 @@ impl FileStateStore {
         statfs_fstype(&self.state_root)
             .as_deref()
             .and_then(network_lock_advisory)
+    }
+}
+
+/// Polls `try_lock` against one overall deadline with capped exponential backoff.
+/// `on_wait` runs once, before the first sleep; `WouldBlock` means the deadline passed.
+fn try_lock_until(
+    file: &File,
+    timeout: Duration,
+    on_wait: impl FnOnce(),
+) -> std::result::Result<(), TryLockError> {
+    let deadline = Instant::now().checked_add(timeout);
+    let mut on_wait = Some(on_wait);
+    let mut backoff = INITIAL_BACKOFF;
+    loop {
+        match file.try_lock() {
+            Err(TryLockError::WouldBlock) => {}
+            outcome => return outcome,
+        }
+        let remaining = deadline.map_or(backoff, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        });
+        if remaining.is_zero() {
+            return Err(TryLockError::WouldBlock);
+        }
+        if let Some(announce) = on_wait.take() {
+            announce();
+        }
+        std::thread::sleep(backoff.min(remaining));
+        backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
 

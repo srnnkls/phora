@@ -45,7 +45,9 @@ fn source_error_is_a_std_error_and_displays() {
 fn store_error_is_a_std_error_and_displays() {
     let dir = TempDir::new().expect("temp state root");
     let first = FileStateStore::open(dir.path().to_path_buf()).expect("open first");
-    let second = FileStateStore::open(dir.path().to_path_buf()).expect("open second");
+    let second = FileStateStore::open(dir.path().to_path_buf())
+        .expect("open second")
+        .with_lock_timeout(std::time::Duration::ZERO);
 
     let _held = first.acquire_lock().expect("first acquires the lock");
     let err: StateError = second
@@ -83,7 +85,9 @@ fn cli_edge_error_converts_from_source_error_preserving_text() {
 fn cli_edge_error_converts_from_store_error_preserving_text() {
     let dir = TempDir::new().expect("temp state root");
     let first = FileStateStore::open(dir.path().to_path_buf()).expect("open first");
-    let second = FileStateStore::open(dir.path().to_path_buf()).expect("open second");
+    let second = FileStateStore::open(dir.path().to_path_buf())
+        .expect("open second")
+        .with_lock_timeout(std::time::Duration::ZERO);
 
     let _held = first.acquire_lock().expect("first acquires the lock");
     let store_err: StateError = second.acquire_lock().expect_err("contended lock errors");

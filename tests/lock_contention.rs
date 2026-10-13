@@ -1,4 +1,5 @@
-//! LOCK-001: mutating commands fail fast (exit 75) on a contended project lock.
+//! LOCK-001: mutating commands wait for a contended project lock up to
+//! `--lock-timeout`, then fail with exit 75; a zero timeout fails fast.
 //!
 //! Contention is real and cross-process: the test flocks the same inode
 //! (`<state_root>/locks/state.lock`) the binary opens, so the child's flock(2)
@@ -154,7 +155,7 @@ fn sync_fails_fast_with_ex_tempfail_when_project_lock_is_held() {
     let fixture = build_fixture();
     let held = hold_project_lock(&fixture);
 
-    let out = run(&fixture, &["sync"]);
+    let out = run(&fixture, &["--lock-timeout", "0", "sync"]);
 
     assert_contended(&out, "sync");
     drop(held);
@@ -168,6 +169,8 @@ fn eject_fails_fast_with_ex_tempfail_when_project_lock_is_held() {
     let out = run(
         &fixture,
         &[
+            "--lock-timeout",
+            "0",
             "eject",
             "editor/init.lua",
             "--source",
@@ -189,6 +192,8 @@ fn uneject_fails_fast_with_ex_tempfail_when_project_lock_is_held() {
     let out = run(
         &fixture,
         &[
+            "--lock-timeout",
+            "0",
             "uneject",
             "editor/init.lua",
             "--source",
@@ -207,7 +212,7 @@ fn rebuild_registry_fails_fast_with_ex_tempfail_when_project_lock_is_held() {
     let fixture = build_fixture();
     let held = hold_project_lock(&fixture);
 
-    let out = run(&fixture, &["rebuild-registry"]);
+    let out = run(&fixture, &["--lock-timeout", "0", "rebuild-registry"]);
 
     assert_contended(&out, "rebuild-registry");
     drop(held);
@@ -219,7 +224,7 @@ fn sync_succeeds_once_the_lock_is_released() {
 
     let blocked = {
         let _held = hold_project_lock(&fixture);
-        run(&fixture, &["sync"])
+        run(&fixture, &["--lock-timeout", "0", "sync"])
     };
     assert_eq!(
         blocked.status.code(),
@@ -235,4 +240,48 @@ fn sync_succeeds_once_the_lock_is_released() {
         after.status.code(),
         String::from_utf8_lossy(&after.stderr)
     );
+}
+
+#[test]
+fn sync_waits_for_a_held_lock_and_succeeds_after_release() {
+    let fixture = build_fixture();
+    let held = hold_project_lock(&fixture);
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(held);
+    });
+
+    let out = run(&fixture, &["--lock-timeout", "10", "sync"]);
+    releaser.join().expect("releaser thread");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "sync must wait for the released lock and succeed; got {:?}\nstderr:\n{stderr}",
+        out.status.code()
+    );
+    assert_eq!(
+        stderr.matches("waiting for another phora process").count(),
+        1,
+        "the wait must be announced exactly once on stderr; got:\n{stderr}"
+    );
+}
+
+#[test]
+fn lock_timeout_env_var_bounds_the_wait() {
+    let fixture = build_fixture();
+    let held = hold_project_lock(&fixture);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_phora"))
+        .arg("sync")
+        .current_dir(fixture.cwd.path())
+        .env("HOME", &fixture.home_path)
+        .env("XDG_CACHE_HOME", &fixture.xdg_cache)
+        .env("XDG_STATE_HOME", &fixture.xdg_state)
+        .env("PHORA_LOCK_TIMEOUT", "1")
+        .output()
+        .expect("phora binary runs");
+    drop(held);
+
+    assert_contended(&out, "sync");
 }

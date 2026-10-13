@@ -103,6 +103,27 @@ fn sync_no_hooks_flag_parses_to_true() {
 }
 
 #[test]
+fn lock_timeout_defaults_to_the_state_store_default() {
+    use clap::Parser;
+    let default = Cli::try_parse_from(["phora", "sync"])
+        .expect("bare sync must parse")
+        .lock_timeout;
+    let zero = Cli::try_parse_from(["phora", "sync", "--lock-timeout", "0"])
+        .expect("--lock-timeout must parse after the subcommand")
+        .lock_timeout;
+    assert_eq!(
+        default,
+        crate::sync::state::locking::DEFAULT_LOCK_TIMEOUT,
+        "an absent --lock-timeout must keep the state store's default wait"
+    );
+    assert_eq!(
+        zero,
+        Duration::ZERO,
+        "--lock-timeout 0 must disable waiting"
+    );
+}
+
+#[test]
 fn sync_without_no_hooks_flag_defaults_to_false() {
     use clap::Parser;
     let cli = Cli::try_parse_from(["phora", "sync"]).expect("bare sync must parse");
@@ -1736,6 +1757,7 @@ fn source_rm_command_scrubs_bindings_and_source_def_from_phora_toml() {
     with_cwd(dir.path(), || {
         run(Cli {
             directory: None,
+            lock_timeout: Duration::ZERO,
             command: Command::Source {
                 cmd: SourceCmd::Rm {
                     name: "dotfiles".to_owned(),
@@ -3728,6 +3750,7 @@ fn add_to_with_refinement_flags_writes_source_and_table_binding() {
     with_cwd(dir.path(), || {
         run(Cli {
             directory: None,
+            lock_timeout: Duration::ZERO,
             command: Command::Add {
                 url: "github:srnnkls/tropos".to_owned(),
                 name: None,
@@ -3796,6 +3819,7 @@ fn add_to_with_no_refinement_flags_writes_a_bare_string_binding() {
     with_cwd(dir.path(), || {
         run(Cli {
             directory: None,
+            lock_timeout: Duration::ZERO,
             command: Command::Add {
                 url: "github:srnnkls/tropos".to_owned(),
                 name: None,
@@ -3854,6 +3878,7 @@ fn add_as_with_multiple_targets_errors() {
     let result = with_cwd(dir.path(), || {
         run(Cli {
             directory: None,
+            lock_timeout: Duration::ZERO,
             command: Command::Add {
                 url: "github:srnnkls/tropos".to_owned(),
                 name: None,
@@ -3893,6 +3918,7 @@ fn add_to_a_single_target_with_as_is_the_happy_path() {
     with_cwd(dir.path(), || {
         run(Cli {
             directory: None,
+            lock_timeout: Duration::ZERO,
             command: Command::Add {
                 url: "github:srnnkls/tropos".to_owned(),
                 name: None,
@@ -3939,6 +3965,7 @@ fn bare_add_without_to_does_not_touch_targets() {
     with_cwd(dir.path(), || {
         run(Cli {
             directory: None,
+            lock_timeout: Duration::ZERO,
             command: Command::Add {
                 url: "github:srnnkls/tropos".to_owned(),
                 name: None,
@@ -3992,6 +4019,7 @@ fn add_to_with_root_scopes_the_source_not_the_binding() {
     with_cwd(dir.path(), || {
         run(Cli {
             directory: None,
+            lock_timeout: Duration::ZERO,
             command: Command::Add {
                 url: "github:srnnkls/tropos".to_owned(),
                 name: None,
@@ -4045,6 +4073,7 @@ fn add_to_with_url_embedded_root_sets_the_source_root() {
     with_cwd(dir.path(), || {
         run(Cli {
             directory: None,
+            lock_timeout: Duration::ZERO,
             command: Command::Add {
                 url: "github:srnnkls/tropos/editor".to_owned(),
                 name: None,
@@ -4106,6 +4135,7 @@ fn bare_add_with_root_still_sets_the_source_root() {
     with_cwd(dir.path(), || {
         run(Cli {
             directory: None,
+            lock_timeout: Duration::ZERO,
             command: Command::Add {
                 url: "github:srnnkls/tropos".to_owned(),
                 name: None,
@@ -4143,6 +4173,7 @@ fn add_as_without_to_errors() {
     let result = with_cwd(dir.path(), || {
         run(Cli {
             directory: None,
+            lock_timeout: Duration::ZERO,
             command: Command::Add {
                 url: "github:srnnkls/tropos".to_owned(),
                 name: None,
@@ -4183,6 +4214,7 @@ fn add_local_with_to_errors() {
     let result = with_cwd(dir.path(), || {
         run(Cli {
             directory: None,
+            lock_timeout: Duration::ZERO,
             command: Command::Add {
                 url: src_path,
                 name: None,
@@ -4223,6 +4255,7 @@ fn add_to_multiple_targets_writes_a_binding_in_each() {
     with_cwd(dir.path(), || {
         run(Cli {
             directory: None,
+            lock_timeout: Duration::ZERO,
             command: Command::Add {
                 url: "github:srnnkls/tropos".to_owned(),
                 name: None,
@@ -4274,6 +4307,7 @@ fn add_to_with_include_exclude_writes_arrays_on_the_source() {
     with_cwd(dir.path(), || {
         run(Cli {
             directory: None,
+            lock_timeout: Duration::ZERO,
             command: Command::Add {
                 url: "github:srnnkls/tropos".to_owned(),
                 name: None,
@@ -4376,6 +4410,7 @@ fn add_to_target_without_sources_array_creates_the_array_and_binds() {
     with_cwd(dir.path(), || {
         run(Cli {
             directory: None,
+            lock_timeout: Duration::ZERO,
             command: Command::Add {
                 url: "github:srnnkls/tropos".to_owned(),
                 name: None,
@@ -4421,6 +4456,7 @@ fn add_to_nonexistent_target_errors_and_leaves_file_untouched() {
     let result = with_cwd(dir.path(), || {
         run(Cli {
             directory: None,
+            lock_timeout: Duration::ZERO,
             command: Command::Add {
                 url: "github:srnnkls/tropos".to_owned(),
                 name: None,
@@ -5582,7 +5618,17 @@ fn rebuild_over_merged_vars_agrees_with_deployed_vars_digest() {
         let _cache = EnvVarGuard::set("XDG_CACHE_HOME", cache.path());
 
         super::sync::run_sync(
-            false, false, false, false, false, false, true, false, None, None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            None,
+            None,
+            std::time::Duration::ZERO,
         )
         .expect("merged-vars deploy succeeds");
 
@@ -5609,7 +5655,8 @@ fn rebuild_over_merged_vars_agrees_with_deployed_vars_digest() {
         reg.remove_artifact(&key)
             .expect("drop the record to force rebuild");
 
-        super::sync::run_rebuild_registry().expect("rebuild reconstructs the dropped record");
+        super::sync::run_rebuild_registry(std::time::Duration::ZERO)
+            .expect("rebuild reconstructs the dropped record");
 
         let reg = open_project_registry(&load_config().expect("load config"))
             .expect("reopen project registry");

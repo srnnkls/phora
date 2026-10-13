@@ -205,7 +205,9 @@ fn state_store_records_and_reads_hook_state() {
 fn state_store_acquires_and_releases_the_project_lock() {
     let dir = TempDir::new().expect("temp state root");
     let first = FileStateStore::open(dir.path().to_path_buf()).expect("open first");
-    let second = FileStateStore::open(dir.path().to_path_buf()).expect("open second");
+    let second = FileStateStore::open(dir.path().to_path_buf())
+        .expect("open second")
+        .with_lock_timeout(std::time::Duration::ZERO);
 
     {
         let _held = as_store(&first)
