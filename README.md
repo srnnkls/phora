@@ -147,6 +147,11 @@ Each sync takes an exclusive OS lock on `state.lock` under the project's registr
 directory, so two syncs of the same project on one machine serialize and never
 corrupt the registry or journal.
 
+A command that finds the lock held prints `phora: waiting for another phora process
+(state.lock held)` once and waits, by default for up to 120 seconds. Set the bound
+with the global `--lock-timeout <SECONDS>` option or `PHORA_LOCK_TIMEOUT`; `0` fails
+at once. When the wait runs out, phora exits with `EX_TEMPFAIL` (75).
+
 That lock is only reliable on a local filesystem. On a network filesystem — NFS,
 SMB, or CIFS — file locks are advisory and best-effort: the kernel may not honor
 them across hosts, so two machines syncing the same state root at once are not

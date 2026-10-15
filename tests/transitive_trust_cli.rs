@@ -358,7 +358,10 @@ fn trust_fails_fast_when_the_project_lock_is_held() {
     );
 
     let held = hold_project_lock(&fixture);
-    let out = run(&fixture, &["trust", "nvim-kit", "--revoke"]);
+    let out = run(
+        &fixture,
+        &["--lock-timeout", "0", "trust", "nvim-kit", "--revoke"],
+    );
     drop(held);
 
     let stderr = String::from_utf8_lossy(&out.stderr);

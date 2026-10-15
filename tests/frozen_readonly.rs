@@ -352,7 +352,7 @@ fn frozen_sync_still_exits_75_on_genuine_lock_contention() {
     held.try_lock()
         .expect("test acquires the project lock first");
 
-    let out = run(&fixture, &["sync", "--frozen"]);
+    let out = run(&fixture, &["--lock-timeout", "0", "sync", "--frozen"]);
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(

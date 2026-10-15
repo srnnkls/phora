@@ -3,6 +3,7 @@
 use std::io::IsTerminal;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -20,7 +21,7 @@ use super::json::JsonSink;
 use super::progress::{ProgressMode, TtySink};
 use super::{
     CliOutcome, DropSources, TtyResolver, build_router, drop_sources, load_config,
-    load_local_config, open_project_registry,
+    load_local_config, lock_project_registry,
 };
 
 fn open_sync_registry(cwd: &Path, config: &Config) -> Result<FileStateStore> {
@@ -45,6 +46,7 @@ pub(super) fn run_sync(
     json: bool,
     drop: Option<DropSources>,
     jobs: Option<usize>,
+    lock_timeout: Duration,
 ) -> Result<CliOutcome> {
     let cwd = std::env::current_dir()?;
     let base = load_config()?;
@@ -59,7 +61,9 @@ pub(super) fn run_sync(
     let effective = crate::config::merge_configs(base.clone(), local.clone());
     let cache_git = cache_root_for(effective.paths.cache.as_deref(), &cwd)?.join("git");
     let backend = build_router(&effective, cache_git)?;
-    let registry = open_sync_registry(&cwd, &effective)?;
+    let registry = open_sync_registry(&cwd, &effective)?
+        .with_lock_timeout(lock_timeout)
+        .on_lock_wait(super::announce_lock_wait);
     // Only a read-only root under --frozen falls back lockless; contention (exit 75) still propagates.
     let guard = match registry.acquire_lock() {
         Ok(guard) => Some(guard),
@@ -303,15 +307,14 @@ fn render_sync_warnings(out: &SyncReport) {
     }
 }
 
-pub(super) fn run_rebuild_registry() -> Result<()> {
+pub(super) fn run_rebuild_registry(lock_timeout: Duration) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let base = load_config()?;
     let local = load_local_config(&cwd)?;
     let mut config = crate::config::merge_configs(base, local);
     config.validate()?;
 
-    let registry = open_project_registry(&config)?;
-    let _guard = registry.acquire_lock()?;
+    let (registry, _guard) = lock_project_registry(&config, lock_timeout)?;
 
     let (base_lock, local_lock) = load_locks(&cwd)?;
     let lock = match base_lock {
@@ -358,6 +361,7 @@ pub(super) fn run_update(
     source: Option<&str>,
     fast_forward: bool,
     prune: bool,
+    lock_timeout: Duration,
 ) -> Result<CliOutcome> {
     let drop = source.map_or(DropSources::All, |s| DropSources::One(s.to_owned()));
     run_sync(
@@ -371,6 +375,7 @@ pub(super) fn run_update(
         false,
         Some(drop),
         None,
+        lock_timeout,
     )
 }
 

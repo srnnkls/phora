@@ -139,7 +139,9 @@ fn source_export_missing_root_renders_root_not_found() {
 fn registry_lock_contention_renders_exact_lock_message() {
     let dir = TempDir::new().expect("temp state root");
     let first = FileStateStore::open(dir.path().to_path_buf()).expect("open first registry");
-    let second = FileStateStore::open(dir.path().to_path_buf()).expect("open second registry");
+    let second = FileStateStore::open(dir.path().to_path_buf())
+        .expect("open second registry")
+        .with_lock_timeout(std::time::Duration::ZERO);
 
     let _held = first.acquire_lock().expect("first acquires the lock");
     let err = second
