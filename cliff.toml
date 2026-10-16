@@ -26,11 +26,11 @@ footer = """
     {% if release.version -%}
         {% if release.previous.version -%}
             [{{ release.version | trim_start_matches(pat="v") }}]: \
-                https://github.com/srnnkls/phora/compare/{{ release.previous.version }}..{{ release.version }}
+                https://github.com/srnnkls/phora/compare/v{{ release.previous.version | trim_start_matches(pat="v") }}...v{{ release.version | trim_start_matches(pat="v") }}
         {% endif -%}
     {% else -%}
         {% if release.previous.version -%}
-            [unreleased]: https://github.com/srnnkls/phora/compare/{{ release.previous.version }}..HEAD
+            [unreleased]: https://github.com/srnnkls/phora/compare/v{{ release.previous.version | trim_start_matches(pat="v") }}...HEAD
         {% endif -%}
     {% endif -%}
 {% endfor %}
@@ -41,19 +41,27 @@ trim = true
 conventional_commits = true
 filter_unconventional = true
 split_commits = false
+commit_preprocessors = [
+    { pattern = "^(\\w+!?)\\(cliff\\)", replace = "${1}" },
+    { pattern = "\\((\\w+\\s)?#([0-9]+)\\)", replace = "([#${2}](https://github.com/srnnkls/phora/pull/${2}))" },
+]
 commit_parsers = [
+    { message = "^(refactor|test|style|ci|build|chore)", skip = true },
+    { message = "^\\w+!?\\((arch|architecture|bench|ci|compat|source-projection-sync)\\)", skip = true },
+    { message = "^[^\\n]*\\b(INV-[0-9]+|PR[0-9]+|T[0-9]{3}|R1)\\b", skip = true },
+    { message = "^[^\\n]*\\b(StageBridge|StateStore|SourceStore|SourceBackend|StageRequest|FileRegistry|ProgressSink|contract)\\b", skip = true },
+    # Internal restructuring commits in 0.2.0 whose subjects name no user-facing change.
+    { sha = "7506f5daf773d6e7910bf0f7efd7dd84001ae56b", skip = true },
+    { sha = "cd5c766920b98afe1dbe0e3866987c478cf38c2d", skip = true },
+    { sha = "09c373a5de5dc47bc8c95567c43a641e76887bba", skip = true },
+    { sha = "eda1ebe97567403e2d3b7f043340bdfdf12033d6", skip = true },
+    { sha = "37aaa060b6f9ead8329a7b4ca555ed101d189acd", skip = true },
+    { sha = "d8d85d0b3f4900c008cc4016ea3ac8e12ad80207", skip = true },
     { message = "^feat", group = "<!-- 0 -->Features" },
     { message = "^fix", group = "<!-- 1 -->Bug Fixes" },
     { message = "^perf", group = "<!-- 2 -->Performance" },
-    { message = "^refactor", group = "<!-- 3 -->Refactor" },
-    { message = "^doc", group = "<!-- 4 -->Documentation" },
-    { message = "^test", group = "<!-- 5 -->Testing" },
-    { message = "^style", group = "<!-- 6 -->Styling" },
-    { message = "^revert", group = "<!-- 7 -->Revert" },
-    { message = "^chore(\\(release\\))?: (release v|prepare )", skip = true },
-    { message = "^chore\\(deps.*\\)", skip = true },
-    { message = "^chore|^ci", group = "<!-- 8 -->Miscellaneous Tasks" },
-    { body = ".*security", group = "<!-- 9 -->Security" },
+    { message = "^doc", group = "<!-- 3 -->Documentation" },
+    { message = "^revert", group = "<!-- 4 -->Revert" },
 ]
 protect_breaking_commits = false
 filter_commits = false

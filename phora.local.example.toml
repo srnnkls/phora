@@ -1,17 +1,13 @@
-# phora.local.toml overlays phora.toml (same schema, local values win per-key).
-# It is machine-local: keep it out of version control.
-#
-# Link mode lives here only. `deploy = "link"` symlinks an artifact destination at
-# the source's live working tree, so uncommitted edits in the checkout are visible
-# through the target with no re-sync. It is honored ONLY in this overlay (setting it
-# in the committed phora.toml is a config error) and ONLY for a local source
-# (`path = "/dir"` or the `git = "/dir"` alias; a remote URL is a config error).
-# Linked artifacts sit outside the integrity
-# model: verify, drift, and rebuild skip them; `phora list` shows them as `linked`.
+# phora.local.toml: this machine's overrides of phora.toml, same schema; keep it out of version control.
+# Sources named here lock in phora.local.lock. Link mode works in either file; phora warns when
+# phora.toml declares the source and the linked path is absolute. Reference: REFERENCE.md#local-overlay
 
-version = 1
-
-# Override an existing source onto a local checkout and live-link it.
-[sources.loqui]
-path = "/home/me/dev/loqui"  # local source: the live working tree
+[sources.loqui]                 # override a source onto a local checkout and symlink it
+path = "~/dev/loqui"
 deploy = "link"
+
+[vars]
+email = "me@work.example"       # replaces this one key from phora.toml
+
+[targets.neovim]
+path = "~/.config/nvim-dev"     # an overriding target restates path; other keys are inherited
