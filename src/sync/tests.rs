@@ -15521,7 +15521,13 @@ mod leaf_granular_deploy_tests {
             }
         }
 
-        fn assert_exact_state_preserved(&self) {
+        fn replace_link_with_real_dir(&self) {
+            std::fs::remove_file(&self.destination).expect("unlink the managed link");
+            std::fs::create_dir(&self.destination).expect("user directory over the link");
+            std::fs::write(self.destination.join("mine.md"), b"user\n").expect("user file");
+        }
+
+        fn assert_replacement_preserved(&self) {
             assert_eq!(
                 self.registry
                     .artifact(&self.record.key)
@@ -15530,20 +15536,27 @@ mod leaf_granular_deploy_tests {
                 "a rejected link drop must preserve the exact managed record"
             );
             assert_only_target_record(&self.registry, &self.record);
-            assert_exact_link(&self.destination, &self.source_target);
+            assert_eq!(
+                std::fs::read(self.destination.join("mine.md")).expect("user file survives"),
+                b"user\n"
+            );
         }
 
-        fn assert_fail_open_drop_happened(&self, policy: LinkDropPolicy) {
+        fn assert_mirrored_drop(&self, policy: LinkDropPolicy) {
             assert!(
                 self.registry
                     .artifact(&self.record.key)
                     .expect("registry read")
                     .is_none(),
-                "the current {policy:?} defect is expected to delete the managed link record"
+                "{policy:?}: a link the live source dropped must lose its record"
             );
             assert!(
                 std::fs::symlink_metadata(&self.destination).is_err(),
-                "the current {policy:?} defect is expected to unlink the managed destination"
+                "{policy:?}: a link the live source dropped must be unlinked"
+            );
+            assert!(
+                self.source_target.is_dir(),
+                "{policy:?}: unlinking must never follow the link into the source"
             );
         }
     }
@@ -15563,28 +15576,21 @@ mod leaf_granular_deploy_tests {
     }
 
     #[cfg(unix)]
-    fn expect_leaf_offer_link_drop_rejected(policy: LinkDropPolicy) {
+    fn expect_leaf_offer_link_drop_mirrored(policy: LinkDropPolicy) {
         let fixture = RealGitLinkDropFixture::new(RealGitLinkSelection::LeafSpecificSourceOffer);
         fixture.delete_leaf_without_moving_head();
-        if let Err(error) = sync(
+        sync(
             &fixture.request(policy),
             &fixture.backend,
             &fixture.registry,
-        ) {
-            assert_link_d9_diagnostic(&error.to_string());
-            fixture.assert_exact_state_preserved();
-        } else {
-            fixture.assert_fail_open_drop_happened(policy);
-            panic!(
-                "B21-R3-H2: an unchanged leaf-specific source offer must not launder a \
-                 collapsed mutable-link drop under {policy:?} prune"
-            );
-        }
+        )
+        .unwrap_or_else(|error| panic!("{policy:?}: {error}"));
+        fixture.assert_mirrored_drop(policy);
     }
 
     #[cfg(unix)]
     #[test]
-    fn sealed_offer_suffix_glob_recovers_source_leaf_from_collapsed_link_record() {
+    fn suffix_glob_collapsed_link_record_mirrors_its_dropped_source_leaf() {
         let wt = TempDir::new().expect("link working tree");
         std::fs::create_dir_all(wt.path().join("editor")).expect("mkdir editor");
         std::fs::write(wt.path().join("editor/a.md"), b"alpha\n").expect("write a.md");
@@ -15628,40 +15634,11 @@ mod leaf_granular_deploy_tests {
         assert_exact_link(&dst, &source_target);
         std::fs::remove_file(wt.path().join("editor/a.md")).expect("remove offered source leaf");
 
-        let Err(err) = sync(&pruning_sync(&cfg), &backend, &registry) else {
-            panic!(
-                "removing a suffix-glob-selected source leaf must trip the sealed-offer guard; \
-                 synthetic probe names cannot prove that a collapsed record was config-narrowed"
-            );
-        };
-        assert_sealed_offer_diagnostic(&err.to_string(), "dest", "ed", "editor");
-        assert_eq!(
-            registry.artifact(&key).expect("registry read"),
-            Some(record.clone()),
-            "a rejected ordinary prune must preserve the exact managed record"
-        );
-        assert_only_target_record(&registry, &record);
-        assert_exact_link(&dst, &source_target);
-
-        let fast_forward = SyncInput {
-            fast_forward: true,
-            prune: true,
-            ..input(&cfg, None, None, None, false)
-        };
-        let Err(err) = sync(&fast_forward, &backend, &registry) else {
-            panic!(
-                "fast-forward must not exempt a mutable link source whose leaf disappeared at \
-                 the unchanged `link` identity"
-            );
-        };
-        assert_sealed_offer_diagnostic(&err.to_string(), "dest", "ed", "editor");
-        assert_eq!(
-            registry.artifact(&key).expect("registry read"),
-            Some(record.clone()),
-            "a rejected fast-forward prune must preserve the exact managed record"
-        );
-        assert_only_target_record(&registry, &record);
-        assert_exact_link(&dst, &source_target);
+        sync(&pruning_sync(&cfg), &backend, &registry)
+            .expect("a collapsed link the live source dropped is mirrored, not sealed");
+        assert_eq!(registry.artifact(&key).expect("registry read"), None);
+        assert!(std::fs::symlink_metadata(&dst).is_err());
+        assert!(source_target.is_dir(), "unlinking never follows the link");
     }
 
     #[cfg(unix)]
@@ -15670,49 +15647,34 @@ mod leaf_granular_deploy_tests {
         let fixture =
             RealGitLinkDropFixture::new(RealGitLinkSelection::ImplicitOfferWithTargetGlob);
         fixture.delete_leaf_without_moving_head();
+        fixture.replace_link_with_real_dir();
 
-        let ordinary_result = sync(
-            &fixture.request(LinkDropPolicy::Ordinary),
-            &fixture.backend,
-            &fixture.registry,
-        );
-        let Err(ordinary_error) = ordinary_result else {
-            panic!(
-                "ordinary prune must seal an ambiguous mutable-link drop at unchanged real Git HEAD"
-            );
-        };
-        let ordinary_rendered = ordinary_error.to_string();
-        assert_sealed_offer_diagnostic(&ordinary_rendered, "dest", "ed", "editor");
-        fixture.assert_exact_state_preserved();
-
-        let fast_forward_result = sync(
-            &fixture.request(LinkDropPolicy::FastForward),
-            &fixture.backend,
-            &fixture.registry,
-        );
-        let Err(fast_forward_error) = fast_forward_result else {
-            fixture.assert_fail_open_drop_happened(LinkDropPolicy::FastForward);
-            panic!(
-                "B21-R3-H1: persisted `link` != current HEAD SHA must never authorize deletion \
-                 of a mutable linked directory under --fast-forward --prune"
-            );
-        };
-
-        assert_link_d9_diagnostic(&ordinary_rendered);
-        assert_link_d9_diagnostic(&fast_forward_error.to_string());
-        fixture.assert_exact_state_preserved();
+        for policy in [LinkDropPolicy::Ordinary, LinkDropPolicy::FastForward] {
+            let Err(error) = sync(
+                &fixture.request(policy),
+                &fixture.backend,
+                &fixture.registry,
+            ) else {
+                panic!(
+                    "B21-R3-H1: persisted `link` != current HEAD SHA must never authorize \
+                     deletion of a directory that replaced the link under {policy:?} prune"
+                );
+            };
+            assert_link_d9_diagnostic(&error.to_string());
+            fixture.assert_replacement_preserved();
+        }
     }
 
     #[cfg(unix)]
     #[test]
-    fn real_git_leaf_specific_offer_seals_collapsed_link_under_ordinary_prune() {
-        expect_leaf_offer_link_drop_rejected(LinkDropPolicy::Ordinary);
+    fn real_git_leaf_specific_offer_mirrors_collapsed_link_drop_under_ordinary_prune() {
+        expect_leaf_offer_link_drop_mirrored(LinkDropPolicy::Ordinary);
     }
 
     #[cfg(unix)]
     #[test]
-    fn real_git_leaf_specific_offer_seals_collapsed_link_under_fast_forward_prune() {
-        expect_leaf_offer_link_drop_rejected(LinkDropPolicy::FastForward);
+    fn real_git_leaf_specific_offer_mirrors_collapsed_link_drop_under_fast_forward_prune() {
+        expect_leaf_offer_link_drop_mirrored(LinkDropPolicy::FastForward);
     }
 
     #[cfg(unix)]

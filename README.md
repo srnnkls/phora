@@ -215,6 +215,7 @@ phora preview --files       # expand each artifact to its files
 phora preview --json        # machine-readable plan
 
 # Stop managing an artifact but keep its files on disk
+# (<target> is a configured target or a composed id that preview prints, e.g. `d88b8686303f1b5e%`)
 phora eject <artifact> --source <source> --target <target>
 phora uneject <artifact> --source <source> --target <target>
 
@@ -901,11 +902,13 @@ Two guardrails apply:
 Linked artifacts sit outside the integrity model: their registry record carries
 a `linked` marker and no per-file hashes. `phora verify` skips them, drift detection
 never reports them modified or foreign, `phora list` shows them as `linked`, and
-`phora rebuild-registry` reconstructs the marker without hashing. `--prune` removes
-an orphaned linked artifact by deleting the symlink only. It also removes a
-dangling managed file link when that link still points to a path admitted by the
-current source offer. Directory links without current attribution remain sealed.
-A regular file or directory replacing a managed link is preserved. If the working-tree target
+`phora rebuild-registry` reconstructs the marker without hashing. A link source is a
+live mirror: when a file or directory leaves its offer (deleted, renamed, or no
+longer included), every sync removes the managed symlink, dangling or not, forgets
+its record, prunes the directories it emptied, and reports the removal; no
+`--fast-forward` is needed. `--prune` removes an orphaned linked artifact by deleting
+the symlink only. A regular file, directory, or foreign symlink replacing a managed
+link is preserved: sync refuses the dropped artifact until it is restored or ejected. If the working-tree target
 is deleted or renamed the link reads as missing and is redeployed on the next sync.
 Switching a source between `link` and `copy` replaces the destination on the next
 sync (symlink ⇄ materialized copy, with full integrity restored on `copy`). If a

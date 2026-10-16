@@ -217,6 +217,10 @@ pub enum SyncWarning {
         source: String,
         artifact: String,
     },
+    LinkedSourceDropped {
+        source: String,
+        artifact: String,
+    },
     CrossDeviceFallback {
         destination: PathBuf,
     },

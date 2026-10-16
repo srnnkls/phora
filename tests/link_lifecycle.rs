@@ -234,14 +234,10 @@ sources.generated = { collapse = false }
 }
 
 #[test]
-fn prune_removes_a_dangling_generated_file_without_changing_the_binding() {
+fn sync_removes_a_dangling_generated_file_without_changing_the_binding() {
     let fixture = generated_file_fixture();
     let root = fixture.path();
-    assert!(
-        !phora_output(root, &["sync"]).status.success(),
-        "pruning requires the flag"
-    );
-    phora(root, &["sync", "--prune"]);
+    phora(root, &["sync"]);
     assert!(fs::symlink_metadata(root.join("deployed/skills/code/obsolete.txt")).is_err());
     assert_eq!(
         fs::read_to_string(root.join("deployed/foreign.txt")).expect("foreign file"),

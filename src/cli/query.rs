@@ -80,7 +80,7 @@ pub(super) fn run_list(view: ListView) -> Result<()> {
     Ok(())
 }
 
-fn inject_offline_graph(
+pub(super) fn inject_offline_graph(
     config: &mut Config,
     cwd: &Path,
     cache_git: std::path::PathBuf,
@@ -150,10 +150,10 @@ pub(super) fn run_preview(sel: &PreviewSelectors, json: bool) -> Result<()> {
 
 pub(super) fn run_explain(target: &str, source: &str, path: Option<&str>) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let config = merge_configs(load_config()?, load_local_config(&cwd)?);
+    let mut config = merge_configs(load_config()?, load_local_config(&cwd)?);
 
-    let parsed = config.parsed_sources()?;
-    let remotes = resolved_remotes(&config, &parsed)?;
+    let mut parsed = config.parsed_sources()?;
+    let mut remotes = resolved_remotes(&config, &parsed)?;
     let (base_lock, local_lock) = load_locks(&cwd)?;
     let lock = base_lock.map_or_else(
         || local_lock.clone(),
@@ -162,6 +162,13 @@ pub(super) fn run_explain(target: &str, source: &str, path: Option<&str>) -> Res
 
     let cache_git = cache_root_for(config.paths.cache.as_deref(), &cwd)?.join("git");
     let backend = build_router(&config, cache_git)?;
+    crate::sync::inject_composed_graph(
+        &mut config,
+        &mut parsed,
+        &mut remotes,
+        &backend,
+        lock.as_ref(),
+    );
     let ctx = OfflineCtx {
         config: &config,
         parsed: &parsed,

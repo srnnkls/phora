@@ -79,6 +79,9 @@ pub(super) fn format_sync_warning(warning: &SyncWarning) -> Option<String> {
         SyncWarning::FastForwardDropped { source, artifact } => {
             format!("phora: fast-forward dropped {source}:{artifact} (removed upstream)")
         }
+        SyncWarning::LinkedSourceDropped { source, artifact } => {
+            format!("phora: removed {source}:{artifact} (no longer in the linked source's offer)")
+        }
         SyncWarning::ContentStoreRepaired { object } => format!(
             "phora: content store object {} did not match its hash; rewrote it",
             object.display()
@@ -91,14 +94,7 @@ pub(super) fn format_sync_warning(warning: &SyncWarning) -> Option<String> {
             source,
             artifact,
             changed,
-        } => {
-            let mut out = format!("phora: skipping locally modified {source}:{artifact}");
-            for path in changed {
-                let _ = write!(out, "\n    {}", path.display());
-            }
-            out.push_str("\n  use --force to overwrite");
-            out
-        }
+        } => format_conflict_modified(source, artifact, changed),
         SyncWarning::ConflictForeign { path } => format!(
             "phora: skipping foreign content at {}; use --force to overwrite",
             path.display()
@@ -118,6 +114,19 @@ pub(super) fn format_sync_warning(warning: &SyncWarning) -> Option<String> {
         }
     };
     Some(rendered)
+}
+
+fn format_conflict_modified(
+    source: &str,
+    artifact: &str,
+    changed: &[std::path::PathBuf],
+) -> String {
+    let mut out = format!("phora: skipping locally modified {source}:{artifact}");
+    for path in changed {
+        let _ = write!(out, "\n    {}", path.display());
+    }
+    out.push_str("\n  use --force to overwrite");
+    out
 }
 
 fn content_filter_cause(attributes: bool, autocrlf: bool) -> &'static str {
