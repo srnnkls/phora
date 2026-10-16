@@ -55,7 +55,7 @@ url = "https://github.com/junegunn/fzf/releases/download/v0.55.0/fzf-0.55.0-linu
 digest = "sha256:4df2393776942780ddab2cea713ddaac06cd5c3886cd23bc9119a6d3aa1e02bd" # checked before extraction
 include = ["fzf"]
 
-[sources.toolkit]               # a package: its own phora.toml targets compose under an importing target
+[sources.toolkit]               # a package: a binding composes one of its phora.toml offers
 repo = "me/toolkit"
 transitive = true
 
@@ -130,13 +130,13 @@ rust-book = { history = true }  # a verified copy with `git log` available
 
 [targets.toolkit]
 path = "~/.config/toolkit"
-imports = [{ source = "toolkit", tag = "v1.2.0" }] # import the package at a tag
 
-[targets.toolkit.take]
-toolkit = ["skills/**"]         # narrow what the package deploys
+[targets.toolkit.sources]
+toolkit = { tag = "v1.2.0", take = ["skills/**"] } # the default offer at a tag, narrowed
 
-[targets.toolkit.collapse]
-toolkit = false
+[targets.toolkit-rules]
+path = "~/.config/toolkit/rules"
+sources.toolkit = { offer = "rules" } # another offer, same pin
 
 [targets.skills]
 path = "~/.claude/skills"

@@ -890,27 +890,28 @@ only from your own config; a dependency's `phora.toml` can't declare one.
 
 ## Transitive dependencies
 
-A *transitive dependency* is a source that is itself a phora project, with its
-own `phora.toml`. Import it and phora deploys that project's targets inside
-yours.
+A *transitive dependency* is a source whose repository is itself a phora
+project. Its `phora.toml` declares *offers*: what it publishes, and where its
+own dependencies land. You bind the source like any other and pick an offer.
 
 [`srnnkls/tropos`](https://github.com/srnnkls/tropos) is a set of agent
 skills. Its `loqui` skill expects coding guidelines from a separate repository,
 [`srnnkls/loqui`](https://github.com/srnnkls/loqui), under
-`skills/loqui/reference/loqui/`. Tropos declares that itself:
+`skills/loqui/reference/loqui/`. Tropos declares that in its default offer:
 
 ```toml
 # srnnkls/tropos: phora.toml
 [sources.loqui]
 host = "github"
 repo = "srnnkls/loqui"
+include = ["README.md", "languages/**", "resources/**"]
 
-[targets.loqui]
-path = "skills/loqui/reference/loqui"
-sources = ["loqui"]
+[offers.default]
+include = ["skills/**"]
+targets.loqui = { path = "skills/loqui/reference/loqui", sources = ["loqui"] }
 ```
 
-You mark tropos `transitive = true` and import it into a target:
+You mark tropos `transitive = true` and bind it:
 
 ```toml
 # your phora.toml
@@ -922,104 +923,96 @@ transitive = true
 
 [targets.claude]
 path = "~/.claude"
-imports = ["tropos"]
+sources = ["tropos"]
 ```
 
 `phora sync` fetches tropos, reads its manifest, fetches loqui, and deploys
-loqui's files under `~/.claude/skills/loqui/reference/loqui/`. One import brings
-in two repositories. `transitive = true` alone does nothing; the source needs an
-`imports` entry. An import can also pick a ref:
+tropos's skills plus loqui's files under
+`~/.claude/skills/loqui/reference/loqui/`. One binding brings in two
+repositories. `transitive = true` alone does nothing; a target has to bind the
+source.
+
+### Offers
+
+An offer has two parts:
+
+- Its own files: `root`, `include` and `exclude` over the repository, like a
+  flat source's offer. Without `include`, every file except `phora.toml` and
+  `phora.lock`.
+- `targets`: ordinary targets that place dependencies. Their paths are relative
+  to the offer's output, which is your target's path.
+
+Every target path is excluded from the offer's own files, so a stale copy
+committed where a dependency lands never deploys beside it.
+
+A repository can publish several offers. Each one states where its
+dependencies land:
 
 ```toml
-imports = [{ source = "tropos", tag = "v2" }]
+[offers.default]
+include = ["skills/**", "rules/fas/**"]
+targets.loqui = { path = "skills/loqui/reference/loqui", sources = ["loqui"] }
+targets.moira = { path = "rules/fas/moira", sources = ["moira"] }
+
+[offers.fas]
+root = "rules/fas"
+targets.moira = { path = "moira", sources = ["moira"] }
 ```
+
+A binding picks one with `offer`; without it, the binding gets `default`,
+which must be declared:
+
+```toml
+[targets.fas-rules]
+path = "~/.config/fas/rules"
+sources.tropos = { offer = "fas" }
+```
+
+Only sources the chosen offer binds are fetched; under `fas`, loqui is never
+cloned. All bindings of one source share its pin, so `~/.claude` and
+`fas-rules` deploy the same tropos commit, and `phora update tropos` moves both.
+
+Offers are all a repository publishes. Its top-level `[targets]` and `[hooks]`
+are its own config, for a `phora sync` run inside it. Only a repository meant
+to be a dependency declares `[offers]`.
+
+### Binding a transitive source
+
+Binding refinements apply:
+
+- `branch`, `tag` or `rev` pick the ref: `sources.tropos = { tag = "v2" }`.
+- `offer` picks the offer.
+- `take` subsets the offer's output, with paths relative to your target, as on
+  a flat binding: `take = ["skills/gestalt/**"]`. Each entry reaches the
+  dependency target it falls under; `**/` globs reach all of them.
+- `collapse` applies to every composed binding. Composed bindings default to
+  `collapse = false`.
+- An alias binds a second offer into the same target:
+  `sources.fas = { source = "tropos", offer = "fas" }`.
+
+`history` and `template` are rejected on a transitive binding, and `offer` on a
+flat one. A transitive source cannot set `root`, `include` or `exclude`; its
+offers are the manifest's.
 
 ### How a dependency composes
 
-The importing target's path is the *anchor*. Each of the dependency's target
-paths is joined under it, and the dependency's own layouts apply. You choose
-where the whole thing lands; the dependency chooses its shape.
+Your target's path is the *anchor*. Each target of the chosen offer is joined
+under it, and that target's own layout applies. You choose where the offer
+lands; the offer chooses its shape.
 
-Every imported dependency keeps its sources to itself. If you and tropos both
-define `loqui`, each serves its own targets. Dependencies can import further
-dependencies, up to 64 levels deep, and a repository reached twice is fetched
-once. If two composed targets resolve to the same path, the sync stops and
-names it.
+Every dependency keeps its sources to itself. If you and tropos both define
+`loqui`, each serves its own targets. An offer target can bind another
+transitive source, up to 64 levels deep, and a repository reached twice is
+fetched once. If two targets of one offer resolve to the same path, the sync
+stops and names it.
 
-### Subsetting a mounted dependency
-
-`[targets.<t>.take]` and `[targets.<t>.collapse]` slice what a dependency
-contributes. They are keyed by the name of the imported source:
-
-```toml
-[targets.claude]
-path = "~/.claude"
-imports = ["tropos"]
-
-[targets.claude.take]
-tropos = ["gestalt/**"]
-
-[targets.claude.collapse]
-tropos = false
-```
-
-The value replaces the `take` or `collapse` of every binding in every target of
-that dependency, so the patterns match paths inside each bound source. A key
-that names no import is ignored. The dependency cannot override these. In
-`phora.local.toml`, an empty table clears the base one, and a non-empty table
-replaces it.
-
-### Local packages
-
-A dependency can ship its own files as well as its dependencies. Such a
-*package* declares itself as a source with `path = "."`:
-
-```toml
-# ~/projects/tropos/phora.toml, committed
-[sources.tropos]
-path = "."
-exclude = ["phora.toml"]
-
-[sources.loqui]
-repo = "srnnkls/loqui"
-include = ["README.md", "languages/**", "resources/**"]
-
-[targets.tropos]
-path = "."
-sources.tropos = { collapse = false }
-
-[targets.loqui]
-path = "skills/loqui/reference/loqui"
-sources.loqui = { collapse = false }
-```
-
-Inside an imported manifest, `path = "."` means the package's committed snapshot
-at the pinned commit. Uncommitted files and your own working directory play no
-part. The self source cannot set a ref, `transitive`, or link mode. Any other
-local path inside a dependency is rejected.
-
-A consumer can import one package into several targets at different refs:
-
-```toml
-[sources.tropos]
-path = "~/projects/tropos"
-branch = "main"
-transitive = true
-
-[targets.canonical]
-path = ".phora/canonical"
-imports = ["tropos"]
-
-[targets.preview]
-path = ".phora/preview"
-imports = [{ source = "tropos", branch = "preview" }]
-```
-
-A package's files and its manifest share one pin. `phora sync` keeps it,
+A dependency's files and its manifest share one pin. `phora sync` keeps it,
 `phora update tropos --fast-forward` advances it and removes what the new commit
 dropped, and `phora sync --frozen` replays it from the cache.
 
-To work on a package in place, link it:
+### Developing a dependency in place
+
+Link a local checkout:
 
 ```toml
 # phora.local.toml
@@ -1028,23 +1021,40 @@ path = "~/projects/tropos"
 deploy = "link"
 ```
 
-phora now reads the manifest and the self source from the working tree,
-uncommitted files included, and deploys the self source as symlinks into it. It
-writes nothing into the package. The lock records it as `resolved = "link"`, and
-`update` leaves it alone. The package's remote dependencies still lock and
-update at pinned commits. Link mode inside a package's own manifest is
-rejected.
+phora now reads the manifest and the offer's own files from the working tree,
+uncommitted files included, and deploys those files as symlinks into it. It
+writes nothing into the checkout. The lock records it as `resolved = "link"`,
+and `update` leaves it alone. Its remote dependencies still lock and update at
+pinned commits. Link mode on a source inside a manifest is rejected.
 
-Moving a package between a pin and a link keeps its artifacts owned. One
+Moving between a pin and a link keeps artifacts owned. One
 `phora sync --prune` swaps copies for links, or links for copies, and removes
 what only the other snapshot offered.
+
+### Deploying an offer's dependencies locally
+
+A repository can deploy its own offer's dependencies into its checkout by
+binding the reserved source `self`:
+
+```toml
+# tropos/phora.toml
+[targets.vendor]
+path = "."
+sources.self = { offer = "default" }
+```
+
+A `self` binding deploys only the offer's targets, never the offer's own files;
+those are the repository. To deploy the repository's own files elsewhere, bind
+it as a flat `path = "."` source. `self` takes no ref, `history` or `template`,
+and the offer's hooks don't run through it.
 
 ### Confinement
 
 A dependency's manifest is input you did not write, so its writes stay inside its
 anchor. phora rejects:
 
-- a dependency target path that is absolute or climbs out with `..`;
+- an offer `root` or target path that is absolute, starts with `~`, or climbs out
+  with `..`;
 - a write through a symlinked directory under the anchor;
 - a write into your `phora.toml`, `phora.local.toml`, their lock files, the
   project's `.git`, or phora's cache and state;
@@ -1562,25 +1572,29 @@ changes the preimage and needs approval again.
 
 ### Transitive composition
 
-phora walks `transitive = true` imports one at a time, before resolution:
+phora walks bindings of `transitive = true` sources one at a time, before
+resolution:
 
 1. Resolve the dependency and read its `phora.toml` at that commit. Only
-   `[sources]`, `[targets]` and per-target hooks are kept; trust fields and the
-   global `[hooks]` are dropped.
-2. Key the download as a *fetch node*: normalized URL, ref and commit. Two paths
+   `[sources]`, `[offers]` and the offers' per-target hooks are kept; top-level
+   targets, trust fields and the global `[hooks]` are dropped.
+2. Pick the binding's offer, `default` unless it names another. Its own files
+   become a reserved source named `self` with a target at the offer root; every
+   offer target path is excluded from them.
+3. Key the download as a *fetch node*: normalized URL, ref and commit. Two paths
    to the same node fetch once.
-3. Key its use as an *instance*: parent, source name, anchor target and fetch
-   node. The same node mounted twice is two instances with separate names, hooks
-   and confinement.
-4. Compose each dependency target as a synthetic target at
-   `<anchor path>/<dependency target path>`. Two composed targets with one
-   destination are an error.
-5. Recurse into the dependency's own imports, up to depth 64.
+4. Key its use as an *instance*: parent, binding identity and anchor target. The
+   same node bound twice is two instances with separate names, hooks and
+   confinement. The instance key leaves out the commit and the offer, so
+   ownership survives updates, links and offer switches.
+5. Compose each offer target as a synthetic target at
+   `<anchor path>/<offer target path>`, named `<instance>%<offer>%<target>`.
+   Two composed targets with one destination are an error.
+6. Recurse into offer targets that bind transitive sources, up to depth 64.
 
-At depth 1 a source may use a local `path`, including the package's self source
-`path = "."`. Deeper, local paths, relative paths and `file://` remotes are
-rejected. Inner sources can't use `deploy = "link"`; the imported source itself
-can.
+Offer roots and target paths must be relative subpaths. Inner sources can't use
+a local path, `file://` remote or `deploy = "link"`; the bound source itself can
+be a local checkout or a link.
 
 Every composed write is confined to its anchor. It is also kept out of a
 protected set: the project's `phora.toml`, `phora.local.toml`, `phora.lock`,

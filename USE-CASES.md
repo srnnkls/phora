@@ -815,28 +815,20 @@ ends.
 
 This is how [srnnkls/dotfiles](https://github.com/srnnkls/dotfiles) deploys
 [tropos](https://github.com/srnnkls/tropos), compiled by
-[henia](https://github.com/srnnkls/henia). Tropos is a phora package: its own
-`phora.toml` offers the canonical files and vendors one dependency under the
-skill that needs it.
+[henia](https://github.com/srnnkls/henia). Tropos is a phora package: its
+default offer publishes the canonical files and vendors one dependency under
+the skill that needs it.
 
 ```toml
 # tropos/phora.toml
-[sources.tropos]
-path = "."
-include = ["skills/**", "agents/**", "instructions/**", "rules/fas/**", "henia.toml", ".henia/harnesses/**", "phora.toml"]
-
 [sources.loqui]
 git = "https://github.com/srnnkls/loqui.git"
 branch = "main"
 include = ["README.md", "languages/**", "resources/**"]
 
-[targets.tropos]
-path = "."
-sources.tropos = { collapse = false }
-
-[targets.loqui]
-path = "skills/loqui/reference/loqui"
-sources.loqui = { collapse = false }
+[offers.default]
+include = ["skills/**", "agents/**", "instructions/**", "rules/fas/**", "henia.toml", ".henia/harnesses/**", "phora.toml"]
+targets.loqui = { path = "skills/loqui/reference/loqui", sources = ["loqui"] }
 ```
 
 The dotfiles repository compiles that package into a build source:

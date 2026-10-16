@@ -300,8 +300,8 @@ Remove a source and every binding to it.
 phora rm <NAME>
 ```
 
-Scrubs `phora.toml` and `phora.local.toml` together, so it takes no `--local`. Entries in a
-target's `imports` are left for you to remove. Same as `phora source rm`.
+Scrubs `phora.toml` and `phora.local.toml` together, so it takes no `--local`. Same as
+`phora source rm`.
 
 ```sh
 phora rm dotfiles
@@ -474,7 +474,7 @@ changed hook or a new commit asks again.
 phora trust toolkit --show phora.toml
 ```
 
-See also: [imports](#imports), [hooks](#hooks), [GUIDE: transitive dependencies](GUIDE.md#transitive-dependencies).
+See also: [offers](#offers), [hooks](#hooks), [GUIDE: transitive dependencies](GUIDE.md#transitive-dependencies).
 
 ### phora rebuild-registry
 
@@ -496,8 +496,7 @@ See also: [Files and state](#files-and-state), [Troubleshooting](#troubleshootin
 ## Configuration
 
 `phora.toml` sits in the project root. Unknown keys are an error in every table except `[vars]`,
-which is free-form, and `[targets.<t>.take]` and `[targets.<t>.collapse]`, whose keys name imports
-and are not checked. [phora.example.toml](phora.example.toml) shows every section below.
+which is free-form. [phora.example.toml](phora.example.toml) shows every section below.
 
 ### Top-level keys
 
@@ -505,6 +504,7 @@ and are not checked. [phora.example.toml](phora.example.toml) shows every sectio
 | --- | --- | --- | --- |
 | `version` | integer | `1` | schema version; `1` is the only one |
 | `protocol` | `"https"` \| `"ssh"` | `"https"` | which remote template forge sources use |
+| `offers` | table | none | what this repository publishes to dependents; see [offers](#offers) |
 
 ### paths
 
@@ -591,7 +591,7 @@ git remote (`git`), download (`url`), or generated (`build`).
 | `allow_symlinks` | bool | `false`; `true` under `history` | deploy symlinks found in the source |
 | `preserve_executable` | bool | `true` | keep the executable bit |
 | `deploy` | `"copy"` \| `"link"` | `"copy"` | copy content, or symlink into the local working tree |
-| `transitive` | bool | `false` | read the source's own `phora.toml`; see [imports](#imports) |
+| `transitive` | bool | `false` | read the source's own `phora.toml` and compose an offer; see [offers](#offers) |
 
 Set at most one of `branch`, `tag` and `rev`. A `url` source rejects `branch`, `tag`, `rev` and
 `root`; tar, tar.gz, tgz and zip archives are unpacked and a single top-level directory is
@@ -657,9 +657,6 @@ henia = { take = [{ "claude/" = "." }] }
 | `path` | path | required | deployment directory; `~` expands |
 | `sources` | array \| table | none | bindings; see [bindings](#bindings) |
 | `layout` | string \| table | `"flat"` | see [layouts](#layouts) |
-| `imports` | array | none | transitive sources to compose here; see [imports](#imports) |
-| `take` | table | none | per-import `take`, keyed by the imported source |
-| `collapse` | table | none | per-import `collapse`, keyed by the imported source |
 | `hooks` | table | none | see [hooks](#hooks) |
 
 `sources` is an allow-list: an omitted key or `[]` deploys nothing.
@@ -694,6 +691,7 @@ order.
 | `branch` | string | the source's ref | follow a branch for this binding |
 | `tag` | string | the source's ref | pin a tag for this binding |
 | `rev` | string | the source's ref | pin a full commit id for this binding |
+| `offer` | string | `"default"` | which offer of a transitive source to compose; see [offers](#offers) |
 
 Each distinct binding ref gets its own lock entry. `root`, `include`, `exclude` and `map` are
 rejected here; set the first three on the source and rename with `take`.
@@ -702,6 +700,8 @@ Restrictions:
 
 - A `url` source binding accepts only `source` and `collapse`.
 - A `link` source binding rejects `branch`, `tag` and `rev`.
+- A transitive source binding rejects `template` and `history`; `offer` is rejected on any other.
+- A `self` binding takes only `offer`, `take` and `collapse`.
 - `history = true` rejects `take`, `template` and `collapse`, and its source may not be `url`,
   `link` or `transitive`, set `root`, `include` or `exclude`, or set `preserve_executable = false`.
 
@@ -757,7 +757,7 @@ layout = { type = "prefixed", separator = "/" }
 | `[targets.<t>.hooks] pre_deploy_on_fail` | `"abort"` (default) stops the sync; `"skip"` skips that target | |
 | `[targets.<t>.hooks] on_change` | after this target's artifacts were added or changed | the sync exits 1 and the hook runs again next time |
 
-A sync runs in this order: `pre_sync`, [build sources](#build-sources), compose imports, resolve,
+A sync runs in this order: `pre_sync`, [build sources](#build-sources), compose offers, resolve,
 plan, `pre_deploy`, apply, prune, your `on_change`, `post_sync`, and the trusted `on_change` hooks
 of imported dependencies. A failed `pre_sync` or an aborting `pre_deploy` skips everything after it,
 `post_sync` included.
@@ -811,25 +811,48 @@ rust-book = { history = true }
 
 See [GUIDE: history overlay](GUIDE.md#history-overlay).
 
-### imports
+### offers
 
-A source with `transitive = true` is a package: its own `phora.toml` targets compose beneath the
-importing target's path.
+A repository meant to be a dependency publishes *offers* in its `phora.toml`. A consumer marks the
+source `transitive = true` and binds it; the binding composes one offer beneath the target's path.
 
-| Form | Meaning |
-| --- | --- |
-| `"name"` | import at the source's ref |
-| `{ source = "name", branch = "..." }` | import at another branch; `tag` or `rev` also work, one at a time |
+```toml
+# the dependency's phora.toml
+[sources.moira]
+repo = "me/moira"
+root = "rules/fas"
 
-- A transitive source must be imported by some target and cannot also appear in that target's
-  `sources`.
-- A `url` package cannot select a ref.
-- An imported package may use `deploy = "link"`; phora then reads its working tree and locks it as
-  `resolved = "link"`. Sources inside a package cannot use link mode.
-- Inside a package, `path = "."` names the package itself, read from the pinned commit.
+[offers.default]
+include = ["skills/**", "rules/fas/**"]
+targets.moira = { path = "rules/fas/moira", sources = ["moira"] }
+
+[offers.fas]
+root = "rules/fas"
+targets.moira = { path = "moira", sources = ["moira"] }
+```
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `root` | path | repository root | serve the offer's own files from this subdirectory |
+| `include` | array of globs | everything except `phora.toml` and `phora.lock` | own files to publish |
+| `exclude` | array of globs | `[]` | own files to withhold |
+| `targets` | table | none | targets placing dependencies, paths relative to the offer's output |
+
+- A binding without `offer` gets `default`, which must be declared. An undeclared offer is an error
+  that names the declared ones.
+- Every offer target path is excluded from the offer's own files.
+- Only sources bound by the chosen offer's targets are fetched.
+- Offer `root` and target paths must be relative; absolute, `~` and `..` are rejected.
+- A source inside the manifest cannot use `path = "."`, a local path, a `file://` remote, `build`
+  or `deploy = "link"`. The name `self` is reserved.
+- Top-level `[targets]` and `[hooks]` are never published; they are the repository's own config.
+- Composed bindings default to `collapse = false`. Hooks on offer targets run in the consumer only
+  after [phora trust](#phora-trust).
 - Nesting stops at depth 64.
-- `[targets.<t>.take]` and `[targets.<t>.collapse]`, keyed by the imported source, override the
-  package's own bindings.
+
+On the consumer side, a transitive source sets only its pin: `root`, `include` and `exclude` are
+rejected. All bindings of one source share one lock entry. The bound source may be a local checkout
+with `deploy = "link"`; phora then reads its working tree and locks it as `resolved = "link"`.
 
 ```toml
 [sources.toolkit]
@@ -838,14 +861,26 @@ transitive = true
 
 [targets.toolkit]
 path = "~/.config/toolkit"
-imports = [{ source = "toolkit", tag = "v1.2.0" }]
+sources.toolkit = { tag = "v1.2.0", take = ["skills/**"] }
 
-[targets.toolkit.take]
-toolkit = ["skills/**"]
+[targets.fas-rules]
+path = "~/.config/fas/rules"
+sources.toolkit = { offer = "fas" }
 ```
 
-See [GUIDE: transitive dependencies](GUIDE.md#transitive-dependencies) and
-[local packages](GUIDE.md#local-packages).
+`take` on a transitive binding is relative to the offer's output; each entry reaches the offer target
+it falls under, and `**/` globs reach all of them.
+
+A repository can deploy its own offer's dependencies with the reserved source `self`, which deploys
+only the offer's targets:
+
+```toml
+[targets.vendor]
+path = "."
+sources.self = { offer = "default" }
+```
+
+See [GUIDE: transitive dependencies](GUIDE.md#transitive-dependencies).
 
 ### Local overlay
 
@@ -857,11 +892,10 @@ version control. Sources it declares or overrides are locked in `phora.local.loc
 | top level, `[paths]`, `[defaults]`, `[vars]` | per key |
 | `[hosts.<name>]` | per key |
 | `[sources.<name>]` | per key; a new kind replaces the old one, and any ref key replaces all three |
-| `[targets.<name>]` | `path` is required; `sources`, `layout`, `imports`, `take`, `collapse` and `hooks` each replace the base value whole |
+| `[targets.<name>]` | `path` is required; `sources`, `layout` and `hooks` each replace the base value whole |
 | `[hooks]` | replaces the base table whole |
 
-An empty `take` or `collapse` table in the overlay clears the base one. Overriding a source with a
-local `path` and `deploy = "link"` drops the base ref.
+Overriding a source with a local `path` and `deploy = "link"` drops the base ref.
 
 ```toml
 [sources.loqui]
