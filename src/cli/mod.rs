@@ -416,11 +416,8 @@ pub fn run_with_outcome(cli: Cli) -> Result<CliOutcome> {
             source,
             target,
         } => {
-            let config = merge_configs(load_config()?, load_local_config(Path::new("."))?);
+            let (config, cache_git) = load_composed_config()?;
             let (registry, _guard) = lock_project_registry(&config, cli.lock_timeout)?;
-            let cwd = std::env::current_dir()?;
-            let cache_git =
-                crate::paths::cache_root_for(config.paths.cache.as_deref(), &cwd)?.join("git");
             let backend = GitBackend::new(cache_git);
             match crate::sync::eject(&config, &registry, &artifact, &source, &target, &backend)? {
                 Some(clone) => println!(
@@ -437,7 +434,7 @@ pub fn run_with_outcome(cli: Cli) -> Result<CliOutcome> {
             source,
             target,
         } => {
-            let config = merge_configs(load_config()?, load_local_config(Path::new("."))?);
+            let (config, _) = load_composed_config()?;
             let (registry, _guard) = lock_project_registry(&config, cli.lock_timeout)?;
             crate::sync::uneject(&config, &registry, &artifact, &source, &target)?;
             println!("unejected {source}/{artifact} in {target}");
@@ -479,6 +476,15 @@ pub fn run_with_outcome(cli: Cli) -> Result<CliOutcome> {
             path,
         } => completed(query::run_explain(&target, &source, path.as_deref())),
     }
+}
+
+/// The merged config with the offline-composed transitive targets, and the git cache it read.
+fn load_composed_config() -> Result<(Config, PathBuf)> {
+    let cwd = std::env::current_dir()?;
+    let mut config = merge_configs(load_config()?, load_local_config(&cwd)?);
+    let cache_git = crate::paths::cache_root_for(config.paths.cache.as_deref(), &cwd)?.join("git");
+    query::inject_offline_graph(&mut config, &cwd, cache_git.clone())?;
+    Ok((config, cache_git))
 }
 
 fn dispatch_sync(cmd: Command, lock_timeout: Duration) -> Result<CliOutcome> {

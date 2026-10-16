@@ -1000,8 +1000,14 @@ fn readonly_state_error(registry: &dyn StateStore) -> Error {
 }
 
 enum FastForwardDrop {
-    Remove { record: ArtifactRecord },
-    KeepLive { record: ArtifactRecord },
+    /// `link` is the symlink a linked record's deployed path held when the drop was planned.
+    Remove {
+        record: ArtifactRecord,
+        link: Option<PathBuf>,
+    },
+    KeepLive {
+        record: ArtifactRecord,
+    },
 }
 
 impl FastForwardDrop {
@@ -1042,7 +1048,12 @@ fn plan_fast_forward_drops(
         if prune::overlaps_live_dest(&path, &expected_paths, &record.key.target) {
             plan.push(FastForwardDrop::KeepLive { record });
         } else {
-            plan.push(FastForwardDrop::Remove { record });
+            let link = if record.linked {
+                std::fs::read_link(&dst).ok()
+            } else {
+                None
+            };
+            plan.push(FastForwardDrop::Remove { record, link });
         }
     }
     Ok(plan)
@@ -1642,11 +1653,12 @@ impl SealedRecordPolicy {
 /// allowed. Only immutable-copy records may treat exclusion of every candidate by the current
 /// offer as intentional config narrowing, or exact current-commit equality as a projection-shape
 /// transition; both are left to reconciliation/prune. When commits differ, only immutable-copy
-/// records are actionable `--fast-forward` drops. A historical linked record or current Link
-/// binding without positive attribution remains ambiguous and seals, even when the current offer
-/// excludes every available candidate. `--prune` also admits a dangling file link
-/// when it still points to an admitted path in the current live source root, and any record
-/// deployed in the other mode: switching between copy and link replaces the whole snapshot.
+/// records are actionable `--fast-forward` drops. A Link binding mirrors its live source: a
+/// linked record whose deployed path is still the symlink into that source, dangling or not, is a
+/// drop on every sync. Any other linked record without positive attribution remains ambiguous and
+/// seals, even when the current offer excludes every available candidate. `--prune` also admits
+/// any record deployed in the other mode: switching between copy and link replaces the whole
+/// snapshot.
 fn validate_sealed_offer(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
@@ -1727,15 +1739,11 @@ fn validate_sealed_offer(
         if has_current_attribution || (policy.immutable_copy && !selection_admits_candidate) {
             continue;
         }
-        if prune
-            && selection_admits_candidate
+        let mirrors_live_source = offer.deploy_mode == DeployMode::Link
             && config.targets.get(&key.target).is_some_and(|target| {
-                dangling_file_link(record, target, offer.live_root.as_deref(), &source_paths)
-            })
-        {
-            continue;
-        }
-        if fast_forward && policy.fast_forward_actionable() {
+                links_into_source(record, target, offer.live_root.as_deref(), &source_paths)
+            });
+        if mirrors_live_source || (fast_forward && policy.fast_forward_actionable()) {
             dropped.push(record.clone());
             continue;
         }
@@ -1769,13 +1777,13 @@ fn live_source_root(config: &Config, source: &ParsedSource) -> Result<Option<Pat
     confine::normalize_physical(&absolute).map(Some)
 }
 
-fn dangling_file_link(
+fn links_into_source(
     record: &ArtifactRecord,
     target: &crate::config::Target,
     source_root: Option<&Path>,
     source_paths: &BTreeSet<String>,
 ) -> bool {
-    if !record.linked || record.kind != crate::sync::state::RecordKind::File {
+    if !record.linked {
         return false;
     }
     let Some(root) = source_root else {
@@ -1785,13 +1793,14 @@ fn dangling_file_link(
     let Ok(link) = std::fs::read_link(&destination) else {
         return false;
     };
-    let actual = destination.parent().unwrap_or(Path::new(".")).join(link);
+    let Ok(actual) = confine::normalize_physical_entry(
+        &destination.parent().unwrap_or(Path::new(".")).join(link),
+    ) else {
+        return false;
+    };
     source_paths.iter().any(|source| {
-        let expected = root.join(source);
-        matches!(std::fs::symlink_metadata(&expected), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
-            && confine::normalize_physical_entry(&actual).ok()
-                .zip(confine::normalize_physical_entry(&expected).ok())
-                .is_some_and(|(actual, expected)| actual == expected)
+        confine::normalize_physical_entry(&root.join(source))
+            .is_ok_and(|expected| actual == expected)
     })
 }
 
@@ -1884,10 +1893,16 @@ fn apply_fast_forward_drops(
                     path,
                 });
             }
-            FastForwardDrop::Remove { .. } => {
-                events.push_warning(SyncWarning::FastForwardDropped {
-                    source: record.key.source.clone(),
-                    artifact: record.key.artifact.clone(),
+            FastForwardDrop::Remove { link, .. } => {
+                if record.linked && std::fs::read_link(&path).ok() != *link {
+                    continue;
+                }
+                let source = record.key.source.clone();
+                let artifact = record.key.artifact.clone();
+                events.push_warning(if record.linked {
+                    SyncWarning::LinkedSourceDropped { source, artifact }
+                } else {
+                    SyncWarning::FastForwardDropped { source, artifact }
                 });
                 remove_orphan_path(&path).map_err(|error| {
                     Error::Sync(format!("fast-forward prune {}: {error}", path.display()))
