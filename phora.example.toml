@@ -3,100 +3,110 @@
 # protocol = "ssh"              # remote template for forge sources; default "https"
 
 [defaults]
-auto_target = true              # `phora add` without --to binds into [targets.default]
+auto_target = true  # `phora add` without --to binds into [targets.default]
 
 # [paths]
-# cache = ".phora/cache"        # git mirrors live under <cache>/git/
+# cache = ".phora/cache"        # git mirrors under <cache>/git/, file contents under <cache>/content/
 # state = ".phora/state"        # registry, journal and state.lock live under <state>/projects/
 
-[vars]                          # values for *.tmpl files; phora.local.toml overrides them per key
+[vars]  # values for *.tmpl files; phora.local.toml overrides them per key
 email = "me@example.com"
 editor = "nvim"
 
-[hosts.company]                 # a custom forge; github, gitlab, codeberg, sr.ht and bitbucket are built in
+[hosts.company]  # a custom forge; github, gitlab, codeberg, sr.ht and bitbucket are built in
 remote = { https = "https://git.company.com/{path}.git", ssh = "git@git.company.com:{path}.git" }
+web = "https://git.company.com/{path}/blob/{commit}/{file}#L{line}"  # links in `phora trust` listings
+
+[tools."github:srnnkls/henia"]  # a tool builds may run; never read from a dependency
+mise = true  # or: path = "~/bin/henia"
+
+[offers.default]  # what a consumer binding this repo transitively composes
+include = ["scripts/**"]  # own files; a target under ~ is never offered
 
 [hooks]
-pre_sync = "test -w ~/.config"                         # gate before any source is resolved; failure stops the sync
-post_sync = "echo 'phora: synced'"                     # runs after target on_change hooks, before trusted transitive ones
+pre_sync = "test -w ~/.config"  # gate before any source is resolved; failure stops the sync
+post_sync = "echo 'phora: synced'"  # runs after target on_change hooks, before trusted transitive ones
 
-[sources.dotfiles]              # forge source, following a branch
-host = "github"                 # the default when repo is set
+[sources.dotfiles]  # forge source, following a branch
+host = "github"  # the default when repo is set
 repo = "me/dotfiles"
 branch = "main"
-root = "modules"                # the offer starts at modules/
+root = "modules"  # the offer starts at modules/
 
 [sources.internal]
 host = "company"
-repo = "team/sub/proj"          # nested paths fill {path}
+repo = "team/sub/proj"  # nested paths fill {path}
 protocol = "ssh"
 root = "configs"
-include = ["editor", "lint"]    # gitignore syntax
-exclude = ["**/test/**", "**/*.bak"] # exclude wins over include
+include = ["editor", "lint"]  # gitignore syntax
+exclude = ["**/test/**", "**/*.bak"]  # exclude wins over include
 
-[sources.fzf]                   # pinned to a tag; bindings can pin other refs
+[sources.fzf]  # pinned to a tag; bindings can pin other refs
 repo = "junegunn/fzf"
 tag = "v0.55.0"
 include = ["bin"]
 
-[sources.loqui]                 # literal git remote, pinned to a full commit id
+[sources.loqui]  # literal git remote, pinned to a full commit id
 git = "https://github.com/srnnkls/loqui.git"
 rev = "9e5d4de28b21871d2b67f40943e1d6d6ffa701a3"
 root = "languages"
 allow_symlinks = false
 preserve_executable = true
 
-[sources.scratch]               # local checkout; ~ expands to your home directory
+[sources.scratch]  # local checkout; ~ expands to your home directory
 path = "~/dev/scratch-configs"
 branch = "main"
 
-[sources.fzf-bin]               # a download, imported as one snapshot
+[sources.fzf-bin]  # a download, imported as one snapshot
 url = "https://github.com/junegunn/fzf/releases/download/v0.55.0/fzf-0.55.0-linux_amd64.tar.gz"
-digest = "sha256:4df2393776942780ddab2cea713ddaac06cd5c3886cd23bc9119a6d3aa1e02bd" # checked before extraction
+digest = "sha256:4df2393776942780ddab2cea713ddaac06cd5c3886cd23bc9119a6d3aa1e02bd"  # checked before extraction
 include = ["fzf"]
 
-[sources.toolkit]               # a package: a binding composes one of its phora.toml offers
+[sources.toolkit]  # a package: a binding composes one of its phora.toml offers
 repo = "me/toolkit"
 transitive = true
 
-[sources.rust-book]             # deployed with its git history below
+[sources.rust-book]  # deployed with its git history below
 repo = "rust-lang/book"
 
-[sources.skill-src]             # generator input
+[sources.skill-src]  # generator input
 repo = "me/skill-sources"
 
-[sources.skills]                # generator output, committed like any other source
+[sources.skills]  # generator output, committed like any other source
 build = { inputs = ["skill-src"], run = "./scripts/gen-skills $PHORA_INPUT/skill-src $PHORA_OUTPUT" }
+
+[sources.harnesses]  # a tool build: argv without a shell, over the toolkit's default offer
+build = { tool = "github:srnnkls/henia@0.1.0-alpha.4", run = "henia build {input} --output {output}", inputs = ["toolkit"] }
 
 [targets.neovim]
 path = "~/.config/nvim"
 
 [targets.neovim.sources]
-nvim = { source = "dotfiles", take = ["nvim/**"], template = ["nvim/lua/user.lua"] } # identity nvim, one slice
+nvim = { source = "dotfiles", take = ["nvim/**"], template = ["nvim/lua/user.lua"] }  # identity nvim, one slice
 
 [targets.neovim.hooks]
-on_change = "nvim --headless '+Lazy! sync' +qa" # runs after this target's artifacts change
+on_change = "nvim --headless '+Lazy! sync' +qa"  # runs after this target's artifacts change
 
 [targets.editors]
 path = "~/.config/editors"
-layout = "by-source"            # each artifact lands under its binding identity
+layout = "by-source"  # each artifact lands under its binding identity
 
 [targets.editors.sources]
 nvim = { source = "dotfiles", take = ["nvim/**"] }
-helix = { source = "dotfiles", take = ["helix/**"], collapse = false } # one artifact per file
+helix = { source = "dotfiles", take = ["helix/**"], collapse = false }  # one artifact per file
 
 [targets.vscode]
 path = "~/.config/Code/User"
 
 [targets.vscode.sources]
-dotfiles = { take = ["vscode/**", { "vscode/settings.json" = "settings.json" }] } # glob plus a rename
+dotfiles = { take = ["vscode/**", { "vscode/settings.json" = "settings.json" }] }  # glob plus a rename
 internal = {}
 
 [targets.agents]
 path = "~/.config/agents"
 
 [targets.agents.sources]
-dotfiles = { take = [{ "claude/" = "." }] } # subtree rename: claude/ lands at the target root
+dotfiles = { take = [{ "claude/" = "." }] }  # subtree rename: claude/ lands at the target root
 
 [targets.policies]
 path = "~/.cupcake/policies/claude"
@@ -104,22 +114,22 @@ sources = ["loqui"]
 layout = { type = "prefixed", separator = "/" }
 
 [targets.policies.hooks]
-pre_deploy = { run = "test -d ~/.cupcake", shell = "bash -c" } # gate checked before any target is written
-pre_deploy_on_fail = "skip"     # a failed gate skips this target only
+pre_deploy = { run = "test -d ~/.cupcake", shell = "bash -c" }  # gate checked before any target is written
+pre_deploy_on_fail = "skip"  # a failed gate skips this target only
 
 [targets.bin]
 path = "~/.local/bin"
 sources = ["fzf-bin"]
 
 [targets.bin.hooks]
-on_change = { cmd = ["fzf", "--version"] } # runs the program directly, with no shell
+on_change = { cmd = ["fzf", "--version"] }  # runs the program directly, with no shell
 
 [targets.tools]
 path = "~/.local/tools"
 layout = "by-source"
 
 [targets.tools.sources]
-stable = { source = "fzf", tag = "v0.55.0" } # two identities, two refs, two lock entries
+stable = { source = "fzf", tag = "v0.55.0" }  # two identities, two refs, two lock entries
 canary = { source = "fzf", tag = "v0.56.0" }
 
 [targets.references]
@@ -132,11 +142,11 @@ rust-book = { history = true }  # a verified copy with `git log` available
 path = "~/.config/toolkit"
 
 [targets.toolkit.sources]
-toolkit = { tag = "v1.2.0", take = ["skills/**"] } # the default offer at a tag, narrowed
+toolkit = { tag = "v1.2.0", take = ["skills/**"] }  # the default offer at a tag, narrowed
 
 [targets.toolkit-rules]
 path = "~/.config/toolkit/rules"
-sources.toolkit = { offer = "rules" } # another offer, same pin
+sources.toolkit = { offer = "rules" }  # another offer, at the source's own ref
 
 [targets.skills]
 path = "~/.claude/skills"
@@ -145,3 +155,7 @@ sources = ["skills"]
 [targets.scratch]
 path = "~/.config/scratch"
 sources = ["scratch"]
+
+[targets.codex]
+path = "~/.codex"
+sources.harnesses = { take = [{ "codex/" = "." }] }

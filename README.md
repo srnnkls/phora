@@ -16,8 +16,9 @@ records a blake3 digest per deployed file, and an interrupted run resumes where 
 
 Underneath sits one content-addressed store per machine. Every repository is fetched once into a
 shared git mirror that holds only the commits you pin and the files you select, and every project
-gets a verified copy of its slice. A binding that asks for history reads it from the same store,
-so ten projects that reference one repository keep one copy of its history.
+gets a verified copy of its slice, reflinked from one store of file contents so copies of the same
+bytes share blocks on a copy-on-write filesystem. A binding that asks for history reads it from the
+same store, so ten projects that reference one repository keep one copy of its history.
 
 Reach for it when shared configuration, editor setups, prompt or skill bundles, or release assets
 live in one or more repositories but have to show up wherever other tools look for them, or when
@@ -138,10 +139,12 @@ Next, try `phora add` and `phora bind` to edit the configuration from the comman
 | [`unbind`](REFERENCE.md#phora-unbind) | remove bindings from a target |
 | [`eject`](REFERENCE.md#phora-eject) | stop managing an artifact and keep its files |
 | [`uneject`](REFERENCE.md#phora-uneject) | manage an ejected artifact again |
-| [`trust`](REFERENCE.md#phora-trust) | review and approve hooks from imported dependencies |
+| [`trust`](REFERENCE.md#phora-trust) | review and approve hooks from transitive dependencies |
 | [`rebuild-registry`](REFERENCE.md#phora-rebuild-registry) | rebuild the registry from the lock and the disk |
+| [`cache prune`](REFERENCE.md#phora-cache-prune) | remove content-store objects no deployment records |
 
-Every command accepts `-C <directory>` to run in another project.
+Every command accepts `-C <directory>` to run in another project, and `--lock-timeout <seconds>`
+to bound its wait for another phora process.
 
 ## Concepts
 
@@ -157,8 +160,9 @@ Every command accepts `-C <directory>` to run in another project.
 | *lock* | `phora.lock`, the commit pinned for each source |
 | *registry* | the machine-local record of what was deployed where, at which commit and digest |
 
-A source with its own `phora.toml` can be imported as a package, and its targets then deploy
-beneath yours. [GUIDE.md](GUIDE.md#transitive-dependencies) covers how that composes.
+A source with its own `phora.toml` can publish *offers*: its own files plus the targets that place
+its dependencies. Bind it as a transitive source and the chosen offer deploys beneath your target.
+[GUIDE.md](GUIDE.md#transitive-dependencies) covers how that composes.
 
 ## Documentation
 

@@ -82,7 +82,8 @@ it back at the pin. A history binding takes the whole repository and rejects
 [Under the hood](GUIDE.md#under-the-hood).
 
 The store saves fetching and history; each project still gets its own copy of
-the files it deploys. To work on a dependency, `phora eject` the history
+the files it deploys, and on a copy-on-write filesystem those copies share
+blocks. To work on a dependency, `phora eject` the history
 checkout into a standalone clone.
 
 ## Dotfiles
@@ -826,9 +827,12 @@ git = "https://github.com/srnnkls/loqui.git"
 branch = "main"
 include = ["README.md", "languages/**", "resources/**"]
 
+[targets.loqui]
+path = "skills/loqui/reference/loqui"
+sources = ["loqui"]
+
 [offers.default]
 include = ["skills/**", "agents/**", "instructions/**", "rules/fas/**", "henia.toml", ".henia/harnesses/**", "phora.toml"]
-targets.loqui = { path = "skills/loqui/reference/loqui", sources = ["loqui"] }
 ```
 
 The dotfiles repository compiles that package into a build source:
@@ -892,10 +896,12 @@ deploy = "link"
 To move to a newer tropos and drop skills it removed, run
 `phora update tropos --fast-forward --prune`. See
 [Building sources](GUIDE.md#building-sources),
-[Local packages](GUIDE.md#local-packages) and [Renaming](GUIDE.md#renaming).
+[Developing a dependency in place](GUIDE.md#developing-a-dependency-in-place) and
+[Renaming](GUIDE.md#renaming).
 
 phora runs henia and deploys what it writes; it doesn't know the harness
-formats.
+formats. Tropos could instead offer the compiled output itself, as a build that
+runs henia as a granted tool; see [Offered builds](GUIDE.md#offered-builds).
 
 ## Smaller situations
 

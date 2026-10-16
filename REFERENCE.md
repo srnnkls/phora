@@ -17,15 +17,17 @@ overlay, and their lock files. `phora help <COMMAND>` prints the built-in help f
 | Option | Meaning |
 | --- | --- |
 | `-C`, `--directory <DIRECTORY>` | run in this project directory; relative paths and hooks resolve from it |
+| `--lock-timeout <SECONDS>` | wait this long for another phora process holding the project lock; `0` fails at once; default 120, or `PHORA_LOCK_TIMEOUT` |
 | `-h`, `--help` | print help |
 | `-V`, `--version` | print the version |
 
 ## Commands
 
 These commands read the merged view of `phora.toml` and `phora.local.toml`: `sync`, `update`,
-`list`, `verify`, `preview`, `explain`, `rebuild-registry`, `bind`, and `target rm`. `add` reads
-`[defaults] auto_target` from the merged view. `rm` and `source rm` read and edit both files. `add`,
-`bind` and `unbind` check the merged view before they write. The others read `phora.toml` alone.
+`list`, `verify`, `preview`, `explain`, `rebuild-registry`, `bind`, `eject`, `uneject` and `target
+rm`. `add` reads `[defaults] auto_target` from the merged view. `rm` and `source rm` read and edit
+both files. `add`, `bind` and `unbind` check the merged view before they write. The others read
+`phora.toml` alone.
 
 ### phora sync
 
@@ -46,7 +48,7 @@ other source deploys at its locked commit. When nothing changed, a sync fetches 
 | `--fast-forward` | delete deployed artifacts that a moved pin no longer offers |
 | `--frozen` | fetch and resolve nothing; every source, nested dependencies included, must already be in the lock, except link sources; fails when a history binding's mirror holds only pinned commits; also runs against a read-only state root when nothing needs writing |
 | `--no-hooks` | run no hooks at all |
-| `--no-transitive-hooks` | run your own hooks, but none from imported dependencies |
+| `--no-transitive-hooks` | run your own hooks, but none from transitive dependencies |
 | `--no-progress` | never draw live progress |
 | `--json` | print one JSON record per event on stdout (NDJSON) |
 | `-j`, `--jobs <N>` | number of resolver threads; must be at least 1 |
@@ -78,7 +80,7 @@ phora update [SOURCE] [--prune] [--fast-forward]
 ```
 
 With no argument, every source is re-resolved. With a source name, that source and every
-transitive dependency, from any import, are re-resolved; your other sources stay pinned.
+transitive dependency it composes are re-resolved; your other sources stay pinned.
 
 | Flag | Meaning |
 | --- | --- |
@@ -113,7 +115,8 @@ phora list [--orphans]
 | `ejected` | no longer managed; files kept |
 | `linked` | a live symlink into a working tree |
 
-A history binding prefixes the state with `history,`.
+A history binding prefixes the state with `history,`. What a transitive binding composes is listed
+under the target that binds it, grouped as `via <binding>/<dependency target>`.
 
 ```console
 $ phora list
@@ -366,7 +369,8 @@ Bind sources to one or more targets.
 
 ```
 phora bind <SOURCE>... --to <TARGET> [--to <TARGET>]... [--as <IDENTITY>] [--take <ENTRY>]...
-           [--branch <BRANCH> | --tag <TAG> | --rev <SHA>] [--root <PATH>] [--history] [--local]
+           [--branch <BRANCH> | --tag <TAG> | --rev <SHA>] [--offer <OFFER>] [--root <PATH>]
+           [--history] [--local]
 ```
 
 A plain bind appends the source name to a flat `sources` list, or writes `name = {}` into a keyed
@@ -380,6 +384,7 @@ table. Any refinement writes a keyed entry.
 | `--branch <BRANCH>` | pin this binding to a branch |
 | `--tag <TAG>` | pin this binding to a tag |
 | `--rev <SHA>` | pin this binding to a full commit id |
+| `--offer <OFFER>` | the offer of a transitive source to bind; `default` when omitted |
 | `--root <PATH>` | set `root` on each named source in the edited file |
 | `--history` | set `history = true`; conflicts with `--root` and `--take` |
 | `--local` | edit `phora.local.toml` |
@@ -452,14 +457,16 @@ See also: [phora eject](#phora-eject).
 
 ### phora trust
 
-Review and approve hooks from imported dependencies.
+Review and approve hooks from transitive dependencies.
 
 ```
 phora trust [SOURCE] [--list] [--revoke] [--show <PATH>]
 ```
 
 With no flags, a terminal prompts once per hook; without a terminal it lists them. A source name
-narrows everything to that dependency. Listings read the cache mirror. A commit or file the mirror lacks is fetched from the dependency's remote.
+narrows everything to that dependency. Listings read the cache mirror. A commit or file the mirror
+lacks is fetched from the dependency's remote. Each listed hook carries a `defined:` link to its line
+in the dependency's `phora.toml` at the commit under review, built from the host's `web` template.
 
 | Flag | Meaning |
 | --- | --- |
@@ -493,6 +500,29 @@ phora rebuild-registry
 
 See also: [Files and state](#files-and-state), [Troubleshooting](#troubleshooting).
 
+### phora cache prune
+
+Remove content-store objects that no deployment records.
+
+```
+phora cache prune [-n | --dry-run]
+```
+
+An object survives when any registry under the state root records its hash, or when it was written
+in the last hour. A successful sync runs the same prune once a week. Deployed files are independent
+clones, so pruning never changes a deployment. A project whose `[paths] state` points elsewhere is
+invisible to this check; its next sync rewrites what it needs.
+
+| Flag | Meaning |
+| --- | --- |
+| `-n`, `--dry-run` | list what would be removed without removing it |
+
+```sh
+phora cache prune --dry-run
+```
+
+See also: [Files and state](#files-and-state).
+
 ## Configuration
 
 `phora.toml` sits in the project root. Unknown keys are an error in every table except `[vars]`,
@@ -505,12 +535,13 @@ which is free-form. [phora.example.toml](phora.example.toml) shows every section
 | `version` | integer | `1` | schema version; `1` is the only one |
 | `protocol` | `"https"` \| `"ssh"` | `"https"` | which remote template forge sources use |
 | `offers` | table | none | what this repository publishes to dependents; see [offers](#offers) |
+| `tools` | table | none | tools builds may run; see [tools](#tools) |
 
 ### paths
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `cache` | path | platform cache root | root for git mirrors, under `<cache>/git/` |
+| `cache` | path | platform cache root | root for git mirrors under `<cache>/git/` and file contents under `<cache>/content/` |
 | `state` | path | platform state root | root for per-project state, under `<state>/projects/` |
 
 A relative path resolves from the project root. The value is the root itself; no `phora` directory
@@ -552,6 +583,7 @@ editor = "nvim"
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `remote` | string \| `{ https, ssh }` | built in for shipped forges | URL templates; a string is the https template |
+| `web` | string | built in for shipped forges | file-at-commit link template for [phora trust](#phora-trust) listings and build errors |
 
 `github`, `gitlab`, `codeberg`, `sr.ht` and `bitbucket` are built in with https and ssh templates. A
 `[hosts.<name>]` table adds a forge or replaces a built-in's templates.
@@ -561,6 +593,7 @@ editor = "nvim"
 | `{path}` | the source's `repo`, as written |
 | `{owner}` | the first `/` segment of `repo` |
 | `{repo}` | everything after it |
+| `{commit}`, `{file}`, `{line}` | in `web` only: the pinned commit, the file and its line |
 
 ```toml
 [hosts.company]
@@ -616,14 +649,16 @@ exclude = ["**/*.bak"]
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `inputs` | array of source names | required | sources deployed under `$PHORA_INPUT/<name>` before the command runs |
+| `inputs` | array of source names | this repository | sources deployed under `$PHORA_INPUT/<name>` before the command runs; omitted, this repository's offer is deployed at `$PHORA_INPUT` |
+| `offer` | string | `"default"` | the offer transitive inputs, or this repository, are bound with |
+| `tool` | string | | run a granted tool instead of a command; see [tool builds](#tool-builds) |
 | `run` | string | | command run by `shell` |
 | `shell` | string | `"sh -c"` | shell for `run` |
 | `cmd` | array | | program and arguments run directly, instead of `run` |
 | `key` | command | | runs every sync; its stdout joins the build key |
 
 Set exactly one of `run` and `cmd`. An input must be a declared, non-build source; a transitive
-input arrives with its dependencies composed, as an import would deploy it.
+input arrives with its dependencies composed, as a binding would deploy it.
 
 The command runs in the project directory with `PHORA_INPUT`, `PHORA_OUTPUT` (an empty directory)
 and `PHORA_SOURCE`. Its stdout goes to stderr. On exit 0, phora commits everything under
@@ -648,6 +683,56 @@ path = "~/.claude"
 
 [targets.claude.sources]
 henia = { take = [{ "claude/" = "." }] }
+```
+
+#### Tool builds
+
+A build with `tool` runs a granted executable instead of a shell command. `inputs` and `offer` work
+as above.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `tool` | `"<identity>@<version>"` | | the tool to run; must be granted under [tools](#tools) |
+| `run` | string | | argv, split with shell-style quoting; `;`, `&`, `\|`, `$`, backticks, `<` and `>` are rejected |
+| `cmd` | array | | argv as written, instead of `run` |
+
+Set exactly one of `run` and `cmd`; `shell` and `key` are rejected. The first argument names one of
+the tool's executables, never a path. `{input}` and `{output}` expand to `$PHORA_INPUT` and
+`$PHORA_OUTPUT`. phora runs the resolved executable by absolute path, without a shell. The build key
+hashes the tool identity, version, argv and the executable's contents.
+
+A dependency can offer a tool build's output: a target binds the build and an offer selects that
+target. The consumer must grant the tool; an ungranted tool fails with the grant to add and a link to
+the build at the pinned commit. An offer that selects its own build's target is an error.
+
+```toml
+[tools."github:srnnkls/henia"]
+mise = true
+
+[sources.tropos]
+repo = "srnnkls/tropos"
+
+[sources.henia]
+build = { tool = "github:srnnkls/henia@0.1.0-alpha.4", run = "henia build {input}/tropos --output {output}", inputs = ["tropos"] }
+```
+
+See [GUIDE: tool builds](GUIDE.md#tool-builds) and [offered builds](GUIDE.md#offered-builds).
+
+### tools
+
+`[tools."<identity>"]` grants a tool that builds may run. Set exactly one key.
+
+| Key | Type | Meaning |
+| --- | --- | --- |
+| `mise` | `true` | resolve the build's pinned version with `mise bin-paths`, installing it with `mise install` when missing (never under `--frozen`) |
+| `path` | path | run this executable, whatever version the build pins |
+
+A grant that resolves to a shell or interpreter (`sh`, `bash`, `python`, `node`, `env`, …) is
+refused. `phora.local.toml` may add or override grants per key.
+
+```toml
+[tools."github:srnnkls/henia"]
+path = "~/bin/henia"
 ```
 
 ### targets
@@ -751,7 +836,7 @@ layout = { type = "prefixed", separator = "/" }
 | Key | Runs | On failure |
 | --- | --- | --- |
 | `[hooks] pre_sync` | first, before any source is read | the remaining entries still run, then the sync stops and the lock is left alone |
-| `[hooks] post_sync` | after your `on_change` hooks, before an imported dependency's `on_change` | the sync exits 1 |
+| `[hooks] post_sync` | after your `on_change` hooks, before a transitive dependency's `on_change` | the sync exits 1 |
 | `[hooks] when` | reserved; the only value is `"always"` | |
 | `[targets.<t>.hooks] pre_deploy` | once per target, before any target is written | see `pre_deploy_on_fail` |
 | `[targets.<t>.hooks] pre_deploy_on_fail` | `"abort"` (default) stops the sync; `"skip"` skips that target | |
@@ -759,7 +844,7 @@ layout = { type = "prefixed", separator = "/" }
 
 A sync runs in this order: `pre_sync`, [build sources](#build-sources), compose offers, resolve,
 plan, `pre_deploy`, apply, prune, your `on_change`, `post_sync`, and the trusted `on_change` hooks
-of imported dependencies. A failed `pre_sync` or an aborting `pre_deploy` skips everything after it,
+of transitive dependencies. A failed `pre_sync` or an aborting `pre_deploy` skips everything after it,
 `post_sync` included.
 
 A hook is a string run by `sh -c`, a table, or an array of them run in order with duplicates
@@ -771,11 +856,11 @@ program directly, with no shell.
 | `pre_sync` | `PHORA_TARGETS`: every configured target name, space-separated |
 | `pre_deploy` | `PHORA_TARGET`, `PHORA_TARGET_PATH` |
 | `on_change` | `PHORA_TARGET`; `PHORA_CHANGED` and `PHORA_CHANGED_NAMES`, newline-separated deployed paths and artifact names |
-| `on_change` from an import | `PHORA_TARGET`: the composed target path |
+| `on_change` from a dependency | `PHORA_TARGET`: the composed target path |
 
 Hooks inherit phora's environment and run in the project directory. `on_change` records success,
 so it skips a sync where nothing changed; removals alone don't trigger it. Hooks come from your own
-config files, and from an imported dependency once you approve its hooks with
+config files, and from a transitive dependency once you approve its hooks with
 [phora trust](#phora-trust).
 
 ```toml
@@ -813,8 +898,9 @@ See [GUIDE: history overlay](GUIDE.md#history-overlay).
 
 ### offers
 
-A repository meant to be a dependency publishes *offers* in its `phora.toml`. A consumer marks the
-source `transitive = true` and binds it; the binding composes one offer beneath the target's path.
+A repository meant to be a dependency publishes *offers* in its `phora.toml`. An offer is the
+repository's own files plus targets it selects from `[targets]`. A consumer marks the source
+`transitive = true` and binds it; the binding composes one offer beneath the target's path.
 
 ```toml
 # the dependency's phora.toml
@@ -822,36 +908,45 @@ source `transitive = true` and binds it; the binding composes one offer beneath 
 repo = "me/moira"
 root = "rules/fas"
 
+[targets.moira]
+path = "rules/fas/moira"
+sources = ["moira"]
+
 [offers.default]
 include = ["skills/**", "rules/fas/**"]
-targets.moira = { path = "rules/fas/moira", sources = ["moira"] }
 
 [offers.fas]
 root = "rules/fas"
-targets.moira = { path = "moira", sources = ["moira"] }
+targets = ["moira"]
 ```
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `root` | path | repository root | serve the offer's own files from this subdirectory |
+| `root` | path | repository root | serve own files and selected targets from this subdirectory |
 | `include` | array of globs | everything except `phora.toml` and `phora.lock` | own files to publish |
 | `exclude` | array of globs | `[]` | own files to withhold |
-| `targets` | table | none | targets placing dependencies, paths relative to the offer's output |
+| `targets` | array of target keys | every offerable target under `root` | targets to offer; `[]` offers own files only |
 
-- A binding without `offer` gets `default`, which must be declared. An undeclared offer is an error
-  that names the declared ones.
-- Every offer target path is excluded from the offer's own files.
+- `default` exists without a declaration: own files and every offerable target. Declaring it
+  overrides it. A binding without `offer` gets `default`; any other undeclared offer is an error that
+  names the declared ones.
+- A selected target lands at its path relative to `root`: `moira` sits at `rules/fas/moira` under
+  `default` and at `moira` under `fas`.
+- Every target path is excluded from the own files, selected or not.
+- A target is offerable when its path is a relative subpath and every source it binds can be
+  fetched or built by a consumer: no local `path`, no `deploy = "link"`, and no build except a
+  [tool build](#tool-builds) that reads this repository's offer. Naming a target that is not
+  offerable, or lies outside `root`, is an error.
+- Offer `root` must be relative; absolute, `~` and `..` are rejected.
 - Only sources bound by the chosen offer's targets are fetched.
-- Offer `root` and target paths must be relative; absolute, `~` and `..` are rejected.
-- A source inside the manifest cannot use `path = "."`, a local path, a `file://` remote, `build`
-  or `deploy = "link"`. The name `self` is reserved.
-- Top-level `[targets]` and `[hooks]` are never published; they are the repository's own config.
-- Composed bindings default to `collapse = false`. Hooks on offer targets run in the consumer only
-  after [phora trust](#phora-trust).
+- `phora.local.toml` cannot declare `[offers]`. A dependency's `[tools]` and top-level `[hooks]` are
+  never read by a consumer.
+- Composed bindings default to `collapse = false`. Hooks on offered targets run in the consumer
+  only after [phora trust](#phora-trust).
 - Nesting stops at depth 64.
 
 On the consumer side, a transitive source sets only its pin: `root`, `include` and `exclude` are
-rejected. All bindings of one source share one lock entry. The bound source may be a local checkout
+rejected. Bindings on the same ref share one lock entry. The bound source may be a local checkout
 with `deploy = "link"`; phora then reads its working tree and locks it as `resolved = "link"`.
 
 ```toml
@@ -868,17 +963,8 @@ path = "~/.config/fas/rules"
 sources.toolkit = { offer = "fas" }
 ```
 
-`take` on a transitive binding is relative to the offer's output; each entry reaches the offer target
-it falls under, and `**/` globs reach all of them.
-
-A repository can deploy its own offer's dependencies with the reserved source `self`, which deploys
-only the offer's targets:
-
-```toml
-[targets.vendor]
-path = "."
-sources.self = { offer = "default" }
-```
+`take` on a transitive binding is relative to the offer's output; each entry reaches the own files or
+the offered target it falls under, and `**/` globs reach all of them.
 
 See [GUIDE: transitive dependencies](GUIDE.md#transitive-dependencies).
 
@@ -916,6 +1002,7 @@ email = "me@work.example"
 | `XDG_CACHE_HOME` | cache root, when absolute; `[paths] cache` wins |
 | `XDG_STATE_HOME` | state root, when absolute; `[paths] state` wins |
 | `HOME` | expands `~` in paths |
+| `PHORA_LOCK_TIMEOUT` | default for `--lock-timeout`, in seconds |
 | `PHORA_NO_PROGRESS` | any non-empty value turns off live progress |
 | `CI` | any non-empty value turns off live progress |
 | `TERM=dumb` | turns off live progress |
@@ -934,6 +1021,7 @@ under [hooks](#hooks).
 | `phora.lock` | commit per source and ref, plus hook approvals; commit it |
 | `phora.local.lock` | pins for overlay sources |
 | `<cache>/git/` | one bare mirror per remote, shared by all projects; safe to delete |
+| `<cache>/content/` | each deployed file's bytes, reflinked into deployments; `phora cache prune` trims it |
 | `<state>/projects/<project>/` | this project's registry, journal and `state.lock` |
 
 | Root | Linux | macOS |
@@ -942,7 +1030,7 @@ under [hooks](#hooks).
 | state | `~/.local/state/phora` | `~/Library/Application Support/phora` |
 
 Precedence is `[paths]`, then `XDG_*`, then the platform default. A sync holds `state.lock` for
-the whole run, and a second sync of the same project exits 75 at once.
+the whole run. A second command that needs it waits up to `--lock-timeout`, then exits 75.
 
 ## Exit status
 
@@ -951,7 +1039,7 @@ the whole run, and a second sync of the same project exits 75 at once.
 | 0 | success |
 | 1 | an error; a failed hook or deploy; `verify` found a mismatch or stripped hooks |
 | 2 | invalid command line |
-| 75 | another phora process holds this project's state lock; retry |
+| 75 | another phora process held this project's state lock past `--lock-timeout`; retry |
 
 ## Troubleshooting
 
@@ -1007,10 +1095,12 @@ them.
 
 ```console
 $ phora sync
-error: lock error: another phora process is running for this project (state.lock held)
+phora: waiting for another phora process (state.lock held)
+error: lock error: another phora process is running for this project (state.lock held); gave up after 120s
 ```
 
-Wait for the other sync, then retry. On NFS, SMB or CIFS the lock is advisory and may not stop a
+The other process held the lock for longer than `--lock-timeout`, 120 seconds by default. Wait for
+it, then retry, or raise the bound with `--lock-timeout` or `PHORA_LOCK_TIMEOUT`. On NFS, SMB or CIFS the lock is advisory and may not stop a
 sync on another machine; phora prints a one-line warning when the state root is on one. If a shared
 home directory is mounted on several machines, don't sync the same project from two of them at
 once, or set `[paths] state` to machine-local storage.

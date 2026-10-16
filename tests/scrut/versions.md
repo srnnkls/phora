@@ -154,12 +154,10 @@ $ grep -c '\[\[sources\]\]' phora.lock
 1
 ```
 
-Note: prune removes the files it tracked, but the now-empty `stable/` and
-`canary/` identity directories stay behind — `rmdir` them if needed:
+Prune removes the files it tracked and the `stable/` and `canary/` identity
+directories they leave empty:
 
 ```scrut
 $ find shell-integration -mindepth 1 -maxdepth 1 | LC_ALL=C sort
-shell-integration/canary
 shell-integration/shellkit
-shell-integration/stable
 ```

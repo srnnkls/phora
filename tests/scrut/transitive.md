@@ -2,11 +2,11 @@
 
 A source can be more than a flat bag of artifacts — it can be a phora project in
 its own right, shipping a `phora.toml` that pulls in further sources and lays
-them out. That is a *transitive dependency*: mark it `transitive = true`, import
-it into a target, and phora composes the dependency's own targets into your
-workspace. A toolkit repo whose skill expects language guidelines vendored
+them out. That is a *transitive dependency*: mark it `transitive = true`, bind
+it from a target, and phora composes what the dependency offers, its own files
+and its targets, under that target. A toolkit repo whose skill expects language guidelines vendored
 underneath it can declare the guidelines repo as one of its sources, and a
-consumer that imports the toolkit gets the guidelines composed into place
+consumer that binds the toolkit gets the guidelines composed into place
 without ever naming them.
 
 A dependency's hooks are a different matter. They are discovered but never run
@@ -52,7 +52,7 @@ sync complete
 ```
 
 The leaf's `nvim` subtree landed under the dep's own target path, itself anchored
-at the consumer's import target — the consumer never had to know that layout.
+at the consumer's binding target — the consumer never had to know that layout.
 
 ```scrut
 $ find "$PWD/target-cfg" -type f | sort | normalize
@@ -76,7 +76,7 @@ and exits non-zero until the hook is trusted.
 
 ```scrut
 $ phora verify 2>&1
-mydeps: untrusted stripped hook * — deployed but not post-processed, artifact may be incomplete; run `phora trust mydeps` to approve (glob)
+nvim-kit: untrusted stripped hook * — deployed but not post-processed, artifact may be incomplete; run `phora trust nvim-kit` to approve (glob)
 [1]
 ```
 
@@ -88,7 +88,7 @@ records the hook pinned to its command and commit; off a terminal the command
 only lists.
 
 ```scrut
-$ phora trust mydeps --list 2>&1 | normalize | grep -E 'command:|env:|note:'
+$ phora trust nvim-kit --list 2>&1 | normalize | grep -E 'command:|env:|note:'
   command: touch "$HOME/dep-hook.sentinel"
   env: PHORA_TARGET=<composed target path>
   note: the hook inherits the FULL process environment, not only the PHORA_* variables
@@ -111,7 +111,7 @@ instead of the XDG roots, which keeps a checkout self-contained. A second
 consumer, isolated on its own `HOME`, declares them.
 
 ```scrut
-$ mkdir -p "$ROOT/pinned" && cd "$ROOT/pinned" && isolate_state && map_insteadof https://github.com/mock/leaf.git "$LEAF" && map_insteadof https://github.com/mock/dep.git "$DEP" && printf 'version = 1\n\n[paths]\ncache = ".phora/cache"\nstate = ".phora/state"\n\n[sources.mydeps]\ngit = "https://github.com/mock/dep.git"\ntransitive = true\n\n[targets.dotcfg]\npath = "out"\nimports = ["mydeps"]\n' > phora.toml && echo seeded
+$ mkdir -p "$ROOT/pinned" && cd "$ROOT/pinned" && isolate_state && map_insteadof https://github.com/mock/leaf.git "$LEAF" && map_insteadof https://github.com/mock/dep.git "$DEP" && printf 'version = 1\n\n[paths]\ncache = ".phora/cache"\nstate = ".phora/state"\n\n[sources.nvim-kit]\ngit = "https://github.com/mock/dep.git"\ntransitive = true\n\n[targets.xdg-config]\npath = "out"\nsources = ["nvim-kit"]\n' > phora.toml && echo seeded
 seeded
 ```
 
@@ -137,10 +137,10 @@ $ cd "$ROOT" && isolate_state && echo restored
 restored
 ```
 
-## `list` groups composed artifacts under the importing target
+## `list` groups composed artifacts under the binding target
 
 The composed artifacts are recorded under a namespaced composed target; `list`
-shows them under the importing `xdg-config`, labelled by import and dep target.
+shows them under the binding target `xdg-config`, labelled by binding and dep target.
 
 ```scrut
 $ phora list 2>&1 | normalize

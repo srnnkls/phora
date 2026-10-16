@@ -61,7 +61,9 @@ machine, including a downloaded tarball. That is why a URL source locks, deploys
 and verifies the same way a repository does. Every project on the machine shares
 the store: a repository is fetched once, only at the commits you pin and only for
 the files you select unless a binding asks for [history](#history-overlay), and
-each project gets a copy of its own slice.
+each project gets a copy of its own slice. Those copies are reflinked from a
+store of file contents, so on a copy-on-write filesystem every deployment of the
+same bytes shares its blocks.
 [Under the hood](#under-the-hood) shows how the store is laid out.
 
 ## Your first sync
@@ -377,6 +379,9 @@ source.
   download with the source's `include` and `exclude` instead.
 - A binding to a link source cannot set a ref.
 - A binding sets at most one ref.
+- A source no target or build references never deploys. `sync` and `preview`
+  name each such source on stderr, which catches a `phora.local.toml` override
+  aimed at a source nothing uses.
 - `phora bind <source> --to <target>` adds a binding, and `--as` and `--take`
   refine it. `phora unbind <identity> --from <target>` removes one by identity.
   Flags that change the offer, such as `--root`, edit the source.
@@ -546,6 +551,10 @@ that path. Without `--prune`, such a link stops the sync.
 A directory link that phora can no longer attribute to a binding stays put. So
 does a regular file or directory that replaced a managed link.
 
+After removing files, phora removes the directories that emptied, up to the
+target's path, deepest first. A directory still holding a tracked path or
+something phora didn't deploy stays, and the sync names it.
+
 If any artifact failed to deploy, sync skips pruning and says so.
 
 ### When upstream drops a file
@@ -574,9 +583,17 @@ phora: 2 orphaned record(s) with no config target — run `phora list --orphans`
 `phora list --orphans` shows where each orphan lives. The registry stores the
 target's path from deploy time, so phora can find the files after the config
 that named them is gone. `phora sync --prune` deletes them. That includes the
-files of an imported dependency once the target that imported it is removed:
+files of a transitive dependency once the target that bound it is removed:
 each is deleted only inside the path it was deployed to. If a path cannot be
 reconstructed, phora drops the record, leaves the files in place and warns.
+
+Renaming a target, folding it into another, or moving a binding between
+targets keeps the files where they were. When a destination's content still
+matches an orphaned or no-longer-wanted record, the same link or a clean copy,
+the sync adopts it under the new target and releases the old record. Locally
+modified content stays a conflict. While a target binds a transitive source,
+the records of what it composes aren't orphans; `phora list` shows them under
+that target.
 
 ### Checking the result
 
@@ -860,7 +877,7 @@ sources.output = { collapse = false }
 
 Before the command runs, phora deploys each input into a scratch directory at
 `$PHORA_INPUT/<name>`, with the input's offer applied. A transitive input
-arrives with its dependencies composed, the same way an import would deploy it.
+arrives with its dependencies composed, the same way a binding would deploy it.
 The command then writes into `$PHORA_OUTPUT`, which starts empty. It runs in the
 project directory, like a hook, and its stdout goes to stderr so `sync --json`
 stays readable.
@@ -885,19 +902,114 @@ stops the sync, and so does a failed `phora update` of the build source, which
 leaves the deployed files as they were. `--frozen` never runs a build: it deploys the locked output, or
 fails when the key no longer matches.
 
-Symlinks in the output are captured as the files they point to. Builds come
-only from your own config; a dependency's `phora.toml` can't declare one.
+Symlinks in the output are captured as the files they point to.
+
+### Tool builds
+
+A build can run a granted *tool* instead of its own command. `tool` names it as
+`<identity>@<version>`, and nothing goes through a shell: `cmd` is argv as
+written, and a string `run` is split with shell-style quoting but rejects `;`,
+`&`, `|`, `$`, backticks, `<` and `>`. `{input}` and `{output}` expand to
+`$PHORA_INPUT` and `$PHORA_OUTPUT`. You grant the tool under `[tools]`:
+
+```toml
+[tools."github:srnnkls/henia"]
+mise = true                    # or: path = "~/bin/henia"
+
+[sources.tropos]
+repo = "srnnkls/tropos"
+
+[sources.henia]
+build = { tool = "github:srnnkls/henia@0.1.0-alpha.4", run = "henia build {input}/tropos --output {output}", inputs = ["tropos"] }
+```
+
+A grant sets one route. `mise = true` resolves the pinned version through
+[mise](https://mise.jdx.dev), with an offline `mise bin-paths` lookup, and runs
+`mise install` when the pin is missing, never under `--frozen`. The command's
+first word must be an executable that version provides. `path = "…"` runs that
+file whatever version the build pins; compatibility is yours.
+
+phora runs the resolved file by absolute path, never through `PATH`, and
+refuses a grant that is a shell or interpreter (`sh`, `bash`, `python`,
+`node`, `env`, …), since its arguments could say anything. A tool build takes
+no `shell` or `key`: the key hashes the tool identity, its version, the argv
+and the executable's bytes, so swapping the binary or bumping the pin rebuilds.
+`phora.local.toml` can add or override grants.
+
+`offer` binds the transitive inputs with that offer. Without `inputs`, a build
+reads one of its own repository's offers, `default` unless `offer` names
+another, materialized at `$PHORA_INPUT` itself: the working tree plus the
+targets that offer composes.
+
+### Offered builds
+
+A dependency can offer what a build makes from it without handing you a shell
+command. Its build runs a tool over one of its own offers, a target places the
+output, and an offer selects that target:
+
+```toml
+# tropos/phora.toml
+[tools."github:srnnkls/henia"]   # for tropos's own syncs; consumers never read it
+mise = true
+
+[sources.harnesses]
+build = { tool = "github:srnnkls/henia@0.1.0-alpha.4", run = "henia build {input} --output {output}" }
+
+[targets.claude]
+path = "dist/claude"
+sources.harnesses = { take = [{ "claude/" = "." }] }
+
+[offers.claude]
+root = "dist/claude"
+targets = ["claude"]
+```
+
+```toml
+# your phora.toml
+[tools."github:srnnkls/henia"]
+mise = true
+
+[sources.tropos]
+host = "github"
+repo = "srnnkls/tropos"
+transitive = true
+
+[targets.claude]
+path = "~/.claude"
+sources.tropos = { offer = "claude" }
+```
+
+The dependency describes the build as data: tool, version and arguments. You
+decide whether that tool may run and how it resolves. phora never reads a
+dependency's `[tools]`, and never offers a build that runs its own command.
+Binding an offer whose tool you haven't granted fails with the grant to add and
+a link to the build at the pinned commit, in the same format as a
+[hook link](#trusting-a-dependencys-hooks).
+
+The build reads the dependency's pinned commit, or its linked working tree, with
+the named offer composed, at `$PHORA_INPUT`. It runs in a scratch directory
+instead of your project, and a symlink that resolves outside its input or
+output fails it. An offer never contains a build that reads it: tropos's
+`default` leaves out the `claude` target here, and an offer that selects its own
+build's target is a config error. The output locks and replays under `--frozen`
+like any build, and one build serves every offer and binding that places it.
+
+A grant vouches that the tool treats its arguments and input as data. A tool
+that executes code named in its arguments, through a plugin flag or an
+`--eval`, hands the dependency code execution.
 
 ## Transitive dependencies
 
 A *transitive dependency* is a source whose repository is itself a phora
-project. Its `phora.toml` declares *offers*: what it publishes, and where its
-own dependencies land. You bind the source like any other and pick an offer.
+project. Its `phora.toml` is its own config and also says what it publishes:
+an *offer*, made of the repository's own files plus the targets it selects. You
+bind the source like any other and pick an offer.
 
 [`srnnkls/tropos`](https://github.com/srnnkls/tropos) is a set of agent
 skills. Its `loqui` skill expects coding guidelines from a separate repository,
 [`srnnkls/loqui`](https://github.com/srnnkls/loqui), under
-`skills/loqui/reference/loqui/`. Tropos declares that in its default offer:
+`skills/loqui/reference/loqui/`. Tropos declares loqui as a source and a target
+that places it:
 
 ```toml
 # srnnkls/tropos: phora.toml
@@ -906,9 +1018,12 @@ host = "github"
 repo = "srnnkls/loqui"
 include = ["README.md", "languages/**", "resources/**"]
 
+[targets.loqui]
+path = "skills/loqui/reference/loqui"
+sources = ["loqui"]
+
 [offers.default]
 include = ["skills/**"]
-targets.loqui = { path = "skills/loqui/reference/loqui", sources = ["loqui"] }
 ```
 
 You mark tropos `transitive = true` and bind it:
@@ -926,41 +1041,57 @@ path = "~/.claude"
 sources = ["tropos"]
 ```
 
-`phora sync` fetches tropos, reads its manifest, fetches loqui, and deploys
+`phora sync` fetches tropos, reads its `phora.toml`, fetches loqui, and deploys
 tropos's skills plus loqui's files under
 `~/.claude/skills/loqui/reference/loqui/`. One binding brings in two
 repositories. `transitive = true` alone does nothing; a target has to bind the
-source.
+source. Inside tropos, a plain `phora sync` deploys loqui to
+`skills/loqui/reference/loqui` in the checkout, from the same file.
 
 ### Offers
 
-An offer has two parts:
+Every repository has a `default` offer without declaring one: all its own files
+and every offerable target. `[offers.<name>]` overrides `default` or adds
+another offer:
 
-- Its own files: `root`, `include` and `exclude` over the repository, like a
-  flat source's offer. Without `include`, every file except `phora.toml` and
-  `phora.lock`.
-- `targets`: ordinary targets that place dependencies. Their paths are relative
-  to the offer's output, which is your target's path.
-
-Every target path is excluded from the offer's own files, so a stale copy
-committed where a dependency lands never deploys beside it.
-
-A repository can publish several offers. Each one states where its
-dependencies land:
+- `root`, `include` and `exclude` shape the own files, like a flat source's
+  offer. Without `include`, every file except `phora.toml` and `phora.lock`.
+- `targets` selects targets by key. Omitted, it selects every offerable target
+  under `root`; `targets = []` offers own files only.
+- `root` re-roots the selected targets as well as the files.
 
 ```toml
+# srnnkls/tropos: phora.toml
+[sources.moira]
+host = "github"
+repo = "srnnkls/moira"
+root = "rules/fas"
+
+[targets.moira]
+path = "rules/fas/moira"
+sources = ["moira"]
+
 [offers.default]
 include = ["skills/**", "rules/fas/**"]
-targets.loqui = { path = "skills/loqui/reference/loqui", sources = ["loqui"] }
-targets.moira = { path = "rules/fas/moira", sources = ["moira"] }
 
 [offers.fas]
 root = "rules/fas"
-targets.moira = { path = "moira", sources = ["moira"] }
+targets = ["moira"]
 ```
 
-A binding picks one with `offer`; without it, the binding gets `default`,
-which must be declared:
+Under `default`, moira lands at `rules/fas/moira`; under `fas`, at `moira`.
+Every target path is cut from the offer's own files, selected or not, so a
+committed copy of what a target deploys never rides along.
+
+A target is offerable when its path is relative to the repository and a
+consumer can fetch or build every source it binds: no local `path`, no
+`deploy = "link"`, and no build that runs its own command (see
+[offered builds](#offered-builds)). A target like `~/.claude` stays out of
+`default`. Naming one in `targets` is a config error, and so is naming a target
+outside the offer's `root`. Offers belong to the committed `phora.toml`;
+`phora.local.toml` can't declare them.
+
+A binding picks an offer with `offer`; without it, the binding gets `default`:
 
 ```toml
 [targets.fas-rules]
@@ -968,47 +1099,47 @@ path = "~/.config/fas/rules"
 sources.tropos = { offer = "fas" }
 ```
 
-Only sources the chosen offer binds are fetched; under `fas`, loqui is never
-cloned. All bindings of one source share its pin, so `~/.claude` and
-`fas-rules` deploy the same tropos commit, and `phora update tropos` moves both.
-
-Offers are all a repository publishes. Its top-level `[targets]` and `[hooks]`
-are its own config, for a `phora sync` run inside it. Only a repository meant
-to be a dependency declares `[offers]`.
+`phora bind tropos --to fas-rules --offer fas` writes the same binding. Only
+sources the chosen offer's targets bind are fetched; under `fas`, loqui is
+never cloned.
 
 ### Binding a transitive source
 
 Binding refinements apply:
 
 - `branch`, `tag` or `rev` pick the ref: `sources.tropos = { tag = "v2" }`.
+  Bindings on the same ref share one pin, so `~/.claude` and `fas-rules`
+  deploy the same tropos commit, and `phora update tropos` moves both.
 - `offer` picks the offer.
 - `take` subsets the offer's output, with paths relative to your target, as on
-  a flat binding: `take = ["skills/gestalt/**"]`. Each entry reaches the
-  dependency target it falls under; `**/` globs reach all of them.
-- `collapse` applies to every composed binding. Composed bindings default to
-  `collapse = false`.
+  a flat binding: `take = ["skills/gestalt/**"]`. Each entry reaches the own
+  files or the offered target it falls under; `**/` globs reach all of them.
+- `collapse` applies to everything the offer composes. Composed bindings
+  default to `collapse = false`.
 - An alias binds a second offer into the same target:
   `sources.fas = { source = "tropos", offer = "fas" }`.
 
 `history` and `template` are rejected on a transitive binding, and `offer` on a
 flat one. A transitive source cannot set `root`, `include` or `exclude`; its
-offers are the manifest's.
+offers are the repository's to declare.
 
 ### How a dependency composes
 
-Your target's path is the *anchor*. Each target of the chosen offer is joined
-under it, and that target's own layout applies. You choose where the offer
-lands; the offer chooses its shape.
+Your target's path is the *anchor*. The offer's own files land at the anchor,
+and each offered target at its path relative to the offer's `root`, joined
+under it. That target's own layout applies. You choose where the offer lands;
+the offer chooses its shape.
 
 Every dependency keeps its sources to itself. If you and tropos both define
-`loqui`, each serves its own targets. An offer target can bind another
+`loqui`, each serves its own targets. An offered target can bind another
 transitive source, up to 64 levels deep, and a repository reached twice is
-fetched once. If two targets of one offer resolve to the same path, the sync
-stops and names it.
+fetched once. If two offered targets resolve to the same path, the sync stops
+and names it.
 
-A dependency's files and its manifest share one pin. `phora sync` keeps it,
+A dependency's files and its `phora.toml` share one pin. `phora sync` keeps it,
 `phora update tropos --fast-forward` advances it and removes what the new commit
-dropped, and `phora sync --frozen` replays it from the cache.
+no longer offers, and `phora sync --frozen` replays it from the cache.
+Ownership survives updates and switches between offers that share a `root`.
 
 ### Developing a dependency in place
 
@@ -1021,40 +1152,24 @@ path = "~/projects/tropos"
 deploy = "link"
 ```
 
-phora now reads the manifest and the offer's own files from the working tree,
-uncommitted files included, and deploys those files as symlinks into it. It
-writes nothing into the checkout. The lock records it as `resolved = "link"`,
+phora now reads the `phora.toml` and the offer's own files from the working
+tree, uncommitted files included, and deploys those files as symlinks into it.
+It writes nothing into the checkout. The lock records it as `resolved = "link"`,
 and `update` leaves it alone. Its remote dependencies still lock and update at
-pinned commits. Link mode on a source inside a manifest is rejected.
+pinned commits. A target in the checkout that binds a linked source is never
+offered.
 
 Moving between a pin and a link keeps artifacts owned. One
 `phora sync --prune` swaps copies for links, or links for copies, and removes
 what only the other snapshot offered.
-
-### Deploying an offer's dependencies locally
-
-A repository can deploy its own offer's dependencies into its checkout by
-binding the reserved source `self`:
-
-```toml
-# tropos/phora.toml
-[targets.vendor]
-path = "."
-sources.self = { offer = "default" }
-```
-
-A `self` binding deploys only the offer's targets, never the offer's own files;
-those are the repository. To deploy the repository's own files elsewhere, bind
-it as a flat `path = "."` source. `self` takes no ref, `history` or `template`,
-and the offer's hooks don't run through it.
 
 ### Confinement
 
 A dependency's manifest is input you did not write, so its writes stay inside its
 anchor. phora rejects:
 
-- an offer `root` or target path that is absolute, starts with `~`, or climbs out
-  with `..`;
+- an offer `root`, or a target an offer names, whose path is absolute, starts
+  with `~`, or climbs out with `..`;
 - a write through a symlinked directory under the anchor;
 - a write into your `phora.toml`, `phora.local.toml`, their lock files, the
   project's `.git`, or phora's cache and state;
@@ -1085,6 +1200,13 @@ phora trust tropos --revoke            # drop every approval
 approved commit. For a new hook it lists the files you compose from the
 dependency. Both read from the cache, fetching a missing commit or file from
 the dependency's remote when the cache lacks it.
+
+Each listed hook links to the line that declares it, at the commit under
+review: `defined: https://github.com/<owner>/<repo>/blob/<commit>/phora.toml#L<line>`.
+The link comes from the `web` template of the host the dependency's remote
+belongs to. The built-in forges ship one and `[hosts.<name>] web = "…"` sets
+your own. A remote that matches no host shows
+`<remote>/phora.toml:<line> at <commit>` instead.
 
 Approvals live in your `phora.lock` as `[[trusted_hooks]]`, each pinned to the
 command and the dependency commit. When the dependency moves to any new commit,
@@ -1118,8 +1240,9 @@ phora writes four things:
 - `phora.local.lock`: pins for every source named in `phora.local.toml`,
   whether it declares the source or overrides one from `phora.toml`.
 - The cache: one mirror per repository, holding just the pinned commits and the
-  files you deploy from them, plus imported downloads and build outputs. You can
-  delete it; the next sync fetches the locked commits again and reruns builds.
+  files you deploy from them, plus imported downloads, build outputs and a
+  content store with each deployed file's bytes. You can delete it; the next
+  sync fetches the locked commits again and reruns builds.
 - The state directory: the registry of what landed where, with hashes. It is the
   only record of what phora wrote, so treat it like data.
 
@@ -1127,15 +1250,16 @@ Both directories follow the XDG conventions and can be moved with `[paths]` or
 environment variables. [Files and state](REFERENCE.md#files-and-state) lists the
 locations.
 
-Two phora runs in one project never write at once: the second exits with status
-`75`. An interrupted sync is finished or rolled back by the next run.
+Two phora runs in one project never write at once: the second waits for the
+first, by default up to 120 seconds, then exits with status `75`. An interrupted
+sync is finished or rolled back by the next run.
 
 ### Cache and state
 
-phora keeps two trees. The *cache root* holds regenerable git mirrors. The
-*state root* holds per-project records that can't be regenerated.
+phora keeps two trees. The *cache root* holds regenerable git mirrors and file
+contents. The *state root* holds per-project records that can't be regenerated.
 
-The cache root contains `git/`:
+The cache root contains `git/` and `content/`:
 
 ```
 <cache>/git/
@@ -1143,7 +1267,19 @@ The cache root contains `git/`:
   <mirror-key>.git.lock              per-mirror flock
   .<mirror-key>.staging-<pid>-<n>/   clone or import in progress
   .phora-download-<pid>-<n>.tmp      URL download in progress
+
+<cache>/content/
+  <xx>/<blake3>                      one file's bytes; a `.x` suffix when executable
+  .last-prune                        time of the last automatic prune
 ```
+
+`<xx>` is the first two hex characters of the hash. `phora cache prune` removes
+objects no registry under the state root records, skipping objects written in
+the last hour; `--dry-run` lists them. A successful sync runs the same prune
+once a week. Deployed files are independent clones, so a prune never changes a
+deployment. A project whose `[paths] state` points elsewhere is invisible to
+other projects' prunes, so its objects may be removed, and its next sync writes
+them again.
 
 The state root contains one directory per project:
 
@@ -1333,16 +1469,20 @@ naming the state root.
 
 Each build source runs through these steps:
 
-1. Build an input workspace: one target per input under a scratch directory,
-   importing a transitive input and binding any other with `collapse = false`.
+1. Build an input workspace under a scratch directory: one target per named
+   input, binding a transitive input with the build's `offer` and every input
+   with `collapse = false`. A build without `inputs` gets one target at the
+   scratch root, binding its own repository with that offer.
 2. Run the workspace pass over it with a private registry, overwriting and
    without hooks. Its lock entries join the run's lock, so inputs stay pinned.
 3. Hash the command, the `key` output and every materialized file into the build
-   key.
+   key. A tool build hashes the tool identity, version, argv and the resolved
+   executable's bytes in place of the command and `key`.
 4. If the lock holds an entry with that key and its commit is in the cache,
    reuse it. Otherwise, unless `--frozen`, run the command into an empty output
    directory and import the output as a synthetic commit into one shared build
-   mirror.
+   mirror. A tool build resolves its grant first, through `mise` or the granted
+   path, and runs the executable by absolute path.
 5. Delete the scratch directory.
 
 Build outputs share one mirror because their commits are content-addressed and
@@ -1416,8 +1556,12 @@ stays on one filesystem. For each leaf, staging:
 1. skips a destination with a `.git` path component, unless an `include` pattern
    has a `.git` segment or the binding is a history overlay;
 2. renders `*.tmpl` files with the effective vars;
-3. writes the bytes and sets the executable bit when the source had it and
-   `preserve_executable` is on. The file keeps the time it was written, as in a
+3. writes the bytes into the content store, unless an object with that hash is
+   already there, and reflinks the object into staging. Each clone is read back
+   against the committed bytes; an object that no longer holds them is rewritten,
+   and the sync warns with its path. Where the cache and the target can't clone,
+   the file is written directly. The executable bit is set when the source had it
+   and `preserve_executable` is on. The file keeps the time it was written, as in a
    git checkout, so a file updated by a sync is never older than build output
    made from its previous version;
 4. rejects a symlink unless `allow_symlinks` is on (the default for history
@@ -1526,8 +1670,11 @@ only that artifact.
 ### Locks
 
 - Per project: `sync`, `update`, `eject`, `uneject`, `rebuild-registry` and
-  `trust` take a non-blocking exclusive lock on `locks/state.lock` for the whole
-  command. If another process holds it, the command exits 75 (`EX_TEMPFAIL`). If
+  `trust` take an exclusive lock on `locks/state.lock` for the whole command.
+  If another process holds it, the command prints
+  `phora: waiting for another phora process (state.lock held)` once and retries
+  until `--lock-timeout` (or `PHORA_LOCK_TIMEOUT`, default 120 seconds) runs
+  out, then exits 75 (`EX_TEMPFAIL`); `0` fails at once. If
   the state root is on a network filesystem (NFS, SMB, CIFS, AFP, WebDAV),
   `sync` prints a one-line warning that the lock may not exclude other machines.
 - Per mirror: fetch, URL import, working-tree capture and history-overlay
@@ -1576,25 +1723,29 @@ phora walks bindings of `transitive = true` sources one at a time, before
 resolution:
 
 1. Resolve the dependency and read its `phora.toml` at that commit. Only
-   `[sources]`, `[offers]` and the offers' per-target hooks are kept; top-level
-   targets, trust fields and the global `[hooks]` are dropped.
-2. Pick the binding's offer, `default` unless it names another. Its own files
-   become a reserved source named `self` with a target at the offer root; every
-   offer target path is excluded from them.
+   `[sources]`, `[targets]` with their per-target hooks, and `[offers]` are
+   kept; `[tools]`, trust fields and the global `[hooks]` are dropped.
+2. Resolve the binding's offer, `default` unless it names another; an
+   undeclared `default` offers own files and every offerable target. The own
+   files become a namespaced source with a target at the anchor; every target
+   path is excluded from them. Each selected target keeps its path relative to
+   the offer's `root`.
 3. Key the download as a *fetch node*: normalized URL, ref and commit. Two paths
    to the same node fetch once.
 4. Key its use as an *instance*: parent, binding identity and anchor target. The
    same node bound twice is two instances with separate names, hooks and
    confinement. The instance key leaves out the commit and the offer, so
    ownership survives updates, links and offer switches.
-5. Compose each offer target as a synthetic target at
-   `<anchor path>/<offer target path>`, named `<instance>%<offer>%<target>`.
-   Two composed targets with one destination are an error.
-6. Recurse into offer targets that bind transitive sources, up to depth 64.
+5. Compose each offered target as a synthetic target at
+   `<anchor path>/<placed target path>`, named `<instance>%<offer>%<target>`.
+   Two composed targets with one destination are an error. An offered build
+   becomes a build source reading the dependency's own offer, after its tool is
+   checked against your `[tools]`.
+6. Recurse into offered targets that bind transitive sources, up to depth 64.
 
-Offer roots and target paths must be relative subpaths. Inner sources can't use
-a local path, `file://` remote or `deploy = "link"`; the bound source itself can
-be a local checkout or a link.
+Offer roots and offered target paths must be relative subpaths. Inner sources
+can't use a local path, `file://` remote or `deploy = "link"`; the bound source
+itself can be a local checkout or a link.
 
 Every composed write is confined to its anchor. It is also kept out of a
 protected set: the project's `phora.toml`, `phora.local.toml`, `phora.lock`,
