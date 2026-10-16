@@ -5,6 +5,100 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3](https://github.com/srnnkls/phora/compare/v0.4.2...v0.4.3) - 2026-10-15
+
+### Bug Fixes
+
+- *(state)* Wait for a held state.lock up to a deadline ([#136](https://github.com/srnnkls/phora/pull/136))
+
+[0.4.3]: https://github.com/srnnkls/phora/compare/v0.4.2...v0.4.3
+
+## [0.4.2](https://github.com/srnnkls/phora/compare/v0.4.1...v0.4.2) - 2026-10-05
+
+### Bug Fixes
+
+- *(sync)* Remove directories emptied by pruned artifacts ([#133](https://github.com/srnnkls/phora/pull/133))
+
+[0.4.2]: https://github.com/srnnkls/phora/compare/v0.4.1...v0.4.2
+
+## [0.4.1](https://github.com/srnnkls/phora/compare/v0.4.0...v0.4.1) - 2026-10-01
+
+### Bug Fixes
+
+- *(cli)* Eject and uneject a target declared in phora.local.toml ([#131](https://github.com/srnnkls/phora/pull/131))
+
+[0.4.1]: https://github.com/srnnkls/phora/compare/v0.4.0...v0.4.1
+
+## [0.4.0](https://github.com/srnnkls/phora/compare/v0.3.3...v0.4.0) - 2026-10-01
+
+### Breaking Changes
+
+- *(transitive)* A target binds a transitive source through `sources` and picks one of its offers with `offer`; the `imports` key and the target-level `[take]`/`[collapse]` tables are gone (a binding's `take`/`collapse` apply instead).
+- *(transitive)* A dependency publishes through `[offers]`: its top-level `[targets]` are offered by the implicit `default` offer when their paths are relative and their sources can be fetched; a `path = "."` source no longer publishes the repo's own files.
+- *(build)* A dependency build names a tool (`tool = "<identity>@<version>"`) that the consumer grants under `[tools]`; `phora.local.toml` cannot declare `[offers]`.
+
+### Features
+
+- *(build)* Offer builds that run a consumer-granted tool ([#130](https://github.com/srnnkls/phora/pull/130))
+- *(transitive)* Bind transitive sources and select offered targets by key ([#129](https://github.com/srnnkls/phora/pull/129))
+
+### Bug Fixes
+
+- *(sync)* Adopt the clean orphan when a stale one shares its destination ([#128](https://github.com/srnnkls/phora/pull/128))
+
+[0.4.0]: https://github.com/srnnkls/phora/compare/v0.3.3...v0.4.0
+
+## [0.3.3](https://github.com/srnnkls/phora/compare/v0.3.2...v0.3.3) - 2026-09-30
+
+### Bug Fixes
+
+- *(sync)* Adopt bindings moved between live targets at their destinations ([#123](https://github.com/srnnkls/phora/pull/123))
+- *(cli)* List composed import records under their importing target ([#122](https://github.com/srnnkls/phora/pull/122))
+
+[0.3.3]: https://github.com/srnnkls/phora/compare/v0.3.2...v0.3.3
+
+## [0.3.2](https://github.com/srnnkls/phora/compare/v0.3.1...v0.3.2) - 2026-09-30
+
+### Features
+
+- *(config)* Warn when a source is bound by no target, import, or build ([#117](https://github.com/srnnkls/phora/pull/117))
+
+### Bug Fixes
+
+- *(transitive)* Apply the importing source's offer to its composed package ([#121](https://github.com/srnnkls/phora/pull/121))
+- *(sync)* Adopt orphaned records at restructured targets' destinations ([#120](https://github.com/srnnkls/phora/pull/120))
+- *(offer)* Match a slash pattern without trailing slash as a directory too ([#116](https://github.com/srnnkls/phora/pull/116))
+
+[0.3.2]: https://github.com/srnnkls/phora/compare/v0.3.1...v0.3.2
+
+## [0.3.1](https://github.com/srnnkls/phora/compare/v0.3.0...v0.3.1) - 2026-09-30
+
+### Features
+
+- *(cache)* Prune content-store objects no deployment records ([#114](https://github.com/srnnkls/phora/pull/114))
+- *(sync)* Verify every content-store clone against its bytes ([#113](https://github.com/srnnkls/phora/pull/113))
+- *(sync)* Reflink copy deployments from a content store ([#112](https://github.com/srnnkls/phora/pull/112))
+- *(source)* Build sources replace prepare targets ([#104](https://github.com/srnnkls/phora/pull/104))
+- *(history)* Eject a history overlay into a standalone clone ([#101](https://github.com/srnnkls/phora/pull/101))
+
+### Bug Fixes
+
+- *(sync)* Keep a shadowed pin at its prior lock position ([#111](https://github.com/srnnkls/phora/pull/111))
+- *(sync)* Keep shared pins for locally overridden sources ([#110](https://github.com/srnnkls/phora/pull/110))
+- *(sync)* Deploy history checkouts verbatim ([#109](https://github.com/srnnkls/phora/pull/109))
+- *(source)* Keep credential helpers from prompting without a terminal ([#107](https://github.com/srnnkls/phora/pull/107))
+- *(source)* Pass configured credential username to helpers ([#106](https://github.com/srnnkls/phora/pull/106))
+- *(sync)* --force overwrites without re-resolving sources ([#102](https://github.com/srnnkls/phora/pull/102))
+- *(sync)* Deploy files with their write time ([#103](https://github.com/srnnkls/phora/pull/103))
+- *(history)* Make overlays read-only and close git race windows ([#100](https://github.com/srnnkls/phora/pull/100))
+
+### Performance
+
+- *(source)* Fetch sliced mirrors without blobs and backfill selected files ([#99](https://github.com/srnnkls/phora/pull/99))
+- *(source)* Clone mirrors as depth-1 slices unless a binding needs history ([#98](https://github.com/srnnkls/phora/pull/98))
+
+[0.3.1]: https://github.com/srnnkls/phora/compare/v0.3.0...v0.3.1
+
 ## [0.3.0](https://github.com/srnnkls/phora/compare/v0.2.0...v0.3.0) - 2026-09-24
 
 ### Features
