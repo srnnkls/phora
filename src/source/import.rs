@@ -231,41 +231,74 @@ pub(super) fn import_tree(
     url: &str,
     entries: &[super::archive::ExtractedEntry],
 ) -> Result<String> {
+    with_import_mirror(git_dir, url, |repo| {
+        let mut root = ImportDir::default();
+        for entry in entries {
+            let oid = write_blob(repo, url, &entry.data)?;
+            root.insert(&entry.path, to_gix_entry_kind(entry.kind), oid)?;
+        }
+        write_import(repo, url, &root)
+    })
+}
+
+pub(super) fn import_captured(
+    git_dir: &Path,
+    url: &str,
+    entries: &[super::worktree::CapturedEntry],
+) -> Result<(String, Vec<gix::ObjectId>)> {
+    with_import_mirror(git_dir, url, |repo| {
+        let mut root = ImportDir::default();
+        let mut oids = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let oid = if let Some(oid) = entry.cached.filter(|oid| repo.has_object(oid)) {
+                oid
+            } else {
+                let data = std::fs::read(&entry.absolute).map_err(|e| {
+                    SourceError::Source(format!("read {}: {e}", entry.absolute.display()))
+                })?;
+                write_blob(repo, url, &data)?
+            };
+            root.insert(&entry.path, to_gix_entry_kind(entry.kind), oid)?;
+            oids.push(oid);
+        }
+        Ok((write_import(repo, url, &root)?, oids))
+    })
+}
+
+fn with_import_mirror<T>(
+    git_dir: &Path,
+    url: &str,
+    write: impl FnOnce(&gix::Repository) -> Result<T>,
+) -> Result<T> {
     let mirror = mirror_path(git_dir, url);
 
     if mirror.exists() {
         let repo = gix::open(&mirror)
             .map_err(|e| SourceError::Source(format!("open mirror {url}: {e}")))?;
-        return write_import(&repo, url, entries);
+        return write(&repo);
     }
 
     std::fs::create_dir_all(git_dir)
         .map_err(|e| SourceError::Source(format!("create git dir for {url}: {e}")))?;
     let staging = MirrorStaging::create(git_dir, url);
-    let commit = {
+    let written = {
         let repo = gix::init_bare(&staging.path)
             .map_err(|e| SourceError::Source(format!("init mirror {url}: {e}")))?;
-        write_import(&repo, url, entries)?
+        write(&repo)?
     };
     staging.commit_to(&mirror, url)?;
-    Ok(commit)
+    Ok(written)
 }
 
-fn write_import(
-    repo: &gix::Repository,
-    url: &str,
-    entries: &[super::archive::ExtractedEntry],
-) -> Result<String> {
-    let mut root = ImportDir::default();
-    for entry in entries {
-        let oid = repo
-            .write_blob(&entry.data)
-            .map_err(|e| SourceError::Source(format!("write blob for {url}: {e}")))?
-            .detach();
-        root.insert(&entry.path, to_gix_entry_kind(entry.kind), oid)?;
-    }
+fn write_blob(repo: &gix::Repository, url: &str, data: &[u8]) -> Result<gix::ObjectId> {
+    Ok(repo
+        .write_blob(data)
+        .map_err(|e| SourceError::Source(format!("write blob for {url}: {e}")))?
+        .detach())
+}
 
-    let root_oid = write_import_tree(repo, &root, url)?;
+fn write_import(repo: &gix::Repository, url: &str, root: &ImportDir) -> Result<String> {
+    let root_oid = write_import_tree(repo, root, url)?;
 
     let signature = gix::actor::Signature {
         name: IMPORT_NAME.into(),
