@@ -9990,6 +9990,41 @@ impl SourceStore for CountingRouter {
 }
 
 #[test]
+fn take_renames_a_single_file_url_source_as_it_lands() {
+    let server = UrlTarServer::spawn(vec![b"%PDF-1.4 not an archive\n".to_vec()]);
+    let git_dir = TempDir::new().expect("git dir");
+    let state_dir = TempDir::new().expect("state dir");
+    let registry = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
+    let backend = CountingRouter::new(git_dir.path().to_path_buf());
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.paper]\nurl = \"{}\"\n\n\
+         [targets.dest]\npath = \"{}\"\n\
+         [targets.dest.sources]\npaper = {{ take = [{{ \"pkg-1.0.tar.gz\" = \"paper.pdf\" }}] }}\n",
+        server.url,
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("url source with a take rename parses");
+    cfg.validate()
+        .expect("`take` on a url source subsets and renames its imported files like any source");
+
+    let out = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+        .expect("sync of a renamed url source deploys");
+    assert!(!out.had_failures, "renamed url sync must succeed");
+
+    assert_eq!(
+        std::fs::read(td.target_path().join("paper.pdf")).expect("renamed file deployed"),
+        b"%PDF-1.4 not an archive\n",
+        "the url's single file must land under its `take` rename"
+    );
+    assert!(
+        !td.target_path().join("pkg-1.0.tar.gz").exists(),
+        "the url basename must not also deploy alongside the rename"
+    );
+}
+
+#[test]
 fn second_sync_of_unchanged_url_is_a_noop() {
     let server = UrlTarServer::spawn(vec![editor_tar_gz(b"-- v1\n")]);
     let git_dir = TempDir::new().expect("git dir");
