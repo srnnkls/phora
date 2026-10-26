@@ -780,7 +780,7 @@ fn no_hosts() -> BTreeMap<String, Host> {
 }
 
 fn parse(input: &str) -> AddTarget {
-    parse_add_url(input, &no_hosts()).unwrap_or_else(|e| panic!("parse `{input}`: {e}"))
+    parse_add_url(input, &no_hosts(), &|_| true).unwrap_or_else(|e| panic!("parse `{input}`: {e}"))
 }
 
 #[test]
@@ -1097,7 +1097,7 @@ fn custom_host_domain_shorthand_maps_to_symbolic_custom_host() {
             .expect("company host present"),
         );
 
-    let parsed = parse_add_url("git.company.com/owner/repo", &hosts)
+    let parsed = parse_add_url("git.company.com/owner/repo", &hosts, &|_| true)
         .expect("custom host shorthand resolves");
 
     assert_eq!(
@@ -1123,6 +1123,92 @@ fn custom_host_domain_shorthand_maps_to_symbolic_custom_host() {
     );
 }
 
+fn parse_download(input: &str) -> AddTarget {
+    parse_add_url(input, &no_hosts(), &|_| false).unwrap_or_else(|e| panic!("parse `{input}`: {e}"))
+}
+
+#[test]
+fn https_url_that_serves_no_git_becomes_a_url_source() {
+    let parsed = parse_download("https://arxiv.org/pdf/2402.01030v4");
+    assert_eq!(
+        parsed.url.as_deref(),
+        Some("https://arxiv.org/pdf/2402.01030v4")
+    );
+    assert!(
+        parsed.git.is_none(),
+        "a download must not become a git remote, got {:?}",
+        parsed.git
+    );
+    assert_eq!(parsed.name, "2402.01030v4");
+}
+
+#[test]
+fn forge_release_asset_becomes_a_url_source() {
+    let url =
+        "https://github.com/junegunn/fzf/releases/download/v0.55.0/fzf-0.55.0-linux_amd64.tar.gz";
+    let parsed = parse_download(url);
+    assert_eq!(parsed.url.as_deref(), Some(url));
+    assert!(parsed.git.is_none());
+    assert_eq!(parsed.name, "fzf-0.55.0-linux_amd64.tar.gz");
+}
+
+#[test]
+fn url_source_name_ignores_query_and_fragment() {
+    let url = "https://example.com/files/report.pdf?download=1#page=2";
+    let parsed = parse_download(url);
+    assert_eq!(parsed.url.as_deref(), Some(url), "the url is kept verbatim");
+    assert_eq!(parsed.name, "report.pdf");
+}
+
+#[test]
+fn git_shaped_https_urls_skip_the_probe() {
+    let refuse_probe =
+        |url: &str| -> bool { panic!("`{url}` is git by shape and must not be probed") };
+    for (input, remote) in [
+        (
+            "https://git.company.com/team/proj.git",
+            "https://git.company.com/team/proj.git",
+        ),
+        (
+            "https://github.com/owner/repo",
+            "https://github.com/owner/repo.git",
+        ),
+        (
+            "https://example.com/company/configs/tree/main/editor",
+            "https://example.com/company/configs.git",
+        ),
+    ] {
+        let parsed = parse_add_url(input, &no_hosts(), &refuse_probe)
+            .unwrap_or_else(|e| panic!("parse `{input}`: {e}"));
+        assert_eq!(parsed.git.as_deref(), Some(remote), "input `{input}`");
+        assert!(parsed.url.is_none(), "input `{input}`");
+    }
+}
+
+#[test]
+fn https_url_that_serves_git_stays_a_literal_git_remote() {
+    let parsed = parse("https://git.company.com/team/proj");
+    assert_eq!(
+        parsed.git.as_deref(),
+        Some("https://git.company.com/team/proj.git")
+    );
+    assert!(parsed.url.is_none());
+}
+
+#[test]
+fn ssh_urls_are_never_probed() {
+    let parsed = parse_add_url(
+        "ssh://git@git.company.com/team/proj",
+        &no_hosts(),
+        &|url: &str| -> bool { panic!("ssh url `{url}` must not be probed") },
+    )
+    .expect("ssh url parses");
+    assert_eq!(
+        parsed.git.as_deref(),
+        Some("ssh://git@git.company.com/team/proj.git")
+    );
+}
+
 // insert_source
 
 const ADD_BASE: &str =
@@ -1135,12 +1221,30 @@ fn lit(git: &str, branch: Option<&str>) -> AddTarget {
         host: None,
         repo: None,
         path: None,
+        url: None,
         protocol: None,
         branch: branch.map(str::to_owned),
         root: None,
         include: Vec::new(),
         exclude: Vec::new(),
     }
+}
+
+#[test]
+fn insert_source_writes_a_download_as_a_url_source() {
+    let source = parse_download("https://arxiv.org/pdf/2402.01030v4");
+    let out = insert_source(ADD_BASE, "paper", &source, None).expect("insert url source");
+
+    let cfg = Config::parse(&out).expect("inserted text is valid phora.toml");
+    let paper = cfg.sources.get("paper").expect("paper source added");
+    assert_eq!(
+        paper.url.as_deref(),
+        Some("https://arxiv.org/pdf/2402.01030v4")
+    );
+    assert!(
+        paper.git.is_none() && paper.host.is_none() && paper.repo.is_none(),
+        "a url source declares only `url`, got:\n{out}"
+    );
 }
 
 #[test]
@@ -1434,7 +1538,7 @@ fn colon_alias_splits_extra_path_into_root() {
 
 #[test]
 fn colon_alias_empty_host_errors() {
-    let err = parse_add_url(":owner/repo", &no_hosts())
+    let err = parse_add_url(":owner/repo", &no_hosts(), &|_| true)
         .expect_err("`:owner/repo` has an empty host and must be rejected");
     assert!(
         err.to_string().contains(":owner/repo"),
@@ -1444,7 +1548,7 @@ fn colon_alias_empty_host_errors() {
 
 #[test]
 fn colon_alias_empty_path_errors() {
-    let err = parse_add_url("github:", &no_hosts())
+    let err = parse_add_url("github:", &no_hosts(), &|_| true)
         .expect_err("`github:` has an empty path and must be rejected");
     assert!(
         err.to_string().contains("github:"),

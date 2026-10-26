@@ -174,6 +174,7 @@ phora add github:srnnkls/tropos             # colon alias -> host = "github"
 phora add gitlab:group/repo                 # any built-in forge (alias caps at owner/repo)
 phora add github.com/me/dotfiles            # domain shorthand -> host = "github"
 phora add https://github.com/me/dotfiles.git  # scheme/scp URLs stay literal (git = "…")
+phora add https://arxiv.org/pdf/2402.01030v4   # an https URL that serves no git repo -> url = "…"
 phora add git@github.com:me/dotfiles.git --tag v1.2
 # Deep GitLab subgroups go in the config `repo` field (repo = "group/sub/proj"),
 # not the colon alias (segments past owner/repo become `root`).
@@ -784,6 +785,13 @@ url = "https://github.com/junegunn/fzf/releases/download/0.55.0/fzf-0.55.0-linux
 digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 include = ["fzf"]
 ```
+
+Adding. `phora add <https-url>` declares a url source unless the URL is a git
+remote. A `.git` repo segment, a built-in or configured forge's `owner/repo`, or a
+`…/tree/<ref>` URL marks a git remote by shape. Any other URL is checked with one
+git smart-HTTP discovery request (`<url>/info/refs?service=git-upload-pack`): an
+upload-pack advertisement or a `401` keeps it a git remote, anything else makes it
+a url source. When no server answers, `add` notes it and keeps the git remote.
 
 Formats. tar, tar.gz/tgz, and zip, detected by content (magic bytes); a
 non-archive URL becomes a single file named from the URL basename.

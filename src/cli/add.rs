@@ -246,7 +246,16 @@ fn resolve_add_source(url: &str) -> Result<AddTarget> {
         return local_path_source(url);
     }
     let hosts = load_config().map(|c| c.hosts).unwrap_or_default();
-    parse_add_url(url, &hosts)
+    parse_add_url(url, &hosts, &probe_git_remote)
+}
+
+fn probe_git_remote(url: &str) -> bool {
+    crate::source::http::serves_git(url).unwrap_or_else(|e| {
+        eprintln!(
+            "note: could not tell whether `{url}` is a git remote or a download ({e}); adding it as a git remote"
+        );
+        true
+    })
 }
 
 fn local_path_source(url: &str) -> Result<AddTarget> {
@@ -263,6 +272,7 @@ fn local_path_source(url: &str) -> Result<AddTarget> {
         host: None,
         repo: None,
         path: Some(path),
+        url: None,
         protocol: None,
         branch: None,
         root: None,
@@ -296,6 +306,7 @@ fn resolve_local_source(url: &str, name: Option<String>) -> Result<(String, AddT
         host: None,
         repo: None,
         path: Some(path),
+        url: None,
         protocol: None,
         branch: None,
         root: None,
@@ -415,6 +426,9 @@ pub(super) fn insert_source_with_ref(
 }
 
 fn describe_source(source: &AddTarget) -> String {
+    if let Some(url) = &source.url {
+        return url.clone();
+    }
     match (&source.git, &source.host, &source.repo, &source.path) {
         (Some(git), ..) => git.clone(),
         (None, Some(host), Some(repo), _) => format!("{host}:{repo}"),
@@ -424,8 +438,8 @@ fn describe_source(source: &AddTarget) -> String {
 }
 
 /// A source derived from an `add` URL/shorthand, before name overrides. Either
-/// literal (`git` is `Some`), symbolic forge (`host`/`repo` are `Some`), or
-/// local path (`path` is `Some`).
+/// literal (`git` is `Some`), symbolic forge (`host`/`repo` are `Some`), local
+/// path (`path` is `Some`), or download (`url` is `Some`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddTarget {
     pub name: String,
@@ -433,6 +447,7 @@ pub struct AddTarget {
     pub host: Option<String>,
     pub repo: Option<String>,
     pub path: Option<String>,
+    pub url: Option<String>,
     pub protocol: Option<Protocol>,
     pub branch: Option<String>,
     pub root: Option<String>,
@@ -441,22 +456,68 @@ pub struct AddTarget {
 }
 
 /// Expands an `add` URL/shorthand into an [`AddTarget`] using the built-in
-/// forge registry overlaid by any host in `hosts`.
+/// forge registry overlaid by any host in `hosts`. An http(s) URL whose shape
+/// does not mark a git remote is one only when `serves_git` confirms it, and a
+/// download otherwise.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Config`] if the input cannot be parsed into owner/repo.
-pub fn parse_add_url(input: &str, hosts: &BTreeMap<String, Host>) -> Result<AddTarget> {
+/// Returns [`Error::Config`] if a git input cannot be parsed into owner/repo.
+pub fn parse_add_url(
+    input: &str,
+    hosts: &BTreeMap<String, Host>,
+    serves_git: &dyn Fn(&str) -> bool,
+) -> Result<AddTarget> {
+    let domains = domain_to_name(hosts);
     if is_scp_ssh(input) {
         return Ok(parse_scp_ssh(input));
     }
     if let Some((scheme, rest)) = split_scheme(input) {
+        if scheme != "ssh" && !is_git_shaped(rest, &domains) && !serves_git(input) {
+            return Ok(url_source(input));
+        }
         return parse_full_url(input, scheme, rest);
     }
     if let Some((host, path)) = input.split_once(':') {
         return parse_colon_alias(input, host, path);
     }
-    parse_shorthand(input, &domain_to_name(hosts))
+    parse_shorthand(input, &domains)
+}
+
+/// A `host/path` whose shape alone marks a git remote: a `.git` repo segment, a
+/// known forge's `owner/repo`, or an `owner/repo/tree/<ref>` browse URL.
+fn is_git_shaped(rest: &str, domains: &BTreeMap<String, String>) -> bool {
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let forge_repo = segments.len() == 2 && domains.contains_key(host);
+    let tree = matches!(segments.as_slice(), [_, _, "tree", _, ..]);
+    let dot_git = segments
+        .last()
+        .is_some_and(|segment| segment.strip_suffix(".git").is_some());
+    forge_repo || tree || dot_git
+}
+
+/// A download named from the URL's last path segment.
+fn url_source(url: &str) -> AddTarget {
+    let location = url.split(['?', '#']).next().unwrap_or(url);
+    let name = location
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(location);
+    AddTarget {
+        name: name.to_owned(),
+        git: None,
+        host: None,
+        repo: None,
+        path: None,
+        url: Some(url.to_owned()),
+        protocol: None,
+        branch: None,
+        root: None,
+        include: Vec::new(),
+        exclude: Vec::new(),
+    }
 }
 
 fn parse_colon_alias(input: &str, host: &str, path: &str) -> Result<AddTarget> {
@@ -496,6 +557,7 @@ fn symbolic_source(host: String, repo: &str, root: Option<String>) -> AddTarget 
         host: Some(host),
         repo: Some(repo.to_owned()),
         path: None,
+        url: None,
         protocol: None,
         branch: None,
         root,
@@ -542,6 +604,7 @@ fn literal_source(
         host: None,
         repo: None,
         path: None,
+        url: None,
         protocol: None,
         branch,
         root,

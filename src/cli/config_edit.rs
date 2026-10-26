@@ -24,6 +24,10 @@ pub(super) fn source_table(source: &AddTarget) -> Table {
         table["path"] = value(path.as_str());
         return table;
     }
+    if let Some(url) = &source.url {
+        table["url"] = value(url.as_str());
+        return table;
+    }
     if let Some(host) = &source.host {
         table["host"] = value(host.as_str());
     }
@@ -710,6 +714,7 @@ mod tests {
             host: None,
             repo: None,
             path: None,
+            url: None,
             protocol: None,
             branch: None,
             root: None,
@@ -725,6 +730,7 @@ mod tests {
             host: Some(host.to_owned()),
             repo: Some(repo.to_owned()),
             path: None,
+            url: None,
             protocol: None,
             branch: None,
             root: None,
@@ -740,6 +746,7 @@ mod tests {
             host: None,
             repo: None,
             path: Some(path.to_owned()),
+            url: None,
             protocol: None,
             branch: None,
             root: None,
