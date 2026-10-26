@@ -14,6 +14,7 @@ type Result<T> = std::result::Result<T, SourceError>;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const BODY_TIMEOUT: Duration = Duration::from_mins(5);
 const MAX_REDIRECTS: u32 = 10;
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Streams the body at `url` into `dest`, following redirects whose scheme is `https`,
 /// or `http` when the original `url` was itself `http`, up to [`MAX_REDIRECTS`] hops.
@@ -116,6 +117,39 @@ pub fn download(url: &str, dest: &Path) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Whether `url` answers git's smart-HTTP discovery as a git server: an upload-pack
+/// advertisement, or a `401` asking for credentials.
+///
+/// # Errors
+///
+/// Returns [`SourceError::Source`] when the discovery request gets no HTTP response.
+pub fn serves_git(url: &str) -> Result<bool> {
+    let agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(CONNECT_TIMEOUT))
+        .timeout_global(Some(PROBE_TIMEOUT))
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
+    let discovery = format!(
+        "{}/info/refs?service=git-upload-pack",
+        url.trim_end_matches('/')
+    );
+    let response = agent
+        .get(&discovery)
+        .call()
+        .map_err(|err| SourceError::Source(format!("GET {discovery} failed: {err}")))?;
+    if response.status() == http::StatusCode::UNAUTHORIZED {
+        return Ok(true);
+    }
+    let advertises = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|mime| mime.trim() == "application/x-git-upload-pack-advertisement");
+    Ok(response.status().is_success() && advertises)
 }
 
 fn scheme_of(location: &str) -> Option<&str> {
