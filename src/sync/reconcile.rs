@@ -52,6 +52,28 @@ pub fn reconcile<R>(
     Ok(ChangeSet { changes })
 }
 
+/// Turns the `Deploy` row of each cleanly relocated artifact into a `Relocate` row.
+pub(super) fn add_relocations(changeset: &mut ChangeSet, relocated: &BTreeSet<Key>) {
+    for change in &mut changeset.changes {
+        let SyncChange::Deploy {
+            target,
+            source,
+            artifact,
+        } = change
+        else {
+            continue;
+        };
+        if !relocated.contains(&(target.clone(), source.clone(), artifact.clone())) {
+            continue;
+        }
+        *change = SyncChange::Relocate {
+            target: std::mem::take(target),
+            source: std::mem::take(source),
+            artifact: std::mem::take(artifact),
+        };
+    }
+}
+
 pub(super) fn add_history_retirement_conflicts<R>(
     changeset: &mut ChangeSet,
     retirements: &[ObservedEntry<R>],

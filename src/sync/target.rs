@@ -160,6 +160,11 @@ fn change_key(change: &SyncChange) -> (String, String, String) {
             source,
             artifact,
         }
+        | SyncChange::Relocate {
+            target,
+            source,
+            artifact,
+        }
         | SyncChange::Overwrite {
             target,
             source,
@@ -427,7 +432,11 @@ fn applied_replacement(change: Option<&SyncChange>, outcome: Option<&ConflictOut
     change.is_none()
         || matches!(
             change,
-            Some(SyncChange::Deploy { .. } | SyncChange::Overwrite { .. })
+            Some(
+                SyncChange::Deploy { .. }
+                    | SyncChange::Relocate { .. }
+                    | SyncChange::Overwrite { .. }
+            )
         )
         || matches!(
             (change, outcome),
@@ -555,7 +564,10 @@ fn apply_reconciled(
     let writes = matches!(
         change,
         Some(
-            SyncChange::Deploy { .. } | SyncChange::Overwrite { .. } | SyncChange::Conflict { .. }
+            SyncChange::Deploy { .. }
+                | SyncChange::Relocate { .. }
+                | SyncChange::Overwrite { .. }
+                | SyncChange::Conflict { .. }
         )
     );
     if journal.refuses_writes() && writes {
@@ -592,7 +604,9 @@ fn apply_reconciled(
     };
 
     match change {
-        Some(SyncChange::Deploy { .. } | SyncChange::Overwrite { .. }) => {
+        Some(
+            SyncChange::Deploy { .. } | SyncChange::Relocate { .. } | SyncChange::Overwrite { .. },
+        ) => {
             let applied = match change {
                 Some(SyncChange::Overwrite { .. }) => AppliedChange::Overwritten {
                     target: run.target_name.to_owned(),

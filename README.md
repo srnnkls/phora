@@ -450,6 +450,10 @@ path = "~/.config/editor"
 nvim = { source = "dotfiles", take = ["nvim/**"] }
 ```
 
+Changing a target's `layout` or `path` moves its artifacts: the next `phora sync`
+deploys each one at its new destination and removes the previous copy, without
+`--prune`. A previous copy modified since deploy stays where it was, with a warning.
+
 Target sources are an explicit allow-list: `["a", "b"]` deploys those two,
 `[]` (or an omitted `sources` key) deploys nothing. Edit the list with `phora
 bind`/`phora unbind` rather than by hand; `bind` onto a target with no `sources`
@@ -522,11 +526,12 @@ matches nothing warns but does not fail. An omitted `take` takes the whole offer
 nvim = { source = "dotfiles", take = ["nvim/**", { "nvim/init.lua" = "init.lua" }] }
 ```
 
-Restriction. `take` (or any other refinement) on a binding backed by a `url` source
-is a config error — a url source has no offer to subset. `branch`/`tag`/`rev`
-on a binding backed by a `url` source or a `deploy = "link"` source are config
-errors too — a url has no ref to resolve, and a link source live-links a working
-tree rather than a pinned commit.
+Restriction. `branch`/`tag`/`rev` on a binding backed by a `url` source or a
+`deploy = "link"` source are config errors — a url has no ref to resolve, and a link
+source live-links a working tree rather than a pinned commit. `template` on a url
+binding is a config error too. `take` works on a url binding as on any other: it
+subsets an archive's files or renames a single downloaded file
+(`paper = { take = [{ "2402.01030v4.pdf" = "code-act.pdf" }] }`).
 
 Binding scope is rejected. `root`, `include`, `exclude`, and `map` are no longer
 binding keys: setting any of them on a `[targets.<t>.sources]` entry is a hard parse

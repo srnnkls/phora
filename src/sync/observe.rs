@@ -148,6 +148,83 @@ where
     Ok(retirements)
 }
 
+/// A desired artifact whose record still places it at an older destination, left behind by a
+/// `layout` or target `path` change. `clean` is observed before deploy, against the old record.
+pub(super) struct Relocation {
+    pub(super) record: ArtifactRecord,
+    pub(super) from: PathBuf,
+    pub(super) clean: bool,
+}
+
+impl Relocation {
+    pub(super) fn key(&self) -> (String, String, String) {
+        (
+            self.record.key.target.clone(),
+            self.record.key.source.clone(),
+            self.record.key.artifact.clone(),
+        )
+    }
+}
+
+pub(super) fn observe_relocations<R>(ctx: &DeployAll<'_, R>) -> Result<Vec<Relocation>>
+where
+    R: StateStore,
+{
+    let desired = super::reconcile::desired_keys(ctx.projection);
+    let mut relocations = Vec::new();
+    for record in ctx.records()? {
+        if target::is_composed_target(&record.key.target) {
+            continue;
+        }
+        let Some(target) = ctx.config.targets.get(&record.key.target) else {
+            continue;
+        };
+        let key = (
+            record.key.target.clone(),
+            record.key.source.clone(),
+            record.key.artifact.clone(),
+        );
+        if !desired.contains(&key) {
+            continue;
+        }
+        let Some(from) = super::prune::orphan_artifact_path(&record) else {
+            continue;
+        };
+        let to: PathBuf = target::record_artifact_path(target, &record)
+            .components()
+            .collect();
+        if from == to || std::fs::symlink_metadata(&from).is_err() {
+            continue;
+        }
+        let ejected = ctx.registry.ejections(&record.key.target)?;
+        let observation = inspect(
+            &from,
+            &record.key.source,
+            &record.commit,
+            &ejected,
+            ctx.registry,
+            &record.key,
+            None,
+        )?;
+        let clean = match observation {
+            ObservedArtifact::Managed(ManagedArtifact { condition, .. }) => matches!(
+                condition,
+                ManagedCondition::Clean
+                    | ManagedCondition::MetadataChangedButContentClean { .. }
+                    | ManagedCondition::Linked
+            ),
+            ObservedArtifact::Foreign(_) => false,
+            ObservedArtifact::Missing | ObservedArtifact::Ejected => continue,
+        };
+        relocations.push(Relocation {
+            record,
+            from,
+            clean,
+        });
+    }
+    Ok(relocations)
+}
+
 fn registry_only_records(
     remove_orphans: bool,
     list_all: impl FnOnce() -> Result<Vec<ArtifactRecord>>,

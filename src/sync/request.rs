@@ -221,6 +221,12 @@ pub enum SyncWarning {
         source: String,
         artifact: String,
     },
+    /// A relocated artifact's previous copy was modified, so it stays where it was.
+    RelocatedCopyKept {
+        source: String,
+        artifact: String,
+        path: PathBuf,
+    },
     CrossDeviceFallback {
         destination: PathBuf,
     },

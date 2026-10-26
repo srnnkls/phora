@@ -81,6 +81,12 @@ pub enum SyncChange {
         artifact: String,
         reason: RemovalReason,
     },
+    /// Deploys like `Deploy` at a new destination, then removes the clean copy left at the old one.
+    Relocate {
+        target: String,
+        source: String,
+        artifact: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

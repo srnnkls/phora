@@ -3903,6 +3903,211 @@ fn sync_with_prune_removes_orphan_files_and_record_but_keeps_current() {
 }
 
 #[test]
+fn layout_change_relocates_artifacts_and_removes_the_old_destination_without_prune() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let flat =
+        config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+    let first = sync(
+        &input(&flat, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("flat sync deploys");
+    let flat_dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+    assert!(
+        flat_dst.join("init.lua").exists(),
+        "flat layout deploys editor/init.lua"
+    );
+
+    let by_source = config_one_source_one_target(
+        "editor-src",
+        &fx.url,
+        "dest",
+        &td.target_path(),
+        "by-source",
+    );
+    let out = sync(
+        &input(&by_source, None, Some(first.base_lock), None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("by-source sync relocates");
+    assert!(!out.had_failures, "relocation must not fail");
+
+    let by_source_dst = td.artifact_dst(&by_source_layout(), "editor-src", "editor");
+    assert!(
+        by_source_dst.join("init.lua").exists(),
+        "the artifact must land at its by-source destination"
+    );
+    assert!(
+        !flat_dst.exists(),
+        "a layout change moves a clean artifact: its old flat destination {} must be removed \
+         without --prune, not stranded as an unmanaged copy",
+        flat_dst.display()
+    );
+    let record = fx
+        .registry
+        .artifact(&artifact_key("dest", "editor-src", "editor"))
+        .expect("registry read")
+        .expect("the relocated artifact keeps its record");
+    assert_eq!(
+        record.layout, "by-source",
+        "the record tracks the new layout"
+    );
+}
+
+#[test]
+fn layout_change_keeps_a_modified_previous_copy_and_warns() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let flat =
+        config_one_source_one_target("editor-src", &fx.url, "dest", &td.target_path(), "flat");
+    let first = sync(
+        &input(&flat, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("flat sync deploys");
+    let flat_dst = td.artifact_dst(&flat_layout(), "editor-src", "editor");
+    std::fs::write(flat_dst.join("init.lua"), b"-- local edit\n").expect("edit the deployed copy");
+
+    let by_source = config_one_source_one_target(
+        "editor-src",
+        &fx.url,
+        "dest",
+        &td.target_path(),
+        "by-source",
+    );
+    let request = SyncRequest {
+        base_config: &by_source,
+        local_config: None,
+        locks: LockSet {
+            base: Some(first.base_lock),
+            local: None,
+        },
+        options: SyncOptions {
+            source_policy: SourcePolicy::Locked,
+            conflict_policy: ConflictPolicy::Refuse,
+            prune_policy: PrunePolicy::KeepOrphans,
+            hook_policy: HookPolicy::All,
+            moved_pin_policy: MovedPinPolicy::Seal,
+            concurrency: Concurrency::default(),
+        },
+        resolver: None,
+        sink: progress::SILENT,
+        trust_prompt: None,
+    };
+    let report = sync(&request, &fx.backend, &fx.registry).expect("by-source sync relocates");
+
+    assert_eq!(
+        std::fs::read(flat_dst.join("init.lua")).expect("the edited copy survives"),
+        b"-- local edit\n",
+        "a modified previous copy must never be deleted by a relocation"
+    );
+    assert!(
+        td.artifact_dst(&by_source_layout(), "editor-src", "editor")
+            .join("init.lua")
+            .exists(),
+        "the artifact still deploys at its new destination"
+    );
+    assert!(
+        report.warnings.iter().any(|warning| matches!(
+            warning,
+            SyncWarning::RelocatedCopyKept { path, .. } if path == &flat_dst
+        )),
+        "keeping the modified copy must warn, naming its path; got {:?}",
+        report.warnings
+    );
+}
+
+#[test]
+fn layout_change_into_the_old_destination_removes_only_the_old_files() {
+    let fx = build_sync_fixture();
+    let td = TargetDir::new();
+    let flat = config_one_source_one_target("editor", &fx.url, "dest", &td.target_path(), "flat");
+    let first = sync(
+        &input(&flat, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("flat sync deploys");
+    let flat_dst = td.artifact_dst(&flat_layout(), "editor", "editor");
+
+    let by_source =
+        config_one_source_one_target("editor", &fx.url, "dest", &td.target_path(), "by-source");
+    sync(
+        &input(&by_source, None, Some(first.base_lock), None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("by-source sync relocates beneath the old destination");
+
+    let by_source_dst = td.artifact_dst(&by_source_layout(), "editor", "editor");
+    assert!(
+        by_source_dst.starts_with(&flat_dst),
+        "fixture: the new destination nests inside the old one"
+    );
+    assert!(
+        by_source_dst.join("init.lua").exists(),
+        "the relocated artifact nested under its old destination must survive the cleanup"
+    );
+    assert!(
+        !flat_dst.join("init.lua").exists(),
+        "the old copy's own files are removed around the nested new destination"
+    );
+}
+
+#[test]
+fn target_path_change_relocates_and_removes_the_old_copy() {
+    let fx = build_sync_fixture();
+    let old_root = TargetDir::new();
+    let new_root = TargetDir::new();
+    let before = config_one_source_one_target(
+        "editor-src",
+        &fx.url,
+        "dest",
+        &old_root.target_path(),
+        "flat",
+    );
+    let first = sync(
+        &input(&before, None, None, None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("first sync deploys");
+    let old_dst = old_root.artifact_dst(&flat_layout(), "editor-src", "editor");
+    assert!(old_dst.join("init.lua").exists());
+
+    let after = config_one_source_one_target(
+        "editor-src",
+        &fx.url,
+        "dest",
+        &new_root.target_path(),
+        "flat",
+    );
+    sync(
+        &input(&after, None, Some(first.base_lock), None, false),
+        &fx.backend,
+        &fx.registry,
+    )
+    .expect("second sync relocates");
+
+    assert!(
+        new_root
+            .artifact_dst(&flat_layout(), "editor-src", "editor")
+            .join("init.lua")
+            .exists(),
+        "the artifact lands under the new target path"
+    );
+    assert!(
+        !old_dst.exists(),
+        "the copy under the old target path is removed: {}",
+        old_dst.display()
+    );
+}
+
+#[test]
 fn sync_skips_prune_when_a_deploy_failed() {
     // A source with a failing artifact (sets had_failures) PLUS a seeded orphan.
     let (src, url) = {
@@ -9987,6 +10192,41 @@ impl SourceStore for CountingRouter {
     ) -> SourceResult<Vec<SourceDirectoryEntry>> {
         SourceStore::list_directory(&self.inner, snapshot, path)
     }
+}
+
+#[test]
+fn take_renames_a_single_file_url_source_as_it_lands() {
+    let server = UrlTarServer::spawn(vec![b"%PDF-1.4 not an archive\n".to_vec()]);
+    let git_dir = TempDir::new().expect("git dir");
+    let state_dir = TempDir::new().expect("state dir");
+    let registry = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
+    let backend = CountingRouter::new(git_dir.path().to_path_buf());
+    let td = TargetDir::new();
+    let toml = format!(
+        "version = 1\n\n\
+         [sources.paper]\nurl = \"{}\"\n\n\
+         [targets.dest]\npath = \"{}\"\n\
+         [targets.dest.sources]\npaper = {{ take = [{{ \"pkg-1.0.tar.gz\" = \"paper.pdf\" }}] }}\n",
+        server.url,
+        td.target_path().display(),
+    );
+    let cfg = Config::parse(&toml).expect("url source with a take rename parses");
+    cfg.validate()
+        .expect("`take` on a url source subsets and renames its imported files like any source");
+
+    let out = sync(&input(&cfg, None, None, None, false), &backend, &registry)
+        .expect("sync of a renamed url source deploys");
+    assert!(!out.had_failures, "renamed url sync must succeed");
+
+    assert_eq!(
+        std::fs::read(td.target_path().join("paper.pdf")).expect("renamed file deployed"),
+        b"%PDF-1.4 not an archive\n",
+        "the url's single file must land under its `take` rename"
+    );
+    assert!(
+        !td.target_path().join("pkg-1.0.tar.gz").exists(),
+        "the url basename must not also deploy alongside the rename"
+    );
 }
 
 #[test]

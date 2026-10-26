@@ -5508,6 +5508,25 @@ dotfiles = { template = [] }
 }
 
 #[test]
+fn take_on_a_url_source_validates() {
+    let toml = r#"
+version = 1
+
+[sources.paper]
+url = "https://arxiv.org/pdf/2402.01030v4.pdf"
+
+[targets.t]
+path = "~/x"
+[targets.t.sources]
+paper = { take = [{ "2402.01030v4.pdf" = "code-act.pdf" }] }
+"#;
+    let cfg = Config::parse(toml).expect("the toml parses");
+    cfg.validate().expect(
+        "a url source imports real files, so `take` may subset and rename them like on any source",
+    );
+}
+
+#[test]
 fn template_on_a_url_source_is_rejected() {
     let toml = r#"
 version = 1

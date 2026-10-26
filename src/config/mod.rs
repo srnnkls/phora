@@ -668,8 +668,6 @@ fn reject_url_slice(source_name: &str, binding: &Binding, source: &Source) -> Re
         "rev"
     } else if binding.template.is_some() {
         "template"
-    } else if binding.take.is_some() {
-        "take"
     } else {
         return Ok(());
     };
