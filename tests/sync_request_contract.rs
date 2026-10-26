@@ -1130,7 +1130,7 @@ fn public_sync_tree_escape_hatches(path: &Path) -> Vec<String> {
         .collect()
 }
 
-const ALLOWED_SYNC_WARNING_SHAPES: [&str; 20] = [
+const ALLOWED_SYNC_WARNING_SHAPES: [&str; 21] = [
     "Projection(ProjectionWarning)",
     "MalformedTransitiveHooks{target:String,detail:String}",
     "LinkPathNotPortable{source:String,path:PathBuf}",
@@ -1144,6 +1144,7 @@ const ALLOWED_SYNC_WARNING_SHAPES: [&str; 20] = [
     "FastForwardKeptLive{source:String,artifact:String,path:PathBuf}",
     "FastForwardDropped{source:String,artifact:String}",
     "LinkedSourceDropped{source:String,artifact:String}",
+    "RelocatedCopyKept{source:String,artifact:String,path:PathBuf}",
     "CrossDeviceFallback{destination:PathBuf}",
     "ConflictModified{source:String,artifact:String,changed:Vec<PathBuf>}",
     "ConflictForeign{path:PathBuf}",

@@ -450,6 +450,10 @@ path = "~/.config/editor"
 nvim = { source = "dotfiles", take = ["nvim/**"] }
 ```
 
+Changing a target's `layout` or `path` moves its artifacts: the next `phora sync`
+deploys each one at its new destination and removes the previous copy, without
+`--prune`. A previous copy modified since deploy stays where it was, with a warning.
+
 Target sources are an explicit allow-list: `["a", "b"]` deploys those two,
 `[]` (or an omitted `sources` key) deploys nothing. Edit the list with `phora
 bind`/`phora unbind` rather than by hand; `bind` onto a target with no `sources`

@@ -7,6 +7,7 @@ use crate::source::SourceStore;
 use crate::sync::state::{ArtifactRecord, StateStore};
 
 use super::confine::ProtectedPathSet;
+use super::observe::Relocation;
 use super::{DeployAll, persisted_manifest_relative_path, remove_orphan_path};
 use crate::projection::build::projected_artifacts;
 use crate::projection::model::Projection;
@@ -253,12 +254,24 @@ pub(super) fn apply_reconciled_removals<R>(
     changes: &[SyncChange],
     observed: &ObservedProjectState<ArtifactRecord>,
     projection: &Projection,
+    relocations: &[Relocation],
     ctx: &DeployAll<'_, R>,
     events: &mut SyncEvents,
 ) -> Result<()>
 where
     R: StateStore,
 {
+    let relocated: BTreeSet<(&str, &str, &str)> = changes
+        .iter()
+        .filter_map(|change| match change {
+            SyncChange::Relocate {
+                target,
+                source,
+                artifact,
+            } => Some((target.as_str(), source.as_str(), artifact.as_str())),
+            _ => None,
+        })
+        .collect();
     let removals: Vec<(&str, &str, &str, &crate::sync::model::RemovalReason)> = changes
         .iter()
         .filter_map(|change| match change {
@@ -329,7 +342,104 @@ where
             reason: reason.clone(),
         });
     }
+    remove_relocated_copies(
+        relocations,
+        &relocated,
+        ctx,
+        &live_paths,
+        &mut emptied,
+        events,
+    )?;
     emptied.sweep(ctx.config, ctx.registry, events)
+}
+
+fn remove_relocated_copies<R>(
+    relocations: &[Relocation],
+    relocated: &BTreeSet<(&str, &str, &str)>,
+    ctx: &DeployAll<'_, R>,
+    live_paths: &LivePathsBySource,
+    emptied: &mut EmptiedDirectories,
+    events: &mut SyncEvents,
+) -> Result<()>
+where
+    R: StateStore,
+{
+    for relocation in relocations {
+        let key = &relocation.record.key;
+        let relocated = relocated.contains(&(
+            key.target.as_str(),
+            key.source.as_str(),
+            key.artifact.as_str(),
+        ));
+        if remove_relocated_copy(relocation, relocated, ctx, live_paths, events)? {
+            emptied.record(ctx.config, &relocation.record);
+        }
+    }
+    Ok(())
+}
+
+/// Removes a relocated artifact's previous copy once the registry records it elsewhere; a copy
+/// modified since deploy stays in place with a warning.
+fn remove_relocated_copy<R>(
+    relocation: &Relocation,
+    relocated: bool,
+    ctx: &DeployAll<'_, R>,
+    live_paths: &LivePathsBySource,
+    events: &mut SyncEvents,
+) -> Result<bool>
+where
+    R: StateStore,
+{
+    let Relocation {
+        record,
+        from,
+        clean,
+    } = relocation;
+    let Some(current) = ctx.registry.artifact(&record.key)? else {
+        return Ok(false);
+    };
+    if orphan_artifact_path(&current).as_ref() == Some(from) {
+        return Ok(false);
+    }
+    if !clean {
+        events.push_warning(SyncWarning::RelocatedCopyKept {
+            source: record.key.source.clone(),
+            artifact: record.key.artifact.clone(),
+            path: from.clone(),
+        });
+        return Ok(false);
+    }
+    let Some(target) = ctx.config.targets.get(&record.key.target) else {
+        return Ok(false);
+    };
+    if !relocated
+        || (record.linked && std::fs::symlink_metadata(from).is_ok_and(|meta| !meta.is_symlink()))
+    {
+        return Ok(false);
+    }
+    let path = match removal_path(target, record, ctx.protected) {
+        Ok(path) => path,
+        Err(error) => {
+            events.push_warning(SyncWarning::PruneRefused {
+                path: from.clone(),
+                reason: error.to_string(),
+            });
+            return Ok(false);
+        }
+    };
+    if overlaps_any_live_dest(&path, live_paths, &record.key.target) {
+        if !overlaps_foreign_live_dest(&path, live_paths, &record.key.target, &record.key.source) {
+            prune_stale_manifest_children(&path, record, live_paths, &record.key.target)?;
+        }
+        return Ok(false);
+    }
+    if overlaps_any_live_path(&path, live_paths) {
+        return Ok(false);
+    }
+    remove_orphan_path(&path)
+        .map_err(|error| Error::Sync(format!("relocate {}: {error}", path.display())))?;
+    super::detach_history_overlay(record, &path, ctx.backend)?;
+    Ok(true)
 }
 
 fn live_paths_by_source(projection: &Projection, config: &Config) -> LivePathsBySource {

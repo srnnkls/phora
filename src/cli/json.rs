@@ -101,6 +101,7 @@ fn warning_kind(warning: &SyncWarning) -> &'static str {
         SyncWarning::FastForwardKeptLive { .. } => "fast_forward_kept_live",
         SyncWarning::FastForwardDropped { .. } => "fast_forward_dropped",
         SyncWarning::LinkedSourceDropped { .. } => "linked_source_dropped",
+        SyncWarning::RelocatedCopyKept { .. } => "relocated_copy_kept",
         SyncWarning::CrossDeviceFallback { .. } => "cross_device_fallback",
         SyncWarning::ConflictModified { .. } => "conflict_modified",
         SyncWarning::ConflictForeign { .. } => "conflict_foreign",

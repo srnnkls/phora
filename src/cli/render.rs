@@ -82,6 +82,10 @@ pub(super) fn format_sync_warning(warning: &SyncWarning) -> Option<String> {
         SyncWarning::LinkedSourceDropped { source, artifact } => {
             format!("phora: removed {source}:{artifact} (no longer in the linked source's offer)")
         }
+        SyncWarning::RelocatedCopyKept { path, .. } => format!(
+            "phora: kept the modified previous copy of a relocated artifact at {}",
+            path.display()
+        ),
         SyncWarning::ContentStoreRepaired { object } => format!(
             "phora: content store object {} did not match its hash; rewrote it",
             object.display()

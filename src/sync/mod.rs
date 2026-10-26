@@ -749,7 +749,7 @@ where
         });
     }
 
-    let (observed, changeset, retirements, decisions) = if ran {
+    let (observed, mut changeset, retirements, decisions) = if ran {
         let (observed, retirements, changeset) = observe_reconciliation(ctx, policy)?;
         refuse_lockless_mutation(ctx.input, registry, &observed, &changeset)?;
         let decisions = resolve_conflicts_reusing(
@@ -768,6 +768,15 @@ where
             initial_decisions,
         )
     };
+    let relocations = observe::observe_relocations(ctx)?;
+    reconcile::add_relocations(
+        &mut changeset,
+        &relocations
+            .iter()
+            .filter(|relocation| relocation.clean)
+            .map(observe::Relocation::key)
+            .collect(),
+    );
     let reconciliation = Reconciliation::new(&changeset, &observed, &retirements, decisions);
     let mut run = ApplyRun {
         had_failures: !skipped_targets.is_empty(),
@@ -795,6 +804,7 @@ where
             &changeset.changes,
             &observed,
             ctx.projection,
+            &relocations,
             ctx,
             &mut run.events,
         )?;
