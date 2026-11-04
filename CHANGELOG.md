@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0](https://github.com/srnnkls/phora/compare/v0.4.4...v0.5.0) - 2026-11-04
+
+### Features
+
+- *(sync)* [**breaking**] Adopt Cargo's lock contract
+
+### Bug Fixes
+
+- *(sync)* Ask before removing a locally changed artifact
+- *(sync)* Keep artifacts that changed locally instead of removing them
+
+### Refactor
+
+- *(sync)* Route upstream drops through observe, reconcile, and one executor
+- *(sync)* Name the lock-contract helpers with verbs
+
+[0.5.0]: https://github.com/srnnkls/phora/compare/0.4.4..0.5.0
+
 ## [0.4.4](https://github.com/srnnkls/phora/compare/v0.4.3...v0.4.4) - 2026-10-16
 
 ### Bug Fixes
