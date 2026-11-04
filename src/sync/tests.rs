@@ -14251,17 +14251,17 @@ fn sealed_offer_intentional_narrowing_does_not_block_prune_of_the_dropped_artifa
 fn moved_pin_deletes_an_artifact_the_new_commit_dropped() {
     let src = TempDir::new().expect("src tempdir");
     let p = src.path();
-    let (url, _c0, _c1) = two_commit_editor_lint_source(p);
+    let (url, _c0, _c1) = init_editor_lint_source(p);
     let td = TargetDir::new();
     let (_g, _s, backend, registry) = fresh_backend_registry();
-    let cfg = editor_lint_config(&url, "branch = \"main\"", &td);
+    let cfg = parse_editor_lint_config(&url, "branch = \"main\"", &td);
     sync(&input(&cfg, None, None, None, false), &backend, &registry).expect("deploy lint");
     let deployed = td.target_path().join("lint");
     assert!(deployed.exists(), "premise: lint is deployed");
 
     run_git(p, &["rm", "-r", "-q", "lint"]);
     run_git(p, &["commit", "-m", "drop lint"]);
-    let report = sync_report(&input(&cfg, None, None, None, false), &backend, &registry)
+    let report = sync_with_report(&input(&cfg, None, None, None, false), &backend, &registry)
         .expect("sync must follow the moved pin: an artifact the new commit dropped is deleted");
     assert!(
         report.warnings.iter().any(|warning| matches!(
@@ -14281,7 +14281,7 @@ fn moved_pin_deletes_an_artifact_the_new_commit_dropped() {
     );
 }
 
-fn sync_report(
+fn sync_with_report(
     input: &SyncInput<'_>,
     backend: &dyn SourceStore,
     registry: &FileStateStore,
@@ -14289,7 +14289,7 @@ fn sync_report(
     sync_core(&input.run_input(), backend, registry).map(|execution| execution.report)
 }
 
-fn has_upstream_drop_modified(report: &SyncReport, artifact: &str) -> bool {
+fn reports_kept_upstream_drop(report: &SyncReport, artifact: &str) -> bool {
     report.warnings.iter().any(|warning| {
         matches!(
             warning,
@@ -14299,7 +14299,7 @@ fn has_upstream_drop_modified(report: &SyncReport, artifact: &str) -> bool {
 }
 
 /// A repo with `editor/` and `lint/` at C0, then C1 editing `editor/` on `main`.
-fn two_commit_editor_lint_source(p: &Path) -> (String, String, String) {
+fn init_editor_lint_source(p: &Path) -> (String, String, String) {
     run_git(p, &["init", "-b", "main", "."]);
     run_git(p, &["config", "user.email", "test@example.com"]);
     run_git(p, &["config", "user.name", "Test"]);
@@ -14321,7 +14321,7 @@ fn two_commit_editor_lint_source(p: &Path) -> (String, String, String) {
     (p.to_string_lossy().into_owned(), c0, c1)
 }
 
-fn editor_lint_config(url: &str, source_extra: &str, target: &TargetDir) -> Config {
+fn parse_editor_lint_config(url: &str, source_extra: &str, target: &TargetDir) -> Config {
     Config::parse(&format!(
         "version = 1\n\n\
          [sources.ed]\ngit = \"{url}\"\n{source_extra}\n\n\
@@ -14334,12 +14334,12 @@ fn editor_lint_config(url: &str, source_extra: &str, target: &TargetDir) -> Conf
 #[test]
 fn selection_edit_keeps_the_locked_commit_and_re_digests_it() {
     let src = TempDir::new().expect("src tempdir");
-    let (url, c0, c1) = two_commit_editor_lint_source(src.path());
+    let (url, c0, c1) = init_editor_lint_source(src.path());
     run_git(src.path(), &["reset", "--hard", &c0]);
     let td = TargetDir::new();
     let (_g, _s, backend, registry) = fresh_backend_registry();
 
-    let narrow = editor_lint_config(&url, "branch = \"main\"\ninclude = [\"editor\"]", &td);
+    let narrow = parse_editor_lint_config(&url, "branch = \"main\"\ninclude = [\"editor\"]", &td);
     let first = sync(
         &input(&narrow, None, None, None, false),
         &backend,
@@ -14354,7 +14354,7 @@ fn selection_edit_keeps_the_locked_commit_and_re_digests_it() {
     assert_eq!(pinned.commit, c0, "premise: the first sync pins C0");
 
     run_git(src.path(), &["reset", "--hard", &c1]);
-    let wide = editor_lint_config(
+    let wide = parse_editor_lint_config(
         &url,
         "branch = \"main\"\ninclude = [\"editor\", \"lint\"]",
         &td,
@@ -14389,11 +14389,11 @@ fn selection_edit_keeps_the_locked_commit_and_re_digests_it() {
 #[test]
 fn ref_edit_re_resolves_the_pin() {
     let src = TempDir::new().expect("src tempdir");
-    let (url, c0, c1) = two_commit_editor_lint_source(src.path());
+    let (url, c0, c1) = init_editor_lint_source(src.path());
     let td = TargetDir::new();
     let (_g, _s, backend, registry) = fresh_backend_registry();
 
-    let on_next = editor_lint_config(&url, "branch = \"next\"", &td);
+    let on_next = parse_editor_lint_config(&url, "branch = \"next\"", &td);
     let first = sync(
         &input(&on_next, None, None, None, false),
         &backend,
@@ -14405,7 +14405,7 @@ fn ref_edit_re_resolves_the_pin() {
         c0
     );
 
-    let on_main = editor_lint_config(&url, "branch = \"main\"", &td);
+    let on_main = parse_editor_lint_config(&url, "branch = \"main\"", &td);
     let second = sync(
         &input(&on_main, None, Some(first.base_lock), None, false),
         &backend,
@@ -14423,10 +14423,10 @@ fn ref_edit_re_resolves_the_pin() {
 fn moved_pin_keeps_a_locally_modified_dropped_artifact_unless_forced() {
     let src = TempDir::new().expect("src tempdir");
     let p = src.path();
-    let (url, _c0, _c1) = two_commit_editor_lint_source(p);
+    let (url, _c0, _c1) = init_editor_lint_source(p);
     let td = TargetDir::new();
     let (_g, _s, backend, registry) = fresh_backend_registry();
-    let cfg = editor_lint_config(&url, "branch = \"main\"", &td);
+    let cfg = parse_editor_lint_config(&url, "branch = \"main\"", &td);
     sync(&input(&cfg, None, None, None, false), &backend, &registry).expect("deploy lint");
 
     let deployed = td.target_path().join("lint/rules.toml");
@@ -14434,10 +14434,10 @@ fn moved_pin_keeps_a_locally_modified_dropped_artifact_unless_forced() {
     run_git(p, &["rm", "-r", "-q", "lint"]);
     run_git(p, &["commit", "-m", "drop lint"]);
 
-    let kept = sync_report(&input(&cfg, None, None, None, false), &backend, &registry)
+    let kept = sync_with_report(&input(&cfg, None, None, None, false), &backend, &registry)
         .expect("a modified upstream drop is a conflict, not an error");
     assert!(
-        has_upstream_drop_modified(&kept, "lint"),
+        reports_kept_upstream_drop(&kept, "lint"),
         "got {:?}",
         kept.warnings
     );
@@ -14871,10 +14871,10 @@ fn sealed_offer_validates_crash_recovered_record_finalized_by_the_sweep() {
         "premise: the target registry is exactly empty before recovery_sweep"
     );
 
-    let report = sync_report(&input(&cfg, None, None, None, false), &backend, &registry)
+    let report = sync_with_report(&input(&cfg, None, None, None, false), &backend, &registry)
         .expect("the moved pin follows; the recovered copy, modified against its record, is kept");
     assert!(
-        has_upstream_drop_modified(&report, "editor"),
+        reports_kept_upstream_drop(&report, "editor"),
         "the drop guard must see the record recovery_sweep finalized, so its snapshot is taken \
          AFTER the sweep; got {:?}",
         report.warnings

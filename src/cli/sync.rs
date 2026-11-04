@@ -54,7 +54,7 @@ pub(super) fn run_sync(
 
     let pins_before = drop
         .is_some()
-        .then(|| root_pins(base_lock.as_ref(), local_lock.as_ref()));
+        .then(|| collect_root_pins(base_lock.as_ref(), local_lock.as_ref()));
     if let Some(drop) = drop {
         drop_sources(base_lock.as_mut(), &drop);
         drop_sources(local_lock.as_mut(), &drop);
@@ -135,9 +135,9 @@ pub(super) fn run_sync(
 
     let outcome = finish_sync(&cwd, &out, interactive, &reporter)?;
     if let Some(before) = pins_before {
-        for line in pin_moves(
+        for line in describe_pin_moves(
             &before,
-            &root_pins(out.locks.base.as_ref(), out.locks.local.as_ref()),
+            &collect_root_pins(out.locks.base.as_ref(), out.locks.local.as_ref()),
         ) {
             eprintln!("{line}");
         }
@@ -151,7 +151,7 @@ pub(super) fn run_sync(
 type RootPins = BTreeMap<(String, Option<String>), (String, String)>;
 
 /// Consumer-root pins keyed by `(source, ref)`, mapped to `(resolved ref, commit)`.
-fn root_pins(base: Option<&Lock>, local: Option<&Lock>) -> RootPins {
+fn collect_root_pins(base: Option<&Lock>, local: Option<&Lock>) -> RootPins {
     base.into_iter()
         .chain(local)
         .flat_map(|lock| &lock.sources)
@@ -165,7 +165,7 @@ fn root_pins(base: Option<&Lock>, local: Option<&Lock>) -> RootPins {
         .collect()
 }
 
-fn pin_moves(before: &RootPins, after: &RootPins) -> Vec<String> {
+fn describe_pin_moves(before: &RootPins, after: &RootPins) -> Vec<String> {
     let label = |(resolved, commit): &(String, String)| {
         format!("{resolved} ({})", commit.get(..8).unwrap_or(commit))
     };
