@@ -3621,6 +3621,7 @@ mod per_binding_refinement {
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
+            link_target: None,
         };
         reg.put_artifact(&rec).expect("put bare-binding record");
 

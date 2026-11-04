@@ -449,6 +449,7 @@ fn rebuild_linked(
         vars_digest: None,
         deploy_root: Some(deploy_root),
         layout_separator: layout.persisted_separator(),
+        link_target: None,
     };
     registry.put_artifact(&record)?;
     Ok(())

@@ -276,6 +276,7 @@ fn record(contents: &[u8], kind: RecordKind, linked: bool) -> ArtifactRecord {
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
+        link_target: None,
     }
 }
 
@@ -1120,6 +1121,7 @@ fn overlap_record(artifact: &str, kind: RecordKind, contents: &[u8]) -> Artifact
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
+        link_target: None,
     }
 }
 

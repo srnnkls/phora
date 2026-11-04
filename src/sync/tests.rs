@@ -212,6 +212,7 @@ fn linked_flat_record(target: &str, source: &str, artifact: &str) -> ArtifactRec
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
+        link_target: None,
     }
 }
 
@@ -3661,7 +3662,7 @@ fn seed_orphan(
             kind: crate::sync::state::ManifestEntryKind::File,
             size: 6,
             mtime: 1_700_000_000,
-            blake3: "blake3:orphan".to_owned(),
+            blake3: blake3::hash(b"stale\n").to_hex().to_string(),
         }],
         directories: None,
         linked: false,
@@ -3672,6 +3673,7 @@ fn seed_orphan(
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
+        link_target: None,
     };
     reg.put_artifact(&record).expect("seed orphan record");
     dst
@@ -3771,6 +3773,7 @@ fn frozen_lockless_sync_with_pending_upstream_drops_refuses_before_pruning() {
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
+        link_target: None,
     }];
     let projection = Projection {
         targets: Vec::new(),
@@ -3991,6 +3994,7 @@ fn seed_orphan_record(reg: &FileStateStore, source: &str, artifact: &str) {
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
+        link_target: None,
     };
     reg.put_artifact(&record)
         .expect("seed overlapping orphan record");
@@ -6253,6 +6257,7 @@ fn sync_runs_recovery_sweep_finishing_a_swapped_but_unrecorded_artifact() {
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
+        link_target: None,
     };
 
     let staging_base = td.parent_path.join(".phora-stage");
@@ -6389,6 +6394,7 @@ fn sync_runs_recovery_before_phase1_even_when_resolve_fails() {
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
+        link_target: None,
     };
 
     let staging_base = td.parent_path.join(".phora-stage");
@@ -6483,6 +6489,7 @@ fn seed_managed_artifact(
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
+        link_target: None,
     };
     reg.put_artifact(&record).expect("seed managed record");
     dst
@@ -6624,6 +6631,7 @@ fn eject_turns_history_overlay_into_a_standalone_clone_before_persisting_ejectio
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
+            link_target: None,
         })
         .expect("persist history record");
 
@@ -6946,6 +6954,7 @@ fn seed_verifiable_artifact(
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
+        link_target: None,
     };
     reg.put_artifact(&record).expect("seed verifiable record");
     dst
@@ -7637,6 +7646,7 @@ fn verify_skips_linked_record_even_with_stray_manifest_file() {
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
+        link_target: None,
     };
     fx.registry
         .put_artifact(&stray)
@@ -7694,6 +7704,7 @@ fn verify_skips_linked_record_over_edited_symlink_target() {
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
+        link_target: None,
     };
     fx.registry
         .put_artifact(&linked)
@@ -7816,6 +7827,7 @@ fn prune_removes_stale_linked_symlink_without_following_it() {
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
+            link_target: None,
         })
         .expect("seed the orphaned linked record");
 
@@ -7910,6 +7922,7 @@ fn prune_drops_a_stale_dir_record_once_the_plan_flips_leaf_granular() {
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
+            link_target: None,
         })
         .expect("seed the stale dir-granular record");
 
@@ -8000,6 +8013,7 @@ fn leaf_record(target: &str, identity: &str, key: &str) -> ArtifactRecord {
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
+        link_target: None,
     }
 }
 
@@ -8347,6 +8361,7 @@ fn prune_keeps_a_foreign_orphan_dir_that_ancestors_a_live_leaf_of_another_bindin
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
+            link_target: None,
         })
         .expect("seed foreign orphan dir record");
 
@@ -8409,6 +8424,7 @@ fn prune_keeps_a_foreign_orphan_leaf_nested_under_a_live_collapsed_dir_of_anothe
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
+            link_target: None,
         })
         .expect("seed foreign orphan leaf record");
 
@@ -11144,6 +11160,7 @@ fn preview_writes_nothing_to_the_registry_or_the_target() {
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
+        link_target: None,
     };
     fx.registry
         .put_artifact(&seeded)
@@ -14093,6 +14110,7 @@ fn seed_recorded_artifact_at(reg: &FileStateStore, source: &str, artifact: &str,
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
+        link_target: None,
     };
     reg.put_artifact(&record).expect("seed recorded artifact");
 }
@@ -14221,7 +14239,6 @@ fn sealed_offer_intentional_narrowing_does_not_block_prune_of_the_dropped_artifa
 
     let stale_dst = td.target_path().join("editor");
     std::fs::create_dir_all(&stale_dst).expect("mkdir stale editor");
-    std::fs::write(stale_dst.join("init.lua"), b"-- init\n").expect("write stale file");
     seed_recorded_artifact(&fx.registry, "editor-src", "editor");
 
     let in_ = SyncInput {
@@ -14293,7 +14310,12 @@ fn reports_kept_upstream_drop(report: &SyncReport, artifact: &str) -> bool {
     report.warnings.iter().any(|warning| {
         matches!(
             warning,
-            SyncWarning::UpstreamDropModified { artifact: dropped, .. } if dropped == artifact
+            SyncWarning::KeptLocalChange {
+                artifact: dropped,
+                change: LocalChange::Modified { .. },
+                cause: RemovalCause::UpstreamDrop,
+                ..
+            } if dropped == artifact
         )
     })
 }
@@ -14813,6 +14835,7 @@ fn crashed_recovery_record(key: ArtifactKey, commit: &str) -> ArtifactRecord {
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
+        link_target: None,
     }
 }
 

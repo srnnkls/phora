@@ -89,6 +89,10 @@ pub struct ArtifactRecord {
     /// Prefixed layout's separator, persisted so an orphan's path reconstructs exactly. `None` for non-prefixed and legacy records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout_separator: Option<String>,
+    /// The symlink a linked record's deployment points at; removal deletes the link only while
+    /// it still reads this. `None` on copies and legacy linked records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_target: Option<String>,
 }
 
 /// Inputs that make a history record's linked-worktree address complete at construction.
@@ -168,6 +172,7 @@ impl ArtifactRecord {
             vars_digest,
             deploy_root,
             layout_separator,
+            link_target: None,
         }
     }
 }
@@ -669,6 +674,7 @@ mod tests {
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
+            link_target: None,
         };
 
         let toml = toml::to_string(&rec).expect("serialize linked record");
@@ -748,6 +754,7 @@ artifact = "snippets"
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
+            link_target: None,
         };
 
         let toml = toml::to_string(&rec).expect("serialize aliased record");
@@ -862,6 +869,7 @@ artifact = "snippets"
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
+            link_target: None,
         };
 
         let toml = toml::to_string(&rec).expect("serialize file-kind record");
@@ -909,6 +917,7 @@ artifact = "snippets"
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
+            link_target: None,
         };
 
         let toml = toml::to_string(&rec).expect("serialize dir-kind record");
@@ -984,6 +993,7 @@ artifact = "snippets"
             vars_digest: vars_digest.map(str::to_owned),
             deploy_root: None,
             layout_separator: None,
+            link_target: None,
         }
     }
 
@@ -1281,6 +1291,7 @@ artifact = "snippets"
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
+            link_target: None,
         }
     }
 

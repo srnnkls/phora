@@ -51,9 +51,9 @@ pub use progress::{
 };
 pub use rebuild::{RebuildReport, rebuild_registry, rebuild_registry_with};
 pub use request::{
-    AppliedChange, Concurrency, ConflictPolicy, DeclineAll, HookPolicy, LockSet, PrunePolicy,
-    SkippedChange, SourcePolicy, SyncOptions, SyncReport, SyncRequest, SyncStatus, SyncWarning,
-    TrustPrompt, TrustRequest,
+    AppliedChange, Concurrency, ConflictPolicy, DeclineAll, HookPolicy, LocalChange, LockSet,
+    PrunePolicy, RemovalCause, SkippedChange, SourcePolicy, SyncOptions, SyncReport, SyncRequest,
+    SyncStatus, SyncWarning, TrustPrompt, TrustRequest,
 };
 pub use verify::{
     OverlayFinding, UntrustedHookFinding, VerifyMismatch, VerifyReason, VerifyReport, verify,
@@ -1835,35 +1835,6 @@ fn persisted_manifest_relative_path(path: &Path) -> Result<ArtifactRelativePath>
     })
 }
 
-/// The files of a managed copy that differ from its record, or `None` when the
-/// deployed copy is clean, absent, or not a plain copy.
-fn locally_modified(
-    record: &ArtifactRecord,
-    target: &crate::config::Target,
-    registry: &dyn StateStore,
-) -> Result<Option<Vec<PathBuf>>> {
-    if record.linked || record.history {
-        return Ok(None);
-    }
-    let ejected = registry.ejections(&record.key.target)?;
-    let observation = inspect::inspect(
-        &prune::removal_destination(target, record),
-        &record.key.source,
-        &record.commit,
-        &ejected,
-        registry,
-        &record.key,
-        record.vars_digest.as_deref(),
-    )?;
-    Ok(match observation {
-        model::ObservedArtifact::Managed(model::ManagedArtifact {
-            condition: model::ManagedCondition::Modified { changed },
-            ..
-        }) => Some(changed),
-        _ => None,
-    })
-}
-
 fn paths_overlap(first: &str, second: &str) -> bool {
     first == second
         || first
@@ -1918,18 +1889,16 @@ fn apply_upstream_drops(
                 if record.linked && std::fs::read_link(&path).ok() != *link {
                     continue;
                 }
-                if !force && let Some(changed) = locally_modified(record, target, registry)? {
-                    events.push_warning(SyncWarning::UpstreamDropModified {
-                        source: record.key.source.clone(),
-                        artifact: record.key.artifact.clone(),
-                        changed: changed.clone(),
-                    });
-                    events.push_skipped(SkippedChange::Conflict {
-                        target: record.key.target.clone(),
-                        source: record.key.source.clone(),
-                        artifact: record.key.artifact.clone(),
-                        kind: model::ConflictKind::Modified { changed },
-                    });
+                let destination = prune::removal_destination(target, record);
+                if !force && let Some(change) = prune::local_change(record, &destination, registry)?
+                {
+                    prune::keep_local_change(
+                        record,
+                        destination,
+                        change,
+                        RemovalCause::UpstreamDrop,
+                        events,
+                    );
                     continue;
                 }
                 let source = record.key.source.clone();

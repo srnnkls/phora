@@ -511,6 +511,7 @@ mod tests {
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
+            link_target: None,
         }
     }
 

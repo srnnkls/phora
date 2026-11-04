@@ -100,7 +100,7 @@ fn warning_kind(warning: &SyncWarning) -> &'static str {
         SyncWarning::OrphanRecordPathUnknown { .. } => "orphan_record_path_unknown",
         SyncWarning::UpstreamDropKeptLive { .. } => "upstream_drop_kept_live",
         SyncWarning::UpstreamDropped { .. } => "upstream_dropped",
-        SyncWarning::UpstreamDropModified { .. } => "upstream_drop_modified",
+        SyncWarning::KeptLocalChange { .. } => "kept_local_change",
         SyncWarning::LinkedSourceDropped { .. } => "linked_source_dropped",
         SyncWarning::CrossDeviceFallback { .. } => "cross_device_fallback",
         SyncWarning::ConflictModified { .. } => "conflict_modified",

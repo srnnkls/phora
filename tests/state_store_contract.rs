@@ -39,6 +39,7 @@ fn record(target: &str, source: &str, artifact: &str) -> ArtifactRecord {
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
+        link_target: None,
     }
 }
 

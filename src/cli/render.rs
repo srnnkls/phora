@@ -67,9 +67,16 @@ pub(super) fn format_sync_warning(warning: &SyncWarning) -> Option<String> {
              cannot be reconstructed (layout `{layout}` unrecognized or missing its separator); \
              any file is left in place rather than deleting a guessed path"
         ),
-        SyncWarning::UpstreamDropKeptLive { .. }
-        | SyncWarning::UpstreamDropped { .. }
-        | SyncWarning::UpstreamDropModified { .. } => format_upstream_drop(warning)?,
+        SyncWarning::UpstreamDropKeptLive { .. } | SyncWarning::UpstreamDropped { .. } => {
+            format_upstream_drop(warning)?
+        }
+        SyncWarning::KeptLocalChange {
+            source,
+            artifact,
+            path,
+            change,
+            cause,
+        } => format_kept_local_change(source, artifact, path, change, *cause),
         SyncWarning::LinkedSourceDropped { source, artifact } => {
             format!("phora: removed {source}:{artifact} (no longer in the linked source's offer)")
         }
@@ -134,21 +141,38 @@ fn format_upstream_drop(warning: &SyncWarning) -> Option<String> {
         SyncWarning::UpstreamDropped { source, artifact } => {
             format!("phora: removed {source}:{artifact} (removed upstream)")
         }
-        SyncWarning::UpstreamDropModified {
-            source,
-            artifact,
-            changed,
-        } => {
-            let mut out =
-                format!("phora: keeping locally modified {source}:{artifact} (removed upstream)");
-            for path in changed {
-                let _ = write!(out, "\n    {}", path.display());
-            }
-            out.push_str("\n  use --force to delete it, or `phora eject` to keep it unmanaged");
-            out
-        }
         _ => return None,
     })
+}
+
+fn format_kept_local_change(
+    source: &str,
+    artifact: &str,
+    path: &std::path::Path,
+    change: &crate::sync::LocalChange,
+    cause: crate::sync::RemovalCause,
+) -> String {
+    use crate::sync::{LocalChange, RemovalCause};
+    let why = match cause {
+        RemovalCause::UpstreamDrop => "removed upstream",
+        RemovalCause::Prune => "no longer selected",
+    };
+    let what = match change {
+        LocalChange::Modified { .. } => "it was modified locally",
+        LocalChange::Replaced => "something phora did not deploy replaced it",
+        LocalChange::Repointed => "the link now points elsewhere",
+    };
+    let mut out = format!(
+        "phora: keeping {source}:{artifact} ({why}) at {}: {what}",
+        path.display()
+    );
+    if let LocalChange::Modified { changed } = change {
+        for changed in changed {
+            let _ = write!(out, "\n    {}", changed.display());
+        }
+    }
+    out.push_str("\n  use --force to delete it, or `phora eject` to keep it unmanaged");
+    out
 }
 
 fn content_filter_cause(attributes: bool, autocrlf: bool) -> &'static str {

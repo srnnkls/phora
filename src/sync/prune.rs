@@ -10,9 +10,14 @@ use super::confine::ProtectedPathSet;
 use super::{DeployAll, persisted_manifest_relative_path, remove_orphan_path};
 use crate::projection::build::projected_artifacts;
 use crate::projection::model::Projection;
-use crate::sync::model::{ObservedArtifact, ObservedProjectState, SyncChange};
+use crate::sync::model::{
+    ConflictKind, ManagedArtifact, ManagedCondition, ObservedArtifact, ObservedProjectState,
+    SyncChange,
+};
 use crate::sync::request::SyncEvents;
-use crate::sync::{AppliedChange, SyncWarning};
+use crate::sync::{
+    AppliedChange, ConflictPolicy, LocalChange, RemovalCause, SkippedChange, SyncWarning,
+};
 
 #[cfg(test)]
 type ExpectedByBinding = BTreeMap<(String, String), Vec<String>>;
@@ -317,6 +322,10 @@ where
             ctx.registry,
             ctx.protected,
             &live_paths,
+            matches!(
+                ctx.input.options().conflict_policy,
+                ConflictPolicy::Overwrite
+            ),
             events,
         )? {
             continue;
@@ -353,6 +362,105 @@ fn live_paths_by_source(projection: &Projection, config: &Config) -> LivePathsBy
     live_paths
 }
 
+/// How the artifact at `path` differs from what phora deployed there; `None` while it is
+/// unchanged or already gone. A link is unchanged while it is a symlink reading the recorded
+/// target (any symlink for a legacy record without one); a copy while its files match the record.
+pub(super) fn local_change(
+    record: &ArtifactRecord,
+    path: &Path,
+    registry: &dyn StateStore,
+) -> Result<Option<LocalChange>> {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return Ok(None);
+    };
+    if record.linked {
+        if !metadata.file_type().is_symlink() {
+            return Ok(Some(LocalChange::Replaced));
+        }
+        let repointed = record.link_target.as_deref().is_some_and(|expected| {
+            std::fs::read_link(path).ok().as_deref() != Some(Path::new(expected))
+        });
+        return Ok(repointed.then_some(LocalChange::Repointed));
+    }
+    if record.history {
+        return Ok(None);
+    }
+    let ejected = registry.ejections(&record.key.target)?;
+    let observation = super::inspect::inspect(
+        path,
+        &record.key.source,
+        &record.commit,
+        &ejected,
+        registry,
+        &record.key,
+        record.vars_digest.as_deref(),
+    )?;
+    Ok(match observation {
+        ObservedArtifact::Managed(ManagedArtifact {
+            condition: ManagedCondition::Modified { changed },
+            ..
+        }) => Some(LocalChange::Modified { changed }),
+        ObservedArtifact::Foreign(_) | ObservedArtifact::Ejected => Some(LocalChange::Replaced),
+        ObservedArtifact::Missing | ObservedArtifact::Managed(_) => None,
+    })
+}
+
+/// Reports an artifact a removal leaves in place, keeping its record so the next sync reports it again.
+pub(super) fn keep_local_change(
+    record: &ArtifactRecord,
+    path: PathBuf,
+    change: LocalChange,
+    cause: RemovalCause,
+    events: &mut SyncEvents,
+) {
+    let kind = match &change {
+        LocalChange::Modified { changed } => ConflictKind::Modified {
+            changed: changed.clone(),
+        },
+        LocalChange::Replaced | LocalChange::Repointed => ConflictKind::Foreign,
+    };
+    events.push_warning(SyncWarning::KeptLocalChange {
+        source: record.key.source.clone(),
+        artifact: record.key.artifact.clone(),
+        path,
+        change,
+        cause,
+    });
+    events.push_skipped(SkippedChange::Conflict {
+        target: record.key.target.clone(),
+        source: record.key.source.clone(),
+        artifact: record.key.artifact.clone(),
+        kind,
+    });
+}
+
+fn kept_for_local_change(
+    record: &ArtifactRecord,
+    path: &Path,
+    registry: &dyn StateStore,
+    force: bool,
+    events: &mut SyncEvents,
+) -> Result<bool> {
+    if force {
+        return Ok(false);
+    }
+    let Some(change) = local_change(record, path, registry)? else {
+        return Ok(false);
+    };
+    keep_local_change(
+        record,
+        path.to_path_buf(),
+        change,
+        RemovalCause::Prune,
+        events,
+    );
+    Ok(true)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "removal threads config, both stores, confinement, live paths, the overwrite flag, and events"
+)]
 fn remove_reconciled_record(
     record: &ArtifactRecord,
     config: &Config,
@@ -360,17 +468,11 @@ fn remove_reconciled_record(
     registry: &dyn StateStore,
     protected: &ProtectedPathSet,
     live_paths: &LivePathsBySource,
+    force: bool,
     events: &mut SyncEvents,
 ) -> Result<bool> {
     if let Some(target) = config.targets.get(&record.key.target) {
         let dst = removal_destination(target, record);
-        if record.linked && std::fs::symlink_metadata(&dst).is_ok_and(|meta| !meta.is_symlink()) {
-            events.push_warning(SyncWarning::PruneRefused {
-                path: dst,
-                reason: "managed link was replaced by a regular file or directory".to_owned(),
-            });
-            return Ok(false);
-        }
         let confined = removal_path(target, record, protected);
         match confined {
             Ok(path) if !overlaps_any_live_dest(&path, live_paths, &record.key.target) => {
@@ -378,6 +480,9 @@ fn remove_reconciled_record(
                     return release_under_live_destination(
                         record, &path, live_paths, config, registry,
                     );
+                }
+                if kept_for_local_change(record, &dst, registry, force, events)? {
+                    return Ok(false);
                 }
                 remove_orphan_path(&path)
                     .map_err(|error| Error::Sync(format!("prune {}: {error}", path.display())))?;
@@ -437,6 +542,9 @@ fn remove_reconciled_record(
         };
         if overlaps_any_live_path(&path, live_paths) {
             return release_under_live_destination(record, &path, live_paths, config, registry);
+        }
+        if kept_for_local_change(record, &path, registry, force, events)? {
+            return Ok(false);
         }
         remove_orphan_path(&path)
             .map_err(|error| Error::Sync(format!("prune {}: {error}", path.display())))?;
@@ -751,6 +859,7 @@ mod tests {
             vars_digest: None,
             deploy_root: Some("/deploy".to_owned()),
             layout_separator: separator.map(str::to_owned),
+            link_target: None,
         }
     }
 

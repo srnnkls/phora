@@ -444,6 +444,7 @@ fn record(
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
+        link_target: None,
     }
 }
 
@@ -2076,6 +2077,7 @@ fn record_for(
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
+        link_target: None,
     }
 }
 
@@ -2481,6 +2483,7 @@ fn mapped_record(
         vars_digest: None,
         deploy_root: None,
         layout_separator: None,
+        link_target: None,
     }
 }
 

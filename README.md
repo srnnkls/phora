@@ -309,10 +309,16 @@ it. A build source is keyed by its config instead, since it has no remote.
 `update` reports each pin it moved as `phora: updated <source>: <old> → <new>`; a ref
 edit picked up by `sync` reports `phora: <source> → <target>: <old> → <new>` per binding.
 Artifacts the new commit no longer offers are removed and reported as `phora:
-removed <source>:<artifact> (removed upstream)`. A dropped artifact you modified
-locally is kept and reported as a conflict (`upstream_drop_modified` in `--json`);
-`--force` deletes it, `phora eject` keeps its files unmanaged. `--prune` covers the
-other direction: artifacts you stopped selecting in config.
+removed <source>:<artifact> (removed upstream)`. `--prune` covers the other
+direction: artifacts you stopped selecting in config, or whose target you removed.
+
+Both removals delete only what phora can prove it deployed unchanged: a copy whose
+files still match its record, or a link that still points where phora pointed it.
+Anything else — a copy you edited, a file or directory that replaced a link, a link
+you re-pointed — stays on disk with its record and is reported on every sync as
+`phora: keeping <source>:<artifact> (<why>) at <path>: <what changed>`
+(`kept_local_change` in `--json`). `--force` deletes it; `phora eject` keeps its
+files unmanaged.
 
 ### Conflicts
 
@@ -935,8 +941,10 @@ live mirror: when a file or directory leaves its offer (deleted, renamed, or no
 longer included), every sync removes the managed symlink, dangling or not, forgets
 its record, prunes the directories it emptied, and reports the removal.
 `--prune` removes an orphaned linked artifact by deleting
-the symlink only. A regular file, directory, or foreign symlink replacing a managed
-link is preserved: sync refuses the dropped artifact until it is restored or ejected. If the working-tree target
+the symlink only, and only while it still points where phora pointed it. A regular
+file, directory, or re-pointed symlink in its place is preserved: sync refuses a
+dropped artifact until it is restored or ejected, and `--prune` keeps it (see
+[Sync and update](#sync-and-update)). If the working-tree target
 is deleted or renamed the link reads as missing and is redeployed on the next sync.
 Switching a source between `link` and `copy` replaces the destination on the next
 sync (symlink ⇄ materialized copy, with full integrity restored on `copy`). If a

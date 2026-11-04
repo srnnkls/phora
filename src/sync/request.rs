@@ -161,6 +161,21 @@ pub enum SkippedChange {
     },
 }
 
+/// How a deployed artifact phora was about to remove differs from what phora deployed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalChange {
+    Modified { changed: Vec<PathBuf> },
+    Replaced,
+    Repointed,
+}
+
+/// Why phora was removing an artifact it kept instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemovalCause {
+    UpstreamDrop,
+    Prune,
+}
+
 /// A non-fatal diagnostic returned to the rendering boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncWarning {
@@ -208,10 +223,12 @@ pub enum SyncWarning {
         source: String,
         artifact: String,
     },
-    UpstreamDropModified {
+    KeptLocalChange {
         source: String,
         artifact: String,
-        changed: Vec<PathBuf>,
+        path: PathBuf,
+        change: LocalChange,
+        cause: RemovalCause,
     },
     LinkedSourceDropped {
         source: String,

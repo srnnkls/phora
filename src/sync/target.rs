@@ -1314,6 +1314,7 @@ fn deploy_link(
         )));
     }
     let policy = entry.source.export_policy(false);
+    let target = link_target(entry);
     let record = ArtifactRecord {
         version: 1,
         key,
@@ -1335,12 +1336,13 @@ fn deploy_link(
         vars_digest: None,
         deploy_root: Some(deploy_root),
         layout_separator: entry.layout.persisted_separator(),
+        link_target: Some(target.to_string_lossy().into_owned()),
     };
     let staging_base = target_parent(entry.artifact_dst).join(".phora-stage");
     link_artifact(
         &staging_base,
         entry.artifact_dst,
-        &link_target(entry),
+        &target,
         record,
         journal,
         registry,
@@ -1599,6 +1601,7 @@ mod kind_aware_layout_tests {
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
+            link_target: None,
         }
     }
 
@@ -1761,6 +1764,7 @@ mod kind_aware_layout_tests {
             vars_digest: None,
             deploy_root: None,
             layout_separator: None,
+            link_target: None,
         };
 
         let base = record_manifest_base(&target, &rec);

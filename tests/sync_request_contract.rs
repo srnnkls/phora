@@ -11,6 +11,7 @@ fn root() -> PathBuf {
 
 const PROBE_SOURCE: &str = r#"
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -19,7 +20,8 @@ use phora::projection::diagnostic::ProjectionWarning;
 use phora::sync::progress::ProgressSink;
 use phora::source::GitBackend;
 use phora::sync::state::{
-    ArtifactKey, ArtifactRecord, FileStateStore, RecordKind, StateStore,
+    ArtifactKey, ArtifactRecord, FileStateStore, ManifestEntryKind, ManifestFile, RecordKind,
+    StateStore,
 };
 use phora::sync::model::{ChangeSet, ConflictKind, ReconciliationPolicy, RemovalReason, SyncChange};
 use phora::sync::{
@@ -168,7 +170,13 @@ fn assert_request_flow_returns_conflict_warning_and_remove_outcomes() {
         kind: RecordKind::File,
         allow_symlinks: false,
         preserve_executable: true,
-        files: vec![],
+        files: vec![ManifestFile {
+            path: PathBuf::from("obsolete"),
+            kind: ManifestEntryKind::File,
+            size: 9,
+            mtime: 0,
+            blake3: blake3::hash(b"obsolete\n").to_hex().to_string(),
+        }],
         directories: None,
         linked: false,
         history: false,
@@ -178,6 +186,7 @@ fn assert_request_flow_returns_conflict_warning_and_remove_outcomes() {
         vars_digest: None,
         deploy_root: Some(orphan_root.to_string_lossy().into_owned()),
         layout_separator: None,
+        link_target: None,
     }).expect("seed orphan record");
 
     let spy = SpyResolver::new();
@@ -231,7 +240,7 @@ fn main() {
 fn public_request_mapping_report_and_workspace_flow_probe() {
     let temp = tempfile::TempDir::new().expect("create isolated contract probe");
     let manifest = format!(
-        "[package]\nname = \"t027-contract-probe\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nphora = {{ path = {:?} }}\ntempfile = \"3.27.0\"\n",
+        "[package]\nname = \"t027-contract-probe\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nphora = {{ path = {:?} }}\ntempfile = \"3.27.0\"\nblake3 = \"1.8.5\"\n",
         root()
     );
     fs::write(temp.path().join("Cargo.toml"), manifest).expect("write probe manifest");
@@ -1136,7 +1145,7 @@ const ALLOWED_SYNC_WARNING_SHAPES: [&str; 21] = [
     "OrphanRecordPathUnknown{source:String,artifact:String,layout:String}",
     "UpstreamDropKeptLive{source:String,artifact:String,path:PathBuf}",
     "UpstreamDropped{source:String,artifact:String}",
-    "UpstreamDropModified{source:String,artifact:String,changed:Vec<PathBuf>}",
+    "KeptLocalChange{source:String,artifact:String,path:PathBuf,change:LocalChange,cause:RemovalCause}",
     "LinkedSourceDropped{source:String,artifact:String}",
     "CrossDeviceFallback{destination:PathBuf}",
     "ConflictModified{source:String,artifact:String,changed:Vec<PathBuf>}",
