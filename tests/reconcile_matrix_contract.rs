@@ -75,11 +75,7 @@ fn observed(entries: Vec<ObservedEntry>) -> ObservedProjectState {
 }
 
 fn policy(force: bool, prune: bool) -> ReconciliationPolicy {
-    ReconciliationPolicy {
-        force,
-        prune,
-        ..ReconciliationPolicy::default()
-    }
+    ReconciliationPolicy { force, prune }
 }
 
 fn managed(condition: ManagedCondition) -> ObservedArtifact {

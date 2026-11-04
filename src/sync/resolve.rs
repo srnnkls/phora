@@ -172,15 +172,15 @@ fn revision_spec(refspec: &Refspec) -> Result<RevisionSpec> {
 }
 
 /// The lock entry that lets a unit skip fetch+resolve, or `None` when a fetch is
-/// required (no matching entry, or `force`).
+/// required (no matching entry, or `refresh`).
 fn lock_hit<'l>(
     config: &Config,
     source: &ParsedSource,
     unit: &Unit,
     effective_lock: Option<&'l Lock>,
-    force: bool,
+    refresh: bool,
 ) -> Option<&'l LockedSource> {
-    if force {
+    if refresh {
         return None;
     }
     let discriminator = ref_discriminator(&unit.effective_ref, &source.refspec());
@@ -203,7 +203,7 @@ fn frozen_miss(name: &str, transitive: bool) -> crate::error::Error {
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "resolving one unit threads config/parsed/remotes/lock/backend plus the force and frozen run flags"
+    reason = "resolving one unit threads config/parsed/remotes/lock/backend plus the refresh and frozen run flags"
 )]
 #[cfg_attr(feature = "trace", tracing::instrument(skip_all, fields(unit = %unit.name)))]
 fn resolve_unit(
@@ -213,7 +213,7 @@ fn resolve_unit(
     instances: &BTreeMap<String, String>,
     effective_lock: Option<&Lock>,
     store: &dyn SourceStore,
-    force: bool,
+    refresh: bool,
     frozen: bool,
     unit: &Unit,
     mirror_refreshed: &mut bool,
@@ -223,7 +223,7 @@ fn resolve_unit(
     };
     let git = remote_for(remotes, &unit.name)?;
 
-    let lock_entry = lock_hit(config, source, unit, effective_lock, force);
+    let lock_entry = lock_hit(config, source, unit, effective_lock, refresh);
     if lock_entry.is_none() && frozen && source.deploy_mode() != DeployMode::Link {
         return Err(frozen_miss(&unit.name, instances.contains_key(&unit.name)));
     }
@@ -287,7 +287,9 @@ fn resolve_unit(
     };
 
     let digest = match lock_entry {
-        Some(locked) if locked.commit == commit => {
+        Some(locked)
+            if locked.commit == commit && locked.config_digest == source.config_digest() =>
+        {
             prefetch_selected_leaves(store, &source_resolution, source)?;
             locked.digest.clone()
         }
@@ -531,7 +533,7 @@ fn fetch_outcome<T>(resolved: &Result<T>, mirror_refreshed: bool) -> FetchOutcom
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "resolution threads config/parsed/remotes/lock/backend plus the force, frozen, and jobs run flags"
+    reason = "resolution threads config/parsed/remotes/lock/backend plus the refresh, frozen, and jobs run flags"
 )]
 #[cfg_attr(feature = "trace", tracing::instrument(skip_all))]
 pub(super) fn resolve_sources(
@@ -542,7 +544,7 @@ pub(super) fn resolve_sources(
     imports: &[ImportResolution],
     effective_lock: Option<&Lock>,
     store: &dyn SourceStore,
-    force: bool,
+    refresh: bool,
     frozen: bool,
     jobs: Option<usize>,
     sink: &dyn ProgressSink,
@@ -583,7 +585,7 @@ pub(super) fn resolve_sources(
                             instances,
                             effective_lock,
                             store,
-                            force,
+                            refresh,
                             frozen,
                             unit,
                             &mut mirror_refreshed,
@@ -624,7 +626,7 @@ pub fn resolve_sources_for_bench(
     remotes: &BTreeMap<String, String>,
     effective_lock: Option<&Lock>,
     store: &dyn SourceStore,
-    force: bool,
+    refresh: bool,
     jobs: Option<usize>,
 ) -> Result<RoutedSources> {
     resolve_sources(
@@ -635,7 +637,7 @@ pub fn resolve_sources_for_bench(
         &[],
         effective_lock,
         store,
-        force,
+        refresh,
         false,
         jobs,
         super::progress::SILENT,

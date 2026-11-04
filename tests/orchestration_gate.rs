@@ -952,7 +952,7 @@ fn one_workspace_projection_is_threaded_across_the_entire_sync_run() {
     assert_eq!(
         total, 1,
         "T021 one-Projection invariant: a sync run must call project_workspace exactly once, then \
-         thread that Projection through fast-forward/drop guarding, deploy/observe/reconcile/apply, \
+         thread that Projection through upstream-drop guarding, deploy/observe/reconcile/apply, \
          and prune. Function/module aliases are resolved. Found {total} production call sites: \
          {call_sites:?}"
     );

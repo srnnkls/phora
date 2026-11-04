@@ -8,8 +8,8 @@ use phora::config::Config;
 use phora::source::GitBackend;
 use phora::sync::state::{ArtifactRecord, FileStateStore, StateStore};
 use phora::sync::{
-    Concurrency, ConflictPolicy, HookPolicy, LockSet, MovedPinPolicy, PrunePolicy, SourcePolicy,
-    SyncOptions, SyncRequest,
+    Concurrency, ConflictPolicy, HookPolicy, LockSet, PrunePolicy, SourcePolicy, SyncOptions,
+    SyncRequest,
 };
 
 mod common;
@@ -283,7 +283,6 @@ fn sync_options() -> SyncOptions {
         conflict_policy: ConflictPolicy::Refuse,
         prune_policy: PrunePolicy::KeepOrphans,
         hook_policy: HookPolicy::None,
-        moved_pin_policy: MovedPinPolicy::Seal,
         concurrency: Concurrency::default(),
     }
 }

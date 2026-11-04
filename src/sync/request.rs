@@ -59,7 +59,6 @@ pub struct SyncOptions {
     pub conflict_policy: ConflictPolicy,
     pub prune_policy: PrunePolicy,
     pub hook_policy: HookPolicy,
-    pub moved_pin_policy: MovedPinPolicy,
     pub concurrency: Concurrency,
 }
 
@@ -94,13 +93,6 @@ pub enum HookPolicy {
     None,
 }
 
-/// How a committed source pin that dropped an offered artifact is handled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MovedPinPolicy {
-    Seal,
-    FastForward,
-}
-
 /// Optional fixed worker count; `None` derives the pool size from the work.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Concurrency {
@@ -112,7 +104,6 @@ impl From<&SyncOptions> for ReconciliationPolicy {
         Self {
             force: matches!(options.conflict_policy, ConflictPolicy::Overwrite),
             prune: matches!(options.prune_policy, PrunePolicy::RemoveOrphans),
-            follow_moved_pin: matches!(options.moved_pin_policy, MovedPinPolicy::FastForward),
         }
     }
 }
@@ -208,14 +199,19 @@ pub enum SyncWarning {
         artifact: String,
         layout: String,
     },
-    FastForwardKeptLive {
+    UpstreamDropKeptLive {
         source: String,
         artifact: String,
         path: PathBuf,
     },
-    FastForwardDropped {
+    UpstreamDropped {
         source: String,
         artifact: String,
+    },
+    UpstreamDropModified {
+        source: String,
+        artifact: String,
+        changed: Vec<PathBuf>,
     },
     LinkedSourceDropped {
         source: String,

@@ -72,8 +72,8 @@ pub struct LockedSource {
     pub resolved: String,
     pub commit: String,
     pub digest: String,
-    /// Hash of export-affecting config; lets sync detect config changes that alter
-    /// export output without a commit change.
+    /// Hash of export-affecting config at the time `digest` was computed; a mismatch
+    /// re-digests the pinned commit without moving it.
     pub config_digest: String,
     /// Kind-tagged effective ref, set only when this entry overrides the source's
     /// default refspec; `None` for the canonical entry so bare locks stay byte-identical.
@@ -134,9 +134,9 @@ pub fn merge_locks(base: &Lock, local: Option<&Lock>) -> Lock {
     merged
 }
 
-/// Whether a locked resolution can be reused for `source`: same remote identity,
-/// refspec, and export-affecting config digest. A source that fails to resolve
-/// never matches.
+/// Whether a locked pin still belongs to `source`: same remote identity and refspec.
+/// Selection config (include, exclude, root, export policy) is not part of the pin.
+/// A source that fails to resolve never matches.
 #[must_use]
 pub fn source_matches(
     source: &ParsedSource,
@@ -148,7 +148,8 @@ pub fn source_matches(
 }
 
 /// Like [`source_matches`] but checks `effective_ref` against the lock's `resolved`,
-/// so a ref-overriding binding reuses only its own (source, ref) entry.
+/// so a ref-overriding binding reuses only its own (source, ref) entry. A build
+/// source has no remote pin; its config digest is its identity.
 #[must_use]
 pub fn entry_matches(
     source: &ParsedSource,
@@ -158,9 +159,8 @@ pub fn entry_matches(
     protocol: Protocol,
 ) -> bool {
     if let (SourceMode::Url, Some(url)) = (source.mode(), source.source_url()) {
-        // Url identity = url + config_digest; the synthetic commit is content-addressed, so no refspec/remote comparison.
-        return NormalizedUrl::parse(url) == NormalizedUrl::parse(&locked.git)
-            && source.config_digest() == locked.config_digest;
+        // The synthetic commit addresses the whole download, so the url alone identifies the pin.
+        return NormalizedUrl::parse(url) == NormalizedUrl::parse(&locked.git);
     }
 
     if source.mode() == SourceMode::Build {
@@ -173,7 +173,6 @@ pub fn entry_matches(
     // Protocol-independent: https/ssh/literal forms of one repo share an identity.
     NormalizedUrl::parse(&resolved) == NormalizedUrl::parse(&locked.git)
         && effective_ref.to_string() == locked.resolved
-        && source.config_digest() == locked.config_digest
 }
 
 /// Routes resolved sources into the base lock and the local lock (`None` when no
@@ -465,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn source_does_not_match_when_config_digest_differs_despite_same_git_and_refspec() {
+    fn source_matches_when_only_config_digest_differs() {
         let source = source_from(
             "git = \"https://github.com/me/dotfiles.git\"\nbranch = \"main\"\ninclude = [\"editor\"]\n",
         );
@@ -490,8 +489,8 @@ mod tests {
             "changing include must change the config digest (guards the test premise)"
         );
         assert!(
-            !source_matches(&source, &locked, &no_hosts(), Protocol::Https),
-            "same git + refspec but changed export config must NOT reuse the locked commit"
+            source_matches(&source, &locked, &no_hosts(), Protocol::Https),
+            "same git + refspec with changed selection config must keep the locked commit"
         );
     }
 
@@ -691,7 +690,7 @@ config_digest = \"PLACEHOLDER\"
     }
 
     #[test]
-    fn host_path_source_does_not_match_when_config_digest_differs() {
+    fn host_path_source_matches_when_only_config_digest_differs() {
         let source = source_from(
             "host = \"github\"\npath = \"srnnkls/tropos\"\nbranch = \"main\"\ninclude = [\"editor\"]\n",
         );
@@ -716,9 +715,9 @@ config_digest = \"PLACEHOLDER\"
             "changing include must change the config digest (guards the test premise)"
         );
         assert!(
-            !source_matches(&source, &locked, &no_hosts(), Protocol::Https),
-            "a symbolic host+path source whose remote + refspec match but whose config_digest \
-             differs must NOT reuse the lock"
+            source_matches(&source, &locked, &no_hosts(), Protocol::Https),
+            "a symbolic host+path source whose remote + refspec match keeps its pin when only \
+             the config_digest differs"
         );
     }
 
@@ -780,7 +779,7 @@ config_digest = \"PLACEHOLDER\"
     }
 
     #[test]
-    fn url_source_does_not_match_when_config_digest_differs() {
+    fn url_source_matches_when_only_config_digest_differs() {
         let source = url_source("https://example.com/p.tar.gz");
         let other = source_from("url = \"https://example.com/p.tar.gz\"\nallow_symlinks = true\n");
         let locked = LockedSource {
@@ -801,8 +800,8 @@ config_digest = \"PLACEHOLDER\"
             "changing allow_symlinks must change the config digest (guards the test premise)"
         );
         assert!(
-            !source_matches(&source, &locked, &no_hosts(), Protocol::Https),
-            "same url but a changed export config must NOT reuse the locked url import"
+            source_matches(&source, &locked, &no_hosts(), Protocol::Https),
+            "same url with a changed export config must keep the locked url import"
         );
     }
 

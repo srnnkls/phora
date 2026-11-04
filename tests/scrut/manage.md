@@ -80,11 +80,12 @@ committed
 `phora update` re-resolves the branch, advances the lock to the new commit, and
 redeploys the affected artifacts in one step — the previously deployed files are
 phora's own (clean against the old lock), so they are refreshed, not skipped as
-foreign content.
+foreign content. It reports the pin it moved.
 
 ```scrut
 $ phora update 2>&1 | normalize
 sync complete
+phora: updated dotfiles: main (ca94c83b) → main (7541e58d)
 ```
 
 `phora where` now reports the second commit `7541e58d` and the updated `editor`

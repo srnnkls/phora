@@ -10,8 +10,8 @@ use phora::projection::diagnostic::ProjectionWarning;
 use phora::source::GitBackend;
 use phora::sync::state::FileStateStore;
 use phora::sync::{
-    Concurrency, ConflictPolicy, HookPolicy, LockSet, MovedPinPolicy, PrunePolicy, SourcePolicy,
-    SyncOptions, SyncReport, SyncRequest, SyncWarning,
+    Concurrency, ConflictPolicy, HookPolicy, LockSet, PrunePolicy, SourcePolicy, SyncOptions,
+    SyncReport, SyncRequest, SyncWarning,
 };
 
 mod common;
@@ -84,7 +84,6 @@ fn sync_with_unmatched_take(pre_deploy: Option<&str>) -> (TempDir, SyncReport) {
                 } else {
                     HookPolicy::None
                 },
-                moved_pin_policy: MovedPinPolicy::Seal,
                 concurrency: Concurrency::default(),
             },
             resolver: None,

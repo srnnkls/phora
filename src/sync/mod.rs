@@ -51,9 +51,9 @@ pub use progress::{
 };
 pub use rebuild::{RebuildReport, rebuild_registry, rebuild_registry_with};
 pub use request::{
-    AppliedChange, Concurrency, ConflictPolicy, DeclineAll, HookPolicy, LockSet, MovedPinPolicy,
-    PrunePolicy, SkippedChange, SourcePolicy, SyncOptions, SyncReport, SyncRequest, SyncStatus,
-    SyncWarning, TrustPrompt, TrustRequest,
+    AppliedChange, Concurrency, ConflictPolicy, DeclineAll, HookPolicy, LockSet, PrunePolicy,
+    SkippedChange, SourcePolicy, SyncOptions, SyncReport, SyncRequest, SyncStatus, SyncWarning,
+    TrustPrompt, TrustRequest,
 };
 pub use verify::{
     OverlayFinding, UntrustedHookFinding, VerifyMismatch, VerifyReason, VerifyReport, verify,
@@ -122,8 +122,6 @@ pub struct SyncInput<'a> {
     /// Proceed without the project lock because the state root is read-only (frozen only).
     /// Legal only when the sync is write-free; any pending write is refused, naming the root.
     pub lockless: bool,
-    /// Follow a moved pin: delete an artifact the new commit dropped rather than sealing; a same-commit narrowing still hard-errors.
-    pub fast_forward: bool,
     pub resolver: Option<&'a dyn ConflictResolver>,
     /// Worker-pool size for parallel fetch/resolve/digest. `None` derives a
     /// default of `min(resolution_units, 8)`; `Some(n)` pins the pool to `n`.
@@ -185,10 +183,6 @@ impl SyncRunInput<'_> {
 
     fn frozen(&self) -> bool {
         matches!(self.options.source_policy, SourcePolicy::Frozen)
-    }
-
-    fn fast_forward(&self) -> bool {
-        matches!(self.options.moved_pin_policy, MovedPinPolicy::FastForward)
     }
 
     fn jobs(&self) -> Option<usize> {
@@ -341,11 +335,6 @@ impl TestSyncInvocation for SyncInput<'_> {
                     PrunePolicy::KeepOrphans
                 },
                 hook_policy,
-                moved_pin_policy: if self.fast_forward {
-                    MovedPinPolicy::FastForward
-                } else {
-                    MovedPinPolicy::Seal
-                },
                 concurrency: Concurrency {
                     jobs: self.jobs.and_then(std::num::NonZeroUsize::new),
                 },
@@ -547,7 +536,7 @@ impl<R: StateStore> DeployAll<'_, R> {
 
 struct DeployProtocol<'a, R> {
     workspace: DeployAll<'a, R>,
-    fast_forward_drops: &'a [FastForwardDrop],
+    upstream_drops: &'a [UpstreamDrop],
 }
 
 /// Outcome of the all-gates-before-mutation deploy protocol. `aborted` means a `pre_deploy` gate
@@ -714,7 +703,7 @@ where
 
 fn apply_target_changes<'a, R>(
     ctx: &DeployAll<'a, R>,
-    fast_forward_drops: &[FastForwardDrop],
+    upstream_drops: &[UpstreamDrop],
 ) -> Result<ApplyRun<'a>>
 where
     R: StateStore,
@@ -776,13 +765,14 @@ where
         changes: changeset.clone(),
         events: SyncEvents::new(ctx.input.sink()),
     };
-    apply_fast_forward_drops(
-        fast_forward_drops,
+    apply_upstream_drops(
+        upstream_drops,
         ctx.backend,
         ctx.registry,
         ctx.config,
         ctx.protected,
         &skipped_targets,
+        policy.force,
         &mut run.events,
     )?;
     ctx.input.sink().phase_started(Phase::Apply);
@@ -999,7 +989,7 @@ fn readonly_state_error(registry: &dyn StateStore) -> Error {
     state::readonly_root_error(state_root).into()
 }
 
-enum FastForwardDrop {
+enum UpstreamDrop {
     /// `link` is the symlink a linked record's deployed path held when the drop was planned.
     Remove {
         record: ArtifactRecord,
@@ -1010,7 +1000,7 @@ enum FastForwardDrop {
     },
 }
 
-impl FastForwardDrop {
+impl UpstreamDrop {
     fn record(&self) -> &ArtifactRecord {
         match self {
             Self::Remove { record, .. } | Self::KeepLive { record, .. } => record,
@@ -1018,14 +1008,14 @@ impl FastForwardDrop {
     }
 }
 
-fn plan_fast_forward_drops(
+fn plan_upstream_drops(
     projection: &Projection,
     config: &Config,
     registry: &dyn StateStore,
     protected: &confine::ProtectedPathSet,
     drops: Vec<ArtifactRecord>,
     lockless: bool,
-) -> Result<Vec<FastForwardDrop>> {
+) -> Result<Vec<UpstreamDrop>> {
     if drops.is_empty() {
         return Ok(Vec::new());
     }
@@ -1041,19 +1031,19 @@ fn plan_fast_forward_drops(
         let dst = prune::removal_destination(target, &record);
         let path = prune::removal_path(target, &record, protected).map_err(|error| {
             Error::Sync(format!(
-                "fast-forward refuses out-of-anchor {}: {error}; eject it instead",
+                "upstream drop refuses out-of-anchor {}: {error}; eject it instead",
                 dst.display()
             ))
         })?;
         if prune::overlaps_live_dest(&path, &expected_paths, &record.key.target) {
-            plan.push(FastForwardDrop::KeepLive { record });
+            plan.push(UpstreamDrop::KeepLive { record });
         } else {
             let link = if record.linked {
                 std::fs::read_link(&dst).ok()
             } else {
                 None
             };
-            plan.push(FastForwardDrop::Remove { record, link });
+            plan.push(UpstreamDrop::Remove { record, link });
         }
     }
     Ok(plan)
@@ -1350,20 +1340,19 @@ fn sync_workspace<R: StateStore>(
     for warning in std::mem::take(&mut projection.warnings) {
         events.push_warning(SyncWarning::Projection(warning));
     }
-    let pending_fast_forward_drops = validate_sealed_offer(
+    let pending_upstream_drops = validate_sealed_offer(
         &effective_config,
         &parsed,
         &projection,
         &recorded_after_recovery,
-        input.fast_forward(),
         input.prune(),
     )?;
-    let fast_forward_drops = plan_fast_forward_drops(
+    let upstream_drops = plan_upstream_drops(
         &projection,
         &effective_config,
         compat_registry,
         &protected,
-        pending_fast_forward_drops,
+        pending_upstream_drops,
         input.lockless,
     )?;
 
@@ -1381,7 +1370,7 @@ fn sync_workspace<R: StateStore>(
             registry,
             journal: &journal,
         },
-        fast_forward_drops: &fast_forward_drops,
+        upstream_drops: &upstream_drops,
     };
     deploy_and_run_hooks(
         &deploy,
@@ -1414,9 +1403,9 @@ where
 {
     let DeployProtocol {
         workspace: deploy,
-        fast_forward_drops,
+        upstream_drops,
     } = protocol;
-    let mut run = apply_target_changes(deploy, fast_forward_drops)?;
+    let mut run = apply_target_changes(deploy, upstream_drops)?;
     run.events.applied.splice(0..0, events.applied);
     run.events.skipped.splice(0..0, events.skipped);
     run.events.warnings.splice(0..0, events.warnings);
@@ -1643,7 +1632,7 @@ impl SealedRecordPolicy {
         self.immutable_copy && !self.commit_differs
     }
 
-    fn fast_forward_actionable(self) -> bool {
+    fn follows_moved_pin(self) -> bool {
         self.immutable_copy && self.commit_differs
     }
 }
@@ -1652,8 +1641,8 @@ impl SealedRecordPolicy {
 /// attribution clears a record in every deploy mode, so a leaf dropped only by `take` stays
 /// allowed. Only immutable-copy records may treat exclusion of every candidate by the current
 /// offer as intentional config narrowing, or exact current-commit equality as a projection-shape
-/// transition; both are left to reconciliation/prune. When commits differ, only immutable-copy
-/// records are actionable `--fast-forward` drops. A Link binding mirrors its live source: a
+/// transition; both are left to reconciliation/prune. When commits differ, an immutable-copy
+/// record follows the moved pin and is dropped. A Link binding mirrors its live source: a
 /// linked record whose deployed path is still the symlink into that source, dangling or not, is a
 /// drop on every sync. Any other linked record without positive attribution remains ambiguous and
 /// seals, even when the current offer excludes every available candidate. `--prune` also admits
@@ -1664,7 +1653,6 @@ fn validate_sealed_offer(
     parsed: &BTreeMap<String, ParsedSource>,
     projection: &Projection,
     recorded: &[ArtifactRecord],
-    fast_forward: bool,
     prune: bool,
 ) -> Result<Vec<ArtifactRecord>> {
     use crate::projection::offer::OfferSelection;
@@ -1743,7 +1731,7 @@ fn validate_sealed_offer(
             && config.targets.get(&key.target).is_some_and(|target| {
                 links_into_source(record, target, offer.live_root.as_deref(), &source_paths)
             });
-        if mirrors_live_source || (fast_forward && policy.fast_forward_actionable()) {
+        if mirrors_live_source || policy.follows_moved_pin() {
             dropped.push(record.clone());
             continue;
         }
@@ -1760,7 +1748,6 @@ fn validate_sealed_offer(
             recorded_commit: &record.commit,
             resolved_commit: &offer.projected.commit,
             resolved_ref: &offer.ref_label,
-            fast_forward_actionable: policy.fast_forward_actionable(),
         }));
     }
     Ok(dropped)
@@ -1848,6 +1835,35 @@ fn persisted_manifest_relative_path(path: &Path) -> Result<ArtifactRelativePath>
     })
 }
 
+/// The files of a managed copy that differ from its record, or `None` when the
+/// deployed copy is clean, absent, or not a plain copy.
+fn locally_modified(
+    record: &ArtifactRecord,
+    target: &crate::config::Target,
+    registry: &dyn StateStore,
+) -> Result<Option<Vec<PathBuf>>> {
+    if record.linked || record.history {
+        return Ok(None);
+    }
+    let ejected = registry.ejections(&record.key.target)?;
+    let observation = inspect::inspect(
+        &prune::removal_destination(target, record),
+        &record.key.source,
+        &record.commit,
+        &ejected,
+        registry,
+        &record.key,
+        record.vars_digest.as_deref(),
+    )?;
+    Ok(match observation {
+        model::ObservedArtifact::Managed(model::ManagedArtifact {
+            condition: model::ManagedCondition::Modified { changed },
+            ..
+        }) => Some(changed),
+        _ => None,
+    })
+}
+
 fn paths_overlap(first: &str, second: &str) -> bool {
     first == second
         || first
@@ -1858,13 +1874,18 @@ fn paths_overlap(first: &str, second: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-fn apply_fast_forward_drops(
-    drops: &[FastForwardDrop],
+#[expect(
+    clippy::too_many_arguments,
+    reason = "applying drops threads the stores, config, confinement, skip set, overwrite flag, and events"
+)]
+fn apply_upstream_drops(
+    drops: &[UpstreamDrop],
     backend: &dyn SourceStore,
     registry: &dyn StateStore,
     config: &Config,
     protected: &confine::ProtectedPathSet,
     skipped_targets: &BTreeSet<String>,
+    force: bool,
     events: &mut SyncEvents,
 ) -> Result<()> {
     let mut emptied = prune::EmptiedDirectories::default();
@@ -1875,26 +1896,40 @@ fn apply_fast_forward_drops(
         }
         let target = config.targets.get(&record.key.target).ok_or_else(|| {
             Error::Sync(format!(
-                "fast-forward target `{}` disappeared before removal",
+                "upstream drop target `{}` disappeared before removal",
                 record.key.target
             ))
         })?;
         let path = prune::removal_path(target, record, protected).map_err(|error| {
             Error::Sync(format!(
-                "fast-forward refuses out-of-anchor {}: {error}; eject it instead",
+                "upstream drop refuses out-of-anchor {}: {error}; eject it instead",
                 record.key.artifact
             ))
         })?;
         match drop {
-            FastForwardDrop::KeepLive { .. } => {
-                events.push_warning(SyncWarning::FastForwardKeptLive {
+            UpstreamDrop::KeepLive { .. } => {
+                events.push_warning(SyncWarning::UpstreamDropKeptLive {
                     source: record.key.source.clone(),
                     artifact: record.key.artifact.clone(),
                     path,
                 });
             }
-            FastForwardDrop::Remove { link, .. } => {
+            UpstreamDrop::Remove { link, .. } => {
                 if record.linked && std::fs::read_link(&path).ok() != *link {
+                    continue;
+                }
+                if !force && let Some(changed) = locally_modified(record, target, registry)? {
+                    events.push_warning(SyncWarning::UpstreamDropModified {
+                        source: record.key.source.clone(),
+                        artifact: record.key.artifact.clone(),
+                        changed: changed.clone(),
+                    });
+                    events.push_skipped(SkippedChange::Conflict {
+                        target: record.key.target.clone(),
+                        source: record.key.source.clone(),
+                        artifact: record.key.artifact.clone(),
+                        kind: model::ConflictKind::Modified { changed },
+                    });
                     continue;
                 }
                 let source = record.key.source.clone();
@@ -1902,10 +1937,10 @@ fn apply_fast_forward_drops(
                 events.push_warning(if record.linked {
                     SyncWarning::LinkedSourceDropped { source, artifact }
                 } else {
-                    SyncWarning::FastForwardDropped { source, artifact }
+                    SyncWarning::UpstreamDropped { source, artifact }
                 });
                 remove_orphan_path(&path).map_err(|error| {
-                    Error::Sync(format!("fast-forward prune {}: {error}", path.display()))
+                    Error::Sync(format!("upstream drop removal {}: {error}", path.display()))
                 })?;
                 emptied.record(config, record);
                 detach_history_overlay(record, &path, backend)?;
@@ -1917,7 +1952,7 @@ fn apply_fast_forward_drops(
 }
 
 #[cfg(test)]
-fn prune_fast_forward_drops_report(
+fn prune_upstream_drops_report(
     projection: &Projection,
     config: &Config,
     registry: &dyn StateStore,
@@ -1926,7 +1961,7 @@ fn prune_fast_forward_drops_report(
     lockless: bool,
     events: &mut SyncEvents,
 ) -> Result<()> {
-    let plan = plan_fast_forward_drops(
+    let plan = plan_upstream_drops(
         projection,
         config,
         registry,
@@ -1935,13 +1970,14 @@ fn prune_fast_forward_drops_report(
         lockless,
     )?;
     let backend = crate::source::GitBackend::new(PathBuf::new());
-    apply_fast_forward_drops(
+    apply_upstream_drops(
         &plan,
         &backend,
         registry,
         config,
         protected,
         &BTreeSet::new(),
+        false,
         events,
     )
 }
@@ -1954,7 +1990,6 @@ struct SealedOffer<'a> {
     recorded_commit: &'a str,
     resolved_commit: &'a str,
     resolved_ref: &'a str,
-    fast_forward_actionable: bool,
 }
 
 fn sealed_offer_diagnostic(ctx: &SealedOffer<'_>) -> Error {
@@ -1966,7 +2001,6 @@ fn sealed_offer_diagnostic(ctx: &SealedOffer<'_>) -> Error {
         recorded_commit,
         resolved_commit,
         resolved_ref,
-        fast_forward_actionable,
     } = ctx;
     let now = pin_label(resolved_ref, resolved_commit);
     let mut details = vec![
@@ -1979,17 +2013,13 @@ fn sealed_offer_diagnostic(ctx: &SealedOffer<'_>) -> Error {
     if let Some(path) = deploy_path {
         details.push(format!("path: {path}"));
     }
-    let remedy = if fast_forward_actionable {
-        "re-sync with `--fast-forward` to drop it, or eject it before removing it".to_string()
-    } else {
-        "restore the artifact to the source's offer, or eject it before removing it".to_string()
-    };
     crate::diagnostic::SelectionDiagnostic {
         entry: format!("{target}:{source}:{artifact}"),
         matched_against: format!("the current offer of source `{source}` in target `{target}`"),
         why: "a recorded artifact is no longer in the source's offer".to_string(),
         did_you_mean: None,
-        remedy,
+        remedy: "restore the artifact to the source's offer, or eject it before removing it"
+            .to_string(),
         debug_hint: Some(format!("phora explain {target} {source} {artifact}")),
         details,
     }

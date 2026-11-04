@@ -231,7 +231,7 @@ fn linked_package_keeps_its_remote_dependency_at_the_locked_commit() {
     fixture.succeeds(&["sync", "--frozen"]);
     assert_eq!(fixture.loqui_commit(), pinned);
 
-    fixture.succeeds(&["update", "--fast-forward"]);
+    fixture.succeeds(&["update"]);
     assert_eq!(
         fixture.read(".tropos/skills/loqui/reference/loqui/languages/rust/README.md"),
         "Loqui v2\n"

@@ -105,20 +105,20 @@ fn assert_dropped_tree_gone(fixture: &Fixture) {
 }
 
 #[test]
-fn fast_forward_drop_removes_emptied_artifact_directories() {
+fn upstream_drop_removes_emptied_artifact_directories() {
     let fixture = fixture("copy");
     drop_upstream(&fixture);
-    phora(&fixture.root, &["update", "--fast-forward"]);
+    phora(&fixture.root, &["update"]);
     assert_dropped_tree_gone(&fixture);
 }
 
 #[test]
-fn fast_forward_drop_keeps_a_directory_holding_a_foreign_file_and_reports_it() {
+fn upstream_drop_keeps_a_directory_holding_a_foreign_file_and_reports_it() {
     let fixture = fixture("copy");
     let foreign = fixture.destination.join("skills/drop/notes.txt");
     fs::write(&foreign, b"mine\n").expect("foreign file");
     drop_upstream(&fixture);
-    let output = phora(&fixture.root, &["update", "--fast-forward"]);
+    let output = phora(&fixture.root, &["update"]);
 
     assert_eq!(
         fs::read(&foreign).expect("foreign file survives"),

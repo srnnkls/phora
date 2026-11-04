@@ -1,5 +1,6 @@
 //! Mutating commands: `sync`, `update`, `rebuild-registry`, and lock I/O.
 
+use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -12,9 +13,8 @@ use crate::paths::{cache_root_for, state_root_for};
 use crate::sync::state::ProjectId;
 use crate::sync::state::{FileStateStore, StateError, StateStore};
 use crate::sync::{
-    Concurrency, ConflictPolicy, ConflictResolver, HookPolicy, LockSet, MovedPinPolicy,
-    PrunePolicy, SkippedChange, SourcePolicy, SyncOptions, SyncReport, SyncRequest, SyncWarning,
-    sync_opened,
+    Concurrency, ConflictPolicy, ConflictResolver, HookPolicy, LockSet, PrunePolicy, SkippedChange,
+    SourcePolicy, SyncOptions, SyncReport, SyncRequest, SyncWarning, sync_opened,
 };
 
 use super::json::JsonSink;
@@ -41,7 +41,6 @@ pub(super) fn run_sync(
     no_hooks: bool,
     no_transitive_hooks: bool,
     frozen: bool,
-    fast_forward: bool,
     no_progress: bool,
     json: bool,
     drop: Option<DropSources>,
@@ -53,6 +52,9 @@ pub(super) fn run_sync(
     let local = load_local_config(&cwd)?;
     let (mut base_lock, mut local_lock) = load_locks(&cwd)?;
 
+    let pins_before = drop
+        .is_some()
+        .then(|| root_pins(base_lock.as_ref(), local_lock.as_ref()));
     if let Some(drop) = drop {
         drop_sources(base_lock.as_mut(), &drop);
         drop_sources(local_lock.as_mut(), &drop);
@@ -121,11 +123,6 @@ pub(super) fn run_sync(
                 PrunePolicy::KeepOrphans
             },
             hook_policy,
-            moved_pin_policy: if fast_forward {
-                MovedPinPolicy::FastForward
-            } else {
-                MovedPinPolicy::Seal
-            },
             concurrency: Concurrency { jobs },
         },
         resolver: interactive.then_some(&resolver as &dyn ConflictResolver),
@@ -137,10 +134,49 @@ pub(super) fn run_sync(
     })?;
 
     let outcome = finish_sync(&cwd, &out, interactive, &reporter)?;
+    if let Some(before) = pins_before {
+        for line in pin_moves(
+            &before,
+            &root_pins(out.locks.base.as_ref(), out.locks.local.as_ref()),
+        ) {
+            eprintln!("{line}");
+        }
+    }
     if outcome == CliOutcome::Success && !lockless {
         super::cache::auto_prune(&effective.paths, &cwd);
     }
     Ok(outcome)
+}
+
+type RootPins = BTreeMap<(String, Option<String>), (String, String)>;
+
+/// Consumer-root pins keyed by `(source, ref)`, mapped to `(resolved ref, commit)`.
+fn root_pins(base: Option<&Lock>, local: Option<&Lock>) -> RootPins {
+    base.into_iter()
+        .chain(local)
+        .flat_map(|lock| &lock.sources)
+        .filter(|entry| entry.instance.is_none())
+        .map(|entry| {
+            (
+                (entry.name.clone(), entry.r#ref.clone()),
+                (entry.resolved.clone(), entry.commit.clone()),
+            )
+        })
+        .collect()
+}
+
+fn pin_moves(before: &RootPins, after: &RootPins) -> Vec<String> {
+    let label = |(resolved, commit): &(String, String)| {
+        format!("{resolved} ({})", commit.get(..8).unwrap_or(commit))
+    };
+    after
+        .iter()
+        .filter_map(|(key, now)| {
+            let was = before.get(key)?;
+            (was.1 != now.1)
+                .then(|| format!("phora: updated {}: {} → {}", key.0, label(was), label(now)))
+        })
+        .collect()
 }
 
 struct StrippedHookNotice {
@@ -359,7 +395,6 @@ pub(super) fn run_rebuild_registry(lock_timeout: Duration) -> Result<()> {
 
 pub(super) fn run_update(
     source: Option<&str>,
-    fast_forward: bool,
     prune: bool,
     lock_timeout: Duration,
 ) -> Result<CliOutcome> {
@@ -370,7 +405,6 @@ pub(super) fn run_update(
         false,
         false,
         false,
-        fast_forward,
         false,
         false,
         Some(drop),

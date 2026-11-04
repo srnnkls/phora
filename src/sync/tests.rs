@@ -474,18 +474,16 @@ fn sync_reads_one_projection_inventory_across_drop_deploy_and_prune() {
     );
     let counting = CountingBackend::new(&fx.backend);
     let mut request = input(&cfg, None, None, None, false);
-    request.fast_forward = true;
     request.prune = true;
 
-    sync(&request, &counting, &fx.registry)
-        .expect("a fresh fast-forward + prune sync must succeed");
+    sync(&request, &counting, &fx.registry).expect("a fresh pin-following prune sync must succeed");
 
     assert_eq!(
         counting.discover_count(),
         2,
         "the final store performs exactly one inventory for lock digest selection and exactly one \
          to build the Projection. The projection inventory must then be threaded through \
-         fast-forward/drop guarding, deploy/observe/reconcile/apply, and prune; any third inventory \
+         upstream-drop guarding, deploy/observe/reconcile/apply, and prune; any third inventory \
          would reopen the phase-local TOCTOU window"
     );
 }
@@ -526,7 +524,6 @@ fn input<'a>(
         no_transitive_hooks: false,
         frozen: false,
         lockless: false,
-        fast_forward: false,
         resolver: None,
         jobs: None,
     }
@@ -3506,7 +3503,6 @@ fn second_deploy_over_correct_link_is_a_noop() {
         &ReconciliationPolicy {
             force: false,
             prune: false,
-            follow_moved_pin: false,
         },
     )
     .expect("live reconcile pass succeeds");
@@ -3694,7 +3690,6 @@ fn frozen_lockless_input(base: &Config, base_lock: Option<Lock>, prune: bool) ->
         no_transitive_hooks: false,
         frozen: true,
         lockless: true,
-        fast_forward: false,
         resolver: None,
         jobs: None,
     }
@@ -3750,7 +3745,7 @@ fn frozen_lockless_prune_with_a_pending_orphan_refuses_before_deleting_files() {
 }
 
 #[test]
-fn frozen_lockless_fast_forward_with_pending_drops_refuses_before_pruning() {
+fn frozen_lockless_sync_with_pending_upstream_drops_refuses_before_pruning() {
     let fx = build_sync_fixture();
     let cwd = TempDir::new().expect("cwd tempdir");
     let protected = test_protected(cwd.path());
@@ -3783,7 +3778,7 @@ fn frozen_lockless_fast_forward_with_pending_drops_refuses_before_pruning() {
     };
 
     let mut events = SyncEvents::discarding();
-    let err = prune_fast_forward_drops_report(
+    let err = prune_upstream_drops_report(
         &projection,
         &cfg,
         &fx.registry,
@@ -3792,7 +3787,7 @@ fn frozen_lockless_fast_forward_with_pending_drops_refuses_before_pruning() {
         true,
         &mut events,
     )
-    .expect_err("a read-only fast-forward carrying pending drops must refuse before any delete");
+    .expect_err("a read-only sync carrying pending upstream drops must refuse before any delete");
 
     let msg = err.to_string();
     assert!(
@@ -3869,7 +3864,6 @@ fn sync_with_prune_removes_orphan_files_and_record_but_keeps_current() {
         no_transitive_hooks: false,
         frozen: false,
         lockless: false,
-        fast_forward: false,
         resolver: None,
         jobs: None,
     };
@@ -3941,7 +3935,6 @@ fn sync_skips_prune_when_a_deploy_failed() {
         no_transitive_hooks: false,
         frozen: false,
         lockless: false,
-        fast_forward: false,
         resolver: None,
         jobs: None,
     };
@@ -4024,7 +4017,6 @@ fn prune_keeps_record_when_orphan_path_overlaps_a_live_dest() {
         no_transitive_hooks: false,
         frozen: false,
         lockless: false,
-        fast_forward: false,
         resolver: None,
         jobs: None,
     };
@@ -4068,7 +4060,6 @@ fn prune_drops_record_when_orphan_path_is_already_absent() {
         no_transitive_hooks: false,
         frozen: false,
         lockless: false,
-        fast_forward: false,
         resolver: None,
         jobs: None,
     };
@@ -4107,7 +4098,6 @@ fn prune_deletes_file_and_drops_record_for_a_normal_orphan() {
         no_transitive_hooks: false,
         frozen: false,
         lockless: false,
-        fast_forward: false,
         resolver: None,
         jobs: None,
     };
@@ -4821,7 +4811,6 @@ fn interactive_input<'a>(
         no_transitive_hooks: false,
         frozen: false,
         lockless: false,
-        fast_forward: false,
         resolver: Some(resolver),
         jobs: None,
     }
@@ -13178,7 +13167,6 @@ fn prune_only_sync_skips_on_change_but_runs_post_sync() {
         no_transitive_hooks: false,
         frozen: false,
         lockless: false,
-        fast_forward: false,
         resolver: None,
         jobs: None,
     };
@@ -13771,7 +13759,6 @@ fn input_with_jobs(base: &Config, jobs: usize) -> SyncInput<'_> {
         no_transitive_hooks: false,
         frozen: false,
         lockless: false,
-        fast_forward: false,
         resolver: None,
         jobs: Some(jobs),
     }
@@ -14111,64 +14098,6 @@ fn seed_recorded_artifact_at(reg: &FileStateStore, source: &str, artifact: &str,
 }
 
 #[test]
-fn sealed_offer_source_dropped_a_still_wanted_artifact_is_a_hard_error() {
-    let src = TempDir::new().expect("src tempdir");
-    let p = src.path();
-    run_git(p, &["init", "-b", "main", "."]);
-    run_git(p, &["config", "user.email", "test@example.com"]);
-    run_git(p, &["config", "user.name", "Test"]);
-    std::fs::create_dir_all(p.join("docs")).expect("mkdir docs");
-    std::fs::write(p.join("docs/readme.md"), b"# docs\n").expect("write docs");
-    run_git(p, &["add", "-A"]);
-    run_git(p, &["commit", "-m", "init without editor/"]);
-    let url = p.to_string_lossy().into_owned();
-
-    let git_dir = TempDir::new().expect("git dir");
-    let state_dir = TempDir::new().expect("state dir");
-    let backend = GitBackend::new(git_dir.path().to_path_buf());
-    let registry = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
-
-    let td = TargetDir::new();
-    let toml = format!(
-        "version = 1\n\n\
-         [sources.editor-src]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
-         [targets.dest]\npath = \"{}\"\nsources = [\"editor-src\"]\nlayout = \"flat\"\n",
-        td.target_path().display(),
-    );
-    let cfg = Config::parse(&toml).expect("default-offer config parses");
-
-    seed_recorded_artifact(&registry, "editor-src", "editor");
-
-    let in_ = input(&cfg, None, None, None, false);
-    let Err(err) = sync(&in_, &backend, &registry) else {
-        panic!(
-            "the default offer STILL selects `editor`, but the source dropped it: a silent source \
-             narrowing under an active offer must be a hard error (D9)"
-        );
-    };
-    let msg = err.to_string();
-    assert_sealed_offer_diagnostic(&msg, "dest", "editor-src", "editor");
-    assert!(
-        msg.contains("--fast-forward"),
-        "the pin moved off the recorded commit, so the remedy must surface `--fast-forward` as \
-         the way to follow the drop; got:\n{msg}"
-    );
-    assert!(
-        msg.contains("binding: source `editor-src` → target `dest`"),
-        "the rejection must name the source→target binding in plain terms; got:\n{msg}"
-    );
-    assert!(
-        msg.contains("pin: recorded ") && msg.contains(" → now "),
-        "the rejection must show the pin transition (recorded commit → resolved ref); got:\n{msg}"
-    );
-    assert!(
-        msg.contains("path: ") && msg.contains("editor"),
-        "the rejection must name the affected deploy path; got:\n{msg}"
-    );
-    drop(src);
-}
-
-#[test]
 fn sealed_offer_ejecting_a_source_dropped_artifact_unblocks_sync() {
     let src = TempDir::new().expect("src tempdir");
     let p = src.path();
@@ -14318,65 +14247,223 @@ fn sealed_offer_intentional_narrowing_does_not_block_prune_of_the_dropped_artifa
 }
 
 /// Init a source repo with only `docs/` (no `editor/`), returning its url and HEAD sha.
-fn init_editorless_source(p: &Path) -> (String, String) {
+#[test]
+fn moved_pin_deletes_an_artifact_the_new_commit_dropped() {
+    let src = TempDir::new().expect("src tempdir");
+    let p = src.path();
+    let (url, _c0, _c1) = two_commit_editor_lint_source(p);
+    let td = TargetDir::new();
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let cfg = editor_lint_config(&url, "branch = \"main\"", &td);
+    sync(&input(&cfg, None, None, None, false), &backend, &registry).expect("deploy lint");
+    let deployed = td.target_path().join("lint");
+    assert!(deployed.exists(), "premise: lint is deployed");
+
+    run_git(p, &["rm", "-r", "-q", "lint"]);
+    run_git(p, &["commit", "-m", "drop lint"]);
+    let report = sync_report(&input(&cfg, None, None, None, false), &backend, &registry)
+        .expect("sync must follow the moved pin: an artifact the new commit dropped is deleted");
+    assert!(
+        report.warnings.iter().any(|warning| matches!(
+            warning,
+            SyncWarning::UpstreamDropped { artifact, .. } if artifact == "lint"
+        )),
+        "the removal is reported as an upstream drop; got {:?}",
+        report.warnings
+    );
+    assert!(!deployed.exists(), "the upstream-removed copy is deleted");
+    assert!(
+        registry
+            .artifact(&artifact_key("dest", "ed", "lint"))
+            .expect("registry read")
+            .is_none(),
+        "the upstream-removed record is dropped",
+    );
+}
+
+fn sync_report(
+    input: &SyncInput<'_>,
+    backend: &dyn SourceStore,
+    registry: &FileStateStore,
+) -> Result<SyncReport> {
+    sync_core(&input.run_input(), backend, registry).map(|execution| execution.report)
+}
+
+fn has_upstream_drop_modified(report: &SyncReport, artifact: &str) -> bool {
+    report.warnings.iter().any(|warning| {
+        matches!(
+            warning,
+            SyncWarning::UpstreamDropModified { artifact: dropped, .. } if dropped == artifact
+        )
+    })
+}
+
+/// A repo with `editor/` and `lint/` at C0, then C1 editing `editor/` on `main`.
+fn two_commit_editor_lint_source(p: &Path) -> (String, String, String) {
     run_git(p, &["init", "-b", "main", "."]);
     run_git(p, &["config", "user.email", "test@example.com"]);
     run_git(p, &["config", "user.name", "Test"]);
-    std::fs::create_dir_all(p.join("docs")).expect("mkdir docs");
-    std::fs::write(p.join("docs/readme.md"), b"# docs\n").expect("write docs");
+    for (path, body) in [
+        ("editor/init.lua", "-- c0\n"),
+        ("lint/rules.toml", "strict = true\n"),
+    ] {
+        let file = p.join(path);
+        std::fs::create_dir_all(file.parent().expect("leaf has a parent")).expect("mkdir leaf");
+        std::fs::write(file, body).expect("write leaf");
+    }
     run_git(p, &["add", "-A"]);
-    run_git(p, &["commit", "-m", "init without editor/"]);
-    (p.to_string_lossy().into_owned(), rev_parse(p, "HEAD"))
+    run_git(p, &["commit", "-m", "c0"]);
+    let c0 = rev_parse(p, "HEAD");
+    run_git(p, &["branch", "next"]);
+    std::fs::write(p.join("editor/init.lua"), b"-- c1\n").expect("edit editor at C1");
+    run_git(p, &["commit", "-am", "c1"]);
+    let c1 = rev_parse(p, "HEAD");
+    (p.to_string_lossy().into_owned(), c0, c1)
+}
+
+fn editor_lint_config(url: &str, source_extra: &str, target: &TargetDir) -> Config {
+    Config::parse(&format!(
+        "version = 1\n\n\
+         [sources.ed]\ngit = \"{url}\"\n{source_extra}\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\"ed\"]\nlayout = \"flat\"\n",
+        target.target_path().display(),
+    ))
+    .expect("editor/lint config parses")
 }
 
 #[test]
-fn fast_forward_deletes_an_artifact_the_new_commit_dropped() {
+fn selection_edit_keeps_the_locked_commit_and_re_digests_it() {
     let src = TempDir::new().expect("src tempdir");
-    let (url, _sha) = init_editorless_source(src.path());
-
-    let git_dir = TempDir::new().expect("git dir");
-    let state_dir = TempDir::new().expect("state dir");
-    let backend = GitBackend::new(git_dir.path().to_path_buf());
-    let registry = FileStateStore::open(state_dir.path().to_path_buf()).expect("open registry");
-
+    let (url, c0, c1) = two_commit_editor_lint_source(src.path());
+    run_git(src.path(), &["reset", "--hard", &c0]);
     let td = TargetDir::new();
-    let toml = format!(
-        "version = 1\n\n\
-         [sources.editor-src]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
-         [targets.dest]\npath = \"{}\"\nsources = [\"editor-src\"]\nlayout = \"flat\"\n",
-        td.target_path().display(),
-    );
-    let cfg = Config::parse(&toml).expect("default-offer config parses");
+    let (_g, _s, backend, registry) = fresh_backend_registry();
 
-    let stale_dst = td.target_path().join("editor");
-    std::fs::create_dir_all(&stale_dst).expect("mkdir stale editor");
-    std::fs::write(stale_dst.join("init.lua"), b"-- init\n").expect("write stale file");
-    seed_recorded_artifact(&registry, "editor-src", "editor");
+    let narrow = editor_lint_config(&url, "branch = \"main\"\ninclude = [\"editor\"]", &td);
+    let first = sync(
+        &input(&narrow, None, None, None, false),
+        &backend,
+        &registry,
+    )
+    .expect("first sync pins C0");
+    let pinned = first
+        .base_lock
+        .find_source("ed")
+        .expect("ed is locked")
+        .clone();
+    assert_eq!(pinned.commit, c0, "premise: the first sync pins C0");
 
-    let in_ = SyncInput {
-        fast_forward: true,
-        ..input(&cfg, None, None, None, false)
-    };
-    let out = sync(&in_, &backend, &registry).expect(
-        "fast-forward must follow the moved pin: an artifact the new commit dropped is deleted, \
-         not sealed",
+    run_git(src.path(), &["reset", "--hard", &c1]);
+    let wide = editor_lint_config(
+        &url,
+        "branch = \"main\"\ninclude = [\"editor\", \"lint\"]",
+        &td,
     );
-    assert!(!out.had_failures, "the fast-forward run must succeed");
+    let second = sync(
+        &input(&wide, None, Some(first.base_lock.clone()), None, false),
+        &backend,
+        &registry,
+    )
+    .expect("widening the selection syncs from the lock");
+    let kept = second.base_lock.find_source("ed").expect("ed stays locked");
+    assert_eq!(
+        kept.commit, c0,
+        "a selection edit must not move the pin to the branch tip"
+    );
+    assert_eq!(kept.config_digest, parsed_of(&wide, "ed").config_digest());
+    assert_ne!(
+        kept.digest, pinned.digest,
+        "the widened selection is re-digested at the pin"
+    );
+    assert_eq!(
+        std::fs::read(td.target_path().join("editor/init.lua")).expect("editor deployed"),
+        b"-- c0\n",
+        "deployed content stays at the pinned commit"
+    );
     assert!(
-        !stale_dst.exists(),
-        "fast-forward must delete the on-disk copy of the upstream-removed artifact",
+        td.target_path().join("lint/rules.toml").exists(),
+        "the widened leaf deploys"
     );
-    assert!(
-        registry
-            .artifact(&artifact_key("dest", "editor-src", "editor"))
-            .expect("registry read")
-            .is_none(),
-        "fast-forward must drop the record for the upstream-removed artifact",
-    );
-    drop(src);
 }
 
-fn prepare_real_pending_fast_forward_drop(
+#[test]
+fn ref_edit_re_resolves_the_pin() {
+    let src = TempDir::new().expect("src tempdir");
+    let (url, c0, c1) = two_commit_editor_lint_source(src.path());
+    let td = TargetDir::new();
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+
+    let on_next = editor_lint_config(&url, "branch = \"next\"", &td);
+    let first = sync(
+        &input(&on_next, None, None, None, false),
+        &backend,
+        &registry,
+    )
+    .expect("first sync pins `next`");
+    assert_eq!(
+        first.base_lock.find_source("ed").expect("locked").commit,
+        c0
+    );
+
+    let on_main = editor_lint_config(&url, "branch = \"main\"", &td);
+    let second = sync(
+        &input(&on_main, None, Some(first.base_lock), None, false),
+        &backend,
+        &registry,
+    )
+    .expect("a ref edit resolves the new ref");
+    assert_eq!(
+        second.base_lock.find_source("ed").expect("locked").commit,
+        c1,
+        "editing the ref must resolve the new ref's tip"
+    );
+}
+
+#[test]
+fn moved_pin_keeps_a_locally_modified_dropped_artifact_unless_forced() {
+    let src = TempDir::new().expect("src tempdir");
+    let p = src.path();
+    let (url, _c0, _c1) = two_commit_editor_lint_source(p);
+    let td = TargetDir::new();
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let cfg = editor_lint_config(&url, "branch = \"main\"", &td);
+    sync(&input(&cfg, None, None, None, false), &backend, &registry).expect("deploy lint");
+
+    let deployed = td.target_path().join("lint/rules.toml");
+    std::fs::write(&deployed, b"strict = false\n").expect("edit the deployed copy");
+    run_git(p, &["rm", "-r", "-q", "lint"]);
+    run_git(p, &["commit", "-m", "drop lint"]);
+
+    let kept = sync_report(&input(&cfg, None, None, None, false), &backend, &registry)
+        .expect("a modified upstream drop is a conflict, not an error");
+    assert!(
+        has_upstream_drop_modified(&kept, "lint"),
+        "got {:?}",
+        kept.warnings
+    );
+    assert!(
+        kept.skipped.iter().any(|skipped| matches!(
+            skipped,
+            SkippedChange::Conflict { artifact, kind: model::ConflictKind::Modified { .. }, .. }
+                if artifact == "lint"
+        )),
+        "the kept drop is reported as a modified conflict; got {:?}",
+        kept.skipped
+    );
+    assert_eq!(std::fs::read(&deployed).expect("kept"), b"strict = false\n");
+    let key = artifact_key("dest", "ed", "lint");
+    assert!(registry.artifact(&key).expect("registry read").is_some());
+
+    sync(&input(&cfg, None, None, None, true), &backend, &registry)
+        .expect("--force deletes the modified drop");
+    assert!(
+        !deployed.exists(),
+        "--force must delete the modified dropped copy"
+    );
+    assert!(registry.artifact(&key).expect("registry read").is_none());
+}
+
+fn prepare_real_pending_upstream_drop(
     fx: &SyncFixture,
     target: &TargetDir,
 ) -> (PathBuf, Vec<ArtifactRecord>) {
@@ -14418,7 +14505,7 @@ fn prepare_real_pending_fast_forward_drop(
     let records = fx
         .registry
         .all_artifacts()
-        .expect("snapshot genuine records before fast-forward");
+        .expect("snapshot genuine records before following the pin");
     (stale_dst, records)
 }
 
@@ -14457,7 +14544,7 @@ fn config_pending_drop_with_later_target(
 fn fast_forward_drop_waits_for_later_post_hook_conflict_abort_before_mutating() {
     let fx = build_sync_fixture();
     let dropped_target = TargetDir::new();
-    let (stale_dst, records_before) = prepare_real_pending_fast_forward_drop(&fx, &dropped_target);
+    let (stale_dst, records_before) = prepare_real_pending_upstream_drop(&fx, &dropped_target);
     let editor_record_before = fx
         .registry
         .artifact(&artifact_key("dest", "editor-src", "editor"))
@@ -14483,8 +14570,7 @@ fn fast_forward_drop_waits_for_later_post_hook_conflict_abort_before_mutating() 
         None,
     );
     let resolver = ScriptedResolver::new(Resolution::Abort);
-    let mut request = interactive_input(&cfg, None, &resolver);
-    request.fast_forward = true;
+    let request = interactive_input(&cfg, None, &resolver);
 
     let result = sync(&request, &fx.backend, &fx.registry);
 
@@ -14545,7 +14631,7 @@ fn fast_forward_drop_waits_for_later_post_hook_conflict_abort_before_mutating() 
 fn fast_forward_drop_waits_for_failing_pre_sync_before_mutating() {
     let fx = build_sync_fixture();
     let dropped_target = TargetDir::new();
-    let (stale_dst, records_before) = prepare_real_pending_fast_forward_drop(&fx, &dropped_target);
+    let (stale_dst, records_before) = prepare_real_pending_upstream_drop(&fx, &dropped_target);
     let editor_record_before = fx
         .registry
         .artifact(&artifact_key("dest", "editor-src", "editor"))
@@ -14565,8 +14651,7 @@ fn fast_forward_drop_waits_for_failing_pre_sync_before_mutating() {
         None,
         Some(&failing_gate),
     );
-    let mut request = input(&cfg, None, None, None, false);
-    request.fast_forward = true;
+    let request = input(&cfg, None, None, None, false);
 
     let out = sync(&request, &fx.backend, &fx.registry)
         .expect("a failed pre_sync gate is reported through the sync output");
@@ -14735,7 +14820,7 @@ fn crashed_recovery_record(key: ArtifactKey, commit: &str) -> ArtifactRecord {
 fn sealed_offer_validates_crash_recovered_record_finalized_by_the_sweep() {
     let src = TempDir::new().expect("src tempdir");
     let p = src.path();
-    let (url, c0, c1) = build_moved_recovery_source(p);
+    let (url, c0, _c1) = build_moved_recovery_source(p);
 
     let git_dir = TempDir::new().expect("git dir");
     let state_dir = TempDir::new().expect("state dir");
@@ -14786,33 +14871,23 @@ fn sealed_offer_validates_crash_recovered_record_finalized_by_the_sweep() {
         "premise: the target registry is exactly empty before recovery_sweep"
     );
 
-    let in_ = input(&cfg, None, None, None, false);
-    let Err(err) = sync(&in_, &backend, &registry) else {
-        panic!(
-            "a crash-recovered, STILL-WANTED, source-dropped artifact must trip D9 once the \
-             sealed-offer snapshot is taken AFTER recovery_sweep, not before"
-        );
-    };
-    let rendered = err.to_string();
-    assert_sealed_offer_diagnostic(&rendered, "dest", "editor-src", "editor");
+    let report = sync_report(&input(&cfg, None, None, None, false), &backend, &registry)
+        .expect("the moved pin follows; the recovered copy, modified against its record, is kept");
     assert!(
-        rendered.contains(&c0[..8]) && rendered.contains(&c1[..8]),
-        "the recovery diagnostic must show the moved C0 -> C1 pin: {rendered}"
-    );
-    assert!(
-        rendered.contains("--fast-forward"),
-        "the recovered copy record is from an older immutable commit, so fast-forward may follow \
-         the moved pin: {rendered}"
+        has_upstream_drop_modified(&report, "editor"),
+        "the drop guard must see the record recovery_sweep finalized, so its snapshot is taken \
+         AFTER the sweep; got {:?}",
+        report.warnings
     );
     assert_eq!(
         registry.artifact(&crashed_key).expect("post-sync get"),
         Some(record),
-        "the sealed sync must preserve the exact record finalized by recovery_sweep"
+        "a kept modified drop must preserve the exact record finalized by recovery_sweep"
     );
     assert_eq!(
         std::fs::read(crashed_dst.join("init.lua")).expect("read recovered destination"),
         b"-- init\n",
-        "the sealed sync must preserve the crash-completed destination bytes"
+        "a kept modified drop must preserve the crash-completed destination bytes"
     );
     drop(src);
 }
@@ -15378,13 +15453,6 @@ mod leaf_granular_deploy_tests {
     }
 
     #[cfg(unix)]
-    #[derive(Clone, Copy, Debug)]
-    enum LinkDropPolicy {
-        Ordinary,
-        FastForward,
-    }
-
-    #[cfg(unix)]
     struct RealGitLinkDropFixture {
         source: TempDir,
         _target: TargetDir,
@@ -15512,11 +15580,10 @@ mod leaf_granular_deploy_tests {
             );
         }
 
-        fn request(&self, policy: LinkDropPolicy) -> SyncInput<'_> {
+        fn request(&self) -> SyncInput<'_> {
             SyncInput {
                 base_lock: Some(self.first_lock.clone()),
                 prune: true,
-                fast_forward: matches!(policy, LinkDropPolicy::FastForward),
                 ..input(&self.config, None, None, None, false)
             }
         }
@@ -15542,21 +15609,21 @@ mod leaf_granular_deploy_tests {
             );
         }
 
-        fn assert_mirrored_drop(&self, policy: LinkDropPolicy) {
+        fn assert_mirrored_drop(&self) {
             assert!(
                 self.registry
                     .artifact(&self.record.key)
                     .expect("registry read")
                     .is_none(),
-                "{policy:?}: a link the live source dropped must lose its record"
+                "a link the live source dropped must lose its record"
             );
             assert!(
                 std::fs::symlink_metadata(&self.destination).is_err(),
-                "{policy:?}: a link the live source dropped must be unlinked"
+                "a link the live source dropped must be unlinked"
             );
             assert!(
                 self.source_target.is_dir(),
-                "{policy:?}: unlinking must never follow the link into the source"
+                "unlinking must never follow the link into the source"
             );
         }
     }
@@ -15568,24 +15635,15 @@ mod leaf_granular_deploy_tests {
             rendered.contains("restore") && rendered.contains("eject"),
             "a mutable-link D9 must retain restore/eject escape guidance; got:\n{rendered}"
         );
-        assert!(
-            !rendered.contains("--fast-forward"),
-            "a mutable link can never be authorized by commit inequality, so its D9 diagnostic \
-             must not recommend --fast-forward; got:\n{rendered}"
-        );
     }
 
     #[cfg(unix)]
-    fn expect_leaf_offer_link_drop_mirrored(policy: LinkDropPolicy) {
+    fn expect_leaf_offer_link_drop_mirrored() {
         let fixture = RealGitLinkDropFixture::new(RealGitLinkSelection::LeafSpecificSourceOffer);
         fixture.delete_leaf_without_moving_head();
-        sync(
-            &fixture.request(policy),
-            &fixture.backend,
-            &fixture.registry,
-        )
-        .unwrap_or_else(|error| panic!("{policy:?}: {error}"));
-        fixture.assert_mirrored_drop(policy);
+        sync(&fixture.request(), &fixture.backend, &fixture.registry)
+            .unwrap_or_else(|error| panic!("{error}"));
+        fixture.assert_mirrored_drop();
     }
 
     #[cfg(unix)]
@@ -15643,38 +15701,26 @@ mod leaf_granular_deploy_tests {
 
     #[cfg(unix)]
     #[test]
-    fn real_git_link_record_never_fast_forwards_by_sentinel_sha_inequality() {
+    fn real_git_link_record_never_follows_a_sentinel_sha_inequality() {
         let fixture =
             RealGitLinkDropFixture::new(RealGitLinkSelection::ImplicitOfferWithTargetGlob);
         fixture.delete_leaf_without_moving_head();
         fixture.replace_link_with_real_dir();
 
-        for policy in [LinkDropPolicy::Ordinary, LinkDropPolicy::FastForward] {
-            let Err(error) = sync(
-                &fixture.request(policy),
-                &fixture.backend,
-                &fixture.registry,
-            ) else {
-                panic!(
-                    "B21-R3-H1: persisted `link` != current HEAD SHA must never authorize \
-                     deletion of a directory that replaced the link under {policy:?} prune"
-                );
-            };
-            assert_link_d9_diagnostic(&error.to_string());
-            fixture.assert_replacement_preserved();
-        }
+        let Err(error) = sync(&fixture.request(), &fixture.backend, &fixture.registry) else {
+            panic!(
+                "B21-R3-H1: persisted `link` != current HEAD SHA must never authorize deletion \
+                 of a directory that replaced the link under prune"
+            );
+        };
+        assert_link_d9_diagnostic(&error.to_string());
+        fixture.assert_replacement_preserved();
     }
 
     #[cfg(unix)]
     #[test]
-    fn real_git_leaf_specific_offer_mirrors_collapsed_link_drop_under_ordinary_prune() {
-        expect_leaf_offer_link_drop_mirrored(LinkDropPolicy::Ordinary);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn real_git_leaf_specific_offer_mirrors_collapsed_link_drop_under_fast_forward_prune() {
-        expect_leaf_offer_link_drop_mirrored(LinkDropPolicy::FastForward);
+    fn real_git_leaf_specific_offer_mirrors_collapsed_link_drop_under_prune() {
+        expect_leaf_offer_link_drop_mirrored();
     }
 
     #[cfg(unix)]
@@ -16159,33 +16205,12 @@ mod leaf_granular_deploy_tests {
         run_git(src.path(), &["add", "-A"]);
         run_git(src.path(), &["commit", "-m", "drop-template"]);
 
-        let Err(err) = sync(&pruning_sync(&cfg), &backend, &registry) else {
-            panic!(
-                "ordinary sync --prune must seal a source-dropped `.tmpl` leaf even though its \
-                 registry key carries the suffix-stripped published name"
-            );
-        };
-        let rendered = err.to_string();
-        assert_sealed_offer_diagnostic(&rendered, "dest", "ed", "editor/motd");
-        assert!(
-            rendered.contains("--fast-forward"),
-            "the source pin moved, so the diagnostic must offer --fast-forward; got:\n{rendered}"
-        );
-        assert!(
-            registry.artifact(&key).expect("registry read").is_some() && dst.exists(),
-            "a rejected ordinary prune must preserve both the template record and deployed path"
-        );
-
-        let fast_forward = SyncInput {
-            fast_forward: true,
-            prune: true,
-            ..input(&cfg, None, None, None, false)
-        };
-        sync(&fast_forward, &backend, &registry)
-            .expect("--fast-forward may follow the moved pin and remove the dropped template");
+        sync(&pruning_sync(&cfg), &backend, &registry)
+            .expect("a moved pin follows and removes the dropped template");
         assert!(
             registry.artifact(&key).expect("registry read").is_none() && !dst.exists(),
-            "fast-forward must remove both the dropped template record and deployed path"
+            "following the moved pin must remove both the suffix-stripped template record and \
+             its deployed path"
         );
         drop(src);
     }

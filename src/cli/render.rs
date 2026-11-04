@@ -67,18 +67,9 @@ pub(super) fn format_sync_warning(warning: &SyncWarning) -> Option<String> {
              cannot be reconstructed (layout `{layout}` unrecognized or missing its separator); \
              any file is left in place rather than deleting a guessed path"
         ),
-        SyncWarning::FastForwardKeptLive {
-            source,
-            artifact,
-            path,
-        } => format!(
-            "phora: fast-forward unrecorded {source}:{artifact} but kept {} (a live artifact sits \
-             there)",
-            path.display()
-        ),
-        SyncWarning::FastForwardDropped { source, artifact } => {
-            format!("phora: fast-forward dropped {source}:{artifact} (removed upstream)")
-        }
+        SyncWarning::UpstreamDropKeptLive { .. }
+        | SyncWarning::UpstreamDropped { .. }
+        | SyncWarning::UpstreamDropModified { .. } => format_upstream_drop(warning)?,
         SyncWarning::LinkedSourceDropped { source, artifact } => {
             format!("phora: removed {source}:{artifact} (no longer in the linked source's offer)")
         }
@@ -127,6 +118,37 @@ fn format_conflict_modified(
     }
     out.push_str("\n  use --force to overwrite");
     out
+}
+
+fn format_upstream_drop(warning: &SyncWarning) -> Option<String> {
+    Some(match warning {
+        SyncWarning::UpstreamDropKeptLive {
+            source,
+            artifact,
+            path,
+        } => format!(
+            "phora: unrecorded {source}:{artifact} (removed upstream) but kept {} (a live artifact \
+             sits there)",
+            path.display()
+        ),
+        SyncWarning::UpstreamDropped { source, artifact } => {
+            format!("phora: removed {source}:{artifact} (removed upstream)")
+        }
+        SyncWarning::UpstreamDropModified {
+            source,
+            artifact,
+            changed,
+        } => {
+            let mut out =
+                format!("phora: keeping locally modified {source}:{artifact} (removed upstream)");
+            for path in changed {
+                let _ = write!(out, "\n    {}", path.display());
+            }
+            out.push_str("\n  use --force to delete it, or `phora eject` to keep it unmanaged");
+            out
+        }
+        _ => return None,
+    })
 }
 
 fn content_filter_cause(attributes: bool, autocrlf: bool) -> &'static str {

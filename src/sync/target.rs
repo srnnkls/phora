@@ -1446,7 +1446,6 @@ fn reconciled_test_change(
     let policy = crate::sync::model::ReconciliationPolicy {
         force: test_policy.force,
         prune: false,
-        follow_moved_pin: false,
     };
     super::reconcile::reconcile(&projection, &observed, &policy)
         .expect("live reconcile accepts the fixture")

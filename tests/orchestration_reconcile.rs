@@ -76,11 +76,7 @@ fn managed(condition: ManagedCondition) -> ObservedArtifact {
 }
 
 fn policy(force: bool, prune: bool) -> ReconciliationPolicy {
-    ReconciliationPolicy {
-        force,
-        prune,
-        ..ReconciliationPolicy::default()
-    }
+    ReconciliationPolicy { force, prune }
 }
 
 #[test]
@@ -182,42 +178,6 @@ fn orphan_managed_modified_under_prune_removes_without_conflict() {
         "R2: a locally-MODIFIED managed orphan under prune is Remove{{Pruned}} with no Conflict \
          — prune overrides modification (parity with live prune_orphans, which never consults \
          modification state). got {:?}",
-        set.changes
-    );
-}
-
-#[test]
-fn reconcile_emits_no_moved_pin_row_even_when_follow_moved_pin_is_set() {
-    let d = Desired {
-        identity: "src",
-        underlying: "src",
-        published_key: "snippets",
-        destination: "snippets",
-    };
-    let proj = projection(vec![binding(&d)]);
-    let policy = ReconciliationPolicy {
-        force: false,
-        prune: true,
-        follow_moved_pin: true,
-    };
-    let state = observed(vec![
-        entry("src", "snippets", managed(ManagedCondition::Clean)),
-        entry("moved", "old", managed(ManagedCondition::Clean)),
-    ]);
-
-    let set = reconcile(&proj, &state, &policy).expect("R3: reconcile");
-
-    assert!(
-        !set.changes.iter().any(|c| matches!(
-            c,
-            SyncChange::Remove {
-                reason: RemovalReason::MovedPin,
-                ..
-            }
-        )),
-        "R3: MovedPin is DROPPED from reconcile's emission surface — no desired×observed cell \
-         may emit Remove{{MovedPin}}, even with follow_moved_pin=true; the fast-forward pre-pass \
-         (apply_fast_forward_drops) stays authoritative. got {:?}",
         set.changes
     );
 }

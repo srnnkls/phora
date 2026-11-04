@@ -24,7 +24,7 @@ use phora::sync::state::{
 use phora::sync::model::{ChangeSet, ConflictKind, ReconciliationPolicy, RemovalReason, SyncChange};
 use phora::sync::{
     AppliedChange, Concurrency, Conflict, ConflictPolicy, ConflictResolver, HookOutcome,
-    HookPolicy, LockSet, MovedPinPolicy, PrunePolicy, Resolution, SkippedChange, SourcePolicy,
+    HookPolicy, LockSet, PrunePolicy, Resolution, SkippedChange, SourcePolicy,
     SyncOptions, SyncReport, SyncRequest, SyncStatus, SyncWarning, sync,
 };
 
@@ -33,7 +33,6 @@ fn options(
     conflict_policy: ConflictPolicy,
     prune_policy: PrunePolicy,
     hook_policy: HookPolicy,
-    moved_pin_policy: MovedPinPolicy,
     jobs: Option<NonZeroUsize>,
 ) -> SyncOptions {
     SyncOptions {
@@ -41,7 +40,6 @@ fn options(
         conflict_policy,
         prune_policy,
         hook_policy,
-        moved_pin_policy,
         concurrency: Concurrency { jobs },
     }
 }
@@ -52,25 +50,23 @@ fn mapped(options: &SyncOptions) -> ReconciliationPolicy {
 
 fn assert_policy_mapping_table() {
     let cases = [
-        ("source locked", options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, MovedPinPolicy::Seal, None), (false, false, false)),
-        ("source refresh", options(SourcePolicy::Refresh, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, MovedPinPolicy::Seal, None), (false, false, false)),
-        ("source frozen", options(SourcePolicy::Frozen, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, MovedPinPolicy::Seal, None), (false, false, false)),
-        ("conflict refuse", options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, MovedPinPolicy::Seal, None), (false, false, false)),
-        ("conflict interactive", options(SourcePolicy::Locked, ConflictPolicy::ResolveInteractively, PrunePolicy::KeepOrphans, HookPolicy::All, MovedPinPolicy::Seal, None), (false, false, false)),
-        ("conflict overwrite", options(SourcePolicy::Locked, ConflictPolicy::Overwrite, PrunePolicy::KeepOrphans, HookPolicy::All, MovedPinPolicy::Seal, None), (true, false, false)),
-        ("prune keep", options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, MovedPinPolicy::Seal, None), (false, false, false)),
-        ("prune remove", options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::RemoveOrphans, HookPolicy::All, MovedPinPolicy::Seal, None), (false, true, false)),
-        ("hooks all", options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, MovedPinPolicy::Seal, None), (false, false, false)),
-        ("hooks no transitive", options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::NoTransitive, MovedPinPolicy::Seal, None), (false, false, false)),
-        ("hooks none", options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::None, MovedPinPolicy::Seal, None), (false, false, false)),
-        ("moved pin seal", options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, MovedPinPolicy::Seal, None), (false, false, false)),
-        ("moved pin fast forward", options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, MovedPinPolicy::FastForward, None), (false, false, true)),
-        ("concurrency derived", options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, MovedPinPolicy::Seal, None), (false, false, false)),
-        ("concurrency fixed", options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, MovedPinPolicy::Seal, NonZeroUsize::new(3)), (false, false, false)),
+        ("source locked", options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, None), (false, false)),
+        ("source refresh", options(SourcePolicy::Refresh, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, None), (false, false)),
+        ("source frozen", options(SourcePolicy::Frozen, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, None), (false, false)),
+        ("conflict refuse", options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, None), (false, false)),
+        ("conflict interactive", options(SourcePolicy::Locked, ConflictPolicy::ResolveInteractively, PrunePolicy::KeepOrphans, HookPolicy::All, None), (false, false)),
+        ("conflict overwrite", options(SourcePolicy::Locked, ConflictPolicy::Overwrite, PrunePolicy::KeepOrphans, HookPolicy::All, None), (true, false)),
+        ("prune keep", options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, None), (false, false)),
+        ("prune remove", options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::RemoveOrphans, HookPolicy::All, None), (false, true)),
+        ("hooks all", options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, None), (false, false)),
+        ("hooks no transitive", options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::NoTransitive, None), (false, false)),
+        ("hooks none", options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::None, None), (false, false)),
+        ("concurrency derived", options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, None), (false, false)),
+        ("concurrency fixed", options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, NonZeroUsize::new(3)), (false, false)),
     ];
     for (name, options, expected) in cases {
         let actual = mapped(&options);
-        assert_eq!((actual.force, actual.prune, actual.follow_moved_pin), expected, "mapping row {name}");
+        assert_eq!((actual.force, actual.prune), expected, "mapping row {name}");
     }
 }
 
@@ -97,14 +93,12 @@ fn assert_exact_public_shapes<'a>(request: SyncRequest<'a>, report: SyncReport) 
         conflict_policy,
         prune_policy,
         hook_policy,
-        moved_pin_policy,
         concurrency,
-    } = options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, MovedPinPolicy::Seal, None);
+    } = options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, None);
     let _: SourcePolicy = source_policy;
     let _: ConflictPolicy = conflict_policy;
     let _: PrunePolicy = prune_policy;
     let _: HookPolicy = hook_policy;
-    let _: MovedPinPolicy = moved_pin_policy;
     let _: Concurrency = concurrency;
 
     let SyncReport { locks, changes, applied, skipped, warnings, hook_outcomes, status } = report;
@@ -196,7 +190,6 @@ fn assert_request_flow_returns_conflict_warning_and_remove_outcomes() {
             ConflictPolicy::ResolveInteractively,
             PrunePolicy::RemoveOrphans,
             HookPolicy::None,
-            MovedPinPolicy::Seal,
             None,
         ),
         resolver: Some(&spy),
@@ -1130,7 +1123,7 @@ fn public_sync_tree_escape_hatches(path: &Path) -> Vec<String> {
         .collect()
 }
 
-const ALLOWED_SYNC_WARNING_SHAPES: [&str; 20] = [
+const ALLOWED_SYNC_WARNING_SHAPES: [&str; 21] = [
     "Projection(ProjectionWarning)",
     "MalformedTransitiveHooks{target:String,detail:String}",
     "LinkPathNotPortable{source:String,path:PathBuf}",
@@ -1141,8 +1134,9 @@ const ALLOWED_SYNC_WARNING_SHAPES: [&str; 20] = [
     "PruneRefused{path:PathBuf,reason:String}",
     "PruneKeptDirectory{path:PathBuf}",
     "OrphanRecordPathUnknown{source:String,artifact:String,layout:String}",
-    "FastForwardKeptLive{source:String,artifact:String,path:PathBuf}",
-    "FastForwardDropped{source:String,artifact:String}",
+    "UpstreamDropKeptLive{source:String,artifact:String,path:PathBuf}",
+    "UpstreamDropped{source:String,artifact:String}",
+    "UpstreamDropModified{source:String,artifact:String,changed:Vec<PathBuf>}",
     "LinkedSourceDropped{source:String,artifact:String}",
     "CrossDeviceFallback{destination:PathBuf}",
     "ConflictModified{source:String,artifact:String,changed:Vec<PathBuf>}",
@@ -1620,9 +1614,11 @@ fn forbidden_post_apply_removal_paths(sources: &[(&str, &str)]) -> Vec<String> {
 
     let mut offenders = Vec::new();
     for function in &functions {
-        let Some(apply_index) = function.calls.iter().position(|call| {
-            call.starts_with("apply") && !call.contains("fast_forward") && !call.contains("drop")
-        }) else {
+        let Some(apply_index) = function
+            .calls
+            .iter()
+            .position(|call| call.starts_with("apply") && !call.contains("drop"))
+        else {
             continue;
         };
         let later = &function.calls[apply_index + 1..];

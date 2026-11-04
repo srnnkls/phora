@@ -249,7 +249,7 @@ fn one_imported_package_selects_harness_refs_updates_and_replays_offline() {
         "path",
         "[targets.codex]\npath = \"out/codex\"\nsources.tropos = { branch = \"codex\" }\n",
     );
-    succeeds(&package, &["update", "tropos", "--fast-forward"]);
+    succeeds(&package, &["update", "tropos"]);
     assert_deployed(&package, "out/codex", "Codex rebuilt\n", "Updated Loqui\n");
     assert!(
         !package
@@ -369,7 +369,7 @@ fn a_failed_pre_sync_hook_keeps_the_existing_deployment_and_lock_on_update() {
         &config_path,
         &format!("{config}\n[hooks]\npre_sync = 'exit 23'\n"),
     );
-    let result = run(&package, &["update", "tropos", "--fast-forward"]);
+    let result = run(&package, &["update", "tropos"]);
     assert!(!result.status.success());
     assert_deployed(&package, "out/claude", "Claude skill\n", "Loqui\n");
     assert_eq!(std::fs::read(lock).expect("lock after failure"), before);

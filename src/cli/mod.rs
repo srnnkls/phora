@@ -134,9 +134,6 @@ pub enum Command {
         no_transitive_hooks: bool,
         #[arg(long)]
         frozen: bool,
-        /// Follow a moved pin: delete artifacts the new commit dropped instead of erroring.
-        #[arg(long)]
-        fast_forward: bool,
         /// Never draw live progress, even on a terminal.
         #[arg(long)]
         no_progress: bool,
@@ -152,9 +149,6 @@ pub enum Command {
         /// Remove managed artifacts absent after updating, including generated links.
         #[arg(long)]
         prune: bool,
-        /// Follow a moved pin: delete artifacts the new commit dropped instead of erroring.
-        #[arg(long)]
-        fast_forward: bool,
     },
     /// Show sources and deployment state.
     List {
@@ -495,7 +489,6 @@ fn dispatch_sync(cmd: Command, lock_timeout: Duration) -> Result<CliOutcome> {
             no_hooks,
             no_transitive_hooks,
             frozen,
-            fast_forward,
             no_progress,
             json,
             jobs,
@@ -505,18 +498,15 @@ fn dispatch_sync(cmd: Command, lock_timeout: Duration) -> Result<CliOutcome> {
             no_hooks,
             no_transitive_hooks,
             frozen,
-            fast_forward,
             no_progress,
             json,
             None,
             jobs,
             lock_timeout,
         ),
-        Command::Update {
-            source,
-            prune,
-            fast_forward,
-        } => sync::run_update(source.as_deref(), fast_forward, prune, lock_timeout),
+        Command::Update { source, prune } => {
+            sync::run_update(source.as_deref(), prune, lock_timeout)
+        }
         _ => unreachable!("dispatch_sync only receives Sync or Update"),
     }
 }

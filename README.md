@@ -88,7 +88,8 @@ Requires a Rust toolchain (edition 2024).
   path. See [Transitive dependencies](#transitive-dependencies).
 - *Lock* — `phora.lock` pins each source to a resolved commit so syncs are
   reproducible (`phora.local.toml` gets a companion `phora.local.lock`).
-  `phora update` bumps it.
+  `sync` keeps every pin; only `phora update` advances one. See
+  [Sync and update](#sync-and-update).
 - *Registry* — per-project state under the state root (`XDG_STATE_HOME` or, by
   default, `~/.local/state/phora` on Linux and `~/Library/Application Support/phora`
   on macOS) recording what was deployed where (commit + content digest), so phora can
@@ -187,9 +188,9 @@ phora unbind nvim --from neovim                          # remove a binding by i
 # --root/--include/--exclude on `add` shape the SOURCE offer (source-owned), not a binding.
 phora add me/dotfiles --to neovim --as nvim --root nvim
 
-# Fetch sources, resolve commits, project artifacts into targets
+# Project the locked commits into targets; resolve only sources the lock does not pin yet
 phora sync
-phora sync --prune          # also remove artifacts no longer selected
+phora sync --prune          # also remove artifacts you no longer select
 phora sync --force          # overwrite locally-modified files without prompting
 phora sync --frozen         # refuse to fetch or re-resolve — every source must be pinned in the lock
 phora sync --no-transitive-hooks  # deploy composed deps, but run none of their hooks
@@ -201,7 +202,7 @@ phora trust tropos --list         # show tropos's hooks without approving anythi
 phora trust tropos --show <path>  # print a tropos dep file (or list a dir) at the pinned commit
 phora trust tropos --revoke       # drop every approval recorded for tropos
 
-# Re-resolve to the latest commit, then sync
+# Advance pins to the current tip of each ref, then sync
 phora update                # all sources
 phora update myconfigs      # one source
 
@@ -288,6 +289,31 @@ home
 `--files` expands each artifact to the files it would deploy; `--json` emits the
 same plan as a machine-readable document.
 
+### Sync and update
+
+The lock follows Cargo's contract: `sync` never moves an existing pin, and
+`update` is the only command that does.
+
+| Command | Pins |
+| ------- | ---- |
+| `phora sync` | keeps every locked commit; resolves only what the lock does not pin |
+| `phora update [source]` | re-resolves each ref (or one source's) to its current tip |
+| `phora sync --frozen` | refuses to fetch or resolve; every source must be locked |
+
+A pin belongs to a source's remote and ref. Editing the remote, URL, `branch`, `tag`,
+or `rev` resolves that source fresh on the next sync, as does a binding that names a
+new ref. Editing the selection — `include`, `exclude`, `root`, `allow_symlinks`,
+`preserve_executable` — keeps the locked commit; phora only re-selects and re-digests
+it. A build source is keyed by its config instead, since it has no remote.
+
+`update` reports each pin it moved as `phora: updated <source>: <old> → <new>`; a ref
+edit picked up by `sync` reports `phora: <source> → <target>: <old> → <new>` per binding.
+Artifacts the new commit no longer offers are removed and reported as `phora:
+removed <source>:<artifact> (removed upstream)`. A dropped artifact you modified
+locally is kept and reported as a conflict (`upstream_drop_modified` in `--json`);
+`--force` deletes it, `phora eject` keeps its files unmanaged. `--prune` covers the
+other direction: artifacts you stopped selecting in config.
+
 ### Conflicts
 
 When `sync` finds a target file that was modified outside phora, or a foreign file
@@ -297,7 +323,9 @@ where an artifact wants to land, it prompts (on a TTY):
 [s]kip / [o]verwrite / [e]ject / [a]bort
 ```
 
-Non-interactive runs skip such files unless `--force` is given.
+Non-interactive runs skip such files unless `--force` is given. A locally modified
+artifact that upstream removed is kept the same way; see
+[Sync and update](#sync-and-update).
 
 ### Hooks
 
@@ -801,8 +829,8 @@ Determinism. Content is imported as a content-addressed synthetic git commit
 (fixed identity, fixed time, constant message), so identical bytes yield an
 identical commit and no lock churn. Deployed files carry the time phora wrote
 them, as with git sources.
-`phora sync` of unchanged content is a no-op; `phora update` (or `--force`)
-re-downloads, and the lock advances only if the content changed. `phora verify`
+`phora sync` reuses the locked import; `phora update` re-downloads, and the lock
+advances only if the content changed. `phora verify`
 re-hashes deployed files with the same guarantees as git sources.
 
 Out of scope (for now). Auth for private assets and forge release-tag
@@ -905,8 +933,8 @@ never reports them modified or foreign, `phora list` shows them as `linked`, and
 `phora rebuild-registry` reconstructs the marker without hashing. A link source is a
 live mirror: when a file or directory leaves its offer (deleted, renamed, or no
 longer included), every sync removes the managed symlink, dangling or not, forgets
-its record, prunes the directories it emptied, and reports the removal; no
-`--fast-forward` is needed. `--prune` removes an orphaned linked artifact by deleting
+its record, prunes the directories it emptied, and reports the removal.
+`--prune` removes an orphaned linked artifact by deleting
 the symlink only. A regular file, directory, or foreign symlink replacing a managed
 link is preserved: sync refuses the dropped artifact until it is restored or ejected. If the working-tree target
 is deleted or renamed the link reads as missing and is redeployed on the next sync.
@@ -1063,8 +1091,8 @@ transitive source accepts `offer`, one of `branch`/`tag`/`rev`, `take` and
 `collapse`; `template` and `history` are rejected.
 
 The offered files and the `phora.toml` that declares them use the same pin.
-Ordinary sync preserves that pin; `phora update tropos --fast-forward` advances it
-and removes what the new commit no longer offers. `phora sync --frozen` replays
+Ordinary sync preserves that pin; `phora update tropos` advances it and removes what
+the new commit no longer offers. `phora sync --frozen` replays
 from the cache. Ownership survives updates and switches between offers that share
 a `root`, while hook trust remains tied to the actual commit.
 

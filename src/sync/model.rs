@@ -86,7 +86,6 @@ pub enum SyncChange {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemovalReason {
     Pruned,
-    MovedPin,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -98,7 +97,6 @@ pub struct ChangeSet {
 pub struct ReconciliationPolicy {
     pub force: bool,
     pub prune: bool,
-    pub follow_moved_pin: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

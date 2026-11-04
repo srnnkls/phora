@@ -5623,7 +5623,6 @@ fn rebuild_over_merged_vars_agrees_with_deployed_vars_digest() {
             false,
             false,
             false,
-            false,
             true,
             false,
             None,
