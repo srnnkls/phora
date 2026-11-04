@@ -3495,6 +3495,7 @@ fn second_deploy_over_correct_link_is_a_noop() {
         backend: &counting,
         registry: &fx.registry,
         journal: &journal,
+        dropped: &[],
     };
     let observed = super::observe::observe_workspace(&ctx, &projection)
         .expect("live observation pass succeeds");
@@ -3747,57 +3748,35 @@ fn frozen_lockless_prune_with_a_pending_orphan_refuses_before_deleting_files() {
 }
 
 #[test]
-fn frozen_lockless_sync_with_pending_upstream_drops_refuses_before_pruning() {
-    let fx = build_sync_fixture();
-    let cwd = TempDir::new().expect("cwd tempdir");
-    let protected = test_protected(cwd.path());
-    let cfg = Config::parse("version = 1\n").expect("empty config parses");
-    let drops = vec![ArtifactRecord {
-        version: 1,
-        key: artifact_key("dest", "gone-src", "obsolete"),
-        source: "gone-src".to_owned(),
-        commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
-        digest: "blake3:drop".to_owned(),
-        projected_at: "2026-01-01T00:00:00Z".to_owned(),
-        layout: "flat".to_owned(),
-        kind: RecordKind::Dir,
-        allow_symlinks: false,
-        preserve_executable: true,
-        files: vec![],
-        directories: None,
-        linked: false,
-        history: false,
-        worktree_admin_id: None,
-        mirror_key: None,
-        cache_git_root: None,
-        vars_digest: None,
-        deploy_root: None,
-        layout_separator: None,
-        link_target: None,
-    }];
-    let projection = Projection {
-        targets: Vec::new(),
-        warnings: Vec::new(),
-    };
+fn frozen_lockless_sync_with_a_pending_upstream_drop_refuses_before_deleting() {
+    let src = TempDir::new().expect("src tempdir");
+    let td = TargetDir::new();
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let (url, _c0, _c1) = init_editor_lint_source(src.path());
+    let cfg = parse_editor_lint_config(&url, "branch = \"main\"", &td);
+    sync(&input(&cfg, None, None, None, false), &backend, &registry).expect("deploy lint");
+    run_git(src.path(), &["rm", "-r", "-q", "lint"]);
+    run_git(src.path(), &["commit", "-m", "drop lint"]);
+    let (_g2, _s2, _, elsewhere) = fresh_backend_registry();
+    let moved = sync(&input(&cfg, None, None, None, false), &backend, &elsewhere)
+        .expect("another checkout locks the dropping commit")
+        .base_lock;
 
-    let mut events = SyncEvents::discarding();
-    let err = prune_upstream_drops_report(
-        &projection,
-        &cfg,
-        &fx.registry,
-        &protected,
-        &drops,
-        true,
-        &mut events,
-    )
-    .expect_err("a read-only sync carrying pending upstream drops must refuse before any delete");
+    let Err(err) = sync(
+        &frozen_lockless_input(&cfg, Some(moved), false),
+        &backend,
+        &registry,
+    ) else {
+        panic!("a read-only sync carrying a pending upstream drop must refuse");
+    };
 
     let msg = err.to_string();
     assert!(
-        msg.contains(&fx.registry.state_root().display().to_string())
+        msg.contains(&registry.state_root().display().to_string())
             && msg.to_lowercase().contains("read-only"),
         "the refusal must name the read-only state root, got: {msg}"
     );
+    assert!(td.target_path().join("lint").exists(), "nothing is deleted");
 }
 
 #[test]
@@ -14281,12 +14260,16 @@ fn moved_pin_deletes_an_artifact_the_new_commit_dropped() {
     let report = sync_with_report(&input(&cfg, None, None, None, false), &backend, &registry)
         .expect("sync must follow the moved pin: an artifact the new commit dropped is deleted");
     assert!(
-        report.warnings.iter().any(|warning| matches!(
-            warning,
-            SyncWarning::UpstreamDropped { artifact, .. } if artifact == "lint"
+        report.applied.iter().any(|applied| matches!(
+            applied,
+            AppliedChange::Removed {
+                artifact,
+                reason: RemovalReason::UpstreamDropped,
+                ..
+            } if artifact == "lint"
         )),
         "the removal is reported as an upstream drop; got {:?}",
-        report.warnings
+        report.applied
     );
     assert!(!deployed.exists(), "the upstream-removed copy is deleted");
     assert!(
@@ -14313,7 +14296,7 @@ fn reports_kept_upstream_drop(report: &SyncReport, artifact: &str) -> bool {
             SyncWarning::KeptLocalChange {
                 artifact: dropped,
                 change: LocalChange::Modified { .. },
-                cause: RemovalCause::UpstreamDrop,
+                reason: RemovalReason::UpstreamDropped,
                 ..
             } if dropped == artifact
         )
@@ -14518,7 +14501,7 @@ fn interactive_prune_asks_and_eject_keeps_the_modified_copy_unmanaged() {
     assert_eq!(resolver.consulted(), 1, "the prune asks once, for lint");
     let conflict = resolver.last_conflict();
     assert_eq!(conflict.artifact, "lint");
-    assert_eq!(conflict.removal, Some(RemovalCause::Prune));
+    assert_eq!(conflict.removal, Some(RemovalReason::Pruned));
     assert_eq!(
         std::fs::read(&deployed).expect("eject keeps the files"),
         b"strict = false\n"
@@ -14552,7 +14535,7 @@ fn interactive_upstream_drop_delete_removes_the_modified_copy() {
     assert_eq!(resolver.consulted(), 1);
     assert_eq!(
         resolver.last_conflict().removal,
-        Some(RemovalCause::UpstreamDrop)
+        Some(RemovalReason::UpstreamDropped)
     );
     assert!(!deployed.exists(), "delete removes the modified copy");
     assert!(
@@ -14590,6 +14573,42 @@ fn an_upstream_drop_under_prune_is_decided_once() {
     assert_eq!(kept.len(), 1, "one artifact, one decision; got {kept:?}");
     assert!(reports_kept_upstream_drop(&report, "lint"));
     assert!(deployed.exists());
+}
+
+#[test]
+fn a_pre_deploy_hook_editing_a_dropped_artifact_keeps_it() {
+    let src = TempDir::new().expect("src tempdir");
+    let td = TargetDir::new();
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let (url, _c0, _c1) = init_editor_lint_source(src.path());
+    let plain = parse_editor_lint_config(&url, "branch = \"main\"", &td);
+    sync(&input(&plain, None, None, None, false), &backend, &registry).expect("deploy lint");
+    run_git(src.path(), &["rm", "-r", "-q", "lint"]);
+    run_git(src.path(), &["commit", "-m", "drop lint"]);
+    let deployed = td.target_path().join("lint/rules.toml");
+    let hooked = Config::parse(&format!(
+        "version = 1\n\n\
+         [sources.ed]\ngit = \"{url}\"\nbranch = \"main\"\n\n\
+         [targets.dest]\npath = \"{}\"\nsources = [\"ed\"]\nlayout = \"flat\"\n\n\
+         [targets.dest.hooks]\npre_deploy = \"printf hooked > '{}'\"\n",
+        td.target_path().display(),
+        deployed.display(),
+    ))
+    .expect("pre_deploy fixture config parses");
+
+    let report = sync_with_report(
+        &input(&hooked, None, None, None, false),
+        &backend,
+        &registry,
+    )
+    .expect("a drop the hook edited is kept, not an error");
+
+    assert!(
+        reports_kept_upstream_drop(&report, "lint"),
+        "the drop is decided on the post-hook file; got {:?}",
+        report.warnings
+    );
+    assert_eq!(std::fs::read(&deployed).expect("kept"), b"hooked");
 }
 
 fn prepare_real_pending_upstream_drop(
@@ -14670,7 +14689,7 @@ fn config_pending_drop_with_later_target(
 }
 
 #[test]
-fn fast_forward_drop_waits_for_later_post_hook_conflict_abort_before_mutating() {
+fn upstream_drop_waits_for_later_post_hook_conflict_abort_before_mutating() {
     let fx = build_sync_fixture();
     let dropped_target = TargetDir::new();
     let (stale_dst, records_before) = prepare_real_pending_upstream_drop(&fx, &dropped_target);
@@ -14728,7 +14747,7 @@ fn fast_forward_drop_waits_for_later_post_hook_conflict_abort_before_mutating() 
     assert_eq!(
         std::fs::read(stale_dst.join("init.lua")).ok(),
         Some(b"-- init\n".to_vec()),
-        "fast-forward may plan the upstream drop, but the stale artifact bytes must survive a \
+        "an upstream drop may be planned, but the stale artifact bytes must survive a \
          later Abort byte-identically"
     );
     assert_eq!(
@@ -14757,7 +14776,7 @@ fn fast_forward_drop_waits_for_later_post_hook_conflict_abort_before_mutating() 
 }
 
 #[test]
-fn fast_forward_drop_waits_for_failing_pre_sync_before_mutating() {
+fn upstream_drop_waits_for_failing_pre_sync_before_mutating() {
     let fx = build_sync_fixture();
     let dropped_target = TargetDir::new();
     let (stale_dst, records_before) = prepare_real_pending_upstream_drop(&fx, &dropped_target);
@@ -14819,7 +14838,7 @@ fn fast_forward_drop_waits_for_failing_pre_sync_before_mutating() {
     assert_eq!(
         std::fs::read(stale_dst.join("init.lua")).ok(),
         Some(b"-- init\n".to_vec()),
-        "a failing pre_sync gate must leave the planned fast-forward drop's bytes byte-identical"
+        "a failing pre_sync gate must leave the planned upstream drop's bytes byte-identical"
     );
     assert_eq!(
         fx.registry
@@ -17027,6 +17046,7 @@ fn observe_workspace_full_registry_scan_follows_prune_policy() {
             backend: &fx.backend,
             registry: &registry,
             journal: &journal,
+            dropped: &[],
         };
 
         let observed = super::observe::observe_workspace(&ctx, &projection)
@@ -17113,6 +17133,7 @@ fn observe_workspace_rejects_duplicate_triplet() {
         backend: &fx.backend,
         registry: &fx.registry,
         journal: &journal,
+        dropped: &[],
     };
 
     let err = super::observe::observe_workspace(&ctx, &projection).expect_err(

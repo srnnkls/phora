@@ -55,6 +55,7 @@ fn modified_observation(changed: Vec<PathBuf>) -> ObservedProjectState {
                 record: (),
                 condition: ManagedCondition::Modified { changed },
                 overlay_stale: false,
+                dropped: None,
             }),
         }],
     }

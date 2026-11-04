@@ -425,10 +425,10 @@ $ phora sync >/dev/null 2>&1; test $? -ne 0 && echo nonzero
 nonzero
 ```
 
-## A skipped target suppresses --prune
+## A skipped target suppresses removals
 
-A skipped pre_deploy target sets `had_failures`, which gates `--prune`: prune must not run, so
-phora emits the skip notice on stderr.
+A skipped pre_deploy target sets `had_failures`, which gates every removal (`--prune` and
+upstream drops): none runs, so phora emits the skip notice on stderr.
 
 ```scrut
 $ cd "$ROOT" && mkdir -p d4 && cd d4 && isolate_state && seed_config_pre_deploy_skip "$(make_git_source proj)" && echo seeded
@@ -436,6 +436,6 @@ seeded
 ```
 
 ```scrut
-$ phora sync --prune 2>&1 | grep -F 'skipping --prune'
-phora: skipping --prune because some artifacts failed to deploy
+$ phora sync --prune 2>&1 | grep -F 'skipping removals'
+phora: skipping removals because some artifacts failed to deploy
 ```

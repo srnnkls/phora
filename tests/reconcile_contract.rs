@@ -66,6 +66,7 @@ fn conflicting_pair() -> (Projection, ObservedProjectState) {
                     changed: vec![PathBuf::from("a.json")],
                 },
                 overlay_stale: false,
+                dropped: None,
             }),
         }],
     };

@@ -1132,21 +1132,19 @@ fn public_sync_tree_escape_hatches(path: &Path) -> Vec<String> {
         .collect()
 }
 
-const ALLOWED_SYNC_WARNING_SHAPES: [&str; 21] = [
+const ALLOWED_SYNC_WARNING_SHAPES: [&str; 19] = [
     "Projection(ProjectionWarning)",
     "MalformedTransitiveHooks{target:String,detail:String}",
     "LinkPathNotPortable{source:String,path:PathBuf}",
     "UnboundSource{source:String}",
     "ReferenceMoved{source:String,target:String,from:String,to:String}",
     "OrphanedRecords{count:usize}",
-    "PruneSkippedAfterFailures",
+    "RemovalsSkippedAfterFailures",
     "PruneRefused{path:PathBuf,reason:String}",
     "PruneKeptDirectory{path:PathBuf}",
     "OrphanRecordPathUnknown{source:String,artifact:String,layout:String}",
-    "UpstreamDropKeptLive{source:String,artifact:String,path:PathBuf}",
-    "UpstreamDropped{source:String,artifact:String}",
-    "KeptLocalChange{source:String,artifact:String,path:PathBuf,change:LocalChange,cause:RemovalCause}",
-    "LinkedSourceDropped{source:String,artifact:String}",
+    "ReleasedUnderLive{source:String,artifact:String,path:PathBuf,reason:RemovalReason}",
+    "KeptLocalChange{source:String,artifact:String,path:PathBuf,change:LocalChange,reason:RemovalReason}",
     "CrossDeviceFallback{destination:PathBuf}",
     "ConflictModified{source:String,artifact:String,changed:Vec<PathBuf>}",
     "ConflictForeign{path:PathBuf}",

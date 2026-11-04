@@ -47,8 +47,8 @@ pub(super) fn format_sync_warning(warning: &SyncWarning) -> Option<String> {
             "phora: {count} orphaned record(s) with no config target — run `phora list --orphans` \
              to inspect, `phora sync --prune` to remove"
         ),
-        SyncWarning::PruneSkippedAfterFailures => {
-            "phora: skipping --prune because some artifacts failed to deploy".to_owned()
+        SyncWarning::RemovalsSkippedAfterFailures => {
+            "phora: skipping removals because some artifacts failed to deploy".to_owned()
         }
         SyncWarning::PruneRefused { path, reason } => format!(
             "phora: refusing to prune out-of-anchor {}: {reason}",
@@ -67,19 +67,23 @@ pub(super) fn format_sync_warning(warning: &SyncWarning) -> Option<String> {
              cannot be reconstructed (layout `{layout}` unrecognized or missing its separator); \
              any file is left in place rather than deleting a guessed path"
         ),
-        SyncWarning::UpstreamDropKeptLive { .. } | SyncWarning::UpstreamDropped { .. } => {
-            format_upstream_drop(warning)?
-        }
+        SyncWarning::ReleasedUnderLive {
+            source,
+            artifact,
+            path,
+            reason,
+        } => format!(
+            "phora: unrecorded {source}:{artifact} ({}) but kept {} (a live artifact sits there)",
+            reason.describe(),
+            path.display()
+        ),
         SyncWarning::KeptLocalChange {
             source,
             artifact,
             path,
             change,
-            cause,
-        } => format_kept_local_change(source, artifact, path, change, *cause),
-        SyncWarning::LinkedSourceDropped { source, artifact } => {
-            format!("phora: removed {source}:{artifact} (no longer in the linked source's offer)")
-        }
+            reason,
+        } => format_kept_local_change(source, artifact, path, change, *reason),
         SyncWarning::ContentStoreRepaired { object } => format!(
             "phora: content store object {} did not match its hash; rewrote it",
             object.display()
@@ -127,33 +131,15 @@ fn format_conflict_modified(
     out
 }
 
-fn format_upstream_drop(warning: &SyncWarning) -> Option<String> {
-    Some(match warning {
-        SyncWarning::UpstreamDropKeptLive {
-            source,
-            artifact,
-            path,
-        } => format!(
-            "phora: unrecorded {source}:{artifact} (removed upstream) but kept {} (a live artifact \
-             sits there)",
-            path.display()
-        ),
-        SyncWarning::UpstreamDropped { source, artifact } => {
-            format!("phora: removed {source}:{artifact} (removed upstream)")
-        }
-        _ => return None,
-    })
-}
-
 fn format_kept_local_change(
     source: &str,
     artifact: &str,
     path: &std::path::Path,
     change: &crate::sync::LocalChange,
-    cause: crate::sync::RemovalCause,
+    reason: crate::sync::RemovalReason,
 ) -> String {
     use crate::sync::LocalChange;
-    let why = cause.describe();
+    let why = reason.describe();
     let what = match change {
         LocalChange::Modified { .. } => "it was modified locally",
         LocalChange::Replaced => "something phora did not deploy replaced it",

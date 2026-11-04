@@ -322,6 +322,25 @@ fn classify_drift(
     ArtifactState::Clean
 }
 
+/// Whether the entry at `path` still holds what `mf` recorded: a regular file by size and mtime,
+/// else by content; a link by its target bytes.
+pub(super) fn matches_manifest(
+    path: &Path,
+    meta: &std::fs::Metadata,
+    mf: &ManifestFile,
+) -> Result<bool> {
+    match mf.kind {
+        ManifestEntryKind::File if meta.is_file() => {
+            if meta.len() == mf.size && mtime_secs(meta, path)? == mf.mtime {
+                return Ok(true);
+            }
+            Ok(revalidate_file(path, meta, mf)?.is_some())
+        }
+        ManifestEntryKind::Link if meta.file_type().is_symlink() => link_matches(path, mf),
+        ManifestEntryKind::File | ManifestEntryKind::Link => Ok(false),
+    }
+}
+
 fn link_matches(path: &Path, mf: &ManifestFile) -> Result<bool> {
     let bytes = link_target_bytes(path)
         .map_err(|e| Error::Projection(format!("read link {}: {e}", path.display())))?;
@@ -432,6 +451,7 @@ fn managed_observation(
         record,
         condition,
         overlay_stale: false,
+        dropped: None,
     }))
 }
 

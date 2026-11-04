@@ -34,6 +34,8 @@ pub struct ManagedArtifact<R = ()> {
     pub record: R,
     pub condition: ManagedCondition,
     pub overlay_stale: bool,
+    /// Set on a record its source no longer offers; it is removed without `--prune`.
+    pub dropped: Option<RemovalReason>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,23 +110,6 @@ impl LocalChange {
     }
 }
 
-/// Why phora was removing an artifact.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RemovalCause {
-    UpstreamDrop,
-    Prune,
-}
-
-impl RemovalCause {
-    #[must_use]
-    pub fn describe(self) -> &'static str {
-        match self {
-            Self::UpstreamDrop => "removed upstream",
-            Self::Prune => "no longer selected",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncChange {
     Deploy {
@@ -154,7 +139,7 @@ pub enum SyncChange {
         source: String,
         artifact: String,
         change: LocalChange,
-        cause: RemovalCause,
+        reason: RemovalReason,
     },
     Remove {
         target: String,
@@ -164,9 +149,26 @@ pub enum SyncChange {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Why phora removes an artifact it deployed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemovalReason {
+    /// No longer selected by config, or its target left config; removed under `--prune`.
     Pruned,
+    /// The source's moved pin no longer offers it.
+    UpstreamDropped,
+    /// A linked source's live working tree no longer offers it.
+    LinkedSourceDropped,
+}
+
+impl RemovalReason {
+    #[must_use]
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Pruned => "no longer selected",
+            Self::UpstreamDropped => "removed upstream",
+            Self::LinkedSourceDropped => "no longer in the linked source's offer",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

@@ -317,13 +317,13 @@ pub(super) fn resolve_conflicts_reusing(
                 source,
                 artifact,
                 change,
-                cause,
+                reason,
             } => (
                 target,
                 source,
                 artifact,
                 change.to_conflict_kind(),
-                Some(*cause),
+                Some(*reason),
             ),
             _ => continue,
         };
@@ -1842,6 +1842,7 @@ mod revalidated_treated_like_clean_tests {
             record: (),
             condition,
             overlay_stale: false,
+            dropped: None,
         })
     }
 
@@ -1937,6 +1938,7 @@ mod mode_transition_conflict_tests {
             record: (),
             condition,
             overlay_stale: false,
+            dropped: None,
         })
     }
 

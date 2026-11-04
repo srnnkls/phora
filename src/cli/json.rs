@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::sync::progress::{
     ArtifactId, FetchId, FetchOutcome, Phase, ProgressSink, Severity, SyncSummary,
 };
-use crate::sync::{AppliedChange, SkippedChange, SyncWarning};
+use crate::sync::{AppliedChange, RemovalReason, SkippedChange, SyncWarning};
 
 /// Writes one JSON object per line to stdout.
 pub(super) struct JsonSink {
@@ -30,6 +30,14 @@ impl JsonSink {
     fn emit(&self, record: &Value) {
         let mut out = self.out.lock().expect("json sink poisoned");
         let _ = writeln!(out, "{record}");
+    }
+}
+
+fn removal_reason_label(reason: RemovalReason) -> &'static str {
+    match reason {
+        RemovalReason::Pruned => "pruned",
+        RemovalReason::UpstreamDropped => "upstream_dropped",
+        RemovalReason::LinkedSourceDropped => "linked_source_dropped",
     }
 }
 
@@ -94,14 +102,12 @@ fn warning_kind(warning: &SyncWarning) -> &'static str {
         SyncWarning::UnboundSource { .. } => "unbound_source",
         SyncWarning::ReferenceMoved { .. } => "reference_moved",
         SyncWarning::OrphanedRecords { .. } => "orphaned_records",
-        SyncWarning::PruneSkippedAfterFailures => "prune_skipped_after_failures",
+        SyncWarning::RemovalsSkippedAfterFailures => "removals_skipped_after_failures",
         SyncWarning::PruneRefused { .. } => "prune_refused",
         SyncWarning::PruneKeptDirectory { .. } => "prune_kept_directory",
         SyncWarning::OrphanRecordPathUnknown { .. } => "orphan_record_path_unknown",
-        SyncWarning::UpstreamDropKeptLive { .. } => "upstream_drop_kept_live",
-        SyncWarning::UpstreamDropped { .. } => "upstream_dropped",
+        SyncWarning::ReleasedUnderLive { .. } => "released_under_live",
         SyncWarning::KeptLocalChange { .. } => "kept_local_change",
-        SyncWarning::LinkedSourceDropped { .. } => "linked_source_dropped",
         SyncWarning::CrossDeviceFallback { .. } => "cross_device_fallback",
         SyncWarning::ConflictModified { .. } => "conflict_modified",
         SyncWarning::ConflictForeign { .. } => "conflict_foreign",
@@ -174,13 +180,17 @@ impl ProgressSink for JsonSink {
 
     fn artifact_applied(&self, change: &AppliedChange) {
         let (change_kind, target, source, artifact) = applied_parts(change);
-        self.emit(&json!({
+        let mut record = json!({
             "type": "artifact_applied",
             "change": change_kind,
             "target": target,
             "source": source,
             "artifact": artifact,
-        }));
+        });
+        if let AppliedChange::Removed { reason, .. } = change {
+            record["reason"] = json!(removal_reason_label(*reason));
+        }
+        self.emit(&record);
     }
 
     fn artifact_skipped(&self, change: &SkippedChange) {

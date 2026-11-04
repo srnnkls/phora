@@ -83,6 +83,7 @@ fn managed(condition: ManagedCondition) -> ObservedArtifact {
         record: (),
         condition,
         overlay_stale: false,
+        dropped: None,
     })
 }
 
@@ -91,6 +92,7 @@ fn stale_managed(condition: ManagedCondition) -> ObservedArtifact {
         record: (),
         condition,
         overlay_stale: true,
+        dropped: None,
     })
 }
 

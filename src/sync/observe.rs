@@ -78,9 +78,15 @@ where
         })?;
     }
     let list_all = || all_records.map_or_else(|| ctx.records(), Ok);
-    let orphans = registry_only_records(ctx.input.prune(), list_all)?;
+    let dropped = ctx
+        .dropped
+        .iter()
+        .map(|drop| (drop.record.clone(), Some(drop.reason)));
+    let pruned = registry_only_records(ctx.input.prune(), list_all)?
+        .into_iter()
+        .map(|record| (record, None));
     let live_paths = super::prune::live_paths_by_source(projection, ctx.config);
-    for record in orphans {
+    for (record, dropped) in dropped.chain(pruned) {
         let triplet = (
             record.key.target.clone(),
             record.key.source.clone(),
@@ -100,6 +106,7 @@ where
                     record,
                     condition,
                     overlay_stale: false,
+                    dropped,
                 }),
             },
         );
@@ -161,7 +168,7 @@ fn observe_orphan_condition<R>(
 where
     R: StateStore,
 {
-    let Some(path) = super::prune::recorded_destination(ctx.config, record) else {
+    let Ok(Some(path)) = super::prune::locate_removal(ctx.config, record, ctx.protected) else {
         return Ok(ManagedCondition::Clean);
     };
     if super::prune::overlaps_any_live_path(&path, live_paths) {
@@ -211,6 +218,7 @@ where
                 record: orphan.clone(),
                 condition: ManagedCondition::Outdated,
                 overlay_stale: false,
+                dropped: None,
             })));
         }
     }
@@ -418,6 +426,7 @@ pub(super) fn absorb_mode_transition<R>(
                 record: managed.record,
                 condition: ManagedCondition::Outdated,
                 overlay_stale: managed.overlay_stale,
+                dropped: managed.dropped,
             })
         }
         other => other,

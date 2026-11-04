@@ -137,7 +137,7 @@ pub enum Resolution {
     Abort,
 }
 
-pub use model::{ConflictKind, LocalChange, RemovalCause};
+pub use model::{ConflictKind, LocalChange, RemovalReason};
 
 /// A single conflict presented to a [`ConflictResolver`] during interactive sync.
 #[derive(Debug, Clone)]
@@ -147,7 +147,7 @@ pub struct Conflict {
     pub artifact: String,
     pub kind: ConflictKind,
     /// Set when the conflict blocks a removal: overwrite then deletes the artifact.
-    pub removal: Option<RemovalCause>,
+    pub removal: Option<RemovalReason>,
 }
 
 /// Decides how to resolve each Modified/Foreign conflict in interactive sync.
@@ -528,17 +528,19 @@ struct DeployAll<'a, R> {
     backend: &'a dyn SourceStore,
     registry: &'a R,
     journal: &'a Journal,
+    dropped: &'a [DroppedRecord],
+}
+
+/// A recorded artifact its source no longer offers, and why.
+pub(super) struct DroppedRecord {
+    pub(super) record: ArtifactRecord,
+    pub(super) reason: model::RemovalReason,
 }
 
 impl<R: StateStore> DeployAll<'_, R> {
     fn records(&self) -> Result<Vec<ArtifactRecord>> {
         Ok(self.registry.all_artifacts()?)
     }
-}
-
-struct DeployProtocol<'a, R> {
-    workspace: DeployAll<'a, R>,
-    upstream_drops: &'a [UpstreamDrop],
 }
 
 /// Outcome of the all-gates-before-mutation deploy protocol. `aborted` means a `pre_deploy` gate
@@ -685,7 +687,6 @@ where
 fn observe_reconciliation<R>(
     ctx: &DeployAll<'_, R>,
     policy: model::ReconciliationPolicy,
-    upstream_drops: &[UpstreamDrop],
 ) -> Result<(
     model::ObservedProjectState<state::ArtifactRecord>,
     Vec<model::ObservedEntry<state::ArtifactRecord>>,
@@ -700,15 +701,11 @@ where
     let mut changeset = reconcile::reconcile(ctx.projection, &observed, &policy)
         .map_err(|error| Error::Sync(error.to_string()))?;
     reconcile::add_history_retirement_conflicts(&mut changeset, &retirements, policy);
-    add_upstream_drop_conflicts(&mut changeset, upstream_drops, policy);
     ctx.input.sink().phase_finished(Phase::Observe);
     Ok((observed, retirements, changeset))
 }
 
-fn apply_target_changes<'a, R>(
-    ctx: &DeployAll<'a, R>,
-    upstream_drops: &[UpstreamDrop],
-) -> Result<ApplyRun<'a>>
+fn apply_target_changes<'a, R>(ctx: &DeployAll<'a, R>) -> Result<ApplyRun<'a>>
 where
     R: StateStore,
 {
@@ -718,7 +715,7 @@ where
         sweep_history_worktrees(ctx)?;
     }
     let (initial_observed, initial_retirements, initial_changeset) =
-        observe_reconciliation(ctx, policy, upstream_drops)?;
+        observe_reconciliation(ctx, policy)?;
     let registry: &dyn StateStore = ctx.registry;
     refuse_lockless_mutation(ctx.input, registry, &initial_observed, &initial_changeset)?;
     let initial_decisions = resolve_conflicts(
@@ -743,8 +740,7 @@ where
     }
 
     let (observed, changeset, retirements, decisions) = if ran {
-        let (observed, retirements, changeset) =
-            observe_reconciliation(ctx, policy, upstream_drops)?;
+        let (observed, retirements, changeset) = observe_reconciliation(ctx, policy)?;
         refuse_lockless_mutation(ctx.input, registry, &observed, &changeset)?;
         let decisions = resolve_conflicts_reusing(
             &changeset,
@@ -770,17 +766,6 @@ where
         changes: changeset.clone(),
         events: SyncEvents::new(ctx.input.sink()),
     };
-    apply_upstream_drops(
-        upstream_drops,
-        ctx.backend,
-        ctx.registry,
-        ctx.config,
-        ctx.protected,
-        &skipped_targets,
-        reconciliation.decisions(),
-        policy.force,
-        &mut run.events,
-    )?;
     ctx.input.sink().phase_started(Phase::Apply);
     run.had_failures |=
         deploy_reconciled_targets(ctx, &reconciliation, &mut run.events, &skipped_targets)?;
@@ -796,9 +781,16 @@ where
             &mut run.events,
         )?;
         ctx.input.sink().phase_finished(Phase::Prune);
-    } else if ctx.input.prune() && run.had_failures {
+    } else if ctx.input.prune()
+        || changeset.changes.iter().any(|change| {
+            matches!(
+                change,
+                model::SyncChange::Remove { .. } | model::SyncChange::RemoveConflict { .. }
+            )
+        })
+    {
         run.events
-            .push_warning(SyncWarning::PruneSkippedAfterFailures);
+            .push_warning(SyncWarning::RemovalsSkippedAfterFailures);
     }
     Ok(run)
 }
@@ -994,112 +986,6 @@ fn readonly_state_error(registry: &dyn StateStore) -> Error {
     let journal_root = registry.journal_root();
     let state_root = journal_root.parent().unwrap_or(&journal_root);
     state::readonly_root_error(state_root).into()
-}
-
-enum UpstreamDrop {
-    /// `link` is the symlink a linked record's deployed path held when the drop was planned;
-    /// `change` is how the deployed artifact differs from its record.
-    Remove {
-        record: ArtifactRecord,
-        link: Option<PathBuf>,
-        change: Option<LocalChange>,
-    },
-    KeepLive {
-        record: ArtifactRecord,
-    },
-}
-
-impl UpstreamDrop {
-    fn record(&self) -> &ArtifactRecord {
-        match self {
-            Self::Remove { record, .. } | Self::KeepLive { record, .. } => record,
-        }
-    }
-}
-
-fn plan_upstream_drops(
-    projection: &Projection,
-    config: &Config,
-    registry: &dyn StateStore,
-    protected: &confine::ProtectedPathSet,
-    drops: Vec<ArtifactRecord>,
-    lockless: bool,
-) -> Result<Vec<UpstreamDrop>> {
-    if drops.is_empty() {
-        return Ok(Vec::new());
-    }
-    if lockless {
-        return Err(readonly_state_error(registry));
-    }
-    let expected_paths = prune::expected_live_paths(projection, config);
-    let mut plan = Vec::new();
-    for record in drops {
-        let Some(target) = config.targets.get(&record.key.target) else {
-            continue;
-        };
-        let dst = prune::removal_destination(target, &record);
-        let path = prune::removal_path(target, &record, protected).map_err(|error| {
-            Error::Sync(format!(
-                "upstream drop refuses out-of-anchor {}: {error}; eject it instead",
-                dst.display()
-            ))
-        })?;
-        if prune::overlaps_live_dest(&path, &expected_paths, &record.key.target) {
-            plan.push(UpstreamDrop::KeepLive { record });
-        } else {
-            let link = if record.linked {
-                std::fs::read_link(&dst).ok()
-            } else {
-                None
-            };
-            let change = prune::detect_local_change(&record, &dst, registry)?;
-            plan.push(UpstreamDrop::Remove {
-                record,
-                link,
-                change,
-            });
-        }
-    }
-    Ok(plan)
-}
-
-/// Turns each locally changed upstream drop into a removal conflict, replacing any prune row
-/// for the same artifact so one decision governs it.
-fn add_upstream_drop_conflicts(
-    changeset: &mut model::ChangeSet,
-    drops: &[UpstreamDrop],
-    policy: model::ReconciliationPolicy,
-) {
-    if policy.force {
-        return;
-    }
-    for drop in drops {
-        let UpstreamDrop::Remove {
-            record,
-            change: Some(change),
-            ..
-        } = drop
-        else {
-            continue;
-        };
-        let key = &record.key;
-        changeset.changes.retain(|row| {
-            let (target, source, artifact) = target::change_key(row);
-            (target.as_str(), source.as_str(), artifact.as_str())
-                != (
-                    key.target.as_str(),
-                    key.source.as_str(),
-                    key.artifact.as_str(),
-                )
-        });
-        changeset.changes.push(model::SyncChange::RemoveConflict {
-            target: key.target.clone(),
-            source: key.source.clone(),
-            artifact: key.artifact.clone(),
-            change: change.clone(),
-            cause: RemovalCause::UpstreamDrop,
-        });
-    }
 }
 
 fn projected_artifact_count(projection: &Projection) -> usize {
@@ -1393,37 +1279,27 @@ fn sync_workspace<R: StateStore>(
     for warning in std::mem::take(&mut projection.warnings) {
         events.push_warning(SyncWarning::Projection(warning));
     }
-    let pending_upstream_drops = validate_sealed_offer(
+    let dropped = validate_sealed_offer(
         &effective_config,
         &parsed,
         &projection,
         &recorded_after_recovery,
         input.prune(),
     )?;
-    let upstream_drops = plan_upstream_drops(
-        &projection,
-        &effective_config,
-        compat_registry,
-        &protected,
-        pending_upstream_drops,
-        input.lockless,
-    )?;
 
-    let deploy = DeployProtocol {
-        workspace: DeployAll {
-            config: &effective_config,
-            parsed: &parsed,
-            remotes: &remotes,
-            projection: &projection,
-            resolved_sources: &routed.resolved,
-            protected: &protected,
-            content_store: Some(&content_store),
-            input,
-            backend,
-            registry,
-            journal: &journal,
-        },
-        upstream_drops: &upstream_drops,
+    let deploy = DeployAll {
+        config: &effective_config,
+        parsed: &parsed,
+        remotes: &remotes,
+        projection: &projection,
+        resolved_sources: &routed.resolved,
+        protected: &protected,
+        content_store: Some(&content_store),
+        input,
+        backend,
+        registry,
+        journal: &journal,
+        dropped: &dropped,
     };
     deploy_and_run_hooks(
         &deploy,
@@ -1442,7 +1318,7 @@ fn sync_workspace<R: StateStore>(
     reason = "the deploy phase threads both locks, both hook sets, the accumulator, and the run clock"
 )]
 fn deploy_and_run_hooks<R>(
-    protocol: &DeployProtocol<'_, R>,
+    deploy: &DeployAll<'_, R>,
     mut base_lock: Lock,
     local_lock: Option<Lock>,
     hook_candidates: &[transitive::TransitiveHookCandidate],
@@ -1454,11 +1330,7 @@ fn deploy_and_run_hooks<R>(
 where
     R: StateStore,
 {
-    let DeployProtocol {
-        workspace: deploy,
-        upstream_drops,
-    } = protocol;
-    let mut run = apply_target_changes(deploy, upstream_drops)?;
+    let mut run = apply_target_changes(deploy)?;
     run.events.applied.splice(0..0, events.applied);
     run.events.skipped.splice(0..0, events.skipped);
     run.events.warnings.splice(0..0, events.warnings);
@@ -1685,6 +1557,17 @@ impl SealedRecordPolicy {
         self.immutable_copy && !self.commit_differs
     }
 
+    /// Why a record no longer offered is removed: a link mirroring its live source, or an
+    /// immutable copy whose pin moved. `None` seals the offer.
+    fn drop_reason(self, mirrors_live_source: bool) -> Option<model::RemovalReason> {
+        if mirrors_live_source {
+            Some(model::RemovalReason::LinkedSourceDropped)
+        } else {
+            self.follows_moved_pin()
+                .then_some(model::RemovalReason::UpstreamDropped)
+        }
+    }
+
     fn follows_moved_pin(self) -> bool {
         self.immutable_copy && self.commit_differs
     }
@@ -1707,7 +1590,7 @@ fn validate_sealed_offer(
     projection: &Projection,
     recorded: &[ArtifactRecord],
     prune: bool,
-) -> Result<Vec<ArtifactRecord>> {
+) -> Result<Vec<DroppedRecord>> {
     use crate::projection::offer::OfferSelection;
 
     let mut offers: BTreeMap<(String, String), BindingOffer<'_>> = BTreeMap::new();
@@ -1784,8 +1667,11 @@ fn validate_sealed_offer(
             && config.targets.get(&key.target).is_some_and(|target| {
                 links_into_source(record, target, offer.live_root.as_deref(), &source_paths)
             });
-        if mirrors_live_source || policy.follows_moved_pin() {
-            dropped.push(record.clone());
+        if let Some(reason) = policy.drop_reason(mirrors_live_source) {
+            dropped.push(DroppedRecord {
+                record: record.clone(),
+                reason,
+            });
             continue;
         }
         let deploy_path = config.targets.get(&key.target).map(|target| {
@@ -1896,116 +1782,6 @@ fn paths_overlap(first: &str, second: &str) -> bool {
         || second
             .strip_prefix(first)
             .is_some_and(|rest| rest.starts_with('/'))
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "applying drops threads the stores, config, confinement, skip set, overwrite flag, and events"
-)]
-fn apply_upstream_drops(
-    drops: &[UpstreamDrop],
-    backend: &dyn SourceStore,
-    registry: &dyn StateStore,
-    config: &Config,
-    protected: &confine::ProtectedPathSet,
-    skipped_targets: &BTreeSet<String>,
-    decisions: &target::ConflictDecisions,
-    force: bool,
-    events: &mut SyncEvents,
-) -> Result<()> {
-    let mut emptied = prune::EmptiedDirectories::default();
-    for drop in drops {
-        let record = drop.record();
-        if skipped_targets.contains(&record.key.target) {
-            continue;
-        }
-        let target = config.targets.get(&record.key.target).ok_or_else(|| {
-            Error::Sync(format!(
-                "upstream drop target `{}` disappeared before removal",
-                record.key.target
-            ))
-        })?;
-        let path = prune::removal_path(target, record, protected).map_err(|error| {
-            Error::Sync(format!(
-                "upstream drop refuses out-of-anchor {}: {error}; eject it instead",
-                record.key.artifact
-            ))
-        })?;
-        match drop {
-            UpstreamDrop::KeepLive { .. } => {
-                events.push_warning(SyncWarning::UpstreamDropKeptLive {
-                    source: record.key.source.clone(),
-                    artifact: record.key.artifact.clone(),
-                    path,
-                });
-            }
-            UpstreamDrop::Remove { link, change, .. } => {
-                if record.linked && std::fs::read_link(&path).ok() != *link {
-                    continue;
-                }
-                if !force
-                    && let Some(change) = change
-                    && !prune::settle_removal_conflict(
-                        record,
-                        prune::removal_destination(target, record),
-                        change,
-                        RemovalCause::UpstreamDrop,
-                        decisions,
-                        registry,
-                        events,
-                    )?
-                {
-                    continue;
-                }
-                let source = record.key.source.clone();
-                let artifact = record.key.artifact.clone();
-                events.push_warning(if record.linked {
-                    SyncWarning::LinkedSourceDropped { source, artifact }
-                } else {
-                    SyncWarning::UpstreamDropped { source, artifact }
-                });
-                remove_orphan_path(&path).map_err(|error| {
-                    Error::Sync(format!("upstream drop removal {}: {error}", path.display()))
-                })?;
-                emptied.record(config, record);
-                detach_history_overlay(record, &path, backend)?;
-            }
-        }
-        registry.remove_artifact(&record.key)?;
-    }
-    emptied.sweep(config, registry, events)
-}
-
-#[cfg(test)]
-fn prune_upstream_drops_report(
-    projection: &Projection,
-    config: &Config,
-    registry: &dyn StateStore,
-    protected: &confine::ProtectedPathSet,
-    drops: &[ArtifactRecord],
-    lockless: bool,
-    events: &mut SyncEvents,
-) -> Result<()> {
-    let plan = plan_upstream_drops(
-        projection,
-        config,
-        registry,
-        protected,
-        drops.to_vec(),
-        lockless,
-    )?;
-    let backend = crate::source::GitBackend::new(PathBuf::new());
-    apply_upstream_drops(
-        &plan,
-        &backend,
-        registry,
-        config,
-        protected,
-        &BTreeSet::new(),
-        &target::ConflictDecisions::new(),
-        false,
-        events,
-    )
 }
 
 struct SealedOffer<'a> {

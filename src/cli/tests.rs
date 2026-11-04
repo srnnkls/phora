@@ -2667,7 +2667,7 @@ fn removal_prompt_offers_delete_instead_of_overwrite() {
         source: "tropos".to_owned(),
         artifact: "lint".to_owned(),
         kind: ConflictKind::Modified { changed: vec![] },
-        removal: Some(crate::sync::RemovalCause::Prune),
+        removal: Some(crate::sync::RemovalReason::Pruned),
     };
     assert_eq!(
         format_conflict_prompt(&conflict),

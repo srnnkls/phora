@@ -232,31 +232,21 @@ impl Reporter {
     }
 }
 
-fn finish_sync(
-    cwd: &Path,
-    out: &SyncReport,
-    interactive: bool,
-    reporter: &Reporter,
-) -> Result<CliOutcome> {
-    // `update` drops pins in memory. A failed pre-sync gate must not persist that drop.
-    let pre_sync_failed = out.hook_outcomes.iter().any(|hook| {
-        hook.scope == crate::sync::HookScope::PreSync
-            && hook.status == crate::sync::HookStatus::Failure
-    });
-    if !pre_sync_failed {
-        let base_lock = out
-            .locks
-            .base
-            .as_ref()
-            .ok_or_else(|| Error::Lock("sync completed without a base lock".to_owned()))?;
-        write_locks(cwd, base_lock, out.locks.local.as_ref())?;
-    }
-    render_sync_warnings(out);
+fn render_applied_and_skipped(out: &SyncReport) {
     for applied in &out.applied {
         match applied {
             crate::sync::AppliedChange::Removed {
-                source, artifact, ..
+                source,
+                artifact,
+                reason: crate::sync::RemovalReason::Pruned,
+                ..
             } => eprintln!("phora: pruning orphaned {source}:{artifact}"),
+            crate::sync::AppliedChange::Removed {
+                source,
+                artifact,
+                reason,
+                ..
+            } => eprintln!("phora: removed {source}:{artifact} ({})", reason.describe()),
             crate::sync::AppliedChange::OverlayRewritten {
                 source, artifact, ..
             } => eprintln!("phora: rewrote history overlay {source}:{artifact}"),
@@ -279,6 +269,29 @@ fn finish_sync(
             SkippedChange::Conflict { .. } => {}
         }
     }
+}
+
+fn finish_sync(
+    cwd: &Path,
+    out: &SyncReport,
+    interactive: bool,
+    reporter: &Reporter,
+) -> Result<CliOutcome> {
+    // `update` drops pins in memory. A failed pre-sync gate must not persist that drop.
+    let pre_sync_failed = out.hook_outcomes.iter().any(|hook| {
+        hook.scope == crate::sync::HookScope::PreSync
+            && hook.status == crate::sync::HookStatus::Failure
+    });
+    if !pre_sync_failed {
+        let base_lock = out
+            .locks
+            .base
+            .as_ref()
+            .ok_or_else(|| Error::Lock("sync completed without a base lock".to_owned()))?;
+        write_locks(cwd, base_lock, out.locks.local.as_ref())?;
+    }
+    render_sync_warnings(out);
+    render_applied_and_skipped(out);
     let report = super::render::render_hook_report(&out.hook_outcomes);
     let stripped = out
         .warnings

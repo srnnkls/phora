@@ -4,7 +4,7 @@ use phora::projection::model::{
 };
 use phora::sync::model::{
     LocalChange, ManagedArtifact, ManagedCondition, ObservedArtifact, ObservedEntry,
-    ObservedProjectState, ReconciliationPolicy, RemovalCause, RemovalReason, SyncChange,
+    ObservedProjectState, ReconciliationPolicy, RemovalReason, SyncChange,
 };
 use phora::sync::reconcile::reconcile;
 use std::path::PathBuf;
@@ -72,6 +72,7 @@ fn managed(condition: ManagedCondition) -> ObservedArtifact {
         record: (),
         condition,
         overlay_stale: false,
+        dropped: None,
     })
 }
 
@@ -174,7 +175,7 @@ fn orphan_managed_modified_under_prune_is_a_removal_conflict_unless_forced() {
             source: "gone".to_owned(),
             artifact: "leftover".to_owned(),
             change: LocalChange::Modified { changed },
-            cause: RemovalCause::Prune,
+            reason: RemovalReason::Pruned,
         }],
         "R2: a locally modified orphan under prune waits on a conflict decision"
     );

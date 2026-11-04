@@ -9,9 +9,7 @@ use crate::projection::diagnostic::ProjectionWarning;
 
 use super::ConflictResolver;
 use super::hooks::HookOutcome;
-use super::model::{
-    ChangeSet, ConflictKind, LocalChange, ReconciliationPolicy, RemovalCause, RemovalReason,
-};
+use super::model::{ChangeSet, ConflictKind, LocalChange, ReconciliationPolicy, RemovalReason};
 use super::progress::{self, ProgressSink};
 
 /// The base and optional local lock carried into or returned from synchronization.
@@ -187,7 +185,7 @@ pub enum SyncWarning {
     OrphanedRecords {
         count: usize,
     },
-    PruneSkippedAfterFailures,
+    RemovalsSkippedAfterFailures,
     PruneRefused {
         path: PathBuf,
         reason: String,
@@ -201,25 +199,19 @@ pub enum SyncWarning {
         artifact: String,
         layout: String,
     },
-    UpstreamDropKeptLive {
+    /// A dropped record was forgotten without deleting its path, which a live artifact holds.
+    ReleasedUnderLive {
         source: String,
         artifact: String,
         path: PathBuf,
-    },
-    UpstreamDropped {
-        source: String,
-        artifact: String,
+        reason: RemovalReason,
     },
     KeptLocalChange {
         source: String,
         artifact: String,
         path: PathBuf,
         change: LocalChange,
-        cause: RemovalCause,
-    },
-    LinkedSourceDropped {
-        source: String,
-        artifact: String,
+        reason: RemovalReason,
     },
     CrossDeviceFallback {
         destination: PathBuf,
