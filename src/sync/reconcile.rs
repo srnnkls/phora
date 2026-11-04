@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::projection::model::Projection;
 use crate::sync::model::{
     ChangeSet, ConflictKind, ManagedArtifact, ManagedCondition, ObservedArtifact, ObservedEntry,
-    ObservedProjectState, ReconciliationPolicy, RemovalReason, SyncChange, SyncError,
+    ObservedProjectState, ReconciliationPolicy, RemovalCause, RemovalReason, SyncChange, SyncError,
 };
 
 type Key = (String, String, String);
@@ -106,6 +106,9 @@ fn classify_desired<R>(
                 },
                 policy,
             )),
+            ManagedCondition::Replaced | ManagedCondition::Repointed => {
+                Some(collision(desired, ConflictKind::Foreign, policy))
+            }
             ManagedCondition::Clean | ManagedCondition::MetadataChangedButContentClean { .. }
                 if managed.overlay_stale =>
             {
@@ -126,15 +129,27 @@ fn classify_orphan<R>(
     entry: &ObservedEntry<R>,
     policy: ReconciliationPolicy,
 ) -> Option<SyncChange> {
-    match &entry.observation {
-        ObservedArtifact::Managed(_) if policy.prune => Some(SyncChange::Remove {
+    let ObservedArtifact::Managed(managed) = &entry.observation else {
+        return None;
+    };
+    if !policy.prune {
+        return None;
+    }
+    Some(match managed.condition.to_local_change() {
+        Some(change) if !policy.force => SyncChange::RemoveConflict {
+            target: entry.target.clone(),
+            source: entry.source.clone(),
+            artifact: entry.artifact.clone(),
+            change,
+            cause: RemovalCause::Prune,
+        },
+        _ => SyncChange::Remove {
             target: entry.target.clone(),
             source: entry.source.clone(),
             artifact: entry.artifact.clone(),
             reason: RemovalReason::Pruned,
-        }),
-        _ => None,
-    }
+        },
+    })
 }
 
 fn deploy(desired: DesiredArtifact) -> SyncChange {

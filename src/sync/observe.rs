@@ -78,7 +78,9 @@ where
         })?;
     }
     let list_all = || all_records.map_or_else(|| ctx.records(), Ok);
-    for record in registry_only_records(ctx.input.prune(), list_all)? {
+    let orphans = registry_only_records(ctx.input.prune(), list_all)?;
+    let live_paths = super::prune::live_paths_by_source(projection, ctx.config);
+    for record in orphans {
         let triplet = (
             record.key.target.clone(),
             record.key.source.clone(),
@@ -87,6 +89,7 @@ where
         if observations.contains_key(&triplet) {
             continue;
         }
+        let condition = observe_orphan_condition(ctx, &record, &live_paths)?;
         observations.insert(
             triplet,
             ObservedEntry {
@@ -95,7 +98,7 @@ where
                 artifact: record.key.artifact.clone(),
                 observation: ObservedArtifact::Managed(ManagedArtifact {
                     record,
-                    condition: ManagedCondition::Clean,
+                    condition,
                     overlay_stale: false,
                 }),
             },
@@ -146,6 +149,28 @@ where
         });
     }
     Ok(retirements)
+}
+
+/// An orphan under a live destination is only released, never deleted, so its content is not
+/// compared; any other orphan reports how its deployed artifact changed since phora recorded it.
+fn observe_orphan_condition<R>(
+    ctx: &DeployAll<'_, R>,
+    record: &ArtifactRecord,
+    live_paths: &super::prune::LivePathsBySource,
+) -> Result<ManagedCondition>
+where
+    R: StateStore,
+{
+    let Some(path) = super::prune::recorded_destination(ctx.config, record) else {
+        return Ok(ManagedCondition::Clean);
+    };
+    if super::prune::overlaps_any_live_path(&path, live_paths) {
+        return Ok(ManagedCondition::Clean);
+    }
+    Ok(
+        super::prune::detect_local_change(record, &path, ctx.registry)?
+            .map_or(ManagedCondition::Clean, ManagedCondition::from),
+    )
 }
 
 fn registry_only_records(

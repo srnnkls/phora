@@ -11,18 +11,17 @@ use super::{DeployAll, persisted_manifest_relative_path, remove_orphan_path};
 use crate::projection::build::projected_artifacts;
 use crate::projection::model::Projection;
 use crate::sync::model::{
-    ConflictKind, ManagedArtifact, ManagedCondition, ObservedArtifact, ObservedProjectState,
-    SyncChange,
+    LocalChange, ManagedArtifact, ManagedCondition, ObservedArtifact, ObservedProjectState,
+    RemovalCause, RemovalReason, SyncChange,
 };
 use crate::sync::request::SyncEvents;
-use crate::sync::{
-    AppliedChange, ConflictPolicy, LocalChange, RemovalCause, SkippedChange, SyncWarning,
-};
+use crate::sync::target::{ConflictDecisions, ConflictOutcome};
+use crate::sync::{AppliedChange, Resolution, SkippedChange, SyncWarning};
 
 #[cfg(test)]
 type ExpectedByBinding = BTreeMap<(String, String), Vec<String>>;
 type ExpectedPaths = BTreeMap<String, Vec<PathBuf>>;
-type LivePathsBySource = BTreeMap<String, Vec<(String, PathBuf)>>;
+pub(super) type LivePathsBySource = BTreeMap<String, Vec<(String, PathBuf)>>;
 
 #[cfg(test)]
 fn is_still_expected(
@@ -60,7 +59,7 @@ fn overlaps_any_live_dest(path: &Path, live: &LivePathsBySource, target: &str) -
         .is_some_and(|dests| dests.iter().any(|(_, dest)| touches(path, dest)))
 }
 
-fn overlaps_any_live_path(path: &Path, live: &LivePathsBySource) -> bool {
+pub(super) fn overlaps_any_live_path(path: &Path, live: &LivePathsBySource) -> bool {
     live.values().flatten().any(|(_, dest)| touches(path, dest))
 }
 
@@ -258,21 +257,34 @@ pub(super) fn apply_reconciled_removals<R>(
     changes: &[SyncChange],
     observed: &ObservedProjectState<ArtifactRecord>,
     projection: &Projection,
+    decisions: &ConflictDecisions,
     ctx: &DeployAll<'_, R>,
     events: &mut SyncEvents,
 ) -> Result<()>
 where
     R: StateStore,
 {
-    let removals: Vec<(&str, &str, &str, &crate::sync::model::RemovalReason)> = changes
+    let removals: Vec<(&str, &str, &str, Option<&LocalChange>)> = changes
         .iter()
         .filter_map(|change| match change {
             SyncChange::Remove {
                 target,
                 source,
                 artifact,
-                reason,
-            } => Some((target.as_str(), source.as_str(), artifact.as_str(), reason)),
+                ..
+            } => Some((target.as_str(), source.as_str(), artifact.as_str(), None)),
+            SyncChange::RemoveConflict {
+                target,
+                source,
+                artifact,
+                change,
+                cause: RemovalCause::Prune,
+            } => Some((
+                target.as_str(),
+                source.as_str(),
+                artifact.as_str(),
+                Some(change),
+            )),
             _ => None,
         })
         .collect();
@@ -306,7 +318,7 @@ where
         .collect();
     let live_paths = live_paths_by_source(projection, ctx.config);
     let mut emptied = EmptiedDirectories::default();
-    for (target, source, artifact, reason) in removals {
+    for (target, source, artifact, change) in removals {
         let Some(record) = records.get(&(target, source, artifact)).copied() else {
             return Err(Error::Sync(format!(
                 "reconciled removal {source}:{artifact} in target {target} has no managed record"
@@ -315,6 +327,22 @@ where
         if adopted.contains(&(target, source, artifact)) {
             continue;
         }
+        if let Some(change) = change {
+            let path = recorded_destination(ctx.config, record)
+                .unwrap_or_else(|| PathBuf::from(&record.key.artifact));
+            let delete = settle_removal_conflict(
+                record,
+                path,
+                change,
+                RemovalCause::Prune,
+                decisions,
+                ctx.registry,
+                events,
+            )?;
+            if !delete {
+                continue;
+            }
+        }
         if !remove_reconciled_record(
             record,
             ctx.config,
@@ -322,10 +350,6 @@ where
             ctx.registry,
             ctx.protected,
             &live_paths,
-            matches!(
-                ctx.input.options().conflict_policy,
-                ConflictPolicy::Overwrite
-            ),
             events,
         )? {
             continue;
@@ -335,13 +359,13 @@ where
             target: target.to_owned(),
             source: source.to_owned(),
             artifact: artifact.to_owned(),
-            reason: reason.clone(),
+            reason: RemovalReason::Pruned,
         });
     }
     emptied.sweep(ctx.config, ctx.registry, events)
 }
 
-fn live_paths_by_source(projection: &Projection, config: &Config) -> LivePathsBySource {
+pub(super) fn live_paths_by_source(projection: &Projection, config: &Config) -> LivePathsBySource {
     let mut live_paths = LivePathsBySource::new();
     for target_projection in &projection.targets {
         let Some(target) = config.targets.get(&target_projection.target) else {
@@ -365,7 +389,7 @@ fn live_paths_by_source(projection: &Projection, config: &Config) -> LivePathsBy
 /// How the artifact at `path` differs from what phora deployed there; `None` while it is
 /// unchanged or already gone. A link is unchanged while it is a symlink reading the recorded
 /// target (any symlink for a legacy record without one); a copy while its files match the record.
-pub(super) fn local_change(
+pub(super) fn detect_local_change(
     record: &ArtifactRecord,
     path: &Path,
     registry: &dyn StateStore,
@@ -405,62 +429,69 @@ pub(super) fn local_change(
     })
 }
 
-/// Reports an artifact a removal leaves in place, keeping its record so the next sync reports it again.
-pub(super) fn keep_local_change(
+/// Reports an artifact a removal leaves in place; its record stays, so the next sync asks again.
+fn report_kept(
     record: &ArtifactRecord,
     path: PathBuf,
-    change: LocalChange,
+    change: &LocalChange,
     cause: RemovalCause,
+    warn: bool,
     events: &mut SyncEvents,
 ) {
-    let kind = match &change {
-        LocalChange::Modified { changed } => ConflictKind::Modified {
-            changed: changed.clone(),
-        },
-        LocalChange::Replaced | LocalChange::Repointed => ConflictKind::Foreign,
-    };
-    events.push_warning(SyncWarning::KeptLocalChange {
-        source: record.key.source.clone(),
-        artifact: record.key.artifact.clone(),
-        path,
-        change,
-        cause,
-    });
+    if warn {
+        events.push_warning(SyncWarning::KeptLocalChange {
+            source: record.key.source.clone(),
+            artifact: record.key.artifact.clone(),
+            path,
+            change: change.clone(),
+            cause,
+        });
+    }
     events.push_skipped(SkippedChange::Conflict {
         target: record.key.target.clone(),
         source: record.key.source.clone(),
         artifact: record.key.artifact.clone(),
-        kind,
+        kind: change.to_conflict_kind(),
     });
 }
 
-fn kept_for_local_change(
+/// Applies the decision on a removal conflict; returns whether the caller deletes the artifact.
+/// Skip keeps it, overwrite deletes it, eject forgets its record and keeps its files.
+pub(super) fn settle_removal_conflict(
     record: &ArtifactRecord,
-    path: &Path,
+    path: PathBuf,
+    change: &LocalChange,
+    cause: RemovalCause,
+    decisions: &ConflictDecisions,
     registry: &dyn StateStore,
-    force: bool,
     events: &mut SyncEvents,
 ) -> Result<bool> {
-    if force {
-        return Ok(false);
-    }
-    let Some(change) = local_change(record, path, registry)? else {
-        return Ok(false);
-    };
-    keep_local_change(
-        record,
-        path.to_path_buf(),
-        change,
-        RemovalCause::Prune,
-        events,
+    let key = (
+        record.key.target.clone(),
+        record.key.source.clone(),
+        record.key.artifact.clone(),
     );
-    Ok(true)
+    let outcome = decisions.get(&key);
+    match outcome.map_or(Resolution::Skip, ConflictOutcome::resolution) {
+        Resolution::Skip => {
+            let warn = outcome.is_none_or(ConflictOutcome::warns);
+            report_kept(record, path, change, cause, warn, events);
+            Ok(false)
+        }
+        Resolution::Eject => {
+            registry.remove_artifact(&record.key)?;
+            events.push_applied(AppliedChange::Ejected {
+                target: record.key.target.clone(),
+                source: record.key.source.clone(),
+                artifact: record.key.artifact.clone(),
+            });
+            Ok(false)
+        }
+        Resolution::Overwrite => Ok(true),
+        Resolution::Abort => Err(Error::Aborted),
+    }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "removal threads config, both stores, confinement, live paths, the overwrite flag, and events"
-)]
 fn remove_reconciled_record(
     record: &ArtifactRecord,
     config: &Config,
@@ -468,7 +499,6 @@ fn remove_reconciled_record(
     registry: &dyn StateStore,
     protected: &ProtectedPathSet,
     live_paths: &LivePathsBySource,
-    force: bool,
     events: &mut SyncEvents,
 ) -> Result<bool> {
     if let Some(target) = config.targets.get(&record.key.target) {
@@ -480,9 +510,6 @@ fn remove_reconciled_record(
                     return release_under_live_destination(
                         record, &path, live_paths, config, registry,
                     );
-                }
-                if kept_for_local_change(record, &dst, registry, force, events)? {
-                    return Ok(false);
                 }
                 remove_orphan_path(&path)
                     .map_err(|error| Error::Sync(format!("prune {}: {error}", path.display())))?;
@@ -542,9 +569,6 @@ fn remove_reconciled_record(
         };
         if overlaps_any_live_path(&path, live_paths) {
             return release_under_live_destination(record, &path, live_paths, config, registry);
-        }
-        if kept_for_local_change(record, &path, registry, force, events)? {
-            return Ok(false);
         }
         remove_orphan_path(&path)
             .map_err(|error| Error::Sync(format!("prune {}: {error}", path.display())))?;
@@ -692,7 +716,7 @@ fn prune_stale_manifest_children(
     Ok(())
 }
 
-fn recorded_destination(config: &Config, record: &ArtifactRecord) -> Option<PathBuf> {
+pub(super) fn recorded_destination(config: &Config, record: &ArtifactRecord) -> Option<PathBuf> {
     match config.targets.get(&record.key.target) {
         Some(target) => Some(removal_destination(target, record)),
         None => orphan_artifact_path(record),

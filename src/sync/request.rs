@@ -9,7 +9,9 @@ use crate::projection::diagnostic::ProjectionWarning;
 
 use super::ConflictResolver;
 use super::hooks::HookOutcome;
-use super::model::{ChangeSet, ConflictKind, ReconciliationPolicy, RemovalReason};
+use super::model::{
+    ChangeSet, ConflictKind, LocalChange, ReconciliationPolicy, RemovalCause, RemovalReason,
+};
 use super::progress::{self, ProgressSink};
 
 /// The base and optional local lock carried into or returned from synchronization.
@@ -159,21 +161,6 @@ pub enum SkippedChange {
         source: String,
         artifact: String,
     },
-}
-
-/// How a deployed artifact phora was about to remove differs from what phora deployed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LocalChange {
-    Modified { changed: Vec<PathBuf> },
-    Replaced,
-    Repointed,
-}
-
-/// Why phora was removing an artifact it kept instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RemovalCause {
-    UpstreamDrop,
-    Prune,
 }
 
 /// A non-fatal diagnostic returned to the rendering boundary.

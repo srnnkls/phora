@@ -58,7 +58,7 @@ use crate::source::SourceName;
 use crate::source::{GitBackend, HttpBackend, RouterBackend};
 use crate::sync::state::ProjectId;
 use crate::sync::state::{FileStateStore, StateError, StateLock, StateStore};
-use crate::sync::{Conflict, ConflictResolver, Resolution};
+use crate::sync::{Conflict, ConflictKind, ConflictResolver, Resolution};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -878,17 +878,19 @@ struct TtyResolver;
 
 impl ConflictResolver for TtyResolver {
     fn resolve(&self, conflict: &Conflict) -> Resolution {
+        let parse = if conflict.removal.is_some() {
+            parse_removal_resolution
+        } else {
+            resolution_from_char
+        };
         loop {
-            eprint!(
-                "phora: conflict at {}/{} in {} — [s]kip/[o]verwrite/[e]ject/[a]bort? ",
-                conflict.source, conflict.artifact, conflict.target
-            );
+            eprint!("{}", format_conflict_prompt(conflict));
             let _ = std::io::stderr().flush();
             let mut line = String::new();
             match std::io::stdin().read_line(&mut line) {
                 Ok(0) | Err(_) => return Resolution::Skip,
                 Ok(_) => {
-                    if let Some(resolution) = line.chars().next().and_then(resolution_from_char) {
+                    if let Some(resolution) = line.chars().next().and_then(parse) {
                         return resolution;
                     }
                 }
@@ -947,6 +949,39 @@ fn load_source(name: &str) -> Result<ParsedSource> {
 
 /// Maps an interactive prompt character to a [`Resolution`]: `s`→Skip, `o`→Overwrite,
 /// `e`→Eject, `a`→Abort; any other character yields `None`.
+#[must_use]
+fn format_conflict_prompt(conflict: &Conflict) -> String {
+    let Conflict {
+        target,
+        source,
+        artifact,
+        kind,
+        removal,
+    } = conflict;
+    let Some(cause) = removal else {
+        return format!(
+            "phora: conflict at {source}/{artifact} in {target} — [s]kip/[o]verwrite/[e]ject/[a]bort? "
+        );
+    };
+    let why = cause.describe();
+    let what = match kind {
+        ConflictKind::Modified { .. } => "you modified it",
+        ConflictKind::Foreign => "something phora did not deploy is in its place",
+    };
+    format!(
+        "phora: {source}/{artifact} in {target} is {why}, but {what} — [s]kip/[d]elete/[e]ject/[a]bort? "
+    )
+}
+
+/// Parses a removal prompt answer; delete is the removal's overwrite.
+fn parse_removal_resolution(c: char) -> Option<Resolution> {
+    match c {
+        'd' => Some(Resolution::Overwrite),
+        'o' => None,
+        other => resolution_from_char(other),
+    }
+}
+
 #[must_use]
 pub fn resolution_from_char(c: char) -> Option<Resolution> {
     match c {

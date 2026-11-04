@@ -2661,6 +2661,29 @@ fn uneject_round_trips_a_mapped_record_back_to_managed() {
 // ── resolution_from_char ───────────────────────────────────────
 
 #[test]
+fn removal_prompt_offers_delete_instead_of_overwrite() {
+    let conflict = Conflict {
+        target: "dest".to_owned(),
+        source: "tropos".to_owned(),
+        artifact: "lint".to_owned(),
+        kind: ConflictKind::Modified { changed: vec![] },
+        removal: Some(crate::sync::RemovalCause::Prune),
+    };
+    assert_eq!(
+        format_conflict_prompt(&conflict),
+        "phora: tropos/lint in dest is no longer selected, but you modified it — \
+         [s]kip/[d]elete/[e]ject/[a]bort? "
+    );
+    assert_eq!(parse_removal_resolution('d'), Some(Resolution::Overwrite));
+    assert_eq!(
+        parse_removal_resolution('o'),
+        None,
+        "`o` is not offered for a removal"
+    );
+    assert_eq!(parse_removal_resolution('e'), Some(Resolution::Eject));
+}
+
+#[test]
 fn resolution_from_char_maps_skip() {
     assert_eq!(
         resolution_from_char('s'),

@@ -3,8 +3,8 @@ use phora::projection::model::{
     TargetPath, TargetProjection,
 };
 use phora::sync::model::{
-    ManagedArtifact, ManagedCondition, ObservedArtifact, ObservedEntry, ObservedProjectState,
-    ReconciliationPolicy, RemovalReason, SyncChange,
+    LocalChange, ManagedArtifact, ManagedCondition, ObservedArtifact, ObservedEntry,
+    ObservedProjectState, ReconciliationPolicy, RemovalCause, RemovalReason, SyncChange,
 };
 use phora::sync::reconcile::reconcile;
 use std::path::PathBuf;
@@ -155,29 +155,39 @@ fn aliased_binding_under_by_source_layout_is_not_a_spurious_orphan() {
 }
 
 #[test]
-fn orphan_managed_modified_under_prune_removes_without_conflict() {
+fn orphan_managed_modified_under_prune_is_a_removal_conflict_unless_forced() {
     let proj = projection(Vec::new());
+    let changed = vec![PathBuf::from("a.json")];
     let state = observed(vec![entry(
         "gone",
         "leftover",
         managed(ManagedCondition::Modified {
-            changed: vec![PathBuf::from("a.json")],
+            changed: changed.clone(),
         }),
     )]);
 
     let set = reconcile(&proj, &state, &policy(false, true)).expect("R2: orphan reconcile");
-
     assert_eq!(
         set.changes,
+        vec![SyncChange::RemoveConflict {
+            target: TARGET.to_owned(),
+            source: "gone".to_owned(),
+            artifact: "leftover".to_owned(),
+            change: LocalChange::Modified { changed },
+            cause: RemovalCause::Prune,
+        }],
+        "R2: a locally modified orphan under prune waits on a conflict decision"
+    );
+
+    let forced = reconcile(&proj, &state, &policy(true, true)).expect("R2: forced reconcile");
+    assert_eq!(
+        forced.changes,
         vec![SyncChange::Remove {
             target: TARGET.to_owned(),
             source: "gone".to_owned(),
             artifact: "leftover".to_owned(),
             reason: RemovalReason::Pruned,
         }],
-        "R2: a locally-MODIFIED managed orphan under prune is Remove{{Pruned}} with no Conflict \
-         — prune overrides modification (parity with live prune_orphans, which never consults \
-         modification state). got {:?}",
-        set.changes
+        "R2: --force removes a modified orphan without asking"
     );
 }

@@ -14485,6 +14485,113 @@ fn moved_pin_keeps_a_locally_modified_dropped_artifact_unless_forced() {
     assert!(registry.artifact(&key).expect("registry read").is_none());
 }
 
+fn deploy_editor_lint_then_edit_lint(
+    p: &Path,
+    td: &TargetDir,
+    backend: &GitBackend,
+    registry: &FileStateStore,
+) -> (Config, PathBuf) {
+    let (url, _c0, _c1) = init_editor_lint_source(p);
+    let cfg = parse_editor_lint_config(&url, "branch = \"main\"", td);
+    sync(&input(&cfg, None, None, None, false), backend, registry).expect("deploy lint");
+    let deployed = td.target_path().join("lint/rules.toml");
+    std::fs::write(&deployed, b"strict = false\n").expect("edit the deployed copy");
+    (cfg, deployed)
+}
+
+#[test]
+fn interactive_prune_asks_and_eject_keeps_the_modified_copy_unmanaged() {
+    let src = TempDir::new().expect("src tempdir");
+    let td = TargetDir::new();
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let (_wide, deployed) = deploy_editor_lint_then_edit_lint(src.path(), &td, &backend, &registry);
+    let url = src.path().to_string_lossy().into_owned();
+    let narrowed = parse_editor_lint_config(&url, "branch = \"main\"\ninclude = [\"editor\"]", &td);
+
+    let resolver = ScriptedResolver::new(Resolution::Eject);
+    let request = SyncInput {
+        prune: true,
+        ..interactive_input(&narrowed, None, &resolver)
+    };
+    sync(&request, &backend, &registry).expect("an ejected removal conflict syncs");
+
+    assert_eq!(resolver.consulted(), 1, "the prune asks once, for lint");
+    let conflict = resolver.last_conflict();
+    assert_eq!(conflict.artifact, "lint");
+    assert_eq!(conflict.removal, Some(RemovalCause::Prune));
+    assert_eq!(
+        std::fs::read(&deployed).expect("eject keeps the files"),
+        b"strict = false\n"
+    );
+    assert!(
+        registry
+            .artifact(&artifact_key("dest", "ed", "lint"))
+            .expect("registry read")
+            .is_none(),
+        "eject forgets the record"
+    );
+}
+
+#[test]
+fn interactive_upstream_drop_delete_removes_the_modified_copy() {
+    let src = TempDir::new().expect("src tempdir");
+    let td = TargetDir::new();
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let (cfg, deployed) = deploy_editor_lint_then_edit_lint(src.path(), &td, &backend, &registry);
+    run_git(src.path(), &["rm", "-r", "-q", "lint"]);
+    run_git(src.path(), &["commit", "-m", "drop lint"]);
+
+    let resolver = ScriptedResolver::new(Resolution::Overwrite);
+    sync(
+        &interactive_input(&cfg, None, &resolver),
+        &backend,
+        &registry,
+    )
+    .expect("a deleted removal conflict syncs");
+
+    assert_eq!(resolver.consulted(), 1);
+    assert_eq!(
+        resolver.last_conflict().removal,
+        Some(RemovalCause::UpstreamDrop)
+    );
+    assert!(!deployed.exists(), "delete removes the modified copy");
+    assert!(
+        registry
+            .artifact(&artifact_key("dest", "ed", "lint"))
+            .expect("registry read")
+            .is_none()
+    );
+}
+
+#[test]
+fn an_upstream_drop_under_prune_is_decided_once() {
+    let src = TempDir::new().expect("src tempdir");
+    let td = TargetDir::new();
+    let (_g, _s, backend, registry) = fresh_backend_registry();
+    let (cfg, deployed) = deploy_editor_lint_then_edit_lint(src.path(), &td, &backend, &registry);
+    run_git(src.path(), &["rm", "-r", "-q", "lint"]);
+    run_git(src.path(), &["commit", "-m", "drop lint"]);
+
+    let report = sync_with_report(
+        &SyncInput {
+            prune: true,
+            ..input(&cfg, None, None, None, false)
+        },
+        &backend,
+        &registry,
+    )
+    .expect("a kept drop under prune syncs");
+
+    let kept: Vec<_> = report
+        .warnings
+        .iter()
+        .filter(|warning| matches!(warning, SyncWarning::KeptLocalChange { .. }))
+        .collect();
+    assert_eq!(kept.len(), 1, "one artifact, one decision; got {kept:?}");
+    assert!(reports_kept_upstream_drop(&report, "lint"));
+    assert!(deployed.exists());
+}
+
 fn prepare_real_pending_upstream_drop(
     fx: &SyncFixture,
     target: &TargetDir,

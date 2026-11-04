@@ -51,9 +51,9 @@ pub use progress::{
 };
 pub use rebuild::{RebuildReport, rebuild_registry, rebuild_registry_with};
 pub use request::{
-    AppliedChange, Concurrency, ConflictPolicy, DeclineAll, HookPolicy, LocalChange, LockSet,
-    PrunePolicy, RemovalCause, SkippedChange, SourcePolicy, SyncOptions, SyncReport, SyncRequest,
-    SyncStatus, SyncWarning, TrustPrompt, TrustRequest,
+    AppliedChange, Concurrency, ConflictPolicy, DeclineAll, HookPolicy, LockSet, PrunePolicy,
+    SkippedChange, SourcePolicy, SyncOptions, SyncReport, SyncRequest, SyncStatus, SyncWarning,
+    TrustPrompt, TrustRequest,
 };
 pub use verify::{
     OverlayFinding, UntrustedHookFinding, VerifyMismatch, VerifyReason, VerifyReport, verify,
@@ -137,7 +137,7 @@ pub enum Resolution {
     Abort,
 }
 
-pub use model::ConflictKind;
+pub use model::{ConflictKind, LocalChange, RemovalCause};
 
 /// A single conflict presented to a [`ConflictResolver`] during interactive sync.
 #[derive(Debug, Clone)]
@@ -146,6 +146,8 @@ pub struct Conflict {
     pub source: String,
     pub artifact: String,
     pub kind: ConflictKind,
+    /// Set when the conflict blocks a removal: overwrite then deletes the artifact.
+    pub removal: Option<RemovalCause>,
 }
 
 /// Decides how to resolve each Modified/Foreign conflict in interactive sync.
@@ -683,6 +685,7 @@ where
 fn observe_reconciliation<R>(
     ctx: &DeployAll<'_, R>,
     policy: model::ReconciliationPolicy,
+    upstream_drops: &[UpstreamDrop],
 ) -> Result<(
     model::ObservedProjectState<state::ArtifactRecord>,
     Vec<model::ObservedEntry<state::ArtifactRecord>>,
@@ -697,6 +700,7 @@ where
     let mut changeset = reconcile::reconcile(ctx.projection, &observed, &policy)
         .map_err(|error| Error::Sync(error.to_string()))?;
     reconcile::add_history_retirement_conflicts(&mut changeset, &retirements, policy);
+    add_upstream_drop_conflicts(&mut changeset, upstream_drops, policy);
     ctx.input.sink().phase_finished(Phase::Observe);
     Ok((observed, retirements, changeset))
 }
@@ -714,7 +718,7 @@ where
         sweep_history_worktrees(ctx)?;
     }
     let (initial_observed, initial_retirements, initial_changeset) =
-        observe_reconciliation(ctx, policy)?;
+        observe_reconciliation(ctx, policy, upstream_drops)?;
     let registry: &dyn StateStore = ctx.registry;
     refuse_lockless_mutation(ctx.input, registry, &initial_observed, &initial_changeset)?;
     let initial_decisions = resolve_conflicts(
@@ -739,7 +743,8 @@ where
     }
 
     let (observed, changeset, retirements, decisions) = if ran {
-        let (observed, retirements, changeset) = observe_reconciliation(ctx, policy)?;
+        let (observed, retirements, changeset) =
+            observe_reconciliation(ctx, policy, upstream_drops)?;
         refuse_lockless_mutation(ctx.input, registry, &observed, &changeset)?;
         let decisions = resolve_conflicts_reusing(
             &changeset,
@@ -772,6 +777,7 @@ where
         ctx.config,
         ctx.protected,
         &skipped_targets,
+        reconciliation.decisions(),
         policy.force,
         &mut run.events,
     )?;
@@ -785,6 +791,7 @@ where
             &changeset.changes,
             &observed,
             ctx.projection,
+            reconciliation.decisions(),
             ctx,
             &mut run.events,
         )?;
@@ -990,10 +997,12 @@ fn readonly_state_error(registry: &dyn StateStore) -> Error {
 }
 
 enum UpstreamDrop {
-    /// `link` is the symlink a linked record's deployed path held when the drop was planned.
+    /// `link` is the symlink a linked record's deployed path held when the drop was planned;
+    /// `change` is how the deployed artifact differs from its record.
     Remove {
         record: ArtifactRecord,
         link: Option<PathBuf>,
+        change: Option<LocalChange>,
     },
     KeepLive {
         record: ArtifactRecord,
@@ -1043,10 +1052,54 @@ fn plan_upstream_drops(
             } else {
                 None
             };
-            plan.push(UpstreamDrop::Remove { record, link });
+            let change = prune::detect_local_change(&record, &dst, registry)?;
+            plan.push(UpstreamDrop::Remove {
+                record,
+                link,
+                change,
+            });
         }
     }
     Ok(plan)
+}
+
+/// Turns each locally changed upstream drop into a removal conflict, replacing any prune row
+/// for the same artifact so one decision governs it.
+fn add_upstream_drop_conflicts(
+    changeset: &mut model::ChangeSet,
+    drops: &[UpstreamDrop],
+    policy: model::ReconciliationPolicy,
+) {
+    if policy.force {
+        return;
+    }
+    for drop in drops {
+        let UpstreamDrop::Remove {
+            record,
+            change: Some(change),
+            ..
+        } = drop
+        else {
+            continue;
+        };
+        let key = &record.key;
+        changeset.changes.retain(|row| {
+            let (target, source, artifact) = target::change_key(row);
+            (target.as_str(), source.as_str(), artifact.as_str())
+                != (
+                    key.target.as_str(),
+                    key.source.as_str(),
+                    key.artifact.as_str(),
+                )
+        });
+        changeset.changes.push(model::SyncChange::RemoveConflict {
+            target: key.target.clone(),
+            source: key.source.clone(),
+            artifact: key.artifact.clone(),
+            change: change.clone(),
+            cause: RemovalCause::UpstreamDrop,
+        });
+    }
 }
 
 fn projected_artifact_count(projection: &Projection) -> usize {
@@ -1856,6 +1909,7 @@ fn apply_upstream_drops(
     config: &Config,
     protected: &confine::ProtectedPathSet,
     skipped_targets: &BTreeSet<String>,
+    decisions: &target::ConflictDecisions,
     force: bool,
     events: &mut SyncEvents,
 ) -> Result<()> {
@@ -1885,20 +1939,22 @@ fn apply_upstream_drops(
                     path,
                 });
             }
-            UpstreamDrop::Remove { link, .. } => {
+            UpstreamDrop::Remove { link, change, .. } => {
                 if record.linked && std::fs::read_link(&path).ok() != *link {
                     continue;
                 }
-                let destination = prune::removal_destination(target, record);
-                if !force && let Some(change) = prune::local_change(record, &destination, registry)?
-                {
-                    prune::keep_local_change(
+                if !force
+                    && let Some(change) = change
+                    && !prune::settle_removal_conflict(
                         record,
-                        destination,
+                        prune::removal_destination(target, record),
                         change,
                         RemovalCause::UpstreamDrop,
+                        decisions,
+                        registry,
                         events,
-                    );
+                    )?
+                {
                     continue;
                 }
                 let source = record.key.source.clone();
@@ -1946,6 +2002,7 @@ fn prune_upstream_drops_report(
         config,
         protected,
         &BTreeSet::new(),
+        &target::ConflictDecisions::new(),
         false,
         events,
     )

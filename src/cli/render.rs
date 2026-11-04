@@ -152,11 +152,8 @@ fn format_kept_local_change(
     change: &crate::sync::LocalChange,
     cause: crate::sync::RemovalCause,
 ) -> String {
-    use crate::sync::{LocalChange, RemovalCause};
-    let why = match cause {
-        RemovalCause::UpstreamDrop => "removed upstream",
-        RemovalCause::Prune => "no longer selected",
-    };
+    use crate::sync::LocalChange;
+    let why = cause.describe();
     let what = match change {
         LocalChange::Modified { .. } => "it was modified locally",
         LocalChange::Replaced => "something phora did not deploy replaced it",

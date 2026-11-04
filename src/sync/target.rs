@@ -73,6 +73,16 @@ pub(super) struct ConflictOutcome {
     warn: bool,
 }
 
+impl ConflictOutcome {
+    pub(super) fn resolution(&self) -> Resolution {
+        self.resolution
+    }
+
+    pub(super) fn warns(&self) -> bool {
+        self.warn
+    }
+}
+
 pub(super) type ConflictDecisions = BTreeMap<(String, String, String), ConflictOutcome>;
 
 pub(super) fn decisions_abort(decisions: &ConflictDecisions) -> bool {
@@ -93,6 +103,10 @@ pub(super) struct Reconciliation<'a> {
 }
 
 impl<'a> Reconciliation<'a> {
+    pub(super) fn decisions(&self) -> &ConflictDecisions {
+        &self.decisions
+    }
+
     pub(super) fn new(
         changeset: &'a ChangeSet,
         observed: &'a super::model::ObservedProjectState<ArtifactRecord>,
@@ -153,7 +167,7 @@ impl<'a> Reconciliation<'a> {
     }
 }
 
-fn change_key(change: &SyncChange) -> (String, String, String) {
+pub(super) fn change_key(change: &SyncChange) -> (String, String, String) {
     let (target, source, artifact) = match change {
         SyncChange::Deploy {
             target,
@@ -171,6 +185,12 @@ fn change_key(change: &SyncChange) -> (String, String, String) {
             artifact,
         }
         | SyncChange::Conflict {
+            target,
+            source,
+            artifact,
+            ..
+        }
+        | SyncChange::RemoveConflict {
             target,
             source,
             artifact,
@@ -285,21 +305,34 @@ pub(super) fn resolve_conflicts_reusing(
 ) -> Result<ConflictDecisions> {
     let mut decisions = ConflictDecisions::new();
     for change in &changeset.changes {
-        let SyncChange::Conflict {
-            target,
-            source,
-            artifact,
-            kind,
-        } = change
-        else {
-            continue;
+        let (target, source, artifact, kind, removal) = match change {
+            SyncChange::Conflict {
+                target,
+                source,
+                artifact,
+                kind,
+            } => (target, source, artifact, kind.clone(), None),
+            SyncChange::RemoveConflict {
+                target,
+                source,
+                artifact,
+                change,
+                cause,
+            } => (
+                target,
+                source,
+                artifact,
+                change.to_conflict_kind(),
+                Some(*cause),
+            ),
+            _ => continue,
         };
         if excluded_targets.contains(target) {
             continue;
         }
         let key = (target.clone(), source.clone(), artifact.clone());
         if let Some(outcome) = previous.get(&key)
-            && &outcome.kind == kind
+            && outcome.kind == kind
         {
             decisions.insert(key, outcome.clone());
             continue;
@@ -311,6 +344,7 @@ pub(super) fn resolve_conflicts_reusing(
                     source: source.clone(),
                     artifact: artifact.clone(),
                     kind: kind.clone(),
+                    removal,
                 }),
                 false,
             ),
@@ -320,7 +354,7 @@ pub(super) fn resolve_conflicts_reusing(
             key,
             ConflictOutcome {
                 resolution,
-                kind: kind.clone(),
+                kind,
                 warn,
             },
         );
@@ -680,7 +714,7 @@ fn apply_reconciled(
                 entry.identity, run.target_name
             ))),
         },
-        Some(SyncChange::Remove { .. }) => {
+        Some(SyncChange::Remove { .. } | SyncChange::RemoveConflict { .. }) => {
             persist_metadata_refresh(&reconciliation.observed, &triplet, registry, &key)?;
             Ok(false)
         }

@@ -315,10 +315,10 @@ direction: artifacts you stopped selecting in config, or whose target you remove
 Both removals delete only what phora can prove it deployed unchanged: a copy whose
 files still match its record, or a link that still points where phora pointed it.
 Anything else — a copy you edited, a file or directory that replaced a link, a link
-you re-pointed — stays on disk with its record and is reported on every sync as
-`phora: keeping <source>:<artifact> (<why>) at <path>: <what changed>`
-(`kept_local_change` in `--json`). `--force` deletes it; `phora eject` keeps its
-files unmanaged.
+you re-pointed — is a conflict. On a TTY, phora asks `[s]kip / [d]elete / [e]ject /
+[a]bort`: eject forgets the record and keeps the files. Otherwise it stays on disk with
+its record and is reported on every sync as `phora: keeping <source>:<artifact> (<why>)
+at <path>: <what changed>` (`kept_local_change` in `--json`); `--force` deletes it.
 
 ### Conflicts
 

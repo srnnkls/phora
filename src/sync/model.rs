@@ -39,10 +39,18 @@ pub struct ManagedArtifact<R = ()> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManagedCondition {
     Clean,
-    MetadataChangedButContentClean { refreshed: Vec<ScannedFile> },
+    MetadataChangedButContentClean {
+        refreshed: Vec<ScannedFile>,
+    },
     Outdated,
-    Modified { changed: Vec<PathBuf> },
+    Modified {
+        changed: Vec<PathBuf>,
+    },
     Linked,
+    /// A recorded link whose path now holds something phora did not deploy.
+    Replaced,
+    /// A recorded link that now points somewhere other than its recorded target.
+    Repointed,
 }
 
 /// What kind of conflict surfaced at an artifact destination.
@@ -50,6 +58,71 @@ pub enum ManagedCondition {
 pub enum ConflictKind {
     Modified { changed: Vec<PathBuf> },
     Foreign,
+}
+
+/// How a deployed artifact phora was about to remove differs from what phora deployed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalChange {
+    Modified { changed: Vec<PathBuf> },
+    Replaced,
+    Repointed,
+}
+
+impl ManagedCondition {
+    /// The local change an orphan observation recorded, if any.
+    #[must_use]
+    pub fn to_local_change(&self) -> Option<LocalChange> {
+        match self {
+            Self::Modified { changed } => Some(LocalChange::Modified {
+                changed: changed.clone(),
+            }),
+            Self::Replaced => Some(LocalChange::Replaced),
+            Self::Repointed => Some(LocalChange::Repointed),
+            Self::Clean
+            | Self::MetadataChangedButContentClean { .. }
+            | Self::Outdated
+            | Self::Linked => None,
+        }
+    }
+}
+
+impl From<LocalChange> for ManagedCondition {
+    fn from(change: LocalChange) -> Self {
+        match change {
+            LocalChange::Modified { changed } => Self::Modified { changed },
+            LocalChange::Replaced => Self::Replaced,
+            LocalChange::Repointed => Self::Repointed,
+        }
+    }
+}
+
+impl LocalChange {
+    #[must_use]
+    pub fn to_conflict_kind(&self) -> ConflictKind {
+        match self {
+            Self::Modified { changed } => ConflictKind::Modified {
+                changed: changed.clone(),
+            },
+            Self::Replaced | Self::Repointed => ConflictKind::Foreign,
+        }
+    }
+}
+
+/// Why phora was removing an artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemovalCause {
+    UpstreamDrop,
+    Prune,
+}
+
+impl RemovalCause {
+    #[must_use]
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::UpstreamDrop => "removed upstream",
+            Self::Prune => "no longer selected",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +147,14 @@ pub enum SyncChange {
         source: String,
         artifact: String,
         kind: ConflictKind,
+    },
+    /// A removal of an artifact that changed locally; it waits on a conflict decision.
+    RemoveConflict {
+        target: String,
+        source: String,
+        artifact: String,
+        change: LocalChange,
+        cause: RemovalCause,
     },
     Remove {
         target: String,
