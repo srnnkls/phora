@@ -179,12 +179,8 @@ struct SyncRunInput<'a> {
 }
 
 impl SyncRunInput<'_> {
-    fn refresh_sources(&self) -> bool {
-        matches!(self.options.source_policy, SourcePolicy::Refresh)
-    }
-
-    fn frozen(&self) -> bool {
-        matches!(self.options.source_policy, SourcePolicy::Frozen)
+    fn source_policy(&self) -> SourcePolicy {
+        self.options.source_policy
     }
 
     fn jobs(&self) -> Option<usize> {
@@ -305,7 +301,7 @@ impl TestSyncInvocation for SyncInput<'_> {
         let source_policy = if self.frozen {
             SourcePolicy::Frozen
         } else {
-            SourcePolicy::Locked
+            SourcePolicy::Reuse
         };
         let conflict_policy = if self.force {
             ConflictPolicy::Overwrite
@@ -1122,12 +1118,8 @@ where
         &effective_config,
         &parsed,
         backend,
-        input.frozen(),
-        if input.refresh_sources() {
-            None
-        } else {
-            effective_lock.as_ref()
-        },
+        input.source_policy(),
+        effective_lock.as_ref(),
     )?;
     let hook_candidates = take_hook_candidates(&mut graph, &mut events);
     let import_refs = graph.import_refs.clone();
@@ -1234,8 +1226,7 @@ fn sync_workspace<R: StateStore>(
         &import_refs,
         effective_lock.as_ref(),
         backend,
-        input.refresh_sources(),
-        input.frozen(),
+        input.source_policy(),
         input.jobs(),
         input.sink(),
     )?;
@@ -1950,7 +1941,8 @@ pub(crate) fn inject_composed_graph(
     backend: &dyn SourceStore,
     lock: Option<&Lock>,
 ) -> Vec<transitive::ComposedTarget> {
-    let Ok(graph) = transitive::resolve_transitive_graph(config, parsed, backend, true, lock)
+    let Ok(graph) =
+        transitive::resolve_transitive_graph(config, parsed, backend, SourcePolicy::Frozen, lock)
     else {
         return Vec::new();
     };

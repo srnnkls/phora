@@ -13,7 +13,7 @@ use crate::source::{
 };
 
 use super::progress::{FetchId, FetchOutcome, ProgressSink};
-use super::{effective_protocol, remote_for};
+use super::{SourcePolicy, effective_protocol, remote_for};
 
 type SourceResult<T> = std::result::Result<T, SourceError>;
 
@@ -172,15 +172,15 @@ fn revision_spec(refspec: &Refspec) -> Result<RevisionSpec> {
 }
 
 /// The lock entry that lets a unit skip fetch+resolve, or `None` when a fetch is
-/// required (no matching entry, or `refresh`).
+/// required (no matching entry, or a refreshing policy).
 fn lock_hit<'l>(
     config: &Config,
     source: &ParsedSource,
     unit: &Unit,
     effective_lock: Option<&'l Lock>,
-    refresh: bool,
+    policy: SourcePolicy,
 ) -> Option<&'l LockedSource> {
-    if refresh {
+    if policy.refreshes() {
         return None;
     }
     let discriminator = ref_discriminator(&unit.effective_ref, &source.refspec());
@@ -190,20 +190,9 @@ fn lock_hit<'l>(
         .filter(|l| entry_matches(source, &unit.effective_ref, l, &config.hosts, protocol))
 }
 
-fn frozen_miss(name: &str, transitive: bool) -> crate::error::Error {
-    let kind = if transitive {
-        "transitive source"
-    } else {
-        "source"
-    };
-    crate::error::Error::Lock(format!(
-        "{kind} `{name}` is not pinned in the lock; --frozen refuses to fetch or re-resolve"
-    ))
-}
-
 #[expect(
     clippy::too_many_arguments,
-    reason = "resolving one unit threads config/parsed/remotes/lock/backend plus the refresh and frozen run flags"
+    reason = "resolving one unit threads config/parsed/remotes/lock/backend plus the source policy"
 )]
 #[cfg_attr(feature = "trace", tracing::instrument(skip_all, fields(unit = %unit.name)))]
 fn resolve_unit(
@@ -213,8 +202,7 @@ fn resolve_unit(
     instances: &BTreeMap<String, String>,
     effective_lock: Option<&Lock>,
     store: &dyn SourceStore,
-    refresh: bool,
-    frozen: bool,
+    policy: SourcePolicy,
     unit: &Unit,
     mirror_refreshed: &mut bool,
 ) -> Result<Option<Resolved>> {
@@ -223,9 +211,14 @@ fn resolve_unit(
     };
     let git = remote_for(remotes, &unit.name)?;
 
-    let lock_entry = lock_hit(config, source, unit, effective_lock, refresh);
-    if lock_entry.is_none() && frozen && source.deploy_mode() != DeployMode::Link {
-        return Err(frozen_miss(&unit.name, instances.contains_key(&unit.name)));
+    let lock_entry = lock_hit(config, source, unit, effective_lock, policy);
+    if lock_entry.is_none() && policy.requires_pins() && source.deploy_mode() != DeployMode::Link {
+        let kind = if instances.contains_key(&unit.name) {
+            "transitive source"
+        } else {
+            "source"
+        };
+        return Err(policy.unpinned(&format!("{kind} `{}`", unit.name)));
     }
 
     let request = resolve_request(source, unit, git, lock_entry)?;
@@ -237,7 +230,7 @@ fn resolve_unit(
             &request,
             source,
             lock_entry,
-            frozen,
+            policy,
             mirror_refreshed,
         )?
     };
@@ -359,7 +352,7 @@ fn resolve_source(
     request: &ResolveRequest,
     source: &ParsedSource,
     lock_entry: Option<&LockedSource>,
-    frozen: bool,
+    policy: SourcePolicy,
     mirror_refreshed: &mut bool,
 ) -> Result<ResolvedSource> {
     if source.deploy_mode() == DeployMode::Link {
@@ -370,7 +363,7 @@ fn resolve_source(
     let resolved = if lock_entry.is_some() {
         match store.resolve(request, ResolvePolicy::CachedOnly) {
             Ok(resolved) => return Ok(resolved),
-            Err(error) if frozen => return Err(error.into()),
+            Err(error) if policy.offline() => return Err(error.into()),
             Err(_) => store.resolve(request, ResolvePolicy::Refresh)?,
         }
     } else if source.mode() == SourceMode::Url || !*mirror_refreshed {
@@ -533,7 +526,7 @@ fn fetch_outcome<T>(resolved: &Result<T>, mirror_refreshed: bool) -> FetchOutcom
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "resolution threads config/parsed/remotes/lock/backend plus the refresh, frozen, and jobs run flags"
+    reason = "resolution threads config/parsed/remotes/lock/backend plus the source policy and jobs"
 )]
 #[cfg_attr(feature = "trace", tracing::instrument(skip_all))]
 pub(super) fn resolve_sources(
@@ -544,8 +537,7 @@ pub(super) fn resolve_sources(
     imports: &[ImportResolution],
     effective_lock: Option<&Lock>,
     store: &dyn SourceStore,
-    refresh: bool,
-    frozen: bool,
+    policy: SourcePolicy,
     jobs: Option<usize>,
     sink: &dyn ProgressSink,
 ) -> Result<RoutedSources> {
@@ -585,8 +577,7 @@ pub(super) fn resolve_sources(
                             instances,
                             effective_lock,
                             store,
-                            refresh,
-                            frozen,
+                            policy,
                             unit,
                             &mut mirror_refreshed,
                         )
@@ -626,7 +617,7 @@ pub fn resolve_sources_for_bench(
     remotes: &BTreeMap<String, String>,
     effective_lock: Option<&Lock>,
     store: &dyn SourceStore,
-    refresh: bool,
+    policy: SourcePolicy,
     jobs: Option<usize>,
 ) -> Result<RoutedSources> {
     resolve_sources(
@@ -637,8 +628,7 @@ pub fn resolve_sources_for_bench(
         &[],
         effective_lock,
         store,
-        refresh,
-        false,
+        policy,
         jobs,
         super::progress::SILENT,
     )

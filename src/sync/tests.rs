@@ -742,8 +742,7 @@ fn link_source_resolves_without_mirror_into_audit_lock_entry() {
         &[],
         None,
         &counting,
-        false,
-        false,
+        SourcePolicy::Reuse,
         None,
         crate::sync::progress::SILENT,
     )
@@ -792,8 +791,7 @@ fn link_source_skips_fetch_and_mirror_digest() {
         &[],
         None,
         &counting,
-        false,
-        false,
+        SourcePolicy::Reuse,
         None,
         crate::sync::progress::SILENT,
     )
@@ -1046,8 +1044,7 @@ fn frozen_errors_naming_source_when_no_lock_entry() {
         &[],
         None,
         &backend,
-        false,
-        true,
+        SourcePolicy::Frozen,
         None,
         crate::sync::progress::SILENT,
     )
@@ -1095,8 +1092,7 @@ fn frozen_reuses_matching_lock_without_touching_network() {
         &[],
         Some(&prior),
         &backend,
-        false,
-        true,
+        SourcePolicy::Frozen,
         None,
         crate::sync::progress::SILENT,
     )
@@ -1146,8 +1142,7 @@ fn frozen_errors_on_drifted_lock_entry() {
         &[],
         Some(&drifted),
         &backend,
-        false,
-        true,
+        SourcePolicy::Frozen,
         None,
         crate::sync::progress::SILENT,
     )
@@ -1193,8 +1188,7 @@ fn non_frozen_reresolves_drifted_lock_entry() {
         &[],
         Some(&drifted),
         &counting,
-        false,
-        false,
+        SourcePolicy::Reuse,
         None,
         crate::sync::progress::SILENT,
     )
@@ -13922,8 +13916,7 @@ fn url_sources_sharing_one_url_each_fetch_so_per_source_digest_is_validated() {
         &[],
         None,
         &recording,
-        false,
-        false,
+        SourcePolicy::Reuse,
         Some(4),
         crate::sync::progress::SILENT,
     )

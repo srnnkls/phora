@@ -800,7 +800,7 @@ mod t029_source_delegation_probe {
         T029_VALIDATE_OVERRIDE.store(false, Ordering::SeqCst);
 
         let (config, parsed) = consumer("git = \"https://example.test/dep.git\"");
-        let graph = resolve_transitive_graph(&config, &parsed, &store, false, None)
+        let graph = resolve_transitive_graph(&config, &parsed, &store, crate::sync::SourcePolicy::Reuse, None)
             .expect("sync must consume the manifest supplied by the source boundary");
         let composed: Vec<crate::config::transitive::Member> = graph
             .targets
@@ -839,7 +839,7 @@ mod t029_source_delegation_probe {
         T029_VALIDATE_ARGS.lock().expect("validate args").clear();
         T029_VALIDATE_OVERRIDE.store(true, Ordering::SeqCst);
         let (config, parsed) = consumer("path = \"/etc\"");
-        let graph = resolve_transitive_graph(&config, &parsed, &store, false, None)
+        let graph = resolve_transitive_graph(&config, &parsed, &store, crate::sync::SourcePolicy::Reuse, None)
             .expect("the source boundary override must be authoritative; duplicate sync confinement would reject");
         assert!(graph.targets[1].target.path.ends_with("boundary"));
         assert_eq!(T029_ACQUIRE_CALLS.load(Ordering::SeqCst), 1);

@@ -248,7 +248,7 @@ fn a_changed_key_rebuilds_but_frozen_refuses() {
     write(&fixture.project.join("key"), "2\n");
     let stderr = fixture.fails(&["sync", "--frozen"]);
     assert!(
-        stderr.contains("--frozen refuses to run a build"),
+        stderr.contains("--frozen requires every source to be pinned"),
         "{stderr}"
     );
     assert_eq!(fixture.builds(), 1);

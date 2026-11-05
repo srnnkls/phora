@@ -52,19 +52,19 @@ fn mapped(options: &SyncOptions) -> ReconciliationPolicy {
 
 fn assert_policy_mapping_table() {
     let cases = [
-        ("source locked", options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, None), (false, false)),
+        ("source locked", options(SourcePolicy::Reuse, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, None), (false, false)),
         ("source refresh", options(SourcePolicy::Refresh, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, None), (false, false)),
         ("source frozen", options(SourcePolicy::Frozen, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, None), (false, false)),
-        ("conflict refuse", options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, None), (false, false)),
-        ("conflict interactive", options(SourcePolicy::Locked, ConflictPolicy::ResolveInteractively, PrunePolicy::KeepOrphans, HookPolicy::All, None), (false, false)),
-        ("conflict overwrite", options(SourcePolicy::Locked, ConflictPolicy::Overwrite, PrunePolicy::KeepOrphans, HookPolicy::All, None), (true, false)),
-        ("prune keep", options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, None), (false, false)),
-        ("prune remove", options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::RemoveOrphans, HookPolicy::All, None), (false, true)),
-        ("hooks all", options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, None), (false, false)),
-        ("hooks no transitive", options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::NoTransitive, None), (false, false)),
-        ("hooks none", options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::None, None), (false, false)),
-        ("concurrency derived", options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, None), (false, false)),
-        ("concurrency fixed", options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, NonZeroUsize::new(3)), (false, false)),
+        ("conflict refuse", options(SourcePolicy::Reuse, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, None), (false, false)),
+        ("conflict interactive", options(SourcePolicy::Reuse, ConflictPolicy::ResolveInteractively, PrunePolicy::KeepOrphans, HookPolicy::All, None), (false, false)),
+        ("conflict overwrite", options(SourcePolicy::Reuse, ConflictPolicy::Overwrite, PrunePolicy::KeepOrphans, HookPolicy::All, None), (true, false)),
+        ("prune keep", options(SourcePolicy::Reuse, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, None), (false, false)),
+        ("prune remove", options(SourcePolicy::Reuse, ConflictPolicy::Refuse, PrunePolicy::RemoveOrphans, HookPolicy::All, None), (false, true)),
+        ("hooks all", options(SourcePolicy::Reuse, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, None), (false, false)),
+        ("hooks no transitive", options(SourcePolicy::Reuse, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::NoTransitive, None), (false, false)),
+        ("hooks none", options(SourcePolicy::Reuse, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::None, None), (false, false)),
+        ("concurrency derived", options(SourcePolicy::Reuse, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, None), (false, false)),
+        ("concurrency fixed", options(SourcePolicy::Reuse, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, NonZeroUsize::new(3)), (false, false)),
     ];
     for (name, options, expected) in cases {
         let actual = mapped(&options);
@@ -96,7 +96,7 @@ fn assert_exact_public_shapes<'a>(request: SyncRequest<'a>, report: SyncReport) 
         prune_policy,
         hook_policy,
         concurrency,
-    } = options(SourcePolicy::Locked, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, None);
+    } = options(SourcePolicy::Reuse, ConflictPolicy::Refuse, PrunePolicy::KeepOrphans, HookPolicy::All, None);
     let _: SourcePolicy = source_policy;
     let _: ConflictPolicy = conflict_policy;
     let _: PrunePolicy = prune_policy;
