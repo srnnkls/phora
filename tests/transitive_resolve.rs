@@ -293,7 +293,7 @@ fn frozen_refuses_to_fetch_an_unpinned_transitive_manifest() {
         "--frozen with no lock must refuse to fetch the transitive manifest, got success; stderr: {stderr}"
     );
     assert!(
-        stderr.contains("dep") && stderr.contains("--frozen refuses to fetch its manifest"),
+        stderr.contains("dep") && stderr.contains("--frozen requires every source to be pinned"),
         "the frozen diagnostic must name the unpinned transitive source (`dep`) and attribute the \
          refusal to --frozen, got: {stderr}"
     );
@@ -625,7 +625,7 @@ fn unfrozen_sync_locks_nested_instance_and_unmodified_frozen_roundtrips() {
          stderr: {frozen_stderr}"
     );
     assert!(
-        !frozen_stderr.contains("not pinned") && !frozen_stderr.contains("refuses to fetch"),
+        !frozen_stderr.contains("not pinned"),
         "the unmodified frozen round-trip must not emit any frozen-miss diagnostic; got: {frozen_stderr}"
     );
     assert_eq!(
@@ -715,7 +715,7 @@ fn frozen_reads_transitive_manifest_offline_without_fetching() {
          stderr: {frozen_stderr}"
     );
     assert!(
-        !frozen_stderr.contains("refuses to fetch") && !frozen_stderr.contains("not pinned"),
+        !frozen_stderr.contains("not pinned"),
         "a fully-pinned frozen run must emit no frozen-miss diagnostic; got: {frozen_stderr}"
     );
 }

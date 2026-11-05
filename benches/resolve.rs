@@ -16,7 +16,7 @@ use phora::source::{
     ResolvedSource, SnapshotId, SourceDirectoryEntry, SourceEntry, SourceError, SourceIdentity,
     SourceInventory, SourceLocation, SourcePath, SourceStore, SourceTimestamp,
 };
-use phora::sync::resolve_sources_for_bench;
+use phora::sync::{SourcePolicy, resolve_sources_for_bench};
 
 type R<T> = std::result::Result<T, SourceError>;
 
@@ -99,8 +99,16 @@ fn bench_resolve(c: &mut Criterion) {
     for (label, jobs) in [("serial", Some(1usize)), ("parallel", None)] {
         group.bench_with_input(BenchmarkId::from_parameter(label), &jobs, |b, &jobs| {
             b.iter(|| {
-                resolve_sources_for_bench(&config, &parsed, &remotes, None, &backend, false, jobs)
-                    .expect("resolve succeeds")
+                resolve_sources_for_bench(
+                    &config,
+                    &parsed,
+                    &remotes,
+                    None,
+                    &backend,
+                    SourcePolicy::Reuse,
+                    jobs,
+                )
+                .expect("resolve succeeds")
             });
         });
     }

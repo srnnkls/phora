@@ -192,7 +192,8 @@ phora add me/dotfiles --to neovim --as nvim --root nvim
 phora sync
 phora sync --prune          # also remove artifacts you no longer select
 phora sync --force          # overwrite locally-modified files without prompting
-phora sync --frozen         # refuse to fetch or re-resolve — every source must be pinned in the lock
+phora sync --locked         # refuse a source the lock does not pin; fetch locked pins as needed
+phora sync --frozen         # like --locked, and fetch nothing — every pin must already be cached
 phora sync --no-transitive-hooks  # deploy composed deps, but run none of their hooks
 
 # Transitive (composed-dependency) hooks — inspect and approve before they run
@@ -298,7 +299,8 @@ The lock follows Cargo's contract: `sync` never moves an existing pin, and
 | ------- | ---- |
 | `phora sync` | keeps every locked commit; resolves only what the lock does not pin |
 | `phora update [source]` | re-resolves each ref (or one source's) to its current tip |
-| `phora sync --frozen` | refuses to fetch or resolve; every source must be locked |
+| `phora sync --locked` | like `sync`, but a source the lock does not pin is an error |
+| `phora sync --frozen` | like `--locked`, and fetches nothing; every pin must already be cached |
 
 A pin belongs to a source's remote and ref. Editing the remote, URL, `branch`, `tag`,
 or `rev` resolves that source fresh on the next sync, as does a binding that names a
@@ -1367,11 +1369,12 @@ and `phora trust tropos --revoke` drops every approval for a dep.
 
 ### Reproducibility
 
-`phora sync --frozen` refuses to fetch or re-resolve anything: every source — root,
-bound dep, and nested dep alike — must already be pinned in the lock. A miss
-hard-errors, naming the source (and, for a nested dep, its depth) so a drifted or
-dropped pin can't pass silently. It is the offline, "the lock is the law" mode for
-CI and reproducible checkouts. A `phora.local.toml` overlay can flip a source to
+`phora sync --locked` requires every source — root, bound dep, and nested dep
+alike — to be pinned in the lock. A miss hard-errors, naming the source (and, for a
+nested dep, its depth) so a drifted or dropped pin can't pass silently; locked pins
+missing from the cache are still fetched, so it works on a fresh checkout. It is the
+"the lock is the law" mode for CI. `phora sync --frozen` adds offline: it fetches
+nothing, so every pin must already be in the cache. A `phora.local.toml` overlay can flip a source to
 `transitive = true` for a single machine, exactly like any other per-machine
 override.
 
