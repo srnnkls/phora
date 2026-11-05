@@ -58,7 +58,7 @@ use crate::source::SourceName;
 use crate::source::{GitBackend, HttpBackend, RouterBackend};
 use crate::sync::state::ProjectId;
 use crate::sync::state::{FileStateStore, StateError, StateLock, StateStore};
-use crate::sync::{Conflict, ConflictKind, ConflictResolver, Resolution};
+use crate::sync::{Conflict, ConflictKind, ConflictResolver, Resolution, SourcePolicy};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -132,6 +132,10 @@ pub enum Command {
         no_hooks: bool,
         #[arg(long)]
         no_transitive_hooks: bool,
+        /// Refuse a source the lock does not pin; locked pins are still fetched when missing.
+        #[arg(long, conflicts_with = "frozen")]
+        locked: bool,
+        /// Like `--locked`, and fetch nothing: every pin must already be cached.
         #[arg(long)]
         frozen: bool,
         /// Never draw live progress, even on a terminal.
@@ -488,6 +492,7 @@ fn dispatch_sync(cmd: Command, lock_timeout: Duration) -> Result<CliOutcome> {
             force,
             no_hooks,
             no_transitive_hooks,
+            locked,
             frozen,
             no_progress,
             json,
@@ -497,7 +502,11 @@ fn dispatch_sync(cmd: Command, lock_timeout: Duration) -> Result<CliOutcome> {
             force,
             no_hooks,
             no_transitive_hooks,
-            frozen,
+            match (locked, frozen) {
+                (_, true) => SourcePolicy::Frozen,
+                (true, false) => SourcePolicy::Locked,
+                (false, false) => SourcePolicy::Reuse,
+            },
             no_progress,
             json,
             None,

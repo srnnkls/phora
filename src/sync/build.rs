@@ -79,7 +79,7 @@ impl Builds {
 
 /// # Errors
 ///
-/// Returns an error when inputs cannot be materialized, `--frozen` meets an unbuilt
+/// Returns an error when inputs cannot be materialized, a pin-requiring policy meets an unbuilt
 /// source, or a build fails with no previous output to fall back to.
 pub(super) fn run(
     input: &SyncRunInput<'_>,
@@ -122,24 +122,22 @@ pub(super) fn run(
         }
         let previous = previous_output(input, backend, name);
         let (program, key) = program_and_key(input, config, spec, &inputs, cwd, previous.as_ref())?;
+        let unbuilt = || {
+            input
+                .source_policy()
+                .unpinned(&format!("build source `{name}`'s output for its inputs"))
+        };
 
         let (resolved, key) = match previous {
             Some((locked, resolved)) if locked.build.as_deref() == Some(key.as_str()) => {
                 (resolved, key)
             }
             _ if built_by_key.contains_key(&key) => (built_by_key[&key].clone(), key),
-            _ if input.frozen() => {
-                return Err(Error::Lock(format!(
-                    "build source `{name}` has no locked output for its inputs; \
-                     --frozen refuses to run a build"
-                )));
-            }
+            _ if input.source_policy().requires_pins() => return Err(unbuilt()),
             previous => {
                 let output = scratch.path.join("output");
                 let Some(program) = &program else {
-                    return Err(Error::Lock(format!(
-                        "build source `{name}` has no locked output; --frozen refuses to run a build"
-                    )));
+                    return Err(unbuilt());
                 };
                 match execute(name, program, &inputs, &output, cwd, backend) {
                     Ok(resolved) => (resolved, key),
@@ -196,7 +194,7 @@ fn previous_output(
     Some((locked, resolved))
 }
 
-/// A frozen tool build replays its locked key without resolving the tool.
+/// An offline tool build replays its locked key without resolving the tool.
 fn program_and_key<'a>(
     input: &SyncRunInput<'_>,
     config: &Config,
@@ -205,7 +203,7 @@ fn program_and_key<'a>(
     cwd: Option<&Path>,
     previous: Option<&(LockedSource, ResolvedSource)>,
 ) -> Result<(Option<Program<'a>>, String)> {
-    if input.frozen() && matches!(spec.tool, BuildTool::Tool { .. }) {
+    if input.source_policy().offline() && matches!(spec.tool, BuildTool::Tool { .. }) {
         let key = previous
             .and_then(|(locked, _)| locked.build.clone())
             .unwrap_or_default();
@@ -262,12 +260,8 @@ fn materialize(
         &config,
         &parsed,
         backend,
-        input.frozen(),
-        if input.refresh_sources() {
-            None
-        } else {
-            lock.as_ref()
-        },
+        input.source_policy(),
+        lock.as_ref(),
     )?;
     let import_refs = std::mem::take(&mut graph.import_refs);
     let instances = graph.inject(&mut config, &mut parsed, &mut remotes);

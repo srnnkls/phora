@@ -65,9 +65,46 @@ pub struct SyncOptions {
 /// How source snapshots are selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourcePolicy {
-    Locked,
+    /// Deploy each locked pin; resolve only what the lock does not pin yet.
+    Reuse,
+    /// Resolve every source to its ref's current tip.
     Refresh,
+    /// Like `Reuse`, but a source the lock does not pin is an error.
+    Locked,
+    /// Like `Locked`, and nothing is fetched: every pin must already be cached.
     Frozen,
+}
+
+impl SourcePolicy {
+    #[must_use]
+    pub fn refreshes(self) -> bool {
+        matches!(self, Self::Refresh)
+    }
+
+    #[must_use]
+    pub fn requires_pins(self) -> bool {
+        matches!(self, Self::Locked | Self::Frozen)
+    }
+
+    #[must_use]
+    pub fn offline(self) -> bool {
+        matches!(self, Self::Frozen)
+    }
+
+    /// The error for `subject` missing from the lock under a pin-requiring policy.
+    pub(crate) fn unpinned(self, subject: &str) -> crate::error::Error {
+        debug_assert!(
+            self.requires_pins(),
+            "only a pin-requiring policy reports a missing pin"
+        );
+        let flag = match self {
+            Self::Frozen => "--frozen",
+            Self::Locked | Self::Reuse | Self::Refresh => "--locked",
+        };
+        crate::error::Error::Lock(format!(
+            "{subject} is not pinned in the lock; {flag} requires every source to be pinned"
+        ))
+    }
 }
 
 /// How desired changes that collide with local content are handled.

@@ -40,7 +40,7 @@ pub(super) fn run_sync(
     force: bool,
     no_hooks: bool,
     no_transitive_hooks: bool,
-    frozen: bool,
+    source_policy: SourcePolicy,
     no_progress: bool,
     json: bool,
     drop: Option<DropSources>,
@@ -69,7 +69,7 @@ pub(super) fn run_sync(
     // Only a read-only root under --frozen falls back lockless; contention (exit 75) still propagates.
     let guard = match registry.acquire_lock() {
         Ok(guard) => Some(guard),
-        Err(StateError::ReadOnly(_)) if frozen => None,
+        Err(StateError::ReadOnly(_)) if source_policy == SourcePolicy::Frozen => None,
         Err(e) => return Err(e.into()),
     };
     let lockless = guard.is_none();
@@ -82,11 +82,6 @@ pub(super) fn run_sync(
     let trust_prompt = super::TtyTrustPrompt;
     let reporter = Reporter::select(json, no_progress);
 
-    let source_policy = if frozen {
-        SourcePolicy::Frozen
-    } else {
-        SourcePolicy::Locked
-    };
     let conflict_policy = if force {
         ConflictPolicy::Overwrite
     } else if interactive {
@@ -417,7 +412,7 @@ pub(super) fn run_update(
         false,
         false,
         false,
-        false,
+        SourcePolicy::Reuse,
         false,
         false,
         Some(drop),

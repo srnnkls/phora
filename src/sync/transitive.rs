@@ -18,6 +18,7 @@ use crate::source::{
     Commit, ResolvePolicy, ResolveRequest, RevisionSpec, SourceLocation, SourceName, SourceStore,
 };
 
+use super::SourcePolicy;
 use super::resolve::ImportResolution;
 use super::resolved_remotes;
 
@@ -225,9 +226,10 @@ pub(super) fn resolve_transitive_graph(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
     backend: &dyn SourceStore,
-    frozen: bool,
+    policy: SourcePolicy,
     effective_lock: Option<&crate::lock::Lock>,
 ) -> Result<ResolvedGraph> {
+    let effective_lock = effective_lock.filter(|_| !policy.refreshes());
     debug_assert!(
         config.targets.values().all(|target| target
             .declared_sources()
@@ -242,8 +244,8 @@ pub(super) fn resolve_transitive_graph(
         return Ok(ResolvedGraph::default());
     }
     let remotes = resolved_remotes(config, parsed)?;
-    let frozen_gate = FrozenGate {
-        frozen,
+    let pins = PinGate {
+        policy,
         lock: effective_lock,
     };
     let mut visited: HashSet<FetchNode> = HashSet::new();
@@ -258,7 +260,7 @@ pub(super) fn resolve_transitive_graph(
                     parsed,
                     remotes: &remotes,
                     backend,
-                    frozen,
+                    policy,
                     effective_lock,
                 },
                 import,
@@ -281,7 +283,7 @@ pub(super) fn resolve_transitive_graph(
                     visited: &mut visited,
                     ancestors: Vec::new(),
                     graph: &mut graph,
-                    frozen: &frozen_gate,
+                    pins: &pins,
                     consumer_hosts: &config.hosts,
                     consumer_tools: &config.tools,
                     default_protocol: config.protocol,
@@ -303,7 +305,7 @@ struct RootImport<'a> {
     parsed: &'a BTreeMap<String, ParsedSource>,
     remotes: &'a BTreeMap<String, String>,
     backend: &'a dyn SourceStore,
-    frozen: bool,
+    policy: SourcePolicy,
     effective_lock: Option<&'a crate::lock::Lock>,
 }
 
@@ -336,7 +338,7 @@ fn acquire_root_import<'a>(
     } else {
         let pin = locked_import_commit(root.config, imported, base, &source, root.effective_lock);
         let (commit, manifest) =
-            acquire_import_manifest(imported, &source, remote, root.backend, root.frozen, pin)?;
+            acquire_import_manifest(imported, &source, remote, root.backend, root.policy, pin)?;
         (PackageSnapshot::Mirror(remote), commit, manifest)
     };
     graph.import_refs.push(ImportResolution {
@@ -400,11 +402,11 @@ fn acquire_import_manifest(
     source: &ParsedSource,
     remote: &str,
     backend: &dyn SourceStore,
-    frozen: bool,
+    policy: SourcePolicy,
     pin: Option<&str>,
 ) -> Result<(String, TransitiveManifest)> {
-    if frozen && pin.is_none() {
-        return Err(frozen_transitive_miss(imported, 1));
+    if policy.requires_pins() && pin.is_none() {
+        return Err(unpinned_transitive(policy, imported, 1));
     }
     crate::source::transitive::acquire_dependency_manifest(
         backend,
@@ -412,11 +414,7 @@ fn acquire_import_manifest(
         source,
         remote,
         pin,
-        if frozen {
-            ResolvePolicy::CachedOnly
-        } else {
-            ResolvePolicy::Refresh
-        },
+        manifest_resolve_policy(policy),
     )
     .map_err(|source| Error::TransitiveSource {
         name: imported.to_owned(),
@@ -425,14 +423,14 @@ fn acquire_import_manifest(
     })
 }
 
-/// [`resolve_transitive_graph`] under the frozen gate: lock-pinned commits, mirror-only reads, no fetch.
+/// [`resolve_transitive_graph`] under [`SourcePolicy::Frozen`]: lock-pinned commits, mirror-only reads, no fetch.
 pub(crate) fn resolve_transitive_graph_offline(
     config: &Config,
     parsed: &BTreeMap<String, ParsedSource>,
     backend: &dyn SourceStore,
     lock: &crate::lock::Lock,
 ) -> Result<ResolvedGraph> {
-    resolve_transitive_graph(config, parsed, backend, true, Some(lock))
+    resolve_transitive_graph(config, parsed, backend, SourcePolicy::Frozen, Some(lock))
 }
 
 struct WalkCtx<'a> {
@@ -441,7 +439,7 @@ struct WalkCtx<'a> {
     visited: &'a mut HashSet<FetchNode>,
     ancestors: Vec<FetchNode>,
     graph: &'a mut ResolvedGraph,
-    frozen: &'a FrozenGate<'a>,
+    pins: &'a PinGate<'a>,
     consumer_hosts: &'a BTreeMap<String, Host>,
     consumer_tools: &'a BTreeMap<String, ToolGrant>,
     default_protocol: Option<Protocol>,
@@ -453,10 +451,19 @@ struct WalkCtx<'a> {
     root_offer: &'a str,
 }
 
-/// Checked at the top of every `fetch_manifest` so no depth can fetch an unpinned/drifted node under `--frozen`.
-struct FrozenGate<'a> {
-    frozen: bool,
+/// Checked at the top of every `fetch_manifest` so no depth reads an unpinned or drifted node
+/// under a pin-requiring policy.
+struct PinGate<'a> {
+    policy: SourcePolicy,
     lock: Option<&'a crate::lock::Lock>,
+}
+
+fn manifest_resolve_policy(policy: SourcePolicy) -> ResolvePolicy {
+    if policy.offline() {
+        ResolvePolicy::CachedOnly
+    } else {
+        ResolvePolicy::Refresh
+    }
 }
 
 /// One offer of a manifest as composition works over it.
@@ -706,7 +713,7 @@ fn namespace_own_files(
     Ok(namespaced)
 }
 
-/// A source already composed by a nested import is graphed (so the frozen gate can pin it) but
+/// A source already composed by a nested import is graphed (so the pin gate can pin it) but
 /// omitted from the returned bind map: it only re-exports its children, binding no target itself.
 fn namespace_dep_sources(
     instance: &Instance,
@@ -761,7 +768,7 @@ fn namespace_dep_sources(
             depth + 1,
         )?;
         let composed_by_nested_import = nested.iter().any(|i| i.source() == inner_name);
-        if inner.is_transitive() && !composed_by_nested_import && !ctx.frozen.frozen {
+        if inner.is_transitive() && !composed_by_nested_import && !ctx.pins.policy.requires_pins() {
             descend_for_validation(inner_name, &parsed, &remote, ctx, depth + 1)?;
         }
         let namespaced = instance.key(&Member::Named(inner_name.clone()));
@@ -827,7 +834,7 @@ fn compose_nested_offers(
             &inner_remote,
             ctx.backend,
             depth + 1,
-            ctx.frozen,
+            ctx.pins,
         )?;
         let inner_layout = OfferLayout::new(&inner_manifest, import.offer())
             .map_err(|e| at_depth(inner_name, depth + 1, &e.to_string()))?;
@@ -870,7 +877,7 @@ fn descend_for_validation(
     depth: usize,
 ) -> Result<()> {
     reject_depth_overflow(name, depth)?;
-    let (commit, manifest) = fetch_manifest(name, parsed, remote, ctx.backend, depth, ctx.frozen)?;
+    let (commit, manifest) = fetch_manifest(name, parsed, remote, ctx.backend, depth, ctx.pins)?;
     let node = FetchNode::new(remote, &parsed.refspec().to_string(), &commit);
     if !ctx.visited.insert(node) {
         return Ok(());
@@ -899,7 +906,7 @@ fn descend_for_validation(
     Ok(())
 }
 
-impl FrozenGate<'_> {
+impl PinGate<'_> {
     fn require_pinned<'l>(
         &'l self,
         name: &str,
@@ -907,7 +914,7 @@ impl FrozenGate<'_> {
         refspec: &Refspec,
         depth: usize,
     ) -> Result<Option<&'l str>> {
-        if !self.frozen {
+        if !self.policy.requires_pins() {
             return Ok(None);
         }
         let remote_id = crate::source::NormalizedUrl::parse(remote);
@@ -927,16 +934,13 @@ impl FrozenGate<'_> {
         });
         match entry {
             Some(locked) => Ok(Some(locked.commit.as_str())),
-            None => Err(frozen_transitive_miss(name, depth)),
+            None => Err(unpinned_transitive(self.policy, name, depth)),
         }
     }
 }
 
-fn frozen_transitive_miss(name: &str, depth: usize) -> Error {
-    Error::Lock(format!(
-        "transitive source `{name}` at depth {depth} is not pinned in the lock; \
-         --frozen refuses to fetch its manifest"
-    ))
+fn unpinned_transitive(policy: SourcePolicy, name: &str, depth: usize) -> Error {
+    policy.unpinned(&format!("transitive source `{name}` at depth {depth}"))
 }
 
 fn import_instance(
@@ -1117,10 +1121,10 @@ fn fetch_manifest(
     remote: &str,
     backend: &dyn SourceStore,
     depth: usize,
-    frozen: &FrozenGate<'_>,
+    pins: &PinGate<'_>,
 ) -> Result<(String, TransitiveManifest)> {
     let refspec = source.refspec();
-    let pinned = frozen.require_pinned(name, remote, &refspec, depth)?;
+    let pinned = pins.require_pinned(name, remote, &refspec, depth)?;
     let source_name = SourceName::trusted(name.to_owned());
     crate::source::transitive::acquire_dependency_manifest(
         backend,
@@ -1128,11 +1132,7 @@ fn fetch_manifest(
         source,
         remote,
         pinned,
-        if frozen.frozen {
-            ResolvePolicy::CachedOnly
-        } else {
-            ResolvePolicy::Refresh
-        },
+        manifest_resolve_policy(pins.policy),
     )
     .map_err(|source| Error::TransitiveSource {
         name: name.to_owned(),
@@ -1409,8 +1409,8 @@ mod tests {
 
     #[test]
     fn require_pinned_is_inactive_without_frozen() {
-        let gate = FrozenGate {
-            frozen: false,
+        let gate = PinGate {
+            policy: SourcePolicy::Reuse,
             lock: None,
         };
         let pinned = gate
@@ -1435,8 +1435,8 @@ mod tests {
             "c0",
             None,
         )]);
-        let gate = FrozenGate {
-            frozen: true,
+        let gate = PinGate {
+            policy: SourcePolicy::Frozen,
             lock: Some(&lock),
         };
         let err = gate
@@ -2059,8 +2059,8 @@ mod tests {
             remote,
             &SourceFailureBackend,
             2,
-            &FrozenGate {
-                frozen: false,
+            &PinGate {
+                policy: SourcePolicy::Reuse,
                 lock: None,
             },
         )
@@ -2174,8 +2174,8 @@ mod tests {
             remote,
             &SyncManifestBackend(read),
             2,
-            &FrozenGate {
-                frozen: false,
+            &PinGate {
+                policy: SourcePolicy::Reuse,
                 lock: None,
             },
         )
