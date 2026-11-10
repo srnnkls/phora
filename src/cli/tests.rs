@@ -5644,7 +5644,7 @@ fn rebuild_over_merged_vars_agrees_with_deployed_vars_digest() {
         let _cache = EnvVarGuard::set("XDG_CACHE_HOME", cache.path());
 
         super::sync::run_sync(
-            false,
+            crate::sync::PrunePolicy::KeepOrphans,
             false,
             false,
             false,

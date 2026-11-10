@@ -35,6 +35,8 @@ pub struct RebuildReport {
     pub modified: Vec<ArtifactKey>,
     /// On-disk artifact dirs under a target with no matching config/lock source.
     pub foreign: Vec<std::path::PathBuf>,
+    /// Records config no longer deploys whose deployed path is gone; dropped from the registry.
+    pub forgotten: Vec<ArtifactKey>,
 }
 
 pub fn rebuild_registry(
@@ -107,8 +109,35 @@ pub fn rebuild_registry_with(
 
         report.foreign.extend(scan_foreign(target, &managed_dests)?);
     }
+    forget_vanished_orphans(config, backend, registry, &mut report)?;
 
     Ok(report)
+}
+
+/// Drops each record config no longer deploys once nothing is left on disk at its recorded path,
+/// releasing a history record's worktree registration with it. An orphan still on disk stays for
+/// `--prune` to remove.
+fn forget_vanished_orphans(
+    config: &Config,
+    backend: &dyn SourceStore,
+    registry: &dyn StateStore,
+    report: &mut RebuildReport,
+) -> Result<()> {
+    for record in registry.all_artifacts()? {
+        if !super::prune::is_orphan(config, &record) {
+            continue;
+        }
+        let Some(path) = super::prune::recorded_destination(config, &record) else {
+            continue;
+        };
+        if std::fs::symlink_metadata(&path).is_ok() {
+            continue;
+        }
+        super::detach_history_overlay(&record, &path, backend)?;
+        registry.remove_artifact(&record.key)?;
+        report.forgotten.push(record.key);
+    }
+    Ok(())
 }
 
 /// The `(name, encoded_ref) -> commit` map `plan_target` needs, drawn from the lock:

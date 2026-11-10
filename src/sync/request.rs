@@ -1,11 +1,13 @@
 //! Public request and report values for a synchronization run.
 
+use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use crate::config::Config;
 use crate::lock::Lock;
 use crate::projection::diagnostic::ProjectionWarning;
+use crate::sync::state::ArtifactRecord;
 
 use super::ConflictResolver;
 use super::hooks::HookOutcome;
@@ -53,7 +55,7 @@ pub struct SyncRequest<'a> {
 }
 
 /// Explicit policies controlling synchronization.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncOptions {
     pub source_policy: SourcePolicy,
     pub conflict_policy: ConflictPolicy,
@@ -79,10 +81,29 @@ pub enum ConflictPolicy {
 }
 
 /// Whether managed records absent from the projection are retained.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrunePolicy {
     KeepOrphans,
     RemoveOrphans,
+    /// Remove only the orphans of these sources.
+    RemoveOrphansOf(BTreeSet<String>),
+}
+
+impl PrunePolicy {
+    #[must_use]
+    pub fn prunes(&self) -> bool {
+        !matches!(self, Self::KeepOrphans)
+    }
+
+    /// Whether this policy removes `record` once it is an orphan.
+    #[must_use]
+    pub fn removes(&self, record: &ArtifactRecord) -> bool {
+        match self {
+            Self::KeepOrphans => false,
+            Self::RemoveOrphans => true,
+            Self::RemoveOrphansOf(sources) => sources.contains(record.source_name()),
+        }
+    }
 }
 
 /// Which hook families participate in the run.
@@ -103,7 +124,7 @@ impl From<&SyncOptions> for ReconciliationPolicy {
     fn from(options: &SyncOptions) -> Self {
         Self {
             force: matches!(options.conflict_policy, ConflictPolicy::Overwrite),
-            prune: matches!(options.prune_policy, PrunePolicy::RemoveOrphans),
+            prune: options.prune_policy.prunes(),
         }
     }
 }

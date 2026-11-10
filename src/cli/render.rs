@@ -44,7 +44,7 @@ pub(super) fn format_sync_warning(warning: &SyncWarning) -> Option<String> {
             to,
         } => format!("phora: {source} → {target}: {from} → {to}"),
         SyncWarning::OrphanedRecords { count } => format!(
-            "phora: {count} orphaned record(s) with no config target — run `phora list --orphans` \
+            "phora: {count} orphaned record(s) no longer in config — run `phora list --orphans` \
              to inspect, `phora sync --prune` to remove"
         ),
         SyncWarning::RemovalsSkippedAfterFailures => {
@@ -402,7 +402,7 @@ pub(super) fn format_orphans(orphans: &[OrphanListing]) -> String {
         let _ = writeln!(out, "No orphaned records.");
         return out;
     }
-    let _ = writeln!(out, "orphaned records (no config target):");
+    let _ = writeln!(out, "orphaned records (no longer in config):");
     for orphan in orphans {
         match &orphan.path {
             Some(path) => {

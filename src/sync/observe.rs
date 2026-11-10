@@ -15,7 +15,7 @@ use crate::sync::model::{
 use crate::sync::state::{ArtifactKey, ArtifactRecord, StateStore};
 
 use super::target::{self, ArtifactEntry, TargetRun};
-use super::{DeployAll, target_run};
+use super::{DeployAll, PrunePolicy, target_run};
 
 type ObservationKey = (String, String, String);
 
@@ -82,7 +82,7 @@ where
         .dropped
         .iter()
         .map(|drop| (drop.record.clone(), Some(drop.reason)));
-    let pruned = registry_only_records(ctx.input.prune(), list_all)?
+    let pruned = registry_only_records(&ctx.input.options().prune_policy, list_all)?
         .into_iter()
         .map(|record| (record, None));
     let live_paths = super::prune::live_paths_by_source(projection, ctx.config);
@@ -181,14 +181,16 @@ where
 }
 
 fn registry_only_records(
-    remove_orphans: bool,
+    prune: &PrunePolicy,
     list_all: impl FnOnce() -> Result<Vec<ArtifactRecord>>,
 ) -> Result<Vec<ArtifactRecord>> {
-    if remove_orphans {
-        list_all()
-    } else {
-        Ok(Vec::new())
+    if !prune.prunes() {
+        return Ok(Vec::new());
     }
+    Ok(list_all()?
+        .into_iter()
+        .filter(|record| prune.removes(record))
+        .collect())
 }
 
 fn adopt_undesired_record<R>(

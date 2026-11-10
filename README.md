@@ -237,7 +237,7 @@ sources a target deploys. `add`/`rm` are top-level sugar over the source namespa
 phora source add owner/repo --name myconfigs --branch main
 phora source list                  # name, resolved remote, refspec
 phora source show myconfigs        # effective config + targets that deploy it
-phora source rm myconfigs          # also scrubs it from every target's `sources`
+phora source rm myconfigs          # unbinds it everywhere and removes what it deployed
 phora rm myconfigs                 # alias for `source rm`
 
 # Targets (--path required; --layout takes flat | by-source | prefixed)
@@ -259,6 +259,14 @@ path `./T`) on an interactive terminal, and errors with a `phora target add` hin
 off a TTY. `--local` on a mutating command writes `phora.local.toml` instead of
 `phora.toml`; `source rm`/`rm` take no `--local`, since their scrub spans both
 files.
+
+`source rm` also removes what the source deployed: after editing config it runs a
+sync whose `--prune` covers only that source's records, so its files, registry
+records, and history worktrees go and nothing else is pruned. A deployed file you
+changed locally is kept and reported like any other removal conflict. A source
+removed by editing `phora.toml` by hand leaves its deployments as orphans: `sync`
+reports them, `phora list --orphans` lists them, `phora sync --prune` removes them,
+and `phora rebuild-registry` forgets those whose files are already gone.
 
 A bare `phora add <url>` (no `--to`) deploys into the project: it ensures
 `[targets.default]` (path `.`, flat layout) and binds the source into it. Set

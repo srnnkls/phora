@@ -213,7 +213,7 @@ trait RunOptions {
     }
 
     fn prune(&self) -> bool {
-        matches!(self.options().prune_policy, PrunePolicy::RemoveOrphans)
+        self.options().prune_policy.prunes()
     }
 
     fn hooks_enabled(&self) -> bool {
@@ -227,7 +227,7 @@ trait RunOptions {
 
 impl RunOptions for SyncRunInput<'_> {
     fn options(&self) -> SyncOptions {
-        self.options
+        self.options.clone()
     }
 
     fn resolver(&self) -> Option<&dyn ConflictResolver> {
@@ -284,7 +284,7 @@ impl TestSyncInvocation for SyncRequest<'_> {
             base_config: self.base_config,
             local_config: self.local_config,
             locks: self.locks.clone(),
-            options: self.options,
+            options: self.options.clone(),
             resolver: self.resolver,
             sink: self.sink,
             trust_prompt: self.trust_prompt,
@@ -1064,7 +1064,7 @@ fn request_run_input<'a>(request: &'a SyncRequest<'a>, lockless: bool) -> SyncRu
         base_config: request.base_config,
         local_config: request.local_config,
         locks: request.locks.clone(),
-        options: request.options,
+        options: request.options.clone(),
         resolver: request.resolver,
         sink: request.sink,
         trust_prompt: request.trust_prompt,
@@ -1284,7 +1284,7 @@ fn sync_workspace<R: StateStore>(
         &parsed,
         &projection,
         &recorded_after_recovery,
-        input.prune(),
+        &input.options().prune_policy,
     )?;
 
     let deploy = DeployAll {
@@ -1349,7 +1349,7 @@ where
     }
     let mut had_failures = run.had_failures;
     let registry: &dyn StateStore = deploy.registry;
-    if !deploy.input.prune() {
+    if deploy.input.options().prune_policy != PrunePolicy::RemoveOrphans {
         notify_orphans(deploy, &mut run.events)?;
     }
 
@@ -1589,7 +1589,7 @@ fn validate_sealed_offer(
     parsed: &BTreeMap<String, ParsedSource>,
     projection: &Projection,
     recorded: &[ArtifactRecord],
-    prune: bool,
+    prune: &PrunePolicy,
 ) -> Result<Vec<DroppedRecord>> {
     use crate::projection::offer::OfferSelection;
 
@@ -1645,7 +1645,7 @@ fn validate_sealed_offer(
             continue;
         }
         let policy = SealedRecordPolicy::classify(record, offer);
-        if policy.same_snapshot_transition() || (prune && policy.mode_switched) {
+        if policy.same_snapshot_transition() || (prune.removes(record) && policy.mode_switched) {
             continue;
         }
         let source_paths = record_source_paths(offer.projected, record)?;

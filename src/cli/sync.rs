@@ -36,7 +36,7 @@ fn open_sync_registry(cwd: &Path, config: &Config) -> Result<FileStateStore> {
     reason = "independent CLI run flags, not a state machine"
 )]
 pub(super) fn run_sync(
-    prune: bool,
+    prune: PrunePolicy,
     force: bool,
     no_hooks: bool,
     no_transitive_hooks: bool,
@@ -117,11 +117,7 @@ pub(super) fn run_sync(
         options: SyncOptions {
             source_policy,
             conflict_policy,
-            prune_policy: if prune {
-                PrunePolicy::RemoveOrphans
-            } else {
-                PrunePolicy::KeepOrphans
-            },
+            prune_policy: prune,
             hook_policy,
             concurrency: Concurrency { jobs },
         },
@@ -387,6 +383,14 @@ pub(super) fn run_rebuild_registry(lock_timeout: Duration) -> Result<()> {
         crate::sync::rebuild_registry_with(&config, &parsed, &remotes, &lock, &backend, &registry)?;
 
     println!("reconstructed {}", report.reconstructed.len());
+    if !report.forgotten.is_empty() {
+        let forgotten: Vec<String> = report
+            .forgotten
+            .iter()
+            .map(|k| format!("{}/{}", k.source, k.artifact))
+            .collect();
+        println!("forgot [{}]", forgotten.join(", "));
+    }
     if !report.modified.is_empty() {
         let modified: Vec<String> = report
             .modified
@@ -406,6 +410,15 @@ pub(super) fn run_rebuild_registry(lock_timeout: Duration) -> Result<()> {
     Ok(())
 }
 
+/// The policy of the `--prune` flag: every orphan, or none.
+pub(super) fn prune_policy(prune: bool) -> PrunePolicy {
+    if prune {
+        PrunePolicy::RemoveOrphans
+    } else {
+        PrunePolicy::KeepOrphans
+    }
+}
+
 pub(super) fn run_update(
     source: Option<&str>,
     prune: bool,
@@ -413,7 +426,7 @@ pub(super) fn run_update(
 ) -> Result<CliOutcome> {
     let drop = source.map_or(DropSources::All, |s| DropSources::One(s.to_owned()));
     run_sync(
-        prune,
+        prune_policy(prune),
         false,
         false,
         false,

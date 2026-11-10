@@ -3,4 +3,4 @@ exit: 0
 sync complete
 --- stderr ---
 phora: source `dotfiles` is bound by no target or build
-phora: 2 orphaned record(s) with no config target â run `phora list --orphans` to inspect, `phora sync --prune` to remove
+phora: 2 orphaned record(s) no longer in config â run `phora list --orphans` to inspect, `phora sync --prune` to remove

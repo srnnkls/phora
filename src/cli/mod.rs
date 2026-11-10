@@ -44,7 +44,7 @@ pub use query::{
 };
 pub use sync::{load_locks, write_locks};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
@@ -58,7 +58,7 @@ use crate::source::SourceName;
 use crate::source::{GitBackend, HttpBackend, RouterBackend};
 use crate::sync::state::ProjectId;
 use crate::sync::state::{FileStateStore, StateError, StateLock, StateStore};
-use crate::sync::{Conflict, ConflictKind, ConflictResolver, Resolution};
+use crate::sync::{Conflict, ConflictKind, ConflictResolver, PrunePolicy, Resolution};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -120,7 +120,7 @@ pub enum Command {
         #[arg(long = "as")]
         r#as: Option<String>,
     },
-    /// Remove a source and scrub it from every target (alias for `source rm`).
+    /// Remove a source, unbind it everywhere, and remove what it deployed (alias for `source rm`).
     Rm { name: String },
     /// Fetch sources and project them to targets.
     Sync {
@@ -300,7 +300,7 @@ pub enum SourceCmd {
         #[arg(long)]
         symlink: bool,
     },
-    /// Remove a source and scrub it from every target's source list.
+    /// Remove a source, unbind it everywhere, and remove what it deployed.
     Rm { name: String },
     /// List sources over the merged config.
     List,
@@ -380,7 +380,10 @@ pub fn run_with_outcome(cli: Cli) -> Result<CliOutcome> {
     }
     match cli.command {
         cmd @ Command::Add { .. } => completed(dispatch_add(cmd)),
-        Command::Rm { name } => completed(run_source_rm(&name)),
+        Command::Rm { name }
+        | Command::Source {
+            cmd: SourceCmd::Rm { name },
+        } => run_source_rm(&name, cli.lock_timeout),
         cmd @ (Command::Sync { .. } | Command::Update { .. }) => {
             dispatch_sync(cmd, cli.lock_timeout)
         }
@@ -493,7 +496,7 @@ fn dispatch_sync(cmd: Command, lock_timeout: Duration) -> Result<CliOutcome> {
             json,
             jobs,
         } => sync::run_sync(
-            prune,
+            sync::prune_policy(prune),
             force,
             no_hooks,
             no_transitive_hooks,
@@ -667,7 +670,7 @@ fn run_source(cmd: SourceCmd) -> Result<()> {
             assume_yes: false,
             refinement: &BindRefinement::default(),
         }),
-        SourceCmd::Rm { name } => run_source_rm(&name),
+        SourceCmd::Rm { .. } => unreachable!("source rm dispatches before run_source"),
         SourceCmd::List => {
             render::print_source_rows(&source_listing(&load_config()?)?);
             Ok(())
@@ -687,7 +690,8 @@ fn read_config_text(path: &str) -> Result<String> {
     }
 }
 
-fn run_source_rm(name: &str) -> Result<()> {
+/// Removes the source from config, then prunes what it deployed with a sync scoped to its records.
+fn run_source_rm(name: &str, lock_timeout: Duration) -> Result<CliOutcome> {
     let main = read_config_text("phora.toml")?;
     let local = read_config_text("phora.local.toml")?;
     let result = config_edit::remove_source(&main, &local, name)?;
@@ -698,7 +702,26 @@ fn run_source_rm(name: &str) -> Result<()> {
         std::fs::write("phora.local.toml", &result.local)?;
     }
     render::print_source_removed(name);
-    Ok(())
+    let config = merge_configs(load_config()?, load_local_config(Path::new("."))?);
+    let deployed = open_project_registry(&config)?
+        .all_artifacts()?
+        .iter()
+        .any(|record| record.source_name() == name);
+    if !deployed {
+        return Ok(CliOutcome::Success);
+    }
+    sync::run_sync(
+        PrunePolicy::RemoveOrphansOf(BTreeSet::from([name.to_owned()])),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        lock_timeout,
+    )
 }
 
 fn run_target(cmd: TargetCmd) -> Result<()> {

@@ -120,6 +120,16 @@ pub struct NewArtifactRecord<'a> {
 }
 
 impl ArtifactRecord {
+    /// The underlying source this record was deployed from; legacy records carry only the key.
+    #[must_use]
+    pub fn source_name(&self) -> &str {
+        if self.source.is_empty() {
+            &self.key.source
+        } else {
+            &self.source
+        }
+    }
+
     /// Build a managed (`linked = false`) record, stamping `projected_at` to now.
     #[must_use]
     pub fn projected(p: NewArtifactRecord<'_>) -> Self {

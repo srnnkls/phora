@@ -61,9 +61,23 @@ fn reconstruct_layout(record: &ArtifactRecord) -> Option<LayoutConfig> {
     Some(LayoutConfig { kind, separator })
 }
 
+/// A record config no longer deploys: its target is gone, or a configured target no longer binds
+/// its source. Composed targets are judged by the transitive graph, so only their presence counts.
 #[must_use]
 pub(crate) fn is_orphan(config: &Config, record: &ArtifactRecord) -> bool {
-    !config.targets.contains_key(&record.key.target)
+    let Some(target) = config.targets.get(&record.key.target) else {
+        return true;
+    };
+    if super::target::is_composed_target(&record.key.target) {
+        return false;
+    }
+    let source = record.source_name();
+    !target.declared_sources().any(|bound| bound == source)
+        && !target
+            .offer_bindings
+            .iter()
+            .flatten()
+            .any(|offer| offer.source() == source)
 }
 
 pub(crate) fn orphan_records(
