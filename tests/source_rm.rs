@@ -7,14 +7,21 @@ mod common;
 
 use common::{run_git, run_phora, run_phora_ok};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Deploy {
+    Copy,
+    History,
+    Link,
+}
+
 struct Project {
     _dir: tempfile::TempDir,
     root: PathBuf,
 }
 
 impl Project {
-    /// Two local sources, `up` and `keep`, synced into target `mako`; `up` with `history` when asked.
-    fn synced(history: bool) -> Self {
+    /// Two local sources, `up` and `keep`, synced into target `mako`; `up` deploys as asked.
+    fn synced(deploy: Deploy) -> Self {
         let dir = tempfile::tempdir().expect("project directory");
         let root = dir.path().join("proj");
         fs::create_dir_all(&root).expect("project root");
@@ -45,14 +52,30 @@ impl Project {
                 "--to",
                 "mako",
             ];
-            if history && name == "up" {
+            if deploy == Deploy::History && name == "up" {
                 args.push("--history");
             }
             args.push("-y");
             run_phora_ok(&project.root, &args);
         }
+        if deploy == Deploy::Link {
+            let config = fs::read_to_string(project.root.join("phora.toml")).expect("config");
+            fs::write(
+                project.root.join("phora.toml"),
+                config.replacen("[sources.up]\n", "[sources.up]\ndeploy = \"link\"\n", 1),
+            )
+            .expect("config");
+        }
         run_phora_ok(&project.root, &["sync"]);
         assert!(project.deployed("up").exists(), "premise: up is deployed");
+        assert_eq!(
+            fs::symlink_metadata(project.deployed("up"))
+                .expect("deployed")
+                .file_type()
+                .is_symlink(),
+            deploy == Deploy::Link,
+            "premise: up deploys as {deploy:?}"
+        );
         project
     }
 
@@ -130,7 +153,7 @@ fn assert_only_keep_remains(project: &Project) {
 
 #[test]
 fn rm_removes_a_history_deployment_its_record_and_its_worktree() {
-    let project = Project::synced(true);
+    let project = Project::synced(Deploy::History);
     let deployed = project.deployed("up");
     assert!(
         project
@@ -153,7 +176,7 @@ fn rm_removes_a_history_deployment_its_record_and_its_worktree() {
 
 #[test]
 fn rm_removes_a_copied_deployment_and_its_record() {
-    let project = Project::synced(false);
+    let project = Project::synced(Deploy::Copy);
 
     run_phora_ok(&project.root, &["rm", "up"]);
 
@@ -162,7 +185,7 @@ fn rm_removes_a_copied_deployment_and_its_record() {
 
 #[test]
 fn rm_keeps_a_locally_modified_deployment() {
-    let project = Project::synced(false);
+    let project = Project::synced(Deploy::Copy);
     let edited = project.deployed("up").join("a.txt");
     fs::write(&edited, "mine\n").expect("edit the deployed copy");
 
@@ -182,7 +205,7 @@ fn rm_keeps_a_locally_modified_deployment() {
 
 #[test]
 fn sync_reports_the_deployment_of_a_source_removed_from_config() {
-    let project = Project::synced(false);
+    let project = Project::synced(Deploy::Copy);
     project.remove_from_config("up");
 
     let stderr = run_phora_ok(&project.root, &["sync"]);
@@ -200,7 +223,7 @@ fn sync_reports_the_deployment_of_a_source_removed_from_config() {
 
 #[test]
 fn rebuild_registry_forgets_a_removed_source_whose_files_are_gone() {
-    let project = Project::synced(true);
+    let project = Project::synced(Deploy::History);
     project.remove_from_config("up");
     fs::rename(project.deployed("up"), project.root.join("trashed-up")).expect("move away");
 
@@ -260,4 +283,26 @@ fn rm_removes_a_transitive_package_composition() {
         !listed.contains("Artifact:"),
         "rm drops the composed records; where:\n{listed}"
     );
+}
+
+#[test]
+fn rm_leaves_an_ejected_deployment_alone() {
+    for deploy in [Deploy::Copy, Deploy::History, Deploy::Link] {
+        let project = Project::synced(deploy);
+        run_phora_ok(
+            &project.root,
+            &["eject", "up", "--source", "up", "--target", "mako"],
+        );
+        let before = fs::symlink_metadata(project.deployed("up")).expect("ejected artifact");
+
+        run_phora_ok(&project.root, &["rm", "up"]);
+
+        let after = fs::symlink_metadata(project.deployed("up"))
+            .unwrap_or_else(|_| panic!("rm deleted the ejected {deploy:?} artifact"));
+        assert_eq!(after.file_type(), before.file_type(), "{deploy:?}");
+        assert!(
+            !project.stdout(&["where"]).contains("up/"),
+            "rm forgets its record"
+        );
+    }
 }

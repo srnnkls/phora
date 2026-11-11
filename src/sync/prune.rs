@@ -401,7 +401,7 @@ where
         live_paths,
         events,
     )? {
-        Removal::Kept => {}
+        Removal::Kept | Removal::Forgotten => {}
         Removal::Released(path) if row.reason != RemovalReason::Pruned => {
             events.push_warning(SyncWarning::ReleasedUnderLive {
                 source: source.to_owned(),
@@ -567,7 +567,19 @@ enum Removal {
     Deleted,
     /// The record was forgotten; its path belongs to a live destination and stays.
     Released(PathBuf),
+    /// The record was forgotten; its ejected files belong to the user and stay.
+    Forgotten,
     Kept,
+}
+
+/// Whether the user ejected `record`'s artifact, so its files are no longer phora's to touch.
+pub(super) fn is_ejected(record: &ArtifactRecord, registry: &dyn StateStore) -> Result<bool> {
+    Ok(registry
+        .ejections(&record.key.target)?
+        .iter()
+        .any(|ejection| {
+            ejection.source == record.key.source && ejection.artifact == record.key.artifact
+        }))
 }
 
 fn remove_reconciled_record(
@@ -579,6 +591,10 @@ fn remove_reconciled_record(
     live_paths: &LivePathsBySource,
     events: &mut SyncEvents,
 ) -> Result<Removal> {
+    if is_ejected(record, registry)? {
+        registry.remove_artifact(&record.key)?;
+        return Ok(Removal::Forgotten);
+    }
     let path = match located {
         Ok(Some(path)) => path,
         Ok(None) => {

@@ -168,6 +168,9 @@ fn observe_orphan_condition<R>(
 where
     R: StateStore,
 {
+    if super::prune::is_ejected(record, ctx.registry)? {
+        return Ok(ManagedCondition::Clean);
+    }
     let Ok(Some(path)) = super::prune::locate_removal(ctx.config, record, ctx.protected) else {
         return Ok(ManagedCondition::Clean);
     };
