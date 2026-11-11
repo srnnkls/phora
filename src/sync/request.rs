@@ -85,8 +85,23 @@ pub enum ConflictPolicy {
 pub enum PrunePolicy {
     KeepOrphans,
     RemoveOrphans,
-    /// Remove only the orphans of these sources.
-    RemoveOrphansOf(BTreeSet<String>),
+    /// Remove only the orphans this scope covers.
+    RemoveOrphansOf(PruneScope),
+}
+
+/// The records a scoped prune may remove: those deployed from `sources`, and every record under
+/// `targets` (the composed targets a removed transitive source rooted).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PruneScope {
+    pub sources: BTreeSet<String>,
+    pub targets: BTreeSet<String>,
+}
+
+impl PruneScope {
+    #[must_use]
+    pub fn covers(&self, record: &ArtifactRecord) -> bool {
+        self.sources.contains(record.source_name()) || self.targets.contains(&record.key.target)
+    }
 }
 
 impl PrunePolicy {
@@ -101,7 +116,7 @@ impl PrunePolicy {
         match self {
             Self::KeepOrphans => false,
             Self::RemoveOrphans => true,
-            Self::RemoveOrphansOf(sources) => sources.contains(record.source_name()),
+            Self::RemoveOrphansOf(scope) => scope.covers(record),
         }
     }
 }

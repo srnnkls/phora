@@ -52,8 +52,8 @@ pub use progress::{
 pub use rebuild::{RebuildReport, rebuild_registry, rebuild_registry_with};
 pub use request::{
     AppliedChange, Concurrency, ConflictPolicy, DeclineAll, HookPolicy, LockSet, PrunePolicy,
-    SkippedChange, SourcePolicy, SyncOptions, SyncReport, SyncRequest, SyncStatus, SyncWarning,
-    TrustPrompt, TrustRequest,
+    PruneScope, SkippedChange, SourcePolicy, SyncOptions, SyncReport, SyncRequest, SyncStatus,
+    SyncWarning, TrustPrompt, TrustRequest,
 };
 pub use verify::{
     OverlayFinding, UntrustedHookFinding, VerifyMismatch, VerifyReason, VerifyReport, verify,

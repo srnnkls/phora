@@ -214,3 +214,50 @@ fn rebuild_registry_forgets_a_removed_source_whose_files_are_gone() {
             .contains("No orphaned records.")
     );
 }
+
+#[test]
+fn rm_removes_a_transitive_package_composition() {
+    let dir = tempfile::tempdir().expect("project directory");
+    let base = dir.path().canonicalize().expect("canonical base");
+    let package = base.join("pkg");
+    for leaf in ["p1", "p2"] {
+        fs::create_dir_all(package.join(leaf)).expect("leaf");
+        fs::write(package.join(leaf).join("f.txt"), format!("{leaf}\n")).expect("file");
+    }
+    fs::write(
+        package.join("phora.toml"),
+        "version = 1\n[offers.default]\ninclude = [\"p1/**\", \"p2/**\"]\n",
+    )
+    .expect("package config");
+    run_git(&package, &["init", "-b", "main", "--template="]);
+    run_git(&package, &["add", "p1", "p2", "phora.toml"]);
+    run_git(&package, &["commit", "-m", "package"]);
+    let root = base.join("proj");
+    fs::create_dir_all(&root).expect("project root");
+    fs::write(
+        root.join("phora.toml"),
+        format!(
+            "version = 1\n[sources.pkg]\npath = {:?}\nbranch = \"main\"\ntransitive = true\n\
+             [targets.t]\npath = \"dest\"\nsources = [\"pkg\"]\n",
+            package.to_str().expect("package path")
+        ),
+    )
+    .expect("config");
+    run_phora_ok(&root, &["sync"]);
+    assert!(
+        root.join("dest/p1/f.txt").exists(),
+        "premise: the package composes"
+    );
+
+    run_phora_ok(&root, &["rm", "pkg"]);
+
+    assert!(
+        !root.join("dest/p1").exists(),
+        "rm removes the composed files"
+    );
+    let listed = String::from_utf8_lossy(&run_phora(&root, &["where"]).stdout).into_owned();
+    assert!(
+        !listed.contains("Artifact:"),
+        "rm drops the composed records; where:\n{listed}"
+    );
+}

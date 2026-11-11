@@ -58,7 +58,7 @@ use crate::source::SourceName;
 use crate::source::{GitBackend, HttpBackend, RouterBackend};
 use crate::sync::state::ProjectId;
 use crate::sync::state::{FileStateStore, StateError, StateLock, StateStore};
-use crate::sync::{Conflict, ConflictKind, ConflictResolver, PrunePolicy, Resolution};
+use crate::sync::{Conflict, ConflictKind, ConflictResolver, PrunePolicy, PruneScope, Resolution};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -690,8 +690,13 @@ fn read_config_text(path: &str) -> Result<String> {
     }
 }
 
-/// Removes the source from config, then prunes what it deployed with a sync scoped to its records.
+/// Removes the source from config, then prunes what it deployed with a sync scoped to its records
+/// and to the composed targets it rooted.
 fn run_source_rm(name: &str, lock_timeout: Duration) -> Result<CliOutcome> {
+    let scope = PruneScope {
+        sources: BTreeSet::from([name.to_owned()]),
+        targets: composed_targets_rooted_at(name)?,
+    };
     let main = read_config_text("phora.toml")?;
     let local = read_config_text("phora.local.toml")?;
     let result = config_edit::remove_source(&main, &local, name)?;
@@ -706,12 +711,12 @@ fn run_source_rm(name: &str, lock_timeout: Duration) -> Result<CliOutcome> {
     let deployed = open_project_registry(&config)?
         .all_artifacts()?
         .iter()
-        .any(|record| record.source_name() == name);
+        .any(|record| scope.covers(record));
     if !deployed {
         return Ok(CliOutcome::Success);
     }
     sync::run_sync(
-        PrunePolicy::RemoveOrphansOf(BTreeSet::from([name.to_owned()])),
+        PrunePolicy::RemoveOrphansOf(scope),
         false,
         false,
         false,
@@ -722,6 +727,28 @@ fn run_source_rm(name: &str, lock_timeout: Duration) -> Result<CliOutcome> {
         None,
         lock_timeout,
     )
+}
+
+/// The composed targets that `name`'s bindings root, resolved offline from the current config.
+fn composed_targets_rooted_at(name: &str) -> Result<BTreeSet<String>> {
+    let cwd = std::env::current_dir()?;
+    let mut config = merge_configs(load_config()?, load_local_config(&cwd)?);
+    let identities: BTreeSet<String> = config
+        .targets
+        .values()
+        .flat_map(|target| target.offer_bindings.iter().flatten())
+        .filter(|offer| offer.source() == name)
+        .map(|offer| offer.identity.clone())
+        .collect();
+    if identities.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let cache_git = crate::paths::cache_root_for(config.paths.cache.as_deref(), &cwd)?.join("git");
+    Ok(query::inject_offline_graph(&mut config, &cwd, cache_git)?
+        .into_iter()
+        .filter(|composed| identities.contains(&composed.import))
+        .map(|composed| composed.name)
+        .collect())
 }
 
 fn run_target(cmd: TargetCmd) -> Result<()> {
