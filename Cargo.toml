@@ -62,6 +62,7 @@ trace = ["gix/tracing-detail", "dep:tracing", "dep:tracing-subscriber"]
 assert_cmd = "2.0.17"
 criterion = "0.5"
 insta = { version = "1.43.2", features = ["filters"] }
+proptest = "1"
 tempfile = "3.27.0"
 
 [[bench]]

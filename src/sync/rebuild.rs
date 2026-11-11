@@ -60,6 +60,9 @@ pub fn rebuild_registry_with(
     backend: &dyn SourceStore,
     registry: &dyn StateStore,
 ) -> Result<RebuildReport> {
+    let configured = config;
+    let locked_config = only_locked_bindings(config, parsed, lock);
+    let config = &locked_config;
     let (resolved_commits, resolved_sources) =
         locked_sources(config, lock, parsed, remotes, backend)?;
 
@@ -109,7 +112,7 @@ pub fn rebuild_registry_with(
 
         report.foreign.extend(scan_foreign(target, &managed_dests)?);
     }
-    forget_vanished_orphans(config, backend, registry, &mut report)?;
+    forget_vanished_orphans(configured, backend, registry, &mut report)?;
 
     Ok(report)
 }
@@ -140,6 +143,41 @@ fn forget_vanished_orphans(
     Ok(())
 }
 
+/// The lock entry pinning `binding`, or `None` for a binding no sync has resolved yet.
+fn locked_entry<'l>(
+    lock: &'l Lock,
+    source: &crate::config::ParsedSource,
+    binding: &crate::config::ResolvedBinding<'_>,
+) -> Option<&'l crate::lock::LockedSource> {
+    let discriminator = ref_discriminator(&binding.effective_ref, &source.refspec());
+    lock.find_entry(binding.source, discriminator.as_deref())
+}
+
+/// `config` without the bindings no sync has locked: they have deployed nothing to rebuild.
+fn only_locked_bindings(
+    config: &Config,
+    parsed: &BTreeMap<String, crate::config::ParsedSource>,
+    lock: &Lock,
+) -> Config {
+    let mut config = config.clone();
+    for target in config.targets.values_mut() {
+        let unlocked: BTreeSet<String> = target
+            .resolve_sources(parsed)
+            .into_iter()
+            .filter(|binding| {
+                parsed
+                    .get(binding.source)
+                    .is_some_and(|source| locked_entry(lock, source, binding).is_none())
+            })
+            .map(|binding| binding.identity.to_owned())
+            .collect();
+        if let Some(bindings) = target.sources.as_mut() {
+            bindings.retain(|identity, _| !unlocked.contains(identity));
+        }
+    }
+    config
+}
+
 /// The `(name, encoded_ref) -> commit` map `plan_target` needs, drawn from the lock:
 /// every binding's effective ref resolves to its locked commit (link sources included).
 type LockedSourceMaps = (BTreeMap<(String, String), String>, ResolvedSourceMap);
@@ -161,15 +199,9 @@ fn locked_sources(
                     binding.source
                 ))
             })?;
-            let discriminator = ref_discriminator(&binding.effective_ref, &source.refspec());
-            let locked = lock
-                .find_entry(binding.source, discriminator.as_deref())
-                .ok_or_else(|| {
-                    Error::Sync(format!(
-                        "no locked commit for source {} at its ref; run sync first",
-                        binding.source
-                    ))
-                })?;
+            let Some(locked) = locked_entry(lock, source, &binding) else {
+                continue;
+            };
             commits.insert(
                 (
                     binding.source.to_owned(),
@@ -263,7 +295,7 @@ fn rebuild_binding(run: &BindingRun<'_>, report: &mut RebuildReport) -> Result<(
         };
         let artifact_dst = run.target.expanded_path().join(item.destination.as_str());
 
-        if run.binding.commit == "link" {
+        if run.source.deploy_mode() == DeployMode::Link {
             rebuild_linked(
                 run.registry,
                 &run.binding.source,
@@ -272,6 +304,7 @@ fn rebuild_binding(run: &BindingRun<'_>, report: &mut RebuildReport) -> Result<(
                 record_kind(&item.materialization),
                 key.clone(),
                 deploy_root.clone(),
+                &artifact_dst,
             )?;
         } else {
             rebuild_one(RebuildOne {
@@ -404,14 +437,14 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
     for sf in staged.files {
         let path = PathBuf::from(sf.destination.as_str());
         let on_disk = manifest_base.join(&path);
-        let (size, mtime) = if let Some(actual) = disk_hash(&on_disk)? {
-            if actual.kind != sf.kind || actual.hash != sf.blake3 {
-                modified = true;
+        let (size, mtime) = match disk_hash(&on_disk)? {
+            Some(actual) if actual.kind == sf.kind && actual.hash == sf.blake3 => {
+                (actual.size, actual.mtime)
             }
-            (actual.size, actual.mtime)
-        } else {
-            modified = true;
-            (sf.size, sf.mtime)
+            _ => {
+                modified = true;
+                (sf.size, sf.mtime)
+            }
         };
         files.push(ManifestFile {
             path,
@@ -448,6 +481,10 @@ fn rebuild_one(args: RebuildOne<'_>) -> Result<()> {
 
 /// Reconstruct a linked artifact's registry record without hashing or export:
 /// a link source has no mirror, so its marker is synthesized from disk discovery.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a linked record threads its source, policy, layout, kind, key, root, and destination"
+)]
 fn rebuild_linked(
     registry: &dyn StateStore,
     underlying_source: &str,
@@ -456,7 +493,9 @@ fn rebuild_linked(
     kind: RecordKind,
     key: ArtifactKey,
     deploy_root: String,
+    artifact_dst: &Path,
 ) -> Result<()> {
+    let link_target = std::fs::read_link(artifact_dst).ok();
     let record = ArtifactRecord {
         version: 1,
         key,
@@ -478,7 +517,7 @@ fn rebuild_linked(
         vars_digest: None,
         deploy_root: Some(deploy_root),
         layout_separator: layout.persisted_separator(),
-        link_target: None,
+        link_target: link_target.map(|target| target.to_string_lossy().into_owned()),
     };
     registry.put_artifact(&record)?;
     Ok(())
