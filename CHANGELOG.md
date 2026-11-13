@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0](https://github.com/srnnkls/phora/compare/v0.5.0...v0.6.0) - 2026-11-13
+
+### Features
+
+- *(sync)* [**breaking**] Add `sync --locked`
+
+### Bug Fixes
+
+- *(sync)* Never delete an ejected artifact on removal
+- *(cli)* `phora rm` also removes a transitive source's composition
+- *(cli)* `phora rm` removes what the source deployed
+
+### Testing
+
+- *(lifecycle)* Cover transitive and url sources, a second target, eject, and --force
+- Random lifecycle model; fix three rebuild-registry bugs it found
+
+[0.6.0]: https://github.com/srnnkls/phora/compare/0.5.0..0.6.0
+
 ## [0.5.0](https://github.com/srnnkls/phora/compare/v0.4.4...v0.5.0) - 2026-11-04
 
 ### Features
