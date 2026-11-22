@@ -1,4 +1,14 @@
 exit: 0
 --- stdout ---
-sync complete
+✓ Synced 1 target · 2 added · <T>
 --- stderr ---
+phora sync  <CWD>
+
+Sources
+  ✓ dotfiles  local <SRC> @ main  fetched <T>
+
+Targets
+  ✓ dotfiles → home  ~/deploy  2 added
+    + editor
+    + lint
+

@@ -10,7 +10,7 @@ mod common;
 
 struct Fixture {
     _home: TempDir,
-    _src: TempDir,
+    src: TempDir,
     cwd: TempDir,
     home_path: std::path::PathBuf,
     xdg_cache: std::path::PathBuf,
@@ -65,7 +65,7 @@ fn build_fixture(extra_config: &str) -> Fixture {
 
     Fixture {
         _home: home,
-        _src: src,
+        src,
         cwd,
         xdg_cache: home_path.join("xdg/cache"),
         xdg_state: home_path.join("xdg/state"),
@@ -146,12 +146,40 @@ fn every_stdout_line_is_json_and_the_last_is_the_summary() {
 }
 
 #[test]
+fn an_upstream_change_reports_the_artifact_as_updated() {
+    let fixture = build_fixture("");
+    assert!(run(&fixture, &["sync"]).status.success(), "initial sync");
+    let src = fixture.src.path();
+    std::fs::write(src.join("editor/init.lua"), b"-- init v2\n").expect("change upstream");
+    git(src, &["commit", "-qam", "upstream change"]);
+
+    std::fs::remove_file(fixture.cwd.path().join("phora.lock")).expect("unpin the old commit");
+
+    let out = run(&fixture, &["sync", "--json"]);
+    assert!(
+        out.status.success(),
+        "sync --json exits 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let records = parse_ndjson(&out.stdout);
+    let applied: Vec<&Value> = records
+        .iter()
+        .filter(|record| record["type"] == "artifact_applied")
+        .collect();
+    assert_eq!(applied.len(), 1, "one applied record: {records:#?}");
+    assert_eq!(applied[0]["change"], "updated", "{records:#?}");
+    let summary = records.last().expect("summary record");
+    assert_eq!(summary["updated"], 1, "{summary}");
+    assert_eq!(summary["deployed"], 0, "{summary}");
+}
+
+#[test]
 fn no_human_text_leaks_onto_the_json_stream() {
     let fixture = build_fixture("");
     let out = run(&fixture, &["sync", "--json"]);
     let stdout = String::from_utf8(out.stdout).expect("stdout is utf-8");
     assert!(
-        !stdout.contains("sync complete") && !stdout.contains("synced 1 target"),
+        !stdout.contains("Synced ") && !stdout.contains("Up to date:"),
         "the human completion line must not share the machine stream: {stdout}"
     );
     assert!(

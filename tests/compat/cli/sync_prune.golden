@@ -1,7 +1,17 @@
 exit: 0
 --- stdout ---
-sync complete
+✓ Synced · 2 removed · <T>
 --- stderr ---
-phora: source `dotfiles` is bound by no target or build
-phora: pruning orphaned dotfiles:editor
-phora: pruning orphaned dotfiles:lint
+phora sync  <CWD>
+
+Sources
+  ✓ dotfiles  local <SRC> @ main  cached <T>
+
+Targets
+  ✓ dotfiles → home    2 removed
+    - editor
+    - lint
+
+Warnings
+  ! source `dotfiles` is bound by no target or build
+

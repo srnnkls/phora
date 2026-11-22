@@ -120,8 +120,8 @@ fn non_tty_skip_lines_keep_their_at_entry_apply_order_across_conflicts() {
         out.status.code()
     );
 
-    let alpha_line = "phora: skipping locally modified dotfiles:alpha";
-    let zulu_line = "phora: skipping locally modified dotfiles:zulu";
+    let alpha_line = "  ! skipping locally modified dotfiles:alpha";
+    let zulu_line = "  ! skipping locally modified dotfiles:zulu";
     let alpha_at = stderr
         .find(alpha_line)
         .unwrap_or_else(|| panic!("the alpha skip line must be emitted; stderr:\n{stderr}"));

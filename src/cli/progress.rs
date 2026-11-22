@@ -1,20 +1,25 @@
-//! Terminal rendering for a sync run.
+//! Human output for a sync run.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::io::IsTerminal;
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use console::Term;
 
+use super::render::{self, Change, Fetched, Palette, RunContext, SyncView, TargetOutcome};
 use crate::sync::progress::{
-    ArtifactId, FetchId, FetchOutcome, Phase, ProgressSink, Severity, SyncSummary,
+    ArtifactId, CommandRun, CommandSubject, FetchId, FetchOutcome, Phase, ProgressSink, Severity,
+    SyncSummary,
 };
-use crate::sync::{AppliedChange, SkippedChange, SyncWarning};
+use crate::sync::{AppliedChange, HookScope, SkippedChange, SyncWarning};
 
 const TICK: Duration = Duration::from_millis(80);
+const CACHED_LISTED: usize = 6;
 
-/// Whether live bars may draw, resolved once from the environment.
+/// Whether the status line may draw, resolved once from the environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ProgressMode {
     Live,
@@ -39,210 +44,388 @@ impl ProgressMode {
     }
 }
 
-const TICKS: &str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ";
-
-fn aggregate_style() -> ProgressStyle {
-    ProgressStyle::with_template(
-        "  {prefix:>10.cyan.bold}  {bar:25.cyan/8} {pos}/{len}  {wide_msg}",
-    )
-    .expect("aggregate template compiles")
-    .progress_chars("━╸━")
+struct Screen {
+    live: bool,
+    term: Term,
+    view: SyncView,
+    status: Option<(String, Instant)>,
+    drawn: bool,
 }
 
-fn child_style() -> ProgressStyle {
-    ProgressStyle::with_template("               {spinner:.cyan} {wide_msg}")
-        .expect("child template compiles")
-        .tick_chars(TICKS)
-}
+impl Screen {
+    fn print(&mut self, text: &str) {
+        self.erase();
+        for line in text.lines() {
+            let _ = self.term.write_line(line);
+        }
+        if text.is_empty() {
+            let _ = self.term.write_line("");
+        }
+        self.draw();
+    }
 
-fn phase_style() -> ProgressStyle {
-    ProgressStyle::with_template("  {prefix:>10.cyan.bold}  {spinner:.cyan} {wide_msg}")
-        .expect("phase template compiles")
-        .tick_chars(TICKS)
+    fn set_status(&mut self, text: String, since: Instant) {
+        self.status = Some((text, since));
+        self.redraw();
+    }
+
+    fn clear_status(&mut self) {
+        self.status = None;
+        self.erase();
+    }
+
+    fn redraw(&mut self) {
+        self.erase();
+        self.draw();
+    }
+
+    fn erase(&mut self) {
+        if self.drawn {
+            let _ = self.term.clear_line();
+            self.drawn = false;
+        }
+    }
+
+    fn draw(&mut self) {
+        let Some((text, since)) = self.status.as_ref().filter(|_| self.live) else {
+            return;
+        };
+        let line = self.view.status(text, since.elapsed());
+        let width = usize::from(self.term.size().1).saturating_sub(1);
+        let _ = self
+            .term
+            .write_str(&console::truncate_str(&line, width, "…"));
+        self.drawn = true;
+    }
 }
 
 #[derive(Default)]
-struct Bars {
-    phase: Option<ProgressBar>,
-    aggregate: Option<ProgressBar>,
-    children: HashMap<String, ProgressBar>,
+struct Resolve {
+    started: Option<Instant>,
+    planned: usize,
+    done: usize,
+    active: BTreeMap<String, (Vec<String>, Instant)>,
+    finished: Vec<(String, Fetched, Duration)>,
 }
 
-/// Draws live bars for the resolve and apply phases and captures the summary.
-///
-/// Only those two: hooks and both stdin prompts inherit this process's stderr,
-/// and all of them run outside that window.
-pub(super) struct TtySink {
-    multi: MultiProgress,
-    bars: Mutex<Bars>,
-    summary: Mutex<Option<SyncSummary>>,
-    planned_artifacts: Mutex<Option<u64>>,
+#[derive(Default)]
+struct Deploy {
+    started: Option<Instant>,
+    planned: usize,
+    done: usize,
+    targets: BTreeMap<String, TargetOutcome>,
+    reported: bool,
 }
 
-impl TtySink {
-    pub(super) fn new(mode: ProgressMode) -> Self {
-        let multi = MultiProgress::new();
-        if mode == ProgressMode::Quiet {
-            multi.set_draw_target(ProgressDrawTarget::hidden());
-        }
-        Self {
-            multi,
-            bars: Mutex::new(Bars::default()),
-            summary: Mutex::new(None),
-            planned_artifacts: Mutex::new(None),
-        }
+#[derive(Default)]
+struct Run {
+    phase: Option<(Phase, Instant)>,
+    section: Option<&'static str>,
+    resolve: Resolve,
+    deploy: Deploy,
+    summary: Option<SyncSummary>,
+}
+
+/// Nothing else may write to the terminal while the status line is drawn.
+pub(super) struct HumanSink {
+    view: SyncView,
+    screen: Arc<Mutex<Screen>>,
+    run: Mutex<Run>,
+    stop: Arc<AtomicBool>,
+    ticker: Option<JoinHandle<()>>,
+}
+
+impl HumanSink {
+    pub(super) fn new(mode: ProgressMode, context: RunContext) -> Self {
+        let live = mode == ProgressMode::Live;
+        let view = SyncView::new(Palette::stderr(), context);
+        let screen = Arc::new(Mutex::new(Screen {
+            live,
+            term: Term::stderr(),
+            view: view.clone(),
+            status: None,
+            drawn: false,
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let ticker = live.then(|| {
+            let screen = Arc::clone(&screen);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(TICK);
+                    let mut screen = screen.lock().expect("screen poisoned");
+                    if screen.status.is_some() {
+                        screen.redraw();
+                    }
+                }
+            })
+        });
+        let sink = Self {
+            view,
+            screen,
+            run: Mutex::new(Run::default()),
+            stop,
+            ticker,
+        };
+        sink.print(&sink.view.header());
+        sink
     }
 
     pub(super) fn summary(&self) -> Option<SyncSummary> {
-        self.summary.lock().expect("sink poisoned").clone()
+        self.run().summary.clone()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Bars> {
-        self.bars.lock().expect("sink poisoned")
+    fn run(&self) -> MutexGuard<'_, Run> {
+        self.run.lock().expect("sink poisoned")
     }
 
-    fn open_phase(&self, label: &str) {
-        let bar = self.multi.add(ProgressBar::new_spinner());
-        bar.set_style(phase_style());
-        bar.set_prefix(label.to_owned());
-        bar.enable_steady_tick(TICK);
-        self.lock().phase = Some(bar);
+    fn screen(&self) -> MutexGuard<'_, Screen> {
+        self.screen.lock().expect("screen poisoned")
     }
 
-    fn open_aggregate(&self, label: &str, len: u64) {
-        let bar = self.multi.add(ProgressBar::new(len));
-        bar.set_style(aggregate_style());
-        bar.set_prefix(label.to_owned());
-        bar.enable_steady_tick(TICK);
-        self.lock().aggregate = Some(bar);
+    fn print(&self, text: &str) {
+        self.screen().print(text);
     }
 
-    fn advance(&self, message: &str) {
-        if let Some(bar) = self.lock().aggregate.as_ref() {
-            bar.inc(1);
-            bar.set_message(message.to_owned());
+    fn print_in(&self, section: &'static str, text: &str) {
+        let entered = {
+            let mut run = self.run();
+            let entered = run.section != Some(section);
+            run.section = Some(section);
+            entered
+        };
+        if entered {
+            self.print(&self.view.section(section));
         }
+        self.print(text);
     }
-}
 
-fn artifact_label(change: &AppliedChange) -> String {
-    let (verb, source, artifact) = match change {
-        AppliedChange::Deployed {
-            source, artifact, ..
-        } => ("+", source, artifact),
-        AppliedChange::Overwritten {
-            source, artifact, ..
-        }
-        | AppliedChange::OverlayRewritten {
-            source, artifact, ..
-        } => ("~", source, artifact),
-        AppliedChange::Ejected {
-            source, artifact, ..
-        } => ("=", source, artifact),
-        AppliedChange::Removed {
-            source, artifact, ..
-        } => ("-", source, artifact),
-    };
-    format!("{verb} {source}/{artifact}")
-}
-
-impl ProgressSink for TtySink {
-    fn phase_started(&self, phase: Phase) {
+    fn phase_status(&self) {
+        let phase = self.run().phase;
         match phase {
-            Phase::Resolve => {}
-            Phase::Apply => {
-                let len = self.planned_artifacts.lock().expect("sink poisoned").take();
-                self.open_aggregate("Deploying", len.unwrap_or(0));
-            }
-            Phase::Build => self.open_phase("Building"),
-            Phase::Compose => self.open_phase("Composing"),
-            Phase::Project => self.open_phase("Projecting"),
-            Phase::Observe => self.open_phase("Checking"),
-            Phase::Prune => self.open_phase("Pruning"),
-            Phase::Hooks => self.open_phase("Hooks"),
+            Some((phase, since)) => self
+                .screen()
+                .set_status(render::status_for_phase(phase).to_owned(), since),
+            None => self.screen().clear_status(),
         }
     }
 
-    fn phase_finished(&self, _phase: Phase) {
-        let mut bars = self.lock();
-        if let Some(bar) = bars.phase.take() {
-            bar.finish_and_clear();
+    fn resolve_status(&self, run: &Run) {
+        let resolve = &run.resolve;
+        let active: Vec<&str> = resolve
+            .active
+            .values()
+            .flat_map(|(sources, _)| sources)
+            .map(|source| render::source_name(source))
+            .collect();
+        let text = render::status_for_resolve(resolve.done, resolve.planned, &active);
+        let since = resolve.started.unwrap_or_else(Instant::now);
+        self.screen().set_status(text, since);
+    }
+
+    fn deploy_status(&self, run: &Run, current: &str) {
+        let deploy = &run.deploy;
+        let text = render::status_for_deploy(deploy.done, deploy.planned, current);
+        let since = deploy.started.unwrap_or_else(Instant::now);
+        self.screen().set_status(text, since);
+    }
+
+    fn report_sources(&self) {
+        let finished = std::mem::take(&mut self.run().resolve.finished);
+        if finished.is_empty() {
+            return;
         }
-        if let Some(bar) = bars.aggregate.take() {
-            bar.finish_and_clear();
+        let (cached, notable): (Vec<_>, Vec<_>) = finished
+            .into_iter()
+            .partition(|(_, how, _)| *how == Fetched::Cached);
+        let mut lines: Vec<String> = notable
+            .iter()
+            .map(|(key, how, elapsed)| self.view.fetched(key, *how, *elapsed))
+            .collect();
+        if cached.len() > CACHED_LISTED {
+            let keys: Vec<String> = cached.into_iter().map(|(key, _, _)| key).collect();
+            lines.push(self.view.cached_summary(&keys));
+        } else {
+            lines.extend(
+                cached
+                    .iter()
+                    .map(|(key, how, elapsed)| self.view.fetched(key, *how, *elapsed)),
+            );
         }
-        for (_, bar) in bars.children.drain() {
-            bar.finish_and_clear();
+        self.print_in("Sources", &lines.join("\n"));
+    }
+
+    fn report_targets(&self) {
+        let text = {
+            let mut run = self.run();
+            let deploy = &mut run.deploy;
+            if deploy.reported || deploy.started.is_none() {
+                return;
+            }
+            deploy.reported = true;
+            self.view.targets(&deploy.targets)
+        };
+        if !text.is_empty() {
+            self.print_in("Targets", &text);
+        }
+    }
+
+    fn record(&self, change: Change) {
+        let mut run = self.run();
+        let current = format!("{} {}", change.target, change.artifact);
+        run.deploy.done += 1;
+        run.deploy
+            .targets
+            .entry(change.target.clone())
+            .or_default()
+            .changes
+            .push(change);
+        self.deploy_status(&run, &current);
+    }
+}
+
+impl Drop for HumanSink {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(ticker) = self.ticker.take() {
+            let _ = ticker.join();
+        }
+        self.screen().clear_status();
+    }
+}
+
+impl ProgressSink for HumanSink {
+    fn phase_started(&self, phase: Phase) {
+        if phase == Phase::Hooks {
+            self.report_targets();
+        }
+        let now = Instant::now();
+        {
+            let mut run = self.run();
+            run.phase = Some((phase, now));
+            match phase {
+                Phase::Resolve => run.resolve.started = Some(now),
+                Phase::Apply => run.deploy.started = run.deploy.started.or(Some(now)),
+                _ => {}
+            }
+        }
+        self.phase_status();
+    }
+
+    fn phase_finished(&self, phase: Phase) {
+        self.run().phase = None;
+        self.screen().clear_status();
+        if phase == Phase::Resolve {
+            self.report_sources();
         }
     }
 
     fn resolve_planned(&self, groups: usize) {
-        self.open_aggregate("Resolving", groups as u64);
+        let mut run = self.run();
+        run.resolve.planned = groups;
+        self.resolve_status(&run);
     }
 
     fn fetch_started(&self, fetch: &FetchId) {
-        let bar = self.multi.add(ProgressBar::new_spinner());
-        bar.set_style(child_style());
-        bar.set_message(fetch.sources.join(", "));
-        bar.enable_steady_tick(TICK);
-        self.lock().children.insert(fetch.mirror.clone(), bar);
+        let mut run = self.run();
+        run.resolve.active.insert(
+            fetch.mirror.clone(),
+            (fetch.sources.clone(), Instant::now()),
+        );
+        self.resolve_status(&run);
     }
 
     fn fetch_finished(&self, fetch: &FetchId, outcome: FetchOutcome) {
-        if let Some(bar) = self.lock().children.remove(&fetch.mirror) {
-            bar.finish_and_clear();
-        }
-        let verb = match outcome {
-            FetchOutcome::Cached => "cached",
-            FetchOutcome::Fetched => "fetched",
-            FetchOutcome::Failed => "failed",
+        let mut run = self.run();
+        let resolve = &mut run.resolve;
+        let elapsed = resolve
+            .active
+            .remove(&fetch.mirror)
+            .map(|(_, started)| started.elapsed())
+            .unwrap_or_default();
+        resolve.done += 1;
+        let how = match outcome {
+            FetchOutcome::Cached => Fetched::Cached,
+            FetchOutcome::Fetched => Fetched::Network,
+            FetchOutcome::Failed => Fetched::Failed,
         };
-        self.advance(&format!("{verb} {}", fetch.sources.join(", ")));
+        resolve.finished.extend(
+            fetch
+                .sources
+                .iter()
+                .map(|source| (source.clone(), how, elapsed)),
+        );
+        self.resolve_status(&run);
     }
 
     fn artifacts_planned(&self, artifacts: usize) {
-        *self.planned_artifacts.lock().expect("sink poisoned") = Some(artifacts as u64);
+        self.run().deploy.planned = artifacts;
     }
 
     fn artifact_applied(&self, change: &AppliedChange) {
-        self.advance(&artifact_label(change));
+        self.record(Change::applied(change));
     }
 
     fn artifact_skipped(&self, change: &SkippedChange) {
-        let (source, artifact) = match change {
-            SkippedChange::Conflict {
-                source, artifact, ..
-            }
-            | SkippedChange::Failed {
-                source, artifact, ..
-            }
-            | SkippedChange::ReadonlyOverlayRewrite {
-                source, artifact, ..
-            } => (source, artifact),
-        };
-        self.advance(&format!("! {source}/{artifact}"));
+        self.record(Change::skipped(change));
     }
 
     fn artifact_unchanged(&self, artifact: &ArtifactId) {
-        self.advance(&format!("= {}/{}", artifact.source, artifact.artifact));
+        let mut run = self.run();
+        run.deploy.done += 1;
+        run.deploy
+            .targets
+            .entry(artifact.target.clone())
+            .or_default();
+        let current = format!("{} {}", artifact.target, artifact.artifact);
+        self.deploy_status(&run, &current);
     }
 
-    fn warning(&self, _warning: &SyncWarning) {}
+    fn command_started(&self, subject: &CommandSubject, command: &str) {
+        let text = render::status_for_command(subject, command);
+        self.screen().set_status(text, Instant::now());
+    }
+
+    fn command_finished(&self, run: &CommandRun) {
+        let section = match run.subject {
+            CommandSubject::Build { .. } => "Sources",
+            CommandSubject::Hook {
+                scope: HookScope::PreSync,
+            } => "Pre-sync hooks",
+            CommandSubject::Hook {
+                scope: HookScope::PreDeploy,
+            } => "Pre-deploy hooks",
+            CommandSubject::Hook { .. } => "Hooks",
+        };
+        self.print_in(section, &self.view.command_run(run));
+        self.phase_status();
+    }
+
+    fn suspend(&self, interact: &mut dyn FnMut()) {
+        let mut screen = self.screen();
+        screen.erase();
+        interact();
+        screen.draw();
+    }
+
+    fn warning(&self, warning: &SyncWarning) {
+        if matches!(warning, SyncWarning::BuildFailed { .. }) {
+            self.print(&self.view.build_kept());
+        }
+    }
 
     fn diagnostic(&self, severity: Severity, message: &str) {
-        let prefix = match severity {
-            Severity::Warn => "phora:",
-            Severity::Error => "phora: error:",
-        };
-        let _ = self.multi.println(format!("{prefix} {message}"));
+        self.print(&self.view.diagnostic(severity, message));
     }
 
     fn finished(&self, summary: &SyncSummary) {
-        *self.summary.lock().expect("sink poisoned") = Some(summary.clone());
+        self.report_targets();
+        self.screen().clear_status();
+        self.run().summary = Some(summary.clone());
     }
 
     fn aborted(&self, _error: &str) {
-        let _ = self.multi.clear();
+        self.screen().clear_status();
     }
 }
 
@@ -250,28 +433,13 @@ impl ProgressSink for TtySink {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_hidden_sink_draws_nothing() {
-        let sink = TtySink::new(ProgressMode::Quiet);
-        assert!(sink.multi.is_hidden());
-        sink.resolve_planned(3);
-        sink.fetch_started(&FetchId {
-            mirror: "m".to_owned(),
-            sources: vec!["editor".to_owned()],
-        });
-        sink.fetch_finished(
-            &FetchId {
-                mirror: "m".to_owned(),
-                sources: vec!["editor".to_owned()],
-            },
-            FetchOutcome::Cached,
-        );
-        sink.phase_finished(Phase::Resolve);
+    fn sink() -> HumanSink {
+        HumanSink::new(ProgressMode::Quiet, RunContext::default())
     }
 
     #[test]
     fn the_summary_survives_the_run() {
-        let sink = TtySink::new(ProgressMode::Quiet);
+        let sink = sink();
         assert!(sink.summary().is_none());
         sink.finished(&SyncSummary {
             deployed: 2,
@@ -281,33 +449,47 @@ mod tests {
     }
 
     #[test]
-    fn a_finished_phase_drops_every_bar() {
-        let sink = TtySink::new(ProgressMode::Quiet);
+    fn resolve_collects_each_source_with_its_outcome() {
+        let sink = sink();
+        sink.phase_started(Phase::Resolve);
         sink.resolve_planned(2);
-        sink.fetch_started(&FetchId {
-            mirror: "m".to_owned(),
-            sources: vec!["a".to_owned()],
-        });
-        assert_eq!(sink.lock().children.len(), 1);
-        sink.phase_finished(Phase::Resolve);
-        let bars = sink.lock();
-        assert!(bars.aggregate.is_none() && bars.phase.is_none() && bars.children.is_empty());
+        for (mirror, outcome) in [("a", FetchOutcome::Fetched), ("b", FetchOutcome::Cached)] {
+            let fetch = FetchId {
+                mirror: mirror.to_owned(),
+                sources: vec![mirror.to_owned()],
+            };
+            sink.fetch_started(&fetch);
+            sink.fetch_finished(&fetch, outcome);
+        }
+        let run = sink.run();
+        let outcomes: Vec<(&str, Fetched)> = run
+            .resolve
+            .finished
+            .iter()
+            .map(|(key, how, _)| (key.as_str(), *how))
+            .collect();
+        assert_eq!(outcomes, [("a", Fetched::Network), ("b", Fetched::Cached)]);
+        assert!(run.resolve.active.is_empty());
     }
 
     #[test]
-    fn artifact_labels_carry_the_change_verb() {
-        let deployed = AppliedChange::Deployed {
+    fn targets_are_reported_once_and_group_changes() {
+        let sink = sink();
+        sink.phase_started(Phase::Apply);
+        sink.artifact_applied(&AppliedChange::Deployed {
             target: "home".to_owned(),
             source: "editor".to_owned(),
             artifact: "init.lua".to_owned(),
-        };
-        assert_eq!(artifact_label(&deployed), "+ editor/init.lua");
-        let removed = AppliedChange::Removed {
-            target: "home".to_owned(),
-            source: "editor".to_owned(),
-            artifact: "old.lua".to_owned(),
-            reason: crate::sync::model::RemovalReason::Pruned,
-        };
-        assert_eq!(artifact_label(&removed), "- editor/old.lua");
+        });
+        sink.artifact_unchanged(&ArtifactId {
+            target: "bin".to_owned(),
+            source: "tools".to_owned(),
+            artifact: "fd".to_owned(),
+        });
+        sink.phase_started(Phase::Hooks);
+        let run = sink.run();
+        assert!(run.deploy.reported);
+        assert_eq!(run.deploy.targets["home"].changes.len(), 1);
+        assert!(run.deploy.targets["bin"].changes.is_empty());
     }
 }

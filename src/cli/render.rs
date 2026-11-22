@@ -7,7 +7,15 @@ use crate::config::transitive::Member;
 use crate::error::{Error, Result};
 use crate::projection::diagnostic::ProjectionWarning;
 use crate::sync::inspect::ArtifactState;
-use crate::sync::{HookOutcome, HookScope, HookStatus, SyncState, SyncSummary, SyncWarning};
+use crate::sync::{HookOutcome, HookScope, HookStatus, SyncState, SyncWarning};
+
+mod sync_view;
+
+pub(super) use sync_view::{
+    Change, Failures, Fetched, Palette, RunContext, SyncView, TargetOutcome, failure, notice,
+    outcome, source_name, status_for_command, status_for_deploy, status_for_phase,
+    status_for_resolve, warnings,
+};
 
 use super::query::{
     CheckMatchReport, ExplainBody, ExplainReport, OfferAttribution, OrphanListing, PreviewPlan,
@@ -167,52 +175,6 @@ fn content_filter_cause(attributes: bool, autocrlf: bool) -> &'static str {
     }
 }
 
-/// One line replacing the bare `sync complete`, on stdout.
-#[must_use]
-pub(super) fn format_sync_summary(summary: &SyncSummary) -> String {
-    let quiet = summary.deployed == 0
-        && summary.overwritten == 0
-        && summary.overlays_rewritten == 0
-        && summary.ejected == 0
-        && summary.removed == 0
-        && summary.conflicts == 0
-        && summary.failures == 0;
-    let elapsed = format_elapsed(summary.elapsed);
-    if quiet {
-        return format!(
-            "up to date: {} target{}, {} artifact{} unchanged in {elapsed}\n",
-            summary.targets,
-            plural(summary.targets),
-            summary.unchanged,
-            plural(summary.unchanged),
-        );
-    }
-    let mut parts = vec![format!("{} deployed", summary.deployed)];
-    let updated = summary.overwritten + summary.overlays_rewritten;
-    if updated > 0 {
-        parts.push(format!("{updated} updated"));
-    }
-    if summary.ejected > 0 {
-        parts.push(format!("{} ejected", summary.ejected));
-    }
-    if summary.removed > 0 {
-        parts.push(format!("{} pruned", summary.removed));
-    }
-    parts.push(format!("{} unchanged", summary.unchanged));
-    if summary.conflicts > 0 {
-        parts.push(format!("{} skipped", summary.conflicts));
-    }
-    if summary.failures > 0 {
-        parts.push(format!("{} failed", summary.failures));
-    }
-    format!(
-        "synced {} target{}: {} in {elapsed}\n",
-        summary.targets,
-        plural(summary.targets),
-        parts.join(", "),
-    )
-}
-
 fn plural(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
 }
@@ -223,103 +185,6 @@ fn format_elapsed(elapsed: std::time::Duration) -> String {
         format!("{}ms", elapsed.as_millis())
     } else {
         format!("{secs:.1}s")
-    }
-}
-
-#[cfg(test)]
-mod summary_tests {
-    use super::format_sync_summary;
-    use crate::sync::SyncSummary;
-    use std::time::Duration;
-
-    fn base() -> SyncSummary {
-        SyncSummary {
-            targets: 2,
-            elapsed: Duration::from_millis(1234),
-            ..SyncSummary::default()
-        }
-    }
-
-    #[test]
-    fn an_all_unchanged_run_reads_as_up_to_date() {
-        let summary = SyncSummary {
-            unchanged: 7,
-            ..base()
-        };
-        assert_eq!(
-            format_sync_summary(&summary),
-            "up to date: 2 targets, 7 artifacts unchanged in 1.2s\n"
-        );
-    }
-
-    #[test]
-    fn a_zero_target_run_stays_singularly_correct() {
-        let summary = SyncSummary {
-            targets: 0,
-            unchanged: 1,
-            ..base()
-        };
-        assert_eq!(
-            format_sync_summary(&summary),
-            "up to date: 0 targets, 1 artifact unchanged in 1.2s\n"
-        );
-    }
-
-    #[test]
-    fn a_changed_run_names_only_the_nonzero_buckets() {
-        let summary = SyncSummary {
-            deployed: 3,
-            unchanged: 4,
-            ..base()
-        };
-        assert_eq!(
-            format_sync_summary(&summary),
-            "synced 2 targets: 3 deployed, 4 unchanged in 1.2s\n"
-        );
-    }
-
-    #[test]
-    fn overlays_fold_into_updated_and_failures_surface() {
-        let summary = SyncSummary {
-            deployed: 1,
-            overwritten: 2,
-            overlays_rewritten: 1,
-            removed: 5,
-            conflicts: 1,
-            failures: 2,
-            unchanged: 0,
-            ..base()
-        };
-        assert_eq!(
-            format_sync_summary(&summary),
-            "synced 2 targets: 1 deployed, 3 updated, 5 pruned, 0 unchanged, 1 skipped, 2 failed \
-             in 1.2s\n"
-        );
-    }
-
-    #[test]
-    fn a_sub_second_run_reports_milliseconds() {
-        let summary = SyncSummary {
-            deployed: 1,
-            elapsed: Duration::from_millis(40),
-            ..base()
-        };
-        assert!(
-            format_sync_summary(&summary).ends_with("in 40ms\n"),
-            "{}",
-            format_sync_summary(&summary)
-        );
-    }
-
-    #[test]
-    fn the_summary_never_says_warning() {
-        let summary = SyncSummary {
-            deployed: 1,
-            failures: 1,
-            ..base()
-        };
-        let rendered = format_sync_summary(&summary).to_lowercase();
-        assert!(!rendered.contains("warning"), "{rendered}");
     }
 }
 

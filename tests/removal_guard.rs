@@ -74,7 +74,7 @@ impl Fixture {
 
 fn assert_kept_message(stderr: &str) {
     assert!(
-        stderr.contains("phora: keeping tropos:skills/keep/SKILL.md")
+        stderr.contains("keeping tropos:skills/keep/SKILL.md")
             && stderr.contains("use --force to delete it"),
         "the kept artifact must be reported with its remedy; got:\n{stderr}"
     );
@@ -158,7 +158,7 @@ fn prune_still_removes_a_clean_copy_and_link() {
             "{deploy}: an unchanged artifact is still pruned; stderr:\n{stderr}"
         );
         assert!(
-            !stderr.contains("phora: keeping"),
+            !stderr.contains("keeping "),
             "{deploy}: nothing is kept:\n{stderr}"
         );
     }

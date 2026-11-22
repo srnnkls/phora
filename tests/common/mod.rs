@@ -55,3 +55,44 @@ pub fn run_phora_ok(directory: &Path, args: &[&str]) -> String {
     assert!(output.status.success(), "phora {args:?} failed:\n{stderr}");
     stderr
 }
+
+/// Replace each space-led duration token (`90ms`, `1.0s`) and its padding with ` <T>`.
+pub fn scrub_durations(text: &str) -> String {
+    text.split_inclusive('\n').map(scrub_line).collect()
+}
+
+fn scrub_line(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(start) = rest.find(' ') {
+        out.push_str(&rest[..start]);
+        let after_spaces = rest[start..].trim_start_matches(' ');
+        if let Some(len) = duration_len(after_spaces) {
+            out.push_str(" <T>");
+            rest = &after_spaces[len..];
+        } else {
+            out.push(' ');
+            rest = &rest[start + 1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn duration_len(text: &str) -> Option<usize> {
+    let digits = text
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(text.len());
+    if digits == 0 || !text.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    let unit = ["ms", "s"]
+        .into_iter()
+        .find(|unit| text[digits..].starts_with(unit))?;
+    let end = digits + unit.len();
+    text[end..]
+        .chars()
+        .next()
+        .is_none_or(char::is_whitespace)
+        .then_some(end)
+}

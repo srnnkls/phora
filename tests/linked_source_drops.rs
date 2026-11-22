@@ -174,7 +174,7 @@ fn sync_removes_a_file_dropped_from_a_linked_offer() {
         fixture.records()
     );
     assert!(
-        stderr(&out).contains("tropos-fas:b.md"),
+        stderr(&out).contains("- b.md  no longer in the linked source's offer"),
         "sync reports the removal: {}",
         stderr(&out)
     );

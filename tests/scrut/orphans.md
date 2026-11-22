@@ -20,7 +20,17 @@ Source the helpers, isolate state, seed the config, and project it.
 
 ```scrut
 $ source "$TESTDIR"/_setup.sh && isolate_state && seed_config "$(make_git_source proj)" >/dev/null && phora sync 2>&1 | normalize
-sync complete
+phora sync  ~
+
+Sources
+  ✓ dotfiles  local <ROOT>/src-proj @ main  fetched <T>
+
+Targets
+  ✓ dotfiles → home  target-home  2 added
+    + editor
+    + lint
+
+✓ Synced 1 target · 2 added · <T>
 ```
 
 Both artifacts deploy to the `home` target and read clean.
@@ -92,9 +102,16 @@ after the completion line reverses these exact lines and fails this assertion.
 
 ```scrut
 $ phora sync 2>&1 | normalize
-phora: source `dotfiles` is bound by no target or build
-phora: 2 orphaned record(s) no longer in config — run `phora list --orphans` to inspect, `phora sync --prune` to remove
-sync complete
+phora sync  ~
+
+Sources
+  ✓ dotfiles  local <ROOT>/src-proj @ main  cached <T>
+
+Warnings
+  ! source `dotfiles` is bound by no target or build
+  ! 2 orphaned record(s) no longer in config — run `phora list --orphans` to inspect, `phora sync --prune` to remove
+
+✓ Up to date · no targets · <T>
 ```
 
 The orphaned files are still on disk before pruning.
@@ -113,7 +130,7 @@ lint-present
 
 ```scrut
 $ phora sync --prune 2>&1 | normalize | tail -n 1
-sync complete
+✓ Synced · 2 removed · <T>
 ```
 
 The orphaned files are physically gone.
@@ -153,12 +170,36 @@ released, and the deployed files stay in place. Linked sources keep their link.
 
 ```scrut
 $ mkdir -p dots/.config/doom && echo hi > dots/.config/doom/init.el && printf '[sources.doom]\npath = "./dots"\nroot = ".config/doom"\ndeploy = "link"\n\n[sources.lint]\npath = "./src-proj"\nbranch = "main"\nroot = "lint"\n\n[targets.doom]\npath = "restructured/doom"\nsources = ["doom"]\n\n[targets.lint]\npath = "restructured/lint"\nsources = ["lint"]\n' > phora.toml && phora sync 2>&1 | normalize
-sync complete
+phora sync  ~
+
+Sources
+  ✓ lint  local ./src-proj @ main  fetched <T>
+  ✓ doom  local ./dots             cached <T>
+
+Targets
+  ✓ doom → doom  restructured/doom  1 added
+    + init.el
+  ✓ lint → lint  restructured/lint  1 added
+    + rules.toml
+
+✓ Synced 2 targets · 2 added · <T>
 ```
 
 ```scrut
 $ printf '[sources.dots]\npath = "./dots"\nroot = ".config"\ndeploy = "link"\n\n[sources.proj]\npath = "./src-proj"\nbranch = "main"\n\n[targets.config]\npath = "restructured"\n\n[targets.config.sources.dots]\ncollapse = false\ntake = ["doom/"]\n\n[targets.config.sources.proj]\ncollapse = false\ntake = ["lint/"]\n' > phora.toml && phora sync 2>&1 | normalize
-sync complete
+phora sync  ~
+
+Sources
+  ✓ proj    local ./src-proj @ main  fetched <T>
+  ✓ dots    local ./dots             cached <T>
+
+Targets
+  ✓ dots → config  restructured  1 updated
+    ~ doom/init.el
+  ✓ proj → config  restructured  1 updated
+    ~ lint/rules.toml
+
+✓ Synced 1 target · 2 updated · <T>
 ```
 
 ```scrut
@@ -188,7 +229,18 @@ new owner adopts the clean copy instead of skipping it as foreign, and
 
 ```scrut
 $ printf '[sources.dots]\npath = "./dots"\nroot = ".config"\ndeploy = "link"\n\n[sources.lint-rules]\npath = "./src-proj"\nbranch = "main"\nroot = "lint"\n\n[targets.config]\npath = "restructured"\n\n[targets.config.sources.dots]\ncollapse = false\ntake = ["doom/"]\n\n[targets.lint]\npath = "restructured/lint"\nsources = ["lint-rules"]\n' > phora.toml && phora sync --prune 2>&1 | normalize
-sync complete
+phora sync  ~
+
+Sources
+  ✓ lint-rules  local ./src-proj @ main  fetched <T>
+  ✓ dots        local ./dots             cached <T>
+
+Targets
+  ✓ dots → config      restructured       up to date
+  ✓ lint-rules → lint  restructured/lint  1 updated
+    ~ rules.toml
+
+✓ Synced 2 targets · 1 updated · 1 unchanged · <T>
 ```
 
 ```scrut

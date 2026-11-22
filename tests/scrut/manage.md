@@ -18,7 +18,17 @@ Source the helpers, isolate state, write the seed config, and project it.
 
 ```scrut
 $ source "$TESTDIR"/_setup.sh && isolate_state && seed_config "$(make_git_source proj)" >/dev/null && phora sync 2>&1 | normalize
-sync complete
+phora sync  ~
+
+Sources
+  ✓ dotfiles  local <ROOT>/src-proj @ main  fetched <T>
+
+Targets
+  ✓ dotfiles → home  target-home  2 added
+    + editor
+    + lint
+
+✓ Synced 1 target · 2 added · <T>
 ```
 
 ## Eject — stop managing an artifact
@@ -84,7 +94,17 @@ foreign content. It reports the pin it moved.
 
 ```scrut
 $ phora update 2>&1 | normalize
-sync complete
+phora update  ~
+
+Sources
+  ✓ dotfiles  local <ROOT>/src-proj @ main  fetched <T>
+
+Targets
+  ✓ dotfiles → home  target-home  2 updated
+    ~ editor
+    ~ lint
+
+✓ Synced 1 target · 2 updated · <T>
 phora: updated dotfiles: main (ca94c83b) → main (7541e58d)
 ```
 

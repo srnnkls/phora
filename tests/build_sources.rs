@@ -270,7 +270,12 @@ fn a_failed_rebuild_keeps_the_previous_output_and_retries() {
     fixture.update_package();
     write(&fixture.project.join("fail-build"), "");
     let stderr = fixture.fails(&["update", "tropos"]);
-    assert!(stderr.contains("build `henia` failed"), "{stderr}");
+    assert!(
+        stderr.contains("✗ henia")
+            && stderr.contains("    kept the previous output")
+            && stderr.contains("✗ 1 build failed · everything else is synced"),
+        "{stderr}"
+    );
     assert_eq!(
         fixture.read("home/.claude/skills/code/SKILL.md"),
         "skill v1\n"

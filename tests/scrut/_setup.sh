@@ -34,7 +34,8 @@ isolate_state() {
 # macOS canonicalizes /var -> /private/var, so `phora add` emits the /private
 # form while `target add` echoes the raw $PWD; collapse both to <ROOT>.
 normalize() {
-	sed -e "s#/private${PWD}#<ROOT>#g" -e "s#${PWD}#<ROOT>#g"
+	sed -e "s#/private${PWD}#<ROOT>#g" -e "s#${PWD}#<ROOT>#g" |
+		sed -E 's/ +[0-9]+(\.[0-9]+)?m?s( |$)/ <T>\2/g'
 }
 
 make_git_source() {

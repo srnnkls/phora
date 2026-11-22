@@ -12,8 +12,8 @@ config or state. Each scenario `cd`s into its own subdirectory and re-isolates,
 giving it a private `HOME`/state. Hooks leave observable artifacts (a log file
 under `$HOME`) so their effect — and ordering against deploy — is asserted
 directly. Output is piped through `normalize`, which collapses the tempdir prefix
-to `<ROOT>`; the report prints the hook command's literal `$HOME` text (it is a
-format string, not a shell), so it stays byte-stable.
+to `<ROOT>` and every duration to `<T>`; a hook line prints the command's literal
+`$HOME` text (it is a format string, not a shell), so it stays byte-stable.
 
 ## Setup
 
@@ -28,12 +28,24 @@ ready
 
 A target carries an `on_change` hook that appends the *deployed* `editor/init.lua`
 to `$HOME/hook.log`. The first sync deploys the included subtrees, then runs the
-hook once; the report names it with its `on_change` scope and `ok` status.
+hook once; its line names the `on_change` scope and how long it ran.
 
 ```scrut
 $ mkdir -p s1 && cd s1 && isolate_state && seed_config_with_hooks "$(make_git_source proj)" >/dev/null && phora sync 2>&1 | normalize
-hook home#cat "$HOME/target-home/editor/init.lua" >> "$HOME/hook.log"#sh -c [on_change] `cat "$HOME/target-home/editor/init.lua" >> "$HOME/hook.log"` ok
-sync complete
+phora sync  ~
+
+Sources
+  ✓ dotfiles  local <ROOT>/src-proj @ main  fetched <T>
+
+Targets
+  ✓ dotfiles → home  target-home  2 added
+    + editor
+    + lint
+
+Hooks
+  ✓ on_change   cat "$HOME/target-home/editor/init.lua" >> "$HOME/hook.log" <T>
+
+✓ Synced 1 target · 2 added · <T>
 ```
 
 The log holds the deployed file's contents — proof the file landed *before* the
@@ -60,7 +72,15 @@ and the log is unchanged.
 
 ```scrut
 $ phora sync 2>&1 | normalize
-sync complete
+phora sync  ~
+
+Sources
+  ✓ dotfiles  local <ROOT>/src-proj @ main  cached <T>
+
+Targets
+  ✓ dotfiles → home  target-home  up to date
+
+✓ Up to date · 1 target · 2 unchanged · <T>
 ```
 
 ```scrut
@@ -80,10 +100,21 @@ seeded
 ```
 
 ```scrut
-$ phora sync 2>&1
-hook home#test -f "$HOME/allow" && echo ran >> "$HOME/hook.log"#sh -c [on_change] `test -f "$HOME/allow" && echo ran >> "$HOME/hook.log"` failed
-phora: one or more hooks failed
-[1]
+$ { phora sync 2>&1; echo "exit $?"; } | normalize
+phora sync  ~
+
+Sources
+  ✓ dotfiles  local <ROOT>/src-proj @ main  fetched <T>
+
+Targets
+  ✓ dotfiles → home  target-home  1 added
+    + editor
+
+Hooks
+  ✗ on_change   test -f "$HOME/allow" && echo ran >> "$HOME/hook.log"  failed <T>
+
+✗ 1 hook failed · everything else is synced
+exit 1
 ```
 
 The files are deployed despite the failed hook.
@@ -98,8 +129,18 @@ hook even though no upstream content changed.
 
 ```scrut
 $ touch "$HOME/allow" && phora sync 2>&1 | normalize
-hook home#test -f "$HOME/allow" && echo ran >> "$HOME/hook.log"#sh -c [on_change] `test -f "$HOME/allow" && echo ran >> "$HOME/hook.log"` ok
-sync complete
+phora sync  ~
+
+Sources
+  ✓ dotfiles  local <ROOT>/src-proj @ main  cached <T>
+
+Targets
+  ✓ dotfiles → home  target-home  up to date
+
+Hooks
+  ✓ on_change   test -f "$HOME/allow" && echo ran >> "$HOME/hook.log" <T>
+
+✓ Up to date · 1 target · 1 unchanged · <T>
 ```
 
 ```scrut
@@ -111,7 +152,15 @@ Now that the success is recorded, a further no-op sync does not re-fire.
 
 ```scrut
 $ phora sync 2>&1 | normalize
-sync complete
+phora sync  ~
+
+Sources
+  ✓ dotfiles  local <ROOT>/src-proj @ main  cached <T>
+
+Targets
+  ✓ dotfiles → home  target-home  up to date
+
+✓ Up to date · 1 target · 1 unchanged · <T>
 ```
 
 ```scrut
@@ -126,7 +175,17 @@ is written.
 
 ```scrut
 $ cd "$ROOT" && mkdir -p s3 && cd s3 && isolate_state && seed_config_with_hooks "$(make_git_source proj)" >/dev/null && phora sync --no-hooks 2>&1 | normalize
-sync complete
+phora sync  ~
+
+Sources
+  ✓ dotfiles  local <ROOT>/src-proj @ main  fetched <T>
+
+Targets
+  ✓ dotfiles → home  target-home  2 added
+    + editor
+    + lint
+
+✓ Synced 1 target · 2 added · <T>
 ```
 
 ```scrut
@@ -154,8 +213,19 @@ Syncing runs only the consumer's global `post_sync` hook.
 
 ```scrut
 $ phora sync 2>&1 | normalize
-hook post_sync#echo post >> "$HOME/post.log"#sh -c [post_sync] `echo post >> "$HOME/post.log"` ok
-sync complete
+phora sync  ~
+
+Sources
+  ✓ dotfiles  local <ROOT>/src-evil @ main  fetched <T>
+
+Targets
+  ✓ dotfiles → home  target-home  1 added
+    + payload
+
+Hooks
+  ✓ post_sync   echo post >> "$HOME/post.log" <T>
+
+✓ Synced 1 target · 1 added · <T>
 ```
 
 The source tree's `phora.toml` lands as ordinary inert content.
@@ -184,8 +254,18 @@ A second sync changes no content, yet the global `post_sync` (default
 
 ```scrut
 $ phora sync 2>&1 | normalize
-hook post_sync#echo post >> "$HOME/post.log"#sh -c [post_sync] `echo post >> "$HOME/post.log"` ok
-sync complete
+phora sync  ~
+
+Sources
+  ✓ dotfiles  local <ROOT>/src-evil @ main  cached <T>
+
+Targets
+  ✓ dotfiles → home  target-home  up to date
+
+Hooks
+  ✓ post_sync   echo post >> "$HOME/post.log" <T>
+
+✓ Up to date · 1 target · 1 unchanged · <T>
 ```
 
 ```scrut
@@ -197,7 +277,7 @@ post
 ## A failing pre_sync hook aborts the whole sync before any file deploys
 
 A global `pre_sync` hook that exits non-zero must gate the entire sync: the failure
-is reported with its `[pre_sync]` scope, the sync exits non-zero, and NO target file
+is reported with its `pre_sync` scope, the sync exits non-zero, and NO target file
 is deployed — pre_sync runs after fetch but before the deploy loop.
 
 ```scrut
@@ -205,11 +285,17 @@ $ cd "$ROOT" && mkdir -p p1 && cd p1 && isolate_state && seed_config_failing_pre
 seeded
 ```
 
-The pre_sync failure is reported with the `[pre_sync]` scope and `failed` status.
+The pre_sync failure is reported with its scope, and the closing line says nothing was
+deployed.
 
 ```scrut
-$ phora sync 2>&1 | normalize | grep -F '[pre_sync]'
-hook pre_sync#exit 1#sh -c [pre_sync] `exit 1` failed
+$ phora sync 2>&1 | normalize
+phora sync  ~
+
+Pre-sync hooks
+  ✗ pre_sync    exit 1  failed <T>
+
+✗ 1 hook failed · nothing was deployed
 ```
 
 The sync exits non-zero.
@@ -229,12 +315,23 @@ absent
 ## A passing pre_sync runs before deploy and sees PHORA_TARGETS
 
 A global `pre_sync` hook records its `PHORA_TARGETS` env, then the sync proceeds to
-deploy. The report names the hook with its `pre_sync` scope and `ok` status.
+deploy. Its line names the hook's `pre_sync` scope and how long it ran.
 
 ```scrut
 $ cd "$ROOT" && mkdir -p p2 && cd p2 && isolate_state && seed_config_pre_sync "$(make_git_source proj)" && phora sync 2>&1 | normalize
-hook pre_sync#echo "$PHORA_TARGETS" > "$HOME/pre.log"#sh -c [pre_sync] `echo "$PHORA_TARGETS" > "$HOME/pre.log"` ok
-sync complete
+phora sync  ~
+
+Pre-sync hooks
+  ✓ pre_sync    echo "$PHORA_TARGETS" > "$HOME/pre.log" <T>
+
+Sources
+  ✓ dotfiles  local <ROOT>/src-proj @ main  fetched <T>
+
+Targets
+  ✓ dotfiles → home  target-home  1 added
+    + editor
+
+✓ Synced 1 target · 1 added · <T>
 ```
 
 The deploy ran after the passing gate.
@@ -258,7 +355,16 @@ gate report appears.
 
 ```scrut
 $ cd "$ROOT" && mkdir -p p3 && cd p3 && isolate_state && seed_config_pre_sync "$(make_git_source proj)" && phora sync --no-hooks 2>&1 | normalize
-sync complete
+phora sync  ~
+
+Sources
+  ✓ dotfiles  local <ROOT>/src-proj @ main  fetched <T>
+
+Targets
+  ✓ dotfiles → home  target-home  1 added
+    + editor
+
+✓ Synced 1 target · 1 added · <T>
 ```
 
 ```scrut
@@ -280,8 +386,19 @@ command, and the two identical entries dedupe to a single line.
 
 ```scrut
 $ cd "$ROOT" && mkdir -p s5 && cd s5 && isolate_state && seed_config_exec_hook "$(make_git_source proj)" && phora sync 2>&1 | normalize
-hook home#touch exec_ran_$HOME#exec [on_change] `touch exec_ran_$HOME` ok
-sync complete
+phora sync  ~
+
+Sources
+  ✓ dotfiles  local <ROOT>/src-proj @ main  fetched <T>
+
+Targets
+  ✓ dotfiles → home  target-home  1 added
+    + editor
+
+Hooks
+  ✓ on_change   touch exec_ran_$HOME <T>
+
+✓ Synced 1 target · 1 added · <T>
 ```
 
 No shell ran, so the `$HOME` token was not expanded — the file is named verbatim.
@@ -295,11 +412,11 @@ verbatim
 
 A target's `pre_deploy` hook records `PHORA_TARGET` and `PHORA_TARGET_PATH`, then probes
 whether the target file already exists. The hook fires *before* that target's deploy, so the
-probe sees the file absent; the report names the hook with its `pre_deploy` scope and `ok`.
+probe sees the file absent; its line names the hook's `pre_deploy` scope.
 
 ```scrut
-$ cd "$ROOT" && mkdir -p d1 && cd d1 && isolate_state && seed_config_pre_deploy_pass "$(make_git_source proj)" && phora sync 2>&1 | normalize | grep -F '[pre_deploy]'
-hook * [pre_deploy] * ok (glob)
+$ cd "$ROOT" && mkdir -p d1 && cd d1 && isolate_state && seed_config_pre_deploy_pass "$(make_git_source proj)" && phora sync 2>&1 | normalize | grep -F 'pre_deploy'
+  ✓ pre_deploy  echo "$PHORA_TARGET $PHORA_TARGET_PATH" > * <T> (glob)
 ```
 
 `PHORA_TARGET` was the deploying target's name.
@@ -335,7 +452,7 @@ deployed
 
 Two targets share one source. Every target's `pre_deploy` gate runs before any target mutates,
 and `zzz`'s exits non-zero under the default `abort`. The gate halts the entire sync before the
-first deploy: neither `aaa` nor `zzz` deploys, the failure renders with `[pre_deploy]`, and the
+first deploy: neither `aaa` nor `zzz` deploys, the failure names its `pre_deploy` scope, and the
 global `post_sync` never runs. Nothing is rolled back, because nothing was applied.
 
 ```scrut
@@ -343,11 +460,13 @@ $ cd "$ROOT" && mkdir -p d2 && cd d2 && isolate_state && seed_config_pre_deploy_
 seeded
 ```
 
-The pre_deploy failure is reported with the `[pre_deploy]` scope and `failed` status.
+The pre_deploy failure is reported with its scope, and the closing line says nothing was
+deployed.
 
 ```scrut
-$ phora sync 2>&1 | normalize | grep -F '[pre_deploy]'
-hook * [pre_deploy] * failed (glob)
+$ phora sync 2>&1 | normalize | grep -E 'pre_deploy|^✗'
+  ✗ pre_deploy  exit 1 * failed <T> (glob)
+✗ 1 hook failed · nothing was deployed
 ```
 
 The sync exits non-zero.
@@ -390,11 +509,12 @@ $ cd "$ROOT" && mkdir -p d3 && cd d3 && isolate_state && seed_config_pre_deploy_
 seeded
 ```
 
-The skip is reported with the `[pre_deploy]` scope and `failed` status.
+The skip is reported with its scope, and the closing line says the rest synced.
 
 ```scrut
-$ phora sync 2>&1 | normalize | grep -F '[pre_deploy]'
-hook * [pre_deploy] * failed (glob)
+$ phora sync 2>&1 | normalize | grep -E 'pre_deploy|^✗'
+  ✗ pre_deploy  exit 1 * failed <T> (glob)
+✗ 1 hook failed · everything else is synced
 ```
 
 The other target `aaa` deployed normally.
@@ -437,5 +557,5 @@ seeded
 
 ```scrut
 $ phora sync --prune 2>&1 | grep -F 'skipping removals'
-phora: skipping removals because some artifacts failed to deploy
+  ! skipping removals because some artifacts failed to deploy
 ```

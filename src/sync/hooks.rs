@@ -5,6 +5,7 @@ use std::process::Command;
 
 use crate::config::{Config, DEFAULT_SHELL_PREFIX, HookCommand, HookWhen, LayoutConfig};
 use crate::error::{Error, Result};
+use crate::sync::progress::{CommandSubject, ProgressSink};
 use crate::sync::request::{TrustPrompt, TrustRequest};
 use crate::sync::state::{ArtifactRecord, StateStore};
 
@@ -45,6 +46,7 @@ pub(super) fn dispatch_hooks(
     config: &Config,
     registry: &dyn StateStore,
     lockless: bool,
+    sink: &dyn ProgressSink,
 ) -> Result<Vec<HookOutcome>> {
     let mut outcomes = Vec::new();
 
@@ -76,6 +78,8 @@ pub(super) fn dispatch_hooks(
             let names = changed_names(&changed);
             let paths = changed_paths(&changed, &target_path, &layout);
             let status = run_hook(
+                sink,
+                HookScope::OnChange,
                 hook,
                 &[
                     ("PHORA_TARGET", target_name.as_str()),
@@ -100,7 +104,7 @@ pub(super) fn dispatch_hooks(
         && matches!(global.when, HookWhen::Always)
     {
         for hook in dedupe(post_sync) {
-            let status = run_hook(hook, &[])?;
+            let status = run_hook(sink, HookScope::PostSync, hook, &[])?;
             let (body, suffix) = hook_key(hook);
             outcomes.push(HookOutcome {
                 hook_id: format!("post_sync#{body}#{suffix}"),
@@ -120,13 +124,22 @@ pub(super) fn dispatch_hooks(
 /// # Errors
 ///
 /// Returns an error if a hook process fails to spawn.
-pub(super) fn dispatch_pre_sync(config: &Config, target_names: &str) -> Result<Vec<HookOutcome>> {
+pub(super) fn dispatch_pre_sync(
+    config: &Config,
+    target_names: &str,
+    sink: &dyn ProgressSink,
+) -> Result<Vec<HookOutcome>> {
     let Some(pre_sync) = config.hooks.as_ref().and_then(|g| g.pre_sync.as_ref()) else {
         return Ok(Vec::new());
     };
     let mut outcomes = Vec::new();
     for hook in dedupe(pre_sync) {
-        let status = run_hook(hook, &[("PHORA_TARGETS", target_names)])?;
+        let status = run_hook(
+            sink,
+            HookScope::PreSync,
+            hook,
+            &[("PHORA_TARGETS", target_names)],
+        )?;
         let (body, suffix) = hook_key(hook);
         outcomes.push(HookOutcome {
             hook_id: format!("pre_sync#{body}#{suffix}"),
@@ -148,6 +161,7 @@ pub(super) fn dispatch_pre_deploy(
     hooks: &crate::config::TargetHooks,
     target_name: &str,
     target_path: &std::path::Path,
+    sink: &dyn ProgressSink,
 ) -> Result<Vec<HookOutcome>> {
     let Some(pre_deploy) = hooks.pre_deploy.as_ref() else {
         return Ok(Vec::new());
@@ -156,6 +170,8 @@ pub(super) fn dispatch_pre_deploy(
     let mut outcomes = Vec::new();
     for hook in dedupe(pre_deploy) {
         let status = run_hook(
+            sink,
+            HookScope::PreDeploy,
             hook,
             &[("PHORA_TARGET", target_name), ("PHORA_TARGET_PATH", &path)],
         )?;
@@ -197,6 +213,7 @@ pub(super) fn dispatch_transitive_hooks(
     candidates: &[TransitiveHookRun<'_>],
     trusted: &BTreeSet<String>,
     prompt: &dyn TrustPrompt,
+    sink: &dyn ProgressSink,
 ) -> Result<(Vec<HookOutcome>, Vec<TransitiveApproval>)> {
     let mut outcomes = Vec::new();
     let mut approvals = Vec::new();
@@ -209,10 +226,13 @@ pub(super) fn dispatch_transitive_hooks(
         } else if let Some(&prior) = decided.get(candidate.preimage) {
             prior
         } else {
-            let answer = prompt.confirm(&TrustRequest {
-                dep_instance: candidate.dep_instance,
-                hook_id: candidate.hook_id,
-                command: candidate.command.display(),
+            let mut answer = false;
+            sink.suspend(&mut || {
+                answer = prompt.confirm(&TrustRequest {
+                    dep_instance: candidate.dep_instance,
+                    hook_id: candidate.hook_id,
+                    command: candidate.command.display(),
+                });
             });
             decided.insert(candidate.preimage, answer);
             answer
@@ -230,6 +250,8 @@ pub(super) fn dispatch_transitive_hooks(
             });
         }
         let status = run_hook(
+            sink,
+            HookScope::OnChange,
             candidate.command,
             &[("PHORA_TARGET", &candidate.target_path.to_string_lossy())],
         )?;
@@ -323,15 +345,24 @@ fn changed_paths(
 /// # Errors
 ///
 /// Returns an error if the hook shell is empty or the process fails to spawn.
-fn run_hook(hook: &HookCommand, env: &[(&str, &str)]) -> Result<HookStatus> {
+fn run_hook(
+    sink: &dyn ProgressSink,
+    scope: HookScope,
+    hook: &HookCommand,
+    env: &[(&str, &str)],
+) -> Result<HookStatus> {
     let mut command = command(hook)?;
     for (key, value) in env {
         command.env(key, value);
     }
 
-    let status = command
-        .status()
-        .map_err(|e| Error::Sync(format!("failed to run hook `{}`: {e}", hook.display())))?;
+    let status = crate::sync::child::run_captured(
+        sink,
+        CommandSubject::Hook { scope },
+        &hook.display(),
+        &mut command,
+    )
+    .map_err(|e| Error::Sync(format!("failed to run hook `{}`: {e}", hook.display())))?;
     Ok(if status.success() {
         HookStatus::Success
     } else {
@@ -422,9 +453,13 @@ mod transitive_trust_tests {
         let candidate = run(&cmd, target);
         let trusted = BTreeSet::new();
 
-        let (_outcomes, approvals) =
-            dispatch_transitive_hooks(&[candidate], &trusted, &CannedPrompt(true))
-                .expect("dispatch with a yes-answering prompt must succeed");
+        let (_outcomes, approvals) = dispatch_transitive_hooks(
+            &[candidate],
+            &trusted,
+            &CannedPrompt(true),
+            &crate::sync::progress::SilentSink,
+        )
+        .expect("dispatch with a yes-answering prompt must succeed");
 
         assert_eq!(
             approvals.len(),
@@ -460,9 +495,13 @@ mod transitive_trust_tests {
         let candidate = run(&cmd, target);
         let trusted = BTreeSet::new();
 
-        let (outcomes, approvals) =
-            dispatch_transitive_hooks(&[candidate], &trusted, &CannedPrompt(false))
-                .expect("dispatch with a no-answering prompt must succeed");
+        let (outcomes, approvals) = dispatch_transitive_hooks(
+            &[candidate],
+            &trusted,
+            &CannedPrompt(false),
+            &crate::sync::progress::SilentSink,
+        )
+        .expect("dispatch with a no-answering prompt must succeed");
 
         assert!(
             approvals.is_empty(),
@@ -513,8 +552,13 @@ mod transitive_trust_tests {
         let trusted = BTreeSet::new();
         let prompt = CountingPrompt(std::sync::atomic::AtomicUsize::new(0), true);
 
-        let (outcomes, approvals) = dispatch_transitive_hooks(&[a, b], &trusted, &prompt)
-            .expect("dispatch with two same-preimage candidates must succeed");
+        let (outcomes, approvals) = dispatch_transitive_hooks(
+            &[a, b],
+            &trusted,
+            &prompt,
+            &crate::sync::progress::SilentSink,
+        )
+        .expect("dispatch with two same-preimage candidates must succeed");
 
         assert_eq!(
             prompt.0.load(std::sync::atomic::Ordering::SeqCst),
@@ -554,8 +598,13 @@ mod transitive_trust_tests {
         let trusted = BTreeSet::new();
         let prompt = CountingPrompt(std::sync::atomic::AtomicUsize::new(0), false);
 
-        let (outcomes, approvals) = dispatch_transitive_hooks(&[a, b], &trusted, &prompt)
-            .expect("dispatch declining a shared preimage must succeed");
+        let (outcomes, approvals) = dispatch_transitive_hooks(
+            &[a, b],
+            &trusted,
+            &prompt,
+            &crate::sync::progress::SilentSink,
+        )
+        .expect("dispatch declining a shared preimage must succeed");
 
         assert_eq!(
             prompt.0.load(std::sync::atomic::Ordering::SeqCst),
@@ -577,8 +626,13 @@ mod transitive_trust_tests {
         let mut trusted = BTreeSet::new();
         trusted.insert("blake3:candidatepreimage".to_owned());
 
-        let (outcomes, approvals) = dispatch_transitive_hooks(&[candidate], &trusted, &NeverPrompt)
-            .expect("a pinned hook dispatches without error");
+        let (outcomes, approvals) = dispatch_transitive_hooks(
+            &[candidate],
+            &trusted,
+            &NeverPrompt,
+            &crate::sync::progress::SilentSink,
+        )
+        .expect("a pinned hook dispatches without error");
 
         assert_eq!(
             outcomes.len(),

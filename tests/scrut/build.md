@@ -15,7 +15,7 @@ $ cat > phora.toml <<'TOML'
 > [sources.output]
 > build = { inputs = ["input"], run = "test ! -e fail-build && cp -R \"$PHORA_INPUT/input/editor\" \"$PHORA_OUTPUT/\"", key = "cat version" }
 > [hooks]
-> post_sync = "test -f deployed/editor/init.lua && echo smoke-ok"
+> post_sync = "test -f deployed/editor/init.lua && echo smoke-ok > smoke.log"
 > [targets.output]
 > path = "deployed"
 > sources.output = { collapse = false }
@@ -28,7 +28,7 @@ $ phora sync > sync.log 2>&1 && test ! -L deployed/editor/init.lua && cat deploy
 ```
 
 ```scrut
-$ sed -n '/^smoke-ok$/p' sync.log
+$ cat smoke.log
 smoke-ok
 ```
 
@@ -40,8 +40,10 @@ $ touch fail-build && echo 2 > version && phora sync > failed.log 2>&1
 ```
 
 ```scrut
-$ grep -c 'build `output` failed' failed.log && cat deployed/editor/init.lua
-1
+$ grep -E '^  ✗ output|^    kept the previous output$|^✗' failed.log && cat deployed/editor/init.lua
+  ✗ output  build from input * failed * (glob)
+    kept the previous output
+✗ 1 build failed · everything else is synced
 -- init
 ```
 

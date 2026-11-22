@@ -35,7 +35,17 @@ offer*, the binding decides what is *taken*.
 
 ```scrut
 $ reset_deploy && seed_selection "$repo" "" 'take = ["editor/init.lua", { "lint/rules.toml" = "lint/local.toml" }]' && phora sync 2>&1 | normalize
-sync complete
+phora sync  ~
+
+Sources
+  ✓ dotfiles  local <ROOT>/src-proj @ main  fetched <T>
+
+Targets
+  ✓ dotfiles → home  target-home  2 added
+    + editor/init.lua
+    + lint/local.toml
+
+✓ Synced 1 target · 2 added · <T>
 ```
 
 `phora list` shows exactly the two taken leaves as deployed artifacts — the
@@ -65,7 +75,15 @@ no leaf, so the binding deploys no artifacts.
 
 ```scrut
 $ reset_deploy && seed_selection "$repo" 'include = ["editor", "lint"]' 'take = []' && phora sync 2>&1 | normalize
-sync complete
+phora sync  ~
+
+Sources
+  ✓ dotfiles  local <ROOT>/src-proj @ main  fetched <T>
+
+Targets
+  ✓ dotfiles → home  target-home  up to date
+
+✓ Up to date · 1 target · <T>
 ```
 
 `phora list` reports the target as empty.
@@ -105,7 +123,17 @@ and leaves its sibling in place — the prune is leaf-granular, never wholesale
 
 ```scrut
 $ reset_deploy && seed_selection "$repo" 'include = ["editor/init.lua", "lint/rules.toml"]' 'take = ["editor/init.lua", "lint/rules.toml"]' && phora sync 2>&1 | normalize
-sync complete
+phora sync  ~
+
+Sources
+  ✓ dotfiles  local <ROOT>/src-proj @ main  fetched <T>
+
+Targets
+  ✓ dotfiles → home  target-home  2 added
+    + editor
+    + lint
+
+✓ Synced 1 target · 2 added · <T>
 ```
 
 ```scrut
@@ -120,8 +148,16 @@ Narrow the take to keep only `editor/init.lua`, then prune. The now-unselected
 
 ```scrut
 $ seed_selection "$repo" 'include = ["editor/init.lua", "lint/rules.toml"]' 'take = ["editor/init.lua"]' && phora sync --prune 2>&1 | normalize
-phora: pruning orphaned dotfiles:lint
-sync complete
+phora sync  ~
+
+Sources
+  ✓ dotfiles  local <ROOT>/src-proj @ main  cached <T>
+
+Targets
+  ✓ dotfiles → home  target-home  1 removed
+    - lint
+
+✓ Synced 1 target · 1 removed · 1 unchanged · <T>
 ```
 
 ```scrut
@@ -146,6 +182,10 @@ literal `phora explain <target> <source> <path>` debug placeholder (SMR-063).
 
 ```scrut
 $ seed_selection "$repo" "" 'take = [{ "editor/init.lua" = "../escape.lua" }]' && phora sync 2>&1 | normalize
+phora sync  ~
+
+Sources
+  ✓ dotfiles  local <ROOT>/src-proj @ main  cached <T>
 error: sync error: selection: ../escape.lua — rename destination is not a portable relative path
 matched against: the deploy root
 remedy: use a forward-slashed relative path inside the deploy root
@@ -165,6 +205,10 @@ identically.
 
 ```scrut
 $ seed_selection "$repo" "" 'take = [{ "editor/init.lua" = "NUL" }]' && phora sync 2>&1 | normalize
+phora sync  ~
+
+Sources
+  ✓ dotfiles  local <ROOT>/src-proj @ main  cached <T>
 error: sync error: selection: NUL — rename destination is not a portable relative path
 matched against: the deploy root
 remedy: use a forward-slashed relative path inside the deploy root
@@ -204,6 +248,10 @@ leaf, and the kernel debug placeholder.
 
 ```scrut
 $ seed_selection "$repo" 'include = ["editor", "lint"]' 'take = ["editor/init.lus"]' && phora sync 2>&1 | normalize
+phora sync  ~
+
+Sources
+  ✓ dotfiles  local <ROOT>/src-proj @ main  cached <T>
 error: sync error: selection: editor/init.lus — not present in the offer; `take` may not widen the offer
 matched against: the offer set
 did you mean: editor/init.lua
@@ -219,7 +267,17 @@ leaf-pattern includes and the binding renames one leaf, collapses another.
 
 ```scrut
 $ reset_deploy && seed_selection "$repo" 'include = ["editor/*.lua", "lint/*.toml"]' 'take = ["editor/init.lua", { "lint/rules.toml" = "lint/local.toml" }]' && phora sync 2>&1 | normalize
-sync complete
+phora sync  ~
+
+Sources
+  ✓ dotfiles  local <ROOT>/src-proj @ main  fetched <T>
+
+Targets
+  ✓ dotfiles → home  target-home  2 added
+    + editor
+    + lint/local.toml
+
+✓ Synced 1 target · 2 added · <T>
 ```
 
 A renamed leaf is attributed to its include and shows its `src -> dest` mapping.

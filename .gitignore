@@ -12,3 +12,4 @@
 # multi-agent review artifacts
 .reviews/
 .peer/
+.issues/

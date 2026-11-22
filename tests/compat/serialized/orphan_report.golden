@@ -1,6 +1,13 @@
 exit: 0
 --- stdout ---
-sync complete
+â Up to date Â· no targets Â· <T>
 --- stderr ---
-phora: source `dotfiles` is bound by no target or build
-phora: 2 orphaned record(s) no longer in config â run `phora list --orphans` to inspect, `phora sync --prune` to remove
+phora sync  <CWD>
+
+Sources
+  â dotfiles  local <SRC> @ main  cached <T>
+
+Warnings
+  ! source `dotfiles` is bound by no target or build
+  ! 2 orphaned record(s) no longer in config â run `phora list --orphans` to inspect, `phora sync --prune` to remove
+

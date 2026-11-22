@@ -174,6 +174,11 @@ pub(super) fn change_key(change: &SyncChange) -> (String, String, String) {
             source,
             artifact,
         }
+        | SyncChange::Update {
+            target,
+            source,
+            artifact,
+        }
         | SyncChange::Overwrite {
             target,
             source,
@@ -461,7 +466,11 @@ fn applied_replacement(change: Option<&SyncChange>, outcome: Option<&ConflictOut
     change.is_none()
         || matches!(
             change,
-            Some(SyncChange::Deploy { .. } | SyncChange::Overwrite { .. })
+            Some(
+                SyncChange::Deploy { .. }
+                    | SyncChange::Update { .. }
+                    | SyncChange::Overwrite { .. }
+            )
         )
         || matches!(
             (change, outcome),
@@ -589,7 +598,10 @@ fn apply_reconciled(
     let writes = matches!(
         change,
         Some(
-            SyncChange::Deploy { .. } | SyncChange::Overwrite { .. } | SyncChange::Conflict { .. }
+            SyncChange::Deploy { .. }
+                | SyncChange::Update { .. }
+                | SyncChange::Overwrite { .. }
+                | SyncChange::Conflict { .. }
         )
     );
     if journal.refuses_writes() && writes {
@@ -626,9 +638,16 @@ fn apply_reconciled(
     };
 
     match change {
-        Some(SyncChange::Deploy { .. } | SyncChange::Overwrite { .. }) => {
+        Some(
+            SyncChange::Deploy { .. } | SyncChange::Update { .. } | SyncChange::Overwrite { .. },
+        ) => {
             let applied = match change {
                 Some(SyncChange::Overwrite { .. }) => AppliedChange::Overwritten {
+                    target: run.target_name.to_owned(),
+                    source: entry.identity.to_owned(),
+                    artifact: published_key.clone(),
+                },
+                Some(SyncChange::Update { .. }) => AppliedChange::Updated {
                     target: run.target_name.to_owned(),
                     source: entry.identity.to_owned(),
                     artifact: published_key.clone(),
@@ -2021,7 +2040,11 @@ mod mode_transition_conflict_tests {
             assert!(
                 matches!(
                     change,
-                    Some(SyncChange::Deploy { .. } | SyncChange::Overwrite { .. })
+                    Some(
+                        SyncChange::Deploy { .. }
+                            | SyncChange::Update { .. }
+                            | SyncChange::Overwrite { .. }
+                    )
                 ),
                 "a clean-like mode transition must proceed as non-conflicting deploy work; only \
                  Modified/Foreign destinations conflict (got {change:?})"

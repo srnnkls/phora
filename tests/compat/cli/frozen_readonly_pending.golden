@@ -1,4 +1,8 @@
 exit: 1
 --- stdout ---
 --- stderr ---
+phora sync  <CWD>
+
+Sources
+  ✓ dotfiles  local <SRC> @ main  cached <T>
 error: state root <XDG_STATE>/phora/projects/<PROJECT> is read-only: a frozen sync cannot write here

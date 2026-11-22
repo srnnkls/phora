@@ -312,6 +312,10 @@ impl Fixture {
             (self.target_path.to_string_lossy().into_owned(), "<TARGET>"),
             (self.home_path.to_string_lossy().into_owned(), "<HOME>"),
             (self.src_path.to_string_lossy().into_owned(), "<SRC>"),
+            (
+                format!("/private{}", self.cwd.path().to_string_lossy()),
+                "<CWD>",
+            ),
             (self.cwd.path().to_string_lossy().into_owned(), "<CWD>"),
         ] {
             s = s.replace(&needle, tag);
@@ -320,7 +324,7 @@ impl Fixture {
             s = s.replace(&project, "<PROJECT>");
         }
         s = s.replace(&self.mirror_key(), "<MIRROR>");
-        normalize_iso_timestamps(&s)
+        common::scrub_durations(&normalize_iso_timestamps(&s))
     }
 
     fn registry_dir(&self) -> PathBuf {

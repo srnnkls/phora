@@ -117,6 +117,11 @@ pub enum SyncChange {
         source: String,
         artifact: String,
     },
+    Update {
+        target: String,
+        source: String,
+        artifact: String,
+    },
     Overwrite {
         target: String,
         source: String,

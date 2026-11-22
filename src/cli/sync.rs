@@ -18,7 +18,7 @@ use crate::sync::{
 };
 
 use super::json::JsonSink;
-use super::progress::{ProgressMode, TtySink};
+use super::progress::{HumanSink, ProgressMode};
 use super::{
     CliOutcome, DropSources, TtyResolver, build_router, drop_sources, load_config,
     load_local_config, lock_project_registry,
@@ -55,6 +55,7 @@ pub(super) fn run_sync(
     let pins_before = drop
         .is_some()
         .then(|| collect_root_pins(base_lock.as_ref(), local_lock.as_ref()));
+    let command = if drop.is_some() { "update" } else { "sync" };
     if let Some(drop) = drop {
         drop_sources(base_lock.as_mut(), &drop);
         drop_sources(local_lock.as_mut(), &drop);
@@ -80,7 +81,11 @@ pub(super) fn run_sync(
     let interactive = std::io::stdin().is_terminal();
     let resolver = TtyResolver;
     let trust_prompt = super::TtyTrustPrompt;
-    let reporter = Reporter::select(json, no_progress);
+    let reporter = Reporter::select(
+        json,
+        no_progress,
+        super::render::RunContext::new(command, &effective, &cwd),
+    );
 
     let conflict_policy = if force {
         ConflictPolicy::Overwrite
@@ -188,37 +193,25 @@ fn stripped_hook_notice(stripped: usize, interactive: bool) -> Option<StrippedHo
 
 /// Machine output owns stdout under `--json`; human text never shares the stream.
 enum Reporter {
-    Tty { sink: Box<TtySink>, live: bool },
+    Human(Box<HumanSink>),
     Json(JsonSink),
 }
 
 impl Reporter {
-    fn select(json: bool, no_progress: bool) -> Self {
+    fn select(json: bool, no_progress: bool, context: super::render::RunContext) -> Self {
         if json {
             return Self::Json(JsonSink::new());
         }
-        let mode = ProgressMode::resolve(no_progress);
-        Self::Tty {
-            sink: Box::new(TtySink::new(mode)),
-            live: mode == ProgressMode::Live,
-        }
+        Self::Human(Box::new(HumanSink::new(
+            ProgressMode::resolve(no_progress),
+            context,
+        )))
     }
 
     fn sink(&self) -> &dyn crate::sync::ProgressSink {
         match self {
-            Self::Tty { sink, .. } => sink.as_ref(),
+            Self::Human(sink) => sink.as_ref(),
             Self::Json(sink) => sink,
-        }
-    }
-
-    fn is_json(&self) -> bool {
-        matches!(self, Self::Json(_))
-    }
-
-    fn summary(&self) -> Option<crate::sync::SyncSummary> {
-        match self {
-            Self::Tty { sink, live: true } => sink.summary(),
-            Self::Tty { live: false, .. } | Self::Json(_) => None,
         }
     }
 }
@@ -281,6 +274,14 @@ fn finish_sync(
             .ok_or_else(|| Error::Lock("sync completed without a base lock".to_owned()))?;
         write_locks(cwd, base_lock, out.locks.local.as_ref())?;
     }
+    match reporter {
+        Reporter::Json(_) => Ok(finish_json(out, interactive)),
+        Reporter::Human(sink) => Ok(finish_human(out, interactive, sink.summary())),
+    }
+}
+
+/// `--json` keeps stdout for records, so the run's prose goes to stderr.
+fn finish_json(out: &SyncReport, interactive: bool) -> CliOutcome {
     render_sync_warnings(out);
     render_applied_and_skipped(out);
     let report = super::render::render_hook_report(&out.hook_outcomes);
@@ -298,7 +299,7 @@ fn finish_sync(
         }
         eprintln!("{}", notice.message);
         if notice.fail {
-            return Ok(CliOutcome::Failure);
+            return CliOutcome::Failure;
         }
     }
     if out.status == crate::sync::SyncStatus::Failed {
@@ -313,30 +314,98 @@ fn finish_sync(
             .skipped
             .iter()
             .any(|skipped| matches!(skipped, SkippedChange::Failed { .. }));
-        let message = match (deploy_failures, hooks_failed) {
-            (true, true) => "phora: some artifacts failed to deploy and one or more hooks failed",
-            (true, false) => "phora: some artifacts failed to deploy",
-            (false, _) => "phora: one or more hooks failed",
-        };
-        eprintln!("{message}");
-        return Ok(CliOutcome::Failure);
-    }
-    if reporter.is_json() {
-        if !report.is_empty() {
-            eprint!("{report}");
-        }
-        return Ok(CliOutcome::Success);
+        let builds_failed = out
+            .warnings
+            .iter()
+            .any(|warning| matches!(warning, SyncWarning::BuildFailed { .. }));
+        let failures: Vec<&str> = [
+            (builds_failed, "one or more builds failed"),
+            (deploy_failures, "some artifacts failed to deploy"),
+            (hooks_failed, "one or more hooks failed"),
+        ]
+        .into_iter()
+        .filter_map(|(failed, what)| failed.then_some(what))
+        .collect();
+        eprintln!("phora: {}", failures.join(" and "));
+        return CliOutcome::Failure;
     }
     if !report.is_empty() {
-        print!("{report}");
+        eprint!("{report}");
     }
-    // `sync complete` is the pinned non-tty stdout contract (src/lib.rs); the
-    // richer summary is terminal decoration only.
-    match reporter.summary() {
-        Some(summary) => print!("{}", super::render::format_sync_summary(&summary)),
-        None => println!("sync complete"),
+    CliOutcome::Success
+}
+
+fn finish_human(
+    out: &SyncReport,
+    interactive: bool,
+    summary: Option<crate::sync::SyncSummary>,
+) -> CliOutcome {
+    let palette = super::render::Palette::stderr();
+    let mut block = super::render::warnings(palette, &out.warnings);
+    let stripped = out
+        .warnings
+        .iter()
+        .find_map(|warning| match warning {
+            SyncWarning::UntrustedTransitiveHooks { count } => Some(*count),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let stripped_fails = match stripped_hook_notice(stripped, interactive) {
+        Some(notice) => {
+            let line = super::render::notice(palette, &notice.message);
+            block = Some(match block {
+                Some(block) => format!("{block}\n{line}"),
+                None => format!("\nWarnings\n{line}"),
+            });
+            notice.fail
+        }
+        None => false,
+    };
+    if let Some(block) = block {
+        eprintln!("{block}");
     }
-    Ok(CliOutcome::Success)
+    let failures = super::render::Failures {
+        builds: out
+            .warnings
+            .iter()
+            .filter(|warning| matches!(warning, SyncWarning::BuildFailed { .. }))
+            .count(),
+        deploys: out
+            .skipped
+            .iter()
+            .filter(|skipped| matches!(skipped, SkippedChange::Failed { .. }))
+            .count(),
+        hooks: out
+            .hook_outcomes
+            .iter()
+            .filter(|o| o.status == crate::sync::HookStatus::Failure)
+            .count(),
+        aborted: aborted_before_deploy(out, summary.as_ref()),
+    };
+    if out.status == crate::sync::SyncStatus::Failed || stripped_fails {
+        eprintln!();
+        eprintln!("{}", super::render::failure(palette, failures));
+        return CliOutcome::Failure;
+    }
+    let summary = summary.unwrap_or_default();
+    eprintln!();
+    println!(
+        "{}",
+        super::render::outcome(super::render::Palette::stdout(), &summary)
+    );
+    CliOutcome::Success
+}
+
+/// A gate abort reports zero targets; a run that reaches deploy reports every configured one.
+fn aborted_before_deploy(out: &SyncReport, summary: Option<&crate::sync::SyncSummary>) -> bool {
+    out.hook_outcomes.iter().any(|hook| {
+        hook.status == crate::sync::HookStatus::Failure
+            && match hook.scope {
+                crate::sync::HookScope::PreSync => true,
+                crate::sync::HookScope::PreDeploy => summary.is_some_and(|s| s.targets == 0),
+                crate::sync::HookScope::OnChange | crate::sync::HookScope::PostSync => false,
+            }
+    })
 }
 
 fn render_sync_warnings(out: &SyncReport) {

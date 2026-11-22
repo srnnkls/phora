@@ -393,11 +393,14 @@ recorded, so a no-op sync runs no `on_change`; a hook that exits non-zero is not
 recorded, makes `phora sync` exit non-zero, leaves the deployed files in place,
 and re-fires on the next sync. `phora sync --no-hooks` deploys without running any hook.
 
-Each hook that ran is reported with its scope and status:
+Hook output is captured. Each hook that ran gets a row under `Hooks` with its
+scope and duration; a failed hook also shows its captured output below the row:
 
 ```
-hook neovim#nvim --headless +'Lazy! sync' +qa#sh -c [on_change] `nvim --headless +'Lazy! sync' +qa` ok
-sync complete
+Hooks
+  ✓ on_change   nvim --headless +'Lazy! sync' +qa    2.4s
+
+✓ Synced 1 target · 1 updated · 3.1s
 ```
 
 Trust boundary. Hooks come only from the consumer's config. A synced source

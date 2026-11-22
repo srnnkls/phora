@@ -5,7 +5,16 @@ pinned Git history in the deployed directory.
 
 ```scrut
 $ source "$TESTDIR"/_setup.sh && isolate_state && source="$(make_git_source history)" && target="$PWD/target-home" && mkdir -p "$target" && printf 'version = 1\n\n[sources.history]\npath = "%s"\nbranch = "main"\n\n[targets.home]\npath = "%s"\nlayout = "flat"\n\n[targets.home.sources.history]\nhistory = true\n' "$source" "$target" > phora.toml && phora sync 2>&1 | normalize
-sync complete
+phora sync  ~
+
+Sources
+  ✓ history  local <ROOT>/src-history @ main  fetched <T>
+
+Targets
+  ✓ history → home  target-home  1 added
+    + history
+
+✓ Synced 1 target · 1 added · <T>
 ```
 
 The deployed artifact is shown as history-enabled and clean.

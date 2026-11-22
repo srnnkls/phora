@@ -3,7 +3,7 @@ use std::process::{Command, Output};
 
 use tempfile::TempDir;
 
-const WARNING: &str = "phora: source `gestalt` is bound by no target or build";
+const WARNING: &str = "source `gestalt` is bound by no target or build";
 
 const BOUND: &str = "version = 1\n\n[sources.used]\npath = \"used\"\n\n\
      [targets.home]\npath = \"~/deploy\"\nsources = [\"used\"]\n";
@@ -65,7 +65,7 @@ fn project(config: &str, local: Option<&str>) -> TempDir {
 fn stderr_warns(out: &Output) -> bool {
     String::from_utf8_lossy(&out.stderr)
         .lines()
-        .any(|line| line == WARNING)
+        .any(|line| line == format!("phora: {WARNING}") || line == format!("  ! {WARNING}"))
 }
 
 #[test]
