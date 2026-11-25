@@ -104,6 +104,14 @@ fn deploy(target: &str, source: &str, artifact: &str) -> SyncChange {
     }
 }
 
+fn update(target: &str, source: &str, artifact: &str) -> SyncChange {
+    SyncChange::Update {
+        target: target.to_owned(),
+        source: source.to_owned(),
+        artifact: artifact.to_owned(),
+    }
+}
+
 fn overwrite(target: &str, source: &str, artifact: &str) -> SyncChange {
     SyncChange::Overwrite {
         target: target.to_owned(),
@@ -245,12 +253,12 @@ fn present_drift_rows() -> Vec<Row> {
             expect: Expect::NoOp,
         },
         Row {
-            name: "outdated→deploy",
+            name: "outdated→update",
             desired: true,
             obs: Obs::Outdated,
             force: false,
             prune: false,
-            expect: Expect::One(deploy(TARGET, SOURCE, ARTIFACT)),
+            expect: Expect::One(update(TARGET, SOURCE, ARTIFACT)),
         },
         Row {
             name: "modified-unforced→conflict-modified",

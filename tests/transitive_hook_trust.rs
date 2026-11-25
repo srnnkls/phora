@@ -585,8 +585,10 @@ fn pre_sync_abort_preserves_recorded_candidate_hooks() {
         "a failing global pre_sync gate must abort the sync with a non-zero exit; stderr: {stderr}"
     );
     assert!(
-        stderr.contains("[pre_sync]"),
-        "the abort must surface the failed pre_sync hook in its report; stderr: {stderr}"
+        stderr.contains("✗ pre_sync")
+            && stderr.contains("exit 1")
+            && stderr.contains("✗ 1 hook failed · nothing was deployed"),
+        "the abort must surface the failed pre_sync hook and say nothing deployed; stderr: {stderr}"
     );
 
     // KEY: the abort must NOT wipe the previously-recorded candidate from the persisted lock.

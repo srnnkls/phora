@@ -189,6 +189,11 @@ pub enum AppliedChange {
         source: String,
         artifact: String,
     },
+    Updated {
+        target: String,
+        source: String,
+        artifact: String,
+    },
     Overwritten {
         target: String,
         source: String,

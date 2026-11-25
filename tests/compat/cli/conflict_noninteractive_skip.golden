@@ -1,5 +1,17 @@
 exit: 0
 --- stdout ---
-sync complete
+✓ Synced 1 target · 1 added · 1 skipped · <T>
 --- stderr ---
-phora: skipping foreign content at <TARGET>/editor; use --force to overwrite
+phora sync  <CWD>
+
+Sources
+  ✓ dotfiles  local <SRC> @ main  fetched <T>
+
+Targets
+  ! dotfiles → home  ~/deploy  1 added · 1 skipped
+    ! editor  skipped, modified locally
+    + lint
+
+Warnings
+  ! skipping foreign content at <TARGET>/editor; use --force to overwrite
+

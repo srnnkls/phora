@@ -113,7 +113,7 @@ pub(super) fn run_preview(sel: &PreviewSelectors, json: bool) -> Result<()> {
             source: source.to_owned(),
         };
         if let Some(rendered) = super::render::format_sync_warning(&warning) {
-            eprintln!("{rendered}");
+            eprintln!("phora: {rendered}");
         }
     }
 

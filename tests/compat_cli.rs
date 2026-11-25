@@ -221,6 +221,18 @@ fn line_diff_announces_final_newline_only_drift() {
 }
 
 #[test]
+fn scrub_durations_replaces_only_timings() {
+    assert_eq!(
+        common::scrub_durations(
+            "  ✓ dotfiles  local x  fetched    90ms\n  ✓ home  built   12.3s\n\
+             ✓ Synced 1 target · 2 added · 4.5s\nin 3 sources, 12 steps, 4sec, 5s-ish\n"
+        ),
+        "  ✓ dotfiles  local x  fetched <T>\n  ✓ home  built <T>\n\
+         ✓ Synced 1 target · 2 added · <T>\nin 3 sources, 12 steps, 4sec, 5s-ish\n"
+    );
+}
+
+#[test]
 fn normalize_scrubs_only_fixture_roots_and_preserves_unrelated_hex() {
     let fx = build_fixture();
     fx.run(&["sync"]);
@@ -379,6 +391,10 @@ impl Fixture {
             (self.target_path.to_string_lossy().into_owned(), "<TARGET>"),
             (self.home_path.to_string_lossy().into_owned(), "<HOME>"),
             (self.src_path.to_string_lossy().into_owned(), "<SRC>"),
+            (
+                format!("/private{}", self.cwd.path().to_string_lossy()),
+                "<CWD>",
+            ),
             (self.cwd.path().to_string_lossy().into_owned(), "<CWD>"),
         ] {
             s = s.replace(&needle, tag);
@@ -386,7 +402,7 @@ impl Fixture {
         if let Some(project) = self.project_id() {
             s = s.replace(&project, "<PROJECT>");
         }
-        s
+        common::scrub_durations(&s)
     }
 }
 
@@ -501,7 +517,7 @@ fn pty_sync_command(fx: &Fixture) -> Command {
         .env("PHORA_PTY_WRAPPER", PTY_CHILD_WRAPPER);
 
     command.env("PHORA_PTY_BIN", env!("CARGO_BIN_EXE_phora"));
-    // The transcript pins `sync complete`; live bars would interleave draw frames.
+    // Transcripts pin finished-step lines; a live status line would interleave redraws.
     command.env("PHORA_NO_PROGRESS", "1");
     fx.configure(&mut command);
     command
@@ -558,40 +574,84 @@ fn sync_transcript_with_live_progress(fx: &Fixture) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+const STATUS_REDRAW: &str = "\r\u{1b}[2K";
+
+/// Visible text with SGR color sequences removed.
+fn strip_sgr(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.clone().next() == Some('[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn is_braille(c: char) -> bool {
+    ('\u{2800}'..='\u{28ff}').contains(&c)
+}
+
+/// The status-line frames: each one is drawn, then erased by the next `\r\x1b[2K`.
+fn status_frames(transcript: &str) -> Vec<String> {
+    transcript
+        .split(STATUS_REDRAW)
+        .filter_map(|chunk| chunk.rsplit('\n').next())
+        .map(strip_sgr)
+        .filter(|frame| frame.starts_with(is_braille))
+        .collect()
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn a_real_terminal_draws_progress_and_the_rich_summary() {
+fn a_real_terminal_draws_a_status_line_and_the_verdict() {
     let fx = build_fixture();
     let transcript = sync_transcript_with_live_progress(&fx);
 
     assert!(
-        transcript.contains("\u{1b}["),
-        "a real TTY must receive ANSI cursor control: {transcript:?}"
+        transcript.contains(STATUS_REDRAW),
+        "a real TTY must rewrite the status line in place: {transcript:?}"
     );
-    for label in ["Resolving", "Deploying"] {
+    for label in ["Resolving sources", "Deploying"] {
         assert!(
             transcript.contains(label),
-            "the {label} bar must reach a real terminal: {transcript:?}"
+            "the {label} status must reach a real terminal: {transcript:?}"
         );
     }
     assert!(
-        transcript.contains('━'),
-        "the bar must render with the heavy-line glyph: {transcript:?}"
+        !transcript.contains(['━', '╸']),
+        "the status line must draw no progress-bar glyphs: {transcript:?}"
     );
-
+    let frames = status_frames(&transcript);
     assert!(
-        transcript.contains("synced 1 target:"),
-        "a terminal run must end in the rich summary, not the plain line: {transcript:?}"
+        frames.iter().any(|frame| frame.contains("Deploying")),
+        "status frames must lead with the spinner: {transcript:?}"
     );
+    for frame in &frames {
+        assert!(
+            frame.chars().count() < 80,
+            "a status frame must fit the 80-column default terminal width: {frame:?}"
+        );
+    }
+    let visible = strip_sgr(&transcript);
     assert!(
-        !transcript.contains("sync complete"),
-        "the plain completion line is the non-tty contract only: {transcript:?}"
+        visible.contains("\nSources\r\n  ✓ dotfiles")
+            && visible.contains("\nTargets\r\n  ✓ dotfiles → home")
+            && visible.contains("✓ Synced 1 target · 2 added · "),
+        "a terminal run must keep its sections and end in the verdict: {visible:?}"
     );
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn no_progress_keeps_a_real_terminal_on_the_plain_contract() {
+fn no_progress_keeps_a_real_terminal_free_of_status_redraws() {
     let fx = build_fixture();
     let mut command = pty_sync_command(&fx);
     let out = command
@@ -600,12 +660,19 @@ fn no_progress_keeps_a_real_terminal_on_the_plain_contract() {
         .expect("installed `script` utility starts a PTY");
     let transcript = normalize_pty_crlf(&out.stdout);
     assert!(
-        transcript.contains("sync complete"),
-        "PHORA_NO_PROGRESS must restore the plain completion line: {transcript:?}"
+        !transcript.contains(STATUS_REDRAW) && !transcript.contains("Resolving sources"),
+        "PHORA_NO_PROGRESS must draw no status line: {transcript:?}"
     );
     assert!(
-        !transcript.contains("Resolving"),
-        "PHORA_NO_PROGRESS must draw no bars: {transcript:?}"
+        !transcript.chars().any(is_braille),
+        "PHORA_NO_PROGRESS must draw no spinner: {transcript:?}"
+    );
+    let visible = strip_sgr(&transcript);
+    assert!(
+        visible.contains("\nSources\n  ✓ dotfiles")
+            && visible.contains("\nTargets\n  ✓ dotfiles → home")
+            && visible.contains("\n✓ Synced 1 target · 2 added · "),
+        "PHORA_NO_PROGRESS must still print its sections and the verdict: {visible:?}"
     );
 }
 
@@ -982,17 +1049,28 @@ fn interactive_foreign_conflict_prompts_and_overwrites_through_a_pty() {
     let child_output = strip_successful_pty_child_status(&transcript).unwrap_or_else(|error| {
         panic!("interactive overwrite child must exit 0: {error}; transcript: {transcript:?}")
     });
-    let after_prompt = child_output.strip_prefix(PROMPT).unwrap_or_else(|| {
+    let child_output = strip_sgr(child_output);
+    let (before_prompt, after_prompt) = child_output.split_once(PROMPT).unwrap_or_else(|| {
         panic!("real TTY sync must emit the exact conflict prompt; got {transcript:?}")
     });
+    assert!(
+        before_prompt.starts_with("phora sync  ")
+            && before_prompt.contains("\nSources\n")
+            && !before_prompt.contains("Targets"),
+        "only the header and resolved sources may precede the prompt: {before_prompt:?}"
+    );
     assert!(
         after_prompt.starts_with("o\n"),
         "the PTY must echo the overwrite answer immediately after the exact prompt: {transcript:?}"
     );
-    assert_eq!(
-        after_prompt.lines().last(),
-        Some("sync complete"),
-        "the successful interactive overwrite must finish with the exact completion line"
+    assert!(
+        after_prompt.contains("\n    ~ editor\n"),
+        "the overwrite must show in the target's change list: {after_prompt:?}"
+    );
+    let verdict = after_prompt.lines().last().unwrap_or_default();
+    assert!(
+        verdict.starts_with("✓ Synced 1 target · 1 added · 1 updated · "),
+        "the successful interactive overwrite must finish with the verdict, got {verdict:?}"
     );
     assert!(
         !after_prompt.contains(PROMPT),

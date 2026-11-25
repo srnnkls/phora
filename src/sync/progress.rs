@@ -1,6 +1,6 @@
 //! Observation port for a synchronization run; rendering lives at the CLI edge.
 
-use super::hooks::HookOutcome;
+use super::hooks::{HookOutcome, HookScope};
 use super::request::{AppliedChange, SkippedChange, SyncWarning};
 
 /// A stage of the run, in pipeline order.
@@ -68,6 +68,7 @@ pub enum Severity {
 pub struct SyncSummary {
     pub targets: usize,
     pub deployed: usize,
+    pub updated: usize,
     pub overwritten: usize,
     pub overlays_rewritten: usize,
     pub ejected: usize,
@@ -80,6 +81,23 @@ pub struct SyncSummary {
     pub hooks_run: usize,
     pub hooks_failed: usize,
     pub elapsed: std::time::Duration,
+}
+
+/// What a child process runs for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandSubject {
+    Build { source: String },
+    Hook { scope: HookScope },
+}
+
+/// A finished build program or hook command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandRun {
+    pub subject: CommandSubject,
+    pub command: String,
+    pub success: bool,
+    pub elapsed: std::time::Duration,
+    pub output: String,
 }
 
 /// Receives run events as they happen.
@@ -98,6 +116,13 @@ pub trait ProgressSink: Sync {
 
     fn hook_started(&self, _hook_id: &str) {}
     fn hook_finished(&self, _outcome: &HookOutcome) {}
+
+    fn command_started(&self, _subject: &CommandSubject, _command: &str) {}
+    fn command_finished(&self, _run: &CommandRun) {}
+
+    fn suspend(&self, interact: &mut dyn FnMut()) {
+        interact();
+    }
 
     fn warning(&self, _warning: &SyncWarning) {}
     fn diagnostic(&self, _severity: Severity, _message: &str) {}

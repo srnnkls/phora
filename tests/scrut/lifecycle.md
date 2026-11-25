@@ -47,7 +47,16 @@ projects the included files into the target.
 
 ```scrut
 $ phora sync 2>&1 | normalize
-sync complete
+phora sync  ~
+
+Sources
+  ✓ src-proj  local <ROOT>/src-proj  fetched <T>
+
+Targets
+  ✓ src-proj → home  target-home  1 added
+    + editor
+
+✓ Synced 1 target · 1 added · <T>
 ```
 
 ## List deployment state
@@ -68,7 +77,15 @@ lock survives must self-heal by re-fetching, not error opening a vanished mirror
 
 ```scrut
 $ rm -rf "$XDG_CACHE_HOME/phora/git" && phora sync 2>&1 | normalize
-sync complete
+phora sync  ~
+
+Sources
+  ✓ src-proj  local <ROOT>/src-proj  fetched <T>
+
+Targets
+  ✓ src-proj → home  target-home  up to date
+
+✓ Up to date · 1 target · 1 unchanged · <T>
 ```
 
 ## Verify deployed contents

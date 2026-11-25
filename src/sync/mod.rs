@@ -2,6 +2,7 @@
 
 pub mod apply;
 mod build;
+mod child;
 pub(crate) mod confine;
 pub mod content;
 mod directories;
@@ -153,6 +154,20 @@ pub struct Conflict {
 /// Decides how to resolve each Modified/Foreign conflict in interactive sync.
 pub trait ConflictResolver {
     fn resolve(&self, conflict: &Conflict) -> Resolution;
+}
+
+struct SuspendedResolver<'a> {
+    inner: &'a dyn ConflictResolver,
+    sink: &'a dyn ProgressSink,
+}
+
+impl ConflictResolver for SuspendedResolver<'_> {
+    fn resolve(&self, conflict: &Conflict) -> Resolution {
+        let mut resolution = Resolution::Skip;
+        self.sink
+            .suspend(&mut || resolution = self.inner.resolve(conflict));
+        resolution
+    }
 }
 
 /// Test-only compatibility output for the pre-T027 unit fixtures.
@@ -476,6 +491,7 @@ fn decide_transitive_hooks(
     candidates: &[transitive::TransitiveHookCandidate],
     effective_lock: Option<&Lock>,
     prompt: Option<&dyn TrustPrompt>,
+    sink: &dyn ProgressSink,
 ) -> Result<TransitiveHookDecision> {
     let trusted = trusted_preimages(effective_lock);
     let runs: Vec<hooks::TransitiveHookRun<'_>> = candidates
@@ -491,8 +507,8 @@ fn decide_transitive_hooks(
         })
         .collect();
     let (outcomes, approvals) = match prompt {
-        Some(prompt) => hooks::dispatch_transitive_hooks(&runs, &trusted, prompt)?,
-        None => hooks::dispatch_transitive_hooks(&runs, &trusted, &request::DeclineAll)?,
+        Some(prompt) => hooks::dispatch_transitive_hooks(&runs, &trusted, prompt, sink)?,
+        None => hooks::dispatch_transitive_hooks(&runs, &trusted, &request::DeclineAll, sink)?,
     };
     let now = chrono::Utc::now().to_rfc3339();
     for approval in approvals {
@@ -587,7 +603,12 @@ fn run_pre_deploy<R>(ctx: &DeployAll<'_, R>) -> Result<PreDeployRun> {
         if hooks.pre_deploy.is_none() {
             continue;
         }
-        let outcomes = hooks::dispatch_pre_deploy(hooks, target_name, &target.expanded_path())?;
+        let outcomes = hooks::dispatch_pre_deploy(
+            hooks,
+            target_name,
+            &target.expanded_path(),
+            ctx.input.sink(),
+        )?;
         run.ran |= !outcomes.is_empty();
         let failed = outcomes
             .iter()
@@ -714,11 +735,13 @@ where
         observe_reconciliation(ctx, policy)?;
     let registry: &dyn StateStore = ctx.registry;
     refuse_lockless_mutation(ctx.input, registry, &initial_observed, &initial_changeset)?;
-    let initial_decisions = resolve_conflicts(
-        &initial_changeset,
-        ctx.input.resolver(),
-        ctx.input.interactive(),
-    )?;
+    let suspended = ctx.input.resolver().map(|inner| SuspendedResolver {
+        inner,
+        sink: ctx.input.sink(),
+    });
+    let resolver = suspended.as_ref().map(|r| r as &dyn ConflictResolver);
+    let initial_decisions =
+        resolve_conflicts(&initial_changeset, resolver, ctx.input.interactive())?;
     let PreDeployRun {
         outcomes,
         skipped_targets,
@@ -742,7 +765,7 @@ where
             &changeset,
             &initial_decisions,
             &skipped_targets,
-            ctx.input.resolver(),
+            resolver,
             ctx.input.interactive(),
         )?;
         (observed, changeset, retirements, decisions)
@@ -1417,6 +1440,7 @@ fn summarize(
     for change in applied {
         match change {
             AppliedChange::Deployed { .. } => summary.deployed += 1,
+            AppliedChange::Updated { .. } => summary.updated += 1,
             AppliedChange::Overwritten { .. } => summary.overwritten += 1,
             AppliedChange::OverlayRewritten { .. } => summary.overlays_rewritten += 1,
             AppliedChange::Ejected { .. } => summary.ejected += 1,
@@ -1485,7 +1509,7 @@ fn run_pre_sync(input: &SyncRunInput<'_>, config: &Config) -> Result<Vec<hooks::
         .map(String::as_str)
         .collect::<Vec<_>>()
         .join(" ");
-    hooks::dispatch_pre_sync(config, &target_names)
+    hooks::dispatch_pre_sync(config, &target_names, input.sink())
 }
 
 fn run_all_hooks(
@@ -1504,6 +1528,7 @@ fn run_all_hooks(
             config,
             registry,
             input.lockless(),
+            input.sink(),
         )?);
     }
     let mut stripped = 0;
@@ -1513,6 +1538,7 @@ fn run_all_hooks(
             hook_candidates,
             effective_lock,
             input.interactive().then(|| input.trust_prompt()).flatten(),
+            input.sink(),
         )?;
         stripped = decision.stripped;
         hook_results.append(&mut decision.outcomes);

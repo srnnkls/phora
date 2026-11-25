@@ -122,6 +122,13 @@ fn snapshot(out: &Output) -> String {
 fn settings(fixture: &Fixture) -> insta::Settings {
     let mut s = insta::Settings::clone_current();
     s.add_filter(
+        &format!(
+            "/private{}",
+            regex_escape(&fixture.cwd.path().to_string_lossy())
+        ),
+        "<CWD>",
+    );
+    s.add_filter(
         &regex_escape(&fixture.xdg_cache.to_string_lossy()),
         "<XDG_CACHE>",
     );
@@ -144,6 +151,7 @@ fn settings(fixture: &Fixture) -> insta::Settings {
     );
     s.add_filter(r"\b[0-9a-f]{40}\b", "<COMMIT>");
     s.add_filter(r"commit [0-9a-f]{8}", "commit <COMMIT8>");
+    s.add_filter(r" +[0-9]+(\.[0-9]+)?m?s(\s|$)", " <T>$2");
     s.add_filter(r"@[0-9a-f]{8}", "@<COMMIT8>");
     s.add_filter(r"\b[0-9a-f]{16}\b", "<PROJECT>");
     s.add_filter(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z", "<TIME>");

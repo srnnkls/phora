@@ -30,6 +30,7 @@ impl JsonSink {
     fn emit(&self, record: &Value) {
         let mut out = self.out.lock().expect("json sink poisoned");
         let _ = writeln!(out, "{record}");
+        let _ = out.flush();
     }
 }
 
@@ -48,6 +49,11 @@ fn applied_parts(change: &AppliedChange) -> (&'static str, &str, &str, &str) {
             source,
             artifact,
         } => ("deployed", target, source, artifact),
+        AppliedChange::Updated {
+            target,
+            source,
+            artifact,
+        } => ("updated", target, source, artifact),
         AppliedChange::Overwritten {
             target,
             source,
@@ -131,6 +137,7 @@ fn summary_record(summary: &SyncSummary) -> Value {
         "type": "summary",
         "targets": summary.targets,
         "deployed": summary.deployed,
+        "updated": summary.updated,
         "overwritten": summary.overwritten,
         "overlays_rewritten": summary.overlays_rewritten,
         "ejected": summary.ejected,
@@ -232,6 +239,16 @@ impl ProgressSink for JsonSink {
         }));
     }
 
+    fn command_finished(&self, run: &crate::sync::progress::CommandRun) {
+        self.emit(&json!({
+            "type": "command_finished",
+            "command": run.command,
+            "status": if run.success { "ok" } else { "failed" },
+            "elapsed_ms": run.elapsed.as_millis(),
+            "output": run.output,
+        }));
+    }
+
     fn warning(&self, warning: &SyncWarning) {
         self.emit(&json!({
             "type": "warning",
@@ -310,6 +327,7 @@ mod tests {
         let record = summary_record(&SyncSummary {
             targets: 2,
             deployed: 3,
+            updated: 5,
             unchanged: 4,
             elapsed: std::time::Duration::from_millis(1234),
             ..SyncSummary::default()
@@ -317,6 +335,7 @@ mod tests {
         assert_eq!(record["type"], "summary");
         assert_eq!(record["targets"], 2);
         assert_eq!(record["deployed"], 3);
+        assert_eq!(record["updated"], 5);
         assert_eq!(record["unchanged"], 4);
         assert_eq!(record["elapsed_ms"], 1234);
         assert!(

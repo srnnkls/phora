@@ -98,7 +98,7 @@ fn classify_desired<R>(
         ObservedArtifact::Foreign(_) => Some(collision(desired, ConflictKind::Foreign, policy)),
         ObservedArtifact::Ejected => None,
         ObservedArtifact::Managed(managed) => match &managed.condition {
-            ManagedCondition::Outdated => Some(deploy(desired)),
+            ManagedCondition::Outdated => Some(update(desired)),
             ManagedCondition::Modified { changed } => Some(collision(
                 desired,
                 ConflictKind::Modified {
@@ -152,6 +152,14 @@ fn classify_orphan<R>(
             reason,
         },
     })
+}
+
+fn update(desired: DesiredArtifact) -> SyncChange {
+    SyncChange::Update {
+        target: desired.target,
+        source: desired.source,
+        artifact: desired.artifact,
+    }
 }
 
 fn deploy(desired: DesiredArtifact) -> SyncChange {

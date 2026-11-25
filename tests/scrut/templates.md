@@ -31,7 +31,16 @@ as `editor/motd` — suffix stripped.
 
 ```scrut
 $ mkdir -p s1 && cd s1 && isolate_state && seed_config_with_vars "$(make_templated_source proj)" && phora sync 2>&1 | normalize
-sync complete
+phora sync  ~
+
+Sources
+  ✓ dotfiles  local <ROOT>/src-proj @ main  fetched <T>
+
+Targets
+  ✓ dotfiles → home  target-home  1 added
+    + editor
+
+✓ Synced 1 target · 1 added · <T>
 ```
 
 The deployed file holds the rendered text.
@@ -84,13 +93,31 @@ seeded
 ```
 
 ```scrut
-$ mkdir -p m1 && cd m1 && isolate_state && seed_config_with_vars "$SHARED" && seed_local_vars alice && phora sync 2>&1 | normalize
-sync complete
+$ mkdir -p m1 && cd m1 && isolate_state && seed_config_with_vars "$SHARED" && seed_local_vars alice && phora sync 2>&1 | normalize | sed -e "s%/private$ROOT%<DOC>%g" -e "s%$ROOT%<DOC>%g"
+phora sync  ~
+
+Sources
+  ✓ dotfiles  local <DOC>/src-shared @ main  fetched <T>
+
+Targets
+  ✓ dotfiles → home  target-home  1 added
+    + editor
+
+✓ Synced 1 target · 1 added · <T>
 ```
 
 ```scrut
-$ cd "$ROOT" && mkdir -p m2 && cd m2 && isolate_state && seed_config_with_vars "$SHARED" && seed_local_vars bob && phora sync 2>&1 | normalize
-sync complete
+$ cd "$ROOT" && mkdir -p m2 && cd m2 && isolate_state && seed_config_with_vars "$SHARED" && seed_local_vars bob && phora sync 2>&1 | normalize | sed -e "s%/private$ROOT%<DOC>%g" -e "s%$ROOT%<DOC>%g"
+phora sync  ~
+
+Sources
+  ✓ dotfiles  local <DOC>/src-shared @ main  fetched <T>
+
+Targets
+  ✓ dotfiles → home  target-home  1 added
+    + editor
+
+✓ Synced 1 target · 1 added · <T>
 ```
 
 Each machine rendered its own greeting.
@@ -133,7 +160,16 @@ the artifact on the next sync.
 
 ```scrut
 $ cd "$ROOT" && mkdir -p s7 && cd s7 && isolate_state && seed_config_with_vars "$(make_templated_source proj)" && seed_local_vars first && phora sync 2>&1 | normalize
-sync complete
+phora sync  ~
+
+Sources
+  ✓ dotfiles  local <ROOT>/src-proj @ main  fetched <T>
+
+Targets
+  ✓ dotfiles → home  target-home  1 added
+    + editor
+
+✓ Synced 1 target · 1 added · <T>
 ```
 
 ```scrut
@@ -151,7 +187,16 @@ captured
 
 ```scrut
 $ seed_local_vars second && phora sync 2>&1 | normalize
-sync complete
+phora sync  ~
+
+Sources
+  ✓ dotfiles  local <ROOT>/src-proj @ main  cached <T>
+
+Targets
+  ✓ dotfiles → home  target-home  1 updated
+    ~ editor
+
+✓ Synced 1 target · 1 updated · <T>
 ```
 
 ```scrut
@@ -180,7 +225,16 @@ templated artifact is reconstructed clean, not `modified`.
 
 ```scrut
 $ cd "$ROOT" && mkdir -p s5 && cd s5 && isolate_state && seed_config_with_vars "$(make_templated_source proj)" && seed_local_vars overlaid && phora sync 2>&1 | normalize
-sync complete
+phora sync  ~
+
+Sources
+  ✓ dotfiles  local <ROOT>/src-proj @ main  fetched <T>
+
+Targets
+  ✓ dotfiles → home  target-home  1 added
+    + editor
+
+✓ Synced 1 target · 1 added · <T>
 ```
 
 ```scrut
@@ -207,7 +261,16 @@ name with no annotation. The source name `motd.tmpl` never appears.
 
 ```scrut
 $ cd "$ROOT" && mkdir -p s6 && cd s6 && isolate_state && seed_config_with_vars "$(make_templated_source proj)" && phora sync 2>&1 | normalize
-sync complete
+phora sync  ~
+
+Sources
+  ✓ dotfiles  local <ROOT>/src-proj @ main  fetched <T>
+
+Targets
+  ✓ dotfiles → home  target-home  1 added
+    + editor
+
+✓ Synced 1 target · 1 added · <T>
 ```
 
 ```scrut

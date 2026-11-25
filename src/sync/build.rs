@@ -16,7 +16,7 @@ use crate::source::{
     SourceLocation, SourceName, SourceStore,
 };
 
-use super::progress::{Phase, SILENT};
+use super::progress::{CommandSubject, Phase, ProgressSink, SILENT};
 use super::request::{ConflictPolicy, HookPolicy, PrunePolicy, SyncEvents, SyncOptions};
 use super::resolve::{RoutedSources, selected_source_digest};
 use super::state::FileStateStore;
@@ -139,15 +139,21 @@ pub(super) fn run(
                 let Some(program) = &program else {
                     return Err(unbuilt());
                 };
-                match execute(name, program, &inputs, &output, cwd, backend) {
+                match execute(input.sink(), name, program, &inputs, &output, cwd, backend) {
                     Ok(resolved) => (resolved, key),
                     Err(error) => {
+                        let detail = match error {
+                            Error::Sync(detail) => detail,
+                            other => other.to_string(),
+                        };
                         let Some((locked, resolved)) = previous else {
-                            return Err(Error::Sync(format!("build `{name}` failed: {error}")));
+                            return Err(Error::Sync(format!(
+                                "build `{name}` failed and has no previous output to keep: {detail}"
+                            )));
                         };
                         events.push_warning(SyncWarning::BuildFailed {
                             source: name.clone(),
-                            detail: error.to_string(),
+                            detail,
                         });
                         builds.failed = true;
                         (resolved, locked.build.clone().unwrap_or_default())
@@ -393,6 +399,7 @@ fn reject_escaping_symlinks(root: &Path, linked: Option<&Path>) -> Result<()> {
 /// Output symlinks are captured as the files they point to: a linked input is live
 /// worktree content, and the scratch directory is gone after the build.
 fn execute(
+    sink: &dyn ProgressSink,
     name: &str,
     program: &Program<'_>,
     inputs: &Path,
@@ -406,14 +413,23 @@ fn execute(
     if let Some(cwd) = cwd {
         process.current_dir(cwd);
     }
-    let status = process
+    process
         .env("PHORA_INPUT", inputs)
         .env("PHORA_OUTPUT", output)
-        .env("PHORA_SOURCE", name)
-        .stdout(Stdio::from(std::io::stderr()))
-        .status()
-        .map_err(|e| Error::Sync(format!("run `{}`: {e}", program.display())))?;
+        .env("PHORA_SOURCE", name);
+    let status = crate::sync::child::run_captured(
+        sink,
+        CommandSubject::Build {
+            source: name.to_owned(),
+        },
+        &program.display(),
+        &mut process,
+    )
+    .map_err(|e| Error::Sync(format!("run `{}`: {e}", program.display())))?;
     if !status.success() {
+        let status = status
+            .code()
+            .map_or_else(|| status.to_string(), |code| format!("status {code}"));
         return Err(Error::Sync(format!(
             "`{}` exited with {status}",
             program.display()
@@ -528,14 +544,15 @@ fn build_key(program: &Program<'_>, inputs: &Path, cwd: Option<&Path>) -> Result
                     process.current_dir(cwd);
                 }
                 let output = process
-                    .stderr(Stdio::inherit())
+                    .stdin(Stdio::null())
                     .output()
                     .map_err(|e| Error::Sync(format!("run build key `{}`: {e}", key.display())))?;
                 if !output.status.success() {
                     return Err(Error::Sync(format!(
-                        "build key `{}` exited with {}",
+                        "build key `{}` exited with {}: {}",
                         key.display(),
-                        output.status
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr).trim()
                     )));
                 }
                 field(&output.stdout);

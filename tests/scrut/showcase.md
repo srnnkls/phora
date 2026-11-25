@@ -55,7 +55,17 @@ resolved commit, and copies the included files into the target.
 
 ```scrut
 $ phora sync 2>&1 | normalize
-sync complete
+phora sync  ~
+
+Sources
+  ✓ src-dotfiles  local <ROOT>/src-dotfiles  fetched <T>
+
+Targets
+  ✓ src-dotfiles → home  target-home  2 added
+    + editor
+    + lint
+
+✓ Synced 1 target · 2 added · <T>
 ```
 
 ## Inspect deployment state
@@ -128,7 +138,19 @@ the target entry is a symlink back to the overlay directory rather than a copy.
 
 ```scrut
 $ phora sync 2>&1 | normalize
-sync complete
+phora sync  ~
+
+Sources
+  ✓ src-dotfiles     local <ROOT>/src-dotfiles  cached <T>
+  ✓ overlay-machine  local <ROOT>/overlay-machine  cached <T>
+
+Targets
+  ✓ src-dotfiles → home        target-home     up to date
+  ✓ overlay-machine → machine  target-machine  2 added
+    + config
+    + notes.txt
+
+✓ Synced 2 targets · 2 added · 2 unchanged · <T>
 ```
 
 `phora where` now reports the overlay artifact too. A linked overlay carries no

@@ -192,7 +192,7 @@ fn rm_keeps_a_locally_modified_deployment() {
     let stderr = run_phora_ok(&project.root, &["rm", "up"]);
 
     assert!(
-        stderr.contains("phora: keeping up:up"),
+        stderr.contains("keeping up:up"),
         "the edit is reported; got:\n{stderr}"
     );
     assert_eq!(fs::read_to_string(&edited).expect("kept"), "mine\n");

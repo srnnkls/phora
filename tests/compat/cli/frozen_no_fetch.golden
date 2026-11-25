@@ -1,4 +1,12 @@
 exit: 0
 --- stdout ---
-sync complete
+✓ Up to date · 1 target · 2 unchanged · <T>
 --- stderr ---
+phora sync  <CWD>
+
+Sources
+  ✓ dotfiles  local <SRC> @ main  cached <T>
+
+Targets
+  ✓ dotfiles → home  ~/deploy  up to date
+

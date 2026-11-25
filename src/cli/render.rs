@@ -7,7 +7,15 @@ use crate::config::transitive::Member;
 use crate::error::{Error, Result};
 use crate::projection::diagnostic::ProjectionWarning;
 use crate::sync::inspect::ArtifactState;
-use crate::sync::{HookOutcome, HookScope, HookStatus, SyncState, SyncSummary, SyncWarning};
+use crate::sync::{HookOutcome, HookScope, HookStatus, SyncState, SyncWarning};
+
+mod sync_view;
+
+pub(super) use sync_view::{
+    Change, Failures, Fetched, Palette, RunContext, SyncView, TargetOutcome, failure, notice,
+    outcome, source_name, status_for_command, status_for_deploy, status_for_phase,
+    status_for_resolve, warnings,
+};
 
 use super::query::{
     CheckMatchReport, ExplainBody, ExplainReport, OfferAttribution, OrphanListing, PreviewPlan,
@@ -20,42 +28,42 @@ use super::query::{
 pub(super) fn format_sync_warning(warning: &SyncWarning) -> Option<String> {
     let rendered = match warning {
         SyncWarning::Projection(ProjectionWarning::TakeNoMatchGlob(pattern)) => {
-            format!("phora: take pattern matched no offered leaf: {pattern}")
+            format!("take pattern matched no offered leaf: {pattern}")
         }
         SyncWarning::Projection(ProjectionWarning::LostCollapseToExclude(dir)) => format!(
-            "phora: dir `{dir}` cannot collapse to one symlink under a within-dir exclude; \
+            "dir `{dir}` cannot collapse to one symlink under a within-dir exclude; \
              falling back to per-leaf links"
         ),
-        SyncWarning::MalformedTransitiveHooks { target, detail } => format!(
-            "phora: dependency target `{target}`: malformed `[targets.{target}.hooks]`: {detail}"
-        ),
+        SyncWarning::MalformedTransitiveHooks { target, detail } => {
+            format!("dependency target `{target}`: malformed `[targets.{target}.hooks]`: {detail}")
+        }
         SyncWarning::LinkPathNotPortable { source, path } => format!(
-            "phora: source `{source}`: deploy = \"link\" uses the absolute path `{}`, which is \
+            "source `{source}`: deploy = \"link\" uses the absolute path `{}`, which is \
              not portable across machines",
             path.display()
         ),
         SyncWarning::UnboundSource { source } => {
-            format!("phora: source `{source}` is bound by no target or build")
+            format!("source `{source}` is bound by no target or build")
         }
         SyncWarning::ReferenceMoved {
             source,
             target,
             from,
             to,
-        } => format!("phora: {source} → {target}: {from} → {to}"),
+        } => format!("{source} → {target}: {from} → {to}"),
         SyncWarning::OrphanedRecords { count } => format!(
-            "phora: {count} orphaned record(s) no longer in config — run `phora list --orphans` \
+            "{count} orphaned record(s) no longer in config — run `phora list --orphans` \
              to inspect, `phora sync --prune` to remove"
         ),
         SyncWarning::RemovalsSkippedAfterFailures => {
-            "phora: skipping removals because some artifacts failed to deploy".to_owned()
+            "skipping removals because some artifacts failed to deploy".to_owned()
         }
         SyncWarning::PruneRefused { path, reason } => format!(
-            "phora: refusing to prune out-of-anchor {}: {reason}",
+            "refusing to prune out-of-anchor {}: {reason}",
             path.display()
         ),
         SyncWarning::PruneKeptDirectory { path } => format!(
-            "phora: kept directory {}: it still holds files phora does not manage",
+            "kept directory {}: it still holds files phora does not manage",
             path.display()
         ),
         SyncWarning::OrphanRecordPathUnknown {
@@ -63,7 +71,7 @@ pub(super) fn format_sync_warning(warning: &SyncWarning) -> Option<String> {
             artifact,
             layout,
         } => format!(
-            "phora: dropping the record for orphaned {source}:{artifact} only — its on-disk path \
+            "dropping the record for orphaned {source}:{artifact} only — its on-disk path \
              cannot be reconstructed (layout `{layout}` unrecognized or missing its separator); \
              any file is left in place rather than deleting a guessed path"
         ),
@@ -73,7 +81,7 @@ pub(super) fn format_sync_warning(warning: &SyncWarning) -> Option<String> {
             path,
             reason,
         } => format!(
-            "phora: unrecorded {source}:{artifact} ({}) but kept {} (a live artifact sits there)",
+            "unrecorded {source}:{artifact} ({}) but kept {} (a live artifact sits there)",
             reason.describe(),
             path.display()
         ),
@@ -85,11 +93,11 @@ pub(super) fn format_sync_warning(warning: &SyncWarning) -> Option<String> {
             reason,
         } => format_kept_local_change(source, artifact, path, change, *reason),
         SyncWarning::ContentStoreRepaired { object } => format!(
-            "phora: content store object {} did not match its hash; rewrote it",
+            "content store object {} did not match its hash; rewrote it",
             object.display()
         ),
         SyncWarning::CrossDeviceFallback { destination } => format!(
-            "phora: staging on a different mount than {}; falling back to recursive copy",
+            "staging on a different mount than {}; falling back to recursive copy",
             destination.display()
         ),
         SyncWarning::ConflictModified {
@@ -98,7 +106,7 @@ pub(super) fn format_sync_warning(warning: &SyncWarning) -> Option<String> {
             changed,
         } => format_conflict_modified(source, artifact, changed),
         SyncWarning::ConflictForeign { path } => format!(
-            "phora: skipping foreign content at {}; use --force to overwrite",
+            "skipping foreign content at {}; use --force to overwrite",
             path.display()
         ),
         SyncWarning::UntrustedTransitiveHooks { .. } => return None,
@@ -107,12 +115,12 @@ pub(super) fn format_sync_warning(warning: &SyncWarning) -> Option<String> {
             attributes,
             autocrlf,
         } => format!(
-            "phora: history source `{source}` uses content filters ({}); its Git overlay may \
+            "history source `{source}` uses content filters ({}); its Git overlay may \
              report files modified",
             content_filter_cause(*attributes, *autocrlf)
         ),
         SyncWarning::BuildFailed { source, detail } => {
-            format!("phora: build `{source}` failed ({detail}); keeping its previous output")
+            format!("build `{source}` failed ({detail}); keeping its previous output")
         }
     };
     Some(rendered)
@@ -123,7 +131,7 @@ fn format_conflict_modified(
     artifact: &str,
     changed: &[std::path::PathBuf],
 ) -> String {
-    let mut out = format!("phora: skipping locally modified {source}:{artifact}");
+    let mut out = format!("skipping locally modified {source}:{artifact}");
     for path in changed {
         let _ = write!(out, "\n    {}", path.display());
     }
@@ -146,7 +154,7 @@ fn format_kept_local_change(
         LocalChange::Repointed => "the link now points elsewhere",
     };
     let mut out = format!(
-        "phora: keeping {source}:{artifact} ({why}) at {}: {what}",
+        "keeping {source}:{artifact} ({why}) at {}: {what}",
         path.display()
     );
     if let LocalChange::Modified { changed } = change {
@@ -167,52 +175,6 @@ fn content_filter_cause(attributes: bool, autocrlf: bool) -> &'static str {
     }
 }
 
-/// One line replacing the bare `sync complete`, on stdout.
-#[must_use]
-pub(super) fn format_sync_summary(summary: &SyncSummary) -> String {
-    let quiet = summary.deployed == 0
-        && summary.overwritten == 0
-        && summary.overlays_rewritten == 0
-        && summary.ejected == 0
-        && summary.removed == 0
-        && summary.conflicts == 0
-        && summary.failures == 0;
-    let elapsed = format_elapsed(summary.elapsed);
-    if quiet {
-        return format!(
-            "up to date: {} target{}, {} artifact{} unchanged in {elapsed}\n",
-            summary.targets,
-            plural(summary.targets),
-            summary.unchanged,
-            plural(summary.unchanged),
-        );
-    }
-    let mut parts = vec![format!("{} deployed", summary.deployed)];
-    let updated = summary.overwritten + summary.overlays_rewritten;
-    if updated > 0 {
-        parts.push(format!("{updated} updated"));
-    }
-    if summary.ejected > 0 {
-        parts.push(format!("{} ejected", summary.ejected));
-    }
-    if summary.removed > 0 {
-        parts.push(format!("{} pruned", summary.removed));
-    }
-    parts.push(format!("{} unchanged", summary.unchanged));
-    if summary.conflicts > 0 {
-        parts.push(format!("{} skipped", summary.conflicts));
-    }
-    if summary.failures > 0 {
-        parts.push(format!("{} failed", summary.failures));
-    }
-    format!(
-        "synced {} target{}: {} in {elapsed}\n",
-        summary.targets,
-        plural(summary.targets),
-        parts.join(", "),
-    )
-}
-
 fn plural(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
 }
@@ -223,103 +185,6 @@ fn format_elapsed(elapsed: std::time::Duration) -> String {
         format!("{}ms", elapsed.as_millis())
     } else {
         format!("{secs:.1}s")
-    }
-}
-
-#[cfg(test)]
-mod summary_tests {
-    use super::format_sync_summary;
-    use crate::sync::SyncSummary;
-    use std::time::Duration;
-
-    fn base() -> SyncSummary {
-        SyncSummary {
-            targets: 2,
-            elapsed: Duration::from_millis(1234),
-            ..SyncSummary::default()
-        }
-    }
-
-    #[test]
-    fn an_all_unchanged_run_reads_as_up_to_date() {
-        let summary = SyncSummary {
-            unchanged: 7,
-            ..base()
-        };
-        assert_eq!(
-            format_sync_summary(&summary),
-            "up to date: 2 targets, 7 artifacts unchanged in 1.2s\n"
-        );
-    }
-
-    #[test]
-    fn a_zero_target_run_stays_singularly_correct() {
-        let summary = SyncSummary {
-            targets: 0,
-            unchanged: 1,
-            ..base()
-        };
-        assert_eq!(
-            format_sync_summary(&summary),
-            "up to date: 0 targets, 1 artifact unchanged in 1.2s\n"
-        );
-    }
-
-    #[test]
-    fn a_changed_run_names_only_the_nonzero_buckets() {
-        let summary = SyncSummary {
-            deployed: 3,
-            unchanged: 4,
-            ..base()
-        };
-        assert_eq!(
-            format_sync_summary(&summary),
-            "synced 2 targets: 3 deployed, 4 unchanged in 1.2s\n"
-        );
-    }
-
-    #[test]
-    fn overlays_fold_into_updated_and_failures_surface() {
-        let summary = SyncSummary {
-            deployed: 1,
-            overwritten: 2,
-            overlays_rewritten: 1,
-            removed: 5,
-            conflicts: 1,
-            failures: 2,
-            unchanged: 0,
-            ..base()
-        };
-        assert_eq!(
-            format_sync_summary(&summary),
-            "synced 2 targets: 1 deployed, 3 updated, 5 pruned, 0 unchanged, 1 skipped, 2 failed \
-             in 1.2s\n"
-        );
-    }
-
-    #[test]
-    fn a_sub_second_run_reports_milliseconds() {
-        let summary = SyncSummary {
-            deployed: 1,
-            elapsed: Duration::from_millis(40),
-            ..base()
-        };
-        assert!(
-            format_sync_summary(&summary).ends_with("in 40ms\n"),
-            "{}",
-            format_sync_summary(&summary)
-        );
-    }
-
-    #[test]
-    fn the_summary_never_says_warning() {
-        let summary = SyncSummary {
-            deployed: 1,
-            failures: 1,
-            ..base()
-        };
-        let rendered = format_sync_summary(&summary).to_lowercase();
-        assert!(!rendered.contains("warning"), "{rendered}");
     }
 }
 
