@@ -28,42 +28,42 @@ use super::query::{
 pub(super) fn format_sync_warning(warning: &SyncWarning) -> Option<String> {
     let rendered = match warning {
         SyncWarning::Projection(ProjectionWarning::TakeNoMatchGlob(pattern)) => {
-            format!("phora: take pattern matched no offered leaf: {pattern}")
+            format!("take pattern matched no offered leaf: {pattern}")
         }
         SyncWarning::Projection(ProjectionWarning::LostCollapseToExclude(dir)) => format!(
-            "phora: dir `{dir}` cannot collapse to one symlink under a within-dir exclude; \
+            "dir `{dir}` cannot collapse to one symlink under a within-dir exclude; \
              falling back to per-leaf links"
         ),
-        SyncWarning::MalformedTransitiveHooks { target, detail } => format!(
-            "phora: dependency target `{target}`: malformed `[targets.{target}.hooks]`: {detail}"
-        ),
+        SyncWarning::MalformedTransitiveHooks { target, detail } => {
+            format!("dependency target `{target}`: malformed `[targets.{target}.hooks]`: {detail}")
+        }
         SyncWarning::LinkPathNotPortable { source, path } => format!(
-            "phora: source `{source}`: deploy = \"link\" uses the absolute path `{}`, which is \
+            "source `{source}`: deploy = \"link\" uses the absolute path `{}`, which is \
              not portable across machines",
             path.display()
         ),
         SyncWarning::UnboundSource { source } => {
-            format!("phora: source `{source}` is bound by no target or build")
+            format!("source `{source}` is bound by no target or build")
         }
         SyncWarning::ReferenceMoved {
             source,
             target,
             from,
             to,
-        } => format!("phora: {source} → {target}: {from} → {to}"),
+        } => format!("{source} → {target}: {from} → {to}"),
         SyncWarning::OrphanedRecords { count } => format!(
-            "phora: {count} orphaned record(s) no longer in config — run `phora list --orphans` \
+            "{count} orphaned record(s) no longer in config — run `phora list --orphans` \
              to inspect, `phora sync --prune` to remove"
         ),
         SyncWarning::RemovalsSkippedAfterFailures => {
-            "phora: skipping removals because some artifacts failed to deploy".to_owned()
+            "skipping removals because some artifacts failed to deploy".to_owned()
         }
         SyncWarning::PruneRefused { path, reason } => format!(
-            "phora: refusing to prune out-of-anchor {}: {reason}",
+            "refusing to prune out-of-anchor {}: {reason}",
             path.display()
         ),
         SyncWarning::PruneKeptDirectory { path } => format!(
-            "phora: kept directory {}: it still holds files phora does not manage",
+            "kept directory {}: it still holds files phora does not manage",
             path.display()
         ),
         SyncWarning::OrphanRecordPathUnknown {
@@ -71,7 +71,7 @@ pub(super) fn format_sync_warning(warning: &SyncWarning) -> Option<String> {
             artifact,
             layout,
         } => format!(
-            "phora: dropping the record for orphaned {source}:{artifact} only — its on-disk path \
+            "dropping the record for orphaned {source}:{artifact} only — its on-disk path \
              cannot be reconstructed (layout `{layout}` unrecognized or missing its separator); \
              any file is left in place rather than deleting a guessed path"
         ),
@@ -81,7 +81,7 @@ pub(super) fn format_sync_warning(warning: &SyncWarning) -> Option<String> {
             path,
             reason,
         } => format!(
-            "phora: unrecorded {source}:{artifact} ({}) but kept {} (a live artifact sits there)",
+            "unrecorded {source}:{artifact} ({}) but kept {} (a live artifact sits there)",
             reason.describe(),
             path.display()
         ),
@@ -93,11 +93,11 @@ pub(super) fn format_sync_warning(warning: &SyncWarning) -> Option<String> {
             reason,
         } => format_kept_local_change(source, artifact, path, change, *reason),
         SyncWarning::ContentStoreRepaired { object } => format!(
-            "phora: content store object {} did not match its hash; rewrote it",
+            "content store object {} did not match its hash; rewrote it",
             object.display()
         ),
         SyncWarning::CrossDeviceFallback { destination } => format!(
-            "phora: staging on a different mount than {}; falling back to recursive copy",
+            "staging on a different mount than {}; falling back to recursive copy",
             destination.display()
         ),
         SyncWarning::ConflictModified {
@@ -106,7 +106,7 @@ pub(super) fn format_sync_warning(warning: &SyncWarning) -> Option<String> {
             changed,
         } => format_conflict_modified(source, artifact, changed),
         SyncWarning::ConflictForeign { path } => format!(
-            "phora: skipping foreign content at {}; use --force to overwrite",
+            "skipping foreign content at {}; use --force to overwrite",
             path.display()
         ),
         SyncWarning::UntrustedTransitiveHooks { .. } => return None,
@@ -115,12 +115,12 @@ pub(super) fn format_sync_warning(warning: &SyncWarning) -> Option<String> {
             attributes,
             autocrlf,
         } => format!(
-            "phora: history source `{source}` uses content filters ({}); its Git overlay may \
+            "history source `{source}` uses content filters ({}); its Git overlay may \
              report files modified",
             content_filter_cause(*attributes, *autocrlf)
         ),
         SyncWarning::BuildFailed { source, detail } => {
-            format!("phora: build `{source}` failed ({detail}); keeping its previous output")
+            format!("build `{source}` failed ({detail}); keeping its previous output")
         }
     };
     Some(rendered)
@@ -131,7 +131,7 @@ fn format_conflict_modified(
     artifact: &str,
     changed: &[std::path::PathBuf],
 ) -> String {
-    let mut out = format!("phora: skipping locally modified {source}:{artifact}");
+    let mut out = format!("skipping locally modified {source}:{artifact}");
     for path in changed {
         let _ = write!(out, "\n    {}", path.display());
     }
@@ -154,7 +154,7 @@ fn format_kept_local_change(
         LocalChange::Repointed => "the link now points elsewhere",
     };
     let mut out = format!(
-        "phora: keeping {source}:{artifact} ({why}) at {}: {what}",
+        "keeping {source}:{artifact} ({why}) at {}: {what}",
         path.display()
     );
     if let LocalChange::Modified { changed } = change {

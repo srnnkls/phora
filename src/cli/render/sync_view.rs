@@ -724,25 +724,12 @@ pub(in crate::cli) fn warnings(palette: Palette, warnings: &[SyncWarning]) -> Op
             )),
             other => format_sync_warning(other),
         })
-        .map(|text| {
-            let text = text.strip_prefix("phora: ").unwrap_or(&text).to_owned();
-            let mut lines = text.lines();
-            let mut out = format!(
-                "  {} {}",
-                Mark::Caution.paint(palette),
-                lines.next().unwrap_or_default()
-            );
-            for line in lines {
-                let _ = write!(out, "\n    {}", line.trim_start());
-            }
-            out
-        })
+        .map(|text| notice(palette, &text))
         .collect();
     (!lines.is_empty()).then(|| format!("\n{}\n{}", palette.bold("Warnings"), lines.join("\n")))
 }
 
 pub(in crate::cli) fn notice(palette: Palette, message: &str) -> String {
-    let message = message.replace("phora: ", "");
     let mut lines = message.lines();
     let mut out = format!(
         "  {} {}",
@@ -750,7 +737,7 @@ pub(in crate::cli) fn notice(palette: Palette, message: &str) -> String {
         lines.next().unwrap_or_default()
     );
     for line in lines {
-        let _ = write!(out, "\n    {line}");
+        let _ = write!(out, "\n    {}", line.trim_start());
     }
     out
 }

@@ -135,7 +135,7 @@ pub(super) fn run_sync(
             &before,
             &collect_root_pins(out.locks.base.as_ref(), out.locks.local.as_ref()),
         ) {
-            eprintln!("{line}");
+            eprintln!("phora: {line}");
         }
     }
     if outcome == CliOutcome::Success && !lockless {
@@ -169,8 +169,7 @@ fn describe_pin_moves(before: &RootPins, after: &RootPins) -> Vec<String> {
         .iter()
         .filter_map(|(key, now)| {
             let was = before.get(key)?;
-            (was.1 != now.1)
-                .then(|| format!("phora: updated {}: {} → {}", key.0, label(was), label(now)))
+            (was.1 != now.1).then(|| format!("updated {}: {} → {}", key.0, label(was), label(now)))
         })
         .collect()
 }
@@ -183,9 +182,9 @@ struct StrippedHookNotice {
 fn stripped_hook_notice(stripped: usize, interactive: bool) -> Option<StrippedHookNotice> {
     (stripped > 0).then(|| StrippedHookNotice {
         message: format!(
-            "phora: {stripped} untrusted transitive hook(s) were stripped and not run — affected \
+            "{stripped} untrusted transitive hook(s) were stripped and not run — affected \
              artifacts are deployed but NOT post-processed and may be incomplete\n\
-             phora: run `phora trust <name>` to inspect and approve {stripped} hook(s)"
+             run `phora trust <name>` to inspect and approve {stripped} hook(s)"
         ),
         fail: interactive,
     })
@@ -297,7 +296,9 @@ fn finish_json(out: &SyncReport, interactive: bool) -> CliOutcome {
         if !report.is_empty() {
             eprint!("{report}");
         }
-        eprintln!("{}", notice.message);
+        for line in notice.message.lines() {
+            eprintln!("phora: {line}");
+        }
         if notice.fail {
             return CliOutcome::Failure;
         }
@@ -411,7 +412,7 @@ fn aborted_before_deploy(out: &SyncReport, summary: Option<&crate::sync::SyncSum
 fn render_sync_warnings(out: &SyncReport) {
     for warning in &out.warnings {
         if let Some(rendered) = super::render::format_sync_warning(warning) {
-            eprintln!("{rendered}");
+            eprintln!("phora: {rendered}");
         }
     }
 }
