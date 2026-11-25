@@ -230,76 +230,25 @@ impl<'de> Deserialize<'de> for TakeEntry {
 /// A per-target binding value. The map key is the binding identity; `source`
 /// overrides the effective source only when the alias diverges from the key.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(try_from = "BindingFields")]
+#[serde(deny_unknown_fields)]
 pub struct Binding {
     pub source: Option<String>,
     pub branch: Option<String>,
     pub tag: Option<String>,
     pub rev: Option<String>,
+    #[serde(default)]
     pub template: Option<TemplateOptIn>,
-    /// A `dest` in config arrives here as the whole-offer subtree rename `{ "./" = dest }`.
+    #[serde(default)]
     pub take: Option<Vec<TakeEntry>>,
+    #[serde(default)]
     pub collapse: Option<bool>,
+    #[serde(default)]
     pub history: bool,
+    #[serde(default)]
     pub offer: Option<String>,
     /// The `take` of the consumer binding that composed this target, applied to its output.
+    #[serde(skip)]
     pub composed_take: Option<Vec<TakeEntry>>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BindingFields {
-    source: Option<String>,
-    branch: Option<String>,
-    tag: Option<String>,
-    rev: Option<String>,
-    #[serde(default)]
-    template: Option<TemplateOptIn>,
-    #[serde(default)]
-    take: Option<Vec<TakeEntry>>,
-    #[serde(default)]
-    dest: Option<String>,
-    #[serde(default)]
-    collapse: Option<bool>,
-    #[serde(default)]
-    history: bool,
-    #[serde(default)]
-    offer: Option<String>,
-}
-
-impl TryFrom<BindingFields> for Binding {
-    type Error = String;
-
-    fn try_from(fields: BindingFields) -> std::result::Result<Self, Self::Error> {
-        let take = match (fields.dest, fields.take) {
-            (Some(dest), Some(_)) => {
-                return Err(format!(
-                    "`dest` cannot be combined with `take`; \
-                     add `{{ \"./\" = \"{dest}\" }}` to `take` instead"
-                ));
-            }
-            (Some(_), None) if fields.history => {
-                return Err("`history` cannot be combined with `dest`".to_owned());
-            }
-            (Some(dest), None) => Some(vec![TakeEntry::Rename {
-                src: "./".to_owned(),
-                dest,
-            }]),
-            (None, take) => take,
-        };
-        Ok(Self {
-            source: fields.source,
-            branch: fields.branch,
-            tag: fields.tag,
-            rev: fields.rev,
-            template: fields.template,
-            take,
-            collapse: fields.collapse,
-            history: fields.history,
-            offer: fields.offer,
-            composed_take: None,
-        })
-    }
 }
 
 impl Binding {
@@ -946,40 +895,5 @@ mod tests {
             resolved.take
         );
         let _ = PathBuf::new();
-    }
-
-    #[test]
-    fn a_binding_dest_becomes_a_whole_offer_subtree_rename() {
-        let b = binding(r#"dest = "apm""#);
-        assert!(
-            matches!(
-                b.take.as_deref(),
-                Some([TakeEntry::Rename { src, dest }]) if src == "./" && dest == "apm"
-            ),
-            "`dest` must desugar to take = [{{ \"./\" = \"apm\" }}]; got: {:?}",
-            b.take
-        );
-    }
-
-    #[test]
-    fn a_binding_dest_with_take_or_history_is_rejected() {
-        for (body, message) in [
-            (
-                r#"dest = "apm"
-take = ["a.md"]"#,
-                "`dest` cannot be combined with `take`",
-            ),
-            (
-                r#"dest = "apm"
-history = true"#,
-                "`history` cannot be combined with `dest`",
-            ),
-        ] {
-            let error = try_binding(body).expect_err("the combination must be rejected");
-            assert!(
-                error.to_string().contains(message),
-                "expected `{message}`; got: {error}"
-            );
-        }
     }
 }
