@@ -302,6 +302,7 @@ pub struct BindRefinement {
     pub tag: Option<String>,
     pub rev: Option<String>,
     pub take: Vec<TakeArg>,
+    pub dest: Option<String>,
     pub history: bool,
     pub offer: Option<String>,
 }
@@ -313,6 +314,7 @@ impl BindRefinement {
             && self.tag.is_none()
             && self.rev.is_none()
             && self.take.is_empty()
+            && self.dest.is_none()
             && !self.history
             && self.offer.is_none()
     }
@@ -340,6 +342,9 @@ fn keyed_binding_value(source: &str, identity: &str, refinement: &BindRefinement
     }
     if let Some(offer) = &refinement.offer {
         table.insert("offer", offer.as_str().into());
+    }
+    if let Some(dest) = &refinement.dest {
+        table.insert("dest", dest.as_str().into());
     }
     if !refinement.take.is_empty() {
         let mut take = Array::new();
@@ -419,6 +424,7 @@ fn merge_refinement(binding: &mut dyn toml_edit::TableLike, refinement: &BindRef
         ("tag", refinement.tag.as_deref()),
         ("rev", refinement.rev.as_deref()),
         ("offer", refinement.offer.as_deref()),
+        ("dest", refinement.dest.as_deref()),
     ] {
         if let Some(value) = value
             && binding

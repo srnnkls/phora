@@ -3791,6 +3791,7 @@ fn add_to_with_refinement_flags_writes_source_and_table_binding() {
                 r#as: Some("nvim".to_owned()),
                 include: Vec::new(),
                 exclude: Vec::new(),
+                dest: None,
             },
         })
         .expect("`add --to editor --as nvim --root nvim` must succeed");
@@ -3860,6 +3861,7 @@ fn add_to_with_no_refinement_flags_writes_a_bare_string_binding() {
                 r#as: None,
                 include: Vec::new(),
                 exclude: Vec::new(),
+                dest: None,
             },
         })
         .expect("`add --to editor` with no refinement flags must succeed");
@@ -3919,6 +3921,7 @@ fn add_as_with_multiple_targets_errors() {
                 r#as: Some("nvim".to_owned()),
                 include: Vec::new(),
                 exclude: Vec::new(),
+                dest: None,
             },
         })
     });
@@ -3959,6 +3962,7 @@ fn add_to_a_single_target_with_as_is_the_happy_path() {
                 r#as: Some("nvim".to_owned()),
                 include: Vec::new(),
                 exclude: Vec::new(),
+                dest: None,
             },
         })
         .expect(
@@ -4006,6 +4010,7 @@ fn bare_add_without_to_does_not_touch_targets() {
                 r#as: None,
                 include: Vec::new(),
                 exclude: Vec::new(),
+                dest: None,
             },
         })
         .expect("bare `add` with no `--to` must succeed");
@@ -4060,6 +4065,7 @@ fn add_to_with_root_scopes_the_source_not_the_binding() {
                 r#as: Some("nvim".to_owned()),
                 include: Vec::new(),
                 exclude: Vec::new(),
+                dest: None,
             },
         })
         .expect("`add --to editor --as nvim --root nvim` must succeed");
@@ -4114,6 +4120,7 @@ fn add_to_with_url_embedded_root_sets_the_source_root() {
                 r#as: None,
                 include: Vec::new(),
                 exclude: Vec::new(),
+                dest: None,
             },
         })
         .expect("`add github:owner/repo/subdir --to editor` must succeed");
@@ -4176,6 +4183,7 @@ fn bare_add_with_root_still_sets_the_source_root() {
                 r#as: None,
                 include: Vec::new(),
                 exclude: Vec::new(),
+                dest: None,
             },
         })
         .expect("bare `add --root` (no `--to`) must succeed");
@@ -4214,6 +4222,7 @@ fn add_as_without_to_errors() {
                 r#as: Some("nvim".to_owned()),
                 include: Vec::new(),
                 exclude: Vec::new(),
+                dest: None,
             },
         })
     });
@@ -4255,6 +4264,7 @@ fn add_local_with_to_errors() {
                 r#as: None,
                 include: Vec::new(),
                 exclude: Vec::new(),
+                dest: None,
             },
         })
     });
@@ -4296,6 +4306,7 @@ fn add_to_multiple_targets_writes_a_binding_in_each() {
                 r#as: None,
                 include: Vec::new(),
                 exclude: Vec::new(),
+                dest: None,
             },
         })
         .expect("`add --to editor --to shell` must succeed");
@@ -4348,6 +4359,7 @@ fn add_to_with_include_exclude_writes_arrays_on_the_source() {
                 r#as: None,
                 include: vec!["*.lua".to_owned()],
                 exclude: vec![".git".to_owned()],
+                dest: None,
             },
         })
         .expect("`add --to editor --include --exclude` must succeed");
@@ -4451,6 +4463,7 @@ fn add_to_target_without_sources_array_creates_the_array_and_binds() {
                 r#as: None,
                 include: Vec::new(),
                 exclude: Vec::new(),
+                dest: None,
             },
         })
         .expect("`add --to editor` must materialize a missing `sources` array, not error");
@@ -4497,6 +4510,7 @@ fn add_to_nonexistent_target_errors_and_leaves_file_untouched() {
                 r#as: None,
                 include: Vec::new(),
                 exclude: Vec::new(),
+                dest: None,
             },
         })
     });
@@ -6394,4 +6408,39 @@ fn add_history_rejects_final_merged_incompatibilities_before_writing() {
         "rejected inherited history root override must preserve phora.local.toml byte-for-byte"
     );
     assert_history_error_mentions(&error, "root");
+}
+
+#[test]
+fn bind_with_dest_writes_a_dest_that_re_roots_the_whole_offer() {
+    let toml = "version = 1\n\n\
+        [sources.apm]\ngit = \"https://github.com/microsoft/apm.git\"\n\n\
+        [targets.resources]\npath = \"resources\"\nsources = []\n";
+
+    let out = config_edit::bind(
+        toml,
+        "resources",
+        &["apm".to_owned()],
+        &config_edit::BindRefinement {
+            dest: Some("apm".to_owned()),
+            ..config_edit::BindRefinement::default()
+        },
+    )
+    .expect("bind --dest must succeed")
+    .text;
+
+    assert!(
+        out.contains("apm = { dest = \"apm\" }"),
+        "bind --dest must write a `dest` binding; got:\n{out}"
+    );
+    let cfg = Config::parse(&out)
+        .unwrap_or_else(|e| panic!("bind output must be valid phora.toml: {e}\n{out}"));
+    let refined = refined_binding(&cfg, "resources", "apm");
+    assert!(
+        matches!(
+            refined.take.as_deref(),
+            Some([crate::config::TakeEntry::Rename { src, dest }]) if src == "./" && dest == "apm"
+        ),
+        "`dest` must parse as the whole-offer subtree rename; got: {:?}",
+        refined.take
+    );
 }

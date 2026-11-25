@@ -121,6 +121,9 @@ pub enum Command {
         history: bool,
         #[arg(long = "as")]
         r#as: Option<String>,
+        /// Deploy the whole offer under this subdirectory of each `--to` target.
+        #[arg(long, requires = "to", conflicts_with = "history")]
+        dest: Option<String>,
     },
     /// Remove a source, unbind it everywhere, and remove what it deployed (alias for `source rm`).
     Rm { name: String },
@@ -224,7 +227,7 @@ pub enum Command {
         to: Vec<String>,
         #[arg(long)]
         local: bool,
-        #[arg(long, conflicts_with_all = ["root", "take"])]
+        #[arg(long, conflicts_with_all = ["root", "take", "dest"])]
         history: bool,
         #[arg(long = "as")]
         r#as: Option<String>,
@@ -232,6 +235,9 @@ pub enum Command {
         root: Option<String>,
         #[arg(long = "take")]
         take: Vec<String>,
+        /// Deploy the whole offer under this subdirectory of the target.
+        #[arg(long, conflicts_with = "take")]
+        dest: Option<String>,
         #[arg(long)]
         branch: Option<String>,
         #[arg(long)]
@@ -540,12 +546,14 @@ fn dispatch_add(cmd: Command) -> Result<()> {
         symlink,
         history,
         r#as,
+        dest,
     } = cmd
     else {
         unreachable!("dispatch_add only handles Command::Add")
     };
     let refinement = BindRefinement {
         r#as,
+        dest,
         history,
         ..BindRefinement::default()
     };
@@ -627,6 +635,7 @@ fn dispatch_bind(cmd: Command) -> Result<()> {
         r#as,
         root,
         take,
+        dest,
         branch,
         tag,
         rev,
@@ -649,6 +658,7 @@ fn dispatch_bind(cmd: Command) -> Result<()> {
                 .iter()
                 .map(|t| config_edit::TakeArg::parse(t))
                 .collect(),
+            dest,
             history,
             offer,
         },

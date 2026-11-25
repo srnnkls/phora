@@ -182,6 +182,7 @@ phora add git@github.com:me/dotfiles.git --tag v1.2
 # Bind sources to a target; --take subsets/renames the offer for that target
 phora bind dotfiles --to neovim                          # bare binding, takes the whole offer
 phora bind dotfiles --to neovim --as nvim --take nvim/**  # take just nvim/** under identity `nvim`
+phora bind apm --to resources --dest apm                  # deploy the whole offer under resources/apm/
 phora add --history <source> --to <target>                # add a source with a history-enabled binding
 phora bind gitoxide --history --to resources --to docs    # one history binding per repeated target
 phora unbind nvim --from neovim                          # remove a binding by identity
@@ -623,7 +624,7 @@ canary = { source = "fzf", tag = "v0.56.0" }
 ```
 
 CLI. `phora bind <source>… --to <target>` adds bindings; `--as`, `--take <entry>…`,
-and `--branch`/`--tag`/`--rev` refine the binding. A `--take` entry is a leaf, a glob,
+`--dest <dir>`, and `--branch`/`--tag`/`--rev` refine the binding. A `--take` entry is a leaf, a glob,
 or a `src=dest` rename (the `=` form writes the `{ src = dest }` rename table). Any
 binding refinement writes a keyed table entry; with no refinement it appends a bare
 source name to the target's flat list (or, if the target is already a keyed table,
@@ -704,6 +705,20 @@ sources.henia = { take = [{ "claude/" = "." }] }   # claude/skills/a/SKILL.md ->
 [targets.codex]
 path = "~/.codex"
 sources.henia = { take = [{ "codex/" = "." }] }
+```
+
+The `src` `"./"` names the whole offer, so `take = [{ "./" = "apm" }]` places every
+offered leaf under `apm/` in the target. A binding-level `dest = "apm"` is the same
+re-root without a `take`; `dest` cannot be combined with `take` or `history`. On the
+CLI, `--dest <dir>` on `phora bind` and on `phora add --to` writes it:
+
+```toml
+[sources.apm]
+git = "https://github.com/microsoft/apm.git"
+
+[targets.resources]
+path = "resources"
+sources.apm = { dest = "apm" }   # README.md -> resources/apm/README.md
 ```
 
 A literal or leaf rename inside the subtree wins for that leaf, a glob in the same

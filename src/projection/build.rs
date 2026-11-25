@@ -11,7 +11,9 @@ use crate::projection::model::{
     WorkspaceTargetInput,
 };
 use crate::projection::offer::OfferSelection;
-use crate::projection::take::{ResolvedTake, TakeResolution, TakeWarning, fold_dest, resolve_take};
+use crate::projection::take::{
+    ResolvedTake, TakeResolution, TakeWarning, fold_dest, resolve_take, subtree_prefix,
+};
 use crate::source::SourcePath;
 
 /// Projects one binding: compile the offer over the inventory, seal `take` over it,
@@ -220,12 +222,9 @@ fn classify_take_error(error: Error, offer: &[String], take: &TakeSpec) -> Proje
     {
         let offered: BTreeSet<&str> = offer.iter().map(String::as_str).collect();
         let unoffered = literals.iter().any(|leaf| !offered.contains(leaf.as_str()))
-            || renames.iter().any(|(src, _)| {
-                if src.ends_with('/') {
-                    !offer.iter().any(|leaf| leaf.starts_with(src.as_str()))
-                } else {
-                    !offered.contains(src.as_str())
-                }
+            || renames.iter().any(|(src, _)| match subtree_prefix(src) {
+                Some(prefix) => !offer.iter().any(|leaf| leaf.starts_with(prefix)),
+                None => !offered.contains(src.as_str()),
             });
         if unoffered {
             return ProjectionError::LeafNotOffered {

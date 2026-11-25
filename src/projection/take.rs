@@ -27,7 +27,8 @@ pub enum Take<'a> {
     /// A destructive rename: literal `src` is consumed out, emitted at `dest`.
     Rename { src: &'a str, dest: &'a str },
     /// A subtree rename: every offered leaf under `prefix` (ending in `/`) is
-    /// re-rooted at `dest`; `dest = "."` is the deploy root.
+    /// re-rooted at `dest`; `dest = "."` is the deploy root, and `prefix = "./"`
+    /// covers the whole offer.
     Subtree { prefix: &'a str, dest: &'a str },
 }
 
@@ -35,11 +36,22 @@ impl<'a> Take<'a> {
     /// Classifies a rename pair: a `src` ending in `/` names a subtree.
     #[must_use]
     pub fn rename(src: &'a str, dest: &'a str) -> Self {
-        if src.ends_with('/') {
+        if subtree_prefix(src).is_some() {
             Self::Subtree { prefix: src, dest }
         } else {
             Self::Rename { src, dest }
         }
+    }
+}
+
+/// The offered-leaf prefix a subtree rename `src` covers: `./` covers the whole
+/// offer, any other `src` ending in `/` covers itself.
+#[must_use]
+pub fn subtree_prefix(src: &str) -> Option<&str> {
+    if src == "./" {
+        Some("")
+    } else {
+        src.ends_with('/').then_some(src)
     }
 }
 
@@ -177,16 +189,17 @@ fn collect_subtrees<'o>(
 ) -> Result<Vec<(&'o str, String)>> {
     let mut roots: BTreeMap<&str, (&str, String)> = BTreeMap::new();
     for directive in directives {
-        let Take::Subtree { prefix, dest } = directive else {
+        let Take::Subtree { prefix: src, dest } = directive else {
             continue;
         };
+        let prefix = subtree_prefix(src).unwrap_or(src);
         if !offer.iter().any(|leaf| leaf.starts_with(prefix)) {
-            return Err(non_offered_subtree_diagnostic(prefix, offer));
+            return Err(non_offered_subtree_diagnostic(src, offer));
         }
         let root = subtree_root(dest)?;
         match roots.get(prefix) {
             Some((prior, prior_root)) if *prior_root != root => {
-                return Err(rename_fan_out_diagnostic(prefix, prior, dest));
+                return Err(rename_fan_out_diagnostic(src, prior, dest));
             }
             Some(_) => {}
             None => {
@@ -1177,6 +1190,39 @@ mod take_resolution_tests {
         assert_kept(
             &res,
             &[("claude/a.md", "a.md"), ("claude/skills/s.md", "s/s.md")],
+        );
+    }
+
+    #[test]
+    fn a_whole_offer_subtree_re_roots_every_leaf_under_its_dest() {
+        let offer = offer(&["a.md", "sub/b.md"]);
+        for dest in ["s", "s/"] {
+            let res = resolve(&offer, &[subtree("./", dest)]);
+            assert_kept(&res, &[("a.md", "s/a.md"), ("sub/b.md", "s/sub/b.md")]);
+        }
+    }
+
+    #[test]
+    fn a_more_specific_rename_wins_over_the_whole_offer_subtree() {
+        let offer = offer(&["a.md", "skills/s.md", "top.md"]);
+        let res = resolve(
+            &offer,
+            &[
+                subtree("./", "s"),
+                subtree("skills/", "k/"),
+                Take::Rename {
+                    src: "top.md",
+                    dest: "TOP.md",
+                },
+            ],
+        );
+        assert_kept(
+            &res,
+            &[
+                ("top.md", "TOP.md"),
+                ("skills/s.md", "k/s.md"),
+                ("a.md", "s/a.md"),
+            ],
         );
     }
 
