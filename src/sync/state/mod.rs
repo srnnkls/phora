@@ -1,7 +1,11 @@
+use std::ffi::OsStr;
 use std::path::Path;
+
+use crate::mount::NormalPath;
 
 mod durable;
 pub mod file;
+pub(crate) mod lifecycle;
 pub mod locking;
 
 pub(crate) use durable::fsync_barrier;
@@ -55,6 +59,18 @@ impl ProjectId {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+#[cfg_attr(not(test), expect(dead_code, reason = "stubs wired by T004 to T008"))]
+impl ProjectId {
+    pub(crate) fn of_canonical(_root: &NormalPath) -> Self {
+        todo!()
+    }
+
+    /// Exactly 16 lowercase hex chars.
+    pub(crate) fn parse(_name: &OsStr) -> Option<Self> {
+        todo!()
     }
 }
 

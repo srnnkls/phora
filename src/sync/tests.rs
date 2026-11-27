@@ -17140,3 +17140,348 @@ fn observe_workspace_rejects_duplicate_triplet() {
          artifact` diagnostic, got: {msg}"
     );
 }
+
+mod state_lifecycle_data_model {
+    use std::collections::BTreeMap;
+    use std::ffi::{OsStr, OsString};
+    use std::io::ErrorKind;
+    use std::num::NonZeroUsize;
+    use std::path::{Path, PathBuf};
+
+    use crate::mount::{
+        AnchorDir, CurrentAnchor, DeletionProof, Location, MountId, NormalPath, Placement,
+        Unproven, locate, normalize_lexical,
+    };
+    use crate::sync::state::lifecycle::{
+        Attention, Confirmation, Confirmed, DropOutcome, DropReason, EjectableWorktree,
+        ForgetReason, GcInput, GcOutcome, GcPlan, GcRecord, Held, IndexRead, JournalState,
+        KeepReason, Leftover, LegacyEvidence, LinkKept, LinkOutcome, MetaDefect, MetaRead, NotHeld,
+        PlannedAction, Probed, ProjectMeta, ProjectRoot, ProjectsEntry, Reason, RecordFate,
+        ReleasableLink, ReleaseReason, Remains, RootObservation, RootlessMeta, StateDirClass,
+        StateDirPath, StateDirProbe, StateRoot, StateRootIndex, Stranded, StrandedEvidence,
+        Succession, SweepFault, SweepInput, SweepReport, TrashEntry, TrashName, TrashSuffix,
+        Trashed, Unreachable, UnreachableRoot, WireDefect, apply_gc, classify, confirm, delete,
+        lock, plan_gc, probe, sweep, trash,
+    };
+    use crate::sync::state::{ArtifactKey, ProjectId, StateError};
+
+    fn mount_shapes(placement: &Placement, unproven: &Unproven, location: &Location) {
+        match placement {
+            Placement::OnAnchorMount | Placement::Elsewhere => {}
+        }
+        match unproven {
+            Unproven::RecordedElsewhere | Unproven::OffMount | Unproven::Encrypted => {}
+            Unproven::AnchorMoved { now } | Unproven::CanonicalDiffers { now } => {
+                let _: &NormalPath = now;
+            }
+            Unproven::SymlinkedComponent(path) => {
+                let _: &NormalPath = path;
+            }
+            Unproven::Fault(kind) => {
+                let _: &ErrorKind = kind;
+            }
+        }
+        match location {
+            Location::Present => {}
+            Location::Deleted(proof) => {
+                let _: &DeletionProof = proof;
+            }
+            Location::Unproven(unproven) => {
+                let _: &Unproven = unproven;
+            }
+        }
+    }
+
+    fn meta_shapes(succession: &Succession, meta_read: &MetaRead, index: &IndexRead) {
+        match succession {
+            Succession::Current => {}
+            Succession::SupersededBy(root) => {
+                let _: &StateRoot = root;
+            }
+        }
+        match meta_read {
+            MetaRead::Rootless(
+                RootlessMeta::Absent | RootlessMeta::Invalid(MetaDefect::RootHashMismatch),
+            ) => {}
+            MetaRead::Rootless(RootlessMeta::Invalid(MetaDefect::Wire(defect))) => {
+                wire_defect_shape(defect);
+            }
+            MetaRead::Valid { meta, succession } => {
+                let _: (&ProjectMeta, &Succession) = (meta, succession);
+            }
+        }
+        match index {
+            IndexRead::Missing => {}
+            IndexRead::Corrupt(defect) => wire_defect_shape(defect),
+            IndexRead::Unreadable(kind) => {
+                let _: &ErrorKind = kind;
+            }
+            IndexRead::Read(index) => {
+                let _: &StateRootIndex = index;
+            }
+        }
+    }
+
+    fn wire_defect_shape(defect: &WireDefect) {
+        match defect {
+            WireDefect::Unparsable | WireDefect::BadHex | WireDefect::NotAbsolute => {}
+            WireDefect::UnsupportedVersion(version) => {
+                let _: &u32 = version;
+            }
+        }
+    }
+
+    fn probe_shapes(probe: &StateDirProbe, observation: &RootObservation, fate: &RecordFate) {
+        match probe {
+            StateDirProbe::Unreadable(kind) => {
+                let _: &ErrorKind = kind;
+            }
+            StateDirProbe::Empty => {}
+            StateDirProbe::Unrooted { meta } => {
+                let _: &RootlessMeta = meta;
+            }
+            StateDirProbe::Rooted {
+                meta,
+                succession,
+                root,
+            } => {
+                let _: (&ProjectMeta, &Succession, &RootObservation) = (meta, succession, root);
+            }
+        }
+        match observation {
+            RootObservation::Present { manifest } => match manifest {
+                Probed::Present | Probed::Absent => {}
+                Probed::Fault(kind) => {
+                    let _: &ErrorKind = kind;
+                }
+            },
+            RootObservation::Deleted { proof, remains } => {
+                let _: (&DeletionProof, &Remains) = (proof, remains);
+            }
+            RootObservation::Unproven(unproven) => {
+                let _: &Unproven = unproven;
+            }
+        }
+        match fate {
+            RecordFate::Ejected | RecordFate::Absent => {}
+            RecordFate::Releasable(link) => {
+                let _: &ReleasableLink = link;
+            }
+            RecordFate::PresentOutside(path) => {
+                let _: &NormalPath = path;
+            }
+            RecordFate::Unresolvable { key } => {
+                let _: &ArtifactKey = key;
+            }
+            RecordFate::Fault { key, kind } => {
+                let _: (&ArtifactKey, &ErrorKind) = (key, kind);
+            }
+        }
+    }
+
+    fn journal_shape(journal: &JournalState) {
+        match journal {
+            JournalState::Clear => {}
+            JournalState::Pending { entries } => {
+                let _: &NonZeroUsize = entries;
+            }
+        }
+    }
+
+    fn class_shapes(class: &StateDirClass) {
+        match class {
+            StateDirClass::Keep(KeepReason::Live) | StateDirClass::Drop(DropReason::Empty) => {}
+            StateDirClass::Drop(DropReason::Gone { proof, links }) => {
+                let _: (&DeletionProof, &Vec<ReleasableLink>) = (proof, links);
+            }
+            StateDirClass::Release(ReleaseReason::Retired { root }) => {
+                let _: &ProjectRoot = root;
+            }
+            StateDirClass::Release(ReleaseReason::Stranded(stranded)) => {
+                let _: &Stranded = stranded;
+            }
+            StateDirClass::Forget(reason) => forget_shape(reason),
+        }
+    }
+
+    fn forget_shape(reason: &ForgetReason) {
+        match reason {
+            ForgetReason::Unrooted { meta } => {
+                let _: &RootlessMeta = meta;
+            }
+            ForgetReason::Abandoned { root, successor } => {
+                let _: (&ProjectRoot, &StateRoot) = (root, successor);
+            }
+            ForgetReason::Unreachable(Unreachable::Unreadable(kind)) => {
+                let _: &ErrorKind = kind;
+            }
+            ForgetReason::Unreachable(Unreachable::Root { root, cause }) => {
+                let _: &ProjectRoot = root;
+                match cause {
+                    UnreachableRoot::Unproven(unproven) => {
+                        let _: &Unproven = unproven;
+                    }
+                    UnreachableRoot::ManifestFault(kind)
+                    | UnreachableRoot::DestinationFault(kind) => {
+                        let _: &ErrorKind = kind;
+                    }
+                }
+            }
+        }
+    }
+
+    fn reason_shape(reason: Reason) {
+        match reason {
+            Reason::Empty
+            | Reason::Unrooted
+            | Reason::Abandoned
+            | Reason::Live
+            | Reason::Retired
+            | Reason::Unreachable
+            | Reason::Stranded
+            | Reason::Gone => {}
+        }
+    }
+
+    fn action_shapes(action: &PlannedAction) {
+        match action {
+            PlannedAction::Drop { dir, reason } => {
+                let _: (&StateDirPath, &DropReason) = (dir, reason);
+            }
+            PlannedAction::ReleaseLinks { dir, stranded } => {
+                let _: (&StateDirPath, &Stranded) = (dir, stranded);
+            }
+            PlannedAction::Eject {
+                dir,
+                reason,
+                worktrees,
+            } => {
+                let _: (&StateDirPath, &ReleaseReason, &Vec<EjectableWorktree>) =
+                    (dir, reason, worktrees);
+            }
+            PlannedAction::Forget { dir, reason } => {
+                let _: (&StateDirPath, &ForgetReason) = (dir, reason);
+            }
+            PlannedAction::Report { dir, attention } => {
+                let _: &StateDirPath = dir;
+                match attention {
+                    Attention::Retired { root } => {
+                        let _: &ProjectRoot = root;
+                    }
+                    Attention::Stranded(stranded) => {
+                        let _: &Stranded = stranded;
+                    }
+                    Attention::Forget(reason) => forget_shape(reason),
+                }
+            }
+        }
+    }
+
+    fn removal_shapes(not_held: &NotHeld, outcome: &DropOutcome, confirmation: &Confirmation) {
+        match not_held {
+            NotHeld::Vanished | NotHeld::Busy => {}
+            NotHeld::Fault(kind) => {
+                let _: &ErrorKind = kind;
+            }
+        }
+        match outcome {
+            DropOutcome::Deleted | DropOutcome::Vanished | DropOutcome::Busy => {}
+            DropOutcome::Leftover(leftover) => {
+                let _: &Leftover = leftover;
+            }
+            DropOutcome::Released(links) => {
+                for link in links {
+                    link_shape(link);
+                }
+            }
+            DropOutcome::Reclassified(reason) => {
+                let _: &Reason = reason;
+            }
+            DropOutcome::Fault(error) => {
+                let _: &StateError = error;
+            }
+        }
+        match confirmation {
+            Confirmation::Granted | Confirmation::Withheld => {}
+        }
+    }
+
+    fn link_shape(link: &LinkOutcome) {
+        match link {
+            LinkOutcome::Unlinked | LinkOutcome::Kept(LinkKept::Confined) => {}
+            LinkOutcome::Kept(LinkKept::Fault(kind)) => {
+                let _: &ErrorKind = kind;
+            }
+        }
+    }
+
+    fn enumeration_shapes(entry: &ProjectsEntry, name: &TrashName, record: &GcRecord) {
+        match entry {
+            ProjectsEntry::State(dir) => {
+                let _: &StateDirPath = dir;
+            }
+            ProjectsEntry::Foreign(path) => {
+                let _: &NormalPath = path;
+            }
+        }
+        match name {
+            TrashName::Entry(entry) => {
+                let _: &TrashEntry = entry;
+            }
+            TrashName::Foreign(name) => {
+                let _: &OsString = name;
+            }
+        }
+        match record {
+            GcRecord::Unrooted { action, legacy } => {
+                let _: (&PlannedAction, &LegacyEvidence) = (action, legacy);
+            }
+            GcRecord::Rooted { action, leftovers } => {
+                let _: (&PlannedAction, &Vec<NormalPath>) = (action, leftovers);
+            }
+        }
+    }
+
+    #[test]
+    fn lifecycle_types_and_signatures_match_the_scope_data_model() {
+        let _: fn(&Path) -> PathBuf = normalize_lexical;
+        let _: fn(&Path) -> Option<NormalPath> = NormalPath::lexical;
+        let _: fn(&NormalPath, Placement, &AnchorDir, &CurrentAnchor) -> Location = locate;
+        let _ = |proof: &DeletionProof| {
+            let _ = proof.path();
+        };
+
+        let _: fn(&NormalPath) -> ProjectId = ProjectId::of_canonical;
+        let _: fn(&OsStr) -> Option<ProjectId> = ProjectId::parse;
+        let _ = |root: NormalPath, id: &ProjectId, path: &Path| {
+            let _ = ProjectRoot::recorded(root, id);
+            let _ = ProjectRoot::canonicalize(path);
+        };
+
+        let _: fn(&StateDirPath, &CurrentAnchor) -> StateDirProbe = probe;
+        let _: fn(&StateDirProbe) -> StateDirClass = classify;
+        let _: fn(&StateDirClass) -> Reason = StateDirClass::reason;
+        let _: fn(&SweepInput) -> SweepReport = sweep;
+        let _: fn(&GcInput) -> GcPlan = plan_gc;
+        let _: fn(GcPlan, Confirmation) -> GcOutcome = apply_gc;
+
+        let _: fn(PlannedAction) -> Result<Held, NotHeld> = lock;
+        let _: fn(Held, Reason) -> Result<Confirmed, Reason> = confirm;
+        let _: fn(Confirmed) -> Result<Trashed, StateError> = trash;
+        let _: fn(Trashed) -> Result<(), Leftover> = delete;
+
+        let _: fn(&Placement, &Unproven, &Location) = mount_shapes;
+        let _: fn(&Succession, &MetaRead, &IndexRead) = meta_shapes;
+        let _: fn(&StateDirProbe, &RootObservation, &RecordFate) = probe_shapes;
+        let _: fn(&JournalState) = journal_shape;
+        let _: fn(&StateDirClass) = class_shapes;
+        let _: fn(&PlannedAction) = action_shapes;
+        let _: fn(&NotHeld, &DropOutcome, &Confirmation) = removal_shapes;
+        let _: fn(&ProjectsEntry, &TrashName, &GcRecord) = enumeration_shapes;
+
+        let _: Option<(MountId, TrashSuffix, StrandedEvidence, SweepFault)> = None;
+        let _: Option<BTreeMap<Reason, NonZeroUsize>> = None;
+
+        let _: fn(Reason) = reason_shape;
+    }
+}

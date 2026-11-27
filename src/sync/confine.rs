@@ -7,6 +7,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::config::Paths;
 use crate::error::{Error, Result};
+use crate::mount::normalize_lexical;
 use crate::paths::{cache_root_for, state_root_for};
 use crate::source::safe_component;
 
@@ -188,25 +189,6 @@ pub(super) fn reject_symlink_ancestor_at_write(anchor: &Path, dst: &Path) -> Res
         Some(parent) => reject_symlink_ancestor(&normalize_lexical(anchor), parent),
         None => Ok(()),
     }
-}
-
-/// Collapses `.`/`..` without touching the filesystem, so confinement holds for paths that do not yet exist.
-fn normalize_lexical(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::ParentDir => match out.components().next_back() {
-                Some(Component::Normal(_)) => {
-                    out.pop();
-                }
-                Some(Component::RootDir | Component::Prefix(_)) => {}
-                _ => out.push(".."),
-            },
-            Component::CurDir => {}
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
 }
 
 /// Same file via different representations (e.g. `/var` -> `/private/var`) must

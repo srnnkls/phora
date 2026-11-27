@@ -16,6 +16,7 @@ pub mod diagnostic;
 pub mod digest;
 pub mod error;
 pub mod lock;
+pub(crate) mod mount;
 pub mod paths;
 pub mod projection;
 pub mod source;
