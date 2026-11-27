@@ -292,6 +292,7 @@ fn materialize(
         sink: SILENT,
         trust_prompt: None,
         lockless: false,
+        sweep: None,
         ..*input
     };
     let registry = FileStateStore::open(scratch.path.join("state"))?;

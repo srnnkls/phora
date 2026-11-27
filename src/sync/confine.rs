@@ -42,6 +42,12 @@ impl ProtectedPathSet {
         })
     }
 
+    #[must_use]
+    pub(super) fn protecting(mut self, path: &Path) -> Self {
+        self.members.push(normalize_lexical(path));
+        self
+    }
+
     fn protects(&self, path: &Path) -> bool {
         let absolute = if path.is_absolute() {
             path.to_path_buf()

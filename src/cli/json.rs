@@ -121,6 +121,7 @@ fn warning_kind(warning: &SyncWarning) -> &'static str {
         SyncWarning::HistoryContentFilter { .. } => "history_content_filter",
         SyncWarning::BuildFailed { .. } => "build_failed",
         SyncWarning::ContentStoreRepaired { .. } => "content_store_repaired",
+        SyncWarning::StateNeedsAttention { .. } => "state_needs_attention",
     }
 }
 
@@ -147,6 +148,7 @@ fn summary_record(summary: &SyncSummary) -> Value {
         "failures": summary.failures,
         "hooks_run": summary.hooks_run,
         "hooks_failed": summary.hooks_failed,
+        "state_dirs_dropped": summary.state_dirs_dropped,
         "elapsed_ms": summary.elapsed.as_millis(),
     })
 }

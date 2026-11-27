@@ -164,6 +164,10 @@ impl StateRootIndex {
     pub fn register(&mut self, root: StateRoot, placement: Placement) -> bool {
         self.roots.insert(root, placement) != Some(placement)
     }
+
+    pub fn unregister(&mut self, root: &StateRoot) {
+        self.roots.retain(|registered, _| registered != root);
+    }
 }
 
 #[derive(Debug)]
@@ -255,9 +259,9 @@ pub enum RecordFate {
 
 #[derive(Debug, Clone)]
 pub struct ReleasableLink {
-    path: NormalPath,
-    link_target: NormalPath,
-    anchor: NormalPath,
+    pub(super) path: NormalPath,
+    pub(super) link_target: NormalPath,
+    pub(super) anchor: NormalPath,
 }
 
 #[derive(Debug)]
@@ -326,7 +330,7 @@ fn unreachable_root(root: ProjectRoot, cause: UnreachableRoot) -> StateDirClass 
     StateDirClass::Forget(ForgetReason::Unreachable(Unreachable::Root { root, cause }))
 }
 
-/// Rows 6 to 8 for a root AD-2 proves deleted.
+/// The `gone` and `stranded` rows for a root proven deleted.
 fn deleted(root: ProjectRoot, proof: &DeletionProof, remains: &Remains) -> StateDirClass {
     let mut links = Vec::new();
     let mut present_outside = Vec::new();
@@ -375,8 +379,8 @@ pub enum ReleaseReason {
 
 #[derive(Debug)]
 pub struct Stranded {
-    proof: DeletionProof,
-    links: Vec<ReleasableLink>,
+    pub(super) proof: DeletionProof,
+    pub(super) links: Vec<ReleasableLink>,
     evidence: StrandedEvidence,
 }
 
@@ -447,6 +451,27 @@ pub enum Reason {
     Gone,
 }
 
+impl Reason {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::Unrooted => "unrooted",
+            Self::Abandoned => "abandoned",
+            Self::Live => "live",
+            Self::Retired => "retired",
+            Self::Unreachable => "unreachable",
+            Self::Stranded => "stranded",
+            Self::Gone => "gone",
+        }
+    }
+
+    /// Whether a sweep that leaves a dir with this reason counts it in its warning.
+    fn needs_attention(self) -> bool {
+        !matches!(self, Self::Empty | Self::Live | Self::Gone)
+    }
+}
+
 #[derive(Debug)]
 pub enum PlannedAction {
     Drop {
@@ -473,6 +498,17 @@ pub enum PlannedAction {
         dir: StateDirPath,
         attention: Attention,
     },
+}
+
+impl PlannedAction {
+    pub fn dir(&self) -> &StateDirPath {
+        let (Self::Drop { dir, .. }
+        | Self::ReleaseLinks { dir, .. }
+        | Self::Eject { dir, .. }
+        | Self::Forget { dir, .. }
+        | Self::Report { dir, .. }) = self;
+        dir
+    }
 }
 
 #[derive(Debug)]
@@ -522,7 +558,17 @@ pub struct Leftover {
 
 /// Unique per rename.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TrashSuffix(pub(super) String);
+pub struct TrashSuffix(String);
+
+impl TrashSuffix {
+    pub(super) fn new(suffix: String) -> Self {
+        Self(suffix)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 /// `<root>/trash/<id>.<suffix>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -578,9 +624,9 @@ pub enum Confirmation {
 /// The index path and the swept roots derive from `default` and `index`.
 #[derive(Debug)]
 pub struct SweepInput {
-    default: StateRoot,
-    index: IndexRead,
-    own: Option<StateDirPath>,
+    pub(super) default: StateRoot,
+    pub(super) index: IndexRead,
+    pub(super) own: Option<StateDirPath>,
 }
 
 #[derive(Debug)]
@@ -589,15 +635,65 @@ pub struct SweepFault {
     error: StateError,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct SweepReport {
-    dropped: Vec<StateDirPath>,
-    released: Vec<NormalPath>,
-    links_kept: Vec<(NormalPath, LinkOutcome)>,
-    busy: Vec<StateDirPath>,
-    leftovers: Vec<TrashEntry>,
+    pub(super) dropped: Vec<StateDirPath>,
+    pub(super) released: Vec<NormalPath>,
+    pub(super) links_kept: Vec<(NormalPath, LinkOutcome)>,
+    pub(super) busy: Vec<StateDirPath>,
+    pub(super) leftovers: Vec<TrashEntry>,
     attention: BTreeMap<Reason, NonZeroUsize>,
     faults: Vec<SweepFault>,
+}
+
+impl SweepReport {
+    /// Counts a dir the sweep leaves in place, when its reason needs attention.
+    pub(super) fn attend(&mut self, reason: Reason) {
+        if reason.needs_attention() {
+            self.attention
+                .entry(reason)
+                .and_modify(|count| *count = count.saturating_add(1))
+                .or_insert(NonZeroUsize::MIN);
+        }
+    }
+
+    pub(super) fn fault(&mut self, dir: Option<StateDirPath>, error: StateError) {
+        self.faults.push(SweepFault { dir, error });
+    }
+
+    #[must_use]
+    pub fn dropped(&self) -> usize {
+        self.dropped.len()
+    }
+
+    /// The count of each reason the sweep left for attention.
+    #[must_use]
+    pub fn attention(&self) -> &BTreeMap<Reason, NonZeroUsize> {
+        &self.attention
+    }
+
+    #[must_use]
+    pub fn released_links(&self) -> usize {
+        self.released.len()
+    }
+
+    #[must_use]
+    pub fn busy(&self) -> usize {
+        self.busy.len()
+    }
+
+    #[must_use]
+    pub fn leftovers(&self) -> usize {
+        self.leftovers.len()
+    }
+
+    /// Each fault, prefixed with its dir when it has one.
+    pub fn faults(&self) -> impl Iterator<Item = String> + '_ {
+        self.faults.iter().map(|fault| match &fault.dir {
+            Some(dir) => format!("{}: {}", dir.path().as_path().display(), fault.error),
+            None => fault.error.to_string(),
+        })
+    }
 }
 
 #[derive(Debug)]

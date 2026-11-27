@@ -96,7 +96,8 @@ use crate::source::{
     SourceName, SourceStore, WorktreeAdminId, WorktreeDeployRequest, WorktreeMirrorGuard,
     WorktreeRemoveRequest, is_local_path, remove_missing_mirror_worktree_gitlink,
 };
-use crate::sync::state::{ArtifactKey, ArtifactRecord, Ejection, StateStore};
+use crate::sync::state::lifecycle::{self, SweepReport};
+use crate::sync::state::{ArtifactKey, ArtifactRecord, Ejection, StateStore, SweepInput};
 
 use journal::Journal;
 use recovery::recovery_sweep;
@@ -191,6 +192,7 @@ struct SyncRunInput<'a> {
     sink: &'a dyn ProgressSink,
     trust_prompt: Option<&'a dyn TrustPrompt>,
     lockless: bool,
+    sweep: Option<&'a SweepInput>,
 }
 
 impl SyncRunInput<'_> {
@@ -213,6 +215,10 @@ trait RunOptions {
     }
 
     fn trust_prompt(&self) -> Option<&dyn TrustPrompt> {
+        None
+    }
+
+    fn sweep(&self) -> Option<&SweepInput> {
         None
     }
 
@@ -255,6 +261,10 @@ impl RunOptions for SyncRunInput<'_> {
 
     fn trust_prompt(&self) -> Option<&dyn TrustPrompt> {
         self.trust_prompt
+    }
+
+    fn sweep(&self) -> Option<&SweepInput> {
+        self.sweep
     }
 }
 
@@ -300,6 +310,7 @@ impl TestSyncInvocation for SyncRequest<'_> {
             sink: self.sink,
             trust_prompt: self.trust_prompt,
             lockless: false,
+            sweep: None,
         }
     }
 
@@ -356,6 +367,7 @@ impl TestSyncInvocation for SyncInput<'_> {
             sink: progress::SILENT,
             trust_prompt: None,
             lockless: self.lockless,
+            sweep: None,
         }
     }
 
@@ -1088,6 +1100,11 @@ fn request_run_input<'a>(request: &'a SyncRequest<'a>, lockless: bool) -> SyncRu
         sink: request.sink,
         trust_prompt: request.trust_prompt,
         lockless,
+        sweep: if lockless {
+            None
+        } else {
+            request.sweep.as_ref()
+        },
     }
 }
 
@@ -1253,6 +1270,7 @@ fn sync_workspace<R: StateStore>(
         input.jobs(),
         input.sink(),
     )?;
+    let build_failed = builds.failed;
     builds.route(&mut routed);
     input.sink().phase_finished(Phase::Resolve);
     let (mut base_lock, local_lock) = split_locks(routed.locks, &local_names);
@@ -1324,12 +1342,13 @@ fn sync_workspace<R: StateStore>(
         pre_sync_outcomes,
         events,
         started,
+        build_failed,
     )
 }
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "the deploy phase threads both locks, both hook sets, the accumulator, and the run clock"
+    reason = "the deploy phase threads both locks, both hook sets, the accumulator, the run clock, and the build outcome"
 )]
 fn deploy_and_run_hooks<R>(
     deploy: &DeployAll<'_, R>,
@@ -1340,6 +1359,7 @@ fn deploy_and_run_hooks<R>(
     pre_sync_outcomes: Vec<hooks::HookOutcome>,
     events: SyncEvents,
     started: std::time::Instant,
+    build_failed: bool,
 ) -> Result<SyncExecution>
 where
     R: StateStore,
@@ -1392,7 +1412,15 @@ where
         .iter()
         .any(|o| o.status == hooks::HookStatus::Failure);
 
-    let summary = summarize(
+    let sweep = deploy
+        .input
+        .sweep()
+        .filter(|_| !had_failures && !build_failed)
+        .map(lifecycle::sweep);
+    if let Some(warning) = sweep.as_ref().and_then(state_attention_warning) {
+        run.events.push_warning(warning);
+    }
+    let mut summary = summarize(
         deploy.config.targets.len(),
         run.events.unchanged,
         &run.events.applied,
@@ -1400,6 +1428,7 @@ where
         &hook_results,
         started.elapsed(),
     );
+    summary.state_dirs_dropped = sweep.as_ref().map_or(0, SweepReport::dropped);
     deploy.input.sink().finished(&summary);
 
     Ok(SyncExecution {
@@ -1420,6 +1449,24 @@ where
             },
         },
         deploy_failures,
+    })
+}
+
+/// The one warning naming `phora gc`; `None` when the sweep left nothing for attention.
+fn state_attention_warning(sweep: &SweepReport) -> Option<SyncWarning> {
+    let reasons = sweep.attention().clone();
+    let faults: Vec<String> = sweep.faults().collect();
+    let quiet = reasons.is_empty()
+        && sweep.released_links() == 0
+        && sweep.busy() == 0
+        && sweep.leftovers() == 0
+        && faults.is_empty();
+    (!quiet).then(|| SyncWarning::StateNeedsAttention {
+        reasons,
+        released_links: sweep.released_links(),
+        busy: sweep.busy(),
+        leftovers: sweep.leftovers(),
+        faults,
     })
 }
 

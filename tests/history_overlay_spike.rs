@@ -302,6 +302,7 @@ fn sync_history(
             resolver: None,
             sink: phora::sync::progress::SILENT,
             trust_prompt: None,
+            sweep: None,
         },
         backend,
         registry,

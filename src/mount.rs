@@ -192,7 +192,7 @@ pub enum Location {
     Unproven(Unproven),
 }
 
-/// Walks `path` with `symlink_metadata`; an absent path is `Deleted` only when every AD-2 clause holds.
+/// Walks `path` with `symlink_metadata`; an absent path is `Deleted` only when every deletion-proof clause holds.
 pub fn locate(
     path: &NormalPath,
     placement: Placement,

@@ -122,8 +122,40 @@ pub(super) fn format_sync_warning(warning: &SyncWarning) -> Option<String> {
         SyncWarning::BuildFailed { source, detail } => {
             format!("build `{source}` failed ({detail}); keeping its previous output")
         }
+        SyncWarning::StateNeedsAttention { .. } => return format_state_attention(warning),
     };
     Some(rendered)
+}
+
+fn format_state_attention(warning: &SyncWarning) -> Option<String> {
+    let SyncWarning::StateNeedsAttention {
+        reasons,
+        released_links,
+        busy,
+        leftovers,
+        faults,
+    } = warning
+    else {
+        return None;
+    };
+    let mut parts: Vec<String> = reasons
+        .iter()
+        .map(|(reason, count)| format!("{count} {}", reason.label()))
+        .collect();
+    if *released_links > 0 {
+        parts.push(format!("{released_links} dangling link(s) released"));
+    }
+    if *busy > 0 {
+        parts.push(format!("{busy} skipped while locked"));
+    }
+    if *leftovers > 0 {
+        parts.push(format!("{leftovers} trash entry(ies) left behind"));
+    }
+    parts.extend(faults.iter().cloned());
+    Some(format!(
+        "state dirs: {}; run `phora gc` to review",
+        parts.join(", ")
+    ))
 }
 
 fn format_conflict_modified(

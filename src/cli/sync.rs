@@ -9,6 +9,7 @@ use std::time::Duration;
 use crate::error::{Error, Result};
 use crate::lock::{Lock, merge_locks};
 use crate::paths::cache_root_for;
+use crate::sync::state::lifecycle;
 use crate::sync::state::{FileStateStore, StateError, StateStore};
 use crate::sync::{
     Concurrency, ConflictPolicy, ConflictResolver, HookPolicy, LockSet, PrunePolicy, SkippedChange,
@@ -70,7 +71,11 @@ pub(super) fn run_sync(
         super::record_project_root(&cwd, &own, &root, held);
     }
     let lockless = guard.is_none();
-    let _guard = guard;
+    let sweep = (!lockless && source_policy != SourcePolicy::Frozen)
+        .then(|| super::lexical_state_root(None, &cwd).ok())
+        .flatten()
+        .map(|default| lifecycle::sweep_input(default, Some(own.clone())));
+    let _guard = guard.map(|held| super::OwnStateLock { own, held });
     if !lockless && let Some(advisory) = registry.lock_advisory() {
         eprintln!("{advisory}");
     }
@@ -120,6 +125,7 @@ pub(super) fn run_sync(
         resolver: interactive.then_some(&resolver as &dyn ConflictResolver),
         sink: reporter.sink(),
         trust_prompt: interactive.then_some(&trust_prompt as &dyn crate::sync::TrustPrompt),
+        sweep,
     };
     let out = sync_opened(&request, &backend, &registry, lockless).inspect_err(|error| {
         request.sink.aborted(&error.to_string());

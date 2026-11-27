@@ -1,13 +1,13 @@
 //! Public request and report values for a synchronization run.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use crate::config::Config;
 use crate::lock::Lock;
 use crate::projection::diagnostic::ProjectionWarning;
-use crate::sync::state::ArtifactRecord;
+use crate::sync::state::{ArtifactRecord, Reason, SweepInput};
 
 use super::ConflictResolver;
 use super::hooks::HookOutcome;
@@ -52,6 +52,8 @@ pub struct SyncRequest<'a> {
     pub resolver: Option<&'a dyn ConflictResolver>,
     pub sink: &'a dyn ProgressSink,
     pub trust_prompt: Option<&'a dyn TrustPrompt>,
+    /// Present on a locked, non-frozen run, which sweeps the state roots before it finishes.
+    pub sweep: Option<SweepInput>,
 }
 
 /// Explicit policies controlling synchronization.
@@ -318,6 +320,14 @@ pub enum SyncWarning {
     /// A content-store object no longer held its bytes and was rewritten.
     ContentStoreRepaired {
         object: PathBuf,
+    },
+    /// State dirs the sweep left for `phora gc`, and what it could not finish.
+    StateNeedsAttention {
+        reasons: BTreeMap<Reason, NonZeroUsize>,
+        released_links: usize,
+        busy: usize,
+        leftovers: usize,
+        faults: Vec<String>,
     },
 }
 

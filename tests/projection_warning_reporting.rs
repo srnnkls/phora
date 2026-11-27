@@ -89,6 +89,7 @@ fn sync_with_unmatched_take(pre_deploy: Option<&str>) -> (TempDir, SyncReport) {
             resolver: None,
             sink: phora::sync::progress::SILENT,
             trust_prompt: None,
+            sweep: None,
         },
         &backend,
         &registry,

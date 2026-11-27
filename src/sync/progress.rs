@@ -80,6 +80,7 @@ pub struct SyncSummary {
     pub sources_fetched: usize,
     pub hooks_run: usize,
     pub hooks_failed: usize,
+    pub state_dirs_dropped: usize,
     pub elapsed: std::time::Duration,
 }
 

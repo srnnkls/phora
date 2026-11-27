@@ -18058,7 +18058,7 @@ mod state_lifecycle_removal {
                 assert!(Instant::now() < deadline, "the waiter never blocked");
                 std::thread::sleep(Duration::from_millis(5));
             }
-            std::fs::remove_dir_all(&dir).expect("the holder removes its dir (FR-2)");
+            std::fs::remove_dir_all(&dir).expect("the holder removes its dir");
             drop(holder);
 
             let relocked = waiting

@@ -433,7 +433,7 @@ pub(super) fn atomic_write(path: &Path, contents: &str) -> Result<()> {
 fn atomic_write_with(
     path: &Path,
     contents: &str,
-    sync: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+    flush: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
 ) -> Result<()> {
     let parent = path
         .parent()
@@ -451,7 +451,7 @@ fn atomic_write_with(
         handle
             .write_all(contents.as_bytes())
             .map_err(|e| StateError::StateStore(format!("write temp {}: {e}", tmp.display())))?;
-        sync(&handle)
+        flush(&handle)
             .map_err(|e| StateError::StateStore(format!("fsync temp {}: {e}", tmp.display())))?;
     }
     std::fs::rename(&tmp, path).map_err(|e| {

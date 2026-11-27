@@ -970,7 +970,7 @@ fn open_project_registry(config: &Config) -> Result<FileStateStore> {
 fn lock_project_registry(
     config: &Config,
     lock_timeout: Duration,
-) -> Result<(FileStateStore, StateLock)> {
+) -> Result<(FileStateStore, OwnStateLock)> {
     let cwd = std::env::current_dir()?;
     let (own, root) = own_state_dir(&cwd, config)?;
     let registry = FileStateStore::open(own.path().as_path().to_path_buf())?
@@ -978,7 +978,21 @@ fn lock_project_registry(
         .on_lock_wait(announce_lock_wait);
     let guard = registry.acquire_lock()?;
     record_project_root(&cwd, &own, &root, &guard);
-    Ok((registry, guard))
+    Ok((registry, OwnStateLock { own, held: guard }))
+}
+
+/// The run's own `state.lock`; at release it removes the state dir when it holds no state.
+struct OwnStateLock {
+    own: StateDirPath,
+    held: StateLock,
+}
+
+impl Drop for OwnStateLock {
+    fn drop(&mut self) {
+        if let Err(error) = lifecycle::remove_stateless(&self.own, &self.held) {
+            eprintln!("phora: removing the empty state dir: {error}");
+        }
+    }
 }
 
 /// The run's own state dir, lexically normalized, and its project root.

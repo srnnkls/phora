@@ -81,6 +81,7 @@ fn assert_exact_public_shapes<'a>(request: SyncRequest<'a>, report: SyncReport) 
         resolver,
         sink,
         trust_prompt,
+        sweep,
     } = request;
     let _: &'a Config = base_config;
     let _: Option<&'a Config> = local_config;
@@ -89,6 +90,7 @@ fn assert_exact_public_shapes<'a>(request: SyncRequest<'a>, report: SyncReport) 
     let _: Option<&'a dyn ConflictResolver> = resolver;
     let _: &'a dyn ProgressSink = sink;
     let _: Option<&'a dyn phora::sync::TrustPrompt> = trust_prompt;
+    let _: Option<_> = sweep;
 
     let SyncOptions {
         source_policy,
@@ -204,6 +206,7 @@ fn assert_request_flow_returns_conflict_warning_and_remove_outcomes() {
         resolver: Some(&spy),
         sink: phora::sync::progress::SILENT,
         trust_prompt: None,
+        sweep: None,
     };
     let backend = GitBackend::new(temp.path().join("cache"));
     let report = sync(&request, &backend, &registry).expect("request flow succeeds");
@@ -1132,7 +1135,7 @@ fn public_sync_tree_escape_hatches(path: &Path) -> Vec<String> {
         .collect()
 }
 
-const ALLOWED_SYNC_WARNING_SHAPES: [&str; 19] = [
+const ALLOWED_SYNC_WARNING_SHAPES: [&str; 20] = [
     "Projection(ProjectionWarning)",
     "MalformedTransitiveHooks{target:String,detail:String}",
     "LinkPathNotPortable{source:String,path:PathBuf}",
@@ -1152,6 +1155,7 @@ const ALLOWED_SYNC_WARNING_SHAPES: [&str; 19] = [
     "HistoryContentFilter{source:String,attributes:bool,autocrlf:bool}",
     "BuildFailed{source:String,detail:String}",
     "ContentStoreRepaired{object:PathBuf}",
+    "StateNeedsAttention{reasons:BTreeMap<Reason,NonZeroUsize>,released_links:usize,busy:usize,leftovers:usize,faults:Vec<String>}",
 ];
 
 fn render_tokens(tokens: &[Token]) -> String {

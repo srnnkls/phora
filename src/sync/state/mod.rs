@@ -14,6 +14,7 @@ pub use file::{
     ManifestEntryKind, ManifestFile, NewArtifactRecord, NewHistoryRecord, RecordKind, ScannedFile,
     StateError, ejected_index, readonly_root_error,
 };
+pub use lifecycle::{Reason, SweepInput};
 pub use locking::StateLock;
 
 pub trait StateStore {
@@ -44,6 +45,8 @@ pub trait StateStore {
     fn journal_root(&self) -> std::path::PathBuf;
 }
 
+const ID_HEX_LEN: usize = 16;
+
 /// Per-project registry identity: BLAKE3 of the canonical project root.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ProjectId(String);
@@ -60,7 +63,7 @@ impl ProjectId {
 
     fn hash(canonical: &Path) -> Self {
         let hash = blake3::hash(canonical.to_string_lossy().as_bytes());
-        Self(hash.to_hex()[..16].to_string())
+        Self(hash.to_hex()[..ID_HEX_LEN].to_string())
     }
 
     #[must_use]
@@ -69,11 +72,15 @@ impl ProjectId {
     }
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "stubs wired by T004 to T008"))]
 impl ProjectId {
     /// Exactly 16 lowercase hex chars.
-    pub(crate) fn parse(_name: &OsStr) -> Option<Self> {
-        todo!()
+    pub(crate) fn parse(name: &OsStr) -> Option<Self> {
+        let name = name.to_str()?;
+        (name.len() == ID_HEX_LEN
+            && name
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
+        .then(|| Self(name.to_owned()))
     }
 }
 

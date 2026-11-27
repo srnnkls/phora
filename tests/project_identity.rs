@@ -136,6 +136,22 @@ fn project_dirs(fx: &Fixture) -> Vec<PathBuf> {
     dirs
 }
 
+/// The fixture config with its target redirected to `<home>/<target_dir>`.
+fn config_with_own_target(fx: &Fixture, target_dir: &str) -> String {
+    let shared = fx.home_path.join("deploy").display().to_string();
+    let own = fx.home_path.join(target_dir).display().to_string();
+    assert!(
+        fx.config.contains(&shared),
+        "fixture config names the shared target"
+    );
+    fx.config.replace(&shared, &own)
+}
+
+/// The path-hash registry directory of the project at `root`.
+fn registry_of(fx: &Fixture, root: &Path) -> PathBuf {
+    projects_base(fx).join(ProjectId::for_path(root).expect("path-hash id").as_str())
+}
+
 /// Does this registry directory hold at least one artifact record?
 fn has_records(registry_dir: &Path) -> bool {
     fn any_toml(dir: &Path) -> bool {
@@ -237,30 +253,43 @@ fn two_clones_get_isolated_registries() {
 
     let clone_b = fx.project.parent().expect("parent").join("clone-b");
     std::fs::create_dir_all(&clone_b).expect("create second clone");
-    write(&clone_b.join("phora.toml"), fx.config.as_bytes());
+    write(
+        &clone_b.join("phora.toml"),
+        config_with_own_target(&fx, "deploy-b").as_bytes(),
+    );
 
     assert_sync_ok(&run(&fx, &fx.project, &["sync"]), "sync clone a");
     assert_sync_ok(&run(&fx, &clone_b, &["sync"]), "sync clone b");
 
-    assert_eq!(
-        project_dirs(&fx).len(),
-        2,
-        "two clones at distinct paths must keep two isolated registries"
+    let registry_a = registry_of(&fx, &fx.project);
+    let registry_b = registry_of(&fx, &clone_b);
+    assert_ne!(
+        registry_a, registry_b,
+        "distinct paths hash to distinct ids"
     );
+    let mut expected = vec![registry_a.clone(), registry_b.clone()];
+    expected.sort();
+    assert_eq!(
+        project_dirs(&fx),
+        expected,
+        "two clones at distinct paths must keep two isolated path-hash registries"
+    );
+    assert!(has_records(&registry_a), "clone a keeps its own records");
+    assert!(has_records(&registry_b), "clone b keeps its own records");
 }
 
 // ── relocation is a known rehash ──────────────────────────────────
 
 /// The registry key is the path, so moving the project rehashes to a fresh
-/// registry at the new path and orphans the old one — its records are left
-/// behind, surfaced by orphan tooling and reclaimable by prune. This test pins
-/// the accepted tradeoff of path-hash identity.
+/// registry at the new path. The original registry's root is gone, but its
+/// copies outside the root still exist, so the sweep keeps it as `stranded`
+/// with its records. This test pins the accepted tradeoff of path-hash identity.
 #[test]
 fn moved_project_rehashes_and_orphans_the_old_registry() {
     let fx = build_fixture();
 
     assert_sync_ok(&run(&fx, &fx.project, &["sync"]), "sync before move");
-    let original = projects_base(&fx).join(ProjectId::for_path(&fx.project).expect("id").as_str());
+    let original = registry_of(&fx, &fx.project);
     assert_eq!(
         project_dirs(&fx),
         vec![original.clone()],
@@ -269,16 +298,32 @@ fn moved_project_rehashes_and_orphans_the_old_registry() {
 
     let moved = fx.project.parent().expect("parent").join("proj-renamed");
     std::fs::rename(&fx.project, &moved).expect("rename project directory");
+    write(
+        &moved.join("phora.toml"),
+        config_with_own_target(&fx, "deploy-moved").as_bytes(),
+    );
 
     assert_sync_ok(&run(&fx, &moved, &["sync"]), "sync after move");
 
+    let rehashed = registry_of(&fx, &moved);
+    assert_ne!(original, rehashed, "the move rehashes the registry key");
+    let mut expected = vec![original.clone(), rehashed.clone()];
+    expected.sort();
     assert_eq!(
-        project_dirs(&fx).len(),
-        2,
-        "moving rehashes to a second registry beside the orphaned original"
+        project_dirs(&fx),
+        expected,
+        "moving rehashes to a fresh registry beside the stranded original"
+    );
+    assert!(
+        has_records(&rehashed),
+        "the moved project records its deployments in the fresh registry"
     );
     assert!(
         has_records(&original),
-        "the prior deployments are orphaned in the original registry (prune reclaims it)"
+        "the original registry keeps the records of its outside copies (stranded)"
+    );
+    assert!(
+        fx.home_path.join("deploy/editor/init.lua").exists(),
+        "premise: the original deployment outside the deleted root still exists"
     );
 }
