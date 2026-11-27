@@ -17165,7 +17165,7 @@ mod state_lifecycle_data_model {
     };
     use crate::sync::state::{ArtifactKey, ProjectId, StateError};
 
-    fn mount_shapes(placement: &Placement, unproven: &Unproven, location: &Location) {
+    fn mount_shapes(placement: Placement, unproven: &Unproven, location: &Location) {
         match placement {
             Placement::OnAnchorMount | Placement::Elsewhere => {}
         }
@@ -17470,7 +17470,7 @@ mod state_lifecycle_data_model {
         let _: fn(Confirmed) -> Result<Trashed, StateError> = trash;
         let _: fn(Trashed) -> Result<(), Leftover> = delete;
 
-        let _: fn(&Placement, &Unproven, &Location) = mount_shapes;
+        let _: fn(Placement, &Unproven, &Location) = mount_shapes;
         let _: fn(&Succession, &MetaRead, &IndexRead) = meta_shapes;
         let _: fn(&StateDirProbe, &RootObservation, &RecordFate) = probe_shapes;
         let _: fn(&JournalState) = journal_shape;
@@ -17483,5 +17483,399 @@ mod state_lifecycle_data_model {
         let _: Option<BTreeMap<Reason, NonZeroUsize>> = None;
 
         let _: fn(Reason) = reason_shape;
+    }
+}
+
+mod state_lifecycle_probe {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+    use std::path::{Path, PathBuf};
+
+    use tempfile::TempDir;
+
+    use crate::mount::{AnchorDir, CurrentAnchor, MountId, NormalPath, Placement, Unproven};
+    use crate::sync::state::lifecycle::{
+        DropReason, ForgetReason, KeepReason, MetaDefect, Probed, ProjectMeta, ProjectRoot, Reason,
+        ReleaseReason, RootObservation, RootlessMeta, StateDirClass, StateDirPath, StateDirProbe,
+        StateRoot, Succession, Unreachable, UnreachableRoot, classify, probe,
+    };
+    use crate::sync::state::{ArtifactRecord, FileStateStore, ProjectId, StateStore as _};
+
+    fn normal(path: &Path) -> NormalPath {
+        NormalPath::lexical(path).expect("absolute fixture path")
+    }
+
+    fn canonical_tmp() -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        (tmp, base)
+    }
+
+    fn copy_record(deploy_root: Option<&str>, layout: &str) -> ArtifactRecord {
+        let mut record = super::linked_flat_record("dest", "src", "editor");
+        record.linked = false;
+        record.layout = layout.to_owned();
+        record.deploy_root = deploy_root.map(str::to_owned);
+        record
+    }
+
+    fn state_dir(
+        base: &Path,
+        root: &Path,
+        on_state_mount: bool,
+        recorded_state_dir: Option<&Path>,
+        records: &[ArtifactRecord],
+    ) -> (StateDirPath, CurrentAnchor) {
+        let dir = StateDirPath::new(
+            StateRoot::new(normal(&base.join("state"))),
+            ProjectId::of_canonical(&normal(root)),
+        );
+        let path = dir.path();
+        std::fs::create_dir_all(path.as_path()).expect("create state dir");
+        let recorded = recorded_state_dir.unwrap_or(path.as_path());
+        std::fs::write(
+            path.as_path().join("project.toml"),
+            format!(
+                "version = 1\nroot = \"{}\"\non_state_mount = {on_state_mount}\nstate_dir = \"{}\"\n",
+                root.display(),
+                recorded.display(),
+            ),
+        )
+        .expect("write project.toml");
+        let store = FileStateStore::open(path.as_path().to_path_buf()).expect("open store");
+        for record in records {
+            store.put_artifact(record).expect("seed record");
+        }
+        let mount = MountId::of(path.as_path()).expect("state dir mount");
+        (dir, CurrentAnchor::new(AnchorDir::new(path), mount))
+    }
+
+    fn deleted_root(base: &Path, name: &str) -> PathBuf {
+        let root = base.join(name).join("proj");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::remove_dir_all(&root).expect("delete root");
+        root
+    }
+
+    fn rooted(
+        root: &ProjectRoot,
+        succession: Succession,
+        observation: RootObservation,
+    ) -> StateDirProbe {
+        StateDirProbe::Rooted {
+            meta: ProjectMeta::new(
+                root.clone(),
+                Placement::OnAnchorMount,
+                AnchorDir::new(normal(Path::new("/state/projects/0123456789abcdef"))),
+            ),
+            succession,
+            root: observation,
+        }
+    }
+
+    #[test]
+    fn classify_maps_each_probe_to_its_classification_row() {
+        let root_path = normal(Path::new("/work/proj"));
+        let root = ProjectRoot::recorded(root_path.clone(), &ProjectId::of_canonical(&root_path))
+            .expect("root hashes to its id");
+        let current = |observation| rooted(&root, Succession::Current, observation);
+        let superseded = |observation| {
+            let successor = StateRoot::new(normal(Path::new("/custom")));
+            rooted(&root, Succession::SupersededBy(successor), observation)
+        };
+        let present = |manifest| RootObservation::Present { manifest };
+        let unproven = |cause| current(RootObservation::Unproven(cause));
+        let denied = ErrorKind::PermissionDenied;
+
+        let rows = [
+            (StateDirProbe::Empty, Reason::Empty),
+            (
+                StateDirProbe::Unrooted {
+                    meta: RootlessMeta::Absent,
+                },
+                Reason::Unrooted,
+            ),
+            (
+                StateDirProbe::Unrooted {
+                    meta: RootlessMeta::Invalid(MetaDefect::RootHashMismatch),
+                },
+                Reason::Unrooted,
+            ),
+            (superseded(present(Probed::Present)), Reason::Abandoned),
+            (
+                superseded(RootObservation::Unproven(Unproven::OffMount)),
+                Reason::Abandoned,
+            ),
+            (current(present(Probed::Present)), Reason::Live),
+            (current(present(Probed::Absent)), Reason::Retired),
+            (current(present(Probed::Fault(denied))), Reason::Unreachable),
+            (StateDirProbe::Unreadable(denied), Reason::Unreachable),
+            (unproven(Unproven::RecordedElsewhere), Reason::Unreachable),
+            (
+                unproven(Unproven::AnchorMoved {
+                    now: normal(Path::new("/moved/projects/x")),
+                }),
+                Reason::Unreachable,
+            ),
+            (unproven(Unproven::Encrypted), Reason::Unreachable),
+            (
+                unproven(Unproven::SymlinkedComponent(normal(Path::new("/work")))),
+                Reason::Unreachable,
+            ),
+            (
+                unproven(Unproven::CanonicalDiffers {
+                    now: normal(Path::new("/work/Proj")),
+                }),
+                Reason::Unreachable,
+            ),
+            (unproven(Unproven::Fault(denied)), Reason::Unreachable),
+        ];
+        for (probe, expected) in &rows {
+            assert_eq!(classify(probe).reason(), *expected, "{probe:?}");
+        }
+
+        assert!(matches!(
+            classify(&superseded(present(Probed::Absent))),
+            StateDirClass::Forget(ForgetReason::Abandoned { root: ref r, .. }) if *r == root
+        ));
+        assert!(matches!(
+            classify(&current(present(Probed::Absent))),
+            StateDirClass::Release(ReleaseReason::Retired { root: ref r }) if *r == root
+        ));
+        assert!(matches!(
+            classify(&current(present(Probed::Present))),
+            StateDirClass::Keep(KeepReason::Live)
+        ));
+        assert!(matches!(
+            classify(&unproven(Unproven::Encrypted)),
+            StateDirClass::Forget(ForgetReason::Unreachable(Unreachable::Root {
+                root: ref r,
+                cause: UnreachableRoot::Unproven(Unproven::Encrypted),
+            })) if *r == root
+        ));
+        assert!(matches!(
+            classify(&current(present(Probed::Fault(denied)))),
+            StateDirClass::Forget(ForgetReason::Unreachable(Unreachable::Root {
+                cause: UnreachableRoot::ManifestFault(ErrorKind::PermissionDenied),
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn probe_proves_a_deleted_root_only_when_every_absence_clause_holds() {
+        let (_tmp, base) = canonical_tmp();
+        let inside = [copy_record(Some("dest"), "flat")];
+
+        let gone_root = deleted_root(&base, "gone");
+        let (dir, anchor) = state_dir(&base, &gone_root, true, None, &inside);
+        match classify(&probe(&dir, &anchor)) {
+            StateDirClass::Drop(DropReason::Gone { proof, links }) => {
+                assert_eq!(
+                    proof.path().as_path(),
+                    gone_root,
+                    "the proof names the recorded root"
+                );
+                assert!(links.is_empty());
+            }
+            other => panic!("deleted root on the state dir's mount must be gone, got {other:?}"),
+        }
+
+        let unreachable =
+            |dir: &StateDirPath, anchor: &CurrentAnchor| match classify(&probe(dir, anchor)) {
+                StateDirClass::Forget(ForgetReason::Unreachable(Unreachable::Root {
+                    cause: UnreachableRoot::Unproven(cause),
+                    ..
+                })) => cause,
+                other => panic!("expected an unreachable root, got {other:?}"),
+            };
+
+        let elsewhere_root = deleted_root(&base, "elsewhere");
+        let (dir, anchor) = state_dir(&base, &elsewhere_root, false, None, &inside);
+        assert!(matches!(
+            unreachable(&dir, &anchor),
+            Unproven::RecordedElsewhere
+        ));
+
+        let moved_root = deleted_root(&base, "moved");
+        let (dir, anchor) = state_dir(
+            &base,
+            &moved_root,
+            true,
+            Some(&base.join("old-state/projects/0123456789abcdef")),
+            &inside,
+        );
+        assert!(matches!(
+            unreachable(&dir, &anchor),
+            Unproven::AnchorMoved { now } if now == dir.path()
+        ));
+
+        let off_mount_root = deleted_root(&base, "off-mount");
+        let (dir, _) = state_dir(&base, &off_mount_root, true, None, &inside);
+        let foreign_mount = CurrentAnchor::new(
+            AnchorDir::new(dir.path()),
+            MountId::of(Path::new("/dev")).expect("mount of /dev"),
+        );
+        assert!(matches!(
+            unreachable(&dir, &foreign_mount),
+            Unproven::OffMount
+        ));
+
+        let symlinked_root = base.join("linked/proj");
+        symlink(base.join("missing"), base.join("linked")).expect("symlink component");
+        let (dir, anchor) = state_dir(&base, &symlinked_root, true, None, &inside);
+        assert!(matches!(
+            unreachable(&dir, &anchor),
+            Unproven::SymlinkedComponent(component) if component.as_path() == base.join("linked")
+        ));
+
+        let sealed = base.join("sealed");
+        let sealed_root = sealed.join("proj");
+        std::fs::create_dir_all(&sealed_root).expect("create sealed root");
+        let (dir, anchor) = state_dir(&base, &sealed_root, true, None, &inside);
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).expect("seal");
+        let sealed_class = classify(&probe(&dir, &anchor));
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).expect("unseal");
+        assert!(
+            matches!(
+                sealed_class,
+                StateDirClass::Forget(ForgetReason::Unreachable(Unreachable::Root {
+                    cause: UnreachableRoot::Unproven(Unproven::Fault(ErrorKind::PermissionDenied)),
+                    ..
+                }))
+            ),
+            "a root whose stat is denied is unreachable, got {sealed_class:?}"
+        );
+    }
+
+    #[test]
+    fn probe_resolves_destinations_of_a_deleted_root_against_the_recorded_root() {
+        let (_tmp, base) = canonical_tmp();
+        let classify_dir = |root: &Path, records: &[ArtifactRecord]| {
+            let (dir, anchor) = state_dir(&base, root, true, None, records);
+            classify(&probe(&dir, &anchor))
+        };
+
+        let outside_root = deleted_root(&base, "outside");
+        std::fs::create_dir_all(base.join("outside/shared/editor")).expect("outside deployment");
+        assert_eq!(
+            classify_dir(&outside_root, &[copy_record(Some("../shared"), "flat")]).reason(),
+            Reason::Stranded,
+            "a present destination under `../shared` of the recorded root strands the dir",
+        );
+
+        let absent_outside_root = deleted_root(&base, "absent-outside");
+        let absolute = base.join("absent-outside/elsewhere");
+        assert_eq!(
+            classify_dir(
+                &absent_outside_root,
+                &[copy_record(
+                    Some(absolute.to_str().expect("utf-8 path")),
+                    "flat"
+                )]
+            )
+            .reason(),
+            Reason::Gone,
+            "an absent outside destination leaves the dir gone",
+        );
+
+        let legacy_root = deleted_root(&base, "legacy");
+        assert_eq!(
+            classify_dir(&legacy_root, &[copy_record(None, "flat")]).reason(),
+            Reason::Stranded,
+            "a record without deploy_root is unresolvable",
+        );
+
+        let unrebuildable_root = deleted_root(&base, "unrebuildable");
+        assert_eq!(
+            classify_dir(
+                &unrebuildable_root,
+                &[copy_record(Some("dest"), "prefixed")]
+            )
+            .reason(),
+            Reason::Stranded,
+            "a prefixed record without its separator is unresolvable",
+        );
+
+        let faulted_root = deleted_root(&base, "faulted");
+        let sealed = base.join("faulted/sealed");
+        std::fs::create_dir_all(sealed.join("editor")).expect("sealed deployment");
+        let (dir, anchor) = state_dir(
+            &base,
+            &faulted_root,
+            true,
+            None,
+            &[copy_record(Some("../sealed"), "flat")],
+        );
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).expect("seal");
+        let faulted_class = classify(&probe(&dir, &anchor));
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).expect("unseal");
+        assert!(
+            matches!(
+                faulted_class,
+                StateDirClass::Forget(ForgetReason::Unreachable(Unreachable::Root {
+                    cause: UnreachableRoot::DestinationFault(ErrorKind::PermissionDenied),
+                    ..
+                }))
+            ),
+            "a destination whose stat is denied makes the dir unreachable, got {faulted_class:?}"
+        );
+    }
+
+    #[test]
+    fn probe_keeps_a_deleted_root_under_an_encrypted_ancestor_unreachable() {
+        let (_tmp, base) = canonical_tmp();
+        let root = deleted_root(&base, "encrypted");
+        let (dir, anchor) = state_dir(
+            &base,
+            &root,
+            true,
+            None,
+            &[copy_record(Some("dest"), "flat")],
+        );
+        let anchor = anchor.with_lookups(|_| Ok(true), Path::canonicalize);
+
+        let class = classify(&probe(&dir, &anchor));
+        assert!(
+            matches!(
+                class,
+                StateDirClass::Forget(ForgetReason::Unreachable(Unreachable::Root {
+                    cause: UnreachableRoot::Unproven(Unproven::Encrypted),
+                    ..
+                }))
+            ),
+            "a deleted root under an encrypted ancestor is unreachable, got {class:?}"
+        );
+    }
+
+    #[test]
+    fn probe_classifies_a_present_root_live_only_when_it_resolves_to_itself() {
+        let (_tmp, base) = canonical_tmp();
+        let root = base.join("present/proj");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(root.join("phora.toml"), "").expect("write manifest");
+        let (dir, anchor) = state_dir(
+            &base,
+            &root,
+            true,
+            None,
+            &[copy_record(Some("dest"), "flat")],
+        );
+
+        assert_eq!(classify(&probe(&dir, &anchor)).reason(), Reason::Live);
+
+        let case_renamed =
+            anchor.with_lookups(|_| Ok(false), |path| Ok(path.with_file_name("PROJ")));
+        let class = classify(&probe(&dir, &case_renamed));
+        assert!(
+            matches!(
+                class,
+                StateDirClass::Forget(ForgetReason::Unreachable(Unreachable::Root {
+                    cause: UnreachableRoot::Unproven(Unproven::CanonicalDiffers { ref now }),
+                    ..
+                })) if now.as_path() == root.with_file_name("PROJ")
+            ),
+            "a present root that canonicalizes elsewhere is unreachable, got {class:?}"
+        );
     }
 }

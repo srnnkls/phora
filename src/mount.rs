@@ -70,7 +70,7 @@ impl MountId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Placement {
     OnAnchorMount,
     Elsewhere,
@@ -103,11 +103,58 @@ impl AnchorDir {
     }
 }
 
-/// The anchor directory as read in this run.
+/// The anchor directory as read in this run, with the lookups `locate` makes beyond `symlink_metadata`.
 #[derive(Debug)]
 pub struct CurrentAnchor {
     dir: AnchorDir,
     mount: MountId,
+    encrypted: fn(&Path) -> std::io::Result<bool>,
+    canonicalize: fn(&Path) -> std::io::Result<PathBuf>,
+}
+
+impl CurrentAnchor {
+    #[must_use]
+    pub fn new(dir: AnchorDir, mount: MountId) -> Self {
+        Self {
+            dir,
+            mount,
+            #[cfg(target_os = "linux")]
+            encrypted: statx_encrypted,
+            // APFS encrypts whole volumes, which the mount comparison covers.
+            #[cfg(not(target_os = "linux"))]
+            encrypted: |_| Ok(false),
+            canonicalize: Path::canonicalize,
+        }
+    }
+
+    /// Replaces the encryption and canonicalize lookups, standing in for another volume.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_lookups(
+        self,
+        encrypted: fn(&Path) -> std::io::Result<bool>,
+        canonicalize: fn(&Path) -> std::io::Result<PathBuf>,
+    ) -> Self {
+        Self {
+            encrypted,
+            canonicalize,
+            ..self
+        }
+    }
+}
+
+/// Statx `STATX_ATTR_ENCRYPTED`; a mask without that bit reads as unencrypted.
+#[cfg(target_os = "linux")]
+fn statx_encrypted(path: &Path) -> std::io::Result<bool> {
+    use rustix::fs::{AtFlags, CWD, StatxAttributes, StatxFlags, statx};
+
+    let stx = statx(CWD, path, AtFlags::empty(), StatxFlags::empty())?;
+    Ok((stx.stx_attributes & stx.stx_attributes_mask).contains(StatxAttributes::ENCRYPTED))
+}
+
+/// `NotFound`, or `NotADirectory` on an ancestor component.
+pub fn is_absent(kind: ErrorKind) -> bool {
+    matches!(kind, ErrorKind::NotFound | ErrorKind::NotADirectory)
 }
 
 /// Constructed only by `locate`.
@@ -145,11 +192,59 @@ pub enum Location {
     Unproven(Unproven),
 }
 
+/// Walks `path` with `symlink_metadata`; an absent path is `Deleted` only when every AD-2 clause holds.
 pub fn locate(
-    _path: &NormalPath,
-    _placement: Placement,
-    _recorded: &AnchorDir,
-    _current: &CurrentAnchor,
+    path: &NormalPath,
+    placement: Placement,
+    recorded: &AnchorDir,
+    current: &CurrentAnchor,
 ) -> Location {
-    todo!()
+    let mut existing = PathBuf::new();
+    for component in path.as_path().components() {
+        let next = existing.join(component);
+        match std::fs::symlink_metadata(&next) {
+            Ok(stat) if stat.file_type().is_symlink() => {
+                return Location::Unproven(Unproven::SymlinkedComponent(NormalPath(next)));
+            }
+            Ok(_) => existing = next,
+            Err(error) if is_absent(error.kind()) => {
+                return absent(path, placement, recorded, current, &existing);
+            }
+            Err(error) => return Location::Unproven(Unproven::Fault(error.kind())),
+        }
+    }
+    match (current.canonicalize)(path.as_path()) {
+        Ok(now) if now == path.as_path() => Location::Present,
+        Ok(now) => Location::Unproven(Unproven::CanonicalDiffers {
+            now: NormalPath(normalize_lexical(&now)),
+        }),
+        Err(error) => Location::Unproven(Unproven::Fault(error.kind())),
+    }
+}
+
+fn absent(
+    path: &NormalPath,
+    placement: Placement,
+    recorded: &AnchorDir,
+    current: &CurrentAnchor,
+    ancestor: &Path,
+) -> Location {
+    if placement != Placement::OnAnchorMount {
+        return Location::Unproven(Unproven::RecordedElsewhere);
+    }
+    if *recorded != current.dir {
+        return Location::Unproven(Unproven::AnchorMoved {
+            now: current.dir.path().clone(),
+        });
+    }
+    match MountId::of(ancestor) {
+        Ok(mount) if mount != current.mount => return Location::Unproven(Unproven::OffMount),
+        Ok(_) => {}
+        Err(error) => return Location::Unproven(Unproven::Fault(error.kind())),
+    }
+    match (current.encrypted)(ancestor) {
+        Ok(false) => Location::Deleted(DeletionProof { path: path.clone() }),
+        Ok(true) => Location::Unproven(Unproven::Encrypted),
+        Err(error) => Location::Unproven(Unproven::Fault(error.kind())),
+    }
 }

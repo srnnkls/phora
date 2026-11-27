@@ -8,13 +8,18 @@ pub use model::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::ErrorKind;
+use std::num::NonZeroUsize;
 use std::path::Path;
 
-use crate::mount::{AnchorDir, CurrentAnchor, Placement};
+use crate::mount::{AnchorDir, CurrentAnchor, Location, NormalPath, Placement, is_absent, locate};
 use crate::sync::journal::Journal;
+use crate::sync::observe::normalize_history_deploy_root_at;
+use crate::sync::prune::orphan_artifact_path;
 use crate::sync::state::file::atomic_write;
 use crate::sync::state::locking::lock_existing;
-use crate::sync::state::{FileStateStore, StateError, StateLock, StateStore as _};
+use crate::sync::state::{
+    ArtifactRecord, FileStateStore, StateError, StateLock, StateStore as _, ejected_index,
+};
 
 const META_FILE: &str = "project.toml";
 const INDEX_FILE: &str = "state-roots.toml";
@@ -178,31 +183,8 @@ fn supersede(
 
 /// Whether the dir holds records, target meta or a pending journal.
 fn holds_state(dir: &Path) -> Result<bool, StateError> {
-    if !FileStateStore::open(dir.to_path_buf())?
-        .all_artifacts()?
-        .is_empty()
-    {
+    if FileStateStore::open(dir.to_path_buf())?.holds_records_or_meta()? {
         return Ok(true);
-    }
-    let targets = dir.join("targets");
-    match std::fs::read_dir(&targets) {
-        Ok(entries) => {
-            for entry in entries {
-                let target = entry.map_err(|error| io_error("read entry in", &targets, &error))?;
-                if !target.file_type().is_ok_and(|kind| kind.is_dir()) {
-                    continue;
-                }
-                let meta_path = target.path().join("meta.toml");
-                if meta_path
-                    .try_exists()
-                    .map_err(|error| io_error("stat", &meta_path, &error))?
-                {
-                    return Ok(true);
-                }
-            }
-        }
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => return Err(io_error("read dir", &targets, &error)),
     }
     let pending = Journal::open_readonly(&dir.join("locks"))
         .entries()
@@ -214,12 +196,120 @@ fn io_error(what: &str, path: &Path, error: &std::io::Error) -> StateError {
     StateError::StateStore(format!("{what} {}: {error}", path.display()))
 }
 
-pub fn probe(_dir: &StateDirPath, _anchor: &CurrentAnchor) -> StateDirProbe {
-    todo!()
+/// Gathers the filesystem facts `classify` reads; records only for a root AD-2 proves deleted.
+pub fn probe(dir: &StateDirPath, anchor: &CurrentAnchor) -> StateDirProbe {
+    probe_dir(dir, anchor).unwrap_or_else(StateDirProbe::Unreadable)
 }
 
-pub fn classify(_probe: &StateDirProbe) -> StateDirClass {
-    todo!()
+fn probe_dir(dir: &StateDirPath, anchor: &CurrentAnchor) -> Result<StateDirProbe, ErrorKind> {
+    let path = dir.path();
+    let path = path.as_path();
+    let holds_state = FileStateStore::open(path.to_path_buf())
+        .and_then(|store| store.holds_records_or_meta())
+        .map_err(|_| ErrorKind::Other)?;
+    let journal = if holds_state {
+        None
+    } else {
+        match journal_state(path)? {
+            JournalState::Clear => return Ok(StateDirProbe::Empty),
+            pending @ JournalState::Pending { .. } => Some(pending),
+        }
+    };
+    let (meta, succession) = match std::fs::read_to_string(path.join(META_FILE)) {
+        Ok(text) => match wire::parse_meta(&text, dir.id()) {
+            MetaRead::Valid { meta, succession } => (meta, succession),
+            MetaRead::Rootless(meta) => return Ok(StateDirProbe::Unrooted { meta }),
+        },
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Ok(StateDirProbe::Unrooted {
+                meta: RootlessMeta::Absent,
+            });
+        }
+        Err(error) => return Err(error.kind()),
+    };
+    let root = match locate(
+        meta.root().path(),
+        *meta.placement(),
+        meta.state_dir(),
+        anchor,
+    ) {
+        Location::Present => RootObservation::Present {
+            manifest: probe_manifest(meta.root()),
+        },
+        Location::Unproven(cause) => RootObservation::Unproven(cause),
+        Location::Deleted(proof) => {
+            let journal = match journal {
+                Some(journal) => journal,
+                None => journal_state(path)?,
+            };
+            RootObservation::Deleted {
+                proof,
+                remains: remains(path, meta.root(), journal)?,
+            }
+        }
+    };
+    Ok(StateDirProbe::Rooted {
+        meta,
+        succession,
+        root,
+    })
+}
+
+fn journal_state(dir: &Path) -> Result<JournalState, ErrorKind> {
+    let entries = Journal::open_readonly(&dir.join("locks"))
+        .entries()
+        .map_err(|_| ErrorKind::Other)?;
+    Ok(
+        NonZeroUsize::new(entries.len()).map_or(JournalState::Clear, |entries| {
+            JournalState::Pending { entries }
+        }),
+    )
+}
+
+fn probe_manifest(root: &ProjectRoot) -> Probed {
+    match std::fs::metadata(root.path().as_path().join("phora.toml")) {
+        Ok(_) => Probed::Present,
+        Err(error) if error.kind() == ErrorKind::NotFound => Probed::Absent,
+        Err(error) => Probed::Fault(error.kind()),
+    }
+}
+
+fn remains(dir: &Path, root: &ProjectRoot, journal: JournalState) -> Result<Remains, ErrorKind> {
+    let store = FileStateStore::open(dir.to_path_buf()).map_err(|_| ErrorKind::Other)?;
+    let records = store.all_artifacts().map_err(|_| ErrorKind::Other)?;
+    let ejected = ejected_index(&store, &records).map_err(|_| ErrorKind::Other)?;
+    let fates = records
+        .into_iter()
+        .map(|record| {
+            let key = &record.key;
+            if ejected.contains(&(key.target.clone(), key.source.clone(), key.artifact.clone())) {
+                RecordFate::Ejected
+            } else {
+                record_fate(root, record)
+            }
+        })
+        .collect();
+    Ok(Remains::new(journal, fates))
+}
+
+/// The record's destination, rebased onto the recorded root, tested with `symlink_metadata`.
+fn record_fate(root: &ProjectRoot, record: ArtifactRecord) -> RecordFate {
+    let Some(destination) = orphan_artifact_path(&record).and_then(|destination| {
+        NormalPath::lexical(&normalize_history_deploy_root_at(
+            root.path().as_path(),
+            &destination,
+        ))
+    }) else {
+        return RecordFate::Unresolvable { key: record.key };
+    };
+    match std::fs::symlink_metadata(destination.as_path()) {
+        Ok(_) => RecordFate::PresentOutside(destination),
+        Err(error) if is_absent(error.kind()) => RecordFate::Absent,
+        Err(error) => RecordFate::Fault {
+            key: record.key,
+            kind: error.kind(),
+        },
+    }
 }
 
 pub fn sweep(_input: &SweepInput) -> SweepReport {

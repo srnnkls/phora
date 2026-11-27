@@ -162,7 +162,7 @@ impl StateRootIndex {
 
     /// Records `root` with its placement; `false` when the index already holds exactly that.
     pub fn register(&mut self, root: StateRoot, placement: Placement) -> bool {
-        self.roots.insert(root, placement.clone()) != Some(placement)
+        self.roots.insert(root, placement) != Some(placement)
     }
 }
 
@@ -231,6 +231,12 @@ pub struct Remains {
     records: Vec<RecordFate>,
 }
 
+impl Remains {
+    pub fn new(journal: JournalState, records: Vec<RecordFate>) -> Self {
+        Self { journal, records }
+    }
+}
+
 #[derive(Debug)]
 pub enum RecordFate {
     Ejected,
@@ -264,7 +270,86 @@ pub enum StateDirClass {
 
 impl StateDirClass {
     pub fn reason(&self) -> Reason {
-        todo!()
+        match self {
+            Self::Keep(KeepReason::Live) => Reason::Live,
+            Self::Drop(DropReason::Empty) => Reason::Empty,
+            Self::Drop(DropReason::Gone { .. }) => Reason::Gone,
+            Self::Release(ReleaseReason::Retired { .. }) => Reason::Retired,
+            Self::Release(ReleaseReason::Stranded(_)) => Reason::Stranded,
+            Self::Forget(ForgetReason::Unrooted { .. }) => Reason::Unrooted,
+            Self::Forget(ForgetReason::Abandoned { .. }) => Reason::Abandoned,
+            Self::Forget(ForgetReason::Unreachable(_)) => Reason::Unreachable,
+        }
+    }
+}
+
+/// The first matching row of the classification table.
+pub fn classify(probe: &StateDirProbe) -> StateDirClass {
+    let (meta, succession, observation) = match probe {
+        StateDirProbe::Unreadable(kind) => {
+            return StateDirClass::Forget(ForgetReason::Unreachable(Unreachable::Unreadable(
+                *kind,
+            )));
+        }
+        StateDirProbe::Empty => return StateDirClass::Drop(DropReason::Empty),
+        StateDirProbe::Unrooted { meta } => {
+            return StateDirClass::Forget(ForgetReason::Unrooted { meta: meta.clone() });
+        }
+        StateDirProbe::Rooted {
+            meta,
+            succession,
+            root,
+        } => (meta, succession, root),
+    };
+    let root = meta.root().clone();
+    match (succession, observation) {
+        (
+            Succession::SupersededBy(successor),
+            RootObservation::Present { .. } | RootObservation::Unproven(_),
+        ) => StateDirClass::Forget(ForgetReason::Abandoned {
+            root,
+            successor: successor.clone(),
+        }),
+        (_, RootObservation::Present { manifest }) => match manifest {
+            Probed::Present => StateDirClass::Keep(KeepReason::Live),
+            Probed::Absent => StateDirClass::Release(ReleaseReason::Retired { root }),
+            Probed::Fault(kind) => unreachable_root(root, UnreachableRoot::ManifestFault(*kind)),
+        },
+        (_, RootObservation::Unproven(cause)) => {
+            unreachable_root(root, UnreachableRoot::Unproven(cause.clone()))
+        }
+        (_, RootObservation::Deleted { proof, remains }) => deleted(root, proof, remains),
+    }
+}
+
+fn unreachable_root(root: ProjectRoot, cause: UnreachableRoot) -> StateDirClass {
+    StateDirClass::Forget(ForgetReason::Unreachable(Unreachable::Root { root, cause }))
+}
+
+/// Rows 6 to 8 for a root AD-2 proves deleted.
+fn deleted(root: ProjectRoot, proof: &DeletionProof, remains: &Remains) -> StateDirClass {
+    let mut links = Vec::new();
+    let mut present_outside = Vec::new();
+    let mut unresolvable = Vec::new();
+    for fate in &remains.records {
+        match fate {
+            RecordFate::Ejected | RecordFate::Absent => {}
+            RecordFate::Releasable(link) => links.push(link.clone()),
+            RecordFate::PresentOutside(path) => present_outside.push(path.clone()),
+            RecordFate::Unresolvable { key } => unresolvable.push(key.clone()),
+            RecordFate::Fault { kind, .. } => {
+                return unreachable_root(root, UnreachableRoot::DestinationFault(*kind));
+            }
+        }
+    }
+    let proof = proof.clone();
+    match StrandedEvidence::new(present_outside, unresolvable, remains.journal.clone()) {
+        Some(evidence) => StateDirClass::Release(ReleaseReason::Stranded(Stranded {
+            proof,
+            links,
+            evidence,
+        })),
+        None => StateDirClass::Drop(DropReason::Gone { proof, links }),
     }
 }
 
@@ -305,11 +390,18 @@ pub struct StrandedEvidence {
 
 impl StrandedEvidence {
     pub fn new(
-        _present_outside: Vec<NormalPath>,
-        _unresolvable: Vec<ArtifactKey>,
-        _journal: JournalState,
+        present_outside: Vec<NormalPath>,
+        unresolvable: Vec<ArtifactKey>,
+        journal: JournalState,
     ) -> Option<Self> {
-        todo!()
+        let holds = !present_outside.is_empty()
+            || !unresolvable.is_empty()
+            || matches!(journal, JournalState::Pending { .. });
+        holds.then_some(Self {
+            present_outside,
+            unresolvable,
+            journal,
+        })
     }
 }
 

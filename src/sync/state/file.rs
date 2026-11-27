@@ -1,6 +1,7 @@
 //! Sync-owned persistent state through `StateStore` and `FileStateStore`.
 
 use std::borrow::Borrow;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -329,11 +330,52 @@ impl FileStateStore {
             .join(format!("{}.toml", key.artifact))
     }
 
-    fn meta_path(&self, target: &str) -> PathBuf {
+    fn meta_path(&self, target: impl AsRef<Path>) -> PathBuf {
         self.state_root
             .join("targets")
             .join(target)
             .join("meta.toml")
+    }
+
+    /// Whether any target holds its meta or a record file, parsing neither; stops at the first found.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a target directory or its meta cannot be read.
+    pub fn holds_records_or_meta(&self) -> Result<bool> {
+        let targets_dir = self.state_root.join("targets");
+        let target_dirs = match std::fs::read_dir(&targets_dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => {
+                return Err(StateError::StateStore(format!(
+                    "read dir {}: {e}",
+                    targets_dir.display()
+                )));
+            }
+        };
+        for target in target_dirs {
+            let target = target.map_err(|e| {
+                StateError::StateStore(format!("read entry in {}: {e}", targets_dir.display()))
+            })?;
+            if !target.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let meta = self.meta_path(target.file_name());
+            if meta
+                .try_exists()
+                .map_err(|e| StateError::StateStore(format!("stat {}: {e}", meta.display())))?
+            {
+                return Ok(true);
+            }
+            let found = walk_record_files(&target.path().join("artifacts"), &mut |_| {
+                Ok(ControlFlow::Break(()))
+            })?;
+            if found.is_break() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn read_meta(&self, target: &str) -> Result<TargetMeta> {
@@ -423,9 +465,21 @@ fn atomic_write_with(
 }
 
 fn collect_records(artifacts_dir: &Path, out: &mut Vec<ArtifactRecord>) -> Result<()> {
+    walk_record_files(artifacts_dir, &mut |path| {
+        out.push(read_record(path)?);
+        Ok(ControlFlow::Continue(()))
+    })
+    .map(|_| ())
+}
+
+/// Visits every `.toml` file at any depth beneath each source dir of `artifacts_dir` until `visit` breaks.
+fn walk_record_files(
+    artifacts_dir: &Path,
+    visit: &mut impl FnMut(&Path) -> Result<ControlFlow<()>>,
+) -> Result<ControlFlow<()>> {
     let source_dirs = match std::fs::read_dir(artifacts_dir) {
         Ok(rd) => rd,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ControlFlow::Continue(())),
         Err(e) => {
             return Err(StateError::StateStore(format!(
                 "read dir {}: {e}",
@@ -440,25 +494,35 @@ fn collect_records(artifacts_dir: &Path, out: &mut Vec<ArtifactRecord>) -> Resul
         if !source.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
-        collect_records_under(&source.path(), out)?;
+        if walk_record_files_under(&source.path(), visit)?.is_break() {
+            return Ok(ControlFlow::Break(()));
+        }
     }
-    Ok(())
+    Ok(ControlFlow::Continue(()))
 }
 
-fn collect_records_under(dir: &Path, out: &mut Vec<ArtifactRecord>) -> Result<()> {
+fn walk_record_files_under(
+    dir: &Path,
+    visit: &mut impl FnMut(&Path) -> Result<ControlFlow<()>>,
+) -> Result<ControlFlow<()>> {
     let entries = std::fs::read_dir(dir)
         .map_err(|e| StateError::StateStore(format!("read dir {}: {e}", dir.display())))?;
     for entry in entries {
         let entry = entry
             .map_err(|e| StateError::StateStore(format!("read entry in {}: {e}", dir.display())))?;
         let path = entry.path();
-        if entry.file_type().is_ok_and(|t| t.is_dir()) {
-            collect_records_under(&path, out)?;
+        let flow = if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            walk_record_files_under(&path, visit)?
         } else if path.extension().is_some_and(|ext| ext == "toml") {
-            out.push(read_record(&path)?);
+            visit(&path)?
+        } else {
+            ControlFlow::Continue(())
+        };
+        if flow.is_break() {
+            return Ok(flow);
         }
     }
-    Ok(())
+    Ok(ControlFlow::Continue(()))
 }
 
 fn sort_records(records: &mut [ArtifactRecord]) {
