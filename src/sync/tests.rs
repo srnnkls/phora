@@ -17505,13 +17505,13 @@ mod state_lifecycle_probe {
         NormalPath::lexical(path).expect("absolute fixture path")
     }
 
-    fn canonical_tmp() -> (TempDir, PathBuf) {
+    pub(super) fn canonical_tmp() -> (TempDir, PathBuf) {
         let tmp = TempDir::new().expect("tempdir");
         let base = tmp.path().canonicalize().expect("canonical tempdir");
         (tmp, base)
     }
 
-    fn copy_record(deploy_root: Option<&str>, layout: &str) -> ArtifactRecord {
+    pub(super) fn copy_record(deploy_root: Option<&str>, layout: &str) -> ArtifactRecord {
         let mut record = super::linked_flat_record("dest", "src", "editor");
         record.linked = false;
         record.layout = layout.to_owned();
@@ -17519,7 +17519,7 @@ mod state_lifecycle_probe {
         record
     }
 
-    fn state_dir(
+    pub(super) fn state_dir(
         base: &Path,
         root: &Path,
         on_state_mount: bool,
@@ -17550,7 +17550,7 @@ mod state_lifecycle_probe {
         (dir, CurrentAnchor::new(AnchorDir::new(path), mount))
     }
 
-    fn deleted_root(base: &Path, name: &str) -> PathBuf {
+    pub(super) fn deleted_root(base: &Path, name: &str) -> PathBuf {
         let root = base.join(name).join("proj");
         std::fs::create_dir_all(&root).expect("create root");
         std::fs::remove_dir_all(&root).expect("delete root");
@@ -17876,6 +17876,285 @@ mod state_lifecycle_probe {
                 })) if now.as_path() == root.with_file_name("PROJ")
             ),
             "a present root that canonicalizes elsewhere is unreachable, got {class:?}"
+        );
+    }
+}
+
+mod state_lifecycle_removal {
+    use std::io::ErrorKind;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{PoisonError, RwLockWriteGuard};
+    use std::time::{Duration, Instant};
+
+    use super::state_lifecycle_probe::{canonical_tmp, copy_record, deleted_root, state_dir};
+    use crate::mount::CurrentAnchor;
+    use crate::sync::state::lifecycle::{
+        NotHeld, PlannedAction, Reason, StateDirClass, StateDirPath, classify, confirm, delete,
+        lock, probe, trash,
+    };
+    use crate::sync::state::locking::{STATE_LOCK_SERIAL, lock_existing};
+    use crate::sync::state::{FileStateStore, StateStore as _};
+
+    fn serial() -> RwLockWriteGuard<'static, ()> {
+        STATE_LOCK_SERIAL
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn planned_drop(dir: &StateDirPath, anchor: &CurrentAnchor) -> (PlannedAction, Reason) {
+        let class = classify(&probe(dir, anchor));
+        let planned = class.reason();
+        let reason = match class {
+            StateDirClass::Drop(reason) => reason,
+            other => panic!("fixture must plan a drop, got {other:?}"),
+        };
+        (
+            PlannedAction::Drop {
+                dir: dir.clone(),
+                reason,
+            },
+            planned,
+        )
+    }
+
+    fn trash_entries(state_root: &Path) -> Vec<String> {
+        let mut names: Vec<String> = match std::fs::read_dir(state_root.join("trash")) {
+            Ok(entries) => entries
+                .map(|entry| {
+                    entry
+                        .expect("trash entry")
+                        .file_name()
+                        .into_string()
+                        .expect("utf-8 trash name")
+                })
+                .collect(),
+            Err(error) if error.kind() == ErrorKind::NotFound => Vec::new(),
+            Err(error) => panic!("read trash: {error}"),
+        };
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn lock_and_confirm_keep_a_dir_that_vanished_is_busy_or_came_back_to_life() {
+        let _serial = serial();
+        let (_tmp, base) = canonical_tmp();
+        let inside = [copy_record(Some("dest"), "flat")];
+
+        let vanished_root = deleted_root(&base, "vanished");
+        let (dir, anchor) = state_dir(&base, &vanished_root, true, None, &inside);
+        let (action, _) = planned_drop(&dir, &anchor);
+        std::fs::remove_dir_all(dir.path().as_path()).expect("another process removes the dir");
+        let outcome = lock(action);
+        assert!(
+            matches!(outcome, Err(NotHeld::Vanished)),
+            "a dir removed between plan and lock is vanished, got {outcome:?}"
+        );
+        assert!(
+            !dir.path().as_path().exists(),
+            "locking a vanished dir must create nothing at its path"
+        );
+
+        let busy_root = deleted_root(&base, "busy");
+        let (dir, anchor) = state_dir(&base, &busy_root, true, None, &inside);
+        let (action, _) = planned_drop(&dir, &anchor);
+        let _other = lock_existing(dir.path().as_path()).expect("another process holds the lock");
+        let outcome = lock(action);
+        assert!(
+            matches!(outcome, Err(NotHeld::Busy)),
+            "a dir whose state.lock is held is busy, got {outcome:?}"
+        );
+
+        let revived_root = deleted_root(&base, "revived");
+        let (dir, anchor) = state_dir(&base, &revived_root, true, None, &inside);
+        let (action, planned) = planned_drop(&dir, &anchor);
+        assert_eq!(planned, Reason::Gone);
+        std::fs::create_dir_all(&revived_root).expect("recreate root");
+        std::fs::write(revived_root.join("phora.toml"), "").expect("recreate manifest");
+        let held = lock(action).expect("lock the planned dir");
+        let outcome = confirm(held, planned);
+        assert!(
+            matches!(outcome, Err(Reason::Live)),
+            "a root recreated between probe and lock re-classifies live, got {outcome:?}"
+        );
+        drop(outcome);
+        assert!(
+            dir.path().as_path().join("project.toml").is_file(),
+            "a re-classified dir is kept"
+        );
+        assert!(trash_entries(dir.root().path().as_path()).is_empty());
+    }
+
+    #[test]
+    fn a_confirmed_drop_is_renamed_into_the_trash_under_a_unique_name_and_deleted() {
+        let _serial = serial();
+        let (_tmp, base) = canonical_tmp();
+        let root = deleted_root(&base, "gone");
+        let inside = [copy_record(Some("dest"), "flat")];
+        let drop_once = || {
+            let (dir, anchor) = state_dir(&base, &root, true, None, &inside);
+            let (action, planned) = planned_drop(&dir, &anchor);
+            let held = lock(action).expect("lock the planned dir");
+            let confirmed = confirm(held, planned).expect("the reason holds under the lock");
+            let trashed = trash(confirmed).expect("rename into the trash");
+            assert!(
+                !dir.path().as_path().exists(),
+                "a trashed dir leaves its path"
+            );
+            (dir, trashed)
+        };
+
+        let (dir, first) = drop_once();
+        let state_root = dir.root().path().as_path().to_path_buf();
+        let prefix = format!("{}.", dir.id().as_str());
+        let entries = trash_entries(&state_root);
+        assert!(
+            matches!(entries.as_slice(), [entry] if entry.len() > prefix.len() && entry.starts_with(&prefix)),
+            "one `<id>.<suffix>` entry under <state root>/trash, got {entries:?}"
+        );
+        assert!(
+            state_root
+                .join("trash")
+                .join(&entries[0])
+                .join("project.toml")
+                .is_file(),
+            "the state dir itself is renamed into the trash"
+        );
+
+        let (_, second) = drop_once();
+        let entries = trash_entries(&state_root);
+        assert!(
+            entries.len() == 2 && entries.iter().all(|entry| entry.starts_with(&prefix)),
+            "each rename of the same id gets its own suffix, got {entries:?}"
+        );
+
+        delete(first).expect("delete the first trash entry");
+        delete(second).expect("delete the second trash entry");
+        assert_eq!(trash_entries(&state_root), Vec::<String>::new());
+    }
+
+    static WAITER_BLOCKED: AtomicBool = AtomicBool::new(false);
+
+    #[test]
+    fn an_own_run_blocked_on_a_removed_dir_relocks_the_recreated_dir() {
+        let _serial = serial();
+        let (_tmp, base) = canonical_tmp();
+        let dir = base.join("state/projects/0123456789abcdef");
+        std::fs::create_dir_all(&dir).expect("create state dir");
+        let holder = FileStateStore::open(dir.clone())
+            .expect("open holder store")
+            .acquire_lock()
+            .expect("holder locks");
+        let waiter = FileStateStore::open(dir.clone())
+            .expect("open waiter store")
+            .with_lock_timeout(Duration::from_secs(10))
+            .on_lock_wait(|| WAITER_BLOCKED.store(true, Ordering::SeqCst));
+
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| waiter.acquire_lock());
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !WAITER_BLOCKED.load(Ordering::SeqCst) {
+                assert!(Instant::now() < deadline, "the waiter never blocked");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::fs::remove_dir_all(&dir).expect("the holder removes its dir (FR-2)");
+            drop(holder);
+
+            let relocked = waiting
+                .join()
+                .expect("waiter thread")
+                .expect("the waiter acquires the lock");
+            let contender = lock_existing(&dir);
+            assert!(
+                matches!(contender, Err(NotHeld::Busy)),
+                "the waiter must hold the state.lock at the dir's path, got {contender:?}"
+            );
+            drop(relocked);
+        });
+    }
+
+    #[test]
+    fn locking_an_existing_dir_never_holds_a_state_lock_replaced_after_it_was_opened() {
+        let _serial = serial();
+        let (_tmp, base) = canonical_tmp();
+        let dir = base.join("state/projects/0123456789abcdef");
+        let locks = dir.join("locks");
+        std::fs::create_dir_all(&locks).expect("create locks dir");
+        let lock_path = locks.join("state.lock");
+        let first = std::fs::File::create(&lock_path).expect("create state.lock");
+        first.lock().expect("holder locks state.lock");
+        let stop = AtomicBool::new(false);
+
+        let stale_holds = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut held = first;
+                let mut round = 0_u64;
+                while !stop.load(Ordering::SeqCst) {
+                    let next_path = locks.join(format!("next.{round}"));
+                    let next = std::fs::File::create(&next_path).expect("create next state.lock");
+                    next.lock().expect("holder locks the next state.lock");
+                    std::fs::rename(&next_path, &lock_path).expect("replace state.lock");
+                    held = next;
+                    round += 1;
+                }
+                drop(held);
+            });
+            let sweepers: Vec<_> = (0..16)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let deadline = Instant::now() + Duration::from_secs(1);
+                        while Instant::now() < deadline && !stop.load(Ordering::SeqCst) {
+                            match lock_existing(&dir) {
+                                Ok(_stale) => {
+                                    stop.store(true, Ordering::SeqCst);
+                                    return 1;
+                                }
+                                Err(NotHeld::Busy | NotHeld::Vanished) => {}
+                                Err(other) => panic!("unexpected lock outcome {other:?}"),
+                            }
+                        }
+                        0
+                    })
+                })
+                .collect();
+            let stale_holds: usize = sweepers
+                .into_iter()
+                .map(|sweeper| sweeper.join().expect("sweeper thread"))
+                .sum();
+            stop.store(true, Ordering::SeqCst);
+            stale_holds
+        });
+        assert_eq!(
+            stale_holds, 0,
+            "lock_existing held a state.lock inode no longer at locks/state.lock while the \
+             holder held the one at the path"
+        );
+    }
+
+    #[test]
+    fn acquiring_the_lock_through_a_dangling_state_lock_symlink_fails_within_the_timeout() {
+        let (_tmp, base) = canonical_tmp();
+        let dir = base.join("state/projects/0123456789abcdef");
+        std::fs::create_dir_all(dir.join("locks")).expect("create locks dir");
+        std::os::unix::fs::symlink(
+            base.join("missing/state.lock"),
+            dir.join("locks/state.lock"),
+        )
+        .expect("dangling state.lock symlink");
+        let timeout = Duration::from_millis(200);
+        let store = FileStateStore::open(dir)
+            .expect("open store")
+            .with_lock_timeout(timeout);
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(store.acquire_lock().map(drop));
+        });
+        let outcome = receiver.recv_timeout(timeout + Duration::from_secs(5));
+        assert!(
+            matches!(outcome, Ok(Err(_))),
+            "a state.lock that cannot be opened is an error within the lock timeout, got {outcome:?}"
         );
     }
 }

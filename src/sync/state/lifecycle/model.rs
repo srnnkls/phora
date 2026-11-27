@@ -492,8 +492,8 @@ pub struct EjectableWorktree {
 
 #[derive(Debug)]
 pub struct Held {
-    dir: StateDirPath,
-    lock: StateLock,
+    pub(super) dir: StateDirPath,
+    pub(super) lock: StateLock,
 }
 
 #[derive(Debug)]
@@ -505,31 +505,31 @@ pub enum NotHeld {
 
 #[derive(Debug)]
 pub struct Confirmed {
-    held: Held,
-    class: StateDirClass,
+    pub(super) held: Held,
+    pub(super) class: StateDirClass,
 }
 
 #[derive(Debug)]
 pub struct Trashed {
-    entry: TrashEntry,
-    lock: StateLock,
+    pub(super) entry: TrashEntry,
+    pub(super) lock: StateLock,
 }
 
 #[derive(Debug)]
 pub struct Leftover {
-    entry: TrashEntry,
+    pub(super) entry: TrashEntry,
 }
 
 /// Unique per rename.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TrashSuffix(String);
+pub struct TrashSuffix(pub(super) String);
 
 /// `<root>/trash/<id>.<suffix>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrashEntry {
-    root: StateRoot,
-    id: ProjectId,
-    suffix: TrashSuffix,
+    pub(super) root: StateRoot,
+    pub(super) id: ProjectId,
+    pub(super) suffix: TrashSuffix,
 }
 
 #[derive(Debug)]

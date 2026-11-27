@@ -9,10 +9,13 @@ pub use model::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::ErrorKind;
 use std::num::NonZeroUsize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::mount::{AnchorDir, CurrentAnchor, Location, NormalPath, Placement, is_absent, locate};
+use crate::mount::{
+    AnchorDir, CurrentAnchor, Location, MountId, NormalPath, Placement, is_absent, locate,
+};
 use crate::sync::journal::Journal;
+use crate::sync::nonce;
 use crate::sync::observe::normalize_history_deploy_root_at;
 use crate::sync::prune::orphan_artifact_path;
 use crate::sync::state::file::atomic_write;
@@ -24,6 +27,9 @@ use crate::sync::state::{
 const META_FILE: &str = "project.toml";
 const INDEX_FILE: &str = "state-roots.toml";
 const INDEX_LOCK_FILE: &str = "state-roots.lock";
+const TRASH_DIR: &str = "trash";
+/// Fresh suffixes tried when a crashed run left an entry under the same name.
+const TRASH_ATTEMPTS: u32 = 8;
 
 /// The project's own locked run: refresh its `project.toml`, register a non-default state root,
 /// and mark every other copy of its id superseded. Each failure comes back as a warning.
@@ -325,19 +331,83 @@ pub fn apply_gc(_plan: GcPlan, _confirmation: Confirmation) -> GcOutcome {
 }
 
 /// Takes the dir's `state.lock` with zero timeout, creating nothing outside an existing dir.
-pub fn lock(_action: PlannedAction) -> Result<Held, NotHeld> {
-    todo!()
+pub fn lock(action: PlannedAction) -> Result<Held, NotHeld> {
+    let (PlannedAction::Drop { dir, .. }
+    | PlannedAction::ReleaseLinks { dir, .. }
+    | PlannedAction::Eject { dir, .. }
+    | PlannedAction::Forget { dir, .. }
+    | PlannedAction::Report { dir, .. }) = action;
+    let lock = lock_existing(dir.path().as_path())?;
+    Ok(Held { dir, lock })
 }
 
 /// Re-probes under the lock; proceeds only when the reason still equals `planned`.
-pub fn confirm(_held: Held, _planned: Reason) -> Result<Confirmed, Reason> {
-    todo!()
+pub fn confirm(held: Held, planned: Reason) -> Result<Confirmed, Reason> {
+    let path = held.dir.path();
+    let probed = match MountId::of(path.as_path()) {
+        Ok(mount) => probe(&held.dir, &CurrentAnchor::new(AnchorDir::new(path), mount)),
+        Err(error) => StateDirProbe::Unreadable(error.kind()),
+    };
+    let class = classify(&probed);
+    match class.reason() {
+        reason if reason == planned => Ok(Confirmed { held, class }),
+        reason => Err(reason),
+    }
 }
 
-pub fn trash(_confirmed: Confirmed) -> Result<Trashed, StateError> {
-    todo!()
+/// Renames the dir to `<root>/trash/<id>.<suffix>`, keeping its lock.
+pub fn trash(confirmed: Confirmed) -> Result<Trashed, StateError> {
+    let Held { dir, lock } = confirmed.held;
+    let from = dir.path();
+    let mut attempts = TRASH_ATTEMPTS;
+    loop {
+        let entry = TrashEntry {
+            root: dir.root().clone(),
+            id: dir.id().clone(),
+            suffix: TrashSuffix(format!("{}-{}", std::process::id(), nonce())),
+        };
+        let to = trash_path(&entry);
+        if let Some(trash_dir) = to.parent() {
+            std::fs::create_dir_all(trash_dir)
+                .map_err(|error| io_error("create trash", trash_dir, &error))?;
+        }
+        match std::fs::rename(from.as_path(), &to) {
+            Ok(()) => return Ok(Trashed { entry, lock }),
+            Err(error)
+                if attempts > 1
+                    && matches!(
+                        error.kind(),
+                        ErrorKind::AlreadyExists | ErrorKind::DirectoryNotEmpty
+                    ) =>
+            {
+                attempts -= 1;
+            }
+            Err(error) => {
+                return Err(StateError::StateStore(format!(
+                    "rename {} -> {}: {error}",
+                    from.as_path().display(),
+                    to.display()
+                )));
+            }
+        }
+    }
 }
 
-pub fn delete(_trashed: Trashed) -> Result<(), Leftover> {
-    todo!()
+/// Deletes the trash entry, `NotFound` counting as deleted, then releases the lock.
+pub fn delete(trashed: Trashed) -> Result<(), Leftover> {
+    match std::fs::remove_dir_all(trash_path(&trashed.entry)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(Leftover {
+            entry: trashed.entry,
+        }),
+    }
+}
+
+fn trash_path(entry: &TrashEntry) -> PathBuf {
+    entry.root.path().as_path().join(TRASH_DIR).join(format!(
+        "{}.{}",
+        entry.id.as_str(),
+        entry.suffix.0
+    ))
 }
