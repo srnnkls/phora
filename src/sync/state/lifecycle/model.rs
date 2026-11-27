@@ -14,18 +14,42 @@ use crate::sync::state::{ArtifactKey, ProjectId, StateError, StateLock};
 pub struct ProjectRoot(NormalPath);
 
 impl ProjectRoot {
-    pub fn recorded(_root: NormalPath, _id: &ProjectId) -> Option<Self> {
-        todo!()
+    pub fn recorded(root: NormalPath, id: &ProjectId) -> Option<Self> {
+        (ProjectId::of_canonical(&root) == *id).then_some(Self(root))
     }
 
     /// The project's own root, in its own run.
-    pub fn canonicalize(_path: &Path) -> std::io::Result<Self> {
-        todo!()
+    pub fn canonicalize(path: &Path) -> std::io::Result<Self> {
+        let canonical = path.canonicalize()?;
+        NormalPath::lexical(&canonical).map(Self).ok_or_else(|| {
+            std::io::Error::other(format!(
+                "canonical root {} is relative",
+                canonical.display()
+            ))
+        })
+    }
+
+    pub fn id(&self) -> ProjectId {
+        ProjectId::of_canonical(&self.0)
+    }
+
+    pub fn path(&self) -> &NormalPath {
+        &self.0
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StateRoot(NormalPath);
+
+impl StateRoot {
+    pub fn new(path: NormalPath) -> Self {
+        Self(path)
+    }
+
+    pub fn path(&self) -> &NormalPath {
+        &self.0
+    }
+}
 
 /// `<root>/projects/<id>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,11 +58,51 @@ pub struct StateDirPath {
     id: ProjectId,
 }
 
+impl StateDirPath {
+    pub fn new(root: StateRoot, id: ProjectId) -> Self {
+        Self { root, id }
+    }
+
+    pub fn root(&self) -> &StateRoot {
+        &self.root
+    }
+
+    pub fn id(&self) -> &ProjectId {
+        &self.id
+    }
+
+    pub fn path(&self) -> NormalPath {
+        self.root.0.join("projects").join(self.id.as_str())
+    }
+}
+
 #[derive(Debug)]
 pub struct ProjectMeta {
     root: ProjectRoot,
     placement: Placement,
     state_dir: AnchorDir,
+}
+
+impl ProjectMeta {
+    pub fn new(root: ProjectRoot, placement: Placement, state_dir: AnchorDir) -> Self {
+        Self {
+            root,
+            placement,
+            state_dir,
+        }
+    }
+
+    pub fn root(&self) -> &ProjectRoot {
+        &self.root
+    }
+
+    pub fn placement(&self) -> &Placement {
+        &self.placement
+    }
+
+    pub fn state_dir(&self) -> &AnchorDir {
+        &self.state_dir
+    }
 }
 
 #[derive(Debug)]
@@ -81,6 +145,25 @@ pub struct StateRootIndex {
     /// The default state root's path as recorded, passed to `locate` for entries.
     anchor: AnchorDir,
     roots: BTreeMap<StateRoot, Placement>,
+}
+
+impl StateRootIndex {
+    pub fn new(anchor: AnchorDir, roots: BTreeMap<StateRoot, Placement>) -> Self {
+        Self { anchor, roots }
+    }
+
+    pub fn anchor(&self) -> &AnchorDir {
+        &self.anchor
+    }
+
+    pub fn roots(&self) -> &BTreeMap<StateRoot, Placement> {
+        &self.roots
+    }
+
+    /// Records `root` with its placement; `false` when the index already holds exactly that.
+    pub fn register(&mut self, root: StateRoot, placement: Placement) -> bool {
+        self.roots.insert(root, placement.clone()) != Some(placement)
+    }
 }
 
 #[derive(Debug)]

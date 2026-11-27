@@ -874,6 +874,19 @@ fn inv3_cli_io_file_passes() {
 }
 
 #[test]
+fn inv3_mount_io_file_passes() {
+    let tree = base_tree();
+    tree.write(
+        "src/mount.rs",
+        "pub fn ancestor_mount(p: &std::path::Path) { let _ = std::fs::symlink_metadata(p); }\n",
+    );
+    tree.check().assert_pass(
+        "src/mount.rs performing filesystem I/O (a permanent INV-3 I/O owner for mount \
+         identity, encryption and provable absence)",
+    );
+}
+
+#[test]
 fn projection_production_io_after_same_line_cfg_test_import_fails() {
     let tree = base_tree();
     tree.write(

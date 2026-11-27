@@ -384,7 +384,7 @@ fn read_record(path: &Path) -> Result<ArtifactRecord> {
         .map_err(|e| StateError::StateStore(format!("parse record {}: {e}", path.display())))
 }
 
-fn atomic_write(path: &Path, contents: &str) -> Result<()> {
+pub(super) fn atomic_write(path: &Path, contents: &str) -> Result<()> {
     atomic_write_with(path, contents, fsync_barrier)
 }
 

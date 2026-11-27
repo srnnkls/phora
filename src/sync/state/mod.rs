@@ -51,9 +51,16 @@ pub struct ProjectId(String);
 impl ProjectId {
     /// Path-hash identity: BLAKE3 of the canonical project root, first 16 hex chars.
     pub fn for_path(root: &Path) -> crate::error::Result<Self> {
-        let canonical = root.canonicalize()?;
+        Ok(Self::hash(&root.canonicalize()?))
+    }
+
+    pub(crate) fn of_canonical(root: &NormalPath) -> Self {
+        Self::hash(root.as_path())
+    }
+
+    fn hash(canonical: &Path) -> Self {
         let hash = blake3::hash(canonical.to_string_lossy().as_bytes());
-        Ok(Self(hash.to_hex()[..16].to_string()))
+        Self(hash.to_hex()[..16].to_string())
     }
 
     #[must_use]
@@ -64,10 +71,6 @@ impl ProjectId {
 
 #[cfg_attr(not(test), expect(dead_code, reason = "stubs wired by T004 to T008"))]
 impl ProjectId {
-    pub(crate) fn of_canonical(_root: &NormalPath) -> Self {
-        todo!()
-    }
-
     /// Exactly 16 lowercase hex chars.
     pub(crate) fn parse(_name: &OsStr) -> Option<Self> {
         todo!()

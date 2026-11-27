@@ -52,11 +52,12 @@ use clap::{Parser, Subcommand};
 
 use crate::config::{Config, ParsedSource, merge_configs};
 use crate::error::{Error, Result};
+use crate::mount::NormalPath;
 use crate::paths::state_root_for;
 use crate::projection::model::TargetName;
 use crate::source::SourceName;
 use crate::source::{GitBackend, HttpBackend, RouterBackend};
-use crate::sync::state::ProjectId;
+use crate::sync::state::lifecycle::{self, ProjectRoot, StateDirPath, StateRoot};
 use crate::sync::state::{FileStateStore, StateError, StateLock, StateStore};
 use crate::sync::{
     Conflict, ConflictKind, ConflictResolver, PrunePolicy, PruneScope, Resolution, SourcePolicy,
@@ -961,12 +962,8 @@ impl ConflictResolver for TtyResolver {
 }
 
 fn open_project_registry(config: &Config) -> Result<FileStateStore> {
-    let cwd = std::env::current_dir()?;
-    let project = ProjectId::for_path(&cwd)?;
-    let registry_root = state_root_for(config.paths.state.as_deref(), &cwd)?
-        .join("projects")
-        .join(project.as_str());
-    Ok(FileStateStore::open(registry_root)?)
+    let (own, _) = own_state_dir(&std::env::current_dir()?, config)?;
+    Ok(FileStateStore::open(own.path().as_path().to_path_buf())?)
 }
 
 /// Opens the project registry and takes its `state.lock`, announcing a wait on stderr.
@@ -974,11 +971,42 @@ fn lock_project_registry(
     config: &Config,
     lock_timeout: Duration,
 ) -> Result<(FileStateStore, StateLock)> {
-    let registry = open_project_registry(config)?
+    let cwd = std::env::current_dir()?;
+    let (own, root) = own_state_dir(&cwd, config)?;
+    let registry = FileStateStore::open(own.path().as_path().to_path_buf())?
         .with_lock_timeout(lock_timeout)
         .on_lock_wait(announce_lock_wait);
     let guard = registry.acquire_lock()?;
+    record_project_root(&cwd, &own, &root, &guard);
     Ok((registry, guard))
+}
+
+/// The run's own state dir, lexically normalized, and its project root.
+fn own_state_dir(cwd: &Path, config: &Config) -> Result<(StateDirPath, ProjectRoot)> {
+    let root = ProjectRoot::canonicalize(cwd)?;
+    let own = StateDirPath::new(
+        lexical_state_root(config.paths.state.as_deref(), cwd)?,
+        root.id(),
+    );
+    Ok((own, root))
+}
+
+/// Records the project's root and state root under the `state.lock` held on `own`; failures only warn.
+fn record_project_root(cwd: &Path, own: &StateDirPath, root: &ProjectRoot, held: &StateLock) {
+    let warnings = lexical_state_root(None, cwd).map_or_else(
+        |error| vec![StateError::StateStore(error.to_string())],
+        |default| lifecycle::record_own_run(own, &default, root, held),
+    );
+    for warning in warnings {
+        eprintln!("phora: recording the project root: {warning}");
+    }
+}
+
+fn lexical_state_root(override_: Option<&Path>, cwd: &Path) -> Result<StateRoot> {
+    let path = state_root_for(override_, cwd)?;
+    NormalPath::lexical(&path)
+        .map(StateRoot::new)
+        .ok_or_else(|| Error::Config(format!("state root {} is not absolute", path.display())))
 }
 
 fn announce_lock_wait() {

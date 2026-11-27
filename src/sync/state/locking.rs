@@ -3,6 +3,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use super::file::{FileStateStore, StateError};
+use super::lifecycle::NotHeld;
 
 type Result<T> = std::result::Result<T, StateError>;
 
@@ -93,6 +94,37 @@ impl FileStateStore {
         statfs_fstype(&self.state_root)
             .as_deref()
             .and_then(network_lock_advisory)
+    }
+}
+
+/// Takes the `state.lock` of another project's existing state dir with zero timeout.
+/// `locks/` and `state.lock` are created only inside a dir that exists, and `NotFound` on the
+/// dir or either entry means `Vanished`.
+pub(crate) fn lock_existing(state_dir: &Path) -> std::result::Result<StateLock, NotHeld> {
+    let locks_dir = state_dir.join("locks");
+    match std::fs::create_dir(&locks_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(not_held(&e)),
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(locks_dir.join("state.lock"))
+        .map_err(|e| not_held(&e))?;
+    match file.try_lock() {
+        Ok(()) => Ok(StateLock { _file: file }),
+        Err(TryLockError::WouldBlock) => Err(NotHeld::Busy),
+        Err(TryLockError::Error(e)) => Err(not_held(&e)),
+    }
+}
+
+fn not_held(e: &std::io::Error) -> NotHeld {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => NotHeld::Vanished,
+        kind => NotHeld::Fault(kind),
     }
 }
 

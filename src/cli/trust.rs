@@ -9,6 +9,7 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::time::Duration;
 
+use crate::config::merge_configs;
 use crate::config::transitive::{Member, TransitiveManifest};
 use crate::error::{Error, Result};
 use crate::lock::{CandidateHookRecord, Lock, TrustedHook};
@@ -18,7 +19,7 @@ use crate::source::{
 };
 use crate::sync::transitive::ResolvedGraph;
 
-use super::{load_config, lock_project_registry};
+use super::{load_config, load_local_config, lock_project_registry};
 
 /// A discovery-only candidate carries no real preimage: it is resolved on first sync.
 const UNRESOLVED_PREIMAGE: &str = "";
@@ -30,11 +31,14 @@ pub(super) fn run_trust(
     show: Option<&str>,
     lock_timeout: Duration,
 ) -> Result<()> {
+    let cwd = std::env::current_dir()?;
     let mut config = load_config()?;
     config.lower_transitive();
-    let _locked = lock_project_registry(&config, lock_timeout)?;
+    let _locked = lock_project_registry(
+        &merge_configs(config.clone(), load_local_config(&cwd)?),
+        lock_timeout,
+    )?;
 
-    let cwd = std::env::current_dir()?;
     let cache_git = crate::paths::cache_root_for(config.paths.cache.as_deref(), &cwd)?.join("git");
     let (mut base_lock, local_lock) = super::sync::load_locks(&cwd)?;
 

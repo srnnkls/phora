@@ -17,6 +17,10 @@ SOURCE_IO_OWNERS=(
   src/source/worktree_deploy.rs
 )
 
+PLATFORM_IO_OWNERS=(
+  src/mount.rs
+)
+
 LEGACY_INFRA=(
   src/main.rs
 )
@@ -357,7 +361,7 @@ inv3_exempt() {
     */tests.rs | *_tests.rs) return 0 ;;
     src/projection/*|src/sync/*|src/cli/*) return 0 ;;
   esac
-  for entry in "${SOURCE_IO_OWNERS[@]}"; do
+  for entry in "${SOURCE_IO_OWNERS[@]}" "${PLATFORM_IO_OWNERS[@]}"; do
     [[ "$rel" == "$entry" ]] && return 0
   done
   for entry in "${LEGACY_ALLOWLIST[@]-}"; do

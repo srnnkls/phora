@@ -1,5 +1,10 @@
 --- locks/journal.toml ---
 entry = []
+--- project.toml ---
+version = 1
+root = "<CWD>"
+on_state_mount = true
+state_dir = "<XDG_STATE>/phora/projects/<PROJECT>"
 --- targets/home/artifacts/dotfiles/editor.toml ---
 version = 1
 source = "dotfiles"

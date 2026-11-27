@@ -28,8 +28,18 @@ pub fn normalize_lexical(path: &Path) -> PathBuf {
 pub struct NormalPath(PathBuf);
 
 impl NormalPath {
-    pub fn lexical(_path: &Path) -> Option<Self> {
-        todo!()
+    pub fn lexical(path: &Path) -> Option<Self> {
+        path.is_absolute().then(|| Self(normalize_lexical(path)))
+    }
+
+    #[must_use]
+    pub fn join(&self, name: impl AsRef<Path>) -> Self {
+        Self(normalize_lexical(&self.0.join(name)))
+    }
+
+    #[must_use]
+    pub fn as_path(&self) -> &Path {
+        &self.0
     }
 }
 
@@ -37,15 +47,61 @@ impl NormalPath {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MountId(u64);
 
+impl MountId {
+    #[cfg(target_os = "linux")]
+    pub fn of(path: &Path) -> std::io::Result<Self> {
+        use rustix::fs::{AtFlags, CWD, StatxFlags, statx};
+
+        let stx = statx(CWD, path, AtFlags::empty(), StatxFlags::MNT_ID)?;
+        if stx.stx_mask & StatxFlags::MNT_ID.bits() != 0 {
+            Ok(Self(stx.stx_mnt_id))
+        } else {
+            Ok(Self(
+                (u64::from(stx.stx_dev_major) << 32) | u64::from(stx.stx_dev_minor),
+            ))
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn of(path: &Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        Ok(Self(std::fs::metadata(path)?.dev()))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Placement {
     OnAnchorMount,
     Elsewhere,
 }
 
+impl Placement {
+    /// Where `path` sits relative to `anchor`'s mount, both read now.
+    pub fn of(path: &Path, anchor: &Path) -> std::io::Result<Self> {
+        Ok(if MountId::of(path)? == MountId::of(anchor)? {
+            Self::OnAnchorMount
+        } else {
+            Self::Elsewhere
+        })
+    }
+}
+
 /// The anchor directory's path, as recorded or as seen now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnchorDir(NormalPath);
+
+impl AnchorDir {
+    #[must_use]
+    pub fn new(path: NormalPath) -> Self {
+        Self(path)
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &NormalPath {
+        &self.0
+    }
+}
 
 /// The anchor directory as read in this run.
 #[derive(Debug)]
