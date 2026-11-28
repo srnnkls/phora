@@ -517,7 +517,11 @@ fn trash_names(trash: &Path) -> Vec<String> {
 }
 
 fn registered_roots(fx: &Fixture) -> Vec<String> {
-    read_toml(&fx.default_state_root().join("state-roots.toml"))
+    let index = fx.default_state_root().join("state-roots.toml");
+    if !index.exists() {
+        return Vec::new();
+    }
+    read_toml(&index)
         .get("roots")
         .and_then(toml::Value::as_array)
         .map(|roots| {
@@ -1314,5 +1318,118 @@ fn gc_eject_yes_trashes_a_gone_dir_whose_confined_link_stays_and_lists_the_link(
             line.contains("leaves") && text_names.iter().any(|name| line.contains(str_of(name)))
         }),
         "the text output lists the kept link as left behind, got:\n{text}"
+    );
+}
+
+/// The `state_dirs_dropped` count of the `--json` summary record.
+fn summary_dirs_dropped(out: &Output) -> Option<u64> {
+    let records = json_records(out);
+    let summary = records
+        .iter()
+        .find(|record| record["type"] == "summary")
+        .unwrap_or_else(|| panic!("sync --json ends with a summary record, got {records:#?}"));
+    summary["state_dirs_dropped"].as_u64()
+}
+
+#[test]
+fn sweep_drops_a_deleted_projects_superseded_copy_and_its_successor_and_counts_both() {
+    let fx = Fixture::new();
+    fx.configure("", "home/deploy");
+
+    let moved = fx.other_project("pi", "", &fx.base.join("pi/first"));
+    fx.phora_in(&moved, &["sync"]);
+    fx.other_project(
+        "pi",
+        "[paths]\nstate = \"../pi-state\"\n",
+        &fx.base.join("pi/second"),
+    );
+    fx.phora_in(&moved, &["sync"]);
+    let successor_root = std::fs::canonicalize(&fx.base)
+        .expect("canonical base")
+        .join("pi-state");
+    let old_copy = state_dir_of(&moved, &fx.default_state_root());
+    let successor = state_dir_of(&moved, &successor_root);
+    assert_eq!(
+        path_field(&read_toml(&old_copy.join("project.toml")), "superseded_by"),
+        Some(str_of(&successor_root)),
+        "setup: the default copy is marked superseded"
+    );
+    assert!(
+        successor.is_dir(),
+        "setup: {} must exist",
+        successor.display()
+    );
+
+    std::fs::remove_dir_all(&moved).expect("delete pi root");
+
+    let out = fx.phora_in(&fx.project, &["sync", "--json"]);
+
+    assert_absent(
+        &old_copy,
+        "a superseded copy of a deleted root is dropped as gone",
+    );
+    assert_absent(
+        &successor,
+        "the successor copy of a deleted root is dropped as gone",
+    );
+    assert_eq!(
+        summary_dirs_dropped(&out),
+        Some(2),
+        "the summary counts both dropped copies"
+    );
+}
+
+#[test]
+fn sweep_unregisters_the_state_roots_of_deleted_projects_inside_their_root_or_absolute() {
+    let fx = Fixture::new();
+    fx.configure("", "home/deploy");
+
+    let inside = fx.other_project(
+        "tau",
+        "[paths]\nstate = \"state\"\n",
+        &fx.base.join("tau/out"),
+    );
+    fx.phora_in(&inside, &["sync"]);
+    let absolute_root = fx.base.join("upsilon-state");
+    let absolute = fx.other_project(
+        "upsilon",
+        &format!("[paths]\nstate = \"{}\"\n", absolute_root.display()),
+        &fx.base.join("upsilon/out"),
+    );
+    fx.phora_in(&absolute, &["sync"]);
+    let inside_root = std::fs::canonicalize(&inside)
+        .expect("canonical tau root")
+        .join("state");
+    let absolute_dir = state_dir_of(&absolute, &absolute_root);
+    let names_root =
+        |registered: &[String], root: &Path| registered.iter().any(|entry| mentions(entry, root));
+    let registered = registered_roots(&fx);
+    assert!(
+        names_root(&registered, &inside_root) && names_root(&registered, &absolute_root),
+        "setup: both custom state roots are registered, got {registered:?}"
+    );
+    assert!(
+        absolute_dir.is_dir(),
+        "setup: {} must exist",
+        absolute_dir.display()
+    );
+
+    std::fs::remove_dir_all(&inside).expect("delete tau root with its state root");
+    std::fs::remove_dir_all(&absolute).expect("delete upsilon root");
+
+    fx.sync();
+
+    assert_absent(
+        &absolute_dir,
+        "a deleted root's dir in an absolute custom state root is dropped",
+    );
+    let registered = registered_roots(&fx);
+    assert!(
+        !names_root(&registered, &inside_root),
+        "a state root deleted with its project's root is unregistered, got {registered:?}"
+    );
+    assert!(
+        !names_root(&registered, &absolute_root),
+        "an absolute state root left without state dirs is unregistered, got {registered:?}"
     );
 }

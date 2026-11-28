@@ -166,6 +166,68 @@ lab/cluster setup — do not run concurrent syncs of the same project from two
 machines; serialize them, or give each machine its own state root by pointing
 `[paths].state` at machine-local storage.
 
+### Dead state
+
+Each project's state dir records the project's root in `project.toml`, and a
+project whose `[paths].state` is not the default registers that state root in
+`state-roots.toml` under the default one. From these records alone, every
+`sync`, `update` and `source rm` that holds the project lock and does not fail
+reviews every state dir in the default and every registered state root. A dir
+that holds no state is dropped. When a root is provably deleted, its link-mode
+symlinks that point into it and now dangle are removed, and its dir is dropped
+once nothing else it deployed remains. Anything else that is not live is kept,
+and the run ends with one warning such as
+``state dirs: 1 stranded; run `phora gc` to review``. `sync --frozen` and
+`cache prune` never sweep state dirs.
+
+`phora gc` reviews the same dirs on demand, from any directory:
+
+```bash
+phora gc --dry-run          # print the plan; change nothing
+phora gc                    # drop the dead dirs, release their dangling links
+phora gc --eject            # also drop every other dir that is not live, after a prompt
+phora gc --eject --yes      # the same, confirmed without a prompt
+phora gc --json             # one NDJSON record per dir on stdout
+```
+
+Each record names the dir's project id, class and reason, root, the evidence
+behind the reason, the planned action, the deployed files that action leaves
+behind, and, once applied, its outcome. The reasons are:
+
+| Reason        | Meaning                                                            | `phora gc`         | `phora gc --eject`          |
+| ------------- | ------------------------------------------------------------------ | ------------------ | --------------------------- |
+| `empty`       | no records, no target metadata, no pending journal                 | drop               | drop                        |
+| `gone`        | root deleted, nothing left outside it but dangling links           | drop               | drop                        |
+| `stranded`    | root deleted, but files outside it, an unresolvable record or a pending journal remain | release links, keep | eject worktrees, drop |
+| `retired`     | root present without `phora.toml`                                  | keep               | eject worktrees, drop       |
+| `unrooted`    | no valid root recorded                                             | keep               | drop                        |
+| `abandoned`   | the project moved to another state root                            | keep               | drop                        |
+| `unreachable` | the root cannot be proven present or deleted                       | keep               | drop                        |
+
+A root counts as deleted only when phora can prove it: the root is missing, it
+was recorded on the state dir's volume, and its nearest existing parent is on
+that volume now, unencrypted and reached through no symlink. A root on an
+unmounted volume, or one moved away and replaced by a symlink, is
+`unreachable`, not deleted. Some reasons may still belong to a live project, and
+gc says so: an `unrooted` dir may be a project not run since this upgrade (run
+`phora sync` in it first), an `unreachable` dir may sit on an unmounted volume,
+and a `retired` dir may be a project checked out on a branch without
+`phora.toml`.
+
+Without `--yes` and without a TTY, `--eject` applies only the `empty` and `gone`
+drops and the link releases, and reports every other dir as pending. gc exits 0
+unless an operation fails. After dropping state it prunes the content store,
+keeping every object a project in any registered state root still uses.
+
+What stays: gc deletes no deployed file except a link-mode symlink that points
+into a deleted root and now dangles. Copies outside a deleted root and files
+inside a retired root are kept and listed as `leaves`. `--eject` turns the
+history worktrees of `stranded` and `retired` dirs into standalone clones before
+the drop; a worktree whose mirror is gone keeps its `.git` link
+and is listed. Live dirs and entries under `projects/` or `trash/` that phora
+did not create are left alone. A registered state root that is absent but not
+provably deleted is listed, and `--eject` unregisters it after the confirmation.
+
 ## Usage
 
 ```bash
@@ -224,6 +286,9 @@ phora uneject <artifact> --source <source> --target <target>
 # Maintenance / debugging
 phora rebuild-registry      # reconstruct registry from lock + on-disk targets
 phora cache prune [-n]      # remove content-store objects no recorded deployment uses
+phora gc --dry-run          # list the state dirs that are not live and what gc would do
+phora gc                    # drop the provably dead ones, then prune the content store
+phora gc --eject --yes      # also eject and drop every other dir that is not live
 phora check-match --source <source> <path>   # debug include/exclude matching
 phora explain <target> <source> [path]       # offline: which include/exclude offered a path, and how `take` resolves it
 ```
