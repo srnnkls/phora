@@ -35,7 +35,19 @@ pub struct PruneReport {
 /// # Errors
 /// Unreadable registries or store entries.
 pub fn prune(store: &Path, projects: &Path, dry_run: bool) -> Result<PruneReport> {
-    let live = live_hashes(projects)?;
+    prune_roots(store, &[projects.to_path_buf()], dry_run)
+}
+
+/// Removes store objects no registry under any of the `projects` dirs references; an absent
+/// dir holds no registry.
+///
+/// # Errors
+/// Unreadable registries or store entries.
+pub fn prune_roots(store: &Path, projects: &[PathBuf], dry_run: bool) -> Result<PruneReport> {
+    let mut live = BTreeSet::new();
+    for dir in projects {
+        live_hashes(dir, &mut live)?;
+    }
     let mut report = PruneReport::default();
     let shards = match std::fs::read_dir(store) {
         Ok(shards) => shards,
@@ -78,6 +90,14 @@ pub fn prune(store: &Path, projects: &Path, dry_run: bool) -> Result<PruneReport
 /// # Errors
 /// As [`prune`], plus a marker that cannot be written.
 pub fn auto_prune(store: &Path, projects: &Path) -> Result<Option<PruneReport>> {
+    auto_prune_roots(store, &[projects.to_path_buf()])
+}
+
+/// As [`auto_prune`], counting the registries under every one of the `projects` dirs.
+///
+/// # Errors
+/// As [`prune_roots`], plus a marker that cannot be written.
+pub fn auto_prune_roots(store: &Path, projects: &[PathBuf]) -> Result<Option<PruneReport>> {
     let marker = store.join(PRUNE_MARKER);
     let recent = std::fs::metadata(&marker)
         .and_then(|meta| meta.modified())
@@ -85,16 +105,15 @@ pub fn auto_prune(store: &Path, projects: &Path) -> Result<Option<PruneReport>> 
     if recent || !store.is_dir() {
         return Ok(None);
     }
-    let report = prune(store, projects, false)?;
+    let report = prune_roots(store, projects, false)?;
     std::fs::File::create(&marker)?;
     Ok(Some(report))
 }
 
-fn live_hashes(projects: &Path) -> Result<BTreeSet<String>> {
-    let mut live = BTreeSet::new();
+fn live_hashes(projects: &Path, live: &mut BTreeSet<String>) -> Result<()> {
     let registries = match std::fs::read_dir(projects) {
         Ok(registries) => registries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(live),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.into()),
     };
     for registry in registries {
@@ -106,7 +125,7 @@ fn live_hashes(projects: &Path) -> Result<BTreeSet<String>> {
             live.extend(record.files.into_iter().map(|file| file.blake3));
         }
     }
-    Ok(live)
+    Ok(())
 }
 
 fn age(time: SystemTime) -> Duration {

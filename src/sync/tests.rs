@@ -17140,3 +17140,1026 @@ fn observe_workspace_rejects_duplicate_triplet() {
          artifact` diagnostic, got: {msg}"
     );
 }
+
+mod state_lifecycle_data_model {
+    use std::collections::BTreeMap;
+    use std::ffi::{OsStr, OsString};
+    use std::io::ErrorKind;
+    use std::num::NonZeroUsize;
+    use std::path::{Path, PathBuf};
+
+    use crate::mount::{
+        AnchorDir, CurrentAnchor, DeletionProof, Location, MountId, NormalPath, Placement,
+        Unproven, locate, normalize_lexical,
+    };
+    use crate::sync::state::lifecycle::{
+        Attention, Confirmation, Confirmed, DropOutcome, DropReason, EjectableWorktree,
+        ForgetReason, GcInput, GcOutcome, GcPlan, GcRecord, Held, IndexRead, JournalState,
+        KeepReason, Leftover, LegacyEvidence, LinkKept, LinkOutcome, MetaDefect, MetaRead, NotHeld,
+        PlannedAction, Probed, ProjectMeta, ProjectRoot, ProjectsEntry, Reason, RecordFate,
+        ReleasableLink, ReleaseReason, Remains, RootObservation, RootlessMeta, StateDirClass,
+        StateDirPath, StateDirProbe, StateRoot, StateRootIndex, Stranded, StrandedEvidence,
+        Succession, SweepFault, SweepInput, SweepReport, TrashEntry, TrashName, TrashSuffix,
+        Trashed, Unreachable, UnreachableRoot, WireDefect, apply_gc, classify, confirm, delete,
+        lock, plan_gc, probe, sweep, trash,
+    };
+    use crate::sync::state::{ArtifactKey, ProjectId, StateError};
+
+    fn mount_shapes(placement: Placement, unproven: &Unproven, location: &Location) {
+        match placement {
+            Placement::OnAnchorMount | Placement::Elsewhere => {}
+        }
+        match unproven {
+            Unproven::RecordedElsewhere | Unproven::OffMount | Unproven::Encrypted => {}
+            Unproven::AnchorMoved { now } | Unproven::CanonicalDiffers { now } => {
+                let _: &NormalPath = now;
+            }
+            Unproven::SymlinkedComponent(path) => {
+                let _: &NormalPath = path;
+            }
+            Unproven::Fault(kind) => {
+                let _: &ErrorKind = kind;
+            }
+        }
+        match location {
+            Location::Present => {}
+            Location::Deleted(proof) => {
+                let _: &DeletionProof = proof;
+            }
+            Location::Unproven(unproven) => {
+                let _: &Unproven = unproven;
+            }
+        }
+    }
+
+    fn meta_shapes(succession: &Succession, meta_read: &MetaRead, index: &IndexRead) {
+        match succession {
+            Succession::Current => {}
+            Succession::SupersededBy(root) => {
+                let _: &StateRoot = root;
+            }
+        }
+        match meta_read {
+            MetaRead::Rootless(
+                RootlessMeta::Absent | RootlessMeta::Invalid(MetaDefect::RootHashMismatch),
+            ) => {}
+            MetaRead::Rootless(RootlessMeta::Invalid(MetaDefect::Wire(defect))) => {
+                wire_defect_shape(defect);
+            }
+            MetaRead::Valid { meta, succession } => {
+                let _: (&ProjectMeta, &Succession) = (meta, succession);
+            }
+        }
+        match index {
+            IndexRead::Missing => {}
+            IndexRead::Corrupt(defect) => wire_defect_shape(defect),
+            IndexRead::Unreadable(kind) => {
+                let _: &ErrorKind = kind;
+            }
+            IndexRead::Read(index) => {
+                let _: &StateRootIndex = index;
+            }
+        }
+    }
+
+    fn wire_defect_shape(defect: &WireDefect) {
+        match defect {
+            WireDefect::Unparsable | WireDefect::BadHex | WireDefect::NotAbsolute => {}
+            WireDefect::UnsupportedVersion(version) => {
+                let _: &u32 = version;
+            }
+        }
+    }
+
+    fn probe_shapes(probe: &StateDirProbe, observation: &RootObservation, fate: &RecordFate) {
+        match probe {
+            StateDirProbe::Unreadable(kind) => {
+                let _: &ErrorKind = kind;
+            }
+            StateDirProbe::Empty => {}
+            StateDirProbe::Unrooted { meta } => {
+                let _: &RootlessMeta = meta;
+            }
+            StateDirProbe::Rooted {
+                meta,
+                succession,
+                root,
+            } => {
+                let _: (&ProjectMeta, &Succession, &RootObservation) = (meta, succession, root);
+            }
+        }
+        match observation {
+            RootObservation::Present { manifest } => match manifest {
+                Probed::Present | Probed::Absent => {}
+                Probed::Fault(kind) => {
+                    let _: &ErrorKind = kind;
+                }
+            },
+            RootObservation::Deleted { proof, remains } => {
+                let _: (&DeletionProof, &Remains) = (proof, remains);
+            }
+            RootObservation::Unproven(unproven) => {
+                let _: &Unproven = unproven;
+            }
+        }
+        match fate {
+            RecordFate::Ejected | RecordFate::Absent => {}
+            RecordFate::Releasable(link) => {
+                let _: &ReleasableLink = link;
+            }
+            RecordFate::PresentOutside(path) => {
+                let _: &NormalPath = path;
+            }
+            RecordFate::Unresolvable { key } => {
+                let _: &ArtifactKey = key;
+            }
+            RecordFate::Fault { key, kind } => {
+                let _: (&ArtifactKey, &ErrorKind) = (key, kind);
+            }
+        }
+    }
+
+    fn journal_shape(journal: &JournalState) {
+        match journal {
+            JournalState::Clear => {}
+            JournalState::Pending { entries } => {
+                let _: &NonZeroUsize = entries;
+            }
+        }
+    }
+
+    fn class_shapes(class: &StateDirClass) {
+        match class {
+            StateDirClass::Keep(KeepReason::Live) | StateDirClass::Drop(DropReason::Empty) => {}
+            StateDirClass::Drop(DropReason::Gone { proof, links }) => {
+                let _: (&DeletionProof, &Vec<ReleasableLink>) = (proof, links);
+            }
+            StateDirClass::Release(ReleaseReason::Retired { root }) => {
+                let _: &ProjectRoot = root;
+            }
+            StateDirClass::Release(ReleaseReason::Stranded(stranded)) => {
+                let _: &Stranded = stranded;
+            }
+            StateDirClass::Forget(reason) => forget_shape(reason),
+        }
+    }
+
+    fn forget_shape(reason: &ForgetReason) {
+        match reason {
+            ForgetReason::Unrooted { meta } => {
+                let _: &RootlessMeta = meta;
+            }
+            ForgetReason::Abandoned { root, successor } => {
+                let _: (&ProjectRoot, &StateRoot) = (root, successor);
+            }
+            ForgetReason::Unreachable(Unreachable::Unreadable(kind)) => {
+                let _: &ErrorKind = kind;
+            }
+            ForgetReason::Unreachable(Unreachable::Root { root, cause }) => {
+                let _: &ProjectRoot = root;
+                match cause {
+                    UnreachableRoot::Unproven(unproven) => {
+                        let _: &Unproven = unproven;
+                    }
+                    UnreachableRoot::ManifestFault(kind) => {
+                        let _: &ErrorKind = kind;
+                    }
+                    UnreachableRoot::DestinationFault { key, kind } => {
+                        let _: (&ArtifactKey, &ErrorKind) = (key, kind);
+                    }
+                }
+            }
+        }
+    }
+
+    fn reason_shape(reason: Reason) {
+        match reason {
+            Reason::Empty
+            | Reason::Unrooted
+            | Reason::Abandoned
+            | Reason::Live
+            | Reason::Retired
+            | Reason::Unreachable
+            | Reason::Stranded
+            | Reason::Gone => {}
+        }
+    }
+
+    fn action_shapes(action: &PlannedAction) {
+        match action {
+            PlannedAction::Drop { dir, reason } => {
+                let _: (&StateDirPath, &DropReason) = (dir, reason);
+            }
+            PlannedAction::ReleaseLinks { dir, stranded } => {
+                let _: (&StateDirPath, &Stranded) = (dir, stranded);
+            }
+            PlannedAction::Eject {
+                dir,
+                reason,
+                worktrees,
+            } => {
+                let _: (&StateDirPath, &ReleaseReason, &Vec<EjectableWorktree>) =
+                    (dir, reason, worktrees);
+            }
+            PlannedAction::Forget { dir, reason } => {
+                let _: (&StateDirPath, &ForgetReason) = (dir, reason);
+            }
+            PlannedAction::Report { dir, attention } => {
+                let _: &StateDirPath = dir;
+                match attention {
+                    Attention::Retired { root } => {
+                        let _: &ProjectRoot = root;
+                    }
+                    Attention::Stranded(stranded) => {
+                        let _: &Stranded = stranded;
+                    }
+                    Attention::Forget(reason) => forget_shape(reason),
+                }
+            }
+        }
+    }
+
+    fn removal_shapes(not_held: &NotHeld, outcome: &DropOutcome, confirmation: Confirmation) {
+        match not_held {
+            NotHeld::Vanished | NotHeld::Busy => {}
+            NotHeld::Fault(kind) => {
+                let _: &ErrorKind = kind;
+            }
+        }
+        match outcome {
+            DropOutcome::Deleted | DropOutcome::Vanished | DropOutcome::Busy => {}
+            DropOutcome::Leftover(leftover) => {
+                let _: &Leftover = leftover;
+            }
+            DropOutcome::Released(links) => {
+                for link in links {
+                    link_shape(link);
+                }
+            }
+            DropOutcome::Reclassified(reason) => {
+                let _: &Reason = reason;
+            }
+            DropOutcome::Fault(error) => {
+                let _: &StateError = error;
+            }
+        }
+        match confirmation {
+            Confirmation::Granted | Confirmation::Withheld => {}
+        }
+    }
+
+    fn link_shape(link: &LinkOutcome) {
+        match link {
+            LinkOutcome::Unlinked | LinkOutcome::Kept(LinkKept::Confined) => {}
+            LinkOutcome::Kept(LinkKept::Fault(kind)) => {
+                let _: &ErrorKind = kind;
+            }
+        }
+    }
+
+    fn enumeration_shapes(entry: &ProjectsEntry, name: &TrashName, record: &GcRecord) {
+        match entry {
+            ProjectsEntry::State(dir) => {
+                let _: &StateDirPath = dir;
+            }
+            ProjectsEntry::Foreign(path) => {
+                let _: &NormalPath = path;
+            }
+        }
+        match name {
+            TrashName::Entry(entry) => {
+                let _: &TrashEntry = entry;
+            }
+            TrashName::Foreign(name) => {
+                let _: &OsString = name;
+            }
+        }
+        match record {
+            GcRecord::Unrooted { action, legacy } => {
+                let _: (&PlannedAction, &LegacyEvidence) = (action, legacy);
+            }
+            GcRecord::Rooted { action, leftovers } => {
+                let _: (&PlannedAction, &Vec<NormalPath>) = (action, leftovers);
+            }
+        }
+    }
+
+    #[test]
+    fn lifecycle_types_and_signatures_match_the_scope_data_model() {
+        let _: fn(&Path) -> PathBuf = normalize_lexical;
+        let _: fn(&Path) -> Option<NormalPath> = NormalPath::lexical;
+        let _: fn(&NormalPath, Placement, &AnchorDir, &CurrentAnchor) -> Location = locate;
+        let _ = |proof: &DeletionProof| {
+            let _ = proof.path();
+        };
+
+        let _: fn(&NormalPath) -> ProjectId = ProjectId::of_canonical;
+        let _: fn(&OsStr) -> Option<ProjectId> = ProjectId::parse;
+        let _ = |root: NormalPath, id: &ProjectId, path: &Path| {
+            let _ = ProjectRoot::recorded(root, id);
+            let _ = ProjectRoot::canonicalize(path);
+        };
+
+        let _: fn(&StateDirPath, &CurrentAnchor) -> StateDirProbe = probe;
+        let _: fn(&StateDirProbe) -> StateDirClass = classify;
+        let _: fn(&StateDirClass) -> Reason = StateDirClass::reason;
+        let _: fn(&SweepInput) -> SweepReport = sweep;
+        let _: fn(&GcInput) -> GcPlan = plan_gc;
+        let _: fn(GcPlan, Confirmation) -> GcOutcome = apply_gc;
+
+        let _: fn(PlannedAction) -> Result<Held, NotHeld> = lock;
+        let _: fn(Held, Reason) -> Result<Confirmed, Reason> = confirm;
+        let _: fn(Confirmed) -> Result<Trashed, StateError> = trash;
+        let _: fn(Trashed) -> Result<(), Leftover> = delete;
+
+        let _: fn(Placement, &Unproven, &Location) = mount_shapes;
+        let _: fn(&Succession, &MetaRead, &IndexRead) = meta_shapes;
+        let _: fn(&StateDirProbe, &RootObservation, &RecordFate) = probe_shapes;
+        let _: fn(&JournalState) = journal_shape;
+        let _: fn(&StateDirClass) = class_shapes;
+        let _: fn(&PlannedAction) = action_shapes;
+        let _: fn(&NotHeld, &DropOutcome, Confirmation) = removal_shapes;
+        let _: fn(&ProjectsEntry, &TrashName, &GcRecord) = enumeration_shapes;
+
+        let _: Option<(MountId, TrashSuffix, StrandedEvidence, SweepFault)> = None;
+        let _: Option<BTreeMap<Reason, NonZeroUsize>> = None;
+
+        let _: fn(Reason) = reason_shape;
+    }
+}
+
+mod state_lifecycle_probe {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+    use std::path::{Path, PathBuf};
+
+    use tempfile::TempDir;
+
+    use crate::mount::{AnchorDir, CurrentAnchor, MountId, NormalPath, Placement, Unproven};
+    use crate::sync::state::lifecycle::{
+        DropReason, ForgetReason, KeepReason, MetaDefect, Probed, ProjectMeta, ProjectRoot, Reason,
+        ReleaseReason, RootObservation, RootlessMeta, StateDirClass, StateDirPath, StateDirProbe,
+        StateRoot, Succession, Unreachable, UnreachableRoot, classify, probe,
+    };
+    use crate::sync::state::{ArtifactRecord, FileStateStore, ProjectId, StateStore as _};
+
+    fn normal(path: &Path) -> NormalPath {
+        NormalPath::lexical(path).expect("absolute fixture path")
+    }
+
+    pub(super) fn canonical_tmp() -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        (tmp, base)
+    }
+
+    pub(super) fn copy_record(deploy_root: Option<&str>, layout: &str) -> ArtifactRecord {
+        let mut record = super::linked_flat_record("dest", "src", "editor");
+        record.linked = false;
+        record.layout = layout.to_owned();
+        record.deploy_root = deploy_root.map(str::to_owned);
+        record
+    }
+
+    pub(super) fn state_dir(
+        base: &Path,
+        root: &Path,
+        on_state_mount: bool,
+        recorded_state_dir: Option<&Path>,
+        records: &[ArtifactRecord],
+    ) -> (StateDirPath, CurrentAnchor) {
+        let dir = StateDirPath::new(
+            StateRoot::new(normal(&base.join("state"))),
+            ProjectId::of_canonical(&normal(root)),
+        );
+        let path = dir.path();
+        std::fs::create_dir_all(path.as_path()).expect("create state dir");
+        let recorded = recorded_state_dir.unwrap_or(path.as_path());
+        std::fs::write(
+            path.as_path().join("project.toml"),
+            format!(
+                "version = 1\nroot = \"{}\"\non_state_mount = {on_state_mount}\nstate_dir = \"{}\"\n",
+                root.display(),
+                recorded.display(),
+            ),
+        )
+        .expect("write project.toml");
+        let store = FileStateStore::open(path.as_path().to_path_buf()).expect("open store");
+        for record in records {
+            store.put_artifact(record).expect("seed record");
+        }
+        let mount = MountId::of(path.as_path()).expect("state dir mount");
+        (dir, CurrentAnchor::new(AnchorDir::new(path), mount))
+    }
+
+    pub(super) fn deleted_root(base: &Path, name: &str) -> PathBuf {
+        let root = base.join(name).join("proj");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::remove_dir_all(&root).expect("delete root");
+        root
+    }
+
+    fn rooted(
+        root: &ProjectRoot,
+        succession: Succession,
+        observation: RootObservation,
+    ) -> StateDirProbe {
+        StateDirProbe::Rooted {
+            meta: ProjectMeta::new(
+                root.clone(),
+                Placement::OnAnchorMount,
+                AnchorDir::new(normal(Path::new("/state/projects/0123456789abcdef"))),
+            ),
+            succession,
+            root: observation,
+        }
+    }
+
+    #[test]
+    fn classify_maps_each_probe_to_its_classification_row() {
+        let root_path = normal(Path::new("/work/proj"));
+        let root = ProjectRoot::recorded(root_path.clone(), &ProjectId::of_canonical(&root_path))
+            .expect("root hashes to its id");
+        let current = |observation| rooted(&root, Succession::Current, observation);
+        let superseded = |observation| {
+            let successor = StateRoot::new(normal(Path::new("/custom")));
+            rooted(&root, Succession::SupersededBy(successor), observation)
+        };
+        let present = |manifest| RootObservation::Present { manifest };
+        let unproven = |cause| current(RootObservation::Unproven(cause));
+        let denied = ErrorKind::PermissionDenied;
+
+        let rows = [
+            (StateDirProbe::Empty, Reason::Empty),
+            (
+                StateDirProbe::Unrooted {
+                    meta: RootlessMeta::Absent,
+                },
+                Reason::Unrooted,
+            ),
+            (
+                StateDirProbe::Unrooted {
+                    meta: RootlessMeta::Invalid(MetaDefect::RootHashMismatch),
+                },
+                Reason::Unrooted,
+            ),
+            (superseded(present(Probed::Present)), Reason::Abandoned),
+            (
+                superseded(RootObservation::Unproven(Unproven::OffMount)),
+                Reason::Abandoned,
+            ),
+            (current(present(Probed::Present)), Reason::Live),
+            (current(present(Probed::Absent)), Reason::Retired),
+            (current(present(Probed::Fault(denied))), Reason::Unreachable),
+            (StateDirProbe::Unreadable(denied), Reason::Unreachable),
+            (unproven(Unproven::RecordedElsewhere), Reason::Unreachable),
+            (
+                unproven(Unproven::AnchorMoved {
+                    now: normal(Path::new("/moved/projects/x")),
+                }),
+                Reason::Unreachable,
+            ),
+            (unproven(Unproven::Encrypted), Reason::Unreachable),
+            (
+                unproven(Unproven::SymlinkedComponent(normal(Path::new("/work")))),
+                Reason::Unreachable,
+            ),
+            (
+                unproven(Unproven::CanonicalDiffers {
+                    now: normal(Path::new("/work/Proj")),
+                }),
+                Reason::Unreachable,
+            ),
+            (unproven(Unproven::Fault(denied)), Reason::Unreachable),
+        ];
+        for (probe, expected) in &rows {
+            assert_eq!(classify(probe).reason(), *expected, "{probe:?}");
+        }
+
+        assert!(matches!(
+            classify(&superseded(present(Probed::Absent))),
+            StateDirClass::Forget(ForgetReason::Abandoned { root: ref r, .. }) if *r == root
+        ));
+        assert!(matches!(
+            classify(&current(present(Probed::Absent))),
+            StateDirClass::Release(ReleaseReason::Retired { root: ref r }) if *r == root
+        ));
+        assert!(matches!(
+            classify(&current(present(Probed::Present))),
+            StateDirClass::Keep(KeepReason::Live)
+        ));
+        assert!(matches!(
+            classify(&unproven(Unproven::Encrypted)),
+            StateDirClass::Forget(ForgetReason::Unreachable(Unreachable::Root {
+                root: ref r,
+                cause: UnreachableRoot::Unproven(Unproven::Encrypted),
+            })) if *r == root
+        ));
+        assert!(matches!(
+            classify(&current(present(Probed::Fault(denied)))),
+            StateDirClass::Forget(ForgetReason::Unreachable(Unreachable::Root {
+                cause: UnreachableRoot::ManifestFault(ErrorKind::PermissionDenied),
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn probe_proves_a_deleted_root_only_when_every_absence_clause_holds() {
+        let (_tmp, base) = canonical_tmp();
+        let inside = [copy_record(Some("dest"), "flat")];
+
+        let gone_root = deleted_root(&base, "gone");
+        let (dir, anchor) = state_dir(&base, &gone_root, true, None, &inside);
+        match classify(&probe(&dir, &anchor)) {
+            StateDirClass::Drop(DropReason::Gone { proof, links }) => {
+                assert_eq!(
+                    proof.path().as_path(),
+                    gone_root,
+                    "the proof names the recorded root"
+                );
+                assert!(links.is_empty());
+            }
+            other => panic!("deleted root on the state dir's mount must be gone, got {other:?}"),
+        }
+
+        let unreachable =
+            |dir: &StateDirPath, anchor: &CurrentAnchor| match classify(&probe(dir, anchor)) {
+                StateDirClass::Forget(ForgetReason::Unreachable(Unreachable::Root {
+                    cause: UnreachableRoot::Unproven(cause),
+                    ..
+                })) => cause,
+                other => panic!("expected an unreachable root, got {other:?}"),
+            };
+
+        let elsewhere_root = deleted_root(&base, "elsewhere");
+        let (dir, anchor) = state_dir(&base, &elsewhere_root, false, None, &inside);
+        assert!(matches!(
+            unreachable(&dir, &anchor),
+            Unproven::RecordedElsewhere
+        ));
+
+        let moved_root = deleted_root(&base, "moved");
+        let (dir, anchor) = state_dir(
+            &base,
+            &moved_root,
+            true,
+            Some(&base.join("old-state/projects/0123456789abcdef")),
+            &inside,
+        );
+        assert!(matches!(
+            unreachable(&dir, &anchor),
+            Unproven::AnchorMoved { now } if now == dir.path()
+        ));
+
+        let off_mount_root = deleted_root(&base, "off-mount");
+        let (dir, _) = state_dir(&base, &off_mount_root, true, None, &inside);
+        let foreign_mount = CurrentAnchor::new(
+            AnchorDir::new(dir.path()),
+            MountId::of(Path::new("/dev")).expect("mount of /dev"),
+        );
+        assert!(matches!(
+            unreachable(&dir, &foreign_mount),
+            Unproven::OffMount
+        ));
+
+        let symlinked_root = base.join("linked/proj");
+        symlink(base.join("missing"), base.join("linked")).expect("symlink component");
+        let (dir, anchor) = state_dir(&base, &symlinked_root, true, None, &inside);
+        assert!(matches!(
+            unreachable(&dir, &anchor),
+            Unproven::SymlinkedComponent(component) if component.as_path() == base.join("linked")
+        ));
+
+        let sealed = base.join("sealed");
+        let sealed_root = sealed.join("proj");
+        std::fs::create_dir_all(&sealed_root).expect("create sealed root");
+        let (dir, anchor) = state_dir(&base, &sealed_root, true, None, &inside);
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).expect("seal");
+        let sealed_class = classify(&probe(&dir, &anchor));
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).expect("unseal");
+        assert!(
+            matches!(
+                sealed_class,
+                StateDirClass::Forget(ForgetReason::Unreachable(Unreachable::Root {
+                    cause: UnreachableRoot::Unproven(Unproven::Fault(ErrorKind::PermissionDenied)),
+                    ..
+                }))
+            ),
+            "a root whose stat is denied is unreachable, got {sealed_class:?}"
+        );
+    }
+
+    #[test]
+    fn probe_resolves_destinations_of_a_deleted_root_against_the_recorded_root() {
+        let (_tmp, base) = canonical_tmp();
+        let classify_dir = |root: &Path, records: &[ArtifactRecord]| {
+            let (dir, anchor) = state_dir(&base, root, true, None, records);
+            classify(&probe(&dir, &anchor))
+        };
+
+        let outside_root = deleted_root(&base, "outside");
+        std::fs::create_dir_all(base.join("outside/shared/editor")).expect("outside deployment");
+        assert_eq!(
+            classify_dir(&outside_root, &[copy_record(Some("../shared"), "flat")]).reason(),
+            Reason::Stranded,
+            "a present destination under `../shared` of the recorded root strands the dir",
+        );
+
+        let absent_outside_root = deleted_root(&base, "absent-outside");
+        let absolute = base.join("absent-outside/elsewhere");
+        assert_eq!(
+            classify_dir(
+                &absent_outside_root,
+                &[copy_record(
+                    Some(absolute.to_str().expect("utf-8 path")),
+                    "flat"
+                )]
+            )
+            .reason(),
+            Reason::Gone,
+            "an absent outside destination leaves the dir gone",
+        );
+
+        let legacy_root = deleted_root(&base, "legacy");
+        assert_eq!(
+            classify_dir(&legacy_root, &[copy_record(None, "flat")]).reason(),
+            Reason::Stranded,
+            "a record without deploy_root is unresolvable",
+        );
+
+        let unrebuildable_root = deleted_root(&base, "unrebuildable");
+        assert_eq!(
+            classify_dir(
+                &unrebuildable_root,
+                &[copy_record(Some("dest"), "prefixed")]
+            )
+            .reason(),
+            Reason::Stranded,
+            "a prefixed record without its separator is unresolvable",
+        );
+
+        let faulted_root = deleted_root(&base, "faulted");
+        let sealed = base.join("faulted/sealed");
+        std::fs::create_dir_all(sealed.join("editor")).expect("sealed deployment");
+        let (dir, anchor) = state_dir(
+            &base,
+            &faulted_root,
+            true,
+            None,
+            &[copy_record(Some("../sealed"), "flat")],
+        );
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).expect("seal");
+        let faulted_class = classify(&probe(&dir, &anchor));
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).expect("unseal");
+        assert!(
+            matches!(
+                faulted_class,
+                StateDirClass::Forget(ForgetReason::Unreachable(Unreachable::Root {
+                    cause: UnreachableRoot::DestinationFault {
+                        kind: ErrorKind::PermissionDenied,
+                        ..
+                    },
+                    ..
+                }))
+            ),
+            "a destination whose stat is denied makes the dir unreachable, got {faulted_class:?}"
+        );
+    }
+
+    #[test]
+    fn probe_keeps_a_deleted_root_under_an_encrypted_ancestor_unreachable() {
+        let (_tmp, base) = canonical_tmp();
+        let root = deleted_root(&base, "encrypted");
+        let (dir, anchor) = state_dir(
+            &base,
+            &root,
+            true,
+            None,
+            &[copy_record(Some("dest"), "flat")],
+        );
+        let anchor = anchor.with_lookups(|_| Ok(true), Path::canonicalize);
+
+        let class = classify(&probe(&dir, &anchor));
+        assert!(
+            matches!(
+                class,
+                StateDirClass::Forget(ForgetReason::Unreachable(Unreachable::Root {
+                    cause: UnreachableRoot::Unproven(Unproven::Encrypted),
+                    ..
+                }))
+            ),
+            "a deleted root under an encrypted ancestor is unreachable, got {class:?}"
+        );
+    }
+
+    #[test]
+    fn probe_classifies_a_present_root_live_only_when_it_resolves_to_itself() {
+        let (_tmp, base) = canonical_tmp();
+        let root = base.join("present/proj");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(root.join("phora.toml"), "").expect("write manifest");
+        let (dir, anchor) = state_dir(
+            &base,
+            &root,
+            true,
+            None,
+            &[copy_record(Some("dest"), "flat")],
+        );
+
+        assert_eq!(classify(&probe(&dir, &anchor)).reason(), Reason::Live);
+
+        let case_renamed =
+            anchor.with_lookups(|_| Ok(false), |path| Ok(path.with_file_name("PROJ")));
+        let class = classify(&probe(&dir, &case_renamed));
+        assert!(
+            matches!(
+                class,
+                StateDirClass::Forget(ForgetReason::Unreachable(Unreachable::Root {
+                    cause: UnreachableRoot::Unproven(Unproven::CanonicalDiffers { ref now }),
+                    ..
+                })) if now.as_path() == root.with_file_name("PROJ")
+            ),
+            "a present root that canonicalizes elsewhere is unreachable, got {class:?}"
+        );
+    }
+}
+
+mod state_lifecycle_removal {
+    use std::io::ErrorKind;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{PoisonError, RwLockWriteGuard};
+    use std::time::{Duration, Instant};
+
+    use super::state_lifecycle_probe::{canonical_tmp, copy_record, deleted_root, state_dir};
+    use crate::mount::CurrentAnchor;
+    use crate::sync::state::lifecycle::{
+        NotHeld, PlannedAction, Reason, StateDirClass, StateDirPath, classify, confirm, delete,
+        lock, probe, trash,
+    };
+    use crate::sync::state::locking::{STATE_LOCK_SERIAL, lock_existing};
+    use crate::sync::state::{FileStateStore, StateStore as _};
+
+    fn serial() -> RwLockWriteGuard<'static, ()> {
+        STATE_LOCK_SERIAL
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn planned_drop(dir: &StateDirPath, anchor: &CurrentAnchor) -> (PlannedAction, Reason) {
+        let class = classify(&probe(dir, anchor));
+        let planned = class.reason();
+        let reason = match class {
+            StateDirClass::Drop(reason) => reason,
+            other => panic!("fixture must plan a drop, got {other:?}"),
+        };
+        (
+            PlannedAction::Drop {
+                dir: dir.clone(),
+                reason,
+            },
+            planned,
+        )
+    }
+
+    fn trash_entries(state_root: &Path) -> Vec<String> {
+        let mut names: Vec<String> = match std::fs::read_dir(state_root.join("trash")) {
+            Ok(entries) => entries
+                .map(|entry| {
+                    entry
+                        .expect("trash entry")
+                        .file_name()
+                        .into_string()
+                        .expect("utf-8 trash name")
+                })
+                .collect(),
+            Err(error) if error.kind() == ErrorKind::NotFound => Vec::new(),
+            Err(error) => panic!("read trash: {error}"),
+        };
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn lock_and_confirm_keep_a_dir_that_vanished_is_busy_or_came_back_to_life() {
+        let _serial = serial();
+        let (_tmp, base) = canonical_tmp();
+        let inside = [copy_record(Some("dest"), "flat")];
+
+        let vanished_root = deleted_root(&base, "vanished");
+        let (dir, anchor) = state_dir(&base, &vanished_root, true, None, &inside);
+        let (action, _) = planned_drop(&dir, &anchor);
+        std::fs::remove_dir_all(dir.path().as_path()).expect("another process removes the dir");
+        let outcome = lock(action);
+        assert!(
+            matches!(outcome, Err(NotHeld::Vanished)),
+            "a dir removed between plan and lock is vanished, got {outcome:?}"
+        );
+        assert!(
+            !dir.path().as_path().exists(),
+            "locking a vanished dir must create nothing at its path"
+        );
+
+        let busy_root = deleted_root(&base, "busy");
+        let (dir, anchor) = state_dir(&base, &busy_root, true, None, &inside);
+        let (action, _) = planned_drop(&dir, &anchor);
+        let _other = lock_existing(dir.path().as_path()).expect("another process holds the lock");
+        let outcome = lock(action);
+        assert!(
+            matches!(outcome, Err(NotHeld::Busy)),
+            "a dir whose state.lock is held is busy, got {outcome:?}"
+        );
+
+        let revived_root = deleted_root(&base, "revived");
+        let (dir, anchor) = state_dir(&base, &revived_root, true, None, &inside);
+        let (action, planned) = planned_drop(&dir, &anchor);
+        assert_eq!(planned, Reason::Gone);
+        std::fs::create_dir_all(&revived_root).expect("recreate root");
+        std::fs::write(revived_root.join("phora.toml"), "").expect("recreate manifest");
+        let held = lock(action).expect("lock the planned dir");
+        let outcome = confirm(held, planned);
+        assert!(
+            matches!(outcome, Err(Reason::Live)),
+            "a root recreated between probe and lock re-classifies live, got {outcome:?}"
+        );
+        drop(outcome);
+        assert!(
+            dir.path().as_path().join("project.toml").is_file(),
+            "a re-classified dir is kept"
+        );
+        assert!(trash_entries(dir.root().path().as_path()).is_empty());
+    }
+
+    #[test]
+    fn a_confirmed_drop_is_renamed_into_the_trash_under_a_unique_name_and_deleted() {
+        let _serial = serial();
+        let (_tmp, base) = canonical_tmp();
+        let root = deleted_root(&base, "gone");
+        let inside = [copy_record(Some("dest"), "flat")];
+        let drop_once = || {
+            let (dir, anchor) = state_dir(&base, &root, true, None, &inside);
+            let (action, planned) = planned_drop(&dir, &anchor);
+            let held = lock(action).expect("lock the planned dir");
+            let confirmed = confirm(held, planned).expect("the reason holds under the lock");
+            let trashed = trash(confirmed).expect("rename into the trash");
+            assert!(
+                !dir.path().as_path().exists(),
+                "a trashed dir leaves its path"
+            );
+            (dir, trashed)
+        };
+
+        let (dir, first) = drop_once();
+        let state_root = dir.root().path().as_path().to_path_buf();
+        let prefix = format!("{}.", dir.id().as_str());
+        let entries = trash_entries(&state_root);
+        assert!(
+            matches!(entries.as_slice(), [entry] if entry.len() > prefix.len() && entry.starts_with(&prefix)),
+            "one `<id>.<suffix>` entry under <state root>/trash, got {entries:?}"
+        );
+        assert!(
+            state_root
+                .join("trash")
+                .join(&entries[0])
+                .join("project.toml")
+                .is_file(),
+            "the state dir itself is renamed into the trash"
+        );
+
+        let (_, second) = drop_once();
+        let entries = trash_entries(&state_root);
+        assert!(
+            entries.len() == 2 && entries.iter().all(|entry| entry.starts_with(&prefix)),
+            "each rename of the same id gets its own suffix, got {entries:?}"
+        );
+
+        delete(first).expect("delete the first trash entry");
+        delete(second).expect("delete the second trash entry");
+        assert_eq!(trash_entries(&state_root), Vec::<String>::new());
+    }
+
+    static WAITER_BLOCKED: AtomicBool = AtomicBool::new(false);
+
+    #[test]
+    fn an_own_run_blocked_on_a_removed_dir_relocks_the_recreated_dir() {
+        let _serial = serial();
+        let (_tmp, base) = canonical_tmp();
+        let dir = base.join("state/projects/0123456789abcdef");
+        std::fs::create_dir_all(&dir).expect("create state dir");
+        let holder = FileStateStore::open(dir.clone())
+            .expect("open holder store")
+            .acquire_lock()
+            .expect("holder locks");
+        let waiter = FileStateStore::open(dir.clone())
+            .expect("open waiter store")
+            .with_lock_timeout(Duration::from_secs(10))
+            .on_lock_wait(|| WAITER_BLOCKED.store(true, Ordering::SeqCst));
+
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| waiter.acquire_lock());
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !WAITER_BLOCKED.load(Ordering::SeqCst) {
+                assert!(Instant::now() < deadline, "the waiter never blocked");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::fs::remove_dir_all(&dir).expect("the holder removes its dir");
+            drop(holder);
+
+            let relocked = waiting
+                .join()
+                .expect("waiter thread")
+                .expect("the waiter acquires the lock");
+            let contender = lock_existing(&dir);
+            assert!(
+                matches!(contender, Err(NotHeld::Busy)),
+                "the waiter must hold the state.lock at the dir's path, got {contender:?}"
+            );
+            drop(relocked);
+        });
+    }
+
+    #[test]
+    fn locking_an_existing_dir_never_holds_a_state_lock_replaced_after_it_was_opened() {
+        let _serial = serial();
+        let (_tmp, base) = canonical_tmp();
+        let dir = base.join("state/projects/0123456789abcdef");
+        let locks = dir.join("locks");
+        std::fs::create_dir_all(&locks).expect("create locks dir");
+        let lock_path = locks.join("state.lock");
+        let first = std::fs::File::create(&lock_path).expect("create state.lock");
+        first.lock().expect("holder locks state.lock");
+        let stop = AtomicBool::new(false);
+
+        let stale_holds = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut held = first;
+                let mut round = 0_u64;
+                while !stop.load(Ordering::SeqCst) {
+                    let next_path = locks.join(format!("next.{round}"));
+                    let next = std::fs::File::create(&next_path).expect("create next state.lock");
+                    next.lock().expect("holder locks the next state.lock");
+                    std::fs::rename(&next_path, &lock_path).expect("replace state.lock");
+                    held = next;
+                    round += 1;
+                }
+                drop(held);
+            });
+            let sweepers: Vec<_> = (0..16)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let deadline = Instant::now() + Duration::from_secs(1);
+                        while Instant::now() < deadline && !stop.load(Ordering::SeqCst) {
+                            match lock_existing(&dir) {
+                                Ok(_stale) => {
+                                    stop.store(true, Ordering::SeqCst);
+                                    return 1;
+                                }
+                                Err(NotHeld::Busy | NotHeld::Vanished) => {}
+                                Err(other) => panic!("unexpected lock outcome {other:?}"),
+                            }
+                        }
+                        0
+                    })
+                })
+                .collect();
+            let stale_holds: usize = sweepers
+                .into_iter()
+                .map(|sweeper| sweeper.join().expect("sweeper thread"))
+                .sum();
+            stop.store(true, Ordering::SeqCst);
+            stale_holds
+        });
+        assert_eq!(
+            stale_holds, 0,
+            "lock_existing held a state.lock inode no longer at locks/state.lock while the \
+             holder held the one at the path"
+        );
+    }
+
+    #[test]
+    fn acquiring_the_lock_through_a_dangling_state_lock_symlink_fails_within_the_timeout() {
+        let (_tmp, base) = canonical_tmp();
+        let dir = base.join("state/projects/0123456789abcdef");
+        std::fs::create_dir_all(dir.join("locks")).expect("create locks dir");
+        std::os::unix::fs::symlink(
+            base.join("missing/state.lock"),
+            dir.join("locks/state.lock"),
+        )
+        .expect("dangling state.lock symlink");
+        let timeout = Duration::from_millis(200);
+        let store = FileStateStore::open(dir)
+            .expect("open store")
+            .with_lock_timeout(timeout);
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(store.acquire_lock().map(drop));
+        });
+        let outcome = receiver.recv_timeout(timeout + Duration::from_secs(5));
+        assert!(
+            matches!(outcome, Ok(Err(_))),
+            "a state.lock that cannot be opened is an error within the lock timeout, got {outcome:?}"
+        );
+    }
+}

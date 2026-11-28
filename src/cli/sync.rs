@@ -6,11 +6,10 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::lock::{Lock, merge_locks};
-use crate::paths::{cache_root_for, state_root_for};
-use crate::sync::state::ProjectId;
+use crate::paths::cache_root_for;
+use crate::sync::state::lifecycle;
 use crate::sync::state::{FileStateStore, StateError, StateStore};
 use crate::sync::{
     Concurrency, ConflictPolicy, ConflictResolver, HookPolicy, LockSet, PrunePolicy, SkippedChange,
@@ -23,12 +22,6 @@ use super::{
     CliOutcome, DropSources, TtyResolver, build_router, drop_sources, load_config,
     load_local_config, lock_project_registry,
 };
-
-fn open_sync_registry(cwd: &Path, config: &Config) -> Result<FileStateStore> {
-    let projects_base = state_root_for(config.paths.state.as_deref(), cwd)?.join("projects");
-    let project = ProjectId::for_path(cwd)?;
-    Ok(FileStateStore::open(projects_base.join(project.as_str()))?)
-}
 
 #[expect(
     clippy::fn_params_excessive_bools,
@@ -64,7 +57,8 @@ pub(super) fn run_sync(
     let effective = crate::config::merge_configs(base.clone(), local.clone());
     let cache_git = cache_root_for(effective.paths.cache.as_deref(), &cwd)?.join("git");
     let backend = build_router(&effective, cache_git)?;
-    let registry = open_sync_registry(&cwd, &effective)?
+    let (own, root) = super::own_state_dir(&cwd, &effective)?;
+    let registry = FileStateStore::open(own.path().as_path().to_path_buf())?
         .with_lock_timeout(lock_timeout)
         .on_lock_wait(super::announce_lock_wait);
     // Only a read-only root under --frozen falls back lockless; contention (exit 75) still propagates.
@@ -73,8 +67,15 @@ pub(super) fn run_sync(
         Err(StateError::ReadOnly(_)) if source_policy == SourcePolicy::Frozen => None,
         Err(e) => return Err(e.into()),
     };
+    if let Some(held) = &guard {
+        super::record_project_root(&cwd, &own, &root, held);
+    }
     let lockless = guard.is_none();
-    let _guard = guard;
+    let sweep = (!lockless && source_policy != SourcePolicy::Frozen)
+        .then(|| super::lexical_state_root(None, &cwd).ok())
+        .flatten()
+        .map(|default| lifecycle::sweep_input(default, Some(own.clone())));
+    let _guard = guard.map(|held| super::OwnStateLock { own, held });
     if !lockless && let Some(advisory) = registry.lock_advisory() {
         eprintln!("{advisory}");
     }
@@ -124,6 +125,7 @@ pub(super) fn run_sync(
         resolver: interactive.then_some(&resolver as &dyn ConflictResolver),
         sink: reporter.sink(),
         trust_prompt: interactive.then_some(&trust_prompt as &dyn crate::sync::TrustPrompt),
+        sweep,
     };
     let out = sync_opened(&request, &backend, &registry, lockless).inspect_err(|error| {
         request.sink.aborted(&error.to_string());

@@ -1,8 +1,11 @@
 use std::fs::{File, TryLockError};
+use std::io::ErrorKind;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use super::file::{FileStateStore, StateError};
+use super::lifecycle::NotHeld;
 
 type Result<T> = std::result::Result<T, StateError>;
 
@@ -50,35 +53,56 @@ pub fn assert_git_sandboxed(cwd: &Path) {
 }
 
 impl FileStateStore {
+    /// Retries while the dir is being removed under it, and until the locked file is the one at
+    /// `locks/state.lock`, so a waiter never ends up holding an unlinked inode.
     pub(super) fn acquire_state_lock(&self) -> Result<StateLock> {
         let locks_dir = &self.journal_root;
-        if let Err(e) = std::fs::create_dir_all(locks_dir) {
-            return Err(self.lock_io_error("create locks dir", locks_dir, &e));
-        }
         let lock_path = locks_dir.join("state.lock");
-        let file = match std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-        {
-            Ok(file) => file,
-            Err(e) => return Err(self.lock_io_error("open lock file", &lock_path, &e)),
-        };
-        match try_lock_until(&file, self.lock_timeout, self.on_lock_wait) {
-            Ok(()) => Ok(StateLock { _file: file }),
-            Err(TryLockError::WouldBlock) if self.lock_timeout.is_zero() => {
-                Err(StateError::Lock(LOCK_HELD.to_owned()))
+        loop {
+            match std::fs::create_dir_all(locks_dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                Err(e) => return Err(self.lock_io_error("create locks dir", locks_dir, &e)),
             }
-            Err(TryLockError::WouldBlock) => Err(StateError::Lock(format!(
-                "{LOCK_HELD}; gave up after {:?}",
-                self.lock_timeout
-            ))),
-            Err(TryLockError::Error(e)) => Err(StateError::StateStore(format!(
-                "acquire lock on {}: {e}",
-                lock_path.display()
-            ))),
+            let file = match std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&lock_path)
+            {
+                Ok(file) => file,
+                Err(e) if e.kind() == ErrorKind::NotFound && is_missing(locks_dir) => continue,
+                Err(e) => return Err(self.lock_io_error("open lock file", &lock_path, &e)),
+            };
+            match try_lock_until(&file, self.lock_timeout, self.on_lock_wait) {
+                Ok(()) => {}
+                Err(TryLockError::WouldBlock) if self.lock_timeout.is_zero() => {
+                    return Err(StateError::Lock(LOCK_HELD.to_owned()));
+                }
+                Err(TryLockError::WouldBlock) => {
+                    return Err(StateError::Lock(format!(
+                        "{LOCK_HELD}; gave up after {:?}",
+                        self.lock_timeout
+                    )));
+                }
+                Err(TryLockError::Error(e)) => {
+                    return Err(StateError::StateStore(format!(
+                        "acquire lock on {}: {e}",
+                        lock_path.display()
+                    )));
+                }
+            }
+            match is_at(&file, &lock_path) {
+                Ok(true) => return Ok(StateLock { _file: file }),
+                Ok(false) => {}
+                Err(e) => {
+                    return Err(StateError::StateStore(format!(
+                        "stat lock {}: {e}",
+                        lock_path.display()
+                    )));
+                }
+            }
         }
     }
 
@@ -93,6 +117,57 @@ impl FileStateStore {
         statfs_fstype(&self.state_root)
             .as_deref()
             .and_then(network_lock_advisory)
+    }
+}
+
+/// Takes the `state.lock` of another project's existing state dir with zero timeout.
+/// `locks/` and `state.lock` are created only inside a dir that exists, and `NotFound` on the
+/// dir or either entry means `Vanished`.
+pub(crate) fn lock_existing(state_dir: &Path) -> std::result::Result<StateLock, NotHeld> {
+    let locks_dir = state_dir.join("locks");
+    let lock_path = locks_dir.join("state.lock");
+    match std::fs::create_dir(&locks_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(not_held(&e)),
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| not_held(&e))?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => return Err(NotHeld::Busy),
+        Err(TryLockError::Error(e)) => return Err(not_held(&e)),
+    }
+    match is_at(&file, &lock_path) {
+        Ok(true) => Ok(StateLock { _file: file }),
+        Ok(false) => Err(NotHeld::Vanished),
+        Err(e) => Err(not_held(&e)),
+    }
+}
+
+/// Whether `file` is still the file at `path`.
+fn is_at(file: &File, path: &Path) -> std::io::Result<bool> {
+    let held = file.metadata()?;
+    match std::fs::metadata(path) {
+        Ok(now) => Ok(held.dev() == now.dev() && held.ino() == now.ino()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn is_missing(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_err_and(|e| e.kind() == ErrorKind::NotFound)
+}
+
+fn not_held(e: &std::io::Error) -> NotHeld {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => NotHeld::Vanished,
+        kind => NotHeld::Fault(kind),
     }
 }
 

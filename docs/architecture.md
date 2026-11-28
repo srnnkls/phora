@@ -2,7 +2,7 @@
 
 Phora is organized around three capability modules — *source*, *projection*, and
 *sync*. `cli` sits at the top of the stack and drives them; `lock`, `paths`,
-`digest`, `diagnostic`, and `error` are shared support modules. `config` is
+`digest`, `diagnostic`, `mount`, and `error` are shared support modules. `config` is
 parsed at the edge and consumed at the sync boundary — after PR3 it reaches
 projection only as converted spec values, never as a raw DTO. The physical
 module layout matches the real data flow: content is obtained, a desired target
@@ -91,7 +91,10 @@ design.md is the authoritative specification for these invariants; each line
 below is the durable one-sentence record.
 
 - INV-3 — only `sync` and `cli` perform target-side I/O; source performs
-  source/cache I/O; projection performs none.
+  source/cache I/O; projection performs none. `src/mount.rs` is the one
+  permanent platform I/O owner outside them: it sits below source and sync and
+  only reads, answering where a path lies relative to an anchor directory's
+  mount and whether its absence is proven.
 - INV-4 — serialized formats (lock, registry, journal, config, cache/mirror
   layout) stay byte-identical throughout; no schema or version bump.
 - INV-5 — artifact, source, variable, and file digests, modes, mtimes,
@@ -109,6 +112,59 @@ below is the durable one-sentence record.
   calls `std::process::exit`.
 - INV-10 — git blame is preserved across file relocations, via `git mv` before
   edits and whole-file moves with `git log --follow` spot-checks.
+
+## State lifecycle
+
+Every state dir under the default state root and under every registered state
+root is live, dropped once provably dead, or reported until `phora gc` resolves
+it. Liveness is a function of stored data alone: phora never scans the
+filesystem for projects and applies no age cutoff. The lifecycle lives in
+`sync::state::lifecycle`, beside the state records and locking it extends.
+
+- Recorded root. A project's own locked run writes `project.toml` into its
+  state dir with `atomic_write`: the canonical root, whether that root sat on
+  the state dir's mount, and the state-dir path as the run saw it. Paths that
+  are not valid UTF-8 are stored as hex bytes. A meta whose root does not hash
+  to the dir's `ProjectId` is invalid. Locks taken on other projects' dirs never
+  write a meta.
+- State-root index. A locked run whose state root is not the default registers
+  that root in `state-roots.toml` under the default state root, read and
+  written under `state-roots.lock`. The same run marks every other copy of its
+  id in the default and registered roots `superseded_by` its current root.
+- Proof of deletion. `mount::locate` walks the recorded root with
+  `symlink_metadata` and yields `Present`, `Deleted` with a proof, or
+  `Unproven`. A proof needs the root `NotFound`, recorded on the state dir's
+  mount, an unchanged state-dir path, and its nearest existing ancestor on that
+  mount now and unencrypted, with no symlinked component on the way.
+- Classification. One probe gathers the filesystem facts; `classify` is a pure,
+  total function of the probe and yields one of four classes, each carrying a
+  reason: Keep (`live`), Drop (`empty`, `gone`), Release (`retired`,
+  `stranded`), Forget (`unrooted`, `abandoned`, `unreachable`). Records are read
+  only when the root is proven deleted.
+- Sweep. Every locked, non-frozen run of the sync pipeline whose status is not
+  failed sweeps in the deploy tail of `sync_core`, after deploy, hook and build
+  failures are known and before the summary. The sweep input rides on
+  `SyncRequest` and `SyncRunInput`; the lockless frozen path, a run aborted
+  before the deploy phase, and the nested build run carry none. The sweep drops
+  Drop-class dirs, releases the dangling links of a deleted root, and reports
+  every other reason in one `SyncWarning` that names `phora gc`. A sweep error is
+  a warning and never changes the exit code.
+- Own-dir removal. The holder of a state dir's `state.lock` removes the dir
+  before releasing the lock when it holds no records, target meta or pending
+  journal. A run's own dir is therefore never left empty, and the sweep skips it.
+- Drop path. Each drop locks the dir with zero timeout, re-probes and proceeds
+  only if the reason is unchanged, releases links through
+  `confine_removal_destination`, renames the dir to
+  `<state root>/trash/<ProjectId>.<suffix>`, and deletes it, all under the lock.
+  A trash entry left by a failed delete or a crash is deleted by the next sweep
+  or `gc`; entries whose name is not a phora trash entry are never touched.
+- `phora gc`. `src/cli/gc.rs` drives `plan_gc` and `apply_gc`: it lists every
+  non-live dir with its evidence and planned action, applies Drop-class drops
+  and link releases without confirmation, and with `--eject` and a confirmation
+  ejects the history worktrees of Release-class dirs into standalone clones and
+  drops every non-live dir. It then prunes the content store, counting the
+  `projects/` of every enumerable state root as GC roots. It deletes no deployed
+  file beyond the released links.
 
 ## DoD → task → test traceability
 

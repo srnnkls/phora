@@ -56,6 +56,23 @@ fn has_entries(dir: &Path) -> bool {
     std::fs::read_dir(dir).is_ok_and(|mut it| it.next().is_some())
 }
 
+fn entries_other_than_state_root_index(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .map(|entry| entry.expect("read default state root entry"))
+        .filter(|entry| {
+            let is_index = matches!(
+                entry.file_name().to_str(),
+                Some("state-roots.toml" | "state-roots.lock")
+            );
+            !(is_index && entry.file_type().is_ok_and(|kind| kind.is_file()))
+        })
+        .map(|entry| entry.path())
+        .collect()
+}
+
 #[test]
 fn paths_config_pins_cache_and_state_away_from_xdg_defaults() {
     let leaf = TempDir::new().expect("leaf repo");
@@ -106,17 +123,20 @@ fn paths_config_pins_cache_and_state_away_from_xdg_defaults() {
     let default_data = home_path.join(".local/share/phora");
     let default_macos_caches = home_path.join("Library/Caches/phora");
     let default_macos_support = home_path.join("Library/Application Support/phora");
-    for dir in [
-        &default_cache,
-        &default_state,
-        &default_data,
-        &default_macos_caches,
-        &default_macos_support,
-    ] {
+    for dir in [&default_cache, &default_data, &default_macos_caches] {
         assert!(
             !dir.exists(),
             "with a [paths] override set, nothing may be written under the default location {}; \
              stderr: {stderr}",
+            dir.display()
+        );
+    }
+    for dir in [&default_state, &default_macos_support] {
+        let unexpected = entries_other_than_state_root_index(dir);
+        assert!(
+            unexpected.is_empty(),
+            "with a [paths] override set, the default state root {} may hold only the \
+             state-root index, found {unexpected:?}; stderr: {stderr}",
             dir.display()
         );
     }

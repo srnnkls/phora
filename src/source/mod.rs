@@ -38,7 +38,8 @@ pub use worktree_deploy::{
     worktree_admin_id,
 };
 pub(crate) use worktree_deploy::{
-    physical_cache_git_root, remove_missing_mirror_worktree_gitlink, verified_cache_git_root,
+    mirror_exists, physical_cache_git_root, remove_missing_mirror_worktree_gitlink,
+    verified_cache_git_root,
 };
 
 use std::collections::BTreeMap;

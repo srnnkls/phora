@@ -1,7 +1,11 @@
+use std::ffi::OsStr;
 use std::path::Path;
+
+use crate::mount::NormalPath;
 
 mod durable;
 pub mod file;
+pub(crate) mod lifecycle;
 pub mod locking;
 
 pub(crate) use durable::fsync_barrier;
@@ -10,6 +14,7 @@ pub use file::{
     ManifestEntryKind, ManifestFile, NewArtifactRecord, NewHistoryRecord, RecordKind, ScannedFile,
     StateError, ejected_index, readonly_root_error,
 };
+pub use lifecycle::{Reason, SweepInput};
 pub use locking::StateLock;
 
 pub trait StateStore {
@@ -40,6 +45,8 @@ pub trait StateStore {
     fn journal_root(&self) -> std::path::PathBuf;
 }
 
+const ID_HEX_LEN: usize = 16;
+
 /// Per-project registry identity: BLAKE3 of the canonical project root.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ProjectId(String);
@@ -47,14 +54,33 @@ pub struct ProjectId(String);
 impl ProjectId {
     /// Path-hash identity: BLAKE3 of the canonical project root, first 16 hex chars.
     pub fn for_path(root: &Path) -> crate::error::Result<Self> {
-        let canonical = root.canonicalize()?;
+        Ok(Self::hash(&root.canonicalize()?))
+    }
+
+    pub(crate) fn of_canonical(root: &NormalPath) -> Self {
+        Self::hash(root.as_path())
+    }
+
+    fn hash(canonical: &Path) -> Self {
         let hash = blake3::hash(canonical.to_string_lossy().as_bytes());
-        Ok(Self(hash.to_hex()[..16].to_string()))
+        Self(hash.to_hex()[..ID_HEX_LEN].to_string())
     }
 
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl ProjectId {
+    /// Exactly 16 lowercase hex chars.
+    pub(crate) fn parse(name: &OsStr) -> Option<Self> {
+        let name = name.to_str()?;
+        (name.len() == ID_HEX_LEN
+            && name
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
+        .then(|| Self(name.to_owned()))
     }
 }
 
