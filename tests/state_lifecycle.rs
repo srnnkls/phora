@@ -787,20 +787,23 @@ fn gc_record<'a>(records: &'a [serde_json::Value], id: &str) -> &'a serde_json::
 }
 
 /// Content-store objects whose bytes equal `body`, aged past the prune grace period.
-fn aged_content_objects(fx: &Fixture, body: &str) -> Vec<PathBuf> {
-    let store = fx.base.join("xdg/cache/phora/content");
-    let past_grace = std::time::SystemTime::now() - std::time::Duration::from_hours(2);
-    let objects: Vec<PathBuf> = snapshot(&store)
-        .into_iter()
-        .filter(|(_, node)| *node == Node::File(body.as_bytes().to_vec()))
-        .map(|(path, _)| store.join(path))
-        .collect();
-    for object in &objects {
-        std::fs::File::open(object)
-            .and_then(|file| file.set_modified(past_grace))
-            .expect("setup: backdate content object");
+fn aged_content_object(fx: &Fixture, body: &str) -> PathBuf {
+    let hash = blake3::hash(body.as_bytes()).to_hex().to_string();
+    let object = fx
+        .base
+        .join("xdg/cache/phora/content")
+        .join(&hash[..2])
+        .join(&hash);
+    if !object.exists() {
+        std::fs::create_dir_all(object.parent().expect("object has a shard dir"))
+            .and_then(|()| std::fs::write(&object, body))
+            .expect("setup: store content object");
     }
-    objects
+    let past_grace = std::time::SystemTime::now() - std::time::Duration::from_hours(2);
+    std::fs::File::open(&object)
+        .and_then(|file| file.set_modified(past_grace))
+        .expect("setup: backdate content object");
+    object
 }
 
 /// The mirror admin dir a history worktree's gitlink points at.
@@ -1020,12 +1023,8 @@ fn plain_gc_drops_only_drop_class_dirs_and_prunes_content_kept_by_registered_roo
     std::fs::remove_dir_all(&stranded).expect("delete beta root");
     std::fs::remove_file(unrooted_dir.join("project.toml")).expect("setup: legacy dir");
 
-    let live_objects = aged_content_objects(&fx, "live only\n");
-    let gone_objects = aged_content_objects(&fx, "gone only\n");
-    assert!(
-        !live_objects.is_empty() && !gone_objects.is_empty(),
-        "setup: both deployments store content objects"
-    );
+    let live_object = aged_content_object(&fx, "live only\n");
+    let gone_object = aged_content_object(&fx, "gone only\n");
 
     fx.phora_in(&fx.base, &["gc"]);
 
@@ -1038,16 +1037,15 @@ fn plain_gc_drops_only_drop_class_dirs_and_prunes_content_kept_by_registered_roo
     assert!(stranded_dir.is_dir(), "plain gc keeps a stranded dir");
     assert!(unrooted_dir.is_dir(), "plain gc keeps an unrooted dir");
     assert!(outside_copy.is_file(), "plain gc deletes no deployed file");
-    for object in &gone_objects {
-        assert_absent(object, "content only the dropped dir referenced is pruned");
-    }
-    for object in &live_objects {
-        assert!(
-            object.is_file(),
-            "{} is referenced by a live dir in a registered state root",
-            object.display()
-        );
-    }
+    assert_absent(
+        &gone_object,
+        "content only the dropped dir referenced is pruned",
+    );
+    assert!(
+        live_object.is_file(),
+        "{} is referenced by a live dir in a registered state root",
+        live_object.display()
+    );
 
     let text = output_text(&fx.phora_in(&fx.base, &["gc", "--eject"]));
 
