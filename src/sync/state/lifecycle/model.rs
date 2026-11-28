@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::mount::{AnchorDir, DeletionProof, NormalPath, Placement, Unproven};
-use crate::source::WorktreeAdminId;
+use crate::source::{Commit, WorktreeAdminId, WorktreeMirrorAddress};
 use crate::sync::state::{ArtifactKey, ProjectId, StateError, StateLock};
 
 /// A recorded root whose path hashes to its state dir's `ProjectId`.
@@ -195,9 +195,9 @@ pub enum JournalState {
 
 #[derive(Debug)]
 pub struct LegacyEvidence {
-    records: usize,
-    recorded_paths: Vec<PathBuf>,
-    newest_record: Option<SystemTime>,
+    pub(super) records: usize,
+    pub(super) recorded_paths: Vec<PathBuf>,
+    pub(super) newest_record: Option<SystemTime>,
 }
 
 #[derive(Debug)]
@@ -238,6 +238,21 @@ pub struct Remains {
 impl Remains {
     pub fn new(journal: JournalState, records: Vec<RecordFate>) -> Self {
         Self { journal, records }
+    }
+
+    /// Every destination still present, copies and links alike.
+    pub(super) fn present(&self) -> Vec<NormalPath> {
+        self.records
+            .iter()
+            .filter_map(|fate| match fate {
+                RecordFate::PresentOutside(path) => Some(path.clone()),
+                RecordFate::Releasable(link) => Some(link.path.clone()),
+                RecordFate::Ejected
+                | RecordFate::Absent
+                | RecordFate::Unresolvable { .. }
+                | RecordFate::Fault { .. } => None,
+            })
+            .collect()
     }
 }
 
@@ -341,8 +356,12 @@ fn deleted(root: ProjectRoot, proof: &DeletionProof, remains: &Remains) -> State
             RecordFate::Releasable(link) => links.push(link.clone()),
             RecordFate::PresentOutside(path) => present_outside.push(path.clone()),
             RecordFate::Unresolvable { key } => unresolvable.push(key.clone()),
-            RecordFate::Fault { kind, .. } => {
-                return unreachable_root(root, UnreachableRoot::DestinationFault(*kind));
+            RecordFate::Fault { key, kind } => {
+                let cause = UnreachableRoot::DestinationFault {
+                    key: key.clone(),
+                    kind: *kind,
+                };
+                return unreachable_root(root, cause);
             }
         }
     }
@@ -435,8 +454,11 @@ pub enum UnreachableRoot {
     Unproven(Unproven),
     /// Root present.
     ManifestFault(ErrorKind),
-    /// Root deleted; any `RecordFate::Fault` in `Remains`.
-    DestinationFault(ErrorKind),
+    /// Root deleted; the first `RecordFate::Fault` in `Remains`.
+    DestinationFault {
+        key: ArtifactKey,
+        kind: ErrorKind,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -520,10 +542,25 @@ pub enum Attention {
 
 #[derive(Debug)]
 pub struct EjectableWorktree {
-    record: ArtifactKey,
-    deploy_root: NormalPath,
-    admin_id: WorktreeAdminId,
-    cache_git_root: NormalPath,
+    pub(super) record: ArtifactKey,
+    pub(super) deploy_root: NormalPath,
+    pub(super) admin_id: WorktreeAdminId,
+    pub(super) address: WorktreeMirrorAddress,
+    pub(super) commit: Commit,
+    /// Checked without locking; a worktree whose mirror is gone keeps its gitlink.
+    pub(super) mirror_present: bool,
+}
+
+impl EjectableWorktree {
+    #[must_use]
+    pub fn deploy_root(&self) -> &NormalPath {
+        &self.deploy_root
+    }
+
+    #[must_use]
+    pub fn mirror_present(&self) -> bool {
+        self.mirror_present
+    }
 }
 
 #[derive(Debug)]
@@ -603,19 +640,19 @@ pub enum DropOutcome {
 }
 
 /// Links come from `Confirmed.class`, so the re-probe already dropped re-pointed links.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum LinkOutcome {
     Unlinked,
     Kept(LinkKept),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum LinkKept {
     Confined,
     Fault(ErrorKind),
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Confirmation {
     Granted,
     Withheld,
@@ -633,6 +670,20 @@ pub struct SweepInput {
 pub struct SweepFault {
     dir: Option<StateDirPath>,
     error: StateError,
+}
+
+impl SweepFault {
+    pub(super) fn new(dir: Option<StateDirPath>, error: StateError) -> Self {
+        Self { dir, error }
+    }
+
+    /// The fault, prefixed with its dir when it has one.
+    fn describe(&self) -> String {
+        match &self.dir {
+            Some(dir) => format!("{}: {}", dir.path().as_path().display(), self.error),
+            None => self.error.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -658,7 +709,22 @@ impl SweepReport {
     }
 
     pub(super) fn fault(&mut self, dir: Option<StateDirPath>, error: StateError) {
-        self.faults.push(SweepFault { dir, error });
+        self.faults.push(SweepFault::new(dir, error));
+    }
+
+    /// The faults and trash leftovers, each as a fault.
+    pub(super) fn into_faults(self) -> Vec<SweepFault> {
+        let leftovers = self.leftovers.into_iter().map(|entry| {
+            let path = super::trash_path(&entry);
+            SweepFault::new(
+                None,
+                StateError::StateStore(format!(
+                    "trash entry {} left for the next pass",
+                    path.display()
+                )),
+            )
+        });
+        self.faults.into_iter().chain(leftovers).collect()
     }
 
     #[must_use]
@@ -689,18 +755,26 @@ impl SweepReport {
 
     /// Each fault, prefixed with its dir when it has one.
     pub fn faults(&self) -> impl Iterator<Item = String> + '_ {
-        self.faults.iter().map(|fault| match &fault.dir {
-            Some(dir) => format!("{}: {}", dir.path().as_path().display(), fault.error),
-            None => fault.error.to_string(),
-        })
+        self.faults.iter().map(SweepFault::describe)
     }
 }
 
 #[derive(Debug)]
 pub struct GcInput {
-    sweep: SweepInput,
-    eject: bool,
-    dry_run: bool,
+    pub(super) sweep: SweepInput,
+    pub(super) eject: bool,
+    pub(super) dry_run: bool,
+}
+
+impl GcInput {
+    #[must_use]
+    pub fn new(sweep: SweepInput, eject: bool, dry_run: bool) -> Self {
+        Self {
+            sweep,
+            eject,
+            dry_run,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -716,17 +790,463 @@ pub enum GcRecord {
     },
 }
 
+/// One fact behind a reason, as `gc` lists it.
 #[derive(Debug)]
-pub struct GcPlan {
-    records: Vec<GcRecord>,
-    index_removals: Vec<StateRoot>,
-    foreign: Vec<NormalPath>,
-    foreign_trash: Vec<OsString>,
+pub enum Fact {
+    Text(String),
+    Count(usize),
+    List(Vec<String>),
+}
+
+/// What a planned action is about: the reason it carries.
+enum Subject<'a> {
+    Drop(&'a DropReason),
+    Retired(&'a ProjectRoot),
+    Stranded(&'a Stranded),
+    Forget(&'a ForgetReason),
+}
+
+impl PlannedAction {
+    fn subject(&self) -> Subject<'_> {
+        match self {
+            Self::Drop { reason, .. } => Subject::Drop(reason),
+            Self::ReleaseLinks { stranded, .. }
+            | Self::Eject {
+                reason: ReleaseReason::Stranded(stranded),
+                ..
+            }
+            | Self::Report {
+                attention: Attention::Stranded(stranded),
+                ..
+            } => Subject::Stranded(stranded),
+            Self::Eject {
+                reason: ReleaseReason::Retired { root },
+                ..
+            }
+            | Self::Report {
+                attention: Attention::Retired { root },
+                ..
+            } => Subject::Retired(root),
+            Self::Forget { reason, .. }
+            | Self::Report {
+                attention: Attention::Forget(reason),
+                ..
+            } => Subject::Forget(reason),
+        }
+    }
+
+    /// The reason the action was planned for, which the re-probe must still find.
+    #[must_use]
+    pub fn reason(&self) -> Reason {
+        match self.subject() {
+            Subject::Drop(DropReason::Empty) => Reason::Empty,
+            Subject::Drop(DropReason::Gone { .. }) => Reason::Gone,
+            Subject::Retired(_) => Reason::Retired,
+            Subject::Stranded(_) => Reason::Stranded,
+            Subject::Forget(ForgetReason::Unrooted { .. }) => Reason::Unrooted,
+            Subject::Forget(ForgetReason::Abandoned { .. }) => Reason::Abandoned,
+            Subject::Forget(ForgetReason::Unreachable(_)) => Reason::Unreachable,
+        }
+    }
+
+    #[must_use]
+    pub fn class(&self) -> &'static str {
+        match self.subject() {
+            Subject::Drop(_) => "drop",
+            Subject::Retired(_) | Subject::Stranded(_) => "release",
+            Subject::Forget(_) => "forget",
+        }
+    }
+
+    pub(super) fn present_outside(&self) -> Option<&[NormalPath]> {
+        match self.subject() {
+            Subject::Stranded(stranded) => Some(&stranded.evidence.present_outside),
+            _ => None,
+        }
+    }
+
+    /// The recorded root of a dir whose root is not proven deleted.
+    pub(super) fn live_root(&self) -> Option<&ProjectRoot> {
+        match self.subject() {
+            Subject::Retired(root)
+            | Subject::Forget(
+                ForgetReason::Abandoned { root, .. }
+                | ForgetReason::Unreachable(Unreachable::Root { root, .. }),
+            ) => Some(root),
+            _ => None,
+        }
+    }
+
+    /// The history worktrees an `Eject` releases.
+    #[must_use]
+    pub fn worktrees(&self) -> &[EjectableWorktree] {
+        match self {
+            Self::Eject { worktrees, .. } => worktrees,
+            _ => &[],
+        }
+    }
+
+    /// The recorded root, for every reason that carries one.
+    #[must_use]
+    pub fn root(&self) -> Option<&NormalPath> {
+        match self.subject() {
+            Subject::Drop(DropReason::Empty)
+            | Subject::Forget(
+                ForgetReason::Unrooted { .. }
+                | ForgetReason::Unreachable(Unreachable::Unreadable(_)),
+            ) => None,
+            Subject::Drop(DropReason::Gone { proof, .. }) => Some(proof.path()),
+            Subject::Stranded(stranded) => Some(stranded.proof.path()),
+            Subject::Retired(root)
+            | Subject::Forget(
+                ForgetReason::Abandoned { root, .. }
+                | ForgetReason::Unreachable(Unreachable::Root { root, .. }),
+            ) => Some(root.path()),
+        }
+    }
+
+    fn evidence(&self) -> Vec<(&'static str, Fact)> {
+        match self.subject() {
+            Subject::Drop(DropReason::Empty) => vec![(
+                "state",
+                Fact::Text("no records, target meta or pending journal".to_owned()),
+            )],
+            Subject::Drop(DropReason::Gone { links, .. }) => {
+                vec![root_deleted(), ("releasable_links", link_list(links))]
+            }
+            Subject::Stranded(stranded) => {
+                let evidence = &stranded.evidence;
+                let entries = match evidence.journal {
+                    JournalState::Clear => 0,
+                    JournalState::Pending { entries } => entries.get(),
+                };
+                vec![
+                    root_deleted(),
+                    ("releasable_links", link_list(&stranded.links)),
+                    ("present_outside", path_list(&evidence.present_outside)),
+                    (
+                        "unresolvable_records",
+                        Fact::List(evidence.unresolvable.iter().map(record_label).collect()),
+                    ),
+                    ("pending_journal_entries", Fact::Count(entries)),
+                ]
+            }
+            Subject::Retired(_) => vec![
+                ("root", Fact::Text("present".to_owned())),
+                ("manifest", Fact::Text("phora.toml absent".to_owned())),
+            ],
+            Subject::Forget(ForgetReason::Unrooted { meta }) => {
+                vec![("meta", Fact::Text(rootless_label(meta)))]
+            }
+            Subject::Forget(ForgetReason::Abandoned { successor, .. }) => vec![
+                ("root", Fact::Text("not proven deleted".to_owned())),
+                (
+                    "superseded_by",
+                    Fact::Text(successor.path().as_path().display().to_string()),
+                ),
+            ],
+            Subject::Forget(ForgetReason::Unreachable(Unreachable::Unreadable(kind))) => {
+                vec![("state_dir", Fact::Text(format!("unreadable: {kind}")))]
+            }
+            Subject::Forget(ForgetReason::Unreachable(Unreachable::Root { cause, .. })) => {
+                vec![("root", Fact::Text(unreachable_label(cause)))]
+            }
+        }
+    }
+}
+
+fn root_deleted() -> (&'static str, Fact) {
+    (
+        "root",
+        Fact::Text(
+            "deleted: absent, recorded on the state dir's mount, state-dir path unchanged, \
+             nearest ancestor on that mount, unencrypted, no symlinked component"
+                .to_owned(),
+        ),
+    )
+}
+
+fn link_list(links: &[ReleasableLink]) -> Fact {
+    Fact::List(
+        links
+            .iter()
+            .map(|link| {
+                format!(
+                    "{} -> {}",
+                    link.path.as_path().display(),
+                    link.link_target.as_path().display()
+                )
+            })
+            .collect(),
+    )
+}
+
+fn record_label(key: &ArtifactKey) -> String {
+    format!("{}/{}/{}", key.target, key.source, key.artifact)
+}
+
+fn path_list(paths: &[NormalPath]) -> Fact {
+    Fact::List(
+        paths
+            .iter()
+            .map(|path| path.as_path().display().to_string())
+            .collect(),
+    )
+}
+
+fn rootless_label(meta: &RootlessMeta) -> String {
+    match meta {
+        RootlessMeta::Absent => "project.toml absent".to_owned(),
+        RootlessMeta::Invalid(MetaDefect::RootHashMismatch) => {
+            "project.toml root does not hash to the dir name".to_owned()
+        }
+        RootlessMeta::Invalid(MetaDefect::Wire(defect)) => match defect {
+            WireDefect::Unparsable => "project.toml unparsable".to_owned(),
+            WireDefect::UnsupportedVersion(version) => {
+                format!("project.toml version {version} unsupported")
+            }
+            WireDefect::BadHex => "project.toml path has bad hex".to_owned(),
+            WireDefect::NotAbsolute => "project.toml path is not absolute".to_owned(),
+        },
+    }
+}
+
+fn unreachable_label(cause: &UnreachableRoot) -> String {
+    match cause {
+        UnreachableRoot::Unproven(unproven) => match unproven {
+            Unproven::RecordedElsewhere => {
+                "absent; recorded off the state dir's mount (on_state_mount false)".to_owned()
+            }
+            Unproven::AnchorMoved { now } => format!(
+                "absent; the state dir moved, now at {}",
+                now.as_path().display()
+            ),
+            Unproven::OffMount => {
+                "absent; nearest existing ancestor is off the state dir's mount".to_owned()
+            }
+            Unproven::Encrypted => "absent; nearest existing ancestor is encrypted".to_owned(),
+            Unproven::SymlinkedComponent(path) => {
+                format!("symlinked component {}", path.as_path().display())
+            }
+            Unproven::CanonicalDiffers { now } => {
+                format!("present, but resolves to {}", now.as_path().display())
+            }
+            Unproven::Fault(kind) => format!("stat failed: {kind}"),
+        },
+        UnreachableRoot::ManifestFault(kind) => format!("present; phora.toml stat failed: {kind}"),
+        UnreachableRoot::DestinationFault { key, kind } => format!(
+            "deleted; the destination stat of record {} failed: {kind}",
+            record_label(key)
+        ),
+    }
+}
+
+impl GcRecord {
+    #[must_use]
+    pub fn action(&self) -> &PlannedAction {
+        let (Self::Unrooted { action, .. } | Self::Rooted { action, .. }) = self;
+        action
+    }
+
+    pub(super) fn into_action(self) -> PlannedAction {
+        let (Self::Unrooted { action, .. } | Self::Rooted { action, .. }) = self;
+        action
+    }
+
+    /// The facts behind the reason; for `unrooted`, the legacy evidence read from the records.
+    #[must_use]
+    pub fn evidence(&self) -> Vec<(&'static str, Fact)> {
+        let mut facts = self.action().evidence();
+        if let Self::Unrooted { legacy, .. } = self {
+            facts.push(("records", Fact::Count(legacy.records)));
+            facts.push((
+                "recorded_paths",
+                Fact::List(
+                    legacy
+                        .recorded_paths
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect(),
+                ),
+            ));
+            let newest = legacy.newest_record.map_or_else(
+                || "unknown".to_owned(),
+                |time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339(),
+            );
+            facts.push(("newest_record", Fact::Text(newest)));
+        }
+        facts
+    }
+
+    /// Every present destination the action leaves behind; for `unrooted`, every recorded path.
+    #[must_use]
+    pub fn leftovers(&self) -> Vec<&Path> {
+        match self {
+            Self::Unrooted { legacy, .. } => {
+                legacy.recorded_paths.iter().map(PathBuf::as_path).collect()
+            }
+            Self::Rooted { leftovers, .. } => leftovers.iter().map(NormalPath::as_path).collect(),
+        }
+    }
 }
 
 #[derive(Debug)]
+pub struct GcPlan {
+    pub(super) records: Vec<GcRecord>,
+    /// Registered roots that are absent and not provably deleted.
+    pub(super) index_removals: Vec<StateRoot>,
+    pub(super) foreign: Vec<NormalPath>,
+    pub(super) foreign_trash: Vec<OsString>,
+    pub(super) default: StateRoot,
+    pub(super) roots: Vec<StateRoot>,
+    pub(super) index_read: bool,
+    pub(super) dry_run: bool,
+    pub(super) faults: Vec<SweepFault>,
+}
+
+impl GcPlan {
+    #[must_use]
+    pub fn records(&self) -> &[GcRecord] {
+        &self.records
+    }
+
+    #[must_use]
+    pub fn index_removals(&self) -> &[StateRoot] {
+        &self.index_removals
+    }
+
+    /// Entries under `projects/` whose name is not a state dir; never touched.
+    #[must_use]
+    pub fn foreign(&self) -> &[NormalPath] {
+        &self.foreign
+    }
+
+    /// Entries under each `trash/` that phora did not put there; never touched.
+    #[must_use]
+    pub fn foreign_trash(&self) -> &[OsString] {
+        &self.foreign_trash
+    }
+
+    /// Whether applying the plan needs a confirmation beyond its drops and link releases.
+    #[must_use]
+    pub fn needs_confirmation(&self) -> bool {
+        !self.index_removals.is_empty()
+            || self.records.iter().any(|record| {
+                matches!(
+                    record.action(),
+                    PlannedAction::Eject { .. } | PlannedAction::Forget { .. }
+                )
+            })
+    }
+
+    pub fn faults(&self) -> impl Iterator<Item = String> + '_ {
+        self.faults.iter().map(SweepFault::describe)
+    }
+}
+
+#[derive(Debug, Default)]
 pub struct GcOutcome {
-    applied: Vec<(StateDirPath, DropOutcome)>,
-    pending: Vec<StateDirPath>,
-    faults: Vec<SweepFault>,
+    pub(super) applied: Vec<(StateDirPath, DropOutcome)>,
+    pub(super) links_kept: Vec<(StateDirPath, NormalPath, LinkKept)>,
+    pub(super) pending: Vec<StateDirPath>,
+    pub(super) faults: Vec<SweepFault>,
+}
+
+impl GcOutcome {
+    #[must_use]
+    pub fn applied(&self) -> &[(StateDirPath, DropOutcome)] {
+        &self.applied
+    }
+
+    /// Dirs whose drop waits for a confirmation.
+    #[must_use]
+    pub fn pending(&self) -> &[StateDirPath] {
+        &self.pending
+    }
+
+    pub fn faults(&self) -> impl Iterator<Item = String> + '_ {
+        self.faults.iter().map(SweepFault::describe)
+    }
+
+    /// The links the dir's release left in place.
+    pub fn links_kept<'a>(
+        &'a self,
+        dir: &'a StateDirPath,
+    ) -> impl Iterator<Item = (&'a NormalPath, &'a LinkKept)> + 'a {
+        self.links_kept
+            .iter()
+            .filter(move |(kept_dir, _, _)| kept_dir == dir)
+            .map(|(_, path, kept)| (path, kept))
+    }
+
+    /// The dir's applied result followed by each link it kept; `None` when nothing was applied.
+    #[must_use]
+    pub fn describe(&self, dir: &StateDirPath) -> Option<String> {
+        let (_, result) = self.applied.iter().find(|(applied, _)| applied == dir)?;
+        let parts: Vec<String> = std::iter::once(result.describe())
+            .chain(self.links_kept(dir).map(|(path, kept)| {
+                format!("link {} kept ({})", path.as_path().display(), kept.label())
+            }))
+            .collect();
+        Some(parts.join("; "))
+    }
+
+    /// Whether an operation errored, a trash entry was left or a link failed to come out.
+    #[must_use]
+    pub fn failed(&self) -> bool {
+        !self.faults.is_empty()
+            || self.applied.iter().any(|(_, outcome)| {
+                matches!(outcome, DropOutcome::Fault(_) | DropOutcome::Leftover(_))
+            })
+            || self
+                .links_kept
+                .iter()
+                .any(|(_, _, kept)| matches!(kept, LinkKept::Fault(_)))
+    }
+}
+
+impl LinkKept {
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            Self::Confined => "confined".to_owned(),
+            Self::Fault(kind) => kind.to_string(),
+        }
+    }
+}
+
+impl DropOutcome {
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Deleted => "dropped".to_owned(),
+            Self::Leftover(leftover) => format!(
+                "dropped; trash entry {} left for the next pass",
+                super::trash_path(&leftover.entry).display()
+            ),
+            Self::Released(links) => {
+                let kept: Vec<String> = links
+                    .iter()
+                    .filter_map(|link| match link {
+                        LinkOutcome::Unlinked => None,
+                        LinkOutcome::Kept(kept) => Some(kept.label()),
+                    })
+                    .collect();
+                let released = links.len() - kept.len();
+                if kept.is_empty() {
+                    format!("kept; {released} link(s) released")
+                } else {
+                    format!(
+                        "kept; {released} link(s) released, {} kept ({})",
+                        kept.len(),
+                        kept.join(", ")
+                    )
+                }
+            }
+            Self::Vanished => "vanished".to_owned(),
+            Self::Busy => "skipped; its state.lock is held".to_owned(),
+            Self::Reclassified(reason) => format!("kept; now {}", reason.label()),
+            Self::Fault(error) => format!("kept; error: {error}"),
+        }
+    }
 }

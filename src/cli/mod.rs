@@ -4,6 +4,7 @@ mod add;
 mod bind;
 mod cache;
 mod config_edit;
+mod gc;
 mod json;
 mod progress;
 mod query;
@@ -217,6 +218,8 @@ pub enum Command {
         #[command(subcommand)]
         cmd: cache::CacheCmd,
     },
+    /// Review state dirs that are not live: drop the dead ones, release their dangling links and prune the content store.
+    Gc(gc::GcArgs),
     /// Bind one or more sources to a target, optionally refining each binding.
     Bind {
         #[arg(required = true)]
@@ -379,6 +382,7 @@ pub fn run(cli: Cli) -> Result<()> {
     run_with_outcome(cli).map(drop)
 }
 
+#[expect(clippy::too_many_lines, reason = "one arm per subcommand")]
 pub fn run_with_outcome(cli: Cli) -> Result<CliOutcome> {
     if let Some(directory) = cli.directory {
         std::env::set_current_dir(&directory).map_err(|error| {
@@ -454,6 +458,7 @@ pub fn run_with_outcome(cli: Cli) -> Result<CliOutcome> {
         Command::Source { cmd } => completed(run_source(cmd)),
         Command::Target { cmd } => completed(run_target(cmd)),
         Command::Cache { cmd } => completed(cache::run_cache(cmd)),
+        Command::Gc(args) => gc::run_gc(args),
         cmd @ Command::Bind { .. } => completed(dispatch_bind(cmd)),
         Command::Unbind {
             sources,

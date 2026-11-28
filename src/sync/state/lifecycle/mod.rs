@@ -1,5 +1,4 @@
 //! State-dir lifecycle: record each project's root, classify every state dir, drop the dead ones.
-#![allow(dead_code, reason = "stubs wired by T004 to T008")]
 
 mod model;
 mod wire;
@@ -18,10 +17,13 @@ use crate::mount::{
     AnchorDir, CurrentAnchor, DeletionProof, Location, MountId, NormalPath, Placement, is_absent,
     locate,
 };
+use crate::source::{
+    GitBackend, SourceError, SourceName, SourceStore as _, WorktreeDeployRequest, mirror_exists,
+};
 use crate::sync::confine::{ProtectedPathSet, confine_removal_destination};
 use crate::sync::journal::Journal;
 use crate::sync::nonce;
-use crate::sync::observe::normalize_history_deploy_root_at;
+use crate::sync::observe::{history_address, normalize_history_deploy_root_at};
 use crate::sync::prune::orphan_artifact_path;
 use crate::sync::state::file::atomic_write;
 use crate::sync::state::locking::lock_existing;
@@ -311,31 +313,51 @@ fn probe_manifest(root: &ProjectRoot) -> Probed {
 }
 
 fn remains(dir: &Path, root: &ProjectRoot, journal: JournalState) -> Result<Remains, ErrorKind> {
-    let store = FileStateStore::open(dir.to_path_buf()).map_err(|_| ErrorKind::Other)?;
-    let records = store.all_artifacts().map_err(|_| ErrorKind::Other)?;
-    let ejected = ejected_index(&store, &records).map_err(|_| ErrorKind::Other)?;
-    let fates = records
-        .into_iter()
-        .map(|record| {
-            let key = &record.key;
-            if ejected.contains(&(key.target.clone(), key.source.clone(), key.artifact.clone())) {
-                RecordFate::Ejected
-            } else {
-                record_fate(root, record)
-            }
-        })
+    let (ejected, unejected) =
+        unejected_records(dir, root.path().as_path()).map_err(|_| ErrorKind::Other)?;
+    let fates = std::iter::repeat_with(|| RecordFate::Ejected)
+        .take(ejected)
+        .chain(
+            unejected
+                .into_iter()
+                .map(|(record, destination)| record_fate(root, record, destination)),
+        )
         .collect();
     Ok(Remains::new(journal, fates))
 }
 
-/// The record's destination, rebased onto the recorded root, tested with `symlink_metadata`.
-fn record_fate(root: &ProjectRoot, record: ArtifactRecord) -> RecordFate {
-    let Some(destination) = orphan_artifact_path(&record).and_then(|destination| {
-        NormalPath::lexical(&normalize_history_deploy_root_at(
-            root.path().as_path(),
-            &destination,
-        ))
-    }) else {
+/// A record with its destination rebased onto a root, `None` when it does not resolve.
+type RebasedRecord = (ArtifactRecord, Option<NormalPath>);
+
+/// The count of ejected records, and every other record rebased onto `root`.
+fn unejected_records(dir: &Path, root: &Path) -> Result<(usize, Vec<RebasedRecord>), StateError> {
+    let store = FileStateStore::open(dir.to_path_buf())?;
+    let records = store.all_artifacts()?;
+    let ejected = ejected_index(&store, &records)?;
+    let total = records.len();
+    let unejected: Vec<_> = records
+        .into_iter()
+        .filter(|record| {
+            let key = &record.key;
+            !ejected.contains(&(key.target.clone(), key.source.clone(), key.artifact.clone()))
+        })
+        .map(|record| {
+            let destination = orphan_artifact_path(&record).and_then(|destination| {
+                NormalPath::lexical(&normalize_history_deploy_root_at(root, &destination))
+            });
+            (record, destination)
+        })
+        .collect();
+    Ok((total - unejected.len(), unejected))
+}
+
+/// The record's rebased destination, tested with `symlink_metadata`.
+fn record_fate(
+    root: &ProjectRoot,
+    record: ArtifactRecord,
+    destination: Option<NormalPath>,
+) -> RecordFate {
+    let Some(destination) = destination else {
         return RecordFate::Unresolvable { key: record.key };
     };
     match std::fs::symlink_metadata(destination.as_path()) {
@@ -393,6 +415,20 @@ pub fn sweep_input(default: StateRoot, own: Option<StateDirPath>) -> SweepInput 
 /// ones, empties each trash and prunes the index; every failure lands in the report.
 pub fn sweep(input: &SweepInput) -> SweepReport {
     let mut report = SweepReport::default();
+    for root in &swept_roots(input, &mut report) {
+        empty_trash(root, &mut report);
+        sweep_root(root, input.own.as_ref(), &mut report);
+    }
+    if matches!(input.index, IndexRead::Read(_))
+        && let Err(error) = prune_index(&input.default)
+    {
+        report.fault(None, error);
+    }
+    report
+}
+
+/// A corrupt or unreadable index leaves the default root only, and a fault.
+fn swept_roots(input: &SweepInput, report: &mut SweepReport) -> Vec<StateRoot> {
     let mut roots = vec![input.default.clone()];
     let index_path = input.default.path().as_path().join(INDEX_FILE);
     match &input.index {
@@ -419,34 +455,24 @@ pub fn sweep(input: &SweepInput) -> SweepReport {
             )),
         ),
     }
-    for root in &roots {
-        empty_trash(root, &mut report);
-        sweep_root(root, input.own.as_ref(), &mut report);
-    }
-    if matches!(input.index, IndexRead::Read(_))
-        && let Err(error) = prune_index(&input.default)
-    {
-        report.fault(None, error);
-    }
-    report
+    roots
 }
 
 fn sweep_root(root: &StateRoot, own: Option<&StateDirPath>, report: &mut SweepReport) {
     let projects = root.path().join("projects");
-    let ids = match state_dir_ids(root) {
-        Ok(ids) => ids,
+    let dirs = match state_dirs(root) {
+        Ok(dirs) => dirs,
         Err(error) if error.kind() == ErrorKind::NotFound => return,
         Err(error) => return report.fault(None, io_error("read", projects.as_path(), &error)),
     };
-    for id in ids {
-        let id = match id {
-            Ok(id) => id,
+    for dir in dirs {
+        let dir = match dir {
+            Ok(dir) => dir,
             Err(error) => {
                 report.fault(None, io_error("read entry in", projects.as_path(), &error));
                 continue;
             }
         };
-        let dir = StateDirPath::new(root.clone(), id);
         if own != Some(&dir) {
             sweep_dir(dir, report);
         }
@@ -470,63 +496,99 @@ fn sweep_dir(dir: StateDirPath, report: &mut SweepReport) {
 /// Lock, re-probe, release links, then trash and delete a dir that is still droppable.
 fn apply_sweep(action: PlannedAction, planned: Reason, report: &mut SweepReport) {
     let dir = action.dir().clone();
-    let held = match lock(action) {
-        Ok(held) => held,
-        Err(NotHeld::Vanished) => return,
-        Err(NotHeld::Busy) => return report.busy.push(dir),
-        Err(NotHeld::Fault(kind)) => {
-            let error = StateError::StateStore(format!("lock: {kind}"));
-            return report.fault(Some(dir), error);
-        }
-    };
-    let confirmed = match confirm(held, planned) {
-        Ok(confirmed) => confirmed,
-        Err(reason) => return report.attend(reason),
-    };
-    let all_unlinked = release_links(&confirmed.class, dir.root(), report);
-    if !all_unlinked || confirmed.class.reason() == Reason::Stranded {
-        return report.attend(Reason::Stranded);
-    }
-    match trash(confirmed) {
-        Ok(trashed) => {
+    match settle(action, planned, false, report) {
+        DropOutcome::Deleted => report.dropped.push(dir),
+        DropOutcome::Leftover(leftover) => {
             report.dropped.push(dir);
-            if let Err(leftover) = delete(trashed) {
-                report.leftovers.push(leftover.entry);
-            }
+            report.leftovers.push(leftover.entry);
         }
-        Err(error) => report.fault(Some(dir), error),
+        DropOutcome::Vanished => {}
+        DropOutcome::Busy => report.busy.push(dir),
+        DropOutcome::Released(_) => report.attend(Reason::Stranded),
+        DropOutcome::Reclassified(reason) => report.attend(reason),
+        DropOutcome::Fault(error) => report.fault(Some(dir), error),
     }
 }
 
-/// Releases the dangling links into the deleted root that the confirmed class carries; whether every one came out `Unlinked`.
-fn release_links(class: &StateDirClass, swept: &StateRoot, report: &mut SweepReport) -> bool {
+/// A `gone` dir whose links did not all come out `Unlinked` stays as `stranded`, unless
+/// `trash_kept`, as under a granted `gc --eject`.
+fn settle(
+    action: PlannedAction,
+    planned: Reason,
+    trash_kept: bool,
+    report: &mut SweepReport,
+) -> DropOutcome {
+    let release_only = matches!(action, PlannedAction::ReleaseLinks { .. });
+    let held = match lock(action) {
+        Ok(held) => held,
+        Err(NotHeld::Vanished) => return DropOutcome::Vanished,
+        Err(NotHeld::Busy) => return DropOutcome::Busy,
+        Err(NotHeld::Fault(kind)) => {
+            return DropOutcome::Fault(StateError::StateStore(format!("lock: {kind}")));
+        }
+    };
+    let dir = held.dir.clone();
+    let confirmed = match confirm(held, planned) {
+        Ok(confirmed) => confirmed,
+        Err(reason) => return DropOutcome::Reclassified(reason),
+    };
+    let links = release_links(&confirmed.class, dir.root(), report);
+    let all_unlinked = links
+        .iter()
+        .all(|outcome| matches!(outcome, LinkOutcome::Unlinked));
+    match confirmed.class.reason() {
+        Reason::Gone if !all_unlinked && !trash_kept => {
+            return DropOutcome::Reclassified(Reason::Stranded);
+        }
+        Reason::Stranded if release_only => return DropOutcome::Released(links),
+        _ => {}
+    }
+    if let Err(error) = eject_worktrees(&confirmed.class, &dir) {
+        return DropOutcome::Fault(error);
+    }
+    match trash(confirmed) {
+        Ok(trashed) => match delete(trashed) {
+            Ok(()) => DropOutcome::Deleted,
+            Err(leftover) => DropOutcome::Leftover(leftover),
+        },
+        Err(error) => DropOutcome::Fault(error),
+    }
+}
+
+/// Releases the dangling links into the deleted root that the confirmed class carries.
+fn release_links(
+    class: &StateDirClass,
+    swept: &StateRoot,
+    report: &mut SweepReport,
+) -> Vec<LinkOutcome> {
     let (proof, links) = match class {
         StateDirClass::Drop(DropReason::Gone { proof, links }) => (proof, links),
         StateDirClass::Release(ReleaseReason::Stranded(stranded)) => {
             (&stranded.proof, &stranded.links)
         }
-        _ => return true,
+        _ => return Vec::new(),
     };
     if links.is_empty() {
-        return true;
+        return Vec::new();
     }
     let protected = protected_paths(proof, swept);
-    let mut all_unlinked = true;
-    for link in links {
-        let outcome = protected
-            .as_ref()
-            .map_or(LinkOutcome::Kept(LinkKept::Confined), |protected| {
-                release_link(link, protected)
-            });
-        match outcome {
-            LinkOutcome::Unlinked => report.released.push(link.path.clone()),
-            kept @ LinkOutcome::Kept(_) => {
-                all_unlinked = false;
-                report.links_kept.push((link.path.clone(), kept));
+    links
+        .iter()
+        .map(|link| {
+            let outcome = protected
+                .as_ref()
+                .map_or(LinkOutcome::Kept(LinkKept::Confined), |protected| {
+                    release_link(link, protected)
+                });
+            match outcome {
+                LinkOutcome::Unlinked => report.released.push(link.path.clone()),
+                LinkOutcome::Kept(_) => {
+                    report.links_kept.push((link.path.clone(), outcome.clone()));
+                }
             }
-        }
-    }
-    all_unlinked
+            outcome
+        })
+        .collect()
 }
 
 /// Resolved from the recorded root with default `Paths`, plus the swept state root.
@@ -555,14 +617,16 @@ fn release_link(link: &ReleasableLink, protected: &ProtectedPathSet) -> LinkOutc
 
 /// Deletes every entry under `trash/` that parses as a `TrashEntry`, never another one.
 fn empty_trash(root: &StateRoot, report: &mut SweepReport) {
-    let trash_dir = root.path().join(TRASH_DIR);
-    let entries = match std::fs::read_dir(trash_dir.as_path()) {
-        Ok(entries) => entries,
+    let names = match trash_names(root) {
+        Ok(names) => names,
         Err(error) if error.kind() == ErrorKind::NotFound => return,
-        Err(error) => return report.fault(None, io_error("read", trash_dir.as_path(), &error)),
+        Err(error) => {
+            let trash_dir = root.path().join(TRASH_DIR);
+            return report.fault(None, io_error("read", trash_dir.as_path(), &error));
+        }
     };
-    for entry in entries.flatten() {
-        let Some(entry) = trash_entry(root, &entry.file_name()) else {
+    for name in names {
+        let TrashName::Entry(entry) = name else {
             continue;
         };
         match std::fs::remove_dir_all(trash_path(&entry)) {
@@ -585,30 +649,77 @@ fn trash_entry(root: &StateRoot, name: &OsStr) -> Option<TrashEntry> {
     })
 }
 
-/// Under the index lock, drops each entry whose root holds no state dir or trash entry, or is
-/// proven deleted against the index's recorded default-root anchor.
+/// Drops each entry whose root holds no state dir or trash entry, or is proven deleted.
 fn prune_index(default: &StateRoot) -> Result<(), StateError> {
+    unregister_where(default, |root, fate| match fate {
+        RegisteredRoot::Present => root.path().as_path().is_dir() && !holds_state_or_trash(root),
+        RegisteredRoot::Deleted => true,
+        RegisteredRoot::Unproven => false,
+    })
+}
+
+/// A registered root, symlinks followed, against the index's recorded default-root anchor.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegisteredRoot {
+    /// Present, or its stat failed other than as absent.
+    Present,
+    Deleted,
+    /// Absent and not provably deleted.
+    Unproven,
+}
+
+fn registered_root(
+    root: &StateRoot,
+    placement: Placement,
+    index: &StateRootIndex,
+    current: Option<&CurrentAnchor>,
+) -> RegisteredRoot {
+    match std::fs::metadata(root.path().as_path()) {
+        Err(error) if is_absent(error.kind()) => {
+            let proven = current.is_some_and(|current| {
+                matches!(
+                    locate(root.path(), placement, index.anchor(), current),
+                    Location::Deleted(_)
+                )
+            });
+            if proven {
+                RegisteredRoot::Deleted
+            } else {
+                RegisteredRoot::Unproven
+            }
+        }
+        _ => RegisteredRoot::Present,
+    }
+}
+
+fn current_anchor(default: &StateRoot) -> std::io::Result<CurrentAnchor> {
+    let default = default.path();
+    MountId::of(default.as_path())
+        .map(|mount| CurrentAnchor::new(AnchorDir::new(default.clone()), mount))
+}
+
+/// Under the index lock, unregisters each root `dead` picks from the index as read now.
+fn unregister_where(
+    default: &StateRoot,
+    dead: impl Fn(&StateRoot, RegisteredRoot) -> bool,
+) -> Result<(), StateError> {
     let default_dir = default.path().as_path();
     let _lock = lock_index(default_dir)?;
     let index_path = default_dir.join(INDEX_FILE);
     let IndexRead::Read(mut index) = read_index(&index_path) else {
         return Ok(());
     };
-    let mount =
-        MountId::of(default_dir).map_err(|error| io_error("read mount of", default_dir, &error))?;
-    let current = CurrentAnchor::new(AnchorDir::new(default.path().clone()), mount);
+    let current =
+        current_anchor(default).map_err(|error| io_error("read mount of", default_dir, &error))?;
     let dead: Vec<StateRoot> = index
         .roots()
         .iter()
-        .filter(
-            |(root, placement)| match std::fs::metadata(root.path().as_path()) {
-                Ok(stat) => stat.is_dir() && !holds_state_or_trash(root),
-                Err(_) => matches!(
-                    locate(root.path(), **placement, index.anchor(), &current),
-                    Location::Deleted(_)
-                ),
-            },
-        )
+        .filter(|(root, placement)| {
+            dead(
+                root,
+                registered_root(root, **placement, &index, Some(&current)),
+            )
+        })
         .map(|(root, _)| root.clone())
         .collect();
     if dead.is_empty() {
@@ -620,18 +731,14 @@ fn prune_index(default: &StateRoot) -> Result<(), StateError> {
     write_index(&index_path, &index)
 }
 
-/// The ids of the dirs under `projects/` whose names parse as a `ProjectId`.
-fn state_dir_ids(
+/// The state dirs under `projects/`.
+fn state_dirs(
     root: &StateRoot,
-) -> std::io::Result<impl Iterator<Item = std::io::Result<ProjectId>>> {
-    let entries = std::fs::read_dir(root.path().join("projects").as_path())?;
-    Ok(entries.filter_map(|entry| {
-        entry
-            .map(|entry| {
-                ProjectId::parse(&entry.file_name())
-                    .filter(|_| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-            })
-            .transpose()
+) -> std::io::Result<impl Iterator<Item = std::io::Result<StateDirPath>> + use<'_>> {
+    Ok(projects_entries(root)?.filter_map(|entry| match entry {
+        Ok(ProjectsEntry::State(dir)) => Some(Ok(dir)),
+        Ok(ProjectsEntry::Foreign(_)) => None,
+        Err(error) => Some(Err(error)),
     }))
 }
 
@@ -644,15 +751,350 @@ fn holds_state_or_trash(root: &StateRoot) -> bool {
         entries
             .any(|entry| entry.is_ok_and(|entry| trash_entry(root, &entry.file_name()).is_some()))
     });
-    holds(state_dir_ids(root).map(|mut ids| ids.any(|id| id.is_ok()))) || holds(trash)
+    holds(state_dirs(root).map(|mut dirs| dirs.any(|dir| dir.is_ok()))) || holds(trash)
 }
 
-pub fn plan_gc(_input: &GcInput) -> GcPlan {
-    todo!()
+/// One record per non-live dir of every swept root, plus what gc lists but never touches.
+pub fn plan_gc(input: &GcInput) -> GcPlan {
+    let sweep = &input.sweep;
+    let mut report = SweepReport::default();
+    let roots = swept_roots(sweep, &mut report);
+    let mut plan = GcPlan {
+        records: Vec::new(),
+        index_removals: unproven_absent_roots(sweep),
+        foreign: Vec::new(),
+        foreign_trash: Vec::new(),
+        default: sweep.default.clone(),
+        roots: Vec::new(),
+        index_read: matches!(sweep.index, IndexRead::Read(_)),
+        dry_run: input.dry_run,
+        faults: Vec::new(),
+    };
+    for root in &roots {
+        plan_root(root, input, &mut plan, &mut report);
+    }
+    plan.roots = roots;
+    plan.faults = report.into_faults();
+    plan
 }
 
-pub fn apply_gc(_plan: GcPlan, _confirmation: Confirmation) -> GcOutcome {
-    todo!()
+fn plan_root(root: &StateRoot, input: &GcInput, plan: &mut GcPlan, report: &mut SweepReport) {
+    let projects = root.path().join("projects");
+    match projects_entries(root).and_then(Iterator::collect::<std::io::Result<Vec<_>>>) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    ProjectsEntry::State(dir) if input.sweep.own.as_ref() == Some(&dir) => {}
+                    ProjectsEntry::State(dir) => {
+                        plan.records.extend(gc_record(dir, input.eject, report));
+                    }
+                    ProjectsEntry::Foreign(path) => plan.foreign.push(path),
+                }
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => report.fault(None, io_error("read", projects.as_path(), &error)),
+    }
+    let trash_dir = root.path().join(TRASH_DIR);
+    match trash_names(root) {
+        Ok(names) => plan
+            .foreign_trash
+            .extend(names.into_iter().filter_map(|name| match name {
+                TrashName::Foreign(name) => Some(trash_dir.as_path().join(name).into_os_string()),
+                TrashName::Entry(_) => None,
+            })),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => report.fault(None, io_error("read", trash_dir.as_path(), &error)),
+    }
+}
+
+/// Each entry under `projects/`: a dir whose name parses as a `ProjectId` is a state dir.
+fn projects_entries(
+    root: &StateRoot,
+) -> std::io::Result<impl Iterator<Item = std::io::Result<ProjectsEntry>> + use<'_>> {
+    let projects = root.path().join("projects");
+    let entries = std::fs::read_dir(projects.as_path())?;
+    Ok(entries.map(move |entry| {
+        let entry = entry?;
+        let name = entry.file_name();
+        let id =
+            ProjectId::parse(&name).filter(|_| entry.file_type().is_ok_and(|kind| kind.is_dir()));
+        Ok(match id {
+            Some(id) => ProjectsEntry::State(StateDirPath::new(root.clone(), id)),
+            None => ProjectsEntry::Foreign(projects.join(&name)),
+        })
+    }))
+}
+
+fn trash_names(root: &StateRoot) -> std::io::Result<Vec<TrashName>> {
+    std::fs::read_dir(root.path().join(TRASH_DIR).as_path())?
+        .map(|entry| {
+            let name = entry?.file_name();
+            Ok(trash_entry(root, &name).map_or(TrashName::Foreign(name), TrashName::Entry))
+        })
+        .collect()
+}
+
+/// `None` for a live dir; only `--eject` plans ejects and Forget-class drops.
+fn gc_record(dir: StateDirPath, eject: bool, report: &mut SweepReport) -> Option<GcRecord> {
+    let action = match classify(&probe_now(&dir)) {
+        StateDirClass::Keep(_) => return None,
+        StateDirClass::Drop(reason) => PlannedAction::Drop { dir, reason },
+        StateDirClass::Release(reason) if eject => {
+            let worktrees =
+                ejectable_worktrees(&dir, release_root(&reason)).unwrap_or_else(|error| {
+                    report.fault(Some(dir.clone()), error);
+                    Vec::new()
+                });
+            PlannedAction::Eject {
+                dir,
+                reason,
+                worktrees,
+            }
+        }
+        StateDirClass::Release(ReleaseReason::Stranded(stranded)) if !stranded.links.is_empty() => {
+            PlannedAction::ReleaseLinks { dir, stranded }
+        }
+        StateDirClass::Release(ReleaseReason::Stranded(stranded)) => PlannedAction::Report {
+            dir,
+            attention: Attention::Stranded(stranded),
+        },
+        StateDirClass::Release(ReleaseReason::Retired { root }) => PlannedAction::Report {
+            dir,
+            attention: Attention::Retired { root },
+        },
+        StateDirClass::Forget(reason) if eject => PlannedAction::Forget { dir, reason },
+        StateDirClass::Forget(reason) => PlannedAction::Report {
+            dir,
+            attention: Attention::Forget(reason),
+        },
+    };
+    if action.reason() == Reason::Unrooted {
+        let legacy = legacy_evidence(action.dir()).unwrap_or_else(|error| {
+            report.fault(Some(action.dir().clone()), error);
+            LegacyEvidence {
+                records: 0,
+                recorded_paths: Vec::new(),
+                newest_record: None,
+            }
+        });
+        return Some(GcRecord::Unrooted { action, legacy });
+    }
+    let leftovers = if let Some(present) = action.present_outside() {
+        present.to_vec()
+    } else if let Some(root) = action.live_root() {
+        let path = action.dir().path();
+        remains(path.as_path(), root, JournalState::Clear).map_or_else(
+            |kind| {
+                let error = StateError::StateStore(format!("read records: {kind}"));
+                report.fault(Some(action.dir().clone()), error);
+                Vec::new()
+            },
+            |remains| remains.present(),
+        )
+    } else {
+        Vec::new()
+    };
+    Some(GcRecord::Rooted { action, leftovers })
+}
+
+fn legacy_evidence(dir: &StateDirPath) -> Result<LegacyEvidence, StateError> {
+    let store = FileStateStore::open(dir.path().as_path().to_path_buf())?;
+    let records = store.all_artifacts()?;
+    let recorded_paths = records
+        .iter()
+        .filter_map(orphan_artifact_path)
+        .filter(|path| path.is_absolute())
+        .collect();
+    Ok(LegacyEvidence {
+        records: records.len(),
+        recorded_paths,
+        newest_record: store.newest_record_modified()?,
+    })
+}
+
+fn release_root(reason: &ReleaseReason) -> &NormalPath {
+    match reason {
+        ReleaseReason::Retired { root } => root.path(),
+        ReleaseReason::Stranded(stranded) => stranded.proof.path(),
+    }
+}
+
+/// Each history record not ejected whose deploy root resolves against `root`.
+fn ejectable_worktrees(
+    dir: &StateDirPath,
+    root: &NormalPath,
+) -> Result<Vec<EjectableWorktree>, StateError> {
+    let (_, records) = unejected_records(dir.path().as_path(), root.as_path())?;
+    let mut worktrees = Vec::new();
+    for (record, deploy_root) in records {
+        if record.linked {
+            continue;
+        }
+        let Ok(Some((address, admin_id))) = history_address(&record) else {
+            continue;
+        };
+        let Some(deploy_root) = deploy_root else {
+            continue;
+        };
+        let Ok(commit) = record.commit.parse() else {
+            continue;
+        };
+        let mirror_present =
+            mirror_exists(&address).map_err(|error| StateError::StateStore(error.to_string()))?;
+        worktrees.push(EjectableWorktree {
+            record: record.key,
+            deploy_root,
+            admin_id,
+            address,
+            commit,
+            mirror_present,
+        });
+    }
+    Ok(worktrees)
+}
+
+/// Recomputed under the dir's lock; a worktree whose mirror is gone keeps its gitlink.
+fn eject_worktrees(class: &StateDirClass, dir: &StateDirPath) -> Result<(), StateError> {
+    let StateDirClass::Release(reason) = class else {
+        return Ok(());
+    };
+    for worktree in ejectable_worktrees(dir, release_root(reason))? {
+        if worktree.mirror_present {
+            eject(&worktree)?;
+        }
+    }
+    Ok(())
+}
+
+fn eject(worktree: &EjectableWorktree) -> Result<(), StateError> {
+    let fail = |error: SourceError| {
+        StateError::StateStore(format!(
+            "eject history worktree {}: {error}",
+            worktree.deploy_root.as_path().display()
+        ))
+    };
+    let source = SourceName::trusted(worktree.record.source.clone());
+    let guard = GitBackend::new(worktree.address.cache_git_root.clone())
+        .lock_worktree_mirror_at(&source, &worktree.address)
+        .map_err(fail)?;
+    guard
+        .eject_worktree(&WorktreeDeployRequest {
+            admin_id: worktree.admin_id.clone(),
+            deploy_root: worktree.deploy_root.as_path().to_path_buf(),
+            commit: worktree.commit.clone(),
+        })
+        .map_err(fail)?;
+    Ok(())
+}
+
+/// Registered roots that are absent and not provably deleted against the index's anchor.
+fn unproven_absent_roots(sweep: &SweepInput) -> Vec<StateRoot> {
+    let IndexRead::Read(index) = &sweep.index else {
+        return Vec::new();
+    };
+    let current = current_anchor(&sweep.default).ok();
+    index
+        .roots()
+        .iter()
+        .filter(|(root, placement)| {
+            *root != &sweep.default
+                && registered_root(root, **placement, index, current.as_ref())
+                    == RegisteredRoot::Unproven
+        })
+        .map(|(root, _)| root.clone())
+        .collect()
+}
+
+/// Without `Granted`, the ejects and Forget-class drops stay pending; a dry-run plan applies nothing.
+pub fn apply_gc(plan: GcPlan, confirmation: Confirmation) -> GcOutcome {
+    let mut outcome = GcOutcome::default();
+    if plan.dry_run {
+        outcome.pending = plan
+            .records
+            .iter()
+            .map(GcRecord::action)
+            .filter(|action| !matches!(action, PlannedAction::Report { .. }))
+            .map(|action| action.dir().clone())
+            .collect();
+        return outcome;
+    }
+    let mut report = SweepReport::default();
+    for root in &plan.roots {
+        empty_trash(root, &mut report);
+    }
+    let granted = confirmation == Confirmation::Granted;
+    for record in plan.records {
+        let action = record.into_action();
+        let planned = action.reason();
+        let dir = action.dir().clone();
+        let action = match action {
+            PlannedAction::Report { .. } => continue,
+            PlannedAction::Eject {
+                dir,
+                reason: ReleaseReason::Stranded(stranded),
+                ..
+            } if !granted => {
+                outcome.pending.push(dir.clone());
+                if stranded.links.is_empty() {
+                    continue;
+                }
+                PlannedAction::ReleaseLinks { dir, stranded }
+            }
+            PlannedAction::Eject { .. } | PlannedAction::Forget { .. } if !granted => {
+                outcome.pending.push(dir);
+                continue;
+            }
+            action => action,
+        };
+        let kept_from = report.links_kept.len();
+        let settled = settle(action, planned, granted, &mut report);
+        outcome
+            .links_kept
+            .extend(
+                report
+                    .links_kept
+                    .drain(kept_from..)
+                    .filter_map(|(path, link)| match link {
+                        LinkOutcome::Kept(kept) => Some((dir.clone(), path, kept)),
+                        LinkOutcome::Unlinked => None,
+                    }),
+            );
+        outcome.applied.push((dir, settled));
+    }
+    if plan.index_read
+        && let Err(error) = prune_index(&plan.default)
+    {
+        report.fault(None, error);
+    }
+    outcome.faults = report.into_faults();
+    outcome
+}
+
+/// Unregisters, under the index lock, each of `roots` that is still absent.
+pub fn unregister_roots(default: &StateRoot, roots: &[StateRoot]) -> Result<(), StateError> {
+    if roots.is_empty() {
+        return Ok(());
+    }
+    unregister_where(default, |root, fate| {
+        fate != RegisteredRoot::Present && roots.contains(root)
+    })
+}
+
+/// The content store's GC roots: `projects/` of the default and every registered state root.
+pub fn projects_dirs(default: &StateRoot) -> Vec<PathBuf> {
+    let projects = |root: &StateRoot| root.path().join("projects").as_path().to_path_buf();
+    let mut dirs = vec![projects(default)];
+    if let IndexRead::Read(index) = read_index(&default.path().as_path().join(INDEX_FILE)) {
+        dirs.extend(
+            index
+                .roots()
+                .keys()
+                .filter(|root| *root != default)
+                .map(projects),
+        );
+    }
+    dirs
 }
 
 /// Takes the dir's `state.lock` with zero timeout, creating nothing outside an existing dir.
@@ -724,13 +1166,14 @@ pub fn trash(confirmed: Confirmed) -> Result<Trashed, StateError> {
 
 /// Deletes the trash entry, `NotFound` counting as deleted, then releases the lock.
 pub fn delete(trashed: Trashed) -> Result<(), Leftover> {
-    match std::fs::remove_dir_all(trash_path(&trashed.entry)) {
+    let Trashed { entry, lock } = trashed;
+    let deleted = match std::fs::remove_dir_all(trash_path(&entry)) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(Leftover {
-            entry: trashed.entry,
-        }),
-    }
+        Err(_) => Err(Leftover { entry }),
+    };
+    drop(lock);
+    deleted
 }
 
 fn trash_path(entry: &TrashEntry) -> PathBuf {

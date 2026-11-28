@@ -86,15 +86,19 @@ impl Fixture {
         self.phora_in(&self.project, args);
     }
 
-    fn phora_in(&self, cwd: &Path, args: &[&str]) -> Output {
-        let out = Command::new(env!("CARGO_BIN_EXE_phora"))
+    fn run_in(&self, cwd: &Path, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_phora"))
             .args(args)
             .current_dir(cwd)
             .env("HOME", self.base.join("home"))
             .env("XDG_CACHE_HOME", self.base.join("xdg/cache"))
             .env("XDG_STATE_HOME", &self.xdg_state)
             .output()
-            .expect("phora binary runs");
+            .expect("phora binary runs")
+    }
+
+    fn phora_in(&self, cwd: &Path, args: &[&str]) -> Output {
+        let out = self.run_in(cwd, args);
         assert!(
             out.status.success(),
             "phora {args:?} in {} failed:\n{}",
@@ -674,5 +678,641 @@ fn sweep_retries_trash_leftovers_and_keeps_foreign_entries_and_their_root_regist
     assert!(
         !registered_roots(&fx).contains(&str_of(&gone_root).to_owned()),
         "a root holding only foreign trash is unregistered"
+    );
+}
+
+/// A committed git repo at `dir` holding `files`.
+fn git_repo(dir: &Path, files: &[(&str, &str)]) -> PathBuf {
+    std::fs::create_dir_all(dir).expect("repo dir");
+    git(dir, &["init", "-b", "main", "."]);
+    for (name, body) in files {
+        write(&dir.join(name), body);
+    }
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-m", "fixture"]);
+    dir.to_path_buf()
+}
+
+fn write_project(dir: &Path, body: &str) -> PathBuf {
+    write(&dir.join("phora.toml"), &format!("version = 1\n\n{body}"));
+    dir.to_path_buf()
+}
+
+/// Config deploying `source` to `target` as a history worktree named `hist`.
+fn history_config(paths: &str, source: &Path, target: &Path) -> String {
+    format!(
+        "{paths}\n[sources.hist]\npath = \"{}\"\nbranch = \"main\"\n\n\
+         [targets.home]\npath = \"{}\"\nlayout = \"flat\"\n\n\
+         [targets.home.sources.hist]\nhistory = true\n",
+        source.display(),
+        target.display()
+    )
+}
+
+/// Config deploying the fixture's shared source to `target` by copy.
+fn copy_config(fx: &Fixture, paths: &str, target: &Path) -> String {
+    format!(
+        "{paths}\n[sources.dotfiles]\npath = \"{}\"\nbranch = \"main\"\n\
+         include = [\"editor\"]\n\n[targets.home]\npath = \"{}\"\n\
+         sources = [\"dotfiles\"]\nlayout = \"flat\"\n",
+        fx.source.display(),
+        target.display()
+    )
+}
+
+fn id_of(project: &Path) -> String {
+    ProjectId::for_path(project)
+        .expect("project id")
+        .as_str()
+        .to_owned()
+}
+
+fn output_text(out: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// Whether `text` names `path` as given or canonicalized.
+fn mentions(text: &str, path: &Path) -> bool {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    text.contains(str_of(path)) || text.contains(str_of(&canonical))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Node {
+    Dir,
+    File(Vec<u8>),
+    Link(PathBuf),
+}
+
+/// Every entry under `root`, keyed by its path relative to `root`.
+fn snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Node> {
+    let mut nodes = std::collections::BTreeMap::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let meta = std::fs::symlink_metadata(&path)
+            .unwrap_or_else(|err| panic!("{} must be readable: {err}", path.display()));
+        let node = if meta.is_symlink() {
+            Node::Link(std::fs::read_link(&path).expect("read link"))
+        } else if meta.is_dir() {
+            for entry in std::fs::read_dir(&path).expect("read dir") {
+                pending.push(entry.expect("dir entry").path());
+            }
+            Node::Dir
+        } else {
+            Node::File(std::fs::read(&path).expect("read file"))
+        };
+        let relative = path.strip_prefix(root).expect("under root").to_path_buf();
+        nodes.insert(relative, node);
+    }
+    nodes
+}
+
+/// The one `--json` record describing the state dir `id`.
+fn gc_record<'a>(records: &'a [serde_json::Value], id: &str) -> &'a serde_json::Value {
+    let matching: Vec<_> = records.iter().filter(|r| r["id"] == id).collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "exactly one gc record must name {id}, got {records:#?}"
+    );
+    matching[0]
+}
+
+/// Content-store objects whose bytes equal `body`, aged past the prune grace period.
+fn aged_content_objects(fx: &Fixture, body: &str) -> Vec<PathBuf> {
+    let store = fx.base.join("xdg/cache/phora/content");
+    let past_grace = std::time::SystemTime::now() - std::time::Duration::from_hours(2);
+    let objects: Vec<PathBuf> = snapshot(&store)
+        .into_iter()
+        .filter(|(_, node)| *node == Node::File(body.as_bytes().to_vec()))
+        .map(|(path, _)| store.join(path))
+        .collect();
+    for object in &objects {
+        std::fs::File::open(object)
+            .and_then(|file| file.set_modified(past_grace))
+            .expect("setup: backdate content object");
+    }
+    objects
+}
+
+/// The mirror admin dir a history worktree's gitlink points at.
+fn gitlink_admin(worktree: &Path) -> PathBuf {
+    let link = std::fs::read_to_string(worktree.join(".git"))
+        .unwrap_or_else(|err| panic!("{} must hold a gitlink: {err}", worktree.display()));
+    PathBuf::from(
+        link.trim()
+            .strip_prefix("gitdir: ")
+            .unwrap_or_else(|| panic!("gitlink must name its gitdir, got {link:?}")),
+    )
+}
+
+/// A project `name` deploying its own source to `home/<name>` as a history worktree, synced.
+fn synced_history_project(fx: &Fixture, name: &str) -> PathBuf {
+    let source = git_repo(
+        &fx.base.join(format!("{name}-src")),
+        &[("file.txt", &format!("{name}\n"))],
+    );
+    let project = write_project(
+        &fx.base.join(name),
+        &history_config("", &source, &fx.base.join("home").join(name)),
+    );
+    fx.phora_in(&project, &["sync"]);
+    project
+}
+
+/// The snapshot without the subtree at `excluded`.
+fn outside(
+    nodes: &std::collections::BTreeMap<PathBuf, Node>,
+    excluded: &Path,
+) -> Vec<(PathBuf, Node)> {
+    nodes
+        .iter()
+        .filter(|(path, _)| !path.starts_with(excluded))
+        .map(|(path, node)| (path.clone(), node.clone()))
+        .collect()
+}
+
+struct RestoreMode(PathBuf, u32);
+
+impl Drop for RestoreMode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+    }
+}
+
+#[test]
+fn gc_dry_run_lists_every_non_live_dir_with_its_evidence_and_changes_nothing() {
+    let fx = Fixture::new();
+    fx.configure("", "home/deploy");
+    fx.sync();
+
+    let retired = fx.other_project(
+        "rho",
+        "[paths]\nstate = \"state\"\n",
+        &fx.base.join("rho/out"),
+    );
+    fx.phora_in(&retired, &["sync"]);
+    let stranded = fx.other_project("beta", "", &fx.base.join("home/beta"));
+    fx.phora_in(&stranded, &["sync"]);
+    let gone = fx.other_project("alpha", "", &fx.base.join("alpha/out"));
+    fx.phora_in(&gone, &["sync"]);
+    let unrooted = fx.other_project("sigma", "", &fx.base.join("home/sigma"));
+    fx.phora_in(&unrooted, &["sync"]);
+    let empty_id = "0123456789abcdef";
+    std::fs::create_dir_all(fx.default_state_root().join("projects").join(empty_id))
+        .expect("setup: empty state dir");
+
+    let stranded_id = id_of(&stranded);
+    let gone_id = id_of(&gone);
+    std::fs::remove_file(retired.join("phora.toml")).expect("retire rho");
+    std::fs::remove_dir_all(&stranded).expect("delete beta root");
+    std::fs::remove_dir_all(&gone).expect("delete alpha root");
+    std::fs::remove_file(state_dir_of(&unrooted, &fx.default_state_root()).join("project.toml"))
+        .expect("setup: legacy dir without project.toml");
+
+    let before = snapshot(&fx.base);
+    let text = output_text(&fx.phora_in(&fx.base, &["gc", "--dry-run"]));
+    let json = fx.phora_in(&fx.base, &["gc", "--dry-run", "--json"]);
+    assert!(
+        snapshot(&fx.base) == before,
+        "a dry run changes no file under any state, cache or deploy root"
+    );
+
+    let live_id = id_of(&fx.project);
+    assert!(
+        !text.contains(&live_id),
+        "a live dir is not listed, got:\n{text}"
+    );
+    for (id, reason) in [
+        (id_of(&retired), "retired"),
+        (stranded_id.clone(), "stranded"),
+        (gone_id.clone(), "gone"),
+        (id_of(&unrooted), "unrooted"),
+        (empty_id.to_owned(), "empty"),
+    ] {
+        assert!(
+            text.contains(&id) && text.contains(reason),
+            "the plan lists {id} as {reason}, got:\n{text}"
+        );
+    }
+    assert!(
+        mentions(&text, &retired),
+        "the retired record names its root, got:\n{text}"
+    );
+
+    let records = json_records(&json);
+    assert!(
+        records.iter().all(|r| r["id"] != live_id.as_str()),
+        "no record for the live dir, got {records:#?}"
+    );
+    let canonical = |path: &Path| std::fs::canonicalize(path).expect("canonical path");
+    let retired_record = gc_record(&records, &id_of(&retired));
+    assert_eq!(retired_record["status"], "retired");
+    assert_eq!(
+        retired_record["root"].as_str(),
+        Some(str_of(&canonical(&retired)))
+    );
+    assert!(
+        retired_record["action"].is_string() || retired_record["action"].is_object(),
+        "every record carries its planned action, got {retired_record:#}"
+    );
+    let stranded_record = gc_record(&records, &stranded_id);
+    assert_eq!(stranded_record["status"], "stranded");
+    let home_beta = canonical(&fx.base.join("home/beta"));
+    let leftovers: Vec<PathBuf> = stranded_record["leftovers"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!("a record lists its leftover destinations, got {stranded_record:#}")
+        })
+        .iter()
+        .filter_map(|p| std::fs::canonicalize(p.as_str()?).ok())
+        .collect();
+    assert!(
+        leftovers.iter().any(|p| p.starts_with(&home_beta)),
+        "the stranded record lists the outside destination it leaves, got {stranded_record:#}"
+    );
+    assert_eq!(gc_record(&records, &gone_id)["status"], "gone");
+    assert_eq!(gc_record(&records, empty_id)["status"], "empty");
+    let unrooted_record = gc_record(&records, &id_of(&unrooted));
+    assert_eq!(unrooted_record["status"], "unrooted");
+    assert!(
+        mentions(
+            &unrooted_record["evidence"].to_string(),
+            &fx.base.join("home/sigma")
+        ),
+        "unrooted evidence lists the recorded paths, got {unrooted_record:#}"
+    );
+}
+
+#[test]
+fn plain_gc_drops_only_drop_class_dirs_and_prunes_content_kept_by_registered_roots() {
+    let fx = Fixture::new();
+    let live_src = git_repo(&fx.base.join("live-src"), &[("live.txt", "live only\n")]);
+    write_project(
+        &fx.project,
+        &format!(
+            "[paths]\nstate = \"../custom-state\"\n\n[sources.live]\npath = \"{}\"\n\
+             branch = \"main\"\n\n[targets.home]\npath = \"{}\"\nsources = [\"live\"]\n\
+             layout = \"flat\"\n",
+            live_src.display(),
+            fx.base.join("home/live").display()
+        ),
+    );
+    fx.sync();
+
+    let gone_src = git_repo(&fx.base.join("gone-src"), &[("gone.txt", "gone only\n")]);
+    let gone = write_project(
+        &fx.base.join("alpha"),
+        &format!(
+            "[sources.gone]\npath = \"{}\"\nbranch = \"main\"\n\n[targets.home]\n\
+             path = \"{}\"\nsources = [\"gone\"]\nlayout = \"flat\"\n",
+            gone_src.display(),
+            fx.base.join("alpha/out").display()
+        ),
+    );
+    fx.phora_in(&gone, &["sync"]);
+
+    let stranded = fx.base.join("beta");
+    git_repo(&stranded.join("src"), &[("tool", "tool\n")]);
+    write_project(
+        &stranded,
+        &format!(
+            "[sources.links]\npath = \"src\"\nbranch = \"main\"\ndeploy = \"link\"\n\
+             include = [\"tool\"]\n\n[sources.dotfiles]\npath = \"{}\"\nbranch = \"main\"\n\
+             include = [\"editor\"]\n\n[targets.links]\npath = \"{}\"\nsources = [\"links\"]\n\n\
+             [targets.home]\npath = \"{}\"\nsources = [\"dotfiles\"]\nlayout = \"flat\"\n",
+            fx.source.display(),
+            fx.base.join("home/beta-links").display(),
+            fx.base.join("home/beta").display()
+        ),
+    );
+    fx.phora_in(&stranded, &["sync"]);
+    let link = fx.base.join("home/beta-links/tool");
+    let outside_copy = fx.base.join("home/beta/editor/init.lua");
+    assert!(
+        std::fs::symlink_metadata(&link).is_ok_and(|m| m.is_symlink()),
+        "setup: {} must be a link",
+        link.display()
+    );
+
+    let unrooted = write_project(
+        &fx.base.join("sigma"),
+        &copy_config(&fx, "", &fx.base.join("home/sigma")),
+    );
+    fx.phora_in(&unrooted, &["sync"]);
+    let empty_dir = fx.default_state_root().join("projects/0123456789abcdef");
+    std::fs::create_dir_all(&empty_dir).expect("setup: empty state dir");
+
+    let gone_dir = state_dir_of(&gone, &fx.default_state_root());
+    let stranded_dir = state_dir_of(&stranded, &fx.default_state_root());
+    let unrooted_dir = state_dir_of(&unrooted, &fx.default_state_root());
+    let stranded_id = id_of(&stranded);
+    std::fs::remove_dir_all(&gone).expect("delete alpha root");
+    std::fs::remove_dir_all(&stranded).expect("delete beta root");
+    std::fs::remove_file(unrooted_dir.join("project.toml")).expect("setup: legacy dir");
+
+    let live_objects = aged_content_objects(&fx, "live only\n");
+    let gone_objects = aged_content_objects(&fx, "gone only\n");
+    assert!(
+        !live_objects.is_empty() && !gone_objects.is_empty(),
+        "setup: both deployments store content objects"
+    );
+
+    fx.phora_in(&fx.base, &["gc"]);
+
+    assert_absent(&empty_dir, "plain gc drops an empty dir");
+    assert_absent(&gone_dir, "plain gc drops a gone dir");
+    assert_absent(
+        &link,
+        "plain gc releases a dangling link into a deleted root",
+    );
+    assert!(stranded_dir.is_dir(), "plain gc keeps a stranded dir");
+    assert!(unrooted_dir.is_dir(), "plain gc keeps an unrooted dir");
+    assert!(outside_copy.is_file(), "plain gc deletes no deployed file");
+    for object in &gone_objects {
+        assert_absent(object, "content only the dropped dir referenced is pruned");
+    }
+    for object in &live_objects {
+        assert!(
+            object.is_file(),
+            "{} is referenced by a live dir in a registered state root",
+            object.display()
+        );
+    }
+
+    let text = output_text(&fx.phora_in(&fx.base, &["gc", "--eject"]));
+
+    assert!(
+        stranded_dir.is_dir() && unrooted_dir.is_dir(),
+        "without a TTY or --yes nothing is ejected or dropped"
+    );
+    assert!(outside_copy.is_file(), "the outside copy stays");
+    assert!(
+        text.contains(&stranded_id) && text.contains("pending"),
+        "the unconfirmed stranded dir is reported pending, got:\n{text}"
+    );
+}
+
+#[test]
+fn gc_eject_yes_ejects_release_class_worktrees_and_drops_dirs_without_deleting_deployed_files() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = Fixture::new();
+    let home = fx.base.join("home");
+
+    let ejected = synced_history_project(&fx, "kappa");
+    let ejected_tree = home.join("kappa/hist");
+    let ejected_admin = gitlink_admin(&ejected_tree);
+
+    let orphaned = synced_history_project(&fx, "lam");
+    let orphaned_tree = home.join("lam/hist");
+    let orphaned_gitlink = std::fs::read(orphaned_tree.join(".git")).expect("lam gitlink");
+    let orphaned_mirror = gitlink_admin(&orphaned_tree)
+        .ancestors()
+        .nth(2)
+        .expect("mirror of the admin dir")
+        .to_path_buf();
+
+    let moved_src = git_repo(&fx.base.join("nu-src"), &[("n.txt", "nu\n")]);
+    let moved = fx.base.join("nu");
+    write_project(
+        &moved,
+        &history_config("", &moved_src, &home.join("nu-first")),
+    );
+    fx.phora_in(&moved, &["sync"]);
+    write_project(
+        &moved,
+        &history_config(
+            "[paths]\nstate = \"../nu-state\"\n",
+            &moved_src,
+            &home.join("nu-second"),
+        ),
+    );
+    fx.phora_in(&moved, &["sync"]);
+    let old_copy = state_dir_of(&moved, &fx.default_state_root());
+    let successor = state_dir_of(
+        &moved,
+        &std::fs::canonicalize(&fx.base)
+            .expect("canonical base")
+            .join("nu-state"),
+    );
+    let old_admin = gitlink_admin(&home.join("nu-first/hist"));
+    let successor_admin = gitlink_admin(&home.join("nu-second/hist"));
+
+    let legacy = write_project(&fx.base.join("mu"), &copy_config(&fx, "", &home.join("mu")));
+    fx.phora_in(&legacy, &["sync"]);
+
+    let unreachable = write_project(
+        &fx.base.join("xi"),
+        &copy_config(&fx, "", &fx.base.join("xi/out")),
+    );
+    fx.phora_in(&unreachable, &["sync"]);
+
+    let dirs = [
+        state_dir_of(&ejected, &fx.default_state_root()),
+        state_dir_of(&orphaned, &fx.default_state_root()),
+        old_copy.clone(),
+        state_dir_of(&legacy, &fx.default_state_root()),
+        state_dir_of(&unreachable, &fx.default_state_root()),
+    ];
+    std::fs::remove_dir_all(&ejected).expect("delete kappa root");
+    std::fs::remove_dir_all(&orphaned).expect("delete lam root");
+    std::fs::remove_dir_all(&orphaned_mirror).expect("remove lam's mirror");
+    std::fs::remove_file(dirs[3].join("project.toml")).expect("setup: legacy dir");
+    let sealed = RestoreMode(unreachable.clone(), 0o755);
+    std::fs::set_permissions(&sealed.0, std::fs::Permissions::from_mode(0o000))
+        .expect("setup: seal xi root");
+    let successor_before = snapshot(&successor);
+    let deployed_before = snapshot(&home);
+
+    let text = output_text(&fx.phora_in(&fx.base, &["gc", "--eject", "--yes"]));
+
+    for dir in &dirs {
+        assert_absent(dir, "a confirmed eject drops every non-live dir");
+    }
+    assert!(
+        snapshot(&successor) == successor_before,
+        "the live successor's dir is untouched"
+    );
+    assert!(
+        ejected_tree.join(".git").is_dir(),
+        "a stranded history worktree becomes a standalone repository"
+    );
+    assert_absent(
+        &ejected_admin,
+        "the mirror holds no admin entry for the ejected worktree",
+    );
+    assert_eq!(
+        std::fs::read(orphaned_tree.join(".git")).ok(),
+        Some(orphaned_gitlink),
+        "a worktree whose mirror is gone keeps its gitlink"
+    );
+    assert!(
+        mentions(&text, &orphaned_tree),
+        "the output lists the worktree left linked to a missing mirror, got:\n{text}"
+    );
+    assert!(
+        old_admin.is_dir() && successor_admin.is_dir(),
+        "an abandoned dir's worktree stays linked to the mirror"
+    );
+    assert!(
+        mentions(&text, &ejected_tree),
+        "the output lists the outside destinations left behind, got:\n{text}"
+    );
+    assert_eq!(
+        outside(&snapshot(&home), Path::new("kappa/hist/.git")),
+        outside(&deployed_before, Path::new("kappa/hist/.git")),
+        "gc changes no deployed file outside the ejected gitdir"
+    );
+}
+
+#[test]
+fn gc_eject_keeps_and_reports_a_dir_whose_eject_fails_and_exits_non_zero() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = Fixture::new();
+    let stranded = synced_history_project(&fx, "kappa");
+    let stranded_dir = state_dir_of(&stranded, &fx.default_state_root());
+    let stranded_id = id_of(&stranded);
+    let admin = gitlink_admin(&fx.base.join("home/kappa/hist"));
+    std::fs::remove_dir_all(&stranded).expect("delete kappa root");
+    let sealed = RestoreMode(admin, 0o755);
+    std::fs::set_permissions(&sealed.0, std::fs::Permissions::from_mode(0o555))
+        .expect("setup: seal the mirror admin dir");
+
+    let out = fx.run_in(&fx.base, &["gc", "--eject", "--yes"]);
+    let text = output_text(&out);
+
+    assert!(
+        stranded_dir.is_dir(),
+        "a dir whose eject errors is kept, got:\n{text}"
+    );
+    assert!(
+        text.lines()
+            .any(|line| line.contains(&stranded_id) && line.contains("error")),
+        "the output reports the dir's eject error, got:\n{text}"
+    );
+    assert!(
+        !out.status.success(),
+        "an eject error exits non-zero, got {:?}:\n{text}",
+        out.status
+    );
+}
+
+#[test]
+fn gc_unregisters_an_absent_unproven_state_root_only_once_confirmed() {
+    let fx = Fixture::new();
+    let project = fx.other_project(
+        "omega",
+        "[paths]\nstate = \"../omega-state\"\n",
+        &fx.base.join("omega/out"),
+    );
+    fx.phora_in(&project, &["sync"]);
+    let custom_root = std::fs::canonicalize(&fx.base)
+        .expect("canonical base")
+        .join("omega-state");
+    let custom = str_of(&custom_root).to_owned();
+    assert!(
+        registered_roots(&fx).contains(&custom),
+        "setup: the custom state root is registered"
+    );
+    // A root recorded off the default root's mount cannot be proven deleted.
+    let index_path = fx.default_state_root().join("state-roots.toml");
+    let mut index = read_toml(&index_path);
+    for root in index
+        .get_mut("roots")
+        .and_then(toml::Value::as_array_mut)
+        .expect("setup: registered roots")
+    {
+        if root.get("path").and_then(toml::Value::as_str) == Some(custom.as_str()) {
+            root.as_table_mut()
+                .expect("setup: root entry table")
+                .insert("on_state_mount".to_owned(), toml::Value::Boolean(false));
+        }
+    }
+    write(
+        &index_path,
+        &toml::to_string(&index).expect("setup: serialize index"),
+    );
+    std::fs::remove_dir_all(&custom_root).expect("remove the custom state root");
+
+    let text = output_text(&fx.phora_in(&fx.base, &["gc", "--eject"]));
+
+    assert!(
+        registered_roots(&fx).contains(&custom),
+        "without --yes the absent root stays registered"
+    );
+    assert!(
+        mentions(&text, &custom_root),
+        "the plan lists the absent root, got:\n{text}"
+    );
+
+    fx.phora_in(&fx.base, &["gc", "--eject", "--yes"]);
+
+    assert!(
+        !registered_roots(&fx).contains(&custom),
+        "a confirmed eject unregisters the absent root, got {:?}",
+        registered_roots(&fx)
+    );
+}
+
+#[test]
+fn gc_eject_yes_trashes_a_gone_dir_whose_confined_link_stays_and_lists_the_link() {
+    let fx = Fixture::new();
+    let canonical_base = std::fs::canonicalize(&fx.base).expect("canonical base");
+    let confined = |name: &str| {
+        let root = synced_linked_project(&fx, name, &format!("../{name}-shared"));
+        let shared = fx.base.join(format!("{name}-shared"));
+        let real_shared = fx.base.join(format!("{name}-real"));
+        std::fs::rename(&shared, &real_shared).expect("setup: move deploy root");
+        std::os::unix::fs::symlink(&real_shared, &shared).expect("setup: symlink deploy root");
+        let dir = state_dir_of(&root, &fx.default_state_root());
+        let id = id_of(&root);
+        std::fs::remove_dir_all(&root).expect("delete linked root");
+        let link_names = [
+            shared.join("tool"),
+            canonical_base.join(format!("{name}-shared/tool")),
+        ];
+        (dir, id, real_shared.join("tool"), link_names)
+    };
+    let is_link = |path: &Path| std::fs::symlink_metadata(path).is_ok_and(|m| m.is_symlink());
+
+    let (json_dir, json_id, json_link, json_names) = confined("epsilon");
+    fx.phora_in(&fx.base, &["gc"]);
+    assert!(json_dir.is_dir(), "plain gc keeps the dir");
+
+    let records = json_records(&fx.phora_in(&fx.base, &["gc", "--eject", "--yes", "--json"]));
+
+    assert_absent(&json_dir, "a confirmed eject trashes the dir");
+    assert!(is_link(&json_link), "the confined link stays on disk");
+    let record = gc_record(&records, &json_id);
+    let leftovers: Vec<&str> = record["leftovers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the record lists its leftovers, got {record:#}"))
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert!(
+        json_names
+            .iter()
+            .any(|name| leftovers.contains(&str_of(name))),
+        "the --json leftovers list the kept link, got {record:#}"
+    );
+
+    let (text_dir, _, text_link, text_names) = confined("eta");
+    let text = output_text(&fx.phora_in(&fx.base, &["gc", "--eject", "--yes"]));
+
+    assert_absent(&text_dir, "a confirmed eject trashes the dir");
+    assert!(is_link(&text_link), "the confined link stays on disk");
+    assert!(
+        text.lines().any(|line| {
+            line.contains("leaves") && text_names.iter().any(|name| line.contains(str_of(name)))
+        }),
+        "the text output lists the kept link as left behind, got:\n{text}"
     );
 }

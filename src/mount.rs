@@ -1,5 +1,4 @@
 //! Placement of a path relative to an anchor directory's mount, and proof of its deletion.
-#![allow(dead_code, reason = "stubs wired by T004 to T008")]
 
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};

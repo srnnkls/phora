@@ -547,16 +547,23 @@ pub(crate) fn remove_missing_mirror_worktree_gitlink(
     admin_id: &WorktreeAdminId,
     deploy_root: &Path,
 ) -> Result<bool> {
+    if mirror_exists(address)? {
+        return Ok(false);
+    }
+    remove_worktree_gitlink(address, admin_id, deploy_root)?;
+    Ok(true)
+}
+
+/// Whether the worktree's mirror exists, checked without locking, creating or removing anything.
+pub(crate) fn mirror_exists(address: &WorktreeMirrorAddress) -> Result<bool> {
     let Some(cache_root) = physical_cache_git_root(&address.cache_git_root)? else {
-        remove_worktree_gitlink(address, admin_id, deploy_root)?;
-        return Ok(true);
+        return Ok(false);
     };
     let mirror = super::cache::mirror_path_for_key(&cache_root, &address.key);
     match std::fs::symlink_metadata(&mirror) {
-        Ok(_) => Ok(false),
+        Ok(_) => Ok(true),
         Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
-            remove_worktree_gitlink(address, admin_id, deploy_root)?;
-            Ok(true)
+            Ok(false)
         }
         Err(error) => Err(SourceError::Source(format!(
             "inspect worktree mirror {}: {error}",

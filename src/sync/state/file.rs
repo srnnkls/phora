@@ -378,6 +378,42 @@ impl FileStateStore {
         Ok(false)
     }
 
+    /// The latest modification time among the record files, `None` when there is none.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a target or record directory, or a record file's metadata, cannot be read.
+    pub(crate) fn newest_record_modified(&self) -> Result<Option<std::time::SystemTime>> {
+        let targets_dir = self.state_root.join("targets");
+        let target_dirs = match std::fs::read_dir(&targets_dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(StateError::StateStore(format!(
+                    "read dir {}: {e}",
+                    targets_dir.display()
+                )));
+            }
+        };
+        let mut newest = None;
+        for target in target_dirs {
+            let target = target.map_err(|e| {
+                StateError::StateStore(format!("read entry in {}: {e}", targets_dir.display()))
+            })?;
+            if !target.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let _ = walk_record_files(&target.path().join("artifacts"), &mut |path| {
+                let modified = std::fs::metadata(path)
+                    .and_then(|meta| meta.modified())
+                    .map_err(|e| StateError::StateStore(format!("stat {}: {e}", path.display())))?;
+                newest = newest.max(Some(modified));
+                Ok(ControlFlow::Continue(()))
+            })?;
+        }
+        Ok(newest)
+    }
+
     fn read_meta(&self, target: &str) -> Result<TargetMeta> {
         let path = self.meta_path(target);
         match std::fs::read_to_string(&path) {

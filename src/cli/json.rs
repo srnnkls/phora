@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use crate::sync::progress::{
     ArtifactId, FetchId, FetchOutcome, Phase, ProgressSink, Severity, SyncSummary,
 };
+use crate::sync::state::lifecycle::{Fact, GcRecord, PlannedAction};
 use crate::sync::{AppliedChange, RemovalReason, SkippedChange, SyncWarning};
 
 /// Writes one JSON object per line to stdout.
@@ -131,6 +132,63 @@ fn fetch_outcome_label(outcome: FetchOutcome) -> &'static str {
         FetchOutcome::Fetched => "fetched",
         FetchOutcome::Failed => "failed",
     }
+}
+
+/// One `phora gc --json` record for a state dir that is not live; `outcome` is filled after applying.
+pub(super) fn gc_record(record: &GcRecord) -> Value {
+    let action = record.action();
+    let evidence: serde_json::Map<String, Value> = record
+        .evidence()
+        .into_iter()
+        .map(|(key, fact)| {
+            let value = match fact {
+                Fact::Text(text) => Value::String(text),
+                Fact::Count(count) => Value::from(count),
+                Fact::List(items) => Value::from(items),
+            };
+            (key.to_owned(), value)
+        })
+        .collect();
+    let worktrees = |mirror_present: bool| -> Vec<String> {
+        action
+            .worktrees()
+            .iter()
+            .filter(|worktree| worktree.mirror_present() == mirror_present)
+            .map(|worktree| worktree.deploy_root().as_path().display().to_string())
+            .collect()
+    };
+    let kind = match action {
+        PlannedAction::Drop { .. } => "drop",
+        PlannedAction::ReleaseLinks { .. } => "release_links",
+        PlannedAction::Eject { .. } => "eject",
+        PlannedAction::Forget { .. } => "forget",
+        PlannedAction::Report { .. } => "report",
+    };
+    json!({
+        "type": "gc",
+        "id": action.dir().id().as_str(),
+        "state_dir": action.dir().path().as_path().display().to_string(),
+        "class": action.class(),
+        "status": action.reason().label(),
+        "root": action.root().map(|root| root.as_path().display().to_string()),
+        "evidence": evidence,
+        "action": {
+            "kind": kind,
+            "eject": worktrees(true),
+            "keep_linked": worktrees(false),
+        },
+        "leftovers": record
+            .leftovers()
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>(),
+        "outcome": Value::Null,
+    })
+}
+
+/// A `phora gc --json` line for a path gc lists and leaves in place.
+pub(super) fn gc_entry(kind: &str, path: &std::path::Path) -> Value {
+    json!({ "type": kind, "path": path.display().to_string() })
 }
 
 fn summary_record(summary: &SyncSummary) -> Value {

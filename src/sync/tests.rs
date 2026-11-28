@@ -17321,9 +17321,11 @@ mod state_lifecycle_data_model {
                     UnreachableRoot::Unproven(unproven) => {
                         let _: &Unproven = unproven;
                     }
-                    UnreachableRoot::ManifestFault(kind)
-                    | UnreachableRoot::DestinationFault(kind) => {
+                    UnreachableRoot::ManifestFault(kind) => {
                         let _: &ErrorKind = kind;
+                    }
+                    UnreachableRoot::DestinationFault { key, kind } => {
+                        let _: (&ArtifactKey, &ErrorKind) = (key, kind);
                     }
                 }
             }
@@ -17377,7 +17379,7 @@ mod state_lifecycle_data_model {
         }
     }
 
-    fn removal_shapes(not_held: &NotHeld, outcome: &DropOutcome, confirmation: &Confirmation) {
+    fn removal_shapes(not_held: &NotHeld, outcome: &DropOutcome, confirmation: Confirmation) {
         match not_held {
             NotHeld::Vanished | NotHeld::Busy => {}
             NotHeld::Fault(kind) => {
@@ -17476,7 +17478,7 @@ mod state_lifecycle_data_model {
         let _: fn(&JournalState) = journal_shape;
         let _: fn(&StateDirClass) = class_shapes;
         let _: fn(&PlannedAction) = action_shapes;
-        let _: fn(&NotHeld, &DropOutcome, &Confirmation) = removal_shapes;
+        let _: fn(&NotHeld, &DropOutcome, Confirmation) = removal_shapes;
         let _: fn(&ProjectsEntry, &TrashName, &GcRecord) = enumeration_shapes;
 
         let _: Option<(MountId, TrashSuffix, StrandedEvidence, SweepFault)> = None;
@@ -17814,7 +17816,10 @@ mod state_lifecycle_probe {
             matches!(
                 faulted_class,
                 StateDirClass::Forget(ForgetReason::Unreachable(Unreachable::Root {
-                    cause: UnreachableRoot::DestinationFault(ErrorKind::PermissionDenied),
+                    cause: UnreachableRoot::DestinationFault {
+                        kind: ErrorKind::PermissionDenied,
+                        ..
+                    },
                     ..
                 }))
             ),
